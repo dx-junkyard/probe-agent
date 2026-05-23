@@ -169,3 +169,180 @@ def test_shadow_candidate_failure_does_not_break_current(sdk):
 
     assert len(sdk["shadows"]) == 1
     assert sdk["shadows"][0]["candidate_error"] is not None
+
+
+def test_shadow_uses_snapshot_when_caller_mutates_input(sdk):
+    """Caller mutates the input list AFTER calling current; candidate must
+    still see the snapshot taken at call time."""
+    import threading
+
+    sdk["set_mode"]("shadow")
+    probe = sdk["decorator_mod"].probe
+    set_candidate = sdk["decorator_mod"].set_candidate
+
+    candidate_gate = threading.Event()
+    candidate_saw: list = []
+
+    def candidate(items: list) -> int:
+        candidate_gate.wait(timeout=2.0)
+        candidate_saw.append(list(items))
+        return sum(items)
+
+    set_candidate("summer", candidate)
+
+    @probe(component_id="summer")
+    def summer(items: list) -> int:
+        return sum(items)
+
+    payload = [1, 2, 3]
+    result = summer(payload)
+    assert result == 6
+
+    # Caller mutates the original list before candidate gets a chance to run.
+    payload.append(999)
+    candidate_gate.set()
+
+    flush = sdk["decorator_mod"].flush
+    flush(timeout=2.0)
+
+    assert candidate_saw == [[1, 2, 3]], f"candidate saw mutated input: {candidate_saw}"
+    assert sdk["shadows"][0]["candidate_output"] == "6"
+
+
+def test_snapshot_falls_back_for_uncopyable_input(sdk):
+    """Uncopyable inputs (sockets/locks) must not break the host call."""
+    import threading
+
+    sdk["set_mode"]("shadow")
+    probe = sdk["decorator_mod"].probe
+    set_candidate = sdk["decorator_mod"].set_candidate
+
+    set_candidate("identity", lambda _lock: "candidate-ok")
+
+    @probe(component_id="identity")
+    def identity(_lock):
+        return "current-ok"
+
+    # threading.Lock is not deepcopy-able — must not raise.
+    result = identity(threading.Lock())
+    assert result == "current-ok"
+
+    flush = sdk["decorator_mod"].flush
+    flush(timeout=2.0)
+    assert sdk["shadows"][0]["candidate_output"] == "'candidate-ok'"
+
+
+def test_flush_waits_for_in_flight_shadows(sdk):
+    """Short-lived processes must be able to deliver shadow results."""
+    import threading
+    import time
+
+    sdk["set_mode"]("shadow")
+    probe = sdk["decorator_mod"].probe
+    set_candidate = sdk["decorator_mod"].set_candidate
+
+    delivered = threading.Event()
+    real_send = sdk["decorator_mod"]._client.send_shadow_result
+
+    def slow_send(payload):
+        # Simulate a slow Control Server.
+        time.sleep(0.2)
+        real_send(payload)
+        delivered.set()
+
+    sdk["decorator_mod"]._client.send_shadow_result = slow_send
+
+    set_candidate("slow", lambda x: x + 1)
+
+    @probe(component_id="slow")
+    def slow(x):
+        return x
+
+    assert slow(1) == 1
+    # Without flush, this test could race; flush must block until done.
+    sdk["decorator_mod"].flush(timeout=3.0)
+    assert delivered.is_set()
+    assert len(sdk["shadows"]) == 1
+
+
+def test_shadow_in_subprocess_delivers_result(tmp_path):
+    """End-to-end: a short-lived python process running @probe in shadow
+    mode must deliver the shadow result via atexit hook."""
+    import http.server
+    import json as _json
+    import socket
+    import subprocess
+    import sys
+    import threading
+
+    received: list = []
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            if self.path.endswith("/policy"):
+                body = _json.dumps({"mode": "shadow"}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def do_POST(self):  # noqa: N802
+            length = int(self.headers.get("Content-Length", "0"))
+            data = self.rfile.read(length)
+            received.append((self.path, _json.loads(data)))
+            self.send_response(201)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *_):  # silence
+            return
+
+    srv = http.server.HTTPServer(("127.0.0.1", port), Handler)
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+        sdk_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        script = tmp_path / "run.py"
+        script.write_text(
+            "from probe_agent import probe, set_candidate\n"
+            "set_candidate('sub', lambda x: x * 10)\n"
+            "@probe(component_id='sub')\n"
+            "def f(x):\n"
+            "    return x + 1\n"
+            "print(f(5))\n"
+        )
+        env = {
+            **os.environ,
+            "PYTHONPATH": sdk_path,
+            "PROBE_SERVER_URL": f"http://127.0.0.1:{port}",
+            "PROBE_DEFAULT_MODE": "shadow",
+            "PROBE_POLICY_TTL": "0",
+            "PROBE_SHUTDOWN_TIMEOUT": "5",
+        }
+        out = subprocess.run(
+            [sys.executable, str(script)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert out.returncode == 0, out.stderr
+        assert out.stdout.strip() == "6"
+    finally:
+        srv.shutdown()
+        th.join(timeout=2)
+
+    paths = [p for p, _ in received]
+    assert any("/traces" in p for p in paths), f"trace missing: {paths}"
+    assert any("/shadow-results" in p for p in paths), f"shadow missing: {paths}"
+    shadow_payload = next(payload for path, payload in received if "/shadow-results" in path)
+    assert shadow_payload["current_output"] == "6"
+    assert shadow_payload["candidate_output"] == "50"

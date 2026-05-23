@@ -1,10 +1,46 @@
+import ast
 import datetime as dt
+import difflib
 import json
 import os
 from typing import Any, Dict, List, Optional
 
 import requests
 import streamlit as st
+
+
+def _maybe_pretty(text: Optional[str]) -> str:
+    """Best-effort pretty-print so the diff is readable.
+
+    The SDK serializes outputs with ``repr()``; for strings/dicts/lists
+    we can re-parse via ``ast.literal_eval`` and pretty JSON it. JSON
+    strings are also handled. Anything else is returned verbatim.
+    """
+    if text is None:
+        return ""
+    raw = text.strip()
+    if not raw:
+        return text
+
+    try:
+        return json.dumps(json.loads(raw), indent=2, ensure_ascii=False, sort_keys=True)
+    except (ValueError, TypeError):
+        pass
+    try:
+        return json.dumps(
+            ast.literal_eval(raw), indent=2, ensure_ascii=False, sort_keys=True, default=str
+        )
+    except (ValueError, SyntaxError, TypeError):
+        pass
+    return text
+
+
+def _unified_diff(current: Optional[str], candidate: Optional[str]) -> str:
+    a = _maybe_pretty(current).splitlines()
+    b = _maybe_pretty(candidate).splitlines()
+    return "\n".join(
+        difflib.unified_diff(a, b, fromfile="current", tofile="candidate", lineterm="")
+    )
 
 SERVER_URL = os.getenv("PROBE_SERVER_URL", "http://localhost:8000").rstrip("/")
 MODES = ["off", "trace", "shadow"]
@@ -128,6 +164,20 @@ else:
                 right.error(s["candidate_error"])
             else:
                 right.code(s.get("candidate_output") or "")
+
+            st.markdown("**diff**")
+            if s.get("candidate_error"):
+                st.warning("candidate raised an error — no diff available")
+            elif same:
+                st.success("no diff (current == candidate)")
+            else:
+                diff = _unified_diff(s.get("current_output"), s.get("candidate_output"))
+                if diff:
+                    st.code(diff, language="diff")
+                else:
+                    # Outputs differ as raw strings but pretty-prints collapsed
+                    # them to the same form (e.g. whitespace-only differences).
+                    st.info("difference present only in raw representation; pretty form is equal")
 
             current_eval = s.get("evaluation") or "unknown"
             new_eval = st.selectbox(

@@ -9,6 +9,27 @@ SDK は host application の実行を絶対にブロックしない。
 - policy 取得失敗時はキャッシュ済み policy、なければ `PROBE_DEFAULT_MODE` を使う
 - shadow 実行は別スレッドで動かし、candidate 例外も握りつぶす（current の返値は影響を受けない）
 
+## shadow の入力スナップショット
+
+shadow candidate には `copy.deepcopy` で複製した args/kwargs を渡す。
+これにより:
+
+- current 実行中に fn が引数を mutate しても candidate には元の値が渡る
+- current 呼び出し後に host 側が引数を mutate しても candidate には元の値が渡る
+
+deepcopy できない値（file handle / lock / socket など）に対しては元参照を
+そのまま渡す fail-safe フォールバックを用意。host application は壊さない。
+
+## 短命プロセスでの shadow 配送
+
+shadow スレッドは `daemon=True` だが、初回 spawn 時に `atexit.register(flush)`
+を行い、インタプリタ終了時に最大 `PROBE_SHUTDOWN_TIMEOUT` 秒だけ in-flight な
+shadow スレッドを join する。
+
+これにより CLI / バッチ系の短命プロセスでも shadow 結果が落ちにくい。
+タイムアウトに達した場合は join を諦めて終了するので、ハングしたスレッドが
+プロセス終了を無限に阻害することはない。
+
 ## モードの意味
 
 | mode | 元関数 | trace 送信 | candidate 実行 | 返値 |

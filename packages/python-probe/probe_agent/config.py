@@ -20,6 +20,7 @@ class ProbeConfig:
     ENV_DEFAULT_MODE = "PROBE_DEFAULT_MODE"
     ENV_POLICY_TTL = "PROBE_POLICY_TTL"
     ENV_TIMEOUT = "PROBE_HTTP_TIMEOUT"
+    ENV_SHUTDOWN_TIMEOUT = "PROBE_SHUTDOWN_TIMEOUT"
 
     @classmethod
     def enabled(cls) -> bool:
@@ -46,3 +47,11 @@ class ProbeConfig:
             return float(os.getenv(cls.ENV_TIMEOUT, "2"))
         except ValueError:
             return 2.0
+
+    @classmethod
+    def shutdown_timeout(cls) -> float:
+        """Max seconds to wait at interpreter exit for shadow threads to finish."""
+        try:
+            return float(os.getenv(cls.ENV_SHUTDOWN_TIMEOUT, "10"))
+        except ValueError:
+            return 10.0
