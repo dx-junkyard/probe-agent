@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from typing import Iterator
 
@@ -67,9 +68,57 @@ CREATE INDEX IF NOT EXISTS idx_shadow_component_ts
 
 CREATE INDEX IF NOT EXISTS idx_shadow_trace
     ON shadow_results (trace_id);
+
+CREATE TABLE IF NOT EXISTS users (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    username      TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    role          TEXT NOT NULL DEFAULT 'user',
+    is_active     INTEGER NOT NULL DEFAULT 1,
+    created_at    REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_hash  TEXT NOT NULL UNIQUE,
+    name        TEXT,
+    kind        TEXT NOT NULL DEFAULT 'api',
+    user_id     INTEGER NOT NULL,
+    revoked     INTEGER NOT NULL DEFAULT 0,
+    created_at  REAL NOT NULL,
+    expires_at  REAL,
+    FOREIGN KEY (user_id) REFERENCES users (id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tokens_hash ON api_tokens (token_hash);
+CREATE INDEX IF NOT EXISTS idx_tokens_user ON api_tokens (user_id);
 """
 
 
 def init_db() -> None:
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+    _bootstrap_admin()
+
+
+def _bootstrap_admin() -> None:
+    """Create an initial admin from env vars if no such user exists yet."""
+    from .security import hash_password
+
+    username = os.getenv("CONTROL_ADMIN_USERNAME", "").strip()
+    password = os.getenv("CONTROL_ADMIN_PASSWORD", "")
+    if not username or not password:
+        return
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM users WHERE username = ?", (username,)
+        ).fetchone()
+        if row is not None:
+            return
+        conn.execute(
+            """
+            INSERT INTO users (username, password_hash, role, is_active, created_at)
+            VALUES (?, ?, 'admin', 1, ?)
+            """,
+            (username, hash_password(password), time.time()),
+        )

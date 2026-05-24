@@ -135,3 +135,133 @@ def test_auth_accepts_second_valid_key(auth_client):
 def test_health_always_accessible(auth_client):
     r = auth_client.get("/health")
     assert r.status_code == 200
+
+
+# --- User / token management tests ---
+
+
+@pytest.fixture
+def admin_client(tmp_path, monkeypatch):
+    monkeypatch.setenv("PROBE_DB_PATH", str(tmp_path / "probe-admin-test.db"))
+    monkeypatch.setenv("CONTROL_ADMIN_USERNAME", "root")
+    monkeypatch.setenv("CONTROL_ADMIN_PASSWORD", "s3cret")
+    monkeypatch.delenv("CONTROL_API_KEYS", raising=False)
+    from app.main import app  # noqa: WPS433
+    with TestClient(app) as c:
+        yield c
+
+
+def _login(client, username="root", password="s3cret"):
+    r = client.post("/auth/login", json={"username": username, "password": password})
+    assert r.status_code == 200, r.text
+    return r.json()["access_token"]
+
+
+def _bearer(token):
+    return {"Authorization": f"Bearer {token}"}
+
+
+def test_admin_bootstrapped_and_password_hashed(admin_client):
+    # Password is never stored in plaintext.
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT password_hash, role FROM users WHERE username = 'root'"
+        ).fetchone()
+    assert row is not None
+    assert row["role"] == "admin"
+    assert "s3cret" not in row["password_hash"]
+    assert row["password_hash"].startswith("pbkdf2_sha256$")
+
+
+def test_login_and_me(admin_client):
+    token = _login(admin_client)
+    r = admin_client.get("/auth/me", headers=_bearer(token))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["user"]["username"] == "root"
+    assert body["user"]["role"] == "admin"
+    assert body["auth"] == "token"
+
+
+def test_login_rejects_bad_password(admin_client):
+    r = admin_client.post("/auth/login", json={"username": "root", "password": "nope"})
+    assert r.status_code == 401
+
+
+def test_unauthenticated_requires_credentials(admin_client):
+    r = admin_client.post("/traces", json=_trace())
+    assert r.status_code == 401
+
+
+def test_admin_only_user_creation(admin_client):
+    admin_token = _login(admin_client)
+    r = admin_client.post(
+        "/users",
+        json={"username": "alice", "password": "pw", "role": "user"},
+        headers=_bearer(admin_token),
+    )
+    assert r.status_code == 201
+
+    # Non-admin cannot create users.
+    user_token = _login(admin_client, "alice", "pw")
+    r = admin_client.post(
+        "/users",
+        json={"username": "bob", "password": "pw"},
+        headers=_bearer(user_token),
+    )
+    assert r.status_code == 403
+
+
+def test_token_issue_use_and_revoke(admin_client):
+    admin_token = _login(admin_client)
+
+    r = admin_client.post(
+        "/tokens", json={"name": "sdk-token"}, headers=_bearer(admin_token)
+    )
+    assert r.status_code == 201
+    body = r.json()
+    raw = body["token"]
+    token_id = body["id"]
+
+    # The issued token works as an X-Api-Key (SDK compatibility path).
+    r = admin_client.post("/traces", json=_trace(), headers={"X-Api-Key": raw})
+    assert r.status_code == 201
+
+    # Revoke it.
+    r = admin_client.post(
+        f"/tokens/{token_id}/revoke", headers=_bearer(admin_token)
+    )
+    assert r.status_code == 200
+    assert r.json()["revoked"] is True
+
+    # Revoked token is rejected.
+    r = admin_client.post("/traces", json=_trace(), headers={"X-Api-Key": raw})
+    assert r.status_code == 401
+
+
+def test_deactivated_user_cannot_authenticate(admin_client):
+    admin_token = _login(admin_client)
+    r = admin_client.post(
+        "/users",
+        json={"username": "carol", "password": "pw"},
+        headers=_bearer(admin_token),
+    )
+    uid = r.json()["id"]
+    user_token = _login(admin_client, "carol", "pw")
+
+    # Deactivate the user.
+    r = admin_client.post(
+        f"/users/{uid}/deactivate", headers=_bearer(admin_token)
+    )
+    assert r.status_code == 200
+    assert r.json()["is_active"] is False
+
+    # Their existing token is now revoked.
+    r = admin_client.get("/auth/me", headers=_bearer(user_token))
+    assert r.status_code == 401
+
+    # And they can no longer log in.
+    r = admin_client.post("/auth/login", json={"username": "carol", "password": "pw"})
+    assert r.status_code == 403
