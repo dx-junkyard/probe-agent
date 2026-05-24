@@ -10,6 +10,17 @@ pip install -r requirements.txt
 PROBE_SERVER_URL=http://localhost:8000 streamlit run app.py
 ```
 
+## Docker での起動
+
+リポジトリルートから:
+
+```bash
+docker compose up --build
+```
+
+Compose 内では `PROBE_SERVER_URL=http://control-server:8000` が設定され、
+同じネットワークの Control Server コンテナを参照する。
+
 ## 機能
 
 - component 一覧（trace 数 / last seen）

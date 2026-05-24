@@ -25,3 +25,14 @@ uvicorn app.main:app --reload --port 8000
 | PUT  | `/shadow-results/{id}/evaluation` | 手動評価 (`better`/`worse`/`same`/`unknown`) |
 
 DB ファイルは `PROBE_DB_PATH` (既定 `./probe.db`) で切り替えられる。
+
+## Docker での起動
+
+リポジトリルートから:
+
+```bash
+docker compose up --build control-server
+```
+
+Compose 利用時は `PROBE_DB_PATH=/data/probe.db` がセットされ、SQLite ファイルは
+名前付き volume `probe-data` に永続化される。

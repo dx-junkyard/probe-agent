@@ -21,7 +21,34 @@ probe-agent/
 └── docs/
 ```
 
-## クイックスタート
+## クイックスタート (Docker Compose)
+
+Control Server と Dashboard をまとめて起動する最短手順:
+
+```bash
+docker compose up --build
+```
+
+- Control Server: <http://localhost:8000> (`/health` で確認)
+- Dashboard:      <http://localhost:8501>
+- SQLite DB は名前付き volume `probe-data` (`/data/probe.db`) に永続化される
+
+サンプルはホスト側の Python から Compose 内の Control Server に向けて実行できる:
+
+```bash
+pip install -e packages/python-probe
+cd examples/simple-pipeline
+PROBE_SERVER_URL=http://localhost:8000 python main.py
+```
+
+停止と DB の破棄:
+
+```bash
+docker compose down          # コンテナのみ停止
+docker compose down -v       # volume (DB) も削除
+```
+
+## クイックスタート (ローカル Python)
 
 ```bash
 # 0. 仮想環境推奨
