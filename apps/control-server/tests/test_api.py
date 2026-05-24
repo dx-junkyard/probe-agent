@@ -251,6 +251,53 @@ def test_evaluate_missing_trace(client):
     assert r.status_code == 404
 
 
+def test_evaluate_sdk_repr_outputs(client):
+    # The SDK serializes outputs with repr(): a returned JSON string arrives
+    # wrapped in Python quotes. The evaluator must normalize before judging.
+    trace = _trace(trace_id="eval-repr")
+    trace["output"] = repr('{"summary": "hello", "lang": "en"}')
+    client.post("/traces", json=trace)
+
+    client.post(
+        "/components/summarizer/criteria",
+        json={
+            "name": "json equal",
+            "criterion_type": "json_equal",
+            "expected_value": '{"lang": "en", "summary": "hello"}',
+        },
+    )
+    client.post(
+        "/components/summarizer/criteria",
+        json={
+            "name": "has keys",
+            "criterion_type": "required_keys",
+            "expected_value": '["summary", "lang"]',
+        },
+    )
+
+    r = client.post("/traces/eval-repr/evaluate")
+    assert r.status_code == 200
+    statuses = [row["status"] for row in r.json()]
+    assert statuses == ["ok", "ok"]
+
+
+def test_evaluate_exact_match_sdk_repr_string(client):
+    trace = _trace(trace_id="eval-exact")
+    trace["output"] = repr("hello")  # "'hello'"
+    client.post("/traces", json=trace)
+    client.post(
+        "/components/summarizer/criteria",
+        json={
+            "name": "exact hello",
+            "criterion_type": "exact_match",
+            "expected_value": "hello",
+        },
+    )
+    r = client.post("/traces/eval-exact/evaluate")
+    assert r.status_code == 200
+    assert r.json()[0]["status"] == "ok"
+
+
 # --- Authentication tests ---
 
 

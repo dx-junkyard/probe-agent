@@ -62,6 +62,10 @@ API:
 評価ロジック（rule-based）:
 
 - `exact_match` / `contains` / `regex` / `json_equal` / `required_keys` は自動判定
+- 判定前に出力と期待値を正規化する。SDK は出力を `repr()` で直列化するため、
+  JSON 文字列や Python リテラル（dict/list の repr）、`repr()` で包まれた JSON 文字列を
+  意味的な値へ変換してから比較する。解析できない値は元の文字列にフォールバックする
+  （`contains` / `regex` は従来どおり生の文字列を対象とする）
 - `natural_language` は自動判定せず `needs_review`
 - 結果は `ok` / `ng` / `needs_review` と reason 付きで保存
 - 再評価は同一 trace の過去結果を置き換える（冪等）

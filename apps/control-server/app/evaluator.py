@@ -11,27 +11,44 @@ import re
 from typing import Any, Optional, Tuple
 
 
-def _coerce(text: Optional[str]) -> Tuple[Any, bool]:
+def _normalize(text: Optional[str]) -> Tuple[Any, bool]:
     """Best-effort parse of a serialized output into a Python object.
 
-    The SDK serializes outputs with ``repr()``; JSON payloads are also
-    common. Returns ``(value, ok)`` where ``ok`` is False if the text
-    could not be parsed into structured data.
+    The SDK serializes outputs with ``repr()``, so a JSON string produced
+    by a function arrives wrapped in Python string quotes, and a dict
+    arrives as a Python dict literal. JSON payloads are also common.
+
+    Strategy:
+
+    1. Try JSON.
+    2. Try ``ast.literal_eval`` for Python literals (incl. ``repr()`` output).
+    3. If the parsed value is itself a string that looks like a JSON object
+       or array, parse it once more as JSON.
+    4. If nothing parses, fall back to the raw stripped string.
+
+    Returns ``(value, parsed)`` where ``parsed`` is False only when the text
+    could not be parsed into structured data (the raw string is returned).
     """
     if text is None:
         return None, False
     raw = text.strip()
     if not raw:
-        return None, False
+        return "", False
     try:
-        return json.loads(raw), True
+        value: Any = json.loads(raw)
     except (ValueError, TypeError):
-        pass
-    try:
-        return ast.literal_eval(raw), True
-    except (ValueError, SyntaxError, TypeError):
-        pass
-    return None, False
+        try:
+            value = ast.literal_eval(raw)
+        except (ValueError, SyntaxError, TypeError):
+            return raw, False
+    if isinstance(value, str):
+        inner = value.strip()
+        if inner[:1] in ("{", "["):
+            try:
+                return json.loads(inner), True
+            except (ValueError, TypeError):
+                pass
+    return value, True
 
 
 def evaluate(
@@ -54,6 +71,10 @@ def evaluate(
         expected = expected_value or ""
         if actual.strip() == expected.strip():
             return "ok", 1.0, "output matches expected value exactly"
+        actual_obj, _ = _normalize(actual)
+        expected_obj, _ = _normalize(expected)
+        if actual_obj == expected_obj:
+            return "ok", 1.0, "normalized output matches expected value"
         return "ng", 0.0, "output does not match expected value"
 
     if criterion_type == "contains":
@@ -72,10 +93,10 @@ def evaluate(
             return "needs_review", None, f"invalid regex: {exc}"
 
     if criterion_type == "json_equal":
-        expected_obj, exp_ok = _coerce(expected_value)
+        expected_obj, exp_ok = _normalize(expected_value)
         if not exp_ok:
             return "needs_review", None, "expected_value is not valid JSON"
-        actual_obj, act_ok = _coerce(actual)
+        actual_obj, act_ok = _normalize(actual)
         if not act_ok:
             return "ng", 0.0, "output is not parseable as JSON"
         if actual_obj == expected_obj:
@@ -83,10 +104,10 @@ def evaluate(
         return "ng", 0.0, "output differs from expected JSON"
 
     if criterion_type == "required_keys":
-        keys_obj, keys_ok = _coerce(expected_value)
+        keys_obj, keys_ok = _normalize(expected_value)
         if not keys_ok or not isinstance(keys_obj, list):
             return "needs_review", None, "expected_value must be a JSON array of keys"
-        actual_obj, act_ok = _coerce(actual)
+        actual_obj, act_ok = _normalize(actual)
         if not act_ok or not isinstance(actual_obj, dict):
             return "ng", 0.0, "output is not a JSON object"
         missing = [k for k in keys_obj if k not in actual_obj]
