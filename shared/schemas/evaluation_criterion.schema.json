@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://probe-agent.dev/schemas/evaluation_criterion.json",
+  "title": "EvaluationCriterion",
+  "type": "object",
+  "required": ["id", "component_id", "name", "criterion_type", "created_at", "updated_at"],
+  "properties": {
+    "id":             { "type": "integer" },
+    "component_id":   { "type": "string" },
+    "name":           { "type": "string" },
+    "description":    { "type": "string" },
+    "criterion_type": {
+      "type": "string",
+      "enum": ["natural_language", "exact_match", "json_equal", "required_keys", "contains", "regex"]
+    },
+    "expected_value": { "type": ["string", "null"] },
+    "weight":         { "type": "number" },
+    "enabled":        { "type": "boolean" },
+    "created_at":     { "type": "number" },
+    "updated_at":     { "type": "number" }
+  },
+  "additionalProperties": false
+}

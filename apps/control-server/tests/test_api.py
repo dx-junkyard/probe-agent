@@ -95,6 +95,162 @@ def test_policy_invalid_mode_rejected(client):
     assert r.status_code == 422
 
 
+# --- Evaluation context tests ---
+
+
+def test_system_profile_default_and_update(client):
+    r = client.get("/system-profile")
+    assert r.status_code == 200
+    assert r.json()["name"] == ""
+
+    payload = {
+        "name": "Support Assistant",
+        "purpose": "answer user questions",
+        "target_users": ["end users", "support staff"],
+        "stakeholder_value": "faster resolution",
+        "constraints": ["no PII leakage"],
+        "success_criteria": ["accurate answers"],
+    }
+    r = client.put("/system-profile", json=payload)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["target_users"] == ["end users", "support staff"]
+    assert body["updated_at"] is not None
+
+    r = client.get("/system-profile")
+    assert r.json()["name"] == "Support Assistant"
+    assert r.json()["constraints"] == ["no PII leakage"]
+
+
+def test_component_profile_default_and_update(client):
+    r = client.get("/components/summarizer/profile")
+    assert r.status_code == 200
+    assert r.json()["component_id"] == "summarizer"
+    assert r.json()["purpose"] == ""
+
+    payload = {
+        "purpose": "summarize text",
+        "responsibility": "produce a short summary",
+        "expected_input": "raw text",
+        "expected_output": "summary string",
+        "failure_impact": "user sees no summary",
+        "notes": "keep under 100 words",
+    }
+    r = client.put("/components/summarizer/profile", json=payload)
+    assert r.status_code == 200
+    assert r.json()["responsibility"] == "produce a short summary"
+
+    r = client.get("/components/summarizer/profile")
+    assert r.json()["expected_output"] == "summary string"
+
+
+def test_criteria_crud(client):
+    r = client.post(
+        "/components/summarizer/criteria",
+        json={
+            "name": "must mention topic",
+            "criterion_type": "contains",
+            "expected_value": "weather",
+        },
+    )
+    assert r.status_code == 201
+    cid = r.json()["id"]
+    assert r.json()["enabled"] is True
+
+    r = client.get("/components/summarizer/criteria")
+    assert len(r.json()) == 1
+
+    r = client.put(
+        f"/criteria/{cid}",
+        json={
+            "name": "must mention topic",
+            "criterion_type": "contains",
+            "expected_value": "forecast",
+            "enabled": False,
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["expected_value"] == "forecast"
+    assert r.json()["enabled"] is False
+
+    r = client.put(
+        "/criteria/9999",
+        json={"name": "x", "criterion_type": "contains"},
+    )
+    assert r.status_code == 404
+
+
+def test_evaluate_trace_rule_based(client):
+    trace = _trace(trace_id="eval-1")
+    trace["output"] = '{"summary": "hello", "lang": "en"}'
+    client.post("/traces", json=trace)
+
+    client.post(
+        "/components/summarizer/criteria",
+        json={
+            "name": "contains hello",
+            "criterion_type": "contains",
+            "expected_value": "hello",
+        },
+    )
+    client.post(
+        "/components/summarizer/criteria",
+        json={
+            "name": "has required keys",
+            "criterion_type": "required_keys",
+            "expected_value": '["summary", "lang"]',
+        },
+    )
+    client.post(
+        "/components/summarizer/criteria",
+        json={
+            "name": "missing key",
+            "criterion_type": "required_keys",
+            "expected_value": '["summary", "author"]',
+        },
+    )
+    client.post(
+        "/components/summarizer/criteria",
+        json={"name": "human check", "criterion_type": "natural_language"},
+    )
+
+    r = client.post("/traces/eval-1/evaluate")
+    assert r.status_code == 200
+    results = r.json()
+    assert len(results) == 4
+    statuses = [row["status"] for row in results]
+    assert statuses.count("ok") == 2
+    assert statuses.count("ng") == 1
+    assert statuses.count("needs_review") == 1
+
+    r = client.get("/traces/eval-1/evaluations")
+    assert r.status_code == 200
+    assert len(r.json()) == 4
+
+
+def test_evaluate_is_idempotent(client):
+    trace = _trace(trace_id="eval-2")
+    trace["output"] = "the quick brown fox"
+    client.post("/traces", json=trace)
+    client.post(
+        "/components/summarizer/criteria",
+        json={
+            "name": "contains fox",
+            "criterion_type": "contains",
+            "expected_value": "fox",
+        },
+    )
+    client.post("/traces/eval-2/evaluate")
+    client.post("/traces/eval-2/evaluate")
+    r = client.get("/traces/eval-2/evaluations")
+    assert len(r.json()) == 1
+
+
+def test_evaluate_missing_trace(client):
+    r = client.post("/traces/nope/evaluate")
+    assert r.status_code == 404
+
+
 # --- Authentication tests ---
 
 

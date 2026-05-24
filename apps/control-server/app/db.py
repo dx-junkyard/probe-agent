@@ -92,6 +92,65 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 
 CREATE INDEX IF NOT EXISTS idx_tokens_hash ON api_tokens (token_hash);
 CREATE INDEX IF NOT EXISTS idx_tokens_user ON api_tokens (user_id);
+
+CREATE TABLE IF NOT EXISTS system_profile (
+    id                TEXT PRIMARY KEY,
+    name              TEXT,
+    purpose           TEXT,
+    target_users      TEXT,
+    stakeholder_value TEXT,
+    constraints       TEXT,
+    success_criteria  TEXT,
+    created_at        REAL,
+    updated_at        REAL
+);
+
+CREATE TABLE IF NOT EXISTS component_profiles (
+    component_id    TEXT PRIMARY KEY,
+    purpose         TEXT,
+    responsibility  TEXT,
+    expected_input  TEXT,
+    expected_output TEXT,
+    failure_impact  TEXT,
+    notes           TEXT,
+    created_at      REAL,
+    updated_at      REAL
+);
+
+CREATE TABLE IF NOT EXISTS evaluation_criteria (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    component_id   TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    description    TEXT,
+    criterion_type TEXT NOT NULL,
+    expected_value TEXT,
+    weight         REAL NOT NULL DEFAULT 1.0,
+    enabled        INTEGER NOT NULL DEFAULT 1,
+    created_at     REAL NOT NULL,
+    updated_at     REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_criteria_component
+    ON evaluation_criteria (component_id);
+
+CREATE TABLE IF NOT EXISTS evaluation_results (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    trace_id       TEXT NOT NULL,
+    component_id   TEXT NOT NULL,
+    criterion_id   INTEGER NOT NULL,
+    status         TEXT NOT NULL,
+    score          REAL,
+    reason         TEXT,
+    actual_output  TEXT,
+    expected_value TEXT,
+    created_at     REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_eval_results_trace
+    ON evaluation_results (trace_id);
+
+CREATE INDEX IF NOT EXISTS idx_eval_results_component
+    ON evaluation_results (component_id);
 """
 
 

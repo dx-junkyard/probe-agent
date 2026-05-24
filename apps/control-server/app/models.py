@@ -1,4 +1,4 @@
-from typing import Any, Literal, Optional
+from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -44,6 +44,102 @@ class ComponentSummary(BaseModel):
 
 class EvaluationUpdate(BaseModel):
     evaluation: Evaluation = Field(..., description="manual verdict")
+
+
+CriterionType = Literal[
+    "natural_language",
+    "exact_match",
+    "json_equal",
+    "required_keys",
+    "contains",
+    "regex",
+]
+EvaluationStatus = Literal["ok", "ng", "needs_review"]
+
+
+class SystemProfile(BaseModel):
+    name: str = ""
+    purpose: str = ""
+    target_users: List[str] = Field(default_factory=list)
+    stakeholder_value: str = ""
+    constraints: List[str] = Field(default_factory=list)
+    success_criteria: List[str] = Field(default_factory=list)
+    created_at: Optional[float] = None
+    updated_at: Optional[float] = None
+
+
+class SystemProfileUpdate(BaseModel):
+    name: str = ""
+    purpose: str = ""
+    target_users: List[str] = Field(default_factory=list)
+    stakeholder_value: str = ""
+    constraints: List[str] = Field(default_factory=list)
+    success_criteria: List[str] = Field(default_factory=list)
+
+
+class ComponentProfile(BaseModel):
+    component_id: str
+    purpose: str = ""
+    responsibility: str = ""
+    expected_input: str = ""
+    expected_output: str = ""
+    failure_impact: str = ""
+    notes: str = ""
+    created_at: Optional[float] = None
+    updated_at: Optional[float] = None
+
+
+class ComponentProfileUpdate(BaseModel):
+    purpose: str = ""
+    responsibility: str = ""
+    expected_input: str = ""
+    expected_output: str = ""
+    failure_impact: str = ""
+    notes: str = ""
+
+
+class EvaluationCriterion(BaseModel):
+    id: int
+    component_id: str
+    name: str
+    description: str = ""
+    criterion_type: CriterionType
+    expected_value: Optional[str] = None
+    weight: float = 1.0
+    enabled: bool = True
+    created_at: float
+    updated_at: float
+
+
+class CriterionCreate(BaseModel):
+    name: str = Field(..., min_length=1)
+    description: str = ""
+    criterion_type: CriterionType
+    expected_value: Optional[str] = None
+    weight: float = 1.0
+    enabled: bool = True
+
+
+class CriterionUpdate(BaseModel):
+    name: str = Field(..., min_length=1)
+    description: str = ""
+    criterion_type: CriterionType
+    expected_value: Optional[str] = None
+    weight: float = 1.0
+    enabled: bool = True
+
+
+class EvaluationResult(BaseModel):
+    id: int
+    trace_id: str
+    component_id: str
+    criterion_id: int
+    status: EvaluationStatus
+    score: Optional[float] = None
+    reason: str = ""
+    actual_output: Optional[str] = None
+    expected_value: Optional[str] = None
+    created_at: float
 
 
 Role = Literal["admin", "user"]

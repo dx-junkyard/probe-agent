@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://probe-agent.dev/schemas/evaluation_result.json",
+  "title": "EvaluationResult",
+  "type": "object",
+  "required": ["id", "trace_id", "component_id", "criterion_id", "status", "created_at"],
+  "properties": {
+    "id":             { "type": "integer" },
+    "trace_id":       { "type": "string" },
+    "component_id":   { "type": "string" },
+    "criterion_id":   { "type": "integer" },
+    "status":         { "type": "string", "enum": ["ok", "ng", "needs_review"] },
+    "score":          { "type": ["number", "null"] },
+    "reason":         { "type": "string" },
+    "actual_output":  { "type": ["string", "null"] },
+    "expected_value": { "type": ["string", "null"] },
+    "created_at":     { "type": "number" }
+  },
+  "additionalProperties": false
+}

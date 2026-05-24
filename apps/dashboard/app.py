@@ -45,6 +45,15 @@ def _unified_diff(current: Optional[str], candidate: Optional[str]) -> str:
 SERVER_URL = os.getenv("PROBE_SERVER_URL", "http://localhost:8000").rstrip("/")
 MODES = ["off", "trace", "shadow"]
 EVALUATIONS = ["unknown", "better", "worse", "same"]
+CRITERION_TYPES = [
+    "natural_language",
+    "exact_match",
+    "json_equal",
+    "required_keys",
+    "contains",
+    "regex",
+]
+STATUS_ICON = {"ok": "✅", "ng": "❌", "needs_review": "🔍"}
 
 
 def api_get(path: str) -> Optional[Any]:
@@ -67,6 +76,20 @@ def api_put(path: str, payload: Dict[str, Any]) -> Optional[Any]:
         return None
 
 
+def api_post(path: str, payload: Optional[Dict[str, Any]] = None) -> Optional[Any]:
+    try:
+        r = requests.post(f"{SERVER_URL}{path}", json=payload, timeout=5)
+        r.raise_for_status()
+        return r.json()
+    except requests.RequestException as e:
+        st.error(f"POST {path} failed: {e}")
+        return None
+
+
+def _lines_to_list(text: str) -> List[str]:
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
 def fmt_ts(ts: Optional[float]) -> str:
     if ts is None:
         return "-"
@@ -76,6 +99,37 @@ def fmt_ts(ts: Optional[float]) -> str:
 st.set_page_config(page_title="probe-agent", layout="wide")
 st.title("probe-agent dashboard")
 st.caption(f"Control Server: {SERVER_URL}")
+
+# --- System profile -------------------------------------------------------
+with st.expander("System Profile（システム全体の目的・価値・制約）"):
+    sp = api_get("/system-profile") or {}
+    with st.form("system-profile-form"):
+        sp_name = st.text_input("name", value=sp.get("name", ""))
+        sp_purpose = st.text_area("purpose", value=sp.get("purpose", ""))
+        sp_users = st.text_area(
+            "target_users (1行1項目)", value="\n".join(sp.get("target_users", []))
+        )
+        sp_value = st.text_area("stakeholder_value", value=sp.get("stakeholder_value", ""))
+        sp_constraints = st.text_area(
+            "constraints (1行1項目)", value="\n".join(sp.get("constraints", []))
+        )
+        sp_success = st.text_area(
+            "success_criteria (1行1項目)", value="\n".join(sp.get("success_criteria", []))
+        )
+        if st.form_submit_button("Save system profile"):
+            api_put(
+                "/system-profile",
+                {
+                    "name": sp_name,
+                    "purpose": sp_purpose,
+                    "target_users": _lines_to_list(sp_users),
+                    "stakeholder_value": sp_value,
+                    "constraints": _lines_to_list(sp_constraints),
+                    "success_criteria": _lines_to_list(sp_success),
+                },
+            )
+            st.success("system profile を保存しました")
+            st.rerun()
 
 components: List[Dict[str, Any]] = api_get("/components") or []
 if not components:
@@ -117,6 +171,98 @@ if new_mode != current_mode:
 
 st.divider()
 
+# --- Component profile -----------------------------------------------------
+st.subheader("Component Profile（責務・入出力期待・失敗時の影響）")
+cp = api_get(f"/components/{selected}/profile") or {}
+with st.form(f"component-profile-{selected}"):
+    cp_purpose = st.text_area("purpose", value=cp.get("purpose", ""))
+    cp_resp = st.text_area("responsibility", value=cp.get("responsibility", ""))
+    cp_in = st.text_area("expected_input", value=cp.get("expected_input", ""))
+    cp_out = st.text_area("expected_output", value=cp.get("expected_output", ""))
+    cp_fail = st.text_area("failure_impact", value=cp.get("failure_impact", ""))
+    cp_notes = st.text_area("notes", value=cp.get("notes", ""))
+    if st.form_submit_button("Save component profile"):
+        api_put(
+            f"/components/{selected}/profile",
+            {
+                "purpose": cp_purpose,
+                "responsibility": cp_resp,
+                "expected_input": cp_in,
+                "expected_output": cp_out,
+                "failure_impact": cp_fail,
+                "notes": cp_notes,
+            },
+        )
+        st.success("component profile を保存しました")
+        st.rerun()
+
+st.divider()
+
+# --- Evaluation criteria ---------------------------------------------------
+st.subheader("Evaluation Criteria（評価基準）")
+criteria = api_get(f"/components/{selected}/criteria") or []
+if not criteria:
+    st.write("評価基準なし。下のフォームで追加してください。")
+for c in criteria:
+    with st.expander(
+        f"#{c['id']} {c['name']} [{c['criterion_type']}] "
+        f"{'有効' if c.get('enabled') else '無効'}"
+    ):
+        with st.form(f"criterion-{c['id']}"):
+            name = st.text_input("name", value=c.get("name", ""))
+            desc = st.text_area("description", value=c.get("description") or "")
+            ctype = st.selectbox(
+                "criterion_type",
+                CRITERION_TYPES,
+                index=CRITERION_TYPES.index(c["criterion_type"]),
+            )
+            expected = st.text_area(
+                "expected_value", value=c.get("expected_value") or ""
+            )
+            weight = st.number_input("weight", value=float(c.get("weight", 1.0)))
+            enabled = st.checkbox("enabled", value=bool(c.get("enabled", True)))
+            if st.form_submit_button("Save"):
+                api_put(
+                    f"/criteria/{c['id']}",
+                    {
+                        "name": name,
+                        "description": desc,
+                        "criterion_type": ctype,
+                        "expected_value": expected or None,
+                        "weight": weight,
+                        "enabled": enabled,
+                    },
+                )
+                st.success("criterion を更新しました")
+                st.rerun()
+
+with st.form(f"new-criterion-{selected}"):
+    st.markdown("**新しい評価基準を追加**")
+    new_name = st.text_input("name", key=f"newname-{selected}")
+    new_type = st.selectbox("criterion_type", CRITERION_TYPES, key=f"newtype-{selected}")
+    new_expected = st.text_area(
+        "expected_value (contains は部分文字列, required_keys/json_equal は JSON)",
+        key=f"newexp-{selected}",
+    )
+    new_desc = st.text_area("description", key=f"newdesc-{selected}")
+    if st.form_submit_button("Add criterion"):
+        if not new_name.strip():
+            st.error("name は必須です")
+        else:
+            api_post(
+                f"/components/{selected}/criteria",
+                {
+                    "name": new_name,
+                    "description": new_desc,
+                    "criterion_type": new_type,
+                    "expected_value": new_expected or None,
+                },
+            )
+            st.success("criterion を追加しました")
+            st.rerun()
+
+st.divider()
+
 # --- Traces ---------------------------------------------------------------
 st.subheader("Latest Traces")
 traces = api_get(f"/components/{selected}/traces?limit=50") or []
@@ -137,6 +283,22 @@ else:
                 st.markdown("**Error**")
                 st.code(t["error"])
             st.caption(f"trace_id: {t['trace_id']}")
+
+            st.markdown("**Evaluation**")
+            if st.button("Evaluate against criteria", key=f"eval-btn-{t['trace_id']}"):
+                api_post(f"/traces/{t['trace_id']}/evaluate")
+                st.rerun()
+            evals = api_get(f"/traces/{t['trace_id']}/evaluations") or []
+            if not evals:
+                st.caption("未評価")
+            for e in evals:
+                icon = STATUS_ICON.get(e["status"], "")
+                score = e.get("score")
+                score_txt = f" (score={score})" if score is not None else ""
+                st.write(
+                    f"{icon} criterion #{e['criterion_id']} → "
+                    f"**{e['status']}**{score_txt} — {e.get('reason', '')}"
+                )
 
 st.divider()
 

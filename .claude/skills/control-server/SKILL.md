@@ -20,6 +20,19 @@ Use this skill for files under:
 - `PUT /components/{component_id}/policy`
 - `POST /components/{component_id}/shadow-results`
 
+## Evaluation context APIs (issue #9)
+
+- `GET /system-profile`, `PUT /system-profile` (singleton, id `default`)
+- `GET /components/{component_id}/profile`, `PUT /components/{component_id}/profile`
+- `GET /components/{component_id}/criteria`, `POST /components/{component_id}/criteria`
+- `PUT /criteria/{criterion_id}`
+- `POST /traces/{trace_id}/evaluate`, `GET /traces/{trace_id}/evaluations`
+
+Evaluation is rule-based only (`app/evaluator.py`); never call an LLM in the MVP.
+`exact_match` / `contains` / `regex` / `json_equal` / `required_keys` are decided
+deterministically; `natural_language` is always recorded as `needs_review`.
+Re-evaluating a trace replaces its prior results (idempotent).
+
 ## Authentication and user management
 
 - Auth is enabled when any user exists or `CONTROL_API_KEYS` is set; otherwise open (MVP compat).
