@@ -10,6 +10,15 @@ pip install -r requirements.txt
 PROBE_SERVER_URL=http://localhost:8000 streamlit run app.py
 ```
 
+## 環境変数
+
+- `PROBE_SERVER_URL`: Control Server の URL（既定 `http://localhost:8000`）。
+- `DASHBOARD_API_KEY`: Control Server が認証必須のときに使う API キー。
+  設定すると全 API リクエストに `X-Api-Key` ヘッダーを付与する。
+- `PROBE_API_KEY`: `DASHBOARD_API_KEY` 未設定時の fallback（SDK と共有）。
+
+どちらのキーも未設定なら、従来どおり認証なしでアクセスする。
+
 ## Docker での起動
 
 リポジトリルートから:

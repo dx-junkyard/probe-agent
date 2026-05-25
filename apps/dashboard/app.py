@@ -43,6 +43,11 @@ def _unified_diff(current: Optional[str], candidate: Optional[str]) -> str:
     )
 
 SERVER_URL = os.getenv("PROBE_SERVER_URL", "http://localhost:8000").rstrip("/")
+# When the Control Server requires authentication, the dashboard attaches an
+# ``X-Api-Key`` header. ``DASHBOARD_API_KEY`` takes precedence, falling back to
+# ``PROBE_API_KEY`` (shared with the SDK). With neither set, requests are sent
+# unauthenticated as before.
+API_KEY = os.getenv("DASHBOARD_API_KEY") or os.getenv("PROBE_API_KEY")
 MODES = ["off", "trace", "shadow"]
 EVALUATIONS = ["unknown", "better", "worse", "same"]
 CRITERION_TYPES = [
@@ -56,9 +61,13 @@ CRITERION_TYPES = [
 STATUS_ICON = {"ok": "✅", "ng": "❌", "needs_review": "🔍"}
 
 
+def _auth_headers() -> Dict[str, str]:
+    return {"X-Api-Key": API_KEY} if API_KEY else {}
+
+
 def api_get(path: str) -> Optional[Any]:
     try:
-        r = requests.get(f"{SERVER_URL}{path}", timeout=3)
+        r = requests.get(f"{SERVER_URL}{path}", headers=_auth_headers(), timeout=3)
         r.raise_for_status()
         return r.json()
     except requests.RequestException as e:
@@ -68,7 +77,9 @@ def api_get(path: str) -> Optional[Any]:
 
 def api_put(path: str, payload: Dict[str, Any]) -> Optional[Any]:
     try:
-        r = requests.put(f"{SERVER_URL}{path}", json=payload, timeout=3)
+        r = requests.put(
+            f"{SERVER_URL}{path}", json=payload, headers=_auth_headers(), timeout=3
+        )
         r.raise_for_status()
         return r.json()
     except requests.RequestException as e:
@@ -78,7 +89,9 @@ def api_put(path: str, payload: Dict[str, Any]) -> Optional[Any]:
 
 def api_post(path: str, payload: Optional[Dict[str, Any]] = None) -> Optional[Any]:
     try:
-        r = requests.post(f"{SERVER_URL}{path}", json=payload, timeout=5)
+        r = requests.post(
+            f"{SERVER_URL}{path}", json=payload, headers=_auth_headers(), timeout=5
+        )
         r.raise_for_status()
         return r.json()
     except requests.RequestException as e:

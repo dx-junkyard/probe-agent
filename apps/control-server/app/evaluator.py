@@ -14,24 +14,62 @@ from typing import Any, Optional, Tuple
 def _coerce(text: Optional[str]) -> Tuple[Any, bool]:
     """Best-effort parse of a serialized output into a Python object.
 
-    The SDK serializes outputs with ``repr()``; JSON payloads are also
-    common. Returns ``(value, ok)`` where ``ok`` is False if the text
-    could not be parsed into structured data.
+    The SDK serializes outputs with ``repr()``, so structured data often
+    arrives double-wrapped: a JSON string return value becomes
+    ``'{"a": 1}'`` (single-quoted) and a ``dict`` becomes its Python
+    ``repr`` (``{'a': 1}``). The flow is:
+
+    1. ``json.loads`` for plain JSON payloads.
+    2. ``ast.literal_eval`` for Python ``repr`` (dicts, lists, quoted
+       strings).
+    3. If the parsed value is itself a string that looks like JSON, decode
+       it once more so a ``repr``-wrapped JSON string is unwrapped to its
+       structured form.
+
+    Returns ``(value, ok)`` where ``ok`` is False if the text could not be
+    parsed into structured data.
     """
     if text is None:
         return None, False
     raw = text.strip()
     if not raw:
         return None, False
+
+    value: Any
+    parsed = False
     try:
-        return json.loads(raw), True
+        value = json.loads(raw)
+        parsed = True
     except (ValueError, TypeError):
-        pass
-    try:
-        return ast.literal_eval(raw), True
-    except (ValueError, SyntaxError, TypeError):
-        pass
-    return None, False
+        try:
+            value = ast.literal_eval(raw)
+            parsed = True
+        except (ValueError, SyntaxError, TypeError):
+            return None, False
+
+    if isinstance(value, str):
+        inner = value.strip()
+        try:
+            value = json.loads(inner)
+        except (ValueError, TypeError):
+            pass
+
+    return value, parsed
+
+
+def _normalize_scalar(text: Optional[str]) -> str:
+    """Unwrap one layer of ``repr``/quoting so scalars compare cleanly.
+
+    ``repr("hello")`` is ``"'hello'"``; this returns the underlying
+    ``"hello"`` so ``exact_match`` treats them as equal. Non-string values
+    (numbers, bools, dicts) are left as their stripped raw text, whose
+    ``str``/``repr`` form already matches expectations.
+    """
+    raw = (text or "").strip()
+    value, ok = _coerce(raw)
+    if ok and isinstance(value, str):
+        return value.strip()
+    return raw
 
 
 def evaluate(
@@ -51,8 +89,7 @@ def evaluate(
         return "needs_review", None, "natural_language requires manual review"
 
     if criterion_type == "exact_match":
-        expected = expected_value or ""
-        if actual.strip() == expected.strip():
+        if _normalize_scalar(actual) == _normalize_scalar(expected_value):
             return "ok", 1.0, "output matches expected value exactly"
         return "ng", 0.0, "output does not match expected value"
 

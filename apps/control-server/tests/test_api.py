@@ -228,6 +228,65 @@ def test_evaluate_trace_rule_based(client):
     assert len(r.json()) == 4
 
 
+def test_evaluate_trace_with_sdk_repr_output(client):
+    # Mirrors what @probe stores: the function returned a JSON string, so the
+    # SDK repr wraps it in single quotes.
+    trace = _trace(trace_id="eval-repr")
+    trace["output"] = "'{\"a\": 2, \"b\": 1}'"
+    client.post("/traces", json=trace)
+
+    client.post(
+        "/components/summarizer/criteria",
+        json={
+            "name": "json equal",
+            "criterion_type": "json_equal",
+            "expected_value": '{"b": 1, "a": 2}',
+        },
+    )
+    client.post(
+        "/components/summarizer/criteria",
+        json={
+            "name": "keys",
+            "criterion_type": "required_keys",
+            "expected_value": '["a", "b"]',
+        },
+    )
+
+    r = client.post("/traces/eval-repr/evaluate")
+    assert r.status_code == 200
+    statuses = sorted(row["status"] for row in r.json())
+    assert statuses == ["ok", "ok"]
+
+
+def test_evaluate_trace_with_dict_repr_output(client):
+    # A function returning a dict: the SDK stores its Python repr.
+    trace = _trace(trace_id="eval-dict")
+    trace["output"] = "{'a': 2, 'b': 1}"
+    client.post("/traces", json=trace)
+
+    client.post(
+        "/components/summarizer/criteria",
+        json={
+            "name": "json equal",
+            "criterion_type": "json_equal",
+            "expected_value": '{"a": 2, "b": 1}',
+        },
+    )
+    client.post(
+        "/components/summarizer/criteria",
+        json={
+            "name": "keys",
+            "criterion_type": "required_keys",
+            "expected_value": '["a", "b"]',
+        },
+    )
+
+    r = client.post("/traces/eval-dict/evaluate")
+    assert r.status_code == 200
+    statuses = sorted(row["status"] for row in r.json())
+    assert statuses == ["ok", "ok"]
+
+
 def test_evaluate_is_idempotent(client):
     trace = _trace(trace_id="eval-2")
     trace["output"] = "the quick brown fox"
