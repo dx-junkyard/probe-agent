@@ -99,6 +99,35 @@ def api_post(path: str, payload: Optional[Dict[str, Any]] = None) -> Optional[An
         return None
 
 
+def api_delete(path: str) -> bool:
+    try:
+        r = requests.delete(
+            f"{SERVER_URL}{path}", headers=_auth_headers(), timeout=5
+        )
+        r.raise_for_status()
+        return True
+    except requests.RequestException as e:
+        st.error(f"DELETE {path} failed: {e}")
+        return False
+
+
+def _current_user() -> Optional[Dict[str, Any]]:
+    """Resolve the authenticated user, or None if anonymous/unauthorized.
+
+    Kept quiet (no st.error) so non-admin or unauthenticated dashboards
+    simply hide the management UI instead of showing an error.
+    """
+    try:
+        r = requests.get(
+            f"{SERVER_URL}/auth/me", headers=_auth_headers(), timeout=3
+        )
+        if r.status_code != 200:
+            return None
+        return r.json().get("user")
+    except requests.RequestException:
+        return None
+
+
 def _lines_to_list(text: str) -> List[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
@@ -112,6 +141,59 @@ def fmt_ts(ts: Optional[float]) -> str:
 st.set_page_config(page_title="probe-agent", layout="wide")
 st.title("probe-agent dashboard")
 st.caption(f"Control Server: {SERVER_URL}")
+
+# --- User management (admin only) -----------------------------------------
+_me = _current_user()
+if _me and _me.get("role") == "admin":
+    with st.expander("User Management（管理者用：ユーザーの作成・停止・削除）"):
+        users: List[Dict[str, Any]] = api_get("/users") or []
+        st.markdown("#### ユーザー一覧")
+        header = st.columns([1, 3, 2, 2, 3, 3])
+        for col, label in zip(
+            header, ["id", "username", "role", "status", "created_at", "操作"]
+        ):
+            col.markdown(f"**{label}**")
+        for u in users:
+            c = st.columns([1, 3, 2, 2, 3, 3])
+            c[0].write(u["id"])
+            c[1].write(u["username"])
+            c[2].write(u["role"])
+            c[3].write("active" if u["is_active"] else "inactive")
+            c[4].write(fmt_ts(u["created_at"]))
+            with c[5]:
+                if u["is_active"]:
+                    if st.checkbox("停止確認", key=f"deact-confirm-{u['id']}"):
+                        if st.button("Deactivate", key=f"deact-{u['id']}"):
+                            if api_post(f"/users/{u['id']}/deactivate") is not None:
+                                st.success(f"{u['username']} を停止しました")
+                                st.rerun()
+                if st.checkbox("削除確認", key=f"del-confirm-{u['id']}"):
+                    if st.button("Delete", key=f"del-{u['id']}"):
+                        if api_delete(f"/users/{u['id']}"):
+                            st.success(f"{u['username']} を削除しました")
+                            st.rerun()
+
+        st.markdown("#### 新規ユーザー作成")
+        with st.form("create-user-form"):
+            new_username = st.text_input("username")
+            new_password = st.text_input("password", type="password")
+            new_role = st.selectbox("role", ["user", "admin"])
+            if st.form_submit_button("Create user"):
+                if not new_username.strip() or not new_password:
+                    st.error("username と password は必須です")
+                elif (
+                    api_post(
+                        "/users",
+                        {
+                            "username": new_username.strip(),
+                            "password": new_password,
+                            "role": new_role,
+                        },
+                    )
+                    is not None
+                ):
+                    st.success(f"ユーザー {new_username.strip()} を作成しました")
+                    st.rerun()
 
 # --- System profile -------------------------------------------------------
 with st.expander("System Profile（システム全体の目的・価値・制約）"):

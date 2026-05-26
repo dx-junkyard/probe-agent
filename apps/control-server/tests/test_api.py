@@ -480,3 +480,97 @@ def test_deactivated_user_cannot_authenticate(admin_client):
     # And they can no longer log in.
     r = admin_client.post("/auth/login", json={"username": "carol", "password": "pw"})
     assert r.status_code == 403
+
+
+def test_delete_user_removes_account_and_tokens(admin_client):
+    admin_token = _login(admin_client)
+    r = admin_client.post(
+        "/users",
+        json={"username": "dave", "password": "pw"},
+        headers=_bearer(admin_token),
+    )
+    uid = r.json()["id"]
+    user_token = _login(admin_client, "dave", "pw")
+
+    r = admin_client.delete(f"/users/{uid}", headers=_bearer(admin_token))
+    assert r.status_code == 204
+
+    # The user is gone from the listing.
+    r = admin_client.get("/users", headers=_bearer(admin_token))
+    assert all(u["username"] != "dave" for u in r.json())
+
+    # Their existing session token no longer authenticates.
+    r = admin_client.get("/auth/me", headers=_bearer(user_token))
+    assert r.status_code == 401
+
+    # And they can no longer log in.
+    r = admin_client.post("/auth/login", json={"username": "dave", "password": "pw"})
+    assert r.status_code == 401
+
+
+def test_delete_missing_user_returns_404(admin_client):
+    admin_token = _login(admin_client)
+    r = admin_client.delete("/users/9999", headers=_bearer(admin_token))
+    assert r.status_code == 404
+
+
+def test_non_admin_cannot_delete_user(admin_client):
+    admin_token = _login(admin_client)
+    r = admin_client.post(
+        "/users",
+        json={"username": "erin", "password": "pw"},
+        headers=_bearer(admin_token),
+    )
+    target_id = r.json()["id"]
+    admin_client.post(
+        "/users",
+        json={"username": "frank", "password": "pw"},
+        headers=_bearer(admin_token),
+    )
+    user_token = _login(admin_client, "frank", "pw")
+    r = admin_client.delete(f"/users/{target_id}", headers=_bearer(user_token))
+    assert r.status_code == 403
+
+
+def test_admin_cannot_delete_self(admin_client):
+    admin_token = _login(admin_client)
+    me = admin_client.get("/auth/me", headers=_bearer(admin_token)).json()
+    my_id = me["user"]["id"]
+    r = admin_client.delete(f"/users/{my_id}", headers=_bearer(admin_token))
+    assert r.status_code == 409
+
+
+def test_cannot_delete_last_active_admin(admin_client):
+    admin_token = _login(admin_client)
+    # Create a second admin, then delete the bootstrapped one so only the new
+    # admin remains. Deleting that last admin must be refused.
+    r = admin_client.post(
+        "/users",
+        json={"username": "second-admin", "password": "pw", "role": "admin"},
+        headers=_bearer(admin_token),
+    )
+    second_id = r.json()["id"]
+    second_token = _login(admin_client, "second-admin", "pw")
+
+    me = admin_client.get("/auth/me", headers=_bearer(admin_token)).json()
+    root_id = me["user"]["id"]
+    r = admin_client.delete(f"/users/{root_id}", headers=_bearer(second_token))
+    assert r.status_code == 204
+
+    # second-admin is now the only active admin and cannot delete itself either,
+    # but a delete by another admin is impossible — confirm the guard via
+    # deactivate, which also protects the last admin.
+    r = admin_client.post(
+        f"/users/{second_id}/deactivate", headers=_bearer(second_token)
+    )
+    assert r.status_code == 409
+
+
+def test_cannot_deactivate_last_active_admin(admin_client):
+    admin_token = _login(admin_client)
+    me = admin_client.get("/auth/me", headers=_bearer(admin_token)).json()
+    root_id = me["user"]["id"]
+    r = admin_client.post(
+        f"/users/{root_id}/deactivate", headers=_bearer(admin_token)
+    )
+    assert r.status_code == 409

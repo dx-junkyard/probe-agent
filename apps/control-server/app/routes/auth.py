@@ -1,7 +1,7 @@
 import time
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 
 from ..auth import Principal, get_principal, require_admin
 from ..db import get_conn
@@ -108,14 +108,28 @@ def create_user(payload: UserCreate, _: Principal = Depends(require_admin)) -> U
     return _user_out(row)
 
 
+def _active_admin_ids(conn) -> set:
+    rows = conn.execute(
+        "SELECT id FROM users WHERE role = 'admin' AND is_active = 1"
+    ).fetchall()
+    return {r["id"] for r in rows}
+
+
 @router.post("/users/{user_id}/deactivate", response_model=UserOut)
 def deactivate_user(user_id: int, _: Principal = Depends(require_admin)) -> UserOut:
     with get_conn() as conn:
-        cur = conn.execute(
-            "UPDATE users SET is_active = 0 WHERE id = ?", (user_id,)
-        )
-        if cur.rowcount == 0:
+        row = conn.execute(
+            "SELECT id, username, role, is_active, created_at FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+        if row is None:
             raise HTTPException(status_code=404, detail="User not found")
+        # Refuse to disable the only remaining active admin.
+        if row["role"] == "admin" and row["is_active"] and _active_admin_ids(conn) == {user_id}:
+            raise HTTPException(
+                status_code=409, detail="Cannot deactivate the last active admin"
+            )
+        conn.execute("UPDATE users SET is_active = 0 WHERE id = ?", (user_id,))
         # Revoke all tokens belonging to the deactivated user.
         conn.execute("UPDATE api_tokens SET revoked = 1 WHERE user_id = ?", (user_id,))
         row = conn.execute(
@@ -123,6 +137,28 @@ def deactivate_user(user_id: int, _: Principal = Depends(require_admin)) -> User
             (user_id,),
         ).fetchone()
     return _user_out(row)
+
+
+@router.delete("/users/{user_id}", status_code=204)
+def delete_user(user_id: int, admin: Principal = Depends(require_admin)) -> Response:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id, role, is_active FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="User not found")
+        # Self-delete is out of scope for the MVP (see issue #14).
+        if user_id == admin.user_id:
+            raise HTTPException(status_code=409, detail="Cannot delete your own account")
+        # Refuse to remove the only remaining active admin.
+        if row["role"] == "admin" and row["is_active"] and _active_admin_ids(conn) == {user_id}:
+            raise HTTPException(
+                status_code=409, detail="Cannot delete the last active admin"
+            )
+        # Drop the user's tokens so any existing session/API token stops working.
+        conn.execute("DELETE FROM api_tokens WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    return Response(status_code=204)
 
 
 @router.get("/tokens", response_model=List[TokenOut])
