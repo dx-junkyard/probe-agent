@@ -24,6 +24,9 @@ dist/
 .DS_Store
 
 # probe-agent local state
+.env
+.env.*
+!.env.example
 *.db
 *.db-journal
 *.db-wal
