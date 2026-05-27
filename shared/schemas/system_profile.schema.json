@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://probe-agent.dev/schemas/system_profile.json",
+  "title": "SystemProfile",
+  "type": "object",
+  "properties": {
+    "name":              { "type": "string" },
+    "purpose":           { "type": "string" },
+    "target_users":      { "type": "array", "items": { "type": "string" } },
+    "stakeholder_value": { "type": "string" },
+    "constraints":       { "type": "array", "items": { "type": "string" } },
+    "success_criteria":  { "type": "array", "items": { "type": "string" } },
+    "created_at":        { "type": ["number", "null"] },
+    "updated_at":        { "type": ["number", "null"] }
+  },
+  "additionalProperties": false
+}

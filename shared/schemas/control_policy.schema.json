@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://probe-agent.dev/schemas/control_policy.json",
+  "title": "ControlPolicy",
+  "type": "object",
+  "required": ["mode"],
+  "properties": {
+    "mode": { "type": "string", "enum": ["off", "trace", "shadow"] }
+  },
+  "additionalProperties": false
+}

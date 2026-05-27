@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://probe-agent.dev/schemas/component_profile.json",
+  "title": "ComponentProfile",
+  "type": "object",
+  "required": ["component_id"],
+  "properties": {
+    "component_id":    { "type": "string" },
+    "purpose":         { "type": "string" },
+    "responsibility":  { "type": "string" },
+    "expected_input":  { "type": "string" },
+    "expected_output": { "type": "string" },
+    "failure_impact":  { "type": "string" },
+    "notes":           { "type": "string" },
+    "created_at":      { "type": ["number", "null"] },
+    "updated_at":      { "type": ["number", "null"] }
+  },
+  "additionalProperties": false
+}
