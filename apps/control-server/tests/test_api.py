@@ -588,6 +588,73 @@ def test_delete_system_removes_its_tokens_and_data(admin_client):
     assert all(row["id"] != system["id"] for row in systems)
 
 
+def test_generation_run_uses_trace_input_and_mock_llm(admin_client, monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    from app.llm import get_llm_client
+
+    get_llm_client.cache_clear()
+    admin_token = _login(admin_client)
+    system = _create_system(admin_client, admin_token, "Generation System")
+    api_token = _issue_system_token(
+        admin_client, admin_token, system["id"], "generation-token"
+    )
+    trace = _trace(component_id="summarizer", trace_id="gen-trace")
+    trace["input"] = {"args": ["'hello'"], "kwargs": {}}
+    trace["output"] = "'hello'"
+    r = admin_client.post(
+        "/traces", json=trace, headers={"X-Api-Key": api_token["token"]}
+    )
+    assert r.status_code == 201
+
+    r = admin_client.post(
+        "/generation-runs",
+        json={
+            "component_id": "summarizer",
+            "trace_id": "gen-trace",
+            "objective": "uppercase the output",
+        },
+        headers=_bearer(admin_token) | {"X-Probe-System-Id": str(system["id"])},
+    )
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["component_id"] == "summarizer"
+    assert body["candidate_output"] == "'HELLO'"
+    assert body["llm_verdict"] == "better"
+    assert "def candidate" in body["generated_code"]
+
+    r = admin_client.get(
+        "/generation-runs?component_id=summarizer&trace_id=gen-trace",
+        headers=_bearer(admin_token) | {"X-Probe-System-Id": str(system["id"])},
+    )
+    assert r.status_code == 200
+    assert r.json()[0]["id"] == body["id"]
+
+
+def test_generation_run_is_system_scoped(admin_client, monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    from app.llm import get_llm_client
+
+    get_llm_client.cache_clear()
+    admin_token = _login(admin_client)
+    system_a = _create_system(admin_client, admin_token, "Generation A")
+    system_b = _create_system(admin_client, admin_token, "Generation B")
+    token_a = _issue_system_token(admin_client, admin_token, system_a["id"], "a")
+    trace = _trace(component_id="shared", trace_id="same-id")
+    trace["input"] = {"args": ["'a'"], "kwargs": {}}
+    admin_client.post("/traces", json=trace, headers={"X-Api-Key": token_a["token"]})
+
+    r = admin_client.post(
+        "/generation-runs",
+        json={
+            "component_id": "shared",
+            "trace_id": "same-id",
+            "objective": "uppercase",
+        },
+        headers=_bearer(admin_token) | {"X-Probe-System-Id": str(system_b["id"])},
+    )
+    assert r.status_code == 404
+
+
 def test_deactivated_user_cannot_authenticate(admin_client):
     admin_token = _login(admin_client)
     r = admin_client.post(

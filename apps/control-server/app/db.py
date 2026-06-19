@@ -181,6 +181,32 @@ CREATE INDEX IF NOT EXISTS idx_eval_results_trace
 
 CREATE INDEX IF NOT EXISTS idx_eval_results_component
     ON evaluation_results (system_id, component_id);
+
+CREATE TABLE IF NOT EXISTS generation_runs (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id          INTEGER NOT NULL,
+    component_id        TEXT NOT NULL,
+    trace_id            TEXT NOT NULL,
+    objective           TEXT NOT NULL,
+    input_json          TEXT,
+    current_output      TEXT,
+    generated_code      TEXT NOT NULL,
+    generation_notes    TEXT,
+    candidate_output    TEXT,
+    execution_error     TEXT,
+    llm_verdict         TEXT NOT NULL DEFAULT 'unknown',
+    llm_reason          TEXT,
+    llm_risks           TEXT,
+    llm_recommendation  TEXT,
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_generation_runs_trace
+    ON generation_runs (system_id, trace_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_generation_runs_component
+    ON generation_runs (system_id, component_id, id DESC);
 """
 
 

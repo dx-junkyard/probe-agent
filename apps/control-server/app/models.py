@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 
 Mode = Literal["off", "trace", "shadow"]
 Evaluation = Literal["better", "worse", "same", "unknown"]
+GenerationVerdict = Literal["better", "worse", "same", "unsafe", "error", "unknown"]
 
 
 class TraceEvent(BaseModel):
@@ -164,6 +165,31 @@ class EvaluationResult(BaseModel):
     reason: str = ""
     actual_output: Optional[str] = None
     expected_value: Optional[str] = None
+    created_at: float
+
+
+class GenerationRunCreate(BaseModel):
+    component_id: str = Field(..., min_length=1)
+    trace_id: str = Field(..., min_length=1)
+    objective: str = Field(..., min_length=1)
+
+
+class GenerationRun(BaseModel):
+    id: int
+    system_id: int
+    component_id: str
+    trace_id: str
+    objective: str
+    input_json: Optional[Any] = None
+    current_output: Optional[str] = None
+    generated_code: str = ""
+    generation_notes: str = ""
+    candidate_output: Optional[str] = None
+    execution_error: Optional[str] = None
+    llm_verdict: GenerationVerdict = "unknown"
+    llm_reason: str = ""
+    llm_risks: str = ""
+    llm_recommendation: str = ""
     created_at: float
 
 

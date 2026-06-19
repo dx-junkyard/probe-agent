@@ -42,8 +42,27 @@ uvicorn app.main:app --reload --port 8000
 | POST | `/systems` | system 作成 |
 | PUT  | `/systems/{id}` | system の名前・環境・説明を更新 |
 | DELETE | `/systems/{id}` | system と観測データを削除 |
+| POST | `/generation-runs` | trace 入力から候補コードを生成・実行・LLM 評価 |
+| GET  | `/generation-runs` | 生成・評価結果一覧 |
+| GET  | `/generation-runs/{id}` | 生成・評価結果詳細 |
 
 DB ファイルは `PROBE_DB_PATH` (既定 `./probe.db`) で切り替えられる。
+
+## LLM 設定
+
+Generate & Evaluate は `app.llm` の抽象化層だけを通して LLM を呼び出す。
+アプリケーションコードはプロバイダ固有の request / response 形式を直接扱わない。
+
+| 変数 | 用途 |
+| --- | --- |
+| `LLM_PROVIDER` | `openai` / `anthropic` / `gemini` / `mock` |
+| `LLM_MODEL` | 使用するモデル名 |
+| `LLM_API_KEY` | 各プロバイダ共通の API key |
+| `LLM_BASE_URL` | 互換 API やプロキシを使う場合の base URL |
+| `LLM_TIMEOUT` | HTTP timeout 秒 |
+
+`OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` も後方互換として読まれる。
+`mock` はテストとローカルUI確認用で、外部 API は呼ばない。
 
 ## 認証とユーザー管理
 

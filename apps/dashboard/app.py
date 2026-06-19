@@ -60,6 +60,14 @@ SESSION_COOKIE_SECURE = os.getenv(
 ).strip().lower() in ("1", "true", "yes", "on")
 MODES = ["off", "trace", "shadow"]
 EVALUATIONS = ["unknown", "better", "worse", "same"]
+GENERATION_VERDICT_ICON = {
+    "better": "✅",
+    "worse": "❌",
+    "same": "➖",
+    "unsafe": "⚠",
+    "error": "⛔",
+    "unknown": "❔",
+}
 CRITERION_TYPES = [
     "natural_language",
     "exact_match",
@@ -474,6 +482,10 @@ def render_connect_sdk_tab(system: Dict[str, Any]) -> None:
         "raw tokenは発行直後にしか表示されません。"
     )
     st.code(_probe_env_text(), language="bash")
+    st.caption(
+        "この形式の.envをshellで読む場合は、下の実行例のように`set -a`で"
+        "子プロセスへexportしてください。"
+    )
     st.download_button(
         "Download .env.sample",
         data=_probe_env_text(),
@@ -508,7 +520,18 @@ def render_connect_sdk_tab(system: Dict[str, Any]) -> None:
 
     st.markdown("実行例:")
     st.code(
-        "source probe-agent-<system-id>.env.sample\npython sample_probe_client.py",
+        "set -a\n"
+        "source probe-agent-<system-id>.env.sample\n"
+        "set +a\n"
+        "python sample_probe_client.py",
+        language="bash",
+    )
+
+    st.markdown("環境変数を直接渡して実行する場合:")
+    st.code(
+        f"PROBE_SERVER_URL={_client_server_url()} \\\n"
+        f"PROBE_API_KEY={_current_or_placeholder_token()} \\\n"
+        "python sample_probe_client.py",
         language="bash",
     )
 
@@ -867,6 +890,158 @@ def render_components_tab(system: Dict[str, Any]) -> None:
                 st.caption(f"trace_id: {s['trace_id']}")
 
 
+def _format_trace_label(trace: Dict[str, Any]) -> str:
+    error = " error" if trace.get("error") else ""
+    return (
+        f"{fmt_ts(trace.get('timestamp'))} | {trace.get('mode') or '-'} | "
+        f"{trace.get('duration_ms', 0):.2f}ms{error} | {trace['trace_id'][:8]}"
+    )
+
+
+def _render_generation_run(run: Dict[str, Any]) -> None:
+    verdict = run.get("llm_verdict") or "unknown"
+    icon = GENERATION_VERDICT_ICON.get(verdict, "")
+    st.markdown(f"### {icon} Verdict: `{verdict}`")
+    if run.get("llm_reason"):
+        st.markdown("**Reason**")
+        st.write(run["llm_reason"])
+    if run.get("llm_risks"):
+        st.markdown("**Risks**")
+        st.write(run["llm_risks"])
+    if run.get("llm_recommendation"):
+        st.markdown("**Recommendation**")
+        st.write(run["llm_recommendation"])
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Current output**")
+        st.code(run.get("current_output") or "")
+    with right:
+        st.markdown("**Candidate output**")
+        if run.get("execution_error"):
+            st.error(run["execution_error"])
+        else:
+            st.code(run.get("candidate_output") or "")
+
+    st.markdown("**Diff**")
+    if run.get("execution_error"):
+        st.warning("candidate execution failed; no output diff available")
+    else:
+        diff = _unified_diff(run.get("current_output"), run.get("candidate_output"))
+        st.code(diff or "no diff", language="diff")
+
+    st.markdown("**Generated code**")
+    st.code(run.get("generated_code") or "", language="python")
+    st.download_button(
+        "Download candidate.py",
+        data=run.get("generated_code") or "",
+        file_name=f"candidate_run_{run['id']}.py",
+        mime="text/x-python",
+    )
+    if run.get("generation_notes"):
+        st.caption(run["generation_notes"])
+
+
+def render_generate_evaluate_tab(system: Dict[str, Any]) -> None:
+    st.subheader("Generate & Evaluate")
+    st.caption(
+        "転送済みtraceの入力パラメーターを使って候補コードを生成し、"
+        "同じ入力で実行してLLM評価します。生成コードは自動適用されません。"
+    )
+
+    components: List[Dict[str, Any]] = api_get("/components") or []
+    if not components:
+        st.info("まだcomponentがありません。まずConnect SDKのサンプルを実行してください。")
+        return
+
+    component_ids = [component["component_id"] for component in components]
+    selected_component = st.selectbox(
+        "Component",
+        component_ids,
+        key=f"gen-component-{system['id']}",
+    )
+    traces = api_get(f"/components/{selected_component}/traces?limit=50") or []
+    if not traces:
+        st.info("このcomponentにはtraceがありません。")
+        return
+
+    trace_ids = [trace["trace_id"] for trace in traces]
+    selected_trace_id = st.selectbox(
+        "Trace",
+        trace_ids,
+        format_func=lambda trace_id: _format_trace_label(
+            next(trace for trace in traces if trace["trace_id"] == trace_id)
+        ),
+        key=f"gen-trace-{system['id']}-{selected_component}",
+    )
+    selected_trace = next(trace for trace in traces if trace["trace_id"] == selected_trace_id)
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Input parameters**")
+        st.code(json.dumps(selected_trace.get("input"), ensure_ascii=False, indent=2))
+    with right:
+        st.markdown("**Current output**")
+        st.code(selected_trace.get("output") or "")
+
+    objective = st.text_area(
+        "Objective",
+        placeholder="例: 出力を短くしつつ、重要な情報を落とさない",
+        key=f"gen-objective-{system['id']}-{selected_component}-{selected_trace_id}",
+    )
+    if st.button(
+        "Generate candidate and evaluate",
+        key=f"gen-run-{system['id']}-{selected_component}-{selected_trace_id}",
+    ):
+        if not objective.strip():
+            st.error("Objective is required")
+        else:
+            with st.spinner("Generating, executing, and evaluating candidate..."):
+                run = api_post(
+                    "/generation-runs",
+                    {
+                        "component_id": selected_component,
+                        "trace_id": selected_trace_id,
+                        "objective": objective.strip(),
+                    },
+                )
+            if run:
+                st.session_state["selected_generation_run_id"] = run["id"]
+                st.success(f"generation run #{run['id']} を作成しました")
+                st.rerun()
+
+    runs = api_get(
+        f"/generation-runs?component_id={selected_component}&trace_id={selected_trace_id}&limit=20"
+    ) or []
+    if not runs:
+        st.caption("まだgeneration runはありません。")
+        return
+
+    st.divider()
+    st.markdown("### Generation runs")
+    run_ids = [run["id"] for run in runs]
+    selected_run_id = st.selectbox(
+        "Run",
+        run_ids,
+        index=run_ids.index(st.session_state.get("selected_generation_run_id"))
+        if st.session_state.get("selected_generation_run_id") in run_ids
+        else 0,
+        format_func=lambda run_id: next(
+            (
+                f"#{run['id']} {fmt_ts(run['created_at'])} "
+                f"{GENERATION_VERDICT_ICON.get(run.get('llm_verdict'), '')} "
+                f"{run.get('llm_verdict')}"
+                for run in runs
+                if run["id"] == run_id
+            ),
+            str(run_id),
+        ),
+        key=f"gen-run-select-{system['id']}-{selected_component}-{selected_trace_id}",
+    )
+    run = next(run for run in runs if run["id"] == selected_run_id)
+    _render_generation_run(run)
+
+
 def render_overview_tab(system: Dict[str, Any]) -> None:
     components: List[Dict[str, Any]] = api_get("/components") or []
     mode_counts = {mode: 0 for mode in MODES}
@@ -1059,7 +1234,7 @@ st.caption(
     f"Last seen: {fmt_ts(selected_system.get('last_seen'))}"
 )
 
-tab_labels = ["Overview", "Connect SDK", "Components", "Settings"]
+tab_labels = ["Overview", "Connect SDK", "Generate & Evaluate", "Components", "Settings"]
 if is_admin:
     tab_labels.append("User Management")
 tabs = st.tabs(tab_labels)
@@ -1069,8 +1244,10 @@ with tabs[0]:
 with tabs[1]:
     render_connect_sdk_tab(selected_system)
 with tabs[2]:
-    render_components_tab(selected_system)
+    render_generate_evaluate_tab(selected_system)
 with tabs[3]:
+    render_components_tab(selected_system)
+with tabs[4]:
     render_system_settings(selected_system)
 if is_admin:
     with tabs[tab_labels.index("User Management")]:

@@ -232,6 +232,27 @@ Dashboard の `Connect SDK` タブでは、選択中 System 用の API token 発
 SDK install command、クライアント環境変数、最小サンプルソース、
 Dockerfile サンプルをまとめて確認・ダウンロードできる。
 
+## Generate & Evaluate
+
+Dashboard の `Generate & Evaluate` タブでは、転送済み trace の入力
+パラメーターを使って候補 Python コードを生成し、同じ入力で実行した結果を
+LLM で評価できる。生成されたコードは保存・ダウンロードできるが、対象
+システムへ自動適用はしない。
+
+Control Server は LLM 呼び出しを `apps/control-server/app/llm.py` に集約しており、
+プロバイダ差分はこの層で吸収する。Compose では `.env` に以下を設定する。
+
+```env
+LLM_PROVIDER=openai   # openai / anthropic / gemini / mock
+LLM_MODEL=gpt-4o-mini
+LLM_API_KEY=...
+LLM_BASE_URL=
+LLM_TIMEOUT=30
+```
+
+`LLM_PROVIDER=mock` はローカルの疎通確認とテスト用で、外部 API は呼ばない。
+実際の評価には `openai` / `anthropic` / `gemini` のいずれかと API key を使う。
+
 ## 認証と Dashboard のログイン方式
 
 現状の Dashboard にはブラウザ上のログイン画面はない。Dashboard は起動時に
