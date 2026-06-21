@@ -202,9 +202,68 @@ class RepositorySnapshot(BaseModel):
     status: Literal["not_configured", "ready", "indexing", "failed"] = "not_configured"
 
 
+SourceType = Literal["documentation", "source", "test", "configuration"]
+SnapshotStatus = Literal["not_configured", "indexing", "ready", "failed"]
+IntelligenceRunStatus = Literal["pending", "completed", "failed"]
+IntelligenceRunType = Literal["system_profile_draft", "feature_map_draft"]
+DecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
+
+
+class RepositoryConfigUpdate(BaseModel):
+    repo_path: str = Field(..., min_length=1)
+    include_patterns: List[str] = Field(default_factory=lambda: ["README.md", "docs/**", "src/**", "tests/**"])
+    exclude_patterns: List[str] = Field(default_factory=lambda: [".env", "secrets/**", "data/**", "*.pem", "*.key", "credentials.*"])
+
+
+class RepositoryConfigOut(BaseModel):
+    system_id: int
+    repo_path: str
+    include_patterns: List[str]
+    exclude_patterns: List[str]
+    created_at: float
+    updated_at: float
+
+
+class SnapshotFileOut(BaseModel):
+    path: str
+    source_type: SourceType
+    size_bytes: int
+
+
+class SnapshotOut(BaseModel):
+    id: int
+    system_id: int
+    commit_sha: str
+    status: SnapshotStatus
+    file_count: int
+    total_size: int
+    error_summary: Optional[str] = None
+    created_at: float
+    completed_at: Optional[float] = None
+    files: List[SnapshotFileOut] = Field(default_factory=list)
+
+
+class IntelligenceRunOut(BaseModel):
+    id: int
+    system_id: int
+    snapshot_id: int
+    run_type: IntelligenceRunType
+    provider: str
+    model: str
+    prompt_version: str
+    schema_version: str
+    decision_method: DecisionMethod
+    status: IntelligenceRunStatus
+    error_details: Optional[str] = None
+    is_mock: bool = False
+    started_at: float
+    completed_at: Optional[float] = None
+
+
 class FeatureEvidence(BaseModel):
     path: str
-    lines: str
+    start_line: int = 0
+    end_line: int = 0
     summary: str = ""
 
 
@@ -263,6 +322,53 @@ class ExperimentSummary(BaseModel):
     variants: List[ExperimentVariant] = Field(default_factory=list)
     metrics: List[str] = Field(default_factory=list)
     interpretation_method: Literal["deterministic", "reasoning_llm", "manual"] = "manual"
+
+
+class SystemProfileDraftOut(BaseModel):
+    id: int
+    system_id: int
+    intelligence_run_id: int
+    snapshot_id: int
+    name: str = ""
+    purpose: str = ""
+    target_users: List[str] = Field(default_factory=list)
+    stakeholder_value: str = ""
+    constraints: List[str] = Field(default_factory=list)
+    success_criteria: List[str] = Field(default_factory=list)
+    evidence: List[FeatureEvidence] = Field(default_factory=list)
+    is_mock: bool = False
+    created_at: float
+
+
+class FeatureDraftOut(BaseModel):
+    id: int
+    system_id: int
+    intelligence_run_id: int
+    snapshot_id: int
+    feature_id: str
+    name: str
+    summary: str
+    user_value: str
+    success_criteria: List[str] = Field(default_factory=list)
+    risks: List[str] = Field(default_factory=list)
+    evidence: List[FeatureEvidence] = Field(default_factory=list)
+    decision_method: DecisionMethod = "reasoning_llm"
+    is_mock: bool = False
+    created_at: float
+
+
+class DraftGenerationResult(BaseModel):
+    intelligence_run: IntelligenceRunOut
+    system_profile_draft: Optional[SystemProfileDraftOut] = None
+    feature_drafts: List[FeatureDraftOut] = Field(default_factory=list)
+
+
+class LatestDraftsOut(BaseModel):
+    system_id: int
+    snapshot: Optional[SnapshotOut] = None
+    intelligence_run: Optional[IntelligenceRunOut] = None
+    system_profile_draft: Optional[SystemProfileDraftOut] = None
+    feature_drafts: List[FeatureDraftOut] = Field(default_factory=list)
 
 
 class ProjectIntelligenceMock(BaseModel):

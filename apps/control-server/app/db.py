@@ -207,6 +207,125 @@ CREATE INDEX IF NOT EXISTS idx_generation_runs_trace
 
 CREATE INDEX IF NOT EXISTS idx_generation_runs_component
     ON generation_runs (system_id, component_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS repository_configs (
+    system_id       INTEGER PRIMARY KEY,
+    repo_path       TEXT NOT NULL,
+    include_patterns TEXT NOT NULL DEFAULT '[]',
+    exclude_patterns TEXT NOT NULL DEFAULT '[]',
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS repository_snapshots (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id       INTEGER NOT NULL,
+    commit_sha      TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'indexing',
+    file_count      INTEGER NOT NULL DEFAULT 0,
+    total_size      INTEGER NOT NULL DEFAULT 0,
+    error_summary   TEXT,
+    created_at      REAL NOT NULL,
+    completed_at    REAL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_system
+    ON repository_snapshots (system_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS snapshot_files (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id     INTEGER NOT NULL,
+    path            TEXT NOT NULL,
+    source_type     TEXT NOT NULL,
+    size_bytes      INTEGER NOT NULL DEFAULT 0,
+    content_hash    TEXT,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshot_files_snapshot
+    ON snapshot_files (snapshot_id);
+
+CREATE TABLE IF NOT EXISTS intelligence_runs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id       INTEGER NOT NULL,
+    snapshot_id     INTEGER NOT NULL,
+    run_type        TEXT NOT NULL,
+    provider        TEXT NOT NULL,
+    model           TEXT NOT NULL,
+    prompt_version  TEXT NOT NULL,
+    schema_version  TEXT NOT NULL,
+    decision_method TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    error_details   TEXT,
+    is_mock         INTEGER NOT NULL DEFAULT 0,
+    started_at      REAL NOT NULL,
+    completed_at    REAL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_intelligence_runs_system
+    ON intelligence_runs (system_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS system_profile_drafts (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id            INTEGER NOT NULL,
+    intelligence_run_id  INTEGER NOT NULL,
+    snapshot_id          INTEGER NOT NULL,
+    name                 TEXT NOT NULL DEFAULT '',
+    purpose              TEXT NOT NULL DEFAULT '',
+    target_users         TEXT NOT NULL DEFAULT '[]',
+    stakeholder_value    TEXT NOT NULL DEFAULT '',
+    constraints          TEXT NOT NULL DEFAULT '[]',
+    success_criteria     TEXT NOT NULL DEFAULT '[]',
+    is_mock              INTEGER NOT NULL DEFAULT 0,
+    created_at           REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_sp_drafts_system
+    ON system_profile_drafts (system_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS feature_drafts (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id            INTEGER NOT NULL,
+    intelligence_run_id  INTEGER NOT NULL,
+    snapshot_id          INTEGER NOT NULL,
+    feature_id           TEXT NOT NULL,
+    name                 TEXT NOT NULL,
+    summary              TEXT NOT NULL DEFAULT '',
+    user_value           TEXT NOT NULL DEFAULT '',
+    success_criteria     TEXT NOT NULL DEFAULT '[]',
+    risks                TEXT NOT NULL DEFAULT '[]',
+    decision_method      TEXT NOT NULL DEFAULT 'reasoning_llm',
+    is_mock              INTEGER NOT NULL DEFAULT 0,
+    created_at           REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_feature_drafts_system
+    ON feature_drafts (system_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS draft_evidence (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id       INTEGER NOT NULL,
+    draft_type      TEXT NOT NULL,
+    draft_id        INTEGER NOT NULL,
+    path            TEXT NOT NULL,
+    start_line      INTEGER NOT NULL DEFAULT 0,
+    end_line        INTEGER NOT NULL DEFAULT 0,
+    summary         TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_draft_evidence_draft
+    ON draft_evidence (draft_type, draft_id);
 """
 
 

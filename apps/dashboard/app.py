@@ -1154,48 +1154,161 @@ def _render_mock_notice(data: Dict[str, Any]) -> None:
         )
 
 
-def render_repository_tab(_system: Dict[str, Any]) -> None:
+def render_repository_tab(system: Dict[str, Any]) -> None:
     st.subheader("Repository")
-    data = _project_intelligence()
-    _render_mock_notice(data)
-    repository = data.get("repository") or {}
-    cols = st.columns(3)
-    cols[0].metric("Status", repository.get("status", "-"))
-    cols[1].metric("Read policy", repository.get("read_policy", "-"))
-    cols[2].metric("Commit", (repository.get("commit_sha") or "-")[:12])
-    st.text_input("Repository path", value=repository.get("repo_path", ""), disabled=True)
-    left, right = st.columns(2)
-    with left:
-        st.markdown("**Included paths**")
-        for path in repository.get("included_paths", []):
-            st.code(path)
-    with right:
-        st.markdown("**Excluded paths**")
-        for path in repository.get("excluded_paths", []):
-            st.code(path)
-    st.button("Create snapshot", disabled=True, help="後続Issueで実装します")
+
+    config = api_get("/repository")
+    snapshot = api_get("/repository/snapshots/latest")
+
+    if snapshot:
+        cols = st.columns(3)
+        cols[0].metric("Status", snapshot.get("status", "-"))
+        cols[1].metric("Files", snapshot.get("file_count", 0))
+        cols[2].metric("Commit", (snapshot.get("commit_sha") or "-")[:12])
+        if snapshot.get("error_summary"):
+            st.error(f"Snapshot error: {snapshot['error_summary']}")
+    else:
+        st.info("スナップショットはまだ作成されていません。")
+
+    st.markdown("### Repository Configuration")
+    with st.form(f"repo-config-{system['id']}"):
+        repo_path = st.text_input(
+            "Repository path",
+            value=(config or {}).get("repo_path", ""),
+        )
+        include_patterns = st.text_area(
+            "Include patterns (1行1パターン)",
+            value="\n".join((config or {}).get("include_patterns", ["README.md", "docs/**", "src/**", "tests/**"])),
+        )
+        exclude_patterns = st.text_area(
+            "Exclude patterns (1行1パターン)",
+            value="\n".join((config or {}).get("exclude_patterns", [".env", "secrets/**", "data/**"])),
+        )
+        if st.form_submit_button("Save configuration"):
+            if not repo_path.strip():
+                st.error("Repository path は必須です")
+            else:
+                result = api_put(
+                    "/repository",
+                    {
+                        "repo_path": repo_path.strip(),
+                        "include_patterns": _lines_to_list(include_patterns),
+                        "exclude_patterns": _lines_to_list(exclude_patterns),
+                    },
+                )
+                if result:
+                    st.success("Repository 設定を保存しました")
+                    st.rerun()
+
+    st.divider()
+
+    if config:
+        if st.button("Create snapshot"):
+            with st.spinner("Snapshot を作成中..."):
+                result = api_post("/repository/snapshots")
+            if result:
+                if result.get("status") == "failed":
+                    st.error(f"Snapshot 作成に失敗しました: {result.get('error_summary', '')}")
+                else:
+                    st.success(
+                        f"Snapshot を作成しました: {result.get('file_count', 0)} files, "
+                        f"commit {(result.get('commit_sha') or '')[:12]}"
+                    )
+                st.rerun()
+
+    if snapshot and snapshot.get("status") == "ready":
+        st.markdown("### Indexed Files")
+        files = snapshot.get("files", [])
+        if files:
+            type_counts: Dict[str, int] = {}
+            for f in files:
+                t = f.get("source_type", "unknown")
+                type_counts[t] = type_counts.get(t, 0) + 1
+            st.caption(
+                " / ".join(f"{t}: {c}" for t, c in sorted(type_counts.items()))
+            )
+            for f in files:
+                st.write(f"- `{f['path']}` ({f['source_type']}, {f['size_bytes']} bytes)")
 
 
-def render_feature_map_tab(_system: Dict[str, Any]) -> None:
+def render_feature_map_tab(system: Dict[str, Any]) -> None:
     st.subheader("Feature Map")
-    data = _project_intelligence()
-    _render_mock_notice(data)
-    for feature in data.get("features", []):
+
+    drafts = api_get("/repository/drafts/latest")
+    if not drafts or (not drafts.get("system_profile_draft") and not drafts.get("feature_drafts")):
+        st.info("ドラフトはまだ生成されていません。Repository タブでスナップショットを作成し、下のボタンでドラフトを生成してください。")
+        snapshot = api_get("/repository/snapshots/latest")
+        if snapshot and snapshot.get("status") == "ready":
+            if st.button("Generate drafts"):
+                with st.spinner("ドラフトを生成中 (LLM 呼び出し)..."):
+                    result = api_post("/repository/drafts/generate")
+                if result:
+                    run = result.get("intelligence_run", {})
+                    if run.get("status") == "failed":
+                        st.error(f"生成に失敗しました: {run.get('error_details', '')}")
+                    else:
+                        st.success("ドラフトを生成しました")
+                    st.rerun()
+        return
+
+    run = drafts.get("intelligence_run")
+    if run:
+        if run.get("is_mock"):
+            st.warning("このドラフトは mock provider で生成されたテスト/開発用データです。")
+        st.caption(
+            f"Provider: {run.get('provider', '-')} / Model: {run.get('model', '-')} / "
+            f"Decision: {run.get('decision_method', '-')}"
+        )
+
+    sp = drafts.get("system_profile_draft")
+    if sp:
+        with st.expander("System Profile Draft", expanded=True):
+            st.markdown(f"**Name:** {sp.get('name', '')}")
+            st.write(sp.get("purpose", ""))
+            st.markdown(f"**User value:** {sp.get('stakeholder_value', '')}")
+            if sp.get("target_users"):
+                st.markdown("**Target users:** " + ", ".join(sp["target_users"]))
+            if sp.get("constraints"):
+                st.markdown("**Constraints**")
+                for c in sp["constraints"]:
+                    st.write(f"- {c}")
+            if sp.get("success_criteria"):
+                st.markdown("**Success criteria**")
+                for s in sp["success_criteria"]:
+                    st.write(f"- {s}")
+            if sp.get("evidence"):
+                st.markdown("**Evidence**")
+                for ev in sp["evidence"]:
+                    line_range = f"L{ev.get('start_line', '?')}-{ev.get('end_line', '?')}"
+                    st.write(f"- `{ev['path']}` ({line_range}): {ev.get('summary', '')}")
+
+    for feature in drafts.get("feature_drafts", []):
         with st.expander(f"{feature['name']} · {feature['feature_id']}", expanded=True):
             st.write(feature.get("summary", ""))
             st.markdown(f"**User value:** {feature.get('user_value', '')}")
-            st.markdown("**Success criteria**")
-            for criterion in feature.get("success_criteria", []):
-                st.write(f"- {criterion}")
-            st.markdown("**Evidence**")
-            for evidence in feature.get("evidence", []):
-                st.write(
-                    f"- `{evidence['path']}` ({evidence['lines']}): "
-                    f"{evidence.get('summary', '')}"
-                )
-            if feature.get("code_links"):
-                st.markdown("**Code links**")
-                st.dataframe(feature["code_links"], use_container_width=True)
+            if feature.get("success_criteria"):
+                st.markdown("**Success criteria**")
+                for criterion in feature["success_criteria"]:
+                    st.write(f"- {criterion}")
+            if feature.get("risks"):
+                st.markdown("**Risks**")
+                for risk in feature["risks"]:
+                    st.write(f"- {risk}")
+            if feature.get("evidence"):
+                st.markdown("**Evidence**")
+                for ev in feature["evidence"]:
+                    line_range = f"L{ev.get('start_line', '?')}-{ev.get('end_line', '?')}"
+                    st.write(f"- `{ev['path']}` ({line_range}): {ev.get('summary', '')}")
+
+    st.divider()
+    snapshot = api_get("/repository/snapshots/latest")
+    if snapshot and snapshot.get("status") == "ready":
+        if st.button("Re-generate drafts"):
+            with st.spinner("ドラフトを再生成中..."):
+                result = api_post("/repository/drafts/generate")
+            if result:
+                st.success("ドラフトを再生成しました")
+                st.rerun()
 
 
 def render_probe_planner_tab(_system: Dict[str, Any]) -> None:

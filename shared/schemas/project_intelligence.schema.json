@@ -2,6 +2,117 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://probe-agent.dev/schemas/project_intelligence.json",
   "title": "ProjectIntelligence",
+  "description": "Combined schema for project intelligence mock (legacy) and real repository understanding endpoints.",
+  "definitions": {
+    "FeatureEvidence": {
+      "type": "object",
+      "required": ["path", "start_line", "end_line", "summary"],
+      "properties": {
+        "path": { "type": "string" },
+        "start_line": { "type": "integer", "minimum": 0 },
+        "end_line": { "type": "integer", "minimum": 0 },
+        "summary": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "RepositoryConfig": {
+      "type": "object",
+      "required": ["system_id", "repo_path", "include_patterns", "exclude_patterns"],
+      "properties": {
+        "system_id": { "type": "integer" },
+        "repo_path": { "type": "string" },
+        "include_patterns": { "type": "array", "items": { "type": "string" } },
+        "exclude_patterns": { "type": "array", "items": { "type": "string" } },
+        "created_at": { "type": "number" },
+        "updated_at": { "type": "number" }
+      }
+    },
+    "SnapshotFile": {
+      "type": "object",
+      "required": ["path", "source_type", "size_bytes"],
+      "properties": {
+        "path": { "type": "string" },
+        "source_type": { "enum": ["documentation", "source", "test", "configuration"] },
+        "size_bytes": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "Snapshot": {
+      "type": "object",
+      "required": ["id", "system_id", "commit_sha", "status", "file_count", "total_size"],
+      "properties": {
+        "id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "commit_sha": { "type": "string" },
+        "status": { "enum": ["not_configured", "indexing", "ready", "failed"] },
+        "file_count": { "type": "integer", "minimum": 0 },
+        "total_size": { "type": "integer", "minimum": 0 },
+        "error_summary": { "type": ["string", "null"] },
+        "created_at": { "type": "number" },
+        "completed_at": { "type": ["number", "null"] },
+        "files": { "type": "array", "items": { "$ref": "#/definitions/SnapshotFile" } }
+      }
+    },
+    "IntelligenceRun": {
+      "type": "object",
+      "required": ["id", "system_id", "snapshot_id", "run_type", "provider", "model", "decision_method", "status"],
+      "properties": {
+        "id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "snapshot_id": { "type": "integer" },
+        "run_type": { "enum": ["system_profile_draft", "feature_map_draft"] },
+        "provider": { "type": "string" },
+        "model": { "type": "string" },
+        "prompt_version": { "type": "string" },
+        "schema_version": { "type": "string" },
+        "decision_method": { "enum": ["deterministic", "reasoning_llm", "manual"] },
+        "status": { "enum": ["pending", "completed", "failed"] },
+        "error_details": { "type": ["string", "null"] },
+        "is_mock": { "type": "boolean" },
+        "started_at": { "type": "number" },
+        "completed_at": { "type": ["number", "null"] }
+      }
+    },
+    "SystemProfileDraft": {
+      "type": "object",
+      "required": ["id", "system_id", "intelligence_run_id", "snapshot_id"],
+      "properties": {
+        "id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "intelligence_run_id": { "type": "integer" },
+        "snapshot_id": { "type": "integer" },
+        "name": { "type": "string" },
+        "purpose": { "type": "string" },
+        "target_users": { "type": "array", "items": { "type": "string" } },
+        "stakeholder_value": { "type": "string" },
+        "constraints": { "type": "array", "items": { "type": "string" } },
+        "success_criteria": { "type": "array", "items": { "type": "string" } },
+        "evidence": { "type": "array", "items": { "$ref": "#/definitions/FeatureEvidence" } },
+        "is_mock": { "type": "boolean" },
+        "created_at": { "type": "number" }
+      }
+    },
+    "FeatureDraft": {
+      "type": "object",
+      "required": ["id", "system_id", "intelligence_run_id", "snapshot_id", "feature_id", "name"],
+      "properties": {
+        "id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "intelligence_run_id": { "type": "integer" },
+        "snapshot_id": { "type": "integer" },
+        "feature_id": { "type": "string" },
+        "name": { "type": "string" },
+        "summary": { "type": "string" },
+        "user_value": { "type": "string" },
+        "success_criteria": { "type": "array", "items": { "type": "string" } },
+        "risks": { "type": "array", "items": { "type": "string" } },
+        "evidence": { "type": "array", "items": { "$ref": "#/definitions/FeatureEvidence" } },
+        "decision_method": { "enum": ["deterministic", "reasoning_llm", "manual"] },
+        "is_mock": { "type": "boolean" },
+        "created_at": { "type": "number" }
+      }
+    }
+  },
   "type": "object",
   "required": ["system_id", "mock", "reasoning_model_required", "deterministic_decision_policy", "repository", "system_profile_draft", "features", "probe_plans", "experiments"],
   "properties": {
