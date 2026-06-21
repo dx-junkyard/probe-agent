@@ -211,6 +211,7 @@ IntelligenceRunType = Literal[
     "feature_map_draft",
     "symbol_index",
     "feature_code_mapping",
+    "probe_plan",
 ]
 DecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
 
@@ -446,6 +447,95 @@ class FeatureCodeLinksOut(BaseModel):
 
 class LinkReviewUpdate(BaseModel):
     review_status: LinkReviewStatus
+
+
+ProbePointStatus = Literal["proposed", "approved", "rejected"]
+ProbePlanStatus = Literal["proposed", "approved", "rejected"]
+
+
+class ProbePointOut(BaseModel):
+    id: int
+    plan_id: int
+    system_id: int
+    component_id: str
+    feature_id: str
+    path: str
+    symbol: str
+    line_start: int
+    line_end: int
+    reason: str
+    recommended_mode: str
+    side_effect_risk: Literal["low", "medium", "high"]
+    replayability: str
+    denylist_hit: Optional[str] = None
+    status: ProbePointStatus = "proposed"
+    created_at: float
+    updated_at: float
+
+
+class ProbePlanOut(BaseModel):
+    id: int
+    system_id: int
+    snapshot_id: int
+    intelligence_run_id: int
+    feature_id: str
+    objective: str
+    status: ProbePlanStatus
+    avoid_reasons: List[str] = Field(default_factory=list)
+    probe_points: List[ProbePointOut] = Field(default_factory=list)
+    intelligence_run: Optional[IntelligenceRunOut] = None
+    is_mock: bool = False
+    created_at: float
+    updated_at: float
+
+
+class ProbePointStatusUpdate(BaseModel):
+    status: ProbePointStatus
+
+
+class ValidationCommandOut(BaseModel):
+    id: int
+    command: str
+    exit_code: int
+    duration_ms: float
+    stdout: str
+    stderr: str
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
+    timed_out: bool = False
+
+
+class ValidationRunOut(BaseModel):
+    id: int
+    patch_id: int
+    system_id: int
+    variant: str
+    worktree_path: str
+    overall_success: bool
+    total_duration_ms: float
+    commands: List[ValidationCommandOut] = Field(default_factory=list)
+    error: Optional[str] = None
+    created_at: float
+
+
+class ProbePatchOut(BaseModel):
+    id: int
+    plan_id: int
+    system_id: int
+    snapshot_id: int
+    commit_sha: str
+    diff: str
+    skipped: List[str] = Field(default_factory=list)
+    status: str
+    error: Optional[str] = None
+    validation_runs: List[ValidationRunOut] = Field(default_factory=list)
+    created_at: float
+
+
+class ProbePlansListOut(BaseModel):
+    system_id: int
+    plans: List[ProbePlanOut] = Field(default_factory=list)
+    is_mock: bool = False
 
 
 class ProjectIntelligenceMock(BaseModel):

@@ -60,7 +60,7 @@
         "id": { "type": "integer" },
         "system_id": { "type": "integer" },
         "snapshot_id": { "type": "integer" },
-        "run_type": { "enum": ["repository_drafts", "system_profile_draft", "feature_map_draft", "symbol_index", "feature_code_mapping"] },
+        "run_type": { "enum": ["repository_drafts", "system_profile_draft", "feature_map_draft", "symbol_index", "feature_code_mapping", "probe_plan"] },
         "provider": { "type": "string" },
         "model": { "type": "string" },
         "prompt_version": { "type": "string" },
@@ -158,6 +158,102 @@
         "updated_at": { "type": "number" }
       },
       "additionalProperties": false
+    },
+    "ProbePoint": {
+      "type": "object",
+      "required": ["id", "plan_id", "system_id", "component_id", "feature_id", "path", "symbol", "line_start", "line_end", "reason", "recommended_mode", "side_effect_risk", "replayability", "status"],
+      "properties": {
+        "id": { "type": "integer" },
+        "plan_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "component_id": { "type": "string" },
+        "feature_id": { "type": "string" },
+        "path": { "type": "string" },
+        "symbol": { "type": "string" },
+        "line_start": { "type": "integer", "minimum": 1 },
+        "line_end": { "type": "integer", "minimum": 1 },
+        "reason": { "type": "string" },
+        "recommended_mode": { "enum": ["trace", "shadow"] },
+        "side_effect_risk": { "enum": ["none", "low", "medium", "high"] },
+        "replayability": { "enum": ["safe", "caution", "unsafe"] },
+        "denylist_hit": { "type": ["string", "null"] },
+        "status": { "enum": ["proposed", "approved", "rejected"] },
+        "created_at": { "type": "number" },
+        "updated_at": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    "ProbePlan": {
+      "type": "object",
+      "required": ["id", "system_id", "snapshot_id", "intelligence_run_id", "feature_id", "objective", "status"],
+      "properties": {
+        "id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "snapshot_id": { "type": "integer" },
+        "intelligence_run_id": { "type": "integer" },
+        "feature_id": { "type": "string" },
+        "objective": { "type": "string" },
+        "status": { "enum": ["proposed", "approved", "rejected"] },
+        "avoid_reasons": { "type": "array", "items": { "type": "string" } },
+        "probe_points": { "type": "array", "items": { "$ref": "#/definitions/ProbePoint" } },
+        "intelligence_run": { "$ref": "#/definitions/IntelligenceRun" },
+        "created_at": { "type": "number" },
+        "updated_at": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    "ProbePatch": {
+      "type": "object",
+      "required": ["id", "plan_id", "system_id", "snapshot_id", "commit_sha", "status"],
+      "properties": {
+        "id": { "type": "integer" },
+        "plan_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "snapshot_id": { "type": "integer" },
+        "commit_sha": { "type": "string" },
+        "diff": { "type": "string" },
+        "worktree_path": { "type": "string" },
+        "skipped": { "type": "array", "items": { "type": "string" } },
+        "status": { "enum": ["generated", "failed"] },
+        "error": { "type": ["string", "null"] },
+        "validation_runs": { "type": "array", "items": { "$ref": "#/definitions/ValidationRun" } },
+        "created_at": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    "ValidationCommand": {
+      "type": "object",
+      "required": ["id", "run_id", "command", "exit_code", "duration_ms"],
+      "properties": {
+        "id": { "type": "integer" },
+        "run_id": { "type": "integer" },
+        "command": { "type": "string" },
+        "exit_code": { "type": "integer" },
+        "duration_ms": { "type": "number" },
+        "stdout": { "type": "string" },
+        "stderr": { "type": "string" },
+        "stdout_truncated": { "type": "boolean" },
+        "stderr_truncated": { "type": "boolean" },
+        "timed_out": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "ValidationRun": {
+      "type": "object",
+      "required": ["id", "patch_id", "system_id", "variant", "overall_success"],
+      "properties": {
+        "id": { "type": "integer" },
+        "patch_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "variant": { "enum": ["baseline", "probed"] },
+        "worktree_path": { "type": "string" },
+        "overall_success": { "type": "boolean" },
+        "total_duration_ms": { "type": "number" },
+        "error": { "type": ["string", "null"] },
+        "commands": { "type": "array", "items": { "$ref": "#/definitions/ValidationCommand" } },
+        "created_at": { "type": "number" }
+      },
+      "additionalProperties": false
     }
   },
   "type": "object",
@@ -182,7 +278,7 @@
     },
     "system_profile_draft": { "type": "object" },
     "features": { "type": "array", "items": { "type": "object" } },
-    "probe_plans": { "type": "array", "items": { "type": "object" } },
+    "probe_plans": { "type": "array", "items": { "$ref": "#/definitions/ProbePlan" } },
     "experiments": { "type": "array", "items": { "type": "object" } }
   },
   "additionalProperties": false

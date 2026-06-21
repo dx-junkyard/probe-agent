@@ -38,8 +38,13 @@ from ..models import (
     IntelligenceRunOut,
     LatestDraftsOut,
     LinkReviewUpdate,
+    ProbePatchOut,
     ProbePlan,
+    ProbePlanOut,
+    ProbePlansListOut,
     ProbePoint,
+    ProbePointOut,
+    ProbePointStatusUpdate,
     ProjectIntelligenceMock,
     RepositoryConfigOut,
     RepositoryConfigUpdate,
@@ -50,6 +55,8 @@ from ..models import (
     SymbolIndexWarningOut,
     SystemProfile,
     SystemProfileDraftOut,
+    ValidationCommandOut,
+    ValidationRunOut,
 )
 
 router = APIRouter()
@@ -1245,7 +1252,687 @@ def review_code_link(
 
 
 # ---------------------------------------------------------------------------
-# Legacy mock endpoint — kept for Probe Planner / Experiments tabs
+# Probe Plan generation (reasoning model)
+# ---------------------------------------------------------------------------
+
+
+def _probe_point_out(row) -> ProbePointOut:
+    return ProbePointOut(
+        id=row["id"],
+        plan_id=row["plan_id"],
+        system_id=row["system_id"],
+        component_id=row["component_id"],
+        feature_id=row["feature_id"],
+        path=row["path"],
+        symbol=row["symbol"],
+        line_start=row["line_start"],
+        line_end=row["line_end"],
+        reason=row["reason"],
+        recommended_mode=row["recommended_mode"],
+        side_effect_risk=row["side_effect_risk"],
+        replayability=row["replayability"],
+        denylist_hit=row["denylist_hit"],
+        status=row["status"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _probe_plan_out(conn, plan_row, include_run: bool = True) -> ProbePlanOut:
+    point_rows = conn.execute(
+        "SELECT * FROM probe_points WHERE plan_id = ? ORDER BY id",
+        (plan_row["id"],),
+    ).fetchall()
+
+    run_out = None
+    is_mock = False
+    if include_run:
+        run_row = conn.execute(
+            "SELECT * FROM intelligence_runs WHERE id = ?",
+            (plan_row["intelligence_run_id"],),
+        ).fetchone()
+        if run_row:
+            run_out = _intelligence_run_out(run_row)
+            is_mock = bool(run_row["is_mock"])
+
+    avoid_rows = conn.execute(
+        """SELECT summary FROM draft_evidence
+           WHERE draft_type = 'probe_plan_avoid' AND draft_id = ?""",
+        (plan_row["id"],),
+    ).fetchall()
+
+    return ProbePlanOut(
+        id=plan_row["id"],
+        system_id=plan_row["system_id"],
+        snapshot_id=plan_row["snapshot_id"],
+        intelligence_run_id=plan_row["intelligence_run_id"],
+        feature_id=plan_row["feature_id"],
+        objective=plan_row["objective"],
+        status=plan_row["status"],
+        avoid_reasons=[r["summary"] for r in avoid_rows],
+        probe_points=[_probe_point_out(r) for r in point_rows],
+        intelligence_run=run_out,
+        is_mock=is_mock,
+        created_at=plan_row["created_at"],
+        updated_at=plan_row["updated_at"],
+    )
+
+
+@router.post(
+    "/repository/probe-plans/generate",
+    response_model=ProbePlanOut,
+    status_code=201,
+)
+def generate_probe_plan_endpoint(
+    feature_id: str,
+    system_id: int = Depends(get_system_id),
+) -> ProbePlanOut:
+    from ..probe_planner import AcceptedLink, generate_probe_plan
+    from ..probe_planner import PROMPT_VERSION as PLAN_PROMPT_VERSION
+    from ..probe_planner import SCHEMA_VERSION as PLAN_SCHEMA_VERSION
+
+    with get_conn() as conn:
+        snapshot_row = conn.execute(
+            """SELECT * FROM repository_snapshots
+               WHERE system_id = ? ORDER BY id DESC LIMIT 1""",
+            (system_id,),
+        ).fetchone()
+    if snapshot_row is None or snapshot_row["status"] != "ready":
+        raise HTTPException(
+            status_code=400,
+            detail="Latest snapshot is not ready.",
+        )
+    snapshot_id = snapshot_row["id"]
+
+    with get_conn() as conn:
+        fd_row = conn.execute(
+            """SELECT fd.* FROM feature_drafts fd
+               JOIN intelligence_runs ir ON fd.intelligence_run_id = ir.id
+               WHERE fd.system_id = ? AND fd.feature_id = ?
+                 AND ir.status = 'completed'
+               ORDER BY fd.id DESC LIMIT 1""",
+            (system_id, feature_id),
+        ).fetchone()
+    if fd_row is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No completed feature draft found for feature_id: {feature_id}",
+        )
+
+    with get_conn() as conn:
+        link_rows = conn.execute(
+            """SELECT fcl.*, cs.path AS sym_path, cs.qualified_name, cs.kind,
+                      cs.start_line, cs.end_line, cs.decorators, cs.component_id,
+                      cs.is_test, cs.docstring
+               FROM feature_code_links fcl
+               JOIN code_symbols cs ON fcl.symbol_id = cs.id
+               WHERE fcl.system_id = ? AND fcl.feature_id = ?
+                 AND fcl.review_status = 'accepted'
+               ORDER BY fcl.confidence DESC""",
+            (system_id, feature_id),
+        ).fetchall()
+    if not link_rows:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No accepted code links for feature: {feature_id}. Accept links first.",
+        )
+
+    accepted_links = []
+    for lr in link_rows:
+        accepted_links.append(AcceptedLink(
+            feature_id=lr["feature_id"],
+            symbol_qualified_name=lr["qualified_name"],
+            symbol_path=lr["sym_path"],
+            symbol_kind=lr["kind"],
+            start_line=lr["start_line"],
+            end_line=lr["end_line"],
+            decorators=json.loads(lr["decorators"]),
+            component_id=lr["component_id"],
+            is_test=bool(lr["is_test"]),
+            docstring=lr["docstring"],
+            relation_reason=lr["relation_reason"],
+        ))
+
+    llm_config = LLMConfig.from_env()
+    intelligence_provider = os.getenv("INTELLIGENCE_LLM_PROVIDER", "").strip()
+    intelligence_model = os.getenv("INTELLIGENCE_LLM_MODEL", "").strip()
+    if intelligence_provider or intelligence_model:
+        llm_config = replace(
+            llm_config,
+            provider=intelligence_provider or llm_config.provider,
+            model=intelligence_model or llm_config.model,
+        )
+
+    started_at = time.time()
+    try:
+        if llm_config.provider != "mock" and not is_reasoning_model(
+            llm_config.provider, llm_config.model
+        ):
+            raise LLMError(
+                "Probe plan generation requires a configured reasoning model"
+            )
+        llm_client = create_llm_client(llm_config)
+        plan_result = generate_probe_plan(
+            llm_client,
+            llm_config,
+            feature_id=feature_id,
+            feature_name=fd_row["name"],
+            feature_summary=fd_row["summary"],
+            feature_user_value=fd_row["user_value"],
+            feature_success_criteria=json.loads(fd_row["success_criteria"]),
+            feature_risks=json.loads(fd_row["risks"]),
+            accepted_links=accepted_links,
+        )
+    except LLMError as exc:
+        from ..probe_planner import PlanResult
+        plan_result = PlanResult(
+            provider=llm_config.provider,
+            model=llm_config.model,
+            is_mock=llm_config.provider == "mock",
+            feature_id=feature_id,
+            objective="",
+            probe_points=[],
+            avoid_reasons=[],
+            error=str(exc),
+        )
+    completed_at = time.time()
+
+    status = "completed" if plan_result.error is None else "failed"
+    now = time.time()
+
+    with get_conn() as conn:
+        conn.execute("BEGIN")
+        try:
+            cur = conn.execute(
+                """INSERT INTO intelligence_runs
+                       (system_id, snapshot_id, run_type, provider, model,
+                        prompt_version, schema_version, decision_method,
+                        status, error_details, is_mock, started_at, completed_at)
+                   VALUES (?, ?, 'probe_plan', ?, ?, ?, ?, 'reasoning_llm',
+                           ?, ?, ?, ?, ?)""",
+                (
+                    system_id, snapshot_id,
+                    plan_result.provider, plan_result.model,
+                    PLAN_PROMPT_VERSION, PLAN_SCHEMA_VERSION,
+                    status, plan_result.error,
+                    1 if plan_result.is_mock else 0,
+                    started_at, completed_at,
+                ),
+            )
+            run_id = cur.lastrowid
+
+            cur = conn.execute(
+                """INSERT INTO probe_plans
+                       (system_id, snapshot_id, intelligence_run_id,
+                        feature_id, objective, status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'proposed', ?, ?)""",
+                (
+                    system_id, snapshot_id, run_id,
+                    feature_id, plan_result.objective,
+                    now, now,
+                ),
+            )
+            plan_id = cur.lastrowid
+
+            for point in plan_result.probe_points:
+                conn.execute(
+                    """INSERT INTO probe_points
+                           (plan_id, system_id, component_id, feature_id,
+                            path, symbol, line_start, line_end, reason,
+                            recommended_mode, side_effect_risk, replayability,
+                            denylist_hit, status, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?)""",
+                    (
+                        plan_id, system_id, point.component_id, point.feature_id,
+                        point.path, point.symbol, point.line_start, point.line_end,
+                        point.reason, point.recommended_mode, point.side_effect_risk,
+                        point.replayability, point.denylist_hit,
+                        now, now,
+                    ),
+                )
+
+            for avoid_reason in plan_result.avoid_reasons:
+                conn.execute(
+                    """INSERT INTO draft_evidence
+                           (system_id, draft_type, draft_id, path,
+                            start_line, end_line, summary)
+                       VALUES (?, 'probe_plan_avoid', ?, '', 0, 0, ?)""",
+                    (system_id, plan_id, avoid_reason),
+                )
+
+            plan_row = conn.execute(
+                "SELECT * FROM probe_plans WHERE id = ?", (plan_id,),
+            ).fetchone()
+            result = _probe_plan_out(conn, plan_row)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    return result
+
+
+@router.get("/repository/probe-plans", response_model=ProbePlansListOut)
+def get_probe_plans(
+    system_id: int = Depends(get_system_id),
+) -> ProbePlansListOut:
+    with get_conn() as conn:
+        plan_rows = conn.execute(
+            "SELECT * FROM probe_plans WHERE system_id = ? ORDER BY id DESC",
+            (system_id,),
+        ).fetchall()
+        plans = [_probe_plan_out(conn, row) for row in plan_rows]
+        is_mock = any(p.is_mock for p in plans)
+    return ProbePlansListOut(system_id=system_id, plans=plans, is_mock=is_mock)
+
+
+@router.get("/repository/probe-plans/{plan_id}", response_model=ProbePlanOut)
+def get_probe_plan(
+    plan_id: int,
+    system_id: int = Depends(get_system_id),
+) -> ProbePlanOut:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM probe_plans WHERE id = ? AND system_id = ?",
+            (plan_id, system_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Probe plan not found")
+        return _probe_plan_out(conn, row)
+
+
+@router.put(
+    "/repository/probe-points/{point_id}/status",
+    response_model=ProbePointOut,
+)
+def update_probe_point_status(
+    point_id: int,
+    payload: ProbePointStatusUpdate,
+    system_id: int = Depends(get_system_id),
+) -> ProbePointOut:
+    now = time.time()
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM probe_points WHERE id = ? AND system_id = ?",
+            (point_id, system_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Probe point not found")
+        conn.execute(
+            """UPDATE probe_points SET status = ?, updated_at = ? WHERE id = ?""",
+            (payload.status, now, point_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM probe_points WHERE id = ?", (point_id,),
+        ).fetchone()
+        return _probe_point_out(row)
+
+
+# ---------------------------------------------------------------------------
+# Patch generation
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/repository/probe-plans/{plan_id}/patch",
+    response_model=ProbePatchOut,
+    status_code=201,
+)
+def generate_patch_endpoint(
+    plan_id: int,
+    system_id: int = Depends(get_system_id),
+) -> ProbePatchOut:
+    from ..patch_generator import ApprovedPoint, generate_patch
+
+    with get_conn() as conn:
+        plan_row = conn.execute(
+            "SELECT * FROM probe_plans WHERE id = ? AND system_id = ?",
+            (plan_id, system_id),
+        ).fetchone()
+    if plan_row is None:
+        raise HTTPException(status_code=404, detail="Probe plan not found")
+
+    snapshot_id = plan_row["snapshot_id"]
+    with get_conn() as conn:
+        snapshot_row = conn.execute(
+            "SELECT * FROM repository_snapshots WHERE id = ?",
+            (snapshot_id,),
+        ).fetchone()
+        config_row = conn.execute(
+            "SELECT * FROM repository_configs WHERE system_id = ?",
+            (system_id,),
+        ).fetchone()
+    if snapshot_row is None or snapshot_row["status"] != "ready":
+        raise HTTPException(status_code=400, detail="Snapshot is not ready")
+    if config_row is None:
+        raise HTTPException(status_code=400, detail="Repository is not configured")
+
+    with get_conn() as conn:
+        point_rows = conn.execute(
+            """SELECT * FROM probe_points
+               WHERE plan_id = ? AND status = 'approved'
+               ORDER BY path, line_start""",
+            (plan_id,),
+        ).fetchall()
+    if not point_rows:
+        raise HTTPException(
+            status_code=400,
+            detail="No approved probe points. Approve points before generating a patch.",
+        )
+
+    approved = [
+        ApprovedPoint(
+            component_id=r["component_id"],
+            path=r["path"],
+            symbol=r["symbol"],
+            recommended_mode=r["recommended_mode"],
+            line_start=r["line_start"],
+            line_end=r["line_end"],
+        )
+        for r in point_rows
+    ]
+
+    worktree_base = os.getenv("PROBE_WORKTREE_BASE", "/tmp/probe-worktrees")
+    os.makedirs(worktree_base, exist_ok=True)
+
+    patch_result = generate_patch(
+        repo_path=config_row["repo_path"],
+        commit_sha=snapshot_row["commit_sha"],
+        approved_points=approved,
+        worktree_base=worktree_base,
+    )
+
+    now = time.time()
+    patch_status = "generated" if patch_result.error is None else "failed"
+
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO probe_patches
+                   (plan_id, system_id, snapshot_id, commit_sha, diff,
+                    worktree_path, skipped, status, error, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                plan_id, system_id, snapshot_id,
+                snapshot_row["commit_sha"], patch_result.diff,
+                patch_result.worktree_path,
+                json.dumps(patch_result.skipped),
+                patch_status, patch_result.error, now,
+            ),
+        )
+        patch_id = cur.lastrowid
+        row = conn.execute(
+            "SELECT * FROM probe_patches WHERE id = ?", (patch_id,),
+        ).fetchone()
+
+    return ProbePatchOut(
+        id=row["id"],
+        plan_id=row["plan_id"],
+        system_id=row["system_id"],
+        snapshot_id=row["snapshot_id"],
+        commit_sha=row["commit_sha"],
+        diff=row["diff"],
+        skipped=json.loads(row["skipped"]),
+        status=row["status"],
+        error=row["error"],
+        created_at=row["created_at"],
+    )
+
+
+@router.get("/repository/probe-patches", response_model=List[ProbePatchOut])
+def list_probe_patches(
+    system_id: int = Depends(get_system_id),
+) -> List[ProbePatchOut]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM probe_patches WHERE system_id = ? ORDER BY id DESC",
+            (system_id,),
+        ).fetchall()
+        results = []
+        for row in rows:
+            val_rows = conn.execute(
+                "SELECT * FROM validation_runs WHERE patch_id = ? ORDER BY id",
+                (row["id"],),
+            ).fetchall()
+            validation_runs = []
+            for vr in val_rows:
+                cmd_rows = conn.execute(
+                    "SELECT * FROM validation_commands WHERE run_id = ? ORDER BY id",
+                    (vr["id"],),
+                ).fetchall()
+                validation_runs.append(ValidationRunOut(
+                    id=vr["id"],
+                    patch_id=vr["patch_id"],
+                    system_id=vr["system_id"],
+                    variant=vr["variant"],
+                    worktree_path=vr["worktree_path"],
+                    overall_success=bool(vr["overall_success"]),
+                    total_duration_ms=vr["total_duration_ms"],
+                    commands=[
+                        ValidationCommandOut(
+                            id=cr["id"],
+                            command=cr["command"],
+                            exit_code=cr["exit_code"],
+                            duration_ms=cr["duration_ms"],
+                            stdout=cr["stdout"],
+                            stderr=cr["stderr"],
+                            stdout_truncated=bool(cr["stdout_truncated"]),
+                            stderr_truncated=bool(cr["stderr_truncated"]),
+                            timed_out=bool(cr["timed_out"]),
+                        )
+                        for cr in cmd_rows
+                    ],
+                    error=vr["error"],
+                    created_at=vr["created_at"],
+                ))
+            results.append(ProbePatchOut(
+                id=row["id"],
+                plan_id=row["plan_id"],
+                system_id=row["system_id"],
+                snapshot_id=row["snapshot_id"],
+                commit_sha=row["commit_sha"],
+                diff=row["diff"],
+                skipped=json.loads(row["skipped"]),
+                status=row["status"],
+                error=row["error"],
+                validation_runs=validation_runs,
+                created_at=row["created_at"],
+            ))
+    return results
+
+
+@router.get("/repository/probe-patches/{patch_id}", response_model=ProbePatchOut)
+def get_probe_patch(
+    patch_id: int,
+    system_id: int = Depends(get_system_id),
+) -> ProbePatchOut:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM probe_patches WHERE id = ? AND system_id = ?",
+            (patch_id, system_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Patch not found")
+
+        val_rows = conn.execute(
+            "SELECT * FROM validation_runs WHERE patch_id = ? ORDER BY id",
+            (patch_id,),
+        ).fetchall()
+
+        validation_runs = []
+        for vr in val_rows:
+            cmd_rows = conn.execute(
+                "SELECT * FROM validation_commands WHERE run_id = ? ORDER BY id",
+                (vr["id"],),
+            ).fetchall()
+            validation_runs.append(ValidationRunOut(
+                id=vr["id"],
+                patch_id=vr["patch_id"],
+                system_id=vr["system_id"],
+                variant=vr["variant"],
+                worktree_path=vr["worktree_path"],
+                overall_success=bool(vr["overall_success"]),
+                total_duration_ms=vr["total_duration_ms"],
+                commands=[
+                    ValidationCommandOut(
+                        id=cr["id"],
+                        command=cr["command"],
+                        exit_code=cr["exit_code"],
+                        duration_ms=cr["duration_ms"],
+                        stdout=cr["stdout"],
+                        stderr=cr["stderr"],
+                        stdout_truncated=bool(cr["stdout_truncated"]),
+                        stderr_truncated=bool(cr["stderr_truncated"]),
+                        timed_out=bool(cr["timed_out"]),
+                    )
+                    for cr in cmd_rows
+                ],
+                error=vr["error"],
+                created_at=vr["created_at"],
+            ))
+
+    return ProbePatchOut(
+        id=row["id"],
+        plan_id=row["plan_id"],
+        system_id=row["system_id"],
+        snapshot_id=row["snapshot_id"],
+        commit_sha=row["commit_sha"],
+        diff=row["diff"],
+        skipped=json.loads(row["skipped"]),
+        status=row["status"],
+        error=row["error"],
+        validation_runs=validation_runs,
+        created_at=row["created_at"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/repository/probe-patches/{patch_id}/validate",
+    response_model=ProbePatchOut,
+    status_code=201,
+)
+def validate_patch_endpoint(
+    patch_id: int,
+    system_id: int = Depends(get_system_id),
+) -> ProbePatchOut:
+    from ..patch_generator import ApprovedPoint, create_worktree, cleanup_worktree
+    from ..validation_runner import load_validation_config, run_validation
+
+    with get_conn() as conn:
+        patch_row = conn.execute(
+            "SELECT * FROM probe_patches WHERE id = ? AND system_id = ?",
+            (patch_id, system_id),
+        ).fetchone()
+    if patch_row is None:
+        raise HTTPException(status_code=404, detail="Patch not found")
+    if patch_row["status"] == "failed":
+        raise HTTPException(status_code=400, detail="Cannot validate a failed patch")
+
+    with get_conn() as conn:
+        config_row = conn.execute(
+            "SELECT * FROM repository_configs WHERE system_id = ?",
+            (system_id,),
+        ).fetchone()
+    if config_row is None:
+        raise HTTPException(status_code=400, detail="Repository is not configured")
+
+    repo_path = config_row["repo_path"]
+    commit_sha = patch_row["commit_sha"]
+
+    config_path = os.path.join(repo_path, "probe-agent.yml")
+    if not os.path.isfile(config_path):
+        config_path_alt = os.path.join(repo_path, "probe-agent.example.yml")
+        if os.path.isfile(config_path_alt):
+            config_path = config_path_alt
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="probe-agent.yml not found in repository",
+            )
+
+    try:
+        val_config = load_validation_config(config_path)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid probe-agent.yml: {exc}",
+        )
+
+    worktree_base = os.getenv("PROBE_WORKTREE_BASE", "/tmp/probe-worktrees")
+    os.makedirs(worktree_base, exist_ok=True)
+
+    baseline_worktree = None
+    probed_worktree = patch_row["worktree_path"]
+    now = time.time()
+
+    try:
+        baseline_worktree = create_worktree(
+            repo_path, commit_sha, worktree_base + "/baseline",
+        )
+    except GitError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create baseline worktree: {exc}",
+        )
+
+    try:
+        baseline_result = run_validation("baseline", baseline_worktree, val_config)
+
+        if probed_worktree and os.path.isdir(probed_worktree):
+            probed_result = run_validation("probed", probed_worktree, val_config)
+        else:
+            probed_result = None
+    finally:
+        if baseline_worktree:
+            cleanup_worktree(repo_path, baseline_worktree)
+
+    with get_conn() as conn:
+        conn.execute("BEGIN")
+        try:
+            for result in [baseline_result] + ([probed_result] if probed_result else []):
+                cur = conn.execute(
+                    """INSERT INTO validation_runs
+                           (patch_id, system_id, variant, worktree_path,
+                            overall_success, total_duration_ms, error, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        patch_id, system_id, result.variant,
+                        result.worktree_path,
+                        1 if result.overall_success else 0,
+                        result.total_duration_ms,
+                        result.error, now,
+                    ),
+                )
+                run_id = cur.lastrowid
+                for cmd in result.results:
+                    conn.execute(
+                        """INSERT INTO validation_commands
+                               (run_id, command, exit_code, duration_ms,
+                                stdout, stderr, stdout_truncated,
+                                stderr_truncated, timed_out)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            run_id, cmd.command, cmd.exit_code,
+                            cmd.duration_ms, cmd.stdout, cmd.stderr,
+                            1 if cmd.stdout_truncated else 0,
+                            1 if cmd.stderr_truncated else 0,
+                            1 if cmd.timed_out else 0,
+                        ),
+                    )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    return get_probe_patch(patch_id, system_id)
+
+
+# ---------------------------------------------------------------------------
+# Legacy mock endpoint — kept for Experiments tab
 # ---------------------------------------------------------------------------
 
 

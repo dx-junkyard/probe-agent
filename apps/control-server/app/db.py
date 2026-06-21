@@ -401,6 +401,109 @@ CREATE INDEX IF NOT EXISTS idx_feature_code_links_run
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_feature_code_links_run_symbol
     ON feature_code_links (intelligence_run_id, feature_id, symbol_id);
+
+CREATE TABLE IF NOT EXISTS probe_plans (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id            INTEGER NOT NULL,
+    snapshot_id          INTEGER NOT NULL,
+    intelligence_run_id  INTEGER NOT NULL,
+    feature_id           TEXT NOT NULL,
+    objective            TEXT NOT NULL DEFAULT '',
+    status               TEXT NOT NULL DEFAULT 'proposed',
+    created_at           REAL NOT NULL,
+    updated_at           REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_probe_plans_system
+    ON probe_plans (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_probe_plans_feature
+    ON probe_plans (system_id, feature_id);
+
+CREATE TABLE IF NOT EXISTS probe_points (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id              INTEGER NOT NULL,
+    system_id            INTEGER NOT NULL,
+    component_id         TEXT NOT NULL,
+    feature_id           TEXT NOT NULL,
+    path                 TEXT NOT NULL,
+    symbol               TEXT NOT NULL,
+    line_start           INTEGER NOT NULL,
+    line_end             INTEGER NOT NULL,
+    reason               TEXT NOT NULL,
+    recommended_mode     TEXT NOT NULL DEFAULT 'trace',
+    side_effect_risk     TEXT NOT NULL DEFAULT 'low',
+    replayability        TEXT NOT NULL DEFAULT '',
+    denylist_hit         TEXT,
+    status               TEXT NOT NULL DEFAULT 'proposed',
+    created_at           REAL NOT NULL,
+    updated_at           REAL NOT NULL,
+    FOREIGN KEY (plan_id) REFERENCES probe_plans (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_probe_points_plan
+    ON probe_points (plan_id);
+
+CREATE INDEX IF NOT EXISTS idx_probe_points_system
+    ON probe_points (system_id, plan_id);
+
+CREATE TABLE IF NOT EXISTS probe_patches (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id              INTEGER NOT NULL,
+    system_id            INTEGER NOT NULL,
+    snapshot_id          INTEGER NOT NULL,
+    commit_sha           TEXT NOT NULL,
+    diff                 TEXT NOT NULL DEFAULT '',
+    worktree_path        TEXT,
+    skipped              TEXT NOT NULL DEFAULT '[]',
+    status               TEXT NOT NULL DEFAULT 'generated',
+    error                TEXT,
+    created_at           REAL NOT NULL,
+    FOREIGN KEY (plan_id) REFERENCES probe_plans (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_probe_patches_plan
+    ON probe_patches (plan_id);
+
+CREATE TABLE IF NOT EXISTS validation_runs (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    patch_id             INTEGER NOT NULL,
+    system_id            INTEGER NOT NULL,
+    variant              TEXT NOT NULL,
+    worktree_path        TEXT NOT NULL,
+    overall_success      INTEGER NOT NULL DEFAULT 0,
+    total_duration_ms    REAL NOT NULL DEFAULT 0.0,
+    error                TEXT,
+    created_at           REAL NOT NULL,
+    FOREIGN KEY (patch_id) REFERENCES probe_patches (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_validation_runs_patch
+    ON validation_runs (patch_id);
+
+CREATE TABLE IF NOT EXISTS validation_commands (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id               INTEGER NOT NULL,
+    command              TEXT NOT NULL,
+    exit_code            INTEGER NOT NULL,
+    duration_ms          REAL NOT NULL DEFAULT 0.0,
+    stdout               TEXT NOT NULL DEFAULT '',
+    stderr               TEXT NOT NULL DEFAULT '',
+    stdout_truncated     INTEGER NOT NULL DEFAULT 0,
+    stderr_truncated     INTEGER NOT NULL DEFAULT 0,
+    timed_out            INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (run_id) REFERENCES validation_runs (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_validation_commands_run
+    ON validation_commands (run_id);
 """
 
 

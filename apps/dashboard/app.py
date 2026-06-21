@@ -1445,19 +1445,178 @@ def render_feature_map_tab(system: Dict[str, Any]) -> None:
                 st.button("Generate code links", disabled=True, help="先にドラフトを生成してください")
 
 
-def render_probe_planner_tab(_system: Dict[str, Any]) -> None:
+def render_probe_planner_tab(system: Dict[str, Any]) -> None:
     st.subheader("Probe Planner")
-    data = _project_intelligence()
-    _render_mock_notice(data)
-    for plan in data.get("probe_plans", []):
-        st.markdown(f"### {plan['feature_id']}")
-        st.write(plan.get("objective", ""))
-        st.dataframe(plan.get("probe_points", []), use_container_width=True)
-        if plan.get("avoid_probe_points"):
-            st.markdown("**Avoid**")
-            for point in plan["avoid_probe_points"]:
-                st.write(f"- {point}")
-    st.button("Generate temporary probe patch", disabled=True, help="後続Issueで実装します")
+
+    plans_data = api_get("/repository/probe-plans")
+    plans = (plans_data or {}).get("plans", [])
+
+    if plans_data and plans_data.get("is_mock"):
+        st.warning("Probe plans は mock provider で生成されたテスト用データです。")
+
+    if not plans:
+        st.info(
+            "Probe Plan はまだ生成されていません。Feature Map タブで "
+            "コードリンクを accept した後、下のボタンで生成してください。"
+        )
+
+    drafts = api_get("/repository/drafts/latest")
+    feature_drafts = (drafts or {}).get("feature_drafts", [])
+    feature_ids = [f["feature_id"] for f in feature_drafts] if feature_drafts else []
+
+    if feature_ids:
+        col_sel, col_btn = st.columns([3, 1])
+        with col_sel:
+            selected_feature = st.selectbox(
+                "Feature を選択",
+                feature_ids,
+                key="probe_plan_feature",
+            )
+        with col_btn:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("Generate probe plan"):
+                with st.spinner("Probe plan を生成中 (LLM 呼び出し)..."):
+                    result = api_post(
+                        f"/repository/probe-plans/generate?feature_id={selected_feature}"
+                    )
+                if result:
+                    run = result.get("intelligence_run", {})
+                    if run.get("status") == "failed":
+                        st.error(f"生成に失敗しました: {run.get('error_details', '')}")
+                    else:
+                        st.success("Probe plan を生成しました")
+                    st.rerun()
+
+    for plan in plans:
+        plan_id = plan.get("id", "?")
+        status_icon = {
+            "proposed": "🔶",
+            "approved": "✅",
+            "rejected": "❌",
+        }.get(plan.get("status", ""), "·")
+
+        with st.expander(
+            f"{status_icon} Plan #{plan_id} · {plan.get('feature_id', '?')} · {plan.get('status', '?')}",
+            expanded=True,
+        ):
+            st.write(plan.get("objective", ""))
+
+            run = plan.get("intelligence_run")
+            if run:
+                if run.get("is_mock"):
+                    st.warning("この plan は mock provider で生成されたテスト用データです。")
+                st.caption(
+                    f"Provider: {run.get('provider', '-')} / Model: {run.get('model', '-')} / "
+                    f"Decision: {run.get('decision_method', '-')}"
+                )
+
+            if plan.get("avoid_reasons"):
+                st.markdown("**Avoid reasons**")
+                for reason in plan["avoid_reasons"]:
+                    st.write(f"- {reason}")
+
+            st.markdown("**Probe Points**")
+            for point in plan.get("probe_points", []):
+                point_id = point.get("id", "?")
+                p_status = point.get("status", "?")
+                p_icon = {"proposed": "🔶", "approved": "✅", "rejected": "❌"}.get(p_status, "·")
+                denylist = point.get("denylist_hit")
+
+                st.markdown(
+                    f"{p_icon} `{point.get('symbol', '?')}` "
+                    f"({point.get('path', '?')}:{point.get('line_start', '?')}-{point.get('line_end', '?')}) "
+                    f"· mode: {point.get('recommended_mode', '?')} · risk: {point.get('side_effect_risk', '?')} "
+                    f"· replay: {point.get('replayability', '?')}"
+                )
+                if denylist:
+                    st.error(f"Denylist hit: {denylist}")
+                st.caption(f"Reason: {point.get('reason', '')}")
+
+                if isinstance(point_id, int):
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        if p_status != "approved":
+                            if st.button("Approve", key=f"approve-point-{point_id}"):
+                                api_put(
+                                    f"/repository/probe-points/{point_id}/status",
+                                    {"status": "approved"},
+                                )
+                                st.rerun()
+                    with c2:
+                        if p_status != "rejected":
+                            if st.button("Reject", key=f"reject-point-{point_id}"):
+                                api_put(
+                                    f"/repository/probe-points/{point_id}/status",
+                                    {"status": "rejected"},
+                                )
+                                st.rerun()
+
+            st.divider()
+            if st.button("Generate patch", key=f"gen-patch-{plan_id}"):
+                with st.spinner("Patch を生成中..."):
+                    patch = api_post(f"/repository/probe-plans/{plan_id}/patch")
+                if patch:
+                    if patch.get("status") == "failed":
+                        st.error(f"Patch 生成に失敗しました: {patch.get('error', '')}")
+                    else:
+                        st.success(f"Patch を生成しました (patch #{patch.get('id')})")
+                    st.rerun()
+
+    st.divider()
+    st.markdown("### Patches")
+    patches = api_get("/repository/probe-patches") or []
+    if not patches:
+        st.caption("パッチはまだ生成されていません。")
+    for patch in patches:
+        patch_id = patch.get("id", "?")
+        p_status = patch.get("status", "?")
+        with st.expander(
+            f"Patch #{patch_id} · plan #{patch.get('plan_id', '?')} · {p_status}",
+            expanded=False,
+        ):
+            if patch.get("error"):
+                st.error(patch["error"])
+            if patch.get("diff"):
+                st.code(patch["diff"], language="diff")
+            if patch.get("skipped"):
+                st.markdown("**Skipped**")
+                for s in patch["skipped"]:
+                    st.write(f"- {s}")
+
+            val_runs = patch.get("validation_runs", [])
+            if val_runs:
+                st.markdown("**Validation Runs**")
+                for vr in val_runs:
+                    ok = vr.get("overall_success")
+                    icon = "✅" if ok else "❌"
+                    st.markdown(
+                        f"{icon} **{vr.get('variant', '?')}** · "
+                        f"{vr.get('total_duration_ms', 0):.0f}ms"
+                    )
+                    if vr.get("error"):
+                        st.error(vr["error"])
+                    for cmd in vr.get("commands", []):
+                        cmd_ok = cmd.get("exit_code", -1) == 0
+                        cmd_icon = "✅" if cmd_ok else "❌"
+                        st.caption(
+                            f"{cmd_icon} `{cmd.get('command', '?')}` "
+                            f"exit={cmd.get('exit_code')} "
+                            f"({cmd.get('duration_ms', 0):.0f}ms)"
+                        )
+                        if cmd.get("timed_out"):
+                            st.warning("Timed out")
+                        if cmd.get("stderr") and not cmd_ok:
+                            st.code(cmd["stderr"][:500], language="text")
+            else:
+                if p_status == "generated":
+                    if st.button("Run validation", key=f"validate-{patch_id}"):
+                        with st.spinner("Validation を実行中..."):
+                            result = api_post(
+                                f"/repository/probe-patches/{patch_id}/validate"
+                            )
+                        if result:
+                            st.success("Validation を実行しました")
+                            st.rerun()
 
 
 def render_experiments_tab(_system: Dict[str, Any]) -> None:
