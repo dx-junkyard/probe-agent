@@ -14,6 +14,7 @@ commands:
   test:
     - pytest
   smoke: []
+  workload: []
 
 runtime:
   network: false
@@ -21,6 +22,10 @@ runtime:
   env:
     PROBE_ENABLED: "true"
     PROBE_DEFAULT_MODE: "trace"
+
+experiment:
+  result_artifact_path: .probe-agent/experiment-result.json
+  artifact_retention_seconds: 86400
 
 intelligence:
   # Open-ended inference must use an external reasoning model.

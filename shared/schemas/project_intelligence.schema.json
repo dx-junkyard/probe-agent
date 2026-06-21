@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://probe-agent.dev/schemas/project_intelligence.json",
-  "title": "ProjectIntelligence",
-  "description": "Combined schema for project intelligence mock (legacy) and real repository understanding endpoints.",
+  "title": "Project Intelligence API Contracts",
+  "description": "Reusable schemas for the repository intelligence, probe planning, validation, and experiment APIs.",
   "definitions": {
     "FeatureEvidence": {
       "type": "object",
@@ -39,10 +39,11 @@
     },
     "Snapshot": {
       "type": "object",
-      "required": ["id", "system_id", "commit_sha", "status", "file_count", "total_size"],
+      "required": ["id", "system_id", "repo_path", "commit_sha", "status", "file_count", "total_size"],
       "properties": {
         "id": { "type": "integer" },
         "system_id": { "type": "integer" },
+        "repo_path": { "type": "string" },
         "commit_sha": { "type": "string" },
         "status": { "enum": ["not_configured", "indexing", "ready", "failed"] },
         "file_count": { "type": "integer", "minimum": 0 },
@@ -60,7 +61,7 @@
         "id": { "type": "integer" },
         "system_id": { "type": "integer" },
         "snapshot_id": { "type": "integer" },
-        "run_type": { "enum": ["repository_drafts", "system_profile_draft", "feature_map_draft", "symbol_index", "feature_code_mapping"] },
+        "run_type": { "enum": ["repository_drafts", "system_profile_draft", "feature_map_draft", "symbol_index", "feature_code_mapping", "probe_plan"] },
         "provider": { "type": "string" },
         "model": { "type": "string" },
         "prompt_version": { "type": "string" },
@@ -158,32 +159,110 @@
         "updated_at": { "type": "number" }
       },
       "additionalProperties": false
-    }
-  },
-  "type": "object",
-  "required": ["system_id", "mock", "reasoning_model_required", "deterministic_decision_policy", "repository", "system_profile_draft", "features", "probe_plans", "experiments"],
-  "properties": {
-    "system_id": { "type": "integer" },
-    "mock": { "type": "boolean" },
-    "reasoning_model_required": { "const": true },
-    "deterministic_decision_policy": { "type": "string" },
-    "repository": {
+    },
+    "ProbePoint": {
       "type": "object",
-      "required": ["repo_path", "commit_sha", "included_paths", "excluded_paths", "read_policy", "status"],
+      "required": ["id", "plan_id", "system_id", "component_id", "feature_id", "path", "symbol", "line_start", "line_end", "reason", "recommended_mode", "side_effect_risk", "replayability", "status"],
       "properties": {
-        "repo_path": { "type": "string" },
-        "commit_sha": { "type": "string" },
-        "included_paths": { "type": "array", "items": { "type": "string" } },
-        "excluded_paths": { "type": "array", "items": { "type": "string" } },
-        "read_policy": { "const": "committed_files_only" },
-        "status": { "enum": ["not_configured", "ready", "indexing", "failed"] }
+        "id": { "type": "integer" },
+        "plan_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "component_id": { "type": "string" },
+        "feature_id": { "type": "string" },
+        "path": { "type": "string" },
+        "symbol": { "type": "string" },
+        "line_start": { "type": "integer", "minimum": 1 },
+        "line_end": { "type": "integer", "minimum": 1 },
+        "reason": { "type": "string" },
+        "recommended_mode": { "enum": ["trace", "shadow"] },
+        "side_effect_risk": { "enum": ["none", "low", "medium", "high"] },
+        "replayability": { "enum": ["safe", "caution", "unsafe"] },
+        "denylist_hit": { "type": ["string", "null"] },
+        "status": { "enum": ["proposed", "approved", "rejected"] },
+        "created_at": { "type": "number" },
+        "updated_at": { "type": "number" }
       },
       "additionalProperties": false
     },
-    "system_profile_draft": { "type": "object" },
-    "features": { "type": "array", "items": { "type": "object" } },
-    "probe_plans": { "type": "array", "items": { "type": "object" } },
-    "experiments": { "type": "array", "items": { "type": "object" } }
+    "ProbePlan": {
+      "type": "object",
+      "required": ["id", "system_id", "snapshot_id", "intelligence_run_id", "feature_id", "objective", "status"],
+      "properties": {
+        "id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "snapshot_id": { "type": "integer" },
+        "intelligence_run_id": { "type": "integer" },
+        "feature_id": { "type": "string" },
+        "objective": { "type": "string" },
+        "status": { "enum": ["proposed", "approved", "rejected"] },
+        "avoid_reasons": { "type": "array", "items": { "type": "string" } },
+        "probe_points": { "type": "array", "items": { "$ref": "#/definitions/ProbePoint" } },
+        "intelligence_run": { "$ref": "#/definitions/IntelligenceRun" },
+        "created_at": { "type": "number" },
+        "updated_at": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    "ProbePatch": {
+      "type": "object",
+      "required": ["id", "plan_id", "system_id", "snapshot_id", "commit_sha", "status"],
+      "properties": {
+        "id": { "type": "integer" },
+        "plan_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "snapshot_id": { "type": "integer" },
+        "commit_sha": { "type": "string" },
+        "diff": { "type": "string" },
+        "worktree_path": { "type": "string" },
+        "skipped": { "type": "array", "items": { "type": "string" } },
+        "status": { "enum": ["generated", "failed"] },
+        "error": { "type": ["string", "null"] },
+        "cleanup_state": { "type": "string" },
+        "cleanup_error": { "type": ["string", "null"] },
+        "validation_runs": { "type": "array", "items": { "$ref": "#/definitions/ValidationRun" } },
+        "created_at": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    "ValidationCommand": {
+      "type": "object",
+      "required": ["id", "run_id", "command", "exit_code", "duration_ms"],
+      "properties": {
+        "id": { "type": "integer" },
+        "run_id": { "type": "integer" },
+        "command": { "type": "string" },
+        "exit_code": { "type": "integer" },
+        "duration_ms": { "type": "number" },
+        "stdout": { "type": "string" },
+        "stderr": { "type": "string" },
+        "stdout_truncated": { "type": "boolean" },
+        "stderr_truncated": { "type": "boolean" },
+        "timed_out": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "ValidationRun": {
+      "type": "object",
+      "required": ["id", "patch_id", "system_id", "variant", "overall_success"],
+      "properties": {
+        "id": { "type": "integer" },
+        "patch_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "variant": { "enum": ["baseline", "probed"] },
+        "worktree_path": { "type": "string" },
+        "overall_success": { "type": "boolean" },
+        "total_duration_ms": { "type": "number" },
+        "trace_received": { "type": ["boolean", "null"] },
+        "trace_status": { "type": "string" },
+        "network_isolation": { "type": "string" },
+        "cleanup_state": { "type": "string" },
+        "cleanup_error": { "type": ["string", "null"] },
+        "error": { "type": ["string", "null"] },
+        "commands": { "type": "array", "items": { "$ref": "#/definitions/ValidationCommand" } },
+        "created_at": { "type": "number" }
+      },
+      "additionalProperties": false
+    }
   },
-  "additionalProperties": false
+  "type": "object"
 }

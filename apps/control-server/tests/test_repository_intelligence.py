@@ -898,25 +898,3 @@ class TestRepositorySchemaMigration:
                 for row in migrated.execute("PRAGMA table_info(snapshot_files)")
             }
         assert "content" in columns
-
-
-# ---------------------------------------------------------------------------
-# Legacy mock endpoint
-# ---------------------------------------------------------------------------
-
-
-class TestLegacyMockEndpoint:
-    def test_project_intelligence_mock_contract(self, admin_client):
-        token = _login(admin_client)
-        system = _create_system(admin_client, token, "MockContract")
-        r = admin_client.get(
-            "/project-intelligence",
-            headers=_headers(token, system["id"]),
-        )
-        assert r.status_code == 200
-        body = r.json()
-        assert body["mock"] is True
-        assert body["reasoning_model_required"] is True
-        assert body["repository"]["read_policy"] == "committed_files_only"
-        assert body["probe_plans"][0]["probe_points"][0]["status"] == "proposed"
-        assert body["experiments"][0]["status"] == "draft"

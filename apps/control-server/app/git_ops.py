@@ -13,7 +13,7 @@ import os
 import posixpath
 import subprocess
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 MAX_FILE_SIZE = 512 * 1024  # 512 KiB per file
 MAX_TOTAL_SIZE = 5 * 1024 * 1024  # 5 MiB total payload to LLM
@@ -54,13 +54,18 @@ class GitTreeEntry:
 
 
 def _run_git(
-    repo_path: str, args: List[str], *, timeout: int = 30
+    repo_path: str,
+    args: List[str],
+    *,
+    timeout: int = 30,
+    input_bytes: Optional[bytes] = None,
 ) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
             ["git", "-c", f"safe.directory={repo_path}", "-C", repo_path] + args,
             capture_output=True,
             timeout=timeout,
+            input=input_bytes,
         )
     except FileNotFoundError as exc:
         raise GitError("git is not installed or not on PATH") from exc

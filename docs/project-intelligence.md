@@ -85,25 +85,18 @@ mount し、Dashboard には container 側の path を設定する。
 JSON Schema は [`shared/schemas/project_intelligence.schema.json`](../shared/schemas/project_intelligence.schema.json)
 を参照する。
 
-## 現在の Mock
+## 実装状態
 
-`GET /project-intelligence` は上記データ契約の代表データを返す。
-Dashboard の以下のタブはこのレスポンスを表示する。
-
-- Repository
-- Feature Map
-- Probe Planner
-- Experiments
-
-レスポンスには必ず `mock: true` が含まれる。現時点では Git 操作、永続化、AST 解析、
-LLM 抽出、worktree 作成、コマンド実行を行わない。
+Repository、Feature Map、Probe Planner、Experiments は実データAPIへ接続されている。
+旧 `GET /project-intelligence` Mock endpoint は廃止した。LLM mock providerは自動テスト
+とlocal smoke用途に限定し、reasoning必須処理では実結果を生成しない。
 
 ## 実装フェーズ
 
 ### Phase 6: Repository Understanding MVP
 
 - System ごとに repository 設定を保存する。
-- `git ls-files` / `git show <sha>:<path>` で committed files のみ読む。
+- `git ls-tree <sha>` / `git show <sha>:<path>` で committed files のみ読む。
 - evidence 付き System Profile Draft と Feature Map Draft を生成・保存する。
 - draft 生成は reasoning model の LLM API を必須とする。
 
@@ -123,9 +116,13 @@ LLM 抽出、worktree 作成、コマンド実行を行わない。
 ### Phase 9: Experiment Runner MVP
 
 - baseline と source patch variants を隔離 workspace で実行する。
+- command、env、timeout、artifact設定はpinned snapshot内の
+  `probe-agent.yml`からのみ読み込む。
+- networkは常に無効とし、sandboxを確立できない場合は実行しない。
 - test、trace、shadow、evaluation、duration を同じ条件で比較する。
 - 数値集計は決定的に行い、自由記述の比較解釈・推奨は reasoning model で行う。
-- 採用候補 patch と根拠を提示するが、対象 repo には自動適用しない。
+- 採用候補 patch と根拠を提示するが、対象 repo には自動適用しない。人間が採用する場合は、
+  完了済みの非baseline variantと判断根拠を明示して記録する。
 
 ## リポジトリ設定案
 

@@ -168,10 +168,15 @@ def api_put(path: str, payload: Dict[str, Any]) -> Optional[Any]:
         return None
 
 
-def api_post(path: str, payload: Optional[Dict[str, Any]] = None) -> Optional[Any]:
+def api_post(
+    path: str,
+    payload: Optional[Dict[str, Any]] = None,
+    *,
+    timeout: float = 5,
+) -> Optional[Any]:
     try:
         r = requests.post(
-            f"{SERVER_URL}{path}", json=payload, headers=_auth_headers(), timeout=5
+            f"{SERVER_URL}{path}", json=payload, headers=_auth_headers(), timeout=timeout
         )
         r.raise_for_status()
         if r.status_code == 204 or not r.content:
@@ -1138,22 +1143,6 @@ def render_system_settings(system: Dict[str, Any]) -> None:
             st.rerun()
 
 
-def _project_intelligence() -> Dict[str, Any]:
-    return api_get("/project-intelligence") or {}
-
-
-def _render_mock_notice(data: Dict[str, Any]) -> None:
-    if data.get("mock"):
-        st.warning(
-            "この画面は契約確認用Mockです。Git snapshot、解析、保存、patch実行はまだ行いません。"
-        )
-    if data.get("reasoning_model_required"):
-        st.caption(
-            "判断方針: 少数の明示的な有限集合への分類だけ決定的ルールを許可し、"
-            "自由度のある推論は reasoning model のLLM APIを必須とします。"
-        )
-
-
 def render_repository_tab(system: Dict[str, Any]) -> None:
     st.subheader("Repository")
 
@@ -1445,34 +1434,444 @@ def render_feature_map_tab(system: Dict[str, Any]) -> None:
                 st.button("Generate code links", disabled=True, help="先にドラフトを生成してください")
 
 
-def render_probe_planner_tab(_system: Dict[str, Any]) -> None:
+def render_probe_planner_tab(system: Dict[str, Any]) -> None:
     st.subheader("Probe Planner")
-    data = _project_intelligence()
-    _render_mock_notice(data)
-    for plan in data.get("probe_plans", []):
-        st.markdown(f"### {plan['feature_id']}")
-        st.write(plan.get("objective", ""))
-        st.dataframe(plan.get("probe_points", []), use_container_width=True)
-        if plan.get("avoid_probe_points"):
-            st.markdown("**Avoid**")
-            for point in plan["avoid_probe_points"]:
-                st.write(f"- {point}")
-    st.button("Generate temporary probe patch", disabled=True, help="後続Issueで実装します")
+
+    plans_data = api_get("/repository/probe-plans")
+    plans = (plans_data or {}).get("plans", [])
+
+    if plans_data and plans_data.get("is_mock"):
+        st.warning("Probe plans は mock provider で生成されたテスト用データです。")
+
+    if not plans:
+        st.info(
+            "Probe Plan はまだ生成されていません。Feature Map タブで "
+            "コードリンクを accept した後、下のボタンで生成してください。"
+        )
+
+    drafts = api_get("/repository/drafts/latest")
+    feature_drafts = (drafts or {}).get("feature_drafts", [])
+    feature_ids = [f["feature_id"] for f in feature_drafts] if feature_drafts else []
+
+    if feature_ids:
+        col_sel, col_btn = st.columns([3, 1])
+        with col_sel:
+            selected_feature = st.selectbox(
+                "Feature を選択",
+                feature_ids,
+                key="probe_plan_feature",
+            )
+        with col_btn:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("Generate probe plan"):
+                with st.spinner("Probe plan を生成中 (LLM 呼び出し)..."):
+                    result = api_post(
+                        f"/repository/probe-plans/generate?feature_id={selected_feature}"
+                    )
+                if result:
+                    run = result.get("intelligence_run", {})
+                    if run.get("status") == "failed":
+                        st.error(f"生成に失敗しました: {run.get('error_details', '')}")
+                    else:
+                        st.success("Probe plan を生成しました")
+                    st.rerun()
+
+    for plan in plans:
+        plan_id = plan.get("id", "?")
+        status_icon = {
+            "proposed": "🔶",
+            "approved": "✅",
+            "rejected": "❌",
+        }.get(plan.get("status", ""), "·")
+
+        with st.expander(
+            f"{status_icon} Plan #{plan_id} · {plan.get('feature_id', '?')} · {plan.get('status', '?')}",
+            expanded=True,
+        ):
+            st.write(plan.get("objective", ""))
+
+            run = plan.get("intelligence_run")
+            if run:
+                if run.get("is_mock"):
+                    st.warning("この plan は mock provider で生成されたテスト用データです。")
+                st.caption(
+                    f"Provider: {run.get('provider', '-')} / Model: {run.get('model', '-')} / "
+                    f"Decision: {run.get('decision_method', '-')}"
+                )
+
+            if plan.get("avoid_reasons"):
+                st.markdown("**Avoid reasons**")
+                for reason in plan["avoid_reasons"]:
+                    st.write(f"- {reason}")
+
+            st.markdown("**Probe Points**")
+            for point in plan.get("probe_points", []):
+                point_id = point.get("id", "?")
+                p_status = point.get("status", "?")
+                p_icon = {"proposed": "🔶", "approved": "✅", "rejected": "❌"}.get(p_status, "·")
+                denylist = point.get("denylist_hit")
+
+                st.markdown(
+                    f"{p_icon} `{point.get('symbol', '?')}` "
+                    f"({point.get('path', '?')}:{point.get('line_start', '?')}-{point.get('line_end', '?')}) "
+                    f"· mode: {point.get('recommended_mode', '?')} · risk: {point.get('side_effect_risk', '?')} "
+                    f"· replay: {point.get('replayability', '?')}"
+                )
+                if denylist:
+                    st.error(f"Denylist hit: {denylist}")
+                st.caption(f"Reason: {point.get('reason', '')}")
+
+                if isinstance(point_id, int):
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        if p_status != "approved":
+                            if st.button("Approve", key=f"approve-point-{point_id}"):
+                                api_put(
+                                    f"/repository/probe-points/{point_id}/status",
+                                    {"status": "approved"},
+                                )
+                                st.rerun()
+                    with c2:
+                        if p_status != "rejected":
+                            if st.button("Reject", key=f"reject-point-{point_id}"):
+                                api_put(
+                                    f"/repository/probe-points/{point_id}/status",
+                                    {"status": "rejected"},
+                                )
+                                st.rerun()
+
+            st.divider()
+            if st.button("Generate patch", key=f"gen-patch-{plan_id}"):
+                with st.spinner("Patch を生成中..."):
+                    patch = api_post(f"/repository/probe-plans/{plan_id}/patch")
+                if patch:
+                    if patch.get("status") == "failed":
+                        st.error(f"Patch 生成に失敗しました: {patch.get('error', '')}")
+                    else:
+                        st.success(f"Patch を生成しました (patch #{patch.get('id')})")
+                    st.rerun()
+
+    st.divider()
+    st.markdown("### Patches")
+    patches = api_get("/repository/probe-patches") or []
+    if not patches:
+        st.caption("パッチはまだ生成されていません。")
+    for patch in patches:
+        patch_id = patch.get("id", "?")
+        p_status = patch.get("status", "?")
+        with st.expander(
+            f"Patch #{patch_id} · plan #{patch.get('plan_id', '?')} · {p_status}",
+            expanded=False,
+        ):
+            if patch.get("error"):
+                st.error(patch["error"])
+            if patch.get("diff"):
+                st.code(patch["diff"], language="diff")
+                st.download_button(
+                    "Download diff",
+                    data=patch["diff"],
+                    file_name=f"probe-patch-{patch_id}.diff",
+                    mime="text/x-diff",
+                    key=f"download-patch-{patch_id}",
+                )
+            if patch.get("skipped"):
+                st.markdown("**Skipped**")
+                for s in patch["skipped"]:
+                    st.write(f"- {s}")
+
+            val_runs = patch.get("validation_runs", [])
+            if val_runs:
+                st.markdown("**Validation Runs**")
+                for vr in val_runs:
+                    ok = vr.get("overall_success")
+                    icon = "✅" if ok else "❌"
+                    st.markdown(
+                        f"{icon} **{vr.get('variant', '?')}** · "
+                        f"{vr.get('total_duration_ms', 0):.0f}ms"
+                    )
+                    if vr.get("error"):
+                        st.error(vr["error"])
+                    trace_status = vr.get("trace_status", "not_checked")
+                    if vr.get("variant") == "probed":
+                        if trace_status == "received":
+                            st.success("Trace received")
+                        elif trace_status == "missing":
+                            st.warning("Trace missing")
+                    st.caption(
+                        f"network isolation: {vr.get('network_isolation', 'not_requested')} · "
+                        f"workspace cleanup: {vr.get('cleanup_state', 'not_attempted')}"
+                    )
+                    if vr.get("cleanup_error"):
+                        st.error(
+                            f"Cleanup failed for {vr.get('worktree_path', '')}: "
+                            f"{vr['cleanup_error']}"
+                        )
+                    for cmd in vr.get("commands", []):
+                        cmd_ok = cmd.get("exit_code", -1) == 0
+                        cmd_icon = "✅" if cmd_ok else "❌"
+                        st.caption(
+                            f"{cmd_icon} `{cmd.get('command', '?')}` "
+                            f"exit={cmd.get('exit_code')} "
+                            f"({cmd.get('duration_ms', 0):.0f}ms)"
+                        )
+                        if cmd.get("timed_out"):
+                            st.warning("Timed out")
+                        if cmd.get("stderr") and not cmd_ok:
+                            st.code(cmd["stderr"][:500], language="text")
+            else:
+                if p_status == "generated":
+                    if st.button("Run validation", key=f"validate-{patch_id}"):
+                        with st.spinner("Validation を実行中..."):
+                            result = api_post(
+                                f"/repository/probe-patches/{patch_id}/validate"
+                            )
+                        if result:
+                            st.success("Validation を実行しました")
+                            st.rerun()
 
 
 def render_experiments_tab(_system: Dict[str, Any]) -> None:
     st.subheader("Experiments")
-    data = _project_intelligence()
-    _render_mock_notice(data)
-    for experiment in data.get("experiments", []):
+    st.caption(
+        "Pinned commit から baseline と source patch variants を独立 worktree に展開し、"
+        "同一 command / env / network policy で比較します。対象 repository は変更しません。"
+    )
+    snapshots = api_get("/repository/snapshots") or []
+    ready_snapshots = [item for item in snapshots if item.get("status") == "ready"]
+    if not ready_snapshots:
+        st.info("Repository タブで ready snapshot を作成してください。")
+        return
+
+    with st.expander("Create experiment", expanded=False):
+        with st.form("create-experiment-form"):
+            snapshot_id = st.selectbox(
+                "Pinned snapshot",
+                [item["id"] for item in ready_snapshots],
+                format_func=lambda value: next(
+                    (
+                        f"#{item['id']} {item['commit_sha'][:12]}"
+                        for item in ready_snapshots
+                        if item["id"] == value
+                    ),
+                    str(value),
+                ),
+            )
+            feature_id = st.text_input("feature_id")
+            objective = st.text_area("objective")
+            st.caption(
+                "実行command、env、timeoutはpinned snapshot内の"
+                "`probe-agent.yml`から読み込みます。Dashboard/APIから任意commandは指定できません。"
+            )
+            st.markdown("**Source patch variant 1**")
+            variant_1_label = st.text_input("label", key="experiment-v1-label")
+            variant_1_risk = st.text_input("risk note", key="experiment-v1-risk")
+            variant_1_patch = st.text_area(
+                "unified diff", key="experiment-v1-patch", height=180
+            )
+            st.markdown("**Source patch variant 2**")
+            variant_2_label = st.text_input("label", key="experiment-v2-label")
+            variant_2_risk = st.text_input("risk note", key="experiment-v2-risk")
+            variant_2_patch = st.text_area(
+                "unified diff", key="experiment-v2-patch", height=180
+            )
+            if st.form_submit_button("Register baseline + 2 variants"):
+                if not all(
+                    [
+                        feature_id.strip(),
+                        objective.strip(),
+                        variant_1_label.strip(),
+                        variant_1_patch.strip(),
+                        variant_2_label.strip(),
+                        variant_2_patch.strip(),
+                    ]
+                ):
+                    st.error("feature/objective と2件の variant label/diff は必須です")
+                else:
+                    created = api_post(
+                        "/experiments",
+                        {
+                            "feature_id": feature_id.strip(),
+                            "objective": objective.strip(),
+                            "snapshot_id": snapshot_id,
+                            "variants": [
+                                {
+                                    "label": variant_1_label.strip(),
+                                    "patch_text": variant_1_patch,
+                                    "source": "dashboard",
+                                    "risk_note": variant_1_risk,
+                                },
+                                {
+                                    "label": variant_2_label.strip(),
+                                    "patch_text": variant_2_patch,
+                                    "source": "dashboard",
+                                    "risk_note": variant_2_risk,
+                                },
+                            ],
+                        },
+                    )
+                    if created:
+                        st.success(f"Experiment #{created['id']} を登録しました")
+                        st.rerun()
+
+    experiments = api_get("/experiments") or []
+    if not experiments:
+        st.write("experiment なし")
+        return
+    for experiment in experiments:
         with st.expander(
-            f"{experiment['experiment_id']} · {experiment['status']}", expanded=True
+            f"#{experiment['id']} · {experiment['feature_id']} · {experiment['status']}",
+            expanded=True,
         ):
             st.write(experiment.get("objective", ""))
-            st.caption(f"baseline commit: {experiment.get('baseline_commit', '-')}")
-            st.dataframe(experiment.get("variants", []), use_container_width=True)
-            st.markdown("**Metrics:** " + ", ".join(experiment.get("metrics", [])))
-    st.button("Run experiment", disabled=True, help="後続Issueで実装します")
+            st.caption(
+                f"baseline commit: {experiment.get('baseline_commit', '-')} · "
+                f"snapshot #{experiment.get('snapshot_id')} · "
+                f"config revision: {experiment.get('config_revision')}"
+            )
+            execution = experiment.get("execution", {})
+            st.json(
+                {
+                    "commands": {
+                        "install": execution.get("install_commands", []),
+                        "test": execution.get("test_commands", []),
+                        "smoke": execution.get("smoke_commands", []),
+                        "workload": execution.get("workload_commands", []),
+                    },
+                    "timeout_seconds": execution.get("timeout_seconds"),
+                    "network": execution.get("network"),
+                    "env_keys": sorted((execution.get("env") or {}).keys()),
+                    "artifact_retention_seconds": execution.get(
+                        "artifact_retention_seconds"
+                    ),
+                }
+            )
+            if experiment["status"] != "running":
+                if st.button("Run experiment", key=f"run-experiment-{experiment['id']}"):
+                    with st.spinner("各 variant を独立 workspace で実行中..."):
+                        result = api_post(
+                            f"/experiments/{experiment['id']}/run", timeout=310
+                        )
+                    if result:
+                        st.rerun()
+
+            comparison = (experiment.get("comparison") or {}).get("variants", [])
+            if comparison:
+                st.markdown("**Deterministic metric comparison**")
+                st.dataframe(comparison, use_container_width=True)
+
+            for variant in experiment.get("variants", []):
+                with st.expander(
+                    f"{variant['variant_key']} · {variant['label']} · {variant['status']}"
+                ):
+                    if variant.get("risk_note"):
+                        st.warning(variant["risk_note"])
+                    st.caption(
+                        f"patch sha256: {variant.get('patch_hash')} · "
+                        f"cleanup: {variant.get('cleanup_state')}"
+                    )
+                    if variant.get("error"):
+                        st.error(variant["error"])
+                    if not variant.get("is_baseline"):
+                        st.code(variant.get("patch_text", ""), language="diff")
+                        st.download_button(
+                            "Download patch",
+                            data=variant.get("patch_text", ""),
+                            file_name=(
+                                f"experiment-{experiment['id']}-"
+                                f"{variant['variant_key']}.diff"
+                            ),
+                            key=f"download-experiment-patch-{variant['id']}",
+                        )
+                    st.json(variant.get("metrics", {}))
+                    for command in variant.get("commands", []):
+                        icon = "✅" if command.get("exit_code") == 0 else "❌"
+                        st.caption(
+                            f"{icon} {command.get('phase')} · "
+                            f"`{command.get('command')}` · "
+                            f"exit={command.get('exit_code')} · "
+                            f"{command.get('duration_ms', 0):.0f}ms"
+                        )
+                        if command.get("stdout"):
+                            st.code(command["stdout"], language="text")
+                        if command.get("stderr"):
+                            st.code(command["stderr"], language="text")
+                    if variant.get("artifacts"):
+                        st.markdown("**Raw artifacts**")
+                        st.json(variant["artifacts"])
+
+            analysis = experiment.get("analysis") or {}
+            st.markdown("**Reasoning interpretation**")
+            if analysis.get("status") == "completed":
+                st.write(analysis.get("narrative") or "")
+                st.info(
+                    f"Recommendation: {analysis.get('recommendation_variant_key') or '-'}\n\n"
+                    f"{analysis.get('recommendation_reason') or ''}"
+                )
+                if analysis.get("risks"):
+                    st.write({"risks": analysis["risks"]})
+            elif analysis.get("status") == "analysis_failed":
+                st.warning(
+                    "Reasoning analysis failed. Raw deterministic metrics remain available; "
+                    "heuristic recommendation is not generated."
+                )
+                st.caption(analysis.get("error") or "")
+            st.caption(
+                f"provider={analysis.get('provider') or '-'} · "
+                f"model={analysis.get('model') or '-'} · "
+                f"prompt={analysis.get('prompt_version') or '-'} · "
+                f"schema={analysis.get('schema_version') or '-'} · "
+                f"method={analysis.get('decision_method') or '-'}"
+            )
+
+            decisions = ["undecided", "adopted", "rejected", "needs_more_data"]
+            current_decision = experiment.get("human_decision", "undecided")
+            adoptable_variants = [
+                variant
+                for variant in experiment.get("variants", [])
+                if not variant.get("is_baseline")
+                and variant.get("status") == "completed"
+            ]
+            with st.form(f"experiment-decision-{experiment['id']}"):
+                decision = st.selectbox(
+                    "Human decision",
+                    decisions,
+                    index=(
+                        decisions.index(current_decision)
+                        if current_decision in decisions
+                        else 0
+                    ),
+                )
+                selected_variant_key = st.selectbox(
+                    "Adopted variant",
+                    [variant["variant_key"] for variant in adoptable_variants],
+                    index=next(
+                        (
+                            index
+                            for index, variant in enumerate(adoptable_variants)
+                            if variant["variant_key"]
+                            == experiment.get("human_decision_variant_key")
+                        ),
+                        0,
+                    ),
+                    disabled=decision != "adopted" or not adoptable_variants,
+                ) if adoptable_variants else None
+                note = st.text_area(
+                    "Decision note", value=experiment.get("human_decision_note", "")
+                )
+                if st.form_submit_button("Save human decision"):
+                    if api_put(
+                        f"/experiments/{experiment['id']}/decision",
+                        {
+                            "decision": decision,
+                            "variant_key": (
+                                selected_variant_key
+                                if decision == "adopted"
+                                else None
+                            ),
+                            "note": note,
+                        },
+                    ):
+                        st.rerun()
 
 
 def render_system_selector(

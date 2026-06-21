@@ -95,20 +95,6 @@ def test_policy_invalid_mode_rejected(client):
     assert r.status_code == 422
 
 
-def test_project_intelligence_mock_contract(client):
-    r = client.get("/project-intelligence")
-    assert r.status_code == 200
-    body = r.json()
-    assert body["mock"] is True
-    assert body["reasoning_model_required"] is True
-    assert "finite set" in body["deterministic_decision_policy"]
-    assert body["repository"]["read_policy"] == "committed_files_only"
-    assert body["repository"]["status"] == "not_configured"
-    assert body["features"][0]["evidence"]
-    assert body["probe_plans"][0]["probe_points"][0]["status"] == "proposed"
-    assert body["experiments"][0]["status"] == "draft"
-
-
 # --- Evaluation context tests ---
 
 
