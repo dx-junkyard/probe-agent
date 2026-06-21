@@ -378,7 +378,7 @@ class LatestDraftsOut(BaseModel):
 
 
 SymbolKind = Literal["module", "class", "function", "async_function"]
-LinkSource = Literal["heuristic", "llm", "manual"]
+LinkSource = Literal["reasoning_llm", "manual"]
 LinkReviewStatus = Literal["proposed", "accepted", "rejected"]
 
 
@@ -392,11 +392,13 @@ class CodeSymbolOut(BaseModel):
     start_line: int
     end_line: int
     decorators: List[str] = Field(default_factory=list)
+    imports: List[str] = Field(default_factory=list)
     docstring: Optional[str] = None
     is_test: bool = False
     is_pydantic_model: bool = False
     route_path: Optional[str] = None
     route_method: Optional[str] = None
+    component_id: Optional[str] = None
 
 
 class SymbolIndexWarningOut(BaseModel):
@@ -425,6 +427,11 @@ class FeatureCodeLinkOut(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     source: LinkSource
     review_status: LinkReviewStatus
+    provider: str
+    model: str
+    prompt_version: str
+    schema_version: str
+    is_stale: bool = False
     created_at: float
     updated_at: float
 

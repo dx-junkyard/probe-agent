@@ -338,11 +338,13 @@ CREATE TABLE IF NOT EXISTS code_symbols (
     start_line      INTEGER NOT NULL,
     end_line        INTEGER NOT NULL,
     decorators      TEXT NOT NULL DEFAULT '[]',
+    imports         TEXT NOT NULL DEFAULT '[]',
     docstring       TEXT,
     is_test         INTEGER NOT NULL DEFAULT 0,
     is_pydantic_model INTEGER NOT NULL DEFAULT 0,
     route_path      TEXT,
     route_method    TEXT,
+    component_id    TEXT,
     FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
 );
@@ -378,7 +380,7 @@ CREATE TABLE IF NOT EXISTS feature_code_links (
     symbol_id       INTEGER NOT NULL,
     relation_reason TEXT NOT NULL,
     confidence      REAL NOT NULL DEFAULT 0.0,
-    source          TEXT NOT NULL DEFAULT 'llm',
+    source          TEXT NOT NULL DEFAULT 'reasoning_llm',
     review_status   TEXT NOT NULL DEFAULT 'proposed',
     created_at      REAL NOT NULL,
     updated_at      REAL NOT NULL,
@@ -396,6 +398,9 @@ CREATE INDEX IF NOT EXISTS idx_feature_code_links_feature
 
 CREATE INDEX IF NOT EXISTS idx_feature_code_links_run
     ON feature_code_links (intelligence_run_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_feature_code_links_run_symbol
+    ON feature_code_links (intelligence_run_id, feature_id, symbol_id);
 """
 
 
@@ -564,6 +569,12 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE snapshot_files ADD COLUMN content BLOB NOT NULL DEFAULT X''"
             )
+        if "imports" not in _columns(conn, "code_symbols"):
+            conn.execute(
+                "ALTER TABLE code_symbols ADD COLUMN imports TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "component_id" not in _columns(conn, "code_symbols"):
+            conn.execute("ALTER TABLE code_symbols ADD COLUMN component_id TEXT")
         _ensure_legacy_system(conn)
     _bootstrap_admin()
 

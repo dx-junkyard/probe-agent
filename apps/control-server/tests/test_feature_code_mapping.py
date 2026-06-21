@@ -57,6 +57,29 @@ def _headers(token, system_id):
     return {**_bearer(token), "X-Probe-System-Id": str(system_id)}
 
 
+class _ReasoningMappingClient:
+    def generate_text(self, messages, *, temperature=None, max_tokens=None):
+        return json.dumps({
+            "links": [{
+                "feature_id": "source-implementation",
+                "symbol_qualified_name": "list_users",
+                "symbol_path": "src/main.py",
+                "relation_reason": "The route implements source-backed user listing.",
+                "confidence": 0.9,
+            }]
+        })
+
+
+def _enable_reasoning_mapping(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("LLM_MODEL", "gpt-5")
+    monkeypatch.setenv("LLM_API_KEY", "unused")
+    monkeypatch.setattr(
+        "app.routes.project_intelligence.create_llm_client",
+        lambda config: _ReasoningMappingClient(),
+    )
+
+
 @pytest.fixture
 def git_repo(tmp_path):
     """Create a git repo with Python files for AST testing."""
@@ -190,6 +213,7 @@ class TestCodeIndexer:
         symbols, imports, warn = index_python_file("src/example.py", source)
         assert warn is None
         names = {s.qualified_name for s in symbols}
+        assert "src.example" in names
         assert "MyClass" in names
         assert "MyClass.method" in names
         assert "regular" in names
@@ -211,6 +235,7 @@ class TestCodeIndexer:
         assert warn is None
         func = next(s for s in symbols if s.qualified_name == "probed_func")
         assert any("probe" in d for d in func.decorators)
+        assert func.component_id == "test"
 
     def test_detects_pydantic_models(self):
         from app.code_indexer import index_python_file
@@ -339,8 +364,8 @@ class TestCodeIndexer:
             ("config.yaml", b"key: value\n"),
         ]
         result = index_snapshot_files(files)
-        assert len(result.symbols) == 1
-        assert result.symbols[0].qualified_name == "hello"
+        assert len(result.symbols) == 2
+        assert {s.qualified_name for s in result.symbols} == {"src.main", "hello"}
         assert result.warnings == []
 
 
@@ -381,6 +406,7 @@ class TestSymbolIndexAPI:
         assert body["warning_count"] == 0
 
         names = {s["qualified_name"] for s in body["symbols"]}
+        assert "src.main" in names
         assert "list_users" in names
         assert "create_user" in names
         assert "UserRequest" in names
@@ -403,6 +429,10 @@ class TestSymbolIndexAPI:
 
         test_func = next(s for s in body["symbols"] if s["qualified_name"] == "test_list_users")
         assert test_func["is_test"] is True
+        summarize = next(s for s in body["symbols"] if s["qualified_name"] == "summarize")
+        assert summarize["component_id"] == "summarizer"
+        main_module = next(s for s in body["symbols"] if s["qualified_name"] == "src.main")
+        assert any(item.startswith("pydantic:") for item in main_module["imports"])
 
         assert body["intelligence_run"] is not None
         assert body["intelligence_run"]["decision_method"] == "deterministic"
@@ -549,7 +579,7 @@ class TestFeatureCodeMappingAPI:
         assert r.status_code == 400
         assert "draft" in r.json()["detail"].lower()
 
-    def test_generate_with_mock_provider(self, admin_client, git_repo):
+    def test_mock_provider_fails_without_fabricating_links(self, admin_client, git_repo):
         token = _login(admin_client)
         system = _create_system(admin_client, token, "MockMapping")
         h = _headers(token, system["id"])
@@ -570,24 +600,16 @@ class TestFeatureCodeMappingAPI:
         body = r.json()
 
         run = body["intelligence_run"]
-        assert run["status"] == "completed"
+        assert run["status"] == "failed"
         assert run["provider"] == "mock"
         assert run["is_mock"] is True
         assert run["decision_method"] == "reasoning_llm"
         assert run["run_type"] == "feature_code_mapping"
 
-        links = body["links"]
-        assert len(links) > 0
-        for link in links:
-            assert link["source"] == "llm"
-            assert link["review_status"] == "proposed"
-            assert 0.0 <= link["confidence"] <= 1.0
-            assert link["relation_reason"] != ""
-            sym = link["symbol"]
-            assert sym["path"] != ""
-            assert sym["qualified_name"] != ""
+        assert "prohibited" in run["error_details"]
+        assert body["links"] == []
 
-    def test_get_code_links(self, admin_client, git_repo):
+    def test_get_code_links(self, admin_client, git_repo, monkeypatch):
         token = _login(admin_client)
         system = _create_system(admin_client, token, "GetLinks")
         h = _headers(token, system["id"])
@@ -598,11 +620,16 @@ class TestFeatureCodeMappingAPI:
 
         _setup_snapshot_and_drafts(admin_client, token, system["id"], git_repo)
         admin_client.post("/repository/symbols/index", headers=h)
+        _enable_reasoning_mapping(monkeypatch)
         admin_client.post("/repository/code-links/generate", headers=h)
 
         r = admin_client.get("/repository/code-links", headers=h)
         assert r.status_code == 200
         assert len(r.json()["links"]) > 0
+        link = r.json()["links"][0]
+        assert link["source"] == "reasoning_llm"
+        assert link["provider"] == "openai"
+        assert link["model"] == "gpt-5"
 
     def test_non_reasoning_model_rejected(self, admin_client, git_repo, monkeypatch):
         token = _login(admin_client)
@@ -631,7 +658,41 @@ class TestFeatureCodeMappingAPI:
         assert "reasoning model" in body["intelligence_run"]["error_details"]
         assert body["links"] == []
 
-    def test_code_links_are_system_scoped(self, admin_client, git_repo):
+    def test_invalid_structured_output_fails_without_links(
+        self, admin_client, git_repo, monkeypatch
+    ):
+        class InvalidSymbolClient:
+            def generate_text(self, messages, *, temperature=None, max_tokens=None):
+                return json.dumps({
+                    "links": [{
+                        "feature_id": "source-implementation",
+                        "symbol_qualified_name": "invented",
+                        "symbol_path": "src/missing.py",
+                        "relation_reason": "Invented by model",
+                        "confidence": 0.9,
+                    }]
+                })
+
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "InvalidMapping")
+        h = _headers(token, system["id"])
+        _setup_snapshot_and_drafts(admin_client, token, system["id"], git_repo)
+        admin_client.post("/repository/symbols/index", headers=h)
+        monkeypatch.setenv("LLM_PROVIDER", "openai")
+        monkeypatch.setenv("LLM_MODEL", "gpt-5")
+        monkeypatch.setenv("LLM_API_KEY", "unused")
+        monkeypatch.setattr(
+            "app.routes.project_intelligence.create_llm_client",
+            lambda config: InvalidSymbolClient(),
+        )
+
+        r = admin_client.post("/repository/code-links/generate", headers=h)
+        assert r.status_code == 201
+        assert r.json()["intelligence_run"]["status"] == "failed"
+        assert "unknown symbol" in r.json()["intelligence_run"]["error_details"]
+        assert r.json()["links"] == []
+
+    def test_code_links_are_system_scoped(self, admin_client, git_repo, monkeypatch):
         token = _login(admin_client)
         sys_a = _create_system(admin_client, token, "LinkScopeA")
         sys_b = _create_system(admin_client, token, "LinkScopeB")
@@ -641,6 +702,7 @@ class TestFeatureCodeMappingAPI:
             "/repository/symbols/index",
             headers=_headers(token, sys_a["id"]),
         )
+        _enable_reasoning_mapping(monkeypatch)
         admin_client.post(
             "/repository/code-links/generate",
             headers=_headers(token, sys_a["id"]),
@@ -665,12 +727,13 @@ class TestFeatureCodeMappingAPI:
 
 
 class TestLinkReview:
-    def test_accept_link(self, admin_client, git_repo):
+    def test_accept_link(self, admin_client, git_repo, monkeypatch):
         token = _login(admin_client)
         system = _create_system(admin_client, token, "AcceptLink")
         h = _headers(token, system["id"])
         _setup_snapshot_and_drafts(admin_client, token, system["id"], git_repo)
         admin_client.post("/repository/symbols/index", headers=h)
+        _enable_reasoning_mapping(monkeypatch)
         gen = admin_client.post("/repository/code-links/generate", headers=h)
         links = gen.json()["links"]
         assert len(links) > 0
@@ -684,12 +747,13 @@ class TestLinkReview:
         assert r.status_code == 200
         assert r.json()["review_status"] == "accepted"
 
-    def test_reject_link(self, admin_client, git_repo):
+    def test_reject_link(self, admin_client, git_repo, monkeypatch):
         token = _login(admin_client)
         system = _create_system(admin_client, token, "RejectLink")
         h = _headers(token, system["id"])
         _setup_snapshot_and_drafts(admin_client, token, system["id"], git_repo)
         admin_client.post("/repository/symbols/index", headers=h)
+        _enable_reasoning_mapping(monkeypatch)
         gen = admin_client.post("/repository/code-links/generate", headers=h)
         links = gen.json()["links"]
         link_id = links[0]["id"]
@@ -702,12 +766,13 @@ class TestLinkReview:
         assert r.status_code == 200
         assert r.json()["review_status"] == "rejected"
 
-    def test_review_persists(self, admin_client, git_repo):
+    def test_review_persists(self, admin_client, git_repo, monkeypatch):
         token = _login(admin_client)
         system = _create_system(admin_client, token, "ReviewPersist")
         h = _headers(token, system["id"])
         _setup_snapshot_and_drafts(admin_client, token, system["id"], git_repo)
         admin_client.post("/repository/symbols/index", headers=h)
+        _enable_reasoning_mapping(monkeypatch)
         gen = admin_client.post("/repository/code-links/generate", headers=h)
         link_id = gen.json()["links"][0]["id"]
 
@@ -731,7 +796,7 @@ class TestLinkReview:
         )
         assert r.status_code == 404
 
-    def test_review_cross_system_denied(self, admin_client, git_repo):
+    def test_review_cross_system_denied(self, admin_client, git_repo, monkeypatch):
         token = _login(admin_client)
         sys_a = _create_system(admin_client, token, "ReviewScopeA")
         sys_b = _create_system(admin_client, token, "ReviewScopeB")
@@ -741,6 +806,7 @@ class TestLinkReview:
             "/repository/symbols/index",
             headers=_headers(token, sys_a["id"]),
         )
+        _enable_reasoning_mapping(monkeypatch)
         gen = admin_client.post(
             "/repository/code-links/generate",
             headers=_headers(token, sys_a["id"]),

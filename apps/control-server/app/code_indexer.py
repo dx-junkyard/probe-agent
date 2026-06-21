@@ -20,11 +20,13 @@ class CodeSymbol:
     start_line: int
     end_line: int
     decorators: List[str] = field(default_factory=list)
+    imports: List[str] = field(default_factory=list)
     docstring: Optional[str] = None
     is_test: bool = False
     is_pydantic_model: bool = False
     route_path: Optional[str] = None
     route_method: Optional[str] = None
+    component_id: Optional[str] = None
 
 
 @dataclass
@@ -104,6 +106,22 @@ def _extract_route_info(decorators: List[ast.expr]) -> Tuple[Optional[str], Opti
     return None, None
 
 
+def _extract_component_id(decorators: List[ast.expr]) -> Optional[str]:
+    for dec in decorators:
+        if not isinstance(dec, ast.Call):
+            continue
+        if _decorator_name(dec.func).split(".")[-1] != "probe":
+            continue
+        for kw in dec.keywords:
+            if (
+                kw.arg == "component_id"
+                and isinstance(kw.value, ast.Constant)
+                and isinstance(kw.value.value, str)
+            ):
+                return kw.value.value
+    return None
+
+
 def _is_pydantic_model(node: ast.ClassDef) -> bool:
     for base in node.bases:
         name = _decorator_name(base)
@@ -161,13 +179,31 @@ def index_python_file(path: str, source: str) -> Tuple[List[CodeSymbol], List[Im
                 is_from_import=True,
             ))
 
+    import_names = [
+        f"{item.module}:{','.join(item.names)}" if item.names else item.module
+        for item in imports
+    ]
+    module_end_line = max(
+        (getattr(node, "end_lineno", None) or getattr(node, "lineno", 1))
+        for node in tree.body
+    ) if tree.body else 1
+    symbols.append(CodeSymbol(
+        path=path,
+        qualified_name=module_name,
+        kind="module",
+        start_line=1,
+        end_line=module_end_line,
+        imports=import_names,
+        docstring=_get_docstring(tree),
+    ))
+
     def _visit(node: ast.AST, prefix: str) -> None:
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 qname = f"{prefix}.{child.name}" if prefix else child.name
                 decorator_strs = [_decorator_str(d) for d in child.decorator_list]
-                decorator_names = [_decorator_name(d) for d in child.decorator_list]
                 route_path, route_method = _extract_route_info(child.decorator_list)
+                component_id = _extract_component_id(child.decorator_list)
                 is_test = _is_test_function(child.name, path)
                 kind = "async_function" if isinstance(child, ast.AsyncFunctionDef) else "function"
                 symbols.append(CodeSymbol(
@@ -181,6 +217,7 @@ def index_python_file(path: str, source: str) -> Tuple[List[CodeSymbol], List[Im
                     is_test=is_test,
                     route_path=route_path,
                     route_method=route_method,
+                    component_id=component_id,
                 ))
                 _visit(child, qname)
 

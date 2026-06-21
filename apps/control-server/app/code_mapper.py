@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from .code_indexer import CodeSymbol
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient
@@ -17,7 +17,7 @@ from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient
 PROMPT_VERSION = "v1"
 SCHEMA_VERSION = "v1"
 
-LinkSource = str  # "heuristic" | "llm" | "manual"
+LinkSource = str  # "reasoning_llm" | "manual"
 ReviewStatus = str  # "proposed" | "accepted" | "rejected"
 
 
@@ -28,7 +28,7 @@ class FeatureCodeLinkResult:
     symbol_path: str
     relation_reason: str
     confidence: float
-    source: str  # "llm"
+    source: str  # "reasoning_llm"
 
 
 @dataclass
@@ -50,6 +50,8 @@ class FeatureContext:
     name: str
     summary: str
     user_value: str
+    success_criteria: List[str] = field(default_factory=list)
+    risks: List[str] = field(default_factory=list)
     evidence_keywords: List[str] = field(default_factory=list)
 
 
@@ -63,11 +65,13 @@ def _build_symbol_context(symbols: List[CodeSymbol], max_symbols: int = 500) -> 
         doc = f' doc="{sym.docstring[:100]}"' if sym.docstring else ""
         test = " [test]" if sym.is_test else ""
         pydantic = " [pydantic]" if sym.is_pydantic_model else ""
+        component = f" component_id={sym.component_id}" if sym.component_id else ""
+        imports = f" imports={','.join(sym.imports)}" if sym.imports else ""
         parts.append(
             f"- {sym.qualified_name} ({sym.kind}) "
             f"in {sym.path}:{sym.start_line}-{sym.end_line}"
             f"{' @' + decorators if decorators else ''}"
-            f"{route}{doc}{test}{pydantic}"
+            f"{route}{doc}{test}{pydantic}{component}{imports}"
         )
     return "\n".join(parts)
 
@@ -80,6 +84,8 @@ def _build_feature_context(features: List[FeatureContext]) -> str:
             f"- Feature: {f.name} (id: {f.feature_id})\n"
             f"  Summary: {f.summary}\n"
             f"  User value: {f.user_value}\n"
+            f"  Success criteria: {', '.join(f.success_criteria) or 'none'}\n"
+            f"  Risks/core-flow constraints: {', '.join(f.risks) or 'none'}\n"
             f"  Evidence keywords: {keywords}"
         )
     return "\n".join(parts)
@@ -129,7 +135,7 @@ Respond with ONLY valid JSON matching this schema:
 def _parse_mapping_response(
     raw_json: str,
     valid_feature_ids: set,
-    valid_symbols: Dict[str, str],
+    valid_symbols: set[Tuple[str, str]],
 ) -> List[FeatureCodeLinkResult]:
     data = json.loads(raw_json)
     if not isinstance(data, dict):
@@ -140,6 +146,7 @@ def _parse_mapping_response(
         raise MappingValidationError("links must be an array")
 
     results = []
+    seen = set()
     for item in links_data:
         if not isinstance(item, dict):
             raise MappingValidationError("link items must be objects")
@@ -148,15 +155,18 @@ def _parse_mapping_response(
         if not feature_id:
             raise MappingValidationError("feature_id is required")
         if feature_id not in valid_feature_ids:
-            continue
+            raise MappingValidationError(f"unknown feature_id: {feature_id}")
 
         sym_name = str(item.get("symbol_qualified_name", "")).strip()
         if not sym_name:
             raise MappingValidationError("symbol_qualified_name is required")
-        if sym_name not in valid_symbols:
-            continue
+        response_path = str(item.get("symbol_path", "")).strip()
+        if (response_path, sym_name) not in valid_symbols:
+            raise MappingValidationError(
+                f"unknown symbol: {response_path}:{sym_name}"
+            )
 
-        sym_path = valid_symbols[sym_name]
+        sym_path = response_path
 
         reason = str(item.get("relation_reason", "")).strip()
         if not reason:
@@ -166,7 +176,13 @@ def _parse_mapping_response(
             confidence = float(item.get("confidence", 0))
         except (TypeError, ValueError) as exc:
             raise MappingValidationError("confidence must be a number") from exc
-        confidence = max(0.0, min(1.0, confidence))
+        if not 0.0 <= confidence <= 1.0:
+            raise MappingValidationError("confidence must be between 0 and 1")
+
+        key = (feature_id, sym_path, sym_name)
+        if key in seen:
+            continue
+        seen.add(key)
 
         results.append(FeatureCodeLinkResult(
             feature_id=feature_id,
@@ -174,46 +190,9 @@ def _parse_mapping_response(
             symbol_path=sym_path,
             relation_reason=reason,
             confidence=confidence,
-            source="llm",
+            source="reasoning_llm",
         ))
 
-    return results
-
-
-def _mock_mapping(
-    features: List[FeatureContext],
-    symbols: List[CodeSymbol],
-) -> List[FeatureCodeLinkResult]:
-    results = []
-    for feature in features:
-        keywords = [kw.lower() for kw in feature.evidence_keywords]
-        keywords.extend(feature.name.lower().split())
-        for sym in symbols:
-            if sym.is_test:
-                continue
-            name_lower = sym.qualified_name.lower()
-            if any(kw in name_lower for kw in keywords if len(kw) > 2):
-                results.append(FeatureCodeLinkResult(
-                    feature_id=feature.feature_id,
-                    symbol_qualified_name=sym.qualified_name,
-                    symbol_path=sym.path,
-                    relation_reason=f"Mock: symbol name matches feature keywords",
-                    confidence=0.7,
-                    source="llm",
-                ))
-                break
-        else:
-            non_test = [s for s in symbols if not s.is_test]
-            if non_test:
-                sym = non_test[0]
-                results.append(FeatureCodeLinkResult(
-                    feature_id=feature.feature_id,
-                    symbol_qualified_name=sym.qualified_name,
-                    symbol_path=sym.path,
-                    relation_reason="Mock: default mapping to first non-test symbol",
-                    confidence=0.5,
-                    source="llm",
-                ))
     return results
 
 
@@ -225,12 +204,15 @@ def generate_code_mapping(
 ) -> MappingResult:
     is_mock = isinstance(client, MockLLMClient)
     if is_mock:
-        links = _mock_mapping(features, symbols)
         return MappingResult(
             provider="mock",
             model="mock",
             is_mock=True,
-            links=links,
+            links=[],
+            error=(
+                "Feature-to-code mapping requires a real reasoning model; "
+                "mock/heuristic fallback is prohibited"
+            ),
         )
 
     if not features:
@@ -277,7 +259,7 @@ def generate_code_mapping(
         )
 
     valid_feature_ids = {f.feature_id for f in features}
-    valid_symbols = {s.qualified_name: s.path for s in symbols}
+    valid_symbols = {(s.path, s.qualified_name) for s in symbols}
 
     try:
         cleaned = raw.strip()

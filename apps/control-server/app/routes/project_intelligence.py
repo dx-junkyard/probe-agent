@@ -679,11 +679,13 @@ def _symbol_out(row) -> CodeSymbolOut:
         start_line=row["start_line"],
         end_line=row["end_line"],
         decorators=json.loads(row["decorators"]),
+        imports=json.loads(row["imports"]),
         docstring=row["docstring"],
         is_test=bool(row["is_test"]),
         is_pydantic_model=bool(row["is_pydantic_model"]),
         route_path=row["route_path"],
         route_method=row["route_method"],
+        component_id=row["component_id"],
     )
 
 
@@ -783,9 +785,10 @@ def index_symbols_endpoint(
                     """
                     INSERT INTO code_symbols
                         (snapshot_id, system_id, path, qualified_name, kind,
-                         start_line, end_line, decorators, docstring,
-                         is_test, is_pydantic_model, route_path, route_method)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         start_line, end_line, decorators, imports, docstring,
+                         is_test, is_pydantic_model, route_path, route_method,
+                         component_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         snapshot_id,
@@ -796,11 +799,13 @@ def index_symbols_endpoint(
                         sym.start_line,
                         sym.end_line,
                         json.dumps(sym.decorators),
+                        json.dumps(sym.imports),
                         sym.docstring,
                         1 if sym.is_test else 0,
                         1 if sym.is_pydantic_model else 0,
                         sym.route_path,
                         sym.route_method,
+                        sym.component_id,
                     ),
                 )
 
@@ -908,6 +913,18 @@ def _link_out(conn, row) -> FeatureCodeLinkOut:
         "SELECT * FROM code_symbols WHERE id = ?",
         (row["symbol_id"],),
     ).fetchone()
+    run_row = conn.execute(
+        "SELECT * FROM intelligence_runs WHERE id = ?",
+        (row["intelligence_run_id"],),
+    ).fetchone()
+    latest_snapshot = conn.execute(
+        """
+        SELECT id FROM repository_snapshots
+        WHERE system_id = ? AND status = 'ready'
+        ORDER BY id DESC LIMIT 1
+        """,
+        (row["system_id"],),
+    ).fetchone()
     return FeatureCodeLinkOut(
         id=row["id"],
         system_id=row["system_id"],
@@ -919,6 +936,14 @@ def _link_out(conn, row) -> FeatureCodeLinkOut:
         confidence=row["confidence"],
         source=row["source"],
         review_status=row["review_status"],
+        provider=run_row["provider"],
+        model=run_row["model"],
+        prompt_version=run_row["prompt_version"],
+        schema_version=run_row["schema_version"],
+        is_stale=(
+            latest_snapshot is None
+            or latest_snapshot["id"] != row["snapshot_id"]
+        ),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -1005,6 +1030,8 @@ def generate_code_links_endpoint(
             name=fd["name"],
             summary=fd["summary"],
             user_value=fd["user_value"],
+            success_criteria=json.loads(fd["success_criteria"]),
+            risks=json.loads(fd["risks"]),
             evidence_keywords=keywords,
         ))
 
@@ -1019,11 +1046,13 @@ def generate_code_links_endpoint(
             start_line=sr["start_line"],
             end_line=sr["end_line"],
             decorators=json.loads(sr["decorators"]),
+            imports=json.loads(sr["imports"]),
             docstring=sr["docstring"],
             is_test=bool(sr["is_test"]),
             is_pydantic_model=bool(sr["is_pydantic_model"]),
             route_path=sr["route_path"],
             route_method=sr["route_method"],
+            component_id=sr["component_id"],
         ))
 
     llm_config = LLMConfig.from_env()
@@ -1058,9 +1087,9 @@ def generate_code_links_endpoint(
 
     status = "completed" if mapping_result.error is None else "failed"
 
-    sym_name_to_id = {}
+    symbol_key_to_id = {}
     for sr in sym_rows:
-        sym_name_to_id[sr["qualified_name"]] = sr["id"]
+        symbol_key_to_id[(sr["path"], sr["qualified_name"])] = sr["id"]
 
     with get_conn() as conn:
         conn.execute("BEGIN")
@@ -1092,7 +1121,9 @@ def generate_code_links_endpoint(
 
             now = time.time()
             for link in mapping_result.links:
-                symbol_id = sym_name_to_id.get(link.symbol_qualified_name)
+                symbol_id = symbol_key_to_id.get(
+                    (link.symbol_path, link.symbol_qualified_name)
+                )
                 if symbol_id is None:
                     continue
                 conn.execute(

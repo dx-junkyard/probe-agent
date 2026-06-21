@@ -125,11 +125,13 @@
         "start_line": { "type": "integer", "minimum": 1 },
         "end_line": { "type": "integer", "minimum": 1 },
         "decorators": { "type": "array", "items": { "type": "string" } },
+        "imports": { "type": "array", "items": { "type": "string" } },
         "docstring": { "type": ["string", "null"] },
         "is_test": { "type": "boolean" },
         "is_pydantic_model": { "type": "boolean" },
         "route_path": { "type": ["string", "null"] },
-        "route_method": { "type": ["string", "null"] }
+        "route_method": { "type": ["string", "null"] },
+        "component_id": { "type": ["string", "null"] }
       },
       "additionalProperties": false
     },
@@ -145,8 +147,13 @@
         "symbol": { "$ref": "#/definitions/CodeSymbol" },
         "relation_reason": { "type": "string" },
         "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
-        "source": { "enum": ["heuristic", "llm", "manual"] },
+        "source": { "enum": ["reasoning_llm", "manual"] },
         "review_status": { "enum": ["proposed", "accepted", "rejected"] },
+        "provider": { "type": "string" },
+        "model": { "type": "string" },
+        "prompt_version": { "type": "string" },
+        "schema_version": { "type": "string" },
+        "is_stale": { "type": "boolean" },
         "created_at": { "type": "number" },
         "updated_at": { "type": "number" }
       },

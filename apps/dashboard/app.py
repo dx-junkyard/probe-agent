@@ -1255,6 +1255,8 @@ def render_repository_tab(system: Dict[str, Any]) -> None:
                     extras.append("pydantic")
                 if sym.get("route_path"):
                     extras.append(f"{sym.get('route_method', '?')} {sym['route_path']}")
+                if sym.get("component_id"):
+                    extras.append(f"component:{sym['component_id']}")
                 extra_str = f" [{', '.join(extras)}]" if extras else ""
                 st.write(
                     f"{kind_icon} `{sym['qualified_name']}` "
@@ -1381,7 +1383,17 @@ def render_feature_map_tab(system: Dict[str, Any]) -> None:
                         f"({sym.get('path', '?')}:{sym.get('start_line', '?')}-{sym.get('end_line', '?')}) "
                         f"· confidence {confidence_pct} · {link.get('review_status', '?')}"
                     )
+                    if sym.get("component_id"):
+                        st.caption(f"Component: `{sym['component_id']}`")
+                    if link.get("is_stale"):
+                        st.error("この link は最新 snapshot に存在しない symbol を参照しています。")
                     st.caption(f"Reason: {link.get('relation_reason', '')}")
+                    st.caption(
+                        "Audit: "
+                        f"{link.get('provider', '?')}/{link.get('model', '?')} · "
+                        f"prompt {link.get('prompt_version', '?')} · "
+                        f"schema {link.get('schema_version', '?')}"
+                    )
                     link_id = link.get("id")
                     review_col1, review_col2 = st.columns(2)
                     with review_col1:
