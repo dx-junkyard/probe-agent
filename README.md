@@ -228,6 +228,31 @@ def summarize(text: str) -> str:
     return text[:80]
 ```
 
+Dashboard の `Connect SDK` タブでは、選択中 System 用の API token 発行、
+SDK install command、クライアント環境変数、最小サンプルソース、
+Dockerfile サンプルをまとめて確認・ダウンロードできる。
+
+## Generate & Evaluate
+
+Dashboard の `Generate & Evaluate` タブでは、転送済み trace の入力
+パラメーターを使って候補 Python コードを生成し、同じ入力で実行した結果を
+LLM で評価できる。生成されたコードは保存・ダウンロードできるが、対象
+システムへ自動適用はしない。
+
+Control Server は LLM 呼び出しを `apps/control-server/app/llm.py` に集約しており、
+プロバイダ差分はこの層で吸収する。Compose では `.env` に以下を設定する。
+
+```env
+LLM_PROVIDER=openai   # openai / anthropic / gemini / mock
+LLM_MODEL=gpt-4o-mini
+LLM_API_KEY=...
+LLM_BASE_URL=
+LLM_TIMEOUT=30
+```
+
+`LLM_PROVIDER=mock` はローカルの疎通確認とテスト用で、外部 API は呼ばない。
+実際の評価には `openai` / `anthropic` / `gemini` のいずれかと API key を使う。
+
 ## 認証と Dashboard のログイン方式
 
 現状の Dashboard にはブラウザ上のログイン画面はない。Dashboard は起動時に
@@ -310,6 +335,8 @@ Docker Compose はリポジトリルートの `.env` を読み込む。ローカ
 | `PROBE_API_KEY` | _(未設定)_ | SDK が送る API キー (`X-Api-Key` ヘッダー) |
 | `CONTROL_API_KEYS` | _(未設定)_ | Control Server が受け付ける API キー（カンマ区切り複数可）。未設定時は認証なし |
 | `DASHBOARD_API_KEY` | _(未設定)_ | Dashboard が Control Server に送る API キー |
+| `PROBE_CLIENT_SERVER_URL` | _(未設定)_ | Dashboard の `Connect SDK` タブに表示するクライアント向け Control Server URL |
+| `PROBE_SDK_INSTALL_URL` | GitHub の `packages/python-probe` | Dashboard の `Connect SDK` タブに表示する SDK install URL |
 | `CONTROL_ADMIN_USERNAME` | _(未設定)_ | 起動時に作成する初期管理者ユーザー名 |
 | `CONTROL_ADMIN_PASSWORD` | _(未設定)_ | 起動時に作成する初期管理者パスワード |
 

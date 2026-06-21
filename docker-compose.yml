@@ -9,6 +9,11 @@ services:
       CONTROL_API_KEYS: ${CONTROL_API_KEYS:-}
       CONTROL_ADMIN_USERNAME: ${CONTROL_ADMIN_USERNAME:-}
       CONTROL_ADMIN_PASSWORD: ${CONTROL_ADMIN_PASSWORD:-}
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-30}
     volumes:
       - probe-data:/data
     ports:
@@ -29,6 +34,9 @@ services:
     environment:
       PROBE_SERVER_URL: ${PROBE_SERVER_URL:-http://control-server:8000}
       DASHBOARD_API_KEY: ${DASHBOARD_API_KEY:-}
+      DASHBOARD_COOKIE_SECURE: ${DASHBOARD_COOKIE_SECURE:-false}
+      PROBE_CLIENT_SERVER_URL: ${PROBE_CLIENT_SERVER_URL:-http://localhost:8000}
+      PROBE_SDK_INSTALL_URL: ${PROBE_SDK_INSTALL_URL:-git+https://github.com/dx-junkyard/probe-agent.git@main#subdirectory=packages/python-probe}
     ports:
       - "8501:8501"
     depends_on:

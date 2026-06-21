@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 
 Mode = Literal["off", "trace", "shadow"]
 Evaluation = Literal["better", "worse", "same", "unknown"]
+GenerationVerdict = Literal["better", "worse", "same", "unsafe", "error", "unknown"]
 
 
 class TraceEvent(BaseModel):
@@ -77,6 +78,31 @@ class SystemProfileUpdate(BaseModel):
     success_criteria: List[str] = Field(default_factory=list)
 
 
+class SystemCreate(BaseModel):
+    name: str = Field(..., min_length=1)
+    environment: str = ""
+    description: str = ""
+
+
+class SystemUpdate(BaseModel):
+    name: str = Field(..., min_length=1)
+    environment: str = ""
+    description: str = ""
+
+
+class SystemOut(BaseModel):
+    id: int
+    name: str
+    environment: str = ""
+    description: str = ""
+    owner_user_id: Optional[int] = None
+    created_at: float
+    updated_at: float
+    component_count: int = 0
+    trace_count: int = 0
+    last_seen: Optional[float] = None
+
+
 class ComponentProfile(BaseModel):
     component_id: str
     purpose: str = ""
@@ -142,6 +168,31 @@ class EvaluationResult(BaseModel):
     created_at: float
 
 
+class GenerationRunCreate(BaseModel):
+    component_id: str = Field(..., min_length=1)
+    trace_id: str = Field(..., min_length=1)
+    objective: str = Field(..., min_length=1)
+
+
+class GenerationRun(BaseModel):
+    id: int
+    system_id: int
+    component_id: str
+    trace_id: str
+    objective: str
+    input_json: Optional[Any] = None
+    current_output: Optional[str] = None
+    generated_code: str = ""
+    generation_notes: str = ""
+    candidate_output: Optional[str] = None
+    execution_error: Optional[str] = None
+    llm_verdict: GenerationVerdict = "unknown"
+    llm_reason: str = ""
+    llm_risks: str = ""
+    llm_recommendation: str = ""
+    created_at: float
+
+
 Role = Literal["admin", "user"]
 TokenKind = Literal["session", "api"]
 
@@ -174,14 +225,32 @@ class UserOut(BaseModel):
 class MeResponse(BaseModel):
     user: Optional[UserOut] = None
     auth: str = Field(..., description="token | legacy_api_key | anonymous")
+    system_id: Optional[int] = None
 
 
 class TokenCreate(BaseModel):
     name: Optional[str] = None
+    system_id: Optional[int] = None
     user_id: Optional[int] = Field(
         default=None, description="owner of the token; defaults to the caller"
     )
     expires_in_days: Optional[int] = Field(default=None, ge=1)
+
+
+class SelfTokenCreate(BaseModel):
+    """Token issuance for the caller's own account (no user_id override)."""
+
+    name: Optional[str] = None
+    system_id: Optional[int] = None
+    expires_in_days: Optional[int] = Field(default=None, ge=1)
+
+
+class PasswordResetRequest(BaseModel):
+    password: str = Field(..., min_length=1)
+
+
+class RoleUpdate(BaseModel):
+    role: Role
 
 
 class TokenOut(BaseModel):
@@ -189,6 +258,7 @@ class TokenOut(BaseModel):
     name: Optional[str] = None
     kind: TokenKind
     user_id: int
+    system_id: Optional[int] = None
     revoked: bool
     created_at: float
     expires_at: Optional[float] = None

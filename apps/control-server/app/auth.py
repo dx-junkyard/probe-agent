@@ -18,6 +18,8 @@ class Principal:
     username: Optional[str] = None
     role: Optional[str] = None
     token_id: Optional[int] = None
+    token_kind: Optional[str] = None
+    system_id: Optional[int] = None
 
     @property
     def is_admin(self) -> bool:
@@ -57,7 +59,8 @@ def _principal_from_token(token: str) -> Optional[Principal]:
     with get_conn() as conn:
         row = conn.execute(
             """
-            SELECT t.id AS token_id, t.revoked AS revoked, t.expires_at AS expires_at,
+            SELECT t.id AS token_id, t.kind AS token_kind, t.system_id AS system_id,
+                   t.revoked AS revoked, t.expires_at AS expires_at,
                    u.id AS user_id, u.username AS username, u.role AS role,
                    u.is_active AS is_active
             FROM api_tokens t
@@ -80,6 +83,8 @@ def _principal_from_token(token: str) -> Optional[Principal]:
         username=row["username"],
         role=row["role"],
         token_id=row["token_id"],
+        token_kind=row["token_kind"],
+        system_id=row["system_id"],
     )
 
 
@@ -109,3 +114,52 @@ async def require_admin(principal: Principal = Depends(get_principal)) -> Princi
     if not principal.is_admin:
         raise HTTPException(status_code=403, detail="Administrator privileges required")
     return principal
+
+
+async def require_user(principal: Principal = Depends(get_principal)) -> Principal:
+    """Require a caller backed by a user account (legacy keys/anonymous fail)."""
+    if principal.user_id is None:
+        raise HTTPException(status_code=403, detail="A user account is required")
+    return principal
+
+
+def _legacy_system_id() -> int:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM systems WHERE name = 'Legacy System' AND owner_user_id IS NULL"
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=500, detail="Legacy system is not initialized")
+    return row["id"]
+
+
+async def get_system_id(
+    x_probe_system_id: Optional[int] = Header(default=None),
+    principal: Principal = Depends(get_principal),
+) -> int:
+    """Resolve the system for data-plane and dashboard requests.
+
+    SDK API tokens are permanently bound to one system. Login sessions choose
+    a system with X-Probe-System-Id, while legacy/anonymous callers retain the
+    pre-system behavior through the automatically created Legacy System.
+    """
+    if principal.token_kind == "api":
+        if principal.system_id is None:
+            raise HTTPException(status_code=403, detail="API token is not bound to a system")
+        return principal.system_id
+
+    if principal.auth in ("legacy_api_key", "anonymous"):
+        return _legacy_system_id()
+
+    if x_probe_system_id is None:
+        raise HTTPException(status_code=400, detail="X-Probe-System-Id is required")
+
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT owner_user_id FROM systems WHERE id = ?", (x_probe_system_id,)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="System not found")
+    if not principal.is_admin and row["owner_user_id"] != principal.user_id:
+        raise HTTPException(status_code=403, detail="System access denied")
+    return x_probe_system_id

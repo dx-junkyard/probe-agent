@@ -456,6 +456,205 @@ def test_token_issue_use_and_revoke(admin_client):
     assert r.status_code == 401
 
 
+def _create_system(client, token, name, environment="production"):
+    r = client.post(
+        "/systems",
+        json={
+            "name": name,
+            "environment": environment,
+            "description": f"{name} description",
+        },
+        headers=_bearer(token),
+    )
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def _issue_system_token(client, login_token, system_id, name):
+    r = client.post(
+        "/tokens/me",
+        json={"name": name, "system_id": system_id},
+        headers=_bearer(login_token),
+    )
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def test_system_tokens_isolate_components_traces_and_policy(admin_client):
+    admin_token = _login(admin_client)
+    system_a = _create_system(admin_client, admin_token, "Support API")
+    system_b = _create_system(admin_client, admin_token, "Document Pipeline")
+    token_a = _issue_system_token(
+        admin_client, admin_token, system_a["id"], "support-production"
+    )
+    token_b = _issue_system_token(
+        admin_client, admin_token, system_b["id"], "documents-production"
+    )
+
+    # The same component and trace ids are valid in separate systems.
+    r = admin_client.post(
+        "/traces",
+        json=_trace(component_id="shared", trace_id="same-trace"),
+        headers={"X-Api-Key": token_a["token"]},
+    )
+    assert r.status_code == 201
+    trace_b = _trace(component_id="shared", trace_id="same-trace")
+    trace_b["output"] = "'SYSTEM_B'"
+    r = admin_client.post(
+        "/traces", json=trace_b, headers={"X-Api-Key": token_b["token"]}
+    )
+    assert r.status_code == 201
+
+    r = admin_client.put(
+        "/components/shared/policy",
+        json={"mode": "shadow"},
+        headers={"X-Api-Key": token_a["token"]},
+    )
+    assert r.status_code == 200
+
+    policy_a = admin_client.get(
+        "/components/shared/policy", headers={"X-Api-Key": token_a["token"]}
+    ).json()
+    policy_b = admin_client.get(
+        "/components/shared/policy", headers={"X-Api-Key": token_b["token"]}
+    ).json()
+    assert policy_a["mode"] == "shadow"
+    assert policy_b["mode"] == "trace"
+
+    rows_a = admin_client.get(
+        "/components/shared/traces", headers={"X-Api-Key": token_a["token"]}
+    ).json()
+    rows_b = admin_client.get(
+        "/components/shared/traces", headers={"X-Api-Key": token_b["token"]}
+    ).json()
+    assert rows_a[0]["output"] == "'HI'"
+    assert rows_b[0]["output"] == "'SYSTEM_B'"
+
+    systems = admin_client.get("/systems", headers=_bearer(admin_token)).json()
+    summaries = {system["id"]: system for system in systems}
+    assert summaries[system_a["id"]]["trace_count"] == 1
+    assert summaries[system_b["id"]]["trace_count"] == 1
+
+
+def test_user_cannot_select_or_issue_token_for_another_users_system(admin_client):
+    admin_token = _login(admin_client)
+    admin_system = _create_system(admin_client, admin_token, "Admin System")
+    _create_user(admin_client, admin_token)
+    user_token = _login(admin_client, "alice", "pw")
+    user_system = _create_system(admin_client, user_token, "Alice System")
+
+    visible = admin_client.get("/systems", headers=_bearer(user_token)).json()
+    assert [system["id"] for system in visible] == [user_system["id"]]
+
+    headers = {
+        **_bearer(user_token),
+        "X-Probe-System-Id": str(admin_system["id"]),
+    }
+    assert admin_client.get("/components", headers=headers).status_code == 403
+
+    r = admin_client.post(
+        "/tokens/me",
+        json={"name": "forbidden", "system_id": admin_system["id"]},
+        headers=_bearer(user_token),
+    )
+    assert r.status_code == 403
+
+
+def test_delete_system_removes_its_tokens_and_data(admin_client):
+    admin_token = _login(admin_client)
+    system = _create_system(admin_client, admin_token, "Disposable")
+    api_token = _issue_system_token(
+        admin_client, admin_token, system["id"], "disposable-token"
+    )
+    admin_client.post(
+        "/traces",
+        json=_trace(trace_id="disposable-trace"),
+        headers={"X-Api-Key": api_token["token"]},
+    )
+
+    r = admin_client.delete(
+        f"/systems/{system['id']}", headers=_bearer(admin_token)
+    )
+    assert r.status_code == 204
+    assert (
+        admin_client.post(
+            "/traces",
+            json=_trace(trace_id="after-delete"),
+            headers={"X-Api-Key": api_token["token"]},
+        ).status_code
+        == 401
+    )
+    systems = admin_client.get("/systems", headers=_bearer(admin_token)).json()
+    assert all(row["id"] != system["id"] for row in systems)
+
+
+def test_generation_run_uses_trace_input_and_mock_llm(admin_client, monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    from app.llm import get_llm_client
+
+    get_llm_client.cache_clear()
+    admin_token = _login(admin_client)
+    system = _create_system(admin_client, admin_token, "Generation System")
+    api_token = _issue_system_token(
+        admin_client, admin_token, system["id"], "generation-token"
+    )
+    trace = _trace(component_id="summarizer", trace_id="gen-trace")
+    trace["input"] = {"args": ["'hello'"], "kwargs": {}}
+    trace["output"] = "'hello'"
+    r = admin_client.post(
+        "/traces", json=trace, headers={"X-Api-Key": api_token["token"]}
+    )
+    assert r.status_code == 201
+
+    r = admin_client.post(
+        "/generation-runs",
+        json={
+            "component_id": "summarizer",
+            "trace_id": "gen-trace",
+            "objective": "uppercase the output",
+        },
+        headers=_bearer(admin_token) | {"X-Probe-System-Id": str(system["id"])},
+    )
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["component_id"] == "summarizer"
+    assert body["candidate_output"] == "'HELLO'"
+    assert body["llm_verdict"] == "better"
+    assert "def candidate" in body["generated_code"]
+
+    r = admin_client.get(
+        "/generation-runs?component_id=summarizer&trace_id=gen-trace",
+        headers=_bearer(admin_token) | {"X-Probe-System-Id": str(system["id"])},
+    )
+    assert r.status_code == 200
+    assert r.json()[0]["id"] == body["id"]
+
+
+def test_generation_run_is_system_scoped(admin_client, monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    from app.llm import get_llm_client
+
+    get_llm_client.cache_clear()
+    admin_token = _login(admin_client)
+    system_a = _create_system(admin_client, admin_token, "Generation A")
+    system_b = _create_system(admin_client, admin_token, "Generation B")
+    token_a = _issue_system_token(admin_client, admin_token, system_a["id"], "a")
+    trace = _trace(component_id="shared", trace_id="same-id")
+    trace["input"] = {"args": ["'a'"], "kwargs": {}}
+    admin_client.post("/traces", json=trace, headers={"X-Api-Key": token_a["token"]})
+
+    r = admin_client.post(
+        "/generation-runs",
+        json={
+            "component_id": "shared",
+            "trace_id": "same-id",
+            "objective": "uppercase",
+        },
+        headers=_bearer(admin_token) | {"X-Probe-System-Id": str(system_b["id"])},
+    )
+    assert r.status_code == 404
+
+
 def test_deactivated_user_cannot_authenticate(admin_client):
     admin_token = _login(admin_client)
     r = admin_client.post(
@@ -564,6 +763,194 @@ def test_cannot_delete_last_active_admin(admin_client):
         f"/users/{second_id}/deactivate", headers=_bearer(second_token)
     )
     assert r.status_code == 409
+
+
+def test_logout_revokes_session_token(admin_client):
+    token = _login(admin_client)
+    r = admin_client.post("/auth/logout", headers=_bearer(token))
+    assert r.status_code == 204
+    r = admin_client.get("/auth/me", headers=_bearer(token))
+    assert r.status_code == 401
+
+
+def _create_user(client, admin_token, username="alice", password="pw", role="user"):
+    r = client.post(
+        "/users",
+        json={"username": username, "password": password, "role": role},
+        headers=_bearer(admin_token),
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+def test_self_token_issue_list_and_revoke(admin_client):
+    admin_token = _login(admin_client)
+    uid = _create_user(admin_client, admin_token)
+    user_token = _login(admin_client, "alice", "pw")
+
+    # A non-admin user can issue their own API token.
+    r = admin_client.post(
+        "/tokens/me", json={"name": "my sdk token"}, headers=_bearer(user_token)
+    )
+    assert r.status_code == 201
+    body = r.json()
+    assert body["user_id"] == uid
+    assert body["kind"] == "api"
+    raw = body["token"]
+    token_id = body["id"]
+
+    # The issued token authenticates SDK-style requests.
+    r = admin_client.post("/traces", json=_trace(), headers={"X-Api-Key": raw})
+    assert r.status_code == 201
+
+    # The listing contains only the caller's tokens (session + api).
+    r = admin_client.get("/tokens/me", headers=_bearer(user_token))
+    assert r.status_code == 200
+    tokens = r.json()
+    assert {t["user_id"] for t in tokens} == {uid}
+    assert any(t["id"] == token_id for t in tokens)
+    # Raw token material is never included in listings.
+    assert all("token" not in t for t in tokens)
+
+    # The user can revoke their own token, after which it stops working.
+    r = admin_client.post(
+        f"/tokens/me/{token_id}/revoke", headers=_bearer(user_token)
+    )
+    assert r.status_code == 200
+    assert r.json()["revoked"] is True
+    r = admin_client.post("/traces", json=_trace(), headers={"X-Api-Key": raw})
+    assert r.status_code == 401
+
+
+def test_self_token_cannot_revoke_others_token(admin_client):
+    admin_token = _login(admin_client)
+    _create_user(admin_client, admin_token)
+    user_token = _login(admin_client, "alice", "pw")
+
+    r = admin_client.post(
+        "/tokens/me", json={"name": "admin token"}, headers=_bearer(admin_token)
+    )
+    admin_owned_id = r.json()["id"]
+
+    r = admin_client.post(
+        f"/tokens/me/{admin_owned_id}/revoke", headers=_bearer(user_token)
+    )
+    assert r.status_code == 404
+    # The admin's token is untouched.
+    r = admin_client.get("/tokens", headers=_bearer(admin_token))
+    target = next(t for t in r.json() if t["id"] == admin_owned_id)
+    assert target["revoked"] is False
+
+
+def test_self_token_endpoints_reject_legacy_key(auth_client):
+    r = auth_client.get("/tokens/me", headers={"X-Api-Key": "good-key"})
+    assert r.status_code == 403
+    r = auth_client.post(
+        "/tokens/me", json={"name": "x"}, headers={"X-Api-Key": "good-key"}
+    )
+    assert r.status_code == 403
+
+
+def test_self_token_endpoints_reject_anonymous(client):
+    # Auth disabled (no users, no legacy keys): there is no user account to
+    # attach a token to.
+    r = client.get("/tokens/me")
+    assert r.status_code == 403
+
+
+def test_admin_tokens_endpoints_reject_non_admin(admin_client):
+    admin_token = _login(admin_client)
+    _create_user(admin_client, admin_token)
+    user_token = _login(admin_client, "alice", "pw")
+
+    assert admin_client.get("/tokens", headers=_bearer(user_token)).status_code == 403
+    r = admin_client.post(
+        "/tokens", json={"name": "x"}, headers=_bearer(user_token)
+    )
+    assert r.status_code == 403
+
+
+def test_admin_password_reset(admin_client):
+    admin_token = _login(admin_client)
+    uid = _create_user(admin_client, admin_token)
+    old_session = _login(admin_client, "alice", "pw")
+    r = admin_client.post(
+        "/tokens/me", json={"name": "sdk"}, headers=_bearer(old_session)
+    )
+    api_raw = r.json()["token"]
+
+    r = admin_client.post(
+        f"/users/{uid}/password",
+        json={"password": "newpw"},
+        headers=_bearer(admin_token),
+    )
+    assert r.status_code == 200
+
+    # Old password no longer works; the new one does.
+    r = admin_client.post("/auth/login", json={"username": "alice", "password": "pw"})
+    assert r.status_code == 401
+    _login(admin_client, "alice", "newpw")
+
+    # Existing sessions are revoked, but API tokens keep working.
+    r = admin_client.get("/auth/me", headers=_bearer(old_session))
+    assert r.status_code == 401
+    r = admin_client.get("/auth/me", headers={"X-Api-Key": api_raw})
+    assert r.status_code == 200
+
+
+def test_password_reset_requires_admin_and_existing_user(admin_client):
+    admin_token = _login(admin_client)
+    _create_user(admin_client, admin_token)
+    user_token = _login(admin_client, "alice", "pw")
+
+    r = admin_client.post(
+        "/users/1/password", json={"password": "x"}, headers=_bearer(user_token)
+    )
+    assert r.status_code == 403
+    r = admin_client.post(
+        "/users/9999/password", json={"password": "x"}, headers=_bearer(admin_token)
+    )
+    assert r.status_code == 404
+
+
+def test_admin_role_change(admin_client):
+    admin_token = _login(admin_client)
+    uid = _create_user(admin_client, admin_token)
+    user_token = _login(admin_client, "alice", "pw")
+    assert admin_client.get("/users", headers=_bearer(user_token)).status_code == 403
+
+    r = admin_client.put(
+        f"/users/{uid}/role", json={"role": "admin"}, headers=_bearer(admin_token)
+    )
+    assert r.status_code == 200
+    assert r.json()["role"] == "admin"
+    assert admin_client.get("/users", headers=_bearer(user_token)).status_code == 200
+
+    r = admin_client.put(
+        f"/users/{uid}/role", json={"role": "user"}, headers=_bearer(admin_token)
+    )
+    assert r.status_code == 200
+    assert admin_client.get("/users", headers=_bearer(user_token)).status_code == 403
+
+
+def test_cannot_demote_last_active_admin(admin_client):
+    admin_token = _login(admin_client)
+    me = admin_client.get("/auth/me", headers=_bearer(admin_token)).json()
+    root_id = me["user"]["id"]
+    r = admin_client.put(
+        f"/users/{root_id}/role", json={"role": "user"}, headers=_bearer(admin_token)
+    )
+    assert r.status_code == 409
+
+
+def test_role_change_requires_admin(admin_client):
+    admin_token = _login(admin_client)
+    uid = _create_user(admin_client, admin_token)
+    user_token = _login(admin_client, "alice", "pw")
+    r = admin_client.put(
+        f"/users/{uid}/role", json={"role": "admin"}, headers=_bearer(user_token)
+    )
+    assert r.status_code == 403
 
 
 def test_cannot_deactivate_last_active_admin(admin_client):

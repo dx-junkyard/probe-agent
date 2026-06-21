@@ -41,8 +41,18 @@ Re-evaluating a trace replaces its prior results (idempotent).
 - Tokens are random (`secrets.token_urlsafe`) and stored only as SHA-256 hashes in `api_tokens`.
 - Accept credentials via `Authorization: Bearer <token>` or `X-Api-Key: <token>`.
 - Resolve the caller with `get_principal`; guard admin endpoints with `require_admin`.
-- Admin-only: create/list users, deactivate users, issue/list/revoke tokens.
-- Deactivating a user must revoke their tokens. Revoked/expired/inactive tokens return 401.
+- Admin-only: create/list users, deactivate/delete users, reset passwords
+  (`POST /users/{id}/password`), change roles (`PUT /users/{id}/role`), and
+  issue/list/revoke any token (`GET/POST /tokens`, `POST /tokens/{id}/revoke`).
+- Self-service token endpoints require a user principal (`require_user`):
+  `GET /tokens/me`, `POST /tokens/me`, `POST /tokens/me/{id}/revoke`.
+  Legacy API keys and anonymous callers get 403; revoking a token owned by
+  someone else returns 404.
+- `POST /auth/logout` revokes the calling token (no-op for legacy keys).
+- Deactivating a user must revoke their tokens. Resetting a password must
+  revoke the user's session tokens (API tokens stay valid).
+- Role changes must not demote the last active admin (409).
+- Revoked/expired/inactive tokens return 401.
 
 ## Rules
 
@@ -65,4 +75,7 @@ Add or update tests for:
 - policy read/update
 - shadow result ingestion
 - schema compatibility
-- auth: login, authenticated user, admin-only access, token issue/revoke, deactivation
+- auth: login/logout, authenticated user, admin-only access, token issue/revoke, deactivation
+- self-service tokens: issue/list/revoke own tokens, cannot touch other users' tokens,
+  legacy key / anonymous rejected
+- password reset and role change permissions and guards

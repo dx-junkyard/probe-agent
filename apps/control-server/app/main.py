@@ -4,7 +4,7 @@ from fastapi import Depends, FastAPI
 
 from .auth import get_principal
 from .db import init_db
-from .routes import auth, components, evaluation, shadow, traces
+from .routes import auth, components, evaluation, generation, shadow, systems, traces
 
 _auth = [Depends(get_principal)]
 
@@ -25,10 +25,12 @@ def create_app() -> FastAPI:
     # Auth router carries its own per-route dependencies (login is public,
     # admin endpoints require an admin principal).
     app.include_router(auth.router)
+    app.include_router(systems.router)
     app.include_router(traces.router, dependencies=_auth)
     app.include_router(components.router, dependencies=_auth)
     app.include_router(shadow.router, dependencies=_auth)
     app.include_router(evaluation.router, dependencies=_auth)
+    app.include_router(generation.router, dependencies=_auth)
     return app
 
 

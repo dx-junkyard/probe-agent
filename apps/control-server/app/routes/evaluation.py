@@ -2,9 +2,10 @@ import json
 import time
 from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 from .. import evaluator
+from ..auth import get_system_id
 from ..db import get_conn
 from ..models import (
     ComponentProfile,
@@ -19,13 +20,14 @@ from ..models import (
 
 router = APIRouter()
 
-_SYSTEM_PROFILE_ID = "default"
-
-
-def _ensure_component(conn, component_id: str) -> None:
+def _ensure_component(conn, system_id: int, component_id: str) -> None:
     conn.execute(
-        "INSERT OR IGNORE INTO components (component_id, mode, updated_at) VALUES (?, 'trace', ?)",
-        (component_id, time.time()),
+        """
+        INSERT OR IGNORE INTO components
+            (system_id, component_id, mode, updated_at)
+        VALUES (?, ?, 'trace', ?)
+        """,
+        (system_id, component_id, time.time()),
     )
 
 
@@ -43,10 +45,12 @@ def _loads_list(raw: Optional[str]) -> List[str]:
 
 
 @router.get("/system-profile", response_model=SystemProfile)
-def get_system_profile() -> SystemProfile:
+def get_system_profile(
+    system_id: int = Depends(get_system_id),
+) -> SystemProfile:
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT * FROM system_profile WHERE id = ?", (_SYSTEM_PROFILE_ID,)
+            "SELECT * FROM system_profile WHERE system_id = ?", (system_id,)
         ).fetchone()
     if row is None:
         return SystemProfile()
@@ -63,20 +67,23 @@ def get_system_profile() -> SystemProfile:
 
 
 @router.put("/system-profile", response_model=SystemProfile)
-def put_system_profile(update: SystemProfileUpdate) -> SystemProfile:
+def put_system_profile(
+    update: SystemProfileUpdate,
+    system_id: int = Depends(get_system_id),
+) -> SystemProfile:
     now = time.time()
     with get_conn() as conn:
         existing = conn.execute(
-            "SELECT created_at FROM system_profile WHERE id = ?", (_SYSTEM_PROFILE_ID,)
+            "SELECT created_at FROM system_profile WHERE system_id = ?", (system_id,)
         ).fetchone()
         created_at = existing["created_at"] if existing and existing["created_at"] else now
         conn.execute(
             """
             INSERT INTO system_profile
-                (id, name, purpose, target_users, stakeholder_value,
+                (system_id, name, purpose, target_users, stakeholder_value,
                  constraints, success_criteria, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
+            ON CONFLICT(system_id) DO UPDATE SET
                 name = excluded.name,
                 purpose = excluded.purpose,
                 target_users = excluded.target_users,
@@ -86,7 +93,7 @@ def put_system_profile(update: SystemProfileUpdate) -> SystemProfile:
                 updated_at = excluded.updated_at
             """,
             (
-                _SYSTEM_PROFILE_ID,
+                system_id,
                 update.name,
                 update.purpose,
                 json.dumps(update.target_users, ensure_ascii=False),
@@ -113,10 +120,19 @@ def put_system_profile(update: SystemProfileUpdate) -> SystemProfile:
 
 
 @router.get("/components/{component_id}/profile", response_model=ComponentProfile)
-def get_component_profile(component_id: str) -> ComponentProfile:
+def get_component_profile(
+    component_id: str,
+    system_id: int = Depends(get_system_id),
+) -> ComponentProfile:
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT * FROM component_profiles WHERE component_id = ?", (component_id,)
+            """
+            SELECT component_id, purpose, responsibility, expected_input,
+                   expected_output, failure_impact, notes, created_at, updated_at
+            FROM component_profiles
+            WHERE system_id = ? AND component_id = ?
+            """,
+            (system_id, component_id),
         ).fetchone()
     if row is None:
         return ComponentProfile(component_id=component_id)
@@ -125,23 +141,28 @@ def get_component_profile(component_id: str) -> ComponentProfile:
 
 @router.put("/components/{component_id}/profile", response_model=ComponentProfile)
 def put_component_profile(
-    component_id: str, update: ComponentProfileUpdate
+    component_id: str,
+    update: ComponentProfileUpdate,
+    system_id: int = Depends(get_system_id),
 ) -> ComponentProfile:
     now = time.time()
     with get_conn() as conn:
-        _ensure_component(conn, component_id)
+        _ensure_component(conn, system_id, component_id)
         existing = conn.execute(
-            "SELECT created_at FROM component_profiles WHERE component_id = ?",
-            (component_id,),
+            """
+            SELECT created_at FROM component_profiles
+            WHERE system_id = ? AND component_id = ?
+            """,
+            (system_id, component_id),
         ).fetchone()
         created_at = existing["created_at"] if existing and existing["created_at"] else now
         conn.execute(
             """
             INSERT INTO component_profiles
-                (component_id, purpose, responsibility, expected_input,
+                (system_id, component_id, purpose, responsibility, expected_input,
                  expected_output, failure_impact, notes, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(component_id) DO UPDATE SET
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(system_id, component_id) DO UPDATE SET
                 purpose = excluded.purpose,
                 responsibility = excluded.responsibility,
                 expected_input = excluded.expected_input,
@@ -151,6 +172,7 @@ def put_component_profile(
                 updated_at = excluded.updated_at
             """,
             (
+                system_id,
                 component_id,
                 update.purpose,
                 update.responsibility,
@@ -192,11 +214,18 @@ def _row_to_criterion(row) -> EvaluationCriterion:
     "/components/{component_id}/criteria",
     response_model=List[EvaluationCriterion],
 )
-def list_criteria(component_id: str) -> List[EvaluationCriterion]:
+def list_criteria(
+    component_id: str,
+    system_id: int = Depends(get_system_id),
+) -> List[EvaluationCriterion]:
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM evaluation_criteria WHERE component_id = ? ORDER BY id",
-            (component_id,),
+            """
+            SELECT * FROM evaluation_criteria
+            WHERE system_id = ? AND component_id = ?
+            ORDER BY id
+            """,
+            (system_id, component_id),
         ).fetchall()
     return [_row_to_criterion(r) for r in rows]
 
@@ -207,19 +236,22 @@ def list_criteria(component_id: str) -> List[EvaluationCriterion]:
     status_code=201,
 )
 def create_criterion(
-    component_id: str, payload: CriterionCreate
+    component_id: str,
+    payload: CriterionCreate,
+    system_id: int = Depends(get_system_id),
 ) -> EvaluationCriterion:
     now = time.time()
     with get_conn() as conn:
-        _ensure_component(conn, component_id)
+        _ensure_component(conn, system_id, component_id)
         cur = conn.execute(
             """
             INSERT INTO evaluation_criteria
-                (component_id, name, description, criterion_type, expected_value,
+                (system_id, component_id, name, description, criterion_type, expected_value,
                  weight, enabled, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                system_id,
                 component_id,
                 payload.name,
                 payload.description,
@@ -243,7 +275,9 @@ def create_criterion(
 
 @router.put("/criteria/{criterion_id}", response_model=EvaluationCriterion)
 def update_criterion(
-    criterion_id: int, payload: CriterionUpdate
+    criterion_id: int,
+    payload: CriterionUpdate,
+    system_id: int = Depends(get_system_id),
 ) -> EvaluationCriterion:
     now = time.time()
     with get_conn() as conn:
@@ -257,7 +291,7 @@ def update_criterion(
                 weight = ?,
                 enabled = ?,
                 updated_at = ?
-            WHERE id = ?
+            WHERE id = ? AND system_id = ?
             """,
             (
                 payload.name,
@@ -268,12 +302,14 @@ def update_criterion(
                 1 if payload.enabled else 0,
                 now,
                 criterion_id,
+                system_id,
             ),
         )
         if cur.rowcount == 0:
             raise HTTPException(404, "criterion not found")
         row = conn.execute(
-            "SELECT * FROM evaluation_criteria WHERE id = ?", (criterion_id,)
+            "SELECT * FROM evaluation_criteria WHERE id = ? AND system_id = ?",
+            (criterion_id, system_id),
         ).fetchone()
     return _row_to_criterion(row)
 
@@ -285,12 +321,18 @@ def update_criterion(
     "/traces/{trace_id}/evaluate",
     response_model=List[EvaluationResult],
 )
-def evaluate_trace(trace_id: str) -> List[EvaluationResult]:
+def evaluate_trace(
+    trace_id: str,
+    system_id: int = Depends(get_system_id),
+) -> List[EvaluationResult]:
     now = time.time()
     with get_conn() as conn:
         trace = conn.execute(
-            "SELECT component_id, output_text FROM traces WHERE trace_id = ?",
-            (trace_id,),
+            """
+            SELECT component_id, output_text FROM traces
+            WHERE system_id = ? AND trace_id = ?
+            """,
+            (system_id, trace_id),
         ).fetchone()
         if trace is None:
             raise HTTPException(404, "trace not found")
@@ -300,14 +342,17 @@ def evaluate_trace(trace_id: str) -> List[EvaluationResult]:
         criteria = conn.execute(
             """
             SELECT * FROM evaluation_criteria
-            WHERE component_id = ? AND enabled = 1
+            WHERE system_id = ? AND component_id = ? AND enabled = 1
             ORDER BY id
             """,
-            (component_id,),
+            (system_id, component_id),
         ).fetchall()
 
         # Re-evaluation replaces prior results for this trace.
-        conn.execute("DELETE FROM evaluation_results WHERE trace_id = ?", (trace_id,))
+        conn.execute(
+            "DELETE FROM evaluation_results WHERE system_id = ? AND trace_id = ?",
+            (system_id, trace_id),
+        )
 
         results: List[EvaluationResult] = []
         for c in criteria:
@@ -317,11 +362,12 @@ def evaluate_trace(trace_id: str) -> List[EvaluationResult]:
             cur = conn.execute(
                 """
                 INSERT INTO evaluation_results
-                    (trace_id, component_id, criterion_id, status, score,
+                    (system_id, trace_id, component_id, criterion_id, status, score,
                      reason, actual_output, expected_value, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    system_id,
                     trace_id,
                     component_id,
                     c["id"],
@@ -354,10 +400,17 @@ def evaluate_trace(trace_id: str) -> List[EvaluationResult]:
     "/traces/{trace_id}/evaluations",
     response_model=List[EvaluationResult],
 )
-def list_evaluations(trace_id: str) -> List[EvaluationResult]:
+def list_evaluations(
+    trace_id: str,
+    system_id: int = Depends(get_system_id),
+) -> List[EvaluationResult]:
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM evaluation_results WHERE trace_id = ? ORDER BY id",
-            (trace_id,),
+            """
+            SELECT * FROM evaluation_results
+            WHERE system_id = ? AND trace_id = ?
+            ORDER BY id
+            """,
+            (system_id, trace_id),
         ).fetchall()
     return [EvaluationResult(**dict(r)) for r in rows]
