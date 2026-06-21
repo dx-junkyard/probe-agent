@@ -513,6 +513,11 @@ class ValidationRunOut(BaseModel):
     worktree_path: str
     overall_success: bool
     total_duration_ms: float
+    trace_received: Optional[bool] = None
+    trace_status: str = "not_checked"
+    network_isolation: str = "not_requested"
+    cleanup_state: str = "not_attempted"
+    cleanup_error: Optional[str] = None
     commands: List[ValidationCommandOut] = Field(default_factory=list)
     error: Optional[str] = None
     created_at: float

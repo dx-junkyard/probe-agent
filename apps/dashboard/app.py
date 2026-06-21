@@ -1578,6 +1578,13 @@ def render_probe_planner_tab(system: Dict[str, Any]) -> None:
                 st.error(patch["error"])
             if patch.get("diff"):
                 st.code(patch["diff"], language="diff")
+                st.download_button(
+                    "Download diff",
+                    data=patch["diff"],
+                    file_name=f"probe-patch-{patch_id}.diff",
+                    mime="text/x-diff",
+                    key=f"download-patch-{patch_id}",
+                )
             if patch.get("skipped"):
                 st.markdown("**Skipped**")
                 for s in patch["skipped"]:
@@ -1595,6 +1602,21 @@ def render_probe_planner_tab(system: Dict[str, Any]) -> None:
                     )
                     if vr.get("error"):
                         st.error(vr["error"])
+                    trace_status = vr.get("trace_status", "not_checked")
+                    if vr.get("variant") == "probed":
+                        if trace_status == "received":
+                            st.success("Trace received")
+                        elif trace_status == "missing":
+                            st.warning("Trace missing")
+                    st.caption(
+                        f"network isolation: {vr.get('network_isolation', 'not_requested')} · "
+                        f"workspace cleanup: {vr.get('cleanup_state', 'not_attempted')}"
+                    )
+                    if vr.get("cleanup_error"):
+                        st.error(
+                            f"Cleanup failed for {vr.get('worktree_path', '')}: "
+                            f"{vr['cleanup_error']}"
+                        )
                     for cmd in vr.get("commands", []):
                         cmd_ok = cmd.get("exit_code", -1) == 0
                         cmd_icon = "✅" if cmd_ok else "❌"

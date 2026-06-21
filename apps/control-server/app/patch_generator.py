@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import textwrap
+import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -44,6 +45,14 @@ class PatchResult:
     error: Optional[str] = None
 
 
+@dataclass
+class CleanupResult:
+    worktree_path: str
+    success: bool
+    state: str
+    error: Optional[str] = None
+
+
 def _has_probe_decorator(func_node: ast.AST) -> bool:
     decorator_list = getattr(func_node, "decorator_list", [])
     for dec in decorator_list:
@@ -71,12 +80,8 @@ def _has_probe_import(source: str) -> bool:
         if isinstance(node, ast.ImportFrom):
             if node.module and "probe_agent" in node.module:
                 for alias in node.names:
-                    if alias.name == "probe":
+                    if alias.name == "probe" and alias.asname in (None, "probe"):
                         return True
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if "probe_agent" in alias.name:
-                    return True
     return False
 
 
@@ -86,7 +91,15 @@ def _find_import_insert_line(source: str) -> int:
     except SyntaxError:
         return 0
     last_import_line = 0
-    for node in ast.iter_child_nodes(tree):
+    body = list(ast.iter_child_nodes(tree))
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, (ast.Str, ast.Constant))
+        and isinstance(getattr(body[0].value, "value", None), str)
+    ):
+        last_import_line = getattr(body[0], "end_lineno", body[0].lineno)
+    for node in body:
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             end = getattr(node, "end_lineno", node.lineno) or node.lineno
             last_import_line = max(last_import_line, end)
@@ -191,9 +204,10 @@ def create_worktree(
 ) -> str:
     real_path = _validate_repo_path(repo_path)
 
-    worktree_dir = os.path.join(worktree_base, f"probe-patch-{commit_sha[:12]}")
-    if os.path.exists(worktree_dir):
-        shutil.rmtree(worktree_dir)
+    worktree_dir = os.path.join(
+        worktree_base,
+        f"probe-patch-{commit_sha[:12]}-{uuid.uuid4().hex[:8]}",
+    )
     os.makedirs(worktree_dir, exist_ok=True)
 
     result = _run_git(real_path, [
@@ -206,17 +220,40 @@ def create_worktree(
     return worktree_dir
 
 
-def cleanup_worktree(repo_path: str, worktree_path: str) -> None:
+def cleanup_worktree(repo_path: str, worktree_path: str) -> CleanupResult:
+    errors = []
     try:
         real_path = _validate_repo_path(repo_path)
-        _run_git(real_path, ["worktree", "remove", "--force", worktree_path], timeout=30)
-    except (GitError, Exception):
-        pass
+        result = _run_git(
+            real_path, ["worktree", "remove", "--force", worktree_path], timeout=30
+        )
+        if result.returncode != 0:
+            errors.append(
+                result.stderr.decode("utf-8", errors="replace").strip()
+                or "git worktree remove failed"
+            )
+    except Exception as exc:
+        errors.append(str(exc))
     if os.path.exists(worktree_path):
         try:
             shutil.rmtree(worktree_path)
-        except OSError:
-            pass
+        except OSError as exc:
+            errors.append(str(exc))
+
+    exists = os.path.exists(worktree_path)
+    if exists:
+        return CleanupResult(
+            worktree_path=worktree_path,
+            success=False,
+            state="cleanup_failed",
+            error="; ".join(e for e in errors if e) or "workspace still exists",
+        )
+    return CleanupResult(
+        worktree_path=worktree_path,
+        success=True,
+        state="removed",
+        error="; ".join(e for e in errors if e) or None,
+    )
 
 
 def generate_patch(
@@ -255,12 +292,16 @@ def generate_patch(
     try:
         for path, file_points in sorted(points_by_file.items()):
             full_path = os.path.join(worktree_path, path)
+            normalized = os.path.realpath(full_path)
+            worktree_real = os.path.realpath(worktree_path)
+            if (
+                os.path.islink(full_path)
+                or not normalized.startswith(worktree_real + os.sep)
+            ):
+                all_skipped.append(f"{path}: path traversal or symlink detected")
+                continue
             if not os.path.isfile(full_path):
                 all_skipped.append(f"{path}: file not found in worktree")
-                continue
-            normalized = os.path.normpath(full_path)
-            if not normalized.startswith(os.path.normpath(worktree_path) + os.sep):
-                all_skipped.append(f"{path}: path traversal detected")
                 continue
 
             with open(full_path, "r", encoding="utf-8", errors="replace") as f:

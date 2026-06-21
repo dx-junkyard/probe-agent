@@ -131,7 +131,7 @@ def git_repo(tmp_path):
             - echo "smoke ok"
         runtime:
           timeout_seconds: 30
-          network: false
+          network: true
     """))
 
     subprocess.run(
@@ -312,6 +312,7 @@ class TestSafetyDenylist:
         assert check_denylist("list_users", None) is None
         assert check_denylist("summarize_text", None) is None
         assert check_denylist("classify_item", None) is None
+        assert check_denylist("display_user", None) is None
 
     def test_docstring_is_checked(self):
         from app.probe_planner import check_denylist
@@ -432,6 +433,36 @@ class TestInstrumentFile:
         patched, skipped = instrument_file(source, [point])
         assert patched.count("from probe_agent import probe") == 1
 
+    def test_plain_module_import_does_not_count_as_probe_binding(self):
+        from app.patch_generator import ApprovedPoint, instrument_file
+
+        source = "import probe_agent\n\ndef my_func():\n    return 42\n"
+        point = ApprovedPoint(
+            component_id="test-comp",
+            path="test.py",
+            symbol="my_func",
+            recommended_mode="trace",
+            line_start=3,
+            line_end=4,
+        )
+        patched, _ = instrument_file(source, [point])
+        assert "from probe_agent import probe" in patched
+
+    def test_preserves_module_docstring_position(self):
+        from app.patch_generator import ApprovedPoint, instrument_file
+
+        source = '"""module docs"""\n\ndef my_func():\n    return 42\n'
+        point = ApprovedPoint(
+            component_id="test-comp",
+            path="test.py",
+            symbol="my_func",
+            recommended_mode="trace",
+            line_start=3,
+            line_end=4,
+        )
+        patched, _ = instrument_file(source, [point])
+        assert patched.startswith('"""module docs"""\n')
+
 
 # ---------------------------------------------------------------------------
 # Unit tests: validation_runner
@@ -510,6 +541,7 @@ class TestRunValidation:
             test_commands=["echo test"],
             smoke_commands=["echo smoke"],
             timeout_seconds=30,
+            network=True,
         )
         result = run_validation("baseline", str(tmp_path), config)
         assert result.overall_success is True
@@ -524,6 +556,7 @@ class TestRunValidation:
             test_commands=["exit 1"],
             smoke_commands=["echo smoke"],
             timeout_seconds=30,
+            network=True,
         )
         result = run_validation("probed", str(tmp_path), config)
         assert result.overall_success is False
@@ -536,6 +569,7 @@ class TestRunValidation:
             install_commands=["echo install"],
             test_commands=[],
             timeout_seconds=30,
+            network=True,
         )
         result = run_validation("baseline", str(tmp_path), config)
         assert result.error is not None
@@ -910,8 +944,12 @@ class TestValidation:
         runs = result.get("validation_runs", [])
         assert len(runs) >= 1
         baseline = [r for r in runs if r["variant"] == "baseline"]
+        probed = [r for r in runs if r["variant"] == "probed"]
         assert len(baseline) == 1
+        assert len(probed) == 1
         assert baseline[0]["overall_success"] is True
+        assert baseline[0]["cleanup_state"] == "removed"
+        assert probed[0]["trace_status"] == "missing"
         for cmd in baseline[0]["commands"]:
             assert cmd["exit_code"] == 0
 
@@ -1044,3 +1082,39 @@ class TestPatchesList:
         patches = r.json()
         assert len(patches) >= 1
         assert patches[0]["plan_id"] == plan["id"]
+
+    def test_download_patch(
+        self, admin_client, git_repo, tmp_path, monkeypatch
+    ):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "patch-download-test")
+        h = _setup_full_pipeline(
+            admin_client, token, system["id"], git_repo, monkeypatch,
+        )
+        monkeypatch.setenv("PROBE_WORKTREE_BASE", str(tmp_path / "worktrees"))
+
+        _enable_reasoning(monkeypatch, _ReasoningProbePlanClient)
+        from app.llm import get_llm_client
+        get_llm_client.cache_clear()
+
+        plan = admin_client.post(
+            "/repository/probe-plans/generate?feature_id=user-management",
+            headers=h,
+        ).json()
+        admin_client.put(
+            f"/repository/probe-points/{plan['probe_points'][0]['id']}/status",
+            json={"status": "approved"},
+            headers=h,
+        )
+        patch = admin_client.post(
+            f"/repository/probe-plans/{plan['id']}/patch",
+            headers=h,
+        ).json()
+
+        r = admin_client.get(
+            f"/repository/probe-patches/{patch['id']}/download",
+            headers=h,
+        )
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/x-diff")
+        assert "@probe" in r.text

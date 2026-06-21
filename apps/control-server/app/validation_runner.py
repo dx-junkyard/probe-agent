@@ -7,6 +7,8 @@ Network is disabled by default; environment variables are allowlisted.
 from __future__ import annotations
 
 import os
+import platform
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -39,6 +41,9 @@ class ValidationResult:
     overall_success: bool = False
     total_duration_ms: float = 0.0
     error: Optional[str] = None
+    network_isolation: str = "not_requested"
+    trace_received: Optional[bool] = None
+    trace_status: str = "not_checked"
 
 
 @dataclass
@@ -51,12 +56,8 @@ class ValidationConfig:
     env_allowlist: Dict[str, str] = field(default_factory=dict)
 
 
-def load_validation_config(config_path: str) -> ValidationConfig:
-    if not os.path.isfile(config_path):
-        raise GitError(f"probe-agent.yml not found: {config_path}")
-
-    with open(config_path, "r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f)
+def load_validation_config_text(raw_text: str) -> ValidationConfig:
+    raw = yaml.safe_load(raw_text)
 
     if not isinstance(raw, dict):
         raise GitError("probe-agent.yml must be a YAML mapping")
@@ -84,7 +85,7 @@ def load_validation_config(config_path: str) -> ValidationConfig:
     test = [str(c) for c in test if c]
     smoke = [str(c) for c in smoke if c]
 
-    timeout = int(runtime.get("timeout_seconds", 60))
+    timeout = max(1, min(int(runtime.get("timeout_seconds", 60)), 300))
     network = bool(runtime.get("network", False))
 
     env_allowlist = {}
@@ -97,10 +98,17 @@ def load_validation_config(config_path: str) -> ValidationConfig:
         install_commands=install,
         test_commands=test,
         smoke_commands=smoke,
-        timeout_seconds=min(timeout, 300),
+        timeout_seconds=timeout,
         network=network,
         env_allowlist=env_allowlist,
     )
+
+
+def load_validation_config(config_path: str) -> ValidationConfig:
+    if not os.path.isfile(config_path):
+        raise GitError(f"probe-agent.yml not found: {config_path}")
+    with open(config_path, "r", encoding="utf-8") as f:
+        return load_validation_config_text(f.read())
 
 
 def _build_env(config: ValidationConfig, worktree_path: str) -> Dict[str, str]:
@@ -130,13 +138,47 @@ def _run_command(
     worktree_path: str,
     env: Dict[str, str],
     timeout: int,
+    network: bool = True,
 ) -> CommandResult:
     start = time.monotonic()
     timed_out = False
     try:
+        argv: Any = command
+        use_shell = True
+        if not network:
+            if platform.system() == "Darwin" and shutil.which("sandbox-exec"):
+                argv = [
+                    "sandbox-exec",
+                    "-p",
+                    "(version 1) (allow default) (deny network*)",
+                    "/bin/sh",
+                    "-c",
+                    command,
+                ]
+                use_shell = False
+            elif shutil.which("bwrap"):
+                argv = [
+                    "bwrap", "--unshare-net", "--dev-bind", "/", "/",
+                    "/bin/sh", "-c", command,
+                ]
+                use_shell = False
+            elif shutil.which("unshare"):
+                argv = ["unshare", "--user", "--map-root-user", "--net", "/bin/sh", "-c", command]
+                use_shell = False
+            else:
+                return CommandResult(
+                    command=command,
+                    exit_code=-1,
+                    duration_ms=0.0,
+                    stdout="",
+                    stderr=(
+                        "Network isolation was requested but no supported "
+                        "sandbox backend is available"
+                    ),
+                )
         result = subprocess.run(
-            command,
-            shell=True,
+            argv,
+            shell=use_shell,
             cwd=worktree_path,
             env=env,
             capture_output=True,
@@ -209,11 +251,19 @@ def run_validation(
         )
 
     overall_success = True
+    isolation_failed = False
     for command, phase in all_commands:
         cmd_result = _run_command(
-            command, worktree_path, env, config.timeout_seconds,
+            command, worktree_path, env, config.timeout_seconds, config.network,
         )
         results.append(cmd_result)
+        if not config.network and (
+            "unshare failed" in cmd_result.stderr
+            or "sandbox backend is available" in cmd_result.stderr
+            or "sandbox-exec" in cmd_result.stderr.lower()
+            and "operation not permitted" in cmd_result.stderr.lower()
+        ):
+            isolation_failed = True
         if cmd_result.exit_code != 0:
             overall_success = False
             if phase in ("install", "test"):
@@ -227,4 +277,8 @@ def run_validation(
         results=results,
         overall_success=overall_success,
         total_duration_ms=total_duration_ms,
+        network_isolation=(
+            "disabled" if config.network
+            else ("failed" if isolation_failed else "enforced")
+        ),
     )

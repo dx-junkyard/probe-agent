@@ -479,6 +479,11 @@ CREATE TABLE IF NOT EXISTS validation_runs (
     worktree_path        TEXT NOT NULL,
     overall_success      INTEGER NOT NULL DEFAULT 0,
     total_duration_ms    REAL NOT NULL DEFAULT 0.0,
+    trace_received       INTEGER,
+    trace_status         TEXT NOT NULL DEFAULT 'not_checked',
+    network_isolation    TEXT NOT NULL DEFAULT 'not_requested',
+    cleanup_state        TEXT NOT NULL DEFAULT 'not_attempted',
+    cleanup_error        TEXT,
     error                TEXT,
     created_at           REAL NOT NULL,
     FOREIGN KEY (patch_id) REFERENCES probe_patches (id) ON DELETE CASCADE,
@@ -678,6 +683,23 @@ def init_db() -> None:
             )
         if "component_id" not in _columns(conn, "code_symbols"):
             conn.execute("ALTER TABLE code_symbols ADD COLUMN component_id TEXT")
+        validation_columns = _columns(conn, "validation_runs")
+        if "trace_received" not in validation_columns:
+            conn.execute("ALTER TABLE validation_runs ADD COLUMN trace_received INTEGER")
+        if "trace_status" not in validation_columns:
+            conn.execute(
+                "ALTER TABLE validation_runs ADD COLUMN trace_status TEXT NOT NULL DEFAULT 'not_checked'"
+            )
+        if "network_isolation" not in validation_columns:
+            conn.execute(
+                "ALTER TABLE validation_runs ADD COLUMN network_isolation TEXT NOT NULL DEFAULT 'not_requested'"
+            )
+        if "cleanup_state" not in validation_columns:
+            conn.execute(
+                "ALTER TABLE validation_runs ADD COLUMN cleanup_state TEXT NOT NULL DEFAULT 'not_attempted'"
+            )
+        if "cleanup_error" not in validation_columns:
+            conn.execute("ALTER TABLE validation_runs ADD COLUMN cleanup_error TEXT")
         _ensure_legacy_system(conn)
     _bootstrap_admin()
 

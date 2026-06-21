@@ -5,7 +5,7 @@ import hashlib
 from dataclasses import replace
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 
 from ..auth import get_system_id
 from ..code_indexer import index_snapshot_files
@@ -22,7 +22,7 @@ from ..draft_generator import (
     GenerationResult,
     generate_drafts,
 )
-from ..git_ops import GitError, create_snapshot
+from ..git_ops import GitError, create_snapshot, read_file_at_commit
 from ..llm import LLMConfig, LLMError, create_llm_client, is_reasoning_model
 from ..models import (
     CodeSymbolOut,
@@ -1707,6 +1707,14 @@ def list_probe_patches(
                     worktree_path=vr["worktree_path"],
                     overall_success=bool(vr["overall_success"]),
                     total_duration_ms=vr["total_duration_ms"],
+                    trace_received=(
+                        None if vr["trace_received"] is None
+                        else bool(vr["trace_received"])
+                    ),
+                    trace_status=vr["trace_status"],
+                    network_isolation=vr["network_isolation"],
+                    cleanup_state=vr["cleanup_state"],
+                    cleanup_error=vr["cleanup_error"],
                     commands=[
                         ValidationCommandOut(
                             id=cr["id"],
@@ -1772,6 +1780,14 @@ def get_probe_patch(
                 worktree_path=vr["worktree_path"],
                 overall_success=bool(vr["overall_success"]),
                 total_duration_ms=vr["total_duration_ms"],
+                trace_received=(
+                    None if vr["trace_received"] is None
+                    else bool(vr["trace_received"])
+                ),
+                trace_status=vr["trace_status"],
+                network_isolation=vr["network_isolation"],
+                cleanup_state=vr["cleanup_state"],
+                cleanup_error=vr["cleanup_error"],
                 commands=[
                     ValidationCommandOut(
                         id=cr["id"],
@@ -1805,6 +1821,27 @@ def get_probe_patch(
     )
 
 
+@router.get("/repository/probe-patches/{patch_id}/download")
+def download_probe_patch(
+    patch_id: int,
+    system_id: int = Depends(get_system_id),
+) -> Response:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT diff FROM probe_patches WHERE id = ? AND system_id = ?",
+            (patch_id, system_id),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Patch not found")
+    return Response(
+        content=row["diff"],
+        media_type="text/x-diff",
+        headers={
+            "Content-Disposition": f'attachment; filename="probe-patch-{patch_id}.diff"'
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -1820,7 +1857,7 @@ def validate_patch_endpoint(
     system_id: int = Depends(get_system_id),
 ) -> ProbePatchOut:
     from ..patch_generator import ApprovedPoint, create_worktree, cleanup_worktree
-    from ..validation_runner import load_validation_config, run_validation
+    from ..validation_runner import load_validation_config_text, run_validation
 
     with get_conn() as conn:
         patch_row = conn.execute(
@@ -1843,23 +1880,22 @@ def validate_patch_endpoint(
     repo_path = config_row["repo_path"]
     commit_sha = patch_row["commit_sha"]
 
-    config_path = os.path.join(repo_path, "probe-agent.yml")
-    if not os.path.isfile(config_path):
-        config_path_alt = os.path.join(repo_path, "probe-agent.example.yml")
-        if os.path.isfile(config_path_alt):
-            config_path = config_path_alt
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail="probe-agent.yml not found in repository",
-            )
-
     try:
-        val_config = load_validation_config(config_path)
+        try:
+            config_bytes = read_file_at_commit(
+                repo_path, commit_sha, "probe-agent.yml"
+            )
+        except GitError:
+            config_bytes = read_file_at_commit(
+                repo_path, commit_sha, "probe-agent.example.yml"
+            )
+        val_config = load_validation_config_text(
+            config_bytes.decode("utf-8", errors="strict")
+        )
     except Exception as exc:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid probe-agent.yml: {exc}",
+            detail=f"Invalid or missing pinned probe-agent.yml: {exc}",
         )
 
     worktree_base = os.getenv("PROBE_WORKTREE_BASE", "/tmp/probe-worktrees")
@@ -1868,6 +1904,7 @@ def validate_patch_endpoint(
     baseline_worktree = None
     probed_worktree = patch_row["worktree_path"]
     now = time.time()
+    cleanup_result = None
 
     try:
         baseline_worktree = create_worktree(
@@ -1883,27 +1920,63 @@ def validate_patch_endpoint(
         baseline_result = run_validation("baseline", baseline_worktree, val_config)
 
         if probed_worktree and os.path.isdir(probed_worktree):
+            with get_conn() as conn:
+                trace_count_before = conn.execute(
+                    "SELECT COUNT(*) AS count FROM traces WHERE system_id = ?",
+                    (system_id,),
+                ).fetchone()["count"]
             probed_result = run_validation("probed", probed_worktree, val_config)
+            with get_conn() as conn:
+                trace_count_after = conn.execute(
+                    "SELECT COUNT(*) AS count FROM traces WHERE system_id = ?",
+                    (system_id,),
+                ).fetchone()["count"]
+            probed_result.trace_received = trace_count_after > trace_count_before
+            probed_result.trace_status = (
+                "received" if probed_result.trace_received else "missing"
+            )
         else:
-            probed_result = None
+            from ..validation_runner import ValidationResult
+            probed_result = ValidationResult(
+                variant="probed",
+                worktree_path=probed_worktree or "",
+                error="Probed worktree is missing",
+            )
+            probed_result.trace_received = False
+            probed_result.trace_status = "missing"
     finally:
         if baseline_worktree:
-            cleanup_worktree(repo_path, baseline_worktree)
+            cleanup_result = cleanup_worktree(repo_path, baseline_worktree)
 
     with get_conn() as conn:
         conn.execute("BEGIN")
         try:
-            for result in [baseline_result] + ([probed_result] if probed_result else []):
+            for result in [baseline_result, probed_result]:
+                cleanup_state = "retained"
+                cleanup_error = None
+                if result.variant == "baseline" and cleanup_result:
+                    cleanup_state = cleanup_result.state
+                    cleanup_error = cleanup_result.error
                 cur = conn.execute(
                     """INSERT INTO validation_runs
                            (patch_id, system_id, variant, worktree_path,
-                            overall_success, total_duration_ms, error, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                            overall_success, total_duration_ms, trace_received,
+                            trace_status, network_isolation, cleanup_state,
+                            cleanup_error, error, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         patch_id, system_id, result.variant,
                         result.worktree_path,
                         1 if result.overall_success else 0,
                         result.total_duration_ms,
+                        (
+                            None if getattr(result, "trace_received", None) is None
+                            else (1 if result.trace_received else 0)
+                        ),
+                        getattr(result, "trace_status", "not_checked"),
+                        result.network_isolation,
+                        cleanup_state,
+                        cleanup_error,
                         result.error, now,
                     ),
                 )

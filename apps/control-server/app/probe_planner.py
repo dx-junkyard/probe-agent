@@ -89,9 +89,11 @@ class AcceptedLink:
 def check_denylist(symbol_name: str, docstring: Optional[str] = None) -> Optional[str]:
     lower_name = symbol_name.lower()
     for keyword in SAFETY_DENYLIST_KEYWORDS:
-        if keyword.lower() in lower_name:
+        escaped = re.escape(keyword.lower())
+        if re.search(rf"(^|[._]){escaped}($|[._])", lower_name):
             return f"symbol name matches safety denylist keyword: {keyword}"
-    combined = lower_name + " " + (docstring or "").lower()
+    normalized_name = re.sub(r"[._]+", " ", lower_name)
+    combined = normalized_name + " " + (docstring or "").lower()
     for pattern in SAFETY_DENYLIST_PATTERNS:
         match = pattern.search(combined)
         if match:
