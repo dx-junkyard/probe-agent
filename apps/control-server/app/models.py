@@ -873,3 +873,158 @@ class WorkspaceDetailOut(WorkspaceOut):
     messages: List[WorkspaceMessageOut] = Field(default_factory=list)
     context_items: List[WorkspaceContextItemOut] = Field(default_factory=list)
     proposals: List[WorkspaceProposalOut] = Field(default_factory=list)
+
+
+# --- Decision Workspace Context Pack (Issue #36) ---------------------------
+#
+# Deterministic, no-LLM digests of existing data, scoped to the workspace's
+# pinned context items. Every digest carries enough source identifiers to
+# trace a finding back to its origin row.
+
+WorkspaceEvidenceSourceType = Literal[
+    "feature_draft",
+    "feature_code_link",
+    "component_profile",
+    "trace",
+    "evaluation_result",
+    "probe_point",
+    "experiment_variant",
+]
+
+
+class WorkspaceEvidenceRef(BaseModel):
+    source_type: WorkspaceEvidenceSourceType
+    source_id: str
+    snapshot_id: Optional[int] = None
+    commit_sha: Optional[str] = None
+    path: Optional[str] = None
+    start_line: Optional[int] = None
+    end_line: Optional[int] = None
+    summary: str = ""
+
+
+class WorkspaceSystemSummary(BaseModel):
+    system_id: int
+    name: str = ""
+    environment: str = ""
+    purpose: str = ""
+    target_users: str = ""
+
+
+class WorkspaceFocusSummary(BaseModel):
+    title: str = ""
+    focus: str = ""
+    summary: str = ""
+
+
+class WorkspaceRepositorySummary(BaseModel):
+    snapshot_id: int
+    commit_sha: str
+    repo_path: str
+    file_count: int
+    status: str
+
+
+class WorkspaceFeatureDigest(BaseModel):
+    feature_id: str
+    name: str = ""
+    summary: str = ""
+    user_value: str = ""
+    success_criteria: List[str] = Field(default_factory=list)
+    risks: List[str] = Field(default_factory=list)
+    accepted_code_link_count: int = 0
+    decision_method: DecisionMethod = "reasoning_llm"
+    evidence: List[WorkspaceEvidenceRef] = Field(default_factory=list)
+
+
+class WorkspaceComponentDigest(BaseModel):
+    component_id: str
+    purpose: str = ""
+    responsibility: str = ""
+    expected_input: str = ""
+    expected_output: str = ""
+    failure_impact: str = ""
+    evidence: List[WorkspaceEvidenceRef] = Field(default_factory=list)
+
+
+class WorkspaceTraceDigest(BaseModel):
+    component_id: str
+    trace_count: int = 0
+    period_start: Optional[float] = None
+    period_end: Optional[float] = None
+    error_count: int = 0
+    eval_failed_count: int = 0
+    representative_input: Optional[str] = None
+    representative_output: Optional[str] = None
+    evidence: List[WorkspaceEvidenceRef] = Field(default_factory=list)
+
+
+class WorkspaceEvaluationDigest(BaseModel):
+    component_id: str
+    criterion_count: int = 0
+    passed_count: int = 0
+    failed_count: int = 0
+    top_failure_reasons: List[str] = Field(default_factory=list)
+    evidence: List[WorkspaceEvidenceRef] = Field(default_factory=list)
+
+
+class WorkspaceProbePointSummary(BaseModel):
+    component_id: str
+    symbol: str
+    path: str
+    recommended_mode: str
+    side_effect_risk: str
+    status: str
+
+
+class WorkspaceProbePlanSummary(BaseModel):
+    plan_id: int
+    feature_id: str
+    objective: str = ""
+    status: str = ""
+    probe_points: List[WorkspaceProbePointSummary] = Field(default_factory=list)
+    evidence: List[WorkspaceEvidenceRef] = Field(default_factory=list)
+
+
+class WorkspaceExperimentVariantSummary(BaseModel):
+    variant_key: str
+    label: str
+    is_baseline: bool
+    status: str
+    metrics: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkspaceExperimentDigest(BaseModel):
+    experiment_id: int
+    feature_id: str
+    objective: str = ""
+    baseline_commit: str = ""
+    status: str = ""
+    variants: List[WorkspaceExperimentVariantSummary] = Field(default_factory=list)
+    analysis_status: str = "not_requested"
+    analysis_narrative: Optional[str] = None
+    analysis_recommendation_variant_key: Optional[str] = None
+    evidence: List[WorkspaceEvidenceRef] = Field(default_factory=list)
+
+
+class WorkspaceHumanDecisionDigest(BaseModel):
+    source_type: Literal["experiment"] = "experiment"
+    source_id: str
+    decision: str
+    variant_key: Optional[str] = None
+    note: str = ""
+
+
+class WorkspaceContextPack(BaseModel):
+    system: WorkspaceSystemSummary
+    focus: Optional[WorkspaceFocusSummary] = None
+    repository: Optional[WorkspaceRepositorySummary] = None
+    features: List[WorkspaceFeatureDigest] = Field(default_factory=list)
+    components: List[WorkspaceComponentDigest] = Field(default_factory=list)
+    traces: List[WorkspaceTraceDigest] = Field(default_factory=list)
+    evaluations: List[WorkspaceEvaluationDigest] = Field(default_factory=list)
+    probe_plans: List[WorkspaceProbePlanSummary] = Field(default_factory=list)
+    experiments: List[WorkspaceExperimentDigest] = Field(default_factory=list)
+    human_decisions: List[WorkspaceHumanDecisionDigest] = Field(default_factory=list)
+    evidence: List[WorkspaceEvidenceRef] = Field(default_factory=list)
+    missing_information: List[str] = Field(default_factory=list)

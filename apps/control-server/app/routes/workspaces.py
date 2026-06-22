@@ -19,6 +19,7 @@ from ..db import get_conn
 from ..models import (
     WorkspaceContextItemCreate,
     WorkspaceContextItemOut,
+    WorkspaceContextPack,
     WorkspaceCreate,
     WorkspaceDecisionCreate,
     WorkspaceDecisionOut,
@@ -29,6 +30,7 @@ from ..models import (
     WorkspaceProposalOut,
     WorkspaceProposalUpdate,
 )
+from ..workspace_context import build_context_pack
 
 router = APIRouter()
 
@@ -175,6 +177,26 @@ def get_workspace(
             context_items=[_context_item_out(c) for c in context_rows],
             proposals=[_proposal_out(conn, p) for p in proposal_rows],
         )
+
+
+@router.get(
+    "/workspaces/{workspace_id}/context-pack",
+    response_model=WorkspaceContextPack,
+)
+def get_workspace_context_pack(
+    workspace_id: int,
+    system_id: int = Depends(get_system_id),
+) -> WorkspaceContextPack:
+    """Deterministic, no-LLM preview of the context that would be handed to
+    the assistant for this workspace (Issue #36). Built only from the
+    workspace's pinned context items -- never the full system dataset."""
+    with get_conn() as conn:
+        workspace = _get_workspace_or_404(conn, workspace_id, system_id)
+        context_items = conn.execute(
+            "SELECT * FROM workspace_context_items WHERE workspace_id = ? ORDER BY id",
+            (workspace_id,),
+        ).fetchall()
+        return build_context_pack(conn, system_id, workspace, context_items)
 
 
 @router.post(
