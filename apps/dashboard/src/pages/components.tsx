@@ -15,6 +15,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { toast } from "sonner";
 import { formatTimestamp } from "@/lib/utils";
 import { cn } from "@/lib/utils";
+import { AddToWorkspaceButton } from "@/components/add-to-workspace";
 
 const MODES = ["off", "trace", "shadow"] as const;
 const EVALUATIONS = ["unknown", "better", "worse", "same"];
@@ -95,6 +96,7 @@ export default function ComponentsPage() {
             <div className="flex items-center justify-between">
               <h2 className="text-lg font-bold font-mono">{selected}</h2>
               <div className="flex items-center gap-2">
+                <AddToWorkspaceButton itemType="component" itemId={selected} label={selected} />
                 {MODES.map(m => (
                   <Button
                     key={m}

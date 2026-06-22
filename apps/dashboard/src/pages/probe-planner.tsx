@@ -13,6 +13,7 @@ import { formatTimestamp } from "@/lib/utils";
 import { Crosshair, CheckCircle, XCircle, FileCode, Play, Download, GitBranch } from "lucide-react";
 import { useState } from "react";
 import type { ProbePatchOut } from "@/api/types";
+import { AddToWorkspaceButton } from "@/components/add-to-workspace";
 
 export default function ProbePlannerPage() {
   const { data: plansData, isLoading } = useProbePlans();
@@ -73,7 +74,12 @@ export default function ProbePlannerPage() {
                       </CardTitle>
                       <CardDescription className="mt-1">{plan.objective}</CardDescription>
                     </div>
-                    <span className="text-xs text-muted-foreground">{formatTimestamp(plan.created_at)}</span>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <span className="text-xs text-muted-foreground">{formatTimestamp(plan.created_at)}</span>
+                      <div onClick={e => e.stopPropagation()}>
+                        <AddToWorkspaceButton itemType="probe_plan" itemId={String(plan.id)} label={`Plan: ${plan.feature_id}`} />
+                      </div>
+                    </div>
                   </div>
                 </CardHeader>
                 {expanded && (

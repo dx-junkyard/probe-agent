@@ -8,6 +8,8 @@ import type {
   ProbePatchOut, GenerationRun, ExperimentOut, MeResponse,
   EvaluationCriterion,
   SystemProfile,
+  WorkspaceOut, WorkspaceDetailOut, WorkspaceContextItemOut,
+  WorkspaceContextPack, WorkspaceAgentTurnOut, WorkspaceProposalOut,
 } from "./types";
 
 function sysKey(base: string) {
@@ -390,6 +392,90 @@ export function useExperimentDecision() {
     mutationFn: ({ id, ...data }: { id: number; decision: string; variant_key?: string; note?: string }) =>
       api.put<ExperimentOut>(`/experiments/${id}/decision`, data),
     onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("experiments") }),
+  });
+}
+
+export function useWorkspaces() {
+  return useQuery({
+    queryKey: sysKey("workspaces"),
+    queryFn: () => api.get<WorkspaceOut[]>("/workspaces"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useWorkspace(id: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("workspace"), id],
+    queryFn: () => api.get<WorkspaceDetailOut>(`/workspaces/${id}`),
+    enabled: !!id && !!getSystemId(),
+  });
+}
+
+export function useCreateWorkspace() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { title: string; focus?: string; summary?: string }) =>
+      api.post<WorkspaceOut>("/workspaces", data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("workspaces") }),
+  });
+}
+
+export function useWorkspaceContextPack(workspaceId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("workspaceContextPack"), workspaceId],
+    queryFn: () => api.get<WorkspaceContextPack>(`/workspaces/${workspaceId}/context-pack`),
+    enabled: !!workspaceId && !!getSystemId(),
+  });
+}
+
+export function useAddWorkspaceContextItem(workspaceId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { item_type: string; item_id: string; label?: string }) =>
+      api.post<WorkspaceContextItemOut>(`/workspaces/${workspaceId}/context`, data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("workspace"), workspaceId] });
+      qc.invalidateQueries({ queryKey: [...sysKey("workspaceContextPack"), workspaceId] });
+    },
+  });
+}
+
+export function useDeleteWorkspaceContextItem(workspaceId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (contextItemId: number) =>
+      api.delete(`/workspaces/${workspaceId}/context/${contextItemId}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("workspace"), workspaceId] });
+      qc.invalidateQueries({ queryKey: [...sysKey("workspaceContextPack"), workspaceId] });
+    },
+  });
+}
+
+export function useCreateWorkspaceAgentTurn(workspaceId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { message: string; context_refs?: { type: string; id: string }[] }) =>
+      api.post<WorkspaceAgentTurnOut>(`/workspaces/${workspaceId}/agent-turns`, data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("workspace"), workspaceId] }),
+  });
+}
+
+export function useAcceptWorkspaceProposal(workspaceId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ proposalId, reason }: { proposalId: number; reason?: string }) =>
+      api.post<WorkspaceProposalOut>(`/workspaces/${workspaceId}/proposals/${proposalId}/accept`, { reason: reason ?? "" }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("workspace"), workspaceId] }),
+  });
+}
+
+export function useRejectWorkspaceProposal(workspaceId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ proposalId, reason }: { proposalId: number; reason?: string }) =>
+      api.post<WorkspaceProposalOut>(`/workspaces/${workspaceId}/proposals/${proposalId}/reject`, { reason: reason ?? "" }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("workspace"), workspaceId] }),
   });
 }
 

@@ -1,7 +1,7 @@
 import { NavLink, useLocation } from "react-router-dom";
 import {
   LayoutDashboard, GitBranch, Map, Crosshair, FlaskConical,
-  Plug, Sparkles, Boxes, Settings, Users, ChevronLeft, ChevronRight,
+  Plug, Sparkles, Boxes, Settings, Users, ChevronLeft, ChevronRight, MessageSquare,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/api/auth";
@@ -16,6 +16,7 @@ const NAV = [
   { to: "/connect-sdk", icon: Plug, label: "Connect SDK" },
   { to: "/generation", icon: Sparkles, label: "Generate" },
   { to: "/components", icon: Boxes, label: "Components" },
+  { to: "/workspaces", icon: MessageSquare, label: "Decision Workspace" },
   { to: "/settings", icon: Settings, label: "Settings" },
 ];
 

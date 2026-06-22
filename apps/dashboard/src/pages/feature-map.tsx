@@ -6,6 +6,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { toast } from "sonner";
 import { Sparkles, Link2, CheckCircle, XCircle, FileText } from "lucide-react";
+import { AddToWorkspaceButton } from "@/components/add-to-workspace";
 
 export default function FeatureMapPage() {
   const { data: drafts, isLoading: draftsLoading } = useLatestDrafts();
@@ -129,6 +130,7 @@ export default function FeatureMapPage() {
                         {f.evidence.length > 3 && <span className="text-muted-foreground">+{f.evidence.length - 3} more</span>}
                       </div>
                     )}
+                    <AddToWorkspaceButton itemType="feature" itemId={f.feature_id} label={f.name} />
                   </CardContent>
                 </Card>
               ))}

@@ -28,6 +28,13 @@ The dashboard should support:
 - Feature Map tab
 - Probe Planner tab
 - Experiments tab
+- Decision Workspace tab (Issue #38): workspace list/create/switch, a
+  conversation thread with grounded findings/assumptions/missing information
+  visually distinguished, pinned context with links back to the owning
+  Feature Map/Components/Probe Planner/Experiments tab, and proposal
+  accept/reject with a required reason. There is no "defer" decision or
+  proposal-edit action in the API (Issue #35 only exposes accept/reject); do
+  not add UI controls for actions the API does not support.
 
 ## Authentication model
 

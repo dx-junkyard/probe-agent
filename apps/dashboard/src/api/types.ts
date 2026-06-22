@@ -450,3 +450,98 @@ export interface SystemProfile {
   created_at: string;
   updated_at: string;
 }
+
+// --- Decision Workspace (Issues #35-#37) ------------------------------------
+
+export type WorkspaceContextItemType = "feature" | "component" | "trace" | "experiment" | "probe_plan";
+export type WorkspaceProposalStatus = "proposed" | "accepted" | "rejected" | "superseded";
+
+export interface WorkspaceOut {
+  id: number;
+  system_id: number;
+  title: string;
+  focus: string;
+  status: string;
+  summary: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface WorkspaceContextItemOut {
+  id: number;
+  workspace_id: number;
+  item_type: string;
+  item_id: string;
+  label: string;
+  created_at: number;
+}
+
+export interface WorkspaceMessageOut {
+  id: number;
+  workspace_id: number;
+  role: string;
+  content: string;
+  context_metadata: Record<string, unknown>;
+  created_at: number;
+}
+
+export interface WorkspaceDecisionOut {
+  id: number;
+  proposal_id: number;
+  decision: string;
+  reason: string;
+  decided_by_user_id: number | null;
+  created_at: number;
+}
+
+export interface WorkspaceProposalOut {
+  id: number;
+  workspace_id: number;
+  message_id: number | null;
+  proposal_type: string;
+  title: string;
+  body: Record<string, unknown>;
+  status: WorkspaceProposalStatus;
+  decisions: WorkspaceDecisionOut[];
+  created_at: number;
+  updated_at: number;
+}
+
+export interface WorkspaceDetailOut extends WorkspaceOut {
+  messages: WorkspaceMessageOut[];
+  context_items: WorkspaceContextItemOut[];
+  proposals: WorkspaceProposalOut[];
+}
+
+export interface WorkspaceEvidenceRef {
+  source_type: string;
+  source_id: string;
+  snapshot_id: number | null;
+  commit_sha: string | null;
+  path: string | null;
+  start_line: number | null;
+  end_line: number | null;
+  summary: string;
+}
+
+export interface WorkspaceContextPack {
+  system: { system_id: number; name: string; environment: string; purpose: string; target_users: string };
+  focus: { title: string; focus: string; summary: string } | null;
+  repository: { snapshot_id: number; commit_sha: string; repo_path: string; file_count: number; status: string } | null;
+  features: Array<{ feature_id: string; name: string; summary: string; evidence: WorkspaceEvidenceRef[] }>;
+  components: Array<{ component_id: string; purpose: string; responsibility: string; evidence: WorkspaceEvidenceRef[] }>;
+  traces: Array<{ component_id: string; trace_count: number; error_count: number; evidence: WorkspaceEvidenceRef[] }>;
+  evaluations: Array<{ component_id: string; passed_count: number; failed_count: number; top_failure_reasons: string[]; evidence: WorkspaceEvidenceRef[] }>;
+  probe_plans: Array<{ plan_id: number; feature_id: string; objective: string; status: string; evidence: WorkspaceEvidenceRef[] }>;
+  experiments: Array<{ experiment_id: number; feature_id: string; objective: string; status: string; evidence: WorkspaceEvidenceRef[] }>;
+  human_decisions: Array<{ source_type: string; source_id: string; decision: string; variant_key: string | null; note: string }>;
+  evidence: WorkspaceEvidenceRef[];
+  missing_information: string[];
+}
+
+export interface WorkspaceAgentTurnOut {
+  user_message: WorkspaceMessageOut;
+  assistant_message: WorkspaceMessageOut | null;
+  proposals: WorkspaceProposalOut[];
+  error: string | null;
+}

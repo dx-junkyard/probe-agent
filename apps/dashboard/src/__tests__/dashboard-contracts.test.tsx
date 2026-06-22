@@ -409,3 +409,112 @@ describe("Probe Patch application", () => {
     });
   });
 });
+
+// ── Decision Workspace tests ────────────────────────────────────────
+
+function setupWorkspaceMocks(overrides: { workspaces?: unknown[]; detail?: unknown; contextPack?: unknown } = {}) {
+  const workspaces = overrides.workspaces ?? [
+    { id: 1, system_id: 1, title: "Theme", focus: "", status: "active", summary: "", created_at: 1, updated_at: 1 },
+  ];
+  const detail = overrides.detail ?? {
+    id: 1, system_id: 1, title: "Theme", focus: "", status: "active", summary: "",
+    created_at: 1, updated_at: 1, messages: [], context_items: [], proposals: [],
+  };
+  const contextPack = overrides.contextPack ?? {
+    system: { system_id: 1, name: "sys", environment: "production", purpose: "", target_users: "" },
+    focus: null, repository: null, features: [], components: [], traces: [], evaluations: [],
+    probe_plans: [], experiments: [], human_decisions: [], evidence: [], missing_information: [],
+  };
+  mockApi.get.mockImplementation((path: string) => {
+    if (path === "/workspaces") return Promise.resolve(workspaces);
+    if (path === "/workspaces/1") return Promise.resolve(detail);
+    if (path === "/workspaces/1/context-pack") return Promise.resolve(contextPack);
+    return Promise.resolve(null);
+  });
+}
+
+describe("Decision Workspace page", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("lists workspaces and selects one to load its conversation", async () => {
+    setupWorkspaceMocks();
+    const { default: WorkspacesPage } = await import("@/pages/workspaces");
+    render(<WorkspacesPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByText("Theme")).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText("Theme"));
+
+    await waitFor(() => {
+      expect(screen.getByText("No messages yet. Ask a question to start the dialogue.")).toBeInTheDocument();
+    });
+  });
+
+  test("sends an agent turn and surfaces a structured failure without throwing", async () => {
+    setupWorkspaceMocks();
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/workspaces/1/agent-turns") {
+        return Promise.resolve({
+          user_message: { id: 1, workspace_id: 1, role: "user", content: "Hi", context_metadata: {}, created_at: 1 },
+          assistant_message: null,
+          proposals: [],
+          error: "no reasoning model configured",
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { default: WorkspacesPage } = await import("@/pages/workspaces");
+    render(<WorkspacesPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(screen.getByText("Theme")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Theme"));
+
+    const textarea = await screen.findByPlaceholderText("Ask about this theme, grounded only in the pinned context...");
+    fireEvent.change(textarea, { target: { value: "What should we try?" } });
+    fireEvent.click(screen.getByText("Send"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/workspaces/1/agent-turns", {
+        message: "What should we try?",
+        context_refs: [],
+      });
+    });
+    await waitFor(() => {
+      expect(screen.getByText(/no reasoning model configured/)).toBeInTheDocument();
+    });
+  });
+
+  test("renders a proposal and sends accept with the typed reason", async () => {
+    setupWorkspaceMocks({
+      detail: {
+        id: 1, system_id: 1, title: "Theme", focus: "", status: "active", summary: "",
+        created_at: 1, updated_at: 1, messages: [], context_items: [],
+        proposals: [{
+          id: 5, workspace_id: 1, message_id: 1, proposal_type: "experiment_draft",
+          title: "Try a shorter summary", body: { feature_id: "feat-1" }, status: "proposed",
+          decisions: [], created_at: 1, updated_at: 1,
+        }],
+      },
+    });
+    mockApi.post.mockResolvedValue({ id: 5, status: "accepted", decisions: [] });
+
+    const { default: WorkspacesPage } = await import("@/pages/workspaces");
+    render(<WorkspacesPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(screen.getByText("Theme")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Theme"));
+
+    await waitFor(() => expect(screen.getByText("Try a shorter summary")).toBeInTheDocument());
+    fireEvent.change(screen.getByPlaceholderText("Reason for this decision..."), { target: { value: "Looks promising" } });
+    fireEvent.click(screen.getByText("Accept"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/workspaces/1/proposals/5/accept", { reason: "Looks promising" });
+    });
+  });
+});

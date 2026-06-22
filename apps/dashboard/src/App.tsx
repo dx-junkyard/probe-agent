@@ -11,6 +11,7 @@ import GenerationPage from "./pages/generation";
 import ComponentsPage from "./pages/components";
 import SettingsPage from "./pages/settings";
 import AdminPage from "./pages/admin";
+import WorkspacesPage from "./pages/workspaces";
 
 export default function App() {
   return (
@@ -25,6 +26,7 @@ export default function App() {
         <Route path="connect-sdk" element={<ConnectSdkPage />} />
         <Route path="generation" element={<GenerationPage />} />
         <Route path="components" element={<ComponentsPage />} />
+        <Route path="workspaces" element={<WorkspacesPage />} />
         <Route path="settings" element={<SettingsPage />} />
         <Route path="admin" element={<AdminPage />} />
       </Route>

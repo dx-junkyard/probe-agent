@@ -16,6 +16,7 @@ import { toast } from "sonner";
 import { formatTimestamp } from "@/lib/utils";
 import { Play, Download, Plus, Trash2 } from "lucide-react";
 import type { ExperimentOut } from "@/api/types";
+import { AddToWorkspaceButton } from "@/components/add-to-workspace";
 
 const STATUS_VARIANT: Record<string, "default" | "success" | "destructive" | "secondary" | "warning"> = {
   draft: "secondary",
@@ -264,7 +265,12 @@ function ExperimentCard({ exp, expanded, onToggle, runExperiment, makeDecision }
               {exp.feature_id} — {exp.objective}
             </CardDescription>
           </div>
-          <span className="text-xs text-muted-foreground">{formatTimestamp(exp.created_at)}</span>
+          <div className="flex items-center gap-2 shrink-0">
+            <span className="text-xs text-muted-foreground">{formatTimestamp(exp.created_at)}</span>
+            <div onClick={e => e.stopPropagation()}>
+              <AddToWorkspaceButton itemType="experiment" itemId={String(exp.id)} label={`Experiment #${exp.id}: ${exp.feature_id}`} />
+            </div>
+          </div>
         </div>
       </CardHeader>
       {expanded && (
