@@ -692,6 +692,26 @@ CREATE TABLE IF NOT EXISTS workspace_decisions (
 
 CREATE INDEX IF NOT EXISTS idx_workspace_decisions_proposal
     ON workspace_decisions (proposal_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS workspace_proposal_drafts (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id        INTEGER NOT NULL,
+    proposal_id         INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    draft_type          TEXT NOT NULL,
+    target_screen       TEXT NOT NULL,
+    payload             TEXT NOT NULL DEFAULT '{}',
+    missing_fields      TEXT NOT NULL DEFAULT '[]',
+    created_by_user_id  INTEGER,
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (workspace_id) REFERENCES workspaces (id) ON DELETE CASCADE,
+    FOREIGN KEY (proposal_id) REFERENCES workspace_proposals (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (created_by_user_id) REFERENCES users (id) ON DELETE SET NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_proposal_drafts_proposal
+    ON workspace_proposal_drafts (proposal_id);
 """
 
 

@@ -1052,3 +1052,25 @@ class WorkspaceAgentTurnOut(BaseModel):
     assistant_message: Optional[WorkspaceMessageOut] = None
     proposals: List[WorkspaceProposalOut] = Field(default_factory=list)
     error: Optional[str] = None
+
+
+# --- Proposal-to-draft handoff (Issue #39) ----------------------------------
+#
+# Converts an *accepted* proposal into a deterministic prefill payload for an
+# existing screen (Probe Planner or Experiments). This never creates a probe
+# plan, probe point, or experiment itself -- only a small tracked record the
+# destination screen reads to prefill its existing, user-driven create flow.
+
+WorkspaceProposalDraftType = Literal["probe_plan_draft", "experiment_draft"]
+
+
+class WorkspaceProposalDraftOut(BaseModel):
+    id: int
+    workspace_id: int
+    proposal_id: int
+    system_id: int
+    draft_type: WorkspaceProposalDraftType
+    target_screen: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    missing_fields: List[str] = Field(default_factory=list)
+    created_at: float

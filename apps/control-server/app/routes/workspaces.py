@@ -35,9 +35,11 @@ from ..models import (
     WorkspaceMessageCreate,
     WorkspaceMessageOut,
     WorkspaceOut,
+    WorkspaceProposalDraftOut,
     WorkspaceProposalOut,
     WorkspaceProposalUpdate,
 )
+from ..workspace_actions import UnsupportedProposalTypeError, build_proposal_draft
 from ..workspace_agent import AgentTurnResult, generate_agent_turn
 from ..workspace_context import build_context_pack
 
@@ -106,6 +108,20 @@ def _workspace_out(row) -> WorkspaceOut:
         summary=row["summary"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+    )
+
+
+def _proposal_draft_out(row) -> WorkspaceProposalDraftOut:
+    return WorkspaceProposalDraftOut(
+        id=row["id"],
+        workspace_id=row["workspace_id"],
+        proposal_id=row["proposal_id"],
+        system_id=row["system_id"],
+        draft_type=row["draft_type"],
+        target_screen=row["target_screen"],
+        payload=json.loads(row["payload"] or "{}"),
+        missing_fields=json.loads(row["missing_fields"] or "[]"),
+        created_at=row["created_at"],
     )
 
 
@@ -621,3 +637,85 @@ def reject_workspace_proposal(
             conn, workspace_id, proposal_id, system_id, "rejected", "rejected",
             payload, principal,
         )
+
+
+@router.post(
+    "/workspaces/{workspace_id}/proposals/{proposal_id}/draft",
+    response_model=WorkspaceProposalDraftOut,
+    status_code=201,
+)
+def create_workspace_proposal_draft(
+    workspace_id: int,
+    proposal_id: int,
+    system_id: int = Depends(get_system_id),
+) -> WorkspaceProposalDraftOut:
+    """Build (or return the existing) deterministic prefill draft for an
+    accepted proposal, for the destination screen (Probe Planner or
+    Experiments) to read. Only accepted proposals may be drafted, and a
+    proposal can only ever have one draft (idempotent via the unique index
+    on `proposal_id`)."""
+    with get_conn() as conn:
+        _get_workspace_or_404(conn, workspace_id, system_id)
+        proposal = _get_proposal_or_404(conn, workspace_id, proposal_id, system_id)
+
+        existing = conn.execute(
+            "SELECT * FROM workspace_proposal_drafts WHERE proposal_id = ?",
+            (proposal_id,),
+        ).fetchone()
+        if existing is not None:
+            return _proposal_draft_out(existing)
+
+        if proposal["status"] != "accepted":
+            raise HTTPException(
+                status_code=409,
+                detail="Only an accepted proposal can be drafted",
+            )
+
+        try:
+            draft = build_proposal_draft(
+                conn, system_id, proposal["proposal_type"], json.loads(proposal["body"] or "{}")
+            )
+        except UnsupportedProposalTypeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        now = time.time()
+        cur = conn.execute(
+            """
+            INSERT INTO workspace_proposal_drafts
+                (workspace_id, proposal_id, system_id, draft_type, target_screen,
+                 payload, missing_fields, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                workspace_id,
+                proposal_id,
+                system_id,
+                proposal["proposal_type"],
+                draft.target_screen,
+                json.dumps(draft.payload, ensure_ascii=False),
+                json.dumps(draft.missing_fields, ensure_ascii=False),
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM workspace_proposal_drafts WHERE id = ?", (cur.lastrowid,)
+        ).fetchone()
+        return _proposal_draft_out(row)
+
+
+@router.get(
+    "/workspace-drafts/{draft_id}",
+    response_model=WorkspaceProposalDraftOut,
+)
+def get_workspace_proposal_draft(
+    draft_id: int,
+    system_id: int = Depends(get_system_id),
+) -> WorkspaceProposalDraftOut:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM workspace_proposal_drafts WHERE id = ? AND system_id = ?",
+            (draft_id, system_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Draft not found")
+        return _proposal_draft_out(row)
