@@ -101,7 +101,7 @@ export interface SnapshotFileOut {
   path: string;
   source_type: string;
   size_bytes: number;
-  inclusion_status: "indexed" | "metadata_only" | "too_large" | "binary";
+  inclusion_status: "indexed" | "metadata_only" | "too_large" | "binary" | "excluded" | "unsupported";
   exclusion_reason: string;
 }
 
@@ -554,10 +554,18 @@ export interface WorkspaceProposalDraftOut {
   draft_type: "probe_plan_draft" | "experiment_draft";
   target_screen: "probe_planner" | "experiments";
   payload: {
-    feature_id?: string;
+    system_id?: number;
+    feature_id?: string | null;
+    focus?: string | null;
     objective?: string;
     target_components?: string[];
     variant_summaries?: string[];
+    snapshot_id?: number | null;
+    constraints?: string[];
+    observation_points?: string[];
+    evaluation_criteria?: string[];
+    context_refs?: Record<string, unknown>[];
+    evidence_refs?: Record<string, unknown>[];
   };
   missing_fields: string[];
   created_at: number;

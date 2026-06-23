@@ -272,9 +272,10 @@ class TestSnapshots:
             headers=h,
         )
         r = admin_client.post("/repository/snapshots", headers=h)
-        paths = {f["path"] for f in r.json()["files"]}
-        assert ".env" not in paths
-        assert "credentials.json" not in paths
+        files = {f["path"]: f for f in r.json()["files"]}
+        assert files[".env"]["inclusion_status"] == "excluded"
+        assert files["credentials.json"]["inclusion_status"] == "excluded"
+        assert "exclusion policy" in files[".env"]["exclusion_reason"]
 
     def test_snapshot_excludes_uncommitted_changes(self, admin_client, git_repo):
         token = _login(admin_client)
@@ -445,8 +446,9 @@ class TestSnapshots:
             headers=h,
         )
         r = admin_client.post("/repository/snapshots", headers=h)
-        paths = {f["path"] for f in r.json()["files"]}
-        assert "linked-secret.txt" not in paths
+        files = {f["path"]: f for f in r.json()["files"]}
+        assert files["linked-secret.txt"]["inclusion_status"] == "unsupported"
+        assert "symlink" in files["linked-secret.txt"]["exclusion_reason"].lower()
 
     def test_snapshot_invalid_path(self, admin_client, tmp_path):
         token = _login(admin_client)
@@ -1075,6 +1077,44 @@ class TestGitSafety:
         assert _matches_patterns("private.key", DEFAULT_EXCLUDE)
         assert _matches_patterns("credentials.json", DEFAULT_EXCLUDE)
         assert _matches_patterns("secrets/api.txt", DEFAULT_EXCLUDE)
+
+
+def test_draft_generation_defaults_to_model_max_output_tokens(monkeypatch):
+    from app.draft_generator import DEFAULT_MAX_OUTPUT_TOKENS, generate_drafts
+    from app.git_ops import IndexedFile
+    from app.llm import LLMClient, LLMConfig
+
+    class CapturingClient(LLMClient):
+        max_tokens = None
+
+        def generate_text(self, messages, *, temperature=None, max_tokens=None):
+            self.max_tokens = max_tokens
+            return "{}"
+
+    monkeypatch.delenv("INTELLIGENCE_MAX_OUTPUT_TOKENS", raising=False)
+    client = CapturingClient()
+    generate_drafts(
+        client,
+        LLMConfig(
+            provider="openai",
+            model="gpt-5.4-mini",
+            api_key="unused",
+            base_url="",
+            timeout=30,
+        ),
+        [
+            IndexedFile(
+                path="README.md",
+                source_type="documentation",
+                size_bytes=6,
+                content_hash="hash",
+                content=b"hello\n",
+            )
+        ],
+    )
+
+    assert DEFAULT_MAX_OUTPUT_TOKENS == 128_000
+    assert client.max_tokens == 128_000
 
 
 class TestRepositorySchemaMigration:

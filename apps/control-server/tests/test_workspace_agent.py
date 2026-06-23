@@ -246,6 +246,7 @@ def test_agent_turn_success_persists_assistant_message_and_proposal(admin_client
     assert data["assistant_message"]["context_metadata"]["assumptions"] == [
         "Traffic patterns are stable."
     ]
+    assert data["assistant_message"]["context_metadata"]["used_context"]
     assert len(data["proposals"]) == 1
     proposal = data["proposals"][0]
     assert proposal["status"] == "proposed"
@@ -347,6 +348,9 @@ def test_agent_turn_pins_requested_context_refs(admin_client, monkeypatch):
     detail = admin_client.get(f"/workspaces/{workspace['id']}", headers=headers).json()
     assert len(detail["context_items"]) == 1
     assert detail["context_items"][0]["item_id"] == "summarizer"
+    assert detail["messages"][0]["context_metadata"]["requested_context_refs"] == [
+        {"type": "component", "id": "summarizer"}
+    ]
 
 
 def test_agent_turn_does_not_partially_pin_invalid_context_refs(admin_client):

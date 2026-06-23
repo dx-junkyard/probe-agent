@@ -1,7 +1,7 @@
 import { useState } from "react";
 import {
   useRepositoryCandidates, useRepositoryConfig, useUpdateRepositoryConfig,
-  useSnapshots, useCreateSnapshot, useSymbols, useIndexSymbols,
+  useSnapshots, useLatestSnapshot, useCreateSnapshot, useSymbols, useIndexSymbols,
 } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
@@ -31,6 +31,7 @@ export default function RepositoryPage() {
   const { data: candidates, isLoading: candidatesLoading } = useRepositoryCandidates();
   const updateConfig = useUpdateRepositoryConfig();
   const { data: snapshots, isLoading: snapsLoading } = useSnapshots();
+  const { data: latestSnapshot } = useLatestSnapshot();
   const createSnapshot = useCreateSnapshot();
   const { data: symbolIndex, isLoading: symLoading } = useSymbols();
   const indexSymbols = useIndexSymbols();
@@ -122,7 +123,7 @@ export default function RepositoryPage() {
                               <span>{formatBytes(s.indexed_size)} indexed</span>
                             )}
                             {s.metadata_only_count > 0 && (
-                              <span className="text-yellow-600">{s.metadata_only_count} metadata-only</span>
+                              <span className="text-yellow-600">{s.metadata_only_count} content omitted</span>
                             )}
                             <span>{formatTimestamp(s.created_at)}</span>
                           </div>
@@ -143,6 +144,29 @@ export default function RepositoryPage() {
                             </div>
                           ))}
                         </div>
+                      )}
+                      {latestSnapshot?.id === s.id && latestSnapshot.files.length > 0 && (
+                        <details className="text-xs">
+                          <summary className="cursor-pointer text-muted-foreground">
+                            Inspect indexed and omitted files
+                          </summary>
+                          <div className="mt-2 max-h-64 space-y-1 overflow-y-auto rounded border p-2">
+                            {latestSnapshot.files.slice(0, 100).map(file => (
+                              <div key={file.path} className="flex items-start justify-between gap-3">
+                                <span className="min-w-0 truncate font-mono" title={file.path}>{file.path}</span>
+                                <span className="shrink-0 text-muted-foreground">
+                                  {file.inclusion_status}
+                                  {file.exclusion_reason ? ` — ${file.exclusion_reason}` : ""}
+                                </span>
+                              </div>
+                            ))}
+                            {latestSnapshot.files.length > 100 && (
+                              <p className="text-muted-foreground">
+                                {latestSnapshot.files.length - 100} additional file(s) omitted from this view.
+                              </p>
+                            )}
+                          </div>
+                        </details>
                       )}
                     </div>
                   ))}

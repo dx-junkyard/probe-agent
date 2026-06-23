@@ -370,9 +370,22 @@ def create_workspace_agent_turn(
             """
             INSERT INTO workspace_messages
                 (workspace_id, system_id, role, content, context_metadata, created_at)
-            VALUES (?, ?, 'user', ?, '{}', ?)
+            VALUES (?, ?, 'user', ?, ?, ?)
             """,
-            (workspace_id, system_id, payload.message, now),
+            (
+                workspace_id,
+                system_id,
+                payload.message,
+                json.dumps(
+                    {
+                        "requested_context_refs": [
+                            ref.model_dump() for ref in payload.context_refs
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                now,
+            ),
         )
         user_message_row = conn.execute(
             "SELECT * FROM workspace_messages WHERE id = ?", (cur.lastrowid,)
@@ -426,6 +439,10 @@ def create_workspace_agent_turn(
                 "assumptions": result.assumptions,
                 "missing_information": result.missing_information,
                 "next_questions": result.next_questions,
+                "used_context": [
+                    ref.model_dump(mode="json") for ref in context_pack.evidence
+                ],
+                "context_missing_information": context_pack.missing_information,
                 "provider": result.provider,
                 "model": result.model,
             }
@@ -642,11 +659,12 @@ def update_workspace_proposal(
                 detail="Only a proposed proposal can be edited",
             )
         title = proposal["title"] if payload.title is None else payload.title
-        body = (
-            proposal["body"]
+        body_value = (
+            json.loads(proposal["body"] or "{}")
             if payload.body is None
-            else json.dumps(payload.body, ensure_ascii=False)
+            else _validated_proposal_body(proposal["proposal_type"], payload.body)
         )
+        body = json.dumps(body_value, ensure_ascii=False)
         conn.execute(
             """
             UPDATE workspace_proposals
@@ -670,17 +688,31 @@ def _resolve_decision(
     principal: Principal,
 ) -> WorkspaceProposalOut:
     now = time.time()
-    proposal = _get_proposal_or_404(conn, workspace_id, proposal_id, system_id)
-    if proposal["status"] == target_status:
-        # Idempotent re-request: do not duplicate decision history.
-        return _proposal_out(conn, proposal)
-    if proposal["status"] != "proposed":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Proposal is already {proposal['status']} and cannot be {decision_type}",
-        )
-    conn.execute("BEGIN")
+    # Serialize competing decisions before reading status. A deferred SQLite
+    # transaction can let two callers both observe "proposed".
+    conn.execute("BEGIN IMMEDIATE")
     try:
+        proposal = _get_proposal_or_404(conn, workspace_id, proposal_id, system_id)
+        if proposal["status"] == target_status:
+            conn.execute("COMMIT")
+            return _proposal_out(conn, proposal)
+        if proposal["status"] != "proposed":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Proposal is already {proposal['status']} and cannot be {decision_type}",
+            )
+        updated = conn.execute(
+            """UPDATE workspace_proposals
+               SET status = ?, updated_at = ?
+               WHERE id = ? AND workspace_id = ? AND system_id = ?
+                 AND status = 'proposed'""",
+            (target_status, now, proposal_id, workspace_id, system_id),
+        )
+        if updated.rowcount != 1:
+            raise HTTPException(
+                status_code=409,
+                detail="Proposal status changed concurrently; reload and retry",
+            )
         conn.execute(
             """
             INSERT INTO workspace_decisions
@@ -697,12 +729,6 @@ def _resolve_decision(
                 principal.user_id,
                 now,
             ),
-        )
-        conn.execute(
-            """UPDATE workspace_proposals
-               SET status = ?, updated_at = ?
-               WHERE id = ? AND status = 'proposed'""",
-            (target_status, now, proposal_id),
         )
         conn.execute("COMMIT")
     except Exception:

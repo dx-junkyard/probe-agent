@@ -118,9 +118,15 @@ def test_experiment_draft_payload_and_missing_fields(admin_client):
     draft = r.json()
     assert draft["target_screen"] == "experiments"
     assert draft["payload"] == {
+        "system_id": system_id,
         "feature_id": "summarizer",
         "objective": "improve quality",
         "variant_summaries": ["longer prompt"],
+        "snapshot_id": None,
+        "constraints": [],
+        "evaluation_criteria": [],
+        "context_refs": [],
+        "evidence_refs": [],
     }
     assert sorted(draft["missing_fields"]) == ["patch_text", "snapshot_id"]
 
@@ -160,7 +166,45 @@ def test_probe_plan_draft_missing_fields_when_nothing_set_up(admin_client):
     draft = r.json()
     assert draft["target_screen"] == "probe_planner"
     assert draft["payload"]["feature_id"] == "summarizer"
+    assert draft["payload"]["system_id"] == system_id
     assert "ready_repository_snapshot" in draft["missing_fields"]
+
+
+def test_draft_preserves_constraints_evaluation_and_evidence(admin_client):
+    token, system_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    workspace, proposal = _create_workspace_with_proposal(
+        admin_client,
+        headers,
+        "experiment_draft",
+        {
+            "feature_id": "summarizer",
+            "objective": "improve quality",
+            "variant_summaries": ["longer prompt"],
+            "snapshot_id": 42,
+            "constraints": ["latency under 2s"],
+            "evaluation_criteria": ["factuality"],
+            "context_refs": [{"type": "feature", "id": "summarizer"}],
+            "evidence_refs": [{"source_type": "trace", "source_id": "t-1"}],
+        },
+    )
+    admin_client.post(
+        f"/workspaces/{workspace['id']}/proposals/{proposal['id']}/accept",
+        json={"reason": "worth trying"},
+        headers=headers,
+    )
+
+    draft = admin_client.post(
+        f"/workspaces/{workspace['id']}/proposals/{proposal['id']}/draft",
+        headers=headers,
+    ).json()
+
+    assert draft["payload"]["snapshot_id"] == 42
+    assert draft["payload"]["constraints"] == ["latency under 2s"]
+    assert draft["payload"]["evaluation_criteria"] == ["factuality"]
+    assert draft["payload"]["context_refs"][0]["id"] == "summarizer"
+    assert draft["payload"]["evidence_refs"][0]["source_id"] == "t-1"
+    assert draft["missing_fields"] == ["patch_text"]
 
 
 def test_probe_plan_draft_missing_fields_when_prerequisites_satisfied(admin_client):

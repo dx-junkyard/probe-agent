@@ -324,6 +324,23 @@ def test_proposal_patch_only_allowed_while_proposed(admin_client):
     assert r.status_code == 409
 
 
+def test_proposal_patch_revalidates_structured_body(admin_client):
+    token, system_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    workspace = admin_client.post(
+        "/workspaces", json={"title": "Theme"}, headers=headers
+    ).json()
+    proposal = _create_proposal(admin_client, headers, workspace["id"])
+
+    r = admin_client.patch(
+        f"/workspaces/{workspace['id']}/proposals/{proposal['id']}",
+        json={"body": {"feature_id": "summarizer"}},
+        headers=headers,
+    )
+
+    assert r.status_code == 422
+
+
 def test_workspaces_and_context_are_system_scoped(admin_client):
     token, system_a = _setup(admin_client, "System A")
     _, system_b = _setup(admin_client, "System B")

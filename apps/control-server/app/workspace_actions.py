@@ -43,8 +43,13 @@ class UnsupportedProposalTypeError(ValueError):
     pass
 
 
-def _missing_fields_for_probe_plan(conn, system_id: int, feature_id: str) -> List[str]:
+def _missing_fields_for_probe_plan(
+    conn, system_id: int, feature_id: str | None
+) -> List[str]:
     missing: List[str] = []
+    if not feature_id:
+        missing.append("feature_id")
+        return missing
 
     snapshot_row = conn.execute(
         """SELECT id FROM repository_snapshots
@@ -105,22 +110,37 @@ def build_proposal_draft(
 
     if isinstance(validated, ProbePlanDraftProposalBody):
         payload = {
+            "system_id": system_id,
             "feature_id": validated.feature_id,
+            "focus": validated.focus,
             "objective": validated.objective,
             "target_components": validated.target_components,
+            "constraints": validated.constraints,
+            "observation_points": validated.observation_points,
+            "evaluation_criteria": validated.evaluation_criteria,
+            "context_refs": [ref.model_dump() for ref in validated.context_refs],
+            "evidence_refs": [ref.model_dump() for ref in validated.evidence_refs],
         }
         missing_fields = _missing_fields_for_probe_plan(
             conn, system_id, validated.feature_id
         )
     elif isinstance(validated, ExperimentDraftProposalBody):
         payload = {
+            "system_id": system_id,
             "feature_id": validated.feature_id,
             "objective": validated.objective,
             "variant_summaries": validated.variant_summaries,
+            "snapshot_id": validated.snapshot_id,
+            "constraints": validated.constraints,
+            "evaluation_criteria": validated.evaluation_criteria,
+            "context_refs": [ref.model_dump() for ref in validated.context_refs],
+            "evidence_refs": [ref.model_dump() for ref in validated.evidence_refs],
         }
         # An experiment_draft proposal never carries a snapshot or patch
         # text -- those are always user-supplied in the Experiments screen.
-        missing_fields = ["snapshot_id", "patch_text"]
+        missing_fields = ["patch_text"]
+        if validated.snapshot_id is None:
+            missing_fields.insert(0, "snapshot_id")
     else:  # pragma: no cover - defensive, unreachable given TARGET_SCREENS
         raise UnsupportedProposalTypeError(f"unsupported proposal type: {proposal_type}")
 

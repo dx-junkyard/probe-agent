@@ -331,3 +331,26 @@ def test_pinned_item_budget_records_omission(admin_client):
 
     assert len(pack["components"]) == 10
     assert any("budget" in m for m in pack["missing_information"])
+
+
+def test_category_character_budget_is_independent_and_records_omission(
+    admin_client, monkeypatch
+):
+    import app.workspace_context as workspace_context
+
+    token, system_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    _seed_component(system_id)
+    workspace = _create_workspace(admin_client, headers)
+    _pin(admin_client, headers, workspace["id"], "component", "summarizer")
+    monkeypatch.setattr(workspace_context, "MAX_CATEGORY_CHARS", 20)
+
+    pack = admin_client.get(
+        f"/workspaces/{workspace['id']}/context-pack", headers=headers
+    ).json()
+
+    assert pack["components"] == []
+    assert any(
+        "category character budget" in message
+        for message in pack["missing_information"]
+    )
