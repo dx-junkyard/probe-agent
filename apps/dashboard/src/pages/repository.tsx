@@ -82,7 +82,15 @@ export default function RepositoryPage() {
               </div>
               <Button
                 size="sm"
-                onClick={() => createSnapshot.mutateAsync().then(() => toast.success("Snapshot created")).catch(e => toast.error(String(e)))}
+                onClick={() => createSnapshot.mutateAsync().then(s => {
+                  if (s.status === "failed") {
+                    toast.error(`Snapshot failed: ${s.error_summary ?? "unknown error"}`);
+                  } else if (s.warnings?.length) {
+                    toast.warning(`Snapshot created with ${s.warnings.length} warning(s)`);
+                  } else {
+                    toast.success("Snapshot created");
+                  }
+                }).catch(e => toast.error(String(e)))}
                 disabled={createSnapshot.isPending}
               >
                 <RefreshCw className={`h-4 w-4 mr-1 ${createSnapshot.isPending ? "animate-spin" : ""}`} />
