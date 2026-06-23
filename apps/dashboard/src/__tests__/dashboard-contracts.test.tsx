@@ -437,6 +437,7 @@ describe("Decision Workspace page", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockSystemId = 1;
+    vi.spyOn(window, "confirm").mockReturnValue(true);
   });
 
   test("lists workspaces and selects one to load its conversation", async () => {
@@ -558,7 +559,7 @@ describe("Decision Workspace page", () => {
 
     await waitFor(() => expect(screen.getByText("Theme")).toBeInTheDocument());
     fireEvent.click(screen.getByText("Theme"));
-    fireEvent.click(await screen.findByText("Open editable draft"));
+    fireEvent.click(await screen.findByText("Create Experiment draft"));
 
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith("/workspaces/1/proposals/5/draft");

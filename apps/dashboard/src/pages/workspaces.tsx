@@ -381,13 +381,27 @@ function ContextProposalsPane({ workspaceId }: { workspaceId: number | null }) {
                 proposal={p}
                 reason={reasons[p.id] ?? ""}
                 onReasonChange={(v) => setReasons(prev => ({ ...prev, [p.id]: v }))}
-                onAccept={() => acceptProposal.mutateAsync({ proposalId: p.id, reason: reasons[p.id] }).then(() => toast.success("Proposal accepted")).catch(e => toast.error(String(e)))}
+                onAccept={() => {
+                  if (!window.confirm(`Accept proposal "${p.title || `#${p.id}`}" with the recorded reason?`)) return;
+                  acceptProposal.mutateAsync({ proposalId: p.id, reason: reasons[p.id] })
+                    .then(() => toast.success("Proposal accepted"))
+                    .catch(e => toast.error(String(e)));
+                }}
                 onReject={() => rejectProposal.mutateAsync({ proposalId: p.id, reason: reasons[p.id] }).then(() => toast.success("Proposal rejected")).catch(e => toast.error(String(e)))}
                 onDefer={() => deferProposal.mutateAsync({ proposalId: p.id, reason: reasons[p.id] }).then(() => toast.success("Proposal deferred")).catch(e => toast.error(String(e)))}
-                onCreateDraft={() => createDraft.mutateAsync(p.id).then(draft => {
-                  const target = draft.target_screen === "probe_planner" ? "/probe-planner" : "/experiments";
-                  navigate(`${target}?draft=${draft.id}&workspace=${workspaceId}`);
-                }).catch(e => toast.error(String(e)))}
+                onCreateDraft={() => {
+                  const likelyMissing = p.proposal_type === "experiment_draft"
+                    ? [p.body.snapshot_id ? null : "snapshot_id", "patch_text"].filter(Boolean).join(", ")
+                    : "repository/feature prerequisites (validated by the server)";
+                  const preview = JSON.stringify(p.body, null, 2);
+                  if (!window.confirm(
+                    `Create an editable ${p.proposal_type}?\n\nPrefill:\n${preview}\n\nPotential missing fields: ${likelyMissing}`,
+                  )) return;
+                  createDraft.mutateAsync(p.id).then(draft => {
+                    const target = draft.target_screen === "probe_planner" ? "/probe-planner" : "/experiments";
+                    navigate(`${target}?draft=${draft.id}&workspace=${workspaceId}`);
+                  }).catch(e => toast.error(String(e)));
+                }}
                 isPending={acceptProposal.isPending || rejectProposal.isPending || deferProposal.isPending || createDraft.isPending}
               />
             ))
@@ -487,7 +501,9 @@ function ProposalCard({ proposal, reason, onReasonChange, onAccept, onReject, on
           )}
           {proposal.status === "accepted" && (
             <Button size="sm" className="w-full" onClick={onCreateDraft} disabled={isPending}>
-              Open editable draft
+              {proposal.proposal_type === "probe_plan_draft"
+                ? "Review in Probe Planner"
+                : "Create Experiment draft"}
             </Button>
           )}
         </div>

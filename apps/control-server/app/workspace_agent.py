@@ -17,7 +17,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Type
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient, is_reasoning_model
 from .models import WorkspaceContextPack
@@ -34,20 +34,55 @@ MAX_RECENT_MESSAGES = 20
 # assistant turn fails closed rather than storing a malformed proposal.
 
 
+class ProposalContextRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: str = Field(..., min_length=1, max_length=100)
+    id: str = Field(..., min_length=1, max_length=200)
+
+
+class ProposalEvidenceRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_type: str = Field(..., min_length=1, max_length=100)
+    source_id: str = Field(..., min_length=1, max_length=200)
+    snapshot_id: Optional[int] = Field(default=None, ge=1)
+    path: Optional[str] = Field(default=None, max_length=1000)
+    start_line: Optional[int] = Field(default=None, ge=1)
+    end_line: Optional[int] = Field(default=None, ge=1)
+
+
 class ExperimentDraftProposalBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     feature_id: str = Field(..., min_length=1, max_length=200)
     objective: str = Field(..., min_length=1, max_length=2000)
     variant_summaries: List[str] = Field(default_factory=list, max_length=10)
+    snapshot_id: Optional[int] = Field(default=None, ge=1)
+    constraints: List[str] = Field(default_factory=list, max_length=20)
+    evaluation_criteria: List[str] = Field(default_factory=list, max_length=20)
+    context_refs: List[ProposalContextRef] = Field(default_factory=list, max_length=20)
+    evidence_refs: List[ProposalEvidenceRef] = Field(default_factory=list, max_length=20)
 
 
 class ProbePlanDraftProposalBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    feature_id: str = Field(..., min_length=1, max_length=200)
+    feature_id: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    focus: Optional[str] = Field(default=None, min_length=1, max_length=500)
     objective: str = Field(..., min_length=1, max_length=2000)
     target_components: List[str] = Field(default_factory=list, max_length=10)
+    constraints: List[str] = Field(default_factory=list, max_length=20)
+    observation_points: List[str] = Field(default_factory=list, max_length=20)
+    evaluation_criteria: List[str] = Field(default_factory=list, max_length=20)
+    context_refs: List[ProposalContextRef] = Field(default_factory=list, max_length=20)
+    evidence_refs: List[ProposalEvidenceRef] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def require_feature_or_focus(self):
+        if not self.feature_id and not self.focus:
+            raise ValueError("feature_id or focus is required")
+        return self
 
 
 PROPOSAL_BODY_MODELS: Dict[str, Type[BaseModel]] = {
@@ -143,8 +178,12 @@ Rules:
   If you cannot cite real evidence for a claim, put it in "assumptions" or
   "missing_information" instead -- never present it as grounded.
 - "proposals[].type" must be one of: experiment_draft, probe_plan_draft.
-  - experiment_draft body: {"feature_id": str, "objective": str, "variant_summaries": [str]}
-  - probe_plan_draft body: {"feature_id": str, "objective": str, "target_components": [str]}
+  - experiment_draft body: {"feature_id": str, "objective": str, "variant_summaries": [str],
+    "snapshot_id": int|null, "constraints": [str], "evaluation_criteria": [str],
+    "context_refs": [object], "evidence_refs": [object]}
+  - probe_plan_draft body: {"feature_id": str|null, "focus": str|null, "objective": str,
+    "target_components": [str], "constraints": [str], "observation_points": [str],
+    "evaluation_criteria": [str], "context_refs": [object], "evidence_refs": [object]}
 - You never decide, adopt, or execute anything. Proposals are always reviewed
   by a human; do not claim a proposal has been accepted or run.
 - If the context pack lacks the information needed to answer confidently,

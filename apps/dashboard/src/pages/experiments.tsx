@@ -174,6 +174,12 @@ export default function ExperimentsPage() {
           {workspaceDraft?.draft_type === "experiment_draft" && (
             <div className="rounded-md border bg-secondary/30 px-3 py-2 text-xs">
               Prefilled from Decision Workspace proposal #{workspaceDraft.proposal_id}.
+              {(workspaceDraft.payload.constraints?.length ?? 0) > 0 && (
+                <span className="ml-2">Constraints: {workspaceDraft.payload.constraints?.join(", ")}.</span>
+              )}
+              {(workspaceDraft.payload.evaluation_criteria?.length ?? 0) > 0 && (
+                <span className="ml-2">Evaluation: {workspaceDraft.payload.evaluation_criteria?.join(", ")}.</span>
+              )}
               {workspaceDraft.missing_fields.length > 0 && (
                 <span className="ml-1 text-muted-foreground">
                   Complete: {workspaceDraft.missing_fields.join(", ")}.

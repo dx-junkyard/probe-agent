@@ -7,6 +7,7 @@ content. Deterministic mock fixtures are available only when LLM_PROVIDER=mock.
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -16,6 +17,7 @@ from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient
 
 PROMPT_VERSION = "v1"
 SCHEMA_VERSION = "v1"
+DEFAULT_MAX_OUTPUT_TOKENS = 128_000
 
 
 @dataclass
@@ -330,15 +332,23 @@ def generate_drafts(
     prompt = _DRAFT_PROMPT_TEMPLATE.format(file_context=file_context)
 
     try:
+        max_output_tokens = int(
+            os.getenv(
+                "INTELLIGENCE_MAX_OUTPUT_TOKENS",
+                str(DEFAULT_MAX_OUTPUT_TOKENS),
+            )
+        )
+        if max_output_tokens < 1:
+            raise ValueError("INTELLIGENCE_MAX_OUTPUT_TOKENS must be positive")
         raw = client.generate_text(
             [
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.2,
-            max_tokens=4096,
+            max_tokens=max_output_tokens,
         )
-    except LLMError as exc:
+    except (LLMError, ValueError) as exc:
         return GenerationResult(
             provider=config.provider,
             model=config.model,

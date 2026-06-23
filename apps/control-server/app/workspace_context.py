@@ -16,6 +16,7 @@ for the system".
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 from typing import List, Optional
@@ -45,6 +46,8 @@ MAX_PROBE_POINTS_PER_PLAN = 10
 MAX_VARIANTS_PER_EXPERIMENT = 10
 MAX_TRACES_SCANNED_PER_COMPONENT = 200
 MAX_FAILURE_REASONS = 3
+MAX_CATEGORY_CHARS = int(os.getenv("WORKSPACE_CONTEXT_MAX_CATEGORY_CHARS", "12000"))
+MAX_CONTEXT_CHARS = int(os.getenv("WORKSPACE_CONTEXT_MAX_CHARS", "50000"))
 
 _SENSITIVE_VALUE_PATTERNS = [
     re.compile(
@@ -118,6 +121,67 @@ class _PackBuilder:
 def _sorted_unique_item_ids(context_items, item_type: str) -> List[str]:
     ids = {row["item_id"] for row in context_items if row["item_type"] == item_type}
     return sorted(ids)
+
+
+def _apply_character_budgets(pack: WorkspaceContextPack) -> WorkspaceContextPack:
+    """Deterministically trim category tails before an LLM sees the pack.
+
+    Snapshot persistence is unaffected. Budgets are independently configurable
+    for Decision Workspace context construction and omissions are recorded.
+    """
+    category_names = (
+        "features",
+        "components",
+        "traces",
+        "evaluations",
+        "probe_plans",
+        "experiments",
+        "human_decisions",
+    )
+    omitted: List[str] = []
+
+    for name in category_names:
+        values = getattr(pack, name)
+        removed = 0
+        while values and len(
+            json.dumps(
+                [item.model_dump(mode="json") for item in values],
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        ) > MAX_CATEGORY_CHARS:
+            values.pop()
+            removed += 1
+        if removed:
+            omitted.append(
+                f"{name}: {removed} item(s) omitted due to the category character budget"
+            )
+
+    # Trim lower-priority category tails in a stable order until the complete
+    # serialized pack fits. System/focus/repository summaries are retained.
+    while len(pack.model_dump_json()) > MAX_CONTEXT_CHARS:
+        for name in reversed(category_names):
+            values = getattr(pack, name)
+            if values:
+                values.pop()
+                omitted.append(
+                    f"{name}: 1 item omitted due to the total context character budget"
+                )
+                break
+        else:
+            if pack.evidence:
+                pack.evidence.pop()
+                if not any("evidence omitted due to" in item for item in omitted):
+                    omitted.append(
+                        "evidence omitted due to the total context character budget"
+                    )
+                continue
+            break
+
+    for message in omitted:
+        if message not in pack.missing_information:
+            pack.missing_information.append(message)
+    return pack
 
 
 def _system_summary(conn: sqlite3.Connection, system_id: int) -> WorkspaceSystemSummary:
@@ -563,7 +627,7 @@ def build_context_pack(conn: sqlite3.Connection, system_id: int, workspace, cont
                 )
             )
 
-    return WorkspaceContextPack(
+    pack = WorkspaceContextPack(
         system=system_summary,
         focus=focus_summary,
         repository=repository_summary,
@@ -577,3 +641,4 @@ def build_context_pack(conn: sqlite3.Connection, system_id: int, workspace, cont
         evidence=builder.evidence,
         missing_information=builder.missing,
     )
+    return _apply_character_budgets(pack)

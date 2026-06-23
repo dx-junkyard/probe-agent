@@ -42,7 +42,9 @@ class GitError(Exception):
     pass
 
 
-INCLUSION_STATUSES = {"indexed", "metadata_only", "too_large", "binary"}
+INCLUSION_STATUSES = {
+    "indexed", "metadata_only", "too_large", "binary", "excluded", "unsupported"
+}
 
 
 @dataclass
@@ -51,7 +53,7 @@ class IndexedFile:
     source_type: str  # documentation | source | test | configuration
     size_bytes: int
     content_hash: str
-    inclusion_status: str = "indexed"  # indexed | metadata_only | too_large | binary
+    inclusion_status: str = "indexed"
     exclusion_reason: str = ""
     content: bytes = field(repr=False, default=b"")
 
@@ -285,14 +287,44 @@ def create_snapshot(
 
     for entry in sorted(entries, key=lambda item: item.path):
         path = entry.path
-        # Symlinks and submodules are not repository content and must never be
-        # resolved through the mutable working tree.
-        if entry.object_type != "blob" or entry.mode == "120000":
-            continue
 
         if include_patterns and not _matches_patterns(path, include_patterns):
             continue
         if _matches_patterns(path, all_exclude):
+            size = (
+                _object_size(real_path, entry.object_id)
+                if entry.object_type == "blob"
+                else 0
+            )
+            files.append(IndexedFile(
+                path=path,
+                source_type=classify_source_type(path),
+                size_bytes=size,
+                content_hash=entry.object_id,
+                inclusion_status="excluded",
+                exclusion_reason="Path matched the repository exclusion policy",
+            ))
+            continue
+
+        # Symlinks and submodules are not repository content and must never be
+        # resolved through the mutable working tree. Record the omission so it
+        # is auditable without following the link or reading mutable content.
+        if entry.object_type != "blob" or entry.mode == "120000":
+            size = (
+                _object_size(real_path, entry.object_id)
+                if entry.object_type == "blob"
+                else 0
+            )
+            files.append(IndexedFile(
+                path=path,
+                source_type=classify_source_type(path),
+                size_bytes=size,
+                content_hash=entry.object_id,
+                inclusion_status="unsupported",
+                exclusion_reason=(
+                    "Git tree entry is a symlink or unsupported non-blob object"
+                ),
+            ))
             continue
 
         size = _object_size(real_path, entry.object_id)

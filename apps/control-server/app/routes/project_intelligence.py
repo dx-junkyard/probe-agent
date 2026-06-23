@@ -310,6 +310,8 @@ def create_snapshot_endpoint(
     warnings = []
     too_large_files = [f for f in files if f.inclusion_status == "too_large"]
     binary_files = [f for f in files if f.inclusion_status == "binary"]
+    excluded_files = [f for f in files if f.inclusion_status == "excluded"]
+    unsupported_files = [f for f in files if f.inclusion_status == "unsupported"]
     if too_large_files:
         warnings.append(
             f"{len(too_large_files)} file(s) exceeded the per-file size limit "
@@ -318,6 +320,15 @@ def create_snapshot_endpoint(
     if binary_files:
         warnings.append(
             f"{len(binary_files)} binary file(s) were recorded without content"
+        )
+    if excluded_files:
+        warnings.append(
+            f"{len(excluded_files)} file(s) were excluded by repository policy"
+        )
+    if unsupported_files:
+        warnings.append(
+            f"{len(unsupported_files)} symlink or unsupported Git object(s) "
+            "were recorded without content"
         )
     completed_at = time.time()
 

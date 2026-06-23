@@ -203,7 +203,9 @@ class RepositorySnapshot(BaseModel):
 
 
 SourceType = Literal["documentation", "source", "test", "configuration"]
-InclusionStatus = Literal["indexed", "metadata_only", "too_large", "binary"]
+InclusionStatus = Literal[
+    "indexed", "metadata_only", "too_large", "binary", "excluded", "unsupported"
+]
 SnapshotStatus = Literal["not_configured", "indexing", "ready", "failed"]
 IntelligenceRunStatus = Literal["pending", "completed", "failed"]
 IntelligenceRunType = Literal[
