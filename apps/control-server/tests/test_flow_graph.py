@@ -1,14 +1,21 @@
-"""Tests for Issue #43: API-rooted execution flow visualization (Phase 1).
+"""Tests for Issue #43: API-rooted execution flow visualization.
 
-Covers deterministic AST call-edge extraction, entrypoint enumeration, flow
+Phase 1: deterministic AST call-edge extraction, entrypoint enumeration, flow
 graph assembly (resolved / inferred / unresolved edges), candidate-path
 selection, depth/node budgets, system scoping, conversion of selected nodes
 into a manual Probe Plan draft, and the safety guarantee that flow selection
 alone never triggers patch generation or application.
+
+Phase 2: explicit external-boundary classification (dispatch / http / database
+/ filesystem) as leaf nodes, and trace/evaluation runtime overlay on nodes.
+
+Phase 3: observed-path overlay diffing real traces against static candidate
+flows, and the language parser-registry extensibility seam.
 """
 
 import subprocess
 import textwrap
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -42,7 +49,7 @@ SAMPLE_SOURCE = textwrap.dedent("""\
 
 
     def save_analysis_result(comps):
-        external_db.commit(comps)
+        requests.post("http://x", json=comps)
         return dynamic_dispatch(comps)
 
 
@@ -138,8 +145,12 @@ class TestCallExtraction:
         from app.flow_graph import extract_call_sites
 
         sites = extract_call_sites("a.py", SAMPLE_SOURCE)
-        # The @router.post(...) decorator must not become a call edge.
-        assert all(s.callee_name != "post" for s in sites)
+        # The @router.post(...) decorator on analyze_document must not become a
+        # call edge attributed to that handler.
+        assert all(
+            not (s.caller_qualified_name == "analyze_document" and s.callee_name == "post")
+            for s in sites
+        )
 
     def test_syntax_error_yields_no_sites(self):
         from app.flow_graph import extract_call_sites
@@ -294,6 +305,129 @@ class TestGraphBuilding:
         ) is None
 
 
+class TestExternalBoundaries:
+    """Phase 2: explicit, enumerated external boundary classification."""
+
+    BOUNDARY_SOURCE = textwrap.dedent("""\
+        async def run_experiment(req):
+            apply_variant(req)
+            requests.post("http://x")
+            cursor.execute("INSERT")
+            task.delay(req)
+            persist(req)
+
+        def apply_variant(req):
+            return req
+
+        def persist(req):
+            open("/tmp/x").write("y")
+            return mystery_external(req)
+    """)
+
+    def _graph(self):
+        from app.flow_graph import SymbolRecord, build_flow_graph
+        import ast
+
+        tree = ast.parse(self.BOUNDARY_SOURCE)
+        syms = [
+            SymbolRecord(
+                i + 1, "e.py", n.name,
+                "async_function" if isinstance(n, ast.AsyncFunctionDef) else "function",
+                n.lineno, n.end_lineno,
+            )
+            for i, n in enumerate(ast.walk(tree))
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        return build_flow_graph(
+            syms, [("e.py", self.BOUNDARY_SOURCE)], 1, "sha",
+            "public_function", "function:e.py::run_experiment",
+        )
+
+    def test_classifies_boundary_kinds(self):
+        graph = self._graph()
+        ext = {n.node_id: n for n in graph.nodes if n.is_external}
+        kinds = {n.boundary_kind for n in ext.values()}
+        assert kinds == {"http", "database", "dispatch", "filesystem"}
+
+    def test_dispatch_is_resolved_io_is_inferred(self):
+        graph = self._graph()
+        by_type = {e.edge_type: e for e in graph.edges}
+        assert by_type["dispatch"].resolution == "resolved"
+        assert by_type["http"].resolution == "inferred"
+        assert by_type["database"].resolution == "inferred"
+
+    def test_external_nodes_are_leaves(self):
+        graph = self._graph()
+        ext_ids = {n.node_id for n in graph.nodes if n.is_external}
+        # No edge originates from an external boundary node.
+        assert all(e.source_node_id not in ext_ids for e in graph.edges)
+
+    def test_unknown_external_call_dropped(self):
+        graph = self._graph()
+        # mystery_external() matches no registry and is not a project symbol.
+        assert all(
+            "mystery_external" not in (e.callee_name or "") for e in graph.edges
+        )
+
+    def test_candidate_flow_counts_boundaries(self):
+        graph = self._graph()
+        assert any(f.external_boundary_count >= 1 for f in graph.candidate_paths)
+
+
+class TestParserRegistry:
+    """Phase 3: language parser extensibility seam."""
+
+    def test_python_registered(self):
+        from app.flow_graph import supported_extensions
+
+        assert ".py" in supported_extensions()
+
+    def test_unknown_extension_returns_empty(self):
+        from app.flow_graph import parse_call_sites
+
+        assert parse_call_sites("main.go", "func main() {}") == []
+
+    def test_register_custom_parser(self):
+        from app.flow_graph import register_parser, parse_call_sites, _CallSite
+
+        def fake_parser(path, source):
+            return [_CallSite("entry", "callee", False, "call", 1)]
+
+        register_parser(".fake", fake_parser)
+        try:
+            sites = parse_call_sites("x.fake", "anything")
+            assert len(sites) == 1
+            assert sites[0].callee_name == "callee"
+        finally:
+            from app.flow_graph import _PARSERS
+            _PARSERS.pop(".fake", None)
+
+
+class TestObservedOverlay:
+    """Phase 3: observed-path overlay against candidate flows."""
+
+    def test_overlay_marks_observed_and_unobserved(self):
+        from app.flow_graph import build_flow_graph, apply_observed_overlay
+
+        records = _records_from_source("a.py", SAMPLE_SOURCE)
+        graph = build_flow_graph(
+            records, [("a.py", SAMPLE_SOURCE)], 1, "x",
+            "http_route", "POST:/documents/analyze",
+        )
+        # Mark one node as observed.
+        for n in graph.nodes:
+            if n.qualified_name == "parse_blocks":
+                n.observed = True
+        apply_observed_overlay(graph)
+        flow = next(
+            f for f in graph.candidate_paths
+            if "a.py::parse_blocks" in f.node_ids
+        )
+        assert flow.observed_node_count >= 1
+        assert "a.py::analyze_document" in flow.unobserved_node_ids
+        assert "a.py::parse_blocks" not in flow.unobserved_node_ids
+
+
 # ---------------------------------------------------------------------------
 # API integration tests
 # ---------------------------------------------------------------------------
@@ -353,6 +487,18 @@ def git_repo(tmp_path):
         def send_email(user):
             return True
     """))
+    (repo / "probed.py").write_text(textwrap.dedent("""\
+        from probe_agent import probe
+
+
+        @probe(component_id="parser")
+        def parse_text(t):
+            return clean(t)
+
+
+        def clean(t):
+            return t
+    """))
     subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"],
                    check=True, capture_output=True)
@@ -400,10 +546,11 @@ class TestFlowApi:
         names = {n["qualified_name"] for n in data["nodes"]}
         assert "analyze_document" in names
         assert "parse_blocks" in names
-        # every node and edge tracks source provenance
+        # every in-repo node and edge tracks source provenance
         for node in data["nodes"]:
-            assert node["path"] and node["line_start"] >= 1
             assert "evidence" in node
+            if not node["is_external"]:
+                assert node["path"] and node["line_start"] >= 1
         for edge in data["edges"]:
             assert edge["resolution"] in ("resolved", "inferred", "unresolved")
         assert len(data["candidate_paths"]) >= 1
@@ -418,6 +565,74 @@ class TestFlowApi:
             headers=h,
         )
         assert r.status_code == 404
+
+    def test_runtime_overlay_marks_observed_nodes(self, admin_client, git_repo, monkeypatch):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "overlay")
+        h = _setup_snapshot(admin_client, token, system["id"], git_repo)
+
+        # Send a real trace for the probed component "parser".
+        r = admin_client.post(
+            "/traces",
+            json={
+                "trace_id": "t-1", "component_id": "parser",
+                "input": {"t": "hi"}, "output": "hi",
+                "duration_ms": 3.0, "timestamp": time.time(),
+            },
+            headers=h,
+        )
+        assert r.status_code == 201, r.text
+
+        r = admin_client.post(
+            "/repository/flow-graphs",
+            json={"entrypoint_type": "public_function",
+                  "entrypoint_id": "function:probed.py::parse_text"},
+            headers=h,
+        )
+        assert r.status_code == 200, r.text
+        data = r.json()
+        nodes = {n["qualified_name"]: n for n in data["nodes"]}
+        assert nodes["parse_text"]["component_id"] == "parser"
+        assert nodes["parse_text"]["trace_count"] == 1
+        assert nodes["parse_text"]["observed"] is True
+        assert nodes["clean"]["observed"] is False
+        # Observed-path overlay diffs against the static candidate flow.
+        flow = data["candidate_paths"][0]
+        assert flow["observed_node_count"] >= 1
+        assert "probed.py::clean" in flow["unobserved_node_ids"]
+
+    def test_external_node_cannot_be_probed(self, admin_client, git_repo, monkeypatch):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "extprobe")
+        h = _setup_snapshot(admin_client, token, system["id"], git_repo)
+        graph = admin_client.post(
+            "/repository/flow-graphs",
+            json={"entrypoint_type": "public_function",
+                  "entrypoint_id": "function:probed.py::parse_text"},
+            headers=h,
+        ).json()
+        # SAMPLE_SOURCE has no external nodes; use app.py save -> external open.
+        graph2 = admin_client.post(
+            "/repository/flow-graphs",
+            json={"entrypoint_type": "http_route",
+                  "entrypoint_id": "POST:/documents/analyze"},
+            headers=h,
+        ).json()
+        ext = [n for n in graph2["nodes"] if n["is_external"]]
+        if not ext:
+            pytest.skip("no external node present in sample")
+        r = admin_client.post(
+            "/repository/probe-plans/from-flow",
+            json={
+                "entrypoint_type": "http_route",
+                "entrypoint_id": "POST:/documents/analyze",
+                "selections": [{"node_id": ext[0]["node_id"],
+                                "observation": "boundary", "mode_preference": "trace"}],
+            },
+            headers=h,
+        )
+        assert r.status_code == 400
+        assert "external" in r.json()["detail"].lower()
 
     def test_high_risk_node_flagged(self, admin_client, git_repo, monkeypatch):
         token = _login(admin_client)

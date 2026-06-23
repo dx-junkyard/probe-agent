@@ -433,12 +433,16 @@ describe("Flow Explorer page", () => {
         qualified_name: "analyze_document", path: "app.py", line_start: 5, line_end: 11,
         component_id: null, probe_capabilities: ["input", "output", "error", "duration"],
         risk: "low", denylist_hit: null, evidence: [],
+        boundary_kind: null, is_external: false, trace_count: 0, error_count: 0,
+        evaluation_pass: 0, evaluation_fail: 0, observed: false,
       },
       {
         node_id: "app.py::parse_blocks", node_type: "function", symbol_id: 2,
         qualified_name: "parse_blocks", path: "app.py", line_start: 14, line_end: 15,
         component_id: null, probe_capabilities: ["input", "output", "error", "duration"],
         risk: "low", denylist_hit: null, evidence: [],
+        boundary_kind: null, is_external: false, trace_count: 0, error_count: 0,
+        evaluation_pass: 0, evaluation_fail: 0, observed: false,
       },
     ],
     edges: [
@@ -454,6 +458,7 @@ describe("Flow Explorer page", () => {
         entrypoint_node_id: "app.py::analyze_document",
         node_ids: ["app.py::analyze_document", "app.py::parse_blocks"],
         node_count: 2, max_depth: 1, confidence: 1.0, unresolved_edge_count: 0,
+        external_boundary_count: 0, observed_node_count: 0, unobserved_node_ids: [],
       },
     ],
     diagnostics: [],
@@ -514,6 +519,66 @@ describe("Flow Explorer page", () => {
         }),
       );
     });
+  });
+
+  test("renders external boundary and observed overlay; boundary is not selectable", async () => {
+    const graphWithBoundary = {
+      ...flowGraph,
+      nodes: [
+        { ...flowGraph.nodes[0], observed: true, trace_count: 4, error_count: 1 },
+        {
+          node_id: "external::database::cursor", node_type: "external_io", symbol_id: null,
+          qualified_name: "cursor.execute", path: "(external)", line_start: 0, line_end: 0,
+          component_id: null, probe_capabilities: ["boundary"], risk: "medium",
+          denylist_hit: null, evidence: [], boundary_kind: "database", is_external: true,
+          trace_count: 0, error_count: 0, evaluation_pass: 0, evaluation_fail: 0, observed: false,
+        },
+      ],
+      edges: [{
+        source_node_id: "app.py::analyze_document", target_node_id: "external::database::cursor",
+        edge_type: "database", confidence: 0.5, resolution: "inferred", callee_name: "execute",
+        line: 8, evidence: [],
+      }],
+      candidate_paths: [{
+        flow_id: "flow-1", title: "analyze_document → cursor.execute", summary: "",
+        entrypoint_node_id: "app.py::analyze_document",
+        node_ids: ["app.py::analyze_document", "external::database::cursor"],
+        node_count: 2, max_depth: 1, confidence: 0.5, unresolved_edge_count: 0,
+        external_boundary_count: 1, observed_node_count: 1, unobserved_node_ids: [],
+      }],
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/flow-entrypoints") {
+        return Promise.resolve({
+          system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
+          entrypoints: [flowGraph.entrypoint],
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/repository/flow-graphs") return Promise.resolve(graphWithBoundary);
+      return Promise.resolve(null);
+    });
+
+    const { default: FlowExplorerPage } = await import("@/pages/flow-explorer");
+    render(<FlowExplorerPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByText("/documents/analyze"));
+
+    // Boundary node renders with a DB badge and trace overlay is shown.
+    const labels = await screen.findAllByText("cursor.execute");
+    const nodeLabel = labels.find(el => el.className.includes("font-medium"));
+    expect(screen.getByText("DB")).toBeInTheDocument();
+    expect(screen.getByText(/4 trace/)).toBeInTheDocument();
+
+    // Clicking the external boundary node must not enable plan creation.
+    fireEvent.click(nodeLabel!);
+    expect(screen.getByText("Create Probe Plan draft")).toBeDisabled();
+    expect(mockApi.post).not.toHaveBeenCalledWith(
+      "/repository/probe-plans/from-flow",
+      expect.anything(),
+    );
   });
 });
 

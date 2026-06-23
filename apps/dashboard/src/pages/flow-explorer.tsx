@@ -12,7 +12,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Workflow, Crosshair, AlertTriangle, ArrowRight } from "lucide-react";
+import { Workflow, Crosshair, AlertTriangle, ArrowRight, Activity } from "lucide-react";
 import type {
   FlowEntrypointOut, FlowGraphOut, FlowNodeOut, FlowProbeSelection,
 } from "@/api/types";
@@ -27,6 +27,10 @@ const RESOLUTION_STYLE: Record<string, string> = {
   resolved: "border-emerald-300 text-emerald-700 dark:text-emerald-300",
   inferred: "border-amber-300 text-amber-700 dark:text-amber-300",
   unresolved: "border-red-300 text-red-700 dark:text-red-300",
+};
+
+const BOUNDARY_LABEL: Record<string, string> = {
+  http: "HTTP", database: "DB", filesystem: "FS", dispatch: "async",
 };
 
 export default function FlowExplorerPage() {
@@ -66,6 +70,10 @@ export default function FlowExplorerPage() {
   };
 
   const toggleNode = (node: FlowNodeOut) => {
+    if (node.is_external) {
+      toast.error("External boundary nodes can't be instrumented. Select the in-repo caller and observe its call boundary.");
+      return;
+    }
     setSelections(prev => {
       const next = { ...prev };
       if (next[node.node_id]) {
@@ -193,14 +201,23 @@ export default function FlowExplorerPage() {
                     }`}
                   >
                     <div className="font-medium truncate">{flow.title}</div>
-                    <div className="text-muted-foreground flex gap-2">
+                    <div className="text-muted-foreground flex flex-wrap gap-x-2">
                       <span>{flow.node_count} nodes</span>
                       <span>depth {flow.max_depth}</span>
                       <span>conf {Math.round(flow.confidence * 100)}%</span>
+                      {flow.external_boundary_count > 0 && (
+                        <span className="text-sky-600">{flow.external_boundary_count} boundary</span>
+                      )}
                       {flow.unresolved_edge_count > 0 && (
                         <span className="text-red-600">{flow.unresolved_edge_count} unresolved</span>
                       )}
                     </div>
+                    {(flow.observed_node_count > 0 || flow.unobserved_node_ids.length > 0) && (
+                      <div className="text-[11px] text-emerald-700 dark:text-emerald-400 mt-0.5">
+                        observed {flow.observed_node_count}/
+                        {flow.observed_node_count + flow.unobserved_node_ids.length} nodes
+                      </div>
+                    )}
                   </button>
                 ))}
               </CardContent>
@@ -245,13 +262,23 @@ export default function FlowExplorerPage() {
                         <button
                           onClick={() => toggleNode(node)}
                           className={`w-full text-left rounded-lg border p-3 transition-colors ${
-                            selected ? "border-primary bg-secondary/40" : "hover:bg-secondary/30"
+                            node.is_external
+                              ? "border-dashed bg-muted/40 cursor-default"
+                              : selected
+                                ? "border-primary bg-secondary/40"
+                                : "hover:bg-secondary/30"
                           }`}
                         >
                           <div className="flex items-center justify-between gap-2">
                             <span className="font-mono text-sm font-medium">{node.qualified_name}</span>
                             <div className="flex items-center gap-1 shrink-0">
-                              <Badge variant="outline" className="text-[10px]">{node.node_type}</Badge>
+                              {node.boundary_kind ? (
+                                <Badge variant="outline" className="text-[10px] border-sky-400 text-sky-700 dark:text-sky-300">
+                                  {BOUNDARY_LABEL[node.boundary_kind] ?? node.boundary_kind}
+                                </Badge>
+                              ) : (
+                                <Badge variant="outline" className="text-[10px]">{node.node_type}</Badge>
+                              )}
                               <Badge variant={RISK_VARIANT[node.risk]} className="text-[10px]">
                                 {node.risk === "high" && <AlertTriangle className="h-3 w-3 mr-0.5" />}
                                 {node.risk}
@@ -259,9 +286,26 @@ export default function FlowExplorerPage() {
                             </div>
                           </div>
                           <div className="text-xs text-muted-foreground mt-0.5">
-                            {node.path}:{node.line_start}–{node.line_end}
+                            {node.is_external ? "external boundary (not instrumentable)" : `${node.path}:${node.line_start}–${node.line_end}`}
                             {node.component_id && <span> · {node.component_id}</span>}
                           </div>
+                          {!node.is_external && (node.trace_count > 0 || node.evaluation_pass + node.evaluation_fail > 0) && (
+                            <div className="flex items-center gap-2 mt-1 text-[11px]">
+                              {node.observed && (
+                                <span className="inline-flex items-center gap-0.5 text-emerald-600">
+                                  <Activity className="h-3 w-3" /> {node.trace_count} trace(s)
+                                </span>
+                              )}
+                              {node.error_count > 0 && (
+                                <span className="text-red-600">{node.error_count} error(s)</span>
+                              )}
+                              {node.evaluation_pass + node.evaluation_fail > 0 && (
+                                <span className="text-muted-foreground">
+                                  eval {node.evaluation_pass}✓/{node.evaluation_fail}✗
+                                </span>
+                              )}
+                            </div>
+                          )}
                           {node.denylist_hit && (
                             <div className="text-xs text-red-600 mt-0.5">⚠ {node.denylist_hit}</div>
                           )}
@@ -351,6 +395,12 @@ export default function FlowExplorerPage() {
                     </div>
                   );
                 })
+              )}
+              {selectionCount >= 2 && (
+                <div className="rounded-md border border-sky-200 bg-sky-50 dark:bg-sky-950/20 dark:border-sky-800 px-2 py-1.5 text-[11px] text-sky-800 dark:text-sky-200">
+                  Multiple nodes selected — trace these together to compare a
+                  latency breakdown or transformation across the flow.
+                </div>
               )}
               <div className="space-y-1">
                 <Label className="text-xs">Observation objective</Label>

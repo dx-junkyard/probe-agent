@@ -329,6 +329,13 @@ export interface FlowNodeOut {
   risk: "low" | "medium" | "high";
   denylist_hit: string | null;
   evidence: EvidenceRefOut[];
+  boundary_kind: string | null;
+  is_external: boolean;
+  trace_count: number;
+  error_count: number;
+  evaluation_pass: number;
+  evaluation_fail: number;
+  observed: boolean;
 }
 
 export interface FlowEdgeOut {
@@ -352,6 +359,9 @@ export interface CandidateFlowOut {
   max_depth: number;
   confidence: number;
   unresolved_edge_count: number;
+  external_boundary_count: number;
+  observed_node_count: number;
+  unobserved_node_ids: string[];
 }
 
 export interface FlowGraphOut {

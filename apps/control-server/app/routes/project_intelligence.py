@@ -1875,6 +1875,13 @@ def _flow_graph_out(system_id: int, graph) -> FlowGraphOut:
                 risk=n.risk,
                 denylist_hit=n.denylist_hit,
                 evidence=_evidence_refs_out(n.evidence),
+                boundary_kind=n.boundary_kind,
+                is_external=n.is_external,
+                trace_count=n.trace_count,
+                error_count=n.error_count,
+                evaluation_pass=n.evaluation_pass,
+                evaluation_fail=n.evaluation_fail,
+                observed=n.observed,
             )
             for n in graph.nodes
         ],
@@ -1902,12 +1909,65 @@ def _flow_graph_out(system_id: int, graph) -> FlowGraphOut:
                 max_depth=c.max_depth,
                 confidence=c.confidence,
                 unresolved_edge_count=c.unresolved_edge_count,
+                external_boundary_count=c.external_boundary_count,
+                observed_node_count=c.observed_node_count,
+                unobserved_node_ids=c.unobserved_node_ids,
             )
             for c in graph.candidate_paths
         ],
         diagnostics=graph.diagnostics,
         truncated=graph.truncated,
     )
+
+
+def _overlay_runtime(system_id: int, graph) -> None:
+    """Overlay real trace/evaluation data onto in-repo nodes (Phase 2/3).
+
+    Only nodes that carry a component_id (i.e. already instrumented symbols)
+    can have runtime observations. Boundary nodes and uninstrumented symbols
+    stay at zero. This reads aggregate counts only; no payloads are exposed.
+    """
+    from ..flow_graph import apply_observed_overlay
+
+    component_ids = sorted({
+        n.component_id for n in graph.nodes if n.component_id
+    })
+    if component_ids:
+        placeholders = ",".join("?" for _ in component_ids)
+        with get_conn() as conn:
+            trace_rows = conn.execute(
+                f"""SELECT component_id,
+                           COUNT(*) AS total,
+                           SUM(CASE WHEN error IS NOT NULL AND error != '' THEN 1 ELSE 0 END) AS errors
+                    FROM traces
+                    WHERE system_id = ? AND component_id IN ({placeholders})
+                    GROUP BY component_id""",
+                (system_id, *component_ids),
+            ).fetchall()
+            eval_rows = conn.execute(
+                f"""SELECT component_id,
+                           SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) AS passed,
+                           SUM(CASE WHEN status = 'ng' THEN 1 ELSE 0 END) AS failed
+                    FROM evaluation_results
+                    WHERE system_id = ? AND component_id IN ({placeholders})
+                    GROUP BY component_id""",
+                (system_id, *component_ids),
+            ).fetchall()
+        traces_by_comp = {r["component_id"]: r for r in trace_rows}
+        evals_by_comp = {r["component_id"]: r for r in eval_rows}
+        for node in graph.nodes:
+            if not node.component_id:
+                continue
+            tr = traces_by_comp.get(node.component_id)
+            if tr:
+                node.trace_count = tr["total"] or 0
+                node.error_count = tr["errors"] or 0
+                node.observed = node.trace_count > 0
+            ev = evals_by_comp.get(node.component_id)
+            if ev:
+                node.evaluation_pass = ev["passed"] or 0
+                node.evaluation_fail = ev["failed"] or 0
+    apply_observed_overlay(graph)
 
 
 @router.post("/repository/flow-graphs", response_model=FlowGraphOut)
@@ -1933,6 +1993,7 @@ def build_flow_graph_endpoint(
             status_code=404,
             detail=f"Entrypoint not found in snapshot: {payload.entrypoint_id}",
         )
+    _overlay_runtime(system_id, graph)
     return _flow_graph_out(system_id, graph)
 
 
@@ -1984,6 +2045,15 @@ def create_probe_plan_from_flow(
             raise HTTPException(
                 status_code=400,
                 detail=f"Selected node is not part of this flow graph: {sel.node_id}",
+            )
+        if node.is_external:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "External boundary nodes cannot be instrumented directly. "
+                    "Select the in-repo caller and observe its call boundary instead: "
+                    f"{sel.node_id}"
+                ),
             )
         selected.append((sel, node))
 

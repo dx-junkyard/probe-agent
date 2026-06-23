@@ -17,8 +17,9 @@ Design constraints (see CLAUDE.md / docs/project-intelligence.md):
 from __future__ import annotations
 
 import ast
+import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .probe_planner import check_denylist
 
@@ -83,7 +84,8 @@ class FlowEntrypoint:
 @dataclass
 class FlowNode:
     node_id: str
-    node_type: str  # http_route | function | async_function
+    # http_route | function | async_function | external_io | async_dispatch
+    node_type: str
     symbol_id: Optional[int]
     qualified_name: str
     path: str
@@ -94,13 +96,23 @@ class FlowNode:
     risk: str  # low | medium | high
     denylist_hit: Optional[str]
     evidence: List[EvidenceRef]
+    # External boundary classification (Phase 2); None for in-repo symbols.
+    boundary_kind: Optional[str] = None  # http | database | filesystem | dispatch
+    is_external: bool = False
+    # Runtime overlay (Phase 2/3); filled by the API layer from traces.
+    trace_count: int = 0
+    error_count: int = 0
+    evaluation_pass: int = 0
+    evaluation_fail: int = 0
+    observed: bool = False
 
 
 @dataclass
 class FlowEdge:
     source_node_id: str
     target_node_id: Optional[str]
-    edge_type: str  # call | await
+    # call | await | dispatch | http | database | filesystem
+    edge_type: str
     confidence: float
     resolution: str  # resolved | inferred | unresolved
     callee_name: str
@@ -119,6 +131,11 @@ class CandidateFlow:
     max_depth: int
     confidence: float
     unresolved_edge_count: int
+    # Phase 2: how many nodes cross an external boundary.
+    external_boundary_count: int = 0
+    # Phase 3: observed-path overlay against real traces.
+    observed_node_count: int = 0
+    unobserved_node_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -145,25 +162,29 @@ class _CallSite:
     is_self: bool
     edge_type: str  # call | await
     line: int
+    base: Optional[str] = None  # immediate attribute base, e.g. "requests"
+    dotted: str = ""  # "requests.get", "task.delay", "open"
 
 
 def _node_id(path: str, qualified_name: str) -> str:
     return f"{path}::{qualified_name}"
 
 
-def _callee_name(func: ast.expr) -> Tuple[Optional[str], bool]:
-    """Return (callee_simple_name, is_self_call) for a call target.
+def _callee_name(func: ast.expr) -> Tuple[Optional[str], bool, Optional[str], str]:
+    """Return (callee_simple_name, is_self, base_name, dotted_name).
 
     Only ``name()``, ``self.method()`` and ``obj.method()`` shapes are handled;
-    anything else returns ``(None, False)`` and is treated as external.
+    anything else returns ``(None, ...)`` and is treated as external.
     """
     if isinstance(func, ast.Name):
-        return func.id, False
+        return func.id, False, None, func.id
     if isinstance(func, ast.Attribute):
         base = func.value
-        is_self = isinstance(base, ast.Name) and base.id == "self"
-        return func.attr, is_self
-    return None, False
+        if isinstance(base, ast.Name):
+            base_name = base.id
+            return func.attr, base_name == "self", base_name, f"{base_name}.{func.attr}"
+        return func.attr, False, None, func.attr
+    return None, False, None, ""
 
 
 def extract_call_sites(path: str, source: str) -> List[_CallSite]:
@@ -196,7 +217,7 @@ def extract_call_sites(path: str, source: str) -> List[_CallSite]:
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 continue
             if isinstance(child, ast.Call):
-                callee, is_self = _callee_name(child.func)
+                callee, is_self, base, dotted = _callee_name(child.func)
                 if callee:
                     sites.append(_CallSite(
                         caller_qualified_name=enclosing_func,
@@ -204,6 +225,8 @@ def extract_call_sites(path: str, source: str) -> List[_CallSite]:
                         is_self=is_self,
                         edge_type="await" if id(child) in awaited else "call",
                         line=getattr(child, "lineno", 0),
+                        base=base,
+                        dotted=dotted,
                     ))
             record_calls(child, enclosing_func)
 
@@ -221,6 +244,114 @@ def extract_call_sites(path: str, source: str) -> List[_CallSite]:
 
     walk(tree.body, "", None)
     return sites
+
+
+# ---------------------------------------------------------------------------
+# Language parser registry (Phase 3 extensibility seam)
+# ---------------------------------------------------------------------------
+
+# A parser maps (path, source) -> list of intra-file call sites. Additional
+# languages register here without touching the graph-assembly code. Symbol and
+# entrypoint extraction remain Python-specific until per-language indexers are
+# added; that is intentionally out of scope for this phase.
+CallSiteParser = Callable[[str, str], List[_CallSite]]
+
+_PARSERS: Dict[str, CallSiteParser] = {}
+
+
+def register_parser(extension: str, parser: CallSiteParser) -> None:
+    _PARSERS[extension.lower()] = parser
+
+
+def supported_extensions() -> List[str]:
+    return sorted(_PARSERS)
+
+
+def parse_call_sites(path: str, source: str) -> List[_CallSite]:
+    """Dispatch call-site extraction to the parser registered for the file."""
+    ext = os.path.splitext(path)[1].lower()
+    parser = _PARSERS.get(ext)
+    if parser is None:
+        return []
+    return parser(path, source)
+
+
+register_parser(".py", extract_call_sites)
+
+
+# ---------------------------------------------------------------------------
+# External boundary classification (Phase 2)
+#
+# Deterministic and explicit: a boundary is recognised only when it matches one
+# of these enumerated registries, mirroring the route-decorator and safety
+# denylist approach. Anything else stays an in-repo call or is dropped as an
+# unknown external/builtin. Unknown side-effect analysis is never inferred here.
+# ---------------------------------------------------------------------------
+
+# Explicit async dispatch / background-job / queue producer APIs.
+_DISPATCH_METHODS = {
+    "delay", "apply_async", "enqueue", "enqueue_call", "add_task",
+    "send_task", "publish", "produce", "schedule", "create_task",
+    "ensure_future", "run_in_executor", "spawn",
+}
+
+# Known external I/O library bases (matched on the immediate attribute base).
+_HTTP_BASES = {"requests", "httpx", "aiohttp", "urllib", "urllib3"}
+_DB_BASES = {
+    "sqlalchemy", "psycopg2", "psycopg", "sqlite3", "pymongo", "redis",
+    "asyncpg", "cursor", "db", "conn", "connection",
+}
+_FS_BASES = {"shutil", "pathlib"}
+_FS_FUNCTIONS = {"open"}
+
+
+def _classify_boundary(site: _CallSite) -> Optional[Tuple[str, str, str, str]]:
+    """Classify an external call into a boundary kind.
+
+    Returns ``(boundary_kind, edge_type, resolution, label)`` or ``None``.
+    ``label`` is used to build a stable synthetic node id.
+    """
+    if site.callee_name in _DISPATCH_METHODS:
+        return ("dispatch", "dispatch", _RESOLVED, site.dotted or site.callee_name)
+    base = site.base
+    if base in _HTTP_BASES:
+        return ("http", "http", _INFERRED, base)
+    if base in _DB_BASES:
+        return ("database", "database", _INFERRED, base)
+    if base in _FS_BASES or site.callee_name in _FS_FUNCTIONS:
+        return ("filesystem", "filesystem", _INFERRED, base or site.callee_name)
+    return None
+
+
+def _external_node_id(boundary_kind: str, label: str) -> str:
+    return f"external::{boundary_kind}::{label}"
+
+
+def _make_external_node(boundary_kind: str, label: str, dotted: str) -> FlowNode:
+    denylist_hit = check_denylist(dotted.replace(".", "_"))
+    risk = "high" if denylist_hit else "medium"
+    node_type = "async_dispatch" if boundary_kind == "dispatch" else "external_io"
+    return FlowNode(
+        node_id=_external_node_id(boundary_kind, label),
+        node_type=node_type,
+        symbol_id=None,
+        qualified_name=dotted or label,
+        path="(external)",
+        line_start=0,
+        line_end=0,
+        component_id=None,
+        probe_capabilities=["boundary"],
+        risk=risk,
+        denylist_hit=denylist_hit,
+        evidence=[EvidenceRef(
+            path="(external)",
+            start_line=0,
+            end_line=0,
+            summary=f"{boundary_kind} boundary: {dotted or label}()",
+        )],
+        boundary_kind=boundary_kind,
+        is_external=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -402,7 +533,7 @@ def build_flow_graph(
     sources = {path: src for path, src in files}
     calls_by_caller: Dict[Tuple[str, str], List[_CallSite]] = {}
     for path, src in files:
-        for site in extract_call_sites(path, src):
+        for site in parse_call_sites(path, src):
             calls_by_caller.setdefault(
                 (path, site.caller_qualified_name), []
             ).append(site)
@@ -428,9 +559,44 @@ def build_flow_graph(
         sites = calls_by_caller.get((caller.path, caller.qualified_name), [])
         for site in sorted(sites, key=lambda s: (s.line, s.callee_name)):
             target, resolution = index.resolve(caller, site)
-            if resolution == "external":
-                continue
             source_id = _node_id(caller.path, caller.qualified_name)
+
+            if resolution == "external":
+                # Phase 2: surface explicitly-recognised boundaries as leaf
+                # nodes; drop genuinely unknown external/builtin calls.
+                classified = _classify_boundary(site)
+                if classified is None:
+                    continue
+                boundary_kind, edge_type, b_resolution, label = classified
+                ext_id = _external_node_id(boundary_kind, label)
+                edge_key = (source_id, ext_id, edge_type)
+                if edge_key in seen_edges:
+                    continue
+                seen_edges.add(edge_key)
+                edges.append(FlowEdge(
+                    source_node_id=source_id,
+                    target_node_id=ext_id,
+                    edge_type=edge_type,
+                    confidence=_CONFIDENCE[b_resolution],
+                    resolution=b_resolution,
+                    callee_name=site.callee_name,
+                    line=site.line,
+                    evidence=[EvidenceRef(
+                        path=caller.path,
+                        start_line=site.line,
+                        end_line=site.line,
+                        summary=f"{boundary_kind} boundary via {site.dotted or site.callee_name}()",
+                    )],
+                ))
+                if ext_id not in nodes:
+                    if len(nodes) >= max_nodes:
+                        truncated = True
+                        continue
+                    nodes[ext_id] = _make_external_node(
+                        boundary_kind, label, site.dotted or site.callee_name,
+                    )
+                continue
+
             if target is None:
                 edge_key = (source_id, None, site.callee_name, site.edge_type, site.line)
                 if edge_key in seen_edges:
@@ -621,6 +787,9 @@ def _enumerate_candidate_flows(
     flows: List[CandidateFlow] = []
     for i, (path, conf) in enumerate(unique[:_MAX_CANDIDATE_FLOWS]):
         unresolved = sum(unresolved_by_node.get(n, 0) for n in path)
+        external = sum(
+            1 for n in path if n in nodes and nodes[n].is_external
+        )
         leaf = nodes.get(path[-1])
         entry = nodes.get(path[0])
         leaf_name = leaf.qualified_name if leaf else path[-1]
@@ -641,8 +810,29 @@ def _enumerate_candidate_flows(
             max_depth=len(path) - 1,
             confidence=round(conf, 3),
             unresolved_edge_count=unresolved,
+            external_boundary_count=external,
         ))
     return flows
+
+
+def apply_observed_overlay(graph: FlowGraph) -> None:
+    """Recompute observed-path overlay on candidate flows (Phase 3).
+
+    Call after the API layer has set ``FlowNode.observed`` from real traces.
+    For each candidate flow it records how many in-repo nodes have runtime
+    observations and which probeable nodes remain unobserved, so the UI can
+    diff the static candidate against what production actually exercised.
+    """
+    observed_ids = {n.node_id for n in graph.nodes if n.observed}
+    for flow in graph.candidate_paths:
+        probeable = [
+            nid for nid in flow.node_ids
+            if any(n.node_id == nid and not n.is_external for n in graph.nodes)
+        ]
+        flow.observed_node_count = sum(1 for nid in probeable if nid in observed_ids)
+        flow.unobserved_node_ids = [
+            nid for nid in probeable if nid not in observed_ids
+        ]
 
 
 def _flow_title(nodes: Dict[str, FlowNode], path: List[str]) -> str:

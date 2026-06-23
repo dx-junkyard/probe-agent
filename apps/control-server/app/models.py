@@ -741,6 +741,15 @@ class FlowNodeOut(BaseModel):
     risk: Literal["low", "medium", "high"] = "low"
     denylist_hit: Optional[str] = None
     evidence: List[EvidenceRefOut] = Field(default_factory=list)
+    # Phase 2: external boundary classification.
+    boundary_kind: Optional[str] = None
+    is_external: bool = False
+    # Phase 2/3: runtime overlay from real traces.
+    trace_count: int = 0
+    error_count: int = 0
+    evaluation_pass: int = 0
+    evaluation_fail: int = 0
+    observed: bool = False
 
 
 class FlowEdgeOut(BaseModel):
@@ -764,6 +773,9 @@ class CandidateFlowOut(BaseModel):
     max_depth: int
     confidence: float = Field(ge=0.0, le=1.0)
     unresolved_edge_count: int
+    external_boundary_count: int = 0
+    observed_node_count: int = 0
+    unobserved_node_ids: List[str] = Field(default_factory=list)
 
 
 class FlowGraphOut(BaseModel):
