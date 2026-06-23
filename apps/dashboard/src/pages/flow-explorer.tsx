@@ -35,6 +35,20 @@ const BOUNDARY_LABEL: Record<string, string> = {
   http: "HTTP", database: "DB", filesystem: "FS", dispatch: "async",
 };
 
+// Issue #48: backend-entrypoint category filters and short badge labels.
+const ENTRYPOINT_CATEGORIES: { key: string; label: string }[] = [
+  { key: "all", label: "All" },
+  { key: "api", label: "API" },
+  { key: "message_queue", label: "Message Queue" },
+  { key: "scheduled_job", label: "Scheduled Job" },
+  { key: "cli", label: "CLI" },
+  { key: "function", label: "Function" },
+];
+
+const CATEGORY_BADGE: Record<string, string> = {
+  api: "API", message_queue: "MQ", scheduled_job: "Job", cli: "CLI", function: "fn",
+};
+
 const nodeKey = (id: string) => `node:${id}`;
 const edgeKey = (id: string) => `edge:${id}`;
 
@@ -71,7 +85,9 @@ function PreviewBlock({ preview }: { preview: ProbePreviewOut }) {
 }
 
 export default function FlowExplorerPage() {
-  const { data: entrypointsData, isLoading } = useFlowEntrypoints();
+  const [category, setCategory] = useState("all");
+  const [filter, setFilter] = useState("");
+  const { data: entrypointsData, isLoading } = useFlowEntrypoints({ category, q: filter });
   const buildGraph = useBuildFlowGraph();
   const createPlan = useCreatePlanFromFlow();
 
@@ -80,15 +96,12 @@ export default function FlowExplorerPage() {
   const [activeFlowId, setActiveFlowId] = useState<string | null>(null);
   const [selections, setSelections] = useState<Record<string, FlowProbeSelection>>({});
   const [objective, setObjective] = useState("");
-  const [filter, setFilter] = useState("");
   const [stale, setStale] = useState(false);
 
+  // The server applies category/substring filters and returns matches in full
+  // (no silent truncation); ``total`` is the unfiltered entrypoint count.
   const entrypoints = entrypointsData?.entrypoints ?? [];
-  const filtered = entrypoints.filter(e =>
-    !filter.trim()
-    || e.label.toLowerCase().includes(filter.toLowerCase())
-    || e.path.toLowerCase().includes(filter.toLowerCase()),
-  );
+  const total = entrypointsData?.total ?? 0;
 
   const openEntrypoint = async (ep: FlowEntrypointOut) => {
     setActiveEntrypoint(ep);
@@ -220,44 +233,81 @@ export default function FlowExplorerPage() {
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm">Entrypoints</CardTitle>
+              <CardDescription className="text-xs">
+                {isLoading
+                  ? "Loading…"
+                  : `${entrypoints.length} of ${total} entrypoint(s)`}
+              </CardDescription>
             </CardHeader>
             <CardContent className="space-y-2">
+              <div className="flex flex-wrap gap-1">
+                {ENTRYPOINT_CATEGORIES.map(c => (
+                  <button
+                    key={c.key}
+                    onClick={() => setCategory(c.key)}
+                    className={`rounded-full border px-2 py-0.5 text-[11px] transition-colors ${
+                      category === c.key
+                        ? "border-primary bg-secondary"
+                        : "hover:bg-secondary/50"
+                    }`}
+                  >
+                    {c.label}
+                  </button>
+                ))}
+              </div>
               <Input
                 value={filter}
                 onChange={e => setFilter(e.target.value)}
-                placeholder="Filter by path or route…"
+                placeholder="Filter by label, path or operation…"
                 className="h-8 text-xs"
               />
               {isLoading ? (
                 <Skeleton className="h-24 w-full" />
               ) : !entrypoints.length ? (
                 <p className="text-xs text-muted-foreground">
-                  No entrypoints. Create a snapshot and index symbols on the{" "}
-                  <Link to="/repository" className="underline">Repository</Link> page.
+                  {total === 0 ? (
+                    <>
+                      No entrypoints. Create a snapshot and index symbols on the{" "}
+                      <Link to="/repository" className="underline">Repository</Link> page.
+                    </>
+                  ) : (
+                    "No entrypoints match this filter."
+                  )}
                 </p>
               ) : (
-                <div className="space-y-1 max-h-72 overflow-y-auto">
-                  {filtered.map(ep => (
-                    <button
-                      key={`${ep.entrypoint_type}:${ep.entrypoint_id}`}
-                      onClick={() => openEntrypoint(ep)}
-                      className={`w-full text-left rounded-md px-2 py-1.5 text-xs transition-colors ${
-                        activeEntrypoint?.entrypoint_id === ep.entrypoint_id
-                          ? "bg-secondary"
-                          : "hover:bg-secondary/50"
-                      }`}
-                    >
-                      <div className="flex items-center gap-1">
-                        <Badge variant="outline" className="text-[10px] px-1 py-0">
-                          {ep.entrypoint_type === "http_route" ? ep.route_method : "fn"}
-                        </Badge>
-                        <span className="font-medium truncate">
-                          {ep.entrypoint_type === "http_route" ? ep.route_path : ep.qualified_name}
-                        </span>
-                      </div>
-                      <div className="text-muted-foreground truncate">{ep.path}</div>
-                    </button>
-                  ))}
+                <div className="space-y-1 max-h-[28rem] overflow-y-auto">
+                  {entrypoints.map(ep => {
+                    const primary = ep.category === "function"
+                      ? ep.qualified_name
+                      : ep.label;
+                    return (
+                      <button
+                        key={`${ep.entrypoint_type}:${ep.entrypoint_id}`}
+                        onClick={() => openEntrypoint(ep)}
+                        className={`w-full text-left rounded-md px-2 py-1.5 text-xs transition-colors ${
+                          activeEntrypoint?.entrypoint_id === ep.entrypoint_id
+                            ? "bg-secondary"
+                            : "hover:bg-secondary/50"
+                        }`}
+                      >
+                        <div className="flex items-center gap-1">
+                          <Badge variant="outline" className="text-[10px] px-1 py-0 shrink-0">
+                            {ep.category === "api"
+                              ? ep.route_method ?? "API"
+                              : CATEGORY_BADGE[ep.category] ?? ep.category}
+                          </Badge>
+                          <span className="font-medium truncate">{primary}</span>
+                        </div>
+                        <div className="text-muted-foreground truncate flex gap-1.5">
+                          <span className="truncate">{ep.path}</span>
+                          {ep.framework && <span className="shrink-0">· {ep.framework}</span>}
+                          {ep.confidence < 1 && (
+                            <span className="shrink-0">· {Math.round(ep.confidence * 100)}%</span>
+                          )}
+                        </div>
+                      </button>
+                    );
+                  })}
                 </div>
               )}
             </CardContent>

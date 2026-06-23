@@ -437,6 +437,8 @@ describe("Flow Explorer page", () => {
       entrypoint_type: "http_route", entrypoint_id: "POST:/documents/analyze",
       label: "POST /documents/analyze", path: "app.py", qualified_name: "analyze_document",
       line_start: 5, line_end: 11, component_id: null, route_method: "POST", route_path: "/documents/analyze",
+      category: "api", framework: "fastapi", operation: "POST /documents/analyze",
+      confidence: 1.0, evidence: [],
     },
     nodes: [
       {
@@ -497,7 +499,7 @@ describe("Flow Explorer page", () => {
       if (path === "/repository/flow-entrypoints") {
         return Promise.resolve({
           system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
-          entrypoints: [flowGraph.entrypoint],
+          total: 1, entrypoints: [flowGraph.entrypoint],
         });
       }
       return Promise.resolve(null);
@@ -514,7 +516,7 @@ describe("Flow Explorer page", () => {
     render(<FlowExplorerPage />, { wrapper: createWrapper() });
 
     // Open the entrypoint -> builds the graph.
-    const entrypointBtn = await screen.findByText("/documents/analyze");
+    const entrypointBtn = await screen.findByText("POST /documents/analyze");
     fireEvent.click(entrypointBtn);
 
     await waitFor(() => {
@@ -590,7 +592,7 @@ describe("Flow Explorer page", () => {
       if (path === "/repository/flow-entrypoints") {
         return Promise.resolve({
           system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
-          entrypoints: [flowGraph.entrypoint],
+          total: 1, entrypoints: [flowGraph.entrypoint],
         });
       }
       return Promise.resolve(null);
@@ -603,7 +605,7 @@ describe("Flow Explorer page", () => {
     const { default: FlowExplorerPage } = await import("@/pages/flow-explorer");
     render(<FlowExplorerPage />, { wrapper: createWrapper() });
 
-    fireEvent.click(await screen.findByText("/documents/analyze"));
+    fireEvent.click(await screen.findByText("POST /documents/analyze"));
 
     // Boundary node renders with a DB badge and trace overlay is shown.
     const labels = await screen.findAllByText("cursor.execute");
@@ -649,7 +651,7 @@ describe("Flow Explorer page", () => {
       if (path === "/repository/flow-entrypoints") {
         return Promise.resolve({
           system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
-          entrypoints: [flowGraph.entrypoint],
+          total: 1, entrypoints: [flowGraph.entrypoint],
         });
       }
       return Promise.resolve(null);
@@ -665,7 +667,7 @@ describe("Flow Explorer page", () => {
     const { default: FlowExplorerPage } = await import("@/pages/flow-explorer");
     render(<FlowExplorerPage />, { wrapper: createWrapper() });
 
-    fireEvent.click(await screen.findByText("/documents/analyze"));
+    fireEvent.click(await screen.findByText("POST /documents/analyze"));
     const matches = await screen.findAllByText("parse_blocks");
     fireEvent.click(matches.find(el => el.className.includes("font-medium"))!);
     const createBtn = await screen.findByText("Create Probe Plan draft");
@@ -675,6 +677,49 @@ describe("Flow Explorer page", () => {
     // The stale banner appears and offers a reload.
     expect(await screen.findByText("Reload graph")).toBeInTheDocument();
     expect(screen.getByText("Create Probe Plan draft")).toBeDisabled();
+  });
+
+  test("category filter requests a typed entrypoint listing and shows the count", async () => {
+    const mqEntrypoint = {
+      entrypoint_type: "message_queue",
+      entrypoint_id: "message_queue:worker.py::analyze_task",
+      label: "Celery: analyze_task", path: "worker.py", qualified_name: "analyze_task",
+      line_start: 1, line_end: 3, component_id: null, route_method: null, route_path: null,
+      category: "message_queue", framework: "celery", operation: "analyze_task",
+      confidence: 0.9, evidence: [],
+    };
+    const calls: string[] = [];
+    mockApi.get.mockImplementation((path: string) => {
+      calls.push(path);
+      if (path === "/repository/flow-entrypoints") {
+        return Promise.resolve({
+          system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
+          total: 2, entrypoints: [flowGraph.entrypoint, mqEntrypoint],
+        });
+      }
+      if (path === "/repository/flow-entrypoints?category=message_queue") {
+        return Promise.resolve({
+          system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
+          total: 2, entrypoints: [mqEntrypoint],
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { default: FlowExplorerPage } = await import("@/pages/flow-explorer");
+    render(<FlowExplorerPage />, { wrapper: createWrapper() });
+
+    // Both kinds are listed initially: "2 of 2".
+    expect(await screen.findByText("2 of 2 entrypoint(s)")).toBeInTheDocument();
+    expect(await screen.findByText("Celery: analyze_task")).toBeInTheDocument();
+
+    // Selecting the Message Queue category requests the typed listing and the
+    // filtered subset is shown in full.
+    fireEvent.click(screen.getByText("Message Queue"));
+    await waitFor(() => {
+      expect(calls).toContain("/repository/flow-entrypoints?category=message_queue");
+    });
+    expect(await screen.findByText("1 of 2 entrypoint(s)")).toBeInTheDocument();
   });
 });
 

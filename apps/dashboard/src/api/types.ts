@@ -306,8 +306,12 @@ export interface ProbePreviewOut {
   denylist_hit: string | null;
 }
 
+export type FlowEntrypointCategory =
+  | "api" | "message_queue" | "scheduled_job" | "cli" | "function";
+
 export interface FlowEntrypointOut {
-  entrypoint_type: "http_route" | "public_function";
+  entrypoint_type:
+    | "http_route" | "public_function" | "message_queue" | "scheduled_job" | "cli";
   entrypoint_id: string;
   label: string;
   path: string;
@@ -317,12 +321,18 @@ export interface FlowEntrypointOut {
   component_id: string | null;
   route_method: string | null;
   route_path: string | null;
+  category: FlowEntrypointCategory;
+  framework: string | null;
+  operation: string | null;
+  confidence: number;
+  evidence: EvidenceRefOut[];
 }
 
 export interface FlowEntrypointsOut {
   system_id: number;
   snapshot_id: number | null;
   commit_sha: string | null;
+  total: number;
   entrypoints: FlowEntrypointOut[];
 }
 

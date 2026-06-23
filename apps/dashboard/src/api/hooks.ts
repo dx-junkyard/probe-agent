@@ -14,8 +14,8 @@ import type {
   WorkspaceProposalDraftOut,
 } from "./types";
 
-function sysKey(base: string) {
-  return [base, getSystemId()];
+function sysKey(base: string, ...extra: unknown[]) {
+  return [base, getSystemId(), ...extra];
 }
 
 export function useMe() {
@@ -303,10 +303,20 @@ export function useUpdateProbePointStatus() {
   });
 }
 
-export function useFlowEntrypoints() {
+export function useFlowEntrypoints(params?: { category?: string; q?: string }) {
+  const category = params?.category && params.category !== "all" ? params.category : "";
+  const q = params?.q?.trim() ?? "";
   return useQuery({
-    queryKey: sysKey("flowEntrypoints"),
-    queryFn: () => api.get<FlowEntrypointsOut>("/repository/flow-entrypoints"),
+    queryKey: sysKey("flowEntrypoints", category, q),
+    queryFn: () => {
+      const search = new URLSearchParams();
+      if (category) search.set("category", category);
+      if (q) search.set("q", q);
+      const qs = search.toString();
+      return api.get<FlowEntrypointsOut>(
+        `/repository/flow-entrypoints${qs ? `?${qs}` : ""}`,
+      );
+    },
     enabled: !!getSystemId(),
   });
 }
