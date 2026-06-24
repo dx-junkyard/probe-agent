@@ -6,7 +6,7 @@ import hashlib
 from dataclasses import replace
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
 from ..auth import Principal, get_system_id, require_user
 from ..code_indexer import index_snapshot_files
@@ -1835,11 +1835,42 @@ def _evidence_refs_out(evidence) -> List[EvidenceRefOut]:
     ]
 
 
+def _entrypoint_out(e) -> FlowEntrypointOut:
+    return FlowEntrypointOut(
+        entrypoint_type=e.entrypoint_type,
+        entrypoint_id=e.entrypoint_id,
+        label=e.label,
+        path=e.path,
+        qualified_name=e.qualified_name,
+        line_start=e.line_start,
+        line_end=e.line_end,
+        component_id=e.component_id,
+        route_method=e.route_method,
+        route_path=e.route_path,
+        category=e.category,
+        framework=e.framework,
+        operation=e.operation,
+        confidence=e.confidence,
+        evidence=_evidence_refs_out(e.evidence),
+    )
+
+
 @router.get("/repository/flow-entrypoints", response_model=FlowEntrypointsOut)
 def list_flow_entrypoints(
     system_id: int = Depends(get_system_id),
+    category: Optional[str] = Query(
+        default=None,
+        description="Filter by entrypoint category: api | message_queue | "
+        "scheduled_job | cli | function. 'all' (or omitted) returns every kind.",
+    ),
+    entrypoint_type: Optional[str] = Query(
+        default=None,
+        description="Alias of 'category'; also accepts dispatch types "
+        "(http_route/public_function) for convenience.",
+    ),
+    q: Optional[str] = Query(default=None, description="Case-insensitive substring filter."),
 ) -> FlowEntrypointsOut:
-    from ..flow_graph import list_entrypoints
+    from ..flow_graph import category_for_type, list_entrypoints
 
     with get_conn() as conn:
         snapshot_row = _latest_ready_snapshot(conn, system_id)
@@ -1847,25 +1878,31 @@ def list_flow_entrypoints(
             return FlowEntrypointsOut(system_id=system_id)
     _, symbols, _ = _load_flow_inputs(system_id)
     entrypoints = list_entrypoints(symbols)
+    total = len(entrypoints)
+
+    # Normalise the requested category. ``entrypoint_type`` aliases category and
+    # also accepts a dispatch type. Hitting matches are returned in full; the
+    # server never silently truncates a filtered listing.
+    wanted = category or entrypoint_type
+    if wanted and wanted.lower() not in ("all", ""):
+        wanted_category = category_for_type(wanted.lower())
+        entrypoints = [e for e in entrypoints if e.category == wanted_category]
+    if q and q.strip():
+        needle = q.strip().lower()
+        entrypoints = [
+            e for e in entrypoints
+            if needle in e.label.lower()
+            or needle in e.path.lower()
+            or needle in (e.operation or "").lower()
+            or needle in e.qualified_name.lower()
+        ]
+
     return FlowEntrypointsOut(
         system_id=system_id,
         snapshot_id=snapshot_row["id"],
         commit_sha=snapshot_row["commit_sha"],
-        entrypoints=[
-            FlowEntrypointOut(
-                entrypoint_type=e.entrypoint_type,
-                entrypoint_id=e.entrypoint_id,
-                label=e.label,
-                path=e.path,
-                qualified_name=e.qualified_name,
-                line_start=e.line_start,
-                line_end=e.line_end,
-                component_id=e.component_id,
-                route_method=e.route_method,
-                route_path=e.route_path,
-            )
-            for e in entrypoints
-        ],
+        total=total,
+        entrypoints=[_entrypoint_out(e) for e in entrypoints],
     )
 
 
@@ -1884,24 +1921,12 @@ def _preview_out(preview) -> ProbePreviewOut:
 def _flow_graph_out(system_id: int, graph) -> FlowGraphOut:
     from ..flow_graph import build_edge_preview, build_node_preview
 
-    ep = graph.entrypoint
     nodes_by_id = {n.node_id: n for n in graph.nodes}
     return FlowGraphOut(
         system_id=system_id,
         snapshot_id=graph.snapshot_id,
         commit_sha=graph.commit_sha,
-        entrypoint=FlowEntrypointOut(
-            entrypoint_type=ep.entrypoint_type,
-            entrypoint_id=ep.entrypoint_id,
-            label=ep.label,
-            path=ep.path,
-            qualified_name=ep.qualified_name,
-            line_start=ep.line_start,
-            line_end=ep.line_end,
-            component_id=ep.component_id,
-            route_method=ep.route_method,
-            route_path=ep.route_path,
-        ),
+        entrypoint=_entrypoint_out(graph.entrypoint),
         nodes=[
             FlowNodeOut(
                 node_id=n.node_id,

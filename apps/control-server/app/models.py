@@ -697,7 +697,15 @@ class ProbePlansListOut(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-FlowEntrypointType = Literal["http_route", "public_function"]
+# Dispatch types accepted by the flow-graph builder, plus the category aliases
+# (api/function) the API normalises for convenience (Issue #48).
+FlowEntrypointType = Literal[
+    "http_route", "public_function", "message_queue", "scheduled_job", "cli",
+    "api", "function",
+]
+FlowEntrypointCategory = Literal[
+    "api", "message_queue", "scheduled_job", "cli", "function",
+]
 FlowEdgeResolution = Literal["resolved", "inferred", "unresolved"]
 
 
@@ -729,12 +737,20 @@ class FlowEntrypointOut(BaseModel):
     component_id: Optional[str] = None
     route_method: Optional[str] = None
     route_path: Optional[str] = None
+    # Issue #48: backend-entrypoint classification metadata.
+    category: FlowEntrypointCategory = "function"
+    framework: Optional[str] = None
+    operation: Optional[str] = None
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    evidence: List[EvidenceRefOut] = Field(default_factory=list)
 
 
 class FlowEntrypointsOut(BaseModel):
     system_id: int
     snapshot_id: Optional[int] = None
     commit_sha: Optional[str] = None
+    # Total before any category/q filtering, so the UI can show "N of M".
+    total: int = 0
     entrypoints: List[FlowEntrypointOut] = Field(default_factory=list)
 
 

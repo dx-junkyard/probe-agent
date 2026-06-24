@@ -181,6 +181,98 @@ class TestEntrypoints:
         assert first == second
 
 
+class TestBackendEntrypointClassification:
+    """Issue #48: API / MQ / scheduled / CLI / public-function detection."""
+
+    def _sym(self, name, decorators, path="m.py", line=1):
+        from app.flow_graph import SymbolRecord
+
+        return SymbolRecord(
+            symbol_id=line, path=path, qualified_name=name,
+            kind="function", start_line=line, end_line=line + 1,
+            decorators=decorators,
+        )
+
+    def test_classifies_each_backend_kind(self):
+        from app.flow_graph import list_entrypoints
+
+        syms = [
+            self._sym("analyze_task", ["app.task()"], line=1),
+            self._sym("shared_one", ["shared_task"], line=3),
+            self._sym("emailer", ["dramatiq.actor"], line=5),
+            self._sym("refresh_views", ["scheduler.scheduled_job('cron')"], line=7),
+            self._sym("beat_task", ["app.periodic_task()"], line=9),
+            self._sym("import_docs", ["click.command()"], line=11),
+            self._sym("plain_public", [], line=13),
+        ]
+        eps = {e.qualified_name: e for e in list_entrypoints(syms)}
+        assert eps["analyze_task"].category == "message_queue"
+        assert eps["analyze_task"].framework == "celery"
+        assert eps["analyze_task"].entrypoint_type == "message_queue"
+        assert eps["analyze_task"].label == "Celery: analyze_task"
+        assert eps["shared_one"].category == "message_queue"
+        assert eps["emailer"].framework == "dramatiq"
+        assert eps["refresh_views"].category == "scheduled_job"
+        assert eps["refresh_views"].framework == "apscheduler"
+        assert eps["beat_task"].category == "scheduled_job"
+        assert eps["import_docs"].category == "cli"
+        assert eps["import_docs"].label == "CLI: import_docs"
+        assert eps["plain_public"].category == "function"
+
+    def test_uncertain_match_lowers_confidence_with_evidence(self):
+        from app.flow_graph import list_entrypoints
+
+        ep = list_entrypoints([self._sym("worker", ["rq.job"])])[0]
+        assert ep.category == "message_queue"
+        assert ep.confidence < 0.8
+        assert ep.evidence and "RQ" in ep.evidence[0].summary
+
+    def test_naming_guess_alone_is_not_a_confirmed_entrypoint(self):
+        # A function merely named like a consumer, with no known decorator, is
+        # a plain public function — never a confirmed MQ entrypoint.
+        from app.flow_graph import list_entrypoints
+
+        ep = list_entrypoints([self._sym("consume_messages", [])])[0]
+        assert ep.category == "function"
+
+    def test_api_entrypoint_carries_framework_and_operation(self):
+        from app.flow_graph import list_entrypoints
+
+        records = _records_from_source("a.py", SAMPLE_SOURCE)
+        api = [e for e in list_entrypoints(records) if e.category == "api"][0]
+        assert api.entrypoint_type == "http_route"
+        assert api.operation == "POST /documents/analyze"
+        assert api.framework == "fastapi"
+        assert api.confidence == 1.0
+        assert api.evidence
+
+    def test_builds_graph_from_message_queue_entrypoint(self):
+        from app.flow_graph import SymbolRecord, build_flow_graph
+
+        source = textwrap.dedent("""\
+            @app.task
+            def analyze_task(payload):
+                return parse(payload)
+
+            def parse(payload):
+                return payload
+        """)
+        records = [
+            SymbolRecord(1, "w.py", "analyze_task", "function", 1, 3,
+                         decorators=["app.task"]),
+            SymbolRecord(2, "w.py", "parse", "function", 5, 6),
+        ]
+        graph = build_flow_graph(
+            records, [("w.py", source)], 1, "sha",
+            "message_queue", "message_queue:w.py::analyze_task",
+        )
+        assert graph is not None
+        assert graph.entrypoint.category == "message_queue"
+        assert graph.entrypoint.framework == "celery"
+        names = {n.qualified_name for n in graph.nodes}
+        assert {"analyze_task", "parse"} <= names
+
+
 class TestGraphBuilding:
     def _graph(self, **kwargs):
         from app.flow_graph import build_flow_graph
@@ -1014,3 +1106,43 @@ class TestSystemScoping:
             headers=h2,
         )
         assert r.status_code == 400  # no snapshot for system2
+
+
+class TestEntrypointFiltering:
+    """Issue #48: category / substring filters return matches in full."""
+
+    def test_filters_and_full_listing(self, admin_client, git_repo, monkeypatch):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "filter")
+        h = _setup_snapshot(admin_client, token, system["id"], git_repo)
+
+        allr = admin_client.get("/repository/flow-entrypoints", headers=h).json()
+        assert allr["total"] == len(allr["entrypoints"])
+        assert allr["total"] >= 2  # at least the route plus public functions
+
+        # ?entrypoint_type=api aliases the category filter (issue example).
+        api = admin_client.get(
+            "/repository/flow-entrypoints?entrypoint_type=api", headers=h,
+        ).json()
+        assert api["entrypoints"]
+        assert all(e["category"] == "api" for e in api["entrypoints"])
+        # total reflects the unfiltered count; the listing is the full subset.
+        assert api["total"] == allr["total"]
+        assert len(api["entrypoints"]) < allr["total"]
+        ep = api["entrypoints"][0]
+        assert ep["operation"] == "POST /documents/analyze"
+        assert ep["evidence"]
+
+        fns = admin_client.get(
+            "/repository/flow-entrypoints?category=function", headers=h,
+        ).json()
+        assert fns["entrypoints"]
+        assert all(e["category"] == "function" for e in fns["entrypoints"])
+
+        q = admin_client.get(
+            "/repository/flow-entrypoints?q=documents", headers=h,
+        ).json()
+        assert q["entrypoints"]
+        for e in q["entrypoints"]:
+            haystack = (e["label"] + e["path"] + e["qualified_name"]).lower()
+            assert "documents" in haystack
