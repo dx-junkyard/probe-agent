@@ -328,12 +328,26 @@ export interface FlowEntrypointOut {
   evidence: EvidenceRefOut[];
 }
 
+export interface EntrypointCountsOut {
+  api: number;
+  message_queue: number;
+  scheduled_job: number;
+  cli: number;
+  function: number;
+}
+
 export interface FlowEntrypointsOut {
   system_id: number;
   snapshot_id: number | null;
   commit_sha: string | null;
   total: number;
   entrypoints: FlowEntrypointOut[];
+  functions: FlowEntrypointOut[];
+  counts: EntrypointCountsOut;
+  indexed_function_count: number;
+  has_backend_entrypoints: boolean;
+  frameworks: string[];
+  diagnostics: string[];
 }
 
 export interface FlowNodeOut {

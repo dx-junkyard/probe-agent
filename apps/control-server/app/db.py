@@ -377,6 +377,37 @@ CREATE TABLE IF NOT EXISTS symbol_index_warnings (
 CREATE INDEX IF NOT EXISTS idx_symbol_warnings_snapshot
     ON symbol_index_warnings (snapshot_id);
 
+CREATE TABLE IF NOT EXISTS code_entrypoints (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id               INTEGER NOT NULL,
+    snapshot_id             INTEGER NOT NULL,
+    entrypoint_type         TEXT NOT NULL,
+    entrypoint_id           TEXT NOT NULL,
+    category                TEXT NOT NULL,
+    label                   TEXT NOT NULL,
+    operation               TEXT,
+    framework               TEXT,
+    handler_symbol_id       INTEGER,
+    handler_path            TEXT NOT NULL,
+    handler_qualified_name  TEXT NOT NULL,
+    line_start              INTEGER NOT NULL,
+    line_end                INTEGER NOT NULL,
+    route_method            TEXT,
+    route_path              TEXT,
+    confidence              REAL NOT NULL DEFAULT 1.0,
+    evidence_json           TEXT NOT NULL DEFAULT '[]',
+    created_at              REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (handler_symbol_id) REFERENCES code_symbols (id) ON DELETE SET NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_code_entrypoints_unique
+    ON code_entrypoints (snapshot_id, entrypoint_type, entrypoint_id);
+
+CREATE INDEX IF NOT EXISTS idx_code_entrypoints_system
+    ON code_entrypoints (system_id, snapshot_id);
+
 CREATE TABLE IF NOT EXISTS feature_code_links (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     system_id       INTEGER NOT NULL,

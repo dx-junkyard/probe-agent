@@ -429,6 +429,17 @@ describe("Flow Explorer page", () => {
     mockSystemId = 1;
   });
 
+  function entrypointsResponse(overrides: Record<string, unknown> = {}) {
+    return {
+      system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
+      total: 0, entrypoints: [], functions: [],
+      counts: { api: 0, message_queue: 0, scheduled_job: 0, cli: 0, function: 0 },
+      indexed_function_count: 0, has_backend_entrypoints: true, frameworks: [],
+      diagnostics: [],
+      ...overrides,
+    };
+  }
+
   const flowGraph = {
     system_id: 1,
     snapshot_id: 5,
@@ -497,10 +508,9 @@ describe("Flow Explorer page", () => {
   test("builds graph and creates a manual plan from selected nodes", async () => {
     mockApi.get.mockImplementation((path: string) => {
       if (path === "/repository/flow-entrypoints") {
-        return Promise.resolve({
-          system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
+        return Promise.resolve(entrypointsResponse({
           total: 1, entrypoints: [flowGraph.entrypoint],
-        });
+        }));
       }
       return Promise.resolve(null);
     });
@@ -590,10 +600,9 @@ describe("Flow Explorer page", () => {
     };
     mockApi.get.mockImplementation((path: string) => {
       if (path === "/repository/flow-entrypoints") {
-        return Promise.resolve({
-          system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
+        return Promise.resolve(entrypointsResponse({
           total: 1, entrypoints: [flowGraph.entrypoint],
-        });
+        }));
       }
       return Promise.resolve(null);
     });
@@ -649,10 +658,9 @@ describe("Flow Explorer page", () => {
   test("detects a stale-graph 409 and prompts a reload", async () => {
     mockApi.get.mockImplementation((path: string) => {
       if (path === "/repository/flow-entrypoints") {
-        return Promise.resolve({
-          system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
+        return Promise.resolve(entrypointsResponse({
           total: 1, entrypoints: [flowGraph.entrypoint],
-        });
+        }));
       }
       return Promise.resolve(null);
     });
@@ -692,16 +700,14 @@ describe("Flow Explorer page", () => {
     mockApi.get.mockImplementation((path: string) => {
       calls.push(path);
       if (path === "/repository/flow-entrypoints") {
-        return Promise.resolve({
-          system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
+        return Promise.resolve(entrypointsResponse({
           total: 2, entrypoints: [flowGraph.entrypoint, mqEntrypoint],
-        });
+        }));
       }
       if (path === "/repository/flow-entrypoints?category=message_queue") {
-        return Promise.resolve({
-          system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
+        return Promise.resolve(entrypointsResponse({
           total: 2, entrypoints: [mqEntrypoint],
-        });
+        }));
       }
       return Promise.resolve(null);
     });

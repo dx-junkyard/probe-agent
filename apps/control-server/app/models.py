@@ -745,13 +745,33 @@ class FlowEntrypointOut(BaseModel):
     evidence: List[EvidenceRefOut] = Field(default_factory=list)
 
 
+class EntrypointCountsOut(BaseModel):
+    api: int = 0
+    message_queue: int = 0
+    scheduled_job: int = 0
+    cli: int = 0
+    function: int = 0
+
+
 class FlowEntrypointsOut(BaseModel):
     system_id: int
     snapshot_id: Optional[int] = None
     commit_sha: Optional[str] = None
-    # Total before any category/q filtering, so the UI can show "N of M".
+    # Issue #51: Flow Explorer is backend-entrypoint-first. ``entrypoints``
+    # carries only backend entrypoints (api/message_queue/scheduled_job/cli);
+    # the public-function fallback is returned separately in ``functions`` and
+    # is only populated when explicitly requested (Advanced). ``total`` is the
+    # backend entrypoint count before any category/q filtering ("N of M").
     total: int = 0
     entrypoints: List[FlowEntrypointOut] = Field(default_factory=list)
+    functions: List[FlowEntrypointOut] = Field(default_factory=list)
+    counts: EntrypointCountsOut = Field(default_factory=EntrypointCountsOut)
+    indexed_function_count: int = 0
+    has_backend_entrypoints: bool = False
+    frameworks: List[str] = Field(default_factory=list)
+    # Deterministic reasons surfaced when backend discovery is thin, so the UI
+    # never silently dumps a giant raw-function list as the intended UX.
+    diagnostics: List[str] = Field(default_factory=list)
 
 
 class FlowNodeOut(BaseModel):

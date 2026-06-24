@@ -246,6 +246,53 @@ Flow Explorer の入口を HTTP route と public function だけでなく、back
   `CLI: import-documents` 等）を主表示し、フィルター結果はスクロール可能な一覧で
   全件確認できる。
 
+### backend-entrypoint-first への再設計（#51）
+
+#48 の種類別フィルターは「全 public function の一覧 + 種類フィルター」のままで、
+backend entrypoint が薄い repository では function の素のリストが事実上の主表示に
+なってしまっていた。#51 で Flow Explorer を backend entrypoint 起点に再設計する。
+
+- **`app/entrypoint_discovery.py`（新規）**: FastAPI/Starlette の
+  `APIRouter(prefix=...)` + `app.include_router(router, prefix=...)`、Flask の
+  `Blueprint(url_prefix=...)` + `app.register_blueprint(bp)` を AST 上で解決し、
+  同一ファイル内・モジュール間の import を解決して router の mount prefix を合成
+  する（`discover_api_routes`）。route 自体の decorator のみでは捉えられない
+  「実際に公開される URL」を決定的に組み立てる。decorator は読めるが router
+  variable を解析できなかった route は、handler シンボル単位で重複排除した上で
+  decorator-only の `entrypoint_id` のまま fallback として残す。
+  Message Queue / Scheduled Job / CLI の検出は #48 の
+  `enumerate_symbol_entrypoints` をそのまま再利用する。
+- **`EntrypointDiscovery`**: `entrypoints`（api/message_queue/scheduled_job/cli =
+  backend entrypoint）と `functions`（public function、Advanced fallback 専用）を
+  分離して保持する。`backend_total`、`counts`（種類別件数）、
+  `indexed_function_count`、検出framework一覧、`diagnostics`
+  （backend entrypoint が0件のとき "No backend entrypoints detected..."、
+  Python indexer のみであること、OpenAPI spec が見つからないこと等を決定的な
+  固定メッセージで通知）を返す。
+- **`code_entrypoints`（新規 system-scoped テーブル）**: 検出結果を snapshot 単位
+  で永続化する。`GET /repository/flow-entrypoints` が呼ばれた際、その
+  `snapshot_id` に対する `intelligence_runs(run_type='entrypoint_index')` が
+  存在しなければ deterministic 判定として 1 度だけ INSERT する（`decision_method=
+  'deterministic'`、`is_mock=0`）。2 回目以降の GET は再計算結果を返すのみで
+  重複 INSERT しない。`code_entrypoints` は `system_id` でスコープし、他 system の
+  行を返さない（isolation test あり）。discovery 自体は読み取り専用で対象
+  repository には書き込まない。
+- **API 契約変更**: `FlowEntrypointsOut.entrypoints` は backend entrypoint のみを
+  返すようになった（function は含まれない）。function は `functions` フィールドに
+  分離し、`include_functions=true` または `category=function` を明示しない限り
+  空配列のままにする（Advanced 専用、デフォルト非表示）。`counts` /
+  `indexed_function_count` / `has_backend_entrypoints` / `frameworks` /
+  `diagnostics` を追加。`total` は backend entrypoint の総数（function を含まない）。
+- **`POST /repository/flow-graphs` / `POST /repository/probe-plans/from-flow`**:
+  graph builder には `discover_entrypoints` が返す composed entrypoint 一覧
+  （backend + function）を渡し、合成済みの URL（例: `POST:/api/documents/analyze`）
+  で entrypoint を解決できるようにした。
+- **Dashboard**: 左ペインの種類フィルターから Function を外し、既定では backend
+  entrypoint のみを表示する。function は "Show Advanced" トグルでのみ表示され、
+  「raw function の利用は discovery が不完全であることのシグナル」と明示する。
+  backend entrypoint が 0 件のときは diagnostics をそのまま表示し、function の
+  一覧を黒幕的な代替表示として出さない。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。

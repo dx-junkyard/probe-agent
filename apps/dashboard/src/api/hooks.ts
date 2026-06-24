@@ -303,15 +303,19 @@ export function useUpdateProbePointStatus() {
   });
 }
 
-export function useFlowEntrypoints(params?: { category?: string; q?: string }) {
+export function useFlowEntrypoints(
+  params?: { category?: string; q?: string; includeFunctions?: boolean },
+) {
   const category = params?.category && params.category !== "all" ? params.category : "";
   const q = params?.q?.trim() ?? "";
+  const includeFunctions = !!params?.includeFunctions;
   return useQuery({
-    queryKey: sysKey("flowEntrypoints", category, q),
+    queryKey: sysKey("flowEntrypoints", category, q, includeFunctions),
     queryFn: () => {
       const search = new URLSearchParams();
       if (category) search.set("category", category);
       if (q) search.set("q", q);
+      if (includeFunctions) search.set("include_functions", "true");
       const qs = search.toString();
       return api.get<FlowEntrypointsOut>(
         `/repository/flow-entrypoints${qs ? `?${qs}` : ""}`,

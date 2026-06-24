@@ -34,6 +34,7 @@ from ..models import (
     CandidateFlowOut,
     CodeSymbolOut,
     DraftGenerationResult,
+    EntrypointCountsOut,
     EvidenceRefOut,
     FlowEdgeOut,
     FlowEntrypointOut,
@@ -1855,13 +1856,93 @@ def _entrypoint_out(e) -> FlowEntrypointOut:
     )
 
 
+def _ensure_entrypoints_indexed(system_id: int, snapshot_row, symbols, files):
+    """Run deterministic entrypoint discovery and persist it once per snapshot.
+
+    Discovery itself is deterministic and recomputed on each call (it is cheap);
+    the persisted ``code_entrypoints`` rows and the ``entrypoint_index``
+    intelligence run are the audit artefacts required by the issue. Persistence
+    is idempotent: it happens only the first time for a given snapshot.
+    """
+    from ..entrypoint_discovery import DISCOVERY_VERSION, discover_entrypoints
+
+    discovery = discover_entrypoints(symbols, files)
+    snapshot_id = snapshot_row["id"]
+    now = time.time()
+    with get_conn() as conn:
+        run_exists = conn.execute(
+            """SELECT 1 FROM intelligence_runs
+               WHERE system_id = ? AND snapshot_id = ?
+                 AND run_type = 'entrypoint_index' LIMIT 1""",
+            (system_id, snapshot_id),
+        ).fetchone()
+        if run_exists:
+            return discovery
+        conn.execute("BEGIN")
+        try:
+            conn.execute(
+                """INSERT INTO intelligence_runs
+                       (system_id, snapshot_id, run_type, provider, model,
+                        prompt_version, schema_version, decision_method,
+                        status, is_mock, started_at, completed_at)
+                   VALUES (?, ?, 'entrypoint_index', 'deterministic', 'ast',
+                           ?, ?, 'deterministic', 'completed', 0, ?, ?)""",
+                (system_id, snapshot_id, DISCOVERY_VERSION, DISCOVERY_VERSION,
+                 now, now),
+            )
+            sym_rows = conn.execute(
+                "SELECT id, path, qualified_name FROM code_symbols "
+                "WHERE snapshot_id = ? AND system_id = ?",
+                (snapshot_id, system_id),
+            ).fetchall()
+            sym_id = {(r["path"], r["qualified_name"]): r["id"] for r in sym_rows}
+            for e in discovery.entrypoints:
+                evidence_json = json.dumps([
+                    {"path": ev.path, "start_line": ev.start_line,
+                     "end_line": ev.end_line, "summary": ev.summary}
+                    for ev in e.evidence
+                ])
+                conn.execute(
+                    """INSERT OR IGNORE INTO code_entrypoints
+                           (system_id, snapshot_id, entrypoint_type, entrypoint_id,
+                            category, label, operation, framework, handler_symbol_id,
+                            handler_path, handler_qualified_name, line_start, line_end,
+                            route_method, route_path, confidence, evidence_json,
+                            created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        system_id, snapshot_id, e.entrypoint_type, e.entrypoint_id,
+                        e.category, e.label, e.operation, e.framework,
+                        sym_id.get((e.path, e.qualified_name)),
+                        e.path, e.qualified_name, e.line_start, e.line_end,
+                        e.route_method, e.route_path, e.confidence, evidence_json,
+                        now,
+                    ),
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return discovery
+
+
+def _ep_matches(e, needle: str) -> bool:
+    return (
+        needle in e.label.lower()
+        or needle in e.path.lower()
+        or needle in (e.operation or "").lower()
+        or needle in e.qualified_name.lower()
+    )
+
+
 @router.get("/repository/flow-entrypoints", response_model=FlowEntrypointsOut)
 def list_flow_entrypoints(
     system_id: int = Depends(get_system_id),
     category: Optional[str] = Query(
         default=None,
-        description="Filter by entrypoint category: api | message_queue | "
-        "scheduled_job | cli | function. 'all' (or omitted) returns every kind.",
+        description="Filter backend entrypoints by category: api | message_queue "
+        "| scheduled_job | cli. 'function' returns the Advanced fallback; "
+        "'all' (or omitted) returns every backend kind.",
     ),
     entrypoint_type: Optional[str] = Query(
         default=None,
@@ -1869,40 +1950,62 @@ def list_flow_entrypoints(
         "(http_route/public_function) for convenience.",
     ),
     q: Optional[str] = Query(default=None, description="Case-insensitive substring filter."),
+    include_functions: bool = Query(
+        default=False,
+        description="Include the public-function Advanced fallback in 'functions'.",
+    ),
 ) -> FlowEntrypointsOut:
-    from ..flow_graph import category_for_type, list_entrypoints
+    """List backend entrypoints (Issue #51, backend-entrypoint-first).
+
+    ``entrypoints`` carries only backend entrypoints (api/message_queue/
+    scheduled_job/cli) resolved to handler symbols. The public-function fallback
+    is demoted to ``functions`` and returned only when explicitly requested
+    (``include_functions`` or ``category=function``). ``counts`` and
+    ``diagnostics`` let the UI explain thin discovery instead of dumping the raw
+    function index.
+    """
+    from ..flow_graph import category_for_type
 
     with get_conn() as conn:
         snapshot_row = _latest_ready_snapshot(conn, system_id)
         if snapshot_row is None:
             return FlowEntrypointsOut(system_id=system_id)
-    _, symbols, _ = _load_flow_inputs(system_id)
-    entrypoints = list_entrypoints(symbols)
-    total = len(entrypoints)
+    snapshot_row, symbols, files = _load_flow_inputs(system_id)
+    discovery = _ensure_entrypoints_indexed(system_id, snapshot_row, symbols, files)
 
-    # Normalise the requested category. ``entrypoint_type`` aliases category and
-    # also accepts a dispatch type. Hitting matches are returned in full; the
-    # server never silently truncates a filtered listing.
+    backend = list(discovery.entrypoints)
+    functions = list(discovery.functions)
+
     wanted = category or entrypoint_type
+    wanted_category = None
     if wanted and wanted.lower() not in ("all", ""):
         wanted_category = category_for_type(wanted.lower())
-        entrypoints = [e for e in entrypoints if e.category == wanted_category]
+
+    if wanted_category == "function":
+        backend = []
+    elif wanted_category is not None:
+        backend = [e for e in backend if e.category == wanted_category]
+
+    want_functions = include_functions or wanted_category == "function"
+    funcs_out = functions if want_functions else []
+
     if q and q.strip():
         needle = q.strip().lower()
-        entrypoints = [
-            e for e in entrypoints
-            if needle in e.label.lower()
-            or needle in e.path.lower()
-            or needle in (e.operation or "").lower()
-            or needle in e.qualified_name.lower()
-        ]
+        backend = [e for e in backend if _ep_matches(e, needle)]
+        funcs_out = [e for e in funcs_out if _ep_matches(e, needle)]
 
     return FlowEntrypointsOut(
         system_id=system_id,
         snapshot_id=snapshot_row["id"],
         commit_sha=snapshot_row["commit_sha"],
-        total=total,
-        entrypoints=[_entrypoint_out(e) for e in entrypoints],
+        total=discovery.backend_total,
+        entrypoints=[_entrypoint_out(e) for e in backend],
+        functions=[_entrypoint_out(e) for e in funcs_out],
+        counts=EntrypointCountsOut(**discovery.counts),
+        indexed_function_count=discovery.indexed_function_count,
+        has_backend_entrypoints=discovery.backend_total > 0,
+        frameworks=discovery.frameworks,
+        diagnostics=discovery.diagnostics,
     )
 
 
@@ -2051,11 +2154,13 @@ def build_flow_graph_endpoint(
     payload: FlowGraphRequest,
     system_id: int = Depends(get_system_id),
 ) -> FlowGraphOut:
+    from ..entrypoint_discovery import discover_entrypoints
     from ..flow_graph import build_flow_graph
 
     snapshot_row, symbols, files = _load_flow_inputs(
         system_id, payload.snapshot_id, payload.commit_sha,
     )
+    discovery = discover_entrypoints(symbols, files)
     graph = build_flow_graph(
         symbols=symbols,
         files=files,
@@ -2065,6 +2170,7 @@ def build_flow_graph_endpoint(
         entrypoint_id=payload.entrypoint_id,
         max_depth=payload.max_depth,
         max_nodes=payload.max_nodes,
+        entrypoints=discovery.entrypoints + discovery.functions,
     )
     if graph is None:
         raise HTTPException(
@@ -2095,6 +2201,7 @@ def create_probe_plan_from_flow(
     This is an explicit, user-driven selection (decision_method=manual). It
     only records a draft; it does not generate, apply, or run any patch.
     """
+    from ..entrypoint_discovery import discover_entrypoints
     from ..flow_graph import (
         build_edge_preview,
         build_flow_graph,
@@ -2104,6 +2211,7 @@ def create_probe_plan_from_flow(
     snapshot_row, symbols, files = _load_flow_inputs(
         system_id, payload.snapshot_id, payload.commit_sha,
     )
+    discovery = discover_entrypoints(symbols, files)
     graph = build_flow_graph(
         symbols=symbols,
         files=files,
@@ -2113,6 +2221,7 @@ def create_probe_plan_from_flow(
         entrypoint_id=payload.entrypoint_id,
         max_depth=payload.max_depth,
         max_nodes=payload.max_nodes,
+        entrypoints=discovery.entrypoints + discovery.functions,
     )
     if graph is None:
         raise HTTPException(

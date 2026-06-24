@@ -1109,16 +1109,28 @@ class TestSystemScoping:
 
 
 class TestEntrypointFiltering:
-    """Issue #48: category / substring filters return matches in full."""
+    """Issue #51: backend-entrypoint-first listing; functions are a fallback.
 
-    def test_filters_and_full_listing(self, admin_client, git_repo, monkeypatch):
+    ``entrypoints`` carries only backend entrypoints (api/mq/job/cli); the
+    public-function fallback is returned in ``functions`` only on request.
+    """
+
+    def test_backend_first_listing(self, admin_client, git_repo, monkeypatch):
         token = _login(admin_client)
         system = _create_system(admin_client, token, "filter")
         h = _setup_snapshot(admin_client, token, system["id"], git_repo)
 
         allr = admin_client.get("/repository/flow-entrypoints", headers=h).json()
+        # Default response is backend-only and excludes the function fallback.
         assert allr["total"] == len(allr["entrypoints"])
-        assert allr["total"] >= 2  # at least the route plus public functions
+        assert allr["entrypoints"]
+        assert all(e["category"] != "function" for e in allr["entrypoints"])
+        assert allr["functions"] == []
+        assert allr["has_backend_entrypoints"] is True
+        # Counts cover every category; functions are indexed but demoted.
+        assert allr["counts"]["api"] >= 1
+        assert allr["counts"]["function"] >= 1
+        assert allr["indexed_function_count"] >= 1
 
         # ?entrypoint_type=api aliases the category filter (issue example).
         api = admin_client.get(
@@ -1126,18 +1138,26 @@ class TestEntrypointFiltering:
         ).json()
         assert api["entrypoints"]
         assert all(e["category"] == "api" for e in api["entrypoints"])
-        # total reflects the unfiltered count; the listing is the full subset.
         assert api["total"] == allr["total"]
-        assert len(api["entrypoints"]) < allr["total"]
         ep = api["entrypoints"][0]
         assert ep["operation"] == "POST /documents/analyze"
         assert ep["evidence"]
 
+        # Functions are the Advanced fallback: empty by default, populated only
+        # when explicitly requested.
+        assert allr["functions"] == []
         fns = admin_client.get(
             "/repository/flow-entrypoints?category=function", headers=h,
         ).json()
-        assert fns["entrypoints"]
-        assert all(e["category"] == "function" for e in fns["entrypoints"])
+        assert fns["entrypoints"] == []
+        assert fns["functions"]
+        assert all(e["category"] == "function" for e in fns["functions"])
+
+        inc = admin_client.get(
+            "/repository/flow-entrypoints?include_functions=true", headers=h,
+        ).json()
+        assert inc["entrypoints"]  # backend still present
+        assert inc["functions"]    # plus the fallback
 
         q = admin_client.get(
             "/repository/flow-entrypoints?q=documents", headers=h,
@@ -1146,3 +1166,40 @@ class TestEntrypointFiltering:
         for e in q["entrypoints"]:
             haystack = (e["label"] + e["path"] + e["qualified_name"]).lower()
             assert "documents" in haystack
+
+    def test_no_backend_entrypoints_shows_diagnostics(
+        self, admin_client, tmp_path, monkeypatch,
+    ):
+        """A repo with only plain functions must not silently dump them."""
+        import subprocess
+
+        repo = tmp_path / "plain-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t.com"],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "T"],
+                       check=True, capture_output=True)
+        (repo / "lib.py").write_text(textwrap.dedent("""\
+            def normalize(t):
+                return t.strip()
+
+
+            def classify(t):
+                return len(t)
+        """))
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"],
+                       check=True, capture_output=True)
+
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "plain")
+        h = _setup_snapshot(admin_client, token, system["id"], repo)
+
+        data = admin_client.get("/repository/flow-entrypoints", headers=h).json()
+        assert data["entrypoints"] == []
+        assert data["has_backend_entrypoints"] is False
+        assert data["counts"]["function"] >= 2
+        assert any(
+            "No backend entrypoints detected" in d for d in data["diagnostics"]
+        )

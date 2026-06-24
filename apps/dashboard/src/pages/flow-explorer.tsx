@@ -35,14 +35,15 @@ const BOUNDARY_LABEL: Record<string, string> = {
   http: "HTTP", database: "DB", filesystem: "FS", dispatch: "async",
 };
 
-// Issue #48: backend-entrypoint category filters and short badge labels.
+// Issue #51: Flow Explorer is backend-entrypoint-first. The public-function
+// fallback is intentionally excluded from these quick filters; it only
+// appears via the explicit "Advanced" toggle below.
 const ENTRYPOINT_CATEGORIES: { key: string; label: string }[] = [
   { key: "all", label: "All" },
   { key: "api", label: "API" },
   { key: "message_queue", label: "Message Queue" },
   { key: "scheduled_job", label: "Scheduled Job" },
   { key: "cli", label: "CLI" },
-  { key: "function", label: "Function" },
 ];
 
 const CATEGORY_BADGE: Record<string, string> = {
@@ -87,7 +88,10 @@ function PreviewBlock({ preview }: { preview: ProbePreviewOut }) {
 export default function FlowExplorerPage() {
   const [category, setCategory] = useState("all");
   const [filter, setFilter] = useState("");
-  const { data: entrypointsData, isLoading } = useFlowEntrypoints({ category, q: filter });
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const { data: entrypointsData, isLoading } = useFlowEntrypoints({
+    category, q: filter, includeFunctions: showAdvanced,
+  });
   const buildGraph = useBuildFlowGraph();
   const createPlan = useCreatePlanFromFlow();
 
@@ -99,9 +103,13 @@ export default function FlowExplorerPage() {
   const [stale, setStale] = useState(false);
 
   // The server applies category/substring filters and returns matches in full
-  // (no silent truncation); ``total`` is the unfiltered entrypoint count.
+  // (no silent truncation); ``total`` is the unfiltered backend entrypoint
+  // count. ``functions`` is the Advanced-only fallback list (Issue #51).
   const entrypoints = entrypointsData?.entrypoints ?? [];
   const total = entrypointsData?.total ?? 0;
+  const functions = entrypointsData?.functions ?? [];
+  const diagnostics = entrypointsData?.diagnostics ?? [];
+  const hasBackend = entrypointsData?.has_backend_entrypoints ?? true;
 
   const openEntrypoint = async (ep: FlowEntrypointOut) => {
     setActiveEntrypoint(ep);
@@ -237,6 +245,9 @@ export default function FlowExplorerPage() {
                 {isLoading
                   ? "Loading…"
                   : `${entrypoints.length} of ${total} entrypoint(s)`}
+                {!isLoading && (entrypointsData?.frameworks?.length ?? 0) > 0 && (
+                  <span> · {entrypointsData!.frameworks.join(", ")}</span>
+                )}
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-2">
@@ -261,14 +272,21 @@ export default function FlowExplorerPage() {
                 placeholder="Filter by label, path or operation…"
                 className="h-8 text-xs"
               />
+              {!isLoading && !hasBackend && diagnostics.length > 0 && (
+                <div className="rounded-md border border-amber-200 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 px-2 py-1.5 text-[11px] text-amber-800 dark:text-amber-200 space-y-0.5">
+                  {diagnostics.map((d, i) => <p key={i}>{d}</p>)}
+                </div>
+              )}
               {isLoading ? (
                 <Skeleton className="h-24 w-full" />
               ) : !entrypoints.length ? (
                 <p className="text-xs text-muted-foreground">
                   {total === 0 ? (
                     <>
-                      No entrypoints. Create a snapshot and index symbols on the{" "}
-                      <Link to="/repository" className="underline">Repository</Link> page.
+                      No backend entrypoints detected. Create a snapshot and index
+                      symbols on the{" "}
+                      <Link to="/repository" className="underline">Repository</Link> page,
+                      or check the Advanced fallback below.
                     </>
                   ) : (
                     "No entrypoints match this filter."
@@ -308,6 +326,43 @@ export default function FlowExplorerPage() {
                       </button>
                     );
                   })}
+                </div>
+              )}
+              <button
+                onClick={() => setShowAdvanced(v => !v)}
+                className="text-[11px] text-muted-foreground underline"
+              >
+                {showAdvanced ? "Hide" : "Show"} Advanced (raw functions,
+                {" "}{entrypointsData?.indexed_function_count ?? 0} indexed)
+              </button>
+              {showAdvanced && (
+                <div className="space-y-1">
+                  <p className="text-[11px] text-muted-foreground">
+                    Raw functions are not resolved backend entrypoints. Using
+                    one here usually means discovery is incomplete for this
+                    repository.
+                  </p>
+                  <div className="space-y-1 max-h-[16rem] overflow-y-auto">
+                    {functions.map(ep => (
+                      <button
+                        key={`${ep.entrypoint_type}:${ep.entrypoint_id}`}
+                        onClick={() => openEntrypoint(ep)}
+                        className={`w-full text-left rounded-md px-2 py-1.5 text-xs transition-colors ${
+                          activeEntrypoint?.entrypoint_id === ep.entrypoint_id
+                            ? "bg-secondary"
+                            : "hover:bg-secondary/50"
+                        }`}
+                      >
+                        <div className="flex items-center gap-1">
+                          <Badge variant="outline" className="text-[10px] px-1 py-0 shrink-0">
+                            {CATEGORY_BADGE.function}
+                          </Badge>
+                          <span className="font-medium truncate">{ep.qualified_name}</span>
+                        </div>
+                        <div className="text-muted-foreground truncate">{ep.path}</div>
+                      </button>
+                    ))}
+                  </div>
                 </div>
               )}
             </CardContent>
