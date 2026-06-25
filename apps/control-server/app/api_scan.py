@@ -26,7 +26,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from .flow_graph import EvidenceRef, FlowEntrypoint
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient
@@ -195,8 +195,47 @@ def _looks_redos(pattern: str) -> bool:
     return any(sig.search(pattern) for sig in _REDOS_SIGNATURES)
 
 
+def _strip_json_fence(raw: str) -> str:
+    cleaned = raw.strip()
+    if not cleaned.startswith("```"):
+        return cleaned
+
+    lines = cleaned.splitlines()
+    if not lines:
+        return cleaned
+    if lines[0].strip().startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _load_first_json_object(raw_json: str) -> Any:
+    """Load the first JSON object from an LLM response.
+
+    The prompt requires JSON-only output, but real models can still wrap the
+    object in a markdown code fence or append a short explanation after the
+    object. Accepting the first valid object keeps API scan operational while
+    the schema validation below remains strict.
+    """
+    cleaned = _strip_json_fence(raw_json)
+    decoder = json.JSONDecoder()
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as first_exc:
+        start = cleaned.find("{")
+        if start < 0:
+            raise first_exc
+        try:
+            data, _ = decoder.raw_decode(cleaned[start:])
+        except json.JSONDecodeError:
+            raise first_exc
+        return data
+
+
 def parse_scan_response(raw_json: str) -> List[ApiScanPattern]:
-    data = json.loads(raw_json)
+    data = _load_first_json_object(raw_json)
     if not isinstance(data, dict):
         raise ApiScanValidationError("LLM response must be an object")
     patterns_data = data.get("patterns", [])

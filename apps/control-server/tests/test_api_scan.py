@@ -37,6 +37,24 @@ class TestParseScanResponse:
         assert pats[0].framework == "django"
         assert pats[0].path_group == "path"
 
+    def test_accepts_fenced_json_response(self):
+        from app.api_scan import parse_scan_response
+
+        raw = "```json\n" + json.dumps({"patterns": []}) + "\n```"
+        assert parse_scan_response(raw) == []
+
+    def test_accepts_trailing_text_after_json_object(self):
+        from app.api_scan import parse_scan_response
+
+        raw = json.dumps({"patterns": []}) + "\nNo API declarations were visible."
+        assert parse_scan_response(raw) == []
+
+    def test_accepts_preface_before_json_object(self):
+        from app.api_scan import parse_scan_response
+
+        raw = "Here is the JSON:\n" + json.dumps({"patterns": []})
+        assert parse_scan_response(raw) == []
+
     def test_invalid_regex_rejected(self):
         from app.api_scan import ApiScanValidationError, parse_scan_response
 
@@ -365,6 +383,35 @@ class TestApiScanEndpoint:
         data = r.json()
         assert data["status"] == "failed"
         assert "reasoning model" in (data["error"] or "")
+
+    def test_stale_snapshot_after_repository_config_change_is_rejected(
+        self, admin_client, tmp_path, monkeypatch,
+    ):
+        repo = _git_repo(tmp_path / "repo")
+        _enable_reasoning_scan(monkeypatch)
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "s")
+        h = _setup_snapshot(admin_client, token, system["id"], repo)
+
+        # Updating include/exclude patterns does not mutate the already-created
+        # snapshot. API scan must not silently inspect the stale file set.
+        r = admin_client.put(
+            "/repository",
+            json={
+                "repo_path": str(repo),
+                "include_patterns": ["*.py", "backend/**"],
+                "exclude_patterns": [],
+            },
+            headers=h,
+        )
+        assert r.status_code == 200, r.text
+
+        r = admin_client.post("/repository/api-scan", headers=h)
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["status"] == "failed"
+        assert "updated after the latest snapshot" in (data["error"] or "")
+        assert data["extracted_count"] == 0
 
     def test_malformed_response_fails_without_persisting(self, admin_client, tmp_path, monkeypatch):
         class _Bad:

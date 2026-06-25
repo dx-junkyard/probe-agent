@@ -4,6 +4,7 @@ import type {
   SystemOut, ComponentSummary, TraceEvent, Policy,
   ShadowResult, ComponentProfile, UserOut, TokenOut,
   RepositoryCandidateOut, RepositoryConfigOut, SnapshotOut, LatestDraftsOut,
+  DraftGenerationResultOut,
   SymbolIndexOut, FeatureCodeLinksOut, ProbePlansListOut, ApiScanResultOut,
   FlowEntrypointsOut, FlowGraphOut, FlowProbeSelection, ProbePlanOut,
   ProbePatchOut, GenerationRun, ExperimentOut, MeResponse,
@@ -228,7 +229,7 @@ export function useLatestDrafts() {
 export function useGenerateDrafts() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: () => api.post("/repository/drafts/generate"),
+    mutationFn: () => api.post<DraftGenerationResultOut>("/repository/drafts/generate"),
     onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("drafts") }),
   });
 }

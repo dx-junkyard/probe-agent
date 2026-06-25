@@ -579,6 +579,15 @@ def generate_drafts_endpoint(
             provider=intelligence_provider or llm_config.provider,
             model=intelligence_model or llm_config.model,
         )
+    try:
+        intelligence_timeout = float(os.getenv("INTELLIGENCE_LLM_TIMEOUT", "120"))
+    except ValueError:
+        intelligence_timeout = 120.0
+    if llm_config.provider != "mock":
+        llm_config = replace(
+            llm_config,
+            timeout=max(llm_config.timeout, intelligence_timeout),
+        )
 
     started_at = time.time()
     try:
@@ -757,7 +766,7 @@ def get_latest_drafts(
         run_row = conn.execute(
             """
             SELECT * FROM intelligence_runs
-            WHERE system_id = ?
+            WHERE system_id = ? AND run_type = 'repository_drafts'
             ORDER BY id DESC LIMIT 1
             """,
             (system_id,),
@@ -2115,6 +2124,34 @@ def _resolve_intelligence_config():
     return llm_config
 
 
+def _snapshot_config_stale_reason(system_id: int, snapshot_row) -> Optional[str]:
+    """Return a clear reason when the latest snapshot predates repo settings.
+
+    Repository include/exclude patterns are applied only when a snapshot is
+    created. If the user adds e.g. ``backend/**`` after the latest snapshot, API
+    discovery will still inspect the old file set and silently miss routes.
+    """
+    with get_conn() as conn:
+        config_row = conn.execute(
+            "SELECT * FROM repository_configs WHERE system_id = ?", (system_id,)
+        ).fetchone()
+    if config_row is None:
+        return None
+
+    snapshot_time = snapshot_row["completed_at"] or snapshot_row["created_at"] or 0
+    if (config_row["updated_at"] or 0) <= snapshot_time:
+        return None
+
+    include_patterns = json.loads(config_row["include_patterns"] or "[]")
+    exclude_patterns = json.loads(config_row["exclude_patterns"] or "[]")
+    return (
+        "Repository settings were updated after the latest snapshot was created. "
+        "Create a new repository snapshot and re-run symbol indexing/API scan. "
+        f"Current include_patterns={include_patterns}, "
+        f"exclude_patterns={exclude_patterns}."
+    )
+
+
 def _api_scan_pattern_out(row) -> ApiScanPatternOut:
     examples = [
         EvidenceRefOut(path=ex.get("path", ""), start_line=int(ex.get("line", 0)),
@@ -2164,6 +2201,26 @@ def run_api_scan(
     )
     snapshot_id = snapshot_row["id"]
     llm_config = _resolve_intelligence_config()
+
+    if payload.snapshot_id is None and payload.commit_sha is None:
+        stale_reason = _snapshot_config_stale_reason(system_id, snapshot_row)
+        if stale_reason:
+            return ApiScanResultOut(
+                system_id=system_id,
+                snapshot_id=snapshot_id,
+                commit_sha=snapshot_row["commit_sha"],
+                status="failed",
+                provider=llm_config.provider,
+                model=llm_config.model,
+                is_mock=llm_config.provider == "mock",
+                error=stale_reason,
+                diagnostics=[
+                    "The API scanner only reads files stored in the selected "
+                    "repository snapshot.",
+                    "Repository include/exclude changes do not modify existing "
+                    "snapshots.",
+                ],
+            )
 
     started_at = time.time()
     try:

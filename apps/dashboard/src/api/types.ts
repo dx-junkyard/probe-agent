@@ -188,6 +188,12 @@ export interface LatestDraftsOut {
   feature_drafts: FeatureDraftOut[];
 }
 
+export interface DraftGenerationResultOut {
+  intelligence_run: IntelligenceRunOut;
+  system_profile_draft: SystemProfileDraftOut | null;
+  feature_drafts: FeatureDraftOut[];
+}
+
 export interface CodeSymbolOut {
   id: number;
   snapshot_id: number;
