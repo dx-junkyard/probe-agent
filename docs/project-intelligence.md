@@ -246,6 +246,100 @@ Flow Explorer の入口を HTTP route と public function だけでなく、back
   `CLI: import-documents` 等）を主表示し、フィルター結果はスクロール可能な一覧で
   全件確認できる。
 
+### backend-entrypoint-first への再設計（#51）
+
+#48 の種類別フィルターは「全 public function の一覧 + 種類フィルター」のままで、
+backend entrypoint が薄い repository では function の素のリストが事実上の主表示に
+なってしまっていた。#51 で Flow Explorer を backend entrypoint 起点に再設計する。
+
+- **`app/entrypoint_discovery.py`（新規）**: FastAPI/Starlette の
+  `APIRouter(prefix=...)` + `app.include_router(router, prefix=...)`、Flask の
+  `Blueprint(url_prefix=...)` + `app.register_blueprint(bp)` を AST 上で解決し、
+  同一ファイル内・モジュール間の import を解決して router の mount prefix を合成
+  する（`discover_api_routes`）。route 自体の decorator のみでは捉えられない
+  「実際に公開される URL」を決定的に組み立てる。decorator は読めるが router
+  variable を解析できなかった route は、handler シンボル単位で重複排除した上で
+  decorator-only の `entrypoint_id` のまま fallback として残す。
+  Message Queue / Scheduled Job / CLI の検出は #48 の
+  `enumerate_symbol_entrypoints` をそのまま再利用する。
+- **`EntrypointDiscovery`**: `entrypoints`（api/message_queue/scheduled_job/cli =
+  backend entrypoint）と `functions`（public function、Advanced fallback 専用）を
+  分離して保持する。`backend_total`、`counts`（種類別件数）、
+  `indexed_function_count`、検出framework一覧、`diagnostics`
+  （backend entrypoint が0件のとき "No backend entrypoints detected..."、
+  Python indexer のみであること、OpenAPI spec が見つからないこと等を決定的な
+  固定メッセージで通知）を返す。
+- **`code_entrypoints`（新規 system-scoped テーブル）**: 検出結果を snapshot 単位
+  で永続化する。`GET /repository/flow-entrypoints` が呼ばれた際、その
+  `snapshot_id` に対する `intelligence_runs(run_type='entrypoint_index')` が
+  存在しなければ deterministic 判定として 1 度だけ INSERT する（`decision_method=
+  'deterministic'`、`is_mock=0`）。2 回目以降の GET は再計算結果を返すのみで
+  重複 INSERT しない。`code_entrypoints` は `system_id` でスコープし、他 system の
+  行を返さない（isolation test あり）。discovery 自体は読み取り専用で対象
+  repository には書き込まない。
+- **API 契約変更**: `FlowEntrypointsOut.entrypoints` は backend entrypoint のみを
+  返すようになった（function は含まれない）。function は `functions` フィールドに
+  分離し、`include_functions=true` または `category=function` を明示しない限り
+  空配列のままにする（Advanced 専用、デフォルト非表示）。`counts` /
+  `indexed_function_count` / `has_backend_entrypoints` / `frameworks` /
+  `diagnostics` を追加。`total` は backend entrypoint の総数（function を含まない）。
+- **`POST /repository/flow-graphs` / `POST /repository/probe-plans/from-flow`**:
+  graph builder には `discover_entrypoints` が返す composed entrypoint 一覧
+  （backend + function）を渡し、合成済みの URL（例: `POST:/api/documents/analyze`）
+  で entrypoint を解決できるようにした。
+- **Dashboard**: 左ペインの種類フィルターから Function を外し、既定では backend
+  entrypoint のみを表示する。function は "Show Advanced" トグルでのみ表示され、
+  「raw function の利用は discovery が不完全であることのシグナル」と明示する。
+  backend entrypoint が 0 件のときは diagnostics をそのまま表示し、function の
+  一覧を黒幕的な代替表示として出さない。
+
+### LLM 支援によるフレームワーク非依存の API 検出（Scan API definitions）
+
+決定的 AST 検出は FastAPI/Starlette/Flask しか認識しないため、Django/DRF・
+Express/NestJS・Go・Rails 等を使う repository では route が 0 件になる。これを
+補うため、Repository ページに **「Scan API definitions」** を追加する。reasoning
+model が snapshot を見て「どこに API 定義があるか」を判断し、**API 定義を抽出する
+正規表現**を生成する。正規表現は pinned snapshot に対して決定的に適用され、
+具体的な entrypoint（method/path/file/line）を抽出する。
+
+CLAUDE.md 原則 6 / reasoning-llm skill に従う:
+
+- 開放的な判断（どのファイルが API を定義し、どの正規表現が一致するか）は LLM が
+  行い、**正規表現は決定的なフィルター**として適用する。
+- mock / 非 reasoning model は **fail closed**（heuristic fallback なし）。
+- 生成された正規表現は **レビュー可能な成果物**として永続化し、決定的 AST の事実
+  とは `source` で分離する。
+
+実装:
+
+- **`app/api_scan.py`（新規）**: `build_snapshot_digest`（file inventory + API を
+  定義しそうなファイルの先頭サンプルを文字数上限付きで送る決定的な digest）、
+  `generate_api_scan`（reasoning model 呼び出し・mock fail closed）、
+  `parse_scan_response`（構造化出力の厳密検証: 正規表現の compile・長さ上限・
+  named group 整合・glob は repository 相対・ReDoS シグネチャ拒否）、
+  `apply_patterns`（**ReDoS 安全**: 行単位・行長上限付きで matching し、最悪
+  backtracking を 1 行に限定。`(?P<path>…)` を route path、`(?P<method>…)` /
+  `method_constant` を HTTP method として抽出）。
+- **永続化（system-scoped・追加のみ）**: `code_entrypoint_patterns`（生成された
+  正規表現と framework/language/reason/confidence/match_count/examples）、および
+  `code_entrypoints` に `source`（`deterministic` / `reasoning_llm`）と
+  `pattern_id` 列を追加（既存 DB には `ALTER TABLE` で後方互換マイグレーション）。
+- **API**: `POST /repository/api-scan`（`intelligence_runs(run_type='api_scan',
+  decision_method='reasoning_llm')` を記録し、pattern と抽出 entrypoint を 1
+  トランザクションで保存。再スキャンは当該 snapshot の `reasoning_llm` 行のみを
+  置換し、決定的行には触れない）、`GET /repository/api-scan`（最新スキャン取得）。
+  `GET /repository/flow-entrypoints` は永続化済みの LLM 由来 API entrypoint を
+  `api` カテゴリへマージし、`source` を返す（決定的 route と衝突する id は
+  決定的側を優先）。LLM 由来 entrypoint は handler symbol を持たないため、
+  flow graph 構築時は 422 を返し「可視化のための一覧表示のみ」と明示する。
+- **Dashboard**: Repository ページに「API Scan」タブを追加し、明示ボタンでのみ
+  実行する。生成された正規表現・framework・match 件数・抽出件数・fail closed
+  エラーを表示し、「LLM 生成のため要レビュー」と明記する。Flow Explorer では
+  LLM 由来 API entrypoint に「LLM」バッジを付ける。
+- **環境変数**: `API_SCAN_DIGEST_MAX_CHARS`（任意・既定 40000）で digest の文字数
+  上限を調整する。reasoning model の選択は既存の `INTELLIGENCE_LLM_PROVIDER` /
+  `INTELLIGENCE_LLM_MODEL`（未設定時は `LLM_PROVIDER` / `LLM_MODEL`）に従う。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。

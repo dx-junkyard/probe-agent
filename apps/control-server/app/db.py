@@ -377,6 +377,67 @@ CREATE TABLE IF NOT EXISTS symbol_index_warnings (
 CREATE INDEX IF NOT EXISTS idx_symbol_warnings_snapshot
     ON symbol_index_warnings (snapshot_id);
 
+CREATE TABLE IF NOT EXISTS code_entrypoints (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id               INTEGER NOT NULL,
+    snapshot_id             INTEGER NOT NULL,
+    entrypoint_type         TEXT NOT NULL,
+    entrypoint_id           TEXT NOT NULL,
+    category                TEXT NOT NULL,
+    label                   TEXT NOT NULL,
+    operation               TEXT,
+    framework               TEXT,
+    handler_symbol_id       INTEGER,
+    handler_path            TEXT NOT NULL,
+    handler_qualified_name  TEXT NOT NULL,
+    line_start              INTEGER NOT NULL,
+    line_end                INTEGER NOT NULL,
+    route_method            TEXT,
+    route_path              TEXT,
+    confidence              REAL NOT NULL DEFAULT 1.0,
+    evidence_json           TEXT NOT NULL DEFAULT '[]',
+    source                  TEXT NOT NULL DEFAULT 'deterministic',
+    pattern_id              INTEGER,
+    created_at              REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (handler_symbol_id) REFERENCES code_symbols (id) ON DELETE SET NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_code_entrypoints_unique
+    ON code_entrypoints (snapshot_id, entrypoint_type, entrypoint_id);
+
+CREATE INDEX IF NOT EXISTS idx_code_entrypoints_system
+    ON code_entrypoints (system_id, snapshot_id);
+
+CREATE TABLE IF NOT EXISTS code_entrypoint_patterns (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id               INTEGER NOT NULL,
+    snapshot_id             INTEGER NOT NULL,
+    intelligence_run_id     INTEGER NOT NULL,
+    file_glob               TEXT NOT NULL,
+    regex                   TEXT NOT NULL,
+    method_group            TEXT,
+    path_group              TEXT,
+    method_constant         TEXT,
+    framework               TEXT NOT NULL,
+    language                TEXT NOT NULL,
+    reason                  TEXT NOT NULL,
+    confidence              REAL NOT NULL DEFAULT 0.0,
+    match_count             INTEGER NOT NULL DEFAULT 0,
+    examples_json           TEXT NOT NULL DEFAULT '[]',
+    created_at              REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_code_entrypoint_patterns_system
+    ON code_entrypoint_patterns (system_id, snapshot_id);
+
+CREATE INDEX IF NOT EXISTS idx_code_entrypoint_patterns_run
+    ON code_entrypoint_patterns (intelligence_run_id);
+
 CREATE TABLE IF NOT EXISTS feature_code_links (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     system_id       INTEGER NOT NULL,
@@ -972,6 +1033,16 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE experiments "
                 "ADD COLUMN human_decision_variant_key TEXT"
+            )
+        entrypoint_columns = _columns(conn, "code_entrypoints")
+        if "source" not in entrypoint_columns:
+            conn.execute(
+                "ALTER TABLE code_entrypoints "
+                "ADD COLUMN source TEXT NOT NULL DEFAULT 'deterministic'"
+            )
+        if "pattern_id" not in entrypoint_columns:
+            conn.execute(
+                "ALTER TABLE code_entrypoints ADD COLUMN pattern_id INTEGER"
             )
         _ensure_legacy_system(conn)
     _bootstrap_admin()

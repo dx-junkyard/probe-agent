@@ -88,6 +88,11 @@ class FlowEntrypoint:
     operation: Optional[str] = None
     confidence: float = 1.0
     evidence: List[EvidenceRef] = field(default_factory=list)
+    # Provenance of the entrypoint: "deterministic" for AST-derived rows,
+    # "reasoning_llm" for entrypoints extracted via an LLM-generated regex
+    # (Repository "Scan API definitions"). Kept so the UI and audit can keep
+    # deterministic facts separate from reasoning-model output.
+    source: str = "deterministic"
 
 
 @dataclass
@@ -739,13 +744,91 @@ def _entry_evidence(sym: SymbolRecord, summary: str) -> List[EvidenceRef]:
     )]
 
 
-def list_entrypoints(symbols: List[SymbolRecord]) -> List[FlowEntrypoint]:
-    """Enumerate deterministic backend entrypoints from snapshot symbols.
+def build_route_entrypoint(sym: SymbolRecord) -> FlowEntrypoint:
+    """Build an HTTP API entrypoint from a symbol's decorator route metadata.
 
-    Detects, in precedence order per symbol: HTTP API routes, message-queue /
-    background consumers, scheduled jobs, CLI commands, and finally public
-    module-level functions. Non-API kinds require an explicit, known framework
-    decorator; nothing is promoted from a naming guess alone.
+    This uses the decorator path only (no router-prefix composition); the
+    framework-aware composer in ``entrypoint_discovery`` supersedes it when the
+    full snapshot source is available.
+    """
+    method = (sym.route_method or "ANY").upper()
+    path = sym.route_path or ""
+    framework = _api_framework(sym)
+    operation = f"{method} {path}".strip()
+    return FlowEntrypoint(
+        entrypoint_type="http_route",
+        entrypoint_id=f"{method}:{path}",
+        label=operation,
+        path=sym.path,
+        qualified_name=sym.qualified_name,
+        line_start=sym.start_line,
+        line_end=sym.end_line,
+        component_id=sym.component_id,
+        route_method=method,
+        route_path=path,
+        category="api",
+        framework=framework,
+        operation=operation,
+        confidence=1.0,
+        evidence=_entry_evidence(sym, f"{framework} HTTP route {operation}"),
+    )
+
+
+def build_backend_entrypoint(
+    sym: SymbolRecord, cls: "_EntrypointClass",
+) -> FlowEntrypoint:
+    """Build a message-queue / scheduled-job / CLI entrypoint from a symbol."""
+    operation = sym.qualified_name
+    title = _FRAMEWORK_TITLES.get(cls.framework, cls.framework.title())
+    if cls.entrypoint_type == "cli":
+        label = f"CLI: {operation}"
+    else:
+        label = f"{title}: {operation}"
+    return FlowEntrypoint(
+        entrypoint_type=cls.entrypoint_type,
+        entrypoint_id=f"{cls.entrypoint_type}:{_node_id(sym.path, sym.qualified_name)}",
+        label=label,
+        path=sym.path,
+        qualified_name=sym.qualified_name,
+        line_start=sym.start_line,
+        line_end=sym.end_line,
+        component_id=sym.component_id,
+        category=_TYPE_TO_CATEGORY[cls.entrypoint_type],
+        framework=cls.framework,
+        operation=operation,
+        confidence=cls.confidence,
+        evidence=_entry_evidence(sym, cls.reason),
+    )
+
+
+def build_function_entrypoint(sym: SymbolRecord) -> FlowEntrypoint:
+    """Build a public-function (Advanced fallback) entrypoint from a symbol."""
+    return FlowEntrypoint(
+        entrypoint_type="public_function",
+        entrypoint_id=f"function:{_node_id(sym.path, sym.qualified_name)}",
+        label=f"{sym.qualified_name} ({sym.path})",
+        path=sym.path,
+        qualified_name=sym.qualified_name,
+        line_start=sym.start_line,
+        line_end=sym.end_line,
+        component_id=sym.component_id,
+        category="function",
+        operation=sym.qualified_name,
+        confidence=1.0,
+        evidence=_entry_evidence(sym, "public module-level function"),
+    )
+
+
+def enumerate_symbol_entrypoints(
+    symbols: List[SymbolRecord],
+) -> Tuple[
+    List[FlowEntrypoint], List[FlowEntrypoint], List[FlowEntrypoint],
+    List[FlowEntrypoint], List[FlowEntrypoint],
+]:
+    """Classify symbols into (routes, message_queue, scheduled, cli, functions).
+
+    Detection is deterministic and decorator-based; nothing is promoted from a
+    naming guess alone. Returned buckets are sorted for stable output.
     """
     routes: List[FlowEntrypoint] = []
     message_queue: List[FlowEntrypoint] = []
@@ -758,29 +841,7 @@ def list_entrypoints(symbols: List[SymbolRecord]) -> List[FlowEntrypoint]:
             continue
 
         if sym.route_path or sym.route_method:
-            method = (sym.route_method or "ANY").upper()
-            path = sym.route_path or ""
-            framework = _api_framework(sym)
-            operation = f"{method} {path}".strip()
-            routes.append(FlowEntrypoint(
-                entrypoint_type="http_route",
-                entrypoint_id=f"{method}:{path}",
-                label=operation,
-                path=sym.path,
-                qualified_name=sym.qualified_name,
-                line_start=sym.start_line,
-                line_end=sym.end_line,
-                component_id=sym.component_id,
-                route_method=method,
-                route_path=path,
-                category="api",
-                framework=framework,
-                operation=operation,
-                confidence=1.0,
-                evidence=_entry_evidence(
-                    sym, f"{framework} HTTP route {operation}",
-                ),
-            ))
+            routes.append(build_route_entrypoint(sym))
             continue
 
         # Decorator-based backend entrypoints are module-level only to avoid
@@ -788,27 +849,7 @@ def list_entrypoints(symbols: List[SymbolRecord]) -> List[FlowEntrypoint]:
         if "." not in sym.qualified_name:
             cls = _classify_symbol(sym)
             if cls is not None:
-                operation = sym.qualified_name
-                title = _FRAMEWORK_TITLES.get(cls.framework, cls.framework.title())
-                if cls.entrypoint_type == "cli":
-                    label = f"CLI: {operation}"
-                else:
-                    label = f"{title}: {operation}"
-                ep = FlowEntrypoint(
-                    entrypoint_type=cls.entrypoint_type,
-                    entrypoint_id=f"{cls.entrypoint_type}:{_node_id(sym.path, sym.qualified_name)}",
-                    label=label,
-                    path=sym.path,
-                    qualified_name=sym.qualified_name,
-                    line_start=sym.start_line,
-                    line_end=sym.end_line,
-                    component_id=sym.component_id,
-                    category=_TYPE_TO_CATEGORY[cls.entrypoint_type],
-                    framework=cls.framework,
-                    operation=operation,
-                    confidence=cls.confidence,
-                    evidence=_entry_evidence(sym, cls.reason),
-                )
+                ep = build_backend_entrypoint(sym, cls)
                 if cls.entrypoint_type == "message_queue":
                     message_queue.append(ep)
                 elif cls.entrypoint_type == "scheduled_job":
@@ -818,32 +859,38 @@ def list_entrypoints(symbols: List[SymbolRecord]) -> List[FlowEntrypoint]:
                 continue
 
         if "." not in sym.qualified_name and not sym.qualified_name.startswith("_"):
-            functions.append(FlowEntrypoint(
-                entrypoint_type="public_function",
-                entrypoint_id=f"function:{_node_id(sym.path, sym.qualified_name)}",
-                label=f"{sym.qualified_name} ({sym.path})",
-                path=sym.path,
-                qualified_name=sym.qualified_name,
-                line_start=sym.start_line,
-                line_end=sym.end_line,
-                component_id=sym.component_id,
-                category="function",
-                operation=sym.qualified_name,
-                confidence=1.0,
-                evidence=_entry_evidence(sym, "public module-level function"),
-            ))
+            functions.append(build_function_entrypoint(sym))
 
     routes.sort(key=lambda e: (e.route_path or "", e.route_method or "", e.path))
     for bucket in (message_queue, scheduled, cli, functions):
         bucket.sort(key=lambda e: (e.path, e.qualified_name))
+    return routes, message_queue, scheduled, cli, functions
+
+
+def list_entrypoints(symbols: List[SymbolRecord]) -> List[FlowEntrypoint]:
+    """Enumerate deterministic backend entrypoints from snapshot symbols.
+
+    Detects, in precedence order per symbol: HTTP API routes, message-queue /
+    background consumers, scheduled jobs, CLI commands, and finally public
+    module-level functions. Non-API kinds require an explicit, known framework
+    decorator; nothing is promoted from a naming guess alone.
+    """
+    routes, message_queue, scheduled, cli, functions = enumerate_symbol_entrypoints(
+        symbols
+    )
     return routes + message_queue + scheduled + cli + functions
 
 
 def _find_entrypoint(
     symbols: List[SymbolRecord], entrypoint_type: str, entrypoint_id: str,
+    entrypoints: Optional[List[FlowEntrypoint]] = None,
 ) -> Optional[Tuple[SymbolRecord, FlowEntrypoint]]:
     entrypoint_type = normalize_entrypoint_type(entrypoint_type)
-    for ep in list_entrypoints(symbols):
+    # When the caller has already discovered entrypoints (e.g. framework-aware
+    # API route composition), resolve against that list; otherwise fall back to
+    # the decorator-only symbol enumeration.
+    candidates = entrypoints if entrypoints is not None else list_entrypoints(symbols)
+    for ep in candidates:
         if ep.entrypoint_type == entrypoint_type and ep.entrypoint_id == entrypoint_id:
             # Resolve back to the concrete symbol record.
             for sym in symbols:
@@ -872,16 +919,21 @@ def build_flow_graph(
     entrypoint_id: str,
     max_depth: int = 8,
     max_nodes: int = 100,
+    entrypoints: Optional[List[FlowEntrypoint]] = None,
 ) -> Optional[FlowGraph]:
     """Build a deterministic flow graph for a single entrypoint.
 
     Returns ``None`` when the entrypoint cannot be located in the snapshot.
+
+    When ``entrypoints`` is provided the entrypoint is resolved against it
+    (used to honour framework-aware API route composition); otherwise the
+    decorator-only symbol enumeration is used.
     """
     max_depth = max(1, min(max_depth, 32))
     max_nodes = max(1, min(max_nodes, 500))
     entrypoint_type = normalize_entrypoint_type(entrypoint_type)
 
-    found = _find_entrypoint(symbols, entrypoint_type, entrypoint_id)
+    found = _find_entrypoint(symbols, entrypoint_type, entrypoint_id, entrypoints)
     if found is None:
         return None
     entry_sym, entry_ep = found

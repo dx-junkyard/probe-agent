@@ -17,6 +17,20 @@ export default function FeatureMapPage() {
 
   const profile = drafts?.system_profile_draft;
   const features = drafts?.feature_drafts ?? [];
+  const handleGenerateDrafts = () => {
+    generateDrafts.mutateAsync()
+      .then((result) => {
+        const run = result.intelligence_run;
+        if (run.status === "failed") {
+          toast.error(run.error_details || "Draft generation failed");
+          return;
+        }
+        toast.success(
+          `Drafts generated: ${result.feature_drafts.length} feature(s)`,
+        );
+      })
+      .catch(e => toast.error(String(e)));
+  };
 
   return (
     <div className="space-y-6">
@@ -34,7 +48,7 @@ export default function FeatureMapPage() {
           </Button>
           <Button
             size="sm"
-            onClick={() => generateDrafts.mutateAsync().then(() => toast.success("Drafts generated")).catch(e => toast.error(String(e)))}
+            onClick={handleGenerateDrafts}
             disabled={generateDrafts.isPending}
           >
             <Sparkles className="h-4 w-4 mr-1" />
@@ -46,6 +60,11 @@ export default function FeatureMapPage() {
       {drafts?.intelligence_run?.is_mock && (
         <div className="rounded-md border border-amber-200 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 px-4 py-3 text-sm text-amber-800 dark:text-amber-200">
           This data is from a mock LLM provider and is for development purposes only.
+        </div>
+      )}
+      {drafts?.intelligence_run?.status === "failed" && (
+        <div className="rounded-md border border-red-200 bg-red-50 dark:bg-red-950/20 dark:border-red-800 px-4 py-3 text-sm text-red-800 dark:text-red-200">
+          Draft generation failed: {drafts.intelligence_run.error_details || "Unknown error"}
         </div>
       )}
 

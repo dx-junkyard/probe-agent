@@ -4,7 +4,8 @@ import type {
   SystemOut, ComponentSummary, TraceEvent, Policy,
   ShadowResult, ComponentProfile, UserOut, TokenOut,
   RepositoryCandidateOut, RepositoryConfigOut, SnapshotOut, LatestDraftsOut,
-  SymbolIndexOut, FeatureCodeLinksOut, ProbePlansListOut,
+  DraftGenerationResultOut,
+  SymbolIndexOut, FeatureCodeLinksOut, ProbePlansListOut, ApiScanResultOut,
   FlowEntrypointsOut, FlowGraphOut, FlowProbeSelection, ProbePlanOut,
   ProbePatchOut, GenerationRun, ExperimentOut, MeResponse,
   EvaluationCriterion,
@@ -228,7 +229,7 @@ export function useLatestDrafts() {
 export function useGenerateDrafts() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: () => api.post("/repository/drafts/generate"),
+    mutationFn: () => api.post<DraftGenerationResultOut>("/repository/drafts/generate"),
     onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("drafts") }),
   });
 }
@@ -246,6 +247,25 @@ export function useIndexSymbols() {
   return useMutation({
     mutationFn: () => api.post<SymbolIndexOut>("/repository/symbols/index"),
     onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("symbols") }),
+  });
+}
+
+export function useApiScanResult() {
+  return useQuery({
+    queryKey: sysKey("apiScan"),
+    queryFn: () => api.get<ApiScanResultOut>("/repository/api-scan"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useRunApiScan() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post<ApiScanResultOut>("/repository/api-scan"),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: sysKey("apiScan") });
+      qc.invalidateQueries({ queryKey: sysKey("flowEntrypoints") });
+    },
   });
 }
 
@@ -303,15 +323,19 @@ export function useUpdateProbePointStatus() {
   });
 }
 
-export function useFlowEntrypoints(params?: { category?: string; q?: string }) {
+export function useFlowEntrypoints(
+  params?: { category?: string; q?: string; includeFunctions?: boolean },
+) {
   const category = params?.category && params.category !== "all" ? params.category : "";
   const q = params?.q?.trim() ?? "";
+  const includeFunctions = !!params?.includeFunctions;
   return useQuery({
-    queryKey: sysKey("flowEntrypoints", category, q),
+    queryKey: sysKey("flowEntrypoints", category, q, includeFunctions),
     queryFn: () => {
       const search = new URLSearchParams();
       if (category) search.set("category", category);
       if (q) search.set("q", q);
+      if (includeFunctions) search.set("include_functions", "true");
       const qs = search.toString();
       return api.get<FlowEntrypointsOut>(
         `/repository/flow-entrypoints${qs ? `?${qs}` : ""}`,

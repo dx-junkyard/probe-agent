@@ -2,6 +2,7 @@ import { useState } from "react";
 import {
   useRepositoryCandidates, useRepositoryConfig, useUpdateRepositoryConfig,
   useSnapshots, useLatestSnapshot, useCreateSnapshot, useSymbols, useIndexSymbols,
+  useApiScanResult, useRunApiScan,
 } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
@@ -14,7 +15,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { toast } from "sonner";
 import { formatTimestamp, formatBytes } from "@/lib/utils";
-import { GitCommit, FolderTree, Code2, RefreshCw, AlertTriangle } from "lucide-react";
+import { GitCommit, FolderTree, Code2, RefreshCw, AlertTriangle, ScanSearch, Sparkles } from "lucide-react";
 import type { RepositoryCandidateOut, RepositoryConfigOut } from "@/api/types";
 
 function patternsToText(patterns: string[] | undefined): string {
@@ -47,6 +48,7 @@ export default function RepositoryPage() {
           <TabsTrigger value="config">Configuration</TabsTrigger>
           <TabsTrigger value="snapshots">Snapshots</TabsTrigger>
           <TabsTrigger value="symbols">Symbols</TabsTrigger>
+          <TabsTrigger value="api-scan">API Scan</TabsTrigger>
         </TabsList>
 
         <TabsContent value="config">
@@ -227,8 +229,117 @@ export default function RepositoryPage() {
             </CardContent>
           </Card>
         </TabsContent>
+
+        <TabsContent value="api-scan">
+          <ApiScanPanel />
+        </TabsContent>
       </Tabs>
     </div>
+  );
+}
+
+function ApiScanPanel() {
+  const { data: scan, isLoading } = useApiScanResult();
+  const runScan = useRunApiScan();
+
+  const onScan = () => {
+    runScan.mutateAsync()
+      .then((r) => {
+        if (r.status === "completed") {
+          toast.success(`Scan complete: ${r.extracted_count} API endpoint(s) from ${r.patterns.length} pattern(s)`);
+        } else {
+          toast.error(r.error || "API scan failed");
+        }
+      })
+      .catch((e) => toast.error(String(e)));
+  };
+
+  const result = runScan.data ?? scan;
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-start justify-between gap-4">
+        <div>
+          <CardTitle className="text-base flex items-center gap-2">
+            <ScanSearch className="h-4 w-4" /> API Definition Scan
+          </CardTitle>
+          <CardDescription>
+            Use a reasoning model to find where API definitions live across any
+            framework/language and generate regexes that extract them. The regexes
+            are applied deterministically to the pinned snapshot. Requires a
+            configured reasoning model; results are LLM-generated — review before
+            trusting.
+          </CardDescription>
+        </div>
+        <Button size="sm" onClick={onScan} disabled={runScan.isPending}>
+          <Sparkles className={`h-4 w-4 mr-1 ${runScan.isPending ? "animate-spin" : ""}`} />
+          {runScan.isPending ? "Scanning…" : "Scan API definitions"}
+        </Button>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {isLoading ? (
+          <div className="space-y-2">{[1,2,3].map(i=><Skeleton key={i} className="h-10 w-full"/>)}</div>
+        ) : !result || result.status === "none" ? (
+          <p className="text-sm text-muted-foreground text-center py-8">
+            No API scan yet. Create a snapshot, then run a scan to detect APIs in
+            frameworks the deterministic indexer does not support.
+          </p>
+        ) : result.status === "failed" ? (
+          <div className="rounded-md border border-red-300 bg-red-50 dark:bg-red-950/20 dark:border-red-800 px-4 py-3 text-sm text-red-800 dark:text-red-200">
+            <div className="flex items-center gap-2 font-medium">
+              <AlertTriangle className="h-4 w-4" /> Scan failed
+              {result.is_mock && <Badge variant="outline" className="text-[10px]">mock</Badge>}
+            </div>
+            <p className="mt-1">{result.error}</p>
+            <p className="mt-1 text-xs">
+              API scanning requires a real reasoning model (set
+              INTELLIGENCE_LLM_PROVIDER / INTELLIGENCE_LLM_MODEL, or LLM_PROVIDER /
+              LLM_MODEL). No heuristic fallback is used.
+            </p>
+          </div>
+        ) : (
+          <>
+            <div className="flex flex-wrap items-center gap-3 text-sm">
+              <Badge variant="secondary">{result.extracted_count} API endpoint(s)</Badge>
+              <span className="text-muted-foreground">
+                {result.patterns.length} pattern(s)
+                {result.provider && ` · ${result.provider}/${result.model}`}
+              </span>
+              {result.frameworks.map(f => (
+                <Badge key={f} variant="outline" className="text-[10px]">{f}</Badge>
+              ))}
+              {result.is_mock && <Badge variant="outline" className="text-[10px]">mock</Badge>}
+            </div>
+            {result.diagnostics.length > 0 && (
+              <ul className="text-xs text-muted-foreground list-disc pl-4 space-y-1">
+                {result.diagnostics.map((d, i) => <li key={i}>{d}</li>)}
+              </ul>
+            )}
+            <div className="space-y-2">
+              {result.patterns.map((p, i) => (
+                <div key={p.id ?? i} className="rounded-md border p-3 space-y-1">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <Badge variant="outline" className="text-[10px]">{p.framework}</Badge>
+                    <Badge variant="outline" className="text-[10px]">{p.language}</Badge>
+                    <span className="text-xs text-muted-foreground">{p.file_glob}</span>
+                    <span className="ml-auto text-xs">{p.match_count} match(es)</span>
+                    <span className="text-xs text-muted-foreground">{Math.round(p.confidence * 100)}%</span>
+                  </div>
+                  <code className="block text-xs font-mono bg-muted/50 rounded px-2 py-1 break-all">{p.regex}</code>
+                  <p className="text-xs text-muted-foreground">{p.reason}</p>
+                </div>
+              ))}
+            </div>
+            <p className="text-[11px] text-muted-foreground">
+              Extracted endpoints appear in the{" "}
+              <span className="font-medium">Flow Explorer</span> API list, marked
+              as LLM-sourced. They are listed for visibility; a process tree
+              cannot yet be rooted from an LLM-only endpoint.
+            </p>
+          </>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 

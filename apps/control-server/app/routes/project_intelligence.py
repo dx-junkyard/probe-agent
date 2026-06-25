@@ -1,3 +1,4 @@
+import fnmatch
 import json
 import os
 import re
@@ -31,9 +32,13 @@ from ..git_ops import (
 )
 from ..llm import LLMConfig, LLMError, create_llm_client, is_reasoning_model
 from ..models import (
+    ApiScanPatternOut,
+    ApiScanRequest,
+    ApiScanResultOut,
     CandidateFlowOut,
     CodeSymbolOut,
     DraftGenerationResult,
+    EntrypointCountsOut,
     EvidenceRefOut,
     FlowEdgeOut,
     FlowEntrypointOut,
@@ -574,6 +579,15 @@ def generate_drafts_endpoint(
             provider=intelligence_provider or llm_config.provider,
             model=intelligence_model or llm_config.model,
         )
+    try:
+        intelligence_timeout = float(os.getenv("INTELLIGENCE_LLM_TIMEOUT", "120"))
+    except ValueError:
+        intelligence_timeout = 120.0
+    if llm_config.provider != "mock":
+        llm_config = replace(
+            llm_config,
+            timeout=max(llm_config.timeout, intelligence_timeout),
+        )
 
     started_at = time.time()
     try:
@@ -752,7 +766,7 @@ def get_latest_drafts(
         run_row = conn.execute(
             """
             SELECT * FROM intelligence_runs
-            WHERE system_id = ?
+            WHERE system_id = ? AND run_type = 'repository_drafts'
             ORDER BY id DESC LIMIT 1
             """,
             (system_id,),
@@ -1852,6 +1866,136 @@ def _entrypoint_out(e) -> FlowEntrypointOut:
         operation=e.operation,
         confidence=e.confidence,
         evidence=_evidence_refs_out(e.evidence),
+        source=getattr(e, "source", "deterministic"),
+    )
+
+
+def _load_persisted_api_entrypoints(system_id: int, snapshot_id: int):
+    """Load previously-saved LLM-regex API entrypoints for a snapshot.
+
+    These come from "Scan API definitions" (an ``api_scan`` reasoning run) and
+    are kept separate from deterministic AST rows by ``source='reasoning_llm'``.
+    """
+    from ..flow_graph import EvidenceRef, FlowEntrypoint
+
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM code_entrypoints WHERE system_id = ? AND snapshot_id = ? "
+            "AND source = 'reasoning_llm'",
+            (system_id, snapshot_id),
+        ).fetchall()
+    eps = []
+    for r in rows:
+        evidence = [
+            EvidenceRef(
+                path=ev["path"], start_line=ev["start_line"],
+                end_line=ev["end_line"], summary=ev["summary"],
+            )
+            for ev in json.loads(r["evidence_json"])
+        ]
+        eps.append(FlowEntrypoint(
+            entrypoint_type=r["entrypoint_type"],
+            entrypoint_id=r["entrypoint_id"],
+            label=r["label"],
+            path=r["handler_path"],
+            qualified_name=r["handler_qualified_name"],
+            line_start=r["line_start"],
+            line_end=r["line_end"],
+            route_method=r["route_method"],
+            route_path=r["route_path"],
+            category=r["category"],
+            framework=r["framework"],
+            operation=r["operation"],
+            confidence=r["confidence"],
+            evidence=evidence,
+            source="reasoning_llm",
+        ))
+    return eps
+
+
+def _ensure_entrypoints_indexed(system_id: int, snapshot_row, symbols, files):
+    """Run deterministic entrypoint discovery and persist it once per snapshot.
+
+    Discovery itself is deterministic and recomputed on each call (it is cheap);
+    the persisted ``code_entrypoints`` rows and the ``entrypoint_index``
+    intelligence run are the audit artefacts required by the issue. Persistence
+    is idempotent: it happens only the first time for a given snapshot.
+    """
+    from ..entrypoint_discovery import DISCOVERY_VERSION, discover_entrypoints
+
+    snapshot_id = snapshot_row["id"]
+    llm_eps = _load_persisted_api_entrypoints(system_id, snapshot_id)
+    discovery = discover_entrypoints(symbols, files, persisted_api=llm_eps)
+    now = time.time()
+    with get_conn() as conn:
+        run_exists = conn.execute(
+            """SELECT 1 FROM intelligence_runs
+               WHERE system_id = ? AND snapshot_id = ?
+                 AND run_type = 'entrypoint_index' LIMIT 1""",
+            (system_id, snapshot_id),
+        ).fetchone()
+        if run_exists:
+            return discovery
+        conn.execute("BEGIN")
+        try:
+            conn.execute(
+                """INSERT INTO intelligence_runs
+                       (system_id, snapshot_id, run_type, provider, model,
+                        prompt_version, schema_version, decision_method,
+                        status, is_mock, started_at, completed_at)
+                   VALUES (?, ?, 'entrypoint_index', 'deterministic', 'ast',
+                           ?, ?, 'deterministic', 'completed', 0, ?, ?)""",
+                (system_id, snapshot_id, DISCOVERY_VERSION, DISCOVERY_VERSION,
+                 now, now),
+            )
+            sym_rows = conn.execute(
+                "SELECT id, path, qualified_name FROM code_symbols "
+                "WHERE snapshot_id = ? AND system_id = ?",
+                (snapshot_id, system_id),
+            ).fetchall()
+            sym_id = {(r["path"], r["qualified_name"]): r["id"] for r in sym_rows}
+            for e in discovery.entrypoints:
+                # LLM-regex entrypoints are persisted by the api_scan endpoint
+                # with their own source/pattern_id; only the deterministic AST
+                # rows are owned by this entrypoint_index run.
+                if getattr(e, "source", "deterministic") != "deterministic":
+                    continue
+                evidence_json = json.dumps([
+                    {"path": ev.path, "start_line": ev.start_line,
+                     "end_line": ev.end_line, "summary": ev.summary}
+                    for ev in e.evidence
+                ])
+                conn.execute(
+                    """INSERT OR IGNORE INTO code_entrypoints
+                           (system_id, snapshot_id, entrypoint_type, entrypoint_id,
+                            category, label, operation, framework, handler_symbol_id,
+                            handler_path, handler_qualified_name, line_start, line_end,
+                            route_method, route_path, confidence, evidence_json,
+                            source, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                               'deterministic', ?)""",
+                    (
+                        system_id, snapshot_id, e.entrypoint_type, e.entrypoint_id,
+                        e.category, e.label, e.operation, e.framework,
+                        sym_id.get((e.path, e.qualified_name)),
+                        e.path, e.qualified_name, e.line_start, e.line_end,
+                        e.route_method, e.route_path, e.confidence, evidence_json,
+                        now,
+                    ),
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return discovery
+
+
+def _ep_matches(e, needle: str) -> bool:
+    return (
+        needle in e.label.lower()
+        or needle in e.path.lower()
+        or needle in (e.operation or "").lower()
+        or needle in e.qualified_name.lower()
     )
 
 
@@ -1860,8 +2004,9 @@ def list_flow_entrypoints(
     system_id: int = Depends(get_system_id),
     category: Optional[str] = Query(
         default=None,
-        description="Filter by entrypoint category: api | message_queue | "
-        "scheduled_job | cli | function. 'all' (or omitted) returns every kind.",
+        description="Filter backend entrypoints by category: api | message_queue "
+        "| scheduled_job | cli. 'function' returns the Advanced fallback; "
+        "'all' (or omitted) returns every backend kind.",
     ),
     entrypoint_type: Optional[str] = Query(
         default=None,
@@ -1869,40 +2014,402 @@ def list_flow_entrypoints(
         "(http_route/public_function) for convenience.",
     ),
     q: Optional[str] = Query(default=None, description="Case-insensitive substring filter."),
+    include_functions: bool = Query(
+        default=False,
+        description="Include the public-function Advanced fallback in 'functions'.",
+    ),
 ) -> FlowEntrypointsOut:
-    from ..flow_graph import category_for_type, list_entrypoints
+    """List backend entrypoints (Issue #51, backend-entrypoint-first).
+
+    ``entrypoints`` carries only backend entrypoints (api/message_queue/
+    scheduled_job/cli) resolved to handler symbols. The public-function fallback
+    is demoted to ``functions`` and returned only when explicitly requested
+    (``include_functions`` or ``category=function``). ``counts`` and
+    ``diagnostics`` let the UI explain thin discovery instead of dumping the raw
+    function index.
+    """
+    from ..flow_graph import category_for_type
 
     with get_conn() as conn:
         snapshot_row = _latest_ready_snapshot(conn, system_id)
         if snapshot_row is None:
             return FlowEntrypointsOut(system_id=system_id)
-    _, symbols, _ = _load_flow_inputs(system_id)
-    entrypoints = list_entrypoints(symbols)
-    total = len(entrypoints)
+    snapshot_row, symbols, files = _load_flow_inputs(system_id)
+    discovery = _ensure_entrypoints_indexed(system_id, snapshot_row, symbols, files)
 
-    # Normalise the requested category. ``entrypoint_type`` aliases category and
-    # also accepts a dispatch type. Hitting matches are returned in full; the
-    # server never silently truncates a filtered listing.
+    backend = list(discovery.entrypoints)
+    functions = list(discovery.functions)
+
     wanted = category or entrypoint_type
+    wanted_category = None
     if wanted and wanted.lower() not in ("all", ""):
         wanted_category = category_for_type(wanted.lower())
-        entrypoints = [e for e in entrypoints if e.category == wanted_category]
+
+    if wanted_category == "function":
+        backend = []
+    elif wanted_category is not None:
+        backend = [e for e in backend if e.category == wanted_category]
+
+    want_functions = include_functions or wanted_category == "function"
+    funcs_out = functions if want_functions else []
+
     if q and q.strip():
         needle = q.strip().lower()
-        entrypoints = [
-            e for e in entrypoints
-            if needle in e.label.lower()
-            or needle in e.path.lower()
-            or needle in (e.operation or "").lower()
-            or needle in e.qualified_name.lower()
-        ]
+        backend = [e for e in backend if _ep_matches(e, needle)]
+        funcs_out = [e for e in funcs_out if _ep_matches(e, needle)]
 
     return FlowEntrypointsOut(
         system_id=system_id,
         snapshot_id=snapshot_row["id"],
         commit_sha=snapshot_row["commit_sha"],
-        total=total,
-        entrypoints=[_entrypoint_out(e) for e in entrypoints],
+        total=discovery.backend_total,
+        entrypoints=[_entrypoint_out(e) for e in backend],
+        functions=[_entrypoint_out(e) for e in funcs_out],
+        counts=EntrypointCountsOut(**discovery.counts),
+        indexed_function_count=discovery.indexed_function_count,
+        has_backend_entrypoints=discovery.backend_total > 0,
+        frameworks=discovery.frameworks,
+        diagnostics=discovery.diagnostics,
+    )
+
+
+def _load_scan_files(system_id: int, expected_snapshot_id=None, expected_commit_sha=None):
+    """Load all indexed text files for the latest ready snapshot (any language).
+
+    Unlike ``_load_flow_inputs`` this is not restricted to ``.py`` and does not
+    require indexed symbols, because the LLM scan operates on raw source across
+    frameworks/languages. Only committed-snapshot content is read.
+    """
+    with get_conn() as conn:
+        snapshot_row = _latest_ready_snapshot(conn, system_id)
+        if snapshot_row is None:
+            raise HTTPException(
+                status_code=400, detail="No ready snapshot. Create a snapshot first.",
+            )
+        snapshot_id = snapshot_row["id"]
+        if (
+            expected_snapshot_id is not None and expected_snapshot_id != snapshot_id
+        ) or (
+            expected_commit_sha is not None
+            and expected_commit_sha != snapshot_row["commit_sha"]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Snapshot is stale: a newer snapshot exists. Reload and retry.",
+            )
+        file_rows = conn.execute(
+            """SELECT path, content FROM snapshot_files
+               WHERE snapshot_id = ? AND inclusion_status = 'indexed'
+               ORDER BY path""",
+            (snapshot_id,),
+        ).fetchall()
+    files = [
+        (fr["path"], bytes(fr["content"] or b"").decode("utf-8", errors="replace"))
+        for fr in file_rows
+    ]
+    return snapshot_row, files
+
+
+def _resolve_intelligence_config():
+    """Return an LLMConfig with the intelligence-model override applied."""
+    llm_config = LLMConfig.from_env()
+    provider = os.getenv("INTELLIGENCE_LLM_PROVIDER", "").strip()
+    model = os.getenv("INTELLIGENCE_LLM_MODEL", "").strip()
+    if provider or model:
+        llm_config = replace(
+            llm_config,
+            provider=provider or llm_config.provider,
+            model=model or llm_config.model,
+        )
+    return llm_config
+
+
+def _snapshot_config_stale_reason(system_id: int, snapshot_row) -> Optional[str]:
+    """Return a clear reason when the latest snapshot predates repo settings.
+
+    Repository include/exclude patterns are applied only when a snapshot is
+    created. If the user adds e.g. ``backend/**`` after the latest snapshot, API
+    discovery will still inspect the old file set and silently miss routes.
+    """
+    with get_conn() as conn:
+        config_row = conn.execute(
+            "SELECT * FROM repository_configs WHERE system_id = ?", (system_id,)
+        ).fetchone()
+    if config_row is None:
+        return None
+
+    snapshot_time = snapshot_row["completed_at"] or snapshot_row["created_at"] or 0
+    if (config_row["updated_at"] or 0) <= snapshot_time:
+        return None
+
+    include_patterns = json.loads(config_row["include_patterns"] or "[]")
+    exclude_patterns = json.loads(config_row["exclude_patterns"] or "[]")
+    return (
+        "Repository settings were updated after the latest snapshot was created. "
+        "Create a new repository snapshot and re-run symbol indexing/API scan. "
+        f"Current include_patterns={include_patterns}, "
+        f"exclude_patterns={exclude_patterns}."
+    )
+
+
+def _api_scan_pattern_out(row) -> ApiScanPatternOut:
+    examples = [
+        EvidenceRefOut(path=ex.get("path", ""), start_line=int(ex.get("line", 0)),
+                       end_line=int(ex.get("line", 0)), summary="example match")
+        for ex in json.loads(row["examples_json"])
+    ]
+    return ApiScanPatternOut(
+        id=row["id"],
+        file_glob=row["file_glob"],
+        regex=row["regex"],
+        method_group=row["method_group"],
+        path_group=row["path_group"],
+        method_constant=row["method_constant"],
+        framework=row["framework"],
+        language=row["language"],
+        reason=row["reason"],
+        confidence=row["confidence"],
+        match_count=row["match_count"],
+        examples=examples,
+    )
+
+
+@router.post("/repository/api-scan", response_model=ApiScanResultOut)
+def run_api_scan(
+    payload: Optional[ApiScanRequest] = None,
+    system_id: int = Depends(get_system_id),
+) -> ApiScanResultOut:
+    """Scan the snapshot with a reasoning model to discover API definitions.
+
+    The model returns regular expressions that filter API definitions; the
+    regexes are applied deterministically to the pinned snapshot to extract
+    concrete entrypoints. Fails closed (no heuristic fallback) for mock or
+    non-reasoning models. Persists an ``api_scan`` audit run, the reviewable
+    regex patterns, and the extracted entrypoints (source='reasoning_llm').
+    """
+    from ..api_scan import (
+        PROMPT_VERSION as SCAN_PROMPT_VERSION,
+        SCHEMA_VERSION as SCAN_SCHEMA_VERSION,
+        apply_patterns,
+        build_snapshot_digest,
+        generate_api_scan,
+    )
+
+    payload = payload or ApiScanRequest()
+    snapshot_row, files = _load_scan_files(
+        system_id, payload.snapshot_id, payload.commit_sha,
+    )
+    snapshot_id = snapshot_row["id"]
+    llm_config = _resolve_intelligence_config()
+
+    if payload.snapshot_id is None and payload.commit_sha is None:
+        stale_reason = _snapshot_config_stale_reason(system_id, snapshot_row)
+        if stale_reason:
+            return ApiScanResultOut(
+                system_id=system_id,
+                snapshot_id=snapshot_id,
+                commit_sha=snapshot_row["commit_sha"],
+                status="failed",
+                provider=llm_config.provider,
+                model=llm_config.model,
+                is_mock=llm_config.provider == "mock",
+                error=stale_reason,
+                diagnostics=[
+                    "The API scanner only reads files stored in the selected "
+                    "repository snapshot.",
+                    "Repository include/exclude changes do not modify existing "
+                    "snapshots.",
+                ],
+            )
+
+    started_at = time.time()
+    try:
+        if llm_config.provider != "mock" and not is_reasoning_model(
+            llm_config.provider, llm_config.model
+        ):
+            raise LLMError(
+                "API definition scanning requires a configured reasoning model"
+            )
+        client = create_llm_client(llm_config)
+        digest = build_snapshot_digest(files)
+        scan = generate_api_scan(client, llm_config, digest)
+    except LLMError as exc:
+        scan = type("R", (), {
+            "provider": llm_config.provider, "model": llm_config.model,
+            "is_mock": llm_config.provider == "mock", "patterns": [],
+            "error": str(exc),
+        })()
+
+    extraction_diags: List[str] = []
+    extracted = []
+    if scan.error is None:
+        extracted, extraction_diags = apply_patterns(scan.patterns, files)
+
+    status = "completed" if scan.error is None else "failed"
+    now = time.time()
+
+    with get_conn() as conn:
+        conn.execute("BEGIN")
+        try:
+            cur = conn.execute(
+                """INSERT INTO intelligence_runs
+                       (system_id, snapshot_id, run_type, provider, model,
+                        prompt_version, schema_version, decision_method,
+                        status, error_details, is_mock, started_at, completed_at)
+                   VALUES (?, ?, 'api_scan', ?, ?, ?, ?, 'reasoning_llm',
+                           ?, ?, ?, ?, ?)""",
+                (
+                    system_id, snapshot_id, scan.provider, scan.model,
+                    SCAN_PROMPT_VERSION, SCAN_SCHEMA_VERSION, status,
+                    scan.error, 1 if scan.is_mock else 0, started_at, now,
+                ),
+            )
+            run_id = cur.lastrowid
+
+            if status == "completed":
+                # Replace any prior LLM-regex discovery for this snapshot so a
+                # re-scan is authoritative; deterministic rows are untouched.
+                conn.execute(
+                    "DELETE FROM code_entrypoints WHERE system_id = ? "
+                    "AND snapshot_id = ? AND source = 'reasoning_llm'",
+                    (system_id, snapshot_id),
+                )
+                pattern_ids = {}
+                for pat in scan.patterns:
+                    pcur = conn.execute(
+                        """INSERT INTO code_entrypoint_patterns
+                               (system_id, snapshot_id, intelligence_run_id,
+                                file_glob, regex, method_group, path_group,
+                                method_constant, framework, language, reason,
+                                confidence, match_count, examples_json, created_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            system_id, snapshot_id, run_id, pat.file_glob,
+                            pat.regex, pat.method_group, pat.path_group,
+                            pat.method_constant, pat.framework, pat.language,
+                            pat.reason, pat.confidence, 0,
+                            json.dumps([
+                                {"path": p, "line": ln} for p, ln in pat.examples
+                            ]),
+                            now,
+                        ),
+                    )
+                    pattern_ids[(pat.file_glob, pat.regex)] = (pcur.lastrowid, pat)
+
+                # Attribute each extracted entrypoint to the first pattern whose
+                # glob+framework matches, for the per-pattern match_count.
+                match_counts = {pid: 0 for pid, _ in pattern_ids.values()}
+                for ep in extracted:
+                    evidence_json = json.dumps([
+                        {"path": ev.path, "start_line": ev.start_line,
+                         "end_line": ev.end_line, "summary": ev.summary}
+                        for ev in ep.evidence
+                    ])
+                    matched_pid = None
+                    for pid, pat in pattern_ids.values():
+                        if ep.framework == pat.framework and fnmatch.fnmatch(
+                            ep.path, pat.file_glob
+                        ):
+                            matched_pid = pid
+                            break
+                    if matched_pid is not None:
+                        match_counts[matched_pid] = match_counts.get(matched_pid, 0) + 1
+                    conn.execute(
+                        """INSERT OR IGNORE INTO code_entrypoints
+                               (system_id, snapshot_id, entrypoint_type, entrypoint_id,
+                                category, label, operation, framework, handler_symbol_id,
+                                handler_path, handler_qualified_name, line_start, line_end,
+                                route_method, route_path, confidence, evidence_json,
+                                source, pattern_id, created_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?,
+                                   'reasoning_llm', ?, ?)""",
+                        (
+                            system_id, snapshot_id, ep.entrypoint_type,
+                            ep.entrypoint_id, ep.category, ep.label, ep.operation,
+                            ep.framework, ep.path, ep.qualified_name, ep.line_start,
+                            ep.line_end, ep.route_method, ep.route_path,
+                            ep.confidence, evidence_json, matched_pid, now,
+                        ),
+                    )
+                for pid, count in match_counts.items():
+                    conn.execute(
+                        "UPDATE code_entrypoint_patterns SET match_count = ? WHERE id = ?",
+                        (count, pid),
+                    )
+
+            pattern_rows = conn.execute(
+                "SELECT * FROM code_entrypoint_patterns WHERE intelligence_run_id = ? "
+                "ORDER BY confidence DESC, id",
+                (run_id,),
+            ).fetchall()
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    frameworks = sorted({p["framework"] for p in pattern_rows if p["framework"]})
+    return ApiScanResultOut(
+        system_id=system_id,
+        snapshot_id=snapshot_id,
+        commit_sha=snapshot_row["commit_sha"],
+        run_id=run_id,
+        status=status,
+        provider=scan.provider,
+        model=scan.model,
+        is_mock=scan.is_mock,
+        error=scan.error,
+        patterns=[_api_scan_pattern_out(p) for p in pattern_rows],
+        extracted_count=len(extracted) if status == "completed" else 0,
+        frameworks=frameworks,
+        diagnostics=extraction_diags,
+    )
+
+
+@router.get("/repository/api-scan", response_model=ApiScanResultOut)
+def get_api_scan(system_id: int = Depends(get_system_id)) -> ApiScanResultOut:
+    """Return the latest API scan (patterns + extracted count) for the snapshot."""
+    with get_conn() as conn:
+        snapshot_row = _latest_ready_snapshot(conn, system_id)
+        if snapshot_row is None:
+            return ApiScanResultOut(system_id=system_id, status="none")
+        snapshot_id = snapshot_row["id"]
+        run = conn.execute(
+            """SELECT * FROM intelligence_runs
+               WHERE system_id = ? AND snapshot_id = ? AND run_type = 'api_scan'
+               ORDER BY id DESC LIMIT 1""",
+            (system_id, snapshot_id),
+        ).fetchone()
+        if run is None:
+            return ApiScanResultOut(
+                system_id=system_id, snapshot_id=snapshot_id,
+                commit_sha=snapshot_row["commit_sha"], status="none",
+            )
+        pattern_rows = conn.execute(
+            "SELECT * FROM code_entrypoint_patterns WHERE intelligence_run_id = ? "
+            "ORDER BY confidence DESC, id",
+            (run["id"],),
+        ).fetchall()
+        extracted_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM code_entrypoints WHERE system_id = ? "
+            "AND snapshot_id = ? AND source = 'reasoning_llm'",
+            (system_id, snapshot_id),
+        ).fetchone()["c"]
+
+    frameworks = sorted({p["framework"] for p in pattern_rows if p["framework"]})
+    return ApiScanResultOut(
+        system_id=system_id,
+        snapshot_id=snapshot_id,
+        commit_sha=snapshot_row["commit_sha"],
+        run_id=run["id"],
+        status=run["status"],
+        provider=run["provider"],
+        model=run["model"],
+        is_mock=bool(run["is_mock"]),
+        error=run["error_details"],
+        patterns=[_api_scan_pattern_out(p) for p in pattern_rows],
+        extracted_count=extracted_count,
+        frameworks=frameworks,
+        diagnostics=[],
     )
 
 
@@ -2051,11 +2558,14 @@ def build_flow_graph_endpoint(
     payload: FlowGraphRequest,
     system_id: int = Depends(get_system_id),
 ) -> FlowGraphOut:
+    from ..entrypoint_discovery import discover_entrypoints
     from ..flow_graph import build_flow_graph
 
     snapshot_row, symbols, files = _load_flow_inputs(
         system_id, payload.snapshot_id, payload.commit_sha,
     )
+    llm_eps = _load_persisted_api_entrypoints(system_id, snapshot_row["id"])
+    discovery = discover_entrypoints(symbols, files, persisted_api=llm_eps)
     graph = build_flow_graph(
         symbols=symbols,
         files=files,
@@ -2065,14 +2575,33 @@ def build_flow_graph_endpoint(
         entrypoint_id=payload.entrypoint_id,
         max_depth=payload.max_depth,
         max_nodes=payload.max_nodes,
+        entrypoints=discovery.entrypoints + discovery.functions,
     )
     if graph is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Entrypoint not found in snapshot: {payload.entrypoint_id}",
-        )
+        _raise_entrypoint_not_found(payload.entrypoint_id, llm_eps)
     _overlay_runtime(system_id, graph)
     return _flow_graph_out(system_id, graph)
+
+
+def _raise_entrypoint_not_found(entrypoint_id: str, llm_eps) -> None:
+    """Raise a 404, or a clearer 422 for LLM-discovered API entrypoints.
+
+    Entrypoints recovered from LLM-generated regexes have no resolved handler
+    symbol, so a deterministic call tree cannot be rooted from them yet.
+    """
+    if any(e.entrypoint_id == entrypoint_id for e in llm_eps):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This API was detected by an LLM-generated regex and is not yet "
+                "mapped to a handler symbol, so a process tree cannot be built "
+                "from it. It is listed for visibility only."
+            ),
+        )
+    raise HTTPException(
+        status_code=404,
+        detail=f"Entrypoint not found in snapshot: {entrypoint_id}",
+    )
 
 
 def _component_id_for(qualified_name: str) -> str:
@@ -2095,6 +2624,7 @@ def create_probe_plan_from_flow(
     This is an explicit, user-driven selection (decision_method=manual). It
     only records a draft; it does not generate, apply, or run any patch.
     """
+    from ..entrypoint_discovery import discover_entrypoints
     from ..flow_graph import (
         build_edge_preview,
         build_flow_graph,
@@ -2104,6 +2634,8 @@ def create_probe_plan_from_flow(
     snapshot_row, symbols, files = _load_flow_inputs(
         system_id, payload.snapshot_id, payload.commit_sha,
     )
+    llm_eps = _load_persisted_api_entrypoints(system_id, snapshot_row["id"])
+    discovery = discover_entrypoints(symbols, files, persisted_api=llm_eps)
     graph = build_flow_graph(
         symbols=symbols,
         files=files,
@@ -2113,12 +2645,10 @@ def create_probe_plan_from_flow(
         entrypoint_id=payload.entrypoint_id,
         max_depth=payload.max_depth,
         max_nodes=payload.max_nodes,
+        entrypoints=discovery.entrypoints + discovery.functions,
     )
     if graph is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Entrypoint not found in snapshot: {payload.entrypoint_id}",
-        )
+        _raise_entrypoint_not_found(payload.entrypoint_id, llm_eps)
 
     nodes_by_id = {n.node_id: n for n in graph.nodes}
     edges_by_id = {e.edge_id: e for e in graph.edges}

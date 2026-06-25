@@ -188,6 +188,12 @@ export interface LatestDraftsOut {
   feature_drafts: FeatureDraftOut[];
 }
 
+export interface DraftGenerationResultOut {
+  intelligence_run: IntelligenceRunOut;
+  system_profile_draft: SystemProfileDraftOut | null;
+  feature_drafts: FeatureDraftOut[];
+}
+
 export interface CodeSymbolOut {
   id: number;
   snapshot_id: number;
@@ -326,6 +332,47 @@ export interface FlowEntrypointOut {
   operation: string | null;
   confidence: number;
   evidence: EvidenceRefOut[];
+  source?: string;
+}
+
+export interface ApiScanPatternOut {
+  id: number | null;
+  file_glob: string;
+  regex: string;
+  method_group: string | null;
+  path_group: string | null;
+  method_constant: string | null;
+  framework: string;
+  language: string;
+  reason: string;
+  confidence: number;
+  match_count: number;
+  examples: EvidenceRefOut[];
+}
+
+export interface ApiScanResultOut {
+  system_id: number;
+  snapshot_id: number | null;
+  commit_sha: string | null;
+  run_id: number | null;
+  status: string;
+  decision_method: string;
+  provider: string | null;
+  model: string | null;
+  is_mock: boolean;
+  error: string | null;
+  patterns: ApiScanPatternOut[];
+  extracted_count: number;
+  frameworks: string[];
+  diagnostics: string[];
+}
+
+export interface EntrypointCountsOut {
+  api: number;
+  message_queue: number;
+  scheduled_job: number;
+  cli: number;
+  function: number;
 }
 
 export interface FlowEntrypointsOut {
@@ -334,6 +381,12 @@ export interface FlowEntrypointsOut {
   commit_sha: string | null;
   total: number;
   entrypoints: FlowEntrypointOut[];
+  functions: FlowEntrypointOut[];
+  counts: EntrypointCountsOut;
+  indexed_function_count: number;
+  has_backend_entrypoints: boolean;
+  frameworks: string[];
+  diagnostics: string[];
 }
 
 export interface FlowNodeOut {
