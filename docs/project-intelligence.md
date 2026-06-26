@@ -340,6 +340,95 @@ CLAUDE.md 原則 6 / reasoning-llm skill に従う:
   上限を調整する。reasoning model の選択は既存の `INTELLIGENCE_LLM_PROVIDER` /
   `INTELLIGENCE_LLM_MODEL`（未設定時は `LLM_PROVIDER` / `LLM_MODEL`）に従う。
 
+## ソース由来の説明メタデータ（Issue #54）
+
+Flow Explorer は API を probe 設定の候補として列挙できるようになったが、
+ソースコードと「システムの目的・中核能力・補助/境界要素・probe 価値」を結ぶ
+共有の説明レイヤーが欠けていた。#54 では、その説明の**原本を対象リポジトリの
+ソース側（docstring）に置く**ための最小フォーマットと、pinned snapshot からの
+**決定的な抽出規則**を定義する。`probe-agent` は説明をリポジトリ側に書き戻さず、
+スナップショットから抽出したコピーを索引するだけである（原本の authoring 場所
+にはならない）。
+
+このメタデータは**著者が書いた事実（source-authored）**であり、CLAUDE.md 原則 7
+に従って reasoning-model の解釈とは**保存・API の両方で分離**する。`origin` は
+常に `source_authored` で、symbol index run の `decision_method` は
+`deterministic` のままにする。自由文から意味を推測してはならない。
+
+### フォーマット
+
+module / class / function の docstring 内に、`probe-agent:` 行で始まる小さな
+構造化ブロックを埋め込む。ブロック本体は marker よりも深くインデントした
+YAML マッピングで、PEP 257 で正規化された docstring に対して解釈する。
+
+```python
+def build_flow_graph(...):
+    """
+    Build a candidate execution flow from a backend entrypoint.
+
+    probe-agent:
+      role: API endpoint for deterministic flow graph construction
+      capability: execution-flow-understanding
+      element_type: core
+      consumers: [dashboard]
+      operation_kind: analysis
+      state_effects: [database-read]
+      probe_value: Validate graph shape, unresolved edges, and external-boundary detection.
+    """
+```
+
+すべての symbol で**任意**であり、ブロックが無ければメタデータは生成されない。
+
+### 語彙
+
+| キー | 型 | 説明 |
+| --- | --- | --- |
+| `role` | string（自由文） | API / backend entrypoint としての役割。原文のままコピーする。 |
+| `capability` | string（自由文） | この symbol が属する中核能力の識別子。 |
+| `element_type` | enum | 階層上の位置。`system` / `core` / `capability` / `element` / `supporting` / `boundary`。 |
+| `system_purpose` | string（自由文） | 通常 module docstring に置く、システム全体の目的。 |
+| `operation_kind` | enum | `analysis` / `read` / `write` / `mutation` / `io` / `orchestration` / `validation` / `other`。 |
+| `consumers` | list[string]（自由文） | この能力の利用者（例: `[dashboard]`）。 |
+| `state_effects` | list[enum] | 各要素は `none` / `database-read` / `database-write` / `network` / `filesystem` / `cache` / `external-api` / `queue`。 |
+| `probe_value` | string（自由文） | probe する価値の説明。 |
+
+enum / enum list は CLAUDE.md 原則 6 に沿って**明示的な有限集合**に限定し、
+自由文フィールドは検証せずそのままコピーする。
+
+### 抽出規則（決定的）
+
+- 対象コードを**実行しない**。docstring は AST 上の文字列リテラルとして読む。
+- pinned snapshot の committed files のみを対象とし、working tree は読まない。
+- `probe-agent:` ブロックを検出し、YAML として `yaml.safe_load` する。
+- 既知キーは型 / enum を検証し、`start_line` / `end_line`（snapshot 上のブロック
+  行範囲）と原文 `raw_block` を保持する。
+- **不正・未知のメタデータは決定的な index warning** として記録し、symbol index
+  全体を失敗させない。
+  - YAML パース失敗、マッピングでない、空ブロック → メタデータ無し + warning。
+  - 未知キー、型不一致、enum 範囲外 → 当該フィールドを破棄して warning。妥当な
+    フィールドは保持する。
+  - 妥当なフィールドが 1 つも無い → メタデータ無し + warning。
+
+### 永続化と API
+
+- `symbol_source_metadata`（system-scoped・追加のみの新規テーブル）に、
+  `snapshot_id` / `system_id` / `symbol_id` / `path` / `qualified_name` /
+  ブロック行範囲 / 各フィールド / `raw_block` / `origin='source_authored'` を
+  保存する。symbol index run の中で deterministic 事実として 1 トランザクション
+  で書き込み、reasoning 出力テーブルとは分離する。
+- `GET /repository/symbols` と `POST /repository/symbols/index` の
+  `CodeSymbolOut.source_metadata` として typed に公開する。これにより次の
+  hierarchy issue が型付きで参照できる。
+- 不正メタデータは `symbol_index_warnings` に
+  `"<qualified_name>: probe-agent metadata: <detail>"` 形式で残す。
+
+### 非対象（#54）
+
+- ソースの自動改変、リポジトリへのメタデータ書き戻し。
+- LLM 生成メタデータ。
+- drift スコアリングや完全な階層・refresh ワークフロー。
+- 自由文からのヒューリスティックな最終分類。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。

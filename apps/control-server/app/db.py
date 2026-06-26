@@ -377,6 +377,42 @@ CREATE TABLE IF NOT EXISTS symbol_index_warnings (
 CREATE INDEX IF NOT EXISTS idx_symbol_warnings_snapshot
     ON symbol_index_warnings (snapshot_id);
 
+-- Source-anchored explanation metadata (Issue #54).  Author-written facts
+-- copied verbatim from docstrings of a pinned snapshot.  Kept separate from
+-- reasoning-model interpretations; origin is always 'source_authored'.
+CREATE TABLE IF NOT EXISTS symbol_source_metadata (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id     INTEGER NOT NULL,
+    system_id       INTEGER NOT NULL,
+    symbol_id       INTEGER NOT NULL,
+    path            TEXT NOT NULL,
+    qualified_name  TEXT NOT NULL,
+    start_line      INTEGER NOT NULL,
+    end_line        INTEGER NOT NULL,
+    role            TEXT,
+    capability      TEXT,
+    element_type    TEXT,
+    system_purpose  TEXT,
+    operation_kind  TEXT,
+    consumers       TEXT NOT NULL DEFAULT '[]',
+    state_effects   TEXT NOT NULL DEFAULT '[]',
+    probe_value     TEXT,
+    raw_block       TEXT NOT NULL,
+    origin          TEXT NOT NULL DEFAULT 'source_authored',
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (symbol_id) REFERENCES code_symbols (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_symbol_source_metadata_snapshot
+    ON symbol_source_metadata (snapshot_id);
+
+CREATE INDEX IF NOT EXISTS idx_symbol_source_metadata_symbol
+    ON symbol_source_metadata (symbol_id);
+
+CREATE INDEX IF NOT EXISTS idx_symbol_source_metadata_system
+    ON symbol_source_metadata (system_id, snapshot_id);
+
 CREATE TABLE IF NOT EXISTS code_entrypoints (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     system_id               INTEGER NOT NULL,

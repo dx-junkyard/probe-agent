@@ -48,6 +48,7 @@ from ..models import (
     FlowNodeOut,
     ProbePlanFromFlowRequest,
     ProbePreviewOut,
+    SourceMetadataOut,
     FeatureCodeLinkOut,
     FeatureCodeLinksOut,
     FeatureDraftOut,
@@ -839,7 +840,33 @@ def get_latest_drafts(
 # ---------------------------------------------------------------------------
 
 
-def _symbol_out(row) -> CodeSymbolOut:
+def _metadata_out(row) -> SourceMetadataOut:
+    return SourceMetadataOut(
+        start_line=row["start_line"],
+        end_line=row["end_line"],
+        raw_block=row["raw_block"],
+        role=row["role"],
+        capability=row["capability"],
+        element_type=row["element_type"],
+        system_purpose=row["system_purpose"],
+        operation_kind=row["operation_kind"],
+        consumers=json.loads(row["consumers"]),
+        state_effects=json.loads(row["state_effects"]),
+        probe_value=row["probe_value"],
+        origin=row["origin"],
+    )
+
+
+def _load_metadata_map(conn, snapshot_id: int) -> dict:
+    """Return ``symbol_id -> SourceMetadataOut`` for a snapshot."""
+    rows = conn.execute(
+        "SELECT * FROM symbol_source_metadata WHERE snapshot_id = ?",
+        (snapshot_id,),
+    ).fetchall()
+    return {r["symbol_id"]: _metadata_out(r) for r in rows}
+
+
+def _symbol_out(row, metadata: Optional[SourceMetadataOut] = None) -> CodeSymbolOut:
     return CodeSymbolOut(
         id=row["id"],
         snapshot_id=row["snapshot_id"],
@@ -857,6 +884,7 @@ def _symbol_out(row) -> CodeSymbolOut:
         route_path=row["route_path"],
         route_method=row["route_method"],
         component_id=row["component_id"],
+        source_metadata=metadata,
     )
 
 
@@ -906,12 +934,13 @@ def index_symbols_endpoint(
                 """,
                 (system_id, snapshot_id),
             ).fetchone()
+            meta_map = _load_metadata_map(conn, snapshot_id)
             return SymbolIndexOut(
                 snapshot_id=snapshot_id,
                 system_id=system_id,
                 symbol_count=len(sym_rows),
                 warning_count=len(warn_rows),
-                symbols=[_symbol_out(r) for r in sym_rows],
+                symbols=[_symbol_out(r, meta_map.get(r["id"])) for r in sym_rows],
                 warnings=[
                     SymbolIndexWarningOut(path=w["path"], message=w["message"])
                     for w in warn_rows
@@ -952,7 +981,7 @@ def index_symbols_endpoint(
             run_id = cur.lastrowid
 
             for sym in result.symbols:
-                conn.execute(
+                sym_cur = conn.execute(
                     """
                     INSERT INTO code_symbols
                         (snapshot_id, system_id, path, qualified_name, kind,
@@ -979,6 +1008,38 @@ def index_symbols_endpoint(
                         sym.component_id,
                     ),
                 )
+                meta = sym.source_metadata
+                if meta is not None:
+                    conn.execute(
+                        """
+                        INSERT INTO symbol_source_metadata
+                            (snapshot_id, system_id, symbol_id, path,
+                             qualified_name, start_line, end_line, role,
+                             capability, element_type, system_purpose,
+                             operation_kind, consumers, state_effects,
+                             probe_value, raw_block, origin)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            snapshot_id,
+                            system_id,
+                            sym_cur.lastrowid,
+                            sym.path,
+                            sym.qualified_name,
+                            meta.start_line,
+                            meta.end_line,
+                            meta.role,
+                            meta.capability,
+                            meta.element_type,
+                            meta.system_purpose,
+                            meta.operation_kind,
+                            json.dumps(meta.consumers),
+                            json.dumps(meta.state_effects),
+                            meta.probe_value,
+                            meta.raw_block,
+                            meta.origin,
+                        ),
+                    )
 
             for warn in result.warnings:
                 conn.execute(
@@ -1004,6 +1065,7 @@ def index_symbols_endpoint(
                 "SELECT * FROM intelligence_runs WHERE id = ?",
                 (run_id,),
             ).fetchone()
+            meta_map = _load_metadata_map(conn, snapshot_id)
         except Exception:
             conn.execute("ROLLBACK")
             raise
@@ -1013,7 +1075,7 @@ def index_symbols_endpoint(
         system_id=system_id,
         symbol_count=len(sym_rows),
         warning_count=len(warn_rows),
-        symbols=[_symbol_out(r) for r in sym_rows],
+        symbols=[_symbol_out(r, meta_map.get(r["id"])) for r in sym_rows],
         warnings=[
             SymbolIndexWarningOut(path=w["path"], message=w["message"])
             for w in warn_rows
@@ -1059,13 +1121,14 @@ def get_symbols(
             """,
             (system_id, snapshot_id),
         ).fetchone()
+        meta_map = _load_metadata_map(conn, snapshot_id)
 
     return SymbolIndexOut(
         snapshot_id=snapshot_id,
         system_id=system_id,
         symbol_count=len(sym_rows),
         warning_count=len(warn_rows),
-        symbols=[_symbol_out(r) for r in sym_rows],
+        symbols=[_symbol_out(r, meta_map.get(r["id"])) for r in sym_rows],
         warnings=[
             SymbolIndexWarningOut(path=w["path"], message=w["message"])
             for w in warn_rows

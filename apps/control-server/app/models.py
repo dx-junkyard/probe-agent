@@ -518,6 +518,36 @@ LinkSource = Literal["reasoning_llm", "manual"]
 LinkReviewStatus = Literal["proposed", "accepted", "rejected"]
 
 
+SourceMetadataElementType = Literal[
+    "system", "core", "capability", "element", "supporting", "boundary"
+]
+SourceMetadataOperationKind = Literal[
+    "analysis", "read", "write", "mutation", "io", "orchestration",
+    "validation", "other",
+]
+
+
+class SourceMetadataOut(BaseModel):
+    """Author-written, source-anchored explanation copied from a docstring.
+
+    These facts are deterministic / source-authored and are kept separate from
+    reasoning-model interpretations.  ``origin`` is always ``source_authored``.
+    """
+
+    start_line: int
+    end_line: int
+    raw_block: str
+    role: Optional[str] = None
+    capability: Optional[str] = None
+    element_type: Optional[SourceMetadataElementType] = None
+    system_purpose: Optional[str] = None
+    operation_kind: Optional[SourceMetadataOperationKind] = None
+    consumers: List[str] = Field(default_factory=list)
+    state_effects: List[str] = Field(default_factory=list)
+    probe_value: Optional[str] = None
+    origin: Literal["source_authored"] = "source_authored"
+
+
 class CodeSymbolOut(BaseModel):
     id: int
     snapshot_id: int
@@ -535,6 +565,7 @@ class CodeSymbolOut(BaseModel):
     route_path: Optional[str] = None
     route_method: Optional[str] = None
     component_id: Optional[str] = None
+    source_metadata: Optional[SourceMetadataOut] = None
 
 
 class SymbolIndexWarningOut(BaseModel):

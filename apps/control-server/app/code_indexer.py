@@ -9,7 +9,96 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
+
+import yaml
+
+
+# ---------------------------------------------------------------------------
+# Source-anchored explanation metadata (Issue #54)
+#
+# Target repositories may embed a small, optional structured block inside a
+# module / class / function docstring describing the symbol's role in the
+# system.  The block is author-written (source-authored) and is copied
+# verbatim into the index; probe-agent never infers meaning from free text and
+# never writes this metadata back to the target repository.  See
+# docs/project-intelligence.md for the documented vocabulary.
+# ---------------------------------------------------------------------------
+
+#: Marker line that opens the metadata block inside a docstring.
+SOURCE_METADATA_MARKER = "probe-agent:"
+
+#: Free-text string fields (copied verbatim, never interpreted).
+_METADATA_STRING_FIELDS = {"role", "capability", "system_purpose", "probe_value"}
+
+#: Free-form list-of-string fields.
+_METADATA_LIST_FIELDS = {"consumers"}
+
+#: Enumerated single-value fields constrained to explicit finite sets.
+_METADATA_ENUM_FIELDS: Dict[str, set] = {
+    "element_type": {
+        "system",
+        "core",
+        "capability",
+        "element",
+        "supporting",
+        "boundary",
+    },
+    "operation_kind": {
+        "analysis",
+        "read",
+        "write",
+        "mutation",
+        "io",
+        "orchestration",
+        "validation",
+        "other",
+    },
+}
+
+#: Enumerated list-value fields whose every item must be in an explicit set.
+_METADATA_ENUM_LIST_FIELDS: Dict[str, set] = {
+    "state_effects": {
+        "none",
+        "database-read",
+        "database-write",
+        "network",
+        "filesystem",
+        "cache",
+        "external-api",
+        "queue",
+    },
+}
+
+_METADATA_KNOWN_KEYS = (
+    _METADATA_STRING_FIELDS
+    | _METADATA_LIST_FIELDS
+    | set(_METADATA_ENUM_FIELDS)
+    | set(_METADATA_ENUM_LIST_FIELDS)
+)
+
+
+@dataclass
+class SourceMetadata:
+    """Author-written explanation metadata extracted from a docstring block.
+
+    ``origin`` is always ``source_authored`` to keep these facts separate from
+    reasoning-model interpretations.  ``start_line``/``end_line`` point at the
+    block inside the pinned snapshot for review.
+    """
+
+    start_line: int
+    end_line: int
+    raw_block: str
+    role: Optional[str] = None
+    capability: Optional[str] = None
+    element_type: Optional[str] = None
+    system_purpose: Optional[str] = None
+    operation_kind: Optional[str] = None
+    consumers: List[str] = field(default_factory=list)
+    state_effects: List[str] = field(default_factory=list)
+    probe_value: Optional[str] = None
+    origin: str = "source_authored"
 
 
 @dataclass
@@ -27,6 +116,7 @@ class CodeSymbol:
     route_path: Optional[str] = None
     route_method: Optional[str] = None
     component_id: Optional[str] = None
+    source_metadata: Optional[SourceMetadata] = None
 
 
 @dataclass
@@ -139,6 +229,171 @@ def _get_docstring(node: ast.AST) -> Optional[str]:
         return None
 
 
+def _docstring_node(node: ast.AST) -> Optional[ast.Constant]:
+    """Return the Constant node holding the symbol's docstring, if any."""
+    body = getattr(node, "body", None)
+    if not body:
+        return None
+    first = body[0]
+    if (
+        isinstance(first, ast.Expr)
+        and isinstance(first.value, ast.Constant)
+        and isinstance(first.value.value, str)
+    ):
+        return first.value
+    return None
+
+
+def _leading_indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _extract_metadata_block(raw_doc: str) -> Optional[Tuple[int, int, str]]:
+    """Locate the ``probe-agent:`` block inside the raw docstring text.
+
+    Returns ``(marker_line_index, last_block_line_index, dedented_block)`` using
+    0-based indices into ``raw_doc`` split on ``\\n``.  Indices are relative to
+    the start of the string literal so callers can offset by the literal's
+    source line.  Returns ``None`` when no marker is present.
+    """
+    lines = raw_doc.split("\n")
+    for idx, line in enumerate(lines):
+        if line.strip() != SOURCE_METADATA_MARKER:
+            continue
+        marker_indent = _leading_indent(line)
+        block_lines: List[str] = []
+        last_idx = idx
+        for offset in range(idx + 1, len(lines)):
+            candidate = lines[offset]
+            if candidate.strip() == "":
+                # Blank lines are tolerated only between block entries.
+                block_lines.append("")
+                continue
+            if _leading_indent(candidate) <= marker_indent:
+                break
+            block_lines.append(candidate)
+            last_idx = offset
+        # Trim trailing blank lines that were optimistically appended.
+        while block_lines and block_lines[-1].strip() == "":
+            block_lines.pop()
+        if not block_lines:
+            return idx, idx, ""
+        common = min(
+            _leading_indent(bl) for bl in block_lines if bl.strip() != ""
+        )
+        dedented = "\n".join(bl[common:] if bl.strip() else "" for bl in block_lines)
+        return idx, last_idx, dedented
+    return None
+
+
+def _validate_metadata_fields(
+    parsed: dict,
+) -> Tuple[Dict[str, object], List[str]]:
+    """Validate parsed key/value pairs against the explicit vocabulary.
+
+    Returns ``(valid_fields, warnings)``.  Unknown keys, wrong types, and
+    out-of-set enum values become deterministic warnings; valid fields are
+    retained.  Free text is never interpreted.
+    """
+    valid: Dict[str, object] = {}
+    warnings: List[str] = []
+
+    for key, value in parsed.items():
+        if not isinstance(key, str) or key not in _METADATA_KNOWN_KEYS:
+            warnings.append(f"unknown metadata key {key!r}")
+            continue
+        if key in _METADATA_STRING_FIELDS:
+            if isinstance(value, str) and value.strip():
+                valid[key] = value.strip()
+            else:
+                warnings.append(f"field {key!r} must be a non-empty string")
+        elif key in _METADATA_LIST_FIELDS:
+            if isinstance(value, list) and all(isinstance(v, str) for v in value):
+                valid[key] = [v.strip() for v in value if v.strip()]
+            else:
+                warnings.append(f"field {key!r} must be a list of strings")
+        elif key in _METADATA_ENUM_FIELDS:
+            allowed = _METADATA_ENUM_FIELDS[key]
+            if isinstance(value, str) and value in allowed:
+                valid[key] = value
+            else:
+                warnings.append(
+                    f"field {key!r} must be one of {sorted(allowed)}"
+                )
+        elif key in _METADATA_ENUM_LIST_FIELDS:
+            allowed = _METADATA_ENUM_LIST_FIELDS[key]
+            if isinstance(value, list) and all(v in allowed for v in value):
+                valid[key] = list(value)
+            else:
+                warnings.append(
+                    f"field {key!r} must be a list of {sorted(allowed)}"
+                )
+
+    return valid, warnings
+
+
+def _parse_source_metadata(
+    node: ast.AST,
+) -> Tuple[Optional[SourceMetadata], List[str]]:
+    """Extract and validate the ``probe-agent:`` block for a single symbol.
+
+    Returns ``(metadata_or_none, warning_messages)``.  Parsing never executes
+    target code (the docstring is already a literal) and never fails the
+    surrounding index.
+    """
+    doc_node = _docstring_node(node)
+    if doc_node is None:
+        return None, []
+    raw_doc = doc_node.value
+    if SOURCE_METADATA_MARKER not in raw_doc:
+        return None, []
+
+    located = _extract_metadata_block(raw_doc)
+    if located is None:
+        return None, []
+    marker_idx, last_idx, block_text = located
+
+    doc_start = getattr(doc_node, "lineno", None)
+    if doc_start is None:
+        return None, ["probe-agent metadata: cannot resolve source location"]
+    block_start = doc_start + marker_idx
+    block_end = doc_start + last_idx
+
+    if not block_text.strip():
+        return None, ["probe-agent metadata: empty block"]
+
+    try:
+        parsed = yaml.safe_load(block_text)
+    except yaml.YAMLError as exc:
+        first = str(exc).splitlines()[0] if str(exc) else "parse error"
+        return None, [f"probe-agent metadata: invalid YAML ({first})"]
+
+    if not isinstance(parsed, dict):
+        return None, ["probe-agent metadata: block must be a key/value mapping"]
+
+    valid, field_warnings = _validate_metadata_fields(parsed)
+    warnings = [f"probe-agent metadata: {w}" for w in field_warnings]
+
+    if not valid:
+        warnings.append("probe-agent metadata: no recognized fields")
+        return None, warnings
+
+    metadata = SourceMetadata(
+        start_line=block_start,
+        end_line=block_end,
+        raw_block=block_text,
+        role=valid.get("role"),
+        capability=valid.get("capability"),
+        element_type=valid.get("element_type"),
+        system_purpose=valid.get("system_purpose"),
+        operation_kind=valid.get("operation_kind"),
+        consumers=list(valid.get("consumers", [])),
+        state_effects=list(valid.get("state_effects", [])),
+        probe_value=valid.get("probe_value"),
+    )
+    return metadata, warnings
+
+
 def _is_test_function(name: str, path: str) -> bool:
     return name.startswith("test_") or name.endswith("_test")
 
@@ -149,14 +404,42 @@ def _end_line(node: ast.AST) -> int:
     return getattr(node, "lineno", 0)
 
 
-def index_python_file(path: str, source: str) -> Tuple[List[CodeSymbol], List[ImportInfo], Optional[IndexWarning]]:
+@dataclass
+class FileIndexResult:
+    symbols: List[CodeSymbol]
+    imports: List[ImportInfo]
+    warnings: List[IndexWarning]
+
+
+def index_python_file(
+    path: str, source: str
+) -> Tuple[List[CodeSymbol], List[ImportInfo], Optional[IndexWarning]]:
+    """Backward-compatible wrapper returning a single optional warning.
+
+    Use :func:`index_python_file_full` to receive every warning, including
+    per-symbol source-metadata warnings.
+    """
+    result = index_python_file_full(path, source)
+    return result.symbols, result.imports, result.warnings[0] if result.warnings else None
+
+
+def index_python_file_full(path: str, source: str) -> FileIndexResult:
     try:
         tree = ast.parse(source, filename=path)
     except SyntaxError as exc:
-        return [], [], IndexWarning(path=path, message=f"SyntaxError: {exc}")
+        return FileIndexResult([], [], [IndexWarning(path=path, message=f"SyntaxError: {exc}")])
 
     symbols: List[CodeSymbol] = []
     imports: List[ImportInfo] = []
+    warnings: List[IndexWarning] = []
+
+    def _attach_metadata(node: ast.AST, symbol: CodeSymbol) -> None:
+        metadata, messages = _parse_source_metadata(node)
+        symbol.source_metadata = metadata
+        for message in messages:
+            warnings.append(
+                IndexWarning(path=path, message=f"{symbol.qualified_name}: {message}")
+            )
 
     module_name = path.replace("/", ".").removesuffix(".py")
     if module_name.endswith(".__init__"):
@@ -187,7 +470,7 @@ def index_python_file(path: str, source: str) -> Tuple[List[CodeSymbol], List[Im
         (getattr(node, "end_lineno", None) or getattr(node, "lineno", 1))
         for node in tree.body
     ) if tree.body else 1
-    symbols.append(CodeSymbol(
+    module_symbol = CodeSymbol(
         path=path,
         qualified_name=module_name,
         kind="module",
@@ -195,7 +478,9 @@ def index_python_file(path: str, source: str) -> Tuple[List[CodeSymbol], List[Im
         end_line=module_end_line,
         imports=import_names,
         docstring=_get_docstring(tree),
-    ))
+    )
+    _attach_metadata(tree, module_symbol)
+    symbols.append(module_symbol)
 
     def _visit(node: ast.AST, prefix: str) -> None:
         for child in ast.iter_child_nodes(node):
@@ -206,7 +491,7 @@ def index_python_file(path: str, source: str) -> Tuple[List[CodeSymbol], List[Im
                 component_id = _extract_component_id(child.decorator_list)
                 is_test = _is_test_function(child.name, path)
                 kind = "async_function" if isinstance(child, ast.AsyncFunctionDef) else "function"
-                symbols.append(CodeSymbol(
+                func_symbol = CodeSymbol(
                     path=path,
                     qualified_name=qname,
                     kind=kind,
@@ -218,14 +503,16 @@ def index_python_file(path: str, source: str) -> Tuple[List[CodeSymbol], List[Im
                     route_path=route_path,
                     route_method=route_method,
                     component_id=component_id,
-                ))
+                )
+                _attach_metadata(child, func_symbol)
+                symbols.append(func_symbol)
                 _visit(child, qname)
 
             elif isinstance(child, ast.ClassDef):
                 qname = f"{prefix}.{child.name}" if prefix else child.name
                 decorator_strs = [_decorator_str(d) for d in child.decorator_list]
                 pydantic = _is_pydantic_model(child)
-                symbols.append(CodeSymbol(
+                class_symbol = CodeSymbol(
                     path=path,
                     qualified_name=qname,
                     kind="class",
@@ -234,11 +521,13 @@ def index_python_file(path: str, source: str) -> Tuple[List[CodeSymbol], List[Im
                     decorators=decorator_strs,
                     docstring=_get_docstring(child),
                     is_pydantic_model=pydantic,
-                ))
+                )
+                _attach_metadata(child, class_symbol)
+                symbols.append(class_symbol)
                 _visit(child, qname)
 
     _visit(tree, "")
-    return symbols, imports, None
+    return FileIndexResult(symbols=symbols, imports=imports, warnings=warnings)
 
 
 def index_snapshot_files(
@@ -257,10 +546,9 @@ def index_snapshot_files(
             warnings.append(IndexWarning(path=path, message="Cannot decode file as UTF-8"))
             continue
 
-        syms, imps, warn = index_python_file(path, source)
-        all_symbols.extend(syms)
-        all_imports.extend(imps)
-        if warn:
-            warnings.append(warn)
+        result = index_python_file_full(path, source)
+        all_symbols.extend(result.symbols)
+        all_imports.extend(result.imports)
+        warnings.extend(result.warnings)
 
     return IndexResult(symbols=all_symbols, imports=all_imports, warnings=warnings)
