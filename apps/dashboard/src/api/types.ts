@@ -223,6 +223,8 @@ export interface SourceMetadataOut {
   state_effects: string[];
   probe_value: string | null;
   origin: "source_authored";
+  // sha256 of the extracted explanation block (Issue #55); change signal only.
+  explanation_hash: string | null;
 }
 
 export interface CodeSymbolOut {
@@ -243,6 +245,33 @@ export interface CodeSymbolOut {
   route_method: string | null;
   component_id: string | null;
   source_metadata: SourceMetadataOut | null;
+  // Source-hash provenance (Issue #55). Change signals, not semantic equality.
+  file_content_hash: string | null;
+  symbol_source_hash: string | null;
+  symbol_body_hash: string | null;
+}
+
+export interface ExplanationAnchorOut {
+  id: number;
+  snapshot_id: number;
+  system_id: number;
+  metadata_id: number;
+  symbol_id: number;
+  path: string;
+  qualified_name: string;
+  start_line: number;
+  end_line: number;
+  file_content_hash: string | null;
+  symbol_source_hash: string | null;
+  symbol_body_hash: string | null;
+  explanation_hash: string | null;
+}
+
+export interface ExplanationAnchorsOut {
+  system_id: number;
+  snapshot_id: number;
+  anchor_count: number;
+  anchors: ExplanationAnchorOut[];
 }
 
 export interface SymbolIndexOut {

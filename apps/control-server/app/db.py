@@ -351,6 +351,8 @@ CREATE TABLE IF NOT EXISTS code_symbols (
     route_path      TEXT,
     route_method    TEXT,
     component_id    TEXT,
+    symbol_source_hash TEXT,
+    symbol_body_hash   TEXT,
     FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
 );
@@ -399,6 +401,7 @@ CREATE TABLE IF NOT EXISTS symbol_source_metadata (
     probe_value     TEXT,
     raw_block       TEXT NOT NULL,
     origin          TEXT NOT NULL DEFAULT 'source_authored',
+    explanation_hash TEXT,
     FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
     FOREIGN KEY (symbol_id) REFERENCES code_symbols (id) ON DELETE CASCADE
@@ -412,6 +415,37 @@ CREATE INDEX IF NOT EXISTS idx_symbol_source_metadata_symbol
 
 CREATE INDEX IF NOT EXISTS idx_symbol_source_metadata_system
     ON symbol_source_metadata (system_id, snapshot_id);
+
+-- Explanation-to-source dependency anchors (Issue #55).  Each source-authored
+-- explanation records the deterministic provenance it depends on: the file,
+-- the symbol span, and the three hash types.  Downstream drift features compare
+-- these hashes against a newer snapshot.  Hash equality is only a change
+-- signal, never proof of semantic equality.
+CREATE TABLE IF NOT EXISTS explanation_source_anchors (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id        INTEGER NOT NULL,
+    system_id          INTEGER NOT NULL,
+    metadata_id        INTEGER NOT NULL,
+    symbol_id          INTEGER NOT NULL,
+    path               TEXT NOT NULL,
+    qualified_name     TEXT NOT NULL,
+    start_line         INTEGER NOT NULL,
+    end_line           INTEGER NOT NULL,
+    file_content_hash  TEXT,
+    symbol_source_hash TEXT,
+    symbol_body_hash   TEXT,
+    explanation_hash   TEXT,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (metadata_id) REFERENCES symbol_source_metadata (id) ON DELETE CASCADE,
+    FOREIGN KEY (symbol_id) REFERENCES code_symbols (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_explanation_anchors_snapshot
+    ON explanation_source_anchors (snapshot_id);
+
+CREATE INDEX IF NOT EXISTS idx_explanation_anchors_system
+    ON explanation_source_anchors (system_id, snapshot_id);
 
 CREATE TABLE IF NOT EXISTS code_entrypoints (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1026,6 +1060,15 @@ def init_db() -> None:
             )
         if "component_id" not in _columns(conn, "code_symbols"):
             conn.execute("ALTER TABLE code_symbols ADD COLUMN component_id TEXT")
+        code_symbol_cols = _columns(conn, "code_symbols")
+        if "symbol_source_hash" not in code_symbol_cols:
+            conn.execute("ALTER TABLE code_symbols ADD COLUMN symbol_source_hash TEXT")
+        if "symbol_body_hash" not in code_symbol_cols:
+            conn.execute("ALTER TABLE code_symbols ADD COLUMN symbol_body_hash TEXT")
+        if "explanation_hash" not in _columns(conn, "symbol_source_metadata"):
+            conn.execute(
+                "ALTER TABLE symbol_source_metadata ADD COLUMN explanation_hash TEXT"
+            )
         validation_columns = _columns(conn, "validation_runs")
         if "trace_received" not in validation_columns:
             conn.execute("ALTER TABLE validation_runs ADD COLUMN trace_received INTEGER")

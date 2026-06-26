@@ -140,7 +140,32 @@
         "consumers": { "type": "array", "items": { "type": "string" } },
         "state_effects": { "type": "array", "items": { "type": "string" } },
         "probe_value": { "type": ["string", "null"] },
-        "origin": { "enum": ["source_authored"] }
+        "origin": { "enum": ["source_authored"] },
+        "explanation_hash": {
+          "type": ["string", "null"],
+          "description": "sha256 of the extracted explanation block. A change signal only; not semantic equality."
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExplanationAnchor": {
+      "type": "object",
+      "description": "A deterministic source anchor an explanation depends on (file, symbol span, and hash provenance). Used by downstream drift features; hash equality is only a change signal.",
+      "required": ["id", "snapshot_id", "system_id", "metadata_id", "symbol_id", "path", "qualified_name", "start_line", "end_line"],
+      "properties": {
+        "id": { "type": "integer" },
+        "snapshot_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "metadata_id": { "type": "integer" },
+        "symbol_id": { "type": "integer" },
+        "path": { "type": "string" },
+        "qualified_name": { "type": "string" },
+        "start_line": { "type": "integer", "minimum": 1 },
+        "end_line": { "type": "integer", "minimum": 1 },
+        "file_content_hash": { "type": ["string", "null"] },
+        "symbol_source_hash": { "type": ["string", "null"] },
+        "symbol_body_hash": { "type": ["string", "null"] },
+        "explanation_hash": { "type": ["string", "null"] }
       },
       "additionalProperties": false
     },
@@ -169,6 +194,18 @@
             { "$ref": "#/definitions/SourceMetadata" },
             { "type": "null" }
           ]
+        },
+        "file_content_hash": {
+          "type": ["string", "null"],
+          "description": "sha256 of the committed file content for the symbol's path in the pinned snapshot."
+        },
+        "symbol_source_hash": {
+          "type": ["string", "null"],
+          "description": "sha256 of the symbol's exact source span (signature + body, as committed)."
+        },
+        "symbol_body_hash": {
+          "type": ["string", "null"],
+          "description": "sha256 of a normalized AST with docstring removed and comments/formatting excluded."
         }
       },
       "additionalProperties": false

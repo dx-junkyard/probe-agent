@@ -8,10 +8,17 @@ produce warnings instead of aborting the whole index.
 from __future__ import annotations
 
 import ast
+import copy
+import hashlib
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import yaml
+
+
+def _hash_text(text: str) -> str:
+    """Deterministic sha256 hex digest of UTF-8 text."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +106,9 @@ class SourceMetadata:
     state_effects: List[str] = field(default_factory=list)
     probe_value: Optional[str] = None
     origin: str = "source_authored"
+    # sha256 of the extracted explanation block (Issue #55). A change signal
+    # only; hash equality is not semantic equality.
+    explanation_hash: Optional[str] = None
 
 
 @dataclass
@@ -117,6 +127,12 @@ class CodeSymbol:
     route_method: Optional[str] = None
     component_id: Optional[str] = None
     source_metadata: Optional[SourceMetadata] = None
+    # Source-hash provenance (Issue #55), computed from the pinned snapshot.
+    # sha256 of the exact source span (signature + body, as committed).
+    symbol_source_hash: Optional[str] = None
+    # sha256 of a normalized AST structure with the docstring removed and
+    # comments/formatting/line numbers excluded. A change signal for behavior.
+    symbol_body_hash: Optional[str] = None
 
 
 @dataclass
@@ -390,8 +406,37 @@ def _parse_source_metadata(
         consumers=list(valid.get("consumers", [])),
         state_effects=list(valid.get("state_effects", [])),
         probe_value=valid.get("probe_value"),
+        explanation_hash=_hash_text(block_text),
     )
     return metadata, warnings
+
+
+def _symbol_source_hash(source_lines: List[str], start_line: int, end_line: int) -> str:
+    """sha256 of the symbol's exact source span (1-based inclusive lines)."""
+    span = "".join(source_lines[start_line - 1 : end_line])
+    return _hash_text(span)
+
+
+def _symbol_body_hash(node: ast.AST) -> str:
+    """sha256 of a normalized AST structure for a module/class/function.
+
+    The leading docstring is stripped and ``ast.dump`` is taken without
+    attributes, so comments, docstrings, formatting, and line numbers do not
+    affect the hash; structural code changes do.  This is a change signal for
+    implementation behavior, not a proof of semantic equivalence.
+    """
+    node_copy = copy.deepcopy(node)
+    body = getattr(node_copy, "body", None)
+    if body:
+        first = body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            node_copy.body = body[1:]
+    dumped = ast.dump(node_copy, annotate_fields=True, include_attributes=False)
+    return _hash_text(dumped)
 
 
 def _is_test_function(name: str, path: str) -> bool:
@@ -432,6 +477,7 @@ def index_python_file_full(path: str, source: str) -> FileIndexResult:
     symbols: List[CodeSymbol] = []
     imports: List[ImportInfo] = []
     warnings: List[IndexWarning] = []
+    source_lines = source.splitlines(keepends=True)
 
     def _attach_metadata(node: ast.AST, symbol: CodeSymbol) -> None:
         metadata, messages = _parse_source_metadata(node)
@@ -440,6 +486,12 @@ def index_python_file_full(path: str, source: str) -> FileIndexResult:
             warnings.append(
                 IndexWarning(path=path, message=f"{symbol.qualified_name}: {message}")
             )
+
+    def _attach_hashes(node: ast.AST, symbol: CodeSymbol) -> None:
+        symbol.symbol_source_hash = _symbol_source_hash(
+            source_lines, symbol.start_line, symbol.end_line
+        )
+        symbol.symbol_body_hash = _symbol_body_hash(node)
 
     module_name = path.replace("/", ".").removesuffix(".py")
     if module_name.endswith(".__init__"):
@@ -480,6 +532,7 @@ def index_python_file_full(path: str, source: str) -> FileIndexResult:
         docstring=_get_docstring(tree),
     )
     _attach_metadata(tree, module_symbol)
+    _attach_hashes(tree, module_symbol)
     symbols.append(module_symbol)
 
     def _visit(node: ast.AST, prefix: str) -> None:
@@ -505,6 +558,7 @@ def index_python_file_full(path: str, source: str) -> FileIndexResult:
                     component_id=component_id,
                 )
                 _attach_metadata(child, func_symbol)
+                _attach_hashes(child, func_symbol)
                 symbols.append(func_symbol)
                 _visit(child, qname)
 
@@ -523,6 +577,7 @@ def index_python_file_full(path: str, source: str) -> FileIndexResult:
                     is_pydantic_model=pydantic,
                 )
                 _attach_metadata(child, class_symbol)
+                _attach_hashes(child, class_symbol)
                 symbols.append(class_symbol)
                 _visit(child, qname)
 

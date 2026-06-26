@@ -429,6 +429,63 @@ enum / enum list は CLAUDE.md 原則 6 に沿って**明示的な有限集合**
 - drift スコアリングや完全な階層・refresh ワークフロー。
 - 自由文からのヒューリスティックな最終分類。
 
+## ソースハッシュによる来歴（Issue #55）
+
+開発者向けの説明（#54 のソース由来メタデータや、後続 issue が作る能力/機能の
+説明階層）は、実装が変わると drift する。「いつ説明を見直すべきか」を後続 issue が
+判定できるように、説明が依存するソース事実に**決定的なハッシュ来歴**を付与する。
+対象リポジトリは原本の source of truth のままで、`probe-agent` は **pinned
+snapshot のコミット済み内容からのみ**ハッシュと抽出コピーを保存する（working tree
+は読まない）。ハッシュは CLAUDE.md 原則 7 に従い reasoning-model の解釈とは分離する。
+
+### ハッシュ種別
+
+1 個の過負荷な値ではなく、用途別に明示的なハッシュ種別を使う。すべて sha256。
+
+| ハッシュ | 対象 | 意味 | 変わる/変わらない |
+| --- | --- | --- | --- |
+| `file_content_hash` | ファイル | コミット済みファイル内容のハッシュ（snapshot が既に保持）。 | ファイル内のどの変更でも変わる。 |
+| `symbol_source_hash` | symbol | symbol の正確なソース span（signature + body, コミット時のまま）のハッシュ。 | コメント・docstring・空白を含む span 内のどの変更でも変わる。 |
+| `symbol_body_hash` | symbol | docstring を除去し `ast.dump`（属性なし）で正規化した構造のハッシュ。コメント・docstring・整形・行番号を**除外**。 | 構造的なコード変更でのみ変わる。コメント/docstring だけの変更では変わらない。 |
+| `explanation_hash` | 説明ブロック | #54 の抽出済み `probe-agent:` ブロック文字列のハッシュ。 | 説明文の変更で変わる。 |
+
+`symbol_body_hash` の正規化は決定的で、テストで保証する（コメントのみ変更・
+docstring のみ変更で安定、実装変更で変化）。
+
+### ハッシュが証明しないこと
+
+- ハッシュの一致は**意味的な等価ではなく、変更シグナルにすぎない**。
+- `symbol_body_hash` が等しくても挙動が同じとは限らない（呼び出し先の変更、
+  グローバル状態、外部 I/O などは捉えられない）。逆に等価な書き換え（変数名変更等）
+  でもハッシュは変わる。
+- ハッシュの不一致は「見直しの候補」を示すだけで、drift の有無や程度は後続 issue が
+  判断する（本 issue は drift スコアを計算しない）。
+
+### 説明→ソース依存（source anchors）
+
+各説明は、依存するソース事実を**source anchor の集合**として記録する:
+`path` / 任意の `symbol` / 行範囲 / `file_content_hash` / `symbol_source_hash` /
+`symbol_body_hash` / `explanation_hash`。#54 では説明はちょうど 1 つの symbol に
+紐づくため anchor は 1 件だが、後続の階層的説明が複数 symbol に依存する場合に
+備えて first-class なテーブルにしておく。
+
+### 永続化と API
+
+- `code_symbols` に `symbol_source_hash` / `symbol_body_hash` を追加（既存 DB は
+  `ALTER TABLE` で後方互換マイグレーション）。`file_content_hash` は
+  `snapshot_files.content_hash` を読み出しで合成する。
+- `symbol_source_metadata` に `explanation_hash` を追加。
+- `explanation_source_anchors`（system-scoped・追加のみの新規テーブル）に anchor
+  集合を保存する。
+- symbol index run を `schema_version='provenance-v1'` でバージョン管理する。
+  #54/#55 以前に index 済みの snapshot を再 index すると、`code_symbols` を作り直さず
+  （feature-code link を cascade 削除しないため）にハッシュ・メタデータ・anchor を
+  **決定的・追加のみ・冪等**にバックフィルする。
+- API: `GET /repository/symbols` と `POST /repository/symbols/index` の
+  `CodeSymbolOut` に `file_content_hash` / `symbol_source_hash` /
+  `symbol_body_hash` を、`SourceMetadataOut` に `explanation_hash` を公開する。
+  `GET /repository/explanation-anchors` で anchor 集合を返す。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。

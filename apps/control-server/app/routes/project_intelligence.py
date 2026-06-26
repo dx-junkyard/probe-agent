@@ -49,6 +49,8 @@ from ..models import (
     ProbePlanFromFlowRequest,
     ProbePreviewOut,
     SourceMetadataOut,
+    ExplanationAnchorOut,
+    ExplanationAnchorsOut,
     FeatureCodeLinkOut,
     FeatureCodeLinksOut,
     FeatureDraftOut,
@@ -843,7 +845,8 @@ def get_latest_drafts(
 # Bumped when the deterministic symbol index gains new extracted facts so that
 # snapshots indexed by an older version can be deterministically upgraded
 # without re-creating code_symbols (which would cascade-delete feature links).
-SYMBOL_INDEX_SCHEMA_VERSION = "metadata-v1"
+# metadata-v1: #54 source metadata. provenance-v1: #55 source-hash provenance.
+SYMBOL_INDEX_SCHEMA_VERSION = "provenance-v1"
 
 
 def _metadata_out(row) -> SourceMetadataOut:
@@ -860,6 +863,7 @@ def _metadata_out(row) -> SourceMetadataOut:
         state_effects=json.loads(row["state_effects"]),
         probe_value=row["probe_value"],
         origin=row["origin"],
+        explanation_hash=row["explanation_hash"],
     )
 
 
@@ -872,15 +876,61 @@ def _load_metadata_map(conn, snapshot_id: int) -> dict:
     return {r["symbol_id"]: _metadata_out(r) for r in rows}
 
 
-def _backfill_source_metadata(conn, system_id: int, snapshot_id: int, run_id: int) -> None:
-    """Deterministically add #54 source metadata to a pre-existing index.
+def _load_file_hash_map(conn, snapshot_id: int) -> dict:
+    """Return ``path -> file_content_hash`` for an indexed snapshot."""
+    rows = conn.execute(
+        "SELECT path, content_hash FROM snapshot_files WHERE snapshot_id = ?",
+        (snapshot_id,),
+    ).fetchall()
+    return {r["path"]: r["content_hash"] for r in rows}
 
-    Snapshots indexed before source-metadata extraction existed keep their
-    ``code_symbols`` rows (so feature-code links are preserved) but have no
-    ``symbol_source_metadata``.  This re-parses the pinned snapshot files and
-    additively inserts metadata + metadata warnings, matching existing symbols
-    by ``(path, qualified_name)``.  It runs once, gated by the run's
-    ``schema_version``.
+
+def _insert_explanation_anchor(
+    conn, snapshot_id: int, system_id: int, metadata_id: int, symbol_id: int,
+    sym, meta, file_content_hash,
+) -> None:
+    """Persist the deterministic source anchor an explanation depends on."""
+    conn.execute(
+        """
+        INSERT INTO explanation_source_anchors
+            (snapshot_id, system_id, metadata_id, symbol_id, path,
+             qualified_name, start_line, end_line, file_content_hash,
+             symbol_source_hash, symbol_body_hash, explanation_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            snapshot_id,
+            system_id,
+            metadata_id,
+            symbol_id,
+            sym.path,
+            sym.qualified_name,
+            meta.start_line,
+            meta.end_line,
+            file_content_hash,
+            sym.symbol_source_hash,
+            sym.symbol_body_hash,
+            meta.explanation_hash,
+        ),
+    )
+
+
+def _backfill_source_metadata(conn, system_id: int, snapshot_id: int, run_id: int) -> None:
+    """Deterministically upgrade a pre-existing symbol index in place.
+
+    Snapshots indexed by an older version keep their ``code_symbols`` rows (so
+    feature-code links are preserved) but may lack #54 source metadata and #55
+    source-hash provenance.  This re-parses the pinned snapshot files and
+    additively backfills, matching existing symbols by ``(path,
+    qualified_name)``:
+
+    - symbol source/body hashes on ``code_symbols`` (idempotent UPDATE),
+    - missing ``symbol_source_metadata`` rows (with explanation hash),
+    - missing explanation hashes on existing metadata rows,
+    - missing ``explanation_source_anchors``,
+    - metadata index warnings.
+
+    It runs once, gated by the run's ``schema_version``.
     """
     file_rows = conn.execute(
         """
@@ -892,16 +942,26 @@ def _backfill_source_metadata(conn, system_id: int, snapshot_id: int, run_id: in
     ).fetchall()
     files = [(fr["path"], bytes(fr["content"] or b"")) for fr in file_rows]
     result = index_snapshot_files(files)
+    file_hash_map = _load_file_hash_map(conn, snapshot_id)
 
     sym_rows = conn.execute(
         "SELECT id, path, qualified_name FROM code_symbols WHERE snapshot_id = ?",
         (snapshot_id,),
     ).fetchall()
     id_by_key = {(r["path"], r["qualified_name"]): r["id"] for r in sym_rows}
-    existing_meta_symbol_ids = {
-        r["symbol_id"]
+    # symbol_id -> (metadata_id, explanation_hash)
+    existing_meta = {
+        r["symbol_id"]: (r["id"], r["explanation_hash"])
         for r in conn.execute(
-            "SELECT symbol_id FROM symbol_source_metadata WHERE snapshot_id = ?",
+            "SELECT id, symbol_id, explanation_hash FROM symbol_source_metadata "
+            "WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchall()
+    }
+    existing_anchor_meta_ids = {
+        r["metadata_id"]
+        for r in conn.execute(
+            "SELECT metadata_id FROM explanation_source_anchors WHERE snapshot_id = ?",
             (snapshot_id,),
         ).fetchall()
     }
@@ -916,41 +976,67 @@ def _backfill_source_metadata(conn, system_id: int, snapshot_id: int, run_id: in
     conn.execute("BEGIN")
     try:
         for sym in result.symbols:
+            symbol_id = id_by_key.get((sym.path, sym.qualified_name))
+            if symbol_id is None:
+                continue
+            # Idempotently set the deterministic source hashes.
+            conn.execute(
+                "UPDATE code_symbols SET symbol_source_hash = ?, symbol_body_hash = ? "
+                "WHERE id = ?",
+                (sym.symbol_source_hash, sym.symbol_body_hash, symbol_id),
+            )
+
             meta = sym.source_metadata
             if meta is None:
                 continue
-            symbol_id = id_by_key.get((sym.path, sym.qualified_name))
-            if symbol_id is None or symbol_id in existing_meta_symbol_ids:
-                continue
-            conn.execute(
-                """
-                INSERT INTO symbol_source_metadata
-                    (snapshot_id, system_id, symbol_id, path, qualified_name,
-                     start_line, end_line, role, capability, element_type,
-                     system_purpose, operation_kind, consumers, state_effects,
-                     probe_value, raw_block, origin)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    snapshot_id,
-                    system_id,
-                    symbol_id,
-                    sym.path,
-                    sym.qualified_name,
-                    meta.start_line,
-                    meta.end_line,
-                    meta.role,
-                    meta.capability,
-                    meta.element_type,
-                    meta.system_purpose,
-                    meta.operation_kind,
-                    json.dumps(meta.consumers),
-                    json.dumps(meta.state_effects),
-                    meta.probe_value,
-                    meta.raw_block,
-                    meta.origin,
-                ),
-            )
+
+            if symbol_id not in existing_meta:
+                cur = conn.execute(
+                    """
+                    INSERT INTO symbol_source_metadata
+                        (snapshot_id, system_id, symbol_id, path, qualified_name,
+                         start_line, end_line, role, capability, element_type,
+                         system_purpose, operation_kind, consumers, state_effects,
+                         probe_value, raw_block, origin, explanation_hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot_id,
+                        system_id,
+                        symbol_id,
+                        sym.path,
+                        sym.qualified_name,
+                        meta.start_line,
+                        meta.end_line,
+                        meta.role,
+                        meta.capability,
+                        meta.element_type,
+                        meta.system_purpose,
+                        meta.operation_kind,
+                        json.dumps(meta.consumers),
+                        json.dumps(meta.state_effects),
+                        meta.probe_value,
+                        meta.raw_block,
+                        meta.origin,
+                        meta.explanation_hash,
+                    ),
+                )
+                metadata_id = cur.lastrowid
+            else:
+                metadata_id, existing_hash = existing_meta[symbol_id]
+                if existing_hash is None:
+                    conn.execute(
+                        "UPDATE symbol_source_metadata SET explanation_hash = ? "
+                        "WHERE id = ?",
+                        (meta.explanation_hash, metadata_id),
+                    )
+
+            if metadata_id not in existing_anchor_meta_ids:
+                _insert_explanation_anchor(
+                    conn, snapshot_id, system_id, metadata_id, symbol_id, sym,
+                    meta, file_hash_map.get(sym.path),
+                )
+                existing_anchor_meta_ids.add(metadata_id)
 
         # Add only metadata warnings (syntax/decode warnings already exist from
         # the original index); guard against duplicates so backfill is idempotent.
@@ -978,7 +1064,11 @@ def _backfill_source_metadata(conn, system_id: int, snapshot_id: int, run_id: in
         raise
 
 
-def _symbol_out(row, metadata: Optional[SourceMetadataOut] = None) -> CodeSymbolOut:
+def _symbol_out(
+    row,
+    metadata: Optional[SourceMetadataOut] = None,
+    file_content_hash: Optional[str] = None,
+) -> CodeSymbolOut:
     return CodeSymbolOut(
         id=row["id"],
         snapshot_id=row["snapshot_id"],
@@ -997,6 +1087,9 @@ def _symbol_out(row, metadata: Optional[SourceMetadataOut] = None) -> CodeSymbol
         route_method=row["route_method"],
         component_id=row["component_id"],
         source_metadata=metadata,
+        file_content_hash=file_content_hash,
+        symbol_source_hash=row["symbol_source_hash"],
+        symbol_body_hash=row["symbol_body_hash"],
     )
 
 
@@ -1058,12 +1151,16 @@ def index_symbols_endpoint(
                 (snapshot_id,),
             ).fetchall()
             meta_map = _load_metadata_map(conn, snapshot_id)
+            file_hash_map = _load_file_hash_map(conn, snapshot_id)
             return SymbolIndexOut(
                 snapshot_id=snapshot_id,
                 system_id=system_id,
                 symbol_count=len(sym_rows),
                 warning_count=len(warn_rows),
-                symbols=[_symbol_out(r, meta_map.get(r["id"])) for r in sym_rows],
+                symbols=[
+                    _symbol_out(r, meta_map.get(r["id"]), file_hash_map.get(r["path"]))
+                    for r in sym_rows
+                ],
                 warnings=[
                     SymbolIndexWarningOut(path=w["path"], message=w["message"])
                     for w in warn_rows
@@ -1074,7 +1171,7 @@ def index_symbols_endpoint(
     with get_conn() as conn:
         file_rows = conn.execute(
             """
-            SELECT path, content FROM snapshot_files
+            SELECT path, content, content_hash FROM snapshot_files
             WHERE snapshot_id = ? AND inclusion_status = 'indexed'
             ORDER BY path
             """,
@@ -1082,6 +1179,7 @@ def index_symbols_endpoint(
         ).fetchall()
 
     files = [(fr["path"], bytes(fr["content"] or b"")) for fr in file_rows]
+    file_hash_map = {fr["path"]: fr["content_hash"] for fr in file_rows}
     started_at = time.time()
     result = index_snapshot_files(files)
     completed_at = time.time()
@@ -1110,8 +1208,8 @@ def index_symbols_endpoint(
                         (snapshot_id, system_id, path, qualified_name, kind,
                          start_line, end_line, decorators, imports, docstring,
                          is_test, is_pydantic_model, route_path, route_method,
-                         component_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         component_id, symbol_source_hash, symbol_body_hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         snapshot_id,
@@ -1129,24 +1227,27 @@ def index_symbols_endpoint(
                         sym.route_path,
                         sym.route_method,
                         sym.component_id,
+                        sym.symbol_source_hash,
+                        sym.symbol_body_hash,
                     ),
                 )
+                symbol_id = sym_cur.lastrowid
                 meta = sym.source_metadata
                 if meta is not None:
-                    conn.execute(
+                    meta_cur = conn.execute(
                         """
                         INSERT INTO symbol_source_metadata
                             (snapshot_id, system_id, symbol_id, path,
                              qualified_name, start_line, end_line, role,
                              capability, element_type, system_purpose,
                              operation_kind, consumers, state_effects,
-                             probe_value, raw_block, origin)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             probe_value, raw_block, origin, explanation_hash)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             snapshot_id,
                             system_id,
-                            sym_cur.lastrowid,
+                            symbol_id,
                             sym.path,
                             sym.qualified_name,
                             meta.start_line,
@@ -1161,7 +1262,12 @@ def index_symbols_endpoint(
                             meta.probe_value,
                             meta.raw_block,
                             meta.origin,
+                            meta.explanation_hash,
                         ),
+                    )
+                    _insert_explanation_anchor(
+                        conn, snapshot_id, system_id, meta_cur.lastrowid,
+                        symbol_id, sym, meta, file_hash_map.get(sym.path),
                     )
 
             for warn in result.warnings:
@@ -1198,7 +1304,10 @@ def index_symbols_endpoint(
         system_id=system_id,
         symbol_count=len(sym_rows),
         warning_count=len(warn_rows),
-        symbols=[_symbol_out(r, meta_map.get(r["id"])) for r in sym_rows],
+        symbols=[
+            _symbol_out(r, meta_map.get(r["id"]), file_hash_map.get(r["path"]))
+            for r in sym_rows
+        ],
         warnings=[
             SymbolIndexWarningOut(path=w["path"], message=w["message"])
             for w in warn_rows
@@ -1245,18 +1354,83 @@ def get_symbols(
             (system_id, snapshot_id),
         ).fetchone()
         meta_map = _load_metadata_map(conn, snapshot_id)
+        file_hash_map = _load_file_hash_map(conn, snapshot_id)
 
     return SymbolIndexOut(
         snapshot_id=snapshot_id,
         system_id=system_id,
         symbol_count=len(sym_rows),
         warning_count=len(warn_rows),
-        symbols=[_symbol_out(r, meta_map.get(r["id"])) for r in sym_rows],
+        symbols=[
+            _symbol_out(r, meta_map.get(r["id"]), file_hash_map.get(r["path"]))
+            for r in sym_rows
+        ],
         warnings=[
             SymbolIndexWarningOut(path=w["path"], message=w["message"])
             for w in warn_rows
         ],
         intelligence_run=_intelligence_run_out(run_row) if run_row else None,
+    )
+
+
+def _anchor_out(row) -> ExplanationAnchorOut:
+    return ExplanationAnchorOut(
+        id=row["id"],
+        snapshot_id=row["snapshot_id"],
+        system_id=row["system_id"],
+        metadata_id=row["metadata_id"],
+        symbol_id=row["symbol_id"],
+        path=row["path"],
+        qualified_name=row["qualified_name"],
+        start_line=row["start_line"],
+        end_line=row["end_line"],
+        file_content_hash=row["file_content_hash"],
+        symbol_source_hash=row["symbol_source_hash"],
+        symbol_body_hash=row["symbol_body_hash"],
+        explanation_hash=row["explanation_hash"],
+    )
+
+
+@router.get(
+    "/repository/explanation-anchors",
+    response_model=ExplanationAnchorsOut,
+)
+def get_explanation_anchors(
+    system_id: int = Depends(get_system_id),
+) -> ExplanationAnchorsOut:
+    """Return the deterministic source anchors each explanation depends on.
+
+    Downstream hierarchy/drift features compare these hashes against a newer
+    snapshot.  Hash equality is only a change signal, never proof of semantic
+    equality.
+    """
+    with get_conn() as conn:
+        snapshot_row = conn.execute(
+            """
+            SELECT * FROM repository_snapshots
+            WHERE system_id = ? ORDER BY id DESC LIMIT 1
+            """,
+            (system_id,),
+        ).fetchone()
+        if snapshot_row is None:
+            return ExplanationAnchorsOut(
+                system_id=system_id, snapshot_id=0, anchor_count=0,
+            )
+        snapshot_id = snapshot_row["id"]
+        rows = conn.execute(
+            """
+            SELECT * FROM explanation_source_anchors
+            WHERE snapshot_id = ? AND system_id = ?
+            ORDER BY path, start_line
+            """,
+            (snapshot_id, system_id),
+        ).fetchall()
+
+    return ExplanationAnchorsOut(
+        system_id=system_id,
+        snapshot_id=snapshot_id,
+        anchor_count=len(rows),
+        anchors=[_anchor_out(r) for r in rows],
     )
 
 

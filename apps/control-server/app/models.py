@@ -546,6 +546,8 @@ class SourceMetadataOut(BaseModel):
     state_effects: List[str] = Field(default_factory=list)
     probe_value: Optional[str] = None
     origin: Literal["source_authored"] = "source_authored"
+    # sha256 of the extracted explanation block (Issue #55); change signal only.
+    explanation_hash: Optional[str] = None
 
 
 class CodeSymbolOut(BaseModel):
@@ -566,6 +568,40 @@ class CodeSymbolOut(BaseModel):
     route_method: Optional[str] = None
     component_id: Optional[str] = None
     source_metadata: Optional[SourceMetadataOut] = None
+    # Source-hash provenance (Issue #55). All computed from the pinned snapshot;
+    # equality is only a change signal, not semantic equivalence.
+    file_content_hash: Optional[str] = None
+    symbol_source_hash: Optional[str] = None
+    symbol_body_hash: Optional[str] = None
+
+
+class ExplanationAnchorOut(BaseModel):
+    """A single source anchor an explanation depends on (Issue #55).
+
+    Bundles the deterministic provenance (file, symbol span, and hash types)
+    that downstream drift features compare against a newer snapshot.
+    """
+
+    id: int
+    snapshot_id: int
+    system_id: int
+    metadata_id: int
+    symbol_id: int
+    path: str
+    qualified_name: str
+    start_line: int
+    end_line: int
+    file_content_hash: Optional[str] = None
+    symbol_source_hash: Optional[str] = None
+    symbol_body_hash: Optional[str] = None
+    explanation_hash: Optional[str] = None
+
+
+class ExplanationAnchorsOut(BaseModel):
+    system_id: int
+    snapshot_id: int
+    anchor_count: int
+    anchors: List[ExplanationAnchorOut] = Field(default_factory=list)
 
 
 class SymbolIndexWarningOut(BaseModel):

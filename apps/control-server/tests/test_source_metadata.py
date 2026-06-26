@@ -380,7 +380,7 @@ class TestSourceMetadataAPI:
         assert flow2["id"] == original_symbol_id
         assert flow2["source_metadata"] is not None
         assert flow2["source_metadata"]["element_type"] == "core"
-        assert body2["intelligence_run"]["schema_version"] == "metadata-v1"
+        assert body2["intelligence_run"]["schema_version"] == "provenance-v1"
         warn_paths = [w["path"] for w in body2["warnings"]]
         assert "src/bad.py" in warn_paths
 
