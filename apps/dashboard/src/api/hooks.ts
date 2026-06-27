@@ -7,7 +7,7 @@ import type {
   DraftGenerationResultOut,
   SymbolIndexOut, FeatureCodeLinksOut, ProbePlansListOut, ApiScanResultOut,
   FlowEntrypointsOut, FlowGraphOut, FlowProbeSelection, ProbePlanOut,
-  ApiRoleCardsOut,
+  ApiRoleCardsOut, ExplanationRefreshOut, RefreshProposalRequest,
   ProbePatchOut, GenerationRun, ExperimentOut, MeResponse,
   EvaluationCriterion,
   SystemProfile,
@@ -351,6 +351,13 @@ export function useApiRoleCards() {
     queryKey: sysKey("apiRoleCards"),
     queryFn: () => api.get<ApiRoleCardsOut>("/repository/api-role-cards"),
     enabled: !!getSystemId(),
+  });
+}
+
+export function useRequestExplanationRefresh() {
+  return useMutation({
+    mutationFn: (body: RefreshProposalRequest) =>
+      api.post<ExplanationRefreshOut>("/repository/explanation-refresh", body),
   });
 }
 

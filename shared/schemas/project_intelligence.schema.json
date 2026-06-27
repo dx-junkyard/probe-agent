@@ -560,6 +560,68 @@
         "cards": { "type": "array", "items": { "$ref": "#/definitions/ApiRoleCard" } }
       },
       "additionalProperties": false
+    },
+    "ExplanationRefreshProposal": {
+      "type": "object",
+      "description": "A reviewable, reasoning-model suggestion to refresh a drifted source-backed explanation (Issue #59). A SUGGESTION only: probe-agent never edits the target source repository; a developer applies it by hand.",
+      "required": ["drift_status", "status"],
+      "properties": {
+        "id": { "type": ["integer", "null"] },
+        "node_id": { "type": ["integer", "null"] },
+        "node_type": { "type": "string" },
+        "name": { "type": "string" },
+        "entrypoint_type": { "type": ["string", "null"] },
+        "entrypoint_id": { "type": ["string", "null"] },
+        "path": { "type": ["string", "null"] },
+        "qualified_name": { "type": ["string", "null"] },
+        "drift_status": { "enum": ["fresh", "partially_stale", "stale", "missing_source", "unknown"] },
+        "drift_reason": { "type": "string" },
+        "changed_hashes": { "type": "array", "items": { "type": "string" } },
+        "old_explanation": { "type": "string" },
+        "proposed_explanation": { "type": ["string", "null"] },
+        "proposed_metadata": { "type": ["object", "null"] },
+        "summary_of_changes": { "type": ["string", "null"] },
+        "confidence": { "type": ["number", "null"] },
+        "captured_file_content_hash": { "type": ["string", "null"] },
+        "captured_symbol_source_hash": { "type": ["string", "null"] },
+        "captured_explanation_hash": { "type": ["string", "null"] },
+        "current_file_content_hash": { "type": ["string", "null"] },
+        "current_symbol_source_hash": { "type": ["string", "null"] },
+        "current_explanation_hash": { "type": ["string", "null"] },
+        "status": { "enum": ["proposed", "failed"] },
+        "is_mock": { "type": "boolean" },
+        "provider": { "type": "string" },
+        "model": { "type": "string" },
+        "decision_method": { "type": "string" },
+        "created_at": { "type": ["number", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "ExplanationRefresh": {
+      "type": "object",
+      "required": ["system_id", "status", "review_required"],
+      "properties": {
+        "system_id": { "type": "integer" },
+        "base_snapshot_id": { "type": ["integer", "null"] },
+        "target_snapshot_id": { "type": ["integer", "null"] },
+        "intelligence_run": { "oneOf": [{ "$ref": "#/definitions/IntelligenceRun" }, { "type": "null" }] },
+        "status": { "enum": ["proposed", "failed"] },
+        "error": { "type": ["string", "null"] },
+        "review_required": { "type": "boolean" },
+        "review_note": { "type": "string" },
+        "proposal": { "oneOf": [{ "$ref": "#/definitions/ExplanationRefreshProposal" }, { "type": "null" }] }
+      },
+      "additionalProperties": false
+    },
+    "ExplanationRefreshList": {
+      "type": "object",
+      "required": ["system_id"],
+      "properties": {
+        "system_id": { "type": "integer" },
+        "review_note": { "type": "string" },
+        "proposals": { "type": "array", "items": { "$ref": "#/definitions/ExplanationRefreshProposal" } }
+      },
+      "additionalProperties": false
     }
   },
   "type": "object"

@@ -40,10 +40,21 @@ from ..git_ops import (
     read_file_at_commit,
 )
 from ..llm import LLMConfig, LLMError, create_llm_client, is_reasoning_model
+from ..refresh_proposal import (
+    REVIEW_REQUIRED_NOTE,
+    RefreshContext,
+    propose_refresh,
+)
+from ..refresh_proposal import PROMPT_VERSION as REFRESH_PROMPT_VERSION
+from ..refresh_proposal import SCHEMA_VERSION as REFRESH_SCHEMA_VERSION
 from ..models import (
     ApiScanPatternOut,
     ApiScanRequest,
     ApiScanResultOut,
+    ExplanationRefreshListOut,
+    ExplanationRefreshOut,
+    ExplanationRefreshProposalOut,
+    RefreshProposalRequest,
     CandidateFlowOut,
     CodeSymbolOut,
     DraftGenerationResult,
@@ -2383,6 +2394,428 @@ def get_api_role_cards(
         target_snapshot_id=target_snapshot_id,
         drift_available=drift_available,
         cards=cards,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Explanation refresh proposals (Issue #59) — reasoning model, suggestion only
+# ---------------------------------------------------------------------------
+
+
+def _read_source_snippet(
+    conn, snapshot_id: int, system_id: int, path: str, qualified_name: Optional[str]
+) -> str:
+    """Return the current source span for a symbol from the pinned snapshot.
+
+    Reads only committed snapshot content (never the working tree). Slices to the
+    symbol's line range when the symbol still exists in the target snapshot;
+    otherwise returns '' so the proposal can state the source is gone.
+    """
+    file_row = conn.execute(
+        "SELECT content FROM snapshot_files WHERE snapshot_id = ? AND path = ? LIMIT 1",
+        (snapshot_id, path),
+    ).fetchone()
+    if file_row is None:
+        return ""
+    raw = file_row["content"]
+    text = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    if qualified_name is None:
+        return "\n".join(text.splitlines()[:60])
+    sym = conn.execute(
+        """
+        SELECT start_line, end_line FROM code_symbols
+        WHERE snapshot_id = ? AND system_id = ? AND path = ? AND qualified_name = ?
+        LIMIT 1
+        """,
+        (snapshot_id, system_id, path, qualified_name),
+    ).fetchone()
+    if sym is None:
+        return ""
+    lines = text.splitlines()
+    start = max(0, (sym["start_line"] or 1) - 1)
+    end = min(len(lines), sym["end_line"] or len(lines))
+    span = lines[start:end]
+    # Cap the snippet so the context pack stays bounded.
+    return "\n".join(span[:200])
+
+
+def _old_metadata_row(conn, snapshot_id: int, system_id: int, path: str, qualified_name: str):
+    return conn.execute(
+        """
+        SELECT raw_block, role, capability, element_type, operation_kind,
+               system_purpose, consumers, state_effects, probe_value
+        FROM symbol_source_metadata
+        WHERE snapshot_id = ? AND system_id = ? AND path = ? AND qualified_name = ?
+        LIMIT 1
+        """,
+        (snapshot_id, system_id, path, qualified_name),
+    ).fetchone()
+
+
+def _refresh_proposal_out(row) -> ExplanationRefreshProposalOut:
+    return ExplanationRefreshProposalOut(
+        id=row["id"],
+        node_id=row["node_id"],
+        node_type=row["node_type"],
+        name=row["name"],
+        entrypoint_type=row["entrypoint_type"],
+        entrypoint_id=row["entrypoint_id"],
+        path=row["path"],
+        qualified_name=row["qualified_name"],
+        drift_status=row["drift_status"] or "unknown",
+        drift_reason=row["drift_reason"],
+        changed_hashes=json.loads(row["changed_hashes"] or "[]"),
+        old_explanation=row["old_explanation"],
+        proposed_explanation=row["proposed_explanation"],
+        proposed_metadata=(
+            json.loads(row["proposed_metadata"]) if row["proposed_metadata"] else None
+        ),
+        summary_of_changes=row["summary_of_changes"],
+        confidence=row["confidence"],
+        captured_file_content_hash=row["captured_file_content_hash"],
+        captured_symbol_source_hash=row["captured_symbol_source_hash"],
+        captured_explanation_hash=row["captured_explanation_hash"],
+        current_file_content_hash=row["current_file_content_hash"],
+        current_symbol_source_hash=row["current_symbol_source_hash"],
+        current_explanation_hash=row["current_explanation_hash"],
+        status=row["status"],
+        is_mock=bool(row["is_mock"]),
+        provider=row["provider"],
+        model=row["model"],
+        decision_method=row["decision_method"],
+        created_at=row["created_at"],
+    )
+
+
+@router.post(
+    "/repository/explanation-refresh",
+    response_model=ExplanationRefreshOut,
+    status_code=201,
+)
+def create_explanation_refresh(
+    payload: RefreshProposalRequest,
+    system_id: int = Depends(get_system_id),
+) -> ExplanationRefreshOut:
+    """Propose a reviewable explanation refresh for a stale node / role card.
+
+    Builds a deterministic context pack (old explanation, changed anchors, old
+    and new hashes, current source snippet from the pinned snapshot, structural
+    facts) and asks a reasoning model to propose updated wording/metadata. The
+    proposal is a SUGGESTION only: probe-agent never edits the target source
+    repository. Fails closed (no heuristic fallback) for mock/non-reasoning
+    models, persisting the failed run so it is visible.
+    """
+    if payload.node_id is None and not (
+        payload.entrypoint_type and payload.entrypoint_id
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Provide node_id or (entrypoint_type, entrypoint_id).",
+        )
+
+    with get_conn() as conn:
+        run_row = conn.execute(
+            """
+            SELECT * FROM intelligence_runs
+            WHERE system_id = ? AND run_type = 'capability_hierarchy'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (system_id,),
+        ).fetchone()
+        if run_row is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No capability hierarchy generated. Generate one first.",
+            )
+        base_snapshot_id = run_row["snapshot_id"]
+
+        # Resolve the requested hierarchy node.
+        node_row = None
+        if payload.node_id is not None:
+            node_row = conn.execute(
+                """
+                SELECT * FROM capability_hierarchy_nodes
+                WHERE id = ? AND system_id = ? AND intelligence_run_id = ?
+                """,
+                (payload.node_id, system_id, run_row["id"]),
+            ).fetchone()
+        else:
+            # Translate the stable logical entrypoint key to the base snapshot's
+            # transient code_entrypoints id, then to its hierarchy node.
+            base_ep = conn.execute(
+                """
+                SELECT id FROM code_entrypoints
+                WHERE snapshot_id = ? AND system_id = ?
+                  AND entrypoint_type = ? AND entrypoint_id = ?
+                LIMIT 1
+                """,
+                (base_snapshot_id, system_id, payload.entrypoint_type,
+                 payload.entrypoint_id),
+            ).fetchone()
+            if base_ep is not None:
+                node_row = conn.execute(
+                    """
+                    SELECT * FROM capability_hierarchy_nodes
+                    WHERE intelligence_run_id = ? AND entrypoint_id = ?
+                    LIMIT 1
+                    """,
+                    (run_row["id"], base_ep["id"]),
+                ).fetchone()
+        if node_row is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Hierarchy node not found for this system.",
+            )
+        if node_row["path"] is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This node has no source anchor (e.g. a draft-linked purpose) "
+                    "and cannot be drift-checked or refreshed."
+                ),
+            )
+
+        # Resolve the target snapshot (must be symbol-indexed; #57 semantics).
+        if payload.target_snapshot_id is None:
+            target_row = _latest_indexed_ready_snapshot(conn, system_id)
+            target = target_row["id"] if target_row else base_snapshot_id
+        else:
+            target = payload.target_snapshot_id
+            owned = conn.execute(
+                "SELECT 1 FROM repository_snapshots WHERE id = ? AND system_id = ?",
+                (target, system_id),
+            ).fetchone()
+            if owned is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Target snapshot not found for this system.",
+                )
+            if not _snapshot_is_indexed(conn, system_id, target):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Target snapshot has no symbol index. Run symbol "
+                        "indexing on it before requesting a refresh."
+                    ),
+                )
+
+        facts = _snapshot_facts(conn, target, system_id)
+        drift = drift_service.compute_anchor_drift(_node_anchor(node_row), facts)
+        if not drift_service.is_review_recommended(drift.status):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Node is {drift.status}, not stale. A refresh proposal is "
+                    "only generated for drifted explanations."
+                ),
+            )
+
+        # Old explanation + parsed metadata from the base (captured) snapshot.
+        meta_row = _old_metadata_row(
+            conn, base_snapshot_id, system_id, node_row["path"],
+            node_row["qualified_name"] or "",
+        )
+        old_explanation = meta_row["raw_block"] if meta_row else ""
+        old_metadata = {}
+        if meta_row is not None:
+            for k in ("role", "capability", "element_type", "operation_kind",
+                      "system_purpose", "probe_value"):
+                if meta_row[k]:
+                    old_metadata[k] = meta_row[k]
+            if meta_row["consumers"]:
+                old_metadata["consumers"] = json.loads(meta_row["consumers"])
+            if meta_row["state_effects"]:
+                old_metadata["state_effects"] = json.loads(meta_row["state_effects"])
+
+        snippet = _read_source_snippet(
+            conn, target, system_id, node_row["path"], node_row["qualified_name"]
+        )
+
+        structural_facts = {
+            "capability_key": node_row["capability_key"],
+            "classification": node_row["classification"],
+            "operation_kind": node_row["operation_kind"],
+        }
+        ep_logical_type = None
+        ep_logical_id = None
+        if node_row["entrypoint_id"] is not None:
+            ep_row = conn.execute(
+                "SELECT * FROM code_entrypoints WHERE id = ? AND system_id = ?",
+                (node_row["entrypoint_id"], system_id),
+            ).fetchone()
+            if ep_row is not None:
+                ep_logical_type = ep_row["entrypoint_type"]
+                ep_logical_id = ep_row["entrypoint_id"]
+                structural_facts.update({
+                    "route_method": ep_row["route_method"],
+                    "route_path": ep_row["route_path"],
+                    "operation": ep_row["operation"],
+                    "category": ep_row["category"],
+                    "framework": ep_row["framework"],
+                })
+
+    ctx = RefreshContext(
+        node_id=node_row["id"],
+        node_type=node_row["node_type"],
+        name=node_row["name"],
+        path=node_row["path"],
+        qualified_name=node_row["qualified_name"],
+        drift_status=drift.status,
+        changed_hashes=drift.changed_hashes,
+        old_explanation=old_explanation,
+        old_metadata=old_metadata,
+        captured_hashes={
+            "file_content_hash": node_row["file_content_hash"],
+            "symbol_source_hash": node_row["symbol_source_hash"],
+            "explanation_hash": node_row["explanation_hash"],
+        },
+        current_hashes={
+            "file_content_hash": drift.current_file_content_hash,
+            "symbol_source_hash": drift.current_symbol_source_hash,
+            "explanation_hash": drift.current_explanation_hash,
+        },
+        source_snippet=snippet,
+        structural_facts={k: v for k, v in structural_facts.items() if v},
+    )
+
+    # Run the reasoning model (fails closed for mock/non-reasoning).
+    llm_config = _resolve_intelligence_config()
+    try:
+        if llm_config.provider != "mock" and not is_reasoning_model(
+            llm_config.provider, llm_config.model
+        ):
+            raise LLMError(
+                "Explanation refresh proposals require a configured reasoning model"
+            )
+        client = create_llm_client(llm_config)
+        proposal = propose_refresh(client, llm_config, ctx)
+    except LLMError as exc:
+        proposal = type("R", (), {
+            "provider": llm_config.provider,
+            "model": llm_config.model,
+            "is_mock": llm_config.provider == "mock",
+            "proposed_explanation": None,
+            "proposed_metadata": None,
+            "summary_of_changes": None,
+            "confidence": None,
+            "error": str(exc),
+        })()
+
+    status = "failed" if proposal.error else "proposed"
+    run_status = "failed" if proposal.error else "completed"
+    drift_reason = (
+        "Source is gone (deleted or renamed)."
+        if drift.status == "missing_source"
+        else f"Changed source hashes: {', '.join(drift.changed_hashes) or 'unknown'}."
+    )
+    now = time.time()
+
+    with get_conn() as conn:
+        conn.execute("BEGIN")
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO intelligence_runs
+                    (system_id, snapshot_id, run_type, provider, model,
+                     prompt_version, schema_version, decision_method,
+                     status, error_details, is_mock, started_at, completed_at)
+                VALUES (?, ?, 'explanation_refresh', ?, ?, ?, ?, 'reasoning_llm',
+                        ?, ?, ?, ?, ?)
+                """,
+                (
+                    system_id, base_snapshot_id, proposal.provider, proposal.model,
+                    REFRESH_PROMPT_VERSION, REFRESH_SCHEMA_VERSION,
+                    run_status, proposal.error, 1 if proposal.is_mock else 0,
+                    now, now,
+                ),
+            )
+            run_id = cur.lastrowid
+
+            cur2 = conn.execute(
+                """
+                INSERT INTO explanation_refresh_proposals
+                    (system_id, intelligence_run_id, base_snapshot_id,
+                     target_snapshot_id, node_id, node_type, name,
+                     entrypoint_type, entrypoint_id, path, qualified_name,
+                     drift_status, drift_reason, changed_hashes, old_explanation,
+                     proposed_explanation, proposed_metadata, summary_of_changes,
+                     confidence, captured_file_content_hash,
+                     captured_symbol_source_hash, captured_explanation_hash,
+                     current_file_content_hash, current_symbol_source_hash,
+                     current_explanation_hash, status, is_mock, provider, model,
+                     decision_method, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reasoning_llm', ?)
+                """,
+                (
+                    system_id, run_id, base_snapshot_id, target,
+                    node_row["id"], node_row["node_type"], node_row["name"],
+                    ep_logical_type, ep_logical_id, node_row["path"],
+                    node_row["qualified_name"], drift.status, drift_reason,
+                    json.dumps(drift.changed_hashes), old_explanation,
+                    proposal.proposed_explanation,
+                    json.dumps(proposal.proposed_metadata)
+                    if proposal.proposed_metadata else None,
+                    proposal.summary_of_changes, proposal.confidence,
+                    node_row["file_content_hash"], node_row["symbol_source_hash"],
+                    node_row["explanation_hash"],
+                    drift.current_file_content_hash,
+                    drift.current_symbol_source_hash,
+                    drift.current_explanation_hash,
+                    status, 1 if proposal.is_mock else 0,
+                    proposal.provider, proposal.model, now,
+                ),
+            )
+            proposal_id = cur2.lastrowid
+            run_out_row = conn.execute(
+                "SELECT * FROM intelligence_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            proposal_row = conn.execute(
+                "SELECT * FROM explanation_refresh_proposals WHERE id = ?",
+                (proposal_id,),
+            ).fetchone()
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    return ExplanationRefreshOut(
+        system_id=system_id,
+        base_snapshot_id=base_snapshot_id,
+        target_snapshot_id=target,
+        intelligence_run=_intelligence_run_out(run_out_row),
+        status=status,
+        error=proposal.error,
+        review_required=True,
+        review_note=REVIEW_REQUIRED_NOTE,
+        proposal=_refresh_proposal_out(proposal_row),
+    )
+
+
+@router.get(
+    "/repository/explanation-refresh",
+    response_model=ExplanationRefreshListOut,
+)
+def list_explanation_refresh(
+    system_id: int = Depends(get_system_id),
+) -> ExplanationRefreshListOut:
+    """List the most recent explanation refresh proposals for the system.
+
+    Every proposal is a suggestion only; the review note states that a developer
+    must apply it to the source by hand.
+    """
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM explanation_refresh_proposals
+            WHERE system_id = ? ORDER BY id DESC LIMIT 50
+            """,
+            (system_id,),
+        ).fetchall()
+    return ExplanationRefreshListOut(
+        system_id=system_id,
+        review_note=REVIEW_REQUIRED_NOTE,
+        proposals=[_refresh_proposal_out(r) for r in rows],
     )
 
 

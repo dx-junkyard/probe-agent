@@ -1,4 +1,4 @@
-from typing import Any, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -217,6 +217,7 @@ IntelligenceRunType = Literal[
     "probe_plan",
     "probe_plan_from_flow",
     "capability_hierarchy",
+    "explanation_refresh",
 ]
 DecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
 # How a single hierarchy claim was produced. Kept distinct from the audit
@@ -1052,6 +1053,71 @@ class ApiRoleCardsOut(BaseModel):
     target_snapshot_id: Optional[int] = None
     drift_available: bool = False
     cards: List[ApiRoleCardOut] = Field(default_factory=list)
+
+
+class RefreshProposalRequest(BaseModel):
+    """Identify the stale hierarchy node / API role card to refresh.
+
+    Provide either ``node_id`` (a capability hierarchy node) or the logical
+    ``(entrypoint_type, entrypoint_id)`` of an API role card.
+    """
+
+    node_id: Optional[int] = None
+    entrypoint_type: Optional[str] = None
+    entrypoint_id: Optional[str] = None
+    target_snapshot_id: Optional[int] = None
+
+
+class ExplanationRefreshProposalOut(BaseModel):
+    id: Optional[int] = None
+    node_id: Optional[int] = None
+    node_type: str = ""
+    name: str = ""
+    entrypoint_type: Optional[str] = None
+    entrypoint_id: Optional[str] = None
+    path: Optional[str] = None
+    qualified_name: Optional[str] = None
+    drift_status: DriftStatus = "unknown"
+    drift_reason: str = ""
+    changed_hashes: List[str] = Field(default_factory=list)
+    # Source-authored explanation as it exists in the target repo (unchanged).
+    old_explanation: str = ""
+    # Reasoning-model suggestion. Never written to the target repository.
+    proposed_explanation: Optional[str] = None
+    proposed_metadata: Optional[Dict[str, Any]] = None
+    summary_of_changes: Optional[str] = None
+    confidence: Optional[float] = None
+    captured_file_content_hash: Optional[str] = None
+    captured_symbol_source_hash: Optional[str] = None
+    captured_explanation_hash: Optional[str] = None
+    current_file_content_hash: Optional[str] = None
+    current_symbol_source_hash: Optional[str] = None
+    current_explanation_hash: Optional[str] = None
+    status: Literal["proposed", "failed"] = "proposed"
+    is_mock: bool = False
+    provider: str = ""
+    model: str = ""
+    decision_method: str = "reasoning_llm"
+    created_at: Optional[float] = None
+
+
+class ExplanationRefreshOut(BaseModel):
+    system_id: int
+    base_snapshot_id: Optional[int] = None
+    target_snapshot_id: Optional[int] = None
+    intelligence_run: Optional[IntelligenceRunOut] = None
+    status: Literal["proposed", "failed"] = "proposed"
+    error: Optional[str] = None
+    # Always true for proposals: a developer must review and apply to source.
+    review_required: bool = True
+    review_note: str = ""
+    proposal: Optional[ExplanationRefreshProposalOut] = None
+
+
+class ExplanationRefreshListOut(BaseModel):
+    system_id: int
+    review_note: str = ""
+    proposals: List[ExplanationRefreshProposalOut] = Field(default_factory=list)
 
 
 class ApiScanRequest(BaseModel):

@@ -661,6 +661,52 @@ API は probe 設定の entrypoint として選べるようになったが、開
 非対象: メタデータ authoring UI、自動 refresh/再生成、ソース書き換え、既存
 Feature Map ページの置き換え。
 
+## 説明の refresh 提案（Issue #59）
+
+#57 は説明が古くなった（hash が drift した）ことを**検出**するだけで、説明レイヤ
+を更新する助けにはならない。#59 はこのメンテナンスループを明示化する: 古くなった
+階層ノード / API Role Card に対し、reasoning model が**更新案（提案）**を生成する。
+提案は**あくまで suggestion** であり、probe-agent は対象リポジトリを書き換えない。
+開発者がレビューしてソースの docstring を手で更新し、次の snapshot が更新後の説明を
+再 index する。
+
+### コンテキストパック（決定的に構築）
+
+提案生成のために以下を集めて reasoning model に渡す:
+
+- 旧説明ブロック（`symbol_source_metadata.raw_block` の逐語コピー）と旧パース済み
+  メタデータ
+- 変化した source anchor と、捕捉時・現在の hash（#55）
+- pin された snapshot から読んだ**現在のソース断片**（symbol 範囲。symbol が消えて
+  いれば空 → 「ソースが無い」と提案に明記）
+- 決定的な構造ファクト（route method/path・operation・category・capability 等）
+
+### fail closed と語彙の制約
+
+- mock / 非 reasoning モデルは**閉じて失敗**し、推測は永続化しない（reasoning-llm
+  skill）。失敗 run は `intelligence_runs` に残り可視化される。
+- 提案メタデータの enum フィールド（`element_type` / `operation_kind` /
+  `state_effects`）は #54 と同じ有限語彙で検証する。未知の enum 値やキーを含む提案は
+  **拒否**する（決定的判断は有限集合に閉じる、CLAUDE.md 原則 6）。
+
+### API
+
+- `POST /repository/explanation-refresh` が `node_id` か論理
+  `(entrypoint_type, entrypoint_id)` で対象ノードを指定して提案を生成する。drift が
+  stale / missing_source のときのみ生成し、fresh なら 409 を返す。target snapshot は
+  #57 と同じく symbol-index 済みのものに限る（未 index は 409）。
+- `GET /repository/explanation-refresh` が直近の提案一覧を返す。
+- レスポンスは常に `review_required=true` と review note を含み、「開発者がレビュー
+  してソースへ適用する必要がある」ことを明示する。提案は
+  `explanation_refresh_proposals`（system scope）に旧説明・提案説明・変化 anchor・
+  drift 理由・provider/model/prompt/schema・捕捉/現在 hash と共に永続化する。
+- Flow Explorer の Role Card に「Propose explanation refresh」操作を追加し、drift が
+  review 推奨のときに提案（旧説明 vs 提案説明 vs 提案メタデータ）と review note を
+  その場で表示する。
+
+非対象: 自動ソース編集、コミット作成、バックグラウンドでの暗黙 refresh、reasoning
+モデル不在時の heuristic fallback。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。

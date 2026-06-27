@@ -496,6 +496,56 @@ CREATE INDEX IF NOT EXISTS idx_capability_hierarchy_run
 CREATE INDEX IF NOT EXISTS idx_capability_hierarchy_system
     ON capability_hierarchy_nodes (system_id, snapshot_id);
 
+-- Explanation refresh proposals (Issue #59). When a source-backed explanation
+-- drifts (#57), a reasoning model proposes updated wording/metadata. Each row
+-- is a reviewable SUGGESTION only: probe-agent never edits the target source
+-- repository, and a developer must apply the change to the source by hand. The
+-- run audit (provider/model/prompt/schema/status/error) lives in
+-- intelligence_runs; this table stores the proposal payload and the captured
+-- vs. current source provenance it was generated from. Scoped by system.
+CREATE TABLE IF NOT EXISTS explanation_refresh_proposals (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    intelligence_run_id   INTEGER NOT NULL,
+    base_snapshot_id      INTEGER NOT NULL,
+    target_snapshot_id    INTEGER NOT NULL,
+    node_id               INTEGER,
+    node_type             TEXT NOT NULL DEFAULT '',
+    name                  TEXT NOT NULL DEFAULT '',
+    entrypoint_type       TEXT,
+    entrypoint_id         TEXT,
+    path                  TEXT,
+    qualified_name        TEXT,
+    drift_status          TEXT NOT NULL DEFAULT '',
+    drift_reason          TEXT NOT NULL DEFAULT '',
+    changed_hashes        TEXT NOT NULL DEFAULT '[]',
+    old_explanation       TEXT NOT NULL DEFAULT '',
+    proposed_explanation  TEXT,
+    proposed_metadata     TEXT,
+    summary_of_changes    TEXT,
+    confidence            REAL,
+    captured_file_content_hash  TEXT,
+    captured_symbol_source_hash TEXT,
+    captured_explanation_hash   TEXT,
+    current_file_content_hash   TEXT,
+    current_symbol_source_hash  TEXT,
+    current_explanation_hash    TEXT,
+    status                TEXT NOT NULL DEFAULT 'proposed',
+    is_mock               INTEGER NOT NULL DEFAULT 0,
+    provider              TEXT NOT NULL DEFAULT '',
+    model                 TEXT NOT NULL DEFAULT '',
+    decision_method       TEXT NOT NULL DEFAULT 'reasoning_llm',
+    created_at            REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_refresh_proposals_system
+    ON explanation_refresh_proposals (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_refresh_proposals_run
+    ON explanation_refresh_proposals (intelligence_run_id);
+
 CREATE TABLE IF NOT EXISTS code_entrypoints (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     system_id               INTEGER NOT NULL,

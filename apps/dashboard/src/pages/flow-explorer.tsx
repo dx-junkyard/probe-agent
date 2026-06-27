@@ -4,6 +4,7 @@ import { Link } from "react-router-dom";
 import { toast } from "sonner";
 import {
   useFlowEntrypoints, useBuildFlowGraph, useCreatePlanFromFlow, useApiRoleCards,
+  useRequestExplanationRefresh,
 } from "@/api/hooks";
 import { ApiError } from "@/api/client";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
@@ -18,6 +19,7 @@ import { Workflow, Crosshair, AlertTriangle, ArrowRight, Activity, RefreshCw, In
 import type {
   FlowEntrypointOut, FlowGraphOut, FlowNodeOut, FlowEdgeOut,
   FlowProbeSelection, ProbePreviewOut, ApiRoleCardOut,
+  ExplanationRefreshOut,
 } from "@/api/types";
 
 const RISK_VARIANT: Record<string, "secondary" | "destructive"> = {
@@ -83,6 +85,22 @@ const PROVENANCE_STYLE: Record<string, string> = {
 
 function ApiRoleCard({ card }: { card: ApiRoleCardOut }) {
   const classified = card.classification === "classified";
+  const refresh = useRequestExplanationRefresh();
+  const [proposal, setProposal] = useState<ExplanationRefreshOut | null>(null);
+
+  const requestRefresh = async () => {
+    setProposal(null);
+    try {
+      const result = await refresh.mutateAsync({
+        entrypoint_type: card.entrypoint_type,
+        entrypoint_id: card.entrypoint_id,
+      });
+      setProposal(result);
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
   return (
     <Card data-testid="api-role-card">
       <CardHeader className="pb-2">
@@ -178,8 +196,75 @@ function ApiRoleCard({ card }: { card: ApiRoleCardOut }) {
             entrypoint.
           </p>
         )}
+
+        {card.drift_review_recommended && (
+          <div className="pt-1 space-y-2">
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 text-[11px] gap-1"
+              onClick={requestRefresh}
+              disabled={refresh.isPending}
+              data-testid="request-refresh"
+            >
+              <RefreshCw className={`h-3 w-3 ${refresh.isPending ? "animate-spin" : ""}`} />
+              {refresh.isPending ? "Proposing…" : "Propose explanation refresh"}
+            </Button>
+            {proposal && <RefreshProposalPanel data={proposal} />}
+          </div>
+        )}
       </CardContent>
     </Card>
+  );
+}
+
+function RefreshProposalPanel({ data }: { data: ExplanationRefreshOut }) {
+  const p = data.proposal;
+  if (data.status === "failed" || !p || p.status === "failed") {
+    return (
+      <div
+        data-testid="refresh-proposal"
+        className="rounded-md border border-red-300 bg-red-50 dark:bg-red-950/20 dark:border-red-800 px-2 py-1.5 text-[11px] text-red-800 dark:text-red-200"
+      >
+        Refresh failed: {data.error ?? "the reasoning model did not return a valid proposal."}
+      </div>
+    );
+  }
+  return (
+    <div
+      data-testid="refresh-proposal"
+      className="rounded-md border border-sky-300 bg-sky-50 dark:bg-sky-950/20 dark:border-sky-800 px-2 py-2 text-[11px] space-y-1.5"
+    >
+      <div className="rounded bg-amber-100 dark:bg-amber-950/30 text-amber-900 dark:text-amber-200 px-2 py-1">
+        {data.review_note}
+      </div>
+      {p.summary_of_changes && (
+        <Field label="What changed">{p.summary_of_changes}</Field>
+      )}
+      <Field label="Drift">{p.drift_reason}</Field>
+      <div>
+        <div className="text-muted-foreground">Current explanation (source of truth):</div>
+        <pre className="whitespace-pre-wrap break-words bg-muted/50 rounded p-1 mt-0.5">
+          {p.old_explanation || "(none)"}
+        </pre>
+      </div>
+      {p.proposed_explanation && (
+        <div>
+          <div className="text-muted-foreground">Proposed explanation (suggestion):</div>
+          <pre className="whitespace-pre-wrap break-words bg-muted/50 rounded p-1 mt-0.5">
+            {p.proposed_explanation}
+          </pre>
+        </div>
+      )}
+      {p.proposed_metadata && (
+        <div>
+          <div className="text-muted-foreground">Proposed metadata (suggestion):</div>
+          <pre className="whitespace-pre-wrap break-words bg-muted/50 rounded p-1 mt-0.5">
+            {JSON.stringify(p.proposed_metadata, null, 2)}
+          </pre>
+        </div>
+      )}
+    </div>
   );
 }
 

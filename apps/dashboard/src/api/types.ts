@@ -456,6 +456,58 @@ export interface ApiRoleCardsOut {
   cards: ApiRoleCardOut[];
 }
 
+// Issue #59: reasoning-model explanation refresh proposals. A proposal is a
+// SUGGESTION only; a developer must review and apply it to the source by hand.
+export interface ExplanationRefreshProposalOut {
+  id: number | null;
+  node_id: number | null;
+  node_type: string;
+  name: string;
+  entrypoint_type: string | null;
+  entrypoint_id: string | null;
+  path: string | null;
+  qualified_name: string | null;
+  drift_status: DriftStatus;
+  drift_reason: string;
+  changed_hashes: string[];
+  old_explanation: string;
+  proposed_explanation: string | null;
+  proposed_metadata: Record<string, unknown> | null;
+  summary_of_changes: string | null;
+  confidence: number | null;
+  captured_file_content_hash: string | null;
+  captured_symbol_source_hash: string | null;
+  captured_explanation_hash: string | null;
+  current_file_content_hash: string | null;
+  current_symbol_source_hash: string | null;
+  current_explanation_hash: string | null;
+  status: "proposed" | "failed";
+  is_mock: boolean;
+  provider: string;
+  model: string;
+  decision_method: string;
+  created_at: number | null;
+}
+
+export interface ExplanationRefreshOut {
+  system_id: number;
+  base_snapshot_id: number | null;
+  target_snapshot_id: number | null;
+  intelligence_run: IntelligenceRunOut | null;
+  status: "proposed" | "failed";
+  error: string | null;
+  review_required: boolean;
+  review_note: string;
+  proposal: ExplanationRefreshProposalOut | null;
+}
+
+export interface RefreshProposalRequest {
+  node_id?: number | null;
+  entrypoint_type?: string | null;
+  entrypoint_id?: string | null;
+  target_snapshot_id?: number | null;
+}
+
 export interface SymbolIndexOut {
   snapshot_id: number | null;
   system_id: number;
