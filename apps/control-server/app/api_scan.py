@@ -160,9 +160,8 @@ expression that matches one endpoint declaration per match.
 Rules:
 - Base every pattern on declaration syntax actually present in the samples.
 - Each regex should match a single endpoint declaration (typically one line).
-- Capture the URL path in a named group `(?P<path>...)` and set `path_group` to that name. This is REQUIRED. If the HTTP method is
-  part of the declaration, capture it in `(?P<method>...)`; otherwise set
-  `method_constant` (e.g. "GET") or leave it null for "ANY".
+- You MUST capture the URL path in a named group `(?P<path>...)` inside the `regex`. This is STRICTLY REQUIRED. If you fail to include `(?P<path>...)` in the regex, the system will crash. Set `path_group` to "path".
+- If the HTTP method is part of the declaration, capture it in `(?P<method>...)` inside the `regex`; otherwise set `method_constant` (e.g. "GET") or leave it null for "ANY".
 - `file_glob` must be a repository-relative glob (e.g. `app/routes/*.js`,
   `**/urls.py`) selecting the files this pattern applies to.
 - Keep regexes simple and linear; avoid nested quantifiers like `(a+)+`.
@@ -173,9 +172,9 @@ Respond with ONLY valid JSON matching this schema:
   "patterns": [
     {{
       "file_glob": "string",
-      "regex": "string",
+      "regex": "string (MUST contain (?P<path>...))",
       "method_group": "string-or-null",
-      "path_group": "string",
+      "path_group": "string (MUST be the exact name of the group, e.g. 'path')",
       "method_constant": "string-or-null",
       "framework": "string",
       "language": "string",
