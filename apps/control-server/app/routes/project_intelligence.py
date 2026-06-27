@@ -1641,7 +1641,13 @@ def _apply_grouping_assignments(built, grouping):
     ]
 
 
-def _provenance_out(row) -> HierarchyProvenanceOut:
+def _provenance_out(row, logical_by_dbid=None) -> HierarchyProvenanceOut:
+    entrypoint_type = None
+    entrypoint_ref = None
+    if logical_by_dbid is not None and row["entrypoint_id"] is not None:
+        logical = logical_by_dbid.get(row["entrypoint_id"])
+        if logical is not None:
+            entrypoint_type, entrypoint_ref = logical
     return HierarchyProvenanceOut(
         provenance_kind=row["provenance_kind"],
         decision_method=row["decision_method"],
@@ -1654,6 +1660,8 @@ def _provenance_out(row) -> HierarchyProvenanceOut:
         explanation_hash=row["explanation_hash"],
         symbol_id=row["symbol_id"],
         entrypoint_id=row["entrypoint_id"],
+        entrypoint_type=entrypoint_type,
+        entrypoint_ref=entrypoint_ref,
         feature_id=row["feature_id"],
         system_profile_draft_id=row["system_profile_draft_id"],
         provider=row["provider"],
@@ -1661,7 +1669,7 @@ def _provenance_out(row) -> HierarchyProvenanceOut:
     )
 
 
-def _element_out(row) -> CapabilityElementOut:
+def _element_out(row, logical_by_dbid=None) -> CapabilityElementOut:
     return CapabilityElementOut(
         id=row["id"],
         name=row["name"],
@@ -1670,18 +1678,33 @@ def _element_out(row) -> CapabilityElementOut:
         operation_kind=row["operation_kind"],
         probe_value=row["probe_value"],
         classification=row["classification"],
-        provenance=_provenance_out(row),
+        provenance=_provenance_out(row, logical_by_dbid),
     )
 
 
-def _supporting_out(row) -> SupportingElementOut:
+def _supporting_out(row, logical_by_dbid=None) -> SupportingElementOut:
     return SupportingElementOut(
         id=row["id"],
         name=row["name"],
         summary=row["summary"],
         supporting_kind=row["supporting_kind"],
-        provenance=_provenance_out(row),
+        provenance=_provenance_out(row, logical_by_dbid),
     )
+
+
+def _logical_entrypoint_map(conn, snapshot_id, system_id) -> dict:
+    """Map a snapshot's code_entrypoints DB row id -> logical (type, id).
+
+    Persisted hierarchy nodes store the snapshot-local DB row id, which is not
+    stable across snapshots. The logical pair lets the dashboard link a node to
+    Flow Explorer (#62) without re-resolving the DB id.
+    """
+    rows = conn.execute(
+        "SELECT id, entrypoint_type, entrypoint_id FROM code_entrypoints "
+        "WHERE snapshot_id = ? AND system_id = ?",
+        (snapshot_id, system_id),
+    ).fetchall()
+    return {r["id"]: (r["entrypoint_type"], r["entrypoint_id"]) for r in rows}
 
 
 def _load_hierarchy_out(conn, system_id, snapshot_id, run_row) -> CapabilityHierarchyOut:
@@ -1690,6 +1713,7 @@ def _load_hierarchy_out(conn, system_id, snapshot_id, run_row) -> CapabilityHier
         "ORDER BY id",
         (run_row["id"],),
     ).fetchall()
+    logical_by_dbid = _logical_entrypoint_map(conn, run_row["snapshot_id"], system_id)
     by_parent: dict = {}
     purpose_row = None
     capability_rows = []
@@ -1714,10 +1738,14 @@ def _load_hierarchy_out(conn, system_id, snapshot_id, run_row) -> CapabilityHier
             capability_key=cap["capability_key"],
             name=cap["name"],
             summary=cap["summary"],
-            provenance=_provenance_out(cap),
-            elements=[_element_out(c) for c in children if c["node_type"] == "element"],
+            provenance=_provenance_out(cap, logical_by_dbid),
+            elements=[
+                _element_out(c, logical_by_dbid)
+                for c in children if c["node_type"] == "element"
+            ],
             supporting_elements=[
-                _supporting_out(c) for c in children if c["node_type"] == "supporting"
+                _supporting_out(c, logical_by_dbid)
+                for c in children if c["node_type"] == "supporting"
             ],
         ))
 
@@ -1727,7 +1755,7 @@ def _load_hierarchy_out(conn, system_id, snapshot_id, run_row) -> CapabilityHier
             id=purpose_row["id"],
             name=purpose_row["name"],
             summary=purpose_row["summary"],
-            provenance=_provenance_out(purpose_row),
+            provenance=_provenance_out(purpose_row, logical_by_dbid),
         )
 
     return CapabilityHierarchyOut(
@@ -1736,8 +1764,12 @@ def _load_hierarchy_out(conn, system_id, snapshot_id, run_row) -> CapabilityHier
         intelligence_run=_intelligence_run_out(run_row),
         purpose=purpose,
         capabilities=capabilities,
-        unclassified_elements=[_element_out(r) for r in unclassified_rows],
-        unattached_supporting=[_supporting_out(r) for r in unattached_supporting_rows],
+        unclassified_elements=[
+            _element_out(r, logical_by_dbid) for r in unclassified_rows
+        ],
+        unattached_supporting=[
+            _supporting_out(r, logical_by_dbid) for r in unattached_supporting_rows
+        ],
         is_mock=bool(run_row["is_mock"]),
     )
 

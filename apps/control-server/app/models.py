@@ -634,6 +634,12 @@ class HierarchyProvenanceOut(BaseModel):
     explanation_hash: Optional[str] = None
     symbol_id: Optional[int] = None
     entrypoint_id: Optional[int] = None
+    # Stable logical entrypoint reference (#62). ``entrypoint_id`` above is the
+    # snapshot-local DB row id and is not safe for cross-snapshot linking. These
+    # carry the logical (type, id) so the dashboard can open the entrypoint in
+    # Flow Explorer without re-resolving the DB id.
+    entrypoint_type: Optional[str] = None
+    entrypoint_ref: Optional[str] = None
     feature_id: Optional[str] = None
     system_profile_draft_id: Optional[int] = None
     provider: Optional[str] = None

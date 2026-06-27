@@ -293,6 +293,10 @@ export interface HierarchyProvenanceOut {
   explanation_hash: string | null;
   symbol_id: number | null;
   entrypoint_id: number | null;
+  // Stable logical entrypoint reference (#62) for Flow Explorer linking. The
+  // numeric entrypoint_id above is snapshot-local and not link-safe.
+  entrypoint_type: string | null;
+  entrypoint_ref: string | null;
   feature_id: string | null;
   system_profile_draft_id: number | null;
   provider: string | null;

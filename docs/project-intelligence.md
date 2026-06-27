@@ -424,8 +424,10 @@ enum / enum list は CLAUDE.md 原則 6 に沿って**明示的な有限集合**
 
 ### 非対象（#54）
 
-- ソースの自動改変、リポジトリへのメタデータ書き戻し。
-- LLM 生成メタデータ。
+- #54 単体としてのソース自動改変、リポジトリへのメタデータ書き戻し。
+  （CLAUDE.md 原則8で許可される対話的interview→隔離worktree→reviewable diff/PR
+  というフローは別issueで扱う。#54はあくまで「既存メタデータの決定的抽出」のみ。）
+- LLM 生成メタデータをそのまま `source_authored` として保存すること。
 - drift スコアリングや完全な階層・refresh ワークフロー。
 - 自由文からのヒューリスティックな最終分類。
 
@@ -706,6 +708,44 @@ Feature Map ページの置き換え。
 
 非対象: 自動ソース編集、コミット作成、バックグラウンドでの暗黙 refresh、reasoning
 モデル不在時の heuristic fallback。
+
+## Capability Map（Issue #62）
+
+#54-#59 で構築した source-backed な能力階層（System Purpose → Core Capability →
+Capability Element / Supporting Element）は、これまで Flow Explorer の API Role
+Card（entrypoint を選んだ後のローカル文脈）からしか見えなかった。#62 は逆方向の
+ナビゲーション、つまり「システムの目的・中核能力から、それを実装する API / 関数 /
+境界 / probe フローへドリルダウンする」体験をダッシュボードに追加する。
+
+- ダッシュボードに **Capability Map** ページ（`/capability-map`）を追加する。左側に
+  System Purpose と Core Capability でグルーピングしたツリー、右側に選択ノードの
+  詳細パネル（provenance バッジ、freshness/drift、source anchor の path + line range、
+  受理済み `FeatureCodeLink` の feature id、reasoning model 情報）を表示する。
+- 階層が未生成のときは、前提条件（snapshot 作成・symbol index・System Profile
+  Draft 生成）を順序付きチェックリストとして表示する（`useLatestSnapshot()` /
+  `useSymbols()` / `useLatestDrafts()` の既存状態をそのまま再利用し、新しい判断や
+  API は追加しない）。実行順序が文章説明だけでは伝わりにくかったため、各項目の完了
+  状態を可視化して `Repository` ページへ誘導する。その上で
+  `Generate capability hierarchy`（`use_reasoning` 任意）操作を提供する。
+- フロントエンドのフック: `useCapabilityHierarchy()` /
+  `useCapabilityHierarchyDrift()` / `useGenerateCapabilityHierarchy()`。
+- 永続化済み階層ノードは snapshot-local な `code_entrypoints` の DB row id を保持して
+  おりリンクに使えない。`GET /repository/capability-hierarchy` の各ノード provenance に
+  安定した論理 entrypoint（`entrypoint_type` / `entrypoint_ref`）を付与し、API /
+  message_queue / scheduled_job / CLI に紐づく要素から Flow Explorer を開けるように
+  する。これは決定的な構造リンクで、新しい主張ではない。
+- Flow Explorer は `entrypoint_type` / `entrypoint_id` クエリパラメータを受け取り、
+  一致する entrypoint を自動選択してフローグラフを構築する。そこから既存の
+  node/edge 選択と Probe Plan draft ワークフローへ継続できる。
+- drift が review 推奨のノードでは #59 の「Propose explanation refresh」を再利用し、
+  提案のみ（ソースは書き換えない）であることを明示する。
+- source-authored / structural / reasoning_llm / manual の provenance は視覚的に区別
+  したまま維持する。
+
+非対象（初版）: Capability Map ページ上での `probe-agent:` メタデータの直接編集、
+このページからの自動ソース書換、Feature Map ページの置換、自由文からの heuristic
+な能力グルーピング。（CLAUDE.md 原則8の対話的interview→隔離worktree→reviewable
+diff/PRフローは別issueのスコープであり、#62 のCapability Mapページ自体には含まない。）
 
 ## リポジトリ設定案
 

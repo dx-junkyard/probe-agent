@@ -1,7 +1,7 @@
 /// <reference types="vitest/globals" />
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter } from "react-router-dom";
+import { BrowserRouter, MemoryRouter } from "react-router-dom";
 import { vi } from "vitest";
 import type { ReactNode } from "react";
 
@@ -1039,6 +1039,156 @@ describe("Decision Workspace page", () => {
 
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith("/workspaces/1/proposals/5/draft");
+    });
+  });
+});
+
+// ── Capability Map tests (Issue #62) ────────────────────────────────
+
+function provenance(overrides: Record<string, unknown> = {}) {
+  return {
+    provenance_kind: "source_authored", decision_method: "deterministic",
+    path: "src/flow.py", qualified_name: "get_flow", start_line: 10, end_line: 20,
+    file_content_hash: "f1", symbol_source_hash: "s1", explanation_hash: "e1",
+    symbol_id: 5, entrypoint_id: 9, entrypoint_type: null, entrypoint_ref: null,
+    feature_id: null, system_profile_draft_id: null, provider: "deterministic",
+    model: "none", ...overrides,
+  };
+}
+
+function emptyHierarchy() {
+  return {
+    system_id: 1, snapshot_id: 0, intelligence_run: null, purpose: null,
+    capabilities: [], unclassified_elements: [], unattached_supporting: [],
+    is_mock: false,
+  };
+}
+
+describe("Capability Map page", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("shows prerequisites and a generate action when no hierarchy exists", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/capability-hierarchy") return Promise.resolve(emptyHierarchy());
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockResolvedValue({
+      ...emptyHierarchy(),
+      intelligence_run: { id: 1, status: "completed", decision_method: "deterministic" },
+    });
+
+    const { default: CapabilityMapPage } = await import("@/pages/capability-map");
+    render(<CapabilityMapPage />, { wrapper: createWrapper() });
+
+    expect(await screen.findByText("No capability hierarchy yet.")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("generate-hierarchy-empty"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/repository/capability-hierarchy/generate");
+    });
+  });
+
+  test("renders the hierarchy and links an entrypoint element to Flow Explorer", async () => {
+    const hierarchy = {
+      system_id: 1, snapshot_id: 5,
+      intelligence_run: { id: 1, status: "completed", decision_method: "deterministic" },
+      purpose: { id: 1, name: "Understand running systems", summary: "purpose summary", provenance: provenance() },
+      capabilities: [{
+        id: 2, capability_key: "doc-analysis", name: "Document Analysis",
+        summary: "analysis capability", provenance: provenance(),
+        elements: [{
+          id: 3, name: "GET /flow", summary: "lists flows", element_role: "Lists available flows",
+          operation_kind: "read", probe_value: null, classification: "classified",
+          provenance: provenance({ entrypoint_type: "http_route", entrypoint_ref: "GET:/flow" }),
+        }],
+        supporting_elements: [{
+          id: 4, name: "results table", summary: "", supporting_kind: "database",
+          provenance: provenance({ provenance_kind: "structural" }),
+        }],
+      }],
+      unclassified_elements: [], unattached_supporting: [], is_mock: false,
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/capability-hierarchy") return Promise.resolve(hierarchy);
+      return Promise.resolve(null);
+    });
+
+    const { default: CapabilityMapPage } = await import("@/pages/capability-map");
+    render(<CapabilityMapPage />, { wrapper: createWrapper() });
+
+    // Tree shows purpose, capability, element, and boundary.
+    expect(await screen.findByText("Understand running systems")).toBeInTheDocument();
+    expect(screen.getByText("Document Analysis")).toBeInTheDocument();
+
+    // Selecting the entrypoint-backed element exposes the Flow Explorer link
+    // carrying the logical entrypoint through query params.
+    fireEvent.click(screen.getByText("GET /flow"));
+    const link = await screen.findByTestId("open-in-flow");
+    expect(link).toHaveAttribute(
+      "href",
+      "/flow-explorer?entrypoint_type=http_route&entrypoint_id=GET%3A%2Fflow",
+    );
+    expect(screen.getByText("Lists available flows")).toBeInTheDocument();
+  });
+});
+
+describe("Flow Explorer auto-select from URL (Issue #62)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("opens the entrypoint named in query params and builds its graph", async () => {
+    const entrypoint = {
+      entrypoint_type: "http_route", entrypoint_id: "POST:/documents/analyze",
+      label: "POST /documents/analyze", path: "app.py", qualified_name: "analyze_document",
+      line_start: 5, line_end: 11, component_id: null, route_method: "POST",
+      route_path: "/documents/analyze", category: "api", framework: "fastapi",
+      operation: "POST /documents/analyze", confidence: 1.0, evidence: [],
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/flow-entrypoints") {
+        return Promise.resolve({
+          system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
+          total: 1, entrypoints: [entrypoint], functions: [],
+          counts: { api: 1, message_queue: 0, scheduled_job: 0, cli: 0, function: 0 },
+          indexed_function_count: 0, has_backend_entrypoints: true, frameworks: ["fastapi"],
+          diagnostics: [],
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockImplementation((path: string) =>
+      path === "/repository/flow-graphs"
+        ? Promise.resolve({
+            system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
+            entrypoint, nodes: [], edges: [], candidate_paths: [],
+            diagnostics: [], truncated: false,
+          })
+        : Promise.resolve(null));
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: FlowExplorerPage } = await import("@/pages/flow-explorer");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={[
+          "/flow-explorer?entrypoint_type=http_route&entrypoint_id=POST:/documents/analyze",
+        ]}>
+          <FlowExplorerPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/repository/flow-graphs", {
+        entrypoint_type: "http_route",
+        entrypoint_id: "POST:/documents/analyze",
+      });
     });
   });
 });
