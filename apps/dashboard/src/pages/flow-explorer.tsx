@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import type { ReactNode } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import {
   useFlowEntrypoints, useBuildFlowGraph, useCreatePlanFromFlow, useApiRoleCards,
@@ -336,6 +336,13 @@ export default function FlowExplorerPage() {
   const diagnostics = entrypointsData?.diagnostics ?? [];
   const hasBackend = entrypointsData?.has_backend_entrypoints ?? true;
 
+  // Issue #62: the Capability Map links here with the logical entrypoint in the
+  // URL so the matching entrypoint auto-opens and its flow graph builds.
+  const [searchParams] = useSearchParams();
+  const wantType = searchParams.get("entrypoint_type");
+  const wantId = searchParams.get("entrypoint_id");
+  const autoOpenedRef = useRef<string | null>(null);
+
   const openEntrypoint = async (ep: FlowEntrypointOut) => {
     setActiveEntrypoint(ep);
     setGraph(null);
@@ -353,6 +360,31 @@ export default function FlowExplorerPage() {
       toast.error(String(e));
     }
   };
+
+  useEffect(() => {
+    if (!wantType || !wantId) return;
+    const key = `${wantType}:${wantId}`;
+    if (autoOpenedRef.current === key) return;
+    if (
+      activeEntrypoint &&
+      activeEntrypoint.entrypoint_type === wantType &&
+      activeEntrypoint.entrypoint_id === wantId
+    ) {
+      autoOpenedRef.current = key;
+      return;
+    }
+    const match = [...entrypoints, ...functions].find(
+      ep => ep.entrypoint_type === wantType && ep.entrypoint_id === wantId,
+    );
+    if (match) {
+      autoOpenedRef.current = key;
+      // Defer out of the effect body: openEntrypoint updates state and kicks off
+      // the graph build, and auto-open is gated by autoOpenedRef so it only
+      // fires once per URL target.
+      queueMicrotask(() => openEntrypoint(match));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wantType, wantId, entrypoints, functions, activeEntrypoint]);
 
   const toggleNode = (node: FlowNodeOut) => {
     if (node.is_external) {

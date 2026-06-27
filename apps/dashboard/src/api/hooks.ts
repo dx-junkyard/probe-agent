@@ -8,6 +8,7 @@ import type {
   SymbolIndexOut, FeatureCodeLinksOut, ProbePlansListOut, ApiScanResultOut,
   FlowEntrypointsOut, FlowGraphOut, FlowProbeSelection, ProbePlanOut,
   ApiRoleCardsOut, ExplanationRefreshOut, RefreshProposalRequest,
+  CapabilityHierarchyOut, CapabilityHierarchyDriftOut,
   ProbePatchOut, GenerationRun, ExperimentOut, MeResponse,
   EvaluationCriterion,
   SystemProfile,
@@ -351,6 +352,41 @@ export function useApiRoleCards() {
     queryKey: sysKey("apiRoleCards"),
     queryFn: () => api.get<ApiRoleCardsOut>("/repository/api-role-cards"),
     enabled: !!getSystemId(),
+  });
+}
+
+// Capability Map (Issue #62) — navigate from system purpose to APIs/probe flows.
+export function useCapabilityHierarchy() {
+  return useQuery({
+    queryKey: sysKey("capabilityHierarchy"),
+    queryFn: () => api.get<CapabilityHierarchyOut>("/repository/capability-hierarchy"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useCapabilityHierarchyDrift() {
+  return useQuery({
+    queryKey: sysKey("capabilityHierarchyDrift"),
+    queryFn: () =>
+      api.get<CapabilityHierarchyDriftOut>("/repository/capability-hierarchy/drift"),
+    enabled: !!getSystemId(),
+    // The endpoint 400s until a hierarchy exists; surface that as "no drift".
+    retry: false,
+  });
+}
+
+export function useGenerateCapabilityHierarchy() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (useReasoning?: boolean) =>
+      api.post<CapabilityHierarchyOut>(
+        `/repository/capability-hierarchy/generate${useReasoning ? "?use_reasoning=true" : ""}`,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: sysKey("capabilityHierarchy") });
+      qc.invalidateQueries({ queryKey: sysKey("capabilityHierarchyDrift") });
+      qc.invalidateQueries({ queryKey: sysKey("apiRoleCards") });
+    },
   });
 }
 

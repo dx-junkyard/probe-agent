@@ -707,6 +707,38 @@ Feature Map ページの置き換え。
 非対象: 自動ソース編集、コミット作成、バックグラウンドでの暗黙 refresh、reasoning
 モデル不在時の heuristic fallback。
 
+## Capability Map（Issue #62）
+
+#54-#59 で構築した source-backed な能力階層（System Purpose → Core Capability →
+Capability Element / Supporting Element）は、これまで Flow Explorer の API Role
+Card（entrypoint を選んだ後のローカル文脈）からしか見えなかった。#62 は逆方向の
+ナビゲーション、つまり「システムの目的・中核能力から、それを実装する API / 関数 /
+境界 / probe フローへドリルダウンする」体験をダッシュボードに追加する。
+
+- ダッシュボードに **Capability Map** ページ（`/capability-map`）を追加する。左側に
+  System Purpose と Core Capability でグルーピングしたツリー、右側に選択ノードの
+  詳細パネル（provenance バッジ、freshness/drift、source anchor の path + line range、
+  受理済み `FeatureCodeLink` の feature id、reasoning model 情報）を表示する。
+- 階層が未生成のときは前提条件（snapshot 作成・symbol index・階層生成）を説明し、
+  `Generate capability hierarchy`（`use_reasoning` 任意）操作を提供する。
+- フロントエンドのフック: `useCapabilityHierarchy()` /
+  `useCapabilityHierarchyDrift()` / `useGenerateCapabilityHierarchy()`。
+- 永続化済み階層ノードは snapshot-local な `code_entrypoints` の DB row id を保持して
+  おりリンクに使えない。`GET /repository/capability-hierarchy` の各ノード provenance に
+  安定した論理 entrypoint（`entrypoint_type` / `entrypoint_ref`）を付与し、API /
+  message_queue / scheduled_job / CLI に紐づく要素から Flow Explorer を開けるように
+  する。これは決定的な構造リンクで、新しい主張ではない。
+- Flow Explorer は `entrypoint_type` / `entrypoint_id` クエリパラメータを受け取り、
+  一致する entrypoint を自動選択してフローグラフを構築する。そこから既存の
+  node/edge 選択と Probe Plan draft ワークフローへ継続できる。
+- drift が review 推奨のノードでは #59 の「Propose explanation refresh」を再利用し、
+  提案のみ（ソースは書き換えない）であることを明示する。
+- source-authored / structural / reasoning_llm / manual の provenance は視覚的に区別
+  したまま維持する。
+
+非対象（初版）: ダッシュボード上での `probe-agent:` メタデータ編集、自動ソース書換、
+Feature Map ページの置換、自由文からの heuristic な能力グルーピング。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。
