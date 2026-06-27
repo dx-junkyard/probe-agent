@@ -116,6 +116,43 @@ class TestBuildHierarchy:
         assert len(built.unattached_supporting) == 1
         assert built.unattached_supporting[0].supporting_kind == "scheduled-job"
 
+    def test_supporting_entrypoint_carries_handler_provenance(self):
+        from app.capability_hierarchy import build_hierarchy, EntrypointRecord
+
+        sym = _sym(5, "nightly", has_metadata=False,
+                   file_content_hash="fch5", symbol_source_hash="ssh5")
+        eps = [EntrypointRecord(
+            entrypoint_id=20, category="scheduled_job", label="nightly job",
+            handler_symbol_id=5, handler_path="src/m.py",
+            handler_qualified_name="nightly", line_start=1, line_end=3,
+        )]
+        built = build_hierarchy([sym], eps, None)
+        node = built.unattached_supporting[0]
+        # The supporting boundary now carries hash provenance for drift detection.
+        assert node.symbol_id == 5
+        assert node.file_content_hash == "fch5"
+        assert node.symbol_source_hash == "ssh5"
+
+    def test_feature_links_attached_to_nodes(self):
+        from app.capability_hierarchy import build_hierarchy, EntrypointRecord
+
+        symbols = [
+            _sym(1, "handler", has_metadata=True, capability="flow",
+                 element_type="element"),
+            _sym(2, "job_fn", has_metadata=False),
+        ]
+        eps = [EntrypointRecord(
+            entrypoint_id=30, category="scheduled_job", label="job",
+            handler_symbol_id=2, handler_path="src/m.py",
+            handler_qualified_name="job_fn", line_start=1, line_end=3,
+        )]
+        built = build_hierarchy(symbols, eps, None,
+                                feature_links={1: "feat-x", 2: "feat-y"})
+        cap = built.capability_by_key("flow")
+        element = next(c for c in cap.children if c.node_type == "element")
+        assert element.feature_id == "feat-x"
+        assert built.unattached_supporting[0].feature_id == "feat-y"
+
     def test_build_is_deterministic(self):
         from app.capability_hierarchy import build_hierarchy
 
@@ -405,6 +442,62 @@ class TestCapabilityHierarchyAPI:
         assert not any(
             e["provenance"]["entrypoint_id"] == ep_id
             for e in body["unclassified_elements"]
+        )
+
+    def test_accepted_feature_link_wired_into_hierarchy(self, admin_client, tmp_path):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "HierFeature")
+        repo = _make_repo(tmp_path)
+        h = _headers(token, system["id"])
+        _index(admin_client, token, system["id"], repo)
+
+        symbols = admin_client.get("/repository/symbols", headers=h).json()
+        snapshot_id = symbols["snapshot_id"]
+        flow_sym = next(
+            s for s in symbols["symbols"] if s["qualified_name"] == "build_flow_graph"
+        )
+
+        # Simulate an accepted Feature-to-Code link (#24) for that symbol.
+        now = 1.0
+        with get_conn() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO intelligence_runs
+                    (system_id, snapshot_id, run_type, provider, model,
+                     prompt_version, schema_version, decision_method, status,
+                     is_mock, started_at, completed_at)
+                VALUES (?, ?, 'feature_code_mapping', 'mock', 'mock', 'v1', 'v1',
+                        'reasoning_llm', 'completed', 1, ?, ?)
+                """,
+                (system["id"], snapshot_id, now, now),
+            )
+            run_id = cur.lastrowid
+            conn.execute(
+                """
+                INSERT INTO feature_code_links
+                    (system_id, snapshot_id, intelligence_run_id, feature_id,
+                     symbol_id, relation_reason, confidence, source,
+                     review_status, created_at, updated_at)
+                VALUES (?, ?, ?, 'flow-feature', ?, 'implements flow', 0.9,
+                        'reasoning_llm', 'accepted', ?, ?)
+                """,
+                (system["id"], snapshot_id, run_id, flow_sym["id"], now, now),
+            )
+
+        body = admin_client.post(
+            "/repository/capability-hierarchy/generate", headers=h
+        ).json()
+        cap = body["capabilities"][0]
+        flow_elements = [
+            e for e in cap["elements"]
+            if e["provenance"]["symbol_id"] == flow_sym["id"]
+            and e["provenance"]["entrypoint_id"] is None
+        ]
+        assert flow_elements
+        assert any(
+            e["provenance"]["feature_id"] == "flow-feature" for e in flow_elements
         )
 
     def test_hierarchy_is_system_scoped(self, admin_client, tmp_path):

@@ -1535,6 +1535,26 @@ def _hierarchy_entrypoint_records(conn, snapshot_id: int, system_id: int):
     ]
 
 
+def _accepted_feature_links_by_symbol(conn, system_id: int, snapshot_id: int) -> dict:
+    """Map ``symbol_id -> feature_id`` for accepted Feature-to-Code links (#24).
+
+    Connects hierarchy nodes back to the existing Feature Map. When a symbol has
+    several accepted links, the highest-confidence one wins (deterministic).
+    """
+    rows = conn.execute(
+        """
+        SELECT symbol_id, feature_id FROM feature_code_links
+        WHERE system_id = ? AND snapshot_id = ? AND review_status = 'accepted'
+        ORDER BY confidence DESC, id ASC
+        """,
+        (system_id, snapshot_id),
+    ).fetchall()
+    mapping: dict = {}
+    for r in rows:
+        mapping.setdefault(r["symbol_id"], r["feature_id"])
+    return mapping
+
+
 def _persist_hierarchy_node(conn, system_id, snapshot_id, run_id, node, parent_id, now):
     cur = conn.execute(
         """
@@ -1728,13 +1748,14 @@ def generate_capability_hierarchy(
             """,
             (system_id, snapshot_id),
         ).fetchone()
+        feature_links = _accepted_feature_links_by_symbol(conn, system_id, snapshot_id)
 
     sp_draft = (
         {"id": draft_row["id"], "name": draft_row["name"], "purpose": draft_row["purpose"]}
         if draft_row is not None
         else None
     )
-    built = build_hierarchy(symbols, entrypoints, sp_draft)
+    built = build_hierarchy(symbols, entrypoints, sp_draft, feature_links=feature_links)
 
     # Optional reasoning-assisted grouping of unclassified API entrypoints.
     grouping = None

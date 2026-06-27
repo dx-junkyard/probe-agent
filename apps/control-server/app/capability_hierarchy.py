@@ -142,17 +142,42 @@ def _apply_anchor(node: HierarchyNode, sym: SymbolRecord) -> None:
     node.explanation_hash = sym.explanation_hash
 
 
+def _apply_handler_provenance(node: HierarchyNode, handler: Optional[SymbolRecord]) -> None:
+    """Copy hash provenance from a resolved entrypoint handler symbol.
+
+    Entrypoint nodes already carry the handler path/line range; this adds the
+    symbol id and #55 hashes so every entrypoint-derived claim (API or backend
+    boundary) can participate in later drift detection.
+    """
+    if handler is None:
+        return
+    node.symbol_id = handler.symbol_id
+    node.file_content_hash = handler.file_content_hash
+    node.symbol_source_hash = handler.symbol_source_hash
+    node.explanation_hash = handler.explanation_hash
+
+
 def build_hierarchy(
     symbols: List[SymbolRecord],
     entrypoints: List[EntrypointRecord],
     system_profile_draft: Optional[Dict] = None,
+    feature_links: Optional[Dict[int, str]] = None,
 ) -> BuiltHierarchy:
     """Deterministically build the hierarchy from source-authored metadata.
 
     Grouping uses only the author-written ``capability`` field; nothing is
     inferred from free text. Symbols/entrypoints without a capability become
     ``unclassified`` rather than being guessed at.
+
+    ``feature_links`` maps ``symbol_id -> feature_id`` for accepted
+    Feature-to-Code links (#24), connecting hierarchy nodes back to the existing
+    Feature Map. It is a deterministic structural link, not a new claim.
     """
+    feature_links = feature_links or {}
+
+    def _feature_for(symbol_id: Optional[int]) -> Optional[str]:
+        return feature_links.get(symbol_id) if symbol_id is not None else None
+
     symbols_by_id = {s.symbol_id: s for s in symbols}
     capabilities: Dict[str, HierarchyNode] = {}
     # Track which (capability_key, supporting_kind, symbol_id) we already added.
@@ -184,6 +209,7 @@ def build_hierarchy(
             if cap.path is None:
                 _apply_anchor(cap, sym)
 
+        feature_id = _feature_for(sym.symbol_id)
         if etype in ("supporting", "boundary"):
             supporting = HierarchyNode(
                 node_type="supporting",
@@ -192,6 +218,7 @@ def build_hierarchy(
                 capability_key=sym.capability,
                 supporting_kind="boundary",
                 operation_kind=sym.operation_kind,
+                feature_id=feature_id,
                 provenance_kind=SOURCE_AUTHORED,
                 decision_method="deterministic",
             )
@@ -207,6 +234,7 @@ def build_hierarchy(
                 operation_kind=sym.operation_kind,
                 probe_value=sym.probe_value,
                 classification="classified",
+                feature_id=feature_id,
                 provenance_kind=SOURCE_AUTHORED,
                 decision_method="deterministic",
             )
@@ -228,6 +256,7 @@ def build_hierarchy(
                 summary=f"{effect} declared by {sym.qualified_name}",
                 capability_key=sym.capability,
                 supporting_kind=kind,
+                feature_id=feature_id,
                 provenance_kind=SOURCE_AUTHORED,
                 decision_method="deterministic",
             )
@@ -281,14 +310,11 @@ def build_hierarchy(
                 provenance_kind=STRUCTURAL,
                 decision_method="deterministic",
             )
-            if handler is not None:
-                node.symbol_id = handler.symbol_id
-                node.file_content_hash = handler.file_content_hash
-                node.symbol_source_hash = handler.symbol_source_hash
+            _apply_handler_provenance(node, handler)
+            node.feature_id = _feature_for(handler.symbol_id) if handler else None
             if cap_key and cap_key in capabilities:
                 node.classification = "classified"
                 node.capability_key = cap_key
-                node.explanation_hash = handler.explanation_hash if handler else None
                 node.provenance_kind = SOURCE_AUTHORED
                 capabilities[cap_key].children.append(node)
             else:
@@ -317,6 +343,8 @@ def build_hierarchy(
                 provenance_kind=STRUCTURAL,
                 decision_method="deterministic",
             )
+            _apply_handler_provenance(node, handler)
+            node.feature_id = _feature_for(handler.symbol_id) if handler else None
             if cap_key and cap_key in capabilities:
                 capabilities[cap_key].children.append(node)
             else:

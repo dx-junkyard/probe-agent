@@ -560,7 +560,13 @@ provider/model も持つ。
   対応付け。能力階層は **source-authored メタデータ起点**で symbol/entrypoint を
   capability に構成する点が異なり、決定的事実と reasoning 解釈を `provenance_kind`
   で分離する。両者は補完的で、後続の API role card・probe 選択コンテキスト・
-  refresh 推奨の意味層となる。
+  refresh 推奨の意味層となる。`review_status='accepted'` の FeatureCodeLink が
+  symbol を Feature に結びつけている場合は、その `feature_id` を該当ノードの
+  provenance に決定的に付与して Feature Map と接続する（複数候補は confidence 最大）。
+- **ハッシュ来歴の網羅性**: capability element だけでなく、message_queue /
+  scheduled_job / cli の supporting 境界も handler symbol が解決できれば
+  `symbol_id` と #55 ハッシュ（file/source/explanation）を持ち、後続の drift 検出に
+  参加できる。
 
 ## リポジトリ設定案
 
