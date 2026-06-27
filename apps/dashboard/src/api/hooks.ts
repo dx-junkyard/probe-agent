@@ -7,6 +7,7 @@ import type {
   DraftGenerationResultOut,
   SymbolIndexOut, FeatureCodeLinksOut, ProbePlansListOut, ApiScanResultOut,
   FlowEntrypointsOut, FlowGraphOut, FlowProbeSelection, ProbePlanOut,
+  ApiRoleCardsOut, ExplanationRefreshOut, RefreshProposalRequest,
   ProbePatchOut, GenerationRun, ExperimentOut, MeResponse,
   EvaluationCriterion,
   SystemProfile,
@@ -342,6 +343,21 @@ export function useFlowEntrypoints(
       );
     },
     enabled: !!getSystemId(),
+  });
+}
+
+export function useApiRoleCards() {
+  return useQuery({
+    queryKey: sysKey("apiRoleCards"),
+    queryFn: () => api.get<ApiRoleCardsOut>("/repository/api-role-cards"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useRequestExplanationRefresh() {
+  return useMutation({
+    mutationFn: (body: RefreshProposalRequest) =>
+      api.post<ExplanationRefreshOut>("/repository/explanation-refresh", body),
   });
 }
 

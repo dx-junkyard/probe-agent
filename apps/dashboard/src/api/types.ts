@@ -194,6 +194,39 @@ export interface DraftGenerationResultOut {
   feature_drafts: FeatureDraftOut[];
 }
 
+export interface SourceMetadataOut {
+  start_line: number;
+  end_line: number;
+  raw_block: string;
+  role: string | null;
+  capability: string | null;
+  element_type:
+    | "system"
+    | "core"
+    | "capability"
+    | "element"
+    | "supporting"
+    | "boundary"
+    | null;
+  system_purpose: string | null;
+  operation_kind:
+    | "analysis"
+    | "read"
+    | "write"
+    | "mutation"
+    | "io"
+    | "orchestration"
+    | "validation"
+    | "other"
+    | null;
+  consumers: string[];
+  state_effects: string[];
+  probe_value: string | null;
+  origin: "source_authored";
+  // sha256 of the extracted explanation block (Issue #55); change signal only.
+  explanation_hash: string | null;
+}
+
 export interface CodeSymbolOut {
   id: number;
   snapshot_id: number;
@@ -211,6 +244,268 @@ export interface CodeSymbolOut {
   route_path: string | null;
   route_method: string | null;
   component_id: string | null;
+  source_metadata: SourceMetadataOut | null;
+  // Source-hash provenance (Issue #55). Change signals, not semantic equality.
+  file_content_hash: string | null;
+  symbol_source_hash: string | null;
+  symbol_body_hash: string | null;
+}
+
+export interface ExplanationAnchorOut {
+  id: number;
+  snapshot_id: number;
+  system_id: number;
+  metadata_id: number;
+  symbol_id: number;
+  path: string;
+  qualified_name: string;
+  start_line: number;
+  end_line: number;
+  file_content_hash: string | null;
+  symbol_source_hash: string | null;
+  symbol_body_hash: string | null;
+  explanation_hash: string | null;
+}
+
+export interface ExplanationAnchorsOut {
+  system_id: number;
+  snapshot_id: number;
+  anchor_count: number;
+  anchors: ExplanationAnchorOut[];
+}
+
+// Source-backed capability hierarchy (Issue #56).
+export type HierarchyProvenanceKind =
+  | "source_authored"
+  | "structural"
+  | "reasoning_llm"
+  | "manual";
+
+export interface HierarchyProvenanceOut {
+  provenance_kind: HierarchyProvenanceKind;
+  decision_method: "deterministic" | "reasoning_llm" | "manual";
+  path: string | null;
+  qualified_name: string | null;
+  start_line: number | null;
+  end_line: number | null;
+  file_content_hash: string | null;
+  symbol_source_hash: string | null;
+  explanation_hash: string | null;
+  symbol_id: number | null;
+  entrypoint_id: number | null;
+  feature_id: string | null;
+  system_profile_draft_id: number | null;
+  provider: string | null;
+  model: string | null;
+}
+
+export interface SupportingElementOut {
+  id: number;
+  name: string;
+  summary: string;
+  supporting_kind: string | null;
+  provenance: HierarchyProvenanceOut;
+}
+
+export interface CapabilityElementOut {
+  id: number;
+  name: string;
+  summary: string;
+  element_role: string | null;
+  operation_kind: string | null;
+  probe_value: string | null;
+  classification: "classified" | "unclassified" | null;
+  provenance: HierarchyProvenanceOut;
+}
+
+export interface CapabilityOut {
+  id: number;
+  capability_key: string | null;
+  name: string;
+  summary: string;
+  provenance: HierarchyProvenanceOut;
+  elements: CapabilityElementOut[];
+  supporting_elements: SupportingElementOut[];
+}
+
+export interface CapabilityPurposeOut {
+  id: number;
+  name: string;
+  summary: string;
+  provenance: HierarchyProvenanceOut;
+}
+
+export interface CapabilityHierarchyOut {
+  system_id: number;
+  snapshot_id: number;
+  intelligence_run: IntelligenceRunOut | null;
+  purpose: CapabilityPurposeOut | null;
+  capabilities: CapabilityOut[];
+  unclassified_elements: CapabilityElementOut[];
+  unattached_supporting: SupportingElementOut[];
+  is_mock: boolean;
+}
+
+// Explanation drift (Issue #57). Hash drift is a review trigger, not a verdict.
+export type DriftStatus =
+  | "fresh"
+  | "partially_stale"
+  | "stale"
+  | "missing_source"
+  | "unknown";
+
+export interface AnchorDriftOut {
+  node_id: number;
+  node_type: string;
+  name: string;
+  path: string | null;
+  qualified_name: string | null;
+  entrypoint_id: number | null;
+  status: DriftStatus;
+  changed_hashes: string[];
+  captured_file_content_hash: string | null;
+  captured_symbol_source_hash: string | null;
+  captured_explanation_hash: string | null;
+  current_file_content_hash: string | null;
+  current_symbol_source_hash: string | null;
+  current_explanation_hash: string | null;
+}
+
+export interface DriftCountsOut {
+  total: number;
+  fresh: number;
+  stale: number;
+  missing: number;
+  unknown: number;
+  symbol_deps_total: number;
+  symbol_deps_changed: number;
+  file_deps_total: number;
+  file_deps_changed: number;
+  explanation_blocks_total: number;
+  explanation_blocks_changed: number;
+  missing_anchors: number;
+  mismatch_ratio: number;
+}
+
+export interface CapabilityDriftOut {
+  capability_id: number;
+  capability_key: string | null;
+  name: string;
+  status: DriftStatus;
+  counts: DriftCountsOut;
+  elements: AnchorDriftOut[];
+  supporting_elements: AnchorDriftOut[];
+}
+
+export interface CapabilityHierarchyDriftOut {
+  system_id: number;
+  base_snapshot_id: number;
+  target_snapshot_id: number;
+  intelligence_run: IntelligenceRunOut | null;
+  status: DriftStatus;
+  counts: DriftCountsOut;
+  target_indexed: boolean;
+  purpose: AnchorDriftOut | null;
+  capabilities: CapabilityDriftOut[];
+  unclassified_elements: AnchorDriftOut[];
+  unattached_supporting: AnchorDriftOut[];
+  is_review_recommended: boolean;
+  review_note: string | null;
+}
+
+// API role cards (Issue #58) — Flow Explorer developer context.
+export interface ApiRoleCardOut {
+  entrypoint_type: string;
+  entrypoint_id: string;
+  label: string;
+  category: string;
+  route_method: string | null;
+  route_path: string | null;
+  operation: string | null;
+  framework: string | null;
+  source: string;
+  handler_resolved: boolean;
+  classification: "classified" | "unclassified" | "unknown";
+  capability_key: string | null;
+  capability_name: string | null;
+  element_type: string | null;
+  role: string | null;
+  operation_kind: string | null;
+  probe_value: string | null;
+  consumers: string[];
+  state_effects: string[];
+  boundaries: string[];
+  flows_through: string[];
+  provenance_kinds: HierarchyProvenanceKind[];
+  drift_status: DriftStatus | null;
+  drift_changed_anchors: number;
+  drift_total_anchors: number;
+  drift_review_recommended: boolean;
+  review_needed: boolean;
+  review_reason: string | null;
+  node_id: number | null;
+}
+
+export interface ApiRoleCardsOut {
+  system_id: number;
+  snapshot_id: number | null;
+  hierarchy_run: IntelligenceRunOut | null;
+  base_snapshot_id: number | null;
+  target_snapshot_id: number | null;
+  drift_available: boolean;
+  cards: ApiRoleCardOut[];
+}
+
+// Issue #59: reasoning-model explanation refresh proposals. A proposal is a
+// SUGGESTION only; a developer must review and apply it to the source by hand.
+export interface ExplanationRefreshProposalOut {
+  id: number | null;
+  node_id: number | null;
+  node_type: string;
+  name: string;
+  entrypoint_type: string | null;
+  entrypoint_id: string | null;
+  path: string | null;
+  qualified_name: string | null;
+  drift_status: DriftStatus;
+  drift_reason: string;
+  changed_hashes: string[];
+  old_explanation: string;
+  proposed_explanation: string | null;
+  proposed_metadata: Record<string, unknown> | null;
+  summary_of_changes: string | null;
+  confidence: number | null;
+  captured_file_content_hash: string | null;
+  captured_symbol_source_hash: string | null;
+  captured_explanation_hash: string | null;
+  current_file_content_hash: string | null;
+  current_symbol_source_hash: string | null;
+  current_explanation_hash: string | null;
+  status: "proposed" | "failed";
+  is_mock: boolean;
+  provider: string;
+  model: string;
+  decision_method: string;
+  created_at: number | null;
+}
+
+export interface ExplanationRefreshOut {
+  system_id: number;
+  base_snapshot_id: number | null;
+  target_snapshot_id: number | null;
+  intelligence_run: IntelligenceRunOut | null;
+  status: "proposed" | "failed";
+  error: string | null;
+  review_required: boolean;
+  review_note: string;
+  proposal: ExplanationRefreshProposalOut | null;
+}
+
+export interface RefreshProposalRequest {
+  node_id?: number | null;
+  entrypoint_type?: string | null;
+  entrypoint_id?: string | null;
+  target_snapshot_id?: number | null;
 }
 
 export interface SymbolIndexOut {

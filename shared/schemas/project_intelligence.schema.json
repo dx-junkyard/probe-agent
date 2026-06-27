@@ -118,6 +118,57 @@
         "created_at": { "type": "number" }
       }
     },
+    "SourceMetadata": {
+      "type": "object",
+      "description": "Author-written, source-anchored explanation copied verbatim from a docstring probe-agent block. Kept separate from reasoning-model output; origin is always source_authored.",
+      "required": ["start_line", "end_line", "raw_block"],
+      "properties": {
+        "start_line": { "type": "integer", "minimum": 1 },
+        "end_line": { "type": "integer", "minimum": 1 },
+        "raw_block": { "type": "string" },
+        "role": { "type": ["string", "null"] },
+        "capability": { "type": ["string", "null"] },
+        "element_type": {
+          "type": ["string", "null"],
+          "enum": ["system", "core", "capability", "element", "supporting", "boundary", null]
+        },
+        "system_purpose": { "type": ["string", "null"] },
+        "operation_kind": {
+          "type": ["string", "null"],
+          "enum": ["analysis", "read", "write", "mutation", "io", "orchestration", "validation", "other", null]
+        },
+        "consumers": { "type": "array", "items": { "type": "string" } },
+        "state_effects": { "type": "array", "items": { "type": "string" } },
+        "probe_value": { "type": ["string", "null"] },
+        "origin": { "enum": ["source_authored"] },
+        "explanation_hash": {
+          "type": ["string", "null"],
+          "description": "sha256 of the extracted explanation block. A change signal only; not semantic equality."
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExplanationAnchor": {
+      "type": "object",
+      "description": "A deterministic source anchor an explanation depends on (file, symbol span, and hash provenance). Used by downstream drift features; hash equality is only a change signal.",
+      "required": ["id", "snapshot_id", "system_id", "metadata_id", "symbol_id", "path", "qualified_name", "start_line", "end_line"],
+      "properties": {
+        "id": { "type": "integer" },
+        "snapshot_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "metadata_id": { "type": "integer" },
+        "symbol_id": { "type": "integer" },
+        "path": { "type": "string" },
+        "qualified_name": { "type": "string" },
+        "start_line": { "type": "integer", "minimum": 1 },
+        "end_line": { "type": "integer", "minimum": 1 },
+        "file_content_hash": { "type": ["string", "null"] },
+        "symbol_source_hash": { "type": ["string", "null"] },
+        "symbol_body_hash": { "type": ["string", "null"] },
+        "explanation_hash": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
     "CodeSymbol": {
       "type": "object",
       "required": ["id", "snapshot_id", "system_id", "path", "qualified_name", "kind", "start_line", "end_line"],
@@ -137,7 +188,25 @@
         "is_pydantic_model": { "type": "boolean" },
         "route_path": { "type": ["string", "null"] },
         "route_method": { "type": ["string", "null"] },
-        "component_id": { "type": ["string", "null"] }
+        "component_id": { "type": ["string", "null"] },
+        "source_metadata": {
+          "oneOf": [
+            { "$ref": "#/definitions/SourceMetadata" },
+            { "type": "null" }
+          ]
+        },
+        "file_content_hash": {
+          "type": ["string", "null"],
+          "description": "sha256 of the committed file content for the symbol's path in the pinned snapshot."
+        },
+        "symbol_source_hash": {
+          "type": ["string", "null"],
+          "description": "sha256 of the symbol's exact source span (signature + body, as committed)."
+        },
+        "symbol_body_hash": {
+          "type": ["string", "null"],
+          "description": "sha256 of a normalized AST with docstring removed and comments/formatting excluded."
+        }
       },
       "additionalProperties": false
     },
@@ -265,6 +334,292 @@
         "error": { "type": ["string", "null"] },
         "commands": { "type": "array", "items": { "$ref": "#/definitions/ValidationCommand" } },
         "created_at": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    "HierarchyProvenance": {
+      "type": "object",
+      "description": "Provenance for a single capability-hierarchy claim. provenance_kind distinguishes source-authored explanation, deterministic structural fact, and reasoning interpretation; decision_method is the audit enum.",
+      "required": ["provenance_kind", "decision_method"],
+      "properties": {
+        "provenance_kind": { "enum": ["source_authored", "structural", "reasoning_llm", "manual"] },
+        "decision_method": { "enum": ["deterministic", "reasoning_llm", "manual"] },
+        "path": { "type": ["string", "null"] },
+        "qualified_name": { "type": ["string", "null"] },
+        "start_line": { "type": ["integer", "null"] },
+        "end_line": { "type": ["integer", "null"] },
+        "file_content_hash": { "type": ["string", "null"] },
+        "symbol_source_hash": { "type": ["string", "null"] },
+        "explanation_hash": { "type": ["string", "null"] },
+        "symbol_id": { "type": ["integer", "null"] },
+        "entrypoint_id": { "type": ["integer", "null"] },
+        "feature_id": { "type": ["string", "null"] },
+        "system_profile_draft_id": { "type": ["integer", "null"] },
+        "provider": { "type": ["string", "null"] },
+        "model": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "SupportingElement": {
+      "type": "object",
+      "required": ["id", "name", "provenance"],
+      "properties": {
+        "id": { "type": "integer" },
+        "name": { "type": "string" },
+        "summary": { "type": "string" },
+        "supporting_kind": { "type": ["string", "null"] },
+        "provenance": { "$ref": "#/definitions/HierarchyProvenance" }
+      },
+      "additionalProperties": false
+    },
+    "CapabilityElement": {
+      "type": "object",
+      "required": ["id", "name", "provenance"],
+      "properties": {
+        "id": { "type": "integer" },
+        "name": { "type": "string" },
+        "summary": { "type": "string" },
+        "element_role": { "type": ["string", "null"] },
+        "operation_kind": { "type": ["string", "null"] },
+        "probe_value": { "type": ["string", "null"] },
+        "classification": { "type": ["string", "null"], "enum": ["classified", "unclassified", null] },
+        "provenance": { "$ref": "#/definitions/HierarchyProvenance" }
+      },
+      "additionalProperties": false
+    },
+    "Capability": {
+      "type": "object",
+      "required": ["id", "name", "provenance"],
+      "properties": {
+        "id": { "type": "integer" },
+        "capability_key": { "type": ["string", "null"] },
+        "name": { "type": "string" },
+        "summary": { "type": "string" },
+        "provenance": { "$ref": "#/definitions/HierarchyProvenance" },
+        "elements": { "type": "array", "items": { "$ref": "#/definitions/CapabilityElement" } },
+        "supporting_elements": { "type": "array", "items": { "$ref": "#/definitions/SupportingElement" } }
+      },
+      "additionalProperties": false
+    },
+    "CapabilityPurpose": {
+      "type": "object",
+      "required": ["id", "name", "provenance"],
+      "properties": {
+        "id": { "type": "integer" },
+        "name": { "type": "string" },
+        "summary": { "type": "string" },
+        "provenance": { "$ref": "#/definitions/HierarchyProvenance" }
+      },
+      "additionalProperties": false
+    },
+    "CapabilityHierarchy": {
+      "type": "object",
+      "required": ["system_id", "snapshot_id"],
+      "properties": {
+        "system_id": { "type": "integer" },
+        "snapshot_id": { "type": "integer" },
+        "intelligence_run": { "oneOf": [{ "$ref": "#/definitions/IntelligenceRun" }, { "type": "null" }] },
+        "purpose": { "oneOf": [{ "$ref": "#/definitions/CapabilityPurpose" }, { "type": "null" }] },
+        "capabilities": { "type": "array", "items": { "$ref": "#/definitions/Capability" } },
+        "unclassified_elements": { "type": "array", "items": { "$ref": "#/definitions/CapabilityElement" } },
+        "unattached_supporting": { "type": "array", "items": { "$ref": "#/definitions/SupportingElement" } },
+        "is_mock": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "DriftCounts": {
+      "type": "object",
+      "description": "Drift dependency counts and ratios for a capability/system. Hash drift is a review trigger, not a correctness verdict.",
+      "properties": {
+        "total": { "type": "integer" },
+        "fresh": { "type": "integer" },
+        "stale": { "type": "integer" },
+        "missing": { "type": "integer" },
+        "unknown": { "type": "integer" },
+        "symbol_deps_total": { "type": "integer" },
+        "symbol_deps_changed": { "type": "integer" },
+        "file_deps_total": { "type": "integer" },
+        "file_deps_changed": { "type": "integer" },
+        "explanation_blocks_total": { "type": "integer" },
+        "explanation_blocks_changed": { "type": "integer" },
+        "missing_anchors": { "type": "integer" },
+        "mismatch_ratio": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    "AnchorDrift": {
+      "type": "object",
+      "required": ["node_id", "node_type", "name", "status"],
+      "properties": {
+        "node_id": { "type": "integer" },
+        "node_type": { "type": "string" },
+        "name": { "type": "string" },
+        "path": { "type": ["string", "null"] },
+        "qualified_name": { "type": ["string", "null"] },
+        "entrypoint_id": { "type": ["integer", "null"] },
+        "status": { "enum": ["fresh", "partially_stale", "stale", "missing_source", "unknown"] },
+        "changed_hashes": { "type": "array", "items": { "type": "string" } },
+        "captured_file_content_hash": { "type": ["string", "null"] },
+        "captured_symbol_source_hash": { "type": ["string", "null"] },
+        "captured_explanation_hash": { "type": ["string", "null"] },
+        "current_file_content_hash": { "type": ["string", "null"] },
+        "current_symbol_source_hash": { "type": ["string", "null"] },
+        "current_explanation_hash": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "CapabilityDrift": {
+      "type": "object",
+      "required": ["capability_id", "name", "status", "counts"],
+      "properties": {
+        "capability_id": { "type": "integer" },
+        "capability_key": { "type": ["string", "null"] },
+        "name": { "type": "string" },
+        "status": { "enum": ["fresh", "partially_stale", "stale", "missing_source", "unknown"] },
+        "counts": { "$ref": "#/definitions/DriftCounts" },
+        "elements": { "type": "array", "items": { "$ref": "#/definitions/AnchorDrift" } },
+        "supporting_elements": { "type": "array", "items": { "$ref": "#/definitions/AnchorDrift" } }
+      },
+      "additionalProperties": false
+    },
+    "CapabilityHierarchyDrift": {
+      "type": "object",
+      "required": ["system_id", "base_snapshot_id", "target_snapshot_id", "status", "counts"],
+      "properties": {
+        "system_id": { "type": "integer" },
+        "base_snapshot_id": { "type": "integer" },
+        "target_snapshot_id": { "type": "integer" },
+        "intelligence_run": { "oneOf": [{ "$ref": "#/definitions/IntelligenceRun" }, { "type": "null" }] },
+        "status": { "enum": ["fresh", "partially_stale", "stale", "missing_source", "unknown"] },
+        "counts": { "$ref": "#/definitions/DriftCounts" },
+        "target_indexed": { "type": "boolean" },
+        "purpose": { "oneOf": [{ "$ref": "#/definitions/AnchorDrift" }, { "type": "null" }] },
+        "capabilities": { "type": "array", "items": { "$ref": "#/definitions/CapabilityDrift" } },
+        "unclassified_elements": { "type": "array", "items": { "$ref": "#/definitions/AnchorDrift" } },
+        "unattached_supporting": { "type": "array", "items": { "$ref": "#/definitions/AnchorDrift" } },
+        "is_review_recommended": { "type": "boolean" },
+        "review_note": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "ApiRoleCard": {
+      "type": "object",
+      "description": "Flow Explorer developer context for one backend entrypoint (Issue #58). Aggregates source-authored explanation (#54), hierarchy placement (#56), and drift (#57). Joins to FlowEntrypoint by (entrypoint_type, entrypoint_id).",
+      "required": ["entrypoint_type", "entrypoint_id", "label", "classification"],
+      "properties": {
+        "entrypoint_type": { "type": "string" },
+        "entrypoint_id": { "type": "string" },
+        "label": { "type": "string" },
+        "category": { "type": "string" },
+        "route_method": { "type": ["string", "null"] },
+        "route_path": { "type": ["string", "null"] },
+        "operation": { "type": ["string", "null"] },
+        "framework": { "type": ["string", "null"] },
+        "source": { "type": "string" },
+        "handler_resolved": { "type": "boolean" },
+        "classification": { "enum": ["classified", "unclassified", "unknown"] },
+        "capability_key": { "type": ["string", "null"] },
+        "capability_name": { "type": ["string", "null"] },
+        "element_type": { "type": ["string", "null"] },
+        "role": { "type": ["string", "null"] },
+        "operation_kind": { "type": ["string", "null"] },
+        "probe_value": { "type": ["string", "null"] },
+        "consumers": { "type": "array", "items": { "type": "string" } },
+        "state_effects": { "type": "array", "items": { "type": "string" } },
+        "boundaries": { "type": "array", "items": { "type": "string" } },
+        "flows_through": { "type": "array", "items": { "type": "string" } },
+        "provenance_kinds": {
+          "type": "array",
+          "items": { "enum": ["source_authored", "structural", "reasoning_llm", "manual"] }
+        },
+        "drift_status": {
+          "oneOf": [
+            { "enum": ["fresh", "partially_stale", "stale", "missing_source", "unknown"] },
+            { "type": "null" }
+          ]
+        },
+        "drift_changed_anchors": { "type": "integer" },
+        "drift_total_anchors": { "type": "integer" },
+        "drift_review_recommended": { "type": "boolean" },
+        "review_needed": { "type": "boolean" },
+        "review_reason": { "type": ["string", "null"] },
+        "node_id": { "type": ["integer", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "ApiRoleCards": {
+      "type": "object",
+      "required": ["system_id"],
+      "properties": {
+        "system_id": { "type": "integer" },
+        "snapshot_id": { "type": ["integer", "null"] },
+        "hierarchy_run": { "oneOf": [{ "$ref": "#/definitions/IntelligenceRun" }, { "type": "null" }] },
+        "base_snapshot_id": { "type": ["integer", "null"] },
+        "target_snapshot_id": { "type": ["integer", "null"] },
+        "drift_available": { "type": "boolean" },
+        "cards": { "type": "array", "items": { "$ref": "#/definitions/ApiRoleCard" } }
+      },
+      "additionalProperties": false
+    },
+    "ExplanationRefreshProposal": {
+      "type": "object",
+      "description": "A reviewable, reasoning-model suggestion to refresh a drifted source-backed explanation (Issue #59). A SUGGESTION only: probe-agent never edits the target source repository; a developer applies it by hand.",
+      "required": ["drift_status", "status"],
+      "properties": {
+        "id": { "type": ["integer", "null"] },
+        "node_id": { "type": ["integer", "null"] },
+        "node_type": { "type": "string" },
+        "name": { "type": "string" },
+        "entrypoint_type": { "type": ["string", "null"] },
+        "entrypoint_id": { "type": ["string", "null"] },
+        "path": { "type": ["string", "null"] },
+        "qualified_name": { "type": ["string", "null"] },
+        "drift_status": { "enum": ["fresh", "partially_stale", "stale", "missing_source", "unknown"] },
+        "drift_reason": { "type": "string" },
+        "changed_hashes": { "type": "array", "items": { "type": "string" } },
+        "old_explanation": { "type": "string" },
+        "proposed_explanation": { "type": ["string", "null"] },
+        "proposed_metadata": { "type": ["object", "null"] },
+        "summary_of_changes": { "type": ["string", "null"] },
+        "confidence": { "type": ["number", "null"] },
+        "captured_file_content_hash": { "type": ["string", "null"] },
+        "captured_symbol_source_hash": { "type": ["string", "null"] },
+        "captured_explanation_hash": { "type": ["string", "null"] },
+        "current_file_content_hash": { "type": ["string", "null"] },
+        "current_symbol_source_hash": { "type": ["string", "null"] },
+        "current_explanation_hash": { "type": ["string", "null"] },
+        "status": { "enum": ["proposed", "failed"] },
+        "is_mock": { "type": "boolean" },
+        "provider": { "type": "string" },
+        "model": { "type": "string" },
+        "decision_method": { "type": "string" },
+        "created_at": { "type": ["number", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "ExplanationRefresh": {
+      "type": "object",
+      "required": ["system_id", "status", "review_required"],
+      "properties": {
+        "system_id": { "type": "integer" },
+        "base_snapshot_id": { "type": ["integer", "null"] },
+        "target_snapshot_id": { "type": ["integer", "null"] },
+        "intelligence_run": { "oneOf": [{ "$ref": "#/definitions/IntelligenceRun" }, { "type": "null" }] },
+        "status": { "enum": ["proposed", "failed"] },
+        "error": { "type": ["string", "null"] },
+        "review_required": { "type": "boolean" },
+        "review_note": { "type": "string" },
+        "proposal": { "oneOf": [{ "$ref": "#/definitions/ExplanationRefreshProposal" }, { "type": "null" }] }
+      },
+      "additionalProperties": false
+    },
+    "ExplanationRefreshList": {
+      "type": "object",
+      "required": ["system_id"],
+      "properties": {
+        "system_id": { "type": "integer" },
+        "review_note": { "type": "string" },
+        "proposals": { "type": "array", "items": { "$ref": "#/definitions/ExplanationRefreshProposal" } }
       },
       "additionalProperties": false
     }

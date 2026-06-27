@@ -1,4 +1,4 @@
-from typing import Any, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -216,8 +216,14 @@ IntelligenceRunType = Literal[
     "feature_code_mapping",
     "probe_plan",
     "probe_plan_from_flow",
+    "capability_hierarchy",
+    "explanation_refresh",
 ]
 DecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
+# How a single hierarchy claim was produced. Kept distinct from the audit
+# DecisionMethod so source-authored facts stay visibly separate from
+# reasoning-model interpretations (Issue #56).
+ProvenanceKind = Literal["source_authored", "structural", "reasoning_llm", "manual"]
 
 
 class RepositoryConfigUpdate(BaseModel):
@@ -518,6 +524,38 @@ LinkSource = Literal["reasoning_llm", "manual"]
 LinkReviewStatus = Literal["proposed", "accepted", "rejected"]
 
 
+SourceMetadataElementType = Literal[
+    "system", "core", "capability", "element", "supporting", "boundary"
+]
+SourceMetadataOperationKind = Literal[
+    "analysis", "read", "write", "mutation", "io", "orchestration",
+    "validation", "other",
+]
+
+
+class SourceMetadataOut(BaseModel):
+    """Author-written, source-anchored explanation copied from a docstring.
+
+    These facts are deterministic / source-authored and are kept separate from
+    reasoning-model interpretations.  ``origin`` is always ``source_authored``.
+    """
+
+    start_line: int
+    end_line: int
+    raw_block: str
+    role: Optional[str] = None
+    capability: Optional[str] = None
+    element_type: Optional[SourceMetadataElementType] = None
+    system_purpose: Optional[str] = None
+    operation_kind: Optional[SourceMetadataOperationKind] = None
+    consumers: List[str] = Field(default_factory=list)
+    state_effects: List[str] = Field(default_factory=list)
+    probe_value: Optional[str] = None
+    origin: Literal["source_authored"] = "source_authored"
+    # sha256 of the extracted explanation block (Issue #55); change signal only.
+    explanation_hash: Optional[str] = None
+
+
 class CodeSymbolOut(BaseModel):
     id: int
     snapshot_id: int
@@ -535,6 +573,188 @@ class CodeSymbolOut(BaseModel):
     route_path: Optional[str] = None
     route_method: Optional[str] = None
     component_id: Optional[str] = None
+    source_metadata: Optional[SourceMetadataOut] = None
+    # Source-hash provenance (Issue #55). All computed from the pinned snapshot;
+    # equality is only a change signal, not semantic equivalence.
+    file_content_hash: Optional[str] = None
+    symbol_source_hash: Optional[str] = None
+    symbol_body_hash: Optional[str] = None
+
+
+class ExplanationAnchorOut(BaseModel):
+    """A single source anchor an explanation depends on (Issue #55).
+
+    Bundles the deterministic provenance (file, symbol span, and hash types)
+    that downstream drift features compare against a newer snapshot.
+    """
+
+    id: int
+    snapshot_id: int
+    system_id: int
+    metadata_id: int
+    symbol_id: int
+    path: str
+    qualified_name: str
+    start_line: int
+    end_line: int
+    file_content_hash: Optional[str] = None
+    symbol_source_hash: Optional[str] = None
+    symbol_body_hash: Optional[str] = None
+    explanation_hash: Optional[str] = None
+
+
+class ExplanationAnchorsOut(BaseModel):
+    system_id: int
+    snapshot_id: int
+    anchor_count: int
+    anchors: List[ExplanationAnchorOut] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Source-backed capability hierarchy (Issue #56)
+# ---------------------------------------------------------------------------
+
+
+class HierarchyProvenanceOut(BaseModel):
+    """Provenance for a single hierarchy claim.
+
+    ``provenance_kind`` distinguishes source-authored explanation, deterministic
+    structural fact, and reasoning-model interpretation. ``decision_method`` is
+    the audit enum. Hashes tie the claim to the pinned snapshot (#55).
+    """
+
+    provenance_kind: ProvenanceKind
+    decision_method: DecisionMethod
+    path: Optional[str] = None
+    qualified_name: Optional[str] = None
+    start_line: Optional[int] = None
+    end_line: Optional[int] = None
+    file_content_hash: Optional[str] = None
+    symbol_source_hash: Optional[str] = None
+    explanation_hash: Optional[str] = None
+    symbol_id: Optional[int] = None
+    entrypoint_id: Optional[int] = None
+    feature_id: Optional[str] = None
+    system_profile_draft_id: Optional[int] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
+
+
+class SupportingElementOut(BaseModel):
+    id: int
+    name: str
+    summary: str = ""
+    supporting_kind: Optional[str] = None
+    provenance: HierarchyProvenanceOut
+
+
+class CapabilityElementOut(BaseModel):
+    id: int
+    name: str
+    summary: str = ""
+    element_role: Optional[str] = None
+    operation_kind: Optional[str] = None
+    probe_value: Optional[str] = None
+    classification: Optional[str] = None  # classified | unclassified
+    provenance: HierarchyProvenanceOut
+
+
+class CapabilityOut(BaseModel):
+    id: int
+    capability_key: Optional[str] = None
+    name: str
+    summary: str = ""
+    provenance: HierarchyProvenanceOut
+    elements: List[CapabilityElementOut] = Field(default_factory=list)
+    supporting_elements: List[SupportingElementOut] = Field(default_factory=list)
+
+
+class CapabilityPurposeOut(BaseModel):
+    id: int
+    name: str
+    summary: str = ""
+    provenance: HierarchyProvenanceOut
+
+
+class CapabilityHierarchyOut(BaseModel):
+    system_id: int
+    snapshot_id: int
+    intelligence_run: Optional[IntelligenceRunOut] = None
+    purpose: Optional[CapabilityPurposeOut] = None
+    capabilities: List[CapabilityOut] = Field(default_factory=list)
+    unclassified_elements: List[CapabilityElementOut] = Field(default_factory=list)
+    unattached_supporting: List[SupportingElementOut] = Field(default_factory=list)
+    is_mock: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Explanation drift (Issue #57)
+# ---------------------------------------------------------------------------
+
+# Anchor-level uses fresh/stale/missing_source/unknown; aggregate levels add
+# partially_stale. Hash drift is a review trigger, not a correctness verdict.
+DriftStatus = Literal[
+    "fresh", "partially_stale", "stale", "missing_source", "unknown"
+]
+
+
+class AnchorDriftOut(BaseModel):
+    node_id: int
+    node_type: str
+    name: str
+    path: Optional[str] = None
+    qualified_name: Optional[str] = None
+    entrypoint_id: Optional[int] = None
+    status: DriftStatus
+    changed_hashes: List[str] = Field(default_factory=list)
+    captured_file_content_hash: Optional[str] = None
+    captured_symbol_source_hash: Optional[str] = None
+    captured_explanation_hash: Optional[str] = None
+    current_file_content_hash: Optional[str] = None
+    current_symbol_source_hash: Optional[str] = None
+    current_explanation_hash: Optional[str] = None
+
+
+class DriftCountsOut(BaseModel):
+    total: int = 0
+    fresh: int = 0
+    stale: int = 0
+    missing: int = 0
+    unknown: int = 0
+    symbol_deps_total: int = 0
+    symbol_deps_changed: int = 0
+    file_deps_total: int = 0
+    file_deps_changed: int = 0
+    explanation_blocks_total: int = 0
+    explanation_blocks_changed: int = 0
+    missing_anchors: int = 0
+    mismatch_ratio: float = 0.0
+
+
+class CapabilityDriftOut(BaseModel):
+    capability_id: int
+    capability_key: Optional[str] = None
+    name: str
+    status: DriftStatus
+    counts: DriftCountsOut
+    elements: List[AnchorDriftOut] = Field(default_factory=list)
+    supporting_elements: List[AnchorDriftOut] = Field(default_factory=list)
+
+
+class CapabilityHierarchyDriftOut(BaseModel):
+    system_id: int
+    base_snapshot_id: int
+    target_snapshot_id: int
+    intelligence_run: Optional[IntelligenceRunOut] = None
+    status: DriftStatus
+    counts: DriftCountsOut
+    target_indexed: bool = True
+    purpose: Optional[AnchorDriftOut] = None
+    capabilities: List[CapabilityDriftOut] = Field(default_factory=list)
+    unclassified_elements: List[AnchorDriftOut] = Field(default_factory=list)
+    unattached_supporting: List[AnchorDriftOut] = Field(default_factory=list)
+    is_review_recommended: bool = False
+    review_note: Optional[str] = None
 
 
 class SymbolIndexWarningOut(BaseModel):
@@ -775,6 +995,129 @@ class FlowEntrypointsOut(BaseModel):
     # Deterministic reasons surfaced when backend discovery is thin, so the UI
     # never silently dumps a giant raw-function list as the intended UX.
     diagnostics: List[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# API role cards (Issue #58) — Flow Explorer developer context.
+# Consumes the #56 capability hierarchy and #57 drift; invents no new semantics.
+# ---------------------------------------------------------------------------
+
+
+class ApiRoleCardOut(BaseModel):
+    # Identity: joins to FlowEntrypointOut by (entrypoint_type, entrypoint_id).
+    entrypoint_type: str
+    entrypoint_id: str
+    label: str
+    category: FlowEntrypointCategory = "function"
+    route_method: Optional[str] = None
+    route_path: Optional[str] = None
+    operation: Optional[str] = None
+    framework: Optional[str] = None
+    source: str = "deterministic"  # deterministic (AST) | reasoning_llm (scan)
+    # Whether a handler symbol resolved -> whether an executable flow graph is
+    # supported. LLM-scan entries without a handler must not imply graph support.
+    handler_resolved: bool = False
+    classification: Literal["classified", "unclassified", "unknown"] = "unknown"
+    capability_key: Optional[str] = None
+    capability_name: Optional[str] = None
+    element_type: Optional[str] = None  # core | element | supporting (from #54)
+    role: Optional[str] = None
+    operation_kind: Optional[str] = None
+    probe_value: Optional[str] = None
+    consumers: List[str] = Field(default_factory=list)
+    state_effects: List[str] = Field(default_factory=list)
+    boundaries: List[str] = Field(default_factory=list)
+    flows_through: List[str] = Field(default_factory=list)
+    # Distinct provenance kinds backing the card, e.g. ["source_authored",
+    # "structural"] or ["reasoning_llm", "structural"].
+    provenance_kinds: List[ProvenanceKind] = Field(default_factory=list)
+    # Drift (#57). Capability-level for classified cards, node-level otherwise.
+    drift_status: Optional[
+        Literal["fresh", "partially_stale", "stale", "missing_source", "unknown"]
+    ] = None
+    drift_changed_anchors: int = 0
+    drift_total_anchors: int = 0
+    drift_review_recommended: bool = False
+    # Review attention for the card itself (distinct from freshness): set when
+    # an LLM-scan entry has no resolved handler/flow.
+    review_needed: bool = False
+    review_reason: Optional[str] = None
+    node_id: Optional[int] = None
+
+
+class ApiRoleCardsOut(BaseModel):
+    system_id: int
+    snapshot_id: Optional[int] = None
+    hierarchy_run: Optional[IntelligenceRunOut] = None
+    base_snapshot_id: Optional[int] = None
+    target_snapshot_id: Optional[int] = None
+    drift_available: bool = False
+    cards: List[ApiRoleCardOut] = Field(default_factory=list)
+
+
+class RefreshProposalRequest(BaseModel):
+    """Identify the stale hierarchy node / API role card to refresh.
+
+    Provide either ``node_id`` (a capability hierarchy node) or the logical
+    ``(entrypoint_type, entrypoint_id)`` of an API role card.
+    """
+
+    node_id: Optional[int] = None
+    entrypoint_type: Optional[str] = None
+    entrypoint_id: Optional[str] = None
+    target_snapshot_id: Optional[int] = None
+
+
+class ExplanationRefreshProposalOut(BaseModel):
+    id: Optional[int] = None
+    node_id: Optional[int] = None
+    node_type: str = ""
+    name: str = ""
+    entrypoint_type: Optional[str] = None
+    entrypoint_id: Optional[str] = None
+    path: Optional[str] = None
+    qualified_name: Optional[str] = None
+    drift_status: DriftStatus = "unknown"
+    drift_reason: str = ""
+    changed_hashes: List[str] = Field(default_factory=list)
+    # Source-authored explanation as it exists in the target repo (unchanged).
+    old_explanation: str = ""
+    # Reasoning-model suggestion. Never written to the target repository.
+    proposed_explanation: Optional[str] = None
+    proposed_metadata: Optional[Dict[str, Any]] = None
+    summary_of_changes: Optional[str] = None
+    confidence: Optional[float] = None
+    captured_file_content_hash: Optional[str] = None
+    captured_symbol_source_hash: Optional[str] = None
+    captured_explanation_hash: Optional[str] = None
+    current_file_content_hash: Optional[str] = None
+    current_symbol_source_hash: Optional[str] = None
+    current_explanation_hash: Optional[str] = None
+    status: Literal["proposed", "failed"] = "proposed"
+    is_mock: bool = False
+    provider: str = ""
+    model: str = ""
+    decision_method: str = "reasoning_llm"
+    created_at: Optional[float] = None
+
+
+class ExplanationRefreshOut(BaseModel):
+    system_id: int
+    base_snapshot_id: Optional[int] = None
+    target_snapshot_id: Optional[int] = None
+    intelligence_run: Optional[IntelligenceRunOut] = None
+    status: Literal["proposed", "failed"] = "proposed"
+    error: Optional[str] = None
+    # Always true for proposals: a developer must review and apply to source.
+    review_required: bool = True
+    review_note: str = ""
+    proposal: Optional[ExplanationRefreshProposalOut] = None
+
+
+class ExplanationRefreshListOut(BaseModel):
+    system_id: int
+    review_note: str = ""
+    proposals: List[ExplanationRefreshProposalOut] = Field(default_factory=list)
 
 
 class ApiScanRequest(BaseModel):

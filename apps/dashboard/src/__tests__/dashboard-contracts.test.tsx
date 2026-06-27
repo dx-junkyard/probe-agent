@@ -727,6 +727,163 @@ describe("Flow Explorer page", () => {
     });
     expect(await screen.findByText("1 of 2 entrypoint(s)")).toBeInTheDocument();
   });
+
+  function roleCard(overrides: Record<string, unknown> = {}) {
+    return {
+      entrypoint_type: "http_route", entrypoint_id: "POST:/documents/analyze",
+      label: "POST /documents/analyze", category: "api", route_method: "POST",
+      route_path: "/documents/analyze", operation: "POST /documents/analyze",
+      framework: "fastapi", source: "deterministic", handler_resolved: true,
+      classification: "classified", capability_key: "doc-analysis",
+      capability_name: "Document Analysis", element_type: "core",
+      role: "Analyzes uploaded documents", operation_kind: "analysis",
+      probe_value: "validate graph shape", consumers: ["dashboard"],
+      state_effects: ["database-read"], boundaries: ["database"],
+      flows_through: ["parse_blocks"],
+      provenance_kinds: ["source_authored", "structural"],
+      drift_status: "partially_stale", drift_changed_anchors: 2,
+      drift_total_anchors: 8, drift_review_recommended: true,
+      review_needed: false, review_reason: null, node_id: 9,
+      ...overrides,
+    };
+  }
+
+  test("shows a classified API role card with provenance and freshness", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/flow-entrypoints") {
+        return Promise.resolve(entrypointsResponse({
+          total: 1, entrypoints: [flowGraph.entrypoint],
+        }));
+      }
+      if (path === "/repository/api-role-cards") {
+        return Promise.resolve({
+          system_id: 1, snapshot_id: 5, hierarchy_run: null,
+          base_snapshot_id: 5, target_snapshot_id: 5, drift_available: true,
+          cards: [roleCard()],
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockImplementation((path: string) =>
+      path === "/repository/flow-graphs" ? Promise.resolve(flowGraph) : Promise.resolve(null));
+
+    const { default: FlowExplorerPage } = await import("@/pages/flow-explorer");
+    render(<FlowExplorerPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByText("POST /documents/analyze"));
+
+    expect(await screen.findByTestId("api-role-card")).toBeInTheDocument();
+    expect(screen.getByText("Document Analysis")).toBeInTheDocument();
+    expect(screen.getByText("Analyzes uploaded documents")).toBeInTheDocument();
+    expect(screen.getByText("source-authored")).toBeInTheDocument();
+    expect(screen.getByText("partially stale")).toBeInTheDocument();
+    expect(screen.getByText(/2 of 8 source\s+anchors changed/)).toBeInTheDocument();
+  });
+
+  test("shows empty state for unclassified and review flag for LLM scan", async () => {
+    const unclassified = {
+      ...flowGraph.entrypoint,
+      entrypoint_id: "GET:/raw", label: "GET /raw", route_method: "GET",
+      route_path: "/raw", operation: "GET /raw", source: "reasoning_llm",
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/flow-entrypoints") {
+        return Promise.resolve(entrypointsResponse({
+          total: 1, entrypoints: [unclassified],
+        }));
+      }
+      if (path === "/repository/api-role-cards") {
+        return Promise.resolve({
+          system_id: 1, snapshot_id: 5, hierarchy_run: null,
+          base_snapshot_id: null, target_snapshot_id: null, drift_available: false,
+          cards: [roleCard({
+            entrypoint_type: "http_route", entrypoint_id: "GET:/raw",
+            label: "GET /raw", route_method: "GET", source: "reasoning_llm",
+            classification: "unclassified", capability_key: null,
+            capability_name: null, element_type: null, role: null,
+            operation_kind: null, probe_value: null, consumers: [],
+            state_effects: [], boundaries: [], flows_through: [],
+            provenance_kinds: ["structural"], drift_status: null,
+            drift_changed_anchors: 0, drift_total_anchors: 0,
+            handler_resolved: false, review_needed: true,
+            review_reason: "LLM-derived API definition without a resolved handler.",
+            node_id: null,
+          })],
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockResolvedValue(flowGraph);
+
+    const { default: FlowExplorerPage } = await import("@/pages/flow-explorer");
+    render(<FlowExplorerPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByText("GET /raw"));
+
+    expect(await screen.findByTestId("api-role-card")).toBeInTheDocument();
+    expect(screen.getByText(/No source-authored explanation yet/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/LLM-derived API definition without a resolved handler/),
+    ).toBeInTheDocument();
+  });
+
+  test("requests an explanation refresh proposal for a drifted card", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/flow-entrypoints") {
+        return Promise.resolve(entrypointsResponse({
+          total: 1, entrypoints: [flowGraph.entrypoint],
+        }));
+      }
+      if (path === "/repository/api-role-cards") {
+        return Promise.resolve({
+          system_id: 1, snapshot_id: 5, hierarchy_run: null,
+          base_snapshot_id: 5, target_snapshot_id: 6, drift_available: true,
+          cards: [roleCard()],
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/repository/flow-graphs") return Promise.resolve(flowGraph);
+      if (path === "/repository/explanation-refresh") {
+        return Promise.resolve({
+          system_id: 1, base_snapshot_id: 5, target_snapshot_id: 6,
+          intelligence_run: null, status: "proposed", error: null,
+          review_required: true,
+          review_note: "This is a suggestion only. The target source repository remains the source of truth.",
+          proposal: {
+            id: 1, node_id: 9, node_type: "element", name: "analyze",
+            entrypoint_type: "http_route", entrypoint_id: "POST:/documents/analyze",
+            path: "src/api.py", qualified_name: "analyze", drift_status: "stale",
+            drift_reason: "Changed source hashes: symbol.",
+            changed_hashes: ["symbol"],
+            old_explanation: "role: Analyzes uploaded documents",
+            proposed_explanation: "Analyzes and caches uploaded documents",
+            proposed_metadata: { role: "Analyzes uploaded documents", element_type: "core" },
+            summary_of_changes: "Now caches results; clarify wording.",
+            confidence: 0.8, captured_file_content_hash: null,
+            captured_symbol_source_hash: null, captured_explanation_hash: null,
+            current_file_content_hash: null, current_symbol_source_hash: null,
+            current_explanation_hash: null, status: "proposed", is_mock: false,
+            provider: "openai", model: "gpt-5", decision_method: "reasoning_llm",
+            created_at: 1,
+          },
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { default: FlowExplorerPage } = await import("@/pages/flow-explorer");
+    render(<FlowExplorerPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByText("POST /documents/analyze"));
+    fireEvent.click(await screen.findByTestId("request-refresh"));
+
+    expect(await screen.findByTestId("refresh-proposal")).toBeInTheDocument();
+    expect(screen.getByText(/suggestion only/)).toBeInTheDocument();
+    expect(screen.getByText("Analyzes and caches uploaded documents")).toBeInTheDocument();
+    expect(screen.getByText(/Now caches results/)).toBeInTheDocument();
+  });
 });
 
 // ── Decision Workspace tests ────────────────────────────────────────

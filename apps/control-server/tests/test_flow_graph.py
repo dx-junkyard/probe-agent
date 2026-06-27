@@ -591,6 +591,20 @@ def git_repo(tmp_path):
         def clean(t):
             return t
     """))
+    # ``dispatch_entry`` calls ``handle()``, which is defined in two different
+    # files and nowhere in the caller's file => an ambiguous, unresolved edge.
+    (repo / "router_dispatch.py").write_text(textwrap.dedent("""\
+        def dispatch_entry(req):
+            return handle(req)
+    """))
+    (repo / "handler_one.py").write_text(textwrap.dedent("""\
+        def handle(req):
+            return req
+    """))
+    (repo / "handler_two.py").write_text(textwrap.dedent("""\
+        def handle(req):
+            return req
+    """))
     subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"],
                    check=True, capture_output=True)
@@ -995,6 +1009,72 @@ class TestEdgeSelection:
             headers=h,
         )
         assert r.status_code == 400
+
+    def test_unresolved_edge_selection_rejected(self, admin_client, git_repo, monkeypatch):
+        """Issue #47: the API must reject an unresolved edge as a probe boundary,
+        not only the dashboard."""
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "edgeunres")
+        h = _setup_snapshot(admin_client, token, system["id"], git_repo)
+        graph = admin_client.post(
+            "/repository/flow-graphs",
+            json={"entrypoint_type": "public_function",
+                  "entrypoint_id": "function:router_dispatch.py::dispatch_entry"},
+            headers=h,
+        ).json()
+        unresolved = [e for e in graph["edges"] if e["resolution"] == "unresolved"]
+        assert unresolved, "expected an unresolved edge in the dispatch graph"
+        edge = unresolved[0]
+
+        r = admin_client.post(
+            "/repository/probe-plans/from-flow",
+            json={
+                "entrypoint_type": "public_function",
+                "entrypoint_id": "function:router_dispatch.py::dispatch_entry",
+                "snapshot_id": graph["snapshot_id"],
+                "commit_sha": graph["commit_sha"],
+                "selections": [
+                    {"target_type": "edge", "edge_id": edge["edge_id"],
+                     "mode_preference": "trace"},
+                ],
+            },
+            headers=h,
+        )
+        assert r.status_code == 400, r.text
+        assert "unresolved" in r.json()["detail"].lower()
+        # No plan/probe-point leaked from the rejected request.
+        plans = admin_client.get("/repository/probe-plans", headers=h)
+        assert plans.status_code == 200
+        assert plans.json()["plans"] == []
+
+    def test_resolved_edge_selection_still_allowed(self, admin_client, git_repo, monkeypatch):
+        """Issue #47: resolved / inferred edges must still convert to a draft."""
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "edgeres")
+        h = _setup_snapshot(admin_client, token, system["id"], git_repo)
+        graph = admin_client.post(
+            "/repository/flow-graphs",
+            json={"entrypoint_type": "http_route",
+                  "entrypoint_id": "POST:/documents/analyze"},
+            headers=h,
+        ).json()
+        edge = [e for e in graph["edges"] if e["resolution"] in ("resolved", "inferred")][0]
+        r = admin_client.post(
+            "/repository/probe-plans/from-flow",
+            json={
+                "entrypoint_type": "http_route",
+                "entrypoint_id": "POST:/documents/analyze",
+                "snapshot_id": graph["snapshot_id"],
+                "commit_sha": graph["commit_sha"],
+                "selections": [
+                    {"target_type": "edge", "edge_id": edge["edge_id"],
+                     "mode_preference": "trace"},
+                ],
+            },
+            headers=h,
+        )
+        assert r.status_code == 201, r.text
+        assert len(r.json()["probe_points"]) == 1
 
     def test_edge_selection_requires_edge_id(self, admin_client, git_repo, monkeypatch):
         token = _login(admin_client)

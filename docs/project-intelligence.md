@@ -340,6 +340,373 @@ CLAUDE.md 原則 6 / reasoning-llm skill に従う:
   上限を調整する。reasoning model の選択は既存の `INTELLIGENCE_LLM_PROVIDER` /
   `INTELLIGENCE_LLM_MODEL`（未設定時は `LLM_PROVIDER` / `LLM_MODEL`）に従う。
 
+## ソース由来の説明メタデータ（Issue #54）
+
+Flow Explorer は API を probe 設定の候補として列挙できるようになったが、
+ソースコードと「システムの目的・中核能力・補助/境界要素・probe 価値」を結ぶ
+共有の説明レイヤーが欠けていた。#54 では、その説明の**原本を対象リポジトリの
+ソース側（docstring）に置く**ための最小フォーマットと、pinned snapshot からの
+**決定的な抽出規則**を定義する。`probe-agent` は説明をリポジトリ側に書き戻さず、
+スナップショットから抽出したコピーを索引するだけである（原本の authoring 場所
+にはならない）。
+
+このメタデータは**著者が書いた事実（source-authored）**であり、CLAUDE.md 原則 7
+に従って reasoning-model の解釈とは**保存・API の両方で分離**する。`origin` は
+常に `source_authored` で、symbol index run の `decision_method` は
+`deterministic` のままにする。自由文から意味を推測してはならない。
+
+### フォーマット
+
+module / class / function の docstring 内に、`probe-agent:` 行で始まる小さな
+構造化ブロックを埋め込む。ブロック本体は marker よりも深くインデントした
+YAML マッピングで、PEP 257 で正規化された docstring に対して解釈する。
+
+```python
+def build_flow_graph(...):
+    """
+    Build a candidate execution flow from a backend entrypoint.
+
+    probe-agent:
+      role: API endpoint for deterministic flow graph construction
+      capability: execution-flow-understanding
+      element_type: core
+      consumers: [dashboard]
+      operation_kind: analysis
+      state_effects: [database-read]
+      probe_value: Validate graph shape, unresolved edges, and external-boundary detection.
+    """
+```
+
+すべての symbol で**任意**であり、ブロックが無ければメタデータは生成されない。
+
+### 語彙
+
+| キー | 型 | 説明 |
+| --- | --- | --- |
+| `role` | string（自由文） | API / backend entrypoint としての役割。原文のままコピーする。 |
+| `capability` | string（自由文） | この symbol が属する中核能力の識別子。 |
+| `element_type` | enum | 階層上の位置。`system` / `core` / `capability` / `element` / `supporting` / `boundary`。 |
+| `system_purpose` | string（自由文） | 通常 module docstring に置く、システム全体の目的。 |
+| `operation_kind` | enum | `analysis` / `read` / `write` / `mutation` / `io` / `orchestration` / `validation` / `other`。 |
+| `consumers` | list[string]（自由文） | この能力の利用者（例: `[dashboard]`）。 |
+| `state_effects` | list[enum] | 各要素は `none` / `database-read` / `database-write` / `network` / `filesystem` / `cache` / `external-api` / `queue`。 |
+| `probe_value` | string（自由文） | probe する価値の説明。 |
+
+enum / enum list は CLAUDE.md 原則 6 に沿って**明示的な有限集合**に限定し、
+自由文フィールドは検証せずそのままコピーする。
+
+### 抽出規則（決定的）
+
+- 対象コードを**実行しない**。docstring は AST 上の文字列リテラルとして読む。
+- pinned snapshot の committed files のみを対象とし、working tree は読まない。
+- `probe-agent:` ブロックを検出し、YAML として `yaml.safe_load` する。
+- 既知キーは型 / enum を検証し、`start_line` / `end_line`（snapshot 上のブロック
+  行範囲）と原文 `raw_block` を保持する。
+- **不正・未知のメタデータは決定的な index warning** として記録し、symbol index
+  全体を失敗させない。
+  - YAML パース失敗、マッピングでない、空ブロック → メタデータ無し + warning。
+  - 未知キー、型不一致、enum 範囲外 → 当該フィールドを破棄して warning。妥当な
+    フィールドは保持する。
+  - 妥当なフィールドが 1 つも無い → メタデータ無し + warning。
+
+### 永続化と API
+
+- `symbol_source_metadata`（system-scoped・追加のみの新規テーブル）に、
+  `snapshot_id` / `system_id` / `symbol_id` / `path` / `qualified_name` /
+  ブロック行範囲 / 各フィールド / `raw_block` / `origin='source_authored'` を
+  保存する。symbol index run の中で deterministic 事実として 1 トランザクション
+  で書き込み、reasoning 出力テーブルとは分離する。
+- `GET /repository/symbols` と `POST /repository/symbols/index` の
+  `CodeSymbolOut.source_metadata` として typed に公開する。これにより次の
+  hierarchy issue が型付きで参照できる。
+- 不正メタデータは `symbol_index_warnings` に
+  `"<qualified_name>: probe-agent metadata: <detail>"` 形式で残す。
+
+### 非対象（#54）
+
+- ソースの自動改変、リポジトリへのメタデータ書き戻し。
+- LLM 生成メタデータ。
+- drift スコアリングや完全な階層・refresh ワークフロー。
+- 自由文からのヒューリスティックな最終分類。
+
+## ソースハッシュによる来歴（Issue #55）
+
+開発者向けの説明（#54 のソース由来メタデータや、後続 issue が作る能力/機能の
+説明階層）は、実装が変わると drift する。「いつ説明を見直すべきか」を後続 issue が
+判定できるように、説明が依存するソース事実に**決定的なハッシュ来歴**を付与する。
+対象リポジトリは原本の source of truth のままで、`probe-agent` は **pinned
+snapshot のコミット済み内容からのみ**ハッシュと抽出コピーを保存する（working tree
+は読まない）。ハッシュは CLAUDE.md 原則 7 に従い reasoning-model の解釈とは分離する。
+
+### ハッシュ種別
+
+1 個の過負荷な値ではなく、用途別に明示的なハッシュ種別を使う。すべて sha256。
+
+| ハッシュ | 対象 | 意味 | 変わる/変わらない |
+| --- | --- | --- | --- |
+| `file_content_hash` | ファイル | コミット済みファイル内容のハッシュ（snapshot が既に保持）。 | ファイル内のどの変更でも変わる。 |
+| `symbol_source_hash` | symbol | symbol の正確なソース span（decorator + signature + body, コミット時のまま）のハッシュ。decorator がある場合は span 開始を先頭 decorator 行にする（API entrypoint の `@router.get(...)` 等は外部から観測される役割の一部のため）。`start_line` は表示・下流の行範囲用に def/class 行のまま。 | decorator・コメント・docstring・空白を含む span 内のどの変更でも変わる。 |
+| `symbol_body_hash` | symbol | docstring を除去し `ast.dump`（属性なし）で正規化した構造のハッシュ。コメント・docstring・整形・行番号を**除外**。 | 構造的なコード変更でのみ変わる。コメント/docstring だけの変更では変わらない。 |
+| `explanation_hash` | 説明ブロック | #54 の抽出済み `probe-agent:` ブロック文字列のハッシュ。 | 説明文の変更で変わる。 |
+
+`symbol_body_hash` の正規化は決定的で、テストで保証する（コメントのみ変更・
+docstring のみ変更で安定、実装変更で変化）。
+
+### ハッシュが証明しないこと
+
+- ハッシュの一致は**意味的な等価ではなく、変更シグナルにすぎない**。
+- `symbol_body_hash` が等しくても挙動が同じとは限らない（呼び出し先の変更、
+  グローバル状態、外部 I/O などは捉えられない）。逆に等価な書き換え（変数名変更等）
+  でもハッシュは変わる。
+- ハッシュの不一致は「見直しの候補」を示すだけで、drift の有無や程度は後続 issue が
+  判断する（本 issue は drift スコアを計算しない）。
+
+### 説明→ソース依存（source anchors）
+
+各説明は、依存するソース事実を**source anchor の集合**として記録する:
+`path` / 任意の `symbol` / 行範囲 / `file_content_hash` / `symbol_source_hash` /
+`symbol_body_hash` / `explanation_hash`。#54 では説明はちょうど 1 つの symbol に
+紐づくため anchor は 1 件だが、後続の階層的説明が複数 symbol に依存する場合に
+備えて first-class なテーブルにしておく。
+
+### 永続化と API
+
+- `code_symbols` に `symbol_source_hash` / `symbol_body_hash` を追加（既存 DB は
+  `ALTER TABLE` で後方互換マイグレーション）。`file_content_hash` は
+  `snapshot_files.content_hash` を読み出しで合成する。
+- `symbol_source_metadata` に `explanation_hash` を追加。
+- `explanation_source_anchors`（system-scoped・追加のみの新規テーブル）に anchor
+  集合を保存する。
+- symbol index run を `schema_version='provenance-v1'` でバージョン管理する。
+  #54/#55 以前に index 済みの snapshot は、`code_symbols` を作り直さず
+  （feature-code link を cascade 削除しないため）にハッシュ・メタデータ・anchor を
+  **決定的・追加のみ・冪等**にバックフィルする。アップグレードは
+  `POST /repository/symbols/index` だけでなく、**read 経路でも**実行する
+  （`GET /repository/symbols` / `GET /repository/explanation-anchors`）。
+  これにより Dashboard は明示的な再 index なしに古い snapshot のハッシュ／anchor を
+  得られる（flow-entrypoint discovery と同じ決定的 INSERT-on-read パターン）。
+  schema_version が一致した以降は再計算しない。
+- API: `GET /repository/symbols` と `POST /repository/symbols/index` の
+  `CodeSymbolOut` に `file_content_hash` / `symbol_source_hash` /
+  `symbol_body_hash` を、`SourceMetadataOut` に `explanation_hash` を公開する。
+  `GET /repository/explanation-anchors` で anchor 集合を返す。
+
+## ソース由来の能力階層（Issue #56）
+
+System Profile / Feature Map draft と Flow Explorer の backend entrypoint に加え、
+開発者が「このシステムは何のためにあり、どの中核能力が価値を生み、各能力をどの
+実装要素が構成し、どの API/job/queue/file/外部境界が補助要素か」を理解するための
+**ソース由来の能力階層**を追加する。#54 のソース由来説明メタデータと #55 のハッシュ
+来歴を監査可能な土台として保つ。
+
+```text
+System Purpose
+  Core Capability
+    Capability Element  -> source symbol / API entrypoint
+    Supporting Element  -> DB / filesystem / external HTTP / queue / scheduled job / CLI
+```
+
+### 構築方針（決定的優先・fail closed）
+
+- **決定的ビルダー**は #54 の著者記述 `capability` フィールドだけで group 化し、
+  自由文からは推測しない。`capability` を持たない symbol / API entrypoint は
+  推測せず `unclassified` にする。
+- **System Purpose**: module の `system_purpose` メタデータ（source_authored）を
+  優先し、無ければ最新 System Profile draft を構造的に link する（structural）。
+- **Capability Element**: `capability` を持つ symbol。`element_type` core/element
+  は capability element、supporting/boundary は supporting element。
+- **Supporting Element**: `state_effects`（database/filesystem/external-http/
+  cache/queue）や、message_queue/scheduled_job/cli の backend entrypoint。
+- **API entrypoint**: handler symbol が `capability` を持てば該当 capability の
+  element として classified、無ければ `unclassified`。
+- **reasoning model** は「unclassified な API entrypoint を既存 capability に
+  振り分ける」open-ended grouping だけに使う。非 reasoning model・API 失敗・
+  構造化出力の検証失敗は **fail closed**（heuristic fallback なし、run を failed に
+  記録）。決定的な source-authored 事実は failed でも保持する。
+
+### provenance と decision method
+
+各ノードは由来を明示する。CLAUDE.md 原則 7 に従い `decision_method` は
+`deterministic`/`reasoning_llm`/`manual` のいずれかに限定し、由来の区別は別フィールド
+`provenance_kind` で表す:
+
+| provenance_kind | 意味 | decision_method |
+| --- | --- | --- |
+| `source_authored` | #54 著者記述の説明から決定的に抽出 | `deterministic` |
+| `structural` | 決定的な構造事実（entrypoint 境界、draft link 等） | `deterministic` |
+| `reasoning_llm` | reasoning model による grouping 解釈 | `reasoning_llm` |
+| `manual` | 将来の手動上書き（本 issue 未実装） | `manual` |
+
+各ノードは source anchor（path/symbol/行範囲）と #55 のハッシュ
+（file_content_hash/symbol_source_hash/explanation_hash）、reasoning 使用時は
+provider/model も持つ。
+
+### 永続化と API
+
+- `capability_hierarchy_nodes`（system + snapshot scoped・新規テーブル）に
+  `node_type`（purpose/capability/element/supporting）と `parent_id` で階層を保存。
+  各 hierarchy run は `intelligence_runs(run_type='capability_hierarchy')` として
+  監査記録する（reasoning 使用時は decision_method=reasoning_llm、provider/model/
+  status/error を保存）。
+- `POST /repository/capability-hierarchy/generate?use_reasoning=true|false` で生成、
+  `GET /repository/capability-hierarchy` で最新階層を取得する。
+
+### 既存概念との関係
+
+- **System Profile / Feature Map draft（#23）** は reasoning model が生成する
+  「外から見たシステム/機能」の draft。能力階層はこれを置き換えず、purpose の
+  fallback ソースとして link するだけ（既存 Feature Map の挙動は変更しない）。
+- **FeatureCodeLink（#24）** は Feature draft と code symbol の reasoning による
+  対応付け。能力階層は **source-authored メタデータ起点**で symbol/entrypoint を
+  capability に構成する点が異なり、決定的事実と reasoning 解釈を `provenance_kind`
+  で分離する。両者は補完的で、後続の API role card・probe 選択コンテキスト・
+  refresh 推奨の意味層となる。`review_status='accepted'` の FeatureCodeLink が
+  symbol を Feature に結びつけている場合は、その `feature_id` を該当ノードの
+  provenance に決定的に付与して Feature Map と接続する（複数候補は confidence 最大）。
+- **ハッシュ来歴の網羅性**: capability element だけでなく、message_queue /
+  scheduled_job / cli の supporting 境界も handler symbol が解決できれば
+  `symbol_id` と #55 ハッシュ（file/source/explanation）を持ち、後続の drift 検出に
+  参加できる。
+
+## 説明の drift 検出（Issue #57）
+
+ソース由来の説明（#56 の能力階層、API role、probe 推奨）は実装が変わると stale に
+なる。「いつ説明を見直すべきか」を **#55 の決定的ハッシュ来歴**だけに基づいて通知する。
+意味的な推測・embedding・heuristic 類似は使わない。**ハッシュの drift は「見直しの
+トリガー」であり、「説明が間違っている」という判定ではない。**
+
+### 仕組み
+
+階層を生成した時点（base snapshot）でノードに記録した
+`file_content_hash` / `symbol_source_hash` / `explanation_hash` を、より新しい
+pinned snapshot（target）の事実と比較する。anchor の対応付けは安定識別子
+（`path` + `qualified_name`）で行い、source 行範囲は弱い証拠としてのみ扱い照合には
+使わない。
+
+### ステータス
+
+- `fresh` — 記録した全ハッシュが target でも一致
+- `stale` — いずれかのハッシュが変化（anchor 単位は changed/unchanged の二値）
+- `partially_stale` — （集約レベルのみ）依存の一部だけが変化
+- `missing_source` — 依存していた file または symbol が消えた（削除/rename）
+- `unknown` — 比較可能なハッシュを持たないノード（draft 由来の purpose 等）
+
+### drift スコア（保守的・文書化済み）
+
+ある capability/system の drift は依存集合から導く（二値ではなく比率と影響 anchor を返す）:
+
+- `symbol_deps_changed / symbol_deps_total`（symbol ソースハッシュの変化）
+- `file_deps_changed / file_deps_total`（file 内容ハッシュの変化・**distinct path** で計上）
+- `explanation_blocks_changed / explanation_blocks_total`（説明ブロックの変化）
+- `missing_anchors / total`（消えた anchor）
+- `mismatch_ratio = (stale + missing) / comparable`、ここで
+  `comparable = fresh + stale + missing`
+
+集約ステータスは保守的に決定する: `comparable=0` なら `unknown`、変化ゼロなら
+`fresh`、全 comparable が missing なら `missing_source`、全 comparable が変化なら
+`stale`、それ以外（一部変化）なら `partially_stale`。
+変化したハッシュは「review needed」を意味し、「説明が誤り」ではない。
+
+### API
+
+- `GET /repository/capability-hierarchy/drift?target_snapshot_id=`（任意・既定は
+  最新の **symbol-indexed** な ready snapshot）。最新の能力階層 run を base とし、
+  target と比較した system / capability / anchor 各レベルの drift（counts・ratio・
+  影響 anchor・`is_review_recommended`・任意の `review_note`）を返す。drift は
+  決定的な再計算であり新規テーブルは持たない（永続化された階層ノードと snapshot
+  事実から導出）。
+- **target は symbol index 済みに限定する**。snapshot は index 前に `ready` になる
+  ため、未 index の snapshot を target にすると symbol 事実が空になり、各 symbol
+  anchor が `missing_source`（削除/rename）と誤判定され false-positive な review
+  推奨が出る。これを避けるため、既定 target は最新の index 済み snapshot（無ければ
+  base に fallback）とし、明示指定した target が未 index の場合は 409 を返す。
+
+本 issue は決定的に留める。reasoning model が説明を更新する作業は、別 issue として
+run metadata 永続化と fail-closed 付きで明示的に行う（本 issue では非対象）。
+
+## Flow Explorer の API Role Card（Issue #58）
+
+API は probe 設定の entrypoint として選べるようになったが、開発者が「どこを probe
+するか」を選ぶ前に各 API の**システム内での役割**を理解できる文脈が必要だった。#58
+は Flow Explorer に **API Role Card** を追加し、#56 の能力階層と #57 の drift を
+そのまま消費して entrypoint 選択時に表示する。UI で新しい階層意味論を発明しない。
+
+### カード内容（backend entrypoint ごと）
+
+- 所属 capability と分類（classified / unclassified / unknown）
+- element type（core / element / supporting）・role・operation kind
+- consumers・state effects・boundaries（state effects から導出）・probe value
+- 同じ capability の他の実装要素（flows through）
+- **provenance**（source-authored / deterministic AST / reasoning-model
+  interpretation / unknown を可視のバッジで区別）
+- **freshness**（#57 の drift status と「N of M source anchors changed」）。
+  drift はグラフ/probe 操作を**ブロックしない**。
+- LLM scan 由来で handler が解決できない entrypoint は **review-needed** を明示し、
+  実行可能なグラフを示唆しない（`handler_resolved=false`）。
+
+### API
+
+- `GET /repository/api-role-cards` が backend entrypoint（api / message_queue /
+  scheduled_job / cli）ごとの role card を返す。各カードは
+  `(entrypoint_type, entrypoint_id)` で `FlowEntrypoint` と join できる。
+- 分類は階層ノード（reasoning grouping を反映）を優先し、無ければ handler の #54
+  メタデータに fallback する。drift は #57 と同じく **symbol-index 済みの最新
+  snapshot** を target にし、classified カードは capability 集約 drift、それ以外は
+  ノード単位 drift を表示する。
+- 階層 entrypoint ノードは base snapshot の `code_entrypoints` 行 id を参照する
+  （snapshot 間で不安定）ため、論理 `(entrypoint_type, entrypoint_id)` に変換して
+  現 snapshot の entrypoint と対応付ける。
+- snapshot/symbol が無ければ空のカード集合を返す（エラーにしない）。
+
+非対象: メタデータ authoring UI、自動 refresh/再生成、ソース書き換え、既存
+Feature Map ページの置き換え。
+
+## 説明の refresh 提案（Issue #59）
+
+#57 は説明が古くなった（hash が drift した）ことを**検出**するだけで、説明レイヤ
+を更新する助けにはならない。#59 はこのメンテナンスループを明示化する: 古くなった
+階層ノード / API Role Card に対し、reasoning model が**更新案（提案）**を生成する。
+提案は**あくまで suggestion** であり、probe-agent は対象リポジトリを書き換えない。
+開発者がレビューしてソースの docstring を手で更新し、次の snapshot が更新後の説明を
+再 index する。
+
+### コンテキストパック（決定的に構築）
+
+提案生成のために以下を集めて reasoning model に渡す:
+
+- 旧説明ブロック（`symbol_source_metadata.raw_block` の逐語コピー）と旧パース済み
+  メタデータ
+- 変化した source anchor と、捕捉時・現在の hash（#55）
+- pin された snapshot から読んだ**現在のソース断片**（symbol 範囲。symbol が消えて
+  いれば空 → 「ソースが無い」と提案に明記）
+- 決定的な構造ファクト（route method/path・operation・category・capability 等）
+
+### fail closed と語彙の制約
+
+- mock / 非 reasoning モデルは**閉じて失敗**し、推測は永続化しない（reasoning-llm
+  skill）。失敗 run は `intelligence_runs` に残り可視化される。
+- 提案メタデータの enum フィールド（`element_type` / `operation_kind` /
+  `state_effects`）は #54 と同じ有限語彙で検証する。未知の enum 値やキーを含む提案は
+  **拒否**する（決定的判断は有限集合に閉じる、CLAUDE.md 原則 6）。
+
+### API
+
+- `POST /repository/explanation-refresh` が `node_id` か論理
+  `(entrypoint_type, entrypoint_id)` で対象ノードを指定して提案を生成する。drift が
+  stale / missing_source のときのみ生成し、fresh なら 409 を返す。target snapshot は
+  #57 と同じく symbol-index 済みのものに限る（未 index は 409）。
+- `GET /repository/explanation-refresh` が直近の提案一覧を返す。
+- レスポンスは常に `review_required=true` と review note を含み、「開発者がレビュー
+  してソースへ適用する必要がある」ことを明示する。提案は
+  `explanation_refresh_proposals`（system scope）に旧説明・提案説明・変化 anchor・
+  drift 理由・provider/model/prompt/schema・捕捉/現在 hash と共に永続化する。
+- Flow Explorer の Role Card に「Propose explanation refresh」操作を追加し、drift が
+  review 推奨のときに提案（旧説明 vs 提案説明 vs 提案メタデータ）と review note を
+  その場で表示する。
+
+非対象: 自動ソース編集、コミット作成、バックグラウンドでの暗黙 refresh、reasoning
+モデル不在時の heuristic fallback。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。

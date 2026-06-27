@@ -351,6 +351,8 @@ CREATE TABLE IF NOT EXISTS code_symbols (
     route_path      TEXT,
     route_method    TEXT,
     component_id    TEXT,
+    symbol_source_hash TEXT,
+    symbol_body_hash   TEXT,
     FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
 );
@@ -376,6 +378,173 @@ CREATE TABLE IF NOT EXISTS symbol_index_warnings (
 
 CREATE INDEX IF NOT EXISTS idx_symbol_warnings_snapshot
     ON symbol_index_warnings (snapshot_id);
+
+-- Source-anchored explanation metadata (Issue #54).  Author-written facts
+-- copied verbatim from docstrings of a pinned snapshot.  Kept separate from
+-- reasoning-model interpretations; origin is always 'source_authored'.
+CREATE TABLE IF NOT EXISTS symbol_source_metadata (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id     INTEGER NOT NULL,
+    system_id       INTEGER NOT NULL,
+    symbol_id       INTEGER NOT NULL,
+    path            TEXT NOT NULL,
+    qualified_name  TEXT NOT NULL,
+    start_line      INTEGER NOT NULL,
+    end_line        INTEGER NOT NULL,
+    role            TEXT,
+    capability      TEXT,
+    element_type    TEXT,
+    system_purpose  TEXT,
+    operation_kind  TEXT,
+    consumers       TEXT NOT NULL DEFAULT '[]',
+    state_effects   TEXT NOT NULL DEFAULT '[]',
+    probe_value     TEXT,
+    raw_block       TEXT NOT NULL,
+    origin          TEXT NOT NULL DEFAULT 'source_authored',
+    explanation_hash TEXT,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (symbol_id) REFERENCES code_symbols (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_symbol_source_metadata_snapshot
+    ON symbol_source_metadata (snapshot_id);
+
+CREATE INDEX IF NOT EXISTS idx_symbol_source_metadata_symbol
+    ON symbol_source_metadata (symbol_id);
+
+CREATE INDEX IF NOT EXISTS idx_symbol_source_metadata_system
+    ON symbol_source_metadata (system_id, snapshot_id);
+
+-- Explanation-to-source dependency anchors (Issue #55).  Each source-authored
+-- explanation records the deterministic provenance it depends on: the file,
+-- the symbol span, and the three hash types.  Downstream drift features compare
+-- these hashes against a newer snapshot.  Hash equality is only a change
+-- signal, never proof of semantic equality.
+CREATE TABLE IF NOT EXISTS explanation_source_anchors (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id        INTEGER NOT NULL,
+    system_id          INTEGER NOT NULL,
+    metadata_id        INTEGER NOT NULL,
+    symbol_id          INTEGER NOT NULL,
+    path               TEXT NOT NULL,
+    qualified_name     TEXT NOT NULL,
+    start_line         INTEGER NOT NULL,
+    end_line           INTEGER NOT NULL,
+    file_content_hash  TEXT,
+    symbol_source_hash TEXT,
+    symbol_body_hash   TEXT,
+    explanation_hash   TEXT,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (metadata_id) REFERENCES symbol_source_metadata (id) ON DELETE CASCADE,
+    FOREIGN KEY (symbol_id) REFERENCES code_symbols (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_explanation_anchors_snapshot
+    ON explanation_source_anchors (snapshot_id);
+
+CREATE INDEX IF NOT EXISTS idx_explanation_anchors_system
+    ON explanation_source_anchors (system_id, snapshot_id);
+
+-- Source-backed capability hierarchy (Issue #56). One row per hierarchy node,
+-- discriminated by node_type (purpose|capability|element|supporting) and linked
+-- to its parent via parent_id. Each node records its provenance (source anchor,
+-- hashes, provenance_kind, decision_method, provider/model) so source-authored
+-- explanation, deterministic structural fact, and reasoning interpretation stay
+-- separable. Scoped by system and repository snapshot.
+CREATE TABLE IF NOT EXISTS capability_hierarchy_nodes (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id               INTEGER NOT NULL,
+    snapshot_id             INTEGER NOT NULL,
+    intelligence_run_id     INTEGER NOT NULL,
+    parent_id               INTEGER,
+    node_type               TEXT NOT NULL,
+    name                    TEXT NOT NULL DEFAULT '',
+    summary                 TEXT NOT NULL DEFAULT '',
+    capability_key          TEXT,
+    element_role            TEXT,
+    operation_kind          TEXT,
+    probe_value             TEXT,
+    supporting_kind         TEXT,
+    classification          TEXT,
+    symbol_id               INTEGER,
+    entrypoint_id           INTEGER,
+    feature_id              TEXT,
+    system_profile_draft_id INTEGER,
+    path                    TEXT,
+    qualified_name          TEXT,
+    start_line              INTEGER,
+    end_line                INTEGER,
+    file_content_hash       TEXT,
+    symbol_source_hash      TEXT,
+    explanation_hash        TEXT,
+    provenance_kind         TEXT NOT NULL DEFAULT 'structural',
+    decision_method         TEXT NOT NULL DEFAULT 'deterministic',
+    provider                TEXT,
+    model                   TEXT,
+    created_at              REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_id) REFERENCES capability_hierarchy_nodes (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_capability_hierarchy_run
+    ON capability_hierarchy_nodes (intelligence_run_id);
+
+CREATE INDEX IF NOT EXISTS idx_capability_hierarchy_system
+    ON capability_hierarchy_nodes (system_id, snapshot_id);
+
+-- Explanation refresh proposals (Issue #59). When a source-backed explanation
+-- drifts (#57), a reasoning model proposes updated wording/metadata. Each row
+-- is a reviewable SUGGESTION only: probe-agent never edits the target source
+-- repository, and a developer must apply the change to the source by hand. The
+-- run audit (provider/model/prompt/schema/status/error) lives in
+-- intelligence_runs; this table stores the proposal payload and the captured
+-- vs. current source provenance it was generated from. Scoped by system.
+CREATE TABLE IF NOT EXISTS explanation_refresh_proposals (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    intelligence_run_id   INTEGER NOT NULL,
+    base_snapshot_id      INTEGER NOT NULL,
+    target_snapshot_id    INTEGER NOT NULL,
+    node_id               INTEGER,
+    node_type             TEXT NOT NULL DEFAULT '',
+    name                  TEXT NOT NULL DEFAULT '',
+    entrypoint_type       TEXT,
+    entrypoint_id         TEXT,
+    path                  TEXT,
+    qualified_name        TEXT,
+    drift_status          TEXT NOT NULL DEFAULT '',
+    drift_reason          TEXT NOT NULL DEFAULT '',
+    changed_hashes        TEXT NOT NULL DEFAULT '[]',
+    old_explanation       TEXT NOT NULL DEFAULT '',
+    proposed_explanation  TEXT,
+    proposed_metadata     TEXT,
+    summary_of_changes    TEXT,
+    confidence            REAL,
+    captured_file_content_hash  TEXT,
+    captured_symbol_source_hash TEXT,
+    captured_explanation_hash   TEXT,
+    current_file_content_hash   TEXT,
+    current_symbol_source_hash  TEXT,
+    current_explanation_hash    TEXT,
+    status                TEXT NOT NULL DEFAULT 'proposed',
+    is_mock               INTEGER NOT NULL DEFAULT 0,
+    provider              TEXT NOT NULL DEFAULT '',
+    model                 TEXT NOT NULL DEFAULT '',
+    decision_method       TEXT NOT NULL DEFAULT 'reasoning_llm',
+    created_at            REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_refresh_proposals_system
+    ON explanation_refresh_proposals (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_refresh_proposals_run
+    ON explanation_refresh_proposals (intelligence_run_id);
 
 CREATE TABLE IF NOT EXISTS code_entrypoints (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -990,6 +1159,15 @@ def init_db() -> None:
             )
         if "component_id" not in _columns(conn, "code_symbols"):
             conn.execute("ALTER TABLE code_symbols ADD COLUMN component_id TEXT")
+        code_symbol_cols = _columns(conn, "code_symbols")
+        if "symbol_source_hash" not in code_symbol_cols:
+            conn.execute("ALTER TABLE code_symbols ADD COLUMN symbol_source_hash TEXT")
+        if "symbol_body_hash" not in code_symbol_cols:
+            conn.execute("ALTER TABLE code_symbols ADD COLUMN symbol_body_hash TEXT")
+        if "explanation_hash" not in _columns(conn, "symbol_source_metadata"):
+            conn.execute(
+                "ALTER TABLE symbol_source_metadata ADD COLUMN explanation_hash TEXT"
+            )
         validation_columns = _columns(conn, "validation_runs")
         if "trace_received" not in validation_columns:
             conn.execute("ALTER TABLE validation_runs ADD COLUMN trace_received INTEGER")
