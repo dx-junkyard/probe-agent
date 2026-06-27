@@ -686,6 +686,76 @@ class CapabilityHierarchyOut(BaseModel):
     is_mock: bool = False
 
 
+# ---------------------------------------------------------------------------
+# Explanation drift (Issue #57)
+# ---------------------------------------------------------------------------
+
+# Anchor-level uses fresh/stale/missing_source/unknown; aggregate levels add
+# partially_stale. Hash drift is a review trigger, not a correctness verdict.
+DriftStatus = Literal[
+    "fresh", "partially_stale", "stale", "missing_source", "unknown"
+]
+
+
+class AnchorDriftOut(BaseModel):
+    node_id: int
+    node_type: str
+    name: str
+    path: Optional[str] = None
+    qualified_name: Optional[str] = None
+    entrypoint_id: Optional[int] = None
+    status: DriftStatus
+    changed_hashes: List[str] = Field(default_factory=list)
+    captured_file_content_hash: Optional[str] = None
+    captured_symbol_source_hash: Optional[str] = None
+    captured_explanation_hash: Optional[str] = None
+    current_file_content_hash: Optional[str] = None
+    current_symbol_source_hash: Optional[str] = None
+    current_explanation_hash: Optional[str] = None
+
+
+class DriftCountsOut(BaseModel):
+    total: int = 0
+    fresh: int = 0
+    stale: int = 0
+    missing: int = 0
+    unknown: int = 0
+    symbol_deps_total: int = 0
+    symbol_deps_changed: int = 0
+    file_deps_total: int = 0
+    file_deps_changed: int = 0
+    explanation_blocks_total: int = 0
+    explanation_blocks_changed: int = 0
+    missing_anchors: int = 0
+    mismatch_ratio: float = 0.0
+
+
+class CapabilityDriftOut(BaseModel):
+    capability_id: int
+    capability_key: Optional[str] = None
+    name: str
+    status: DriftStatus
+    counts: DriftCountsOut
+    elements: List[AnchorDriftOut] = Field(default_factory=list)
+    supporting_elements: List[AnchorDriftOut] = Field(default_factory=list)
+
+
+class CapabilityHierarchyDriftOut(BaseModel):
+    system_id: int
+    base_snapshot_id: int
+    target_snapshot_id: int
+    intelligence_run: Optional[IntelligenceRunOut] = None
+    status: DriftStatus
+    counts: DriftCountsOut
+    target_indexed: bool = True
+    purpose: Optional[AnchorDriftOut] = None
+    capabilities: List[CapabilityDriftOut] = Field(default_factory=list)
+    unclassified_elements: List[AnchorDriftOut] = Field(default_factory=list)
+    unattached_supporting: List[AnchorDriftOut] = Field(default_factory=list)
+    is_review_recommended: bool = False
+    review_note: Optional[str] = None
+
+
 class SymbolIndexWarningOut(BaseModel):
     path: str
     message: str

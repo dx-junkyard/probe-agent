@@ -19,6 +19,7 @@ from ..capability_hierarchy import (
 from ..capability_hierarchy import PROMPT_VERSION as HIERARCHY_PROMPT_VERSION
 from ..capability_hierarchy import SCHEMA_VERSION as HIERARCHY_SCHEMA_VERSION
 from ..code_indexer import index_snapshot_files
+from .. import drift as drift_service
 from ..code_mapper import (
     FeatureContext,
     generate_code_mapping,
@@ -65,6 +66,10 @@ from ..models import (
     CapabilityPurposeOut,
     SupportingElementOut,
     HierarchyProvenanceOut,
+    AnchorDriftOut,
+    CapabilityDriftOut,
+    CapabilityHierarchyDriftOut,
+    DriftCountsOut,
     FeatureCodeLinkOut,
     FeatureCodeLinksOut,
     FeatureDraftOut,
@@ -1884,6 +1889,211 @@ def get_capability_hierarchy(
                 system_id=system_id, snapshot_id=snapshot_id,
             )
         return _load_hierarchy_out(conn, system_id, snapshot_id, run_row)
+
+
+# ---------------------------------------------------------------------------
+# Explanation drift (Issue #57)
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_facts(conn, snapshot_id: int, system_id: int) -> drift_service.SnapshotFacts:
+    """Deterministic hash facts of a pinned snapshot for drift comparison."""
+    file_rows = conn.execute(
+        "SELECT path, content_hash FROM snapshot_files WHERE snapshot_id = ?",
+        (snapshot_id,),
+    ).fetchall()
+    sym_rows = conn.execute(
+        """
+        SELECT cs.path, cs.qualified_name, cs.symbol_source_hash,
+               ssm.explanation_hash
+        FROM code_symbols cs
+        LEFT JOIN symbol_source_metadata ssm ON ssm.symbol_id = cs.id
+        WHERE cs.snapshot_id = ? AND cs.system_id = ?
+        """,
+        (snapshot_id, system_id),
+    ).fetchall()
+    return drift_service.SnapshotFacts(
+        file_hash_by_path={r["path"]: r["content_hash"] for r in file_rows},
+        symbol_by_key={
+            (r["path"], r["qualified_name"]): (
+                r["symbol_source_hash"], r["explanation_hash"]
+            )
+            for r in sym_rows
+        },
+    )
+
+
+def _node_anchor(row) -> drift_service.NodeAnchor:
+    return drift_service.NodeAnchor(
+        node_id=row["id"],
+        node_type=row["node_type"],
+        name=row["name"],
+        path=row["path"],
+        qualified_name=row["qualified_name"],
+        entrypoint_id=row["entrypoint_id"],
+        file_content_hash=row["file_content_hash"],
+        symbol_source_hash=row["symbol_source_hash"],
+        explanation_hash=row["explanation_hash"],
+    )
+
+
+def _anchor_drift_out(d: drift_service.AnchorDrift) -> AnchorDriftOut:
+    return AnchorDriftOut(
+        node_id=d.node_id,
+        node_type=d.node_type,
+        name=d.name,
+        path=d.path,
+        qualified_name=d.qualified_name,
+        entrypoint_id=d.entrypoint_id,
+        status=d.status,
+        changed_hashes=d.changed_hashes,
+        captured_file_content_hash=d.captured_file_content_hash,
+        captured_symbol_source_hash=d.captured_symbol_source_hash,
+        captured_explanation_hash=d.captured_explanation_hash,
+        current_file_content_hash=d.current_file_content_hash,
+        current_symbol_source_hash=d.current_symbol_source_hash,
+        current_explanation_hash=d.current_explanation_hash,
+    )
+
+
+def _counts_out(counts: drift_service.DriftCounts) -> DriftCountsOut:
+    return DriftCountsOut(**counts.__dict__)
+
+
+@router.get(
+    "/repository/capability-hierarchy/drift",
+    response_model=CapabilityHierarchyDriftOut,
+)
+def get_capability_hierarchy_drift(
+    target_snapshot_id: Optional[int] = Query(
+        default=None,
+        description="Snapshot to compare against. Defaults to the latest ready "
+        "snapshot. The hierarchy's own snapshot is the base.",
+    ),
+    system_id: int = Depends(get_system_id),
+) -> CapabilityHierarchyDriftOut:
+    """Report deterministic explanation drift for the latest capability hierarchy.
+
+    Compares the source hashes captured when the hierarchy was generated against
+    a newer pinned snapshot. Hash drift is a review trigger, not a correctness
+    verdict.
+    """
+    with get_conn() as conn:
+        run_row = conn.execute(
+            """
+            SELECT * FROM intelligence_runs
+            WHERE system_id = ? AND run_type = 'capability_hierarchy'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (system_id,),
+        ).fetchone()
+        if run_row is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No capability hierarchy generated. Generate one first.",
+            )
+        base_snapshot_id = run_row["snapshot_id"]
+
+        if target_snapshot_id is None:
+            target_row = _latest_ready_snapshot(conn, system_id)
+            target = target_row["id"] if target_row else base_snapshot_id
+        else:
+            target = target_snapshot_id
+            owned = conn.execute(
+                "SELECT 1 FROM repository_snapshots WHERE id = ? AND system_id = ?",
+                (target, system_id),
+            ).fetchone()
+            if owned is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Target snapshot not found for this system.",
+                )
+
+        node_rows = conn.execute(
+            "SELECT * FROM capability_hierarchy_nodes WHERE intelligence_run_id = ? "
+            "ORDER BY id",
+            (run_row["id"],),
+        ).fetchall()
+        facts = _snapshot_facts(conn, target, system_id)
+        target_indexed = bool(facts.symbol_by_key) or bool(
+            conn.execute(
+                "SELECT 1 FROM code_symbols WHERE snapshot_id = ? LIMIT 1", (target,)
+            ).fetchone()
+        )
+
+    # Compute per-node drift deterministically.
+    drift_by_node: dict = {}
+    by_parent: dict = {}
+    purpose_row = None
+    capability_rows = []
+    unclassified_rows = []
+    unattached_supporting_rows = []
+    for r in node_rows:
+        drift_by_node[r["id"]] = drift_service.compute_anchor_drift(
+            _node_anchor(r), facts
+        )
+        by_parent.setdefault(r["parent_id"], []).append(r)
+        if r["node_type"] == "purpose":
+            purpose_row = r
+        elif r["node_type"] == "capability":
+            capability_rows.append(r)
+        elif r["parent_id"] is None and r["node_type"] == "element":
+            unclassified_rows.append(r)
+        elif r["parent_id"] is None and r["node_type"] == "supporting":
+            unattached_supporting_rows.append(r)
+
+    all_drifts = list(drift_by_node.values())
+
+    capabilities_out = []
+    for cap in capability_rows:
+        children = by_parent.get(cap["id"], [])
+        element_drifts = [
+            drift_by_node[c["id"]] for c in children if c["node_type"] == "element"
+        ]
+        supporting_drifts = [
+            drift_by_node[c["id"]] for c in children if c["node_type"] == "supporting"
+        ]
+        cap_self = drift_by_node[cap["id"]]
+        cap_status, cap_counts = drift_service.aggregate_drift(
+            [cap_self] + element_drifts + supporting_drifts
+        )
+        capabilities_out.append(CapabilityDriftOut(
+            capability_id=cap["id"],
+            capability_key=cap["capability_key"],
+            name=cap["name"],
+            status=cap_status,
+            counts=_counts_out(cap_counts),
+            elements=[_anchor_drift_out(d) for d in element_drifts],
+            supporting_elements=[_anchor_drift_out(d) for d in supporting_drifts],
+        ))
+
+    system_status, system_counts = drift_service.aggregate_drift(all_drifts)
+
+    return CapabilityHierarchyDriftOut(
+        system_id=system_id,
+        base_snapshot_id=base_snapshot_id,
+        target_snapshot_id=target,
+        intelligence_run=_intelligence_run_out(run_row),
+        status=system_status,
+        counts=_counts_out(system_counts),
+        target_indexed=target_indexed,
+        purpose=(
+            _anchor_drift_out(drift_by_node[purpose_row["id"]])
+            if purpose_row is not None else None
+        ),
+        capabilities=capabilities_out,
+        unclassified_elements=[
+            _anchor_drift_out(drift_by_node[r["id"]]) for r in unclassified_rows
+        ],
+        unattached_supporting=[
+            _anchor_drift_out(drift_by_node[r["id"]]) for r in unattached_supporting_rows
+        ],
+        is_review_recommended=drift_service.is_review_recommended(system_status),
+        review_note=(
+            drift_service.REVIEW_NOTE
+            if drift_service.is_review_recommended(system_status) else None
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

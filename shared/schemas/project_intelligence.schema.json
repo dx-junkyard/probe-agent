@@ -426,6 +426,81 @@
         "is_mock": { "type": "boolean" }
       },
       "additionalProperties": false
+    },
+    "DriftCounts": {
+      "type": "object",
+      "description": "Drift dependency counts and ratios for a capability/system. Hash drift is a review trigger, not a correctness verdict.",
+      "properties": {
+        "total": { "type": "integer" },
+        "fresh": { "type": "integer" },
+        "stale": { "type": "integer" },
+        "missing": { "type": "integer" },
+        "unknown": { "type": "integer" },
+        "symbol_deps_total": { "type": "integer" },
+        "symbol_deps_changed": { "type": "integer" },
+        "file_deps_total": { "type": "integer" },
+        "file_deps_changed": { "type": "integer" },
+        "explanation_blocks_total": { "type": "integer" },
+        "explanation_blocks_changed": { "type": "integer" },
+        "missing_anchors": { "type": "integer" },
+        "mismatch_ratio": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    "AnchorDrift": {
+      "type": "object",
+      "required": ["node_id", "node_type", "name", "status"],
+      "properties": {
+        "node_id": { "type": "integer" },
+        "node_type": { "type": "string" },
+        "name": { "type": "string" },
+        "path": { "type": ["string", "null"] },
+        "qualified_name": { "type": ["string", "null"] },
+        "entrypoint_id": { "type": ["integer", "null"] },
+        "status": { "enum": ["fresh", "partially_stale", "stale", "missing_source", "unknown"] },
+        "changed_hashes": { "type": "array", "items": { "type": "string" } },
+        "captured_file_content_hash": { "type": ["string", "null"] },
+        "captured_symbol_source_hash": { "type": ["string", "null"] },
+        "captured_explanation_hash": { "type": ["string", "null"] },
+        "current_file_content_hash": { "type": ["string", "null"] },
+        "current_symbol_source_hash": { "type": ["string", "null"] },
+        "current_explanation_hash": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "CapabilityDrift": {
+      "type": "object",
+      "required": ["capability_id", "name", "status", "counts"],
+      "properties": {
+        "capability_id": { "type": "integer" },
+        "capability_key": { "type": ["string", "null"] },
+        "name": { "type": "string" },
+        "status": { "enum": ["fresh", "partially_stale", "stale", "missing_source", "unknown"] },
+        "counts": { "$ref": "#/definitions/DriftCounts" },
+        "elements": { "type": "array", "items": { "$ref": "#/definitions/AnchorDrift" } },
+        "supporting_elements": { "type": "array", "items": { "$ref": "#/definitions/AnchorDrift" } }
+      },
+      "additionalProperties": false
+    },
+    "CapabilityHierarchyDrift": {
+      "type": "object",
+      "required": ["system_id", "base_snapshot_id", "target_snapshot_id", "status", "counts"],
+      "properties": {
+        "system_id": { "type": "integer" },
+        "base_snapshot_id": { "type": "integer" },
+        "target_snapshot_id": { "type": "integer" },
+        "intelligence_run": { "oneOf": [{ "$ref": "#/definitions/IntelligenceRun" }, { "type": "null" }] },
+        "status": { "enum": ["fresh", "partially_stale", "stale", "missing_source", "unknown"] },
+        "counts": { "$ref": "#/definitions/DriftCounts" },
+        "target_indexed": { "type": "boolean" },
+        "purpose": { "oneOf": [{ "$ref": "#/definitions/AnchorDrift" }, { "type": "null" }] },
+        "capabilities": { "type": "array", "items": { "$ref": "#/definitions/CapabilityDrift" } },
+        "unclassified_elements": { "type": "array", "items": { "$ref": "#/definitions/AnchorDrift" } },
+        "unattached_supporting": { "type": "array", "items": { "$ref": "#/definitions/AnchorDrift" } },
+        "is_review_recommended": { "type": "boolean" },
+        "review_note": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
     }
   },
   "type": "object"

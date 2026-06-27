@@ -346,6 +346,73 @@ export interface CapabilityHierarchyOut {
   is_mock: boolean;
 }
 
+// Explanation drift (Issue #57). Hash drift is a review trigger, not a verdict.
+export type DriftStatus =
+  | "fresh"
+  | "partially_stale"
+  | "stale"
+  | "missing_source"
+  | "unknown";
+
+export interface AnchorDriftOut {
+  node_id: number;
+  node_type: string;
+  name: string;
+  path: string | null;
+  qualified_name: string | null;
+  entrypoint_id: number | null;
+  status: DriftStatus;
+  changed_hashes: string[];
+  captured_file_content_hash: string | null;
+  captured_symbol_source_hash: string | null;
+  captured_explanation_hash: string | null;
+  current_file_content_hash: string | null;
+  current_symbol_source_hash: string | null;
+  current_explanation_hash: string | null;
+}
+
+export interface DriftCountsOut {
+  total: number;
+  fresh: number;
+  stale: number;
+  missing: number;
+  unknown: number;
+  symbol_deps_total: number;
+  symbol_deps_changed: number;
+  file_deps_total: number;
+  file_deps_changed: number;
+  explanation_blocks_total: number;
+  explanation_blocks_changed: number;
+  missing_anchors: number;
+  mismatch_ratio: number;
+}
+
+export interface CapabilityDriftOut {
+  capability_id: number;
+  capability_key: string | null;
+  name: string;
+  status: DriftStatus;
+  counts: DriftCountsOut;
+  elements: AnchorDriftOut[];
+  supporting_elements: AnchorDriftOut[];
+}
+
+export interface CapabilityHierarchyDriftOut {
+  system_id: number;
+  base_snapshot_id: number;
+  target_snapshot_id: number;
+  intelligence_run: IntelligenceRunOut | null;
+  status: DriftStatus;
+  counts: DriftCountsOut;
+  target_indexed: boolean;
+  purpose: AnchorDriftOut | null;
+  capabilities: CapabilityDriftOut[];
+  unclassified_elements: AnchorDriftOut[];
+  unattached_supporting: AnchorDriftOut[];
+  is_review_recommended: boolean;
+  review_note: string | null;
+}
+
 export interface SymbolIndexOut {
   snapshot_id: number | null;
   system_id: number;

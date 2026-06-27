@@ -568,6 +568,56 @@ provider/model も持つ。
   `symbol_id` と #55 ハッシュ（file/source/explanation）を持ち、後続の drift 検出に
   参加できる。
 
+## 説明の drift 検出（Issue #57）
+
+ソース由来の説明（#56 の能力階層、API role、probe 推奨）は実装が変わると stale に
+なる。「いつ説明を見直すべきか」を **#55 の決定的ハッシュ来歴**だけに基づいて通知する。
+意味的な推測・embedding・heuristic 類似は使わない。**ハッシュの drift は「見直しの
+トリガー」であり、「説明が間違っている」という判定ではない。**
+
+### 仕組み
+
+階層を生成した時点（base snapshot）でノードに記録した
+`file_content_hash` / `symbol_source_hash` / `explanation_hash` を、より新しい
+pinned snapshot（target）の事実と比較する。anchor の対応付けは安定識別子
+（`path` + `qualified_name`）で行い、source 行範囲は弱い証拠としてのみ扱い照合には
+使わない。
+
+### ステータス
+
+- `fresh` — 記録した全ハッシュが target でも一致
+- `stale` — いずれかのハッシュが変化（anchor 単位は changed/unchanged の二値）
+- `partially_stale` — （集約レベルのみ）依存の一部だけが変化
+- `missing_source` — 依存していた file または symbol が消えた（削除/rename）
+- `unknown` — 比較可能なハッシュを持たないノード（draft 由来の purpose 等）
+
+### drift スコア（保守的・文書化済み）
+
+ある capability/system の drift は依存集合から導く（二値ではなく比率と影響 anchor を返す）:
+
+- `symbol_deps_changed / symbol_deps_total`（symbol ソースハッシュの変化）
+- `file_deps_changed / file_deps_total`（file 内容ハッシュの変化・**distinct path** で計上）
+- `explanation_blocks_changed / explanation_blocks_total`（説明ブロックの変化）
+- `missing_anchors / total`（消えた anchor）
+- `mismatch_ratio = (stale + missing) / comparable`、ここで
+  `comparable = fresh + stale + missing`
+
+集約ステータスは保守的に決定する: `comparable=0` なら `unknown`、変化ゼロなら
+`fresh`、全 comparable が missing なら `missing_source`、全 comparable が変化なら
+`stale`、それ以外（一部変化）なら `partially_stale`。
+変化したハッシュは「review needed」を意味し、「説明が誤り」ではない。
+
+### API
+
+- `GET /repository/capability-hierarchy/drift?target_snapshot_id=`（任意・既定は
+  最新 ready snapshot）。最新の能力階層 run を base とし、target と比較した
+  system / capability / anchor 各レベルの drift（counts・ratio・影響 anchor・
+  `is_review_recommended`・任意の `review_note`）を返す。drift は決定的な再計算で
+  あり新規テーブルは持たない（永続化された階層ノードと snapshot 事実から導出）。
+
+本 issue は決定的に留める。reasoning model が説明を更新する作業は、別 issue として
+run metadata 永続化と fail-closed 付きで明示的に行う（本 issue では非対象）。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。
