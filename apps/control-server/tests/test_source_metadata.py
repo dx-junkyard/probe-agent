@@ -442,3 +442,35 @@ class TestSourceMetadataAPI:
         assert "build_flow_graph" not in qnames
         for s in r_b.json()["symbols"]:
             assert s["source_metadata"] is None
+
+    def test_duplicate_symbols_do_not_break_indexing(self, admin_client, tmp_path):
+        # Two module-level defs with the same name collide on the
+        # (snapshot_id, qualified_name, path) unique index. Indexing must
+        # ignore the duplicate instead of raising a UNIQUE constraint error.
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "DupSys")
+        repo = tmp_path / "dup-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.email", "t@t.com"],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.name", "T"],
+            check=True, capture_output=True,
+        )
+        (repo / "src").mkdir()
+        (repo / "src" / "dup.py").write_text(
+            "def dup():\n    return 1\n\n\ndef dup():\n    return 2\n"
+        )
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-m", "init"],
+            check=True, capture_output=True,
+        )
+
+        body = _index(admin_client, token, system["id"], repo)
+        # Indexing succeeds and the duplicate is collapsed to a single row.
+        dup_syms = [s for s in body["symbols"] if s["qualified_name"] == "dup"]
+        assert len(dup_syms) == 1

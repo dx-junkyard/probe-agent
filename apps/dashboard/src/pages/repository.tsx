@@ -88,10 +88,10 @@ export default function RepositoryPage() {
                 onClick={() => createSnapshot.mutateAsync().then(s => {
                   if (s.status === "failed") {
                     toast.error(`Snapshot failed: ${s.error_summary ?? "unknown error"}`);
-                  } else if (s.warnings?.length) {
-                    toast.warning(`Snapshot created with ${s.warnings.length} warning(s)`);
                   } else {
-                    toast.success("Snapshot created");
+                    toast.success("Snapshot created", {
+                      description: s.warnings?.length ? `with ${s.warnings.length} warning(s)` : "All files indexed successfully.",
+                    });
                   }
                 }).catch(e => toast.error(String(e)))}
                 disabled={createSnapshot.isPending}
@@ -153,20 +153,35 @@ export default function RepositoryPage() {
                             Inspect indexed and omitted files
                           </summary>
                           <div className="mt-2 max-h-64 space-y-1 overflow-y-auto rounded border p-2">
-                            {latestSnapshot.files.slice(0, 100).map(file => (
-                              <div key={file.path} className="flex items-start justify-between gap-3">
-                                <span className="min-w-0 truncate font-mono" title={file.path}>{file.path}</span>
-                                <span className="shrink-0 text-muted-foreground">
-                                  {file.inclusion_status}
-                                  {file.exclusion_reason ? ` — ${file.exclusion_reason}` : ""}
-                                </span>
-                              </div>
-                            ))}
-                            {latestSnapshot.files.length > 100 && (
-                              <p className="text-muted-foreground">
-                                {latestSnapshot.files.length - 100} additional file(s) omitted from this view.
-                              </p>
-                            )}
+                            {(() => {
+                              const DISPLAY_LIMIT = 100;
+                              const problemFiles = latestSnapshot.files.filter(f => f.inclusion_status !== 'indexed');
+                              const indexedFiles = latestSnapshot.files.filter(f => f.inclusion_status === 'indexed');
+
+                              const indexedToShowCount = Math.max(0, DISPLAY_LIMIT - problemFiles.length);
+                              const indexedToShow = indexedFiles.slice(0, indexedToShowCount);
+                              const filesToShow = [...problemFiles, ...indexedToShow];
+                              const omittedCount = indexedFiles.length - indexedToShow.length;
+
+                              return (
+                                <>
+                                  {filesToShow.map(file => (
+                                    <div key={file.path} className="flex items-start justify-between gap-3">
+                                      <span className="min-w-0 truncate font-mono" title={file.path}>{file.path}</span>
+                                      <span className="shrink-0 text-muted-foreground">
+                                        {file.inclusion_status}
+                                        {file.exclusion_reason ? ` — ${file.exclusion_reason}` : ""}
+                                      </span>
+                                    </div>
+                                  ))}
+                                  {omittedCount > 0 && (
+                                    <p className="text-muted-foreground text-xs italic mt-2">
+                                      {omittedCount} additional indexed file(s) omitted from this view.
+                                    </p>
+                                  )}
+                                </>
+                              );
+                            })()}
                           </div>
                         </details>
                       )}

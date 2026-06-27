@@ -45,9 +45,9 @@ class LLMConfig:
             "mock": "mock",
         }.get(provider, "gpt-4o-mini")
         try:
-            timeout = float(os.getenv("LLM_TIMEOUT", "30"))
+            timeout = float(os.getenv("LLM_TIMEOUT", "120"))
         except ValueError:
-            timeout = 30.0
+            timeout = 120.0
         return cls(
             provider=provider,
             api_key=api_key,
@@ -216,19 +216,33 @@ class GeminiClient(LLMClient):
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
     ) -> str:
-        system_parts = [m["content"] for m in messages if m.get("role") == "system"]
-        text = "\n\n".join(
-            [f"System:\n{chr(10).join(system_parts)}"] if system_parts else []
-            + [f"{m.get('role', 'user')}:\n{m.get('content', '')}" for m in messages if m.get("role") != "system"]
-        )
+        system_instructions = [
+            {"parts": [{"text": m["content"]}]}
+            for m in messages
+            if m.get("role") == "system"
+        ]
+        
+        contents = []
+        for m in messages:
+            role = m.get("role")
+            if role == "system":
+                continue
+            
+            api_role = "model" if role in ("assistant", "developer") else "user"
+            contents.append({"role": api_role, "parts": [{"text": m.get("content", "")}]})
+
         generation_config: Dict[str, Any] = {}
         if temperature is not None:
             generation_config["temperature"] = temperature
         if max_tokens is not None:
             generation_config["maxOutputTokens"] = max_tokens
-        payload: Dict[str, Any] = {"contents": [{"parts": [{"text": text}]}]}
+            
+        payload: Dict[str, Any] = {"contents": contents}
         if generation_config:
             payload["generationConfig"] = generation_config
+        if system_instructions:
+            payload["systemInstruction"] = system_instructions[0]
+
         base = self.config.base_url or "https://generativelanguage.googleapis.com/v1beta"
         response = _request_json(
             f"{base.rstrip('/')}/models/{self.config.model}:generateContent?key={self.config.api_key}",
@@ -237,10 +251,15 @@ class GeminiClient(LLMClient):
             timeout=self.config.timeout,
         )
         try:
-            parts = response["candidates"][0]["content"]["parts"]
+            # When finishReason is MAX_TOKENS, content can be missing or empty.
+            candidate = response.get("candidates", [{}])[0]
+            content = candidate.get("content", {})
+            if not content:
+                return ""
+            parts = content.get("parts", [])
             return "".join(part.get("text", "") for part in parts)
-        except (KeyError, IndexError, TypeError) as exc:
-            raise LLMError(f"Unexpected Gemini response: {response}") from exc
+        except (IndexError, TypeError) as exc:
+            raise LLMError(f"Unexpected Gemini response format: {response}") from exc
 
 
 class MockLLMClient(LLMClient):
