@@ -1,28 +1,33 @@
-"""System-understanding interview persistence and CRUD API (Issue #67).
+"""System-understanding interview persistence and CRUD API (Issues #67, #68).
 
-This is the #35 analogue for the #66 conversational metadata/probe authoring
-flow: a pure persistence + contract layer. These endpoints only store interview
-sessions, their ordered conversation turns, and the combined per-symbol
-proposals (proposed `probe-agent:` docstring metadata block + probe plan).
+Issue #67 — the #35 analogue for the #66 conversational metadata/probe
+authoring flow: a pure persistence + contract layer. These endpoints only
+store interview sessions, their ordered conversation turns, and the combined
+per-symbol proposals.
 
-They never call an LLM and never write to a worktree. Reasoning-run audit
-metadata is stored in the shared ``intelligence_runs`` table and linked from
-messages/proposals; later sibling issues populate it from real reasoning runs,
-add the approve/reject/edit transitions, build the context pack and dialogue,
-and materialize an isolated-worktree diff.
+Issue #68 — the #36 analogue: a deterministic, no-LLM context-pack builder
+that assembles symbols, entrypoints, and existing metadata from a pinned
+snapshot and flags which items are classified vs. unclassified, within an
+explicit LLM context budget.
+
+None of these endpoints call an LLM or write to a worktree.
 """
 
 from __future__ import annotations
 
 import json
 import time
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from fastapi import Query
+
 from ..auth import get_system_id
 from ..db import get_conn
+from ..interview_context import build_interview_context
 from ..models import (
+    InterviewContextPack,
     InterviewMessageCreate,
     InterviewMessageOut,
     InterviewProposalMetadataBlock,
@@ -199,6 +204,28 @@ def get_interview_session(
             **_session_out(row).model_dump(),
             messages=[_message_out(m) for m in message_rows],
             proposals=[_proposal_out(conn, p) for p in proposal_rows],
+        )
+
+
+@router.get(
+    "/interview/sessions/{session_id}/context-pack",
+    response_model=InterviewContextPack,
+)
+def get_interview_context_pack(
+    session_id: int,
+    system_id: int = Depends(get_system_id),
+    budget: Optional[int] = Query(default=None, ge=1000, le=500_000),
+) -> InterviewContextPack:
+    """Deterministic, no-LLM context pack for a pinned interview session.
+
+    Assembles symbols, entrypoints, and existing metadata from the session's
+    pinned snapshot and flags which items are classified vs. unclassified,
+    all within an explicit LLM context budget (Issue #68).
+    """
+    with get_conn() as conn:
+        session = _get_session_or_404(conn, session_id, system_id)
+        return build_interview_context(
+            conn, system_id, session["snapshot_id"], budget_chars=budget,
         )
 
 

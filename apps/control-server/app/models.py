@@ -1826,3 +1826,69 @@ class InterviewProposalOut(BaseModel):
 class InterviewSessionDetailOut(InterviewSessionOut):
     messages: List[InterviewMessageOut] = Field(default_factory=list)
     proposals: List[InterviewProposalOut] = Field(default_factory=list)
+
+
+# --- Interview Context Pack (Issue #68) -------------------------------------
+#
+# Deterministic, no-LLM context assembly for the system-understanding
+# interview. Reads indexed symbols, entrypoints, existing probe-agent:
+# metadata, and capability hierarchy classification from a pinned snapshot
+# and flags which items are already classified vs. unclassified (blank-page).
+# Every item carries a snapshot-relative evidence location. Output respects
+# an LLM context budget independent of snapshot storage.
+
+InterviewSymbolClassification = Literal["classified", "unclassified"]
+
+
+class InterviewEvidenceLocation(BaseModel):
+    snapshot_id: int
+    path: str
+    qualified_name: str
+    start_line: int
+    end_line: int
+
+
+class InterviewSymbolItem(BaseModel):
+    symbol_id: int
+    path: str
+    qualified_name: str
+    kind: str
+    start_line: int
+    end_line: int
+    classification: InterviewSymbolClassification
+    has_metadata: bool = False
+    element_type: Optional[str] = None
+    role: Optional[str] = None
+    capability: Optional[str] = None
+    operation_kind: Optional[str] = None
+    probe_value: Optional[str] = None
+    evidence: InterviewEvidenceLocation
+
+
+class InterviewEntrypointItem(BaseModel):
+    entrypoint_id: int
+    entrypoint_type: str
+    category: str
+    label: str
+    handler_path: str
+    handler_qualified_name: str
+    line_start: int
+    line_end: int
+    classification: InterviewSymbolClassification
+    has_metadata: bool = False
+    evidence: InterviewEvidenceLocation
+
+
+class InterviewContextPack(BaseModel):
+    system_id: int
+    snapshot_id: int
+    total_symbols: int
+    total_entrypoints: int
+    classified_count: int
+    unclassified_count: int
+    budget_max_chars: int
+    budget_used_chars: int
+    truncated: bool = False
+    symbols: List[InterviewSymbolItem] = Field(default_factory=list)
+    entrypoints: List[InterviewEntrypointItem] = Field(default_factory=list)
+    omission_notes: List[str] = Field(default_factory=list)
