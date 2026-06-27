@@ -1254,7 +1254,7 @@ def index_symbols_endpoint(
             for sym in result.symbols:
                 sym_cur = conn.execute(
                     """
-                    INSERT INTO code_symbols
+                    INSERT OR IGNORE INTO code_symbols
                         (snapshot_id, system_id, path, qualified_name, kind,
                          start_line, end_line, decorators, imports, docstring,
                          is_test, is_pydantic_model, route_path, route_method,
@@ -1281,6 +1281,12 @@ def index_symbols_endpoint(
                         sym.symbol_body_hash,
                     ),
                 )
+                # INSERT OR IGNORE skips duplicate (snapshot_id, qualified_name,
+                # path) rows instead of raising a UNIQUE constraint error. When a
+                # row is ignored, lastrowid is stale, so skip the dependent
+                # source-metadata/anchor inserts to avoid mis-attributing them.
+                if sym_cur.rowcount == 0:
+                    continue
                 symbol_id = sym_cur.lastrowid
                 meta = sym.source_metadata
                 if meta is not None:

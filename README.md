@@ -272,7 +272,7 @@ LLM_PROVIDER=openai   # openai / anthropic / gemini / mock
 LLM_MODEL=gpt-5.4-mini
 LLM_API_KEY=...
 LLM_BASE_URL=
-LLM_TIMEOUT=30
+LLM_TIMEOUT=120
 ```
 
 `LLM_PROVIDER=mock` はローカルの疎通確認とテスト用で、外部 API は呼ばない。
