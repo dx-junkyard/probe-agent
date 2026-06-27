@@ -1896,6 +1896,36 @@ def get_capability_hierarchy(
 # ---------------------------------------------------------------------------
 
 
+def _snapshot_is_indexed(conn, system_id: int, snapshot_id: int) -> bool:
+    """True when a snapshot has a completed symbol index (so drift is meaningful)."""
+    return conn.execute(
+        """
+        SELECT 1 FROM intelligence_runs
+        WHERE system_id = ? AND snapshot_id = ?
+          AND run_type = 'symbol_index' AND status = 'completed'
+        LIMIT 1
+        """,
+        (system_id, snapshot_id),
+    ).fetchone() is not None
+
+
+def _latest_indexed_ready_snapshot(conn, system_id: int):
+    """Latest ready snapshot that also has a completed symbol index."""
+    return conn.execute(
+        """
+        SELECT rs.* FROM repository_snapshots rs
+        WHERE rs.system_id = ? AND rs.status = 'ready'
+          AND EXISTS (
+              SELECT 1 FROM intelligence_runs ir
+              WHERE ir.system_id = rs.system_id AND ir.snapshot_id = rs.id
+                AND ir.run_type = 'symbol_index' AND ir.status = 'completed'
+          )
+        ORDER BY rs.id DESC LIMIT 1
+        """,
+        (system_id,),
+    ).fetchone()
+
+
 def _snapshot_facts(conn, snapshot_id: int, system_id: int) -> drift_service.SnapshotFacts:
     """Deterministic hash facts of a pinned snapshot for drift comparison."""
     file_rows = conn.execute(
@@ -1995,7 +2025,11 @@ def get_capability_hierarchy_drift(
         base_snapshot_id = run_row["snapshot_id"]
 
         if target_snapshot_id is None:
-            target_row = _latest_ready_snapshot(conn, system_id)
+            # Compare only against a symbol-indexed snapshot: an un-indexed
+            # snapshot has no code_symbols, which would make every symbol anchor
+            # look like a deleted source (false-positive review). Fall back to
+            # the hierarchy's own (always indexed) base snapshot.
+            target_row = _latest_indexed_ready_snapshot(conn, system_id)
             target = target_row["id"] if target_row else base_snapshot_id
         else:
             target = target_snapshot_id
@@ -2008,6 +2042,14 @@ def get_capability_hierarchy_drift(
                     status_code=404,
                     detail="Target snapshot not found for this system.",
                 )
+            if not _snapshot_is_indexed(conn, system_id, target):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Target snapshot has no symbol index. Run symbol "
+                        "indexing on it before computing drift."
+                    ),
+                )
 
         node_rows = conn.execute(
             "SELECT * FROM capability_hierarchy_nodes WHERE intelligence_run_id = ? "
@@ -2015,11 +2057,7 @@ def get_capability_hierarchy_drift(
             (run_row["id"],),
         ).fetchall()
         facts = _snapshot_facts(conn, target, system_id)
-        target_indexed = bool(facts.symbol_by_key) or bool(
-            conn.execute(
-                "SELECT 1 FROM code_symbols WHERE snapshot_id = ? LIMIT 1", (target,)
-            ).fetchone()
-        )
+        target_indexed = _snapshot_is_indexed(conn, system_id, target)
 
     # Compute per-node drift deterministically.
     drift_by_node: dict = {}

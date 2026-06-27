@@ -328,6 +328,52 @@ class TestDriftAPI:
         cap = next(c for c in body["capabilities"] if c["capability_key"] == "flow")
         assert cap["status"] == "fresh"
 
+    def test_default_target_skips_unindexed_snapshot(self, admin_client, tmp_path):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "DriftUnindexed")
+        repo = _make_repo(tmp_path)
+        h = self._setup_hierarchy(admin_client, token, system["id"], repo)
+
+        # Create a newer snapshot but do NOT symbol-index it.
+        (repo / "src" / "flow.py").write_text(
+            FLOW_V1.replace('{"nodes": 1}', '{"nodes": 9}')
+        )
+        _git(repo, "add", ".")
+        _git(repo, "commit", "-m", "v2 unindexed")
+        snap = admin_client.post("/repository/snapshots", headers=h).json()
+        assert snap["status"] == "ready"
+
+        body = admin_client.get(
+            "/repository/capability-hierarchy/drift", headers=h
+        ).json()
+        # The default target must be the indexed base, not the un-indexed newer
+        # snapshot, so there is no false-positive missing_source.
+        assert body["target_snapshot_id"] == body["base_snapshot_id"]
+        assert body["target_indexed"] is True
+        assert body["status"] == "fresh"
+        assert body["is_review_recommended"] is False
+        assert body["counts"]["missing"] == 0
+
+    def test_explicit_unindexed_target_returns_409(self, admin_client, tmp_path):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "DriftUnindexed409")
+        repo = _make_repo(tmp_path)
+        h = self._setup_hierarchy(admin_client, token, system["id"], repo)
+
+        (repo / "src" / "flow.py").write_text(
+            FLOW_V1.replace('{"nodes": 1}', '{"nodes": 9}')
+        )
+        _git(repo, "add", ".")
+        _git(repo, "commit", "-m", "v2 unindexed")
+        snap = admin_client.post("/repository/snapshots", headers=h).json()
+
+        r = admin_client.get(
+            f"/repository/capability-hierarchy/drift?target_snapshot_id={snap['id']}",
+            headers=h,
+        )
+        assert r.status_code == 409
+        assert "symbol index" in r.json()["detail"].lower()
+
     def test_no_hierarchy_returns_400(self, admin_client, tmp_path):
         token = _login(admin_client)
         system = _create_system(admin_client, token, "DriftNone")
