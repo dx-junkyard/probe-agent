@@ -218,6 +218,7 @@ IntelligenceRunType = Literal[
     "probe_plan_from_flow",
     "capability_hierarchy",
     "explanation_refresh",
+    "interview_proposal",
 ]
 DecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
 # How a single hierarchy claim was produced. Kept distinct from the audit
@@ -1665,3 +1666,163 @@ class WorkspaceProposalDraftOut(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     missing_fields: List[str] = Field(default_factory=list)
     created_at: float
+
+
+# --- System-understanding interview persistence (Issue #67) -----------------
+#
+# A pure persistence + CRUD contract for the #66 conversational metadata/probe
+# authoring flow. No LLM call and no worktree write happen here; later sibling
+# issues build dialogue, approval transitions, materialization, and the UI on
+# top of these models. The combined per-symbol proposal carries both the
+# proposed `probe-agent:` docstring metadata block (#54 vocabulary) and the
+# associated probe-plan fields (#25 model).
+
+InterviewSessionStatus = Literal["open", "proposals_ready", "materialized", "closed"]
+InterviewMessageRole = Literal["user", "assistant", "system"]
+InterviewProposalApprovalState = Literal["proposed", "approved", "rejected", "edited"]
+# Finite #54 vocabulary for a single state_effects entry.
+SourceMetadataStateEffect = Literal[
+    "none",
+    "database-read",
+    "database-write",
+    "network",
+    "filesystem",
+    "cache",
+    "external-api",
+    "queue",
+]
+ProbeRecommendedMode = Literal["trace", "shadow"]
+ProbeSideEffectRisk = Literal["none", "low", "medium", "high"]
+ProbeReplayability = Literal["safe", "caution", "unsafe"]
+
+
+class InterviewSessionCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    snapshot_id: int
+    title: str = Field(default="", max_length=200)
+    focus: str = Field(default="", max_length=500)
+
+
+class InterviewSessionOut(BaseModel):
+    id: int
+    system_id: int
+    snapshot_id: int
+    title: str
+    focus: str
+    status: InterviewSessionStatus
+    created_at: float
+    updated_at: float
+
+
+class InterviewMessageCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: InterviewMessageRole
+    content: str = Field(..., min_length=1, max_length=20_000)
+    intelligence_run_id: Optional[int] = None
+
+
+class InterviewMessageOut(BaseModel):
+    id: int
+    session_id: int
+    role: InterviewMessageRole
+    content: str
+    intelligence_run_id: Optional[int] = None
+    created_at: float
+
+
+class InterviewProposalMetadataBlock(BaseModel):
+    """Proposed `probe-agent:` docstring metadata block for one symbol.
+
+    Finite fields (``element_type`` / ``operation_kind`` / ``state_effects``)
+    are validated against #54's vocabulary; the rest are free text per #54.
+    This is an LLM-authored *proposal*, so unlike ``SourceMetadataOut`` it
+    carries no ``origin``/``explanation_hash``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    role: Optional[str] = Field(default=None, max_length=2000)
+    capability: Optional[str] = Field(default=None, max_length=2000)
+    system_purpose: Optional[str] = Field(default=None, max_length=2000)
+    probe_value: Optional[str] = Field(default=None, max_length=2000)
+    element_type: Optional[SourceMetadataElementType] = None
+    operation_kind: Optional[SourceMetadataOperationKind] = None
+    consumers: List[str] = Field(default_factory=list)
+    state_effects: List[SourceMetadataStateEffect] = Field(default_factory=list)
+
+
+class InterviewProposalProbePlan(BaseModel):
+    """Proposed probe-plan fields for the same symbol (#25 model)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    feature_id: str = Field(default="", max_length=200)
+    objective: str = Field(default="", max_length=2000)
+    reason: str = Field(default="", max_length=2000)
+    recommended_mode: ProbeRecommendedMode = "trace"
+    side_effect_risk: ProbeSideEffectRisk = "low"
+    replayability: ProbeReplayability = "safe"
+
+
+class InterviewProposalItem(BaseModel):
+    """One combined per-symbol proposal in a create request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(..., min_length=1, max_length=500)
+    qualified_name: str = Field(..., min_length=1, max_length=500)
+    symbol_id: Optional[int] = None
+    metadata: InterviewProposalMetadataBlock
+    probe_plan: InterviewProposalProbePlan
+
+
+class InterviewRunAudit(BaseModel):
+    """Reasoning-run audit metadata for a batch of proposals.
+
+    Persisted as an ``intelligence_runs`` row (the shared audit store) and
+    linked from each proposal. ``decision_method`` is fixed to ``reasoning_llm``
+    for this issue; ``manual`` is set only by the later approval issue.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str = Field(..., min_length=1, max_length=200)
+    model: str = Field(..., min_length=1, max_length=200)
+    prompt_version: str = Field(..., min_length=1, max_length=100)
+    schema_version: str = Field(..., min_length=1, max_length=100)
+    is_mock: bool = False
+
+
+class InterviewProposalsCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    audit: InterviewRunAudit
+    message_id: Optional[int] = None
+    proposals: List[InterviewProposalItem] = Field(..., min_length=1)
+
+
+class InterviewProposalOut(BaseModel):
+    id: int
+    session_id: int
+    system_id: int
+    snapshot_id: int
+    message_id: Optional[int] = None
+    intelligence_run_id: int
+    symbol_id: Optional[int] = None
+    path: str
+    qualified_name: str
+    metadata: InterviewProposalMetadataBlock
+    probe_plan: InterviewProposalProbePlan
+    decision_method: DecisionMethod
+    approval_state: InterviewProposalApprovalState
+    is_mock: bool = False
+    intelligence_run: Optional[IntelligenceRunOut] = None
+    created_at: float
+    updated_at: float
+
+
+class InterviewSessionDetailOut(InterviewSessionOut):
+    messages: List[InterviewMessageOut] = Field(default_factory=list)
+    proposals: List[InterviewProposalOut] = Field(default_factory=list)

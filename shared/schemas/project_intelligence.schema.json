@@ -66,7 +66,7 @@
         "id": { "type": "integer" },
         "system_id": { "type": "integer" },
         "snapshot_id": { "type": "integer" },
-        "run_type": { "enum": ["repository_drafts", "system_profile_draft", "feature_map_draft", "symbol_index", "feature_code_mapping", "probe_plan"] },
+        "run_type": { "enum": ["repository_drafts", "system_profile_draft", "feature_map_draft", "symbol_index", "feature_code_mapping", "probe_plan", "interview_proposal"] },
         "provider": { "type": "string" },
         "model": { "type": "string" },
         "prompt_version": { "type": "string" },
@@ -620,6 +620,113 @@
         "system_id": { "type": "integer" },
         "review_note": { "type": "string" },
         "proposals": { "type": "array", "items": { "$ref": "#/definitions/ExplanationRefreshProposal" } }
+      },
+      "additionalProperties": false
+    },
+    "InterviewProposalMetadataBlock": {
+      "type": "object",
+      "description": "Proposed probe-agent: docstring metadata block for a single symbol (Issue #67). Finite fields (element_type, operation_kind, state_effects) use #54's vocabulary; role/capability/system_purpose/probe_value are free text per #54. This is an LLM-authored proposal, not a source_authored extraction, so it carries no origin/explanation_hash.",
+      "properties": {
+        "role": { "type": ["string", "null"] },
+        "capability": { "type": ["string", "null"] },
+        "system_purpose": { "type": ["string", "null"] },
+        "probe_value": { "type": ["string", "null"] },
+        "element_type": {
+          "type": ["string", "null"],
+          "enum": ["system", "core", "capability", "element", "supporting", "boundary", null]
+        },
+        "operation_kind": {
+          "type": ["string", "null"],
+          "enum": ["analysis", "read", "write", "mutation", "io", "orchestration", "validation", "other", null]
+        },
+        "consumers": { "type": "array", "items": { "type": "string" } },
+        "state_effects": {
+          "type": "array",
+          "items": {
+            "enum": ["none", "database-read", "database-write", "network", "filesystem", "cache", "external-api", "queue"]
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "InterviewProposalProbePlan": {
+      "type": "object",
+      "description": "Proposed probe-plan fields for the same symbol (Issue #25 model). Mirrors ProbePoint's finite vocabularies.",
+      "properties": {
+        "feature_id": { "type": "string" },
+        "objective": { "type": "string" },
+        "reason": { "type": "string" },
+        "recommended_mode": { "enum": ["trace", "shadow"] },
+        "side_effect_risk": { "enum": ["none", "low", "medium", "high"] },
+        "replayability": { "enum": ["safe", "caution", "unsafe"] }
+      },
+      "additionalProperties": false
+    },
+    "InterviewCombinedProposal": {
+      "type": "object",
+      "description": "Combined per-symbol proposal payload for the system-understanding interview (Issue #67): the proposed probe-agent: docstring metadata block AND the associated probe plan for one symbol, kept consistent with #54's vocabulary and #25's probe-plan fields.",
+      "required": ["path", "qualified_name", "metadata", "probe_plan"],
+      "properties": {
+        "path": { "type": "string" },
+        "qualified_name": { "type": "string" },
+        "symbol_id": { "type": ["integer", "null"] },
+        "metadata": { "$ref": "#/definitions/InterviewProposalMetadataBlock" },
+        "probe_plan": { "$ref": "#/definitions/InterviewProposalProbePlan" }
+      },
+      "additionalProperties": false
+    },
+    "InterviewProposal": {
+      "type": "object",
+      "description": "A persisted interview proposal row (Issue #67). Wraps the combined payload with identifiers, the reasoning-run audit link, decision_method, and per-item approval state. decision_method is reasoning_llm for newly stored proposals; manual is set only by the later approval issue.",
+      "required": ["id", "session_id", "system_id", "snapshot_id", "intelligence_run_id", "path", "qualified_name", "metadata", "probe_plan", "decision_method", "approval_state"],
+      "properties": {
+        "id": { "type": "integer" },
+        "session_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "snapshot_id": { "type": "integer" },
+        "message_id": { "type": ["integer", "null"] },
+        "intelligence_run_id": { "type": "integer" },
+        "symbol_id": { "type": ["integer", "null"] },
+        "path": { "type": "string" },
+        "qualified_name": { "type": "string" },
+        "metadata": { "$ref": "#/definitions/InterviewProposalMetadataBlock" },
+        "probe_plan": { "$ref": "#/definitions/InterviewProposalProbePlan" },
+        "decision_method": { "enum": ["deterministic", "reasoning_llm", "manual"] },
+        "approval_state": { "enum": ["proposed", "approved", "rejected", "edited"] },
+        "is_mock": { "type": "boolean" },
+        "intelligence_run": { "oneOf": [{ "$ref": "#/definitions/IntelligenceRun" }, { "type": "null" }] },
+        "created_at": { "type": "number" },
+        "updated_at": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    "InterviewMessage": {
+      "type": "object",
+      "required": ["id", "session_id", "role", "content"],
+      "properties": {
+        "id": { "type": "integer" },
+        "session_id": { "type": "integer" },
+        "role": { "enum": ["user", "assistant", "system"] },
+        "content": { "type": "string" },
+        "intelligence_run_id": { "type": ["integer", "null"] },
+        "created_at": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    "InterviewSession": {
+      "type": "object",
+      "required": ["id", "system_id", "snapshot_id", "status"],
+      "properties": {
+        "id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "snapshot_id": { "type": "integer" },
+        "title": { "type": "string" },
+        "focus": { "type": "string" },
+        "status": { "enum": ["open", "proposals_ready", "materialized", "closed"] },
+        "messages": { "type": "array", "items": { "$ref": "#/definitions/InterviewMessage" } },
+        "proposals": { "type": "array", "items": { "$ref": "#/definitions/InterviewProposal" } },
+        "created_at": { "type": "number" },
+        "updated_at": { "type": "number" }
       },
       "additionalProperties": false
     }
