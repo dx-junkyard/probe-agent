@@ -1952,7 +1952,7 @@ class InterviewProposalApproveRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    actor: str = Field(default="", max_length=200)
+    actor: str = Field(min_length=1, max_length=200)
 
 
 class InterviewProposalRejectRequest(BaseModel):
@@ -1960,7 +1960,7 @@ class InterviewProposalRejectRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    actor: str = Field(default="", max_length=200)
+    actor: str = Field(min_length=1, max_length=200)
 
 
 class InterviewProposalEditRequest(BaseModel):
@@ -1968,7 +1968,7 @@ class InterviewProposalEditRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    actor: str = Field(default="", max_length=200)
+    actor: str = Field(min_length=1, max_length=200)
     metadata: InterviewProposalMetadataBlock
     probe_plan: InterviewProposalProbePlan
 

@@ -229,7 +229,7 @@ def test_approval_creates_manual_record_preserving_original(admin_client):
     assert original_p["probe_plan"]["objective"] == original_probe_plan["objective"]
     # approval_state is updated for convenience, but the content is unchanged.
     assert original_p["approval_state"] == "approved"
-    assert original_p["decision_method"] == "manual"
+    assert original_p["decision_method"] == "reasoning_llm"
 
 
 def test_edit_creates_manual_record_with_corrected_values(admin_client):
@@ -347,6 +347,50 @@ def test_edit_with_denylisted_symbol_is_rejected(admin_client):
     r = admin_client.get(f"/interview/sessions/{sid}/approved-set", headers=headers)
     assert len(r.json()["items"]) == 0
     assert r.json()["pending_count"] == 1
+
+
+def test_edit_with_denylisted_content_in_fields_is_rejected(admin_client):
+    """An edit that smuggles denylisted intent into edited text fields
+    (e.g. objective, reason, probe_value) is caught even when the symbol
+    name itself is safe."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+
+    proposals = [
+        _valid_proposal_item(
+            path="src/processor.py",
+            qualified_name="processor.run_task",
+        ),
+    ]
+    sid, created = _create_session_with_proposals(
+        admin_client, headers, snapshot_id, proposals=proposals,
+    )
+    p = created[0]
+
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/proposals/{p['id']}/edit",
+        json={
+            "actor": "dev",
+            "metadata": {
+                "role": "Handle refund requests",
+                "capability": "billing",
+                "element_type": "core",
+                "operation_kind": "write",
+                "state_effects": ["external-api"],
+            },
+            "probe_plan": {
+                "feature_id": "billing",
+                "objective": "Trace refund flow",
+                "reason": "Need visibility into charge operations",
+                "recommended_mode": "trace",
+                "side_effect_risk": "low",
+                "replayability": "safe",
+            },
+        },
+        headers=headers,
+    )
+    assert r.status_code == 422, r.text
+    assert "denylist" in r.json()["detail"].lower()
 
 
 def test_approve_denylisted_symbol_is_allowed(admin_client):
@@ -471,6 +515,21 @@ def test_edit_validates_enum_fields(admin_client):
                 "replayability": "safe",
             },
         },
+        headers=headers,
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_empty_actor_is_rejected(admin_client):
+    """Actor must be non-empty (min_length=1)."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    sid, proposals = _create_session_with_proposals(admin_client, headers, snapshot_id)
+
+    p = proposals[0]
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/proposals/{p['id']}/approve",
+        json={"actor": ""},
         headers=headers,
     )
     assert r.status_code == 422, r.text

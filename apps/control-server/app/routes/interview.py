@@ -751,7 +751,7 @@ def _persist_decision(
 
     conn.execute(
         """UPDATE interview_proposal
-           SET approval_state = ?, decision_method = 'manual', updated_at = ?
+           SET approval_state = ?, updated_at = ?
            WHERE id = ?""",
         (decision, now, proposal_id),
     )
@@ -830,11 +830,24 @@ def edit_interview_proposal(
         proposal = _get_proposal_or_404(conn, proposal_id, session_id, system_id)
         _check_proposal_state(proposal)
 
-        hit = check_denylist(proposal["qualified_name"])
+        extra_text_parts = []
+        if payload.metadata:
+            for field in ("role", "capability", "system_purpose", "probe_value"):
+                val = getattr(payload.metadata, field, None)
+                if val:
+                    extra_text_parts.append(val)
+        if payload.probe_plan:
+            for field in ("feature_id", "objective", "reason"):
+                val = getattr(payload.probe_plan, field, None)
+                if val:
+                    extra_text_parts.append(val)
+        extra_text = " ".join(extra_text_parts) if extra_text_parts else None
+
+        hit = check_denylist(proposal["qualified_name"], extra_text)
         if hit:
             raise HTTPException(
                 status_code=422,
-                detail=f"Edit rejected: symbol is denylisted ({hit})",
+                detail=f"Edit rejected: denylisted content ({hit})",
             )
 
         return _persist_decision(
