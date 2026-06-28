@@ -1892,3 +1892,26 @@ class InterviewContextPack(BaseModel):
     symbols: List[InterviewSymbolItem] = Field(default_factory=list)
     entrypoints: List[InterviewEntrypointItem] = Field(default_factory=list)
     omission_notes: List[str] = Field(default_factory=list)
+
+
+# --- Interview dialogue turn (Issue #69) ------------------------------------
+#
+# A reasoning-model dialogue turn that, grounded in #68's context pack,
+# produces structured assistant turns and combined per-symbol proposals
+# (docstring metadata + probe plan) persisted via #67's tables.
+
+
+class InterviewDialogueTurnCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message: str = Field(..., min_length=1, max_length=20_000)
+    budget: Optional[int] = Field(default=None, ge=1000, le=500_000)
+
+
+class InterviewDialogueTurnOut(BaseModel):
+    user_message: InterviewMessageOut
+    assistant_message: Optional[InterviewMessageOut] = None
+    proposals: List[InterviewProposalOut] = Field(default_factory=list)
+    denied_symbols: List[str] = Field(default_factory=list)
+    next_questions: List[str] = Field(default_factory=list)
+    error: Optional[str] = None

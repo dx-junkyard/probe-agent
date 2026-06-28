@@ -821,6 +821,46 @@ Decision Workspace の #36（Context Pack Builder）と同じ位置づけ。pin 
   / `InterviewEvidenceLocation`
   （[shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json)）。
 
+## インタビュー推論ダイアログ（Issue #69）
+
+Decision Workspace の #37（Agent Turn）と同じ位置づけ。#68 のコンテキストパックに
+基づき、推論モデルとの構造化された対話ターンを生成し、シンボルごとの複合提案
+（`probe-agent:` docstring メタデータブロック + Probe Plan）を産出する。
+
+エンドポイント:
+
+- `POST /interview/sessions/{id}/dialogue-turns` — ユーザーメッセージを受け取り、
+  推論モデル（またはテスト用 mock）を呼び出して構造化応答を生成。成功時はユーザー
+  メッセージ・アシスタントメッセージ・提案を #67 のテーブルに永続化する。
+
+応答の構造（`InterviewDialogueTurnOut`）:
+
+- `user_message` — 永続化されたユーザーメッセージ。
+- `assistant_message` — 推論成功時のアシスタントメッセージ（`intelligence_run_id`
+  紐づき）。失敗時は `null`。
+- `proposals` — 検証済み複合提案のリスト（`InterviewProposalOut`）。
+- `denied_symbols` — 安全性 denylist で除外されたシンボルのリスト。
+- `next_questions` — モデルからのフォローアップ質問。
+- `error` — 推論失敗時のエラー詳細（fail-closed）。
+
+安全性:
+
+- `probe_planner.py` の `check_denylist` で決定的に安全性チェック。denylist に
+  該当するシンボル（payment / auth / email 等）は、モデルが提案しても除外される。
+- #54 語彙（`element_type` / `operation_kind` / `state_effects`）と #25 probe-plan
+  フィールドに対するスキーマ検証。不正な値は即時拒否。
+
+Fail-closed:
+
+- 非推論モデル → エラー（ヒューリスティック代替なし）。
+- LLM API エラー → エラー永続化、提案なし。
+- 構造化出力の検証失敗 → エラー永続化、提案なし。
+- すべての失敗は `intelligence_runs` テーブルに `status: failed` +
+  `error_details` として永続化。
+
+共有スキーマ: `InterviewDialogueTurnCreate` / `InterviewDialogueTurnOut`
+（[shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json)）。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。

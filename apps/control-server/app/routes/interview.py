@@ -1,4 +1,4 @@
-"""System-understanding interview persistence and CRUD API (Issues #67, #68).
+"""System-understanding interview API (Issues #67, #68, #69).
 
 Issue #67 — the #35 analogue for the #66 conversational metadata/probe
 authoring flow: a pure persistence + contract layer. These endpoints only
@@ -10,7 +10,10 @@ that assembles symbols, entrypoints, and existing metadata from a pinned
 snapshot and flags which items are classified vs. unclassified, within an
 explicit LLM context budget.
 
-None of these endpoints call an LLM or write to a worktree.
+Issue #69 — the #37 analogue: a reasoning-model dialogue endpoint that,
+grounded in #68's context pack, produces structured assistant turns and
+combined per-symbol proposals (docstring metadata + probe plan) persisted via
+#67, failing closed if reasoning/config/validation fails.
 """
 
 from __future__ import annotations
@@ -25,9 +28,17 @@ from fastapi import Query
 
 from ..auth import get_system_id
 from ..db import get_conn
+from ..interview_agent import (
+    PROMPT_VERSION as INTERVIEW_PROMPT_VERSION,
+    SCHEMA_VERSION as INTERVIEW_SCHEMA_VERSION,
+    generate_interview_turn,
+)
 from ..interview_context import build_interview_context
+from ..llm import LLMConfig, create_llm_client
 from ..models import (
     InterviewContextPack,
+    InterviewDialogueTurnCreate,
+    InterviewDialogueTurnOut,
     InterviewMessageCreate,
     InterviewMessageOut,
     InterviewProposalMetadataBlock,
@@ -410,3 +421,190 @@ def create_interview_proposals(
             new_ids,
         ).fetchall()
         return [_proposal_out(conn, r) for r in rows]
+
+
+@router.post(
+    "/interview/sessions/{session_id}/dialogue-turns",
+    response_model=InterviewDialogueTurnOut,
+    status_code=201,
+)
+def create_interview_dialogue_turn(
+    session_id: int,
+    payload: InterviewDialogueTurnCreate,
+    system_id: int = Depends(get_system_id),
+) -> InterviewDialogueTurnOut:
+    """Generate a structured dialogue turn with combined proposals (Issue #69).
+
+    Calls a reasoning model (or mock for tests) grounded in the session's
+    pinned snapshot context pack.  On success, persists user message, assistant
+    message, and proposals with full audit metadata.  On failure, persists the
+    failure detail and returns an error — no heuristic fallback.
+    """
+    now = time.time()
+    with get_conn() as conn:
+        session = _get_session_or_404(conn, session_id, system_id)
+        snapshot_id = session["snapshot_id"]
+
+        context_pack = build_interview_context(
+            conn, system_id, snapshot_id, budget_chars=payload.budget,
+        )
+
+        history_rows = conn.execute(
+            "SELECT role, content FROM interview_message "
+            "WHERE session_id = ? ORDER BY id",
+            (session_id,),
+        ).fetchall()
+        history = [{"role": r["role"], "content": r["content"]} for r in history_rows]
+
+        config = LLMConfig.from_env()
+        client = create_llm_client(config)
+
+        result = generate_interview_turn(
+            client, config,
+            context_pack=context_pack,
+            history=history,
+            user_message=payload.message,
+        )
+
+        conn.execute("BEGIN")
+        try:
+            # Persist user message.
+            user_cur = conn.execute(
+                """INSERT INTO interview_message
+                       (session_id, system_id, role, content,
+                        intelligence_run_id, created_at)
+                   VALUES (?, ?, 'user', ?, NULL, ?)""",
+                (session_id, system_id, payload.message, now),
+            )
+            user_row = conn.execute(
+                "SELECT * FROM interview_message WHERE id = ?",
+                (user_cur.lastrowid,),
+            ).fetchone()
+            user_msg = _message_out(user_row)
+
+            if result.error:
+                # Persist failed intelligence run.
+                conn.execute(
+                    """INSERT INTO intelligence_runs
+                           (system_id, snapshot_id, run_type, provider, model,
+                            prompt_version, schema_version, decision_method,
+                            status, error_details, is_mock, started_at,
+                            completed_at)
+                       VALUES (?, ?, 'interview_proposal', ?, ?, ?, ?,
+                               'reasoning_llm', 'failed', ?, ?, ?, ?)""",
+                    (
+                        system_id, snapshot_id,
+                        result.provider, result.model,
+                        INTERVIEW_PROMPT_VERSION, INTERVIEW_SCHEMA_VERSION,
+                        result.error,
+                        1 if result.is_mock else 0,
+                        now, now,
+                    ),
+                )
+                conn.execute(
+                    "UPDATE interview_session SET updated_at = ? "
+                    "WHERE id = ? AND system_id = ?",
+                    (now, session_id, system_id),
+                )
+                conn.execute("COMMIT")
+                return InterviewDialogueTurnOut(
+                    user_message=user_msg,
+                    error=result.error,
+                )
+
+            # Persist completed intelligence run.
+            run_cur = conn.execute(
+                """INSERT INTO intelligence_runs
+                       (system_id, snapshot_id, run_type, provider, model,
+                        prompt_version, schema_version, decision_method,
+                        status, is_mock, started_at, completed_at)
+                   VALUES (?, ?, 'interview_proposal', ?, ?, ?, ?,
+                           'reasoning_llm', 'completed', ?, ?, ?)""",
+                (
+                    system_id, snapshot_id,
+                    result.provider, result.model,
+                    INTERVIEW_PROMPT_VERSION, INTERVIEW_SCHEMA_VERSION,
+                    1 if result.is_mock else 0,
+                    now, now,
+                ),
+            )
+            run_id = run_cur.lastrowid
+
+            # Persist assistant message linked to the run.
+            asst_cur = conn.execute(
+                """INSERT INTO interview_message
+                       (session_id, system_id, role, content,
+                        intelligence_run_id, created_at)
+                   VALUES (?, ?, 'assistant', ?, ?, ?)""",
+                (session_id, system_id, result.assistant_message, run_id, now),
+            )
+            asst_row = conn.execute(
+                "SELECT * FROM interview_message WHERE id = ?",
+                (asst_cur.lastrowid,),
+            ).fetchone()
+            asst_msg = _message_out(asst_row)
+
+            # Persist combined proposals.
+            proposal_ids: List[int] = []
+            for p in result.proposals:
+                cur = conn.execute(
+                    """INSERT INTO interview_proposal
+                           (session_id, system_id, snapshot_id, message_id,
+                            intelligence_run_id, symbol_id, path, qualified_name,
+                            md_role, md_capability, md_system_purpose,
+                            md_probe_value, md_element_type, md_operation_kind,
+                            md_consumers, md_state_effects,
+                            feature_id, objective, probe_reason,
+                            recommended_mode, side_effect_risk, replayability,
+                            decision_method, approval_state, is_mock,
+                            created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                               ?, ?, ?, ?, ?, ?,
+                               'reasoning_llm', 'proposed', ?, ?, ?)""",
+                    (
+                        session_id, system_id, snapshot_id,
+                        asst_cur.lastrowid, run_id,
+                        p.symbol_id, p.path, p.qualified_name,
+                        p.metadata.role, p.metadata.capability,
+                        p.metadata.system_purpose, p.metadata.probe_value,
+                        p.metadata.element_type, p.metadata.operation_kind,
+                        json.dumps(p.metadata.consumers, ensure_ascii=False),
+                        json.dumps(
+                            [str(s) for s in p.metadata.state_effects],
+                            ensure_ascii=False,
+                        ),
+                        p.probe_plan.feature_id, p.probe_plan.objective,
+                        p.probe_plan.reason, p.probe_plan.recommended_mode,
+                        p.probe_plan.side_effect_risk, p.probe_plan.replayability,
+                        1 if result.is_mock else 0,
+                        now, now,
+                    ),
+                )
+                proposal_ids.append(cur.lastrowid)
+
+            conn.execute(
+                "UPDATE interview_session SET updated_at = ? "
+                "WHERE id = ? AND system_id = ?",
+                (now, session_id, system_id),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+        proposals_out: List[InterviewProposalOut] = []
+        if proposal_ids:
+            rows = conn.execute(
+                "SELECT * FROM interview_proposal WHERE id IN (%s) ORDER BY id"
+                % ",".join("?" for _ in proposal_ids),
+                proposal_ids,
+            ).fetchall()
+            proposals_out = [_proposal_out(conn, r) for r in rows]
+
+        return InterviewDialogueTurnOut(
+            user_message=user_msg,
+            assistant_message=asst_msg,
+            proposals=proposals_out,
+            denied_symbols=result.denied_symbols,
+            next_questions=result.next_questions,
+        )

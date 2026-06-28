@@ -803,6 +803,30 @@
         "omission_notes": { "type": "array", "items": { "type": "string" } }
       },
       "additionalProperties": false
+    },
+    "InterviewDialogueTurnCreate": {
+      "type": "object",
+      "description": "Request payload for a reasoning-model dialogue turn (Issue #69). Sends a user message to the interview agent, which produces structured proposals grounded in the session's pinned snapshot.",
+      "required": ["message"],
+      "properties": {
+        "message": { "type": "string", "minLength": 1, "maxLength": 20000 },
+        "budget": { "type": ["integer", "null"], "minimum": 1000, "maximum": 500000 }
+      },
+      "additionalProperties": false
+    },
+    "InterviewDialogueTurnOut": {
+      "type": "object",
+      "description": "Response from a reasoning-model dialogue turn (Issue #69). Contains the persisted user message, assistant message (if successful), combined proposals, any denylist-excluded symbols, follow-up questions, and an error field for fail-closed runs.",
+      "required": ["user_message"],
+      "properties": {
+        "user_message": { "$ref": "#/definitions/InterviewMessage" },
+        "assistant_message": { "oneOf": [{ "$ref": "#/definitions/InterviewMessage" }, { "type": "null" }] },
+        "proposals": { "type": "array", "items": { "$ref": "#/definitions/InterviewProposal" } },
+        "denied_symbols": { "type": "array", "items": { "type": "string" } },
+        "next_questions": { "type": "array", "items": { "type": "string" } },
+        "error": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
     }
   },
   "type": "object"
