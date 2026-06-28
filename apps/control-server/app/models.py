@@ -1711,6 +1711,9 @@ class InterviewSessionOut(BaseModel):
     title: str
     focus: str
     status: InterviewSessionStatus
+    materialization_diff: Optional[str] = None
+    materialization_ref: Optional[str] = None
+    materialized_at: Optional[float] = None
     created_at: float
     updated_at: float
 
@@ -1892,3 +1895,163 @@ class InterviewContextPack(BaseModel):
     symbols: List[InterviewSymbolItem] = Field(default_factory=list)
     entrypoints: List[InterviewEntrypointItem] = Field(default_factory=list)
     omission_notes: List[str] = Field(default_factory=list)
+
+
+# --- Interview Dialogue Turn (Issue #69) -------------------------------------
+#
+# Request/response models for the reasoning-model dialogue endpoint. The
+# endpoint generates a structured assistant turn grounded in #68's context
+# pack, optionally producing per-symbol combined proposals validated against
+# #54 vocabulary and the safety denylist from probe_planner.py.
+
+
+class InterviewDialogueTurnRequest(BaseModel):
+    """Request body for a single interview dialogue turn."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_message: str = Field(..., min_length=1, max_length=20_000)
+    budget: Optional[int] = Field(default=None, ge=1000, le=500_000)
+
+
+class InterviewDialogueProposalOut(BaseModel):
+    """A single combined proposal from a dialogue turn, before persistence."""
+
+    path: str
+    qualified_name: str
+    symbol_id: Optional[int] = None
+    metadata: InterviewProposalMetadataBlock
+    probe_plan: InterviewProposalProbePlan
+    denylist_hit: Optional[str] = None
+
+
+class InterviewDialogueTurnOut(BaseModel):
+    """Response from a single interview dialogue turn.
+
+    Contains the structured assistant message, any generated proposals, and
+    the reasoning-run audit metadata. If error is set, the turn failed closed
+    and no proposals should be stored.
+    """
+
+    assistant_message: str = ""
+    proposals: List[InterviewDialogueProposalOut] = Field(default_factory=list)
+    next_questions: List[str] = Field(default_factory=list)
+    intelligence_run: Optional[IntelligenceRunOut] = None
+    error: Optional[str] = None
+
+
+# --- Interview Proposal Approval (Issue #70) ----------------------------------
+#
+# Per-item approval gate: a developer can approve, reject, or edit each
+# proposed { docstring_metadata, probe_plan } item. Decisions are persisted
+# as decision_method='manual' records that reference — but do not overwrite —
+# the original reasoning_llm proposal.
+
+InterviewDecisionAction = Literal["approved", "rejected", "edited"]
+
+
+class InterviewProposalApproveRequest(BaseModel):
+    """Approve a proposal as-is."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str = Field(min_length=1, max_length=200)
+
+
+class InterviewProposalRejectRequest(BaseModel):
+    """Reject a proposal."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str = Field(min_length=1, max_length=200)
+
+
+class InterviewProposalEditRequest(BaseModel):
+    """Edit and approve a proposal with corrected values."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str = Field(min_length=1, max_length=200)
+    metadata: InterviewProposalMetadataBlock
+    probe_plan: InterviewProposalProbePlan
+
+
+class InterviewProposalDecisionOut(BaseModel):
+    """A persisted manual decision on a proposal."""
+
+    id: int
+    proposal_id: int
+    session_id: int
+    system_id: int
+    decision: InterviewDecisionAction
+    decision_method: DecisionMethod
+    actor: str
+    edited_metadata: Optional[InterviewProposalMetadataBlock] = None
+    edited_probe_plan: Optional[InterviewProposalProbePlan] = None
+    denylist_hit: Optional[str] = None
+    decided_at: float
+
+
+class InterviewApprovedItemOut(BaseModel):
+    """An item from the approved set, ready for materialization.
+
+    Contains the effective metadata/probe_plan: the edited values if the
+    decision was 'edited', or the original proposal values if 'approved'.
+    """
+
+    proposal_id: int
+    path: str
+    qualified_name: str
+    symbol_id: Optional[int] = None
+    metadata: InterviewProposalMetadataBlock
+    probe_plan: InterviewProposalProbePlan
+    decision: InterviewDecisionAction
+    decision_id: int
+    actor: str
+    decided_at: float
+
+
+class InterviewApprovedSetOut(BaseModel):
+    """The approved set for a session: items eligible for materialization."""
+
+    session_id: int
+    system_id: int
+    snapshot_id: int
+    items: List[InterviewApprovedItemOut] = Field(default_factory=list)
+    total_proposals: int = 0
+    approved_count: int = 0
+    rejected_count: int = 0
+    pending_count: int = 0
+
+
+# --- Interview Materialization (Issue #71) ------------------------------------
+#
+# Materializes approved docstring metadata + probe instrumentation into a
+# single reviewable diff from an isolated worktree. The target repo's
+# tracked branches are never written to.
+
+
+class InterviewMaterializeRequest(BaseModel):
+    """Request to materialize the approved set into a reviewable diff."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    worktree_base: Optional[str] = Field(
+        default=None,
+        description="Base directory for the temporary worktree. "
+        "Defaults to system temp if not provided.",
+    )
+
+
+class InterviewMaterializeOut(BaseModel):
+    """Result of materializing approved proposals into a diff."""
+
+    session_id: int
+    system_id: int
+    snapshot_id: int
+    diff: str
+    files_changed: int
+    items_materialized: int
+    skipped: List[str] = Field(default_factory=list)
+    materialized_at: float
+    error: Optional[str] = None

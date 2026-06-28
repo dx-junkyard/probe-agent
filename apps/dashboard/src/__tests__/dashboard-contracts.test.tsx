@@ -1135,6 +1135,266 @@ describe("Capability Map page", () => {
   });
 });
 
+// ── Interview dashboard tests (Issue #72) ───────────────────────────
+
+function interviewSession() {
+  return {
+    id: 7,
+    system_id: 1,
+    snapshot_id: 42,
+    title: "System interview",
+    focus: "Review metadata",
+    status: "open",
+    materialization_diff: null,
+    materialization_ref: null,
+    materialized_at: null,
+    created_at: 1,
+    updated_at: 2,
+  };
+}
+
+function interviewProposal() {
+  return {
+    id: 9,
+    session_id: 7,
+    system_id: 1,
+    snapshot_id: 42,
+    message_id: 3,
+    intelligence_run_id: 4,
+    symbol_id: 11,
+    path: "src/summarize.py",
+    qualified_name: "summarize.summarize_text",
+    metadata: {
+      role: "Summarize free text",
+      capability: "summarization",
+      system_purpose: "Document workflow",
+      probe_value: "Validate latency",
+      element_type: "core",
+      operation_kind: "analysis",
+      consumers: ["api"],
+      state_effects: ["none"],
+    },
+    probe_plan: {
+      feature_id: "summarization",
+      objective: "Trace summarizer",
+      reason: "Low risk function",
+      recommended_mode: "trace",
+      side_effect_risk: "low",
+      replayability: "safe",
+    },
+    decision_method: "reasoning_llm",
+    approval_state: "proposed",
+    is_mock: true,
+    intelligence_run: {
+      id: 4,
+      system_id: 1,
+      snapshot_id: 42,
+      run_type: "interview_dialogue",
+      provider: "mock",
+      model: "mock-reasoner",
+      prompt_version: "interview-v1",
+      schema_version: "1",
+      decision_method: "reasoning_llm",
+      status: "completed",
+      error_details: null,
+      is_mock: true,
+      started_at: "1",
+      completed_at: "2",
+    },
+    created_at: 1,
+    updated_at: 1,
+  };
+}
+
+function mockInterviewApi(options: { approvedCount?: number } = {}) {
+  const session = interviewSession();
+  const proposal = interviewProposal();
+  const approvedCount = options.approvedCount ?? 0;
+  mockApi.get.mockImplementation((path: string) => {
+    if (path === "/repository/snapshots/latest") {
+      return Promise.resolve({
+        id: 42,
+        system_id: 1,
+        repo_path: "/repo",
+        commit_sha: "abcdef1234567890",
+        status: "ready",
+        file_count: 1,
+        total_size: 10,
+        indexed_size: 10,
+        metadata_only_count: 0,
+        warnings: [],
+        error_summary: null,
+        created_at: "1",
+        completed_at: "2",
+        files: [],
+      });
+    }
+    if (path === "/interview/sessions") return Promise.resolve([session]);
+    if (path === "/interview/sessions/7") {
+      return Promise.resolve({
+        ...session,
+        messages: [
+          { id: 1, session_id: 7, role: "assistant", content: "Found unclassified symbols.", intelligence_run_id: 4, created_at: 1 },
+        ],
+        proposals: [proposal],
+      });
+    }
+    if (path === "/interview/sessions/7/context-pack") {
+      return Promise.resolve({
+        system_id: 1,
+        snapshot_id: 42,
+        total_symbols: 1,
+        total_entrypoints: 1,
+        classified_count: 0,
+        unclassified_count: 1,
+        budget_max_chars: 1000,
+        budget_used_chars: 200,
+        truncated: false,
+        symbols: [{
+          symbol_id: 11,
+          path: "src/summarize.py",
+          qualified_name: "summarize.summarize_text",
+          kind: "function",
+          start_line: 1,
+          end_line: 3,
+          classification: "unclassified",
+          has_metadata: false,
+          element_type: null,
+          role: null,
+          capability: null,
+          operation_kind: null,
+          probe_value: null,
+          evidence: { snapshot_id: 42, path: "src/summarize.py", qualified_name: "summarize.summarize_text", start_line: 1, end_line: 3 },
+        }],
+        entrypoints: [],
+        omission_notes: [],
+      });
+    }
+    if (path === "/interview/sessions/7/approved-set") {
+      return Promise.resolve({
+        session_id: 7,
+        system_id: 1,
+        snapshot_id: 42,
+        items: approvedCount ? [{
+          proposal_id: 9,
+          path: "src/summarize.py",
+          qualified_name: "summarize.summarize_text",
+          symbol_id: 11,
+          metadata: proposal.metadata,
+          probe_plan: proposal.probe_plan,
+          decision: "approved",
+          decision_id: 12,
+          actor: "admin",
+          decided_at: 3,
+        }] : [],
+        total_proposals: 1,
+        approved_count: approvedCount,
+        rejected_count: 0,
+        pending_count: approvedCount ? 0 : 1,
+      });
+    }
+    return Promise.resolve(null);
+  });
+  return { session, proposal };
+}
+
+describe("Interview page", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("renders mock reasoning provenance and wires proposal decisions", async () => {
+    mockInterviewApi();
+    mockApi.post.mockResolvedValue({ id: 1, decision: "approved", decision_method: "manual" });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByText("summarize.summarize_text")).toBeInTheDocument();
+    expect(screen.getByText("mock")).toBeInTheDocument();
+    expect(screen.getByText("reasoning_llm")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Approve/i }));
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/7/proposals/9/approve",
+        { actor: "admin" },
+      );
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /Reject/i }));
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/7/proposals/9/reject",
+        { actor: "admin" },
+      );
+    });
+  });
+
+  test("sends edits through the validated edit endpoint and materializes a diff", async () => {
+    mockInterviewApi({ approvedCount: 1 });
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7/materialize") {
+        return Promise.resolve({
+          session_id: 7,
+          system_id: 1,
+          snapshot_id: 42,
+          diff: "diff --git a/src/summarize.py b/src/summarize.py",
+          files_changed: 1,
+          items_materialized: 1,
+          skipped: [],
+          materialized_at: 3,
+          error: null,
+        });
+      }
+      return Promise.resolve({ id: 5, decision: "edited", decision_method: "manual" });
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByText("Proposal Review")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Edit/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /Save manual edit/i }));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/7/proposals/9/edit",
+        expect.objectContaining({
+          actor: "admin",
+          metadata: expect.objectContaining({ role: "Summarize free text" }),
+          probe_plan: expect.objectContaining({ recommended_mode: "trace" }),
+        }),
+      );
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /Materialize/i }));
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/interview/sessions/7/materialize", {});
+    });
+    expect(await screen.findByText(/diff --git/)).toBeInTheDocument();
+  });
+});
+
 describe("Flow Explorer auto-select from URL (Issue #62)", () => {
   beforeEach(() => {
     vi.clearAllMocks();

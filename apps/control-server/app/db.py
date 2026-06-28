@@ -953,14 +953,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_proposal_drafts_proposal
 -- metadata lives in the shared intelligence_runs store and is referenced from
 -- messages/proposals via intelligence_run_id rather than duplicated here.
 CREATE TABLE IF NOT EXISTS interview_session (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    system_id     INTEGER NOT NULL,
-    snapshot_id   INTEGER NOT NULL,
-    title         TEXT NOT NULL DEFAULT '',
-    focus         TEXT NOT NULL DEFAULT '',
-    status        TEXT NOT NULL DEFAULT 'open',
-    created_at    REAL NOT NULL,
-    updated_at    REAL NOT NULL,
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id            INTEGER NOT NULL,
+    snapshot_id          INTEGER NOT NULL,
+    title                TEXT NOT NULL DEFAULT '',
+    focus                TEXT NOT NULL DEFAULT '',
+    status               TEXT NOT NULL DEFAULT 'open',
+    materialization_diff TEXT,
+    materialization_ref  TEXT,
+    materialized_at      REAL,
+    created_at           REAL NOT NULL,
+    updated_at           REAL NOT NULL,
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
     FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE
 );
@@ -1031,6 +1034,49 @@ CREATE INDEX IF NOT EXISTS idx_interview_proposal_session
 
 CREATE INDEX IF NOT EXISTS idx_interview_proposal_system
     ON interview_proposal (system_id, session_id);
+
+-- Issue #70: per-item approval gate with manual decision record.
+-- Each decision is a separate row that references — but does not overwrite —
+-- the original reasoning_llm proposal. For edits, the developer-corrected
+-- metadata and probe-plan values are stored here. decision_method is always
+-- 'manual' for rows in this table.
+CREATE TABLE IF NOT EXISTS interview_proposal_decision (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id         INTEGER NOT NULL,
+    session_id          INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    decision            TEXT NOT NULL,
+    decision_method     TEXT NOT NULL DEFAULT 'manual',
+    actor               TEXT NOT NULL DEFAULT '',
+    -- Edited metadata (populated only for decision='edited').
+    edited_md_role             TEXT,
+    edited_md_capability       TEXT,
+    edited_md_system_purpose   TEXT,
+    edited_md_probe_value      TEXT,
+    edited_md_element_type     TEXT,
+    edited_md_operation_kind   TEXT,
+    edited_md_consumers        TEXT,
+    edited_md_state_effects    TEXT,
+    -- Edited probe-plan (populated only for decision='edited').
+    edited_feature_id          TEXT,
+    edited_objective           TEXT,
+    edited_probe_reason        TEXT,
+    edited_recommended_mode    TEXT,
+    edited_side_effect_risk    TEXT,
+    edited_replayability       TEXT,
+    -- Denylist re-check result for edits.
+    denylist_hit        TEXT,
+    decided_at          REAL NOT NULL,
+    FOREIGN KEY (proposal_id) REFERENCES interview_proposal (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_interview_proposal_decision_proposal
+    ON interview_proposal_decision (proposal_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_interview_proposal_decision_session
+    ON interview_proposal_decision (session_id);
 """
 
 
@@ -1310,6 +1356,19 @@ def init_db() -> None:
         if "pattern_id" not in entrypoint_columns:
             conn.execute(
                 "ALTER TABLE code_entrypoints ADD COLUMN pattern_id INTEGER"
+            )
+        session_cols = _columns(conn, "interview_session")
+        if "materialization_diff" not in session_cols:
+            conn.execute(
+                "ALTER TABLE interview_session ADD COLUMN materialization_diff TEXT"
+            )
+        if "materialization_ref" not in session_cols:
+            conn.execute(
+                "ALTER TABLE interview_session ADD COLUMN materialization_ref TEXT"
+            )
+        if "materialized_at" not in session_cols:
+            conn.execute(
+                "ALTER TABLE interview_session ADD COLUMN materialized_at REAL"
             )
         _ensure_legacy_system(conn)
     _bootstrap_admin()

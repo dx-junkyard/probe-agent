@@ -803,6 +803,113 @@
         "omission_notes": { "type": "array", "items": { "type": "string" } }
       },
       "additionalProperties": false
+    },
+    "InterviewDialogueTurnRequest": {
+      "type": "object",
+      "description": "Request body for a single interview dialogue turn (Issue #69).",
+      "required": ["user_message"],
+      "properties": {
+        "user_message": { "type": "string", "minLength": 1, "maxLength": 20000 },
+        "budget": { "type": ["integer", "null"], "minimum": 1000, "maximum": 500000 }
+      },
+      "additionalProperties": false
+    },
+    "InterviewDialogueProposalOut": {
+      "type": "object",
+      "description": "A single combined proposal from a dialogue turn (Issue #69), before persistence.",
+      "required": ["path", "qualified_name", "metadata", "probe_plan"],
+      "properties": {
+        "path": { "type": "string" },
+        "qualified_name": { "type": "string" },
+        "symbol_id": { "type": ["integer", "null"] },
+        "metadata": { "$ref": "#/definitions/InterviewProposalMetadataBlock" },
+        "probe_plan": { "$ref": "#/definitions/InterviewProposalProbePlan" },
+        "denylist_hit": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "InterviewDialogueTurnOut": {
+      "type": "object",
+      "description": "Response from a single interview dialogue turn (Issue #69). If error is set, the turn failed closed and no proposals were stored.",
+      "properties": {
+        "assistant_message": { "type": "string" },
+        "proposals": { "type": "array", "items": { "$ref": "#/definitions/InterviewDialogueProposalOut" } },
+        "next_questions": { "type": "array", "items": { "type": "string" } },
+        "intelligence_run": { "oneOf": [{ "$ref": "#/definitions/IntelligenceRun" }, { "type": "null" }] },
+        "error": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "InterviewProposalDecision": {
+      "type": "object",
+      "description": "A persisted manual decision on a proposal (Issue #70). Each decision references — but does not overwrite — the original reasoning_llm proposal.",
+      "required": ["id", "proposal_id", "session_id", "system_id", "decision", "decision_method", "decided_at"],
+      "properties": {
+        "id": { "type": "integer" },
+        "proposal_id": { "type": "integer" },
+        "session_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "decision": { "enum": ["approved", "rejected", "edited"] },
+        "decision_method": { "enum": ["deterministic", "reasoning_llm", "manual"] },
+        "actor": { "type": "string" },
+        "edited_metadata": { "oneOf": [{ "$ref": "#/definitions/InterviewProposalMetadataBlock" }, { "type": "null" }] },
+        "edited_probe_plan": { "oneOf": [{ "$ref": "#/definitions/InterviewProposalProbePlan" }, { "type": "null" }] },
+        "denylist_hit": { "type": ["string", "null"] },
+        "decided_at": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    "InterviewApprovedItem": {
+      "type": "object",
+      "description": "An item from the approved set, ready for materialization (Issue #70). Contains the effective values: edited if decision was 'edited', original if 'approved'.",
+      "required": ["proposal_id", "path", "qualified_name", "metadata", "probe_plan", "decision", "decision_id", "decided_at"],
+      "properties": {
+        "proposal_id": { "type": "integer" },
+        "path": { "type": "string" },
+        "qualified_name": { "type": "string" },
+        "symbol_id": { "type": ["integer", "null"] },
+        "metadata": { "$ref": "#/definitions/InterviewProposalMetadataBlock" },
+        "probe_plan": { "$ref": "#/definitions/InterviewProposalProbePlan" },
+        "decision": { "enum": ["approved", "edited"] },
+        "decision_id": { "type": "integer" },
+        "actor": { "type": "string" },
+        "decided_at": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    "InterviewApprovedSet": {
+      "type": "object",
+      "description": "The approved set for a session: items eligible for materialization (Issue #70).",
+      "required": ["session_id", "system_id", "snapshot_id"],
+      "properties": {
+        "session_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "snapshot_id": { "type": "integer" },
+        "items": { "type": "array", "items": { "$ref": "#/definitions/InterviewApprovedItem" } },
+        "total_proposals": { "type": "integer", "minimum": 0 },
+        "approved_count": { "type": "integer", "minimum": 0 },
+        "rejected_count": { "type": "integer", "minimum": 0 },
+        "pending_count": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+
+    "InterviewMaterializeResult": {
+      "type": "object",
+      "description": "Result of materializing approved proposals into a reviewable diff (Issue #71).",
+      "required": ["session_id", "system_id", "snapshot_id", "diff", "files_changed", "items_materialized", "materialized_at"],
+      "properties": {
+        "session_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "snapshot_id": { "type": "integer" },
+        "diff": { "type": "string" },
+        "files_changed": { "type": "integer", "minimum": 0 },
+        "items_materialized": { "type": "integer", "minimum": 0 },
+        "skipped": { "type": "array", "items": { "type": "string" } },
+        "materialized_at": { "type": "number" },
+        "error": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
     }
   },
   "type": "object"

@@ -15,6 +15,10 @@ import type {
   WorkspaceOut, WorkspaceDetailOut, WorkspaceContextItemOut,
   WorkspaceContextPack, WorkspaceAgentTurnOut, WorkspaceProposalOut,
   WorkspaceProposalDraftOut,
+  InterviewSessionOut, InterviewSessionDetailOut, InterviewContextPack,
+  InterviewDialogueTurnOut, InterviewProposalDecisionOut,
+  InterviewProposalMetadataBlock, InterviewProposalProbePlan,
+  InterviewApprovedSetOut, InterviewMaterializeOut,
 } from "./types";
 
 function sysKey(base: string, ...extra: unknown[]) {
@@ -458,6 +462,121 @@ export function useApplyProbePatch() {
         expected_commit_sha: expectedCommitSha,
       }),
     onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("probePatches") }),
+  });
+}
+
+export function useInterviewSessions() {
+  return useQuery({
+    queryKey: sysKey("interviewSessions"),
+    queryFn: () => api.get<InterviewSessionOut[]>("/interview/sessions"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useCreateInterviewSession() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { snapshot_id: number; title?: string; focus?: string }) =>
+      api.post<InterviewSessionOut>("/interview/sessions", data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("interviewSessions") }),
+  });
+}
+
+export function useInterviewSession(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("interviewSession"), sessionId],
+    queryFn: () => api.get<InterviewSessionDetailOut>(`/interview/sessions/${sessionId}`),
+    enabled: !!sessionId && !!getSystemId(),
+  });
+}
+
+export function useInterviewContextPack(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("interviewContextPack"), sessionId],
+    queryFn: () => api.get<InterviewContextPack>(`/interview/sessions/${sessionId}/context-pack`),
+    enabled: !!sessionId && !!getSystemId(),
+  });
+}
+
+export function useInterviewDialogueTurn(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { user_message: string; budget?: number }) =>
+      api.post<InterviewDialogueTurnOut>(`/interview/sessions/${sessionId}/dialogue-turn`, data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+      qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
+    },
+  });
+}
+
+export function useApproveInterviewProposal(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ proposalId, actor }: { proposalId: number; actor: string }) =>
+      api.post<InterviewProposalDecisionOut>(
+        `/interview/sessions/${sessionId}/proposals/${proposalId}/approve`,
+        { actor },
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewApprovedSet"), sessionId] });
+    },
+  });
+}
+
+export function useRejectInterviewProposal(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ proposalId, actor }: { proposalId: number; actor: string }) =>
+      api.post<InterviewProposalDecisionOut>(
+        `/interview/sessions/${sessionId}/proposals/${proposalId}/reject`,
+        { actor },
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewApprovedSet"), sessionId] });
+    },
+  });
+}
+
+export function useEditInterviewProposal(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: {
+      proposalId: number;
+      actor: string;
+      metadata: InterviewProposalMetadataBlock;
+      probe_plan: InterviewProposalProbePlan;
+    }) =>
+      api.post<InterviewProposalDecisionOut>(
+        `/interview/sessions/${sessionId}/proposals/${data.proposalId}/edit`,
+        { actor: data.actor, metadata: data.metadata, probe_plan: data.probe_plan },
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewApprovedSet"), sessionId] });
+    },
+  });
+}
+
+export function useInterviewApprovedSet(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("interviewApprovedSet"), sessionId],
+    queryFn: () => api.get<InterviewApprovedSetOut>(`/interview/sessions/${sessionId}/approved-set`),
+    enabled: !!sessionId && !!getSystemId(),
+  });
+}
+
+export function useMaterializeInterview(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      api.post<InterviewMaterializeOut>(`/interview/sessions/${sessionId}/materialize`, {}),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+      qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
+    },
   });
 }
 
