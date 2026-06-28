@@ -273,3 +273,65 @@ class TestDocumentationIndexer:
         index = build_documentation_index(conn, 1, snap_id)
         assert index.snapshot_id == snap_id
         assert index.total_chunks > 0
+
+
+class TestFencedCodeBlockHeadings:
+    """Headings inside fenced code blocks must not create new chunks."""
+
+    def test_heading_inside_fence_ignored(self):
+        text = "# Real Heading\n\nSome text.\n\n```python\n# Not a heading\nprint('hello')\n```\n\nMore text."
+        chunks = chunk_markdown("test.md", text)
+        assert len(chunks) == 1
+        assert chunks[0].heading_path == ["Real Heading"]
+
+    def test_multiple_fences(self):
+        text = (
+            "# Top\n\nIntro\n\n"
+            "```\n# fake1\n```\n\n"
+            "## Real Sub\n\nBody\n\n"
+            "```bash\n# fake2\n# fake3\n```\n"
+        )
+        chunks = chunk_markdown("test.md", text)
+        headings = [c.heading_path for c in chunks]
+        assert ["Top"] in headings
+        assert ["Top", "Real Sub"] in headings
+        assert not any("fake1" in h for c in chunks for h in c.heading_path)
+
+    def test_unclosed_fence_treats_rest_as_code(self):
+        text = "# Title\n\nText\n\n```\n# Inside\n## Also inside\n"
+        chunks = chunk_markdown("test.md", text)
+        assert len(chunks) == 1
+        assert chunks[0].heading_path == ["Title"]
+
+
+class TestGlobPatternMatching:
+    """_is_doc_file must support glob patterns like docs/**/*.md."""
+
+    def test_doublestar_glob(self):
+        assert _is_doc_file("docs/guide.md", ["docs/**/*.md"])
+        assert _is_doc_file("docs/api/reference.md", ["docs/**/*.md"])
+
+    def test_single_star_glob(self):
+        assert _is_doc_file("docs/guide.md", ["docs/*.md"])
+        assert not _is_doc_file("docs/api/reference.md", ["docs/*.md"])
+
+    def test_question_mark_glob(self):
+        assert _is_doc_file("docs/v1.md", ["docs/v?.md"])
+        assert not _is_doc_file("docs/v10.md", ["docs/v?.md"])
+
+    def test_glob_mixed_with_plain(self):
+        patterns = ["README.md", "docs/**/*.md"]
+        assert _is_doc_file("README.md", patterns)
+        assert _is_doc_file("docs/deep/nested/file.md", patterns)
+        assert not _is_doc_file("src/main.md", patterns)
+
+    def test_glob_with_indexer(self):
+        conn = _make_db()
+        snap_id = _insert_snapshot(conn)
+        _insert_doc_file(conn, snap_id, "docs/api/ref.md", "# API\n\nContent")
+        _insert_doc_file(conn, snap_id, "src/notes.md", "# Notes\n\nBody")
+
+        index = build_documentation_index(conn, 1, snap_id, doc_patterns=["docs/**/*.md"])
+        paths = [f.path for f in index.files]
+        assert "docs/api/ref.md" in paths
+        assert "src/notes.md" not in paths

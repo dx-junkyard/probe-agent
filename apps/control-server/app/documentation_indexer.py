@@ -11,7 +11,9 @@ parameter for future extensibility.
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
+import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -43,14 +45,31 @@ class DocumentationIndex:
     total_chunks: int = 0
 
 
+def _glob_match(path: str, pattern: str) -> bool:
+    """Match a path against a glob pattern, supporting ``**`` for any depth."""
+    escaped = re.escape(pattern)
+    escaped = escaped.replace(r"\*\*/", "(?:.*/)?")
+    escaped = escaped.replace(r"\*\*", ".*")
+    escaped = escaped.replace(r"\*", "[^/]*")
+    escaped = escaped.replace(r"\?", "[^/]")
+    return re.fullmatch(escaped, path) is not None
+
+
 def _is_doc_file(path: str, patterns: List[str]) -> bool:
-    """Check if a file path matches documentation patterns."""
+    """Check if a file path matches documentation patterns.
+
+    Supports exact filenames (``README.md``), directory prefixes
+    (``docs/``), and glob patterns (``docs/**/*.md``).
+    """
     lower = path.lower()
     if not lower.endswith(".md"):
         return False
     for pattern in patterns:
         if pattern.endswith("/"):
             if lower.startswith(pattern.lower()) or path.startswith(pattern):
+                return True
+        elif any(c in pattern for c in ("*", "?", "[")):
+            if _glob_match(lower, pattern.lower()):
                 return True
         else:
             if lower == pattern.lower() or path == pattern:

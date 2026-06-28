@@ -147,9 +147,15 @@ def chunk_markdown(path: str, text: str) -> List[MarkdownChunk]:
     current_heading_path: List[str] = []
     current_level = 0
 
+    in_fence = False
+
     for i, line in enumerate(raw_lines):
         line_num = i + 1
-        level = _heading_level(line)
+
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+
+        level = None if in_fence else _heading_level(line)
 
         if level is not None and current_lines:
             sections.append((
