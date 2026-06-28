@@ -568,6 +568,36 @@ export function useInterviewApprovedSet(sessionId: number | null) {
   });
 }
 
+export function useAdvanceInterviewStage(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { stage: string; user_intent?: string }) =>
+      api.post<InterviewSessionOut>(
+        `/interview/sessions/${sessionId}/advance-stage`,
+        data,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+      qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
+    },
+  });
+}
+
+export function useUpdateInterviewUnderstanding(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      api.post<InterviewSessionOut>(
+        `/interview/sessions/${sessionId}/update-understanding`,
+        {},
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+      qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
+    },
+  });
+}
+
 export function useMaterializeInterview(sessionId: number | null) {
   const qc = useQueryClient();
   return useMutation({

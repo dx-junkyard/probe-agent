@@ -1679,6 +1679,16 @@ class WorkspaceProposalDraftOut(BaseModel):
 
 InterviewSessionStatus = Literal["open", "proposals_ready", "materialized", "closed"]
 InterviewMessageRole = Literal["user", "assistant", "system"]
+
+InterviewStage = Literal[
+    "understanding_initialized",
+    "purpose_confirmation",
+    "capability_confirmation",
+    "element_classification",
+    "api_boundary_mapping",
+    "probe_flow_selection",
+    "proposal_generation",
+]
 InterviewProposalApprovalState = Literal["proposed", "approved", "rejected", "edited"]
 # Finite #54 vocabulary for a single state_effects entry.
 SourceMetadataStateEffect = Literal[
@@ -1711,6 +1721,11 @@ class InterviewSessionOut(BaseModel):
     title: str
     focus: str
     status: InterviewSessionStatus
+    stage: Optional[InterviewStage] = "understanding_initialized"
+    current_understanding: Optional[Dict[str, Any]] = None
+    gap_analysis: Optional[List[Dict[str, Any]]] = None
+    open_questions: Optional[List[Dict[str, Any]]] = None
+    user_intent: Optional[str] = None
     materialization_diff: Optional[str] = None
     materialization_ref: Optional[str] = None
     materialized_at: Optional[float] = None
@@ -1938,6 +1953,10 @@ class InterviewDialogueTurnOut(BaseModel):
     next_questions: List[str] = Field(default_factory=list)
     intelligence_run: Optional[IntelligenceRunOut] = None
     error: Optional[str] = None
+    stage: Optional[InterviewStage] = None
+    current_understanding: Optional[Dict[str, Any]] = None
+    gap_analysis: Optional[List[Dict[str, Any]]] = None
+    open_questions_structured: Optional[List[Dict[str, Any]]] = None
 
 
 # --- Interview Proposal Approval (Issue #70) ----------------------------------

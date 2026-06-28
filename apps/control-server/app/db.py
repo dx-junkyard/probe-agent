@@ -959,6 +959,11 @@ CREATE TABLE IF NOT EXISTS interview_session (
     title                TEXT NOT NULL DEFAULT '',
     focus                TEXT NOT NULL DEFAULT '',
     status               TEXT NOT NULL DEFAULT 'open',
+    stage                TEXT NOT NULL DEFAULT 'understanding_initialized',
+    current_understanding TEXT,
+    gap_analysis         TEXT,
+    open_questions       TEXT,
+    user_intent          TEXT,
     materialization_diff TEXT,
     materialization_ref  TEXT,
     materialized_at      REAL,
@@ -1077,6 +1082,23 @@ CREATE INDEX IF NOT EXISTS idx_interview_proposal_decision_proposal
 
 CREATE INDEX IF NOT EXISTS idx_interview_proposal_decision_session
     ON interview_proposal_decision (session_id);
+
+-- Understanding graph snapshots (Issue #79). Persists merged documentation
+-- claim graphs for a system. Each snapshot records the full graph JSON,
+-- source hash, claim count, and confidence summary.
+CREATE TABLE IF NOT EXISTS understanding_graph_snapshots (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    graph_json          TEXT NOT NULL,
+    source_hash         TEXT NOT NULL DEFAULT '',
+    claim_count         INTEGER NOT NULL DEFAULT 0,
+    confidence_summary  TEXT NOT NULL DEFAULT '{}',
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_graph_system
+    ON understanding_graph_snapshots (system_id, id DESC);
 """
 
 
@@ -1356,6 +1378,27 @@ def init_db() -> None:
         if "pattern_id" not in entrypoint_columns:
             conn.execute(
                 "ALTER TABLE code_entrypoints ADD COLUMN pattern_id INTEGER"
+            )
+        session_cols = _columns(conn, "interview_session")
+        if "stage" not in session_cols:
+            conn.execute(
+                "ALTER TABLE interview_session ADD COLUMN stage TEXT NOT NULL DEFAULT 'understanding_initialized'"
+            )
+        if "current_understanding" not in session_cols:
+            conn.execute(
+                "ALTER TABLE interview_session ADD COLUMN current_understanding TEXT"
+            )
+        if "gap_analysis" not in session_cols:
+            conn.execute(
+                "ALTER TABLE interview_session ADD COLUMN gap_analysis TEXT"
+            )
+        if "open_questions" not in session_cols:
+            conn.execute(
+                "ALTER TABLE interview_session ADD COLUMN open_questions TEXT"
+            )
+        if "user_intent" not in session_cols:
+            conn.execute(
+                "ALTER TABLE interview_session ADD COLUMN user_intent TEXT"
             )
         session_cols = _columns(conn, "interview_session")
         if "materialization_diff" not in session_cols:

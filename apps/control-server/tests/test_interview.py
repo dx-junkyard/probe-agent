@@ -369,3 +369,115 @@ def test_migration_creates_tables_and_preserves_existing_data(admin_client):
             ).fetchone()["n"]
             == 1
         )
+
+
+# --- Stage Workflow (Issue #82) -----------------------------------------------
+
+
+def test_session_has_initial_stage(admin_client):
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    r = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "stage test"},
+        headers=headers,
+    )
+    assert r.status_code == 201
+    assert r.json()["stage"] == "understanding_initialized"
+
+
+def test_advance_stage(admin_client):
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    r = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "advance test"},
+        headers=headers,
+    )
+    session_id = r.json()["id"]
+
+    r = admin_client.post(
+        f"/interview/sessions/{session_id}/advance-stage",
+        json={"stage": "purpose_confirmation"},
+        headers=headers,
+    )
+    assert r.status_code == 200
+    assert r.json()["stage"] == "purpose_confirmation"
+
+
+def test_advance_stage_does_not_go_backward(admin_client):
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    r = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "no backward"},
+        headers=headers,
+    )
+    session_id = r.json()["id"]
+
+    admin_client.post(
+        f"/interview/sessions/{session_id}/advance-stage",
+        json={"stage": "capability_confirmation"},
+        headers=headers,
+    )
+
+    r = admin_client.post(
+        f"/interview/sessions/{session_id}/advance-stage",
+        json={"stage": "purpose_confirmation"},
+        headers=headers,
+    )
+    assert r.status_code == 200
+    assert r.json()["stage"] == "capability_confirmation"
+
+
+def test_advance_stage_saves_user_intent(admin_client):
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    r = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "intent test"},
+        headers=headers,
+    )
+    session_id = r.json()["id"]
+
+    r = admin_client.post(
+        f"/interview/sessions/{session_id}/advance-stage",
+        json={"stage": "purpose_confirmation", "user_intent": "Understand the summarizer pipeline"},
+        headers=headers,
+    )
+    assert r.status_code == 200
+    assert r.json()["user_intent"] == "Understand the summarizer pipeline"
+
+
+def test_session_understanding_fields_initially_null(admin_client):
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    r = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "null test"},
+        headers=headers,
+    )
+    assert r.status_code == 201
+    data = r.json()
+    assert data["current_understanding"] is None
+    assert data["gap_analysis"] is None
+    assert data["open_questions"] is None
+    assert data["user_intent"] is None
+
+
+def test_invalid_stage_rejected(admin_client):
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    r = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "invalid"},
+        headers=headers,
+    )
+    session_id = r.json()["id"]
+
+    r = admin_client.post(
+        f"/interview/sessions/{session_id}/advance-stage",
+        json={"stage": "nonexistent_stage"},
+        headers=headers,
+    )
+    assert r.status_code == 422

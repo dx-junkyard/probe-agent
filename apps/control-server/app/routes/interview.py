@@ -15,9 +15,8 @@ import json
 import time
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
-
-from fastapi import Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, ConfigDict
 
 from ..auth import get_system_id
 from ..db import get_conn
@@ -54,10 +53,31 @@ from ..models import (
 )
 from ..probe_planner import check_denylist
 
+STAGE_ORDER = [
+    "understanding_initialized",
+    "purpose_confirmation",
+    "capability_confirmation",
+    "element_classification",
+    "api_boundary_mapping",
+    "probe_flow_selection",
+    "proposal_generation",
+]
+
+
+def _advance_stage(current_stage: str, target: str) -> str:
+    """Advance to target stage if it's ahead of current."""
+    try:
+        current_idx = STAGE_ORDER.index(current_stage)
+        target_idx = STAGE_ORDER.index(target)
+    except ValueError:
+        return current_stage
+    return target if target_idx > current_idx else current_stage
+
 router = APIRouter()
 
 
 def _session_out(row) -> InterviewSessionOut:
+    import json as _json
     return InterviewSessionOut(
         id=row["id"],
         system_id=row["system_id"],
@@ -65,6 +85,11 @@ def _session_out(row) -> InterviewSessionOut:
         title=row["title"],
         focus=row["focus"],
         status=row["status"],
+        stage=row["stage"] if row["stage"] else "understanding_initialized",
+        current_understanding=_json.loads(row["current_understanding"]) if row["current_understanding"] else None,
+        gap_analysis=_json.loads(row["gap_analysis"]) if row["gap_analysis"] else None,
+        open_questions=_json.loads(row["open_questions"]) if row["open_questions"] else None,
+        user_intent=row["user_intent"],
         materialization_diff=row["materialization_diff"],
         materialization_ref=row["materialization_ref"],
         materialized_at=row["materialized_at"],
@@ -190,8 +215,8 @@ def create_interview_session(
         cur = conn.execute(
             """
             INSERT INTO interview_session
-                (system_id, snapshot_id, title, focus, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, 'open', ?, ?)
+                (system_id, snapshot_id, title, focus, status, stage, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'open', 'understanding_initialized', ?, ?)
             """,
             (system_id, payload.snapshot_id, payload.title, payload.focus, now, now),
         )
@@ -570,9 +595,13 @@ def interview_dialogue_turn(
             )
             asst_message_id = asst_cur.lastrowid
 
-            # Persist proposals if any.
+            # Gate proposals behind proposal_generation stage (Issue #83).
+            current_stage = session["stage"] or "understanding_initialized"
+            proposals_allowed = current_stage == "proposal_generation"
+
             proposal_outs: List[InterviewDialogueProposalOut] = []
-            for p in turn.proposals:
+            gated_proposals = turn.proposals if proposals_allowed else []
+            for p in gated_proposals:
                 conn.execute(
                     """INSERT INTO interview_proposal
                         (session_id, system_id, snapshot_id, message_id,
@@ -631,11 +660,19 @@ def interview_dialogue_turn(
             conn.execute("ROLLBACK")
             raise
 
+        # Re-read session for latest understanding state.
+        updated_row = _get_session_or_404(conn, session_id, system_id)
+        updated_session = _session_out(updated_row)
+
         return InterviewDialogueTurnOut(
             assistant_message=turn.assistant_message,
             proposals=proposal_outs,
             next_questions=turn.next_questions,
             intelligence_run=intelligence_run_out,
+            stage=updated_session.stage,
+            current_understanding=updated_session.current_understanding,
+            gap_analysis=updated_session.gap_analysis,
+            open_questions_structured=updated_session.open_questions,
         )
 
 
@@ -1089,3 +1126,144 @@ def materialize_interview_session(
         skipped=result.skipped,
         materialized_at=now,
     )
+
+
+# --- Stage Advancement (Issue #82) -------------------------------------------
+
+
+class _AdvanceStageRequest(BaseModel):
+    stage: str
+    user_intent: Optional[str] = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+@router.post(
+    "/interview/sessions/{session_id}/advance-stage",
+    response_model=InterviewSessionOut,
+)
+def advance_interview_stage(
+    session_id: int,
+    payload: _AdvanceStageRequest,
+    system_id: int = Depends(get_system_id),
+) -> InterviewSessionOut:
+    """Advance the interview session to a specified stage."""
+    if payload.stage not in STAGE_ORDER:
+        raise HTTPException(status_code=422, detail=f"Invalid stage: {payload.stage}")
+
+    now = time.time()
+    with get_conn() as conn:
+        session = _get_session_or_404(conn, session_id, system_id)
+        new_stage = _advance_stage(session["stage"] or "understanding_initialized", payload.stage)
+
+        updates = ["stage = ?", "updated_at = ?"]
+        params: list = [new_stage, now]
+
+        if payload.user_intent is not None:
+            updates.append("user_intent = ?")
+            params.append(payload.user_intent)
+
+        params.extend([session_id, system_id])
+        conn.execute(
+            f"UPDATE interview_session SET {', '.join(updates)} WHERE id = ? AND system_id = ?",
+            params,
+        )
+        row = _get_session_or_404(conn, session_id, system_id)
+        return _session_out(row)
+
+
+@router.post(
+    "/interview/sessions/{session_id}/update-understanding",
+    response_model=InterviewSessionOut,
+)
+def update_interview_understanding(
+    session_id: int,
+    system_id: int = Depends(get_system_id),
+) -> InterviewSessionOut:
+    """Update the session's current understanding from its graph/reconciliation data.
+
+    This endpoint is the entry point for generating an initial understanding
+    when Start Interview is clicked, or for refreshing after new turns.
+    """
+    now = time.time()
+    with get_conn() as conn:
+        session = _get_session_or_404(conn, session_id, system_id)
+        snapshot_id = session["snapshot_id"]
+
+        from ..documentation_indexer import build_documentation_index
+        from ..documentation_claim_scanner import scan_all_chunks
+        from ..understanding_graph import build_understanding_graph, save_graph_snapshot
+        from ..docs_code_reconciler import reconcile
+        from ..system_understanding_reviewer import generate_understanding_review
+
+        doc_index = build_documentation_index(conn, system_id, snapshot_id)
+
+        config = _get_intelligence_llm_config()
+        client = create_llm_client(config)
+
+        scan_results = scan_all_chunks(client, config, doc_index.chunks)
+
+        graph = build_understanding_graph(scan_results)
+        save_graph_snapshot(conn, system_id, graph)
+
+        reconciliation = reconcile(conn, system_id, snapshot_id, graph)
+
+        review = generate_understanding_review(
+            client, config,
+            graph=graph,
+            reconciliation=reconciliation,
+        )
+
+        if review.error:
+            conn.execute(
+                """UPDATE interview_session
+                   SET updated_at = ?
+                   WHERE id = ? AND system_id = ?""",
+                (now, session_id, system_id),
+            )
+            row = _get_session_or_404(conn, session_id, system_id)
+            return _session_out(row)
+
+        understanding_json = json.dumps(review.current_understanding) if review.current_understanding else None
+        gap_json = json.dumps(review.gap_analysis) if review.gap_analysis else None
+        questions_json = json.dumps(review.open_questions) if review.open_questions else None
+
+        new_stage = _advance_stage(
+            session["stage"] or "understanding_initialized",
+            "purpose_confirmation",
+        )
+
+        conn.execute(
+            """UPDATE interview_session
+               SET current_understanding = ?, gap_analysis = ?, open_questions = ?,
+                   stage = ?, updated_at = ?
+               WHERE id = ? AND system_id = ?""",
+            (understanding_json, gap_json, questions_json, new_stage, now, session_id, system_id),
+        )
+
+        if review.current_understanding:
+            summary_parts = []
+            for purpose in review.current_understanding.get("system_purpose", []):
+                summary_parts.append(f"System Purpose: {purpose.get('name', 'unknown')}")
+            for cap in review.current_understanding.get("core_capabilities", []):
+                summary_parts.append(f"Core Capability: {cap.get('name', 'unknown')}")
+            if summary_parts:
+                asst_content = (
+                    "I've analyzed the documentation and code to build an initial understanding.\n\n"
+                    + "\n".join(f"- {p}" for p in summary_parts)
+                )
+                if review.open_questions:
+                    asst_content += "\n\nKey questions:\n"
+                    for q in review.open_questions[:5]:
+                        asst_content += f"- {q.get('question', '')}\n"
+                asst_content += f"\nSuggested next: {review.suggested_next_action}"
+
+                conn.execute(
+                    """INSERT INTO interview_message
+                        (session_id, system_id, role, content, created_at)
+                    VALUES (?, ?, 'assistant', ?, ?)""",
+                    (session_id, system_id, asst_content, now),
+                )
+
+        row = _get_session_or_404(conn, session_id, system_id)
+        return _session_out(row)
