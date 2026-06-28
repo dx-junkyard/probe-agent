@@ -213,6 +213,94 @@ class TestReconcileStaleExplanation:
         assert len(stale) >= 1
 
 
+class TestAPIMatchHandlerSymbolTracked:
+    """P2: API route match must also mark handler symbol as matched."""
+
+    def test_handler_symbol_not_reported_code_only(self):
+        conn, snap_id = _make_db()
+        sym_id = _add_symbol(conn, snap_id, "src/api.py", "api.get_users")
+        _add_entrypoint(conn, snap_id, "src/api.py", "api.get_users",
+                        route_method="GET", route_path="/users", symbol_id=sym_id)
+        graph = _build_graph([_claim(
+            claim_type="api_boundary",
+            summary="Users API endpoint",
+            apis=["GET /users"],
+        )])
+        result = reconcile(conn, 1, snap_id, graph)
+        assert result.matched_count >= 1
+        code_only = [g for g in result.gaps if g.gap_type == "code_only"
+                     and g.node_name == "api.get_users"]
+        assert len(code_only) == 0
+
+
+class TestDriftFilteredBySnapshot:
+    """P2: drift proposals must be scoped to the target snapshot."""
+
+    def test_drift_from_other_snapshot_excluded(self):
+        conn, snap_id = _make_db()
+        now = time.time()
+        other_snap = conn.execute(
+            """INSERT INTO repository_snapshots
+                (system_id, repo_path, commit_sha, status, file_count, created_at)
+            VALUES (1, '/tmp/repo', 'other_sha', 'completed', 0, ?)""",
+            (now,),
+        ).lastrowid
+        conn.execute(
+            """INSERT INTO intelligence_runs
+                (system_id, snapshot_id, run_type, provider, model,
+                 prompt_version, schema_version, decision_method, status,
+                 is_mock, started_at)
+            VALUES (1, ?, 'refresh', 'test', 'test', 'v1', 'v1',
+                    'reasoning_llm', 'completed', 0, ?)""",
+            (other_snap, now),
+        )
+        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            """INSERT INTO explanation_refresh_proposals
+                (system_id, intelligence_run_id, base_snapshot_id, target_snapshot_id,
+                 path, qualified_name, drift_status, drift_reason, status, created_at)
+            VALUES (1, ?, ?, ?, 'src/func.py', 'func.calc', 'drifted',
+                    'Body hash changed', 'proposed', ?)""",
+            (run_id, other_snap, other_snap, now),
+        )
+        graph = _build_graph([_claim(
+            claim_type="capability_element",
+            summary="Calculation function",
+            symbols=["func.calc"],
+        )])
+        result = reconcile(conn, 1, snap_id, graph)
+        stale = [g for g in result.gaps if g.gap_type == "stale_explanation"]
+        assert len(stale) == 0
+
+
+class TestTestSymbolExcluded:
+    """P2: test symbols must not create false code_only gaps."""
+
+    def test_is_test_symbol_excluded_from_code_only(self):
+        conn, snap_id = _make_db()
+        conn.execute(
+            """INSERT INTO code_symbols
+                (snapshot_id, system_id, path, qualified_name, kind,
+                 start_line, end_line, is_test)
+            VALUES (?, 1, 'tests/test_main.py', 'test_main.test_run',
+                    'function', 1, 10, 1)""",
+            (snap_id,),
+        )
+        graph = _build_graph([])
+        result = reconcile(conn, 1, snap_id, graph)
+        code_only = [g for g in result.gaps if g.gap_type == "code_only"
+                     and g.node_name == "test_main.test_run"]
+        assert len(code_only) == 0
+
+    def test_non_test_symbol_still_reported(self):
+        conn, snap_id = _make_db()
+        _add_symbol(conn, snap_id, "src/main.py", "main.run", kind="function")
+        graph = _build_graph([])
+        result = reconcile(conn, 1, snap_id, graph)
+        code_only = [g for g in result.gaps if g.gap_type == "code_only"]
+        assert len(code_only) >= 1
+
+
 class TestReconcilePreservesEvidence:
     def test_both_sides_evidence(self):
         conn, snap_id = _make_db()

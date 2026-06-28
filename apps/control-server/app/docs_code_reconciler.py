@@ -84,7 +84,7 @@ def _load_code_symbols(
 ) -> List[Dict[str, Any]]:
     rows = conn.execute(
         """SELECT id, path, qualified_name, kind, start_line, end_line,
-                  route_path, route_method, component_id
+                  route_path, route_method, component_id, is_test
            FROM code_symbols
            WHERE system_id = ? AND snapshot_id = ?
            ORDER BY path, start_line""",
@@ -135,14 +135,14 @@ def _load_capability_nodes(
 
 
 def _load_drift_info(
-    conn: sqlite3.Connection, system_id: int
+    conn: sqlite3.Connection, system_id: int, snapshot_id: int
 ) -> List[Dict[str, Any]]:
     rows = conn.execute(
         """SELECT id, path, qualified_name, drift_status, drift_reason
            FROM explanation_refresh_proposals
-           WHERE system_id = ? AND status = 'proposed'
+           WHERE system_id = ? AND target_snapshot_id = ? AND status = 'proposed'
            ORDER BY id DESC""",
-        (system_id,),
+        (system_id, snapshot_id),
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -220,7 +220,7 @@ def reconcile(
     entrypoints = _load_entrypoints(conn, system_id, snapshot_id)
     source_metadata = _load_source_metadata(conn, system_id, snapshot_id)
     capability_nodes = _load_capability_nodes(conn, system_id, snapshot_id)
-    drift_info = _load_drift_info(conn, system_id)
+    drift_info = _load_drift_info(conn, system_id, snapshot_id)
 
     mappings: List[ReconciliationMapping] = []
     gaps: List[ReconciliationMapping] = []
@@ -243,6 +243,12 @@ def reconcile(
                     matched_symbol_ids.add(ce.symbol_id)
                 if ce.entrypoint_id:
                     matched_entrypoint_ids.add(ce.entrypoint_id)
+                    ep_rec = next(
+                        (e for e in entrypoints if e["id"] == ce.entrypoint_id),
+                        None,
+                    )
+                    if ep_rec and ep_rec.get("handler_symbol_id"):
+                        matched_symbol_ids.add(ep_rec["handler_symbol_id"])
 
             mappings.append(ReconciliationMapping(
                 node_id=nid,
@@ -267,6 +273,8 @@ def reconcile(
 
     for sym in code_symbols:
         if sym["id"] not in matched_symbol_ids:
+            if sym.get("is_test"):
+                continue
             if sym["kind"] in ("function", "class", "method"):
                 gaps.append(ReconciliationMapping(
                     node_id=None,
