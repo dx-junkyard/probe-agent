@@ -1935,3 +1935,87 @@ class InterviewDialogueTurnOut(BaseModel):
     next_questions: List[str] = Field(default_factory=list)
     intelligence_run: Optional[IntelligenceRunOut] = None
     error: Optional[str] = None
+
+
+# --- Interview Proposal Approval (Issue #70) ----------------------------------
+#
+# Per-item approval gate: a developer can approve, reject, or edit each
+# proposed { docstring_metadata, probe_plan } item. Decisions are persisted
+# as decision_method='manual' records that reference — but do not overwrite —
+# the original reasoning_llm proposal.
+
+InterviewDecisionAction = Literal["approved", "rejected", "edited"]
+
+
+class InterviewProposalApproveRequest(BaseModel):
+    """Approve a proposal as-is."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str = Field(default="", max_length=200)
+
+
+class InterviewProposalRejectRequest(BaseModel):
+    """Reject a proposal."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str = Field(default="", max_length=200)
+
+
+class InterviewProposalEditRequest(BaseModel):
+    """Edit and approve a proposal with corrected values."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str = Field(default="", max_length=200)
+    metadata: InterviewProposalMetadataBlock
+    probe_plan: InterviewProposalProbePlan
+
+
+class InterviewProposalDecisionOut(BaseModel):
+    """A persisted manual decision on a proposal."""
+
+    id: int
+    proposal_id: int
+    session_id: int
+    system_id: int
+    decision: InterviewDecisionAction
+    decision_method: DecisionMethod
+    actor: str
+    edited_metadata: Optional[InterviewProposalMetadataBlock] = None
+    edited_probe_plan: Optional[InterviewProposalProbePlan] = None
+    denylist_hit: Optional[str] = None
+    decided_at: float
+
+
+class InterviewApprovedItemOut(BaseModel):
+    """An item from the approved set, ready for materialization.
+
+    Contains the effective metadata/probe_plan: the edited values if the
+    decision was 'edited', or the original proposal values if 'approved'.
+    """
+
+    proposal_id: int
+    path: str
+    qualified_name: str
+    symbol_id: Optional[int] = None
+    metadata: InterviewProposalMetadataBlock
+    probe_plan: InterviewProposalProbePlan
+    decision: InterviewDecisionAction
+    decision_id: int
+    actor: str
+    decided_at: float
+
+
+class InterviewApprovedSetOut(BaseModel):
+    """The approved set for a session: items eligible for materialization."""
+
+    session_id: int
+    system_id: int
+    snapshot_id: int
+    items: List[InterviewApprovedItemOut] = Field(default_factory=list)
+    total_proposals: int = 0
+    approved_count: int = 0
+    rejected_count: int = 0
+    pending_count: int = 0

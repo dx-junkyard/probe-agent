@@ -839,6 +839,59 @@
         "error": { "type": ["string", "null"] }
       },
       "additionalProperties": false
+    },
+    "InterviewProposalDecision": {
+      "type": "object",
+      "description": "A persisted manual decision on a proposal (Issue #70). Each decision references — but does not overwrite — the original reasoning_llm proposal.",
+      "required": ["id", "proposal_id", "session_id", "system_id", "decision", "decision_method", "decided_at"],
+      "properties": {
+        "id": { "type": "integer" },
+        "proposal_id": { "type": "integer" },
+        "session_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "decision": { "enum": ["approved", "rejected", "edited"] },
+        "decision_method": { "enum": ["deterministic", "reasoning_llm", "manual"] },
+        "actor": { "type": "string" },
+        "edited_metadata": { "oneOf": [{ "$ref": "#/definitions/InterviewProposalMetadataBlock" }, { "type": "null" }] },
+        "edited_probe_plan": { "oneOf": [{ "$ref": "#/definitions/InterviewProposalProbePlan" }, { "type": "null" }] },
+        "denylist_hit": { "type": ["string", "null"] },
+        "decided_at": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    "InterviewApprovedItem": {
+      "type": "object",
+      "description": "An item from the approved set, ready for materialization (Issue #70). Contains the effective values: edited if decision was 'edited', original if 'approved'.",
+      "required": ["proposal_id", "path", "qualified_name", "metadata", "probe_plan", "decision", "decision_id", "decided_at"],
+      "properties": {
+        "proposal_id": { "type": "integer" },
+        "path": { "type": "string" },
+        "qualified_name": { "type": "string" },
+        "symbol_id": { "type": ["integer", "null"] },
+        "metadata": { "$ref": "#/definitions/InterviewProposalMetadataBlock" },
+        "probe_plan": { "$ref": "#/definitions/InterviewProposalProbePlan" },
+        "decision": { "enum": ["approved", "edited"] },
+        "decision_id": { "type": "integer" },
+        "actor": { "type": "string" },
+        "decided_at": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    "InterviewApprovedSet": {
+      "type": "object",
+      "description": "The approved set for a session: items eligible for materialization (Issue #70).",
+      "required": ["session_id", "system_id", "snapshot_id"],
+      "properties": {
+        "session_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "snapshot_id": { "type": "integer" },
+        "items": { "type": "array", "items": { "$ref": "#/definitions/InterviewApprovedItem" } },
+        "total_proposals": { "type": "integer", "minimum": 0 },
+        "approved_count": { "type": "integer", "minimum": 0 },
+        "rejected_count": { "type": "integer", "minimum": 0 },
+        "pending_count": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
     }
   },
   "type": "object"
