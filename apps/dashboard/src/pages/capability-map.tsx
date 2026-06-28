@@ -15,7 +15,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import {
   Map as MapIcon, Sparkles, Workflow, RefreshCw, Link2,
   Target, Boxes, Layers, Server, ChevronRight, AlertTriangle,
-  CheckCircle2, Circle,
+  CheckCircle2, Circle, MessageSquareText,
 } from "lucide-react";
 import type {
   CapabilityOut, CapabilityElementOut,
@@ -437,16 +437,25 @@ export default function CapabilityMapPage() {
               without a capability stay unclassified rather than being guessed at.
             </p>
             <PrerequisiteChecklist />
-            <Button
-              size="sm"
-              className="mt-2"
-              onClick={() => handleGenerate(false)}
-              disabled={generate.isPending}
-              data-testid="generate-hierarchy-empty"
-            >
-              <Sparkles className="h-4 w-4 mr-1" />
-              {generate.isPending ? "Generating…" : "Generate capability hierarchy"}
-            </Button>
+            <div className="flex justify-center gap-2 flex-wrap mt-2">
+              <Link
+                to="/interview"
+                className={buttonVariants({ size: "sm", variant: "outline" })}
+                data-testid="start-interview-empty"
+              >
+                <MessageSquareText className="h-4 w-4 mr-1" />
+                Start interview
+              </Link>
+              <Button
+                size="sm"
+                onClick={() => handleGenerate(false)}
+                disabled={generate.isPending}
+                data-testid="generate-hierarchy-empty"
+              >
+                <Sparkles className="h-4 w-4 mr-1" />
+                {generate.isPending ? "Generating…" : "Generate capability hierarchy"}
+              </Button>
+            </div>
           </CardContent>
         </Card>
       ) : (
@@ -511,8 +520,17 @@ export default function CapabilityMapPage() {
 
               {hierarchy!.unclassified_elements.length > 0 && (
                 <div className="pt-2">
-                  <div className="px-2 py-1 text-[10px] uppercase tracking-wide text-muted-foreground">
-                    Unclassified
+                  <div className="px-2 py-1 flex items-center justify-between gap-2">
+                    <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                      Unclassified
+                    </span>
+                    <Link
+                      to="/interview"
+                      className="inline-flex items-center text-[10px] text-primary hover:underline"
+                    >
+                      <MessageSquareText className="h-3 w-3 mr-1" />
+                      Interview
+                    </Link>
                   </div>
                   {hierarchy!.unclassified_elements.map(el => (
                     <TreeRow

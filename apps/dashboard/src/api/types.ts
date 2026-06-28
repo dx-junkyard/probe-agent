@@ -122,6 +122,205 @@ export interface SnapshotOut {
   files: SnapshotFileOut[];
 }
 
+export type InterviewSessionStatus = "open" | "proposals_ready" | "materialized" | "closed";
+export type InterviewMessageRole = "user" | "assistant" | "system";
+export type InterviewDecisionMethod = "deterministic" | "reasoning_llm" | "manual";
+export type InterviewApprovalState = "proposed" | "approved" | "rejected" | "edited";
+export type SourceMetadataElementType =
+  | "system" | "core" | "capability" | "element" | "supporting" | "boundary";
+export type SourceMetadataOperationKind =
+  | "analysis" | "read" | "write" | "mutation" | "io" | "orchestration" | "validation" | "other";
+export type SourceMetadataStateEffect =
+  | "none" | "database-read" | "database-write" | "network" | "filesystem" | "cache" | "external-api" | "queue";
+export type ProbeRecommendedMode = "trace" | "shadow";
+export type ProbeSideEffectRisk = "none" | "low" | "medium" | "high";
+export type ProbeReplayability = "safe" | "caution" | "unsafe";
+
+export interface InterviewSessionOut {
+  id: number;
+  system_id: number;
+  snapshot_id: number;
+  title: string;
+  focus: string;
+  status: InterviewSessionStatus;
+  materialization_diff: string | null;
+  materialization_ref: string | null;
+  materialized_at: number | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface InterviewMessageOut {
+  id: number;
+  session_id: number;
+  role: InterviewMessageRole;
+  content: string;
+  intelligence_run_id: number | null;
+  created_at: number;
+}
+
+export interface InterviewProposalMetadataBlock {
+  role: string | null;
+  capability: string | null;
+  system_purpose: string | null;
+  probe_value: string | null;
+  element_type: SourceMetadataElementType | null;
+  operation_kind: SourceMetadataOperationKind | null;
+  consumers: string[];
+  state_effects: SourceMetadataStateEffect[];
+}
+
+export interface InterviewProposalProbePlan {
+  feature_id: string;
+  objective: string;
+  reason: string;
+  recommended_mode: ProbeRecommendedMode;
+  side_effect_risk: ProbeSideEffectRisk;
+  replayability: ProbeReplayability;
+}
+
+export interface InterviewProposalOut {
+  id: number;
+  session_id: number;
+  system_id: number;
+  snapshot_id: number;
+  message_id: number | null;
+  intelligence_run_id: number;
+  symbol_id: number | null;
+  path: string;
+  qualified_name: string;
+  metadata: InterviewProposalMetadataBlock;
+  probe_plan: InterviewProposalProbePlan;
+  decision_method: InterviewDecisionMethod;
+  approval_state: InterviewApprovalState;
+  is_mock: boolean;
+  intelligence_run: IntelligenceRunOut | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface InterviewSessionDetailOut extends InterviewSessionOut {
+  messages: InterviewMessageOut[];
+  proposals: InterviewProposalOut[];
+}
+
+export interface InterviewEvidenceLocation {
+  snapshot_id: number;
+  path: string;
+  qualified_name: string;
+  start_line: number;
+  end_line: number;
+}
+
+export interface InterviewSymbolItem {
+  symbol_id: number;
+  path: string;
+  qualified_name: string;
+  kind: string;
+  start_line: number;
+  end_line: number;
+  classification: "classified" | "unclassified";
+  has_metadata: boolean;
+  element_type: string | null;
+  role: string | null;
+  capability: string | null;
+  operation_kind: string | null;
+  probe_value: string | null;
+  evidence: InterviewEvidenceLocation;
+}
+
+export interface InterviewEntrypointItem {
+  entrypoint_id: number;
+  entrypoint_type: string;
+  category: string;
+  label: string;
+  handler_path: string;
+  handler_qualified_name: string;
+  line_start: number;
+  line_end: number;
+  classification: "classified" | "unclassified";
+  has_metadata: boolean;
+  evidence: InterviewEvidenceLocation;
+}
+
+export interface InterviewContextPack {
+  system_id: number;
+  snapshot_id: number;
+  total_symbols: number;
+  total_entrypoints: number;
+  classified_count: number;
+  unclassified_count: number;
+  budget_max_chars: number;
+  budget_used_chars: number;
+  truncated: boolean;
+  symbols: InterviewSymbolItem[];
+  entrypoints: InterviewEntrypointItem[];
+  omission_notes: string[];
+}
+
+export interface InterviewDialogueTurnOut {
+  assistant_message: string;
+  proposals: {
+    path: string;
+    qualified_name: string;
+    symbol_id: number | null;
+    metadata: InterviewProposalMetadataBlock;
+    probe_plan: InterviewProposalProbePlan;
+    denylist_hit: string | null;
+  }[];
+  next_questions: string[];
+  intelligence_run: IntelligenceRunOut | null;
+  error: string | null;
+}
+
+export interface InterviewProposalDecisionOut {
+  id: number;
+  proposal_id: number;
+  session_id: number;
+  system_id: number;
+  decision: "approved" | "rejected" | "edited";
+  decision_method: InterviewDecisionMethod;
+  actor: string;
+  edited_metadata: InterviewProposalMetadataBlock | null;
+  edited_probe_plan: InterviewProposalProbePlan | null;
+  denylist_hit: string | null;
+  decided_at: number;
+}
+
+export interface InterviewApprovedSetOut {
+  session_id: number;
+  system_id: number;
+  snapshot_id: number;
+  items: {
+    proposal_id: number;
+    path: string;
+    qualified_name: string;
+    symbol_id: number | null;
+    metadata: InterviewProposalMetadataBlock;
+    probe_plan: InterviewProposalProbePlan;
+    decision: "approved" | "edited";
+    decision_id: number;
+    actor: string;
+    decided_at: number;
+  }[];
+  total_proposals: number;
+  approved_count: number;
+  rejected_count: number;
+  pending_count: number;
+}
+
+export interface InterviewMaterializeOut {
+  session_id: number;
+  system_id: number;
+  snapshot_id: number;
+  diff: string;
+  files_changed: number;
+  items_materialized: number;
+  skipped: string[];
+  materialized_at: number;
+  error: string | null;
+}
+
 export interface IntelligenceRunOut {
   id: number;
   system_id: number;

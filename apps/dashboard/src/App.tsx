@@ -5,6 +5,7 @@ import OverviewPage from "./pages/overview";
 import RepositoryPage from "./pages/repository";
 import FeatureMapPage from "./pages/feature-map";
 import CapabilityMapPage from "./pages/capability-map";
+import InterviewPage from "./pages/interview";
 import ProbePlannerPage from "./pages/probe-planner";
 import FlowExplorerPage from "./pages/flow-explorer";
 import ExperimentsPage from "./pages/experiments";
@@ -24,6 +25,7 @@ export default function App() {
         <Route path="repository" element={<RepositoryPage />} />
         <Route path="feature-map" element={<FeatureMapPage />} />
         <Route path="capability-map" element={<CapabilityMapPage />} />
+        <Route path="interview" element={<InterviewPage />} />
         <Route path="flow-explorer" element={<FlowExplorerPage />} />
         <Route path="probe-planner" element={<ProbePlannerPage />} />
         <Route path="experiments" element={<ExperimentsPage />} />
