@@ -169,6 +169,27 @@ def _extract_symbols(text: str) -> List[str]:
     return [s for s in sorted(candidates) if s not in excluded and not s[0].isdigit()]
 
 
+def _get_evidence_text(chunk: MarkdownChunk, start_line: int, end_line: int) -> str:
+    """Extract the text from a chunk corresponding to evidence line range."""
+    chunk_lines = chunk.content.split("\n")
+    offset = chunk.start_line
+    rel_start = max(0, start_line - offset)
+    rel_end = min(len(chunk_lines), end_line - offset + 1)
+    return "\n".join(chunk_lines[rel_start:rel_end])
+
+
+def _merge_unique(model_list: List[str], deterministic_list: List[str]) -> List[str]:
+    """Merge two lists, preserving order and removing duplicates."""
+    seen: Set[str] = set()
+    result: List[str] = []
+    for item in model_list + deterministic_list:
+        lower = item.lower()
+        if lower not in seen:
+            seen.add(lower)
+            result.append(item)
+    return result
+
+
 def scan_chunk(
     client: LLMClient,
     config: LLMConfig,
@@ -180,7 +201,7 @@ def scan_chunk(
     If a cache dict is provided and contains a result for the chunk's
     content_hash + prompt/schema version, return the cached result.
     """
-    cache_key = f"{chunk.content_hash}:{PROMPT_VERSION}:{SCHEMA_VERSION}"
+    cache_key = f"{chunk.content_hash}:{chunk.path}:{chunk.start_line}:{PROMPT_VERSION}:{SCHEMA_VERSION}"
 
     if cache is not None and cache_key in cache:
         cached = cache[cache_key]
@@ -299,18 +320,40 @@ def scan_chunk(
             ))
             continue
 
-        claims.append(DocumentationClaim(
-            claim_type=raw_claim.claim_type,
-            summary=raw_claim.summary,
-            evidence=ClaimEvidence(
-                path=chunk.path,
-                start_line=raw_claim.evidence_start_line,
-                end_line=raw_claim.evidence_end_line,
-            ),
-            confidence=raw_claim.confidence,
-            mentioned_apis=raw_claim.mentioned_apis,
-            mentioned_symbols=raw_claim.mentioned_symbols,
-        ))
+        clamped_confidence = max(0.0, min(1.0, raw_claim.confidence))
+
+        evidence_text = _get_evidence_text(chunk, raw_claim.evidence_start_line, raw_claim.evidence_end_line)
+        merged_apis = _merge_unique(raw_claim.mentioned_apis, _extract_api_paths(evidence_text))
+        merged_symbols = _merge_unique(raw_claim.mentioned_symbols, _extract_symbols(evidence_text))
+
+        try:
+            claim = DocumentationClaim(
+                claim_type=raw_claim.claim_type,
+                summary=raw_claim.summary,
+                evidence=ClaimEvidence(
+                    path=chunk.path,
+                    start_line=raw_claim.evidence_start_line,
+                    end_line=raw_claim.evidence_end_line,
+                ),
+                confidence=clamped_confidence,
+                mentioned_apis=merged_apis,
+                mentioned_symbols=merged_symbols,
+            )
+        except ValidationError as exc:
+            claims.append(DocumentationClaim(
+                claim_type="implementation_note",
+                summary=raw_claim.summary[:200] if raw_claim.summary else "Validation failed",
+                evidence=ClaimEvidence(
+                    path=chunk.path,
+                    start_line=max(raw_claim.evidence_start_line, chunk.start_line),
+                    end_line=min(raw_claim.evidence_end_line, chunk.end_line),
+                ),
+                confidence=0.0,
+                is_valid=False,
+                invalid_reason=f"Claim validation failed: {exc}",
+            ))
+            continue
+        claims.append(claim)
 
     result = ChunkScanResult(
         chunk_id=chunk.chunk_id,

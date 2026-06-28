@@ -18,6 +18,8 @@ from app.documentation_claim_scanner import (
     scan_chunk,
     scan_all_chunks,
     _validate_claim_bounds,
+    _extract_api_paths,
+    _extract_symbols,
     _RawClaim,
 )
 from app.llm import LLMConfig, MockLLMClient
@@ -325,3 +327,134 @@ class TestScanAllChunks:
         assert len(results) == 2
         assert results[0].chunk_id == "c1"
         assert results[1].chunk_id == "c2"
+
+
+class TestConfidenceClamping:
+    """P1: out-of-range confidence must be clamped, not crash."""
+
+    def test_confidence_above_1_clamped(self):
+        chunk = _make_chunk(content="# Title\n\nSystem does X", start_line=1, end_line=3)
+        response = {"claims": [{
+            "claim_type": "system_purpose",
+            "summary": "System does X",
+            "evidence_start_line": 1,
+            "evidence_end_line": 3,
+            "confidence": 2.0,
+            "mentioned_apis": [],
+            "mentioned_symbols": [],
+        }]}
+        client = FakeLLMClient(response)
+        result = scan_chunk(client, _mock_config(), chunk)
+        assert result.error is None
+        assert len(result.claims) == 1
+        assert result.claims[0].is_valid
+        assert result.claims[0].confidence == 1.0
+
+    def test_confidence_below_0_clamped(self):
+        chunk = _make_chunk(content="# Title\n\nSomething", start_line=1, end_line=3)
+        response = {"claims": [{
+            "claim_type": "core_capability",
+            "summary": "Has capability",
+            "evidence_start_line": 1,
+            "evidence_end_line": 3,
+            "confidence": -0.5,
+            "mentioned_apis": [],
+            "mentioned_symbols": [],
+        }]}
+        client = FakeLLMClient(response)
+        result = scan_chunk(client, _mock_config(), chunk)
+        assert result.error is None
+        assert len(result.claims) == 1
+        assert result.claims[0].is_valid
+        assert result.claims[0].confidence == 0.0
+
+
+class TestCacheEvidence:
+    """P2: cache must not return evidence from a different path/offset."""
+
+    def test_same_content_different_path_no_cache_collision(self):
+        content = "# Title\n\nIdentical content here"
+        chunk_a = _make_chunk(chunk_id="a", path="README.md", start_line=1, end_line=3,
+                              content=content, content_hash="samehash")
+        chunk_b = _make_chunk(chunk_id="b", path="docs/copy.md", start_line=101, end_line=103,
+                              content=content, content_hash="samehash")
+
+        response = {"claims": [{
+            "claim_type": "system_purpose",
+            "summary": "System purpose claim",
+            "evidence_start_line": 1,
+            "evidence_end_line": 3,
+            "confidence": 0.9,
+            "mentioned_apis": [],
+            "mentioned_symbols": [],
+        }]}
+        client = FakeLLMClient(response)
+        cache: dict = {}
+
+        result_a = scan_chunk(client, _mock_config(), chunk_a, cache=cache)
+        assert result_a.claims[0].evidence.path == "README.md"
+
+        result_b = scan_chunk(client, _mock_config(), chunk_b, cache=cache)
+        assert not result_b.is_cached
+        assert result_b.claims[0].evidence.path == "docs/copy.md"
+
+    def test_same_path_same_offset_cache_hit(self):
+        chunk = _make_chunk(content_hash="h1")
+        response = {"claims": []}
+        client = FakeLLMClient(response)
+        cache: dict = {}
+
+        scan_chunk(client, _mock_config(), chunk, cache=cache)
+        result2 = scan_chunk(client, _mock_config(), chunk, cache=cache)
+        assert result2.is_cached
+
+
+class TestDeterministicExtraction:
+    """P2: deterministic API/symbol extraction must augment model output."""
+
+    def test_api_path_merged_from_evidence(self):
+        content = "# API\n\nUse GET /users to list users\nand POST /items to create"
+        chunk = _make_chunk(content=content, start_line=1, end_line=4)
+        response = {"claims": [{
+            "claim_type": "api_boundary",
+            "summary": "Lists users and creates items",
+            "evidence_start_line": 1,
+            "evidence_end_line": 4,
+            "confidence": 0.8,
+            "mentioned_apis": ["GET /users"],
+            "mentioned_symbols": [],
+        }]}
+        client = FakeLLMClient(response)
+        result = scan_chunk(client, _mock_config(), chunk)
+        apis = result.claims[0].mentioned_apis
+        assert "GET /users" in apis
+        assert any("/items" in a for a in apis)
+
+    def test_symbol_merged_from_evidence(self):
+        content = "# Symbols\n\nThe app.models.User class handles users"
+        chunk = _make_chunk(content=content, start_line=1, end_line=3)
+        response = {"claims": [{
+            "claim_type": "capability_element",
+            "summary": "User model handles users",
+            "evidence_start_line": 1,
+            "evidence_end_line": 3,
+            "confidence": 0.8,
+            "mentioned_apis": [],
+            "mentioned_symbols": [],
+        }]}
+        client = FakeLLMClient(response)
+        result = scan_chunk(client, _mock_config(), chunk)
+        symbols = result.claims[0].mentioned_symbols
+        assert "app.models.User" in symbols
+
+    def test_extract_api_paths_standalone(self):
+        text = "Use GET /api/v1/users and POST /items/create for operations"
+        apis = _extract_api_paths(text)
+        assert "/api/v1/users" in apis
+        assert "/items/create" in apis
+
+    def test_extract_symbols_standalone(self):
+        text = "The app.models.User class and utils.helpers.parse function"
+        symbols = _extract_symbols(text)
+        assert "app.models.User" in symbols
+        assert "utils.helpers.parse" in symbols
