@@ -310,7 +310,7 @@ def test_strip_module_prefix():
     assert _strip_module_prefix("summarize.summarize_text", "src/summarize.py") == "summarize_text"
     assert _strip_module_prefix("classifier.Cls.method", "src/classifier.py") == "Cls.method"
     assert _strip_module_prefix("top_func", "src/other.py") == "top_func"
-    assert _strip_module_prefix("mod.mod", "src/mod.py") == "mod"
+    assert _strip_module_prefix("summarize", "src/summarize.py") == ""
 
 
 # --- Test 8: No approved items returns error ---------------------------------
@@ -362,3 +362,160 @@ def func_b():
     assert "func_a" in result.diff
     assert "func_b" in result.diff
     assert "@probe" in result.diff
+
+
+# --- Test 10: Failed items produce error ------------------------------------
+
+
+def test_failed_items_produce_error(tmp_path, monkeypatch):
+    """When a symbol is not found, the result reports an error with the count."""
+    monkeypatch.setenv("PROBE_REPOSITORY_ROOTS", str(tmp_path))
+    repo, sha = _init_repo(tmp_path, {"src/summarize.py": SAMPLE_SOURCE})
+    worktree_base = str(tmp_path / "worktrees")
+    os.makedirs(worktree_base)
+
+    items = [
+        _make_item(
+            path="src/summarize.py",
+            qualified_name="summarize.nonexistent_func",
+        ),
+    ]
+
+    result = materialize_approved_set(repo, sha, items, worktree_base)
+
+    assert result.error is not None
+    assert "1 item(s) failed" in result.error
+    assert result.items_applied == 0
+    assert result.items_total == 1
+
+
+def test_partial_failure_reports_items_applied(tmp_path, monkeypatch):
+    """When some items succeed and others fail, items_applied reflects only successes."""
+    monkeypatch.setenv("PROBE_REPOSITORY_ROOTS", str(tmp_path))
+    repo, sha = _init_repo(tmp_path, {"src/summarize.py": SAMPLE_SOURCE})
+    worktree_base = str(tmp_path / "worktrees")
+    os.makedirs(worktree_base)
+
+    items = [
+        _make_item(
+            path="src/summarize.py",
+            qualified_name="summarize.summarize_text",
+        ),
+        _make_item(
+            path="src/missing.py",
+            qualified_name="missing.no_such_func",
+        ),
+    ]
+
+    result = materialize_approved_set(repo, sha, items, worktree_base)
+
+    assert result.error is not None
+    assert result.items_applied == 1
+    assert result.items_total == 2
+
+
+# --- Test 11: Module-level docstring ----------------------------------------
+
+
+def test_module_docstring_materialization(tmp_path, monkeypatch):
+    """A module-level proposal writes a probe-agent: block in the module docstring."""
+    monkeypatch.setenv("PROBE_REPOSITORY_ROOTS", str(tmp_path))
+
+    source = """\
+def helper():
+    return 1
+"""
+    repo, sha = _init_repo(tmp_path, {"src/utils.py": source})
+    worktree_base = str(tmp_path / "worktrees")
+    os.makedirs(worktree_base)
+
+    from app.patch_generator import create_worktree, cleanup_worktree
+    from app.docstring_writer import write_metadata_to_source, MetadataValues
+
+    worktree_path = None
+    try:
+        worktree_path = create_worktree(repo, sha, worktree_base)
+        full = os.path.join(worktree_path, "src/utils.py")
+        with open(full) as f:
+            src = f.read()
+
+        values = MetadataValues(role="Utility module", element_type="supporting")
+        result, err = write_metadata_to_source(src, "", values)
+        assert err is None
+        assert "probe-agent:" in result
+        assert "role: Utility module" in result
+
+        tree = ast.parse(result)
+        meta, warnings = _parse_source_metadata(tree)
+        assert meta is not None
+        assert meta.role == "Utility module"
+        assert meta.element_type == "supporting"
+    finally:
+        if worktree_path:
+            cleanup_worktree(repo, worktree_path)
+
+
+def test_module_with_existing_docstring(tmp_path, monkeypatch):
+    """Module-level probe-agent: block is added to an existing module docstring."""
+    monkeypatch.setenv("PROBE_REPOSITORY_ROOTS", str(tmp_path))
+
+    source = '\"\"\"Utility helpers.\"\"\"\n\ndef helper():\n    return 1\n'
+    repo, sha = _init_repo(tmp_path, {"src/utils.py": source})
+    worktree_base = str(tmp_path / "worktrees")
+    os.makedirs(worktree_base)
+
+    from app.docstring_writer import write_metadata_to_source, MetadataValues
+
+    values = MetadataValues(role="Utility module", element_type="supporting")
+    result, err = write_metadata_to_source(textwrap.dedent(source), "", values)
+    assert err is None
+    assert "Utility helpers." in result
+    assert "probe-agent:" in result
+
+    tree = ast.parse(result)
+    meta, warnings = _parse_source_metadata(tree)
+    assert meta is not None
+    assert meta.role == "Utility module"
+
+
+# --- Test 12: YAML-safe free text ------------------------------------------
+
+
+def test_yaml_special_chars_round_trip(tmp_path, monkeypatch):
+    """Free text with YAML-special characters round-trips through the extractor."""
+    monkeypatch.setenv("PROBE_REPOSITORY_ROOTS", str(tmp_path))
+
+    source = """\
+def tricky():
+    return 1
+"""
+    repo, sha = _init_repo(tmp_path, {"src/tricky.py": source})
+    worktree_base = str(tmp_path / "worktrees")
+    os.makedirs(worktree_base)
+
+    from app.docstring_writer import write_metadata_to_source, MetadataValues
+
+    values = MetadataValues(
+        role="Handle input: parse & validate [items]",
+        capability="data-processing",
+        system_purpose="Parse config #values with special: chars",
+        probe_value="Check {throughput} & latency",
+        element_type="core",
+        operation_kind="validation",
+    )
+    result, err = write_metadata_to_source(textwrap.dedent(source), "tricky", values)
+    assert err is None
+
+    tree = ast.parse(result)
+    func_node = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "tricky":
+            func_node = node
+            break
+
+    assert func_node is not None
+    meta, warnings = _parse_source_metadata(func_node)
+    assert meta is not None
+    assert meta.role == "Handle input: parse & validate [items]"
+    assert meta.system_purpose == "Parse config #values with special: chars"
+    assert meta.probe_value == "Check {throughput} & latency"

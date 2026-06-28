@@ -1357,6 +1357,19 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE code_entrypoints ADD COLUMN pattern_id INTEGER"
             )
+        session_cols = _columns(conn, "interview_session")
+        if "materialization_diff" not in session_cols:
+            conn.execute(
+                "ALTER TABLE interview_session ADD COLUMN materialization_diff TEXT"
+            )
+        if "materialization_ref" not in session_cols:
+            conn.execute(
+                "ALTER TABLE interview_session ADD COLUMN materialization_ref TEXT"
+            )
+        if "materialized_at" not in session_cols:
+            conn.execute(
+                "ALTER TABLE interview_session ADD COLUMN materialized_at REAL"
+            )
         _ensure_legacy_system(conn)
     _bootstrap_admin()
 

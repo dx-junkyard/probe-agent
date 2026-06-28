@@ -1057,10 +1057,18 @@ def materialize_interview_session(
         worktree_base=worktree_base,
     )
 
-    if result.error:
+    if result.items_applied == 0:
         raise HTTPException(
             status_code=500,
-            detail=f"Materialization failed: {result.error}",
+            detail=f"Materialization failed: {result.error or 'no items applied'}",
+        )
+    if result.error:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Partial materialization: {result.items_applied}/{result.items_total} "
+                f"items applied. {result.error}"
+            ),
         )
 
     with get_conn() as conn:
@@ -1077,7 +1085,7 @@ def materialize_interview_session(
         snapshot_id=snapshot_id,
         diff=result.diff,
         files_changed=result.files_changed,
-        items_materialized=len(approved_set.items),
+        items_materialized=result.items_applied,
         skipped=result.skipped,
         materialized_at=now,
     )

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from .docstring_writer import (
     MetadataValues,
@@ -46,6 +46,8 @@ class MaterializationResult:
     worktree_path: str
     diff: str
     files_changed: int
+    items_applied: int
+    items_total: int
     skipped: List[str]
     error: Optional[str] = None
     cleanup_state: str = "not_attempted"
@@ -64,6 +66,8 @@ def materialize_approved_set(
             worktree_path="",
             diff="",
             files_changed=0,
+            items_applied=0,
+            items_total=0,
             skipped=[],
             error="No approved items to materialize",
         )
@@ -77,12 +81,15 @@ def materialize_approved_set(
             worktree_path="",
             diff="",
             files_changed=0,
+            items_applied=0,
+            items_total=len(items),
             skipped=[],
             error=str(exc),
         )
 
     all_skipped: List[str] = []
     files_changed = 0
+    failed_items: Set[str] = set()
     cleanup: Optional[CleanupResult] = None
 
     try:
@@ -98,10 +105,16 @@ def materialize_approved_set(
                 os.path.islink(full_path)
                 or not normalized.startswith(worktree_real + os.sep)
             ):
-                all_skipped.append(f"{path}: path traversal or symlink detected")
+                msg = f"{path}: path traversal or symlink detected"
+                all_skipped.append(msg)
+                for fi in file_items:
+                    failed_items.add(fi.qualified_name)
                 continue
             if not os.path.isfile(full_path):
-                all_skipped.append(f"{path}: file not found in worktree")
+                msg = f"{path}: file not found in worktree"
+                all_skipped.append(msg)
+                for fi in file_items:
+                    failed_items.add(fi.qualified_name)
                 continue
 
             with open(full_path, "r", encoding="utf-8", errors="replace") as f:
@@ -125,10 +138,16 @@ def materialize_approved_set(
                 ))
 
             source, doc_skipped = apply_docstring_edits(source, doc_edits)
-            all_skipped.extend(f"{path}: {s}" for s in doc_skipped)
+            for s in doc_skipped:
+                all_skipped.append(f"{path}: {s}")
+                sym = s.split(":")[0].strip()
+                for fi in file_items:
+                    if _strip_module_prefix(fi.qualified_name, path) == sym:
+                        failed_items.add(fi.qualified_name)
 
             source, probe_skipped = instrument_file(source, probe_points)
-            all_skipped.extend(f"{path}: {s}" for s in probe_skipped)
+            for s in probe_skipped:
+                all_skipped.append(f"{path}: {s}")
 
             if source != original:
                 with open(full_path, "w", encoding="utf-8") as f:
@@ -150,10 +169,19 @@ def materialize_approved_set(
     finally:
         cleanup = cleanup_worktree(real_path, worktree_path)
 
+    items_applied = len(items) - len(failed_items)
+    if failed_items and error is None:
+        error = (
+            f"{len(failed_items)} item(s) failed to materialize: "
+            + ", ".join(sorted(failed_items))
+        )
+
     return MaterializationResult(
         worktree_path=worktree_path,
         diff=diff,
         files_changed=files_changed,
+        items_applied=items_applied,
+        items_total=len(items),
         skipped=all_skipped,
         error=error,
         cleanup_state=cleanup.state if cleanup else "not_attempted",
