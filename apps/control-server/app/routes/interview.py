@@ -1,4 +1,4 @@
-"""System-understanding interview API (Issues #67, #68, #69, #70).
+"""System-understanding interview API (Issues #67, #68, #69, #70, #71).
 
 Issue #67 — persistence + contract layer for sessions, messages, proposals.
 Issue #68 — deterministic, no-LLM context-pack builder.
@@ -6,6 +6,7 @@ Issue #69 — reasoning-model dialogue endpoint that produces structured
 assistant turns and per-symbol combined proposals (docstring metadata +
 probe plan), validated against #54 vocabulary and the safety denylist.
 Issue #70 — per-item approval gate with manual decision record.
+Issue #71 — worktree materialization of approved set into reviewable diff.
 """
 
 from __future__ import annotations
@@ -34,6 +35,8 @@ from ..models import (
     InterviewDialogueProposalOut,
     InterviewDialogueTurnOut,
     InterviewDialogueTurnRequest,
+    InterviewMaterializeOut,
+    InterviewMaterializeRequest,
     InterviewMessageCreate,
     InterviewMessageOut,
     InterviewProposalApproveRequest,
@@ -62,6 +65,9 @@ def _session_out(row) -> InterviewSessionOut:
         title=row["title"],
         focus=row["focus"],
         status=row["status"],
+        materialization_diff=row["materialization_diff"],
+        materialization_ref=row["materialization_ref"],
+        materialized_at=row["materialized_at"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -970,3 +976,108 @@ def get_interview_approved_set(
             rejected_count=rejected_count,
             pending_count=pending_count,
         )
+
+
+@router.post(
+    "/interview/sessions/{session_id}/materialize",
+    response_model=InterviewMaterializeOut,
+)
+def materialize_interview_session(
+    session_id: int,
+    payload: InterviewMaterializeRequest,
+    system_id: int = Depends(get_system_id),
+) -> InterviewMaterializeOut:
+    """Materialize approved proposals into a single reviewable diff.
+
+    Creates an isolated worktree from the pinned commit, writes approved
+    ``probe-agent:`` docstring blocks and ``@probe`` instrumentation, and
+    returns the unified diff.  The target repository's tracked branches
+    are never written to; the worktree is cleaned up after diff capture.
+    """
+    import tempfile
+    from ..docstring_writer import MetadataValues
+    from ..interview_materializer import (
+        MaterializationItem,
+        materialize_approved_set,
+    )
+
+    now = time.time()
+    with get_conn() as conn:
+        session = _get_session_or_404(conn, session_id, system_id)
+        snapshot_id = session["snapshot_id"]
+
+        snapshot = conn.execute(
+            "SELECT * FROM repository_snapshots WHERE id = ? AND system_id = ?",
+            (snapshot_id, system_id),
+        ).fetchone()
+        if snapshot is None:
+            raise HTTPException(status_code=404, detail="Snapshot not found")
+
+        repo_path = snapshot["repo_path"]
+        commit_sha = snapshot["commit_sha"]
+
+    approved_set = get_interview_approved_set(session_id, system_id)
+    if not approved_set.items:
+        raise HTTPException(
+            status_code=422,
+            detail="No approved items to materialize",
+        )
+
+    mat_items: List[MaterializationItem] = []
+    for item in approved_set.items:
+        md = item.metadata
+        pp = item.probe_plan
+        mat_items.append(MaterializationItem(
+            path=item.path,
+            qualified_name=item.qualified_name,
+            metadata=MetadataValues(
+                role=md.role,
+                capability=md.capability,
+                system_purpose=md.system_purpose,
+                probe_value=md.probe_value,
+                element_type=md.element_type,
+                operation_kind=md.operation_kind,
+                consumers=md.consumers if md.consumers else None,
+                state_effects=md.state_effects if md.state_effects else None,
+            ),
+            component_id=item.qualified_name.replace(".", "_"),
+            recommended_mode=pp.recommended_mode,
+            line_start=0,
+            line_end=0,
+        ))
+
+    worktree_base = payload.worktree_base or tempfile.mkdtemp(
+        prefix="probe-interview-"
+    )
+
+    result = materialize_approved_set(
+        repo_path=repo_path,
+        commit_sha=commit_sha,
+        items=mat_items,
+        worktree_base=worktree_base,
+    )
+
+    if result.error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Materialization failed: {result.error}",
+        )
+
+    with get_conn() as conn:
+        conn.execute(
+            """UPDATE interview_session
+               SET materialization_diff = ?, materialized_at = ?, updated_at = ?
+               WHERE id = ? AND system_id = ?""",
+            (result.diff, now, now, session_id, system_id),
+        )
+
+    return InterviewMaterializeOut(
+        session_id=session_id,
+        system_id=system_id,
+        snapshot_id=snapshot_id,
+        diff=result.diff,
+        files_changed=result.files_changed,
+        items_materialized=len(approved_set.items),
+        skipped=result.skipped,
+        materialized_at=now,
+    )

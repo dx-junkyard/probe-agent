@@ -953,14 +953,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_proposal_drafts_proposal
 -- metadata lives in the shared intelligence_runs store and is referenced from
 -- messages/proposals via intelligence_run_id rather than duplicated here.
 CREATE TABLE IF NOT EXISTS interview_session (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    system_id     INTEGER NOT NULL,
-    snapshot_id   INTEGER NOT NULL,
-    title         TEXT NOT NULL DEFAULT '',
-    focus         TEXT NOT NULL DEFAULT '',
-    status        TEXT NOT NULL DEFAULT 'open',
-    created_at    REAL NOT NULL,
-    updated_at    REAL NOT NULL,
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id            INTEGER NOT NULL,
+    snapshot_id          INTEGER NOT NULL,
+    title                TEXT NOT NULL DEFAULT '',
+    focus                TEXT NOT NULL DEFAULT '',
+    status               TEXT NOT NULL DEFAULT 'open',
+    materialization_diff TEXT,
+    materialization_ref  TEXT,
+    materialized_at      REAL,
+    created_at           REAL NOT NULL,
+    updated_at           REAL NOT NULL,
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
     FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE
 );

@@ -892,6 +892,24 @@
         "pending_count": { "type": "integer", "minimum": 0 }
       },
       "additionalProperties": false
+    },
+
+    "InterviewMaterializeResult": {
+      "type": "object",
+      "description": "Result of materializing approved proposals into a reviewable diff (Issue #71).",
+      "required": ["session_id", "system_id", "snapshot_id", "diff", "files_changed", "items_materialized", "materialized_at"],
+      "properties": {
+        "session_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "snapshot_id": { "type": "integer" },
+        "diff": { "type": "string" },
+        "files_changed": { "type": "integer", "minimum": 0 },
+        "items_materialized": { "type": "integer", "minimum": 0 },
+        "skipped": { "type": "array", "items": { "type": "string" } },
+        "materialized_at": { "type": "number" },
+        "error": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
     }
   },
   "type": "object"

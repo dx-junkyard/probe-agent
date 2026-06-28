@@ -1711,6 +1711,9 @@ class InterviewSessionOut(BaseModel):
     title: str
     focus: str
     status: InterviewSessionStatus
+    materialization_diff: Optional[str] = None
+    materialization_ref: Optional[str] = None
+    materialized_at: Optional[float] = None
     created_at: float
     updated_at: float
 
@@ -2019,3 +2022,36 @@ class InterviewApprovedSetOut(BaseModel):
     approved_count: int = 0
     rejected_count: int = 0
     pending_count: int = 0
+
+
+# --- Interview Materialization (Issue #71) ------------------------------------
+#
+# Materializes approved docstring metadata + probe instrumentation into a
+# single reviewable diff from an isolated worktree. The target repo's
+# tracked branches are never written to.
+
+
+class InterviewMaterializeRequest(BaseModel):
+    """Request to materialize the approved set into a reviewable diff."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    worktree_base: Optional[str] = Field(
+        default=None,
+        description="Base directory for the temporary worktree. "
+        "Defaults to system temp if not provided.",
+    )
+
+
+class InterviewMaterializeOut(BaseModel):
+    """Result of materializing approved proposals into a diff."""
+
+    session_id: int
+    system_id: int
+    snapshot_id: int
+    diff: str
+    files_changed: int
+    items_materialized: int
+    skipped: List[str] = Field(default_factory=list)
+    materialized_at: float
+    error: Optional[str] = None
