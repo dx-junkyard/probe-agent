@@ -1,16 +1,10 @@
-"""System-understanding interview persistence and CRUD API (Issues #67, #68).
+"""System-understanding interview API (Issues #67, #68, #69).
 
-Issue #67 — the #35 analogue for the #66 conversational metadata/probe
-authoring flow: a pure persistence + contract layer. These endpoints only
-store interview sessions, their ordered conversation turns, and the combined
-per-symbol proposals.
-
-Issue #68 — the #36 analogue: a deterministic, no-LLM context-pack builder
-that assembles symbols, entrypoints, and existing metadata from a pinned
-snapshot and flags which items are classified vs. unclassified, within an
-explicit LLM context budget.
-
-None of these endpoints call an LLM or write to a worktree.
+Issue #67 — persistence + contract layer for sessions, messages, proposals.
+Issue #68 — deterministic, no-LLM context-pack builder.
+Issue #69 — reasoning-model dialogue endpoint that produces structured
+assistant turns and per-symbol combined proposals (docstring metadata +
+probe plan), validated against #54 vocabulary and the safety denylist.
 """
 
 from __future__ import annotations
@@ -26,8 +20,17 @@ from fastapi import Query
 from ..auth import get_system_id
 from ..db import get_conn
 from ..interview_context import build_interview_context
+from ..interview_agent import (
+    PROMPT_VERSION as INTERVIEW_PROMPT_VERSION,
+    SCHEMA_VERSION as INTERVIEW_SCHEMA_VERSION,
+    generate_interview_turn,
+)
+from ..llm import LLMConfig, create_llm_client, is_reasoning_model
 from ..models import (
     InterviewContextPack,
+    InterviewDialogueProposalOut,
+    InterviewDialogueTurnOut,
+    InterviewDialogueTurnRequest,
     InterviewMessageCreate,
     InterviewMessageOut,
     InterviewProposalMetadataBlock,
@@ -410,3 +413,213 @@ def create_interview_proposals(
             new_ids,
         ).fetchall()
         return [_proposal_out(conn, r) for r in rows]
+
+
+# --- Dialogue Turn (Issue #69) -----------------------------------------------
+
+
+def _get_intelligence_llm_config() -> LLMConfig:
+    """Build LLMConfig preferring INTELLIGENCE_LLM_* over generic LLM_*."""
+    import os
+
+    provider = os.getenv("INTELLIGENCE_LLM_PROVIDER") or os.getenv("LLM_PROVIDER", "openai")
+    provider = provider.strip().lower()
+    model = os.getenv("INTELLIGENCE_LLM_MODEL") or os.getenv("LLM_MODEL")
+    if not model:
+        defaults = {
+            "openai": "gpt-4o-mini",
+            "anthropic": "claude-3-5-haiku-latest",
+            "gemini": "gemini-1.5-flash",
+            "mock": "mock",
+        }
+        model = defaults.get(provider, "gpt-4o-mini")
+    api_key = (
+        os.getenv("LLM_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+        or os.getenv("ANTHROPIC_API_KEY")
+        or os.getenv("GEMINI_API_KEY")
+    )
+    try:
+        timeout = float(os.getenv("LLM_TIMEOUT", "120"))
+    except ValueError:
+        timeout = 120.0
+    return LLMConfig(
+        provider=provider,
+        api_key=api_key,
+        model=model,
+        base_url=os.getenv("LLM_BASE_URL") or None,
+        timeout=timeout,
+    )
+
+
+@router.post(
+    "/interview/sessions/{session_id}/dialogue-turn",
+    response_model=InterviewDialogueTurnOut,
+)
+def interview_dialogue_turn(
+    session_id: int,
+    payload: InterviewDialogueTurnRequest,
+    system_id: int = Depends(get_system_id),
+) -> InterviewDialogueTurnOut:
+    """Generate a reasoning-model dialogue turn for the interview (Issue #69).
+
+    1. Builds a deterministic context pack from the session's pinned snapshot.
+    2. Assembles conversation history from stored messages.
+    3. Calls the reasoning model for a structured response.
+    4. Validates proposals against #54 vocabulary and the safety denylist.
+    5. On success: persists user message, assistant message, intelligence run,
+       and any proposals. On failure: persists the failure and returns error.
+    """
+    now = time.time()
+    config = _get_intelligence_llm_config()
+    client = create_llm_client(config)
+
+    with get_conn() as conn:
+        session = _get_session_or_404(conn, session_id, system_id)
+        snapshot_id = session["snapshot_id"]
+
+        context_pack = build_interview_context(
+            conn, system_id, snapshot_id, budget_chars=payload.budget,
+        )
+
+        message_rows = conn.execute(
+            "SELECT role, content FROM interview_message WHERE session_id = ? ORDER BY id",
+            (session_id,),
+        ).fetchall()
+        history = [{"role": r["role"], "content": r["content"]} for r in message_rows]
+
+        turn = generate_interview_turn(
+            client,
+            config,
+            context_pack=context_pack,
+            history=history,
+            user_message=payload.user_message,
+        )
+
+        conn.execute("BEGIN")
+        try:
+            # Store user message.
+            conn.execute(
+                """INSERT INTO interview_message
+                    (session_id, system_id, role, content, intelligence_run_id, created_at)
+                VALUES (?, ?, 'user', ?, NULL, ?)""",
+                (session_id, system_id, payload.user_message, now),
+            )
+
+            # Store intelligence run (success or failure).
+            run_status = "failed" if turn.error else "completed"
+            run_cur = conn.execute(
+                """INSERT INTO intelligence_runs
+                    (system_id, snapshot_id, run_type, provider, model,
+                     prompt_version, schema_version, decision_method, status,
+                     error_details, is_mock, started_at, completed_at)
+                VALUES (?, ?, 'interview_dialogue', ?, ?, ?, ?, 'reasoning_llm',
+                        ?, ?, ?, ?, ?)""",
+                (
+                    system_id,
+                    snapshot_id,
+                    turn.provider,
+                    turn.model,
+                    turn.prompt_version,
+                    turn.schema_version,
+                    run_status,
+                    turn.error,
+                    1 if turn.is_mock else 0,
+                    now,
+                    now,
+                ),
+            )
+            run_id = run_cur.lastrowid
+
+            run_row = conn.execute(
+                "SELECT * FROM intelligence_runs WHERE id = ?", (run_id,),
+            ).fetchone()
+            intelligence_run_out = _intelligence_run_out(run_row)
+
+            if turn.error:
+                conn.execute(
+                    "UPDATE interview_session SET updated_at = ? WHERE id = ? AND system_id = ?",
+                    (now, session_id, system_id),
+                )
+                conn.execute("COMMIT")
+                return InterviewDialogueTurnOut(
+                    error=turn.error,
+                    intelligence_run=intelligence_run_out,
+                )
+
+            # Store assistant message.
+            asst_cur = conn.execute(
+                """INSERT INTO interview_message
+                    (session_id, system_id, role, content, intelligence_run_id, created_at)
+                VALUES (?, ?, 'assistant', ?, ?, ?)""",
+                (session_id, system_id, turn.assistant_message, run_id, now),
+            )
+            asst_message_id = asst_cur.lastrowid
+
+            # Persist proposals if any.
+            proposal_outs: List[InterviewDialogueProposalOut] = []
+            for p in turn.proposals:
+                conn.execute(
+                    """INSERT INTO interview_proposal
+                        (session_id, system_id, snapshot_id, message_id,
+                         intelligence_run_id, symbol_id, path, qualified_name,
+                         md_role, md_capability, md_system_purpose, md_probe_value,
+                         md_element_type, md_operation_kind, md_consumers,
+                         md_state_effects, feature_id, objective, probe_reason,
+                         recommended_mode, side_effect_risk, replayability,
+                         decision_method, approval_state, is_mock,
+                         created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, 'reasoning_llm', 'proposed', ?, ?, ?)""",
+                    (
+                        session_id,
+                        system_id,
+                        snapshot_id,
+                        asst_message_id,
+                        run_id,
+                        p.symbol_id,
+                        p.path,
+                        p.qualified_name,
+                        p.metadata.role,
+                        p.metadata.capability,
+                        p.metadata.system_purpose,
+                        p.metadata.probe_value,
+                        p.metadata.element_type,
+                        p.metadata.operation_kind,
+                        json.dumps(p.metadata.consumers, ensure_ascii=False),
+                        json.dumps(p.metadata.state_effects, ensure_ascii=False),
+                        p.probe_plan.feature_id,
+                        p.probe_plan.objective,
+                        p.probe_plan.reason,
+                        p.probe_plan.recommended_mode,
+                        p.probe_plan.side_effect_risk,
+                        p.probe_plan.replayability,
+                        1 if turn.is_mock else 0,
+                        now,
+                        now,
+                    ),
+                )
+                proposal_outs.append(InterviewDialogueProposalOut(
+                    path=p.path,
+                    qualified_name=p.qualified_name,
+                    symbol_id=p.symbol_id,
+                    metadata=p.metadata,
+                    probe_plan=p.probe_plan,
+                    denylist_hit=p.denylist_hit,
+                ))
+
+            conn.execute(
+                "UPDATE interview_session SET updated_at = ? WHERE id = ? AND system_id = ?",
+                (now, session_id, system_id),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+        return InterviewDialogueTurnOut(
+            assistant_message=turn.assistant_message,
+            proposals=proposal_outs,
+            next_questions=turn.next_questions,
+            intelligence_run=intelligence_run_out,
+        )

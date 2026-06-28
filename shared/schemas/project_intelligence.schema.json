@@ -803,6 +803,42 @@
         "omission_notes": { "type": "array", "items": { "type": "string" } }
       },
       "additionalProperties": false
+    },
+    "InterviewDialogueTurnRequest": {
+      "type": "object",
+      "description": "Request body for a single interview dialogue turn (Issue #69).",
+      "required": ["user_message"],
+      "properties": {
+        "user_message": { "type": "string", "minLength": 1, "maxLength": 20000 },
+        "budget": { "type": ["integer", "null"], "minimum": 1000, "maximum": 500000 }
+      },
+      "additionalProperties": false
+    },
+    "InterviewDialogueProposalOut": {
+      "type": "object",
+      "description": "A single combined proposal from a dialogue turn (Issue #69), before persistence.",
+      "required": ["path", "qualified_name", "metadata", "probe_plan"],
+      "properties": {
+        "path": { "type": "string" },
+        "qualified_name": { "type": "string" },
+        "symbol_id": { "type": ["integer", "null"] },
+        "metadata": { "$ref": "#/definitions/InterviewProposalMetadataBlock" },
+        "probe_plan": { "$ref": "#/definitions/InterviewProposalProbePlan" },
+        "denylist_hit": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "InterviewDialogueTurnOut": {
+      "type": "object",
+      "description": "Response from a single interview dialogue turn (Issue #69). If error is set, the turn failed closed and no proposals were stored.",
+      "properties": {
+        "assistant_message": { "type": "string" },
+        "proposals": { "type": "array", "items": { "$ref": "#/definitions/InterviewDialogueProposalOut" } },
+        "next_questions": { "type": "array", "items": { "type": "string" } },
+        "intelligence_run": { "oneOf": [{ "$ref": "#/definitions/IntelligenceRun" }, { "type": "null" }] },
+        "error": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
     }
   },
   "type": "object"

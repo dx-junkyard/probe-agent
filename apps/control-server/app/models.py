@@ -1892,3 +1892,46 @@ class InterviewContextPack(BaseModel):
     symbols: List[InterviewSymbolItem] = Field(default_factory=list)
     entrypoints: List[InterviewEntrypointItem] = Field(default_factory=list)
     omission_notes: List[str] = Field(default_factory=list)
+
+
+# --- Interview Dialogue Turn (Issue #69) -------------------------------------
+#
+# Request/response models for the reasoning-model dialogue endpoint. The
+# endpoint generates a structured assistant turn grounded in #68's context
+# pack, optionally producing per-symbol combined proposals validated against
+# #54 vocabulary and the safety denylist from probe_planner.py.
+
+
+class InterviewDialogueTurnRequest(BaseModel):
+    """Request body for a single interview dialogue turn."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_message: str = Field(..., min_length=1, max_length=20_000)
+    budget: Optional[int] = Field(default=None, ge=1000, le=500_000)
+
+
+class InterviewDialogueProposalOut(BaseModel):
+    """A single combined proposal from a dialogue turn, before persistence."""
+
+    path: str
+    qualified_name: str
+    symbol_id: Optional[int] = None
+    metadata: InterviewProposalMetadataBlock
+    probe_plan: InterviewProposalProbePlan
+    denylist_hit: Optional[str] = None
+
+
+class InterviewDialogueTurnOut(BaseModel):
+    """Response from a single interview dialogue turn.
+
+    Contains the structured assistant message, any generated proposals, and
+    the reasoning-run audit metadata. If error is set, the turn failed closed
+    and no proposals should be stored.
+    """
+
+    assistant_message: str = ""
+    proposals: List[InterviewDialogueProposalOut] = Field(default_factory=list)
+    next_questions: List[str] = Field(default_factory=list)
+    intelligence_run: Optional[IntelligenceRunOut] = None
+    error: Optional[str] = None
