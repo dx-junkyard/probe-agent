@@ -271,3 +271,99 @@ class TestGraphPersistence:
         assert "claim_count" in d
         assert "confidence_summary" in d
         json.dumps(d)
+
+
+class TestSnapshotIdPersistence:
+    """Finding 1: graph snapshot must be linked to its repository snapshot."""
+
+    def test_save_with_snapshot_id(self):
+        conn = _make_db()
+        now = time.time()
+        conn.execute(
+            "INSERT INTO repository_snapshots (id, system_id, repo_path, commit_sha, status, created_at) "
+            "VALUES (42, 1, '/repo', 'abc', 'ready', ?)",
+            (now,),
+        )
+        graph = build_understanding_graph([_scan_result([_claim()])])
+        gid = save_graph_snapshot(conn, 1, graph, snapshot_id=42)
+        loaded = load_graph_snapshot(conn, gid)
+        assert loaded["snapshot_id"] == 42
+
+    def test_save_without_snapshot_id(self):
+        conn = _make_db()
+        graph = build_understanding_graph([_scan_result([_claim()])])
+        gid = save_graph_snapshot(conn, 1, graph)
+        loaded = load_graph_snapshot(conn, gid)
+        assert loaded["snapshot_id"] is None
+
+
+class TestInputOrderStability:
+    """Finding 2: graph must be deterministic regardless of claim input order."""
+
+    def test_swapped_scan_results_same_graph(self):
+        claim_a = _claim(claim_type="system_purpose", summary="Purpose A", path="a.md")
+        claim_b = _claim(claim_type="system_purpose", summary="Purpose B", path="b.md")
+        result_a = _scan_result([claim_a], chunk_id="ca", content_hash="ha")
+        result_b = _scan_result([claim_b], chunk_id="cb", content_hash="hb")
+
+        graph_1 = build_understanding_graph([result_a, result_b])
+        graph_2 = build_understanding_graph([result_b, result_a])
+
+        assert graph_1.source_hash == graph_2.source_hash
+        assert sorted(graph_1.nodes.keys()) == sorted(graph_2.nodes.keys())
+        assert graph_1.conflicts == graph_2.conflicts
+
+    def test_swapped_claims_within_result_same_graph(self):
+        claim_a = _claim(claim_type="core_capability", summary="Cap A")
+        claim_b = _claim(claim_type="core_capability", summary="Cap B")
+
+        graph_1 = build_understanding_graph([_scan_result([claim_a, claim_b])])
+        graph_2 = build_understanding_graph([_scan_result([claim_b, claim_a])])
+
+        assert graph_1.source_hash == graph_2.source_hash
+        assert sorted(graph_1.nodes.keys()) == sorted(graph_2.nodes.keys())
+
+    def test_conflict_ids_stable_across_order(self):
+        claim_a = _claim(claim_type="system_purpose", summary="Purpose X", path="x.md")
+        claim_b = _claim(claim_type="system_purpose", summary="Purpose Y", path="y.md")
+
+        graph_1 = build_understanding_graph([
+            _scan_result([claim_a], chunk_id="c1", content_hash="h1"),
+            _scan_result([claim_b], chunk_id="c2", content_hash="h2"),
+        ])
+        graph_2 = build_understanding_graph([
+            _scan_result([claim_b], chunk_id="c2", content_hash="h2"),
+            _scan_result([claim_a], chunk_id="c1", content_hash="h1"),
+        ])
+
+        conflict_nodes_1 = {nid for nid, n in graph_1.nodes.items() if n.node_type == "conflict"}
+        conflict_nodes_2 = {nid for nid, n in graph_2.nodes.items() if n.node_type == "conflict"}
+        assert conflict_nodes_1 == conflict_nodes_2
+
+
+class TestSourceHashContent:
+    """Finding 3: source_hash must reflect claim content, not just chunk IDs."""
+
+    def test_different_claims_same_chunk_different_hash(self):
+        claim_a = _claim(summary="System does A")
+        claim_b = _claim(summary="System does B")
+
+        graph_a = build_understanding_graph([_scan_result([claim_a])])
+        graph_b = build_understanding_graph([_scan_result([claim_b])])
+
+        assert graph_a.source_hash != graph_b.source_hash
+
+    def test_different_confidence_different_hash(self):
+        claim_high = _claim(summary="System does X", confidence=0.9)
+        claim_low = _claim(summary="System does X", confidence=0.3)
+
+        graph_h = build_understanding_graph([_scan_result([claim_high])])
+        graph_l = build_understanding_graph([_scan_result([claim_low])])
+
+        assert graph_h.source_hash != graph_l.source_hash
+
+    def test_same_claims_same_hash(self):
+        claims = [_claim(summary="System does X")]
+        graph_1 = build_understanding_graph([_scan_result(claims)])
+        graph_2 = build_understanding_graph([_scan_result(claims)])
+        assert graph_1.source_hash == graph_2.source_hash

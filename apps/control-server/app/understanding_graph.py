@@ -111,11 +111,12 @@ def _detect_conflicts(nodes: Dict[str, GraphNode]) -> List[Tuple[str, str]]:
     for nid, node in nodes.items():
         by_type[node.node_type].append(nid)
 
-    purpose_nodes = by_type.get("system_purpose", [])
+    purpose_nodes = sorted(by_type.get("system_purpose", []))
     if len(purpose_nodes) > 1:
         for i in range(len(purpose_nodes)):
             for j in range(i + 1, len(purpose_nodes)):
-                conflicts.append((purpose_nodes[i], purpose_nodes[j]))
+                pair = tuple(sorted([purpose_nodes[i], purpose_nodes[j]]))
+                conflicts.append(pair)
 
     return conflicts
 
@@ -155,8 +156,13 @@ def build_understanding_graph(
     total_claims = 0
     valid_claims = 0
 
-    for result in scan_results:
-        for claim in result.claims:
+    sorted_results = sorted(scan_results, key=lambda r: r.chunk_id)
+    for result in sorted_results:
+        sorted_claims = sorted(
+            result.claims,
+            key=lambda c: (c.claim_type, c.summary, c.evidence.path, c.evidence.start_line),
+        )
+        for claim in sorted_claims:
             total_claims += 1
             if claim.is_valid:
                 valid_claims += 1
@@ -194,8 +200,8 @@ def build_understanding_graph(
             )
             node.evidence = _merge_evidence(node.evidence, [new_evidence])
             node.confidence = _recalculate_confidence(node.evidence)
-            node.mentioned_apis = list(set(node.mentioned_apis + claim.mentioned_apis))
-            node.mentioned_symbols = list(set(node.mentioned_symbols + claim.mentioned_symbols))
+            node.mentioned_apis = sorted(set(node.mentioned_apis + claim.mentioned_apis))
+            node.mentioned_symbols = sorted(set(node.mentioned_symbols + claim.mentioned_symbols))
         else:
             nid = _node_id(node_type, name)
             evidence = EvidenceRef(
@@ -252,10 +258,24 @@ def build_understanding_graph(
         confidence_summary[nt] = sum(confs) / len(confs) if confs else 0.0
 
     if source_hash is None:
-        hash_input = json.dumps(
-            sorted([(r.chunk_id, r.chunk_content_hash) for r in scan_results]),
-            sort_keys=True,
-        )
+        hash_parts = []
+        for result in sorted_results:
+            claims_data = [
+                (c.claim_type, c.summary, c.evidence.path, c.evidence.start_line,
+                 c.evidence.end_line, c.confidence)
+                for c in sorted(
+                    result.claims,
+                    key=lambda c: (c.claim_type, c.summary, c.evidence.path, c.evidence.start_line),
+                )
+            ]
+            hash_parts.append((
+                result.chunk_id,
+                result.chunk_content_hash,
+                result.prompt_version,
+                result.schema_version,
+                claims_data,
+            ))
+        hash_input = json.dumps(hash_parts, sort_keys=True, default=str)
         source_hash = hashlib.sha256(hash_input.encode()).hexdigest()[:16]
 
     return UnderstandingGraph(
@@ -370,18 +390,19 @@ def save_graph_snapshot(
     conn: sqlite3.Connection,
     system_id: int,
     graph: UnderstandingGraph,
-    source_version: str = "",
+    snapshot_id: Optional[int] = None,
 ) -> int:
     """Persist a graph snapshot to the database."""
     now = time.time()
     graph_json = json.dumps(graph_to_dict(graph), ensure_ascii=False)
     cur = conn.execute(
         """INSERT INTO understanding_graph_snapshots
-            (system_id, graph_json, source_hash, claim_count,
+            (system_id, snapshot_id, graph_json, source_hash, claim_count,
              confidence_summary, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)""",
+        VALUES (?, ?, ?, ?, ?, ?, ?)""",
         (
             system_id,
+            snapshot_id,
             graph_json,
             graph.source_hash,
             graph.claim_count,
@@ -406,6 +427,7 @@ def load_graph_snapshot(
     return {
         "id": row["id"],
         "system_id": row["system_id"],
+        "snapshot_id": row["snapshot_id"] if "snapshot_id" in row.keys() else None,
         "graph": json.loads(row["graph_json"]),
         "source_hash": row["source_hash"],
         "claim_count": row["claim_count"],

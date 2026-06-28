@@ -1089,12 +1089,14 @@ CREATE INDEX IF NOT EXISTS idx_interview_proposal_decision_session
 CREATE TABLE IF NOT EXISTS understanding_graph_snapshots (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     system_id           INTEGER NOT NULL,
+    snapshot_id         INTEGER,
     graph_json          TEXT NOT NULL,
     source_hash         TEXT NOT NULL DEFAULT '',
     claim_count         INTEGER NOT NULL DEFAULT 0,
     confidence_summary  TEXT NOT NULL DEFAULT '{}',
     created_at          REAL NOT NULL,
-    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_understanding_graph_system
@@ -1412,6 +1414,11 @@ def init_db() -> None:
         if "materialized_at" not in session_cols:
             conn.execute(
                 "ALTER TABLE interview_session ADD COLUMN materialized_at REAL"
+            )
+        graph_cols = _columns(conn, "understanding_graph_snapshots")
+        if graph_cols and "snapshot_id" not in graph_cols:
+            conn.execute(
+                "ALTER TABLE understanding_graph_snapshots ADD COLUMN snapshot_id INTEGER"
             )
         _ensure_legacy_system(conn)
     _bootstrap_admin()

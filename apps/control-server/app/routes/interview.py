@@ -1204,7 +1204,7 @@ def update_interview_understanding(
         scan_results = scan_all_chunks(client, config, doc_index.chunks)
 
         graph = build_understanding_graph(scan_results)
-        save_graph_snapshot(conn, system_id, graph)
+        save_graph_snapshot(conn, system_id, graph, snapshot_id=snapshot_id)
 
         reconciliation = reconcile(conn, system_id, snapshot_id, graph)
 
