@@ -113,6 +113,16 @@ def _valid_audit():
     }
 
 
+def _advance_to_proposal_generation(client, session_id, headers):
+    """Advance a session through all stages to proposal_generation."""
+    r = client.post(
+        f"/interview/sessions/{session_id}/advance-stage",
+        json={"stage": "proposal_generation"},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+
+
 def _create_session_with_proposals(client, headers, snapshot_id, proposals=None):
     """Create a session and populate it with proposals."""
     r = client.post(
@@ -123,6 +133,8 @@ def _create_session_with_proposals(client, headers, snapshot_id, proposals=None)
     assert r.status_code == 201, r.text
     session = r.json()
     sid = session["id"]
+
+    _advance_to_proposal_generation(client, sid, headers)
 
     if proposals is None:
         proposals = [
