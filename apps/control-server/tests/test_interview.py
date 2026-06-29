@@ -481,3 +481,18 @@ def test_invalid_stage_rejected(admin_client):
         headers=headers,
     )
     assert r.status_code == 422
+
+
+def test_session_has_last_error_field(admin_client):
+    """P1: last_error field is present and initially null."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    r = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "error test"},
+        headers=headers,
+    )
+    assert r.status_code == 201
+    data = r.json()
+    assert "last_error" in data
+    assert data["last_error"] is None

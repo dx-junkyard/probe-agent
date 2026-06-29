@@ -419,7 +419,13 @@ export default function InterviewPage() {
         focus: "Author reviewed probe-agent metadata and probe proposals",
       });
       setSearchParams({ session: String(created.id) });
-      toast.success("Interview started");
+      toast.success("Interview started — building initial understanding…");
+      try {
+        await updateUnderstanding.mutateAsync();
+        toast.success("Initial understanding ready");
+      } catch (e) {
+        toast.error(`Understanding generation failed: ${String(e)}`);
+      }
     } catch (e) {
       toast.error(String(e));
     }
@@ -428,8 +434,12 @@ export default function InterviewPage() {
   const initUnderstanding = async () => {
     if (!selectedSessionId) return;
     try {
-      await updateUnderstanding.mutateAsync();
-      toast.success("Understanding updated");
+      const updated = await updateUnderstanding.mutateAsync();
+      if (updated.last_error) {
+        toast.error(`Understanding review failed: ${updated.last_error}`);
+      } else {
+        toast.success("Understanding updated");
+      }
     } catch (e) {
       toast.error(String(e));
     }
@@ -700,13 +710,22 @@ export default function InterviewPage() {
                   </div>
                 </CardHeader>
                 <CardContent>
+                  {session.last_error && (
+                    <div className="rounded-md border border-destructive bg-destructive/10 p-3 mb-3 text-sm text-destructive flex items-start gap-2">
+                      <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
+                      <div>
+                        <div className="font-medium">Understanding generation failed</div>
+                        <div className="text-xs mt-1">{session.last_error}</div>
+                      </div>
+                    </div>
+                  )}
                   {session.current_understanding ? (
                     <UnderstandingPanel understanding={session.current_understanding} />
-                  ) : (
+                  ) : !session.last_error ? (
                     <div className="text-sm text-muted-foreground text-center py-6" data-testid="no-understanding">
                       Click &ldquo;Build Understanding&rdquo; to analyze documentation and code.
                     </div>
-                  )}
+                  ) : null}
                 </CardContent>
               </Card>
 

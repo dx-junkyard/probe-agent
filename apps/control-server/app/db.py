@@ -964,6 +964,7 @@ CREATE TABLE IF NOT EXISTS interview_session (
     gap_analysis         TEXT,
     open_questions       TEXT,
     user_intent          TEXT,
+    last_error           TEXT,
     materialization_diff TEXT,
     materialization_ref  TEXT,
     materialized_at      REAL,
@@ -1414,6 +1415,11 @@ def init_db() -> None:
         if "materialized_at" not in session_cols:
             conn.execute(
                 "ALTER TABLE interview_session ADD COLUMN materialized_at REAL"
+            )
+        session_cols = _columns(conn, "interview_session")
+        if "last_error" not in session_cols:
+            conn.execute(
+                "ALTER TABLE interview_session ADD COLUMN last_error TEXT"
             )
         graph_cols = _columns(conn, "understanding_graph_snapshots")
         if graph_cols and "snapshot_id" not in graph_cols:

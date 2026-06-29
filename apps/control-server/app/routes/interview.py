@@ -90,6 +90,7 @@ def _session_out(row) -> InterviewSessionOut:
         gap_analysis=_json.loads(row["gap_analysis"]) if row["gap_analysis"] else None,
         open_questions=_json.loads(row["open_questions"]) if row["open_questions"] else None,
         user_intent=row["user_intent"],
+        last_error=row["last_error"] if "last_error" in row.keys() else None,
         materialization_diff=row["materialization_diff"],
         materialization_ref=row["materialization_ref"],
         materialized_at=row["materialized_at"],
@@ -651,9 +652,31 @@ def interview_dialogue_turn(
                     denylist_hit=p.denylist_hit,
                 ))
 
+            stage_updates = ["updated_at = ?"]
+            stage_params: list = [now]
+
+            if payload.user_message.strip():
+                existing_intent = session["user_intent"] or ""
+                new_intent = (existing_intent + "\n" + payload.user_message.strip()).strip() if existing_intent else payload.user_message.strip()
+                if len(new_intent) > 2000:
+                    new_intent = new_intent[-2000:]
+                stage_updates.append("user_intent = ?")
+                stage_params.append(new_intent)
+
+            if current_stage != "proposal_generation":
+                try:
+                    current_idx = STAGE_ORDER.index(current_stage)
+                    if current_idx < len(STAGE_ORDER) - 1:
+                        next_stage = STAGE_ORDER[current_idx + 1]
+                        stage_updates.append("stage = ?")
+                        stage_params.append(next_stage)
+                except ValueError:
+                    pass
+
+            stage_params.extend([session_id, system_id])
             conn.execute(
-                "UPDATE interview_session SET updated_at = ? WHERE id = ? AND system_id = ?",
-                (now, session_id, system_id),
+                f"UPDATE interview_session SET {', '.join(stage_updates)} WHERE id = ? AND system_id = ?",
+                stage_params,
             )
             conn.execute("COMMIT")
         except Exception:
@@ -1217,9 +1240,15 @@ def update_interview_understanding(
         if review.error:
             conn.execute(
                 """UPDATE interview_session
-                   SET updated_at = ?
+                   SET last_error = ?, updated_at = ?
                    WHERE id = ? AND system_id = ?""",
-                (now, session_id, system_id),
+                (review.error, now, session_id, system_id),
+            )
+            conn.execute(
+                """INSERT INTO interview_message
+                    (session_id, system_id, role, content, created_at)
+                VALUES (?, ?, 'assistant', ?, ?)""",
+                (session_id, system_id, f"Understanding review failed: {review.error}", now),
             )
             row = _get_session_or_404(conn, session_id, system_id)
             return _session_out(row)
@@ -1236,7 +1265,7 @@ def update_interview_understanding(
         conn.execute(
             """UPDATE interview_session
                SET current_understanding = ?, gap_analysis = ?, open_questions = ?,
-                   stage = ?, updated_at = ?
+                   stage = ?, last_error = NULL, updated_at = ?
                WHERE id = ? AND system_id = ?""",
             (understanding_json, gap_json, questions_json, new_stage, now, session_id, system_id),
         )

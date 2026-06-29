@@ -1726,6 +1726,7 @@ class InterviewSessionOut(BaseModel):
     gap_analysis: Optional[List[Dict[str, Any]]] = None
     open_questions: Optional[List[Dict[str, Any]]] = None
     user_intent: Optional[str] = None
+    last_error: Optional[str] = None
     materialization_diff: Optional[str] = None
     materialization_ref: Optional[str] = None
     materialized_at: Optional[float] = None

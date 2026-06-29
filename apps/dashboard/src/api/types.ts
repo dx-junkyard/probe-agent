@@ -189,6 +189,7 @@ export interface InterviewSessionOut {
   gap_analysis: GapItem[] | null;
   open_questions: OpenQuestion[] | null;
   user_intent: string | null;
+  last_error: string | null;
   materialization_diff: string | null;
   materialization_ref: string | null;
   materialized_at: number | null;
