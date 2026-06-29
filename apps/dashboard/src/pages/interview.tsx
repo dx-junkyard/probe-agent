@@ -2,10 +2,12 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import {
-  CheckCircle, FileCode, GitPullRequest, MessageSquareText, Pencil,
-  Play, Send, Sparkles, XCircle,
+  AlertCircle, CheckCircle, ChevronRight, FileCode, GitPullRequest,
+  HelpCircle, Layers, MessageSquareText, Pencil, Play, Send, Sparkles,
+  Target, XCircle,
 } from "lucide-react";
 import {
+  useAdvanceInterviewStage,
   useApproveInterviewProposal,
   useCreateInterviewSession,
   useEditInterviewProposal,
@@ -17,6 +19,7 @@ import {
   useLatestSnapshot,
   useMaterializeInterview,
   useRejectInterviewProposal,
+  useUpdateInterviewUnderstanding,
 } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
 import { Button } from "@/components/ui/button";
@@ -30,16 +33,21 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { formatTimestamp } from "@/lib/utils";
 import type {
+  CurrentUnderstanding,
+  GapItem,
   InterviewMaterializeOut,
   InterviewProposalMetadataBlock,
   InterviewProposalOut,
   InterviewProposalProbePlan,
+  InterviewStage,
+  OpenQuestion,
   ProbeRecommendedMode,
   ProbeReplayability,
   ProbeSideEffectRisk,
   SourceMetadataElementType,
   SourceMetadataOperationKind,
   SourceMetadataStateEffect,
+  UnderstandingItem,
 } from "@/api/types";
 
 const ELEMENT_TYPES: Array<"" | SourceMetadataElementType> = [
@@ -52,6 +60,30 @@ const PROBE_MODES: ProbeRecommendedMode[] = ["trace", "shadow"];
 const RISK_LEVELS: ProbeSideEffectRisk[] = ["none", "low", "medium", "high"];
 const REPLAYABILITY: ProbeReplayability[] = ["safe", "caution", "unsafe"];
 
+const STAGE_LABELS: Record<InterviewStage, string> = {
+  understanding_initialized: "Understanding",
+  purpose_confirmation: "Purpose",
+  capability_confirmation: "Capabilities",
+  element_classification: "Elements",
+  api_boundary_mapping: "API Boundaries",
+  probe_flow_selection: "Probe Flows",
+  proposal_generation: "Proposals",
+};
+
+const STAGE_ORDER: InterviewStage[] = [
+  "understanding_initialized",
+  "purpose_confirmation",
+  "capability_confirmation",
+  "element_classification",
+  "api_boundary_mapping",
+  "probe_flow_selection",
+  "proposal_generation",
+];
+
+function stageIndex(stage: InterviewStage): number {
+  return STAGE_ORDER.indexOf(stage);
+}
+
 function provenanceVariant(value: string) {
   if (value === "manual") return "success" as const;
   if (value === "reasoning_llm") return "secondary" as const;
@@ -62,6 +94,19 @@ function approvalVariant(value: string) {
   if (value === "approved" || value === "edited") return "success" as const;
   if (value === "rejected") return "destructive" as const;
   return "secondary" as const;
+}
+
+function confidenceVariant(level: string) {
+  if (level === "confirmed") return "success" as const;
+  if (level === "likely") return "secondary" as const;
+  if (level === "conflicting") return "destructive" as const;
+  return "outline" as const;
+}
+
+function severityVariant(severity: string) {
+  if (severity === "high") return "destructive" as const;
+  if (severity === "medium") return "warning" as const;
+  return "outline" as const;
 }
 
 function csv(items: string[]) {
@@ -173,6 +218,146 @@ function MetadataGrid({ metadata, probe }: {
   );
 }
 
+function StageStepper({ current }: { current: InterviewStage }) {
+  const currentIdx = stageIndex(current);
+  return (
+    <div className="flex items-center gap-1 flex-wrap" data-testid="stage-stepper">
+      {STAGE_ORDER.map((stage, idx) => {
+        const isCurrent = idx === currentIdx;
+        const isDone = idx < currentIdx;
+        return (
+          <div key={stage} className="flex items-center gap-1">
+            {idx > 0 && <ChevronRight className="h-3 w-3 text-muted-foreground shrink-0" />}
+            <Badge
+              variant={isCurrent ? "default" : isDone ? "success" : "outline"}
+              className={isCurrent ? "ring-2 ring-primary/30" : ""}
+              data-testid={`stage-${stage}`}
+            >
+              {STAGE_LABELS[stage]}
+            </Badge>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function UnderstandingItemCard({ item, category }: { item: UnderstandingItem; category: string }) {
+  return (
+    <div className="rounded-md border p-3 space-y-2">
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="font-medium text-sm">{item.name}</div>
+          <div className="text-xs text-muted-foreground">{category}</div>
+        </div>
+        <Badge variant={confidenceVariant(item.confidence.level)}>
+          {item.confidence.level}
+        </Badge>
+      </div>
+      {item.summary && <p className="text-xs">{item.summary}</p>}
+      {item.why_core && <p className="text-xs text-muted-foreground italic">{item.why_core}</p>}
+      {item.evidence.length > 0 && (
+        <div className="space-y-1">
+          {item.evidence.map((e, i) => (
+            <div key={i} className="text-[10px] text-muted-foreground font-mono">
+              {e.path}:{e.start_line}-{e.end_line} — {e.summary}
+            </div>
+          ))}
+        </div>
+      )}
+      {item.related_apis.length > 0 && (
+        <div className="text-[10px] text-muted-foreground">APIs: {item.related_apis.join(", ")}</div>
+      )}
+      {item.children.length > 0 && (
+        <div className="text-[10px] text-muted-foreground">Children: {item.children.join(", ")}</div>
+      )}
+    </div>
+  );
+}
+
+function UnderstandingPanel({ understanding }: { understanding: CurrentUnderstanding }) {
+  const sections: [string, UnderstandingItem[]][] = [
+    ["System Purpose", understanding.system_purpose],
+    ["Core Capabilities", understanding.core_capabilities],
+    ["Capability Elements", understanding.capability_elements],
+    ["Supporting Elements", understanding.supporting_elements],
+    ["API Boundaries", understanding.api_boundaries],
+    ["Probe Flow Candidates", understanding.probe_flow_candidates],
+  ];
+
+  const hasContent = sections.some(([, items]) => items.length > 0);
+
+  if (!hasContent) {
+    return (
+      <div className="text-sm text-muted-foreground text-center py-4">
+        No understanding items found. The documentation may need more detail.
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4" data-testid="understanding-panel">
+      {sections.map(([label, items]) =>
+        items.length > 0 ? (
+          <div key={label}>
+            <h4 className="text-xs font-semibold uppercase text-muted-foreground mb-2">{label}</h4>
+            <div className="space-y-2">
+              {items.map((item, idx) => (
+                <UnderstandingItemCard key={idx} item={item} category={label} />
+              ))}
+            </div>
+          </div>
+        ) : null,
+      )}
+    </div>
+  );
+}
+
+function GapAnalysisPanel({ gaps }: { gaps: GapItem[] }) {
+  if (gaps.length === 0) return null;
+  return (
+    <div className="space-y-2" data-testid="gap-analysis-panel">
+      {gaps.map((gap, idx) => (
+        <div key={idx} className="rounded-md border p-3 flex items-start gap-3">
+          <AlertCircle className="h-4 w-4 mt-0.5 shrink-0 text-amber-500" />
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-medium">{gap.name}</span>
+              <Badge variant={severityVariant(gap.severity)}>{gap.severity}</Badge>
+              <Badge variant="outline">{gap.gap_type}</Badge>
+            </div>
+            {gap.summary && <p className="text-xs text-muted-foreground mt-1">{gap.summary}</p>}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function OpenQuestionsPanel({ questions }: { questions: OpenQuestion[] }) {
+  if (questions.length === 0) return null;
+  return (
+    <div className="space-y-2" data-testid="open-questions-panel">
+      {questions.map((q, idx) => (
+        <div key={idx} className="rounded-md border p-3 flex items-start gap-3">
+          <HelpCircle className="h-4 w-4 mt-0.5 shrink-0 text-blue-500" />
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <span className="text-sm">{q.question}</span>
+            </div>
+            <div className="flex gap-1 mt-1">
+              <Badge variant="outline">{q.category}</Badge>
+              <Badge variant={q.priority === "high" ? "destructive" : q.priority === "medium" ? "warning" : "outline"}>
+                {q.priority}
+              </Badge>
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export default function InterviewPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const sessionParam = Number(searchParams.get("session"));
@@ -191,22 +376,31 @@ export default function InterviewPage() {
   const reject = useRejectInterviewProposal(selectedSessionId);
   const edit = useEditInterviewProposal(selectedSessionId);
   const materialize = useMaterializeInterview(selectedSessionId);
+  const advanceStage = useAdvanceInterviewStage(selectedSessionId);
+  const updateUnderstanding = useUpdateInterviewUnderstanding(selectedSessionId);
 
   const [message, setMessage] = useState("");
   const [editing, setEditing] = useState<InterviewProposalOut | null>(null);
   const [editForm, setEditForm] = useState<EditForm | null>(null);
   const [lastMaterialization, setLastMaterialization] = useState<InterviewMaterializeOut | null>(null);
+  const [userIntent, setUserIntent] = useState("");
 
   const sortedSessions = useMemo(() => sessions ?? [], [sessions]);
   const proposals = session?.proposals ?? [];
   const pendingCount = proposals.filter(p => p.approval_state === "proposed").length;
   const diff = lastMaterialization?.diff || session?.materialization_diff || "";
+  const currentStage = session?.stage ?? "understanding_initialized";
+  const isProposalStage = currentStage === "proposal_generation";
 
   useEffect(() => {
     if (!selectedSessionId && sortedSessions.length > 0) {
       setSearchParams({ session: String(sortedSessions[0].id) }, { replace: true });
     }
   }, [selectedSessionId, sortedSessions, setSearchParams]);
+
+  useEffect(() => {
+    if (session?.user_intent) setUserIntent(session.user_intent);
+  }, [session?.user_intent]);
 
   const unclassifiedPreview = useMemo(
     () => contextPack?.symbols.filter(s => s.classification === "unclassified").slice(0, 6) ?? [],
@@ -225,7 +419,27 @@ export default function InterviewPage() {
         focus: "Author reviewed probe-agent metadata and probe proposals",
       });
       setSearchParams({ session: String(created.id) });
-      toast.success("Interview started");
+      toast.success("Interview started — building initial understanding…");
+      try {
+        await updateUnderstanding.mutateAsync();
+        toast.success("Initial understanding ready");
+      } catch (e) {
+        toast.error(`Understanding generation failed: ${String(e)}`);
+      }
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
+  const initUnderstanding = async () => {
+    if (!selectedSessionId) return;
+    try {
+      const updated = await updateUnderstanding.mutateAsync();
+      if (updated.last_error) {
+        toast.error(`Understanding review failed: ${updated.last_error}`);
+      } else {
+        toast.success("Understanding updated");
+      }
     } catch (e) {
       toast.error(String(e));
     }
@@ -235,10 +449,22 @@ export default function InterviewPage() {
     const text = message.trim();
     if (!text || !selectedSessionId) return;
     try {
-      const result = await dialogueTurn.mutateAsync({ user_message: text });
+      const result = await dialogueTurn.mutateAsync({
+        user_message: text,
+        generate_proposals: isProposalStage,
+      });
       setMessage("");
       if (result.error) toast.error(result.error);
       else toast.success(result.proposals.length ? `${result.proposals.length} proposal(s) generated` : "Interview turn saved");
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
+  const doAdvanceStage = async (targetStage: string) => {
+    try {
+      await advanceStage.mutateAsync({ stage: targetStage, user_intent: userIntent || undefined });
+      toast.success(`Advanced to ${STAGE_LABELS[targetStage as InterviewStage] ?? targetStage}`);
     } catch (e) {
       toast.error(String(e));
     }
@@ -277,6 +503,10 @@ export default function InterviewPage() {
     }
   };
 
+  const nextStageKey = stageIndex(currentStage) < STAGE_ORDER.length - 1
+    ? STAGE_ORDER[stageIndex(currentStage) + 1]
+    : null;
+
   return (
     <div className="space-y-6">
       <div className="flex items-start justify-between gap-3 flex-wrap">
@@ -285,8 +515,7 @@ export default function InterviewPage() {
             <MessageSquareText className="h-6 w-6" /> System Interview
           </h1>
           <p className="text-sm text-muted-foreground mt-1 max-w-3xl">
-            Snapshot-scoped review for LLM-authored metadata and probe proposals.
-            Manual approval is recorded through the approval API before any diff is materialized.
+            Guided understanding workflow: build system knowledge before generating proposals.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -333,7 +562,15 @@ export default function InterviewPage() {
         </Card>
       ) : (
         <>
+          {/* Stage stepper */}
+          <Card>
+            <CardContent className="py-3">
+              <StageStepper current={currentStage} />
+            </CardContent>
+          </Card>
+
           <div className="grid grid-cols-1 xl:grid-cols-[360px_1fr] gap-4">
+            {/* Left column: session info + conversation */}
             <div className="space-y-4">
               <Card>
                 <CardHeader>
@@ -357,6 +594,34 @@ export default function InterviewPage() {
                       <div className="text-xs text-muted-foreground">pending</div>
                     </div>
                   </div>
+
+                  {/* User Intent / Target State */}
+                  <div className="rounded-md border p-3 space-y-2">
+                    <div className="flex items-center gap-2">
+                      <Target className="h-4 w-4 text-muted-foreground" />
+                      <span className="font-medium text-xs">User Intent / Target State</span>
+                    </div>
+                    <Textarea
+                      rows={2}
+                      value={userIntent}
+                      onChange={e => setUserIntent(e.target.value)}
+                      placeholder="What are you trying to achieve with this system?"
+                      className="text-xs"
+                    />
+                    {nextStageKey && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="w-full"
+                        onClick={() => doAdvanceStage(nextStageKey)}
+                        disabled={advanceStage.isPending}
+                      >
+                        <ChevronRight className="h-4 w-4 mr-1" />
+                        {advanceStage.isPending ? "Advancing..." : `Advance to ${STAGE_LABELS[nextStageKey]}`}
+                      </Button>
+                    )}
+                  </div>
+
                   {contextPack && (
                     <div className="rounded-md border p-3 space-y-2">
                       <div className="flex items-center justify-between">
@@ -384,7 +649,11 @@ export default function InterviewPage() {
               <Card>
                 <CardHeader>
                   <CardTitle className="text-sm">Conversation</CardTitle>
-                  <CardDescription>Turns are grounded in the pinned snapshot context.</CardDescription>
+                  <CardDescription>
+                    {isProposalStage
+                      ? "Turns are grounded in the pinned snapshot context."
+                      : "Answer the understanding questions before proposals are generated."}
+                  </CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-3">
                   <div className="space-y-2 max-h-[24rem] overflow-y-auto pr-1">
@@ -404,23 +673,106 @@ export default function InterviewPage() {
                     rows={5}
                     value={message}
                     onChange={e => setMessage(e.target.value)}
-                    placeholder="Ask for metadata and probe proposals for the unclassified entrypoints."
+                    placeholder={isProposalStage
+                      ? "Ask for metadata and probe proposals for the unclassified entrypoints."
+                      : "Answer the understanding questions or provide clarification."}
                   />
-                  <Button size="sm" onClick={sendTurn} disabled={dialogueTurn.isPending || !message.trim()}>
-                    <Send className="h-4 w-4 mr-1" />
-                    {dialogueTurn.isPending ? "Sending..." : "Send turn"}
-                  </Button>
+                  <div className="flex gap-2">
+                    <Button size="sm" onClick={sendTurn} disabled={dialogueTurn.isPending || !message.trim()}>
+                      <Send className="h-4 w-4 mr-1" />
+                      {dialogueTurn.isPending ? "Sending..." : "Send turn"}
+                    </Button>
+                  </div>
                 </CardContent>
               </Card>
             </div>
 
+            {/* Right column: understanding, gaps, proposals, diff */}
             <div className="space-y-4">
+              {/* Current Understanding */}
+              <Card>
+                <CardHeader>
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <CardTitle className="text-sm flex items-center gap-2">
+                        <Layers className="h-4 w-4" /> Current Understanding
+                      </CardTitle>
+                      <CardDescription>
+                        System knowledge built from documentation and code analysis.
+                      </CardDescription>
+                    </div>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={initUnderstanding}
+                      disabled={updateUnderstanding.isPending}
+                    >
+                      <Sparkles className="h-4 w-4 mr-1" />
+                      {updateUnderstanding.isPending ? "Analyzing..." : "Build Understanding"}
+                    </Button>
+                  </div>
+                </CardHeader>
+                <CardContent>
+                  {session.last_error && (
+                    <div className="rounded-md border border-destructive bg-destructive/10 p-3 mb-3 text-sm text-destructive flex items-start gap-2">
+                      <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
+                      <div>
+                        <div className="font-medium">Understanding generation failed</div>
+                        <div className="text-xs mt-1">{session.last_error}</div>
+                      </div>
+                    </div>
+                  )}
+                  {session.current_understanding ? (
+                    <UnderstandingPanel understanding={session.current_understanding} />
+                  ) : !session.last_error ? (
+                    <div className="text-sm text-muted-foreground text-center py-6" data-testid="no-understanding">
+                      Click &ldquo;Build Understanding&rdquo; to analyze documentation and code.
+                    </div>
+                  ) : null}
+                </CardContent>
+              </Card>
+
+              {/* Open Questions */}
+              {session.open_questions && session.open_questions.length > 0 && (
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-sm flex items-center gap-2">
+                      <HelpCircle className="h-4 w-4" /> Open Questions
+                    </CardTitle>
+                    <CardDescription>Questions to resolve for deeper understanding.</CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <OpenQuestionsPanel questions={session.open_questions} />
+                  </CardContent>
+                </Card>
+              )}
+
+              {/* Gap Analysis */}
+              {session.gap_analysis && session.gap_analysis.length > 0 && (
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-sm flex items-center gap-2">
+                      <AlertCircle className="h-4 w-4" /> Gap Analysis
+                    </CardTitle>
+                    <CardDescription>Gaps between documentation and code.</CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <GapAnalysisPanel gaps={session.gap_analysis} />
+                  </CardContent>
+                </Card>
+              )}
+
+              {/* Proposal Review — visible always but gated messaging */}
               <Card>
                 <CardHeader>
                   <div className="flex items-center justify-between gap-2">
                     <div>
                       <CardTitle className="text-sm">Proposal Review</CardTitle>
-                      <CardDescription>Approve, reject, or edit each combined metadata + probe item.</CardDescription>
+                      <CardDescription>
+                        {isProposalStage
+                          ? "Approve, reject, or edit each combined metadata + probe item."
+                          : "Proposals will be available after understanding is confirmed."}
+                      </CardDescription>
                     </div>
                     <Button
                       size="sm"
@@ -434,7 +786,11 @@ export default function InterviewPage() {
                   </div>
                 </CardHeader>
                 <CardContent className="space-y-3">
-                  {proposals.length === 0 ? (
+                  {!isProposalStage && proposals.length === 0 ? (
+                    <div className="text-sm text-muted-foreground" data-testid="no-proposals-yet">
+                      Complete the understanding stages to unlock proposal generation.
+                    </div>
+                  ) : proposals.length === 0 ? (
                     <div className="text-sm text-muted-foreground">No proposals yet. Send an interview turn to generate review items.</div>
                   ) : proposals.map(proposal => (
                     <div key={proposal.id} className="rounded-md border p-4 space-y-3" data-testid="interview-proposal-card">
@@ -448,6 +804,19 @@ export default function InterviewPage() {
                           <AuditBadge proposal={proposal} />
                         </div>
                       </div>
+                      {(proposal.capability_name || proposal.evidence_summary || proposal.proposal_confidence != null) && (
+                        <div className="rounded-md bg-muted/50 px-3 py-2 text-xs space-y-1">
+                          {proposal.capability_name && (
+                            <div><span className="font-medium">Capability:</span> {proposal.capability_name}</div>
+                          )}
+                          {proposal.evidence_summary && (
+                            <div><span className="font-medium">Evidence:</span> {proposal.evidence_summary}</div>
+                          )}
+                          {proposal.proposal_confidence != null && (
+                            <div><span className="font-medium">Confidence:</span> {(proposal.proposal_confidence * 100).toFixed(0)}%</div>
+                          )}
+                        </div>
+                      )}
                       <MetadataGrid metadata={proposal.metadata} probe={proposal.probe_plan} />
                       <div className="flex items-center gap-2 justify-end">
                         <Button

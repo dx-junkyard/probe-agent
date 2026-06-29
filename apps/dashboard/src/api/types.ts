@@ -124,6 +124,14 @@ export interface SnapshotOut {
 
 export type InterviewSessionStatus = "open" | "proposals_ready" | "materialized" | "closed";
 export type InterviewMessageRole = "user" | "assistant" | "system";
+export type InterviewStage =
+  | "understanding_initialized"
+  | "purpose_confirmation"
+  | "capability_confirmation"
+  | "element_classification"
+  | "api_boundary_mapping"
+  | "probe_flow_selection"
+  | "proposal_generation";
 export type InterviewDecisionMethod = "deterministic" | "reasoning_llm" | "manual";
 export type InterviewApprovalState = "proposed" | "approved" | "rejected" | "edited";
 export type SourceMetadataElementType =
@@ -136,6 +144,39 @@ export type ProbeRecommendedMode = "trace" | "shadow";
 export type ProbeSideEffectRisk = "none" | "low" | "medium" | "high";
 export type ProbeReplayability = "safe" | "caution" | "unsafe";
 
+export interface UnderstandingItem {
+  name: string;
+  summary: string;
+  confidence: { level: string; reason: string };
+  evidence: { path: string; start_line: number; end_line: number; summary: string }[];
+  why_core: string;
+  related_docs: string[];
+  related_apis: string[];
+  children: string[];
+}
+
+export interface GapItem {
+  gap_type: string;
+  name: string;
+  summary: string;
+  severity: string;
+}
+
+export interface OpenQuestion {
+  question: string;
+  category: string;
+  priority: string;
+}
+
+export interface CurrentUnderstanding {
+  system_purpose: UnderstandingItem[];
+  core_capabilities: UnderstandingItem[];
+  capability_elements: UnderstandingItem[];
+  supporting_elements: UnderstandingItem[];
+  api_boundaries: UnderstandingItem[];
+  probe_flow_candidates: UnderstandingItem[];
+}
+
 export interface InterviewSessionOut {
   id: number;
   system_id: number;
@@ -143,6 +184,12 @@ export interface InterviewSessionOut {
   title: string;
   focus: string;
   status: InterviewSessionStatus;
+  stage: InterviewStage;
+  current_understanding: CurrentUnderstanding | null;
+  gap_analysis: GapItem[] | null;
+  open_questions: OpenQuestion[] | null;
+  user_intent: string | null;
+  last_error: string | null;
   materialization_diff: string | null;
   materialization_ref: string | null;
   materialized_at: number | null;
@@ -191,6 +238,10 @@ export interface InterviewProposalOut {
   qualified_name: string;
   metadata: InterviewProposalMetadataBlock;
   probe_plan: InterviewProposalProbePlan;
+  graph_node_id: string | null;
+  capability_name: string | null;
+  evidence_summary: string | null;
+  proposal_confidence: number | null;
   decision_method: InterviewDecisionMethod;
   approval_state: InterviewApprovalState;
   is_mock: boolean;
@@ -271,6 +322,10 @@ export interface InterviewDialogueTurnOut {
   next_questions: string[];
   intelligence_run: IntelligenceRunOut | null;
   error: string | null;
+  stage: InterviewStage | null;
+  current_understanding: CurrentUnderstanding | null;
+  gap_analysis: GapItem[] | null;
+  open_questions_structured: OpenQuestion[] | null;
 }
 
 export interface InterviewProposalDecisionOut {

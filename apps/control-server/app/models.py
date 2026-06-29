@@ -1679,6 +1679,16 @@ class WorkspaceProposalDraftOut(BaseModel):
 
 InterviewSessionStatus = Literal["open", "proposals_ready", "materialized", "closed"]
 InterviewMessageRole = Literal["user", "assistant", "system"]
+
+InterviewStage = Literal[
+    "understanding_initialized",
+    "purpose_confirmation",
+    "capability_confirmation",
+    "element_classification",
+    "api_boundary_mapping",
+    "probe_flow_selection",
+    "proposal_generation",
+]
 InterviewProposalApprovalState = Literal["proposed", "approved", "rejected", "edited"]
 # Finite #54 vocabulary for a single state_effects entry.
 SourceMetadataStateEffect = Literal[
@@ -1711,6 +1721,12 @@ class InterviewSessionOut(BaseModel):
     title: str
     focus: str
     status: InterviewSessionStatus
+    stage: Optional[InterviewStage] = "understanding_initialized"
+    current_understanding: Optional[Dict[str, Any]] = None
+    gap_analysis: Optional[List[Dict[str, Any]]] = None
+    open_questions: Optional[List[Dict[str, Any]]] = None
+    user_intent: Optional[str] = None
+    last_error: Optional[str] = None
     materialization_diff: Optional[str] = None
     materialization_ref: Optional[str] = None
     materialized_at: Optional[float] = None
@@ -1779,6 +1795,10 @@ class InterviewProposalItem(BaseModel):
     symbol_id: Optional[int] = None
     metadata: InterviewProposalMetadataBlock
     probe_plan: InterviewProposalProbePlan
+    graph_node_id: Optional[str] = None
+    capability_name: Optional[str] = None
+    evidence_summary: Optional[str] = None
+    proposal_confidence: Optional[float] = None
 
 
 class InterviewRunAudit(BaseModel):
@@ -1819,6 +1839,10 @@ class InterviewProposalOut(BaseModel):
     metadata: InterviewProposalMetadataBlock
     probe_plan: InterviewProposalProbePlan
     decision_method: DecisionMethod
+    graph_node_id: Optional[str] = None
+    capability_name: Optional[str] = None
+    evidence_summary: Optional[str] = None
+    proposal_confidence: Optional[float] = None
     approval_state: InterviewProposalApprovalState
     is_mock: bool = False
     intelligence_run: Optional[IntelligenceRunOut] = None
@@ -1912,6 +1936,7 @@ class InterviewDialogueTurnRequest(BaseModel):
 
     user_message: str = Field(..., min_length=1, max_length=20_000)
     budget: Optional[int] = Field(default=None, ge=1000, le=500_000)
+    generate_proposals: bool = False
 
 
 class InterviewDialogueProposalOut(BaseModel):
@@ -1922,6 +1947,10 @@ class InterviewDialogueProposalOut(BaseModel):
     symbol_id: Optional[int] = None
     metadata: InterviewProposalMetadataBlock
     probe_plan: InterviewProposalProbePlan
+    graph_node_id: Optional[str] = None
+    capability_name: Optional[str] = None
+    evidence_summary: Optional[str] = None
+    proposal_confidence: Optional[float] = None
     denylist_hit: Optional[str] = None
 
 
@@ -1938,6 +1967,10 @@ class InterviewDialogueTurnOut(BaseModel):
     next_questions: List[str] = Field(default_factory=list)
     intelligence_run: Optional[IntelligenceRunOut] = None
     error: Optional[str] = None
+    stage: Optional[InterviewStage] = None
+    current_understanding: Optional[Dict[str, Any]] = None
+    gap_analysis: Optional[List[Dict[str, Any]]] = None
+    open_questions_structured: Optional[List[Dict[str, Any]]] = None
 
 
 # --- Interview Proposal Approval (Issue #70) ----------------------------------

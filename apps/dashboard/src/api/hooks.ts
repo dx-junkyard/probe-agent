@@ -501,7 +501,7 @@ export function useInterviewContextPack(sessionId: number | null) {
 export function useInterviewDialogueTurn(sessionId: number | null) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (data: { user_message: string; budget?: number }) =>
+    mutationFn: (data: { user_message: string; budget?: number; generate_proposals?: boolean }) =>
       api.post<InterviewDialogueTurnOut>(`/interview/sessions/${sessionId}/dialogue-turn`, data),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
@@ -565,6 +565,36 @@ export function useInterviewApprovedSet(sessionId: number | null) {
     queryKey: [...sysKey("interviewApprovedSet"), sessionId],
     queryFn: () => api.get<InterviewApprovedSetOut>(`/interview/sessions/${sessionId}/approved-set`),
     enabled: !!sessionId && !!getSystemId(),
+  });
+}
+
+export function useAdvanceInterviewStage(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { stage: string; user_intent?: string }) =>
+      api.post<InterviewSessionOut>(
+        `/interview/sessions/${sessionId}/advance-stage`,
+        data,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+      qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
+    },
+  });
+}
+
+export function useUpdateInterviewUnderstanding(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      api.post<InterviewSessionOut>(
+        `/interview/sessions/${sessionId}/update-understanding`,
+        {},
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+      qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
+    },
   });
 }
 
