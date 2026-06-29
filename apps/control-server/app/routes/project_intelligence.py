@@ -98,6 +98,7 @@ from ..models import (
     ProbePointStatusUpdate,
     RepositoryCandidateOut,
     RepositoryConfigOut,
+    SystemUnderstandingOut,
     RepositoryConfigUpdate,
     SnapshotFileOut,
     SnapshotOut,
@@ -174,6 +175,100 @@ def _probe_patch_out(conn, row) -> ProbePatchOut:
         applied_by_user_id=row["applied_by_user_id"],
         validation_runs=validation_runs,
         created_at=row["created_at"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# System Understanding (Issue #86)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/repository/system-understanding",
+    response_model=SystemUnderstandingOut,
+)
+def get_system_understanding_endpoint(
+    system_id: int = Depends(get_system_id),
+) -> SystemUnderstandingOut:
+    from ..system_understanding_service import get_system_understanding
+    summary = get_system_understanding(system_id)
+    return _system_understanding_to_out(summary)
+
+
+@router.post(
+    "/repository/system-understanding/build",
+    response_model=SystemUnderstandingOut,
+)
+def build_system_understanding_endpoint(
+    system_id: int = Depends(get_system_id),
+) -> SystemUnderstandingOut:
+    from ..system_understanding_service import build_system_understanding
+    summary = build_system_understanding(system_id)
+    return _system_understanding_to_out(summary)
+
+
+def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
+    from ..models import (
+        SystemUnderstandingOut,
+        SystemUnderstandingPipelineStepOut,
+        SystemUnderstandingNextActionOut,
+        SystemUnderstandingGapSummaryOut,
+        SystemUnderstandingMetadataCoverageOut,
+        SystemUnderstandingCapabilitySummaryOut,
+        SystemUnderstandingEntrypointSummaryOut,
+        SystemUnderstandingSymbolSummaryOut,
+        SystemUnderstandingPurposeOut,
+        SystemUnderstandingGapOut,
+    )
+    pipeline = [
+        SystemUnderstandingPipelineStepOut(step=s.step, status=s.status, detail=s.detail)
+        for s in summary.pipeline
+    ]
+    purpose = None
+    if summary.purpose:
+        purpose = SystemUnderstandingPurposeOut(**summary.purpose)
+    capabilities = [
+        SystemUnderstandingCapabilitySummaryOut(**c) for c in summary.capabilities
+    ]
+    entrypoints = [
+        SystemUnderstandingEntrypointSummaryOut(**e) for e in summary.entrypoints
+    ]
+    major_symbols = [
+        SystemUnderstandingSymbolSummaryOut(**s) for s in summary.major_symbols
+    ]
+    gaps = [
+        SystemUnderstandingGapOut(**g) for g in summary.gaps
+    ]
+    gap_summary = [
+        SystemUnderstandingGapSummaryOut(gap_type=gs.gap_type, count=gs.count)
+        for gs in summary.gap_summary
+    ]
+    metadata_coverage = None
+    if summary.metadata_coverage:
+        mc = summary.metadata_coverage
+        metadata_coverage = SystemUnderstandingMetadataCoverageOut(
+            symbol_count=mc.symbol_count,
+            symbols_with_source_metadata=mc.symbols_with_source_metadata,
+            entrypoint_count=mc.entrypoint_count,
+            entrypoints_with_capability_link=mc.entrypoints_with_capability_link,
+        )
+    next_actions = [
+        SystemUnderstandingNextActionOut(action=a.action, reason=a.reason, link=a.link)
+        for a in summary.next_actions
+    ]
+    return SystemUnderstandingOut(
+        system_id=summary.system_id,
+        snapshot_id=summary.snapshot_id,
+        commit_sha=summary.commit_sha,
+        pipeline=pipeline,
+        purpose=purpose,
+        capabilities=capabilities,
+        entrypoints=entrypoints,
+        major_symbols=major_symbols,
+        gaps=gaps,
+        gap_summary=gap_summary,
+        metadata_coverage=metadata_coverage,
+        next_actions=next_actions,
     )
 
 

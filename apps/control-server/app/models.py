@@ -2088,3 +2088,84 @@ class InterviewMaterializeOut(BaseModel):
     skipped: List[str] = Field(default_factory=list)
     materialized_at: float
     error: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# System Understanding (Issue #86)
+# ---------------------------------------------------------------------------
+
+PipelineStepStatus = Literal["complete", "missing", "warning", "blocked", "failed"]
+
+
+class SystemUnderstandingPipelineStepOut(BaseModel):
+    step: str
+    status: PipelineStepStatus
+    detail: Optional[str] = None
+
+
+class SystemUnderstandingNextActionOut(BaseModel):
+    action: str
+    reason: str
+    link: Optional[str] = None
+
+
+class SystemUnderstandingGapSummaryOut(BaseModel):
+    gap_type: str
+    count: int
+
+
+class SystemUnderstandingMetadataCoverageOut(BaseModel):
+    symbol_count: int = 0
+    symbols_with_source_metadata: int = 0
+    entrypoint_count: int = 0
+    entrypoints_with_capability_link: int = 0
+
+
+class SystemUnderstandingCapabilitySummaryOut(BaseModel):
+    name: str
+    summary: Optional[str] = None
+    provenance_kind: Optional[str] = None
+
+
+class SystemUnderstandingEntrypointSummaryOut(BaseModel):
+    entrypoint_type: str
+    entrypoint_id: str
+    category: Optional[str] = None
+    label: Optional[str] = None
+
+
+class SystemUnderstandingSymbolSummaryOut(BaseModel):
+    path: str
+    qualified_name: str
+    kind: Optional[str] = None
+    route_path: Optional[str] = None
+    route_method: Optional[str] = None
+    component_id: Optional[str] = None
+
+
+class SystemUnderstandingPurposeOut(BaseModel):
+    name: str
+    summary: Optional[str] = None
+    provenance_kind: Optional[str] = None
+
+
+class SystemUnderstandingGapOut(BaseModel):
+    gap_type: Optional[str] = None
+    node_name: Optional[str] = None
+    notes: Optional[str] = None
+    code_refs: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class SystemUnderstandingOut(BaseModel):
+    system_id: int
+    snapshot_id: Optional[int] = None
+    commit_sha: Optional[str] = None
+    pipeline: List[SystemUnderstandingPipelineStepOut] = Field(default_factory=list)
+    purpose: Optional[SystemUnderstandingPurposeOut] = None
+    capabilities: List[SystemUnderstandingCapabilitySummaryOut] = Field(default_factory=list)
+    entrypoints: List[SystemUnderstandingEntrypointSummaryOut] = Field(default_factory=list)
+    major_symbols: List[SystemUnderstandingSymbolSummaryOut] = Field(default_factory=list)
+    gaps: List[SystemUnderstandingGapOut] = Field(default_factory=list)
+    gap_summary: List[SystemUnderstandingGapSummaryOut] = Field(default_factory=list)
+    metadata_coverage: Optional[SystemUnderstandingMetadataCoverageOut] = None
+    next_actions: List[SystemUnderstandingNextActionOut] = Field(default_factory=list)
