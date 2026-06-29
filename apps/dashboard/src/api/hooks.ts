@@ -501,7 +501,7 @@ export function useInterviewContextPack(sessionId: number | null) {
 export function useInterviewDialogueTurn(sessionId: number | null) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (data: { user_message: string; budget?: number }) =>
+    mutationFn: (data: { user_message: string; budget?: number; generate_proposals?: boolean }) =>
       api.post<InterviewDialogueTurnOut>(`/interview/sessions/${sessionId}/dialogue-turn`, data),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });

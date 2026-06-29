@@ -238,6 +238,10 @@ export interface InterviewProposalOut {
   qualified_name: string;
   metadata: InterviewProposalMetadataBlock;
   probe_plan: InterviewProposalProbePlan;
+  graph_node_id: string | null;
+  capability_name: string | null;
+  evidence_summary: string | null;
+  proposal_confidence: number | null;
   decision_method: InterviewDecisionMethod;
   approval_state: InterviewApprovalState;
   is_mock: boolean;

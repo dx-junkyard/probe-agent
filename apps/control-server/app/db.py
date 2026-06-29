@@ -1020,6 +1020,11 @@ CREATE TABLE IF NOT EXISTS interview_proposal (
     recommended_mode    TEXT NOT NULL DEFAULT 'trace',
     side_effect_risk    TEXT NOT NULL DEFAULT 'low',
     replayability       TEXT NOT NULL DEFAULT 'safe',
+    -- Provenance: link to understanding graph node and capability scope.
+    graph_node_id       TEXT,
+    capability_name     TEXT,
+    evidence_summary    TEXT,
+    proposal_confidence REAL,
     -- Audit + per-item approval. decision_method is the Principle 7 enum;
     -- newly stored proposals are reasoning_llm (this issue never sets manual).
     decision_method     TEXT NOT NULL DEFAULT 'reasoning_llm',
@@ -1421,6 +1426,12 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE interview_session ADD COLUMN last_error TEXT"
             )
+        proposal_cols = _columns(conn, "interview_proposal")
+        if proposal_cols and "graph_node_id" not in proposal_cols:
+            conn.execute("ALTER TABLE interview_proposal ADD COLUMN graph_node_id TEXT")
+            conn.execute("ALTER TABLE interview_proposal ADD COLUMN capability_name TEXT")
+            conn.execute("ALTER TABLE interview_proposal ADD COLUMN evidence_summary TEXT")
+            conn.execute("ALTER TABLE interview_proposal ADD COLUMN proposal_confidence REAL")
         graph_cols = _columns(conn, "understanding_graph_snapshots")
         if graph_cols and "snapshot_id" not in graph_cols:
             conn.execute(

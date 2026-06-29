@@ -1795,6 +1795,10 @@ class InterviewProposalItem(BaseModel):
     symbol_id: Optional[int] = None
     metadata: InterviewProposalMetadataBlock
     probe_plan: InterviewProposalProbePlan
+    graph_node_id: Optional[str] = None
+    capability_name: Optional[str] = None
+    evidence_summary: Optional[str] = None
+    proposal_confidence: Optional[float] = None
 
 
 class InterviewRunAudit(BaseModel):
@@ -1835,6 +1839,10 @@ class InterviewProposalOut(BaseModel):
     metadata: InterviewProposalMetadataBlock
     probe_plan: InterviewProposalProbePlan
     decision_method: DecisionMethod
+    graph_node_id: Optional[str] = None
+    capability_name: Optional[str] = None
+    evidence_summary: Optional[str] = None
+    proposal_confidence: Optional[float] = None
     approval_state: InterviewProposalApprovalState
     is_mock: bool = False
     intelligence_run: Optional[IntelligenceRunOut] = None
@@ -1928,6 +1936,7 @@ class InterviewDialogueTurnRequest(BaseModel):
 
     user_message: str = Field(..., min_length=1, max_length=20_000)
     budget: Optional[int] = Field(default=None, ge=1000, le=500_000)
+    generate_proposals: bool = False
 
 
 class InterviewDialogueProposalOut(BaseModel):
@@ -1938,6 +1947,10 @@ class InterviewDialogueProposalOut(BaseModel):
     symbol_id: Optional[int] = None
     metadata: InterviewProposalMetadataBlock
     probe_plan: InterviewProposalProbePlan
+    graph_node_id: Optional[str] = None
+    capability_name: Optional[str] = None
+    evidence_summary: Optional[str] = None
+    proposal_confidence: Optional[float] = None
     denylist_hit: Optional[str] = None
 
 

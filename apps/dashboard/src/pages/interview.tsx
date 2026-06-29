@@ -449,7 +449,10 @@ export default function InterviewPage() {
     const text = message.trim();
     if (!text || !selectedSessionId) return;
     try {
-      const result = await dialogueTurn.mutateAsync({ user_message: text });
+      const result = await dialogueTurn.mutateAsync({
+        user_message: text,
+        generate_proposals: isProposalStage,
+      });
       setMessage("");
       if (result.error) toast.error(result.error);
       else toast.success(result.proposals.length ? `${result.proposals.length} proposal(s) generated` : "Interview turn saved");
@@ -801,6 +804,19 @@ export default function InterviewPage() {
                           <AuditBadge proposal={proposal} />
                         </div>
                       </div>
+                      {(proposal.capability_name || proposal.evidence_summary || proposal.proposal_confidence != null) && (
+                        <div className="rounded-md bg-muted/50 px-3 py-2 text-xs space-y-1">
+                          {proposal.capability_name && (
+                            <div><span className="font-medium">Capability:</span> {proposal.capability_name}</div>
+                          )}
+                          {proposal.evidence_summary && (
+                            <div><span className="font-medium">Evidence:</span> {proposal.evidence_summary}</div>
+                          )}
+                          {proposal.proposal_confidence != null && (
+                            <div><span className="font-medium">Confidence:</span> {(proposal.proposal_confidence * 100).toFixed(0)}%</div>
+                          )}
+                        </div>
+                      )}
                       <MetadataGrid metadata={proposal.metadata} probe={proposal.probe_plan} />
                       <div className="flex items-center gap-2 justify-end">
                         <Button

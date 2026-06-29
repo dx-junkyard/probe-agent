@@ -162,6 +162,10 @@ def _proposal_out(conn, row) -> InterviewProposalOut:
             side_effect_risk=row["side_effect_risk"],
             replayability=row["replayability"],
         ),
+        graph_node_id=row["graph_node_id"] if "graph_node_id" in row.keys() else None,
+        capability_name=row["capability_name"] if "capability_name" in row.keys() else None,
+        evidence_summary=row["evidence_summary"] if "evidence_summary" in row.keys() else None,
+        proposal_confidence=row["proposal_confidence"] if "proposal_confidence" in row.keys() else None,
         decision_method=row["decision_method"],
         approval_state=row["approval_state"],
         is_mock=bool(row["is_mock"]),
@@ -357,6 +361,12 @@ def create_interview_proposals(
     now = time.time()
     with get_conn() as conn:
         session = _get_session_or_404(conn, session_id, system_id)
+        current_stage = session["stage"] or "understanding_initialized"
+        if current_stage != "proposal_generation":
+            raise HTTPException(
+                status_code=422,
+                detail=f"Proposals can only be created in proposal_generation stage (current: {current_stage})",
+            )
         snapshot_id = session["snapshot_id"]
         message_id = payload.message_id
         if message_id is not None:
@@ -405,10 +415,12 @@ def create_interview_proposals(
                          md_element_type, md_operation_kind, md_consumers,
                          md_state_effects, feature_id, objective, probe_reason,
                          recommended_mode, side_effect_risk, replayability,
+                         graph_node_id, capability_name, evidence_summary,
+                         proposal_confidence,
                          decision_method, approval_state, is_mock,
                          created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                            ?, ?, ?, ?, 'reasoning_llm', 'proposed', ?, ?, ?)
+                            ?, ?, ?, ?, ?, ?, ?, ?, 'reasoning_llm', 'proposed', ?, ?, ?)
                     """,
                     (
                         session_id,
@@ -433,6 +445,10 @@ def create_interview_proposals(
                         item.probe_plan.recommended_mode,
                         item.probe_plan.side_effect_risk,
                         item.probe_plan.replayability,
+                        item.graph_node_id,
+                        item.capability_name,
+                        item.evidence_summary,
+                        item.proposal_confidence,
                         1 if payload.audit.is_mock else 0,
                         now,
                         now,
@@ -596,13 +612,21 @@ def interview_dialogue_turn(
             )
             asst_message_id = asst_cur.lastrowid
 
-            # Gate proposals behind proposal_generation stage (Issue #83).
+            # Gate proposals behind proposal_generation stage + explicit request (Issue #83).
             current_stage = session["stage"] or "understanding_initialized"
-            proposals_allowed = current_stage == "proposal_generation"
+            proposals_allowed = (
+                current_stage == "proposal_generation"
+                and payload.generate_proposals
+                and session["current_understanding"] is not None
+            )
 
             proposal_outs: List[InterviewDialogueProposalOut] = []
             gated_proposals = turn.proposals if proposals_allowed else []
             for p in gated_proposals:
+                p_graph_node_id = getattr(p, "graph_node_id", None)
+                p_capability_name = getattr(p, "capability_name", None)
+                p_evidence_summary = getattr(p, "evidence_summary", None)
+                p_proposal_confidence = getattr(p, "proposal_confidence", None)
                 conn.execute(
                     """INSERT INTO interview_proposal
                         (session_id, system_id, snapshot_id, message_id,
@@ -611,10 +635,12 @@ def interview_dialogue_turn(
                          md_element_type, md_operation_kind, md_consumers,
                          md_state_effects, feature_id, objective, probe_reason,
                          recommended_mode, side_effect_risk, replayability,
+                         graph_node_id, capability_name, evidence_summary,
+                         proposal_confidence,
                          decision_method, approval_state, is_mock,
                          created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                            ?, ?, ?, ?, 'reasoning_llm', 'proposed', ?, ?, ?)""",
+                            ?, ?, ?, ?, ?, ?, ?, ?, 'reasoning_llm', 'proposed', ?, ?, ?)""",
                     (
                         session_id,
                         system_id,
@@ -638,6 +664,10 @@ def interview_dialogue_turn(
                         p.probe_plan.recommended_mode,
                         p.probe_plan.side_effect_risk,
                         p.probe_plan.replayability,
+                        p_graph_node_id,
+                        p_capability_name,
+                        p_evidence_summary,
+                        p_proposal_confidence,
                         1 if turn.is_mock else 0,
                         now,
                         now,
@@ -649,6 +679,10 @@ def interview_dialogue_turn(
                     symbol_id=p.symbol_id,
                     metadata=p.metadata,
                     probe_plan=p.probe_plan,
+                    graph_node_id=p_graph_node_id,
+                    capability_name=p_capability_name,
+                    evidence_summary=p_evidence_summary,
+                    proposal_confidence=p_proposal_confidence,
                     denylist_hit=p.denylist_hit,
                 ))
 

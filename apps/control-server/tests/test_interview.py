@@ -75,6 +75,24 @@ def _setup(client, name="System A"):
     return token, system["id"], snapshot_id
 
 
+def _advance_to_proposal_generation(client, session_id, headers):
+    """Advance a session through all stages to proposal_generation."""
+    stages = [
+        "purpose_confirmation",
+        "capability_confirmation",
+        "element_classification",
+        "api_boundary_mapping",
+        "probe_flow_selection",
+        "proposal_generation",
+    ]
+    for stage in stages:
+        client.post(
+            f"/interview/sessions/{session_id}/advance-stage",
+            json={"stage": stage},
+            headers=headers,
+        )
+
+
 def _valid_proposal_item():
     return {
         "path": "src/summarize.py",
@@ -207,6 +225,7 @@ def test_proposal_roundtrips_with_audit_and_default_decision_method(admin_client
         "/interview/sessions", json={"snapshot_id": snapshot_id}, headers=headers
     ).json()
     sid = session["id"]
+    _advance_to_proposal_generation(admin_client, sid, headers)
 
     r = admin_client.post(
         f"/interview/sessions/{sid}/proposals",
@@ -292,6 +311,7 @@ def test_system_isolation_for_sessions_and_proposals(admin_client):
     session_a = admin_client.post(
         "/interview/sessions", json={"snapshot_id": snapshot_a}, headers=headers_a
     ).json()
+    _advance_to_proposal_generation(admin_client, session_a["id"], headers_a)
     admin_client.post(
         f"/interview/sessions/{session_a['id']}/proposals",
         json={"audit": _valid_audit(), "proposals": [_valid_proposal_item()]},
@@ -496,3 +516,74 @@ def test_session_has_last_error_field(admin_client):
     data = r.json()
     assert "last_error" in data
     assert data["last_error"] is None
+
+
+def test_proposals_rejected_before_proposal_stage(admin_client):
+    """P1: /proposals API must enforce stage gate."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "gate test"},
+        headers=headers,
+    ).json()
+    sid = session["id"]
+
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/proposals",
+        json={"audit": _valid_audit(), "proposals": [_valid_proposal_item()]},
+        headers=headers,
+    )
+    assert r.status_code == 422
+    assert "proposal_generation" in r.json()["detail"]
+
+
+def test_proposals_accepted_in_proposal_stage(admin_client):
+    """P1: /proposals API works when in proposal_generation stage."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "gate accept"},
+        headers=headers,
+    ).json()
+    sid = session["id"]
+    _advance_to_proposal_generation(admin_client, sid, headers)
+
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/proposals",
+        json={"audit": _valid_audit(), "proposals": [_valid_proposal_item()]},
+        headers=headers,
+    )
+    assert r.status_code == 201
+
+
+def test_proposal_provenance_fields_persisted(admin_client):
+    """P2: proposal provenance fields are stored and returned."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "provenance test"},
+        headers=headers,
+    ).json()
+    sid = session["id"]
+    _advance_to_proposal_generation(admin_client, sid, headers)
+
+    item = _valid_proposal_item()
+    item["graph_node_id"] = "abc123def456"
+    item["capability_name"] = "Trace Recording"
+    item["evidence_summary"] = "README.md:1-5 describes trace recording"
+    item["proposal_confidence"] = 0.85
+
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/proposals",
+        json={"audit": _valid_audit(), "proposals": [item]},
+        headers=headers,
+    )
+    assert r.status_code == 201
+    proposal = r.json()[0]
+    assert proposal["graph_node_id"] == "abc123def456"
+    assert proposal["capability_name"] == "Trace Recording"
+    assert proposal["evidence_summary"] == "README.md:1-5 describes trace recording"
+    assert proposal["proposal_confidence"] == 0.85
