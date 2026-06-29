@@ -1452,3 +1452,218 @@ describe("Flow Explorer auto-select from URL (Issue #62)", () => {
     });
   });
 });
+
+// ── System Understanding page tests ─────────────────────────────────
+
+describe("System Understanding page", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const emptyResponse = {
+    system_id: 1,
+    snapshot_id: null,
+    commit_sha: null,
+    pipeline: [
+      { step: "repository_configured", status: "missing" },
+      { step: "snapshot_ready", status: "missing" },
+      { step: "documentation_indexed", status: "missing" },
+      { step: "documentation_claims_scanned", status: "missing" },
+      { step: "symbols_indexed", status: "missing" },
+      { step: "entrypoints_discovered", status: "missing" },
+      { step: "docs_code_reconciled", status: "missing" },
+      { step: "capability_hierarchy_ready", status: "missing" },
+    ],
+    purpose: null,
+    capabilities: [],
+    entrypoints: [],
+    major_symbols: [],
+    gaps: [],
+    gap_summary: [],
+    metadata_coverage: null,
+    next_actions: [{ action: "Configure repository", reason: "No repository configured", link: "/repository" }],
+  };
+
+  const completeResponse = {
+    system_id: 1,
+    snapshot_id: 5,
+    commit_sha: "abc12345def",
+    pipeline: [
+      { step: "repository_configured", status: "complete" },
+      { step: "snapshot_ready", status: "complete" },
+      { step: "documentation_indexed", status: "complete" },
+      { step: "documentation_claims_scanned", status: "complete" },
+      { step: "symbols_indexed", status: "complete" },
+      { step: "entrypoints_discovered", status: "complete" },
+      { step: "docs_code_reconciled", status: "complete" },
+      { step: "capability_hierarchy_ready", status: "complete" },
+    ],
+    purpose: { name: "Test System", summary: "A test system for unit testing", provenance_kind: "reasoning_llm" },
+    capabilities: [
+      { name: "User Auth", summary: "Handles authentication", provenance_kind: "reasoning_llm" },
+    ],
+    entrypoints: [
+      { entrypoint_type: "http_route", entrypoint_id: "GET:/items", category: "api", label: "List items" },
+    ],
+    major_symbols: [
+      { path: "src/main.py", qualified_name: "list_items", kind: "function", route_path: "/items", route_method: "GET", component_id: null },
+    ],
+    gaps: [],
+    gap_summary: [],
+    metadata_coverage: { symbol_count: 42, symbols_with_source_metadata: 5, entrypoint_count: 10, entrypoints_with_capability_link: 3 },
+    next_actions: [],
+  };
+
+  const blockedResponse = {
+    ...emptyResponse,
+    snapshot_id: 3,
+    commit_sha: "def456",
+    pipeline: [
+      { step: "repository_configured", status: "complete" },
+      { step: "snapshot_ready", status: "complete" },
+      { step: "documentation_indexed", status: "missing", detail: "Reasoning model required" },
+      { step: "documentation_claims_scanned", status: "missing" },
+      { step: "symbols_indexed", status: "complete" },
+      { step: "entrypoints_discovered", status: "complete" },
+      { step: "docs_code_reconciled", status: "missing" },
+      { step: "capability_hierarchy_ready", status: "missing", detail: "Reasoning model required" },
+    ],
+    next_actions: [
+      { action: "Configure reasoning model", reason: "Required for documentation and capability analysis", link: null },
+    ],
+  };
+
+  const gapResponse = {
+    ...completeResponse,
+    gap_summary: [
+      { gap_type: "docs_only", count: 3 },
+      { gap_type: "code_only", count: 5 },
+    ],
+    metadata_coverage: { symbol_count: 100, symbols_with_source_metadata: 2, entrypoint_count: 20, entrypoints_with_capability_link: 1 },
+  };
+
+  test("renders empty state when no snapshot exists", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(emptyResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByText("System Understanding")).toBeTruthy();
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Get started with System Understanding")).toBeTruthy();
+    });
+  });
+
+  test("renders pipeline complete state with all sections", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(completeResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByText("Test System")).toBeTruthy();
+    });
+
+    expect(screen.getByText("A test system for unit testing")).toBeTruthy();
+    expect(screen.getByText("User Auth")).toBeTruthy();
+    expect(screen.getByText("GET:/items")).toBeTruthy();
+    expect(screen.getByText("list_items")).toBeTruthy();
+    expect(screen.getByText("42")).toBeTruthy();
+    expect(screen.getByText("10")).toBeTruthy();
+  });
+
+  test("renders reasoning model blocked state without heuristic fallback", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(blockedResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("pipeline-checklist")).toBeTruthy();
+    });
+
+    const checklist = screen.getByTestId("pipeline-checklist");
+    expect(checklist.textContent).toContain("missing");
+    expect(checklist.textContent).toContain("complete");
+  });
+
+  test("renders docs-code gaps", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(gapResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("gap-summary")).toBeTruthy();
+    });
+
+    expect(screen.getByText("docs_only")).toBeTruthy();
+    expect(screen.getByText("code_only")).toBeTruthy();
+  });
+
+  test("renders metadata coverage with low values", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(gapResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("metadata-coverage")).toBeTruthy();
+    });
+
+    expect(screen.getByText("100")).toBeTruthy();
+    expect(screen.getByText("2 with metadata")).toBeTruthy();
+    expect(screen.getByText("20")).toBeTruthy();
+    expect(screen.getByText("1 with capability link")).toBeTruthy();
+  });
+
+  test("build button triggers POST and refreshes", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(emptyResponse)
+        : Promise.resolve(null),
+    );
+    mockApi.post.mockImplementation((path: string) =>
+      path === "/repository/system-understanding/build"
+        ? Promise.resolve(completeResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("build-button")).toBeTruthy();
+    });
+
+    fireEvent.click(screen.getByTestId("build-button"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/repository/system-understanding/build");
+    });
+  });
+});

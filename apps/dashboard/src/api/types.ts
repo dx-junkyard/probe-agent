@@ -1296,3 +1296,79 @@ export interface WorkspaceProposalDraftOut {
   missing_fields: string[];
   created_at: number;
 }
+
+// System Understanding (Issue #86 / #87)
+
+export interface SystemUnderstandingPipelineStep {
+  step: string;
+  status: "complete" | "missing" | "warning" | "blocked" | "failed";
+  detail?: string | null;
+}
+
+export interface SystemUnderstandingNextAction {
+  action: string;
+  reason: string;
+  link?: string | null;
+}
+
+export interface SystemUnderstandingGapSummary {
+  gap_type: string;
+  count: number;
+}
+
+export interface SystemUnderstandingMetadataCoverage {
+  symbol_count: number;
+  symbols_with_source_metadata: number;
+  entrypoint_count: number;
+  entrypoints_with_capability_link: number;
+}
+
+export interface SystemUnderstandingCapability {
+  name: string;
+  summary?: string | null;
+  provenance_kind?: string | null;
+}
+
+export interface SystemUnderstandingEntrypoint {
+  entrypoint_type: string;
+  entrypoint_id: string;
+  category?: string | null;
+  label?: string | null;
+}
+
+export interface SystemUnderstandingSymbol {
+  path: string;
+  qualified_name: string;
+  kind?: string | null;
+  route_path?: string | null;
+  route_method?: string | null;
+  component_id?: string | null;
+}
+
+export interface SystemUnderstandingPurpose {
+  name: string;
+  summary?: string | null;
+  provenance_kind?: string | null;
+}
+
+export interface SystemUnderstandingGap {
+  gap_type?: string | null;
+  node_name?: string | null;
+  notes?: string | null;
+  code_refs: Array<Record<string, unknown>>;
+}
+
+export interface SystemUnderstandingOut {
+  system_id: number;
+  snapshot_id: number | null;
+  commit_sha: string | null;
+  pipeline: SystemUnderstandingPipelineStep[];
+  purpose: SystemUnderstandingPurpose | null;
+  capabilities: SystemUnderstandingCapability[];
+  entrypoints: SystemUnderstandingEntrypoint[];
+  major_symbols: SystemUnderstandingSymbol[];
+  gaps: SystemUnderstandingGap[];
+  gap_summary: SystemUnderstandingGapSummary[];
+  metadata_coverage: SystemUnderstandingMetadataCoverage | null;
+  next_actions: SystemUnderstandingNextAction[];
+}
