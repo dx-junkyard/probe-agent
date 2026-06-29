@@ -1351,11 +1351,39 @@ export interface SystemUnderstandingPurpose {
   provenance_kind?: string | null;
 }
 
+export interface SystemUnderstandingGapNextAction {
+  action: string;
+  link?: string | null;
+}
+
+export interface SystemUnderstandingGapDocRef {
+  path: string;
+  start_line?: number | null;
+  end_line?: number | null;
+}
+
+export interface SystemUnderstandingGapSymbolRef {
+  path?: string | null;
+  qualified_name?: string | null;
+}
+
+export interface SystemUnderstandingGapEntrypointRef {
+  entrypoint_type?: string | null;
+  entrypoint_ref?: string | null;
+}
+
 export interface SystemUnderstandingGap {
   gap_type?: string | null;
+  severity: string;
+  title?: string | null;
   node_name?: string | null;
   notes?: string | null;
+  capability_key?: string | null;
+  doc_refs: SystemUnderstandingGapDocRef[];
+  symbol_refs: SystemUnderstandingGapSymbolRef[];
+  entrypoint_refs: SystemUnderstandingGapEntrypointRef[];
   code_refs: Array<Record<string, unknown>>;
+  next_actions: SystemUnderstandingGapNextAction[];
 }
 
 export interface SystemUnderstandingOut {

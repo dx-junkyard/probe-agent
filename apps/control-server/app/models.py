@@ -2149,11 +2149,39 @@ class SystemUnderstandingPurposeOut(BaseModel):
     provenance_kind: Optional[str] = None
 
 
+class SystemUnderstandingGapNextActionOut(BaseModel):
+    action: str
+    link: Optional[str] = None
+
+
+class SystemUnderstandingGapDocRef(BaseModel):
+    path: str
+    start_line: Optional[int] = None
+    end_line: Optional[int] = None
+
+
+class SystemUnderstandingGapSymbolRef(BaseModel):
+    path: Optional[str] = None
+    qualified_name: Optional[str] = None
+
+
+class SystemUnderstandingGapEntrypointRef(BaseModel):
+    entrypoint_type: Optional[str] = None
+    entrypoint_ref: Optional[str] = None
+
+
 class SystemUnderstandingGapOut(BaseModel):
     gap_type: Optional[str] = None
+    severity: str = "info"
+    title: Optional[str] = None
     node_name: Optional[str] = None
     notes: Optional[str] = None
+    capability_key: Optional[str] = None
+    doc_refs: List[SystemUnderstandingGapDocRef] = Field(default_factory=list)
+    symbol_refs: List[SystemUnderstandingGapSymbolRef] = Field(default_factory=list)
+    entrypoint_refs: List[SystemUnderstandingGapEntrypointRef] = Field(default_factory=list)
     code_refs: List[Dict[str, Any]] = Field(default_factory=list)
+    next_actions: List[SystemUnderstandingGapNextActionOut] = Field(default_factory=list)
 
 
 class SystemUnderstandingOut(BaseModel):

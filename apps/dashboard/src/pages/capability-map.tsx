@@ -6,6 +6,7 @@ import {
   useCapabilityHierarchy, useCapabilityHierarchyDrift,
   useGenerateCapabilityHierarchy, useRequestExplanationRefresh,
   useLatestSnapshot, useSymbols, useLatestDrafts,
+  useSystemUnderstanding,
 } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button, buttonVariants } from "@/components/ui/button";
@@ -128,9 +129,17 @@ function DetailsPanel({
 }) {
   const refresh = useRequestExplanationRefresh();
   const [proposal, setProposal] = useState<ExplanationRefreshOut | null>(null);
+  const { data: understanding } = useSystemUnderstanding();
 
   const data = selected.data;
   const provenance = data.provenance;
+
+  const relatedGaps = useMemo(() => {
+    if (!understanding?.gaps) return [];
+    const capName = selected.kind === "capability" ? data.name : null;
+    if (!capName) return [];
+    return understanding.gaps.filter((g) => g.capability_key === capName);
+  }, [understanding?.gaps, selected.kind, data.name]);
   const drift = driftByNode.get(data.id);
   const reviewRecommended = drift ? REVIEW_STATUSES.includes(drift.status) : false;
   const entrypointType = provenance.entrypoint_type;
@@ -263,6 +272,18 @@ function DetailsPanel({
               the source of truth; nothing is written back.
             </p>
             {proposal && <RefreshPanel data={proposal} />}
+          </div>
+        )}
+
+        {relatedGaps.length > 0 && (
+          <div className="pt-2 space-y-1.5" data-testid="related-gaps">
+            <p className="text-[11px] font-medium text-muted-foreground">Related gaps</p>
+            {relatedGaps.map((g, i) => (
+              <div key={i} className="flex items-center gap-1.5 text-[11px]">
+                <AlertTriangle className="h-3 w-3 text-yellow-600 shrink-0" />
+                <span>{g.title ?? g.node_name ?? g.gap_type}</span>
+              </div>
+            ))}
           </div>
         )}
       </CardContent>

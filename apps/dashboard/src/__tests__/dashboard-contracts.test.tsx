@@ -1485,6 +1485,66 @@ describe("System Understanding page", () => {
     next_actions: [{ action: "Configure repository", reason: "No repository configured", link: "/repository" }],
   };
 
+  const gapWorklistResponse = {
+    system_id: 1,
+    snapshot_id: 5,
+    commit_sha: "abc12345",
+    pipeline: [
+      { step: "repository_configured", status: "complete" },
+      { step: "snapshot_ready", status: "complete" },
+      { step: "documentation_indexed", status: "complete" },
+      { step: "documentation_claims_scanned", status: "complete" },
+      { step: "symbols_indexed", status: "complete" },
+      { step: "entrypoints_discovered", status: "complete" },
+      { step: "docs_code_reconciled", status: "warning" },
+      { step: "capability_hierarchy_ready", status: "complete" },
+    ],
+    purpose: { name: "Test System", summary: "A test system", provenance_kind: "reasoning_llm" },
+    capabilities: [],
+    entrypoints: [],
+    major_symbols: [],
+    gaps: [
+      {
+        gap_type: "unclassified_entrypoint",
+        severity: "info",
+        title: "Entrypoint not classified: GET:/items",
+        node_name: "GET:/items",
+        notes: "No capability classification",
+        capability_key: null,
+        doc_refs: [],
+        symbol_refs: [{ path: "src/main.py", qualified_name: "list_items" }],
+        entrypoint_refs: [{ entrypoint_type: "http_route", entrypoint_ref: "GET:/items" }],
+        code_refs: [],
+        next_actions: [
+          { action: "Open Interview", link: "/interview" },
+          { action: "Add source metadata", link: "/interview" },
+        ],
+      },
+      {
+        gap_type: "docs_only",
+        severity: "warning",
+        title: "Documented but no matching implementation: Auth",
+        node_name: "Auth",
+        notes: "Found in docs but no matching code",
+        capability_key: null,
+        doc_refs: [{ path: "docs/design.md", start_line: 10, end_line: 20 }],
+        symbol_refs: [],
+        entrypoint_refs: [],
+        code_refs: [],
+        next_actions: [
+          { action: "Open docs evidence", link: null },
+          { action: "Create implementation issue", link: null },
+        ],
+      },
+    ],
+    gap_summary: [
+      { gap_type: "unclassified_entrypoint", count: 1 },
+      { gap_type: "docs_only", count: 1 },
+    ],
+    metadata_coverage: { symbol_count: 42, symbols_with_source_metadata: 5, entrypoint_count: 10, entrypoints_with_capability_link: 3 },
+    next_actions: [{ action: "Review docs-code gaps", reason: "2 gaps found", link: "/system-understanding" }],
+  };
+
   const completeResponse = {
     system_id: 1,
     snapshot_id: 5,
@@ -1536,6 +1596,15 @@ describe("System Understanding page", () => {
 
   const gapResponse = {
     ...completeResponse,
+    gaps: [
+      {
+        gap_type: "docs_only", severity: "warning", title: "Documented but missing: Feature X",
+        node_name: "Feature X", notes: null, capability_key: null,
+        doc_refs: [{ path: "README.md", start_line: 1, end_line: 5 }],
+        symbol_refs: [], entrypoint_refs: [], code_refs: [],
+        next_actions: [{ action: "Open docs evidence", link: null }],
+      },
+    ],
     gap_summary: [
       { gap_type: "docs_only", count: 3 },
       { gap_type: "code_only", count: 5 },
@@ -1603,10 +1672,66 @@ describe("System Understanding page", () => {
     expect(checklist.textContent).toContain("complete");
   });
 
-  test("renders docs-code gaps", async () => {
+  test("renders docs-code gap worklist with cards", async () => {
     mockApi.get.mockImplementation((path: string) =>
       path === "/repository/system-understanding"
-        ? Promise.resolve(gapResponse)
+        ? Promise.resolve(gapWorklistResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("gap-worklist")).toBeTruthy();
+    });
+
+    expect(screen.getByText(/Entrypoint not classified/)).toBeTruthy();
+    expect(screen.getByText(/Documented but no matching implementation/)).toBeTruthy();
+
+    const cards = screen.getAllByTestId("gap-card");
+    expect(cards.length).toBe(2);
+  });
+
+  test("renders gap next action buttons", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(gapWorklistResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("gap-worklist")).toBeTruthy();
+    });
+
+    expect(screen.getByText("Open Interview")).toBeTruthy();
+    expect(screen.getByText("Open docs evidence")).toBeTruthy();
+  });
+
+  test("shows no-gaps message when gaps are empty", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve({ ...completeResponse, gaps: [], gap_summary: [] })
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("no-gaps-message")).toBeTruthy();
+    });
+
+    expect(screen.getByText(/No significant differences/)).toBeTruthy();
+  });
+
+  test("renders gap type filter buttons", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(gapWorklistResponse)
         : Promise.resolve(null),
     );
 
@@ -1617,11 +1742,12 @@ describe("System Understanding page", () => {
       expect(screen.getByTestId("gap-summary")).toBeTruthy();
     });
 
-    expect(screen.getByText("docs_only")).toBeTruthy();
-    expect(screen.getByText("code_only")).toBeTruthy();
+    expect(screen.getByText("All (2)")).toBeTruthy();
+    expect(screen.getByText("unclassified_entrypoint (1)")).toBeTruthy();
+    expect(screen.getByText("docs_only (1)")).toBeTruthy();
   });
 
-  test("renders metadata coverage with low values", async () => {
+  test("renders metadata coverage with values from gap response", async () => {
     mockApi.get.mockImplementation((path: string) =>
       path === "/repository/system-understanding"
         ? Promise.resolve(gapResponse)

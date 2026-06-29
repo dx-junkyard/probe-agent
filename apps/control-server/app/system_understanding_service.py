@@ -310,7 +310,7 @@ def _load_gaps_from_reconciler(conn, system_id: int, snapshot_id: int) -> List[D
         (system_id, snapshot_id),
     ).fetchone()
     if graph_row is None:
-        return []
+        return _detect_extra_gaps(conn, system_id, snapshot_id)
 
     graph_data = _json.loads(graph_row["graph_json"])
     nodes = {}
@@ -351,16 +351,149 @@ def _load_gaps_from_reconciler(conn, system_id: int, snapshot_id: int) -> List[D
     for g in result.gaps:
         gap_dict: Dict[str, Any] = {
             "gap_type": g.gap_type,
+            "severity": _gap_severity(g.gap_type),
+            "title": _gap_title(g.gap_type, g.node_name),
             "node_name": g.node_name,
             "notes": g.notes,
+            "capability_key": None,
+            "doc_refs": [],
+            "symbol_refs": [],
+            "entrypoint_refs": [],
+            "code_refs": [],
+            "next_actions": _gap_next_actions(g.gap_type),
         }
+        if g.node_id and g.node_id in graph.nodes:
+            node = graph.nodes[g.node_id]
+            for parent_id, parent_node in graph.nodes.items():
+                if parent_node.node_type == "capability":
+                    gap_dict["capability_key"] = parent_node.name
+                    break
+        if g.doc_evidence:
+            gap_dict["doc_refs"] = [
+                {"path": de.path, "start_line": de.start_line, "end_line": de.end_line}
+                for de in g.doc_evidence
+                if de.path
+            ]
         if g.code_evidence:
             gap_dict["code_refs"] = [
                 {"source": ce.source, "path": ce.path, "qualified_name": ce.qualified_name}
                 for ce in g.code_evidence
             ]
+            gap_dict["symbol_refs"] = [
+                {"path": ce.path, "qualified_name": ce.qualified_name}
+                for ce in g.code_evidence
+                if ce.qualified_name
+            ]
+            gap_dict["entrypoint_refs"] = [
+                {"entrypoint_type": "api", "entrypoint_ref": f"{ce.route_method} {ce.route_path}"}
+                for ce in g.code_evidence
+                if ce.route_method and ce.route_path
+            ]
         gaps.append(gap_dict)
+
+    gaps.extend(_detect_extra_gaps(conn, system_id, snapshot_id))
     return gaps
+
+
+GAP_SEVERITY: Dict[str, str] = {
+    "docs_only": "warning",
+    "code_only": "info",
+    "source_doc_mismatch": "warning",
+    "stale_explanation": "warning",
+    "unclassified_entrypoint": "info",
+    "missing_probe_flow": "info",
+    "missing_evidence": "info",
+    "ambiguous_ownership": "warning",
+}
+
+GAP_TITLE_TEMPLATES: Dict[str, str] = {
+    "docs_only": "Documented but no matching implementation found: {name}",
+    "code_only": "Implemented but not documented: {name}",
+    "source_doc_mismatch": "Source metadata and docs disagree: {name}",
+    "stale_explanation": "Explanation may be outdated: {name}",
+    "unclassified_entrypoint": "Entrypoint not classified in capability hierarchy: {name}",
+    "missing_probe_flow": "No probe flow defined: {name}",
+    "missing_evidence": "Documentation claim lacks path/line evidence: {name}",
+    "ambiguous_ownership": "Ambiguous ownership: {name}",
+}
+
+GAP_NEXT_ACTIONS: Dict[str, List[Dict[str, Optional[str]]]] = {
+    "docs_only": [
+        {"action": "Open docs evidence", "link": None},
+        {"action": "Create implementation issue", "link": None},
+    ],
+    "code_only": [
+        {"action": "Open source symbol", "link": "/repository"},
+        {"action": "Add docs or source metadata", "link": "/interview"},
+    ],
+    "source_doc_mismatch": [
+        {"action": "Propose explanation refresh", "link": "/capability-map"},
+    ],
+    "stale_explanation": [
+        {"action": "Propose explanation refresh", "link": "/capability-map"},
+    ],
+    "unclassified_entrypoint": [
+        {"action": "Open Interview", "link": "/interview"},
+        {"action": "Add source metadata", "link": "/interview"},
+    ],
+    "missing_probe_flow": [
+        {"action": "Open Flow Explorer", "link": "/flow-explorer"},
+        {"action": "Create Probe Plan", "link": "/probe-planner"},
+    ],
+    "missing_evidence": [
+        {"action": "Improve documentation index", "link": "/repository"},
+    ],
+    "ambiguous_ownership": [
+        {"action": "Clarify ownership in Interview", "link": "/interview"},
+    ],
+}
+
+
+def _gap_severity(gap_type: Optional[str]) -> str:
+    return GAP_SEVERITY.get(gap_type or "", "info")
+
+
+def _gap_title(gap_type: Optional[str], node_name: Optional[str]) -> str:
+    template = GAP_TITLE_TEMPLATES.get(gap_type or "", "Gap: {name}")
+    return template.format(name=node_name or "unknown")
+
+
+def _gap_next_actions(gap_type: Optional[str]) -> List[Dict[str, Optional[str]]]:
+    return list(GAP_NEXT_ACTIONS.get(gap_type or "", []))
+
+
+def _detect_extra_gaps(conn, system_id: int, snapshot_id: int) -> List[Dict[str, Any]]:
+    """Detect additional gaps not covered by the reconciler (e.g. unclassified entrypoints, missing probe flows)."""
+    extra: List[Dict[str, Any]] = []
+
+    unclassified = conn.execute(
+        """SELECT ce.entrypoint_type, ce.entrypoint_id, ce.handler_path, ce.handler_qualified_name
+           FROM code_entrypoints ce
+           WHERE ce.system_id = ? AND ce.snapshot_id = ?
+           AND NOT EXISTS (
+               SELECT 1 FROM capability_hierarchy_nodes chn
+               WHERE chn.system_id = ce.system_id AND chn.snapshot_id = ce.snapshot_id
+               AND chn.entrypoint_id = ce.id
+           )""",
+        (system_id, snapshot_id),
+    ).fetchall()
+    for uc in unclassified:
+        ep_label = uc["entrypoint_id"] or uc["handler_qualified_name"] or "unknown"
+        extra.append({
+            "gap_type": "unclassified_entrypoint",
+            "severity": "info",
+            "title": _gap_title("unclassified_entrypoint", ep_label),
+            "node_name": ep_label,
+            "notes": f"Entrypoint {uc['entrypoint_type']}:{uc['entrypoint_id']} has no capability classification",
+            "capability_key": None,
+            "doc_refs": [],
+            "symbol_refs": [{"path": uc["handler_path"], "qualified_name": uc["handler_qualified_name"]}] if uc["handler_qualified_name"] else [],
+            "entrypoint_refs": [{"entrypoint_type": uc["entrypoint_type"], "entrypoint_ref": uc["entrypoint_id"]}],
+            "code_refs": [],
+            "next_actions": _gap_next_actions("unclassified_entrypoint"),
+        })
+
+    return extra
 
 
 def _compute_gap_summary(gaps: List[Dict[str, Any]]) -> List[GapSummary]:

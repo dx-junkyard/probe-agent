@@ -294,3 +294,118 @@ class TestPipelineStepStatuses:
         valid_statuses = {"complete", "missing", "warning", "blocked", "failed"}
         for step in data["pipeline"]:
             assert step["status"] in valid_statuses, f"Invalid status for {step['step']}: {step['status']}"
+
+
+class TestGapWorklist:
+    def test_gaps_include_structured_fields(self, admin_client, tmp_path):
+        """After build, gaps should include severity, title, and next_actions."""
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "gap-struct-sys")
+        hdrs = _headers(token, sys["id"])
+        repo, sha = _init_git_repo(tmp_path)
+
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        admin_client.post(
+            "/repository/snapshots",
+            json={"commit_sha": sha},
+            headers=hdrs,
+        )
+
+        r = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        assert r.status_code == 200
+        data = r.json()
+
+        for gap in data["gaps"]:
+            assert "gap_type" in gap
+            assert "severity" in gap
+            assert gap["severity"] in ("info", "warning", "error")
+            assert "title" in gap
+            assert "next_actions" in gap
+            assert isinstance(gap["next_actions"], list)
+            assert "doc_refs" in gap
+            assert "symbol_refs" in gap
+            assert "entrypoint_refs" in gap
+
+    def test_gap_next_actions_are_deterministic(self, admin_client, tmp_path):
+        """Same state should produce same gap next_actions."""
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "gap-det-sys")
+        hdrs = _headers(token, sys["id"])
+        repo, sha = _init_git_repo(tmp_path)
+
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        admin_client.post(
+            "/repository/snapshots",
+            json={"commit_sha": sha},
+            headers=hdrs,
+        )
+
+        r1 = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        r2 = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+
+        gaps1 = r1.json()["gaps"]
+        gaps2 = r2.json()["gaps"]
+        actions1 = [
+            [a["action"] for a in g["next_actions"]]
+            for g in gaps1
+        ]
+        actions2 = [
+            [a["action"] for a in g["next_actions"]]
+            for g in gaps2
+        ]
+        assert actions1 == actions2
+
+    def test_unclassified_entrypoints_detected(self, admin_client, tmp_path):
+        """Entrypoints without capability links should appear as unclassified_entrypoint gaps."""
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "gap-unclass-sys")
+        hdrs = _headers(token, sys["id"])
+        repo, sha = _init_git_repo(tmp_path)
+
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        admin_client.post(
+            "/repository/snapshots",
+            json={"commit_sha": sha},
+            headers=hdrs,
+        )
+
+        r = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        assert r.status_code == 200
+        data = r.json()
+
+        ep_count = data["metadata_coverage"]["entrypoint_count"]
+        ep_linked = data["metadata_coverage"]["entrypoints_with_capability_link"]
+        unclassified_gaps = [g for g in data["gaps"] if g["gap_type"] == "unclassified_entrypoint"]
+
+        if ep_count > 0 and ep_linked == 0:
+            assert len(unclassified_gaps) > 0
+            for ug in unclassified_gaps:
+                assert ug["severity"] == "info"
+                assert any(a["action"] == "Open Interview" for a in ug["next_actions"])
+
+    def test_no_gaps_returns_empty_list(self, admin_client, tmp_path):
+        """When no snapshot exists, gaps should be an empty list."""
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "gap-empty-sys")
+        hdrs = _headers(token, sys["id"])
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200
+        data = r.json()
+
+        assert data["gaps"] == []
+        assert data["gap_summary"] == []

@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useSystemUnderstanding, useBuildSystemUnderstanding } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
@@ -6,11 +7,12 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   CheckCircle2, XCircle, AlertTriangle, Ban, HelpCircle,
-  RefreshCw, ArrowRight, ExternalLink,
+  RefreshCw, ArrowRight, ExternalLink, FileText, Code, Zap,
 } from "lucide-react";
 import type {
   SystemUnderstandingPipelineStep,
   SystemUnderstandingNextAction,
+  SystemUnderstandingGap,
   SystemUnderstandingOut,
 } from "@/api/types";
 
@@ -112,6 +114,166 @@ function NextActionsList({ actions }: { actions: SystemUnderstandingNextAction[]
         </li>
       ))}
     </ul>
+  );
+}
+
+function SeverityIcon({ severity }: { severity: string }) {
+  switch (severity) {
+    case "warning": return <AlertTriangle className="h-4 w-4 text-yellow-600" />;
+    case "error": return <XCircle className="h-4 w-4 text-red-600" />;
+    default: return <HelpCircle className="h-4 w-4 text-blue-500" />;
+  }
+}
+
+function GapCard({ gap }: { gap: SystemUnderstandingGap }) {
+  return (
+    <div className="rounded-lg border p-4 space-y-3" data-testid="gap-card">
+      <div className="flex items-start gap-2">
+        <SeverityIcon severity={gap.severity} />
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-medium">{gap.title ?? gap.node_name ?? "Unknown gap"}</p>
+          <div className="flex flex-wrap items-center gap-1.5 mt-1">
+            <Badge variant="outline" className="text-xs">{gap.gap_type}</Badge>
+            <Badge variant={gap.severity === "warning" ? "secondary" : "outline"} className="text-xs">{gap.severity}</Badge>
+            {gap.capability_key && (
+              <Badge variant="secondary" className="text-xs">
+                <Link to="/capability-map" className="hover:underline">{gap.capability_key}</Link>
+              </Badge>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {gap.notes && (
+        <p className="text-xs text-muted-foreground pl-6">{gap.notes}</p>
+      )}
+
+      {(gap.doc_refs.length > 0 || gap.symbol_refs.length > 0 || gap.entrypoint_refs.length > 0) && (
+        <div className="pl-6 space-y-1.5 text-xs">
+          {gap.doc_refs.map((dr, i) => (
+            <div key={`doc-${i}`} className="flex items-center gap-1.5 text-muted-foreground">
+              <FileText className="h-3 w-3 shrink-0" />
+              <span className="font-mono">
+                {dr.path}
+                {dr.start_line != null && dr.end_line != null && `:${dr.start_line}-${dr.end_line}`}
+              </span>
+            </div>
+          ))}
+          {gap.symbol_refs.map((sr, i) => (
+            <div key={`sym-${i}`} className="flex items-center gap-1.5 text-muted-foreground">
+              <Code className="h-3 w-3 shrink-0" />
+              <span className="font-mono">
+                {sr.path && `${sr.path}: `}{sr.qualified_name}
+              </span>
+            </div>
+          ))}
+          {gap.entrypoint_refs.map((er, i) => (
+            <div key={`ep-${i}`} className="flex items-center gap-1.5 text-muted-foreground">
+              <Zap className="h-3 w-3 shrink-0" />
+              <span className="font-mono">{er.entrypoint_type}: {er.entrypoint_ref}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {gap.next_actions.length > 0 && (
+        <div className="pl-6 flex flex-wrap gap-2">
+          {gap.next_actions.map((na, i) => (
+            na.link ? (
+              <Link key={i} to={na.link}>
+                <Button variant="outline" size="sm" className="h-7 text-xs">
+                  {na.action}
+                </Button>
+              </Link>
+            ) : (
+              <Button key={i} variant="outline" size="sm" className="h-7 text-xs" disabled>
+                {na.action}
+              </Button>
+            )
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function GapWorklist({ gaps, gapSummary }: {
+  gaps: SystemUnderstandingGap[];
+  gapSummary: { gap_type: string; count: number }[];
+}) {
+  const [typeFilter, setTypeFilter] = useState<string | null>(null);
+
+  if (gaps.length === 0 && gapSummary.length === 0) {
+    return (
+      <Card data-testid="gap-worklist">
+        <CardHeader>
+          <CardTitle className="text-base">Docs-Code Gaps</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <p className="text-sm text-muted-foreground" data-testid="no-gaps-message">
+            No significant differences found between documentation and code.
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  const allTypes = Array.from(new Set(gaps.map((g) => g.gap_type ?? "unknown")));
+  const filtered = typeFilter
+    ? gaps.filter((g) => (g.gap_type ?? "unknown") === typeFilter)
+    : gaps;
+
+  const severityCounts = gaps.reduce((acc, g) => {
+    acc[g.severity] = (acc[g.severity] || 0) + 1;
+    return acc;
+  }, {} as Record<string, number>);
+
+  return (
+    <Card data-testid="gap-worklist">
+      <CardHeader>
+        <CardTitle className="text-base">Docs-Code Gap Worklist</CardTitle>
+        <CardDescription>
+          {gaps.length} gap{gaps.length !== 1 ? "s" : ""} found
+          {Object.entries(severityCounts).map(([sev, cnt]) => (
+            <span key={sev}> / {cnt} {sev}</span>
+          ))}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {/* Summary chips */}
+        <div className="flex flex-wrap gap-2" data-testid="gap-summary">
+          <Button
+            variant={typeFilter === null ? "default" : "outline"}
+            size="sm"
+            className="h-7 text-xs"
+            onClick={() => setTypeFilter(null)}
+          >
+            All ({gaps.length})
+          </Button>
+          {allTypes.map((t) => {
+            const count = gaps.filter((g) => (g.gap_type ?? "unknown") === t).length;
+            return (
+              <Button
+                key={t}
+                variant={typeFilter === t ? "default" : "outline"}
+                size="sm"
+                className="h-7 text-xs"
+                onClick={() => setTypeFilter(typeFilter === t ? null : t)}
+              >
+                {t} ({count})
+              </Button>
+            );
+          })}
+        </div>
+
+        {/* Gap cards */}
+        <div className="space-y-3" data-testid="gap-cards">
+          {filtered.map((gap, i) => (
+            <GapCard key={i} gap={gap} />
+          ))}
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 
@@ -322,28 +484,8 @@ function DataView({ data }: { data: SystemUnderstandingOut }) {
         </Card>
       )}
 
-      {/* Docs-Code Gaps */}
-      {data.gap_summary.length > 0 && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-base">Docs-Code Gaps</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="flex flex-wrap gap-3" data-testid="gap-summary">
-              {data.gap_summary.map((g, i) => (
-                <div key={i} className="flex items-center gap-2 rounded-md border px-3 py-2 text-sm">
-                  <AlertTriangle className="h-4 w-4 text-yellow-600" />
-                  <span className="font-medium">{g.gap_type}</span>
-                  <Badge variant="secondary">{g.count}</Badge>
-                </div>
-              ))}
-            </div>
-            <p className="text-xs text-muted-foreground mt-3">
-              Total gaps: {data.gap_summary.reduce((s, g) => s + g.count, 0)}
-            </p>
-          </CardContent>
-        </Card>
-      )}
+      {/* Docs-Code Gap Worklist */}
+      <GapWorklist gaps={data.gaps} gapSummary={data.gap_summary} />
 
       {/* Next Actions */}
       {data.next_actions.length > 0 && (

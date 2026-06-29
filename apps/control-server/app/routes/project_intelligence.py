@@ -219,6 +219,10 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
         SystemUnderstandingSymbolSummaryOut,
         SystemUnderstandingPurposeOut,
         SystemUnderstandingGapOut,
+        SystemUnderstandingGapNextActionOut,
+        SystemUnderstandingGapDocRef,
+        SystemUnderstandingGapSymbolRef,
+        SystemUnderstandingGapEntrypointRef,
     )
     pipeline = [
         SystemUnderstandingPipelineStepOut(step=s.step, status=s.status, detail=s.detail)
@@ -237,7 +241,20 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
         SystemUnderstandingSymbolSummaryOut(**s) for s in summary.major_symbols
     ]
     gaps = [
-        SystemUnderstandingGapOut(**g) for g in summary.gaps
+        SystemUnderstandingGapOut(
+            gap_type=g.get("gap_type"),
+            severity=g.get("severity", "info"),
+            title=g.get("title"),
+            node_name=g.get("node_name"),
+            notes=g.get("notes"),
+            capability_key=g.get("capability_key"),
+            doc_refs=[SystemUnderstandingGapDocRef(**dr) for dr in g.get("doc_refs", [])],
+            symbol_refs=[SystemUnderstandingGapSymbolRef(**sr) for sr in g.get("symbol_refs", [])],
+            entrypoint_refs=[SystemUnderstandingGapEntrypointRef(**er) for er in g.get("entrypoint_refs", [])],
+            code_refs=g.get("code_refs", []),
+            next_actions=[SystemUnderstandingGapNextActionOut(**na) for na in g.get("next_actions", [])],
+        )
+        for g in summary.gaps
     ]
     gap_summary = [
         SystemUnderstandingGapSummaryOut(gap_type=gs.gap_type, count=gs.count)
