@@ -16,7 +16,7 @@ issue #1 で定義された MVP の実装メモ。
                                                   |
                                           +---------------+
                                           |  Dashboard    |
-                                          |  (Streamlit)  |
+                                          |  (React/Vite) |
                                           +---------------+
 ```
 
