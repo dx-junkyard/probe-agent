@@ -24,6 +24,9 @@ from app.understanding_graph import (
 )
 from app.docs_code_reconciler import ReconciliationResult, ReconciliationMapping
 from app.system_understanding_reviewer import (
+    CONFIDENCE_LEVELS,
+    GAP_TYPE_VALUES,
+    NEXT_ACTION_VALUES,
     ReviewResult,
     generate_understanding_review,
     PROMPT_VERSION,
@@ -125,7 +128,7 @@ VALID_REVIEW_RESPONSE = {
         {"question": "What is the primary deployment target?", "category": "purpose", "priority": "high"},
         {"question": "Which API endpoints handle shadow results?", "category": "api", "priority": "medium"},
     ],
-    "suggested_next_action": "Confirm system purpose before capability review",
+    "suggested_next_action": "confirm_purpose",
 }
 
 
@@ -245,7 +248,7 @@ class TestReviewGeneration:
             "open_questions": [
                 {"question": "No graph available - start documentation?", "category": "general", "priority": "high"}
             ],
-            "suggested_next_action": "Create documentation",
+            "suggested_next_action": "confirm_purpose",
         })
         result = generate_understanding_review(
             client, _reasoning_config(),
@@ -253,3 +256,121 @@ class TestReviewGeneration:
         )
         assert result.error is None
         assert len(result.open_questions) > 0
+
+
+class TestEnumValidation:
+    """P1: invalid enum values must be rejected by schema validation."""
+
+    def test_invalid_confidence_level_rejected(self):
+        response = dict(VALID_REVIEW_RESPONSE)
+        response["system_purpose"] = [{
+            "name": "Test",
+            "summary": "Test",
+            "confidence": {"level": "definitely", "reason": "bad"},
+            "evidence": [{"path": "a.md", "start_line": 1, "end_line": 5, "summary": "s"}],
+        }]
+        graph = _build_graph([_claim()])
+        client = FakeReasoningClient(response)
+        result = generate_understanding_review(
+            client, _reasoning_config(),
+            graph=graph, reconciliation=_empty_reconciliation(),
+        )
+        assert result.error is not None
+
+    def test_invalid_gap_type_rejected(self):
+        response = dict(VALID_REVIEW_RESPONSE)
+        response["gap_analysis"] = [{"gap_type": "nonsense", "name": "bad", "severity": "low"}]
+        graph = _build_graph([_claim()])
+        client = FakeReasoningClient(response)
+        result = generate_understanding_review(
+            client, _reasoning_config(),
+            graph=graph, reconciliation=_empty_reconciliation(),
+        )
+        assert result.error is not None
+
+    def test_invalid_severity_rejected(self):
+        response = dict(VALID_REVIEW_RESPONSE)
+        response["gap_analysis"] = [{"gap_type": "code_only", "name": "x", "severity": "critical"}]
+        graph = _build_graph([_claim()])
+        client = FakeReasoningClient(response)
+        result = generate_understanding_review(
+            client, _reasoning_config(),
+            graph=graph, reconciliation=_empty_reconciliation(),
+        )
+        assert result.error is not None
+
+    def test_invalid_category_rejected(self):
+        response = dict(VALID_REVIEW_RESPONSE)
+        response["open_questions"] = [{"question": "?", "category": "random", "priority": "high"}]
+        graph = _build_graph([_claim()])
+        client = FakeReasoningClient(response)
+        result = generate_understanding_review(
+            client, _reasoning_config(),
+            graph=graph, reconciliation=_empty_reconciliation(),
+        )
+        assert result.error is not None
+
+    def test_invalid_next_action_rejected(self):
+        response = dict(VALID_REVIEW_RESPONSE)
+        response["suggested_next_action"] = "Generate probe proposals now"
+        graph = _build_graph([_claim()])
+        client = FakeReasoningClient(response)
+        result = generate_understanding_review(
+            client, _reasoning_config(),
+            graph=graph, reconciliation=_empty_reconciliation(),
+        )
+        assert result.error is not None
+
+
+class TestEvidenceRequired:
+    """P1: major understanding items without evidence must be downgraded."""
+
+    def test_purpose_without_evidence_downgraded(self):
+        response = dict(VALID_REVIEW_RESPONSE)
+        response["system_purpose"] = [{
+            "name": "Unevidenced purpose",
+            "summary": "Claimed without evidence",
+            "confidence": {"level": "confirmed", "reason": "trust me"},
+            "evidence": [],
+        }]
+        graph = _build_graph([_claim()])
+        client = FakeReasoningClient(response)
+        result = generate_understanding_review(
+            client, _reasoning_config(),
+            graph=graph, reconciliation=_empty_reconciliation(),
+        )
+        assert result.error is None
+        purpose = result.current_understanding["system_purpose"][0]
+        assert purpose["confidence"]["level"] == "uncertain"
+        evidence_questions = [q for q in result.open_questions
+                             if "no evidence" in q["question"].lower()]
+        assert len(evidence_questions) >= 1
+
+    def test_capability_without_evidence_downgraded(self):
+        response = dict(VALID_REVIEW_RESPONSE)
+        response["core_capabilities"] = [{
+            "name": "Unevidenced cap",
+            "summary": "No proof",
+            "confidence": {"level": "likely", "reason": "maybe"},
+            "evidence": [],
+        }]
+        graph = _build_graph([_claim()])
+        client = FakeReasoningClient(response)
+        result = generate_understanding_review(
+            client, _reasoning_config(),
+            graph=graph, reconciliation=_empty_reconciliation(),
+        )
+        assert result.error is None
+        cap = result.current_understanding["core_capabilities"][0]
+        assert cap["confidence"]["level"] == "uncertain"
+
+    def test_item_with_evidence_not_downgraded(self):
+        graph = _build_graph([_claim()])
+        client = FakeReasoningClient(VALID_REVIEW_RESPONSE)
+        result = generate_understanding_review(
+            client, _reasoning_config(),
+            graph=graph, reconciliation=_empty_reconciliation(),
+        )
+        assert result.error is None
+        purpose = result.current_understanding["system_purpose"][0]
+        assert purpose["confidence"]["level"] == "likely"

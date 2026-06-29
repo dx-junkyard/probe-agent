@@ -11,10 +11,11 @@ Does NOT generate metadata/probe proposals in this step.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .docs_code_reconciler import ReconciliationResult, ReconciliationMapping
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient, is_reasoning_model
@@ -24,9 +25,35 @@ PROMPT_VERSION = "understanding-review-v1"
 SCHEMA_VERSION = "understanding-review-v1"
 
 
+CONFIDENCE_LEVELS = {"confirmed", "likely", "uncertain", "conflicting"}
+GAP_TYPE_VALUES = {
+    "docs_only", "code_only", "source_doc_mismatch", "stale_explanation",
+    "ambiguous_ownership", "unclassified_entrypoint", "missing_probe_flow",
+}
+SEVERITY_VALUES = {"low", "medium", "high"}
+CATEGORY_VALUES = {"purpose", "capability", "api", "probe_flow", "general"}
+PRIORITY_VALUES = {"high", "medium", "low"}
+
+NEXT_ACTION_VALUES = {
+    "confirm_purpose",
+    "review_capabilities",
+    "review_elements",
+    "review_api_boundaries",
+    "review_probe_flows",
+    "resolve_conflicts",
+    "resolve_open_questions",
+    "ready_for_proposal",
+}
+
+_PROPOSAL_PATTERN = re.compile(
+    r"\b(generat|creat|propos|instrument|patch|metadata|probe.plan|probe.propos)\w*\b",
+    re.IGNORECASE,
+)
+
+
 class _ConfidenceLevel(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    level: str = "uncertain"
+    level: Literal["confirmed", "likely", "uncertain", "conflicting"] = "uncertain"
     reason: str = ""
 
 
@@ -52,17 +79,20 @@ class _UnderstandingItem(BaseModel):
 
 class _GapItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    gap_type: str
+    gap_type: Literal[
+        "docs_only", "code_only", "source_doc_mismatch", "stale_explanation",
+        "ambiguous_ownership", "unclassified_entrypoint", "missing_probe_flow",
+    ]
     name: str
     summary: str = ""
-    severity: str = "low"
+    severity: Literal["low", "medium", "high"] = "low"
 
 
 class _OpenQuestion(BaseModel):
     model_config = ConfigDict(extra="forbid")
     question: str
-    category: str = "general"
-    priority: str = "medium"
+    category: Literal["purpose", "capability", "api", "probe_flow", "general"] = "general"
+    priority: Literal["high", "medium", "low"] = "medium"
 
 
 class _RawReviewResponse(BaseModel):
@@ -76,7 +106,17 @@ class _RawReviewResponse(BaseModel):
     probe_flow_candidates: List[_UnderstandingItem] = Field(default_factory=list)
     gap_analysis: List[_GapItem] = Field(default_factory=list)
     open_questions: List[_OpenQuestion] = Field(default_factory=list)
-    suggested_next_action: str = ""
+    suggested_next_action: Literal[
+        "confirm_purpose",
+        "review_capabilities",
+        "review_elements",
+        "review_api_boundaries",
+        "review_probe_flows",
+        "resolve_conflicts",
+        "resolve_open_questions",
+        "ready_for_proposal",
+        "",
+    ] = ""
 
 
 @dataclass
@@ -233,6 +273,20 @@ def generate_understanding_review(
             is_mock=False,
             error=f"Failed to parse review response: {exc}",
         )
+
+    _EVIDENCE_REQUIRED_SECTIONS = (
+        "system_purpose", "core_capabilities", "capability_elements", "api_boundaries",
+    )
+    for section_name in _EVIDENCE_REQUIRED_SECTIONS:
+        items: List[_UnderstandingItem] = getattr(validated, section_name)
+        for item in items:
+            if not item.evidence:
+                item.confidence = _ConfidenceLevel(level="uncertain", reason="No evidence provided")
+                validated.open_questions.append(_OpenQuestion(
+                    question=f"No evidence for {section_name} item: {item.name}",
+                    category="general",
+                    priority="high",
+                ))
 
     current_understanding = {
         "system_purpose": [item.model_dump() for item in validated.system_purpose],
