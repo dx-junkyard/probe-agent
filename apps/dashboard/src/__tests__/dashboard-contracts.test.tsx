@@ -1792,4 +1792,80 @@ describe("System Understanding page", () => {
       expect(mockApi.post).toHaveBeenCalledWith("/repository/system-understanding/build");
     });
   });
+
+  test("entrypoint IDs link to Flow Explorer with query params", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(completeResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const link = await screen.findByTestId("entrypoint-flow-link");
+    expect(link).toBeTruthy();
+    expect(link.getAttribute("href")).toContain("/flow-explorer?entrypoint_type=http_route&entrypoint_id=");
+  });
+
+  test("symbol route links to Flow Explorer", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(completeResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const link = await screen.findByTestId("symbol-flow-link");
+    expect(link).toBeTruthy();
+    expect(link.getAttribute("href")).toContain("/flow-explorer?entrypoint_type=api");
+  });
+
+  test("gap entrypoint refs link to Flow Explorer", async () => {
+    const responseWithEpGap = {
+      ...completeResponse,
+      gaps: [{
+        gap_type: "unclassified_entrypoint", severity: "info",
+        title: "Unclassified: GET /health", node_name: null, notes: null,
+        capability_key: null,
+        doc_refs: [], symbol_refs: [],
+        entrypoint_refs: [{ entrypoint_type: "http_route", entrypoint_ref: "GET /health" }],
+        code_refs: [],
+        next_actions: [],
+      }],
+      gap_summary: [{ gap_type: "unclassified_entrypoint", count: 1 }],
+    };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(responseWithEpGap)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const link = await screen.findByTestId("gap-entrypoint-link");
+    expect(link).toBeTruthy();
+    expect(link.getAttribute("href")).toContain("/flow-explorer?entrypoint_type=http_route");
+  });
+
+  test("capability names link to Capability Map with query param", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(completeResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByText("User Auth")).toBeTruthy();
+    });
+
+    const capLink = screen.getByText("User Auth");
+    expect(capLink.closest("a")?.getAttribute("href")).toContain("/capability-map?capability=User%20Auth");
+  });
 });

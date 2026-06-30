@@ -137,7 +137,7 @@ function GapCard({ gap }: { gap: SystemUnderstandingGap }) {
             <Badge variant={gap.severity === "warning" ? "secondary" : "outline"} className="text-xs">{gap.severity}</Badge>
             {gap.capability_key && (
               <Badge variant="secondary" className="text-xs">
-                <Link to="/capability-map" className="hover:underline">{gap.capability_key}</Link>
+                <Link to={`/capability-map?capability=${encodeURIComponent(gap.capability_key)}`} className="hover:underline">{gap.capability_key}</Link>
               </Badge>
             )}
           </div>
@@ -170,7 +170,13 @@ function GapCard({ gap }: { gap: SystemUnderstandingGap }) {
           {gap.entrypoint_refs.map((er, i) => (
             <div key={`ep-${i}`} className="flex items-center gap-1.5 text-muted-foreground">
               <Zap className="h-3 w-3 shrink-0" />
-              <span className="font-mono">{er.entrypoint_type}: {er.entrypoint_ref}</span>
+              <Link
+                to={`/flow-explorer?entrypoint_type=${encodeURIComponent(er.entrypoint_type)}&entrypoint_id=${encodeURIComponent(er.entrypoint_ref)}`}
+                className="font-mono text-primary hover:underline"
+                data-testid="gap-entrypoint-link"
+              >
+                {er.entrypoint_type}: {er.entrypoint_ref}
+              </Link>
             </div>
           ))}
         </div>
@@ -381,7 +387,7 @@ function DataView({ data }: { data: SystemUnderstandingOut }) {
                 <li key={i} className="flex items-start gap-2 text-sm">
                   <Badge variant="outline" className="mt-0.5 shrink-0">{c.provenance_kind ?? "unknown"}</Badge>
                   <div>
-                    <Link to="/capability-map" className="font-medium hover:underline">{c.name}</Link>
+                    <Link to={`/capability-map?capability=${encodeURIComponent(c.name)}`} className="font-medium hover:underline">{c.name}</Link>
                     {c.summary && <p className="text-muted-foreground text-xs">{c.summary}</p>}
                   </div>
                 </li>
@@ -419,7 +425,15 @@ function DataView({ data }: { data: SystemUnderstandingOut }) {
                       <td className="py-1.5">
                         <Badge variant="outline" className="text-xs">{ep.entrypoint_type}</Badge>
                       </td>
-                      <td className="py-1.5 font-mono text-xs">{ep.entrypoint_id}</td>
+                      <td className="py-1.5 font-mono text-xs">
+                        <Link
+                          to={`/flow-explorer?entrypoint_type=${encodeURIComponent(ep.entrypoint_type)}&entrypoint_id=${encodeURIComponent(ep.entrypoint_id)}`}
+                          className="text-primary hover:underline"
+                          data-testid="entrypoint-flow-link"
+                        >
+                          {ep.entrypoint_id}
+                        </Link>
+                      </td>
                       <td className="py-1.5">{ep.category ?? "—"}</td>
                       <td className="py-1.5">{ep.label ?? "—"}</td>
                     </tr>
@@ -466,9 +480,15 @@ function DataView({ data }: { data: SystemUnderstandingOut }) {
                       <td className="py-1.5 font-mono text-xs">{sym.qualified_name}</td>
                       <td className="py-1.5">{sym.kind ?? "—"}</td>
                       <td className="py-1.5 font-mono text-xs">
-                        {sym.route_method && sym.route_path
-                          ? `${sym.route_method} ${sym.route_path}`
-                          : "—"}
+                        {sym.route_method && sym.route_path ? (
+                          <Link
+                            to={`/flow-explorer?entrypoint_type=api&entrypoint_id=${encodeURIComponent(`${sym.route_method} ${sym.route_path}`)}`}
+                            className="text-primary hover:underline"
+                            data-testid="symbol-flow-link"
+                          >
+                            {sym.route_method} {sym.route_path}
+                          </Link>
+                        ) : "—"}
                       </td>
                     </tr>
                   ))}

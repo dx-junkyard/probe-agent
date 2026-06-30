@@ -1,6 +1,6 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import {
   useCapabilityHierarchy, useCapabilityHierarchyDrift,
@@ -224,9 +224,13 @@ function DetailsPanel({
           )}
           {provenance.feature_id && (
             <Field label="Feature Map">
-              <span className="inline-flex items-center gap-1">
+              <Link
+                to={`/feature-map?feature=${encodeURIComponent(provenance.feature_id)}`}
+                className="inline-flex items-center gap-1 text-primary hover:underline"
+                data-testid="feature-map-link"
+              >
                 <Link2 className="h-3 w-3" /> {provenance.feature_id}
-              </span>
+              </Link>
             </Field>
           )}
           {provenance.provider && provenance.provider !== "deterministic" && (
@@ -358,6 +362,21 @@ export default function CapabilityMapPage() {
   const { data: driftData } = useCapabilityHierarchyDrift();
   const generate = useGenerateCapabilityHierarchy();
   const [selected, setSelected] = useState<SelectedNode | null>(null);
+  const [searchParams] = useSearchParams();
+  const autoSelectedRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    const wantCap = searchParams.get("capability");
+    if (!wantCap || !hierarchy?.capabilities) return;
+    if (autoSelectedRef.current === wantCap) return;
+    const match = hierarchy.capabilities.find(
+      (c) => c.name === wantCap || c.capability_key === wantCap,
+    );
+    if (match) {
+      autoSelectedRef.current = wantCap;
+      setSelected({ kind: "capability", data: match });
+    }
+  }, [searchParams, hierarchy]);
 
   // Flatten every drift anchor to its hierarchy node id for O(1) freshness lookup.
   const driftByNode = useMemo(() => {
