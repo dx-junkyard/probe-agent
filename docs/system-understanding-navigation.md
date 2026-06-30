@@ -94,3 +94,64 @@ probe_plans_reviewed       # probe plan がレビューされている
 | `warning` | 完了したが注意事項あり（例: docs-code gap が見つかった） |
 | `blocked` | 前提条件が不足（例: reasoning model 未設定） |
 | `failed` | 実行したがエラーで失敗 |
+
+## ページ間ナビゲーション
+
+Issue #90 で実装されたクロスページリンク:
+
+| From | To | Mechanism |
+| --- | --- | --- |
+| System Understanding — capabilities | Capability Map | `?capability=<name>` で自動選択 |
+| System Understanding — entrypoints | Flow Explorer | `?entrypoint_type=...&entrypoint_id=...` で自動オープン |
+| System Understanding — symbols (route) | Flow Explorer | route path で entrypoint を指定 |
+| System Understanding — gap capability_key | Capability Map | `?capability=<key>` で自動選択 |
+| System Understanding — gap entrypoint_refs | Flow Explorer | `?entrypoint_type=...&entrypoint_id=...` |
+| Capability Map — element/boundary | Flow Explorer | entrypoint_type + entrypoint_ref で指定 |
+| Capability Map — feature_id | Feature Map | `?feature=<id>` でハイライト＋スクロール |
+| Feature Map — related capabilities | Capability Map | `?capability=<key>` で自動選択 |
+| Feature Map — code links (feature_id) | Feature Map | `?feature=<id>` でハイライト |
+
+## Dogfooding: probe-agent 自身への System Understanding 適用
+
+probe-agent は自身の `probe-agent:` source-authored metadata を使って
+System Understanding パイプラインを検証できる（dogfooding）。
+
+### メタデータが付与されているファイル
+
+Issue #89 で以下の 15 ファイルに module-level `probe-agent:` メタデータを追加:
+
+| ファイル | capability | element_type |
+| --- | --- | --- |
+| `system_understanding_service.py` | repository-understanding | core |
+| `documentation_indexer.py` | documentation-understanding | core |
+| `documentation_chunker.py` | documentation-understanding | element |
+| `documentation_claim_scanner.py` | documentation-understanding | element |
+| `understanding_graph.py` | documentation-understanding | element |
+| `docs_code_reconciler.py` | docs-code-reconciliation | core |
+| `system_understanding_reviewer.py` | repository-understanding | element |
+| `code_indexer.py` | code-intelligence | core |
+| `capability_hierarchy.py` | capability-mapping | core |
+| `entrypoint_discovery.py` | entrypoint-discovery | core |
+| `api_scan.py` | entrypoint-discovery | element |
+| `flow_graph.py` | execution-flow-understanding | core |
+| `experiment_runner.py` | variant-evaluation | core |
+| `routes/project_intelligence.py` | repository-understanding | element |
+| `routes/interview.py` | interactive-system-understanding | element |
+
+### 検証手順
+
+1. **Repository 設定**: Dashboard で probe-agent リポジトリを追加
+2. **Snapshot 作成**: commit SHA を pin して snapshot を作成
+3. **Build / Refresh**: System Understanding ページの Build ボタンを実行
+4. **Pipeline 確認**: 決定的ステップ（symbols_indexed, entrypoints_discovered）が complete であることを確認
+5. **Metadata coverage 確認**: `symbols_with_source_metadata` が 0 より大きいことを確認
+6. **Capability Map 確認**: source-authored provenance で capability が表示されることを確認
+7. **Gap worklist 確認**: unclassified entrypoint がない、または期待通りの gap が表示されることを確認
+8. **ナビゲーション確認**: System Understanding → Capability Map → Flow Explorer の導線が機能することを確認
+
+### 期待される結果
+
+- 15 ファイルの module-level メタデータが symbol index に抽出される
+- 各 capability（documentation-understanding, code-intelligence 等）が Capability Map に表示される
+- API route 型の entrypoint が Flow Explorer で表示可能
+- Gap worklist にメタデータ未付与の entrypoint が `unclassified_entrypoint` として表示される
