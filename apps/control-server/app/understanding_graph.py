@@ -7,6 +7,15 @@ conflicts. Every graph node retains provenance and evidence.
 
 This module is deterministic: same claim set produces same graph. No LLM
 calls are made here.
+
+probe-agent:
+  role: Deterministic claim-to-graph merger
+  capability: documentation-understanding
+  element_type: element
+  consumers: [docs-code-reconciliation, system-understanding]
+  operation_kind: analysis
+  state_effects: [database-write]
+  probe_value: Verify that identical claim sets produce identical graphs with stable node IDs.
 """
 
 from __future__ import annotations

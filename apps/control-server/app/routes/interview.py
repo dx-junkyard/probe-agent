@@ -7,6 +7,15 @@ assistant turns and per-symbol combined proposals (docstring metadata +
 probe plan), validated against #54 vocabulary and the safety denylist.
 Issue #70 — per-item approval gate with manual decision record.
 Issue #71 — worktree materialization of approved set into reviewable diff.
+
+probe-agent:
+  role: Interactive system-understanding interview API
+  capability: interactive-system-understanding
+  element_type: element
+  consumers: [dashboard]
+  operation_kind: io
+  state_effects: [database-read, database-write, external-api]
+  probe_value: Verify that interview proposals use reasoning model and approval records decision_method as manual.
 """
 
 from __future__ import annotations

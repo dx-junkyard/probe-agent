@@ -1,3 +1,15 @@
+"""Project Intelligence API routes.
+
+probe-agent:
+  role: Project Intelligence REST API boundary
+  capability: repository-understanding
+  element_type: element
+  consumers: [dashboard]
+  operation_kind: io
+  state_effects: [database-read, database-write, external-api]
+  probe_value: Verify that API endpoints enforce committed-snapshot-only reads and reasoning-model audit trails.
+"""
+
 import fnmatch
 import json
 import os

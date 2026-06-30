@@ -3,6 +3,15 @@
 Aggregates existing intelligence components (snapshot, documentation index,
 claim scanner, symbol index, entrypoint discovery, docs-code reconciler,
 capability hierarchy) into a single read or build response.
+
+probe-agent:
+  role: Unified system understanding orchestrator
+  capability: repository-understanding
+  element_type: core
+  consumers: [dashboard, control-server]
+  operation_kind: orchestration
+  state_effects: [database-read, database-write]
+  probe_value: Verify that pipeline status, gaps, metadata coverage, and next actions are consistent across GET and POST endpoints.
 """
 
 import json
