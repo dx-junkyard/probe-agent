@@ -1443,6 +1443,11 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE understanding_graph_snapshots ADD COLUMN snapshot_id INTEGER"
             )
+        # Repair rows written with the out-of-contract 'success' status; the
+        # shared schema only allows 'pending' / 'completed' / 'failed'.
+        conn.execute(
+            "UPDATE intelligence_runs SET status = 'completed' WHERE status = 'success'"
+        )
         _ensure_legacy_system(conn)
     _bootstrap_admin()
 
