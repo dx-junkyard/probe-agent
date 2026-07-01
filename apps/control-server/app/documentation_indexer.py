@@ -5,6 +5,15 @@ repository snapshot and produces a deterministic chunk index using
 the Markdown chunker. Respects the committed-snapshot-only constraint:
 no working tree reads.
 
+probe-agent:
+  role: Documentation chunk indexer for snapshot files
+  capability: documentation-understanding
+  element_type: core
+  consumers: [system-understanding, control-server]
+  operation_kind: analysis
+  state_effects: [database-read]
+  probe_value: Confirm that chunk index is deterministic and respects committed-snapshot-only constraint.
+
 Custom documentation path patterns are supported via doc_patterns
 parameter for future extensibility.
 """

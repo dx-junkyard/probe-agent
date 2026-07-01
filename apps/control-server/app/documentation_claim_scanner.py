@@ -7,6 +7,15 @@ chunk content hash and prompt/schema version.
 
 This module performs local extraction only — it does not decide final
 System Purpose or Core Capability hierarchy.
+
+probe-agent:
+  role: Evidence-bound documentation claim extractor
+  capability: documentation-understanding
+  element_type: element
+  consumers: [system-understanding, interview]
+  operation_kind: analysis
+  state_effects: [external-api]
+  probe_value: Compare extracted claims against expected System Purpose and Capability evidence.
 """
 
 from __future__ import annotations

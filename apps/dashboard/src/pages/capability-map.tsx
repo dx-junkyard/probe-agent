@@ -1,11 +1,12 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import {
   useCapabilityHierarchy, useCapabilityHierarchyDrift,
   useGenerateCapabilityHierarchy, useRequestExplanationRefresh,
   useLatestSnapshot, useSymbols, useLatestDrafts,
+  useSystemUnderstanding, useApiRoleCards, useCodeLinks,
 } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button, buttonVariants } from "@/components/ui/button";
@@ -128,9 +129,19 @@ function DetailsPanel({
 }) {
   const refresh = useRequestExplanationRefresh();
   const [proposal, setProposal] = useState<ExplanationRefreshOut | null>(null);
+  const { data: understanding } = useSystemUnderstanding();
+  const { data: roleCardsData } = useApiRoleCards();
+  const { data: codeLinksData } = useCodeLinks();
 
   const data = selected.data;
   const provenance = data.provenance;
+
+  const relatedGaps = useMemo(() => {
+    if (!understanding?.gaps) return [];
+    const capName = selected.kind === "capability" ? data.name : null;
+    if (!capName) return [];
+    return understanding.gaps.filter((g) => g.capability_key === capName);
+  }, [understanding?.gaps, selected.kind, data.name]);
   const drift = driftByNode.get(data.id);
   const reviewRecommended = drift ? REVIEW_STATUSES.includes(drift.status) : false;
   const entrypointType = provenance.entrypoint_type;
@@ -215,9 +226,13 @@ function DetailsPanel({
           )}
           {provenance.feature_id && (
             <Field label="Feature Map">
-              <span className="inline-flex items-center gap-1">
+              <Link
+                to={`/feature-map?feature=${encodeURIComponent(provenance.feature_id)}`}
+                className="inline-flex items-center gap-1 text-primary hover:underline"
+                data-testid="feature-map-link"
+              >
                 <Link2 className="h-3 w-3" /> {provenance.feature_id}
-              </span>
+              </Link>
             </Field>
           )}
           {provenance.provider && provenance.provider !== "deterministic" && (
@@ -263,6 +278,103 @@ function DetailsPanel({
               the source of truth; nothing is written back.
             </p>
             {proposal && <RefreshPanel data={proposal} />}
+          </div>
+        )}
+
+        {selected.kind === "capability" && (() => {
+          const capKey = selected.data.capability_key ?? selected.data.name;
+          const relatedApis = (roleCardsData?.cards ?? []).filter(
+            c => c.capability_key === capKey,
+          );
+          const elements = selected.data.elements ?? [];
+          const featureIds = new Set<string>();
+          for (const el of elements) {
+            if (el.provenance.feature_id) featureIds.add(el.provenance.feature_id);
+          }
+          const linkedFeatures = (codeLinksData?.links ?? []).filter(
+            l => l.review_status === "accepted" && elements.some(
+              el => el.provenance.qualified_name === l.symbol,
+            ),
+          );
+          for (const lf of linkedFeatures) {
+            if (lf.feature_id) featureIds.add(lf.feature_id);
+          }
+          const featureList = Array.from(featureIds);
+          const probeElements = elements.filter(el => el.probe_value);
+          return (
+            <>
+              {relatedApis.length > 0 && (
+                <div className="pt-2 space-y-1.5" data-testid="related-apis">
+                  <p className="text-[11px] font-medium text-muted-foreground">Related APIs</p>
+                  {relatedApis.map((api, i) => (
+                    <Link
+                      key={i}
+                      to={`/flow-explorer?entrypoint_type=${encodeURIComponent(api.entrypoint_type)}&entrypoint_id=${encodeURIComponent(api.entrypoint_id)}`}
+                      className="flex items-center gap-1.5 text-[11px] text-primary hover:underline"
+                    >
+                      <Server className="h-3 w-3 shrink-0" />
+                      <span>{api.label}</span>
+                    </Link>
+                  ))}
+                </div>
+              )}
+              {elements.length > 0 && (
+                <div className="pt-2 space-y-1.5" data-testid="major-functions">
+                  <p className="text-[11px] font-medium text-muted-foreground">Major Functions</p>
+                  {elements.slice(0, 10).map((el, i) => (
+                    <div key={i} className="flex items-center gap-1.5 text-[11px]">
+                      <Target className="h-3 w-3 shrink-0 text-muted-foreground" />
+                      <span className="font-mono">{el.name}</span>
+                      {el.element_role && (
+                        <Badge variant="outline" className="text-[10px]">{el.element_role}</Badge>
+                      )}
+                    </div>
+                  ))}
+                  {elements.length > 10 && (
+                    <span className="text-[11px] text-muted-foreground">+{elements.length - 10} more</span>
+                  )}
+                </div>
+              )}
+              {featureList.length > 0 && (
+                <div className="pt-2 space-y-1.5" data-testid="related-features">
+                  <p className="text-[11px] font-medium text-muted-foreground">Related Features</p>
+                  {featureList.map((fid) => (
+                    <Link
+                      key={fid}
+                      to={`/feature-map?feature=${encodeURIComponent(fid)}`}
+                      className="flex items-center gap-1.5 text-[11px] text-primary hover:underline"
+                    >
+                      <Link2 className="h-3 w-3 shrink-0" />
+                      <span>{fid}</span>
+                    </Link>
+                  ))}
+                </div>
+              )}
+              {probeElements.length > 0 && (
+                <div className="pt-2 space-y-1.5" data-testid="probe-candidates">
+                  <p className="text-[11px] font-medium text-muted-foreground">Probe Flow Candidates</p>
+                  {probeElements.map((el, i) => (
+                    <div key={i} className="flex items-center gap-1.5 text-[11px]">
+                      <Sparkles className="h-3 w-3 shrink-0 text-violet-500" />
+                      <span className="font-mono">{el.name}</span>
+                      <span className="text-muted-foreground">{el.probe_value}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          );
+        })()}
+
+        {relatedGaps.length > 0 && (
+          <div className="pt-2 space-y-1.5" data-testid="related-gaps">
+            <p className="text-[11px] font-medium text-muted-foreground">Related gaps</p>
+            {relatedGaps.map((g, i) => (
+              <div key={i} className="flex items-center gap-1.5 text-[11px]">
+                <AlertTriangle className="h-3 w-3 text-yellow-600 shrink-0" />
+                <span>{g.title ?? g.node_name ?? g.gap_type}</span>
+              </div>
+            ))}
           </div>
         )}
       </CardContent>
@@ -337,6 +449,21 @@ export default function CapabilityMapPage() {
   const { data: driftData } = useCapabilityHierarchyDrift();
   const generate = useGenerateCapabilityHierarchy();
   const [selected, setSelected] = useState<SelectedNode | null>(null);
+  const [searchParams] = useSearchParams();
+  const autoSelectedRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    const wantCap = searchParams.get("capability");
+    if (!wantCap || !hierarchy?.capabilities) return;
+    if (autoSelectedRef.current === wantCap) return;
+    const match = hierarchy.capabilities.find(
+      (c) => c.name === wantCap || c.capability_key === wantCap,
+    );
+    if (match) {
+      autoSelectedRef.current = wantCap;
+      setSelected({ kind: "capability", data: match });
+    }
+  }, [searchParams, hierarchy]);
 
   // Flatten every drift anchor to its hierarchy node id for O(1) freshness lookup.
   const driftByNode = useMemo(() => {

@@ -4,6 +4,15 @@ Splits Markdown files by heading structure, preserving heading paths,
 line ranges, and content hashes. Only splits by size when a heading section
 exceeds MAX_CHUNK_LINES. Output is deterministic and stable for identical
 input.
+
+probe-agent:
+  role: Deterministic Markdown heading-based chunker
+  capability: documentation-understanding
+  element_type: element
+  consumers: [system-understanding, control-server]
+  operation_kind: analysis
+  state_effects: [none]
+  probe_value: Verify that identical input always produces identical chunks with stable hashes.
 """
 
 from __future__ import annotations

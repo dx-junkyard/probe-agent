@@ -19,6 +19,7 @@ import type {
   InterviewDialogueTurnOut, InterviewProposalDecisionOut,
   InterviewProposalMetadataBlock, InterviewProposalProbePlan,
   InterviewApprovedSetOut, InterviewMaterializeOut,
+  SystemUnderstandingOut,
 } from "./types";
 
 function sysKey(base: string, ...extra: unknown[]) {
@@ -782,6 +783,22 @@ export function useWorkspaceProposalDraft(draftId: number | null) {
     queryKey: [...sysKey("workspaceDraft"), draftId],
     queryFn: () => api.get<WorkspaceProposalDraftOut>(`/workspace-drafts/${draftId}`),
     enabled: !!draftId && !!getSystemId(),
+  });
+}
+
+export function useSystemUnderstanding() {
+  return useQuery({
+    queryKey: sysKey("system-understanding"),
+    queryFn: () => api.get<SystemUnderstandingOut>("/repository/system-understanding"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useBuildSystemUnderstanding() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post<SystemUnderstandingOut>("/repository/system-understanding/build"),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("system-understanding") }),
   });
 }
 

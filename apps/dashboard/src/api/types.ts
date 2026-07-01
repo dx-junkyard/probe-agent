@@ -824,6 +824,8 @@ export interface ProbePointOut {
   updated_at: string;
 }
 
+export type ProbePlanOrigin = "feature_map" | "capability_map" | "flow_explorer" | "interview" | "manual";
+
 export interface ProbePlanOut {
   id: number;
   system_id: number;
@@ -832,6 +834,7 @@ export interface ProbePlanOut {
   feature_id: string;
   objective: string;
   status: string;
+  origin: ProbePlanOrigin;
   avoid_reasons: string[];
   probe_points: ProbePointOut[];
   intelligence_run: IntelligenceRunOut | null;
@@ -1295,4 +1298,108 @@ export interface WorkspaceProposalDraftOut {
   };
   missing_fields: string[];
   created_at: number;
+}
+
+// System Understanding (Issue #86 / #87)
+
+export interface SystemUnderstandingPipelineStep {
+  step: string;
+  status: "complete" | "missing" | "warning" | "blocked" | "failed";
+  detail?: string | null;
+}
+
+export interface SystemUnderstandingNextAction {
+  action: string;
+  reason: string;
+  link?: string | null;
+}
+
+export interface SystemUnderstandingGapSummary {
+  gap_type: string;
+  count: number;
+}
+
+export interface SystemUnderstandingMetadataCoverage {
+  symbol_count: number;
+  symbols_with_source_metadata: number;
+  entrypoint_count: number;
+  entrypoints_with_capability_link: number;
+}
+
+export interface SystemUnderstandingCapability {
+  name: string;
+  summary?: string | null;
+  provenance_kind?: string | null;
+}
+
+export interface SystemUnderstandingEntrypoint {
+  entrypoint_type: string;
+  entrypoint_id: string;
+  category?: string | null;
+  label?: string | null;
+}
+
+export interface SystemUnderstandingSymbol {
+  path: string;
+  qualified_name: string;
+  kind?: string | null;
+  route_path?: string | null;
+  route_method?: string | null;
+  component_id?: string | null;
+}
+
+export interface SystemUnderstandingPurpose {
+  name: string;
+  summary?: string | null;
+  provenance_kind?: string | null;
+}
+
+export interface SystemUnderstandingGapNextAction {
+  action: string;
+  link?: string | null;
+}
+
+export interface SystemUnderstandingGapDocRef {
+  path: string;
+  start_line?: number | null;
+  end_line?: number | null;
+}
+
+export interface SystemUnderstandingGapSymbolRef {
+  path?: string | null;
+  qualified_name?: string | null;
+}
+
+export interface SystemUnderstandingGapEntrypointRef {
+  entrypoint_type?: string | null;
+  entrypoint_ref?: string | null;
+}
+
+export interface SystemUnderstandingGap {
+  gap_type?: string | null;
+  severity: string;
+  title?: string | null;
+  node_name?: string | null;
+  notes?: string | null;
+  capability_key?: string | null;
+  doc_refs: SystemUnderstandingGapDocRef[];
+  symbol_refs: SystemUnderstandingGapSymbolRef[];
+  entrypoint_refs: SystemUnderstandingGapEntrypointRef[];
+  code_refs: Array<Record<string, unknown>>;
+  next_actions: SystemUnderstandingGapNextAction[];
+}
+
+export interface SystemUnderstandingOut {
+  system_id: number;
+  snapshot_id: number | null;
+  commit_sha: string | null;
+  pipeline: SystemUnderstandingPipelineStep[];
+  purpose: SystemUnderstandingPurpose | null;
+  capabilities: SystemUnderstandingCapability[];
+  entrypoints: SystemUnderstandingEntrypoint[];
+  major_symbols: SystemUnderstandingSymbol[];
+  gaps: SystemUnderstandingGap[];
+  gap_summary: SystemUnderstandingGapSummary[];
+  metadata_coverage: SystemUnderstandingMetadataCoverage | null;
+  next_actions: SystemUnderstandingNextAction[];
 }

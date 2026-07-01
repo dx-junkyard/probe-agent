@@ -6,6 +6,15 @@ read raw documentation wholesale — operates on the structured claim graph
 and reconciliation result.
 
 Does NOT generate metadata/probe proposals in this step.
+
+probe-agent:
+  role: Reasoning-model system understanding reviewer
+  capability: repository-understanding
+  element_type: element
+  consumers: [interactive-system-understanding, system-understanding]
+  operation_kind: analysis
+  state_effects: [external-api]
+  probe_value: Verify that review uses reasoning model and fails closed on mock/non-reasoning models.
 """
 
 from __future__ import annotations

@@ -646,6 +646,7 @@ CREATE TABLE IF NOT EXISTS probe_plans (
     feature_id           TEXT NOT NULL,
     objective            TEXT NOT NULL DEFAULT '',
     status               TEXT NOT NULL DEFAULT 'proposed',
+    origin               TEXT NOT NULL DEFAULT 'manual',
     created_at           REAL NOT NULL,
     updated_at           REAL NOT NULL,
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
@@ -1432,6 +1433,11 @@ def init_db() -> None:
             conn.execute("ALTER TABLE interview_proposal ADD COLUMN capability_name TEXT")
             conn.execute("ALTER TABLE interview_proposal ADD COLUMN evidence_summary TEXT")
             conn.execute("ALTER TABLE interview_proposal ADD COLUMN proposal_confidence REAL")
+        plan_cols = _columns(conn, "probe_plans")
+        if plan_cols and "origin" not in plan_cols:
+            conn.execute(
+                "ALTER TABLE probe_plans ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'"
+            )
         graph_cols = _columns(conn, "understanding_graph_snapshots")
         if graph_cols and "snapshot_id" not in graph_cols:
             conn.execute(

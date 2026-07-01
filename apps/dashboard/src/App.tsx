@@ -15,6 +15,7 @@ import ComponentsPage from "./pages/components";
 import SettingsPage from "./pages/settings";
 import AdminPage from "./pages/admin";
 import WorkspacesPage from "./pages/workspaces";
+import SystemUnderstandingPage from "./pages/system-understanding";
 
 export default function App() {
   return (
@@ -22,6 +23,7 @@ export default function App() {
       <Route path="/login" element={<LoginPage />} />
       <Route element={<AppLayout />}>
         <Route index element={<OverviewPage />} />
+        <Route path="system-understanding" element={<SystemUnderstandingPage />} />
         <Route path="repository" element={<RepositoryPage />} />
         <Route path="feature-map" element={<FeatureMapPage />} />
         <Route path="capability-map" element={<CapabilityMapPage />} />

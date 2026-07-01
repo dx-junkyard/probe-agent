@@ -5,6 +5,15 @@ code symbols, entrypoints, API scan results, source-authored metadata,
 capability hierarchy, drift detection, and flow graph data.
 
 Produces structured gap mappings with evidence from both sides.
+
+probe-agent:
+  role: Documentation-to-code gap reconciler
+  capability: docs-code-reconciliation
+  element_type: core
+  consumers: [system-understanding, capability-mapping]
+  operation_kind: analysis
+  state_effects: [database-read, database-write]
+  probe_value: Verify that gaps are produced when documentation claims have no matching code symbols and vice versa.
 """
 
 from __future__ import annotations
@@ -25,6 +34,7 @@ GAP_TYPES = {
     "ambiguous_ownership",
     "unclassified_entrypoint",
     "missing_probe_flow",
+    "missing_evidence",
 }
 
 
