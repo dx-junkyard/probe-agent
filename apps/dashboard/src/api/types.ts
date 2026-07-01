@@ -122,6 +122,260 @@ export interface SnapshotOut {
   files: SnapshotFileOut[];
 }
 
+export type InterviewSessionStatus = "open" | "proposals_ready" | "materialized" | "closed";
+export type InterviewMessageRole = "user" | "assistant" | "system";
+export type InterviewStage =
+  | "understanding_initialized"
+  | "purpose_confirmation"
+  | "capability_confirmation"
+  | "element_classification"
+  | "api_boundary_mapping"
+  | "probe_flow_selection"
+  | "proposal_generation";
+export type InterviewDecisionMethod = "deterministic" | "reasoning_llm" | "manual";
+export type InterviewApprovalState = "proposed" | "approved" | "rejected" | "edited";
+export type SourceMetadataElementType =
+  | "system" | "core" | "capability" | "element" | "supporting" | "boundary";
+export type SourceMetadataOperationKind =
+  | "analysis" | "read" | "write" | "mutation" | "io" | "orchestration" | "validation" | "other";
+export type SourceMetadataStateEffect =
+  | "none" | "database-read" | "database-write" | "network" | "filesystem" | "cache" | "external-api" | "queue";
+export type ProbeRecommendedMode = "trace" | "shadow";
+export type ProbeSideEffectRisk = "none" | "low" | "medium" | "high";
+export type ProbeReplayability = "safe" | "caution" | "unsafe";
+
+export interface UnderstandingItem {
+  name: string;
+  summary: string;
+  confidence: { level: string; reason: string };
+  evidence: { path: string; start_line: number; end_line: number; summary: string }[];
+  why_core: string;
+  related_docs: string[];
+  related_apis: string[];
+  children: string[];
+}
+
+export interface GapItem {
+  gap_type: string;
+  name: string;
+  summary: string;
+  severity: string;
+}
+
+export interface OpenQuestion {
+  question: string;
+  category: string;
+  priority: string;
+}
+
+export interface CurrentUnderstanding {
+  system_purpose: UnderstandingItem[];
+  core_capabilities: UnderstandingItem[];
+  capability_elements: UnderstandingItem[];
+  supporting_elements: UnderstandingItem[];
+  api_boundaries: UnderstandingItem[];
+  probe_flow_candidates: UnderstandingItem[];
+}
+
+export interface InterviewSessionOut {
+  id: number;
+  system_id: number;
+  snapshot_id: number;
+  title: string;
+  focus: string;
+  status: InterviewSessionStatus;
+  stage: InterviewStage;
+  current_understanding: CurrentUnderstanding | null;
+  gap_analysis: GapItem[] | null;
+  open_questions: OpenQuestion[] | null;
+  user_intent: string | null;
+  last_error: string | null;
+  materialization_diff: string | null;
+  materialization_ref: string | null;
+  materialized_at: number | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface InterviewMessageOut {
+  id: number;
+  session_id: number;
+  role: InterviewMessageRole;
+  content: string;
+  intelligence_run_id: number | null;
+  created_at: number;
+}
+
+export interface InterviewProposalMetadataBlock {
+  role: string | null;
+  capability: string | null;
+  system_purpose: string | null;
+  probe_value: string | null;
+  element_type: SourceMetadataElementType | null;
+  operation_kind: SourceMetadataOperationKind | null;
+  consumers: string[];
+  state_effects: SourceMetadataStateEffect[];
+}
+
+export interface InterviewProposalProbePlan {
+  feature_id: string;
+  objective: string;
+  reason: string;
+  recommended_mode: ProbeRecommendedMode;
+  side_effect_risk: ProbeSideEffectRisk;
+  replayability: ProbeReplayability;
+}
+
+export interface InterviewProposalOut {
+  id: number;
+  session_id: number;
+  system_id: number;
+  snapshot_id: number;
+  message_id: number | null;
+  intelligence_run_id: number;
+  symbol_id: number | null;
+  path: string;
+  qualified_name: string;
+  metadata: InterviewProposalMetadataBlock;
+  probe_plan: InterviewProposalProbePlan;
+  graph_node_id: string | null;
+  capability_name: string | null;
+  evidence_summary: string | null;
+  proposal_confidence: number | null;
+  decision_method: InterviewDecisionMethod;
+  approval_state: InterviewApprovalState;
+  is_mock: boolean;
+  intelligence_run: IntelligenceRunOut | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface InterviewSessionDetailOut extends InterviewSessionOut {
+  messages: InterviewMessageOut[];
+  proposals: InterviewProposalOut[];
+}
+
+export interface InterviewEvidenceLocation {
+  snapshot_id: number;
+  path: string;
+  qualified_name: string;
+  start_line: number;
+  end_line: number;
+}
+
+export interface InterviewSymbolItem {
+  symbol_id: number;
+  path: string;
+  qualified_name: string;
+  kind: string;
+  start_line: number;
+  end_line: number;
+  classification: "classified" | "unclassified";
+  has_metadata: boolean;
+  element_type: string | null;
+  role: string | null;
+  capability: string | null;
+  operation_kind: string | null;
+  probe_value: string | null;
+  evidence: InterviewEvidenceLocation;
+}
+
+export interface InterviewEntrypointItem {
+  entrypoint_id: number;
+  entrypoint_type: string;
+  category: string;
+  label: string;
+  handler_path: string;
+  handler_qualified_name: string;
+  line_start: number;
+  line_end: number;
+  classification: "classified" | "unclassified";
+  has_metadata: boolean;
+  evidence: InterviewEvidenceLocation;
+}
+
+export interface InterviewContextPack {
+  system_id: number;
+  snapshot_id: number;
+  total_symbols: number;
+  total_entrypoints: number;
+  classified_count: number;
+  unclassified_count: number;
+  budget_max_chars: number;
+  budget_used_chars: number;
+  truncated: boolean;
+  symbols: InterviewSymbolItem[];
+  entrypoints: InterviewEntrypointItem[];
+  omission_notes: string[];
+}
+
+export interface InterviewDialogueTurnOut {
+  assistant_message: string;
+  proposals: {
+    path: string;
+    qualified_name: string;
+    symbol_id: number | null;
+    metadata: InterviewProposalMetadataBlock;
+    probe_plan: InterviewProposalProbePlan;
+    denylist_hit: string | null;
+  }[];
+  next_questions: string[];
+  intelligence_run: IntelligenceRunOut | null;
+  error: string | null;
+  stage: InterviewStage | null;
+  current_understanding: CurrentUnderstanding | null;
+  gap_analysis: GapItem[] | null;
+  open_questions_structured: OpenQuestion[] | null;
+}
+
+export interface InterviewProposalDecisionOut {
+  id: number;
+  proposal_id: number;
+  session_id: number;
+  system_id: number;
+  decision: "approved" | "rejected" | "edited";
+  decision_method: InterviewDecisionMethod;
+  actor: string;
+  edited_metadata: InterviewProposalMetadataBlock | null;
+  edited_probe_plan: InterviewProposalProbePlan | null;
+  denylist_hit: string | null;
+  decided_at: number;
+}
+
+export interface InterviewApprovedSetOut {
+  session_id: number;
+  system_id: number;
+  snapshot_id: number;
+  items: {
+    proposal_id: number;
+    path: string;
+    qualified_name: string;
+    symbol_id: number | null;
+    metadata: InterviewProposalMetadataBlock;
+    probe_plan: InterviewProposalProbePlan;
+    decision: "approved" | "edited";
+    decision_id: number;
+    actor: string;
+    decided_at: number;
+  }[];
+  total_proposals: number;
+  approved_count: number;
+  rejected_count: number;
+  pending_count: number;
+}
+
+export interface InterviewMaterializeOut {
+  session_id: number;
+  system_id: number;
+  snapshot_id: number;
+  diff: string;
+  files_changed: number;
+  items_materialized: number;
+  skipped: string[];
+  materialized_at: number;
+  error: string | null;
+}
+
 export interface IntelligenceRunOut {
   id: number;
   system_id: number;
@@ -293,6 +547,10 @@ export interface HierarchyProvenanceOut {
   explanation_hash: string | null;
   symbol_id: number | null;
   entrypoint_id: number | null;
+  // Stable logical entrypoint reference (#62) for Flow Explorer linking. The
+  // numeric entrypoint_id above is snapshot-local and not link-safe.
+  entrypoint_type: string | null;
+  entrypoint_ref: string | null;
   feature_id: string | null;
   system_profile_draft_id: number | null;
   provider: string | null;
@@ -566,6 +824,8 @@ export interface ProbePointOut {
   updated_at: string;
 }
 
+export type ProbePlanOrigin = "feature_map" | "capability_map" | "flow_explorer" | "interview" | "manual";
+
 export interface ProbePlanOut {
   id: number;
   system_id: number;
@@ -574,6 +834,7 @@ export interface ProbePlanOut {
   feature_id: string;
   objective: string;
   status: string;
+  origin: ProbePlanOrigin;
   avoid_reasons: string[];
   probe_points: ProbePointOut[];
   intelligence_run: IntelligenceRunOut | null;
@@ -1037,4 +1298,108 @@ export interface WorkspaceProposalDraftOut {
   };
   missing_fields: string[];
   created_at: number;
+}
+
+// System Understanding (Issue #86 / #87)
+
+export interface SystemUnderstandingPipelineStep {
+  step: string;
+  status: "complete" | "missing" | "warning" | "blocked" | "failed";
+  detail?: string | null;
+}
+
+export interface SystemUnderstandingNextAction {
+  action: string;
+  reason: string;
+  link?: string | null;
+}
+
+export interface SystemUnderstandingGapSummary {
+  gap_type: string;
+  count: number;
+}
+
+export interface SystemUnderstandingMetadataCoverage {
+  symbol_count: number;
+  symbols_with_source_metadata: number;
+  entrypoint_count: number;
+  entrypoints_with_capability_link: number;
+}
+
+export interface SystemUnderstandingCapability {
+  name: string;
+  summary?: string | null;
+  provenance_kind?: string | null;
+}
+
+export interface SystemUnderstandingEntrypoint {
+  entrypoint_type: string;
+  entrypoint_id: string;
+  category?: string | null;
+  label?: string | null;
+}
+
+export interface SystemUnderstandingSymbol {
+  path: string;
+  qualified_name: string;
+  kind?: string | null;
+  route_path?: string | null;
+  route_method?: string | null;
+  component_id?: string | null;
+}
+
+export interface SystemUnderstandingPurpose {
+  name: string;
+  summary?: string | null;
+  provenance_kind?: string | null;
+}
+
+export interface SystemUnderstandingGapNextAction {
+  action: string;
+  link?: string | null;
+}
+
+export interface SystemUnderstandingGapDocRef {
+  path: string;
+  start_line?: number | null;
+  end_line?: number | null;
+}
+
+export interface SystemUnderstandingGapSymbolRef {
+  path?: string | null;
+  qualified_name?: string | null;
+}
+
+export interface SystemUnderstandingGapEntrypointRef {
+  entrypoint_type?: string | null;
+  entrypoint_ref?: string | null;
+}
+
+export interface SystemUnderstandingGap {
+  gap_type?: string | null;
+  severity: string;
+  title?: string | null;
+  node_name?: string | null;
+  notes?: string | null;
+  capability_key?: string | null;
+  doc_refs: SystemUnderstandingGapDocRef[];
+  symbol_refs: SystemUnderstandingGapSymbolRef[];
+  entrypoint_refs: SystemUnderstandingGapEntrypointRef[];
+  code_refs: Array<Record<string, unknown>>;
+  next_actions: SystemUnderstandingGapNextAction[];
+}
+
+export interface SystemUnderstandingOut {
+  system_id: number;
+  snapshot_id: number | null;
+  commit_sha: string | null;
+  pipeline: SystemUnderstandingPipelineStep[];
+  purpose: SystemUnderstandingPurpose | null;
+  capabilities: SystemUnderstandingCapability[];
+  entrypoints: SystemUnderstandingEntrypoint[];
+  major_symbols: SystemUnderstandingSymbol[];
+  gaps: SystemUnderstandingGap[];
+  gap_summary: SystemUnderstandingGapSummary[];
+  metadata_coverage: SystemUnderstandingMetadataCoverage | null;
+  next_actions: SystemUnderstandingNextAction[];
 }

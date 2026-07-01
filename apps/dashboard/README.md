@@ -1,73 +1,63 @@
-# React + TypeScript + Vite
+# probe-agent Dashboard
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+probe-agent の Web ダッシュボード。React + TypeScript + Vite で構築されている。
 
-Currently, two official plugins are available:
+Control Server と連携し、対象システムのトレース閲覧、モード制御、
+リポジトリ理解、能力階層、probe 計画、実験管理を行う。
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## セットアップ
 
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+cd apps/dashboard
+npm install
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+## 開発
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm run dev
 ```
+
+開発サーバーは `http://localhost:5173` で起動する。
+Vite の proxy 設定により `/api` へのリクエストは自動的に
+Control Server (`http://localhost:8000`) へ転送される。
+
+Control Server が別のポートやホストで動いている場合は、
+`vite.config.ts` の `server.proxy` を調整する。
+
+## ビルド
+
+```bash
+npm run build
+```
+
+成果物は `dist/` に出力される。
+
+## テスト
+
+```bash
+npm run test
+```
+
+## 主なページ
+
+| ページ | パス | 説明 |
+| --- | --- | --- |
+| Overview | `/` | component 数、trace 数、active mode の概要 |
+| System Understanding | `/system-understanding` | pipeline checklist、System Purpose、Capabilities、metadata coverage、docs-code gap、next actions |
+| Repository | `/repository` | リポジトリ設定、snapshot 管理、symbol index、API scan |
+| Capability Map | `/capability-map` | System Purpose → Core Capability → Element のツリーとドリルダウン |
+| Feature Map | `/feature-map` | ユーザー価値単位の機能一覧と code mapping |
+| Flow Explorer | `/flow-explorer` | entrypoint からの候補実行フロー可視化 |
+| Probe Planner | `/probe-planner` | 観測点の mode・risk・承認管理 |
+| Interview | `/interview` | システム理解インタビュー |
+| Experiments | `/experiments` | baseline と source patch variants の比較実験 |
+
+## 技術スタック
+
+- React 19 + TypeScript
+- Vite (dev server + build)
+- TanStack Query (データフェッチ)
+- Tailwind CSS 4
+- React Router 7
+- Vitest + Testing Library (テスト)

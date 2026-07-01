@@ -1,7 +1,7 @@
 /// <reference types="vitest/globals" />
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter } from "react-router-dom";
+import { BrowserRouter, MemoryRouter } from "react-router-dom";
 import { vi } from "vitest";
 import type { ReactNode } from "react";
 
@@ -1040,5 +1040,832 @@ describe("Decision Workspace page", () => {
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith("/workspaces/1/proposals/5/draft");
     });
+  });
+});
+
+// ── Capability Map tests (Issue #62) ────────────────────────────────
+
+function provenance(overrides: Record<string, unknown> = {}) {
+  return {
+    provenance_kind: "source_authored", decision_method: "deterministic",
+    path: "src/flow.py", qualified_name: "get_flow", start_line: 10, end_line: 20,
+    file_content_hash: "f1", symbol_source_hash: "s1", explanation_hash: "e1",
+    symbol_id: 5, entrypoint_id: 9, entrypoint_type: null, entrypoint_ref: null,
+    feature_id: null, system_profile_draft_id: null, provider: "deterministic",
+    model: "none", ...overrides,
+  };
+}
+
+function emptyHierarchy() {
+  return {
+    system_id: 1, snapshot_id: 0, intelligence_run: null, purpose: null,
+    capabilities: [], unclassified_elements: [], unattached_supporting: [],
+    is_mock: false,
+  };
+}
+
+describe("Capability Map page", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("shows prerequisites and a generate action when no hierarchy exists", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/capability-hierarchy") return Promise.resolve(emptyHierarchy());
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockResolvedValue({
+      ...emptyHierarchy(),
+      intelligence_run: { id: 1, status: "completed", decision_method: "deterministic" },
+    });
+
+    const { default: CapabilityMapPage } = await import("@/pages/capability-map");
+    render(<CapabilityMapPage />, { wrapper: createWrapper() });
+
+    expect(await screen.findByText("No capability hierarchy yet.")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("generate-hierarchy-empty"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/repository/capability-hierarchy/generate");
+    });
+  });
+
+  test("renders the hierarchy and links an entrypoint element to Flow Explorer", async () => {
+    const hierarchy = {
+      system_id: 1, snapshot_id: 5,
+      intelligence_run: { id: 1, status: "completed", decision_method: "deterministic" },
+      purpose: { id: 1, name: "Understand running systems", summary: "purpose summary", provenance: provenance() },
+      capabilities: [{
+        id: 2, capability_key: "doc-analysis", name: "Document Analysis",
+        summary: "analysis capability", provenance: provenance(),
+        elements: [{
+          id: 3, name: "GET /flow", summary: "lists flows", element_role: "Lists available flows",
+          operation_kind: "read", probe_value: null, classification: "classified",
+          provenance: provenance({ entrypoint_type: "http_route", entrypoint_ref: "GET:/flow" }),
+        }],
+        supporting_elements: [{
+          id: 4, name: "results table", summary: "", supporting_kind: "database",
+          provenance: provenance({ provenance_kind: "structural" }),
+        }],
+      }],
+      unclassified_elements: [], unattached_supporting: [], is_mock: false,
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/capability-hierarchy") return Promise.resolve(hierarchy);
+      return Promise.resolve(null);
+    });
+
+    const { default: CapabilityMapPage } = await import("@/pages/capability-map");
+    render(<CapabilityMapPage />, { wrapper: createWrapper() });
+
+    // Tree shows purpose, capability, element, and boundary.
+    expect(await screen.findByText("Understand running systems")).toBeInTheDocument();
+    expect(screen.getByText("Document Analysis")).toBeInTheDocument();
+
+    // Selecting the entrypoint-backed element exposes the Flow Explorer link
+    // carrying the logical entrypoint through query params.
+    fireEvent.click(screen.getByText("GET /flow"));
+    const link = await screen.findByTestId("open-in-flow");
+    expect(link).toHaveAttribute(
+      "href",
+      "/flow-explorer?entrypoint_type=http_route&entrypoint_id=GET%3A%2Fflow",
+    );
+    expect(screen.getByText("Lists available flows")).toBeInTheDocument();
+  });
+});
+
+// ── Interview dashboard tests (Issue #72) ───────────────────────────
+
+function interviewSession() {
+  return {
+    id: 7,
+    system_id: 1,
+    snapshot_id: 42,
+    title: "System interview",
+    focus: "Review metadata",
+    status: "open",
+    materialization_diff: null,
+    materialization_ref: null,
+    materialized_at: null,
+    created_at: 1,
+    updated_at: 2,
+  };
+}
+
+function interviewProposal() {
+  return {
+    id: 9,
+    session_id: 7,
+    system_id: 1,
+    snapshot_id: 42,
+    message_id: 3,
+    intelligence_run_id: 4,
+    symbol_id: 11,
+    path: "src/summarize.py",
+    qualified_name: "summarize.summarize_text",
+    metadata: {
+      role: "Summarize free text",
+      capability: "summarization",
+      system_purpose: "Document workflow",
+      probe_value: "Validate latency",
+      element_type: "core",
+      operation_kind: "analysis",
+      consumers: ["api"],
+      state_effects: ["none"],
+    },
+    probe_plan: {
+      feature_id: "summarization",
+      objective: "Trace summarizer",
+      reason: "Low risk function",
+      recommended_mode: "trace",
+      side_effect_risk: "low",
+      replayability: "safe",
+    },
+    decision_method: "reasoning_llm",
+    approval_state: "proposed",
+    is_mock: true,
+    intelligence_run: {
+      id: 4,
+      system_id: 1,
+      snapshot_id: 42,
+      run_type: "interview_dialogue",
+      provider: "mock",
+      model: "mock-reasoner",
+      prompt_version: "interview-v1",
+      schema_version: "1",
+      decision_method: "reasoning_llm",
+      status: "completed",
+      error_details: null,
+      is_mock: true,
+      started_at: "1",
+      completed_at: "2",
+    },
+    created_at: 1,
+    updated_at: 1,
+  };
+}
+
+function mockInterviewApi(options: { approvedCount?: number } = {}) {
+  const session = interviewSession();
+  const proposal = interviewProposal();
+  const approvedCount = options.approvedCount ?? 0;
+  mockApi.get.mockImplementation((path: string) => {
+    if (path === "/repository/snapshots/latest") {
+      return Promise.resolve({
+        id: 42,
+        system_id: 1,
+        repo_path: "/repo",
+        commit_sha: "abcdef1234567890",
+        status: "ready",
+        file_count: 1,
+        total_size: 10,
+        indexed_size: 10,
+        metadata_only_count: 0,
+        warnings: [],
+        error_summary: null,
+        created_at: "1",
+        completed_at: "2",
+        files: [],
+      });
+    }
+    if (path === "/interview/sessions") return Promise.resolve([session]);
+    if (path === "/interview/sessions/7") {
+      return Promise.resolve({
+        ...session,
+        messages: [
+          { id: 1, session_id: 7, role: "assistant", content: "Found unclassified symbols.", intelligence_run_id: 4, created_at: 1 },
+        ],
+        proposals: [proposal],
+      });
+    }
+    if (path === "/interview/sessions/7/context-pack") {
+      return Promise.resolve({
+        system_id: 1,
+        snapshot_id: 42,
+        total_symbols: 1,
+        total_entrypoints: 1,
+        classified_count: 0,
+        unclassified_count: 1,
+        budget_max_chars: 1000,
+        budget_used_chars: 200,
+        truncated: false,
+        symbols: [{
+          symbol_id: 11,
+          path: "src/summarize.py",
+          qualified_name: "summarize.summarize_text",
+          kind: "function",
+          start_line: 1,
+          end_line: 3,
+          classification: "unclassified",
+          has_metadata: false,
+          element_type: null,
+          role: null,
+          capability: null,
+          operation_kind: null,
+          probe_value: null,
+          evidence: { snapshot_id: 42, path: "src/summarize.py", qualified_name: "summarize.summarize_text", start_line: 1, end_line: 3 },
+        }],
+        entrypoints: [],
+        omission_notes: [],
+      });
+    }
+    if (path === "/interview/sessions/7/approved-set") {
+      return Promise.resolve({
+        session_id: 7,
+        system_id: 1,
+        snapshot_id: 42,
+        items: approvedCount ? [{
+          proposal_id: 9,
+          path: "src/summarize.py",
+          qualified_name: "summarize.summarize_text",
+          symbol_id: 11,
+          metadata: proposal.metadata,
+          probe_plan: proposal.probe_plan,
+          decision: "approved",
+          decision_id: 12,
+          actor: "admin",
+          decided_at: 3,
+        }] : [],
+        total_proposals: 1,
+        approved_count: approvedCount,
+        rejected_count: 0,
+        pending_count: approvedCount ? 0 : 1,
+      });
+    }
+    return Promise.resolve(null);
+  });
+  return { session, proposal };
+}
+
+describe("Interview page", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("renders mock reasoning provenance and wires proposal decisions", async () => {
+    mockInterviewApi();
+    mockApi.post.mockResolvedValue({ id: 1, decision: "approved", decision_method: "manual" });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByText("summarize.summarize_text")).toBeInTheDocument();
+    expect(screen.getByText("mock")).toBeInTheDocument();
+    expect(screen.getByText("reasoning_llm")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Approve/i }));
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/7/proposals/9/approve",
+        { actor: "admin" },
+      );
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /Reject/i }));
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/7/proposals/9/reject",
+        { actor: "admin" },
+      );
+    });
+  });
+
+  test("sends edits through the validated edit endpoint and materializes a diff", async () => {
+    mockInterviewApi({ approvedCount: 1 });
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7/materialize") {
+        return Promise.resolve({
+          session_id: 7,
+          system_id: 1,
+          snapshot_id: 42,
+          diff: "diff --git a/src/summarize.py b/src/summarize.py",
+          files_changed: 1,
+          items_materialized: 1,
+          skipped: [],
+          materialized_at: 3,
+          error: null,
+        });
+      }
+      return Promise.resolve({ id: 5, decision: "edited", decision_method: "manual" });
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByText("Proposal Review")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Edit/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /Save manual edit/i }));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/7/proposals/9/edit",
+        expect.objectContaining({
+          actor: "admin",
+          metadata: expect.objectContaining({ role: "Summarize free text" }),
+          probe_plan: expect.objectContaining({ recommended_mode: "trace" }),
+        }),
+      );
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /Materialize/i }));
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/interview/sessions/7/materialize", {});
+    });
+    expect(await screen.findByText(/diff --git/)).toBeInTheDocument();
+  });
+});
+
+describe("Flow Explorer auto-select from URL (Issue #62)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("opens the entrypoint named in query params and builds its graph", async () => {
+    const entrypoint = {
+      entrypoint_type: "http_route", entrypoint_id: "POST:/documents/analyze",
+      label: "POST /documents/analyze", path: "app.py", qualified_name: "analyze_document",
+      line_start: 5, line_end: 11, component_id: null, route_method: "POST",
+      route_path: "/documents/analyze", category: "api", framework: "fastapi",
+      operation: "POST /documents/analyze", confidence: 1.0, evidence: [],
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/flow-entrypoints") {
+        return Promise.resolve({
+          system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
+          total: 1, entrypoints: [entrypoint], functions: [],
+          counts: { api: 1, message_queue: 0, scheduled_job: 0, cli: 0, function: 0 },
+          indexed_function_count: 0, has_backend_entrypoints: true, frameworks: ["fastapi"],
+          diagnostics: [],
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockImplementation((path: string) =>
+      path === "/repository/flow-graphs"
+        ? Promise.resolve({
+            system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
+            entrypoint, nodes: [], edges: [], candidate_paths: [],
+            diagnostics: [], truncated: false,
+          })
+        : Promise.resolve(null));
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: FlowExplorerPage } = await import("@/pages/flow-explorer");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={[
+          "/flow-explorer?entrypoint_type=http_route&entrypoint_id=POST:/documents/analyze",
+        ]}>
+          <FlowExplorerPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/repository/flow-graphs", {
+        entrypoint_type: "http_route",
+        entrypoint_id: "POST:/documents/analyze",
+      });
+    });
+  });
+});
+
+// ── System Understanding page tests ─────────────────────────────────
+
+describe("System Understanding page", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const emptyResponse = {
+    system_id: 1,
+    snapshot_id: null,
+    commit_sha: null,
+    pipeline: [
+      { step: "repository_configured", status: "missing" },
+      { step: "snapshot_ready", status: "missing" },
+      { step: "documentation_indexed", status: "missing" },
+      { step: "documentation_claims_scanned", status: "missing" },
+      { step: "symbols_indexed", status: "missing" },
+      { step: "entrypoints_discovered", status: "missing" },
+      { step: "docs_code_reconciled", status: "missing" },
+      { step: "capability_hierarchy_ready", status: "missing" },
+    ],
+    purpose: null,
+    capabilities: [],
+    entrypoints: [],
+    major_symbols: [],
+    gaps: [],
+    gap_summary: [],
+    metadata_coverage: null,
+    next_actions: [{ action: "Configure repository", reason: "No repository configured", link: "/repository" }],
+  };
+
+  const gapWorklistResponse = {
+    system_id: 1,
+    snapshot_id: 5,
+    commit_sha: "abc12345",
+    pipeline: [
+      { step: "repository_configured", status: "complete" },
+      { step: "snapshot_ready", status: "complete" },
+      { step: "documentation_indexed", status: "complete" },
+      { step: "documentation_claims_scanned", status: "complete" },
+      { step: "symbols_indexed", status: "complete" },
+      { step: "entrypoints_discovered", status: "complete" },
+      { step: "docs_code_reconciled", status: "warning" },
+      { step: "capability_hierarchy_ready", status: "complete" },
+    ],
+    purpose: { name: "Test System", summary: "A test system", provenance_kind: "reasoning_llm" },
+    capabilities: [],
+    entrypoints: [],
+    major_symbols: [],
+    gaps: [
+      {
+        gap_type: "unclassified_entrypoint",
+        severity: "info",
+        title: "Entrypoint not classified: GET:/items",
+        node_name: "GET:/items",
+        notes: "No capability classification",
+        capability_key: null,
+        doc_refs: [],
+        symbol_refs: [{ path: "src/main.py", qualified_name: "list_items" }],
+        entrypoint_refs: [{ entrypoint_type: "http_route", entrypoint_ref: "GET:/items" }],
+        code_refs: [],
+        next_actions: [
+          { action: "Open Interview", link: "/interview" },
+          { action: "Add source metadata", link: "/interview" },
+        ],
+      },
+      {
+        gap_type: "docs_only",
+        severity: "warning",
+        title: "Documented but no matching implementation: Auth",
+        node_name: "Auth",
+        notes: "Found in docs but no matching code",
+        capability_key: null,
+        doc_refs: [{ path: "docs/design.md", start_line: 10, end_line: 20 }],
+        symbol_refs: [],
+        entrypoint_refs: [],
+        code_refs: [],
+        next_actions: [
+          { action: "Open docs evidence", link: null },
+          { action: "Create implementation issue", link: null },
+        ],
+      },
+    ],
+    gap_summary: [
+      { gap_type: "unclassified_entrypoint", count: 1 },
+      { gap_type: "docs_only", count: 1 },
+    ],
+    metadata_coverage: { symbol_count: 42, symbols_with_source_metadata: 5, entrypoint_count: 10, entrypoints_with_capability_link: 3 },
+    next_actions: [{ action: "Review docs-code gaps", reason: "2 gaps found", link: "/system-understanding" }],
+  };
+
+  const completeResponse = {
+    system_id: 1,
+    snapshot_id: 5,
+    commit_sha: "abc12345def",
+    pipeline: [
+      { step: "repository_configured", status: "complete" },
+      { step: "snapshot_ready", status: "complete" },
+      { step: "documentation_indexed", status: "complete" },
+      { step: "documentation_claims_scanned", status: "complete" },
+      { step: "symbols_indexed", status: "complete" },
+      { step: "entrypoints_discovered", status: "complete" },
+      { step: "docs_code_reconciled", status: "complete" },
+      { step: "capability_hierarchy_ready", status: "complete" },
+    ],
+    purpose: { name: "Test System", summary: "A test system for unit testing", provenance_kind: "reasoning_llm" },
+    capabilities: [
+      { name: "User Auth", summary: "Handles authentication", provenance_kind: "reasoning_llm" },
+    ],
+    entrypoints: [
+      { entrypoint_type: "http_route", entrypoint_id: "GET:/items", category: "api", label: "List items" },
+    ],
+    major_symbols: [
+      { path: "src/main.py", qualified_name: "list_items", kind: "function", route_path: "/items", route_method: "GET", component_id: null },
+    ],
+    gaps: [],
+    gap_summary: [],
+    metadata_coverage: { symbol_count: 42, symbols_with_source_metadata: 5, entrypoint_count: 10, entrypoints_with_capability_link: 3 },
+    next_actions: [],
+  };
+
+  const blockedResponse = {
+    ...emptyResponse,
+    snapshot_id: 3,
+    commit_sha: "def456",
+    pipeline: [
+      { step: "repository_configured", status: "complete" },
+      { step: "snapshot_ready", status: "complete" },
+      { step: "documentation_indexed", status: "missing", detail: "Reasoning model required" },
+      { step: "documentation_claims_scanned", status: "missing" },
+      { step: "symbols_indexed", status: "complete" },
+      { step: "entrypoints_discovered", status: "complete" },
+      { step: "docs_code_reconciled", status: "missing" },
+      { step: "capability_hierarchy_ready", status: "missing", detail: "Reasoning model required" },
+    ],
+    next_actions: [
+      { action: "Configure reasoning model", reason: "Required for documentation and capability analysis", link: null },
+    ],
+  };
+
+  const gapResponse = {
+    ...completeResponse,
+    gaps: [
+      {
+        gap_type: "docs_only", severity: "warning", title: "Documented but missing: Feature X",
+        node_name: "Feature X", notes: null, capability_key: null,
+        doc_refs: [{ path: "README.md", start_line: 1, end_line: 5 }],
+        symbol_refs: [], entrypoint_refs: [], code_refs: [],
+        next_actions: [{ action: "Open docs evidence", link: null }],
+      },
+    ],
+    gap_summary: [
+      { gap_type: "docs_only", count: 3 },
+      { gap_type: "code_only", count: 5 },
+    ],
+    metadata_coverage: { symbol_count: 100, symbols_with_source_metadata: 2, entrypoint_count: 20, entrypoints_with_capability_link: 1 },
+  };
+
+  test("renders empty state when no snapshot exists", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(emptyResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByText("System Understanding")).toBeTruthy();
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Get started with System Understanding")).toBeTruthy();
+    });
+  });
+
+  test("renders pipeline complete state with all sections", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(completeResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByText("Test System")).toBeTruthy();
+    });
+
+    expect(screen.getByText("A test system for unit testing")).toBeTruthy();
+    expect(screen.getByText("User Auth")).toBeTruthy();
+    expect(screen.getByText("GET:/items")).toBeTruthy();
+    expect(screen.getByText("list_items")).toBeTruthy();
+    expect(screen.getByText("42")).toBeTruthy();
+    expect(screen.getByText("10")).toBeTruthy();
+  });
+
+  test("renders reasoning model blocked state without heuristic fallback", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(blockedResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("pipeline-checklist")).toBeTruthy();
+    });
+
+    const checklist = screen.getByTestId("pipeline-checklist");
+    expect(checklist.textContent).toContain("missing");
+    expect(checklist.textContent).toContain("complete");
+  });
+
+  test("renders docs-code gap worklist with cards", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(gapWorklistResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("gap-worklist")).toBeTruthy();
+    });
+
+    expect(screen.getByText(/Entrypoint not classified/)).toBeTruthy();
+    expect(screen.getByText(/Documented but no matching implementation/)).toBeTruthy();
+
+    const cards = screen.getAllByTestId("gap-card");
+    expect(cards.length).toBe(2);
+  });
+
+  test("renders gap next action buttons", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(gapWorklistResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("gap-worklist")).toBeTruthy();
+    });
+
+    expect(screen.getByText("Open Interview")).toBeTruthy();
+    expect(screen.getByText("Open docs evidence")).toBeTruthy();
+  });
+
+  test("shows no-gaps message when gaps are empty", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve({ ...completeResponse, gaps: [], gap_summary: [] })
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("no-gaps-message")).toBeTruthy();
+    });
+
+    expect(screen.getByText(/No significant differences/)).toBeTruthy();
+  });
+
+  test("renders gap type filter buttons", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(gapWorklistResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("gap-summary")).toBeTruthy();
+    });
+
+    expect(screen.getByText("All (2)")).toBeTruthy();
+    expect(screen.getByText("unclassified_entrypoint (1)")).toBeTruthy();
+    expect(screen.getByText("docs_only (1)")).toBeTruthy();
+  });
+
+  test("renders metadata coverage with values from gap response", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(gapResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("metadata-coverage")).toBeTruthy();
+    });
+
+    expect(screen.getByText("100")).toBeTruthy();
+    expect(screen.getByText("2 with metadata")).toBeTruthy();
+    expect(screen.getByText("20")).toBeTruthy();
+    expect(screen.getByText("1 with capability link")).toBeTruthy();
+  });
+
+  test("build button triggers POST and refreshes", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(emptyResponse)
+        : Promise.resolve(null),
+    );
+    mockApi.post.mockImplementation((path: string) =>
+      path === "/repository/system-understanding/build"
+        ? Promise.resolve(completeResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("build-button")).toBeTruthy();
+    });
+
+    fireEvent.click(screen.getByTestId("build-button"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/repository/system-understanding/build");
+    });
+  });
+
+  test("entrypoint IDs link to Flow Explorer with query params", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(completeResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const link = await screen.findByTestId("entrypoint-flow-link");
+    expect(link).toBeTruthy();
+    expect(link.getAttribute("href")).toContain("/flow-explorer?entrypoint_type=http_route&entrypoint_id=");
+  });
+
+  test("symbol route links to Flow Explorer", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(completeResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const link = await screen.findByTestId("symbol-flow-link");
+    expect(link).toBeTruthy();
+    expect(link.getAttribute("href")).toContain("/flow-explorer?entrypoint_type=api");
+  });
+
+  test("gap entrypoint refs link to Flow Explorer", async () => {
+    const responseWithEpGap = {
+      ...completeResponse,
+      gaps: [{
+        gap_type: "unclassified_entrypoint", severity: "info",
+        title: "Unclassified: GET /health", node_name: null, notes: null,
+        capability_key: null,
+        doc_refs: [], symbol_refs: [],
+        entrypoint_refs: [{ entrypoint_type: "http_route", entrypoint_ref: "GET /health" }],
+        code_refs: [],
+        next_actions: [],
+      }],
+      gap_summary: [{ gap_type: "unclassified_entrypoint", count: 1 }],
+    };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(responseWithEpGap)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const link = await screen.findByTestId("gap-entrypoint-link");
+    expect(link).toBeTruthy();
+    expect(link.getAttribute("href")).toContain("/flow-explorer?entrypoint_type=http_route");
+  });
+
+  test("capability names link to Capability Map with query param", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(completeResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByText("User Auth")).toBeTruthy();
+    });
+
+    const capLink = screen.getByText("User Auth");
+    expect(capLink.closest("a")?.getAttribute("href")).toContain("/capability-map?capability=User%20Auth");
   });
 });

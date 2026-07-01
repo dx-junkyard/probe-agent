@@ -335,6 +335,31 @@ class TestCapabilityHierarchyAPI:
         ep_elements = [e for e in cap["elements"] if e["provenance"]["entrypoint_id"]]
         assert any(e["name"] == "GET /flow" for e in ep_elements)
 
+    def test_entrypoint_node_exposes_logical_reference(self, admin_client, tmp_path):
+        # #62: API/job/CLI elements carry a stable logical (type, id) the
+        # dashboard uses to open the entrypoint in Flow Explorer. The raw
+        # ``entrypoint_id`` DB row id is snapshot-local and not link-safe.
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "HierLogical")
+        repo = _make_repo(tmp_path)
+        h = _headers(token, system["id"])
+        _index(admin_client, token, system["id"], repo)
+
+        admin_client.post("/repository/capability-hierarchy/generate", headers=h)
+        body = admin_client.get(
+            "/repository/capability-hierarchy", headers=h
+        ).json()
+        cap = body["capabilities"][0]
+        flow_ep = next(e for e in cap["elements"] if e["name"] == "GET /flow")
+        prov = flow_ep["provenance"]
+        assert prov["entrypoint_type"]
+        assert prov["entrypoint_ref"]
+        # Source-authored elements without an entrypoint stay null.
+        non_ep = [
+            e for e in cap["elements"] if e["provenance"]["entrypoint_id"] is None
+        ]
+        assert all(e["provenance"]["entrypoint_ref"] is None for e in non_ep)
+
     def test_get_returns_latest_and_empty_without_run(self, admin_client, tmp_path):
         token = _login(admin_client)
         system = _create_system(admin_client, token, "HierGet")

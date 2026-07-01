@@ -218,6 +218,7 @@ IntelligenceRunType = Literal[
     "probe_plan_from_flow",
     "capability_hierarchy",
     "explanation_refresh",
+    "interview_proposal",
 ]
 DecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
 # How a single hierarchy claim was produced. Kept distinct from the audit
@@ -634,6 +635,12 @@ class HierarchyProvenanceOut(BaseModel):
     explanation_hash: Optional[str] = None
     symbol_id: Optional[int] = None
     entrypoint_id: Optional[int] = None
+    # Stable logical entrypoint reference (#62). ``entrypoint_id`` above is the
+    # snapshot-local DB row id and is not safe for cross-snapshot linking. These
+    # carry the logical (type, id) so the dashboard can open the entrypoint in
+    # Flow Explorer without re-resolving the DB id.
+    entrypoint_type: Optional[str] = None
+    entrypoint_ref: Optional[str] = None
     feature_id: Optional[str] = None
     system_profile_draft_id: Optional[int] = None
     provider: Optional[str] = None
@@ -836,6 +843,7 @@ class ProbePlanOut(BaseModel):
     feature_id: str
     objective: str
     status: ProbePlanStatus
+    origin: str = "manual"
     avoid_reasons: List[str] = Field(default_factory=list)
     probe_points: List[ProbePointOut] = Field(default_factory=list)
     intelligence_run: Optional[IntelligenceRunOut] = None
@@ -1659,3 +1667,534 @@ class WorkspaceProposalDraftOut(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     missing_fields: List[str] = Field(default_factory=list)
     created_at: float
+
+
+# --- System-understanding interview persistence (Issue #67) -----------------
+#
+# A pure persistence + CRUD contract for the #66 conversational metadata/probe
+# authoring flow. No LLM call and no worktree write happen here; later sibling
+# issues build dialogue, approval transitions, materialization, and the UI on
+# top of these models. The combined per-symbol proposal carries both the
+# proposed `probe-agent:` docstring metadata block (#54 vocabulary) and the
+# associated probe-plan fields (#25 model).
+
+InterviewSessionStatus = Literal["open", "proposals_ready", "materialized", "closed"]
+InterviewMessageRole = Literal["user", "assistant", "system"]
+
+InterviewStage = Literal[
+    "understanding_initialized",
+    "purpose_confirmation",
+    "capability_confirmation",
+    "element_classification",
+    "api_boundary_mapping",
+    "probe_flow_selection",
+    "proposal_generation",
+]
+InterviewProposalApprovalState = Literal["proposed", "approved", "rejected", "edited"]
+# Finite #54 vocabulary for a single state_effects entry.
+SourceMetadataStateEffect = Literal[
+    "none",
+    "database-read",
+    "database-write",
+    "network",
+    "filesystem",
+    "cache",
+    "external-api",
+    "queue",
+]
+ProbeRecommendedMode = Literal["trace", "shadow"]
+ProbeSideEffectRisk = Literal["none", "low", "medium", "high"]
+ProbeReplayability = Literal["safe", "caution", "unsafe"]
+
+
+class InterviewSessionCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    snapshot_id: int
+    title: str = Field(default="", max_length=200)
+    focus: str = Field(default="", max_length=500)
+
+
+class InterviewSessionOut(BaseModel):
+    id: int
+    system_id: int
+    snapshot_id: int
+    title: str
+    focus: str
+    status: InterviewSessionStatus
+    stage: Optional[InterviewStage] = "understanding_initialized"
+    current_understanding: Optional[Dict[str, Any]] = None
+    gap_analysis: Optional[List[Dict[str, Any]]] = None
+    open_questions: Optional[List[Dict[str, Any]]] = None
+    user_intent: Optional[str] = None
+    last_error: Optional[str] = None
+    materialization_diff: Optional[str] = None
+    materialization_ref: Optional[str] = None
+    materialized_at: Optional[float] = None
+    created_at: float
+    updated_at: float
+
+
+class InterviewMessageCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: InterviewMessageRole
+    content: str = Field(..., min_length=1, max_length=20_000)
+    intelligence_run_id: Optional[int] = None
+
+
+class InterviewMessageOut(BaseModel):
+    id: int
+    session_id: int
+    role: InterviewMessageRole
+    content: str
+    intelligence_run_id: Optional[int] = None
+    created_at: float
+
+
+class InterviewProposalMetadataBlock(BaseModel):
+    """Proposed `probe-agent:` docstring metadata block for one symbol.
+
+    Finite fields (``element_type`` / ``operation_kind`` / ``state_effects``)
+    are validated against #54's vocabulary; the rest are free text per #54.
+    This is an LLM-authored *proposal*, so unlike ``SourceMetadataOut`` it
+    carries no ``origin``/``explanation_hash``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    role: Optional[str] = Field(default=None, max_length=2000)
+    capability: Optional[str] = Field(default=None, max_length=2000)
+    system_purpose: Optional[str] = Field(default=None, max_length=2000)
+    probe_value: Optional[str] = Field(default=None, max_length=2000)
+    element_type: Optional[SourceMetadataElementType] = None
+    operation_kind: Optional[SourceMetadataOperationKind] = None
+    consumers: List[str] = Field(default_factory=list)
+    state_effects: List[SourceMetadataStateEffect] = Field(default_factory=list)
+
+
+class InterviewProposalProbePlan(BaseModel):
+    """Proposed probe-plan fields for the same symbol (#25 model)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    feature_id: str = Field(default="", max_length=200)
+    objective: str = Field(default="", max_length=2000)
+    reason: str = Field(default="", max_length=2000)
+    recommended_mode: ProbeRecommendedMode = "trace"
+    side_effect_risk: ProbeSideEffectRisk = "low"
+    replayability: ProbeReplayability = "safe"
+
+
+class InterviewProposalItem(BaseModel):
+    """One combined per-symbol proposal in a create request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(..., min_length=1, max_length=500)
+    qualified_name: str = Field(..., min_length=1, max_length=500)
+    symbol_id: Optional[int] = None
+    metadata: InterviewProposalMetadataBlock
+    probe_plan: InterviewProposalProbePlan
+    graph_node_id: Optional[str] = None
+    capability_name: Optional[str] = None
+    evidence_summary: Optional[str] = None
+    proposal_confidence: Optional[float] = None
+
+
+class InterviewRunAudit(BaseModel):
+    """Reasoning-run audit metadata for a batch of proposals.
+
+    Persisted as an ``intelligence_runs`` row (the shared audit store) and
+    linked from each proposal. ``decision_method`` is fixed to ``reasoning_llm``
+    for this issue; ``manual`` is set only by the later approval issue.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str = Field(..., min_length=1, max_length=200)
+    model: str = Field(..., min_length=1, max_length=200)
+    prompt_version: str = Field(..., min_length=1, max_length=100)
+    schema_version: str = Field(..., min_length=1, max_length=100)
+    is_mock: bool = False
+
+
+class InterviewProposalsCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    audit: InterviewRunAudit
+    message_id: Optional[int] = None
+    proposals: List[InterviewProposalItem] = Field(..., min_length=1)
+
+
+class InterviewProposalOut(BaseModel):
+    id: int
+    session_id: int
+    system_id: int
+    snapshot_id: int
+    message_id: Optional[int] = None
+    intelligence_run_id: int
+    symbol_id: Optional[int] = None
+    path: str
+    qualified_name: str
+    metadata: InterviewProposalMetadataBlock
+    probe_plan: InterviewProposalProbePlan
+    decision_method: DecisionMethod
+    graph_node_id: Optional[str] = None
+    capability_name: Optional[str] = None
+    evidence_summary: Optional[str] = None
+    proposal_confidence: Optional[float] = None
+    approval_state: InterviewProposalApprovalState
+    is_mock: bool = False
+    intelligence_run: Optional[IntelligenceRunOut] = None
+    created_at: float
+    updated_at: float
+
+
+class InterviewSessionDetailOut(InterviewSessionOut):
+    messages: List[InterviewMessageOut] = Field(default_factory=list)
+    proposals: List[InterviewProposalOut] = Field(default_factory=list)
+
+
+# --- Interview Context Pack (Issue #68) -------------------------------------
+#
+# Deterministic, no-LLM context assembly for the system-understanding
+# interview. Reads indexed symbols, entrypoints, existing probe-agent:
+# metadata, and capability hierarchy classification from a pinned snapshot
+# and flags which items are already classified vs. unclassified (blank-page).
+# Every item carries a snapshot-relative evidence location. Output respects
+# an LLM context budget independent of snapshot storage.
+
+InterviewSymbolClassification = Literal["classified", "unclassified"]
+
+
+class InterviewEvidenceLocation(BaseModel):
+    snapshot_id: int
+    path: str
+    qualified_name: str
+    start_line: int
+    end_line: int
+
+
+class InterviewSymbolItem(BaseModel):
+    symbol_id: int
+    path: str
+    qualified_name: str
+    kind: str
+    start_line: int
+    end_line: int
+    classification: InterviewSymbolClassification
+    has_metadata: bool = False
+    element_type: Optional[str] = None
+    role: Optional[str] = None
+    capability: Optional[str] = None
+    operation_kind: Optional[str] = None
+    probe_value: Optional[str] = None
+    evidence: InterviewEvidenceLocation
+
+
+class InterviewEntrypointItem(BaseModel):
+    entrypoint_id: int
+    entrypoint_type: str
+    category: str
+    label: str
+    handler_path: str
+    handler_qualified_name: str
+    line_start: int
+    line_end: int
+    classification: InterviewSymbolClassification
+    has_metadata: bool = False
+    evidence: InterviewEvidenceLocation
+
+
+class InterviewContextPack(BaseModel):
+    system_id: int
+    snapshot_id: int
+    total_symbols: int
+    total_entrypoints: int
+    classified_count: int
+    unclassified_count: int
+    budget_max_chars: int
+    budget_used_chars: int
+    truncated: bool = False
+    symbols: List[InterviewSymbolItem] = Field(default_factory=list)
+    entrypoints: List[InterviewEntrypointItem] = Field(default_factory=list)
+    omission_notes: List[str] = Field(default_factory=list)
+
+
+# --- Interview Dialogue Turn (Issue #69) -------------------------------------
+#
+# Request/response models for the reasoning-model dialogue endpoint. The
+# endpoint generates a structured assistant turn grounded in #68's context
+# pack, optionally producing per-symbol combined proposals validated against
+# #54 vocabulary and the safety denylist from probe_planner.py.
+
+
+class InterviewDialogueTurnRequest(BaseModel):
+    """Request body for a single interview dialogue turn."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_message: str = Field(..., min_length=1, max_length=20_000)
+    budget: Optional[int] = Field(default=None, ge=1000, le=500_000)
+    generate_proposals: bool = False
+
+
+class InterviewDialogueProposalOut(BaseModel):
+    """A single combined proposal from a dialogue turn, before persistence."""
+
+    path: str
+    qualified_name: str
+    symbol_id: Optional[int] = None
+    metadata: InterviewProposalMetadataBlock
+    probe_plan: InterviewProposalProbePlan
+    graph_node_id: Optional[str] = None
+    capability_name: Optional[str] = None
+    evidence_summary: Optional[str] = None
+    proposal_confidence: Optional[float] = None
+    denylist_hit: Optional[str] = None
+
+
+class InterviewDialogueTurnOut(BaseModel):
+    """Response from a single interview dialogue turn.
+
+    Contains the structured assistant message, any generated proposals, and
+    the reasoning-run audit metadata. If error is set, the turn failed closed
+    and no proposals should be stored.
+    """
+
+    assistant_message: str = ""
+    proposals: List[InterviewDialogueProposalOut] = Field(default_factory=list)
+    next_questions: List[str] = Field(default_factory=list)
+    intelligence_run: Optional[IntelligenceRunOut] = None
+    error: Optional[str] = None
+    stage: Optional[InterviewStage] = None
+    current_understanding: Optional[Dict[str, Any]] = None
+    gap_analysis: Optional[List[Dict[str, Any]]] = None
+    open_questions_structured: Optional[List[Dict[str, Any]]] = None
+
+
+# --- Interview Proposal Approval (Issue #70) ----------------------------------
+#
+# Per-item approval gate: a developer can approve, reject, or edit each
+# proposed { docstring_metadata, probe_plan } item. Decisions are persisted
+# as decision_method='manual' records that reference — but do not overwrite —
+# the original reasoning_llm proposal.
+
+InterviewDecisionAction = Literal["approved", "rejected", "edited"]
+
+
+class InterviewProposalApproveRequest(BaseModel):
+    """Approve a proposal as-is."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str = Field(min_length=1, max_length=200)
+
+
+class InterviewProposalRejectRequest(BaseModel):
+    """Reject a proposal."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str = Field(min_length=1, max_length=200)
+
+
+class InterviewProposalEditRequest(BaseModel):
+    """Edit and approve a proposal with corrected values."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str = Field(min_length=1, max_length=200)
+    metadata: InterviewProposalMetadataBlock
+    probe_plan: InterviewProposalProbePlan
+
+
+class InterviewProposalDecisionOut(BaseModel):
+    """A persisted manual decision on a proposal."""
+
+    id: int
+    proposal_id: int
+    session_id: int
+    system_id: int
+    decision: InterviewDecisionAction
+    decision_method: DecisionMethod
+    actor: str
+    edited_metadata: Optional[InterviewProposalMetadataBlock] = None
+    edited_probe_plan: Optional[InterviewProposalProbePlan] = None
+    denylist_hit: Optional[str] = None
+    decided_at: float
+
+
+class InterviewApprovedItemOut(BaseModel):
+    """An item from the approved set, ready for materialization.
+
+    Contains the effective metadata/probe_plan: the edited values if the
+    decision was 'edited', or the original proposal values if 'approved'.
+    """
+
+    proposal_id: int
+    path: str
+    qualified_name: str
+    symbol_id: Optional[int] = None
+    metadata: InterviewProposalMetadataBlock
+    probe_plan: InterviewProposalProbePlan
+    decision: InterviewDecisionAction
+    decision_id: int
+    actor: str
+    decided_at: float
+
+
+class InterviewApprovedSetOut(BaseModel):
+    """The approved set for a session: items eligible for materialization."""
+
+    session_id: int
+    system_id: int
+    snapshot_id: int
+    items: List[InterviewApprovedItemOut] = Field(default_factory=list)
+    total_proposals: int = 0
+    approved_count: int = 0
+    rejected_count: int = 0
+    pending_count: int = 0
+
+
+# --- Interview Materialization (Issue #71) ------------------------------------
+#
+# Materializes approved docstring metadata + probe instrumentation into a
+# single reviewable diff from an isolated worktree. The target repo's
+# tracked branches are never written to.
+
+
+class InterviewMaterializeRequest(BaseModel):
+    """Request to materialize the approved set into a reviewable diff."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    worktree_base: Optional[str] = Field(
+        default=None,
+        description="Base directory for the temporary worktree. "
+        "Defaults to system temp if not provided.",
+    )
+
+
+class InterviewMaterializeOut(BaseModel):
+    """Result of materializing approved proposals into a diff."""
+
+    session_id: int
+    system_id: int
+    snapshot_id: int
+    diff: str
+    files_changed: int
+    items_materialized: int
+    skipped: List[str] = Field(default_factory=list)
+    materialized_at: float
+    error: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# System Understanding (Issue #86)
+# ---------------------------------------------------------------------------
+
+PipelineStepStatus = Literal["complete", "missing", "warning", "blocked", "failed"]
+
+
+class SystemUnderstandingPipelineStepOut(BaseModel):
+    step: str
+    status: PipelineStepStatus
+    detail: Optional[str] = None
+
+
+class SystemUnderstandingNextActionOut(BaseModel):
+    action: str
+    reason: str
+    link: Optional[str] = None
+
+
+class SystemUnderstandingGapSummaryOut(BaseModel):
+    gap_type: str
+    count: int
+
+
+class SystemUnderstandingMetadataCoverageOut(BaseModel):
+    symbol_count: int = 0
+    symbols_with_source_metadata: int = 0
+    entrypoint_count: int = 0
+    entrypoints_with_capability_link: int = 0
+
+
+class SystemUnderstandingCapabilitySummaryOut(BaseModel):
+    name: str
+    summary: Optional[str] = None
+    provenance_kind: Optional[str] = None
+
+
+class SystemUnderstandingEntrypointSummaryOut(BaseModel):
+    entrypoint_type: str
+    entrypoint_id: str
+    category: Optional[str] = None
+    label: Optional[str] = None
+
+
+class SystemUnderstandingSymbolSummaryOut(BaseModel):
+    path: str
+    qualified_name: str
+    kind: Optional[str] = None
+    route_path: Optional[str] = None
+    route_method: Optional[str] = None
+    component_id: Optional[str] = None
+
+
+class SystemUnderstandingPurposeOut(BaseModel):
+    name: str
+    summary: Optional[str] = None
+    provenance_kind: Optional[str] = None
+
+
+class SystemUnderstandingGapNextActionOut(BaseModel):
+    action: str
+    link: Optional[str] = None
+
+
+class SystemUnderstandingGapDocRef(BaseModel):
+    path: str
+    start_line: Optional[int] = None
+    end_line: Optional[int] = None
+
+
+class SystemUnderstandingGapSymbolRef(BaseModel):
+    path: Optional[str] = None
+    qualified_name: Optional[str] = None
+
+
+class SystemUnderstandingGapEntrypointRef(BaseModel):
+    entrypoint_type: Optional[str] = None
+    entrypoint_ref: Optional[str] = None
+
+
+class SystemUnderstandingGapOut(BaseModel):
+    gap_type: Optional[str] = None
+    severity: str = "info"
+    title: Optional[str] = None
+    node_name: Optional[str] = None
+    notes: Optional[str] = None
+    capability_key: Optional[str] = None
+    doc_refs: List[SystemUnderstandingGapDocRef] = Field(default_factory=list)
+    symbol_refs: List[SystemUnderstandingGapSymbolRef] = Field(default_factory=list)
+    entrypoint_refs: List[SystemUnderstandingGapEntrypointRef] = Field(default_factory=list)
+    code_refs: List[Dict[str, Any]] = Field(default_factory=list)
+    next_actions: List[SystemUnderstandingGapNextActionOut] = Field(default_factory=list)
+
+
+class SystemUnderstandingOut(BaseModel):
+    system_id: int
+    snapshot_id: Optional[int] = None
+    commit_sha: Optional[str] = None
+    pipeline: List[SystemUnderstandingPipelineStepOut] = Field(default_factory=list)
+    purpose: Optional[SystemUnderstandingPurposeOut] = None
+    capabilities: List[SystemUnderstandingCapabilitySummaryOut] = Field(default_factory=list)
+    entrypoints: List[SystemUnderstandingEntrypointSummaryOut] = Field(default_factory=list)
+    major_symbols: List[SystemUnderstandingSymbolSummaryOut] = Field(default_factory=list)
+    gaps: List[SystemUnderstandingGapOut] = Field(default_factory=list)
+    gap_summary: List[SystemUnderstandingGapSummaryOut] = Field(default_factory=list)
+    metadata_coverage: Optional[SystemUnderstandingMetadataCoverageOut] = None
+    next_actions: List[SystemUnderstandingNextActionOut] = Field(default_factory=list)

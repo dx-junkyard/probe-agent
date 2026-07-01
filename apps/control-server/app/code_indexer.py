@@ -3,6 +3,15 @@
 Parses Python source files from a snapshot and extracts module-level,
 class-level, and function-level symbols.  Syntax errors in individual files
 produce warnings instead of aborting the whole index.
+
+probe-agent:
+  role: Deterministic Python AST symbol extractor
+  capability: code-intelligence
+  element_type: core
+  consumers: [entrypoint-discovery, capability-mapping, docs-code-reconciliation]
+  operation_kind: analysis
+  state_effects: [none]
+  probe_value: Verify that identical source produces identical symbol index with stable hashes.
 """
 
 from __future__ import annotations

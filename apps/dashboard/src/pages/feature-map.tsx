@@ -1,11 +1,13 @@
-import { useLatestDrafts, useGenerateDrafts, useCodeLinks, useGenerateCodeLinks, useReviewCodeLink } from "@/api/hooks";
+import { useEffect, useRef, useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
+import { useLatestDrafts, useGenerateDrafts, useCodeLinks, useGenerateCodeLinks, useReviewCodeLink, useCapabilityHierarchy } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { toast } from "sonner";
-import { Sparkles, Link2, CheckCircle, XCircle, FileText } from "lucide-react";
+import { Sparkles, Link2, CheckCircle, XCircle, FileText, Boxes } from "lucide-react";
 import { AddToWorkspaceButton } from "@/components/add-to-workspace";
 
 export default function FeatureMapPage() {
@@ -14,6 +16,23 @@ export default function FeatureMapPage() {
   const { data: codeLinks, isLoading: linksLoading } = useCodeLinks();
   const generateLinks = useGenerateCodeLinks();
   const reviewLink = useReviewCodeLink();
+  const { data: hierarchy } = useCapabilityHierarchy();
+  const [searchParams] = useSearchParams();
+  const [highlightedFeature, setHighlightedFeature] = useState<string | null>(null);
+  const highlightRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const featureParam = searchParams.get("feature");
+    if (featureParam) {
+      setHighlightedFeature(featureParam);
+    }
+  }, [searchParams]);
+
+  useEffect(() => {
+    if (highlightedFeature && highlightRef.current) {
+      highlightRef.current.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [highlightedFeature]);
 
   const profile = drafts?.system_profile_draft;
   const features = drafts?.feature_drafts ?? [];
@@ -127,32 +146,76 @@ export default function FeatureMapPage() {
             <Card><CardContent className="py-8 text-center text-sm text-muted-foreground">No features discovered yet</CardContent></Card>
           ) : (
             <div className="grid gap-4 md:grid-cols-2">
-              {features.map(f => (
-                <Card key={f.id}>
-                  <CardHeader className="pb-3">
-                    <div className="flex items-start justify-between">
-                      <CardTitle className="text-sm">{f.name}</CardTitle>
-                      <Badge variant="outline" className="text-xs">{f.feature_id}</Badge>
-                    </div>
-                    <CardDescription className="text-xs">{f.summary}</CardDescription>
-                  </CardHeader>
-                  <CardContent className="space-y-2 text-xs">
-                    {f.user_value && <div><span className="font-medium text-muted-foreground">Value: </span>{f.user_value}</div>}
-                    {f.risks && <div><span className="font-medium text-muted-foreground">Risks: </span>{f.risks}</div>}
-                    {f.evidence?.length > 0 && (
-                      <div className="pt-1 space-y-0.5">
-                        {f.evidence.slice(0, 3).map((e, i) => (
-                          <div key={i} className="font-mono text-muted-foreground">
-                            {e.file}:{e.line_start}–{e.line_end}
-                          </div>
-                        ))}
-                        {f.evidence.length > 3 && <span className="text-muted-foreground">+{f.evidence.length - 3} more</span>}
+              {features.map(f => {
+                const featureLinks = (codeLinks?.links ?? []).filter(l => l.feature_id === f.feature_id);
+                const acceptedLinks = featureLinks.filter(l => l.review_status === "accepted");
+                const linkedSymbols = new Set(acceptedLinks.map(l => l.symbol));
+                const capsFromLinks = (hierarchy?.capabilities ?? []).filter(cap =>
+                  cap.elements.some(el => linkedSymbols.has(el.provenance.qualified_name ?? "")),
+                );
+                const capsFromHierarchy = (hierarchy?.capabilities ?? []).filter(cap =>
+                  cap.elements.some(el => el.provenance.feature_id === f.feature_id),
+                );
+                const relatedCapIds = new Set<number>();
+                const relatedCaps: typeof capsFromLinks = [];
+                for (const cap of [...capsFromLinks, ...capsFromHierarchy]) {
+                  if (!relatedCapIds.has(cap.id)) {
+                    relatedCapIds.add(cap.id);
+                    relatedCaps.push(cap);
+                  }
+                }
+                const isHighlighted = highlightedFeature === f.feature_id;
+                return (
+                  <Card
+                    key={f.id}
+                    ref={isHighlighted ? highlightRef : undefined}
+                    className={isHighlighted ? "ring-2 ring-primary" : ""}
+                    data-testid="feature-card"
+                  >
+                    <CardHeader className="pb-3">
+                      <div className="flex items-start justify-between">
+                        <CardTitle className="text-sm">{f.name}</CardTitle>
+                        <Badge variant="outline" className="text-xs">{f.feature_id}</Badge>
                       </div>
-                    )}
-                    <AddToWorkspaceButton itemType="feature" itemId={f.feature_id} label={f.name} />
-                  </CardContent>
-                </Card>
-              ))}
+                      <CardDescription className="text-xs">{f.summary}</CardDescription>
+                    </CardHeader>
+                    <CardContent className="space-y-2 text-xs">
+                      {f.user_value && <div><span className="font-medium text-muted-foreground">Value: </span>{f.user_value}</div>}
+                      {f.risks && <div><span className="font-medium text-muted-foreground">Risks: </span>{f.risks}</div>}
+                      {f.evidence?.length > 0 && (
+                        <div className="pt-1 space-y-0.5">
+                          {f.evidence.slice(0, 3).map((e, i) => (
+                            <div key={i} className="font-mono text-muted-foreground">
+                              {e.file}:{e.line_start}–{e.line_end}
+                            </div>
+                          ))}
+                          {f.evidence.length > 3 && <span className="text-muted-foreground">+{f.evidence.length - 3} more</span>}
+                        </div>
+                      )}
+                      {relatedCaps.length > 0 && (
+                        <div className="pt-1 flex flex-wrap gap-1" data-testid="feature-capability-links">
+                          {relatedCaps.map(cap => (
+                            <Link
+                              key={cap.id}
+                              to={`/capability-map?capability=${encodeURIComponent(cap.capability_key ?? cap.name)}`}
+                              className="inline-flex items-center gap-1 text-primary hover:underline"
+                            >
+                              <Boxes className="h-3 w-3" />
+                              <span>{cap.name}</span>
+                            </Link>
+                          ))}
+                        </div>
+                      )}
+                      {featureLinks.length > 0 && (
+                        <div className="pt-1 text-muted-foreground">
+                          <span className="font-medium">{featureLinks.length} code link{featureLinks.length !== 1 ? "s" : ""}</span>
+                        </div>
+                      )}
+                      <AddToWorkspaceButton itemType="feature" itemId={f.feature_id} label={f.name} />
+                    </CardContent>
+                  </Card>
+                );
+              })}
             </div>
           )}
         </TabsContent>
@@ -183,7 +246,14 @@ export default function FeatureMapPage() {
                     <tbody>
                       {codeLinks.links.map(l => (
                         <tr key={l.id} className="border-b last:border-0">
-                          <td className="py-2 text-xs">{l.feature_id}</td>
+                          <td className="py-2 text-xs">
+                            <Link
+                              to={`/feature-map?feature=${encodeURIComponent(l.feature_id)}`}
+                              className="text-primary hover:underline"
+                            >
+                              {l.feature_id}
+                            </Link>
+                          </td>
                           <td className="py-2 font-mono text-xs">{l.symbol}</td>
                           <td className="py-2">
                             <div className="flex items-center gap-2">
