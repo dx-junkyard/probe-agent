@@ -8,6 +8,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import {
   CheckCircle2, XCircle, AlertTriangle, Ban, HelpCircle,
   RefreshCw, ArrowRight, ExternalLink, FileText, Code, Zap,
+  Boxes, Target,
 } from "lucide-react";
 import type {
   SystemUnderstandingPipelineStep,
@@ -330,6 +331,41 @@ function EmptyState() {
   );
 }
 
+function EntryCards() {
+  return (
+    <div className="grid gap-4 md:grid-cols-2">
+      <Link to="/capability-map" className="block group">
+        <Card className="h-full transition-colors group-hover:border-primary/50">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm flex items-center gap-2">
+              <Boxes className="h-4 w-4" />
+              Start from Capability
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="text-xs text-muted-foreground">
+            Browse capabilities discovered from source metadata and code structure.
+            Drill into elements, see related APIs, and identify probe candidates.
+          </CardContent>
+        </Card>
+      </Link>
+      <Link to="/feature-map" className="block group">
+        <Card className="h-full transition-colors group-hover:border-primary/50">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm flex items-center gap-2">
+              <Target className="h-4 w-4" />
+              Start from Feature
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="text-xs text-muted-foreground">
+            Explore features extracted from documentation, map them to code symbols
+            via Feature-to-Code Links, and trace their capability connections.
+          </CardContent>
+        </Card>
+      </Link>
+    </div>
+  );
+}
+
 function DataView({ data }: { data: SystemUnderstandingOut }) {
   const pipeline = data.pipeline ?? [];
   const allMissing = pipeline.every((s) => s.status === "missing");
@@ -346,6 +382,8 @@ function DataView({ data }: { data: SystemUnderstandingOut }) {
           {allMissing ? <EmptyState /> : <PipelineChecklist steps={pipeline} />}
         </CardContent>
       </Card>
+
+      {!allMissing && <EntryCards />}
 
       <div className="grid gap-6 lg:grid-cols-2">
         {/* System Purpose */}

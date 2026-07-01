@@ -6,7 +6,7 @@ import {
   useCapabilityHierarchy, useCapabilityHierarchyDrift,
   useGenerateCapabilityHierarchy, useRequestExplanationRefresh,
   useLatestSnapshot, useSymbols, useLatestDrafts,
-  useSystemUnderstanding,
+  useSystemUnderstanding, useApiRoleCards, useCodeLinks,
 } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button, buttonVariants } from "@/components/ui/button";
@@ -122,14 +122,17 @@ function RefreshPanel({ data }: { data: ExplanationRefreshOut }) {
 }
 
 function DetailsPanel({
-  selected, driftByNode,
+  selected, driftByNode, allCapabilities,
 }: {
   selected: SelectedNode;
   driftByNode: Map<number, AnchorDriftOut>;
+  allCapabilities?: CapabilityOut[];
 }) {
   const refresh = useRequestExplanationRefresh();
   const [proposal, setProposal] = useState<ExplanationRefreshOut | null>(null);
   const { data: understanding } = useSystemUnderstanding();
+  const { data: roleCardsData } = useApiRoleCards();
+  const { data: codeLinksData } = useCodeLinks();
 
   const data = selected.data;
   const provenance = data.provenance;
@@ -278,6 +281,91 @@ function DetailsPanel({
             {proposal && <RefreshPanel data={proposal} />}
           </div>
         )}
+
+        {selected.kind === "capability" && (() => {
+          const capKey = selected.data.capability_key ?? selected.data.name;
+          const relatedApis = (roleCardsData?.cards ?? []).filter(
+            c => c.capability_key === capKey,
+          );
+          const elements = selected.data.elements ?? [];
+          const featureIds = new Set<string>();
+          for (const el of elements) {
+            if (el.provenance.feature_id) featureIds.add(el.provenance.feature_id);
+          }
+          const linkedFeatures = (codeLinksData?.links ?? []).filter(
+            l => l.status === "accepted" && elements.some(
+              el => el.provenance.qualified_name === l.symbol_qualified_name,
+            ),
+          );
+          for (const lf of linkedFeatures) {
+            if (lf.feature_id) featureIds.add(lf.feature_id);
+          }
+          const featureList = Array.from(featureIds);
+          const probeElements = elements.filter(el => el.probe_value);
+          return (
+            <>
+              {relatedApis.length > 0 && (
+                <div className="pt-2 space-y-1.5" data-testid="related-apis">
+                  <p className="text-[11px] font-medium text-muted-foreground">Related APIs</p>
+                  {relatedApis.map((api, i) => (
+                    <Link
+                      key={i}
+                      to={`/flow-explorer?entrypoint_type=${encodeURIComponent(api.entrypoint_type)}&entrypoint_id=${encodeURIComponent(api.entrypoint_id)}`}
+                      className="flex items-center gap-1.5 text-[11px] text-primary hover:underline"
+                    >
+                      <Server className="h-3 w-3 shrink-0" />
+                      <span>{api.label}</span>
+                    </Link>
+                  ))}
+                </div>
+              )}
+              {elements.length > 0 && (
+                <div className="pt-2 space-y-1.5" data-testid="major-functions">
+                  <p className="text-[11px] font-medium text-muted-foreground">Major Functions</p>
+                  {elements.slice(0, 10).map((el, i) => (
+                    <div key={i} className="flex items-center gap-1.5 text-[11px]">
+                      <Target className="h-3 w-3 shrink-0 text-muted-foreground" />
+                      <span className="font-mono">{el.name}</span>
+                      {el.element_role && (
+                        <Badge variant="outline" className="text-[10px]">{el.element_role}</Badge>
+                      )}
+                    </div>
+                  ))}
+                  {elements.length > 10 && (
+                    <span className="text-[11px] text-muted-foreground">+{elements.length - 10} more</span>
+                  )}
+                </div>
+              )}
+              {featureList.length > 0 && (
+                <div className="pt-2 space-y-1.5" data-testid="related-features">
+                  <p className="text-[11px] font-medium text-muted-foreground">Related Features</p>
+                  {featureList.map((fid) => (
+                    <Link
+                      key={fid}
+                      to={`/feature-map?feature=${encodeURIComponent(fid)}`}
+                      className="flex items-center gap-1.5 text-[11px] text-primary hover:underline"
+                    >
+                      <Link2 className="h-3 w-3 shrink-0" />
+                      <span>{fid}</span>
+                    </Link>
+                  ))}
+                </div>
+              )}
+              {probeElements.length > 0 && (
+                <div className="pt-2 space-y-1.5" data-testid="probe-candidates">
+                  <p className="text-[11px] font-medium text-muted-foreground">Probe Flow Candidates</p>
+                  {probeElements.map((el, i) => (
+                    <div key={i} className="flex items-center gap-1.5 text-[11px]">
+                      <Sparkles className="h-3 w-3 shrink-0 text-violet-500" />
+                      <span className="font-mono">{el.name}</span>
+                      <span className="text-muted-foreground">{el.probe_value}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          );
+        })()}
 
         {relatedGaps.length > 0 && (
           <div className="pt-2 space-y-1.5" data-testid="related-gaps">
@@ -612,7 +700,7 @@ export default function CapabilityMapPage() {
           {/* Right: details */}
           <div className="space-y-4">
             {selected ? (
-              <DetailsPanel selected={selected} driftByNode={driftByNode} />
+              <DetailsPanel selected={selected} driftByNode={driftByNode} allCapabilities={capabilities} />
             ) : (
               <Card>
                 <CardContent className="py-12 text-center text-sm text-muted-foreground">

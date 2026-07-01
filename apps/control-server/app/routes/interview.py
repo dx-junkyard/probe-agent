@@ -215,6 +215,17 @@ def create_interview_session(
     payload: InterviewSessionCreate,
     system_id: int = Depends(get_system_id),
 ) -> InterviewSessionOut:
+    """Create a new interview session for a system.
+
+    probe-agent:
+      role: API boundary for creating a new interview session
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: write
+      state_effects: [database-write]
+      probe_value: Verify session creation persists correct fields and returns valid session
+    """
     now = time.time()
     with get_conn() as conn:
         snapshot = conn.execute(
@@ -277,6 +288,15 @@ def get_interview_context_pack(
     Assembles symbols, entrypoints, and existing metadata from the session's
     pinned snapshot and flags which items are classified vs. unclassified,
     all within an explicit LLM context budget (Issue #68).
+
+    probe-agent:
+      role: API boundary for retrieving the deterministic context pack
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: Verify context pack assembly respects budget and returns correct classification state
     """
     with get_conn() as conn:
         session = _get_session_or_404(conn, session_id, system_id)
@@ -366,6 +386,15 @@ def create_interview_proposals(
     supplies the already-produced payload and the audit metadata of the
     reasoning run that produced it. The audit metadata is stored as one
     ``intelligence_runs`` row that every proposal in the batch links to.
+
+    probe-agent:
+      role: API boundary for persisting interview proposals
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: write
+      state_effects: [database-write]
+      probe_value: Verify proposals are persisted with correct intelligence run linkage and stage guard
     """
     now = time.time()
     with get_conn() as conn:
@@ -534,6 +563,15 @@ def interview_dialogue_turn(
     4. Validates proposals against #54 vocabulary and the safety denylist.
     5. On success: persists user message, assistant message, intelligence run,
        and any proposals. On failure: persists the failure and returns error.
+
+    probe-agent:
+      role: API boundary for generating a reasoning-model dialogue turn
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: orchestration
+      state_effects: [database-write, external-api]
+      probe_value: Verify dialogue turn persists messages and proposals, and handles LLM failures gracefully
     """
     now = time.time()
     config = _get_intelligence_llm_config()
@@ -886,6 +924,17 @@ def approve_interview_proposal(
     payload: InterviewProposalApproveRequest,
     system_id: int = Depends(get_system_id),
 ) -> InterviewProposalDecisionOut:
+    """Approve a pending interview proposal for materialization.
+
+    probe-agent:
+      role: API boundary for approving an interview proposal
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: write
+      state_effects: [database-write]
+      probe_value: Verify approval persists decision and enforces proposal state guard
+    """
     now = time.time()
     with get_conn() as conn:
         _get_session_or_404(conn, session_id, system_id)
@@ -1096,6 +1145,15 @@ def materialize_interview_session(
     ``probe-agent:`` docstring blocks and ``@probe`` instrumentation, and
     returns the unified diff.  The target repository's tracked branches
     are never written to; the worktree is cleaned up after diff capture.
+
+    probe-agent:
+      role: API boundary for materializing approved proposals into a diff
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: orchestration
+      state_effects: [database-write, filesystem]
+      probe_value: Verify materialization produces a valid diff from approved proposals without modifying tracked branches
     """
     import tempfile
     from ..docstring_writer import MetadataValues
@@ -1250,6 +1308,15 @@ def update_interview_understanding(
 
     This endpoint is the entry point for generating an initial understanding
     when Start Interview is clicked, or for refreshing after new turns.
+
+    probe-agent:
+      role: API boundary for updating session understanding from graph data
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: orchestration
+      state_effects: [database-write]
+      probe_value: Verify understanding update rebuilds graph and reconciliation correctly
     """
     now = time.time()
     with get_conn() as conn:

@@ -824,6 +824,8 @@ export interface ProbePointOut {
   updated_at: string;
 }
 
+export type ProbePlanOrigin = "feature_map" | "capability_map" | "flow_explorer" | "interview" | "manual";
+
 export interface ProbePlanOut {
   id: number;
   system_id: number;
@@ -832,6 +834,7 @@ export interface ProbePlanOut {
   feature_id: string;
   objective: string;
   status: string;
+  origin: ProbePlanOrigin;
   avoid_reasons: string[];
   probe_points: ProbePointOut[];
   intelligence_run: IntelligenceRunOut | null;

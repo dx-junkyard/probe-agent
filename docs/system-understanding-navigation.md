@@ -111,6 +111,31 @@ Issue #90 で実装されたクロスページリンク:
 | Feature Map — related capabilities | Capability Map | `?capability=<key>` で自動選択 |
 | Feature Map — code links (feature_id) | Feature Map | `?feature=<id>` でハイライト |
 
+## Feature Map から始める場合
+
+Feature Map は「ユーザー価値」を起点とする探索パスを提供する。
+
+1. **Feature Map ページを開く**: System Understanding の "Start from Feature" カードまたはサイドバーから遷移
+2. **Feature を選択**: ドキュメントから抽出された Feature 一覧から対象を選ぶ
+3. **Code Links を確認**: Feature に紐づく `accepted` 状態の FeatureCodeLink を確認。各リンクの `symbol_qualified_name` がコード上の実装単位を示す
+4. **Related Capabilities を確認**: Feature カード内の Capability リンクから Capability Map に遷移
+   - 優先順位: (1) accepted FeatureCodeLink の symbol → source metadata の capability, (2) capability hierarchy node の feature_id, (3) docs-code gap refs
+5. **Probe Plan を作成**: Capability の element を選び、Flow Explorer 経由で probe plan を作成する
+
+## Capability Map から始める場合
+
+Capability Map は「実装構造」を起点とする探索パスを提供する。
+
+1. **Capability Map ページを開く**: System Understanding の "Start from Capability" カードまたはサイドバーから遷移
+2. **Capability を選択**: ツリーから Core Capability を選ぶ
+3. **Detail パネルを確認**:
+   - **Related APIs**: この capability に属する API entrypoint の一覧。クリックで Flow Explorer に遷移
+   - **Major Functions**: capability を構成する element の一覧（role, probe value 付き）
+   - **Related Features**: この capability に紐づく Feature の一覧。クリックで Feature Map に遷移
+   - **Probe Flow Candidates**: probe_value が設定された element。観測対象の候補
+4. **Flow Explorer に遷移**: Related APIs のリンクまたは "Open in Flow Explorer" ボタンから遷移
+5. **Probe Plan を作成**: Flow Explorer でノード/エッジを選択し、plan を submit すると自動的に Probe Planner に遷移
+
 ## Dogfooding: probe-agent 自身への System Understanding 適用
 
 probe-agent は自身の `probe-agent:` source-authored metadata を使って

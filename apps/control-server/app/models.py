@@ -843,6 +843,7 @@ class ProbePlanOut(BaseModel):
     feature_id: str
     objective: str
     status: ProbePlanStatus
+    origin: str = "manual"
     avoid_reasons: List[str] = Field(default_factory=list)
     probe_points: List[ProbePointOut] = Field(default_factory=list)
     intelligence_run: Optional[IntelligenceRunOut] = None
