@@ -101,17 +101,33 @@ def _check_snapshot_ready(conn, system_id: int, snapshot_row) -> PipelineStep:
     return PipelineStep("snapshot_ready", "missing")
 
 
+def _is_reasoning_model_available() -> bool:
+    """Check whether a non-mock reasoning model is configured."""
+    import os
+    provider = (os.getenv("INTELLIGENCE_LLM_PROVIDER") or os.getenv("LLM_PROVIDER", "openai")).strip().lower()
+    if provider == "mock":
+        return False
+    from .llm import is_reasoning_model
+    model = os.getenv("INTELLIGENCE_LLM_MODEL") or os.getenv("LLM_MODEL")
+    if not model:
+        defaults = {"openai": "gpt-4o-mini", "anthropic": "claude-3-5-haiku-latest", "gemini": "gemini-1.5-flash"}
+        model = defaults.get(provider, "gpt-4o-mini")
+    return is_reasoning_model(provider, model)
+
+
 def _check_documentation_indexed(conn, system_id: int, snapshot_id: Optional[int]) -> PipelineStep:
     if snapshot_id is None:
         return PipelineStep("documentation_indexed", "missing")
     row = conn.execute(
-        "SELECT id, status FROM intelligence_runs WHERE system_id = ? AND run_type = 'draft_generation' AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
+        "SELECT id, status FROM intelligence_runs WHERE system_id = ? AND run_type IN ('draft_generation', 'repository_drafts') AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
         (system_id, snapshot_id),
     ).fetchone()
     if row:
         if row["status"] == "success":
             return PipelineStep("documentation_indexed", "complete")
         return PipelineStep("documentation_indexed", "failed", detail=f"run status: {row['status']}")
+    if not _is_reasoning_model_available():
+        return PipelineStep("documentation_indexed", "blocked", detail="Reasoning model not configured")
     return PipelineStep("documentation_indexed", "missing")
 
 
@@ -124,6 +140,8 @@ def _check_documentation_claims_scanned(conn, system_id: int, snapshot_id: Optio
     ).fetchone()
     if row:
         return PipelineStep("documentation_claims_scanned", "complete")
+    if not _is_reasoning_model_available():
+        return PipelineStep("documentation_claims_scanned", "blocked", detail="Reasoning model not configured")
     return PipelineStep("documentation_claims_scanned", "missing")
 
 
@@ -179,11 +197,13 @@ def _check_capability_hierarchy_ready(conn, system_id: int, snapshot_id: Optiona
         (system_id, snapshot_id),
     ).fetchone()
     if row:
-        if row["status"] == "success":
+        if row["status"] in ("success", "completed"):
             return PipelineStep("capability_hierarchy_ready", "complete")
         if row["status"] == "failed":
             return PipelineStep("capability_hierarchy_ready", "failed")
         return PipelineStep("capability_hierarchy_ready", "warning", detail=f"status: {row['status']}")
+    if not _is_reasoning_model_available():
+        return PipelineStep("capability_hierarchy_ready", "blocked", detail="Reasoning model not configured")
     return PipelineStep("capability_hierarchy_ready", "missing")
 
 
@@ -502,6 +522,69 @@ def _detect_extra_gaps(conn, system_id: int, snapshot_id: int) -> List[Dict[str,
             "next_actions": _gap_next_actions("unclassified_entrypoint"),
         })
 
+    # missing_probe_flow: classified entrypoints with no probe plan
+    classified_eps = conn.execute(
+        """SELECT ce.entrypoint_type, ce.entrypoint_id, ce.handler_path, ce.handler_qualified_name,
+                  chn.capability_key
+           FROM code_entrypoints ce
+           JOIN capability_hierarchy_nodes chn
+               ON chn.system_id = ce.system_id AND chn.snapshot_id = ce.snapshot_id
+               AND chn.entrypoint_id = ce.id
+           WHERE ce.system_id = ? AND ce.snapshot_id = ?
+           AND NOT EXISTS (
+               SELECT 1 FROM probe_plans pp
+               WHERE pp.system_id = ce.system_id AND pp.snapshot_id = ce.snapshot_id
+           )""",
+        (system_id, snapshot_id),
+    ).fetchall()
+    for ep in classified_eps:
+        ep_label = ep["entrypoint_id"] or ep["handler_qualified_name"] or "unknown"
+        extra.append({
+            "gap_type": "missing_probe_flow",
+            "severity": _gap_severity("missing_probe_flow"),
+            "title": _gap_title("missing_probe_flow", ep_label),
+            "node_name": ep_label,
+            "notes": f"Entrypoint {ep['entrypoint_type']}:{ep['entrypoint_id']} is classified but has no probe plan",
+            "capability_key": ep["capability_key"],
+            "doc_refs": [],
+            "symbol_refs": [{"path": ep["handler_path"], "qualified_name": ep["handler_qualified_name"]}] if ep["handler_qualified_name"] else [],
+            "entrypoint_refs": [{"entrypoint_type": ep["entrypoint_type"], "entrypoint_ref": ep["entrypoint_id"]}],
+            "code_refs": [],
+            "next_actions": _gap_next_actions("missing_probe_flow"),
+        })
+
+    # missing_evidence: understanding graph nodes whose evidence list is empty
+    graph_snapshot = conn.execute(
+        "SELECT graph_json FROM understanding_graph_snapshots WHERE system_id = ? AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
+        (system_id, snapshot_id),
+    ).fetchone()
+    if graph_snapshot:
+        try:
+            graph_data = json.loads(graph_snapshot["graph_json"])
+            nodes = graph_data.get("nodes", {})
+            for node_id, node in nodes.items():
+                node_type = node.get("node_type", "")
+                if node_type == "conflict":
+                    continue
+                evidence = node.get("evidence", [])
+                if not evidence:
+                    node_name = node.get("name", node_id)
+                    extra.append({
+                        "gap_type": "missing_evidence",
+                        "severity": _gap_severity("missing_evidence"),
+                        "title": _gap_title("missing_evidence", node_name),
+                        "node_name": node_name,
+                        "notes": f"Documentation claim '{node_name}' has no file/line evidence",
+                        "capability_key": None,
+                        "doc_refs": [],
+                        "symbol_refs": [],
+                        "entrypoint_refs": [],
+                        "code_refs": [],
+                        "next_actions": _gap_next_actions("missing_evidence"),
+                    })
+        except (json.JSONDecodeError, TypeError):
+            pass
+
     return extra
 
 
@@ -753,9 +836,88 @@ def build_system_understanding(system_id: int) -> SystemUnderstandingSummary:
                     import logging
                     logging.getLogger(__name__).warning("Entrypoint discovery in build failed: %s", _ep_exc, exc_info=True)
 
-        # Reasoning-model-dependent steps are not auto-run:
-        # - documentation_indexed / documentation_claims_scanned (draft generation)
-        # - capability_hierarchy_ready
-        # These are deferred to explicit user action to avoid heuristic fallback.
+        # Step: documentation pipeline (requires reasoning model)
+        doc_indexed = conn.execute(
+            "SELECT id FROM intelligence_runs WHERE system_id = ? AND run_type IN ('draft_generation', 'repository_drafts') AND snapshot_id = ? AND status = 'success' LIMIT 1",
+            (system_id, snapshot_id),
+        ).fetchone()
+        graph_row = conn.execute(
+            "SELECT id FROM understanding_graph_snapshots WHERE system_id = ? AND snapshot_id = ? LIMIT 1",
+            (system_id, snapshot_id),
+        ).fetchone()
+
+        if not doc_indexed or not graph_row:
+            if _is_reasoning_model_available():
+                try:
+                    from .documentation_indexer import build_documentation_index
+                    from .documentation_claim_scanner import scan_all_chunks
+                    from .understanding_graph import build_understanding_graph, save_graph_snapshot
+                    from .docs_code_reconciler import reconcile
+                    from .routes.interview import _get_intelligence_llm_config
+
+                    doc_index = build_documentation_index(conn, system_id, snapshot_id)
+                    config = _get_intelligence_llm_config()
+                    client = create_llm_client(config)
+                    scan_results = scan_all_chunks(client, config, doc_index.chunks)
+                    graph = build_understanding_graph(scan_results)
+                    save_graph_snapshot(conn, system_id, graph, snapshot_id=snapshot_id)
+                    reconcile(conn, system_id, snapshot_id, graph)
+                except Exception as _doc_exc:
+                    import logging
+                    logging.getLogger(__name__).warning("Documentation pipeline in build failed: %s", _doc_exc, exc_info=True)
+
+        # Step: capability_hierarchy_ready (deterministic base)
+        cap_run = conn.execute(
+            "SELECT id FROM intelligence_runs WHERE system_id = ? AND run_type = 'capability_hierarchy' AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
+            (system_id, snapshot_id),
+        ).fetchone()
+        if not cap_run:
+            try:
+                from .capability_hierarchy import (
+                    build_hierarchy,
+                    PROMPT_VERSION as HIERARCHY_PROMPT_VERSION,
+                    SCHEMA_VERSION as HIERARCHY_SCHEMA_VERSION,
+                )
+                from .routes.project_intelligence import (
+                    _hierarchy_symbol_records,
+                    _hierarchy_entrypoint_records,
+                    _persist_hierarchy_node,
+                )
+
+                symbols_h = _hierarchy_symbol_records(conn, snapshot_id, system_id)
+                entrypoints_h = _hierarchy_entrypoint_records(conn, snapshot_id, system_id)
+
+                if symbols_h:
+                    draft_row = conn.execute(
+                        "SELECT id, name, purpose FROM system_profile_drafts WHERE system_id = ? AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
+                        (system_id, snapshot_id),
+                    ).fetchone()
+                    sp_draft = {"id": draft_row["id"], "name": draft_row["name"], "purpose": draft_row["purpose"]} if draft_row else None
+
+                    built = build_hierarchy(symbols_h, entrypoints_h, sp_draft)
+
+                    now = time.time()
+                    run_id = conn.execute(
+                        """INSERT INTO intelligence_runs
+                            (system_id, snapshot_id, run_type, provider, model,
+                             prompt_version, schema_version, decision_method,
+                             status, is_mock, started_at, completed_at)
+                        VALUES (?, ?, 'capability_hierarchy', 'deterministic', 'none',
+                                ?, ?, 'deterministic', 'success', 0, ?, ?)""",
+                        (system_id, snapshot_id, HIERARCHY_PROMPT_VERSION, HIERARCHY_SCHEMA_VERSION, now, now),
+                    ).lastrowid
+
+                    purpose_id = None
+                    if built.purpose is not None:
+                        purpose_id = _persist_hierarchy_node(conn, system_id, snapshot_id, run_id, built.purpose, None, now)
+                    for cap in built.capabilities:
+                        _persist_hierarchy_node(conn, system_id, snapshot_id, run_id, cap, purpose_id, now)
+                    for node in built.unclassified_elements:
+                        _persist_hierarchy_node(conn, system_id, snapshot_id, run_id, node, None, now)
+                    for node in built.unattached_supporting:
+                        _persist_hierarchy_node(conn, system_id, snapshot_id, run_id, node, None, now)
+            except Exception as _cap_exc:
+                import logging
+                logging.getLogger(__name__).warning("Capability hierarchy in build failed: %s", _cap_exc, exc_info=True)
 
     return get_system_understanding(system_id)

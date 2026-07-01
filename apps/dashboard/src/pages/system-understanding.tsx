@@ -208,6 +208,7 @@ function GapWorklist({ gaps, gapSummary }: {
   gapSummary: { gap_type: string; count: number }[];
 }) {
   const [typeFilter, setTypeFilter] = useState<string | null>(null);
+  const [capabilityFilter, setCapabilityFilter] = useState<string | null>(null);
 
   if (gaps.length === 0 && gapSummary.length === 0) {
     return (
@@ -225,9 +226,10 @@ function GapWorklist({ gaps, gapSummary }: {
   }
 
   const allTypes = Array.from(new Set(gaps.map((g) => g.gap_type ?? "unknown")));
-  const filtered = typeFilter
-    ? gaps.filter((g) => (g.gap_type ?? "unknown") === typeFilter)
-    : gaps;
+  const allCapabilities = Array.from(new Set(gaps.map((g) => g.capability_key).filter(Boolean))) as string[];
+  const filtered = gaps
+    .filter((g) => !typeFilter || (g.gap_type ?? "unknown") === typeFilter)
+    .filter((g) => !capabilityFilter || g.capability_key === capabilityFilter);
 
   const severityCounts = gaps.reduce((acc, g) => {
     acc[g.severity] = (acc[g.severity] || 0) + 1;
@@ -271,6 +273,34 @@ function GapWorklist({ gaps, gapSummary }: {
             );
           })}
         </div>
+
+        {/* Capability filter */}
+        {allCapabilities.length > 0 && (
+          <div className="flex flex-wrap gap-2" data-testid="gap-capability-filter">
+            <Button
+              variant={capabilityFilter === null ? "default" : "outline"}
+              size="sm"
+              className="h-7 text-xs"
+              onClick={() => setCapabilityFilter(null)}
+            >
+              All capabilities
+            </Button>
+            {allCapabilities.map((cap) => {
+              const count = gaps.filter((g) => g.capability_key === cap).length;
+              return (
+                <Button
+                  key={cap}
+                  variant={capabilityFilter === cap ? "default" : "outline"}
+                  size="sm"
+                  className="h-7 text-xs"
+                  onClick={() => setCapabilityFilter(capabilityFilter === cap ? null : cap)}
+                >
+                  {cap} ({count})
+                </Button>
+              );
+            })}
+          </div>
+        )}
 
         {/* Gap cards */}
         <div className="space-y-3" data-testid="gap-cards">

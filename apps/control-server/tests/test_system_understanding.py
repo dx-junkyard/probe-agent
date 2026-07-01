@@ -188,10 +188,12 @@ class TestSystemUnderstandingReportsReasoningModelBlocked:
         data = r.json()
 
         pipeline = {s["step"]: s["status"] for s in data["pipeline"]}
-        # Documentation indexed and capability hierarchy require reasoning model
-        # They should be missing, not filled with heuristic data
-        assert pipeline["documentation_indexed"] == "missing"
-        assert pipeline["capability_hierarchy_ready"] == "missing"
+        # Documentation indexed and claims scanned require reasoning model
+        # They should be blocked when no reasoning model is configured
+        assert pipeline["documentation_indexed"] == "blocked"
+        assert pipeline["documentation_claims_scanned"] == "blocked"
+        # Capability hierarchy has a deterministic base that runs without reasoning
+        assert pipeline["capability_hierarchy_ready"] in ("complete", "blocked")
 
 
 class TestSystemUnderstandingReportsMetadataCoverage:

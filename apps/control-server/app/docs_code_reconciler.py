@@ -34,6 +34,7 @@ GAP_TYPES = {
     "ambiguous_ownership",
     "unclassified_entrypoint",
     "missing_probe_flow",
+    "missing_evidence",
 }
 
 
