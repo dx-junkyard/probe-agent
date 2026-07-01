@@ -168,18 +168,29 @@ function GapCard({ gap }: { gap: SystemUnderstandingGap }) {
               </span>
             </div>
           ))}
-          {gap.entrypoint_refs.map((er, i) => (
-            <div key={`ep-${i}`} className="flex items-center gap-1.5 text-muted-foreground">
-              <Zap className="h-3 w-3 shrink-0" />
-              <Link
-                to={`/flow-explorer?entrypoint_type=${encodeURIComponent(er.entrypoint_type)}&entrypoint_id=${encodeURIComponent(er.entrypoint_ref)}`}
-                className="font-mono text-primary hover:underline"
-                data-testid="gap-entrypoint-link"
-              >
-                {er.entrypoint_type}: {er.entrypoint_ref}
-              </Link>
-            </div>
-          ))}
+          {gap.entrypoint_refs.map((er, i) => {
+            const label = [er.entrypoint_type, er.entrypoint_ref].filter(Boolean).join(": ") || "Unknown entrypoint";
+            const flowLink = er.entrypoint_type && er.entrypoint_ref
+              ? `/flow-explorer?entrypoint_type=${encodeURIComponent(er.entrypoint_type)}&entrypoint_id=${encodeURIComponent(er.entrypoint_ref)}`
+              : null;
+
+            return (
+              <div key={`ep-${i}`} className="flex items-center gap-1.5 text-muted-foreground">
+                <Zap className="h-3 w-3 shrink-0" />
+                {flowLink ? (
+                  <Link
+                    to={flowLink}
+                    className="font-mono text-primary hover:underline"
+                    data-testid="gap-entrypoint-link"
+                  >
+                    {label}
+                  </Link>
+                ) : (
+                  <span className="font-mono">{label}</span>
+                )}
+              </div>
+            );
+          })}
         </div>
       )}
 

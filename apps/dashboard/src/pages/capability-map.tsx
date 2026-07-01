@@ -122,11 +122,10 @@ function RefreshPanel({ data }: { data: ExplanationRefreshOut }) {
 }
 
 function DetailsPanel({
-  selected, driftByNode, allCapabilities,
+  selected, driftByNode,
 }: {
   selected: SelectedNode;
   driftByNode: Map<number, AnchorDriftOut>;
-  allCapabilities?: CapabilityOut[];
 }) {
   const refresh = useRequestExplanationRefresh();
   const [proposal, setProposal] = useState<ExplanationRefreshOut | null>(null);
@@ -293,8 +292,8 @@ function DetailsPanel({
             if (el.provenance.feature_id) featureIds.add(el.provenance.feature_id);
           }
           const linkedFeatures = (codeLinksData?.links ?? []).filter(
-            l => l.status === "accepted" && elements.some(
-              el => el.provenance.qualified_name === l.symbol_qualified_name,
+            l => l.review_status === "accepted" && elements.some(
+              el => el.provenance.qualified_name === l.symbol,
             ),
           );
           for (const lf of linkedFeatures) {
@@ -700,7 +699,7 @@ export default function CapabilityMapPage() {
           {/* Right: details */}
           <div className="space-y-4">
             {selected ? (
-              <DetailsPanel selected={selected} driftByNode={driftByNode} allCapabilities={capabilities} />
+              <DetailsPanel selected={selected} driftByNode={driftByNode} />
             ) : (
               <Card>
                 <CardContent className="py-12 text-center text-sm text-muted-foreground">

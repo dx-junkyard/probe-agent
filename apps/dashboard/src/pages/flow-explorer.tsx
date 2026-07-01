@@ -1,11 +1,10 @@
 import { useState, useEffect, useRef } from "react";
-import type { ReactNode } from "react";
 import { Link, useSearchParams, useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import {
   useFlowEntrypoints, useBuildFlowGraph, useCreatePlanFromFlow, useApiRoleCards,
 } from "@/api/hooks";
-import { ApiRoleCard, PROVENANCE_LABEL, PROVENANCE_STYLE, DRIFT_STYLE, DRIFT_LABEL } from "@/components/api-role-card";
+import { ApiRoleCard } from "@/components/api-role-card";
 import { ApiError } from "@/api/client";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -18,7 +17,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Workflow, Crosshair, AlertTriangle, ArrowRight, Activity, RefreshCw } from "lucide-react";
 import type {
   FlowEntrypointOut, FlowGraphOut, FlowNodeOut, FlowEdgeOut,
-  FlowProbeSelection, ProbePreviewOut, ApiRoleCardOut,
+  FlowProbeSelection, ProbePreviewOut,
 } from "@/api/types";
 
 const RISK_VARIANT: Record<string, "secondary" | "destructive"> = {

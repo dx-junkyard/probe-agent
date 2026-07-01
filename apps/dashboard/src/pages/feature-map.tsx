@@ -147,23 +147,23 @@ export default function FeatureMapPage() {
           ) : (
             <div className="grid gap-4 md:grid-cols-2">
               {features.map(f => {
-                const acceptedLinks = featureLinks.filter(l => l.status === "accepted");
-              const linkedSymbols = new Set(acceptedLinks.map(l => l.symbol_qualified_name));
-              const capsFromLinks = (hierarchy?.capabilities ?? []).filter(cap =>
-                cap.elements.some(el => linkedSymbols.has(el.provenance.qualified_name)),
-              );
-              const capsFromHierarchy = (hierarchy?.capabilities ?? []).filter(cap =>
-                cap.elements.some(el => el.provenance.feature_id === f.feature_id),
-              );
-              const relatedCapIds = new Set<number>();
-              const relatedCaps: typeof capsFromLinks = [];
-              for (const cap of [...capsFromLinks, ...capsFromHierarchy]) {
-                if (!relatedCapIds.has(cap.id)) {
-                  relatedCapIds.add(cap.id);
-                  relatedCaps.push(cap);
-                }
-              }
                 const featureLinks = (codeLinks?.links ?? []).filter(l => l.feature_id === f.feature_id);
+                const acceptedLinks = featureLinks.filter(l => l.review_status === "accepted");
+                const linkedSymbols = new Set(acceptedLinks.map(l => l.symbol));
+                const capsFromLinks = (hierarchy?.capabilities ?? []).filter(cap =>
+                  cap.elements.some(el => linkedSymbols.has(el.provenance.qualified_name ?? "")),
+                );
+                const capsFromHierarchy = (hierarchy?.capabilities ?? []).filter(cap =>
+                  cap.elements.some(el => el.provenance.feature_id === f.feature_id),
+                );
+                const relatedCapIds = new Set<number>();
+                const relatedCaps: typeof capsFromLinks = [];
+                for (const cap of [...capsFromLinks, ...capsFromHierarchy]) {
+                  if (!relatedCapIds.has(cap.id)) {
+                    relatedCapIds.add(cap.id);
+                    relatedCaps.push(cap);
+                  }
+                }
                 const isHighlighted = highlightedFeature === f.feature_id;
                 return (
                   <Card
