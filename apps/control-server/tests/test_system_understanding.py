@@ -411,3 +411,100 @@ class TestGapWorklist:
 
         assert data["gaps"] == []
         assert data["gap_summary"] == []
+
+
+class TestIntelligenceRunStatusContract:
+    """Regression tests: intelligence_runs.status must stay within the shared
+    schema vocabulary ('pending' / 'completed' / 'failed'). Build previously
+    wrote 'success', which broke IntelligenceRunOut serialization downstream."""
+
+    def _build(self, admin_client, tmp_path, name):
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, name)
+        hdrs = _headers(token, sys["id"])
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        admin_client.post(
+            "/repository/snapshots", json={"commit_sha": sha}, headers=hdrs
+        )
+        r = admin_client.post(
+            "/repository/system-understanding/build", headers=hdrs
+        )
+        assert r.status_code == 200
+        return hdrs
+
+    def test_build_writes_contract_statuses_only(self, admin_client, tmp_path):
+        self._build(admin_client, tmp_path, "status-contract-sys")
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT status FROM intelligence_runs"
+            ).fetchall()
+        statuses = {row["status"] for row in rows}
+        assert statuses <= {"pending", "completed", "failed"}, statuses
+
+    def test_hierarchy_endpoints_work_after_build(self, admin_client, tmp_path):
+        hdrs = self._build(admin_client, tmp_path, "post-build-sys")
+
+        hierarchy = admin_client.get(
+            "/repository/capability-hierarchy", headers=hdrs
+        )
+        assert hierarchy.status_code == 200, hierarchy.text
+        assert hierarchy.json()["intelligence_run"]["status"] == "completed"
+
+        drift = admin_client.get(
+            "/repository/capability-hierarchy/drift", headers=hdrs
+        )
+        assert drift.status_code == 200, drift.text
+
+        cards = admin_client.get("/repository/api-role-cards", headers=hdrs)
+        assert cards.status_code == 200, cards.text
+
+    def test_symbols_indexed_complete_after_explicit_index(
+        self, admin_client, tmp_path
+    ):
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "explicit-index-sys")
+        hdrs = _headers(token, sys["id"])
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        admin_client.post(
+            "/repository/snapshots", json={"commit_sha": sha}, headers=hdrs
+        )
+        index_r = admin_client.post("/repository/symbols/index", headers=hdrs)
+        assert index_r.status_code in (200, 201), index_r.text
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200
+        pipeline = {s["step"]: s["status"] for s in r.json()["pipeline"]}
+        assert pipeline["symbols_indexed"] == "complete"
+
+    def test_init_db_repairs_legacy_success_rows(self, admin_client, tmp_path):
+        hdrs = self._build(admin_client, tmp_path, "legacy-repair-sys")
+        from app.db import get_conn, init_db
+
+        with get_conn() as conn:
+            conn.execute(
+                "UPDATE intelligence_runs SET status = 'success' "
+                "WHERE run_type = 'capability_hierarchy'"
+            )
+        init_db()
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT status FROM intelligence_runs"
+            ).fetchall()
+        assert {row["status"] for row in rows} <= {"pending", "completed", "failed"}
+
+        hierarchy = admin_client.get(
+            "/repository/capability-hierarchy", headers=hdrs
+        )
+        assert hierarchy.status_code == 200, hierarchy.text

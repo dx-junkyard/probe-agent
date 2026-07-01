@@ -123,7 +123,7 @@ def _check_documentation_indexed(conn, system_id: int, snapshot_id: Optional[int
         (system_id, snapshot_id),
     ).fetchone()
     if row:
-        if row["status"] == "success":
+        if row["status"] == "completed":
             return PipelineStep("documentation_indexed", "complete")
         return PipelineStep("documentation_indexed", "failed", detail=f"run status: {row['status']}")
     if not _is_reasoning_model_available():
@@ -153,7 +153,7 @@ def _check_symbols_indexed(conn, system_id: int, snapshot_id: Optional[int]) -> 
         (system_id, snapshot_id),
     ).fetchone()
     if row:
-        if row["status"] == "success":
+        if row["status"] == "completed":
             return PipelineStep("symbols_indexed", "complete")
         return PipelineStep("symbols_indexed", "failed", detail=f"run status: {row['status']}")
     return PipelineStep("symbols_indexed", "missing")
@@ -197,7 +197,7 @@ def _check_capability_hierarchy_ready(conn, system_id: int, snapshot_id: Optiona
         (system_id, snapshot_id),
     ).fetchone()
     if row:
-        if row["status"] in ("success", "completed"):
+        if row["status"] == "completed":
             return PipelineStep("capability_hierarchy_ready", "complete")
         if row["status"] == "failed":
             return PipelineStep("capability_hierarchy_ready", "failed")
@@ -718,7 +718,7 @@ def build_system_understanding(system_id: int) -> SystemUnderstandingSummary:
 
         # Step: symbols_indexed - deterministic, can be auto-run
         sym_run = conn.execute(
-            "SELECT id FROM intelligence_runs WHERE system_id = ? AND run_type = 'symbol_index' AND snapshot_id = ? AND status = 'success' LIMIT 1",
+            "SELECT id FROM intelligence_runs WHERE system_id = ? AND run_type = 'symbol_index' AND snapshot_id = ? AND status = 'completed' LIMIT 1",
             (system_id, snapshot_id),
         ).fetchone()
         if not sym_run:
@@ -738,7 +738,7 @@ def build_system_understanding(system_id: int) -> SystemUnderstandingSummary:
                              status, is_mock, started_at, completed_at)
                         VALUES (?, ?, 'symbol_index', 'deterministic', 'n/a',
                                 'n/a', 'provenance-v1', 'deterministic',
-                                'success', 0, ?, ?)""",
+                                'completed', 0, ?, ?)""",
                         (system_id, snapshot_id, now, now),
                     ).lastrowid
                     for sym in result.symbols:
@@ -806,7 +806,7 @@ def build_system_understanding(system_id: int) -> SystemUnderstandingSummary:
                              status, is_mock, started_at, completed_at)
                         VALUES (?, ?, 'entrypoint_index', 'deterministic', 'n/a',
                                 'n/a', 'provenance-v1', 'deterministic',
-                                'success', 0, ?, ?)""",
+                                'completed', 0, ?, ?)""",
                         (system_id, snapshot_id, now, now),
                     ).lastrowid
                     for ep in discovery.entrypoints + discovery.functions:
@@ -838,7 +838,7 @@ def build_system_understanding(system_id: int) -> SystemUnderstandingSummary:
 
         # Step: documentation pipeline (requires reasoning model)
         doc_indexed = conn.execute(
-            "SELECT id FROM intelligence_runs WHERE system_id = ? AND run_type IN ('draft_generation', 'repository_drafts') AND snapshot_id = ? AND status = 'success' LIMIT 1",
+            "SELECT id FROM intelligence_runs WHERE system_id = ? AND run_type IN ('draft_generation', 'repository_drafts') AND snapshot_id = ? AND status = 'completed' LIMIT 1",
             (system_id, snapshot_id),
         ).fetchone()
         graph_row = conn.execute(
@@ -903,7 +903,7 @@ def build_system_understanding(system_id: int) -> SystemUnderstandingSummary:
                              prompt_version, schema_version, decision_method,
                              status, is_mock, started_at, completed_at)
                         VALUES (?, ?, 'capability_hierarchy', 'deterministic', 'none',
-                                ?, ?, 'deterministic', 'success', 0, ?, ?)""",
+                                ?, ?, 'deterministic', 'completed', 0, ?, ?)""",
                         (system_id, snapshot_id, HIERARCHY_PROMPT_VERSION, HIERARCHY_SCHEMA_VERSION, now, now),
                     ).lastrowid
 
