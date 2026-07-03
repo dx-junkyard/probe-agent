@@ -45,6 +45,7 @@ uvicorn app.main:app --reload --port 8000
 | POST | `/generation-runs` | trace 入力から候補コードを生成・実行・LLM 評価 |
 | GET  | `/generation-runs` | 生成・評価結果一覧 |
 | GET  | `/generation-runs/{id}` | 生成・評価結果詳細 |
+| GET  | `/system-diagnostics` | 必須設定の静的ヘルスチェック (LLM 不使用、Issue #101) |
 
 DB ファイルは `PROBE_DB_PATH` (既定 `./probe.db`) で切り替えられる。
 
@@ -57,6 +58,9 @@ Generate & Evaluate は `app.llm` の抽象化層だけを通して LLM を呼�
 | --- | --- |
 | `LLM_PROVIDER` | `openai` / `anthropic` / `gemini` / `mock` |
 | `LLM_MODEL` | 使用するモデル名 |
+| `INTELLIGENCE_LLM_PROVIDER` | Feature Intelligence 用 provider (未設定なら `LLM_PROVIDER` を使用) |
+| `INTELLIGENCE_LLM_MODEL` | Feature Intelligence 用 reasoning model (未設定なら `LLM_MODEL` を使用) |
+| `INTELLIGENCE_LLM_TIMEOUT` | Feature Intelligence の HTTP timeout 秒（既定値: `120`） |
 | `INTELLIGENCE_MAX_OUTPUT_TOKENS` | Repository Draft生成の最大出力token数（既定値: `128000`） |
 | `LLM_API_KEY` | 各プロバイダ共通の API key |
 | `LLM_BASE_URL` | 互換 API やプロキシを使う場合の base URL |
@@ -64,6 +68,21 @@ Generate & Evaluate は `app.llm` の抽象化層だけを通して LLM を呼�
 
 `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` も後方互換として読まれる。
 `mock` はテストとローカルUI確認用で、外部 API は呼ばない。
+
+## 設定診断 (System Diagnostics)
+
+`GET /system-diagnostics` は必須設定の静的・決定的ヘルスチェックを返す (Issue #101)。
+
+- 環境変数の有無、enum 値、パスの存在と read/write 権限、provider と model
+  family の整合、reasoning-capable かどうかを LLM を使わずに検査する。
+- 実行しないと分からない失敗 (LLM の timeout / auth / invalid model、snapshot
+  失敗など) は、直近の `intelligence_runs.error_details` / snapshot 状態を
+  `last_observed_error` としてそのまま返す。エラーメッセージの解釈・分類は
+  行わない (Principle 6)。
+- severity は `ok | warning | error | blocked | unknown`。各 check は
+  impact・remediation・関連 env/path/画面/pipeline step を持ち、Dashboard の
+  alert badge と System Understanding の pipeline 行から参照される。
+- すべての check は `decision_method: deterministic`。
 
 ## 認証とユーザー管理
 

@@ -1,16 +1,18 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { useSystemUnderstanding, useBuildSystemUnderstanding } from "@/api/hooks";
+import { useSystemUnderstanding, useBuildSystemUnderstanding, useSystemDiagnostics } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
+import { DiagnosticCheckCard } from "@/components/diagnostics-badge";
 import {
   CheckCircle2, XCircle, AlertTriangle, Ban, HelpCircle,
   RefreshCw, ArrowRight, ExternalLink, FileText, Code, Zap,
-  Boxes, Target,
+  Boxes, Target, Stethoscope,
 } from "lucide-react";
 import type {
+  SystemDiagnosticCheck,
   SystemUnderstandingPipelineStep,
   SystemUnderstandingNextAction,
   SystemUnderstandingGap,
@@ -62,27 +64,54 @@ function statusVariant(status: string): "default" | "secondary" | "destructive" 
   }
 }
 
-function PipelineChecklist({ steps }: { steps: SystemUnderstandingPipelineStep[] }) {
+function PipelineChecklist({ steps, checksByStep }: {
+  steps: SystemUnderstandingPipelineStep[];
+  checksByStep: Record<string, SystemDiagnosticCheck[]>;
+}) {
+  const [expandedStep, setExpandedStep] = useState<string | null>(null);
   return (
     <ul className="space-y-2" data-testid="pipeline-checklist">
       {steps.map((s) => {
         const link = STEP_LINKS[s.step];
         const label = STEP_LABELS[s.step] ?? s.step;
+        const relatedChecks = s.status === "complete" ? [] : (checksByStep[s.step] ?? []);
+        const expanded = expandedStep === s.step;
         return (
-          <li key={s.step} className="flex items-center gap-3 text-sm">
-            <StatusIcon status={s.status} />
-            <span className="flex-1">
-              {link ? (
-                <Link to={link} className="hover:underline">{label}</Link>
-              ) : (
-                label
+          <li key={s.step} className="text-sm">
+            <div className="flex items-center gap-3">
+              <StatusIcon status={s.status} />
+              <span className="flex-1">
+                {link ? (
+                  <Link to={link} className="hover:underline">{label}</Link>
+                ) : (
+                  label
+                )}
+              </span>
+              <Badge variant={statusVariant(s.status)} className="text-xs">
+                {s.status}
+              </Badge>
+              {s.detail && (
+                <span className="text-xs text-muted-foreground ml-1">{s.detail}</span>
               )}
-            </span>
-            <Badge variant={statusVariant(s.status)} className="text-xs">
-              {s.status}
-            </Badge>
-            {s.detail && (
-              <span className="text-xs text-muted-foreground ml-1">{s.detail}</span>
+              {relatedChecks.length > 0 && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-6 text-xs gap-1"
+                  data-testid={`pipeline-diagnose-${s.step}`}
+                  onClick={() => setExpandedStep(expanded ? null : s.step)}
+                >
+                  <Stethoscope className="h-3 w-3" />
+                  Why? ({relatedChecks.length})
+                </Button>
+              )}
+            </div>
+            {expanded && relatedChecks.length > 0 && (
+              <div className="mt-2 ml-7 space-y-2" data-testid={`pipeline-diagnostics-${s.step}`}>
+                {relatedChecks.map((c) => (
+                  <DiagnosticCheckCard key={c.check_id} check={c} />
+                ))}
+              </div>
             )}
           </li>
         );
@@ -377,7 +406,10 @@ function EntryCards() {
   );
 }
 
-function DataView({ data }: { data: SystemUnderstandingOut }) {
+function DataView({ data, checksByStep }: {
+  data: SystemUnderstandingOut;
+  checksByStep: Record<string, SystemDiagnosticCheck[]>;
+}) {
   const pipeline = data.pipeline ?? [];
   const allMissing = pipeline.every((s) => s.status === "missing");
 
@@ -387,10 +419,14 @@ function DataView({ data }: { data: SystemUnderstandingOut }) {
       <Card>
         <CardHeader>
           <CardTitle className="text-base">Pipeline Status</CardTitle>
-          <CardDescription>Progress through the system understanding pipeline</CardDescription>
+          <CardDescription>
+            Progress through the system understanding pipeline. Steps that are
+            missing or blocked show a "Why?" button when a configuration
+            diagnostic or a recent run failure explains them.
+          </CardDescription>
         </CardHeader>
         <CardContent>
-          {allMissing ? <EmptyState /> : <PipelineChecklist steps={pipeline} />}
+          {allMissing ? <EmptyState /> : <PipelineChecklist steps={pipeline} checksByStep={checksByStep} />}
         </CardContent>
       </Card>
 
@@ -604,7 +640,19 @@ function DataView({ data }: { data: SystemUnderstandingOut }) {
 
 export default function SystemUnderstandingPage() {
   const { data, isLoading, error } = useSystemUnderstanding();
+  const { data: diagnostics } = useSystemDiagnostics();
   const build = useBuildSystemUnderstanding();
+
+  const checksByStep = useMemo(() => {
+    const map: Record<string, SystemDiagnosticCheck[]> = {};
+    for (const check of diagnostics?.checks ?? []) {
+      if (check.severity === "ok") continue;
+      for (const step of check.related_pipeline_steps) {
+        (map[step] ??= []).push(check);
+      }
+    }
+    return map;
+  }, [diagnostics]);
 
   return (
     <div className="space-y-6">
@@ -650,7 +698,7 @@ export default function SystemUnderstandingPage() {
           {[1, 2, 3].map((i) => <Skeleton key={i} className="h-32 w-full" />)}
         </div>
       ) : data ? (
-        <DataView data={data} />
+        <DataView data={data} checksByStep={checksByStep} />
       ) : null}
     </div>
   );

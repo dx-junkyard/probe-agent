@@ -35,6 +35,14 @@ The dashboard should support:
   accept/reject with a required reason. There is no "defer" decision or
   proposal-edit action in the API (Issue #35 only exposes accept/reject); do
   not add UI controls for actions the API does not support.
+- System settings diagnostics (Issue #101): a header alert badge
+  (`components/diagnostics-badge.tsx`) fed by `GET /system-diagnostics`.
+  The badge count is error+blocked+warning checks; clicking opens a dialog
+  showing each check's detail, impact, remediation, related env vars, and
+  the verbatim last observed run error. The System Understanding page shows
+  a "Why?" button on missing/blocked pipeline rows that expands the related
+  diagnostics. Diagnostics are deterministic server output — never decorate
+  them with client-side heuristic explanations.
 
 ## Authentication model
 

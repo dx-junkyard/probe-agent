@@ -20,6 +20,7 @@ import type {
   InterviewProposalMetadataBlock, InterviewProposalProbePlan,
   InterviewApprovedSetOut, InterviewMaterializeOut,
   SystemUnderstandingOut,
+  SystemDiagnosticsOut,
 } from "./types";
 
 function sysKey(base: string, ...extra: unknown[]) {
@@ -798,7 +799,19 @@ export function useBuildSystemUnderstanding() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: () => api.post<SystemUnderstandingOut>("/repository/system-understanding/build"),
-    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("system-understanding") }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: sysKey("system-understanding") });
+      qc.invalidateQueries({ queryKey: sysKey("system-diagnostics") });
+    },
+  });
+}
+
+export function useSystemDiagnostics() {
+  return useQuery({
+    queryKey: sysKey("system-diagnostics"),
+    queryFn: () => api.get<SystemDiagnosticsOut>("/system-diagnostics"),
+    enabled: !!getSystemId(),
+    staleTime: 30_000,
   });
 }
 
