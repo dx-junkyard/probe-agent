@@ -2236,3 +2236,90 @@ class SystemDiagnosticsOut(BaseModel):
     overall_severity: DiagnosticSeverity
     severity_counts: Dict[str, int] = Field(default_factory=dict)
     checks: List[SystemDiagnosticCheckOut] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Per-screen assistant (Issue #102)
+# ---------------------------------------------------------------------------
+
+
+class SettingMetadataOut(BaseModel):
+    key: str
+    display_name: str
+    category: str
+    requiredness: Literal["required", "conditional", "optional"]
+    description: str
+    impact: str
+    remediation: str
+    valid_values: Optional[List[str]] = None
+    validation_rule: str = ""
+    related_checks: List[str] = Field(default_factory=list)
+    related_pages: List[str] = Field(default_factory=list)
+    related_pipeline_steps: List[str] = Field(default_factory=list)
+    docs_link: str = ""
+    # Settings explanations are static code-managed metadata, never LLM output.
+    decision_method: Literal["deterministic"] = "deterministic"
+
+
+class SettingsMetadataOut(BaseModel):
+    settings: List[SettingMetadataOut] = Field(default_factory=list)
+
+
+class AssistantSuggestedQuestionOut(BaseModel):
+    question: str
+    source: Literal["diagnostics", "static"]
+    check_id: str = ""
+
+
+class AssistantScreenContextOut(BaseModel):
+    screen_id: str
+    title: str
+    route: str
+    purpose: str
+    primary_data_sources: List[str] = Field(default_factory=list)
+    visible_sections: List[str] = Field(default_factory=list)
+    common_questions: List[str] = Field(default_factory=list)
+    related_settings: List[str] = Field(default_factory=list)
+    related_checks: List[str] = Field(default_factory=list)
+    related_pipeline_steps: List[str] = Field(default_factory=list)
+    related_endpoints: List[str] = Field(default_factory=list)
+    # Current deterministic state for this screen (diagnostics subset).
+    state_severity: DiagnosticSeverity = "ok"
+    screen_checks: List[SystemDiagnosticCheckOut] = Field(default_factory=list)
+    suggested_questions: List[AssistantSuggestedQuestionOut] = Field(default_factory=list)
+
+
+class AssistantAskRequest(BaseModel):
+    screen_id: str = Field(..., min_length=1, max_length=100)
+    question: str = Field(..., min_length=1, max_length=4000)
+    route_params: Dict[str, str] = Field(default_factory=dict)
+    visible_check_ids: List[str] = Field(default_factory=list, max_length=50)
+
+
+class AssistantActionOut(BaseModel):
+    label: str
+    kind: Literal["navigate", "configure", "operate"]
+    target: str
+    detail: str = ""
+
+
+class AssistantCitationOut(BaseModel):
+    type: Literal["setting", "diagnostic_check", "pipeline_step"]
+    id: str
+    title: str = ""
+    detail: str = ""
+
+
+class AssistantAskOut(BaseModel):
+    screen_id: str
+    answer: str
+    suggested_actions: List[AssistantActionOut] = Field(default_factory=list)
+    citations: List[AssistantCitationOut] = Field(default_factory=list)
+    used_fallback: bool
+    fallback_reason: Optional[str] = None
+    decision_method: Literal["deterministic", "reasoning_llm"]
+    provider: str
+    model: str
+    prompt_version: str
+    schema_version: str
+    generated_at: float

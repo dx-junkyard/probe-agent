@@ -3,6 +3,7 @@ import { useAuth } from "@/api/auth";
 import { Sidebar } from "./sidebar";
 import { Header } from "./header";
 import { Skeleton } from "@/components/ui/skeleton";
+import { AssistantPanel } from "@/components/assistant-panel";
 
 export function AppLayout() {
   const { user, loading } = useAuth();
@@ -30,6 +31,7 @@ export function AppLayout() {
           <Outlet />
         </main>
       </div>
+      <AssistantPanel />
     </div>
   );
 }

@@ -1438,3 +1438,85 @@ export interface SystemDiagnosticsOut {
   severity_counts: Record<string, number>;
   checks: SystemDiagnosticCheck[];
 }
+
+// Per-screen assistant (Issue #102)
+
+export interface AssistantSettingMetadata {
+  key: string;
+  display_name: string;
+  category: string;
+  requiredness: "required" | "conditional" | "optional";
+  description: string;
+  impact: string;
+  remediation: string;
+  valid_values?: string[] | null;
+  validation_rule: string;
+  related_checks: string[];
+  related_pages: string[];
+  related_pipeline_steps: string[];
+  docs_link: string;
+  decision_method: "deterministic";
+}
+
+export interface AssistantSettingsMetadataOut {
+  settings: AssistantSettingMetadata[];
+}
+
+export interface AssistantSuggestedQuestion {
+  question: string;
+  source: "diagnostics" | "static";
+  check_id: string;
+}
+
+export interface AssistantScreenContext {
+  screen_id: string;
+  title: string;
+  route: string;
+  purpose: string;
+  primary_data_sources: string[];
+  visible_sections: string[];
+  common_questions: string[];
+  related_settings: string[];
+  related_checks: string[];
+  related_pipeline_steps: string[];
+  related_endpoints: string[];
+  state_severity: DiagnosticSeverity;
+  screen_checks: SystemDiagnosticCheck[];
+  suggested_questions: AssistantSuggestedQuestion[];
+}
+
+export interface AssistantAskRequest {
+  screen_id: string;
+  question: string;
+  route_params?: Record<string, string>;
+  visible_check_ids?: string[];
+}
+
+export interface AssistantAction {
+  label: string;
+  kind: "navigate" | "configure" | "operate";
+  target: string;
+  detail: string;
+}
+
+export interface AssistantCitation {
+  type: "setting" | "diagnostic_check" | "pipeline_step";
+  id: string;
+  title: string;
+  detail: string;
+}
+
+export interface AssistantAskOut {
+  screen_id: string;
+  answer: string;
+  suggested_actions: AssistantAction[];
+  citations: AssistantCitation[];
+  used_fallback: boolean;
+  fallback_reason?: string | null;
+  decision_method: "deterministic" | "reasoning_llm";
+  provider: string;
+  model: string;
+  prompt_version: string;
+  schema_version: string;
+  generated_at: number;
+}

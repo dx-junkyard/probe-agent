@@ -56,6 +56,36 @@ class LLMConfig:
             timeout=timeout,
         )
 
+    @classmethod
+    def intelligence_from_env(cls) -> "LLMConfig":
+        """Config preferring INTELLIGENCE_LLM_* over the generic LLM_* vars."""
+        base = cls.from_env()
+        provider = (
+            os.getenv("INTELLIGENCE_LLM_PROVIDER") or base.provider
+        ).strip().lower()
+        model = (os.getenv("INTELLIGENCE_LLM_MODEL") or "").strip()
+        if not model:
+            model = os.getenv("LLM_MODEL") or {
+                "openai": "gpt-4o-mini",
+                "anthropic": "claude-3-5-haiku-latest",
+                "gemini": "gemini-1.5-flash",
+                "mock": "mock",
+            }.get(provider, "gpt-4o-mini")
+        timeout = base.timeout
+        raw_timeout = os.getenv("INTELLIGENCE_LLM_TIMEOUT")
+        if raw_timeout and raw_timeout.strip():
+            try:
+                timeout = float(raw_timeout)
+            except ValueError:
+                pass
+        return cls(
+            provider=provider,
+            api_key=base.api_key,
+            model=model,
+            base_url=base.base_url,
+            timeout=timeout,
+        )
+
 
 class LLMClient(ABC):
     @abstractmethod

@@ -46,6 +46,9 @@ uvicorn app.main:app --reload --port 8000
 | GET  | `/generation-runs` | 生成・評価結果一覧 |
 | GET  | `/generation-runs/{id}` | 生成・評価結果詳細 |
 | GET  | `/system-diagnostics` | 必須設定の静的ヘルスチェック (LLM 不使用、Issue #101) |
+| GET  | `/assistant/settings-metadata` | 設定項目の静的説明メタデータ (コード管理、Issue #102) |
+| GET  | `/assistant/screen-context/{screen_id}` | 画面コンテキスト + 現在の診断状態 + 提案質問 |
+| POST | `/assistant/ask` | 画面コンテキスト/設定メタデータ/診断結果に根拠づけた Q&A |
 
 DB ファイルは `PROBE_DB_PATH` (既定 `./probe.db`) で切り替えられる。
 
@@ -83,6 +86,29 @@ Generate & Evaluate は `app.llm` の抽象化層だけを通して LLM を呼�
   impact・remediation・関連 env/path/画面/pipeline step を持ち、Dashboard の
   alert badge と System Understanding の pipeline 行から参照される。
 - すべての check は `decision_method: deterministic`。
+
+## 画面アシスタント (Per-page Assistant)
+
+各画面のエージェントボタンから使う画面コンテキスト付き Q&A (Issue #102)。
+
+- `GET /assistant/settings-metadata`: 設定項目の説明 (目的・影響・修正方法・
+  valid values・関連 check/画面/pipeline step)。`app/settings_metadata.py` の
+  静的データで、LLM 生成ではない。診断 check が `related_env` で参照する
+  env var は必ずエントリを持つ (テストで強制)。
+- `GET /assistant/screen-context/{screen_id}`: 画面の目的・セクション・関連
+  設定/チェック/エンドポイントの静的定義 (`app/assistant.py`) に、その画面に
+  関連する現在の診断 check と提案質問 (失敗中 check 由来を先頭) を付けて返す。
+- `POST /assistant/ask`: 質問に対し、画面コンテキスト + 設定メタデータ +
+  決定的診断結果だけを根拠に回答する。実 provider (openai/anthropic/gemini +
+  API key) があればその限定コンテキストのみを LLM に渡し
+  (`decision_method: reasoning_llm`)、citation と navigate 先はコンテキスト
+  外のものを構造的に除去する。provider が `mock`・key 無し・LLM 失敗時は
+  静的メタデータと診断結果をそのまま組み立てた fallback 回答を返し、
+  `used_fallback: true` と `fallback_reason` を明示する。fallback は既知の
+  設定 key / check 名 / pipeline step 名との有限マッチのみで内容を選び、
+  自由文をヒューリスティックに解釈しない (Principle 6)。
+- Q&A は永続化しない。監査メタデータ (provider/model/prompt/schema version、
+  decision method、失敗詳細) はレスポンスに含めて返す。
 
 ## 認証とユーザー管理
 
