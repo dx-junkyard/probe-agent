@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from .db import get_conn
-from .llm import is_reasoning_model
+from .llm import PROVIDER_KEY_ENV, is_reasoning_model
 
 # Severity vocabulary from Issue #101. Order = worst first.
 SEVERITY_ORDER = ["error", "blocked", "warning", "unknown", "ok"]
@@ -45,12 +45,6 @@ MODEL_FAMILY_PREFIXES: Dict[str, tuple] = {
     "anthropic": ("claude-",),
     "gemini": ("gemini-",),
     "mock": ("mock",),
-}
-
-PROVIDER_KEY_ENV: Dict[str, str] = {
-    "openai": "OPENAI_API_KEY",
-    "anthropic": "ANTHROPIC_API_KEY",
-    "gemini": "GEMINI_API_KEY",
 }
 
 _DEFAULT_MODELS = {

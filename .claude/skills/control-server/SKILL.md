@@ -57,6 +57,41 @@ fallback for intelligence work.
 - New required settings must be added here with title/impact/remediation so
   the Dashboard alert badge can explain them.
 
+## Per-screen assistant (issue #102)
+
+- `GET /assistant/settings-metadata`, `GET /assistant/screen-context/{screen_id}`,
+  `POST /assistant/ask` (`app/assistant.py`, `app/settings_metadata.py`,
+  `routes/assistant.py`).
+- Settings explanations are static code-managed metadata in
+  `app/settings_metadata.py` (key, requiredness, valid values, description,
+  impact, remediation, related checks/pages/pipeline steps) — never LLM
+  generated. Every env var referenced by a diagnostics check's `related_env`
+  must have a metadata entry (enforced by tests).
+- Screen contexts in `app/assistant.py` are a static registry keyed by
+  dashboard route segment (`overview`, `system-understanding`, ...). Adding a
+  dashboard page means adding its screen context here.
+- `POST /assistant/ask` grounds every answer in a limited, deterministic
+  context pack: the screen context, settings metadata mentioned in the
+  question (finite key matching only), and the current `system_diagnostics`
+  checks. Only this pack is sent to the LLM.
+- LLM answers (`decision_method: reasoning_llm`, `used_fallback: false`) are
+  strict-JSON validated; citations and navigate/operate targets outside the
+  supplied pack/route set are dropped (structural validation — `operate`
+  targets are routes where the operation is performed, never bare operation
+  names). The API key must match the effective provider
+  (`LLMConfig.intelligence_from_env`), same rule as the diagnostics
+  `_api_key_status`; a mismatched key means no external call. Provider
+  `mock`, a missing/mismatched key,
+  LLM errors, or invalid output all switch to the deterministic fallback
+  composed verbatim from the metadata/diagnostics above
+  (`decision_method: deterministic`, `used_fallback: true`, with
+  `llm_error` populated on failure). The fallback never interprets free text
+  beyond finite-set matching against known setting keys, check ids/titles,
+  and pipeline steps.
+- Assistant Q&A is not persisted (no chat tables); audit metadata
+  (provider/model/prompt/schema version, decision method, failure detail) is
+  returned in the response instead.
+
 ## Feature Intelligence APIs (issues #23-#26)
 
 The current `GET /project-intelligence` response is a mock contract.

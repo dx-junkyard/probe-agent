@@ -2051,3 +2051,215 @@ describe("System settings diagnostics", () => {
     expect(expanded.textContent).toContain("HTTP 401: invalid api key");
   });
 });
+
+// ── Per-screen assistant (Issue #102) ───────────────────────────────
+
+describe("Per-screen assistant panel", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const screenContextResponse = {
+    screen_id: "system-understanding",
+    title: "System Understanding",
+    route: "/system-understanding",
+    purpose:
+      "Track the progress and artifacts of the repository understanding pipeline.",
+    primary_data_sources: ["repository snapshots", "intelligence runs"],
+    visible_sections: ["Repository configured", "Documentation indexed"],
+    common_questions: ["What does Build / Refresh run?"],
+    related_settings: ["INTELLIGENCE_LLM_MODEL"],
+    related_checks: ["intelligence_llm_config"],
+    related_pipeline_steps: ["documentation_indexed"],
+    related_endpoints: ["GET /repository/system-understanding"],
+    state_severity: "blocked",
+    screen_checks: [
+      {
+        check_id: "intelligence_llm_config",
+        category: "llm",
+        title: "Intelligence reasoning model configuration",
+        severity: "blocked",
+        detail: "effective intelligence provider is 'mock'.",
+        impact: "Reasoning steps stay blocked.",
+        remediation: "Set INTELLIGENCE_LLM_PROVIDER and INTELLIGENCE_LLM_MODEL.",
+        related_env: ["INTELLIGENCE_LLM_PROVIDER", "INTELLIGENCE_LLM_MODEL"],
+        related_paths: [],
+        related_pages: ["/system-understanding"],
+        related_pipeline_steps: ["documentation_indexed"],
+        last_observed_error: null,
+        decision_method: "deterministic",
+      },
+    ],
+    suggested_questions: [
+      {
+        question: "Why is 'Intelligence reasoning model configuration' blocked?",
+        source: "diagnostics",
+        check_id: "intelligence_llm_config",
+      },
+      { question: "What does Build / Refresh run?", source: "static", check_id: "" },
+    ],
+  };
+
+  const askResponse = {
+    screen_id: "system-understanding",
+    answer:
+      "INTELLIGENCE_LLM_MODEL (Intelligence reasoning model, conditional): reasoning-capable model id for Feature Intelligence.",
+    suggested_actions: [
+      {
+        label: "Review INTELLIGENCE_LLM_MODEL",
+        kind: "configure",
+        target: "INTELLIGENCE_LLM_MODEL",
+        detail: "Set a reasoning-capable model id.",
+      },
+      {
+        label: "Open /system-understanding",
+        kind: "navigate",
+        target: "/system-understanding",
+        detail: "",
+      },
+    ],
+    citations: [
+      {
+        type: "setting",
+        id: "INTELLIGENCE_LLM_MODEL",
+        title: "Intelligence reasoning model",
+        detail: "",
+      },
+      {
+        type: "diagnostic_check",
+        id: "intelligence_llm_config",
+        title: "Intelligence reasoning model configuration",
+        detail: "blocked: effective intelligence provider is 'mock'.",
+      },
+    ],
+    used_fallback: true,
+    fallback_reason: "LLM provider 'mock' is test-only data.",
+    decision_method: "deterministic",
+    provider: "mock",
+    model: "mock",
+    prompt_version: "v1",
+    schema_version: "v1",
+    generated_at: 1750000000,
+  };
+
+  function mockAssistantApi() {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/assistant/screen-context/system-understanding"
+        ? Promise.resolve(screenContextResponse)
+        : Promise.resolve(null),
+    );
+    mockApi.post.mockImplementation((path: string) =>
+      path === "/assistant/ask"
+        ? Promise.resolve(askResponse)
+        : Promise.resolve(null),
+    );
+  }
+
+  async function renderPanelAt(route: string) {
+    const { AssistantPanel } = await import("@/components/assistant-panel");
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={[route]}>
+          <AssistantPanel />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+  }
+
+  test("agent button opens the panel with screen summary, state, and suggested questions", async () => {
+    mockAssistantApi();
+    await renderPanelAt("/system-understanding");
+
+    // Closed by default: only the floating button, no panel blocking the page.
+    const button = screen.getByTestId("assistant-button");
+    expect(screen.queryByTestId("assistant-panel")).toBeNull();
+
+    fireEvent.click(button);
+    await screen.findByTestId("assistant-panel");
+
+    // The screen context is fetched for the current route's screen id.
+    await waitFor(() => {
+      expect(mockApi.get).toHaveBeenCalledWith(
+        "/assistant/screen-context/system-understanding",
+      );
+    });
+
+    // Screen name, purpose, and current state summary are visible.
+    expect(screen.getByText("System Understanding")).toBeTruthy();
+    expect(screen.getByText(/repository understanding pipeline/)).toBeTruthy();
+    const state = await screen.findByTestId("assistant-state-summary");
+    expect(state.textContent).toContain("1 check(s) need attention");
+    expect(state.textContent).toContain("effective intelligence provider is 'mock'");
+
+    // Diagnostics-derived question is offered first.
+    const suggestions = screen.getAllByTestId("assistant-suggested-question");
+    expect(suggestions[0].textContent).toContain(
+      "Why is 'Intelligence reasoning model configuration' blocked?",
+    );
+  });
+
+  test("asking a question renders the answer with fallback marking, citations, and actions", async () => {
+    mockAssistantApi();
+    await renderPanelAt("/system-understanding");
+    fireEvent.click(screen.getByTestId("assistant-button"));
+    await screen.findByTestId("assistant-panel");
+
+    const input = await screen.findByTestId("assistant-question-input");
+    fireEvent.change(input, {
+      target: { value: "What should INTELLIGENCE_LLM_MODEL be set to?" },
+    });
+    fireEvent.click(screen.getByTestId("assistant-send"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/assistant/ask", {
+        screen_id: "system-understanding",
+        question: "What should INTELLIGENCE_LLM_MODEL be set to?",
+        visible_check_ids: ["intelligence_llm_config"],
+      });
+    });
+
+    const answer = await screen.findByTestId("assistant-answer");
+    expect(answer.textContent).toContain("reasoning-capable model id");
+
+    // Fallback answers are visibly marked; deterministic output is not
+    // decorated as an LLM answer.
+    expect(screen.getByTestId("assistant-fallback-badge")).toBeTruthy();
+
+    // Citations show what the answer is based on.
+    const citations = screen.getAllByTestId("assistant-citation");
+    expect(citations.map((c) => c.textContent).join(" ")).toContain(
+      "INTELLIGENCE_LLM_MODEL",
+    );
+
+    // Suggested actions include a configure hint and a navigation action.
+    const actions = screen.getAllByTestId("assistant-action");
+    expect(actions.length).toBe(2);
+    expect(actions.map((a) => a.textContent).join(" ")).toContain(
+      "Review INTELLIGENCE_LLM_MODEL",
+    );
+  });
+
+  test("panel maps the root route to the overview screen id", async () => {
+    mockApi.get.mockImplementation(() =>
+      Promise.resolve({
+        ...screenContextResponse,
+        screen_id: "overview",
+        title: "Overview",
+        route: "/",
+        state_severity: "ok",
+        screen_checks: [],
+        suggested_questions: [],
+      }),
+    );
+    await renderPanelAt("/");
+    fireEvent.click(screen.getByTestId("assistant-button"));
+    await screen.findByTestId("assistant-panel");
+    await waitFor(() => {
+      expect(mockApi.get).toHaveBeenCalledWith("/assistant/screen-context/overview");
+    });
+  });
+});

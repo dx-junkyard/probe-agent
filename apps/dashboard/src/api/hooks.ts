@@ -21,6 +21,8 @@ import type {
   InterviewApprovedSetOut, InterviewMaterializeOut,
   SystemUnderstandingOut,
   SystemDiagnosticsOut,
+  AssistantScreenContext, AssistantAskRequest, AssistantAskOut,
+  AssistantSettingsMetadataOut,
 } from "./types";
 
 function sysKey(base: string, ...extra: unknown[]) {
@@ -803,6 +805,32 @@ export function useBuildSystemUnderstanding() {
       qc.invalidateQueries({ queryKey: sysKey("system-understanding") });
       qc.invalidateQueries({ queryKey: sysKey("system-diagnostics") });
     },
+  });
+}
+
+// Per-screen assistant (Issue #102)
+
+export function useAssistantScreenContext(screenId: string | null, enabled = true) {
+  return useQuery({
+    queryKey: [...sysKey("assistant-screen-context"), screenId],
+    queryFn: () => api.get<AssistantScreenContext>(`/assistant/screen-context/${screenId}`),
+    enabled: !!screenId && !!getSystemId() && enabled,
+    staleTime: 30_000,
+  });
+}
+
+export function useAssistantSettingsMetadata() {
+  return useQuery({
+    queryKey: ["assistant-settings-metadata"],
+    queryFn: () => api.get<AssistantSettingsMetadataOut>("/assistant/settings-metadata"),
+    staleTime: 5 * 60_000,
+  });
+}
+
+export function useAssistantAsk() {
+  return useMutation({
+    mutationFn: (data: AssistantAskRequest) =>
+      api.post<AssistantAskOut>("/assistant/ask", data),
   });
 }
 
