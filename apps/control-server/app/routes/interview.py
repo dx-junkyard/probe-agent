@@ -33,9 +33,10 @@ from ..interview_context import build_interview_context
 from ..interview_agent import (
     PROMPT_VERSION as INTERVIEW_PROMPT_VERSION,
     SCHEMA_VERSION as INTERVIEW_SCHEMA_VERSION,
+    InterviewTurnResult,
     generate_interview_turn,
 )
-from ..llm import LLMConfig, create_llm_client, is_reasoning_model
+from ..llm import LLMConfig, LLMError, create_llm_client, is_reasoning_model
 from ..models import (
     InterviewApprovedItemOut,
     InterviewApprovedSetOut,
@@ -541,7 +542,12 @@ def interview_dialogue_turn(
     """
     now = time.time()
     config = LLMConfig.intelligence_from_env()
-    client = create_llm_client(config)
+    client_error: Optional[str] = None
+    try:
+        client = create_llm_client(config)
+    except LLMError as exc:
+        client = None
+        client_error = str(exc)
 
     with get_conn() as conn:
         session = _get_session_or_404(conn, session_id, system_id)
@@ -557,13 +563,21 @@ def interview_dialogue_turn(
         ).fetchall()
         history = [{"role": r["role"], "content": r["content"]} for r in message_rows]
 
-        turn = generate_interview_turn(
-            client,
-            config,
-            context_pack=context_pack,
-            history=history,
-            user_message=payload.user_message,
-        )
+        if client_error:
+            turn = InterviewTurnResult(
+                provider=config.provider,
+                model=config.model,
+                is_mock=config.provider == "mock",
+                error=client_error,
+            )
+        else:
+            turn = generate_interview_turn(
+                client,
+                config,
+                context_pack=context_pack,
+                history=history,
+                user_message=payload.user_message,
+            )
 
         conn.execute("BEGIN")
         try:
@@ -1295,10 +1309,27 @@ def update_interview_understanding(
         from ..docs_code_reconciler import reconcile
         from ..system_understanding_reviewer import generate_understanding_review
 
-        doc_index = build_documentation_index(conn, system_id, snapshot_id)
-
         config = LLMConfig.intelligence_from_env()
-        client = create_llm_client(config)
+        try:
+            client = create_llm_client(config)
+        except LLMError as exc:
+            error = str(exc)
+            conn.execute(
+                """UPDATE interview_session
+                   SET last_error = ?, updated_at = ?
+                   WHERE id = ? AND system_id = ?""",
+                (error, now, session_id, system_id),
+            )
+            conn.execute(
+                """INSERT INTO interview_message
+                    (session_id, system_id, role, content, created_at)
+                VALUES (?, ?, 'assistant', ?, ?)""",
+                (session_id, system_id, f"Understanding update failed: {error}", now),
+            )
+            row = _get_session_or_404(conn, session_id, system_id)
+            return _session_out(row)
+
+        doc_index = build_documentation_index(conn, system_id, snapshot_id)
 
         scan_results = scan_all_chunks(client, config, doc_index.chunks)
 

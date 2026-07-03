@@ -518,6 +518,76 @@ def test_session_has_last_error_field(admin_client):
     assert data["last_error"] is None
 
 
+def _configure_provider_key_mismatch(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("INTELLIGENCE_LLM_PROVIDER", "anthropic")
+    monkeypatch.setenv("INTELLIGENCE_LLM_MODEL", "claude-sonnet-4-5")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-only-key")
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+
+def test_dialogue_turn_records_llm_config_failure(admin_client, monkeypatch):
+    """Provider/key mismatch must fail closed as a recorded turn, not 500."""
+    _configure_provider_key_mismatch(monkeypatch)
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "config mismatch"},
+        headers=headers,
+    ).json()
+
+    r = admin_client.post(
+        f"/interview/sessions/{session['id']}/dialogue-turn",
+        json={"user_message": "このシステムを説明して"},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["assistant_message"] == ""
+    assert body["error"]
+    assert "ANTHROPIC_API_KEY" in body["error"]
+    run = body["intelligence_run"]
+    assert run["run_type"] == "interview_dialogue"
+    assert run["provider"] == "anthropic"
+    assert run["status"] == "failed"
+    assert "ANTHROPIC_API_KEY" in run["error_details"]
+
+    detail = admin_client.get(
+        f"/interview/sessions/{session['id']}", headers=headers
+    ).json()
+    assert [m["role"] for m in detail["messages"]] == ["user"]
+
+
+def test_update_understanding_records_llm_config_failure(admin_client, monkeypatch):
+    """Start/refresh understanding should surface config failure on the session."""
+    _configure_provider_key_mismatch(monkeypatch)
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "update mismatch"},
+        headers=headers,
+    ).json()
+
+    r = admin_client.post(
+        f"/interview/sessions/{session['id']}/update-understanding",
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["last_error"]
+    assert "ANTHROPIC_API_KEY" in body["last_error"]
+
+    detail = admin_client.get(
+        f"/interview/sessions/{session['id']}", headers=headers
+    ).json()
+    assert detail["messages"][-1]["role"] == "assistant"
+    assert "ANTHROPIC_API_KEY" in detail["messages"][-1]["content"]
+
+
 def test_proposals_rejected_before_proposal_stage(admin_client):
     """P1: /proposals API must enforce stage gate."""
     token, system_id, snapshot_id = _setup(admin_client)
