@@ -2198,3 +2198,41 @@ class SystemUnderstandingOut(BaseModel):
     gap_summary: List[SystemUnderstandingGapSummaryOut] = Field(default_factory=list)
     metadata_coverage: Optional[SystemUnderstandingMetadataCoverageOut] = None
     next_actions: List[SystemUnderstandingNextActionOut] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# System diagnostics (Issue #101)
+# ---------------------------------------------------------------------------
+
+DiagnosticSeverity = Literal["ok", "warning", "error", "blocked", "unknown"]
+
+
+class DiagnosticLastObservedErrorOut(BaseModel):
+    source: str
+    status: str
+    error: Optional[str] = None
+    observed_at: Optional[float] = None
+
+
+class SystemDiagnosticCheckOut(BaseModel):
+    check_id: str
+    category: str
+    title: str
+    severity: DiagnosticSeverity
+    detail: str
+    impact: str = ""
+    remediation: str = ""
+    related_env: List[str] = Field(default_factory=list)
+    related_paths: List[str] = Field(default_factory=list)
+    related_pages: List[str] = Field(default_factory=list)
+    related_pipeline_steps: List[str] = Field(default_factory=list)
+    last_observed_error: Optional[DiagnosticLastObservedErrorOut] = None
+    decision_method: Literal["deterministic"] = "deterministic"
+
+
+class SystemDiagnosticsOut(BaseModel):
+    system_id: int
+    generated_at: float
+    overall_severity: DiagnosticSeverity
+    severity_counts: Dict[str, int] = Field(default_factory=dict)
+    checks: List[SystemDiagnosticCheckOut] = Field(default_factory=list)

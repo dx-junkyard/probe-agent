@@ -1403,3 +1403,38 @@ export interface SystemUnderstandingOut {
   metadata_coverage: SystemUnderstandingMetadataCoverage | null;
   next_actions: SystemUnderstandingNextAction[];
 }
+
+// System settings diagnostics (Issue #101)
+
+export type DiagnosticSeverity = "ok" | "warning" | "error" | "blocked" | "unknown";
+
+export interface DiagnosticLastObservedError {
+  source: string;
+  status: string;
+  error?: string | null;
+  observed_at?: number | null;
+}
+
+export interface SystemDiagnosticCheck {
+  check_id: string;
+  category: string;
+  title: string;
+  severity: DiagnosticSeverity;
+  detail: string;
+  impact: string;
+  remediation: string;
+  related_env: string[];
+  related_paths: string[];
+  related_pages: string[];
+  related_pipeline_steps: string[];
+  last_observed_error?: DiagnosticLastObservedError | null;
+  decision_method: "deterministic";
+}
+
+export interface SystemDiagnosticsOut {
+  system_id: number;
+  generated_at: number;
+  overall_severity: DiagnosticSeverity;
+  severity_counts: Record<string, number>;
+  checks: SystemDiagnosticCheck[];
+}

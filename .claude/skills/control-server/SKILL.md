@@ -40,6 +40,23 @@ mapping, planning, and interpretation must call a reasoning model through the
 provider-neutral LLM layer. Do not reuse `app/evaluator.py` as a heuristic
 fallback for intelligence work.
 
+## System settings diagnostics (issue #101)
+
+- `GET /system-diagnostics` (`app/system_diagnostics.py`, `routes/diagnostics.py`)
+  returns deterministic, LLM-free health checks for required configuration:
+  env presence, enum membership, path existence and read/write permission,
+  provider/model-family consistency, reasoning-capability, and pipeline
+  prerequisites.
+- Severity vocabulary: `ok | warning | error | blocked | unknown`. Every
+  check carries impact, remediation, related env/paths/pages/pipeline steps,
+  and `decision_method: deterministic`.
+- Runtime-only failures (LLM timeout/auth/invalid model, snapshot failures)
+  are surfaced verbatim from the latest persisted run/snapshot records as
+  `last_observed_error`. Never classify or interpret error text with
+  heuristics, and never call an LLM from a diagnostics check.
+- New required settings must be added here with title/impact/remediation so
+  the Dashboard alert badge can explain them.
+
 ## Feature Intelligence APIs (issues #23-#26)
 
 The current `GET /project-intelligence` response is a mock contract.

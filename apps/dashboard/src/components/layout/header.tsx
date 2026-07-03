@@ -7,6 +7,7 @@ import { Dialog, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useCreateSystem } from "@/api/hooks";
+import { DiagnosticsBadge } from "@/components/diagnostics-badge";
 import { toast } from "sonner";
 
 function initTheme() {
@@ -81,6 +82,7 @@ export function Header() {
       </div>
 
       <div className="flex items-center gap-2">
+        <DiagnosticsBadge />
         <ThemeToggle />
         {user && (
           <span className="text-sm text-muted-foreground">

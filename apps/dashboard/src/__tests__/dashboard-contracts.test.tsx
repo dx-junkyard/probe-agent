@@ -1869,3 +1869,185 @@ describe("System Understanding page", () => {
     expect(capLink.closest("a")?.getAttribute("href")).toContain("/capability-map?capability=User%20Auth");
   });
 });
+
+// ── System settings diagnostics (Issue #101) ────────────────────────
+
+describe("System settings diagnostics", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const diagnosticsResponse = {
+    system_id: 1,
+    generated_at: 1750000000,
+    overall_severity: "error",
+    severity_counts: { ok: 3, warning: 1, error: 1, blocked: 1, unknown: 0 },
+    checks: [
+      {
+        check_id: "intelligence_llm_config",
+        category: "llm",
+        title: "Intelligence reasoning model configuration",
+        severity: "error",
+        detail: "model 'gpt-5.4' configured but INTELLIGENCE_LLM_PROVIDER is empty.",
+        impact: "Documentation indexing and capability hierarchy stay blocked.",
+        remediation: "Set INTELLIGENCE_LLM_PROVIDER and INTELLIGENCE_LLM_MODEL to a reasoning-capable pair.",
+        related_env: ["INTELLIGENCE_LLM_PROVIDER", "INTELLIGENCE_LLM_MODEL"],
+        related_paths: [],
+        related_pages: ["/system-understanding"],
+        related_pipeline_steps: ["documentation_indexed", "capability_hierarchy_ready"],
+        last_observed_error: {
+          source: "intelligence_runs#12:repository_drafts",
+          status: "failed",
+          error: "LLM request failed: HTTP 401: invalid api key",
+          observed_at: 1749999000,
+        },
+        decision_method: "deterministic",
+      },
+      {
+        check_id: "snapshot_status",
+        category: "repository",
+        title: "Ready repository snapshot",
+        severity: "warning",
+        detail: "Latest ready snapshot #7 contains 0 indexed files.",
+        impact: "Indexing produces empty results.",
+        remediation: "Review the include/exclude patterns in the Repository tab.",
+        related_env: [],
+        related_paths: [],
+        related_pages: ["/repository"],
+        related_pipeline_steps: ["snapshot_ready"],
+        last_observed_error: null,
+        decision_method: "deterministic",
+      },
+      {
+        check_id: "pipeline_documentation_index",
+        category: "pipeline",
+        title: "Documentation index run",
+        severity: "blocked",
+        detail: "This step has never run and requires a reasoning model, which is not configured.",
+        impact: "The step shows as blocked/missing in System Understanding.",
+        remediation: "Fix the intelligence reasoning model configuration, then run a build.",
+        related_env: [],
+        related_paths: [],
+        related_pages: ["/system-understanding"],
+        related_pipeline_steps: ["documentation_indexed"],
+        last_observed_error: null,
+        decision_method: "deterministic",
+      },
+      {
+        check_id: "database_storage",
+        category: "database",
+        title: "Database storage",
+        severity: "ok",
+        detail: "Database path ./probe.db is readable and writable.",
+        impact: "",
+        remediation: "",
+        related_env: ["PROBE_DB_PATH"],
+        related_paths: ["./probe.db"],
+        related_pages: [],
+        related_pipeline_steps: [],
+        last_observed_error: null,
+        decision_method: "deterministic",
+      },
+    ],
+  };
+
+  test("badge shows attention count and opens detail dialog with remediation and last error", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-diagnostics"
+        ? Promise.resolve(diagnosticsResponse)
+        : Promise.resolve(null),
+    );
+
+    const { DiagnosticsBadge } = await import("@/components/diagnostics-badge");
+    render(<DiagnosticsBadge />, { wrapper: createWrapper() });
+
+    const badge = await screen.findByTestId("diagnostics-badge");
+    // error(1) + blocked(1) + warning(1) = 3
+    expect(screen.getByTestId("diagnostics-badge-count").textContent).toBe("3");
+
+    fireEvent.click(badge);
+
+    await waitFor(() => {
+      expect(screen.getByText("System Settings Diagnostics")).toBeTruthy();
+    });
+
+    // Problems are listed with detail, impact, remediation, related env.
+    expect(screen.getByText(/INTELLIGENCE_LLM_PROVIDER is empty/)).toBeTruthy();
+    expect(
+      screen.getByText(/Set INTELLIGENCE_LLM_PROVIDER and INTELLIGENCE_LLM_MODEL/),
+    ).toBeTruthy();
+    // Last observed runtime failure is shown verbatim.
+    const lastError = screen.getByTestId("diagnostic-last-error");
+    expect(lastError.textContent).toContain("HTTP 401: invalid api key");
+    expect(lastError.textContent).toContain("intelligence_runs#12:repository_drafts");
+    // Passing checks are still visible as passing.
+    expect(screen.getByText("Passing checks")).toBeTruthy();
+    expect(screen.getByText("Database storage")).toBeTruthy();
+  });
+
+  test("badge renders without count when everything is ok", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-diagnostics"
+        ? Promise.resolve({
+            ...diagnosticsResponse,
+            overall_severity: "ok",
+            severity_counts: { ok: 4, warning: 0, error: 0, blocked: 0, unknown: 0 },
+            checks: [diagnosticsResponse.checks[3]],
+          })
+        : Promise.resolve(null),
+    );
+
+    const { DiagnosticsBadge } = await import("@/components/diagnostics-badge");
+    render(<DiagnosticsBadge />, { wrapper: createWrapper() });
+
+    await screen.findByTestId("diagnostics-badge");
+    expect(screen.queryByTestId("diagnostics-badge-count")).toBeNull();
+  });
+
+  test("System Understanding pipeline rows link missing/blocked steps to diagnostics", async () => {
+    const suResponse = {
+      system_id: 1,
+      snapshot_id: 7,
+      commit_sha: "94e9d605aaaa",
+      pipeline: [
+        { step: "repository_configured", status: "complete" },
+        { step: "snapshot_ready", status: "complete" },
+        { step: "documentation_indexed", status: "missing" },
+        { step: "documentation_claims_scanned", status: "missing" },
+        { step: "symbols_indexed", status: "complete" },
+        { step: "entrypoints_discovered", status: "complete" },
+        { step: "docs_code_reconciled", status: "warning" },
+        { step: "capability_hierarchy_ready", status: "missing" },
+      ],
+      purpose: null,
+      capabilities: [],
+      entrypoints: [],
+      major_symbols: [],
+      gaps: [],
+      gap_summary: [],
+      metadata_coverage: null,
+      next_actions: [],
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(suResponse);
+      if (path === "/system-diagnostics") return Promise.resolve(diagnosticsResponse);
+      return Promise.resolve(null);
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    // documentation_indexed is missing and has two related diagnostics.
+    const diagnoseButton = await screen.findByTestId("pipeline-diagnose-documentation_indexed");
+    expect(diagnoseButton.textContent).toContain("2");
+
+    // Complete steps get no diagnose button even if a check references them.
+    expect(screen.queryByTestId("pipeline-diagnose-snapshot_ready")).toBeNull();
+
+    fireEvent.click(diagnoseButton);
+    const expanded = await screen.findByTestId("pipeline-diagnostics-documentation_indexed");
+    expect(expanded.textContent).toContain("INTELLIGENCE_LLM_PROVIDER is empty");
+    expect(expanded.textContent).toContain("HTTP 401: invalid api key");
+  });
+});
