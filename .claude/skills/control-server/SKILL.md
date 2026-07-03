@@ -75,8 +75,13 @@ fallback for intelligence work.
   question (finite key matching only), and the current `system_diagnostics`
   checks. Only this pack is sent to the LLM.
 - LLM answers (`decision_method: reasoning_llm`, `used_fallback: false`) are
-  strict-JSON validated; citations and navigate targets outside the supplied
-  pack are dropped (structural validation). Provider `mock`, a missing key,
+  strict-JSON validated; citations and navigate/operate targets outside the
+  supplied pack/route set are dropped (structural validation — `operate`
+  targets are routes where the operation is performed, never bare operation
+  names). The API key must match the effective provider
+  (`LLMConfig.intelligence_from_env`), same rule as the diagnostics
+  `_api_key_status`; a mismatched key means no external call. Provider
+  `mock`, a missing/mismatched key,
   LLM errors, or invalid output all switch to the deterministic fallback
   composed verbatim from the metadata/diagnostics above
   (`decision_method: deterministic`, `used_fallback: true`, with

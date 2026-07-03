@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from .llm import LLMClient, LLMConfig, LLMError
+from .llm import LLMClient, LLMConfig, LLMError, PROVIDER_KEY_ENV
 from .settings_metadata import SETTINGS_BY_KEY, SettingMetadata
 from .system_diagnostics import DiagnosticCheck, SystemDiagnosticsReport
 
@@ -733,8 +733,9 @@ Respond with ONLY a JSON object (no markdown fence) of this shape:
 {
   "answer": "explanation grounded in the provided context",
   "suggested_actions": [
-    {"label": "short action", "kind": "navigate|configure|operate",
-     "target": "a route from navigable_routes for navigate, a setting key for configure, or a short operation name for operate",
+    {"label": "short action (for operate: the operation name, e.g. 'Run Build / Refresh')",
+     "kind": "navigate|configure|operate",
+     "target": "a setting key for configure; a route from navigable_routes for navigate and for operate (the screen where the operation is performed)",
      "detail": "optional how-to detail"}
   ],
   "citations": [
@@ -791,7 +792,9 @@ def _llm_answer(
     setting_keys = {s.key for s in pack.settings}
     actions = []
     for a in parsed.suggested_actions:
-        if a.kind == "navigate" and a.target not in KNOWN_ROUTES:
+        # navigate/operate targets are routes the UI navigates to; anything
+        # outside the finite route set is dropped (structural validation).
+        if a.kind in ("navigate", "operate") and a.target not in KNOWN_ROUTES:
             continue
         if a.kind == "configure" and a.target not in setting_keys:
             continue
@@ -1010,12 +1013,19 @@ def answer_question(
     """
     pack = build_context_pack(ctx, question, report, visible_check_ids)
     if client is None:
-        reason = (
-            "LLM provider 'mock' is test-only data and is never used for "
-            "assistant answers."
-            if config.provider == "mock"
-            else f"No usable LLM configuration (provider '{config.provider}')."
-        )
+        if config.provider == "mock":
+            reason = (
+                "LLM provider 'mock' is test-only data and is never used for "
+                "assistant answers."
+            )
+        elif config.provider in REAL_PROVIDERS and not config.api_key:
+            key_env = PROVIDER_KEY_ENV.get(config.provider, "")
+            reason = (
+                f"No API key for provider '{config.provider}' "
+                f"(set LLM_API_KEY{f' or {key_env}' if key_env else ''})."
+            )
+        else:
+            reason = f"No usable LLM configuration (provider '{config.provider}')."
         return _fallback_answer(pack, report, config, reason)
     try:
         return _llm_answer(client, config, pack, report, question)

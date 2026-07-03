@@ -101,7 +101,9 @@ function AnswerMessage({ result }: { result: AssistantAskOut }) {
                     {a.label}:{" "}
                     <code className="bg-muted px-1 py-0.5 rounded font-mono text-[11px]">{a.target}</code>
                   </span>
-                ) : (
+                ) : a.target.startsWith("/") ? (
+                  // navigate/operate targets are in-app routes (validated
+                  // server-side against the known route set).
                   <button
                     className="inline-flex items-center gap-1 text-xs text-primary hover:underline cursor-pointer"
                     onClick={() => navigate(a.target)}
@@ -111,6 +113,15 @@ function AnswerMessage({ result }: { result: AssistantAskOut }) {
                     <ExternalLink className="h-3.5 w-3.5 shrink-0" />
                     {a.label}
                   </button>
+                ) : (
+                  <span
+                    className="inline-flex items-center gap-1 text-xs"
+                    data-testid="assistant-action"
+                    title={a.detail}
+                  >
+                    <Wrench className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                    {a.label}
+                  </span>
                 )}
               </div>
             ))}

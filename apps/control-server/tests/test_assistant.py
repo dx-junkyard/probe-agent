@@ -306,6 +306,18 @@ class _GroundedClient:
                         "detail": "",
                     },
                     {
+                        "label": "Run Build / Refresh",
+                        "kind": "operate",
+                        "target": "/system-understanding",
+                        "detail": "Click Build / Refresh at the top of the page.",
+                    },
+                    {
+                        "label": "Do something vague",
+                        "kind": "operate",
+                        "target": "Build / Refresh",
+                        "detail": "",
+                    },
+                    {
                         "label": "Set the model",
                         "kind": "configure",
                         "target": "INTELLIGENCE_LLM_MODEL",
@@ -370,6 +382,12 @@ def test_ask_llm_answer_filters_ungrounded_citations_and_actions(
     targets = {a["target"] for a in body["suggested_actions"]}
     assert "/system-understanding" in targets
     assert "/not-a-route" not in targets  # dropped: unknown route
+    # operate targets are routes too: a valid one is kept, a bare operation
+    # name is dropped so the UI never navigates to a non-existent path.
+    operate_targets = [
+        a["target"] for a in body["suggested_actions"] if a["kind"] == "operate"
+    ]
+    assert operate_targets == ["/system-understanding"]
 
 
 def test_ask_llm_failure_switches_to_marked_fallback(admin_client, monkeypatch):
@@ -411,6 +429,40 @@ def test_ask_llm_malformed_output_switches_to_marked_fallback(
     body = r.json()
     assert body["used_fallback"] is True
     assert "not valid JSON" in body["fallback_reason"]
+
+
+def test_ask_provider_key_mismatch_falls_back_without_llm_call(
+    admin_client, monkeypatch
+):
+    """A key belonging to a different provider is not usable: no external
+    call is attempted and the fallback reason names the missing key."""
+    token = _login(admin_client)
+    system = _create_system(admin_client, token)
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("INTELLIGENCE_LLM_PROVIDER", "anthropic")
+    monkeypatch.setenv("INTELLIGENCE_LLM_MODEL", "claude-sonnet-4-5")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-only-key")
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    def _fail(config):
+        raise AssertionError("create_llm_client must not be called")
+
+    monkeypatch.setattr("app.routes.assistant.create_llm_client", _fail)
+    r = admin_client.post(
+        "/assistant/ask",
+        json={
+            "screen_id": "system-understanding",
+            "question": "What should INTELLIGENCE_LLM_MODEL be set to?",
+        },
+        headers=_headers(token, system["id"]),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["used_fallback"] is True
+    assert body["decision_method"] == "deterministic"
+    assert "anthropic" in body["fallback_reason"]
+    assert "ANTHROPIC_API_KEY" in body["fallback_reason"]
 
 
 def test_ask_requires_auth(admin_client):

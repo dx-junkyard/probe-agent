@@ -20,6 +20,13 @@ from typing import Any, Dict, List, Optional
 
 Message = Dict[str, str]
 
+# Provider-specific API key env vars (also used by system_diagnostics).
+PROVIDER_KEY_ENV: Dict[str, str] = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+}
+
 
 @dataclass(frozen=True)
 class LLMConfig:
@@ -58,7 +65,14 @@ class LLMConfig:
 
     @classmethod
     def intelligence_from_env(cls) -> "LLMConfig":
-        """Config preferring INTELLIGENCE_LLM_* over the generic LLM_* vars."""
+        """Config preferring INTELLIGENCE_LLM_* over the generic LLM_* vars.
+
+        Unlike ``from_env``, the API key must match the effective provider
+        (generic LLM_API_KEY or that provider's specific key); a key that
+        belongs to a different provider is not usable and yields
+        ``api_key=None`` so callers fail closed instead of making a doomed
+        external call.
+        """
         base = cls.from_env()
         provider = (
             os.getenv("INTELLIGENCE_LLM_PROVIDER") or base.provider
@@ -71,6 +85,11 @@ class LLMConfig:
                 "gemini": "gemini-1.5-flash",
                 "mock": "mock",
             }.get(provider, "gpt-4o-mini")
+        specific_env = PROVIDER_KEY_ENV.get(provider)
+        api_key = (
+            (os.getenv("LLM_API_KEY") or "").strip()
+            or ((os.getenv(specific_env) or "").strip() if specific_env else "")
+        ) or None
         timeout = base.timeout
         raw_timeout = os.getenv("INTELLIGENCE_LLM_TIMEOUT")
         if raw_timeout and raw_timeout.strip():
@@ -80,7 +99,7 @@ class LLMConfig:
                 pass
         return cls(
             provider=provider,
-            api_key=base.api_key,
+            api_key=api_key,
             model=model,
             base_url=base.base_url,
             timeout=timeout,
