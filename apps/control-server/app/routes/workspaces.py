@@ -12,9 +12,7 @@ never directly.
 from __future__ import annotations
 
 import json
-import os
 import time
-from dataclasses import replace
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -323,19 +321,6 @@ def get_workspace_context_pack(
         return build_context_pack(conn, system_id, workspace, context_items)
 
 
-def _resolve_intelligence_llm_config() -> LLMConfig:
-    config = LLMConfig.from_env()
-    intelligence_provider = os.getenv("INTELLIGENCE_LLM_PROVIDER", "").strip()
-    intelligence_model = os.getenv("INTELLIGENCE_LLM_MODEL", "").strip()
-    if intelligence_provider or intelligence_model:
-        config = replace(
-            config,
-            provider=intelligence_provider or config.provider,
-            model=intelligence_model or config.model,
-        )
-    return config
-
-
 @router.post(
     "/workspaces/{workspace_id}/agent-turns",
     response_model=WorkspaceAgentTurnOut,
@@ -399,7 +384,7 @@ def create_workspace_agent_turn(
         context_pack = build_context_pack(conn, system_id, workspace, context_items)
         workspace_summary = workspace["summary"] or ""
 
-    config = _resolve_intelligence_llm_config()
+    config = LLMConfig.intelligence_from_env()
     try:
         client = create_llm_client(config)
     except LLMError as exc:

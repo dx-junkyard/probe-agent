@@ -512,40 +512,6 @@ def create_interview_proposals(
 # --- Dialogue Turn (Issue #69) -----------------------------------------------
 
 
-def _get_intelligence_llm_config() -> LLMConfig:
-    """Build LLMConfig preferring INTELLIGENCE_LLM_* over generic LLM_*."""
-    import os
-
-    provider = os.getenv("INTELLIGENCE_LLM_PROVIDER") or os.getenv("LLM_PROVIDER", "openai")
-    provider = provider.strip().lower()
-    model = os.getenv("INTELLIGENCE_LLM_MODEL") or os.getenv("LLM_MODEL")
-    if not model:
-        defaults = {
-            "openai": "gpt-4o-mini",
-            "anthropic": "claude-3-5-haiku-latest",
-            "gemini": "gemini-1.5-flash",
-            "mock": "mock",
-        }
-        model = defaults.get(provider, "gpt-4o-mini")
-    api_key = (
-        os.getenv("LLM_API_KEY")
-        or os.getenv("OPENAI_API_KEY")
-        or os.getenv("ANTHROPIC_API_KEY")
-        or os.getenv("GEMINI_API_KEY")
-    )
-    try:
-        timeout = float(os.getenv("LLM_TIMEOUT", "120"))
-    except ValueError:
-        timeout = 120.0
-    return LLMConfig(
-        provider=provider,
-        api_key=api_key,
-        model=model,
-        base_url=os.getenv("LLM_BASE_URL") or None,
-        timeout=timeout,
-    )
-
-
 @router.post(
     "/interview/sessions/{session_id}/dialogue-turn",
     response_model=InterviewDialogueTurnOut,
@@ -574,7 +540,7 @@ def interview_dialogue_turn(
       probe_value: Verify dialogue turn persists messages and proposals, and handles LLM failures gracefully
     """
     now = time.time()
-    config = _get_intelligence_llm_config()
+    config = LLMConfig.intelligence_from_env()
     client = create_llm_client(config)
 
     with get_conn() as conn:
@@ -1331,7 +1297,7 @@ def update_interview_understanding(
 
         doc_index = build_documentation_index(conn, system_id, snapshot_id)
 
-        config = _get_intelligence_llm_config()
+        config = LLMConfig.intelligence_from_env()
         client = create_llm_client(config)
 
         scan_results = scan_all_chunks(client, config, doc_index.chunks)

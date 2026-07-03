@@ -102,17 +102,15 @@ def _check_snapshot_ready(conn, system_id: int, snapshot_row) -> PipelineStep:
 
 
 def _is_reasoning_model_available() -> bool:
-    """Check whether a non-mock reasoning model is configured."""
-    import os
-    provider = (os.getenv("INTELLIGENCE_LLM_PROVIDER") or os.getenv("LLM_PROVIDER", "openai")).strip().lower()
-    if provider == "mock":
+    """Check whether a non-mock reasoning model is configured with a usable API key."""
+    from .llm import LLMConfig, is_reasoning_model
+
+    config = LLMConfig.intelligence_from_env()
+    if config.provider == "mock":
         return False
-    from .llm import is_reasoning_model
-    model = os.getenv("INTELLIGENCE_LLM_MODEL") or os.getenv("LLM_MODEL")
-    if not model:
-        defaults = {"openai": "gpt-4o-mini", "anthropic": "claude-3-5-haiku-latest", "gemini": "gemini-1.5-flash"}
-        model = defaults.get(provider, "gpt-4o-mini")
-    return is_reasoning_model(provider, model)
+    if not config.api_key:
+        return False
+    return is_reasoning_model(config.provider, config.model)
 
 
 def _check_documentation_indexed(conn, system_id: int, snapshot_id: Optional[int]) -> PipelineStep:
@@ -853,10 +851,9 @@ def build_system_understanding(system_id: int) -> SystemUnderstandingSummary:
                     from .documentation_claim_scanner import scan_all_chunks
                     from .understanding_graph import build_understanding_graph, save_graph_snapshot
                     from .docs_code_reconciler import reconcile
-                    from .routes.interview import _get_intelligence_llm_config
 
                     doc_index = build_documentation_index(conn, system_id, snapshot_id)
-                    config = _get_intelligence_llm_config()
+                    config = LLMConfig.intelligence_from_env()
                     client = create_llm_client(config)
                     scan_results = scan_all_chunks(client, config, doc_index.chunks)
                     graph = build_understanding_graph(scan_results)
