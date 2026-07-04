@@ -16,7 +16,6 @@ import os
 import re
 import time
 import hashlib
-from dataclasses import replace
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
@@ -784,24 +783,7 @@ def generate_drafts_endpoint(
             )
         )
 
-    llm_config = LLMConfig.from_env()
-    intelligence_provider = os.getenv("INTELLIGENCE_LLM_PROVIDER", "").strip()
-    intelligence_model = os.getenv("INTELLIGENCE_LLM_MODEL", "").strip()
-    if intelligence_provider or intelligence_model:
-        llm_config = replace(
-            llm_config,
-            provider=intelligence_provider or llm_config.provider,
-            model=intelligence_model or llm_config.model,
-        )
-    try:
-        intelligence_timeout = float(os.getenv("INTELLIGENCE_LLM_TIMEOUT", "120"))
-    except ValueError:
-        intelligence_timeout = 120.0
-    if llm_config.provider != "mock":
-        llm_config = replace(
-            llm_config,
-            timeout=max(llm_config.timeout, intelligence_timeout),
-        )
+    llm_config = _resolve_intelligence_config()
 
     started_at = time.time()
     try:
@@ -3273,15 +3255,7 @@ def generate_code_links_endpoint(
             component_id=sr["component_id"],
         ))
 
-    llm_config = LLMConfig.from_env()
-    intelligence_provider = os.getenv("INTELLIGENCE_LLM_PROVIDER", "").strip()
-    intelligence_model = os.getenv("INTELLIGENCE_LLM_MODEL", "").strip()
-    if intelligence_provider or intelligence_model:
-        llm_config = replace(
-            llm_config,
-            provider=intelligence_provider or llm_config.provider,
-            model=intelligence_model or llm_config.model,
-        )
+    llm_config = _resolve_intelligence_config()
 
     started_at = time.time()
     try:
@@ -3618,15 +3592,7 @@ def generate_probe_plan_endpoint(
             relation_reason=lr["relation_reason"],
         ))
 
-    llm_config = LLMConfig.from_env()
-    intelligence_provider = os.getenv("INTELLIGENCE_LLM_PROVIDER", "").strip()
-    intelligence_model = os.getenv("INTELLIGENCE_LLM_MODEL", "").strip()
-    if intelligence_provider or intelligence_model:
-        llm_config = replace(
-            llm_config,
-            provider=intelligence_provider or llm_config.provider,
-            model=intelligence_model or llm_config.model,
-        )
+    llm_config = _resolve_intelligence_config()
 
     started_at = time.time()
     try:
@@ -4187,18 +4153,9 @@ def _load_scan_files(system_id: int, expected_snapshot_id=None, expected_commit_
     return snapshot_row, files
 
 
-def _resolve_intelligence_config():
-    """Return an LLMConfig with the intelligence-model override applied."""
-    llm_config = LLMConfig.from_env()
-    provider = os.getenv("INTELLIGENCE_LLM_PROVIDER", "").strip()
-    model = os.getenv("INTELLIGENCE_LLM_MODEL", "").strip()
-    if provider or model:
-        llm_config = replace(
-            llm_config,
-            provider=provider or llm_config.provider,
-            model=model or llm_config.model,
-        )
-    return llm_config
+def _resolve_intelligence_config() -> LLMConfig:
+    """Return the intelligence-model LLMConfig (provider-matched API key)."""
+    return LLMConfig.intelligence_from_env()
 
 
 def _snapshot_config_stale_reason(system_id: int, snapshot_row) -> Optional[str]:

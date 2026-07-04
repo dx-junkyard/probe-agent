@@ -219,6 +219,7 @@ IntelligenceRunType = Literal[
     "capability_hierarchy",
     "explanation_refresh",
     "interview_proposal",
+    "interview_dialogue",
 ]
 DecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
 # How a single hierarchy claim was produced. Kept distinct from the audit
