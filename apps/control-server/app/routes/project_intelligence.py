@@ -697,6 +697,7 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
             entrypoint_refs=[SystemUnderstandingGapEntrypointRef(**er) for er in g.get("entrypoint_refs", [])],
             code_refs=g.get("code_refs", []),
             next_actions=[SystemUnderstandingGapNextActionOut(**na) for na in g.get("next_actions", [])],
+            source_id=g.get("source_id"),
             source_key=g.get("source_key"),
             issue_drafts=[IssueDraftRefOut(**d) for d in g.get("issue_drafts", [])],
         )

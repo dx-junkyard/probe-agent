@@ -62,7 +62,13 @@ def gap_source_key(gap: Dict[str, Any]) -> str:
     gap_type = (gap.get("gap_type") or "unknown").strip()
     node_name = (gap.get("node_name") or "unknown").strip()
 
-    parts: List[str] = [f"capability:{gap.get('capability_key') or ''}"]
+    parts: List[str] = [
+        # The strongest identifier: a stable per-gap source id (graph node id or
+        # entrypoint identity). Evidence/capability can be empty (e.g.
+        # missing_evidence gaps), so without this two same-named gaps collide.
+        f"source_id:{gap.get('source_id') or ''}",
+        f"capability:{gap.get('capability_key') or ''}",
+    ]
     for dr in gap.get("doc_refs") or []:
         parts.append(
             f"doc:{dr.get('path', '')}:{dr.get('start_line', '')}:{dr.get('end_line', '')}"

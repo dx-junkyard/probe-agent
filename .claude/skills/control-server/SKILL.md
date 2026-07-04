@@ -173,9 +173,13 @@ heuristic result.
   /repository/system-understanding` attaches any matching drafts to each gap
   (`issue_drafts`), matched by that key against the caller's open connection
   (the DB lock is non-reentrant — never open a nested `get_conn`). The key
-  folds in `capability_key` + docs/code/entrypoint evidence (hashed, order
+  folds in a stable per-gap `source_id` (graph node id / entrypoint identity)
+  plus `capability_key` + docs/code/entrypoint evidence (hashed, order
   independent), not just `gap_type` + `node_name`, so same-named gaps in one
-  system don't share drafts.
+  system don't share drafts — including evidence-less gaps like
+  `missing_evidence`, which are distinguished by `source_id` alone. `source_id`
+  is on the gap output so it round-trips: a draft created from a POSTed gap
+  resolves to the same key the display computed.
 - `POST /issue-drafts` accepts the displayed `snapshot_id` / `commit_sha`;
   if a newer snapshot has since become ready the request is refused (409) so
   a draft never embeds a snapshot that disagrees with the gap evidence in the

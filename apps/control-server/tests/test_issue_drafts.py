@@ -210,6 +210,24 @@ class TestSourceKeyDisambiguation:
         }
         assert gap_source_key(gap_a) != gap_source_key(gap_b)
 
+    def test_empty_evidence_gaps_disambiguated_by_source_id(self):
+        """missing_evidence gaps carry no evidence/capability; source_id must disambiguate."""
+        from app.issue_drafts import gap_source_key
+
+        base = {
+            "gap_type": "missing_evidence",
+            "node_name": "Auth",
+            "capability_key": None,
+            "doc_refs": [],
+            "symbol_refs": [],
+            "entrypoint_refs": [],
+        }
+        gap_a = {**base, "source_id": "node:claim-1"}
+        gap_b = {**base, "source_id": "node:claim-2"}
+        assert gap_source_key(gap_a) != gap_source_key(gap_b)
+        # Same source_id -> same key (stable re-attachment).
+        assert gap_source_key(gap_a) == gap_source_key({**base, "source_id": "node:claim-1"})
+
     def test_key_is_stable_and_order_independent(self):
         from app.issue_drafts import gap_source_key
 

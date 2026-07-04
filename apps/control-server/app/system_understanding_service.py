@@ -430,6 +430,10 @@ def _load_gaps_from_reconciler(conn, system_id: int, snapshot_id: int) -> List[D
             "entrypoint_refs": [],
             "code_refs": [],
             "next_actions": _gap_next_actions(g.gap_type),
+            # Stable identifier for source_key disambiguation (Issue #107): the
+            # reconciler's graph node id distinguishes same-named nodes even when
+            # a gap carries no evidence/capability.
+            "source_id": (f"node:{g.node_id}" if g.node_id else None),
         }
         if g.node_id and g.node_id in graph.nodes:
             node = graph.nodes[g.node_id]
@@ -560,6 +564,7 @@ def _detect_extra_gaps(conn, system_id: int, snapshot_id: int) -> List[Dict[str,
             "entrypoint_refs": [{"entrypoint_type": uc["entrypoint_type"], "entrypoint_ref": uc["entrypoint_id"]}],
             "code_refs": [],
             "next_actions": _gap_next_actions("unclassified_entrypoint"),
+            "source_id": f"entrypoint:{uc['entrypoint_type']}:{uc['entrypoint_id']}",
         })
 
     # missing_probe_flow: classified entrypoints with no probe plan
@@ -591,6 +596,7 @@ def _detect_extra_gaps(conn, system_id: int, snapshot_id: int) -> List[Dict[str,
             "entrypoint_refs": [{"entrypoint_type": ep["entrypoint_type"], "entrypoint_ref": ep["entrypoint_id"]}],
             "code_refs": [],
             "next_actions": _gap_next_actions("missing_probe_flow"),
+            "source_id": f"entrypoint:{ep['entrypoint_type']}:{ep['entrypoint_id']}",
         })
 
     # missing_evidence: understanding graph nodes whose evidence list is empty
@@ -621,6 +627,9 @@ def _detect_extra_gaps(conn, system_id: int, snapshot_id: int) -> List[Dict[str,
                         "entrypoint_refs": [],
                         "code_refs": [],
                         "next_actions": _gap_next_actions("missing_evidence"),
+                        # The graph node id disambiguates same-named claims that
+                        # both lack evidence (Issue #107).
+                        "source_id": f"node:{node_id}",
                     })
         except (json.JSONDecodeError, TypeError):
             pass

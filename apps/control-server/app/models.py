@@ -2195,6 +2195,10 @@ class SystemUnderstandingGapOut(BaseModel):
     next_actions: List[SystemUnderstandingGapNextActionOut] = Field(default_factory=list)
     # Issue #107: stable identity for matching drafts back to this gap, plus any
     # issue drafts already generated for it (with registered external URLs).
+    # source_id is a stable per-gap identifier (graph node id / entrypoint
+    # identity) folded into source_key; it round-trips so a draft created from a
+    # POSTed gap resolves to the same key the display computed.
+    source_id: Optional[str] = None
     source_key: Optional[str] = None
     issue_drafts: List[IssueDraftRefOut] = Field(default_factory=list)
 

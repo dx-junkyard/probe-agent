@@ -1395,6 +1395,7 @@ export interface SystemUnderstandingGap {
   code_refs: Array<Record<string, unknown>>;
   next_actions: SystemUnderstandingGapNextAction[];
   // Issue #107
+  source_id?: string | null;
   source_key?: string | null;
   issue_drafts?: IssueDraftRef[];
 }
