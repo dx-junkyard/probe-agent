@@ -141,8 +141,13 @@ heuristic result.
 - LLM failures fail the `claim_scan` step visibly with per-chunk errors;
   deterministic steps still complete (no heuristic fallback, Principle 6).
 - Job status vocabulary: `queued / running / completed / partial / failed /
-  cancelled` (+ derived `is_stuck`). `partial` means some steps completed and
-  at least one failed.
+  cancelled` (+ derived `is_stuck`). `completed` requires every step
+  completed; any remaining failed/blocked/cancelled step yields `partial`
+  (or `failed` when no step completed), so blocked reasoning steps never
+  hide behind a completed job.
+- Each worker execution (initial enqueue and every retry) is a
+  `system_understanding_build_runs` row; the build endpoints return both
+  `job_id` and the latest `run_id`.
 - Status endpoints: `GET .../jobs/{job_id}`, `GET .../jobs/active`, plus the
   back-compat `GET .../build/latest` and `GET .../build/{id}` returning the
   same extended payload (steps, llm task counts, artifact counts).

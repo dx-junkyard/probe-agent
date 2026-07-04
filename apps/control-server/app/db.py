@@ -1155,6 +1155,26 @@ CREATE TABLE IF NOT EXISTS system_understanding_build_steps (
     UNIQUE (build_id, step)
 );
 
+-- One row per worker execution of a build job (Issue #109): the initial
+-- enqueue and every retry/resume each get their own run. The run id is the
+-- externally referenceable identifier returned by the build endpoint next to
+-- the job id; its status mirrors the job outcome for that execution.
+CREATE TABLE IF NOT EXISTS system_understanding_build_runs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    build_id      INTEGER NOT NULL,
+    system_id     INTEGER NOT NULL,
+    trigger       TEXT NOT NULL DEFAULT 'build',
+    status        TEXT NOT NULL DEFAULT 'running',
+    started_at    REAL,
+    completed_at  REAL,
+    created_at    REAL NOT NULL,
+    FOREIGN KEY (build_id) REFERENCES system_understanding_builds (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_build_runs_build
+    ON system_understanding_build_runs (build_id, id DESC);
+
 CREATE INDEX IF NOT EXISTS idx_understanding_build_steps_build
     ON system_understanding_build_steps (build_id);
 
@@ -1567,6 +1587,12 @@ def init_db() -> None:
                SET status = 'failed',
                    last_error = COALESCE(last_error, 'Interrupted by server restart'),
                    completed_at = COALESCE(completed_at, ?)
+               WHERE status = 'running'""",
+            (time.time(),),
+        )
+        conn.execute(
+            """UPDATE system_understanding_build_runs
+               SET status = 'failed', completed_at = COALESCE(completed_at, ?)
                WHERE status = 'running'""",
             (time.time(),),
         )

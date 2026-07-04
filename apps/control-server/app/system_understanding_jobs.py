@@ -170,6 +170,26 @@ def _reasoning_available() -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _open_run(conn, build_id: int, system_id: int, trigger: str) -> int:
+    """Create the run row for one worker execution of a build job."""
+    now = time.time()
+    return conn.execute(
+        """INSERT INTO system_understanding_build_runs
+            (build_id, system_id, trigger, status, started_at, created_at)
+        VALUES (?, ?, ?, 'running', ?, ?)""",
+        (build_id, system_id, trigger, now, now),
+    ).lastrowid
+
+
+def _close_open_runs(conn, build_id: int, status: str) -> None:
+    conn.execute(
+        """UPDATE system_understanding_build_runs
+           SET status = ?, completed_at = COALESCE(completed_at, ?)
+           WHERE build_id = ? AND status = 'running'""",
+        (status, time.time(), build_id),
+    )
+
+
 def start_system_understanding_build(system_id: int) -> int:
     """Create (or reuse) a build job and run it on a background thread.
 
@@ -205,6 +225,7 @@ def start_system_understanding_build(system_id: int) -> int:
                    WHERE build_id = ? AND status = 'running'""",
                 (now, active["id"]),
             )
+            _close_open_runs(conn, active["id"], "failed")
 
         snapshot_row = _get_latest_ready_snapshot(conn, system_id)
         snapshot_id = snapshot_row["id"] if snapshot_row else None
@@ -221,6 +242,7 @@ def start_system_understanding_build(system_id: int) -> int:
                 VALUES (?, ?, ?, ?, ?, 'pending', ?)""",
                 (build_id, system_id, snapshot_id, step, json.dumps(STEP_DEPENDS[step]), now),
             )
+        _open_run(conn, build_id, system_id, "build")
 
     _spawn(build_id, system_id)
     return build_id
@@ -245,6 +267,7 @@ def _run_job_safely(build_id: int, system_id: int) -> None:
                    WHERE id = ?""",
                 (str(exc), time.time(), build_id),
             )
+            _close_open_runs(conn, build_id, "failed")
 
 
 def _mark_step(
@@ -320,6 +343,7 @@ def _execute_job(build_id: int, system_id: int) -> None:
                    WHERE id = ?""",
                 (time.time(), build_id),
             )
+            _close_open_runs(conn, build_id, "failed")
         return
 
     snapshot_id = snapshot_row["id"]
@@ -449,20 +473,23 @@ def _finalize_job(build_id: int, cancelled: bool) -> None:
             (build_id,),
         ).fetchall()
 
+    # Any step left failed/blocked/cancelled means the job did NOT fully
+    # complete: report `partial` (or `failed` when nothing completed) so the
+    # blocked/failed steps stay visible and retryable in the UI instead of
+    # hiding behind a `completed` job (Issue #109 review).
     completed_n = sum(1 for s in steps if s["status"] == "completed")
+    incomplete = [s for s in steps if s["status"] != "completed"]
     failed = [s for s in steps if s["status"] == "failed"]
     if cancelled:
         status = "cancelled"
         error = None
-    elif failed and completed_n:
-        status = "partial"
-        error = f"{failed[0]['step']}: {failed[0]['error']}"
-    elif failed:
-        status = "failed"
-        error = f"{failed[0]['step']}: {failed[0]['error']}"
-    else:
+    elif not incomplete:
         status = "completed"
         error = None
+    else:
+        status = "partial" if completed_n else "failed"
+        first = failed[0] if failed else incomplete[0]
+        error = f"{first['step']}: {first['error']}"
 
     with get_conn() as conn:
         conn.execute(
@@ -472,6 +499,7 @@ def _finalize_job(build_id: int, cancelled: bool) -> None:
                WHERE id = ?""",
             (status, error, now, now, build_id),
         )
+        _close_open_runs(conn, build_id, status)
     logger.info("system_understanding job %s finished with status=%s", build_id, status)
 
 
@@ -550,6 +578,9 @@ def retry_build(system_id: int, build_id: int, step: Optional[str] = None) -> No
                WHERE id = ?""",
             (now, build_id),
         )
+        # A retried stuck job may still have its previous run open.
+        _close_open_runs(conn, build_id, "failed")
+        _open_run(conn, build_id, system_id, "step_retry" if step else "retry")
 
     _spawn(build_id, system_id)
 
@@ -686,9 +717,16 @@ def _job_to_dict(conn, job) -> Dict[str, Any]:
             "completed_at": s["completed_at"],
         })
 
+    latest_run = conn.execute(
+        "SELECT id FROM system_understanding_build_runs "
+        "WHERE build_id = ? ORDER BY id DESC LIMIT 1",
+        (job["id"],),
+    ).fetchone()
+
     return {
         "id": job["id"],
         "job_id": job["id"],
+        "run_id": latest_run["id"] if latest_run else None,
         "system_id": job["system_id"],
         "snapshot_id": job["snapshot_id"],
         "status": job["status"],

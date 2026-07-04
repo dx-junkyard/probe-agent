@@ -162,6 +162,7 @@ class TestJobCreation:
         assert r.status_code == 202, r.text
         job = r.json()
         assert job["job_id"] == job["id"]
+        assert job["run_id"] is not None
         assert job["status"] in ("queued", "running", "completed", "partial")
         step_names = [s["step"] for s in job["steps"]]
         assert step_names == [
@@ -198,8 +199,10 @@ class TestStepStatusAndProvenance:
         job = _wait_job(admin_client, hdrs, r.json()["id"])
         steps = _steps_by_name(job)
 
-        # Deterministic steps complete even though the LLM step is blocked.
-        assert job["status"] == "completed"
+        # Deterministic steps complete even though the LLM step is blocked;
+        # remaining blocked steps make the job partial, never completed.
+        assert job["status"] == "partial"
+        assert "Reasoning model" in job["error"]
         for name in ("symbol_index", "entrypoint_index", "documentation_index",
                      "capability_hierarchy"):
             step = steps[name]
@@ -322,6 +325,10 @@ class TestLlmChunkQueue:
         steps2 = _steps_by_name(job2)
 
         assert job2["status"] == "completed"
+        # The retry is a new run of the same job.
+        assert job2["job_id"] == job["job_id"]
+        assert job2["run_id"] is not None
+        assert job2["run_id"] != job["run_id"]
         assert steps2["claim_scan"]["status"] == "completed"
         assert steps2["understanding_graph"]["status"] == "completed"
         assert steps2["docs_code_reconcile"]["status"] == "completed"
@@ -472,7 +479,9 @@ class TestStuckDetectionAndResume:
         )
         assert retry.status_code == 202, retry.text
         job2 = _wait_job(admin_client, hdrs, job_id)
-        assert job2["status"] == "completed"
+        # Reasoning steps are still blocked (mock provider), so the resumed
+        # job is partial, and the interrupted deterministic step completed.
+        assert job2["status"] == "partial"
         assert job2["is_stuck"] is False
         assert _steps_by_name(job2)["documentation_index"]["status"] == "completed"
 

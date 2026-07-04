@@ -1921,6 +1921,7 @@ describe("System Understanding build job panel (Issue #109)", () => {
   const runningJob = {
     id: 7,
     job_id: 7,
+    run_id: 71,
     system_id: 1,
     snapshot_id: 5,
     status: "running",

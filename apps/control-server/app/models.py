@@ -2242,8 +2242,13 @@ class SystemUnderstandingArtifactCountsOut(BaseModel):
 class SystemUnderstandingBuildOut(BaseModel):
     id: int
     job_id: int
+    # Latest execution (initial enqueue or retry) of this job. None only for
+    # legacy rows created before run tracking existed.
+    run_id: Optional[int] = None
     system_id: int
     snapshot_id: Optional[int] = None
+    # completed only when every step completed; blocked/cancelled/failed
+    # steps yield partial (or failed when no step completed).
     status: str  # queued, running, completed, partial, failed, cancelled
     current_step: Optional[str] = None
     error: Optional[str] = None

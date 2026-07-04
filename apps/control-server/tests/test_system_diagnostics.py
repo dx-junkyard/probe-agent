@@ -421,12 +421,14 @@ class TestPipelinePrerequisites:
                 f"/repository/system-understanding/build/{build_id}", headers=hdrs
             )
             assert status_r.status_code == 200, status_r.text
-            if status_r.json()["status"] in ("completed", "failed"):
+            if status_r.json()["status"] in ("completed", "partial", "failed", "cancelled"):
                 break
             time.sleep(0.05)
         else:
             pytest.fail(f"Build {build_id} did not settle in time")
-        assert status_r.json()["status"] == "completed"
+        # Reasoning steps stay blocked with the mock provider (Issue #109),
+        # so the job is partial while the deterministic runs completed.
+        assert status_r.json()["status"] == "partial"
 
         _, checks = _get_checks(admin_client, hdrs)
         sym = checks["pipeline_symbol_index"]

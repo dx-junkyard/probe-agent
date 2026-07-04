@@ -1441,8 +1441,12 @@ export interface SystemUnderstandingArtifactCounts {
 export interface SystemUnderstandingBuildOut {
   id: number;
   job_id: number;
+  /** Latest execution (initial enqueue or retry) of this job. */
+  run_id: number | null;
   system_id: number;
   snapshot_id: number | null;
+  /** "completed" only when every step completed; remaining blocked/
+   * cancelled/failed steps yield "partial" ("failed" when nothing completed). */
   status: "queued" | "running" | "completed" | "partial" | "failed" | "cancelled";
   current_step: string | null;
   error: string | null;

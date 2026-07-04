@@ -74,7 +74,7 @@ def _build_and_wait(client, hdrs, timeout=10.0):
         )
         assert status_r.status_code == 200, status_r.text
         build = status_r.json()
-        if build["status"] in ("completed", "failed"):
+        if build["status"] in ("completed", "partial", "failed", "cancelled"):
             break
         time.sleep(0.05)
     else:
@@ -180,7 +180,9 @@ class TestSystemUnderstandingBuild:
         assert snap_r.status_code == 201
 
         build = _build_and_wait(admin_client, hdrs)
-        assert build["status"] == "completed"
+        # Deterministic steps complete, but the reasoning steps stay blocked
+        # (mock provider), so the job settles as partial — not completed.
+        assert build["status"] == "partial"
 
         r = admin_client.get("/repository/system-understanding", headers=hdrs)
         assert r.status_code == 200
@@ -468,7 +470,9 @@ class TestIntelligenceRunStatusContract:
             "/repository/snapshots", json={"commit_sha": sha}, headers=hdrs
         )
         build = _build_and_wait(admin_client, hdrs)
-        assert build["status"] == "completed"
+        # Reasoning steps stay blocked with the mock provider, so the job is
+        # partial while every deterministic artifact is still persisted.
+        assert build["status"] == "partial"
         return hdrs
 
     def test_build_writes_contract_statuses_only(self, admin_client, tmp_path):

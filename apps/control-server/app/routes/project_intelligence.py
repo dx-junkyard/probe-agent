@@ -494,6 +494,7 @@ def _build_out(job: dict) -> SystemUnderstandingBuildOut:
     return SystemUnderstandingBuildOut(
         id=job["id"],
         job_id=job["job_id"],
+        run_id=job["run_id"],
         system_id=job["system_id"],
         snapshot_id=job["snapshot_id"],
         status=job["status"],
