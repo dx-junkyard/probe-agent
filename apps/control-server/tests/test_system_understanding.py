@@ -657,3 +657,121 @@ class TestBuildDoesNotBlockOtherRequests:
                 break
             time.sleep(0.05)
         assert status == "completed"
+
+
+class TestNextActionsPriority:
+    """Issue #120: purpose/capabilities take priority over pipeline-complete.
+
+    Unit tests against ``_build_next_actions`` directly since a fully
+    "complete" pipeline (including the reasoning-only claim-scan step)
+    cannot be produced under the mock LLM provider used by the API tests
+    above.
+    """
+
+    def _complete_pipeline(self):
+        from app.system_understanding_service import PIPELINE_STEPS, PipelineStep
+
+        return [PipelineStep(step, "complete") for step in PIPELINE_STEPS]
+
+    def _incomplete_pipeline(self, missing_step):
+        from app.system_understanding_service import PipelineStep
+
+        steps = []
+        for step in self._complete_pipeline():
+            steps.append(
+                PipelineStep(step.step, "missing" if step.step == missing_step else "complete")
+            )
+        return steps
+
+    def test_incomplete_pipeline_step_takes_priority_over_purpose(self):
+        from app.system_understanding_service import _build_next_actions
+
+        actions = _build_next_actions(
+            self._incomplete_pipeline("symbols_indexed"),
+            purpose=None,
+            capabilities=[],
+            metadata_coverage=None,
+            gap_count=0,
+        )
+        labels = [a.action for a in actions]
+        assert "Index code symbols" in labels
+        assert "Define System Purpose" not in labels
+
+    def test_claim_scan_blocked_does_not_offer_exploration(self):
+        from app.system_understanding_service import MetadataCoverage, _build_next_actions
+
+        actions = _build_next_actions(
+            self._incomplete_pipeline("documentation_claims_scanned"),
+            purpose={"name": "Sys", "summary": "Does things"},
+            capabilities=[{"name": "Cap"}],
+            metadata_coverage=MetadataCoverage(symbol_count=10, symbols_with_source_metadata=10),
+            gap_count=0,
+        )
+        labels = [a.action for a in actions]
+        assert labels == ["Scan documentation claims"]
+
+    def test_docs_code_reconcile_missing_does_not_offer_exploration(self):
+        from app.system_understanding_service import MetadataCoverage, _build_next_actions
+
+        actions = _build_next_actions(
+            self._incomplete_pipeline("docs_code_reconciled"),
+            purpose={"name": "Sys", "summary": "Does things"},
+            capabilities=[{"name": "Cap"}],
+            metadata_coverage=MetadataCoverage(symbol_count=10, symbols_with_source_metadata=10),
+            gap_count=0,
+        )
+        labels = [a.action for a in actions]
+        assert labels == ["Reconcile docs and code"]
+
+    def test_complete_pipeline_without_purpose_is_top_priority(self):
+        from app.system_understanding_service import _build_next_actions
+
+        actions = _build_next_actions(
+            self._complete_pipeline(),
+            purpose=None,
+            capabilities=[{"name": "Do things"}],
+            metadata_coverage=None,
+            gap_count=3,
+        )
+        assert actions[0].action == "Define System Purpose"
+        assert actions[0].reason == "Pipeline completed, but no system purpose is defined yet."
+        assert actions[0].link == "/interview"
+
+    def test_complete_pipeline_without_capabilities_after_purpose(self):
+        from app.system_understanding_service import _build_next_actions
+
+        actions = _build_next_actions(
+            self._complete_pipeline(),
+            purpose={"name": "Sys", "summary": "Does things"},
+            capabilities=[],
+            metadata_coverage=None,
+            gap_count=0,
+        )
+        assert actions[0].action == "Identify main system capabilities"
+        assert actions[0].link == "/interview"
+
+    def test_metadata_coverage_and_gaps_after_purpose_and_capabilities(self):
+        from app.system_understanding_service import MetadataCoverage, _build_next_actions
+
+        actions = _build_next_actions(
+            self._complete_pipeline(),
+            purpose={"name": "Sys", "summary": "Does things"},
+            capabilities=[{"name": "Cap"}],
+            metadata_coverage=MetadataCoverage(symbol_count=10, symbols_with_source_metadata=0),
+            gap_count=2,
+        )
+        labels = [a.action for a in actions]
+        assert labels == ["Add source metadata", "Review docs-code gaps"]
+
+    def test_fully_satisfied_pipeline_offers_exploration_actions(self):
+        from app.system_understanding_service import MetadataCoverage, _build_next_actions
+
+        actions = _build_next_actions(
+            self._complete_pipeline(),
+            purpose={"name": "Sys", "summary": "Does things"},
+            capabilities=[{"name": "Cap"}],
+            metadata_coverage=MetadataCoverage(symbol_count=10, symbols_with_source_metadata=10),
+            gap_count=0,
+        )
+        labels = [a.action for a in actions]
+        assert labels == ["Start from Capability", "Start from Feature", "Open Flow Explorer"]

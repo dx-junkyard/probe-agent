@@ -40,6 +40,7 @@ const CATEGORY_LABELS: Record<string, string> = {
   auth: "認証 / システムスコープ",
   llm: "LLM / Intelligence",
   pipeline: "System Understanding パイプライン",
+  understanding: "System Purpose / 主な機能",
 };
 
 const SEVERITY_LABELS: Record<string, string> = {
