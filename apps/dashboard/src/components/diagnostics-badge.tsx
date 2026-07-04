@@ -1,22 +1,30 @@
 import { useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 import { useSystemDiagnostics } from "@/api/hooks";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import {
-  AlertTriangle, Ban, CheckCircle2, HelpCircle, ShieldAlert, XCircle,
+  AlertTriangle, Ban, CheckCircle2, ChevronRight, HelpCircle, ShieldAlert, XCircle,
 } from "lucide-react";
 import type { DiagnosticSeverity, SystemDiagnosticCheck } from "@/api/types";
 
 const SEVERITY_ORDER: DiagnosticSeverity[] = ["error", "blocked", "warning", "unknown", "ok"];
 
 const CATEGORY_LABELS: Record<string, string> = {
-  repository: "Repository",
-  database: "Database / Storage",
-  auth: "Auth / System scope",
+  repository: "リポジトリ",
+  database: "データベース / ストレージ",
+  auth: "認証 / システムスコープ",
   llm: "LLM / Intelligence",
-  pipeline: "System Understanding pipeline",
+  pipeline: "System Understanding パイプライン",
+};
+
+const SEVERITY_LABELS: Record<string, string> = {
+  ok: "正常",
+  warning: "警告",
+  error: "エラー",
+  blocked: "ブロック",
+  unknown: "未確認",
 };
 
 export function DiagnosticSeverityIcon({ severity, className = "h-4 w-4" }: {
@@ -46,33 +54,48 @@ function severityBadgeVariant(severity: string): "default" | "secondary" | "dest
   }
 }
 
-export function DiagnosticCheckCard({ check }: { check: SystemDiagnosticCheck }) {
-  return (
-    <div className="rounded-lg border p-3 space-y-2" data-testid="diagnostic-check">
+export function DiagnosticCheckCard({ check, onActivate }: {
+  check: SystemDiagnosticCheck;
+  onActivate?: (check: SystemDiagnosticCheck) => void;
+}) {
+  const interactive = !!onActivate;
+  const actionLabel =
+    check.fix_kind === "navigate" ? "修正画面を開く" : "対処方法を表示";
+
+  const body = (
+    <>
       <div className="flex items-start gap-2">
         <DiagnosticSeverityIcon severity={check.severity} />
         <div className="flex-1 min-w-0">
           <p className="text-sm font-medium">{check.title}</p>
           <div className="flex flex-wrap items-center gap-1.5 mt-1">
             <Badge variant={severityBadgeVariant(check.severity)} className="text-xs">
-              {check.severity}
+              {SEVERITY_LABELS[check.severity] ?? check.severity}
             </Badge>
             <Badge variant="outline" className="text-xs">
               {CATEGORY_LABELS[check.category] ?? check.category}
             </Badge>
           </div>
         </div>
+        {interactive && (
+          <span className="flex items-center gap-1 text-xs text-primary shrink-0" data-testid="diagnostic-fix-action">
+            {actionLabel}
+            <ChevronRight className="h-3.5 w-3.5" />
+          </span>
+        )}
       </div>
-      <p className="text-xs text-muted-foreground pl-6">{check.detail}</p>
+      <p className="text-xs text-muted-foreground pl-6">
+        <span className="font-medium text-foreground">原因: </span>{check.detail}
+      </p>
       {check.impact && (
         <p className="text-xs pl-6">
-          <span className="font-medium">Impact:</span>{" "}
+          <span className="font-medium">影響:</span>{" "}
           <span className="text-muted-foreground">{check.impact}</span>
         </p>
       )}
       {check.remediation && (
         <p className="text-xs pl-6" data-testid="diagnostic-remediation">
-          <span className="font-medium">Fix:</span>{" "}
+          <span className="font-medium">対処:</span>{" "}
           <span className="text-muted-foreground">{check.remediation}</span>
         </p>
       )}
@@ -98,7 +121,7 @@ export function DiagnosticCheckCard({ check }: { check: SystemDiagnosticCheck })
           data-testid="diagnostic-last-error"
         >
           <p className="text-[11px] font-medium">
-            Last observed error ({check.last_observed_error.source}
+            直近のエラー ({check.last_observed_error.source}
             {check.last_observed_error.observed_at
               ? ` — ${new Date(check.last_observed_error.observed_at * 1000).toLocaleString()}`
               : ""})
@@ -108,20 +131,100 @@ export function DiagnosticCheckCard({ check }: { check: SystemDiagnosticCheck })
           </p>
         </div>
       )}
-      {check.related_pages.length > 0 && (
-        <div className="pl-6 flex flex-wrap gap-2">
-          {check.related_pages.map((page) => (
-            <Link key={page} to={page} className="text-xs text-primary hover:underline">
-              {page}
-            </Link>
-          ))}
-        </div>
-      )}
+    </>
+  );
+
+  if (interactive) {
+    return (
+      <div
+        role="button"
+        tabIndex={0}
+        onClick={() => onActivate!(check)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            onActivate!(check);
+          }
+        }}
+        className="w-full text-left rounded-lg border p-3 space-y-2 cursor-pointer hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        data-testid="diagnostic-check"
+      >
+        {body}
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-lg border p-3 space-y-2" data-testid="diagnostic-check">
+      {body}
     </div>
   );
 }
 
-export function DiagnosticsDialogContent({ checks }: { checks: SystemDiagnosticCheck[] }) {
+function EnvFixDialog({ check, onClose }: { check: SystemDiagnosticCheck | null; onClose: () => void }) {
+  return (
+    <Dialog open={!!check} onOpenChange={(o) => { if (!o) onClose(); }}>
+      {check && (
+        <>
+          <DialogHeader>
+            <DialogTitle>環境設定の対応が必要です</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3 text-sm" data-testid="diagnostic-env-dialog">
+            <div className="flex items-center gap-2">
+              <DiagnosticSeverityIcon severity={check.severity} />
+              <p className="font-medium">{check.title}</p>
+            </div>
+            <p className="text-muted-foreground">
+              <span className="font-medium text-foreground">原因: </span>{check.detail}
+            </p>
+            {check.impact && (
+              <p className="text-muted-foreground">
+                <span className="font-medium text-foreground">影響: </span>{check.impact}
+              </p>
+            )}
+            {check.remediation && (
+              <p className="text-muted-foreground">
+                <span className="font-medium text-foreground">対処: </span>{check.remediation}
+              </p>
+            )}
+            {check.related_env.length > 0 && (
+              <div className="space-y-1">
+                <p className="text-xs font-medium">設定が必要な環境変数</p>
+                <div className="flex flex-wrap gap-1">
+                  {check.related_env.map((env) => (
+                    <code key={env} className="text-[11px] bg-muted px-1.5 py-0.5 rounded font-mono">
+                      {env}
+                    </code>
+                  ))}
+                </div>
+              </div>
+            )}
+            <p className="text-xs text-muted-foreground rounded border bg-muted/40 p-2">
+              この問題は画面上では修正できません。上記の環境変数を <code className="font-mono">.env</code>{" "}
+              などで設定し、Control Server を再起動してから、該当する処理（snapshot 作成や
+              System Understanding のビルドなど）を再実行してください。
+            </p>
+            {check.last_observed_error && (
+              <div className="rounded border border-destructive/40 bg-destructive/5 p-2 space-y-1">
+                <p className="text-[11px] font-medium">
+                  直近のエラー ({check.last_observed_error.source})
+                </p>
+                <p className="text-[11px] font-mono whitespace-pre-wrap break-all text-muted-foreground">
+                  {check.last_observed_error.error ?? `status: ${check.last_observed_error.status}`}
+                </p>
+              </div>
+            )}
+          </div>
+        </>
+      )}
+    </Dialog>
+  );
+}
+
+export function DiagnosticsDialogContent({ checks, onActivate }: {
+  checks: SystemDiagnosticCheck[];
+  onActivate?: (check: SystemDiagnosticCheck) => void;
+}) {
   const sorted = useMemo(
     () =>
       [...checks].sort(
@@ -136,19 +239,25 @@ export function DiagnosticsDialogContent({ checks }: { checks: SystemDiagnosticC
     <div className="space-y-4">
       {problems.length === 0 ? (
         <p className="text-sm text-muted-foreground">
-          All configuration checks passed. No required settings are missing or invalid.
+          すべての設定チェックに合格しました。不足・不正な必須設定はありません。
         </p>
       ) : (
-        <div className="space-y-2" data-testid="diagnostics-problems">
-          {problems.map((c) => (
-            <DiagnosticCheckCard key={c.check_id} check={c} />
-          ))}
-        </div>
+        <>
+          <p className="text-xs text-muted-foreground">
+            各項目をクリックすると、修正できる問題は該当画面へ移動します。画面で直接
+            修正できない設定はダイアログで対応手順を表示します。
+          </p>
+          <div className="space-y-2" data-testid="diagnostics-problems">
+            {problems.map((c) => (
+              <DiagnosticCheckCard key={c.check_id} check={c} onActivate={onActivate} />
+            ))}
+          </div>
+        </>
       )}
       {healthy.length > 0 && (
         <div>
           <p className="text-xs font-medium text-muted-foreground mb-1.5">
-            Passing checks
+            正常なチェック
           </p>
           <ul className="space-y-1">
             {healthy.map((c) => (
@@ -161,8 +270,8 @@ export function DiagnosticsDialogContent({ checks }: { checks: SystemDiagnosticC
         </div>
       )}
       <p className="text-[11px] text-muted-foreground">
-        All checks are deterministic (no LLM). Runtime failures are shown from
-        the most recent recorded run.
+        すべてのチェックは決定的（LLM 不使用）です。実行時の失敗は直近の実行記録から
+        そのまま表示しています。
       </p>
     </div>
   );
@@ -171,6 +280,8 @@ export function DiagnosticsDialogContent({ checks }: { checks: SystemDiagnosticC
 export function DiagnosticsBadge() {
   const { data } = useSystemDiagnostics();
   const [open, setOpen] = useState(false);
+  const [envCheck, setEnvCheck] = useState<SystemDiagnosticCheck | null>(null);
+  const navigate = useNavigate();
 
   if (!data) return null;
 
@@ -178,6 +289,18 @@ export function DiagnosticsBadge() {
     (data.severity_counts["error"] ?? 0) + (data.severity_counts["blocked"] ?? 0);
   const warningCount = data.severity_counts["warning"] ?? 0;
   const attention = errorCount + warningCount;
+
+  const activate = (check: SystemDiagnosticCheck) => {
+    if (check.fix_kind === "navigate" && check.fix_page) {
+      const params = new URLSearchParams();
+      params.set("diagnostic", check.check_id);
+      if (check.fix_anchor) params.set("fix", check.fix_anchor);
+      setOpen(false);
+      navigate(`${check.fix_page}?${params.toString()}`);
+    } else {
+      setEnvCheck(check);
+    }
+  };
 
   return (
     <>
@@ -213,8 +336,9 @@ export function DiagnosticsBadge() {
         <DialogHeader>
           <DialogTitle>System Settings Diagnostics</DialogTitle>
         </DialogHeader>
-        <DiagnosticsDialogContent checks={data.checks} />
+        <DiagnosticsDialogContent checks={data.checks} onActivate={activate} />
       </Dialog>
+      <EnvFixDialog check={envCheck} onClose={() => setEnvCheck(null)} />
     </>
   );
 }

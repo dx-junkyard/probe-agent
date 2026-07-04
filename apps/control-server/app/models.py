@@ -2372,6 +2372,10 @@ class SystemDiagnosticCheckOut(BaseModel):
     related_pipeline_steps: List[str] = Field(default_factory=list)
     last_observed_error: Optional[DiagnosticLastObservedErrorOut] = None
     decision_method: Literal["deterministic"] = "deterministic"
+    # Issue #115: where the user fixes the problem.
+    fix_kind: Literal["navigate", "dialog"] = "dialog"
+    fix_page: Optional[str] = None
+    fix_anchor: Optional[str] = None
 
 
 class SystemDiagnosticsOut(BaseModel):

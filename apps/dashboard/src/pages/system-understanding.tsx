@@ -24,6 +24,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Select } from "@/components/ui/select";
 import { Label } from "@/components/ui/label";
 import { DiagnosticCheckCard } from "@/components/diagnostics-badge";
+import { useDiagnosticHighlight, DiagnosticFixCallout } from "@/components/diagnostic-fix";
 import { toast } from "sonner";
 import {
   CheckCircle2, XCircle, AlertTriangle, Ban, HelpCircle,
@@ -1128,6 +1129,7 @@ export default function SystemUnderstandingPage() {
   const settledBuildId = useRef<number | null>(null);
 
   const buildRunning = latestBuild?.status === "queued" || latestBuild?.status === "running";
+  const buildHighlight = useDiagnosticHighlight<HTMLButtonElement>("build");
 
   // Refresh the aggregated view and diagnostics once a build job settles.
   useEffect(() => {
@@ -1162,6 +1164,7 @@ export default function SystemUnderstandingPage() {
           </p>
         </div>
         <Button
+          {...buildHighlight}
           onClick={() => build.mutate()}
           disabled={build.isPending || buildRunning}
           variant="default"
@@ -1180,6 +1183,8 @@ export default function SystemUnderstandingPage() {
           )}
         </Button>
       </div>
+
+      <DiagnosticFixCallout anchor="build" />
 
       {latestBuild && (buildRunning || latestBuild.is_stuck ||
         latestBuild.status === "failed" || latestBuild.status === "partial" ||

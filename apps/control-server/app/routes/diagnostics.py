@@ -52,6 +52,9 @@ def get_system_diagnostics(
                 else None
             ),
             decision_method="deterministic",
+            fix_kind=c.fix_kind,
+            fix_page=c.fix_page,
+            fix_anchor=c.fix_anchor,
         )
         for c in report.checks
     ]
