@@ -697,6 +697,32 @@ class TestNextActionsPriority:
         assert "Index code symbols" in labels
         assert "Define System Purpose" not in labels
 
+    def test_claim_scan_blocked_does_not_offer_exploration(self):
+        from app.system_understanding_service import MetadataCoverage, _build_next_actions
+
+        actions = _build_next_actions(
+            self._incomplete_pipeline("documentation_claims_scanned"),
+            purpose={"name": "Sys", "summary": "Does things"},
+            capabilities=[{"name": "Cap"}],
+            metadata_coverage=MetadataCoverage(symbol_count=10, symbols_with_source_metadata=10),
+            gap_count=0,
+        )
+        labels = [a.action for a in actions]
+        assert labels == ["Scan documentation claims"]
+
+    def test_docs_code_reconcile_missing_does_not_offer_exploration(self):
+        from app.system_understanding_service import MetadataCoverage, _build_next_actions
+
+        actions = _build_next_actions(
+            self._incomplete_pipeline("docs_code_reconciled"),
+            purpose={"name": "Sys", "summary": "Does things"},
+            capabilities=[{"name": "Cap"}],
+            metadata_coverage=MetadataCoverage(symbol_count=10, symbols_with_source_metadata=10),
+            gap_count=0,
+        )
+        labels = [a.action for a in actions]
+        assert labels == ["Reconcile docs and code"]
+
     def test_complete_pipeline_without_purpose_is_top_priority(self):
         from app.system_understanding_service import _build_next_actions
 

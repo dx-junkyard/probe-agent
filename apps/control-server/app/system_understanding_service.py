@@ -718,11 +718,25 @@ def _build_next_actions(
             link="/system-understanding",
         ))
 
+    if step_map.get("documentation_claims_scanned") != "complete":
+        actions.append(NextAction(
+            action="Scan documentation claims",
+            reason="Documentation claims have not been scanned",
+            link="/system-understanding",
+        ))
+
     if step_map.get("entrypoints_discovered") != "complete":
         actions.append(NextAction(
             action="Discover entrypoints",
             reason="API/CLI/queue entrypoints have not been discovered",
             link="/flow-explorer",
+        ))
+
+    if step_map.get("docs_code_reconciled") != "complete":
+        actions.append(NextAction(
+            action="Reconcile docs and code",
+            reason="Documentation and code have not been reconciled",
+            link="/system-understanding",
         ))
 
     if step_map.get("capability_hierarchy_ready") != "complete":
@@ -737,7 +751,7 @@ def _build_next_actions(
     # complete, a completed pipeline is not the same as a usable system
     # understanding — System Purpose and main capabilities are the highest
     # priority next actions, ahead of metadata coverage and docs-code gaps.
-    pipeline_complete = not actions
+    pipeline_complete = all(s.status == "complete" for s in pipeline)
 
     if pipeline_complete:
         purpose_defined = bool(purpose and (purpose.get("summary") or purpose.get("name")))
