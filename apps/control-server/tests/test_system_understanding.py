@@ -55,6 +55,34 @@ def _headers(token, system_id):
     return {**_bearer(token), "X-Probe-System-Id": str(system_id)}
 
 
+def _build_and_wait(client, hdrs, timeout=10.0):
+    """Trigger a system understanding build and poll until it settles.
+
+    Issue #106: the build endpoint is asynchronous (returns 202 immediately
+    with a build id) so tests must poll the build-status endpoint instead of
+    expecting the aggregated result inline.
+    """
+    r = client.post("/repository/system-understanding/build", headers=hdrs)
+    assert r.status_code == 202, r.text
+    build = r.json()
+    build_id = build["id"]
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status_r = client.get(
+            f"/repository/system-understanding/build/{build_id}", headers=hdrs
+        )
+        assert status_r.status_code == 200, status_r.text
+        build = status_r.json()
+        if build["status"] in ("completed", "failed"):
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail(f"Build {build_id} did not settle within {timeout}s: {build}")
+
+    return build
+
+
 def _init_git_repo(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -151,7 +179,10 @@ class TestSystemUnderstandingBuild:
         )
         assert snap_r.status_code == 201
 
-        r = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        build = _build_and_wait(admin_client, hdrs)
+        assert build["status"] == "completed"
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
         assert r.status_code == 200
         data = r.json()
 
@@ -183,7 +214,8 @@ class TestSystemUnderstandingReportsReasoningModelBlocked:
             headers=hdrs,
         )
 
-        r = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        _build_and_wait(admin_client, hdrs)
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
         assert r.status_code == 200
         data = r.json()
 
@@ -214,7 +246,8 @@ class TestSystemUnderstandingReportsMetadataCoverage:
             headers=hdrs,
         )
 
-        r = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        _build_and_wait(admin_client, hdrs)
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
         assert r.status_code == 200
         data = r.json()
 
@@ -317,7 +350,8 @@ class TestGapWorklist:
             headers=hdrs,
         )
 
-        r = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        _build_and_wait(admin_client, hdrs)
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
         assert r.status_code == 200
         data = r.json()
 
@@ -350,7 +384,8 @@ class TestGapWorklist:
             headers=hdrs,
         )
 
-        r1 = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        _build_and_wait(admin_client, hdrs)
+        r1 = admin_client.get("/repository/system-understanding", headers=hdrs)
         r2 = admin_client.get("/repository/system-understanding", headers=hdrs)
         assert r1.status_code == 200
         assert r2.status_code == 200
@@ -385,7 +420,8 @@ class TestGapWorklist:
             headers=hdrs,
         )
 
-        r = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        _build_and_wait(admin_client, hdrs)
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
         assert r.status_code == 200
         data = r.json()
 
@@ -431,10 +467,8 @@ class TestIntelligenceRunStatusContract:
         admin_client.post(
             "/repository/snapshots", json={"commit_sha": sha}, headers=hdrs
         )
-        r = admin_client.post(
-            "/repository/system-understanding/build", headers=hdrs
-        )
-        assert r.status_code == 200
+        build = _build_and_wait(admin_client, hdrs)
+        assert build["status"] == "completed"
         return hdrs
 
     def test_build_writes_contract_statuses_only(self, admin_client, tmp_path):
@@ -508,3 +542,79 @@ class TestIntelligenceRunStatusContract:
             "/repository/capability-hierarchy", headers=hdrs
         )
         assert hierarchy.status_code == 200, hierarchy.text
+
+
+class TestBuildDoesNotBlockOtherRequests:
+    """Regression tests for Issue #106: a slow/hanging build step must not
+    make /health, /auth/me, or /systems become unresponsive."""
+
+    def test_build_runs_in_background_and_stays_responsive(
+        self, admin_client, tmp_path, monkeypatch
+    ):
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "async-build-sys")
+        hdrs = _headers(token, sys["id"])
+        repo, sha = _init_git_repo(tmp_path)
+
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        admin_client.post(
+            "/repository/snapshots", json={"commit_sha": sha}, headers=hdrs
+        )
+
+        # Simulate a slow/hanging reasoning-model call during the
+        # documentation step: this used to run inside the single
+        # get_conn() block held for the whole build, starving every other
+        # request of the shared sqlite lock.
+        import app.system_understanding_service as sus
+        import app.documentation_claim_scanner as scanner_module
+
+        monkeypatch.setattr(sus, "_is_reasoning_model_available", lambda: True)
+
+        def _slow_scan_all_chunks(client, config, chunks):
+            time.sleep(1.0)
+            return []
+
+        monkeypatch.setattr(scanner_module, "scan_all_chunks", _slow_scan_all_chunks)
+
+        build_r = admin_client.post(
+            "/repository/system-understanding/build", headers=hdrs
+        )
+        assert build_r.status_code == 202, build_r.text
+        build_id = build_r.json()["id"]
+
+        # Give the background thread a moment to reach the slow step, then
+        # verify unrelated endpoints (including DB-backed ones) respond
+        # quickly instead of queueing behind a held connection lock.
+        time.sleep(0.2)
+        for _ in range(5):
+            started = time.time()
+            health_r = admin_client.get("/health")
+            me_r = admin_client.get("/auth/me", headers=_bearer(token))
+            systems_r = admin_client.get("/systems", headers=_bearer(token))
+            elapsed = time.time() - started
+
+            assert health_r.status_code == 200
+            assert me_r.status_code == 200
+            assert systems_r.status_code == 200
+            assert elapsed < 0.5, (
+                f"unrelated requests took {elapsed:.2f}s while a build was "
+                "running; the shared DB lock is likely held across the slow step"
+            )
+
+        # The build itself should still complete once the slow step returns.
+        deadline = time.time() + 10.0
+        status = None
+        while time.time() < deadline:
+            status_r = admin_client.get(
+                f"/repository/system-understanding/build/{build_id}", headers=hdrs
+            )
+            assert status_r.status_code == 200
+            status = status_r.json()["status"]
+            if status in ("completed", "failed"):
+                break
+            time.sleep(0.05)
+        assert status == "completed"

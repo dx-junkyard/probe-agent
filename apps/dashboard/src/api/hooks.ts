@@ -20,12 +20,13 @@ import type {
   InterviewProposalMetadataBlock, InterviewProposalProbePlan,
   InterviewApprovedSetOut, InterviewMaterializeOut,
   SystemUnderstandingOut,
+  SystemUnderstandingBuildOut,
   SystemDiagnosticsOut,
   AssistantScreenContext, AssistantAskRequest, AssistantAskOut,
   AssistantSettingsMetadataOut,
 } from "./types";
 
-function sysKey(base: string, ...extra: unknown[]) {
+export function sysKey(base: string, ...extra: unknown[]) {
   return [base, getSystemId(), ...extra];
 }
 
@@ -800,10 +801,28 @@ export function useSystemUnderstanding() {
 export function useBuildSystemUnderstanding() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: () => api.post<SystemUnderstandingOut>("/repository/system-understanding/build"),
+    mutationFn: () =>
+      api.post<SystemUnderstandingBuildOut>("/repository/system-understanding/build"),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: sysKey("system-understanding") });
-      qc.invalidateQueries({ queryKey: sysKey("system-diagnostics") });
+      qc.invalidateQueries({ queryKey: sysKey("system-understanding-build") });
+    },
+  });
+}
+
+/** Polls the latest system understanding build until it settles, so the
+ * dashboard can show progress instead of blocking on one long request
+ * (Issue #106). Callers should invalidate `system-understanding` and
+ * `system-diagnostics` once `status` transitions to "completed" or "failed". */
+export function useLatestSystemUnderstandingBuild() {
+  return useQuery({
+    queryKey: sysKey("system-understanding-build"),
+    queryFn: () =>
+      api.get<SystemUnderstandingBuildOut | null>("/repository/system-understanding/build/latest"),
+    enabled: !!getSystemId(),
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+      if (status === "queued" || status === "running") return 2000;
+      return false;
     },
   });
 }

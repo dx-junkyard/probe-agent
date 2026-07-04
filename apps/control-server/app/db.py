@@ -1108,6 +1108,23 @@ CREATE TABLE IF NOT EXISTS understanding_graph_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_understanding_graph_system
     ON understanding_graph_snapshots (system_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS system_understanding_builds (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id     INTEGER NOT NULL,
+    snapshot_id   INTEGER,
+    status        TEXT NOT NULL DEFAULT 'queued',
+    current_step  TEXT,
+    error         TEXT,
+    started_at    REAL,
+    completed_at  REAL,
+    created_at    REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_builds_system
+    ON system_understanding_builds (system_id, id DESC);
 """
 
 
