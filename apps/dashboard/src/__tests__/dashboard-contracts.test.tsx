@@ -2079,7 +2079,7 @@ describe("System settings diagnostics", () => {
     system_id: 1,
     generated_at: 1750000000,
     overall_severity: "error",
-    severity_counts: { ok: 3, warning: 1, error: 1, blocked: 1, unknown: 0 },
+    severity_counts: { ok: 3, warning: 2, error: 1, blocked: 0, unknown: 0 },
     checks: [
       {
         check_id: "intelligence_llm_config",
@@ -2087,12 +2087,12 @@ describe("System settings diagnostics", () => {
         title: "Intelligence reasoning model configuration",
         severity: "error",
         detail: "model 'gpt-5.4' configured but INTELLIGENCE_LLM_PROVIDER is empty.",
-        impact: "Documentation indexing and capability hierarchy stay blocked.",
+        impact: "Claim scanning and capability hierarchy stay blocked.",
         remediation: "Set INTELLIGENCE_LLM_PROVIDER and INTELLIGENCE_LLM_MODEL to a reasoning-capable pair.",
         related_env: ["INTELLIGENCE_LLM_PROVIDER", "INTELLIGENCE_LLM_MODEL"],
         related_paths: [],
         related_pages: ["/system-understanding"],
-        related_pipeline_steps: ["documentation_indexed", "capability_hierarchy_ready"],
+        related_pipeline_steps: ["documentation_claims_scanned", "capability_hierarchy_ready"],
         last_observed_error: {
           source: "intelligence_runs#12:repository_drafts",
           status: "failed",
@@ -2119,11 +2119,11 @@ describe("System settings diagnostics", () => {
       {
         check_id: "pipeline_documentation_index",
         category: "pipeline",
-        title: "Documentation index run",
-        severity: "blocked",
-        detail: "This step has never run and requires a reasoning model, which is not configured.",
-        impact: "The step shows as blocked/missing in System Understanding.",
-        remediation: "Fix the intelligence reasoning model configuration, then run a build.",
+        title: "Documentation index build step",
+        severity: "warning",
+        detail: "This build step has not run for the current snapshot.",
+        impact: "The step shows as missing in System Understanding.",
+        remediation: "Run Build / Refresh in System Understanding to index documentation chunks.",
         related_env: [],
         related_paths: [],
         related_pages: ["/system-understanding"],
@@ -2160,7 +2160,7 @@ describe("System settings diagnostics", () => {
     render(<DiagnosticsBadge />, { wrapper: createWrapper() });
 
     const badge = await screen.findByTestId("diagnostics-badge");
-    // error(1) + blocked(1) + warning(1) = 3
+    // error(1) + warning(2) = 3
     expect(screen.getByTestId("diagnostics-badge-count").textContent).toBe("3");
 
     fireEvent.click(badge);
@@ -2235,17 +2235,17 @@ describe("System settings diagnostics", () => {
     const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
 
-    // documentation_indexed is missing and has two related diagnostics.
+    // documentation_indexed is missing and has a dedicated build-step diagnostic.
     const diagnoseButton = await screen.findByTestId("pipeline-diagnose-documentation_indexed");
-    expect(diagnoseButton.textContent).toContain("2");
+    expect(diagnoseButton.textContent).toContain("1");
 
     // Complete steps get no diagnose button even if a check references them.
     expect(screen.queryByTestId("pipeline-diagnose-snapshot_ready")).toBeNull();
 
     fireEvent.click(diagnoseButton);
     const expanded = await screen.findByTestId("pipeline-diagnostics-documentation_indexed");
-    expect(expanded.textContent).toContain("INTELLIGENCE_LLM_PROVIDER is empty");
-    expect(expanded.textContent).toContain("HTTP 401: invalid api key");
+    expect(expanded.textContent).toContain("Documentation index build step");
+    expect(expanded.textContent).toContain("Run Build / Refresh");
   });
 });
 

@@ -106,7 +106,7 @@ Pipeline checklist の各ステップ status を確認する:
 | `snapshot_ready` | `complete` | Step 3 で作成済み |
 | `symbols_indexed` | `complete` | Step 4 で実行済み |
 | `entrypoints_discovered` | `complete` | API route handler が検出される |
-| `documentation_indexed` | `complete` or `blocked` | reasoning model 依存 |
+| `documentation_indexed` | `complete` or `warning` | deterministic chunk index |
 | `documentation_claims_scanned` | `complete` or `blocked` | reasoning model 依存 |
 | `docs_code_reconciled` | `complete` or `warning` | gap がある場合 `warning` |
 | `capability_hierarchy_ready` | `complete` or `blocked` | reasoning model 依存 |
@@ -118,7 +118,7 @@ Dashboard の System Understanding ページを開く (`http://localhost:5173` >
 確認事項:
 
 - Pipeline の各ステップが Step 5 の期待通りの status で表示されること
-- reasoning model 未設定の場合、`documentation_indexed` と `documentation_claims_scanned` が `blocked` であること
+- reasoning model 未設定の場合、`documentation_claims_scanned` が `blocked` であること
 - `blocked` のステップには detail に理由が表示されること
 - Next Actions に未完了ステップへの対処が示されること
 
@@ -247,8 +247,8 @@ System Understanding
 
 ### reasoning model 未設定で `blocked` になるステップがある
 
-`documentation_indexed`, `documentation_claims_scanned`, `capability_hierarchy_ready` は reasoning model を必要とする。
-これらが `blocked` の場合でも、決定的ステップ (`symbols_indexed`, `entrypoints_discovered`) と source-authored metadata に基づく Capability Map は検証可能である。
+`documentation_claims_scanned`, `capability_hierarchy_ready` は reasoning model を必要とする。
+これらが `blocked` の場合でも、決定的ステップ (`documentation_indexed`, `symbols_indexed`, `entrypoints_discovered`) と source-authored metadata に基づく Capability Map は検証可能である。
 
 ### symbols_with_source_metadata が 0 になる
 

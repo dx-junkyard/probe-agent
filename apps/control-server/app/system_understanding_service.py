@@ -118,6 +118,39 @@ def _is_reasoning_model_available() -> bool:
 def _check_documentation_indexed(conn, system_id: int, snapshot_id: Optional[int]) -> PipelineStep:
     if snapshot_id is None:
         return PipelineStep("documentation_indexed", "missing")
+    job_step = conn.execute(
+        """SELECT status, error, artifact_provenance
+           FROM system_understanding_build_steps
+           WHERE system_id = ? AND snapshot_id = ? AND step = 'documentation_index'
+           ORDER BY id DESC LIMIT 1""",
+        (system_id, snapshot_id),
+    ).fetchone()
+    if job_step:
+        if job_step["status"] == "completed":
+            try:
+                provenance = json.loads(job_step["artifact_provenance"] or "{}")
+            except json.JSONDecodeError:
+                provenance = {}
+            chunk_count = provenance.get("chunk_count")
+            if isinstance(chunk_count, int) and chunk_count == 0:
+                return PipelineStep(
+                    "documentation_indexed",
+                    "warning",
+                    detail="No documentation chunks found",
+                )
+            return PipelineStep("documentation_indexed", "complete")
+        if job_step["status"] == "failed":
+            return PipelineStep(
+                "documentation_indexed",
+                "failed",
+                detail=job_step["error"] or "documentation_index failed",
+            )
+        if job_step["status"] == "blocked":
+            return PipelineStep(
+                "documentation_indexed",
+                "blocked",
+                detail=job_step["error"] or "documentation_index blocked",
+            )
     row = conn.execute(
         "SELECT id, status FROM intelligence_runs WHERE system_id = ? AND run_type IN ('draft_generation', 'repository_drafts') AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
         (system_id, snapshot_id),
@@ -126,8 +159,6 @@ def _check_documentation_indexed(conn, system_id: int, snapshot_id: Optional[int
         if row["status"] == "completed":
             return PipelineStep("documentation_indexed", "complete")
         return PipelineStep("documentation_indexed", "failed", detail=f"run status: {row['status']}")
-    if not _is_reasoning_model_available():
-        return PipelineStep("documentation_indexed", "blocked", detail="Reasoning model not configured")
     return PipelineStep("documentation_indexed", "missing")
 
 
@@ -634,9 +665,9 @@ def _build_next_actions(pipeline: List[PipelineStep], metadata_coverage: Optiona
 
     if step_map.get("documentation_indexed") != "complete":
         actions.append(NextAction(
-            action="Generate drafts",
-            reason="Documentation has not been indexed into drafts",
-            link="/repository",
+            action="Build documentation index",
+            reason="Documentation files have not been indexed into chunks",
+            link="/system-understanding",
         ))
 
     if step_map.get("entrypoints_discovered") != "complete":

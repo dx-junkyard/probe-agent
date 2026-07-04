@@ -222,12 +222,40 @@ class TestSystemUnderstandingReportsReasoningModelBlocked:
         data = r.json()
 
         pipeline = {s["step"]: s["status"] for s in data["pipeline"]}
-        # Documentation indexed and claims scanned require reasoning model
-        # They should be blocked when no reasoning model is configured
-        assert pipeline["documentation_indexed"] == "blocked"
+        # Documentation indexing is deterministic; claim scanning is the first
+        # documentation step that requires a reasoning model.
+        assert pipeline["documentation_indexed"] == "complete"
         assert pipeline["documentation_claims_scanned"] == "blocked"
         # Capability hierarchy has a deterministic base that runs without reasoning
         assert pipeline["capability_hierarchy_ready"] in ("complete", "blocked")
+
+    def test_documentation_indexed_reflects_build_step_not_draft_generation(
+        self, admin_client, tmp_path
+    ):
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "doc-index-step-sys")
+        hdrs = _headers(token, sys["id"])
+        repo, sha = _init_git_repo(tmp_path)
+
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        admin_client.post(
+            "/repository/snapshots",
+            json={"commit_sha": sha},
+            headers=hdrs,
+        )
+
+        build = _build_and_wait(admin_client, hdrs)
+        steps = {s["step"]: s for s in build["steps"]}
+        assert steps["documentation_index"]["status"] == "completed"
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200
+        pipeline = {s["step"]: s["status"] for s in r.json()["pipeline"]}
+        assert pipeline["documentation_indexed"] == "complete"
 
 
 class TestSystemUnderstandingReportsMetadataCoverage:

@@ -549,7 +549,6 @@ def _check_intelligence_llm_config() -> DiagnosticCheck:
         "LLM_MODEL",
     ]
     reasoning_steps = [
-        "documentation_indexed",
         "documentation_claims_scanned",
         "docs_code_reconciled",
         "capability_hierarchy_ready",
@@ -632,7 +631,7 @@ def _check_intelligence_llm_config() -> DiagnosticCheck:
         severity=severity,
         detail=detail,
         impact=(
-            "Documentation indexing, claim scanning, docs-code reconciliation, "
+            "Claim scanning, docs-code reconciliation, "
             "and capability hierarchy generation fail or stay blocked without a "
             "valid reasoning model; there is no heuristic fallback."
             if severity in ("error", "blocked", "warning")
@@ -887,6 +886,76 @@ def _artifact_backed_pipeline_check(
     )
 
 
+def _build_step_pipeline_check(
+    conn,
+    system_id: int,
+    snapshot_id: Optional[int],
+    *,
+    check_id: str,
+    title: str,
+    step: str,
+    pipeline_steps: List[str],
+    not_run_remediation: str,
+) -> DiagnosticCheck:
+    base = dict(
+        check_id=check_id,
+        category="pipeline",
+        title=title,
+        related_pages=["/system-understanding"],
+        related_pipeline_steps=pipeline_steps,
+    )
+    if snapshot_id is None:
+        return DiagnosticCheck(
+            severity="blocked",
+            detail="No ready snapshot exists, so this step cannot run.",
+            impact="The step stays missing until a snapshot is created.",
+            remediation="Create a snapshot from the Repository tab first.",
+            **base,
+        )
+    row = conn.execute(
+        """SELECT id, status, error, completed_at, started_at
+           FROM system_understanding_build_steps
+           WHERE system_id = ? AND snapshot_id = ? AND step = ?
+           ORDER BY id DESC LIMIT 1""",
+        (system_id, snapshot_id, step),
+    ).fetchone()
+    if row is None:
+        return DiagnosticCheck(
+            severity="warning",
+            detail="This build step has not run for the current snapshot.",
+            impact="The step shows as missing in System Understanding.",
+            remediation=not_run_remediation,
+            **base,
+        )
+    if row["status"] == "completed":
+        return DiagnosticCheck(
+            severity="ok",
+            detail=f"Latest build step (#{row['id']}, {step}) completed.",
+            impact="",
+            remediation="",
+            **base,
+        )
+    if row["status"] == "blocked":
+        severity = "blocked"
+    elif row["status"] in ("failed", "cancelled"):
+        severity = "error"
+    else:
+        severity = "warning"
+    return DiagnosticCheck(
+        severity=severity,
+        detail=f"Latest build step (#{row['id']}, {step}) has status '{row['status']}'.",
+        impact="The step's artifacts are missing or stale.",
+        remediation="Read the build step error below, fix the root cause, and re-run the build.",
+        last_observed_error=LastObservedError(
+            source=f"system_understanding_build_steps#{row['id']}:{step}",
+            status=row["status"],
+            error=row["error"],
+            observed_at=row["completed_at"] or row["started_at"],
+        ),
+        **base,
+    )
+
+
 def run_system_diagnostics(system_id: int) -> SystemDiagnosticsReport:
     """Run all deterministic settings/health checks for one system."""
     from .system_understanding_service import _is_reasoning_model_available
@@ -931,15 +1000,13 @@ def run_system_diagnostics(system_id: int) -> SystemDiagnosticsReport:
             )
         )
         checks.append(
-            _run_backed_pipeline_check(
+            _build_step_pipeline_check(
                 conn, system_id, snapshot_id,
                 check_id="pipeline_documentation_index",
-                title="Documentation index run",
-                run_types=["draft_generation", "repository_drafts"],
+                title="Documentation index build step",
+                step="documentation_index",
                 pipeline_steps=["documentation_indexed"],
-                requires_reasoning=True,
-                reasoning_available=reasoning_available,
-                not_run_remediation="Generate drafts from the Repository tab or run Build / Refresh.",
+                not_run_remediation="Run Build / Refresh in System Understanding to index documentation chunks.",
             )
         )
         checks.append(
