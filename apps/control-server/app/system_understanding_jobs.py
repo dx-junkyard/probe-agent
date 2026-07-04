@@ -304,6 +304,23 @@ def _mark_step(
         )
 
 
+def _fail_job_without_snapshot(build_id: int, error: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """UPDATE system_understanding_build_steps
+               SET status = 'blocked', error = 'No ready snapshot'
+               WHERE build_id = ? AND status = 'pending'""",
+            (build_id,),
+        )
+        conn.execute(
+            """UPDATE system_understanding_builds
+               SET status = 'failed', error = ?, current_step = NULL, completed_at = ?
+               WHERE id = ?""",
+            (error, time.time(), build_id),
+        )
+        _close_open_runs(conn, build_id, "failed")
+
+
 def _execute_job(build_id: int, system_id: int) -> None:
     from .system_understanding_service import _get_latest_ready_snapshot
 
@@ -316,34 +333,46 @@ def _execute_job(build_id: int, system_id: int) -> None:
                WHERE id = ?""",
             (now, now, build_id),
         )
-        snapshot_row = _get_latest_ready_snapshot(conn, system_id)
+        job = conn.execute(
+            "SELECT snapshot_id FROM system_understanding_builds WHERE id = ?",
+            (build_id,),
+        ).fetchone()
+        # The snapshot the job was created with is authoritative: a retry or
+        # resume must run against the same pinned snapshot even if a newer
+        # ready snapshot has appeared since (Issue #109: jobs bind to a
+        # snapshot_id). Only jobs created without any ready snapshot fall
+        # back to the latest one available now.
+        snapshot_id = job["snapshot_id"]
+        if snapshot_id is not None:
+            snapshot_row = conn.execute(
+                "SELECT * FROM repository_snapshots "
+                "WHERE id = ? AND system_id = ? AND status = 'ready'",
+                (snapshot_id, system_id),
+            ).fetchone()
+        else:
+            snapshot_row = _get_latest_ready_snapshot(conn, system_id)
+            if snapshot_row is not None:
+                conn.execute(
+                    "UPDATE system_understanding_builds SET snapshot_id = ? WHERE id = ?",
+                    (snapshot_row["id"], build_id),
+                )
         if snapshot_row is not None:
-            conn.execute(
-                "UPDATE system_understanding_builds SET snapshot_id = COALESCE(snapshot_id, ?) WHERE id = ?",
-                (snapshot_row["id"], build_id),
-            )
             conn.execute(
                 "UPDATE system_understanding_build_steps SET snapshot_id = COALESCE(snapshot_id, ?) WHERE build_id = ?",
                 (snapshot_row["id"], build_id),
             )
 
     if snapshot_row is None:
-        with get_conn() as conn:
-            conn.execute(
-                """UPDATE system_understanding_build_steps
-                   SET status = 'blocked', error = 'No ready snapshot'
-                   WHERE build_id = ? AND status = 'pending'""",
-                (build_id,),
+        if snapshot_id is not None:
+            _fail_job_without_snapshot(
+                build_id,
+                f"Snapshot {snapshot_id} is no longer available; start a new build",
             )
-            conn.execute(
-                """UPDATE system_understanding_builds
-                   SET status = 'failed',
-                       error = 'No ready repository snapshot; create a snapshot first',
-                       current_step = NULL, completed_at = ?
-                   WHERE id = ?""",
-                (time.time(), build_id),
+        else:
+            _fail_job_without_snapshot(
+                build_id,
+                "No ready repository snapshot; create a snapshot first",
             )
-            _close_open_runs(conn, build_id, "failed")
         return
 
     snapshot_id = snapshot_row["id"]

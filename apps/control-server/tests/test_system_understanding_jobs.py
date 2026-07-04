@@ -435,6 +435,81 @@ class TestRetrySemantics:
         assert retry.status_code == 404
 
 
+class TestSnapshotPinning:
+    def test_retry_runs_against_the_job_snapshot_not_the_latest(
+        self, admin_client, tmp_path
+    ):
+        """A job binds to the snapshot it was created with: retrying after a
+        newer ready snapshot appears must not silently re-run steps against
+        the newer snapshot (Issue #109 review)."""
+        token = _login(admin_client)
+        _, hdrs = _setup_repo(admin_client, token, tmp_path, "job-pin-sys")
+
+        r = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        job1 = _wait_job(admin_client, hdrs, r.json()["id"])
+        snapshot1_id = job1["snapshot_id"]
+        assert snapshot1_id is not None
+        chunks1 = _steps_by_name(job1)["documentation_index"]["artifact_provenance"]["chunk_count"]
+
+        # Simulate an interrupted deterministic step so retry has work to do.
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            conn.execute(
+                "UPDATE system_understanding_build_steps SET status = 'failed', "
+                "error = 'interrupted' WHERE build_id = ? AND step = 'documentation_index'",
+                (job1["id"],),
+            )
+
+        # A newer ready snapshot appears (with clearly different docs).
+        repo = tmp_path / "repo"
+        (repo / "README.md").write_text(TWO_SECTION_README + "\n## SectionC\n\nMore.\n")
+        subprocess.run(["git", "add", "."], cwd=str(repo), check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "more docs"],
+            cwd=str(repo), check=True, capture_output=True,
+        )
+        sha2 = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo), check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        snap2 = admin_client.post(
+            "/repository/snapshots", json={"commit_sha": sha2}, headers=hdrs
+        )
+        assert snap2.status_code == 201, snap2.text
+        snapshot2_id = snap2.json()["id"]
+        assert snapshot2_id != snapshot1_id
+
+        retry = admin_client.post(
+            f"/repository/system-understanding/jobs/{job1['id']}/retry", headers=hdrs
+        )
+        assert retry.status_code == 202, retry.text
+        job1_after = _wait_job(admin_client, hdrs, job1["id"])
+
+        # The retried job stayed pinned to its original snapshot ...
+        assert job1_after["snapshot_id"] == snapshot1_id
+        with get_conn() as conn:
+            step_snapshots = {
+                row["snapshot_id"]
+                for row in conn.execute(
+                    "SELECT snapshot_id FROM system_understanding_build_steps WHERE build_id = ?",
+                    (job1["id"],),
+                ).fetchall()
+            }
+        assert step_snapshots == {snapshot1_id}
+        # ... and the re-run step processed snapshot 1's docs, not snapshot 2's.
+        chunks_after = _steps_by_name(job1_after)["documentation_index"]["artifact_provenance"]["chunk_count"]
+        assert chunks_after == chunks1
+
+        # A brand-new build binds to the latest snapshot and sees different docs
+        # (guard: proves the two snapshots are distinguishable by chunk_count).
+        r2 = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        job2 = _wait_job(admin_client, hdrs, r2.json()["id"])
+        assert job2["snapshot_id"] == snapshot2_id
+        chunks2 = _steps_by_name(job2)["documentation_index"]["artifact_provenance"]["chunk_count"]
+        assert chunks2 != chunks1
+
+
 class TestStuckDetectionAndResume:
     def test_stale_heartbeat_marks_job_stuck_and_retry_resumes(
         self, admin_client, tmp_path

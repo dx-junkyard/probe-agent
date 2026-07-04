@@ -125,6 +125,11 @@ heuristic result.
 - Job/step state lives in `system_understanding_builds` /
   `system_understanding_build_steps`; claim-scan chunks are
   `system_understanding_llm_tasks` rows with unified retry/backoff/cancel.
+- Jobs bind to the snapshot they were created with: retry/resume always
+  runs against the job's stored `snapshot_id`, never the latest ready
+  snapshot. Only a job created without any ready snapshot binds to the
+  latest one at execution time; a pinned snapshot that disappeared fails
+  the job with an explicit error.
 - Steps: `symbol_index`, `entrypoint_index`, `documentation_index`,
   `claim_scan` (reasoning), `understanding_graph`, `docs_code_reconcile`,
   `capability_hierarchy`. Dependencies are explicit; a step whose dependency
