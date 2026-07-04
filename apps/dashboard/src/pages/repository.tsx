@@ -5,6 +5,9 @@ import {
   useApiScanResult, useRunApiScan,
 } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
+import {
+  useDiagnosticFocus, useDiagnosticHighlight, DiagnosticFixCallout,
+} from "@/components/diagnostic-fix";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -39,11 +42,37 @@ export default function RepositoryPage() {
 
   const configKey = systemId != null ? `${systemId}-${config?.repo_path ?? ""}` : "empty";
 
+  // Issue #115: when routed here from a diagnostic, open the tab that holds the
+  // fix location and highlight it. The tab is controlled so a diagnostic can
+  // select it without discarding in-progress form state, while normal tab
+  // switching stays user-controlled.
+  const focus = useDiagnosticFocus();
+  const anchorTab =
+    focus.anchor === "snapshot-create"
+      ? "snapshots"
+      : focus.anchor === "repo-config" || focus.anchor === "repo-patterns"
+        ? "config"
+        : null;
+
+  // Controlled tab: a fresh diagnostic navigation (anchor/check changes) selects
+  // the tab holding the fix, while later manual switching stays user-controlled.
+  // State is adjusted during render (guarded by the focus token) rather than in
+  // an effect, per the React "adjusting state when a prop changes" pattern.
+  const [tab, setTab] = useState(anchorTab ?? "config");
+  const focusToken = anchorTab ? `${focus.anchor}:${focus.checkId ?? ""}` : null;
+  const [lastToken, setLastToken] = useState(focusToken);
+  if (focusToken && focusToken !== lastToken) {
+    setLastToken(focusToken);
+    setTab(anchorTab!);
+  }
+
+  const snapshotHighlight = useDiagnosticHighlight<HTMLButtonElement>("snapshot-create");
+
   return (
     <div className="space-y-6">
       <h1 className="text-2xl font-bold tracking-tight">Repository</h1>
 
-      <Tabs defaultValue="config">
+      <Tabs value={tab} onValueChange={setTab}>
         <TabsList>
           <TabsTrigger value="config">Configuration</TabsTrigger>
           <TabsTrigger value="snapshots">Snapshots</TabsTrigger>
@@ -52,6 +81,8 @@ export default function RepositoryPage() {
         </TabsList>
 
         <TabsContent value="config">
+          <DiagnosticFixCallout anchor="repo-config" className="mb-3" />
+          <DiagnosticFixCallout anchor="repo-patterns" className="mb-3" />
           <Card>
             <CardHeader>
               <CardTitle className="text-base">Repository Configuration</CardTitle>
@@ -77,6 +108,7 @@ export default function RepositoryPage() {
         </TabsContent>
 
         <TabsContent value="snapshots">
+          <DiagnosticFixCallout anchor="snapshot-create" className="mb-3" />
           <Card>
             <CardHeader className="flex flex-row items-center justify-between">
               <div>
@@ -84,6 +116,7 @@ export default function RepositoryPage() {
                 <CardDescription>Point-in-time snapshots of the repository</CardDescription>
               </div>
               <Button
+                {...snapshotHighlight}
                 size="sm"
                 onClick={() => createSnapshot.mutateAsync().then(s => {
                   if (s.status === "failed") {
@@ -367,6 +400,8 @@ function RepoConfigForm({ config, candidates, onSave, isPending }: {
   const [repoPath, setRepoPath] = useState(config?.repo_path ?? "");
   const [includePatterns, setIncludePatterns] = useState(patternsToText(config?.include_patterns));
   const [excludePatterns, setExcludePatterns] = useState(patternsToText(config?.exclude_patterns));
+  const repoPathHighlight = useDiagnosticHighlight<HTMLDivElement>("repo-config");
+  const patternsHighlight = useDiagnosticHighlight<HTMLDivElement>("repo-patterns");
 
   const handleSave = async () => {
     try {
@@ -380,7 +415,7 @@ function RepoConfigForm({ config, candidates, onSave, isPending }: {
 
   return (
     <>
-      <div className="space-y-2">
+      <div {...repoPathHighlight} className={`space-y-2 ${repoPathHighlight.className}`}>
         <Label>Repository</Label>
         <Select value={repoPath} onChange={e => setRepoPath(e.target.value)}>
           <option value="">Select repository...</option>
@@ -401,13 +436,15 @@ function RepoConfigForm({ config, candidates, onSave, isPending }: {
           </p>
         )}
       </div>
-      <div className="space-y-2">
-        <Label>Include Patterns <span className="text-muted-foreground font-normal">(one per line)</span></Label>
-        <Textarea value={includePatterns} onChange={e => setIncludePatterns(e.target.value)} placeholder={"*.py\n*.js"} rows={3} />
-      </div>
-      <div className="space-y-2">
-        <Label>Exclude Patterns <span className="text-muted-foreground font-normal">(one per line)</span></Label>
-        <Textarea value={excludePatterns} onChange={e => setExcludePatterns(e.target.value)} placeholder={"test_*\n__pycache__"} rows={3} />
+      <div {...patternsHighlight} className={`space-y-4 ${patternsHighlight.className}`}>
+        <div className="space-y-2">
+          <Label>Include Patterns <span className="text-muted-foreground font-normal">(one per line)</span></Label>
+          <Textarea value={includePatterns} onChange={e => setIncludePatterns(e.target.value)} placeholder={"*.py\n*.js"} rows={3} />
+        </div>
+        <div className="space-y-2">
+          <Label>Exclude Patterns <span className="text-muted-foreground font-normal">(one per line)</span></Label>
+          <Textarea value={excludePatterns} onChange={e => setExcludePatterns(e.target.value)} placeholder={"test_*\n__pycache__"} rows={3} />
+        </div>
       </div>
       <Button onClick={handleSave} disabled={isPending || !repoPath || !candidates.some(candidate => candidate.path === repoPath)}>
         {isPending ? "Saving..." : "Save Configuration"}

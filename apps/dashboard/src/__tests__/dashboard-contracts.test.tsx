@@ -2241,6 +2241,9 @@ describe("System settings diagnostics", () => {
           observed_at: 1749999000,
         },
         decision_method: "deterministic",
+        fix_kind: "dialog",
+        fix_page: null,
+        fix_anchor: null,
       },
       {
         check_id: "snapshot_status",
@@ -2256,6 +2259,9 @@ describe("System settings diagnostics", () => {
         related_pipeline_steps: ["snapshot_ready"],
         last_observed_error: null,
         decision_method: "deterministic",
+        fix_kind: "navigate",
+        fix_page: "/repository",
+        fix_anchor: "repo-patterns",
       },
       {
         check_id: "pipeline_documentation_index",
@@ -2271,6 +2277,9 @@ describe("System settings diagnostics", () => {
         related_pipeline_steps: ["documentation_indexed"],
         last_observed_error: null,
         decision_method: "deterministic",
+        fix_kind: "navigate",
+        fix_page: "/system-understanding",
+        fix_anchor: "build",
       },
       {
         check_id: "database_storage",
@@ -2286,6 +2295,9 @@ describe("System settings diagnostics", () => {
         related_pipeline_steps: [],
         last_observed_error: null,
         decision_method: "deterministic",
+        fix_kind: "dialog",
+        fix_page: null,
+        fix_anchor: null,
       },
     ],
   };
@@ -2320,8 +2332,60 @@ describe("System settings diagnostics", () => {
     expect(lastError.textContent).toContain("HTTP 401: invalid api key");
     expect(lastError.textContent).toContain("intelligence_runs#12:repository_drafts");
     // Passing checks are still visible as passing.
-    expect(screen.getByText("Passing checks")).toBeTruthy();
+    expect(screen.getByText("正常なチェック")).toBeTruthy();
     expect(screen.getByText("Database storage")).toBeTruthy();
+  });
+
+  test("clicking a navigate check routes to its fix page with focus params", async () => {
+    window.history.pushState({}, "", "/");
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-diagnostics"
+        ? Promise.resolve(diagnosticsResponse)
+        : Promise.resolve(null),
+    );
+
+    const { DiagnosticsBadge } = await import("@/components/diagnostics-badge");
+    render(<DiagnosticsBadge />, { wrapper: createWrapper() });
+
+    const badge = await screen.findByTestId("diagnostics-badge");
+    fireEvent.click(badge);
+
+    // snapshot_status is a navigate check → click its card.
+    const snapshotDetail = await screen.findByText(/0 indexed files/);
+    fireEvent.click(snapshotDetail);
+
+    await waitFor(() => {
+      expect(window.location.pathname).toBe("/repository");
+    });
+    const params = new URLSearchParams(window.location.search);
+    expect(params.get("diagnostic")).toBe("snapshot_status");
+    expect(params.get("fix")).toBe("repo-patterns");
+  });
+
+  test("clicking an env-only check opens a remediation dialog instead of navigating", async () => {
+    window.history.pushState({}, "", "/");
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-diagnostics"
+        ? Promise.resolve(diagnosticsResponse)
+        : Promise.resolve(null),
+    );
+
+    const { DiagnosticsBadge } = await import("@/components/diagnostics-badge");
+    render(<DiagnosticsBadge />, { wrapper: createWrapper() });
+
+    const badge = await screen.findByTestId("diagnostics-badge");
+    fireEvent.click(badge);
+
+    // intelligence_llm_config is a dialog check → click its card.
+    const llmDetail = await screen.findByText(/INTELLIGENCE_LLM_PROVIDER is empty/);
+    fireEvent.click(llmDetail);
+
+    const envDialog = await screen.findByTestId("diagnostic-env-dialog");
+    expect(envDialog.textContent).toContain("設定が必要な環境変数");
+    // Did not navigate away.
+    expect(window.location.pathname).toBe("/");
+    // The list dialog closed so the two modals don't stack.
+    expect(screen.queryByText("System Settings Diagnostics")).toBeNull();
   });
 
   test("badge renders without count when everything is ok", async () => {

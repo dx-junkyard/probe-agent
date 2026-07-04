@@ -79,6 +79,9 @@ def _check_out(check: DiagnosticCheck) -> SystemDiagnosticCheckOut:
             else None
         ),
         decision_method="deterministic",
+        fix_kind=check.fix_kind,
+        fix_page=check.fix_page,
+        fix_anchor=check.fix_anchor,
     )
 
 

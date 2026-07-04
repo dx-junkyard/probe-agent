@@ -56,6 +56,16 @@ fallback for intelligence work.
   heuristics, and never call an LLM from a diagnostics check.
 - New required settings must be added here with title/impact/remediation so
   the Dashboard alert badge can explain them.
+- Issue #115: user-facing text (title/detail/impact/remediation) is Japanese
+  and framed as 原因 / 修正場所 / 次の操作. Each check also carries a
+  deterministic fix target: `fix_kind` (finite `navigate | dialog`),
+  `fix_page` (a Dashboard route), and `fix_anchor` (a member of the finite
+  anchor set: `repo-config`, `repo-patterns`, `snapshot-create`, `build`).
+  `navigate` means an in-app control fixes it; `dialog` means it is an env
+  var / restart with no in-app control. These are chosen structurally per
+  branch — never inferred — and must be kept in sync with the `diag-anchor`
+  attributes rendered by the Dashboard. Identifiers embedded in `detail`
+  (env var names, model ids, paths) stay verbatim.
 
 ## Per-screen assistant (issue #102)
 

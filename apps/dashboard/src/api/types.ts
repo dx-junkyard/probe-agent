@@ -1537,6 +1537,10 @@ export interface SystemDiagnosticCheck {
   related_pipeline_steps: string[];
   last_observed_error?: DiagnosticLastObservedError | null;
   decision_method: "deterministic";
+  // Issue #115: where the user fixes the problem.
+  fix_kind: "navigate" | "dialog";
+  fix_page?: string | null;
+  fix_anchor?: string | null;
 }
 
 export interface SystemDiagnosticsOut {
