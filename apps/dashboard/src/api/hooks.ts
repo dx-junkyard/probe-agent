@@ -21,6 +21,9 @@ import type {
   InterviewApprovedSetOut, InterviewMaterializeOut,
   SystemUnderstandingOut,
   SystemUnderstandingBuildOut,
+  IssueDraft,
+  IssueDraftCreateRequest,
+  IssueDraftUpdateRequest,
   SystemDiagnosticsOut,
   AssistantScreenContext, AssistantAskRequest, AssistantAskOut,
   AssistantSettingsMetadataOut,
@@ -880,6 +883,48 @@ export function useCancelSystemUnderstandingStep() {
       ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: sysKey("system-understanding-build") });
+    },
+  });
+}
+
+// Issue drafts (Issue #107)
+
+export function useIssueDrafts() {
+  return useQuery({
+    queryKey: sysKey("issue-drafts"),
+    queryFn: () => api.get<IssueDraft[]>("/issue-drafts"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useIssueDraft(id: number | null) {
+  return useQuery({
+    queryKey: sysKey("issue-draft", id),
+    queryFn: () => api.get<IssueDraft>(`/issue-drafts/${id}`),
+    enabled: !!getSystemId() && id != null,
+  });
+}
+
+export function useCreateIssueDraft() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: IssueDraftCreateRequest) =>
+      api.post<IssueDraft>("/issue-drafts", body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: sysKey("issue-drafts") });
+      qc.invalidateQueries({ queryKey: sysKey("system-understanding") });
+    },
+  });
+}
+
+export function useUpdateIssueDraft() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, body }: { id: number; body: IssueDraftUpdateRequest }) =>
+      api.patch<IssueDraft>(`/issue-drafts/${id}`, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: sysKey("issue-drafts") });
+      qc.invalidateQueries({ queryKey: sysKey("system-understanding") });
     },
   });
 }

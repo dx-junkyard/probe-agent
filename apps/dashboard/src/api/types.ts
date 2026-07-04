@@ -1375,6 +1375,13 @@ export interface SystemUnderstandingGapEntrypointRef {
   entrypoint_ref?: string | null;
 }
 
+export interface IssueDraftRef {
+  id: number;
+  status: string;
+  external_url?: string | null;
+  title: string;
+}
+
 export interface SystemUnderstandingGap {
   gap_type?: string | null;
   severity: string;
@@ -1387,6 +1394,50 @@ export interface SystemUnderstandingGap {
   entrypoint_refs: SystemUnderstandingGapEntrypointRef[];
   code_refs: Array<Record<string, unknown>>;
   next_actions: SystemUnderstandingGapNextAction[];
+  // Issue #107
+  source_id?: string | null;
+  source_key?: string | null;
+  issue_drafts?: IssueDraftRef[];
+}
+
+// Issue #107: issue drafts generated from System Understanding gaps.
+export type IssueDraftStatus =
+  | "draft"
+  | "copied"
+  | "external_created"
+  | "closed"
+  | "rejected";
+
+export interface IssueDraft {
+  id: number;
+  system_id: number;
+  snapshot_id?: number | null;
+  commit_sha?: string | null;
+  source_type: string;
+  source_key?: string | null;
+  gap_type?: string | null;
+  severity?: string | null;
+  node_name?: string | null;
+  title: string;
+  body_markdown: string;
+  status: IssueDraftStatus;
+  external_url?: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface IssueDraftCreateRequest {
+  source_type?: string;
+  gap: SystemUnderstandingGap;
+  snapshot_id?: number | null;
+  commit_sha?: string | null;
+}
+
+export interface IssueDraftUpdateRequest {
+  title?: string;
+  body_markdown?: string;
+  status?: IssueDraftStatus;
+  external_url?: string;
 }
 
 export interface SystemUnderstandingOut {
