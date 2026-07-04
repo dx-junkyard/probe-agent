@@ -586,7 +586,11 @@ function IssueDraftBadges({ drafts, onOpen }: { drafts: IssueDraftRef[]; onOpen:
   );
 }
 
-function GapCard({ gap }: { gap: SystemUnderstandingGap }) {
+function GapCard({ gap, snapshotId, commitSha }: {
+  gap: SystemUnderstandingGap;
+  snapshotId: number | null;
+  commitSha: string | null;
+}) {
   const createDraft = useCreateIssueDraft();
   const [openDraftId, setOpenDraftId] = useState<number | null>(null);
   const drafts = gap.issue_drafts ?? [];
@@ -597,7 +601,7 @@ function GapCard({ gap }: { gap: SystemUnderstandingGap }) {
       return;
     }
     createDraft.mutate(
-      { gap },
+      { gap, snapshot_id: snapshotId, commit_sha: commitSha },
       {
         onSuccess: (draft) => {
           setOpenDraftId(draft.id);
@@ -719,9 +723,11 @@ function GapCard({ gap }: { gap: SystemUnderstandingGap }) {
   );
 }
 
-function GapWorklist({ gaps, gapSummary }: {
+function GapWorklist({ gaps, gapSummary, snapshotId, commitSha }: {
   gaps: SystemUnderstandingGap[];
   gapSummary: { gap_type: string; count: number }[];
+  snapshotId: number | null;
+  commitSha: string | null;
 }) {
   const [typeFilter, setTypeFilter] = useState<string | null>(null);
   const [capabilityFilter, setCapabilityFilter] = useState<string | null>(null);
@@ -821,7 +827,7 @@ function GapWorklist({ gaps, gapSummary }: {
         {/* Gap cards */}
         <div className="space-y-3" data-testid="gap-cards">
           {filtered.map((gap, i) => (
-            <GapCard key={i} gap={gap} />
+            <GapCard key={i} gap={gap} snapshotId={snapshotId} commitSha={commitSha} />
           ))}
         </div>
       </CardContent>
@@ -1095,7 +1101,7 @@ function DataView({ data, checksByStep }: {
       )}
 
       {/* Docs-Code Gap Worklist */}
-      <GapWorklist gaps={data.gaps} gapSummary={data.gap_summary} />
+      <GapWorklist gaps={data.gaps} gapSummary={data.gap_summary} snapshotId={data.snapshot_id} commitSha={data.commit_sha} />
 
       {/* Next Actions */}
       {data.next_actions.length > 0 && (

@@ -1428,6 +1428,8 @@ export interface IssueDraft {
 export interface IssueDraftCreateRequest {
   source_type?: string;
   gap: SystemUnderstandingGap;
+  snapshot_id?: number | null;
+  commit_sha?: string | null;
 }
 
 export interface IssueDraftUpdateRequest {

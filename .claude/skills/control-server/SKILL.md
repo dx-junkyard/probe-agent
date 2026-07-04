@@ -172,7 +172,14 @@ heuristic result.
   deterministic `source_key` (`gap_source_key`), and `GET
   /repository/system-understanding` attaches any matching drafts to each gap
   (`issue_drafts`), matched by that key against the caller's open connection
-  (the DB lock is non-reentrant — never open a nested `get_conn`).
+  (the DB lock is non-reentrant — never open a nested `get_conn`). The key
+  folds in `capability_key` + docs/code/entrypoint evidence (hashed, order
+  independent), not just `gap_type` + `node_name`, so same-named gaps in one
+  system don't share drafts.
+- `POST /issue-drafts` accepts the displayed `snapshot_id` / `commit_sha`;
+  if a newer snapshot has since become ready the request is refused (409) so
+  a draft never embeds a snapshot that disagrees with the gap evidence in the
+  payload. Omitting it falls back to the latest ready snapshot.
 - `status` vocabulary is a finite set: `draft / copied / external_created /
   closed / rejected` (validated; anything else is 422). `external_url` is a
   plain user-supplied string, validated only as `http(s)://`; probe-agent

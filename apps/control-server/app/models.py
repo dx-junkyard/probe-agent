@@ -2298,6 +2298,12 @@ class IssueDraftCreateRequest(BaseModel):
         "system_understanding_gap", "interview", "probe_proposal"
     ] = "system_understanding_gap"
     gap: SystemUnderstandingGapOut
+    # The snapshot the gap was displayed against. When provided, the server
+    # rejects the request (409) if a newer snapshot has since become ready, so a
+    # draft never embeds a snapshot id / commit sha that disagrees with the gap
+    # evidence the caller was looking at.
+    snapshot_id: Optional[int] = None
+    commit_sha: Optional[str] = None
 
 
 class IssueDraftUpdateRequest(BaseModel):

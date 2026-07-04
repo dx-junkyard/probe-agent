@@ -517,6 +517,19 @@ def create_issue_draft_endpoint(
     snapshot_id = snapshot_row["id"] if snapshot_row else None
     commit_sha = snapshot_row["commit_sha"] if snapshot_row else None
 
+    # Bind the draft to the snapshot the gap was displayed against. If the
+    # caller pinned a snapshot and a newer one has since become ready, refuse
+    # rather than embed a snapshot id / commit sha that disagrees with the gap
+    # evidence in the payload.
+    if payload.snapshot_id is not None and payload.snapshot_id != snapshot_id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Snapshot has changed since this gap was displayed; refresh "
+                "System Understanding and generate the draft again."
+            ),
+        )
+
     draft = create_gap_draft(
         system_id,
         payload.gap.model_dump(),

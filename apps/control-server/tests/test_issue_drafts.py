@@ -77,7 +77,8 @@ def _init_git_repo(tmp_path):
     src.mkdir()
     (src / "main.py").write_text(
         'from fastapi import APIRouter\n\nrouter = APIRouter()\n\n'
-        '@router.get("/items")\ndef list_items():\n    """List all items."""\n    return []\n'
+        '@router.get("/items")\ndef list_items():\n    """List all items."""\n    return []\n\n'
+        '@router.get("/widgets")\ndef list_widgets():\n    """List all widgets."""\n    return []\n'
     )
     subprocess.run(["git", "add", "."], cwd=str(repo), check=True, capture_output=True)
     subprocess.run(
@@ -184,6 +185,120 @@ class TestIssueDraftGeneration:
         get_r = admin_client.get(f"/issue-drafts/{draft_id}", headers=hdrs)
         assert get_r.status_code == 200
         assert get_r.json()["id"] == draft_id
+
+
+class TestSourceKeyDisambiguation:
+    def test_same_type_and_name_gaps_get_distinct_keys(self):
+        """Two gaps with the same type/name but different evidence must not collide."""
+        from app.issue_drafts import gap_source_key
+
+        gap_a = {
+            "gap_type": "docs_only",
+            "node_name": "Auth",
+            "capability_key": "security",
+            "doc_refs": [{"path": "docs/a.md", "start_line": 1, "end_line": 5}],
+            "symbol_refs": [],
+            "entrypoint_refs": [],
+        }
+        gap_b = {
+            "gap_type": "docs_only",
+            "node_name": "Auth",
+            "capability_key": "billing",
+            "doc_refs": [{"path": "docs/b.md", "start_line": 9, "end_line": 12}],
+            "symbol_refs": [],
+            "entrypoint_refs": [],
+        }
+        assert gap_source_key(gap_a) != gap_source_key(gap_b)
+
+    def test_key_is_stable_and_order_independent(self):
+        from app.issue_drafts import gap_source_key
+
+        gap1 = {
+            "gap_type": "code_only",
+            "node_name": "list_items",
+            "capability_key": None,
+            "doc_refs": [],
+            "symbol_refs": [
+                {"path": "a.py", "qualified_name": "f"},
+                {"path": "b.py", "qualified_name": "g"},
+            ],
+            "entrypoint_refs": [],
+        }
+        gap2 = {  # same evidence, reordered
+            "gap_type": "code_only",
+            "node_name": "list_items",
+            "capability_key": None,
+            "doc_refs": [],
+            "symbol_refs": [
+                {"path": "b.py", "qualified_name": "g"},
+                {"path": "a.py", "qualified_name": "f"},
+            ],
+            "entrypoint_refs": [],
+        }
+        assert gap_source_key(gap1) == gap_source_key(gap2)
+
+    def test_distinct_drafts_do_not_cross_attach(self, admin_client, tmp_path):
+        """Drafts for different gaps must attach only to their own gap."""
+        hdrs, sha, understanding = _setup_system_with_gaps(admin_client, tmp_path, "idraft-distinct")
+        gaps = understanding["gaps"]
+        if len(gaps) < 2:
+            pytest.skip("need at least two distinct gaps")
+        assert gaps[0]["source_key"] != gaps[1]["source_key"]
+
+        d0 = admin_client.post("/issue-drafts", json={"gap": gaps[0]}, headers=hdrs).json()
+        d1 = admin_client.post("/issue-drafts", json={"gap": gaps[1]}, headers=hdrs).json()
+        assert d0["source_key"] != d1["source_key"]
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        by_key = {g["source_key"]: g for g in r.json()["gaps"]}
+        assert [x["id"] for x in by_key[gaps[0]["source_key"]]["issue_drafts"]] == [d0["id"]]
+        assert [x["id"] for x in by_key[gaps[1]["source_key"]]["issue_drafts"]] == [d1["id"]]
+
+
+class TestSnapshotPinning:
+    def test_matching_snapshot_accepted(self, admin_client, tmp_path):
+        hdrs, sha, understanding = _setup_system_with_gaps(admin_client, tmp_path, "idraft-snap-ok")
+        gap = understanding["gaps"][0]
+        r = admin_client.post(
+            "/issue-drafts",
+            json={
+                "gap": gap,
+                "snapshot_id": understanding["snapshot_id"],
+                "commit_sha": understanding["commit_sha"],
+            },
+            headers=hdrs,
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["snapshot_id"] == understanding["snapshot_id"]
+        assert r.json()["commit_sha"] == sha
+
+    def test_stale_snapshot_rejected(self, admin_client, tmp_path):
+        """A gap displayed against an older snapshot is refused (409) once a new one is ready."""
+        hdrs, sha, understanding = _setup_system_with_gaps(admin_client, tmp_path, "idraft-snap-stale")
+        gap = understanding["gaps"][0]
+        stale_snapshot_id = understanding["snapshot_id"]
+
+        # A newer snapshot becomes ready (same commit is fine; the id differs).
+        new_snap = admin_client.post(
+            "/repository/snapshots", json={"commit_sha": sha}, headers=hdrs
+        )
+        assert new_snap.status_code == 201
+        assert new_snap.json()["id"] != stale_snapshot_id
+
+        r = admin_client.post(
+            "/issue-drafts",
+            json={"gap": gap, "snapshot_id": stale_snapshot_id},
+            headers=hdrs,
+        )
+        assert r.status_code == 409
+
+    def test_omitted_snapshot_falls_back_to_latest(self, admin_client, tmp_path):
+        """Backward compatible: without a pinned snapshot, the latest ready one is used."""
+        hdrs, sha, understanding = _setup_system_with_gaps(admin_client, tmp_path, "idraft-snap-omit")
+        gap = understanding["gaps"][0]
+        r = admin_client.post("/issue-drafts", json={"gap": gap}, headers=hdrs)
+        assert r.status_code == 201
+        assert r.json()["snapshot_id"] == understanding["snapshot_id"]
 
 
 class TestIssueDraftEditing:

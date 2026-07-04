@@ -27,6 +27,7 @@ probe-agent:
     and that status/external_url transitions stay within the finite vocabulary.
 """
 
+import hashlib
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -52,11 +53,29 @@ def gap_source_key(gap: Dict[str, Any]) -> str:
     """Deterministic identity for a gap so drafts can be matched back to it.
 
     Gaps are recomputed on every read (they have no stable DB id), so the key is
-    derived from the finite gap_type plus the node name it concerns.
+    derived deterministically from the gap's identity. gap_type + node_name alone
+    collide when a system has several same-typed/same-named gaps, which would mix
+    up their drafts (and the wrong external URL would surface on the wrong gap).
+    To disambiguate, the key also folds in the capability and the docs / code /
+    entrypoint evidence that locate the gap, hashed into a short stable suffix.
     """
     gap_type = (gap.get("gap_type") or "unknown").strip()
     node_name = (gap.get("node_name") or "unknown").strip()
-    return f"system_understanding_gap:{gap_type}:{node_name}"
+
+    parts: List[str] = [f"capability:{gap.get('capability_key') or ''}"]
+    for dr in gap.get("doc_refs") or []:
+        parts.append(
+            f"doc:{dr.get('path', '')}:{dr.get('start_line', '')}:{dr.get('end_line', '')}"
+        )
+    for sr in gap.get("symbol_refs") or []:
+        parts.append(f"sym:{sr.get('path', '')}:{sr.get('qualified_name', '')}")
+    for er in gap.get("entrypoint_refs") or []:
+        parts.append(
+            f"ep:{er.get('entrypoint_type', '')}:{er.get('entrypoint_ref', '')}"
+        )
+    # Sort so the key is independent of evidence ordering, then hash.
+    digest = hashlib.sha1("|".join(sorted(parts)).encode("utf-8")).hexdigest()[:12]
+    return f"system_understanding_gap:{gap_type}:{node_name}:{digest}"
 
 
 def _fmt_doc_ref(dr: Dict[str, Any]) -> str:

@@ -1930,7 +1930,11 @@ describe("System Understanding page", () => {
     fireEvent.click(btn);
 
     await waitFor(() => {
-      expect(mockApi.post).toHaveBeenCalledWith("/issue-drafts", { gap: gapWithSourceKey });
+      expect(mockApi.post).toHaveBeenCalledWith("/issue-drafts", {
+        gap: gapWithSourceKey,
+        snapshot_id: 5,
+        commit_sha: "abc12345def",
+      });
     });
   });
 
