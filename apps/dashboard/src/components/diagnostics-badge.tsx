@@ -11,6 +11,29 @@ import type { DiagnosticSeverity, SystemDiagnosticCheck } from "@/api/types";
 
 const SEVERITY_ORDER: DiagnosticSeverity[] = ["error", "blocked", "warning", "unknown", "ok"];
 
+interface GroupedCheck {
+  representative: SystemDiagnosticCheck;
+  titles: string[];
+  check_ids: string[];
+}
+
+function groupChecksByRootCause(checks: SystemDiagnosticCheck[]): GroupedCheck[] {
+  const groups: GroupedCheck[] = [];
+  const keyMap = new Map<string, number>();
+  for (const c of checks) {
+    const key = `${c.detail}\0${c.impact}\0${c.remediation}\0${c.fix_page ?? ""}\0${c.fix_anchor ?? ""}`;
+    const idx = keyMap.get(key);
+    if (idx !== undefined) {
+      groups[idx].titles.push(c.title);
+      groups[idx].check_ids.push(c.check_id);
+    } else {
+      keyMap.set(key, groups.length);
+      groups.push({ representative: c, titles: [c.title], check_ids: [c.check_id] });
+    }
+  }
+  return groups;
+}
+
 const CATEGORY_LABELS: Record<string, string> = {
   repository: "リポジトリ",
   database: "データベース / ストレージ",
@@ -54,20 +77,31 @@ function severityBadgeVariant(severity: string): "default" | "secondary" | "dest
   }
 }
 
-export function DiagnosticCheckCard({ check, onActivate }: {
+export function DiagnosticCheckCard({ check, onActivate, groupedTitles }: {
   check: SystemDiagnosticCheck;
   onActivate?: (check: SystemDiagnosticCheck) => void;
+  groupedTitles?: string[];
 }) {
   const interactive = !!onActivate;
   const actionLabel =
     check.fix_kind === "navigate" ? "修正画面を開く" : "対処方法を表示";
+  const titles = groupedTitles && groupedTitles.length > 1 ? groupedTitles : null;
 
   const body = (
     <>
       <div className="flex items-start gap-2">
         <DiagnosticSeverityIcon severity={check.severity} />
         <div className="flex-1 min-w-0">
-          <p className="text-sm font-medium">{check.title}</p>
+          {titles ? (
+            <>
+              <p className="text-sm font-medium">{titles.length} 件のステップが同じ原因でブロックされています</p>
+              <ul className="mt-1 pl-4 list-disc text-xs text-muted-foreground">
+                {titles.map((t) => <li key={t}>{t}</li>)}
+              </ul>
+            </>
+          ) : (
+            <p className="text-sm font-medium">{check.title}</p>
+          )}
           <div className="flex flex-wrap items-center gap-1.5 mt-1">
             <Badge variant={severityBadgeVariant(check.severity)} className="text-xs">
               {SEVERITY_LABELS[check.severity] ?? check.severity}
@@ -235,6 +269,7 @@ export function DiagnosticsDialogContent({ checks, onActivate }: {
   );
   const problems = sorted.filter((c) => c.severity !== "ok");
   const healthy = sorted.filter((c) => c.severity === "ok");
+  const grouped = useMemo(() => groupChecksByRootCause(problems), [problems]);
   return (
     <div className="space-y-4">
       {problems.length === 0 ? (
@@ -248,8 +283,13 @@ export function DiagnosticsDialogContent({ checks, onActivate }: {
             修正できない設定はダイアログで対応手順を表示します。
           </p>
           <div className="space-y-2" data-testid="diagnostics-problems">
-            {problems.map((c) => (
-              <DiagnosticCheckCard key={c.check_id} check={c} onActivate={onActivate} />
+            {grouped.map((g) => (
+              <DiagnosticCheckCard
+                key={g.check_ids.join(",")}
+                check={g.representative}
+                onActivate={onActivate}
+                groupedTitles={g.titles}
+              />
             ))}
           </div>
         </>
