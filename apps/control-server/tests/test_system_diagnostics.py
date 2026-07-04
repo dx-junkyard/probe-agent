@@ -411,7 +411,22 @@ class TestPipelinePrerequisites:
         build = admin_client.post(
             "/repository/system-understanding/build", headers=hdrs
         )
-        assert build.status_code == 200, build.text
+        assert build.status_code == 202, build.text
+        build_id = build.json()["id"]
+
+        # Issue #106: build runs asynchronously; poll until it settles.
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            status_r = admin_client.get(
+                f"/repository/system-understanding/build/{build_id}", headers=hdrs
+            )
+            assert status_r.status_code == 200, status_r.text
+            if status_r.json()["status"] in ("completed", "failed"):
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail(f"Build {build_id} did not settle in time")
+        assert status_r.json()["status"] == "completed"
 
         _, checks = _get_checks(admin_client, hdrs)
         sym = checks["pipeline_symbol_index"]

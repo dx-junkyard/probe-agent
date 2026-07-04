@@ -1404,6 +1404,18 @@ export interface SystemUnderstandingOut {
   next_actions: SystemUnderstandingNextAction[];
 }
 
+export interface SystemUnderstandingBuildOut {
+  id: number;
+  system_id: number;
+  snapshot_id: number | null;
+  status: "queued" | "running" | "completed" | "failed";
+  current_step: string | null;
+  error: string | null;
+  started_at: number | null;
+  completed_at: number | null;
+  created_at: number;
+}
+
 // System settings diagnostics (Issue #101)
 
 export type DiagnosticSeverity = "ok" | "warning" | "error" | "blocked" | "unknown";
