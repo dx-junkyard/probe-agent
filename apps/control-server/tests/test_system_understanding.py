@@ -74,7 +74,7 @@ def _build_and_wait(client, hdrs, timeout=10.0):
         )
         assert status_r.status_code == 200, status_r.text
         build = status_r.json()
-        if build["status"] in ("completed", "failed"):
+        if build["status"] in ("completed", "partial", "failed", "cancelled"):
             break
         time.sleep(0.05)
     else:
@@ -180,7 +180,9 @@ class TestSystemUnderstandingBuild:
         assert snap_r.status_code == 201
 
         build = _build_and_wait(admin_client, hdrs)
-        assert build["status"] == "completed"
+        # Deterministic steps complete, but the reasoning steps stay blocked
+        # (mock provider), so the job settles as partial — not completed.
+        assert build["status"] == "partial"
 
         r = admin_client.get("/repository/system-understanding", headers=hdrs)
         assert r.status_code == 200
@@ -468,7 +470,9 @@ class TestIntelligenceRunStatusContract:
             "/repository/snapshots", json={"commit_sha": sha}, headers=hdrs
         )
         build = _build_and_wait(admin_client, hdrs)
-        assert build["status"] == "completed"
+        # Reasoning steps stay blocked with the mock provider, so the job is
+        # partial while every deterministic artifact is still persisted.
+        assert build["status"] == "partial"
         return hdrs
 
     def test_build_writes_contract_statuses_only(self, admin_client, tmp_path):
@@ -565,20 +569,27 @@ class TestBuildDoesNotBlockOtherRequests:
             "/repository/snapshots", json={"commit_sha": sha}, headers=hdrs
         )
 
-        # Simulate a slow/hanging reasoning-model call during the
-        # documentation step: this used to run inside the single
-        # get_conn() block held for the whole build, starving every other
-        # request of the shared sqlite lock.
+        # Simulate a slow/hanging reasoning-model call during the claim scan
+        # step: this used to run inside the single get_conn() block held for
+        # the whole build, starving every other request of the shared sqlite
+        # lock. Claim scanning is chunk-level since Issue #109, so patch
+        # scan_chunk (the per-chunk LLM call).
         import app.system_understanding_service as sus
         import app.documentation_claim_scanner as scanner_module
 
         monkeypatch.setattr(sus, "_is_reasoning_model_available", lambda: True)
 
-        def _slow_scan_all_chunks(client, config, chunks):
+        def _slow_scan_chunk(client, config, chunk, cache=None):
             time.sleep(1.0)
-            return []
+            return scanner_module.ChunkScanResult(
+                chunk_id=chunk.chunk_id,
+                chunk_content_hash=chunk.content_hash,
+                prompt_version=scanner_module.PROMPT_VERSION,
+                schema_version=scanner_module.SCHEMA_VERSION,
+                claims=[],
+            )
 
-        monkeypatch.setattr(scanner_module, "scan_all_chunks", _slow_scan_all_chunks)
+        monkeypatch.setattr(scanner_module, "scan_chunk", _slow_scan_chunk)
 
         build_r = admin_client.post(
             "/repository/system-understanding/build", headers=hdrs

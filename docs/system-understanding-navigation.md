@@ -167,7 +167,11 @@ Issue #89 で以下の 15 ファイルに module-level `probe-agent:` メタデ�
 
 1. **Repository 設定**: Dashboard で probe-agent リポジトリを追加
 2. **Snapshot 作成**: commit SHA を pin して snapshot を作成
-3. **Build / Refresh**: System Understanding ページの Build ボタンを実行
+3. **Build / Refresh**: System Understanding ページの Build ボタンを実行。
+   Build は step 単位で orchestration される非同期ジョブ (Issue #109) として
+   実行され、ページはジョブを polling して step ごとの進捗・エラー・
+   retry / cancel 操作・artifact 件数を表示する。ブラウザを閉じても
+   ジョブ状態は DB から復元される
 4. **Pipeline 確認**: 決定的ステップ（symbols_indexed, entrypoints_discovered）が complete であることを確認
 5. **Metadata coverage 確認**: `symbols_with_source_metadata` が 0 より大きいことを確認
 6. **Capability Map 確認**: source-authored provenance で capability が表示されることを確認

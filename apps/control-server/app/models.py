@@ -2201,16 +2201,72 @@ class SystemUnderstandingOut(BaseModel):
     next_actions: List[SystemUnderstandingNextActionOut] = Field(default_factory=list)
 
 
+class SystemUnderstandingBuildStepOut(BaseModel):
+    """One orchestrated step of a System Understanding build job (Issue #109)."""
+
+    id: int
+    step: str
+    status: str  # pending, running, completed, failed, blocked, cancelled
+    depends_on: List[str] = Field(default_factory=list)
+    reused_existing: bool = False
+    cancel_requested: bool = False
+    error: Optional[str] = None
+    artifact_provenance: Dict[str, Any] = Field(default_factory=dict)
+    duration_ms: Optional[float] = None
+    heartbeat_at: Optional[float] = None
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
+
+
+class SystemUnderstandingLlmTaskSummaryOut(BaseModel):
+    """Aggregate counts of chunk-level LLM tasks for a build job."""
+
+    total: int = 0
+    pending: int = 0
+    running: int = 0
+    completed: int = 0
+    failed: int = 0
+    cancelled: int = 0
+    reused: int = 0
+
+
+class SystemUnderstandingArtifactCountsOut(BaseModel):
+    """Deterministic persisted artifact counts for the job's snapshot."""
+
+    symbols: int = 0
+    entrypoints: int = 0
+    understanding_graph_claims: int = 0
+    capability_hierarchy_nodes: int = 0
+
+
 class SystemUnderstandingBuildOut(BaseModel):
     id: int
+    job_id: int
+    # Latest execution (initial enqueue or retry) of this job. None only for
+    # legacy rows created before run tracking existed.
+    run_id: Optional[int] = None
     system_id: int
     snapshot_id: Optional[int] = None
-    status: str  # queued, running, completed, failed
+    # completed only when every step completed; blocked/cancelled/failed
+    # steps yield partial (or failed when no step completed).
+    status: str  # queued, running, completed, partial, failed, cancelled
     current_step: Optional[str] = None
     error: Optional[str] = None
+    cancel_requested: bool = False
+    is_stuck: bool = False
+    heartbeat_at: Optional[float] = None
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
     created_at: float
+    steps: List[SystemUnderstandingBuildStepOut] = Field(default_factory=list)
+    llm_tasks: Optional[SystemUnderstandingLlmTaskSummaryOut] = None
+    artifact_counts: Optional[SystemUnderstandingArtifactCountsOut] = None
+
+
+class SystemUnderstandingJobRetryIn(BaseModel):
+    """Optional step name to retry only that step (plus its dependents)."""
+
+    step: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

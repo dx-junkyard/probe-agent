@@ -809,10 +809,13 @@ export function useBuildSystemUnderstanding() {
   });
 }
 
-/** Polls the latest system understanding build until it settles, so the
- * dashboard can show progress instead of blocking on one long request
- * (Issue #106). Callers should invalidate `system-understanding` and
- * `system-diagnostics` once `status` transitions to "completed" or "failed". */
+/** Polls the latest system understanding build job until it settles, so the
+ * dashboard can show step-level progress instead of blocking on one long
+ * request (Issues #106/#109). The job (including per-step status, errors,
+ * LLM chunk task counts, and artifact counts) is persisted server-side, so
+ * reopening the browser restores the active/last job. Callers should
+ * invalidate `system-understanding` and `system-diagnostics` once `status`
+ * settles. */
 export function useLatestSystemUnderstandingBuild() {
   return useQuery({
     queryKey: sysKey("system-understanding-build"),
@@ -823,6 +826,60 @@ export function useLatestSystemUnderstandingBuild() {
       const status = query.state.data?.status;
       if (status === "queued" || status === "running") return 2000;
       return false;
+    },
+  });
+}
+
+export function useActiveSystemUnderstandingJobs() {
+  return useQuery({
+    queryKey: sysKey("system-understanding-jobs-active"),
+    queryFn: () =>
+      api.get<SystemUnderstandingBuildOut[]>("/repository/system-understanding/jobs/active"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useCancelSystemUnderstandingJob() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (jobId: number) =>
+      api.post<SystemUnderstandingBuildOut>(
+        `/repository/system-understanding/jobs/${jobId}/cancel`,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: sysKey("system-understanding-build") });
+    },
+  });
+}
+
+/** Retry/resume a settled or stuck job. With `step`, only that step (plus
+ * its non-completed dependents) is reset; completed steps never re-run. */
+export function useRetrySystemUnderstandingJob() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ jobId, step }: { jobId: number; step?: string }) =>
+      step
+        ? api.post<SystemUnderstandingBuildOut>(
+            `/repository/system-understanding/jobs/${jobId}/steps/${encodeURIComponent(step)}/retry`,
+          )
+        : api.post<SystemUnderstandingBuildOut>(
+            `/repository/system-understanding/jobs/${jobId}/retry`,
+          ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: sysKey("system-understanding-build") });
+    },
+  });
+}
+
+export function useCancelSystemUnderstandingStep() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ jobId, step }: { jobId: number; step: string }) =>
+      api.post<SystemUnderstandingBuildOut>(
+        `/repository/system-understanding/jobs/${jobId}/steps/${encodeURIComponent(step)}/cancel`,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: sysKey("system-understanding-build") });
     },
   });
 }
