@@ -157,6 +157,30 @@ heuristic result.
   back-compat `GET .../build/latest` and `GET .../build/{id}` returning the
   same extended payload (steps, llm task counts, artifact counts).
 
+## Issue drafts (issue #107)
+
+- `POST /issue-drafts`, `GET /issue-drafts`, `GET /issue-drafts/{id}`,
+  `PATCH /issue-drafts/{id}` (`app/issue_drafts.py`, `routes/project_intelligence.py`).
+  probe-agent's DB (`issue_drafts` table, system-scoped) is the source of
+  truth; external trackers are NOT integrated.
+- A draft is generated from a System Understanding gap: rendering the gap's
+  title, docs/code/entrypoint evidence, next actions, and the pinned
+  `snapshot_id` / `commit_sha` into a Markdown body is a deterministic,
+  structural template (Principle 6) — no reasoning model is called. Upstream
+  gap detection is where reasoning happens.
+- Gaps are recomputed per read (no stable id), so each gap carries a
+  deterministic `source_key` (`gap_source_key`), and `GET
+  /repository/system-understanding` attaches any matching drafts to each gap
+  (`issue_drafts`), matched by that key against the caller's open connection
+  (the DB lock is non-reentrant — never open a nested `get_conn`).
+- `status` vocabulary is a finite set: `draft / copied / external_created /
+  closed / rejected` (validated; anything else is 422). `external_url` is a
+  plain user-supplied string, validated only as `http(s)://`; probe-agent
+  never fetches, creates, or syncs the external issue and never writes to the
+  target repository (Non-goals; Principle 5).
+- `PATCH` uses field set-ness so `external_url: ""` clears a registered URL
+  while omitting it leaves it untouched.
+
 ## Authentication and user management
 
 - Auth is enabled when any user exists or `CONTROL_API_KEYS` is set; otherwise open (MVP compat).

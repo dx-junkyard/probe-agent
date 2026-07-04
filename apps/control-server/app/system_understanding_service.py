@@ -628,6 +628,39 @@ def _detect_extra_gaps(conn, system_id: int, snapshot_id: int) -> List[Dict[str,
     return extra
 
 
+def _attach_issue_drafts(conn, system_id: int, gaps: List[Dict[str, Any]]) -> None:
+    """Attach a stable source_key and any existing issue drafts to each gap.
+
+    Issue #107: drafts persist independently of the (recomputed-per-read) gaps,
+    so they are matched back by source_key. Runs against the caller's open
+    connection because the DB lock is non-reentrant.
+    """
+    from .issue_drafts import gap_source_key
+
+    drafts_by_key: Dict[str, List[Dict[str, Any]]] = {}
+    rows = conn.execute(
+        """SELECT id, source_key, status, external_url, title
+           FROM issue_drafts WHERE system_id = ? ORDER BY id DESC""",
+        (system_id,),
+    ).fetchall()
+    for r in rows:
+        key = r["source_key"]
+        if key:
+            drafts_by_key.setdefault(key, []).append(
+                {
+                    "id": r["id"],
+                    "status": r["status"],
+                    "external_url": r["external_url"],
+                    "title": r["title"],
+                }
+            )
+
+    for gap in gaps:
+        key = gap_source_key(gap)
+        gap["source_key"] = key
+        gap["issue_drafts"] = drafts_by_key.get(key, [])
+
+
 def _compute_gap_summary(gaps: List[Dict[str, Any]]) -> List[GapSummary]:
     counts: Dict[str, int] = {}
     for g in gaps:
@@ -728,6 +761,7 @@ def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
             summary.major_symbols = _load_major_symbols(conn, system_id, snapshot_id)
             summary.metadata_coverage = _load_metadata_coverage(conn, system_id, snapshot_id)
             summary.gaps = _load_gaps_from_reconciler(conn, system_id, snapshot_id)
+            _attach_issue_drafts(conn, system_id, summary.gaps)
             summary.gap_summary = _compute_gap_summary(summary.gaps)
 
         summary.next_actions = _build_next_actions(

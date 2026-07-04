@@ -106,6 +106,7 @@ Issue #90 で実装されたクロスページリンク:
 | System Understanding — symbols (route) | Flow Explorer | route path で entrypoint を指定 |
 | System Understanding — gap capability_key | Capability Map | `?capability=<key>` で自動選択 |
 | System Understanding — gap entrypoint_refs | Flow Explorer | `?entrypoint_type=...&entrypoint_id=...` |
+| System Understanding — gap `Create implementation issue` | Issue draft dialog | gap から issue draft を生成・編集・Markdown コピー・外部 URL 登録（#107, probe-agent DB が正本、外部 tracker 連携なし） |
 | Capability Map — element/boundary | Flow Explorer | entrypoint_type + entrypoint_ref で指定 |
 | Capability Map — feature_id | Feature Map | `?feature=<id>` でハイライト＋スクロール |
 | Feature Map — related capabilities | Capability Map | `?capability=<key>` で自動選択 |

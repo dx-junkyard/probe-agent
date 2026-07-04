@@ -99,6 +99,9 @@ from ..models import (
     FeatureDraftOut,
     FeatureEvidence,
     IntelligenceRunOut,
+    IssueDraftCreateRequest,
+    IssueDraftOut,
+    IssueDraftUpdateRequest,
     LatestDraftsOut,
     LinkReviewUpdate,
     ProbePatchApplyRequest,
@@ -484,6 +487,128 @@ def retry_system_understanding_step_endpoint(
     return _build_out(get_job(system_id, job_id))
 
 
+# ---------------------------------------------------------------------------
+# Issue drafts (Issue #107)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/issue-drafts", response_model=IssueDraftOut, status_code=201)
+def create_issue_draft_endpoint(
+    payload: IssueDraftCreateRequest,
+    system_id: int = Depends(get_system_id),
+) -> IssueDraftOut:
+    """Generate and persist an issue draft from a System Understanding gap.
+
+    probe-agent:
+      role: API boundary for generating an issue draft from a gap
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: transformation
+      state_effects: [database-read, database-write]
+      probe_value: verify the draft body embeds the pinned snapshot/commit and
+        gap evidence, and never creates an external issue itself.
+    """
+    from ..issue_drafts import create_gap_draft
+    from ..system_understanding_service import _get_latest_ready_snapshot
+
+    with get_conn() as conn:
+        snapshot_row = _get_latest_ready_snapshot(conn, system_id)
+    snapshot_id = snapshot_row["id"] if snapshot_row else None
+    commit_sha = snapshot_row["commit_sha"] if snapshot_row else None
+
+    draft = create_gap_draft(
+        system_id,
+        payload.gap.model_dump(),
+        snapshot_id,
+        commit_sha,
+        source_type=payload.source_type,
+    )
+    return IssueDraftOut(**draft)
+
+
+@router.get("/issue-drafts", response_model=List[IssueDraftOut])
+def list_issue_drafts_endpoint(
+    system_id: int = Depends(get_system_id),
+) -> List[IssueDraftOut]:
+    """List issue drafts for the current system.
+
+    probe-agent:
+      role: API boundary for listing issue drafts
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: verify drafts are scoped to the calling system only.
+    """
+    from ..issue_drafts import list_drafts
+
+    return [IssueDraftOut(**d) for d in list_drafts(system_id)]
+
+
+@router.get("/issue-drafts/{draft_id}", response_model=IssueDraftOut)
+def get_issue_draft_endpoint(
+    draft_id: int,
+    system_id: int = Depends(get_system_id),
+) -> IssueDraftOut:
+    """Retrieve a single issue draft.
+
+    probe-agent:
+      role: API boundary for retrieving one issue draft
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: verify a draft owned by another system returns 404.
+    """
+    from ..issue_drafts import get_draft
+
+    draft = get_draft(system_id, draft_id)
+    if draft is None:
+        raise HTTPException(status_code=404, detail="Issue draft not found")
+    return IssueDraftOut(**draft)
+
+
+@router.patch("/issue-drafts/{draft_id}", response_model=IssueDraftOut)
+def update_issue_draft_endpoint(
+    draft_id: int,
+    payload: IssueDraftUpdateRequest,
+    system_id: int = Depends(get_system_id),
+) -> IssueDraftOut:
+    """Edit a draft's title/body/status or register an external issue URL.
+
+    probe-agent:
+      role: API boundary for editing an issue draft and registering its URL
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: transformation
+      state_effects: [database-write]
+      probe_value: verify status stays within the finite vocabulary and
+        external_url is validated as http(s) but never fetched or synced.
+    """
+    from ..issue_drafts import DraftValidationError, update_draft
+
+    fields_set = payload.model_fields_set
+    try:
+        draft = update_draft(
+            system_id,
+            draft_id,
+            title=payload.title,
+            body_markdown=payload.body_markdown,
+            status=payload.status,
+            external_url=payload.external_url,
+            external_url_set="external_url" in fields_set,
+        )
+    except DraftValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    if draft is None:
+        raise HTTPException(status_code=404, detail="Issue draft not found")
+    return IssueDraftOut(**draft)
+
+
 def _build_out(job: dict) -> SystemUnderstandingBuildOut:
     from ..models import (
         SystemUnderstandingArtifactCountsOut,
@@ -528,6 +653,7 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
         SystemUnderstandingGapDocRef,
         SystemUnderstandingGapSymbolRef,
         SystemUnderstandingGapEntrypointRef,
+        IssueDraftRefOut,
     )
     pipeline = [
         SystemUnderstandingPipelineStepOut(step=s.step, status=s.status, detail=s.detail)
@@ -558,6 +684,8 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
             entrypoint_refs=[SystemUnderstandingGapEntrypointRef(**er) for er in g.get("entrypoint_refs", [])],
             code_refs=g.get("code_refs", []),
             next_actions=[SystemUnderstandingGapNextActionOut(**na) for na in g.get("next_actions", [])],
+            source_key=g.get("source_key"),
+            issue_drafts=[IssueDraftRefOut(**d) for d in g.get("issue_drafts", [])],
         )
         for g in summary.gaps
     ]

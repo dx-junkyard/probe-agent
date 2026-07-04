@@ -2172,6 +2172,15 @@ class SystemUnderstandingGapEntrypointRef(BaseModel):
     entrypoint_ref: Optional[str] = None
 
 
+class IssueDraftRefOut(BaseModel):
+    """Lightweight reference to an issue draft, embedded next to its gap."""
+
+    id: int
+    status: str
+    external_url: Optional[str] = None
+    title: str
+
+
 class SystemUnderstandingGapOut(BaseModel):
     gap_type: Optional[str] = None
     severity: str = "info"
@@ -2184,6 +2193,10 @@ class SystemUnderstandingGapOut(BaseModel):
     entrypoint_refs: List[SystemUnderstandingGapEntrypointRef] = Field(default_factory=list)
     code_refs: List[Dict[str, Any]] = Field(default_factory=list)
     next_actions: List[SystemUnderstandingGapNextActionOut] = Field(default_factory=list)
+    # Issue #107: stable identity for matching drafts back to this gap, plus any
+    # issue drafts already generated for it (with registered external URLs).
+    source_key: Optional[str] = None
+    issue_drafts: List[IssueDraftRefOut] = Field(default_factory=list)
 
 
 class SystemUnderstandingOut(BaseModel):
@@ -2267,6 +2280,58 @@ class SystemUnderstandingJobRetryIn(BaseModel):
     """Optional step name to retry only that step (plus its dependents)."""
 
     step: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Issue drafts (Issue #107)
+# ---------------------------------------------------------------------------
+
+
+class IssueDraftCreateRequest(BaseModel):
+    """Generate an issue draft from a System Understanding gap.
+
+    The server renders the Markdown body deterministically and pins the current
+    snapshot id / commit sha, so callers only supply the gap they are looking at.
+    """
+
+    source_type: Literal[
+        "system_understanding_gap", "interview", "probe_proposal"
+    ] = "system_understanding_gap"
+    gap: SystemUnderstandingGapOut
+
+
+class IssueDraftUpdateRequest(BaseModel):
+    """Partial update of an issue draft.
+
+    Any field left unset is preserved. `external_url` uses the model's set-ness
+    (exclude_unset) so passing `""` clears a previously registered URL while
+    omitting it leaves the current value untouched.
+    """
+
+    title: Optional[str] = None
+    body_markdown: Optional[str] = None
+    status: Optional[
+        Literal["draft", "copied", "external_created", "closed", "rejected"]
+    ] = None
+    external_url: Optional[str] = None
+
+
+class IssueDraftOut(BaseModel):
+    id: int
+    system_id: int
+    snapshot_id: Optional[int] = None
+    commit_sha: Optional[str] = None
+    source_type: str
+    source_key: Optional[str] = None
+    gap_type: Optional[str] = None
+    severity: Optional[str] = None
+    node_name: Optional[str] = None
+    title: str
+    body_markdown: str
+    status: str
+    external_url: Optional[str] = None
+    created_at: float
+    updated_at: float
 
 
 # ---------------------------------------------------------------------------

@@ -1217,6 +1217,39 @@ CREATE INDEX IF NOT EXISTS idx_understanding_llm_tasks_build
 
 CREATE INDEX IF NOT EXISTS idx_understanding_llm_tasks_system
     ON system_understanding_llm_tasks (system_id, snapshot_id, chunk_content_hash);
+
+-- Issue drafts (Issue #107). probe-agent is the source of truth for issue
+-- drafts generated from System Understanding gaps (and, later, interviews /
+-- probe proposals). The draft body is a deterministic Markdown rendering of an
+-- already-derived gap (its title, evidence, and pinned snapshot), not an
+-- open-ended inference. External issue trackers are not integrated; the user
+-- registers the URL of an issue they created elsewhere. status vocabulary:
+-- draft / copied / external_created / closed / rejected.
+CREATE TABLE IF NOT EXISTS issue_drafts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id     INTEGER NOT NULL,
+    snapshot_id   INTEGER,
+    commit_sha    TEXT,
+    source_type   TEXT NOT NULL DEFAULT 'system_understanding_gap',
+    source_key    TEXT,
+    gap_type      TEXT,
+    severity      TEXT,
+    node_name     TEXT,
+    title         TEXT NOT NULL,
+    body_markdown TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'draft',
+    external_url  TEXT,
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_issue_drafts_system
+    ON issue_drafts (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_issue_drafts_source
+    ON issue_drafts (system_id, source_key);
 """
 
 
