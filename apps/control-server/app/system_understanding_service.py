@@ -15,11 +15,15 @@ probe-agent:
 """
 
 import json
+import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from .db import get_conn
+
+logger = logging.getLogger(__name__)
 
 
 # Pipeline step names (from docs/system-understanding-navigation.md)
@@ -696,145 +700,186 @@ def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
         return summary
 
 
-def build_system_understanding(system_id: int) -> SystemUnderstandingSummary:
-    """Execute or re-use existing steps to build a system understanding.
+def _mark_build_step(build_id: Optional[int], step: str) -> None:
+    if build_id is None:
+        return
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE system_understanding_builds SET current_step = ? WHERE id = ?",
+            (step, build_id),
+        )
 
-    Runs deterministic steps (snapshot check, symbol index, entrypoint discovery)
-    where possible. Steps requiring a reasoning model are marked as blocked
-    if no reasoning model is configured.
+
+def _run_symbols_indexed_step(system_id: int, snapshot_id: int, build_id: Optional[int]) -> None:
+    """Deterministic AST indexing. Reads/writes are short-lived; parsing runs
+    without holding a database connection so it cannot stall unrelated requests.
     """
     from .code_indexer import index_snapshot_files
-    from .llm import LLMConfig, create_llm_client, get_llm_client, is_reasoning_model, LLMError
 
+    _mark_build_step(build_id, "symbols_indexed")
     with get_conn() as conn:
-        snapshot_row = _get_latest_ready_snapshot(conn, system_id)
-        if not snapshot_row:
-            return get_system_understanding(system_id)
-
-        snapshot_id = snapshot_row["id"]
-        commit_sha = snapshot_row["commit_sha"]
-
-        # Step: symbols_indexed - deterministic, can be auto-run
         sym_run = conn.execute(
             "SELECT id FROM intelligence_runs WHERE system_id = ? AND run_type = 'symbol_index' AND snapshot_id = ? AND status = 'completed' LIMIT 1",
             (system_id, snapshot_id),
         ).fetchone()
+        file_rows = None
         if not sym_run:
             file_rows = conn.execute(
                 "SELECT path, content, content_hash FROM snapshot_files WHERE snapshot_id = ? AND inclusion_status = 'indexed' ORDER BY path",
                 (snapshot_id,),
             ).fetchall()
-            if file_rows:
-                try:
-                    files = [(fr["path"], bytes(fr["content"] or b"")) for fr in file_rows]
-                    result = index_snapshot_files(files)
-                    now = time.time()
-                    run_id = conn.execute(
-                        """INSERT INTO intelligence_runs
-                            (system_id, snapshot_id, run_type, provider, model,
-                             prompt_version, schema_version, decision_method,
-                             status, is_mock, started_at, completed_at)
-                        VALUES (?, ?, 'symbol_index', 'deterministic', 'n/a',
-                                'n/a', 'provenance-v1', 'deterministic',
-                                'completed', 0, ?, ?)""",
-                        (system_id, snapshot_id, now, now),
-                    ).lastrowid
-                    for sym in result.symbols:
-                        conn.execute(
-                            """INSERT OR IGNORE INTO code_symbols
-                                (snapshot_id, system_id, path, qualified_name, kind, start_line, end_line,
-                                 docstring, decorators, imports, is_test, route_path, route_method,
-                                 component_id, symbol_source_hash, symbol_body_hash)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                            (
-                                snapshot_id, system_id, sym.path, sym.qualified_name,
-                                sym.kind, sym.start_line, sym.end_line,
-                                sym.docstring, json.dumps(sym.decorators), json.dumps(sym.imports),
-                                1 if sym.is_test else 0, sym.route_path, sym.route_method,
-                                sym.component_id,
-                                sym.symbol_source_hash, sym.symbol_body_hash,
-                            ),
-                        )
-                except Exception as _exc:
-                    import logging
-                    logging.getLogger(__name__).warning("Symbol index in build failed: %s", _exc, exc_info=True)
+    if sym_run or not file_rows:
+        return
 
-        # Step: entrypoints_discovered - deterministic, can be auto-run
+    started_at = time.time()
+    try:
+        files = [(fr["path"], bytes(fr["content"] or b"")) for fr in file_rows]
+        result = index_snapshot_files(files)
+    except Exception as exc:
+        logger.warning("Symbol index in build failed: %s", exc, exc_info=True)
+        return
+    logger.info(
+        "system_understanding build_id=%s step=symbols_indexed indexed %d symbols in %.2fs",
+        build_id, len(result.symbols), time.time() - started_at,
+    )
+
+    with get_conn() as conn:
+        now = time.time()
+        conn.execute(
+            """INSERT INTO intelligence_runs
+                (system_id, snapshot_id, run_type, provider, model,
+                 prompt_version, schema_version, decision_method,
+                 status, is_mock, started_at, completed_at)
+            VALUES (?, ?, 'symbol_index', 'deterministic', 'n/a',
+                    'n/a', 'provenance-v1', 'deterministic',
+                    'completed', 0, ?, ?)""",
+            (system_id, snapshot_id, started_at, now),
+        )
+        for sym in result.symbols:
+            conn.execute(
+                """INSERT OR IGNORE INTO code_symbols
+                    (snapshot_id, system_id, path, qualified_name, kind, start_line, end_line,
+                     docstring, decorators, imports, is_test, route_path, route_method,
+                     component_id, symbol_source_hash, symbol_body_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    snapshot_id, system_id, sym.path, sym.qualified_name,
+                    sym.kind, sym.start_line, sym.end_line,
+                    sym.docstring, json.dumps(sym.decorators), json.dumps(sym.imports),
+                    1 if sym.is_test else 0, sym.route_path, sym.route_method,
+                    sym.component_id,
+                    sym.symbol_source_hash, sym.symbol_body_hash,
+                ),
+            )
+
+
+def _run_entrypoints_discovered_step(system_id: int, snapshot_id: int, build_id: Optional[int]) -> None:
+    """Deterministic entrypoint discovery, run without holding a connection."""
+    from .entrypoint_discovery import discover_entrypoints
+    from .flow_graph import SymbolRecord
+
+    _mark_build_step(build_id, "entrypoints_discovered")
+    with get_conn() as conn:
         ep_run = conn.execute(
             "SELECT id FROM intelligence_runs WHERE system_id = ? AND run_type = 'entrypoint_index' AND snapshot_id = ? LIMIT 1",
             (system_id, snapshot_id),
         ).fetchone()
+        symbols = None
+        file_rows_ep = None
         if not ep_run:
             symbols = conn.execute(
                 "SELECT * FROM code_symbols WHERE system_id = ? AND snapshot_id = ?",
                 (system_id, snapshot_id),
             ).fetchall()
             if symbols:
-                try:
-                    from .entrypoint_discovery import discover_entrypoints
-                    from .flow_graph import SymbolRecord
-                    file_rows_ep = conn.execute(
-                        "SELECT path, content FROM snapshot_files WHERE snapshot_id = ? AND inclusion_status = 'indexed' ORDER BY path",
-                        (snapshot_id,),
-                    ).fetchall()
-                    ep_files = [(fr["path"], (bytes(fr["content"] or b"")).decode("utf-8", errors="replace")) for fr in file_rows_ep]
-                    sym_records = [
-                        SymbolRecord(
-                            symbol_id=s["id"],
-                            path=s["path"],
-                            qualified_name=s["qualified_name"],
-                            kind=s["kind"],
-                            start_line=s["start_line"],
-                            end_line=s["end_line"],
-                            decorators=json.loads(s["decorators"]) if isinstance(s["decorators"], str) else (s["decorators"] or []),
-                            component_id=s["component_id"],
-                            route_path=s["route_path"],
-                            route_method=s["route_method"],
-                            docstring=s["docstring"],
-                            is_test=bool(s["is_test"]),
-                        )
-                        for s in symbols
-                    ]
-                    discovery = discover_entrypoints(sym_records, ep_files)
-                    now = time.time()
-                    run_id = conn.execute(
-                        """INSERT INTO intelligence_runs
-                            (system_id, snapshot_id, run_type, provider, model,
-                             prompt_version, schema_version, decision_method,
-                             status, is_mock, started_at, completed_at)
-                        VALUES (?, ?, 'entrypoint_index', 'deterministic', 'n/a',
-                                'n/a', 'provenance-v1', 'deterministic',
-                                'completed', 0, ?, ?)""",
-                        (system_id, snapshot_id, now, now),
-                    ).lastrowid
-                    for ep in discovery.entrypoints + discovery.functions:
-                        sym_row = next(
-                            (s for s in symbols if s["qualified_name"] == ep.qualified_name),
-                            None,
-                        )
-                        handler_symbol_id = sym_row["id"] if sym_row else None
-                        conn.execute(
-                            """INSERT OR IGNORE INTO code_entrypoints
-                                (system_id, snapshot_id, entrypoint_type, entrypoint_id, category, label,
-                                 handler_symbol_id, handler_qualified_name, handler_path,
-                                 route_method, route_path, framework, operation, confidence,
-                                 line_start, line_end, source, created_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'deterministic', ?)""",
-                            (
-                                system_id, snapshot_id, ep.entrypoint_type, ep.entrypoint_id,
-                                ep.category, ep.label,
-                                handler_symbol_id, ep.qualified_name, ep.path,
-                                ep.route_method, ep.route_path,
-                                ep.framework, ep.operation, ep.confidence,
-                                ep.line_start, ep.line_end,
-                                now,
-                            ),
-                        )
-                except Exception as _ep_exc:
-                    import logging
-                    logging.getLogger(__name__).warning("Entrypoint discovery in build failed: %s", _ep_exc, exc_info=True)
+                file_rows_ep = conn.execute(
+                    "SELECT path, content FROM snapshot_files WHERE snapshot_id = ? AND inclusion_status = 'indexed' ORDER BY path",
+                    (snapshot_id,),
+                ).fetchall()
+    if ep_run or not symbols:
+        return
 
-        # Step: documentation pipeline (requires reasoning model)
+    started_at = time.time()
+    try:
+        ep_files = [(fr["path"], (bytes(fr["content"] or b"")).decode("utf-8", errors="replace")) for fr in file_rows_ep]
+        sym_records = [
+            SymbolRecord(
+                symbol_id=s["id"],
+                path=s["path"],
+                qualified_name=s["qualified_name"],
+                kind=s["kind"],
+                start_line=s["start_line"],
+                end_line=s["end_line"],
+                decorators=json.loads(s["decorators"]) if isinstance(s["decorators"], str) else (s["decorators"] or []),
+                component_id=s["component_id"],
+                route_path=s["route_path"],
+                route_method=s["route_method"],
+                docstring=s["docstring"],
+                is_test=bool(s["is_test"]),
+            )
+            for s in symbols
+        ]
+        discovery = discover_entrypoints(sym_records, ep_files)
+    except Exception as exc:
+        logger.warning("Entrypoint discovery in build failed: %s", exc, exc_info=True)
+        return
+    logger.info(
+        "system_understanding build_id=%s step=entrypoints_discovered found %d entrypoints in %.2fs",
+        build_id, len(discovery.entrypoints) + len(discovery.functions), time.time() - started_at,
+    )
+
+    with get_conn() as conn:
+        now = time.time()
+        conn.execute(
+            """INSERT INTO intelligence_runs
+                (system_id, snapshot_id, run_type, provider, model,
+                 prompt_version, schema_version, decision_method,
+                 status, is_mock, started_at, completed_at)
+            VALUES (?, ?, 'entrypoint_index', 'deterministic', 'n/a',
+                    'n/a', 'provenance-v1', 'deterministic',
+                    'completed', 0, ?, ?)""",
+            (system_id, snapshot_id, started_at, now),
+        )
+        for ep in discovery.entrypoints + discovery.functions:
+            sym_row = next(
+                (s for s in symbols if s["qualified_name"] == ep.qualified_name),
+                None,
+            )
+            handler_symbol_id = sym_row["id"] if sym_row else None
+            conn.execute(
+                """INSERT OR IGNORE INTO code_entrypoints
+                    (system_id, snapshot_id, entrypoint_type, entrypoint_id, category, label,
+                     handler_symbol_id, handler_qualified_name, handler_path,
+                     route_method, route_path, framework, operation, confidence,
+                     line_start, line_end, source, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'deterministic', ?)""",
+                (
+                    system_id, snapshot_id, ep.entrypoint_type, ep.entrypoint_id,
+                    ep.category, ep.label,
+                    handler_symbol_id, ep.qualified_name, ep.path,
+                    ep.route_method, ep.route_path,
+                    ep.framework, ep.operation, ep.confidence,
+                    ep.line_start, ep.line_end,
+                    now,
+                ),
+            )
+
+
+def _run_documentation_pipeline_step(system_id: int, snapshot_id: int, build_id: Optional[int]) -> None:
+    """Reasoning-model documentation indexing and claim scanning.
+
+    The LLM calls (bounded by LLM_TIMEOUT / INTELLIGENCE_LLM_TIMEOUT) run
+    outside of any held database connection so a slow or hanging provider
+    cannot block unrelated requests such as /health, /auth/me, or /systems.
+    """
+    from .documentation_indexer import build_documentation_index
+    from .documentation_claim_scanner import scan_all_chunks
+    from .understanding_graph import build_understanding_graph, save_graph_snapshot
+    from .docs_code_reconciler import reconcile
+    from .llm import LLMConfig, create_llm_client
+
+    _mark_build_step(build_id, "documentation_indexed")
+    with get_conn() as conn:
         doc_indexed = conn.execute(
             "SELECT id FROM intelligence_runs WHERE system_id = ? AND run_type IN ('draft_generation', 'repository_drafts') AND snapshot_id = ? AND status = 'completed' LIMIT 1",
             (system_id, snapshot_id),
@@ -843,78 +888,196 @@ def build_system_understanding(system_id: int) -> SystemUnderstandingSummary:
             "SELECT id FROM understanding_graph_snapshots WHERE system_id = ? AND snapshot_id = ? LIMIT 1",
             (system_id, snapshot_id),
         ).fetchone()
+        if (doc_indexed and graph_row) or not _is_reasoning_model_available():
+            return
+        doc_index = build_documentation_index(conn, system_id, snapshot_id)
 
-        if not doc_indexed or not graph_row:
-            if _is_reasoning_model_available():
-                try:
-                    from .documentation_indexer import build_documentation_index
-                    from .documentation_claim_scanner import scan_all_chunks
-                    from .understanding_graph import build_understanding_graph, save_graph_snapshot
-                    from .docs_code_reconciler import reconcile
+    started_at = time.time()
+    try:
+        config = LLMConfig.intelligence_from_env()
+        client = create_llm_client(config)
+        scan_results = scan_all_chunks(client, config, doc_index.chunks)
+        graph = build_understanding_graph(scan_results)
+    except Exception as exc:
+        logger.warning("Documentation pipeline in build failed: %s", exc, exc_info=True)
+        return
+    logger.info(
+        "system_understanding build_id=%s step=documentation_indexed scanned %d chunks in %.2fs",
+        build_id, len(doc_index.chunks), time.time() - started_at,
+    )
 
-                    doc_index = build_documentation_index(conn, system_id, snapshot_id)
-                    config = LLMConfig.intelligence_from_env()
-                    client = create_llm_client(config)
-                    scan_results = scan_all_chunks(client, config, doc_index.chunks)
-                    graph = build_understanding_graph(scan_results)
-                    save_graph_snapshot(conn, system_id, graph, snapshot_id=snapshot_id)
-                    reconcile(conn, system_id, snapshot_id, graph)
-                except Exception as _doc_exc:
-                    import logging
-                    logging.getLogger(__name__).warning("Documentation pipeline in build failed: %s", _doc_exc, exc_info=True)
+    with get_conn() as conn:
+        save_graph_snapshot(conn, system_id, graph, snapshot_id=snapshot_id)
+        reconcile(conn, system_id, snapshot_id, graph)
 
-        # Step: capability_hierarchy_ready (deterministic base)
+
+def _run_capability_hierarchy_step(system_id: int, snapshot_id: int, build_id: Optional[int]) -> None:
+    """Deterministic capability grouping from already-indexed symbols/entrypoints."""
+    from .capability_hierarchy import (
+        build_hierarchy,
+        PROMPT_VERSION as HIERARCHY_PROMPT_VERSION,
+        SCHEMA_VERSION as HIERARCHY_SCHEMA_VERSION,
+    )
+    from .routes.project_intelligence import (
+        _hierarchy_symbol_records,
+        _hierarchy_entrypoint_records,
+        _persist_hierarchy_node,
+    )
+
+    _mark_build_step(build_id, "capability_hierarchy_ready")
+    with get_conn() as conn:
         cap_run = conn.execute(
             "SELECT id FROM intelligence_runs WHERE system_id = ? AND run_type = 'capability_hierarchy' AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
             (system_id, snapshot_id),
         ).fetchone()
-        if not cap_run:
-            try:
-                from .capability_hierarchy import (
-                    build_hierarchy,
-                    PROMPT_VERSION as HIERARCHY_PROMPT_VERSION,
-                    SCHEMA_VERSION as HIERARCHY_SCHEMA_VERSION,
-                )
-                from .routes.project_intelligence import (
-                    _hierarchy_symbol_records,
-                    _hierarchy_entrypoint_records,
-                    _persist_hierarchy_node,
-                )
+        if cap_run:
+            return
+        symbols_h = _hierarchy_symbol_records(conn, snapshot_id, system_id)
+        entrypoints_h = _hierarchy_entrypoint_records(conn, snapshot_id, system_id)
+        if not symbols_h:
+            return
+        draft_row = conn.execute(
+            "SELECT id, name, purpose FROM system_profile_drafts WHERE system_id = ? AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
+            (system_id, snapshot_id),
+        ).fetchone()
 
-                symbols_h = _hierarchy_symbol_records(conn, snapshot_id, system_id)
-                entrypoints_h = _hierarchy_entrypoint_records(conn, snapshot_id, system_id)
+    sp_draft = {"id": draft_row["id"], "name": draft_row["name"], "purpose": draft_row["purpose"]} if draft_row else None
+    started_at = time.time()
+    built = build_hierarchy(symbols_h, entrypoints_h, sp_draft)
+    logger.info(
+        "system_understanding build_id=%s step=capability_hierarchy_ready built %d capabilities in %.2fs",
+        build_id, len(built.capabilities), time.time() - started_at,
+    )
 
-                if symbols_h:
-                    draft_row = conn.execute(
-                        "SELECT id, name, purpose FROM system_profile_drafts WHERE system_id = ? AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
-                        (system_id, snapshot_id),
-                    ).fetchone()
-                    sp_draft = {"id": draft_row["id"], "name": draft_row["name"], "purpose": draft_row["purpose"]} if draft_row else None
+    with get_conn() as conn:
+        now = time.time()
+        run_id = conn.execute(
+            """INSERT INTO intelligence_runs
+                (system_id, snapshot_id, run_type, provider, model,
+                 prompt_version, schema_version, decision_method,
+                 status, is_mock, started_at, completed_at)
+            VALUES (?, ?, 'capability_hierarchy', 'deterministic', 'none',
+                    ?, ?, 'deterministic', 'completed', 0, ?, ?)""",
+            (system_id, snapshot_id, HIERARCHY_PROMPT_VERSION, HIERARCHY_SCHEMA_VERSION, started_at, now),
+        ).lastrowid
 
-                    built = build_hierarchy(symbols_h, entrypoints_h, sp_draft)
+        purpose_id = None
+        if built.purpose is not None:
+            purpose_id = _persist_hierarchy_node(conn, system_id, snapshot_id, run_id, built.purpose, None, now)
+        for cap in built.capabilities:
+            _persist_hierarchy_node(conn, system_id, snapshot_id, run_id, cap, purpose_id, now)
+        for node in built.unclassified_elements:
+            _persist_hierarchy_node(conn, system_id, snapshot_id, run_id, node, None, now)
+        for node in built.unattached_supporting:
+            _persist_hierarchy_node(conn, system_id, snapshot_id, run_id, node, None, now)
 
-                    now = time.time()
-                    run_id = conn.execute(
-                        """INSERT INTO intelligence_runs
-                            (system_id, snapshot_id, run_type, provider, model,
-                             prompt_version, schema_version, decision_method,
-                             status, is_mock, started_at, completed_at)
-                        VALUES (?, ?, 'capability_hierarchy', 'deterministic', 'none',
-                                ?, ?, 'deterministic', 'completed', 0, ?, ?)""",
-                        (system_id, snapshot_id, HIERARCHY_PROMPT_VERSION, HIERARCHY_SCHEMA_VERSION, now, now),
-                    ).lastrowid
 
-                    purpose_id = None
-                    if built.purpose is not None:
-                        purpose_id = _persist_hierarchy_node(conn, system_id, snapshot_id, run_id, built.purpose, None, now)
-                    for cap in built.capabilities:
-                        _persist_hierarchy_node(conn, system_id, snapshot_id, run_id, cap, purpose_id, now)
-                    for node in built.unclassified_elements:
-                        _persist_hierarchy_node(conn, system_id, snapshot_id, run_id, node, None, now)
-                    for node in built.unattached_supporting:
-                        _persist_hierarchy_node(conn, system_id, snapshot_id, run_id, node, None, now)
-            except Exception as _cap_exc:
-                import logging
-                logging.getLogger(__name__).warning("Capability hierarchy in build failed: %s", _cap_exc, exc_info=True)
+def build_system_understanding(
+    system_id: int, build_id: Optional[int] = None
+) -> SystemUnderstandingSummary:
+    """Execute or re-use existing steps to build a system understanding.
+
+    Runs deterministic steps (snapshot check, symbol index, entrypoint discovery)
+    where possible. Steps requiring a reasoning model are marked as blocked
+    if no reasoning model is configured.
+
+    Each step opens its own short-lived database connection and performs any
+    CPU- or network-bound work (AST parsing, LLM calls) without holding a
+    connection, so a slow step cannot starve unrelated requests of the shared
+    database lock (see Issue #106).
+    """
+    with get_conn() as conn:
+        snapshot_row = _get_latest_ready_snapshot(conn, system_id)
+    if not snapshot_row:
+        return get_system_understanding(system_id)
+
+    snapshot_id = snapshot_row["id"]
+
+    for step_name, step_fn in (
+        ("symbols_indexed", _run_symbols_indexed_step),
+        ("entrypoints_discovered", _run_entrypoints_discovered_step),
+        ("documentation_indexed", _run_documentation_pipeline_step),
+        ("capability_hierarchy_ready", _run_capability_hierarchy_step),
+    ):
+        try:
+            step_fn(system_id, snapshot_id, build_id)
+        except Exception:
+            logger.warning(
+                "system_understanding build_id=%s step=%s raised unexpectedly",
+                build_id, step_name, exc_info=True,
+            )
 
     return get_system_understanding(system_id)
+
+
+def start_system_understanding_build(system_id: int) -> int:
+    """Enqueue a system understanding build as a background job.
+
+    Returns the new build's id immediately; the build itself runs on a
+    background thread so the HTTP request that triggered it (and every other
+    request) is never held open for the duration of the build.
+    """
+    with get_conn() as conn:
+        snapshot_row = _get_latest_ready_snapshot(conn, system_id)
+        snapshot_id = snapshot_row["id"] if snapshot_row else None
+        build_id = conn.execute(
+            """INSERT INTO system_understanding_builds
+                (system_id, snapshot_id, status, created_at)
+            VALUES (?, ?, 'queued', ?)""",
+            (system_id, snapshot_id, time.time()),
+        ).lastrowid
+
+    thread = threading.Thread(
+        target=_run_build_job, args=(build_id, system_id), daemon=True
+    )
+    thread.start()
+    return build_id
+
+
+def _run_build_job(build_id: int, system_id: int) -> None:
+    started_at = time.time()
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE system_understanding_builds SET status = 'running', started_at = ? WHERE id = ?",
+            (started_at, build_id),
+        )
+    logger.info("system_understanding build %s starting for system_id=%s", build_id, system_id)
+
+    try:
+        build_system_understanding(system_id, build_id=build_id)
+    except Exception as exc:
+        logger.exception("system_understanding build %s failed", build_id)
+        with get_conn() as conn:
+            conn.execute(
+                """UPDATE system_understanding_builds
+                SET status = 'failed', error = ?, current_step = NULL, completed_at = ?
+                WHERE id = ?""",
+                (str(exc), time.time(), build_id),
+            )
+        return
+
+    elapsed = time.time() - started_at
+    logger.info("system_understanding build %s completed in %.2fs", build_id, elapsed)
+    with get_conn() as conn:
+        conn.execute(
+            """UPDATE system_understanding_builds
+            SET status = 'completed', current_step = NULL, completed_at = ?
+            WHERE id = ?""",
+            (time.time(), build_id),
+        )
+
+
+def get_system_understanding_build(system_id: int, build_id: int):
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM system_understanding_builds WHERE id = ? AND system_id = ?",
+            (build_id, system_id),
+        ).fetchone()
+
+
+def get_latest_system_understanding_build(system_id: int):
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM system_understanding_builds WHERE system_id = ? ORDER BY id DESC LIMIT 1",
+            (system_id,),
+        ).fetchone()

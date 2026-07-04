@@ -116,6 +116,7 @@ from ..models import (
     SymbolIndexOut,
     SymbolIndexWarningOut,
     SystemProfileDraftOut,
+    SystemUnderstandingBuildOut,
     ValidationCommandOut,
     ValidationRunOut,
 )
@@ -219,25 +220,96 @@ def get_system_understanding_endpoint(
 
 @router.post(
     "/repository/system-understanding/build",
-    response_model=SystemUnderstandingOut,
+    response_model=SystemUnderstandingBuildOut,
+    status_code=202,
 )
 def build_system_understanding_endpoint(
     system_id: int = Depends(get_system_id),
-) -> SystemUnderstandingOut:
-    """Trigger a full system understanding build from the latest snapshot.
+) -> SystemUnderstandingBuildOut:
+    """Enqueue a system understanding build and return immediately.
 
     probe-agent:
-      role: API boundary for orchestrating system understanding build
+      role: API boundary for enqueueing an asynchronous system understanding build
       capability: repository-understanding
       element_type: boundary
       consumers: [dashboard, control-server]
       operation_kind: orchestration
       state_effects: [database-read, database-write]
-      probe_value: verify build completes and persists pipeline steps correctly
+      probe_value: verify the request returns immediately with a build id while the
+        build runs in the background, and that /health, /auth/me, and /systems stay
+        responsive while a build is in flight (Issue #106).
     """
-    from ..system_understanding_service import build_system_understanding
-    summary = build_system_understanding(system_id)
-    return _system_understanding_to_out(summary)
+    from ..system_understanding_service import (
+        get_system_understanding_build,
+        start_system_understanding_build,
+    )
+    build_id = start_system_understanding_build(system_id)
+    return _build_out(get_system_understanding_build(system_id, build_id))
+
+
+@router.get(
+    "/repository/system-understanding/build/latest",
+    response_model=Optional[SystemUnderstandingBuildOut],
+)
+def get_latest_system_understanding_build_endpoint(
+    system_id: int = Depends(get_system_id),
+) -> Optional[SystemUnderstandingBuildOut]:
+    """Poll the most recently triggered system understanding build.
+
+    probe-agent:
+      role: API boundary for polling system understanding build progress
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: verify build status/current_step/error are visible without
+        blocking on the build itself.
+    """
+    from ..system_understanding_service import get_latest_system_understanding_build
+    row = get_latest_system_understanding_build(system_id)
+    return _build_out(row) if row else None
+
+
+@router.get(
+    "/repository/system-understanding/build/{build_id}",
+    response_model=SystemUnderstandingBuildOut,
+)
+def get_system_understanding_build_endpoint(
+    build_id: int,
+    system_id: int = Depends(get_system_id),
+) -> SystemUnderstandingBuildOut:
+    """Poll a specific system understanding build by id.
+
+    probe-agent:
+      role: API boundary for polling a specific system understanding build
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: verify build status/current_step/error are visible without
+        blocking on the build itself.
+    """
+    from ..system_understanding_service import get_system_understanding_build
+    row = get_system_understanding_build(system_id, build_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Build not found")
+    return _build_out(row)
+
+
+def _build_out(row) -> SystemUnderstandingBuildOut:
+    return SystemUnderstandingBuildOut(
+        id=row["id"],
+        system_id=row["system_id"],
+        snapshot_id=row["snapshot_id"],
+        status=row["status"],
+        current_step=row["current_step"],
+        error=row["error"],
+        started_at=row["started_at"],
+        completed_at=row["completed_at"],
+        created_at=row["created_at"],
+    )
 
 
 def _system_understanding_to_out(summary) -> SystemUnderstandingOut:

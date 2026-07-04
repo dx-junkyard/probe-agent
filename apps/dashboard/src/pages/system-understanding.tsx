@@ -1,6 +1,13 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { useSystemUnderstanding, useBuildSystemUnderstanding, useSystemDiagnostics } from "@/api/hooks";
+import { useQueryClient } from "@tanstack/react-query";
+import {
+  useSystemUnderstanding,
+  useBuildSystemUnderstanding,
+  useLatestSystemUnderstandingBuild,
+  useSystemDiagnostics,
+  sysKey,
+} from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -642,6 +649,21 @@ export default function SystemUnderstandingPage() {
   const { data, isLoading, error } = useSystemUnderstanding();
   const { data: diagnostics } = useSystemDiagnostics();
   const build = useBuildSystemUnderstanding();
+  const { data: latestBuild } = useLatestSystemUnderstandingBuild();
+  const qc = useQueryClient();
+  const settledBuildId = useRef<number | null>(null);
+
+  const buildRunning = latestBuild?.status === "queued" || latestBuild?.status === "running";
+
+  // Refresh the aggregated view and diagnostics once a build settles.
+  useEffect(() => {
+    if (!latestBuild) return;
+    if (latestBuild.status !== "completed" && latestBuild.status !== "failed") return;
+    if (settledBuildId.current === latestBuild.id) return;
+    settledBuildId.current = latestBuild.id;
+    qc.invalidateQueries({ queryKey: sysKey("system-understanding") });
+    qc.invalidateQueries({ queryKey: sysKey("system-diagnostics") });
+  }, [latestBuild, qc]);
 
   const checksByStep = useMemo(() => {
     const map: Record<string, SystemDiagnosticCheck[]> = {};
@@ -667,11 +689,11 @@ export default function SystemUnderstandingPage() {
         </div>
         <Button
           onClick={() => build.mutate()}
-          disabled={build.isPending}
+          disabled={build.isPending || buildRunning}
           variant="default"
           data-testid="build-button"
         >
-          {build.isPending ? (
+          {build.isPending || buildRunning ? (
             <>
               <RefreshCw className="h-4 w-4 mr-2 animate-spin" />
               Building...
@@ -684,6 +706,31 @@ export default function SystemUnderstandingPage() {
           )}
         </Button>
       </div>
+
+      {buildRunning && (
+        <Card data-testid="build-progress">
+          <CardContent className="py-4 flex items-center gap-3">
+            <RefreshCw className="h-4 w-4 animate-spin text-muted-foreground shrink-0" />
+            <p className="text-sm text-muted-foreground">
+              Build in progress
+              {latestBuild?.current_step && (
+                <> — {STEP_LABELS[latestBuild.current_step] ?? latestBuild.current_step}</>
+              )}
+              . This page keeps working normally while the build runs in the background.
+            </p>
+          </CardContent>
+        </Card>
+      )}
+
+      {latestBuild?.status === "failed" && (
+        <Card data-testid="build-failed">
+          <CardContent className="py-4">
+            <p className="text-sm text-destructive">
+              Last build failed{latestBuild.error ? `: ${latestBuild.error}` : "."}
+            </p>
+          </CardContent>
+        </Card>
+      )}
 
       {error && (
         <Card>

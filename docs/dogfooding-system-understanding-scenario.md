@@ -82,8 +82,20 @@ deterministic な symbol index が実行される。以下を確認する:
 
 ### Step 5: System Understanding を Build する
 
+`POST /repository/system-understanding/build` は非同期ジョブとして実行され、
+build 完了を待たずに `202` と build id を即座に返す(Issue #106: 同期実行だと
+LLM 呼び出し中に `/health` `/auth/me` `/systems` まで応答不能になっていた)。
+
 ```bash
 curl -X POST http://localhost:8000/repository/system-understanding/build
+# => {"id": 1, "status": "queued", ...}
+
+# 完了するまで status をポーリングする
+curl http://localhost:8000/repository/system-understanding/build/1
+# => status が "completed" または "failed" になるまで繰り返す
+
+# 集約結果を取得する
+curl http://localhost:8000/repository/system-understanding
 ```
 
 Pipeline checklist の各ステップ status を確認する:

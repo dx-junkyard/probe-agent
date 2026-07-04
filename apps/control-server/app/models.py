@@ -2201,6 +2201,18 @@ class SystemUnderstandingOut(BaseModel):
     next_actions: List[SystemUnderstandingNextActionOut] = Field(default_factory=list)
 
 
+class SystemUnderstandingBuildOut(BaseModel):
+    id: int
+    system_id: int
+    snapshot_id: Optional[int] = None
+    status: str  # queued, running, completed, failed
+    current_step: Optional[str] = None
+    error: Optional[str] = None
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
+    created_at: float
+
+
 # ---------------------------------------------------------------------------
 # System diagnostics (Issue #101)
 # ---------------------------------------------------------------------------
