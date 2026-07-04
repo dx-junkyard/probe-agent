@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { useSystemDiagnostics } from "@/api/hooks";
 import { DiagnosticSeverityIcon } from "@/components/diagnostics-badge";
 import { cn } from "@/lib/utils";
@@ -40,19 +40,21 @@ export function useFocusedCheck(anchor: string): SystemDiagnosticCheck | null {
 export function useDiagnosticHighlight<T extends HTMLElement>(anchor: string) {
   const focus = useDiagnosticFocus();
   const ref = useRef<T>(null);
-  const matches = focus.anchor === anchor;
-  // Records the anchor whose highlight has already faded, so state is only
-  // updated from the timeout callback (never synchronously inside the effect).
-  const [fadedAnchor, setFadedAnchor] = useState<string | null>(null);
+  // Key the highlight on the specific focus (anchor + check), not just the
+  // anchor, so re-navigating to the same anchor for a different check re-fires
+  // the scroll and ring. Records the focus token whose highlight has already
+  // faded, so state is only updated from the timeout callback.
+  const focusToken = focus.anchor === anchor ? `${anchor}:${focus.checkId ?? ""}` : null;
+  const [fadedToken, setFadedToken] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!matches) return;
+    if (!focusToken) return;
     ref.current?.scrollIntoView({ behavior: "smooth", block: "center" });
-    const timer = setTimeout(() => setFadedAnchor(anchor), 4000);
+    const timer = setTimeout(() => setFadedToken(focusToken), 4000);
     return () => clearTimeout(timer);
-  }, [matches, anchor]);
+  }, [focusToken]);
 
-  const active = matches && fadedAnchor !== anchor;
+  const active = focusToken !== null && fadedToken !== focusToken;
   return {
     ref,
     "data-diag-anchor": anchor,
@@ -102,4 +104,34 @@ export function DiagnosticFixCallout({ anchor, className }: { anchor: string; cl
       </div>
     </div>
   );
+}
+
+/**
+ * Shared activation for a clicked diagnostic. `navigate` checks route to the
+ * fix page with `?diagnostic=<id>&fix=<anchor>`; `dialog` checks (env var /
+ * restart, no in-app control) are surfaced via `envCheck` so the caller can
+ * render an EnvFixDialog. Used by both the badge dialog and the in-page
+ * pipeline diagnostics so the two entry points behave identically.
+ */
+export function useDiagnosticActivate(options?: { onNavigate?: () => void }) {
+  const navigate = useNavigate();
+  const onNavigate = options?.onNavigate;
+  const [envCheck, setEnvCheck] = useState<SystemDiagnosticCheck | null>(null);
+
+  const activate = useCallback(
+    (check: SystemDiagnosticCheck) => {
+      if (check.fix_kind === "navigate" && check.fix_page) {
+        const params = new URLSearchParams();
+        params.set("diagnostic", check.check_id);
+        if (check.fix_anchor) params.set("fix", check.fix_anchor);
+        onNavigate?.();
+        navigate(`${check.fix_page}?${params.toString()}`);
+      } else {
+        setEnvCheck(check);
+      }
+    },
+    [navigate, onNavigate],
+  );
+
+  return { activate, envCheck, closeEnv: () => setEnvCheck(null) };
 }

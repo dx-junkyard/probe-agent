@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
-import { useNavigate } from "react-router-dom";
 import { useSystemDiagnostics } from "@/api/hooks";
+import { useDiagnosticActivate } from "@/components/diagnostic-fix";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -161,7 +161,7 @@ export function DiagnosticCheckCard({ check, onActivate }: {
   );
 }
 
-function EnvFixDialog({ check, onClose }: { check: SystemDiagnosticCheck | null; onClose: () => void }) {
+export function EnvFixDialog({ check, onClose }: { check: SystemDiagnosticCheck | null; onClose: () => void }) {
   return (
     <Dialog open={!!check} onOpenChange={(o) => { if (!o) onClose(); }}>
       {check && (
@@ -280,8 +280,7 @@ export function DiagnosticsDialogContent({ checks, onActivate }: {
 export function DiagnosticsBadge() {
   const { data } = useSystemDiagnostics();
   const [open, setOpen] = useState(false);
-  const [envCheck, setEnvCheck] = useState<SystemDiagnosticCheck | null>(null);
-  const navigate = useNavigate();
+  const { activate, envCheck, closeEnv } = useDiagnosticActivate();
 
   if (!data) return null;
 
@@ -290,16 +289,11 @@ export function DiagnosticsBadge() {
   const warningCount = data.severity_counts["warning"] ?? 0;
   const attention = errorCount + warningCount;
 
-  const activate = (check: SystemDiagnosticCheck) => {
-    if (check.fix_kind === "navigate" && check.fix_page) {
-      const params = new URLSearchParams();
-      params.set("diagnostic", check.check_id);
-      if (check.fix_anchor) params.set("fix", check.fix_anchor);
-      setOpen(false);
-      navigate(`${check.fix_page}?${params.toString()}`);
-    } else {
-      setEnvCheck(check);
-    }
+  // Close the list dialog before routing or opening the env dialog so the two
+  // modals never stack.
+  const handleActivate = (check: SystemDiagnosticCheck) => {
+    setOpen(false);
+    activate(check);
   };
 
   return (
@@ -336,9 +330,9 @@ export function DiagnosticsBadge() {
         <DialogHeader>
           <DialogTitle>System Settings Diagnostics</DialogTitle>
         </DialogHeader>
-        <DiagnosticsDialogContent checks={data.checks} onActivate={activate} />
+        <DiagnosticsDialogContent checks={data.checks} onActivate={handleActivate} />
       </Dialog>
-      <EnvFixDialog check={envCheck} onClose={() => setEnvCheck(null)} />
+      <EnvFixDialog check={envCheck} onClose={closeEnv} />
     </>
   );
 }

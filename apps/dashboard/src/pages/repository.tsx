@@ -43,8 +43,9 @@ export default function RepositoryPage() {
   const configKey = systemId != null ? `${systemId}-${config?.repo_path ?? ""}` : "empty";
 
   // Issue #115: when routed here from a diagnostic, open the tab that holds the
-  // fix location and highlight it. Remounting on the anchor lets the diagnostic
-  // pick the tab while normal tab switching stays user-controlled.
+  // fix location and highlight it. The tab is controlled so a diagnostic can
+  // select it without discarding in-progress form state, while normal tab
+  // switching stays user-controlled.
   const focus = useDiagnosticFocus();
   const anchorTab =
     focus.anchor === "snapshot-create"
@@ -53,13 +54,25 @@ export default function RepositoryPage() {
         ? "config"
         : null;
 
+  // Controlled tab: a fresh diagnostic navigation (anchor/check changes) selects
+  // the tab holding the fix, while later manual switching stays user-controlled.
+  // State is adjusted during render (guarded by the focus token) rather than in
+  // an effect, per the React "adjusting state when a prop changes" pattern.
+  const [tab, setTab] = useState(anchorTab ?? "config");
+  const focusToken = anchorTab ? `${focus.anchor}:${focus.checkId ?? ""}` : null;
+  const [lastToken, setLastToken] = useState(focusToken);
+  if (focusToken && focusToken !== lastToken) {
+    setLastToken(focusToken);
+    setTab(anchorTab!);
+  }
+
   const snapshotHighlight = useDiagnosticHighlight<HTMLButtonElement>("snapshot-create");
 
   return (
     <div className="space-y-6">
       <h1 className="text-2xl font-bold tracking-tight">Repository</h1>
 
-      <Tabs key={anchorTab ?? "default"} defaultValue={anchorTab ?? "config"}>
+      <Tabs value={tab} onValueChange={setTab}>
         <TabsList>
           <TabsTrigger value="config">Configuration</TabsTrigger>
           <TabsTrigger value="snapshots">Snapshots</TabsTrigger>
@@ -387,6 +400,7 @@ function RepoConfigForm({ config, candidates, onSave, isPending }: {
   const [repoPath, setRepoPath] = useState(config?.repo_path ?? "");
   const [includePatterns, setIncludePatterns] = useState(patternsToText(config?.include_patterns));
   const [excludePatterns, setExcludePatterns] = useState(patternsToText(config?.exclude_patterns));
+  const repoPathHighlight = useDiagnosticHighlight<HTMLDivElement>("repo-config");
   const patternsHighlight = useDiagnosticHighlight<HTMLDivElement>("repo-patterns");
 
   const handleSave = async () => {
@@ -401,7 +415,7 @@ function RepoConfigForm({ config, candidates, onSave, isPending }: {
 
   return (
     <>
-      <div className="space-y-2">
+      <div {...repoPathHighlight} className={`space-y-2 ${repoPathHighlight.className}`}>
         <Label>Repository</Label>
         <Select value={repoPath} onChange={e => setRepoPath(e.target.value)}>
           <option value="">Select repository...</option>

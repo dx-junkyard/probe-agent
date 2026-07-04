@@ -806,6 +806,40 @@ def _latest_ready_snapshot_id(conn, system_id: int) -> Optional[int]:
     return row["id"] if row else None
 
 
+def _no_ready_snapshot_check(base: dict) -> DiagnosticCheck:
+    """Blocked result shared by every pipeline check when no snapshot is ready."""
+    return DiagnosticCheck(
+        severity="blocked",
+        detail="ready な snapshot がないため、このステップは実行できません。",
+        impact="snapshot が作成されるまでこのステップは未実行のままです。",
+        remediation="まず Repository タブから snapshot を作成してください。",
+        fix_kind=FIX_KIND_NAVIGATE,
+        fix_page=PAGE_REPOSITORY,
+        fix_anchor=ANCHOR_SNAPSHOT_CREATE,
+        **base,
+    )
+
+
+def _reasoning_unavailable_check(base: dict, *, detail: str) -> DiagnosticCheck:
+    """Blocked result when a step needs reasoning but no reasoning model is set.
+
+    ``detail`` differs per pipeline step; everything else is shared.
+    """
+    return DiagnosticCheck(
+        severity="blocked",
+        detail=detail,
+        impact="System Understanding でこのステップはブロック/未実行として表示されます。",
+        remediation=(
+            "intelligence 用 reasoning モデル設定（上記の LLM チェックを参照）を"
+            "修正してからビルドを実行してください。"
+        ),
+        fix_kind=FIX_KIND_NAVIGATE,
+        fix_page=PAGE_SYSTEM_UNDERSTANDING,
+        fix_anchor=ANCHOR_BUILD,
+        **base,
+    )
+
+
 def _run_backed_pipeline_check(
     conn,
     system_id: int,
@@ -827,16 +861,7 @@ def _run_backed_pipeline_check(
         related_pipeline_steps=pipeline_steps,
     )
     if snapshot_id is None:
-        return DiagnosticCheck(
-            severity="blocked",
-            detail="ready な snapshot がないため、このステップは実行できません。",
-            impact="snapshot が作成されるまでこのステップは未実行のままです。",
-            remediation="まず Repository タブから snapshot を作成してください。",
-            fix_kind=FIX_KIND_NAVIGATE,
-            fix_page=PAGE_REPOSITORY,
-            fix_anchor=ANCHOR_SNAPSHOT_CREATE,
-            **base,
-        )
+        return _no_ready_snapshot_check(base)
     placeholders = ",".join("?" for _ in run_types)
     row = conn.execute(
         f"SELECT id, run_type, status, error_details, completed_at, started_at "
@@ -847,21 +872,12 @@ def _run_backed_pipeline_check(
     ).fetchone()
     if row is None:
         if requires_reasoning and not reasoning_available:
-            return DiagnosticCheck(
-                severity="blocked",
+            return _reasoning_unavailable_check(
+                base,
                 detail=(
                     "このステップは一度も実行されておらず、reasoning モデルが"
                     "必要ですが設定されていません。"
                 ),
-                impact="System Understanding でこのステップはブロック/未実行として表示されます。",
-                remediation=(
-                    "intelligence 用 reasoning モデル設定（上記の LLM チェックを参照）を"
-                    "修正してからビルドを実行してください。"
-                ),
-                fix_kind=FIX_KIND_NAVIGATE,
-                fix_page=PAGE_SYSTEM_UNDERSTANDING,
-                fix_anchor=ANCHOR_BUILD,
-                **base,
             )
         return DiagnosticCheck(
             severity="warning",
@@ -926,34 +942,16 @@ def _artifact_backed_pipeline_check(
         related_pipeline_steps=pipeline_steps,
     )
     if snapshot_id is None:
-        return DiagnosticCheck(
-            severity="blocked",
-            detail="ready な snapshot がないため、このステップは実行できません。",
-            impact="snapshot が作成されるまでこのステップは未実行のままです。",
-            remediation="まず Repository タブから snapshot を作成してください。",
-            fix_kind=FIX_KIND_NAVIGATE,
-            fix_page=PAGE_REPOSITORY,
-            fix_anchor=ANCHOR_SNAPSHOT_CREATE,
-            **base,
-        )
+        return _no_ready_snapshot_check(base)
     row = conn.execute(artifact_sql, (system_id, snapshot_id)).fetchone()
     if row is None:
         if requires_reasoning and not reasoning_available:
-            return DiagnosticCheck(
-                severity="blocked",
+            return _reasoning_unavailable_check(
+                base,
                 detail=(
                     "現在の snapshot に対する成果物がなく、必要な reasoning モデルが"
                     "設定されていません。"
                 ),
-                impact="System Understanding でこのステップはブロック/未実行として表示されます。",
-                remediation=(
-                    "intelligence 用 reasoning モデル設定（上記の LLM チェックを参照）を"
-                    "修正してからビルドを実行してください。"
-                ),
-                fix_kind=FIX_KIND_NAVIGATE,
-                fix_page=PAGE_SYSTEM_UNDERSTANDING,
-                fix_anchor=ANCHOR_BUILD,
-                **base,
             )
         return DiagnosticCheck(
             severity="warning",
@@ -993,16 +991,7 @@ def _build_step_pipeline_check(
         related_pipeline_steps=pipeline_steps,
     )
     if snapshot_id is None:
-        return DiagnosticCheck(
-            severity="blocked",
-            detail="ready な snapshot がないため、このステップは実行できません。",
-            impact="snapshot が作成されるまでこのステップは未実行のままです。",
-            remediation="まず Repository タブから snapshot を作成してください。",
-            fix_kind=FIX_KIND_NAVIGATE,
-            fix_page=PAGE_REPOSITORY,
-            fix_anchor=ANCHOR_SNAPSHOT_CREATE,
-            **base,
-        )
+        return _no_ready_snapshot_check(base)
     row = conn.execute(
         """SELECT id, status, error, completed_at, started_at
            FROM system_understanding_build_steps
