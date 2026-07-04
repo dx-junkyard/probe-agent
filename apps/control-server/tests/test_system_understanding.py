@@ -74,7 +74,7 @@ def _build_and_wait(client, hdrs, timeout=10.0):
         )
         assert status_r.status_code == 200, status_r.text
         build = status_r.json()
-        if build["status"] in ("completed", "failed"):
+        if build["status"] in ("completed", "partial", "failed", "cancelled"):
             break
         time.sleep(0.05)
     else:
@@ -180,7 +180,9 @@ class TestSystemUnderstandingBuild:
         assert snap_r.status_code == 201
 
         build = _build_and_wait(admin_client, hdrs)
-        assert build["status"] == "completed"
+        # Deterministic steps complete, but the reasoning steps stay blocked
+        # (mock provider), so the job settles as partial — not completed.
+        assert build["status"] == "partial"
 
         r = admin_client.get("/repository/system-understanding", headers=hdrs)
         assert r.status_code == 200
@@ -220,12 +222,40 @@ class TestSystemUnderstandingReportsReasoningModelBlocked:
         data = r.json()
 
         pipeline = {s["step"]: s["status"] for s in data["pipeline"]}
-        # Documentation indexed and claims scanned require reasoning model
-        # They should be blocked when no reasoning model is configured
-        assert pipeline["documentation_indexed"] == "blocked"
+        # Documentation indexing is deterministic; claim scanning is the first
+        # documentation step that requires a reasoning model.
+        assert pipeline["documentation_indexed"] == "complete"
         assert pipeline["documentation_claims_scanned"] == "blocked"
         # Capability hierarchy has a deterministic base that runs without reasoning
         assert pipeline["capability_hierarchy_ready"] in ("complete", "blocked")
+
+    def test_documentation_indexed_reflects_build_step_not_draft_generation(
+        self, admin_client, tmp_path
+    ):
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "doc-index-step-sys")
+        hdrs = _headers(token, sys["id"])
+        repo, sha = _init_git_repo(tmp_path)
+
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        admin_client.post(
+            "/repository/snapshots",
+            json={"commit_sha": sha},
+            headers=hdrs,
+        )
+
+        build = _build_and_wait(admin_client, hdrs)
+        steps = {s["step"]: s for s in build["steps"]}
+        assert steps["documentation_index"]["status"] == "completed"
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200
+        pipeline = {s["step"]: s["status"] for s in r.json()["pipeline"]}
+        assert pipeline["documentation_indexed"] == "complete"
 
 
 class TestSystemUnderstandingReportsMetadataCoverage:
@@ -468,7 +498,9 @@ class TestIntelligenceRunStatusContract:
             "/repository/snapshots", json={"commit_sha": sha}, headers=hdrs
         )
         build = _build_and_wait(admin_client, hdrs)
-        assert build["status"] == "completed"
+        # Reasoning steps stay blocked with the mock provider, so the job is
+        # partial while every deterministic artifact is still persisted.
+        assert build["status"] == "partial"
         return hdrs
 
     def test_build_writes_contract_statuses_only(self, admin_client, tmp_path):
@@ -565,20 +597,27 @@ class TestBuildDoesNotBlockOtherRequests:
             "/repository/snapshots", json={"commit_sha": sha}, headers=hdrs
         )
 
-        # Simulate a slow/hanging reasoning-model call during the
-        # documentation step: this used to run inside the single
-        # get_conn() block held for the whole build, starving every other
-        # request of the shared sqlite lock.
+        # Simulate a slow/hanging reasoning-model call during the claim scan
+        # step: this used to run inside the single get_conn() block held for
+        # the whole build, starving every other request of the shared sqlite
+        # lock. Claim scanning is chunk-level since Issue #109, so patch
+        # scan_chunk (the per-chunk LLM call).
         import app.system_understanding_service as sus
         import app.documentation_claim_scanner as scanner_module
 
         monkeypatch.setattr(sus, "_is_reasoning_model_available", lambda: True)
 
-        def _slow_scan_all_chunks(client, config, chunks):
+        def _slow_scan_chunk(client, config, chunk, cache=None):
             time.sleep(1.0)
-            return []
+            return scanner_module.ChunkScanResult(
+                chunk_id=chunk.chunk_id,
+                chunk_content_hash=chunk.content_hash,
+                prompt_version=scanner_module.PROMPT_VERSION,
+                schema_version=scanner_module.SCHEMA_VERSION,
+                claims=[],
+            )
 
-        monkeypatch.setattr(scanner_module, "scan_all_chunks", _slow_scan_all_chunks)
+        monkeypatch.setattr(scanner_module, "scan_chunk", _slow_scan_chunk)
 
         build_r = admin_client.post(
             "/repository/system-understanding/build", headers=hdrs

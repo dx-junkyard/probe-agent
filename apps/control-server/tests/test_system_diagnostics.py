@@ -337,8 +337,8 @@ class TestLastObservedFailures:
         assert "invalid api key" in c["last_observed_error"]["error"]
 
         doc = checks["pipeline_documentation_index"]
-        assert doc["severity"] == "error"
-        assert "invalid api key" in doc["last_observed_error"]["error"]
+        assert doc["severity"] == "warning"
+        assert "not run" in doc["detail"]
 
     def test_no_reasoning_run_is_unknown(self, admin_client):
         _, _, hdrs = _setup(admin_client)
@@ -391,8 +391,8 @@ class TestPipelinePrerequisites:
         _, checks = _get_checks(admin_client, hdrs)
         assert checks["pipeline_symbol_index"]["severity"] == "warning"
         assert checks["pipeline_entrypoint_index"]["severity"] == "warning"
+        assert checks["pipeline_documentation_index"]["severity"] == "warning"
         # Reasoning-required steps stay blocked under the mock provider.
-        assert checks["pipeline_documentation_index"]["severity"] == "blocked"
         assert checks["pipeline_understanding_graph"]["severity"] == "blocked"
         assert checks["pipeline_capability_hierarchy"]["severity"] == "blocked"
 
@@ -421,12 +421,14 @@ class TestPipelinePrerequisites:
                 f"/repository/system-understanding/build/{build_id}", headers=hdrs
             )
             assert status_r.status_code == 200, status_r.text
-            if status_r.json()["status"] in ("completed", "failed"):
+            if status_r.json()["status"] in ("completed", "partial", "failed", "cancelled"):
                 break
             time.sleep(0.05)
         else:
             pytest.fail(f"Build {build_id} did not settle in time")
-        assert status_r.json()["status"] == "completed"
+        # Reasoning steps stay blocked with the mock provider (Issue #109),
+        # so the job is partial while the deterministic runs completed.
+        assert status_r.json()["status"] == "partial"
 
         _, checks = _get_checks(admin_client, hdrs)
         sym = checks["pipeline_symbol_index"]

@@ -54,7 +54,6 @@ class SettingMetadata:
 
 
 _REASONING_STEPS = [
-    "documentation_indexed",
     "documentation_claims_scanned",
     "docs_code_reconciled",
     "capability_hierarchy_ready",

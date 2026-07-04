@@ -117,6 +117,46 @@ Keep these storage concerns separate:
 Reasoning failure must be represented as a failed run. Do not synthesize a
 heuristic result.
 
+## System Understanding build jobs (issue #109)
+
+- `POST /repository/system-understanding/build` enqueues a step-orchestrated
+  background job (`app/system_understanding_jobs.py`) and returns the job id
+  immediately (202). Never run build steps inside a request handler.
+- Job/step state lives in `system_understanding_builds` /
+  `system_understanding_build_steps`; claim-scan chunks are
+  `system_understanding_llm_tasks` rows with unified retry/backoff/cancel.
+- Jobs bind to the snapshot they were created with: retry/resume always
+  runs against the job's stored `snapshot_id`, never the latest ready
+  snapshot. Only a job created without any ready snapshot binds to the
+  latest one at execution time; a pinned snapshot that disappeared fails
+  the job with an explicit error.
+- Steps: `symbol_index`, `entrypoint_index`, `documentation_index`,
+  `claim_scan` (reasoning), `understanding_graph`, `docs_code_reconcile`,
+  `capability_hierarchy`. Dependencies are explicit; a step whose dependency
+  is not completed is `blocked`, never silently skipped or approximated.
+- Completed steps are never re-executed. Retry
+  (`POST .../jobs/{id}/retry`, `POST .../jobs/{id}/steps/{step}/retry`)
+  resets only missing/failed/blocked/cancelled steps; completed chunk scan
+  results are reused by content hash. Cancel is available per job and per
+  step; workers check the flag between steps and between chunks.
+- Jobs and steps persist heartbeats. A queued/running job without a recent
+  heartbeat (`SYSTEM_UNDERSTANDING_STUCK_AFTER_SECONDS`, default 300) is
+  reported `is_stuck`; `init_db` fails over jobs interrupted by a restart so
+  they become retryable instead of active-forever.
+- LLM failures fail the `claim_scan` step visibly with per-chunk errors;
+  deterministic steps still complete (no heuristic fallback, Principle 6).
+- Job status vocabulary: `queued / running / completed / partial / failed /
+  cancelled` (+ derived `is_stuck`). `completed` requires every step
+  completed; any remaining failed/blocked/cancelled step yields `partial`
+  (or `failed` when no step completed), so blocked reasoning steps never
+  hide behind a completed job.
+- Each worker execution (initial enqueue and every retry) is a
+  `system_understanding_build_runs` row; the build endpoints return both
+  `job_id` and the latest `run_id`.
+- Status endpoints: `GET .../jobs/{job_id}`, `GET .../jobs/active`, plus the
+  back-compat `GET .../build/latest` and `GET .../build/{id}` returning the
+  same extended payload (steps, llm task counts, artifact counts).
+
 ## Authentication and user management
 
 - Auth is enabled when any user exists or `CONTROL_API_KEYS` is set; otherwise open (MVP compat).

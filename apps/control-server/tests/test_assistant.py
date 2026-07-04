@@ -91,7 +91,7 @@ def test_settings_metadata_is_static_and_deterministic(admin_client):
     assert model_meta["impact"]
     assert model_meta["remediation"]
     assert "intelligence_llm_config" in model_meta["related_checks"]
-    assert "documentation_indexed" in model_meta["related_pipeline_steps"]
+    assert "documentation_claims_scanned" in model_meta["related_pipeline_steps"]
 
     provider_meta = by_key["LLM_PROVIDER"]
     assert provider_meta["valid_values"] == ["openai", "anthropic", "gemini", "mock"]
@@ -291,7 +291,7 @@ class _GroundedClient:
         }
         return json.dumps(
             {
-                "answer": "Documentation indexing needs a reasoning model.",
+                "answer": "Documentation claim scanning needs a reasoning model.",
                 "suggested_actions": [
                     {
                         "label": "Open System Understanding",

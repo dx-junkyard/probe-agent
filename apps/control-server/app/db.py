@@ -1110,21 +1110,113 @@ CREATE INDEX IF NOT EXISTS idx_understanding_graph_system
     ON understanding_graph_snapshots (system_id, id DESC);
 
 CREATE TABLE IF NOT EXISTS system_understanding_builds (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    system_id     INTEGER NOT NULL,
-    snapshot_id   INTEGER,
-    status        TEXT NOT NULL DEFAULT 'queued',
-    current_step  TEXT,
-    error         TEXT,
-    started_at    REAL,
-    completed_at  REAL,
-    created_at    REAL NOT NULL,
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    snapshot_id       INTEGER,
+    status            TEXT NOT NULL DEFAULT 'queued',
+    current_step      TEXT,
+    error             TEXT,
+    cancel_requested  INTEGER NOT NULL DEFAULT 0,
+    heartbeat_at      REAL,
+    started_at        REAL,
+    completed_at      REAL,
+    created_at        REAL NOT NULL,
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
     FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_understanding_builds_system
     ON system_understanding_builds (system_id, id DESC);
+
+-- Step-level orchestration for System Understanding builds (Issue #109).
+-- One row per (build, step). Deterministic status vocabulary:
+-- pending / running / completed / failed / blocked / cancelled.
+-- artifact_provenance stores deterministic facts about what the step
+-- produced or reused (intelligence_run_id, row counts, graph snapshot id).
+CREATE TABLE IF NOT EXISTS system_understanding_build_steps (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    build_id          INTEGER NOT NULL,
+    system_id         INTEGER NOT NULL,
+    snapshot_id       INTEGER,
+    step              TEXT NOT NULL,
+    depends_on        TEXT NOT NULL DEFAULT '[]',
+    status            TEXT NOT NULL DEFAULT 'pending',
+    reused_existing   INTEGER NOT NULL DEFAULT 0,
+    cancel_requested  INTEGER NOT NULL DEFAULT 0,
+    error             TEXT,
+    artifact_provenance TEXT NOT NULL DEFAULT '{}',
+    heartbeat_at      REAL,
+    started_at        REAL,
+    completed_at      REAL,
+    created_at        REAL NOT NULL,
+    FOREIGN KEY (build_id) REFERENCES system_understanding_builds (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL,
+    UNIQUE (build_id, step)
+);
+
+-- One row per worker execution of a build job (Issue #109): the initial
+-- enqueue and every retry/resume each get their own run. The run id is the
+-- externally referenceable identifier returned by the build endpoint next to
+-- the job id; its status mirrors the job outcome for that execution.
+CREATE TABLE IF NOT EXISTS system_understanding_build_runs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    build_id      INTEGER NOT NULL,
+    system_id     INTEGER NOT NULL,
+    trigger       TEXT NOT NULL DEFAULT 'build',
+    status        TEXT NOT NULL DEFAULT 'running',
+    started_at    REAL,
+    completed_at  REAL,
+    created_at    REAL NOT NULL,
+    FOREIGN KEY (build_id) REFERENCES system_understanding_builds (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_build_runs_build
+    ON system_understanding_build_runs (build_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_build_steps_build
+    ON system_understanding_build_steps (build_id);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_build_steps_system
+    ON system_understanding_build_steps (system_id, id DESC);
+
+-- Chunk-level LLM tasks for the claim_scan step (Issue #109). Each row is one
+-- documentation chunk scan with unified retry/backoff accounting. Completed
+-- results are kept (result_json) so a retry only re-scans failed chunks and a
+-- later build for the same snapshot can reuse results by content hash.
+CREATE TABLE IF NOT EXISTS system_understanding_llm_tasks (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    build_id           INTEGER NOT NULL,
+    step_id            INTEGER NOT NULL,
+    system_id          INTEGER NOT NULL,
+    snapshot_id        INTEGER,
+    task_type          TEXT NOT NULL DEFAULT 'claim_scan_chunk',
+    chunk_id           TEXT NOT NULL,
+    chunk_content_hash TEXT NOT NULL DEFAULT '',
+    chunk_path         TEXT NOT NULL DEFAULT '',
+    prompt_version     TEXT NOT NULL DEFAULT '',
+    schema_version     TEXT NOT NULL DEFAULT '',
+    status             TEXT NOT NULL DEFAULT 'pending',
+    attempts           INTEGER NOT NULL DEFAULT 0,
+    max_attempts       INTEGER NOT NULL DEFAULT 3,
+    reused_existing    INTEGER NOT NULL DEFAULT 0,
+    last_error         TEXT,
+    result_json        TEXT,
+    started_at         REAL,
+    completed_at       REAL,
+    created_at         REAL NOT NULL,
+    FOREIGN KEY (build_id) REFERENCES system_understanding_builds (id) ON DELETE CASCADE,
+    FOREIGN KEY (step_id) REFERENCES system_understanding_build_steps (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    UNIQUE (build_id, chunk_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_llm_tasks_build
+    ON system_understanding_llm_tasks (build_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_llm_tasks_system
+    ON system_understanding_llm_tasks (system_id, snapshot_id, chunk_content_hash);
 """
 
 
@@ -1460,6 +1552,50 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE understanding_graph_snapshots ADD COLUMN snapshot_id INTEGER"
             )
+        build_cols = _columns(conn, "system_understanding_builds")
+        if "cancel_requested" not in build_cols:
+            conn.execute(
+                "ALTER TABLE system_understanding_builds "
+                "ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0"
+            )
+        if "heartbeat_at" not in build_cols:
+            conn.execute(
+                "ALTER TABLE system_understanding_builds ADD COLUMN heartbeat_at REAL"
+            )
+        # Builds left 'queued'/'running' by a previous process can never make
+        # progress after a restart (their worker thread is gone). Mark them
+        # failed with an explicit reason so they surface as retryable instead
+        # of appearing active forever.
+        conn.execute(
+            """UPDATE system_understanding_builds
+               SET status = 'failed',
+                   error = COALESCE(error, 'Interrupted by server restart'),
+                   completed_at = COALESCE(completed_at, ?)
+               WHERE status IN ('queued', 'running')""",
+            (time.time(),),
+        )
+        conn.execute(
+            """UPDATE system_understanding_build_steps
+               SET status = 'failed',
+                   error = COALESCE(error, 'Interrupted by server restart'),
+                   completed_at = COALESCE(completed_at, ?)
+               WHERE status = 'running'""",
+            (time.time(),),
+        )
+        conn.execute(
+            """UPDATE system_understanding_llm_tasks
+               SET status = 'failed',
+                   last_error = COALESCE(last_error, 'Interrupted by server restart'),
+                   completed_at = COALESCE(completed_at, ?)
+               WHERE status = 'running'""",
+            (time.time(),),
+        )
+        conn.execute(
+            """UPDATE system_understanding_build_runs
+               SET status = 'failed', completed_at = COALESCE(completed_at, ?)
+               WHERE status = 'running'""",
+            (time.time(),),
+        )
         # Repair rows written with the out-of-contract 'success' status; the
         # shared schema only allows 'pending' / 'completed' / 'failed'.
         conn.execute(

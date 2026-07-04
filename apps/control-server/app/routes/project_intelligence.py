@@ -117,6 +117,7 @@ from ..models import (
     SymbolIndexWarningOut,
     SystemProfileDraftOut,
     SystemUnderstandingBuildOut,
+    SystemUnderstandingJobRetryIn,
     ValidationCommandOut,
     ValidationRunOut,
 )
@@ -226,7 +227,7 @@ def get_system_understanding_endpoint(
 def build_system_understanding_endpoint(
     system_id: int = Depends(get_system_id),
 ) -> SystemUnderstandingBuildOut:
-    """Enqueue a system understanding build and return immediately.
+    """Enqueue a step-orchestrated system understanding build job (Issue #109).
 
     probe-agent:
       role: API boundary for enqueueing an asynchronous system understanding build
@@ -235,16 +236,14 @@ def build_system_understanding_endpoint(
       consumers: [dashboard, control-server]
       operation_kind: orchestration
       state_effects: [database-read, database-write]
-      probe_value: verify the request returns immediately with a build id while the
-        build runs in the background, and that /health, /auth/me, and /systems stay
-        responsive while a build is in flight (Issue #106).
+      probe_value: verify the request returns immediately with a job id and step
+        list while the build runs in the background, and that /health stays
+        responsive while a build is in flight (Issues #106, #109).
     """
-    from ..system_understanding_service import (
-        get_system_understanding_build,
-        start_system_understanding_build,
-    )
-    build_id = start_system_understanding_build(system_id)
-    return _build_out(get_system_understanding_build(system_id, build_id))
+    from ..system_understanding_jobs import get_job, start_system_understanding_build
+
+    job_id = start_system_understanding_build(system_id)
+    return _build_out(get_job(system_id, job_id))
 
 
 @router.get(
@@ -254,7 +253,7 @@ def build_system_understanding_endpoint(
 def get_latest_system_understanding_build_endpoint(
     system_id: int = Depends(get_system_id),
 ) -> Optional[SystemUnderstandingBuildOut]:
-    """Poll the most recently triggered system understanding build.
+    """Poll the most recently triggered system understanding build job.
 
     probe-agent:
       role: API boundary for polling system understanding build progress
@@ -263,12 +262,65 @@ def get_latest_system_understanding_build_endpoint(
       consumers: [dashboard]
       operation_kind: read
       state_effects: [database-read]
-      probe_value: verify build status/current_step/error are visible without
-        blocking on the build itself.
+      probe_value: verify job/step status and errors are visible without
+        blocking on the build itself, and survive browser reloads.
     """
-    from ..system_understanding_service import get_latest_system_understanding_build
-    row = get_latest_system_understanding_build(system_id)
-    return _build_out(row) if row else None
+    from ..system_understanding_jobs import get_latest_job
+
+    job = get_latest_job(system_id)
+    return _build_out(job) if job else None
+
+
+@router.get(
+    "/repository/system-understanding/jobs/active",
+    response_model=List[SystemUnderstandingBuildOut],
+)
+def list_active_system_understanding_jobs_endpoint(
+    system_id: int = Depends(get_system_id),
+) -> List[SystemUnderstandingBuildOut]:
+    """List active (queued/running) build jobs, with stuck detection.
+
+    probe-agent:
+      role: API boundary for listing active system understanding build jobs
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: verify active jobs are scoped to the calling system and
+        stale heartbeats surface as is_stuck.
+    """
+    from ..system_understanding_jobs import list_active_jobs
+
+    return [_build_out(j) for j in list_active_jobs(system_id)]
+
+
+@router.get(
+    "/repository/system-understanding/jobs/{job_id}",
+    response_model=SystemUnderstandingBuildOut,
+)
+def get_system_understanding_job_endpoint(
+    job_id: int,
+    system_id: int = Depends(get_system_id),
+) -> SystemUnderstandingBuildOut:
+    """Poll a specific build job with per-step status and provenance.
+
+    probe-agent:
+      role: API boundary for polling a specific system understanding build job
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: verify step status/started_at/completed_at/duration/error and
+        artifact provenance are readable per step.
+    """
+    from ..system_understanding_jobs import get_job
+
+    job = get_job(system_id, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Build job not found")
+    return _build_out(job)
 
 
 @router.get(
@@ -279,7 +331,7 @@ def get_system_understanding_build_endpoint(
     build_id: int,
     system_id: int = Depends(get_system_id),
 ) -> SystemUnderstandingBuildOut:
-    """Poll a specific system understanding build by id.
+    """Back-compat alias of the job status endpoint.
 
     probe-agent:
       role: API boundary for polling a specific system understanding build
@@ -291,24 +343,172 @@ def get_system_understanding_build_endpoint(
       probe_value: verify build status/current_step/error are visible without
         blocking on the build itself.
     """
-    from ..system_understanding_service import get_system_understanding_build
-    row = get_system_understanding_build(system_id, build_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="Build not found")
-    return _build_out(row)
+    return get_system_understanding_job_endpoint(build_id, system_id)
 
 
-def _build_out(row) -> SystemUnderstandingBuildOut:
+@router.post(
+    "/repository/system-understanding/jobs/{job_id}/cancel",
+    response_model=SystemUnderstandingBuildOut,
+)
+def cancel_system_understanding_job_endpoint(
+    job_id: int,
+    system_id: int = Depends(get_system_id),
+) -> SystemUnderstandingBuildOut:
+    """Request cancellation of an active build job.
+
+    probe-agent:
+      role: API boundary for cancelling a system understanding build job
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: orchestration
+      state_effects: [database-write]
+      probe_value: verify a cancel request stops the worker between steps/chunks
+        and settles the job as cancelled.
+    """
+    from ..system_understanding_jobs import (
+        JobConflict, JobNotFound, cancel_build, get_job,
+    )
+
+    try:
+        cancel_build(system_id, job_id)
+    except JobNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except JobConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return _build_out(get_job(system_id, job_id))
+
+
+@router.post(
+    "/repository/system-understanding/jobs/{job_id}/retry",
+    response_model=SystemUnderstandingBuildOut,
+    status_code=202,
+)
+def retry_system_understanding_job_endpoint(
+    job_id: int,
+    body: Optional[SystemUnderstandingJobRetryIn] = None,
+    system_id: int = Depends(get_system_id),
+) -> SystemUnderstandingBuildOut:
+    """Resume a settled/stuck job; only missing or failed steps re-run.
+
+    probe-agent:
+      role: API boundary for retrying/resuming a system understanding build job
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: orchestration
+      state_effects: [database-read, database-write]
+      probe_value: verify completed steps are never re-executed and retry
+        resumes from persisted DB state after interruption.
+    """
+    from ..system_understanding_jobs import (
+        JobConflict, JobNotFound, get_job, retry_build,
+    )
+
+    step = body.step if body else None
+    try:
+        retry_build(system_id, job_id, step=step)
+    except JobNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except JobConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return _build_out(get_job(system_id, job_id))
+
+
+@router.post(
+    "/repository/system-understanding/jobs/{job_id}/steps/{step}/cancel",
+    response_model=SystemUnderstandingBuildOut,
+)
+def cancel_system_understanding_step_endpoint(
+    job_id: int,
+    step: str,
+    system_id: int = Depends(get_system_id),
+) -> SystemUnderstandingBuildOut:
+    """Cancel a single pending/running step without cancelling the whole job.
+
+    probe-agent:
+      role: API boundary for cancelling one build step
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: orchestration
+      state_effects: [database-write]
+      probe_value: verify a step-level cancel settles only that step while the
+        job continues with independent steps.
+    """
+    from ..system_understanding_jobs import (
+        JobConflict, JobNotFound, cancel_step, get_job,
+    )
+
+    try:
+        cancel_step(system_id, job_id, step)
+    except JobNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except JobConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return _build_out(get_job(system_id, job_id))
+
+
+@router.post(
+    "/repository/system-understanding/jobs/{job_id}/steps/{step}/retry",
+    response_model=SystemUnderstandingBuildOut,
+    status_code=202,
+)
+def retry_system_understanding_step_endpoint(
+    job_id: int,
+    step: str,
+    system_id: int = Depends(get_system_id),
+) -> SystemUnderstandingBuildOut:
+    """Retry a single failed/blocked/cancelled step (and its dependents).
+
+    probe-agent:
+      role: API boundary for retrying one build step
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: orchestration
+      state_effects: [database-read, database-write]
+      probe_value: verify a completed step is refused (409) and a failed step
+        re-runs together with its dependent steps only.
+    """
+    from ..system_understanding_jobs import (
+        JobConflict, JobNotFound, get_job, retry_build,
+    )
+
+    try:
+        retry_build(system_id, job_id, step=step)
+    except JobNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except JobConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return _build_out(get_job(system_id, job_id))
+
+
+def _build_out(job: dict) -> SystemUnderstandingBuildOut:
+    from ..models import (
+        SystemUnderstandingArtifactCountsOut,
+        SystemUnderstandingBuildStepOut,
+        SystemUnderstandingLlmTaskSummaryOut,
+    )
+
     return SystemUnderstandingBuildOut(
-        id=row["id"],
-        system_id=row["system_id"],
-        snapshot_id=row["snapshot_id"],
-        status=row["status"],
-        current_step=row["current_step"],
-        error=row["error"],
-        started_at=row["started_at"],
-        completed_at=row["completed_at"],
-        created_at=row["created_at"],
+        id=job["id"],
+        job_id=job["job_id"],
+        run_id=job["run_id"],
+        system_id=job["system_id"],
+        snapshot_id=job["snapshot_id"],
+        status=job["status"],
+        current_step=job["current_step"],
+        error=job["error"],
+        cancel_requested=job["cancel_requested"],
+        is_stuck=job["is_stuck"],
+        heartbeat_at=job["heartbeat_at"],
+        started_at=job["started_at"],
+        completed_at=job["completed_at"],
+        created_at=job["created_at"],
+        steps=[SystemUnderstandingBuildStepOut(**s) for s in job["steps"]],
+        llm_tasks=SystemUnderstandingLlmTaskSummaryOut(**job["llm_tasks"]),
+        artifact_counts=SystemUnderstandingArtifactCountsOut(**job["artifact_counts"]),
     )
 
 
