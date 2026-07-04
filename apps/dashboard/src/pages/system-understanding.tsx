@@ -23,8 +23,10 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Select } from "@/components/ui/select";
 import { Label } from "@/components/ui/label";
-import { DiagnosticCheckCard } from "@/components/diagnostics-badge";
-import { useDiagnosticHighlight, DiagnosticFixCallout } from "@/components/diagnostic-fix";
+import { DiagnosticCheckCard, EnvFixDialog } from "@/components/diagnostics-badge";
+import {
+  useDiagnosticActivate, useDiagnosticHighlight, DiagnosticFixCallout,
+} from "@/components/diagnostic-fix";
 import { toast } from "sonner";
 import {
   CheckCircle2, XCircle, AlertTriangle, Ban, HelpCircle,
@@ -107,7 +109,9 @@ function PipelineChecklist({ steps, checksByStep }: {
   checksByStep: Record<string, SystemDiagnosticCheck[]>;
 }) {
   const [expandedStep, setExpandedStep] = useState<string | null>(null);
+  const { activate, envCheck, closeEnv } = useDiagnosticActivate();
   return (
+    <>
     <ul className="space-y-2" data-testid="pipeline-checklist">
       {steps.map((s) => {
         const link = STEP_LINKS[s.step];
@@ -147,7 +151,7 @@ function PipelineChecklist({ steps, checksByStep }: {
             {expanded && relatedChecks.length > 0 && (
               <div className="mt-2 ml-7 space-y-2" data-testid={`pipeline-diagnostics-${s.step}`}>
                 {relatedChecks.map((c) => (
-                  <DiagnosticCheckCard key={c.check_id} check={c} />
+                  <DiagnosticCheckCard key={c.check_id} check={c} onActivate={activate} />
                 ))}
               </div>
             )}
@@ -155,6 +159,8 @@ function PipelineChecklist({ steps, checksByStep }: {
         );
       })}
     </ul>
+    <EnvFixDialog check={envCheck} onClose={closeEnv} />
+    </>
   );
 }
 

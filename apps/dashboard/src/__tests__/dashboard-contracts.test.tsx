@@ -2384,6 +2384,8 @@ describe("System settings diagnostics", () => {
     expect(envDialog.textContent).toContain("設定が必要な環境変数");
     // Did not navigate away.
     expect(window.location.pathname).toBe("/");
+    // The list dialog closed so the two modals don't stack.
+    expect(screen.queryByText("System Settings Diagnostics")).toBeNull();
   });
 
   test("badge renders without count when everything is ok", async () => {
