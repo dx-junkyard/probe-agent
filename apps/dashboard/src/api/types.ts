@@ -1404,16 +1404,57 @@ export interface SystemUnderstandingOut {
   next_actions: SystemUnderstandingNextAction[];
 }
 
+// System Understanding build job orchestration (Issue #109)
+
+export interface SystemUnderstandingBuildStep {
+  id: number;
+  step: string;
+  status: "pending" | "running" | "completed" | "failed" | "blocked" | "cancelled";
+  depends_on: string[];
+  reused_existing: boolean;
+  cancel_requested: boolean;
+  error: string | null;
+  artifact_provenance: Record<string, unknown>;
+  duration_ms: number | null;
+  heartbeat_at: number | null;
+  started_at: number | null;
+  completed_at: number | null;
+}
+
+export interface SystemUnderstandingLlmTaskSummary {
+  total: number;
+  pending: number;
+  running: number;
+  completed: number;
+  failed: number;
+  cancelled: number;
+  reused: number;
+}
+
+export interface SystemUnderstandingArtifactCounts {
+  symbols: number;
+  entrypoints: number;
+  understanding_graph_claims: number;
+  capability_hierarchy_nodes: number;
+}
+
 export interface SystemUnderstandingBuildOut {
   id: number;
+  job_id: number;
   system_id: number;
   snapshot_id: number | null;
-  status: "queued" | "running" | "completed" | "failed";
+  status: "queued" | "running" | "completed" | "partial" | "failed" | "cancelled";
   current_step: string | null;
   error: string | null;
+  cancel_requested: boolean;
+  is_stuck: boolean;
+  heartbeat_at: number | null;
   started_at: number | null;
   completed_at: number | null;
   created_at: number;
+  steps: SystemUnderstandingBuildStep[];
+  llm_tasks: SystemUnderstandingLlmTaskSummary | null;
+  artifact_counts: SystemUnderstandingArtifactCounts | null;
 }
 
 // System settings diagnostics (Issue #101)

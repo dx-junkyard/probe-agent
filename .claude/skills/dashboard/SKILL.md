@@ -53,6 +53,15 @@ The dashboard should support:
   navigate actions use client-side routing. The screen id sent to the API is
   the route's first path segment (`/` → `overview`). The panel must not
   block or overlap primary page actions when closed.
+- System Understanding build job polling (Issue #109): Build / Refresh
+  triggers an async job and the page polls `/repository/system-understanding/
+  build/latest` (2s while queued/running). The job panel
+  (`pages/system-understanding.tsx` `BuildJobPanel`) must show per-step
+  status/duration/error, claim-scan chunk progress, artifact counts, a
+  `stuck` badge when `is_stuck`, and cancel (job/step) plus retry (job/step)
+  actions. Never block the mutation waiting for completion, never offer
+  retry on a completed step, and rely on the server-persisted job so a
+  browser reload restores the active/last job state.
 
 ## Authentication model
 

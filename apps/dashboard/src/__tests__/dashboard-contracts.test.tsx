@@ -1872,6 +1872,202 @@ describe("System Understanding page", () => {
 
 // ── System settings diagnostics (Issue #101) ────────────────────────
 
+describe("System Understanding build job panel (Issue #109)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const baseUnderstanding = {
+    system_id: 1,
+    snapshot_id: 5,
+    commit_sha: "abc12345def",
+    pipeline: [
+      { step: "repository_configured", status: "complete" },
+      { step: "snapshot_ready", status: "complete" },
+      { step: "documentation_indexed", status: "missing" },
+      { step: "documentation_claims_scanned", status: "missing" },
+      { step: "symbols_indexed", status: "complete" },
+      { step: "entrypoints_discovered", status: "complete" },
+      { step: "docs_code_reconciled", status: "missing" },
+      { step: "capability_hierarchy_ready", status: "complete" },
+    ],
+    purpose: null,
+    capabilities: [],
+    entrypoints: [],
+    major_symbols: [],
+    gaps: [],
+    gap_summary: [],
+    metadata_coverage: null,
+    next_actions: [],
+  };
+
+  const jobStep = (step: string, status: string, extra: Record<string, unknown> = {}) => ({
+    id: 1,
+    step,
+    status,
+    depends_on: [],
+    reused_existing: false,
+    cancel_requested: false,
+    error: null,
+    artifact_provenance: {},
+    duration_ms: status === "completed" ? 120 : null,
+    heartbeat_at: null,
+    started_at: null,
+    completed_at: null,
+    ...extra,
+  });
+
+  const runningJob = {
+    id: 7,
+    job_id: 7,
+    system_id: 1,
+    snapshot_id: 5,
+    status: "running",
+    current_step: "claim_scan",
+    error: null,
+    cancel_requested: false,
+    is_stuck: false,
+    heartbeat_at: Date.now() / 1000,
+    started_at: Date.now() / 1000,
+    completed_at: null,
+    created_at: Date.now() / 1000,
+    steps: [
+      jobStep("symbol_index", "completed", { id: 1, reused_existing: true }),
+      jobStep("entrypoint_index", "completed", { id: 2 }),
+      jobStep("documentation_index", "completed", { id: 3 }),
+      jobStep("claim_scan", "running", { id: 4 }),
+      jobStep("understanding_graph", "pending", { id: 5 }),
+      jobStep("docs_code_reconcile", "pending", { id: 6 }),
+      jobStep("capability_hierarchy", "pending", { id: 7 }),
+    ],
+    llm_tasks: { total: 8, pending: 3, running: 1, completed: 4, failed: 0, cancelled: 0, reused: 2 },
+    artifact_counts: { symbols: 42, entrypoints: 10, understanding_graph_claims: 0, capability_hierarchy_nodes: 6 },
+  };
+
+  const partialJob = {
+    ...runningJob,
+    id: 8,
+    job_id: 8,
+    status: "partial",
+    current_step: null,
+    error: "claim_scan: 2/8 documentation chunks failed to scan",
+    completed_at: Date.now() / 1000,
+    steps: [
+      jobStep("symbol_index", "completed", { id: 1 }),
+      jobStep("entrypoint_index", "completed", { id: 2 }),
+      jobStep("documentation_index", "completed", { id: 3 }),
+      jobStep("claim_scan", "failed", { id: 4, error: "2/8 documentation chunks failed to scan" }),
+      jobStep("understanding_graph", "blocked", { id: 5, error: "Dependency not satisfied: claim_scan is failed" }),
+      jobStep("docs_code_reconcile", "blocked", { id: 6 }),
+      jobStep("capability_hierarchy", "completed", { id: 7 }),
+    ],
+    llm_tasks: { total: 8, pending: 0, running: 0, completed: 6, failed: 2, cancelled: 0, reused: 0 },
+  };
+
+  function mockPage(latestBuild: unknown) {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(baseUnderstanding);
+      if (path === "/repository/system-understanding/build/latest") return Promise.resolve(latestBuild);
+      return Promise.resolve(null);
+    });
+  }
+
+  test("running job shows step statuses, chunk progress, and cancel action", async () => {
+    mockPage(runningJob);
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("build-job-panel")).toBeTruthy();
+    });
+
+    expect(screen.getByTestId("job-status").textContent).toBe("running");
+    expect(screen.getByTestId("job-steps").children.length).toBe(7);
+    expect(screen.getByTestId("job-step-claim_scan").textContent).toContain("running");
+    expect(screen.getByTestId("job-llm-progress").textContent).toContain("chunks 4/8");
+    expect(screen.getByTestId("job-step-symbol_index").textContent).toContain("reused");
+    expect(screen.getByTestId("job-artifact-counts").textContent).toContain("Symbols: 42");
+    expect(screen.getByTestId("job-cancel")).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId("job-cancel"));
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/repository/system-understanding/jobs/7/cancel",
+      );
+    });
+  });
+
+  test("partial job shows step errors and retry actions", async () => {
+    mockPage(partialJob);
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("build-job-panel")).toBeTruthy();
+    });
+
+    expect(screen.getByTestId("job-status").textContent).toBe("partial");
+    expect(screen.getByTestId("job-error").textContent).toContain("2/8 documentation chunks failed");
+    expect(screen.getByTestId("job-step-error-claim_scan").textContent).toContain("failed to scan");
+    expect(screen.getByTestId("build-failed")).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId("job-step-retry-claim_scan"));
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/repository/system-understanding/jobs/8/steps/claim_scan/retry",
+      );
+    });
+
+    fireEvent.click(screen.getByTestId("job-retry"));
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/repository/system-understanding/jobs/8/retry",
+      );
+    });
+  });
+
+  test("stuck job is flagged and retryable", async () => {
+    mockPage({
+      ...runningJob,
+      id: 9,
+      job_id: 9,
+      is_stuck: true,
+      heartbeat_at: Date.now() / 1000 - 100000,
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("job-stuck")).toBeTruthy();
+    });
+    expect(screen.getByTestId("job-retry")).toBeTruthy();
+  });
+
+  test("completed job without failures does not keep the panel on screen", async () => {
+    mockPage({
+      ...runningJob,
+      id: 10,
+      job_id: 10,
+      status: "completed",
+      current_step: null,
+      completed_at: Date.now() / 1000,
+      steps: runningJob.steps.map((s) => ({ ...s, status: "completed" })),
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("pipeline-checklist")).toBeTruthy();
+    });
+    expect(screen.queryByTestId("build-job-panel")).toBeNull();
+  });
+});
+
 describe("System settings diagnostics", () => {
   beforeEach(() => {
     vi.clearAllMocks();

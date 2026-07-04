@@ -117,6 +117,36 @@ Keep these storage concerns separate:
 Reasoning failure must be represented as a failed run. Do not synthesize a
 heuristic result.
 
+## System Understanding build jobs (issue #109)
+
+- `POST /repository/system-understanding/build` enqueues a step-orchestrated
+  background job (`app/system_understanding_jobs.py`) and returns the job id
+  immediately (202). Never run build steps inside a request handler.
+- Job/step state lives in `system_understanding_builds` /
+  `system_understanding_build_steps`; claim-scan chunks are
+  `system_understanding_llm_tasks` rows with unified retry/backoff/cancel.
+- Steps: `symbol_index`, `entrypoint_index`, `documentation_index`,
+  `claim_scan` (reasoning), `understanding_graph`, `docs_code_reconcile`,
+  `capability_hierarchy`. Dependencies are explicit; a step whose dependency
+  is not completed is `blocked`, never silently skipped or approximated.
+- Completed steps are never re-executed. Retry
+  (`POST .../jobs/{id}/retry`, `POST .../jobs/{id}/steps/{step}/retry`)
+  resets only missing/failed/blocked/cancelled steps; completed chunk scan
+  results are reused by content hash. Cancel is available per job and per
+  step; workers check the flag between steps and between chunks.
+- Jobs and steps persist heartbeats. A queued/running job without a recent
+  heartbeat (`SYSTEM_UNDERSTANDING_STUCK_AFTER_SECONDS`, default 300) is
+  reported `is_stuck`; `init_db` fails over jobs interrupted by a restart so
+  they become retryable instead of active-forever.
+- LLM failures fail the `claim_scan` step visibly with per-chunk errors;
+  deterministic steps still complete (no heuristic fallback, Principle 6).
+- Job status vocabulary: `queued / running / completed / partial / failed /
+  cancelled` (+ derived `is_stuck`). `partial` means some steps completed and
+  at least one failed.
+- Status endpoints: `GET .../jobs/{job_id}`, `GET .../jobs/active`, plus the
+  back-compat `GET .../build/latest` and `GET .../build/{id}` returning the
+  same extended payload (steps, llm task counts, artifact counts).
+
 ## Authentication and user management
 
 - Auth is enabled when any user exists or `CONTROL_API_KEYS` is set; otherwise open (MVP compat).

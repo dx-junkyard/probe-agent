@@ -565,20 +565,27 @@ class TestBuildDoesNotBlockOtherRequests:
             "/repository/snapshots", json={"commit_sha": sha}, headers=hdrs
         )
 
-        # Simulate a slow/hanging reasoning-model call during the
-        # documentation step: this used to run inside the single
-        # get_conn() block held for the whole build, starving every other
-        # request of the shared sqlite lock.
+        # Simulate a slow/hanging reasoning-model call during the claim scan
+        # step: this used to run inside the single get_conn() block held for
+        # the whole build, starving every other request of the shared sqlite
+        # lock. Claim scanning is chunk-level since Issue #109, so patch
+        # scan_chunk (the per-chunk LLM call).
         import app.system_understanding_service as sus
         import app.documentation_claim_scanner as scanner_module
 
         monkeypatch.setattr(sus, "_is_reasoning_model_available", lambda: True)
 
-        def _slow_scan_all_chunks(client, config, chunks):
+        def _slow_scan_chunk(client, config, chunk, cache=None):
             time.sleep(1.0)
-            return []
+            return scanner_module.ChunkScanResult(
+                chunk_id=chunk.chunk_id,
+                chunk_content_hash=chunk.content_hash,
+                prompt_version=scanner_module.PROMPT_VERSION,
+                schema_version=scanner_module.SCHEMA_VERSION,
+                claims=[],
+            )
 
-        monkeypatch.setattr(scanner_module, "scan_all_chunks", _slow_scan_all_chunks)
+        monkeypatch.setattr(scanner_module, "scan_chunk", _slow_scan_chunk)
 
         build_r = admin_client.post(
             "/repository/system-understanding/build", headers=hdrs

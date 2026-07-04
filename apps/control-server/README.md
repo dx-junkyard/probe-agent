@@ -72,6 +72,22 @@ Generate & Evaluate は `app.llm` の抽象化層だけを通して LLM を呼�
 `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` も後方互換として読まれる。
 `mock` はテストとローカルUI確認用で、外部 API は呼ばない。
 
+## System Understanding build ジョブ (Issue #109)
+
+`POST /repository/system-understanding/build` は step 単位で orchestration
+される非同期ジョブを enqueue し、即座に `job_id` を返す。進捗は
+`GET /repository/system-understanding/jobs/{job_id}` /
+`GET /repository/system-understanding/jobs/active` で polling する。
+step ごとに status / started_at / completed_at / duration / error /
+artifact provenance が永続化され、completed step は再実行されない。
+claim scan は chunk 単位の LLM task として retry / backoff / cancel を統一管理する。
+
+| 変数 | 用途 |
+| --- | --- |
+| `SYSTEM_UNDERSTANDING_STUCK_AFTER_SECONDS` | heartbeat がこの秒数更新されない active job を stuck と判定（既定値: `300`） |
+| `SYSTEM_UNDERSTANDING_LLM_MAX_ATTEMPTS` | claim scan chunk task の最大試行回数（既定値: `3`） |
+| `SYSTEM_UNDERSTANDING_LLM_BACKOFF_SECONDS` | chunk task retry の指数 backoff 基準秒（既定値: `2`） |
+
 ## 設定診断 (System Diagnostics)
 
 `GET /system-diagnostics` は必須設定の静的・決定的ヘルスチェックを返す (Issue #101)。
