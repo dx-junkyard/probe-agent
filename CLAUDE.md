@@ -72,6 +72,13 @@ Feature Map, Probe Planner, and Experiments tabs are explicit mocks. Replace
 each mock only when implementing its owning issue; do not silently present
 mock data as persisted or analyzed data.
 
+A conversational system-understanding interview that proposes `probe-agent:`
+docstring metadata and probe instrumentation together (see Principle 8) is a
+future phase building on #25's isolated-worktree instrumentation. It is not
+owned by #23-#26 as written; do not start implementing it until it has its
+own issue, so persistence and approval flows are designed deliberately
+instead of being bolted onto an unrelated issue's scope.
+
 ---
 
 ## Core Design Principles
@@ -100,7 +107,11 @@ mock data as persisted or analyzed data.
    - Enumerate with `git ls-files` and read with `git show <sha>:<path>`.
    - Never read untracked, ignored, or uncommitted file contents.
    - Reject path traversal and repository-external symlink access.
-   - Do not write to the target repository.
+   - Do not write to the target repository's tracked branches, and never
+     commit or push to it directly. The one exception is the conversational
+     metadata/probe authoring flow in Principle 8, which writes only inside
+     an isolated worktree and stops at a reviewable diff/PR — the developer
+     performs the final apply/merge into the real repository.
 
 6. Limit deterministic decisions to explicit finite sets.
    - Deterministic rules are allowed only when the result belongs to a small,
@@ -127,6 +138,22 @@ mock data as persisted or analyzed data.
    - Commands must come from explicit repository configuration.
    - Network is off by default; environment variables are allowlisted.
    - Preserve reviewable patches and deterministic raw results.
+   - A conversational system-understanding interview (purpose / capability /
+     element discovery with the developer) may propose `probe-agent:`
+     docstring metadata and probe instrumentation together. Proposed text is
+     LLM-authored and stays `reasoning_llm` until a human approves it; once
+     approved, probe-agent materializes the docstring edits and probe
+     instrumentation in the same isolated worktree used for Probe Plans
+     (Issue #25) and produces a single reviewable diff or pull request.
+   - probe-agent never commits or pushes the result to the target
+     repository's tracked branches itself. The developer reviews the diff/PR
+     and performs the merge — this keeps the "no direct write to target
+     repo" boundary (Principle 5) while removing manual transcription work.
+   - This does not relax Principle 6: which capability an element belongs to,
+     what its role/probe value is, and what to instrument remain
+     reasoning-model proposals, never heuristic free-text guesses, and the
+     developer's approval is the `decision_method: manual` record, not the
+     LLM's output alone (Principle 7).
 
 ---
 

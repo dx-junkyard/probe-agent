@@ -25,6 +25,15 @@ The framework-aware part this adds over the symbol-only ``list_entrypoints`` is
 ``app.include_router(router, prefix="/api")`` is reported as ``/api/users/...``,
 including across modules. Flask blueprints (``url_prefix``) get the same
 treatment.
+
+probe-agent:
+  role: Deterministic backend entrypoint discoverer
+  capability: entrypoint-discovery
+  element_type: core
+  consumers: [capability-mapping, execution-flow-understanding, system-understanding]
+  operation_kind: analysis
+  state_effects: [none]
+  probe_value: Verify that framework-aware route composition produces correct prefixed paths deterministically.
 """
 
 from __future__ import annotations

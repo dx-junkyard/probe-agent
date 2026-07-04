@@ -35,6 +35,24 @@ The dashboard should support:
   accept/reject with a required reason. There is no "defer" decision or
   proposal-edit action in the API (Issue #35 only exposes accept/reject); do
   not add UI controls for actions the API does not support.
+- System settings diagnostics (Issue #101): a header alert badge
+  (`components/diagnostics-badge.tsx`) fed by `GET /system-diagnostics`.
+  The badge count is error+blocked+warning checks; clicking opens a dialog
+  showing each check's detail, impact, remediation, related env vars, and
+  the verbatim last observed run error. The System Understanding page shows
+  a "Why?" button on missing/blocked pipeline rows that expands the related
+  diagnostics. Diagnostics are deterministic server output — never decorate
+  them with client-side heuristic explanations.
+- Per-screen assistant (Issue #102): a floating agent button rendered by the
+  app layout on every page (`components/assistant-panel.tsx`). It opens a
+  right-side panel showing the screen's purpose, the current diagnostics
+  state for that screen, suggested questions (failing checks first), a
+  free-text question box, and answers from `POST /assistant/ask`. Answers
+  must render `used_fallback` and decision method visibly, list citations
+  (settings, diagnostics checks, pipeline steps) and suggested actions;
+  navigate actions use client-side routing. The screen id sent to the API is
+  the route's first path segment (`/` → `overview`). The panel must not
+  block or overlap primary page actions when closed.
 
 ## Authentication model
 

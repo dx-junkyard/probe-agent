@@ -9,7 +9,7 @@
 cd apps/control-server && uvicorn app.main:app --port 8000
 
 # 2. Dashboard を起動 (別ターミナル)
-cd apps/dashboard && streamlit run app.py
+cd apps/dashboard && npm install && npm run dev
 
 # 3. SDK をインストールしてサンプル実行 (別ターミナル)
 pip install -e packages/python-probe

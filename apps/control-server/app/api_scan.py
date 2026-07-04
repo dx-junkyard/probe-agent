@@ -17,6 +17,15 @@ This honours the codebase rules:
 - Mock and non-reasoning models fail closed; there is no heuristic fallback.
 - The generated regexes are reviewable artifacts persisted alongside an audit
   run, kept separate from deterministic AST facts.
+
+probe-agent:
+  role: LLM-assisted framework-agnostic API scanner
+  capability: entrypoint-discovery
+  element_type: element
+  consumers: [entrypoint-discovery, capability-mapping]
+  operation_kind: analysis
+  state_effects: [external-api]
+  probe_value: Verify that reasoning model regex proposals are applied deterministically and mock models fail closed.
 """
 
 from __future__ import annotations

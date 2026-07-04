@@ -3,6 +3,15 @@
 Generates ProbePoint candidates from features and accepted code links.
 The safety denylist is deterministic and overrides LLM output — it cannot be
 unlocked by model suggestions.
+
+probe-agent:
+  role: Core logic for generating probe plans from features and code links
+  capability: probe-planning
+  element_type: core
+  operation_kind: analysis
+  consumers: [control-server, dashboard]
+  state_effects: [external-api]
+  probe_value: Verify plan generation honours the safety denylist, produces valid ProbePoints, and records reasoning-model audit metadata.
 """
 
 from __future__ import annotations
