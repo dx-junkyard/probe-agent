@@ -139,6 +139,8 @@ SCREEN_CONTEXTS: List[ScreenContext] = [
             "snapshot_status",
             "llm_base_config",
             "intelligence_llm_config",
+            "system_purpose",
+            "system_capabilities",
             "llm_last_run",
             *_PIPELINE_CHECKS,
         ],
@@ -197,7 +199,13 @@ SCREEN_CONTEXTS: List[ScreenContext] = [
             "What does drift mean here?",
         ],
         related_settings=[*_INTELLIGENCE_SETTINGS, "LLM_API_KEY"],
-        related_checks=["intelligence_llm_config", "pipeline_capability_hierarchy", "llm_last_run"],
+        related_checks=[
+            "system_purpose",
+            "system_capabilities",
+            "intelligence_llm_config",
+            "pipeline_capability_hierarchy",
+            "llm_last_run",
+        ],
         related_pipeline_steps=["capability_hierarchy_ready"],
         related_endpoints=[
             "GET /repository/capability-hierarchy",
@@ -281,7 +289,13 @@ SCREEN_CONTEXTS: List[ScreenContext] = [
         visible_sections=["Understanding", "Proposals", "Approved set"],
         common_questions=["Why can't the interview generate proposals?"],
         related_settings=[*_INTELLIGENCE_SETTINGS, "LLM_API_KEY"],
-        related_checks=["intelligence_llm_config", "llm_last_run", "snapshot_status"],
+        related_checks=[
+            "system_purpose",
+            "system_capabilities",
+            "intelligence_llm_config",
+            "llm_last_run",
+            "snapshot_status",
+        ],
         related_pipeline_steps=["snapshot_ready"],
         related_endpoints=["GET /interview/sessions", "POST /interview/sessions"],
     ),
@@ -421,6 +435,13 @@ PIPELINE_STEP_LABELS: Dict[str, str] = {
 CHECK_OPERATIONS: Dict[str, tuple] = {
     "repository_config": ("Configure the repository", "/repository"),
     "snapshot_status": ("Create a snapshot", "/repository"),
+    # Issue #120: System Purpose / Core Capabilities are prerequisites for
+    # probe design, flow exploration, and improvement proposals, so their
+    # suggested actions are listed ahead of pipeline/llm_last_run below
+    # (dict order here doesn't matter; check order in run_system_diagnostics
+    # does, since _fallback_actions preserves that order).
+    "system_purpose": ("Define System Purpose", "/interview"),
+    "system_capabilities": ("Identify main system capabilities", "/interview"),
     "pipeline_symbol_index": ("Run Build / Refresh", "/system-understanding"),
     "pipeline_entrypoint_index": ("Run Build / Refresh", "/system-understanding"),
     "pipeline_documentation_index": ("Run Build / Refresh", "/system-understanding"),

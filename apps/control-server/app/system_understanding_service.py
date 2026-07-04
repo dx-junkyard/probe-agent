@@ -678,7 +678,13 @@ def _compute_gap_summary(gaps: List[Dict[str, Any]]) -> List[GapSummary]:
     return [GapSummary(gap_type=k, count=v) for k, v in sorted(counts.items())]
 
 
-def _build_next_actions(pipeline: List[PipelineStep], metadata_coverage: Optional[MetadataCoverage], gap_count: int) -> List[NextAction]:
+def _build_next_actions(
+    pipeline: List[PipelineStep],
+    purpose: Optional[Dict[str, Any]],
+    capabilities: List[Dict[str, Any]],
+    metadata_coverage: Optional[MetadataCoverage],
+    gap_count: int,
+) -> List[NextAction]:
     actions: List[NextAction] = []
     step_map = {s.step: s.status for s in pipeline}
 
@@ -726,6 +732,33 @@ def _build_next_actions(pipeline: List[PipelineStep], metadata_coverage: Optiona
             link="/capability-map",
         ))
 
+    # Issue #120: pipeline step remediation (above) always takes priority
+    # while the pipeline is incomplete or blocked/failed. Once every step is
+    # complete, a completed pipeline is not the same as a usable system
+    # understanding — System Purpose and main capabilities are the highest
+    # priority next actions, ahead of metadata coverage and docs-code gaps.
+    pipeline_complete = not actions
+
+    if pipeline_complete:
+        purpose_defined = bool(purpose and (purpose.get("summary") or purpose.get("name")))
+        if not purpose_defined:
+            actions.append(NextAction(
+                action="Define System Purpose",
+                reason="Pipeline completed, but no system purpose is defined yet.",
+                link="/interview",
+            ))
+
+        if not capabilities:
+            actions.append(NextAction(
+                action="Identify main system capabilities",
+                reason=(
+                    "System purpose and main capabilities are not identified yet, "
+                    "so probe candidates, flow exploration, and improvement "
+                    "proposals lack a foundation."
+                ),
+                link="/interview",
+            ))
+
     if metadata_coverage and metadata_coverage.symbol_count > 0:
         ratio = metadata_coverage.symbols_with_source_metadata / metadata_coverage.symbol_count
         if ratio < 0.1:
@@ -742,8 +775,22 @@ def _build_next_actions(pipeline: List[PipelineStep], metadata_coverage: Optiona
             link="/system-understanding",
         ))
 
-    if step_map.get("docs_code_reconciled") == "complete" and gap_count == 0 and not actions:
-        pass
+    if pipeline_complete and not actions:
+        actions.append(NextAction(
+            action="Start from Capability",
+            reason="System understanding is complete; explore from the Capability Map.",
+            link="/capability-map",
+        ))
+        actions.append(NextAction(
+            action="Start from Feature",
+            reason="System understanding is complete; explore from the Feature Map.",
+            link="/feature-map",
+        ))
+        actions.append(NextAction(
+            action="Open Flow Explorer",
+            reason="System understanding is complete; explore call flows from entrypoints.",
+            link="/flow-explorer",
+        ))
 
     return actions
 
@@ -775,6 +822,8 @@ def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
 
         summary.next_actions = _build_next_actions(
             pipeline,
+            summary.purpose,
+            summary.capabilities,
             summary.metadata_coverage,
             len(summary.gaps),
         )

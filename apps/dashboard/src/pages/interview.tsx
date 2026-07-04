@@ -22,6 +22,7 @@ import {
   useUpdateInterviewUnderstanding,
 } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
+import { DiagnosticFixCallout } from "@/components/diagnostic-fix";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -539,6 +540,9 @@ export default function InterviewPage() {
           </Button>
         </div>
       </div>
+
+      <DiagnosticFixCallout anchor="interview-purpose" />
+      <DiagnosticFixCallout anchor="interview-capabilities" />
 
       {!latestSnapshot && !snapshotLoading && (
         <Card>
