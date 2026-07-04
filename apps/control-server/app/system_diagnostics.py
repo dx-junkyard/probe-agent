@@ -55,6 +55,8 @@ FIX_KIND_DIALOG = "dialog"
 PAGE_REPOSITORY = "/repository"
 PAGE_SYSTEM_UNDERSTANDING = "/system-understanding"
 PAGE_ADMIN = "/admin"
+PAGE_INTERVIEW = "/interview"
+PAGE_CAPABILITY_MAP = "/capability-map"
 
 # Fix anchors. These must match the ``diag-anchor`` attributes rendered by the
 # Dashboard so the target UI can be highlighted. Finite, explicit set.
@@ -62,6 +64,8 @@ ANCHOR_REPO_CONFIG = "repo-config"
 ANCHOR_REPO_PATTERNS = "repo-patterns"
 ANCHOR_SNAPSHOT_CREATE = "snapshot-create"
 ANCHOR_BUILD = "build"
+ANCHOR_INTERVIEW_PURPOSE = "interview-purpose"
+ANCHOR_INTERVIEW_CAPABILITIES = "interview-capabilities"
 
 KNOWN_PROVIDERS = {"openai", "anthropic", "gemini", "mock"}
 
@@ -94,7 +98,7 @@ class LastObservedError:
 @dataclass
 class DiagnosticCheck:
     check_id: str
-    category: str  # repository | database | auth | llm | pipeline
+    category: str  # repository | database | auth | llm | pipeline | understanding
     title: str
     severity: str  # ok | warning | error | blocked | unknown
     detail: str
@@ -820,6 +824,107 @@ def _no_ready_snapshot_check(base: dict) -> DiagnosticCheck:
     )
 
 
+def _check_system_purpose(conn, system_id: int, snapshot_id: Optional[int]) -> DiagnosticCheck:
+    """Issue #120: System Purpose is a prerequisite for probe design, flow
+
+    exploration, and improvement proposals matching user intent, not just a
+    blank field on a page — so it is tracked here alongside required
+    settings, and its remediation is prioritized ahead of ``llm_last_run``.
+    """
+    base = dict(
+        check_id="system_purpose",
+        category="understanding",
+        title="System Purpose の定義",
+        related_pages=[PAGE_SYSTEM_UNDERSTANDING, PAGE_INTERVIEW],
+        related_pipeline_steps=["capability_hierarchy_ready"],
+    )
+    if snapshot_id is None:
+        return _no_ready_snapshot_check(base)
+    node = conn.execute(
+        "SELECT name, summary FROM capability_hierarchy_nodes "
+        "WHERE system_id = ? AND snapshot_id = ? AND node_type = 'purpose' LIMIT 1",
+        (system_id, snapshot_id),
+    ).fetchone()
+    draft = conn.execute(
+        "SELECT name, purpose FROM system_profile_drafts "
+        "WHERE system_id = ? AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
+        (system_id, snapshot_id),
+    ).fetchone()
+    defined = (node is not None and (node["name"] or node["summary"])) or (
+        draft is not None and (draft["name"] or draft["purpose"])
+    )
+    if defined:
+        return DiagnosticCheck(
+            severity="ok",
+            detail="System Purpose が定義されています。",
+            impact="",
+            remediation="",
+            **base,
+        )
+    return DiagnosticCheck(
+        severity="warning",
+        detail=(
+            "System Purpose が未定義です。Pipeline のステップが完了していても、"
+            "このシステムが何のためのものかが定義されていません。"
+        ),
+        impact=(
+            "probe 設計・flow 探索・改善提案・ユーザー意図との整合の前提となる"
+            "根幹情報が欠けています。"
+        ),
+        remediation="Interview で System Purpose を定義・確認してください。",
+        fix_kind=FIX_KIND_NAVIGATE,
+        fix_page=PAGE_INTERVIEW,
+        fix_anchor=ANCHOR_INTERVIEW_PURPOSE,
+        **base,
+    )
+
+
+def _check_system_capabilities(conn, system_id: int, snapshot_id: Optional[int]) -> DiagnosticCheck:
+    """Issue #120: main system capabilities (Core Capabilities) are the other
+
+    prerequisite for probe/flow/improvement work, tracked the same way as
+    System Purpose above.
+    """
+    base = dict(
+        check_id="system_capabilities",
+        category="understanding",
+        title="主な機能 / Core Capabilities の把握",
+        related_pages=[PAGE_SYSTEM_UNDERSTANDING, PAGE_INTERVIEW, PAGE_CAPABILITY_MAP],
+        related_pipeline_steps=["capability_hierarchy_ready"],
+    )
+    if snapshot_id is None:
+        return _no_ready_snapshot_check(base)
+    count = conn.execute(
+        "SELECT COUNT(*) FROM capability_hierarchy_nodes "
+        "WHERE system_id = ? AND snapshot_id = ? AND node_type = 'capability'",
+        (system_id, snapshot_id),
+    ).fetchone()[0]
+    if count > 0:
+        return DiagnosticCheck(
+            severity="ok",
+            detail=f"{count} 件の Core Capability が定義されています。",
+            impact="",
+            remediation="",
+            **base,
+        )
+    return DiagnosticCheck(
+        severity="warning",
+        detail="対象システムの主な機能（Core Capabilities）が未定義・空です。",
+        impact=(
+            "probe 候補選定・flow 探索・改善提案の前提となる、システムの主要な"
+            "機能の把握ができていません。"
+        ),
+        remediation=(
+            "Interview で主な機能を特定するか、Capability Map で capability 階層を"
+            "確認してください。"
+        ),
+        fix_kind=FIX_KIND_NAVIGATE,
+        fix_page=PAGE_INTERVIEW,
+        fix_anchor=ANCHOR_INTERVIEW_CAPABILITIES,
+        **base,
+    )
+
+
 def _reasoning_unavailable_check(base: dict, *, detail: str) -> DiagnosticCheck:
     """Blocked result when a step needs reasoning but no reasoning model is set.
 
@@ -1058,9 +1163,18 @@ def run_system_diagnostics(system_id: int) -> SystemDiagnosticsReport:
         checks.append(_check_repository_config(conn, system_id))
         checks.append(_check_snapshot_status(conn, system_id))
         checks.append(_check_auth_scope(conn, system_id))
-        checks.append(_check_last_reasoning_run(conn, system_id))
 
         snapshot_id = _latest_ready_snapshot_id(conn, system_id)
+
+        # Issue #120: System Purpose and Core Capabilities are prerequisites
+        # for probe design, flow exploration, and improvement proposals, so
+        # they are checked ahead of the pipeline/llm_last_run checks below —
+        # a completed pipeline with no purpose is still a warning, not "ok".
+        checks.append(_check_system_purpose(conn, system_id, snapshot_id))
+        checks.append(_check_system_capabilities(conn, system_id, snapshot_id))
+
+        checks.append(_check_last_reasoning_run(conn, system_id))
+
         checks.append(
             _run_backed_pipeline_check(
                 conn, system_id, snapshot_id,

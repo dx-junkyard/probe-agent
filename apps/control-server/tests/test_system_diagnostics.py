@@ -470,3 +470,113 @@ class TestPipelinePrerequisites:
         assert sym["severity"] == "ok"
         assert sym["related_pipeline_steps"] == ["symbols_indexed"]
         assert checks["pipeline_entrypoint_index"]["severity"] == "ok"
+
+
+_PURPOSE_MODULE = (
+    '"""Module docstring.\n'
+    '\n'
+    'probe-agent:\n'
+    '  role: Coordinates the whole system\n'
+    '  capability: core-flow\n'
+    '  element_type: system\n'
+    '  system_purpose: Automate the thing end to end\n'
+    '"""\n'
+    '\n'
+    'def run():\n'
+    '    """Run it.\n'
+    '\n'
+    '    probe-agent:\n'
+    '      role: Runs the core flow\n'
+    '      capability: core-flow\n'
+    '      element_type: core\n'
+    '    """\n'
+    '    return 1\n'
+)
+
+
+def _make_purpose_repo(tmp_path, name="purpose-repo"):
+    repo = tmp_path / name
+    repo.mkdir()
+    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t.com"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "T"],
+                   check=True, capture_output=True)
+    (repo / "src").mkdir()
+    (repo / "src" / "core.py").write_text(_PURPOSE_MODULE)
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"],
+                   check=True, capture_output=True)
+    return repo
+
+
+class TestSystemPurposeAndCapabilities:
+    """Issue #120: System Purpose / Core Capabilities are health checks,
+
+    not just optional page content, so an all-complete pipeline with no
+    purpose or capabilities still surfaces a warning instead of `ok`.
+    """
+
+    def test_no_snapshot_is_blocked(self, admin_client):
+        _, _, hdrs = _setup(admin_client)
+        _, checks = _get_checks(admin_client, hdrs)
+        assert checks["system_purpose"]["severity"] == "blocked"
+        assert checks["system_capabilities"]["severity"] == "blocked"
+
+    def test_snapshot_without_hierarchy_is_warning(self, admin_client, tmp_path):
+        _, _, hdrs = _setup(admin_client)
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+
+        _, checks = _get_checks(admin_client, hdrs)
+        purpose = checks["system_purpose"]
+        caps = checks["system_capabilities"]
+        assert purpose["severity"] == "warning"
+        assert purpose["fix_kind"] == "navigate"
+        assert purpose["fix_page"] == "/interview"
+        assert purpose["fix_anchor"] == "interview-purpose"
+        assert caps["severity"] == "warning"
+        assert caps["fix_anchor"] == "interview-capabilities"
+
+    def test_source_authored_purpose_and_capability_is_ok(self, admin_client, tmp_path):
+        _, _, hdrs = _setup(admin_client)
+        repo = _make_purpose_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["src/**"]},
+            headers=hdrs,
+        )
+        admin_client.post("/repository/snapshots", headers=hdrs)
+        idx = admin_client.post("/repository/symbols/index", headers=hdrs)
+        assert idx.status_code == 201, idx.text
+        gen = admin_client.post("/repository/capability-hierarchy/generate", headers=hdrs)
+        assert gen.status_code == 201, gen.text
+
+        _, checks = _get_checks(admin_client, hdrs)
+        assert checks["system_purpose"]["severity"] == "ok"
+        assert checks["system_capabilities"]["severity"] == "ok"
+
+    def test_isolated_per_system(self, admin_client, tmp_path):
+        token, _, hdrs_a = _setup(admin_client, name="purpose-a")
+        sys_b = _create_system(admin_client, token, "purpose-b")
+        hdrs_b = _headers(token, sys_b["id"])
+
+        repo = _make_purpose_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["src/**"]},
+            headers=hdrs_a,
+        )
+        admin_client.post("/repository/snapshots", headers=hdrs_a)
+        admin_client.post("/repository/symbols/index", headers=hdrs_a)
+        admin_client.post("/repository/capability-hierarchy/generate", headers=hdrs_a)
+
+        _, checks_a = _get_checks(admin_client, hdrs_a)
+        _, checks_b = _get_checks(admin_client, hdrs_b)
+        assert checks_a["system_purpose"]["severity"] == "ok"
+        assert checks_b["system_purpose"]["severity"] == "blocked"
