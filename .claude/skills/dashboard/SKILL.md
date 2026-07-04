@@ -43,6 +43,14 @@ The dashboard should support:
   a "Why?" button on missing/blocked pipeline rows that expands the related
   diagnostics. Diagnostics are deterministic server output — never decorate
   them with client-side heuristic explanations.
+  Issue #115: the dialog text is Japanese and each problem is clickable.
+  A `fix_kind: navigate` check routes to `fix_page?diagnostic=<id>&fix=<anchor>`
+  and closes the dialog; a `fix_kind: dialog` check opens an env-var
+  remediation dialog (which env vars, plus restart/re-run steps). Target
+  pages render a `diag-anchor` on the fix control and an inline
+  `DiagnosticFixCallout` (`components/diagnostic-fix.tsx`) that highlights the
+  control and shows 原因 / 次の操作 verbatim from the diagnostic — no
+  client-side interpretation.
 - Per-screen assistant (Issue #102): a floating agent button rendered by the
   app layout on every page (`components/assistant-panel.tsx`). It opens a
   right-side panel showing the screen's purpose, the current diagnostics

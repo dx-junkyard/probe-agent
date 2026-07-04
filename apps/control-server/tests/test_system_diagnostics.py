@@ -135,6 +135,41 @@ class TestDiagnosticsBasics:
         assert "mock" in checks["llm_base_config"]["detail"]
         assert checks["intelligence_llm_config"]["severity"] == "blocked"
 
+    def test_checks_carry_fix_navigation(self, admin_client):
+        """Issue #115: every check has a finite fix_kind, and navigate checks
+        point at a Dashboard page."""
+        _, _, hdrs = _setup(admin_client)
+        _, checks = _get_checks(admin_client, hdrs)
+
+        for c in checks.values():
+            assert c["fix_kind"] in ("navigate", "dialog"), c["check_id"]
+            if c["fix_kind"] == "navigate":
+                assert c["fix_page"], c["check_id"]
+
+        # Repository config (unconfigured) routes to the repository config form.
+        repo = checks["repository_config"]
+        assert repo["fix_kind"] == "navigate"
+        assert repo["fix_page"] == "/repository"
+        assert repo["fix_anchor"] == "repo-config"
+
+        # Snapshot creation routes to the snapshot creation control.
+        snap = checks["snapshot_status"]
+        assert snap["fix_kind"] == "navigate"
+        assert snap["fix_anchor"] == "snapshot-create"
+
+        # Env-only LLM configuration is fixed via a dialog, not a page.
+        assert checks["intelligence_llm_config"]["fix_kind"] == "dialog"
+        assert checks["llm_base_config"]["fix_kind"] == "dialog"
+
+    def test_messages_are_japanese(self, admin_client):
+        """Diagnostics remediation/impact text is Japanese (Issue #115)."""
+        _, _, hdrs = _setup(admin_client)
+        _, checks = _get_checks(admin_client, hdrs)
+
+        repo = checks["repository_config"]
+        assert "リポジトリ" in repo["remediation"]
+        assert "設定されていません" in repo["detail"]
+
 
 class TestRepositoryChecks:
     def test_missing_repository_roots_is_error(self, admin_client, monkeypatch):
@@ -200,7 +235,7 @@ class TestRepositoryChecks:
         _, checks = _get_checks(admin_client, hdrs)
         c = checks["snapshot_status"]
         assert c["severity"] == "warning"
-        assert "0 indexed" in c["detail"]
+        assert "0 件" in c["detail"]
 
 
 class TestLLMConfigChecks:
@@ -241,7 +276,7 @@ class TestLLMConfigChecks:
         c = checks["intelligence_llm_config"]
         assert c["severity"] == "error"
         assert "claude-opus-4" in c["detail"]
-        assert "INTELLIGENCE_LLM_PROVIDER is empty" in c["detail"]
+        assert "INTELLIGENCE_LLM_PROVIDER が未設定" in c["detail"]
 
     def test_unknown_model_family_is_warning(self, admin_client, monkeypatch):
         _, _, hdrs = _setup(admin_client)
@@ -338,7 +373,7 @@ class TestLastObservedFailures:
 
         doc = checks["pipeline_documentation_index"]
         assert doc["severity"] == "warning"
-        assert "not run" in doc["detail"]
+        assert "実行されていません" in doc["detail"]
 
     def test_no_reasoning_run_is_unknown(self, admin_client):
         _, _, hdrs = _setup(admin_client)

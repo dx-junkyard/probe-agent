@@ -9,6 +9,7 @@ const mockApi = {
   get: vi.fn(),
   post: vi.fn(),
   put: vi.fn(),
+  patch: vi.fn(),
   delete: vi.fn(),
 };
 let mockSystemId: number | null = 1;
@@ -1868,6 +1869,146 @@ describe("System Understanding page", () => {
     const capLink = screen.getByText("User Auth");
     expect(capLink.closest("a")?.getAttribute("href")).toContain("/capability-map?capability=User%20Auth");
   });
+
+  // ── Issue drafts (Issue #107) ──────────────────────────────────────
+
+  const gapWithSourceKey = {
+    gap_type: "docs_only",
+    severity: "warning",
+    title: "Documented but no matching implementation: Auth",
+    node_name: "Auth",
+    notes: "Found in docs but no matching code",
+    capability_key: null,
+    doc_refs: [{ path: "docs/design.md", start_line: 10, end_line: 20 }],
+    symbol_refs: [],
+    entrypoint_refs: [],
+    code_refs: [],
+    next_actions: [
+      { action: "Open docs evidence", link: null },
+      { action: "Create implementation issue", link: null },
+    ],
+    source_key: "system_understanding_gap:docs_only:Auth",
+    issue_drafts: [],
+  };
+
+  const draftGapResponse = {
+    ...completeResponse,
+    gaps: [gapWithSourceKey],
+    gap_summary: [{ gap_type: "docs_only", count: 1 }],
+  };
+
+  const sampleDraft = {
+    id: 7,
+    system_id: 1,
+    snapshot_id: 5,
+    commit_sha: "abc12345def",
+    source_type: "system_understanding_gap",
+    source_key: "system_understanding_gap:docs_only:Auth",
+    gap_type: "docs_only",
+    severity: "warning",
+    node_name: "Auth",
+    title: "Documented but no matching implementation: Auth",
+    body_markdown: "## Gap\n\n- **Type:** `docs_only`\n\n## Observation snapshot\n\n- **Commit sha:** `abc12345def`\n",
+    status: "draft",
+    external_url: null,
+    created_at: 1,
+    updated_at: 1,
+  };
+
+  test("Create implementation issue button generates a draft via POST", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(draftGapResponse)
+        : Promise.resolve(null),
+    );
+    mockApi.post.mockResolvedValue(sampleDraft);
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const btn = await screen.findByTestId("gap-create-issue");
+    fireEvent.click(btn);
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/issue-drafts", {
+        gap: gapWithSourceKey,
+        snapshot_id: 5,
+        commit_sha: "abc12345def",
+      });
+    });
+  });
+
+  test("draft dialog opens after generation and can copy Markdown", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(draftGapResponse);
+      if (path === "/issue-drafts/7") return Promise.resolve(sampleDraft);
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockResolvedValue(sampleDraft);
+
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByTestId("gap-create-issue"));
+
+    const copyBtn = await screen.findByTestId("issue-draft-copy");
+    fireEvent.click(copyBtn);
+    expect(writeText).toHaveBeenCalledWith(sampleDraft.body_markdown);
+  });
+
+  test("registering an external URL PATCHes the draft", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(draftGapResponse);
+      if (path === "/issue-drafts/7") return Promise.resolve(sampleDraft);
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockResolvedValue(sampleDraft);
+    mockApi.patch.mockResolvedValue({ ...sampleDraft, external_url: "https://x.test/1", status: "external_created" });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByTestId("gap-create-issue"));
+
+    const urlInput = await screen.findByTestId("issue-draft-url");
+    fireEvent.change(urlInput, { target: { value: "https://x.test/1" } });
+    fireEvent.click(screen.getByTestId("issue-draft-register-url"));
+
+    await waitFor(() => {
+      expect(mockApi.patch).toHaveBeenCalledWith("/issue-drafts/7", {
+        external_url: "https://x.test/1",
+        status: "external_created",
+      });
+    });
+  });
+
+  test("existing gap draft with external URL is surfaced on the gap", async () => {
+    const gapWithDraft = {
+      ...gapWithSourceKey,
+      issue_drafts: [
+        { id: 7, status: "external_created", external_url: "https://x.test/1", title: "Auth" },
+      ],
+    };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve({ ...draftGapResponse, gaps: [gapWithDraft] })
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("gap-issue-drafts")).toBeTruthy();
+    });
+    const link = screen.getByTestId("gap-issue-draft-url");
+    expect(link.getAttribute("href")).toBe("https://x.test/1");
+    // Existing draft flips the action button label to "Open issue draft".
+    expect(screen.getByText("Open issue draft")).toBeTruthy();
+  });
 });
 
 // ── System settings diagnostics (Issue #101) ────────────────────────
@@ -2100,6 +2241,9 @@ describe("System settings diagnostics", () => {
           observed_at: 1749999000,
         },
         decision_method: "deterministic",
+        fix_kind: "dialog",
+        fix_page: null,
+        fix_anchor: null,
       },
       {
         check_id: "snapshot_status",
@@ -2115,6 +2259,9 @@ describe("System settings diagnostics", () => {
         related_pipeline_steps: ["snapshot_ready"],
         last_observed_error: null,
         decision_method: "deterministic",
+        fix_kind: "navigate",
+        fix_page: "/repository",
+        fix_anchor: "repo-patterns",
       },
       {
         check_id: "pipeline_documentation_index",
@@ -2130,6 +2277,9 @@ describe("System settings diagnostics", () => {
         related_pipeline_steps: ["documentation_indexed"],
         last_observed_error: null,
         decision_method: "deterministic",
+        fix_kind: "navigate",
+        fix_page: "/system-understanding",
+        fix_anchor: "build",
       },
       {
         check_id: "database_storage",
@@ -2145,6 +2295,9 @@ describe("System settings diagnostics", () => {
         related_pipeline_steps: [],
         last_observed_error: null,
         decision_method: "deterministic",
+        fix_kind: "dialog",
+        fix_page: null,
+        fix_anchor: null,
       },
     ],
   };
@@ -2179,8 +2332,60 @@ describe("System settings diagnostics", () => {
     expect(lastError.textContent).toContain("HTTP 401: invalid api key");
     expect(lastError.textContent).toContain("intelligence_runs#12:repository_drafts");
     // Passing checks are still visible as passing.
-    expect(screen.getByText("Passing checks")).toBeTruthy();
+    expect(screen.getByText("正常なチェック")).toBeTruthy();
     expect(screen.getByText("Database storage")).toBeTruthy();
+  });
+
+  test("clicking a navigate check routes to its fix page with focus params", async () => {
+    window.history.pushState({}, "", "/");
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-diagnostics"
+        ? Promise.resolve(diagnosticsResponse)
+        : Promise.resolve(null),
+    );
+
+    const { DiagnosticsBadge } = await import("@/components/diagnostics-badge");
+    render(<DiagnosticsBadge />, { wrapper: createWrapper() });
+
+    const badge = await screen.findByTestId("diagnostics-badge");
+    fireEvent.click(badge);
+
+    // snapshot_status is a navigate check → click its card.
+    const snapshotDetail = await screen.findByText(/0 indexed files/);
+    fireEvent.click(snapshotDetail);
+
+    await waitFor(() => {
+      expect(window.location.pathname).toBe("/repository");
+    });
+    const params = new URLSearchParams(window.location.search);
+    expect(params.get("diagnostic")).toBe("snapshot_status");
+    expect(params.get("fix")).toBe("repo-patterns");
+  });
+
+  test("clicking an env-only check opens a remediation dialog instead of navigating", async () => {
+    window.history.pushState({}, "", "/");
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-diagnostics"
+        ? Promise.resolve(diagnosticsResponse)
+        : Promise.resolve(null),
+    );
+
+    const { DiagnosticsBadge } = await import("@/components/diagnostics-badge");
+    render(<DiagnosticsBadge />, { wrapper: createWrapper() });
+
+    const badge = await screen.findByTestId("diagnostics-badge");
+    fireEvent.click(badge);
+
+    // intelligence_llm_config is a dialog check → click its card.
+    const llmDetail = await screen.findByText(/INTELLIGENCE_LLM_PROVIDER is empty/);
+    fireEvent.click(llmDetail);
+
+    const envDialog = await screen.findByTestId("diagnostic-env-dialog");
+    expect(envDialog.textContent).toContain("設定が必要な環境変数");
+    // Did not navigate away.
+    expect(window.location.pathname).toBe("/");
+    // The list dialog closed so the two modals don't stack.
+    expect(screen.queryByText("System Settings Diagnostics")).toBeNull();
   });
 
   test("badge renders without count when everything is ok", async () => {

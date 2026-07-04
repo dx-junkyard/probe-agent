@@ -56,6 +56,16 @@ fallback for intelligence work.
   heuristics, and never call an LLM from a diagnostics check.
 - New required settings must be added here with title/impact/remediation so
   the Dashboard alert badge can explain them.
+- Issue #115: user-facing text (title/detail/impact/remediation) is Japanese
+  and framed as 原因 / 修正場所 / 次の操作. Each check also carries a
+  deterministic fix target: `fix_kind` (finite `navigate | dialog`),
+  `fix_page` (a Dashboard route), and `fix_anchor` (a member of the finite
+  anchor set: `repo-config`, `repo-patterns`, `snapshot-create`, `build`).
+  `navigate` means an in-app control fixes it; `dialog` means it is an env
+  var / restart with no in-app control. These are chosen structurally per
+  branch — never inferred — and must be kept in sync with the `diag-anchor`
+  attributes rendered by the Dashboard. Identifiers embedded in `detail`
+  (env var names, model ids, paths) stay verbatim.
 
 ## Per-screen assistant (issue #102)
 
@@ -156,6 +166,41 @@ heuristic result.
 - Status endpoints: `GET .../jobs/{job_id}`, `GET .../jobs/active`, plus the
   back-compat `GET .../build/latest` and `GET .../build/{id}` returning the
   same extended payload (steps, llm task counts, artifact counts).
+
+## Issue drafts (issue #107)
+
+- `POST /issue-drafts`, `GET /issue-drafts`, `GET /issue-drafts/{id}`,
+  `PATCH /issue-drafts/{id}` (`app/issue_drafts.py`, `routes/project_intelligence.py`).
+  probe-agent's DB (`issue_drafts` table, system-scoped) is the source of
+  truth; external trackers are NOT integrated.
+- A draft is generated from a System Understanding gap: rendering the gap's
+  title, docs/code/entrypoint evidence, next actions, and the pinned
+  `snapshot_id` / `commit_sha` into a Markdown body is a deterministic,
+  structural template (Principle 6) — no reasoning model is called. Upstream
+  gap detection is where reasoning happens.
+- Gaps are recomputed per read (no stable id), so each gap carries a
+  deterministic `source_key` (`gap_source_key`), and `GET
+  /repository/system-understanding` attaches any matching drafts to each gap
+  (`issue_drafts`), matched by that key against the caller's open connection
+  (the DB lock is non-reentrant — never open a nested `get_conn`). The key
+  folds in a stable per-gap `source_id` (graph node id / entrypoint identity)
+  plus `capability_key` + docs/code/entrypoint evidence (hashed, order
+  independent), not just `gap_type` + `node_name`, so same-named gaps in one
+  system don't share drafts — including evidence-less gaps like
+  `missing_evidence`, which are distinguished by `source_id` alone. `source_id`
+  is on the gap output so it round-trips: a draft created from a POSTed gap
+  resolves to the same key the display computed.
+- `POST /issue-drafts` accepts the displayed `snapshot_id` / `commit_sha`;
+  if a newer snapshot has since become ready the request is refused (409) so
+  a draft never embeds a snapshot that disagrees with the gap evidence in the
+  payload. Omitting it falls back to the latest ready snapshot.
+- `status` vocabulary is a finite set: `draft / copied / external_created /
+  closed / rejected` (validated; anything else is 422). `external_url` is a
+  plain user-supplied string, validated only as `http(s)://`; probe-agent
+  never fetches, creates, or syncs the external issue and never writes to the
+  target repository (Non-goals; Principle 5).
+- `PATCH` uses field set-ness so `external_url: ""` clears a registered URL
+  while omitting it leaves it untouched.
 
 ## Authentication and user management
 

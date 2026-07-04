@@ -430,6 +430,10 @@ def _load_gaps_from_reconciler(conn, system_id: int, snapshot_id: int) -> List[D
             "entrypoint_refs": [],
             "code_refs": [],
             "next_actions": _gap_next_actions(g.gap_type),
+            # Stable identifier for source_key disambiguation (Issue #107): the
+            # reconciler's graph node id distinguishes same-named nodes even when
+            # a gap carries no evidence/capability.
+            "source_id": (f"node:{g.node_id}" if g.node_id else None),
         }
         if g.node_id and g.node_id in graph.nodes:
             node = graph.nodes[g.node_id]
@@ -560,6 +564,7 @@ def _detect_extra_gaps(conn, system_id: int, snapshot_id: int) -> List[Dict[str,
             "entrypoint_refs": [{"entrypoint_type": uc["entrypoint_type"], "entrypoint_ref": uc["entrypoint_id"]}],
             "code_refs": [],
             "next_actions": _gap_next_actions("unclassified_entrypoint"),
+            "source_id": f"entrypoint:{uc['entrypoint_type']}:{uc['entrypoint_id']}",
         })
 
     # missing_probe_flow: classified entrypoints with no probe plan
@@ -591,6 +596,7 @@ def _detect_extra_gaps(conn, system_id: int, snapshot_id: int) -> List[Dict[str,
             "entrypoint_refs": [{"entrypoint_type": ep["entrypoint_type"], "entrypoint_ref": ep["entrypoint_id"]}],
             "code_refs": [],
             "next_actions": _gap_next_actions("missing_probe_flow"),
+            "source_id": f"entrypoint:{ep['entrypoint_type']}:{ep['entrypoint_id']}",
         })
 
     # missing_evidence: understanding graph nodes whose evidence list is empty
@@ -621,11 +627,47 @@ def _detect_extra_gaps(conn, system_id: int, snapshot_id: int) -> List[Dict[str,
                         "entrypoint_refs": [],
                         "code_refs": [],
                         "next_actions": _gap_next_actions("missing_evidence"),
+                        # The graph node id disambiguates same-named claims that
+                        # both lack evidence (Issue #107).
+                        "source_id": f"node:{node_id}",
                     })
         except (json.JSONDecodeError, TypeError):
             pass
 
     return extra
+
+
+def _attach_issue_drafts(conn, system_id: int, gaps: List[Dict[str, Any]]) -> None:
+    """Attach a stable source_key and any existing issue drafts to each gap.
+
+    Issue #107: drafts persist independently of the (recomputed-per-read) gaps,
+    so they are matched back by source_key. Runs against the caller's open
+    connection because the DB lock is non-reentrant.
+    """
+    from .issue_drafts import gap_source_key
+
+    drafts_by_key: Dict[str, List[Dict[str, Any]]] = {}
+    rows = conn.execute(
+        """SELECT id, source_key, status, external_url, title
+           FROM issue_drafts WHERE system_id = ? ORDER BY id DESC""",
+        (system_id,),
+    ).fetchall()
+    for r in rows:
+        key = r["source_key"]
+        if key:
+            drafts_by_key.setdefault(key, []).append(
+                {
+                    "id": r["id"],
+                    "status": r["status"],
+                    "external_url": r["external_url"],
+                    "title": r["title"],
+                }
+            )
+
+    for gap in gaps:
+        key = gap_source_key(gap)
+        gap["source_key"] = key
+        gap["issue_drafts"] = drafts_by_key.get(key, [])
 
 
 def _compute_gap_summary(gaps: List[Dict[str, Any]]) -> List[GapSummary]:
@@ -728,6 +770,7 @@ def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
             summary.major_symbols = _load_major_symbols(conn, system_id, snapshot_id)
             summary.metadata_coverage = _load_metadata_coverage(conn, system_id, snapshot_id)
             summary.gaps = _load_gaps_from_reconciler(conn, system_id, snapshot_id)
+            _attach_issue_drafts(conn, system_id, summary.gaps)
             summary.gap_summary = _compute_gap_summary(summary.gaps)
 
         summary.next_actions = _build_next_actions(

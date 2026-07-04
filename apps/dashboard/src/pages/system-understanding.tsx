@@ -9,17 +9,29 @@ import {
   useRetrySystemUnderstandingJob,
   useCancelSystemUnderstandingStep,
   useSystemDiagnostics,
+  useCreateIssueDraft,
+  useUpdateIssueDraft,
+  useIssueDraft,
   sysKey,
 } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { DiagnosticCheckCard } from "@/components/diagnostics-badge";
+import { Dialog, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import { Select } from "@/components/ui/select";
+import { Label } from "@/components/ui/label";
+import { DiagnosticCheckCard, EnvFixDialog } from "@/components/diagnostics-badge";
+import {
+  useDiagnosticActivate, useDiagnosticHighlight, DiagnosticFixCallout,
+} from "@/components/diagnostic-fix";
+import { toast } from "sonner";
 import {
   CheckCircle2, XCircle, AlertTriangle, Ban, HelpCircle,
   RefreshCw, ArrowRight, ExternalLink, FileText, Code, Zap,
-  Boxes, Target, Stethoscope,
+  Boxes, Target, Stethoscope, Copy, FilePlus2,
 } from "lucide-react";
 import type {
   SystemDiagnosticCheck,
@@ -29,6 +41,9 @@ import type {
   SystemUnderstandingOut,
   SystemUnderstandingBuildOut,
   SystemUnderstandingBuildStep,
+  IssueDraft,
+  IssueDraftRef,
+  IssueDraftStatus,
 } from "@/api/types";
 
 const STEP_LABELS: Record<string, string> = {
@@ -94,7 +109,9 @@ function PipelineChecklist({ steps, checksByStep }: {
   checksByStep: Record<string, SystemDiagnosticCheck[]>;
 }) {
   const [expandedStep, setExpandedStep] = useState<string | null>(null);
+  const { activate, envCheck, closeEnv } = useDiagnosticActivate();
   return (
+    <>
     <ul className="space-y-2" data-testid="pipeline-checklist">
       {steps.map((s) => {
         const link = STEP_LINKS[s.step];
@@ -134,7 +151,7 @@ function PipelineChecklist({ steps, checksByStep }: {
             {expanded && relatedChecks.length > 0 && (
               <div className="mt-2 ml-7 space-y-2" data-testid={`pipeline-diagnostics-${s.step}`}>
                 {relatedChecks.map((c) => (
-                  <DiagnosticCheckCard key={c.check_id} check={c} />
+                  <DiagnosticCheckCard key={c.check_id} check={c} onActivate={activate} />
                 ))}
               </div>
             )}
@@ -142,6 +159,8 @@ function PipelineChecklist({ steps, checksByStep }: {
         );
       })}
     </ul>
+    <EnvFixDialog check={envCheck} onClose={closeEnv} />
+    </>
   );
 }
 
@@ -372,7 +391,234 @@ function SeverityIcon({ severity }: { severity: string }) {
   }
 }
 
-function GapCard({ gap }: { gap: SystemUnderstandingGap }) {
+const CREATE_ISSUE_ACTION = "Create implementation issue";
+
+const ISSUE_DRAFT_STATUS_LABELS: Record<IssueDraftStatus, string> = {
+  draft: "Draft",
+  copied: "Copied",
+  external_created: "Issue created",
+  closed: "Closed",
+  rejected: "Rejected",
+};
+
+function copyMarkdown(text: string) {
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(text).then(
+      () => toast.success("Markdown copied to clipboard"),
+      () => toast.error("Could not copy Markdown"),
+    );
+  } else {
+    toast.error("Clipboard is not available");
+  }
+}
+
+// Issue #107: draft editor. Loads the full draft (body_markdown) by id, lets the
+// developer edit title/body, copy the Markdown into any tracker, register the
+// external issue URL they created, and set the draft status. probe-agent never
+// creates the external issue itself.
+function IssueDraftDialog({ draftId, onClose }: { draftId: number | null; onClose: () => void }) {
+  const { data: draft, isLoading } = useIssueDraft(draftId);
+  return (
+    <Dialog open={draftId != null} onOpenChange={(o) => { if (!o) onClose(); }}>
+      <DialogHeader>
+        <DialogTitle>Issue draft</DialogTitle>
+      </DialogHeader>
+      {isLoading || !draft ? (
+        <div className="space-y-2" data-testid="issue-draft-loading">
+          <Skeleton className="h-8 w-full" />
+          <Skeleton className="h-40 w-full" />
+        </div>
+      ) : (
+        // Remount on id change so the editor re-initializes its local form
+        // state from the freshly loaded draft without a state-sync effect.
+        <IssueDraftEditor key={draft.id} draft={draft} />
+      )}
+    </Dialog>
+  );
+}
+
+function IssueDraftEditor({ draft }: { draft: IssueDraft }) {
+  const update = useUpdateIssueDraft();
+  const [title, setTitle] = useState(draft.title);
+  const [body, setBody] = useState(draft.body_markdown);
+  const [status, setStatus] = useState<IssueDraftStatus>(draft.status);
+  const [externalUrl, setExternalUrl] = useState(draft.external_url ?? "");
+
+  const saveContent = () => {
+    update.mutate(
+      { id: draft.id, body: { title, body_markdown: body, status } },
+      { onSuccess: () => toast.success("Draft saved") },
+    );
+  };
+
+  const registerUrl = () => {
+    update.mutate(
+      {
+        id: draft.id,
+        body: {
+          external_url: externalUrl,
+          status: externalUrl.trim() ? "external_created" : status,
+        },
+      },
+      {
+        onSuccess: () => toast.success(externalUrl.trim() ? "External URL registered" : "External URL cleared"),
+        onError: (e: unknown) => toast.error(e instanceof Error ? e.message : "Could not register URL"),
+      },
+    );
+  };
+
+  return (
+        <div className="space-y-4" data-testid="issue-draft-dialog">
+          <div className="space-y-1.5">
+            <Label htmlFor="issue-draft-title">Title</Label>
+            <Input
+              id="issue-draft-title"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              data-testid="issue-draft-title"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between">
+              <Label htmlFor="issue-draft-body">Markdown body</Label>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 text-xs"
+                onClick={() => copyMarkdown(body)}
+                data-testid="issue-draft-copy"
+              >
+                <Copy className="h-3 w-3 mr-1" /> Copy Markdown
+              </Button>
+            </div>
+            <Textarea
+              id="issue-draft-body"
+              value={body}
+              rows={12}
+              onChange={(e) => setBody(e.target.value)}
+              className="font-mono text-xs"
+              data-testid="issue-draft-body"
+            />
+          </div>
+          <div className="flex items-end gap-2">
+            <div className="space-y-1.5">
+              <Label htmlFor="issue-draft-status">Status</Label>
+              <Select
+                id="issue-draft-status"
+                value={status}
+                onChange={(e) => setStatus(e.target.value as IssueDraftStatus)}
+                data-testid="issue-draft-status"
+                className="w-40"
+              >
+                {(Object.keys(ISSUE_DRAFT_STATUS_LABELS) as IssueDraftStatus[]).map((s) => (
+                  <option key={s} value={s}>{ISSUE_DRAFT_STATUS_LABELS[s]}</option>
+                ))}
+              </Select>
+            </div>
+            <Button onClick={saveContent} disabled={update.isPending} data-testid="issue-draft-save">
+              Save
+            </Button>
+          </div>
+          <div className="space-y-1.5 border-t pt-4">
+            <Label htmlFor="issue-draft-url">External issue URL</Label>
+            <p className="text-xs text-muted-foreground">
+              Create the issue in your tracker (GitHub, GitLab, Jira, ...), then paste its URL here.
+              probe-agent does not create or sync the issue.
+            </p>
+            <div className="flex gap-2">
+              <Input
+                id="issue-draft-url"
+                value={externalUrl}
+                placeholder="https://github.com/org/repo/issues/123"
+                onChange={(e) => setExternalUrl(e.target.value)}
+                data-testid="issue-draft-url"
+              />
+              <Button
+                variant="outline"
+                onClick={registerUrl}
+                disabled={update.isPending}
+                data-testid="issue-draft-register-url"
+              >
+                Register
+              </Button>
+            </div>
+            {draft.external_url && (
+              <a
+                href={draft.external_url}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
+                data-testid="issue-draft-external-link"
+              >
+                <ExternalLink className="h-3 w-3" /> {draft.external_url}
+              </a>
+            )}
+          </div>
+        </div>
+  );
+}
+
+function IssueDraftBadges({ drafts, onOpen }: { drafts: IssueDraftRef[]; onOpen: (id: number) => void }) {
+  if (drafts.length === 0) return null;
+  return (
+    <div className="pl-6 flex flex-wrap gap-2" data-testid="gap-issue-drafts">
+      {drafts.map((d) => {
+        const statusLabel = ISSUE_DRAFT_STATUS_LABELS[d.status as IssueDraftStatus] ?? d.status;
+        return (
+          <div key={d.id} className="flex items-center gap-1.5">
+            <Button
+              variant="secondary"
+              size="sm"
+              className="h-7 text-xs"
+              onClick={() => onOpen(d.id)}
+              data-testid="gap-issue-draft-open"
+            >
+              <FileText className="h-3 w-3 mr-1" /> Issue draft · {statusLabel}
+            </Button>
+            {d.external_url && (
+              <a
+                href={d.external_url}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
+                data-testid="gap-issue-draft-url"
+              >
+                <ExternalLink className="h-3 w-3" /> issue
+              </a>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function GapCard({ gap, snapshotId, commitSha }: {
+  gap: SystemUnderstandingGap;
+  snapshotId: number | null;
+  commitSha: string | null;
+}) {
+  const createDraft = useCreateIssueDraft();
+  const [openDraftId, setOpenDraftId] = useState<number | null>(null);
+  const drafts = gap.issue_drafts ?? [];
+
+  const handleCreateIssue = () => {
+    if (drafts.length > 0) {
+      setOpenDraftId(drafts[0].id);
+      return;
+    }
+    createDraft.mutate(
+      { gap, snapshot_id: snapshotId, commit_sha: commitSha },
+      {
+        onSuccess: (draft) => {
+          setOpenDraftId(draft.id);
+          toast.success("Issue draft generated");
+        },
+        onError: (e: unknown) => toast.error(e instanceof Error ? e.message : "Could not generate draft"),
+      },
+    );
+  };
+
   return (
     <div className="rounded-lg border p-4 space-y-3" data-testid="gap-card">
       <div className="flex items-start gap-2">
@@ -440,10 +686,29 @@ function GapCard({ gap }: { gap: SystemUnderstandingGap }) {
         </div>
       )}
 
+      <IssueDraftBadges drafts={drafts} onOpen={setOpenDraftId} />
+
       {gap.next_actions.length > 0 && (
         <div className="pl-6 flex flex-wrap gap-2">
-          {gap.next_actions.map((na, i) => (
-            na.link ? (
+          {gap.next_actions.map((na, i) => {
+            if (na.action === CREATE_ISSUE_ACTION) {
+              // Issue #107: connect the placeholder next action to the draft flow.
+              return (
+                <Button
+                  key={i}
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-xs"
+                  onClick={handleCreateIssue}
+                  disabled={createDraft.isPending}
+                  data-testid="gap-create-issue"
+                >
+                  <FilePlus2 className="h-3 w-3 mr-1" />
+                  {drafts.length > 0 ? "Open issue draft" : na.action}
+                </Button>
+              );
+            }
+            return na.link ? (
               <Link key={i} to={na.link}>
                 <Button variant="outline" size="sm" className="h-7 text-xs">
                   {na.action}
@@ -453,17 +718,23 @@ function GapCard({ gap }: { gap: SystemUnderstandingGap }) {
               <Button key={i} variant="outline" size="sm" className="h-7 text-xs" disabled>
                 {na.action}
               </Button>
-            )
-          ))}
+            );
+          })}
         </div>
+      )}
+
+      {openDraftId != null && (
+        <IssueDraftDialog draftId={openDraftId} onClose={() => setOpenDraftId(null)} />
       )}
     </div>
   );
 }
 
-function GapWorklist({ gaps, gapSummary }: {
+function GapWorklist({ gaps, gapSummary, snapshotId, commitSha }: {
   gaps: SystemUnderstandingGap[];
   gapSummary: { gap_type: string; count: number }[];
+  snapshotId: number | null;
+  commitSha: string | null;
 }) {
   const [typeFilter, setTypeFilter] = useState<string | null>(null);
   const [capabilityFilter, setCapabilityFilter] = useState<string | null>(null);
@@ -563,7 +834,7 @@ function GapWorklist({ gaps, gapSummary }: {
         {/* Gap cards */}
         <div className="space-y-3" data-testid="gap-cards">
           {filtered.map((gap, i) => (
-            <GapCard key={i} gap={gap} />
+            <GapCard key={i} gap={gap} snapshotId={snapshotId} commitSha={commitSha} />
           ))}
         </div>
       </CardContent>
@@ -837,7 +1108,7 @@ function DataView({ data, checksByStep }: {
       )}
 
       {/* Docs-Code Gap Worklist */}
-      <GapWorklist gaps={data.gaps} gapSummary={data.gap_summary} />
+      <GapWorklist gaps={data.gaps} gapSummary={data.gap_summary} snapshotId={data.snapshot_id} commitSha={data.commit_sha} />
 
       {/* Next Actions */}
       {data.next_actions.length > 0 && (
@@ -864,6 +1135,7 @@ export default function SystemUnderstandingPage() {
   const settledBuildId = useRef<number | null>(null);
 
   const buildRunning = latestBuild?.status === "queued" || latestBuild?.status === "running";
+  const buildHighlight = useDiagnosticHighlight<HTMLButtonElement>("build");
 
   // Refresh the aggregated view and diagnostics once a build job settles.
   useEffect(() => {
@@ -898,6 +1170,7 @@ export default function SystemUnderstandingPage() {
           </p>
         </div>
         <Button
+          {...buildHighlight}
           onClick={() => build.mutate()}
           disabled={build.isPending || buildRunning}
           variant="default"
@@ -916,6 +1189,8 @@ export default function SystemUnderstandingPage() {
           )}
         </Button>
       </div>
+
+      <DiagnosticFixCallout anchor="build" />
 
       {latestBuild && (buildRunning || latestBuild.is_stuck ||
         latestBuild.status === "failed" || latestBuild.status === "partial" ||
