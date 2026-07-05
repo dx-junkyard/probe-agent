@@ -363,7 +363,9 @@ export interface InterviewDialogueTurnOut {
 // --- Structured Interview Q&A (Issue #129) ----------------------------------
 
 export type InterviewQaCategory = "purpose" | "capability" | "api" | "probe_flow" | "general";
-export type InterviewQaSource = "reviewer" | "dialogue" | "zero_base";
+// Issue #135: "runtime" questions come from reconciling approved metadata
+// against deterministic runtime trace aggregates.
+export type InterviewQaSource = "reviewer" | "dialogue" | "zero_base" | "runtime";
 export type InterviewQaStatus = "open" | "answered" | "revised" | "skipped";
 
 export interface InterviewQaEvidenceRef {
@@ -384,6 +386,9 @@ export interface InterviewQaOut {
   question_source: InterviewQaSource;
   hypothesis: string | null;
   evidence_refs: InterviewQaEvidenceRef[];
+  // Issue #135: raw aggregated trace facts + declared-metadata provenance,
+  // populated only for question_source === "runtime".
+  runtime_evidence: RuntimeQaEvidence | null;
   answer_text: string | null;
   status: InterviewQaStatus;
   answered_by: string | null;
@@ -452,6 +457,69 @@ export interface InterviewMaterializeOut {
   items_materialized: number;
   skipped: string[];
   materialized_at: number;
+  error: string | null;
+}
+
+// --- Runtime Reality Check (Issue #135) --------------------------------------
+
+export interface RuntimeTraceFactsOut {
+  component_id: string;
+  window_days: number;
+  call_count: number;
+  error_count: number;
+  error_rate: number | null;
+  duration_p50_ms: number | null;
+  duration_p90_ms: number | null;
+  duration_p99_ms: number | null;
+  last_observed_at: number | null;
+  has_traces: boolean;
+}
+
+export interface RuntimeRealityCheckItemOut {
+  proposal_id: number;
+  decision_id: number;
+  path: string;
+  qualified_name: string;
+  component_id: string;
+  role: string | null;
+  probe_value: string | null;
+  state_effects: string[];
+  recommended_mode: string;
+  facts: RuntimeTraceFactsOut;
+}
+
+export interface RuntimeRealityFactsOut {
+  session_id: number;
+  system_id: number;
+  snapshot_id: number;
+  window_days: number;
+  items: RuntimeRealityCheckItemOut[];
+}
+
+export interface RuntimeQaEvidence {
+  component_id: string;
+  qualified_name: string;
+  path: string;
+  metadata_source: { proposal_id: number; decision_id: number; session_id: number };
+  declared: {
+    role: string | null;
+    probe_value: string | null;
+    state_effects: string[];
+    recommended_mode: string;
+  };
+  facts: RuntimeTraceFactsOut;
+  answer_options: string[];
+}
+
+export interface RuntimeRealityCheckRunOut {
+  session_id: number;
+  system_id: number;
+  snapshot_id: number;
+  intelligence_run: IntelligenceRunOut | null;
+  items_considered: number;
+  created_qa_ids: number[];
+  skipped: boolean;
+  skipped_reason: string | null;
   error: string | null;
 }
 

@@ -22,6 +22,7 @@ import {
   useMaterializeInterview,
   useRejectInterviewProposal,
   useResumeInterviewQa,
+  useRunRuntimeRealityCheck,
   useSkipInterviewQa,
   useUpdateInterviewUnderstanding,
 } from "@/api/hooks";
@@ -501,6 +502,9 @@ function QaItemCard({
           )}
         </div>
         <div className="flex gap-1 shrink-0">
+          {qa.question_source === "runtime" && (
+            <Badge variant="secondary" data-testid={`qa-source-runtime-${qa.id}`}>実態チェック</Badge>
+          )}
           <Badge variant="outline">{qa.question_category}</Badge>
           <Badge variant={
             qa.status === "answered" ? "success"
@@ -520,6 +524,33 @@ function QaItemCard({
               {e.char_count != null ? ` (${e.char_count} chars 読込)` : ""}
             </div>
           ))}
+        </div>
+      )}
+
+      {qa.runtime_evidence && (
+        <div
+          className="rounded-md bg-muted/40 border p-2 text-[11px] space-y-1"
+          data-testid={`qa-runtime-evidence-${qa.id}`}
+        >
+          <p className="font-mono text-muted-foreground">
+            {qa.runtime_evidence.component_id} ({qa.runtime_evidence.path})
+          </p>
+          <p>
+            直近{qa.runtime_evidence.facts.window_days}日: 呼び出し{qa.runtime_evidence.facts.call_count}件、
+            エラー{qa.runtime_evidence.facts.error_count}件
+            {qa.runtime_evidence.facts.error_rate != null
+              ? `(${(qa.runtime_evidence.facts.error_rate * 100).toFixed(1)}%)`
+              : ""}
+            {qa.runtime_evidence.facts.duration_p50_ms != null && (
+              <>、p50 {qa.runtime_evidence.facts.duration_p50_ms.toFixed(1)}ms</>
+            )}
+            {!qa.runtime_evidence.facts.has_traces && "(トレース0件)"}
+          </p>
+          <p className="text-muted-foreground">
+            承認済み理解: role="{qa.runtime_evidence.declared.role ?? "-"}" /
+            state_effects=[{qa.runtime_evidence.declared.state_effects.join(", ")}] /
+            recommended_mode={qa.runtime_evidence.declared.recommended_mode}
+          </p>
         </div>
       )}
 
@@ -571,13 +602,14 @@ function QaItemCard({
   );
 }
 
-function QaPanel({ sessionId, actor }: { sessionId: number; actor: string }) {
+function QaPanel({
+  sessionId, actor, approvedCount,
+}: { sessionId: number; actor: string; approvedCount: number }) {
   const { data: qaList } = useInterviewQaList(sessionId);
   const answer = useAnswerInterviewQa(sessionId);
   const skip = useSkipInterviewQa(sessionId);
   const resume = useResumeInterviewQa(sessionId);
-
-  if (!qaList || qaList.items.length === 0) return null;
+  const runRealityCheck = useRunRuntimeRealityCheck(sessionId);
 
   const handleAnswer = async (qaId: number, answerText: string) => {
     try {
@@ -592,14 +624,44 @@ function QaPanel({ sessionId, actor }: { sessionId: number; actor: string }) {
     }
   };
 
+  const handleRuntimeRealityCheck = async () => {
+    try {
+      const result = await runRealityCheck.mutateAsync();
+      if (result.skipped) {
+        toast.info(result.skipped_reason ?? "既存の未回答の実態チェック質問があるため、実行をスキップしました。");
+      } else if (result.error) {
+        toast.error(`実態チェックに失敗しました: ${result.error}`);
+      } else if (result.created_qa_ids.length === 0) {
+        toast.success("実態チェックを実行しましたが、確認すべきズレは見つかりませんでした。");
+      } else {
+        toast.success(`実態チェックにより ${result.created_qa_ids.length} 件の確認質問を生成しました。`);
+      }
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
+  if (!qaList || qaList.items.length === 0) return null;
+
   return (
     <Card data-testid="qa-panel">
       <CardHeader>
         <CardTitle className="text-sm flex items-center gap-2">
           <HelpCircle className="h-4 w-4" /> Q&amp;A一覧
         </CardTitle>
-        <CardDescription>
-          残質問 {qaList.open_count} 件(うち高優先度 {qaList.high_priority_open_count} 件)
+        <CardDescription className="flex items-center justify-between gap-2">
+          <span>
+            残質問 {qaList.open_count} 件(うち高優先度 {qaList.high_priority_open_count} 件)
+          </span>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={handleRuntimeRealityCheck}
+            disabled={runRealityCheck.isPending || approvedCount === 0}
+            data-testid="run-runtime-reality-check"
+          >
+            {runRealityCheck.isPending ? "実行中..." : "実態チェックを実行"}
+          </Button>
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
@@ -1375,7 +1437,7 @@ export default function InterviewPage() {
                 </Card>
               )}
 
-              <QaPanel sessionId={session.id} actor={actor} />
+              <QaPanel sessionId={session.id} actor={actor} approvedCount={approvedCount} />
 
               {session.gap_analysis && session.gap_analysis.length > 0 && (
                 <Card>

@@ -20,6 +20,7 @@ import type {
   InterviewProposalMetadataBlock, InterviewProposalProbePlan,
   InterviewApprovedSetOut, InterviewMaterializeOut,
   InterviewQaListOut, InterviewQaOut, InterviewQaAnswerOut,
+  RuntimeRealityFactsOut, RuntimeRealityCheckRunOut,
   SystemUnderstandingOut,
   SystemUnderstandingBuildOut,
   IssueDraft,
@@ -696,6 +697,30 @@ export function useMaterializeInterview(sessionId: number | null) {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
       qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
+    },
+  });
+}
+
+// --- Runtime Reality Check (Issue #135) --------------------------------------
+
+export function useRuntimeRealityFacts(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("runtimeRealityFacts"), sessionId],
+    queryFn: () => api.get<RuntimeRealityFactsOut>(`/interview/sessions/${sessionId}/runtime-facts`),
+    enabled: !!sessionId && !!getSystemId(),
+  });
+}
+
+export function useRunRuntimeRealityCheck(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      api.post<RuntimeRealityCheckRunOut>(
+        `/interview/sessions/${sessionId}/runtime-reality-check`, {},
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] });
+      qc.invalidateQueries({ queryKey: [...sysKey("runtimeRealityFacts"), sessionId] });
     },
   });
 }

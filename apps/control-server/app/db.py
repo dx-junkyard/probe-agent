@@ -1112,6 +1112,10 @@ CREATE TABLE IF NOT EXISTS interview_qa (
     question_source     TEXT NOT NULL DEFAULT 'dialogue',
     hypothesis          TEXT,
     evidence_refs       TEXT,
+    -- Issue #135: raw aggregated trace facts + declared-metadata provenance
+    -- for question_source = 'runtime' rows only (JSON object). NULL for all
+    -- other sources; kept separate from evidence_refs (code line ranges).
+    runtime_evidence    TEXT,
     answer_text         TEXT,
     status              TEXT NOT NULL DEFAULT 'open',
     answered_by         TEXT,
@@ -1692,6 +1696,11 @@ def init_db() -> None:
         conn.execute(
             "UPDATE intelligence_runs SET status = 'completed' WHERE status = 'success'"
         )
+        qa_cols = _columns(conn, "interview_qa")
+        if qa_cols and "runtime_evidence" not in qa_cols:
+            # Issue #135: raw trace-aggregate + metadata-provenance JSON for
+            # question_source = 'runtime' rows; existing rows stay NULL.
+            conn.execute("ALTER TABLE interview_qa ADD COLUMN runtime_evidence TEXT")
         _ensure_legacy_system(conn)
     _bootstrap_admin()
 

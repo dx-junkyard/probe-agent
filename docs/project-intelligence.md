@@ -922,6 +922,62 @@ deterministic。読んだスニペットは raw fact として保存され、LLM
 **含まない:** 自由なツールユースループ、working tree・未コミット内容の読み出し、
 読んだ内容に基づく提案の自動生成、対象リポジトリへの書き込み。
 
+## Runtime Reality Check（Issue #135）
+
+#129/#130 までの Q&A 層は静的な情報(docs / code / 会話)しか見ておらず、`@probe`
+が集めた実行時トレース(入出力・エラー・実行時間)は理解のレイヤーに一切還流して
+いなかった。本 issue は承認済みの `probe-agent:` メタデータ / probe plan(role /
+probe_value / state_effects / recommended_mode)と、同じ component_id のトレース
+決定的集計を突合し、ズレの可能性がある論点を確認質問として `interview_qa`
+(`question_source: "runtime"`)に返す。
+
+判断区分(Principle 6):
+
+- **集計(deterministic, `app/runtime_reality.py` の `aggregate_component_facts`)**:
+  対象 System の `traces` テーブルから、直近 `RUNTIME_REALITY_CHECK_WINDOW_DAYS`
+  (既定 7)日分の呼び出し数・エラー率・duration の p50/p90/p99・最終観測時刻を
+  数値集計するだけ。トレースが1件も無い場合は `has_traces: false` で数値項目は
+  null になる(「承認済み probe plan にトレースが無い」の生の事実)。解釈は
+  一切行わない。System 分離は `system_id` での WHERE 句のみで保証する。
+- **突合(reasoning_llm, `generate_runtime_reality_check`)**: 集計事実 + 承認済み
+  メタデータを入力に、「ズレの可能性があり確認する価値のある論点」を最大
+  `MAX_RUNTIME_QUESTIONS`(5)件、構造化出力で選ばせる。応答が参照する
+  `component_id`/`qualified_name` は入力に存在するものへの完全一致でなければ
+  fail-closed(存在しないシンボルの捏造を防ぐ、Principle 6)。モック/非推論
+  モデル・API エラー・構造化出力検証失敗は、いずれもヒューリスティックな
+  代替質問を生成せず run failed として記録される。
+
+対象 component_id と承認済みメタデータの対応付けは、`qualified_name.replace(".", "_")`
+という materialization(#71)が書き込むのと同じ決定的変換で行う。曖昧マッチはしない。
+
+エンドポイント:
+
+- `GET /interview/sessions/{id}/runtime-facts` — 集計のみ(reasoning 呼び出しなし、
+  `intelligence_runs` にも記録しない)。承認済み要素ごとの declared メタデータと
+  facts を返す。
+- `POST /interview/sessions/{id}/runtime-reality-check` — 手動実行のみ(定期実行や
+  自動スケジューリングはしない)。実行のたびに成功・失敗を問わず
+  `run_type: "runtime_reality_check"` の `intelligence_runs` 行を記録する
+  (Principle 7)。失敗時は `interview_qa` 行を一切作らない(fail-closed)。
+  そのセッションに未回答の `question_source: "runtime"` 質問が既に存在する場合は
+  ノイズ抑制のため実行を抑止し(`skipped: true`)、`intelligence_runs` 行も作らない。
+
+生成された質問は通常の `interview_qa` 行(`question_source: "runtime"`)として
+登録され、回答は他の Q&A と同様に扱われる(理解の反映は「理解を更新」を通じてのみ
+発生し、自動では反映されない)。根拠は `evidence_refs`(コード行範囲、runtime 質問
+では空)とは別に新しい `runtime_evidence` カラム(JSON)に保存し、参照した集計値
+(生の数値)とメタデータの出典(`path` / `qualified_name` / `proposal_id` /
+`decision_id`)をそのまま質問カードに表示できるようにする。
+
+**含まない:** メタデータ・probe plan・policy の自動更新、トレースの自動評価・
+スコアリング(#9 の領分)、定期実行・自動スケジューリング、閾値ヒューリスティック
+による「ズレ確定」判定。
+
+共有スキーマ: `RuntimeTraceFacts` / `RuntimeRealityCheckItem` / `RuntimeRealityFacts`
+/ `RuntimeRealityCheckRun`、`InterviewQA.question_source` への `"runtime"` の追加、
+`IntelligenceRun.run_type` への `"runtime_reality_check"` の追加
+([shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json))。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。

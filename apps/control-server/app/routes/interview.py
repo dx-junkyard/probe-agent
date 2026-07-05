@@ -45,7 +45,15 @@ from ..interview_evidence import (
     EvidenceReadError,
     read_evidence_snippets,
 )
+from ..interview_language import get_interview_language
 from ..llm import LLMConfig, LLMError, create_llm_client, is_reasoning_model
+from ..runtime_reality import (
+    RuntimeCheckInputItem,
+    RuntimeRealityCheckResult,
+    aggregate_component_facts,
+    generate_runtime_reality_check,
+    window_days as runtime_window_days,
+)
 from ..models import (
     InterviewApprovedItemOut,
     InterviewApprovedSetOut,
@@ -78,6 +86,9 @@ from ..models import (
     InterviewSessionOut,
     InterviewStructuredQuestion,
     IntelligenceRunOut,
+    RuntimeRealityCheckItemOut,
+    RuntimeRealityCheckRunOut,
+    RuntimeRealityFactsOut,
 )
 from ..probe_planner import check_denylist
 
@@ -209,6 +220,11 @@ def _qa_out(row) -> InterviewQaOut:
             [InterviewQaEvidenceRefOut(**e) for e in json.loads(row["evidence_refs"])]
             if row["evidence_refs"] else []
         ),
+        runtime_evidence=(
+            json.loads(row["runtime_evidence"])
+            if ("runtime_evidence" in row.keys() and row["runtime_evidence"])
+            else None
+        ),
         answer_text=row["answer_text"],
         status=row["status"],
         answered_by=row["answered_by"],
@@ -249,13 +265,14 @@ def _insert_qa_row(
     status: str = "open",
     answered_by: Optional[str] = None,
     answered_at: Optional[float] = None,
+    runtime_evidence: Optional[dict] = None,
 ) -> int:
     cur = conn.execute(
         """INSERT INTO interview_qa
             (session_id, system_id, question_text, question_category,
-             question_source, hypothesis, evidence_refs, answer_text, status,
-             answered_by, created_at, answered_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             question_source, hypothesis, evidence_refs, runtime_evidence,
+             answer_text, status, answered_by, created_at, answered_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             session_id,
             system_id,
@@ -265,6 +282,7 @@ def _insert_qa_row(
             hypothesis,
             json.dumps([e.model_dump() for e in evidence_refs], ensure_ascii=False)
             if evidence_refs else None,
+            json.dumps(runtime_evidence, ensure_ascii=False) if runtime_evidence else None,
             answer_text,
             status,
             answered_by,
@@ -2243,3 +2261,255 @@ def update_interview_understanding(
 
         row = _get_session_or_404(conn, session_id, system_id)
         return _session_out(row)
+
+
+# --- Runtime Reality Check (Issue #135) --------------------------------------
+
+
+def _build_runtime_check_items(
+    conn, system_id: int, approved_set
+) -> List[RuntimeCheckInputItem]:
+    """Approved items for this session paired with deterministic trace facts.
+
+    component_id is derived from qualified_name exactly as materialization
+    (#71) writes it (``qualified_name.replace(".", "_")``), so aggregation
+    matches by construction rather than fuzzy lookup (Principle 6).
+
+    Takes an already-fetched ``approved_set`` (rather than fetching it here)
+    because ``get_interview_approved_set`` opens its own ``get_conn()`` and
+    the SQLite connection lock is not reentrant — this must never be called
+    while ``conn``'s own ``with get_conn()`` block is open.
+    """
+    items: List[RuntimeCheckInputItem] = []
+    for approved in approved_set.items:
+        component_id = approved.qualified_name.replace(".", "_")
+        facts = aggregate_component_facts(conn, system_id, component_id)
+        items.append(
+            RuntimeCheckInputItem(
+                proposal_id=approved.proposal_id,
+                decision_id=approved.decision_id,
+                path=approved.path,
+                qualified_name=approved.qualified_name,
+                component_id=component_id,
+                role=approved.metadata.role,
+                probe_value=approved.metadata.probe_value,
+                state_effects=approved.metadata.state_effects,
+                recommended_mode=approved.probe_plan.recommended_mode,
+                facts=facts,
+            )
+        )
+    return items
+
+
+@router.get(
+    "/interview/sessions/{session_id}/runtime-facts",
+    response_model=RuntimeRealityFactsOut,
+)
+def get_runtime_reality_facts(
+    session_id: int,
+    system_id: int = Depends(get_system_id),
+) -> RuntimeRealityFactsOut:
+    """Deterministic trace aggregates for the session's approved elements.
+
+    No reasoning model is called here; this is numeric aggregation only
+    (Principle 6), scoped to this System's traces.
+
+    probe-agent:
+      role: API boundary for deterministic runtime trace aggregation
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: Verify aggregation is System-isolated and deterministic for the same trace set
+    """
+    approved_set = get_interview_approved_set(session_id, system_id)
+    with get_conn() as conn:
+        items = _build_runtime_check_items(conn, system_id, approved_set)
+
+    return RuntimeRealityFactsOut(
+        session_id=session_id,
+        system_id=system_id,
+        snapshot_id=approved_set.snapshot_id,
+        window_days=runtime_window_days(),
+        items=[
+            RuntimeRealityCheckItemOut(
+                proposal_id=i.proposal_id,
+                decision_id=i.decision_id,
+                path=i.path,
+                qualified_name=i.qualified_name,
+                component_id=i.component_id,
+                role=i.role,
+                probe_value=i.probe_value,
+                state_effects=i.state_effects,
+                recommended_mode=i.recommended_mode,
+                facts=i.facts,
+            )
+            for i in items
+        ],
+    )
+
+
+@router.post(
+    "/interview/sessions/{session_id}/runtime-reality-check",
+    response_model=RuntimeRealityCheckRunOut,
+)
+def run_runtime_reality_check(
+    session_id: int,
+    system_id: int = Depends(get_system_id),
+) -> RuntimeRealityCheckRunOut:
+    """Reconcile approved metadata/probe plans against runtime trace facts.
+
+    Manual-only trigger (no scheduling). Suppresses re-running while
+    unanswered ``question_source: 'runtime'`` questions exist for this
+    session (noise control from the issue notes) — that check is
+    deterministic and happens before any reasoning call. On both success and
+    failure the run is recorded in intelligence_runs; on failure no
+    interview_qa rows are created (fail-closed, Principle 6/7).
+
+    probe-agent:
+      role: API boundary for the runtime reality check reasoning run
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: orchestration
+      state_effects: [database-read, database-write, external-api]
+      probe_value: Verify the run fails closed on reasoning errors and is suppressed while unanswered runtime questions remain
+    """
+    now = time.time()
+    approved_set = get_interview_approved_set(session_id, system_id)
+    snapshot_id = approved_set.snapshot_id
+
+    with get_conn() as conn:
+        open_runtime = conn.execute(
+            """SELECT id FROM interview_qa
+               WHERE session_id = ? AND system_id = ?
+                 AND question_source = 'runtime' AND status = 'open'
+               LIMIT 1""",
+            (session_id, system_id),
+        ).fetchone()
+        if open_runtime is not None:
+            return RuntimeRealityCheckRunOut(
+                session_id=session_id,
+                system_id=system_id,
+                snapshot_id=snapshot_id,
+                skipped=True,
+                skipped_reason=(
+                    "Unanswered runtime reality check questions already exist "
+                    "for this session; answer or skip them before re-running."
+                ),
+            )
+
+        items = _build_runtime_check_items(conn, system_id, approved_set)
+        if not items:
+            raise HTTPException(
+                status_code=422,
+                detail="No approved elements to check against runtime traces",
+            )
+
+        config = LLMConfig.intelligence_from_env()
+        try:
+            client = create_llm_client(config)
+            client_error = None
+        except LLMError as exc:
+            client = None
+            client_error = str(exc)
+
+        try:
+            language = get_interview_language()
+        except ValueError as exc:
+            client_error = client_error or str(exc)
+
+        if client_error:
+            result = RuntimeRealityCheckResult(
+                provider=config.provider,
+                model=config.model,
+                is_mock=config.provider == "mock",
+                error=client_error,
+            )
+        else:
+            result = generate_runtime_reality_check(
+                client, config, items=items, language=language
+            )
+
+        run_status = "failed" if result.error else "completed"
+        run_cur = conn.execute(
+            """INSERT INTO intelligence_runs
+                (system_id, snapshot_id, run_type, provider, model,
+                 prompt_version, schema_version, decision_method, status,
+                 error_details, is_mock, started_at, completed_at)
+            VALUES (?, ?, 'runtime_reality_check', ?, ?, ?, ?,
+                    'reasoning_llm', ?, ?, ?, ?, ?)""",
+            (
+                system_id,
+                snapshot_id,
+                result.provider,
+                result.model,
+                result.prompt_version,
+                result.schema_version,
+                run_status,
+                result.error,
+                1 if result.is_mock else 0,
+                now,
+                now,
+            ),
+        )
+        run_id = run_cur.lastrowid
+        run_row = conn.execute(
+            "SELECT * FROM intelligence_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+
+        if result.error:
+            return RuntimeRealityCheckRunOut(
+                session_id=session_id,
+                system_id=system_id,
+                snapshot_id=snapshot_id,
+                intelligence_run=_intelligence_run_out(run_row),
+                items_considered=len(items),
+                error=result.error,
+            )
+
+        by_key = {(i.component_id, i.qualified_name): i for i in items}
+        created_qa_ids: List[int] = []
+        for q in result.questions:
+            item = by_key[(q.component_id, q.qualified_name)]
+            runtime_evidence = {
+                "component_id": item.component_id,
+                "qualified_name": item.qualified_name,
+                "path": item.path,
+                "metadata_source": {
+                    "proposal_id": item.proposal_id,
+                    "decision_id": item.decision_id,
+                    "session_id": session_id,
+                },
+                "declared": {
+                    "role": item.role,
+                    "probe_value": item.probe_value,
+                    "state_effects": item.state_effects,
+                    "recommended_mode": item.recommended_mode,
+                },
+                "facts": item.facts.model_dump(),
+                "answer_options": q.answer_options,
+            }
+            qa_id = _insert_qa_row(
+                conn,
+                session_id,
+                system_id,
+                question_text=q.question_text,
+                question_category="probe_flow",
+                question_source="runtime",
+                hypothesis=q.hypothesis or None,
+                evidence_refs=[],
+                now=now,
+                runtime_evidence=runtime_evidence,
+            )
+            created_qa_ids.append(qa_id)
+
+        return RuntimeRealityCheckRunOut(
+            session_id=session_id,
+            system_id=system_id,
+            snapshot_id=snapshot_id,
+            intelligence_run=_intelligence_run_out(run_row),
+            items_considered=len(items),
+            created_qa_ids=created_qa_ids,
+        )
