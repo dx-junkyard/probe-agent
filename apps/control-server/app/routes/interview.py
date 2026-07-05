@@ -31,11 +31,16 @@ from ..auth import get_system_id
 from ..db import get_conn
 from ..interview_context import build_interview_context
 from ..interview_agent import (
+    EVIDENCE_PROMPT_VERSION,
+    EVIDENCE_SCHEMA_VERSION,
     PROMPT_VERSION as INTERVIEW_PROMPT_VERSION,
     SCHEMA_VERSION as INTERVIEW_SCHEMA_VERSION,
+    EvidenceSelectionResult,
     InterviewTurnResult,
     generate_interview_turn,
+    select_evidence_targets,
 )
+from ..interview_evidence import EvidenceReadError, read_evidence_snippets
 from ..llm import LLMConfig, LLMError, create_llm_client, is_reasoning_model
 from ..models import (
     InterviewApprovedItemOut,
@@ -57,6 +62,13 @@ from ..models import (
     InterviewProposalProbePlan,
     InterviewProposalRejectRequest,
     InterviewProposalsCreate,
+    InterviewQaActorRequest,
+    InterviewQaAnswerOut,
+    InterviewQaAnswerRequest,
+    InterviewQaCreate,
+    InterviewQaEvidenceRefOut,
+    InterviewQaListOut,
+    InterviewQaOut,
     InterviewSessionCreate,
     InterviewSessionDetailOut,
     InterviewSessionOut,
@@ -136,6 +148,9 @@ def _session_out(row) -> InterviewSessionOut:
             row["understanding_confirmed_by"]
             if "understanding_confirmed_by" in row.keys() else None
         ),
+        answers_revised_at=(
+            row["answers_revised_at"] if "answers_revised_at" in row.keys() else None
+        ),
         materialization_diff=row["materialization_diff"],
         materialization_ref=row["materialization_ref"],
         materialized_at=row["materialized_at"],
@@ -172,6 +187,88 @@ def _intelligence_run_out(row) -> IntelligenceRunOut:
         started_at=row["started_at"],
         completed_at=row["completed_at"],
     )
+
+
+# --- Structured Interview Q&A (Issue #129) ----------------------------------
+
+
+def _qa_out(row) -> InterviewQaOut:
+    return InterviewQaOut(
+        id=row["id"],
+        session_id=row["session_id"],
+        system_id=row["system_id"],
+        question_text=row["question_text"],
+        question_category=row["question_category"],
+        question_source=row["question_source"],
+        hypothesis=row["hypothesis"],
+        evidence_refs=(
+            [InterviewQaEvidenceRefOut(**e) for e in json.loads(row["evidence_refs"])]
+            if row["evidence_refs"] else []
+        ),
+        answer_text=row["answer_text"],
+        status=row["status"],
+        answered_by=row["answered_by"],
+        superseded_by_id=row["superseded_by_id"],
+        created_at=row["created_at"],
+        answered_at=row["answered_at"],
+    )
+
+
+# Deterministic priority mapping (Principle 6): purpose/capability questions
+# gate the rest of the interview, so they are treated as high priority.
+_HIGH_PRIORITY_QA_CATEGORIES = frozenset({"purpose", "capability"})
+
+
+def _get_qa_or_404(conn, qa_id: int, session_id: int, system_id: int):
+    row = conn.execute(
+        """SELECT * FROM interview_qa
+           WHERE id = ? AND session_id = ? AND system_id = ?""",
+        (qa_id, session_id, system_id),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Question not found")
+    return row
+
+
+def _insert_qa_row(
+    conn,
+    session_id: int,
+    system_id: int,
+    *,
+    question_text: str,
+    question_category: str,
+    question_source: str,
+    hypothesis: Optional[str],
+    evidence_refs: List[InterviewQaEvidenceRefOut],
+    now: float,
+    answer_text: Optional[str] = None,
+    status: str = "open",
+    answered_by: Optional[str] = None,
+    answered_at: Optional[float] = None,
+) -> int:
+    cur = conn.execute(
+        """INSERT INTO interview_qa
+            (session_id, system_id, question_text, question_category,
+             question_source, hypothesis, evidence_refs, answer_text, status,
+             answered_by, created_at, answered_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            session_id,
+            system_id,
+            question_text,
+            question_category,
+            question_source,
+            hypothesis,
+            json.dumps([e.model_dump() for e in evidence_refs], ensure_ascii=False)
+            if evidence_refs else None,
+            answer_text,
+            status,
+            answered_by,
+            now,
+            answered_at,
+        ),
+    )
+    return cur.lastrowid
 
 
 def _proposal_out(conn, row) -> InterviewProposalOut:
@@ -630,6 +727,12 @@ def interview_dialogue_turn(
             json.loads(session["open_questions"]) if session["open_questions"] else None
         )
 
+        # Issue #130: pass 1 selects (or declines) evidence to read from the
+        # pinned snapshot before pass 2 asks the next question. Both passes
+        # are audited as separate intelligence_runs rows below.
+        evidence_audit: Optional[EvidenceSelectionResult] = None
+        evidence_snippets: list = []
+
         if client_error:
             turn = InterviewTurnResult(
                 provider=config.provider,
@@ -638,16 +741,58 @@ def interview_dialogue_turn(
                 error=client_error,
             )
         else:
-            turn = generate_interview_turn(
+            evidence_audit = select_evidence_targets(
                 client,
                 config,
                 context_pack=context_pack,
                 history=history,
                 user_message=payload.user_message,
                 current_understanding=session_understanding,
-                gap_analysis=session_gaps,
-                open_questions=session_open_questions,
             )
+            turn = None
+            if evidence_audit.error:
+                turn = InterviewTurnResult(
+                    provider=config.provider,
+                    model=config.model,
+                    is_mock=evidence_audit.is_mock,
+                    error=evidence_audit.error,
+                )
+            elif evidence_audit.need_evidence:
+                snapshot_row = conn.execute(
+                    "SELECT repo_path, commit_sha FROM repository_snapshots WHERE id = ? AND system_id = ?",
+                    (snapshot_id, system_id),
+                ).fetchone()
+                try:
+                    if snapshot_row is None or not snapshot_row["repo_path"]:
+                        raise EvidenceReadError(
+                            "Snapshot repository path is unavailable for evidence reads"
+                        )
+                    evidence_snippets = read_evidence_snippets(
+                        snapshot_row["repo_path"],
+                        snapshot_row["commit_sha"],
+                        evidence_audit.targets,
+                    )
+                except EvidenceReadError as exc:
+                    # Fail-closed: no "continue without the snippet" fallback.
+                    turn = InterviewTurnResult(
+                        provider=config.provider,
+                        model=config.model,
+                        is_mock=False,
+                        error=str(exc),
+                    )
+
+            if turn is None:
+                turn = generate_interview_turn(
+                    client,
+                    config,
+                    context_pack=context_pack,
+                    history=history,
+                    user_message=payload.user_message,
+                    current_understanding=session_understanding,
+                    gap_analysis=session_gaps,
+                    open_questions=session_open_questions,
+                    evidence_snippets=evidence_snippets,
+                )
 
         conn.execute("BEGIN")
         try:
@@ -658,6 +803,36 @@ def interview_dialogue_turn(
                 VALUES (?, ?, 'user', ?, NULL, ?)""",
                 (session_id, system_id, payload.user_message, now),
             )
+
+            # Store the pass-1 evidence-selection run (Issue #130), when it ran.
+            evidence_run_out: Optional[IntelligenceRunOut] = None
+            if evidence_audit is not None:
+                ev_status = "failed" if evidence_audit.error else "completed"
+                ev_cur = conn.execute(
+                    """INSERT INTO intelligence_runs
+                        (system_id, snapshot_id, run_type, provider, model,
+                         prompt_version, schema_version, decision_method, status,
+                         error_details, is_mock, started_at, completed_at)
+                    VALUES (?, ?, 'interview_evidence_selection', ?, ?, ?, ?,
+                            'reasoning_llm', ?, ?, ?, ?, ?)""",
+                    (
+                        system_id,
+                        snapshot_id,
+                        evidence_audit.provider,
+                        evidence_audit.model,
+                        evidence_audit.prompt_version,
+                        evidence_audit.schema_version,
+                        ev_status,
+                        evidence_audit.error,
+                        1 if evidence_audit.is_mock else 0,
+                        now,
+                        now,
+                    ),
+                )
+                evidence_run_row = conn.execute(
+                    "SELECT * FROM intelligence_runs WHERE id = ?", (ev_cur.lastrowid,),
+                ).fetchone()
+                evidence_run_out = _intelligence_run_out(evidence_run_row)
 
             # Store intelligence run (success or failure).
             run_status = "failed" if turn.error else "completed"
@@ -698,6 +873,7 @@ def interview_dialogue_turn(
                 return InterviewDialogueTurnOut(
                     error=turn.error,
                     intelligence_run=intelligence_run_out,
+                    evidence_run=evidence_run_out,
                 )
 
             # Store assistant message.
@@ -824,6 +1000,61 @@ def interview_dialogue_turn(
                     if remaining_questions else None
                 )
 
+            # Issue #129: persist next_questions as ID-addressable interview_qa
+            # rows (in addition to the legacy open_questions JSON above, kept
+            # during the migration period). Issue #130: attach the char_count
+            # of any evidence snippet a question's evidence_refs actually cite,
+            # so the dashboard can show what was read for that question.
+            created_qa_ids: List[int] = []
+            for raw_question in turn.next_questions:
+                question = _question_out(raw_question)
+                qa_evidence_refs = [
+                    InterviewQaEvidenceRefOut(
+                        path=ref.path,
+                        start_line=ref.start_line,
+                        end_line=ref.end_line,
+                        char_count=next(
+                            (
+                                s.char_count for s in evidence_snippets
+                                if s.path == ref.path
+                                and s.start_line <= ref.start_line
+                                and s.end_line >= ref.end_line
+                            ),
+                            None,
+                        ),
+                    )
+                    for ref in question.evidence_refs
+                ]
+                created_qa_ids.append(_insert_qa_row(
+                    conn, session_id, system_id,
+                    question_text=question.question_text,
+                    question_category="general",
+                    question_source="dialogue",
+                    hypothesis=question.hypothesis,
+                    evidence_refs=qa_evidence_refs,
+                    now=now,
+                ))
+
+            # Issue #129: answered_qa_id is the ID-based replacement for the
+            # exact-text answered_question match above; both are honored
+            # during the migration period. Silently ignored if the row is
+            # missing or already answered — the dialogue turn itself must
+            # never fail because of a stale Q&A reference.
+            if payload.answered_qa_id is not None:
+                answered_row = conn.execute(
+                    """SELECT id, status FROM interview_qa
+                       WHERE id = ? AND session_id = ? AND system_id = ?""",
+                    (payload.answered_qa_id, session_id, system_id),
+                ).fetchone()
+                if answered_row is not None and answered_row["status"] in ("open", "skipped"):
+                    conn.execute(
+                        """UPDATE interview_qa
+                           SET answer_text = ?, status = 'answered',
+                               answered_by = ?, answered_at = ?
+                           WHERE id = ?""",
+                        (payload.user_message, payload.actor, now, payload.answered_qa_id),
+                    )
+
             if payload.user_message.strip():
                 existing_intent = session["user_intent"] or ""
                 new_intent = (existing_intent + "\n" + payload.user_message.strip()).strip() if existing_intent else payload.user_message.strip()
@@ -865,7 +1096,265 @@ def interview_dialogue_turn(
             current_understanding=updated_session.current_understanding,
             gap_analysis=updated_session.gap_analysis,
             open_questions_structured=updated_session.open_questions,
+            created_qa_ids=created_qa_ids,
+            evidence_run=evidence_run_out,
+            evidence_used=[
+                InterviewQaEvidenceRefOut(
+                    path=s.path, start_line=s.start_line, end_line=s.end_line,
+                    char_count=s.char_count,
+                )
+                for s in evidence_snippets
+            ],
         )
+
+
+# --- Structured Interview Q&A (Issue #129) -----------------------------------
+
+
+@router.get(
+    "/interview/sessions/{session_id}/qa",
+    response_model=InterviewQaListOut,
+)
+def list_interview_qa(
+    session_id: int,
+    system_id: int = Depends(get_system_id),
+) -> InterviewQaListOut:
+    """List the current Q&A rows for a session.
+
+    "Current" means the latest revision in each chain (rows with no
+    superseded_by_id). Superseded rows remain in the database for audit but
+    are reachable only via the ``previous`` field of the answer endpoint's
+    response, not this list — this keeps the list one row per question.
+
+    probe-agent:
+      role: API boundary for the structured interview Q&A list
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: Verify the list excludes superseded rows and reports open/high-priority counts correctly
+    """
+    with get_conn() as conn:
+        session = _get_session_or_404(conn, session_id, system_id)
+        rows = conn.execute(
+            """SELECT * FROM interview_qa
+               WHERE session_id = ? AND system_id = ? AND superseded_by_id IS NULL
+               ORDER BY id""",
+            (session_id, system_id),
+        ).fetchall()
+        items = [_qa_out(r) for r in rows]
+        open_items = [i for i in items if i.status == "open"]
+        return InterviewQaListOut(
+            session_id=session_id,
+            system_id=system_id,
+            items=items,
+            open_count=len(open_items),
+            high_priority_open_count=sum(
+                1 for i in open_items if i.question_category in _HIGH_PRIORITY_QA_CATEGORIES
+            ),
+            answers_revised_at=(
+                session["answers_revised_at"]
+                if "answers_revised_at" in session.keys() else None
+            ),
+        )
+
+
+@router.post(
+    "/interview/sessions/{session_id}/qa",
+    response_model=InterviewQaOut,
+    status_code=201,
+)
+def create_interview_qa(
+    session_id: int,
+    payload: InterviewQaCreate,
+    system_id: int = Depends(get_system_id),
+) -> InterviewQaOut:
+    """Create a Q&A row for a question from any of the three sources.
+
+    Dialogue-turn questions are created automatically by the dialogue-turn
+    endpoint; this endpoint additionally lets the reviewer flow and the
+    zero-base fixed questions register themselves as structured rows.
+
+    probe-agent:
+      role: API boundary for registering a new structured interview question
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: write
+      state_effects: [database-write]
+      probe_value: Verify a new question persists with status open and no answer
+    """
+    now = time.time()
+    with get_conn() as conn:
+        _get_session_or_404(conn, session_id, system_id)
+        qa_id = _insert_qa_row(
+            conn, session_id, system_id,
+            question_text=payload.question_text,
+            question_category=payload.question_category,
+            question_source=payload.question_source,
+            hypothesis=payload.hypothesis,
+            evidence_refs=payload.evidence_refs,
+            now=now,
+        )
+        row = conn.execute("SELECT * FROM interview_qa WHERE id = ?", (qa_id,)).fetchone()
+        return _qa_out(row)
+
+
+@router.post(
+    "/interview/sessions/{session_id}/qa/{qa_id}/answer",
+    response_model=InterviewQaAnswerOut,
+)
+def answer_interview_qa(
+    session_id: int,
+    qa_id: int,
+    payload: InterviewQaAnswerRequest,
+    system_id: int = Depends(get_system_id),
+) -> InterviewQaAnswerOut:
+    """Answer a question, or correct its existing answer.
+
+    First answer (status 'open' or 'skipped'): recorded on the same row —
+    there is nothing to supersede yet. Correction (status 'answered'): never
+    overwrites; inserts a new 'answered' row holding the correction and marks
+    the old row 'revised' with superseded_by_id pointing at the new row
+    (Principle 7 audit trail). Corrections also set the session's
+    answers_revised_at flag so the dashboard can recommend rebuilding the
+    understanding, and — without auto-invalidating or regenerating anything —
+    report whether the session already has generated proposals.
+
+    probe-agent:
+      role: API boundary for answering or correcting an interview question
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: write
+      state_effects: [database-write]
+      probe_value: Verify corrections create a new revision row, link the old row, and never overwrite a prior answer
+    """
+    now = time.time()
+    with get_conn() as conn:
+        _get_session_or_404(conn, session_id, system_id)
+        qa = _get_qa_or_404(conn, qa_id, session_id, system_id)
+
+        if qa["superseded_by_id"] is not None or qa["status"] == "revised":
+            raise HTTPException(
+                status_code=409,
+                detail="This question has already been superseded by a newer revision",
+            )
+
+        proposal_row = conn.execute(
+            "SELECT id FROM interview_proposal WHERE session_id = ? LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        has_proposals = proposal_row is not None
+
+        conn.execute("BEGIN")
+        try:
+            if qa["status"] in ("open", "skipped"):
+                conn.execute(
+                    """UPDATE interview_qa
+                       SET answer_text = ?, status = 'answered', answered_by = ?,
+                           answered_at = ?
+                       WHERE id = ?""",
+                    (payload.answer_text, payload.actor, now, qa_id),
+                )
+                conn.execute("COMMIT")
+                updated = conn.execute(
+                    "SELECT * FROM interview_qa WHERE id = ?", (qa_id,)
+                ).fetchone()
+                return InterviewQaAnswerOut(
+                    qa=_qa_out(updated),
+                    previous=None,
+                    regeneration_recommended=False,
+                )
+
+            # status == 'answered': this is a correction. Insert a new
+            # revision row, then link the old row forward.
+            new_id = _insert_qa_row(
+                conn, session_id, system_id,
+                question_text=qa["question_text"],
+                question_category=qa["question_category"],
+                question_source=qa["question_source"],
+                hypothesis=qa["hypothesis"],
+                evidence_refs=(
+                    [InterviewQaEvidenceRefOut(**e) for e in json.loads(qa["evidence_refs"])]
+                    if qa["evidence_refs"] else []
+                ),
+                now=now,
+                answer_text=payload.answer_text,
+                status="answered",
+                answered_by=payload.actor,
+                answered_at=now,
+            )
+            conn.execute(
+                "UPDATE interview_qa SET status = 'revised', superseded_by_id = ? WHERE id = ?",
+                (new_id, qa_id),
+            )
+            conn.execute(
+                """UPDATE interview_session SET answers_revised_at = ?, updated_at = ?
+                   WHERE id = ? AND system_id = ?""",
+                (now, now, session_id, system_id),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+        new_row = conn.execute("SELECT * FROM interview_qa WHERE id = ?", (new_id,)).fetchone()
+        old_row = conn.execute("SELECT * FROM interview_qa WHERE id = ?", (qa_id,)).fetchone()
+        return InterviewQaAnswerOut(
+            qa=_qa_out(new_row),
+            previous=_qa_out(old_row),
+            regeneration_recommended=has_proposals,
+        )
+
+
+@router.post(
+    "/interview/sessions/{session_id}/qa/{qa_id}/skip",
+    response_model=InterviewQaOut,
+)
+def skip_interview_qa(
+    session_id: int,
+    qa_id: int,
+    payload: InterviewQaActorRequest,
+    system_id: int = Depends(get_system_id),
+) -> InterviewQaOut:
+    """Skip an open question so it can be answered later (state: open -> skipped)."""
+    with get_conn() as conn:
+        _get_session_or_404(conn, session_id, system_id)
+        qa = _get_qa_or_404(conn, qa_id, session_id, system_id)
+        if qa["status"] != "open":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Only 'open' questions can be skipped (current: {qa['status']})",
+            )
+        conn.execute("UPDATE interview_qa SET status = 'skipped' WHERE id = ?", (qa_id,))
+        row = conn.execute("SELECT * FROM interview_qa WHERE id = ?", (qa_id,)).fetchone()
+        return _qa_out(row)
+
+
+@router.post(
+    "/interview/sessions/{session_id}/qa/{qa_id}/resume",
+    response_model=InterviewQaOut,
+)
+def resume_interview_qa(
+    session_id: int,
+    qa_id: int,
+    payload: InterviewQaActorRequest,
+    system_id: int = Depends(get_system_id),
+) -> InterviewQaOut:
+    """Reopen a skipped question (state: skipped -> open)."""
+    with get_conn() as conn:
+        _get_session_or_404(conn, session_id, system_id)
+        qa = _get_qa_or_404(conn, qa_id, session_id, system_id)
+        if qa["status"] != "skipped":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Only 'skipped' questions can be resumed (current: {qa['status']})",
+            )
+        conn.execute("UPDATE interview_qa SET status = 'open' WHERE id = ?", (qa_id,))
+        row = conn.execute("SELECT * FROM interview_qa WHERE id = ?", (qa_id,)).fetchone()
+        return _qa_out(row)
 
 
 # --- Proposal Approval Gate (Issue #70) ---------------------------------------
@@ -1575,7 +2064,7 @@ def update_interview_understanding(
         conn.execute(
             """UPDATE interview_session
                SET current_understanding = ?, gap_analysis = ?, open_questions = ?,
-                   stage = ?, last_error = NULL, updated_at = ?
+                   stage = ?, last_error = NULL, answers_revised_at = NULL, updated_at = ?
                WHERE id = ? AND system_id = ?""",
             (understanding_json, gap_json, questions_json, new_stage, now, session_id, system_id),
         )

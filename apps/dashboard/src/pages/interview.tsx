@@ -7,6 +7,7 @@ import {
   Sparkles, XCircle,
 } from "lucide-react";
 import {
+  useAnswerInterviewQa,
   useApproveInterviewProposal,
   useConfirmInterviewUnderstanding,
   useCreateInterviewSession,
@@ -14,11 +15,14 @@ import {
   useInterviewApprovedSet,
   useInterviewContextPack,
   useInterviewDialogueTurn,
+  useInterviewQaList,
   useInterviewSession,
   useInterviewSessions,
   useLatestSnapshot,
   useMaterializeInterview,
   useRejectInterviewProposal,
+  useResumeInterviewQa,
+  useSkipInterviewQa,
   useUpdateInterviewUnderstanding,
 } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
@@ -40,6 +44,7 @@ import type {
   InterviewProposalMetadataBlock,
   InterviewProposalOut,
   InterviewProposalProbePlan,
+  InterviewQaOut,
   InterviewQuestionEvidenceRef,
   InterviewSessionDetailOut,
   InterviewStage,
@@ -463,6 +468,176 @@ function UnderstandingPanel({ understanding }: { understanding: CurrentUnderstan
   );
 }
 
+// Q&A一覧パネル(Issue #129)。会話ログとは別に、質問・回答をIDベースで
+// 一覧・編集・スキップできる。回答の修正は新しいリビジョン行として保存され、
+// 旧回答も previous として残る(上書きしない)。
+function QaItemCard({
+  qa, onAnswer, onSkip, onResume, answering, skipping, resuming,
+}: {
+  qa: InterviewQaOut;
+  onAnswer: (qaId: number, answerText: string) => Promise<void>;
+  onSkip: (qaId: number) => void;
+  onResume: (qaId: number) => void;
+  answering: boolean;
+  skipping: boolean;
+  resuming: boolean;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(qa.answer_text ?? "");
+
+  const submit = async () => {
+    if (!draft.trim()) return;
+    await onAnswer(qa.id, draft.trim());
+    setEditing(false);
+  };
+
+  return (
+    <div className="rounded-md border p-3 space-y-2" data-testid={`qa-item-${qa.id}`}>
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <p className="text-sm font-medium break-words">{qa.question_text}</p>
+          {qa.hypothesis && (
+            <p className="text-xs text-muted-foreground italic mt-1">仮説: {qa.hypothesis}</p>
+          )}
+        </div>
+        <div className="flex gap-1 shrink-0">
+          <Badge variant="outline">{qa.question_category}</Badge>
+          <Badge variant={
+            qa.status === "answered" ? "success"
+              : qa.status === "skipped" ? "warning"
+              : qa.status === "revised" ? "secondary" : "outline"
+          }>
+            {qa.status}
+          </Badge>
+        </div>
+      </div>
+
+      {qa.evidence_refs.length > 0 && (
+        <div className="text-[10px] text-muted-foreground font-mono space-y-0.5">
+          {qa.evidence_refs.map((e, i) => (
+            <div key={i}>
+              参照コード: {e.path}:{e.start_line}-{e.end_line}
+              {e.char_count != null ? ` (${e.char_count} chars 読込)` : ""}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {qa.answer_text && !editing && (
+        <p className="text-sm bg-muted/40 rounded p-2 whitespace-pre-wrap break-words">
+          {qa.answer_text}
+          {qa.answered_by && (
+            <span className="block text-[10px] text-muted-foreground mt-1">
+              回答者: {qa.answered_by}
+            </span>
+          )}
+        </p>
+      )}
+
+      {editing ? (
+        <div className="space-y-2">
+          <Textarea
+            value={draft}
+            onChange={e => setDraft(e.target.value)}
+            rows={3}
+            placeholder="回答を入力"
+          />
+          <div className="flex gap-2">
+            <Button size="sm" onClick={submit} disabled={answering || !draft.trim()}>
+              {answering ? "送信中..." : "保存"}
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => setEditing(false)}>キャンセル</Button>
+          </div>
+        </div>
+      ) : (
+        <div className="flex gap-2">
+          <Button size="sm" variant="outline" onClick={() => setEditing(true)}>
+            <Pencil className="h-3 w-3 mr-1" />
+            {qa.status === "answered" ? "回答を修正" : "回答する"}
+          </Button>
+          {qa.status === "open" && (
+            <Button size="sm" variant="outline" onClick={() => onSkip(qa.id)} disabled={skipping}>
+              後で回答
+            </Button>
+          )}
+          {qa.status === "skipped" && (
+            <Button size="sm" variant="outline" onClick={() => onResume(qa.id)} disabled={resuming}>
+              再開
+            </Button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function QaPanel({ sessionId, actor }: { sessionId: number; actor: string }) {
+  const { data: qaList } = useInterviewQaList(sessionId);
+  const answer = useAnswerInterviewQa(sessionId);
+  const skip = useSkipInterviewQa(sessionId);
+  const resume = useResumeInterviewQa(sessionId);
+
+  if (!qaList || qaList.items.length === 0) return null;
+
+  const handleAnswer = async (qaId: number, answerText: string) => {
+    try {
+      const result = await answer.mutateAsync({ qaId, answer_text: answerText, actor });
+      if (result.regeneration_recommended) {
+        toast.warning("回答が変わったため、生成済みの提案の再生成を検討してください(自動では再生成されません)。");
+      } else {
+        toast.success("回答を保存しました");
+      }
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
+  return (
+    <Card data-testid="qa-panel">
+      <CardHeader>
+        <CardTitle className="text-sm flex items-center gap-2">
+          <HelpCircle className="h-4 w-4" /> Q&amp;A一覧
+        </CardTitle>
+        <CardDescription>
+          残質問 {qaList.open_count} 件(うち高優先度 {qaList.high_priority_open_count} 件)
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {qaList.answers_revised_at && (
+          <div
+            className="rounded-md border border-amber-500 bg-amber-500/10 p-3 text-sm flex items-start gap-2"
+            data-testid="answers-revised-banner"
+          >
+            <AlertCircle className="h-4 w-4 mt-0.5 shrink-0 text-amber-600" />
+            <div>
+              回答が修正されました。内容を反映するには「理解を更新」を実行してください
+              (自動では再構築されません)。
+            </div>
+          </div>
+        )}
+        <div className="space-y-2 max-h-[26rem] overflow-y-auto pr-1">
+          {qaList.items.map(qa => (
+            <QaItemCard
+              key={qa.id}
+              qa={qa}
+              onAnswer={handleAnswer}
+              onSkip={qaId => skip.mutate({ qaId, actor }, {
+                onError: e => toast.error(String(e)),
+              })}
+              onResume={qaId => resume.mutate({ qaId, actor }, {
+                onError: e => toast.error(String(e)),
+              })}
+              answering={answer.isPending}
+              skipping={skip.isPending}
+              resuming={resume.isPending}
+            />
+          ))}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 function GapAnalysisPanel({ gaps }: { gaps: GapItem[] }) {
   if (gaps.length === 0) return null;
   return (
@@ -668,6 +843,7 @@ export default function InterviewPage() {
         user_message: text,
         generate_proposals: isProposalStage && unlocked,
         answered_question: answeredQuestionForTurn,
+        actor,
       });
       setMessage("");
       if (result.error) toast.error(result.error);
@@ -1196,6 +1372,8 @@ export default function InterviewPage() {
                   </CardContent>
                 </Card>
               )}
+
+              <QaPanel sessionId={session.id} actor={actor} />
 
               {session.gap_analysis && session.gap_analysis.length > 0 && (
                 <Card>

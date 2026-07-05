@@ -830,6 +830,84 @@ Decision Workspace の #36（Context Pack Builder）と同じ位置づけ。pin 
   / `InterviewEvidenceLocation`
   （[shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json)）。
 
+## インタビューの構造化 Q&A（Issue #129）
+
+対話ターン（Issue #69）の `interview_message` は会話ログの生記録であり、質問と回答の
+対応関係を持たない。回答は `interview_session.open_questions` という JSON blob 上で
+質問文の完全一致マッチにより消費されており、後から回答を訂正する手段がなかった。
+本 issue は ID を持つ Q&A ペアの層を、既存の会話ログ・`open_questions` の**上に**追加する
+（`interview_message` / `open_questions` は移行期間中そのまま残す）。
+
+新テーブル `interview_qa`（System-scoped、この issue が所有）:
+
+- `question_text` / `question_category`（`purpose|capability|api|probe_flow|general`）/
+  `question_source`（`reviewer|dialogue|zero_base`）— いずれも有限集合（Principle 6）。
+- `hypothesis` / `evidence_refs`（#128 の仮説・根拠と同形。#130 が実際に読んだ範囲の
+  `char_count` を追加で保持する）。
+- `answer_text` / `status`（`open|answered|revised|skipped`）/ `answered_by` /
+  `superseded_by_id`。
+
+**回答の修正は UPDATE ではなく新リビジョン行の追加。** 最初の回答は `open`/`skipped` の
+行に直接記録するが（供養する対象がまだ無い）、既に `answered` の行を訂正する場合は
+新しい行を `answered` として挿入し、旧行を `revised` にして `superseded_by_id` で新行へ
+リンクする。旧回答は削除・上書きされず監査可能なまま残る（Principle 7）。
+
+副作用として `interview_session.answers_revised_at` を立てる。これは Dashboard に
+「理解を再構築してください」バナーを出すためのフラグで、**理解の再構築が成功した時のみ**
+クリアされる（修正そのものでは自動的にクリアしない）。同様に、そのセッションに
+生成済み提案（`interview_proposal`）が存在する場合は回答レスポンスに
+`regeneration_recommended: true` を返すが、既存の提案は自動では無効化・再生成されない。
+
+対話ターン（`POST /interview/sessions/{id}/dialogue-turn`）は次の2つを行う:
+
+1. モデルが返した `next_questions` を `question_source: "dialogue"` の `interview_qa`
+   行として作成し、作成された ID を `created_qa_ids` として返す。
+2. `answered_question`（テキスト完全一致、#123）に加えて `answered_qa_id`（ID 参照）を
+   受け付ける。ID 参照は言い換えに強く、存在しない/既に回答済みの ID は無視されターン
+   自体は失敗しない。テキスト一致は移行期間中は併存するが、いずれ削除される。
+
+エンドポイント: `GET/POST /interview/sessions/{id}/qa`,
+`POST .../qa/{qa_id}/answer|skip|resume`。旧セッション（`interview_qa` 行が無い）は
+一覧が空になるだけで、バックフィルは行わない。
+
+**含まない:** 回答内容の自動解釈、質問の類似度マッチングによる自動重複排除、提案の
+自動再生成・自動無効化。
+
+共有スキーマ: `InterviewQA` / `InterviewQaEvidenceRef` / `InterviewQaAnswerOut`
+（[shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json)）。
+
+## 質問前の軽量エビデンス調査（Issue #130）
+
+#128 で対話ターンは仮説を持つが、確信度が低い論点ではシンボル名と行範囲だけを根拠に
+質問してしまう。本 issue は対話ターンを決定的な2パス構成に分割し、質問を出す前に
+pinned snapshot のソース断片を有界に読めるようにする。
+
+- **パス1（`interview_agent.select_evidence_targets`, reasoning_llm）**: 「次の質問の
+  ために読みたい `(path, start_line, end_line)` を最大 `MAX_EVIDENCE_TARGETS`(10) 件選ぶ、
+  または `need_evidence: false` で不要と宣言する」構造化出力を要求する。`path` は
+  context pack / current understanding に存在するものに限定し、範囲外の参照は
+  `interview_agent._allowed_evidence_spans` と同じ許可集合で検証エラーとして fail する。
+- **取得（`interview_evidence.read_evidence_snippets`, deterministic）**: 検証済みの
+  対象を `git_ops.read_file_at_commit`（pinned commit からのみ、Principle 5）で読み出す。
+  1ファイルあたりの行数上限（`INTERVIEW_EVIDENCE_MAX_LINES_PER_FILE`、既定 200）と
+  合計文字数バジェット（`INTERVIEW_EVIDENCE_MAX_CHARS`、既定 20000）、ファイル数上限
+  （`INTERVIEW_EVIDENCE_MAX_FILES`、既定 5）で抑制する。読み出し失敗（存在しない
+  パス・git エラー）はターン全体を fail-closed にする — スニペット無しでの続行は
+  存在しない（パス1が明示的に「不要」と宣言した場合のみスニペット無しで正常に進む）。
+- **パス2（既存の `interview_agent.generate_interview_turn`）**: 読んだスニペットを
+  プロンプトに追加し、#128 の仮説+確認質問を生成する。質問の `evidence_refs` は
+  スニペットの範囲も引用可能になり、実際に読んだ範囲と一致すれば `interview_qa` の
+  `evidence_refs[].char_count` に反映される。
+- **監査**: パス1・パス2は別々の `intelligence_runs` 行として記録する
+  (`run_type`: `interview_evidence_selection` / `interview_dialogue`)。
+  対話ターンのレスポンスにも `evidence_run` / `evidence_used` として両方を返す。
+
+判断区分: どこを読むか・質問内容は reasoning_llm。読めるか（実在・範囲・バジェット）は
+deterministic。読んだスニペットは raw fact として保存され、LLM の解釈とは分離される。
+
+**含まない:** 自由なツールユースループ、working tree・未コミット内容の読み出し、
+読んだ内容に基づく提案の自動生成、対象リポジトリへの書き込み。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。

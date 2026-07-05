@@ -819,10 +819,20 @@ def _stub_reasoning_turn(monkeypatch, *, proposals=None, next_questions=None):
     consumption run through the real route code.
     """
     from app.routes import interview as interview_routes
-    from app.interview_agent import InterviewTurnResult
+    from app.interview_agent import EvidenceSelectionResult, InterviewTurnResult
 
     def fake_create_llm_client(config):
         return object()
+
+    def fake_select_evidence_targets(
+        client, config, *, context_pack, history, user_message, **kwargs
+    ):
+        return EvidenceSelectionResult(
+            provider="anthropic",
+            model="claude-sonnet-4-5",
+            is_mock=False,
+            need_evidence=False,
+        )
 
     def fake_generate_interview_turn(
         client, config, *, context_pack, history, user_message, **kwargs
@@ -837,6 +847,9 @@ def _stub_reasoning_turn(monkeypatch, *, proposals=None, next_questions=None):
         )
 
     monkeypatch.setattr(interview_routes, "create_llm_client", fake_create_llm_client)
+    monkeypatch.setattr(
+        interview_routes, "select_evidence_targets", fake_select_evidence_targets
+    )
     monkeypatch.setattr(
         interview_routes, "generate_interview_turn", fake_generate_interview_turn
     )
