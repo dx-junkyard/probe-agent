@@ -45,6 +45,10 @@ uvicorn app.main:app --reload --port 8000
 | POST | `/generation-runs` | trace 入力から候補コードを生成・実行・LLM 評価 |
 | GET  | `/generation-runs` | 生成・評価結果一覧 |
 | GET  | `/generation-runs/{id}` | 生成・評価結果詳細 |
+| GET  | `/system-diagnostics` | 必須設定の静的ヘルスチェック (LLM 不使用、Issue #101) |
+| GET  | `/assistant/settings-metadata` | 設定項目の静的説明メタデータ (コード管理、Issue #102) |
+| GET  | `/assistant/screen-context/{screen_id}` | 画面コンテキスト + 現在の診断状態 + 提案質問 |
+| POST | `/assistant/ask` | 画面コンテキスト/設定メタデータ/診断結果に根拠づけた Q&A |
 
 DB ファイルは `PROBE_DB_PATH` (既定 `./probe.db`) で切り替えられる。
 
@@ -57,6 +61,9 @@ Generate & Evaluate は `app.llm` の抽象化層だけを通して LLM を呼�
 | --- | --- |
 | `LLM_PROVIDER` | `openai` / `anthropic` / `gemini` / `mock` |
 | `LLM_MODEL` | 使用するモデル名 |
+| `INTELLIGENCE_LLM_PROVIDER` | Feature Intelligence 用 provider (未設定なら `LLM_PROVIDER` を使用) |
+| `INTELLIGENCE_LLM_MODEL` | Feature Intelligence 用 reasoning model (未設定なら `LLM_MODEL` を使用) |
+| `INTELLIGENCE_LLM_TIMEOUT` | Feature Intelligence の HTTP timeout 秒（既定値: `120`） |
 | `INTELLIGENCE_MAX_OUTPUT_TOKENS` | Repository Draft生成の最大出力token数（既定値: `128000`） |
 | `LLM_API_KEY` | 各プロバイダ共通の API key |
 | `LLM_BASE_URL` | 互換 API やプロキシを使う場合の base URL |
@@ -64,6 +71,64 @@ Generate & Evaluate は `app.llm` の抽象化層だけを通して LLM を呼�
 
 `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` も後方互換として読まれる。
 `mock` はテストとローカルUI確認用で、外部 API は呼ばない。
+
+## System Understanding build ジョブ (Issue #109)
+
+`POST /repository/system-understanding/build` は step 単位で orchestration
+される非同期ジョブを enqueue し、即座に `job_id` / `run_id` を返す
+(`run_id` は初回実行・retry ごとに発番される実行単位の識別子)。進捗は
+`GET /repository/system-understanding/jobs/{job_id}` /
+`GET /repository/system-understanding/jobs/active` で polling する。
+step ごとに status / started_at / completed_at / duration / error /
+artifact provenance が永続化され、completed step は再実行されない。
+claim scan は chunk 単位の LLM task として retry / backoff / cancel を統一管理する。
+job status は全 step 完了時のみ `completed` になり、failed / blocked /
+cancelled の step が残る場合は `partial`(1 つも完了していなければ `failed`)
+として区別される。
+
+| 変数 | 用途 |
+| --- | --- |
+| `SYSTEM_UNDERSTANDING_STUCK_AFTER_SECONDS` | heartbeat がこの秒数更新されない active job を stuck と判定（既定値: `300`） |
+| `SYSTEM_UNDERSTANDING_LLM_MAX_ATTEMPTS` | claim scan chunk task の最大試行回数（既定値: `3`） |
+| `SYSTEM_UNDERSTANDING_LLM_BACKOFF_SECONDS` | chunk task retry の指数 backoff 基準秒（既定値: `2`） |
+
+## 設定診断 (System Diagnostics)
+
+`GET /system-diagnostics` は必須設定の静的・決定的ヘルスチェックを返す (Issue #101)。
+
+- 環境変数の有無、enum 値、パスの存在と read/write 権限、provider と model
+  family の整合、reasoning-capable かどうかを LLM を使わずに検査する。
+- 実行しないと分からない失敗 (LLM の timeout / auth / invalid model、snapshot
+  失敗など) は、直近の `intelligence_runs.error_details` / snapshot 状態を
+  `last_observed_error` としてそのまま返す。エラーメッセージの解釈・分類は
+  行わない (Principle 6)。
+- severity は `ok | warning | error | blocked | unknown`。各 check は
+  impact・remediation・関連 env/path/画面/pipeline step を持ち、Dashboard の
+  alert badge と System Understanding の pipeline 行から参照される。
+- すべての check は `decision_method: deterministic`。
+
+## 画面アシスタント (Per-page Assistant)
+
+各画面のエージェントボタンから使う画面コンテキスト付き Q&A (Issue #102)。
+
+- `GET /assistant/settings-metadata`: 設定項目の説明 (目的・影響・修正方法・
+  valid values・関連 check/画面/pipeline step)。`app/settings_metadata.py` の
+  静的データで、LLM 生成ではない。診断 check が `related_env` で参照する
+  env var は必ずエントリを持つ (テストで強制)。
+- `GET /assistant/screen-context/{screen_id}`: 画面の目的・セクション・関連
+  設定/チェック/エンドポイントの静的定義 (`app/assistant.py`) に、その画面に
+  関連する現在の診断 check と提案質問 (失敗中 check 由来を先頭) を付けて返す。
+- `POST /assistant/ask`: 質問に対し、画面コンテキスト + 設定メタデータ +
+  決定的診断結果だけを根拠に回答する。実 provider (openai/anthropic/gemini +
+  API key) があればその限定コンテキストのみを LLM に渡し
+  (`decision_method: reasoning_llm`)、citation と navigate 先はコンテキスト
+  外のものを構造的に除去する。provider が `mock`・key 無し・LLM 失敗時は
+  静的メタデータと診断結果をそのまま組み立てた fallback 回答を返し、
+  `used_fallback: true` と `fallback_reason` を明示する。fallback は既知の
+  設定 key / check 名 / pipeline step 名との有限マッチのみで内容を選び、
+  自由文をヒューリスティックに解釈しない (Principle 6)。
+- Q&A は永続化しない。監査メタデータ (provider/model/prompt/schema version、
+  decision method、失敗詳細) はレスポンスに含めて返す。
 
 ## 認証とユーザー管理
 

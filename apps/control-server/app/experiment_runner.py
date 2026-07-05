@@ -1,4 +1,14 @@
-"""Isolated source-patch experiment execution and deterministic comparison."""
+"""Isolated source-patch experiment execution and deterministic comparison.
+
+probe-agent:
+  role: Isolated experiment executor and comparator
+  capability: variant-evaluation
+  element_type: core
+  consumers: [dashboard, probe-planning]
+  operation_kind: io
+  state_effects: [filesystem, external-api]
+  probe_value: Verify that experiments run in isolated worktrees and deterministic metrics are preserved when interpretation fails.
+"""
 
 from __future__ import annotations
 

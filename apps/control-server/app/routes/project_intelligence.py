@@ -1,10 +1,21 @@
+"""Project Intelligence API routes.
+
+probe-agent:
+  role: Project Intelligence REST API boundary
+  capability: repository-understanding
+  element_type: element
+  consumers: [dashboard]
+  operation_kind: io
+  state_effects: [database-read, database-write, external-api]
+  probe_value: Verify that API endpoints enforce committed-snapshot-only reads and reasoning-model audit trails.
+"""
+
 import fnmatch
 import json
 import os
 import re
 import time
 import hashlib
-from dataclasses import replace
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
@@ -88,6 +99,9 @@ from ..models import (
     FeatureDraftOut,
     FeatureEvidence,
     IntelligenceRunOut,
+    IssueDraftCreateRequest,
+    IssueDraftOut,
+    IssueDraftUpdateRequest,
     LatestDraftsOut,
     LinkReviewUpdate,
     ProbePatchApplyRequest,
@@ -98,12 +112,15 @@ from ..models import (
     ProbePointStatusUpdate,
     RepositoryCandidateOut,
     RepositoryConfigOut,
+    SystemUnderstandingOut,
     RepositoryConfigUpdate,
     SnapshotFileOut,
     SnapshotOut,
     SymbolIndexOut,
     SymbolIndexWarningOut,
     SystemProfileDraftOut,
+    SystemUnderstandingBuildOut,
+    SystemUnderstandingJobRetryIn,
     ValidationCommandOut,
     ValidationRunOut,
 )
@@ -178,6 +195,548 @@ def _probe_patch_out(conn, row) -> ProbePatchOut:
 
 
 # ---------------------------------------------------------------------------
+# System Understanding (Issue #86)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/repository/system-understanding",
+    response_model=SystemUnderstandingOut,
+)
+def get_system_understanding_endpoint(
+    system_id: int = Depends(get_system_id),
+) -> SystemUnderstandingOut:
+    """Retrieve current system understanding summary.
+
+    probe-agent:
+      role: API boundary for retrieving aggregated system understanding
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: verify correct aggregation of pipeline steps and gap summaries
+    """
+    from ..system_understanding_service import get_system_understanding
+    summary = get_system_understanding(system_id)
+    return _system_understanding_to_out(summary)
+
+
+@router.post(
+    "/repository/system-understanding/build",
+    response_model=SystemUnderstandingBuildOut,
+    status_code=202,
+)
+def build_system_understanding_endpoint(
+    system_id: int = Depends(get_system_id),
+) -> SystemUnderstandingBuildOut:
+    """Enqueue a step-orchestrated system understanding build job (Issue #109).
+
+    probe-agent:
+      role: API boundary for enqueueing an asynchronous system understanding build
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: orchestration
+      state_effects: [database-read, database-write]
+      probe_value: verify the request returns immediately with a job id and step
+        list while the build runs in the background, and that /health stays
+        responsive while a build is in flight (Issues #106, #109).
+    """
+    from ..system_understanding_jobs import get_job, start_system_understanding_build
+
+    job_id = start_system_understanding_build(system_id)
+    return _build_out(get_job(system_id, job_id))
+
+
+@router.get(
+    "/repository/system-understanding/build/latest",
+    response_model=Optional[SystemUnderstandingBuildOut],
+)
+def get_latest_system_understanding_build_endpoint(
+    system_id: int = Depends(get_system_id),
+) -> Optional[SystemUnderstandingBuildOut]:
+    """Poll the most recently triggered system understanding build job.
+
+    probe-agent:
+      role: API boundary for polling system understanding build progress
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: verify job/step status and errors are visible without
+        blocking on the build itself, and survive browser reloads.
+    """
+    from ..system_understanding_jobs import get_latest_job
+
+    job = get_latest_job(system_id)
+    return _build_out(job) if job else None
+
+
+@router.get(
+    "/repository/system-understanding/jobs/active",
+    response_model=List[SystemUnderstandingBuildOut],
+)
+def list_active_system_understanding_jobs_endpoint(
+    system_id: int = Depends(get_system_id),
+) -> List[SystemUnderstandingBuildOut]:
+    """List active (queued/running) build jobs, with stuck detection.
+
+    probe-agent:
+      role: API boundary for listing active system understanding build jobs
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: verify active jobs are scoped to the calling system and
+        stale heartbeats surface as is_stuck.
+    """
+    from ..system_understanding_jobs import list_active_jobs
+
+    return [_build_out(j) for j in list_active_jobs(system_id)]
+
+
+@router.get(
+    "/repository/system-understanding/jobs/{job_id}",
+    response_model=SystemUnderstandingBuildOut,
+)
+def get_system_understanding_job_endpoint(
+    job_id: int,
+    system_id: int = Depends(get_system_id),
+) -> SystemUnderstandingBuildOut:
+    """Poll a specific build job with per-step status and provenance.
+
+    probe-agent:
+      role: API boundary for polling a specific system understanding build job
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: verify step status/started_at/completed_at/duration/error and
+        artifact provenance are readable per step.
+    """
+    from ..system_understanding_jobs import get_job
+
+    job = get_job(system_id, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Build job not found")
+    return _build_out(job)
+
+
+@router.get(
+    "/repository/system-understanding/build/{build_id}",
+    response_model=SystemUnderstandingBuildOut,
+)
+def get_system_understanding_build_endpoint(
+    build_id: int,
+    system_id: int = Depends(get_system_id),
+) -> SystemUnderstandingBuildOut:
+    """Back-compat alias of the job status endpoint.
+
+    probe-agent:
+      role: API boundary for polling a specific system understanding build
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: verify build status/current_step/error are visible without
+        blocking on the build itself.
+    """
+    return get_system_understanding_job_endpoint(build_id, system_id)
+
+
+@router.post(
+    "/repository/system-understanding/jobs/{job_id}/cancel",
+    response_model=SystemUnderstandingBuildOut,
+)
+def cancel_system_understanding_job_endpoint(
+    job_id: int,
+    system_id: int = Depends(get_system_id),
+) -> SystemUnderstandingBuildOut:
+    """Request cancellation of an active build job.
+
+    probe-agent:
+      role: API boundary for cancelling a system understanding build job
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: orchestration
+      state_effects: [database-write]
+      probe_value: verify a cancel request stops the worker between steps/chunks
+        and settles the job as cancelled.
+    """
+    from ..system_understanding_jobs import (
+        JobConflict, JobNotFound, cancel_build, get_job,
+    )
+
+    try:
+        cancel_build(system_id, job_id)
+    except JobNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except JobConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return _build_out(get_job(system_id, job_id))
+
+
+@router.post(
+    "/repository/system-understanding/jobs/{job_id}/retry",
+    response_model=SystemUnderstandingBuildOut,
+    status_code=202,
+)
+def retry_system_understanding_job_endpoint(
+    job_id: int,
+    body: Optional[SystemUnderstandingJobRetryIn] = None,
+    system_id: int = Depends(get_system_id),
+) -> SystemUnderstandingBuildOut:
+    """Resume a settled/stuck job; only missing or failed steps re-run.
+
+    probe-agent:
+      role: API boundary for retrying/resuming a system understanding build job
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: orchestration
+      state_effects: [database-read, database-write]
+      probe_value: verify completed steps are never re-executed and retry
+        resumes from persisted DB state after interruption.
+    """
+    from ..system_understanding_jobs import (
+        JobConflict, JobNotFound, get_job, retry_build,
+    )
+
+    step = body.step if body else None
+    try:
+        retry_build(system_id, job_id, step=step)
+    except JobNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except JobConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return _build_out(get_job(system_id, job_id))
+
+
+@router.post(
+    "/repository/system-understanding/jobs/{job_id}/steps/{step}/cancel",
+    response_model=SystemUnderstandingBuildOut,
+)
+def cancel_system_understanding_step_endpoint(
+    job_id: int,
+    step: str,
+    system_id: int = Depends(get_system_id),
+) -> SystemUnderstandingBuildOut:
+    """Cancel a single pending/running step without cancelling the whole job.
+
+    probe-agent:
+      role: API boundary for cancelling one build step
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: orchestration
+      state_effects: [database-write]
+      probe_value: verify a step-level cancel settles only that step while the
+        job continues with independent steps.
+    """
+    from ..system_understanding_jobs import (
+        JobConflict, JobNotFound, cancel_step, get_job,
+    )
+
+    try:
+        cancel_step(system_id, job_id, step)
+    except JobNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except JobConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return _build_out(get_job(system_id, job_id))
+
+
+@router.post(
+    "/repository/system-understanding/jobs/{job_id}/steps/{step}/retry",
+    response_model=SystemUnderstandingBuildOut,
+    status_code=202,
+)
+def retry_system_understanding_step_endpoint(
+    job_id: int,
+    step: str,
+    system_id: int = Depends(get_system_id),
+) -> SystemUnderstandingBuildOut:
+    """Retry a single failed/blocked/cancelled step (and its dependents).
+
+    probe-agent:
+      role: API boundary for retrying one build step
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: orchestration
+      state_effects: [database-read, database-write]
+      probe_value: verify a completed step is refused (409) and a failed step
+        re-runs together with its dependent steps only.
+    """
+    from ..system_understanding_jobs import (
+        JobConflict, JobNotFound, get_job, retry_build,
+    )
+
+    try:
+        retry_build(system_id, job_id, step=step)
+    except JobNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except JobConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return _build_out(get_job(system_id, job_id))
+
+
+# ---------------------------------------------------------------------------
+# Issue drafts (Issue #107)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/issue-drafts", response_model=IssueDraftOut, status_code=201)
+def create_issue_draft_endpoint(
+    payload: IssueDraftCreateRequest,
+    system_id: int = Depends(get_system_id),
+) -> IssueDraftOut:
+    """Generate and persist an issue draft from a System Understanding gap.
+
+    probe-agent:
+      role: API boundary for generating an issue draft from a gap
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: transformation
+      state_effects: [database-read, database-write]
+      probe_value: verify the draft body embeds the pinned snapshot/commit and
+        gap evidence, and never creates an external issue itself.
+    """
+    from ..issue_drafts import create_gap_draft
+    from ..system_understanding_service import _get_latest_ready_snapshot
+
+    with get_conn() as conn:
+        snapshot_row = _get_latest_ready_snapshot(conn, system_id)
+    snapshot_id = snapshot_row["id"] if snapshot_row else None
+    commit_sha = snapshot_row["commit_sha"] if snapshot_row else None
+
+    # Bind the draft to the snapshot the gap was displayed against. If the
+    # caller pinned a snapshot and a newer one has since become ready, refuse
+    # rather than embed a snapshot id / commit sha that disagrees with the gap
+    # evidence in the payload.
+    if payload.snapshot_id is not None and payload.snapshot_id != snapshot_id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Snapshot has changed since this gap was displayed; refresh "
+                "System Understanding and generate the draft again."
+            ),
+        )
+
+    draft = create_gap_draft(
+        system_id,
+        payload.gap.model_dump(),
+        snapshot_id,
+        commit_sha,
+        source_type=payload.source_type,
+    )
+    return IssueDraftOut(**draft)
+
+
+@router.get("/issue-drafts", response_model=List[IssueDraftOut])
+def list_issue_drafts_endpoint(
+    system_id: int = Depends(get_system_id),
+) -> List[IssueDraftOut]:
+    """List issue drafts for the current system.
+
+    probe-agent:
+      role: API boundary for listing issue drafts
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: verify drafts are scoped to the calling system only.
+    """
+    from ..issue_drafts import list_drafts
+
+    return [IssueDraftOut(**d) for d in list_drafts(system_id)]
+
+
+@router.get("/issue-drafts/{draft_id}", response_model=IssueDraftOut)
+def get_issue_draft_endpoint(
+    draft_id: int,
+    system_id: int = Depends(get_system_id),
+) -> IssueDraftOut:
+    """Retrieve a single issue draft.
+
+    probe-agent:
+      role: API boundary for retrieving one issue draft
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: verify a draft owned by another system returns 404.
+    """
+    from ..issue_drafts import get_draft
+
+    draft = get_draft(system_id, draft_id)
+    if draft is None:
+        raise HTTPException(status_code=404, detail="Issue draft not found")
+    return IssueDraftOut(**draft)
+
+
+@router.patch("/issue-drafts/{draft_id}", response_model=IssueDraftOut)
+def update_issue_draft_endpoint(
+    draft_id: int,
+    payload: IssueDraftUpdateRequest,
+    system_id: int = Depends(get_system_id),
+) -> IssueDraftOut:
+    """Edit a draft's title/body/status or register an external issue URL.
+
+    probe-agent:
+      role: API boundary for editing an issue draft and registering its URL
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: transformation
+      state_effects: [database-write]
+      probe_value: verify status stays within the finite vocabulary and
+        external_url is validated as http(s) but never fetched or synced.
+    """
+    from ..issue_drafts import DraftValidationError, update_draft
+
+    fields_set = payload.model_fields_set
+    try:
+        draft = update_draft(
+            system_id,
+            draft_id,
+            title=payload.title,
+            body_markdown=payload.body_markdown,
+            status=payload.status,
+            external_url=payload.external_url,
+            external_url_set="external_url" in fields_set,
+        )
+    except DraftValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    if draft is None:
+        raise HTTPException(status_code=404, detail="Issue draft not found")
+    return IssueDraftOut(**draft)
+
+
+def _build_out(job: dict) -> SystemUnderstandingBuildOut:
+    from ..models import (
+        SystemUnderstandingArtifactCountsOut,
+        SystemUnderstandingBuildStepOut,
+        SystemUnderstandingLlmTaskSummaryOut,
+    )
+
+    return SystemUnderstandingBuildOut(
+        id=job["id"],
+        job_id=job["job_id"],
+        run_id=job["run_id"],
+        system_id=job["system_id"],
+        snapshot_id=job["snapshot_id"],
+        status=job["status"],
+        current_step=job["current_step"],
+        error=job["error"],
+        cancel_requested=job["cancel_requested"],
+        is_stuck=job["is_stuck"],
+        heartbeat_at=job["heartbeat_at"],
+        started_at=job["started_at"],
+        completed_at=job["completed_at"],
+        created_at=job["created_at"],
+        steps=[SystemUnderstandingBuildStepOut(**s) for s in job["steps"]],
+        llm_tasks=SystemUnderstandingLlmTaskSummaryOut(**job["llm_tasks"]),
+        artifact_counts=SystemUnderstandingArtifactCountsOut(**job["artifact_counts"]),
+    )
+
+
+def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
+    from ..models import (
+        SystemUnderstandingOut,
+        SystemUnderstandingPipelineStepOut,
+        SystemUnderstandingNextActionOut,
+        SystemUnderstandingGapSummaryOut,
+        SystemUnderstandingMetadataCoverageOut,
+        SystemUnderstandingCapabilitySummaryOut,
+        SystemUnderstandingEntrypointSummaryOut,
+        SystemUnderstandingSymbolSummaryOut,
+        SystemUnderstandingPurposeOut,
+        SystemUnderstandingGapOut,
+        SystemUnderstandingGapNextActionOut,
+        SystemUnderstandingGapDocRef,
+        SystemUnderstandingGapSymbolRef,
+        SystemUnderstandingGapEntrypointRef,
+        IssueDraftRefOut,
+    )
+    pipeline = [
+        SystemUnderstandingPipelineStepOut(step=s.step, status=s.status, detail=s.detail)
+        for s in summary.pipeline
+    ]
+    purpose = None
+    if summary.purpose:
+        purpose = SystemUnderstandingPurposeOut(**summary.purpose)
+    capabilities = [
+        SystemUnderstandingCapabilitySummaryOut(**c) for c in summary.capabilities
+    ]
+    entrypoints = [
+        SystemUnderstandingEntrypointSummaryOut(**e) for e in summary.entrypoints
+    ]
+    major_symbols = [
+        SystemUnderstandingSymbolSummaryOut(**s) for s in summary.major_symbols
+    ]
+    gaps = [
+        SystemUnderstandingGapOut(
+            gap_type=g.get("gap_type"),
+            severity=g.get("severity", "info"),
+            title=g.get("title"),
+            node_name=g.get("node_name"),
+            notes=g.get("notes"),
+            capability_key=g.get("capability_key"),
+            doc_refs=[SystemUnderstandingGapDocRef(**dr) for dr in g.get("doc_refs", [])],
+            symbol_refs=[SystemUnderstandingGapSymbolRef(**sr) for sr in g.get("symbol_refs", [])],
+            entrypoint_refs=[SystemUnderstandingGapEntrypointRef(**er) for er in g.get("entrypoint_refs", [])],
+            code_refs=g.get("code_refs", []),
+            next_actions=[SystemUnderstandingGapNextActionOut(**na) for na in g.get("next_actions", [])],
+            source_id=g.get("source_id"),
+            source_key=g.get("source_key"),
+            issue_drafts=[IssueDraftRefOut(**d) for d in g.get("issue_drafts", [])],
+        )
+        for g in summary.gaps
+    ]
+    gap_summary = [
+        SystemUnderstandingGapSummaryOut(gap_type=gs.gap_type, count=gs.count)
+        for gs in summary.gap_summary
+    ]
+    metadata_coverage = None
+    if summary.metadata_coverage:
+        mc = summary.metadata_coverage
+        metadata_coverage = SystemUnderstandingMetadataCoverageOut(
+            symbol_count=mc.symbol_count,
+            symbols_with_source_metadata=mc.symbols_with_source_metadata,
+            entrypoint_count=mc.entrypoint_count,
+            entrypoints_with_capability_link=mc.entrypoints_with_capability_link,
+        )
+    next_actions = [
+        SystemUnderstandingNextActionOut(action=a.action, reason=a.reason, link=a.link)
+        for a in summary.next_actions
+    ]
+    return SystemUnderstandingOut(
+        system_id=summary.system_id,
+        snapshot_id=summary.snapshot_id,
+        commit_sha=summary.commit_sha,
+        pipeline=pipeline,
+        purpose=purpose,
+        capabilities=capabilities,
+        entrypoints=entrypoints,
+        major_symbols=major_symbols,
+        gaps=gaps,
+        gap_summary=gap_summary,
+        metadata_coverage=metadata_coverage,
+        next_actions=next_actions,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Repository configuration
 # ---------------------------------------------------------------------------
 
@@ -221,6 +780,17 @@ def put_repository_config(
     payload: RepositoryConfigUpdate,
     system_id: int = Depends(get_system_id),
 ) -> RepositoryConfigOut:
+    """Create or update repository configuration for a system.
+
+    probe-agent:
+      role: API boundary for persisting repository configuration
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: write
+      state_effects: [database-write, filesystem]
+      probe_value: verify upsert semantics and pattern validation
+    """
     now = time.time()
     include_json = json.dumps(payload.include_patterns)
     exclude_json = json.dumps(payload.exclude_patterns)
@@ -306,6 +876,17 @@ def _snapshot_out(conn, snapshot_row, include_files: bool = False) -> SnapshotOu
 def create_snapshot_endpoint(
     system_id: int = Depends(get_system_id),
 ) -> SnapshotOut:
+    """Create a new repository snapshot from the configured repository.
+
+    probe-agent:
+      role: API boundary for creating repository snapshots
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: write
+      state_effects: [database-write, filesystem]
+      probe_value: verify snapshot captures committed files at pinned SHA
+    """
     with get_conn() as conn:
         config_row = conn.execute(
             "SELECT * FROM repository_configs WHERE system_id = ?", (system_id,)
@@ -552,6 +1133,17 @@ def _feature_draft_out(conn, row) -> FeatureDraftOut:
 def generate_drafts_endpoint(
     system_id: int = Depends(get_system_id),
 ) -> DraftGenerationResult:
+    """Generate system profile and feature drafts via reasoning model.
+
+    probe-agent:
+      role: API boundary for orchestrating draft generation
+      capability: documentation-understanding
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: orchestration
+      state_effects: [database-write, external-api]
+      probe_value: verify reasoning model is called and drafts are persisted with run metadata
+    """
     with get_conn() as conn:
         snapshot_row = conn.execute(
             """
@@ -605,24 +1197,7 @@ def generate_drafts_endpoint(
             )
         )
 
-    llm_config = LLMConfig.from_env()
-    intelligence_provider = os.getenv("INTELLIGENCE_LLM_PROVIDER", "").strip()
-    intelligence_model = os.getenv("INTELLIGENCE_LLM_MODEL", "").strip()
-    if intelligence_provider or intelligence_model:
-        llm_config = replace(
-            llm_config,
-            provider=intelligence_provider or llm_config.provider,
-            model=intelligence_model or llm_config.model,
-        )
-    try:
-        intelligence_timeout = float(os.getenv("INTELLIGENCE_LLM_TIMEOUT", "120"))
-    except ValueError:
-        intelligence_timeout = 120.0
-    if llm_config.provider != "mock":
-        llm_config = replace(
-            llm_config,
-            timeout=max(llm_config.timeout, intelligence_timeout),
-        )
+    llm_config = _resolve_intelligence_config()
 
     started_at = time.time()
     try:
@@ -797,6 +1372,17 @@ def generate_drafts_endpoint(
 def get_latest_drafts(
     system_id: int = Depends(get_system_id),
 ) -> LatestDraftsOut:
+    """Retrieve the latest generated drafts for system profile and features.
+
+    probe-agent:
+      role: API boundary for fetching latest draft generation results
+      capability: documentation-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: verify latest drafts and associated intelligence run are returned
+    """
     with get_conn() as conn:
         run_row = conn.execute(
             """
@@ -1166,6 +1752,17 @@ def _symbol_out(
 def index_symbols_endpoint(
     system_id: int = Depends(get_system_id),
 ) -> SymbolIndexOut:
+    """Index code symbols from the latest snapshot using AST analysis.
+
+    probe-agent:
+      role: API boundary for orchestrating symbol indexing
+      capability: code-intelligence
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: orchestration
+      state_effects: [database-write]
+      probe_value: verify AST symbols are extracted and persisted from snapshot files
+    """
     with get_conn() as conn:
         snapshot_row = conn.execute(
             """
@@ -1376,6 +1973,17 @@ def index_symbols_endpoint(
 def get_symbols(
     system_id: int = Depends(get_system_id),
 ) -> SymbolIndexOut:
+    """Retrieve indexed code symbols for the latest snapshot.
+
+    probe-agent:
+      role: API boundary for fetching persisted code symbols
+      capability: code-intelligence
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: verify symbols match the latest snapshot and include warnings
+    """
     with get_conn() as conn:
         snapshot_row = conn.execute(
             """
@@ -1641,7 +2249,13 @@ def _apply_grouping_assignments(built, grouping):
     ]
 
 
-def _provenance_out(row) -> HierarchyProvenanceOut:
+def _provenance_out(row, logical_by_dbid=None) -> HierarchyProvenanceOut:
+    entrypoint_type = None
+    entrypoint_ref = None
+    if logical_by_dbid is not None and row["entrypoint_id"] is not None:
+        logical = logical_by_dbid.get(row["entrypoint_id"])
+        if logical is not None:
+            entrypoint_type, entrypoint_ref = logical
     return HierarchyProvenanceOut(
         provenance_kind=row["provenance_kind"],
         decision_method=row["decision_method"],
@@ -1654,6 +2268,8 @@ def _provenance_out(row) -> HierarchyProvenanceOut:
         explanation_hash=row["explanation_hash"],
         symbol_id=row["symbol_id"],
         entrypoint_id=row["entrypoint_id"],
+        entrypoint_type=entrypoint_type,
+        entrypoint_ref=entrypoint_ref,
         feature_id=row["feature_id"],
         system_profile_draft_id=row["system_profile_draft_id"],
         provider=row["provider"],
@@ -1661,7 +2277,7 @@ def _provenance_out(row) -> HierarchyProvenanceOut:
     )
 
 
-def _element_out(row) -> CapabilityElementOut:
+def _element_out(row, logical_by_dbid=None) -> CapabilityElementOut:
     return CapabilityElementOut(
         id=row["id"],
         name=row["name"],
@@ -1670,18 +2286,33 @@ def _element_out(row) -> CapabilityElementOut:
         operation_kind=row["operation_kind"],
         probe_value=row["probe_value"],
         classification=row["classification"],
-        provenance=_provenance_out(row),
+        provenance=_provenance_out(row, logical_by_dbid),
     )
 
 
-def _supporting_out(row) -> SupportingElementOut:
+def _supporting_out(row, logical_by_dbid=None) -> SupportingElementOut:
     return SupportingElementOut(
         id=row["id"],
         name=row["name"],
         summary=row["summary"],
         supporting_kind=row["supporting_kind"],
-        provenance=_provenance_out(row),
+        provenance=_provenance_out(row, logical_by_dbid),
     )
+
+
+def _logical_entrypoint_map(conn, snapshot_id, system_id) -> dict:
+    """Map a snapshot's code_entrypoints DB row id -> logical (type, id).
+
+    Persisted hierarchy nodes store the snapshot-local DB row id, which is not
+    stable across snapshots. The logical pair lets the dashboard link a node to
+    Flow Explorer (#62) without re-resolving the DB id.
+    """
+    rows = conn.execute(
+        "SELECT id, entrypoint_type, entrypoint_id FROM code_entrypoints "
+        "WHERE snapshot_id = ? AND system_id = ?",
+        (snapshot_id, system_id),
+    ).fetchall()
+    return {r["id"]: (r["entrypoint_type"], r["entrypoint_id"]) for r in rows}
 
 
 def _load_hierarchy_out(conn, system_id, snapshot_id, run_row) -> CapabilityHierarchyOut:
@@ -1690,6 +2321,7 @@ def _load_hierarchy_out(conn, system_id, snapshot_id, run_row) -> CapabilityHier
         "ORDER BY id",
         (run_row["id"],),
     ).fetchall()
+    logical_by_dbid = _logical_entrypoint_map(conn, run_row["snapshot_id"], system_id)
     by_parent: dict = {}
     purpose_row = None
     capability_rows = []
@@ -1714,10 +2346,14 @@ def _load_hierarchy_out(conn, system_id, snapshot_id, run_row) -> CapabilityHier
             capability_key=cap["capability_key"],
             name=cap["name"],
             summary=cap["summary"],
-            provenance=_provenance_out(cap),
-            elements=[_element_out(c) for c in children if c["node_type"] == "element"],
+            provenance=_provenance_out(cap, logical_by_dbid),
+            elements=[
+                _element_out(c, logical_by_dbid)
+                for c in children if c["node_type"] == "element"
+            ],
             supporting_elements=[
-                _supporting_out(c) for c in children if c["node_type"] == "supporting"
+                _supporting_out(c, logical_by_dbid)
+                for c in children if c["node_type"] == "supporting"
             ],
         ))
 
@@ -1727,7 +2363,7 @@ def _load_hierarchy_out(conn, system_id, snapshot_id, run_row) -> CapabilityHier
             id=purpose_row["id"],
             name=purpose_row["name"],
             summary=purpose_row["summary"],
-            provenance=_provenance_out(purpose_row),
+            provenance=_provenance_out(purpose_row, logical_by_dbid),
         )
 
     return CapabilityHierarchyOut(
@@ -1736,8 +2372,12 @@ def _load_hierarchy_out(conn, system_id, snapshot_id, run_row) -> CapabilityHier
         intelligence_run=_intelligence_run_out(run_row),
         purpose=purpose,
         capabilities=capabilities,
-        unclassified_elements=[_element_out(r) for r in unclassified_rows],
-        unattached_supporting=[_supporting_out(r) for r in unattached_supporting_rows],
+        unclassified_elements=[
+            _element_out(r, logical_by_dbid) for r in unclassified_rows
+        ],
+        unattached_supporting=[
+            _supporting_out(r, logical_by_dbid) for r in unattached_supporting_rows
+        ],
         is_mock=bool(run_row["is_mock"]),
     )
 
@@ -1756,6 +2396,17 @@ def generate_capability_hierarchy(
     ),
     system_id: int = Depends(get_system_id),
 ) -> CapabilityHierarchyOut:
+    """Generate capability hierarchy from source-authored and discovered entrypoints.
+
+    probe-agent:
+      role: API boundary for orchestrating capability hierarchy generation
+      capability: capability-mapping
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: orchestration
+      state_effects: [database-write, external-api]
+      probe_value: verify source-authored capabilities are preserved and reasoning grouping is persisted
+    """
     # Deterministic structural inputs (committed snapshot only).
     snapshot_row, flow_symbols, files = _load_flow_inputs(system_id)
     snapshot_id = snapshot_row["id"]
@@ -1884,6 +2535,17 @@ def generate_capability_hierarchy(
 def get_capability_hierarchy(
     system_id: int = Depends(get_system_id),
 ) -> CapabilityHierarchyOut:
+    """Retrieve the persisted capability hierarchy.
+
+    probe-agent:
+      role: API boundary for fetching persisted capability hierarchy
+      capability: capability-mapping
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: verify hierarchy reflects latest generation run
+    """
     with get_conn() as conn:
         snapshot_row = conn.execute(
             """
@@ -2192,6 +2854,15 @@ def get_api_role_cards(
     place in the capability hierarchy (#56), and explanation drift (#57) into a
     developer-facing card. Invents no new hierarchy semantics; degrades to a
     clear unclassified/unknown state when context is missing.
+
+    probe-agent:
+      role: API boundary for fetching entrypoint role cards
+      capability: entrypoint-discovery
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: verify role cards aggregate hierarchy, explanation, and drift status
     """
     with get_conn() as conn:
         snapshot_row = _latest_ready_snapshot(conn, system_id)
@@ -2510,6 +3181,15 @@ def create_explanation_refresh(
     proposal is a SUGGESTION only: probe-agent never edits the target source
     repository. Fails closed (no heuristic fallback) for mock/non-reasoning
     models, persisting the failed run so it is visible.
+
+    probe-agent:
+      role: API boundary for proposing explanation refresh via reasoning model
+      capability: capability-mapping
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: write
+      state_effects: [database-write, external-api]
+      probe_value: verify refresh proposal is persisted and reasoning run metadata is recorded
     """
     if payload.node_id is None and not (
         payload.entrypoint_type and payload.entrypoint_id
@@ -2879,6 +3559,17 @@ def _link_out(conn, row) -> FeatureCodeLinkOut:
 def generate_code_links_endpoint(
     system_id: int = Depends(get_system_id),
 ) -> FeatureCodeLinksOut:
+    """Generate feature-to-code links using reasoning model.
+
+    probe-agent:
+      role: API boundary for orchestrating feature-to-code link generation
+      capability: code-intelligence
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: orchestration
+      state_effects: [database-write, external-api]
+      probe_value: verify code links are generated and persisted with reasoning run metadata
+    """
     with get_conn() as conn:
         snapshot_row = conn.execute(
             """
@@ -2978,15 +3669,7 @@ def generate_code_links_endpoint(
             component_id=sr["component_id"],
         ))
 
-    llm_config = LLMConfig.from_env()
-    intelligence_provider = os.getenv("INTELLIGENCE_LLM_PROVIDER", "").strip()
-    intelligence_model = os.getenv("INTELLIGENCE_LLM_MODEL", "").strip()
-    if intelligence_provider or intelligence_model:
-        llm_config = replace(
-            llm_config,
-            provider=intelligence_provider or llm_config.provider,
-            model=intelligence_model or llm_config.model,
-        )
+    llm_config = _resolve_intelligence_config()
 
     started_at = time.time()
     try:
@@ -3244,6 +3927,17 @@ def generate_probe_plan_endpoint(
     objective: str = "",
     system_id: int = Depends(get_system_id),
 ) -> ProbePlanOut:
+    """Generate a probe plan for a feature using reasoning model.
+
+    probe-agent:
+      role: API boundary for orchestrating probe plan generation
+      capability: probe-planning
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: orchestration
+      state_effects: [database-write, external-api]
+      probe_value: verify probe plan is generated with probe points and reasoning metadata
+    """
     from ..probe_planner import AcceptedLink, generate_probe_plan
     from ..probe_planner import PROMPT_VERSION as PLAN_PROMPT_VERSION
     from ..probe_planner import SCHEMA_VERSION as PLAN_SCHEMA_VERSION
@@ -3312,15 +4006,7 @@ def generate_probe_plan_endpoint(
             relation_reason=lr["relation_reason"],
         ))
 
-    llm_config = LLMConfig.from_env()
-    intelligence_provider = os.getenv("INTELLIGENCE_LLM_PROVIDER", "").strip()
-    intelligence_model = os.getenv("INTELLIGENCE_LLM_MODEL", "").strip()
-    if intelligence_provider or intelligence_model:
-        llm_config = replace(
-            llm_config,
-            provider=intelligence_provider or llm_config.provider,
-            model=intelligence_model or llm_config.model,
-        )
+    llm_config = _resolve_intelligence_config()
 
     started_at = time.time()
     try:
@@ -3385,8 +4071,8 @@ def generate_probe_plan_endpoint(
             cur = conn.execute(
                 """INSERT INTO probe_plans
                        (system_id, snapshot_id, intelligence_run_id,
-                        feature_id, objective, status, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        feature_id, objective, status, origin, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'feature_map', ?, ?)""",
                 (
                     system_id, snapshot_id, run_id,
                     feature_id, plan_result.objective,
@@ -3437,6 +4123,17 @@ def generate_probe_plan_endpoint(
 def get_probe_plans(
     system_id: int = Depends(get_system_id),
 ) -> ProbePlansListOut:
+    """List all probe plans for the current system.
+
+    probe-agent:
+      role: API boundary for listing persisted probe plans
+      capability: probe-planning
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: verify all plans for the system are returned in descending order
+    """
     with get_conn() as conn:
         plan_rows = conn.execute(
             "SELECT * FROM probe_plans WHERE system_id = ? ORDER BY id DESC",
@@ -3778,6 +4475,15 @@ def list_flow_entrypoints(
     (``include_functions`` or ``category=function``). ``counts`` and
     ``diagnostics`` let the UI explain thin discovery instead of dumping the raw
     function index.
+
+    probe-agent:
+      role: API boundary for listing backend entrypoints
+      capability: execution-flow-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: verify entrypoint categories and filtering behave correctly
     """
     from ..flow_graph import category_for_type
 
@@ -3861,18 +4567,9 @@ def _load_scan_files(system_id: int, expected_snapshot_id=None, expected_commit_
     return snapshot_row, files
 
 
-def _resolve_intelligence_config():
-    """Return an LLMConfig with the intelligence-model override applied."""
-    llm_config = LLMConfig.from_env()
-    provider = os.getenv("INTELLIGENCE_LLM_PROVIDER", "").strip()
-    model = os.getenv("INTELLIGENCE_LLM_MODEL", "").strip()
-    if provider or model:
-        llm_config = replace(
-            llm_config,
-            provider=provider or llm_config.provider,
-            model=model or llm_config.model,
-        )
-    return llm_config
+def _resolve_intelligence_config() -> LLMConfig:
+    """Return the intelligence-model LLMConfig (provider-matched API key)."""
+    return LLMConfig.intelligence_from_env()
 
 
 def _snapshot_config_stale_reason(system_id: int, snapshot_row) -> Optional[str]:
@@ -4309,6 +5006,17 @@ def build_flow_graph_endpoint(
     payload: FlowGraphRequest,
     system_id: int = Depends(get_system_id),
 ) -> FlowGraphOut:
+    """Build a flow graph from a selected entrypoint.
+
+    probe-agent:
+      role: API boundary for building execution flow graphs
+      capability: execution-flow-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: orchestration
+      state_effects: [database-read]
+      probe_value: verify flow graph nodes and edges are constructed from entrypoint
+    """
     from ..entrypoint_discovery import discover_entrypoints
     from ..flow_graph import build_flow_graph
 
@@ -4374,6 +5082,15 @@ def create_probe_plan_from_flow(
 
     This is an explicit, user-driven selection (decision_method=manual). It
     only records a draft; it does not generate, apply, or run any patch.
+
+    probe-agent:
+      role: API boundary for creating probe plans from flow node selection
+      capability: probe-planning
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: write
+      state_effects: [database-write]
+      probe_value: verify manual probe plan draft is persisted with selected flow nodes
     """
     from ..entrypoint_discovery import discover_entrypoints
     from ..flow_graph import (
@@ -4496,8 +5213,8 @@ def create_probe_plan_from_flow(
             cur = conn.execute(
                 """INSERT INTO probe_plans
                        (system_id, snapshot_id, intelligence_run_id,
-                        feature_id, objective, status, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, 'proposed', ?, ?)""",
+                        feature_id, objective, status, origin, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'proposed', 'flow_explorer', ?, ?)""",
                 (
                     system_id, snapshot_id, run_id, feature_id,
                     payload.objective.strip(), now, now,
@@ -4553,6 +5270,17 @@ def generate_patch_endpoint(
     plan_id: int,
     system_id: int = Depends(get_system_id),
 ) -> ProbePatchOut:
+    """Generate an instrumentation patch from an approved probe plan.
+
+    probe-agent:
+      role: API boundary for orchestrating instrumentation patch generation
+      capability: probe-planning
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: orchestration
+      state_effects: [database-write, external-api]
+      probe_value: verify patch is generated from approved probe points and persisted
+    """
     from ..patch_generator import ApprovedPoint, generate_patch
 
     with get_conn() as conn:

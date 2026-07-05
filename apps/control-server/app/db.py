@@ -646,6 +646,7 @@ CREATE TABLE IF NOT EXISTS probe_plans (
     feature_id           TEXT NOT NULL,
     objective            TEXT NOT NULL DEFAULT '',
     status               TEXT NOT NULL DEFAULT 'proposed',
+    origin               TEXT NOT NULL DEFAULT 'manual',
     created_at           REAL NOT NULL,
     updated_at           REAL NOT NULL,
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
@@ -942,6 +943,313 @@ CREATE TABLE IF NOT EXISTS workspace_proposal_drafts (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_proposal_drafts_proposal
     ON workspace_proposal_drafts (proposal_id);
+
+-- System-understanding interview persistence (Issue #67). This is the #35
+-- analogue for the #66 conversational metadata/probe authoring flow: a pure
+-- persistence + CRUD layer with no LLM calls and no worktree writes. A session
+-- is bound to one system and one pinned repository snapshot; messages are the
+-- ordered conversation turns; proposals are one row per proposed symbol holding
+-- both the proposed `probe-agent:` docstring metadata block (#54 vocabulary)
+-- and the associated probe-plan fields (#25 model). Reasoning-run audit
+-- metadata lives in the shared intelligence_runs store and is referenced from
+-- messages/proposals via intelligence_run_id rather than duplicated here.
+CREATE TABLE IF NOT EXISTS interview_session (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id            INTEGER NOT NULL,
+    snapshot_id          INTEGER NOT NULL,
+    title                TEXT NOT NULL DEFAULT '',
+    focus                TEXT NOT NULL DEFAULT '',
+    status               TEXT NOT NULL DEFAULT 'open',
+    stage                TEXT NOT NULL DEFAULT 'understanding_initialized',
+    current_understanding TEXT,
+    gap_analysis         TEXT,
+    open_questions       TEXT,
+    user_intent          TEXT,
+    last_error           TEXT,
+    materialization_diff TEXT,
+    materialization_ref  TEXT,
+    materialized_at      REAL,
+    created_at           REAL NOT NULL,
+    updated_at           REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_interview_session_system
+    ON interview_session (system_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS interview_message (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id          INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    role                TEXT NOT NULL,
+    content             TEXT NOT NULL,
+    intelligence_run_id INTEGER,
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_interview_message_session
+    ON interview_message (session_id, id);
+
+CREATE TABLE IF NOT EXISTS interview_proposal (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id          INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    snapshot_id         INTEGER NOT NULL,
+    message_id          INTEGER,
+    intelligence_run_id INTEGER NOT NULL,
+    symbol_id           INTEGER,
+    path                TEXT NOT NULL,
+    qualified_name      TEXT NOT NULL,
+    -- #54 docstring metadata block: free-text fields.
+    md_role             TEXT,
+    md_capability       TEXT,
+    md_system_purpose   TEXT,
+    md_probe_value      TEXT,
+    -- #54 docstring metadata block: finite-vocabulary fields (validated in API).
+    md_element_type     TEXT,
+    md_operation_kind   TEXT,
+    md_consumers        TEXT NOT NULL DEFAULT '[]',
+    md_state_effects    TEXT NOT NULL DEFAULT '[]',
+    -- #25 probe-plan fields for the same symbol.
+    feature_id          TEXT NOT NULL DEFAULT '',
+    objective           TEXT NOT NULL DEFAULT '',
+    probe_reason        TEXT NOT NULL DEFAULT '',
+    recommended_mode    TEXT NOT NULL DEFAULT 'trace',
+    side_effect_risk    TEXT NOT NULL DEFAULT 'low',
+    replayability       TEXT NOT NULL DEFAULT 'safe',
+    -- Provenance: link to understanding graph node and capability scope.
+    graph_node_id       TEXT,
+    capability_name     TEXT,
+    evidence_summary    TEXT,
+    proposal_confidence REAL,
+    -- Audit + per-item approval. decision_method is the Principle 7 enum;
+    -- newly stored proposals are reasoning_llm (this issue never sets manual).
+    decision_method     TEXT NOT NULL DEFAULT 'reasoning_llm',
+    approval_state      TEXT NOT NULL DEFAULT 'proposed',
+    is_mock             INTEGER NOT NULL DEFAULT 0,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (message_id) REFERENCES interview_message (id) ON DELETE SET NULL,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE CASCADE,
+    FOREIGN KEY (symbol_id) REFERENCES code_symbols (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_interview_proposal_session
+    ON interview_proposal (session_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_interview_proposal_system
+    ON interview_proposal (system_id, session_id);
+
+-- Issue #70: per-item approval gate with manual decision record.
+-- Each decision is a separate row that references — but does not overwrite —
+-- the original reasoning_llm proposal. For edits, the developer-corrected
+-- metadata and probe-plan values are stored here. decision_method is always
+-- 'manual' for rows in this table.
+CREATE TABLE IF NOT EXISTS interview_proposal_decision (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id         INTEGER NOT NULL,
+    session_id          INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    decision            TEXT NOT NULL,
+    decision_method     TEXT NOT NULL DEFAULT 'manual',
+    actor               TEXT NOT NULL DEFAULT '',
+    -- Edited metadata (populated only for decision='edited').
+    edited_md_role             TEXT,
+    edited_md_capability       TEXT,
+    edited_md_system_purpose   TEXT,
+    edited_md_probe_value      TEXT,
+    edited_md_element_type     TEXT,
+    edited_md_operation_kind   TEXT,
+    edited_md_consumers        TEXT,
+    edited_md_state_effects    TEXT,
+    -- Edited probe-plan (populated only for decision='edited').
+    edited_feature_id          TEXT,
+    edited_objective           TEXT,
+    edited_probe_reason        TEXT,
+    edited_recommended_mode    TEXT,
+    edited_side_effect_risk    TEXT,
+    edited_replayability       TEXT,
+    -- Denylist re-check result for edits.
+    denylist_hit        TEXT,
+    decided_at          REAL NOT NULL,
+    FOREIGN KEY (proposal_id) REFERENCES interview_proposal (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_interview_proposal_decision_proposal
+    ON interview_proposal_decision (proposal_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_interview_proposal_decision_session
+    ON interview_proposal_decision (session_id);
+
+-- Understanding graph snapshots (Issue #79). Persists merged documentation
+-- claim graphs for a system. Each snapshot records the full graph JSON,
+-- source hash, claim count, and confidence summary.
+CREATE TABLE IF NOT EXISTS understanding_graph_snapshots (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    snapshot_id         INTEGER,
+    graph_json          TEXT NOT NULL,
+    source_hash         TEXT NOT NULL DEFAULT '',
+    claim_count         INTEGER NOT NULL DEFAULT 0,
+    confidence_summary  TEXT NOT NULL DEFAULT '{}',
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_graph_system
+    ON understanding_graph_snapshots (system_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS system_understanding_builds (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    snapshot_id       INTEGER,
+    status            TEXT NOT NULL DEFAULT 'queued',
+    current_step      TEXT,
+    error             TEXT,
+    cancel_requested  INTEGER NOT NULL DEFAULT 0,
+    heartbeat_at      REAL,
+    started_at        REAL,
+    completed_at      REAL,
+    created_at        REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_builds_system
+    ON system_understanding_builds (system_id, id DESC);
+
+-- Step-level orchestration for System Understanding builds (Issue #109).
+-- One row per (build, step). Deterministic status vocabulary:
+-- pending / running / completed / failed / blocked / cancelled.
+-- artifact_provenance stores deterministic facts about what the step
+-- produced or reused (intelligence_run_id, row counts, graph snapshot id).
+CREATE TABLE IF NOT EXISTS system_understanding_build_steps (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    build_id          INTEGER NOT NULL,
+    system_id         INTEGER NOT NULL,
+    snapshot_id       INTEGER,
+    step              TEXT NOT NULL,
+    depends_on        TEXT NOT NULL DEFAULT '[]',
+    status            TEXT NOT NULL DEFAULT 'pending',
+    reused_existing   INTEGER NOT NULL DEFAULT 0,
+    cancel_requested  INTEGER NOT NULL DEFAULT 0,
+    error             TEXT,
+    artifact_provenance TEXT NOT NULL DEFAULT '{}',
+    heartbeat_at      REAL,
+    started_at        REAL,
+    completed_at      REAL,
+    created_at        REAL NOT NULL,
+    FOREIGN KEY (build_id) REFERENCES system_understanding_builds (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL,
+    UNIQUE (build_id, step)
+);
+
+-- One row per worker execution of a build job (Issue #109): the initial
+-- enqueue and every retry/resume each get their own run. The run id is the
+-- externally referenceable identifier returned by the build endpoint next to
+-- the job id; its status mirrors the job outcome for that execution.
+CREATE TABLE IF NOT EXISTS system_understanding_build_runs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    build_id      INTEGER NOT NULL,
+    system_id     INTEGER NOT NULL,
+    trigger       TEXT NOT NULL DEFAULT 'build',
+    status        TEXT NOT NULL DEFAULT 'running',
+    started_at    REAL,
+    completed_at  REAL,
+    created_at    REAL NOT NULL,
+    FOREIGN KEY (build_id) REFERENCES system_understanding_builds (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_build_runs_build
+    ON system_understanding_build_runs (build_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_build_steps_build
+    ON system_understanding_build_steps (build_id);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_build_steps_system
+    ON system_understanding_build_steps (system_id, id DESC);
+
+-- Chunk-level LLM tasks for the claim_scan step (Issue #109). Each row is one
+-- documentation chunk scan with unified retry/backoff accounting. Completed
+-- results are kept (result_json) so a retry only re-scans failed chunks and a
+-- later build for the same snapshot can reuse results by content hash.
+CREATE TABLE IF NOT EXISTS system_understanding_llm_tasks (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    build_id           INTEGER NOT NULL,
+    step_id            INTEGER NOT NULL,
+    system_id          INTEGER NOT NULL,
+    snapshot_id        INTEGER,
+    task_type          TEXT NOT NULL DEFAULT 'claim_scan_chunk',
+    chunk_id           TEXT NOT NULL,
+    chunk_content_hash TEXT NOT NULL DEFAULT '',
+    chunk_path         TEXT NOT NULL DEFAULT '',
+    prompt_version     TEXT NOT NULL DEFAULT '',
+    schema_version     TEXT NOT NULL DEFAULT '',
+    status             TEXT NOT NULL DEFAULT 'pending',
+    attempts           INTEGER NOT NULL DEFAULT 0,
+    max_attempts       INTEGER NOT NULL DEFAULT 3,
+    reused_existing    INTEGER NOT NULL DEFAULT 0,
+    last_error         TEXT,
+    result_json        TEXT,
+    started_at         REAL,
+    completed_at       REAL,
+    created_at         REAL NOT NULL,
+    FOREIGN KEY (build_id) REFERENCES system_understanding_builds (id) ON DELETE CASCADE,
+    FOREIGN KEY (step_id) REFERENCES system_understanding_build_steps (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    UNIQUE (build_id, chunk_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_llm_tasks_build
+    ON system_understanding_llm_tasks (build_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_llm_tasks_system
+    ON system_understanding_llm_tasks (system_id, snapshot_id, chunk_content_hash);
+
+-- Issue drafts (Issue #107). probe-agent is the source of truth for issue
+-- drafts generated from System Understanding gaps (and, later, interviews /
+-- probe proposals). The draft body is a deterministic Markdown rendering of an
+-- already-derived gap (its title, evidence, and pinned snapshot), not an
+-- open-ended inference. External issue trackers are not integrated; the user
+-- registers the URL of an issue they created elsewhere. status vocabulary:
+-- draft / copied / external_created / closed / rejected.
+CREATE TABLE IF NOT EXISTS issue_drafts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id     INTEGER NOT NULL,
+    snapshot_id   INTEGER,
+    commit_sha    TEXT,
+    source_type   TEXT NOT NULL DEFAULT 'system_understanding_gap',
+    source_key    TEXT,
+    gap_type      TEXT,
+    severity      TEXT,
+    node_name     TEXT,
+    title         TEXT NOT NULL,
+    body_markdown TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'draft',
+    external_url  TEXT,
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_issue_drafts_system
+    ON issue_drafts (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_issue_drafts_source
+    ON issue_drafts (system_id, source_key);
 """
 
 
@@ -1222,6 +1530,110 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE code_entrypoints ADD COLUMN pattern_id INTEGER"
             )
+        session_cols = _columns(conn, "interview_session")
+        if "stage" not in session_cols:
+            conn.execute(
+                "ALTER TABLE interview_session ADD COLUMN stage TEXT NOT NULL DEFAULT 'understanding_initialized'"
+            )
+        if "current_understanding" not in session_cols:
+            conn.execute(
+                "ALTER TABLE interview_session ADD COLUMN current_understanding TEXT"
+            )
+        if "gap_analysis" not in session_cols:
+            conn.execute(
+                "ALTER TABLE interview_session ADD COLUMN gap_analysis TEXT"
+            )
+        if "open_questions" not in session_cols:
+            conn.execute(
+                "ALTER TABLE interview_session ADD COLUMN open_questions TEXT"
+            )
+        if "user_intent" not in session_cols:
+            conn.execute(
+                "ALTER TABLE interview_session ADD COLUMN user_intent TEXT"
+            )
+        session_cols = _columns(conn, "interview_session")
+        if "materialization_diff" not in session_cols:
+            conn.execute(
+                "ALTER TABLE interview_session ADD COLUMN materialization_diff TEXT"
+            )
+        if "materialization_ref" not in session_cols:
+            conn.execute(
+                "ALTER TABLE interview_session ADD COLUMN materialization_ref TEXT"
+            )
+        if "materialized_at" not in session_cols:
+            conn.execute(
+                "ALTER TABLE interview_session ADD COLUMN materialized_at REAL"
+            )
+        session_cols = _columns(conn, "interview_session")
+        if "last_error" not in session_cols:
+            conn.execute(
+                "ALTER TABLE interview_session ADD COLUMN last_error TEXT"
+            )
+        proposal_cols = _columns(conn, "interview_proposal")
+        if proposal_cols and "graph_node_id" not in proposal_cols:
+            conn.execute("ALTER TABLE interview_proposal ADD COLUMN graph_node_id TEXT")
+            conn.execute("ALTER TABLE interview_proposal ADD COLUMN capability_name TEXT")
+            conn.execute("ALTER TABLE interview_proposal ADD COLUMN evidence_summary TEXT")
+            conn.execute("ALTER TABLE interview_proposal ADD COLUMN proposal_confidence REAL")
+        plan_cols = _columns(conn, "probe_plans")
+        if plan_cols and "origin" not in plan_cols:
+            conn.execute(
+                "ALTER TABLE probe_plans ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'"
+            )
+        graph_cols = _columns(conn, "understanding_graph_snapshots")
+        if graph_cols and "snapshot_id" not in graph_cols:
+            conn.execute(
+                "ALTER TABLE understanding_graph_snapshots ADD COLUMN snapshot_id INTEGER"
+            )
+        build_cols = _columns(conn, "system_understanding_builds")
+        if "cancel_requested" not in build_cols:
+            conn.execute(
+                "ALTER TABLE system_understanding_builds "
+                "ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0"
+            )
+        if "heartbeat_at" not in build_cols:
+            conn.execute(
+                "ALTER TABLE system_understanding_builds ADD COLUMN heartbeat_at REAL"
+            )
+        # Builds left 'queued'/'running' by a previous process can never make
+        # progress after a restart (their worker thread is gone). Mark them
+        # failed with an explicit reason so they surface as retryable instead
+        # of appearing active forever.
+        conn.execute(
+            """UPDATE system_understanding_builds
+               SET status = 'failed',
+                   error = COALESCE(error, 'Interrupted by server restart'),
+                   completed_at = COALESCE(completed_at, ?)
+               WHERE status IN ('queued', 'running')""",
+            (time.time(),),
+        )
+        conn.execute(
+            """UPDATE system_understanding_build_steps
+               SET status = 'failed',
+                   error = COALESCE(error, 'Interrupted by server restart'),
+                   completed_at = COALESCE(completed_at, ?)
+               WHERE status = 'running'""",
+            (time.time(),),
+        )
+        conn.execute(
+            """UPDATE system_understanding_llm_tasks
+               SET status = 'failed',
+                   last_error = COALESCE(last_error, 'Interrupted by server restart'),
+                   completed_at = COALESCE(completed_at, ?)
+               WHERE status = 'running'""",
+            (time.time(),),
+        )
+        conn.execute(
+            """UPDATE system_understanding_build_runs
+               SET status = 'failed', completed_at = COALESCE(completed_at, ?)
+               WHERE status = 'running'""",
+            (time.time(),),
+        )
+        # Repair rows written with the out-of-contract 'success' status; the
+        # shared schema only allows 'pending' / 'completed' / 'failed'.
+        conn.execute(
+            "UPDATE intelligence_runs SET status = 'completed' WHERE status = 'success'"
+        )
         _ensure_legacy_system(conn)
     _bootstrap_admin()
 

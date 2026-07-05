@@ -7,7 +7,6 @@ import json
 import os
 import re
 import time
-from dataclasses import replace
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -374,15 +373,7 @@ def _store_analysis_failure(
 
 
 def _run_reasoning_analysis(experiment: ExperimentOut) -> None:
-    config = LLMConfig.from_env()
-    intelligence_provider = os.getenv("INTELLIGENCE_LLM_PROVIDER", "").strip()
-    intelligence_model = os.getenv("INTELLIGENCE_LLM_MODEL", "").strip()
-    if intelligence_provider or intelligence_model:
-        config = replace(
-            config,
-            provider=intelligence_provider or config.provider,
-            model=intelligence_model or config.model,
-        )
+    config = LLMConfig.intelligence_from_env()
     if config.provider == "mock" or not is_reasoning_model(config.provider, config.model):
         _store_analysis_failure(
             experiment.id,

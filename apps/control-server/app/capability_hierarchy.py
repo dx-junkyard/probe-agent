@@ -15,6 +15,15 @@ API entrypoints is delegated to a reasoning model, which fails closed (no
 heuristic fallback). Every node records its provenance kind so source-authored
 explanation, deterministic structural fact, and reasoning interpretation stay
 visibly separate.
+
+probe-agent:
+  role: Source-backed capability hierarchy builder
+  capability: capability-mapping
+  element_type: core
+  consumers: [system-understanding, dashboard]
+  operation_kind: analysis
+  state_effects: [external-api]
+  probe_value: Verify that source-authored metadata groups symbols deterministically and unclassified entrypoints require reasoning model.
 """
 
 from __future__ import annotations

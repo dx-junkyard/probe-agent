@@ -12,6 +12,15 @@ Design constraints (see CLAUDE.md / docs/project-intelligence.md):
 - Node/edge ordering and identifiers are stable regardless of input order so
   the same snapshot always yields the same graph.
 - No LLM inference happens here. Summaries/titles are deterministic.
+
+probe-agent:
+  role: Deterministic execution-flow graph builder
+  capability: execution-flow-understanding
+  element_type: core
+  consumers: [dashboard, probe-planning]
+  operation_kind: analysis
+  state_effects: [none]
+  probe_value: Verify that identical snapshots produce identical flow graphs with stable node/edge IDs.
 """
 
 from __future__ import annotations

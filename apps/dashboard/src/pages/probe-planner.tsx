@@ -116,6 +116,11 @@ export default function ProbePlannerPage() {
                         <Badge variant={plan.status === "approved" ? "success" : plan.status === "rejected" ? "destructive" : "secondary"}>
                           {plan.status}
                         </Badge>
+                        {plan.origin && plan.origin !== "manual" && (
+                          <Badge variant="outline" className="text-[10px]">
+                            {plan.origin.replace("_", " ")}
+                          </Badge>
+                        )}
                       </CardTitle>
                       <CardDescription className="mt-1">{plan.objective}</CardDescription>
                     </div>

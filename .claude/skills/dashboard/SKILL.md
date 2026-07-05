@@ -35,6 +35,41 @@ The dashboard should support:
   accept/reject with a required reason. There is no "defer" decision or
   proposal-edit action in the API (Issue #35 only exposes accept/reject); do
   not add UI controls for actions the API does not support.
+- System settings diagnostics (Issue #101): a header alert badge
+  (`components/diagnostics-badge.tsx`) fed by `GET /system-diagnostics`.
+  The badge count is error+blocked+warning checks; clicking opens a dialog
+  showing each check's detail, impact, remediation, related env vars, and
+  the verbatim last observed run error. The System Understanding page shows
+  a "Why?" button on missing/blocked pipeline rows that expands the related
+  diagnostics. Diagnostics are deterministic server output — never decorate
+  them with client-side heuristic explanations.
+  Issue #115: the dialog text is Japanese and each problem is clickable.
+  A `fix_kind: navigate` check routes to `fix_page?diagnostic=<id>&fix=<anchor>`
+  and closes the dialog; a `fix_kind: dialog` check opens an env-var
+  remediation dialog (which env vars, plus restart/re-run steps). Target
+  pages render a `diag-anchor` on the fix control and an inline
+  `DiagnosticFixCallout` (`components/diagnostic-fix.tsx`) that highlights the
+  control and shows 原因 / 次の操作 verbatim from the diagnostic — no
+  client-side interpretation.
+- Per-screen assistant (Issue #102): a floating agent button rendered by the
+  app layout on every page (`components/assistant-panel.tsx`). It opens a
+  right-side panel showing the screen's purpose, the current diagnostics
+  state for that screen, suggested questions (failing checks first), a
+  free-text question box, and answers from `POST /assistant/ask`. Answers
+  must render `used_fallback` and decision method visibly, list citations
+  (settings, diagnostics checks, pipeline steps) and suggested actions;
+  navigate actions use client-side routing. The screen id sent to the API is
+  the route's first path segment (`/` → `overview`). The panel must not
+  block or overlap primary page actions when closed.
+- System Understanding build job polling (Issue #109): Build / Refresh
+  triggers an async job and the page polls `/repository/system-understanding/
+  build/latest` (2s while queued/running). The job panel
+  (`pages/system-understanding.tsx` `BuildJobPanel`) must show per-step
+  status/duration/error, claim-scan chunk progress, artifact counts, a
+  `stuck` badge when `is_stuck`, and cancel (job/step) plus retry (job/step)
+  actions. Never block the mutation waiting for completion, never offer
+  retry on a completed step, and rely on the server-persisted job so a
+  browser reload restores the active/last job state.
 
 ## Authentication model
 

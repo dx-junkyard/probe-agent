@@ -40,6 +40,68 @@ mapping, planning, and interpretation must call a reasoning model through the
 provider-neutral LLM layer. Do not reuse `app/evaluator.py` as a heuristic
 fallback for intelligence work.
 
+## System settings diagnostics (issue #101)
+
+- `GET /system-diagnostics` (`app/system_diagnostics.py`, `routes/diagnostics.py`)
+  returns deterministic, LLM-free health checks for required configuration:
+  env presence, enum membership, path existence and read/write permission,
+  provider/model-family consistency, reasoning-capability, and pipeline
+  prerequisites.
+- Severity vocabulary: `ok | warning | error | blocked | unknown`. Every
+  check carries impact, remediation, related env/paths/pages/pipeline steps,
+  and `decision_method: deterministic`.
+- Runtime-only failures (LLM timeout/auth/invalid model, snapshot failures)
+  are surfaced verbatim from the latest persisted run/snapshot records as
+  `last_observed_error`. Never classify or interpret error text with
+  heuristics, and never call an LLM from a diagnostics check.
+- New required settings must be added here with title/impact/remediation so
+  the Dashboard alert badge can explain them.
+- Issue #115: user-facing text (title/detail/impact/remediation) is Japanese
+  and framed as 原因 / 修正場所 / 次の操作. Each check also carries a
+  deterministic fix target: `fix_kind` (finite `navigate | dialog`),
+  `fix_page` (a Dashboard route), and `fix_anchor` (a member of the finite
+  anchor set: `repo-config`, `repo-patterns`, `snapshot-create`, `build`).
+  `navigate` means an in-app control fixes it; `dialog` means it is an env
+  var / restart with no in-app control. These are chosen structurally per
+  branch — never inferred — and must be kept in sync with the `diag-anchor`
+  attributes rendered by the Dashboard. Identifiers embedded in `detail`
+  (env var names, model ids, paths) stay verbatim.
+
+## Per-screen assistant (issue #102)
+
+- `GET /assistant/settings-metadata`, `GET /assistant/screen-context/{screen_id}`,
+  `POST /assistant/ask` (`app/assistant.py`, `app/settings_metadata.py`,
+  `routes/assistant.py`).
+- Settings explanations are static code-managed metadata in
+  `app/settings_metadata.py` (key, requiredness, valid values, description,
+  impact, remediation, related checks/pages/pipeline steps) — never LLM
+  generated. Every env var referenced by a diagnostics check's `related_env`
+  must have a metadata entry (enforced by tests).
+- Screen contexts in `app/assistant.py` are a static registry keyed by
+  dashboard route segment (`overview`, `system-understanding`, ...). Adding a
+  dashboard page means adding its screen context here.
+- `POST /assistant/ask` grounds every answer in a limited, deterministic
+  context pack: the screen context, settings metadata mentioned in the
+  question (finite key matching only), and the current `system_diagnostics`
+  checks. Only this pack is sent to the LLM.
+- LLM answers (`decision_method: reasoning_llm`, `used_fallback: false`) are
+  strict-JSON validated; citations and navigate/operate targets outside the
+  supplied pack/route set are dropped (structural validation — `operate`
+  targets are routes where the operation is performed, never bare operation
+  names). The API key must match the effective provider
+  (`LLMConfig.intelligence_from_env`), same rule as the diagnostics
+  `_api_key_status`; a mismatched key means no external call. Provider
+  `mock`, a missing/mismatched key,
+  LLM errors, or invalid output all switch to the deterministic fallback
+  composed verbatim from the metadata/diagnostics above
+  (`decision_method: deterministic`, `used_fallback: true`, with
+  `llm_error` populated on failure). The fallback never interprets free text
+  beyond finite-set matching against known setting keys, check ids/titles,
+  and pipeline steps.
+- Assistant Q&A is not persisted (no chat tables); audit metadata
+  (provider/model/prompt/schema version, decision method, failure detail) is
+  returned in the response instead.
+
 ## Feature Intelligence APIs (issues #23-#26)
 
 The current `GET /project-intelligence` response is a mock contract.
@@ -64,6 +126,81 @@ Keep these storage concerns separate:
 
 Reasoning failure must be represented as a failed run. Do not synthesize a
 heuristic result.
+
+## System Understanding build jobs (issue #109)
+
+- `POST /repository/system-understanding/build` enqueues a step-orchestrated
+  background job (`app/system_understanding_jobs.py`) and returns the job id
+  immediately (202). Never run build steps inside a request handler.
+- Job/step state lives in `system_understanding_builds` /
+  `system_understanding_build_steps`; claim-scan chunks are
+  `system_understanding_llm_tasks` rows with unified retry/backoff/cancel.
+- Jobs bind to the snapshot they were created with: retry/resume always
+  runs against the job's stored `snapshot_id`, never the latest ready
+  snapshot. Only a job created without any ready snapshot binds to the
+  latest one at execution time; a pinned snapshot that disappeared fails
+  the job with an explicit error.
+- Steps: `symbol_index`, `entrypoint_index`, `documentation_index`,
+  `claim_scan` (reasoning), `understanding_graph`, `docs_code_reconcile`,
+  `capability_hierarchy`. Dependencies are explicit; a step whose dependency
+  is not completed is `blocked`, never silently skipped or approximated.
+- Completed steps are never re-executed. Retry
+  (`POST .../jobs/{id}/retry`, `POST .../jobs/{id}/steps/{step}/retry`)
+  resets only missing/failed/blocked/cancelled steps; completed chunk scan
+  results are reused by content hash. Cancel is available per job and per
+  step; workers check the flag between steps and between chunks.
+- Jobs and steps persist heartbeats. A queued/running job without a recent
+  heartbeat (`SYSTEM_UNDERSTANDING_STUCK_AFTER_SECONDS`, default 300) is
+  reported `is_stuck`; `init_db` fails over jobs interrupted by a restart so
+  they become retryable instead of active-forever.
+- LLM failures fail the `claim_scan` step visibly with per-chunk errors;
+  deterministic steps still complete (no heuristic fallback, Principle 6).
+- Job status vocabulary: `queued / running / completed / partial / failed /
+  cancelled` (+ derived `is_stuck`). `completed` requires every step
+  completed; any remaining failed/blocked/cancelled step yields `partial`
+  (or `failed` when no step completed), so blocked reasoning steps never
+  hide behind a completed job.
+- Each worker execution (initial enqueue and every retry) is a
+  `system_understanding_build_runs` row; the build endpoints return both
+  `job_id` and the latest `run_id`.
+- Status endpoints: `GET .../jobs/{job_id}`, `GET .../jobs/active`, plus the
+  back-compat `GET .../build/latest` and `GET .../build/{id}` returning the
+  same extended payload (steps, llm task counts, artifact counts).
+
+## Issue drafts (issue #107)
+
+- `POST /issue-drafts`, `GET /issue-drafts`, `GET /issue-drafts/{id}`,
+  `PATCH /issue-drafts/{id}` (`app/issue_drafts.py`, `routes/project_intelligence.py`).
+  probe-agent's DB (`issue_drafts` table, system-scoped) is the source of
+  truth; external trackers are NOT integrated.
+- A draft is generated from a System Understanding gap: rendering the gap's
+  title, docs/code/entrypoint evidence, next actions, and the pinned
+  `snapshot_id` / `commit_sha` into a Markdown body is a deterministic,
+  structural template (Principle 6) — no reasoning model is called. Upstream
+  gap detection is where reasoning happens.
+- Gaps are recomputed per read (no stable id), so each gap carries a
+  deterministic `source_key` (`gap_source_key`), and `GET
+  /repository/system-understanding` attaches any matching drafts to each gap
+  (`issue_drafts`), matched by that key against the caller's open connection
+  (the DB lock is non-reentrant — never open a nested `get_conn`). The key
+  folds in a stable per-gap `source_id` (graph node id / entrypoint identity)
+  plus `capability_key` + docs/code/entrypoint evidence (hashed, order
+  independent), not just `gap_type` + `node_name`, so same-named gaps in one
+  system don't share drafts — including evidence-less gaps like
+  `missing_evidence`, which are distinguished by `source_id` alone. `source_id`
+  is on the gap output so it round-trips: a draft created from a POSTed gap
+  resolves to the same key the display computed.
+- `POST /issue-drafts` accepts the displayed `snapshot_id` / `commit_sha`;
+  if a newer snapshot has since become ready the request is refused (409) so
+  a draft never embeds a snapshot that disagrees with the gap evidence in the
+  payload. Omitting it falls back to the latest ready snapshot.
+- `status` vocabulary is a finite set: `draft / copied / external_created /
+  closed / rejected` (validated; anything else is 422). `external_url` is a
+  plain user-supplied string, validated only as `http(s)://`; probe-agent
+  never fetches, creates, or syncs the external issue and never writes to the
+  target repository (Non-goals; Principle 5).
+- `PATCH` uses field set-ness so `external_url: ""` clears a registered URL
+  while omitting it leaves it untouched.
 
 ## Authentication and user management
 

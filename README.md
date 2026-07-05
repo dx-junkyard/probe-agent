@@ -17,7 +17,7 @@
 probe-agent/
 ├── apps/
 │   ├── control-server/   # FastAPI + SQLite。trace 受信と policy 配布
-│   └── dashboard/        # Streamlit。component 一覧、trace 閲覧、shadow 比較
+│   └── dashboard/        # React/Vite。component 一覧、trace 閲覧、shadow 比較
 ├── packages/
 │   └── python-probe/     # Python SDK (probe_agent)
 ├── examples/
@@ -87,14 +87,18 @@ pip install -e apps/control-server
 # 2. Control Server 起動 (port 8000)
 uvicorn app.main:app --app-dir apps/control-server --reload --port 8000
 
-# 3. Dashboard 起動 (別ターミナル, port 8501)
-pip install -r apps/dashboard/requirements.txt
-PROBE_SERVER_URL=http://localhost:8000 streamlit run apps/dashboard/app.py
+# 3. Dashboard 起動 (別ターミナル, port 5173)
+cd apps/dashboard
+npm install
+npm run dev
 
 # 4. サンプル実行 (別ターミナル)
 cd examples/simple-pipeline
 PROBE_SERVER_URL=http://localhost:8000 python main.py
 ```
+
+開発サーバーは `http://localhost:5173` で起動する。Vite の proxy 設定により
+`/api` へのリクエストは自動的に Control Server (`http://localhost:8000`) へ転送される。
 
 Dashboard で `summarizer` / `classifier` の mode を `shadow` に切り替えてから
 サンプルを再実行すると、候補実装との比較結果が確認できる。
