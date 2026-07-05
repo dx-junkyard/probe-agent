@@ -1,4 +1,5 @@
 """Sample calculator application utilizing @probe for execution tracing and shadow mode.
+Now supports advanced expression parsing (including parenthesis and multiple operators).
 
 Run:
     $env:PROBE_SERVER_URL="http://localhost:8000"
@@ -38,80 +39,144 @@ def run_multiply(a: float, b: float) -> float:
 def run_divide(a: float, b: float) -> float:
     return divide(a, b)
 
-def run_interactive():
-    print("--- \u96fb\u535e\u30a2\u30d7\u30ea (Interactive Mode) ---")
-    print("\u5404\u6f14\u7b97\u3092\u5b9f\u884c\u3059\u308b\u306b\u306f\u3001\u88cf\u3067 PROBE \u306e\u30c8\u30ec\u30fc\u30b9\u304c\u884c\u308f\u308c\u307e\u3059\u3002")
-    print("\u7d42\u4e86\u3059\u308b\u306b\u306f 'exit' \u3092\u5165\u529b\u3057\u3066\u304f\u3060\u3055\u3044\u3002\n")
-    
-    # \u6570\u5f0f\u30d4\u30c3\u30af\u30a2\u30c3\u30d7\u7528\u306e\u65b0\u3057\u3044\u65b9\u5f0f (\u30b5\u30dd\u30fc\u30c8: \u5c0f\u6570, \u8c9f\u306e\u6570, \u30b9\u30da\u30fc\u30b9\u306a\u3057)
-    calc_re = re.compile(r"^([-+]?\d*\.?\d+)\s*([\+\-\*/])\s*([-+]?\d*\.?\d+)$")
+# --- 数式評価パーサー (Recursive Descent Parser) ---
+# 数値（小数対応）または演算子（+, -, *, /, (, )）にマッチするトークナイザー
+TOKEN_RE = re.compile(r"(\d*\.\d+|\d+|[\+\-\*/\(\)])")
 
+class ExpressionEvaluator:
+    """Evaluates mathematical expressions with operator precedence and parenthesis.
+    Calls tracked probe functions (run_add, run_subtract, etc.) for each operation.
+    """
+    def __init__(self, expression: str):
+        # スペースをすべて除去した上で、トークンに分割
+        tokens = TOKEN_RE.findall(expression.replace(" ", ""))
+        self.tokens = [t for t in tokens if t.strip()]
+        self.pos = 0
+
+    def peek(self):
+        if self.pos < len(self.tokens):
+            return self.tokens[self.pos]
+        return None
+
+    def consume(self, expected=None):
+        token = self.peek()
+        if token is None:
+            raise ValueError("不完全な数式です。")
+        if expected and token != expected:
+            raise ValueError(f"期待されない演算子です: {token}")
+        self.pos += 1
+        return token
+
+    def parse(self) -> float:
+        if not self.tokens:
+            raise ValueError("空の入力です。")
+        res = self.expr()
+        if self.pos < len(self.tokens):
+            raise ValueError(f"無効な文字が残っています: {self.tokens[self.pos:]}")
+        return res
+
+    def expr(self) -> float:
+        term_val = self.term()
+        while self.pos < len(self.tokens) and self.tokens[self.pos] in ('+', '-'):
+            op = self.tokens[self.pos]
+            self.pos += 1
+            next_term = self.term()
+            if op == "+":
+                term_val = run_add(term_val, next_term)
+            else:
+                term_val = run_subtract(term_val, next_term)
+        return term_val
+
+    def term(self) -> float:
+        factor_val = self.factor()
+        while self.pos < len(self.tokens) and self.tokens[self.pos] in ('*', '/'):
+            op = self.tokens[self.pos]
+            self.pos += 1
+            next_factor = self.factor()
+            if op == "*":
+                factor_val = run_multiply(factor_val, next_factor)
+            else:
+                factor_val = run_divide(factor_val, next_factor)
+        return factor_val
+
+    def factor(self) -> float:
+        token = self.peek()
+        if token == '(':
+            self.consume('(')
+            res = self.expr()
+            self.consume(')')
+            return res
+        elif token == '-':
+            self.consume('-')
+            # 単項マイナスの処理
+            return -self.factor()
+        elif token == '+':
+            self.consume('+')
+            return self.factor()
+        
+        # 数値のパース
+        token = self.consume()
+        try:
+            return float(token)
+        except ValueError:
+            raise ValueError(f"無効な数値です: '{token}'")
+
+    # 別名定義（exprをエントリポイントとする）
+    expr_eval = expr
+
+def evaluate_expression(expression: str) -> float:
+    evaluator = ExpressionEvaluator(expression)
+    # expr()を呼び出すラッパー
+    if not evaluator.tokens:
+        raise ValueError("数式が入力されていません。")
+    return evaluator.expr_eval()
+
+def run_interactive():
+    print("--- 電卓アプリ (Interactive Mode) ---")
+    print("複雑な数式（例: 256526-929+6565 や (2+3)*5）を計算できます。")
+    print("各ステップの演算は、裏で PROBE の個別トレース（calculator_add 等）として送信されます。")
+    print("終了するには 'exit' を入力してください。\n")
+    
     while True:
         try:
-            user_input = input("\u5f0f\u3092\u5165\u529b\u3057\u3066\u304f\u3060\u3055\u3044 (\u4f8b: 5+3, 10 / 2) -> ").strip()
+            user_input = input("式を入力してください -> ").strip()
             if user_input.lower() == "exit":
                 break
-            
-            match = calc_re.match(user_input)
-            if not match:
-                print("\u30a8\u30e9\u30fc: '\u6570 \u6f14\u7b97\u5b50 \u6570' \u306e\u5f62\u5f0f\u3067\u5165\u529b\u3057\u3066\u304f\u3060\u3055\u3044 (\u4f8b: 5+3, 10 / 2)")
+            if not user_input:
                 continue
             
-            a_val, op, b_val = match.groups()
-            a = float(a_val)
-            b = float(b_val)
-            
-            res = 0.0
-            if op == "+":
-                res = run_add(a, b)
-            elif op == "-":
-                res = run_subtract(a, b)
-            elif op == "*":
-                res = run_multiply(a, b)
-            elif op == "/":
-                res = run_divide(a, b)
-            else:
-                print(f"\u30a8\u30e9\u30fc: \u30b5\u30dd\u30fc\u30c8\u3055\u308c\u3066\u3044\u306a\u3044\u6f14\u7b97\u5b50\u3067\u3059: {op}")
-                continue
-                
-            print(f"\u7d50\u679c: {res}\n")
+            res = evaluate_expression(user_input)
+            print(f"結果: {res}\n")
             
         except ValueError as e:
-            print(f"\u30a8\u30e9\u30fc: \u5165\u529b\u5024\u304c\u4e0d\u6b63\u3067\u3059\u3002 {e}\n")
+            print(f"エラー: {e}\n")
         except Exception as e:
-            print(f"\u30a8\u30e9\u30fc\u304c\u767a\u751f\u3057\u307e\u3057\u305f: {e}\n")
+            print(f"エラーが発生しました: {e}\n")
 
 def run_demo():
-    print("--- \u30c7\u30e2\u5b9f\u884c (Automated Mode) ---")
-    print("\u203b \u5bfe\u8a71\u30e2\u30fc\u30c9\u3092\u8d77\u52d5\u3059\u308b\u306b\u306f 'python main.py --interactive' \u3092\u5b9f\u884c\u3057\u3001\u7d42\u4e86\u3059\u308b\u306b\u306f 'exit' \u3068\u5165\u529b\u3057\u307e\u3059\u3002\n")
-    demo_cases = [
-        (10.0, "+", 5.0),
-        (20.0, "-", 8.0),
-        (6.0, "*", 7.0),
-        (100.0, "/", 4.0),
-        (5.0, "/", 0.0)  # ゼロ\u9664\u7b97\u306e\u30c6\u30b9\u30c8
+    print("--- デモ実行 (Automated Mode) ---")
+    print("※ 対話モードを起動するには 'python main.py --interactive' を実行し、終了するには 'exit' と入力します。\n")
+    
+    demo_expressions = [
+        "10 + 5",
+        "256526 - 929 + 6565",      # 複数演算子のテスト
+        "2 * (3 + 4)",              # 括弧付き
+        "100 / 4 * 2",              # 優先順位（左から右）
+        "5 / 0"                     # ゼロ除算のテスト
     ]
     
-    for a, op, b in demo_cases:
-        print(f"\u5b9f\u884c\u4e2d: {a} {op} {b}")
+    for expr in demo_expressions:
+        print(f"数式: {expr}")
         try:
-            res = 0.0
-            if op == "+":
-                res = run_add(a, b)
-            elif op == "-":
-                res = run_subtract(a, b)
-            elif op == "*":
-                res = run_multiply(a, b)
-            elif op == "/":
-                res = run_divide(a, b)
-            print(f" -> \u7d50\u679c: {res}\n")
+            res = evaluate_expression(expr)
+            print(f" -> 結果: {res}\n")
         except Exception as e:
-            print(f" -> \u30a8\u30e9\u30fc (\u671f\u5f85\u901a\u308a): {e}\n")
+            print(f" -> エラー (期待通り): {e}\n")
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--interactive":
         run_interactive()
     else:
         run_demo()
-        print("\n\u5bfe\u8a71\u30e2\u30fc\u30c9\u3092\u5b9f\u884c\u3059\u308b\u306b\u306f\u3001\u4ee5\u4e0b\u306e\u3088\u3046\u306b\u5b9f\u884c\u3057\u3066\u304f\u3060\u3055\u3044:")
+        print("\n対話モードを実行するには、以下のように実行してください:")
         print("  python main.py --interactive")
