@@ -83,6 +83,7 @@ def run_interactive():
 
 def run_demo():
     print("--- \u30c7\u30e2\u5b9f\u884c (Automated Mode) ---")
+    print("\u203b \u5bfe\u8a71\u30e2\u30fc\u30c9\u3092\u8d77\u52d5\u3059\u308b\u306b\u306f 'python main.py --interactive' \u3092\u5b9f\u884c\u3057\u3001\u7d42\u4e86\u3059\u308b\u306b\u306f 'exit' \u3068\u5165\u529b\u3057\u307e\u3059\u3002\n")
     demo_cases = [
         (10.0, "+", 5.0),
         (20.0, "-", 8.0),
