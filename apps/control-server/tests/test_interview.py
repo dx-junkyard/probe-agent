@@ -735,7 +735,7 @@ def test_update_understanding_without_graph_fails_fast(admin_client, monkeypatch
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["last_error"]
-    assert "Understanding graph is not ready" in body["last_error"]
+    assert "理解グラフが未構築" in body["last_error"]
 
 
 def test_proposals_rejected_before_proposal_stage(admin_client):
@@ -824,7 +824,9 @@ def _stub_reasoning_turn(monkeypatch, *, proposals=None, next_questions=None):
     def fake_create_llm_client(config):
         return object()
 
-    def fake_generate_interview_turn(client, config, *, context_pack, history, user_message):
+    def fake_generate_interview_turn(
+        client, config, *, context_pack, history, user_message, **kwargs
+    ):
         return InterviewTurnResult(
             provider="anthropic",
             model="claude-sonnet-4-5",

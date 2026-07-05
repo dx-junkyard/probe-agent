@@ -456,8 +456,11 @@ class TestEvidenceRequired:
         assert result.error is None
         purpose = result.current_understanding["system_purpose"][0]
         assert purpose["confidence"]["level"] == "uncertain"
+        # The no-evidence follow-up question is localized (ja by default,
+        # Issue #127); match on the item name it embeds instead of wording.
         evidence_questions = [q for q in result.open_questions
-                             if "no evidence" in q["question"].lower()]
+                             if "Unevidenced purpose" in q["question"]
+                             and q["priority"] == "high"]
         assert len(evidence_questions) >= 1
 
     def test_capability_without_evidence_downgraded(self):
@@ -488,3 +491,63 @@ class TestEvidenceRequired:
         assert result.error is None
         purpose = result.current_understanding["system_purpose"][0]
         assert purpose["confidence"]["level"] == "likely"
+
+
+class TestOutputLanguage:
+    """Issue #127: LLM-facing prompts pin the configured output language."""
+
+    def test_japanese_directive_by_default(self, monkeypatch):
+        monkeypatch.delenv("INTERVIEW_LANGUAGE", raising=False)
+        client = CapturingReasoningClient([VALID_REVIEW_RESPONSE])
+        result = generate_understanding_review(
+            client, _reasoning_config(),
+            graph=_build_graph([_claim()]), reconciliation=_empty_reconciliation(),
+        )
+        assert result.error is None
+        system_msg = client.calls[0]["messages"][0]["content"]
+        assert "in Japanese" in system_msg
+        assert "enum values" in system_msg
+        assert result.prompt_version == "understanding-review-v2"
+
+    def test_english_directive(self, monkeypatch):
+        monkeypatch.setenv("INTERVIEW_LANGUAGE", "en")
+        client = CapturingReasoningClient([VALID_REVIEW_RESPONSE])
+        result = generate_understanding_review(
+            client, _reasoning_config(),
+            graph=_build_graph([_claim()]), reconciliation=_empty_reconciliation(),
+        )
+        assert result.error is None
+        assert "in English" in client.calls[0]["messages"][0]["content"]
+
+    def test_invalid_language_fails_closed(self, monkeypatch):
+        monkeypatch.setenv("INTERVIEW_LANGUAGE", "xx")
+        client = CapturingReasoningClient([VALID_REVIEW_RESPONSE])
+        result = generate_understanding_review(
+            client, _reasoning_config(),
+            graph=_build_graph([_claim()]), reconciliation=_empty_reconciliation(),
+        )
+        assert result.error is not None
+        assert "INTERVIEW_LANGUAGE" in result.error
+        assert client.calls == []
+
+    def test_no_evidence_question_localized(self, monkeypatch):
+        monkeypatch.delenv("INTERVIEW_LANGUAGE", raising=False)
+        response = dict(VALID_REVIEW_RESPONSE)
+        response["system_purpose"] = [{
+            "name": "Runtime probe evaluation",
+            "summary": "no evidence supplied",
+            "confidence": {"level": "likely", "reason": "guess"},
+            "evidence": [],
+            "why_core": "",
+            "related_docs": [],
+            "related_apis": [],
+            "children": [],
+        }]
+        client = FakeReasoningClient(response)
+        result = generate_understanding_review(
+            client, _reasoning_config(),
+            graph=_build_graph([_claim()]), reconciliation=_empty_reconciliation(),
+        )
+        assert result.error is None
+        questions = [q["question"] for q in result.open_questions]
+        assert any("根拠" in q and "Runtime probe evaluation" in q for q in questions)
