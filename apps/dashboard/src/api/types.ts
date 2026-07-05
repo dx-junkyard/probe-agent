@@ -210,6 +210,9 @@ export interface InterviewSessionOut {
   last_error: string | null;
   understanding_confirmed_at: number | null;
   understanding_confirmed_by: string | null;
+  // Issue #129: set when an answered interview_qa question is corrected;
+  // cleared only by a successful understanding rebuild.
+  answers_revised_at: number | null;
   materialization_diff: string | null;
   materialization_ref: string | null;
   materialized_at: number | null;
@@ -346,6 +349,58 @@ export interface InterviewDialogueTurnOut {
   current_understanding: CurrentUnderstanding | null;
   gap_analysis: GapItem[] | null;
   open_questions_structured: OpenQuestion[] | null;
+  // Issue #129: IDs of the interview_qa rows created from next_questions.
+  created_qa_ids: number[];
+  // Issue #130: pass-1 evidence-selection audit + what was actually read.
+  evidence_run: IntelligenceRunOut | null;
+  evidence_used: InterviewQaEvidenceRef[];
+}
+
+// --- Structured Interview Q&A (Issue #129) ----------------------------------
+
+export type InterviewQaCategory = "purpose" | "capability" | "api" | "probe_flow" | "general";
+export type InterviewQaSource = "reviewer" | "dialogue" | "zero_base";
+export type InterviewQaStatus = "open" | "answered" | "revised" | "skipped";
+
+export interface InterviewQaEvidenceRef {
+  path: string;
+  start_line: number;
+  end_line: number;
+  // Issue #130: populated when this evidence was actually read from the
+  // pinned snapshot for the question, as opposed to just cited.
+  char_count: number | null;
+}
+
+export interface InterviewQaOut {
+  id: number;
+  session_id: number;
+  system_id: number;
+  question_text: string;
+  question_category: InterviewQaCategory;
+  question_source: InterviewQaSource;
+  hypothesis: string | null;
+  evidence_refs: InterviewQaEvidenceRef[];
+  answer_text: string | null;
+  status: InterviewQaStatus;
+  answered_by: string | null;
+  superseded_by_id: number | null;
+  created_at: number;
+  answered_at: number | null;
+}
+
+export interface InterviewQaAnswerOut {
+  qa: InterviewQaOut;
+  previous: InterviewQaOut | null;
+  regeneration_recommended: boolean;
+}
+
+export interface InterviewQaListOut {
+  session_id: number;
+  system_id: number;
+  items: InterviewQaOut[];
+  open_count: number;
+  high_priority_open_count: number;
+  answers_revised_at: number | null;
 }
 
 export interface InterviewProposalDecisionOut {

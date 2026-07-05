@@ -66,7 +66,7 @@
         "id": { "type": "integer" },
         "system_id": { "type": "integer" },
         "snapshot_id": { "type": "integer" },
-        "run_type": { "enum": ["repository_drafts", "system_profile_draft", "feature_map_draft", "symbol_index", "feature_code_mapping", "probe_plan", "interview_proposal"] },
+        "run_type": { "enum": ["repository_drafts", "system_profile_draft", "feature_map_draft", "symbol_index", "feature_code_mapping", "probe_plan", "probe_plan_from_flow", "capability_hierarchy", "explanation_refresh", "interview_proposal", "interview_dialogue", "interview_evidence_selection"] },
         "provider": { "type": "string" },
         "model": { "type": "string" },
         "prompt_version": { "type": "string" },
@@ -731,6 +731,7 @@
         "last_error": { "type": ["string", "null"] },
         "understanding_confirmed_at": { "type": ["number", "null"], "description": "Issue #123: timestamp of the developer's manual confirmation that the interview gathered enough context; unlocks the proposal gate when no structured understanding could be built (zero-base fallback)." },
         "understanding_confirmed_by": { "type": ["string", "null"] },
+        "answers_revised_at": { "type": ["number", "null"], "description": "Issue #129: set when an interview_qa answer is corrected; cleared only by a successful understanding rebuild, never automatically by the revision itself. Drives the dashboard's rebuild-recommended banner." },
         "materialization_diff": { "type": ["string", "null"] },
         "materialization_ref": { "type": ["string", "null"] },
         "materialized_at": { "type": ["number", "null"] },
@@ -817,13 +818,15 @@
     },
     "InterviewDialogueTurnRequest": {
       "type": "object",
-      "description": "Request body for a single interview dialogue turn (Issue #69). generate_proposals gates proposal output (Issue #83); answered_question lets the server consume the open question the user just answered (Issue #123).",
+      "description": "Request body for a single interview dialogue turn (Issue #69). generate_proposals gates proposal output (Issue #83); answered_question lets the server consume the open question the user just answered (Issue #123), superseded by answered_qa_id (Issue #129) but still honored during the migration period.",
       "required": ["user_message"],
       "properties": {
         "user_message": { "type": "string", "minLength": 1, "maxLength": 20000 },
         "budget": { "type": ["integer", "null"], "minimum": 1000, "maximum": 500000 },
         "generate_proposals": { "type": "boolean", "default": false },
-        "answered_question": { "type": ["string", "null"], "maxLength": 2000 }
+        "answered_question": { "type": ["string", "null"], "maxLength": 2000 },
+        "answered_qa_id": { "type": ["integer", "null"] },
+        "actor": { "type": "string", "minLength": 1, "maxLength": 200, "default": "dashboard" }
       },
       "additionalProperties": false
     },
@@ -866,7 +869,7 @@
     },
     "InterviewDialogueTurnOut": {
       "type": "object",
-      "description": "Response from a single interview dialogue turn (Issue #69). If error is set, the turn failed closed and no proposals were stored. next_questions are structured hypothesis-first questions since Issue #128 (schema interview-v2).",
+      "description": "Response from a single interview dialogue turn (Issue #69). If error is set, the turn failed closed and no proposals were stored. next_questions are structured hypothesis-first questions since Issue #128 (schema interview-v2). created_qa_ids/evidence_run/evidence_used are Issue #129/#130 additions.",
       "properties": {
         "assistant_message": { "type": "string" },
         "proposals": { "type": "array", "items": { "$ref": "#/definitions/InterviewDialogueProposalOut" } },
@@ -876,7 +879,68 @@
         "stage": { "enum": ["understanding_initialized", "purpose_confirmation", "capability_confirmation", "element_classification", "api_boundary_mapping", "probe_flow_selection", "proposal_generation", null] },
         "current_understanding": { "type": ["object", "null"] },
         "gap_analysis": { "type": ["array", "null"], "items": { "type": "object" } },
-        "open_questions_structured": { "type": ["array", "null"], "items": { "type": "object" } }
+        "open_questions_structured": { "type": ["array", "null"], "items": { "type": "object" } },
+        "created_qa_ids": { "type": "array", "items": { "type": "integer" } },
+        "evidence_run": { "oneOf": [{ "$ref": "#/definitions/IntelligenceRun" }, { "type": "null" }] },
+        "evidence_used": { "type": "array", "items": { "$ref": "#/definitions/InterviewQaEvidenceRef" } }
+      },
+      "additionalProperties": false
+    },
+    "InterviewQaEvidenceRef": {
+      "type": "object",
+      "description": "Snapshot-relative code reference for a Q&A row, optionally with what was actually read (Issue #130's char_count).",
+      "required": ["path"],
+      "properties": {
+        "path": { "type": "string" },
+        "start_line": { "type": "integer", "default": 0 },
+        "end_line": { "type": "integer", "default": 0 },
+        "char_count": { "type": ["integer", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "InterviewQA": {
+      "type": "object",
+      "description": "A structured interview question/answer row (Issue #129). Correcting an answer never overwrites this row: a new row is inserted with the correction and this row is marked 'revised' with superseded_by_id set to the new row's id.",
+      "required": ["id", "session_id", "system_id", "question_text", "question_category", "question_source", "status", "created_at"],
+      "properties": {
+        "id": { "type": "integer" },
+        "session_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "question_text": { "type": "string" },
+        "question_category": { "enum": ["purpose", "capability", "api", "probe_flow", "general"] },
+        "question_source": { "enum": ["reviewer", "dialogue", "zero_base"] },
+        "hypothesis": { "type": ["string", "null"] },
+        "evidence_refs": { "type": "array", "items": { "$ref": "#/definitions/InterviewQaEvidenceRef" } },
+        "answer_text": { "type": ["string", "null"] },
+        "status": { "enum": ["open", "answered", "revised", "skipped"] },
+        "answered_by": { "type": ["string", "null"] },
+        "superseded_by_id": { "type": ["integer", "null"] },
+        "created_at": { "type": "number" },
+        "answered_at": { "type": ["number", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "InterviewQaAnswerOut": {
+      "type": "object",
+      "description": "Result of answering or correcting a question (Issue #129). regeneration_recommended is set (never acted on automatically) when the session already has generated proposals.",
+      "required": ["qa", "regeneration_recommended"],
+      "properties": {
+        "qa": { "$ref": "#/definitions/InterviewQA" },
+        "previous": { "oneOf": [{ "$ref": "#/definitions/InterviewQA" }, { "type": "null" }] },
+        "regeneration_recommended": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "InterviewQaList": {
+      "type": "object",
+      "required": ["session_id", "system_id"],
+      "properties": {
+        "session_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "items": { "type": "array", "items": { "$ref": "#/definitions/InterviewQA" } },
+        "open_count": { "type": "integer", "minimum": 0 },
+        "high_priority_open_count": { "type": "integer", "minimum": 0 },
+        "answers_revised_at": { "type": ["number", "null"] }
       },
       "additionalProperties": false
     },

@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from .interview_evidence import EvidenceSnippet, EvidenceTarget, validate_evidence_targets
 from .interview_language import get_interview_language, language_directive
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient, is_reasoning_model
 from .models import (
@@ -34,13 +35,19 @@ from .models import (
 )
 from .probe_planner import check_denylist
 
-# v3: configurable output language (Issue #127) + hypothesis-first questions
-# grounded in the session's current understanding (Issue #128).
-PROMPT_VERSION = "interview-v3"
+# v4: pass-1 evidence-selection prompt precedes this one when evidence
+# snippets are supplied (Issue #130); the response schema is unchanged.
+PROMPT_VERSION = "interview-v4"
 # v2: next_questions items are structured {question_text, hypothesis,
 # evidence_refs, answer_options} objects (Issue #128); plain strings are
 # still accepted and normalized.
 SCHEMA_VERSION = "interview-v2"
+
+# Issue #130: pass-1 (evidence selection) prompt/schema versions, audited as
+# a separate intelligence_runs row from the pass-2 dialogue turn above.
+EVIDENCE_PROMPT_VERSION = "interview-evidence-v1"
+EVIDENCE_SCHEMA_VERSION = "interview-evidence-v1"
+MAX_EVIDENCE_TARGETS = 10
 
 MAX_RECENT_MESSAGES = 20
 
@@ -250,6 +257,16 @@ def _trim_json(value: Any, max_chars: int) -> str:
     return text[: max(0, max_chars - 30)] + "…[truncated to budget]"
 
 
+def _format_evidence_snippets(snippets: List[EvidenceSnippet]) -> str:
+    blocks = []
+    for s in snippets:
+        blocks.append(
+            f"### {s.path}:{s.start_line}-{s.end_line}"
+            f"{' (truncated to budget)' if s.truncated else ''}\n{s.content}"
+        )
+    return "\n\n".join(blocks)
+
+
 def _build_user_prompt(
     context_pack: InterviewContextPack,
     history: List[Dict[str, str]],
@@ -259,6 +276,7 @@ def _build_user_prompt(
     gap_analysis: Optional[List[Dict[str, Any]]] = None,
     open_questions: Optional[List[Dict[str, Any]]] = None,
     understanding_max_chars: int = DEFAULT_UNDERSTANDING_MAX_CHARS,
+    evidence_snippets: Optional[List[EvidenceSnippet]] = None,
 ) -> str:
     recent_history = history[-MAX_RECENT_MESSAGES:]
     parts: List[str] = []
@@ -277,6 +295,12 @@ def _build_user_prompt(
             "anything already answered in the history)"
         )
         parts.append(_trim_json(open_questions, GAP_AND_QUESTION_MAX_CHARS))
+    if evidence_snippets:
+        parts.append(
+            "## Referenced source evidence (read from the pinned snapshot for this "
+            "turn; you may cite these exact path/line ranges as evidence_refs)"
+        )
+        parts.append(_format_evidence_snippets(evidence_snippets))
     parts.append(
         "## Context Pack (snapshot-grounded symbols and entrypoints; the only allowed reference source)"
     )
@@ -404,12 +428,16 @@ def generate_interview_turn(
     current_understanding: Optional[Dict[str, Any]] = None,
     gap_analysis: Optional[List[Dict[str, Any]]] = None,
     open_questions: Optional[List[Dict[str, Any]]] = None,
+    evidence_snippets: Optional[List[EvidenceSnippet]] = None,
 ) -> InterviewTurnResult:
     """Generate one structured assistant turn for the interview dialogue.
 
     When the session carries a built understanding, it is injected as the
     model's working hypothesis so questions confirm/correct it instead of
-    starting from scratch (Issue #128).
+    starting from scratch (Issue #128). ``evidence_snippets`` are source
+    fragments read from the pinned snapshot by the pass-1 evidence-selection
+    step (Issue #130); when present, question evidence_refs may cite them in
+    addition to context-pack/current-understanding spans.
 
     Fail-closed: if the client is mock, the model is not a reasoning model,
     the language/budget configuration is invalid, the API call fails, or
@@ -447,6 +475,7 @@ def generate_interview_turn(
         gap_analysis=gap_analysis,
         open_questions=open_questions,
         understanding_max_chars=understanding_max_chars,
+        evidence_snippets=evidence_snippets,
     )
 
     try:
@@ -523,9 +552,12 @@ def generate_interview_turn(
     # Normalize questions and structurally validate their evidence refs
     # against the snapshot-grounded spans (deterministic; fail closed).
     questions = [_normalize_question(q) for q in validated.next_questions]
-    evidence_error = _validate_question_evidence(
-        questions, _allowed_evidence_spans(context_pack, current_understanding)
-    )
+    allowed_spans = _allowed_evidence_spans(context_pack, current_understanding)
+    for snippet in evidence_snippets or []:
+        allowed_spans.setdefault(snippet.path, []).append(
+            (snippet.start_line, snippet.end_line)
+        )
+    evidence_error = _validate_question_evidence(questions, allowed_spans)
     if evidence_error:
         return InterviewTurnResult(
             provider=config.provider,
@@ -541,4 +573,179 @@ def generate_interview_turn(
         assistant_message=validated.assistant_message,
         proposals=proposals,
         next_questions=questions,
+    )
+
+
+# --- Evidence selection (pass 1 of Issue #130's two-pass dialogue turn) ------
+#
+# Before generating a question, the model may ask to read up to
+# MAX_EVIDENCE_TARGETS source fragments from the pinned snapshot, or declare
+# that no evidence is needed. Which paths/symbols exist to choose from, and
+# whether a chosen target is actually readable within budget, are
+# deterministic (Principle 6); only the choice of what to read and the
+# resulting question are reasoning-model output.
+
+_EVIDENCE_SYSTEM_PROMPT = """\
+You are the evidence-selection step of a system-understanding interview \
+assistant for probe-agent. Before the next question is written, decide \
+whether reading a small number of source fragments from the supplied \
+context pack would make that question more precise.
+
+Respond with a single JSON object and nothing else (no markdown fences, no \
+commentary), matching exactly this shape:
+
+{
+  "need_evidence": true|false,
+  "targets": [
+    {"path": "src/module.py", "start_line": 1, "end_line": 40, "reason": "..."}
+  ]
+}
+
+Rules:
+- "targets" may contain at most %d entries. Prefer fewer, focused reads.
+- Every "path" must be a path that appears in the supplied context pack or \
+current understanding. Never invent a path.
+- "start_line"/"end_line" must be a sane, bounded range (a function body, \
+not an entire file).
+- Set "need_evidence" to false and leave "targets" empty when your current \
+hypothesis (or the symbol name and line range alone) is already enough to \
+ask a precise question — most turns do not need this step.
+- This step never asks the developer anything and never proposes metadata; \
+it only selects what to read.
+""" % MAX_EVIDENCE_TARGETS
+
+
+def _evidence_system_prompt(language: str) -> str:
+    return _EVIDENCE_SYSTEM_PROMPT + language_directive(language) + "\n"
+
+
+class _RawEvidenceTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(..., min_length=1, max_length=500)
+    start_line: int = Field(..., ge=1)
+    end_line: int = Field(..., ge=1)
+    reason: str = Field(default="", max_length=500)
+
+
+class _RawEvidenceSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    need_evidence: bool = False
+    targets: List[_RawEvidenceTarget] = Field(
+        default_factory=list, max_length=MAX_EVIDENCE_TARGETS
+    )
+
+
+@dataclass
+class EvidenceSelectionResult:
+    provider: str
+    model: str
+    is_mock: bool
+    prompt_version: str = EVIDENCE_PROMPT_VERSION
+    schema_version: str = EVIDENCE_SCHEMA_VERSION
+    need_evidence: bool = False
+    targets: List[EvidenceTarget] = field(default_factory=list)
+    error: Optional[str] = None
+
+
+def select_evidence_targets(
+    client: LLMClient,
+    config: LLMConfig,
+    *,
+    context_pack: InterviewContextPack,
+    history: List[Dict[str, str]],
+    user_message: str,
+    current_understanding: Optional[Dict[str, Any]] = None,
+) -> EvidenceSelectionResult:
+    """Pass 1: choose evidence to read before asking the next question.
+
+    Fail-closed on the same conditions as ``generate_interview_turn``: a
+    mock/non-reasoning client, invalid language configuration, an LLM call
+    failure, malformed structured output, or a target outside the allowed
+    context-pack/current-understanding path set.
+    """
+    is_mock = isinstance(client, MockLLMClient)
+    if is_mock or not is_reasoning_model(config.provider, config.model):
+        return EvidenceSelectionResult(
+            provider=config.provider,
+            model=config.model,
+            is_mock=is_mock,
+            error=(
+                "Interview evidence selection requires a configured reasoning "
+                "model; mock/heuristic fallback is prohibited"
+            ),
+        )
+
+    try:
+        language = get_interview_language()
+    except ValueError as exc:
+        return EvidenceSelectionResult(
+            provider=config.provider, model=config.model, is_mock=False, error=str(exc),
+        )
+
+    recent_history = history[-MAX_RECENT_MESSAGES:]
+    parts: List[str] = []
+    if current_understanding:
+        parts.append("## Current understanding")
+        parts.append(_trim_json(current_understanding, GAP_AND_QUESTION_MAX_CHARS))
+    parts.append("## Context Pack (only allowed source of paths/symbols)")
+    parts.append(context_pack.model_dump_json())
+    if recent_history:
+        parts.append("## Recent conversation history")
+        for msg in recent_history:
+            parts.append(f"{msg['role']}: {msg['content']}")
+    parts.append("## Latest user message")
+    parts.append(user_message)
+    prompt = "\n\n".join(parts)
+
+    try:
+        raw = client.generate_text(
+            [
+                {"role": "system", "content": _evidence_system_prompt(language)},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+            max_tokens=1024,
+        )
+    except LLMError as exc:
+        return EvidenceSelectionResult(
+            provider=config.provider, model=config.model, is_mock=False, error=str(exc),
+        )
+
+    try:
+        parsed = json.loads(_strip_fences(raw))
+        validated = _RawEvidenceSelection.model_validate(parsed)
+    except (json.JSONDecodeError, ValidationError) as exc:
+        return EvidenceSelectionResult(
+            provider=config.provider,
+            model=config.model,
+            is_mock=False,
+            error=f"Failed to parse evidence-selection response: {exc}",
+        )
+
+    targets = [
+        EvidenceTarget(
+            path=t.path, start_line=t.start_line, end_line=t.end_line, reason=t.reason,
+        )
+        for t in validated.targets
+    ]
+
+    if validated.need_evidence and targets:
+        allowed_spans = _allowed_evidence_spans(context_pack, current_understanding)
+        error = validate_evidence_targets(targets, allowed_spans)
+        if error:
+            return EvidenceSelectionResult(
+                provider=config.provider,
+                model=config.model,
+                is_mock=False,
+                error=f"Evidence target validation failed: {error}",
+            )
+
+    return EvidenceSelectionResult(
+        provider=config.provider,
+        model=config.model,
+        is_mock=False,
+        need_evidence=validated.need_evidence and bool(targets),
+        targets=targets,
     )

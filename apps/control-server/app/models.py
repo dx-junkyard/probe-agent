@@ -220,6 +220,11 @@ IntelligenceRunType = Literal[
     "explanation_refresh",
     "interview_proposal",
     "interview_dialogue",
+    # Issue #130: pass 1 of the dialogue turn (choose evidence to read, or
+    # declare no evidence needed) is audited separately from pass 2 (question
+    # generation, run_type "interview_dialogue" above) so the two reasoning
+    # calls stay distinguishable in the audit trail.
+    "interview_evidence_selection",
 ]
 DecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
 # How a single hierarchy claim was produced. Kept distinct from the audit
@@ -1731,6 +1736,10 @@ class InterviewSessionOut(BaseModel):
     last_error: Optional[str] = None
     understanding_confirmed_at: Optional[float] = None
     understanding_confirmed_by: Optional[str] = None
+    # Issue #129: set when an answered interview_qa question is corrected.
+    # Never cleared automatically by the revision itself — only a successful
+    # understanding rebuild (update-understanding) clears it.
+    answers_revised_at: Optional[float] = None
     materialization_diff: Optional[str] = None
     materialization_ref: Optional[str] = None
     materialized_at: Optional[float] = None
@@ -1944,7 +1953,14 @@ class InterviewDialogueTurnRequest(BaseModel):
     # Issue #123: the open question the user is answering with this turn.
     # The server removes it from the session's open_questions (exact match)
     # so the UI never re-asks an already-answered question.
+    # Superseded by answered_qa_id (Issue #129); still accepted during the
+    # migration period and applied in addition to it, never instead of it.
     answered_question: Optional[str] = Field(default=None, max_length=2000)
+    # Issue #129: ID of the interview_qa row this turn answers. Preferred
+    # over answered_question because it survives question rewording and
+    # cannot silently match the wrong question.
+    answered_qa_id: Optional[int] = None
+    actor: str = Field(default="dashboard", min_length=1, max_length=200)
 
 
 class InterviewConfirmUnderstandingRequest(BaseModel):
@@ -2021,6 +2037,108 @@ class InterviewDialogueTurnOut(BaseModel):
     current_understanding: Optional[Dict[str, Any]] = None
     gap_analysis: Optional[List[Dict[str, Any]]] = None
     open_questions_structured: Optional[List[Dict[str, Any]]] = None
+    # Issue #129: the structured Q&A rows created from next_questions, so the
+    # caller can navigate straight to them without re-fetching the list.
+    created_qa_ids: List[int] = Field(default_factory=list)
+    # Issue #130: audit of the pass-1 evidence-selection run, when it ran.
+    evidence_run: Optional[IntelligenceRunOut] = None
+    evidence_used: List["InterviewQaEvidenceRefOut"] = Field(default_factory=list)
+
+
+# --- Structured Interview Q&A (Issue #129) ------------------------------------
+#
+# Question/answer pairs as ID-addressable rows, replacing exact-text matching
+# against the interview_session.open_questions JSON blob. Correcting an
+# answer never overwrites the row; it inserts a new revision and links the
+# old row forward via superseded_by_id, so every prior answer stays
+# auditable (Principle 7). question_category/question_source/status are
+# explicit finite sets (Principle 6).
+
+InterviewQaCategory = Literal["purpose", "capability", "api", "probe_flow", "general"]
+InterviewQaSource = Literal["reviewer", "dialogue", "zero_base"]
+InterviewQaStatus = Literal["open", "answered", "revised", "skipped"]
+
+
+class InterviewQaEvidenceRefOut(BaseModel):
+    """Snapshot-relative code reference, optionally with what was actually read.
+
+    ``char_count`` is populated only for evidence that Issue #130's
+    evidence-gathering step read from the pinned snapshot; it is a raw fact
+    about what was fetched, kept separate from any LLM interpretation of it.
+    """
+
+    path: str
+    start_line: int = 0
+    end_line: int = 0
+    char_count: Optional[int] = None
+
+
+class InterviewQaCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question_text: str = Field(..., min_length=1, max_length=2_000)
+    question_category: InterviewQaCategory = "general"
+    question_source: InterviewQaSource = "dialogue"
+    hypothesis: Optional[str] = Field(default=None, max_length=4_000)
+    evidence_refs: List[InterviewQaEvidenceRefOut] = Field(default_factory=list, max_length=10)
+
+
+class InterviewQaActorRequest(BaseModel):
+    """Actor for a skip/resume action (Principle 7: manual decisions record who/when)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str = Field(..., min_length=1, max_length=200)
+
+
+class InterviewQaAnswerRequest(BaseModel):
+    """Answer or correct a question.
+
+    If the current row is 'open' or 'skipped', the answer is recorded on that
+    same row (first answer — nothing to supersede). If the current row is
+    'answered', this is a correction: a new row is inserted with the new
+    answer and the old row is marked 'revised' with superseded_by_id set.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    answer_text: str = Field(..., min_length=1, max_length=20_000)
+    actor: str = Field(..., min_length=1, max_length=200)
+
+
+class InterviewQaOut(BaseModel):
+    id: int
+    session_id: int
+    system_id: int
+    question_text: str
+    question_category: InterviewQaCategory
+    question_source: InterviewQaSource
+    hypothesis: Optional[str] = None
+    evidence_refs: List[InterviewQaEvidenceRefOut] = Field(default_factory=list)
+    answer_text: Optional[str] = None
+    status: InterviewQaStatus
+    answered_by: Optional[str] = None
+    superseded_by_id: Optional[int] = None
+    created_at: float
+    answered_at: Optional[float] = None
+
+
+class InterviewQaAnswerOut(BaseModel):
+    qa: InterviewQaOut
+    previous: Optional[InterviewQaOut] = None
+    # True when this session already has generated proposals, so the
+    # dashboard can surface "regeneration recommended" without probe-agent
+    # ever auto-invalidating or regenerating the approved/proposed set.
+    regeneration_recommended: bool = False
+
+
+class InterviewQaListOut(BaseModel):
+    session_id: int
+    system_id: int
+    items: List[InterviewQaOut] = Field(default_factory=list)
+    open_count: int = 0
+    high_priority_open_count: int = 0
+    answers_revised_at: Optional[float] = None
 
 
 # --- Interview Proposal Approval (Issue #70) ----------------------------------

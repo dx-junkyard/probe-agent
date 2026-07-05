@@ -1094,6 +1094,44 @@ CREATE INDEX IF NOT EXISTS idx_interview_proposal_decision_proposal
 CREATE INDEX IF NOT EXISTS idx_interview_proposal_decision_session
     ON interview_proposal_decision (session_id);
 
+-- Structured interview Q&A (Issue #129). Each row is one question; answering
+-- a question the first time sets answer_text/status on the same row, but
+-- *correcting* an existing answer never overwrites it — it inserts a new row
+-- with the corrected answer and links the old row forward via
+-- superseded_by_id, keeping every prior answer auditable (Principle 7).
+-- question_category/question_source/status are explicit finite sets
+-- (Principle 6, deterministic). hypothesis/evidence_refs are populated by
+-- Issue #130's evidence-backed dialogue turns; both are nullable because
+-- not every question carries a hypothesis or read evidence.
+CREATE TABLE IF NOT EXISTS interview_qa (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id          INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    question_text       TEXT NOT NULL,
+    question_category   TEXT NOT NULL DEFAULT 'general',
+    question_source     TEXT NOT NULL DEFAULT 'dialogue',
+    hypothesis          TEXT,
+    evidence_refs       TEXT,
+    answer_text         TEXT,
+    status              TEXT NOT NULL DEFAULT 'open',
+    answered_by         TEXT,
+    superseded_by_id    INTEGER,
+    created_at          REAL NOT NULL,
+    answered_at         REAL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES interview_qa (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_interview_qa_session
+    ON interview_qa (session_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_interview_qa_system
+    ON interview_qa (system_id, session_id);
+
+CREATE INDEX IF NOT EXISTS idx_interview_qa_current
+    ON interview_qa (session_id, superseded_by_id);
+
 -- Understanding graph snapshots (Issue #79). Persists merged documentation
 -- claim graphs for a system. Each snapshot records the full graph JSON,
 -- source hash, claim count, and confidence summary.
@@ -1580,6 +1618,14 @@ def init_db() -> None:
         if "understanding_confirmed_by" not in session_cols:
             conn.execute(
                 "ALTER TABLE interview_session ADD COLUMN understanding_confirmed_by TEXT"
+            )
+        if "answers_revised_at" not in session_cols:
+            # Issue #129: set when an interview_qa answer is corrected; cleared
+            # when the developer rebuilds the understanding. Drives the
+            # dashboard's "rebuild recommended" banner; never auto-cleared by
+            # a revision itself (Principle 8: no automatic re-adoption).
+            conn.execute(
+                "ALTER TABLE interview_session ADD COLUMN answers_revised_at REAL"
             )
         proposal_cols = _columns(conn, "interview_proposal")
         if proposal_cols and "graph_node_id" not in proposal_cols:

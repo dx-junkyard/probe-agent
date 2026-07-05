@@ -19,6 +19,7 @@ import type {
   InterviewDialogueTurnOut, InterviewProposalDecisionOut,
   InterviewProposalMetadataBlock, InterviewProposalProbePlan,
   InterviewApprovedSetOut, InterviewMaterializeOut,
+  InterviewQaListOut, InterviewQaOut, InterviewQaAnswerOut,
   SystemUnderstandingOut,
   SystemUnderstandingBuildOut,
   IssueDraft,
@@ -514,12 +515,71 @@ export function useInterviewDialogueTurn(sessionId: number | null) {
       budget?: number;
       generate_proposals?: boolean;
       answered_question?: string;
+      answered_qa_id?: number;
+      actor?: string;
     }) =>
       api.post<InterviewDialogueTurnOut>(`/interview/sessions/${sessionId}/dialogue-turn`, data),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
       qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] });
     },
+  });
+}
+
+// --- Structured Interview Q&A (Issue #129) ----------------------------------
+
+export function useInterviewQaList(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("interviewQa"), sessionId],
+    queryFn: () => api.get<InterviewQaListOut>(`/interview/sessions/${sessionId}/qa`),
+    enabled: !!sessionId && !!getSystemId(),
+  });
+}
+
+export function useCreateInterviewQa(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: {
+      question_text: string;
+      question_category?: string;
+      question_source?: string;
+      hypothesis?: string;
+    }) => api.post<InterviewQaOut>(`/interview/sessions/${sessionId}/qa`, data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] }),
+  });
+}
+
+export function useAnswerInterviewQa(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ qaId, answer_text, actor }: { qaId: number; answer_text: string; actor: string }) =>
+      api.post<InterviewQaAnswerOut>(
+        `/interview/sessions/${sessionId}/qa/${qaId}/answer`,
+        { answer_text, actor },
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] });
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+    },
+  });
+}
+
+export function useSkipInterviewQa(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ qaId, actor }: { qaId: number; actor: string }) =>
+      api.post<InterviewQaOut>(`/interview/sessions/${sessionId}/qa/${qaId}/skip`, { actor }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] }),
+  });
+}
+
+export function useResumeInterviewQa(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ qaId, actor }: { qaId: number; actor: string }) =>
+      api.post<InterviewQaOut>(`/interview/sessions/${sessionId}/qa/${qaId}/resume`, { actor }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] }),
   });
 }
 
