@@ -6,6 +6,7 @@ Run:
 """
 
 import sys
+import re
 from probe_agent import probe, set_candidate
 from components import (
     add, add_v2,
@@ -42,18 +43,21 @@ def run_interactive():
     print("\u5404\u6f14\u7b97\u3092\u5b9f\u884c\u3059\u308b\u306b\u306f\u3001\u88cf\u3067 PROBE \u306e\u30c8\u30ec\u30fc\u30b9\u304c\u884c\u308f\u308c\u307e\u3059\u3002")
     print("\u7d42\u4e86\u3059\u308b\u306b\u306f 'exit' \u3092\u5165\u529b\u3057\u3066\u304f\u3060\u3055\u3044\u3002\n")
     
+    # \u6570\u5f0f\u30d4\u30c3\u30af\u30a2\u30c3\u30d7\u7528\u306e\u65b0\u3057\u3044\u65b9\u5f0f (\u30b5\u30dd\u30fc\u30c8: \u5c0f\u6570, \u8c9f\u306e\u6570, \u30b9\u30da\u30fc\u30b9\u306a\u3057)
+    calc_re = re.compile(r"^([-+]?\d*\.?\d+)\s*([\+\-\*/])\s*([-+]?\d*\.?\d+)$")
+
     while True:
         try:
-            user_input = input("\u5f0f\u3092\u5165\u529b\u3057\u3066\u304f\u3060\u3055\u3044 (\u4f8b: 5 + 3, 10 / 2) -> ").strip()
+            user_input = input("\u5f0f\u3092\u5165\u529b\u3057\u3066\u304f\u3060\u3055\u3044 (\u4f8b: 5+3, 10 / 2) -> ").strip()
             if user_input.lower() == "exit":
                 break
             
-            parts = user_input.split()
-            if len(parts) != 3:
-                print("\u30a8\u30e9\u30fc: '\u6570 \u6f14\u7b97\u5b50 \u6570' \u306e\u5f62\u5f0f\u3067\u5165\u529b\u3057\u3066\u304f\u3060\u3055\u3044 (\u4f8b: 5 + 3)")
+            match = calc_re.match(user_input)
+            if not match:
+                print("\u30a8\u30e9\u30fc: '\u6570 \u6f14\u7b97\u5b50 \u6570' \u306e\u5f62\u5f0f\u3067\u5165\u529b\u3057\u3066\u304f\u3060\u3055\u3044 (\u4f8b: 5+3, 10 / 2)")
                 continue
             
-            a_val, op, b_val = parts
+            a_val, op, b_val = match.groups()
             a = float(a_val)
             b = float(b_val)
             
