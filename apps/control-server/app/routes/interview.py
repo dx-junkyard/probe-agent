@@ -1444,10 +1444,8 @@ def update_interview_understanding(
         session = _get_session_or_404(conn, session_id, system_id)
         snapshot_id = session["snapshot_id"]
 
-        from ..documentation_indexer import build_documentation_index
-        from ..documentation_claim_scanner import scan_all_chunks
-        from ..understanding_graph import build_understanding_graph, save_graph_snapshot
         from ..docs_code_reconciler import reconcile
+        from ..system_understanding_service import _load_graph_for_snapshot
         from ..system_understanding_reviewer import generate_understanding_review
 
         config = LLMConfig.intelligence_from_env()
@@ -1470,12 +1468,26 @@ def update_interview_understanding(
             row = _get_session_or_404(conn, session_id, system_id)
             return _session_out(row)
 
-        doc_index = build_documentation_index(conn, system_id, snapshot_id)
-
-        scan_results = scan_all_chunks(client, config, doc_index.chunks)
-
-        graph = build_understanding_graph(scan_results)
-        save_graph_snapshot(conn, system_id, graph, snapshot_id=snapshot_id)
+        graph = _load_graph_for_snapshot(conn, system_id, snapshot_id)
+        if graph is None:
+            error = (
+                "Understanding graph is not ready for this snapshot. "
+                "Run System Understanding build/refresh before updating interview understanding."
+            )
+            conn.execute(
+                """UPDATE interview_session
+                   SET last_error = ?, updated_at = ?
+                   WHERE id = ? AND system_id = ?""",
+                (error, now, session_id, system_id),
+            )
+            conn.execute(
+                """INSERT INTO interview_message
+                    (session_id, system_id, role, content, created_at)
+                VALUES (?, ?, 'assistant', ?, ?)""",
+                (session_id, system_id, f"Understanding update failed: {error}", now),
+            )
+            row = _get_session_or_404(conn, session_id, system_id)
+            return _session_out(row)
 
         reconciliation = reconcile(conn, system_id, snapshot_id, graph)
 
