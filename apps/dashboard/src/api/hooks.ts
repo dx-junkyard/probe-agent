@@ -509,7 +509,12 @@ export function useInterviewContextPack(sessionId: number | null) {
 export function useInterviewDialogueTurn(sessionId: number | null) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (data: { user_message: string; budget?: number; generate_proposals?: boolean }) =>
+    mutationFn: (data: {
+      user_message: string;
+      budget?: number;
+      generate_proposals?: boolean;
+      answered_question?: string;
+    }) =>
       api.post<InterviewDialogueTurnOut>(`/interview/sessions/${sessionId}/dialogue-turn`, data),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
@@ -591,15 +596,32 @@ export function useAdvanceInterviewStage(sessionId: number | null) {
   });
 }
 
-export function useUpdateInterviewUnderstanding(sessionId: number | null) {
+export function useConfirmInterviewUnderstanding(sessionId: number | null) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: () =>
+    mutationFn: (data: { actor: string }) =>
+      api.post<InterviewSessionOut>(
+        `/interview/sessions/${sessionId}/confirm-understanding`,
+        data,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+      qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
+    },
+  });
+}
+
+export function useUpdateInterviewUnderstanding() {
+  const qc = useQueryClient();
+  return useMutation({
+    // Takes the target session id explicitly so it can run right after
+    // session creation, before the URL/search-param session id updates.
+    mutationFn: (sessionId: number) =>
       api.post<InterviewSessionOut>(
         `/interview/sessions/${sessionId}/update-understanding`,
         {},
       ),
-    onSuccess: () => {
+    onSuccess: (_data, sessionId) => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
       qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
     },
