@@ -723,6 +723,17 @@
         "title": { "type": "string" },
         "focus": { "type": "string" },
         "status": { "enum": ["open", "proposals_ready", "materialized", "closed"] },
+        "stage": { "enum": ["understanding_initialized", "purpose_confirmation", "capability_confirmation", "element_classification", "api_boundary_mapping", "probe_flow_selection", "proposal_generation"] },
+        "current_understanding": { "type": ["object", "null"] },
+        "gap_analysis": { "type": ["array", "null"], "items": { "type": "object" } },
+        "open_questions": { "type": ["array", "null"], "items": { "type": "object" } },
+        "user_intent": { "type": ["string", "null"] },
+        "last_error": { "type": ["string", "null"] },
+        "understanding_confirmed_at": { "type": ["number", "null"], "description": "Issue #123: timestamp of the developer's manual confirmation that the interview gathered enough context; unlocks the proposal gate when no structured understanding could be built (zero-base fallback)." },
+        "understanding_confirmed_by": { "type": ["string", "null"] },
+        "materialization_diff": { "type": ["string", "null"] },
+        "materialization_ref": { "type": ["string", "null"] },
+        "materialized_at": { "type": ["number", "null"] },
         "messages": { "type": "array", "items": { "$ref": "#/definitions/InterviewMessage" } },
         "proposals": { "type": "array", "items": { "$ref": "#/definitions/InterviewProposal" } },
         "created_at": { "type": "number" },
@@ -806,11 +817,13 @@
     },
     "InterviewDialogueTurnRequest": {
       "type": "object",
-      "description": "Request body for a single interview dialogue turn (Issue #69).",
+      "description": "Request body for a single interview dialogue turn (Issue #69). generate_proposals gates proposal output (Issue #83); answered_question lets the server consume the open question the user just answered (Issue #123).",
       "required": ["user_message"],
       "properties": {
         "user_message": { "type": "string", "minLength": 1, "maxLength": 20000 },
-        "budget": { "type": ["integer", "null"], "minimum": 1000, "maximum": 500000 }
+        "budget": { "type": ["integer", "null"], "minimum": 1000, "maximum": 500000 },
+        "generate_proposals": { "type": "boolean", "default": false },
+        "answered_question": { "type": ["string", "null"], "maxLength": 2000 }
       },
       "additionalProperties": false
     },
@@ -836,7 +849,11 @@
         "proposals": { "type": "array", "items": { "$ref": "#/definitions/InterviewDialogueProposalOut" } },
         "next_questions": { "type": "array", "items": { "type": "string" } },
         "intelligence_run": { "oneOf": [{ "$ref": "#/definitions/IntelligenceRun" }, { "type": "null" }] },
-        "error": { "type": ["string", "null"] }
+        "error": { "type": ["string", "null"] },
+        "stage": { "enum": ["understanding_initialized", "purpose_confirmation", "capability_confirmation", "element_classification", "api_boundary_mapping", "probe_flow_selection", "proposal_generation", null] },
+        "current_understanding": { "type": ["object", "null"] },
+        "gap_analysis": { "type": ["array", "null"], "items": { "type": "object" } },
+        "open_questions_structured": { "type": ["array", "null"], "items": { "type": "object" } }
       },
       "additionalProperties": false
     },

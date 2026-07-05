@@ -190,6 +190,8 @@ export interface InterviewSessionOut {
   open_questions: OpenQuestion[] | null;
   user_intent: string | null;
   last_error: string | null;
+  understanding_confirmed_at: number | null;
+  understanding_confirmed_by: string | null;
   materialization_diff: string | null;
   materialization_ref: string | null;
   materialized_at: number | null;

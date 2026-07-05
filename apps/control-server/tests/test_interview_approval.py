@@ -114,10 +114,20 @@ def _valid_audit():
 
 
 def _advance_to_proposal_generation(client, session_id, headers):
-    """Advance a session through all stages to proposal_generation."""
+    """Reach proposal_generation with the understanding gate satisfied.
+
+    Records an interview answer and the developer's manual confirmation
+    (Issue #123), which advances the session and unlocks proposal creation.
+    """
     r = client.post(
-        f"/interview/sessions/{session_id}/advance-stage",
-        json={"stage": "proposal_generation"},
+        f"/interview/sessions/{session_id}/messages",
+        json={"role": "user", "content": "対象と目的を確認しました"},
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    r = client.post(
+        f"/interview/sessions/{session_id}/confirm-understanding",
+        json={"actor": "root"},
         headers=headers,
     )
     assert r.status_code == 200, r.text
