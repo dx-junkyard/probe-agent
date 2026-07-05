@@ -715,7 +715,7 @@ def test_question_evidence_unknown_path_fails_closed():
 
 
 def test_question_evidence_out_of_range_fails_closed():
-    """Line ranges that overlap no known span for the path are rejected."""
+    """Line ranges outside any known span for the path are rejected."""
     response = _valid_response(proposals=[])
     response["next_questions"] = [{
         "question_text": "これは正しいですか?",
@@ -731,7 +731,53 @@ def test_question_evidence_out_of_range_fails_closed():
     )
 
     assert result.error is not None
-    assert "overlap" in result.error
+    assert "not contained" in result.error
+    assert result.next_questions == []
+
+
+def test_question_evidence_partial_overlap_not_containment_fails_closed():
+    """A range that merely overlaps a known span (rather than being fully
+    contained within it) is rejected — overlap alone is not sufficient."""
+    response = _valid_response(proposals=[])
+    response["next_questions"] = [{
+        "question_text": "これは正しいですか?",
+        "hypothesis": "仮説",
+        # Known span for src/summarize.py is (1, 10); this range extends
+        # far past it and must not be accepted just because it overlaps.
+        "evidence_refs": [{"path": "src/summarize.py", "start_line": 1, "end_line": 999_999}],
+        "answer_options": [],
+    }]
+    client = FakeLLMClient(response=response)
+
+    result = generate_interview_turn(
+        client, _make_config(),
+        context_pack=_context_pack(), history=[], user_message="質問してください",
+    )
+
+    assert result.error is not None
+    assert "not contained" in result.error
+    assert result.next_questions == []
+
+
+def test_question_evidence_path_only_fails_closed():
+    """Evidence refs without a concrete line range (path-only evidence) are
+    rejected at parse time — start_line/end_line are required, >= 1."""
+    response = _valid_response(proposals=[])
+    response["next_questions"] = [{
+        "question_text": "これは正しいですか?",
+        "hypothesis": "仮説",
+        "evidence_refs": [{"path": "src/summarize.py"}],
+        "answer_options": [],
+    }]
+    client = FakeLLMClient(response=response)
+
+    result = generate_interview_turn(
+        client, _make_config(),
+        context_pack=_context_pack(), history=[], user_message="質問してください",
+    )
+
+    assert result.error is not None
+    assert "Failed to parse structured response" in result.error
     assert result.next_questions == []
 
 
