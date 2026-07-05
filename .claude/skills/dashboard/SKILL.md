@@ -83,11 +83,19 @@ The dashboard should support:
   action. There is no manual stage-advance control — the server advances the
   stage on each dialogue turn. `Build Understanding` is kept only as the
   secondary 「理解を更新」(refresh) action. Proposal and diff panels stay
-  hidden until the `proposal_generation` stage; proposal generation stays
-  locked server-side until understanding is confirmed (Issue #83 gate).
+  hidden until the `proposal_generation` stage AND the proposal gate is
+  unlocked. The gate (server-side, Issue #83 + #123) passes when a built
+  `current_understanding` exists OR the developer explicitly confirmed the
+  zero-base context via `POST .../confirm-understanding` (persisted as
+  `understanding_confirmed_at/by` — a manual decision record). The UI never
+  shows "ready for proposals" while the gate is locked; in that case it
+  shows the 「この内容で提案生成に進む」 confirm action instead.
   Zero-base questions are a fixed UI questionnaire (goal / affected area /
   desired change / constraints / success criteria); answers still flow
   through the reasoning-model dialogue turn — never heuristic inference.
+  Each dialogue turn sends `answered_question` (the focused open question)
+  so the server consumes it from `open_questions` and appends the model's
+  follow-up questions; the UI must not re-ask answered questions.
 
 ## Authentication model
 

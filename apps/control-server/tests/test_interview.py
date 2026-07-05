@@ -657,3 +657,206 @@ def test_proposal_provenance_fields_persisted(admin_client):
     assert proposal["capability_name"] == "Trace Recording"
     assert proposal["evidence_summary"] == "README.md:1-5 describes trace recording"
     assert proposal["proposal_confidence"] == 0.85
+
+
+# --- Issue #123: zero-base confirmation gate + open-question consumption -----
+
+
+def _stub_reasoning_turn(monkeypatch, *, proposals=None, next_questions=None):
+    """Stub the route-level reasoning turn with a successful result.
+
+    Only the LLM call is stubbed; persistence, gating, and question
+    consumption run through the real route code.
+    """
+    from app.routes import interview as interview_routes
+    from app.interview_agent import InterviewTurnResult
+
+    def fake_create_llm_client(config):
+        return object()
+
+    def fake_generate_interview_turn(client, config, *, context_pack, history, user_message):
+        return InterviewTurnResult(
+            provider="anthropic",
+            model="claude-sonnet-4-5",
+            is_mock=False,
+            assistant_message="了解しました。",
+            proposals=list(proposals or []),
+            next_questions=list(next_questions or []),
+        )
+
+    monkeypatch.setattr(interview_routes, "create_llm_client", fake_create_llm_client)
+    monkeypatch.setattr(
+        interview_routes, "generate_interview_turn", fake_generate_interview_turn
+    )
+
+
+def _stub_proposal_result():
+    from app.interview_agent import InterviewProposalResult
+    from app.models import InterviewProposalMetadataBlock, InterviewProposalProbePlan
+
+    item = _valid_proposal_item()
+    return InterviewProposalResult(
+        path=item["path"],
+        qualified_name=item["qualified_name"],
+        symbol_id=None,
+        metadata=InterviewProposalMetadataBlock(**item["metadata"]),
+        probe_plan=InterviewProposalProbePlan(**item["probe_plan"]),
+    )
+
+
+def _set_open_questions(session_id, questions):
+    import json
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE interview_session SET open_questions = ? WHERE id = ?",
+            (json.dumps(questions, ensure_ascii=False), session_id),
+        )
+
+
+def test_confirm_understanding_requires_context(admin_client):
+    """Confirming an empty session (no understanding, no answers) is rejected."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "empty confirm"},
+        headers=headers,
+    ).json()
+
+    r = admin_client.post(
+        f"/interview/sessions/{session['id']}/confirm-understanding",
+        json={"actor": "root"},
+        headers=headers,
+    )
+    assert r.status_code == 422
+
+
+def test_confirm_understanding_unlocks_zero_base_proposals(admin_client, monkeypatch):
+    """Zero-base flow: manual confirmation satisfies the proposal gate."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "zero base"},
+        headers=headers,
+    ).json()
+    sid = session["id"]
+
+    # Zero-base answers exist as user messages; no current_understanding.
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/messages",
+        json={"role": "user", "content": "目標はトレースの安定運用です"},
+        headers=headers,
+    )
+    assert r.status_code == 201
+
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/confirm-understanding",
+        json={"actor": "root"},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["understanding_confirmed_at"] is not None
+    assert body["understanding_confirmed_by"] == "root"
+    assert body["stage"] == "proposal_generation"
+    assert body["current_understanding"] is None
+
+    # With confirmation recorded, a successful reasoning turn now persists
+    # proposals even though current_understanding is still null.
+    _stub_reasoning_turn(monkeypatch, proposals=[_stub_proposal_result()])
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/dialogue-turn",
+        json={"user_message": "提案を生成してください", "generate_proposals": True},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["error"] is None
+    assert len(body["proposals"]) == 1
+
+    detail = admin_client.get(f"/interview/sessions/{sid}", headers=headers).json()
+    assert len(detail["proposals"]) == 1
+    assert detail["proposals"][0]["decision_method"] == "reasoning_llm"
+
+
+def test_proposals_stay_gated_without_understanding_or_confirmation(
+    admin_client, monkeypatch
+):
+    """Reaching proposal_generation alone must not unlock proposals."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "still gated"},
+        headers=headers,
+    ).json()
+    sid = session["id"]
+    _advance_to_proposal_generation(admin_client, sid, headers)
+
+    _stub_reasoning_turn(monkeypatch, proposals=[_stub_proposal_result()])
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/dialogue-turn",
+        json={"user_message": "提案を生成してください", "generate_proposals": True},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["proposals"] == []
+
+    detail = admin_client.get(f"/interview/sessions/{sid}", headers=headers).json()
+    assert detail["proposals"] == []
+
+
+def test_dialogue_turn_consumes_answered_question(admin_client, monkeypatch):
+    """The answered open question is removed; model follow-ups are appended."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "consume question"},
+        headers=headers,
+    ).json()
+    sid = session["id"]
+    _set_open_questions(sid, [
+        {"question": "認証はどの層で行いますか?", "category": "boundary", "priority": "high"},
+        {"question": "トレースの保持期間は?", "category": "capability", "priority": "low"},
+    ])
+
+    _stub_reasoning_turn(monkeypatch, next_questions=["リトライ方針はありますか?"])
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/dialogue-turn",
+        json={
+            "user_message": "APIゲートウェイ層で認証します",
+            "answered_question": "認証はどの層で行いますか?",
+        },
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    questions = body["open_questions_structured"]
+    texts = [q["question"] for q in questions]
+    assert "認証はどの層で行いますか?" not in texts
+    assert "トレースの保持期間は?" in texts
+    assert "リトライ方針はありますか?" in texts
+    followup = next(q for q in questions if q["question"] == "リトライ方針はありますか?")
+    assert followup["category"] == "followup"
+    assert followup["priority"] == "medium"
+
+    detail = admin_client.get(f"/interview/sessions/{sid}", headers=headers).json()
+    assert [q["question"] for q in detail["open_questions"]] == texts
+
+
+def test_understanding_confirmation_columns_migrated(admin_client):
+    """Additive migration: confirmation columns exist and default to null."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    data = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "migration"},
+        headers=headers,
+    ).json()
+    assert data["understanding_confirmed_at"] is None
+    assert data["understanding_confirmed_by"] is None

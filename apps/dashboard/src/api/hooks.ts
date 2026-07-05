@@ -509,7 +509,12 @@ export function useInterviewContextPack(sessionId: number | null) {
 export function useInterviewDialogueTurn(sessionId: number | null) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (data: { user_message: string; budget?: number; generate_proposals?: boolean }) =>
+    mutationFn: (data: {
+      user_message: string;
+      budget?: number;
+      generate_proposals?: boolean;
+      answered_question?: string;
+    }) =>
       api.post<InterviewDialogueTurnOut>(`/interview/sessions/${sessionId}/dialogue-turn`, data),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
@@ -582,6 +587,21 @@ export function useAdvanceInterviewStage(sessionId: number | null) {
     mutationFn: (data: { stage: string; user_intent?: string }) =>
       api.post<InterviewSessionOut>(
         `/interview/sessions/${sessionId}/advance-stage`,
+        data,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+      qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
+    },
+  });
+}
+
+export function useConfirmInterviewUnderstanding(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { actor: string }) =>
+      api.post<InterviewSessionOut>(
+        `/interview/sessions/${sessionId}/confirm-understanding`,
         data,
       ),
     onSuccess: () => {

@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import {
   useApproveInterviewProposal,
+  useConfirmInterviewUnderstanding,
   useCreateInterviewSession,
   useEditInterviewProposal,
   useInterviewApprovedSet,
@@ -145,6 +146,15 @@ function hasUnderstandingContent(u: CurrentUnderstanding | null | undefined): bo
   ].some(items => (items ?? []).length > 0);
 }
 
+// 提案生成のロック解除条件: 構築済みの理解があるか、ゼロベースで
+// ユーザーが内容を明示的に確定した(manual decision)場合のみ。
+function proposalsUnlocked(session: InterviewSessionDetailOut): boolean {
+  return (
+    hasUnderstandingContent(session.current_understanding) ||
+    session.understanding_confirmed_at != null
+  );
+}
+
 function deriveUiState(
   session: InterviewSessionDetailOut,
   building: boolean,
@@ -152,6 +162,8 @@ function deriveUiState(
   if (building) return "preparing";
   const stage = session.stage ?? "understanding_initialized";
   if (stage === "proposal_generation") {
+    // ステージ到達だけでは解除しない: 未確定のゼロベースは確定を求める。
+    if (!proposalsUnlocked(session)) return "zero_base";
     return (session.proposals ?? []).length > 0 ? "proposal_review" : "ready_for_proposals";
   }
   if (hasUnderstandingContent(session.current_understanding)) {
@@ -477,6 +489,7 @@ export default function InterviewPage() {
   const edit = useEditInterviewProposal(selectedSessionId);
   const materialize = useMaterializeInterview(selectedSessionId);
   const updateUnderstanding = useUpdateInterviewUnderstanding();
+  const confirmUnderstanding = useConfirmInterviewUnderstanding(selectedSessionId);
 
   const [message, setMessage] = useState("");
   const [editing, setEditing] = useState<InterviewProposalOut | null>(null);
@@ -493,6 +506,7 @@ export default function InterviewPage() {
 
   const building = createSession.isPending || updateUnderstanding.isPending;
   const uiState: InterviewUiState | null = session ? deriveUiState(session, building) : null;
+  const unlocked = session ? proposalsUnlocked(session) : false;
 
   useEffect(() => {
     if (!selectedSessionId && sortedSessions.length > 0) {
@@ -505,6 +519,12 @@ export default function InterviewPage() {
     [session?.messages],
   );
 
+  // ゼロベースの固定質問に一通り回答した(またはステージを走り切った)ら、
+  // ユーザーによる明示的な確定で提案生成をロック解除する。
+  const zeroBaseComplete =
+    uiState === "zero_base" &&
+    (userMessageCount >= ZERO_BASE_QUESTIONS.length || isProposalStage);
+
   // 現在ユーザーに求める「1つの質問/確認」を導出する。
   const focusedQuestion = useMemo(() => {
     if (!session || !uiState) return null;
@@ -516,6 +536,9 @@ export default function InterviewPage() {
       return open.length > 0 ? open[0].question : STAGE_QUESTIONS[currentStage];
     }
     if (uiState === "zero_base") {
+      if (zeroBaseComplete) {
+        return "必要な回答が揃いました。補足があれば入力し、なければ「この内容で提案生成に進む」を押して内容を確定してください。";
+      }
       const idx = Math.min(userMessageCount, ZERO_BASE_QUESTIONS.length - 1);
       return ZERO_BASE_QUESTIONS[idx];
     }
@@ -523,7 +546,17 @@ export default function InterviewPage() {
       return "提案を生成する準備ができました。対象にしたい範囲や重視したい観点があれば入力し、「送信して提案を生成」を押してください。";
     }
     return null;
-  }, [session, uiState, currentStage, userMessageCount]);
+  }, [session, uiState, currentStage, userMessageCount, zeroBaseComplete]);
+
+  // fill_gaps で表示中の open question を回答対象としてサーバーに渡し、
+  // 回答済みの質問が再表示されないよう消費してもらう。
+  const answeredQuestionForTurn = useMemo(() => {
+    if (uiState !== "fill_gaps" || !session) return undefined;
+    const open = sortQuestions(session.open_questions ?? []);
+    return open.length > 0 && open[0].question === focusedQuestion
+      ? focusedQuestion
+      : undefined;
+  }, [uiState, session, focusedQuestion]);
 
   const nextActionText = useMemo(() => {
     switch (uiState) {
@@ -536,7 +569,9 @@ export default function InterviewPage() {
       case "fill_gaps":
         return "表示中の質問に回答して送信してください。回答が十分になると自動的に次の確認へ進みます。";
       case "zero_base":
-        return "自動では十分な理解を構築できませんでした。表示される質問に1つずつ回答してください。";
+        return zeroBaseComplete
+          ? "必要な回答が揃いました。「この内容で提案生成に進む」で内容を確定すると提案を生成できます。"
+          : "自動では十分な理解を構築できませんでした。表示される質問に1つずつ回答してください。";
       case "ready_for_proposals":
         return "「送信して提案を生成」を押すと、確認済みの理解にもとづいて提案が生成されます。";
       case "proposal_review":
@@ -546,7 +581,7 @@ export default function InterviewPage() {
       default:
         return "";
     }
-  }, [uiState, approvedCount]);
+  }, [uiState, approvedCount, zeroBaseComplete]);
 
   const startSession = async () => {
     if (!latestSnapshot) {
@@ -596,12 +631,23 @@ export default function InterviewPage() {
     try {
       const result = await dialogueTurn.mutateAsync({
         user_message: text,
-        generate_proposals: isProposalStage,
+        generate_proposals: isProposalStage && unlocked,
+        answered_question: answeredQuestionForTurn,
       });
       setMessage("");
       if (result.error) toast.error(result.error);
       else if (result.proposals.length) toast.success(`${result.proposals.length}件の提案を生成しました`);
       else toast.success("回答を送信しました");
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
+  const doConfirmUnderstanding = async () => {
+    if (!selectedSessionId) return;
+    try {
+      await confirmUnderstanding.mutateAsync({ actor });
+      toast.success("内容を確定しました。提案を生成できます。");
     } catch (e) {
       toast.error(String(e));
     }
@@ -776,11 +822,22 @@ export default function InterviewPage() {
                           <p className="text-sm">{focusedQuestion}</p>
                         </div>
                       )}
+                      {zeroBaseComplete && (
+                        <Button
+                          size="sm"
+                          onClick={doConfirmUnderstanding}
+                          disabled={confirmUnderstanding.isPending}
+                          data-testid="confirm-understanding"
+                        >
+                          <CheckCircle className="h-4 w-4 mr-1" />
+                          {confirmUnderstanding.isPending ? "確定中..." : "この内容で提案生成に進む"}
+                        </Button>
+                      )}
                       <Textarea
                         rows={4}
                         value={message}
                         onChange={e => setMessage(e.target.value)}
-                        placeholder={isProposalStage
+                        placeholder={isProposalStage && unlocked
                           ? "提案の対象範囲や重視したい観点があれば入力してください。"
                           : "上の質問への回答や修正点を入力してください。"}
                       />
@@ -789,7 +846,7 @@ export default function InterviewPage() {
                           <Send className="h-4 w-4 mr-1" />
                           {dialogueTurn.isPending
                             ? "送信中..."
-                            : isProposalStage
+                            : isProposalStage && unlocked
                               ? "送信して提案を生成"
                               : "回答を送信"}
                         </Button>
@@ -799,8 +856,8 @@ export default function InterviewPage() {
                 </CardContent>
               </Card>
 
-              {/* 提案・差分は proposal_generation 到達まで表示しない(Issue #123) */}
-              {isProposalStage && (
+              {/* 提案・差分は proposal_generation 到達 + ロック解除まで表示しない(Issue #123) */}
+              {isProposalStage && unlocked && (
                 <>
                   <Card>
                     <CardHeader>

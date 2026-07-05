@@ -1729,6 +1729,8 @@ class InterviewSessionOut(BaseModel):
     open_questions: Optional[List[Dict[str, Any]]] = None
     user_intent: Optional[str] = None
     last_error: Optional[str] = None
+    understanding_confirmed_at: Optional[float] = None
+    understanding_confirmed_by: Optional[str] = None
     materialization_diff: Optional[str] = None
     materialization_ref: Optional[str] = None
     materialized_at: Optional[float] = None
@@ -1939,6 +1941,24 @@ class InterviewDialogueTurnRequest(BaseModel):
     user_message: str = Field(..., min_length=1, max_length=20_000)
     budget: Optional[int] = Field(default=None, ge=1000, le=500_000)
     generate_proposals: bool = False
+    # Issue #123: the open question the user is answering with this turn.
+    # The server removes it from the session's open_questions (exact match)
+    # so the UI never re-asks an already-answered question.
+    answered_question: Optional[str] = Field(default=None, max_length=2000)
+
+
+class InterviewConfirmUnderstandingRequest(BaseModel):
+    """Manual confirmation that the gathered interview context is sufficient.
+
+    Issue #123: in the zero-base fallback (no structured understanding could
+    be built), the developer explicitly confirms that the conversation
+    contains enough context to move to proposal generation. This is a manual
+    decision record, not an LLM output.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str = Field(min_length=1, max_length=200)
 
 
 class InterviewDialogueProposalOut(BaseModel):

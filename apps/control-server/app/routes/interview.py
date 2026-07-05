@@ -40,6 +40,7 @@ from ..llm import LLMConfig, LLMError, create_llm_client, is_reasoning_model
 from ..models import (
     InterviewApprovedItemOut,
     InterviewApprovedSetOut,
+    InterviewConfirmUnderstandingRequest,
     InterviewContextPack,
     InterviewDialogueProposalOut,
     InterviewDialogueTurnOut,
@@ -101,6 +102,14 @@ def _session_out(row) -> InterviewSessionOut:
         open_questions=_json.loads(row["open_questions"]) if row["open_questions"] else None,
         user_intent=row["user_intent"],
         last_error=row["last_error"] if "last_error" in row.keys() else None,
+        understanding_confirmed_at=(
+            row["understanding_confirmed_at"]
+            if "understanding_confirmed_at" in row.keys() else None
+        ),
+        understanding_confirmed_by=(
+            row["understanding_confirmed_by"]
+            if "understanding_confirmed_by" in row.keys() else None
+        ),
         materialization_diff=row["materialization_diff"],
         materialization_ref=row["materialization_ref"],
         materialized_at=row["materialized_at"],
@@ -639,12 +648,23 @@ def interview_dialogue_turn(
             )
             asst_message_id = asst_cur.lastrowid
 
-            # Gate proposals behind proposal_generation stage + explicit request (Issue #83).
+            # Gate proposals behind proposal_generation stage + explicit request
+            # (Issue #83). The understanding requirement is satisfied either by
+            # a built structured understanding, or — in the zero-base fallback
+            # where none could be built — by the developer's explicit manual
+            # confirmation of the gathered context (Issue #123).
             current_stage = session["stage"] or "understanding_initialized"
+            understanding_confirmed = (
+                "understanding_confirmed_at" in session.keys()
+                and session["understanding_confirmed_at"] is not None
+            )
             proposals_allowed = (
                 current_stage == "proposal_generation"
                 and payload.generate_proposals
-                and session["current_understanding"] is not None
+                and (
+                    session["current_understanding"] is not None
+                    or understanding_confirmed
+                )
             )
 
             proposal_outs: List[InterviewDialogueProposalOut] = []
@@ -715,6 +735,37 @@ def interview_dialogue_turn(
 
             stage_updates = ["updated_at = ?"]
             stage_params: list = [now]
+
+            # Consume the answered open question and record the model's
+            # follow-up questions so the UI never re-asks what was already
+            # answered (Issue #123). Removal is an exact-text structural
+            # match; new questions come verbatim from the reasoning model.
+            existing_questions: List[dict] = (
+                json.loads(session["open_questions"]) if session["open_questions"] else []
+            )
+            remaining_questions = [
+                q for q in existing_questions
+                if not (
+                    payload.answered_question
+                    and q.get("question") == payload.answered_question
+                )
+            ]
+            known_texts = {q.get("question") for q in remaining_questions}
+            for question_text in turn.next_questions:
+                if question_text and question_text not in known_texts:
+                    remaining_questions.append({
+                        "question": question_text,
+                        "category": "followup",
+                        "priority": "medium",
+                    })
+                    known_texts.add(question_text)
+            remaining_questions = remaining_questions[:20]
+            if remaining_questions != existing_questions:
+                stage_updates.append("open_questions = ?")
+                stage_params.append(
+                    json.dumps(remaining_questions, ensure_ascii=False)
+                    if remaining_questions else None
+                )
 
             if payload.user_message.strip():
                 existing_intent = session["user_intent"] or ""
@@ -1230,6 +1281,80 @@ def materialize_interview_session(
         skipped=result.skipped,
         materialized_at=now,
     )
+
+
+# --- Understanding Confirmation (Issue #123) ---------------------------------
+
+
+@router.post(
+    "/interview/sessions/{session_id}/confirm-understanding",
+    response_model=InterviewSessionOut,
+)
+def confirm_interview_understanding(
+    session_id: int,
+    payload: InterviewConfirmUnderstandingRequest,
+    system_id: int = Depends(get_system_id),
+) -> InterviewSessionOut:
+    """Record the developer's manual confirmation of the interview context.
+
+    In the zero-base fallback no structured understanding exists, so the
+    Issue #83 proposal gate can never be satisfied by ``current_understanding``
+    alone. This endpoint records an explicit manual decision that the
+    conversation gathered enough context, advances the session to
+    ``proposal_generation``, and thereby unlocks proposal generation. The
+    confirmation is a human decision (Principle 7 ``manual``), never an LLM
+    output.
+
+    probe-agent:
+      role: API boundary for manually confirming interview understanding
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: write
+      state_effects: [database-write]
+      probe_value: Verify manual confirmation unlocks the proposal gate and is persisted with actor and timestamp
+    """
+    now = time.time()
+    with get_conn() as conn:
+        session = _get_session_or_404(conn, session_id, system_id)
+
+        user_turns = conn.execute(
+            "SELECT COUNT(*) AS n FROM interview_message WHERE session_id = ? AND role = 'user'",
+            (session_id,),
+        ).fetchone()["n"]
+        if session["current_understanding"] is None and user_turns == 0:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Nothing to confirm: the session has no built understanding "
+                    "and no interview answers yet"
+                ),
+            )
+
+        new_stage = _advance_stage(
+            session["stage"] or "understanding_initialized",
+            "proposal_generation",
+        )
+        conn.execute(
+            """UPDATE interview_session
+               SET understanding_confirmed_at = ?, understanding_confirmed_by = ?,
+                   stage = ?, updated_at = ?
+               WHERE id = ? AND system_id = ?""",
+            (now, payload.actor, new_stage, now, session_id, system_id),
+        )
+        conn.execute(
+            """INSERT INTO interview_message
+                (session_id, system_id, role, content, created_at)
+            VALUES (?, ?, 'user', ?, ?)""",
+            (
+                session_id,
+                system_id,
+                "これまでの回答内容を確定し、提案生成に進みます。",
+                now,
+            ),
+        )
+        row = _get_session_or_404(conn, session_id, system_id)
+        return _session_out(row)
 
 
 # --- Stage Advancement (Issue #82) -------------------------------------------
