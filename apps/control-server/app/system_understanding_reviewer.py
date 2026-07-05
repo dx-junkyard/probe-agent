@@ -20,6 +20,7 @@ probe-agent:
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional
@@ -32,6 +33,7 @@ from .understanding_graph import UnderstandingGraph, GraphNode, EvidenceRef
 
 PROMPT_VERSION = "understanding-review-v1"
 SCHEMA_VERSION = "understanding-review-v1"
+DEFAULT_REVIEW_MAX_OUTPUT_TOKENS = 32_768
 
 
 CONFIDENCE_LEVELS = {"confirmed", "likely", "uncertain", "conflicting"}
@@ -168,6 +170,16 @@ Rules:
 - Order open questions from top-level purpose toward API/probe flow details.
 - Do NOT generate metadata or probe proposals — this is understanding only.
 - Use only the evidence provided in the input; do not invent facts.
+- Keep each top-level list to the most important 8 items.
+- Keep evidence to the strongest 3 references per item.
+- Keep summaries and reasons concise.
+"""
+
+_COMPACT_RETRY_PROMPT = """\
+Your previous response was not valid complete JSON, likely because it was too
+long or truncated. Regenerate the same schema as one compact JSON object only.
+Use at most 5 items in each top-level list, at most 2 evidence references per
+item, and concise one-sentence summaries.
 """
 
 
@@ -231,6 +243,25 @@ def _strip_fences(raw: str) -> str:
     return "\n".join(lines)
 
 
+def _review_max_output_tokens() -> int:
+    raw = os.getenv(
+        "INTELLIGENCE_REVIEW_MAX_OUTPUT_TOKENS",
+        str(DEFAULT_REVIEW_MAX_OUTPUT_TOKENS),
+    )
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("INTELLIGENCE_REVIEW_MAX_OUTPUT_TOKENS must be an integer") from exc
+    if value < 1:
+        raise ValueError("INTELLIGENCE_REVIEW_MAX_OUTPUT_TOKENS must be positive")
+    return value
+
+
+def _parse_review_response(raw: str) -> _RawReviewResponse:
+    parsed = json.loads(_strip_fences(raw))
+    return _RawReviewResponse.model_validate(parsed)
+
+
 def generate_understanding_review(
     client: LLMClient,
     config: LLMConfig,
@@ -254,6 +285,15 @@ def generate_understanding_review(
         )
 
     prompt = _build_review_prompt(graph, reconciliation, history)
+    try:
+        max_output_tokens = _review_max_output_tokens()
+    except ValueError as exc:
+        return ReviewResult(
+            provider=config.provider,
+            model=config.model,
+            is_mock=False,
+            error=str(exc),
+        )
 
     try:
         raw = client.generate_text(
@@ -262,7 +302,7 @@ def generate_understanding_review(
                 {"role": "user", "content": prompt},
             ],
             temperature=0.2,
-            max_tokens=8192,
+            max_tokens=max_output_tokens,
         )
     except LLMError as exc:
         return ReviewResult(
@@ -273,8 +313,25 @@ def generate_understanding_review(
         )
 
     try:
-        parsed = json.loads(_strip_fences(raw))
-        validated = _RawReviewResponse.model_validate(parsed)
+        validated = _parse_review_response(raw)
+    except json.JSONDecodeError:
+        try:
+            raw = client.generate_text(
+                [
+                    {"role": "system", "content": f"{_SYSTEM_PROMPT}\n\n{_COMPACT_RETRY_PROMPT}"},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.1,
+                max_tokens=max_output_tokens,
+            )
+            validated = _parse_review_response(raw)
+        except (json.JSONDecodeError, ValidationError, LLMError) as exc:
+            return ReviewResult(
+                provider=config.provider,
+                model=config.model,
+                is_mock=False,
+                error=f"Failed to parse review response: {exc}",
+            )
     except (json.JSONDecodeError, ValidationError) as exc:
         return ReviewResult(
             provider=config.provider,
