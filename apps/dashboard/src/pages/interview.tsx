@@ -2,12 +2,11 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import {
-  AlertCircle, CheckCircle, ChevronRight, FileCode, GitPullRequest,
-  HelpCircle, Layers, MessageSquareText, Pencil, Play, Send, Sparkles,
-  Target, XCircle,
+  AlertCircle, CheckCircle, FileCode, GitPullRequest,
+  HelpCircle, Layers, Loader2, MessageSquareText, Pencil, Play, Send,
+  Sparkles, XCircle,
 } from "lucide-react";
 import {
-  useAdvanceInterviewStage,
   useApproveInterviewProposal,
   useCreateInterviewSession,
   useEditInterviewProposal,
@@ -40,6 +39,7 @@ import type {
   InterviewProposalMetadataBlock,
   InterviewProposalOut,
   InterviewProposalProbePlan,
+  InterviewSessionDetailOut,
   InterviewStage,
   OpenQuestion,
   ProbeRecommendedMode,
@@ -61,16 +61,6 @@ const PROBE_MODES: ProbeRecommendedMode[] = ["trace", "shadow"];
 const RISK_LEVELS: ProbeSideEffectRisk[] = ["none", "low", "medium", "high"];
 const REPLAYABILITY: ProbeReplayability[] = ["safe", "caution", "unsafe"];
 
-const STAGE_LABELS: Record<InterviewStage, string> = {
-  understanding_initialized: "Understanding",
-  purpose_confirmation: "Purpose",
-  capability_confirmation: "Capabilities",
-  element_classification: "Elements",
-  api_boundary_mapping: "API Boundaries",
-  probe_flow_selection: "Probe Flows",
-  proposal_generation: "Proposals",
-};
-
 const STAGE_ORDER: InterviewStage[] = [
   "understanding_initialized",
   "purpose_confirmation",
@@ -81,8 +71,113 @@ const STAGE_ORDER: InterviewStage[] = [
   "proposal_generation",
 ];
 
+// ユーザー向けの進捗表示: ステージ名ではなく「何を確認する作業か」を示す。
+const STAGE_LABELS: Record<InterviewStage, string> = {
+  understanding_initialized: "準備",
+  purpose_confirmation: "目的",
+  capability_confirmation: "主要機能",
+  element_classification: "要素分類",
+  api_boundary_mapping: "API境界",
+  probe_flow_selection: "プローブ対象フロー",
+  proposal_generation: "提案",
+};
+
+const STAGE_WORK_DESCRIPTIONS: Record<InterviewStage, string> = {
+  understanding_initialized: "自動分析でシステム理解を構築します",
+  purpose_confirmation: "ゴールと成功基準を確認します",
+  capability_confirmation: "主要な機能領域を確認します",
+  element_classification: "構成要素の分類を確認します",
+  api_boundary_mapping: "責務の境界を確認します",
+  probe_flow_selection: "計測すべき重要な実行フローを確認します",
+  proposal_generation: "提案を生成・レビューします",
+};
+
+// 各ステージでの既定の確認質問(open questions が無い場合に表示)。
+const STAGE_QUESTIONS: Record<InterviewStage, string> = {
+  understanding_initialized: "自動分析の完了をお待ちください。",
+  purpose_confirmation:
+    "上記の理解(特に目的と成功基準)は正しいですか?正しければ「はい」、違う場合は修正すべき点を入力してください。",
+  capability_confirmation: "主要な機能領域の一覧に過不足はありませんか?",
+  element_classification: "各構成要素の分類は妥当ですか?修正があれば教えてください。",
+  api_boundary_mapping: "APIの責務境界はこの理解で正しいですか?",
+  probe_flow_selection: "計測(プローブ)すべき重要な実行フローはどれですか?",
+  proposal_generation: "必要な理解が揃いました。提案を生成できます。",
+};
+
+// ゼロベースインタビュー(自動理解が構築できない場合)の固定質問。
+// 質問文は固定のUIガイドであり、回答の解釈は常に推論モデル側で行う。
+const ZERO_BASE_QUESTIONS = [
+  "このシステム(または今回の取り組み)で達成したい目標は何ですか?",
+  "影響を受ける領域(機能・モジュール・API)はどこですか?",
+  "どのような変更・改善を望んでいますか?",
+  "守るべき制約(性能・互換性・安全性など)はありますか?",
+  "成功をどのように判定しますか?(成功基準)",
+];
+
+type InterviewUiState =
+  | "preparing"
+  | "needs_build"
+  | "confirm_understanding"
+  | "fill_gaps"
+  | "zero_base"
+  | "ready_for_proposals"
+  | "proposal_review";
+
+const UI_STATE_LABELS: Record<InterviewUiState, string> = {
+  preparing: "理解を構築中",
+  needs_build: "理解が未構築",
+  confirm_understanding: "理解の確認",
+  fill_gaps: "不足情報の確認",
+  zero_base: "ゼロベースインタビュー",
+  ready_for_proposals: "提案の準備完了",
+  proposal_review: "提案のレビューと承認",
+};
+
 function stageIndex(stage: InterviewStage): number {
   return STAGE_ORDER.indexOf(stage);
+}
+
+function hasUnderstandingContent(u: CurrentUnderstanding | null | undefined): boolean {
+  if (!u) return false;
+  return [
+    u.system_purpose, u.core_capabilities, u.capability_elements,
+    u.supporting_elements, u.api_boundaries, u.probe_flow_candidates,
+  ].some(items => (items ?? []).length > 0);
+}
+
+function deriveUiState(
+  session: InterviewSessionDetailOut,
+  building: boolean,
+): InterviewUiState {
+  if (building) return "preparing";
+  const stage = session.stage ?? "understanding_initialized";
+  if (stage === "proposal_generation") {
+    return (session.proposals ?? []).length > 0 ? "proposal_review" : "ready_for_proposals";
+  }
+  if (hasUnderstandingContent(session.current_understanding)) {
+    return stage === "purpose_confirmation" || stage === "understanding_initialized"
+      ? "confirm_understanding"
+      : "fill_gaps";
+  }
+  // 理解が使えない: 構築を試みて失敗した/空だった場合はゼロベースへ。
+  if (session.last_error || session.current_understanding) return "zero_base";
+  return "needs_build";
+}
+
+function sortQuestions(questions: OpenQuestion[]): OpenQuestion[] {
+  const rank = (p: string) => (p === "high" ? 0 : p === "medium" ? 1 : 2);
+  return [...questions].sort((a, b) => rank(a.priority) - rank(b.priority));
+}
+
+function buildConfirmationPrompt(u: CurrentUnderstanding): string {
+  const purposes = u.system_purpose.map(i => i.name).filter(Boolean).slice(0, 3);
+  const caps = u.core_capabilities.map(i => i.name).filter(Boolean).slice(0, 5);
+  const purposeText = purposes.length ? `「${purposes.join("、")}」` : "(目的は未推定)";
+  const capsText = caps.length ? `主要機能として「${caps.join("、")}」を持つ` : "";
+  return (
+    `このシステムを、${purposeText}を目的とし、${capsText}システムと理解しました。` +
+    "この理解は今回のセッションの対象として正しいですか?違う場合は、修正・絞り込みすべき点を教えてください。"
+  );
 }
 
 function provenanceVariant(value: string) {
@@ -219,26 +314,54 @@ function MetadataGrid({ metadata, probe }: {
   );
 }
 
-function StageStepper({ current }: { current: InterviewStage }) {
+function ProgressSteps({ current }: { current: InterviewStage }) {
   const currentIdx = stageIndex(current);
   return (
-    <div className="flex items-center gap-1 flex-wrap" data-testid="stage-stepper">
-      {STAGE_ORDER.map((stage, idx) => {
-        const isCurrent = idx === currentIdx;
-        const isDone = idx < currentIdx;
-        return (
-          <div key={stage} className="flex items-center gap-1">
-            {idx > 0 && <ChevronRight className="h-3 w-3 text-muted-foreground shrink-0" />}
+    <div className="space-y-1" data-testid="stage-stepper">
+      <div className="flex items-center gap-1 flex-wrap">
+        {STAGE_ORDER.map((stage, idx) => {
+          const isCurrent = idx === currentIdx;
+          const isDone = idx < currentIdx;
+          return (
             <Badge
+              key={stage}
               variant={isCurrent ? "default" : isDone ? "success" : "outline"}
               className={isCurrent ? "ring-2 ring-primary/30" : ""}
               data-testid={`stage-${stage}`}
             >
-              {STAGE_LABELS[stage]}
+              {isDone ? "✓ " : ""}{STAGE_LABELS[stage]}
             </Badge>
-          </div>
-        );
-      })}
+          );
+        })}
+      </div>
+      <p className="text-xs text-muted-foreground">
+        現在: {STAGE_LABELS[current]} — {STAGE_WORK_DESCRIPTIONS[current]}
+      </p>
+    </div>
+  );
+}
+
+function NextActionBanner({ uiState, nextAction }: {
+  uiState: InterviewUiState;
+  nextAction: string;
+}) {
+  return (
+    <div
+      className="rounded-md border bg-muted/40 p-3 flex items-start gap-3"
+      data-testid="next-action"
+    >
+      {uiState === "preparing" ? (
+        <Loader2 className="h-4 w-4 mt-0.5 shrink-0 animate-spin text-primary" />
+      ) : (
+        <Sparkles className="h-4 w-4 mt-0.5 shrink-0 text-primary" />
+      )}
+      <div className="min-w-0">
+        <div className="flex items-center gap-2">
+          <Badge variant="secondary">{UI_STATE_LABELS[uiState]}</Badge>
+          <span className="text-xs font-medium text-muted-foreground">次にやること</span>
+        </div>
+        <p className="text-sm mt-1">{nextAction}</p>
+      </div>
     </div>
   );
 }
@@ -270,7 +393,7 @@ function UnderstandingItemCard({ item, category }: { item: UnderstandingItem; ca
         <div className="text-[10px] text-muted-foreground">APIs: {item.related_apis.join(", ")}</div>
       )}
       {item.children.length > 0 && (
-        <div className="text-[10px] text-muted-foreground">Children: {item.children.join(", ")}</div>
+        <div className="text-[10px] text-muted-foreground">子要素: {item.children.join(", ")}</div>
       )}
     </div>
   );
@@ -278,12 +401,12 @@ function UnderstandingItemCard({ item, category }: { item: UnderstandingItem; ca
 
 function UnderstandingPanel({ understanding }: { understanding: CurrentUnderstanding }) {
   const sections: [string, UnderstandingItem[]][] = [
-    ["System Purpose", understanding.system_purpose],
-    ["Core Capabilities", understanding.core_capabilities],
-    ["Capability Elements", understanding.capability_elements],
-    ["Supporting Elements", understanding.supporting_elements],
-    ["API Boundaries", understanding.api_boundaries],
-    ["Probe Flow Candidates", understanding.probe_flow_candidates],
+    ["システムの目的", understanding.system_purpose],
+    ["主要機能", understanding.core_capabilities],
+    ["機能要素", understanding.capability_elements],
+    ["支援要素", understanding.supporting_elements],
+    ["API境界", understanding.api_boundaries],
+    ["プローブ対象フロー候補", understanding.probe_flow_candidates],
   ];
 
   const hasContent = sections.some(([, items]) => items.length > 0);
@@ -291,7 +414,7 @@ function UnderstandingPanel({ understanding }: { understanding: CurrentUnderstan
   if (!hasContent) {
     return (
       <div className="text-sm text-muted-foreground text-center py-4">
-        No understanding items found. The documentation may need more detail.
+        理解項目が見つかりませんでした。ドキュメントの内容が不足している可能性があります。
       </div>
     );
   }
@@ -335,30 +458,6 @@ function GapAnalysisPanel({ gaps }: { gaps: GapItem[] }) {
   );
 }
 
-function OpenQuestionsPanel({ questions }: { questions: OpenQuestion[] }) {
-  if (questions.length === 0) return null;
-  return (
-    <div className="space-y-2" data-testid="open-questions-panel">
-      {questions.map((q, idx) => (
-        <div key={idx} className="rounded-md border p-3 flex items-start gap-3">
-          <HelpCircle className="h-4 w-4 mt-0.5 shrink-0 text-blue-500" />
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <span className="text-sm">{q.question}</span>
-            </div>
-            <div className="flex gap-1 mt-1">
-              <Badge variant="outline">{q.category}</Badge>
-              <Badge variant={q.priority === "high" ? "destructive" : q.priority === "medium" ? "warning" : "outline"}>
-                {q.priority}
-              </Badge>
-            </div>
-          </div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
 export default function InterviewPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const sessionParam = Number(searchParams.get("session"));
@@ -377,21 +476,23 @@ export default function InterviewPage() {
   const reject = useRejectInterviewProposal(selectedSessionId);
   const edit = useEditInterviewProposal(selectedSessionId);
   const materialize = useMaterializeInterview(selectedSessionId);
-  const advanceStage = useAdvanceInterviewStage(selectedSessionId);
-  const updateUnderstanding = useUpdateInterviewUnderstanding(selectedSessionId);
+  const updateUnderstanding = useUpdateInterviewUnderstanding();
 
   const [message, setMessage] = useState("");
   const [editing, setEditing] = useState<InterviewProposalOut | null>(null);
   const [editForm, setEditForm] = useState<EditForm | null>(null);
   const [lastMaterialization, setLastMaterialization] = useState<InterviewMaterializeOut | null>(null);
-  const [userIntent, setUserIntent] = useState("");
 
   const sortedSessions = useMemo(() => sessions ?? [], [sessions]);
   const proposals = session?.proposals ?? [];
   const pendingCount = proposals.filter(p => p.approval_state === "proposed").length;
+  const approvedCount = approvedSet?.approved_count ?? 0;
   const diff = lastMaterialization?.diff || session?.materialization_diff || "";
   const currentStage = session?.stage ?? "understanding_initialized";
   const isProposalStage = currentStage === "proposal_generation";
+
+  const building = createSession.isPending || updateUnderstanding.isPending;
+  const uiState: InterviewUiState | null = session ? deriveUiState(session, building) : null;
 
   useEffect(() => {
     if (!selectedSessionId && sortedSessions.length > 0) {
@@ -399,18 +500,57 @@ export default function InterviewPage() {
     }
   }, [selectedSessionId, sortedSessions, setSearchParams]);
 
-  useEffect(() => {
-    if (session?.user_intent) setUserIntent(session.user_intent);
-  }, [session?.user_intent]);
-
-  const unclassifiedPreview = useMemo(
-    () => contextPack?.symbols.filter(s => s.classification === "unclassified").slice(0, 6) ?? [],
-    [contextPack],
+  const userMessageCount = useMemo(
+    () => (session?.messages ?? []).filter(m => m.role === "user").length,
+    [session?.messages],
   );
+
+  // 現在ユーザーに求める「1つの質問/確認」を導出する。
+  const focusedQuestion = useMemo(() => {
+    if (!session || !uiState) return null;
+    if (uiState === "confirm_understanding" && session.current_understanding) {
+      return buildConfirmationPrompt(session.current_understanding);
+    }
+    if (uiState === "fill_gaps") {
+      const open = sortQuestions(session.open_questions ?? []);
+      return open.length > 0 ? open[0].question : STAGE_QUESTIONS[currentStage];
+    }
+    if (uiState === "zero_base") {
+      const idx = Math.min(userMessageCount, ZERO_BASE_QUESTIONS.length - 1);
+      return ZERO_BASE_QUESTIONS[idx];
+    }
+    if (uiState === "ready_for_proposals") {
+      return "提案を生成する準備ができました。対象にしたい範囲や重視したい観点があれば入力し、「送信して提案を生成」を押してください。";
+    }
+    return null;
+  }, [session, uiState, currentStage, userMessageCount]);
+
+  const nextActionText = useMemo(() => {
+    switch (uiState) {
+      case "preparing":
+        return "ドキュメントとコードから自動でシステム理解を構築しています。完了までお待ちください。";
+      case "needs_build":
+        return "「理解を構築」を押して自動分析を実行してください。";
+      case "confirm_understanding":
+        return "推定した理解を確認し、正しければ「はい」、違う場合は修正点を入力して送信してください。";
+      case "fill_gaps":
+        return "表示中の質問に回答して送信してください。回答が十分になると自動的に次の確認へ進みます。";
+      case "zero_base":
+        return "自動では十分な理解を構築できませんでした。表示される質問に1つずつ回答してください。";
+      case "ready_for_proposals":
+        return "「送信して提案を生成」を押すと、確認済みの理解にもとづいて提案が生成されます。";
+      case "proposal_review":
+        return approvedCount > 0
+          ? "承認済みの提案から「差分を生成」でレビュー用の差分を作成できます。残りの提案のレビューも続けられます。"
+          : "各提案を承認・編集・却下してください。承認した提案から差分を生成できます。";
+      default:
+        return "";
+    }
+  }, [uiState, approvedCount]);
 
   const startSession = async () => {
     if (!latestSnapshot) {
-      toast.error("Create a repository snapshot first");
+      toast.error("先にリポジトリのスナップショットを作成してください");
       return;
     }
     try {
@@ -420,26 +560,30 @@ export default function InterviewPage() {
         focus: "Author reviewed probe-agent metadata and probe proposals",
       });
       setSearchParams({ session: String(created.id) });
-      toast.success("Interview started — building initial understanding…");
+      toast.success("インタビューを開始しました。システム理解を自動構築しています…");
       try {
-        await updateUnderstanding.mutateAsync();
-        toast.success("Initial understanding ready");
+        const updated = await updateUnderstanding.mutateAsync(created.id);
+        if (updated.last_error) {
+          toast.error(`自動理解の構築に失敗しました: ${updated.last_error}`);
+        } else {
+          toast.success("初期理解の構築が完了しました。内容を確認してください。");
+        }
       } catch (e) {
-        toast.error(`Understanding generation failed: ${String(e)}`);
+        toast.error(`自動理解の構築に失敗しました: ${String(e)}`);
       }
     } catch (e) {
       toast.error(String(e));
     }
   };
 
-  const initUnderstanding = async () => {
+  const refreshUnderstanding = async () => {
     if (!selectedSessionId) return;
     try {
-      const updated = await updateUnderstanding.mutateAsync();
+      const updated = await updateUnderstanding.mutateAsync(selectedSessionId);
       if (updated.last_error) {
-        toast.error(`Understanding review failed: ${updated.last_error}`);
+        toast.error(`理解の更新に失敗しました: ${updated.last_error}`);
       } else {
-        toast.success("Understanding updated");
+        toast.success("理解を更新しました");
       }
     } catch (e) {
       toast.error(String(e));
@@ -456,16 +600,8 @@ export default function InterviewPage() {
       });
       setMessage("");
       if (result.error) toast.error(result.error);
-      else toast.success(result.proposals.length ? `${result.proposals.length} proposal(s) generated` : "Interview turn saved");
-    } catch (e) {
-      toast.error(String(e));
-    }
-  };
-
-  const doAdvanceStage = async (targetStage: string) => {
-    try {
-      await advanceStage.mutateAsync({ stage: targetStage, user_intent: userIntent || undefined });
-      toast.success(`Advanced to ${STAGE_LABELS[targetStage as InterviewStage] ?? targetStage}`);
+      else if (result.proposals.length) toast.success(`${result.proposals.length}件の提案を生成しました`);
+      else toast.success("回答を送信しました");
     } catch (e) {
       toast.error(String(e));
     }
@@ -485,7 +621,7 @@ export default function InterviewPage() {
         metadata: metadataFromForm(editForm),
         probe_plan: editForm.probe_plan,
       });
-      toast.success("Edited proposal approved");
+      toast.success("修正した提案を承認しました");
       setEditing(null);
       setEditForm(null);
     } catch (e) {
@@ -498,25 +634,22 @@ export default function InterviewPage() {
     try {
       const result = await materialize.mutateAsync();
       setLastMaterialization(result);
-      toast.success(`Materialized ${result.items_materialized} item(s)`);
+      toast.success(`${result.items_materialized}件を差分化しました`);
     } catch (e) {
       toast.error(String(e));
     }
   };
-
-  const nextStageKey = stageIndex(currentStage) < STAGE_ORDER.length - 1
-    ? STAGE_ORDER[stageIndex(currentStage) + 1]
-    : null;
 
   return (
     <div className="space-y-6">
       <div className="flex items-start justify-between gap-3 flex-wrap">
         <div>
           <h1 className="text-2xl font-bold tracking-tight flex items-center gap-2">
-            <MessageSquareText className="h-6 w-6" /> System Interview
+            <MessageSquareText className="h-6 w-6" /> システムインタビュー
           </h1>
           <p className="text-sm text-muted-foreground mt-1 max-w-3xl">
-            Guided understanding workflow: build system knowledge before generating proposals.
+            開始すると、ドキュメントとコードの自動分析からシステム理解を構築し、
+            確認と不足情報の質問を経て提案生成へ進みます。
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -525,18 +658,18 @@ export default function InterviewPage() {
             value={selectedSessionId ? String(selectedSessionId) : ""}
             onChange={e => setSearchParams(e.target.value ? { session: e.target.value } : {})}
             disabled={!sortedSessions.length}
-            aria-label="Interview session"
+            aria-label="インタビューセッション"
           >
-            <option value="">No session selected</option>
+            <option value="">セッション未選択</option>
             {sortedSessions.map(s => (
               <option key={s.id} value={s.id}>
                 #{s.id} · snapshot {s.snapshot_id} · {s.status}
               </option>
             ))}
           </Select>
-          <Button size="sm" onClick={startSession} disabled={createSession.isPending || snapshotLoading || !latestSnapshot}>
+          <Button size="sm" onClick={startSession} disabled={building || snapshotLoading || !latestSnapshot}>
             <Sparkles className="h-4 w-4 mr-1" />
-            {createSession.isPending ? "Starting..." : "Start interview"}
+            {building ? "分析中..." : "インタビューを開始"}
           </Button>
         </div>
       </div>
@@ -547,8 +680,9 @@ export default function InterviewPage() {
       {!latestSnapshot && !snapshotLoading && (
         <Card>
           <CardContent className="py-8 text-center text-sm text-muted-foreground">
-            No repository snapshot is available. Create one on the{" "}
-            <Link className="underline" to="/repository">Repository</Link> page before starting an interview.
+            リポジトリのスナップショットがありません。インタビューを開始する前に{" "}
+            <Link className="underline" to="/repository">リポジトリ</Link>{" "}
+            ページでスナップショットを作成してください。
           </CardContent>
         </Card>
       )}
@@ -560,109 +694,43 @@ export default function InterviewPage() {
         </div>
       ) : !selectedSessionId || !session ? (
         <Card>
-          <CardContent className="py-10 text-center text-sm text-muted-foreground">
-            Start an interview from the latest repository snapshot or continue an existing session.
+          <CardContent className="py-10 text-center space-y-3">
+            <p className="text-sm text-muted-foreground">
+              「インタビューを開始」を押すと、最新スナップショットから自動でシステム理解を構築し、
+              確認する内容を1つずつ質問します。
+            </p>
+            <Button onClick={startSession} disabled={building || snapshotLoading || !latestSnapshot}>
+              <Sparkles className="h-4 w-4 mr-1" />
+              {building ? "分析中..." : "インタビューを開始"}
+            </Button>
           </CardContent>
         </Card>
       ) : (
         <>
-          {/* Stage stepper */}
+          {uiState && <NextActionBanner uiState={uiState} nextAction={nextActionText} />}
+
           <Card>
             <CardContent className="py-3">
-              <StageStepper current={currentStage} />
+              <ProgressSteps current={currentStage} />
             </CardContent>
           </Card>
 
-          <div className="grid grid-cols-1 xl:grid-cols-[360px_1fr] gap-4">
-            {/* Left column: session info + conversation */}
+          <div className="grid grid-cols-1 xl:grid-cols-[1fr_380px] gap-4">
+            {/* メイン: 会話がインタビューの主要な操作領域 */}
             <div className="space-y-4">
               <Card>
                 <CardHeader>
-                  <CardTitle className="text-sm">Session #{session.id}</CardTitle>
-                  <CardDescription>
-                    Snapshot {session.snapshot_id} · {formatTimestamp(session.updated_at)}
-                  </CardDescription>
-                </CardHeader>
-                <CardContent className="space-y-3 text-sm">
-                  <div className="grid grid-cols-3 gap-2">
-                    <div className="rounded-md border p-2">
-                      <div className="text-lg font-semibold">{proposals.length}</div>
-                      <div className="text-xs text-muted-foreground">proposals</div>
-                    </div>
-                    <div className="rounded-md border p-2">
-                      <div className="text-lg font-semibold">{approvedSet?.approved_count ?? 0}</div>
-                      <div className="text-xs text-muted-foreground">approved</div>
-                    </div>
-                    <div className="rounded-md border p-2">
-                      <div className="text-lg font-semibold">{pendingCount}</div>
-                      <div className="text-xs text-muted-foreground">pending</div>
-                    </div>
-                  </div>
-
-                  {/* User Intent / Target State */}
-                  <div className="rounded-md border p-3 space-y-2">
-                    <div className="flex items-center gap-2">
-                      <Target className="h-4 w-4 text-muted-foreground" />
-                      <span className="font-medium text-xs">User Intent / Target State</span>
-                    </div>
-                    <Textarea
-                      rows={2}
-                      value={userIntent}
-                      onChange={e => setUserIntent(e.target.value)}
-                      placeholder="What are you trying to achieve with this system?"
-                      className="text-xs"
-                    />
-                    {nextStageKey && (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        className="w-full"
-                        onClick={() => doAdvanceStage(nextStageKey)}
-                        disabled={advanceStage.isPending}
-                      >
-                        <ChevronRight className="h-4 w-4 mr-1" />
-                        {advanceStage.isPending ? "Advancing..." : `Advance to ${STAGE_LABELS[nextStageKey]}`}
-                      </Button>
-                    )}
-                  </div>
-
-                  {contextPack && (
-                    <div className="rounded-md border p-3 space-y-2">
-                      <div className="flex items-center justify-between">
-                        <span className="font-medium">Context pack</span>
-                        <Badge variant={contextPack.truncated ? "warning" : "secondary"}>
-                          {contextPack.budget_used_chars.toLocaleString()} chars
-                        </Badge>
-                      </div>
-                      <div className="text-xs text-muted-foreground">
-                        {contextPack.total_symbols} symbols · {contextPack.total_entrypoints} entrypoints ·{" "}
-                        {contextPack.unclassified_count} unclassified
-                      </div>
-                      <div className="space-y-1">
-                        {unclassifiedPreview.map(s => (
-                          <div key={s.symbol_id} className="truncate text-xs font-mono">
-                            {s.path}:{s.qualified_name}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </CardContent>
-              </Card>
-
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-sm">Conversation</CardTitle>
+                  <CardTitle className="text-sm">会話</CardTitle>
                   <CardDescription>
                     {isProposalStage
-                      ? "Turns are grounded in the pinned snapshot context."
-                      : "Answer the understanding questions before proposals are generated."}
+                      ? "ターンは固定スナップショットのコンテキストに基づきます。"
+                      : "システムからの確認・質問に回答すると、自動的に次の確認へ進みます。"}
                   </CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-3">
-                  <div className="space-y-2 max-h-[24rem] overflow-y-auto pr-1">
+                  <div className="space-y-2 max-h-[26rem] overflow-y-auto pr-1">
                     {session.messages.length === 0 ? (
-                      <div className="text-sm text-muted-foreground">No turns yet.</div>
+                      <div className="text-sm text-muted-foreground">まだ会話はありません。</div>
                     ) : session.messages.map(m => (
                       <div key={m.id} className="rounded-md border p-3 text-sm">
                         <div className="flex items-center justify-between gap-2 mb-1">
@@ -673,46 +741,252 @@ export default function InterviewPage() {
                       </div>
                     ))}
                   </div>
-                  <Textarea
-                    rows={5}
-                    value={message}
-                    onChange={e => setMessage(e.target.value)}
-                    placeholder={isProposalStage
-                      ? "Ask for metadata and probe proposals for the unclassified entrypoints."
-                      : "Answer the understanding questions or provide clarification."}
-                  />
-                  <div className="flex gap-2">
-                    <Button size="sm" onClick={sendTurn} disabled={dialogueTurn.isPending || !message.trim()}>
-                      <Send className="h-4 w-4 mr-1" />
-                      {dialogueTurn.isPending ? "Sending..." : "Send turn"}
-                    </Button>
-                  </div>
+
+                  {uiState === "preparing" ? (
+                    <div className="rounded-md border p-4 text-sm text-muted-foreground flex items-center gap-2" data-testid="preparing-indicator">
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      自動分析を実行中です。しばらくお待ちください…
+                    </div>
+                  ) : uiState === "needs_build" ? (
+                    <div className="rounded-md border p-4 space-y-2 text-sm" data-testid="needs-build">
+                      <p className="text-muted-foreground">
+                        このセッションではまだシステム理解が構築されていません。
+                      </p>
+                      <Button size="sm" onClick={refreshUnderstanding} disabled={building}>
+                        <Sparkles className="h-4 w-4 mr-1" />
+                        理解を構築
+                      </Button>
+                    </div>
+                  ) : (
+                    <>
+                      {uiState === "zero_base" && (
+                        <div
+                          className="rounded-md border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 p-3 text-xs text-amber-900 dark:text-amber-100"
+                          data-testid="zero-base-notice"
+                        >
+                          自動では十分なシステム理解を構築できませんでした。ゼロベースのインタビューに切り替えます。
+                          {session.last_error && (
+                            <div className="mt-1 font-mono break-words">{session.last_error}</div>
+                          )}
+                        </div>
+                      )}
+                      {focusedQuestion && (
+                        <div className="rounded-md border bg-muted/40 p-3 flex items-start gap-2" data-testid="focused-question">
+                          <HelpCircle className="h-4 w-4 mt-0.5 shrink-0 text-blue-500" />
+                          <p className="text-sm">{focusedQuestion}</p>
+                        </div>
+                      )}
+                      <Textarea
+                        rows={4}
+                        value={message}
+                        onChange={e => setMessage(e.target.value)}
+                        placeholder={isProposalStage
+                          ? "提案の対象範囲や重視したい観点があれば入力してください。"
+                          : "上の質問への回答や修正点を入力してください。"}
+                      />
+                      <div className="flex gap-2">
+                        <Button size="sm" onClick={sendTurn} disabled={dialogueTurn.isPending || !message.trim()}>
+                          <Send className="h-4 w-4 mr-1" />
+                          {dialogueTurn.isPending
+                            ? "送信中..."
+                            : isProposalStage
+                              ? "送信して提案を生成"
+                              : "回答を送信"}
+                        </Button>
+                      </div>
+                    </>
+                  )}
                 </CardContent>
               </Card>
+
+              {/* 提案・差分は proposal_generation 到達まで表示しない(Issue #123) */}
+              {isProposalStage && (
+                <>
+                  <Card>
+                    <CardHeader>
+                      <div className="flex items-center justify-between gap-2">
+                        <div>
+                          <CardTitle className="text-sm">提案レビュー</CardTitle>
+                          <CardDescription>
+                            各提案(メタデータ + プローブ計画)を承認・却下・編集してください。
+                          </CardDescription>
+                        </div>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={triggerMaterialization}
+                          disabled={materialize.isPending || approvedCount === 0}
+                        >
+                          <Play className="h-4 w-4 mr-1" />
+                          {materialize.isPending ? "生成中..." : "差分を生成"}
+                        </Button>
+                      </div>
+                    </CardHeader>
+                    <CardContent className="space-y-3">
+                      {proposals.length === 0 ? (
+                        <div className="text-sm text-muted-foreground" data-testid="no-proposals-yet">
+                          まだ提案はありません。会話から「送信して提案を生成」でレビュー項目を生成してください。
+                        </div>
+                      ) : proposals.map(proposal => (
+                        <div key={proposal.id} className="rounded-md border p-4 space-y-3" data-testid="interview-proposal-card">
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <div className="font-mono text-sm truncate">{proposal.qualified_name}</div>
+                              <div className="text-xs text-muted-foreground truncate">{proposal.path}</div>
+                            </div>
+                            <div className="flex flex-col items-end gap-1 shrink-0">
+                              <Badge variant={approvalVariant(proposal.approval_state)}>{proposal.approval_state}</Badge>
+                              <AuditBadge proposal={proposal} />
+                            </div>
+                          </div>
+                          {(proposal.capability_name || proposal.evidence_summary || proposal.proposal_confidence != null) && (
+                            <div className="rounded-md bg-muted/50 px-3 py-2 text-xs space-y-1">
+                              {proposal.capability_name && (
+                                <div><span className="font-medium">Capability:</span> {proposal.capability_name}</div>
+                              )}
+                              {proposal.evidence_summary && (
+                                <div><span className="font-medium">根拠:</span> {proposal.evidence_summary}</div>
+                              )}
+                              {proposal.proposal_confidence != null && (
+                                <div><span className="font-medium">確信度:</span> {(proposal.proposal_confidence * 100).toFixed(0)}%</div>
+                              )}
+                            </div>
+                          )}
+                          <MetadataGrid metadata={proposal.metadata} probe={proposal.probe_plan} />
+                          <div className="flex items-center gap-2 justify-end">
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              onClick={() => openEdit(proposal)}
+                              disabled={proposal.approval_state !== "proposed" || edit.isPending}
+                            >
+                              <Pencil className="h-4 w-4 mr-1" />
+                              編集
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              onClick={() => approve.mutateAsync({ proposalId: proposal.id, actor }).then(() => toast.success("提案を承認しました")).catch(e => toast.error(String(e)))}
+                              disabled={proposal.approval_state !== "proposed" || approve.isPending}
+                            >
+                              <CheckCircle className="h-4 w-4 mr-1 text-emerald-600" />
+                              承認
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              onClick={() => reject.mutateAsync({ proposalId: proposal.id, actor }).then(() => toast.success("提案を却下しました")).catch(e => toast.error(String(e)))}
+                              disabled={proposal.approval_state !== "proposed" || reject.isPending}
+                            >
+                              <XCircle className="h-4 w-4 mr-1 text-red-500" />
+                              却下
+                            </Button>
+                          </div>
+                        </div>
+                      ))}
+                    </CardContent>
+                  </Card>
+
+                  <Card>
+                    <CardHeader>
+                      <div className="flex items-center justify-between gap-2">
+                        <div>
+                          <CardTitle className="text-sm">レビュー用差分</CardTitle>
+                          <CardDescription>差分の生成までで停止し、適用は開発者がレビューして行います。</CardDescription>
+                        </div>
+                        <Button size="sm" variant="outline" onClick={() => openDiff(diff, session.id)} disabled={!diff}>
+                          <GitPullRequest className="h-4 w-4 mr-1" />
+                          差分を開く
+                        </Button>
+                      </div>
+                    </CardHeader>
+                    <CardContent className="space-y-3">
+                      {lastMaterialization?.skipped?.length ? (
+                        <div className="rounded-md border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 p-3 text-xs text-amber-900 dark:text-amber-100">
+                          {lastMaterialization.skipped.join("; ")}
+                        </div>
+                      ) : null}
+                      {diff ? (
+                        <pre className="max-h-[28rem] overflow-auto rounded-md border bg-muted p-3 text-xs whitespace-pre-wrap">
+                          {diff}
+                        </pre>
+                      ) : (
+                        <div className="rounded-md border p-6 text-center text-sm text-muted-foreground">
+                          提案を1件以上承認してから「差分を生成」を押すと、まとめて1つの差分が生成されます。
+                        </div>
+                      )}
+                      {session.materialization_ref && (
+                        <a className="inline-flex items-center text-sm underline" href={session.materialization_ref} target="_blank" rel="noreferrer">
+                          <FileCode className="h-4 w-4 mr-1" />
+                          Materialization リファレンスを開く
+                        </a>
+                      )}
+                    </CardContent>
+                  </Card>
+                </>
+              )}
             </div>
 
-            {/* Right column: understanding, gaps, proposals, diff */}
+            {/* サイド: 理解の内容・セッション情報(補助的な表示) */}
             <div className="space-y-4">
-              {/* Current Understanding */}
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">セッション #{session.id}</CardTitle>
+                  <CardDescription>
+                    Snapshot {session.snapshot_id} · {formatTimestamp(session.updated_at)}
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-3 text-sm">
+                  <div className="grid grid-cols-3 gap-2">
+                    <div className="rounded-md border p-2">
+                      <div className="text-lg font-semibold">{proposals.length}</div>
+                      <div className="text-xs text-muted-foreground">提案</div>
+                    </div>
+                    <div className="rounded-md border p-2">
+                      <div className="text-lg font-semibold">{approvedCount}</div>
+                      <div className="text-xs text-muted-foreground">承認済み</div>
+                    </div>
+                    <div className="rounded-md border p-2">
+                      <div className="text-lg font-semibold">{pendingCount}</div>
+                      <div className="text-xs text-muted-foreground">未処理</div>
+                    </div>
+                  </div>
+                  {contextPack && (
+                    <div className="rounded-md border p-3 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <span className="font-medium">コンテキストパック</span>
+                        <Badge variant={contextPack.truncated ? "warning" : "secondary"}>
+                          {contextPack.budget_used_chars.toLocaleString()} chars
+                        </Badge>
+                      </div>
+                      <div className="text-xs text-muted-foreground">
+                        {contextPack.total_symbols} symbols · {contextPack.total_entrypoints} entrypoints ·{" "}
+                        {contextPack.unclassified_count} 未分類
+                      </div>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+
               <Card>
                 <CardHeader>
                   <div className="flex items-center justify-between gap-2">
                     <div>
                       <CardTitle className="text-sm flex items-center gap-2">
-                        <Layers className="h-4 w-4" /> Current Understanding
+                        <Layers className="h-4 w-4" /> 現在の理解
                       </CardTitle>
                       <CardDescription>
-                        System knowledge built from documentation and code analysis.
+                        ドキュメントとコード分析から構築したシステム理解。
                       </CardDescription>
                     </div>
                     <Button
                       size="sm"
                       variant="outline"
-                      onClick={initUnderstanding}
-                      disabled={updateUnderstanding.isPending}
+                      onClick={refreshUnderstanding}
+                      disabled={building}
                     >
                       <Sparkles className="h-4 w-4 mr-1" />
-                      {updateUnderstanding.isPending ? "Analyzing..." : "Build Understanding"}
+                      {updateUnderstanding.isPending ? "分析中..." : "理解を更新"}
                     </Button>
                   </div>
                 </CardHeader>
@@ -721,7 +995,7 @@ export default function InterviewPage() {
                     <div className="rounded-md border border-destructive bg-destructive/10 p-3 mb-3 text-sm text-destructive flex items-start gap-2">
                       <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
                       <div>
-                        <div className="font-medium">Understanding generation failed</div>
+                        <div className="font-medium">理解の構築に失敗しました</div>
                         <div className="text-xs mt-1">{session.last_error}</div>
                       </div>
                     </div>
@@ -730,168 +1004,54 @@ export default function InterviewPage() {
                     <UnderstandingPanel understanding={session.current_understanding} />
                   ) : !session.last_error ? (
                     <div className="text-sm text-muted-foreground text-center py-6" data-testid="no-understanding">
-                      Click &ldquo;Build Understanding&rdquo; to analyze documentation and code.
+                      まだ理解は構築されていません。
                     </div>
                   ) : null}
                 </CardContent>
               </Card>
 
-              {/* Open Questions */}
-              {session.open_questions && session.open_questions.length > 0 && (
+              {session.open_questions && session.open_questions.length > 1 && (
                 <Card>
                   <CardHeader>
                     <CardTitle className="text-sm flex items-center gap-2">
-                      <HelpCircle className="h-4 w-4" /> Open Questions
+                      <HelpCircle className="h-4 w-4" /> 残りの質問
                     </CardTitle>
-                    <CardDescription>Questions to resolve for deeper understanding.</CardDescription>
+                    <CardDescription>この後の確認で1つずつ質問されます。</CardDescription>
                   </CardHeader>
                   <CardContent>
-                    <OpenQuestionsPanel questions={session.open_questions} />
+                    <div className="space-y-2" data-testid="open-questions-panel">
+                      {sortQuestions(session.open_questions).slice(1).map((q, idx) => (
+                        <div key={idx} className="rounded-md border p-3 flex items-start gap-3">
+                          <HelpCircle className="h-4 w-4 mt-0.5 shrink-0 text-blue-500" />
+                          <div className="min-w-0">
+                            <span className="text-sm">{q.question}</span>
+                            <div className="flex gap-1 mt-1">
+                              <Badge variant="outline">{q.category}</Badge>
+                              <Badge variant={q.priority === "high" ? "destructive" : q.priority === "medium" ? "warning" : "outline"}>
+                                {q.priority}
+                              </Badge>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
                   </CardContent>
                 </Card>
               )}
 
-              {/* Gap Analysis */}
               {session.gap_analysis && session.gap_analysis.length > 0 && (
                 <Card>
                   <CardHeader>
                     <CardTitle className="text-sm flex items-center gap-2">
-                      <AlertCircle className="h-4 w-4" /> Gap Analysis
+                      <AlertCircle className="h-4 w-4" /> ギャップ分析
                     </CardTitle>
-                    <CardDescription>Gaps between documentation and code.</CardDescription>
+                    <CardDescription>ドキュメントとコードの差分。</CardDescription>
                   </CardHeader>
                   <CardContent>
                     <GapAnalysisPanel gaps={session.gap_analysis} />
                   </CardContent>
                 </Card>
               )}
-
-              {/* Proposal Review — visible always but gated messaging */}
-              <Card>
-                <CardHeader>
-                  <div className="flex items-center justify-between gap-2">
-                    <div>
-                      <CardTitle className="text-sm">Proposal Review</CardTitle>
-                      <CardDescription>
-                        {isProposalStage
-                          ? "Approve, reject, or edit each combined metadata + probe item."
-                          : "Proposals will be available after understanding is confirmed."}
-                      </CardDescription>
-                    </div>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={triggerMaterialization}
-                      disabled={materialize.isPending || (approvedSet?.approved_count ?? 0) === 0}
-                    >
-                      <Play className="h-4 w-4 mr-1" />
-                      {materialize.isPending ? "Materializing..." : "Materialize"}
-                    </Button>
-                  </div>
-                </CardHeader>
-                <CardContent className="space-y-3">
-                  {!isProposalStage && proposals.length === 0 ? (
-                    <div className="text-sm text-muted-foreground" data-testid="no-proposals-yet">
-                      Complete the understanding stages to unlock proposal generation.
-                    </div>
-                  ) : proposals.length === 0 ? (
-                    <div className="text-sm text-muted-foreground">No proposals yet. Send an interview turn to generate review items.</div>
-                  ) : proposals.map(proposal => (
-                    <div key={proposal.id} className="rounded-md border p-4 space-y-3" data-testid="interview-proposal-card">
-                      <div className="flex items-start justify-between gap-3">
-                        <div className="min-w-0">
-                          <div className="font-mono text-sm truncate">{proposal.qualified_name}</div>
-                          <div className="text-xs text-muted-foreground truncate">{proposal.path}</div>
-                        </div>
-                        <div className="flex flex-col items-end gap-1 shrink-0">
-                          <Badge variant={approvalVariant(proposal.approval_state)}>{proposal.approval_state}</Badge>
-                          <AuditBadge proposal={proposal} />
-                        </div>
-                      </div>
-                      {(proposal.capability_name || proposal.evidence_summary || proposal.proposal_confidence != null) && (
-                        <div className="rounded-md bg-muted/50 px-3 py-2 text-xs space-y-1">
-                          {proposal.capability_name && (
-                            <div><span className="font-medium">Capability:</span> {proposal.capability_name}</div>
-                          )}
-                          {proposal.evidence_summary && (
-                            <div><span className="font-medium">Evidence:</span> {proposal.evidence_summary}</div>
-                          )}
-                          {proposal.proposal_confidence != null && (
-                            <div><span className="font-medium">Confidence:</span> {(proposal.proposal_confidence * 100).toFixed(0)}%</div>
-                          )}
-                        </div>
-                      )}
-                      <MetadataGrid metadata={proposal.metadata} probe={proposal.probe_plan} />
-                      <div className="flex items-center gap-2 justify-end">
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() => openEdit(proposal)}
-                          disabled={proposal.approval_state !== "proposed" || edit.isPending}
-                        >
-                          <Pencil className="h-4 w-4 mr-1" />
-                          Edit
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() => approve.mutateAsync({ proposalId: proposal.id, actor }).then(() => toast.success("Proposal approved")).catch(e => toast.error(String(e)))}
-                          disabled={proposal.approval_state !== "proposed" || approve.isPending}
-                        >
-                          <CheckCircle className="h-4 w-4 mr-1 text-emerald-600" />
-                          Approve
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() => reject.mutateAsync({ proposalId: proposal.id, actor }).then(() => toast.success("Proposal rejected")).catch(e => toast.error(String(e)))}
-                          disabled={proposal.approval_state !== "proposed" || reject.isPending}
-                        >
-                          <XCircle className="h-4 w-4 mr-1 text-red-500" />
-                          Reject
-                        </Button>
-                      </div>
-                    </div>
-                  ))}
-                </CardContent>
-              </Card>
-
-              <Card>
-                <CardHeader>
-                  <div className="flex items-center justify-between gap-2">
-                    <div>
-                      <CardTitle className="text-sm">Reviewable Diff</CardTitle>
-                      <CardDescription>Materialization stops at a diff artifact for developer review.</CardDescription>
-                    </div>
-                    <Button size="sm" variant="outline" onClick={() => openDiff(diff, session.id)} disabled={!diff}>
-                      <GitPullRequest className="h-4 w-4 mr-1" />
-                      Open diff
-                    </Button>
-                  </div>
-                </CardHeader>
-                <CardContent className="space-y-3">
-                  {lastMaterialization?.skipped?.length ? (
-                    <div className="rounded-md border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 p-3 text-xs text-amber-900 dark:text-amber-100">
-                      {lastMaterialization.skipped.join("; ")}
-                    </div>
-                  ) : null}
-                  {diff ? (
-                    <pre className="max-h-[28rem] overflow-auto rounded-md border bg-muted p-3 text-xs whitespace-pre-wrap">
-                      {diff}
-                    </pre>
-                  ) : (
-                    <div className="rounded-md border p-6 text-center text-sm text-muted-foreground">
-                      Approve at least one proposal, then materialize to generate a single combined diff.
-                    </div>
-                  )}
-                  {session.materialization_ref && (
-                    <a className="inline-flex items-center text-sm underline" href={session.materialization_ref} target="_blank" rel="noreferrer">
-                      <FileCode className="h-4 w-4 mr-1" />
-                      Open materialization reference
-                    </a>
-                  )}
-                </CardContent>
-              </Card>
             </div>
           </div>
 
@@ -899,7 +1059,7 @@ export default function InterviewPage() {
             {editing && editForm && (
               <>
                 <DialogHeader>
-                  <DialogTitle>Edit Proposal</DialogTitle>
+                  <DialogTitle>提案の編集</DialogTitle>
                 </DialogHeader>
                 <div className="space-y-4">
                   <div className="text-xs font-mono text-muted-foreground">{editing.path}:{editing.qualified_name}</div>
@@ -948,9 +1108,9 @@ export default function InterviewPage() {
                     <Textarea rows={4} value={editForm.probe_plan.reason} onChange={e => setEditForm({ ...editForm, probe_plan: { ...editForm.probe_plan, reason: e.target.value } })} />
                   </div>
                   <div className="flex justify-end gap-2">
-                    <Button variant="outline" onClick={() => { setEditing(null); setEditForm(null); }}>Cancel</Button>
+                    <Button variant="outline" onClick={() => { setEditing(null); setEditForm(null); }}>キャンセル</Button>
                     <Button onClick={saveEdit} disabled={edit.isPending}>
-                      {edit.isPending ? "Saving..." : "Save manual edit"}
+                      {edit.isPending ? "保存中..." : "修正を保存して承認"}
                     </Button>
                   </div>
                 </div>

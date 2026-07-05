@@ -591,15 +591,17 @@ export function useAdvanceInterviewStage(sessionId: number | null) {
   });
 }
 
-export function useUpdateInterviewUnderstanding(sessionId: number | null) {
+export function useUpdateInterviewUnderstanding() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: () =>
+    // Takes the target session id explicitly so it can run right after
+    // session creation, before the URL/search-param session id updates.
+    mutationFn: (sessionId: number) =>
       api.post<InterviewSessionOut>(
         `/interview/sessions/${sessionId}/update-understanding`,
         {},
       ),
-    onSuccess: () => {
+    onSuccess: (_data, sessionId) => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
       qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
     },

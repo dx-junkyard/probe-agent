@@ -70,6 +70,24 @@ The dashboard should support:
   actions. Never block the mutation waiting for completion, never offer
   retry on a completed step, and rely on the server-persisted job so a
   browser reload restores the active/last job state.
+- System Interview auto-understanding-first flow (Issue #123): the interview
+  page (`pages/interview.tsx`) is Japanese-language and state-driven. Clicking
+  「インタビューを開始」 creates the session and immediately triggers
+  `update-understanding` (auto-understanding-first). The UI derives one
+  explicit state from server data (deterministic finite set):
+  `preparing` (analysis running) / `needs_build` (no understanding yet, no
+  error) / `confirm_understanding` (inferred summary shown for confirmation)
+  / `fill_gaps` (one focused question at a time) / `zero_base` (fallback
+  interview when understanding failed or is empty) / `ready_for_proposals` /
+  `proposal_review`. A next-action banner always states the required user
+  action. There is no manual stage-advance control — the server advances the
+  stage on each dialogue turn. `Build Understanding` is kept only as the
+  secondary 「理解を更新」(refresh) action. Proposal and diff panels stay
+  hidden until the `proposal_generation` stage; proposal generation stays
+  locked server-side until understanding is confirmed (Issue #83 gate).
+  Zero-base questions are a fixed UI questionnaire (goal / affected area /
+  desired change / constraints / success criteria); answers still flow
+  through the reasoning-model dialogue turn — never heuristic inference.
 
 ## Authentication model
 
