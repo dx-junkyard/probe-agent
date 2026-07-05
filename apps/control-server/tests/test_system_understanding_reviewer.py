@@ -21,10 +21,12 @@ from app.understanding_graph import (
     UnderstandingGraph,
     build_understanding_graph,
     EvidenceRef,
+    GraphNode,
 )
 from app.docs_code_reconciler import ReconciliationResult, ReconciliationMapping
 from app.system_understanding_reviewer import (
     CONFIDENCE_LEVELS,
+    DEFAULT_REVIEW_MAX_OUTPUT_TOKENS,
     GAP_TYPE_VALUES,
     NEXT_ACTION_VALUES,
     ReviewResult,
@@ -90,6 +92,19 @@ class ErrorReasoningClient:
     def generate_text(self, messages, **kwargs):
         from app.llm import LLMError
         raise LLMError("API timeout")
+
+
+class CapturingReasoningClient:
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = []
+
+    def generate_text(self, messages, **kwargs):
+        self.calls.append({"messages": messages, "kwargs": kwargs})
+        response = self._responses.pop(0)
+        if isinstance(response, dict):
+            return json.dumps(response)
+        return response
 
 
 VALID_REVIEW_RESPONSE = {
@@ -226,6 +241,53 @@ class TestReviewGeneration:
         assert result.error is not None
         assert "timeout" in result.error.lower()
 
+    def test_default_review_output_budget_is_not_8192(self, monkeypatch):
+        monkeypatch.delenv("INTELLIGENCE_REVIEW_MAX_OUTPUT_TOKENS", raising=False)
+        graph = _build_graph([_claim()])
+        recon = _empty_reconciliation()
+        client = CapturingReasoningClient([VALID_REVIEW_RESPONSE])
+
+        result = generate_understanding_review(
+            client, _reasoning_config(),
+            graph=graph, reconciliation=recon,
+        )
+
+        assert result.error is None
+        assert DEFAULT_REVIEW_MAX_OUTPUT_TOKENS == 32_768
+        assert client.calls[0]["kwargs"]["max_tokens"] == DEFAULT_REVIEW_MAX_OUTPUT_TOKENS
+
+    def test_review_output_budget_can_be_overridden(self, monkeypatch):
+        monkeypatch.setenv("INTELLIGENCE_REVIEW_MAX_OUTPUT_TOKENS", "12345")
+        graph = _build_graph([_claim()])
+        recon = _empty_reconciliation()
+        client = CapturingReasoningClient([VALID_REVIEW_RESPONSE])
+
+        result = generate_understanding_review(
+            client, _reasoning_config(),
+            graph=graph, reconciliation=recon,
+        )
+
+        assert result.error is None
+        assert client.calls[0]["kwargs"]["max_tokens"] == 12345
+
+    def test_truncated_json_retries_compact_review(self, monkeypatch):
+        monkeypatch.delenv("INTELLIGENCE_REVIEW_MAX_OUTPUT_TOKENS", raising=False)
+        graph = _build_graph([_claim()])
+        recon = _empty_reconciliation()
+        client = CapturingReasoningClient([
+            '{"system_purpose": [{"name": "cut off',
+            VALID_REVIEW_RESPONSE,
+        ])
+
+        result = generate_understanding_review(
+            client, _reasoning_config(),
+            graph=graph, reconciliation=recon,
+        )
+
+        assert result.error is None
+        assert len(client.calls) == 2
+        assert "compact JSON object" in client.calls[1]["messages"][0]["content"]
+
     def test_runs_without_raw_documents(self):
         """Verify review runs from graph + reconciliation, not raw doc content."""
         graph = _build_graph([_claim()])
@@ -233,6 +295,46 @@ class TestReviewGeneration:
         prompt = _build_review_prompt(graph, recon)
         assert "Understanding Graph Nodes" in prompt
         assert "Code Intelligence Reconciliation" in prompt
+
+    def test_review_prompt_is_compacted_for_large_graph(self, monkeypatch):
+        monkeypatch.setenv("INTELLIGENCE_REVIEW_MAX_NODES_PER_TYPE", "3")
+        monkeypatch.setenv("INTELLIGENCE_REVIEW_MAX_PROMPT_CHARS", "20000")
+        nodes = {}
+        for i in range(40):
+            node_id = f"cap-{i}"
+            nodes[node_id] = GraphNode(
+                node_id=node_id,
+                node_type="core_capability",
+                name=f"Capability {i} " + ("x" * 200),
+                summary="summary " + ("y" * 500),
+                evidence=[
+                    EvidenceRef(
+                        path=f"docs/{i}.md",
+                        start_line=1,
+                        end_line=2,
+                        chunk_id=f"chunk-{i}",
+                        confidence=0.9,
+                        summary="evidence " + ("z" * 500),
+                    )
+                ],
+                confidence=0.9,
+            )
+        graph = UnderstandingGraph(
+            nodes=nodes,
+            claim_count=40,
+            valid_claim_count=40,
+            confidence_summary={"core_capability": 0.9},
+            conflicts=[],
+            weak_nodes=[],
+            source_hash="hash",
+        )
+
+        prompt = _build_review_prompt(graph, _empty_reconciliation())
+
+        assert "total_nodes: 40" in prompt
+        assert "included_nodes: 3" in prompt
+        assert prompt.count("[core_capability]") == 3
+        assert len(prompt) < 20_000
 
     def test_missing_graph_handled(self):
         empty_graph = build_understanding_graph([])
@@ -320,6 +422,18 @@ class TestEnumValidation:
             graph=graph, reconciliation=_empty_reconciliation(),
         )
         assert result.error is not None
+
+    def test_descriptive_next_action_is_normalized(self):
+        response = dict(VALID_REVIEW_RESPONSE)
+        response["suggested_next_action"] = "Clarify the top-level product goal with the user."
+        graph = _build_graph([_claim()])
+        client = FakeReasoningClient(response)
+        result = generate_understanding_review(
+            client, _reasoning_config(),
+            graph=graph, reconciliation=_empty_reconciliation(),
+        )
+        assert result.error is None
+        assert result.suggested_next_action == "resolve_open_questions"
 
 
 class TestEvidenceRequired:

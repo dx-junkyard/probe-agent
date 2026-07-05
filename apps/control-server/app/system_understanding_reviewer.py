@@ -20,6 +20,7 @@ probe-agent:
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional
@@ -32,6 +33,10 @@ from .understanding_graph import UnderstandingGraph, GraphNode, EvidenceRef
 
 PROMPT_VERSION = "understanding-review-v1"
 SCHEMA_VERSION = "understanding-review-v1"
+DEFAULT_REVIEW_MAX_OUTPUT_TOKENS = 32_768
+DEFAULT_REVIEW_MAX_NODES_PER_TYPE = 5
+DEFAULT_REVIEW_MAX_PROMPT_CHARS = 30_000
+DEFAULT_REVIEW_MAX_EVIDENCE_PER_NODE = 2
 
 
 CONFIDENCE_LEVELS = {"confirmed", "likely", "uncertain", "conflicting"}
@@ -168,7 +173,75 @@ Rules:
 - Order open questions from top-level purpose toward API/probe flow details.
 - Do NOT generate metadata or probe proposals — this is understanding only.
 - Use only the evidence provided in the input; do not invent facts.
+- Keep each top-level list to the most important 8 items.
+- Keep evidence to the strongest 3 references per item.
+- Keep summaries and reasons concise.
 """
+
+_COMPACT_RETRY_PROMPT = """\
+Your previous response was not valid complete JSON, likely because it was too
+long or truncated. Regenerate the same schema as one compact JSON object only.
+Use at most 5 items in each top-level list, at most 2 evidence references per
+item, and concise one-sentence summaries.
+"""
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if value < 1:
+        raise ValueError(f"{name} must be positive")
+    return value
+
+
+def _trim(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 3)].rstrip() + "..."
+
+
+def _review_node_score(node: GraphNode) -> tuple:
+    return (
+        1 if not node.is_weak else 0,
+        node.confidence,
+        len(node.evidence),
+        1 if node.mentioned_apis else 0,
+        1 if node.mentioned_symbols else 0,
+        node.name,
+    )
+
+
+def _selected_review_nodes(graph: UnderstandingGraph) -> List[GraphNode]:
+    max_per_type = _positive_int_env(
+        "INTELLIGENCE_REVIEW_MAX_NODES_PER_TYPE",
+        DEFAULT_REVIEW_MAX_NODES_PER_TYPE,
+    )
+    type_order = [
+        "system_purpose",
+        "core_capability",
+        "capability_element",
+        "api_boundary",
+        "probe_flow",
+        "supporting_element",
+        "open_question",
+        "conflict",
+    ]
+    by_type: Dict[str, List[GraphNode]] = {node_type: [] for node_type in type_order}
+    extra_types: Dict[str, List[GraphNode]] = {}
+    for node in graph.nodes.values():
+        target = by_type if node.node_type in by_type else extra_types
+        target.setdefault(node.node_type, []).append(node)
+
+    selected: List[GraphNode] = []
+    for node_type in type_order + sorted(extra_types):
+        nodes = by_type.get(node_type) or extra_types.get(node_type) or []
+        selected.extend(
+            sorted(nodes, key=_review_node_score, reverse=True)[:max_per_type]
+        )
+    return selected
 
 
 def _build_review_prompt(
@@ -179,18 +252,30 @@ def _build_review_prompt(
     """Build the review prompt from graph + code facts."""
     parts: List[str] = []
 
-    parts.append("## Understanding Graph Nodes\n")
-    for nid, node in sorted(graph.nodes.items()):
-        ev_summaries = [f"  - {e.path}:{e.start_line}-{e.end_line} ({e.summary[:80]})" for e in node.evidence[:5]]
+    selected_nodes = _selected_review_nodes(graph)
+    parts.append(
+        "## Understanding Graph Nodes\n"
+        f"- total_nodes: {len(graph.nodes)}\n"
+        f"- included_nodes: {len(selected_nodes)}\n"
+        f"- claim_count: {graph.claim_count}\n"
+        f"- valid_claim_count: {graph.valid_claim_count}"
+    )
+    for node in selected_nodes:
+        ev_summaries = [
+            f"  - {e.path}:{e.start_line}-{e.end_line} ({_trim(e.summary, 100)})"
+            for e in node.evidence[:DEFAULT_REVIEW_MAX_EVIDENCE_PER_NODE]
+        ]
         parts.append(
-            f"- [{node.node_type}] {node.name} (confidence={node.confidence:.2f}, "
+            f"- [{node.node_type}] {_trim(node.name, 140)} (confidence={node.confidence:.2f}, "
             f"weak={node.is_weak})\n"
             + "\n".join(ev_summaries)
         )
+        if node.summary and node.summary != node.name:
+            parts.append(f"  Summary: {_trim(node.summary, 180)}")
         if node.mentioned_apis:
-            parts.append(f"  APIs: {', '.join(node.mentioned_apis)}")
+            parts.append(f"  APIs: {_trim(', '.join(node.mentioned_apis[:8]), 240)}")
         if node.mentioned_symbols:
-            parts.append(f"  Symbols: {', '.join(node.mentioned_symbols)}")
+            parts.append(f"  Symbols: {_trim(', '.join(node.mentioned_symbols[:8]), 240)}")
 
     if graph.conflicts:
         parts.append("\n## Conflicts\n")
@@ -210,14 +295,26 @@ def _build_review_prompt(
     if reconciliation.gaps:
         parts.append("\n### Gaps")
         for gap in reconciliation.gaps[:20]:
-            parts.append(f"- [{gap.gap_type}] {gap.node_name}: {gap.notes}")
+            parts.append(
+                f"- [{gap.gap_type}] {_trim(gap.node_name, 140)}: {_trim(gap.notes, 180)}"
+            )
 
     if history:
         parts.append("\n## Interview History\n")
         for msg in history[-10:]:
             parts.append(f"{msg['role']}: {msg['content'][:500]}")
 
-    return "\n".join(parts)
+    prompt = "\n".join(parts)
+    max_prompt_chars = _positive_int_env(
+        "INTELLIGENCE_REVIEW_MAX_PROMPT_CHARS",
+        DEFAULT_REVIEW_MAX_PROMPT_CHARS,
+    )
+    if len(prompt) > max_prompt_chars:
+        prompt = (
+            prompt[: max_prompt_chars - 120].rstrip()
+            + "\n\n[Prompt truncated to configured review budget; use included high-priority graph nodes only.]"
+        )
+    return prompt
 
 
 def _strip_fences(raw: str) -> str:
@@ -229,6 +326,24 @@ def _strip_fences(raw: str) -> str:
     if lines and lines[-1].strip() == "```":
         lines = lines[:-1]
     return "\n".join(lines)
+
+
+def _review_max_output_tokens() -> int:
+    return _positive_int_env(
+        "INTELLIGENCE_REVIEW_MAX_OUTPUT_TOKENS",
+        DEFAULT_REVIEW_MAX_OUTPUT_TOKENS,
+    )
+
+
+def _parse_review_response(raw: str) -> _RawReviewResponse:
+    parsed = json.loads(_strip_fences(raw))
+    if (
+        isinstance(parsed, dict)
+        and parsed.get("suggested_next_action") not in NEXT_ACTION_VALUES
+        and not _PROPOSAL_PATTERN.search(str(parsed.get("suggested_next_action") or ""))
+    ):
+        parsed["suggested_next_action"] = "resolve_open_questions"
+    return _RawReviewResponse.model_validate(parsed)
 
 
 def generate_understanding_review(
@@ -254,6 +369,15 @@ def generate_understanding_review(
         )
 
     prompt = _build_review_prompt(graph, reconciliation, history)
+    try:
+        max_output_tokens = _review_max_output_tokens()
+    except ValueError as exc:
+        return ReviewResult(
+            provider=config.provider,
+            model=config.model,
+            is_mock=False,
+            error=str(exc),
+        )
 
     try:
         raw = client.generate_text(
@@ -262,7 +386,7 @@ def generate_understanding_review(
                 {"role": "user", "content": prompt},
             ],
             temperature=0.2,
-            max_tokens=8192,
+            max_tokens=max_output_tokens,
         )
     except LLMError as exc:
         return ReviewResult(
@@ -273,8 +397,25 @@ def generate_understanding_review(
         )
 
     try:
-        parsed = json.loads(_strip_fences(raw))
-        validated = _RawReviewResponse.model_validate(parsed)
+        validated = _parse_review_response(raw)
+    except json.JSONDecodeError:
+        try:
+            raw = client.generate_text(
+                [
+                    {"role": "system", "content": f"{_SYSTEM_PROMPT}\n\n{_COMPACT_RETRY_PROMPT}"},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.1,
+                max_tokens=max_output_tokens,
+            )
+            validated = _parse_review_response(raw)
+        except (json.JSONDecodeError, ValidationError, LLMError) as exc:
+            return ReviewResult(
+                provider=config.provider,
+                model=config.model,
+                is_mock=False,
+                error=f"Failed to parse review response: {exc}",
+            )
     except (json.JSONDecodeError, ValidationError) as exc:
         return ReviewResult(
             provider=config.provider,

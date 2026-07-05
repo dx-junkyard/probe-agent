@@ -1138,7 +1138,7 @@ describe("Capability Map page", () => {
 
 // ── Interview dashboard tests (Issue #72) ───────────────────────────
 
-function interviewSession() {
+function interviewSession(overrides: Record<string, unknown> = {}) {
   return {
     id: 7,
     system_id: 1,
@@ -1146,11 +1146,33 @@ function interviewSession() {
     title: "System interview",
     focus: "Review metadata",
     status: "open",
+    stage: "proposal_generation",
+    current_understanding: null,
+    gap_analysis: null,
+    open_questions: null,
+    user_intent: null,
+    last_error: null,
+    understanding_confirmed_at: 3,
+    understanding_confirmed_by: "admin",
     materialization_diff: null,
     materialization_ref: null,
     materialized_at: null,
     created_at: 1,
     updated_at: 2,
+    ...overrides,
+  };
+}
+
+function understandingItem(name: string) {
+  return {
+    name,
+    summary: `${name} summary`,
+    confidence: { level: "likely", reason: "docs" },
+    evidence: [],
+    why_core: "",
+    related_docs: [],
+    related_apis: [],
+    children: [],
   };
 }
 
@@ -1207,9 +1229,14 @@ function interviewProposal() {
   };
 }
 
-function mockInterviewApi(options: { approvedCount?: number } = {}) {
-  const session = interviewSession();
+function mockInterviewApi(options: {
+  approvedCount?: number;
+  session?: Record<string, unknown>;
+  proposals?: unknown[];
+} = {}) {
+  const session = interviewSession(options.session ?? {});
   const proposal = interviewProposal();
+  const proposals = options.proposals ?? [proposal];
   const approvedCount = options.approvedCount ?? 0;
   mockApi.get.mockImplementation((path: string) => {
     if (path === "/repository/snapshots/latest") {
@@ -1237,7 +1264,7 @@ function mockInterviewApi(options: { approvedCount?: number } = {}) {
         messages: [
           { id: 1, session_id: 7, role: "assistant", content: "Found unclassified symbols.", intelligence_run_id: 4, created_at: 1 },
         ],
-        proposals: [proposal],
+        proposals,
       });
     }
     if (path === "/interview/sessions/7/context-pack") {
@@ -1325,7 +1352,7 @@ describe("Interview page", () => {
     expect(screen.getByText("mock")).toBeInTheDocument();
     expect(screen.getByText("reasoning_llm")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /Approve/i }));
+    fireEvent.click(screen.getByRole("button", { name: /承認/ }));
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith(
         "/interview/sessions/7/proposals/9/approve",
@@ -1333,7 +1360,7 @@ describe("Interview page", () => {
       );
     });
 
-    fireEvent.click(screen.getByRole("button", { name: /Reject/i }));
+    fireEvent.click(screen.getByRole("button", { name: /却下/ }));
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith(
         "/interview/sessions/7/proposals/9/reject",
@@ -1373,9 +1400,9 @@ describe("Interview page", () => {
       </QueryClientProvider>,
     );
 
-    expect(await screen.findByText("Proposal Review")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /Edit/i }));
-    fireEvent.click(await screen.findByRole("button", { name: /Save manual edit/i }));
+    expect(await screen.findByText("提案レビュー")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /編集/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /修正を保存して承認/ }));
 
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith(
@@ -1388,11 +1415,248 @@ describe("Interview page", () => {
       );
     });
 
-    fireEvent.click(screen.getByRole("button", { name: /Materialize/i }));
+    fireEvent.click(screen.getByRole("button", { name: /差分を生成/ }));
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith("/interview/sessions/7/materialize", {});
     });
     expect(await screen.findByText(/diff --git/)).toBeInTheDocument();
+  });
+
+  test("shows confirmation question and hides proposal panels before proposal stage (Issue #123)", async () => {
+    mockInterviewApi({
+      session: {
+        stage: "purpose_confirmation",
+        current_understanding: {
+          system_purpose: [understandingItem("Runtime probe platform")],
+          core_capabilities: [understandingItem("Trace ingestion")],
+          capability_elements: [],
+          supporting_elements: [],
+          api_boundaries: [],
+          probe_flow_candidates: [],
+        },
+      },
+      proposals: [],
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // The first user-facing step is confirmation of the inferred summary.
+    const question = await screen.findByTestId("focused-question");
+    expect(question.textContent).toContain("正しいですか");
+    expect(question.textContent).toContain("Runtime probe platform");
+
+    // The next required action is always explicit.
+    expect(screen.getByTestId("next-action")).toBeInTheDocument();
+
+    // Proposal and diff panels stay hidden until proposal_generation.
+    expect(screen.queryByText("提案レビュー")).toBeNull();
+    expect(screen.queryByText("レビュー用差分")).toBeNull();
+
+    // No manual stage-advance control.
+    expect(screen.queryByRole("button", { name: /Advance/i })).toBeNull();
+  });
+
+  test("falls back to a zero-base interview when understanding cannot be built (Issue #123)", async () => {
+    mockInterviewApi({
+      session: {
+        stage: "understanding_initialized",
+        current_understanding: null,
+        last_error: "reasoning model is not configured",
+        understanding_confirmed_at: null,
+        understanding_confirmed_by: null,
+      },
+      proposals: [],
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const notice = await screen.findByTestId("zero-base-notice");
+    expect(notice.textContent).toContain("ゼロベース");
+    expect(notice.textContent).toContain("reasoning model is not configured");
+
+    // The zero-base interview asks one focused question at a time,
+    // starting with the target goal.
+    const question = screen.getByTestId("focused-question");
+    expect(question.textContent).toContain("達成したい目標");
+  });
+
+  test("zero-base flow requires explicit confirmation before proposals unlock (Issue #123)", async () => {
+    // Reached proposal_generation through zero-base answers, but the user
+    // has not confirmed the gathered context yet.
+    mockInterviewApi({
+      session: {
+        stage: "proposal_generation",
+        current_understanding: null,
+        last_error: "reasoning model is not configured",
+        understanding_confirmed_at: null,
+        understanding_confirmed_by: null,
+      },
+      proposals: [],
+    });
+    mockApi.post.mockResolvedValue(interviewSession({
+      stage: "proposal_generation",
+      understanding_confirmed_at: 9,
+      understanding_confirmed_by: "admin",
+    }));
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // Proposal panels stay hidden until the manual confirmation.
+    const confirmButton = await screen.findByTestId("confirm-understanding");
+    expect(screen.queryByText("提案レビュー")).toBeNull();
+
+    fireEvent.click(confirmButton);
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/7/confirm-understanding",
+        { actor: "admin" },
+      );
+    });
+  });
+
+  test("answering a gap question passes it to the server for consumption (Issue #123)", async () => {
+    mockInterviewApi({
+      session: {
+        stage: "capability_confirmation",
+        current_understanding: {
+          system_purpose: [understandingItem("Runtime probe platform")],
+          core_capabilities: [],
+          capability_elements: [],
+          supporting_elements: [],
+          api_boundaries: [],
+          probe_flow_candidates: [],
+        },
+        open_questions: [
+          { question: "認証はどの層で行いますか?", category: "boundary", priority: "high" },
+          { question: "保持期間は?", category: "capability", priority: "low" },
+        ],
+        understanding_confirmed_at: null,
+        understanding_confirmed_by: null,
+      },
+      proposals: [],
+    });
+    mockApi.post.mockResolvedValue({
+      assistant_message: "了解しました。", proposals: [], next_questions: [],
+      intelligence_run: null, error: null, stage: "element_classification",
+      current_understanding: null, gap_analysis: null, open_questions_structured: null,
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // The highest-priority open question is the focused question.
+    const question = await screen.findByTestId("focused-question");
+    expect(question.textContent).toContain("認証はどの層で行いますか?");
+
+    fireEvent.change(screen.getByPlaceholderText(/上の質問への回答/), {
+      target: { value: "APIゲートウェイ層で認証します" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /回答を送信/ }));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/7/dialogue-turn",
+        expect.objectContaining({
+          user_message: "APIゲートウェイ層で認証します",
+          answered_question: "認証はどの層で行いますか?",
+          generate_proposals: false,
+        }),
+      );
+    });
+  });
+
+  test("Start Interview builds understanding automatically (Issue #123)", async () => {
+    mockInterviewApi();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/snapshots/latest") {
+        return Promise.resolve({
+          id: 42, system_id: 1, repo_path: "/repo", commit_sha: "abcdef1234567890",
+          status: "ready", file_count: 1, total_size: 10, indexed_size: 10,
+          metadata_only_count: 0, warnings: [], error_summary: null,
+          created_at: "1", completed_at: "2", files: [],
+        });
+      }
+      if (path === "/interview/sessions") return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/interview/sessions") {
+        return Promise.resolve(interviewSession({ id: 8, stage: "understanding_initialized" }));
+      }
+      if (path === "/interview/sessions/8/update-understanding") {
+        return Promise.resolve(interviewSession({ id: 8, stage: "purpose_confirmation" }));
+      }
+      return Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const startButtons = await screen.findAllByRole("button", { name: /インタビューを開始/ });
+    await waitFor(() => expect(startButtons[0]).not.toBeDisabled());
+    fireEvent.click(startButtons[0]);
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions",
+        expect.objectContaining({ snapshot_id: 42 }),
+      );
+    });
+    // Understanding is built automatically for the created session.
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/8/update-understanding",
+        {},
+      );
+    });
   });
 });
 

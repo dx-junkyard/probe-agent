@@ -966,6 +966,10 @@ CREATE TABLE IF NOT EXISTS interview_session (
     open_questions       TEXT,
     user_intent          TEXT,
     last_error           TEXT,
+    -- Issue #123: manual confirmation that unlocks proposal generation when
+    -- no structured understanding could be built (zero-base interview).
+    understanding_confirmed_at REAL,
+    understanding_confirmed_by TEXT,
     materialization_diff TEXT,
     materialization_ref  TEXT,
     materialized_at      REAL,
@@ -1568,6 +1572,14 @@ def init_db() -> None:
         if "last_error" not in session_cols:
             conn.execute(
                 "ALTER TABLE interview_session ADD COLUMN last_error TEXT"
+            )
+        if "understanding_confirmed_at" not in session_cols:
+            conn.execute(
+                "ALTER TABLE interview_session ADD COLUMN understanding_confirmed_at REAL"
+            )
+        if "understanding_confirmed_by" not in session_cols:
+            conn.execute(
+                "ALTER TABLE interview_session ADD COLUMN understanding_confirmed_by TEXT"
             )
         proposal_cols = _columns(conn, "interview_proposal")
         if proposal_cols and "graph_node_id" not in proposal_cols:
