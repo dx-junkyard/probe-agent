@@ -404,7 +404,7 @@ def create_interview_proposals(
       consumers: [dashboard, control-server]
       operation_kind: write
       state_effects: [database-write]
-      probe_value: Verify proposals are persisted with correct intelligence run linkage and stage guard
+      probe_value: Verify proposals are persisted with correct intelligence run linkage and stage/confirmation guards
     """
     now = time.time()
     with get_conn() as conn:
@@ -414,6 +414,22 @@ def create_interview_proposals(
             raise HTTPException(
                 status_code=422,
                 detail=f"Proposals can only be created in proposal_generation stage (current: {current_stage})",
+            )
+        # Same understanding gate as dialogue-turn (Issues #83, #123): the
+        # stage alone (reachable via advance-stage) must not unlock proposal
+        # persistence without a built understanding or the developer's
+        # explicit confirmation of the interview context.
+        understanding_confirmed = (
+            "understanding_confirmed_at" in session.keys()
+            and session["understanding_confirmed_at"] is not None
+        )
+        if session["current_understanding"] is None and not understanding_confirmed:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Proposals are locked until understanding is confirmed: "
+                    "build an understanding or confirm the interview context first"
+                ),
             )
         snapshot_id = session["snapshot_id"]
         message_id = payload.message_id

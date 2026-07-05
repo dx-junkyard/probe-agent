@@ -76,7 +76,11 @@ def _setup(client, name="System A"):
 
 
 def _advance_to_proposal_generation(client, session_id, headers):
-    """Advance a session through all stages to proposal_generation."""
+    """Advance a session through all stages to proposal_generation.
+
+    Stage advancement only — this does NOT satisfy the Issue #83/#123
+    understanding gate, so proposal creation stays locked.
+    """
     stages = [
         "purpose_confirmation",
         "capability_confirmation",
@@ -91,6 +95,24 @@ def _advance_to_proposal_generation(client, session_id, headers):
             json={"stage": stage},
             headers=headers,
         )
+
+
+def _confirm_and_reach_proposal_generation(client, session_id, headers):
+    """Satisfy the proposal gate the way the zero-base UI flow does:
+    record an interview answer, then the developer's manual confirmation
+    (which also advances the session to proposal_generation)."""
+    r = client.post(
+        f"/interview/sessions/{session_id}/messages",
+        json={"role": "user", "content": "対象と目的を確認しました"},
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    r = client.post(
+        f"/interview/sessions/{session_id}/confirm-understanding",
+        json={"actor": "root"},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
 
 
 def _valid_proposal_item():
@@ -225,7 +247,7 @@ def test_proposal_roundtrips_with_audit_and_default_decision_method(admin_client
         "/interview/sessions", json={"snapshot_id": snapshot_id}, headers=headers
     ).json()
     sid = session["id"]
-    _advance_to_proposal_generation(admin_client, sid, headers)
+    _confirm_and_reach_proposal_generation(admin_client, sid, headers)
 
     r = admin_client.post(
         f"/interview/sessions/{sid}/proposals",
@@ -311,7 +333,7 @@ def test_system_isolation_for_sessions_and_proposals(admin_client):
     session_a = admin_client.post(
         "/interview/sessions", json={"snapshot_id": snapshot_a}, headers=headers_a
     ).json()
-    _advance_to_proposal_generation(admin_client, session_a["id"], headers_a)
+    _confirm_and_reach_proposal_generation(admin_client, session_a["id"], headers_a)
     admin_client.post(
         f"/interview/sessions/{session_a['id']}/proposals",
         json={"audit": _valid_audit(), "proposals": [_valid_proposal_item()]},
@@ -618,7 +640,7 @@ def test_proposals_accepted_in_proposal_stage(admin_client):
         headers=headers,
     ).json()
     sid = session["id"]
-    _advance_to_proposal_generation(admin_client, sid, headers)
+    _confirm_and_reach_proposal_generation(admin_client, sid, headers)
 
     r = admin_client.post(
         f"/interview/sessions/{sid}/proposals",
@@ -638,7 +660,7 @@ def test_proposal_provenance_fields_persisted(admin_client):
         headers=headers,
     ).json()
     sid = session["id"]
-    _advance_to_proposal_generation(admin_client, sid, headers)
+    _confirm_and_reach_proposal_generation(admin_client, sid, headers)
 
     item = _valid_proposal_item()
     item["graph_node_id"] = "abc123def456"
@@ -860,3 +882,45 @@ def test_understanding_confirmation_columns_migrated(admin_client):
     ).json()
     assert data["understanding_confirmed_at"] is None
     assert data["understanding_confirmed_by"] is None
+
+
+def test_proposals_endpoint_rejected_without_understanding_confirmation(admin_client):
+    """Stage alone must not unlock /proposals persistence (Issue #123)."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "persist gate"},
+        headers=headers,
+    ).json()
+    sid = session["id"]
+    _advance_to_proposal_generation(admin_client, sid, headers)
+
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/proposals",
+        json={"audit": _valid_audit(), "proposals": [_valid_proposal_item()]},
+        headers=headers,
+    )
+    assert r.status_code == 422
+    assert "locked until understanding is confirmed" in r.json()["detail"]
+
+    # After an interview answer and the manual confirmation, the same
+    # request succeeds.
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/messages",
+        json={"role": "user", "content": "対象と目的を確認しました"},
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/confirm-understanding",
+        json={"actor": "root"},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/proposals",
+        json={"audit": _valid_audit(), "proposals": [_valid_proposal_item()]},
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
