@@ -102,8 +102,8 @@ class _RawQuestionEvidence(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     path: str = Field(..., min_length=1)
-    start_line: int = 0
-    end_line: int = 0
+    start_line: int = Field(..., ge=1)
+    end_line: int = Field(..., ge=1)
 
 
 class _RawStructuredQuestion(BaseModel):
@@ -342,10 +342,11 @@ def _allowed_evidence_spans(
 
 def _span_matches(ref: InterviewQuestionEvidenceRef, span: Tuple[int, int]) -> bool:
     start, end = span
-    if start == 0 and end == 0:
-        # Path-level evidence without a known line range accepts any lines.
-        return True
-    return ref.start_line <= end and ref.end_line >= start
+    if start < 1 or end < start:
+        # No real line range is known for this path; nothing can be
+        # contained within it.
+        return False
+    return ref.start_line >= start and ref.end_line <= end
 
 
 def _validate_question_evidence(
@@ -360,17 +361,15 @@ def _validate_question_evidence(
                     f"question evidence references unknown path '{ref.path}' "
                     "(not in context pack or current understanding)"
                 )
-            if ref.start_line < 0 or ref.end_line < ref.start_line:
+            if ref.start_line < 1 or ref.end_line < ref.start_line:
                 return (
                     f"question evidence has invalid line range "
                     f"{ref.start_line}-{ref.end_line} for '{ref.path}'"
                 )
-            if (ref.start_line or ref.end_line) and not any(
-                _span_matches(ref, span) for span in spans[ref.path]
-            ):
+            if not any(_span_matches(ref, span) for span in spans[ref.path]):
                 return (
-                    f"question evidence lines {ref.start_line}-{ref.end_line} do "
-                    f"not overlap any known span in '{ref.path}'"
+                    f"question evidence lines {ref.start_line}-{ref.end_line} are "
+                    f"not contained in any known span in '{ref.path}'"
                 )
     return None
 
