@@ -375,3 +375,54 @@ def test_empty_snapshot_returns_empty_pack(admin_client):
     assert pack["symbols"] == []
     assert pack["entrypoints"] == []
     assert pack["truncated"] is False
+
+
+# --- Issue #128: stage-aware truncation priority ------------------------------
+
+
+def test_stage_aware_truncation_prioritizes_entrypoints(admin_client):
+    """For entrypoint-focused stages, budget truncation removes symbols
+    before entrypoints; the default order (entrypoints first) is unchanged
+    for other stages. Selection stays deterministic and auditable."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    _insert_symbols(system_id, snapshot_id, count=60, prefix="src/large.py")
+    for i in range(10):
+        _insert_entrypoint(system_id, snapshot_id, idx=i)
+
+    from app.db import get_conn
+    from app.interview_context import build_interview_context
+
+    budget = 9000
+    with get_conn() as conn:
+        default_pack = build_interview_context(
+            conn, system_id, snapshot_id, budget_chars=budget,
+        )
+        api_pack = build_interview_context(
+            conn, system_id, snapshot_id, budget_chars=budget,
+            stage="api_boundary_mapping",
+        )
+        api_pack_again = build_interview_context(
+            conn, system_id, snapshot_id, budget_chars=budget,
+            stage="api_boundary_mapping",
+        )
+        unknown_stage_pack = build_interview_context(
+            conn, system_id, snapshot_id, budget_chars=budget,
+            stage="not_a_real_stage",
+        )
+
+    assert default_pack.truncated
+    assert api_pack.truncated
+
+    # Default order sacrifices entrypoints first; the API-boundary stage
+    # keeps them and sacrifices symbols instead.
+    assert len(api_pack.entrypoints) > len(default_pack.entrypoints)
+    assert len(api_pack.symbols) < len(default_pack.symbols)
+
+    # Deterministic: same snapshot + budget + stage → identical pack.
+    assert api_pack.model_dump() == api_pack_again.model_dump()
+
+    # A stage outside the known finite set behaves exactly like no stage.
+    assert unknown_stage_pack.model_dump() == default_pack.model_dump()
+
+    # The stage-dependent choice is recorded for auditability.
+    assert any("api_boundary_mapping" in note for note in api_pack.omission_notes)

@@ -1961,6 +1961,34 @@ class InterviewConfirmUnderstandingRequest(BaseModel):
     actor: str = Field(min_length=1, max_length=200)
 
 
+class InterviewQuestionEvidenceRef(BaseModel):
+    """Snapshot-relative code reference backing an interview question (Issue #128).
+
+    Paths and line ranges are validated deterministically against the
+    context pack / stored understanding before the turn is accepted; refs
+    the model invented fail the turn closed.
+    """
+
+    path: str
+    start_line: int = 0
+    end_line: int = 0
+
+
+class InterviewStructuredQuestion(BaseModel):
+    """Hypothesis-first interview question (Issue #128).
+
+    The model states its current hypothesis with evidence, then asks a
+    focused confirmation question. Plain-string questions are still accepted
+    from older prompt versions and normalized to this shape (question_text
+    only) — a structural conversion, not an interpretation.
+    """
+
+    question_text: str
+    hypothesis: Optional[str] = None
+    evidence_refs: List[InterviewQuestionEvidenceRef] = Field(default_factory=list)
+    answer_options: List[str] = Field(default_factory=list)
+
+
 class InterviewDialogueProposalOut(BaseModel):
     """A single combined proposal from a dialogue turn, before persistence."""
 
@@ -1986,7 +2014,7 @@ class InterviewDialogueTurnOut(BaseModel):
 
     assistant_message: str = ""
     proposals: List[InterviewDialogueProposalOut] = Field(default_factory=list)
-    next_questions: List[str] = Field(default_factory=list)
+    next_questions: List[InterviewStructuredQuestion] = Field(default_factory=list)
     intelligence_run: Optional[IntelligenceRunOut] = None
     error: Optional[str] = None
     stage: Optional[InterviewStage] = None

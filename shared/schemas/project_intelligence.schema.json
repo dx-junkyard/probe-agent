@@ -841,13 +841,36 @@
       },
       "additionalProperties": false
     },
+    "InterviewQuestionEvidenceRef": {
+      "type": "object",
+      "description": "Snapshot-relative code reference backing an interview question (Issue #128). Validated deterministically against the context pack / stored understanding before the turn is accepted.",
+      "required": ["path"],
+      "properties": {
+        "path": { "type": "string" },
+        "start_line": { "type": "integer", "default": 0 },
+        "end_line": { "type": "integer", "default": 0 }
+      },
+      "additionalProperties": false
+    },
+    "InterviewStructuredQuestion": {
+      "type": "object",
+      "description": "Hypothesis-first interview question (Issue #128): the model states its working hypothesis with evidence, then asks a focused confirmation question. answer_options offer quick replies when the realistic answers form a small set.",
+      "required": ["question_text"],
+      "properties": {
+        "question_text": { "type": "string", "minLength": 1 },
+        "hypothesis": { "type": ["string", "null"] },
+        "evidence_refs": { "type": "array", "items": { "$ref": "#/definitions/InterviewQuestionEvidenceRef" } },
+        "answer_options": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
     "InterviewDialogueTurnOut": {
       "type": "object",
-      "description": "Response from a single interview dialogue turn (Issue #69). If error is set, the turn failed closed and no proposals were stored.",
+      "description": "Response from a single interview dialogue turn (Issue #69). If error is set, the turn failed closed and no proposals were stored. next_questions are structured hypothesis-first questions since Issue #128 (schema interview-v2).",
       "properties": {
         "assistant_message": { "type": "string" },
         "proposals": { "type": "array", "items": { "$ref": "#/definitions/InterviewDialogueProposalOut" } },
-        "next_questions": { "type": "array", "items": { "type": "string" } },
+        "next_questions": { "type": "array", "items": { "$ref": "#/definitions/InterviewStructuredQuestion" } },
         "intelligence_run": { "oneOf": [{ "$ref": "#/definitions/IntelligenceRun" }, { "type": "null" }] },
         "error": { "type": ["string", "null"] },
         "stage": { "enum": ["understanding_initialized", "purpose_confirmation", "capability_confirmation", "element_classification", "api_boundary_mapping", "probe_flow_selection", "proposal_generation", null] },

@@ -28,10 +28,12 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .docs_code_reconciler import ReconciliationResult, ReconciliationMapping
+from .interview_language import get_interview_language, language_directive
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient, is_reasoning_model
 from .understanding_graph import UnderstandingGraph, GraphNode, EvidenceRef
 
-PROMPT_VERSION = "understanding-review-v1"
+# v2: configurable output language for questions/summaries (Issue #127).
+PROMPT_VERSION = "understanding-review-v2"
 SCHEMA_VERSION = "understanding-review-v1"
 DEFAULT_REVIEW_MAX_OUTPUT_TOKENS = 32_768
 DEFAULT_REVIEW_MAX_NODES_PER_TYPE = 5
@@ -176,7 +178,21 @@ Rules:
 - Keep each top-level list to the most important 8 items.
 - Keep evidence to the strongest 3 references per item.
 - Keep summaries and reasons concise.
+- Phrase each open question as a focused confirmation the developer can
+  answer briefly; avoid broad "explain the system" questions when the
+  graph already contains a hypothesis to confirm.
 """
+
+
+def _system_prompt(language: str) -> str:
+    return _SYSTEM_PROMPT + language_directive(language) + "\n"
+
+
+# Localized text for the deterministic no-evidence fallback question.
+_NO_EVIDENCE_QUESTION = {
+    "ja": "「{name}」({section})の根拠がドキュメント・コードから見つかりませんでした。この項目は正しいですか?",
+    "en": "No evidence for {section} item: {name}. Is this item correct?",
+}
 
 _COMPACT_RETRY_PROMPT = """\
 Your previous response was not valid complete JSON, likely because it was too
@@ -371,6 +387,7 @@ def generate_understanding_review(
     prompt = _build_review_prompt(graph, reconciliation, history)
     try:
         max_output_tokens = _review_max_output_tokens()
+        language = get_interview_language()
     except ValueError as exc:
         return ReviewResult(
             provider=config.provider,
@@ -378,11 +395,12 @@ def generate_understanding_review(
             is_mock=False,
             error=str(exc),
         )
+    system_prompt = _system_prompt(language)
 
     try:
         raw = client.generate_text(
             [
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.2,
@@ -402,7 +420,7 @@ def generate_understanding_review(
         try:
             raw = client.generate_text(
                 [
-                    {"role": "system", "content": f"{_SYSTEM_PROMPT}\n\n{_COMPACT_RETRY_PROMPT}"},
+                    {"role": "system", "content": f"{system_prompt}\n\n{_COMPACT_RETRY_PROMPT}"},
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.1,
@@ -433,7 +451,9 @@ def generate_understanding_review(
             if not item.evidence:
                 item.confidence = _ConfidenceLevel(level="uncertain", reason="No evidence provided")
                 validated.open_questions.append(_OpenQuestion(
-                    question=f"No evidence for {section_name} item: {item.name}",
+                    question=_NO_EVIDENCE_QUESTION[language].format(
+                        section=section_name, name=item.name,
+                    ),
                     category="general",
                     priority="high",
                 ))

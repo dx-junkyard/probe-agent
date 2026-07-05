@@ -60,6 +60,7 @@ from ..models import (
     InterviewSessionCreate,
     InterviewSessionDetailOut,
     InterviewSessionOut,
+    InterviewStructuredQuestion,
     IntelligenceRunOut,
 )
 from ..probe_planner import check_denylist
@@ -83,6 +84,31 @@ def _advance_stage(current_stage: str, target: str) -> str:
     except ValueError:
         return current_stage
     return target if target_idx > current_idx else current_stage
+
+
+def _question_entry(question) -> dict:
+    """Normalize a turn question (structured object or legacy string) into
+    the open_questions JSON entry shape."""
+    if isinstance(question, str):
+        return {"question": question, "category": "followup", "priority": "medium"}
+    entry = {
+        "question": question.question_text,
+        "category": "followup",
+        "priority": "medium",
+    }
+    if question.hypothesis:
+        entry["hypothesis"] = question.hypothesis
+    if question.evidence_refs:
+        entry["evidence_refs"] = [r.model_dump() for r in question.evidence_refs]
+    if question.answer_options:
+        entry["answer_options"] = list(question.answer_options)
+    return entry
+
+
+def _question_out(question) -> InterviewStructuredQuestion:
+    if isinstance(question, str):
+        return InterviewStructuredQuestion(question_text=question)
+    return question
 
 router = APIRouter()
 
@@ -577,9 +603,11 @@ def interview_dialogue_turn(
     with get_conn() as conn:
         session = _get_session_or_404(conn, session_id, system_id)
         snapshot_id = session["snapshot_id"]
+        session_stage = session["stage"] or "understanding_initialized"
 
         context_pack = build_interview_context(
             conn, system_id, snapshot_id, budget_chars=payload.budget,
+            stage=session_stage,
         )
 
         message_rows = conn.execute(
@@ -587,6 +615,20 @@ def interview_dialogue_turn(
             (session_id,),
         ).fetchall()
         history = [{"role": r["role"], "content": r["content"]} for r in message_rows]
+
+        # Issue #128: the built understanding is the model's working
+        # hypothesis — inject it so questions confirm/correct instead of
+        # asking from scratch.
+        session_understanding = (
+            json.loads(session["current_understanding"])
+            if session["current_understanding"] else None
+        )
+        session_gaps = (
+            json.loads(session["gap_analysis"]) if session["gap_analysis"] else None
+        )
+        session_open_questions = (
+            json.loads(session["open_questions"]) if session["open_questions"] else None
+        )
 
         if client_error:
             turn = InterviewTurnResult(
@@ -602,6 +644,9 @@ def interview_dialogue_turn(
                 context_pack=context_pack,
                 history=history,
                 user_message=payload.user_message,
+                current_understanding=session_understanding,
+                gap_analysis=session_gaps,
+                open_questions=session_open_questions,
             )
 
         conn.execute("BEGIN")
@@ -755,10 +800,9 @@ def interview_dialogue_turn(
             # Consume the answered open question and record the model's
             # follow-up questions so the UI never re-asks what was already
             # answered (Issue #123). Removal is an exact-text structural
-            # match; new questions come verbatim from the reasoning model.
-            existing_questions: List[dict] = (
-                json.loads(session["open_questions"]) if session["open_questions"] else []
-            )
+            # match; new questions come verbatim from the reasoning model
+            # (structured with hypothesis/evidence since Issue #128).
+            existing_questions: List[dict] = list(session_open_questions or [])
             remaining_questions = [
                 q for q in existing_questions
                 if not (
@@ -767,14 +811,11 @@ def interview_dialogue_turn(
                 )
             ]
             known_texts = {q.get("question") for q in remaining_questions}
-            for question_text in turn.next_questions:
-                if question_text and question_text not in known_texts:
-                    remaining_questions.append({
-                        "question": question_text,
-                        "category": "followup",
-                        "priority": "medium",
-                    })
-                    known_texts.add(question_text)
+            for question in turn.next_questions:
+                entry = _question_entry(question)
+                if entry["question"] and entry["question"] not in known_texts:
+                    remaining_questions.append(entry)
+                    known_texts.add(entry["question"])
             remaining_questions = remaining_questions[:20]
             if remaining_questions != existing_questions:
                 stage_updates.append("open_questions = ?")
@@ -818,7 +859,7 @@ def interview_dialogue_turn(
         return InterviewDialogueTurnOut(
             assistant_message=turn.assistant_message,
             proposals=proposal_outs,
-            next_questions=turn.next_questions,
+            next_questions=[_question_out(q) for q in turn.next_questions],
             intelligence_run=intelligence_run_out,
             stage=updated_session.stage,
             current_understanding=updated_session.current_understanding,
@@ -1463,7 +1504,7 @@ def update_interview_understanding(
                 """INSERT INTO interview_message
                     (session_id, system_id, role, content, created_at)
                 VALUES (?, ?, 'assistant', ?, ?)""",
-                (session_id, system_id, f"Understanding update failed: {error}", now),
+                (session_id, system_id, f"理解の更新に失敗しました: {error}", now),
             )
             row = _get_session_or_404(conn, session_id, system_id)
             return _session_out(row)
@@ -1471,8 +1512,8 @@ def update_interview_understanding(
         graph = _load_graph_for_snapshot(conn, system_id, snapshot_id)
         if graph is None:
             error = (
-                "Understanding graph is not ready for this snapshot. "
-                "Run System Understanding build/refresh before updating interview understanding."
+                "このスナップショットの理解グラフが未構築です。"
+                "先に System Understanding の build/refresh を実行してください。"
             )
             conn.execute(
                 """UPDATE interview_session
@@ -1484,17 +1525,26 @@ def update_interview_understanding(
                 """INSERT INTO interview_message
                     (session_id, system_id, role, content, created_at)
                 VALUES (?, ?, 'assistant', ?, ?)""",
-                (session_id, system_id, f"Understanding update failed: {error}", now),
+                (session_id, system_id, f"理解の更新に失敗しました: {error}", now),
             )
             row = _get_session_or_404(conn, session_id, system_id)
             return _session_out(row)
 
         reconciliation = reconcile(conn, system_id, snapshot_id, graph)
 
+        # Issue #128: feed the interview answers back into the review so
+        # the rebuilt understanding reflects what the developer already said.
+        history_rows = conn.execute(
+            "SELECT role, content FROM interview_message WHERE session_id = ? ORDER BY id",
+            (session_id,),
+        ).fetchall()
+        history = [{"role": r["role"], "content": r["content"]} for r in history_rows]
+
         review = generate_understanding_review(
             client, config,
             graph=graph,
             reconciliation=reconciliation,
+            history=history or None,
         )
 
         if review.error:
@@ -1508,7 +1558,7 @@ def update_interview_understanding(
                 """INSERT INTO interview_message
                     (session_id, system_id, role, content, created_at)
                 VALUES (?, ?, 'assistant', ?, ?)""",
-                (session_id, system_id, f"Understanding review failed: {review.error}", now),
+                (session_id, system_id, f"理解のレビューに失敗しました: {review.error}", now),
             )
             row = _get_session_or_404(conn, session_id, system_id)
             return _session_out(row)
@@ -1533,19 +1583,19 @@ def update_interview_understanding(
         if review.current_understanding:
             summary_parts = []
             for purpose in review.current_understanding.get("system_purpose", []):
-                summary_parts.append(f"System Purpose: {purpose.get('name', 'unknown')}")
+                summary_parts.append(f"システムの目的: {purpose.get('name', '不明')}")
             for cap in review.current_understanding.get("core_capabilities", []):
-                summary_parts.append(f"Core Capability: {cap.get('name', 'unknown')}")
+                summary_parts.append(f"主要機能: {cap.get('name', '不明')}")
             if summary_parts:
                 asst_content = (
-                    "I've analyzed the documentation and code to build an initial understanding.\n\n"
+                    "ドキュメントとコードを分析し、初期理解を構築しました。\n\n"
                     + "\n".join(f"- {p}" for p in summary_parts)
                 )
                 if review.open_questions:
-                    asst_content += "\n\nKey questions:\n"
+                    asst_content += "\n\n主な確認事項:\n"
                     for q in review.open_questions[:5]:
                         asst_content += f"- {q.get('question', '')}\n"
-                asst_content += f"\nSuggested next: {review.suggested_next_action}"
+                asst_content += f"\n推奨される次のステップ: {review.suggested_next_action}"
 
                 conn.execute(
                     """INSERT INTO interview_message

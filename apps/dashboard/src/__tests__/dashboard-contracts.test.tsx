@@ -1466,6 +1466,84 @@ describe("Interview page", () => {
     expect(screen.queryByRole("button", { name: /Advance/i })).toBeNull();
   });
 
+  test("renders hypothesis-first question with evidence and quick answers (Issue #128)", async () => {
+    const questionText = "トレース取り込みは control-server の責務という理解で正しいですか?";
+    mockInterviewApi({
+      session: {
+        stage: "capability_confirmation",
+        current_understanding: {
+          system_purpose: [understandingItem("Runtime probe platform")],
+          core_capabilities: [],
+          capability_elements: [],
+          supporting_elements: [],
+          api_boundaries: [],
+          probe_flow_candidates: [],
+        },
+        open_questions: [
+          {
+            question: questionText,
+            category: "capability",
+            priority: "high",
+            hypothesis: "トレース取り込みは control-server が担う",
+            evidence_refs: [
+              { path: "apps/control-server/app/main.py", start_line: 10, end_line: 42 },
+            ],
+            answer_options: [],
+          },
+        ],
+      },
+      proposals: [],
+    });
+    mockApi.post.mockResolvedValue({
+      assistant_message: "了解しました。",
+      proposals: [],
+      next_questions: [],
+      intelligence_run: null,
+      error: null,
+      stage: "element_classification",
+      current_understanding: null,
+      gap_analysis: null,
+      open_questions_structured: [],
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // The question card shows the model's hypothesis and its snapshot-grounded
+    // evidence, so the developer sees why this is being asked.
+    const question = await screen.findByTestId("focused-question");
+    expect(question.textContent).toContain(questionText);
+    expect(screen.getByTestId("question-hypothesis").textContent).toContain(
+      "control-server が担う",
+    );
+    expect(screen.getByTestId("question-evidence").textContent).toContain(
+      "apps/control-server/app/main.py:10-42",
+    );
+
+    // 「はい」 sends a canned confirmation through the normal dialogue turn
+    // and consumes the focused open question. It is dialogue input, not an
+    // approval action.
+    fireEvent.click(screen.getByTestId("quick-answer-yes"));
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/7/dialogue-turn",
+        expect.objectContaining({
+          user_message: "はい、その理解で正しいです。",
+          answered_question: questionText,
+        }),
+      );
+    });
+  });
+
   test("falls back to a zero-base interview when understanding cannot be built (Issue #123)", async () => {
     mockInterviewApi({
       session: {

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import {
@@ -40,6 +40,7 @@ import type {
   InterviewProposalMetadataBlock,
   InterviewProposalOut,
   InterviewProposalProbePlan,
+  InterviewQuestionEvidenceRef,
   InterviewSessionDetailOut,
   InterviewStage,
   OpenQuestion,
@@ -191,6 +192,19 @@ function buildConfirmationPrompt(u: CurrentUnderstanding): string {
     "この理解は今回のセッションの対象として正しいですか?違う場合は、修正・絞り込みすべき点を教えてください。"
   );
 }
+
+// 現在ユーザーに提示する1つの質問。仮説・根拠・クイック回答候補を持つ
+// (Issue #128)。confirmable のとき「はい/いいえ」クイック回答を表示する。
+type FocusedQuestion = {
+  text: string;
+  hypothesis?: string | null;
+  evidenceRefs?: InterviewQuestionEvidenceRef[];
+  answerOptions?: string[];
+  confirmable: boolean;
+};
+
+const QUICK_ANSWER_YES = "はい、その理解で正しいです。";
+const QUICK_ANSWER_NO_PREFIX = "いいえ、正しくありません。修正点: ";
 
 function provenanceVariant(value: string) {
   if (value === "manual") return "success" as const;
@@ -492,6 +506,7 @@ export default function InterviewPage() {
   const confirmUnderstanding = useConfirmInterviewUnderstanding(selectedSessionId);
 
   const [message, setMessage] = useState("");
+  const messageInputRef = useRef<HTMLTextAreaElement | null>(null);
   const [editing, setEditing] = useState<InterviewProposalOut | null>(null);
   const [editForm, setEditForm] = useState<EditForm | null>(null);
   const [lastMaterialization, setLastMaterialization] = useState<InterviewMaterializeOut | null>(null);
@@ -526,24 +541,44 @@ export default function InterviewPage() {
     (userMessageCount >= ZERO_BASE_QUESTIONS.length || isProposalStage);
 
   // 現在ユーザーに求める「1つの質問/確認」を導出する。
-  const focusedQuestion = useMemo(() => {
+  const focusedQuestion = useMemo<FocusedQuestion | null>(() => {
     if (!session || !uiState) return null;
     if (uiState === "confirm_understanding" && session.current_understanding) {
-      return buildConfirmationPrompt(session.current_understanding);
+      return {
+        text: buildConfirmationPrompt(session.current_understanding),
+        confirmable: true,
+      };
     }
     if (uiState === "fill_gaps") {
       const open = sortQuestions(session.open_questions ?? []);
-      return open.length > 0 ? open[0].question : STAGE_QUESTIONS[currentStage];
+      if (open.length === 0) {
+        return { text: STAGE_QUESTIONS[currentStage], confirmable: false };
+      }
+      const q = open[0];
+      return {
+        text: q.question,
+        hypothesis: q.hypothesis ?? null,
+        evidenceRefs: q.evidence_refs ?? [],
+        answerOptions: q.answer_options ?? [],
+        // 仮説付きの質問は「はい/いいえ+修正」で答えられる確認型。
+        confirmable: !!q.hypothesis,
+      };
     }
     if (uiState === "zero_base") {
       if (zeroBaseComplete) {
-        return "必要な回答が揃いました。補足があれば入力し、なければ「この内容で提案生成に進む」を押して内容を確定してください。";
+        return {
+          text: "必要な回答が揃いました。補足があれば入力し、なければ「この内容で提案生成に進む」を押して内容を確定してください。",
+          confirmable: false,
+        };
       }
       const idx = Math.min(userMessageCount, ZERO_BASE_QUESTIONS.length - 1);
-      return ZERO_BASE_QUESTIONS[idx];
+      return { text: ZERO_BASE_QUESTIONS[idx], confirmable: false };
     }
     if (uiState === "ready_for_proposals") {
-      return "提案を生成する準備ができました。対象にしたい範囲や重視したい観点があれば入力し、「送信して提案を生成」を押してください。";
+      return {
+        text: "提案を生成する準備ができました。対象にしたい範囲や重視したい観点があれば入力し、「送信して提案を生成」を押してください。",
+        confirmable: false,
+      };
     }
     return null;
   }, [session, uiState, currentStage, userMessageCount, zeroBaseComplete]);
@@ -551,10 +586,10 @@ export default function InterviewPage() {
   // fill_gaps で表示中の open question を回答対象としてサーバーに渡し、
   // 回答済みの質問が再表示されないよう消費してもらう。
   const answeredQuestionForTurn = useMemo(() => {
-    if (uiState !== "fill_gaps" || !session) return undefined;
+    if (uiState !== "fill_gaps" || !session || !focusedQuestion) return undefined;
     const open = sortQuestions(session.open_questions ?? []);
-    return open.length > 0 && open[0].question === focusedQuestion
-      ? focusedQuestion
+    return open.length > 0 && open[0].question === focusedQuestion.text
+      ? focusedQuestion.text
       : undefined;
   }, [uiState, session, focusedQuestion]);
 
@@ -625,8 +660,8 @@ export default function InterviewPage() {
     }
   };
 
-  const sendTurn = async () => {
-    const text = message.trim();
+  const sendText = async (raw: string) => {
+    const text = raw.trim();
     if (!text || !selectedSessionId) return;
     try {
       const result = await dialogueTurn.mutateAsync({
@@ -641,6 +676,14 @@ export default function InterviewPage() {
     } catch (e) {
       toast.error(String(e));
     }
+  };
+
+  const sendTurn = () => sendText(message);
+
+  // 「いいえ」は修正内容の入力を促す: 定型の書き出しを入力欄に入れてフォーカスする。
+  const startCorrection = () => {
+    setMessage(QUICK_ANSWER_NO_PREFIX);
+    messageInputRef.current?.focus();
   };
 
   const doConfirmUnderstanding = async () => {
@@ -817,9 +860,66 @@ export default function InterviewPage() {
                         </div>
                       )}
                       {focusedQuestion && (
-                        <div className="rounded-md border bg-muted/40 p-3 flex items-start gap-2" data-testid="focused-question">
-                          <HelpCircle className="h-4 w-4 mt-0.5 shrink-0 text-blue-500" />
-                          <p className="text-sm">{focusedQuestion}</p>
+                        <div className="rounded-md border bg-muted/40 p-3 space-y-2" data-testid="focused-question">
+                          {focusedQuestion.hypothesis && (
+                            <div className="rounded-md bg-background/60 border p-2 text-sm" data-testid="question-hypothesis">
+                              <span className="text-[10px] uppercase font-semibold text-muted-foreground block mb-1">仮説</span>
+                              {focusedQuestion.hypothesis}
+                            </div>
+                          )}
+                          <div className="flex items-start gap-2">
+                            <HelpCircle className="h-4 w-4 mt-0.5 shrink-0 text-blue-500" />
+                            <p className="text-sm">{focusedQuestion.text}</p>
+                          </div>
+                          {(focusedQuestion.evidenceRefs ?? []).length > 0 && (
+                            <div className="space-y-0.5" data-testid="question-evidence">
+                              <span className="text-[10px] uppercase font-semibold text-muted-foreground">根拠</span>
+                              {focusedQuestion.evidenceRefs!.map((e, i) => (
+                                <div key={i} className="text-[10px] text-muted-foreground font-mono">
+                                  {e.path}{e.start_line > 0 ? `:${e.start_line}-${e.end_line}` : ""}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                          {(focusedQuestion.confirmable || (focusedQuestion.answerOptions ?? []).length > 0) && (
+                            <div className="flex flex-wrap gap-2 pt-1" data-testid="quick-answers">
+                              {focusedQuestion.confirmable && (
+                                <>
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    onClick={() => sendText(QUICK_ANSWER_YES)}
+                                    disabled={dialogueTurn.isPending}
+                                    data-testid="quick-answer-yes"
+                                  >
+                                    <CheckCircle className="h-4 w-4 mr-1 text-emerald-600" />
+                                    はい、正しいです
+                                  </Button>
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    onClick={startCorrection}
+                                    disabled={dialogueTurn.isPending}
+                                    data-testid="quick-answer-no"
+                                  >
+                                    <Pencil className="h-4 w-4 mr-1" />
+                                    いいえ(修正を入力)
+                                  </Button>
+                                </>
+                              )}
+                              {(focusedQuestion.answerOptions ?? []).map((opt, i) => (
+                                <Button
+                                  key={i}
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={() => sendText(opt)}
+                                  disabled={dialogueTurn.isPending}
+                                >
+                                  {opt}
+                                </Button>
+                              ))}
+                            </div>
+                          )}
                         </div>
                       )}
                       {zeroBaseComplete && (
@@ -834,6 +934,7 @@ export default function InterviewPage() {
                         </Button>
                       )}
                       <Textarea
+                        ref={messageInputRef}
                         rows={4}
                         value={message}
                         onChange={e => setMessage(e.target.value)}

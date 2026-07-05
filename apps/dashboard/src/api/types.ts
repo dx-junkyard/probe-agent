@@ -162,10 +162,28 @@ export interface GapItem {
   severity: string;
 }
 
+export interface InterviewQuestionEvidenceRef {
+  path: string;
+  start_line: number;
+  end_line: number;
+}
+
 export interface OpenQuestion {
   question: string;
   category: string;
   priority: string;
+  // Issue #128: hypothesis-first questions carry the model's working
+  // hypothesis, its snapshot-grounded evidence, and quick-answer options.
+  hypothesis?: string | null;
+  evidence_refs?: InterviewQuestionEvidenceRef[];
+  answer_options?: string[];
+}
+
+export interface InterviewStructuredQuestion {
+  question_text: string;
+  hypothesis: string | null;
+  evidence_refs: InterviewQuestionEvidenceRef[];
+  answer_options: string[];
 }
 
 export interface CurrentUnderstanding {
@@ -321,7 +339,7 @@ export interface InterviewDialogueTurnOut {
     probe_plan: InterviewProposalProbePlan;
     denylist_hit: string | null;
   }[];
-  next_questions: string[];
+  next_questions: InterviewStructuredQuestion[];
   intelligence_run: IntelligenceRunOut | null;
   error: string | null;
   stage: InterviewStage | null;
