@@ -651,6 +651,25 @@ def test_understanding_and_gaps_injected_into_prompt():
     assert user_prompt.index("Current understanding") < user_prompt.index("Context Pack")
 
 
+def test_answered_qa_injected_into_prompt():
+    """Confirmed Q&A pairs are supplied with a do-not-re-ask rule so the
+    reasoning model suppresses semantic re-asking (Issue #129)."""
+    client = _CapturingClient()
+
+    result = generate_interview_turn(
+        client, _make_config(),
+        context_pack=_context_pack(), history=[], user_message="次の質問をどうぞ",
+        answered_qa=[{"question": "主要な利用者は誰ですか?", "answer": "社内の開発者です"}],
+    )
+
+    assert result.error is None
+    user_prompt = client.messages[-1]["content"]
+    assert "Confirmed Q&A" in user_prompt
+    assert "主要な利用者は誰ですか?" in user_prompt
+    assert "社内の開発者です" in user_prompt
+    assert "NEVER ask about these topics again" in user_prompt
+
+
 def test_structured_question_with_valid_evidence():
     """Structured hypothesis-first questions round-trip with their evidence."""
     response = _valid_response(proposals=[])

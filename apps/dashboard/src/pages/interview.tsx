@@ -759,13 +759,14 @@ export default function InterviewPage() {
   }, [session, uiState, currentStage, userMessageCount, zeroBaseComplete]);
 
   // fill_gaps で表示中の open question を回答対象としてサーバーに渡し、
-  // 回答済みの質問が再表示されないよう消費してもらう。
-  const answeredQuestionForTurn = useMemo(() => {
-    if (uiState !== "fill_gaps" || !session || !focusedQuestion) return undefined;
+  // 回答済みの質問が再表示されないよう消費してもらう。qa_id を持つ
+  // エントリは ID 参照(answered_qa_id)で消費し、Q&A 一覧の行も
+  // answered になる(Issue #129)。テキストは旧セッション互換のため併送する。
+  const answeredForTurn = useMemo<{ text?: string; qaId?: number }>(() => {
+    if (uiState !== "fill_gaps" || !session || !focusedQuestion) return {};
     const open = sortQuestions(session.open_questions ?? []);
-    return open.length > 0 && open[0].question === focusedQuestion.text
-      ? focusedQuestion.text
-      : undefined;
+    if (open.length === 0 || open[0].question !== focusedQuestion.text) return {};
+    return { text: focusedQuestion.text, qaId: open[0].qa_id ?? undefined };
   }, [uiState, session, focusedQuestion]);
 
   const nextActionText = useMemo(() => {
@@ -842,7 +843,8 @@ export default function InterviewPage() {
       const result = await dialogueTurn.mutateAsync({
         user_message: text,
         generate_proposals: isProposalStage && unlocked,
-        answered_question: answeredQuestionForTurn,
+        answered_question: answeredForTurn.text,
+        answered_qa_id: answeredForTurn.qaId,
         actor,
       });
       setMessage("");

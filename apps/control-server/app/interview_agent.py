@@ -23,7 +23,12 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from .interview_evidence import EvidenceSnippet, EvidenceTarget, validate_evidence_targets
+from .interview_evidence import (
+    EvidenceConfigError,
+    EvidenceSnippet,
+    EvidenceTarget,
+    validate_evidence_targets,
+)
 from .interview_language import get_interview_language, language_directive
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient, is_reasoning_model
 from .models import (
@@ -35,9 +40,11 @@ from .models import (
 )
 from .probe_planner import check_denylist
 
+# v5: confirmed Q&A pairs (latest revisions from interview_qa) are injected
+# with a do-not-re-ask rule (Issue #129).
 # v4: pass-1 evidence-selection prompt precedes this one when evidence
 # snippets are supplied (Issue #130); the response schema is unchanged.
-PROMPT_VERSION = "interview-v4"
+PROMPT_VERSION = "interview-v5"
 # v2: next_questions items are structured {question_text, hypothesis,
 # evidence_refs, answer_options} objects (Issue #128); plain strings are
 # still accepted and normalized.
@@ -275,6 +282,7 @@ def _build_user_prompt(
     current_understanding: Optional[Dict[str, Any]] = None,
     gap_analysis: Optional[List[Dict[str, Any]]] = None,
     open_questions: Optional[List[Dict[str, Any]]] = None,
+    answered_qa: Optional[List[Dict[str, Any]]] = None,
     understanding_max_chars: int = DEFAULT_UNDERSTANDING_MAX_CHARS,
     evidence_snippets: Optional[List[EvidenceSnippet]] = None,
 ) -> str:
@@ -295,6 +303,13 @@ def _build_user_prompt(
             "anything already answered in the history)"
         )
         parts.append(_trim_json(open_questions, GAP_AND_QUESTION_MAX_CHARS))
+    if answered_qa:
+        parts.append(
+            "## Confirmed Q&A (latest revisions of already-answered interview "
+            "questions; treat the answers as established facts and NEVER ask "
+            "about these topics again, even reworded)"
+        )
+        parts.append(_trim_json(answered_qa, GAP_AND_QUESTION_MAX_CHARS))
     if evidence_snippets:
         parts.append(
             "## Referenced source evidence (read from the pinned snapshot for this "
@@ -428,13 +443,16 @@ def generate_interview_turn(
     current_understanding: Optional[Dict[str, Any]] = None,
     gap_analysis: Optional[List[Dict[str, Any]]] = None,
     open_questions: Optional[List[Dict[str, Any]]] = None,
+    answered_qa: Optional[List[Dict[str, Any]]] = None,
     evidence_snippets: Optional[List[EvidenceSnippet]] = None,
 ) -> InterviewTurnResult:
     """Generate one structured assistant turn for the interview dialogue.
 
     When the session carries a built understanding, it is injected as the
     model's working hypothesis so questions confirm/correct it instead of
-    starting from scratch (Issue #128). ``evidence_snippets`` are source
+    starting from scratch (Issue #128). ``answered_qa`` carries the latest
+    revisions of already-answered interview_qa pairs with a do-not-re-ask
+    rule (Issue #129). ``evidence_snippets`` are source
     fragments read from the pinned snapshot by the pass-1 evidence-selection
     step (Issue #130); when present, question evidence_refs may cite them in
     addition to context-pack/current-understanding spans.
@@ -474,6 +492,7 @@ def generate_interview_turn(
         current_understanding=current_understanding,
         gap_analysis=gap_analysis,
         open_questions=open_questions,
+        answered_qa=answered_qa,
         understanding_max_chars=understanding_max_chars,
         evidence_snippets=evidence_snippets,
     )
@@ -733,7 +752,12 @@ def select_evidence_targets(
 
     if validated.need_evidence and targets:
         allowed_spans = _allowed_evidence_spans(context_pack, current_understanding)
-        error = validate_evidence_targets(targets, allowed_spans)
+        try:
+            error = validate_evidence_targets(targets, allowed_spans)
+        except EvidenceConfigError as exc:
+            # Invalid INTERVIEW_EVIDENCE_* configuration fails the turn closed
+            # as a recorded run failure, not an unaudited HTTP 500.
+            error = str(exc)
         if error:
             return EvidenceSelectionResult(
                 provider=config.provider,

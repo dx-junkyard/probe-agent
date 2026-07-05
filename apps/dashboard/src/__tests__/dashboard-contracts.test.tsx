@@ -1489,6 +1489,7 @@ describe("Interview page", () => {
               { path: "apps/control-server/app/main.py", start_line: 10, end_line: 42 },
             ],
             answer_options: [],
+            qa_id: 42,
           },
         ],
       },
@@ -1530,7 +1531,8 @@ describe("Interview page", () => {
     );
 
     // 「はい」 sends a canned confirmation through the normal dialogue turn
-    // and consumes the focused open question. It is dialogue input, not an
+    // and consumes the focused open question — by qa_id (Issue #129), with
+    // the text kept for legacy sessions. It is dialogue input, not an
     // approval action.
     fireEvent.click(screen.getByTestId("quick-answer-yes"));
     await waitFor(() => {
@@ -1539,6 +1541,7 @@ describe("Interview page", () => {
         expect.objectContaining({
           user_message: "はい、その理解で正しいです。",
           answered_question: questionText,
+          answered_qa_id: 42,
         }),
       );
     });

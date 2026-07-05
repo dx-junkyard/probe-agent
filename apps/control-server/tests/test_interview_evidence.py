@@ -270,6 +270,22 @@ def test_select_evidence_targets_llm_error_fails_closed():
     assert "timeout" in result.error
 
 
+def test_select_evidence_targets_invalid_config_fails_closed(monkeypatch):
+    """An invalid INTERVIEW_EVIDENCE_* value must become a recorded turn
+    failure (fail-closed), never an unhandled exception."""
+    monkeypatch.setenv("INTERVIEW_EVIDENCE_MAX_FILES", "not-a-number")
+    client = FakeLLMClient(response={
+        "need_evidence": True,
+        "targets": [{"path": "src/summarize.py", "start_line": 1, "end_line": 20, "reason": "check"}],
+    })
+    result = select_evidence_targets(
+        client, _make_config(), context_pack=_context_pack(), history=[],
+        user_message="Ask about the summarizer.",
+    )
+    assert result.error is not None
+    assert "INTERVIEW_EVIDENCE_MAX_FILES" in result.error
+
+
 # --- Route-level two-pass wiring ----------------------------------------------
 
 

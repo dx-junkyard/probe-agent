@@ -401,6 +401,8 @@ def _stub_reasoning_turn(monkeypatch, *, next_questions=None):
     from app.routes import interview as interview_routes
     from app.interview_agent import EvidenceSelectionResult, InterviewTurnResult
 
+    captured: dict = {}
+
     def fake_create_llm_client(config):
         return object()
 
@@ -411,6 +413,7 @@ def _stub_reasoning_turn(monkeypatch, *, next_questions=None):
         )
 
     def fake_generate_interview_turn(client, config, **kwargs):
+        captured.update(kwargs)
         return InterviewTurnResult(
             provider="anthropic", model="claude-sonnet-4-5", is_mock=False,
             assistant_message="了解しました。",
@@ -424,6 +427,7 @@ def _stub_reasoning_turn(monkeypatch, *, next_questions=None):
     monkeypatch.setattr(
         interview_routes, "generate_interview_turn", fake_generate_interview_turn
     )
+    return captured
 
 
 def test_dialogue_turn_creates_qa_rows_for_next_questions(admin_client, monkeypatch):
@@ -479,6 +483,125 @@ def test_dialogue_turn_consumes_answered_qa_id(admin_client, monkeypatch):
     assert answered["status"] == "answered"
     assert answered["answer_text"] == "APIゲートウェイ層で認証します"
     assert answered["answered_by"] == "root"
+
+
+def test_dialogue_turn_open_questions_entries_carry_qa_id(admin_client, monkeypatch):
+    """The legacy open_questions JSON entries carry the interview_qa row ID
+    so the dashboard can consume the focused question by ID, not text."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+
+    _stub_reasoning_turn(monkeypatch, next_questions=["保存期間はどれくらいですか?"])
+    body = admin_client.post(
+        f"/interview/sessions/{session_id}/dialogue-turn",
+        json={"user_message": "こんにちは"},
+        headers=headers,
+    ).json()
+
+    assert len(body["created_qa_ids"]) == 1
+    entries = body["open_questions_structured"]
+    assert entries and entries[0]["qa_id"] == body["created_qa_ids"][0]
+
+
+def test_dialogue_turn_text_consumption_marks_qa_answered(admin_client, monkeypatch):
+    """During the migration period, exact-text answered_question consumption
+    must keep the interview_qa row in sync (marked answered), so the Q&A
+    panel's open count matches the conversation state."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+
+    question = "リトライ方針はありますか?"
+    _stub_reasoning_turn(monkeypatch, next_questions=[question])
+    first = admin_client.post(
+        f"/interview/sessions/{session_id}/dialogue-turn",
+        json={"user_message": "こんにちは"},
+        headers=headers,
+    ).json()
+    qa_id = first["created_qa_ids"][0]
+
+    _stub_reasoning_turn(monkeypatch, next_questions=[])
+    r = admin_client.post(
+        f"/interview/sessions/{session_id}/dialogue-turn",
+        json={
+            "user_message": "リトライは3回まで指数バックオフです",
+            "answered_question": question,
+            "actor": "root",
+        },
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["error"] is None
+
+    listing = admin_client.get(
+        f"/interview/sessions/{session_id}/qa", headers=headers
+    ).json()
+    answered = next(i for i in listing["items"] if i["id"] == qa_id)
+    assert answered["status"] == "answered"
+    assert answered["answer_text"] == "リトライは3回まで指数バックオフです"
+    # The JSON entry was consumed as well.
+    remaining = r.json()["open_questions_structured"] or []
+    assert all(e["question"] != question for e in remaining)
+
+
+def test_dialogue_turn_does_not_duplicate_qa_for_same_question_text(admin_client, monkeypatch):
+    """A question re-emitted with identical text across turns reuses the
+    existing interview_qa row (structural exact-text dedupe, Principle 6)."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+
+    question = "認証はどの層で行いますか?"
+    _stub_reasoning_turn(monkeypatch, next_questions=[question])
+    first = admin_client.post(
+        f"/interview/sessions/{session_id}/dialogue-turn",
+        json={"user_message": "1回目"},
+        headers=headers,
+    ).json()
+    assert len(first["created_qa_ids"]) == 1
+
+    _stub_reasoning_turn(monkeypatch, next_questions=[question])
+    second = admin_client.post(
+        f"/interview/sessions/{session_id}/dialogue-turn",
+        json={"user_message": "2回目"},
+        headers=headers,
+    ).json()
+    assert second["created_qa_ids"] == []
+
+    listing = admin_client.get(
+        f"/interview/sessions/{session_id}/qa", headers=headers
+    ).json()
+    assert sum(1 for i in listing["items"] if i["question_text"] == question) == 1
+
+
+def test_dialogue_turn_injects_confirmed_qa_into_prompt(admin_client, monkeypatch):
+    """The latest revisions of answered Q&A pairs are passed to the reasoning
+    turn with a do-not-re-ask rule (Issue #129 acceptance)."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+
+    qa = _create_qa(
+        admin_client, headers, session_id,
+        question_text="主要な利用者は誰ですか?", question_source="dialogue",
+    )
+    r = admin_client.post(
+        f"/interview/sessions/{session_id}/qa/{qa['id']}/answer",
+        json={"answer_text": "社内の開発者です", "actor": "root"},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+
+    captured = _stub_reasoning_turn(monkeypatch, next_questions=[])
+    admin_client.post(
+        f"/interview/sessions/{session_id}/dialogue-turn",
+        json={"user_message": "続けてください"},
+        headers=headers,
+    )
+    assert captured["answered_qa"] == [
+        {"question": "主要な利用者は誰ですか?", "answer": "社内の開発者です"}
+    ]
 
 
 def test_dialogue_turn_ignores_stale_answered_qa_id(admin_client, monkeypatch):

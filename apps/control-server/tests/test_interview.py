@@ -633,6 +633,23 @@ def test_update_understanding_records_llm_config_failure(admin_client, monkeypat
     assert detail["messages"][-1]["role"] == "assistant"
     assert "ANTHROPIC_API_KEY" in detail["messages"][-1]["content"]
 
+    # Principle 7: the failed understanding review is a recorded reasoning
+    # run, linked from the assistant failure message.
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        run = conn.execute(
+            """SELECT * FROM intelligence_runs
+               WHERE system_id = ? AND run_type = 'understanding_review'
+               ORDER BY id DESC""",
+            (system_id,),
+        ).fetchone()
+    assert run is not None
+    assert run["status"] == "failed"
+    assert "ANTHROPIC_API_KEY" in run["error_details"]
+    assert run["prompt_version"] == "understanding-review-v2"
+    assert detail["messages"][-1]["intelligence_run_id"] == run["id"]
+
 
 def test_update_understanding_uses_existing_graph_without_claim_scan(admin_client, monkeypatch):
     """Interview refresh must not synchronously rescan all documentation chunks."""
@@ -698,6 +715,111 @@ def test_update_understanding_uses_existing_graph_without_claim_scan(admin_clien
     body = r.json()
     assert body["last_error"] is None
     assert body["current_understanding"]
+
+
+def test_update_understanding_records_run_and_reviewer_qa_rows(admin_client, monkeypatch):
+    """A successful understanding review is recorded in intelligence_runs
+    (Principle 7 / Issue #127) and its open questions become ID-addressable
+    interview_qa rows with qa_id carried in the open_questions JSON
+    (Issue #129). Rebuilding does not duplicate identical questions."""
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("LLM_MODEL", "o3-mini")
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+    token, system_id, snapshot_id = _setup(admin_client)
+    _insert_understanding_graph(system_id, snapshot_id)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "reviewer qa"},
+        headers=headers,
+    ).json()
+
+    class FakeReviewClient:
+        def generate_text(self, messages, *, temperature=None, max_tokens=None):
+            import json
+
+            return json.dumps({
+                "system_purpose": [{
+                    "name": "Probe repository inspection",
+                    "summary": "Inspects probe agent repositories",
+                    "confidence": {"level": "likely", "reason": "README evidence"},
+                    "evidence": [{
+                        "path": "README.md",
+                        "start_line": 1,
+                        "end_line": 5,
+                        "summary": "README states purpose",
+                    }],
+                    "why_core": "",
+                    "related_docs": ["README.md"],
+                    "related_apis": [],
+                    "children": [],
+                }],
+                "core_capabilities": [],
+                "capability_elements": [],
+                "supporting_elements": [],
+                "api_boundaries": [],
+                "probe_flow_candidates": [],
+                "gap_analysis": [],
+                "open_questions": [{
+                    "question": "トレースの保持期間はどれくらいですか?",
+                    "category": "capability",
+                    "priority": "high",
+                }],
+                "suggested_next_action": "confirm_purpose",
+            })
+
+    import app.routes.interview as interview_route
+
+    monkeypatch.setattr(interview_route, "create_llm_client", lambda config: FakeReviewClient())
+
+    r = admin_client.post(
+        f"/interview/sessions/{session['id']}/update-understanding",
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["last_error"] is None
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        run = conn.execute(
+            """SELECT * FROM intelligence_runs
+               WHERE system_id = ? AND run_type = 'understanding_review'
+               ORDER BY id DESC""",
+            (system_id,),
+        ).fetchone()
+    assert run is not None
+    assert run["status"] == "completed"
+    assert run["prompt_version"] == "understanding-review-v2"
+    assert run["decision_method"] == "reasoning_llm"
+
+    qa_listing = admin_client.get(
+        f"/interview/sessions/{session['id']}/qa", headers=headers
+    ).json()
+    reviewer_items = [
+        i for i in qa_listing["items"] if i["question_source"] == "reviewer"
+    ]
+    assert len(reviewer_items) == 1
+    assert reviewer_items[0]["question_text"] == "トレースの保持期間はどれくらいですか?"
+    assert reviewer_items[0]["question_category"] == "capability"
+
+    # The open_questions JSON carries the qa_id so the dashboard can answer
+    # by ID instead of exact text.
+    assert body["open_questions"][0]["qa_id"] == reviewer_items[0]["id"]
+
+    # A rebuild with the same questions must not duplicate the Q&A rows.
+    r2 = admin_client.post(
+        f"/interview/sessions/{session['id']}/update-understanding",
+        headers=headers,
+    )
+    assert r2.status_code == 200, r2.text
+    qa_after = admin_client.get(
+        f"/interview/sessions/{session['id']}/qa", headers=headers
+    ).json()
+    assert len([
+        i for i in qa_after["items"] if i["question_source"] == "reviewer"
+    ]) == 1
 
 
 def test_update_understanding_without_graph_fails_fast(admin_client, monkeypatch):
