@@ -40,7 +40,11 @@ from ..interview_agent import (
     generate_interview_turn,
     select_evidence_targets,
 )
-from ..interview_evidence import EvidenceReadError, read_evidence_snippets
+from ..interview_evidence import (
+    EvidenceConfigError,
+    EvidenceReadError,
+    read_evidence_snippets,
+)
 from ..llm import LLMConfig, LLMError, create_llm_client, is_reasoning_model
 from ..models import (
     InterviewApprovedItemOut,
@@ -727,6 +731,22 @@ def interview_dialogue_turn(
             json.loads(session["open_questions"]) if session["open_questions"] else None
         )
 
+        # Issue #129: the latest revisions of already-answered Q&A pairs are
+        # injected into the prompt with a do-not-re-ask rule, so semantic
+        # re-asking is suppressed by the reasoning model (never by fuzzy
+        # text matching — Principle 6).
+        answered_qa_rows = conn.execute(
+            """SELECT question_text, answer_text FROM interview_qa
+               WHERE session_id = ? AND system_id = ?
+                 AND superseded_by_id IS NULL AND status = 'answered'
+               ORDER BY id""",
+            (session_id, system_id),
+        ).fetchall()
+        answered_qa_pairs = [
+            {"question": r["question_text"], "answer": r["answer_text"]}
+            for r in answered_qa_rows
+        ] or None
+
         # Issue #130: pass 1 selects (or declines) evidence to read from the
         # pinned snapshot before pass 2 asks the next question. Both passes
         # are audited as separate intelligence_runs rows below.
@@ -772,8 +792,10 @@ def interview_dialogue_turn(
                         snapshot_row["commit_sha"],
                         evidence_audit.targets,
                     )
-                except EvidenceReadError as exc:
-                    # Fail-closed: no "continue without the snippet" fallback.
+                except (EvidenceReadError, EvidenceConfigError) as exc:
+                    # Fail-closed: no "continue without the snippet" fallback,
+                    # and invalid INTERVIEW_EVIDENCE_* configuration is a
+                    # recorded turn failure, not an unaudited HTTP 500.
                     turn = InterviewTurnResult(
                         provider=config.provider,
                         model=config.model,
@@ -791,6 +813,7 @@ def interview_dialogue_turn(
                     current_understanding=session_understanding,
                     gap_analysis=session_gaps,
                     open_questions=session_open_questions,
+                    answered_qa=answered_qa_pairs,
                     evidence_snippets=evidence_snippets,
                 )
 
@@ -973,22 +996,90 @@ def interview_dialogue_turn(
             stage_updates = ["updated_at = ?"]
             stage_params: list = [now]
 
+            # Issue #129: persist next_questions as ID-addressable interview_qa
+            # rows first, so the legacy open_questions JSON entries below can
+            # carry each row's qa_id and the dashboard can answer by ID.
+            # A question whose exact text already exists as a current row is
+            # not re-inserted (structural exact-text dedupe); its existing ID
+            # is reused. Issue #130: attach the char_count of any evidence
+            # snippet a question's evidence_refs actually cite, so the
+            # dashboard can show what was read for that question.
+            existing_qa_by_text = {
+                r["question_text"]: r["id"]
+                for r in conn.execute(
+                    """SELECT id, question_text FROM interview_qa
+                       WHERE session_id = ? AND system_id = ?
+                         AND superseded_by_id IS NULL
+                       ORDER BY id""",
+                    (session_id, system_id),
+                ).fetchall()
+            }
+            created_qa_ids: List[int] = []
+            new_entries: List[dict] = []
+            for raw_question in turn.next_questions:
+                question = _question_out(raw_question)
+                if question.question_text in existing_qa_by_text:
+                    qa_id = existing_qa_by_text[question.question_text]
+                else:
+                    qa_evidence_refs = [
+                        InterviewQaEvidenceRefOut(
+                            path=ref.path,
+                            start_line=ref.start_line,
+                            end_line=ref.end_line,
+                            char_count=next(
+                                (
+                                    s.char_count for s in evidence_snippets
+                                    if s.path == ref.path
+                                    and s.start_line <= ref.start_line
+                                    and s.end_line >= ref.end_line
+                                ),
+                                None,
+                            ),
+                        )
+                        for ref in question.evidence_refs
+                    ]
+                    qa_id = _insert_qa_row(
+                        conn, session_id, system_id,
+                        question_text=question.question_text,
+                        question_category="general",
+                        question_source="dialogue",
+                        hypothesis=question.hypothesis,
+                        evidence_refs=qa_evidence_refs,
+                        now=now,
+                    )
+                    existing_qa_by_text[question.question_text] = qa_id
+                    created_qa_ids.append(qa_id)
+                entry = _question_entry(raw_question)
+                entry["qa_id"] = qa_id
+                new_entries.append(entry)
+
             # Consume the answered open question and record the model's
             # follow-up questions so the UI never re-asks what was already
-            # answered (Issue #123). Removal is an exact-text structural
-            # match; new questions come verbatim from the reasoning model
-            # (structured with hypothesis/evidence since Issue #128).
+            # answered (Issues #123, #129). Consumption is structural:
+            # answered_qa_id matches an entry's qa_id; answered_question is
+            # the legacy exact-text match, honored during the migration
+            # period. Both roads also mark the interview_qa row answered.
+            consumed_qa_ids: set = set()
+            if payload.answered_qa_id is not None:
+                consumed_qa_ids.add(payload.answered_qa_id)
             existing_questions: List[dict] = list(session_open_questions or [])
-            remaining_questions = [
-                q for q in existing_questions
-                if not (
+            remaining_questions: List[dict] = []
+            for q in existing_questions:
+                text_match = bool(
                     payload.answered_question
                     and q.get("question") == payload.answered_question
                 )
-            ]
+                id_match = (
+                    q.get("qa_id") is not None
+                    and q.get("qa_id") == payload.answered_qa_id
+                )
+                if text_match or id_match:
+                    if q.get("qa_id") is not None:
+                        consumed_qa_ids.add(q["qa_id"])
+                    continue
+                remaining_questions.append(q)
             known_texts = {q.get("question") for q in remaining_questions}
-            for question in turn.next_questions:
-                entry = _question_entry(question)
+            for entry in new_entries:
                 if entry["question"] and entry["question"] not in known_texts:
                     remaining_questions.append(entry)
                     known_texts.add(entry["question"])
@@ -1000,51 +1091,15 @@ def interview_dialogue_turn(
                     if remaining_questions else None
                 )
 
-            # Issue #129: persist next_questions as ID-addressable interview_qa
-            # rows (in addition to the legacy open_questions JSON above, kept
-            # during the migration period). Issue #130: attach the char_count
-            # of any evidence snippet a question's evidence_refs actually cite,
-            # so the dashboard can show what was read for that question.
-            created_qa_ids: List[int] = []
-            for raw_question in turn.next_questions:
-                question = _question_out(raw_question)
-                qa_evidence_refs = [
-                    InterviewQaEvidenceRefOut(
-                        path=ref.path,
-                        start_line=ref.start_line,
-                        end_line=ref.end_line,
-                        char_count=next(
-                            (
-                                s.char_count for s in evidence_snippets
-                                if s.path == ref.path
-                                and s.start_line <= ref.start_line
-                                and s.end_line >= ref.end_line
-                            ),
-                            None,
-                        ),
-                    )
-                    for ref in question.evidence_refs
-                ]
-                created_qa_ids.append(_insert_qa_row(
-                    conn, session_id, system_id,
-                    question_text=question.question_text,
-                    question_category="general",
-                    question_source="dialogue",
-                    hypothesis=question.hypothesis,
-                    evidence_refs=qa_evidence_refs,
-                    now=now,
-                ))
-
-            # Issue #129: answered_qa_id is the ID-based replacement for the
-            # exact-text answered_question match above; both are honored
-            # during the migration period. Silently ignored if the row is
-            # missing or already answered — the dialogue turn itself must
-            # never fail because of a stale Q&A reference.
-            if payload.answered_qa_id is not None:
+            # Issue #129: record the user's message as the answer on each
+            # consumed Q&A row. Silently ignored if a row is missing or
+            # already answered — the dialogue turn itself must never fail
+            # because of a stale Q&A reference.
+            for consumed_id in sorted(consumed_qa_ids):
                 answered_row = conn.execute(
                     """SELECT id, status FROM interview_qa
                        WHERE id = ? AND session_id = ? AND system_id = ?""",
-                    (payload.answered_qa_id, session_id, system_id),
+                    (consumed_id, session_id, system_id),
                 ).fetchone()
                 if answered_row is not None and answered_row["status"] in ("open", "skipped"):
                     conn.execute(
@@ -1052,7 +1107,7 @@ def interview_dialogue_turn(
                            SET answer_text = ?, status = 'answered',
                                answered_by = ?, answered_at = ?
                            WHERE id = ?""",
-                        (payload.user_message, payload.actor, now, payload.answered_qa_id),
+                        (payload.user_message, payload.actor, now, consumed_id),
                     )
 
             if payload.user_message.strip():
@@ -1976,13 +2031,54 @@ def update_interview_understanding(
 
         from ..docs_code_reconciler import reconcile
         from ..system_understanding_service import _load_graph_for_snapshot
-        from ..system_understanding_reviewer import generate_understanding_review
+        from ..system_understanding_reviewer import (
+            PROMPT_VERSION as REVIEW_PROMPT_VERSION,
+            SCHEMA_VERSION as REVIEW_SCHEMA_VERSION,
+            generate_understanding_review,
+        )
+
+        # Principle 7: the understanding review is a reasoning run; record it
+        # in intelligence_runs for success and failure alike so the reviewer's
+        # prompt_version stays auditable (Issue #127).
+        def _record_review_run(
+            status: str,
+            error_details: Optional[str],
+            provider: str,
+            model: str,
+            is_mock: bool,
+        ) -> int:
+            cur = conn.execute(
+                """INSERT INTO intelligence_runs
+                    (system_id, snapshot_id, run_type, provider, model,
+                     prompt_version, schema_version, decision_method, status,
+                     error_details, is_mock, started_at, completed_at)
+                VALUES (?, ?, 'understanding_review', ?, ?, ?, ?,
+                        'reasoning_llm', ?, ?, ?, ?, ?)""",
+                (
+                    system_id,
+                    snapshot_id,
+                    provider,
+                    model,
+                    REVIEW_PROMPT_VERSION,
+                    REVIEW_SCHEMA_VERSION,
+                    status,
+                    error_details,
+                    1 if is_mock else 0,
+                    now,
+                    now,
+                ),
+            )
+            return cur.lastrowid
 
         config = LLMConfig.intelligence_from_env()
         try:
             client = create_llm_client(config)
         except LLMError as exc:
             error = str(exc)
+            run_id = _record_review_run(
+                "failed", error, config.provider, config.model,
+                config.provider == "mock",
+            )
             conn.execute(
                 """UPDATE interview_session
                    SET last_error = ?, updated_at = ?
@@ -1991,9 +2087,9 @@ def update_interview_understanding(
             )
             conn.execute(
                 """INSERT INTO interview_message
-                    (session_id, system_id, role, content, created_at)
-                VALUES (?, ?, 'assistant', ?, ?)""",
-                (session_id, system_id, f"理解の更新に失敗しました: {error}", now),
+                    (session_id, system_id, role, content, intelligence_run_id, created_at)
+                VALUES (?, ?, 'assistant', ?, ?, ?)""",
+                (session_id, system_id, f"理解の更新に失敗しました: {error}", run_id, now),
             )
             row = _get_session_or_404(conn, session_id, system_id)
             return _session_out(row)
@@ -2037,6 +2133,10 @@ def update_interview_understanding(
         )
 
         if review.error:
+            run_id = _record_review_run(
+                "failed", review.error, review.provider, review.model,
+                review.is_mock,
+            )
             conn.execute(
                 """UPDATE interview_session
                    SET last_error = ?, updated_at = ?
@@ -2045,16 +2145,64 @@ def update_interview_understanding(
             )
             conn.execute(
                 """INSERT INTO interview_message
-                    (session_id, system_id, role, content, created_at)
-                VALUES (?, ?, 'assistant', ?, ?)""",
-                (session_id, system_id, f"理解のレビューに失敗しました: {review.error}", now),
+                    (session_id, system_id, role, content, intelligence_run_id, created_at)
+                VALUES (?, ?, 'assistant', ?, ?, ?)""",
+                (session_id, system_id, f"理解のレビューに失敗しました: {review.error}", run_id, now),
             )
             row = _get_session_or_404(conn, session_id, system_id)
             return _session_out(row)
 
+        run_id = _record_review_run(
+            "completed", None, review.provider, review.model, review.is_mock,
+        )
+
+        # Issue #129: register the reviewer's open questions as
+        # ID-addressable interview_qa rows (question_source "reviewer") and
+        # carry each row's qa_id in the open_questions JSON so the dashboard
+        # answers by ID. Questions whose exact text already exists as a
+        # current row are not re-inserted (structural exact-text dedupe,
+        # e.g. across repeated rebuilds).
+        existing_qa_by_text = {
+            r["question_text"]: r["id"]
+            for r in conn.execute(
+                """SELECT id, question_text FROM interview_qa
+                   WHERE session_id = ? AND system_id = ?
+                     AND superseded_by_id IS NULL
+                   ORDER BY id""",
+                (session_id, system_id),
+            ).fetchall()
+        }
+        open_question_entries: List[dict] = []
+        for q in review.open_questions or []:
+            entry = dict(q)
+            text = entry.get("question") or ""
+            if not text:
+                continue
+            if text in existing_qa_by_text:
+                qa_id = existing_qa_by_text[text]
+            else:
+                category = entry.get("category")
+                if category not in ("purpose", "capability", "api", "probe_flow", "general"):
+                    category = "general"
+                qa_id = _insert_qa_row(
+                    conn, session_id, system_id,
+                    question_text=text,
+                    question_category=category,
+                    question_source="reviewer",
+                    hypothesis=None,
+                    evidence_refs=[],
+                    now=now,
+                )
+                existing_qa_by_text[text] = qa_id
+            entry["qa_id"] = qa_id
+            open_question_entries.append(entry)
+
         understanding_json = json.dumps(review.current_understanding) if review.current_understanding else None
         gap_json = json.dumps(review.gap_analysis) if review.gap_analysis else None
-        questions_json = json.dumps(review.open_questions) if review.open_questions else None
+        questions_json = (
+            json.dumps(open_question_entries, ensure_ascii=False)
+            if open_question_entries else None
+        )
 
         new_stage = _advance_stage(
             session["stage"] or "understanding_initialized",
@@ -2088,9 +2236,9 @@ def update_interview_understanding(
 
                 conn.execute(
                     """INSERT INTO interview_message
-                        (session_id, system_id, role, content, created_at)
-                    VALUES (?, ?, 'assistant', ?, ?)""",
-                    (session_id, system_id, asst_content, now),
+                        (session_id, system_id, role, content, intelligence_run_id, created_at)
+                    VALUES (?, ?, 'assistant', ?, ?, ?)""",
+                    (session_id, system_id, asst_content, run_id, now),
                 )
 
         row = _get_session_or_404(conn, session_id, system_id)

@@ -177,6 +177,10 @@ export interface OpenQuestion {
   hypothesis?: string | null;
   evidence_refs?: InterviewQuestionEvidenceRef[];
   answer_options?: string[];
+  // Issue #129: ID of the interview_qa row backing this question. Sent as
+  // answered_qa_id with the dialogue turn so consumption is ID-based;
+  // absent on entries from sessions predating the Q&A layer.
+  qa_id?: number | null;
 }
 
 export interface InterviewStructuredQuestion {

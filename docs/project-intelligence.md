@@ -858,13 +858,27 @@ Decision Workspace の #36（Context Pack Builder）と同じ位置づけ。pin 
 生成済み提案（`interview_proposal`）が存在する場合は回答レスポンスに
 `regeneration_recommended: true` を返すが、既存の提案は自動では無効化・再生成されない。
 
-対話ターン（`POST /interview/sessions/{id}/dialogue-turn`）は次の2つを行う:
+対話ターン（`POST /interview/sessions/{id}/dialogue-turn`）は次を行う:
 
 1. モデルが返した `next_questions` を `question_source: "dialogue"` の `interview_qa`
-   行として作成し、作成された ID を `created_qa_ids` として返す。
-2. `answered_question`（テキスト完全一致、#123）に加えて `answered_qa_id`（ID 参照）を
+   行として作成し、新規作成された ID を `created_qa_ids` として返す。既存の現行行と
+   質問文が完全一致する場合は再挿入せず既存 ID を再利用する（構造的な完全一致
+   dedupe、Principle 6）。移行期間中も残る `open_questions` JSON の各エントリには
+   対応する `qa_id` を持たせ、Dashboard は ID で回答対象を指定する。
+2. `answered_question`（テキスト完全一致、#123）に加えて `answered_qa_id`(ID 参照)を
    受け付ける。ID 参照は言い換えに強く、存在しない/既に回答済みの ID は無視されターン
-   自体は失敗しない。テキスト一致は移行期間中は併存するが、いずれ削除される。
+   自体は失敗しない。テキスト一致は移行期間中は併存するが(その場合も一致した
+   エントリの `qa_id` 行が answered に同期される)、いずれ削除される。
+3. 回答済み Q&A の最新リビジョン一覧を対話プロンプトに
+   「確定事実として再質問しない」指示付きで注入する(prompt `interview-v5`)。
+   意味レベルの重複質問の抑止は reasoning model への指示で行い、
+   類似度ヒューリスティックでは行わない(Principle 6)。
+
+理解構築(`POST .../update-understanding`)は reviewer の `open_questions` を
+`question_source: "reviewer"` の `interview_qa` 行として登録し(同じく完全一致
+dedupe)、`open_questions` JSON のエントリに `qa_id` を付与する。また理解レビュー
+自体を `run_type: understanding_review` の `intelligence_runs` 行として成功・失敗
+ともに記録し、生成/失敗メッセージを run にリンクする(Principle 7)。
 
 エンドポイント: `GET/POST /interview/sessions/{id}/qa`,
 `POST .../qa/{qa_id}/answer|skip|resume`。旧セッション（`interview_qa` 行が無い）は

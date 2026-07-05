@@ -225,6 +225,11 @@ IntelligenceRunType = Literal[
     # generation, run_type "interview_dialogue" above) so the two reasoning
     # calls stay distinguishable in the audit trail.
     "interview_evidence_selection",
+    # Issue #127/#123: the system-understanding review behind
+    # update-understanding (system_understanding_reviewer.py). Recorded for
+    # both success and failure so the reviewer's prompt_version stays
+    # auditable (Principle 7).
+    "understanding_review",
 ]
 DecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
 # How a single hierarchy claim was produced. Kept distinct from the audit
