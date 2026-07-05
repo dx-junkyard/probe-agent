@@ -68,6 +68,30 @@ def _insert_snapshot(system_id, commit_sha="abc123"):
         return cur.lastrowid
 
 
+def _insert_understanding_graph(system_id, snapshot_id):
+    from app.documentation_claim_scanner import ChunkScanResult, ClaimEvidence, DocumentationClaim
+    from app.understanding_graph import build_understanding_graph, save_graph_snapshot
+    from app.db import get_conn
+
+    result = ChunkScanResult(
+        chunk_id="chunk-1",
+        chunk_content_hash="hash-1",
+        prompt_version="claim-scanner-v1",
+        schema_version="claim-scanner-v1",
+        claims=[
+            DocumentationClaim(
+                claim_type="system_purpose",
+                summary="System helps inspect probe agent repositories",
+                evidence=ClaimEvidence(path="README.md", start_line=1, end_line=5),
+                confidence=0.9,
+            )
+        ],
+    )
+    graph = build_understanding_graph([result])
+    with get_conn() as conn:
+        return save_graph_snapshot(conn, system_id, graph, snapshot_id=snapshot_id)
+
+
 def _setup(client, name="System A"):
     token = _login(client)
     system = _create_system(client, token, name)
@@ -608,6 +632,110 @@ def test_update_understanding_records_llm_config_failure(admin_client, monkeypat
     ).json()
     assert detail["messages"][-1]["role"] == "assistant"
     assert "ANTHROPIC_API_KEY" in detail["messages"][-1]["content"]
+
+
+def test_update_understanding_uses_existing_graph_without_claim_scan(admin_client, monkeypatch):
+    """Interview refresh must not synchronously rescan all documentation chunks."""
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("LLM_MODEL", "o3-mini")
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+    token, system_id, snapshot_id = _setup(admin_client)
+    _insert_understanding_graph(system_id, snapshot_id)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "reuse graph"},
+        headers=headers,
+    ).json()
+
+    import app.documentation_claim_scanner as scanner
+
+    def fail_scan(*args, **kwargs):
+        raise AssertionError("update-understanding must not run claim scan")
+
+    monkeypatch.setattr(scanner, "scan_all_chunks", fail_scan)
+
+    class FakeReviewClient:
+        def generate_text(self, messages, *, temperature=None, max_tokens=None):
+            import json
+
+            return json.dumps({
+                "system_purpose": [{
+                    "name": "Probe repository inspection",
+                    "summary": "Inspects probe agent repositories",
+                    "confidence": {"level": "likely", "reason": "README evidence"},
+                    "evidence": [{
+                        "path": "README.md",
+                        "start_line": 1,
+                        "end_line": 5,
+                        "summary": "README states purpose",
+                    }],
+                    "why_core": "",
+                    "related_docs": ["README.md"],
+                    "related_apis": [],
+                    "children": [],
+                }],
+                "core_capabilities": [],
+                "capability_elements": [],
+                "supporting_elements": [],
+                "api_boundaries": [],
+                "probe_flow_candidates": [],
+                "gap_analysis": [],
+                "open_questions": [],
+                "suggested_next_action": "confirm_purpose",
+            })
+
+    import app.routes.interview as interview_route
+
+    monkeypatch.setattr(interview_route, "create_llm_client", lambda config: FakeReviewClient())
+
+    r = admin_client.post(
+        f"/interview/sessions/{session['id']}/update-understanding",
+        headers=headers,
+    )
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["last_error"] is None
+    assert body["current_understanding"]
+
+
+def test_update_understanding_without_graph_fails_fast(admin_client, monkeypatch):
+    """Missing graph should surface a fast actionable error, not trigger a heavy scan."""
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("LLM_MODEL", "o3-mini")
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "missing graph"},
+        headers=headers,
+    ).json()
+
+    import app.documentation_claim_scanner as scanner
+
+    def fail_scan(*args, **kwargs):
+        raise AssertionError("missing graph path must not run claim scan")
+
+    monkeypatch.setattr(scanner, "scan_all_chunks", fail_scan)
+
+    class FakeClient:
+        pass
+
+    import app.routes.interview as interview_route
+
+    monkeypatch.setattr(interview_route, "create_llm_client", lambda config: FakeClient())
+
+    r = admin_client.post(
+        f"/interview/sessions/{session['id']}/update-understanding",
+        headers=headers,
+    )
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["last_error"]
+    assert "Understanding graph is not ready" in body["last_error"]
 
 
 def test_proposals_rejected_before_proposal_stage(admin_client):

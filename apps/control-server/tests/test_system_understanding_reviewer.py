@@ -21,6 +21,7 @@ from app.understanding_graph import (
     UnderstandingGraph,
     build_understanding_graph,
     EvidenceRef,
+    GraphNode,
 )
 from app.docs_code_reconciler import ReconciliationResult, ReconciliationMapping
 from app.system_understanding_reviewer import (
@@ -295,6 +296,46 @@ class TestReviewGeneration:
         assert "Understanding Graph Nodes" in prompt
         assert "Code Intelligence Reconciliation" in prompt
 
+    def test_review_prompt_is_compacted_for_large_graph(self, monkeypatch):
+        monkeypatch.setenv("INTELLIGENCE_REVIEW_MAX_NODES_PER_TYPE", "3")
+        monkeypatch.setenv("INTELLIGENCE_REVIEW_MAX_PROMPT_CHARS", "20000")
+        nodes = {}
+        for i in range(40):
+            node_id = f"cap-{i}"
+            nodes[node_id] = GraphNode(
+                node_id=node_id,
+                node_type="core_capability",
+                name=f"Capability {i} " + ("x" * 200),
+                summary="summary " + ("y" * 500),
+                evidence=[
+                    EvidenceRef(
+                        path=f"docs/{i}.md",
+                        start_line=1,
+                        end_line=2,
+                        chunk_id=f"chunk-{i}",
+                        confidence=0.9,
+                        summary="evidence " + ("z" * 500),
+                    )
+                ],
+                confidence=0.9,
+            )
+        graph = UnderstandingGraph(
+            nodes=nodes,
+            claim_count=40,
+            valid_claim_count=40,
+            confidence_summary={"core_capability": 0.9},
+            conflicts=[],
+            weak_nodes=[],
+            source_hash="hash",
+        )
+
+        prompt = _build_review_prompt(graph, _empty_reconciliation())
+
+        assert "total_nodes: 40" in prompt
+        assert "included_nodes: 3" in prompt
+        assert prompt.count("[core_capability]") == 3
+        assert len(prompt) < 20_000
+
     def test_missing_graph_handled(self):
         empty_graph = build_understanding_graph([])
         recon = _empty_reconciliation()
@@ -381,6 +422,18 @@ class TestEnumValidation:
             graph=graph, reconciliation=_empty_reconciliation(),
         )
         assert result.error is not None
+
+    def test_descriptive_next_action_is_normalized(self):
+        response = dict(VALID_REVIEW_RESPONSE)
+        response["suggested_next_action"] = "Clarify the top-level product goal with the user."
+        graph = _build_graph([_claim()])
+        client = FakeReasoningClient(response)
+        result = generate_understanding_review(
+            client, _reasoning_config(),
+            graph=graph, reconciliation=_empty_reconciliation(),
+        )
+        assert result.error is None
+        assert result.suggested_next_action == "resolve_open_questions"
 
 
 class TestEvidenceRequired:

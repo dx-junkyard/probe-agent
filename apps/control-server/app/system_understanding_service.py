@@ -394,6 +394,10 @@ def _load_graph_for_snapshot(conn, system_id: int, snapshot_id: int):
             confidence=nd.get("confidence", 0.0),
             mentioned_apis=nd.get("mentioned_apis", []),
             mentioned_symbols=nd.get("mentioned_symbols", []),
+            children=nd.get("children", []),
+            parent_id=nd.get("parent_id"),
+            conflict_with=nd.get("conflict_with"),
+            is_weak=nd.get("is_weak", False),
         )
 
     return UnderstandingGraph(
