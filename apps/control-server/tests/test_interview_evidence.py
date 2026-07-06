@@ -125,6 +125,22 @@ def test_validate_evidence_targets_rejects_invalid_range():
     assert "invalid line range" in error
 
 
+def test_validate_evidence_targets_rejects_out_of_span_range():
+    """A known path but a range outside every known span is fail-closed —
+    the model must not read arbitrary rows of a context-pack file (Issue #130)."""
+    allowed = {"src/summarize.py": [(10, 20)]}
+    targets = [EvidenceTarget(path="src/summarize.py", start_line=1, end_line=5000)]
+    error = validate_evidence_targets(targets, allowed)
+    assert error is not None
+    assert "not contained in any known span" in error
+
+
+def test_validate_evidence_targets_accepts_range_within_span():
+    allowed = {"src/summarize.py": [(10, 20)]}
+    targets = [EvidenceTarget(path="src/summarize.py", start_line=12, end_line=18)]
+    assert validate_evidence_targets(targets, allowed) is None
+
+
 def test_validate_evidence_targets_enforces_file_limit():
     allowed = {"a.py": [(1, 10)], "b.py": [(1, 10)]}
     targets = [

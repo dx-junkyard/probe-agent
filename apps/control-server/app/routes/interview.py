@@ -796,6 +796,12 @@ def interview_dialogue_turn(
         # are audited as separate intelligence_runs rows below.
         evidence_audit: Optional[EvidenceSelectionResult] = None
         evidence_snippets: list = []
+        # Issue #137: the pass-1 reasoning call can succeed (valid targets) yet
+        # the deterministic read of those targets can still fail closed. That
+        # failure belongs on the evidence-selection run's audit record, not
+        # only on the turn — track it so the run is marked failed, not
+        # "completed", even though partial snippets were read.
+        evidence_read_error: Optional[str] = None
 
         if client_error:
             turn = InterviewTurnResult(
@@ -841,6 +847,7 @@ def interview_dialogue_turn(
                     # Whatever snippets were read before the failing target
                     # are kept so they can still be audited (Issue #137).
                     evidence_snippets = exc.partial_snippets
+                    evidence_read_error = str(exc)
                     turn = InterviewTurnResult(
                         provider=config.provider,
                         model=config.model,
@@ -849,7 +856,9 @@ def interview_dialogue_turn(
                     )
                 except EvidenceConfigError as exc:
                     # Invalid INTERVIEW_EVIDENCE_* configuration is a recorded
-                    # turn failure, not an unaudited HTTP 500.
+                    # turn failure, not an unaudited HTTP 500. The read phase
+                    # did not complete, so the selection run is failed too.
+                    evidence_read_error = str(exc)
                     turn = InterviewTurnResult(
                         provider=config.provider,
                         model=config.model,
@@ -884,7 +893,12 @@ def interview_dialogue_turn(
             # Store the pass-1 evidence-selection run (Issue #130), when it ran.
             evidence_run_out: Optional[IntelligenceRunOut] = None
             if evidence_audit is not None:
-                ev_status = "failed" if evidence_audit.error else "completed"
+                # The selection run is failed if either the reasoning call
+                # failed or the deterministic read of its targets failed
+                # (Issue #137): the audit must show "what was attempted and
+                # failed", not a misleading completed.
+                ev_error = evidence_audit.error or evidence_read_error
+                ev_status = "failed" if ev_error else "completed"
                 ev_cur = conn.execute(
                     """INSERT INTO intelligence_runs
                         (system_id, snapshot_id, run_type, provider, model,
@@ -900,7 +914,7 @@ def interview_dialogue_turn(
                         evidence_audit.prompt_version,
                         evidence_audit.schema_version,
                         ev_status,
-                        evidence_audit.error,
+                        ev_error,
                         1 if evidence_audit.is_mock else 0,
                         now,
                         now,
@@ -2330,6 +2344,30 @@ def update_interview_understanding(
                WHERE id = ? AND system_id = ?""",
             (understanding_json, gap_json, questions_json, new_stage, now, session_id, system_id),
         )
+
+        # Issue #136: an existing session whose understanding was built before
+        # this feature has a current_understanding but no revision rows. Seed
+        # that prior state as the initial revision (no run produced it in the
+        # revision history, so intelligence_run_id is NULL) *before* appending
+        # the new one, so this update's diff has a real "previous" to compare
+        # against instead of collapsing to has_previous:false and losing the
+        # pre-existing understanding. No blanket backfill of other sessions.
+        has_revision = conn.execute(
+            """SELECT 1 FROM understanding_revision
+               WHERE session_id = ? AND system_id = ? LIMIT 1""",
+            (session_id, system_id),
+        ).fetchone()
+        if has_revision is None and session["current_understanding"]:
+            conn.execute(
+                """INSERT INTO understanding_revision
+                    (session_id, system_id, snapshot_id, intelligence_run_id,
+                     current_understanding, gap_analysis, created_at)
+                VALUES (?, ?, ?, NULL, ?, ?, ?)""",
+                (
+                    session_id, system_id, snapshot_id,
+                    session["current_understanding"], session["gap_analysis"], now,
+                ),
+            )
 
         # Issue #136: append (never overwrite) an understanding revision,
         # linked to the understanding_review run that produced it, so the

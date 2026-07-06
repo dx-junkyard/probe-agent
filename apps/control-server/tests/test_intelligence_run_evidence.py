@@ -209,7 +209,13 @@ def test_partial_read_failure_persists_what_was_read(admin_client, monkeypatch, 
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["error"] is not None
-    assert body["evidence_run"]["status"] == "completed"  # pass-1 selection itself succeeded
+    # The pass-1 reasoning call produced valid targets, but the deterministic
+    # read of those targets failed closed. That failure belongs on the
+    # selection run's audit record, so it is recorded "failed" (not
+    # "completed") with the read error in its details (Issue #137).
+    assert body["evidence_run"]["status"] == "failed"
+    assert "does_not_exist.py" in (body["evidence_run"]["error_details"] or "")
+    # Whatever was read before the failing target is still audited.
     assert len(body["evidence_reads"]) == 1
     assert body["evidence_reads"][0]["path"] == "src/summarize.py"
 

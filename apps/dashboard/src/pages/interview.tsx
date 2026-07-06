@@ -802,10 +802,10 @@ function UnderstandingDiffPanel({
                     <p key={`r-${n}`} className="text-red-600">- {n}</p>
                   ))}
                   {s.confidence_changed.map(c => (
-                    <p key={`c-${c.name}`} className="flex items-center gap-1">
+                    <div key={`c-${c.name}`} className="flex items-center gap-1">
                       <Badge variant="outline">{c.name}</Badge>
-                      確信度: {c.before ?? "-"} → {c.after ?? "-"}
-                    </p>
+                      <span>確信度: {c.before ?? "-"} → {c.after ?? "-"}</span>
+                    </div>
                   ))}
                   {s.summary_changed.map(n => (
                     <p key={`s-${n}`}>{n}: 説明が更新されました</p>

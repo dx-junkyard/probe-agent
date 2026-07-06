@@ -6,9 +6,10 @@ a question, or declares that no evidence is needed. This module handles the
 deterministic half of that split (Principle 6):
 
 - Validating that each target's ``path`` is one the model is allowed to
-  reference (it must appear in the context pack or current understanding —
-  the same allowed-path set ``interview_agent._allowed_evidence_spans`` uses
-  for question evidence_refs).
+  reference and that its line range is contained within a span surfaced for
+  that path (it must appear in the context pack or current understanding —
+  the same allowed-span set ``interview_agent._allowed_evidence_spans`` uses
+  for question evidence_refs, enforced with the same containment check).
 - Reading the validated targets from the *pinned* commit via
   ``git_ops.read_file_at_commit`` (never the working tree, never untracked
   content — Principle 5), enforcing a per-file line cap and a total
@@ -120,7 +121,30 @@ def validate_evidence_targets(
                 f"evidence target has invalid line range "
                 f"{target.start_line}-{target.end_line} for '{target.path}'"
             )
+        if not any(
+            _span_contains(target, span) for span in allowed_paths[target.path]
+        ):
+            return (
+                f"evidence target lines {target.start_line}-{target.end_line} are "
+                f"not contained in any known span in '{target.path}'"
+            )
     return None
+
+
+def _span_contains(target: EvidenceTarget, span: Tuple[int, int]) -> bool:
+    """Whether ``target``'s line range is contained within ``span``.
+
+    Mirrors ``interview_agent._span_matches`` so pass-1 evidence targets are
+    bounded to the exact snapshot spans surfaced in the context pack, not just
+    a known path — a target requesting rows outside every known span is
+    fail-closed, matching the question-side evidence_ref check (Issue #130).
+    """
+    start, end = span
+    if start < 1 or end < start:
+        # No real line range is known for this path; nothing can be
+        # contained within it.
+        return False
+    return target.start_line >= start and target.end_line <= end
 
 
 def read_evidence_snippets(

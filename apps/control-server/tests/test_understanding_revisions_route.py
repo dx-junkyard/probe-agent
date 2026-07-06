@@ -249,6 +249,53 @@ def test_first_revision_has_no_previous(admin_client, monkeypatch):
     assert diff["sections"] == []
 
 
+def test_existing_understanding_seeded_as_initial_revision(admin_client, monkeypatch):
+    """Issue #136: a session whose understanding predates this feature has a
+    current_understanding but no revision rows. The next update seeds that
+    prior state as the initial revision (intelligence_run_id NULL) before
+    appending the new one, so the diff has a real previous to compare."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+
+    # Simulate a pre-#136 session: current_understanding set directly, with no
+    # understanding_revision rows.
+    from app.db import get_conn
+
+    prior_understanding = json.loads(_understanding_response(cap_names=["OldCap"]))
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE interview_session SET current_understanding = ? WHERE id = ?",
+            (json.dumps(prior_understanding), session_id),
+        )
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM understanding_revision WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()["c"] == 0
+
+    _patch_review_client(monkeypatch, _understanding_response(cap_names=["OldCap", "NewCap"]))
+    r = admin_client.post(
+        f"/interview/sessions/{session_id}/update-understanding", headers=headers,
+    )
+    assert r.status_code == 200, r.text
+
+    revisions = admin_client.get(
+        f"/interview/sessions/{session_id}/understanding-revisions", headers=headers,
+    ).json()["items"]
+    # Seed (prior) + new revision, newest first.
+    assert len(revisions) == 2
+    assert revisions[1]["intelligence_run_id"] is None  # seeded initial revision
+    assert revisions[1]["current_understanding"]["core_capabilities"][0]["name"] == "OldCap"
+    assert revisions[0]["intelligence_run_id"] is not None  # new revision linked to run
+
+    diff = admin_client.get(
+        f"/interview/sessions/{session_id}/understanding-diff", headers=headers,
+    ).json()
+    assert diff["has_previous"] is True
+    cap_section = next(s for s in diff["sections"] if s["section"] == "core_capabilities")
+    assert cap_section["added"] == ["NewCap"]
+
+
 def test_diff_with_no_revisions_at_all_does_not_crash(admin_client):
     token, system_id, snapshot_id = _setup(admin_client)
     headers = _headers(token, system_id)
