@@ -557,3 +557,272 @@ def test_prompt_version_and_schema_version():
 
     assert result.prompt_version == PROMPT_VERSION
     assert result.schema_version == SCHEMA_VERSION
+
+
+# --- Issues #127/#128: output language, hypothesis injection, evidence refs --
+
+
+class _CapturingClient(LLMClient):
+    def __init__(self, response=None):
+        self._response = response if response is not None else _valid_response(proposals=[])
+        self.messages: List[Dict[str, str]] = []
+
+    def generate_text(self, messages, *, temperature=None, max_tokens=None):
+        self.messages = list(messages)
+        return json.dumps(self._response)
+
+
+def test_language_directive_japanese_by_default(monkeypatch):
+    """INTERVIEW_LANGUAGE defaults to ja: the system prompt pins Japanese
+    output while keeping JSON keys and enum values in English."""
+    monkeypatch.delenv("INTERVIEW_LANGUAGE", raising=False)
+    client = _CapturingClient()
+
+    result = generate_interview_turn(
+        client, _make_config(),
+        context_pack=_context_pack(), history=[], user_message="こんにちは",
+    )
+
+    assert result.error is None
+    system_prompt = client.messages[0]["content"]
+    assert "in Japanese" in system_prompt
+    assert "enum values" in system_prompt
+
+
+def test_language_directive_english(monkeypatch):
+    monkeypatch.setenv("INTERVIEW_LANGUAGE", "en")
+    client = _CapturingClient()
+
+    result = generate_interview_turn(
+        client, _make_config(),
+        context_pack=_context_pack(), history=[], user_message="Hello",
+    )
+
+    assert result.error is None
+    assert "in English" in client.messages[0]["content"]
+
+
+def test_invalid_language_fails_closed(monkeypatch):
+    """An unsupported INTERVIEW_LANGUAGE never silently falls back."""
+    monkeypatch.setenv("INTERVIEW_LANGUAGE", "fr")
+    client = _CapturingClient()
+
+    result = generate_interview_turn(
+        client, _make_config(),
+        context_pack=_context_pack(), history=[], user_message="Bonjour",
+    )
+
+    assert result.error is not None
+    assert "INTERVIEW_LANGUAGE" in result.error
+    assert client.messages == []  # no LLM call was made
+    assert result.proposals == []
+    assert result.next_questions == []
+
+
+def test_understanding_and_gaps_injected_into_prompt():
+    """The session's built understanding, gap analysis, and open questions
+    are supplied to the model as its working hypothesis (Issue #128)."""
+    client = _CapturingClient()
+    understanding = {
+        "system_purpose": [{
+            "name": "Trace platform",
+            "evidence": [{"path": "src/summarize.py", "start_line": 1, "end_line": 10}],
+        }],
+    }
+
+    result = generate_interview_turn(
+        client, _make_config(),
+        context_pack=_context_pack(), history=[], user_message="続けてください",
+        current_understanding=understanding,
+        gap_analysis=[{"gap_type": "code_only", "name": "helper.util"}],
+        open_questions=[{"question": "保持期間は?", "category": "capability", "priority": "low"}],
+    )
+
+    assert result.error is None
+    user_prompt = client.messages[-1]["content"]
+    assert "Current understanding" in user_prompt
+    assert "Trace platform" in user_prompt
+    assert "Gap analysis" in user_prompt
+    assert "helper.util" in user_prompt
+    assert "Open questions" in user_prompt
+    assert "保持期間は?" in user_prompt
+    # Understanding must appear before the context pack so it reads as the
+    # primary hypothesis.
+    assert user_prompt.index("Current understanding") < user_prompt.index("Context Pack")
+
+
+def test_answered_qa_injected_into_prompt():
+    """Confirmed Q&A pairs are supplied with a do-not-re-ask rule so the
+    reasoning model suppresses semantic re-asking (Issue #129)."""
+    client = _CapturingClient()
+
+    result = generate_interview_turn(
+        client, _make_config(),
+        context_pack=_context_pack(), history=[], user_message="次の質問をどうぞ",
+        answered_qa=[{"question": "主要な利用者は誰ですか?", "answer": "社内の開発者です"}],
+    )
+
+    assert result.error is None
+    user_prompt = client.messages[-1]["content"]
+    assert "Confirmed Q&A" in user_prompt
+    assert "主要な利用者は誰ですか?" in user_prompt
+    assert "社内の開発者です" in user_prompt
+    assert "NEVER ask about these topics again" in user_prompt
+
+
+def test_structured_question_with_valid_evidence():
+    """Structured hypothesis-first questions round-trip with their evidence."""
+    response = _valid_response(proposals=[])
+    response["next_questions"] = [{
+        "question_text": "summarize_text は要約機能の中核という理解で正しいですか?",
+        "hypothesis": "summarize_text が要約機能の中核実装である",
+        "evidence_refs": [{"path": "src/summarize.py", "start_line": 2, "end_line": 8}],
+        "answer_options": ["はい", "いいえ"],
+    }]
+    client = FakeLLMClient(response=response)
+
+    result = generate_interview_turn(
+        client, _make_config(),
+        context_pack=_context_pack(), history=[], user_message="質問してください",
+    )
+
+    assert result.error is None
+    assert len(result.next_questions) == 1
+    q = result.next_questions[0]
+    assert q.hypothesis == "summarize_text が要約機能の中核実装である"
+    assert q.evidence_refs[0].path == "src/summarize.py"
+    assert q.answer_options == ["はい", "いいえ"]
+
+
+def test_plain_string_question_normalized():
+    """Legacy plain-string questions normalize to question_text-only objects."""
+    client = FakeLLMClient(response=_valid_response(proposals=[]))
+
+    result = generate_interview_turn(
+        client, _make_config(),
+        context_pack=_context_pack(), history=[], user_message="質問してください",
+    )
+
+    assert result.error is None
+    q = result.next_questions[0]
+    assert q.question_text == "What is the expected latency budget?"
+    assert q.hypothesis is None
+    assert q.evidence_refs == []
+
+
+def test_question_evidence_unknown_path_fails_closed():
+    """Evidence refs pointing outside the context pack / understanding are
+    rejected — the whole turn fails closed, no heuristic salvage."""
+    response = _valid_response(proposals=[])
+    response["next_questions"] = [{
+        "question_text": "これは正しいですか?",
+        "hypothesis": "仮説",
+        "evidence_refs": [{"path": "src/invented.py", "start_line": 1, "end_line": 5}],
+        "answer_options": [],
+    }]
+    client = FakeLLMClient(response=response)
+
+    result = generate_interview_turn(
+        client, _make_config(),
+        context_pack=_context_pack(), history=[], user_message="質問してください",
+    )
+
+    assert result.error is not None
+    assert "unknown path" in result.error
+    assert result.next_questions == []
+    assert result.proposals == []
+
+
+def test_question_evidence_out_of_range_fails_closed():
+    """Line ranges outside any known span for the path are rejected."""
+    response = _valid_response(proposals=[])
+    response["next_questions"] = [{
+        "question_text": "これは正しいですか?",
+        "hypothesis": "仮説",
+        "evidence_refs": [{"path": "src/summarize.py", "start_line": 500, "end_line": 600}],
+        "answer_options": [],
+    }]
+    client = FakeLLMClient(response=response)
+
+    result = generate_interview_turn(
+        client, _make_config(),
+        context_pack=_context_pack(), history=[], user_message="質問してください",
+    )
+
+    assert result.error is not None
+    assert "not contained" in result.error
+    assert result.next_questions == []
+
+
+def test_question_evidence_partial_overlap_not_containment_fails_closed():
+    """A range that merely overlaps a known span (rather than being fully
+    contained within it) is rejected — overlap alone is not sufficient."""
+    response = _valid_response(proposals=[])
+    response["next_questions"] = [{
+        "question_text": "これは正しいですか?",
+        "hypothesis": "仮説",
+        # Known span for src/summarize.py is (1, 10); this range extends
+        # far past it and must not be accepted just because it overlaps.
+        "evidence_refs": [{"path": "src/summarize.py", "start_line": 1, "end_line": 999_999}],
+        "answer_options": [],
+    }]
+    client = FakeLLMClient(response=response)
+
+    result = generate_interview_turn(
+        client, _make_config(),
+        context_pack=_context_pack(), history=[], user_message="質問してください",
+    )
+
+    assert result.error is not None
+    assert "not contained" in result.error
+    assert result.next_questions == []
+
+
+def test_question_evidence_path_only_fails_closed():
+    """Evidence refs without a concrete line range (path-only evidence) are
+    rejected at parse time — start_line/end_line are required, >= 1."""
+    response = _valid_response(proposals=[])
+    response["next_questions"] = [{
+        "question_text": "これは正しいですか?",
+        "hypothesis": "仮説",
+        "evidence_refs": [{"path": "src/summarize.py"}],
+        "answer_options": [],
+    }]
+    client = FakeLLMClient(response=response)
+
+    result = generate_interview_turn(
+        client, _make_config(),
+        context_pack=_context_pack(), history=[], user_message="質問してください",
+    )
+
+    assert result.error is not None
+    assert "Failed to parse structured response" in result.error
+    assert result.next_questions == []
+
+
+def test_question_evidence_from_understanding_allowed():
+    """Paths known only through the stored understanding's evidence are
+    valid reference targets."""
+    response = _valid_response(proposals=[])
+    response["next_questions"] = [{
+        "question_text": "docs/design.md の記述と一致していますか?",
+        "hypothesis": "設計docと実装は一致している",
+        "evidence_refs": [{"path": "docs/design.md", "start_line": 3, "end_line": 5}],
+        "answer_options": [],
+    }]
+    client = FakeLLMClient(response=response)
+    understanding = {
+        "system_purpose": [{
+            "name": "Trace platform",
+            "evidence": [{"path": "docs/design.md", "start_line": 1, "end_line": 10}],
+        }],
+    }
+
+    result = generate_interview_turn(
+        client, _make_config(),
+        context_pack=_context_pack(), history=[], user_message="質問してください",
+        current_understanding=understanding,
+    )
+
+    assert result.error is None
+    assert result.next_questions[0].evidence_refs[0].path == "docs/design.md"

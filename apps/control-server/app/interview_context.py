@@ -37,6 +37,16 @@ DEFAULT_BUDGET_CHARS = int(os.getenv("INTERVIEW_CONTEXT_MAX_CHARS", "60000"))
 MAX_SYMBOLS = 500
 MAX_ENTRYPOINTS = 200
 
+# Issue #128: stages whose confirmation work centers on entrypoints. For
+# these, budget truncation removes symbols before entrypoints so the items
+# under discussion survive. Membership in this explicit finite set is the
+# only stage-dependent behavior (deterministic; the reasoning model still
+# makes every open-ended decision).
+ENTRYPOINT_PRIORITY_STAGES = frozenset({
+    "api_boundary_mapping",
+    "probe_flow_selection",
+})
+
 
 def _evidence(snapshot_id: int, path: str, qname: str, start: int, end: int) -> InterviewEvidenceLocation:
     return InterviewEvidenceLocation(
@@ -109,6 +119,7 @@ def build_interview_context(
     system_id: int,
     snapshot_id: int,
     budget_chars: Optional[int] = None,
+    stage: Optional[str] = None,
 ) -> InterviewContextPack:
     """Build a deterministic interview context pack.
 
@@ -116,7 +127,10 @@ def build_interview_context(
     1. Unclassified symbols first (they most need authoring), then classified.
     2. Within each group, order by (path, start_line) for reproducibility.
     3. Entrypoints follow the same unclassified-first, then (path, line) order.
-    4. Truncate tail items to fit within the LLM context budget.
+    4. Truncate tail items to fit within the LLM context budget. For
+       entrypoint-focused stages (ENTRYPOINT_PRIORITY_STAGES) symbols are
+       truncated before entrypoints; otherwise entrypoints go first
+       (Issue #128). A stage outside the known set behaves like None.
     """
     budget = budget_chars if budget_chars is not None else DEFAULT_BUDGET_CHARS
     omission_notes: List[str] = []
@@ -241,38 +255,42 @@ def build_interview_context(
         omission_notes=omission_notes,
     )
 
-    pack = _apply_budget(pack, budget)
+    pack = _apply_budget(pack, budget, stage=stage)
     return pack
 
 
-def _apply_budget(pack: InterviewContextPack, budget: int) -> InterviewContextPack:
+def _apply_budget(
+    pack: InterviewContextPack,
+    budget: int,
+    stage: Optional[str] = None,
+) -> InterviewContextPack:
     """Deterministically truncate tail items until the serialized pack fits.
 
     Truncation removes from the *tail* of each list (classified items first,
     since unclassified items are at the head and are the priority). This
     mirrors the Decision Workspace pattern of removing lower-priority items.
+
+    The stage decides only which list shrinks first: entrypoint-focused
+    stages sacrifice symbols first, all other stages sacrifice entrypoints
+    first (the pre-#128 behavior).
     """
     truncated = False
+    entrypoints_first = stage not in ENTRYPOINT_PRIORITY_STAGES
 
-    # First pass: remove classified symbols from the tail (they have metadata
-    # already). Then remove classified entrypoints. Then unclassified items
-    # from both lists as a last resort.
     while len(pack.model_dump_json()) > budget:
-        removed = False
-        # Try removing the last entrypoint (classified ones are at the tail).
-        if pack.entrypoints:
-            pack.entrypoints.pop()
-            removed = True
+        primary = pack.entrypoints if entrypoints_first else pack.symbols
+        secondary = pack.symbols if entrypoints_first else pack.entrypoints
+        # Classified items sit at each list's tail, so tail pops remove the
+        # lowest-priority items first.
+        if primary:
+            primary.pop()
             truncated = True
             continue
-        # Try removing the last symbol (classified ones are at the tail).
-        if pack.symbols:
-            pack.symbols.pop()
-            removed = True
+        if secondary:
+            secondary.pop()
             truncated = True
             continue
-        if not removed:
-            break
+        break
 
     if truncated:
         classified_count = sum(1 for s in pack.symbols if s.classification == "classified")
@@ -282,6 +300,10 @@ def _apply_budget(pack: InterviewContextPack, budget: int) -> InterviewContextPa
         pack.truncated = True
         pack.omission_notes.append(
             "items truncated to fit within the LLM context budget"
+            + (
+                f" (stage '{stage}' prioritized entrypoints over symbols)"
+                if not entrypoints_first else ""
+            )
         )
 
     pack.budget_used_chars = len(pack.model_dump_json())

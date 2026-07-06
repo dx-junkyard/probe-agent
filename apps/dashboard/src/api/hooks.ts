@@ -19,6 +19,9 @@ import type {
   InterviewDialogueTurnOut, InterviewProposalDecisionOut,
   InterviewProposalMetadataBlock, InterviewProposalProbePlan,
   InterviewApprovedSetOut, InterviewMaterializeOut,
+  InterviewQaListOut, InterviewQaOut, InterviewQaAnswerOut,
+  RuntimeRealityFactsOut, RuntimeRealityCheckRunOut,
+  UnderstandingRevisionListOut, UnderstandingDiffOut,
   SystemUnderstandingOut,
   SystemUnderstandingBuildOut,
   IssueDraft,
@@ -514,12 +517,71 @@ export function useInterviewDialogueTurn(sessionId: number | null) {
       budget?: number;
       generate_proposals?: boolean;
       answered_question?: string;
+      answered_qa_id?: number;
+      actor?: string;
     }) =>
       api.post<InterviewDialogueTurnOut>(`/interview/sessions/${sessionId}/dialogue-turn`, data),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
       qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] });
     },
+  });
+}
+
+// --- Structured Interview Q&A (Issue #129) ----------------------------------
+
+export function useInterviewQaList(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("interviewQa"), sessionId],
+    queryFn: () => api.get<InterviewQaListOut>(`/interview/sessions/${sessionId}/qa`),
+    enabled: !!sessionId && !!getSystemId(),
+  });
+}
+
+export function useCreateInterviewQa(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: {
+      question_text: string;
+      question_category?: string;
+      question_source?: string;
+      hypothesis?: string;
+    }) => api.post<InterviewQaOut>(`/interview/sessions/${sessionId}/qa`, data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] }),
+  });
+}
+
+export function useAnswerInterviewQa(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ qaId, answer_text, actor }: { qaId: number; answer_text: string; actor: string }) =>
+      api.post<InterviewQaAnswerOut>(
+        `/interview/sessions/${sessionId}/qa/${qaId}/answer`,
+        { answer_text, actor },
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] });
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+    },
+  });
+}
+
+export function useSkipInterviewQa(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ qaId, actor }: { qaId: number; actor: string }) =>
+      api.post<InterviewQaOut>(`/interview/sessions/${sessionId}/qa/${qaId}/skip`, { actor }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] }),
+  });
+}
+
+export function useResumeInterviewQa(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ qaId, actor }: { qaId: number; actor: string }) =>
+      api.post<InterviewQaOut>(`/interview/sessions/${sessionId}/qa/${qaId}/resume`, { actor }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] }),
   });
 }
 
@@ -624,7 +686,31 @@ export function useUpdateInterviewUnderstanding() {
     onSuccess: (_data, sessionId) => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
       qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
+      qc.invalidateQueries({ queryKey: [...sysKey("understandingRevisions"), sessionId] });
+      qc.invalidateQueries({ queryKey: [...sysKey("understandingDiff"), sessionId] });
     },
+  });
+}
+
+// --- Understanding Revisions (Issue #136) ------------------------------------
+
+export function useUnderstandingRevisions(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("understandingRevisions"), sessionId],
+    queryFn: () => api.get<UnderstandingRevisionListOut>(
+      `/interview/sessions/${sessionId}/understanding-revisions`,
+    ),
+    enabled: !!sessionId && !!getSystemId(),
+  });
+}
+
+export function useUnderstandingDiff(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("understandingDiff"), sessionId],
+    queryFn: () => api.get<UnderstandingDiffOut>(
+      `/interview/sessions/${sessionId}/understanding-diff`,
+    ),
+    enabled: !!sessionId && !!getSystemId(),
   });
 }
 
@@ -636,6 +722,30 @@ export function useMaterializeInterview(sessionId: number | null) {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
       qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
+    },
+  });
+}
+
+// --- Runtime Reality Check (Issue #135) --------------------------------------
+
+export function useRuntimeRealityFacts(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("runtimeRealityFacts"), sessionId],
+    queryFn: () => api.get<RuntimeRealityFactsOut>(`/interview/sessions/${sessionId}/runtime-facts`),
+    enabled: !!sessionId && !!getSystemId(),
+  });
+}
+
+export function useRunRuntimeRealityCheck(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      api.post<RuntimeRealityCheckRunOut>(
+        `/interview/sessions/${sessionId}/runtime-reality-check`, {},
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] });
+      qc.invalidateQueries({ queryKey: [...sysKey("runtimeRealityFacts"), sessionId] });
     },
   });
 }

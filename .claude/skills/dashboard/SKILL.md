@@ -93,9 +93,22 @@ The dashboard should support:
   Zero-base questions are a fixed UI questionnaire (goal / affected area /
   desired change / constraints / success criteria); answers still flow
   through the reasoning-model dialogue turn — never heuristic inference.
-  Each dialogue turn sends `answered_question` (the focused open question)
-  so the server consumes it from `open_questions` and appends the model's
-  follow-up questions; the UI must not re-ask answered questions.
+  Each dialogue turn sends `answered_qa_id` (the focused open question's
+  `qa_id`, Issue #129) plus `answered_question` (exact text, kept for
+  sessions predating the Q&A layer) so the server consumes the question
+  from `open_questions` AND marks the matching `interview_qa` row answered;
+  the UI must not re-ask answered questions.
+- Hypothesis-first questions (Issues #127/#128): all LLM-generated interview
+  text is in the configured `INTERVIEW_LANGUAGE` (default Japanese; JSON
+  keys/enums stay English). Open questions may carry `hypothesis`,
+  `evidence_refs` (path + line range, server-validated against the pinned
+  snapshot), and `answer_options`. The focused-question card renders the
+  hypothesis and evidence, and shows quick answers: 「はい、正しいです」
+  sends a canned confirmation through the normal dialogue turn;
+  「いいえ(修正を入力)」only prefills the textarea with a correction
+  prefix and focuses it (no API call); `answer_options` render as
+  send-on-click buttons. Quick answers are plain dialogue input — they are
+  NOT approval actions; the proposal approval gate is unchanged.
 
 ## Authentication model
 
