@@ -566,6 +566,62 @@ describe("Flow Explorer page", () => {
     });
   });
 
+  test("runtime overlay panel shows observed nodes and divergences", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/flow-entrypoints") {
+        return Promise.resolve(entrypointsResponse({
+          total: 1, entrypoints: [flowGraph.entrypoint],
+        }));
+      }
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/repository/flow-graphs") return Promise.resolve(flowGraph);
+      if (path === "/repository/flow-overlay") {
+        return Promise.resolve({
+          selection: { kind: "entity", entity_type: "order", entity_id: "o-1" },
+          nodes: [
+            { node_id: "app.py::analyze_document", component_id: "analyze", observable: true, observed: true, observation_count: 3, last_observed_at: 2 },
+            { node_id: "app.py::parse_blocks", component_id: null, observable: false, observed: false, observation_count: 0, last_observed_at: null },
+          ],
+          edges: [],
+          divergences: [{ source_component_id: "analyze", target_component_id: "refund", count: 1 }],
+          observed_component_ids: ["analyze", "refund"],
+          unmatched_component_ids: ["refund"],
+          observed_trace_count: 3,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { default: FlowExplorerPage } = await import("@/pages/flow-explorer");
+    render(<FlowExplorerPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByText("POST /documents/analyze"));
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/repository/flow-graphs", expect.any(Object));
+    });
+
+    const panel = await screen.findByTestId("flow-overlay-panel");
+    fireEvent.change(within(panel).getByLabelText("overlay entity type"), { target: { value: "order" } });
+    fireEvent.change(within(panel).getByLabelText("overlay entity id"), { target: { value: "o-1" } });
+    fireEvent.click(within(panel).getByRole("button", { name: /Apply overlay/ }));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/repository/flow-overlay",
+        expect.objectContaining({
+          entrypoint_type: "http_route", entrypoint_id: "POST:/documents/analyze",
+          selection: expect.objectContaining({ kind: "entity", entity_type: "order", entity_id: "o-1" }),
+        }),
+      );
+    });
+    expect(await within(panel).findByText(/observed \(3\)/)).toBeInTheDocument();
+    expect(within(panel).getByText(/no probe/)).toBeInTheDocument();
+    const div = within(panel).getByTestId("overlay-divergences");
+    expect(within(div).getByText(/analyze → refund/)).toBeInTheDocument();
+  });
+
   test("renders external boundary and observed overlay; boundary is not selectable", async () => {
     const graphWithBoundary = {
       ...flowGraph,

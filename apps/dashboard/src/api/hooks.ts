@@ -3,6 +3,7 @@ import { api, getSystemId } from "./client";
 import type {
   SystemOut, ComponentSummary, TraceEvent, Policy,
   LineageOut, TraceAnalyzer, AnalysisRun,
+  FlowOverlayOut, FlowOverlayRequest,
   ShadowResult, ComponentProfile, UserOut, TokenOut,
   RepositoryCandidateOut, RepositoryConfigOut, SnapshotOut, LatestDraftsOut,
   DraftGenerationResultOut,
@@ -167,6 +168,14 @@ export function useRunAnalyzer() {
     mutationFn: (id: number) => api.post<AnalysisRun>(`/trace-analyzers/${id}/runs`),
     onSuccess: (_d, id) =>
       qc.invalidateQueries({ queryKey: [...sysKey("trace-analyzer-runs"), id] }),
+  });
+}
+
+// Flow Explorer runtime overlay (Issue #151)
+export function useFlowOverlay() {
+  return useMutation({
+    mutationFn: (body: FlowOverlayRequest) =>
+      api.post<FlowOverlayOut>("/repository/flow-overlay", body),
   });
 }
 

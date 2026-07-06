@@ -1287,6 +1287,25 @@ Issue #144 に集約し、実装は以下の sub-issue に依存順で分割し�
   fields 差分をハイライト。
 - **非目標**: 数値許容誤差・意味的同等判定、差分の原因解釈(等値比較のみ)。
 
+### Phase 6 実装状態(#151)
+
+Flow Explorer(Issue #43 / #58 の静的フロー)に **runtime lineage overlay** を追加する。
+
+- **API**: `POST /repository/flow-overlay`。既存の flow graph builder で静的フローを
+  構築し、entity / correlation / flow / 保存済み analyzer(entity filter)から lineage
+  ステップを解決して突き合わせる。突き合わせは **component_id の完全一致のみ**
+  (有限の構造的判定、Principle 6)。
+- **出力**(`app/flow_overlay.py` の決定的計算): ノードごとの `observable`
+  (component_id を持つか)/ `observed` / 観測回数 / 直近観測時刻、静的エッジに対応する
+  実行時遷移の有無(`observed_transition`)、静的グラフに無い実行時遷移の一覧
+  (`divergences`、parent_span 経由で再構成)、静的グラフに現れない観測 component
+  (`unmatched_component_ids`)。probe を持たないノードは「観測対象外」として `observed`
+  と区別する。乖離の原因解釈はしない(決定的事実のみ)。
+- **Dashboard**: Flow Explorer に「Runtime overlay」パネルを追加。entity /
+  correlation / flow を選ぶと各 probe 点の observed / unobserved / no-probe を
+  バッジで区別し、乖離遷移を強調表示する。overlay 未選択時の既存挙動は不変。
+- **DB 所有権なし**(毎回決定的に突き合わせて算出、新規テーブルなし)。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。

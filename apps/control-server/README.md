@@ -60,6 +60,7 @@ uvicorn app.main:app --reload --port 8000
 | PUT  | `/trace-analyzers/{id}/review` | proposed→approved/rejected(#148) |
 | POST | `/trace-analyzers/{id}/runs` | approved のみ read-only 実行(#148) |
 | GET  | `/trace-analyzers/{id}/runs[/{run_id}]` | run 一覧・取得(#148) |
+| POST | `/repository/flow-overlay` | 静的フローに runtime lineage を重ねる overlay(#151) |
 
 DB ファイルは `PROBE_DB_PATH` (既定 `./probe.db`) で切り替えられる。
 

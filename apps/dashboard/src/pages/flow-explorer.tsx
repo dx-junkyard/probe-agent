@@ -3,6 +3,7 @@ import { Link, useSearchParams, useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import {
   useFlowEntrypoints, useBuildFlowGraph, useCreatePlanFromFlow, useApiRoleCards,
+  useFlowOverlay,
 } from "@/api/hooks";
 import { ApiRoleCard } from "@/components/api-role-card";
 import { ApiError } from "@/api/client";
@@ -17,7 +18,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Workflow, Crosshair, AlertTriangle, ArrowRight, Activity, RefreshCw } from "lucide-react";
 import type {
   FlowEntrypointOut, FlowGraphOut, FlowNodeOut, FlowEdgeOut,
-  FlowProbeSelection, ProbePreviewOut,
+  FlowProbeSelection, ProbePreviewOut, FlowOverlayOut,
 } from "@/api/types";
 
 const RISK_VARIANT: Record<string, "secondary" | "destructive"> = {
@@ -457,6 +458,9 @@ export default function FlowExplorerPage() {
               </CardContent>
             </Card>
           )}
+          {graph && activeEntrypoint && (
+            <FlowOverlayPanel entrypoint={activeEntrypoint} graph={graph} />
+          )}
         </div>
 
         {/* Center: API role card + flow graph */}
@@ -698,5 +702,121 @@ export default function FlowExplorerPage() {
         </div>
       </div>
     </div>
+  );
+}
+
+// Issue #151: runtime lineage overlay. Given the built graph's entrypoint, look
+// up which probe points were observed for a selected entity / correlation /
+// flow, and which runtime transitions diverge from the static graph. Matching
+// is by component_id exact equality only (no interpretation).
+function FlowOverlayPanel({ entrypoint, graph }: {
+  entrypoint: FlowEntrypointOut;
+  graph: FlowGraphOut;
+}) {
+  const overlayMut = useFlowOverlay();
+  const [kind, setKind] = useState<"entity" | "correlation" | "flow">("entity");
+  const [entityType, setEntityType] = useState("");
+  const [entityId, setEntityId] = useState("");
+  const [singleId, setSingleId] = useState("");
+  const [overlay, setOverlay] = useState<FlowOverlayOut | null>(null);
+
+  const apply = async () => {
+    const selection =
+      kind === "entity"
+        ? { kind, entity_type: entityType.trim(), entity_id: entityId.trim() }
+        : { kind, [kind === "correlation" ? "correlation_id" : "flow_id"]: singleId.trim() };
+    if (kind === "entity" ? !entityType.trim() || !entityId.trim() : !singleId.trim()) return;
+    try {
+      const res = await overlayMut.mutateAsync({
+        entrypoint_type: entrypoint.entrypoint_type,
+        entrypoint_id: entrypoint.entrypoint_id,
+        snapshot_id: graph.snapshot_id,
+        commit_sha: graph.commit_sha,
+        selection,
+      });
+      setOverlay(res);
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
+  const observableNodes = overlay?.nodes.filter(n => n.observable) ?? [];
+  const observedCount = observableNodes.filter(n => n.observed).length;
+
+  return (
+    <Card data-testid="flow-overlay-panel">
+      <CardHeader className="pb-2">
+        <CardTitle className="text-sm flex items-center gap-1">
+          <Activity className="h-4 w-4" /> Runtime overlay
+        </CardTitle>
+        <CardDescription className="text-xs">
+          Observed vs unobserved probe points for a lineage selection.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-2">
+        <div className="flex gap-1">
+          {(["entity", "correlation", "flow"] as const).map(k => (
+            <Button key={k} size="sm" variant={kind === k ? "default" : "outline"}
+              className="h-7 px-2 text-xs" onClick={() => setKind(k)}>
+              {k}
+            </Button>
+          ))}
+        </div>
+        {kind === "entity" ? (
+          <div className="flex gap-1">
+            <Input aria-label="overlay entity type" placeholder="order" value={entityType}
+              onChange={e => setEntityType(e.target.value)} className="h-7 text-xs" />
+            <Input aria-label="overlay entity id" placeholder="o-1" value={entityId}
+              onChange={e => setEntityId(e.target.value)} className="h-7 text-xs" />
+          </div>
+        ) : (
+          <Input aria-label="overlay id" placeholder={kind === "correlation" ? "req-abc" : "checkout"}
+            value={singleId} onChange={e => setSingleId(e.target.value)} className="h-7 text-xs" />
+        )}
+        <Button size="sm" className="h-7 text-xs w-full" onClick={apply} disabled={overlayMut.isPending}>
+          {overlayMut.isPending ? "Applying…" : "Apply overlay"}
+        </Button>
+
+        {overlay && (
+          <div className="space-y-2 pt-1 text-xs">
+            <div className="text-muted-foreground">
+              observed {observedCount}/{observableNodes.length} probe points ·{" "}
+              {overlay.observed_trace_count} traces
+            </div>
+            <div className="space-y-1">
+              {overlay.nodes.map(n => (
+                <div key={n.node_id} className="flex items-center justify-between gap-2">
+                  <span className="font-mono truncate">{n.component_id ?? n.node_id}</span>
+                  {!n.observable ? (
+                    <Badge variant="secondary" className="text-[10px]">no probe</Badge>
+                  ) : n.observed ? (
+                    <Badge variant="success" className="text-[10px]">observed ({n.observation_count})</Badge>
+                  ) : (
+                    <Badge variant="outline" className="text-[10px]">unobserved</Badge>
+                  )}
+                </div>
+              ))}
+            </div>
+            {overlay.divergences.length > 0 && (
+              <div className="space-y-1" data-testid="overlay-divergences">
+                <div className="font-medium text-amber-600 flex items-center gap-1">
+                  <AlertTriangle className="h-3 w-3" /> Divergent transitions
+                </div>
+                {overlay.divergences.map((d, i) => (
+                  <div key={i} className="font-mono text-amber-700 dark:text-amber-400">
+                    {d.source_component_id} → {d.target_component_id} ({d.count})
+                  </div>
+                ))}
+              </div>
+            )}
+            {overlay.unmatched_component_ids.length > 0 && (
+              <div className="text-muted-foreground">
+                observed but not in graph: {overlay.unmatched_component_ids.join(", ")}
+              </div>
+            )}
+          </div>
+        )}
+      </CardContent>
+    </Card>
   );
 }

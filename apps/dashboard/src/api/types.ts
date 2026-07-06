@@ -101,6 +101,58 @@ export interface AnalysisRun {
   completed_at: number | null;
 }
 
+// Flow Explorer runtime overlay (Issue #151)
+export interface FlowOverlayNode {
+  node_id: string;
+  component_id: string | null;
+  observable: boolean;
+  observed: boolean;
+  observation_count: number;
+  last_observed_at: number | null;
+}
+
+export interface FlowOverlayEdge {
+  edge_id: string;
+  source_node_id: string;
+  target_node_id: string | null;
+  source_component_id: string | null;
+  target_component_id: string | null;
+  observed_transition: boolean;
+}
+
+export interface FlowDivergence {
+  source_component_id: string;
+  target_component_id: string;
+  count: number;
+}
+
+export interface FlowOverlayOut {
+  selection: Record<string, unknown>;
+  nodes: FlowOverlayNode[];
+  edges: FlowOverlayEdge[];
+  divergences: FlowDivergence[];
+  observed_component_ids: string[];
+  unmatched_component_ids: string[];
+  observed_trace_count: number;
+}
+
+export interface FlowOverlayRequest {
+  entrypoint_type: string;
+  entrypoint_id: string;
+  max_depth?: number;
+  max_nodes?: number;
+  snapshot_id?: number | null;
+  commit_sha?: string | null;
+  selection: {
+    kind: "entity" | "correlation" | "flow" | "analyzer";
+    entity_type?: string;
+    entity_id?: string;
+    correlation_id?: string;
+    flow_id?: string;
+    analyzer_id?: number;
+  };
+}
+
 export interface ShadowResult {
   id: number;
   trace_id: string;

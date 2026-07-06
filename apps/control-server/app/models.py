@@ -1396,6 +1396,63 @@ class FlowGraphRequest(BaseModel):
     commit_sha: Optional[str] = None
 
 
+class FlowOverlaySelection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["entity", "correlation", "flow", "analyzer"]
+    entity_type: Optional[str] = None
+    entity_id: Optional[str] = None
+    correlation_id: Optional[str] = None
+    flow_id: Optional[str] = None
+    analyzer_id: Optional[int] = None
+
+
+class FlowOverlayRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    entrypoint_type: FlowEntrypointType
+    entrypoint_id: str = Field(..., min_length=1)
+    max_depth: int = Field(default=8, ge=1, le=32)
+    max_nodes: int = Field(default=100, ge=1, le=500)
+    snapshot_id: Optional[int] = None
+    commit_sha: Optional[str] = None
+    selection: FlowOverlaySelection
+
+
+class FlowOverlayNode(BaseModel):
+    node_id: str
+    component_id: Optional[str] = None
+    observable: bool  # has a component_id (an instrumented probe point)
+    observed: bool
+    observation_count: int = 0
+    last_observed_at: Optional[float] = None
+
+
+class FlowOverlayEdge(BaseModel):
+    edge_id: str
+    source_node_id: str
+    target_node_id: Optional[str] = None
+    source_component_id: Optional[str] = None
+    target_component_id: Optional[str] = None
+    observed_transition: bool = False
+
+
+class FlowDivergence(BaseModel):
+    source_component_id: str
+    target_component_id: str
+    count: int
+
+
+class FlowOverlayOut(BaseModel):
+    selection: Dict[str, Any] = Field(default_factory=dict)
+    nodes: List[FlowOverlayNode] = Field(default_factory=list)
+    edges: List[FlowOverlayEdge] = Field(default_factory=list)
+    divergences: List[FlowDivergence] = Field(default_factory=list)
+    observed_component_ids: List[str] = Field(default_factory=list)
+    unmatched_component_ids: List[str] = Field(default_factory=list)
+    observed_trace_count: int = 0
+
+
 class FlowProbeSelection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
