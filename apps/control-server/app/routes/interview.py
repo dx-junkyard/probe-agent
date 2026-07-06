@@ -45,7 +45,11 @@ from ..interview_evidence import (
     EvidenceReadError,
     read_evidence_snippets,
 )
-from ..interview_language import get_interview_language
+from ..interview_language import (
+    get_interview_language,
+    interview_message,
+    resolve_message_language,
+)
 from ..llm import LLMConfig, LLMError, create_llm_client, is_reasoning_model
 from ..runtime_reality import (
     RuntimeCheckInputItem,
@@ -2026,7 +2030,7 @@ def confirm_interview_understanding(
             (
                 session_id,
                 system_id,
-                "これまでの回答内容を確定し、提案生成に進みます。",
+                interview_message("confirm_understanding_message", resolve_message_language()),
                 now,
             ),
         )
@@ -2101,6 +2105,12 @@ def update_interview_understanding(
       probe_value: Verify understanding update rebuilds graph and reconciliation correctly
     """
     now = time.time()
+    # Issue #138: fixed-text messages this route composes itself follow
+    # INTERVIEW_LANGUAGE. Falls back to ja only for these messages if the
+    # setting is invalid, so a misconfiguration doesn't prevent the failure
+    # message itself from being composed; reasoning calls below still fail
+    # closed through get_interview_language() unchanged.
+    msg_lang = resolve_message_language()
     with get_conn() as conn:
         session = _get_session_or_404(conn, session_id, system_id)
         snapshot_id = session["snapshot_id"]
@@ -2165,17 +2175,18 @@ def update_interview_understanding(
                 """INSERT INTO interview_message
                     (session_id, system_id, role, content, intelligence_run_id, created_at)
                 VALUES (?, ?, 'assistant', ?, ?, ?)""",
-                (session_id, system_id, f"理解の更新に失敗しました: {error}", run_id, now),
+                (
+                    session_id, system_id,
+                    interview_message("understanding_update_failed", msg_lang, error=error),
+                    run_id, now,
+                ),
             )
             row = _get_session_or_404(conn, session_id, system_id)
             return _session_out(row)
 
         graph = _load_graph_for_snapshot(conn, system_id, snapshot_id)
         if graph is None:
-            error = (
-                "このスナップショットの理解グラフが未構築です。"
-                "先に System Understanding の build/refresh を実行してください。"
-            )
+            error = interview_message("graph_not_built", msg_lang)
             conn.execute(
                 """UPDATE interview_session
                    SET last_error = ?, updated_at = ?
@@ -2186,7 +2197,11 @@ def update_interview_understanding(
                 """INSERT INTO interview_message
                     (session_id, system_id, role, content, created_at)
                 VALUES (?, ?, 'assistant', ?, ?)""",
-                (session_id, system_id, f"理解の更新に失敗しました: {error}", now),
+                (
+                    session_id, system_id,
+                    interview_message("understanding_update_failed", msg_lang, error=error),
+                    now,
+                ),
             )
             row = _get_session_or_404(conn, session_id, system_id)
             return _session_out(row)
@@ -2223,7 +2238,11 @@ def update_interview_understanding(
                 """INSERT INTO interview_message
                     (session_id, system_id, role, content, intelligence_run_id, created_at)
                 VALUES (?, ?, 'assistant', ?, ?, ?)""",
-                (session_id, system_id, f"理解のレビューに失敗しました: {review.error}", run_id, now),
+                (
+                    session_id, system_id,
+                    interview_message("review_failed", msg_lang, error=review.error),
+                    run_id, now,
+                ),
             )
             row = _get_session_or_404(conn, session_id, system_id)
             return _session_out(row)
@@ -2317,21 +2336,29 @@ def update_interview_understanding(
         )
 
         if review.current_understanding:
+            unknown_name = interview_message("unknown_name", msg_lang)
+            purpose_label = interview_message("system_purpose_label", msg_lang)
+            capability_label = interview_message("core_capability_label", msg_lang)
             summary_parts = []
             for purpose in review.current_understanding.get("system_purpose", []):
-                summary_parts.append(f"システムの目的: {purpose.get('name', '不明')}")
+                summary_parts.append(f"{purpose_label}: {purpose.get('name') or unknown_name}")
             for cap in review.current_understanding.get("core_capabilities", []):
-                summary_parts.append(f"主要機能: {cap.get('name', '不明')}")
+                summary_parts.append(f"{capability_label}: {cap.get('name') or unknown_name}")
             if summary_parts:
                 asst_content = (
-                    "ドキュメントとコードを分析し、初期理解を構築しました。\n\n"
+                    interview_message("understanding_built_intro", msg_lang) + "\n\n"
                     + "\n".join(f"- {p}" for p in summary_parts)
                 )
                 if review.open_questions:
-                    asst_content += "\n\n主な確認事項:\n"
+                    asst_content += (
+                        "\n\n" + interview_message("key_questions_heading", msg_lang) + "\n"
+                    )
                     for q in review.open_questions[:5]:
                         asst_content += f"- {q.get('question', '')}\n"
-                asst_content += f"\n推奨される次のステップ: {review.suggested_next_action}"
+                asst_content += (
+                    f"\n{interview_message('suggested_next_action_label', msg_lang)}: "
+                    f"{review.suggested_next_action}"
+                )
 
                 conn.execute(
                     """INSERT INTO interview_message

@@ -890,6 +890,31 @@ dedupe)、`open_questions` JSON のエントリに `qa_id` を付与する。ま
 共有スキーマ: `InterviewQA` / `InterviewQaEvidenceRef` / `InterviewQaAnswerOut`
 （[shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json)）。
 
+## サーバー生成固定文言の INTERVIEW_LANGUAGE 対応(Issue #138)
+
+#127 は LLM 生成テキストの出力言語を `INTERVIEW_LANGUAGE`(既定 `ja`)に従わせたが、
+サーバー自身が `interview_message` / `interview_session` に書き込む固定文言(LLM 出力
+ではない、例: 「理解の更新に失敗しました: …」「これまでの回答内容を確定し、提案生成
+に進みます。」)は日本語固定のままだった。本 issue は `interview_language.py` に
+有限のメッセージキー × 言語のテーブル `INTERVIEW_MESSAGES` と、テーブル参照のみで
+文言を選ぶ `interview_message(key, language, **kwargs)` を追加し、
+`routes/interview.py` の対象文言をすべて置き換える。
+
+- 対象: 理解更新の失敗(LLM設定エラー / 理解グラフ未構築 / レビュー失敗)・成功時の
+  要約メッセージ(ラベル「システムの目的」「主要機能」「主な確認事項」「推奨される
+  次のステップ」を含む)・confirm-understanding の挿入メッセージ。
+- 文言選択は決定的なテーブル参照のみ(Principle 6)。翻訳 API・推測は使わない。
+  `INTERVIEW_MESSAGES` の全キーが `ja`/`en` 両方を持つことをテストで網羅チェックする。
+- **不正な `INTERVIEW_LANGUAGE` への対処**: `resolve_message_language()` は
+  `get_interview_language()` が `ValueError` を投げた場合、固定文言の組み立てに限り
+  `ja` へ決定的にフォールバックする。これは reasoning 呼び出し
+  (`generate_understanding_review` 内の `get_interview_language()`)の fail-closed
+  挙動(#127 実装済み)を変更しない——設定不備はこれまでどおり `review.error` として
+  報告され続けるが、その**報告メッセージ自体の組み立て**が同じ設定不備で壊れないように
+  するための例外的なフォールバックである。
+
+**含まない:** Dashboard 側文言の多言語化、`ja`/`en` 以外の言語追加。
+
 ## 質問前の軽量エビデンス調査（Issue #130）
 
 #128 で対話ターンは仮説を持つが、確信度が低い論点ではシンボル名と行範囲だけを根拠に

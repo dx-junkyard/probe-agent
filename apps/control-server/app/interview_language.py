@@ -8,6 +8,11 @@ English so schema contracts are unaffected.
 
 Invalid values fail closed: callers surface the error through their normal
 reasoning-run failure path instead of silently falling back to English.
+
+Issue #138 extends this to the server's own fixed-text messages (assistant
+messages the route inserts directly, not LLM output) via ``INTERVIEW_MESSAGES``
+and ``interview_message()`` below, so ``INTERVIEW_LANGUAGE=en`` does not leave
+Japanese boilerplate mixed into an otherwise-English conversation log.
 """
 
 from __future__ import annotations
@@ -31,6 +36,90 @@ def get_interview_language() -> str:
             f"{list(SUPPORTED_INTERVIEW_LANGUAGES)}, got {raw!r}"
         )
     return raw
+
+
+# --- Server fixed-text messages (Issue #138) ---------------------------------
+#
+# Text the server itself composes and inserts into interview_message /
+# interview_session rows (not LLM output) — a finite set of message keys, each
+# with a ja/en entry. Selection is table lookup only (deterministic,
+# Principle 6): no translation API, no inference. Every key must be present
+# for every language in SUPPORTED_INTERVIEW_LANGUAGES (checked by tests).
+
+INTERVIEW_MESSAGES: dict = {
+    "understanding_update_failed": {
+        "ja": "理解の更新に失敗しました: {error}",
+        "en": "Failed to update understanding: {error}",
+    },
+    "graph_not_built": {
+        "ja": (
+            "このスナップショットの理解グラフが未構築です。"
+            "先に System Understanding の build/refresh を実行してください。"
+        ),
+        "en": (
+            "The understanding graph for this snapshot has not been built yet. "
+            "Run System Understanding build/refresh first."
+        ),
+    },
+    "review_failed": {
+        "ja": "理解のレビューに失敗しました: {error}",
+        "en": "Failed to review understanding: {error}",
+    },
+    "understanding_built_intro": {
+        "ja": "ドキュメントとコードを分析し、初期理解を構築しました。",
+        "en": "Analyzed the documentation and code and built an initial understanding.",
+    },
+    "system_purpose_label": {
+        "ja": "システムの目的",
+        "en": "System purpose",
+    },
+    "core_capability_label": {
+        "ja": "主要機能",
+        "en": "Core capability",
+    },
+    "unknown_name": {
+        "ja": "不明",
+        "en": "unknown",
+    },
+    "key_questions_heading": {
+        "ja": "主な確認事項:",
+        "en": "Key questions to confirm:",
+    },
+    "suggested_next_action_label": {
+        "ja": "推奨される次のステップ",
+        "en": "Suggested next step",
+    },
+    "confirm_understanding_message": {
+        "ja": "これまでの回答内容を確定し、提案生成に進みます。",
+        "en": "Confirmed the answers so far; proceeding to proposal generation.",
+    },
+}
+
+# Deterministic fallback language for the fixed-text messages above only,
+# used when INTERVIEW_LANGUAGE itself is invalid/unset in a way that would
+# otherwise prevent even the failure message from being composed. This never
+# affects LLM-directed content: reasoning calls keep failing closed through
+# get_interview_language() raising ValueError, exactly as before Issue #138.
+FIXED_TEXT_FALLBACK_LANGUAGE = "ja"
+
+
+def resolve_message_language() -> str:
+    """Language for server fixed-text messages; falls back to ja on invalid config.
+
+    Deliberately distinct from get_interview_language(), which stays
+    fail-closed for reasoning-model calls. A misconfigured INTERVIEW_LANGUAGE
+    must not prevent the server from composing the very failure message that
+    reports the misconfiguration.
+    """
+    try:
+        return get_interview_language()
+    except ValueError:
+        return FIXED_TEXT_FALLBACK_LANGUAGE
+
+
+def interview_message(key: str, language: str, **kwargs) -> str:
+    """Look up and format a server fixed-text message. Table lookup only."""
+    return INTERVIEW_MESSAGES[key][language].format(**kwargs)
 
 
 def language_directive(language: str) -> str:
