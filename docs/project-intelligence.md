@@ -1211,6 +1211,33 @@ Issue #144 に集約し、実装は以下の sub-issue に依存順で分割し�
 - テスト: dashboard contracts(検索→ステップ表示→変化ハイライト→空状態)、
   サーバー lineage への projection 同梱テスト。
 
+### Phase 4a 実装状態(#148)
+
+- **スキーマ**: `shared/schemas/trace_analyzer_spec.schema.json`。`source`
+  (当面 `trace_projections`)/ `filter`(entity / components / projection_name /
+  phases / time_window)/ `select`(name + path)/ `group_by` / `order_by` /
+  `compare`(phase + fields の**契約のみ**、実行は Phase 5)。パス式は #146 の
+  projection サブセットを再利用。
+- **エンジン**(`app/trace_analyzer.py`): fail-closed な spec 検証と **read-only**
+  実行。`trace_projections` / `trace_entities` を SELECT し宣言的に評価するのみで
+  対象データへ書き込まない。上限(`ANALYZER_MAX_INPUT_ROWS` /
+  `ANALYZER_MAX_OUTPUT_BYTES` / `ANALYZER_MAX_SECONDS`)超過は run を failed にして
+  `error_details` に記録(部分結果は保存しない)。行の整列は決定的な全順序。
+- **永続化**: system-scoped の `trace_analyzers`(`spec_json` / `source` /
+  `review_status` / `decision_method` / provider·model·prompt_version·
+  schema_version〔#149 が書く〕/ `is_mock` / timestamps)と
+  `trace_analysis_runs`(`status` / `result_json` / `error_details` / `row_count` /
+  timestamps)。監査契約(Principle 7)として本 issue がテーブルを所有。
+- **API**: `POST /trace-analyzers`(手動作成、schema 検証 fail-closed で 422)、
+  `GET /trace-analyzers` / `GET /trace-analyzers/{id}`、
+  `PUT /trace-analyzers/{id}/review`(proposed→approved/rejected の有限遷移)、
+  `POST /trace-analyzers/{id}/runs`(**approved のみ**実行可、それ以外 409)、
+  `GET /trace-analyzers/{id}/runs[/{run_id}]`。手動作成は `decision_method=manual`。
+- **Dashboard**: `Trace Analyzers` ページ(JSON spec 作成→review→run→結果表示)と、
+  Trace Lineage Explorer の入力ソースに「保存済み analyzer(entity filter)」を追加。
+- 新環境変数は README / この節に記載。`compare` の実行が Phase 5 の非目標である
+  ことをコードコメントとスキーマ description で明示。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。

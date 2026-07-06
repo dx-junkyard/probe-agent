@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { useLineage, type LineageQuery } from "@/api/hooks";
+import { useLineage, useAnalyzers, type LineageQuery } from "@/api/hooks";
 import type { LineageStep } from "@/api/types";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -10,7 +10,15 @@ import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { formatTimestamp, cn } from "@/lib/utils";
 
-type SearchKind = "entity" | "correlation" | "flow";
+type SearchKind = "entity" | "correlation" | "flow" | "analyzer";
+
+// Extract an entity filter {type,id} from a saved analyzer spec, if present.
+function analyzerEntity(spec: unknown): { type: string; id: string } | null {
+  const filter = (spec as { filter?: { entity?: { type?: string; id?: string } } })?.filter;
+  const ent = filter?.entity;
+  if (ent && ent.type && ent.id) return { type: ent.type, id: ent.id };
+  return null;
+}
 
 const ROLE_VARIANT: Record<string, "success" | "warning" | "secondary"> = {
   source: "success",
@@ -50,12 +58,16 @@ export default function TraceLineagePage() {
   const [activeQuery, setActiveQuery] = useState<LineageQuery | null>(null);
 
   const { data, isLoading, isError } = useLineage(activeQuery);
+  const { data: analyzers } = useAnalyzers();
+  const analyzerSources = (Array.isArray(analyzers) ? analyzers : []).filter((a) =>
+    analyzerEntity(a.spec),
+  );
 
   const submit = () => {
     if (kind === "entity") {
       if (!entityType.trim() || !entityId.trim()) return;
       setActiveQuery({ kind: "entity", entityType: entityType.trim(), entityId: entityId.trim() });
-    } else {
+    } else if (kind === "correlation" || kind === "flow") {
       if (!singleId.trim()) return;
       setActiveQuery({ kind, id: singleId.trim() });
     }
@@ -83,7 +95,7 @@ export default function TraceLineagePage() {
       <Card>
         <CardContent className="pt-6 space-y-4">
           <div className="flex gap-2">
-            {(["entity", "correlation", "flow"] as const).map((k) => (
+            {(["entity", "correlation", "flow", "analyzer"] as const).map((k) => (
               <Button
                 key={k}
                 size="sm"
@@ -95,6 +107,32 @@ export default function TraceLineagePage() {
             ))}
           </div>
 
+          {kind === "analyzer" ? (
+            <div className="space-y-2">
+              <Label className="text-xs">Saved analyzer (entity-filtered)</Label>
+              {analyzerSources.length === 0 ? (
+                <p className="text-xs text-muted-foreground">
+                  No saved analyzer with an entity filter. Create one in Trace Analyzers.
+                </p>
+              ) : (
+                <div className="flex flex-wrap gap-2">
+                  {analyzerSources.map((a) => {
+                    const ent = analyzerEntity(a.spec)!;
+                    return (
+                      <Button
+                        key={a.id}
+                        size="sm"
+                        variant="outline"
+                        onClick={() => setActiveQuery({ kind: "entity", entityType: ent.type, entityId: ent.id })}
+                      >
+                        {a.name || `analyzer #${a.id}`} · {ent.type}:{ent.id}
+                      </Button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          ) : (
           <div className="flex flex-wrap items-end gap-3">
             {kind === "entity" ? (
               <>
@@ -143,6 +181,7 @@ export default function TraceLineagePage() {
             </div>
             <Button onClick={submit}>Search</Button>
           </div>
+          )}
         </CardContent>
       </Card>
 

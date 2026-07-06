@@ -3313,3 +3313,64 @@ describe("Trace Lineage Explorer page", () => {
     expect(screen.getByText(/probe_context/)).toBeInTheDocument();
   });
 });
+
+// ── Trace Analyzers (Issue #148) ────────────────────────────────────
+
+describe("Trace Analyzers page", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const analyzer = {
+    id: 7, name: "order flow", intent: "", spec: {
+      source: "trace_projections",
+      select: [{ name: "status", path: "$.fields.status" }],
+    },
+    source: "trace_projections", review_status: "proposed", decision_method: "manual",
+    provider: null, model: null, prompt_version: null, schema_version: null,
+    is_mock: false, created_at: 1, updated_at: 1,
+  };
+
+  test("rejects run until analyzer is approved (server 409 surfaced)", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/trace-analyzers") return Promise.resolve([{ ...analyzer, review_status: "approved" }]);
+      if (path.endsWith("/runs")) return Promise.resolve([]);
+      return Promise.resolve({});
+    });
+    mockApi.post.mockResolvedValue({
+      id: 1, analyzer_id: 7, status: "completed",
+      result: { row_count: 2, rows: [{ status: "a" }, { status: "b" }] },
+      error_details: null, row_count: 2, started_at: 1, completed_at: 2,
+    });
+    const { default: Page } = await import("@/pages/trace-analyzers");
+    render(<Page />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByText("order flow"));
+    const runBtn = await screen.findByRole("button", { name: "Run" });
+    expect(runBtn).not.toBeDisabled();
+    fireEvent.click(runBtn);
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/trace-analyzers/7/runs");
+    });
+  });
+
+  test("creating an analyzer posts a parsed spec", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/trace-analyzers") return Promise.resolve([]);
+      return Promise.resolve([]);
+    });
+    mockApi.post.mockResolvedValue(analyzer);
+    const { default: Page } = await import("@/pages/trace-analyzers");
+    render(<Page />, { wrapper: createWrapper() });
+
+    fireEvent.change(screen.getByLabelText("analyzer name"), { target: { value: "my analyzer" } });
+    fireEvent.click(screen.getByRole("button", { name: /Create/ }));
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/trace-analyzers",
+        expect.objectContaining({ name: "my analyzer", spec: expect.any(Object) }),
+      );
+    });
+  });
+});

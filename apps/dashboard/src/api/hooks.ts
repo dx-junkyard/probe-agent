@@ -2,7 +2,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, getSystemId } from "./client";
 import type {
   SystemOut, ComponentSummary, TraceEvent, Policy,
-  LineageOut,
+  LineageOut, TraceAnalyzer, AnalysisRun,
   ShadowResult, ComponentProfile, UserOut, TokenOut,
   RepositoryCandidateOut, RepositoryConfigOut, SnapshotOut, LatestDraftsOut,
   DraftGenerationResultOut,
@@ -123,6 +123,50 @@ export function useLineage(query: LineageQuery | null) {
     queryKey: [...sysKey("trace-lineage"), query],
     queryFn: () => api.get<LineageOut>(lineagePath(query as LineageQuery)),
     enabled: lineageReady(query) && !!getSystemId(),
+  });
+}
+
+// Trace analyzers (Issue #148)
+export function useAnalyzers() {
+  return useQuery({
+    queryKey: sysKey("trace-analyzers"),
+    queryFn: () => api.get<TraceAnalyzer[]>("/trace-analyzers"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useAnalyzerRuns(analyzerId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("trace-analyzer-runs"), analyzerId],
+    queryFn: () => api.get<AnalysisRun[]>(`/trace-analyzers/${analyzerId}/runs`),
+    enabled: !!analyzerId && !!getSystemId(),
+  });
+}
+
+export function useCreateAnalyzer() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { name: string; intent?: string; spec: unknown }) =>
+      api.post<TraceAnalyzer>("/trace-analyzers", body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("trace-analyzers") }),
+  });
+}
+
+export function useReviewAnalyzer() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, review_status }: { id: number; review_status: "approved" | "rejected" }) =>
+      api.put<TraceAnalyzer>(`/trace-analyzers/${id}/review`, { review_status }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("trace-analyzers") }),
+  });
+}
+
+export function useRunAnalyzer() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => api.post<AnalysisRun>(`/trace-analyzers/${id}/runs`),
+    onSuccess: (_d, id) =>
+      qc.invalidateQueries({ queryKey: [...sysKey("trace-analyzer-runs"), id] }),
   });
 }
 

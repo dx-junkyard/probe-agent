@@ -72,6 +72,35 @@ export interface LineageOut {
   steps: LineageStep[];
 }
 
+// Trace analyzers (Issue #148/#149)
+export interface TraceAnalyzer {
+  id: number;
+  name: string;
+  intent: string;
+  spec: Record<string, unknown>;
+  source: string;
+  review_status: "proposed" | "approved" | "rejected";
+  decision_method: "deterministic" | "reasoning_llm" | "manual";
+  provider: string | null;
+  model: string | null;
+  prompt_version: string | null;
+  schema_version: string | null;
+  is_mock: boolean;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface AnalysisRun {
+  id: number;
+  analyzer_id: number;
+  status: "pending" | "completed" | "failed";
+  result: Record<string, unknown> | null;
+  error_details: string | null;
+  row_count: number | null;
+  started_at: number;
+  completed_at: number | null;
+}
+
 export interface ShadowResult {
   id: number;
   trace_id: string;

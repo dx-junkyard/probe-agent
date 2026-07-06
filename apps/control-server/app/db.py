@@ -178,6 +178,49 @@ CREATE INDEX IF NOT EXISTS idx_trace_projections_trace
 CREATE INDEX IF NOT EXISTS idx_trace_projections_component
     ON trace_projections (system_id, component_id, created_at DESC);
 
+-- Trace analyzers (Issue #148, Phase 4a). Saved, reviewable, read-only views
+-- over trace_projections. LLM-proposal columns (provider/model/prompt_version/
+-- schema_version) are written by Issue #149; the table (audit contract) is
+-- owned here.
+CREATE TABLE IF NOT EXISTS trace_analyzers (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id       INTEGER NOT NULL,
+    name            TEXT NOT NULL DEFAULT '',
+    intent          TEXT NOT NULL DEFAULT '',
+    spec_json       TEXT NOT NULL,
+    source          TEXT NOT NULL DEFAULT 'trace_projections',
+    review_status   TEXT NOT NULL DEFAULT 'proposed',
+    decision_method TEXT NOT NULL DEFAULT 'manual',
+    provider        TEXT,
+    model           TEXT,
+    prompt_version  TEXT,
+    schema_version  TEXT,
+    is_mock         INTEGER NOT NULL DEFAULT 0,
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_trace_analyzers_system
+    ON trace_analyzers (system_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS trace_analysis_runs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id     INTEGER NOT NULL,
+    analyzer_id   INTEGER NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending',
+    result_json   TEXT,
+    error_details TEXT,
+    row_count     INTEGER,
+    started_at    REAL NOT NULL,
+    completed_at  REAL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (analyzer_id) REFERENCES trace_analyzers (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_trace_analysis_runs_analyzer
+    ON trace_analysis_runs (system_id, analyzer_id, id DESC);
+
 CREATE TABLE IF NOT EXISTS system_profile (
     system_id         INTEGER PRIMARY KEY,
     name              TEXT,

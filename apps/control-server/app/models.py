@@ -102,6 +102,49 @@ class LineageOut(BaseModel):
     steps: List[LineageStepOut] = Field(default_factory=list)
 
 
+# --- Trace analyzers (Issue #148) ------------------------------------------
+
+AnalyzerReviewStatus = Literal["proposed", "approved", "rejected"]
+
+
+class TraceAnalyzerCreate(BaseModel):
+    name: str = ""
+    intent: str = ""
+    spec: Dict[str, Any]
+
+
+class AnalyzerReviewUpdate(BaseModel):
+    review_status: Literal["approved", "rejected"]
+
+
+class TraceAnalyzerOut(BaseModel):
+    id: int
+    name: str = ""
+    intent: str = ""
+    spec: Dict[str, Any] = Field(default_factory=dict)
+    source: str = "trace_projections"
+    review_status: str = "proposed"
+    decision_method: str = "manual"
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    prompt_version: Optional[str] = None
+    schema_version: Optional[str] = None
+    is_mock: bool = False
+    created_at: float
+    updated_at: float
+
+
+class AnalysisRunOut(BaseModel):
+    id: int
+    analyzer_id: int
+    status: str
+    result: Optional[Dict[str, Any]] = None
+    error_details: Optional[str] = None
+    row_count: Optional[int] = None
+    started_at: float
+    completed_at: Optional[float] = None
+
+
 class ShadowResult(BaseModel):
     trace_id: str
     component_id: str

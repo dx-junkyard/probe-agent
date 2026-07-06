@@ -49,8 +49,28 @@ uvicorn app.main:app --reload --port 8000
 | GET  | `/assistant/settings-metadata` | 設定項目の静的説明メタデータ (コード管理、Issue #102) |
 | GET  | `/assistant/screen-context/{screen_id}` | 画面コンテキスト + 現在の診断状態 + 提案質問 |
 | POST | `/assistant/ask` | 画面コンテキスト/設定メタデータ/診断結果に根拠づけた Q&A |
+| GET  | `/trace-lineage/entities/{type}/{id}` | entity 単位の系譜(#145) |
+| GET  | `/trace-lineage/correlations/{id}` | correlation 単位の系譜(#145) |
+| GET  | `/trace-lineage/flows/{id}` | flow 単位の系譜(#145) |
+| GET  | `/traces/{trace_id}/projections` | trace の projection 取得(#146) |
+| GET  | `/components/{id}/projections` | component の projection 一覧(#146) |
+| POST | `/trace-analyzers` | analyzer 手動作成(schema 検証 fail-closed、#148) |
+| GET  | `/trace-analyzers` / `/trace-analyzers/{id}` | analyzer 一覧・取得(#148) |
+| PUT  | `/trace-analyzers/{id}/review` | proposed→approved/rejected(#148) |
+| POST | `/trace-analyzers/{id}/runs` | approved のみ read-only 実行(#148) |
+| GET  | `/trace-analyzers/{id}/runs[/{run_id}]` | run 一覧・取得(#148) |
 
 DB ファイルは `PROBE_DB_PATH` (既定 `./probe.db`) で切り替えられる。
+
+### Trace lineage / analyzer の環境変数
+
+| 変数 | 既定 | 説明 |
+| --- | --- | --- |
+| `ANALYZER_MAX_INPUT_ROWS` | `10000` | analyzer 実行時にスキャンする projection 行の上限(超過で run 失敗) |
+| `ANALYZER_MAX_OUTPUT_BYTES` | `200000` | analyzer 結果 JSON の最大バイト数(超過で run 失敗) |
+| `ANALYZER_MAX_SECONDS` | `10` | analyzer 実行の最大秒数(超過で run 失敗) |
+
+SDK 側の projection 上限(`PROBE_PROJECTION_MAX_*`)は `packages/python-probe/README.md` を参照。
 
 ## LLM 設定
 
