@@ -9,8 +9,9 @@ structural diff, not a semantic one (Principle 6): renames show up as one
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List, Optional
+
+from .interview_evidence import _positive_int_env
 
 UNDERSTANDING_SECTIONS = [
     "system_purpose",
@@ -25,18 +26,9 @@ DEFAULT_REVISION_LIMIT = 20
 
 
 def revision_limit() -> int:
-    raw = os.getenv(
-        "INTERVIEW_UNDERSTANDING_REVISION_LIMIT", str(DEFAULT_REVISION_LIMIT)
+    return _positive_int_env(
+        "INTERVIEW_UNDERSTANDING_REVISION_LIMIT", DEFAULT_REVISION_LIMIT
     )
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            "INTERVIEW_UNDERSTANDING_REVISION_LIMIT must be an integer"
-        ) from exc
-    if value < 1:
-        raise ValueError("INTERVIEW_UNDERSTANDING_REVISION_LIMIT must be positive")
-    return value
 
 
 def _items_by_name(items: Optional[List[Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:

@@ -55,6 +55,7 @@ from ..runtime_reality import (
     RuntimeCheckInputItem,
     RuntimeRealityCheckResult,
     aggregate_component_facts,
+    declared_block,
     generate_runtime_reality_check,
     window_days as runtime_window_days,
 )
@@ -97,7 +98,6 @@ from ..models import (
     IntelligenceRunEvidenceListOut,
     IntelligenceRunEvidenceOut,
     IntelligenceRunOut,
-    RuntimeRealityCheckItemOut,
     RuntimeRealityCheckRunOut,
     RuntimeRealityFactsOut,
     UnderstandingDiffOut,
@@ -116,6 +116,17 @@ STAGE_ORDER = [
     "probe_flow_selection",
     "proposal_generation",
 ]
+
+
+def _component_id_for(qualified_name: str) -> str:
+    """Deterministic component_id for an interview-authored probe.
+
+    Single definition shared by worktree materialization (Issue #71), which
+    stamps this id onto the generated ``@probe`` decorator, and the Runtime
+    Reality Check (Issue #135), which aggregates traces by the same id. If
+    the derivations drifted, runtime facts would silently match zero traces.
+    """
+    return qualified_name.replace(".", "_")
 
 
 def _advance_stage(current_stage: str, target: str) -> str:
@@ -1404,7 +1415,10 @@ def answer_interview_qa(
                 )
 
             # status == 'answered': this is a correction. Insert a new
-            # revision row, then link the old row forward.
+            # revision row, then link the old row forward. runtime_evidence
+            # (Issue #135) is carried onto the new current row just like
+            # evidence_refs, so correcting a runtime question's answer never
+            # drops the trace-fact provenance that justified the question.
             new_id = _insert_qa_row(
                 conn, session_id, system_id,
                 question_text=qa["question_text"],
@@ -1420,6 +1434,11 @@ def answer_interview_qa(
                 status="answered",
                 answered_by=payload.actor,
                 answered_at=now,
+                runtime_evidence=(
+                    json.loads(qa["runtime_evidence"])
+                    if ("runtime_evidence" in qa.keys() and qa["runtime_evidence"])
+                    else None
+                ),
             )
             conn.execute(
                 "UPDATE interview_qa SET status = 'revised', superseded_by_id = ? WHERE id = ?",
@@ -1913,7 +1932,7 @@ def materialize_interview_session(
                 consumers=md.consumers if md.consumers else None,
                 state_effects=md.state_effects if md.state_effects else None,
             ),
-            component_id=item.qualified_name.replace(".", "_"),
+            component_id=_component_id_for(item.qualified_name),
             recommended_mode=pp.recommended_mode,
             line_start=0,
             line_end=0,
@@ -2328,11 +2347,12 @@ def update_interview_understanding(
             limit = DEFAULT_REVISION_LIMIT
         conn.execute(
             """DELETE FROM understanding_revision
-               WHERE session_id = ? AND id NOT IN (
+               WHERE session_id = ? AND system_id = ? AND id NOT IN (
                    SELECT id FROM understanding_revision
-                   WHERE session_id = ? ORDER BY id DESC LIMIT ?
+                   WHERE session_id = ? AND system_id = ?
+                   ORDER BY id DESC LIMIT ?
                )""",
-            (session_id, session_id, limit),
+            (session_id, system_id, session_id, system_id, limit),
         )
 
         if review.current_understanding:
@@ -2545,6 +2565,13 @@ def get_understanding_diff(
             ).fetchone()
             if from_row is None:
                 raise HTTPException(status_code=404, detail="Revision not found (from)")
+            if from_row["id"] >= to_row["id"]:
+                # A reversed range would silently swap added/removed and
+                # invert confidence before/after — reject it instead.
+                raise HTTPException(
+                    status_code=422,
+                    detail="'from' must be an earlier revision than 'to'",
+                )
         else:
             from_row = conn.execute(
                 """SELECT * FROM understanding_revision
@@ -2594,7 +2621,7 @@ def _build_runtime_check_items(
     """
     items: List[RuntimeCheckInputItem] = []
     for approved in approved_set.items:
-        component_id = approved.qualified_name.replace(".", "_")
+        component_id = _component_id_for(approved.qualified_name)
         facts = aggregate_component_facts(conn, system_id, component_id)
         items.append(
             RuntimeCheckInputItem(
@@ -2636,29 +2663,21 @@ def get_runtime_reality_facts(
       probe_value: Verify aggregation is System-isolated and deterministic for the same trace set
     """
     approved_set = get_interview_approved_set(session_id, system_id)
-    with get_conn() as conn:
-        items = _build_runtime_check_items(conn, system_id, approved_set)
+    # A misconfigured RUNTIME_REALITY_CHECK_* env var is a client-visible
+    # configuration error (422), not an unhandled 500.
+    try:
+        window = runtime_window_days()
+        with get_conn() as conn:
+            items = _build_runtime_check_items(conn, system_id, approved_set)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
     return RuntimeRealityFactsOut(
         session_id=session_id,
         system_id=system_id,
         snapshot_id=approved_set.snapshot_id,
-        window_days=runtime_window_days(),
-        items=[
-            RuntimeRealityCheckItemOut(
-                proposal_id=i.proposal_id,
-                decision_id=i.decision_id,
-                path=i.path,
-                qualified_name=i.qualified_name,
-                component_id=i.component_id,
-                role=i.role,
-                probe_value=i.probe_value,
-                state_effects=i.state_effects,
-                recommended_mode=i.recommended_mode,
-                facts=i.facts,
-            )
-            for i in items
-        ],
+        window_days=window,
+        items=items,
     )
 
 
@@ -2692,136 +2711,149 @@ def run_runtime_reality_check(
     approved_set = get_interview_approved_set(session_id, system_id)
     snapshot_id = approved_set.snapshot_id
 
+    # First connection: suppression check + deterministic aggregation only.
+    # get_conn() holds the process-wide DB lock, so the reasoning call below
+    # must happen after this block closes — holding the lock across an
+    # external LLM round trip would stall every other request.
+    try:
+        with get_conn() as conn:
+            open_runtime = conn.execute(
+                """SELECT id FROM interview_qa
+                   WHERE session_id = ? AND system_id = ?
+                     AND question_source = 'runtime' AND status = 'open'
+                   LIMIT 1""",
+                (session_id, system_id),
+            ).fetchone()
+            if open_runtime is not None:
+                return RuntimeRealityCheckRunOut(
+                    session_id=session_id,
+                    system_id=system_id,
+                    snapshot_id=snapshot_id,
+                    skipped=True,
+                    skipped_reason=(
+                        "Unanswered runtime reality check questions already exist "
+                        "for this session; answer or skip them before re-running."
+                    ),
+                )
+
+            items = _build_runtime_check_items(conn, system_id, approved_set)
+    except ValueError as exc:
+        # Misconfigured RUNTIME_REALITY_CHECK_* env var: client-visible 422,
+        # consistent with the runtime-facts endpoint.
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    if not items:
+        raise HTTPException(
+            status_code=422,
+            detail="No approved elements to check against runtime traces",
+        )
+
+    config = LLMConfig.intelligence_from_env()
+    result: Optional[RuntimeRealityCheckResult] = None
+    try:
+        client = create_llm_client(config)
+        language = get_interview_language()
+    except (LLMError, ValueError) as exc:
+        result = RuntimeRealityCheckResult(
+            provider=config.provider,
+            model=config.model,
+            is_mock=config.provider == "mock",
+            error=str(exc),
+        )
+
+    if result is None:
+        result = generate_runtime_reality_check(
+            client, config, items=items, language=language
+        )
+
+    # Second connection: persist the audit run and any generated questions
+    # atomically — a mid-loop failure must not leave a completed run with a
+    # partial question set (which would also wrongly suppress the next run).
     with get_conn() as conn:
-        open_runtime = conn.execute(
-            """SELECT id FROM interview_qa
-               WHERE session_id = ? AND system_id = ?
-                 AND question_source = 'runtime' AND status = 'open'
-               LIMIT 1""",
-            (session_id, system_id),
-        ).fetchone()
-        if open_runtime is not None:
-            return RuntimeRealityCheckRunOut(
-                session_id=session_id,
-                system_id=system_id,
-                snapshot_id=snapshot_id,
-                skipped=True,
-                skipped_reason=(
-                    "Unanswered runtime reality check questions already exist "
-                    "for this session; answer or skip them before re-running."
+        run_status = "failed" if result.error else "completed"
+        conn.execute("BEGIN")
+        try:
+            run_cur = conn.execute(
+                """INSERT INTO intelligence_runs
+                    (system_id, snapshot_id, run_type, provider, model,
+                     prompt_version, schema_version, decision_method, status,
+                     error_details, is_mock, started_at, completed_at)
+                VALUES (?, ?, 'runtime_reality_check', ?, ?, ?, ?,
+                        'reasoning_llm', ?, ?, ?, ?, ?)""",
+                (
+                    system_id,
+                    snapshot_id,
+                    result.provider,
+                    result.model,
+                    result.prompt_version,
+                    result.schema_version,
+                    run_status,
+                    result.error,
+                    1 if result.is_mock else 0,
+                    now,
+                    now,
                 ),
             )
+            run_id = run_cur.lastrowid
 
-        items = _build_runtime_check_items(conn, system_id, approved_set)
-        if not items:
-            raise HTTPException(
-                status_code=422,
-                detail="No approved elements to check against runtime traces",
-            )
+            by_key = {(i.component_id, i.qualified_name): i for i in items}
+            created_qa_ids: List[int] = []
+            if not result.error:
+                for q in result.questions:
+                    item = by_key[(q.component_id, q.qualified_name)]
+                    # Raw facts + declared-metadata provenance only. The LLM's
+                    # own output (question_text/hypothesis) lives in the
+                    # dedicated interview_qa columns, never in this blob
+                    # (raw facts vs interpretation separation).
+                    runtime_evidence = {
+                        "component_id": item.component_id,
+                        "qualified_name": item.qualified_name,
+                        "path": item.path,
+                        "metadata_source": {
+                            "proposal_id": item.proposal_id,
+                            "decision_id": item.decision_id,
+                            "session_id": session_id,
+                        },
+                        "declared": declared_block(item),
+                        "facts": item.facts.model_dump(),
+                    }
+                    qa_id = _insert_qa_row(
+                        conn,
+                        session_id,
+                        system_id,
+                        question_text=q.question_text,
+                        question_category="probe_flow",
+                        question_source="runtime",
+                        hypothesis=q.hypothesis or None,
+                        evidence_refs=[],
+                        now=now,
+                        runtime_evidence=runtime_evidence,
+                    )
+                    created_qa_ids.append(qa_id)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
-        config = LLMConfig.intelligence_from_env()
-        try:
-            client = create_llm_client(config)
-            client_error = None
-        except LLMError as exc:
-            client = None
-            client_error = str(exc)
-
-        try:
-            language = get_interview_language()
-        except ValueError as exc:
-            client_error = client_error or str(exc)
-
-        if client_error:
-            result = RuntimeRealityCheckResult(
-                provider=config.provider,
-                model=config.model,
-                is_mock=config.provider == "mock",
-                error=client_error,
-            )
-        else:
-            result = generate_runtime_reality_check(
-                client, config, items=items, language=language
-            )
-
-        run_status = "failed" if result.error else "completed"
-        run_cur = conn.execute(
-            """INSERT INTO intelligence_runs
-                (system_id, snapshot_id, run_type, provider, model,
-                 prompt_version, schema_version, decision_method, status,
-                 error_details, is_mock, started_at, completed_at)
-            VALUES (?, ?, 'runtime_reality_check', ?, ?, ?, ?,
-                    'reasoning_llm', ?, ?, ?, ?, ?)""",
-            (
-                system_id,
-                snapshot_id,
-                result.provider,
-                result.model,
-                result.prompt_version,
-                result.schema_version,
-                run_status,
-                result.error,
-                1 if result.is_mock else 0,
-                now,
-                now,
-            ),
-        )
-        run_id = run_cur.lastrowid
         run_row = conn.execute(
             "SELECT * FROM intelligence_runs WHERE id = ?", (run_id,)
         ).fetchone()
 
-        if result.error:
-            return RuntimeRealityCheckRunOut(
-                session_id=session_id,
-                system_id=system_id,
-                snapshot_id=snapshot_id,
-                intelligence_run=_intelligence_run_out(run_row),
-                items_considered=len(items),
-                error=result.error,
-            )
-
-        by_key = {(i.component_id, i.qualified_name): i for i in items}
-        created_qa_ids: List[int] = []
-        for q in result.questions:
-            item = by_key[(q.component_id, q.qualified_name)]
-            runtime_evidence = {
-                "component_id": item.component_id,
-                "qualified_name": item.qualified_name,
-                "path": item.path,
-                "metadata_source": {
-                    "proposal_id": item.proposal_id,
-                    "decision_id": item.decision_id,
-                    "session_id": session_id,
-                },
-                "declared": {
-                    "role": item.role,
-                    "probe_value": item.probe_value,
-                    "state_effects": item.state_effects,
-                    "recommended_mode": item.recommended_mode,
-                },
-                "facts": item.facts.model_dump(),
-                "answer_options": q.answer_options,
-            }
-            qa_id = _insert_qa_row(
-                conn,
-                session_id,
-                system_id,
-                question_text=q.question_text,
-                question_category="probe_flow",
-                question_source="runtime",
-                hypothesis=q.hypothesis or None,
-                evidence_refs=[],
-                now=now,
-                runtime_evidence=runtime_evidence,
-            )
-            created_qa_ids.append(qa_id)
-
+    if result.error:
         return RuntimeRealityCheckRunOut(
             session_id=session_id,
             system_id=system_id,
             snapshot_id=snapshot_id,
             intelligence_run=_intelligence_run_out(run_row),
             items_considered=len(items),
-            created_qa_ids=created_qa_ids,
+            error=result.error,
         )
+
+    return RuntimeRealityCheckRunOut(
+        session_id=session_id,
+        system_id=system_id,
+        snapshot_id=snapshot_id,
+        intelligence_run=_intelligence_run_out(run_row),
+        items_considered=len(items),
+        created_qa_ids=created_qa_ids,
+    )

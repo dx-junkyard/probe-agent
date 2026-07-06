@@ -22,7 +22,6 @@ Two clearly separated steps (Principle 6):
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -30,9 +29,14 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+# Shared JSON-response helpers (same fence-stripping / budget-trimming the
+# dialogue passes use) and the shared positive-int env parser, instead of
+# re-declaring local copies of either.
+from .interview_agent import _strip_fences, _trim_json
+from .interview_evidence import _positive_int_env
 from .interview_language import language_directive
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient, is_reasoning_model
-from .models import RuntimeTraceFactsOut
+from .models import RuntimeRealityCheckItemOut, RuntimeTraceFactsOut
 
 PROMPT_VERSION = "runtime-reality-v1"
 SCHEMA_VERSION = "runtime-reality-v1"
@@ -43,25 +47,11 @@ MAX_RUNTIME_QUESTIONS = 5
 
 
 def window_days() -> int:
-    raw = os.getenv("RUNTIME_REALITY_CHECK_WINDOW_DAYS", str(DEFAULT_WINDOW_DAYS))
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError("RUNTIME_REALITY_CHECK_WINDOW_DAYS must be an integer") from exc
-    if value < 1:
-        raise ValueError("RUNTIME_REALITY_CHECK_WINDOW_DAYS must be positive")
-    return value
+    return _positive_int_env("RUNTIME_REALITY_CHECK_WINDOW_DAYS", DEFAULT_WINDOW_DAYS)
 
 
 def _max_chars() -> int:
-    raw = os.getenv("RUNTIME_REALITY_CHECK_MAX_CHARS", str(DEFAULT_MAX_CHARS))
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError("RUNTIME_REALITY_CHECK_MAX_CHARS must be an integer") from exc
-    if value < 1:
-        raise ValueError("RUNTIME_REALITY_CHECK_MAX_CHARS must be positive")
-    return value
+    return _positive_int_env("RUNTIME_REALITY_CHECK_MAX_CHARS", DEFAULT_MAX_CHARS)
 
 
 def _percentile(sorted_values: List[float], pct: float) -> float:
@@ -94,13 +84,19 @@ def aggregate_component_facts(
     days = window_days_value if window_days_value is not None else window_days()
     since = time.time() - days * 86_400
 
-    rows = conn.execute(
-        """SELECT error, duration_ms, timestamp FROM traces
+    # Counts/max are aggregated in SQL so only duration values (needed for
+    # the percentile math) cross the SQLite boundary, instead of every row.
+    summary = conn.execute(
+        """SELECT COUNT(*) AS call_count,
+                  SUM(CASE WHEN error IS NOT NULL AND error != '' THEN 1 ELSE 0 END)
+                      AS error_count,
+                  MAX(timestamp) AS last_observed_at
+           FROM traces
            WHERE system_id = ? AND component_id = ? AND timestamp >= ?""",
         (system_id, component_id, since),
-    ).fetchall()
+    ).fetchone()
 
-    call_count = len(rows)
+    call_count = summary["call_count"]
     if call_count == 0:
         return RuntimeTraceFactsOut(
             component_id=component_id,
@@ -115,11 +111,17 @@ def aggregate_component_facts(
             has_traces=False,
         )
 
-    error_count = sum(1 for r in rows if r["error"])
-    durations = sorted(
-        float(r["duration_ms"]) for r in rows if r["duration_ms"] is not None
-    )
-    last_observed_at = max(r["timestamp"] for r in rows)
+    error_count = summary["error_count"] or 0
+    durations = [
+        float(r["duration_ms"])
+        for r in conn.execute(
+            """SELECT duration_ms FROM traces
+               WHERE system_id = ? AND component_id = ? AND timestamp >= ?
+                 AND duration_ms IS NOT NULL
+               ORDER BY duration_ms""",
+            (system_id, component_id, since),
+        )
+    ]
 
     return RuntimeTraceFactsOut(
         component_id=component_id,
@@ -130,26 +132,32 @@ def aggregate_component_facts(
         duration_p50_ms=_percentile(durations, 0.50) if durations else None,
         duration_p90_ms=_percentile(durations, 0.90) if durations else None,
         duration_p99_ms=_percentile(durations, 0.99) if durations else None,
-        last_observed_at=last_observed_at,
+        last_observed_at=summary["last_observed_at"],
         has_traces=True,
     )
 
 
 # --- Reasoning reconciliation step -------------------------------------------
 
+# One approved element's declared understanding + facts. The API response
+# model doubles as the reconciliation input so the two cannot drift; the
+# old dataclass name is kept for callers/tests.
+RuntimeCheckInputItem = RuntimeRealityCheckItemOut
 
-@dataclass
-class RuntimeCheckInputItem:
-    proposal_id: int
-    decision_id: int
-    path: str
-    qualified_name: str
-    component_id: str
-    role: Optional[str]
-    probe_value: Optional[str]
-    state_effects: List[str]
-    recommended_mode: str
-    facts: RuntimeTraceFactsOut
+
+def declared_block(item: RuntimeRealityCheckItemOut) -> Dict[str, Any]:
+    """The declared-understanding projection of an item.
+
+    Single source for both the reconciliation prompt payload and the
+    persisted runtime_evidence provenance, so what is stored always matches
+    what the model was shown.
+    """
+    return {
+        "role": item.role,
+        "probe_value": item.probe_value,
+        "state_effects": item.state_effects,
+        "recommended_mode": item.recommended_mode,
+    }
 
 
 @dataclass
@@ -237,36 +245,13 @@ def _system_prompt(language: str) -> str:
     return _SYSTEM_PROMPT + "\n" + language_directive(language) + "\n"
 
 
-def _strip_fences(raw: str) -> str:
-    cleaned = raw.strip()
-    if not cleaned.startswith("```"):
-        return cleaned
-    lines = cleaned.split("\n")
-    lines = lines[1:] if lines[0].startswith("```") else lines
-    if lines and lines[-1].strip() == "```":
-        lines = lines[:-1]
-    return "\n".join(lines)
-
-
-def _trim_json(value: Any, max_chars: int) -> str:
-    text = json.dumps(value, ensure_ascii=False)
-    if len(text) <= max_chars:
-        return text
-    return text[: max(0, max_chars - 30)] + "…[truncated to budget]"
-
-
 def _build_user_prompt(items: List[RuntimeCheckInputItem], max_chars: int) -> str:
     payload = [
         {
             "component_id": item.component_id,
             "qualified_name": item.qualified_name,
             "path": item.path,
-            "declared": {
-                "role": item.role,
-                "probe_value": item.probe_value,
-                "state_effects": item.state_effects,
-                "recommended_mode": item.recommended_mode,
-            },
+            "declared": declared_block(item),
             "facts": item.facts.model_dump(),
         }
         for item in items

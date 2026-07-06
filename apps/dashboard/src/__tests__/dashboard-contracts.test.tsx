@@ -1234,6 +1234,7 @@ function mockInterviewApi(options: {
   session?: Record<string, unknown>;
   proposals?: unknown[];
   understandingDiff?: Record<string, unknown>;
+  qaList?: Record<string, unknown>;
 } = {}) {
   const session = interviewSession(options.session ?? {});
   const proposal = interviewProposal();
@@ -1242,6 +1243,9 @@ function mockInterviewApi(options: {
   mockApi.get.mockImplementation((path: string) => {
     if (path === "/interview/sessions/7/understanding-diff") {
       return Promise.resolve(options.understandingDiff ?? null);
+    }
+    if (path === "/interview/sessions/7/qa") {
+      return Promise.resolve(options.qaList ?? null);
     }
     if (path === "/repository/snapshots/latest") {
       return Promise.resolve({
@@ -1371,6 +1375,38 @@ describe("Interview page", () => {
         { actor: "admin" },
       );
     });
+  });
+
+  test("runtime reality check trigger is reachable with zero Q&A rows (Issue #135)", async () => {
+    // Approved elements exist but no questions yet — the most useful moment
+    // for the first reality check. The trigger must not be hidden behind an
+    // empty Q&A list.
+    mockInterviewApi({
+      approvedCount: 1,
+      qaList: {
+        session_id: 7,
+        system_id: 1,
+        items: [],
+        open_count: 0,
+        high_priority_open_count: 0,
+        answers_revised_at: null,
+      },
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const button = await screen.findByTestId("run-runtime-reality-check");
+    expect(button).toBeEnabled();
   });
 
   test("shows understanding diff summary and expandable detail (Issue #136)", async () => {

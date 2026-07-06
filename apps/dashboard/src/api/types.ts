@@ -566,6 +566,8 @@ export interface RuntimeQaEvidence {
   qualified_name: string;
   path: string;
   metadata_source: { proposal_id: number; decision_id: number; session_id: number };
+  // Raw facts + declared-metadata provenance only; the LLM's question text
+  // and hypothesis live in the interview_qa columns, never in this blob.
   declared: {
     role: string | null;
     probe_value: string | null;
@@ -573,7 +575,6 @@ export interface RuntimeQaEvidence {
     recommended_mode: string;
   };
   facts: RuntimeTraceFactsOut;
-  answer_options: string[];
 }
 
 export interface RuntimeRealityCheckRunOut {

@@ -1005,14 +1005,17 @@ probe_value / state_effects / recommended_mode)と、同じ component_id のト�
   一切行わない。System 分離は `system_id` での WHERE 句のみで保証する。
 - **突合(reasoning_llm, `generate_runtime_reality_check`)**: 集計事実 + 承認済み
   メタデータを入力に、「ズレの可能性があり確認する価値のある論点」を最大
-  `MAX_RUNTIME_QUESTIONS`(5)件、構造化出力で選ばせる。応答が参照する
+  `MAX_RUNTIME_QUESTIONS`(5)件、構造化出力で選ばせる。プロンプトに注入する
+  集計+メタデータの JSON は `RUNTIME_REALITY_CHECK_MAX_CHARS`(既定 8000)で
+  明示的にバジェット制限する(既存の `INTERVIEW_*_MAX_CHARS` パターン)。応答が参照する
   `component_id`/`qualified_name` は入力に存在するものへの完全一致でなければ
   fail-closed(存在しないシンボルの捏造を防ぐ、Principle 6)。モック/非推論
   モデル・API エラー・構造化出力検証失敗は、いずれもヒューリスティックな
   代替質問を生成せず run failed として記録される。
 
-対象 component_id と承認済みメタデータの対応付けは、`qualified_name.replace(".", "_")`
-という materialization(#71)が書き込むのと同じ決定的変換で行う。曖昧マッチはしない。
+対象 component_id と承認済みメタデータの対応付けは、materialization(#71)が
+書き込むのと同じ決定的変換(`routes/interview.py` の `_component_id_for`、
+`qualified_name.replace(".", "_")`)を両者で共有して行う。曖昧マッチはしない。
 
 エンドポイント:
 

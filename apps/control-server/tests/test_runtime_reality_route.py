@@ -425,3 +425,101 @@ def test_runtime_reality_check_never_auto_changes_metadata_or_policy(admin_clien
     )
     assert policy.status_code == 200
     assert policy.json()["mode"] in ("trace", "off")
+
+
+def test_runtime_evidence_survives_answer_correction(admin_client, monkeypatch):
+    """Correcting a runtime question's answer inserts a new revision row;
+    the runtime_evidence provenance must carry over to that new current row
+    (review fix: it was previously dropped, unlike evidence_refs)."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_approved_session(admin_client, headers, snapshot_id)
+
+    _patch_llm(monkeypatch, response={
+        "questions": [
+            {
+                "component_id": "summarize_summarize_text",
+                "qualified_name": "summarize.summarize_text",
+                "question_text": "確認質問",
+                "hypothesis": "仮説",
+                "answer_options": [],
+            }
+        ]
+    })
+    r = admin_client.post(
+        f"/interview/sessions/{session_id}/runtime-reality-check", headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    qa_id = r.json()["created_qa_ids"][0]
+
+    # First answer, then a correction (creates a new revision row).
+    r = admin_client.post(
+        f"/interview/sessions/{session_id}/qa/{qa_id}/answer",
+        json={"answer_text": "はい、正しいです", "actor": "dev"},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    r = admin_client.post(
+        f"/interview/sessions/{session_id}/qa/{qa_id}/answer",
+        json={"answer_text": "いいえ、実はDB書き込みがあります", "actor": "dev"},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    corrected = r.json()["qa"]
+    assert corrected["id"] != qa_id
+    assert corrected["question_source"] == "runtime"
+    assert corrected["runtime_evidence"] is not None
+    assert corrected["runtime_evidence"]["component_id"] == "summarize_summarize_text"
+
+
+def test_runtime_evidence_excludes_llm_output(admin_client, monkeypatch):
+    """runtime_evidence stores raw facts + declared-metadata provenance only;
+    LLM output (answer_options and the like) must not be mixed into it."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_approved_session(admin_client, headers, snapshot_id)
+
+    _patch_llm(monkeypatch, response={
+        "questions": [
+            {
+                "component_id": "summarize_summarize_text",
+                "qualified_name": "summarize.summarize_text",
+                "question_text": "確認質問",
+                "hypothesis": "仮説",
+                "answer_options": ["はい", "いいえ"],
+            }
+        ]
+    })
+    r = admin_client.post(
+        f"/interview/sessions/{session_id}/runtime-reality-check", headers=headers,
+    )
+    assert r.status_code == 200, r.text
+
+    qa_list = admin_client.get(
+        f"/interview/sessions/{session_id}/qa", headers=headers,
+    ).json()
+    qa = next(q for q in qa_list["items"] if q["question_source"] == "runtime")
+    assert set(qa["runtime_evidence"].keys()) == {
+        "component_id", "qualified_name", "path", "metadata_source",
+        "declared", "facts",
+    }
+
+
+def test_runtime_facts_misconfigured_window_returns_422(admin_client, monkeypatch):
+    """A misconfigured RUNTIME_REALITY_CHECK_WINDOW_DAYS is a structured 422,
+    not an unhandled 500 (fail-closed configuration reporting)."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_approved_session(admin_client, headers, snapshot_id)
+
+    monkeypatch.setenv("RUNTIME_REALITY_CHECK_WINDOW_DAYS", "0")
+    r = admin_client.get(
+        f"/interview/sessions/{session_id}/runtime-facts", headers=headers,
+    )
+    assert r.status_code == 422, r.text
+    assert "RUNTIME_REALITY_CHECK_WINDOW_DAYS" in r.json()["detail"]
+
+    r = admin_client.post(
+        f"/interview/sessions/{session_id}/runtime-reality-check", headers=headers,
+    )
+    assert r.status_code == 422, r.text

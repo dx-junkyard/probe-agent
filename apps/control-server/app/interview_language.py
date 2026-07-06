@@ -93,6 +93,14 @@ INTERVIEW_MESSAGES: dict = {
         "ja": "これまでの回答内容を確定し、提案生成に進みます。",
         "en": "Confirmed the answers so far; proceeding to proposal generation.",
     },
+    # Deterministic no-evidence fallback question appended by the
+    # system-understanding reviewer (previously a private table in
+    # system_understanding_reviewer.py; registered here so the
+    # all-keys-in-all-languages test covers it too).
+    "no_evidence_question": {
+        "ja": "「{name}」({section})の根拠がドキュメント・コードから見つかりませんでした。この項目は正しいですか?",
+        "en": "No evidence for {section} item: {name}. Is this item correct?",
+    },
 }
 
 # Deterministic fallback language for the fixed-text messages above only,

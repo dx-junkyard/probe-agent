@@ -306,3 +306,28 @@ def test_revision_rotation_respects_limit(admin_client, monkeypatch):
         r["current_understanding"]["core_capabilities"][0]["name"] for r in revisions
     ]
     assert set(names) == {"cap-2", "cap-3", "cap-4"}
+
+
+def test_diff_rejects_reversed_range(admin_client, monkeypatch):
+    """from must be an earlier revision than to; a reversed range would
+    silently swap added/removed (review fix)."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+
+    _patch_review_client(monkeypatch, _understanding_response(cap_names=["A"]))
+    admin_client.post(f"/interview/sessions/{session_id}/update-understanding", headers=headers)
+    _patch_review_client(monkeypatch, _understanding_response(cap_names=["A", "B"]))
+    admin_client.post(f"/interview/sessions/{session_id}/update-understanding", headers=headers)
+
+    revisions = admin_client.get(
+        f"/interview/sessions/{session_id}/understanding-revisions", headers=headers,
+    ).json()["items"]
+    newer, older = revisions[0]["id"], revisions[1]["id"]
+
+    r = admin_client.get(
+        f"/interview/sessions/{session_id}/understanding-diff"
+        f"?from={newer}&to={older}",
+        headers=headers,
+    )
+    assert r.status_code == 422, r.text

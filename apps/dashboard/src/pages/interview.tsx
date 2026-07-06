@@ -645,7 +645,12 @@ function QaPanel({
     }
   };
 
-  if (!qaList || qaList.items.length === 0) return null;
+  // Keep the panel visible when there are no Q&A rows yet but the session
+  // has approved elements: the Runtime Reality Check trigger (Issue #135)
+  // lives here, and its most useful moment is exactly before any questions
+  // exist. Hide the panel only when there is nothing to show AND nothing
+  // that could be run.
+  if (!qaList || (qaList.items.length === 0 && approvedCount === 0)) return null;
 
   return (
     <Card data-testid="qa-panel">
@@ -704,6 +709,22 @@ function QaPanel({
   );
 }
 
+// 差分サマリーの件数(追加/削除/確信度変化/説明変化)。パネル表示と
+// 「理解を更新」トーストの両方で使う単一の集計ロジック。
+function summarizeUnderstandingDiff(diff: UnderstandingDiffOut) {
+  const added = diff.sections.reduce((n, s) => n + s.added.length, 0);
+  const removed = diff.sections.reduce((n, s) => n + s.removed.length, 0);
+  const confidenceChanged = diff.sections.reduce((n, s) => n + s.confidence_changed.length, 0);
+  const summaryChanged = diff.sections.reduce((n, s) => n + s.summary_changed.length, 0);
+  return {
+    added,
+    removed,
+    confidenceChanged,
+    summaryChanged,
+    hasChanges: added + removed + confidenceChanged + summaryChanged > 0,
+  };
+}
+
 // 理解のリビジョン差分パネル(Issue #136)。「理解を更新」の結果、直前リビジョンから
 // 何が変わったかを決定的な差分(追加/削除/確信度変化)で表示する。回答修正から
 // 再構築した直後は「あなたの回答修正が反映されました」の文脈を添える。
@@ -726,11 +747,13 @@ function UnderstandingDiffPanel({
     );
   }
 
-  const addedCount = diff.sections.reduce((n, s) => n + s.added.length, 0);
-  const removedCount = diff.sections.reduce((n, s) => n + s.removed.length, 0);
-  const confidenceCount = diff.sections.reduce((n, s) => n + s.confidence_changed.length, 0);
-  const summaryCount = diff.sections.reduce((n, s) => n + s.summary_changed.length, 0);
-  const hasChanges = addedCount + removedCount + confidenceCount + summaryCount > 0;
+  const {
+    added: addedCount,
+    removed: removedCount,
+    confidenceChanged: confidenceCount,
+    summaryChanged: summaryCount,
+    hasChanges,
+  } = summarizeUnderstandingDiff(diff);
 
   return (
     <Card data-testid="understanding-diff-panel">
@@ -864,6 +887,14 @@ export default function InterviewPage() {
       setSearchParams({ session: String(sortedSessions[0].id) }, { replace: true });
     }
   }, [selectedSessionId, sortedSessions, setSearchParams]);
+
+  // Per-session UI state: switching sessions must not carry over the
+  // previous session's "answers reflected" banner (#136) or last-turn
+  // evidence reads (#137) — both describe events in that session only.
+  useEffect(() => {
+    setAnswerRevisionReflected(false);
+    setLastEvidenceReads([]);
+  }, [selectedSessionId]);
 
   const userMessageCount = useMemo(
     () => (session?.messages ?? []).filter(m => m.role === "user").length,
@@ -1000,14 +1031,12 @@ export default function InterviewPage() {
         if (!diff.has_previous) {
           toast.success("理解を更新しました(初回のリビジョンです)");
         } else {
-          const added = diff.sections.reduce((n, s) => n + s.added.length, 0);
-          const removed = diff.sections.reduce((n, s) => n + s.removed.length, 0);
-          const confidenceChanged = diff.sections.reduce((n, s) => n + s.confidence_changed.length, 0);
-          if (added + removed + confidenceChanged === 0) {
+          const counts = summarizeUnderstandingDiff(diff);
+          if (!counts.hasChanges) {
             toast.success("理解を更新しました(前回からの変化はありません)");
           } else {
             toast.success(
-              `理解を更新しました(追加 ${added} / 削除 ${removed} / 確信度変化 ${confidenceChanged})`,
+              `理解を更新しました(追加 ${counts.added} / 削除 ${counts.removed} / 確信度変化 ${counts.confidenceChanged})`,
             );
           }
         }
