@@ -43,6 +43,7 @@ import { formatTimestamp } from "@/lib/utils";
 import type {
   CurrentUnderstanding,
   GapItem,
+  IntelligenceRunEvidenceOut,
   InterviewMaterializeOut,
   InterviewProposalMetadataBlock,
   InterviewProposalOut,
@@ -844,6 +845,7 @@ export default function InterviewPage() {
   const [editForm, setEditForm] = useState<EditForm | null>(null);
   const [lastMaterialization, setLastMaterialization] = useState<InterviewMaterializeOut | null>(null);
   const [answerRevisionReflected, setAnswerRevisionReflected] = useState(false);
+  const [lastEvidenceReads, setLastEvidenceReads] = useState<IntelligenceRunEvidenceOut[]>([]);
 
   const sortedSessions = useMemo(() => sessions ?? [], [sessions]);
   const proposals = session?.proposals ?? [];
@@ -1029,6 +1031,7 @@ export default function InterviewPage() {
         actor,
       });
       setMessage("");
+      setLastEvidenceReads(result.evidence_reads ?? []);
       if (result.error) toast.error(result.error);
       else if (result.proposals.length) toast.success(`${result.proposals.length}件の提案を生成しました`);
       else toast.success("回答を送信しました");
@@ -1311,6 +1314,22 @@ export default function InterviewPage() {
                               : "回答を送信"}
                         </Button>
                       </div>
+                      {lastEvidenceReads.length > 0 && (
+                        <div
+                          className="rounded-md border p-2 text-[10px] text-muted-foreground font-mono space-y-0.5"
+                          data-testid="evidence-reads-panel"
+                        >
+                          <p className="text-[10px] uppercase font-semibold not-italic">
+                            このターンで参照したコード
+                          </p>
+                          {lastEvidenceReads.map((e, i) => (
+                            <div key={i}>
+                              {e.path}:{e.start_line}-{e.end_line} ({e.char_count} chars)
+                              {e.truncated ? " (truncated)" : ""}
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </>
                   )}
                 </CardContent>

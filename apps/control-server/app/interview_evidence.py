@@ -79,7 +79,16 @@ class EvidenceSnippet:
 
 
 class EvidenceReadError(Exception):
-    """Fail-closed error: the turn must not continue without the snippet."""
+    """Fail-closed error: the turn must not continue without the snippet.
+
+    ``partial_snippets`` carries whatever snippets were successfully read
+    before the failing target, so the caller can still persist an audit of
+    what was actually read (Issue #137) even though the turn fails closed.
+    """
+
+    def __init__(self, message: str, partial_snippets: Optional[List["EvidenceSnippet"]] = None):
+        super().__init__(message)
+        self.partial_snippets: List["EvidenceSnippet"] = partial_snippets or []
 
 
 def validate_evidence_targets(
@@ -134,7 +143,8 @@ def read_evidence_snippets(
             raw = read_file_at_commit(repo_path, commit_sha, target.path)
         except GitError as exc:
             raise EvidenceReadError(
-                f"failed to read evidence '{target.path}' at {commit_sha}: {exc}"
+                f"failed to read evidence '{target.path}' at {commit_sha}: {exc}",
+                partial_snippets=snippets,
             ) from exc
 
         text = raw.decode("utf-8", errors="replace")

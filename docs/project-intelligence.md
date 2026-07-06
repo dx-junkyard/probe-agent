@@ -1017,6 +1017,36 @@ probe_value / state_effects / recommended_mode)と、同じ component_id のト�
 `IntelligenceRun.run_type` への `"runtime_reality_check"` の追加
 ([shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json))。
 
+## パス1で読んだエビデンス全件の監査永続化(Issue #137)
+
+#130 の2パス方式では、パス1が選んだエビデンスをサーバーが pinned snapshot から読み、
+パス2の質問生成に添えるが、従来は「モデルが質問の `evidence_refs` に引用した範囲」
+だけが `interview_qa.evidence_refs[].char_count` として残り、**引用されなかった
+エビデンス**は監査記録に残らなかった。本 issue は読んだ全スニペットを新テーブル
+`intelligence_run_evidence`(System-scoped、この issue が所有)に永続化する。
+
+- 1行 = 読んだ1スニペット(`path` / `start_line` / `end_line` / `char_count` /
+  `truncated`)。スニペット本文は保存しない(サイズ・機密性の観点、Principle 5)。
+  パス1の `intelligence_runs`(`run_type: interview_evidence_selection`)行に
+  `intelligence_run_id` でリンクする。
+- 書き込みは対話ターンの既存トランザクション内で行い、質問への引用の有無に関わらず
+  記録する(raw fact と interpretation の分離)。引用の有無は
+  `interview_qa.evidence_refs` 側の既存表示のまま変更しない。
+- 読み出しが部分的に失敗した場合(`interview_evidence.EvidenceReadError`)は、
+  失敗した対象より前に読めたスニペットを `partial_snippets` として保持し、
+  ターン自体は従来どおり fail-closed のまま、読めた分だけを監査に残す。
+- API: `GET /interview/evidence-runs/{run_id}/evidence`(System 分離、
+  `interview_evidence_selection` run のみ対象、他 run_type/他 System は 404)。
+  対話ターンのレスポンスにも `evidence_reads` として同じ内容を含める
+  (既存の `evidence_used` は変更しない)。
+
+**含まない:** スニペット本文の永続化・再表示、引用されなかったエビデンスの
+`interview_qa.evidence_refs` への混入。
+
+共有スキーマ: `IntelligenceRunEvidence` / `IntelligenceRunEvidenceList`、
+`InterviewDialogueTurnOut.evidence_reads`
+([shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json))。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。

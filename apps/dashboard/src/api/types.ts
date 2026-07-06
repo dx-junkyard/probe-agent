@@ -358,6 +358,29 @@ export interface InterviewDialogueTurnOut {
   // Issue #130: pass-1 evidence-selection audit + what was actually read.
   evidence_run: IntelligenceRunOut | null;
   evidence_used: InterviewQaEvidenceRef[];
+  // Issue #137: every snippet actually read for this turn's evidence-selection
+  // run, regardless of citation. evidence_used above is unchanged.
+  evidence_reads: IntelligenceRunEvidenceOut[];
+}
+
+// --- Evidence read audit (Issue #137) -----------------------------------------
+
+export interface IntelligenceRunEvidenceOut {
+  id: number;
+  system_id: number;
+  intelligence_run_id: number;
+  path: string;
+  start_line: number;
+  end_line: number;
+  char_count: number;
+  truncated: boolean;
+  created_at: number;
+}
+
+export interface IntelligenceRunEvidenceListOut {
+  intelligence_run_id: number;
+  system_id: number;
+  items: IntelligenceRunEvidenceOut[];
 }
 
 // --- Structured Interview Q&A (Issue #129) ----------------------------------

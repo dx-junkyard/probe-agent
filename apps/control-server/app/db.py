@@ -1162,6 +1162,31 @@ CREATE INDEX IF NOT EXISTS idx_understanding_revision_session
 CREATE INDEX IF NOT EXISTS idx_understanding_revision_system
     ON understanding_revision (system_id, session_id);
 
+-- Evidence actually read during pass 1 of the interview dialogue turn
+-- (Issue #137). One row per snippet read from the pinned snapshot,
+-- regardless of whether the resulting question cited it — a raw fact kept
+-- separate from interview_qa.evidence_refs (which only holds cited spans).
+-- Snippet content itself is never persisted (size/confidentiality).
+CREATE TABLE IF NOT EXISTS intelligence_run_evidence (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    intelligence_run_id INTEGER NOT NULL,
+    path                TEXT NOT NULL,
+    start_line          INTEGER NOT NULL,
+    end_line            INTEGER NOT NULL,
+    char_count          INTEGER NOT NULL DEFAULT 0,
+    truncated           INTEGER NOT NULL DEFAULT 0,
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_intelligence_run_evidence_run
+    ON intelligence_run_evidence (intelligence_run_id);
+
+CREATE INDEX IF NOT EXISTS idx_intelligence_run_evidence_system
+    ON intelligence_run_evidence (system_id, intelligence_run_id);
+
 -- Understanding graph snapshots (Issue #79). Persists merged documentation
 -- claim graphs for a system. Each snapshot records the full graph JSON,
 -- source hash, claim count, and confidence summary.

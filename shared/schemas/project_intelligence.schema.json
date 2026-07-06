@@ -882,7 +882,35 @@
         "open_questions_structured": { "type": ["array", "null"], "items": { "type": "object" } },
         "created_qa_ids": { "type": "array", "items": { "type": "integer" } },
         "evidence_run": { "oneOf": [{ "$ref": "#/definitions/IntelligenceRun" }, { "type": "null" }] },
-        "evidence_used": { "type": "array", "items": { "$ref": "#/definitions/InterviewQaEvidenceRef" } }
+        "evidence_used": { "type": "array", "items": { "$ref": "#/definitions/InterviewQaEvidenceRef" } },
+        "evidence_reads": { "type": "array", "items": { "$ref": "#/definitions/IntelligenceRunEvidence" } }
+      },
+      "additionalProperties": false
+    },
+    "IntelligenceRunEvidence": {
+      "type": "object",
+      "description": "One snippet actually read from the pinned snapshot during pass 1 of the interview dialogue turn (Issue #137), regardless of whether the resulting question cited it. Snippet content itself is never persisted.",
+      "required": ["id", "system_id", "intelligence_run_id", "path", "start_line", "end_line", "char_count", "truncated", "created_at"],
+      "properties": {
+        "id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "intelligence_run_id": { "type": "integer" },
+        "path": { "type": "string" },
+        "start_line": { "type": "integer" },
+        "end_line": { "type": "integer" },
+        "char_count": { "type": "integer" },
+        "truncated": { "type": "boolean" },
+        "created_at": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    "IntelligenceRunEvidenceList": {
+      "type": "object",
+      "required": ["intelligence_run_id", "system_id"],
+      "properties": {
+        "intelligence_run_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "items": { "type": "array", "items": { "$ref": "#/definitions/IntelligenceRunEvidence" } }
       },
       "additionalProperties": false
     },

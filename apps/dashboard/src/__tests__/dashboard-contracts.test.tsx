@@ -1492,6 +1492,59 @@ describe("Interview page", () => {
     expect(await screen.findByTestId("answer-revision-reflected-banner")).toBeInTheDocument();
   });
 
+  test("shows all evidence read for a turn, even when uncited (Issue #137)", async () => {
+    mockInterviewApi();
+    mockApi.post.mockResolvedValue({
+      assistant_message: "読みました。",
+      proposals: [],
+      next_questions: [],
+      intelligence_run: null,
+      error: null,
+      stage: "proposal_generation",
+      current_understanding: null,
+      gap_analysis: null,
+      open_questions_structured: [],
+      evidence_run: { id: 99, run_type: "interview_evidence_selection" },
+      evidence_used: [],
+      evidence_reads: [
+        {
+          id: 1, system_id: 1, intelligence_run_id: 99,
+          path: "src/summarize.py", start_line: 1, end_line: 10,
+          char_count: 120, truncated: false, created_at: 1,
+        },
+        {
+          id: 2, system_id: 1, intelligence_run_id: 99,
+          path: "src/classifier.py", start_line: 1, end_line: 3,
+          char_count: 40, truncated: true, created_at: 1,
+        },
+      ],
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const textarea = await screen.findByPlaceholderText(
+      /上の質問への回答や修正点を入力してください。|提案の対象範囲や重視したい観点があれば入力してください。/,
+    );
+    fireEvent.change(textarea, { target: { value: "詳細を教えてください" } });
+    fireEvent.click(screen.getByRole("button", { name: /送信/ }));
+
+    const panel = await screen.findByTestId("evidence-reads-panel");
+    expect(panel.textContent).toContain("src/summarize.py:1-10");
+    expect(panel.textContent).toContain("120 chars");
+    expect(panel.textContent).toContain("src/classifier.py:1-3");
+    expect(panel.textContent).toContain("truncated");
+  });
+
   test("sends edits through the validated edit endpoint and materializes a diff", async () => {
     mockInterviewApi({ approvedCount: 1 });
     mockApi.post.mockImplementation((path: string) => {

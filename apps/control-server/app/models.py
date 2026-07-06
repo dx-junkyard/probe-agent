@@ -2053,6 +2053,36 @@ class InterviewDialogueTurnOut(BaseModel):
     # Issue #130: audit of the pass-1 evidence-selection run, when it ran.
     evidence_run: Optional[IntelligenceRunOut] = None
     evidence_used: List["InterviewQaEvidenceRefOut"] = Field(default_factory=list)
+    # Issue #137: the persisted intelligence_run_evidence rows for this
+    # turn's evidence-selection run — every snippet actually read, whether
+    # or not a question cited it. evidence_used above is unchanged.
+    evidence_reads: List["IntelligenceRunEvidenceOut"] = Field(default_factory=list)
+
+
+# --- Evidence read audit (Issue #137) -----------------------------------------
+#
+# Persists every snippet pass 1 of the interview dialogue turn actually read
+# from the pinned snapshot, linked to the interview_evidence_selection
+# intelligence_runs row — independent of whether the resulting question
+# cited it. Snippet content is never stored (Principle 5/size).
+
+
+class IntelligenceRunEvidenceOut(BaseModel):
+    id: int
+    system_id: int
+    intelligence_run_id: int
+    path: str
+    start_line: int
+    end_line: int
+    char_count: int
+    truncated: bool
+    created_at: float
+
+
+class IntelligenceRunEvidenceListOut(BaseModel):
+    intelligence_run_id: int
+    system_id: int
+    items: List[IntelligenceRunEvidenceOut] = Field(default_factory=list)
 
 
 # --- Structured Interview Q&A (Issue #129) ------------------------------------

@@ -90,6 +90,8 @@ from ..models import (
     InterviewSessionDetailOut,
     InterviewSessionOut,
     InterviewStructuredQuestion,
+    IntelligenceRunEvidenceListOut,
+    IntelligenceRunEvidenceOut,
     IntelligenceRunOut,
     RuntimeRealityCheckItemOut,
     RuntimeRealityCheckRunOut,
@@ -819,10 +821,20 @@ def interview_dialogue_turn(
                         snapshot_row["commit_sha"],
                         evidence_audit.targets,
                     )
-                except (EvidenceReadError, EvidenceConfigError) as exc:
-                    # Fail-closed: no "continue without the snippet" fallback,
-                    # and invalid INTERVIEW_EVIDENCE_* configuration is a
-                    # recorded turn failure, not an unaudited HTTP 500.
+                except EvidenceReadError as exc:
+                    # Fail-closed: no "continue without the snippet" fallback.
+                    # Whatever snippets were read before the failing target
+                    # are kept so they can still be audited (Issue #137).
+                    evidence_snippets = exc.partial_snippets
+                    turn = InterviewTurnResult(
+                        provider=config.provider,
+                        model=config.model,
+                        is_mock=False,
+                        error=str(exc),
+                    )
+                except EvidenceConfigError as exc:
+                    # Invalid INTERVIEW_EVIDENCE_* configuration is a recorded
+                    # turn failure, not an unaudited HTTP 500.
                     turn = InterviewTurnResult(
                         provider=config.provider,
                         model=config.model,
@@ -884,6 +896,41 @@ def interview_dialogue_turn(
                 ).fetchone()
                 evidence_run_out = _intelligence_run_out(evidence_run_row)
 
+            # Issue #137: persist every snippet actually read during pass 1,
+            # linked to its evidence-selection run, regardless of whether the
+            # eventual question cites it or pass 2 later fails. Snippet
+            # content itself is never stored.
+            evidence_reads_out: List[IntelligenceRunEvidenceOut] = []
+            if evidence_audit is not None and evidence_snippets:
+                for snippet in evidence_snippets:
+                    er_cur = conn.execute(
+                        """INSERT INTO intelligence_run_evidence
+                            (system_id, intelligence_run_id, path, start_line,
+                             end_line, char_count, truncated, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            system_id,
+                            ev_cur.lastrowid,
+                            snippet.path,
+                            snippet.start_line,
+                            snippet.end_line,
+                            snippet.char_count,
+                            1 if snippet.truncated else 0,
+                            now,
+                        ),
+                    )
+                    evidence_reads_out.append(IntelligenceRunEvidenceOut(
+                        id=er_cur.lastrowid,
+                        system_id=system_id,
+                        intelligence_run_id=ev_cur.lastrowid,
+                        path=snippet.path,
+                        start_line=snippet.start_line,
+                        end_line=snippet.end_line,
+                        char_count=snippet.char_count,
+                        truncated=snippet.truncated,
+                        created_at=now,
+                    ))
+
             # Store intelligence run (success or failure).
             run_status = "failed" if turn.error else "completed"
             run_cur = conn.execute(
@@ -924,6 +971,7 @@ def interview_dialogue_turn(
                     error=turn.error,
                     intelligence_run=intelligence_run_out,
                     evidence_run=evidence_run_out,
+                    evidence_reads=evidence_reads_out,
                 )
 
             # Store assistant message.
@@ -1187,6 +1235,7 @@ def interview_dialogue_turn(
                 )
                 for s in evidence_snippets
             ],
+            evidence_reads=evidence_reads_out,
         )
 
 
@@ -2293,6 +2342,69 @@ def update_interview_understanding(
 
         row = _get_session_or_404(conn, session_id, system_id)
         return _session_out(row)
+
+
+# --- Evidence read audit (Issue #137) ----------------------------------------
+
+
+@router.get(
+    "/interview/evidence-runs/{run_id}/evidence",
+    response_model=IntelligenceRunEvidenceListOut,
+)
+def list_intelligence_run_evidence(
+    run_id: int,
+    system_id: int = Depends(get_system_id),
+) -> IntelligenceRunEvidenceListOut:
+    """List every snippet read for a pass-1 evidence-selection run.
+
+    Includes snippets not cited by the resulting question — the read audit
+    is independent of citation (Principle 7 raw-fact/interpretation split).
+    Scoped by System; the run must also be an interview_evidence_selection
+    run for this System, or 404.
+
+    probe-agent:
+      role: API boundary for the persisted evidence-read audit
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: Verify reads are listed regardless of citation and are System-isolated
+    """
+    with get_conn() as conn:
+        run_row = conn.execute(
+            """SELECT id FROM intelligence_runs
+               WHERE id = ? AND system_id = ? AND run_type = 'interview_evidence_selection'""",
+            (run_id, system_id),
+        ).fetchone()
+        if run_row is None:
+            raise HTTPException(status_code=404, detail="Evidence-selection run not found")
+
+        rows = conn.execute(
+            """SELECT * FROM intelligence_run_evidence
+               WHERE intelligence_run_id = ? AND system_id = ?
+               ORDER BY id""",
+            (run_id, system_id),
+        ).fetchall()
+
+    return IntelligenceRunEvidenceListOut(
+        intelligence_run_id=run_id,
+        system_id=system_id,
+        items=[
+            IntelligenceRunEvidenceOut(
+                id=r["id"],
+                system_id=r["system_id"],
+                intelligence_run_id=r["intelligence_run_id"],
+                path=r["path"],
+                start_line=r["start_line"],
+                end_line=r["end_line"],
+                char_count=r["char_count"],
+                truncated=bool(r["truncated"]),
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ],
+    )
 
 
 # --- Understanding Revisions (Issue #136) ------------------------------------
