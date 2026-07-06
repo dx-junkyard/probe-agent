@@ -45,6 +45,38 @@ with probe_context(correlation_id="req-abc", flow_id="checkout"):
   `GET /trace-lineage/entities/{type}/{id}`、`/correlations/{id}`、`/flows/{id}` で
   時系列に取得できる。probe が `off` / 無効のときは系譜処理は一切実行されない。
 
+## 宣言的 Projection（Issue #146 / Phase 2）
+
+raw payload を保存せず、宣言的な spec で **入出力の一部だけを構造化して抽出**できる。
+式は安全な有限サブセット（`$.a.b` / `$.items[*].sku` / `[0]` インデックス）に限定し、
+`eval` や任意コード実行は行わない。
+
+```python
+from probe_agent import probe
+
+@probe(component_id="order-service", projection={
+    "name": "orders",
+    "output": {
+        "fields":  {"order_id": "$.order.id", "skus": "$.items[*].sku"},
+        "metrics": {"item_count": {"op": "count", "path": "$.items[*]"}},
+        "samples": {"first_skus": {"path": "$.items[*].sku", "limit": 5}},
+    },
+    "entities": [{"type": "order", "id_path": "$.order.id", "role": "source"}],
+    "redact": ["$.customer.email"],
+})
+def handle(order):
+    ...
+```
+
+- 演算は `len` / `count` / `exists` / `sha256` の有限集合のみ（`op`）。`samples` は先頭 N 件。
+- `entities[].id_path` で抽出したエンティティは Phase 1 の lineage に反映される。
+- `redact` 指定のパスは保存前にプレースホルダへ置換される。
+- 上限超過時は決定的に丸められ `truncated=true` になり、`data_hash` が常に付与される。
+- spec は登録時に検証（**fail closed**、不正な spec は即エラー）。実行時の抽出エラーは
+  **非致命**で、対象関数は動き続け projection のみ診断として落ちる。
+- 入力の root は `{"args": [...], "kwargs": {...}}`、出力の root は戻り値。
+- `set_projection(component_id, spec)` でも登録できる。
+
 ## 環境変数
 
 | 名前 | デフォルト | 説明 |
@@ -55,6 +87,9 @@ with probe_context(correlation_id="req-abc", flow_id="checkout"):
 | `PROBE_POLICY_TTL` | `10` | policy キャッシュ秒数 |
 | `PROBE_HTTP_TIMEOUT` | `2` | HTTP リクエストのタイムアウト秒数 |
 | `PROBE_SHUTDOWN_TIMEOUT` | `10` | atexit 時に shadow 完了を待つ最大秒数 |
+| `PROBE_PROJECTION_MAX_BYTES` | `8192` | projection データの最大バイト数（超過で決定的に truncate） |
+| `PROBE_PROJECTION_MAX_FIELDS` | `64` | projection の最大フィールド数 |
+| `PROBE_PROJECTION_MAX_SAMPLES` | `20` | sample の最大要素数 |
 
 ## 設計メモ
 

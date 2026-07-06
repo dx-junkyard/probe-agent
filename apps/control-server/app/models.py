@@ -8,12 +8,27 @@ GenerationVerdict = Literal["better", "worse", "same", "unsafe", "error", "unkno
 
 
 EntityRole = Literal["source", "derived", "related"]
+# Projection phases: input/output (Issue #146); shadow_* added in Issue #150.
+ProjectionPhase = Literal["input", "output", "shadow_current", "shadow_candidate"]
 
 
 class TraceEntity(BaseModel):
     type: str
     id: str
     role: EntityRole = "related"
+
+
+class TraceProjectionIn(BaseModel):
+    """A projection extraction result attached to a trace (Issue #146)."""
+
+    projection_name: str
+    phase: ProjectionPhase = "output"
+    fields: Dict[str, Any] = Field(default_factory=dict)
+    metrics: Dict[str, Any] = Field(default_factory=dict)
+    samples: Dict[str, Any] = Field(default_factory=dict)
+    data_hash: Optional[str] = None
+    truncated: bool = False
+    error: Optional[str] = None
 
 
 class TraceEvent(BaseModel):
@@ -31,6 +46,22 @@ class TraceEvent(BaseModel):
     flow_id: Optional[str] = None
     correlation_id: Optional[str] = None
     entities: Optional[List[TraceEntity]] = None
+    # Phase 2 projections (Issue #146) — optional extraction results.
+    projections: Optional[List[TraceProjectionIn]] = None
+
+
+class ProjectionOut(BaseModel):
+    trace_id: str
+    component_id: str
+    projection_name: str
+    phase: str
+    fields: Dict[str, Any] = Field(default_factory=dict)
+    metrics: Dict[str, Any] = Field(default_factory=dict)
+    samples: Dict[str, Any] = Field(default_factory=dict)
+    data_hash: Optional[str] = None
+    truncated: bool = False
+    error: Optional[str] = None
+    created_at: float
 
 
 class LineageEntityOut(BaseModel):

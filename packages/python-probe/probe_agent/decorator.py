@@ -10,6 +10,7 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from . import context as _lineage
+from . import projection as _projection
 from .client import ControlClient
 from .config import ProbeConfig
 from .policy import PolicyCache
@@ -20,6 +21,25 @@ _client = ControlClient()
 _policy_cache = PolicyCache(client=_client)
 _candidates: Dict[str, Callable[..., Any]] = {}
 _candidates_lock = threading.Lock()
+
+_projections: Dict[str, "_projection.ProjectionSpec"] = {}
+_projections_lock = threading.Lock()
+
+
+def set_projection(component_id: str, spec: Any) -> None:
+    """Register a projection spec for a component.
+
+    Validates the spec immediately (fail-closed): an invalid spec raises
+    ``ProjectionError`` here, at registration, rather than at trace time.
+    """
+    compiled = _projection.compile_spec(spec)
+    with _projections_lock:
+        _projections[component_id] = compiled
+
+
+def _get_projection(component_id: str) -> "Optional[_projection.ProjectionSpec]":
+    with _projections_lock:
+        return _projections.get(component_id)
 
 _inflight: Set[threading.Thread] = set()
 _inflight_lock = threading.Lock()
@@ -102,6 +122,7 @@ def probe(
     component_id: str,
     candidate: Optional[Callable[..., Any]] = None,
     entities: Optional[List[Any]] = None,
+    projection: Optional[Any] = None,
 ):
     """Wrap a function so its input/output/error/duration are reported.
 
@@ -120,6 +141,9 @@ def probe(
     """
     if candidate is not None:
         set_candidate(component_id, candidate)
+    if projection is not None:
+        # Fail-closed at decoration time on an invalid spec.
+        set_projection(component_id, projection)
     static_entities = _lineage._normalize_entities(entities)
 
     def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -180,6 +204,25 @@ def probe(
                 "timestamp": time.time(),
             }
             trace.update(lineage)
+
+            spec = _get_projection(component_id)
+            if spec is not None:
+                # Extraction is non-fatal: a bad projection must not break the
+                # host function. Input root is a stable {args, kwargs} envelope;
+                # output root is the return value (absent when fn raised).
+                try:
+                    input_root = {"args": list(args), "kwargs": dict(kwargs)}
+                    output_root = _projection._MISSING if raised else output
+                    payloads, proj_entities = _projection.extract(
+                        spec, input_root=input_root, output_root=output_root
+                    )
+                    if payloads:
+                        trace["projections"] = payloads
+                    if proj_entities:
+                        trace["entities"] = list(trace.get("entities", [])) + proj_entities
+                except Exception:  # noqa: BLE001
+                    logger.debug("projection extraction failed", exc_info=True)
+
             try:
                 _client.send_trace(trace)
             except Exception:  # noqa: BLE001

@@ -1173,6 +1173,27 @@ Issue #144 に集約し、実装は以下の sub-issue に依存順で分割し�
   該当トレース + span + entity を timestamp 昇順で返す(System isolation)。
 - Dashboard は未変更(Phase 3 / #147 の領分)。
 
+### Phase 2 実装状態(#146)
+
+- **スキーマ**: `shared/schemas/projection_spec.schema.json`。パス式は安全な有限
+  サブセット(`$.a.b` / `$.items[*].sku` / `[i]`)、演算は `len` / `count` / `exists` /
+  `sha256` の有限集合、出力は `fields` / `metrics` / `samples`。`entities[].id_path` と
+  `redact` を持つ。
+- **SDK 抽出エンジン**(`probe_agent/projection.py`): `eval` なしの決定的パス評価。
+  `@probe(projection=...)` / `set_projection(component_id, spec)` は登録時に **fail
+  closed** で検証。実行時抽出エラーは非致命で projection のみ落として診断に残す。
+  上限(`PROBE_PROJECTION_MAX_BYTES` / `_MAX_FIELDS` / `_MAX_SAMPLES`)超過で決定的に
+  truncate し `truncated` マーカーと `data_hash` を付与。`redact` パスは保存前に
+  置換(copy-on-write でキャラ元データを非破壊)。`id_path` エンティティは Phase 1 の
+  lineage entities にマージされる。入力 root は `{args, kwargs}`、出力 root は戻り値。
+- **永続化**: system-scoped の `trace_projections`(`projection_name` / `phase` /
+  `data_json` / `data_hash` / `truncated` / `extract_error` / `created_at`。`phase` は
+  当面 `input | output`、`shadow_*` は Phase 5/#150 が所有)。raw payload は保存しない。
+  `(system_id, trace_id, component_id, projection_name, phase)` UNIQUE で再 POST 冪等。
+- **API**: `POST /traces` が optional の `projections` を受理、
+  `GET /traces/{trace_id}/projections` と `GET /components/{component_id}/projections`。
+- 新環境変数は README / この節に記載。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。

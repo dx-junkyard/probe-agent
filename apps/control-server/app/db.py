@@ -153,6 +153,31 @@ CREATE INDEX IF NOT EXISTS idx_trace_entities_lookup
 CREATE INDEX IF NOT EXISTS idx_trace_entities_trace
     ON trace_entities (system_id, trace_id);
 
+-- Declarative projections (Issue #146, Phase 2). Stores only the bounded,
+-- structured slice produced by a projection spec — never the raw payload.
+-- phase is 'input' | 'output' here; 'shadow_current' / 'shadow_candidate'
+-- are added by Issue #150 (Phase 5).
+CREATE TABLE IF NOT EXISTS trace_projections (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id       INTEGER NOT NULL,
+    trace_id        TEXT NOT NULL,
+    component_id    TEXT NOT NULL,
+    projection_name TEXT NOT NULL,
+    phase           TEXT NOT NULL,
+    data_json       TEXT NOT NULL,
+    data_hash       TEXT,
+    truncated       INTEGER NOT NULL DEFAULT 0,
+    extract_error   TEXT,
+    created_at      REAL NOT NULL,
+    UNIQUE (system_id, trace_id, component_id, projection_name, phase),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_trace_projections_trace
+    ON trace_projections (system_id, trace_id);
+CREATE INDEX IF NOT EXISTS idx_trace_projections_component
+    ON trace_projections (system_id, component_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS system_profile (
     system_id         INTEGER PRIMARY KEY,
     name              TEXT,
