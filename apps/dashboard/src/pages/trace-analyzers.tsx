@@ -1,6 +1,7 @@
 import { useState } from "react";
 import {
   useAnalyzers, useCreateAnalyzer, useReviewAnalyzer, useRunAnalyzer, useAnalyzerRuns,
+  useProposeAnalyzer,
 } from "@/api/hooks";
 import type { TraceAnalyzer } from "@/api/types";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
@@ -37,11 +38,25 @@ export default function TraceAnalyzersPage() {
   const create = useCreateAnalyzer();
   const review = useReviewAnalyzer();
   const runMut = useRunAnalyzer();
+  const propose = useProposeAnalyzer();
   const [selected, setSelected] = useState<number | null>(null);
   const { data: runs } = useAnalyzerRuns(selected);
 
   const [name, setName] = useState("");
   const [specText, setSpecText] = useState(EXAMPLE_SPEC);
+  const [intent, setIntent] = useState("");
+
+  const doPropose = async () => {
+    if (!intent.trim()) return;
+    try {
+      const created = await propose.mutateAsync({ intent: intent.trim() });
+      toast.success(created.is_mock ? "Proposed (mock)" : "Proposal saved (proposed)");
+      setSelected(created.id);
+      setIntent("");
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
 
   const current = analyzers?.find((a) => a.id === selected);
 
@@ -107,6 +122,30 @@ export default function TraceAnalyzersPage() {
       </div>
 
       <div className="flex-1 overflow-y-auto space-y-6">
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Propose from natural language</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <p className="text-xs text-muted-foreground">
+              A reasoning model turns your intent into a spec. Proposals are saved as
+              <span className="font-medium"> proposed</span> and must be reviewed before they can run —
+              the model never approves anything. Requires a configured reasoning model
+              (fails closed otherwise).
+            </p>
+            <Textarea
+              aria-label="analyzer intent"
+              value={intent}
+              onChange={(e) => setIntent(e.target.value)}
+              rows={2}
+              placeholder="Show me where order o-1's status changed across components"
+            />
+            <Button onClick={doPropose} disabled={propose.isPending} variant="outline">
+              {propose.isPending ? "Proposing…" : "Propose spec"}
+            </Button>
+          </CardContent>
+        </Card>
+
         <Card>
           <CardHeader>
             <CardTitle className="text-base">Create analyzer (manual)</CardTitle>

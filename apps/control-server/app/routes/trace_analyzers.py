@@ -12,8 +12,10 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from ..auth import get_system_id
 from ..db import get_conn
+from ..llm import LLMConfig, LLMError, create_llm_client
 from ..models import (
     AnalysisRunOut,
+    AnalyzerProposeRequest,
     AnalyzerReviewUpdate,
     TraceAnalyzerCreate,
     TraceAnalyzerOut,
@@ -23,6 +25,12 @@ from ..trace_analyzer import (
     AnalyzerSpecError,
     compile_spec,
     run_analyzer,
+)
+from ..trace_analyzer_proposer import (
+    PROMPT_VERSION,
+    SCHEMA_VERSION,
+    build_proposal_context,
+    propose,
 )
 
 router = APIRouter()
@@ -87,6 +95,74 @@ def create_analyzer(
                 json.dumps(body.spec, ensure_ascii=False),
                 now,
                 now,
+            ),
+        )
+        row = _fetch_analyzer(conn, system_id, cur.lastrowid)
+    return _row_to_analyzer(row)
+
+
+def _record_run(conn, system_id, run_type, provider, model, is_mock, status, error):
+    """Persist a reasoning-run audit row (snapshot-less; Issue #149)."""
+    now = time.time()
+    conn.execute(
+        """
+        INSERT INTO intelligence_runs
+            (system_id, snapshot_id, run_type, provider, model, prompt_version,
+             schema_version, decision_method, status, error_details, is_mock,
+             started_at, completed_at)
+        VALUES (?, NULL, ?, ?, ?, ?, ?, 'reasoning_llm', ?, ?, ?, ?, ?)
+        """,
+        (
+            system_id, run_type, provider, model, PROMPT_VERSION, SCHEMA_VERSION,
+            status, error, 1 if is_mock else 0, now, now,
+        ),
+    )
+
+
+@router.post("/trace-analyzers/propose", status_code=201, response_model=TraceAnalyzerOut)
+def propose_analyzer(
+    body: AnalyzerProposeRequest, system_id: int = Depends(get_system_id)
+) -> TraceAnalyzerOut:
+    """Propose an analyzer spec from a natural-language intent via a reasoning
+    model. Fails closed (422) with an audited failed run on any error; a
+    successful proposal is saved as ``proposed`` (never auto-approved)."""
+    config = LLMConfig.intelligence_from_env()
+    with get_conn() as conn:
+        ctx = build_proposal_context(conn, system_id)
+
+        # Client creation can fail closed (e.g. missing API key). Record it.
+        try:
+            client = create_llm_client(config)
+        except LLMError as exc:
+            _record_run(conn, system_id, "analyzer_proposal", config.provider,
+                        config.model, False, "failed", str(exc))
+            raise HTTPException(422, f"reasoning model not configured: {exc}")
+
+        result = propose(client, config, body.intent, ctx)
+
+        if result.error or result.spec is None:
+            _record_run(conn, system_id, "analyzer_proposal", result.provider,
+                        result.model, result.is_mock, "failed", result.error)
+            raise HTTPException(422, f"proposal failed: {result.error}")
+
+        _record_run(conn, system_id, "analyzer_proposal", result.provider,
+                    result.model, result.is_mock, "completed", None)
+
+        now = time.time()
+        cur = conn.execute(
+            """
+            INSERT INTO trace_analyzers
+                (system_id, name, intent, spec_json, source, review_status,
+                 decision_method, provider, model, prompt_version, schema_version,
+                 is_mock, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'trace_projections', 'proposed', 'reasoning_llm',
+                    ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                system_id, body.name, body.intent,
+                json.dumps(result.spec, ensure_ascii=False),
+                result.provider, result.model, result.prompt_version,
+                result.schema_version, 1 if result.is_mock else 0, now, now,
             ),
         )
         row = _fetch_analyzer(conn, system_id, cur.lastrowid)

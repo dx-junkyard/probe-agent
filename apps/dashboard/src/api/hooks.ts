@@ -170,6 +170,16 @@ export function useRunAnalyzer() {
   });
 }
 
+// LLM-assisted proposal (Issue #149)
+export function useProposeAnalyzer() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { intent: string; name?: string }) =>
+      api.post<TraceAnalyzer>("/trace-analyzers/propose", body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("trace-analyzers") }),
+  });
+}
+
 export function useShadowResults(componentId: string | null, limit = 50) {
   return useQuery({
     queryKey: [...sysKey("shadow"), componentId, limit],

@@ -3373,4 +3373,31 @@ describe("Trace Analyzers page", () => {
       );
     });
   });
+
+  test("proposing from natural language posts the intent and marks mock", async () => {
+    const proposed = {
+      ...analyzer, id: 9, decision_method: "reasoning_llm", is_mock: true,
+      provider: "mock", model: "mock",
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/trace-analyzers") return Promise.resolve([proposed]);
+      return Promise.resolve([]);
+    });
+    mockApi.post.mockResolvedValue(proposed);
+    const { default: Page } = await import("@/pages/trace-analyzers");
+    render(<Page />, { wrapper: createWrapper() });
+
+    fireEvent.change(screen.getByLabelText("analyzer intent"), {
+      target: { value: "where did order o-1 status change" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Propose spec/ }));
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/trace-analyzers/propose",
+        expect.objectContaining({ intent: "where did order o-1 status change" }),
+      );
+    });
+    // The proposed analyzer surfaces its reasoning-model + mock provenance.
+    expect(await screen.findByText(/Proposed by a reasoning model/)).toBeInTheDocument();
+  });
 });

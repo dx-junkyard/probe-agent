@@ -55,6 +55,7 @@ uvicorn app.main:app --reload --port 8000
 | GET  | `/traces/{trace_id}/projections` | trace の projection 取得(#146) |
 | GET  | `/components/{id}/projections` | component の projection 一覧(#146) |
 | POST | `/trace-analyzers` | analyzer 手動作成(schema 検証 fail-closed、#148) |
+| POST | `/trace-analyzers/propose` | 自然言語 → reasoning model → schema+実在検証 → proposed 保存(#149) |
 | GET  | `/trace-analyzers` / `/trace-analyzers/{id}` | analyzer 一覧・取得(#148) |
 | PUT  | `/trace-analyzers/{id}/review` | proposed→approved/rejected(#148) |
 | POST | `/trace-analyzers/{id}/runs` | approved のみ read-only 実行(#148) |

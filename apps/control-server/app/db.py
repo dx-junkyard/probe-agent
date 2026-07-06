@@ -363,7 +363,9 @@ CREATE INDEX IF NOT EXISTS idx_snapshot_files_snapshot
 CREATE TABLE IF NOT EXISTS intelligence_runs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     system_id       INTEGER NOT NULL,
-    snapshot_id     INTEGER NOT NULL,
+    -- Nullable since Issue #149: reasoning runs that are not tied to a
+    -- repository snapshot (e.g. analyzer proposals over runtime traces).
+    snapshot_id     INTEGER,
     run_type        TEXT NOT NULL,
     provider        TEXT NOT NULL,
     model           TEXT NOT NULL,
@@ -1613,10 +1615,71 @@ def _migrate_to_system_scope(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA foreign_keys=ON")
 
 
+def _migrate_intelligence_runs_snapshot_nullable(conn: sqlite3.Connection) -> None:
+    """Relax intelligence_runs.snapshot_id to nullable on pre-existing DBs
+    (Issue #149). Fresh DBs already get the nullable column from SCHEMA.
+
+    Uses the safe SQLite table-rebuild with legacy_alter_table so child FK
+    references to intelligence_runs are not rewritten during the rename.
+    """
+    info = conn.execute("PRAGMA table_info(intelligence_runs)").fetchall()
+    snap = next((c for c in info if c["name"] == "snapshot_id"), None)
+    if snap is None or snap["notnull"] == 0:
+        return  # already nullable (or table missing)
+
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("PRAGMA legacy_alter_table=ON")
+    try:
+        conn.execute("ALTER TABLE intelligence_runs RENAME TO _intelligence_runs_old")
+        conn.execute(
+            """
+            CREATE TABLE intelligence_runs (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                system_id       INTEGER NOT NULL,
+                snapshot_id     INTEGER,
+                run_type        TEXT NOT NULL,
+                provider        TEXT NOT NULL,
+                model           TEXT NOT NULL,
+                prompt_version  TEXT NOT NULL,
+                schema_version  TEXT NOT NULL,
+                decision_method TEXT NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                error_details   TEXT,
+                is_mock         INTEGER NOT NULL DEFAULT 0,
+                started_at      REAL NOT NULL,
+                completed_at    REAL,
+                FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+                FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO intelligence_runs
+                (id, system_id, snapshot_id, run_type, provider, model,
+                 prompt_version, schema_version, decision_method, status,
+                 error_details, is_mock, started_at, completed_at)
+            SELECT id, system_id, snapshot_id, run_type, provider, model,
+                   prompt_version, schema_version, decision_method, status,
+                   error_details, is_mock, started_at, completed_at
+            FROM _intelligence_runs_old
+            """
+        )
+        conn.execute("DROP TABLE _intelligence_runs_old")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_intelligence_runs_system "
+            "ON intelligence_runs (system_id, id DESC)"
+        )
+    finally:
+        conn.execute("PRAGMA legacy_alter_table=OFF")
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
 def init_db() -> None:
     with get_conn() as conn:
         _migrate_to_system_scope(conn)
         conn.executescript(SCHEMA)
+        _migrate_intelligence_runs_snapshot_nullable(conn)
         if "content" not in _columns(conn, "snapshot_files"):
             conn.execute(
                 "ALTER TABLE snapshot_files ADD COLUMN content BLOB NOT NULL DEFAULT X''"

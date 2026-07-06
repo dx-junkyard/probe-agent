@@ -117,6 +117,11 @@ class AnalyzerReviewUpdate(BaseModel):
     review_status: Literal["approved", "rejected"]
 
 
+class AnalyzerProposeRequest(BaseModel):
+    intent: str = Field(..., min_length=1)
+    name: str = ""
+
+
 class TraceAnalyzerOut(BaseModel):
     id: int
     name: str = ""

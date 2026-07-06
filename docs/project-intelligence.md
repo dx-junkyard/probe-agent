@@ -1238,6 +1238,33 @@ Issue #144 に集約し、実装は以下の sub-issue に依存順で分割し�
 - 新環境変数は README / この節に記載。`compare` の実行が Phase 5 の非目標である
   ことをコードコメントとスキーマ description で明示。
 
+### Phase 4b 実装状態(#149)
+
+- **提案**(`app/trace_analyzer_proposer.py`): 自然言語 intent + 決定的コンテキスト
+  (対象 system の component_id / entity type / projection 名 / field 名 / phase の
+  実在一覧)を reasoning model に渡し、structured output を
+  `trace_analyzer_spec` として検証 → **実在チェック**(存在しない component /
+  entity type / projection name / field を参照する提案は決定的に reject)→ 合格した
+  spec を `review_status=proposed` / `decision_method=reasoning_llm` で保存。
+- **fail closed**: reasoning model 未設定(API key 欠如で client 生成失敗)・API
+  失敗・JSON でない・schema 検証失敗・実在チェック失敗はすべて **422 で失敗**し
+  heuristic フォールバックしない。失敗も含め監査記録を残す。
+- **mock**: `LLM_PROVIDER=mock` は smoke 用の明示経路。コンテキストから決定的に
+  spec を生成し `is_mock=1` を全面に付与(UI / API で mock と明示)。
+- **監査**: 成功・失敗とも `intelligence_runs`(`run_type='analyzer_proposal'`、
+  `decision_method='reasoning_llm'`、provider / model / prompt_version /
+  schema_version / status / error_details / is_mock)に永続化。analyzer 提案は
+  repository snapshot に紐づかないため `intelligence_runs.snapshot_id` を
+  **nullable 化**(既存 DB は安全な table-rebuild で移行、fresh DB は SCHEMA から)。
+  成功時は `trace_analyzers` にも provider/model/prompt/schema/is_mock を保存。
+- **承認ゲート**: 提案は既存 `PUT /trace-analyzers/{id}/review` でのみ approved に
+  なり、LLM 出力単体では実行可能にならない(#148 のゲートを再利用)。
+- **Dashboard**: Trace Analyzers ページに「Propose from natural language」入力を
+  追加。提案の provenance(reasoning_llm / mock バッジ)と review 必須を明示。
+- **API**: `POST /trace-analyzers/propose`。既存 `app/llm.py` の provider 抽象と
+  mock を再利用。prompt/schema version は `analyzer-propose-v1` /
+  `trace-analyzer-spec-v1`。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。
