@@ -830,6 +830,257 @@ Decision Workspace の #36（Context Pack Builder）と同じ位置づけ。pin 
   / `InterviewEvidenceLocation`
   （[shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json)）。
 
+## インタビューの構造化 Q&A（Issue #129）
+
+対話ターン（Issue #69）の `interview_message` は会話ログの生記録であり、質問と回答の
+対応関係を持たない。回答は `interview_session.open_questions` という JSON blob 上で
+質問文の完全一致マッチにより消費されており、後から回答を訂正する手段がなかった。
+本 issue は ID を持つ Q&A ペアの層を、既存の会話ログ・`open_questions` の**上に**追加する
+（`interview_message` / `open_questions` は移行期間中そのまま残す）。
+
+新テーブル `interview_qa`（System-scoped、この issue が所有）:
+
+- `question_text` / `question_category`（`purpose|capability|api|probe_flow|general`）/
+  `question_source`（`reviewer|dialogue|zero_base`）— いずれも有限集合（Principle 6）。
+- `hypothesis` / `evidence_refs`（#128 の仮説・根拠と同形。#130 が実際に読んだ範囲の
+  `char_count` を追加で保持する）。
+- `answer_text` / `status`（`open|answered|revised|skipped`）/ `answered_by` /
+  `superseded_by_id`。
+
+**回答の修正は UPDATE ではなく新リビジョン行の追加。** 最初の回答は `open`/`skipped` の
+行に直接記録するが（供養する対象がまだ無い）、既に `answered` の行を訂正する場合は
+新しい行を `answered` として挿入し、旧行を `revised` にして `superseded_by_id` で新行へ
+リンクする。旧回答は削除・上書きされず監査可能なまま残る（Principle 7）。
+
+副作用として `interview_session.answers_revised_at` を立てる。これは Dashboard に
+「理解を再構築してください」バナーを出すためのフラグで、**理解の再構築が成功した時のみ**
+クリアされる（修正そのものでは自動的にクリアしない）。同様に、そのセッションに
+生成済み提案（`interview_proposal`）が存在する場合は回答レスポンスに
+`regeneration_recommended: true` を返すが、既存の提案は自動では無効化・再生成されない。
+
+対話ターン（`POST /interview/sessions/{id}/dialogue-turn`）は次を行う:
+
+1. モデルが返した `next_questions` を `question_source: "dialogue"` の `interview_qa`
+   行として作成し、新規作成された ID を `created_qa_ids` として返す。既存の現行行と
+   質問文が完全一致する場合は再挿入せず既存 ID を再利用する（構造的な完全一致
+   dedupe、Principle 6）。移行期間中も残る `open_questions` JSON の各エントリには
+   対応する `qa_id` を持たせ、Dashboard は ID で回答対象を指定する。
+2. `answered_question`（テキスト完全一致、#123）に加えて `answered_qa_id`(ID 参照)を
+   受け付ける。ID 参照は言い換えに強く、存在しない/既に回答済みの ID は無視されターン
+   自体は失敗しない。テキスト一致は移行期間中は併存するが(その場合も一致した
+   エントリの `qa_id` 行が answered に同期される)、いずれ削除される。
+3. 回答済み Q&A の最新リビジョン一覧を対話プロンプトに
+   「確定事実として再質問しない」指示付きで注入する(prompt `interview-v5`)。
+   意味レベルの重複質問の抑止は reasoning model への指示で行い、
+   類似度ヒューリスティックでは行わない(Principle 6)。
+
+理解構築(`POST .../update-understanding`)は reviewer の `open_questions` を
+`question_source: "reviewer"` の `interview_qa` 行として登録し(同じく完全一致
+dedupe)、`open_questions` JSON のエントリに `qa_id` を付与する。また理解レビュー
+自体を `run_type: understanding_review` の `intelligence_runs` 行として成功・失敗
+ともに記録し、生成/失敗メッセージを run にリンクする(Principle 7)。
+
+エンドポイント: `GET/POST /interview/sessions/{id}/qa`,
+`POST .../qa/{qa_id}/answer|skip|resume`。旧セッション（`interview_qa` 行が無い）は
+一覧が空になるだけで、バックフィルは行わない。
+
+**含まない:** 回答内容の自動解釈、質問の類似度マッチングによる自動重複排除、提案の
+自動再生成・自動無効化。
+
+共有スキーマ: `InterviewQA` / `InterviewQaEvidenceRef` / `InterviewQaAnswerOut`
+（[shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json)）。
+
+## サーバー生成固定文言の INTERVIEW_LANGUAGE 対応(Issue #138)
+
+#127 は LLM 生成テキストの出力言語を `INTERVIEW_LANGUAGE`(既定 `ja`)に従わせたが、
+サーバー自身が `interview_message` / `interview_session` に書き込む固定文言(LLM 出力
+ではない、例: 「理解の更新に失敗しました: …」「これまでの回答内容を確定し、提案生成
+に進みます。」)は日本語固定のままだった。本 issue は `interview_language.py` に
+有限のメッセージキー × 言語のテーブル `INTERVIEW_MESSAGES` と、テーブル参照のみで
+文言を選ぶ `interview_message(key, language, **kwargs)` を追加し、
+`routes/interview.py` の対象文言をすべて置き換える。
+
+- 対象: 理解更新の失敗(LLM設定エラー / 理解グラフ未構築 / レビュー失敗)・成功時の
+  要約メッセージ(ラベル「システムの目的」「主要機能」「主な確認事項」「推奨される
+  次のステップ」を含む)・confirm-understanding の挿入メッセージ。
+- 文言選択は決定的なテーブル参照のみ(Principle 6)。翻訳 API・推測は使わない。
+  `INTERVIEW_MESSAGES` の全キーが `ja`/`en` 両方を持つことをテストで網羅チェックする。
+- **不正な `INTERVIEW_LANGUAGE` への対処**: `resolve_message_language()` は
+  `get_interview_language()` が `ValueError` を投げた場合、固定文言の組み立てに限り
+  `ja` へ決定的にフォールバックする。これは reasoning 呼び出し
+  (`generate_understanding_review` 内の `get_interview_language()`)の fail-closed
+  挙動(#127 実装済み)を変更しない——設定不備はこれまでどおり `review.error` として
+  報告され続けるが、その**報告メッセージ自体の組み立て**が同じ設定不備で壊れないように
+  するための例外的なフォールバックである。
+
+**含まない:** Dashboard 側文言の多言語化、`ja`/`en` 以外の言語追加。
+
+## 質問前の軽量エビデンス調査（Issue #130）
+
+#128 で対話ターンは仮説を持つが、確信度が低い論点ではシンボル名と行範囲だけを根拠に
+質問してしまう。本 issue は対話ターンを決定的な2パス構成に分割し、質問を出す前に
+pinned snapshot のソース断片を有界に読めるようにする。
+
+- **パス1（`interview_agent.select_evidence_targets`, reasoning_llm）**: 「次の質問の
+  ために読みたい `(path, start_line, end_line)` を最大 `MAX_EVIDENCE_TARGETS`(10) 件選ぶ、
+  または `need_evidence: false` で不要と宣言する」構造化出力を要求する。`path` は
+  context pack / current understanding に存在するものに限定し、範囲外の参照は
+  `interview_agent._allowed_evidence_spans` と同じ許可集合で検証エラーとして fail する。
+- **取得（`interview_evidence.read_evidence_snippets`, deterministic）**: 検証済みの
+  対象を `git_ops.read_file_at_commit`（pinned commit からのみ、Principle 5）で読み出す。
+  1ファイルあたりの行数上限（`INTERVIEW_EVIDENCE_MAX_LINES_PER_FILE`、既定 200）と
+  合計文字数バジェット（`INTERVIEW_EVIDENCE_MAX_CHARS`、既定 20000）、ファイル数上限
+  （`INTERVIEW_EVIDENCE_MAX_FILES`、既定 5）で抑制する。読み出し失敗（存在しない
+  パス・git エラー）はターン全体を fail-closed にする — スニペット無しでの続行は
+  存在しない（パス1が明示的に「不要」と宣言した場合のみスニペット無しで正常に進む）。
+- **パス2（既存の `interview_agent.generate_interview_turn`）**: 読んだスニペットを
+  プロンプトに追加し、#128 の仮説+確認質問を生成する。質問の `evidence_refs` は
+  スニペットの範囲も引用可能になり、実際に読んだ範囲と一致すれば `interview_qa` の
+  `evidence_refs[].char_count` に反映される。
+- **監査**: パス1・パス2は別々の `intelligence_runs` 行として記録する
+  (`run_type`: `interview_evidence_selection` / `interview_dialogue`)。
+  対話ターンのレスポンスにも `evidence_run` / `evidence_used` として両方を返す。
+
+判断区分: どこを読むか・質問内容は reasoning_llm。読めるか（実在・範囲・バジェット）は
+deterministic。読んだスニペットは raw fact として保存され、LLM の解釈とは分離される。
+
+**含まない:** 自由なツールユースループ、working tree・未コミット内容の読み出し、
+読んだ内容に基づく提案の自動生成、対象リポジトリへの書き込み。
+
+## 理解のリビジョンと差分レビュー(Issue #136)
+
+`interview_session.current_understanding` は「理解を更新」のたびに**上書き**されており、
+回答が理解にどう反映されたかが見えなかった。本 issue は新テーブル
+`understanding_revision`(System-scoped、この issue が所有)を追加し、
+`update-understanding` が成功するたびに1行追記する(上書きしない)。各行は
+`intelligence_runs`(`run_type: understanding_review`)の該当 run に
+`intelligence_run_id` でリンクし、「どの reasoning run が生んだ理解か」を
+監査可能にする(Principle 7)。
+
+- **決定的な構造差分(deterministic, `app/understanding_diff.py`)**: 6セクション
+  (`system_purpose` / `core_capabilities` / `capability_elements` /
+  `supporting_elements` / `api_boundaries` / `probe_flow_candidates`)ごとに、
+  項目 `name` の完全一致のみで対応付け、追加 / 削除 / `confidence.level` の変化 /
+  `summary` の変化有無を算出する。リネームは「削除+追加」として現れる
+  (意味的な同一性判定はしない、Principle 6)。差分は常にオンデマンド計算で
+  保存しない(常に再現可能)。
+- **エンドポイント**: `GET /interview/sessions/{id}/understanding-revisions`
+  (新しい順の一覧)、`GET /interview/sessions/{id}/understanding-diff?from=&to=`
+  (`to` 省略時は最新リビジョン、`from` 省略時は `to` の直前リビジョン)。
+  比較対象となる前リビジョンが無い場合(そのセッションの初回リビジョン、または
+  リビジョンが1件も無い場合)は `has_previous: false` かつ `sections: []` を返す
+  ——「全項目が追加された」という誤った差分にはしない。
+- **既存セッションの初回リビジョン化**: この機能より前に理解を構築済みで
+  リビジョン行が1件も無いセッションは、次の `update-understanding` 成功時に、
+  上書き前の `current_understanding` を「初回リビジョン」として先に追記してから
+  新しいリビジョンを追記する(この初回行に対応する reasoning run は無いため
+  `intelligence_run_id` は NULL)。これにより「今回の更新でどこが変わったか」を
+  失わずに差分できる。全既存セッションの一括バックフィルはしない。
+- **保持上限**: `INTERVIEW_UNDERSTANDING_REVISION_LIMIT`(既定 20)を超えた古い
+  リビジョンは追記のたびに決定的にローテーション削除される。削除は
+  `intelligence_runs` に記録しない(監査対象は生成イベントであって、保持
+  ローテーションではないため)。
+- Dashboard: 「理解を更新」実行後、直前リビジョンとの差分サマリー(追加/削除/
+  確信度変化の件数)をトースト表示し、詳細差分(セクションごとの追加=緑・
+  削除=赤・確信度変化バッジ)を展開できる。回答修正(#129
+  `answers_revised_at`)からの再構築後は、その文脈を明示するメッセージを添える。
+
+**含まない:** LLM による差分の要約・解釈、理解の巻き戻し(閲覧のみ)、
+提案・メタデータへの影響伝播の自動化。
+
+共有スキーマ: `UnderstandingRevision` / `UnderstandingRevisionList` /
+`UnderstandingDiff` / `UnderstandingDiffSection` / `UnderstandingDiffConfidenceChange`
+([shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json))。
+
+## Runtime Reality Check（Issue #135）
+
+#129/#130 までの Q&A 層は静的な情報(docs / code / 会話)しか見ておらず、`@probe`
+が集めた実行時トレース(入出力・エラー・実行時間)は理解のレイヤーに一切還流して
+いなかった。本 issue は承認済みの `probe-agent:` メタデータ / probe plan(role /
+probe_value / state_effects / recommended_mode)と、同じ component_id のトレース
+決定的集計を突合し、ズレの可能性がある論点を確認質問として `interview_qa`
+(`question_source: "runtime"`)に返す。
+
+判断区分(Principle 6):
+
+- **集計(deterministic, `app/runtime_reality.py` の `aggregate_component_facts`)**:
+  対象 System の `traces` テーブルから、直近 `RUNTIME_REALITY_CHECK_WINDOW_DAYS`
+  (既定 7)日分の呼び出し数・エラー率・duration の p50/p90/p99・最終観測時刻を
+  数値集計するだけ。トレースが1件も無い場合は `has_traces: false` で数値項目は
+  null になる(「承認済み probe plan にトレースが無い」の生の事実)。解釈は
+  一切行わない。System 分離は `system_id` での WHERE 句のみで保証する。
+- **突合(reasoning_llm, `generate_runtime_reality_check`)**: 集計事実 + 承認済み
+  メタデータを入力に、「ズレの可能性があり確認する価値のある論点」を最大
+  `MAX_RUNTIME_QUESTIONS`(5)件、構造化出力で選ばせる。プロンプトに注入する
+  集計+メタデータの JSON は `RUNTIME_REALITY_CHECK_MAX_CHARS`(既定 8000)で
+  明示的にバジェット制限する(既存の `INTERVIEW_*_MAX_CHARS` パターン)。応答が参照する
+  `component_id`/`qualified_name` は入力に存在するものへの完全一致でなければ
+  fail-closed(存在しないシンボルの捏造を防ぐ、Principle 6)。モック/非推論
+  モデル・API エラー・構造化出力検証失敗は、いずれもヒューリスティックな
+  代替質問を生成せず run failed として記録される。
+
+対象 component_id と承認済みメタデータの対応付けは、materialization(#71)が
+書き込むのと同じ決定的変換(`routes/interview.py` の `_component_id_for`、
+`qualified_name.replace(".", "_")`)を両者で共有して行う。曖昧マッチはしない。
+
+エンドポイント:
+
+- `GET /interview/sessions/{id}/runtime-facts` — 集計のみ(reasoning 呼び出しなし、
+  `intelligence_runs` にも記録しない)。承認済み要素ごとの declared メタデータと
+  facts を返す。
+- `POST /interview/sessions/{id}/runtime-reality-check` — 手動実行のみ(定期実行や
+  自動スケジューリングはしない)。実行のたびに成功・失敗を問わず
+  `run_type: "runtime_reality_check"` の `intelligence_runs` 行を記録する
+  (Principle 7)。失敗時は `interview_qa` 行を一切作らない(fail-closed)。
+  そのセッションに未回答の `question_source: "runtime"` 質問が既に存在する場合は
+  ノイズ抑制のため実行を抑止し(`skipped: true`)、`intelligence_runs` 行も作らない。
+
+生成された質問は通常の `interview_qa` 行(`question_source: "runtime"`)として
+登録され、回答は他の Q&A と同様に扱われる(理解の反映は「理解を更新」を通じてのみ
+発生し、自動では反映されない)。根拠は `evidence_refs`(コード行範囲、runtime 質問
+では空)とは別に新しい `runtime_evidence` カラム(JSON)に保存し、参照した集計値
+(生の数値)とメタデータの出典(`path` / `qualified_name` / `proposal_id` /
+`decision_id`)をそのまま質問カードに表示できるようにする。
+
+**含まない:** メタデータ・probe plan・policy の自動更新、トレースの自動評価・
+スコアリング(#9 の領分)、定期実行・自動スケジューリング、閾値ヒューリスティック
+による「ズレ確定」判定。
+
+共有スキーマ: `RuntimeTraceFacts` / `RuntimeRealityCheckItem` / `RuntimeRealityFacts`
+/ `RuntimeRealityCheckRun`、`InterviewQA.question_source` への `"runtime"` の追加、
+`IntelligenceRun.run_type` への `"runtime_reality_check"` の追加
+([shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json))。
+
+## パス1で読んだエビデンス全件の監査永続化(Issue #137)
+
+#130 の2パス方式では、パス1が選んだエビデンスをサーバーが pinned snapshot から読み、
+パス2の質問生成に添えるが、従来は「モデルが質問の `evidence_refs` に引用した範囲」
+だけが `interview_qa.evidence_refs[].char_count` として残り、**引用されなかった
+エビデンス**は監査記録に残らなかった。本 issue は読んだ全スニペットを新テーブル
+`intelligence_run_evidence`(System-scoped、この issue が所有)に永続化する。
+
+- 1行 = 読んだ1スニペット(`path` / `start_line` / `end_line` / `char_count` /
+  `truncated`)。スニペット本文は保存しない(サイズ・機密性の観点、Principle 5)。
+  パス1の `intelligence_runs`(`run_type: interview_evidence_selection`)行に
+  `intelligence_run_id` でリンクする。
+- 書き込みは対話ターンの既存トランザクション内で行い、質問への引用の有無に関わらず
+  記録する(raw fact と interpretation の分離)。引用の有無は
+  `interview_qa.evidence_refs` 側の既存表示のまま変更しない。
+- 読み出しが部分的に失敗した場合(`interview_evidence.EvidenceReadError`)は、
+  失敗した対象より前に読めたスニペットを `partial_snippets` として保持し、
+  ターン自体は従来どおり fail-closed のまま、読めた分だけを監査に残す。
+- API: `GET /interview/evidence-runs/{run_id}/evidence`(System 分離、
+  `interview_evidence_selection` run のみ対象、他 run_type/他 System は 404)。
+  対話ターンのレスポンスにも `evidence_reads` として同じ内容を含める
+  (既存の `evidence_used` は変更しない)。
+
+**含まない:** スニペット本文の永続化・再表示、引用されなかったエビデンスの
+`interview_qa.evidence_refs` への混入。
+
+共有スキーマ: `IntelligenceRunEvidence` / `IntelligenceRunEvidenceList`、
+`InterviewDialogueTurnOut.evidence_reads`
+([shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json))。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。

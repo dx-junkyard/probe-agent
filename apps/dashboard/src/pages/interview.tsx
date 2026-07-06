@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import {
@@ -7,6 +7,7 @@ import {
   Sparkles, XCircle,
 } from "lucide-react";
 import {
+  useAnswerInterviewQa,
   useApproveInterviewProposal,
   useConfirmInterviewUnderstanding,
   useCreateInterviewSession,
@@ -14,14 +15,20 @@ import {
   useInterviewApprovedSet,
   useInterviewContextPack,
   useInterviewDialogueTurn,
+  useInterviewQaList,
   useInterviewSession,
   useInterviewSessions,
   useLatestSnapshot,
   useMaterializeInterview,
   useRejectInterviewProposal,
+  useResumeInterviewQa,
+  useRunRuntimeRealityCheck,
+  useSkipInterviewQa,
+  useUnderstandingDiff,
   useUpdateInterviewUnderstanding,
 } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
+import { api } from "@/api/client";
 import { DiagnosticFixCallout } from "@/components/diagnostic-fix";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -36,10 +43,13 @@ import { formatTimestamp } from "@/lib/utils";
 import type {
   CurrentUnderstanding,
   GapItem,
+  IntelligenceRunEvidenceOut,
   InterviewMaterializeOut,
   InterviewProposalMetadataBlock,
   InterviewProposalOut,
   InterviewProposalProbePlan,
+  InterviewQaOut,
+  InterviewQuestionEvidenceRef,
   InterviewSessionDetailOut,
   InterviewStage,
   OpenQuestion,
@@ -49,6 +59,7 @@ import type {
   SourceMetadataElementType,
   SourceMetadataOperationKind,
   SourceMetadataStateEffect,
+  UnderstandingDiffOut,
   UnderstandingItem,
 } from "@/api/types";
 
@@ -191,6 +202,19 @@ function buildConfirmationPrompt(u: CurrentUnderstanding): string {
     "この理解は今回のセッションの対象として正しいですか?違う場合は、修正・絞り込みすべき点を教えてください。"
   );
 }
+
+// 現在ユーザーに提示する1つの質問。仮説・根拠・クイック回答候補を持つ
+// (Issue #128)。confirmable のとき「はい/いいえ」クイック回答を表示する。
+type FocusedQuestion = {
+  text: string;
+  hypothesis?: string | null;
+  evidenceRefs?: InterviewQuestionEvidenceRef[];
+  answerOptions?: string[];
+  confirmable: boolean;
+};
+
+const QUICK_ANSWER_YES = "はい、その理解で正しいです。";
+const QUICK_ANSWER_NO_PREFIX = "いいえ、正しくありません。修正点: ";
 
 function provenanceVariant(value: string) {
   if (value === "manual") return "success" as const;
@@ -449,6 +473,353 @@ function UnderstandingPanel({ understanding }: { understanding: CurrentUnderstan
   );
 }
 
+// Q&A一覧パネル(Issue #129)。会話ログとは別に、質問・回答をIDベースで
+// 一覧・編集・スキップできる。回答の修正は新しいリビジョン行として保存され、
+// 旧回答も previous として残る(上書きしない)。
+function QaItemCard({
+  qa, onAnswer, onSkip, onResume, answering, skipping, resuming,
+}: {
+  qa: InterviewQaOut;
+  onAnswer: (qaId: number, answerText: string) => Promise<void>;
+  onSkip: (qaId: number) => void;
+  onResume: (qaId: number) => void;
+  answering: boolean;
+  skipping: boolean;
+  resuming: boolean;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(qa.answer_text ?? "");
+
+  const submit = async () => {
+    if (!draft.trim()) return;
+    await onAnswer(qa.id, draft.trim());
+    setEditing(false);
+  };
+
+  return (
+    <div className="rounded-md border p-3 space-y-2" data-testid={`qa-item-${qa.id}`}>
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <p className="text-sm font-medium break-words">{qa.question_text}</p>
+          {qa.hypothesis && (
+            <p className="text-xs text-muted-foreground italic mt-1">仮説: {qa.hypothesis}</p>
+          )}
+        </div>
+        <div className="flex gap-1 shrink-0">
+          {qa.question_source === "runtime" && (
+            <Badge variant="secondary" data-testid={`qa-source-runtime-${qa.id}`}>実態チェック</Badge>
+          )}
+          <Badge variant="outline">{qa.question_category}</Badge>
+          <Badge variant={
+            qa.status === "answered" ? "success"
+              : qa.status === "skipped" ? "warning"
+              : qa.status === "revised" ? "secondary" : "outline"
+          }>
+            {qa.status}
+          </Badge>
+        </div>
+      </div>
+
+      {qa.evidence_refs.length > 0 && (
+        <div className="text-[10px] text-muted-foreground font-mono space-y-0.5">
+          {qa.evidence_refs.map((e, i) => (
+            <div key={i}>
+              参照コード: {e.path}:{e.start_line}-{e.end_line}
+              {e.char_count != null ? ` (${e.char_count} chars 読込)` : ""}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {qa.runtime_evidence && (
+        <div
+          className="rounded-md bg-muted/40 border p-2 text-[11px] space-y-1"
+          data-testid={`qa-runtime-evidence-${qa.id}`}
+        >
+          <p className="font-mono text-muted-foreground">
+            {qa.runtime_evidence.component_id} ({qa.runtime_evidence.path})
+          </p>
+          <p>
+            直近{qa.runtime_evidence.facts.window_days}日: 呼び出し{qa.runtime_evidence.facts.call_count}件、
+            エラー{qa.runtime_evidence.facts.error_count}件
+            {qa.runtime_evidence.facts.error_rate != null
+              ? `(${(qa.runtime_evidence.facts.error_rate * 100).toFixed(1)}%)`
+              : ""}
+            {qa.runtime_evidence.facts.duration_p50_ms != null && (
+              <>、p50 {qa.runtime_evidence.facts.duration_p50_ms.toFixed(1)}ms</>
+            )}
+            {!qa.runtime_evidence.facts.has_traces && "(トレース0件)"}
+          </p>
+          <p className="text-muted-foreground">
+            承認済み理解: role="{qa.runtime_evidence.declared.role ?? "-"}" /
+            state_effects=[{qa.runtime_evidence.declared.state_effects.join(", ")}] /
+            recommended_mode={qa.runtime_evidence.declared.recommended_mode}
+          </p>
+        </div>
+      )}
+
+      {qa.answer_text && !editing && (
+        <p className="text-sm bg-muted/40 rounded p-2 whitespace-pre-wrap break-words">
+          {qa.answer_text}
+          {qa.answered_by && (
+            <span className="block text-[10px] text-muted-foreground mt-1">
+              回答者: {qa.answered_by}
+            </span>
+          )}
+        </p>
+      )}
+
+      {editing ? (
+        <div className="space-y-2">
+          <Textarea
+            value={draft}
+            onChange={e => setDraft(e.target.value)}
+            rows={3}
+            placeholder="回答を入力"
+          />
+          <div className="flex gap-2">
+            <Button size="sm" onClick={submit} disabled={answering || !draft.trim()}>
+              {answering ? "送信中..." : "保存"}
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => setEditing(false)}>キャンセル</Button>
+          </div>
+        </div>
+      ) : (
+        <div className="flex gap-2">
+          <Button size="sm" variant="outline" onClick={() => setEditing(true)}>
+            <Pencil className="h-3 w-3 mr-1" />
+            {qa.status === "answered" ? "回答を修正" : "回答する"}
+          </Button>
+          {qa.status === "open" && (
+            <Button size="sm" variant="outline" onClick={() => onSkip(qa.id)} disabled={skipping}>
+              後で回答
+            </Button>
+          )}
+          {qa.status === "skipped" && (
+            <Button size="sm" variant="outline" onClick={() => onResume(qa.id)} disabled={resuming}>
+              再開
+            </Button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function QaPanel({
+  sessionId, actor, approvedCount,
+}: { sessionId: number; actor: string; approvedCount: number }) {
+  const { data: qaList } = useInterviewQaList(sessionId);
+  const answer = useAnswerInterviewQa(sessionId);
+  const skip = useSkipInterviewQa(sessionId);
+  const resume = useResumeInterviewQa(sessionId);
+  const runRealityCheck = useRunRuntimeRealityCheck(sessionId);
+
+  const handleAnswer = async (qaId: number, answerText: string) => {
+    try {
+      const result = await answer.mutateAsync({ qaId, answer_text: answerText, actor });
+      if (result.regeneration_recommended) {
+        toast.warning("回答が変わったため、生成済みの提案の再生成を検討してください(自動では再生成されません)。");
+      } else {
+        toast.success("回答を保存しました");
+      }
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
+  const handleRuntimeRealityCheck = async () => {
+    try {
+      const result = await runRealityCheck.mutateAsync();
+      if (result.skipped) {
+        toast.info(result.skipped_reason ?? "既存の未回答の実態チェック質問があるため、実行をスキップしました。");
+      } else if (result.error) {
+        toast.error(`実態チェックに失敗しました: ${result.error}`);
+      } else if (result.created_qa_ids.length === 0) {
+        toast.success("実態チェックを実行しましたが、確認すべきズレは見つかりませんでした。");
+      } else {
+        toast.success(`実態チェックにより ${result.created_qa_ids.length} 件の確認質問を生成しました。`);
+      }
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
+  // Keep the panel visible when there are no Q&A rows yet but the session
+  // has approved elements: the Runtime Reality Check trigger (Issue #135)
+  // lives here, and its most useful moment is exactly before any questions
+  // exist. Hide the panel only when there is nothing to show AND nothing
+  // that could be run.
+  if (!qaList || (qaList.items.length === 0 && approvedCount === 0)) return null;
+
+  return (
+    <Card data-testid="qa-panel">
+      <CardHeader>
+        <CardTitle className="text-sm flex items-center gap-2">
+          <HelpCircle className="h-4 w-4" /> Q&amp;A一覧
+        </CardTitle>
+        <CardDescription className="flex items-center justify-between gap-2">
+          <span>
+            残質問 {qaList.open_count} 件(うち高優先度 {qaList.high_priority_open_count} 件)
+          </span>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={handleRuntimeRealityCheck}
+            disabled={runRealityCheck.isPending || approvedCount === 0}
+            data-testid="run-runtime-reality-check"
+          >
+            {runRealityCheck.isPending ? "実行中..." : "実態チェックを実行"}
+          </Button>
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {qaList.answers_revised_at && (
+          <div
+            className="rounded-md border border-amber-500 bg-amber-500/10 p-3 text-sm flex items-start gap-2"
+            data-testid="answers-revised-banner"
+          >
+            <AlertCircle className="h-4 w-4 mt-0.5 shrink-0 text-amber-600" />
+            <div>
+              回答が修正されました。内容を反映するには「理解を更新」を実行してください
+              (自動では再構築されません)。
+            </div>
+          </div>
+        )}
+        <div className="space-y-2 max-h-[26rem] overflow-y-auto pr-1">
+          {qaList.items.map(qa => (
+            <QaItemCard
+              key={qa.id}
+              qa={qa}
+              onAnswer={handleAnswer}
+              onSkip={qaId => skip.mutate({ qaId, actor }, {
+                onError: e => toast.error(String(e)),
+              })}
+              onResume={qaId => resume.mutate({ qaId, actor }, {
+                onError: e => toast.error(String(e)),
+              })}
+              answering={answer.isPending}
+              skipping={skip.isPending}
+              resuming={resume.isPending}
+            />
+          ))}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+// 差分サマリーの件数(追加/削除/確信度変化/説明変化)。パネル表示と
+// 「理解を更新」トーストの両方で使う単一の集計ロジック。
+function summarizeUnderstandingDiff(diff: UnderstandingDiffOut) {
+  const added = diff.sections.reduce((n, s) => n + s.added.length, 0);
+  const removed = diff.sections.reduce((n, s) => n + s.removed.length, 0);
+  const confidenceChanged = diff.sections.reduce((n, s) => n + s.confidence_changed.length, 0);
+  const summaryChanged = diff.sections.reduce((n, s) => n + s.summary_changed.length, 0);
+  return {
+    added,
+    removed,
+    confidenceChanged,
+    summaryChanged,
+    hasChanges: added + removed + confidenceChanged + summaryChanged > 0,
+  };
+}
+
+// 理解のリビジョン差分パネル(Issue #136)。「理解を更新」の結果、直前リビジョンから
+// 何が変わったかを決定的な差分(追加/削除/確信度変化)で表示する。回答修正から
+// 再構築した直後は「あなたの回答修正が反映されました」の文脈を添える。
+function UnderstandingDiffPanel({
+  sessionId, answerRevisionReflected,
+}: { sessionId: number; answerRevisionReflected: boolean }) {
+  const { data: diff } = useUnderstandingDiff(sessionId);
+  const [expanded, setExpanded] = useState(false);
+
+  if (!diff) return null;
+
+  if (!diff.has_previous) {
+    return (
+      <Card data-testid="understanding-diff-panel">
+        <CardHeader>
+          <CardTitle className="text-sm">理解の変化</CardTitle>
+          <CardDescription>比較対象となる前のリビジョンがありません(初回の理解構築です)。</CardDescription>
+        </CardHeader>
+      </Card>
+    );
+  }
+
+  const {
+    added: addedCount,
+    removed: removedCount,
+    confidenceChanged: confidenceCount,
+    summaryChanged: summaryCount,
+    hasChanges,
+  } = summarizeUnderstandingDiff(diff);
+
+  return (
+    <Card data-testid="understanding-diff-panel">
+      <CardHeader>
+        <CardTitle className="text-sm flex items-center gap-2">
+          <Sparkles className="h-4 w-4" /> 理解の変化
+        </CardTitle>
+        <CardDescription data-testid="understanding-diff-summary">
+          {hasChanges
+            ? `追加 ${addedCount} / 削除 ${removedCount} / 確信度変化 ${confidenceCount} / 説明変化 ${summaryCount}`
+            : "前回のリビジョンから変化はありません"}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-2">
+        {answerRevisionReflected && (
+          <div
+            className="rounded-md border border-emerald-400 bg-emerald-50 dark:bg-emerald-950/20 p-2 text-xs"
+            data-testid="answer-revision-reflected-banner"
+          >
+            あなたの回答修正が理解に反映されました。
+          </div>
+        )}
+        {hasChanges && (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => setExpanded(e => !e)}
+            data-testid="toggle-understanding-diff-detail"
+          >
+            {expanded ? "詳細を隠す" : "詳細を見る"}
+          </Button>
+        )}
+        {expanded && (
+          <div className="space-y-2 text-xs" data-testid="understanding-diff-detail">
+            {diff.sections.map(s => {
+              const empty = s.added.length === 0 && s.removed.length === 0
+                && s.confidence_changed.length === 0 && s.summary_changed.length === 0;
+              if (empty) return null;
+              return (
+                <div key={s.section} className="border rounded-md p-2 space-y-1">
+                  <p className="font-semibold">{s.section}</p>
+                  {s.added.map(n => (
+                    <p key={`a-${n}`} className="text-emerald-600">+ {n}</p>
+                  ))}
+                  {s.removed.map(n => (
+                    <p key={`r-${n}`} className="text-red-600">- {n}</p>
+                  ))}
+                  {s.confidence_changed.map(c => (
+                    <div key={`c-${c.name}`} className="flex items-center gap-1">
+                      <Badge variant="outline">{c.name}</Badge>
+                      <span>確信度: {c.before ?? "-"} → {c.after ?? "-"}</span>
+                    </div>
+                  ))}
+                  {s.summary_changed.map(n => (
+                    <p key={`s-${n}`}>{n}: 説明が更新されました</p>
+                  ))}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 function GapAnalysisPanel({ gaps }: { gaps: GapItem[] }) {
   if (gaps.length === 0) return null;
   return (
@@ -492,9 +863,12 @@ export default function InterviewPage() {
   const confirmUnderstanding = useConfirmInterviewUnderstanding(selectedSessionId);
 
   const [message, setMessage] = useState("");
+  const messageInputRef = useRef<HTMLTextAreaElement | null>(null);
   const [editing, setEditing] = useState<InterviewProposalOut | null>(null);
   const [editForm, setEditForm] = useState<EditForm | null>(null);
   const [lastMaterialization, setLastMaterialization] = useState<InterviewMaterializeOut | null>(null);
+  const [answerRevisionReflected, setAnswerRevisionReflected] = useState(false);
+  const [lastEvidenceReads, setLastEvidenceReads] = useState<IntelligenceRunEvidenceOut[]>([]);
 
   const sortedSessions = useMemo(() => sessions ?? [], [sessions]);
   const proposals = session?.proposals ?? [];
@@ -514,6 +888,14 @@ export default function InterviewPage() {
     }
   }, [selectedSessionId, sortedSessions, setSearchParams]);
 
+  // Per-session UI state: switching sessions must not carry over the
+  // previous session's "answers reflected" banner (#136) or last-turn
+  // evidence reads (#137) — both describe events in that session only.
+  useEffect(() => {
+    setAnswerRevisionReflected(false);
+    setLastEvidenceReads([]);
+  }, [selectedSessionId]);
+
   const userMessageCount = useMemo(
     () => (session?.messages ?? []).filter(m => m.role === "user").length,
     [session?.messages],
@@ -526,36 +908,57 @@ export default function InterviewPage() {
     (userMessageCount >= ZERO_BASE_QUESTIONS.length || isProposalStage);
 
   // 現在ユーザーに求める「1つの質問/確認」を導出する。
-  const focusedQuestion = useMemo(() => {
+  const focusedQuestion = useMemo<FocusedQuestion | null>(() => {
     if (!session || !uiState) return null;
     if (uiState === "confirm_understanding" && session.current_understanding) {
-      return buildConfirmationPrompt(session.current_understanding);
+      return {
+        text: buildConfirmationPrompt(session.current_understanding),
+        confirmable: true,
+      };
     }
     if (uiState === "fill_gaps") {
       const open = sortQuestions(session.open_questions ?? []);
-      return open.length > 0 ? open[0].question : STAGE_QUESTIONS[currentStage];
+      if (open.length === 0) {
+        return { text: STAGE_QUESTIONS[currentStage], confirmable: false };
+      }
+      const q = open[0];
+      return {
+        text: q.question,
+        hypothesis: q.hypothesis ?? null,
+        evidenceRefs: q.evidence_refs ?? [],
+        answerOptions: q.answer_options ?? [],
+        // 仮説付きの質問は「はい/いいえ+修正」で答えられる確認型。
+        confirmable: !!q.hypothesis,
+      };
     }
     if (uiState === "zero_base") {
       if (zeroBaseComplete) {
-        return "必要な回答が揃いました。補足があれば入力し、なければ「この内容で提案生成に進む」を押して内容を確定してください。";
+        return {
+          text: "必要な回答が揃いました。補足があれば入力し、なければ「この内容で提案生成に進む」を押して内容を確定してください。",
+          confirmable: false,
+        };
       }
       const idx = Math.min(userMessageCount, ZERO_BASE_QUESTIONS.length - 1);
-      return ZERO_BASE_QUESTIONS[idx];
+      return { text: ZERO_BASE_QUESTIONS[idx], confirmable: false };
     }
     if (uiState === "ready_for_proposals") {
-      return "提案を生成する準備ができました。対象にしたい範囲や重視したい観点があれば入力し、「送信して提案を生成」を押してください。";
+      return {
+        text: "提案を生成する準備ができました。対象にしたい範囲や重視したい観点があれば入力し、「送信して提案を生成」を押してください。",
+        confirmable: false,
+      };
     }
     return null;
   }, [session, uiState, currentStage, userMessageCount, zeroBaseComplete]);
 
   // fill_gaps で表示中の open question を回答対象としてサーバーに渡し、
-  // 回答済みの質問が再表示されないよう消費してもらう。
-  const answeredQuestionForTurn = useMemo(() => {
-    if (uiState !== "fill_gaps" || !session) return undefined;
+  // 回答済みの質問が再表示されないよう消費してもらう。qa_id を持つ
+  // エントリは ID 参照(answered_qa_id)で消費し、Q&A 一覧の行も
+  // answered になる(Issue #129)。テキストは旧セッション互換のため併送する。
+  const answeredForTurn = useMemo<{ text?: string; qaId?: number }>(() => {
+    if (uiState !== "fill_gaps" || !session || !focusedQuestion) return {};
     const open = sortQuestions(session.open_questions ?? []);
-    return open.length > 0 && open[0].question === focusedQuestion
-      ? focusedQuestion
-      : undefined;
+    if (open.length === 0 || open[0].question !== focusedQuestion.text) return {};
+    return { text: focusedQuestion.text, qaId: open[0].qa_id ?? undefined };
   }, [uiState, session, focusedQuestion]);
 
   const nextActionText = useMemo(() => {
@@ -613,11 +1016,31 @@ export default function InterviewPage() {
 
   const refreshUnderstanding = async () => {
     if (!selectedSessionId) return;
+    const hadAnswerRevision = !!session?.answers_revised_at;
     try {
       const updated = await updateUnderstanding.mutateAsync(selectedSessionId);
       if (updated.last_error) {
         toast.error(`理解の更新に失敗しました: ${updated.last_error}`);
-      } else {
+        return;
+      }
+      setAnswerRevisionReflected(hadAnswerRevision);
+      try {
+        const diff = await api.get<UnderstandingDiffOut>(
+          `/interview/sessions/${selectedSessionId}/understanding-diff`,
+        );
+        if (!diff.has_previous) {
+          toast.success("理解を更新しました(初回のリビジョンです)");
+        } else {
+          const counts = summarizeUnderstandingDiff(diff);
+          if (!counts.hasChanges) {
+            toast.success("理解を更新しました(前回からの変化はありません)");
+          } else {
+            toast.success(
+              `理解を更新しました(追加 ${counts.added} / 削除 ${counts.removed} / 確信度変化 ${counts.confidenceChanged})`,
+            );
+          }
+        }
+      } catch {
         toast.success("理解を更新しました");
       }
     } catch (e) {
@@ -625,22 +1048,33 @@ export default function InterviewPage() {
     }
   };
 
-  const sendTurn = async () => {
-    const text = message.trim();
+  const sendText = async (raw: string) => {
+    const text = raw.trim();
     if (!text || !selectedSessionId) return;
     try {
       const result = await dialogueTurn.mutateAsync({
         user_message: text,
         generate_proposals: isProposalStage && unlocked,
-        answered_question: answeredQuestionForTurn,
+        answered_question: answeredForTurn.text,
+        answered_qa_id: answeredForTurn.qaId,
+        actor,
       });
       setMessage("");
+      setLastEvidenceReads(result.evidence_reads ?? []);
       if (result.error) toast.error(result.error);
       else if (result.proposals.length) toast.success(`${result.proposals.length}件の提案を生成しました`);
       else toast.success("回答を送信しました");
     } catch (e) {
       toast.error(String(e));
     }
+  };
+
+  const sendTurn = () => sendText(message);
+
+  // 「いいえ」は修正内容の入力を促す: 定型の書き出しを入力欄に入れてフォーカスする。
+  const startCorrection = () => {
+    setMessage(QUICK_ANSWER_NO_PREFIX);
+    messageInputRef.current?.focus();
   };
 
   const doConfirmUnderstanding = async () => {
@@ -817,9 +1251,66 @@ export default function InterviewPage() {
                         </div>
                       )}
                       {focusedQuestion && (
-                        <div className="rounded-md border bg-muted/40 p-3 flex items-start gap-2" data-testid="focused-question">
-                          <HelpCircle className="h-4 w-4 mt-0.5 shrink-0 text-blue-500" />
-                          <p className="text-sm">{focusedQuestion}</p>
+                        <div className="rounded-md border bg-muted/40 p-3 space-y-2" data-testid="focused-question">
+                          {focusedQuestion.hypothesis && (
+                            <div className="rounded-md bg-background/60 border p-2 text-sm" data-testid="question-hypothesis">
+                              <span className="text-[10px] uppercase font-semibold text-muted-foreground block mb-1">仮説</span>
+                              {focusedQuestion.hypothesis}
+                            </div>
+                          )}
+                          <div className="flex items-start gap-2">
+                            <HelpCircle className="h-4 w-4 mt-0.5 shrink-0 text-blue-500" />
+                            <p className="text-sm">{focusedQuestion.text}</p>
+                          </div>
+                          {(focusedQuestion.evidenceRefs ?? []).length > 0 && (
+                            <div className="space-y-0.5" data-testid="question-evidence">
+                              <span className="text-[10px] uppercase font-semibold text-muted-foreground">根拠</span>
+                              {focusedQuestion.evidenceRefs!.map((e, i) => (
+                                <div key={i} className="text-[10px] text-muted-foreground font-mono">
+                                  {e.path}{e.start_line > 0 ? `:${e.start_line}-${e.end_line}` : ""}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                          {(focusedQuestion.confirmable || (focusedQuestion.answerOptions ?? []).length > 0) && (
+                            <div className="flex flex-wrap gap-2 pt-1" data-testid="quick-answers">
+                              {focusedQuestion.confirmable && (
+                                <>
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    onClick={() => sendText(QUICK_ANSWER_YES)}
+                                    disabled={dialogueTurn.isPending}
+                                    data-testid="quick-answer-yes"
+                                  >
+                                    <CheckCircle className="h-4 w-4 mr-1 text-emerald-600" />
+                                    はい、正しいです
+                                  </Button>
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    onClick={startCorrection}
+                                    disabled={dialogueTurn.isPending}
+                                    data-testid="quick-answer-no"
+                                  >
+                                    <Pencil className="h-4 w-4 mr-1" />
+                                    いいえ(修正を入力)
+                                  </Button>
+                                </>
+                              )}
+                              {(focusedQuestion.answerOptions ?? []).map((opt, i) => (
+                                <Button
+                                  key={i}
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={() => sendText(opt)}
+                                  disabled={dialogueTurn.isPending}
+                                >
+                                  {opt}
+                                </Button>
+                              ))}
+                            </div>
+                          )}
                         </div>
                       )}
                       {zeroBaseComplete && (
@@ -834,6 +1325,7 @@ export default function InterviewPage() {
                         </Button>
                       )}
                       <Textarea
+                        ref={messageInputRef}
                         rows={4}
                         value={message}
                         onChange={e => setMessage(e.target.value)}
@@ -851,6 +1343,22 @@ export default function InterviewPage() {
                               : "回答を送信"}
                         </Button>
                       </div>
+                      {lastEvidenceReads.length > 0 && (
+                        <div
+                          className="rounded-md border p-2 text-[10px] text-muted-foreground font-mono space-y-0.5"
+                          data-testid="evidence-reads-panel"
+                        >
+                          <p className="text-[10px] uppercase font-semibold not-italic">
+                            このターンで参照したコード
+                          </p>
+                          {lastEvidenceReads.map((e, i) => (
+                            <div key={i}>
+                              {e.path}:{e.start_line}-{e.end_line} ({e.char_count} chars)
+                              {e.truncated ? " (truncated)" : ""}
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </>
                   )}
                 </CardContent>
@@ -1095,6 +1603,13 @@ export default function InterviewPage() {
                   </CardContent>
                 </Card>
               )}
+
+              <UnderstandingDiffPanel
+                sessionId={session.id}
+                answerRevisionReflected={answerRevisionReflected}
+              />
+
+              <QaPanel sessionId={session.id} actor={actor} approvedCount={approvedCount} />
 
               {session.gap_analysis && session.gap_analysis.length > 0 && (
                 <Card>

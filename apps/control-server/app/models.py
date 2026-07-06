@@ -220,6 +220,21 @@ IntelligenceRunType = Literal[
     "explanation_refresh",
     "interview_proposal",
     "interview_dialogue",
+    # Issue #130: pass 1 of the dialogue turn (choose evidence to read, or
+    # declare no evidence needed) is audited separately from pass 2 (question
+    # generation, run_type "interview_dialogue" above) so the two reasoning
+    # calls stay distinguishable in the audit trail.
+    "interview_evidence_selection",
+    # Issue #127/#123: the system-understanding review behind
+    # update-understanding (system_understanding_reviewer.py). Recorded for
+    # both success and failure so the reviewer's prompt_version stays
+    # auditable (Principle 7).
+    "understanding_review",
+    # Issue #135: reconciling approved metadata/probe plans against
+    # deterministic runtime trace aggregates. The aggregation itself is
+    # deterministic and not separately audited; only the reasoning
+    # reconciliation step that picks confirmation questions is.
+    "runtime_reality_check",
 ]
 DecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
 # How a single hierarchy claim was produced. Kept distinct from the audit
@@ -1731,6 +1746,10 @@ class InterviewSessionOut(BaseModel):
     last_error: Optional[str] = None
     understanding_confirmed_at: Optional[float] = None
     understanding_confirmed_by: Optional[str] = None
+    # Issue #129: set when an answered interview_qa question is corrected.
+    # Never cleared automatically by the revision itself — only a successful
+    # understanding rebuild (update-understanding) clears it.
+    answers_revised_at: Optional[float] = None
     materialization_diff: Optional[str] = None
     materialization_ref: Optional[str] = None
     materialized_at: Optional[float] = None
@@ -1944,7 +1963,14 @@ class InterviewDialogueTurnRequest(BaseModel):
     # Issue #123: the open question the user is answering with this turn.
     # The server removes it from the session's open_questions (exact match)
     # so the UI never re-asks an already-answered question.
+    # Superseded by answered_qa_id (Issue #129); still accepted during the
+    # migration period and applied in addition to it, never instead of it.
     answered_question: Optional[str] = Field(default=None, max_length=2000)
+    # Issue #129: ID of the interview_qa row this turn answers. Preferred
+    # over answered_question because it survives question rewording and
+    # cannot silently match the wrong question.
+    answered_qa_id: Optional[int] = None
+    actor: str = Field(default="dashboard", min_length=1, max_length=200)
 
 
 class InterviewConfirmUnderstandingRequest(BaseModel):
@@ -1959,6 +1985,34 @@ class InterviewConfirmUnderstandingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     actor: str = Field(min_length=1, max_length=200)
+
+
+class InterviewQuestionEvidenceRef(BaseModel):
+    """Snapshot-relative code reference backing an interview question (Issue #128).
+
+    Paths and line ranges are validated deterministically against the
+    context pack / stored understanding before the turn is accepted; refs
+    the model invented fail the turn closed.
+    """
+
+    path: str
+    start_line: int = 0
+    end_line: int = 0
+
+
+class InterviewStructuredQuestion(BaseModel):
+    """Hypothesis-first interview question (Issue #128).
+
+    The model states its current hypothesis with evidence, then asks a
+    focused confirmation question. Plain-string questions are still accepted
+    from older prompt versions and normalized to this shape (question_text
+    only) — a structural conversion, not an interpretation.
+    """
+
+    question_text: str
+    hypothesis: Optional[str] = None
+    evidence_refs: List[InterviewQuestionEvidenceRef] = Field(default_factory=list)
+    answer_options: List[str] = Field(default_factory=list)
 
 
 class InterviewDialogueProposalOut(BaseModel):
@@ -1986,13 +2040,284 @@ class InterviewDialogueTurnOut(BaseModel):
 
     assistant_message: str = ""
     proposals: List[InterviewDialogueProposalOut] = Field(default_factory=list)
-    next_questions: List[str] = Field(default_factory=list)
+    next_questions: List[InterviewStructuredQuestion] = Field(default_factory=list)
     intelligence_run: Optional[IntelligenceRunOut] = None
     error: Optional[str] = None
     stage: Optional[InterviewStage] = None
     current_understanding: Optional[Dict[str, Any]] = None
     gap_analysis: Optional[List[Dict[str, Any]]] = None
     open_questions_structured: Optional[List[Dict[str, Any]]] = None
+    # Issue #129: the structured Q&A rows created from next_questions, so the
+    # caller can navigate straight to them without re-fetching the list.
+    created_qa_ids: List[int] = Field(default_factory=list)
+    # Issue #130: audit of the pass-1 evidence-selection run, when it ran.
+    evidence_run: Optional[IntelligenceRunOut] = None
+    evidence_used: List["InterviewQaEvidenceRefOut"] = Field(default_factory=list)
+    # Issue #137: the persisted intelligence_run_evidence rows for this
+    # turn's evidence-selection run — every snippet actually read, whether
+    # or not a question cited it. evidence_used above is unchanged.
+    evidence_reads: List["IntelligenceRunEvidenceOut"] = Field(default_factory=list)
+
+
+# --- Evidence read audit (Issue #137) -----------------------------------------
+#
+# Persists every snippet pass 1 of the interview dialogue turn actually read
+# from the pinned snapshot, linked to the interview_evidence_selection
+# intelligence_runs row — independent of whether the resulting question
+# cited it. Snippet content is never stored (Principle 5/size).
+
+
+class IntelligenceRunEvidenceOut(BaseModel):
+    id: int
+    system_id: int
+    intelligence_run_id: int
+    path: str
+    start_line: int
+    end_line: int
+    char_count: int
+    truncated: bool
+    created_at: float
+
+
+class IntelligenceRunEvidenceListOut(BaseModel):
+    intelligence_run_id: int
+    system_id: int
+    items: List[IntelligenceRunEvidenceOut] = Field(default_factory=list)
+
+
+# --- Structured Interview Q&A (Issue #129) ------------------------------------
+#
+# Question/answer pairs as ID-addressable rows, replacing exact-text matching
+# against the interview_session.open_questions JSON blob. Correcting an
+# answer never overwrites the row; it inserts a new revision and links the
+# old row forward via superseded_by_id, so every prior answer stays
+# auditable (Principle 7). question_category/question_source/status are
+# explicit finite sets (Principle 6).
+
+InterviewQaCategory = Literal["purpose", "capability", "api", "probe_flow", "general"]
+# Issue #135: "runtime" questions are generated by reconciling approved
+# metadata/probe plans against deterministic runtime trace aggregates,
+# distinct from the dialogue/reviewer/zero_base sources above.
+InterviewQaSource = Literal["reviewer", "dialogue", "zero_base", "runtime"]
+InterviewQaStatus = Literal["open", "answered", "revised", "skipped"]
+
+
+class InterviewQaEvidenceRefOut(BaseModel):
+    """Snapshot-relative code reference, optionally with what was actually read.
+
+    ``char_count`` is populated only for evidence that Issue #130's
+    evidence-gathering step read from the pinned snapshot; it is a raw fact
+    about what was fetched, kept separate from any LLM interpretation of it.
+    """
+
+    path: str
+    start_line: int = 0
+    end_line: int = 0
+    char_count: Optional[int] = None
+
+
+class InterviewQaCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question_text: str = Field(..., min_length=1, max_length=2_000)
+    question_category: InterviewQaCategory = "general"
+    question_source: InterviewQaSource = "dialogue"
+    hypothesis: Optional[str] = Field(default=None, max_length=4_000)
+    evidence_refs: List[InterviewQaEvidenceRefOut] = Field(default_factory=list, max_length=10)
+
+
+class InterviewQaActorRequest(BaseModel):
+    """Actor for a skip/resume action (Principle 7: manual decisions record who/when)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str = Field(..., min_length=1, max_length=200)
+
+
+class InterviewQaAnswerRequest(BaseModel):
+    """Answer or correct a question.
+
+    If the current row is 'open' or 'skipped', the answer is recorded on that
+    same row (first answer — nothing to supersede). If the current row is
+    'answered', this is a correction: a new row is inserted with the new
+    answer and the old row is marked 'revised' with superseded_by_id set.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    answer_text: str = Field(..., min_length=1, max_length=20_000)
+    actor: str = Field(..., min_length=1, max_length=200)
+
+
+class InterviewQaOut(BaseModel):
+    id: int
+    session_id: int
+    system_id: int
+    question_text: str
+    question_category: InterviewQaCategory
+    question_source: InterviewQaSource
+    hypothesis: Optional[str] = None
+    evidence_refs: List[InterviewQaEvidenceRefOut] = Field(default_factory=list)
+    # Issue #135: raw aggregated trace facts + declared-metadata provenance
+    # for question_source == "runtime" rows. Kept separate from
+    # evidence_refs (code line ranges) because runtime evidence is numeric
+    # aggregation, not a source-code span. Null for all other sources.
+    runtime_evidence: Optional[Dict[str, Any]] = None
+    answer_text: Optional[str] = None
+    status: InterviewQaStatus
+    answered_by: Optional[str] = None
+    superseded_by_id: Optional[int] = None
+    created_at: float
+    answered_at: Optional[float] = None
+
+
+class InterviewQaAnswerOut(BaseModel):
+    qa: InterviewQaOut
+    previous: Optional[InterviewQaOut] = None
+    # True when this session already has generated proposals, so the
+    # dashboard can surface "regeneration recommended" without probe-agent
+    # ever auto-invalidating or regenerating the approved/proposed set.
+    regeneration_recommended: bool = False
+
+
+class InterviewQaListOut(BaseModel):
+    session_id: int
+    system_id: int
+    items: List[InterviewQaOut] = Field(default_factory=list)
+    open_count: int = 0
+    high_priority_open_count: int = 0
+    answers_revised_at: Optional[float] = None
+
+
+# --- Runtime Reality Check (Issue #135) --------------------------------------
+#
+# Reconciles approved interview metadata/probe plans (role, probe_value,
+# state_effects, recommended_mode) against deterministic runtime trace
+# aggregates for the same component_id, and asks the developer to confirm or
+# correct any surprising mismatch. Aggregation is numeric-only (Principle 6,
+# decision_method deterministic); which mismatches are worth a question, and
+# the question text/hypothesis, are reasoning_llm output persisted as
+# question_source "runtime" interview_qa rows.
+
+
+class RuntimeTraceFactsOut(BaseModel):
+    """Deterministic trace aggregates for one component_id over a window.
+
+    ``has_traces`` is false (and the numeric fields are null) when the
+    component has an approved probe plan but zero recorded traces — the
+    "0 traces" signal called out in the issue. This is a raw fact; whether
+    it is worth a question is decided by the reasoning step, never here.
+    """
+
+    component_id: str
+    window_days: int
+    call_count: int = 0
+    error_count: int = 0
+    error_rate: Optional[float] = None
+    duration_p50_ms: Optional[float] = None
+    duration_p90_ms: Optional[float] = None
+    duration_p99_ms: Optional[float] = None
+    last_observed_at: Optional[float] = None
+    has_traces: bool = False
+
+
+class RuntimeRealityCheckItemOut(BaseModel):
+    """One approved element's declared understanding paired with its facts."""
+
+    proposal_id: int
+    decision_id: int
+    path: str
+    qualified_name: str
+    component_id: str
+    role: Optional[str] = None
+    probe_value: Optional[str] = None
+    state_effects: List[str] = Field(default_factory=list)
+    recommended_mode: str = "trace"
+    facts: RuntimeTraceFactsOut
+
+
+class RuntimeRealityFactsOut(BaseModel):
+    """Response for the deterministic-only facts endpoint (no LLM call)."""
+
+    session_id: int
+    system_id: int
+    snapshot_id: int
+    window_days: int
+    items: List[RuntimeRealityCheckItemOut] = Field(default_factory=list)
+
+
+class RuntimeRealityCheckRunOut(BaseModel):
+    """Response for triggering the reasoning reconciliation run.
+
+    ``skipped`` is true when generation was suppressed because unanswered
+    runtime questions already exist for this session (noise control from the
+    issue notes); in that case no intelligence_runs row is created.
+    """
+
+    session_id: int
+    system_id: int
+    snapshot_id: int
+    intelligence_run: Optional[IntelligenceRunOut] = None
+    items_considered: int = 0
+    created_qa_ids: List[int] = Field(default_factory=list)
+    skipped: bool = False
+    skipped_reason: Optional[str] = None
+    error: Optional[str] = None
+
+
+# --- Understanding Revisions (Issue #136) ------------------------------------
+#
+# Each successful update-understanding call appends one row (never
+# overwritten) so the Dashboard can show what changed since the previous
+# revision. Diffing is deterministic (exact-name matching only, Principle 6)
+# and computed on demand — no diff result is persisted.
+
+
+class UnderstandingRevisionOut(BaseModel):
+    id: int
+    session_id: int
+    system_id: int
+    snapshot_id: int
+    intelligence_run_id: Optional[int] = None
+    current_understanding: Optional[Dict[str, Any]] = None
+    gap_analysis: Optional[List[Dict[str, Any]]] = None
+    created_at: float
+
+
+class UnderstandingRevisionListOut(BaseModel):
+    session_id: int
+    system_id: int
+    items: List[UnderstandingRevisionOut] = Field(default_factory=list)
+
+
+class UnderstandingDiffConfidenceChange(BaseModel):
+    name: str
+    before: Optional[str] = None
+    after: Optional[str] = None
+
+
+class UnderstandingDiffSectionOut(BaseModel):
+    section: str
+    added: List[str] = Field(default_factory=list)
+    removed: List[str] = Field(default_factory=list)
+    confidence_changed: List[UnderstandingDiffConfidenceChange] = Field(default_factory=list)
+    summary_changed: List[str] = Field(default_factory=list)
+
+
+class UnderstandingDiffOut(BaseModel):
+    """Structural diff between two understanding revisions.
+
+    ``has_previous`` is false when ``to_revision_id`` is the session's first
+    revision (or no revisions exist yet); ``sections`` is then empty and the
+    caller must show "no comparison target" rather than an all-added diff.
+    """
+
+    session_id: int
+    system_id: int
+    from_revision_id: Optional[int] = None
+    to_revision_id: Optional[int] = None
+    has_previous: bool = False
+    sections: List[UnderstandingDiffSectionOut] = Field(default_factory=list)
 
 
 # --- Interview Proposal Approval (Issue #70) ----------------------------------
