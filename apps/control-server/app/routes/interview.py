@@ -804,7 +804,41 @@ def interview_dialogue_turn(
         unconfirmed_qa_pairs = [
             {"question": r["question_text"], "answer": r["answer_text"]}
             for r in unconfirmed_qa_rows
-        ] or None
+        ]
+
+        # Issue #142: when THIS turn is an explicit "I don't know" answer, the
+        # question being answered is still 'open' (it is only marked
+        # 'unconfirmed' AFTER the LLM call, below), so it is not yet in
+        # unconfirmed_qa_pairs. Inject it into this turn's reasoning context so
+        # the model forms a hypothesis and re-confirms in the SAME turn from
+        # the explicit flag — not from a free-text guess about user_message.
+        current_unknown_qa: List[dict] = []
+        if payload.answer_unknown:
+            unknown_question_text: Optional[str] = None
+            if payload.answered_qa_id is not None:
+                q_row = conn.execute(
+                    """SELECT question_text FROM interview_qa
+                       WHERE id = ? AND session_id = ? AND system_id = ?""",
+                    (payload.answered_qa_id, session_id, system_id),
+                ).fetchone()
+                if q_row is not None:
+                    unknown_question_text = q_row["question_text"]
+            if unknown_question_text is None and payload.answered_question:
+                unknown_question_text = payload.answered_question
+            current_unknown_qa.append({
+                "question": unknown_question_text or "(the question just answered)",
+                "answer": payload.user_message,
+            })
+
+        # Merge the current unknown answer ahead of already-persisted
+        # unconfirmed rows, de-duplicated by question text.
+        merged_unconfirmed = list(current_unknown_qa)
+        seen_unconfirmed = {u["question"] for u in merged_unconfirmed}
+        for u in unconfirmed_qa_pairs:
+            if u["question"] not in seen_unconfirmed:
+                merged_unconfirmed.append(u)
+                seen_unconfirmed.add(u["question"])
+        unconfirmed_qa_for_turn = merged_unconfirmed or None
 
         # Issue #130: pass 1 selects (or declines) evidence to read from the
         # pinned snapshot before pass 2 asks the next question. Both passes
@@ -892,7 +926,7 @@ def interview_dialogue_turn(
                     gap_analysis=session_gaps,
                     open_questions=session_open_questions,
                     answered_qa=answered_qa_pairs,
-                    unconfirmed_qa=unconfirmed_qa_pairs,
+                    unconfirmed_qa=unconfirmed_qa_for_turn,
                     evidence_snippets=evidence_snippets,
                 )
 
@@ -1286,6 +1320,7 @@ def interview_dialogue_turn(
                 for s in evidence_snippets
             ],
             evidence_reads=evidence_reads_out,
+            evidence_refs_dropped=turn.evidence_refs_dropped,
         )
 
 

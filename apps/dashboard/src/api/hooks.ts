@@ -519,6 +519,10 @@ export function useInterviewDialogueTurn(sessionId: number | null) {
       answered_question?: string;
       answered_qa_id?: number;
       actor?: string;
+      // Issue #142: mark this turn as an explicit "I don't know" answer so the
+      // consumed Q&A row is recorded as 'unconfirmed' and the model forms a
+      // hypothesis to re-confirm instead of treating it as an answered fact.
+      answer_unknown?: boolean;
     }) =>
       api.post<InterviewDialogueTurnOut>(`/interview/sessions/${sessionId}/dialogue-turn`, data),
     onSuccess: () => {

@@ -361,6 +361,9 @@ export interface InterviewDialogueTurnOut {
   // Issue #137: every snippet actually read for this turn's evidence-selection
   // run, regardless of citation. evidence_used above is unchanged.
   evidence_reads: IntelligenceRunEvidenceOut[];
+  // Issue #142: count of question evidence_refs dropped as unverifiable
+  // (graceful fallback, not an error).
+  evidence_refs_dropped: number;
 }
 
 // --- Evidence read audit (Issue #137) -----------------------------------------

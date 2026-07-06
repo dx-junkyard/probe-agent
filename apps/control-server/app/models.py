@@ -2063,6 +2063,11 @@ class InterviewDialogueTurnOut(BaseModel):
     # turn's evidence-selection run — every snippet actually read, whether
     # or not a question cited it. evidence_used above is unchanged.
     evidence_reads: List["IntelligenceRunEvidenceOut"] = Field(default_factory=list)
+    # Issue #142: how many question evidence_refs were dropped as unverifiable
+    # (not contained in any known snapshot span). A dropped ref is a graceful
+    # fallback — the question is still asked — so this is surfaced for operator
+    # visibility, not an error.
+    evidence_refs_dropped: int = 0
 
 
 # --- Evidence read audit (Issue #137) -----------------------------------------

@@ -147,6 +147,47 @@ def test_unknown_dialogue_answer_records_unconfirmed_not_error(admin_client, mon
     assert row["id"] not in [i["id"] for i in qa_list["items"] if i["status"] == "answered"]
 
 
+def test_unknown_answer_injected_into_same_turn_context(admin_client, monkeypatch):
+    """P1: an explicit "I don't know" answer must reach the SAME turn's LLM
+    prompt as structured input, not only the next turn. The question being
+    answered is still 'open' at prompt-build time, so the route injects it
+    into unconfirmed_qa for this turn from the answer_unknown flag."""
+    from app.interview_agent import InterviewTurnResult
+
+    headers, session_id, _ = _setup_session(admin_client)
+
+    qa = admin_client.post(
+        f"/interview/sessions/{session_id}/qa",
+        json={"question_text": "この関数の役割は?", "question_category": "general"},
+        headers=headers,
+    ).json()
+
+    capture: dict = {}
+    _stub_two_pass(
+        monkeypatch,
+        turn_result=InterviewTurnResult(
+            provider="anthropic", model="claude-sonnet-4-5", is_mock=False,
+            assistant_message="仮説を立てます",
+        ),
+        capture=capture,
+    )
+
+    r = admin_client.post(
+        f"/interview/sessions/{session_id}/dialogue-turn",
+        json={
+            "user_message": "わかりません",
+            "answered_qa_id": qa["id"],
+            "answer_unknown": True,
+        },
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    # The current (still-open) question is present in THIS turn's context.
+    unconfirmed = capture.get("unconfirmed_qa")
+    assert unconfirmed is not None
+    assert any(u["question"] == "この関数の役割は?" for u in unconfirmed)
+
+
 def test_unconfirmed_qa_fed_back_to_next_turn_context(admin_client, monkeypatch):
     from app.interview_agent import InterviewTurnResult
 
@@ -190,6 +231,30 @@ def test_unconfirmed_qa_fed_back_to_next_turn_context(admin_client, monkeypatch)
     unconfirmed = capture.get("unconfirmed_qa")
     assert unconfirmed is not None
     assert any(u["question"] == "この関数の役割は?" for u in unconfirmed)
+
+
+def test_evidence_refs_dropped_surfaced_in_response(admin_client, monkeypatch):
+    """The dropped-ref count is exposed on the turn response for operator
+    visibility (auditability), not just kept on the internal object."""
+    from app.interview_agent import InterviewTurnResult
+
+    headers, session_id, _ = _setup_session(admin_client)
+
+    _stub_two_pass(
+        monkeypatch,
+        turn_result=InterviewTurnResult(
+            provider="anthropic", model="claude-sonnet-4-5", is_mock=False,
+            assistant_message="OK", evidence_refs_dropped=2,
+        ),
+    )
+
+    r = admin_client.post(
+        f"/interview/sessions/{session_id}/dialogue-turn",
+        json={"user_message": "続けてください"},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["evidence_refs_dropped"] == 2
 
 
 # --- Q&A answer endpoint "I don't know" -------------------------------------

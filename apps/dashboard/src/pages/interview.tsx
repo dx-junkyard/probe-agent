@@ -1069,7 +1069,7 @@ export default function InterviewPage() {
     }
   };
 
-  const sendText = async (raw: string) => {
+  const sendText = async (raw: string, opts?: { answerUnknown?: boolean }) => {
     const text = raw.trim();
     if (!text || !selectedSessionId) return;
     try {
@@ -1079,10 +1079,12 @@ export default function InterviewPage() {
         answered_question: answeredForTurn.text,
         answered_qa_id: answeredForTurn.qaId,
         actor,
+        answer_unknown: opts?.answerUnknown,
       });
       setMessage("");
       setLastEvidenceReads(result.evidence_reads ?? []);
       if (result.error) toast.error(result.error);
+      else if (opts?.answerUnknown) toast.info("「わからない」として記録しました。仮説を立てて確認を続けます。");
       else if (result.proposals.length) toast.success(`${result.proposals.length}件の提案を生成しました`);
       else toast.success("回答を送信しました");
     } catch (e) {
@@ -1091,6 +1093,11 @@ export default function InterviewPage() {
   };
 
   const sendTurn = () => sendText(message);
+
+  // Issue #142: 現在の focused question に対して「わからない」を明示送信する。
+  // 自由文ではなく answer_unknown フラグで送り、確定回答なしとして記録させる。
+  const sendUnknown = () =>
+    sendText(message.trim() || "わかりません", { answerUnknown: true });
 
   // 「いいえ」は修正内容の入力を促す: 定型の書き出しを入力欄に入れてフォーカスする。
   const startCorrection = () => {
@@ -1293,7 +1300,7 @@ export default function InterviewPage() {
                               ))}
                             </div>
                           )}
-                          {(focusedQuestion.confirmable || (focusedQuestion.answerOptions ?? []).length > 0) && (
+                          {(focusedQuestion.confirmable || (focusedQuestion.answerOptions ?? []).length > 0 || uiState === "fill_gaps") && (
                             <div className="flex flex-wrap gap-2 pt-1" data-testid="quick-answers">
                               {focusedQuestion.confirmable && (
                                 <>
@@ -1330,6 +1337,20 @@ export default function InterviewPage() {
                                   {opt}
                                 </Button>
                               ))}
+                              {/* Issue #142: 明示的な「わからない」入力。自由文ではなく
+                                  answer_unknown フラグで送り、確定回答なしとして記録する。 */}
+                              {uiState === "fill_gaps" && (
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={sendUnknown}
+                                  disabled={dialogueTurn.isPending}
+                                  data-testid="quick-answer-unknown"
+                                >
+                                  <HelpCircle className="h-4 w-4 mr-1" />
+                                  わからない
+                                </Button>
+                              )}
                             </div>
                           )}
                         </div>
