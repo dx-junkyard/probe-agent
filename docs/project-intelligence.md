@@ -1153,6 +1153,26 @@ Issue #144 に集約し、実装は以下の sub-issue に依存順で分割し�
 突き合わせはすべて deterministic。自然言語からの analyzer spec 生成のみ reasoning_llm
 (承認は manual)。LLM は ingest のホットパスには置かない。
 
+### Phase 1 実装状態(#145)
+
+- **スキーマ**: `shared/schemas/trace_event.schema.json` に optional の `span_id` /
+  `parent_span_id` / `flow_id` / `correlation_id` / `entities`(`{type,id,role}`、
+  `role` は `source|derived|related` の有限集合)を追加。既存ペイロードは無変更で受理。
+- **SDK**: `probe_context(correlation_id, flow_id, entities)` コンテキストマネージャ
+  (`contextvars` ベース)、probe 毎の `span_id` 生成とネスト呼び出しの
+  `parent_span_id` 自動設定、`@probe(entities=[...])` / `add_entity(type,id,role)` に
+  よる明示値エンティティ付与。shadow スレッドへは `contextvars.copy_context()` で系譜を
+  引き渡し、candidate 内のネスト probe も同じ lineage に載る。probe が `off` / 無効の
+  ときは系譜処理を一切実行しない(early-return の後でのみ contextvars を読む)。
+- **永続化**: system-scoped の `trace_spans`(PK `(system_id, trace_id)`、
+  `(correlation_id)` / `(flow_id)` インデックス)と `trace_entities`
+  (`(entity_type, entity_id)` / `(trace_id)` インデックス)。既存の `traces` 書き込みは
+  変更せず、系譜は `input_json` に重ねない。エンティティは再 POST で置換(冪等)。
+- **API**: `GET /trace-lineage/entities/{entity_type}/{entity_id}`、
+  `/trace-lineage/correlations/{correlation_id}`、`/trace-lineage/flows/{flow_id}` が
+  該当トレース + span + entity を timestamp 昇順で返す(System isolation)。
+- Dashboard は未変更(Phase 3 / #147 の領分)。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。

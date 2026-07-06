@@ -16,6 +16,7 @@ from .routes import (
     project_intelligence,
     shadow,
     systems,
+    trace_lineage,
     traces,
     workspaces,
 )
@@ -41,6 +42,7 @@ def create_app() -> FastAPI:
     app.include_router(auth.router)
     app.include_router(systems.router)
     app.include_router(traces.router, dependencies=_auth)
+    app.include_router(trace_lineage.router, dependencies=_auth)
     app.include_router(components.router, dependencies=_auth)
     app.include_router(shadow.router, dependencies=_auth)
     app.include_router(evaluation.router, dependencies=_auth)

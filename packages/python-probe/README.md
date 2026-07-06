@@ -14,6 +14,37 @@ def summarize(text: str) -> str:
 set_candidate("summarizer", summarize_v2)
 ```
 
+## トレース系譜メタデータ（Issue #145 / Phase 1）
+
+`probe_context` で一連の probe 呼び出しに **correlation_id / flow_id / entities** を
+付与できる。すべて任意で、付けなければ従来どおりのトレースになる。
+
+```python
+from probe_agent import probe, probe_context, add_entity
+
+@probe(component_id="order-validate", entities=[{"type": "order", "id": "o-123", "role": "source"}])
+def validate(order):
+    ...
+
+with probe_context(correlation_id="req-abc", flow_id="checkout"):
+    add_entity("tenant", "t-9")          # 以降の probe すべてに付与
+    validate(order)                       # order-validate と同じ correlation を共有
+```
+
+- `probe_context(correlation_id=None, flow_id=None, entities=None)`: ブロック内の
+  すべての probe が同じ `correlation_id` / `flow_id` を共有する。未指定なら外側の
+  コンテキストを継承し、無ければ自動生成する。
+- ネストした probe 呼び出しには `parent_span_id` が自動で設定される（各 probe は
+  一意の `span_id` を持つ）。
+- `add_entity(type, id, role="related")` / `@probe(entities=[...])`: エンティティは
+  **呼び出し側が渡す明示値**のみ（パス式による抽出は Phase 2 / Issue #146）。
+  `role` は `source` / `derived` / `related` の有限集合。
+- shadow モードでは candidate スレッドに `contextvars.copy_context()` で系譜が
+  引き継がれ、candidate 内のネスト probe も同じ lineage に載る。
+- 系譜は Control Server の `trace_spans` / `trace_entities` に保存され、
+  `GET /trace-lineage/entities/{type}/{id}`、`/correlations/{id}`、`/flows/{id}` で
+  時系列に取得できる。probe が `off` / 無効のときは系譜処理は一切実行されない。
+
 ## 環境変数
 
 | 名前 | デフォルト | 説明 |

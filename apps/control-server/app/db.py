@@ -115,6 +115,44 @@ CREATE INDEX IF NOT EXISTS idx_shadow_component_ts
 CREATE INDEX IF NOT EXISTS idx_shadow_trace
     ON shadow_results (system_id, trace_id);
 
+-- Trace lineage (Issue #145, Phase 1). Optional correlation metadata is kept
+-- out of traces.input_json in dedicated, indexed tables. Backward compatible:
+-- traces without lineage simply have no rows here.
+CREATE TABLE IF NOT EXISTS trace_spans (
+    system_id      INTEGER NOT NULL,
+    trace_id       TEXT NOT NULL,
+    component_id   TEXT NOT NULL,
+    span_id        TEXT,
+    parent_span_id TEXT,
+    flow_id        TEXT,
+    correlation_id TEXT,
+    timestamp      REAL NOT NULL,
+    PRIMARY KEY (system_id, trace_id),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_trace_spans_correlation
+    ON trace_spans (system_id, correlation_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_trace_spans_flow
+    ON trace_spans (system_id, flow_id, timestamp);
+
+CREATE TABLE IF NOT EXISTS trace_entities (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id    INTEGER NOT NULL,
+    trace_id     TEXT NOT NULL,
+    component_id TEXT NOT NULL,
+    entity_type  TEXT NOT NULL,
+    entity_id    TEXT NOT NULL,
+    role         TEXT NOT NULL DEFAULT 'related',
+    timestamp    REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_trace_entities_lookup
+    ON trace_entities (system_id, entity_type, entity_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_trace_entities_trace
+    ON trace_entities (system_id, trace_id);
+
 CREATE TABLE IF NOT EXISTS system_profile (
     system_id         INTEGER PRIMARY KEY,
     name              TEXT,

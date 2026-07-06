@@ -22,6 +22,61 @@ def _ensure_component(conn, system_id: int, component_id: str) -> None:
     )
 
 
+def _write_lineage(conn, system_id: int, event: TraceEvent) -> None:
+    """Persist optional lineage metadata (Issue #145) in dedicated tables.
+
+    A span row is written whenever any span/flow/correlation metadata is
+    present; entities are re-materialized on re-post so an INSERT OR REPLACE
+    trace stays consistent.
+    """
+    has_span = any(
+        v is not None
+        for v in (event.span_id, event.parent_span_id, event.flow_id, event.correlation_id)
+    )
+    if has_span:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO trace_spans
+                (system_id, trace_id, component_id, span_id, parent_span_id,
+                 flow_id, correlation_id, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                system_id,
+                event.trace_id,
+                event.component_id,
+                event.span_id,
+                event.parent_span_id,
+                event.flow_id,
+                event.correlation_id,
+                event.timestamp,
+            ),
+        )
+
+    # Re-materialize entities for this trace (idempotent on re-post).
+    conn.execute(
+        "DELETE FROM trace_entities WHERE system_id = ? AND trace_id = ?",
+        (system_id, event.trace_id),
+    )
+    for ent in event.entities or []:
+        conn.execute(
+            """
+            INSERT INTO trace_entities
+                (system_id, trace_id, component_id, entity_type, entity_id, role, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                system_id,
+                event.trace_id,
+                event.component_id,
+                ent.type,
+                ent.id,
+                ent.role,
+                event.timestamp,
+            ),
+        )
+
+
 @router.post("/traces", status_code=201)
 def post_trace(
     event: TraceEvent, system_id: int = Depends(get_system_id)
@@ -47,6 +102,7 @@ def post_trace(
                 event.timestamp,
             ),
         )
+        _write_lineage(conn, system_id, event)
     return {"ok": True, "trace_id": event.trace_id}
 
 

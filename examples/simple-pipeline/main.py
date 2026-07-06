@@ -8,8 +8,9 @@ Switch modes from the dashboard (off / trace / shadow) and rerun.
 """
 
 import time
+import uuid
 
-from probe_agent import probe, set_candidate
+from probe_agent import add_entity, probe, probe_context, set_candidate
 
 from components import (
     classify,
@@ -53,9 +54,13 @@ JSON_SAMPLES = [
 
 
 def main() -> None:
-    for s in SAMPLES:
-        print("summary :", run_summarize(s))
-        print("label   :", run_classify(s))
+    for i, s in enumerate(SAMPLES):
+        # Group the summarize + classify probes for this document into one
+        # logical flow so lineage can be queried by document / correlation.
+        with probe_context(correlation_id=str(uuid.uuid4()), flow_id="ingest-doc"):
+            add_entity("document", f"doc-{i}", role="source")
+            print("summary :", run_summarize(s))
+            print("label   :", run_classify(s))
         time.sleep(0.1)
     for j in JSON_SAMPLES:
         print("normal  :", run_normalize(j))

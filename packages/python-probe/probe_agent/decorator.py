@@ -1,4 +1,5 @@
 import atexit
+import contextvars
 import copy
 import functools
 import logging
@@ -6,8 +7,9 @@ import threading
 import time
 import traceback
 import uuid
-from typing import Any, Callable, Dict, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 
+from . import context as _lineage
 from .client import ControlClient
 from .config import ProbeConfig
 from .policy import PolicyCache
@@ -96,7 +98,11 @@ def _ensure_atexit() -> None:
         _atexit_registered = True
 
 
-def probe(component_id: str, candidate: Optional[Callable[..., Any]] = None):
+def probe(
+    component_id: str,
+    candidate: Optional[Callable[..., Any]] = None,
+    entities: Optional[List[Any]] = None,
+):
     """Wrap a function so its input/output/error/duration are reported.
 
     Modes (driven by Control Server policy):
@@ -106,9 +112,15 @@ def probe(component_id: str, candidate: Optional[Callable[..., Any]] = None):
                      candidate runs in a background thread on a snapshot
                      of the inputs and its output is sent as a shadow
                      result for comparison.
+
+    ``entities`` are explicit business-entity references (``{"type","id",
+    "role"}`` or ``(type, id[, role])``) attached to every trace this probe
+    emits, in addition to any entities on the active ``probe_context``. Values
+    are supplied by the caller; no extraction is performed here (Phase 2).
     """
     if candidate is not None:
         set_candidate(component_id, candidate)
+    static_entities = _lineage._normalize_entities(entities)
 
     def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
         @functools.wraps(fn)
@@ -123,6 +135,11 @@ def probe(component_id: str, candidate: Optional[Callable[..., Any]] = None):
                 return fn(*args, **kwargs)
 
             trace_id = str(uuid.uuid4())
+            # Lineage snapshot (span/parent/correlation/flow/entities). Cheap
+            # contextvar reads; only reached once tracing is active.
+            lineage = _lineage.current_lineage(extra_entities=static_entities)
+            span_token = _lineage.enter_span(lineage["span_id"])
+
             start = time.perf_counter()
             error_repr: Optional[str] = None
             output: Any = None
@@ -136,11 +153,19 @@ def probe(component_id: str, candidate: Optional[Callable[..., Any]] = None):
             args_snap = tuple(_snapshot(a) for a in args) if run_shadow else args
             kwargs_snap = {k: _snapshot(v) for k, v in kwargs.items()} if run_shadow else kwargs
 
+            # Capture the context (with this span active) for the shadow
+            # thread so the candidate's nested probes stay on the same
+            # lineage. contextvars are not inherited by threads otherwise.
+            shadow_ctx = contextvars.copy_context() if run_shadow else None
+
             try:
-                output = fn(*args, **kwargs)
-            except BaseException as e:  # noqa: BLE001
-                raised = e
-                error_repr = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+                try:
+                    output = fn(*args, **kwargs)
+                except BaseException as e:  # noqa: BLE001
+                    raised = e
+                    error_repr = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+            finally:
+                _lineage.exit_span(span_token)
 
             duration_ms = (time.perf_counter() - start) * 1000.0
 
@@ -154,6 +179,7 @@ def probe(component_id: str, candidate: Optional[Callable[..., Any]] = None):
                 "duration_ms": duration_ms,
                 "timestamp": time.time(),
             }
+            trace.update(lineage)
             try:
                 _client.send_trace(trace)
             except Exception:  # noqa: BLE001
@@ -165,7 +191,7 @@ def probe(component_id: str, candidate: Optional[Callable[..., Any]] = None):
                     current_output_repr = _safe_repr(output)
                     _spawn_shadow(
                         component_id, trace_id, cand, args_snap, kwargs_snap,
-                        current_output_repr,
+                        current_output_repr, shadow_ctx,
                     )
 
             if raised is not None:
@@ -184,6 +210,7 @@ def _spawn_shadow(
     args: tuple,
     kwargs: dict,
     current_output_repr: str,
+    shadow_ctx: Optional[contextvars.Context] = None,
 ) -> None:
     _ensure_atexit()
 
@@ -215,7 +242,11 @@ def _spawn_shadow(
             with _inflight_lock:
                 _inflight.discard(threading.current_thread())
 
-    t = threading.Thread(target=run, daemon=True, name=f"probe-shadow-{component_id}")
+    # Run inside a copy of the spawning context so the candidate's nested
+    # probes inherit correlation_id / flow_id / entities and become children
+    # of this probe's span (threads do not inherit contextvars).
+    target = run if shadow_ctx is None else (lambda: shadow_ctx.run(run))
+    t = threading.Thread(target=target, daemon=True, name=f"probe-shadow-{component_id}")
     with _inflight_lock:
         _inflight.add(t)
     t.start()

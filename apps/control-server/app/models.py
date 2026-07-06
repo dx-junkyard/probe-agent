@@ -7,6 +7,15 @@ Evaluation = Literal["better", "worse", "same", "unknown"]
 GenerationVerdict = Literal["better", "worse", "same", "unsafe", "error", "unknown"]
 
 
+EntityRole = Literal["source", "derived", "related"]
+
+
+class TraceEntity(BaseModel):
+    type: str
+    id: str
+    role: EntityRole = "related"
+
+
 class TraceEvent(BaseModel):
     trace_id: str
     component_id: str
@@ -16,6 +25,38 @@ class TraceEvent(BaseModel):
     error: Optional[str] = None
     duration_ms: float = 0.0
     timestamp: float
+    # Phase 1 lineage (Issue #145) — all optional, backward compatible.
+    span_id: Optional[str] = None
+    parent_span_id: Optional[str] = None
+    flow_id: Optional[str] = None
+    correlation_id: Optional[str] = None
+    entities: Optional[List[TraceEntity]] = None
+
+
+class LineageEntityOut(BaseModel):
+    type: str
+    id: str
+    role: str = "related"
+
+
+class LineageStepOut(BaseModel):
+    trace_id: str
+    component_id: str
+    mode: Optional[str] = None
+    span_id: Optional[str] = None
+    parent_span_id: Optional[str] = None
+    flow_id: Optional[str] = None
+    correlation_id: Optional[str] = None
+    duration_ms: Optional[float] = None
+    timestamp: float
+    output: Optional[str] = None
+    error: Optional[str] = None
+    entities: List[LineageEntityOut] = Field(default_factory=list)
+
+
+class LineageOut(BaseModel):
+    query: Dict[str, Any] = Field(default_factory=dict)
+    steps: List[LineageStepOut] = Field(default_factory=list)
 
 
 class ShadowResult(BaseModel):

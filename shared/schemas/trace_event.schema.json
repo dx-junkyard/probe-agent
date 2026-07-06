@@ -18,7 +18,26 @@
     "output":      { "type": ["string", "null"] },
     "error":       { "type": ["string", "null"] },
     "duration_ms": { "type": "number", "minimum": 0 },
-    "timestamp":   { "type": "number" }
+    "timestamp":   { "type": "number" },
+
+    "span_id":        { "type": ["string", "null"], "description": "Identifier for this probe invocation (Phase 1 lineage)." },
+    "parent_span_id": { "type": ["string", "null"], "description": "span_id of the enclosing probe invocation, if any." },
+    "flow_id":        { "type": ["string", "null"], "description": "Logical flow this trace participates in." },
+    "correlation_id": { "type": ["string", "null"], "description": "Correlation identifier shared across a request/operation." },
+    "entities": {
+      "type": ["array", "null"],
+      "description": "Business entities this trace relates to (explicit values supplied by the caller).",
+      "items": {
+        "type": "object",
+        "required": ["type", "id"],
+        "properties": {
+          "type": { "type": "string" },
+          "id":   { "type": "string" },
+          "role": { "type": "string", "enum": ["source", "derived", "related"] }
+        },
+        "additionalProperties": false
+      }
+    }
   },
   "additionalProperties": false
 }
