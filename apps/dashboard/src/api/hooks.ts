@@ -519,6 +519,10 @@ export function useInterviewDialogueTurn(sessionId: number | null) {
       answered_question?: string;
       answered_qa_id?: number;
       actor?: string;
+      // Issue #142: mark this turn as an explicit "I don't know" answer so the
+      // consumed Q&A row is recorded as 'unconfirmed' and the model forms a
+      // hypothesis to re-confirm instead of treating it as an answered fact.
+      answer_unknown?: boolean;
     }) =>
       api.post<InterviewDialogueTurnOut>(`/interview/sessions/${sessionId}/dialogue-turn`, data),
     onSuccess: () => {
@@ -555,10 +559,10 @@ export function useCreateInterviewQa(sessionId: number | null) {
 export function useAnswerInterviewQa(sessionId: number | null) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ qaId, answer_text, actor }: { qaId: number; answer_text: string; actor: string }) =>
+    mutationFn: ({ qaId, answer_text, actor, answer_unknown }: { qaId: number; answer_text: string; actor: string; answer_unknown?: boolean }) =>
       api.post<InterviewQaAnswerOut>(
         `/interview/sessions/${sessionId}/qa/${qaId}/answer`,
-        { answer_text, actor },
+        { answer_text, actor, answer_unknown: answer_unknown ?? false },
       ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] });

@@ -480,7 +480,7 @@ function QaItemCard({
   qa, onAnswer, onSkip, onResume, answering, skipping, resuming,
 }: {
   qa: InterviewQaOut;
-  onAnswer: (qaId: number, answerText: string) => Promise<void>;
+  onAnswer: (qaId: number, answerText: string, answerUnknown?: boolean) => Promise<void>;
   onSkip: (qaId: number) => void;
   onResume: (qaId: number) => void;
   answering: boolean;
@@ -493,6 +493,13 @@ function QaItemCard({
   const submit = async () => {
     if (!draft.trim()) return;
     await onAnswer(qa.id, draft.trim());
+    setEditing(false);
+  };
+
+  // Issue #142: 「わからない」を有効な入力として記録する。エラーにはせず、
+  // status=unconfirmed として保存し、以後の推論で仮説→再確認に回す。
+  const submitUnknown = async () => {
+    await onAnswer(qa.id, draft.trim(), true);
     setEditing(false);
   };
 
@@ -513,9 +520,10 @@ function QaItemCard({
           <Badge variant={
             qa.status === "answered" ? "success"
               : qa.status === "skipped" ? "warning"
+              : qa.status === "unconfirmed" ? "warning"
               : qa.status === "revised" ? "secondary" : "outline"
           }>
-            {qa.status}
+            {qa.status === "unconfirmed" ? "不明(要確認)" : qa.status}
           </Badge>
         </div>
       </div>
@@ -581,6 +589,15 @@ function QaItemCard({
             <Button size="sm" onClick={submit} disabled={answering || !draft.trim()}>
               {answering ? "送信中..." : "保存"}
             </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={submitUnknown}
+              disabled={answering}
+              data-testid={`qa-answer-unknown-${qa.id}`}
+            >
+              わからない
+            </Button>
             <Button size="sm" variant="outline" onClick={() => setEditing(false)}>キャンセル</Button>
           </div>
         </div>
@@ -588,7 +605,7 @@ function QaItemCard({
         <div className="flex gap-2">
           <Button size="sm" variant="outline" onClick={() => setEditing(true)}>
             <Pencil className="h-3 w-3 mr-1" />
-            {qa.status === "answered" ? "回答を修正" : "回答する"}
+            {qa.status === "answered" || qa.status === "unconfirmed" ? "回答を修正" : "回答する"}
           </Button>
           {qa.status === "open" && (
             <Button size="sm" variant="outline" onClick={() => onSkip(qa.id)} disabled={skipping}>
@@ -615,10 +632,14 @@ function QaPanel({
   const resume = useResumeInterviewQa(sessionId);
   const runRealityCheck = useRunRuntimeRealityCheck(sessionId);
 
-  const handleAnswer = async (qaId: number, answerText: string) => {
+  const handleAnswer = async (qaId: number, answerText: string, answerUnknown?: boolean) => {
     try {
-      const result = await answer.mutateAsync({ qaId, answer_text: answerText, actor });
-      if (result.regeneration_recommended) {
+      const result = await answer.mutateAsync({
+        qaId, answer_text: answerText, actor, answer_unknown: answerUnknown,
+      });
+      if (answerUnknown) {
+        toast.info("「わからない」として記録しました。仮説を立てて確認質問を続けます。");
+      } else if (result.regeneration_recommended) {
         toast.warning("回答が変わったため、生成済みの提案の再生成を検討してください(自動では再生成されません)。");
       } else {
         toast.success("回答を保存しました");
@@ -1048,7 +1069,7 @@ export default function InterviewPage() {
     }
   };
 
-  const sendText = async (raw: string) => {
+  const sendText = async (raw: string, opts?: { answerUnknown?: boolean }) => {
     const text = raw.trim();
     if (!text || !selectedSessionId) return;
     try {
@@ -1058,10 +1079,12 @@ export default function InterviewPage() {
         answered_question: answeredForTurn.text,
         answered_qa_id: answeredForTurn.qaId,
         actor,
+        answer_unknown: opts?.answerUnknown,
       });
       setMessage("");
       setLastEvidenceReads(result.evidence_reads ?? []);
       if (result.error) toast.error(result.error);
+      else if (opts?.answerUnknown) toast.info("「わからない」として記録しました。仮説を立てて確認を続けます。");
       else if (result.proposals.length) toast.success(`${result.proposals.length}件の提案を生成しました`);
       else toast.success("回答を送信しました");
     } catch (e) {
@@ -1070,6 +1093,11 @@ export default function InterviewPage() {
   };
 
   const sendTurn = () => sendText(message);
+
+  // Issue #142: 現在の focused question に対して「わからない」を明示送信する。
+  // 自由文ではなく answer_unknown フラグで送り、確定回答なしとして記録させる。
+  const sendUnknown = () =>
+    sendText(message.trim() || "わかりません", { answerUnknown: true });
 
   // 「いいえ」は修正内容の入力を促す: 定型の書き出しを入力欄に入れてフォーカスする。
   const startCorrection = () => {
@@ -1272,7 +1300,7 @@ export default function InterviewPage() {
                               ))}
                             </div>
                           )}
-                          {(focusedQuestion.confirmable || (focusedQuestion.answerOptions ?? []).length > 0) && (
+                          {(focusedQuestion.confirmable || (focusedQuestion.answerOptions ?? []).length > 0 || uiState === "fill_gaps") && (
                             <div className="flex flex-wrap gap-2 pt-1" data-testid="quick-answers">
                               {focusedQuestion.confirmable && (
                                 <>
@@ -1309,6 +1337,20 @@ export default function InterviewPage() {
                                   {opt}
                                 </Button>
                               ))}
+                              {/* Issue #142: 明示的な「わからない」入力。自由文ではなく
+                                  answer_unknown フラグで送り、確定回答なしとして記録する。 */}
+                              {uiState === "fill_gaps" && (
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={sendUnknown}
+                                  disabled={dialogueTurn.isPending}
+                                  data-testid="quick-answer-unknown"
+                                >
+                                  <HelpCircle className="h-4 w-4 mr-1" />
+                                  わからない
+                                </Button>
+                              )}
                             </div>
                           )}
                         </div>

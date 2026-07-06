@@ -1971,6 +1971,12 @@ class InterviewDialogueTurnRequest(BaseModel):
     # cannot silently match the wrong question.
     answered_qa_id: Optional[int] = None
     actor: str = Field(default="dashboard", min_length=1, max_length=200)
+    # Issue #142: the developer answered "I don't know" (「わかりません」/不明).
+    # The turn is NOT an error: the answered Q&A row is recorded as
+    # 'unconfirmed' rather than 'answered', and the reasoning model is asked to
+    # form an evidence-grounded hypothesis and re-confirm it, so the interview
+    # continues instead of stopping.
+    answer_unknown: bool = False
 
 
 class InterviewConfirmUnderstandingRequest(BaseModel):
@@ -2057,6 +2063,11 @@ class InterviewDialogueTurnOut(BaseModel):
     # turn's evidence-selection run — every snippet actually read, whether
     # or not a question cited it. evidence_used above is unchanged.
     evidence_reads: List["IntelligenceRunEvidenceOut"] = Field(default_factory=list)
+    # Issue #142: how many question evidence_refs were dropped as unverifiable
+    # (not contained in any known snapshot span). A dropped ref is a graceful
+    # fallback — the question is still asked — so this is surfaced for operator
+    # visibility, not an error.
+    evidence_refs_dropped: int = 0
 
 
 # --- Evidence read audit (Issue #137) -----------------------------------------
@@ -2099,7 +2110,12 @@ InterviewQaCategory = Literal["purpose", "capability", "api", "probe_flow", "gen
 # metadata/probe plans against deterministic runtime trace aggregates,
 # distinct from the dialogue/reviewer/zero_base sources above.
 InterviewQaSource = Literal["reviewer", "dialogue", "zero_base", "runtime"]
-InterviewQaStatus = Literal["open", "answered", "revised", "skipped"]
+# Issue #142: "unconfirmed" records that the developer explicitly could not
+# confirm the answer ("I don't know" / 「わかりません」). It is a valid input,
+# not an error: the row is kept, its answer text stored, and it is fed back to
+# the reasoning model as an open hypothesis to re-confirm — never counted as a
+# confirmed/answered fact.
+InterviewQaStatus = Literal["open", "answered", "revised", "skipped", "unconfirmed"]
 
 
 class InterviewQaEvidenceRefOut(BaseModel):
@@ -2141,12 +2157,26 @@ class InterviewQaAnswerRequest(BaseModel):
     same row (first answer — nothing to supersede). If the current row is
     'answered', this is a correction: a new row is inserted with the new
     answer and the old row is marked 'revised' with superseded_by_id set.
+
+    Issue #142: when ``answer_unknown`` is set, the developer explicitly could
+    not confirm the answer. The row is recorded with status 'unconfirmed'
+    rather than 'answered', ``answer_text`` may be blank, and the interview
+    continues (the reasoning model re-confirms via a hypothesis question).
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    answer_text: str = Field(..., min_length=1, max_length=20_000)
+    # min_length is 0 so an "I don't know" answer can be blank; a validator
+    # below still requires non-empty text for a normal (confirmed) answer.
+    answer_text: str = Field(default="", max_length=20_000)
     actor: str = Field(..., min_length=1, max_length=200)
+    answer_unknown: bool = False
+
+    @model_validator(mode="after")
+    def _require_answer_or_unknown(self) -> "InterviewQaAnswerRequest":
+        if not self.answer_unknown and not self.answer_text.strip():
+            raise ValueError("answer_text is required unless answer_unknown is set")
+        return self
 
 
 class InterviewQaOut(BaseModel):

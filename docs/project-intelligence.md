@@ -1081,6 +1081,43 @@ probe_value / state_effects / recommended_mode)と、同じ component_id のト�
 `InterviewDialogueTurnOut.evidence_reads`
 ([shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json))。
 
+## 不明回答の継続と仮説の再確認(Issue #142)
+
+インタビューで質問された開発者が「わかりません」「不明」など確定回答を持たない
+ことがある。従来はその後の対話ターンで、LLM が仮説のために生成した `evidence_refs`
+の検証に失敗すると `Question evidence validation failed` でターン全体が fail-closed
+となり、会話が停止してしまうことがあった。本 issue は「不明回答」を有効な入力として
+扱い、会話を止めずに仮説→再確認へ回す。
+
+- **不明回答の記録(deterministic / manual)**: 「わからない」かどうかは自由文の
+  ヒューリスティック判定ではなく、UI からの明示フラグ `answer_unknown`(有限の
+  真偽値)で受け取る(Principle 6)。対話ターン(`answered_qa_id` + `answer_unknown`)
+  および `POST .../qa/{qa_id}/answer`(`answer_unknown`)で指定でき、該当 `interview_qa`
+  行は `answered` ではなく **新 status `unconfirmed`** で記録される。回答本文は空でも
+  よい。これは「確定回答なし」という開発者の明示入力であり、エラーではない。
+- **推論コンテキストへの還元(reasoning_llm)**: `unconfirmed` 行は後続ターンの
+  プロンプトに「確定回答なし。確定事実として扱わず、根拠から仮説を立てて確認質問を
+  出す」ブロックとして注入される。`answered`(確定事実、再質問禁止)とは別枠で、
+  混同しない。LLM の仮説は従来どおり `next_questions` の `hypothesis` として
+  `status: "open"` の `interview_qa` 行になり、`current_understanding` の確定理解には
+  ならない(Principle 7: 仮説は `reasoning_llm`、確定は人手の確認で `open` → 回答)。
+- **evidence_refs の graceful fallback(deterministic)**: 質問の `evidence_refs` が
+  既知スパンに含まれない場合、従来はターン全体を fail させていたが、本 issue では
+  **該当参照だけを落として**質問(と仮説)は残す。落とした件数は
+  `InterviewTurnResult.evidence_refs_dropped` に記録する。既知スパンへの包含判定は
+  有限集合に対する構造チェックであり、参照の作り直し(ヒューリスティック解釈)は
+  行わない。1つの不正な行範囲が会話全体を止めることはなくなる。
+
+判断区分: 「不明かどうか」は UI の明示フラグ(deterministic/manual)、不正参照の除去は
+構造チェック(deterministic)、仮説生成と確認質問は reasoning_llm。開発者の確認
+(`open` → 回答)が確定であり、LLM 出力単体では確定にならない(Principle 6/7)。
+
+**含まない:** 自由文からの「不明」自動判定、`unconfirmed` を確定理解として
+`current_understanding` に反映すること、不正 `evidence_refs` の作り直し。
+
+共有スキーマ: `InterviewQA.status` への `"unconfirmed"` の追加
+([shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json))。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。

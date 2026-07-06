@@ -883,7 +883,8 @@
         "created_qa_ids": { "type": "array", "items": { "type": "integer" } },
         "evidence_run": { "oneOf": [{ "$ref": "#/definitions/IntelligenceRun" }, { "type": "null" }] },
         "evidence_used": { "type": "array", "items": { "$ref": "#/definitions/InterviewQaEvidenceRef" } },
-        "evidence_reads": { "type": "array", "items": { "$ref": "#/definitions/IntelligenceRunEvidence" } }
+        "evidence_reads": { "type": "array", "items": { "$ref": "#/definitions/IntelligenceRunEvidence" } },
+        "evidence_refs_dropped": { "type": "integer", "default": 0 }
       },
       "additionalProperties": false
     },
@@ -928,7 +929,7 @@
     },
     "InterviewQA": {
       "type": "object",
-      "description": "A structured interview question/answer row (Issue #129). Correcting an answer never overwrites this row: a new row is inserted with the correction and this row is marked 'revised' with superseded_by_id set to the new row's id.",
+      "description": "A structured interview question/answer row (Issue #129). Correcting an answer never overwrites this row: a new row is inserted with the correction and this row is marked 'revised' with superseded_by_id set to the new row's id. Status 'unconfirmed' (Issue #142) records that the developer explicitly could not confirm the answer ('I don't know'); such rows are valid input, not errors, and are fed back to the reasoning model as open hypotheses to re-confirm, never as established facts.",
       "required": ["id", "session_id", "system_id", "question_text", "question_category", "question_source", "status", "created_at"],
       "properties": {
         "id": { "type": "integer" },
@@ -941,7 +942,7 @@
         "evidence_refs": { "type": "array", "items": { "$ref": "#/definitions/InterviewQaEvidenceRef" } },
         "runtime_evidence": { "type": ["object", "null"] },
         "answer_text": { "type": ["string", "null"] },
-        "status": { "enum": ["open", "answered", "revised", "skipped"] },
+        "status": { "enum": ["open", "answered", "revised", "skipped", "unconfirmed"] },
         "answered_by": { "type": ["string", "null"] },
         "superseded_by_id": { "type": ["integer", "null"] },
         "created_at": { "type": "number" },

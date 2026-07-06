@@ -710,9 +710,11 @@ def test_plain_string_question_normalized():
     assert q.evidence_refs == []
 
 
-def test_question_evidence_unknown_path_fails_closed():
-    """Evidence refs pointing outside the context pack / understanding are
-    rejected — the whole turn fails closed, no heuristic salvage."""
+def test_question_evidence_unknown_path_dropped_not_fatal():
+    """Issue #142: an evidence ref pointing outside the context pack /
+    understanding is dropped (graceful fallback), not fatal. The question and
+    its hypothesis survive so the developer can still confirm it, and no
+    heuristic salvage of the ref happens — it is simply removed."""
     response = _valid_response(proposals=[])
     response["next_questions"] = [{
         "question_text": "これは正しいですか?",
@@ -727,14 +729,16 @@ def test_question_evidence_unknown_path_fails_closed():
         context_pack=_context_pack(), history=[], user_message="質問してください",
     )
 
-    assert result.error is not None
-    assert "unknown path" in result.error
-    assert result.next_questions == []
-    assert result.proposals == []
+    assert result.error is None
+    assert len(result.next_questions) == 1
+    q = result.next_questions[0]
+    assert q.hypothesis == "仮説"
+    assert q.evidence_refs == []
+    assert result.evidence_refs_dropped == 1
 
 
-def test_question_evidence_out_of_range_fails_closed():
-    """Line ranges outside any known span for the path are rejected."""
+def test_question_evidence_out_of_range_dropped_not_fatal():
+    """Line ranges outside any known span for the path are dropped, not fatal."""
     response = _valid_response(proposals=[])
     response["next_questions"] = [{
         "question_text": "これは正しいですか?",
@@ -749,20 +753,22 @@ def test_question_evidence_out_of_range_fails_closed():
         context_pack=_context_pack(), history=[], user_message="質問してください",
     )
 
-    assert result.error is not None
-    assert "not contained" in result.error
-    assert result.next_questions == []
+    assert result.error is None
+    assert len(result.next_questions) == 1
+    assert result.next_questions[0].evidence_refs == []
+    assert result.evidence_refs_dropped == 1
 
 
-def test_question_evidence_partial_overlap_not_containment_fails_closed():
+def test_question_evidence_partial_overlap_dropped_not_fatal():
     """A range that merely overlaps a known span (rather than being fully
-    contained within it) is rejected — overlap alone is not sufficient."""
+    contained within it) is dropped — overlap alone is not containment, but it
+    is not fatal either (Issue #142)."""
     response = _valid_response(proposals=[])
     response["next_questions"] = [{
         "question_text": "これは正しいですか?",
         "hypothesis": "仮説",
         # Known span for src/summarize.py is (1, 10); this range extends
-        # far past it and must not be accepted just because it overlaps.
+        # far past it and must not be kept just because it overlaps.
         "evidence_refs": [{"path": "src/summarize.py", "start_line": 1, "end_line": 999_999}],
         "answer_options": [],
     }]
@@ -773,9 +779,37 @@ def test_question_evidence_partial_overlap_not_containment_fails_closed():
         context_pack=_context_pack(), history=[], user_message="質問してください",
     )
 
-    assert result.error is not None
-    assert "not contained" in result.error
-    assert result.next_questions == []
+    assert result.error is None
+    assert len(result.next_questions) == 1
+    assert result.next_questions[0].evidence_refs == []
+    assert result.evidence_refs_dropped == 1
+
+
+def test_question_evidence_keeps_valid_drops_only_invalid():
+    """When a question mixes a valid and an invalid ref, only the invalid one
+    is dropped — the verifiable citation is preserved (Issue #142)."""
+    response = _valid_response(proposals=[])
+    response["next_questions"] = [{
+        "question_text": "これは正しいですか?",
+        "hypothesis": "仮説",
+        "evidence_refs": [
+            {"path": "src/summarize.py", "start_line": 2, "end_line": 8},
+            {"path": "src/invented.py", "start_line": 1, "end_line": 5},
+        ],
+        "answer_options": [],
+    }]
+    client = FakeLLMClient(response=response)
+
+    result = generate_interview_turn(
+        client, _make_config(),
+        context_pack=_context_pack(), history=[], user_message="質問してください",
+    )
+
+    assert result.error is None
+    assert result.evidence_refs_dropped == 1
+    refs = result.next_questions[0].evidence_refs
+    assert len(refs) == 1
+    assert refs[0].path == "src/summarize.py"
 
 
 def test_question_evidence_path_only_fails_closed():
