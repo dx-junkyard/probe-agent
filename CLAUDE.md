@@ -66,6 +66,11 @@ creating incomplete persistence or execution paths for later phases.
 4. Issue #26 — Experiment Workspace Runner MVP
    - baseline and source-patch variants
    - deterministic metrics plus reasoning-model interpretation
+5. Issue #144 — Trace Lineage & Dynamic Analysis track (sub-issues #145-#152)
+   - entity/correlation/flow lineage, bounded projections, review-gated
+     analyzers, shadow subset diffs, Flow Explorer runtime overlay
+   - implement sub-issues in dependency order; see the Issue #144 section in
+     `docs/project-intelligence.md` for the breakdown and design decisions
 
 The existing `GET /project-intelligence` endpoint and the Repository,
 Feature Map, Probe Planner, and Experiments tabs are explicit mocks. Replace

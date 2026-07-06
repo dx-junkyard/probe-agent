@@ -1118,6 +1118,41 @@ probe_value / state_effects / recommended_mode)と、同じ component_id のト�
 共有スキーマ: `InterviewQA.status` への `"unconfirmed"` の追加
 ([shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json))。
 
+## 大規模トレースのリネージと動的分析(Issue #144)
+
+大きな payload・バッチ・多数の派生レコードを扱うシステム向けに、component 単位の
+トレース閲覧を「エンティティ単位・フロー単位の観測と分析」へ拡張する。設計の全体像は
+Issue #144 に集約し、実装は以下の sub-issue に依存順で分割した(#144 の Phase 案を
+ベースに一部再構成している)。
+
+| Sub-issue | 内容 | 依存 |
+| --- | --- | --- |
+| #145 | 系譜メタデータ基盤: `span_id` / `parent_span_id` / `flow_id` / `correlation_id` / entity refs(明示値のみ)、`trace_spans` / `trace_entities`、lineage クエリ API | なし |
+| #146 | 宣言的 Projection: 制約付きパス式 + 有限演算(`len`/`count`/`exists`/`sha256`/`sample`)、SDK 抽出エンジン、`trace_projections`、`id_path` による entity 抽出 | #145 |
+| #147 | Trace Lineage Explorer(Dashboard MVP): entity/correlation/flow 検索、ステップ表示、field 変化ハイライト | #145, #146 |
+| #148 | Analyzer 手動作成と read-only 実行基盤: spec スキーマ、`trace_analyzers` / `trace_analysis_runs`、review ゲート、実行上限 | #145, #146 |
+| #149 | LLM 支援 Analyzer 提案: 自然言語 → reasoning model → schema 検証 → `proposed`。fail closed、監査メタデータ必須 | #148 |
+| #150 | Shadow 対応 projection と subset diff 集計: `shadow_current` / `shadow_candidate` phase、analyzer filter 下の決定的差分集計 | #146, #148 |
+| #151 | Flow Explorer への runtime lineage overlay: 観測済み/未観測 probe point、静的フローとの乖離表示 | #145, #147 |
+| #152 | sampling と retention: trace_id ハッシュベースの決定的 sampling、期間・件数 retention、監査付き削除 | #145, #146, #148 |
+
+#144 原文からの主な設計調整:
+
+- **パス式による entity 抽出は Phase 1 から Phase 2(#146)へ移動**: `id_path` 評価は
+  projection の式エンジンを必要とするため、#145 では明示値のエンティティ付与のみとし、
+  式エンジンの所有権を #146 に一本化した。
+- **Phase 4 を手動(#148)と LLM 提案(#149)に分割**: 決定的な spec 検証・実行基盤と
+  reasoning_llm による提案(Principle 6/7 の監査・fail closed 要件)を別 issue にした。
+- **`caused_by` フィールドと `record_derivation` は初期実装から除外**: 派生エンティティは
+  生成元トレースへ `role="derived"` で付与すれば lineage クエリが成立するため、独立した
+  entity 間派生グラフは必要になった時点で別 issue とする。
+- **sampling / retention を独立 issue(#152)に分離**: 初期実装はサイズ・件数上限のみを
+  持ち、時間軸の運用ポリシーは分けて設計する。
+
+判断区分: 系譜の保存/検索、projection 抽出、analyzer の検証/実行、diff 集計、overlay の
+突き合わせはすべて deterministic。自然言語からの analyzer spec 生成のみ reasoning_llm
+(承認は manual)。LLM は ingest のホットパスには置かない。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。
