@@ -221,6 +221,33 @@ CREATE TABLE IF NOT EXISTS trace_analysis_runs (
 CREATE INDEX IF NOT EXISTS idx_trace_analysis_runs_analyzer
     ON trace_analysis_runs (system_id, analyzer_id, id DESC);
 
+-- Retention policies + audit (Issue #152). Explicit, per-target settings for
+-- lineage/projection/analyzer-run data. Default behaviour with no rows is
+-- "never delete". target_table is one of trace_spans / trace_entities /
+-- trace_projections / trace_analysis_runs.
+CREATE TABLE IF NOT EXISTS retention_policies (
+    system_id    INTEGER NOT NULL,
+    target_table TEXT NOT NULL,
+    max_age_days REAL,
+    max_count    INTEGER,
+    updated_at   REAL NOT NULL,
+    PRIMARY KEY (system_id, target_table),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS retention_audit (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id     INTEGER NOT NULL,
+    target_table  TEXT NOT NULL,
+    deleted_count INTEGER NOT NULL,
+    reason        TEXT NOT NULL,
+    executed_at   REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_retention_audit_system
+    ON retention_audit (system_id, id DESC);
+
 CREATE TABLE IF NOT EXISTS system_profile (
     system_id         INTEGER PRIMARY KEY,
     name              TEXT,

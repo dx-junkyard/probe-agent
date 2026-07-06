@@ -81,6 +81,24 @@ def handle(order):
   shadow スレッド内で抽出されて比較用に送信される(Issue #150)。production の返り値は
   不変で、candidate がエラーなら `shadow_candidate` は送られない。
 
+## サンプリング（Issue #152 / Phase 7）
+
+高頻度コンポーネントで lineage / projection の量を抑えるため、`@probe(sample_rate=...)`
+で **決定的なサンプリング**ができる。
+
+```python
+@probe(component_id="hot-path", sample_rate=0.1, projection=...)
+def handler(x):
+    ...
+```
+
+- `sample_rate` は `trace_id` のハッシュに基づく決定的判定(seed 不要)。同じ trace の
+  input / output / shadow projection と lineage は**まとめて残るか、まとめて落ちる**。
+- **trace 本体は常に全件送信**され、既存挙動は変わらない。間引かれるのは lineage
+  (span / correlation / flow / entities)と projection のみ。
+- `None`(既定)は全件保持。`0.0` は lineage/projection を全て落とす。
+- 保存済みデータの期間・件数 retention は Control Server 側の設定(`/retention/*`)で行う。
+
 ## 環境変数
 
 | 名前 | デフォルト | 説明 |

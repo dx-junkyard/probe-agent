@@ -207,13 +207,16 @@ def review_analyzer(
     return _row_to_analyzer(row)
 
 
-def _row_to_run(row) -> AnalysisRunOut:
+def _row_to_run(row, projection_cutoff: "float | None" = None) -> AnalysisRunOut:
     result = None
     if row["result_json"]:
         try:
             result = json.loads(row["result_json"])
         except json.JSONDecodeError:
             result = None
+    # Issue #152: flag runs whose referenced projections may have been pruned
+    # by a retention policy (conservative, by age; no reference counting).
+    data_expired = bool(projection_cutoff is not None and row["started_at"] < projection_cutoff)
     return AnalysisRunOut(
         id=row["id"],
         analyzer_id=row["analyzer_id"],
@@ -223,6 +226,12 @@ def _row_to_run(row) -> AnalysisRunOut:
         row_count=row["row_count"],
         started_at=row["started_at"],
         completed_at=row["completed_at"],
+        data_expired=data_expired,
+        data_expired_note=(
+            "Projection data older than the retention window may have been "
+            "deleted; this result can reference pruned traces."
+            if data_expired else None
+        ),
     )
 
 
@@ -275,20 +284,25 @@ def create_run(
 def list_runs(
     analyzer_id: int, system_id: int = Depends(get_system_id)
 ) -> List[AnalysisRunOut]:
+    from ..retention import projection_expiry_cutoff
+
     with get_conn() as conn:
         _fetch_analyzer(conn, system_id, analyzer_id)
+        cutoff = projection_expiry_cutoff(conn, system_id)
         rows = conn.execute(
             "SELECT * FROM trace_analysis_runs WHERE system_id = ? AND analyzer_id = ? "
             "ORDER BY id DESC",
             (system_id, analyzer_id),
         ).fetchall()
-    return [_row_to_run(r) for r in rows]
+    return [_row_to_run(r, cutoff) for r in rows]
 
 
 @router.get("/trace-analyzers/{analyzer_id}/runs/{run_id}", response_model=AnalysisRunOut)
 def get_run(
     analyzer_id: int, run_id: int, system_id: int = Depends(get_system_id)
 ) -> AnalysisRunOut:
+    from ..retention import projection_expiry_cutoff
+
     with get_conn() as conn:
         row = conn.execute(
             "SELECT * FROM trace_analysis_runs WHERE id = ? AND analyzer_id = ? AND system_id = ?",
@@ -296,4 +310,5 @@ def get_run(
         ).fetchone()
         if row is None:
             raise HTTPException(404, "run not found")
-    return _row_to_run(row)
+        cutoff = projection_expiry_cutoff(conn, system_id)
+    return _row_to_run(row, cutoff)

@@ -61,6 +61,9 @@ uvicorn app.main:app --reload --port 8000
 | POST | `/trace-analyzers/{id}/runs` | approved のみ read-only 実行(#148) |
 | GET  | `/trace-analyzers/{id}/runs[/{run_id}]` | run 一覧・取得(#148) |
 | POST | `/repository/flow-overlay` | 静的フローに runtime lineage を重ねる overlay(#151) |
+| GET/PUT | `/retention/policies` | system 単位の retention 設定(既定は削除しない、#152) |
+| POST | `/retention/apply` | retention の明示適用(古い順・監査付き、#152) |
+| GET  | `/retention/audit` | retention 適用の監査ログ(#152) |
 
 DB ファイルは `PROBE_DB_PATH` (既定 `./probe.db`) で切り替えられる。
 
@@ -72,6 +75,7 @@ DB ファイルは `PROBE_DB_PATH` (既定 `./probe.db`) で切り替えられ�
 | `ANALYZER_MAX_OUTPUT_BYTES` | `200000` | analyzer 結果 JSON の最大バイト数(超過で run 失敗) |
 | `ANALYZER_MAX_SECONDS` | `10` | analyzer 実行の最大秒数(超過で run 失敗) |
 | `ANALYZER_MAX_EXAMPLES` | `5` | shadow diff の diff クラスごとに保持する例示トレース数(#150) |
+| `RETENTION_BATCH_SIZE` | `1000` | retention 削除のバッチ上限(長時間ロック回避、#152) |
 
 SDK 側の projection 上限(`PROBE_PROJECTION_MAX_*`)は `packages/python-probe/README.md` を参照。
 

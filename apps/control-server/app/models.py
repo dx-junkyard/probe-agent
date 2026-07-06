@@ -148,6 +148,50 @@ class AnalysisRunOut(BaseModel):
     row_count: Optional[int] = None
     started_at: float
     completed_at: Optional[float] = None
+    # Issue #152: set when a retention policy may have pruned the projection
+    # data this run referenced (no reference counting; conservative by age).
+    data_expired: bool = False
+    data_expired_note: Optional[str] = None
+
+
+RetentionTarget = Literal[
+    "trace_spans", "trace_entities", "trace_projections", "trace_analysis_runs"
+]
+
+
+class RetentionPolicyIn(BaseModel):
+    target_table: RetentionTarget
+    max_age_days: Optional[float] = Field(default=None, ge=0)
+    max_count: Optional[int] = Field(default=None, ge=0)
+
+
+class RetentionPoliciesUpdate(BaseModel):
+    policies: List[RetentionPolicyIn] = Field(default_factory=list)
+
+
+class RetentionPolicyOut(BaseModel):
+    target_table: str
+    max_age_days: Optional[float] = None
+    max_count: Optional[int] = None
+    updated_at: float
+
+
+class RetentionApplyResult(BaseModel):
+    target_table: str
+    deleted_count: int
+
+
+class RetentionApplyOut(BaseModel):
+    executed_at: float
+    results: List[RetentionApplyResult] = Field(default_factory=list)
+
+
+class RetentionAuditOut(BaseModel):
+    id: int
+    target_table: str
+    deleted_count: int
+    reason: str
+    executed_at: float
 
 
 class ShadowResult(BaseModel):

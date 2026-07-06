@@ -99,6 +99,8 @@ export interface AnalysisRun {
   row_count: number | null;
   started_at: number;
   completed_at: number | null;
+  data_expired?: boolean;
+  data_expired_note?: string | null;
 }
 
 // Flow Explorer runtime overlay (Issue #151)

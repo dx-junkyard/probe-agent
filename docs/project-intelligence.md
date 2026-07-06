@@ -1306,6 +1306,29 @@ Flow Explorer(Issue #43 / #58 の静的フロー)に **runtime lineage overlay**
   バッジで区別し、乖離遷移を強調表示する。overlay 未選択時の既存挙動は不変。
 - **DB 所有権なし**(毎回決定的に突き合わせて算出、新規テーブルなし)。
 
+### Phase 7 実装状態(#152)
+
+運用ハードニング: sampling と retention。
+
+- **SDK sampling**: `@probe(sample_rate=...)` による **trace_id ハッシュベースの決定的
+  サンプリング**。trace 本体は常に全件送信し、lineage(span/correlation/flow/entities)
+  と projection(input/output/shadow)のみをまとめて間引く(同一 trace は全採用か全棄却)。
+  `None`=全採用、`0.0`=lineage/projection を全棄却。
+- **retention 設定**: system-scoped の `retention_policies`(target=`trace_spans` /
+  `trace_entities` / `trace_projections` / `trace_analysis_runs`、軸=`max_age_days` /
+  `max_count`)。**既定は「削除しない」**(ポリシー行が無ければ何もしない)。
+- **適用**: `POST /retention/apply` の明示トリガーで、古い順・ポリシー範囲内のみ削除。
+  `RETENTION_BATCH_SIZE`(既定 1000)で rowid バッチ削除し長時間ロックを回避。System-
+  scoped(他 system に触れない、isolation テストあり)。適用結果(対象・件数・時刻)を
+  `retention_audit` に監査記録。
+- **削除済み参照の明示**: 参照カウントはせず、analyzer run の `started_at` が
+  projection の age retention cutoff より古ければ `data_expired=true` +
+  note を返す(保守的・決定的)。
+- **API**: `GET/PUT /retention/policies`、`POST /retention/apply`、
+  `GET /retention/audit`。新環境変数は README に記載。
+- **非目標**: traces / shadow_results 本体の retention、自動アーカイブ、LLM による
+  削除判断(ポリシーは常に人間設定の決定的ルール)。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。

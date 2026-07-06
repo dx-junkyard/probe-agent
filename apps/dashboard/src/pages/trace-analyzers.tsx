@@ -231,6 +231,11 @@ export default function TraceAnalyzersPage() {
                     {latestRun.error_details && (
                       <p className="text-xs text-destructive">{latestRun.error_details}</p>
                     )}
+                    {latestRun.data_expired && (
+                      <p className="text-xs text-amber-600">
+                        ⚠ {latestRun.data_expired_note ?? "Referenced data may have been deleted by retention."}
+                      </p>
+                    )}
                     {latestRun.status === "completed" && (
                       <AddToWorkspaceButton
                         itemType="analyzer_run"

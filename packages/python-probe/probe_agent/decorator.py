@@ -2,6 +2,7 @@ import atexit
 import contextvars
 import copy
 import functools
+import hashlib
 import logging
 import threading
 import time
@@ -40,6 +41,23 @@ def set_projection(component_id: str, spec: Any) -> None:
 def _get_projection(component_id: str) -> "Optional[_projection.ProjectionSpec]":
     with _projections_lock:
         return _projections.get(component_id)
+
+
+def _sampled_in(trace_id: str, sample_rate: Optional[float]) -> bool:
+    """Deterministic, trace_id-hash-based sampling decision (Issue #152).
+
+    ``None`` keeps everything. The same trace_id always yields the same
+    decision, so a trace's input/output/shadow projections and lineage are all
+    kept or all dropped together. The trace body itself is never sampled out —
+    only lineage/projection enrichment is.
+    """
+    if sample_rate is None or sample_rate >= 1.0:
+        return True
+    if sample_rate <= 0.0:
+        return False
+    digest = hashlib.sha256(trace_id.encode("utf-8")).hexdigest()[:8]
+    fraction = int(digest, 16) / 0xFFFFFFFF
+    return fraction < sample_rate
 
 _inflight: Set[threading.Thread] = set()
 _inflight_lock = threading.Lock()
@@ -123,6 +141,7 @@ def probe(
     candidate: Optional[Callable[..., Any]] = None,
     entities: Optional[List[Any]] = None,
     projection: Optional[Any] = None,
+    sample_rate: Optional[float] = None,
 ):
     """Wrap a function so its input/output/error/duration are reported.
 
@@ -159,6 +178,9 @@ def probe(
                 return fn(*args, **kwargs)
 
             trace_id = str(uuid.uuid4())
+            # Deterministic sampling (Issue #152): the trace body is always
+            # sent; only lineage + projections are sampled by trace_id hash.
+            keep_enrichment = _sampled_in(trace_id, sample_rate)
             # Lineage snapshot (span/parent/correlation/flow/entities). Cheap
             # contextvar reads; only reached once tracing is active.
             lineage = _lineage.current_lineage(extra_entities=static_entities)
@@ -203,10 +225,11 @@ def probe(
                 "duration_ms": duration_ms,
                 "timestamp": time.time(),
             }
-            trace.update(lineage)
+            if keep_enrichment:
+                trace.update(lineage)
 
             spec = _get_projection(component_id)
-            if spec is not None:
+            if spec is not None and keep_enrichment:
                 # Extraction is non-fatal: a bad projection must not break the
                 # host function. Input root is a stable {args, kwargs} envelope;
                 # output root is the return value (absent when fn raised).
@@ -234,7 +257,8 @@ def probe(
                     current_output_repr = _safe_repr(output)
                     _spawn_shadow(
                         component_id, trace_id, cand, args_snap, kwargs_snap,
-                        current_output_repr, shadow_ctx, spec, output,
+                        current_output_repr, shadow_ctx,
+                        spec if keep_enrichment else None, output,
                     )
 
             if raised is not None:
