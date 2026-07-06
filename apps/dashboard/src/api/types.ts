@@ -33,6 +33,45 @@ export interface Policy {
   mode: "off" | "trace" | "shadow";
 }
 
+// Trace lineage (Issue #145/#146/#147)
+export interface LineageEntity {
+  type: string;
+  id: string;
+  role: string;
+}
+
+export interface LineageProjection {
+  projection_name: string;
+  phase: string;
+  fields: Record<string, unknown>;
+  metrics: Record<string, unknown>;
+  samples: Record<string, unknown>;
+  data_hash: string | null;
+  truncated: boolean;
+  error: string | null;
+}
+
+export interface LineageStep {
+  trace_id: string;
+  component_id: string;
+  mode: string | null;
+  span_id: string | null;
+  parent_span_id: string | null;
+  flow_id: string | null;
+  correlation_id: string | null;
+  duration_ms: number | null;
+  timestamp: number;
+  output: string | null;
+  error: string | null;
+  entities: LineageEntity[];
+  projections: LineageProjection[];
+}
+
+export interface LineageOut {
+  query: Record<string, unknown>;
+  steps: LineageStep[];
+}
+
 export interface ShadowResult {
   id: number;
   trace_id: string;

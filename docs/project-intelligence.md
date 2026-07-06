@@ -1194,6 +1194,23 @@ Issue #144 に集約し、実装は以下の sub-issue に依存順で分割し�
   `GET /traces/{trace_id}/projections` と `GET /components/{component_id}/projections`。
 - 新環境変数は README / この節に記載。
 
+### Phase 3 実装状態(#147)
+
+- **サーバー**: 可視化用に別 endpoint を足すのではなく、既存 lineage API
+  (`/trace-lineage/{entities,correlations,flows}`)の各 step に projection を **同梱**
+  する方針を採用した(`LineageStepOut.projections`)。UI が追加リクエストなしで
+  projected fields を描画できる。決定は本節に記録(issue #147 の実装時判断)。
+- **Dashboard**: 新ページ `Trace Lineage Explorer`(`/trace-lineage`、サイドバー導線)。
+  entity type + ID / correlation ID / flow ID で検索し、timestamp・parent_span 準拠の
+  縦タイムラインで表示する。各ノードは component_id、projected `fields` / `metrics`、
+  entity バッジ(source/derived/related)を表示し、**前ステップとの field 値変化を
+  決定的な等値比較でハイライト**する(大きい値は文字数 digest 表示)。ノードから
+  Components / Flow Explorer へ遷移でき、lineage が無いシステムでは
+  `probe_context` / projection 設定を案内する空状態を出す。フック `useLineage`。
+- 比較・整列・変化判定はすべて deterministic(等値比較のみ、意味解釈はしない)。
+- テスト: dashboard contracts(検索→ステップ表示→変化ハイライト→空状態)、
+  サーバー lineage への projection 同梱テスト。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。

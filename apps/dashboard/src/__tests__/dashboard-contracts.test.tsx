@@ -3222,3 +3222,94 @@ describe("Per-screen assistant panel", () => {
     });
   });
 });
+
+// ── Trace Lineage Explorer (Issue #147) ─────────────────────────────
+
+describe("Trace Lineage Explorer page", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  function lineageResponse() {
+    return {
+      query: { kind: "entity", entity_type: "order", entity_id: "o-1" },
+      steps: [
+        {
+          trace_id: "trace-aaaa1111", component_id: "validate", mode: "trace",
+          span_id: "s1", parent_span_id: null, flow_id: "f1", correlation_id: "c1",
+          duration_ms: 2, timestamp: 100, output: "'ok'", error: null,
+          entities: [{ type: "order", id: "o-1", role: "source" }],
+          projections: [{
+            projection_name: "orders", phase: "output",
+            fields: { status: "pending" }, metrics: {}, samples: {},
+            data_hash: "h1", truncated: false, error: null,
+          }],
+        },
+        {
+          trace_id: "trace-bbbb2222", component_id: "charge", mode: "trace",
+          span_id: "s2", parent_span_id: "s1", flow_id: "f1", correlation_id: "c1",
+          duration_ms: 3, timestamp: 200, output: "'ok'", error: null,
+          entities: [{ type: "order", id: "o-1", role: "related" }],
+          projections: [{
+            projection_name: "orders", phase: "output",
+            fields: { status: "charged" }, metrics: {}, samples: {},
+            data_hash: "h2", truncated: false, error: null,
+          }],
+        },
+      ],
+    };
+  }
+
+  test("searching an entity shows time-ordered steps with projected fields", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path.startsWith("/trace-lineage/entities/")) return Promise.resolve(lineageResponse());
+      return Promise.resolve({});
+    });
+    const { default: TraceLineagePage } = await import("@/pages/trace-lineage");
+    render(<TraceLineagePage />, { wrapper: createWrapper() });
+
+    fireEvent.change(screen.getByLabelText("entity type"), { target: { value: "order" } });
+    fireEvent.change(screen.getByLabelText("entity id"), { target: { value: "o-1" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+
+    await waitFor(() => {
+      expect(mockApi.get).toHaveBeenCalledWith("/trace-lineage/entities/order/o-1");
+    });
+    expect(await screen.findByText("validate")).toBeInTheDocument();
+    expect(screen.getByText("charge")).toBeInTheDocument();
+    // Projected field values are shown.
+    expect(screen.getByText(/pending/)).toBeInTheDocument();
+    expect(screen.getByText(/charged/)).toBeInTheDocument();
+  });
+
+  test("changed projected field between steps is highlighted", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path.startsWith("/trace-lineage/entities/")) return Promise.resolve(lineageResponse());
+      return Promise.resolve({});
+    });
+    const { default: TraceLineagePage } = await import("@/pages/trace-lineage");
+    render(<TraceLineagePage />, { wrapper: createWrapper() });
+
+    fireEvent.change(screen.getByLabelText("entity type"), { target: { value: "order" } });
+    fireEvent.change(screen.getByLabelText("entity id"), { target: { value: "o-1" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+
+    // The second step's status changed (pending -> charged): a change marker appears.
+    const markers = await screen.findAllByLabelText("changed");
+    expect(markers.length).toBeGreaterThanOrEqual(1);
+  });
+
+  test("empty lineage shows SDK setup guidance", async () => {
+    mockApi.get.mockImplementation(() => Promise.resolve({ query: {}, steps: [] }));
+    const { default: TraceLineagePage } = await import("@/pages/trace-lineage");
+    render(<TraceLineagePage />, { wrapper: createWrapper() });
+
+    fireEvent.change(screen.getByLabelText("entity type"), { target: { value: "order" } });
+    fireEvent.change(screen.getByLabelText("entity id"), { target: { value: "missing" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+
+    expect(await screen.findByText(/No lineage found/)).toBeInTheDocument();
+    expect(screen.getByText(/probe_context/)).toBeInTheDocument();
+  });
+});

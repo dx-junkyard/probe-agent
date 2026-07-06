@@ -2,6 +2,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, getSystemId } from "./client";
 import type {
   SystemOut, ComponentSummary, TraceEvent, Policy,
+  LineageOut,
   ShadowResult, ComponentProfile, UserOut, TokenOut,
   RepositoryCandidateOut, RepositoryConfigOut, SnapshotOut, LatestDraftsOut,
   DraftGenerationResultOut,
@@ -92,6 +93,36 @@ export function useUpdatePolicy() {
     mutationFn: ({ componentId, mode }: { componentId: string; mode: string }) =>
       api.put<Policy>(`/components/${componentId}/policy`, { mode }),
     onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("components") }),
+  });
+}
+
+// Trace lineage (Issue #147). kind selects the query dimension.
+export type LineageQuery =
+  | { kind: "entity"; entityType: string; entityId: string }
+  | { kind: "correlation"; id: string }
+  | { kind: "flow"; id: string };
+
+function lineagePath(q: LineageQuery): string {
+  if (q.kind === "entity") {
+    return `/trace-lineage/entities/${encodeURIComponent(q.entityType)}/${encodeURIComponent(q.entityId)}`;
+  }
+  if (q.kind === "correlation") {
+    return `/trace-lineage/correlations/${encodeURIComponent(q.id)}`;
+  }
+  return `/trace-lineage/flows/${encodeURIComponent(q.id)}`;
+}
+
+function lineageReady(q: LineageQuery | null): boolean {
+  if (!q) return false;
+  if (q.kind === "entity") return !!q.entityType && !!q.entityId;
+  return !!q.id;
+}
+
+export function useLineage(query: LineageQuery | null) {
+  return useQuery({
+    queryKey: [...sysKey("trace-lineage"), query],
+    queryFn: () => api.get<LineageOut>(lineagePath(query as LineageQuery)),
+    enabled: lineageReady(query) && !!getSystemId(),
   });
 }
 

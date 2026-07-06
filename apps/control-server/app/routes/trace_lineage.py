@@ -6,13 +6,19 @@ metadata and entities. This is the minimal shape a client needs to assemble a
 lineage graph; richer projections arrive in later phases.
 """
 
+import json
 from typing import List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Query
 
 from ..auth import get_system_id
 from ..db import get_conn
-from ..models import LineageEntityOut, LineageOut, LineageStepOut
+from ..models import (
+    LineageEntityOut,
+    LineageOut,
+    LineageProjectionOut,
+    LineageStepOut,
+)
 
 router = APIRouter()
 
@@ -42,11 +48,35 @@ def _assemble(conn, system_id: int, ordered: List[Tuple[str, float]]) -> List[Li
             """,
             (system_id, trace_id),
         ).fetchall()
+        prows = conn.execute(
+            """
+            SELECT projection_name, phase, data_json, data_hash, truncated, extract_error
+            FROM trace_projections WHERE system_id = ? AND trace_id = ?
+            ORDER BY projection_name, phase
+            """,
+            (system_id, trace_id),
+        ).fetchall()
 
         entities = [
             LineageEntityOut(type=e["entity_type"], id=e["entity_id"], role=e["role"])
             for e in erows
         ]
+        projections = []
+        for p in prows:
+            try:
+                data = json.loads(p["data_json"]) if p["data_json"] else {}
+            except json.JSONDecodeError:
+                data = {}
+            projections.append(LineageProjectionOut(
+                projection_name=p["projection_name"],
+                phase=p["phase"],
+                fields=data.get("fields", {}) or {},
+                metrics=data.get("metrics", {}) or {},
+                samples=data.get("samples", {}) or {},
+                data_hash=p["data_hash"],
+                truncated=bool(p["truncated"]),
+                error=p["extract_error"],
+            ))
         if trow is not None:
             step = LineageStepOut(
                 trace_id=trow["trace_id"],
@@ -61,6 +91,7 @@ def _assemble(conn, system_id: int, ordered: List[Tuple[str, float]]) -> List[Li
                 flow_id=srow["flow_id"] if srow else None,
                 correlation_id=srow["correlation_id"] if srow else None,
                 entities=entities,
+                projections=projections,
             )
         else:
             # Span/entity exists but the trace row was pruned; still surface it.
@@ -73,6 +104,7 @@ def _assemble(conn, system_id: int, ordered: List[Tuple[str, float]]) -> List[Li
                 flow_id=srow["flow_id"] if srow else None,
                 correlation_id=srow["correlation_id"] if srow else None,
                 entities=entities,
+                projections=projections,
             )
         steps.append(step)
     return steps

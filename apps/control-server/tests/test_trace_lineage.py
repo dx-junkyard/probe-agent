@@ -82,6 +82,22 @@ def test_flow_lineage_with_spans(client):
     assert steps[1]["span_id"] == "s2"
 
 
+def test_lineage_includes_projections(client):
+    """Phase 3 (#147): lineage steps carry projected fields for the UI."""
+    client.post("/traces", json=_trace(
+        "t1", ts=1.0, correlation_id="k",
+        projections=[{"projection_name": "orders", "phase": "output",
+                      "fields": {"status": "pending"}}]))
+    client.post("/traces", json=_trace(
+        "t2", ts=2.0, correlation_id="k",
+        projections=[{"projection_name": "orders", "phase": "output",
+                      "fields": {"status": "charged"}}]))
+
+    steps = client.get("/trace-lineage/correlations/k").json()["steps"]
+    assert steps[0]["projections"][0]["fields"] == {"status": "pending"}
+    assert steps[1]["projections"][0]["fields"] == {"status": "charged"}
+
+
 def test_repost_replaces_entities(client):
     client.post("/traces", json=_trace(
         "t1", entities=[{"type": "order", "id": "old"}]))

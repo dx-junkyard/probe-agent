@@ -70,6 +70,17 @@ class LineageEntityOut(BaseModel):
     role: str = "related"
 
 
+class LineageProjectionOut(BaseModel):
+    projection_name: str
+    phase: str
+    fields: Dict[str, Any] = Field(default_factory=dict)
+    metrics: Dict[str, Any] = Field(default_factory=dict)
+    samples: Dict[str, Any] = Field(default_factory=dict)
+    data_hash: Optional[str] = None
+    truncated: bool = False
+    error: Optional[str] = None
+
+
 class LineageStepOut(BaseModel):
     trace_id: str
     component_id: str
@@ -83,6 +94,7 @@ class LineageStepOut(BaseModel):
     output: Optional[str] = None
     error: Optional[str] = None
     entities: List[LineageEntityOut] = Field(default_factory=list)
+    projections: List[LineageProjectionOut] = Field(default_factory=list)
 
 
 class LineageOut(BaseModel):

@@ -8,6 +8,7 @@ import CapabilityMapPage from "./pages/capability-map";
 import InterviewPage from "./pages/interview";
 import ProbePlannerPage from "./pages/probe-planner";
 import FlowExplorerPage from "./pages/flow-explorer";
+import TraceLineagePage from "./pages/trace-lineage";
 import ExperimentsPage from "./pages/experiments";
 import ConnectSdkPage from "./pages/connect-sdk";
 import GenerationPage from "./pages/generation";
@@ -29,6 +30,7 @@ export default function App() {
         <Route path="capability-map" element={<CapabilityMapPage />} />
         <Route path="interview" element={<InterviewPage />} />
         <Route path="flow-explorer" element={<FlowExplorerPage />} />
+        <Route path="trace-lineage" element={<TraceLineagePage />} />
         <Route path="probe-planner" element={<ProbePlannerPage />} />
         <Route path="experiments" element={<ExperimentsPage />} />
         <Route path="connect-sdk" element={<ConnectSdkPage />} />
