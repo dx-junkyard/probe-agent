@@ -331,6 +331,41 @@ def _apply_limits(data: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
     return data, truncated
 
 
+def extract_phase(spec: ProjectionSpec, root: Any, phase: str) -> Optional[Dict[str, Any]]:
+    """Apply the spec's ``output`` section to ``root`` under an arbitrary phase
+    label (used for shadow_current / shadow_candidate in Phase 5 / Issue #150).
+
+    Returns ``None`` when the spec has no output section, or a diagnostic
+    payload with ``error`` set if extraction fails (never raises).
+    """
+    if "output" not in spec.sections:
+        return None
+    try:
+        redacted = _apply_redaction(root, spec.redact)
+        data = _extract_section(spec.sections["output"], redacted)
+        data, truncated = _apply_limits(data)
+        return {
+            "projection_name": spec.name,
+            "phase": phase,
+            "fields": data["fields"],
+            "metrics": data["metrics"],
+            "samples": data["samples"],
+            "data_hash": _hash(data),
+            "truncated": truncated,
+        }
+    except Exception as e:  # noqa: BLE001 — non-fatal diagnostic
+        return {
+            "projection_name": spec.name,
+            "phase": phase,
+            "fields": {},
+            "metrics": {},
+            "samples": {},
+            "data_hash": None,
+            "truncated": False,
+            "error": f"{type(e).__name__}: {e}",
+        }
+
+
 def extract(
     spec: ProjectionSpec,
     input_root: Any = _MISSING,

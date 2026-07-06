@@ -1,3 +1,4 @@
+import json
 import time
 from typing import List
 
@@ -8,6 +9,38 @@ from ..db import get_conn
 from ..models import EvaluationUpdate, ShadowResult
 
 router = APIRouter()
+
+
+def _write_shadow_projections(conn, system_id: int, result: ShadowResult) -> None:
+    """Persist shadow_current / shadow_candidate projections (Issue #150),
+    keyed by the existing trace_id. Never stores the raw payload."""
+    if not result.projections:
+        return
+    for proj in result.projections:
+        data_json = json.dumps(
+            {"fields": proj.fields, "metrics": proj.metrics, "samples": proj.samples},
+            ensure_ascii=False,
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO trace_projections
+                (system_id, trace_id, component_id, projection_name, phase,
+                 data_json, data_hash, truncated, extract_error, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                system_id,
+                result.trace_id,
+                result.component_id,
+                proj.projection_name,
+                proj.phase,
+                data_json,
+                proj.data_hash,
+                1 if proj.truncated else 0,
+                proj.error,
+                result.timestamp,
+            ),
+        )
 
 
 @router.post("/components/{component_id}/shadow-results", status_code=201)
@@ -46,6 +79,7 @@ def post_shadow_result(
                 result.timestamp,
             ),
         )
+        _write_shadow_projections(conn, system_id, result)
     return {"ok": True, "id": cur.lastrowid}
 
 

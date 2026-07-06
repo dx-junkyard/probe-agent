@@ -234,7 +234,7 @@ def probe(
                     current_output_repr = _safe_repr(output)
                     _spawn_shadow(
                         component_id, trace_id, cand, args_snap, kwargs_snap,
-                        current_output_repr, shadow_ctx,
+                        current_output_repr, shadow_ctx, spec, output,
                     )
 
             if raised is not None:
@@ -254,6 +254,8 @@ def _spawn_shadow(
     kwargs: dict,
     current_output_repr: str,
     shadow_ctx: Optional[contextvars.Context] = None,
+    spec: "Optional[_projection.ProjectionSpec]" = None,
+    current_output: Any = None,
 ) -> None:
     _ensure_atexit()
 
@@ -277,6 +279,23 @@ def _spawn_shadow(
                 "candidate_duration_ms": c_duration,
                 "timestamp": time.time(),
             }
+            # Shadow projections (Issue #150): project current + candidate
+            # output under shadow_* phases. Only when a spec is registered, so
+            # unprojected components incur zero extra cost. Non-fatal.
+            if spec is not None:
+                projections = []
+                try:
+                    cur = _projection.extract_phase(spec, current_output, "shadow_current")
+                    if cur is not None:
+                        projections.append(cur)
+                    if c_error is None:
+                        cand_proj = _projection.extract_phase(spec, c_output, "shadow_candidate")
+                        if cand_proj is not None:
+                            projections.append(cand_proj)
+                except Exception:  # noqa: BLE001
+                    logger.debug("shadow projection failed", exc_info=True)
+                if projections:
+                    payload["projections"] = projections
             try:
                 _client.send_shadow_result(payload)
             except Exception:  # noqa: BLE001

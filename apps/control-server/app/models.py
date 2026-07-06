@@ -158,6 +158,8 @@ class ShadowResult(BaseModel):
     candidate_error: Optional[str] = None
     candidate_duration_ms: float = 0.0
     timestamp: float
+    # Phase 5 shadow projections (Issue #150): shadow_current / shadow_candidate.
+    projections: Optional[List["TraceProjectionIn"]] = None
 
 
 class Policy(BaseModel):
@@ -1505,7 +1507,7 @@ class TokenCreateResponse(TokenOut):
 
 WorkspaceMessageRole = Literal["user", "assistant", "system"]
 WorkspaceContextItemType = Literal[
-    "feature", "component", "trace", "experiment", "probe_plan"
+    "feature", "component", "trace", "experiment", "probe_plan", "analyzer_run"
 ]
 WorkspaceProposalStatus = Literal[
     "proposed", "accepted", "rejected", "deferred", "superseded"

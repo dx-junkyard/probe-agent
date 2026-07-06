@@ -11,8 +11,21 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Skeleton } from "@/components/ui/skeleton";
+import { AddToWorkspaceButton } from "@/components/add-to-workspace";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
+
+interface CompareSummary {
+  phases: string[];
+  fields: string[];
+  entity_count: number;
+  diff_entity_count: number;
+  diff_fields: Record<string, number>;
+  candidate_error_count: number;
+  components_with_diff: string[];
+  examples: Record<string, string[]>;
+  compared_trace_count: number;
+}
 
 const EXAMPLE_SPEC = `{
   "source": "trace_projections",
@@ -218,6 +231,16 @@ export default function TraceAnalyzersPage() {
                     {latestRun.error_details && (
                       <p className="text-xs text-destructive">{latestRun.error_details}</p>
                     )}
+                    {latestRun.status === "completed" && (
+                      <AddToWorkspaceButton
+                        itemType="analyzer_run"
+                        itemId={String(latestRun.id)}
+                        label={`analyzer run #${latestRun.id}`}
+                      />
+                    )}
+                    {latestRun.result?.compare ? (
+                      <CompareSummaryView compare={latestRun.result.compare as unknown as CompareSummary} />
+                    ) : null}
                     {latestRun.result && (
                       <pre className="rounded bg-muted p-3 text-xs overflow-x-auto max-h-64 overflow-y-auto">
                         {JSON.stringify(latestRun.result, null, 2)}
@@ -230,6 +253,45 @@ export default function TraceAnalyzersPage() {
           </Card>
         )}
       </div>
+    </div>
+  );
+}
+
+function CompareSummaryView({ compare }: { compare: CompareSummary }) {
+  return (
+    <div className="rounded-lg border p-3 space-y-2" data-testid="compare-summary">
+      <div className="flex items-center gap-2 flex-wrap text-xs">
+        <Badge variant="outline">{compare.phases.join(" vs ")}</Badge>
+        <span className="text-muted-foreground">
+          {compare.diff_entity_count}/{compare.entity_count} entities differ
+        </span>
+        {compare.candidate_error_count > 0 && (
+          <Badge variant="destructive">{compare.candidate_error_count} candidate errors</Badge>
+        )}
+      </div>
+      <div className="text-xs">
+        <div className="font-medium mb-1">Field diffs</div>
+        <div className="flex flex-wrap gap-2">
+          {Object.entries(compare.diff_fields).map(([field, count]) => (
+            <Badge key={field} variant={count > 0 ? "warning" : "secondary"}>
+              {field}: {count}
+            </Badge>
+          ))}
+        </div>
+      </div>
+      {Object.keys(compare.examples).length > 0 && (
+        <div className="text-xs">
+          <div className="font-medium mb-1">Example traces</div>
+          {Object.entries(compare.examples).map(([cls, traces]) => (
+            <div key={cls} className="flex items-center gap-2 flex-wrap">
+              <span className="font-mono text-muted-foreground">{cls}</span>
+              {traces.map((t) => (
+                <span key={t} className="font-mono">{t.slice(0, 12)}</span>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

@@ -1265,6 +1265,28 @@ Issue #144 に集約し、実装は以下の sub-issue に依存順で分割し�
   mock を再利用。prompt/schema version は `analyzer-propose-v1` /
   `trace-analyzer-spec-v1`。
 
+### Phase 5 実装状態(#150)
+
+- **SDK**: shadow モード時、output projection spec を current 出力
+  (`phase=shadow_current`)と candidate 出力(`phase=shadow_candidate`)に適用し、
+  既存 shadow スレッド内で抽出して shadow-results ペイロードに同梱。production の
+  返り値・例外挙動は不変(Principle 1)、projection 失敗は非致命。projection 未設定の
+  コンポーネントは追加コストゼロ(spec があるときのみ抽出)。
+- **サーバー**: `ShadowResult` に optional `projections` を追加、
+  `POST /components/{id}/shadow-results` が `trace_projections` に
+  `shadow_current` / `shadow_candidate` phase で保存(trace_id で紐付け、raw 非保存)。
+- **差分集計**: analyzer 実行エンジンに `compare` 実行を実装(#148 では契約のみ)。
+  フィールド単位の決定的等値比較で `entity_count` / `diff_entity_count` /
+  `diff_fields`(フィールド別件数)/ `candidate_error_count` / `components_with_diff`
+  を算出し、diff クラス(フィールド×コンポーネント)ごとに例示トレース ID を最大
+  `ANALYZER_MAX_EXAMPLES` 件保持。**キー欠落 vs null は非等価**、**NaN は常に非等価**、
+  candidate エラーは diff ではなく `candidate_error_count` に分類(仕様化・テスト済み)。
+- **Dashboard**: analyzer run 結果に compare サマリ + 例示トレースを表示、run を
+  workspace context(`analyzer_run`)に pin 可能。Trace Lineage Explorer に
+  「Shadow compare」トグルを追加し、ノード上で current / candidate の projected
+  fields 差分をハイライト。
+- **非目標**: 数値許容誤差・意味的同等判定、差分の原因解釈(等値比較のみ)。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。

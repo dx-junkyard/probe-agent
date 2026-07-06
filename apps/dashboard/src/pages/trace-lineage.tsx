@@ -41,6 +41,32 @@ function flatten(step: LineageStep): Record<string, string> {
   return out;
 }
 
+// Deterministic shadow diff for a step: compare shadow_current vs
+// shadow_candidate projected fields (equality only). Returns null when the
+// step has no shadow projections.
+function shadowDiff(step: LineageStep): { field: string; current: string; candidate: string; changed: boolean }[] | null {
+  const cur = (step.projections ?? []).find((p) => p.phase === "shadow_current");
+  const cand = (step.projections ?? []).find((p) => p.phase === "shadow_candidate");
+  if (!cur && !cand) return null;
+  const keys = new Set([
+    ...Object.keys(cur?.fields ?? {}),
+    ...Object.keys(cand?.fields ?? {}),
+  ]);
+  return Array.from(keys).map((field) => {
+    const c = cur?.fields ?? {};
+    const d = cand?.fields ?? {};
+    const cPresent = field in c;
+    const dPresent = field in d;
+    const changed = cPresent !== dPresent || digest(c[field]) !== digest(d[field]);
+    return {
+      field,
+      current: cPresent ? digest(c[field]) : "(absent)",
+      candidate: dPresent ? digest(d[field]) : "(absent)",
+      changed,
+    };
+  });
+}
+
 // Bounded display of a value; large values are shown as a length digest.
 function digest(v: unknown): string {
   const s = typeof v === "string" ? v : JSON.stringify(v);
@@ -55,6 +81,7 @@ export default function TraceLineagePage() {
   const [entityId, setEntityId] = useState("");
   const [singleId, setSingleId] = useState("");
   const [componentFilter, setComponentFilter] = useState("");
+  const [shadowCompare, setShadowCompare] = useState(false);
   const [activeQuery, setActiveQuery] = useState<LineageQuery | null>(null);
 
   const { data, isLoading, isError } = useLineage(activeQuery);
@@ -182,6 +209,18 @@ export default function TraceLineagePage() {
             <Button onClick={submit}>Search</Button>
           </div>
           )}
+          <div className="flex items-center gap-2 pt-1">
+            <Button
+              size="sm"
+              variant={shadowCompare ? "default" : "outline"}
+              onClick={() => setShadowCompare((v) => !v)}
+            >
+              Shadow compare
+            </Button>
+            <span className="text-xs text-muted-foreground">
+              Highlight current vs candidate projected fields on each node.
+            </span>
+          </div>
         </CardContent>
       </Card>
 
@@ -231,6 +270,32 @@ export default function TraceLineagePage() {
                         ))}
                       </div>
                     )}
+
+                    {shadowCompare && (() => {
+                      const diff = shadowDiff(step);
+                      if (!diff) return null;
+                      return (
+                        <div className="rounded-lg border divide-y text-xs" data-testid="shadow-diff">
+                          <div className="px-3 py-1.5 font-medium bg-muted/50">current vs candidate</div>
+                          {diff.map((d) => (
+                            <div
+                              key={d.field}
+                              className={cn(
+                                "grid grid-cols-3 gap-2 px-3 py-1.5",
+                                d.changed && "bg-amber-100/60 dark:bg-amber-900/30",
+                              )}
+                            >
+                              <span className="font-mono text-muted-foreground">{d.field}</span>
+                              <span className="font-mono break-all">{d.current}</span>
+                              <span className="font-mono break-all">
+                                {d.candidate}
+                                {d.changed && <span className="ml-1 text-amber-600" aria-label="shadow-changed">●</span>}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      );
+                    })()}
 
                     {Object.keys(cur).length > 0 && (
                       <div className="rounded-lg border divide-y text-xs">

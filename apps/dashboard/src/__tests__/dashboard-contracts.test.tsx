@@ -3400,4 +3400,32 @@ describe("Trace Analyzers page", () => {
     // The proposed analyzer surfaces its reasoning-model + mock provenance.
     expect(await screen.findByText(/Proposed by a reasoning model/)).toBeInTheDocument();
   });
+
+  test("shadow compare run renders a diff summary", async () => {
+    const approved = { ...analyzer, id: 5, review_status: "approved" };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/trace-analyzers") return Promise.resolve([approved]);
+      if (path.endsWith("/runs")) return Promise.resolve([{
+        id: 3, analyzer_id: 5, status: "completed", error_details: null,
+        row_count: 2, started_at: 1, completed_at: 2,
+        result: {
+          row_count: 2,
+          compare: {
+            phases: ["shadow_current", "shadow_candidate"], fields: ["status"],
+            entity_count: 2, diff_entity_count: 1, diff_fields: { status: 1 },
+            candidate_error_count: 0, components_with_diff: ["svc"],
+            examples: { "status::svc": ["trace-aaaa1111"] }, compared_trace_count: 2,
+          },
+        },
+      }]);
+      return Promise.resolve({});
+    });
+    const { default: Page } = await import("@/pages/trace-analyzers");
+    render(<Page />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByText("order flow"));
+    const summary = await screen.findByTestId("compare-summary");
+    expect(within(summary).getByText(/1\/2 entities differ/)).toBeInTheDocument();
+    expect(within(summary).getByText(/status: 1/)).toBeInTheDocument();
+  });
 });

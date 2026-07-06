@@ -220,6 +220,16 @@ def _validate_context_ref(
             if item_id.isdigit()
             else None
         )
+    elif item_type == "analyzer_run":
+        # Issue #150: pin a completed analyzer run as evidence.
+        row = (
+            conn.execute(
+                "SELECT 1 FROM trace_analysis_runs WHERE system_id = ? AND id = ?",
+                (system_id, int(item_id)),
+            ).fetchone()
+            if item_id.isdigit()
+            else None
+        )
     else:  # The Pydantic input model should make this unreachable.
         row = None
     if row is None:

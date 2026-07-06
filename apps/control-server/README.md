@@ -70,6 +70,7 @@ DB ファイルは `PROBE_DB_PATH` (既定 `./probe.db`) で切り替えられ�
 | `ANALYZER_MAX_INPUT_ROWS` | `10000` | analyzer 実行時にスキャンする projection 行の上限(超過で run 失敗) |
 | `ANALYZER_MAX_OUTPUT_BYTES` | `200000` | analyzer 結果 JSON の最大バイト数(超過で run 失敗) |
 | `ANALYZER_MAX_SECONDS` | `10` | analyzer 実行の最大秒数(超過で run 失敗) |
+| `ANALYZER_MAX_EXAMPLES` | `5` | shadow diff の diff クラスごとに保持する例示トレース数(#150) |
 
 SDK 側の projection 上限(`PROBE_PROJECTION_MAX_*`)は `packages/python-probe/README.md` を参照。
 

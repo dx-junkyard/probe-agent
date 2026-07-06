@@ -76,6 +76,10 @@ def handle(order):
   **非致命**で、対象関数は動き続け projection のみ診断として落ちる。
 - 入力の root は `{"args": [...], "kwargs": {...}}`、出力の root は戻り値。
 - `set_projection(component_id, spec)` でも登録できる。
+- shadow モードでは、projection の `output` セクションが current 出力
+  (`phase=shadow_current`)と candidate 出力(`phase=shadow_candidate`)にも適用され、
+  shadow スレッド内で抽出されて比較用に送信される(Issue #150)。production の返り値は
+  不変で、candidate がエラーなら `shadow_candidate` は送られない。
 
 ## 環境変数
 

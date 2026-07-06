@@ -52,6 +52,10 @@ def max_seconds() -> float:
         return 10.0
 
 
+def max_examples() -> int:
+    return _int_env("ANALYZER_MAX_EXAMPLES", 5)
+
+
 # --- path grammar ----------------------------------------------------------
 
 def parse_path(path: str) -> List[tuple]:
@@ -341,9 +345,193 @@ def run_analyzer(conn, system_id: int, spec: AnalyzerSpec) -> Dict[str, Any]:
     else:
         result["rows"] = rows
 
+    if spec.compare is not None:
+        result["compare"] = _run_compare(conn, system_id, spec)
+
     encoded = json.dumps(result, ensure_ascii=False, default=repr)
     if len(encoded.encode("utf-8")) > max_output_bytes():
         raise AnalyzerLimitError(
             f"output {len(encoded.encode('utf-8'))} bytes exceeds limit {max_output_bytes()}"
         )
     return result
+
+
+_ABSENT = object()
+
+
+def _field_equal(a: Any, b: Any) -> bool:
+    """Deterministic field equality for shadow diffing (Issue #150).
+
+    Rules (documented + tested):
+      * a missing key and an explicit ``null`` are NOT equal (presence differs);
+      * two missing keys are equal;
+      * NaN is never equal to anything (including NaN);
+      * otherwise standard ``==`` on the JSON-decoded values.
+    """
+    a_present = a is not _ABSENT
+    b_present = b is not _ABSENT
+    if a_present != b_present:
+        return False
+    if not a_present:
+        return True
+    if isinstance(a, float) and a != a:  # NaN
+        return False
+    if isinstance(b, float) and b != b:
+        return False
+    return a == b
+
+
+def _compare_query(system_id: int, spec: AnalyzerSpec) -> Tuple[str, list]:
+    """Projections for the two compare phases within the analyzer filter
+    (filter.phases is ignored for compare — the phases come from compare)."""
+    phase_a, phase_b = spec.compare["phases"]
+    where = ["tp.system_id = ?", "tp.phase IN (?, ?)"]
+    params: List[Any] = [system_id, phase_a, phase_b]
+    f = spec.filter
+    if "components" in f and f["components"]:
+        placeholders = ",".join("?" for _ in f["components"])
+        where.append(f"tp.component_id IN ({placeholders})")
+        params.extend(f["components"])
+    if "projection_name" in f:
+        where.append("tp.projection_name = ?")
+        params.append(f["projection_name"])
+    if "time_window" in f:
+        tw = f["time_window"]
+        if tw.get("start") is not None:
+            where.append("tp.created_at >= ?")
+            params.append(tw["start"])
+        if tw.get("end") is not None:
+            where.append("tp.created_at <= ?")
+            params.append(tw["end"])
+    if "entity" in f:
+        where.append(
+            "tp.trace_id IN (SELECT te.trace_id FROM trace_entities te "
+            "WHERE te.system_id = ? AND te.entity_type = ? AND te.entity_id = ?)"
+        )
+        params.extend([system_id, f["entity"]["type"], f["entity"]["id"]])
+    sql = (
+        "SELECT tp.trace_id, tp.component_id, tp.phase, tp.data_json "
+        "FROM trace_projections tp WHERE " + " AND ".join(where) +
+        " ORDER BY tp.created_at ASC, tp.id ASC"
+    )
+    return sql, params
+
+
+def _run_compare(conn, system_id: int, spec: AnalyzerSpec) -> Dict[str, Any]:
+    phase_a, phase_b = spec.compare["phases"]
+    fields = spec.compare["fields"]
+    entity_type = spec.compare.get("entity_type")
+
+    sql, params = _compare_query(system_id, spec)
+    rows = conn.execute(sql, params).fetchall()
+
+    # Group by (trace_id, component_id): phase -> fields dict.
+    grouped: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = {}
+    for r in rows:
+        try:
+            data = json.loads(r["data_json"]) if r["data_json"] else {}
+        except json.JSONDecodeError:
+            data = {}
+        grouped.setdefault((r["trace_id"], r["component_id"]), {})[r["phase"]] = (
+            data.get("fields", {}) or {}
+        )
+
+    diff_fields: Dict[str, int] = {f: 0 for f in fields}
+    components_with_diff: set = set()
+    examples: Dict[str, List[str]] = {}
+    diff_trace_ids: set = set()
+    compared_trace_ids: set = set()
+
+    for (trace_id, component_id), phases in grouped.items():
+        if phase_a not in phases or phase_b not in phases:
+            continue
+        compared_trace_ids.add(trace_id)
+        fa, fb = phases[phase_a], phases[phase_b]
+        for field in fields:
+            if not _field_equal(fa.get(field, _ABSENT), fb.get(field, _ABSENT)):
+                diff_fields[field] += 1
+                components_with_diff.add(component_id)
+                diff_trace_ids.add(trace_id)
+                key = f"{field}::{component_id}"
+                bucket = examples.setdefault(key, [])
+                if len(bucket) < max_examples() and trace_id not in bucket:
+                    bucket.append(trace_id)
+
+    # candidate errors (only meaningful when comparing against shadow_candidate);
+    # a candidate that raised has no shadow_candidate projection, so it is
+    # classified here rather than as a field diff.
+    candidate_error_count = 0
+    if "shadow_candidate" in (phase_a, phase_b):
+        candidate_error_count = _candidate_error_count(conn, system_id, spec)
+
+    # entity-level aggregation
+    if entity_type:
+        entity_count, diff_entity_count = _entity_counts(
+            conn, system_id, entity_type, compared_trace_ids, diff_trace_ids
+        )
+    else:
+        entity_count = len(compared_trace_ids)
+        diff_entity_count = len(diff_trace_ids)
+
+    return {
+        "phases": [phase_a, phase_b],
+        "fields": fields,
+        "entity_count": entity_count,
+        "diff_entity_count": diff_entity_count,
+        "diff_fields": diff_fields,
+        "candidate_error_count": candidate_error_count,
+        "components_with_diff": sorted(components_with_diff),
+        "examples": {k: v for k, v in sorted(examples.items())},
+        "compared_trace_count": len(compared_trace_ids),
+    }
+
+
+def _candidate_error_count(conn, system_id: int, spec: AnalyzerSpec) -> int:
+    """Count shadow results whose candidate raised, within the analyzer filter."""
+    where = ["sr.system_id = ?", "sr.candidate_error IS NOT NULL"]
+    params: List[Any] = [system_id]
+    f = spec.filter
+    if "components" in f and f["components"]:
+        placeholders = ",".join("?" for _ in f["components"])
+        where.append(f"sr.component_id IN ({placeholders})")
+        params.extend(f["components"])
+    if "time_window" in f:
+        tw = f["time_window"]
+        if tw.get("start") is not None:
+            where.append("sr.timestamp >= ?")
+            params.append(tw["start"])
+        if tw.get("end") is not None:
+            where.append("sr.timestamp <= ?")
+            params.append(tw["end"])
+    if "entity" in f:
+        where.append(
+            "sr.trace_id IN (SELECT te.trace_id FROM trace_entities te "
+            "WHERE te.system_id = ? AND te.entity_type = ? AND te.entity_id = ?)"
+        )
+        params.extend([system_id, f["entity"]["type"], f["entity"]["id"]])
+    row = conn.execute(
+        "SELECT COUNT(DISTINCT sr.trace_id) AS n FROM shadow_results sr WHERE "
+        + " AND ".join(where),
+        params,
+    ).fetchone()
+    return row["n"] if row else 0
+
+
+def _entity_counts(
+    conn, system_id: int, entity_type: str, compared: set, diffed: set
+) -> Tuple[int, int]:
+    if not compared:
+        return 0, 0
+    placeholders = ",".join("?" for _ in compared)
+    rows = conn.execute(
+        f"SELECT DISTINCT trace_id, entity_id FROM trace_entities "
+        f"WHERE system_id = ? AND entity_type = ? AND trace_id IN ({placeholders})",
+        [system_id, entity_type, *compared],
+    ).fetchall()
+    all_entities: set = set()
+    diff_entities: set = set()
+    for r in rows:
+        all_entities.add(r["entity_id"])
+        if r["trace_id"] in diffed:
+            diff_entities.add(r["entity_id"])
+    return len(all_entities), len(diff_entities)

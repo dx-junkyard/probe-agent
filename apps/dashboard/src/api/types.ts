@@ -1469,7 +1469,7 @@ export interface SystemProfile {
 
 // --- Decision Workspace (Issues #35-#37) ------------------------------------
 
-export type WorkspaceContextItemType = "feature" | "component" | "trace" | "experiment" | "probe_plan";
+export type WorkspaceContextItemType = "feature" | "component" | "trace" | "experiment" | "probe_plan" | "analyzer_run";
 export type WorkspaceProposalStatus = "proposed" | "accepted" | "rejected" | "deferred" | "superseded";
 
 export interface WorkspaceOut {
