@@ -1136,6 +1136,32 @@ CREATE INDEX IF NOT EXISTS idx_interview_qa_system
 CREATE INDEX IF NOT EXISTS idx_interview_qa_current
     ON interview_qa (session_id, superseded_by_id);
 
+-- Understanding revisions (Issue #136). One row per successful
+-- update-understanding call — appended, never overwritten — so the
+-- Dashboard can show what changed since the previous revision. Linked to
+-- the understanding_review intelligence_runs row that produced it
+-- (Principle 7). Diffing is computed on demand from these rows; no diff
+-- result is stored (always reproducible, Principle 6).
+CREATE TABLE IF NOT EXISTS understanding_revision (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id              INTEGER NOT NULL,
+    system_id               INTEGER NOT NULL,
+    snapshot_id             INTEGER NOT NULL,
+    intelligence_run_id     INTEGER,
+    current_understanding   TEXT,
+    gap_analysis            TEXT,
+    created_at              REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_revision_session
+    ON understanding_revision (session_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_revision_system
+    ON understanding_revision (system_id, session_id);
+
 -- Understanding graph snapshots (Issue #79). Persists merged documentation
 -- claim graphs for a system. Each snapshot records the full graph JSON,
 -- source hash, claim count, and confidence summary.

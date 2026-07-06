@@ -21,6 +21,7 @@ import type {
   InterviewApprovedSetOut, InterviewMaterializeOut,
   InterviewQaListOut, InterviewQaOut, InterviewQaAnswerOut,
   RuntimeRealityFactsOut, RuntimeRealityCheckRunOut,
+  UnderstandingRevisionListOut, UnderstandingDiffOut,
   SystemUnderstandingOut,
   SystemUnderstandingBuildOut,
   IssueDraft,
@@ -685,7 +686,31 @@ export function useUpdateInterviewUnderstanding() {
     onSuccess: (_data, sessionId) => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
       qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
+      qc.invalidateQueries({ queryKey: [...sysKey("understandingRevisions"), sessionId] });
+      qc.invalidateQueries({ queryKey: [...sysKey("understandingDiff"), sessionId] });
     },
+  });
+}
+
+// --- Understanding Revisions (Issue #136) ------------------------------------
+
+export function useUnderstandingRevisions(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("understandingRevisions"), sessionId],
+    queryFn: () => api.get<UnderstandingRevisionListOut>(
+      `/interview/sessions/${sessionId}/understanding-revisions`,
+    ),
+    enabled: !!sessionId && !!getSystemId(),
+  });
+}
+
+export function useUnderstandingDiff(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("understandingDiff"), sessionId],
+    queryFn: () => api.get<UnderstandingDiffOut>(
+      `/interview/sessions/${sessionId}/understanding-diff`,
+    ),
+    enabled: !!sessionId && !!getSystemId(),
   });
 }
 

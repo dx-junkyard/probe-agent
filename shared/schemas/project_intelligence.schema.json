@@ -945,6 +945,68 @@
       },
       "additionalProperties": false
     },
+    "UnderstandingRevision": {
+      "type": "object",
+      "description": "One appended (never overwritten) understanding snapshot from a successful update-understanding call (Issue #136), linked to the understanding_review intelligence_runs row that produced it.",
+      "required": ["id", "session_id", "system_id", "snapshot_id", "created_at"],
+      "properties": {
+        "id": { "type": "integer" },
+        "session_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "snapshot_id": { "type": "integer" },
+        "intelligence_run_id": { "type": ["integer", "null"] },
+        "current_understanding": { "type": ["object", "null"] },
+        "gap_analysis": { "type": ["array", "null"], "items": { "type": "object" } },
+        "created_at": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    "UnderstandingRevisionList": {
+      "type": "object",
+      "required": ["session_id", "system_id"],
+      "properties": {
+        "session_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "items": { "type": "array", "items": { "$ref": "#/definitions/UnderstandingRevision" } }
+      },
+      "additionalProperties": false
+    },
+    "UnderstandingDiffConfidenceChange": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string" },
+        "before": { "type": ["string", "null"] },
+        "after": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "UnderstandingDiffSection": {
+      "type": "object",
+      "required": ["section"],
+      "properties": {
+        "section": { "type": "string" },
+        "added": { "type": "array", "items": { "type": "string" } },
+        "removed": { "type": "array", "items": { "type": "string" } },
+        "confidence_changed": { "type": "array", "items": { "$ref": "#/definitions/UnderstandingDiffConfidenceChange" } },
+        "summary_changed": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "UnderstandingDiff": {
+      "type": "object",
+      "description": "Deterministic structural diff between two understanding revisions, matched by exact item name only (Issue #136). has_previous=false means there is no earlier revision to compare against (e.g. the session's first revision); sections is then empty rather than an all-added diff.",
+      "required": ["session_id", "system_id", "has_previous"],
+      "properties": {
+        "session_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "from_revision_id": { "type": ["integer", "null"] },
+        "to_revision_id": { "type": ["integer", "null"] },
+        "has_previous": { "type": "boolean" },
+        "sections": { "type": "array", "items": { "$ref": "#/definitions/UnderstandingDiffSection" } }
+      },
+      "additionalProperties": false
+    },
     "RuntimeTraceFacts": {
       "type": "object",
       "description": "Deterministic trace aggregates for one component_id over a window (Issue #135). has_traces=false with null numeric fields is the '0 traces for an approved probe plan' signal; whether that is worth a question is decided by the reasoning step, never here.",

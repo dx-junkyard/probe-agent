@@ -24,9 +24,11 @@ import {
   useResumeInterviewQa,
   useRunRuntimeRealityCheck,
   useSkipInterviewQa,
+  useUnderstandingDiff,
   useUpdateInterviewUnderstanding,
 } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
+import { api } from "@/api/client";
 import { DiagnosticFixCallout } from "@/components/diagnostic-fix";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -56,6 +58,7 @@ import type {
   SourceMetadataElementType,
   SourceMetadataOperationKind,
   SourceMetadataStateEffect,
+  UnderstandingDiffOut,
   UnderstandingItem,
 } from "@/api/types";
 
@@ -700,6 +703,99 @@ function QaPanel({
   );
 }
 
+// 理解のリビジョン差分パネル(Issue #136)。「理解を更新」の結果、直前リビジョンから
+// 何が変わったかを決定的な差分(追加/削除/確信度変化)で表示する。回答修正から
+// 再構築した直後は「あなたの回答修正が反映されました」の文脈を添える。
+function UnderstandingDiffPanel({
+  sessionId, answerRevisionReflected,
+}: { sessionId: number; answerRevisionReflected: boolean }) {
+  const { data: diff } = useUnderstandingDiff(sessionId);
+  const [expanded, setExpanded] = useState(false);
+
+  if (!diff) return null;
+
+  if (!diff.has_previous) {
+    return (
+      <Card data-testid="understanding-diff-panel">
+        <CardHeader>
+          <CardTitle className="text-sm">理解の変化</CardTitle>
+          <CardDescription>比較対象となる前のリビジョンがありません(初回の理解構築です)。</CardDescription>
+        </CardHeader>
+      </Card>
+    );
+  }
+
+  const addedCount = diff.sections.reduce((n, s) => n + s.added.length, 0);
+  const removedCount = diff.sections.reduce((n, s) => n + s.removed.length, 0);
+  const confidenceCount = diff.sections.reduce((n, s) => n + s.confidence_changed.length, 0);
+  const summaryCount = diff.sections.reduce((n, s) => n + s.summary_changed.length, 0);
+  const hasChanges = addedCount + removedCount + confidenceCount + summaryCount > 0;
+
+  return (
+    <Card data-testid="understanding-diff-panel">
+      <CardHeader>
+        <CardTitle className="text-sm flex items-center gap-2">
+          <Sparkles className="h-4 w-4" /> 理解の変化
+        </CardTitle>
+        <CardDescription data-testid="understanding-diff-summary">
+          {hasChanges
+            ? `追加 ${addedCount} / 削除 ${removedCount} / 確信度変化 ${confidenceCount} / 説明変化 ${summaryCount}`
+            : "前回のリビジョンから変化はありません"}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-2">
+        {answerRevisionReflected && (
+          <div
+            className="rounded-md border border-emerald-400 bg-emerald-50 dark:bg-emerald-950/20 p-2 text-xs"
+            data-testid="answer-revision-reflected-banner"
+          >
+            あなたの回答修正が理解に反映されました。
+          </div>
+        )}
+        {hasChanges && (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => setExpanded(e => !e)}
+            data-testid="toggle-understanding-diff-detail"
+          >
+            {expanded ? "詳細を隠す" : "詳細を見る"}
+          </Button>
+        )}
+        {expanded && (
+          <div className="space-y-2 text-xs" data-testid="understanding-diff-detail">
+            {diff.sections.map(s => {
+              const empty = s.added.length === 0 && s.removed.length === 0
+                && s.confidence_changed.length === 0 && s.summary_changed.length === 0;
+              if (empty) return null;
+              return (
+                <div key={s.section} className="border rounded-md p-2 space-y-1">
+                  <p className="font-semibold">{s.section}</p>
+                  {s.added.map(n => (
+                    <p key={`a-${n}`} className="text-emerald-600">+ {n}</p>
+                  ))}
+                  {s.removed.map(n => (
+                    <p key={`r-${n}`} className="text-red-600">- {n}</p>
+                  ))}
+                  {s.confidence_changed.map(c => (
+                    <p key={`c-${c.name}`} className="flex items-center gap-1">
+                      <Badge variant="outline">{c.name}</Badge>
+                      確信度: {c.before ?? "-"} → {c.after ?? "-"}
+                    </p>
+                  ))}
+                  {s.summary_changed.map(n => (
+                    <p key={`s-${n}`}>{n}: 説明が更新されました</p>
+                  ))}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 function GapAnalysisPanel({ gaps }: { gaps: GapItem[] }) {
   if (gaps.length === 0) return null;
   return (
@@ -747,6 +843,7 @@ export default function InterviewPage() {
   const [editing, setEditing] = useState<InterviewProposalOut | null>(null);
   const [editForm, setEditForm] = useState<EditForm | null>(null);
   const [lastMaterialization, setLastMaterialization] = useState<InterviewMaterializeOut | null>(null);
+  const [answerRevisionReflected, setAnswerRevisionReflected] = useState(false);
 
   const sortedSessions = useMemo(() => sessions ?? [], [sessions]);
   const proposals = session?.proposals ?? [];
@@ -886,11 +983,33 @@ export default function InterviewPage() {
 
   const refreshUnderstanding = async () => {
     if (!selectedSessionId) return;
+    const hadAnswerRevision = !!session?.answers_revised_at;
     try {
       const updated = await updateUnderstanding.mutateAsync(selectedSessionId);
       if (updated.last_error) {
         toast.error(`理解の更新に失敗しました: ${updated.last_error}`);
-      } else {
+        return;
+      }
+      setAnswerRevisionReflected(hadAnswerRevision);
+      try {
+        const diff = await api.get<UnderstandingDiffOut>(
+          `/interview/sessions/${selectedSessionId}/understanding-diff`,
+        );
+        if (!diff.has_previous) {
+          toast.success("理解を更新しました(初回のリビジョンです)");
+        } else {
+          const added = diff.sections.reduce((n, s) => n + s.added.length, 0);
+          const removed = diff.sections.reduce((n, s) => n + s.removed.length, 0);
+          const confidenceChanged = diff.sections.reduce((n, s) => n + s.confidence_changed.length, 0);
+          if (added + removed + confidenceChanged === 0) {
+            toast.success("理解を更新しました(前回からの変化はありません)");
+          } else {
+            toast.success(
+              `理解を更新しました(追加 ${added} / 削除 ${removed} / 確信度変化 ${confidenceChanged})`,
+            );
+          }
+        }
+      } catch {
         toast.success("理解を更新しました");
       }
     } catch (e) {
@@ -1436,6 +1555,11 @@ export default function InterviewPage() {
                   </CardContent>
                 </Card>
               )}
+
+              <UnderstandingDiffPanel
+                sessionId={session.id}
+                answerRevisionReflected={answerRevisionReflected}
+              />
 
               <QaPanel sessionId={session.id} actor={actor} approvedCount={approvedCount} />
 

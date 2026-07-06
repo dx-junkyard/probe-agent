@@ -922,6 +922,45 @@ deterministic。読んだスニペットは raw fact として保存され、LLM
 **含まない:** 自由なツールユースループ、working tree・未コミット内容の読み出し、
 読んだ内容に基づく提案の自動生成、対象リポジトリへの書き込み。
 
+## 理解のリビジョンと差分レビュー(Issue #136)
+
+`interview_session.current_understanding` は「理解を更新」のたびに**上書き**されており、
+回答が理解にどう反映されたかが見えなかった。本 issue は新テーブル
+`understanding_revision`(System-scoped、この issue が所有)を追加し、
+`update-understanding` が成功するたびに1行追記する(上書きしない)。各行は
+`intelligence_runs`(`run_type: understanding_review`)の該当 run に
+`intelligence_run_id` でリンクし、「どの reasoning run が生んだ理解か」を
+監査可能にする(Principle 7)。
+
+- **決定的な構造差分(deterministic, `app/understanding_diff.py`)**: 6セクション
+  (`system_purpose` / `core_capabilities` / `capability_elements` /
+  `supporting_elements` / `api_boundaries` / `probe_flow_candidates`)ごとに、
+  項目 `name` の完全一致のみで対応付け、追加 / 削除 / `confidence.level` の変化 /
+  `summary` の変化有無を算出する。リネームは「削除+追加」として現れる
+  (意味的な同一性判定はしない、Principle 6)。差分は常にオンデマンド計算で
+  保存しない(常に再現可能)。
+- **エンドポイント**: `GET /interview/sessions/{id}/understanding-revisions`
+  (新しい順の一覧)、`GET /interview/sessions/{id}/understanding-diff?from=&to=`
+  (`to` 省略時は最新リビジョン、`from` 省略時は `to` の直前リビジョン)。
+  比較対象となる前リビジョンが無い場合(そのセッションの初回リビジョン、または
+  リビジョンが1件も無い場合)は `has_previous: false` かつ `sections: []` を返す
+  ——「全項目が追加された」という誤った差分にはしない。
+- **保持上限**: `INTERVIEW_UNDERSTANDING_REVISION_LIMIT`(既定 20)を超えた古い
+  リビジョンは追記のたびに決定的にローテーション削除される。削除は
+  `intelligence_runs` に記録しない(監査対象は生成イベントであって、保持
+  ローテーションではないため)。
+- Dashboard: 「理解を更新」実行後、直前リビジョンとの差分サマリー(追加/削除/
+  確信度変化の件数)をトースト表示し、詳細差分(セクションごとの追加=緑・
+  削除=赤・確信度変化バッジ)を展開できる。回答修正(#129
+  `answers_revised_at`)からの再構築後は、その文脈を明示するメッセージを添える。
+
+**含まない:** LLM による差分の要約・解釈、理解の巻き戻し(閲覧のみ)、
+提案・メタデータへの影響伝播の自動化。
+
+共有スキーマ: `UnderstandingRevision` / `UnderstandingRevisionList` /
+`UnderstandingDiff` / `UnderstandingDiffSection` / `UnderstandingDiffConfidenceChange`
+([shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json))。
+
 ## Runtime Reality Check（Issue #135）
 
 #129/#130 までの Q&A 層は静的な情報(docs / code / 会話)しか見ておらず、`@probe`

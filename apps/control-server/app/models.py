@@ -2235,6 +2235,61 @@ class RuntimeRealityCheckRunOut(BaseModel):
     error: Optional[str] = None
 
 
+# --- Understanding Revisions (Issue #136) ------------------------------------
+#
+# Each successful update-understanding call appends one row (never
+# overwritten) so the Dashboard can show what changed since the previous
+# revision. Diffing is deterministic (exact-name matching only, Principle 6)
+# and computed on demand — no diff result is persisted.
+
+
+class UnderstandingRevisionOut(BaseModel):
+    id: int
+    session_id: int
+    system_id: int
+    snapshot_id: int
+    intelligence_run_id: Optional[int] = None
+    current_understanding: Optional[Dict[str, Any]] = None
+    gap_analysis: Optional[List[Dict[str, Any]]] = None
+    created_at: float
+
+
+class UnderstandingRevisionListOut(BaseModel):
+    session_id: int
+    system_id: int
+    items: List[UnderstandingRevisionOut] = Field(default_factory=list)
+
+
+class UnderstandingDiffConfidenceChange(BaseModel):
+    name: str
+    before: Optional[str] = None
+    after: Optional[str] = None
+
+
+class UnderstandingDiffSectionOut(BaseModel):
+    section: str
+    added: List[str] = Field(default_factory=list)
+    removed: List[str] = Field(default_factory=list)
+    confidence_changed: List[UnderstandingDiffConfidenceChange] = Field(default_factory=list)
+    summary_changed: List[str] = Field(default_factory=list)
+
+
+class UnderstandingDiffOut(BaseModel):
+    """Structural diff between two understanding revisions.
+
+    ``has_previous`` is false when ``to_revision_id`` is the session's first
+    revision (or no revisions exist yet); ``sections`` is then empty and the
+    caller must show "no comparison target" rather than an all-added diff.
+    """
+
+    session_id: int
+    system_id: int
+    from_revision_id: Optional[int] = None
+    to_revision_id: Optional[int] = None
+    has_previous: bool = False
+    sections: List[UnderstandingDiffSectionOut] = Field(default_factory=list)
+
+
 # --- Interview Proposal Approval (Issue #70) ----------------------------------
 #
 # Per-item approval gate: a developer can approve, reject, or edit each

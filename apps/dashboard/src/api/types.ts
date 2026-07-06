@@ -460,6 +460,48 @@ export interface InterviewMaterializeOut {
   error: string | null;
 }
 
+// --- Understanding Revisions (Issue #136) ------------------------------------
+
+export interface UnderstandingRevisionOut {
+  id: number;
+  session_id: number;
+  system_id: number;
+  snapshot_id: number;
+  intelligence_run_id: number | null;
+  current_understanding: CurrentUnderstanding | null;
+  gap_analysis: Record<string, unknown>[] | null;
+  created_at: number;
+}
+
+export interface UnderstandingRevisionListOut {
+  session_id: number;
+  system_id: number;
+  items: UnderstandingRevisionOut[];
+}
+
+export interface UnderstandingDiffConfidenceChange {
+  name: string;
+  before: string | null;
+  after: string | null;
+}
+
+export interface UnderstandingDiffSectionOut {
+  section: string;
+  added: string[];
+  removed: string[];
+  confidence_changed: UnderstandingDiffConfidenceChange[];
+  summary_changed: string[];
+}
+
+export interface UnderstandingDiffOut {
+  session_id: number;
+  system_id: number;
+  from_revision_id: number | null;
+  to_revision_id: number | null;
+  has_previous: boolean;
+  sections: UnderstandingDiffSectionOut[];
+}
+
 // --- Runtime Reality Check (Issue #135) --------------------------------------
 
 export interface RuntimeTraceFactsOut {

@@ -54,6 +54,11 @@ from ..runtime_reality import (
     generate_runtime_reality_check,
     window_days as runtime_window_days,
 )
+from ..understanding_diff import (
+    DEFAULT_REVISION_LIMIT,
+    diff_understanding,
+    revision_limit,
+)
 from ..models import (
     InterviewApprovedItemOut,
     InterviewApprovedSetOut,
@@ -89,6 +94,10 @@ from ..models import (
     RuntimeRealityCheckItemOut,
     RuntimeRealityCheckRunOut,
     RuntimeRealityFactsOut,
+    UnderstandingDiffOut,
+    UnderstandingDiffSectionOut,
+    UnderstandingRevisionListOut,
+    UnderstandingRevisionOut,
 )
 from ..probe_planner import check_denylist
 
@@ -2235,6 +2244,29 @@ def update_interview_understanding(
             (understanding_json, gap_json, questions_json, new_stage, now, session_id, system_id),
         )
 
+        # Issue #136: append (never overwrite) an understanding revision,
+        # linked to the understanding_review run that produced it, so the
+        # Dashboard can show a deterministic diff against the previous one.
+        conn.execute(
+            """INSERT INTO understanding_revision
+                (session_id, system_id, snapshot_id, intelligence_run_id,
+                 current_understanding, gap_analysis, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (session_id, system_id, snapshot_id, run_id, understanding_json, gap_json, now),
+        )
+        try:
+            limit = revision_limit()
+        except ValueError:
+            limit = DEFAULT_REVISION_LIMIT
+        conn.execute(
+            """DELETE FROM understanding_revision
+               WHERE session_id = ? AND id NOT IN (
+                   SELECT id FROM understanding_revision
+                   WHERE session_id = ? ORDER BY id DESC LIMIT ?
+               )""",
+            (session_id, session_id, limit),
+        )
+
         if review.current_understanding:
             summary_parts = []
             for purpose in review.current_understanding.get("system_purpose", []):
@@ -2261,6 +2293,147 @@ def update_interview_understanding(
 
         row = _get_session_or_404(conn, session_id, system_id)
         return _session_out(row)
+
+
+# --- Understanding Revisions (Issue #136) ------------------------------------
+
+
+def _revision_out(row) -> UnderstandingRevisionOut:
+    return UnderstandingRevisionOut(
+        id=row["id"],
+        session_id=row["session_id"],
+        system_id=row["system_id"],
+        snapshot_id=row["snapshot_id"],
+        intelligence_run_id=row["intelligence_run_id"],
+        current_understanding=(
+            json.loads(row["current_understanding"]) if row["current_understanding"] else None
+        ),
+        gap_analysis=json.loads(row["gap_analysis"]) if row["gap_analysis"] else None,
+        created_at=row["created_at"],
+    )
+
+
+@router.get(
+    "/interview/sessions/{session_id}/understanding-revisions",
+    response_model=UnderstandingRevisionListOut,
+)
+def list_understanding_revisions(
+    session_id: int,
+    system_id: int = Depends(get_system_id),
+) -> UnderstandingRevisionListOut:
+    """List understanding revisions for a session, newest first.
+
+    probe-agent:
+      role: API boundary for listing understanding revisions
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: Verify revisions are System-isolated and appended in order
+    """
+    with get_conn() as conn:
+        _get_session_or_404(conn, session_id, system_id)
+        rows = conn.execute(
+            """SELECT * FROM understanding_revision
+               WHERE session_id = ? AND system_id = ?
+               ORDER BY id DESC""",
+            (session_id, system_id),
+        ).fetchall()
+
+    return UnderstandingRevisionListOut(
+        session_id=session_id,
+        system_id=system_id,
+        items=[_revision_out(r) for r in rows],
+    )
+
+
+@router.get(
+    "/interview/sessions/{session_id}/understanding-diff",
+    response_model=UnderstandingDiffOut,
+)
+def get_understanding_diff(
+    session_id: int,
+    system_id: int = Depends(get_system_id),
+    to: Optional[int] = Query(default=None),
+    from_: Optional[int] = Query(default=None, alias="from"),
+) -> UnderstandingDiffOut:
+    """Deterministic structural diff between two understanding revisions.
+
+    ``to`` defaults to the latest revision; ``from`` defaults to the
+    revision immediately before ``to``. When there is no earlier revision to
+    compare against (first revision, or no revisions at all), returns
+    ``has_previous: false`` with empty sections rather than diffing against
+    an empty understanding.
+
+    probe-agent:
+      role: API boundary for the deterministic understanding-revision diff
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: Verify the diff is deterministic, name-matched, and System-isolated
+    """
+    with get_conn() as conn:
+        _get_session_or_404(conn, session_id, system_id)
+
+        if to is not None:
+            to_row = conn.execute(
+                """SELECT * FROM understanding_revision
+                   WHERE id = ? AND session_id = ? AND system_id = ?""",
+                (to, session_id, system_id),
+            ).fetchone()
+            if to_row is None:
+                raise HTTPException(status_code=404, detail="Revision not found (to)")
+        else:
+            to_row = conn.execute(
+                """SELECT * FROM understanding_revision
+                   WHERE session_id = ? AND system_id = ?
+                   ORDER BY id DESC LIMIT 1""",
+                (session_id, system_id),
+            ).fetchone()
+            if to_row is None:
+                return UnderstandingDiffOut(
+                    session_id=session_id, system_id=system_id, has_previous=False,
+                )
+
+        if from_ is not None:
+            from_row = conn.execute(
+                """SELECT * FROM understanding_revision
+                   WHERE id = ? AND session_id = ? AND system_id = ?""",
+                (from_, session_id, system_id),
+            ).fetchone()
+            if from_row is None:
+                raise HTTPException(status_code=404, detail="Revision not found (from)")
+        else:
+            from_row = conn.execute(
+                """SELECT * FROM understanding_revision
+                   WHERE session_id = ? AND system_id = ? AND id < ?
+                   ORDER BY id DESC LIMIT 1""",
+                (session_id, system_id, to_row["id"]),
+            ).fetchone()
+
+    if from_row is None:
+        return UnderstandingDiffOut(
+            session_id=session_id,
+            system_id=system_id,
+            to_revision_id=to_row["id"],
+            has_previous=False,
+        )
+
+    previous = json.loads(from_row["current_understanding"]) if from_row["current_understanding"] else None
+    current = json.loads(to_row["current_understanding"]) if to_row["current_understanding"] else None
+    sections = diff_understanding(previous, current)
+
+    return UnderstandingDiffOut(
+        session_id=session_id,
+        system_id=system_id,
+        from_revision_id=from_row["id"],
+        to_revision_id=to_row["id"],
+        has_previous=True,
+        sections=[UnderstandingDiffSectionOut(**s) for s in sections],
+    )
 
 
 # --- Runtime Reality Check (Issue #135) --------------------------------------
