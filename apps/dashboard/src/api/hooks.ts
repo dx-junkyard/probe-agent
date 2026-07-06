@@ -555,10 +555,10 @@ export function useCreateInterviewQa(sessionId: number | null) {
 export function useAnswerInterviewQa(sessionId: number | null) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ qaId, answer_text, actor }: { qaId: number; answer_text: string; actor: string }) =>
+    mutationFn: ({ qaId, answer_text, actor, answer_unknown }: { qaId: number; answer_text: string; actor: string; answer_unknown?: boolean }) =>
       api.post<InterviewQaAnswerOut>(
         `/interview/sessions/${sessionId}/qa/${qaId}/answer`,
-        { answer_text, actor },
+        { answer_text, actor, answer_unknown: answer_unknown ?? false },
       ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] });

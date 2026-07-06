@@ -480,7 +480,7 @@ function QaItemCard({
   qa, onAnswer, onSkip, onResume, answering, skipping, resuming,
 }: {
   qa: InterviewQaOut;
-  onAnswer: (qaId: number, answerText: string) => Promise<void>;
+  onAnswer: (qaId: number, answerText: string, answerUnknown?: boolean) => Promise<void>;
   onSkip: (qaId: number) => void;
   onResume: (qaId: number) => void;
   answering: boolean;
@@ -493,6 +493,13 @@ function QaItemCard({
   const submit = async () => {
     if (!draft.trim()) return;
     await onAnswer(qa.id, draft.trim());
+    setEditing(false);
+  };
+
+  // Issue #142: 「わからない」を有効な入力として記録する。エラーにはせず、
+  // status=unconfirmed として保存し、以後の推論で仮説→再確認に回す。
+  const submitUnknown = async () => {
+    await onAnswer(qa.id, draft.trim(), true);
     setEditing(false);
   };
 
@@ -513,9 +520,10 @@ function QaItemCard({
           <Badge variant={
             qa.status === "answered" ? "success"
               : qa.status === "skipped" ? "warning"
+              : qa.status === "unconfirmed" ? "warning"
               : qa.status === "revised" ? "secondary" : "outline"
           }>
-            {qa.status}
+            {qa.status === "unconfirmed" ? "不明(要確認)" : qa.status}
           </Badge>
         </div>
       </div>
@@ -581,6 +589,15 @@ function QaItemCard({
             <Button size="sm" onClick={submit} disabled={answering || !draft.trim()}>
               {answering ? "送信中..." : "保存"}
             </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={submitUnknown}
+              disabled={answering}
+              data-testid={`qa-answer-unknown-${qa.id}`}
+            >
+              わからない
+            </Button>
             <Button size="sm" variant="outline" onClick={() => setEditing(false)}>キャンセル</Button>
           </div>
         </div>
@@ -588,7 +605,7 @@ function QaItemCard({
         <div className="flex gap-2">
           <Button size="sm" variant="outline" onClick={() => setEditing(true)}>
             <Pencil className="h-3 w-3 mr-1" />
-            {qa.status === "answered" ? "回答を修正" : "回答する"}
+            {qa.status === "answered" || qa.status === "unconfirmed" ? "回答を修正" : "回答する"}
           </Button>
           {qa.status === "open" && (
             <Button size="sm" variant="outline" onClick={() => onSkip(qa.id)} disabled={skipping}>
@@ -615,10 +632,14 @@ function QaPanel({
   const resume = useResumeInterviewQa(sessionId);
   const runRealityCheck = useRunRuntimeRealityCheck(sessionId);
 
-  const handleAnswer = async (qaId: number, answerText: string) => {
+  const handleAnswer = async (qaId: number, answerText: string, answerUnknown?: boolean) => {
     try {
-      const result = await answer.mutateAsync({ qaId, answer_text: answerText, actor });
-      if (result.regeneration_recommended) {
+      const result = await answer.mutateAsync({
+        qaId, answer_text: answerText, actor, answer_unknown: answerUnknown,
+      });
+      if (answerUnknown) {
+        toast.info("「わからない」として記録しました。仮説を立てて確認質問を続けます。");
+      } else if (result.regeneration_recommended) {
         toast.warning("回答が変わったため、生成済みの提案の再生成を検討してください(自動では再生成されません)。");
       } else {
         toast.success("回答を保存しました");

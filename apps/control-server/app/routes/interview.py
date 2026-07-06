@@ -791,6 +791,21 @@ def interview_dialogue_turn(
             for r in answered_qa_rows
         ] or None
 
+        # Issue #142: rows the developer explicitly could not confirm ("I
+        # don't know"). They are valid, recorded input — fed back as open
+        # hypotheses the model must re-confirm, never as established facts.
+        unconfirmed_qa_rows = conn.execute(
+            """SELECT question_text, answer_text FROM interview_qa
+               WHERE session_id = ? AND system_id = ?
+                 AND superseded_by_id IS NULL AND status = 'unconfirmed'
+               ORDER BY id""",
+            (session_id, system_id),
+        ).fetchall()
+        unconfirmed_qa_pairs = [
+            {"question": r["question_text"], "answer": r["answer_text"]}
+            for r in unconfirmed_qa_rows
+        ] or None
+
         # Issue #130: pass 1 selects (or declines) evidence to read from the
         # pinned snapshot before pass 2 asks the next question. Both passes
         # are audited as separate intelligence_runs rows below.
@@ -877,6 +892,7 @@ def interview_dialogue_turn(
                     gap_analysis=session_gaps,
                     open_questions=session_open_questions,
                     answered_qa=answered_qa_pairs,
+                    unconfirmed_qa=unconfirmed_qa_pairs,
                     evidence_snippets=evidence_snippets,
                 )
 
@@ -1199,6 +1215,11 @@ def interview_dialogue_turn(
             # consumed Q&A row. Silently ignored if a row is missing or
             # already answered — the dialogue turn itself must never fail
             # because of a stale Q&A reference.
+            # Issue #142: when the developer answered "I don't know"
+            # (answer_unknown), the row is recorded as 'unconfirmed' rather
+            # than 'answered' — a valid but non-confirming input that later
+            # turns re-confirm via a hypothesis question.
+            consumed_status = "unconfirmed" if payload.answer_unknown else "answered"
             for consumed_id in sorted(consumed_qa_ids):
                 answered_row = conn.execute(
                     """SELECT id, status FROM interview_qa
@@ -1208,10 +1229,10 @@ def interview_dialogue_turn(
                 if answered_row is not None and answered_row["status"] in ("open", "skipped"):
                     conn.execute(
                         """UPDATE interview_qa
-                           SET answer_text = ?, status = 'answered',
+                           SET answer_text = ?, status = ?,
                                answered_by = ?, answered_at = ?
                            WHERE id = ?""",
-                        (payload.user_message, payload.actor, now, consumed_id),
+                        (payload.user_message, consumed_status, payload.actor, now, consumed_id),
                     )
 
             if payload.user_message.strip():
@@ -1408,15 +1429,19 @@ def answer_interview_qa(
         ).fetchone()
         has_proposals = proposal_row is not None
 
+        # Issue #142: an "I don't know" answer records the row as
+        # 'unconfirmed' (valid but non-confirming) instead of 'answered'.
+        new_status = "unconfirmed" if payload.answer_unknown else "answered"
+
         conn.execute("BEGIN")
         try:
             if qa["status"] in ("open", "skipped"):
                 conn.execute(
                     """UPDATE interview_qa
-                       SET answer_text = ?, status = 'answered', answered_by = ?,
+                       SET answer_text = ?, status = ?, answered_by = ?,
                            answered_at = ?
                        WHERE id = ?""",
-                    (payload.answer_text, payload.actor, now, qa_id),
+                    (payload.answer_text, new_status, payload.actor, now, qa_id),
                 )
                 conn.execute("COMMIT")
                 updated = conn.execute(
@@ -1428,7 +1453,8 @@ def answer_interview_qa(
                     regeneration_recommended=False,
                 )
 
-            # status == 'answered': this is a correction. Insert a new
+            # status is 'answered' or 'unconfirmed': this is a correction.
+            # Insert a new
             # revision row, then link the old row forward. runtime_evidence
             # (Issue #135) is carried onto the new current row just like
             # evidence_refs, so correcting a runtime question's answer never
@@ -1445,7 +1471,7 @@ def answer_interview_qa(
                 ),
                 now=now,
                 answer_text=payload.answer_text,
-                status="answered",
+                status=new_status,
                 answered_by=payload.actor,
                 answered_at=now,
                 runtime_evidence=(

@@ -389,7 +389,10 @@ export type InterviewQaCategory = "purpose" | "capability" | "api" | "probe_flow
 // Issue #135: "runtime" questions come from reconciling approved metadata
 // against deterministic runtime trace aggregates.
 export type InterviewQaSource = "reviewer" | "dialogue" | "zero_base" | "runtime";
-export type InterviewQaStatus = "open" | "answered" | "revised" | "skipped";
+// "unconfirmed" (Issue #142): the developer explicitly could not confirm the
+// answer ("わかりません"). Recorded as valid input, re-confirmed later via a
+// hypothesis question — never treated as an answered/confirmed fact.
+export type InterviewQaStatus = "open" | "answered" | "revised" | "skipped" | "unconfirmed";
 
 export interface InterviewQaEvidenceRef {
   path: string;
