@@ -66,7 +66,7 @@
         "id": { "type": "integer" },
         "system_id": { "type": "integer" },
         "snapshot_id": { "type": "integer" },
-        "run_type": { "enum": ["repository_drafts", "system_profile_draft", "feature_map_draft", "symbol_index", "feature_code_mapping", "probe_plan", "probe_plan_from_flow", "capability_hierarchy", "explanation_refresh", "interview_proposal", "interview_dialogue", "interview_evidence_selection", "understanding_review"] },
+        "run_type": { "enum": ["repository_drafts", "system_profile_draft", "feature_map_draft", "symbol_index", "feature_code_mapping", "probe_plan", "probe_plan_from_flow", "capability_hierarchy", "explanation_refresh", "interview_proposal", "interview_dialogue", "interview_evidence_selection", "understanding_review", "runtime_reality_check"] },
         "provider": { "type": "string" },
         "model": { "type": "string" },
         "prompt_version": { "type": "string" },
@@ -882,7 +882,35 @@
         "open_questions_structured": { "type": ["array", "null"], "items": { "type": "object" } },
         "created_qa_ids": { "type": "array", "items": { "type": "integer" } },
         "evidence_run": { "oneOf": [{ "$ref": "#/definitions/IntelligenceRun" }, { "type": "null" }] },
-        "evidence_used": { "type": "array", "items": { "$ref": "#/definitions/InterviewQaEvidenceRef" } }
+        "evidence_used": { "type": "array", "items": { "$ref": "#/definitions/InterviewQaEvidenceRef" } },
+        "evidence_reads": { "type": "array", "items": { "$ref": "#/definitions/IntelligenceRunEvidence" } }
+      },
+      "additionalProperties": false
+    },
+    "IntelligenceRunEvidence": {
+      "type": "object",
+      "description": "One snippet actually read from the pinned snapshot during pass 1 of the interview dialogue turn (Issue #137), regardless of whether the resulting question cited it. Snippet content itself is never persisted.",
+      "required": ["id", "system_id", "intelligence_run_id", "path", "start_line", "end_line", "char_count", "truncated", "created_at"],
+      "properties": {
+        "id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "intelligence_run_id": { "type": "integer" },
+        "path": { "type": "string" },
+        "start_line": { "type": "integer" },
+        "end_line": { "type": "integer" },
+        "char_count": { "type": "integer" },
+        "truncated": { "type": "boolean" },
+        "created_at": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    "IntelligenceRunEvidenceList": {
+      "type": "object",
+      "required": ["intelligence_run_id", "system_id"],
+      "properties": {
+        "intelligence_run_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "items": { "type": "array", "items": { "$ref": "#/definitions/IntelligenceRunEvidence" } }
       },
       "additionalProperties": false
     },
@@ -908,9 +936,10 @@
         "system_id": { "type": "integer" },
         "question_text": { "type": "string" },
         "question_category": { "enum": ["purpose", "capability", "api", "probe_flow", "general"] },
-        "question_source": { "enum": ["reviewer", "dialogue", "zero_base"] },
+        "question_source": { "enum": ["reviewer", "dialogue", "zero_base", "runtime"] },
         "hypothesis": { "type": ["string", "null"] },
         "evidence_refs": { "type": "array", "items": { "$ref": "#/definitions/InterviewQaEvidenceRef" } },
+        "runtime_evidence": { "type": ["object", "null"] },
         "answer_text": { "type": ["string", "null"] },
         "status": { "enum": ["open", "answered", "revised", "skipped"] },
         "answered_by": { "type": ["string", "null"] },
@@ -941,6 +970,134 @@
         "open_count": { "type": "integer", "minimum": 0 },
         "high_priority_open_count": { "type": "integer", "minimum": 0 },
         "answers_revised_at": { "type": ["number", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "UnderstandingRevision": {
+      "type": "object",
+      "description": "One appended (never overwritten) understanding snapshot from a successful update-understanding call (Issue #136), linked to the understanding_review intelligence_runs row that produced it.",
+      "required": ["id", "session_id", "system_id", "snapshot_id", "created_at"],
+      "properties": {
+        "id": { "type": "integer" },
+        "session_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "snapshot_id": { "type": "integer" },
+        "intelligence_run_id": { "type": ["integer", "null"] },
+        "current_understanding": { "type": ["object", "null"] },
+        "gap_analysis": { "type": ["array", "null"], "items": { "type": "object" } },
+        "created_at": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    "UnderstandingRevisionList": {
+      "type": "object",
+      "required": ["session_id", "system_id"],
+      "properties": {
+        "session_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "items": { "type": "array", "items": { "$ref": "#/definitions/UnderstandingRevision" } }
+      },
+      "additionalProperties": false
+    },
+    "UnderstandingDiffConfidenceChange": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string" },
+        "before": { "type": ["string", "null"] },
+        "after": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "UnderstandingDiffSection": {
+      "type": "object",
+      "required": ["section"],
+      "properties": {
+        "section": { "type": "string" },
+        "added": { "type": "array", "items": { "type": "string" } },
+        "removed": { "type": "array", "items": { "type": "string" } },
+        "confidence_changed": { "type": "array", "items": { "$ref": "#/definitions/UnderstandingDiffConfidenceChange" } },
+        "summary_changed": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "UnderstandingDiff": {
+      "type": "object",
+      "description": "Deterministic structural diff between two understanding revisions, matched by exact item name only (Issue #136). has_previous=false means there is no earlier revision to compare against (e.g. the session's first revision); sections is then empty rather than an all-added diff.",
+      "required": ["session_id", "system_id", "has_previous"],
+      "properties": {
+        "session_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "from_revision_id": { "type": ["integer", "null"] },
+        "to_revision_id": { "type": ["integer", "null"] },
+        "has_previous": { "type": "boolean" },
+        "sections": { "type": "array", "items": { "$ref": "#/definitions/UnderstandingDiffSection" } }
+      },
+      "additionalProperties": false
+    },
+    "RuntimeTraceFacts": {
+      "type": "object",
+      "description": "Deterministic trace aggregates for one component_id over a window (Issue #135). has_traces=false with null numeric fields is the '0 traces for an approved probe plan' signal; whether that is worth a question is decided by the reasoning step, never here.",
+      "required": ["component_id", "window_days", "call_count", "error_count", "has_traces"],
+      "properties": {
+        "component_id": { "type": "string" },
+        "window_days": { "type": "integer" },
+        "call_count": { "type": "integer", "minimum": 0 },
+        "error_count": { "type": "integer", "minimum": 0 },
+        "error_rate": { "type": ["number", "null"] },
+        "duration_p50_ms": { "type": ["number", "null"] },
+        "duration_p90_ms": { "type": ["number", "null"] },
+        "duration_p99_ms": { "type": ["number", "null"] },
+        "last_observed_at": { "type": ["number", "null"] },
+        "has_traces": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "RuntimeRealityCheckItem": {
+      "type": "object",
+      "description": "One approved element's declared understanding paired with its runtime trace facts (Issue #135).",
+      "required": ["proposal_id", "decision_id", "path", "qualified_name", "component_id", "facts"],
+      "properties": {
+        "proposal_id": { "type": "integer" },
+        "decision_id": { "type": "integer" },
+        "path": { "type": "string" },
+        "qualified_name": { "type": "string" },
+        "component_id": { "type": "string" },
+        "role": { "type": ["string", "null"] },
+        "probe_value": { "type": ["string", "null"] },
+        "state_effects": { "type": "array", "items": { "type": "string" } },
+        "recommended_mode": { "type": "string" },
+        "facts": { "$ref": "#/definitions/RuntimeTraceFacts" }
+      },
+      "additionalProperties": false
+    },
+    "RuntimeRealityFacts": {
+      "type": "object",
+      "description": "Response for the deterministic-only runtime facts endpoint (no reasoning model call, Issue #135).",
+      "required": ["session_id", "system_id", "snapshot_id", "window_days"],
+      "properties": {
+        "session_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "snapshot_id": { "type": "integer" },
+        "window_days": { "type": "integer" },
+        "items": { "type": "array", "items": { "$ref": "#/definitions/RuntimeRealityCheckItem" } }
+      },
+      "additionalProperties": false
+    },
+    "RuntimeRealityCheckRun": {
+      "type": "object",
+      "description": "Response for triggering the Runtime Reality Check reasoning run (Issue #135). skipped=true means generation was suppressed because unanswered runtime questions already exist for this session; no intelligence_runs row is created in that case.",
+      "required": ["session_id", "system_id", "snapshot_id"],
+      "properties": {
+        "session_id": { "type": "integer" },
+        "system_id": { "type": "integer" },
+        "snapshot_id": { "type": "integer" },
+        "intelligence_run": { "oneOf": [{ "$ref": "#/definitions/IntelligenceRun" }, { "type": "null" }] },
+        "items_considered": { "type": "integer", "minimum": 0 },
+        "created_qa_ids": { "type": "array", "items": { "type": "integer" } },
+        "skipped": { "type": "boolean" },
+        "skipped_reason": { "type": ["string", "null"] },
+        "error": { "type": ["string", "null"] }
       },
       "additionalProperties": false
     },

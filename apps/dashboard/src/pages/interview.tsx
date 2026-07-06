@@ -22,10 +22,13 @@ import {
   useMaterializeInterview,
   useRejectInterviewProposal,
   useResumeInterviewQa,
+  useRunRuntimeRealityCheck,
   useSkipInterviewQa,
+  useUnderstandingDiff,
   useUpdateInterviewUnderstanding,
 } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
+import { api } from "@/api/client";
 import { DiagnosticFixCallout } from "@/components/diagnostic-fix";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -40,6 +43,7 @@ import { formatTimestamp } from "@/lib/utils";
 import type {
   CurrentUnderstanding,
   GapItem,
+  IntelligenceRunEvidenceOut,
   InterviewMaterializeOut,
   InterviewProposalMetadataBlock,
   InterviewProposalOut,
@@ -55,6 +59,7 @@ import type {
   SourceMetadataElementType,
   SourceMetadataOperationKind,
   SourceMetadataStateEffect,
+  UnderstandingDiffOut,
   UnderstandingItem,
 } from "@/api/types";
 
@@ -501,6 +506,9 @@ function QaItemCard({
           )}
         </div>
         <div className="flex gap-1 shrink-0">
+          {qa.question_source === "runtime" && (
+            <Badge variant="secondary" data-testid={`qa-source-runtime-${qa.id}`}>実態チェック</Badge>
+          )}
           <Badge variant="outline">{qa.question_category}</Badge>
           <Badge variant={
             qa.status === "answered" ? "success"
@@ -520,6 +528,33 @@ function QaItemCard({
               {e.char_count != null ? ` (${e.char_count} chars 読込)` : ""}
             </div>
           ))}
+        </div>
+      )}
+
+      {qa.runtime_evidence && (
+        <div
+          className="rounded-md bg-muted/40 border p-2 text-[11px] space-y-1"
+          data-testid={`qa-runtime-evidence-${qa.id}`}
+        >
+          <p className="font-mono text-muted-foreground">
+            {qa.runtime_evidence.component_id} ({qa.runtime_evidence.path})
+          </p>
+          <p>
+            直近{qa.runtime_evidence.facts.window_days}日: 呼び出し{qa.runtime_evidence.facts.call_count}件、
+            エラー{qa.runtime_evidence.facts.error_count}件
+            {qa.runtime_evidence.facts.error_rate != null
+              ? `(${(qa.runtime_evidence.facts.error_rate * 100).toFixed(1)}%)`
+              : ""}
+            {qa.runtime_evidence.facts.duration_p50_ms != null && (
+              <>、p50 {qa.runtime_evidence.facts.duration_p50_ms.toFixed(1)}ms</>
+            )}
+            {!qa.runtime_evidence.facts.has_traces && "(トレース0件)"}
+          </p>
+          <p className="text-muted-foreground">
+            承認済み理解: role="{qa.runtime_evidence.declared.role ?? "-"}" /
+            state_effects=[{qa.runtime_evidence.declared.state_effects.join(", ")}] /
+            recommended_mode={qa.runtime_evidence.declared.recommended_mode}
+          </p>
         </div>
       )}
 
@@ -571,13 +606,14 @@ function QaItemCard({
   );
 }
 
-function QaPanel({ sessionId, actor }: { sessionId: number; actor: string }) {
+function QaPanel({
+  sessionId, actor, approvedCount,
+}: { sessionId: number; actor: string; approvedCount: number }) {
   const { data: qaList } = useInterviewQaList(sessionId);
   const answer = useAnswerInterviewQa(sessionId);
   const skip = useSkipInterviewQa(sessionId);
   const resume = useResumeInterviewQa(sessionId);
-
-  if (!qaList || qaList.items.length === 0) return null;
+  const runRealityCheck = useRunRuntimeRealityCheck(sessionId);
 
   const handleAnswer = async (qaId: number, answerText: string) => {
     try {
@@ -592,14 +628,49 @@ function QaPanel({ sessionId, actor }: { sessionId: number; actor: string }) {
     }
   };
 
+  const handleRuntimeRealityCheck = async () => {
+    try {
+      const result = await runRealityCheck.mutateAsync();
+      if (result.skipped) {
+        toast.info(result.skipped_reason ?? "既存の未回答の実態チェック質問があるため、実行をスキップしました。");
+      } else if (result.error) {
+        toast.error(`実態チェックに失敗しました: ${result.error}`);
+      } else if (result.created_qa_ids.length === 0) {
+        toast.success("実態チェックを実行しましたが、確認すべきズレは見つかりませんでした。");
+      } else {
+        toast.success(`実態チェックにより ${result.created_qa_ids.length} 件の確認質問を生成しました。`);
+      }
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
+  // Keep the panel visible when there are no Q&A rows yet but the session
+  // has approved elements: the Runtime Reality Check trigger (Issue #135)
+  // lives here, and its most useful moment is exactly before any questions
+  // exist. Hide the panel only when there is nothing to show AND nothing
+  // that could be run.
+  if (!qaList || (qaList.items.length === 0 && approvedCount === 0)) return null;
+
   return (
     <Card data-testid="qa-panel">
       <CardHeader>
         <CardTitle className="text-sm flex items-center gap-2">
           <HelpCircle className="h-4 w-4" /> Q&amp;A一覧
         </CardTitle>
-        <CardDescription>
-          残質問 {qaList.open_count} 件(うち高優先度 {qaList.high_priority_open_count} 件)
+        <CardDescription className="flex items-center justify-between gap-2">
+          <span>
+            残質問 {qaList.open_count} 件(うち高優先度 {qaList.high_priority_open_count} 件)
+          </span>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={handleRuntimeRealityCheck}
+            disabled={runRealityCheck.isPending || approvedCount === 0}
+            data-testid="run-runtime-reality-check"
+          >
+            {runRealityCheck.isPending ? "実行中..." : "実態チェックを実行"}
+          </Button>
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
@@ -633,6 +704,117 @@ function QaPanel({ sessionId, actor }: { sessionId: number; actor: string }) {
             />
           ))}
         </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+// 差分サマリーの件数(追加/削除/確信度変化/説明変化)。パネル表示と
+// 「理解を更新」トーストの両方で使う単一の集計ロジック。
+function summarizeUnderstandingDiff(diff: UnderstandingDiffOut) {
+  const added = diff.sections.reduce((n, s) => n + s.added.length, 0);
+  const removed = diff.sections.reduce((n, s) => n + s.removed.length, 0);
+  const confidenceChanged = diff.sections.reduce((n, s) => n + s.confidence_changed.length, 0);
+  const summaryChanged = diff.sections.reduce((n, s) => n + s.summary_changed.length, 0);
+  return {
+    added,
+    removed,
+    confidenceChanged,
+    summaryChanged,
+    hasChanges: added + removed + confidenceChanged + summaryChanged > 0,
+  };
+}
+
+// 理解のリビジョン差分パネル(Issue #136)。「理解を更新」の結果、直前リビジョンから
+// 何が変わったかを決定的な差分(追加/削除/確信度変化)で表示する。回答修正から
+// 再構築した直後は「あなたの回答修正が反映されました」の文脈を添える。
+function UnderstandingDiffPanel({
+  sessionId, answerRevisionReflected,
+}: { sessionId: number; answerRevisionReflected: boolean }) {
+  const { data: diff } = useUnderstandingDiff(sessionId);
+  const [expanded, setExpanded] = useState(false);
+
+  if (!diff) return null;
+
+  if (!diff.has_previous) {
+    return (
+      <Card data-testid="understanding-diff-panel">
+        <CardHeader>
+          <CardTitle className="text-sm">理解の変化</CardTitle>
+          <CardDescription>比較対象となる前のリビジョンがありません(初回の理解構築です)。</CardDescription>
+        </CardHeader>
+      </Card>
+    );
+  }
+
+  const {
+    added: addedCount,
+    removed: removedCount,
+    confidenceChanged: confidenceCount,
+    summaryChanged: summaryCount,
+    hasChanges,
+  } = summarizeUnderstandingDiff(diff);
+
+  return (
+    <Card data-testid="understanding-diff-panel">
+      <CardHeader>
+        <CardTitle className="text-sm flex items-center gap-2">
+          <Sparkles className="h-4 w-4" /> 理解の変化
+        </CardTitle>
+        <CardDescription data-testid="understanding-diff-summary">
+          {hasChanges
+            ? `追加 ${addedCount} / 削除 ${removedCount} / 確信度変化 ${confidenceCount} / 説明変化 ${summaryCount}`
+            : "前回のリビジョンから変化はありません"}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-2">
+        {answerRevisionReflected && (
+          <div
+            className="rounded-md border border-emerald-400 bg-emerald-50 dark:bg-emerald-950/20 p-2 text-xs"
+            data-testid="answer-revision-reflected-banner"
+          >
+            あなたの回答修正が理解に反映されました。
+          </div>
+        )}
+        {hasChanges && (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => setExpanded(e => !e)}
+            data-testid="toggle-understanding-diff-detail"
+          >
+            {expanded ? "詳細を隠す" : "詳細を見る"}
+          </Button>
+        )}
+        {expanded && (
+          <div className="space-y-2 text-xs" data-testid="understanding-diff-detail">
+            {diff.sections.map(s => {
+              const empty = s.added.length === 0 && s.removed.length === 0
+                && s.confidence_changed.length === 0 && s.summary_changed.length === 0;
+              if (empty) return null;
+              return (
+                <div key={s.section} className="border rounded-md p-2 space-y-1">
+                  <p className="font-semibold">{s.section}</p>
+                  {s.added.map(n => (
+                    <p key={`a-${n}`} className="text-emerald-600">+ {n}</p>
+                  ))}
+                  {s.removed.map(n => (
+                    <p key={`r-${n}`} className="text-red-600">- {n}</p>
+                  ))}
+                  {s.confidence_changed.map(c => (
+                    <p key={`c-${c.name}`} className="flex items-center gap-1">
+                      <Badge variant="outline">{c.name}</Badge>
+                      確信度: {c.before ?? "-"} → {c.after ?? "-"}
+                    </p>
+                  ))}
+                  {s.summary_changed.map(n => (
+                    <p key={`s-${n}`}>{n}: 説明が更新されました</p>
+                  ))}
+                </div>
+              );
+            })}
+          </div>
+        )}
       </CardContent>
     </Card>
   );
@@ -685,6 +867,8 @@ export default function InterviewPage() {
   const [editing, setEditing] = useState<InterviewProposalOut | null>(null);
   const [editForm, setEditForm] = useState<EditForm | null>(null);
   const [lastMaterialization, setLastMaterialization] = useState<InterviewMaterializeOut | null>(null);
+  const [answerRevisionReflected, setAnswerRevisionReflected] = useState(false);
+  const [lastEvidenceReads, setLastEvidenceReads] = useState<IntelligenceRunEvidenceOut[]>([]);
 
   const sortedSessions = useMemo(() => sessions ?? [], [sessions]);
   const proposals = session?.proposals ?? [];
@@ -703,6 +887,14 @@ export default function InterviewPage() {
       setSearchParams({ session: String(sortedSessions[0].id) }, { replace: true });
     }
   }, [selectedSessionId, sortedSessions, setSearchParams]);
+
+  // Per-session UI state: switching sessions must not carry over the
+  // previous session's "answers reflected" banner (#136) or last-turn
+  // evidence reads (#137) — both describe events in that session only.
+  useEffect(() => {
+    setAnswerRevisionReflected(false);
+    setLastEvidenceReads([]);
+  }, [selectedSessionId]);
 
   const userMessageCount = useMemo(
     () => (session?.messages ?? []).filter(m => m.role === "user").length,
@@ -824,11 +1016,31 @@ export default function InterviewPage() {
 
   const refreshUnderstanding = async () => {
     if (!selectedSessionId) return;
+    const hadAnswerRevision = !!session?.answers_revised_at;
     try {
       const updated = await updateUnderstanding.mutateAsync(selectedSessionId);
       if (updated.last_error) {
         toast.error(`理解の更新に失敗しました: ${updated.last_error}`);
-      } else {
+        return;
+      }
+      setAnswerRevisionReflected(hadAnswerRevision);
+      try {
+        const diff = await api.get<UnderstandingDiffOut>(
+          `/interview/sessions/${selectedSessionId}/understanding-diff`,
+        );
+        if (!diff.has_previous) {
+          toast.success("理解を更新しました(初回のリビジョンです)");
+        } else {
+          const counts = summarizeUnderstandingDiff(diff);
+          if (!counts.hasChanges) {
+            toast.success("理解を更新しました(前回からの変化はありません)");
+          } else {
+            toast.success(
+              `理解を更新しました(追加 ${counts.added} / 削除 ${counts.removed} / 確信度変化 ${counts.confidenceChanged})`,
+            );
+          }
+        }
+      } catch {
         toast.success("理解を更新しました");
       }
     } catch (e) {
@@ -848,6 +1060,7 @@ export default function InterviewPage() {
         actor,
       });
       setMessage("");
+      setLastEvidenceReads(result.evidence_reads ?? []);
       if (result.error) toast.error(result.error);
       else if (result.proposals.length) toast.success(`${result.proposals.length}件の提案を生成しました`);
       else toast.success("回答を送信しました");
@@ -1130,6 +1343,22 @@ export default function InterviewPage() {
                               : "回答を送信"}
                         </Button>
                       </div>
+                      {lastEvidenceReads.length > 0 && (
+                        <div
+                          className="rounded-md border p-2 text-[10px] text-muted-foreground font-mono space-y-0.5"
+                          data-testid="evidence-reads-panel"
+                        >
+                          <p className="text-[10px] uppercase font-semibold not-italic">
+                            このターンで参照したコード
+                          </p>
+                          {lastEvidenceReads.map((e, i) => (
+                            <div key={i}>
+                              {e.path}:{e.start_line}-{e.end_line} ({e.char_count} chars)
+                              {e.truncated ? " (truncated)" : ""}
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </>
                   )}
                 </CardContent>
@@ -1375,7 +1604,12 @@ export default function InterviewPage() {
                 </Card>
               )}
 
-              <QaPanel sessionId={session.id} actor={actor} />
+              <UnderstandingDiffPanel
+                sessionId={session.id}
+                answerRevisionReflected={answerRevisionReflected}
+              />
+
+              <QaPanel sessionId={session.id} actor={actor} approvedCount={approvedCount} />
 
               {session.gap_analysis && session.gap_analysis.length > 0 && (
                 <Card>

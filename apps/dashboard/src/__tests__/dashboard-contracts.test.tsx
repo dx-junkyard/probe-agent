@@ -1,5 +1,5 @@
 /// <reference types="vitest/globals" />
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, MemoryRouter } from "react-router-dom";
 import { vi } from "vitest";
@@ -1233,12 +1233,20 @@ function mockInterviewApi(options: {
   approvedCount?: number;
   session?: Record<string, unknown>;
   proposals?: unknown[];
+  understandingDiff?: Record<string, unknown>;
+  qaList?: Record<string, unknown>;
 } = {}) {
   const session = interviewSession(options.session ?? {});
   const proposal = interviewProposal();
   const proposals = options.proposals ?? [proposal];
   const approvedCount = options.approvedCount ?? 0;
   mockApi.get.mockImplementation((path: string) => {
+    if (path === "/interview/sessions/7/understanding-diff") {
+      return Promise.resolve(options.understandingDiff ?? null);
+    }
+    if (path === "/interview/sessions/7/qa") {
+      return Promise.resolve(options.qaList ?? null);
+    }
     if (path === "/repository/snapshots/latest") {
       return Promise.resolve({
         id: 42,
@@ -1367,6 +1375,210 @@ describe("Interview page", () => {
         { actor: "admin" },
       );
     });
+  });
+
+  test("runtime reality check trigger is reachable with zero Q&A rows (Issue #135)", async () => {
+    // Approved elements exist but no questions yet — the most useful moment
+    // for the first reality check. The trigger must not be hidden behind an
+    // empty Q&A list.
+    mockInterviewApi({
+      approvedCount: 1,
+      qaList: {
+        session_id: 7,
+        system_id: 1,
+        items: [],
+        open_count: 0,
+        high_priority_open_count: 0,
+        answers_revised_at: null,
+      },
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const button = await screen.findByTestId("run-runtime-reality-check");
+    expect(button).toBeEnabled();
+  });
+
+  test("shows understanding diff summary and expandable detail (Issue #136)", async () => {
+    mockInterviewApi({
+      understandingDiff: {
+        session_id: 7,
+        system_id: 1,
+        from_revision_id: 1,
+        to_revision_id: 2,
+        has_previous: true,
+        sections: [
+          {
+            section: "core_capabilities",
+            added: ["Classify"],
+            removed: [],
+            confidence_changed: [{ name: "Summarize", before: "uncertain", after: "confirmed" }],
+            summary_changed: [],
+          },
+          {
+            section: "system_purpose",
+            added: [],
+            removed: [],
+            confidence_changed: [],
+            summary_changed: [],
+          },
+        ],
+      },
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const panel = await screen.findByTestId("understanding-diff-panel");
+    expect(within(panel).getByTestId("understanding-diff-summary")).toHaveTextContent(
+      "追加 1 / 削除 0 / 確信度変化 1",
+    );
+
+    expect(screen.queryByTestId("understanding-diff-detail")).not.toBeInTheDocument();
+    fireEvent.click(within(panel).getByTestId("toggle-understanding-diff-detail"));
+    const detail = await screen.findByTestId("understanding-diff-detail");
+    expect(within(detail).getByText("+ Classify")).toBeInTheDocument();
+    expect(within(detail).getByText(/確信度: uncertain → confirmed/)).toBeInTheDocument();
+  });
+
+  test("shows 'no comparison target' when the session has no previous revision (Issue #136)", async () => {
+    mockInterviewApi({
+      understandingDiff: {
+        session_id: 7,
+        system_id: 1,
+        from_revision_id: null,
+        to_revision_id: 1,
+        has_previous: false,
+        sections: [],
+      },
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const panel = await screen.findByTestId("understanding-diff-panel");
+    expect(within(panel).getByText("比較対象となる前のリビジョンがありません(初回の理解構築です)。")).toBeInTheDocument();
+  });
+
+  test("shows 'your answer correction was reflected' after rebuilding from a revised answer (Issue #136)", async () => {
+    mockInterviewApi({
+      session: { answers_revised_at: 123 },
+      understandingDiff: {
+        session_id: 7,
+        system_id: 1,
+        from_revision_id: 1,
+        to_revision_id: 2,
+        has_previous: true,
+        sections: [],
+      },
+    });
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7/update-understanding") {
+        return Promise.resolve(interviewSession({ answers_revised_at: null, last_error: null }));
+      }
+      return Promise.resolve({ id: 1, decision: "approved", decision_method: "manual" });
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const refreshButton = await screen.findByRole("button", { name: /理解を更新/ });
+    fireEvent.click(refreshButton);
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/interview/sessions/7/update-understanding", {});
+    });
+    expect(await screen.findByTestId("answer-revision-reflected-banner")).toBeInTheDocument();
+  });
+
+  test("shows all evidence read for a turn, even when uncited (Issue #137)", async () => {
+    mockInterviewApi();
+    mockApi.post.mockResolvedValue({
+      assistant_message: "読みました。",
+      proposals: [],
+      next_questions: [],
+      intelligence_run: null,
+      error: null,
+      stage: "proposal_generation",
+      current_understanding: null,
+      gap_analysis: null,
+      open_questions_structured: [],
+      evidence_run: { id: 99, run_type: "interview_evidence_selection" },
+      evidence_used: [],
+      evidence_reads: [
+        {
+          id: 1, system_id: 1, intelligence_run_id: 99,
+          path: "src/summarize.py", start_line: 1, end_line: 10,
+          char_count: 120, truncated: false, created_at: 1,
+        },
+        {
+          id: 2, system_id: 1, intelligence_run_id: 99,
+          path: "src/classifier.py", start_line: 1, end_line: 3,
+          char_count: 40, truncated: true, created_at: 1,
+        },
+      ],
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const textarea = await screen.findByPlaceholderText(
+      /上の質問への回答や修正点を入力してください。|提案の対象範囲や重視したい観点があれば入力してください。/,
+    );
+    fireEvent.change(textarea, { target: { value: "詳細を教えてください" } });
+    fireEvent.click(screen.getByRole("button", { name: /送信/ }));
+
+    const panel = await screen.findByTestId("evidence-reads-panel");
+    expect(panel.textContent).toContain("src/summarize.py:1-10");
+    expect(panel.textContent).toContain("120 chars");
+    expect(panel.textContent).toContain("src/classifier.py:1-3");
+    expect(panel.textContent).toContain("truncated");
   });
 
   test("sends edits through the validated edit endpoint and materializes a diff", async () => {

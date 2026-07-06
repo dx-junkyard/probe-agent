@@ -195,6 +195,20 @@ def test_read_evidence_snippets_never_reads_uncommitted_content(tmp_path):
     assert snippets[0].content == "committed content"
 
 
+def test_read_evidence_snippets_exposes_partial_results_on_failure(tmp_path):
+    """Issue #137: a target that fails partway through must not lose the
+    snippets successfully read before it — they are still audit-worthy."""
+    repo, sha = _init_repo(tmp_path, {"a.py": "hello\n"})
+    targets = [
+        EvidenceTarget(path="a.py", start_line=1, end_line=1),
+        EvidenceTarget(path="does/not/exist.py", start_line=1, end_line=1),
+    ]
+    with pytest.raises(EvidenceReadError) as exc_info:
+        read_evidence_snippets(repo, sha, targets)
+    assert len(exc_info.value.partial_snippets) == 1
+    assert exc_info.value.partial_snippets[0].path == "a.py"
+
+
 # --- select_evidence_targets (pass 1 reasoning call) -------------------------
 
 

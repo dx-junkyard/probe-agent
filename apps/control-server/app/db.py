@@ -1112,6 +1112,10 @@ CREATE TABLE IF NOT EXISTS interview_qa (
     question_source     TEXT NOT NULL DEFAULT 'dialogue',
     hypothesis          TEXT,
     evidence_refs       TEXT,
+    -- Issue #135: raw aggregated trace facts + declared-metadata provenance
+    -- for question_source = 'runtime' rows only (JSON object). NULL for all
+    -- other sources; kept separate from evidence_refs (code line ranges).
+    runtime_evidence    TEXT,
     answer_text         TEXT,
     status              TEXT NOT NULL DEFAULT 'open',
     answered_by         TEXT,
@@ -1131,6 +1135,57 @@ CREATE INDEX IF NOT EXISTS idx_interview_qa_system
 
 CREATE INDEX IF NOT EXISTS idx_interview_qa_current
     ON interview_qa (session_id, superseded_by_id);
+
+-- Understanding revisions (Issue #136). One row per successful
+-- update-understanding call — appended, never overwritten — so the
+-- Dashboard can show what changed since the previous revision. Linked to
+-- the understanding_review intelligence_runs row that produced it
+-- (Principle 7). Diffing is computed on demand from these rows; no diff
+-- result is stored (always reproducible, Principle 6).
+CREATE TABLE IF NOT EXISTS understanding_revision (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id              INTEGER NOT NULL,
+    system_id               INTEGER NOT NULL,
+    snapshot_id             INTEGER NOT NULL,
+    intelligence_run_id     INTEGER,
+    current_understanding   TEXT,
+    gap_analysis            TEXT,
+    created_at              REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_revision_session
+    ON understanding_revision (session_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_revision_system
+    ON understanding_revision (system_id, session_id);
+
+-- Evidence actually read during pass 1 of the interview dialogue turn
+-- (Issue #137). One row per snippet read from the pinned snapshot,
+-- regardless of whether the resulting question cited it — a raw fact kept
+-- separate from interview_qa.evidence_refs (which only holds cited spans).
+-- Snippet content itself is never persisted (size/confidentiality).
+CREATE TABLE IF NOT EXISTS intelligence_run_evidence (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    intelligence_run_id INTEGER NOT NULL,
+    path                TEXT NOT NULL,
+    start_line          INTEGER NOT NULL,
+    end_line            INTEGER NOT NULL,
+    char_count          INTEGER NOT NULL DEFAULT 0,
+    truncated           INTEGER NOT NULL DEFAULT 0,
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_intelligence_run_evidence_run
+    ON intelligence_run_evidence (intelligence_run_id);
+
+CREATE INDEX IF NOT EXISTS idx_intelligence_run_evidence_system
+    ON intelligence_run_evidence (system_id, intelligence_run_id);
 
 -- Understanding graph snapshots (Issue #79). Persists merged documentation
 -- claim graphs for a system. Each snapshot records the full graph JSON,
@@ -1692,6 +1747,11 @@ def init_db() -> None:
         conn.execute(
             "UPDATE intelligence_runs SET status = 'completed' WHERE status = 'success'"
         )
+        qa_cols = _columns(conn, "interview_qa")
+        if qa_cols and "runtime_evidence" not in qa_cols:
+            # Issue #135: raw trace-aggregate + metadata-provenance JSON for
+            # question_source = 'runtime' rows; existing rows stay NULL.
+            conn.execute("ALTER TABLE interview_qa ADD COLUMN runtime_evidence TEXT")
         _ensure_legacy_system(conn)
     _bootstrap_admin()
 

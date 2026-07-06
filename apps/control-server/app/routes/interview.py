@@ -45,7 +45,25 @@ from ..interview_evidence import (
     EvidenceReadError,
     read_evidence_snippets,
 )
+from ..interview_language import (
+    get_interview_language,
+    interview_message,
+    resolve_message_language,
+)
 from ..llm import LLMConfig, LLMError, create_llm_client, is_reasoning_model
+from ..runtime_reality import (
+    RuntimeCheckInputItem,
+    RuntimeRealityCheckResult,
+    aggregate_component_facts,
+    declared_block,
+    generate_runtime_reality_check,
+    window_days as runtime_window_days,
+)
+from ..understanding_diff import (
+    DEFAULT_REVISION_LIMIT,
+    diff_understanding,
+    revision_limit,
+)
 from ..models import (
     InterviewApprovedItemOut,
     InterviewApprovedSetOut,
@@ -77,7 +95,15 @@ from ..models import (
     InterviewSessionDetailOut,
     InterviewSessionOut,
     InterviewStructuredQuestion,
+    IntelligenceRunEvidenceListOut,
+    IntelligenceRunEvidenceOut,
     IntelligenceRunOut,
+    RuntimeRealityCheckRunOut,
+    RuntimeRealityFactsOut,
+    UnderstandingDiffOut,
+    UnderstandingDiffSectionOut,
+    UnderstandingRevisionListOut,
+    UnderstandingRevisionOut,
 )
 from ..probe_planner import check_denylist
 
@@ -90,6 +116,17 @@ STAGE_ORDER = [
     "probe_flow_selection",
     "proposal_generation",
 ]
+
+
+def _component_id_for(qualified_name: str) -> str:
+    """Deterministic component_id for an interview-authored probe.
+
+    Single definition shared by worktree materialization (Issue #71), which
+    stamps this id onto the generated ``@probe`` decorator, and the Runtime
+    Reality Check (Issue #135), which aggregates traces by the same id. If
+    the derivations drifted, runtime facts would silently match zero traces.
+    """
+    return qualified_name.replace(".", "_")
 
 
 def _advance_stage(current_stage: str, target: str) -> str:
@@ -209,6 +246,11 @@ def _qa_out(row) -> InterviewQaOut:
             [InterviewQaEvidenceRefOut(**e) for e in json.loads(row["evidence_refs"])]
             if row["evidence_refs"] else []
         ),
+        runtime_evidence=(
+            json.loads(row["runtime_evidence"])
+            if ("runtime_evidence" in row.keys() and row["runtime_evidence"])
+            else None
+        ),
         answer_text=row["answer_text"],
         status=row["status"],
         answered_by=row["answered_by"],
@@ -249,13 +291,14 @@ def _insert_qa_row(
     status: str = "open",
     answered_by: Optional[str] = None,
     answered_at: Optional[float] = None,
+    runtime_evidence: Optional[dict] = None,
 ) -> int:
     cur = conn.execute(
         """INSERT INTO interview_qa
             (session_id, system_id, question_text, question_category,
-             question_source, hypothesis, evidence_refs, answer_text, status,
-             answered_by, created_at, answered_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             question_source, hypothesis, evidence_refs, runtime_evidence,
+             answer_text, status, answered_by, created_at, answered_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             session_id,
             system_id,
@@ -265,6 +308,7 @@ def _insert_qa_row(
             hypothesis,
             json.dumps([e.model_dump() for e in evidence_refs], ensure_ascii=False)
             if evidence_refs else None,
+            json.dumps(runtime_evidence, ensure_ascii=False) if runtime_evidence else None,
             answer_text,
             status,
             answered_by,
@@ -792,10 +836,20 @@ def interview_dialogue_turn(
                         snapshot_row["commit_sha"],
                         evidence_audit.targets,
                     )
-                except (EvidenceReadError, EvidenceConfigError) as exc:
-                    # Fail-closed: no "continue without the snippet" fallback,
-                    # and invalid INTERVIEW_EVIDENCE_* configuration is a
-                    # recorded turn failure, not an unaudited HTTP 500.
+                except EvidenceReadError as exc:
+                    # Fail-closed: no "continue without the snippet" fallback.
+                    # Whatever snippets were read before the failing target
+                    # are kept so they can still be audited (Issue #137).
+                    evidence_snippets = exc.partial_snippets
+                    turn = InterviewTurnResult(
+                        provider=config.provider,
+                        model=config.model,
+                        is_mock=False,
+                        error=str(exc),
+                    )
+                except EvidenceConfigError as exc:
+                    # Invalid INTERVIEW_EVIDENCE_* configuration is a recorded
+                    # turn failure, not an unaudited HTTP 500.
                     turn = InterviewTurnResult(
                         provider=config.provider,
                         model=config.model,
@@ -857,6 +911,41 @@ def interview_dialogue_turn(
                 ).fetchone()
                 evidence_run_out = _intelligence_run_out(evidence_run_row)
 
+            # Issue #137: persist every snippet actually read during pass 1,
+            # linked to its evidence-selection run, regardless of whether the
+            # eventual question cites it or pass 2 later fails. Snippet
+            # content itself is never stored.
+            evidence_reads_out: List[IntelligenceRunEvidenceOut] = []
+            if evidence_audit is not None and evidence_snippets:
+                for snippet in evidence_snippets:
+                    er_cur = conn.execute(
+                        """INSERT INTO intelligence_run_evidence
+                            (system_id, intelligence_run_id, path, start_line,
+                             end_line, char_count, truncated, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            system_id,
+                            ev_cur.lastrowid,
+                            snippet.path,
+                            snippet.start_line,
+                            snippet.end_line,
+                            snippet.char_count,
+                            1 if snippet.truncated else 0,
+                            now,
+                        ),
+                    )
+                    evidence_reads_out.append(IntelligenceRunEvidenceOut(
+                        id=er_cur.lastrowid,
+                        system_id=system_id,
+                        intelligence_run_id=ev_cur.lastrowid,
+                        path=snippet.path,
+                        start_line=snippet.start_line,
+                        end_line=snippet.end_line,
+                        char_count=snippet.char_count,
+                        truncated=snippet.truncated,
+                        created_at=now,
+                    ))
+
             # Store intelligence run (success or failure).
             run_status = "failed" if turn.error else "completed"
             run_cur = conn.execute(
@@ -897,6 +986,7 @@ def interview_dialogue_turn(
                     error=turn.error,
                     intelligence_run=intelligence_run_out,
                     evidence_run=evidence_run_out,
+                    evidence_reads=evidence_reads_out,
                 )
 
             # Store assistant message.
@@ -1160,6 +1250,7 @@ def interview_dialogue_turn(
                 )
                 for s in evidence_snippets
             ],
+            evidence_reads=evidence_reads_out,
         )
 
 
@@ -1324,7 +1415,10 @@ def answer_interview_qa(
                 )
 
             # status == 'answered': this is a correction. Insert a new
-            # revision row, then link the old row forward.
+            # revision row, then link the old row forward. runtime_evidence
+            # (Issue #135) is carried onto the new current row just like
+            # evidence_refs, so correcting a runtime question's answer never
+            # drops the trace-fact provenance that justified the question.
             new_id = _insert_qa_row(
                 conn, session_id, system_id,
                 question_text=qa["question_text"],
@@ -1340,6 +1434,11 @@ def answer_interview_qa(
                 status="answered",
                 answered_by=payload.actor,
                 answered_at=now,
+                runtime_evidence=(
+                    json.loads(qa["runtime_evidence"])
+                    if ("runtime_evidence" in qa.keys() and qa["runtime_evidence"])
+                    else None
+                ),
             )
             conn.execute(
                 "UPDATE interview_qa SET status = 'revised', superseded_by_id = ? WHERE id = ?",
@@ -1833,7 +1932,7 @@ def materialize_interview_session(
                 consumers=md.consumers if md.consumers else None,
                 state_effects=md.state_effects if md.state_effects else None,
             ),
-            component_id=item.qualified_name.replace(".", "_"),
+            component_id=_component_id_for(item.qualified_name),
             recommended_mode=pp.recommended_mode,
             line_start=0,
             line_end=0,
@@ -1950,7 +2049,7 @@ def confirm_interview_understanding(
             (
                 session_id,
                 system_id,
-                "これまでの回答内容を確定し、提案生成に進みます。",
+                interview_message("confirm_understanding_message", resolve_message_language()),
                 now,
             ),
         )
@@ -2025,6 +2124,12 @@ def update_interview_understanding(
       probe_value: Verify understanding update rebuilds graph and reconciliation correctly
     """
     now = time.time()
+    # Issue #138: fixed-text messages this route composes itself follow
+    # INTERVIEW_LANGUAGE. Falls back to ja only for these messages if the
+    # setting is invalid, so a misconfiguration doesn't prevent the failure
+    # message itself from being composed; reasoning calls below still fail
+    # closed through get_interview_language() unchanged.
+    msg_lang = resolve_message_language()
     with get_conn() as conn:
         session = _get_session_or_404(conn, session_id, system_id)
         snapshot_id = session["snapshot_id"]
@@ -2089,17 +2194,18 @@ def update_interview_understanding(
                 """INSERT INTO interview_message
                     (session_id, system_id, role, content, intelligence_run_id, created_at)
                 VALUES (?, ?, 'assistant', ?, ?, ?)""",
-                (session_id, system_id, f"理解の更新に失敗しました: {error}", run_id, now),
+                (
+                    session_id, system_id,
+                    interview_message("understanding_update_failed", msg_lang, error=error),
+                    run_id, now,
+                ),
             )
             row = _get_session_or_404(conn, session_id, system_id)
             return _session_out(row)
 
         graph = _load_graph_for_snapshot(conn, system_id, snapshot_id)
         if graph is None:
-            error = (
-                "このスナップショットの理解グラフが未構築です。"
-                "先に System Understanding の build/refresh を実行してください。"
-            )
+            error = interview_message("graph_not_built", msg_lang)
             conn.execute(
                 """UPDATE interview_session
                    SET last_error = ?, updated_at = ?
@@ -2110,7 +2216,11 @@ def update_interview_understanding(
                 """INSERT INTO interview_message
                     (session_id, system_id, role, content, created_at)
                 VALUES (?, ?, 'assistant', ?, ?)""",
-                (session_id, system_id, f"理解の更新に失敗しました: {error}", now),
+                (
+                    session_id, system_id,
+                    interview_message("understanding_update_failed", msg_lang, error=error),
+                    now,
+                ),
             )
             row = _get_session_or_404(conn, session_id, system_id)
             return _session_out(row)
@@ -2147,7 +2257,11 @@ def update_interview_understanding(
                 """INSERT INTO interview_message
                     (session_id, system_id, role, content, intelligence_run_id, created_at)
                 VALUES (?, ?, 'assistant', ?, ?, ?)""",
-                (session_id, system_id, f"理解のレビューに失敗しました: {review.error}", run_id, now),
+                (
+                    session_id, system_id,
+                    interview_message("review_failed", msg_lang, error=review.error),
+                    run_id, now,
+                ),
             )
             row = _get_session_or_404(conn, session_id, system_id)
             return _session_out(row)
@@ -2217,22 +2331,54 @@ def update_interview_understanding(
             (understanding_json, gap_json, questions_json, new_stage, now, session_id, system_id),
         )
 
+        # Issue #136: append (never overwrite) an understanding revision,
+        # linked to the understanding_review run that produced it, so the
+        # Dashboard can show a deterministic diff against the previous one.
+        conn.execute(
+            """INSERT INTO understanding_revision
+                (session_id, system_id, snapshot_id, intelligence_run_id,
+                 current_understanding, gap_analysis, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (session_id, system_id, snapshot_id, run_id, understanding_json, gap_json, now),
+        )
+        try:
+            limit = revision_limit()
+        except ValueError:
+            limit = DEFAULT_REVISION_LIMIT
+        conn.execute(
+            """DELETE FROM understanding_revision
+               WHERE session_id = ? AND system_id = ? AND id NOT IN (
+                   SELECT id FROM understanding_revision
+                   WHERE session_id = ? AND system_id = ?
+                   ORDER BY id DESC LIMIT ?
+               )""",
+            (session_id, system_id, session_id, system_id, limit),
+        )
+
         if review.current_understanding:
+            unknown_name = interview_message("unknown_name", msg_lang)
+            purpose_label = interview_message("system_purpose_label", msg_lang)
+            capability_label = interview_message("core_capability_label", msg_lang)
             summary_parts = []
             for purpose in review.current_understanding.get("system_purpose", []):
-                summary_parts.append(f"システムの目的: {purpose.get('name', '不明')}")
+                summary_parts.append(f"{purpose_label}: {purpose.get('name') or unknown_name}")
             for cap in review.current_understanding.get("core_capabilities", []):
-                summary_parts.append(f"主要機能: {cap.get('name', '不明')}")
+                summary_parts.append(f"{capability_label}: {cap.get('name') or unknown_name}")
             if summary_parts:
                 asst_content = (
-                    "ドキュメントとコードを分析し、初期理解を構築しました。\n\n"
+                    interview_message("understanding_built_intro", msg_lang) + "\n\n"
                     + "\n".join(f"- {p}" for p in summary_parts)
                 )
                 if review.open_questions:
-                    asst_content += "\n\n主な確認事項:\n"
+                    asst_content += (
+                        "\n\n" + interview_message("key_questions_heading", msg_lang) + "\n"
+                    )
                     for q in review.open_questions[:5]:
                         asst_content += f"- {q.get('question', '')}\n"
-                asst_content += f"\n推奨される次のステップ: {review.suggested_next_action}"
+                asst_content += (
+                    f"\n{interview_message('suggested_next_action_label', msg_lang)}: "
+                    f"{review.suggested_next_action}"
+                )
 
                 conn.execute(
                     """INSERT INTO interview_message
@@ -2243,3 +2389,471 @@ def update_interview_understanding(
 
         row = _get_session_or_404(conn, session_id, system_id)
         return _session_out(row)
+
+
+# --- Evidence read audit (Issue #137) ----------------------------------------
+
+
+@router.get(
+    "/interview/evidence-runs/{run_id}/evidence",
+    response_model=IntelligenceRunEvidenceListOut,
+)
+def list_intelligence_run_evidence(
+    run_id: int,
+    system_id: int = Depends(get_system_id),
+) -> IntelligenceRunEvidenceListOut:
+    """List every snippet read for a pass-1 evidence-selection run.
+
+    Includes snippets not cited by the resulting question — the read audit
+    is independent of citation (Principle 7 raw-fact/interpretation split).
+    Scoped by System; the run must also be an interview_evidence_selection
+    run for this System, or 404.
+
+    probe-agent:
+      role: API boundary for the persisted evidence-read audit
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: Verify reads are listed regardless of citation and are System-isolated
+    """
+    with get_conn() as conn:
+        run_row = conn.execute(
+            """SELECT id FROM intelligence_runs
+               WHERE id = ? AND system_id = ? AND run_type = 'interview_evidence_selection'""",
+            (run_id, system_id),
+        ).fetchone()
+        if run_row is None:
+            raise HTTPException(status_code=404, detail="Evidence-selection run not found")
+
+        rows = conn.execute(
+            """SELECT * FROM intelligence_run_evidence
+               WHERE intelligence_run_id = ? AND system_id = ?
+               ORDER BY id""",
+            (run_id, system_id),
+        ).fetchall()
+
+    return IntelligenceRunEvidenceListOut(
+        intelligence_run_id=run_id,
+        system_id=system_id,
+        items=[
+            IntelligenceRunEvidenceOut(
+                id=r["id"],
+                system_id=r["system_id"],
+                intelligence_run_id=r["intelligence_run_id"],
+                path=r["path"],
+                start_line=r["start_line"],
+                end_line=r["end_line"],
+                char_count=r["char_count"],
+                truncated=bool(r["truncated"]),
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ],
+    )
+
+
+# --- Understanding Revisions (Issue #136) ------------------------------------
+
+
+def _revision_out(row) -> UnderstandingRevisionOut:
+    return UnderstandingRevisionOut(
+        id=row["id"],
+        session_id=row["session_id"],
+        system_id=row["system_id"],
+        snapshot_id=row["snapshot_id"],
+        intelligence_run_id=row["intelligence_run_id"],
+        current_understanding=(
+            json.loads(row["current_understanding"]) if row["current_understanding"] else None
+        ),
+        gap_analysis=json.loads(row["gap_analysis"]) if row["gap_analysis"] else None,
+        created_at=row["created_at"],
+    )
+
+
+@router.get(
+    "/interview/sessions/{session_id}/understanding-revisions",
+    response_model=UnderstandingRevisionListOut,
+)
+def list_understanding_revisions(
+    session_id: int,
+    system_id: int = Depends(get_system_id),
+) -> UnderstandingRevisionListOut:
+    """List understanding revisions for a session, newest first.
+
+    probe-agent:
+      role: API boundary for listing understanding revisions
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: Verify revisions are System-isolated and appended in order
+    """
+    with get_conn() as conn:
+        _get_session_or_404(conn, session_id, system_id)
+        rows = conn.execute(
+            """SELECT * FROM understanding_revision
+               WHERE session_id = ? AND system_id = ?
+               ORDER BY id DESC""",
+            (session_id, system_id),
+        ).fetchall()
+
+    return UnderstandingRevisionListOut(
+        session_id=session_id,
+        system_id=system_id,
+        items=[_revision_out(r) for r in rows],
+    )
+
+
+@router.get(
+    "/interview/sessions/{session_id}/understanding-diff",
+    response_model=UnderstandingDiffOut,
+)
+def get_understanding_diff(
+    session_id: int,
+    system_id: int = Depends(get_system_id),
+    to: Optional[int] = Query(default=None),
+    from_: Optional[int] = Query(default=None, alias="from"),
+) -> UnderstandingDiffOut:
+    """Deterministic structural diff between two understanding revisions.
+
+    ``to`` defaults to the latest revision; ``from`` defaults to the
+    revision immediately before ``to``. When there is no earlier revision to
+    compare against (first revision, or no revisions at all), returns
+    ``has_previous: false`` with empty sections rather than diffing against
+    an empty understanding.
+
+    probe-agent:
+      role: API boundary for the deterministic understanding-revision diff
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: Verify the diff is deterministic, name-matched, and System-isolated
+    """
+    with get_conn() as conn:
+        _get_session_or_404(conn, session_id, system_id)
+
+        if to is not None:
+            to_row = conn.execute(
+                """SELECT * FROM understanding_revision
+                   WHERE id = ? AND session_id = ? AND system_id = ?""",
+                (to, session_id, system_id),
+            ).fetchone()
+            if to_row is None:
+                raise HTTPException(status_code=404, detail="Revision not found (to)")
+        else:
+            to_row = conn.execute(
+                """SELECT * FROM understanding_revision
+                   WHERE session_id = ? AND system_id = ?
+                   ORDER BY id DESC LIMIT 1""",
+                (session_id, system_id),
+            ).fetchone()
+            if to_row is None:
+                return UnderstandingDiffOut(
+                    session_id=session_id, system_id=system_id, has_previous=False,
+                )
+
+        if from_ is not None:
+            from_row = conn.execute(
+                """SELECT * FROM understanding_revision
+                   WHERE id = ? AND session_id = ? AND system_id = ?""",
+                (from_, session_id, system_id),
+            ).fetchone()
+            if from_row is None:
+                raise HTTPException(status_code=404, detail="Revision not found (from)")
+            if from_row["id"] >= to_row["id"]:
+                # A reversed range would silently swap added/removed and
+                # invert confidence before/after — reject it instead.
+                raise HTTPException(
+                    status_code=422,
+                    detail="'from' must be an earlier revision than 'to'",
+                )
+        else:
+            from_row = conn.execute(
+                """SELECT * FROM understanding_revision
+                   WHERE session_id = ? AND system_id = ? AND id < ?
+                   ORDER BY id DESC LIMIT 1""",
+                (session_id, system_id, to_row["id"]),
+            ).fetchone()
+
+    if from_row is None:
+        return UnderstandingDiffOut(
+            session_id=session_id,
+            system_id=system_id,
+            to_revision_id=to_row["id"],
+            has_previous=False,
+        )
+
+    previous = json.loads(from_row["current_understanding"]) if from_row["current_understanding"] else None
+    current = json.loads(to_row["current_understanding"]) if to_row["current_understanding"] else None
+    sections = diff_understanding(previous, current)
+
+    return UnderstandingDiffOut(
+        session_id=session_id,
+        system_id=system_id,
+        from_revision_id=from_row["id"],
+        to_revision_id=to_row["id"],
+        has_previous=True,
+        sections=[UnderstandingDiffSectionOut(**s) for s in sections],
+    )
+
+
+# --- Runtime Reality Check (Issue #135) --------------------------------------
+
+
+def _build_runtime_check_items(
+    conn, system_id: int, approved_set
+) -> List[RuntimeCheckInputItem]:
+    """Approved items for this session paired with deterministic trace facts.
+
+    component_id is derived from qualified_name exactly as materialization
+    (#71) writes it (``qualified_name.replace(".", "_")``), so aggregation
+    matches by construction rather than fuzzy lookup (Principle 6).
+
+    Takes an already-fetched ``approved_set`` (rather than fetching it here)
+    because ``get_interview_approved_set`` opens its own ``get_conn()`` and
+    the SQLite connection lock is not reentrant — this must never be called
+    while ``conn``'s own ``with get_conn()`` block is open.
+    """
+    items: List[RuntimeCheckInputItem] = []
+    for approved in approved_set.items:
+        component_id = _component_id_for(approved.qualified_name)
+        facts = aggregate_component_facts(conn, system_id, component_id)
+        items.append(
+            RuntimeCheckInputItem(
+                proposal_id=approved.proposal_id,
+                decision_id=approved.decision_id,
+                path=approved.path,
+                qualified_name=approved.qualified_name,
+                component_id=component_id,
+                role=approved.metadata.role,
+                probe_value=approved.metadata.probe_value,
+                state_effects=approved.metadata.state_effects,
+                recommended_mode=approved.probe_plan.recommended_mode,
+                facts=facts,
+            )
+        )
+    return items
+
+
+@router.get(
+    "/interview/sessions/{session_id}/runtime-facts",
+    response_model=RuntimeRealityFactsOut,
+)
+def get_runtime_reality_facts(
+    session_id: int,
+    system_id: int = Depends(get_system_id),
+) -> RuntimeRealityFactsOut:
+    """Deterministic trace aggregates for the session's approved elements.
+
+    No reasoning model is called here; this is numeric aggregation only
+    (Principle 6), scoped to this System's traces.
+
+    probe-agent:
+      role: API boundary for deterministic runtime trace aggregation
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: Verify aggregation is System-isolated and deterministic for the same trace set
+    """
+    approved_set = get_interview_approved_set(session_id, system_id)
+    # A misconfigured RUNTIME_REALITY_CHECK_* env var is a client-visible
+    # configuration error (422), not an unhandled 500.
+    try:
+        window = runtime_window_days()
+        with get_conn() as conn:
+            items = _build_runtime_check_items(conn, system_id, approved_set)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return RuntimeRealityFactsOut(
+        session_id=session_id,
+        system_id=system_id,
+        snapshot_id=approved_set.snapshot_id,
+        window_days=window,
+        items=items,
+    )
+
+
+@router.post(
+    "/interview/sessions/{session_id}/runtime-reality-check",
+    response_model=RuntimeRealityCheckRunOut,
+)
+def run_runtime_reality_check(
+    session_id: int,
+    system_id: int = Depends(get_system_id),
+) -> RuntimeRealityCheckRunOut:
+    """Reconcile approved metadata/probe plans against runtime trace facts.
+
+    Manual-only trigger (no scheduling). Suppresses re-running while
+    unanswered ``question_source: 'runtime'`` questions exist for this
+    session (noise control from the issue notes) — that check is
+    deterministic and happens before any reasoning call. On both success and
+    failure the run is recorded in intelligence_runs; on failure no
+    interview_qa rows are created (fail-closed, Principle 6/7).
+
+    probe-agent:
+      role: API boundary for the runtime reality check reasoning run
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: orchestration
+      state_effects: [database-read, database-write, external-api]
+      probe_value: Verify the run fails closed on reasoning errors and is suppressed while unanswered runtime questions remain
+    """
+    now = time.time()
+    approved_set = get_interview_approved_set(session_id, system_id)
+    snapshot_id = approved_set.snapshot_id
+
+    # First connection: suppression check + deterministic aggregation only.
+    # get_conn() holds the process-wide DB lock, so the reasoning call below
+    # must happen after this block closes — holding the lock across an
+    # external LLM round trip would stall every other request.
+    try:
+        with get_conn() as conn:
+            open_runtime = conn.execute(
+                """SELECT id FROM interview_qa
+                   WHERE session_id = ? AND system_id = ?
+                     AND question_source = 'runtime' AND status = 'open'
+                   LIMIT 1""",
+                (session_id, system_id),
+            ).fetchone()
+            if open_runtime is not None:
+                return RuntimeRealityCheckRunOut(
+                    session_id=session_id,
+                    system_id=system_id,
+                    snapshot_id=snapshot_id,
+                    skipped=True,
+                    skipped_reason=(
+                        "Unanswered runtime reality check questions already exist "
+                        "for this session; answer or skip them before re-running."
+                    ),
+                )
+
+            items = _build_runtime_check_items(conn, system_id, approved_set)
+    except ValueError as exc:
+        # Misconfigured RUNTIME_REALITY_CHECK_* env var: client-visible 422,
+        # consistent with the runtime-facts endpoint.
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    if not items:
+        raise HTTPException(
+            status_code=422,
+            detail="No approved elements to check against runtime traces",
+        )
+
+    config = LLMConfig.intelligence_from_env()
+    result: Optional[RuntimeRealityCheckResult] = None
+    try:
+        client = create_llm_client(config)
+        language = get_interview_language()
+    except (LLMError, ValueError) as exc:
+        result = RuntimeRealityCheckResult(
+            provider=config.provider,
+            model=config.model,
+            is_mock=config.provider == "mock",
+            error=str(exc),
+        )
+
+    if result is None:
+        result = generate_runtime_reality_check(
+            client, config, items=items, language=language
+        )
+
+    # Second connection: persist the audit run and any generated questions
+    # atomically — a mid-loop failure must not leave a completed run with a
+    # partial question set (which would also wrongly suppress the next run).
+    with get_conn() as conn:
+        run_status = "failed" if result.error else "completed"
+        conn.execute("BEGIN")
+        try:
+            run_cur = conn.execute(
+                """INSERT INTO intelligence_runs
+                    (system_id, snapshot_id, run_type, provider, model,
+                     prompt_version, schema_version, decision_method, status,
+                     error_details, is_mock, started_at, completed_at)
+                VALUES (?, ?, 'runtime_reality_check', ?, ?, ?, ?,
+                        'reasoning_llm', ?, ?, ?, ?, ?)""",
+                (
+                    system_id,
+                    snapshot_id,
+                    result.provider,
+                    result.model,
+                    result.prompt_version,
+                    result.schema_version,
+                    run_status,
+                    result.error,
+                    1 if result.is_mock else 0,
+                    now,
+                    now,
+                ),
+            )
+            run_id = run_cur.lastrowid
+
+            by_key = {(i.component_id, i.qualified_name): i for i in items}
+            created_qa_ids: List[int] = []
+            if not result.error:
+                for q in result.questions:
+                    item = by_key[(q.component_id, q.qualified_name)]
+                    # Raw facts + declared-metadata provenance only. The LLM's
+                    # own output (question_text/hypothesis) lives in the
+                    # dedicated interview_qa columns, never in this blob
+                    # (raw facts vs interpretation separation).
+                    runtime_evidence = {
+                        "component_id": item.component_id,
+                        "qualified_name": item.qualified_name,
+                        "path": item.path,
+                        "metadata_source": {
+                            "proposal_id": item.proposal_id,
+                            "decision_id": item.decision_id,
+                            "session_id": session_id,
+                        },
+                        "declared": declared_block(item),
+                        "facts": item.facts.model_dump(),
+                    }
+                    qa_id = _insert_qa_row(
+                        conn,
+                        session_id,
+                        system_id,
+                        question_text=q.question_text,
+                        question_category="probe_flow",
+                        question_source="runtime",
+                        hypothesis=q.hypothesis or None,
+                        evidence_refs=[],
+                        now=now,
+                        runtime_evidence=runtime_evidence,
+                    )
+                    created_qa_ids.append(qa_id)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+        run_row = conn.execute(
+            "SELECT * FROM intelligence_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+
+    if result.error:
+        return RuntimeRealityCheckRunOut(
+            session_id=session_id,
+            system_id=system_id,
+            snapshot_id=snapshot_id,
+            intelligence_run=_intelligence_run_out(run_row),
+            items_considered=len(items),
+            error=result.error,
+        )
+
+    return RuntimeRealityCheckRunOut(
+        session_id=session_id,
+        system_id=system_id,
+        snapshot_id=snapshot_id,
+        intelligence_run=_intelligence_run_out(run_row),
+        items_considered=len(items),
+        created_qa_ids=created_qa_ids,
+    )

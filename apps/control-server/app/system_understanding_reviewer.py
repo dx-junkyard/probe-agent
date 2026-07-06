@@ -28,7 +28,11 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .docs_code_reconciler import ReconciliationResult, ReconciliationMapping
-from .interview_language import get_interview_language, language_directive
+from .interview_language import (
+    get_interview_language,
+    interview_message,
+    language_directive,
+)
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient, is_reasoning_model
 from .understanding_graph import UnderstandingGraph, GraphNode, EvidenceRef
 
@@ -187,12 +191,6 @@ Rules:
 def _system_prompt(language: str) -> str:
     return _SYSTEM_PROMPT + language_directive(language) + "\n"
 
-
-# Localized text for the deterministic no-evidence fallback question.
-_NO_EVIDENCE_QUESTION = {
-    "ja": "「{name}」({section})の根拠がドキュメント・コードから見つかりませんでした。この項目は正しいですか?",
-    "en": "No evidence for {section} item: {name}. Is this item correct?",
-}
 
 _COMPACT_RETRY_PROMPT = """\
 Your previous response was not valid complete JSON, likely because it was too
@@ -451,7 +449,8 @@ def generate_understanding_review(
             if not item.evidence:
                 item.confidence = _ConfidenceLevel(level="uncertain", reason="No evidence provided")
                 validated.open_questions.append(_OpenQuestion(
-                    question=_NO_EVIDENCE_QUESTION[language].format(
+                    question=interview_message(
+                        "no_evidence_question", language,
                         section=section_name, name=item.name,
                     ),
                     category="general",
