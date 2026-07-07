@@ -410,7 +410,8 @@ def _compare_query(system_id: int, spec: AnalyzerSpec) -> Tuple[str, list]:
         )
         params.extend([system_id, f["entity"]["type"], f["entity"]["id"]])
     sql = (
-        "SELECT tp.trace_id, tp.component_id, tp.phase, tp.data_json "
+        "SELECT tp.trace_id, tp.component_id, tp.projection_name, tp.phase, "
+        "tp.data_json "
         "FROM trace_projections tp WHERE " + " AND ".join(where) +
         " ORDER BY tp.created_at ASC, tp.id ASC"
     )
@@ -425,16 +426,20 @@ def _run_compare(conn, system_id: int, spec: AnalyzerSpec) -> Dict[str, Any]:
     sql, params = _compare_query(system_id, spec)
     rows = conn.execute(sql, params).fetchall()
 
-    # Group by (trace_id, component_id): phase -> fields dict.
-    grouped: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = {}
+    # Group by (trace_id, component_id, projection_name): phase -> fields dict.
+    # projection_name is part of the key so that, when an analyzer does not pin
+    # filter.projection_name and a trace carries several projections, the two
+    # phases are matched within the same projection instead of the last
+    # projection silently overwriting the earlier ones.
+    grouped: Dict[Tuple[str, str, str], Dict[str, Dict[str, Any]]] = {}
     for r in rows:
         try:
             data = json.loads(r["data_json"]) if r["data_json"] else {}
         except json.JSONDecodeError:
             data = {}
-        grouped.setdefault((r["trace_id"], r["component_id"]), {})[r["phase"]] = (
-            data.get("fields", {}) or {}
-        )
+        grouped.setdefault(
+            (r["trace_id"], r["component_id"], r["projection_name"]), {}
+        )[r["phase"]] = (data.get("fields", {}) or {})
 
     diff_fields: Dict[str, int] = {f: 0 for f in fields}
     components_with_diff: set = set()
@@ -442,7 +447,7 @@ def _run_compare(conn, system_id: int, spec: AnalyzerSpec) -> Dict[str, Any]:
     diff_trace_ids: set = set()
     compared_trace_ids: set = set()
 
-    for (trace_id, component_id), phases in grouped.items():
+    for (trace_id, component_id, _projection_name), phases in grouped.items():
         if phase_a not in phases or phase_b not in phases:
             continue
         compared_trace_ids.add(trace_id)
