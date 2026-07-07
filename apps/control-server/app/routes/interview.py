@@ -840,6 +840,26 @@ def interview_dialogue_turn(
                 seen_unconfirmed.add(u["question"])
         unconfirmed_qa_for_turn = merged_unconfirmed or None
 
+        # Proposal gate (Issues #83, #123), computed BEFORE the reasoning
+        # call: proposal_generation stage + explicit request + a built
+        # understanding or the developer's manual confirmation. The same
+        # value both tells the model that proposals were requested this turn
+        # (so an empty-proposal reply must carry narrowing questions instead
+        # of a plain answer — prompt interview-v6) and gates persistence
+        # below.
+        understanding_confirmed = (
+            "understanding_confirmed_at" in session.keys()
+            and session["understanding_confirmed_at"] is not None
+        )
+        proposals_requested = (
+            session_stage == "proposal_generation"
+            and payload.generate_proposals
+            and (
+                session["current_understanding"] is not None
+                or understanding_confirmed
+            )
+        )
+
         # Issue #130: pass 1 selects (or declines) evidence to read from the
         # pinned snapshot before pass 2 asks the next question. Both passes
         # are audited as separate intelligence_runs rows below.
@@ -928,6 +948,7 @@ def interview_dialogue_turn(
                     answered_qa=answered_qa_pairs,
                     unconfirmed_qa=unconfirmed_qa_for_turn,
                     evidence_snippets=evidence_snippets,
+                    proposals_requested=proposals_requested,
                 )
 
         conn.execute("BEGIN")
@@ -1051,6 +1072,7 @@ def interview_dialogue_turn(
                     intelligence_run=intelligence_run_out,
                     evidence_run=evidence_run_out,
                     evidence_reads=evidence_reads_out,
+                    proposals_requested=proposals_requested,
                 )
 
             # Store assistant message.
@@ -1062,27 +1084,14 @@ def interview_dialogue_turn(
             )
             asst_message_id = asst_cur.lastrowid
 
-            # Gate proposals behind proposal_generation stage + explicit request
-            # (Issue #83). The understanding requirement is satisfied either by
-            # a built structured understanding, or — in the zero-base fallback
-            # where none could be built — by the developer's explicit manual
-            # confirmation of the gathered context (Issue #123).
+            # Persistence gate = the same proposal gate computed before the
+            # reasoning call (Issues #83, #123). Kept as defense-in-depth: even
+            # if the model emits proposals on a turn that did not request
+            # them, nothing is persisted.
             current_stage = session["stage"] or "understanding_initialized"
-            understanding_confirmed = (
-                "understanding_confirmed_at" in session.keys()
-                and session["understanding_confirmed_at"] is not None
-            )
-            proposals_allowed = (
-                current_stage == "proposal_generation"
-                and payload.generate_proposals
-                and (
-                    session["current_understanding"] is not None
-                    or understanding_confirmed
-                )
-            )
 
             proposal_outs: List[InterviewDialogueProposalOut] = []
-            gated_proposals = turn.proposals if proposals_allowed else []
+            gated_proposals = turn.proposals if proposals_requested else []
             for p in gated_proposals:
                 p_graph_node_id = getattr(p, "graph_node_id", None)
                 p_capability_name = getattr(p, "capability_name", None)
@@ -1304,6 +1313,7 @@ def interview_dialogue_turn(
         return InterviewDialogueTurnOut(
             assistant_message=turn.assistant_message,
             proposals=proposal_outs,
+            proposals_requested=proposals_requested,
             next_questions=[_question_out(q) for q in turn.next_questions],
             intelligence_run=intelligence_run_out,
             stage=updated_session.stage,

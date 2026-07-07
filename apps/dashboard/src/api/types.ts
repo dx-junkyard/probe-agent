@@ -512,6 +512,11 @@ export interface InterviewDialogueTurnOut {
     probe_plan: InterviewProposalProbePlan;
     denylist_hit: string | null;
   }[];
+  // Whether this turn asked the reasoning model for proposals (gate open +
+  // generate_proposals). True with zero proposals means the model returned
+  // narrowing questions instead — show narrowing guidance, not a plain
+  // success message.
+  proposals_requested: boolean;
   next_questions: InterviewStructuredQuestion[];
   intelligence_run: IntelligenceRunOut | null;
   error: string | null;
