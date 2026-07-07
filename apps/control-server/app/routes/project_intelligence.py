@@ -49,6 +49,8 @@ from ..git_ops import (
     create_snapshot,
     discover_repository_candidates,
     read_file_at_commit,
+    resolve_head,
+    working_tree_status,
 )
 from ..llm import LLMConfig, LLMError, create_llm_client, is_reasoning_model
 from ..refresh_proposal import (
@@ -114,6 +116,8 @@ from ..models import (
     ProbePointStatusUpdate,
     RepositoryCandidateOut,
     RepositoryConfigOut,
+    RepositoryStatusOut,
+    SnapshotRefOut,
     SystemUnderstandingOut,
     RepositoryConfigUpdate,
     SnapshotFileOut,
@@ -558,8 +562,28 @@ def list_issue_drafts_endpoint(
       probe_value: verify drafts are scoped to the calling system only.
     """
     from ..issue_drafts import list_drafts
+    from ..system_understanding_service import _get_latest_ready_snapshot
 
-    return [IssueDraftOut(**d) for d in list_drafts(system_id)]
+    with get_conn() as conn:
+        latest = _get_latest_ready_snapshot(conn, system_id)
+    latest_commit = latest["commit_sha"] if latest else None
+
+    return [
+        IssueDraftOut(**d, stale=_draft_is_stale(d, latest_commit))
+        for d in list_drafts(system_id)
+    ]
+
+
+def _draft_is_stale(draft: dict, latest_commit: Optional[str]) -> bool:
+    """A draft is stale when the analysis it was generated from is behind the
+    latest ready snapshot. If no snapshot exists yet, or the draft was created
+    without a commit, we cannot claim staleness (Issue #158)."""
+    if latest_commit is None:
+        return False
+    draft_commit = draft.get("commit_sha")
+    if not draft_commit:
+        return False
+    return draft_commit != latest_commit
 
 
 @router.get("/issue-drafts/{draft_id}", response_model=IssueDraftOut)
@@ -579,11 +603,15 @@ def get_issue_draft_endpoint(
       probe_value: verify a draft owned by another system returns 404.
     """
     from ..issue_drafts import get_draft
+    from ..system_understanding_service import _get_latest_ready_snapshot
 
     draft = get_draft(system_id, draft_id)
     if draft is None:
         raise HTTPException(status_code=404, detail="Issue draft not found")
-    return IssueDraftOut(**draft)
+    with get_conn() as conn:
+        latest = _get_latest_ready_snapshot(conn, system_id)
+    latest_commit = latest["commit_sha"] if latest else None
+    return IssueDraftOut(**draft, stale=_draft_is_stale(draft, latest_commit))
 
 
 @router.patch("/issue-drafts/{draft_id}", response_model=IssueDraftOut)
@@ -1044,6 +1072,135 @@ def list_snapshots(
             (system_id,),
         ).fetchall()
         return [_snapshot_out(conn, row) for row in rows]
+
+
+def _snapshot_ref(row) -> Optional[SnapshotRefOut]:
+    if row is None:
+        return None
+    return SnapshotRefOut(
+        id=row["id"],
+        commit_sha=row["commit_sha"],
+        status=row["status"],
+        created_at=row["created_at"],
+    )
+
+
+@router.get("/repository/status", response_model=RepositoryStatusOut)
+def repository_status(
+    system_id: int = Depends(get_system_id),
+) -> RepositoryStatusOut:
+    """Repository refresh-hub state for the current system (Issue #158).
+
+    Read-only: reads the configured repository's HEAD and working-tree status
+    with ``git rev-parse`` / ``git status`` and compares them to the latest
+    snapshot so the dashboard can show whether the analysis is stale and what to
+    do next. Never mutates the target repository (Principle 5); reading HEAD or a
+    dirty tree does not fetch, pull, or write anything.
+
+    probe-agent:
+      role: API boundary reporting repository/snapshot freshness for the refresh loop
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [database-read, filesystem]
+      probe_value: verify HEAD/dirty reads never mutate the repo and that
+        snapshot_stale reflects latest-snapshot-vs-HEAD divergence.
+    """
+    with get_conn() as conn:
+        config_row = conn.execute(
+            "SELECT * FROM repository_configs WHERE system_id = ?", (system_id,)
+        ).fetchone()
+        latest_row = conn.execute(
+            "SELECT * FROM repository_snapshots WHERE system_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (system_id,),
+        ).fetchone()
+        latest_ready = conn.execute(
+            "SELECT * FROM repository_snapshots WHERE system_id = ? AND status = 'ready' "
+            "ORDER BY id DESC LIMIT 1",
+            (system_id,),
+        ).fetchone()
+        indexed_row = _latest_indexed_ready_snapshot(conn, system_id)
+
+    from ..system_understanding_jobs import get_latest_job
+
+    understanding = get_latest_job(system_id)
+
+    if config_row is None or not config_row["repo_path"]:
+        return RepositoryStatusOut(
+            configured=False,
+            latest_snapshot=_snapshot_ref(latest_row),
+            latest_indexed_snapshot=_snapshot_ref(indexed_row),
+            understanding_snapshot_id=(understanding or {}).get("snapshot_id"),
+            understanding_status=(understanding or {}).get("status"),
+            next_actions=["Configure the target repository."],
+        )
+
+    repo_path = config_row["repo_path"]
+    current_head: Optional[str] = None
+    head_error: Optional[str] = None
+    working_tree_dirty: Optional[bool] = None
+    dirty_file_count = 0
+    dirty_sample: List[str] = []
+    try:
+        current_head = resolve_head(repo_path)
+        wt = working_tree_status(repo_path)
+        working_tree_dirty = not wt.clean
+        dirty_file_count = wt.dirty_file_count
+        dirty_sample = wt.sample
+    except GitError as exc:
+        head_error = str(exc)
+
+    # Stale when a ready snapshot exists whose commit differs from current HEAD,
+    # or no ready snapshot exists at all while HEAD is known.
+    ready_commit = latest_ready["commit_sha"] if latest_ready else None
+    snapshot_stale = bool(
+        current_head is not None
+        and (ready_commit is None or ready_commit != current_head)
+    )
+    symbols_stale = bool(
+        latest_ready is not None
+        and (indexed_row is None or indexed_row["id"] != latest_ready["id"])
+    )
+
+    next_actions: List[str] = []
+    if head_error:
+        next_actions.append(
+            "Repository HEAD could not be read; check the repository path."
+        )
+    if working_tree_dirty:
+        next_actions.append(
+            "Working tree is dirty; commit, stash, or revert before relying on "
+            "patch apply."
+        )
+    if snapshot_stale:
+        if ready_commit is None:
+            next_actions.append("Create a snapshot of the current HEAD.")
+        else:
+            next_actions.append(
+                "Repository HEAD changed; create a new snapshot before generating "
+                "new analysis or patches."
+            )
+    if symbols_stale and not snapshot_stale:
+        next_actions.append("Re-index symbols for the latest snapshot.")
+
+    return RepositoryStatusOut(
+        configured=True,
+        repo_path=repo_path,
+        current_head=current_head,
+        head_error=head_error,
+        working_tree_dirty=working_tree_dirty,
+        dirty_file_count=dirty_file_count,
+        dirty_sample=dirty_sample,
+        latest_snapshot=_snapshot_ref(latest_row),
+        latest_indexed_snapshot=_snapshot_ref(indexed_row),
+        understanding_snapshot_id=(understanding or {}).get("snapshot_id"),
+        understanding_status=(understanding or {}).get("status"),
+        snapshot_stale=snapshot_stale,
+        symbols_stale=symbols_stale,
+        next_actions=next_actions,
+    )
 
 
 # ---------------------------------------------------------------------------

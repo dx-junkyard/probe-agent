@@ -15,6 +15,8 @@ from ..db import get_conn
 from ..llm import LLMConfig, LLMError, create_llm_client
 from ..models import (
     AnalysisRunOut,
+    AnalyzerContextOut,
+    AnalyzerEntityOut,
     AnalyzerProposeRequest,
     AnalyzerReviewUpdate,
     TraceAnalyzerCreate,
@@ -169,6 +171,44 @@ def propose_analyzer(
         )
         row = _fetch_analyzer(conn, system_id, cur.lastrowid)
     return _row_to_analyzer(row)
+
+
+# Bound on distinct (entity_type, entity_id) pairs surfaced to the builder so a
+# high-cardinality system cannot return an unbounded id list.
+_MAX_CONTEXT_ENTITIES = 500
+
+
+@router.get("/trace-analyzers/context", response_model=AnalyzerContextOut)
+def analyzer_context(system_id: int = Depends(get_system_id)) -> AnalyzerContextOut:
+    """Candidate values for the analyzer builder (Issue #157).
+
+    Deterministic, read-only. Returns the finite sets of identifiers a spec may
+    reference — components, entity types/ids, projection names, projection field
+    names, and phases — so the dashboard builder can offer them as choices
+    instead of requiring hand-written JSON. Same finite sets the LLM proposal
+    context uses (Principle 6); this endpoint makes no open-ended decision.
+    """
+    with get_conn() as conn:
+        ctx = build_proposal_context(conn, system_id)
+        entity_rows = conn.execute(
+            "SELECT DISTINCT entity_type, entity_id FROM trace_entities "
+            "WHERE system_id = ? ORDER BY entity_type, entity_id LIMIT ?",
+            (system_id, _MAX_CONTEXT_ENTITIES + 1),
+        ).fetchall()
+    truncated = len(entity_rows) > _MAX_CONTEXT_ENTITIES
+    entities = [
+        AnalyzerEntityOut(entity_type=r["entity_type"], entity_id=r["entity_id"])
+        for r in entity_rows[:_MAX_CONTEXT_ENTITIES]
+    ]
+    return AnalyzerContextOut(
+        components=ctx.components,
+        entity_types=ctx.entity_types,
+        entities=entities,
+        projection_names=ctx.projection_names,
+        field_names=ctx.field_names,
+        phases=ctx.phases,
+        entities_truncated=truncated,
+    )
 
 
 @router.get("/trace-analyzers", response_model=List[TraceAnalyzerOut])
