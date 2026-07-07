@@ -109,6 +109,16 @@ The dashboard should support:
   prefix and focuses it (no API call); `answer_options` render as
   send-on-click buttons. Quick answers are plain dialogue input — they are
   NOT approval actions; the proposal approval gate is unchanged.
+- Empty-proposal narrowing: a `generate_proposals` turn can legitimately
+  return zero proposals when the reasoning model lacks grounded targets; the
+  server then returns narrowing questions and `proposals_requested: true` in
+  the dialogue-turn response. In `ready_for_proposals`, if the session still
+  has open questions, the focused-question card shows the top one (with
+  hypothesis / answer options / 「わからない」) instead of the fixed
+  "ready" prompt, consumes it via `answered_qa_id` on send, and each answer
+  re-requests proposal generation. When a requested turn yields no proposals
+  and no error, show an informational toast (narrowing continues) — never a
+  bare success toast that implies proposals were created.
 
 ## Authentication model
 

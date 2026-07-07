@@ -870,7 +870,7 @@ Decision Workspace の #36（Context Pack Builder）と同じ位置づけ。pin 
    自体は失敗しない。テキスト一致は移行期間中は併存するが(その場合も一致した
    エントリの `qa_id` 行が answered に同期される)、いずれ削除される。
 3. 回答済み Q&A の最新リビジョン一覧を対話プロンプトに
-   「確定事実として再質問しない」指示付きで注入する(prompt `interview-v5`)。
+   「確定事実として再質問しない」指示付きで注入する(prompt `interview-v5` 以降)。
    意味レベルの重複質問の抑止は reasoning model への指示で行い、
    類似度ヒューリスティックでは行わない(Principle 6)。
 
@@ -1117,6 +1117,35 @@ probe_value / state_effects / recommended_mode)と、同じ component_id のト�
 
 共有スキーマ: `InterviewQA.status` への `"unconfirmed"` の追加
 ([shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json))。
+
+## 提案生成ターンの空提案と絞り込み継続
+
+`proposal_generation` 段階で `generate_proposals: true` のターンを送っても、従来は
+reasoning model が `proposals: []` の通常回答だけを返すことがあり、レスポンスは正常
+(`completed`)なのに提案が 1 件も作られず、UI 上は「提案レビューが空のまま進展しない」
+ように見えた。本改善は「提案生成を依頼されたターン」を明示的な契約にする。
+
+- **依頼の明示(deterministic)**: 提案ゲート(`proposal_generation` 段階 +
+  `generate_proposals` + 理解構築済みまたは手動確認済み — Issues #83/#123 と同一条件)を
+  LLM 呼び出し**前**に判定し、`generate_interview_turn` に `proposals_requested` として
+  渡す。プロンプト(`interview-v6`)には「開発者が提案生成を依頼した」セクションが
+  入り、モデルは (a) 根拠のあるシンボルへの提案を返すか、(b) 提案できるだけの情報が
+  ない場合は不足内容を `assistant_message` で説明し、仮説(`hypothesis`)と候補
+  (`answer_options`)付きの絞り込み質問を `next_questions` で返すことを要求される。
+- **fail-closed の構造チェック(deterministic)**: 依頼されたターンで提案も
+  `next_questions` も空の応答は構造化出力の契約違反としてターンを fail させ、
+  `intelligence_runs` に失敗として記録する(Principle 6/7: 「なぜ提案できないか」の
+  判断は reasoning_llm、「両方空か」は有限の構造チェック)。
+- **レスポンスへの可視化**: `InterviewDialogueTurnOut.proposals_requested` を追加し、
+  Dashboard は「依頼したが提案 0 件(=絞り込み継続)」と「そもそも依頼していない
+  ターン」を区別できる。絞り込み質問は従来どおり `open_questions` / `interview_qa`
+  (`question_source: "dialogue"`)として永続化されるため、Dashboard の
+  `ready_for_proposals` 状態は未回答の open question があればそれを提示し、回答の
+  たびに提案生成を再試行する(回答は `answered_qa_id` で消費、「わからない」は
+  #142 の `answer_unknown` で継続)。
+
+**含まない:** 提案の自動リトライ・自動生成ループ、絞り込み質問のヒューリスティック
+生成、空提案時のモック/ヒューリスティック代替。
 
 ## 大規模トレースのリネージと動的分析(Issue #144)
 

@@ -2347,6 +2347,12 @@ class InterviewDialogueTurnOut(BaseModel):
 
     assistant_message: str = ""
     proposals: List[InterviewDialogueProposalOut] = Field(default_factory=list)
+    # Whether this turn asked the reasoning model for proposals (the Issue
+    # #83/#123 gate passed with generate_proposals set). True with an empty
+    # proposals list means the model needs narrowing answers first and
+    # returned next_questions instead — the dashboard must not present that
+    # as a plain successful reply.
+    proposals_requested: bool = False
     next_questions: List[InterviewStructuredQuestion] = Field(default_factory=list)
     intelligence_run: Optional[IntelligenceRunOut] = None
     error: Optional[str] = None

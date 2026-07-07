@@ -1742,6 +1742,79 @@ describe("Interview page", () => {
     expect(panel.textContent).toContain("truncated");
   });
 
+  test("proposal narrowing: shows the model's narrowing question and re-requests proposals on answer", async () => {
+    // A generate_proposals turn returned zero proposals: the narrowing
+    // question persisted into open_questions must replace the fixed
+    // "ready for proposals" prompt, and answering it consumes the qa_id
+    // while re-requesting proposal generation.
+    mockInterviewApi({
+      proposals: [],
+      session: {
+        open_questions: [{
+          question: "計測対象は要約フローで正しいですか?",
+          category: "followup",
+          priority: "medium",
+          hypothesis: "summarize.summarize_text が主要なプローブ候補",
+          qa_id: 21,
+        }],
+      },
+    });
+    mockApi.post.mockResolvedValue({
+      assistant_message: "了解しました。",
+      proposals: [],
+      proposals_requested: true,
+      next_questions: [],
+      intelligence_run: null,
+      error: null,
+      stage: "proposal_generation",
+      current_understanding: null,
+      gap_analysis: null,
+      open_questions_structured: [],
+      created_qa_ids: [],
+      evidence_run: null,
+      evidence_used: [],
+      evidence_reads: [],
+      evidence_refs_dropped: 0,
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const card = await screen.findByTestId("focused-question");
+    expect(within(card).getByText("計測対象は要約フローで正しいですか?")).toBeInTheDocument();
+    expect(within(card).getByTestId("question-hypothesis")).toHaveTextContent(
+      "summarize.summarize_text が主要なプローブ候補",
+    );
+    // 「わからない」は提案ステージの絞り込みでも使える(Issue #142 と同じ経路)。
+    expect(within(card).getByTestId("quick-answer-unknown")).toBeInTheDocument();
+    // 次のアクション文言が絞り込み継続を案内する。
+    expect((await screen.findByTestId("next-action")).textContent).toContain(
+      "提案に必要な情報がまだ不足しています",
+    );
+
+    // 仮説付き質問への「はい」は、qa_id を消費しつつ提案生成を再依頼する。
+    fireEvent.click(within(card).getByTestId("quick-answer-yes"));
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/7/dialogue-turn",
+        expect.objectContaining({
+          generate_proposals: true,
+          answered_qa_id: 21,
+          answered_question: "計測対象は要約フローで正しいですか?",
+        }),
+      );
+    });
+  });
+
   test("sends edits through the validated edit endpoint and materializes a diff", async () => {
     mockInterviewApi({ approvedCount: 1 });
     mockApi.post.mockImplementation((path: string) => {

@@ -869,10 +869,11 @@
     },
     "InterviewDialogueTurnOut": {
       "type": "object",
-      "description": "Response from a single interview dialogue turn (Issue #69). If error is set, the turn failed closed and no proposals were stored. next_questions are structured hypothesis-first questions since Issue #128 (schema interview-v2). created_qa_ids/evidence_run/evidence_used are Issue #129/#130 additions.",
+      "description": "Response from a single interview dialogue turn (Issue #69). If error is set, the turn failed closed and no proposals were stored. next_questions are structured hypothesis-first questions since Issue #128 (schema interview-v2). created_qa_ids/evidence_run/evidence_used are Issue #129/#130 additions. proposals_requested reports whether this turn asked the reasoning model for proposals (generate_proposals with the stage/understanding gate open); when true with an empty proposals list, the model returned narrowing questions in next_questions instead — a requested turn that returns neither fails closed.",
       "properties": {
         "assistant_message": { "type": "string" },
         "proposals": { "type": "array", "items": { "$ref": "#/definitions/InterviewDialogueProposalOut" } },
+        "proposals_requested": { "type": "boolean", "default": false },
         "next_questions": { "type": "array", "items": { "$ref": "#/definitions/InterviewStructuredQuestion" } },
         "intelligence_run": { "oneOf": [{ "$ref": "#/definitions/IntelligenceRun" }, { "type": "null" }] },
         "error": { "type": ["string", "null"] },
