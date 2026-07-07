@@ -109,6 +109,34 @@ The dashboard should support:
   prefix and focuses it (no API call); `answer_options` render as
   send-on-click buttons. Quick answers are plain dialogue input — they are
   NOT approval actions; the proposal approval gate is unchanged.
+- Connectivity guide & warning badge (Issue #165): `pages/setup-guide.tsx`
+  (`/setup-guide`) is the Japanese client-setup instruction page. The
+  developer picks their execution pattern from a finite set (host-direct /
+  same Docker Compose project / add SDK to an existing image / external
+  repository or compose project) and sees the env vars, compose snippets,
+  token setup (no-auth local, legacy `CONTROL_API_KEYS`, issued API token),
+  patch-apply commands (`git apply --check` → `git apply` → tests → commit),
+  a manual smoke-trace `curl` (component_id `probe-smoke-check`), and a
+  failure-isolation section (missing config / auth failure / network
+  unreachable / no events sent / workload not run). A live connectivity
+  status card polls `GET /connectivity/status`. `?session=<id>` renders a
+  context banner for that interview session (snapshot, commit, patch state).
+  Secrets policy: the page shows placeholders only — never real tokens.
+  `components/connectivity-badge.tsx` renders in the header: state
+  `no_signal` → warning badge 「シグナル未受信」, `smoke_only` → info badge
+  「疎通確認のみ受信」; both link to `/setup-guide`; `receiving` hides the
+  badge. Wording must stay observation-based (「まだ受信していない」), never
+  「未設定」— the server cannot know why nothing arrived.
+- Interview review-diff card (Issue #165): the card explains intent and
+  provenance (generated from approved proposals, against the pinned
+  snapshot/commit, changes are `probe-agent:` docstring metadata +
+  `@probe` instrumentation, the target repository is NOT modified, the
+  developer reviews and applies manually), offers a `.patch` download via a
+  client-side Blob with filename
+  `probe-agent-system{systemId}-session{sessionId}-snapshot{snapshotId}[-{commit8}].patch`
+  (disabled with a reason when the diff is empty), shows `git apply`
+  guidance, and after materialization links to `/setup-guide?session=<id>`
+  as the next action.
 - Empty-proposal narrowing: a `generate_proposals` turn can legitimately
   return zero proposals when the reasoning model lacks grounded targets; the
   server then returns narrowing questions and `proposals_requested: true` in

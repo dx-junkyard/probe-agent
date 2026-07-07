@@ -11,6 +11,7 @@ import { toast } from "sonner";
 import { formatTimestamp } from "@/lib/utils";
 import { Copy, Key, Trash2 } from "lucide-react";
 import { getClientServerUrl } from "@/lib/env";
+import { CodeBlock } from "@/components/code-block";
 
 export default function ConnectSdkPage() {
   const { systemId } = useAuth();
@@ -169,19 +170,3 @@ def summarize(text: str) -> str:
   );
 }
 
-function CodeBlock({ children, lang }: { children: string; lang: string }) {
-  return (
-    <div className="relative">
-      <pre className="rounded-md bg-muted p-4 overflow-x-auto text-sm font-mono">
-        <code>{children}</code>
-      </pre>
-      <Button
-        variant="ghost" size="icon" className="absolute top-2 right-2 h-7 w-7"
-        onClick={() => { navigator.clipboard.writeText(children); toast.success("Copied"); }}
-        title={`Copy ${lang} code`}
-      >
-        <Copy className="h-3 w-3" />
-      </Button>
-    </div>
-  );
-}

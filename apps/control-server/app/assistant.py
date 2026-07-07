@@ -331,6 +331,33 @@ SCREEN_CONTEXTS: List[ScreenContext] = [
         related_endpoints=["POST /tokens/me", "POST /traces"],
     ),
     ScreenContext(
+        screen_id="setup-guide",
+        title="接続セットアップガイド",
+        route="/setup-guide",
+        purpose=(
+            "Guide developers through making a monitored application send "
+            "traces to probe-agent: pick an execution pattern, configure env "
+            "vars / tokens / compose, apply the generated review patch, run a "
+            "smoke check, and isolate failures when no signal arrives."
+        ),
+        primary_data_sources=["connectivity status", "interview sessions", "API tokens"],
+        visible_sections=[
+            "接続ステータス",
+            "実行形態の選択",
+            "認証トークンの設定",
+            "パッチの適用",
+            "疎通確認",
+            "トラブルシューティング",
+        ],
+        common_questions=[
+            "トレースが届かないときは何を確認すればよいですか?",
+            "PROBE_SERVER_URL には何を設定しますか?",
+        ],
+        related_settings=["CONTROL_API_KEYS"],
+        related_checks=["auth_scope"],
+        related_endpoints=["GET /connectivity/status", "POST /traces"],
+    ),
+    ScreenContext(
         screen_id="generation",
         title="Generate & Evaluate",
         route="/generation",
