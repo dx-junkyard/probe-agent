@@ -422,6 +422,111 @@ describe("Probe Patch application", () => {
   });
 });
 
+// ── Repository refresh loop (Issue #158) ────────────────────────────
+
+describe("Repository Refresh Hub", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const baseGet = (status: Record<string, unknown>) => (path: string) => {
+    if (path === "/repository") return Promise.resolve({
+      id: 1, system_id: 1, repo_path: "/repos/alpha", include_patterns: [], exclude_patterns: [],
+    });
+    if (path === "/repository-candidates") return Promise.resolve([{ name: "alpha", path: "/repos/alpha" }]);
+    if (path === "/repository/snapshots") return Promise.resolve([]);
+    if (path === "/repository/symbols") return Promise.resolve({ symbols: [], symbol_count: 0 });
+    if (path === "/repository/status") return Promise.resolve(status);
+    return Promise.resolve(null);
+  };
+
+  test("shows a stale banner and next steps when HEAD moved past the snapshot", async () => {
+    mockApi.get.mockImplementation(baseGet({
+      configured: true, repo_path: "/repos/alpha",
+      current_head: "def5678000", head_error: null,
+      working_tree_dirty: false, dirty_file_count: 0, dirty_sample: [],
+      latest_snapshot: { id: 12, commit_sha: "abc1234000", status: "ready", created_at: 1 },
+      latest_indexed_snapshot: null,
+      understanding_snapshot_id: null, understanding_status: null,
+      snapshot_stale: true, symbols_stale: false,
+      next_actions: ["Repository HEAD changed; create a new snapshot before generating new analysis or patches."],
+    }));
+
+    const { default: RepositoryPage } = await import("@/pages/repository");
+    render(<RepositoryPage />, { wrapper: createWrapper() });
+
+    const hub = await screen.findByTestId("refresh-hub");
+    expect(within(hub).getByTestId("snapshot-stale-badge")).toBeInTheDocument();
+    // The next-steps list echoes the server's actionable guidance verbatim.
+    expect(
+      within(hub).getByText(/create a new snapshot before generating new analysis or patches/i),
+    ).toBeInTheDocument();
+  });
+
+  test("shows up to date when nothing is stale", async () => {
+    mockApi.get.mockImplementation(baseGet({
+      configured: true, repo_path: "/repos/alpha",
+      current_head: "abc1234000", head_error: null,
+      working_tree_dirty: false, dirty_file_count: 0, dirty_sample: [],
+      latest_snapshot: { id: 12, commit_sha: "abc1234000", status: "ready", created_at: 1 },
+      latest_indexed_snapshot: { id: 12, commit_sha: "abc1234000", status: "ready", created_at: 1 },
+      understanding_snapshot_id: 12, understanding_status: "completed",
+      snapshot_stale: false, symbols_stale: false, next_actions: [],
+    }));
+
+    const { default: RepositoryPage } = await import("@/pages/repository");
+    render(<RepositoryPage />, { wrapper: createWrapper() });
+
+    const hub = await screen.findByTestId("refresh-hub");
+    expect(within(hub).getByText("Up to date")).toBeInTheDocument();
+  });
+});
+
+describe("Probe Patch HEAD-changed recovery", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("surfaces recovery guidance when HEAD moved past the patch commit", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({
+        system_id: 1, is_mock: false,
+        plans: [{ id: 10, feature_id: "feat-1", objective: "Observe", status: "proposed", created_at: "2024-01-01", probe_points: [] }],
+      });
+      if (path === "/repository/probe-patches") return Promise.resolve([{
+        id: 20, plan_id: 10, system_id: 1, snapshot_id: 5,
+        commit_sha: "abcdef1234567890", diff: "diff --git a/a.py b/a.py",
+        worktree_path: null, skipped: [], status: "generated", error: null,
+        cleanup_state: "removed", cleanup_error: null,
+        apply_status: "not_applied", apply_error: null, applied_at: null,
+        applied_by_user_id: null, validation_runs: [], created_at: "2024-01-01",
+      }]);
+      if (path === "/repository/status") return Promise.resolve({
+        configured: true, repo_path: "/repos/alpha",
+        current_head: "9999999999", head_error: null,
+        working_tree_dirty: false, dirty_file_count: 0, dirty_sample: [],
+        latest_snapshot: null, latest_indexed_snapshot: null,
+        understanding_snapshot_id: null, understanding_status: null,
+        snapshot_stale: true, symbols_stale: false, next_actions: [],
+      });
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Feature: feat-1"));
+
+    expect(await screen.findByTestId("patch-stale-badge")).toBeInTheDocument();
+    const recovery = await screen.findByTestId("patch-recovery");
+    expect(within(recovery).getByText(/git apply --check/)).toBeInTheDocument();
+    expect(within(recovery).getByText(/cannot be applied after HEAD changed/i)).toBeInTheDocument();
+  });
+});
+
 // ── Flow Explorer tests ─────────────────────────────────────────────
 
 describe("Flow Explorer page", () => {

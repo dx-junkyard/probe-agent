@@ -2,7 +2,7 @@ import { useState } from "react";
 import {
   useRepositoryCandidates, useRepositoryConfig, useUpdateRepositoryConfig,
   useSnapshots, useLatestSnapshot, useCreateSnapshot, useSymbols, useIndexSymbols,
-  useApiScanResult, useRunApiScan,
+  useApiScanResult, useRunApiScan, useRepositoryStatus,
 } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
 import {
@@ -18,7 +18,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { toast } from "sonner";
 import { formatTimestamp, formatBytes } from "@/lib/utils";
-import { GitCommit, FolderTree, Code2, RefreshCw, AlertTriangle, ScanSearch, Sparkles } from "lucide-react";
+import { GitCommit, FolderTree, Code2, RefreshCw, AlertTriangle, ScanSearch, Sparkles, GitBranch, CheckCircle2 } from "lucide-react";
 import type { RepositoryCandidateOut, RepositoryConfigOut } from "@/api/types";
 
 function patternsToText(patterns: string[] | undefined): string {
@@ -71,6 +71,27 @@ export default function RepositoryPage() {
   return (
     <div className="space-y-6">
       <h1 className="text-2xl font-bold tracking-tight">Repository</h1>
+
+      <RepositoryRefreshHub
+        onCreateSnapshot={() =>
+          createSnapshot.mutateAsync().then(s => {
+            if (s.status === "failed") {
+              toast.error(`Snapshot failed: ${s.error_summary ?? "unknown error"}`);
+            } else {
+              toast.success("Snapshot created");
+            }
+            setTab("snapshots");
+          }).catch(e => toast.error(String(e)))
+        }
+        creatingSnapshot={createSnapshot.isPending}
+        onIndexSymbols={() =>
+          indexSymbols.mutateAsync().then(() => {
+            toast.success("Symbols indexed");
+            setTab("symbols");
+          }).catch(e => toast.error(String(e)))
+        }
+        indexingSymbols={indexSymbols.isPending}
+      />
 
       <Tabs value={tab} onValueChange={setTab}>
         <TabsList>
@@ -283,6 +304,159 @@ export default function RepositoryPage() {
         </TabsContent>
       </Tabs>
     </div>
+  );
+}
+
+function shortSha(sha: string | null | undefined): string {
+  return sha ? sha.slice(0, 8) : "—";
+}
+
+function RepositoryRefreshHub({
+  onCreateSnapshot, creatingSnapshot, onIndexSymbols, indexingSymbols,
+}: {
+  onCreateSnapshot: () => void;
+  creatingSnapshot: boolean;
+  onIndexSymbols: () => void;
+  indexingSymbols: boolean;
+}) {
+  const { data: status, isLoading, refetch, isFetching } = useRepositoryStatus();
+
+  if (isLoading) {
+    return <Card><CardContent className="py-6"><Skeleton className="h-24 w-full" /></CardContent></Card>;
+  }
+  if (!status) return null;
+
+  if (!status.configured) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base flex items-center gap-2">
+            <GitBranch className="h-4 w-4" /> Repository Refresh
+          </CardTitle>
+          <CardDescription>Configure the target repository to enable the refresh loop.</CardDescription>
+        </CardHeader>
+      </Card>
+    );
+  }
+
+  const fresh = !status.snapshot_stale && !status.symbols_stale && !status.working_tree_dirty && !status.head_error;
+
+  return (
+    <Card data-testid="refresh-hub">
+      <CardHeader className="flex flex-row items-start justify-between gap-4">
+        <div>
+          <CardTitle className="text-base flex items-center gap-2">
+            <GitBranch className="h-4 w-4" /> Repository Refresh Hub
+          </CardTitle>
+          <CardDescription>
+            Detect when analysis is stale relative to the repository and re-run the
+            steps in order. Reads HEAD / working tree only — never fetches, pulls, or
+            writes to the repository.
+          </CardDescription>
+        </div>
+        <Button size="sm" variant="outline" onClick={() => refetch()} disabled={isFetching}>
+          <RefreshCw className={`h-4 w-4 mr-1 ${isFetching ? "animate-spin" : ""}`} />
+          Refresh status
+        </Button>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 text-sm">
+          <div className="space-y-0.5">
+            <div className="text-xs text-muted-foreground">Current HEAD</div>
+            <div className="font-mono">{shortSha(status.current_head)}</div>
+          </div>
+          <div className="space-y-0.5">
+            <div className="text-xs text-muted-foreground">Latest snapshot</div>
+            <div className="font-mono flex items-center gap-1">
+              {status.latest_snapshot
+                ? <>#{status.latest_snapshot.id} <span className="text-muted-foreground">{shortSha(status.latest_snapshot.commit_sha)}</span></>
+                : "none"}
+            </div>
+          </div>
+          <div className="space-y-0.5">
+            <div className="text-xs text-muted-foreground">Symbol index</div>
+            <div className="font-mono">
+              {status.latest_indexed_snapshot ? `#${status.latest_indexed_snapshot.id}` : "none"}
+            </div>
+          </div>
+          <div className="space-y-0.5">
+            <div className="text-xs text-muted-foreground">Understanding build</div>
+            <div className="font-mono">
+              {status.understanding_snapshot_id
+                ? `#${status.understanding_snapshot_id} (${status.understanding_status ?? "?"})`
+                : "none"}
+            </div>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          {fresh && (
+            <Badge variant="success" className="gap-1">
+              <CheckCircle2 className="h-3 w-3" /> Up to date
+            </Badge>
+          )}
+          {status.snapshot_stale && (
+            <Badge variant="destructive" data-testid="snapshot-stale-badge">Snapshot stale vs HEAD</Badge>
+          )}
+          {status.symbols_stale && !status.snapshot_stale && (
+            <Badge variant="warning">Symbols stale</Badge>
+          )}
+          {status.working_tree_dirty && (
+            <Badge variant="warning" data-testid="dirty-badge">
+              Working tree dirty ({status.dirty_file_count})
+            </Badge>
+          )}
+          {status.head_error && <Badge variant="destructive">HEAD unreadable</Badge>}
+        </div>
+
+        {status.head_error && (
+          <p className="text-xs text-destructive">{status.head_error}</p>
+        )}
+
+        {status.snapshot_stale && (
+          <div className="rounded-md border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
+            {status.latest_snapshot
+              ? <>This analysis is based on snapshot #{status.latest_snapshot.id} at <code>{shortSha(status.latest_snapshot.commit_sha)}</code>; repository HEAD is <code>{shortSha(status.current_head)}</code>. Create a new snapshot and rebuild before generating a new patch.</>
+              : <>No snapshot exists for HEAD <code>{shortSha(status.current_head)}</code> yet. Create the first snapshot to begin analysis.</>}
+          </div>
+        )}
+
+        {status.working_tree_dirty && status.dirty_sample.length > 0 && (
+          <details className="text-xs">
+            <summary className="cursor-pointer text-muted-foreground">
+              {status.dirty_file_count} uncommitted change(s) — commit, stash, or revert before relying on patch apply
+            </summary>
+            <pre className="mt-2 rounded bg-muted p-2 overflow-x-auto">{status.dirty_sample.join("\n")}</pre>
+          </details>
+        )}
+
+        {status.next_actions.length > 0 && (
+          <div className="text-xs">
+            <div className="font-medium mb-1">Next steps</div>
+            <ol className="list-decimal pl-5 space-y-0.5 text-muted-foreground">
+              {status.next_actions.map((a, i) => <li key={i}>{a}</li>)}
+            </ol>
+          </div>
+        )}
+
+        {/* Guided actions: the whole refresh flow in one place instead of scattered buttons. */}
+        <div className="flex flex-wrap gap-2">
+          <Button size="sm" onClick={onCreateSnapshot} disabled={creatingSnapshot}>
+            <RefreshCw className={`h-4 w-4 mr-1 ${creatingSnapshot ? "animate-spin" : ""}`} />
+            {status.snapshot_stale ? "Create new snapshot" : "Re-snapshot"}
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={onIndexSymbols}
+            disabled={indexingSymbols || !status.latest_snapshot}
+          >
+            <Code2 className={`h-4 w-4 mr-1 ${indexingSymbols ? "animate-spin" : ""}`} />
+            Index symbols
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 

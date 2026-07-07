@@ -583,7 +583,7 @@ function RowsTable({ rows }: { rows: Record<string, unknown>[] }) {
             type="button"
             onClick={() => setHidden((h) => {
               const n = new Set(h);
-              n.has(f) ? n.delete(f) : n.add(f);
+              if (n.has(f)) n.delete(f); else n.add(f);
               return n;
             })}
             className={cn(
