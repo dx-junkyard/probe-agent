@@ -102,6 +102,7 @@ from ..models import (
     FeatureCodeLinksOut,
     FeatureDraftOut,
     FeatureEvidence,
+    GitHubIssueStatusOut,
     IntelligenceRunOut,
     IssueDraftCreateRequest,
     IssueDraftOut,
@@ -586,6 +587,48 @@ def _draft_is_stale(draft: dict, latest_commit: Optional[str]) -> bool:
     return draft_commit != latest_commit
 
 
+@router.get("/issue-drafts/github-status", response_model=GitHubIssueStatusOut)
+def github_issue_status_endpoint(
+    system_id: int = Depends(get_system_id),
+) -> GitHubIssueStatusOut:
+    """Whether draft -> GitHub issue creation is available (Issue #158).
+
+    Registered before `/issue-drafts/{draft_id}` so the literal "github-status"
+    segment isn't swallowed by that path parameter.
+
+    probe-agent:
+      role: API boundary reporting GitHub issue-creation availability
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [filesystem]
+      probe_value: verify availability is false (with a reason) whenever
+        GITHUB_TOKEN is unset or owner/repo cannot be determined, never a guess.
+    """
+    from ..github_integration import resolve_github_config
+
+    with get_conn() as conn:
+        config_row = conn.execute(
+            "SELECT * FROM repository_configs WHERE system_id = ?", (system_id,)
+        ).fetchone()
+    if config_row is None or not config_row["repo_path"]:
+        return GitHubIssueStatusOut(available=False, reason="Repository not configured.")
+
+    github_config = resolve_github_config(config_row["repo_path"])
+    if github_config is None:
+        return GitHubIssueStatusOut(
+            available=False,
+            reason=(
+                "GITHUB_TOKEN is not set, or the repository's owner/repo could "
+                "not be determined from its origin remote."
+            ),
+        )
+    return GitHubIssueStatusOut(
+        available=True, owner=github_config.owner, repo=github_config.repo
+    )
+
+
 @router.get("/issue-drafts/{draft_id}", response_model=IssueDraftOut)
 def get_issue_draft_endpoint(
     draft_id: int,
@@ -650,6 +693,68 @@ def update_issue_draft_endpoint(
     if draft is None:
         raise HTTPException(status_code=404, detail="Issue draft not found")
     return IssueDraftOut(**draft)
+
+
+@router.post("/issue-drafts/{draft_id}/create-github-issue", response_model=IssueDraftOut)
+def create_github_issue_endpoint(
+    draft_id: int,
+    system_id: int = Depends(get_system_id),
+) -> IssueDraftOut:
+    """Create a GitHub issue from a draft and save its URL (Issue #158).
+
+    probe-agent:
+      role: API boundary creating the external GitHub issue for a draft
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: orchestration
+      state_effects: [database-write, network]
+      probe_value: verify a 422 when GitHub is unavailable, and that success
+        sets external_url/status without altering the draft's title/body.
+    """
+    from ..github_integration import (
+        GitHubIntegrationError,
+        create_github_issue,
+        resolve_github_config,
+    )
+    from ..issue_drafts import get_draft, update_draft
+
+    draft = get_draft(system_id, draft_id)
+    if draft is None:
+        raise HTTPException(status_code=404, detail="Issue draft not found")
+
+    with get_conn() as conn:
+        config_row = conn.execute(
+            "SELECT * FROM repository_configs WHERE system_id = ?", (system_id,)
+        ).fetchone()
+    if config_row is None or not config_row["repo_path"]:
+        raise HTTPException(status_code=422, detail="Repository not configured.")
+
+    github_config = resolve_github_config(config_row["repo_path"])
+    if github_config is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "GitHub issue creation is not available: GITHUB_TOKEN is not "
+                "set, or the repository owner/repo could not be determined."
+            ),
+        )
+
+    try:
+        html_url = create_github_issue(
+            github_config, draft["title"], draft["body_markdown"]
+        )
+    except GitHubIntegrationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    updated = update_draft(
+        system_id,
+        draft_id,
+        status="external_created",
+        external_url=html_url,
+        external_url_set=True,
+    )
+    return IssueDraftOut(**updated)
 
 
 def _build_out(job: dict) -> SystemUnderstandingBuildOut:

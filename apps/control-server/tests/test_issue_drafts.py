@@ -431,6 +431,96 @@ class TestGapDraftSurfacing:
             assert gap["source_key"]
 
 
+class TestGitHubIntegration:
+    """Issue #158 External Issue Loop: draft -> GitHub issue creation."""
+
+    def test_status_unavailable_without_token(self, admin_client, tmp_path, monkeypatch):
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_REPO", raising=False)
+        hdrs, sha, understanding = _setup_system_with_gaps(admin_client, tmp_path, "idraft-gh-notoken")
+        r = admin_client.get("/issue-drafts/github-status", headers=hdrs)
+        assert r.status_code == 200, r.text
+        assert r.json()["available"] is False
+        assert r.json()["reason"]
+
+    def test_status_available_with_token_and_github_remote(self, admin_client, tmp_path, monkeypatch):
+        hdrs, sha, understanding = _setup_system_with_gaps(admin_client, tmp_path, "idraft-gh-avail")
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        monkeypatch.setenv("GITHUB_REPO", "acme/widgets")
+        r = admin_client.get("/issue-drafts/github-status", headers=hdrs)
+        assert r.status_code == 200, r.text
+        assert r.json() == {
+            "available": True, "owner": "acme", "repo": "widgets", "reason": None,
+        }
+
+    def test_create_github_issue_rejected_when_unavailable(self, admin_client, tmp_path, monkeypatch):
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_REPO", raising=False)
+        hdrs, sha, understanding = _setup_system_with_gaps(admin_client, tmp_path, "idraft-gh-unavail")
+        gap = understanding["gaps"][0]
+        draft_id = admin_client.post("/issue-drafts", json={"gap": gap}, headers=hdrs).json()["id"]
+
+        r = admin_client.post(f"/issue-drafts/{draft_id}/create-github-issue", headers=hdrs)
+        assert r.status_code == 422
+
+    def test_create_github_issue_saves_external_url(self, admin_client, tmp_path, monkeypatch):
+        hdrs, sha, understanding = _setup_system_with_gaps(admin_client, tmp_path, "idraft-gh-create")
+        gap = understanding["gaps"][0]
+        draft_id = admin_client.post("/issue-drafts", json={"gap": gap}, headers=hdrs).json()["id"]
+        original_title = admin_client.get(f"/issue-drafts/{draft_id}", headers=hdrs).json()["title"]
+
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        monkeypatch.setenv("GITHUB_REPO", "acme/widgets")
+
+        from app.routes import project_intelligence as pi
+
+        def fake_create(config, title, body):
+            assert config.owner == "acme"
+            assert config.repo == "widgets"
+            assert title == original_title
+            return "https://github.com/acme/widgets/issues/42"
+
+        monkeypatch.setattr(
+            "app.github_integration.create_github_issue", fake_create
+        )
+
+        r = admin_client.post(f"/issue-drafts/{draft_id}/create-github-issue", headers=hdrs)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["external_url"] == "https://github.com/acme/widgets/issues/42"
+        assert body["status"] == "external_created"
+        assert body["title"] == original_title
+
+        get_r = admin_client.get(f"/issue-drafts/{draft_id}", headers=hdrs)
+        assert get_r.json()["external_url"] == "https://github.com/acme/widgets/issues/42"
+
+    def test_create_github_issue_failure_reports_422(self, admin_client, tmp_path, monkeypatch):
+        hdrs, sha, understanding = _setup_system_with_gaps(admin_client, tmp_path, "idraft-gh-fail")
+        gap = understanding["gaps"][0]
+        draft_id = admin_client.post("/issue-drafts", json={"gap": gap}, headers=hdrs).json()["id"]
+
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        monkeypatch.setenv("GITHUB_REPO", "acme/widgets")
+
+        from app.github_integration import GitHubIntegrationError
+
+        def fake_create(config, title, body):
+            raise GitHubIntegrationError("HTTP 403: rate limited")
+
+        monkeypatch.setattr(
+            "app.github_integration.create_github_issue", fake_create
+        )
+
+        r = admin_client.post(f"/issue-drafts/{draft_id}/create-github-issue", headers=hdrs)
+        assert r.status_code == 422
+        assert "rate limited" in r.text
+
+        # Draft is unchanged on failure.
+        get_r = admin_client.get(f"/issue-drafts/{draft_id}", headers=hdrs)
+        assert get_r.json()["external_url"] is None
+        assert get_r.json()["status"] == "draft"
+
+
 class TestSystemIsolation:
     def test_drafts_scoped_to_system(self, admin_client, tmp_path):
         token = _login(admin_client)

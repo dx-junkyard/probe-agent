@@ -66,6 +66,26 @@ def test_context_empty_when_no_data(env):
     assert body["field_names"] == []
 
 
+def test_context_reports_truncation_past_bound(env, monkeypatch):
+    """entities_truncated must flip true once distinct entities exceed the bound,
+    so the dashboard can warn instead of silently hiding ids (Issue #157)."""
+    from app.routes import trace_analyzers
+
+    monkeypatch.setattr(trace_analyzers, "_MAX_CONTEXT_ENTITIES", 3)
+    client = env
+    for i in range(5):
+        client.post("/traces", json={
+            "trace_id": f"t{i}", "component_id": "validate", "mode": "trace",
+            "duration_ms": 1.0, "timestamp": time.time(),
+            "entities": [{"type": "order", "id": f"o-{i}", "role": "source"}],
+        })
+    r = client.get("/trace-analyzers/context")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["entities_truncated"] is True
+    assert len(body["entities"]) == 3
+
+
 def test_context_route_does_not_collide_with_analyzer_id(env):
     """'context' must resolve to the context endpoint, not be parsed as an id."""
     client = env
