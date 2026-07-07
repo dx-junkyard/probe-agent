@@ -18,7 +18,45 @@
     "output":      { "type": ["string", "null"] },
     "error":       { "type": ["string", "null"] },
     "duration_ms": { "type": "number", "minimum": 0 },
-    "timestamp":   { "type": "number" }
+    "timestamp":   { "type": "number" },
+
+    "span_id":        { "type": ["string", "null"], "description": "Identifier for this probe invocation (Phase 1 lineage)." },
+    "parent_span_id": { "type": ["string", "null"], "description": "span_id of the enclosing probe invocation, if any." },
+    "flow_id":        { "type": ["string", "null"], "description": "Logical flow this trace participates in." },
+    "correlation_id": { "type": ["string", "null"], "description": "Correlation identifier shared across a request/operation." },
+    "entities": {
+      "type": ["array", "null"],
+      "description": "Business entities this trace relates to (explicit values supplied by the caller).",
+      "items": {
+        "type": "object",
+        "required": ["type", "id"],
+        "properties": {
+          "type": { "type": "string" },
+          "id":   { "type": "string" },
+          "role": { "type": "string", "enum": ["source", "derived", "related"] }
+        },
+        "additionalProperties": false
+      }
+    },
+    "projections": {
+      "type": ["array", "null"],
+      "description": "Projection extraction results attached to this trace (Issue #146). Bounded, structured slices produced by a projection_spec — never the raw payload. shadow_* phases normally arrive on shadow results (Issue #150) but are accepted here for contract parity with the server model.",
+      "items": {
+        "type": "object",
+        "required": ["projection_name"],
+        "properties": {
+          "projection_name": { "type": "string" },
+          "phase": { "type": "string", "enum": ["input", "output", "shadow_current", "shadow_candidate"] },
+          "fields":  { "type": "object" },
+          "metrics": { "type": "object" },
+          "samples": { "type": "object" },
+          "data_hash": { "type": ["string", "null"] },
+          "truncated": { "type": "boolean" },
+          "error": { "type": ["string", "null"], "description": "Non-fatal extraction diagnostic; set when extraction failed and fields/metrics/samples are empty." }
+        },
+        "additionalProperties": false
+      }
+    }
   },
   "additionalProperties": false
 }

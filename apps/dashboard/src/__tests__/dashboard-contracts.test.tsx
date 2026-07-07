@@ -566,6 +566,62 @@ describe("Flow Explorer page", () => {
     });
   });
 
+  test("runtime overlay panel shows observed nodes and divergences", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/flow-entrypoints") {
+        return Promise.resolve(entrypointsResponse({
+          total: 1, entrypoints: [flowGraph.entrypoint],
+        }));
+      }
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/repository/flow-graphs") return Promise.resolve(flowGraph);
+      if (path === "/repository/flow-overlay") {
+        return Promise.resolve({
+          selection: { kind: "entity", entity_type: "order", entity_id: "o-1" },
+          nodes: [
+            { node_id: "app.py::analyze_document", component_id: "analyze", observable: true, observed: true, observation_count: 3, last_observed_at: 2 },
+            { node_id: "app.py::parse_blocks", component_id: null, observable: false, observed: false, observation_count: 0, last_observed_at: null },
+          ],
+          edges: [],
+          divergences: [{ source_component_id: "analyze", target_component_id: "refund", count: 1 }],
+          observed_component_ids: ["analyze", "refund"],
+          unmatched_component_ids: ["refund"],
+          observed_trace_count: 3,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { default: FlowExplorerPage } = await import("@/pages/flow-explorer");
+    render(<FlowExplorerPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByText("POST /documents/analyze"));
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/repository/flow-graphs", expect.any(Object));
+    });
+
+    const panel = await screen.findByTestId("flow-overlay-panel");
+    fireEvent.change(within(panel).getByLabelText("overlay entity type"), { target: { value: "order" } });
+    fireEvent.change(within(panel).getByLabelText("overlay entity id"), { target: { value: "o-1" } });
+    fireEvent.click(within(panel).getByRole("button", { name: /Apply overlay/ }));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/repository/flow-overlay",
+        expect.objectContaining({
+          entrypoint_type: "http_route", entrypoint_id: "POST:/documents/analyze",
+          selection: expect.objectContaining({ kind: "entity", entity_type: "order", entity_id: "o-1" }),
+        }),
+      );
+    });
+    expect(await within(panel).findByText(/observed \(3\)/)).toBeInTheDocument();
+    expect(within(panel).getByText(/no probe/)).toBeInTheDocument();
+    const div = within(panel).getByTestId("overlay-divergences");
+    expect(within(div).getByText(/analyze → refund/)).toBeInTheDocument();
+  });
+
   test("renders external boundary and observed overlay; boundary is not selectable", async () => {
     const graphWithBoundary = {
       ...flowGraph,
@@ -3220,5 +3276,258 @@ describe("Per-screen assistant panel", () => {
     await waitFor(() => {
       expect(mockApi.get).toHaveBeenCalledWith("/assistant/screen-context/overview");
     });
+  });
+});
+
+// ── Trace Lineage Explorer (Issue #147) ─────────────────────────────
+
+describe("Trace Lineage Explorer page", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  function lineageResponse() {
+    return {
+      query: { kind: "entity", entity_type: "order", entity_id: "o-1" },
+      steps: [
+        {
+          trace_id: "trace-aaaa1111", component_id: "validate", mode: "trace",
+          span_id: "s1", parent_span_id: null, flow_id: "f1", correlation_id: "c1",
+          duration_ms: 2, timestamp: 100, output: "'ok'", error: null,
+          entities: [{ type: "order", id: "o-1", role: "source" }],
+          projections: [{
+            projection_name: "orders", phase: "output",
+            fields: { status: "pending" }, metrics: {}, samples: {},
+            data_hash: "h1", truncated: false, error: null,
+          }],
+        },
+        {
+          trace_id: "trace-bbbb2222", component_id: "charge", mode: "trace",
+          span_id: "s2", parent_span_id: "s1", flow_id: "f1", correlation_id: "c1",
+          duration_ms: 3, timestamp: 200, output: "'ok'", error: null,
+          entities: [{ type: "order", id: "o-1", role: "related" }],
+          projections: [{
+            projection_name: "orders", phase: "output",
+            fields: { status: "charged" }, metrics: {}, samples: {},
+            data_hash: "h2", truncated: false, error: null,
+          }],
+        },
+      ],
+    };
+  }
+
+  test("searching an entity shows time-ordered steps with projected fields", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path.startsWith("/trace-lineage/entities/")) return Promise.resolve(lineageResponse());
+      return Promise.resolve({});
+    });
+    const { default: TraceLineagePage } = await import("@/pages/trace-lineage");
+    render(<TraceLineagePage />, { wrapper: createWrapper() });
+
+    fireEvent.change(screen.getByLabelText("entity type"), { target: { value: "order" } });
+    fireEvent.change(screen.getByLabelText("entity id"), { target: { value: "o-1" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+
+    await waitFor(() => {
+      expect(mockApi.get).toHaveBeenCalledWith("/trace-lineage/entities/order/o-1");
+    });
+    expect(await screen.findByText("validate")).toBeInTheDocument();
+    expect(screen.getByText("charge")).toBeInTheDocument();
+    // Projected field values are shown.
+    expect(screen.getByText(/pending/)).toBeInTheDocument();
+    expect(screen.getByText(/charged/)).toBeInTheDocument();
+  });
+
+  test("changed projected field between steps is highlighted", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path.startsWith("/trace-lineage/entities/")) return Promise.resolve(lineageResponse());
+      return Promise.resolve({});
+    });
+    const { default: TraceLineagePage } = await import("@/pages/trace-lineage");
+    render(<TraceLineagePage />, { wrapper: createWrapper() });
+
+    fireEvent.change(screen.getByLabelText("entity type"), { target: { value: "order" } });
+    fireEvent.change(screen.getByLabelText("entity id"), { target: { value: "o-1" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+
+    // The second step's status changed (pending -> charged): a change marker appears.
+    const markers = await screen.findAllByLabelText("changed");
+    expect(markers.length).toBeGreaterThanOrEqual(1);
+  });
+
+  test("empty lineage shows SDK setup guidance", async () => {
+    mockApi.get.mockImplementation(() => Promise.resolve({ query: {}, steps: [] }));
+    const { default: TraceLineagePage } = await import("@/pages/trace-lineage");
+    render(<TraceLineagePage />, { wrapper: createWrapper() });
+
+    fireEvent.change(screen.getByLabelText("entity type"), { target: { value: "order" } });
+    fireEvent.change(screen.getByLabelText("entity id"), { target: { value: "missing" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+
+    expect(await screen.findByText(/No lineage found/)).toBeInTheDocument();
+    expect(screen.getByText(/probe_context/)).toBeInTheDocument();
+  });
+
+  test("time window inputs add start/end to the lineage query", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path.startsWith("/trace-lineage/entities/")) return Promise.resolve(lineageResponse());
+      return Promise.resolve({});
+    });
+    const { default: TraceLineagePage } = await import("@/pages/trace-lineage");
+    render(<TraceLineagePage />, { wrapper: createWrapper() });
+
+    fireEvent.change(screen.getByLabelText("entity type"), { target: { value: "order" } });
+    fireEvent.change(screen.getByLabelText("entity id"), { target: { value: "o-1" } });
+    fireEvent.change(screen.getByLabelText("time window start"), {
+      target: { value: "2026-07-01T00:00" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+
+    await waitFor(() => {
+      const call = mockApi.get.mock.calls.find(
+        (c: string[]) => typeof c[0] === "string" && c[0].startsWith("/trace-lineage/entities/"),
+      );
+      expect(call?.[0]).toMatch(/\/trace-lineage\/entities\/order\/o-1\?start=\d+/);
+    });
+  });
+
+  test("deep link ?kind=entity&type=…&id=… searches on load", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path.startsWith("/trace-lineage/entities/")) return Promise.resolve(lineageResponse());
+      return Promise.resolve({});
+    });
+    const { default: TraceLineagePage } = await import("@/pages/trace-lineage");
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/trace-lineage?kind=entity&type=order&id=o-1"]}>
+          <TraceLineagePage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => {
+      expect(mockApi.get).toHaveBeenCalledWith("/trace-lineage/entities/order/o-1");
+    });
+    expect(await screen.findByText("validate")).toBeInTheDocument();
+  });
+});
+
+// ── Trace Analyzers (Issue #148) ────────────────────────────────────
+
+describe("Trace Analyzers page", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const analyzer = {
+    id: 7, name: "order flow", intent: "", spec: {
+      source: "trace_projections",
+      select: [{ name: "status", path: "$.fields.status" }],
+    },
+    source: "trace_projections", review_status: "proposed", decision_method: "manual",
+    provider: null, model: null, prompt_version: null, schema_version: null,
+    is_mock: false, created_at: 1, updated_at: 1,
+  };
+
+  test("rejects run until analyzer is approved (server 409 surfaced)", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/trace-analyzers") return Promise.resolve([{ ...analyzer, review_status: "approved" }]);
+      if (path.endsWith("/runs")) return Promise.resolve([]);
+      return Promise.resolve({});
+    });
+    mockApi.post.mockResolvedValue({
+      id: 1, analyzer_id: 7, status: "completed",
+      result: { row_count: 2, rows: [{ status: "a" }, { status: "b" }] },
+      error_details: null, row_count: 2, started_at: 1, completed_at: 2,
+    });
+    const { default: Page } = await import("@/pages/trace-analyzers");
+    render(<Page />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByText("order flow"));
+    const runBtn = await screen.findByRole("button", { name: "Run" });
+    expect(runBtn).not.toBeDisabled();
+    fireEvent.click(runBtn);
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/trace-analyzers/7/runs");
+    });
+  });
+
+  test("creating an analyzer posts a parsed spec", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/trace-analyzers") return Promise.resolve([]);
+      return Promise.resolve([]);
+    });
+    mockApi.post.mockResolvedValue(analyzer);
+    const { default: Page } = await import("@/pages/trace-analyzers");
+    render(<Page />, { wrapper: createWrapper() });
+
+    fireEvent.change(screen.getByLabelText("analyzer name"), { target: { value: "my analyzer" } });
+    fireEvent.click(screen.getByRole("button", { name: /Create/ }));
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/trace-analyzers",
+        expect.objectContaining({ name: "my analyzer", spec: expect.any(Object) }),
+      );
+    });
+  });
+
+  test("proposing from natural language posts the intent and marks mock", async () => {
+    const proposed = {
+      ...analyzer, id: 9, decision_method: "reasoning_llm", is_mock: true,
+      provider: "mock", model: "mock",
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/trace-analyzers") return Promise.resolve([proposed]);
+      return Promise.resolve([]);
+    });
+    mockApi.post.mockResolvedValue(proposed);
+    const { default: Page } = await import("@/pages/trace-analyzers");
+    render(<Page />, { wrapper: createWrapper() });
+
+    fireEvent.change(screen.getByLabelText("analyzer intent"), {
+      target: { value: "where did order o-1 status change" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Propose spec/ }));
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/trace-analyzers/propose",
+        expect.objectContaining({ intent: "where did order o-1 status change" }),
+      );
+    });
+    // The proposed analyzer surfaces its reasoning-model + mock provenance.
+    expect(await screen.findByText(/Proposed by a reasoning model/)).toBeInTheDocument();
+  });
+
+  test("shadow compare run renders a diff summary", async () => {
+    const approved = { ...analyzer, id: 5, review_status: "approved" };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/trace-analyzers") return Promise.resolve([approved]);
+      if (path.endsWith("/runs")) return Promise.resolve([{
+        id: 3, analyzer_id: 5, status: "completed", error_details: null,
+        row_count: 2, started_at: 1, completed_at: 2,
+        result: {
+          row_count: 2,
+          compare: {
+            phases: ["shadow_current", "shadow_candidate"], fields: ["status"],
+            entity_count: 2, diff_entity_count: 1, diff_fields: { status: 1 },
+            candidate_error_count: 0, components_with_diff: ["svc"],
+            examples: { "status::svc": ["trace-aaaa1111"] }, compared_trace_count: 2,
+          },
+        },
+      }]);
+      return Promise.resolve({});
+    });
+    const { default: Page } = await import("@/pages/trace-analyzers");
+    render(<Page />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByText("order flow"));
+    const summary = await screen.findByTestId("compare-summary");
+    expect(within(summary).getByText(/1\/2 entities differ/)).toBeInTheDocument();
+    expect(within(summary).getByText(/status: 1/)).toBeInTheDocument();
   });
 });

@@ -2,6 +2,8 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, getSystemId } from "./client";
 import type {
   SystemOut, ComponentSummary, TraceEvent, Policy,
+  LineageOut, TraceAnalyzer, AnalysisRun,
+  FlowOverlayOut, FlowOverlayRequest,
   ShadowResult, ComponentProfile, UserOut, TokenOut,
   RepositoryCandidateOut, RepositoryConfigOut, SnapshotOut, LatestDraftsOut,
   DraftGenerationResultOut,
@@ -92,6 +94,105 @@ export function useUpdatePolicy() {
     mutationFn: ({ componentId, mode }: { componentId: string; mode: string }) =>
       api.put<Policy>(`/components/${componentId}/policy`, { mode }),
     onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("components") }),
+  });
+}
+
+// Trace lineage (Issue #147). kind selects the query dimension; start/end are
+// an optional time window (unix seconds).
+export type LineageQuery =
+  | { kind: "entity"; entityType: string; entityId: string; start?: number; end?: number }
+  | { kind: "correlation"; id: string; start?: number; end?: number }
+  | { kind: "flow"; id: string; start?: number; end?: number };
+
+function lineagePath(q: LineageQuery): string {
+  let path: string;
+  if (q.kind === "entity") {
+    path = `/trace-lineage/entities/${encodeURIComponent(q.entityType)}/${encodeURIComponent(q.entityId)}`;
+  } else if (q.kind === "correlation") {
+    path = `/trace-lineage/correlations/${encodeURIComponent(q.id)}`;
+  } else {
+    path = `/trace-lineage/flows/${encodeURIComponent(q.id)}`;
+  }
+  const params = new URLSearchParams();
+  if (q.start != null) params.set("start", String(q.start));
+  if (q.end != null) params.set("end", String(q.end));
+  const qs = params.toString();
+  return qs ? `${path}?${qs}` : path;
+}
+
+function lineageReady(q: LineageQuery | null): boolean {
+  if (!q) return false;
+  if (q.kind === "entity") return !!q.entityType && !!q.entityId;
+  return !!q.id;
+}
+
+export function useLineage(query: LineageQuery | null) {
+  return useQuery({
+    queryKey: [...sysKey("trace-lineage"), query],
+    queryFn: () => api.get<LineageOut>(lineagePath(query as LineageQuery)),
+    enabled: lineageReady(query) && !!getSystemId(),
+  });
+}
+
+// Trace analyzers (Issue #148)
+export function useAnalyzers() {
+  return useQuery({
+    queryKey: sysKey("trace-analyzers"),
+    queryFn: () => api.get<TraceAnalyzer[]>("/trace-analyzers"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useAnalyzerRuns(analyzerId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("trace-analyzer-runs"), analyzerId],
+    queryFn: () => api.get<AnalysisRun[]>(`/trace-analyzers/${analyzerId}/runs`),
+    enabled: !!analyzerId && !!getSystemId(),
+  });
+}
+
+export function useCreateAnalyzer() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { name: string; intent?: string; spec: unknown }) =>
+      api.post<TraceAnalyzer>("/trace-analyzers", body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("trace-analyzers") }),
+  });
+}
+
+export function useReviewAnalyzer() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, review_status }: { id: number; review_status: "approved" | "rejected" }) =>
+      api.put<TraceAnalyzer>(`/trace-analyzers/${id}/review`, { review_status }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("trace-analyzers") }),
+  });
+}
+
+export function useRunAnalyzer() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => api.post<AnalysisRun>(`/trace-analyzers/${id}/runs`),
+    onSuccess: (_d, id) =>
+      qc.invalidateQueries({ queryKey: [...sysKey("trace-analyzer-runs"), id] }),
+  });
+}
+
+// Flow Explorer runtime overlay (Issue #151)
+export function useFlowOverlay() {
+  return useMutation({
+    mutationFn: (body: FlowOverlayRequest) =>
+      api.post<FlowOverlayOut>("/repository/flow-overlay", body),
+  });
+}
+
+// LLM-assisted proposal (Issue #149)
+export function useProposeAnalyzer() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { intent: string; name?: string }) =>
+      api.post<TraceAnalyzer>("/trace-analyzers/propose", body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("trace-analyzers") }),
   });
 }
 

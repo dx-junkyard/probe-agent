@@ -33,6 +33,131 @@ export interface Policy {
   mode: "off" | "trace" | "shadow";
 }
 
+// Trace lineage (Issue #145/#146/#147)
+export interface LineageEntity {
+  type: string;
+  id: string;
+  role: string;
+}
+
+export interface LineageProjection {
+  projection_name: string;
+  phase: string;
+  fields: Record<string, unknown>;
+  metrics: Record<string, unknown>;
+  samples: Record<string, unknown>;
+  data_hash: string | null;
+  truncated: boolean;
+  error: string | null;
+}
+
+export interface LineageStep {
+  trace_id: string;
+  component_id: string;
+  mode: string | null;
+  span_id: string | null;
+  parent_span_id: string | null;
+  flow_id: string | null;
+  correlation_id: string | null;
+  duration_ms: number | null;
+  timestamp: number;
+  output: string | null;
+  error: string | null;
+  entities: LineageEntity[];
+  projections: LineageProjection[];
+}
+
+export interface LineageOut {
+  query: Record<string, unknown>;
+  steps: LineageStep[];
+}
+
+// Trace analyzers (Issue #148/#149)
+export interface TraceAnalyzer {
+  id: number;
+  name: string;
+  intent: string;
+  spec: Record<string, unknown>;
+  source: string;
+  review_status: "proposed" | "approved" | "rejected";
+  decision_method: "deterministic" | "reasoning_llm" | "manual";
+  provider: string | null;
+  model: string | null;
+  prompt_version: string | null;
+  schema_version: string | null;
+  is_mock: boolean;
+  // Audit of the human review decision (set on approve/reject; always "manual").
+  reviewed_at: number | null;
+  review_decision_method: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface AnalysisRun {
+  id: number;
+  analyzer_id: number;
+  status: "pending" | "completed" | "failed";
+  result: Record<string, unknown> | null;
+  error_details: string | null;
+  row_count: number | null;
+  started_at: number;
+  completed_at: number | null;
+  data_expired?: boolean;
+  data_expired_note?: string | null;
+}
+
+// Flow Explorer runtime overlay (Issue #151)
+export interface FlowOverlayNode {
+  node_id: string;
+  component_id: string | null;
+  observable: boolean;
+  observed: boolean;
+  observation_count: number;
+  last_observed_at: number | null;
+}
+
+export interface FlowOverlayEdge {
+  edge_id: string;
+  source_node_id: string;
+  target_node_id: string | null;
+  source_component_id: string | null;
+  target_component_id: string | null;
+  observed_transition: boolean;
+}
+
+export interface FlowDivergence {
+  source_component_id: string;
+  target_component_id: string;
+  count: number;
+}
+
+export interface FlowOverlayOut {
+  selection: Record<string, unknown>;
+  nodes: FlowOverlayNode[];
+  edges: FlowOverlayEdge[];
+  divergences: FlowDivergence[];
+  observed_component_ids: string[];
+  unmatched_component_ids: string[];
+  observed_trace_count: number;
+}
+
+export interface FlowOverlayRequest {
+  entrypoint_type: string;
+  entrypoint_id: string;
+  max_depth?: number;
+  max_nodes?: number;
+  snapshot_id?: number | null;
+  commit_sha?: string | null;
+  selection: {
+    kind: "entity" | "correlation" | "flow" | "analyzer";
+    entity_type?: string;
+    entity_id?: string;
+    correlation_id?: string;
+    flow_id?: string;
+    analyzer_id?: number;
+  };
+}
+
 export interface ShadowResult {
   id: number;
   trace_id: string;
@@ -1401,7 +1526,7 @@ export interface SystemProfile {
 
 // --- Decision Workspace (Issues #35-#37) ------------------------------------
 
-export type WorkspaceContextItemType = "feature" | "component" | "trace" | "experiment" | "probe_plan";
+export type WorkspaceContextItemType = "feature" | "component" | "trace" | "experiment" | "probe_plan" | "analyzer_run";
 export type WorkspaceProposalStatus = "proposed" | "accepted" | "rejected" | "deferred" | "superseded";
 
 export interface WorkspaceOut {

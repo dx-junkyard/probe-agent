@@ -77,6 +77,8 @@ from ..models import (
     FlowGraphOut,
     FlowGraphRequest,
     FlowNodeOut,
+    FlowOverlayRequest,
+    FlowOverlayOut,
     ProbePlanFromFlowRequest,
     ProbePreviewOut,
     SourceMetadataOut,
@@ -5040,6 +5042,131 @@ def build_flow_graph_endpoint(
         _raise_entrypoint_not_found(payload.entrypoint_id, llm_eps)
     _overlay_runtime(system_id, graph)
     return _flow_graph_out(system_id, graph)
+
+
+def _resolve_lineage_steps(conn, system_id: int, selection) -> list:
+    """Resolve a lineage selection into ordered trace steps (Issue #151).
+
+    Returns rows with trace_id / component_id / span_id / parent_span_id /
+    timestamp. Deterministic; entity/correlation/flow/analyzer only.
+    """
+    kind = selection.kind
+    if kind == "analyzer":
+        row = conn.execute(
+            "SELECT spec_json FROM trace_analyzers WHERE id = ? AND system_id = ?",
+            (selection.analyzer_id, system_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, "analyzer not found")
+        try:
+            spec = json.loads(row["spec_json"]) if row["spec_json"] else {}
+        except json.JSONDecodeError:
+            spec = {}
+        ent = (spec.get("filter") or {}).get("entity")
+        if not ent:
+            raise HTTPException(
+                422, "analyzer has no entity filter to drive a flow overlay"
+            )
+        selection = selection.model_copy(update={
+            "kind": "entity", "entity_type": ent["type"], "entity_id": ent["id"],
+        })
+        kind = "entity"
+
+    if kind == "entity":
+        if not selection.entity_type or not selection.entity_id:
+            raise HTTPException(422, "entity_type and entity_id are required")
+        trace_ids = [
+            r["trace_id"]
+            for r in conn.execute(
+                "SELECT DISTINCT trace_id FROM trace_entities "
+                "WHERE system_id = ? AND entity_type = ? AND entity_id = ?",
+                (system_id, selection.entity_type, selection.entity_id),
+            ).fetchall()
+        ]
+    elif kind == "correlation":
+        if not selection.correlation_id:
+            raise HTTPException(422, "correlation_id is required")
+        trace_ids = [
+            r["trace_id"]
+            for r in conn.execute(
+                "SELECT trace_id FROM trace_spans WHERE system_id = ? AND correlation_id = ?",
+                (system_id, selection.correlation_id),
+            ).fetchall()
+        ]
+    else:  # flow
+        if not selection.flow_id:
+            raise HTTPException(422, "flow_id is required")
+        trace_ids = [
+            r["trace_id"]
+            for r in conn.execute(
+                "SELECT trace_id FROM trace_spans WHERE system_id = ? AND flow_id = ?",
+                (system_id, selection.flow_id),
+            ).fetchall()
+        ]
+
+    steps = []
+    for tid in trace_ids:
+        trow = conn.execute(
+            "SELECT component_id, timestamp FROM traces WHERE system_id = ? AND trace_id = ?",
+            (system_id, tid),
+        ).fetchone()
+        srow = conn.execute(
+            "SELECT span_id, parent_span_id FROM trace_spans "
+            "WHERE system_id = ? AND trace_id = ?",
+            (system_id, tid),
+        ).fetchone()
+        if trow is None:
+            continue
+        steps.append({
+            "trace_id": tid,
+            "component_id": trow["component_id"],
+            "timestamp": trow["timestamp"],
+            "span_id": srow["span_id"] if srow else None,
+            "parent_span_id": srow["parent_span_id"] if srow else None,
+        })
+    steps.sort(key=lambda s: (s["timestamp"], s["trace_id"]))
+    return steps
+
+
+@router.post("/repository/flow-overlay", response_model=FlowOverlayOut)
+def flow_runtime_overlay(
+    payload: FlowOverlayRequest, system_id: int = Depends(get_system_id)
+) -> FlowOverlayOut:
+    """Overlay runtime lineage onto a static flow graph (Issue #151).
+
+    Matching is by component_id exact equality only (a finite structural
+    check); nodes without a component_id are 'not observable'. Runtime
+    transitions absent from the static graph are reported as divergences. No
+    interpretation of why they diverge.
+    """
+    from ..entrypoint_discovery import discover_entrypoints
+    from ..flow_graph import build_flow_graph
+
+    snapshot_row, symbols, files = _load_flow_inputs(
+        system_id, payload.snapshot_id, payload.commit_sha,
+    )
+    llm_eps = _load_persisted_api_entrypoints(system_id, snapshot_row["id"])
+    discovery = discover_entrypoints(symbols, files, persisted_api=llm_eps)
+    graph = build_flow_graph(
+        symbols=symbols,
+        files=files,
+        snapshot_id=snapshot_row["id"],
+        commit_sha=snapshot_row["commit_sha"],
+        entrypoint_type=payload.entrypoint_type,
+        entrypoint_id=payload.entrypoint_id,
+        max_depth=payload.max_depth,
+        max_nodes=payload.max_nodes,
+        entrypoints=discovery.entrypoints + discovery.functions,
+    )
+    if graph is None:
+        _raise_entrypoint_not_found(payload.entrypoint_id, llm_eps)
+
+    from ..flow_overlay import compute_overlay
+
+    with get_conn() as conn:
+        steps = _resolve_lineage_steps(conn, system_id, payload.selection)
+
+    return compute_overlay(graph, steps, payload.selection.model_dump(exclude_none=True))
 
 
 def _raise_entrypoint_not_found(entrypoint_id: str, llm_eps) -> None:
