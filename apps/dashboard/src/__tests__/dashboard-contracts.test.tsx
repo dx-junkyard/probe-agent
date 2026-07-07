@@ -3743,3 +3743,127 @@ describe("Trace Analyzers page", () => {
     expect(within(table).getByText("changed")).toBeInTheDocument();
   });
 });
+
+// ── Connectivity guide & warning badge (Issue #165) ──────────────────
+
+function connectivityStatus(overrides: Record<string, unknown> = {}) {
+  return {
+    system_id: 1,
+    state: "no_signal",
+    total_trace_count: 0,
+    smoke_trace_count: 0,
+    real_trace_count: 0,
+    first_trace_at: null,
+    last_trace_at: null,
+    last_trace_component_id: null,
+    smoke_component_id: "probe-smoke-check",
+    materialized_session_ids: [],
+    ...overrides,
+  };
+}
+
+describe("Connectivity warning badge (Issue #165)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("no_signal renders an observation-based warning linking to the setup guide", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/connectivity/status") return Promise.resolve(connectivityStatus());
+      return Promise.resolve(null);
+    });
+    const { ConnectivityBadge } = await import("@/components/connectivity-badge");
+    render(<ConnectivityBadge />, { wrapper: createWrapper() });
+
+    const badge = await screen.findByTestId("connectivity-badge");
+    expect(badge).toHaveAttribute("data-state", "no_signal");
+    expect(badge).toHaveAttribute("href", "/setup-guide");
+    // Wording is observation-based ("not received"), never "未設定".
+    expect(badge.textContent).toContain("シグナル未受信");
+  });
+
+  test("smoke_only renders the intermediate state", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/connectivity/status") {
+        return Promise.resolve(connectivityStatus({
+          state: "smoke_only", total_trace_count: 1, smoke_trace_count: 1,
+        }));
+      }
+      return Promise.resolve(null);
+    });
+    const { ConnectivityBadge } = await import("@/components/connectivity-badge");
+    render(<ConnectivityBadge />, { wrapper: createWrapper() });
+
+    const badge = await screen.findByTestId("connectivity-badge");
+    expect(badge).toHaveAttribute("data-state", "smoke_only");
+    expect(badge.textContent).toContain("疎通確認のみ受信");
+  });
+
+  test("receiving renders no badge (warning clears after the first real trace)", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/connectivity/status") {
+        return Promise.resolve(connectivityStatus({
+          state: "receiving", total_trace_count: 3, real_trace_count: 3,
+          last_trace_component_id: "svc",
+        }));
+      }
+      return Promise.resolve(null);
+    });
+    const { ConnectivityBadge } = await import("@/components/connectivity-badge");
+    render(<ConnectivityBadge />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(mockApi.get).toHaveBeenCalledWith("/connectivity/status"));
+    expect(screen.queryByTestId("connectivity-badge")).not.toBeInTheDocument();
+  });
+});
+
+describe("Patch filename provenance (Issue #165)", () => {
+  test("encodes system / session / snapshot / commit", async () => {
+    const { buildPatchFilename } = await import("@/lib/patch");
+    expect(buildPatchFilename({
+      systemId: 2, sessionId: 7, snapshotId: 31, commitSha: "abcdef0123456789",
+    })).toBe("probe-agent-system2-session7-snapshot31-abcdef01.patch");
+  });
+
+  test("omits missing commit and system", async () => {
+    const { buildPatchFilename } = await import("@/lib/patch");
+    expect(buildPatchFilename({
+      systemId: null, sessionId: 7, snapshotId: 31, commitSha: null,
+    })).toBe("probe-agent-session7-snapshot31.patch");
+  });
+});
+
+describe("Setup guide page (Issue #165)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("shows connectivity facts, smoke convention, and failure isolation sections", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/connectivity/status") {
+        return Promise.resolve(connectivityStatus({ materialized_session_ids: [4] }));
+      }
+      return Promise.resolve(null);
+    });
+    const { default: SetupGuidePage } = await import("@/pages/setup-guide");
+    render(<SetupGuidePage />, { wrapper: createWrapper() });
+
+    const card = await screen.findByTestId("connectivity-status-card");
+    const label = await within(card).findByTestId("connectivity-state-label");
+    expect(label.textContent).toBe("シグナル未受信");
+    // A generated patch with no signal yet is called out explicitly.
+    expect(within(card).getByText(/レビュー用差分は生成済みです/)).toBeInTheDocument();
+    expect(within(card).getByText("probe-smoke-check")).toBeInTheDocument();
+
+    // Failure-isolation viewpoints required by the issue.
+    for (const cause of ["設定不足", "認証失敗", "ネットワーク不達", "イベント未送信", "対象 workload 未実行"]) {
+      expect(screen.getByText(cause)).toBeInTheDocument();
+    }
+    // Execution patterns are selectable.
+    expect(screen.getByText("同じ Docker Compose 内")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("ホストで直接実行"));
+    expect(screen.getByText(/PROBE_SERVER_URL="http:\/\/localhost:8000"/)).toBeInTheDocument();
+  });
+});

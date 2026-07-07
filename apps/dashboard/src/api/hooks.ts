@@ -34,6 +34,7 @@ import type {
   SystemDiagnosticsOut,
   AssistantScreenContext, AssistantAskRequest, AssistantAskOut,
   AssistantSettingsMetadataOut,
+  ConnectivityStatusOut,
 } from "./types";
 
 export function sysKey(base: string, ...extra: unknown[]) {
@@ -1232,6 +1233,19 @@ export function useAssistantAsk() {
   return useMutation({
     mutationFn: (data: AssistantAskRequest) =>
       api.post<AssistantAskOut>("/assistant/ask", data),
+  });
+}
+
+// Issue #165: deterministic signal-reception facts for the connectivity
+// badge and the setup-guide page. Polls so the badge clears without a reload
+// once the first trace arrives.
+export function useConnectivityStatus(refetchInterval: number = 30_000) {
+  return useQuery({
+    queryKey: sysKey("connectivity-status"),
+    queryFn: () => api.get<ConnectivityStatusOut>("/connectivity/status"),
+    enabled: !!getSystemId(),
+    refetchInterval,
+    staleTime: 5_000,
   });
 }
 

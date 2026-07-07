@@ -201,6 +201,37 @@ def test_create_list_and_get_session(admin_client):
     detail = r.json()
     assert detail["messages"] == []
     assert detail["proposals"] == []
+    # Issue #165: the detail endpoint states which commit the pinned snapshot
+    # (and therefore any generated review patch) refers to.
+    assert detail["snapshot_commit_sha"] == "abc123"
+
+
+def test_materialized_sessions_reported_by_connectivity(admin_client):
+    """Sessions with a generated review diff appear in connectivity status
+    so the Dashboard can pair "patch generated" with "no signal yet"."""
+    from app.db import get_conn
+
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    r = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "t", "focus": "f"},
+        headers=headers,
+    )
+    session_id = r.json()["id"]
+
+    body = admin_client.get("/connectivity/status", headers=headers).json()
+    assert body["materialized_session_ids"] == []
+
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE interview_session SET materialization_diff = ?, materialized_at = ? WHERE id = ?",
+            ("diff --git a/x b/x", time.time(), session_id),
+        )
+
+    body = admin_client.get("/connectivity/status", headers=headers).json()
+    assert body["materialized_session_ids"] == [session_id]
+    assert body["state"] == "no_signal"
 
 
 def test_session_requires_snapshot_from_same_system(admin_client):

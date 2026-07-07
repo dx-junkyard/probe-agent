@@ -2,7 +2,7 @@ import { NavLink, useLocation } from "react-router-dom";
 import {
   LayoutDashboard, GitBranch, Map, Crosshair, FlaskConical,
   Plug, Sparkles, Boxes, Settings, Users, ChevronLeft, ChevronRight, MessageSquare,
-  Workflow, Network, MessageSquareText, Brain, GitFork, Filter,
+  Workflow, Network, MessageSquareText, Brain, GitFork, Filter, LifeBuoy,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/api/auth";
@@ -21,6 +21,7 @@ const NAV = [
   { to: "/interview", icon: MessageSquareText, label: "Interview" },
   { to: "/experiments", icon: FlaskConical, label: "Experiments" },
   { to: "/connect-sdk", icon: Plug, label: "Connect SDK" },
+  { to: "/setup-guide", icon: LifeBuoy, label: "接続ガイド" },
   { to: "/generation", icon: Sparkles, label: "Generate" },
   { to: "/components", icon: Boxes, label: "Components" },
   { to: "/workspaces", icon: MessageSquare, label: "Decision Workspace" },

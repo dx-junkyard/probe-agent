@@ -66,8 +66,19 @@ uvicorn app.main:app --reload --port 8000
 | GET/PUT | `/retention/policies` | system 単位の retention 設定(既定は削除しない、#152) |
 | POST | `/retention/apply` | retention の明示適用(古い順・監査付き、#152) |
 | GET  | `/retention/audit` | retention 適用の監査ログ(#152) |
+| GET  | `/connectivity/status` | system 単位のシグナル受信状況(`no_signal`/`smoke_only`/`receiving`、決定的、#165) |
 
 DB ファイルは `PROBE_DB_PATH` (既定 `./probe.db`) で切り替えられる。
+
+### 疎通確認 (Connectivity status, Issue #165)
+
+`GET /connectivity/status` は呼び出し元 system の trace 受信状況を観測事実の
+まま返す(LLM 不使用・原因推定なし)。`state` は有限集合で、trace が 1 件も
+無ければ `no_signal`、component_id が `probe-smoke-check` (完全一致) の手動
+smoke trace のみなら `smoke_only`、実 workload の trace が 1 件以上あれば
+`receiving` になる。Dashboard のヘッダーバッジと接続セットアップガイド
+(`/setup-guide`) がこの API を参照する。手動 smoke trace は通常の
+`POST /traces` に component_id `probe-smoke-check` で送る。
 
 ### Trace lineage / analyzer の環境変数
 

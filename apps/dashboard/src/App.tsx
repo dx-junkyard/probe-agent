@@ -12,6 +12,7 @@ import TraceLineagePage from "./pages/trace-lineage";
 import TraceAnalyzersPage from "./pages/trace-analyzers";
 import ExperimentsPage from "./pages/experiments";
 import ConnectSdkPage from "./pages/connect-sdk";
+import SetupGuidePage from "./pages/setup-guide";
 import GenerationPage from "./pages/generation";
 import ComponentsPage from "./pages/components";
 import SettingsPage from "./pages/settings";
@@ -36,6 +37,7 @@ export default function App() {
         <Route path="probe-planner" element={<ProbePlannerPage />} />
         <Route path="experiments" element={<ExperimentsPage />} />
         <Route path="connect-sdk" element={<ConnectSdkPage />} />
+        <Route path="setup-guide" element={<SetupGuidePage />} />
         <Route path="generation" element={<GenerationPage />} />
         <Route path="components" element={<ComponentsPage />} />
         <Route path="workspaces" element={<WorkspacesPage />} />

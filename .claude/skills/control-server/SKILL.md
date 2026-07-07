@@ -212,6 +212,29 @@ heuristic result.
   calls are a 422 with a reason; the manual copy/paste URL flow always stays
   available as a fallback. This is still not a target-repository write.
 
+## Connectivity status (issue #165)
+
+- `GET /connectivity/status` (`routes/connectivity.py`) returns deterministic,
+  LLM-free signal-reception facts for the caller's system: trace counts,
+  first/last trace timestamps, last component id, and a finite `state`:
+  `no_signal` (zero traces) / `smoke_only` (only smoke-check traces) /
+  `receiving` (at least one real trace).
+- Smoke traces are classified by exact `component_id` match against the
+  documented convention `probe-smoke-check` (finite structural check,
+  Principle 6). The setup-guide page tells developers to use that id for
+  manual `curl` smoke traces so ingest-path checks are distinguishable from
+  real workload traces.
+- The response also lists interview sessions with a generated
+  materialization diff (`materialized_session_ids`) so the Dashboard can
+  connect "patch generated" with "no signal received yet".
+- Everything here is an observed fact — never infer *why* no signal arrived,
+  and never call an LLM. System isolation is mandatory: traces from other
+  systems must not affect the state.
+- The interview session detail endpoint exposes `snapshot_commit_sha`
+  (joined from the pinned snapshot) and `POST .../materialize` returns
+  `commit_sha`, so the review-diff UI can state which commit the patch
+  applies to and build a provenance-bearing `.patch` filename.
+
 ## Authentication and user management
 
 - Auth is enabled when any user exists or `CONTROL_API_KEYS` is set; otherwise open (MVP compat).

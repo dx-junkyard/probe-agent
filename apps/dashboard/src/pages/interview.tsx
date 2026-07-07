@@ -2,8 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import {
-  AlertCircle, CheckCircle, FileCode, GitPullRequest,
-  HelpCircle, Layers, Loader2, MessageSquareText, Pencil, Play, Send,
+  AlertCircle, CheckCircle, Download, FileCode, GitPullRequest,
+  HelpCircle, Layers, LifeBuoy, Loader2, MessageSquareText, Pencil, Play, Send,
   Sparkles, XCircle,
 } from "lucide-react";
 import {
@@ -40,6 +40,7 @@ import { Select } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { formatTimestamp } from "@/lib/utils";
+import { buildPatchFilename, downloadTextFile } from "@/lib/patch";
 import type {
   CurrentUnderstanding,
   GapItem,
@@ -908,6 +909,9 @@ export default function InterviewPage() {
   const pendingCount = proposals.filter(p => p.approval_state === "proposed").length;
   const approvedCount = approvedSet?.approved_count ?? 0;
   const diff = lastMaterialization?.diff || session?.materialization_diff || "";
+  // 差分の生成元 commit。直近の生成結果を優先し、無ければセッションの pinned
+  // snapshot の commit(差分はセッションの snapshot に対して生成される)。
+  const patchCommitSha = lastMaterialization?.commit_sha || session?.snapshot_commit_sha || null;
   const currentStage = session?.stage ?? "understanding_initialized";
   const isProposalStage = currentStage === "proposal_generation";
 
@@ -1017,13 +1021,15 @@ export default function InterviewPage() {
           ? "提案に必要な情報がまだ不足しています。表示中の確認質問に回答して対象を絞り込んでください。回答を送信するたびに提案生成を再試行します。"
           : "「送信して提案を生成」を押すと、確認済みの理解にもとづいて提案が生成されます。";
       case "proposal_review":
+        if (diff)
+          return "レビュー用差分を生成済みです。.patch を保存して対象リポジトリに適用し、接続セットアップガイドで監視対象の設定と疎通確認へ進んでください。";
         return approvedCount > 0
           ? "承認済みの提案から「差分を生成」でレビュー用の差分を作成できます。残りの提案のレビューも続けられます。"
           : "各提案を承認・編集・却下してください。承認した提案から差分を生成できます。";
       default:
         return "";
     }
-  }, [uiState, approvedCount, zeroBaseComplete, proposalNarrowing]);
+  }, [uiState, approvedCount, zeroBaseComplete, proposalNarrowing, diff]);
 
   const startSession = async () => {
     if (!latestSnapshot) {
@@ -1164,10 +1170,25 @@ export default function InterviewPage() {
     try {
       const result = await materialize.mutateAsync();
       setLastMaterialization(result);
-      toast.success(`${result.items_materialized}件を差分化しました`);
+      toast.success(`${result.items_materialized}件を差分化しました。内容をレビューし、.patch の保存と適用へ進めます。`);
     } catch (e) {
       toast.error(String(e));
     }
+  };
+
+  // Issue #165: 生成済み diff を `.patch` として保存する。ファイル名に
+  // system / session / snapshot / commit を含め、由来を追跡できるようにする。
+  const downloadPatch = () => {
+    if (!diff || !session) return;
+    downloadTextFile(
+      diff,
+      buildPatchFilename({
+        systemId: session.system_id,
+        sessionId: session.id,
+        snapshotId: session.snapshot_id,
+        commitSha: patchCommitSha,
+      }),
+    );
   };
 
   return (
@@ -1520,18 +1541,48 @@ export default function InterviewPage() {
 
                   <Card>
                     <CardHeader>
-                      <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center justify-between gap-2 flex-wrap">
                         <div>
                           <CardTitle className="text-sm">レビュー用差分</CardTitle>
                           <CardDescription>差分の生成までで停止し、適用は開発者がレビューして行います。</CardDescription>
                         </div>
-                        <Button size="sm" variant="outline" onClick={() => openDiff(diff, session.id)} disabled={!diff}>
-                          <GitPullRequest className="h-4 w-4 mr-1" />
-                          差分を開く
-                        </Button>
+                        <div className="flex items-center gap-2">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={downloadPatch}
+                            disabled={!diff}
+                            data-testid="download-patch-button"
+                            title={diff ? undefined : "差分が未生成のためダウンロードできません"}
+                          >
+                            <Download className="h-4 w-4 mr-1" />
+                            .patch をダウンロード
+                          </Button>
+                          <Button size="sm" variant="outline" onClick={() => openDiff(diff, session.id)} disabled={!diff}>
+                            <GitPullRequest className="h-4 w-4 mr-1" />
+                            差分を開く
+                          </Button>
+                        </div>
                       </div>
                     </CardHeader>
                     <CardContent className="space-y-3">
+                      {/* 差分の意図と生成元(Issue #165)。適用判断に必要な前提を明示する。 */}
+                      <div className="rounded-md bg-muted/50 p-3 text-xs space-y-1" data-testid="patch-provenance">
+                        <p className="font-medium">この差分について</p>
+                        <ul className="list-disc pl-4 space-y-0.5 text-muted-foreground">
+                          <li>承認済みのインタビュー提案から生成された、レビュー用の patch です。</li>
+                          <li>
+                            snapshot {session.snapshot_id}
+                            {patchCommitSha && (
+                              <> (commit <code className="font-mono">{patchCommitSha.slice(0, 8)}</code>)</>
+                            )}{" "}
+                            に対する差分です。適用時も同じ commit をベースにしてください。
+                          </li>
+                          <li>変更内容は probe-agent: docstring メタデータと @probe 計装です。</li>
+                          <li>対象リポジトリのブランチや実ファイルは自動では変更されていません。</li>
+                          <li>内容をレビューし、妥当な場合に開発者が手動で適用します(下の適用手順)。</li>
+                        </ul>
+                      </div>
                       {lastMaterialization?.skipped?.length ? (
                         <div className="rounded-md border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 p-3 text-xs text-amber-900 dark:text-amber-100">
                           {lastMaterialization.skipped.join("; ")}
@@ -1544,7 +1595,57 @@ export default function InterviewPage() {
                       ) : (
                         <div className="rounded-md border p-6 text-center text-sm text-muted-foreground">
                           提案を1件以上承認してから「差分を生成」を押すと、まとめて1つの差分が生成されます。
+                          差分が未生成の間は .patch のダウンロードはできません。
                         </div>
+                      )}
+                      {diff && (
+                        <>
+                          <details className="rounded-md border p-3 text-xs" data-testid="patch-apply-commands">
+                            <summary className="cursor-pointer font-medium text-sm">
+                              適用手順とコマンド例
+                            </summary>
+                            <pre className="mt-2 overflow-x-auto rounded-md bg-muted p-3 font-mono whitespace-pre">
+{`# 対象リポジトリで、差分生成時と同じ commit をベースにする
+git switch -c probe-instrumentation ${patchCommitSha ? patchCommitSha.slice(0, 8) : "<commit-sha>"}
+
+# 適用できるか事前に確認する
+git apply --check path/to/downloaded.patch
+
+# patch を適用する
+git apply path/to/downloaded.patch
+
+# 変更内容を確認する
+git diff
+
+# 必要なテストや疎通確認を実行する(接続ガイド参照)
+
+# 問題なければ通常の開発フローで commit / PR へ進む
+git status
+git add -p
+git commit`}
+                            </pre>
+                          </details>
+                          {/* インタビュー完了後の次アクション(Issue #165):設定と疎通確認へ誘導する */}
+                          <div
+                            className="rounded-md border border-primary/40 bg-primary/5 p-3 text-sm flex items-start gap-2"
+                            data-testid="setup-guide-next-action"
+                          >
+                            <LifeBuoy className="h-4 w-4 mt-0.5 shrink-0" />
+                            <div>
+                              <p className="font-medium">次のステップ: 監視対象の設定と疎通確認</p>
+                              <p className="text-xs text-muted-foreground mt-0.5">
+                                patch の適用だけでは監視は始まりません。監視対象側の環境変数・トークン・接続先の設定と、
+                                trace が届くことの確認が必要です。
+                              </p>
+                              <Link
+                                className="inline-flex items-center text-sm underline mt-1"
+                                to={`/setup-guide?session=${session.id}`}
+                              >
+                                接続セットアップガイドを開く(このセッションの文脈付き)
+                              </Link>
+                            </div>
+                          </div>
+                        </>
                       )}
                       {session.materialization_ref && (
                         <a className="inline-flex items-center text-sm underline" href={session.materialization_ref} target="_blank" rel="noreferrer">
