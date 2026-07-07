@@ -364,29 +364,54 @@ function AnalyzerBuilder({ onCreated }: { onCreated: (id: number) => void }) {
         {template && ctx && (
           <div className="space-y-3 rounded-lg border p-3">
             {needsEntity && (
-              <div className="grid grid-cols-2 gap-3">
-                <div className="space-y-1">
-                  <Label className="text-xs">Entity type</Label>
-                  <Select
-                    aria-label="entity type"
-                    value={state.entityType}
-                    onChange={(e) => set({ entityType: e.target.value, entityId: "" })}
-                  >
-                    <option value="">Select…</option>
-                    {ctx.entity_types.map((t) => <option key={t} value={t}>{t}</option>)}
-                  </Select>
-                </div>
-                <div className="space-y-1">
-                  <Label className="text-xs">Entity id</Label>
-                  <Select
-                    aria-label="entity id"
-                    value={state.entityId}
-                    onChange={(e) => set({ entityId: e.target.value })}
-                    disabled={!state.entityType}
-                  >
-                    <option value="">Select…</option>
-                    {entityIds.map((id) => <option key={id} value={id}>{id}</option>)}
-                  </Select>
+              <div className="space-y-2">
+                {ctx.entities_truncated && (
+                  <p className="text-xs text-amber-600" data-testid="entities-truncated-warning">
+                    This system has more entities than the builder can list — the entity
+                    id dropdown only shows the first page of ids. Type an id directly
+                    below if the one you need isn't in the list.
+                  </p>
+                )}
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-1">
+                    <Label className="text-xs">Entity type</Label>
+                    <Select
+                      aria-label="entity type"
+                      value={state.entityType}
+                      onChange={(e) => set({ entityType: e.target.value, entityId: "" })}
+                    >
+                      <option value="">Select…</option>
+                      {ctx.entity_types.map((t) => <option key={t} value={t}>{t}</option>)}
+                    </Select>
+                  </div>
+                  <div className="space-y-1">
+                    <Label className="text-xs">Entity id</Label>
+                    {ctx.entities_truncated ? (
+                      <Input
+                        aria-label="entity id"
+                        list="analyzer-builder-entity-ids"
+                        value={state.entityId}
+                        onChange={(e) => set({ entityId: e.target.value })}
+                        disabled={!state.entityType}
+                        placeholder="Type or pick an id…"
+                      />
+                    ) : (
+                      <Select
+                        aria-label="entity id"
+                        value={state.entityId}
+                        onChange={(e) => set({ entityId: e.target.value })}
+                        disabled={!state.entityType}
+                      >
+                        <option value="">Select…</option>
+                        {entityIds.map((id) => <option key={id} value={id}>{id}</option>)}
+                      </Select>
+                    )}
+                    {ctx.entities_truncated && (
+                      <datalist id="analyzer-builder-entity-ids">
+                        {entityIds.map((id) => <option key={id} value={id} />)}
+                      </datalist>
+                    )}
+                  </div>
                 </div>
               </div>
             )}

@@ -3024,6 +3024,16 @@ class IssueDraftOut(BaseModel):
     updated_at: float
 
 
+class GitHubIssueStatusOut(BaseModel):
+    """Whether GitHub issue creation is available for the current system's
+    configured repository (Issue #158 External Issue Loop)."""
+
+    available: bool
+    owner: Optional[str] = None
+    repo: Optional[str] = None
+    reason: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # System diagnostics (Issue #101)
 # ---------------------------------------------------------------------------

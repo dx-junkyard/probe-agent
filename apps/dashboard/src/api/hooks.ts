@@ -29,6 +29,7 @@ import type {
   SystemUnderstandingBuildOut,
   IssueDraft,
   IssueDraftCreateRequest,
+  GitHubIssueStatus,
   IssueDraftUpdateRequest,
   SystemDiagnosticsOut,
   AssistantScreenContext, AssistantAskRequest, AssistantAskOut,
@@ -1179,6 +1180,28 @@ export function useUpdateIssueDraft() {
   return useMutation({
     mutationFn: ({ id, body }: { id: number; body: IssueDraftUpdateRequest }) =>
       api.patch<IssueDraft>(`/issue-drafts/${id}`, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: sysKey("issue-drafts") });
+      qc.invalidateQueries({ queryKey: sysKey("system-understanding") });
+    },
+  });
+}
+
+// External Issue Loop: draft -> GitHub issue (Issue #158)
+
+export function useGitHubIssueStatus() {
+  return useQuery({
+    queryKey: sysKey("issue-drafts-github-status"),
+    queryFn: () => api.get<GitHubIssueStatus>("/issue-drafts/github-status"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useCreateGitHubIssue() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) =>
+      api.post<IssueDraft>(`/issue-drafts/${id}/create-github-issue`),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: sysKey("issue-drafts") });
       qc.invalidateQueries({ queryKey: sysKey("system-understanding") });

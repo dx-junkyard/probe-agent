@@ -1828,6 +1828,15 @@ export interface IssueDraftUpdateRequest {
   external_url?: string;
 }
 
+// Issue #158: whether draft -> GitHub issue creation is available for the
+// current system's configured repository.
+export interface GitHubIssueStatus {
+  available: boolean;
+  owner?: string | null;
+  repo?: string | null;
+  reason?: string | null;
+}
+
 export interface SystemUnderstandingOut {
   system_id: number;
   snapshot_id: number | null;

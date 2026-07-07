@@ -12,9 +12,12 @@ Design notes:
   already-derived gap (Principle 6). It makes no open-ended decision, so it does
   not call a reasoning model. The upstream gap detection (docs-code reconcile,
   claim scan) is where reasoning happens.
-- probe-agent never creates the external issue and never writes to the target
-  repository (issue Non-goals; Principle 5). It only manages the draft and a
-  user-supplied external URL string.
+- probe-agent never writes to the target repository's tracked branches
+  (Principle 5). Registering `external_url` accepts any user-supplied
+  http(s) string for any tracker. When GitHub is configured (Issue #158,
+  see `github_integration.py`), the dashboard can also ask probe-agent to
+  create the GitHub issue itself and it calls `update_draft` with the
+  resulting URL the same way a manually-registered URL would be stored.
 
 probe-agent:
   role: Issue draft generation and lifecycle store
