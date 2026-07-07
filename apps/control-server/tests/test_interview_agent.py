@@ -785,6 +785,50 @@ def test_question_evidence_partial_overlap_dropped_not_fatal():
     assert result.evidence_refs_dropped == 1
 
 
+def test_question_evidence_broad_known_path_range_dropped_not_fatal():
+    """Issue #155: a known path with a range broader than the allowed span is
+    dropped instead of failing the dialogue turn."""
+    response = _valid_response(proposals=[])
+    response["next_questions"] = [
+        {
+            "question_text": "これは正しいですか?",
+            "hypothesis": "仮説",
+            "evidence_refs": [
+                {"path": "src/broad.py", "start_line": 100, "end_line": 182}
+            ],
+            "answer_options": [],
+        }
+    ]
+    client = FakeLLMClient(response=response)
+    context_pack = _context_pack(
+        [
+            InterviewSymbolItem(
+                symbol_id=7,
+                path="src/broad.py",
+                qualified_name="broad.allowed",
+                kind="function",
+                start_line=100,
+                end_line=120,
+                classification="unclassified",
+                has_metadata=False,
+                evidence=_evidence(path="src/broad.py", qname="broad.allowed"),
+            ),
+        ]
+    )
+
+    result = generate_interview_turn(
+        client, _make_config(),
+        context_pack=context_pack,
+        history=[],
+        user_message="質問してください",
+    )
+
+    assert result.error is None
+    assert len(result.next_questions) == 1
+    assert result.next_questions[0].evidence_refs == []
+    assert result.evidence_refs_dropped == 1
+
+
 def test_question_evidence_keeps_valid_drops_only_invalid():
     """When a question mixes a valid and an invalid ref, only the invalid one
     is dropped — the verifiable citation is preserved (Issue #142)."""

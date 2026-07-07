@@ -375,6 +375,30 @@ class TestLastObservedFailures:
         assert doc["severity"] == "warning"
         assert "実行されていません" in doc["detail"]
 
+    def test_evidence_validation_failure_has_specific_remediation(
+        self, admin_client, tmp_path
+    ):
+        _, sys, hdrs = _setup(admin_client)
+        _insert_snapshot_and_run(
+            str(tmp_path / "probe-diag-test.db"), sys["id"],
+            run_type="interview_dialogue", status="failed",
+            error_details=(
+                "Question evidence validation failed: question evidence lines "
+                "100-182 are not contained in any known span in "
+                "'apps/control-server/app/documentation_indexer.py'"
+            ),
+        )
+
+        _, checks = _get_checks(admin_client, hdrs)
+        c = checks["llm_last_run"]
+        assert c["severity"] == "error"
+        assert "evidence_refs" in c["remediation"]
+        assert "API キー・モデル ID・タイムアウト設定ではなく" in c["remediation"]
+        assert c["related_env"] == []
+        assert c["related_pages"] == ["/interview"]
+        assert c["related_pipeline_steps"] == ["interview_dialogue"]
+        assert c["fix_page"] == "/interview"
+
     def test_no_reasoning_run_is_unknown(self, admin_client):
         _, _, hdrs = _setup(admin_client)
         _, checks = _get_checks(admin_client, hdrs)
