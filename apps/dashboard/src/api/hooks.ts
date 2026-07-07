@@ -2,7 +2,8 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, getSystemId } from "./client";
 import type {
   SystemOut, ComponentSummary, TraceEvent, Policy,
-  LineageOut, TraceAnalyzer, AnalysisRun,
+  LineageOut, TraceAnalyzer, AnalysisRun, AnalyzerContext,
+  RepositoryStatus,
   FlowOverlayOut, FlowOverlayRequest,
   ShadowResult, ComponentProfile, UserOut, TokenOut,
   RepositoryCandidateOut, RepositoryConfigOut, SnapshotOut, LatestDraftsOut,
@@ -139,6 +140,15 @@ export function useAnalyzers() {
   return useQuery({
     queryKey: sysKey("trace-analyzers"),
     queryFn: () => api.get<TraceAnalyzer[]>("/trace-analyzers"),
+    enabled: !!getSystemId(),
+  });
+}
+
+// Trace Analyzer builder candidate values (Issue #157)
+export function useAnalyzerContext() {
+  return useQuery({
+    queryKey: sysKey("trace-analyzer-context"),
+    queryFn: () => api.get<AnalyzerContext>("/trace-analyzers/context"),
     enabled: !!getSystemId(),
   });
 }
@@ -317,6 +327,15 @@ export function useSnapshots() {
   });
 }
 
+// Repository refresh-hub status (Issue #158)
+export function useRepositoryStatus() {
+  return useQuery({
+    queryKey: sysKey("repositoryStatus"),
+    queryFn: () => api.get<RepositoryStatus>("/repository/status"),
+    enabled: !!getSystemId(),
+  });
+}
+
 export function useLatestSnapshot() {
   return useQuery({
     queryKey: sysKey("latestSnapshot"),
@@ -332,6 +351,7 @@ export function useCreateSnapshot() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: sysKey("snapshots") });
       qc.invalidateQueries({ queryKey: sysKey("latestSnapshot") });
+      qc.invalidateQueries({ queryKey: sysKey("repositoryStatus") });
     },
   });
 }

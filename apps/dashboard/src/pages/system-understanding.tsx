@@ -469,6 +469,22 @@ function IssueDraftEditor({ draft }: { draft: IssueDraft }) {
 
   return (
         <div className="space-y-4" data-testid="issue-draft-dialog">
+          {/* Issue #158: show which snapshot/commit the draft was generated from
+              and whether that analysis is now stale relative to the latest snapshot. */}
+          <div className="rounded-md border px-3 py-2 text-xs text-muted-foreground" data-testid="issue-draft-provenance">
+            Generated from{" "}
+            {draft.snapshot_id != null ? <>snapshot #{draft.snapshot_id}</> : "an unknown snapshot"}
+            {draft.commit_sha ? <> at <code className="font-mono">{draft.commit_sha.slice(0, 8)}</code></> : null}.
+            {draft.stale && (
+              <span
+                className="ml-1 font-medium text-amber-700 dark:text-amber-400"
+                data-testid="issue-draft-stale"
+              >
+                {" "}The repository has a newer snapshot — this draft may be stale. Refresh
+                System Understanding and regenerate the draft before creating a new issue.
+              </span>
+            )}
+          </div>
           <div className="space-y-1.5">
             <Label htmlFor="issue-draft-title">Title</Label>
             <Input

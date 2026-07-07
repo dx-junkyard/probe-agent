@@ -94,6 +94,43 @@ def resolve_head(repo_path: str) -> str:
     return result.stdout.decode("utf-8").strip()
 
 
+@dataclass(frozen=True)
+class WorkingTreeStatus:
+    """Read-only view of the working tree (Issue #158).
+
+    ``dirty`` reflects any staged, unstaged, or untracked change. ``sample``
+    holds a bounded list of ``git status --porcelain`` lines so the dashboard can
+    show the developer *what* is dirty without us ever mutating the tree.
+    """
+
+    clean: bool
+    dirty_file_count: int
+    sample: List[str]
+
+
+def working_tree_status(repo_path: str, *, sample_limit: int = 20) -> WorkingTreeStatus:
+    """Return whether the working tree is clean using a read-only status query.
+
+    This never modifies the repository. It runs ``git status --porcelain`` (which
+    reports staged, unstaged, and untracked paths) and reports a clean/dirty
+    verdict plus a bounded sample of the changed entries. Refresh and patch-apply
+    flows use this to gate on a dirty tree (Principle 5: never write to the target
+    repository; only observe it).
+    """
+    real_path = _validate_repo_path(repo_path)
+    result = _run_git(real_path, ["status", "--porcelain"])
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        raise GitError(f"git status failed: {stderr}")
+    text = result.stdout.decode("utf-8", errors="replace")
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    return WorkingTreeStatus(
+        clean=not lines,
+        dirty_file_count=len(lines),
+        sample=lines[:sample_limit],
+    )
+
+
 def _allowed_repository_roots() -> List[str]:
     raw = os.getenv("PROBE_REPOSITORY_ROOTS", "").strip()
     if not raw:

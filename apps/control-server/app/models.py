@@ -143,6 +143,29 @@ class TraceAnalyzerOut(BaseModel):
     updated_at: float
 
 
+class AnalyzerEntityOut(BaseModel):
+    entity_type: str
+    entity_id: str
+
+
+class AnalyzerContextOut(BaseModel):
+    """Candidate values for the Trace Analyzer builder (Issue #157).
+
+    Deterministic, read-only projection of the identifiers a declarative
+    analyzer spec may reference, so the dashboard can offer them as choices
+    instead of asking the user to hand-write JSON. Sourced from the same
+    finite sets the LLM proposal context uses (Principle 6).
+    """
+
+    components: List[str] = Field(default_factory=list)
+    entity_types: List[str] = Field(default_factory=list)
+    entities: List[AnalyzerEntityOut] = Field(default_factory=list)
+    projection_names: List[str] = Field(default_factory=list)
+    field_names: List[str] = Field(default_factory=list)
+    phases: List[str] = Field(default_factory=list)
+    entities_truncated: bool = False
+
+
 class AnalysisRunOut(BaseModel):
     id: int
     analyzer_id: int
@@ -468,6 +491,45 @@ class SnapshotOut(BaseModel):
     created_at: float
     completed_at: Optional[float] = None
     files: List[SnapshotFileOut] = Field(default_factory=list)
+
+
+class SnapshotRefOut(BaseModel):
+    id: int
+    commit_sha: str
+    status: str
+    created_at: float
+
+
+class RepositoryStatusOut(BaseModel):
+    """Repository refresh hub state (Issue #158).
+
+    Read-only summary that lets the dashboard show, in one place, whether the
+    latest analysis is stale relative to the repository's current HEAD and what
+    step to take next. Reading HEAD / working-tree status never mutates the
+    target repository (Principle 5).
+    """
+
+    configured: bool
+    repo_path: Optional[str] = None
+    # Current committed HEAD of the configured repository (read-only rev-parse).
+    current_head: Optional[str] = None
+    head_error: Optional[str] = None
+    working_tree_dirty: Optional[bool] = None
+    dirty_file_count: int = 0
+    dirty_sample: List[str] = Field(default_factory=list)
+    # Newest snapshot regardless of index/build state.
+    latest_snapshot: Optional[SnapshotRefOut] = None
+    # Newest snapshot that also has a completed symbol index.
+    latest_indexed_snapshot: Optional[SnapshotRefOut] = None
+    # Snapshot the most recent System Understanding build ran against.
+    understanding_snapshot_id: Optional[int] = None
+    understanding_status: Optional[str] = None
+    # True when the latest snapshot's commit differs from current HEAD, so a new
+    # snapshot should be created before generating new analysis/patches.
+    snapshot_stale: bool = False
+    # True when a ready snapshot exists but has no completed symbol index.
+    symbols_stale: bool = False
+    next_actions: List[str] = Field(default_factory=list)
 
 
 class IntelligenceRunOut(BaseModel):
@@ -2954,6 +3016,10 @@ class IssueDraftOut(BaseModel):
     body_markdown: str
     status: str
     external_url: Optional[str] = None
+    # Issue #158: True when the draft's originating snapshot/commit no longer
+    # matches the latest ready snapshot, so the analysis behind it may be out of
+    # date. Computed at read time; never persisted.
+    stale: bool = False
     created_at: float
     updated_at: float
 

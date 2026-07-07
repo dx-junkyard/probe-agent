@@ -55,11 +55,13 @@ uvicorn app.main:app --reload --port 8000
 | GET  | `/traces/{trace_id}/projections` | trace の projection 取得(#146) |
 | GET  | `/components/{id}/projections` | component の projection 一覧(#146) |
 | POST | `/trace-analyzers` | analyzer 手動作成(schema 検証 fail-closed、#148) |
+| GET  | `/trace-analyzers/context` | builder 用の候補値(component/entity/projection/field/phase、read-only、#157) |
 | POST | `/trace-analyzers/propose` | 自然言語 → reasoning model → schema+実在検証 → proposed 保存(#149) |
 | GET  | `/trace-analyzers` / `/trace-analyzers/{id}` | analyzer 一覧・取得(#148) |
 | PUT  | `/trace-analyzers/{id}/review` | proposed→approved/rejected(#148) |
 | POST | `/trace-analyzers/{id}/runs` | approved のみ read-only 実行(#148) |
 | GET  | `/trace-analyzers/{id}/runs[/{run_id}]` | run 一覧・取得(#148) |
+| GET  | `/repository/status` | refresh hub 状態(HEAD/dirty/latest snapshot/stale、read-only、#158) |
 | POST | `/repository/flow-overlay` | 静的フローに runtime lineage を重ねる overlay(#151) |
 | GET/PUT | `/retention/policies` | system 単位の retention 設定(既定は削除しない、#152) |
 | POST | `/retention/apply` | retention の明示適用(古い順・監査付き、#152) |
