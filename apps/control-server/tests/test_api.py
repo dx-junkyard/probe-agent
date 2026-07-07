@@ -316,10 +316,21 @@ def test_evaluate_missing_trace(client):
 @pytest.fixture
 def auth_client(tmp_path, monkeypatch):
     monkeypatch.setenv("PROBE_DB_PATH", str(tmp_path / "probe-auth-test.db"))
-    monkeypatch.setenv("CONTROL_API_KEYS", "good-key,also-good")
+    monkeypatch.setenv("CONTROL_ADMIN_USERNAME", "root")
+    monkeypatch.setenv("CONTROL_ADMIN_PASSWORD", "s3cret")
+    monkeypatch.delenv("CONTROL_API_KEYS", raising=False)
     from app.main import app  # noqa: WPS433
     with TestClient(app) as c:
         yield c
+
+
+def _issue_api_token(client, username="root", password="s3cret", **payload):
+    session_token = _login(client, username, password)
+    r = client.post(
+        "/tokens/me", json={"name": "sdk", **payload}, headers=_bearer(session_token)
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["token"]
 
 
 def test_auth_disabled_allows_all(client):
@@ -337,14 +348,26 @@ def test_auth_rejects_invalid_key(auth_client):
     assert r.status_code == 401
 
 
-def test_auth_accepts_valid_key(auth_client):
+def test_auth_accepts_valid_api_token(auth_client):
+    token = _issue_api_token(auth_client)
+    r = auth_client.post("/traces", json=_trace(), headers={"X-Api-Key": token})
+    assert r.status_code == 201
+
+
+def test_auth_accepts_valid_api_token_as_bearer(auth_client):
+    token = _issue_api_token(auth_client)
+    r = auth_client.post(
+        "/traces", json=_trace(), headers={"Authorization": f"Bearer {token}"}
+    )
+    assert r.status_code == 201
+
+
+def test_auth_rejects_legacy_control_api_keys_env(auth_client, monkeypatch):
+    # CONTROL_API_KEYS is a removed legacy mechanism (Issue #167); setting it
+    # must not grant access even though it once would have.
+    monkeypatch.setenv("CONTROL_API_KEYS", "good-key")
     r = auth_client.post("/traces", json=_trace(), headers={"X-Api-Key": "good-key"})
-    assert r.status_code == 201
-
-
-def test_auth_accepts_second_valid_key(auth_client):
-    r = auth_client.post("/traces", json=_trace(), headers={"X-Api-Key": "also-good"})
-    assert r.status_code == 201
+    assert r.status_code == 401
 
 
 def test_health_always_accessible(auth_client):
@@ -842,17 +865,20 @@ def test_self_token_cannot_revoke_others_token(admin_client):
     assert target["revoked"] is False
 
 
-def test_self_token_endpoints_reject_legacy_key(auth_client):
+def test_self_token_endpoints_reject_invalid_token(auth_client):
+    # An unrecognized X-Api-Key (e.g. a stale legacy CONTROL_API_KEYS value)
+    # is not a valid api_tokens row, so it is rejected outright (401), not
+    # merely lacking a user principal.
     r = auth_client.get("/tokens/me", headers={"X-Api-Key": "good-key"})
-    assert r.status_code == 403
+    assert r.status_code == 401
     r = auth_client.post(
         "/tokens/me", json={"name": "x"}, headers={"X-Api-Key": "good-key"}
     )
-    assert r.status_code == 403
+    assert r.status_code == 401
 
 
 def test_self_token_endpoints_reject_anonymous(client):
-    # Auth disabled (no users, no legacy keys): there is no user account to
+    # Auth disabled (no users exist yet): there is no user account to
     # attach a token to.
     r = client.get("/tokens/me")
     assert r.status_code == 403

@@ -237,7 +237,12 @@ heuristic result.
 
 ## Authentication and user management
 
-- Auth is enabled when any user exists or `CONTROL_API_KEYS` is set; otherwise open (MVP compat).
+- Auth is enabled when any user exists; otherwise open (MVP compat,
+  bootstrap-only, not a supported SDK route).
+- `CONTROL_API_KEYS` (legacy fixed shared-key auth) is removed (Issue #167):
+  the env var is never read, there is no `legacy_api_key` principal, and
+  setting it has no effect. `X-Api-Key` / `Authorization: Bearer` are only
+  accepted when they hash-match a live row in `api_tokens`.
 - Initial admin is bootstrapped from `CONTROL_ADMIN_USERNAME` / `CONTROL_ADMIN_PASSWORD` at startup.
 - Passwords are hashed with PBKDF2-HMAC-SHA256 (`app/security.py`); never store plaintext.
 - Tokens are random (`secrets.token_urlsafe`) and stored only as SHA-256 hashes in `api_tokens`.
@@ -248,13 +253,19 @@ heuristic result.
   issue/list/revoke any token (`GET/POST /tokens`, `POST /tokens/{id}/revoke`).
 - Self-service token endpoints require a user principal (`require_user`):
   `GET /tokens/me`, `POST /tokens/me`, `POST /tokens/me/{id}/revoke`.
-  Legacy API keys and anonymous callers get 403; revoking a token owned by
-  someone else returns 404.
-- `POST /auth/logout` revokes the calling token (no-op for legacy keys).
+  Anonymous callers get 403; revoking a token owned by someone else returns 404.
+- `kind='api'` tokens always carry a `system_id`; when issued without an
+  explicit `system_id`, they bind to the caller's own system (never the
+  Legacy System) via `_resolve_token_system` (`routes/auth.py`).
+- `POST /auth/logout` revokes the calling token (no-op when the caller has
+  no token row, e.g. anonymous mode).
 - Deactivating a user must revoke their tokens. Resetting a password must
   revoke the user's session tokens (API tokens stay valid).
 - Role changes must not demote the last active admin (409).
-- Revoked/expired/inactive tokens return 401.
+- Revoked/expired/inactive/unrecognized tokens return 401.
+- `Legacy System` is kept only for data that predates system isolation; new
+  trace ingestion never routes there except through the anonymous
+  bootstrap-only fallback in `get_system_id` (no users exist yet).
 
 ## Rules
 
@@ -284,7 +295,9 @@ Add or update tests for:
 - schema compatibility
 - auth: login/logout, authenticated user, admin-only access, token issue/revoke, deactivation
 - self-service tokens: issue/list/revoke own tokens, cannot touch other users' tokens,
-  legacy key / anonymous rejected
+  invalid token / anonymous rejected
+- `CONTROL_API_KEYS` grants no access even when set (removed legacy path);
+  a new API token never binds to the Legacy System by default
 - password reset and role change permissions and guards
 - System isolation for every intelligence table/API
 - committed-only snapshot behavior

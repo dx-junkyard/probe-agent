@@ -1652,7 +1652,7 @@ class UserOut(BaseModel):
 
 class MeResponse(BaseModel):
     user: Optional[UserOut] = None
-    auth: str = Field(..., description="token | legacy_api_key | anonymous")
+    auth: str = Field(..., description="token | anonymous")
     system_id: Optional[int] = None
 
 

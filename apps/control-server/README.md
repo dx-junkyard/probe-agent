@@ -186,31 +186,38 @@ cancelled の step が残る場合は `partial`(1 つも完了していなけれ
 | --- | --- |
 | `CONTROL_ADMIN_USERNAME` | 起動時に作成する初期管理者のユーザー名 |
 | `CONTROL_ADMIN_PASSWORD` | 初期管理者のパスワード (起動時にハッシュ化して保存) |
-| `CONTROL_API_KEYS` | 旧来の固定 API キー (後方互換のため残置、カンマ区切り) |
 
 - `CONTROL_ADMIN_USERNAME` / `CONTROL_ADMIN_PASSWORD` が設定されていて同名ユーザーが
   まだ存在しない場合、起動時に `admin` ロールのユーザーを作成する。
 - パスワードは平文保存されず、PBKDF2-HMAC-SHA256 (ソルト付き) でハッシュ化される。
 
+`CONTROL_API_KEYS` による固定共有キー認証は廃止された。設定しても
+読み取られず、`X-Api-Key` / `Authorization: Bearer` の認証には使われない。
+
 ### 認証の有効化条件
 
-ユーザーが1人以上存在するか `CONTROL_API_KEYS` が設定されている場合に認証が有効になる。
-どちらもなければ MVP 互換で認証なし(全許可)で動作する。
+ユーザーが1人以上存在する場合に認証が有効になる。1人も存在しなければ
+MVP 互換で認証なし(全許可)で動作する。これはブートストラップ前の
+一時的な状態であり、SDK 送信の通常導線ではない。
 
 ### トークンの使い方
 
-- ログインで得た token、または admin が発行した API token を
+- ログインで得た token、または admin/本人が発行した API token を
   `Authorization: Bearer <token>` もしくは `X-Api-Key: <token>` で送る。
+  `api_tokens` テーブルに存在する有効な token だけが受け付けられる。
 - SDK は `PROBE_API_KEY` を `X-Api-Key` に付与するため、発行した
   API token を `PROBE_API_KEY` に設定すればそのまま利用できる。
-- API token は発行時に 1 つの system へ紐づき、component、trace、policy、
-  profile、評価結果はその system 内だけで参照・更新される。
+- `kind='api'` の token は発行時に必ず 1 つの system へ紐づき、component、
+  trace、policy、profile、評価結果はその system 内だけで参照・更新される。
+  system_id を指定せずに発行した場合も、token 所有者自身の system に
+  紐づく(Legacy System へは流れない)。
 - Dashboard のログイン session は `X-Probe-System-Id` で選択中 system を指定する。
   SDK の API token では system が token から決まるため、このヘッダーは不要。
 - 一般ユーザーは `/tokens/me` 系 API で自分の token を発行・一覧・失効できる
-  (Dashboard の「My Tokens」タブが使用)。legacy API key や匿名アクセスでは
-  使えない (403)。他ユーザーの token の失効は 404 になる。
-- 失効済み・期限切れ・無効化ユーザーの token は 401 で拒否される。
+  (Dashboard の「My Tokens」タブが使用)。匿名アクセスでは使えない (403)。
+  他ユーザーの token の失効は 404 になる。
+- 失効済み・期限切れ・無効化ユーザーの token は 401 で拒否される。無効な
+  token や token なしでの data-plane アクセスも 401 で拒否される。
 
 ### ユーザーの停止・削除に関する安全制約
 
@@ -222,12 +229,13 @@ cancelled の step が残る場合は `partial`(1 つも完了していなけれ
 - 最後の active admin は停止・削除・降格できない (409)。
 - admin は自分自身のアカウントを削除できない (409)。
 
-### CONTROL_API_KEYS からの移行
+### Legacy System について
 
-1. `CONTROL_ADMIN_USERNAME` / `CONTROL_ADMIN_PASSWORD` を設定して起動し管理者を作成。
-2. `/auth/login` で token を取得し、`/tokens` で SDK 用 API token を発行。
-3. 各 SDK / クライアントの `PROBE_API_KEY` を発行した token に置き換える。
-4. 移行完了後に `CONTROL_API_KEYS` を削除する。
+`Legacy System` は system 分離導入前のデータ互換のために残っているのみで、
+新規 trace の保存先として使われることはない。認証が無効(ブートストラップ
+前で管理者ユーザーが 0 人)の間だけ、匿名アクセスがこの system にフォール
+バックする。system-bound API token による送信は常に token に紐づいた
+system へ保存され、Legacy System には流れない。
 
 ## Docker での起動
 

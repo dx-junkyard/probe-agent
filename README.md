@@ -299,14 +299,16 @@ DashboardではControl Serverが`/repositories`配下から検出したGit Repos
 
 ## 認証と Dashboard のログイン方式
 
-現状の Dashboard にはブラウザ上のログイン画面はない。Dashboard は起動時に
-`DASHBOARD_API_KEY`（未設定時は `PROBE_API_KEY`）を読み、この token を
-`X-Api-Key` ヘッダーとして Control Server に送る。
+Dashboard はブラウザ上のログイン画面(`/login`)からユーザー名/パスワードで
+サインインする。ログインで得たセッション token は `Authorization: Bearer`
+ヘッダーとして Control Server に送られ、選択中 System は
+`X-Probe-System-Id` ヘッダーで指定する。admin ロールでログインすると
+User Management(ユーザーの作成・停止・削除)タブが表示される。
 
-admin 用のユーザー管理画面を表示するには、`DASHBOARD_API_KEY` に
-**admin ユーザーが発行した API token** を設定する必要がある。
-`CONTROL_API_KEYS` の固定キーは legacy key として認証されるため、admin
-ユーザーとは見なされず、User Management は表示されない。
+SDK / 監視対象アプリからの trace 送信はこのログインセッションとは別で、
+Dashboard の `Connect SDK` タブで発行する system-bound API token
+(`PROBE_API_KEY`)を使う。legacy な固定共有キー(`CONTROL_API_KEYS`)は
+廃止済みで、設定しても認証には使われない。
 
 ### 1. 初期 admin を設定して起動
 
@@ -327,41 +329,18 @@ docker compose up -d
 初回起動時に `CONTROL_ADMIN_USERNAME` / `CONTROL_ADMIN_PASSWORD` から
 admin ユーザーが作成される。既に DB volume が存在し、admin が作成されない
 場合は、必要に応じて `docker compose down -v` で DB を初期化してから起動する。
+管理者ユーザーが 1 人も存在しない間、Control Server は認証なし(MVP 互換
+モード)で動作する。これはブートストラップ前の一時的な状態であり、
+SDK 送信の通常導線ではない。
 
-### 2. admin でログインして API token を発行
+### 2. Dashboard にログインして SDK 用トークンを発行
 
-ホストから Control Server にログインする。
-
-```bash
-ADMIN_TOKEN=$(curl -sS -X POST http://localhost:8000/auth/login \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"admin-pass-"}' \
-  | sed -E 's/.*"access_token":"([^"]+)".*/\1/')
-```
-
-Dashboard 用の API token を発行する。
-
-```bash
-curl -sS -X POST http://localhost:8000/tokens \
-  -H "Authorization: Bearer ${ADMIN_TOKEN}" \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"dashboard-admin-token"}'
-```
-
-レスポンスの `token` を `.env` に設定する。
-
-```env
-DASHBOARD_API_KEY=<発行された token>
-```
-
-Dashboard コンテナを再作成する。
-
-```bash
-docker compose up -d --force-recreate dashboard
-```
-
-再読み込み後、Dashboard 上部に
-`User Management（管理者用：ユーザーの作成・停止・削除）` が表示される。
+ブラウザで Dashboard(`http://localhost:8501`)を開き、`CONTROL_ADMIN_USERNAME`
+/ `CONTROL_ADMIN_PASSWORD` でログインする。`Connect SDK` タブで対象 System
+用の API token を発行し、表示された値を監視対象アプリの `PROBE_API_KEY` に
+設定する。この token は発行時に一度だけ表示され、特定の System に恒久的に
+紐づく(送信側でのシステム指定は不要)。複数 System を扱う場合は System
+ごとに token を発行する。
 
 ## 環境変数
 
@@ -376,9 +355,7 @@ Docker Compose はリポジトリルートの `.env` を読み込む。ローカ
 | `PROBE_POLICY_TTL` | `10` | policy キャッシュ秒数 |
 | `PROBE_HTTP_TIMEOUT` | `2` | HTTP タイムアウト秒数 |
 | `PROBE_DB_PATH` | `./probe.db` | Control Server の SQLite ファイル |
-| `PROBE_API_KEY` | _(未設定)_ | SDK が送る API キー (`X-Api-Key` ヘッダー) |
-| `CONTROL_API_KEYS` | _(未設定)_ | Control Server が受け付ける API キー（カンマ区切り複数可）。未設定時は認証なし |
-| `DASHBOARD_API_KEY` | _(未設定)_ | Dashboard が Control Server に送る API キー |
+| `PROBE_API_KEY` | _(未設定)_ | SDK が送る、Dashboard 発行の system-bound API token (`X-Api-Key` ヘッダー) |
 | `PROBE_CLIENT_SERVER_URL` | _(未設定)_ | Dashboard の `Connect SDK` タブに表示するクライアント向け Control Server URL |
 | `PROBE_SDK_INSTALL_URL` | GitHub の `packages/python-probe` | Dashboard の `Connect SDK` タブに表示する SDK install URL |
 | `CONTROL_ADMIN_USERNAME` | _(未設定)_ | 起動時に作成する初期管理者ユーザー名 |

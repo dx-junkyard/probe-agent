@@ -127,15 +127,8 @@ def _resolve_token_system(
     conn, principal: Principal, requested_system_id: Optional[int]
 ) -> int:
     if requested_system_id is None:
-        if principal.is_admin:
-            row = conn.execute(
-                """
-                SELECT id FROM systems
-                WHERE name = 'Legacy System' AND owner_user_id IS NULL
-                """
-            ).fetchone()
-            if row is not None:
-                return row["id"]
+        # New tokens must bind to a system owned by the token's user, never
+        # silently to the Legacy System (Issue #167).
         row = conn.execute(
             "SELECT id FROM systems WHERE owner_user_id = ? ORDER BY id LIMIT 1",
             (principal.user_id,),

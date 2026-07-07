@@ -321,8 +321,8 @@ SETTINGS_METADATA: List[SettingMetadata] = [
             "with CONTROL_ADMIN_PASSWORD)."
         ),
         impact=(
-            "Without any user or CONTROL_API_KEYS, the server runs without "
-            "authentication (MVP compatibility mode)."
+            "Without any user, the server runs without authentication "
+            "(MVP compatibility mode)."
         ),
         remediation="Set CONTROL_ADMIN_USERNAME and CONTROL_ADMIN_PASSWORD, then restart once to bootstrap the admin.",
         validation_rule="Effective only together with CONTROL_ADMIN_PASSWORD.",
@@ -336,25 +336,11 @@ SETTINGS_METADATA: List[SettingMetadata] = [
         requiredness="conditional",
         description="Password for the bootstrap admin user. Stored only as a PBKDF2 hash.",
         impact=(
-            "Without any user or CONTROL_API_KEYS, the server runs without "
-            "authentication (MVP compatibility mode)."
+            "Without any user, the server runs without authentication "
+            "(MVP compatibility mode)."
         ),
         remediation="Set CONTROL_ADMIN_USERNAME and CONTROL_ADMIN_PASSWORD, then restart once to bootstrap the admin.",
         validation_rule="Effective only together with CONTROL_ADMIN_USERNAME.",
-        related_checks=["auth_scope"],
-        related_pages=["/admin"],
-    ),
-    SettingMetadata(
-        key="CONTROL_API_KEYS",
-        display_name="Legacy API keys",
-        category="auth",
-        requiredness="optional",
-        description=(
-            "Comma-separated legacy service API keys accepted as X-Api-Key. "
-            "Enables auth even when no user exists."
-        ),
-        impact="If empty and no user exists, anyone who can reach the server has full access.",
-        remediation="Set CONTROL_API_KEYS, or bootstrap an admin user instead.",
         related_checks=["auth_scope"],
         related_pages=["/admin"],
     ),

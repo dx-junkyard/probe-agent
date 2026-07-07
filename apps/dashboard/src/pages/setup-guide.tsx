@@ -397,27 +397,21 @@ curl -sS "$PROBE_SERVER_URL/health"   # => {"ok":true}`}</CodeBlock>
         <CardHeader>
           <CardTitle className="text-sm">認証トークンの設定</CardTitle>
           <CardDescription>
-            Control Server の認証状態に応じて、SDK / curl が送るトークンの扱いが変わります(3 パターン)。
+            Control Server の認証状態に応じて、SDK / curl が送るトークンの扱いが変わります。
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3 text-sm">
           <div className="rounded-md border p-3 space-y-1">
-            <div className="font-medium">1. 認証なしローカル開発</div>
+            <div className="font-medium">1. 認証なしローカル開発(ブートストラップ前のみ)</div>
             <p className="text-xs text-muted-foreground">
-              ユーザーも <code className="font-mono">CONTROL_API_KEYS</code> も未設定の場合、認証は無効です。
-              <code className="font-mono">PROBE_API_KEY</code> は不要で、trace は Legacy System に記録されます。
+              管理者ユーザーが 1 人も存在しない場合、認証は無効です。
+              <code className="font-mono">PROBE_API_KEY</code> は不要ですが、trace は system に紐づかない
+              <code className="font-mono">Legacy System</code> に記録されます。これは初回セットアップ前の
+              一時的な状態であり、通常運用の送信経路ではありません。まず管理者ユーザーを作成してください。
             </p>
           </div>
           <div className="rounded-md border p-3 space-y-1">
-            <div className="font-medium">2. legacy CONTROL_API_KEYS</div>
-            <p className="text-xs text-muted-foreground">
-              Control Server 側の <code className="font-mono">CONTROL_API_KEYS</code> に列挙した共有キーを、
-              対象アプリの <code className="font-mono">PROBE_API_KEY</code> に設定します。この場合も trace は
-              Legacy System に記録されます。システム別に分けたい場合は次の API トークンを使ってください。
-            </p>
-          </div>
-          <div className="rounded-md border p-3 space-y-1">
-            <div className="font-medium">3. 発行済み API トークン(推奨)</div>
+            <div className="font-medium">2. 発行済み API トークン(唯一の通常導線)</div>
             <p className="text-xs text-muted-foreground">
               <Link className="underline" to="/connect-sdk">Connect SDK ページ</Link> でシステムに紐づく
               トークンを発行し、<code className="font-mono">PROBE_API_KEY</code> に設定します。トークンは

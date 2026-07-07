@@ -114,7 +114,8 @@ The dashboard should support:
   developer picks their execution pattern from a finite set (host-direct /
   same Docker Compose project / add SDK to an existing image / external
   repository or compose project) and sees the env vars, compose snippets,
-  token setup (no-auth local, legacy `CONTROL_API_KEYS`, issued API token),
+  token setup (no-auth local bootstrap fallback, issued API token as the
+  only normal route; legacy `CONTROL_API_KEYS` is removed and not shown),
   patch-apply commands (`git apply --check` → `git apply` → tests → commit),
   a manual smoke-trace `curl` (component_id `probe-smoke-check`), and a
   failure-isolation section (missing config / auth failure / network
@@ -150,13 +151,16 @@ The dashboard should support:
 
 ## Authentication model
 
-- The session token from `/auth/login` lives in `st.session_state` only
-  (no persistent login in MVP) and is sent as `Authorization: Bearer`.
-- A session token takes precedence over `DASHBOARD_API_KEY` / `PROBE_API_KEY`;
-  the env keys remain as service/fallback credentials sent as `X-Api-Key`.
+- Dashboard users sign in on the browser `/login` page (`src/pages/login.tsx`);
+  the session token is kept client-side (`src/api/client.ts`) and sent as
+  `Authorization: Bearer`, with the selected system as `X-Probe-System-Id`.
+- SDK / monitored-app trace submission is unrelated to the login session: it
+  uses a system-bound API token issued from the Connect SDK tab
+  (`PROBE_API_KEY`, sent as `X-Api-Key`). `CONTROL_API_KEYS` (legacy fixed
+  shared-key auth) is removed and must not be presented as a normal
+  configuration option anywhere in the UI or docs.
 - Gate UI by `/auth/me`: the My Tokens tab needs a user principal, the
-  User Management tab needs role `admin`. Anonymous / legacy API key
-  callers see neither.
+  User Management tab needs role `admin`. Anonymous callers see neither.
 - Show the raw token only once, right after issuing it, together with a
   `PROBE_API_KEY=...` snippet.
 

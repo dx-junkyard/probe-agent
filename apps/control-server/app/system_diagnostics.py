@@ -446,7 +446,6 @@ def _check_database_storage() -> DiagnosticCheck:
 
 def _check_auth_scope(conn, system_id: int) -> DiagnosticCheck:
     users = conn.execute("SELECT COUNT(*) FROM users WHERE is_active = 1").fetchone()[0]
-    legacy_keys = bool(os.getenv("CONTROL_API_KEYS", "").strip())
     system_row = conn.execute(
         "SELECT id, name FROM systems WHERE id = ?", (system_id,)
     ).fetchone()
@@ -462,25 +461,24 @@ def _check_auth_scope(conn, system_id: int) -> DiagnosticCheck:
             remediation="ヘッダーで既存のシステムを選択するか、新しいシステムを作成してください。",
             fix_kind=FIX_KIND_DIALOG,
         )
-    if users == 0 and not legacy_keys:
+    if users == 0:
         return DiagnosticCheck(
             check_id="auth_scope",
             category="auth",
             title="認証とシステムスコープ",
             severity="warning",
             detail=(
-                "アクティブなユーザーがおらず CONTROL_API_KEYS も未設定です。"
+                "アクティブなユーザーがいません。"
                 "サーバーは認証なし（MVP 互換モード）で動作しています。"
             ),
             impact="Control Server に到達できる誰もが全アクセス権を持ちます。",
             remediation=(
                 "CONTROL_ADMIN_USERNAME / CONTROL_ADMIN_PASSWORD を設定して管理者"
-                "ユーザーを初期化するか、CONTROL_API_KEYS を設定してください。"
+                "ユーザーを初期化し、Dashboard から system-bound API token を発行してください。"
             ),
             related_env=[
                 "CONTROL_ADMIN_USERNAME",
                 "CONTROL_ADMIN_PASSWORD",
-                "CONTROL_API_KEYS",
             ],
             related_pages=[PAGE_ADMIN],
             fix_kind=FIX_KIND_DIALOG,
@@ -492,13 +490,11 @@ def _check_auth_scope(conn, system_id: int) -> DiagnosticCheck:
         severity="ok",
         detail=(
             f"選択中のシステム '{system_row['name']}' は存在します。"
-            f"アクティブユーザー {users} 名"
-            + ("、レガシー API キー設定済み" if legacy_keys else "")
-            + "。"
+            f"アクティブユーザー {users} 名。"
         ),
         impact="",
         remediation="",
-        related_env=["CONTROL_API_KEYS"],
+        related_env=[],
     )
 
 
