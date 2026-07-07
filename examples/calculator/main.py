@@ -3,11 +3,13 @@ Now supports advanced expression parsing (including parenthesis and multiple ope
 
 Run:
     $env:PROBE_SERVER_URL="http://localhost:8000"
-    python main.py
+    uvicorn main:app --reload
 """
 
 import sys
 import re
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 from probe_agent import probe, set_candidate
 from components import (
     add, add_v2,
@@ -15,6 +17,14 @@ from components import (
     multiply, multiply_v2,
     divide, divide_v2
 )
+
+app = FastAPI(title="Calculator API", description="API for advanced expression parsing", version="1.0.0")
+
+class CalculationRequest(BaseModel):
+    expression: str
+
+class CalculationResponse(BaseModel):
+    result: float
 
 # 新しい候補(V2)を登録。
 # これにより、PROBE_SERVER 側で shadow モードが有効になった際に比較が行われます。
@@ -131,6 +141,18 @@ def evaluate_expression(expression: str) -> float:
         raise ValueError("数式が入力されていません。")
     return evaluator.expr_eval()
 
+@app.post("/calculate", response_model=CalculationResponse)
+def calculate_api(request: CalculationRequest):
+    try:
+        res = evaluate_expression(request.expression)
+        return CalculationResponse(result=res)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ZeroDivisionError as e:
+        raise HTTPException(status_code=400, detail="0で割ることはできません。")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"エラーが発生しました: {e}")
+
 def run_interactive():
     print("--- 電卓アプリ (Interactive Mode) ---")
     print("複雑な数式（例: 256526-929+6565 や (2+3)*5）を計算できます。")
@@ -153,30 +175,15 @@ def run_interactive():
         except Exception as e:
             print(f"エラーが発生しました: {e}\n")
 
-def run_demo():
-    print("--- デモ実行 (Automated Mode) ---")
-    print("※ 対話モードを起動するには 'python main.py --interactive' を実行し、終了するには 'exit' と入力します。\n")
-    
-    demo_expressions = [
-        "10 + 5",
-        "256526 - 929 + 6565",      # 複数演算子のテスト
-        "2 * (3 + 4)",              # 括弧付き
-        "100 / 4 * 2",              # 優先順位（左から右）
-        "5 / 0"                     # ゼロ除算のテスト
-    ]
-    
-    for expr in demo_expressions:
-        print(f"数式: {expr}")
-        try:
-            res = evaluate_expression(expr)
-            print(f" -> 結果: {res}\n")
-        except Exception as e:
-            print(f" -> エラー (期待通り): {e}\n")
+def run_api():
+    import uvicorn
+    # Change port to 8080 to avoid conflicts if 8000 is used
+    uvicorn.run(app, host="0.0.0.0", port=8080)
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--interactive":
         run_interactive()
     else:
-        run_demo()
+        run_api()
         print("\n対話モードを実行するには、以下のように実行してください:")
         print("  python main.py --interactive")
