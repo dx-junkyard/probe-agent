@@ -49,6 +49,8 @@ from ..git_ops import (
     create_snapshot,
     discover_repository_candidates,
     read_file_at_commit,
+    resolve_head,
+    working_tree_status,
 )
 from ..llm import LLMConfig, LLMError, create_llm_client, is_reasoning_model
 from ..refresh_proposal import (
@@ -77,6 +79,8 @@ from ..models import (
     FlowGraphOut,
     FlowGraphRequest,
     FlowNodeOut,
+    FlowOverlayRequest,
+    FlowOverlayOut,
     ProbePlanFromFlowRequest,
     ProbePreviewOut,
     SourceMetadataOut,
@@ -98,6 +102,7 @@ from ..models import (
     FeatureCodeLinksOut,
     FeatureDraftOut,
     FeatureEvidence,
+    GitHubIssueStatusOut,
     IntelligenceRunOut,
     IssueDraftCreateRequest,
     IssueDraftOut,
@@ -112,6 +117,8 @@ from ..models import (
     ProbePointStatusUpdate,
     RepositoryCandidateOut,
     RepositoryConfigOut,
+    RepositoryStatusOut,
+    SnapshotRefOut,
     SystemUnderstandingOut,
     RepositoryConfigUpdate,
     SnapshotFileOut,
@@ -556,8 +563,70 @@ def list_issue_drafts_endpoint(
       probe_value: verify drafts are scoped to the calling system only.
     """
     from ..issue_drafts import list_drafts
+    from ..system_understanding_service import _get_latest_ready_snapshot
 
-    return [IssueDraftOut(**d) for d in list_drafts(system_id)]
+    with get_conn() as conn:
+        latest = _get_latest_ready_snapshot(conn, system_id)
+    latest_commit = latest["commit_sha"] if latest else None
+
+    return [
+        IssueDraftOut(**d, stale=_draft_is_stale(d, latest_commit))
+        for d in list_drafts(system_id)
+    ]
+
+
+def _draft_is_stale(draft: dict, latest_commit: Optional[str]) -> bool:
+    """A draft is stale when the analysis it was generated from is behind the
+    latest ready snapshot. If no snapshot exists yet, or the draft was created
+    without a commit, we cannot claim staleness (Issue #158)."""
+    if latest_commit is None:
+        return False
+    draft_commit = draft.get("commit_sha")
+    if not draft_commit:
+        return False
+    return draft_commit != latest_commit
+
+
+@router.get("/issue-drafts/github-status", response_model=GitHubIssueStatusOut)
+def github_issue_status_endpoint(
+    system_id: int = Depends(get_system_id),
+) -> GitHubIssueStatusOut:
+    """Whether draft -> GitHub issue creation is available (Issue #158).
+
+    Registered before `/issue-drafts/{draft_id}` so the literal "github-status"
+    segment isn't swallowed by that path parameter.
+
+    probe-agent:
+      role: API boundary reporting GitHub issue-creation availability
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [filesystem]
+      probe_value: verify availability is false (with a reason) whenever
+        GITHUB_TOKEN is unset or owner/repo cannot be determined, never a guess.
+    """
+    from ..github_integration import resolve_github_config
+
+    with get_conn() as conn:
+        config_row = conn.execute(
+            "SELECT * FROM repository_configs WHERE system_id = ?", (system_id,)
+        ).fetchone()
+    if config_row is None or not config_row["repo_path"]:
+        return GitHubIssueStatusOut(available=False, reason="Repository not configured.")
+
+    github_config = resolve_github_config(config_row["repo_path"])
+    if github_config is None:
+        return GitHubIssueStatusOut(
+            available=False,
+            reason=(
+                "GITHUB_TOKEN is not set, or the repository's owner/repo could "
+                "not be determined from its origin remote."
+            ),
+        )
+    return GitHubIssueStatusOut(
+        available=True, owner=github_config.owner, repo=github_config.repo
+    )
 
 
 @router.get("/issue-drafts/{draft_id}", response_model=IssueDraftOut)
@@ -577,11 +646,15 @@ def get_issue_draft_endpoint(
       probe_value: verify a draft owned by another system returns 404.
     """
     from ..issue_drafts import get_draft
+    from ..system_understanding_service import _get_latest_ready_snapshot
 
     draft = get_draft(system_id, draft_id)
     if draft is None:
         raise HTTPException(status_code=404, detail="Issue draft not found")
-    return IssueDraftOut(**draft)
+    with get_conn() as conn:
+        latest = _get_latest_ready_snapshot(conn, system_id)
+    latest_commit = latest["commit_sha"] if latest else None
+    return IssueDraftOut(**draft, stale=_draft_is_stale(draft, latest_commit))
 
 
 @router.patch("/issue-drafts/{draft_id}", response_model=IssueDraftOut)
@@ -620,6 +693,68 @@ def update_issue_draft_endpoint(
     if draft is None:
         raise HTTPException(status_code=404, detail="Issue draft not found")
     return IssueDraftOut(**draft)
+
+
+@router.post("/issue-drafts/{draft_id}/create-github-issue", response_model=IssueDraftOut)
+def create_github_issue_endpoint(
+    draft_id: int,
+    system_id: int = Depends(get_system_id),
+) -> IssueDraftOut:
+    """Create a GitHub issue from a draft and save its URL (Issue #158).
+
+    probe-agent:
+      role: API boundary creating the external GitHub issue for a draft
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: orchestration
+      state_effects: [database-write, network]
+      probe_value: verify a 422 when GitHub is unavailable, and that success
+        sets external_url/status without altering the draft's title/body.
+    """
+    from ..github_integration import (
+        GitHubIntegrationError,
+        create_github_issue,
+        resolve_github_config,
+    )
+    from ..issue_drafts import get_draft, update_draft
+
+    draft = get_draft(system_id, draft_id)
+    if draft is None:
+        raise HTTPException(status_code=404, detail="Issue draft not found")
+
+    with get_conn() as conn:
+        config_row = conn.execute(
+            "SELECT * FROM repository_configs WHERE system_id = ?", (system_id,)
+        ).fetchone()
+    if config_row is None or not config_row["repo_path"]:
+        raise HTTPException(status_code=422, detail="Repository not configured.")
+
+    github_config = resolve_github_config(config_row["repo_path"])
+    if github_config is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "GitHub issue creation is not available: GITHUB_TOKEN is not "
+                "set, or the repository owner/repo could not be determined."
+            ),
+        )
+
+    try:
+        html_url = create_github_issue(
+            github_config, draft["title"], draft["body_markdown"]
+        )
+    except GitHubIntegrationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    updated = update_draft(
+        system_id,
+        draft_id,
+        status="external_created",
+        external_url=html_url,
+        external_url_set=True,
+    )
+    return IssueDraftOut(**updated)
 
 
 def _build_out(job: dict) -> SystemUnderstandingBuildOut:
@@ -1042,6 +1177,135 @@ def list_snapshots(
             (system_id,),
         ).fetchall()
         return [_snapshot_out(conn, row) for row in rows]
+
+
+def _snapshot_ref(row) -> Optional[SnapshotRefOut]:
+    if row is None:
+        return None
+    return SnapshotRefOut(
+        id=row["id"],
+        commit_sha=row["commit_sha"],
+        status=row["status"],
+        created_at=row["created_at"],
+    )
+
+
+@router.get("/repository/status", response_model=RepositoryStatusOut)
+def repository_status(
+    system_id: int = Depends(get_system_id),
+) -> RepositoryStatusOut:
+    """Repository refresh-hub state for the current system (Issue #158).
+
+    Read-only: reads the configured repository's HEAD and working-tree status
+    with ``git rev-parse`` / ``git status`` and compares them to the latest
+    snapshot so the dashboard can show whether the analysis is stale and what to
+    do next. Never mutates the target repository (Principle 5); reading HEAD or a
+    dirty tree does not fetch, pull, or write anything.
+
+    probe-agent:
+      role: API boundary reporting repository/snapshot freshness for the refresh loop
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [database-read, filesystem]
+      probe_value: verify HEAD/dirty reads never mutate the repo and that
+        snapshot_stale reflects latest-snapshot-vs-HEAD divergence.
+    """
+    with get_conn() as conn:
+        config_row = conn.execute(
+            "SELECT * FROM repository_configs WHERE system_id = ?", (system_id,)
+        ).fetchone()
+        latest_row = conn.execute(
+            "SELECT * FROM repository_snapshots WHERE system_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (system_id,),
+        ).fetchone()
+        latest_ready = conn.execute(
+            "SELECT * FROM repository_snapshots WHERE system_id = ? AND status = 'ready' "
+            "ORDER BY id DESC LIMIT 1",
+            (system_id,),
+        ).fetchone()
+        indexed_row = _latest_indexed_ready_snapshot(conn, system_id)
+
+    from ..system_understanding_jobs import get_latest_job
+
+    understanding = get_latest_job(system_id)
+
+    if config_row is None or not config_row["repo_path"]:
+        return RepositoryStatusOut(
+            configured=False,
+            latest_snapshot=_snapshot_ref(latest_row),
+            latest_indexed_snapshot=_snapshot_ref(indexed_row),
+            understanding_snapshot_id=(understanding or {}).get("snapshot_id"),
+            understanding_status=(understanding or {}).get("status"),
+            next_actions=["Configure the target repository."],
+        )
+
+    repo_path = config_row["repo_path"]
+    current_head: Optional[str] = None
+    head_error: Optional[str] = None
+    working_tree_dirty: Optional[bool] = None
+    dirty_file_count = 0
+    dirty_sample: List[str] = []
+    try:
+        current_head = resolve_head(repo_path)
+        wt = working_tree_status(repo_path)
+        working_tree_dirty = not wt.clean
+        dirty_file_count = wt.dirty_file_count
+        dirty_sample = wt.sample
+    except GitError as exc:
+        head_error = str(exc)
+
+    # Stale when a ready snapshot exists whose commit differs from current HEAD,
+    # or no ready snapshot exists at all while HEAD is known.
+    ready_commit = latest_ready["commit_sha"] if latest_ready else None
+    snapshot_stale = bool(
+        current_head is not None
+        and (ready_commit is None or ready_commit != current_head)
+    )
+    symbols_stale = bool(
+        latest_ready is not None
+        and (indexed_row is None or indexed_row["id"] != latest_ready["id"])
+    )
+
+    next_actions: List[str] = []
+    if head_error:
+        next_actions.append(
+            "Repository HEAD could not be read; check the repository path."
+        )
+    if working_tree_dirty:
+        next_actions.append(
+            "Working tree is dirty; commit, stash, or revert before relying on "
+            "patch apply."
+        )
+    if snapshot_stale:
+        if ready_commit is None:
+            next_actions.append("Create a snapshot of the current HEAD.")
+        else:
+            next_actions.append(
+                "Repository HEAD changed; create a new snapshot before generating "
+                "new analysis or patches."
+            )
+    if symbols_stale and not snapshot_stale:
+        next_actions.append("Re-index symbols for the latest snapshot.")
+
+    return RepositoryStatusOut(
+        configured=True,
+        repo_path=repo_path,
+        current_head=current_head,
+        head_error=head_error,
+        working_tree_dirty=working_tree_dirty,
+        dirty_file_count=dirty_file_count,
+        dirty_sample=dirty_sample,
+        latest_snapshot=_snapshot_ref(latest_row),
+        latest_indexed_snapshot=_snapshot_ref(indexed_row),
+        understanding_snapshot_id=(understanding or {}).get("snapshot_id"),
+        understanding_status=(understanding or {}).get("status"),
+        snapshot_stale=snapshot_stale,
+        symbols_stale=symbols_stale,
+        next_actions=next_actions,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -5040,6 +5304,131 @@ def build_flow_graph_endpoint(
         _raise_entrypoint_not_found(payload.entrypoint_id, llm_eps)
     _overlay_runtime(system_id, graph)
     return _flow_graph_out(system_id, graph)
+
+
+def _resolve_lineage_steps(conn, system_id: int, selection) -> list:
+    """Resolve a lineage selection into ordered trace steps (Issue #151).
+
+    Returns rows with trace_id / component_id / span_id / parent_span_id /
+    timestamp. Deterministic; entity/correlation/flow/analyzer only.
+    """
+    kind = selection.kind
+    if kind == "analyzer":
+        row = conn.execute(
+            "SELECT spec_json FROM trace_analyzers WHERE id = ? AND system_id = ?",
+            (selection.analyzer_id, system_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, "analyzer not found")
+        try:
+            spec = json.loads(row["spec_json"]) if row["spec_json"] else {}
+        except json.JSONDecodeError:
+            spec = {}
+        ent = (spec.get("filter") or {}).get("entity")
+        if not ent:
+            raise HTTPException(
+                422, "analyzer has no entity filter to drive a flow overlay"
+            )
+        selection = selection.model_copy(update={
+            "kind": "entity", "entity_type": ent["type"], "entity_id": ent["id"],
+        })
+        kind = "entity"
+
+    if kind == "entity":
+        if not selection.entity_type or not selection.entity_id:
+            raise HTTPException(422, "entity_type and entity_id are required")
+        trace_ids = [
+            r["trace_id"]
+            for r in conn.execute(
+                "SELECT DISTINCT trace_id FROM trace_entities "
+                "WHERE system_id = ? AND entity_type = ? AND entity_id = ?",
+                (system_id, selection.entity_type, selection.entity_id),
+            ).fetchall()
+        ]
+    elif kind == "correlation":
+        if not selection.correlation_id:
+            raise HTTPException(422, "correlation_id is required")
+        trace_ids = [
+            r["trace_id"]
+            for r in conn.execute(
+                "SELECT trace_id FROM trace_spans WHERE system_id = ? AND correlation_id = ?",
+                (system_id, selection.correlation_id),
+            ).fetchall()
+        ]
+    else:  # flow
+        if not selection.flow_id:
+            raise HTTPException(422, "flow_id is required")
+        trace_ids = [
+            r["trace_id"]
+            for r in conn.execute(
+                "SELECT trace_id FROM trace_spans WHERE system_id = ? AND flow_id = ?",
+                (system_id, selection.flow_id),
+            ).fetchall()
+        ]
+
+    steps = []
+    for tid in trace_ids:
+        trow = conn.execute(
+            "SELECT component_id, timestamp FROM traces WHERE system_id = ? AND trace_id = ?",
+            (system_id, tid),
+        ).fetchone()
+        srow = conn.execute(
+            "SELECT span_id, parent_span_id FROM trace_spans "
+            "WHERE system_id = ? AND trace_id = ?",
+            (system_id, tid),
+        ).fetchone()
+        if trow is None:
+            continue
+        steps.append({
+            "trace_id": tid,
+            "component_id": trow["component_id"],
+            "timestamp": trow["timestamp"],
+            "span_id": srow["span_id"] if srow else None,
+            "parent_span_id": srow["parent_span_id"] if srow else None,
+        })
+    steps.sort(key=lambda s: (s["timestamp"], s["trace_id"]))
+    return steps
+
+
+@router.post("/repository/flow-overlay", response_model=FlowOverlayOut)
+def flow_runtime_overlay(
+    payload: FlowOverlayRequest, system_id: int = Depends(get_system_id)
+) -> FlowOverlayOut:
+    """Overlay runtime lineage onto a static flow graph (Issue #151).
+
+    Matching is by component_id exact equality only (a finite structural
+    check); nodes without a component_id are 'not observable'. Runtime
+    transitions absent from the static graph are reported as divergences. No
+    interpretation of why they diverge.
+    """
+    from ..entrypoint_discovery import discover_entrypoints
+    from ..flow_graph import build_flow_graph
+
+    snapshot_row, symbols, files = _load_flow_inputs(
+        system_id, payload.snapshot_id, payload.commit_sha,
+    )
+    llm_eps = _load_persisted_api_entrypoints(system_id, snapshot_row["id"])
+    discovery = discover_entrypoints(symbols, files, persisted_api=llm_eps)
+    graph = build_flow_graph(
+        symbols=symbols,
+        files=files,
+        snapshot_id=snapshot_row["id"],
+        commit_sha=snapshot_row["commit_sha"],
+        entrypoint_type=payload.entrypoint_type,
+        entrypoint_id=payload.entrypoint_id,
+        max_depth=payload.max_depth,
+        max_nodes=payload.max_nodes,
+        entrypoints=discovery.entrypoints + discovery.functions,
+    )
+    if graph is None:
+        _raise_entrypoint_not_found(payload.entrypoint_id, llm_eps)
+
+    from ..flow_overlay import compute_overlay
+
+    with get_conn() as conn:
+        steps = _resolve_lineage_steps(conn, system_id, payload.selection)
+
+    return compute_overlay(graph, steps, payload.selection.model_dump(exclude_none=True))
 
 
 def _raise_entrypoint_not_found(entrypoint_id: str, llm_eps) -> None:

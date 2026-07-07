@@ -12,6 +12,8 @@ import {
   useCreateIssueDraft,
   useUpdateIssueDraft,
   useIssueDraft,
+  useGitHubIssueStatus,
+  useCreateGitHubIssue,
   sysKey,
 } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
@@ -439,10 +441,23 @@ function IssueDraftDialog({ draftId, onClose }: { draftId: number | null; onClos
 
 function IssueDraftEditor({ draft }: { draft: IssueDraft }) {
   const update = useUpdateIssueDraft();
+  const githubStatus = useGitHubIssueStatus();
+  const createGithubIssue = useCreateGitHubIssue();
   const [title, setTitle] = useState(draft.title);
   const [body, setBody] = useState(draft.body_markdown);
   const [status, setStatus] = useState<IssueDraftStatus>(draft.status);
   const [externalUrl, setExternalUrl] = useState(draft.external_url ?? "");
+
+  const createOnGithub = () => {
+    createGithubIssue.mutate(draft.id, {
+      onSuccess: (updated) => {
+        setExternalUrl(updated.external_url ?? "");
+        setStatus(updated.status);
+        toast.success("GitHub issue created");
+      },
+      onError: (e: unknown) => toast.error(e instanceof Error ? e.message : "Could not create GitHub issue"),
+    });
+  };
 
   const saveContent = () => {
     update.mutate(
@@ -469,6 +484,22 @@ function IssueDraftEditor({ draft }: { draft: IssueDraft }) {
 
   return (
         <div className="space-y-4" data-testid="issue-draft-dialog">
+          {/* Issue #158: show which snapshot/commit the draft was generated from
+              and whether that analysis is now stale relative to the latest snapshot. */}
+          <div className="rounded-md border px-3 py-2 text-xs text-muted-foreground" data-testid="issue-draft-provenance">
+            Generated from{" "}
+            {draft.snapshot_id != null ? <>snapshot #{draft.snapshot_id}</> : "an unknown snapshot"}
+            {draft.commit_sha ? <> at <code className="font-mono">{draft.commit_sha.slice(0, 8)}</code></> : null}.
+            {draft.stale && (
+              <span
+                className="ml-1 font-medium text-amber-700 dark:text-amber-400"
+                data-testid="issue-draft-stale"
+              >
+                {" "}The repository has a newer snapshot — this draft may be stale. Refresh
+                System Understanding and regenerate the draft before creating a new issue.
+              </span>
+            )}
+          </div>
           <div className="space-y-1.5">
             <Label htmlFor="issue-draft-title">Title</Label>
             <Input
@@ -521,10 +552,29 @@ function IssueDraftEditor({ draft }: { draft: IssueDraft }) {
           </div>
           <div className="space-y-1.5 border-t pt-4">
             <Label htmlFor="issue-draft-url">External issue URL</Label>
-            <p className="text-xs text-muted-foreground">
-              Create the issue in your tracker (GitHub, GitLab, Jira, ...), then paste its URL here.
-              probe-agent does not create or sync the issue.
-            </p>
+            {githubStatus.data?.available ? (
+              <div className="flex items-center justify-between gap-2 rounded-md border px-3 py-2" data-testid="issue-draft-github-available">
+                <p className="text-xs text-muted-foreground">
+                  GitHub is configured for{" "}
+                  <code className="font-mono">{githubStatus.data.owner}/{githubStatus.data.repo}</code>.
+                  Create the issue directly, or paste an existing tracker URL below.
+                </p>
+                <Button
+                  size="sm"
+                  className="h-7 text-xs shrink-0"
+                  onClick={createOnGithub}
+                  disabled={createGithubIssue.isPending}
+                  data-testid="issue-draft-create-github"
+                >
+                  Create GitHub issue
+                </Button>
+              </div>
+            ) : (
+              <p className="text-xs text-muted-foreground" data-testid="issue-draft-github-unavailable">
+                Create the issue in your tracker (GitHub, GitLab, Jira, ...), then paste its URL here.
+                {githubStatus.data?.reason ? ` (${githubStatus.data.reason})` : ""}
+              </p>
+            )}
             <div className="flex gap-2">
               <Input
                 id="issue-draft-url"

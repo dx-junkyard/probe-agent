@@ -115,6 +115,145 @@ CREATE INDEX IF NOT EXISTS idx_shadow_component_ts
 CREATE INDEX IF NOT EXISTS idx_shadow_trace
     ON shadow_results (system_id, trace_id);
 
+-- Trace lineage (Issue #145, Phase 1). Optional correlation metadata is kept
+-- out of traces.input_json in dedicated, indexed tables. Backward compatible:
+-- traces without lineage simply have no rows here.
+CREATE TABLE IF NOT EXISTS trace_spans (
+    system_id      INTEGER NOT NULL,
+    trace_id       TEXT NOT NULL,
+    component_id   TEXT NOT NULL,
+    span_id        TEXT,
+    parent_span_id TEXT,
+    flow_id        TEXT,
+    correlation_id TEXT,
+    timestamp      REAL NOT NULL,
+    PRIMARY KEY (system_id, trace_id),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_trace_spans_correlation
+    ON trace_spans (system_id, correlation_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_trace_spans_flow
+    ON trace_spans (system_id, flow_id, timestamp);
+
+CREATE TABLE IF NOT EXISTS trace_entities (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id    INTEGER NOT NULL,
+    trace_id     TEXT NOT NULL,
+    component_id TEXT NOT NULL,
+    entity_type  TEXT NOT NULL,
+    entity_id    TEXT NOT NULL,
+    role         TEXT NOT NULL DEFAULT 'related',
+    timestamp    REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_trace_entities_lookup
+    ON trace_entities (system_id, entity_type, entity_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_trace_entities_trace
+    ON trace_entities (system_id, trace_id);
+
+-- Declarative projections (Issue #146, Phase 2). Stores only the bounded,
+-- structured slice produced by a projection spec — never the raw payload.
+-- phase is 'input' | 'output' here; 'shadow_current' / 'shadow_candidate'
+-- are added by Issue #150 (Phase 5).
+CREATE TABLE IF NOT EXISTS trace_projections (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id       INTEGER NOT NULL,
+    trace_id        TEXT NOT NULL,
+    component_id    TEXT NOT NULL,
+    projection_name TEXT NOT NULL,
+    phase           TEXT NOT NULL,
+    data_json       TEXT NOT NULL,
+    data_hash       TEXT,
+    truncated       INTEGER NOT NULL DEFAULT 0,
+    extract_error   TEXT,
+    created_at      REAL NOT NULL,
+    UNIQUE (system_id, trace_id, component_id, projection_name, phase),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_trace_projections_trace
+    ON trace_projections (system_id, trace_id);
+CREATE INDEX IF NOT EXISTS idx_trace_projections_component
+    ON trace_projections (system_id, component_id, created_at DESC);
+
+-- Trace analyzers (Issue #148, Phase 4a). Saved, reviewable, read-only views
+-- over trace_projections. LLM-proposal columns (provider/model/prompt_version/
+-- schema_version) are written by Issue #149; the table (audit contract) is
+-- owned here.
+CREATE TABLE IF NOT EXISTS trace_analyzers (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id       INTEGER NOT NULL,
+    name            TEXT NOT NULL DEFAULT '',
+    intent          TEXT NOT NULL DEFAULT '',
+    spec_json       TEXT NOT NULL,
+    source          TEXT NOT NULL DEFAULT 'trace_projections',
+    review_status   TEXT NOT NULL DEFAULT 'proposed',
+    decision_method TEXT NOT NULL DEFAULT 'manual',
+    provider        TEXT,
+    model           TEXT,
+    prompt_version  TEXT,
+    schema_version  TEXT,
+    is_mock         INTEGER NOT NULL DEFAULT 0,
+    -- The human review decision is its own audit record (Principle 7):
+    -- decision_method above describes who AUTHORED the spec (manual /
+    -- reasoning_llm); review_decision_method records that the approve/reject
+    -- decision was made by a human ('manual'), never by the LLM.
+    reviewed_at            REAL,
+    review_decision_method TEXT,
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_trace_analyzers_system
+    ON trace_analyzers (system_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS trace_analysis_runs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id     INTEGER NOT NULL,
+    analyzer_id   INTEGER NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending',
+    result_json   TEXT,
+    error_details TEXT,
+    row_count     INTEGER,
+    started_at    REAL NOT NULL,
+    completed_at  REAL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (analyzer_id) REFERENCES trace_analyzers (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_trace_analysis_runs_analyzer
+    ON trace_analysis_runs (system_id, analyzer_id, id DESC);
+
+-- Retention policies + audit (Issue #152). Explicit, per-target settings for
+-- lineage/projection/analyzer-run data. Default behaviour with no rows is
+-- "never delete". target_table is one of trace_spans / trace_entities /
+-- trace_projections / trace_analysis_runs.
+CREATE TABLE IF NOT EXISTS retention_policies (
+    system_id    INTEGER NOT NULL,
+    target_table TEXT NOT NULL,
+    max_age_days REAL,
+    max_count    INTEGER,
+    updated_at   REAL NOT NULL,
+    PRIMARY KEY (system_id, target_table),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS retention_audit (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id     INTEGER NOT NULL,
+    target_table  TEXT NOT NULL,
+    deleted_count INTEGER NOT NULL,
+    reason        TEXT NOT NULL,
+    executed_at   REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_retention_audit_system
+    ON retention_audit (system_id, id DESC);
+
 CREATE TABLE IF NOT EXISTS system_profile (
     system_id         INTEGER PRIMARY KEY,
     name              TEXT,
@@ -257,7 +396,9 @@ CREATE INDEX IF NOT EXISTS idx_snapshot_files_snapshot
 CREATE TABLE IF NOT EXISTS intelligence_runs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     system_id       INTEGER NOT NULL,
-    snapshot_id     INTEGER NOT NULL,
+    -- Nullable since Issue #149: reasoning runs that are not tied to a
+    -- repository snapshot (e.g. analyzer proposals over runtime traces).
+    snapshot_id     INTEGER,
     run_type        TEXT NOT NULL,
     provider        TEXT NOT NULL,
     model           TEXT NOT NULL,
@@ -1507,10 +1648,78 @@ def _migrate_to_system_scope(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA foreign_keys=ON")
 
 
+def _migrate_intelligence_runs_snapshot_nullable(conn: sqlite3.Connection) -> None:
+    """Relax intelligence_runs.snapshot_id to nullable on pre-existing DBs
+    (Issue #149). Fresh DBs already get the nullable column from SCHEMA.
+
+    Uses the safe SQLite table-rebuild with legacy_alter_table so child FK
+    references to intelligence_runs are not rewritten during the rename.
+    """
+    info = conn.execute("PRAGMA table_info(intelligence_runs)").fetchall()
+    snap = next((c for c in info if c["name"] == "snapshot_id"), None)
+    if snap is None or snap["notnull"] == 0:
+        return  # already nullable (or table missing)
+
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("PRAGMA legacy_alter_table=ON")
+    try:
+        conn.execute("ALTER TABLE intelligence_runs RENAME TO _intelligence_runs_old")
+        conn.execute(
+            """
+            CREATE TABLE intelligence_runs (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                system_id       INTEGER NOT NULL,
+                snapshot_id     INTEGER,
+                run_type        TEXT NOT NULL,
+                provider        TEXT NOT NULL,
+                model           TEXT NOT NULL,
+                prompt_version  TEXT NOT NULL,
+                schema_version  TEXT NOT NULL,
+                decision_method TEXT NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                error_details   TEXT,
+                is_mock         INTEGER NOT NULL DEFAULT 0,
+                started_at      REAL NOT NULL,
+                completed_at    REAL,
+                FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+                FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO intelligence_runs
+                (id, system_id, snapshot_id, run_type, provider, model,
+                 prompt_version, schema_version, decision_method, status,
+                 error_details, is_mock, started_at, completed_at)
+            SELECT id, system_id, snapshot_id, run_type, provider, model,
+                   prompt_version, schema_version, decision_method, status,
+                   error_details, is_mock, started_at, completed_at
+            FROM _intelligence_runs_old
+            """
+        )
+        conn.execute("DROP TABLE _intelligence_runs_old")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_intelligence_runs_system "
+            "ON intelligence_runs (system_id, id DESC)"
+        )
+    finally:
+        conn.execute("PRAGMA legacy_alter_table=OFF")
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
 def init_db() -> None:
     with get_conn() as conn:
         _migrate_to_system_scope(conn)
         conn.executescript(SCHEMA)
+        _migrate_intelligence_runs_snapshot_nullable(conn)
+        ta_cols = _columns(conn, "trace_analyzers")
+        if "reviewed_at" not in ta_cols:
+            conn.execute("ALTER TABLE trace_analyzers ADD COLUMN reviewed_at REAL")
+        if "review_decision_method" not in ta_cols:
+            conn.execute(
+                "ALTER TABLE trace_analyzers ADD COLUMN review_decision_method TEXT"
+            )
         if "content" not in _columns(conn, "snapshot_files"):
             conn.execute(
                 "ALTER TABLE snapshot_files ADD COLUMN content BLOB NOT NULL DEFAULT X''"

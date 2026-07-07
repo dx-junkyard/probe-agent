@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://probe-agent.dev/schemas/trace_analyzer_spec.json",
+  "title": "TraceAnalyzerSpec",
+  "description": "Declarative, read-only analyzer over saved trace projections (Issue #148). Deterministic: reuses the finite path grammar of projection_spec. The 'compare' section is a contract only in Phase 4a; its execution arrives in Phase 5 (#150).",
+  "type": "object",
+  "required": ["source", "select"],
+  "additionalProperties": false,
+  "properties": {
+    "source": {
+      "type": "string",
+      "description": "Data source. Only 'trace_projections' is supported in Phase 4a.",
+      "enum": ["trace_projections"]
+    },
+    "filter": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "entity": {
+          "type": "object",
+          "required": ["type", "id"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "type": "string", "minLength": 1 },
+            "id": { "type": "string", "minLength": 1 }
+          }
+        },
+        "components": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "projection_name": { "type": "string", "minLength": 1 },
+        "phases": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["input", "output", "shadow_current", "shadow_candidate"] }
+        },
+        "time_window": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "start": { "type": "number" },
+            "end": { "type": "number" }
+          }
+        }
+      }
+    },
+    "select": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "path"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "path": { "$ref": "#/$defs/path" }
+        }
+      }
+    },
+    "group_by": {
+      "type": "array",
+      "description": "Names from 'select' to group rows by.",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "order_by": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "dir": { "type": "string", "enum": ["asc", "desc"] }
+        }
+      }
+    },
+    "compare": {
+      "type": "object",
+      "description": "Shadow-diff definition. Contract only in Phase 4a; executed in Phase 5 (#150).",
+      "required": ["phases", "fields"],
+      "additionalProperties": false,
+      "properties": {
+        "phases": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "type": "string", "enum": ["input", "output", "shadow_current", "shadow_candidate"] }
+        },
+        "fields": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "entity_type": { "type": "string", "minLength": 1 }
+      }
+    }
+  },
+  "$defs": {
+    "path": {
+      "type": "string",
+      "pattern": "^\\$(\\.[A-Za-z0-9_\\-]+|\\[[0-9]+\\]|\\[\\*\\])*$"
+    }
+  }
+}

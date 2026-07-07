@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://probe-agent.dev/schemas/projection_spec.json",
+  "title": "ProjectionSpec",
+  "description": "Declarative, deterministic projection for a probe point (Issue #146). Extracts a bounded, structured slice of input/output payloads without storing the raw payload. No arbitrary code execution: only the finite path grammar and operation set below.",
+  "type": "object",
+  "required": ["name"],
+  "additionalProperties": false,
+  "properties": {
+    "name": { "type": "string", "minLength": 1 },
+    "input":  { "$ref": "#/$defs/section" },
+    "output": { "$ref": "#/$defs/section" },
+    "entities": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/entityRef" }
+    },
+    "redact": {
+      "type": "array",
+      "description": "Paths whose values are replaced with a placeholder before saving.",
+      "items": { "$ref": "#/$defs/path" }
+    }
+  },
+  "$defs": {
+    "path": {
+      "type": "string",
+      "description": "Path expression: '$' root, '.key' object/dict access, '[i]' list index, '[*]' wildcard. e.g. $.order.id, $.items[*].sku, $.items[0]",
+      "pattern": "^\\$(\\.[A-Za-z0-9_\\-]+|\\[[0-9]+\\]|\\[\\*\\])*$"
+    },
+    "section": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "fields":  { "type": "object", "additionalProperties": { "$ref": "#/$defs/path" } },
+        "metrics": { "type": "object", "additionalProperties": { "$ref": "#/$defs/metric" } },
+        "samples": { "type": "object", "additionalProperties": { "$ref": "#/$defs/sample" } }
+      }
+    },
+    "metric": {
+      "type": "object",
+      "required": ["op", "path"],
+      "additionalProperties": false,
+      "properties": {
+        "op": { "type": "string", "enum": ["len", "count", "exists", "sha256"] },
+        "path": { "$ref": "#/$defs/path" }
+      }
+    },
+    "sample": {
+      "type": "object",
+      "required": ["path"],
+      "additionalProperties": false,
+      "properties": {
+        "path": { "$ref": "#/$defs/path" },
+        "limit": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "entityRef": {
+      "type": "object",
+      "required": ["type", "id_path"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "type": "string", "minLength": 1 },
+        "id_path": { "$ref": "#/$defs/path" },
+        "phase": { "type": "string", "enum": ["input", "output"] },
+        "role": { "type": "string", "enum": ["source", "derived", "related"] }
+      }
+    }
+  }
+}

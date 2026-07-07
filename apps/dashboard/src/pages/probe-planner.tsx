@@ -1,7 +1,7 @@
 import {
   useProbePlans, useGenerateProbePlan, useUpdateProbePointStatus,
   useProbePatches, useGeneratePatch, useValidatePatch, useApplyProbePatch,
-  useLatestDrafts, useWorkspaceProposalDraft,
+  useLatestDrafts, useWorkspaceProposalDraft, useRepositoryStatus,
 } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -31,6 +31,7 @@ export default function ProbePlannerPage() {
   const generatePlan = useGenerateProbePlan();
   const updatePointStatus = useUpdateProbePointStatus();
   const { data: patches } = useProbePatches();
+  const { data: repoStatus } = useRepositoryStatus();
   const generatePatch = useGeneratePatch();
   const validatePatch = useValidatePatch();
   const applyPatch = useApplyProbePatch();
@@ -189,7 +190,14 @@ export default function ProbePlannerPage() {
                                 <Badge variant={patch.apply_status === "applied" ? "success" : patch.status === "failed" ? "destructive" : "secondary"}>
                                   {patch.apply_status === "applied" ? "applied" : patch.status}
                                 </Badge>
-                                <span className="font-mono text-xs">{patch.commit_sha?.slice(0, 8)}</span>
+                                <span className="font-mono text-xs" title="Generated for this commit">
+                                  {patch.commit_sha?.slice(0, 8)}
+                                </span>
+                                {repoStatus?.current_head
+                                  && repoStatus.current_head !== patch.commit_sha
+                                  && patch.apply_status !== "applied" && (
+                                  <Badge variant="destructive" data-testid="patch-stale-badge">HEAD changed</Badge>
+                                )}
                               </div>
                               <div className="flex gap-1">
                                 <Button
@@ -236,10 +244,19 @@ export default function ProbePlannerPage() {
                               </pre>
                             )}
                             {patch.apply_status === "applied" && (
-                              <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/20 dark:text-emerald-200">
-                                Applied to the repository working tree. Review and commit the changes before creating a new snapshot.
+                              <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/20 dark:text-emerald-200 space-y-1">
+                                <div className="font-medium">Applied to the repository working tree (no commit created).</div>
+                                <ol className="list-decimal pl-4 space-y-0.5">
+                                  <li>Review the patched files and run tests.</li>
+                                  <li>Commit the changes in the repository.</li>
+                                  <li>
+                                    Create a new snapshot and rebuild analysis from the{" "}
+                                    <Link to="/repository" className="underline">Repository Refresh Hub</Link>.
+                                  </li>
+                                </ol>
                               </div>
                             )}
+                            <PatchRecovery patch={patch} currentHead={repoStatus?.current_head ?? null} />
                             {patch.apply_error && (
                               <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800 dark:border-red-800 dark:bg-red-950/20 dark:text-red-200">
                                 Apply failed: {patch.apply_error}
@@ -386,6 +403,52 @@ export default function ProbePlannerPage() {
           </div>
         )}
       </Dialog>
+    </div>
+  );
+}
+
+// Patch apply recovery guidance (Issue #158). When HEAD moved past the commit a
+// patch was generated for, or an apply failed, show the safe read-only commands
+// and next actions instead of leaving the user stuck. Nothing here runs git —
+// destructive/remote operations stay manual and explicit.
+function PatchRecovery({ patch, currentHead }: { patch: ProbePatchOut; currentHead: string | null }) {
+  const headChanged = !!currentHead && currentHead !== patch.commit_sha && patch.apply_status !== "applied";
+  const applyConflict = !!patch.apply_error;
+  if (!headChanged && !applyConflict) return null;
+
+  const patchFile = `probe-patch-${patch.id}.diff`;
+  return (
+    <div
+      className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950/20 dark:text-amber-200 space-y-2"
+      data-testid="patch-recovery"
+    >
+      {headChanged && (
+        <div>
+          <div className="font-medium">Repository HEAD changed since this patch was generated.</div>
+          <div>
+            This patch was generated for <code>{patch.commit_sha?.slice(0, 8)}</code>; HEAD is now{" "}
+            <code>{currentHead?.slice(0, 8)}</code>. It cannot be applied after HEAD changed. Create a
+            new snapshot, rebuild the plan, and regenerate the patch from the{" "}
+            <Link to="/repository" className="underline">Repository Refresh Hub</Link>.
+          </div>
+        </div>
+      )}
+      {applyConflict && (
+        <div>
+          <div className="font-medium">Apply the patch manually:</div>
+          <ol className="list-decimal pl-4 space-y-0.5">
+            <li>Download the patch, then check it before applying.</li>
+            <li>If <code>git apply --check</code> fails on a dirty tree, commit / stash / revert first.</li>
+            <li>If the conflict cannot be resolved, recreate the plan from the latest snapshot.</li>
+          </ol>
+        </div>
+      )}
+      <pre className="rounded bg-muted/70 p-2 overflow-x-auto text-[11px] leading-5">{[
+        "git status --short",
+        "git rev-parse HEAD",
+        `git apply --check ${patchFile}`,
+        `git apply ${patchFile}`,
+      ].join("\n")}</pre>
     </div>
   );
 }

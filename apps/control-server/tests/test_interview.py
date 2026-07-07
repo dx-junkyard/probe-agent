@@ -934,11 +934,15 @@ def test_proposal_provenance_fields_persisted(admin_client):
 # --- Issue #123: zero-base confirmation gate + open-question consumption -----
 
 
-def _stub_reasoning_turn(monkeypatch, *, proposals=None, next_questions=None):
+def _stub_reasoning_turn(
+    monkeypatch, *, proposals=None, next_questions=None, captured=None,
+):
     """Stub the route-level reasoning turn with a successful result.
 
     Only the LLM call is stubbed; persistence, gating, and question
-    consumption run through the real route code.
+    consumption run through the real route code. When ``captured`` (a dict)
+    is supplied, the keyword arguments the route passes to the reasoning
+    turn are recorded into it for assertions.
     """
     from app.routes import interview as interview_routes
     from app.interview_agent import EvidenceSelectionResult, InterviewTurnResult
@@ -959,6 +963,9 @@ def _stub_reasoning_turn(monkeypatch, *, proposals=None, next_questions=None):
     def fake_generate_interview_turn(
         client, config, *, context_pack, history, user_message, **kwargs
     ):
+        if captured is not None:
+            captured.update(kwargs)
+            captured["user_message"] = user_message
         return InterviewTurnResult(
             provider="anthropic",
             model="claude-sonnet-4-5",
@@ -1095,6 +1102,111 @@ def test_proposals_stay_gated_without_understanding_or_confirmation(
 
     detail = admin_client.get(f"/interview/sessions/{sid}", headers=headers).json()
     assert detail["proposals"] == []
+
+
+# --- Empty-proposal narrowing (proposals_requested contract) -----------------
+
+
+def test_requested_turn_with_zero_proposals_reports_narrowing(
+    admin_client, monkeypatch
+):
+    """A generate_proposals turn that yields no proposals is a narrowing
+    turn: proposals_requested is reported, the model was told about the
+    request, and the narrowing question is persisted for the dashboard."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "narrowing"},
+        headers=headers,
+    ).json()
+    sid = session["id"]
+    _confirm_and_reach_proposal_generation(admin_client, sid, headers)
+
+    captured: dict = {}
+    _stub_reasoning_turn(
+        monkeypatch,
+        next_questions=["対象は要約フローで正しいですか?"],
+        captured=captured,
+    )
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/dialogue-turn",
+        json={"user_message": "提案を生成してください", "generate_proposals": True},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["error"] is None
+    assert body["proposals"] == []
+    assert body["proposals_requested"] is True
+    assert [q["question_text"] for q in body["next_questions"]] == [
+        "対象は要約フローで正しいですか?"
+    ]
+    # The route told the reasoning model that proposals were requested
+    # (prompt interview-v6 contract: propose or keep narrowing).
+    assert captured["proposals_requested"] is True
+    # The narrowing question is persisted so the dashboard can re-surface it
+    # in ready_for_proposals and consume it on the next turn.
+    texts = [q["question"] for q in body["open_questions_structured"]]
+    assert "対象は要約フローで正しいですか?" in texts
+    # Narrowing is a valid turn, not a failure.
+    assert body["intelligence_run"]["status"] == "completed"
+
+
+def test_gated_turn_does_not_request_proposals_from_model(
+    admin_client, monkeypatch
+):
+    """With the understanding gate closed, generate_proposals never reaches
+    the reasoning model as a request, and the response reports it."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "gated request"},
+        headers=headers,
+    ).json()
+    sid = session["id"]
+    _advance_to_proposal_generation(admin_client, sid, headers)
+
+    captured: dict = {}
+    _stub_reasoning_turn(
+        monkeypatch, proposals=[_stub_proposal_result()], captured=captured
+    )
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/dialogue-turn",
+        json={"user_message": "提案を生成してください", "generate_proposals": True},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert captured["proposals_requested"] is False
+    assert body["proposals_requested"] is False
+    assert body["proposals"] == []
+
+
+def test_plain_turn_reports_proposals_not_requested(admin_client, monkeypatch):
+    """Even with the gate open, a turn without generate_proposals is an
+    ordinary conversation turn."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "plain turn"},
+        headers=headers,
+    ).json()
+    sid = session["id"]
+    _confirm_and_reach_proposal_generation(admin_client, sid, headers)
+
+    captured: dict = {}
+    _stub_reasoning_turn(monkeypatch, captured=captured)
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/dialogue-turn",
+        json={"user_message": "補足です: 精度を重視したい"},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    assert captured["proposals_requested"] is False
+    assert r.json()["proposals_requested"] is False
 
 
 def test_dialogue_turn_consumes_answered_question(admin_client, monkeypatch):

@@ -4,8 +4,8 @@ Static, LLM-free health checks for required configuration: environment
 variables, filesystem paths and permissions, provider/model consistency,
 and pipeline prerequisites. Failures that can only be observed at runtime
 (LLM timeouts, auth errors, snapshot/index failures) are surfaced verbatim
-from the most recent persisted run records; they are never interpreted or
-classified by heuristics.
+from the most recent persisted run records; remediation is selected only by
+finite, literal error classes, never by LLM or open-ended inference.
 
 Every decision in this module is a finite-set or structural validation
 (Principle 6): env var presence, enum membership, path existence and
@@ -714,6 +714,59 @@ def _check_intelligence_llm_config() -> DiagnosticCheck:
     )
 
 
+def _last_run_failure_guidance(run_type: str, error: Optional[str]) -> Dict[str, Any]:
+    error_text = (error or "").lower()
+    if "evidence validation failed" in error_text:
+        pages = (
+            [PAGE_INTERVIEW]
+            if run_type == "interview_dialogue"
+            else [PAGE_SYSTEM_UNDERSTANDING]
+        )
+        steps = (
+            ["interview_dialogue"]
+            if run_type == "interview_dialogue"
+            else [
+                "documentation_claims_scanned",
+                "capability_hierarchy_ready",
+            ]
+        )
+        return {
+            "remediation": (
+                "下記の直近のエラーは API キー・モデル ID・タイムアウト設定ではなく、"
+                "reasoning モデルの構造化出力に含まれる evidence_refs が許可された"
+                "snapshot 範囲外だったことを示しています。無効な evidence_refs は保存前に"
+                "破棄されるべきなので、該当機能を再実行し、同じ validation error が続く"
+                "場合は evidence_refs の生成/検証ロジックを確認してください。"
+            ),
+            "related_env": [],
+            "related_pages": pages,
+            "related_pipeline_steps": steps,
+            "fix_page": pages[0],
+            "fix_anchor": None,
+        }
+    return {
+        "remediation": (
+            "下記の直近のエラーを確認し、指し示す設定（API キー・モデル ID・"
+            "タイムアウト）を修正してから、System Understanding でビルドを"
+            "再実行してください。"
+        ),
+        "related_env": [
+            "INTELLIGENCE_LLM_PROVIDER",
+            "INTELLIGENCE_LLM_MODEL",
+            "LLM_API_KEY",
+            "INTELLIGENCE_LLM_TIMEOUT",
+        ],
+        "related_pages": [PAGE_SYSTEM_UNDERSTANDING],
+        "related_pipeline_steps": [
+            "documentation_indexed",
+            "documentation_claims_scanned",
+            "capability_hierarchy_ready",
+        ],
+        "fix_page": PAGE_SYSTEM_UNDERSTANDING,
+        "fix_anchor": ANCHOR_BUILD,
+    }
+
+
 def _check_last_reasoning_run(conn, system_id: int) -> DiagnosticCheck:
     row = conn.execute(
         "SELECT id, run_type, status, error_details, completed_at, started_at, is_mock "
@@ -745,6 +798,7 @@ def _check_last_reasoning_run(conn, system_id: int) -> DiagnosticCheck:
         )
     observed_at = row["completed_at"] or row["started_at"]
     if row["status"] == "failed":
+        guidance = _last_run_failure_guidance(row["run_type"], row["error_details"])
         return DiagnosticCheck(
             check_id="llm_last_run",
             category="llm",
@@ -758,23 +812,10 @@ def _check_last_reasoning_run(conn, system_id: int) -> DiagnosticCheck:
                 "reasoning に基づく成果物（ドラフト・claim・capability 階層）が"
                 "生成されていないか、古くなっています。"
             ),
-            remediation=(
-                "下記の直近のエラーを確認し、指し示す設定（API キー・モデル ID・"
-                "タイムアウト）を修正してから、System Understanding でビルドを"
-                "再実行してください。"
-            ),
-            related_env=[
-                "INTELLIGENCE_LLM_PROVIDER",
-                "INTELLIGENCE_LLM_MODEL",
-                "LLM_API_KEY",
-                "INTELLIGENCE_LLM_TIMEOUT",
-            ],
-            related_pages=[PAGE_SYSTEM_UNDERSTANDING],
-            related_pipeline_steps=[
-                "documentation_indexed",
-                "documentation_claims_scanned",
-                "capability_hierarchy_ready",
-            ],
+            remediation=guidance["remediation"],
+            related_env=guidance["related_env"],
+            related_pages=guidance["related_pages"],
+            related_pipeline_steps=guidance["related_pipeline_steps"],
             last_observed_error=LastObservedError(
                 source=f"intelligence_runs#{row['id']}:{row['run_type']}",
                 status=row["status"],
@@ -782,8 +823,8 @@ def _check_last_reasoning_run(conn, system_id: int) -> DiagnosticCheck:
                 observed_at=observed_at,
             ),
             fix_kind=FIX_KIND_NAVIGATE,
-            fix_page=PAGE_SYSTEM_UNDERSTANDING,
-            fix_anchor=ANCHOR_BUILD,
+            fix_page=guidance["fix_page"],
+            fix_anchor=guidance["fix_anchor"],
         )
     mock_note = "（モック実行）" if row["is_mock"] else ""
     return DiagnosticCheck(

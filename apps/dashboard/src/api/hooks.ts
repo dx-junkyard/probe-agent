@@ -2,6 +2,9 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, getSystemId } from "./client";
 import type {
   SystemOut, ComponentSummary, TraceEvent, Policy,
+  LineageOut, TraceAnalyzer, AnalysisRun, AnalyzerContext,
+  RepositoryStatus,
+  FlowOverlayOut, FlowOverlayRequest,
   ShadowResult, ComponentProfile, UserOut, TokenOut,
   RepositoryCandidateOut, RepositoryConfigOut, SnapshotOut, LatestDraftsOut,
   DraftGenerationResultOut,
@@ -26,6 +29,7 @@ import type {
   SystemUnderstandingBuildOut,
   IssueDraft,
   IssueDraftCreateRequest,
+  GitHubIssueStatus,
   IssueDraftUpdateRequest,
   SystemDiagnosticsOut,
   AssistantScreenContext, AssistantAskRequest, AssistantAskOut,
@@ -92,6 +96,114 @@ export function useUpdatePolicy() {
     mutationFn: ({ componentId, mode }: { componentId: string; mode: string }) =>
       api.put<Policy>(`/components/${componentId}/policy`, { mode }),
     onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("components") }),
+  });
+}
+
+// Trace lineage (Issue #147). kind selects the query dimension; start/end are
+// an optional time window (unix seconds).
+export type LineageQuery =
+  | { kind: "entity"; entityType: string; entityId: string; start?: number; end?: number }
+  | { kind: "correlation"; id: string; start?: number; end?: number }
+  | { kind: "flow"; id: string; start?: number; end?: number };
+
+function lineagePath(q: LineageQuery): string {
+  let path: string;
+  if (q.kind === "entity") {
+    path = `/trace-lineage/entities/${encodeURIComponent(q.entityType)}/${encodeURIComponent(q.entityId)}`;
+  } else if (q.kind === "correlation") {
+    path = `/trace-lineage/correlations/${encodeURIComponent(q.id)}`;
+  } else {
+    path = `/trace-lineage/flows/${encodeURIComponent(q.id)}`;
+  }
+  const params = new URLSearchParams();
+  if (q.start != null) params.set("start", String(q.start));
+  if (q.end != null) params.set("end", String(q.end));
+  const qs = params.toString();
+  return qs ? `${path}?${qs}` : path;
+}
+
+function lineageReady(q: LineageQuery | null): boolean {
+  if (!q) return false;
+  if (q.kind === "entity") return !!q.entityType && !!q.entityId;
+  return !!q.id;
+}
+
+export function useLineage(query: LineageQuery | null) {
+  return useQuery({
+    queryKey: [...sysKey("trace-lineage"), query],
+    queryFn: () => api.get<LineageOut>(lineagePath(query as LineageQuery)),
+    enabled: lineageReady(query) && !!getSystemId(),
+  });
+}
+
+// Trace analyzers (Issue #148)
+export function useAnalyzers() {
+  return useQuery({
+    queryKey: sysKey("trace-analyzers"),
+    queryFn: () => api.get<TraceAnalyzer[]>("/trace-analyzers"),
+    enabled: !!getSystemId(),
+  });
+}
+
+// Trace Analyzer builder candidate values (Issue #157)
+export function useAnalyzerContext() {
+  return useQuery({
+    queryKey: sysKey("trace-analyzer-context"),
+    queryFn: () => api.get<AnalyzerContext>("/trace-analyzers/context"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useAnalyzerRuns(analyzerId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("trace-analyzer-runs"), analyzerId],
+    queryFn: () => api.get<AnalysisRun[]>(`/trace-analyzers/${analyzerId}/runs`),
+    enabled: !!analyzerId && !!getSystemId(),
+  });
+}
+
+export function useCreateAnalyzer() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { name: string; intent?: string; spec: unknown }) =>
+      api.post<TraceAnalyzer>("/trace-analyzers", body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("trace-analyzers") }),
+  });
+}
+
+export function useReviewAnalyzer() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, review_status }: { id: number; review_status: "approved" | "rejected" }) =>
+      api.put<TraceAnalyzer>(`/trace-analyzers/${id}/review`, { review_status }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("trace-analyzers") }),
+  });
+}
+
+export function useRunAnalyzer() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => api.post<AnalysisRun>(`/trace-analyzers/${id}/runs`),
+    onSuccess: (_d, id) =>
+      qc.invalidateQueries({ queryKey: [...sysKey("trace-analyzer-runs"), id] }),
+  });
+}
+
+// Flow Explorer runtime overlay (Issue #151)
+export function useFlowOverlay() {
+  return useMutation({
+    mutationFn: (body: FlowOverlayRequest) =>
+      api.post<FlowOverlayOut>("/repository/flow-overlay", body),
+  });
+}
+
+// LLM-assisted proposal (Issue #149)
+export function useProposeAnalyzer() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { intent: string; name?: string }) =>
+      api.post<TraceAnalyzer>("/trace-analyzers/propose", body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("trace-analyzers") }),
   });
 }
 
@@ -216,6 +328,15 @@ export function useSnapshots() {
   });
 }
 
+// Repository refresh-hub status (Issue #158)
+export function useRepositoryStatus() {
+  return useQuery({
+    queryKey: sysKey("repositoryStatus"),
+    queryFn: () => api.get<RepositoryStatus>("/repository/status"),
+    enabled: !!getSystemId(),
+  });
+}
+
 export function useLatestSnapshot() {
   return useQuery({
     queryKey: sysKey("latestSnapshot"),
@@ -231,6 +352,7 @@ export function useCreateSnapshot() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: sysKey("snapshots") });
       qc.invalidateQueries({ queryKey: sysKey("latestSnapshot") });
+      qc.invalidateQueries({ queryKey: sysKey("repositoryStatus") });
     },
   });
 }
@@ -519,6 +641,10 @@ export function useInterviewDialogueTurn(sessionId: number | null) {
       answered_question?: string;
       answered_qa_id?: number;
       actor?: string;
+      // Issue #142: mark this turn as an explicit "I don't know" answer so the
+      // consumed Q&A row is recorded as 'unconfirmed' and the model forms a
+      // hypothesis to re-confirm instead of treating it as an answered fact.
+      answer_unknown?: boolean;
     }) =>
       api.post<InterviewDialogueTurnOut>(`/interview/sessions/${sessionId}/dialogue-turn`, data),
     onSuccess: () => {
@@ -555,10 +681,10 @@ export function useCreateInterviewQa(sessionId: number | null) {
 export function useAnswerInterviewQa(sessionId: number | null) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ qaId, answer_text, actor }: { qaId: number; answer_text: string; actor: string }) =>
+    mutationFn: ({ qaId, answer_text, actor, answer_unknown }: { qaId: number; answer_text: string; actor: string; answer_unknown?: boolean }) =>
       api.post<InterviewQaAnswerOut>(
         `/interview/sessions/${sessionId}/qa/${qaId}/answer`,
-        { answer_text, actor },
+        { answer_text, actor, answer_unknown: answer_unknown ?? false },
       ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] });
@@ -1054,6 +1180,28 @@ export function useUpdateIssueDraft() {
   return useMutation({
     mutationFn: ({ id, body }: { id: number; body: IssueDraftUpdateRequest }) =>
       api.patch<IssueDraft>(`/issue-drafts/${id}`, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: sysKey("issue-drafts") });
+      qc.invalidateQueries({ queryKey: sysKey("system-understanding") });
+    },
+  });
+}
+
+// External Issue Loop: draft -> GitHub issue (Issue #158)
+
+export function useGitHubIssueStatus() {
+  return useQuery({
+    queryKey: sysKey("issue-drafts-github-status"),
+    queryFn: () => api.get<GitHubIssueStatus>("/issue-drafts/github-status"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useCreateGitHubIssue() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) =>
+      api.post<IssueDraft>(`/issue-drafts/${id}/create-github-issue`),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: sysKey("issue-drafts") });
       qc.invalidateQueries({ queryKey: sysKey("system-understanding") });

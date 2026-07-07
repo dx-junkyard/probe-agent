@@ -197,10 +197,20 @@ heuristic result.
 - `status` vocabulary is a finite set: `draft / copied / external_created /
   closed / rejected` (validated; anything else is 422). `external_url` is a
   plain user-supplied string, validated only as `http(s)://`; probe-agent
-  never fetches, creates, or syncs the external issue and never writes to the
-  target repository (Non-goals; Principle 5).
+  never writes to the target repository's tracked branches (Non-goals;
+  Principle 5).
 - `PATCH` uses field set-ness so `external_url: ""` clears a registered URL
   while omitting it leaves it untouched.
+- `GET /issue-drafts/github-status` and `POST
+  /issue-drafts/{id}/create-github-issue` (Issue #158, `github_integration.py`)
+  add an optional GitHub path: availability is a finite, structural check
+  (`GITHUB_TOKEN` set + owner/repo resolvable from the configured repo's
+  `origin` remote or `GITHUB_REPO=owner/repo`, never guessed). When available,
+  creating the issue calls the GitHub REST API directly and stores the
+  returned `html_url` via the same `update_draft` external_url path a manual
+  registration uses (status -> `external_created`). Unavailable or failed
+  calls are a 422 with a reason; the manual copy/paste URL flow always stays
+  available as a fallback. This is still not a target-repository write.
 
 ## Authentication and user management
 

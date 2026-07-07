@@ -7,6 +7,30 @@ Evaluation = Literal["better", "worse", "same", "unknown"]
 GenerationVerdict = Literal["better", "worse", "same", "unsafe", "error", "unknown"]
 
 
+EntityRole = Literal["source", "derived", "related"]
+# Projection phases: input/output (Issue #146); shadow_* added in Issue #150.
+ProjectionPhase = Literal["input", "output", "shadow_current", "shadow_candidate"]
+
+
+class TraceEntity(BaseModel):
+    type: str
+    id: str
+    role: EntityRole = "related"
+
+
+class TraceProjectionIn(BaseModel):
+    """A projection extraction result attached to a trace (Issue #146)."""
+
+    projection_name: str
+    phase: ProjectionPhase = "output"
+    fields: Dict[str, Any] = Field(default_factory=dict)
+    metrics: Dict[str, Any] = Field(default_factory=dict)
+    samples: Dict[str, Any] = Field(default_factory=dict)
+    data_hash: Optional[str] = None
+    truncated: bool = False
+    error: Optional[str] = None
+
+
 class TraceEvent(BaseModel):
     trace_id: str
     component_id: str
@@ -16,6 +40,185 @@ class TraceEvent(BaseModel):
     error: Optional[str] = None
     duration_ms: float = 0.0
     timestamp: float
+    # Phase 1 lineage (Issue #145) — all optional, backward compatible.
+    span_id: Optional[str] = None
+    parent_span_id: Optional[str] = None
+    flow_id: Optional[str] = None
+    correlation_id: Optional[str] = None
+    entities: Optional[List[TraceEntity]] = None
+    # Phase 2 projections (Issue #146) — optional extraction results.
+    projections: Optional[List[TraceProjectionIn]] = None
+
+
+class ProjectionOut(BaseModel):
+    trace_id: str
+    component_id: str
+    projection_name: str
+    phase: str
+    fields: Dict[str, Any] = Field(default_factory=dict)
+    metrics: Dict[str, Any] = Field(default_factory=dict)
+    samples: Dict[str, Any] = Field(default_factory=dict)
+    data_hash: Optional[str] = None
+    truncated: bool = False
+    error: Optional[str] = None
+    created_at: float
+
+
+class LineageEntityOut(BaseModel):
+    type: str
+    id: str
+    role: str = "related"
+
+
+class LineageProjectionOut(BaseModel):
+    projection_name: str
+    phase: str
+    fields: Dict[str, Any] = Field(default_factory=dict)
+    metrics: Dict[str, Any] = Field(default_factory=dict)
+    samples: Dict[str, Any] = Field(default_factory=dict)
+    data_hash: Optional[str] = None
+    truncated: bool = False
+    error: Optional[str] = None
+
+
+class LineageStepOut(BaseModel):
+    trace_id: str
+    component_id: str
+    mode: Optional[str] = None
+    span_id: Optional[str] = None
+    parent_span_id: Optional[str] = None
+    flow_id: Optional[str] = None
+    correlation_id: Optional[str] = None
+    duration_ms: Optional[float] = None
+    timestamp: float
+    output: Optional[str] = None
+    error: Optional[str] = None
+    entities: List[LineageEntityOut] = Field(default_factory=list)
+    projections: List[LineageProjectionOut] = Field(default_factory=list)
+
+
+class LineageOut(BaseModel):
+    query: Dict[str, Any] = Field(default_factory=dict)
+    steps: List[LineageStepOut] = Field(default_factory=list)
+
+
+# --- Trace analyzers (Issue #148) ------------------------------------------
+
+AnalyzerReviewStatus = Literal["proposed", "approved", "rejected"]
+
+
+class TraceAnalyzerCreate(BaseModel):
+    name: str = ""
+    intent: str = ""
+    spec: Dict[str, Any]
+
+
+class AnalyzerReviewUpdate(BaseModel):
+    review_status: Literal["approved", "rejected"]
+
+
+class AnalyzerProposeRequest(BaseModel):
+    intent: str = Field(..., min_length=1)
+    name: str = ""
+
+
+class TraceAnalyzerOut(BaseModel):
+    id: int
+    name: str = ""
+    intent: str = ""
+    spec: Dict[str, Any] = Field(default_factory=dict)
+    source: str = "trace_projections"
+    review_status: str = "proposed"
+    decision_method: str = "manual"
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    prompt_version: Optional[str] = None
+    schema_version: Optional[str] = None
+    is_mock: bool = False
+    # Audit of the human review decision (Principle 7): set on approve/reject.
+    # Always 'manual' when set — approval never comes from the LLM.
+    reviewed_at: Optional[float] = None
+    review_decision_method: Optional[str] = None
+    created_at: float
+    updated_at: float
+
+
+class AnalyzerEntityOut(BaseModel):
+    entity_type: str
+    entity_id: str
+
+
+class AnalyzerContextOut(BaseModel):
+    """Candidate values for the Trace Analyzer builder (Issue #157).
+
+    Deterministic, read-only projection of the identifiers a declarative
+    analyzer spec may reference, so the dashboard can offer them as choices
+    instead of asking the user to hand-write JSON. Sourced from the same
+    finite sets the LLM proposal context uses (Principle 6).
+    """
+
+    components: List[str] = Field(default_factory=list)
+    entity_types: List[str] = Field(default_factory=list)
+    entities: List[AnalyzerEntityOut] = Field(default_factory=list)
+    projection_names: List[str] = Field(default_factory=list)
+    field_names: List[str] = Field(default_factory=list)
+    phases: List[str] = Field(default_factory=list)
+    entities_truncated: bool = False
+
+
+class AnalysisRunOut(BaseModel):
+    id: int
+    analyzer_id: int
+    status: str
+    result: Optional[Dict[str, Any]] = None
+    error_details: Optional[str] = None
+    row_count: Optional[int] = None
+    started_at: float
+    completed_at: Optional[float] = None
+    # Issue #152: set when a retention policy may have pruned the projection
+    # data this run referenced (no reference counting; conservative by age).
+    data_expired: bool = False
+    data_expired_note: Optional[str] = None
+
+
+RetentionTarget = Literal[
+    "trace_spans", "trace_entities", "trace_projections", "trace_analysis_runs"
+]
+
+
+class RetentionPolicyIn(BaseModel):
+    target_table: RetentionTarget
+    max_age_days: Optional[float] = Field(default=None, ge=0)
+    max_count: Optional[int] = Field(default=None, ge=0)
+
+
+class RetentionPoliciesUpdate(BaseModel):
+    policies: List[RetentionPolicyIn] = Field(default_factory=list)
+
+
+class RetentionPolicyOut(BaseModel):
+    target_table: str
+    max_age_days: Optional[float] = None
+    max_count: Optional[int] = None
+    updated_at: float
+
+
+class RetentionApplyResult(BaseModel):
+    target_table: str
+    deleted_count: int
+
+
+class RetentionApplyOut(BaseModel):
+    executed_at: float
+    results: List[RetentionApplyResult] = Field(default_factory=list)
+
+
+class RetentionAuditOut(BaseModel):
+    id: int
+    target_table: str
+    deleted_count: int
+    reason: str
+    executed_at: float
 
 
 class ShadowResult(BaseModel):
@@ -26,6 +229,8 @@ class ShadowResult(BaseModel):
     candidate_error: Optional[str] = None
     candidate_duration_ms: float = 0.0
     timestamp: float
+    # Phase 5 shadow projections (Issue #150): shadow_current / shadow_candidate.
+    projections: Optional[List["TraceProjectionIn"]] = None
 
 
 class Policy(BaseModel):
@@ -286,6 +491,45 @@ class SnapshotOut(BaseModel):
     created_at: float
     completed_at: Optional[float] = None
     files: List[SnapshotFileOut] = Field(default_factory=list)
+
+
+class SnapshotRefOut(BaseModel):
+    id: int
+    commit_sha: str
+    status: str
+    created_at: float
+
+
+class RepositoryStatusOut(BaseModel):
+    """Repository refresh hub state (Issue #158).
+
+    Read-only summary that lets the dashboard show, in one place, whether the
+    latest analysis is stale relative to the repository's current HEAD and what
+    step to take next. Reading HEAD / working-tree status never mutates the
+    target repository (Principle 5).
+    """
+
+    configured: bool
+    repo_path: Optional[str] = None
+    # Current committed HEAD of the configured repository (read-only rev-parse).
+    current_head: Optional[str] = None
+    head_error: Optional[str] = None
+    working_tree_dirty: Optional[bool] = None
+    dirty_file_count: int = 0
+    dirty_sample: List[str] = Field(default_factory=list)
+    # Newest snapshot regardless of index/build state.
+    latest_snapshot: Optional[SnapshotRefOut] = None
+    # Newest snapshot that also has a completed symbol index.
+    latest_indexed_snapshot: Optional[SnapshotRefOut] = None
+    # Snapshot the most recent System Understanding build ran against.
+    understanding_snapshot_id: Optional[int] = None
+    understanding_status: Optional[str] = None
+    # True when the latest snapshot's commit differs from current HEAD, so a new
+    # snapshot should be created before generating new analysis/patches.
+    snapshot_stale: bool = False
+    # True when a ready snapshot exists but has no completed symbol index.
+    symbols_stale: bool = False
+    next_actions: List[str] = Field(default_factory=list)
 
 
 class IntelligenceRunOut(BaseModel):
@@ -1262,6 +1506,63 @@ class FlowGraphRequest(BaseModel):
     commit_sha: Optional[str] = None
 
 
+class FlowOverlaySelection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["entity", "correlation", "flow", "analyzer"]
+    entity_type: Optional[str] = None
+    entity_id: Optional[str] = None
+    correlation_id: Optional[str] = None
+    flow_id: Optional[str] = None
+    analyzer_id: Optional[int] = None
+
+
+class FlowOverlayRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    entrypoint_type: FlowEntrypointType
+    entrypoint_id: str = Field(..., min_length=1)
+    max_depth: int = Field(default=8, ge=1, le=32)
+    max_nodes: int = Field(default=100, ge=1, le=500)
+    snapshot_id: Optional[int] = None
+    commit_sha: Optional[str] = None
+    selection: FlowOverlaySelection
+
+
+class FlowOverlayNode(BaseModel):
+    node_id: str
+    component_id: Optional[str] = None
+    observable: bool  # has a component_id (an instrumented probe point)
+    observed: bool
+    observation_count: int = 0
+    last_observed_at: Optional[float] = None
+
+
+class FlowOverlayEdge(BaseModel):
+    edge_id: str
+    source_node_id: str
+    target_node_id: Optional[str] = None
+    source_component_id: Optional[str] = None
+    target_component_id: Optional[str] = None
+    observed_transition: bool = False
+
+
+class FlowDivergence(BaseModel):
+    source_component_id: str
+    target_component_id: str
+    count: int
+
+
+class FlowOverlayOut(BaseModel):
+    selection: Dict[str, Any] = Field(default_factory=dict)
+    nodes: List[FlowOverlayNode] = Field(default_factory=list)
+    edges: List[FlowOverlayEdge] = Field(default_factory=list)
+    divergences: List[FlowDivergence] = Field(default_factory=list)
+    observed_component_ids: List[str] = Field(default_factory=list)
+    unmatched_component_ids: List[str] = Field(default_factory=list)
+    observed_trace_count: int = 0
+
+
 class FlowProbeSelection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1373,7 +1674,7 @@ class TokenCreateResponse(TokenOut):
 
 WorkspaceMessageRole = Literal["user", "assistant", "system"]
 WorkspaceContextItemType = Literal[
-    "feature", "component", "trace", "experiment", "probe_plan"
+    "feature", "component", "trace", "experiment", "probe_plan", "analyzer_run"
 ]
 WorkspaceProposalStatus = Literal[
     "proposed", "accepted", "rejected", "deferred", "superseded"
@@ -1971,6 +2272,12 @@ class InterviewDialogueTurnRequest(BaseModel):
     # cannot silently match the wrong question.
     answered_qa_id: Optional[int] = None
     actor: str = Field(default="dashboard", min_length=1, max_length=200)
+    # Issue #142: the developer answered "I don't know" (「わかりません」/不明).
+    # The turn is NOT an error: the answered Q&A row is recorded as
+    # 'unconfirmed' rather than 'answered', and the reasoning model is asked to
+    # form an evidence-grounded hypothesis and re-confirm it, so the interview
+    # continues instead of stopping.
+    answer_unknown: bool = False
 
 
 class InterviewConfirmUnderstandingRequest(BaseModel):
@@ -2040,6 +2347,12 @@ class InterviewDialogueTurnOut(BaseModel):
 
     assistant_message: str = ""
     proposals: List[InterviewDialogueProposalOut] = Field(default_factory=list)
+    # Whether this turn asked the reasoning model for proposals (the Issue
+    # #83/#123 gate passed with generate_proposals set). True with an empty
+    # proposals list means the model needs narrowing answers first and
+    # returned next_questions instead — the dashboard must not present that
+    # as a plain successful reply.
+    proposals_requested: bool = False
     next_questions: List[InterviewStructuredQuestion] = Field(default_factory=list)
     intelligence_run: Optional[IntelligenceRunOut] = None
     error: Optional[str] = None
@@ -2057,6 +2370,11 @@ class InterviewDialogueTurnOut(BaseModel):
     # turn's evidence-selection run — every snippet actually read, whether
     # or not a question cited it. evidence_used above is unchanged.
     evidence_reads: List["IntelligenceRunEvidenceOut"] = Field(default_factory=list)
+    # Issue #142: how many question evidence_refs were dropped as unverifiable
+    # (not contained in any known snapshot span). A dropped ref is a graceful
+    # fallback — the question is still asked — so this is surfaced for operator
+    # visibility, not an error.
+    evidence_refs_dropped: int = 0
 
 
 # --- Evidence read audit (Issue #137) -----------------------------------------
@@ -2099,7 +2417,12 @@ InterviewQaCategory = Literal["purpose", "capability", "api", "probe_flow", "gen
 # metadata/probe plans against deterministic runtime trace aggregates,
 # distinct from the dialogue/reviewer/zero_base sources above.
 InterviewQaSource = Literal["reviewer", "dialogue", "zero_base", "runtime"]
-InterviewQaStatus = Literal["open", "answered", "revised", "skipped"]
+# Issue #142: "unconfirmed" records that the developer explicitly could not
+# confirm the answer ("I don't know" / 「わかりません」). It is a valid input,
+# not an error: the row is kept, its answer text stored, and it is fed back to
+# the reasoning model as an open hypothesis to re-confirm — never counted as a
+# confirmed/answered fact.
+InterviewQaStatus = Literal["open", "answered", "revised", "skipped", "unconfirmed"]
 
 
 class InterviewQaEvidenceRefOut(BaseModel):
@@ -2141,12 +2464,26 @@ class InterviewQaAnswerRequest(BaseModel):
     same row (first answer — nothing to supersede). If the current row is
     'answered', this is a correction: a new row is inserted with the new
     answer and the old row is marked 'revised' with superseded_by_id set.
+
+    Issue #142: when ``answer_unknown`` is set, the developer explicitly could
+    not confirm the answer. The row is recorded with status 'unconfirmed'
+    rather than 'answered', ``answer_text`` may be blank, and the interview
+    continues (the reasoning model re-confirms via a hypothesis question).
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    answer_text: str = Field(..., min_length=1, max_length=20_000)
+    # min_length is 0 so an "I don't know" answer can be blank; a validator
+    # below still requires non-empty text for a normal (confirmed) answer.
+    answer_text: str = Field(default="", max_length=20_000)
     actor: str = Field(..., min_length=1, max_length=200)
+    answer_unknown: bool = False
+
+    @model_validator(mode="after")
+    def _require_answer_or_unknown(self) -> "InterviewQaAnswerRequest":
+        if not self.answer_unknown and not self.answer_text.strip():
+            raise ValueError("answer_text is required unless answer_unknown is set")
+        return self
 
 
 class InterviewQaOut(BaseModel):
@@ -2685,8 +3022,22 @@ class IssueDraftOut(BaseModel):
     body_markdown: str
     status: str
     external_url: Optional[str] = None
+    # Issue #158: True when the draft's originating snapshot/commit no longer
+    # matches the latest ready snapshot, so the analysis behind it may be out of
+    # date. Computed at read time; never persisted.
+    stale: bool = False
     created_at: float
     updated_at: float
+
+
+class GitHubIssueStatusOut(BaseModel):
+    """Whether GitHub issue creation is available for the current system's
+    configured repository (Issue #158 External Issue Loop)."""
+
+    available: bool
+    owner: Optional[str] = None
+    repo: Optional[str] = None
+    reason: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

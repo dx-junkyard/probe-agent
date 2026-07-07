@@ -216,6 +216,18 @@ type FocusedQuestion = {
 const QUICK_ANSWER_YES = "はい、その理解で正しいです。";
 const QUICK_ANSWER_NO_PREFIX = "いいえ、正しくありません。修正点: ";
 
+// open question エントリを focused-question カード表示用の形に変換する。
+function focusedFromOpenQuestion(q: OpenQuestion): FocusedQuestion {
+  return {
+    text: q.question,
+    hypothesis: q.hypothesis ?? null,
+    evidenceRefs: q.evidence_refs ?? [],
+    answerOptions: q.answer_options ?? [],
+    // 仮説付きの質問は「はい/いいえ+修正」で答えられる確認型。
+    confirmable: !!q.hypothesis,
+  };
+}
+
 function provenanceVariant(value: string) {
   if (value === "manual") return "success" as const;
   if (value === "reasoning_llm") return "secondary" as const;
@@ -480,7 +492,7 @@ function QaItemCard({
   qa, onAnswer, onSkip, onResume, answering, skipping, resuming,
 }: {
   qa: InterviewQaOut;
-  onAnswer: (qaId: number, answerText: string) => Promise<void>;
+  onAnswer: (qaId: number, answerText: string, answerUnknown?: boolean) => Promise<void>;
   onSkip: (qaId: number) => void;
   onResume: (qaId: number) => void;
   answering: boolean;
@@ -493,6 +505,13 @@ function QaItemCard({
   const submit = async () => {
     if (!draft.trim()) return;
     await onAnswer(qa.id, draft.trim());
+    setEditing(false);
+  };
+
+  // Issue #142: 「わからない」を有効な入力として記録する。エラーにはせず、
+  // status=unconfirmed として保存し、以後の推論で仮説→再確認に回す。
+  const submitUnknown = async () => {
+    await onAnswer(qa.id, draft.trim(), true);
     setEditing(false);
   };
 
@@ -513,9 +532,10 @@ function QaItemCard({
           <Badge variant={
             qa.status === "answered" ? "success"
               : qa.status === "skipped" ? "warning"
+              : qa.status === "unconfirmed" ? "warning"
               : qa.status === "revised" ? "secondary" : "outline"
           }>
-            {qa.status}
+            {qa.status === "unconfirmed" ? "不明(要確認)" : qa.status}
           </Badge>
         </div>
       </div>
@@ -581,6 +601,15 @@ function QaItemCard({
             <Button size="sm" onClick={submit} disabled={answering || !draft.trim()}>
               {answering ? "送信中..." : "保存"}
             </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={submitUnknown}
+              disabled={answering}
+              data-testid={`qa-answer-unknown-${qa.id}`}
+            >
+              わからない
+            </Button>
             <Button size="sm" variant="outline" onClick={() => setEditing(false)}>キャンセル</Button>
           </div>
         </div>
@@ -588,7 +617,7 @@ function QaItemCard({
         <div className="flex gap-2">
           <Button size="sm" variant="outline" onClick={() => setEditing(true)}>
             <Pencil className="h-3 w-3 mr-1" />
-            {qa.status === "answered" ? "回答を修正" : "回答する"}
+            {qa.status === "answered" || qa.status === "unconfirmed" ? "回答を修正" : "回答する"}
           </Button>
           {qa.status === "open" && (
             <Button size="sm" variant="outline" onClick={() => onSkip(qa.id)} disabled={skipping}>
@@ -615,10 +644,14 @@ function QaPanel({
   const resume = useResumeInterviewQa(sessionId);
   const runRealityCheck = useRunRuntimeRealityCheck(sessionId);
 
-  const handleAnswer = async (qaId: number, answerText: string) => {
+  const handleAnswer = async (qaId: number, answerText: string, answerUnknown?: boolean) => {
     try {
-      const result = await answer.mutateAsync({ qaId, answer_text: answerText, actor });
-      if (result.regeneration_recommended) {
+      const result = await answer.mutateAsync({
+        qaId, answer_text: answerText, actor, answer_unknown: answerUnknown,
+      });
+      if (answerUnknown) {
+        toast.info("「わからない」として記録しました。仮説を立てて確認質問を続けます。");
+      } else if (result.regeneration_recommended) {
         toast.warning("回答が変わったため、生成済みの提案の再生成を検討してください(自動では再生成されません)。");
       } else {
         toast.success("回答を保存しました");
@@ -881,6 +914,10 @@ export default function InterviewPage() {
   const building = createSession.isPending || updateUnderstanding.isPending;
   const uiState: InterviewUiState | null = session ? deriveUiState(session, building) : null;
   const unlocked = session ? proposalsUnlocked(session) : false;
+  // 提案ステージで未回答の絞り込み質問が残っている状態。提案生成を依頼しても
+  // 情報不足だった場合、モデルの確認質問が open_questions に残る。
+  const proposalNarrowing =
+    uiState === "ready_for_proposals" && (session?.open_questions ?? []).length > 0;
 
   useEffect(() => {
     if (!selectedSessionId && sortedSessions.length > 0) {
@@ -921,15 +958,7 @@ export default function InterviewPage() {
       if (open.length === 0) {
         return { text: STAGE_QUESTIONS[currentStage], confirmable: false };
       }
-      const q = open[0];
-      return {
-        text: q.question,
-        hypothesis: q.hypothesis ?? null,
-        evidenceRefs: q.evidence_refs ?? [],
-        answerOptions: q.answer_options ?? [],
-        // 仮説付きの質問は「はい/いいえ+修正」で答えられる確認型。
-        confirmable: !!q.hypothesis,
-      };
+      return focusedFromOpenQuestion(open[0]);
     }
     if (uiState === "zero_base") {
       if (zeroBaseComplete) {
@@ -942,6 +971,11 @@ export default function InterviewPage() {
       return { text: ZERO_BASE_QUESTIONS[idx], confirmable: false };
     }
     if (uiState === "ready_for_proposals") {
+      // 提案生成を依頼しても情報不足で提案できなかった場合、モデルは絞り込みの
+      // 確認質問を open_questions に返す(プロンプト interview-v6)。固定文の
+      // 代わりにその質問を提示し、回答のたびに提案生成を再試行する。
+      const open = sortQuestions(session.open_questions ?? []);
+      if (open.length > 0) return focusedFromOpenQuestion(open[0]);
       return {
         text: "提案を生成する準備ができました。対象にしたい範囲や重視したい観点があれば入力し、「送信して提案を生成」を押してください。",
         confirmable: false,
@@ -950,12 +984,15 @@ export default function InterviewPage() {
     return null;
   }, [session, uiState, currentStage, userMessageCount, zeroBaseComplete]);
 
-  // fill_gaps で表示中の open question を回答対象としてサーバーに渡し、
-  // 回答済みの質問が再表示されないよう消費してもらう。qa_id を持つ
-  // エントリは ID 参照(answered_qa_id)で消費し、Q&A 一覧の行も
+  // fill_gaps / 提案ステージの絞り込みで表示中の open question を回答対象と
+  // してサーバーに渡し、回答済みの質問が再表示されないよう消費してもらう。
+  // qa_id を持つエントリは ID 参照(answered_qa_id)で消費し、Q&A 一覧の行も
   // answered になる(Issue #129)。テキストは旧セッション互換のため併送する。
   const answeredForTurn = useMemo<{ text?: string; qaId?: number }>(() => {
-    if (uiState !== "fill_gaps" || !session || !focusedQuestion) return {};
+    if (
+      (uiState !== "fill_gaps" && uiState !== "ready_for_proposals") ||
+      !session || !focusedQuestion
+    ) return {};
     const open = sortQuestions(session.open_questions ?? []);
     if (open.length === 0 || open[0].question !== focusedQuestion.text) return {};
     return { text: focusedQuestion.text, qaId: open[0].qa_id ?? undefined };
@@ -976,7 +1013,9 @@ export default function InterviewPage() {
           ? "必要な回答が揃いました。「この内容で提案生成に進む」で内容を確定すると提案を生成できます。"
           : "自動では十分な理解を構築できませんでした。表示される質問に1つずつ回答してください。";
       case "ready_for_proposals":
-        return "「送信して提案を生成」を押すと、確認済みの理解にもとづいて提案が生成されます。";
+        return proposalNarrowing
+          ? "提案に必要な情報がまだ不足しています。表示中の確認質問に回答して対象を絞り込んでください。回答を送信するたびに提案生成を再試行します。"
+          : "「送信して提案を生成」を押すと、確認済みの理解にもとづいて提案が生成されます。";
       case "proposal_review":
         return approvedCount > 0
           ? "承認済みの提案から「差分を生成」でレビュー用の差分を作成できます。残りの提案のレビューも続けられます。"
@@ -984,7 +1023,7 @@ export default function InterviewPage() {
       default:
         return "";
     }
-  }, [uiState, approvedCount, zeroBaseComplete]);
+  }, [uiState, approvedCount, zeroBaseComplete, proposalNarrowing]);
 
   const startSession = async () => {
     if (!latestSnapshot) {
@@ -1048,7 +1087,7 @@ export default function InterviewPage() {
     }
   };
 
-  const sendText = async (raw: string) => {
+  const sendText = async (raw: string, opts?: { answerUnknown?: boolean }) => {
     const text = raw.trim();
     if (!text || !selectedSessionId) return;
     try {
@@ -1058,11 +1097,17 @@ export default function InterviewPage() {
         answered_question: answeredForTurn.text,
         answered_qa_id: answeredForTurn.qaId,
         actor,
+        answer_unknown: opts?.answerUnknown,
       });
       setMessage("");
       setLastEvidenceReads(result.evidence_reads ?? []);
       if (result.error) toast.error(result.error);
+      else if (opts?.answerUnknown) toast.info("「わからない」として記録しました。仮説を立てて確認を続けます。");
       else if (result.proposals.length) toast.success(`${result.proposals.length}件の提案を生成しました`);
+      else if (result.proposals_requested)
+        // 提案を依頼したが情報不足: モデルは絞り込みの確認質問を返している。
+        // 「送信成功」だけ出すと提案が作られたように見えるため区別する。
+        toast.info("提案はまだ生成されませんでした。表示される確認質問に回答して、プローブ対象を一緒に絞り込んでください。");
       else toast.success("回答を送信しました");
     } catch (e) {
       toast.error(String(e));
@@ -1070,6 +1115,11 @@ export default function InterviewPage() {
   };
 
   const sendTurn = () => sendText(message);
+
+  // Issue #142: 現在の focused question に対して「わからない」を明示送信する。
+  // 自由文ではなく answer_unknown フラグで送り、確定回答なしとして記録させる。
+  const sendUnknown = () =>
+    sendText(message.trim() || "わかりません", { answerUnknown: true });
 
   // 「いいえ」は修正内容の入力を促す: 定型の書き出しを入力欄に入れてフォーカスする。
   const startCorrection = () => {
@@ -1272,7 +1322,7 @@ export default function InterviewPage() {
                               ))}
                             </div>
                           )}
-                          {(focusedQuestion.confirmable || (focusedQuestion.answerOptions ?? []).length > 0) && (
+                          {(focusedQuestion.confirmable || (focusedQuestion.answerOptions ?? []).length > 0 || uiState === "fill_gaps" || proposalNarrowing) && (
                             <div className="flex flex-wrap gap-2 pt-1" data-testid="quick-answers">
                               {focusedQuestion.confirmable && (
                                 <>
@@ -1309,6 +1359,21 @@ export default function InterviewPage() {
                                   {opt}
                                 </Button>
                               ))}
+                              {/* Issue #142: 明示的な「わからない」入力。自由文ではなく
+                                  answer_unknown フラグで送り、確定回答なしとして記録する。
+                                  提案ステージの絞り込み質問でも同様に使える。 */}
+                              {(uiState === "fill_gaps" || proposalNarrowing) && (
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={sendUnknown}
+                                  disabled={dialogueTurn.isPending}
+                                  data-testid="quick-answer-unknown"
+                                >
+                                  <HelpCircle className="h-4 w-4 mr-1" />
+                                  わからない
+                                </Button>
+                              )}
                             </div>
                           )}
                         </div>
@@ -1329,7 +1394,7 @@ export default function InterviewPage() {
                         rows={4}
                         value={message}
                         onChange={e => setMessage(e.target.value)}
-                        placeholder={isProposalStage && unlocked
+                        placeholder={isProposalStage && unlocked && !proposalNarrowing
                           ? "提案の対象範囲や重視したい観点があれば入力してください。"
                           : "上の質問への回答や修正点を入力してください。"}
                       />
@@ -1391,6 +1456,7 @@ export default function InterviewPage() {
                       {proposals.length === 0 ? (
                         <div className="text-sm text-muted-foreground" data-testid="no-proposals-yet">
                           まだ提案はありません。会話から「送信して提案を生成」でレビュー項目を生成してください。
+                          情報が不足している場合は、AIが対象を絞り込むための確認質問を返します。
                         </div>
                       ) : proposals.map(proposal => (
                         <div key={proposal.id} className="rounded-md border p-4 space-y-3" data-testid="interview-proposal-card">

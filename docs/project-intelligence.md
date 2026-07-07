@@ -870,7 +870,7 @@ Decision Workspace の #36（Context Pack Builder）と同じ位置づけ。pin 
    自体は失敗しない。テキスト一致は移行期間中は併存するが(その場合も一致した
    エントリの `qa_id` 行が answered に同期される)、いずれ削除される。
 3. 回答済み Q&A の最新リビジョン一覧を対話プロンプトに
-   「確定事実として再質問しない」指示付きで注入する(prompt `interview-v5`)。
+   「確定事実として再質問しない」指示付きで注入する(prompt `interview-v5` 以降)。
    意味レベルの重複質問の抑止は reasoning model への指示で行い、
    類似度ヒューリスティックでは行わない(Principle 6)。
 
@@ -1080,6 +1080,301 @@ probe_value / state_effects / recommended_mode)と、同じ component_id のト�
 共有スキーマ: `IntelligenceRunEvidence` / `IntelligenceRunEvidenceList`、
 `InterviewDialogueTurnOut.evidence_reads`
 ([shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json))。
+
+## 不明回答の継続と仮説の再確認(Issue #142)
+
+インタビューで質問された開発者が「わかりません」「不明」など確定回答を持たない
+ことがある。従来はその後の対話ターンで、LLM が仮説のために生成した `evidence_refs`
+の検証に失敗すると `Question evidence validation failed` でターン全体が fail-closed
+となり、会話が停止してしまうことがあった。本 issue は「不明回答」を有効な入力として
+扱い、会話を止めずに仮説→再確認へ回す。
+
+- **不明回答の記録(deterministic / manual)**: 「わからない」かどうかは自由文の
+  ヒューリスティック判定ではなく、UI からの明示フラグ `answer_unknown`(有限の
+  真偽値)で受け取る(Principle 6)。対話ターン(`answered_qa_id` + `answer_unknown`)
+  および `POST .../qa/{qa_id}/answer`(`answer_unknown`)で指定でき、該当 `interview_qa`
+  行は `answered` ではなく **新 status `unconfirmed`** で記録される。回答本文は空でも
+  よい。これは「確定回答なし」という開発者の明示入力であり、エラーではない。
+- **推論コンテキストへの還元(reasoning_llm)**: `unconfirmed` 行は後続ターンの
+  プロンプトに「確定回答なし。確定事実として扱わず、根拠から仮説を立てて確認質問を
+  出す」ブロックとして注入される。`answered`(確定事実、再質問禁止)とは別枠で、
+  混同しない。LLM の仮説は従来どおり `next_questions` の `hypothesis` として
+  `status: "open"` の `interview_qa` 行になり、`current_understanding` の確定理解には
+  ならない(Principle 7: 仮説は `reasoning_llm`、確定は人手の確認で `open` → 回答)。
+- **evidence_refs の graceful fallback(deterministic)**: 質問の `evidence_refs` が
+  既知スパンに含まれない場合、従来はターン全体を fail させていたが、本 issue では
+  **該当参照だけを落として**質問(と仮説)は残す。落とした件数は
+  `InterviewTurnResult.evidence_refs_dropped` に記録する。既知スパンへの包含判定は
+  有限集合に対する構造チェックであり、参照の作り直し(ヒューリスティック解釈)は
+  行わない。1つの不正な行範囲が会話全体を止めることはなくなる。
+
+判断区分: 「不明かどうか」は UI の明示フラグ(deterministic/manual)、不正参照の除去は
+構造チェック(deterministic)、仮説生成と確認質問は reasoning_llm。開発者の確認
+(`open` → 回答)が確定であり、LLM 出力単体では確定にならない(Principle 6/7)。
+
+**含まない:** 自由文からの「不明」自動判定、`unconfirmed` を確定理解として
+`current_understanding` に反映すること、不正 `evidence_refs` の作り直し。
+
+共有スキーマ: `InterviewQA.status` への `"unconfirmed"` の追加
+([shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json))。
+
+## 提案生成ターンの空提案と絞り込み継続
+
+`proposal_generation` 段階で `generate_proposals: true` のターンを送っても、従来は
+reasoning model が `proposals: []` の通常回答だけを返すことがあり、レスポンスは正常
+(`completed`)なのに提案が 1 件も作られず、UI 上は「提案レビューが空のまま進展しない」
+ように見えた。本改善は「提案生成を依頼されたターン」を明示的な契約にする。
+
+- **依頼の明示(deterministic)**: 提案ゲート(`proposal_generation` 段階 +
+  `generate_proposals` + 理解構築済みまたは手動確認済み — Issues #83/#123 と同一条件)を
+  LLM 呼び出し**前**に判定し、`generate_interview_turn` に `proposals_requested` として
+  渡す。プロンプト(`interview-v6`)には「開発者が提案生成を依頼した」セクションが
+  入り、モデルは (a) 根拠のあるシンボルへの提案を返すか、(b) 提案できるだけの情報が
+  ない場合は不足内容を `assistant_message` で説明し、仮説(`hypothesis`)と候補
+  (`answer_options`)付きの絞り込み質問を `next_questions` で返すことを要求される。
+- **fail-closed の構造チェック(deterministic)**: 依頼されたターンで提案も
+  `next_questions` も空の応答は構造化出力の契約違反としてターンを fail させ、
+  `intelligence_runs` に失敗として記録する(Principle 6/7: 「なぜ提案できないか」の
+  判断は reasoning_llm、「両方空か」は有限の構造チェック)。
+- **レスポンスへの可視化**: `InterviewDialogueTurnOut.proposals_requested` を追加し、
+  Dashboard は「依頼したが提案 0 件(=絞り込み継続)」と「そもそも依頼していない
+  ターン」を区別できる。絞り込み質問は従来どおり `open_questions` / `interview_qa`
+  (`question_source: "dialogue"`)として永続化されるため、Dashboard の
+  `ready_for_proposals` 状態は未回答の open question があればそれを提示し、回答の
+  たびに提案生成を再試行する(回答は `answered_qa_id` で消費、「わからない」は
+  #142 の `answer_unknown` で継続)。
+
+**含まない:** 提案の自動リトライ・自動生成ループ、絞り込み質問のヒューリスティック
+生成、空提案時のモック/ヒューリスティック代替。
+
+## 大規模トレースのリネージと動的分析(Issue #144)
+
+大きな payload・バッチ・多数の派生レコードを扱うシステム向けに、component 単位の
+トレース閲覧を「エンティティ単位・フロー単位の観測と分析」へ拡張する。設計の全体像は
+Issue #144 に集約し、実装は以下の sub-issue に依存順で分割した(#144 の Phase 案を
+ベースに一部再構成している)。
+
+| Sub-issue | 内容 | 依存 |
+| --- | --- | --- |
+| #145 | 系譜メタデータ基盤: `span_id` / `parent_span_id` / `flow_id` / `correlation_id` / entity refs(明示値のみ)、`trace_spans` / `trace_entities`、lineage クエリ API | なし |
+| #146 | 宣言的 Projection: 制約付きパス式 + 有限演算(`len`/`count`/`exists`/`sha256`/`sample`)、SDK 抽出エンジン、`trace_projections`、`id_path` による entity 抽出 | #145 |
+| #147 | Trace Lineage Explorer(Dashboard MVP): entity/correlation/flow 検索、ステップ表示、field 変化ハイライト | #145, #146 |
+| #148 | Analyzer 手動作成と read-only 実行基盤: spec スキーマ、`trace_analyzers` / `trace_analysis_runs`、review ゲート、実行上限 | #145, #146 |
+| #149 | LLM 支援 Analyzer 提案: 自然言語 → reasoning model → schema 検証 → `proposed`。fail closed、監査メタデータ必須 | #148 |
+| #150 | Shadow 対応 projection と subset diff 集計: `shadow_current` / `shadow_candidate` phase、analyzer filter 下の決定的差分集計 | #146, #148 |
+| #151 | Flow Explorer への runtime lineage overlay: 観測済み/未観測 probe point、静的フローとの乖離表示 | #145, #147 |
+| #152 | sampling と retention: trace_id ハッシュベースの決定的 sampling、期間・件数 retention、監査付き削除 | #145, #146, #148 |
+
+#144 原文からの主な設計調整:
+
+- **パス式による entity 抽出は Phase 1 から Phase 2(#146)へ移動**: `id_path` 評価は
+  projection の式エンジンを必要とするため、#145 では明示値のエンティティ付与のみとし、
+  式エンジンの所有権を #146 に一本化した。
+- **Phase 4 を手動(#148)と LLM 提案(#149)に分割**: 決定的な spec 検証・実行基盤と
+  reasoning_llm による提案(Principle 6/7 の監査・fail closed 要件)を別 issue にした。
+- **`caused_by` フィールドと `record_derivation` は初期実装から除外**: 派生エンティティは
+  生成元トレースへ `role="derived"` で付与すれば lineage クエリが成立するため、独立した
+  entity 間派生グラフは必要になった時点で別 issue とする。
+- **sampling / retention を独立 issue(#152)に分離**: 初期実装はサイズ・件数上限のみを
+  持ち、時間軸の運用ポリシーは分けて設計する。
+
+判断区分: 系譜の保存/検索、projection 抽出、analyzer の検証/実行、diff 集計、overlay の
+突き合わせはすべて deterministic。自然言語からの analyzer spec 生成のみ reasoning_llm
+(承認は manual)。LLM は ingest のホットパスには置かない。
+
+### Phase 1 実装状態(#145)
+
+- **スキーマ**: `shared/schemas/trace_event.schema.json` に optional の `span_id` /
+  `parent_span_id` / `flow_id` / `correlation_id` / `entities`(`{type,id,role}`、
+  `role` は `source|derived|related` の有限集合)を追加。既存ペイロードは無変更で受理。
+- **SDK**: `probe_context(correlation_id, flow_id, entities)` コンテキストマネージャ
+  (`contextvars` ベース)、probe 毎の `span_id` 生成とネスト呼び出しの
+  `parent_span_id` 自動設定、`@probe(entities=[...])` / `add_entity(type,id,role)` に
+  よる明示値エンティティ付与。shadow スレッドへは `contextvars.copy_context()` で系譜を
+  引き渡し、candidate 内のネスト probe も同じ lineage に載る。probe が `off` / 無効の
+  ときは系譜処理を一切実行しない(early-return の後でのみ contextvars を読む)。
+- **永続化**: system-scoped の `trace_spans`(PK `(system_id, trace_id)`、
+  `(correlation_id)` / `(flow_id)` インデックス)と `trace_entities`
+  (`(entity_type, entity_id)` / `(trace_id)` インデックス)。既存の `traces` 書き込みは
+  変更せず、系譜は `input_json` に重ねない。エンティティは再 POST で置換(冪等)。
+- **API**: `GET /trace-lineage/entities/{entity_type}/{entity_id}`、
+  `/trace-lineage/correlations/{correlation_id}`、`/trace-lineage/flows/{flow_id}` が
+  該当トレース + span + entity を timestamp 昇順で返す(System isolation)。
+- Dashboard は未変更(Phase 3 / #147 の領分)。
+
+### Phase 2 実装状態(#146)
+
+- **スキーマ**: `shared/schemas/projection_spec.schema.json`。パス式は安全な有限
+  サブセット(`$.a.b` / `$.items[*].sku` / `[i]`)、演算は `len` / `count` / `exists` /
+  `sha256` の有限集合、出力は `fields` / `metrics` / `samples`。`entities[].id_path` と
+  `redact` を持つ。
+- **SDK 抽出エンジン**(`probe_agent/projection.py`): `eval` なしの決定的パス評価。
+  `@probe(projection=...)` / `set_projection(component_id, spec)` は登録時に **fail
+  closed** で検証。実行時抽出エラーは非致命で projection のみ落として診断に残す。
+  上限(`PROBE_PROJECTION_MAX_BYTES` / `_MAX_FIELDS` / `_MAX_SAMPLES`)超過で決定的に
+  truncate し `truncated` マーカーと `data_hash` を付与。`redact` パスは保存前に
+  置換(copy-on-write で元データを非破壊)。dict / list は値単位で精密に置換し、
+  オブジェクト属性など構造的に置換できない経路では、その redact パスと重なる抽出値を
+  丸ごとプレースホルダに置換する(fail closed)。redact パスと重なる `id_path` は
+  エンティティ化しない。`id_path` エンティティは Phase 1 の lineage entities に
+  マージされる。入力 root は `{args, kwargs}`、出力 root は戻り値。**input セクションは
+  関数実行前に抽出**され、関数が引数を破壊的に変更しても呼び出し時の値(= shadow
+  candidate が受け取る snapshot と同じ入力)を反映する。
+- **永続化**: system-scoped の `trace_projections`(`projection_name` / `phase` /
+  `data_json` / `data_hash` / `truncated` / `extract_error` / `created_at`。`phase` は
+  当面 `input | output`、`shadow_*` は Phase 5/#150 が所有)。raw payload は保存しない。
+  `(system_id, trace_id, component_id, projection_name, phase)` UNIQUE で再 POST 冪等。
+- **API**: `POST /traces` が optional の `projections` を受理、
+  `GET /traces/{trace_id}/projections` と `GET /components/{component_id}/projections`。
+  trace ペイロードに載る `projections` は `trace_event.schema.json` にも契約として
+  定義されている(Principle 3)。
+- 新環境変数は README / この節に記載。
+
+### Phase 3 実装状態(#147)
+
+- **サーバー**: 可視化用に別 endpoint を足すのではなく、既存 lineage API
+  (`/trace-lineage/{entities,correlations,flows}`)の各 step に projection を **同梱**
+  する方針を採用した(`LineageStepOut.projections`)。UI が追加リクエストなしで
+  projected fields を描画できる。決定は本節に記録(issue #147 の実装時判断)。
+  3 endpoint とも optional の `start` / `end`(unix 秒)クエリで時間窓を絞り込める。
+- **Dashboard**: 新ページ `Trace Lineage Explorer`(`/trace-lineage`、サイドバー導線)。
+  entity type + ID / correlation ID / flow ID で検索し、時間窓(From / To)と
+  コンポーネント絞り込みを併用できる。timestamp・parent_span 準拠の
+  縦タイムラインで表示する。各ノードは component_id、projected `fields` / `metrics`、
+  entity バッジ(source/derived/related)を表示し、**前ステップとの field 値変化を
+  決定的な等値比較でハイライト**する(大きい値は文字数 digest 表示)。ノードから
+  Components(`/components?component=<id>` で該当コンポーネントを直接選択)/
+  Flow Explorer へ遷移でき、lineage が無いシステムでは
+  `probe_context` / projection 設定を案内する空状態を出す。フック `useLineage`。
+  `/trace-lineage?kind=…&type=…&id=…` の deep link で検索済み状態を開ける
+  (Flow Explorer overlay からの遷移に使用)。
+- 比較・整列・変化判定はすべて deterministic(等値比較のみ、意味解釈はしない)。
+- テスト: dashboard contracts(検索→ステップ表示→変化ハイライト→空状態)、
+  サーバー lineage への projection 同梱テスト。
+
+### Phase 4a 実装状態(#148)
+
+- **スキーマ**: `shared/schemas/trace_analyzer_spec.schema.json`。`source`
+  (当面 `trace_projections`)/ `filter`(entity / components / projection_name /
+  phases / time_window)/ `select`(name + path)/ `group_by` / `order_by` /
+  `compare`(phase + fields の**契約のみ**、実行は Phase 5)。パス式は #146 の
+  projection サブセットを再利用。
+- **エンジン**(`app/trace_analyzer.py`): fail-closed な spec 検証と **read-only**
+  実行。`trace_projections` / `trace_entities` を SELECT し宣言的に評価するのみで
+  対象データへ書き込まない。上限(`ANALYZER_MAX_INPUT_ROWS` /
+  `ANALYZER_MAX_OUTPUT_BYTES` / `ANALYZER_MAX_SECONDS`)超過は run を failed にして
+  `error_details` に記録(部分結果は保存しない)。行の整列は決定的な全順序。
+- **永続化**: system-scoped の `trace_analyzers`(`spec_json` / `source` /
+  `review_status` / `decision_method` / provider·model·prompt_version·
+  schema_version〔#149 が書く〕/ `is_mock` / `reviewed_at` /
+  `review_decision_method` / timestamps)と
+  `trace_analysis_runs`(`status` / `result_json` / `error_details` / `row_count` /
+  timestamps)。監査契約(Principle 7)として本 issue がテーブルを所有。
+- **API**: `POST /trace-analyzers`(手動作成、schema 検証 fail-closed で 422)、
+  `GET /trace-analyzers` / `GET /trace-analyzers/{id}`、
+  `PUT /trace-analyzers/{id}/review`(proposed→approved/rejected の有限遷移)、
+  `POST /trace-analyzers/{id}/runs`(**approved のみ**実行可、それ以外 409)、
+  `GET /trace-analyzers/{id}/runs[/{run_id}]`。手動作成は `decision_method=manual`。
+  review 操作は常に人間の決定であり、`reviewed_at` + `review_decision_method='manual'`
+  として analyzer 行に監査記録される(`decision_method` は spec の作成主体
+  〔manual / reasoning_llm〕、`review_decision_method` は承認/却下の主体を表す)。
+- **Dashboard**: `Trace Analyzers` ページ(JSON spec 作成→review→run→結果表示)と、
+  Trace Lineage Explorer の入力ソースに「保存済み analyzer(entity filter)」を追加。
+- 新環境変数は README / この節に記載。`compare` の実行が Phase 5 の非目標である
+  ことをコードコメントとスキーマ description で明示。
+
+### Phase 4b 実装状態(#149)
+
+- **提案**(`app/trace_analyzer_proposer.py`): 自然言語 intent + 決定的コンテキスト
+  (対象 system の component_id / entity type / projection 名 / field 名 / phase の
+  実在一覧)を reasoning model に渡し、structured output を
+  `trace_analyzer_spec` として検証 → **実在チェック**(存在しない component /
+  entity type / projection name / field を参照する提案は決定的に reject)→ 合格した
+  spec を `review_status=proposed` / `decision_method=reasoning_llm` で保存。
+- **fail closed**: reasoning model 未設定(API key 欠如で client 生成失敗)・API
+  失敗・JSON でない・schema 検証失敗・実在チェック失敗はすべて **422 で失敗**し
+  heuristic フォールバックしない。失敗も含め監査記録を残す。
+- **mock**: `LLM_PROVIDER=mock` は smoke 用の明示経路。コンテキストから決定的に
+  spec を生成し `is_mock=1` を全面に付与(UI / API で mock と明示)。
+- **監査**: 成功・失敗とも `intelligence_runs`(`run_type='analyzer_proposal'`、
+  `decision_method='reasoning_llm'`、provider / model / prompt_version /
+  schema_version / status / error_details / is_mock)に永続化。analyzer 提案は
+  repository snapshot に紐づかないため `intelligence_runs.snapshot_id` を
+  **nullable 化**(既存 DB は安全な table-rebuild で移行、fresh DB は SCHEMA から)。
+  成功時は `trace_analyzers` にも provider/model/prompt/schema/is_mock を保存。
+- **承認ゲート**: 提案は既存 `PUT /trace-analyzers/{id}/review` でのみ approved に
+  なり、LLM 出力単体では実行可能にならない(#148 のゲートを再利用)。
+- **Dashboard**: Trace Analyzers ページに「Propose from natural language」入力を
+  追加。提案の provenance(reasoning_llm / mock バッジ)と review 必須を明示。
+- **API**: `POST /trace-analyzers/propose`。既存 `app/llm.py` の provider 抽象と
+  mock を再利用。prompt/schema version は `analyzer-propose-v1` /
+  `trace-analyzer-spec-v1`。
+
+### Phase 5 実装状態(#150)
+
+- **SDK**: shadow モード時、output projection spec を current 出力
+  (`phase=shadow_current`)と candidate 出力(`phase=shadow_candidate`)に適用し、
+  既存 shadow スレッド内で抽出して shadow-results ペイロードに同梱。production の
+  返り値・例外挙動は不変(Principle 1)、projection 失敗は非致命。projection 未設定の
+  コンポーネントは追加コストゼロ(spec があるときのみ抽出)。
+- **サーバー**: `ShadowResult` に optional `projections` を追加、
+  `POST /components/{id}/shadow-results` が `trace_projections` に
+  `shadow_current` / `shadow_candidate` phase で保存(trace_id で紐付け、raw 非保存)。
+- **差分集計**: analyzer 実行エンジンに `compare` 実行を実装(#148 では契約のみ)。
+  フィールド単位の決定的等値比較で `entity_count` / `diff_entity_count` /
+  `diff_fields`(フィールド別件数)/ `candidate_error_count` / `components_with_diff`
+  を算出し、diff クラス(フィールド×コンポーネント)ごとに例示トレース ID を最大
+  `ANALYZER_MAX_EXAMPLES` 件保持。**キー欠落 vs null は非等価**、**NaN は常に非等価**、
+  candidate エラーは diff ではなく `candidate_error_count` に分類(仕様化・テスト済み)。
+- **Dashboard**: analyzer run 結果に compare サマリ + 例示トレースを表示、run を
+  workspace context(`analyzer_run`)に pin 可能。Trace Lineage Explorer に
+  「Shadow compare」トグルを追加し、ノード上で current / candidate の projected
+  fields 差分をハイライト。
+- **非目標**: 数値許容誤差・意味的同等判定、差分の原因解釈(等値比較のみ)。
+
+### Phase 6 実装状態(#151)
+
+Flow Explorer(Issue #43 / #58 の静的フロー)に **runtime lineage overlay** を追加する。
+
+- **API**: `POST /repository/flow-overlay`。既存の flow graph builder で静的フローを
+  構築し、entity / correlation / flow / 保存済み analyzer(entity filter)から lineage
+  ステップを解決して突き合わせる。突き合わせは **component_id の完全一致のみ**
+  (有限の構造的判定、Principle 6)。
+- **出力**(`app/flow_overlay.py` の決定的計算): ノードごとの `observable`
+  (component_id を持つか)/ `observed` / 観測回数 / 直近観測時刻、静的エッジに対応する
+  実行時遷移の有無(`observed_transition`)、静的グラフに無い実行時遷移の一覧
+  (`divergences`、parent_span 経由で再構成)、静的グラフに現れない観測 component
+  (`unmatched_component_ids`)。probe を持たないノードは「観測対象外」として `observed`
+  と区別する。乖離の原因解釈はしない(決定的事実のみ)。
+- **Dashboard**: Flow Explorer に「Runtime overlay」パネルを追加。entity /
+  correlation / flow / 保存済み analyzer(entity filter 持ちのみ列挙)を選ぶと
+  各 probe 点の observed / unobserved / no-probe をバッジで区別し、乖離遷移を
+  強調表示する。適用中の選択は「Trace Lineage →」リンクで Trace Lineage Explorer の
+  同じ検索(deep link)に遷移できる。overlay 未選択時の既存挙動は不変。
+- **DB 所有権なし**(毎回決定的に突き合わせて算出、新規テーブルなし)。
+
+### Phase 7 実装状態(#152)
+
+運用ハードニング: sampling と retention。
+
+- **SDK sampling**: `@probe(sample_rate=...)` による **trace_id ハッシュベースの決定的
+  サンプリング**。trace 本体は常に全件送信し、lineage(span/correlation/flow/entities)
+  と projection(input/output/shadow)のみをまとめて間引く(同一 trace は全採用か全棄却)。
+  `None`=全採用、`0.0`=lineage/projection を全棄却。
+- **retention 設定**: system-scoped の `retention_policies`(target=`trace_spans` /
+  `trace_entities` / `trace_projections` / `trace_analysis_runs`、軸=`max_age_days` /
+  `max_count`)。**既定は「削除しない」**(ポリシー行が無ければ何もしない)。
+- **適用**: `POST /retention/apply` の明示トリガーで、古い順・ポリシー範囲内のみ削除。
+  `RETENTION_BATCH_SIZE`(既定 1000)で rowid バッチ削除し長時間ロックを回避。System-
+  scoped(他 system に触れない、isolation テストあり)。適用結果(対象・件数・時刻)を
+  `retention_audit` に監査記録。
+- **削除済み参照の明示**: 参照カウントはせず、analyzer run の `started_at` が
+  projection の age retention cutoff より古ければ `data_expired=true` +
+  note を返す(保守的・決定的)。
+- **API**: `GET/PUT /retention/policies`、`POST /retention/apply`、
+  `GET /retention/audit`。新環境変数は README に記載。
+- **非目標**: traces / shadow_results 本体の retention、自動アーカイブ、LLM による
+  削除判断(ポリシーは常に人間設定の決定的ルール)。
 
 ## リポジトリ設定案
 

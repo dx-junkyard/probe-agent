@@ -33,6 +33,147 @@ export interface Policy {
   mode: "off" | "trace" | "shadow";
 }
 
+// Trace lineage (Issue #145/#146/#147)
+export interface LineageEntity {
+  type: string;
+  id: string;
+  role: string;
+}
+
+export interface LineageProjection {
+  projection_name: string;
+  phase: string;
+  fields: Record<string, unknown>;
+  metrics: Record<string, unknown>;
+  samples: Record<string, unknown>;
+  data_hash: string | null;
+  truncated: boolean;
+  error: string | null;
+}
+
+export interface LineageStep {
+  trace_id: string;
+  component_id: string;
+  mode: string | null;
+  span_id: string | null;
+  parent_span_id: string | null;
+  flow_id: string | null;
+  correlation_id: string | null;
+  duration_ms: number | null;
+  timestamp: number;
+  output: string | null;
+  error: string | null;
+  entities: LineageEntity[];
+  projections: LineageProjection[];
+}
+
+export interface LineageOut {
+  query: Record<string, unknown>;
+  steps: LineageStep[];
+}
+
+// Trace analyzers (Issue #148/#149)
+export interface TraceAnalyzer {
+  id: number;
+  name: string;
+  intent: string;
+  spec: Record<string, unknown>;
+  source: string;
+  review_status: "proposed" | "approved" | "rejected";
+  decision_method: "deterministic" | "reasoning_llm" | "manual";
+  provider: string | null;
+  model: string | null;
+  prompt_version: string | null;
+  schema_version: string | null;
+  is_mock: boolean;
+  // Audit of the human review decision (set on approve/reject; always "manual").
+  reviewed_at: number | null;
+  review_decision_method: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface AnalysisRun {
+  id: number;
+  analyzer_id: number;
+  status: "pending" | "completed" | "failed";
+  result: Record<string, unknown> | null;
+  error_details: string | null;
+  row_count: number | null;
+  started_at: number;
+  completed_at: number | null;
+  data_expired?: boolean;
+  data_expired_note?: string | null;
+}
+
+// Trace Analyzer builder candidate values (Issue #157)
+export interface AnalyzerEntity {
+  entity_type: string;
+  entity_id: string;
+}
+
+export interface AnalyzerContext {
+  components: string[];
+  entity_types: string[];
+  entities: AnalyzerEntity[];
+  projection_names: string[];
+  field_names: string[];
+  phases: string[];
+  entities_truncated: boolean;
+}
+
+// Flow Explorer runtime overlay (Issue #151)
+export interface FlowOverlayNode {
+  node_id: string;
+  component_id: string | null;
+  observable: boolean;
+  observed: boolean;
+  observation_count: number;
+  last_observed_at: number | null;
+}
+
+export interface FlowOverlayEdge {
+  edge_id: string;
+  source_node_id: string;
+  target_node_id: string | null;
+  source_component_id: string | null;
+  target_component_id: string | null;
+  observed_transition: boolean;
+}
+
+export interface FlowDivergence {
+  source_component_id: string;
+  target_component_id: string;
+  count: number;
+}
+
+export interface FlowOverlayOut {
+  selection: Record<string, unknown>;
+  nodes: FlowOverlayNode[];
+  edges: FlowOverlayEdge[];
+  divergences: FlowDivergence[];
+  observed_component_ids: string[];
+  unmatched_component_ids: string[];
+  observed_trace_count: number;
+}
+
+export interface FlowOverlayRequest {
+  entrypoint_type: string;
+  entrypoint_id: string;
+  max_depth?: number;
+  max_nodes?: number;
+  snapshot_id?: number | null;
+  commit_sha?: string | null;
+  selection: {
+    kind: "entity" | "correlation" | "flow" | "analyzer";
+    entity_type?: string;
+    entity_id?: string;
+    correlation_id?: string;
+    flow_id?: string;
+    analyzer_id?: number;
+  };
+}
+
 export interface ShadowResult {
   id: number;
   trace_id: string;
@@ -120,6 +261,31 @@ export interface SnapshotOut {
   created_at: string;
   completed_at: string | null;
   files: SnapshotFileOut[];
+}
+
+// Repository refresh-hub status (Issue #158)
+export interface SnapshotRef {
+  id: number;
+  commit_sha: string;
+  status: string;
+  created_at: number;
+}
+
+export interface RepositoryStatus {
+  configured: boolean;
+  repo_path: string | null;
+  current_head: string | null;
+  head_error: string | null;
+  working_tree_dirty: boolean | null;
+  dirty_file_count: number;
+  dirty_sample: string[];
+  latest_snapshot: SnapshotRef | null;
+  latest_indexed_snapshot: SnapshotRef | null;
+  understanding_snapshot_id: number | null;
+  understanding_status: string | null;
+  snapshot_stale: boolean;
+  symbols_stale: boolean;
+  next_actions: string[];
 }
 
 export type InterviewSessionStatus = "open" | "proposals_ready" | "materialized" | "closed";
@@ -346,6 +512,11 @@ export interface InterviewDialogueTurnOut {
     probe_plan: InterviewProposalProbePlan;
     denylist_hit: string | null;
   }[];
+  // Whether this turn asked the reasoning model for proposals (gate open +
+  // generate_proposals). True with zero proposals means the model returned
+  // narrowing questions instead — show narrowing guidance, not a plain
+  // success message.
+  proposals_requested: boolean;
   next_questions: InterviewStructuredQuestion[];
   intelligence_run: IntelligenceRunOut | null;
   error: string | null;
@@ -361,6 +532,9 @@ export interface InterviewDialogueTurnOut {
   // Issue #137: every snippet actually read for this turn's evidence-selection
   // run, regardless of citation. evidence_used above is unchanged.
   evidence_reads: IntelligenceRunEvidenceOut[];
+  // Issue #142: count of question evidence_refs dropped as unverifiable
+  // (graceful fallback, not an error).
+  evidence_refs_dropped: number;
 }
 
 // --- Evidence read audit (Issue #137) -----------------------------------------
@@ -389,7 +563,10 @@ export type InterviewQaCategory = "purpose" | "capability" | "api" | "probe_flow
 // Issue #135: "runtime" questions come from reconciling approved metadata
 // against deterministic runtime trace aggregates.
 export type InterviewQaSource = "reviewer" | "dialogue" | "zero_base" | "runtime";
-export type InterviewQaStatus = "open" | "answered" | "revised" | "skipped";
+// "unconfirmed" (Issue #142): the developer explicitly could not confirm the
+// answer ("わかりません"). Recorded as valid input, re-confirmed later via a
+// hypothesis question — never treated as an answered/confirmed fact.
+export type InterviewQaStatus = "open" | "answered" | "revised" | "skipped" | "unconfirmed";
 
 export interface InterviewQaEvidenceRef {
   path: string;
@@ -1395,7 +1572,7 @@ export interface SystemProfile {
 
 // --- Decision Workspace (Issues #35-#37) ------------------------------------
 
-export type WorkspaceContextItemType = "feature" | "component" | "trace" | "experiment" | "probe_plan";
+export type WorkspaceContextItemType = "feature" | "component" | "trace" | "experiment" | "probe_plan" | "analyzer_run";
 export type WorkspaceProposalStatus = "proposed" | "accepted" | "rejected" | "deferred" | "superseded";
 
 export interface WorkspaceOut {
@@ -1635,6 +1812,9 @@ export interface IssueDraft {
   body_markdown: string;
   status: IssueDraftStatus;
   external_url?: string | null;
+  // Issue #158: computed at read time — true when the draft's snapshot/commit is
+  // behind the latest ready snapshot.
+  stale?: boolean;
   created_at: number;
   updated_at: number;
 }
@@ -1651,6 +1831,15 @@ export interface IssueDraftUpdateRequest {
   body_markdown?: string;
   status?: IssueDraftStatus;
   external_url?: string;
+}
+
+// Issue #158: whether draft -> GitHub issue creation is available for the
+// current system's configured repository.
+export interface GitHubIssueStatus {
+  available: boolean;
+  owner?: string | null;
+  repo?: string | null;
+  reason?: string | null;
 }
 
 export interface SystemUnderstandingOut {

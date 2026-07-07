@@ -40,11 +40,15 @@ from .models import (
 )
 from .probe_planner import check_denylist
 
+# v6: an explicit proposal-generation-requested section is injected when the
+# developer triggered generate_proposals with the gate open; on such turns
+# the model must return proposals OR narrowing questions, never neither
+# (empty-proposal turns previously looked like a stalled interview).
 # v5: confirmed Q&A pairs (latest revisions from interview_qa) are injected
 # with a do-not-re-ask rule (Issue #129).
 # v4: pass-1 evidence-selection prompt precedes this one when evidence
 # snippets are supplied (Issue #130); the response schema is unchanged.
-PROMPT_VERSION = "interview-v5"
+PROMPT_VERSION = "interview-v6"
 # v2: next_questions items are structured {question_text, hypothesis,
 # evidence_refs, answer_options} objects (Issue #128); plain strings are
 # still accepted and normalized.
@@ -165,6 +169,11 @@ class InterviewTurnResult:
     assistant_message: str = ""
     proposals: List[InterviewProposalResult] = field(default_factory=list)
     next_questions: List[InterviewStructuredQuestion] = field(default_factory=list)
+    # Issue #142: count of question evidence_refs dropped as unverifiable
+    # (not contained in any known snapshot span). A dropped ref is a graceful
+    # fallback, not a failure — the question is still asked without that
+    # citation, so a single bad line range never stops the interview.
+    evidence_refs_dropped: int = 0
     error: Optional[str] = None
 
 
@@ -238,6 +247,24 @@ Rules:
   or the answered open-questions already covers.
 - If you lack information to classify a symbol, say so in your message
   and ask a clarifying question in "next_questions".
+- When the user prompt contains a "Proposal generation requested" section,
+  the developer explicitly asked for proposals this turn. Produce one
+  combined proposal for every symbol whose role you can ground in the
+  context pack and the conversation so far. If you cannot propose ANY
+  symbol with confidence, do NOT reply with a plain message: explain in
+  "assistant_message" exactly what information is missing, and ask 1-3
+  focused narrowing questions in "next_questions" — each stating your best
+  "hypothesis" about which symbols or flows are worth probing (grounded in
+  the context pack, never invented) and offering "answer_options" when the
+  realistic choices form a small set — so you and the developer narrow the
+  probe targets together. On such a turn, returning both an empty
+  "proposals" and an empty "next_questions" is a contract violation and
+  will be rejected.
+- When an "Unconfirmed Q&A" block is supplied, the developer answered "I
+  don't know" for that topic. Never treat it as an established fact and never
+  stop the interview over it: form your best hypothesis from the context and
+  evidence, put it in "hypothesis", and ask one focused confirmation question
+  in "next_questions" so the developer can confirm or correct it.
 - Do not invent symbols not present in the context pack.
 """
 
@@ -283,8 +310,10 @@ def _build_user_prompt(
     gap_analysis: Optional[List[Dict[str, Any]]] = None,
     open_questions: Optional[List[Dict[str, Any]]] = None,
     answered_qa: Optional[List[Dict[str, Any]]] = None,
+    unconfirmed_qa: Optional[List[Dict[str, Any]]] = None,
     understanding_max_chars: int = DEFAULT_UNDERSTANDING_MAX_CHARS,
     evidence_snippets: Optional[List[EvidenceSnippet]] = None,
+    proposals_requested: bool = False,
 ) -> str:
     recent_history = history[-MAX_RECENT_MESSAGES:]
     parts: List[str] = []
@@ -310,6 +339,16 @@ def _build_user_prompt(
             "about these topics again, even reworded)"
         )
         parts.append(_trim_json(answered_qa, GAP_AND_QUESTION_MAX_CHARS))
+    if unconfirmed_qa:
+        parts.append(
+            "## Unconfirmed Q&A (the developer explicitly could NOT confirm these "
+            "topics — 「わかりません」/不明. Treat each as an OPEN hypothesis, never as "
+            "an established fact: propose your best hypothesis grounded in the "
+            "context pack / evidence and ask ONE focused confirmation question so "
+            "the developer can confirm or correct it. Keep going — an unknown "
+            "answer is valid input, not a reason to stop.)"
+        )
+        parts.append(_trim_json(unconfirmed_qa, GAP_AND_QUESTION_MAX_CHARS))
     if evidence_snippets:
         parts.append(
             "## Referenced source evidence (read from the pinned snapshot for this "
@@ -324,6 +363,17 @@ def _build_user_prompt(
         parts.append("## Recent conversation history")
         for msg in recent_history:
             parts.append(f"{msg['role']}: {msg['content']}")
+    if proposals_requested:
+        parts.append(
+            "## Proposal generation requested\n"
+            "The developer explicitly triggered proposal generation for this "
+            "turn. Produce combined proposals for the symbols you can ground "
+            "in the context pack and the conversation. If you cannot propose "
+            "any symbol with confidence, explain what is missing in "
+            "assistant_message and ask focused narrowing questions (with "
+            "hypothesis and answer_options) in next_questions instead — "
+            "never return neither proposals nor next_questions."
+        )
     parts.append("## Latest user message")
     parts.append(user_message)
     return "\n\n".join(parts)
@@ -388,29 +438,44 @@ def _span_matches(ref: InterviewQuestionEvidenceRef, span: Tuple[int, int]) -> b
     return ref.start_line >= start and ref.end_line <= end
 
 
-def _validate_question_evidence(
+def _ref_is_verifiable(
+    ref: InterviewQuestionEvidenceRef,
+    spans: Dict[str, List[Tuple[int, int]]],
+) -> bool:
+    """Whether an evidence ref points inside a known snapshot span.
+
+    Structural containment check over a finite, snapshot-grounded set of spans
+    (Principle 6): a known path with a line range fully contained in one of its
+    surfaced spans. Anything else is unverifiable.
+    """
+    if ref.path not in spans:
+        return False
+    if ref.start_line < 1 or ref.end_line < ref.start_line:
+        return False
+    return any(_span_matches(ref, span) for span in spans[ref.path])
+
+
+def _drop_unverifiable_evidence_refs(
     questions: List[InterviewStructuredQuestion],
     spans: Dict[str, List[Tuple[int, int]]],
-) -> Optional[str]:
-    """Structural validation of question evidence refs; returns an error or None."""
+) -> int:
+    """Drop evidence refs not contained in a known snapshot span, in place.
+
+    Issue #142: an unverifiable ref is a graceful fallback, not a fatal error.
+    Previously a single bad line range failed the whole turn closed, which —
+    combined with the interview forming hypotheses after an "I don't know"
+    answer — could stop the conversation entirely. Instead we keep the
+    question (and its hypothesis, so the developer can still confirm it) and
+    drop only the offending citation. This is deterministic structural
+    sanitization over a finite set, never a heuristic reinterpretation of the
+    model's intent. Returns the number of refs dropped.
+    """
+    dropped = 0
     for q in questions:
-        for ref in q.evidence_refs:
-            if ref.path not in spans:
-                return (
-                    f"question evidence references unknown path '{ref.path}' "
-                    "(not in context pack or current understanding)"
-                )
-            if ref.start_line < 1 or ref.end_line < ref.start_line:
-                return (
-                    f"question evidence has invalid line range "
-                    f"{ref.start_line}-{ref.end_line} for '{ref.path}'"
-                )
-            if not any(_span_matches(ref, span) for span in spans[ref.path]):
-                return (
-                    f"question evidence lines {ref.start_line}-{ref.end_line} are "
-                    f"not contained in any known span in '{ref.path}'"
-                )
-    return None
+        kept = [r for r in q.evidence_refs if _ref_is_verifiable(r, spans)]
+        dropped += len(q.evidence_refs) - len(kept)
+        q.evidence_refs = kept
+    return dropped
 
 
 def _apply_denylist(proposal: InterviewProposalResult) -> InterviewProposalResult:
@@ -444,7 +509,9 @@ def generate_interview_turn(
     gap_analysis: Optional[List[Dict[str, Any]]] = None,
     open_questions: Optional[List[Dict[str, Any]]] = None,
     answered_qa: Optional[List[Dict[str, Any]]] = None,
+    unconfirmed_qa: Optional[List[Dict[str, Any]]] = None,
     evidence_snippets: Optional[List[EvidenceSnippet]] = None,
+    proposals_requested: bool = False,
 ) -> InterviewTurnResult:
     """Generate one structured assistant turn for the interview dialogue.
 
@@ -452,15 +519,27 @@ def generate_interview_turn(
     model's working hypothesis so questions confirm/correct it instead of
     starting from scratch (Issue #128). ``answered_qa`` carries the latest
     revisions of already-answered interview_qa pairs with a do-not-re-ask
-    rule (Issue #129). ``evidence_snippets`` are source
+    rule (Issue #129). ``unconfirmed_qa`` carries Q&A rows the developer
+    could not confirm ("I don't know" — Issue #142); they are injected as
+    open hypotheses to re-confirm, never as established facts.
+    ``evidence_snippets`` are source
     fragments read from the pinned snapshot by the pass-1 evidence-selection
     step (Issue #130); when present, question evidence_refs may cite them in
     addition to context-pack/current-understanding spans.
 
+    ``proposals_requested`` is the pre-computed proposal gate from the route
+    (proposal_generation stage + generate_proposals + built or manually
+    confirmed understanding). When true, the prompt tells the model the
+    developer asked for proposals this turn, and the model must return either
+    proposals or narrowing next_questions; a response with neither fails the
+    turn closed — otherwise the interview silently stalls on a plain reply.
+
     Fail-closed: if the client is mock, the model is not a reasoning model,
-    the language/budget configuration is invalid, the API call fails, or
-    validation (including deterministic evidence-ref checks) fails, the
-    result carries an error and no proposals are stored.
+    the language/budget configuration is invalid, the API call fails, or the
+    structured output / proposal vocabulary is invalid, the result carries an
+    error and no proposals are stored. Unverifiable question evidence_refs are
+    the one non-fatal case (Issue #142): they are dropped, not failed, and the
+    count is reported in ``evidence_refs_dropped``.
     """
     is_mock = isinstance(client, MockLLMClient)
     if is_mock or not is_reasoning_model(config.provider, config.model):
@@ -493,8 +572,10 @@ def generate_interview_turn(
         gap_analysis=gap_analysis,
         open_questions=open_questions,
         answered_qa=answered_qa,
+        unconfirmed_qa=unconfirmed_qa,
         understanding_max_chars=understanding_max_chars,
         evidence_snippets=evidence_snippets,
+        proposals_requested=proposals_requested,
     )
 
     try:
@@ -576,13 +657,26 @@ def generate_interview_turn(
         allowed_spans.setdefault(snippet.path, []).append(
             (snippet.start_line, snippet.end_line)
         )
-    evidence_error = _validate_question_evidence(questions, allowed_spans)
-    if evidence_error:
+    # Issue #142: unverifiable evidence refs are dropped (graceful fallback),
+    # not fatal. The question and its hypothesis survive so the developer can
+    # still confirm it; only the uncitable line range is removed.
+    dropped = _drop_unverifiable_evidence_refs(questions, allowed_spans)
+
+    # Contract check for requested proposal turns (structural, finite —
+    # Principle 6): the model must either propose or keep narrowing with
+    # questions. A plain reply with neither previously looked like a
+    # successful turn while the proposal review stayed empty forever.
+    if proposals_requested and not proposals and not questions:
         return InterviewTurnResult(
             provider=config.provider,
             model=config.model,
             is_mock=False,
-            error=f"Question evidence validation failed: {evidence_error}",
+            error=(
+                "Proposal generation was requested but the model returned "
+                "neither proposals nor narrowing questions; the turn is "
+                "rejected so the interview does not silently stall "
+                f"(prompt {PROMPT_VERSION})"
+            ),
         )
 
     return InterviewTurnResult(
@@ -592,6 +686,7 @@ def generate_interview_turn(
         assistant_message=validated.assistant_message,
         proposals=proposals,
         next_questions=questions,
+        evidence_refs_dropped=dropped,
     )
 
 

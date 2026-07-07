@@ -710,9 +710,11 @@ def test_plain_string_question_normalized():
     assert q.evidence_refs == []
 
 
-def test_question_evidence_unknown_path_fails_closed():
-    """Evidence refs pointing outside the context pack / understanding are
-    rejected — the whole turn fails closed, no heuristic salvage."""
+def test_question_evidence_unknown_path_dropped_not_fatal():
+    """Issue #142: an evidence ref pointing outside the context pack /
+    understanding is dropped (graceful fallback), not fatal. The question and
+    its hypothesis survive so the developer can still confirm it, and no
+    heuristic salvage of the ref happens — it is simply removed."""
     response = _valid_response(proposals=[])
     response["next_questions"] = [{
         "question_text": "これは正しいですか?",
@@ -727,14 +729,16 @@ def test_question_evidence_unknown_path_fails_closed():
         context_pack=_context_pack(), history=[], user_message="質問してください",
     )
 
-    assert result.error is not None
-    assert "unknown path" in result.error
-    assert result.next_questions == []
-    assert result.proposals == []
+    assert result.error is None
+    assert len(result.next_questions) == 1
+    q = result.next_questions[0]
+    assert q.hypothesis == "仮説"
+    assert q.evidence_refs == []
+    assert result.evidence_refs_dropped == 1
 
 
-def test_question_evidence_out_of_range_fails_closed():
-    """Line ranges outside any known span for the path are rejected."""
+def test_question_evidence_out_of_range_dropped_not_fatal():
+    """Line ranges outside any known span for the path are dropped, not fatal."""
     response = _valid_response(proposals=[])
     response["next_questions"] = [{
         "question_text": "これは正しいですか?",
@@ -749,20 +753,22 @@ def test_question_evidence_out_of_range_fails_closed():
         context_pack=_context_pack(), history=[], user_message="質問してください",
     )
 
-    assert result.error is not None
-    assert "not contained" in result.error
-    assert result.next_questions == []
+    assert result.error is None
+    assert len(result.next_questions) == 1
+    assert result.next_questions[0].evidence_refs == []
+    assert result.evidence_refs_dropped == 1
 
 
-def test_question_evidence_partial_overlap_not_containment_fails_closed():
+def test_question_evidence_partial_overlap_dropped_not_fatal():
     """A range that merely overlaps a known span (rather than being fully
-    contained within it) is rejected — overlap alone is not sufficient."""
+    contained within it) is dropped — overlap alone is not containment, but it
+    is not fatal either (Issue #142)."""
     response = _valid_response(proposals=[])
     response["next_questions"] = [{
         "question_text": "これは正しいですか?",
         "hypothesis": "仮説",
         # Known span for src/summarize.py is (1, 10); this range extends
-        # far past it and must not be accepted just because it overlaps.
+        # far past it and must not be kept just because it overlaps.
         "evidence_refs": [{"path": "src/summarize.py", "start_line": 1, "end_line": 999_999}],
         "answer_options": [],
     }]
@@ -773,9 +779,81 @@ def test_question_evidence_partial_overlap_not_containment_fails_closed():
         context_pack=_context_pack(), history=[], user_message="質問してください",
     )
 
-    assert result.error is not None
-    assert "not contained" in result.error
-    assert result.next_questions == []
+    assert result.error is None
+    assert len(result.next_questions) == 1
+    assert result.next_questions[0].evidence_refs == []
+    assert result.evidence_refs_dropped == 1
+
+
+def test_question_evidence_broad_known_path_range_dropped_not_fatal():
+    """Issue #155: a known path with a range broader than the allowed span is
+    dropped instead of failing the dialogue turn."""
+    response = _valid_response(proposals=[])
+    response["next_questions"] = [
+        {
+            "question_text": "これは正しいですか?",
+            "hypothesis": "仮説",
+            "evidence_refs": [
+                {"path": "src/broad.py", "start_line": 100, "end_line": 182}
+            ],
+            "answer_options": [],
+        }
+    ]
+    client = FakeLLMClient(response=response)
+    context_pack = _context_pack(
+        [
+            InterviewSymbolItem(
+                symbol_id=7,
+                path="src/broad.py",
+                qualified_name="broad.allowed",
+                kind="function",
+                start_line=100,
+                end_line=120,
+                classification="unclassified",
+                has_metadata=False,
+                evidence=_evidence(path="src/broad.py", qname="broad.allowed"),
+            ),
+        ]
+    )
+
+    result = generate_interview_turn(
+        client, _make_config(),
+        context_pack=context_pack,
+        history=[],
+        user_message="質問してください",
+    )
+
+    assert result.error is None
+    assert len(result.next_questions) == 1
+    assert result.next_questions[0].evidence_refs == []
+    assert result.evidence_refs_dropped == 1
+
+
+def test_question_evidence_keeps_valid_drops_only_invalid():
+    """When a question mixes a valid and an invalid ref, only the invalid one
+    is dropped — the verifiable citation is preserved (Issue #142)."""
+    response = _valid_response(proposals=[])
+    response["next_questions"] = [{
+        "question_text": "これは正しいですか?",
+        "hypothesis": "仮説",
+        "evidence_refs": [
+            {"path": "src/summarize.py", "start_line": 2, "end_line": 8},
+            {"path": "src/invented.py", "start_line": 1, "end_line": 5},
+        ],
+        "answer_options": [],
+    }]
+    client = FakeLLMClient(response=response)
+
+    result = generate_interview_turn(
+        client, _make_config(),
+        context_pack=_context_pack(), history=[], user_message="質問してください",
+    )
+
+    assert result.error is None
+    assert result.evidence_refs_dropped == 1
+    refs = result.next_questions[0].evidence_refs
+    assert len(refs) == 1
+    assert refs[0].path == "src/summarize.py"
 
 
 def test_question_evidence_path_only_fails_closed():
@@ -826,3 +904,114 @@ def test_question_evidence_from_understanding_allowed():
 
     assert result.error is None
     assert result.next_questions[0].evidence_refs[0].path == "docs/design.md"
+
+
+# --- Requested proposal turns must propose or narrow (prompt interview-v6) ----
+
+
+def test_proposal_request_directive_included_in_prompt():
+    """When proposals_requested is set, the user prompt carries the explicit
+    proposal-generation-requested section so the model knows the developer
+    triggered generation (it can no longer treat the turn as a plain chat)."""
+    client = _CapturingClient()
+
+    result = generate_interview_turn(
+        client, _make_config(),
+        context_pack=_context_pack(), history=[],
+        user_message="重視したい観点は精度です",
+        proposals_requested=True,
+    )
+
+    assert result.error is None
+    user_prompt = client.messages[-1]["content"]
+    assert "Proposal generation requested" in user_prompt
+
+
+def test_proposal_request_directive_absent_without_request():
+    """Ordinary turns do not claim the developer requested proposals."""
+    client = _CapturingClient()
+
+    result = generate_interview_turn(
+        client, _make_config(),
+        context_pack=_context_pack(), history=[],
+        user_message="このシステムについて教えてください",
+    )
+
+    assert result.error is None
+    assert "Proposal generation requested" not in client.messages[-1]["content"]
+
+
+def test_requested_turn_with_neither_proposals_nor_questions_fails_closed():
+    """A requested proposal turn that returns a plain reply (no proposals, no
+    narrowing questions) violates the structured-output contract and fails
+    the turn instead of silently leaving the proposal review empty."""
+    response = {
+        "assistant_message": "現時点では特に提案はありません。",
+        "proposals": [],
+        "next_questions": [],
+    }
+    client = FakeLLMClient(response=response)
+
+    result = generate_interview_turn(
+        client, _make_config(),
+        context_pack=_context_pack(), history=[],
+        user_message="提案を生成してください",
+        proposals_requested=True,
+    )
+
+    assert result.error is not None
+    assert "neither proposals nor narrowing questions" in result.error
+    assert result.proposals == []
+    assert result.next_questions == []
+
+
+def test_requested_turn_with_narrowing_questions_is_valid():
+    """A requested proposal turn may return zero proposals as long as it
+    keeps narrowing with hypothesis questions — the interview continues."""
+    response = {
+        "assistant_message": "提案にはまず対象範囲の確認が必要です。",
+        "proposals": [],
+        "next_questions": [{
+            "question_text": "計測対象は要約フローで正しいですか?",
+            "hypothesis": "summarize.summarize_text が主要なプローブ候補",
+            "evidence_refs": [
+                {"path": "src/summarize.py", "start_line": 1, "end_line": 10},
+            ],
+            "answer_options": ["はい", "他のフローを対象にしたい"],
+        }],
+    }
+    client = FakeLLMClient(response=response)
+
+    result = generate_interview_turn(
+        client, _make_config(),
+        context_pack=_context_pack(), history=[],
+        user_message="提案を生成してください",
+        proposals_requested=True,
+    )
+
+    assert result.error is None
+    assert result.proposals == []
+    assert len(result.next_questions) == 1
+    assert result.next_questions[0].hypothesis is not None
+    assert result.next_questions[0].answer_options == ["はい", "他のフローを対象にしたい"]
+
+
+def test_unrequested_turn_with_neither_is_still_valid():
+    """The neither-case contract applies only to requested proposal turns:
+    a plain conversational reply remains valid on ordinary turns."""
+    response = {
+        "assistant_message": "了解しました。",
+        "proposals": [],
+        "next_questions": [],
+    }
+    client = FakeLLMClient(response=response)
+
+    result = generate_interview_turn(
+        client, _make_config(),
+        context_pack=_context_pack(), history=[],
+        user_message="ありがとうございます",
+    )
+
+    assert result.error is None
+    assert result.proposals == []
+    assert result.next_questions == []
