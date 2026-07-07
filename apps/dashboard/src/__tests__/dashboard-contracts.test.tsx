@@ -3457,7 +3457,7 @@ describe("Trace Analyzers page", () => {
     });
   });
 
-  test("creating an analyzer posts a parsed spec", async () => {
+  test("advanced JSON editor still posts a parsed spec", async () => {
     mockApi.get.mockImplementation((path: string) => {
       if (path === "/trace-analyzers") return Promise.resolve([]);
       return Promise.resolve([]);
@@ -3467,11 +3467,43 @@ describe("Trace Analyzers page", () => {
     render(<Page />, { wrapper: createWrapper() });
 
     fireEvent.change(screen.getByLabelText("analyzer name"), { target: { value: "my analyzer" } });
-    fireEvent.click(screen.getByRole("button", { name: /Create/ }));
+    // Advanced JSON stays available as an escape hatch (Issue #157).
+    fireEvent.click(screen.getByText("Advanced JSON editor"));
+    fireEvent.click(screen.getByRole("button", { name: /Create from JSON/ }));
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith(
         "/trace-analyzers",
         expect.objectContaining({ name: "my analyzer", spec: expect.any(Object) }),
+      );
+    });
+  });
+
+  test("template builder generates a shadow-diff spec without hand-written JSON", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/trace-analyzers") return Promise.resolve([]);
+      if (path === "/trace-analyzers/context") return Promise.resolve({
+        components: ["svc"], entity_types: ["order"],
+        entities: [{ entity_type: "order", entity_id: "o-1" }],
+        projection_names: ["orders"], field_names: ["status"],
+        phases: ["shadow_current", "shadow_candidate"], entities_truncated: false,
+      });
+      return Promise.resolve([]);
+    });
+    mockApi.post.mockResolvedValue(analyzer);
+    const { default: Page } = await import("@/pages/trace-analyzers");
+    render(<Page />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByText("Shadow diff"));
+    // Choose the field to compare from the real context (a chip button).
+    fireEvent.click(await screen.findByRole("button", { name: "status" }));
+    const preview = await screen.findByTestId("spec-preview");
+    expect(preview.textContent).toContain("shadow_current");
+    expect(preview.textContent).toContain("shadow_candidate");
+    fireEvent.click(screen.getByRole("button", { name: /Create \(proposed\)/ }));
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/trace-analyzers",
+        expect.objectContaining({ spec: expect.objectContaining({ compare: expect.any(Object) }) }),
       );
     });
   });
@@ -3526,8 +3558,10 @@ describe("Trace Analyzers page", () => {
     render(<Page />, { wrapper: createWrapper() });
 
     fireEvent.click(await screen.findByText("order flow"));
-    const summary = await screen.findByTestId("compare-summary");
-    expect(within(summary).getByText(/1\/2 entities differ/)).toBeInTheDocument();
-    expect(within(summary).getByText(/status: 1/)).toBeInTheDocument();
+    // The compare tab renders a current/candidate/changed table (Issue #157).
+    const table = await screen.findByTestId("compare-table");
+    expect(within(table).getByText(/1\/2 entities differ/)).toBeInTheDocument();
+    expect(within(table).getByText("status")).toBeInTheDocument();
+    expect(within(table).getByText("changed")).toBeInTheDocument();
   });
 });

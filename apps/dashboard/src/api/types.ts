@@ -106,6 +106,22 @@ export interface AnalysisRun {
   data_expired_note?: string | null;
 }
 
+// Trace Analyzer builder candidate values (Issue #157)
+export interface AnalyzerEntity {
+  entity_type: string;
+  entity_id: string;
+}
+
+export interface AnalyzerContext {
+  components: string[];
+  entity_types: string[];
+  entities: AnalyzerEntity[];
+  projection_names: string[];
+  field_names: string[];
+  phases: string[];
+  entities_truncated: boolean;
+}
+
 // Flow Explorer runtime overlay (Issue #151)
 export interface FlowOverlayNode {
   node_id: string;
@@ -245,6 +261,31 @@ export interface SnapshotOut {
   created_at: string;
   completed_at: string | null;
   files: SnapshotFileOut[];
+}
+
+// Repository refresh-hub status (Issue #158)
+export interface SnapshotRef {
+  id: number;
+  commit_sha: string;
+  status: string;
+  created_at: number;
+}
+
+export interface RepositoryStatus {
+  configured: boolean;
+  repo_path: string | null;
+  current_head: string | null;
+  head_error: string | null;
+  working_tree_dirty: boolean | null;
+  dirty_file_count: number;
+  dirty_sample: string[];
+  latest_snapshot: SnapshotRef | null;
+  latest_indexed_snapshot: SnapshotRef | null;
+  understanding_snapshot_id: number | null;
+  understanding_status: string | null;
+  snapshot_stale: boolean;
+  symbols_stale: boolean;
+  next_actions: string[];
 }
 
 export type InterviewSessionStatus = "open" | "proposals_ready" | "materialized" | "closed";
@@ -1766,6 +1807,9 @@ export interface IssueDraft {
   body_markdown: string;
   status: IssueDraftStatus;
   external_url?: string | null;
+  // Issue #158: computed at read time — true when the draft's snapshot/commit is
+  // behind the latest ready snapshot.
+  stale?: boolean;
   created_at: number;
   updated_at: number;
 }
