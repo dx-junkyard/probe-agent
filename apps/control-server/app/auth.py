@@ -1,4 +1,3 @@
-import os
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -13,7 +12,7 @@ from .security import hash_token
 class Principal:
     """Resolved caller identity for a request."""
 
-    auth: str  # "token" | "legacy_api_key" | "anonymous"
+    auth: str  # "token" | "anonymous"
     user_id: Optional[int] = None
     username: Optional[str] = None
     role: Optional[str] = None
@@ -26,13 +25,6 @@ class Principal:
         return self.role == "admin"
 
 
-def _legacy_keys() -> Optional[set]:
-    raw = os.getenv("CONTROL_API_KEYS", "").strip()
-    if not raw:
-        return None
-    return {k.strip() for k in raw.split(",") if k.strip()}
-
-
 def _users_exist() -> bool:
     with get_conn() as conn:
         row = conn.execute("SELECT 1 FROM users LIMIT 1").fetchone()
@@ -40,8 +32,8 @@ def _users_exist() -> bool:
 
 
 def auth_enabled() -> bool:
-    """Auth is active once any user exists or legacy keys are configured."""
-    return _users_exist() or _legacy_keys() is not None
+    """Auth is active once any user exists."""
+    return _users_exist()
 
 
 def _extract_token(authorization: Optional[str], x_api_key: Optional[str]) -> Optional[str]:
@@ -103,10 +95,6 @@ async def get_principal(
     if principal is not None:
         return principal
 
-    legacy = _legacy_keys()
-    if legacy is not None and token in legacy:
-        return Principal(auth="legacy_api_key", role="service")
-
     raise HTTPException(status_code=401, detail="Invalid or revoked credentials")
 
 
@@ -117,7 +105,7 @@ async def require_admin(principal: Principal = Depends(get_principal)) -> Princi
 
 
 async def require_user(principal: Principal = Depends(get_principal)) -> Principal:
-    """Require a caller backed by a user account (legacy keys/anonymous fail)."""
+    """Require a caller backed by a user account (anonymous callers fail)."""
     if principal.user_id is None:
         raise HTTPException(status_code=403, detail="A user account is required")
     return principal
@@ -140,15 +128,17 @@ async def get_system_id(
     """Resolve the system for data-plane and dashboard requests.
 
     SDK API tokens are permanently bound to one system. Login sessions choose
-    a system with X-Probe-System-Id, while legacy/anonymous callers retain the
-    pre-system behavior through the automatically created Legacy System.
+    a system with X-Probe-System-Id, while anonymous callers (no user
+    bootstrapped yet) retain the pre-system behavior through the
+    automatically created Legacy System. Anonymous mode is a bootstrap-only
+    fallback, not a supported route for SDK trace submission.
     """
     if principal.token_kind == "api":
         if principal.system_id is None:
             raise HTTPException(status_code=403, detail="API token is not bound to a system")
         return principal.system_id
 
-    if principal.auth in ("legacy_api_key", "anonymous"):
+    if principal.auth == "anonymous":
         return _legacy_system_id()
 
     if x_probe_system_id is None:

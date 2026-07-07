@@ -6,7 +6,6 @@ services:
     container_name: probe-control-server
     environment:
       PROBE_DB_PATH: /data/probe.db
-      CONTROL_API_KEYS: ${CONTROL_API_KEYS:-}
       CONTROL_ADMIN_USERNAME: ${CONTROL_ADMIN_USERNAME:-}
       CONTROL_ADMIN_PASSWORD: ${CONTROL_ADMIN_PASSWORD:-}
       LLM_PROVIDER: ${LLM_PROVIDER:-openai}
