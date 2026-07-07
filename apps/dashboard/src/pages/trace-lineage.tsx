@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { useLineage, useAnalyzers, type LineageQuery } from "@/api/hooks";
 import type { LineageStep } from "@/api/types";
 import { Card, CardContent } from "@/components/ui/card";
@@ -75,14 +75,44 @@ function digest(v: unknown): string {
   return s;
 }
 
+// datetime-local value -> unix seconds (undefined when empty/invalid).
+function toEpoch(v: string): number | undefined {
+  if (!v) return undefined;
+  const ms = Date.parse(v);
+  return Number.isNaN(ms) ? undefined : ms / 1000;
+}
+
+// Deep link (Issue #151 navigation): /trace-lineage?kind=entity&type=order&id=o-1,
+// ?kind=correlation&id=… or ?kind=flow&id=…
+function queryFromParams(params: URLSearchParams): LineageQuery | null {
+  const kind = params.get("kind");
+  const id = params.get("id");
+  if (kind === "entity") {
+    const type = params.get("type");
+    return type && id ? { kind: "entity", entityType: type, entityId: id } : null;
+  }
+  if ((kind === "correlation" || kind === "flow") && id) return { kind, id };
+  return null;
+}
+
 export default function TraceLineagePage() {
-  const [kind, setKind] = useState<SearchKind>("entity");
-  const [entityType, setEntityType] = useState("");
-  const [entityId, setEntityId] = useState("");
-  const [singleId, setSingleId] = useState("");
+  const [searchParams] = useSearchParams();
+  const [initialQuery] = useState<LineageQuery | null>(() => queryFromParams(searchParams));
+  const [kind, setKind] = useState<SearchKind>(initialQuery?.kind ?? "entity");
+  const [entityType, setEntityType] = useState(
+    initialQuery?.kind === "entity" ? initialQuery.entityType : "",
+  );
+  const [entityId, setEntityId] = useState(
+    initialQuery?.kind === "entity" ? initialQuery.entityId : "",
+  );
+  const [singleId, setSingleId] = useState(
+    initialQuery && initialQuery.kind !== "entity" ? initialQuery.id : "",
+  );
   const [componentFilter, setComponentFilter] = useState("");
+  const [windowStart, setWindowStart] = useState("");
+  const [windowEnd, setWindowEnd] = useState("");
   const [shadowCompare, setShadowCompare] = useState(false);
-  const [activeQuery, setActiveQuery] = useState<LineageQuery | null>(null);
+  const [activeQuery, setActiveQuery] = useState<LineageQuery | null>(initialQuery);
 
   const { data, isLoading, isError } = useLineage(activeQuery);
   const { data: analyzers } = useAnalyzers();
@@ -91,12 +121,14 @@ export default function TraceLineagePage() {
   );
 
   const submit = () => {
+    const start = toEpoch(windowStart);
+    const end = toEpoch(windowEnd);
     if (kind === "entity") {
       if (!entityType.trim() || !entityId.trim()) return;
-      setActiveQuery({ kind: "entity", entityType: entityType.trim(), entityId: entityId.trim() });
+      setActiveQuery({ kind: "entity", entityType: entityType.trim(), entityId: entityId.trim(), start, end });
     } else if (kind === "correlation" || kind === "flow") {
       if (!singleId.trim()) return;
-      setActiveQuery({ kind, id: singleId.trim() });
+      setActiveQuery({ kind, id: singleId.trim(), start, end });
     }
   };
 
@@ -204,6 +236,26 @@ export default function TraceLineagePage() {
                 value={componentFilter}
                 onChange={(e) => setComponentFilter(e.target.value)}
                 className="w-48"
+              />
+            </div>
+            <div className="space-y-1">
+              <Label className="text-xs">From</Label>
+              <Input
+                aria-label="time window start"
+                type="datetime-local"
+                value={windowStart}
+                onChange={(e) => setWindowStart(e.target.value)}
+                className="w-52"
+              />
+            </div>
+            <div className="space-y-1">
+              <Label className="text-xs">To</Label>
+              <Input
+                aria-label="time window end"
+                type="datetime-local"
+                value={windowEnd}
+                onChange={(e) => setWindowEnd(e.target.value)}
+                className="w-52"
               />
             </div>
             <Button onClick={submit}>Search</Button>
@@ -322,7 +374,12 @@ export default function TraceLineagePage() {
 
                     <div className="flex items-center gap-3 text-xs">
                       <span className="font-mono text-muted-foreground">{step.trace_id.slice(0, 12)}</span>
-                      <Link to="/components" className="text-primary underline">Component</Link>
+                      <Link
+                        to={`/components?component=${encodeURIComponent(step.component_id)}`}
+                        className="text-primary underline"
+                      >
+                        Component
+                      </Link>
                       <Link to="/flow-explorer" className="text-primary underline">Flow Explorer</Link>
                     </div>
                   </CardContent>

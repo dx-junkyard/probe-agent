@@ -91,6 +91,19 @@ def test_review_transitions(client):
     assert r.json()["review_status"] == "rejected"
 
 
+def test_review_records_manual_decision(client):
+    """The approve/reject act itself is audited as a manual decision
+    (Principle 7), separate from who authored the spec."""
+    a = _create(client)
+    assert a["reviewed_at"] is None
+    assert a["review_decision_method"] is None
+    _approve(client, a["id"])
+    got = client.get(f"/trace-analyzers/{a['id']}").json()
+    assert got["review_status"] == "approved"
+    assert got["reviewed_at"] is not None
+    assert got["review_decision_method"] == "manual"
+
+
 # --- execution --------------------------------------------------------------
 
 def test_select_and_filter(client):

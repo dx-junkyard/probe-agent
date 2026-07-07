@@ -70,16 +70,25 @@ def handle(order):
 
 - 演算は `len` / `count` / `exists` / `sha256` の有限集合のみ（`op`）。`samples` は先頭 N 件。
 - `entities[].id_path` で抽出したエンティティは Phase 1 の lineage に反映される。
-- `redact` 指定のパスは保存前にプレースホルダへ置換される。
+  `redact` パスと重なる `id_path` はエンティティ化されない(fail closed)。
+- `redact` 指定のパスは保存前にプレースホルダへ置換される。dict / list 構造は
+  値だけを精密に置換する。オブジェクト属性など構造的に置換できない経路では、
+  その redact パスと重なるパスの抽出値を**丸ごとプレースホルダに置換**する
+  (fail closed — 取りこぼしより過剰マスクを選ぶ)。
 - 上限超過時は決定的に丸められ `truncated=true` になり、`data_hash` が常に付与される。
 - spec は登録時に検証（**fail closed**、不正な spec は即エラー）。実行時の抽出エラーは
   **非致命**で、対象関数は動き続け projection のみ診断として落ちる。
 - 入力の root は `{"args": [...], "kwargs": {...}}`、出力の root は戻り値。
+- `input` セクションは**関数実行前**に抽出される。関数が引数を破壊的に変更しても
+  input projection は呼び出し時の値を反映し、shadow candidate が受け取る snapshot と
+  同じ入力を表す(Issue #146 の deepcopy 相互作用)。
 - `set_projection(component_id, spec)` でも登録できる。
 - shadow モードでは、projection の `output` セクションが current 出力
-  (`phase=shadow_current`)と candidate 出力(`phase=shadow_candidate`)にも適用され、
-  shadow スレッド内で抽出されて比較用に送信される(Issue #150)。production の返り値は
-  不変で、candidate がエラーなら `shadow_candidate` は送られない。
+  (`phase=shadow_current`)と candidate 出力(`phase=shadow_candidate`)にも適用される
+  (Issue #150)。`shadow_current` は**呼び出し元スレッドで**返却直後に抽出され
+  (呼び出し元による返り値の mutation と競合しない)、candidate 出力は shadow
+  スレッド内で抽出される。production の返り値は不変で、candidate がエラーなら
+  `shadow_candidate` は送られない。
 
 ## サンプリング（Issue #152 / Phase 7）
 

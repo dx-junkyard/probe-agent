@@ -69,6 +69,40 @@ def test_wildcard_field_returns_list():
     assert p["fields"]["skus"][:2] == ["s0", "s1"]
 
 
+def test_redaction_fails_closed_for_object_attributes():
+    """Structural redaction cannot rewrite object attributes, so extraction
+    must mask any value whose path overlaps a redact path it could not apply."""
+    class Order:
+        def __init__(self):
+            self.id = "o-1"
+            self.secret = "sk-XYZ"
+
+    spec = compile_spec({
+        "name": "obj",
+        "output": {"fields": {"secret": "$.secret", "id": "$.id", "whole": "$"}},
+        "redact": ["$.secret"],
+    })
+    p = extract(spec, output_root=Order())[0][0]
+    # Exact overlap: masked, not leaked via attribute access.
+    assert p["fields"]["secret"] == P._REDACTED
+    # "$" is a prefix of the blocked redact path -> masked (fail closed);
+    # a repr of the whole object could otherwise leak the attribute.
+    assert p["fields"]["whole"] == P._REDACTED
+    assert "sk-XYZ" not in str(p)
+    # Non-overlapping paths keep working (over-masking is bounded).
+    assert p["fields"]["id"] == "o-1"
+
+
+def test_entity_id_path_never_resolves_redacted_value():
+    spec = compile_spec({
+        "name": "ent-redact",
+        "entities": [{"type": "secret", "id_path": "$.order.secret", "role": "related"}],
+        "redact": ["$.order.secret"],
+    })
+    _, entities = extract(spec, output_root=_big_payload())
+    assert entities == []
+
+
 def test_redaction_replaces_value_before_save():
     spec = compile_spec({
         "name": "r",

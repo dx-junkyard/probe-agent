@@ -97,20 +97,27 @@ export function useUpdatePolicy() {
   });
 }
 
-// Trace lineage (Issue #147). kind selects the query dimension.
+// Trace lineage (Issue #147). kind selects the query dimension; start/end are
+// an optional time window (unix seconds).
 export type LineageQuery =
-  | { kind: "entity"; entityType: string; entityId: string }
-  | { kind: "correlation"; id: string }
-  | { kind: "flow"; id: string };
+  | { kind: "entity"; entityType: string; entityId: string; start?: number; end?: number }
+  | { kind: "correlation"; id: string; start?: number; end?: number }
+  | { kind: "flow"; id: string; start?: number; end?: number };
 
 function lineagePath(q: LineageQuery): string {
+  let path: string;
   if (q.kind === "entity") {
-    return `/trace-lineage/entities/${encodeURIComponent(q.entityType)}/${encodeURIComponent(q.entityId)}`;
+    path = `/trace-lineage/entities/${encodeURIComponent(q.entityType)}/${encodeURIComponent(q.entityId)}`;
+  } else if (q.kind === "correlation") {
+    path = `/trace-lineage/correlations/${encodeURIComponent(q.id)}`;
+  } else {
+    path = `/trace-lineage/flows/${encodeURIComponent(q.id)}`;
   }
-  if (q.kind === "correlation") {
-    return `/trace-lineage/correlations/${encodeURIComponent(q.id)}`;
-  }
-  return `/trace-lineage/flows/${encodeURIComponent(q.id)}`;
+  const params = new URLSearchParams();
+  if (q.start != null) params.set("start", String(q.start));
+  if (q.end != null) params.set("end", String(q.end));
+  const qs = params.toString();
+  return qs ? `${path}?${qs}` : path;
 }
 
 function lineageReady(q: LineageQuery | null): boolean {

@@ -1184,14 +1184,21 @@ Issue #144 に集約し、実装は以下の sub-issue に依存順で分割し�
   closed** で検証。実行時抽出エラーは非致命で projection のみ落として診断に残す。
   上限(`PROBE_PROJECTION_MAX_BYTES` / `_MAX_FIELDS` / `_MAX_SAMPLES`)超過で決定的に
   truncate し `truncated` マーカーと `data_hash` を付与。`redact` パスは保存前に
-  置換(copy-on-write でキャラ元データを非破壊)。`id_path` エンティティは Phase 1 の
-  lineage entities にマージされる。入力 root は `{args, kwargs}`、出力 root は戻り値。
+  置換(copy-on-write で元データを非破壊)。dict / list は値単位で精密に置換し、
+  オブジェクト属性など構造的に置換できない経路では、その redact パスと重なる抽出値を
+  丸ごとプレースホルダに置換する(fail closed)。redact パスと重なる `id_path` は
+  エンティティ化しない。`id_path` エンティティは Phase 1 の lineage entities に
+  マージされる。入力 root は `{args, kwargs}`、出力 root は戻り値。**input セクションは
+  関数実行前に抽出**され、関数が引数を破壊的に変更しても呼び出し時の値(= shadow
+  candidate が受け取る snapshot と同じ入力)を反映する。
 - **永続化**: system-scoped の `trace_projections`(`projection_name` / `phase` /
   `data_json` / `data_hash` / `truncated` / `extract_error` / `created_at`。`phase` は
   当面 `input | output`、`shadow_*` は Phase 5/#150 が所有)。raw payload は保存しない。
   `(system_id, trace_id, component_id, projection_name, phase)` UNIQUE で再 POST 冪等。
 - **API**: `POST /traces` が optional の `projections` を受理、
   `GET /traces/{trace_id}/projections` と `GET /components/{component_id}/projections`。
+  trace ペイロードに載る `projections` は `trace_event.schema.json` にも契約として
+  定義されている(Principle 3)。
 - 新環境変数は README / この節に記載。
 
 ### Phase 3 実装状態(#147)
@@ -1200,13 +1207,18 @@ Issue #144 に集約し、実装は以下の sub-issue に依存順で分割し�
   (`/trace-lineage/{entities,correlations,flows}`)の各 step に projection を **同梱**
   する方針を採用した(`LineageStepOut.projections`)。UI が追加リクエストなしで
   projected fields を描画できる。決定は本節に記録(issue #147 の実装時判断)。
+  3 endpoint とも optional の `start` / `end`(unix 秒)クエリで時間窓を絞り込める。
 - **Dashboard**: 新ページ `Trace Lineage Explorer`(`/trace-lineage`、サイドバー導線)。
-  entity type + ID / correlation ID / flow ID で検索し、timestamp・parent_span 準拠の
+  entity type + ID / correlation ID / flow ID で検索し、時間窓(From / To)と
+  コンポーネント絞り込みを併用できる。timestamp・parent_span 準拠の
   縦タイムラインで表示する。各ノードは component_id、projected `fields` / `metrics`、
   entity バッジ(source/derived/related)を表示し、**前ステップとの field 値変化を
   決定的な等値比較でハイライト**する(大きい値は文字数 digest 表示)。ノードから
-  Components / Flow Explorer へ遷移でき、lineage が無いシステムでは
+  Components(`/components?component=<id>` で該当コンポーネントを直接選択)/
+  Flow Explorer へ遷移でき、lineage が無いシステムでは
   `probe_context` / projection 設定を案内する空状態を出す。フック `useLineage`。
+  `/trace-lineage?kind=…&type=…&id=…` の deep link で検索済み状態を開ける
+  (Flow Explorer overlay からの遷移に使用)。
 - 比較・整列・変化判定はすべて deterministic(等値比較のみ、意味解釈はしない)。
 - テスト: dashboard contracts(検索→ステップ表示→変化ハイライト→空状態)、
   サーバー lineage への projection 同梱テスト。
@@ -1225,7 +1237,8 @@ Issue #144 に集約し、実装は以下の sub-issue に依存順で分割し�
   `error_details` に記録(部分結果は保存しない)。行の整列は決定的な全順序。
 - **永続化**: system-scoped の `trace_analyzers`(`spec_json` / `source` /
   `review_status` / `decision_method` / provider·model·prompt_version·
-  schema_version〔#149 が書く〕/ `is_mock` / timestamps)と
+  schema_version〔#149 が書く〕/ `is_mock` / `reviewed_at` /
+  `review_decision_method` / timestamps)と
   `trace_analysis_runs`(`status` / `result_json` / `error_details` / `row_count` /
   timestamps)。監査契約(Principle 7)として本 issue がテーブルを所有。
 - **API**: `POST /trace-analyzers`(手動作成、schema 検証 fail-closed で 422)、
@@ -1233,6 +1246,9 @@ Issue #144 に集約し、実装は以下の sub-issue に依存順で分割し�
   `PUT /trace-analyzers/{id}/review`(proposed→approved/rejected の有限遷移)、
   `POST /trace-analyzers/{id}/runs`(**approved のみ**実行可、それ以外 409)、
   `GET /trace-analyzers/{id}/runs[/{run_id}]`。手動作成は `decision_method=manual`。
+  review 操作は常に人間の決定であり、`reviewed_at` + `review_decision_method='manual'`
+  として analyzer 行に監査記録される(`decision_method` は spec の作成主体
+  〔manual / reasoning_llm〕、`review_decision_method` は承認/却下の主体を表す)。
 - **Dashboard**: `Trace Analyzers` ページ(JSON spec 作成→review→run→結果表示)と、
   Trace Lineage Explorer の入力ソースに「保存済み analyzer(entity filter)」を追加。
 - 新環境変数は README / この節に記載。`compare` の実行が Phase 5 の非目標である
@@ -1302,8 +1318,10 @@ Flow Explorer(Issue #43 / #58 の静的フロー)に **runtime lineage overlay**
   (`unmatched_component_ids`)。probe を持たないノードは「観測対象外」として `observed`
   と区別する。乖離の原因解釈はしない(決定的事実のみ)。
 - **Dashboard**: Flow Explorer に「Runtime overlay」パネルを追加。entity /
-  correlation / flow を選ぶと各 probe 点の observed / unobserved / no-probe を
-  バッジで区別し、乖離遷移を強調表示する。overlay 未選択時の既存挙動は不変。
+  correlation / flow / 保存済み analyzer(entity filter 持ちのみ列挙)を選ぶと
+  各 probe 点の observed / unobserved / no-probe をバッジで区別し、乖離遷移を
+  強調表示する。適用中の選択は「Trace Lineage →」リンクで Trace Lineage Explorer の
+  同じ検索(deep link)に遷移できる。overlay 未選択時の既存挙動は不変。
 - **DB 所有権なし**(毎回決定的に突き合わせて算出、新規テーブルなし)。
 
 ### Phase 7 実装状態(#152)

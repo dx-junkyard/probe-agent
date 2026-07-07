@@ -157,6 +157,12 @@ def probe(
     "role"}`` or ``(type, id[, role])``) attached to every trace this probe
     emits, in addition to any entities on the active ``probe_context``. Values
     are supplied by the caller; no extraction is performed here (Phase 2).
+
+    ``projection`` is a declarative extraction spec (Issue #146), validated
+    fail-closed at decoration time. The input phase is extracted before the
+    function runs (reflecting the arguments as received); the output phase
+    after it returns. ``sample_rate`` (Issue #152) deterministically thins
+    lineage + projections by trace_id hash; the trace body is always sent.
     """
     if candidate is not None:
         set_candidate(component_id, candidate)
@@ -204,6 +210,23 @@ def probe(
             # lineage. contextvars are not inherited by threads otherwise.
             shadow_ctx = contextvars.copy_context() if run_shadow else None
 
+            spec = _get_projection(component_id) if keep_enrichment else None
+            proj_payloads: List[Dict[str, Any]] = []
+            proj_entities: List[Dict[str, str]] = []
+            if spec is not None:
+                # Input projection is extracted BEFORE fn runs so it reflects
+                # the arguments as received — the same values a shadow
+                # candidate sees via the pre-call snapshot — even when fn
+                # mutates its arguments. Non-fatal like all extraction.
+                try:
+                    payloads, ents = _projection.extract(
+                        spec, input_root={"args": list(args), "kwargs": dict(kwargs)}
+                    )
+                    proj_payloads.extend(payloads)
+                    proj_entities.extend(ents)
+                except Exception:  # noqa: BLE001
+                    logger.debug("input projection extraction failed", exc_info=True)
+
             try:
                 try:
                     output = fn(*args, **kwargs)
@@ -228,23 +251,18 @@ def probe(
             if keep_enrichment:
                 trace.update(lineage)
 
-            spec = _get_projection(component_id)
-            if spec is not None and keep_enrichment:
-                # Extraction is non-fatal: a bad projection must not break the
-                # host function. Input root is a stable {args, kwargs} envelope;
-                # output root is the return value (absent when fn raised).
+            if spec is not None and raised is None:
+                # Output projection (the input phase was extracted pre-call).
                 try:
-                    input_root = {"args": list(args), "kwargs": dict(kwargs)}
-                    output_root = _projection._MISSING if raised else output
-                    payloads, proj_entities = _projection.extract(
-                        spec, input_root=input_root, output_root=output_root
-                    )
-                    if payloads:
-                        trace["projections"] = payloads
-                    if proj_entities:
-                        trace["entities"] = list(trace.get("entities", [])) + proj_entities
+                    payloads, ents = _projection.extract(spec, output_root=output)
+                    proj_payloads.extend(payloads)
+                    proj_entities.extend(ents)
                 except Exception:  # noqa: BLE001
-                    logger.debug("projection extraction failed", exc_info=True)
+                    logger.debug("output projection extraction failed", exc_info=True)
+            if proj_payloads:
+                trace["projections"] = proj_payloads
+            if proj_entities:
+                trace["entities"] = list(trace.get("entities", [])) + proj_entities
 
             try:
                 _client.send_trace(trace)
@@ -255,10 +273,16 @@ def probe(
                 cand = _get_candidate(component_id)
                 if cand is not None:
                     current_output_repr = _safe_repr(output)
+                    # shadow_current is projected here, in the caller's thread,
+                    # so a caller mutating the returned object cannot race the
+                    # shadow thread into a spurious current-vs-candidate diff.
+                    current_projection = (
+                        _projection.extract_phase(spec, output, "shadow_current")
+                        if spec is not None else None
+                    )
                     _spawn_shadow(
                         component_id, trace_id, cand, args_snap, kwargs_snap,
-                        current_output_repr, shadow_ctx,
-                        spec if keep_enrichment else None, output,
+                        current_output_repr, shadow_ctx, spec, current_projection,
                     )
 
             if raised is not None:
@@ -279,7 +303,7 @@ def _spawn_shadow(
     current_output_repr: str,
     shadow_ctx: Optional[contextvars.Context] = None,
     spec: "Optional[_projection.ProjectionSpec]" = None,
-    current_output: Any = None,
+    current_projection: Optional[Dict[str, Any]] = None,
 ) -> None:
     _ensure_atexit()
 
@@ -303,23 +327,22 @@ def _spawn_shadow(
                 "candidate_duration_ms": c_duration,
                 "timestamp": time.time(),
             }
-            # Shadow projections (Issue #150): project current + candidate
-            # output under shadow_* phases. Only when a spec is registered, so
-            # unprojected components incur zero extra cost. Non-fatal.
-            if spec is not None:
-                projections = []
+            # Shadow projections (Issue #150): shadow_current was projected in
+            # the caller's thread; the candidate output is projected here. Only
+            # when a spec is registered, so unprojected components incur zero
+            # extra cost. Non-fatal.
+            projections = []
+            if current_projection is not None:
+                projections.append(current_projection)
+            if spec is not None and c_error is None:
                 try:
-                    cur = _projection.extract_phase(spec, current_output, "shadow_current")
-                    if cur is not None:
-                        projections.append(cur)
-                    if c_error is None:
-                        cand_proj = _projection.extract_phase(spec, c_output, "shadow_candidate")
-                        if cand_proj is not None:
-                            projections.append(cand_proj)
+                    cand_proj = _projection.extract_phase(spec, c_output, "shadow_candidate")
+                    if cand_proj is not None:
+                        projections.append(cand_proj)
                 except Exception:  # noqa: BLE001
                     logger.debug("shadow projection failed", exc_info=True)
-                if projections:
-                    payload["projections"] = projections
+            if projections:
+                payload["projections"] = projections
             try:
                 _client.send_shadow_result(payload)
             except Exception:  # noqa: BLE001

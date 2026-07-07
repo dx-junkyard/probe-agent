@@ -61,6 +61,24 @@ def test_entity_lineage_time_ordered(client):
     assert steps[0]["entities"][0]["role"] == "derived"
 
 
+def test_time_window_filters_steps(client):
+    """Issue #147: optional start/end (unix seconds) bound the lineage query."""
+    for tid, ts in (("t1", 100.0), ("t2", 200.0), ("t3", 300.0)):
+        client.post("/traces", json=_trace(
+            tid, ts=ts, correlation_id="corr-w",
+            entities=[{"type": "order", "id": "o1", "role": "source"}]))
+
+    steps = client.get(
+        "/trace-lineage/correlations/corr-w", params={"start": 150.0, "end": 250.0}
+    ).json()["steps"]
+    assert [s["trace_id"] for s in steps] == ["t2"]
+
+    steps = client.get(
+        "/trace-lineage/entities/order/o1", params={"start": 150.0}
+    ).json()["steps"]
+    assert [s["trace_id"] for s in steps] == ["t2", "t3"]
+
+
 def test_correlation_lineage(client):
     client.post("/traces", json=_trace("b", ts=2.0, correlation_id="corr-1"))
     client.post("/traces", json=_trace("a", ts=1.0, correlation_id="corr-1"))
