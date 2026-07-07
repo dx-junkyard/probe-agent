@@ -37,6 +37,25 @@
         },
         "additionalProperties": false
       }
+    },
+    "projections": {
+      "type": ["array", "null"],
+      "description": "Projection extraction results attached to this trace (Issue #146). Bounded, structured slices produced by a projection_spec — never the raw payload. shadow_* phases normally arrive on shadow results (Issue #150) but are accepted here for contract parity with the server model.",
+      "items": {
+        "type": "object",
+        "required": ["projection_name"],
+        "properties": {
+          "projection_name": { "type": "string" },
+          "phase": { "type": "string", "enum": ["input", "output", "shadow_current", "shadow_candidate"] },
+          "fields":  { "type": "object" },
+          "metrics": { "type": "object" },
+          "samples": { "type": "object" },
+          "data_hash": { "type": ["string", "null"] },
+          "truncated": { "type": "boolean" },
+          "error": { "type": ["string", "null"], "description": "Non-fatal extraction diagnostic; set when extraction failed and fields/metrics/samples are empty." }
+        },
+        "additionalProperties": false
+      }
     }
   },
   "additionalProperties": false

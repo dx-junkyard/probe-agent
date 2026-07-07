@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import {
   useComponents, useTraces, useUpdatePolicy,
   useComponentProfile, useUpdateComponentProfile,
@@ -24,8 +25,12 @@ const MODE_VARIANT: Record<string, "secondary" | "success" | "warning"> = {
 };
 
 export default function ComponentsPage() {
+  const [searchParams] = useSearchParams();
   const { data: components, isLoading } = useComponents();
-  const [selected, setSelected] = useState<string | null>(null);
+  // Deep link from Trace Lineage / analyzer results: /components?component=<id>
+  const [selected, setSelected] = useState<string | null>(
+    searchParams.get("component"),
+  );
   const updatePolicy = useUpdatePolicy();
   const { data: traces } = useTraces(selected, 20);
   const { data: profile } = useComponentProfile(selected);

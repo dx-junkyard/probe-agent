@@ -54,6 +54,8 @@ def _row_to_analyzer(row) -> TraceAnalyzerOut:
         prompt_version=row["prompt_version"],
         schema_version=row["schema_version"],
         is_mock=bool(row["is_mock"]),
+        reviewed_at=row["reviewed_at"],
+        review_decision_method=row["review_decision_method"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -198,10 +200,15 @@ def review_analyzer(
         row = _fetch_analyzer(conn, system_id, analyzer_id)
         if row["review_status"] not in ("proposed", "approved", "rejected"):
             raise HTTPException(409, "analyzer is not in a reviewable state")
+        now = time.time()
+        # The review action is always a human decision; record it as such
+        # (decision_method on the row describes who authored the spec, this
+        # records who approved/rejected it — Principle 7).
         conn.execute(
-            "UPDATE trace_analyzers SET review_status = ?, updated_at = ? "
+            "UPDATE trace_analyzers SET review_status = ?, reviewed_at = ?, "
+            "review_decision_method = 'manual', updated_at = ? "
             "WHERE id = ? AND system_id = ?",
-            (body.review_status, time.time(), analyzer_id, system_id),
+            (body.review_status, now, now, analyzer_id, system_id),
         )
         row = _fetch_analyzer(conn, system_id, analyzer_id)
     return _row_to_analyzer(row)

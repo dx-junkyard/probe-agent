@@ -3368,6 +3368,52 @@ describe("Trace Lineage Explorer page", () => {
     expect(await screen.findByText(/No lineage found/)).toBeInTheDocument();
     expect(screen.getByText(/probe_context/)).toBeInTheDocument();
   });
+
+  test("time window inputs add start/end to the lineage query", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path.startsWith("/trace-lineage/entities/")) return Promise.resolve(lineageResponse());
+      return Promise.resolve({});
+    });
+    const { default: TraceLineagePage } = await import("@/pages/trace-lineage");
+    render(<TraceLineagePage />, { wrapper: createWrapper() });
+
+    fireEvent.change(screen.getByLabelText("entity type"), { target: { value: "order" } });
+    fireEvent.change(screen.getByLabelText("entity id"), { target: { value: "o-1" } });
+    fireEvent.change(screen.getByLabelText("time window start"), {
+      target: { value: "2026-07-01T00:00" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+
+    await waitFor(() => {
+      const call = mockApi.get.mock.calls.find(
+        (c: string[]) => typeof c[0] === "string" && c[0].startsWith("/trace-lineage/entities/"),
+      );
+      expect(call?.[0]).toMatch(/\/trace-lineage\/entities\/order\/o-1\?start=\d+/);
+    });
+  });
+
+  test("deep link ?kind=entity&type=…&id=… searches on load", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path.startsWith("/trace-lineage/entities/")) return Promise.resolve(lineageResponse());
+      return Promise.resolve({});
+    });
+    const { default: TraceLineagePage } = await import("@/pages/trace-lineage");
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/trace-lineage?kind=entity&type=order&id=o-1"]}>
+          <TraceLineagePage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => {
+      expect(mockApi.get).toHaveBeenCalledWith("/trace-lineage/entities/order/o-1");
+    });
+    expect(await screen.findByText("validate")).toBeInTheDocument();
+  });
 });
 
 // ── Trace Analyzers (Issue #148) ────────────────────────────────────

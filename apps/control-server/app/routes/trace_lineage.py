@@ -116,24 +116,39 @@ def _limit(limit: Optional[int]) -> int:
     return max(1, min(limit, 2000))
 
 
+def _window(col: str, start: Optional[float], end: Optional[float]) -> Tuple[str, list]:
+    """Optional time-window filter (Issue #147): unix-seconds bounds on ``col``."""
+    sql, params = "", []
+    if start is not None:
+        sql += f" AND {col} >= ?"
+        params.append(start)
+    if end is not None:
+        sql += f" AND {col} <= ?"
+        params.append(end)
+    return sql, params
+
+
 @router.get("/trace-lineage/entities/{entity_type}/{entity_id}", response_model=LineageOut)
 def lineage_by_entity(
     entity_type: str,
     entity_id: str,
     limit: Optional[int] = Query(default=None),
+    start: Optional[float] = Query(default=None),
+    end: Optional[float] = Query(default=None),
     system_id: int = Depends(get_system_id),
 ) -> LineageOut:
+    win_sql, win_params = _window("tr.timestamp", start, end)
     with get_conn() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT DISTINCT te.trace_id AS trace_id, tr.timestamp AS timestamp
             FROM trace_entities te
             JOIN traces tr ON tr.system_id = te.system_id AND tr.trace_id = te.trace_id
-            WHERE te.system_id = ? AND te.entity_type = ? AND te.entity_id = ?
+            WHERE te.system_id = ? AND te.entity_type = ? AND te.entity_id = ?{win_sql}
             ORDER BY tr.timestamp ASC, te.trace_id ASC
             LIMIT ?
             """,
-            (system_id, entity_type, entity_id, _limit(limit)),
+            (system_id, entity_type, entity_id, *win_params, _limit(limit)),
         ).fetchall()
         ordered = [(r["trace_id"], r["timestamp"]) for r in rows]
         steps = _assemble(conn, system_id, ordered)
@@ -147,17 +162,20 @@ def lineage_by_entity(
 def lineage_by_correlation(
     correlation_id: str,
     limit: Optional[int] = Query(default=None),
+    start: Optional[float] = Query(default=None),
+    end: Optional[float] = Query(default=None),
     system_id: int = Depends(get_system_id),
 ) -> LineageOut:
+    win_sql, win_params = _window("timestamp", start, end)
     with get_conn() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT trace_id, timestamp FROM trace_spans
-            WHERE system_id = ? AND correlation_id = ?
+            WHERE system_id = ? AND correlation_id = ?{win_sql}
             ORDER BY timestamp ASC, trace_id ASC
             LIMIT ?
             """,
-            (system_id, correlation_id, _limit(limit)),
+            (system_id, correlation_id, *win_params, _limit(limit)),
         ).fetchall()
         ordered = [(r["trace_id"], r["timestamp"]) for r in rows]
         steps = _assemble(conn, system_id, ordered)
@@ -170,17 +188,20 @@ def lineage_by_correlation(
 def lineage_by_flow(
     flow_id: str,
     limit: Optional[int] = Query(default=None),
+    start: Optional[float] = Query(default=None),
+    end: Optional[float] = Query(default=None),
     system_id: int = Depends(get_system_id),
 ) -> LineageOut:
+    win_sql, win_params = _window("timestamp", start, end)
     with get_conn() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT trace_id, timestamp FROM trace_spans
-            WHERE system_id = ? AND flow_id = ?
+            WHERE system_id = ? AND flow_id = ?{win_sql}
             ORDER BY timestamp ASC, trace_id ASC
             LIMIT ?
             """,
-            (system_id, flow_id, _limit(limit)),
+            (system_id, flow_id, *win_params, _limit(limit)),
         ).fetchall()
         ordered = [(r["trace_id"], r["timestamp"]) for r in rows]
         steps = _assemble(conn, system_id, ordered)

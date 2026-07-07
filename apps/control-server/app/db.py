@@ -196,6 +196,12 @@ CREATE TABLE IF NOT EXISTS trace_analyzers (
     prompt_version  TEXT,
     schema_version  TEXT,
     is_mock         INTEGER NOT NULL DEFAULT 0,
+    -- The human review decision is its own audit record (Principle 7):
+    -- decision_method above describes who AUTHORED the spec (manual /
+    -- reasoning_llm); review_decision_method records that the approve/reject
+    -- decision was made by a human ('manual'), never by the LLM.
+    reviewed_at            REAL,
+    review_decision_method TEXT,
     created_at      REAL NOT NULL,
     updated_at      REAL NOT NULL,
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
@@ -1707,6 +1713,13 @@ def init_db() -> None:
         _migrate_to_system_scope(conn)
         conn.executescript(SCHEMA)
         _migrate_intelligence_runs_snapshot_nullable(conn)
+        ta_cols = _columns(conn, "trace_analyzers")
+        if "reviewed_at" not in ta_cols:
+            conn.execute("ALTER TABLE trace_analyzers ADD COLUMN reviewed_at REAL")
+        if "review_decision_method" not in ta_cols:
+            conn.execute(
+                "ALTER TABLE trace_analyzers ADD COLUMN review_decision_method TEXT"
+            )
         if "content" not in _columns(conn, "snapshot_files"):
             conn.execute(
                 "ALTER TABLE snapshot_files ADD COLUMN content BLOB NOT NULL DEFAULT X''"

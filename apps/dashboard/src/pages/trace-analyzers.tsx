@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import {
   useAnalyzers, useCreateAnalyzer, useReviewAnalyzer, useRunAnalyzer, useAnalyzerRuns,
   useProposeAnalyzer,
@@ -287,14 +288,28 @@ function CompareSummaryView({ compare }: { compare: CompareSummary }) {
       {Object.keys(compare.examples).length > 0 && (
         <div className="text-xs">
           <div className="font-medium mb-1">Example traces</div>
-          {Object.entries(compare.examples).map(([cls, traces]) => (
-            <div key={cls} className="flex items-center gap-2 flex-wrap">
-              <span className="font-mono text-muted-foreground">{cls}</span>
-              {traces.map((t) => (
-                <span key={t} className="font-mono">{t.slice(0, 12)}</span>
-              ))}
-            </div>
-          ))}
+          {Object.entries(compare.examples).map(([cls, traces]) => {
+            // Diff-class key is "field::component_id"; link to that
+            // component's trace list for inspection.
+            const component = cls.split("::")[1];
+            return (
+              <div key={cls} className="flex items-center gap-2 flex-wrap">
+                {component ? (
+                  <Link
+                    to={`/components?component=${encodeURIComponent(component)}`}
+                    className="font-mono text-primary underline"
+                  >
+                    {cls}
+                  </Link>
+                ) : (
+                  <span className="font-mono text-muted-foreground">{cls}</span>
+                )}
+                {traces.map((t) => (
+                  <span key={t} className="font-mono" title={t}>{t.slice(0, 12)}</span>
+                ))}
+              </div>
+            );
+          })}
         </div>
       )}
     </div>

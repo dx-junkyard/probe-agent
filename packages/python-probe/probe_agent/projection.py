@@ -122,35 +122,83 @@ def _resolve(segments: List[tuple], root: Any) -> List[Any]:
 
 
 # --- redaction (copy-on-write along redacted paths only) -------------------
+#
+# Structural redaction only rewrites dict/list trees. Extraction, however, can
+# also read object *attributes* (_get_key), which a copy-on-write rewrite
+# cannot reach. Any redact path whose traversal hits a non-dict/list node with
+# segments remaining is therefore reported as "blocked", and extraction
+# fail-closes by masking every extracted value whose path overlaps a blocked
+# redact path (over-redaction is safe; under-redaction is not).
 
-def _redact_one(node: Any, segs: List[tuple]) -> Any:
+def _redact_one(node: Any, segs: List[tuple]) -> Tuple[Any, bool]:
+    """Return (new_node, blocked). ``blocked`` means the path could not be
+    applied structurally and the value may still be reachable via attributes."""
     if not segs:
-        return _REDACTED
+        return _REDACTED, False
     seg, rest = segs[0], segs[1:]
     if seg[0] == "key":
-        if isinstance(node, dict) and seg[1] in node:
-            new = dict(node)
-            new[seg[1]] = _redact_one(node[seg[1]], rest)
-            return new
-        return node
+        if isinstance(node, dict):
+            if seg[1] in node:
+                new_val, blocked = _redact_one(node[seg[1]], rest)
+                new = dict(node)
+                new[seg[1]] = new_val
+                return new, blocked
+            return node, False  # absent in a dict — nothing to leak
+        return node, True  # attribute access could still resolve this key
     if seg[0] == "index":
-        if isinstance(node, list) and -len(node) <= seg[1] < len(node):
-            new = list(node)
-            new[seg[1]] = _redact_one(node[seg[1]], rest)
-            return new
-        return node
+        if isinstance(node, (list, tuple)):
+            if -len(node) <= seg[1] < len(node):
+                new = list(node)
+                new_val, blocked = _redact_one(node[seg[1]], rest)
+                new[seg[1]] = new_val
+                return new, blocked
+            return node, False
+        return node, True
     # wildcard
-    if isinstance(node, list):
-        return [_redact_one(v, rest) for v in node]
+    if isinstance(node, (list, tuple)):
+        blocked = False
+        out = []
+        for v in node:
+            new_val, b = _redact_one(v, rest)
+            out.append(new_val)
+            blocked = blocked or b
+        return out, blocked
     if isinstance(node, dict):
-        return {k: _redact_one(v, rest) for k, v in node.items()}
-    return node
+        blocked = False
+        new = {}
+        for k, v in node.items():
+            new_val, b = _redact_one(v, rest)
+            new[k] = new_val
+            blocked = blocked or b
+        return new, blocked
+    return node, True
 
 
-def _apply_redaction(root: Any, redact_segments: List[List[tuple]]) -> Any:
+def _apply_redaction(root: Any, redact_segments: List[List[tuple]]) -> Tuple[Any, List[List[tuple]]]:
+    """Apply structural redaction; return (root, blocked_paths)."""
+    blocked_paths: List[List[tuple]] = []
     for segs in redact_segments:
-        root = _redact_one(root, segs)
-    return root
+        root, blocked = _redact_one(root, segs)
+        if blocked:
+            blocked_paths.append(segs)
+    return root, blocked_paths
+
+
+def _segments_overlap(a: List[tuple], b: List[tuple]) -> bool:
+    """True when one path is a (wildcard-tolerant) prefix of the other, i.e.
+    the extraction could read at/below/above the redacted location."""
+    for sa, sb in zip(a, b):
+        if sa[0] == "wild" or sb[0] == "wild":
+            continue
+        if sa != sb:
+            return False
+    return True
+
+
+def _mask_if_blocked(segs: List[tuple], blocked: List[List[tuple]], value: Any) -> Any:
+    if any(_segments_overlap(segs, b) for b in blocked):
+        return _REDACTED
+    return value
 
 
 # --- canonicalisation / hashing --------------------------------------------
@@ -258,19 +306,22 @@ def compile_spec(spec: Any) -> ProjectionSpec:
 
 # --- extraction ------------------------------------------------------------
 
-def _extract_section(section: Dict[str, Any], root: Any) -> Dict[str, Any]:
+def _extract_section(
+    section: Dict[str, Any], root: Any, blocked: List[List[tuple]]
+) -> Dict[str, Any]:
     out_fields: Dict[str, Any] = {}
     for fname, segs in section["fields"].items():
         matches = _resolve(segs, root)
         if _path_has_wildcard(segs):
-            out_fields[fname] = _jsonable(matches)
+            value = _jsonable(matches)
         else:
-            out_fields[fname] = _jsonable(matches[0]) if matches else None
+            value = _jsonable(matches[0]) if matches else None
+        out_fields[fname] = _mask_if_blocked(segs, blocked, value)
 
     out_metrics: Dict[str, Any] = {}
     for mname, (op, segs) in section["metrics"].items():
         matches = _resolve(segs, root)
-        out_metrics[mname] = _apply_metric(op, matches)
+        out_metrics[mname] = _mask_if_blocked(segs, blocked, _apply_metric(op, matches))
 
     out_samples: Dict[str, Any] = {}
     for sname, (segs, limit) in section["samples"].items():
@@ -281,7 +332,7 @@ def _extract_section(section: Dict[str, Any], root: Any) -> Dict[str, Any]:
             items = matches
         n = limit if limit is not None else max_samples()
         n = min(n, max_samples())
-        out_samples[sname] = _jsonable(items[:n])
+        out_samples[sname] = _mask_if_blocked(segs, blocked, _jsonable(items[:n]))
 
     return {"fields": out_fields, "metrics": out_metrics, "samples": out_samples}
 
@@ -341,8 +392,8 @@ def extract_phase(spec: ProjectionSpec, root: Any, phase: str) -> Optional[Dict[
     if "output" not in spec.sections:
         return None
     try:
-        redacted = _apply_redaction(root, spec.redact)
-        data = _extract_section(spec.sections["output"], redacted)
+        redacted, blocked = _apply_redaction(root, spec.redact)
+        data = _extract_section(spec.sections["output"], redacted, blocked)
         data, truncated = _apply_limits(data)
         return {
             "projection_name": spec.name,
@@ -387,8 +438,8 @@ def extract(
         if root is _MISSING:
             continue
         try:
-            redacted = _apply_redaction(root, spec.redact)
-            data = _extract_section(spec.sections[phase], redacted)
+            redacted, blocked = _apply_redaction(root, spec.redact)
+            data = _extract_section(spec.sections[phase], redacted, blocked)
             data, truncated = _apply_limits(data)
             payloads.append({
                 "projection_name": spec.name,
@@ -416,12 +467,16 @@ def extract(
         root = roots.get(ent["phase"], _MISSING)
         if root is _MISSING:
             continue
+        # Entities resolve against the raw root, so a redacted value must never
+        # become an entity id: skip any id_path that overlaps a redact path.
+        if any(_segments_overlap(ent["id_path"], r) for r in spec.redact):
+            continue
         try:
             matches = _resolve(ent["id_path"], root)
         except Exception:  # noqa: BLE001
             continue
         for match in matches:
-            if match is None:
+            if match is None or match == _REDACTED:
                 continue
             entities.append({"type": ent["type"], "id": str(match), "role": ent["role"]})
 

@@ -135,6 +135,10 @@ class TraceAnalyzerOut(BaseModel):
     prompt_version: Optional[str] = None
     schema_version: Optional[str] = None
     is_mock: bool = False
+    # Audit of the human review decision (Principle 7): set on approve/reject.
+    # Always 'manual' when set — approval never comes from the LLM.
+    reviewed_at: Optional[float] = None
+    review_decision_method: Optional[str] = None
     created_at: float
     updated_at: float
 

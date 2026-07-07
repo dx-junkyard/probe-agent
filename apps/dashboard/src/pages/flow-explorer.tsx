@@ -3,7 +3,7 @@ import { Link, useSearchParams, useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import {
   useFlowEntrypoints, useBuildFlowGraph, useCreatePlanFromFlow, useApiRoleCards,
-  useFlowOverlay,
+  useFlowOverlay, useAnalyzers,
 } from "@/api/hooks";
 import { ApiRoleCard } from "@/components/api-role-card";
 import { ApiError } from "@/api/client";
@@ -18,7 +18,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Workflow, Crosshair, AlertTriangle, ArrowRight, Activity, RefreshCw } from "lucide-react";
 import type {
   FlowEntrypointOut, FlowGraphOut, FlowNodeOut, FlowEdgeOut,
-  FlowProbeSelection, ProbePreviewOut, FlowOverlayOut,
+  FlowProbeSelection, ProbePreviewOut, FlowOverlayOut, FlowOverlayRequest,
 } from "@/api/types";
 
 const RISK_VARIANT: Record<string, "secondary" | "destructive"> = {
@@ -705,27 +705,40 @@ export default function FlowExplorerPage() {
   );
 }
 
+// Extract an entity filter {type,id} from a saved analyzer spec, if present.
+function overlayAnalyzerEntity(spec: unknown): { type: string; id: string } | null {
+  const filter = (spec as { filter?: { entity?: { type?: string; id?: string } } })?.filter;
+  const ent = filter?.entity;
+  if (ent && ent.type && ent.id) return { type: ent.type, id: ent.id };
+  return null;
+}
+
 // Issue #151: runtime lineage overlay. Given the built graph's entrypoint, look
 // up which probe points were observed for a selected entity / correlation /
-// flow, and which runtime transitions diverge from the static graph. Matching
-// is by component_id exact equality only (no interpretation).
+// flow / saved analyzer (its entity filter), and which runtime transitions
+// diverge from the static graph. Matching is by component_id exact equality
+// only (no interpretation).
 function FlowOverlayPanel({ entrypoint, graph }: {
   entrypoint: FlowEntrypointOut;
   graph: FlowGraphOut;
 }) {
   const overlayMut = useFlowOverlay();
-  const [kind, setKind] = useState<"entity" | "correlation" | "flow">("entity");
+  const { data: analyzers } = useAnalyzers();
+  const [kind, setKind] = useState<"entity" | "correlation" | "flow" | "analyzer">("entity");
   const [entityType, setEntityType] = useState("");
   const [entityId, setEntityId] = useState("");
   const [singleId, setSingleId] = useState("");
   const [overlay, setOverlay] = useState<FlowOverlayOut | null>(null);
+  const [lineageLink, setLineageLink] = useState<string | null>(null);
 
-  const apply = async () => {
-    const selection =
-      kind === "entity"
-        ? { kind, entity_type: entityType.trim(), entity_id: entityId.trim() }
-        : { kind, [kind === "correlation" ? "correlation_id" : "flow_id"]: singleId.trim() };
-    if (kind === "entity" ? !entityType.trim() || !entityId.trim() : !singleId.trim()) return;
+  const analyzerSources = (Array.isArray(analyzers) ? analyzers : []).filter((a) =>
+    overlayAnalyzerEntity(a.spec),
+  );
+
+  const applySelection = async (
+    selection: FlowOverlayRequest["selection"],
+    link: string | null,
+  ) => {
     try {
       const res = await overlayMut.mutateAsync({
         entrypoint_type: entrypoint.entrypoint_type,
@@ -735,8 +748,28 @@ function FlowOverlayPanel({ entrypoint, graph }: {
         selection,
       });
       setOverlay(res);
+      setLineageLink(link);
     } catch (e) {
       toast.error(String(e));
+    }
+  };
+
+  const apply = async () => {
+    if (kind === "analyzer") return; // analyzers apply directly from their buttons
+    if (kind === "entity" ? !entityType.trim() || !entityId.trim() : !singleId.trim()) return;
+    if (kind === "entity") {
+      const type = entityType.trim();
+      const id = entityId.trim();
+      await applySelection(
+        { kind, entity_type: type, entity_id: id },
+        `/trace-lineage?kind=entity&type=${encodeURIComponent(type)}&id=${encodeURIComponent(id)}`,
+      );
+    } else {
+      const id = singleId.trim();
+      await applySelection(
+        { kind, [kind === "correlation" ? "correlation_id" : "flow_id"]: id },
+        `/trace-lineage?kind=${kind}&id=${encodeURIComponent(id)}`,
+      );
     }
   };
 
@@ -755,14 +788,43 @@ function FlowOverlayPanel({ entrypoint, graph }: {
       </CardHeader>
       <CardContent className="space-y-2">
         <div className="flex gap-1">
-          {(["entity", "correlation", "flow"] as const).map(k => (
+          {(["entity", "correlation", "flow", "analyzer"] as const).map(k => (
             <Button key={k} size="sm" variant={kind === k ? "default" : "outline"}
               className="h-7 px-2 text-xs" onClick={() => setKind(k)}>
               {k}
             </Button>
           ))}
         </div>
-        {kind === "entity" ? (
+        {kind === "analyzer" ? (
+          analyzerSources.length === 0 ? (
+            <p className="text-xs text-muted-foreground">
+              No saved analyzer with an entity filter.
+            </p>
+          ) : (
+            <div className="flex flex-wrap gap-1">
+              {analyzerSources.map((a) => {
+                const ent = overlayAnalyzerEntity(a.spec)!;
+                return (
+                  <Button
+                    key={a.id}
+                    size="sm"
+                    variant="outline"
+                    className="h-7 px-2 text-xs"
+                    disabled={overlayMut.isPending}
+                    onClick={() =>
+                      applySelection(
+                        { kind: "analyzer", analyzer_id: a.id },
+                        `/trace-lineage?kind=entity&type=${encodeURIComponent(ent.type)}&id=${encodeURIComponent(ent.id)}`,
+                      )
+                    }
+                  >
+                    {a.name || `analyzer #${a.id}`} · {ent.type}:{ent.id}
+                  </Button>
+                );
+              })}
+            </div>
+          )
+        ) : kind === "entity" ? (
           <div className="flex gap-1">
             <Input aria-label="overlay entity type" placeholder="order" value={entityType}
               onChange={e => setEntityType(e.target.value)} className="h-7 text-xs" />
@@ -773,15 +835,24 @@ function FlowOverlayPanel({ entrypoint, graph }: {
           <Input aria-label="overlay id" placeholder={kind === "correlation" ? "req-abc" : "checkout"}
             value={singleId} onChange={e => setSingleId(e.target.value)} className="h-7 text-xs" />
         )}
-        <Button size="sm" className="h-7 text-xs w-full" onClick={apply} disabled={overlayMut.isPending}>
-          {overlayMut.isPending ? "Applying…" : "Apply overlay"}
-        </Button>
+        {kind !== "analyzer" && (
+          <Button size="sm" className="h-7 text-xs w-full" onClick={apply} disabled={overlayMut.isPending}>
+            {overlayMut.isPending ? "Applying…" : "Apply overlay"}
+          </Button>
+        )}
 
         {overlay && (
           <div className="space-y-2 pt-1 text-xs">
-            <div className="text-muted-foreground">
-              observed {observedCount}/{observableNodes.length} probe points ·{" "}
-              {overlay.observed_trace_count} traces
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-muted-foreground">
+                observed {observedCount}/{observableNodes.length} probe points ·{" "}
+                {overlay.observed_trace_count} traces
+              </span>
+              {lineageLink && (
+                <Link to={lineageLink} className="text-primary underline shrink-0">
+                  Trace Lineage →
+                </Link>
+              )}
             </div>
             <div className="space-y-1">
               {overlay.nodes.map(n => (

@@ -92,6 +92,42 @@ def test_candidate_error_yields_no_candidate_projection(sdk):
     assert _phases(s) == {"shadow_current"}  # no shadow_candidate on error
 
 
+def test_input_projection_reflects_precall_values_when_fn_mutates(sdk):
+    """Issue #146 deepcopy interaction: the input projection is extracted
+    before the function runs, so current and candidate share the same input
+    projection even when the function mutates its arguments."""
+    probe = sdk["decorator_mod"].probe
+    set_candidate = sdk["decorator_mod"].set_candidate
+    flush = sdk["decorator_mod"].flush
+
+    def candidate(order):
+        # Candidate sees the pre-call snapshot: status must still be "new".
+        return {"seen_status": order["status"]}
+
+    set_candidate("svc", candidate)
+
+    @probe(component_id="svc", projection={
+        "name": "orders",
+        "input": {"fields": {"status_in": "$.args[0].status"}},
+        "output": {"fields": {"seen_status": "$.seen_status"}},
+    })
+    def svc(order):
+        order["status"] = "mutated"
+        return {"seen_status": order["status"]}
+
+    svc({"status": "new"})
+    flush(timeout=2.0)
+
+    t = sdk["traces"][0]
+    by_phase = {p["phase"]: p for p in t["projections"]}
+    assert by_phase["input"]["fields"] == {"status_in": "new"}  # pre-call value
+    s = sdk["shadows"][0]
+    shadow_phases = {p["phase"]: p for p in s["projections"]}
+    # Candidate ran on the pristine snapshot, unaffected by the mutation.
+    assert shadow_phases["shadow_candidate"]["fields"] == {"seen_status": "new"}
+    assert shadow_phases["shadow_current"]["fields"] == {"seen_status": "mutated"}
+
+
 def test_no_projection_no_extra_cost(sdk):
     probe = sdk["decorator_mod"].probe
     set_candidate = sdk["decorator_mod"].set_candidate

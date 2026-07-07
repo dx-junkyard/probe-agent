@@ -86,6 +86,9 @@ export interface TraceAnalyzer {
   prompt_version: string | null;
   schema_version: string | null;
   is_mock: boolean;
+  // Audit of the human review decision (set on approve/reject; always "manual").
+  reviewed_at: number | null;
+  review_decision_method: string | null;
   created_at: number;
   updated_at: number;
 }
