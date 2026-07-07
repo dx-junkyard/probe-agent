@@ -159,6 +159,18 @@ def _existence_errors(spec: Dict[str, Any], ctx: ProposalContext) -> List[str]:
     for ref in _extract_field_refs(spec):
         if ref not in ctx.field_names:
             errors.append(f"unknown projection field {ref!r}")
+    # compare references must resolve too: a typo'd compare field (or entity
+    # type) is not caught by select-path validation, and at run time a field
+    # absent from both phases aggregates as "no diff" — silently defeating the
+    # fail-closed review gate. Reject unknown identifiers here instead.
+    cmp = spec.get("compare")
+    if isinstance(cmp, dict):
+        for cfield in cmp.get("fields") or []:
+            if cfield not in ctx.field_names:
+                errors.append(f"unknown compare field {cfield!r}")
+        cet = cmp.get("entity_type")
+        if cet is not None and cet not in ctx.entity_types:
+            errors.append(f"unknown compare entity type {cet!r}")
     return errors
 
 

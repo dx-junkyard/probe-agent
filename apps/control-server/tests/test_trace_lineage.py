@@ -126,6 +126,47 @@ def test_repost_replaces_entities(client):
     assert len(client.get("/trace-lineage/entities/order/new").json()["steps"]) == 1
 
 
+def test_repost_clears_stale_span(client):
+    client.post("/traces", json=_trace("t1", correlation_id="c1", flow_id="f1"))
+    assert len(client.get("/trace-lineage/correlations/c1").json()["steps"]) == 1
+    # Re-post the same trace with no span metadata: the old correlation/flow
+    # ids must not survive onto the new trace.
+    client.post("/traces", json=_trace("t1"))
+    assert client.get("/trace-lineage/correlations/c1").json()["steps"] == []
+    assert client.get("/trace-lineage/flows/f1").json()["steps"] == []
+
+
+def test_repost_clears_stale_projections(client):
+    client.post("/traces", json=_trace("t1", projections=[
+        {"projection_name": "orders", "phase": "output", "fields": {"status": "pending"}}]))
+    assert len(client.get("/traces/t1/projections").json()) == 1
+    # Re-post without projections: stale projection must not remain attached.
+    client.post("/traces", json=_trace("t1"))
+    assert client.get("/traces/t1/projections").json() == []
+
+
+def test_repost_preserves_shadow_projections(client):
+    # Shadow projections are written by a separate route on the same trace_id
+    # and use a disjoint phase namespace; a /traces re-post must not clobber
+    # them.
+    client.post("/traces", json=_trace("t1"))
+    client.post("/components/c/shadow-results", json={
+        "trace_id": "t1", "component_id": "c",
+        "current_output": "x", "candidate_output": "y",
+        "candidate_error": None, "candidate_duration_ms": 1.0,
+        "timestamp": time.time(),
+        "projections": [
+            {"projection_name": "orders", "phase": "shadow_current", "fields": {"status": "a"}},
+            {"projection_name": "orders", "phase": "shadow_candidate", "fields": {"status": "b"}},
+        ],
+    })
+    assert len(client.get("/traces/t1/projections").json()) == 2
+    # Re-post the trace (no projections) — shadow projections stay intact.
+    client.post("/traces", json=_trace("t1"))
+    phases = {p["phase"] for p in client.get("/traces/t1/projections").json()}
+    assert phases == {"shadow_current", "shadow_candidate"}
+
+
 # --- System isolation -------------------------------------------------------
 
 @pytest.fixture

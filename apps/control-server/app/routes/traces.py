@@ -25,18 +25,24 @@ def _ensure_component(conn, system_id: int, component_id: str) -> None:
 def _write_lineage(conn, system_id: int, event: TraceEvent) -> None:
     """Persist optional lineage metadata (Issue #145) in dedicated tables.
 
-    A span row is written whenever any span/flow/correlation metadata is
-    present; entities are re-materialized on re-post so an INSERT OR REPLACE
-    trace stays consistent.
+    Span and entity rows are re-materialized per trace so a re-post stays
+    consistent with the INSERT OR REPLACE ``traces`` row: a re-post without
+    span metadata deletes the stale span, so old correlation/flow ids never
+    survive onto a trace that no longer carries them.
     """
     has_span = any(
         v is not None
         for v in (event.span_id, event.parent_span_id, event.flow_id, event.correlation_id)
     )
+    # Re-materialize the span row for this trace (idempotent on re-post).
+    conn.execute(
+        "DELETE FROM trace_spans WHERE system_id = ? AND trace_id = ?",
+        (system_id, event.trace_id),
+    )
     if has_span:
         conn.execute(
             """
-            INSERT OR REPLACE INTO trace_spans
+            INSERT INTO trace_spans
                 (system_id, trace_id, component_id, span_id, parent_span_id,
                  flow_id, correlation_id, timestamp)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -79,10 +85,20 @@ def _write_lineage(conn, system_id: int, event: TraceEvent) -> None:
 
 def _write_projections(conn, system_id: int, event: TraceEvent) -> None:
     """Persist optional projections (Issue #146). Only the bounded, structured
-    slice is stored — never the raw payload. Idempotent on re-post."""
-    if not event.projections:
-        return
-    for proj in event.projections:
+    slice is stored — never the raw payload. Idempotent on re-post.
+
+    The trace's own input/output projections are re-materialized per trace so a
+    re-post with fewer (or no) projections cannot leave stale rows that then
+    look like they belong to the new trace. Shadow projections
+    (shadow_current/shadow_candidate) are owned by the shadow-results route and
+    use a disjoint phase namespace, so they are deliberately left untouched.
+    """
+    conn.execute(
+        "DELETE FROM trace_projections WHERE system_id = ? AND trace_id = ? "
+        "AND phase NOT IN ('shadow_current', 'shadow_candidate')",
+        (system_id, event.trace_id),
+    )
+    for proj in event.projections or []:
         data_json = json.dumps(
             {"fields": proj.fields, "metrics": proj.metrics, "samples": proj.samples},
             ensure_ascii=False,

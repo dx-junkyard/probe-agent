@@ -144,6 +144,57 @@ def test_unknown_field_rejected(env, monkeypatch):
     assert "unknown projection field" in r.json()["detail"]
 
 
+def test_unknown_compare_field_rejected(env, monkeypatch):
+    client, db_path = env
+    _seed(client)
+    _use_real_provider(monkeypatch)
+    import app.routes.trace_analyzers as mod
+    # 'status' exists, 'stauts' is a typo the select-path check would miss.
+    spec = {"source": "trace_projections",
+            "select": [{"name": "t", "path": "$.trace_id"}],
+            "compare": {"phases": ["shadow_current", "shadow_candidate"],
+                        "fields": ["stauts"]}}
+    monkeypatch.setattr(mod, "create_llm_client", lambda cfg: _FakeClient(json.dumps(spec)))
+
+    r = client.post("/trace-analyzers/propose", json={"intent": "x"})
+    assert r.status_code == 422
+    assert "unknown compare field" in r.json()["detail"]
+    assert _runs(db_path)[-1]["status"] == "failed"
+    assert client.get("/trace-analyzers").json() == []
+
+
+def test_unknown_compare_entity_type_rejected(env, monkeypatch):
+    client, _ = env
+    _seed(client)
+    _use_real_provider(monkeypatch)
+    import app.routes.trace_analyzers as mod
+    spec = {"source": "trace_projections",
+            "select": [{"name": "t", "path": "$.trace_id"}],
+            "compare": {"phases": ["shadow_current", "shadow_candidate"],
+                        "fields": ["status"], "entity_type": "shipment"}}
+    monkeypatch.setattr(mod, "create_llm_client", lambda cfg: _FakeClient(json.dumps(spec)))
+
+    r = client.post("/trace-analyzers/propose", json={"intent": "x"})
+    assert r.status_code == 422
+    assert "unknown compare entity type" in r.json()["detail"]
+
+
+def test_valid_compare_fields_accepted(env, monkeypatch):
+    client, _ = env
+    _seed(client)
+    _use_real_provider(monkeypatch)
+    import app.routes.trace_analyzers as mod
+    spec = {"source": "trace_projections",
+            "select": [{"name": "t", "path": "$.trace_id"}],
+            "compare": {"phases": ["shadow_current", "shadow_candidate"],
+                        "fields": ["status"], "entity_type": "order"}}
+    monkeypatch.setattr(mod, "create_llm_client", lambda cfg: _FakeClient(json.dumps(spec)))
+
+    r = client.post("/trace-analyzers/propose", json={"intent": "compare status"})
+    assert r.status_code == 201, r.text
+    assert r.json()["review_status"] == "proposed"
+
+
 def test_valid_real_proposal_saved(env, monkeypatch):
     client, db_path = env
     _seed(client)

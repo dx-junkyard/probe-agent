@@ -108,6 +108,34 @@ def test_compare_respects_entity_filter(client):
     assert cmp["examples"]["status::svc"] == ["t1"]
 
 
+def test_multiple_projections_do_not_overwrite_in_compare(client):
+    # A trace with two projections; an analyzer that does NOT pin
+    # filter.projection_name must not let one projection mask the other.
+    _trace(client, "t1")
+    client.post("/components/svc/shadow-results", json={
+        "trace_id": "t1", "component_id": "svc",
+        "current_output": "x", "candidate_output": "y",
+        "candidate_error": None, "candidate_duration_ms": 1.0,
+        "timestamp": time.time(),
+        "projections": [
+            # real diff on this projection ...
+            {"projection_name": "aaa", "phase": "shadow_current", "fields": {"status": "x"}},
+            {"projection_name": "aaa", "phase": "shadow_candidate", "fields": {"status": "y"}},
+            # ... which the old (trace_id, component_id)-only grouping let a
+            # later same-valued projection overwrite.
+            {"projection_name": "zzz", "phase": "shadow_current", "fields": {"status": "s"}},
+            {"projection_name": "zzz", "phase": "shadow_candidate", "fields": {"status": "s"}},
+        ],
+    })
+
+    run = _analyzer(client, {
+        "phases": ["shadow_current", "shadow_candidate"], "fields": ["status"],
+    })
+    cmp = run["result"]["compare"]
+    assert cmp["diff_fields"]["status"] == 1  # the 'aaa' diff is not masked
+    assert cmp["examples"]["status::svc"] == ["t1"]
+
+
 # --- workspace pin ----------------------------------------------------------
 
 @pytest.fixture
