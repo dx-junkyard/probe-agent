@@ -27,6 +27,21 @@ The dashboard should support:
 - Repository tab
 - Feature Map tab
 - Probe Planner tab
+- Probe Patterns tab (Issue #168, `pages/probe-patterns.tsx`): pattern
+  list/detail with status (`active`/`stale`/`archived`/`superseded`),
+  objective, point counts, source commit, lifecycle history, and the latest
+  reconciliation summary. The pre-release flow scans the latest snapshot's
+  `@probe` instrumentation, saves selected probes as a pattern (inheriting
+  probe-plan context), then generates a removal diff that is applied only
+  after a typed confirmation (REMOVE) against the pinned commit. The
+  re-development flow reconciles a pattern against the latest snapshot and
+  renders each point's classification badge, decision method, evidence, and
+  hypothesis with a short confirm question — はい (accept) / いいえ
+  (reject) / わからないので調べる (investigate; renders the returned
+  implementation-state summary + recommendation). Exact matches need no
+  decision; `unsafe`/`missing` can never be accepted. "Create Probe Plan"
+  hands off to the existing Probe Planner gates and links there — the page
+  itself never applies instrumentation.
 - Experiments tab
 - Decision Workspace tab (Issue #38): workspace list/create/switch, a
   conversation thread with grounded findings/assumptions/missing information

@@ -71,6 +71,13 @@ creating incomplete persistence or execution paths for later phases.
      analyzers, shadow subset diffs, Flow Explorer runtime overlay
    - implement sub-issues in dependency order; see the Issue #144 section in
      `docs/project-intelligence.md` for the breakdown and design decisions
+6. Issue #168 — Probe Pattern lifecycle
+   - deterministic instrumentation scan, pre-release removal patches with an
+     explicit apply boundary, pattern reconciliation against the latest
+     snapshot (deterministic structural checks first, reasoning model for
+     moved/split/missing, no heuristic fallback), and plan creation that
+     reuses the #25 approval/patch/validate/apply gates
+   - see the Issue #168 section in `docs/project-intelligence.md`
 
 The existing `GET /project-intelligence` endpoint and the Repository,
 Feature Map, Probe Planner, and Experiments tabs are explicit mocks. Replace

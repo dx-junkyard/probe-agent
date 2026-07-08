@@ -1244,7 +1244,7 @@ export interface ProbePointOut {
   updated_at: string;
 }
 
-export type ProbePlanOrigin = "feature_map" | "capability_map" | "flow_explorer" | "interview" | "manual";
+export type ProbePlanOrigin = "feature_map" | "capability_map" | "flow_explorer" | "interview" | "probe_pattern" | "manual";
 
 export interface ProbePlanOut {
   id: number;
@@ -1267,6 +1267,196 @@ export interface ProbePlansListOut {
   system_id: number;
   plans: ProbePlanOut[];
   is_mock: boolean;
+}
+
+// ── Probe Pattern lifecycle (Issue #168) ────────────────────────────
+
+export type ProbePatternStatus = "active" | "stale" | "archived" | "superseded";
+export type ProbePatternOrigin = "scan" | "probe_plan" | "manual";
+export type ReconcileClassification =
+  | "exact_match" | "moved_match" | "changed_signature"
+  | "split_or_merged" | "missing" | "unsafe";
+export type ReconcileUserDecision = "pending" | "accepted" | "rejected";
+
+export interface InstrumentedProbeOut {
+  path: string;
+  symbol: string;
+  line_start: number;
+  line_end: number;
+  component_id: string | null;
+  docstring: string | null;
+  linked_plan_id: number | null;
+  linked_feature_id: string | null;
+  linked_objective: string | null;
+  linked_reason: string | null;
+  linked_recommended_mode: string | null;
+  pattern_ids: number[];
+}
+
+export interface InstrumentationScanOut {
+  system_id: number;
+  snapshot_id: number;
+  commit_sha: string;
+  probes: InstrumentedProbeOut[];
+}
+
+export interface ProbePatternPointOut {
+  id: number;
+  pattern_id: number;
+  system_id: number;
+  component_id: string;
+  path: string;
+  symbol: string;
+  line_start: number;
+  line_end: number;
+  reason: string;
+  recommended_mode: string;
+  side_effect_risk: string;
+  replayability: string;
+  signature: string;
+  symbol_source_hash: string | null;
+  symbol_body_hash: string | null;
+  docstring: string | null;
+  status: "saved" | "removed_from_production";
+  removed_at: number | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ProbePatternEventOut {
+  id: number;
+  pattern_id: number;
+  event_type: string;
+  detail: Record<string, unknown>;
+  created_at: number;
+}
+
+export interface ReconcileEvidenceOut {
+  path: string;
+  start_line: number;
+  end_line: number;
+  summary: string;
+}
+
+export interface PatternInvestigationOut {
+  summary: string;
+  recommendation: string;
+  proposed_target_path: string | null;
+  proposed_target_symbol: string | null;
+  evidence: ReconcileEvidenceOut[];
+  is_mock: boolean;
+  created_at: number;
+}
+
+export interface ReconcilePointOut {
+  id: number;
+  reconciliation_id: number;
+  pattern_point_id: number;
+  classification: ReconcileClassification;
+  decision_method: "deterministic" | "reasoning_llm";
+  target_path: string | null;
+  target_symbol: string | null;
+  target_line_start: number | null;
+  target_line_end: number | null;
+  confidence: number;
+  explanation: string;
+  hypothesis: string;
+  question: string;
+  evidence: ReconcileEvidenceOut[];
+  denylist_hit: string | null;
+  body_changed: boolean;
+  user_decision: ReconcileUserDecision;
+  decided_at: number | null;
+  investigation: PatternInvestigationOut | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ProbePatternReconciliationOut {
+  id: number;
+  pattern_id: number;
+  system_id: number;
+  snapshot_id: number;
+  commit_sha: string;
+  intelligence_run_id: number | null;
+  status: string;
+  error: string | null;
+  summary: Record<string, number>;
+  points: ReconcilePointOut[];
+  intelligence_run: IntelligenceRunOut | null;
+  is_mock: boolean;
+  created_at: number;
+}
+
+export interface ProbeRemovalPatchOut {
+  id: number;
+  pattern_id: number;
+  system_id: number;
+  snapshot_id: number;
+  commit_sha: string;
+  diff: string;
+  skipped: string[];
+  status: string;
+  error: string | null;
+  cleanup_state: string;
+  cleanup_error: string | null;
+  apply_status: string;
+  apply_error: string | null;
+  applied_at: number | null;
+  applied_by_user_id: number | null;
+  created_at: number;
+}
+
+export interface ProbePatternOut {
+  id: number;
+  system_id: number;
+  name: string;
+  feature_id: string;
+  capability: string;
+  objective: string;
+  description: string;
+  status: ProbePatternStatus;
+  origin: ProbePatternOrigin;
+  source_plan_id: number | null;
+  source_snapshot_id: number | null;
+  source_commit_sha: string;
+  superseded_by_id: number | null;
+  last_used_at: number | null;
+  last_reconciled_at: number | null;
+  point_count: number;
+  removed_point_count: number;
+  points: ProbePatternPointOut[];
+  events: ProbePatternEventOut[];
+  latest_reconciliation: ProbePatternReconciliationOut | null;
+  pending_decision_count: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ProbePatternsListOut {
+  system_id: number;
+  patterns: ProbePatternOut[];
+}
+
+export interface ProbePatternPointIn {
+  path: string;
+  symbol: string;
+  component_id?: string;
+  reason?: string;
+  recommended_mode?: string;
+  side_effect_risk?: "low" | "medium" | "high";
+  replayability?: string;
+}
+
+export interface ProbePatternCreateRequest {
+  name: string;
+  feature_id?: string;
+  capability?: string;
+  objective?: string;
+  description?: string;
+  origin?: ProbePatternOrigin;
+  source_plan_id?: number | null;
+  points: ProbePatternPointIn[];
 }
 
 // ── Flow graph explorer (Issue #43) ─────────────────────────────────
