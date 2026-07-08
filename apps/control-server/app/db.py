@@ -1488,6 +1488,172 @@ CREATE INDEX IF NOT EXISTS idx_issue_drafts_system
 
 CREATE INDEX IF NOT EXISTS idx_issue_drafts_source
     ON issue_drafts (system_id, source_key);
+
+-- Probe Patterns (Issue #168). A pattern is a reusable observation unit that
+-- survives pre-release probe removal: what feature it observes, which probe
+-- points it carried, and the pinned snapshot/commit it was captured from.
+-- Reconciliation against a newer snapshot is persisted separately so users
+-- can see how the implementation moved since the pattern was saved.
+CREATE TABLE IF NOT EXISTS probe_patterns (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    name                TEXT NOT NULL,
+    feature_id          TEXT NOT NULL DEFAULT '',
+    capability          TEXT NOT NULL DEFAULT '',
+    objective           TEXT NOT NULL DEFAULT '',
+    description         TEXT NOT NULL DEFAULT '',
+    status              TEXT NOT NULL DEFAULT 'active',
+    origin              TEXT NOT NULL DEFAULT 'manual',
+    source_plan_id      INTEGER,
+    source_snapshot_id  INTEGER,
+    source_commit_sha   TEXT NOT NULL DEFAULT '',
+    superseded_by_id    INTEGER,
+    last_used_at        REAL,
+    last_reconciled_at  REAL,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (source_plan_id) REFERENCES probe_plans (id) ON DELETE SET NULL,
+    FOREIGN KEY (source_snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL,
+    FOREIGN KEY (superseded_by_id) REFERENCES probe_patterns (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_probe_patterns_system
+    ON probe_patterns (system_id, id DESC);
+
+-- Points carry the structural facts captured at save time (signature and
+-- source/body hashes from the pinned snapshot) so reconciliation can decide
+-- exact_match / changed_signature deterministically without re-reading the
+-- old repository state.
+CREATE TABLE IF NOT EXISTS probe_pattern_points (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    pattern_id          INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    component_id        TEXT NOT NULL DEFAULT '',
+    path                TEXT NOT NULL,
+    symbol              TEXT NOT NULL,
+    line_start          INTEGER NOT NULL DEFAULT 0,
+    line_end            INTEGER NOT NULL DEFAULT 0,
+    reason              TEXT NOT NULL DEFAULT '',
+    recommended_mode    TEXT NOT NULL DEFAULT 'trace',
+    side_effect_risk    TEXT NOT NULL DEFAULT 'low',
+    replayability       TEXT NOT NULL DEFAULT '',
+    signature           TEXT NOT NULL DEFAULT '',
+    symbol_source_hash  TEXT,
+    symbol_body_hash    TEXT,
+    docstring           TEXT,
+    status              TEXT NOT NULL DEFAULT 'saved',
+    removed_at          REAL,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    FOREIGN KEY (pattern_id) REFERENCES probe_patterns (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_probe_pattern_points_pattern
+    ON probe_pattern_points (pattern_id);
+
+-- Append-only lifecycle history so "what happened to this pattern and when"
+-- (saved, removed before release, reconciled, re-planned) stays auditable.
+CREATE TABLE IF NOT EXISTS probe_pattern_events (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    pattern_id          INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    event_type          TEXT NOT NULL,
+    detail              TEXT NOT NULL DEFAULT '{}',
+    created_by_user_id  INTEGER,
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (pattern_id) REFERENCES probe_patterns (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (created_by_user_id) REFERENCES users (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_probe_pattern_events_pattern
+    ON probe_pattern_events (pattern_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS probe_pattern_reconciliations (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    pattern_id           INTEGER NOT NULL,
+    system_id            INTEGER NOT NULL,
+    snapshot_id          INTEGER NOT NULL,
+    commit_sha           TEXT NOT NULL,
+    intelligence_run_id  INTEGER,
+    status               TEXT NOT NULL DEFAULT 'completed',
+    error                TEXT,
+    summary_json         TEXT NOT NULL DEFAULT '{}',
+    created_at           REAL NOT NULL,
+    FOREIGN KEY (pattern_id) REFERENCES probe_patterns (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_probe_pattern_reconciliations_pattern
+    ON probe_pattern_reconciliations (pattern_id, id DESC);
+
+-- Per-point reconcile classification. decision_method records whether the
+-- classification was a deterministic structural check or a reasoning-model
+-- proposal; user_decision records the developer's manual call on it.
+CREATE TABLE IF NOT EXISTS probe_pattern_reconcile_points (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    reconciliation_id   INTEGER NOT NULL,
+    pattern_point_id    INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    classification      TEXT NOT NULL,
+    decision_method     TEXT NOT NULL DEFAULT 'deterministic',
+    target_path         TEXT,
+    target_symbol       TEXT,
+    target_line_start   INTEGER,
+    target_line_end     INTEGER,
+    confidence          REAL NOT NULL DEFAULT 0.0,
+    explanation         TEXT NOT NULL DEFAULT '',
+    hypothesis          TEXT NOT NULL DEFAULT '',
+    question            TEXT NOT NULL DEFAULT '',
+    evidence_json       TEXT NOT NULL DEFAULT '[]',
+    denylist_hit        TEXT,
+    body_changed        INTEGER NOT NULL DEFAULT 0,
+    user_decision       TEXT NOT NULL DEFAULT 'pending',
+    decided_at          REAL,
+    investigation_json  TEXT,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    FOREIGN KEY (reconciliation_id) REFERENCES probe_pattern_reconciliations (id) ON DELETE CASCADE,
+    FOREIGN KEY (pattern_point_id) REFERENCES probe_pattern_points (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_probe_pattern_reconcile_points_rec
+    ON probe_pattern_reconcile_points (reconciliation_id);
+
+-- Reviewable pre-release removal diffs. Mirrors probe_patches' explicit apply
+-- boundary: generated in an isolated worktree, applied to the target working
+-- tree only after commit-sha confirmation against a clean tree.
+CREATE TABLE IF NOT EXISTS probe_removal_patches (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    pattern_id           INTEGER NOT NULL,
+    system_id            INTEGER NOT NULL,
+    snapshot_id          INTEGER NOT NULL,
+    commit_sha           TEXT NOT NULL,
+    diff                 TEXT NOT NULL DEFAULT '',
+    point_ids            TEXT NOT NULL DEFAULT '[]',
+    skipped              TEXT NOT NULL DEFAULT '[]',
+    status               TEXT NOT NULL DEFAULT 'generated',
+    error                TEXT,
+    cleanup_state        TEXT NOT NULL DEFAULT 'not_attempted',
+    cleanup_error        TEXT,
+    apply_status         TEXT NOT NULL DEFAULT 'not_applied',
+    apply_error          TEXT,
+    applied_at           REAL,
+    applied_by_user_id   INTEGER,
+    created_at           REAL NOT NULL,
+    FOREIGN KEY (pattern_id) REFERENCES probe_patterns (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (applied_by_user_id) REFERENCES users (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_probe_removal_patches_pattern
+    ON probe_removal_patches (pattern_id, id DESC);
 """
 
 

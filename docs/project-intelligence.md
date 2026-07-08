@@ -1376,6 +1376,62 @@ Flow Explorer(Issue #43 / #58 の静的フロー)に **runtime lineage overlay**
 - **非目標**: traces / shadow_results 本体の retention、自動アーカイブ、LLM による
   削除判断(ポリシーは常に人間設定の決定的ルール)。
 
+## Probe Pattern ライフサイクル(Issue #168)
+
+本番リリース前に probe を外し、再開発時に「何を・なぜ観測していたか」を実装差分と
+突き合わせながら復元するためのレイヤー。Probe Pattern は保存済み設定ではなく
+「特定機能を観測するための再利用可能な認識単位」として扱い、ユーザーの認識と
+probe-agent の認識を同期させることを最優先にする。
+
+実装: `routes/probe_patterns.py` / `instrumentation_remover.py` /
+`pattern_reconciler.py`、Dashboard `pages/probe-patterns.tsx`。
+テーブル: `probe_patterns` / `probe_pattern_points` / `probe_pattern_events` /
+`probe_pattern_reconciliations` / `probe_pattern_reconcile_points` /
+`probe_removal_patches`(すべて system-scoped)。
+
+### 設計上の決定
+
+- **保存時に構造的事実を確定する**: pattern point は pinned snapshot から
+  抽出したシグネチャ・`symbol_source_hash` / `symbol_body_hash`・docstring・
+  行範囲・commit を保持する。これにより再開発時の reconcile で
+  「同一 path+symbol かつ同一シグネチャ → `exact_match`」
+  「同一 path+symbol でシグネチャ相違 → `changed_signature`」
+  「正規化 AST ハッシュが唯一の別位置に一致 → verbatim 移動の `moved_match`」
+  「denylist 一致 → `unsafe`」を決定的(Principle 6 の構造検証)に判定できる。
+- **開放的な判定だけを reasoning model に委ねる**: 上記で解決しない
+  移動・rename・分割/統合・消滅(`moved_match` / `split_or_merged` /
+  `missing`)は reasoning_llm。候補シンボル(同名末尾・同ファイル・同
+  ディレクトリ)は決定的 retrieval としてプロンプトに渡すだけで、最終判定には
+  しない。LLM 出力は有限集合の classification・index 済みシンボルへの target・
+  snapshot 実在パスへの evidence を厳密検証し、失敗時は run を failed として
+  永続化する(決定的分類の結果は残す。ヒューリスティック代替は禁止)。
+- **監査**: reconcile は `pattern_reconcile`、調査補助は `pattern_investigate`、
+  reconcile からの plan 化は `probe_plan_from_pattern` の intelligence run として
+  provider / model / prompt_version / decision_method を永続化。全点が決定的に
+  解決した reconcile は `decision_method: deterministic`(LLM 呼び出しなし)。
+- **削除は既存 patch と同じ書き込み境界**: 削除 patch は隔離 worktree で
+  `@probe` デコレータ(と未使用になった import)だけを AST 編集して生成した
+  reviewable diff。適用は commit SHA 確認 + clean tree 必須の明示エンドポイント
+  のみで、成功時に該当 point を `removed_from_production` に更新し、履歴
+  イベントを残す。
+- **再装着は既存ゲートを再利用する**: 承認済み reconcile から作る Probe Plan は
+  origin `probe_pattern` の通常 plan(point は `proposed`)。`exact_match` は
+  自動で、非 exact は accepted のみが plan point になり、`missing` / `unsafe` /
+  denylist は決して含めない。その先の approve → patch → validate → apply は
+  Issue #25 の既存フローそのままで、ショートカット適用経路は作らない。
+- **ヒアリング UX**: 非 exact の各 point には短い仮説 + evidence + yes/no で
+  答えられる確認質問が付く。「わからないので調べる」は pinned snapshot の
+  関連ファイル(対象ファイル・旧ファイル・evidence・シンボル名を含む
+  テスト)を bounded に読み、現在の実装状況の短い要約と推奨を返す
+  reasoning run(失敗時は fail closed)。
+- **status 遷移は有限集合**: reconcile 完了時に全点 `exact_match` なら
+  `active`、それ以外は `stale`。`archived` / `superseded` は手動操作のみ。
+
+### 非目標(Issue #168 のとおり)
+
+- 完全自動での probe 復元・古い pattern の無条件適用はしない。
+- ユーザー確認なしの対象リポジトリ書き換えはしない(Principle 5/8 維持)。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。

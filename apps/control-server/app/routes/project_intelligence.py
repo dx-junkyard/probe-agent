@@ -4172,6 +4172,7 @@ def _probe_plan_out(conn, plan_row, include_run: bool = True) -> ProbePlanOut:
         feature_id=plan_row["feature_id"],
         objective=plan_row["objective"],
         status=plan_row["status"],
+        origin=plan_row["origin"],
         avoid_reasons=[r["summary"] for r in avoid_rows],
         probe_points=[_probe_point_out(r) for r in point_rows],
         intelligence_run=run_out,
