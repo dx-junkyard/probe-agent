@@ -1416,16 +1416,30 @@ probe-agent の認識を同期させることを最優先にする。
   イベントを残す。
 - **再装着は既存ゲートを再利用する**: 承認済み reconcile から作る Probe Plan は
   origin `probe_pattern` の通常 plan(point は `proposed`)。`exact_match` は
-  自動で、非 exact は accepted のみが plan point になり、`missing` / `unsafe` /
-  denylist は決して含めない。その先の approve → patch → validate → apply は
+  自動で、非 exact は accepted のみが plan point になり、`unsafe` / denylist は
+  決して含めない。`split_or_merged` が複数 target に解決した場合は各 target に
+  probe point を張る(primary は `target_*`、残りは reconcile point の
+  `additional_targets_json`)。その先の approve → patch → validate → apply は
   Issue #25 の既存フローそのままで、ショートカット適用経路は作らない。
+- **本番前削除→再装着のライフサイクルは複数回まわる**: plan 作成時に、寄与した
+  pattern point を現在コードへ再アンカー(path/symbol/行範囲/シグネチャ/hash/
+  docstring を更新)し status を `saved` に戻す。`split_or_merged` の追加 target
+  は新しい `saved` pattern point として追加する。これにより次回リリース前の
+  削除 patch(`saved` point のみ対象)が同じ Pattern から再度実行できる。
+  pattern point の status は「観測対象として認識している状態」を表し、実際の
+  instrumentation 適用は #25 ゲートで担保する。
 - **ヒアリング UX**: 非 exact の各 point には短い仮説 + evidence + yes/no で
   答えられる確認質問が付く。「わからないので調べる」は pinned snapshot の
   関連ファイル(対象ファイル・旧ファイル・evidence・シンボル名を含む
   テスト)を bounded に読み、現在の実装状況の短い要約と推奨を返す
-  reasoning run(失敗時は fail closed)。
+  reasoning run(失敗時は fail closed)。`missing` は reconcile 時点では target を
+  持たないが、調査が index 済みシンボルを `proposed_target` として返した場合、
+  ユーザーが accept すると `target_*` に昇格させ、通常の plan 化ゲートに載せる
+  (accept が `decision_method: manual`、denylist 一致は昇格拒否)。
 - **status 遷移は有限集合**: reconcile 完了時に全点 `exact_match` なら
   `active`、それ以外は `stale`。`archived` / `superseded` は手動操作のみ。
+  pattern point の status は `saved` / `removed_from_production` の二値で、削除
+  patch 適用で `removed_from_production`、reconcile からの plan 化で `saved`。
 
 ### 非目標(Issue #168 のとおり)
 

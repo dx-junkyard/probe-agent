@@ -533,7 +533,7 @@ function ReconciliationSection({ pattern, onCreatePlan, createPending }: {
   const eligible = rec.status === "completed" && rec.points.some(p =>
     (p.classification === "exact_match" && p.user_decision !== "rejected")
     || (p.user_decision === "accepted" && p.target_symbol
-        && p.classification !== "missing" && p.classification !== "unsafe"),
+        && p.classification !== "unsafe" && !p.denylist_hit),
   );
 
   return (
@@ -617,6 +617,17 @@ function ReconcilePointCard({ point, patternPoint }: {
         {patternPoint && <span>{patternPoint.path}:{patternPoint.symbol}</span>}
         {moved && <span> → {point.target_path}:{point.target_symbol}</span>}
       </div>
+      {point.additional_targets.length > 0 && (
+        <div className="text-xs">
+          <span className="font-medium">Split across:</span>
+          {point.additional_targets.map((t, i) => (
+            <span key={i} className="font-mono ml-1">
+              {t.path}:{t.symbol}{i < point.additional_targets.length - 1 ? "," : ""}
+            </span>
+          ))}
+          <span className="text-muted-foreground"> — accepting re-attaches a probe to each</span>
+        </div>
+      )}
 
       {point.hypothesis && <div className="text-xs"><span className="font-medium">Hypothesis:</span> {point.hypothesis}</div>}
       {point.explanation && <div className="text-xs text-muted-foreground">{point.explanation}</div>}
@@ -691,6 +702,35 @@ function ReconcilePointCard({ point, patternPoint }: {
               {ev.summary && <> — {ev.summary}</>}
             </div>
           ))}
+          {point.investigation.proposed_target_symbol
+            && point.user_decision !== "accepted" && (
+            <div className="flex gap-2 flex-wrap pt-1">
+              <Button
+                size="sm" variant="outline"
+                disabled={decide.isPending}
+                onClick={() =>
+                  decide.mutateAsync({ pointId: point.id, decision: "accepted" })
+                    .then(() => toast.success("提案された対象で pattern を更新しました"))
+                    .catch(e => toast.error(String(e)))
+                }
+              >
+                <CheckCircle className="h-3 w-3 mr-1 text-emerald-600" />
+                この方針で更新
+              </Button>
+              {point.user_decision !== "rejected" && (
+                <Button
+                  size="sm" variant="outline"
+                  disabled={decide.isPending}
+                  onClick={() =>
+                    decide.mutateAsync({ pointId: point.id, decision: "rejected" })
+                      .catch(e => toast.error(String(e)))
+                  }
+                >
+                  <XCircle className="h-3 w-3 mr-1 text-red-500" /> 見送る
+                </Button>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>

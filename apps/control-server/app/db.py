@@ -1615,6 +1615,11 @@ CREATE TABLE IF NOT EXISTS probe_pattern_reconcile_points (
     user_decision       TEXT NOT NULL DEFAULT 'pending',
     decided_at          REAL,
     investigation_json  TEXT,
+    -- split_or_merged points can resolve to more than one current symbol.
+    -- target_* holds the primary; the remainder are kept here as a JSON list
+    -- of {path, symbol, line_start, line_end} so re-attachment can produce a
+    -- probe point per resulting location.
+    additional_targets_json TEXT NOT NULL DEFAULT '[]',
     created_at          REAL NOT NULL,
     updated_at          REAL NOT NULL,
     FOREIGN KEY (reconciliation_id) REFERENCES probe_pattern_reconciliations (id) ON DELETE CASCADE,
@@ -2067,6 +2072,12 @@ def init_db() -> None:
         if plan_cols and "origin" not in plan_cols:
             conn.execute(
                 "ALTER TABLE probe_plans ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'"
+            )
+        reconcile_point_cols = _columns(conn, "probe_pattern_reconcile_points")
+        if reconcile_point_cols and "additional_targets_json" not in reconcile_point_cols:
+            conn.execute(
+                "ALTER TABLE probe_pattern_reconcile_points "
+                "ADD COLUMN additional_targets_json TEXT NOT NULL DEFAULT '[]'"
             )
         graph_cols = _columns(conn, "understanding_graph_snapshots")
         if graph_cols and "snapshot_id" not in graph_cols:

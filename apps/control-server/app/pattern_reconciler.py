@@ -105,6 +105,10 @@ class ReconcilePointResult:
     target_symbol: Optional[str] = None
     target_line_start: Optional[int] = None
     target_line_end: Optional[int] = None
+    # Extra current symbols a split_or_merged responsibility resolved to,
+    # beyond the primary target_*. Each item is a dict with path/symbol/
+    # line_start/line_end so re-attachment can emit one probe point per site.
+    additional_targets: List[dict] = field(default_factory=list)
     confidence: float = 0.0
     explanation: str = ""
     hypothesis: str = ""
@@ -495,6 +499,7 @@ def parse_reconcile_response(
             )
 
         evidence = _parse_evidence(item.get("evidence", []), known_paths)
+        additional_targets: List[dict] = []
         for target in targets[1:]:
             evidence.append(EvidenceRef(
                 path=target.path,
@@ -502,6 +507,12 @@ def parse_reconcile_response(
                 end_line=target.end_line,
                 summary=f"Additional target: {target.qualified_name}",
             ))
+            additional_targets.append({
+                "path": target.path,
+                "symbol": target.qualified_name,
+                "line_start": target.start_line,
+                "line_end": target.end_line,
+            })
 
         primary = targets[0] if targets else None
         denylist = (
@@ -517,6 +528,7 @@ def parse_reconcile_response(
             target_symbol=primary.qualified_name if primary else None,
             target_line_start=primary.start_line if primary else None,
             target_line_end=primary.end_line if primary else None,
+            additional_targets=additional_targets,
             confidence=confidence,
             explanation=str(item.get("explanation", "")).strip(),
             hypothesis=hypothesis,

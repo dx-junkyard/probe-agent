@@ -55,6 +55,7 @@ from ..models import (
     ReconcileDecisionRequest,
     ReconcileEvidenceOut,
     ReconcilePointOut,
+    ReconcileTargetOut,
 )
 from ..pattern_reconciler import (
     INVESTIGATE_PROMPT_VERSION,
@@ -172,6 +173,70 @@ def _component_id_for(qualified_name: str) -> str:
     return f"{kebab}-observer" if kebab else "pattern-observer"
 
 
+def _reattach_reason(base_reason: str, classification: str, origin: str) -> str:
+    reason = base_reason or "Saved probe pattern point"
+    if classification == "exact_match":
+        return reason
+    note = "investigation" if classification == "missing" else classification
+    return f"{reason} (re-attached via pattern reconcile: {note} from {origin})"
+
+
+def _target_anchor(symbol_facts, sources, path, symbol, line_start, line_end):
+    """Structural facts for re-anchoring a pattern point to a current symbol."""
+    facts = symbol_facts.get((path, symbol))
+    return {
+        "line_start": (line_start or (facts["start_line"] if facts else 0)) or 0,
+        "line_end": (line_end or (facts["end_line"] if facts else 0)) or 0,
+        "signature": extract_signature(sources.get(path, ""), symbol) if facts else "",
+        "symbol_source_hash": facts["symbol_source_hash"] if facts else None,
+        "symbol_body_hash": facts["symbol_body_hash"] if facts else None,
+        "docstring": facts["docstring"] if facts else None,
+    }
+
+
+def _investigation_promotion(conn, rec_point_row, system_id: int):
+    """Resolve an investigation's proposed target into a re-attachable target.
+
+    A ``missing`` reconcile point has no reconcile-time target, but the
+    ``investigate`` reasoning run may have proposed one. When the developer
+    accepts such a point, we promote that proposal into ``target_*`` so the
+    existing plan-creation gates can re-attach it. The proposed symbol must
+    still exist in the reconciliation's pinned snapshot and must not be
+    safety-denylisted. Returns a target dict or ``None`` when there is no
+    usable proposal.
+    """
+    try:
+        investigation = json.loads(rec_point_row["investigation_json"] or "null")
+    except (json.JSONDecodeError, TypeError):
+        investigation = None
+    if not isinstance(investigation, dict):
+        return None
+    path = investigation.get("proposed_target_path")
+    symbol = investigation.get("proposed_target_symbol")
+    if not path or not symbol:
+        return None
+    rec_row = conn.execute(
+        "SELECT snapshot_id FROM probe_pattern_reconciliations WHERE id = ?",
+        (rec_point_row["reconciliation_id"],),
+    ).fetchone()
+    if rec_row is None:
+        return None
+    symbol_row = conn.execute(
+        """SELECT * FROM code_symbols
+           WHERE snapshot_id = ? AND path = ? AND qualified_name = ?""",
+        (rec_row["snapshot_id"], path, symbol),
+    ).fetchone()
+    if symbol_row is None:
+        return None
+    return {
+        "path": path,
+        "symbol": symbol,
+        "line_start": symbol_row["start_line"],
+        "line_end": symbol_row["end_line"],
+        "denylist_hit": check_denylist(symbol, symbol_row["docstring"]),
+    }
+
+
 def _intelligence_run_out(row) -> IntelligenceRunOut:
     return IntelligenceRunOut(
         id=row["id"],
@@ -247,6 +312,23 @@ def _evidence_out(raw: str) -> List[ReconcileEvidenceOut]:
     return out
 
 
+def _targets_out(raw: Optional[str]) -> List[ReconcileTargetOut]:
+    try:
+        items = json.loads(raw or "[]")
+    except json.JSONDecodeError:
+        return []
+    out = []
+    for item in items if isinstance(items, list) else []:
+        if isinstance(item, dict):
+            out.append(ReconcileTargetOut(
+                path=str(item.get("path", "")),
+                symbol=str(item.get("symbol", "")),
+                line_start=item.get("line_start"),
+                line_end=item.get("line_end"),
+            ))
+    return out
+
+
 def _investigation_out(raw: Optional[str]) -> Optional[PatternInvestigationOut]:
     if not raw:
         return None
@@ -287,6 +369,7 @@ def _reconcile_point_out(row) -> ReconcilePointOut:
         target_symbol=row["target_symbol"],
         target_line_start=row["target_line_start"],
         target_line_end=row["target_line_end"],
+        additional_targets=_targets_out(row["additional_targets_json"]),
         confidence=row["confidence"],
         explanation=row["explanation"],
         hypothesis=row["hypothesis"],
@@ -1157,8 +1240,9 @@ def reconcile_probe_pattern(
                             target_symbol, target_line_start, target_line_end,
                             confidence, explanation, hypothesis, question,
                             evidence_json, denylist_hit, body_changed,
+                            additional_targets_json,
                             user_decision, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                                'pending', ?, ?)""",
                     (
                         reconciliation_id, r.pattern_point_id, system_id,
@@ -1174,7 +1258,9 @@ def reconcile_probe_pattern(
                             }
                             for e in r.evidence
                         ]),
-                        r.denylist_hit, 1 if r.body_changed else 0, now, now,
+                        r.denylist_hit, 1 if r.body_changed else 0,
+                        json.dumps(r.additional_targets),
+                        now, now,
                     ),
                 )
 
@@ -1262,13 +1348,38 @@ def decide_reconcile_point(
                 status_code=409,
                 detail="Safety-denylisted reconcile points cannot be accepted",
             )
+        promoted = None
         if payload.decision == "accepted" and row["classification"] == "missing":
-            raise HTTPException(
-                status_code=409,
-                detail="A missing point has no target to accept",
-            )
+            promoted = _investigation_promotion(conn, row, system_id)
+            if promoted is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "A missing point has no target to accept. Investigate "
+                        "it first, then accept the proposed target."
+                    ),
+                )
+            if promoted["denylist_hit"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "The investigated target is safety-denylisted and "
+                        "cannot be accepted"
+                    ),
+                )
         conn.execute("BEGIN")
         try:
+            if promoted is not None:
+                conn.execute(
+                    """UPDATE probe_pattern_reconcile_points
+                       SET target_path = ?, target_symbol = ?,
+                           target_line_start = ?, target_line_end = ?
+                       WHERE id = ?""",
+                    (
+                        promoted["path"], promoted["symbol"],
+                        promoted["line_start"], promoted["line_end"], point_id,
+                    ),
+                )
             conn.execute(
                 """UPDATE probe_pattern_reconcile_points
                    SET user_decision = ?, decided_at = ?, updated_at = ?
@@ -1286,6 +1397,10 @@ def decide_reconcile_point(
                         "reconcile_point_id": point_id,
                         "decision": payload.decision,
                         "classification": row["classification"],
+                        **(
+                            {"promoted_target": f"{promoted['path']}:{promoted['symbol']}"}
+                            if promoted is not None else {}
+                        ),
                     },
                     principal.user_id,
                 )
@@ -1503,8 +1618,14 @@ def create_plan_from_reconciliation(
     through the existing approve -> patch -> validate -> apply gates.
 
     Eligible points: exact matches (unless rejected) and explicitly accepted
-    moved/changed/split points with a resolved target. Missing and unsafe
-    points never become plan points.
+    moved/changed/split points with a resolved target. A split_or_merged point
+    re-attaches a probe point at every resolved target. A ``missing`` point is
+    eligible only after investigation proposed a target and the developer
+    accepted it. Unsafe/denylisted points never become plan points.
+
+    Creating the plan also re-anchors the pattern's own points to the current
+    code and marks them ``saved`` again, so the pre-release removal / reconcile
+    lifecycle can run for the next release cycle.
 
     probe-agent:
       role: API boundary converting reconcile decisions into a Probe Plan
@@ -1553,19 +1674,25 @@ def create_plan_from_reconciliation(
                WHERE rp.reconciliation_id = ? ORDER BY rp.id""",
             (reconciliation_id,),
         ).fetchall()
-        symbol_docs = {
-            (r["path"], r["qualified_name"]): r["docstring"]
+        symbol_facts = {
+            (r["path"], r["qualified_name"]): r
             for r in conn.execute(
-                "SELECT path, qualified_name, docstring FROM code_symbols WHERE snapshot_id = ?",
+                """SELECT path, qualified_name, start_line, end_line,
+                          symbol_source_hash, symbol_body_hash, docstring
+                   FROM code_symbols WHERE snapshot_id = ?""",
                 (rec_row["snapshot_id"],),
             ).fetchall()
         }
+        sources = _load_python_sources(conn, rec_row["snapshot_id"])
 
     eligible = []
     for r in point_rows:
         if r["user_decision"] == "rejected":
             continue
-        if r["classification"] in ("missing", "unsafe") or r["denylist_hit"]:
+        # unsafe / denylisted targets are never re-attached. ``missing`` points
+        # are eligible only once investigation has proposed a target and the
+        # developer accepted it (which fills target_* on the point).
+        if r["classification"] == "unsafe" or r["denylist_hit"]:
             continue
         if not r["target_path"] or not r["target_symbol"]:
             continue
@@ -1614,34 +1741,105 @@ def create_plan_from_reconciliation(
             )
             plan_id = cur.lastrowid
 
+            probe_point_count = 0
             for r in eligible:
-                target_key = (r["target_path"], r["target_symbol"])
-                denylist_hit = check_denylist(
-                    r["target_symbol"], symbol_docs.get(target_key),
+                origin = f"{r['pp_path']}:{r['pp_symbol']}"
+                reason = _reattach_reason(
+                    r["pp_reason"], r["classification"], origin,
                 )
-                reason = r["pp_reason"] or "Saved probe pattern point"
-                if r["classification"] != "exact_match":
-                    reason += (
-                        f" (re-attached via pattern reconcile: {r['classification']}"
-                        f" from {r['pp_path']}:{r['pp_symbol']})"
+                # A split_or_merged responsibility resolves to more than one
+                # current symbol: re-attach a probe point at each.
+                try:
+                    extra = json.loads(r["additional_targets_json"] or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    extra = []
+                targets = [{
+                    "path": r["target_path"],
+                    "symbol": r["target_symbol"],
+                    "line_start": r["target_line_start"],
+                    "line_end": r["target_line_end"],
+                }]
+                for t in extra if isinstance(extra, list) else []:
+                    if isinstance(t, dict) and t.get("path") and t.get("symbol"):
+                        targets.append({
+                            "path": t["path"],
+                            "symbol": t["symbol"],
+                            "line_start": t.get("line_start"),
+                            "line_end": t.get("line_end"),
+                        })
+
+                for idx, t in enumerate(targets):
+                    anchor = _target_anchor(
+                        symbol_facts, sources,
+                        t["path"], t["symbol"], t["line_start"], t["line_end"],
                     )
-                conn.execute(
-                    """INSERT INTO probe_points
-                           (plan_id, system_id, component_id, feature_id,
-                            path, symbol, line_start, line_end, reason,
-                            recommended_mode, side_effect_risk, replayability,
-                            denylist_hit, status, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                               'proposed', ?, ?)""",
-                    (
-                        plan_id, system_id,
-                        r["pp_component_id"] or _component_id_for(r["target_symbol"]),
-                        feature_id, r["target_path"], r["target_symbol"],
-                        r["target_line_start"] or 0, r["target_line_end"] or 0,
-                        reason, r["pp_mode"], r["pp_risk"],
-                        r["pp_replayability"], denylist_hit, now, now,
-                    ),
-                )
+                    denylist_hit = check_denylist(t["symbol"], anchor["docstring"])
+                    component_id = (
+                        r["pp_component_id"] or _component_id_for(t["symbol"])
+                        if idx == 0 else _component_id_for(t["symbol"])
+                    )
+                    conn.execute(
+                        """INSERT INTO probe_points
+                               (plan_id, system_id, component_id, feature_id,
+                                path, symbol, line_start, line_end, reason,
+                                recommended_mode, side_effect_risk, replayability,
+                                denylist_hit, status, created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                   'proposed', ?, ?)""",
+                        (
+                            plan_id, system_id, component_id,
+                            feature_id, t["path"], t["symbol"],
+                            anchor["line_start"], anchor["line_end"],
+                            reason, r["pp_mode"], r["pp_risk"],
+                            r["pp_replayability"], denylist_hit, now, now,
+                        ),
+                    )
+                    probe_point_count += 1
+
+                    # Re-anchor the pattern's own points to the current code so
+                    # the lifecycle can loop: the primary target updates the
+                    # origin pattern point back to 'saved', extra split targets
+                    # add new saved points. Without this the next pre-release
+                    # removal (which only touches 'saved' points) has nothing
+                    # to remove.
+                    if idx == 0:
+                        conn.execute(
+                            """UPDATE probe_pattern_points
+                               SET path = ?, symbol = ?, line_start = ?,
+                                   line_end = ?, signature = ?,
+                                   symbol_source_hash = ?, symbol_body_hash = ?,
+                                   docstring = ?, status = 'saved',
+                                   removed_at = NULL, updated_at = ?
+                               WHERE id = ? AND pattern_id = ?""",
+                            (
+                                t["path"], t["symbol"],
+                                anchor["line_start"], anchor["line_end"],
+                                anchor["signature"], anchor["symbol_source_hash"],
+                                anchor["symbol_body_hash"], anchor["docstring"],
+                                now, r["pattern_point_id"], pattern_id,
+                            ),
+                        )
+                    else:
+                        conn.execute(
+                            """INSERT INTO probe_pattern_points
+                                   (pattern_id, system_id, component_id, path,
+                                    symbol, line_start, line_end, reason,
+                                    recommended_mode, side_effect_risk,
+                                    replayability, signature, symbol_source_hash,
+                                    symbol_body_hash, docstring, status,
+                                    created_at, updated_at)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                       ?, 'saved', ?, ?)""",
+                            (
+                                pattern_id, system_id, component_id, t["path"],
+                                t["symbol"], anchor["line_start"],
+                                anchor["line_end"], r["pp_reason"], r["pp_mode"],
+                                r["pp_risk"], r["pp_replayability"],
+                                anchor["signature"], anchor["symbol_source_hash"],
+                                anchor["symbol_body_hash"], anchor["docstring"],
+                                now, now,
+                            ),
+                        )
 
             conn.execute(
                 "UPDATE probe_patterns SET last_used_at = ?, updated_at = ? WHERE id = ?",
@@ -1653,6 +1851,16 @@ def create_plan_from_reconciliation(
                     "plan_id": plan_id,
                     "reconciliation_id": reconciliation_id,
                     "point_count": len(eligible),
+                    "probe_point_count": probe_point_count,
+                },
+                principal.user_id,
+            )
+            _record_event(
+                conn, pattern_id, system_id, "reattached",
+                {
+                    "plan_id": plan_id,
+                    "reconciliation_id": reconciliation_id,
+                    "probe_point_count": probe_point_count,
                 },
                 principal.user_id,
             )

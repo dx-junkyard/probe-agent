@@ -907,6 +907,254 @@ def test_investigate_fails_closed_with_mock(
 
 
 # ---------------------------------------------------------------------------
+# Lifecycle loop: re-attachment returns points to 'saved' (P1)
+# ---------------------------------------------------------------------------
+
+
+def test_reattachment_returns_points_to_saved_for_next_removal(
+    admin_client, git_repo,
+):
+    """After removal+apply, creating a plan from a reconciliation must return
+    the pattern points to 'saved' and re-anchor them, so a second pre-release
+    removal can run from the same pattern."""
+    token = _login(admin_client)
+    system = _create_system(admin_client, token, "lifecycle-loop")
+    h = _headers(token, system["id"])
+    snapshot = _setup_repo(admin_client, h, git_repo)
+    pattern = _make_pattern(admin_client, h, [
+        {"path": "src/app.py", "symbol": "calculate_total"},
+    ])
+
+    # Round 1: remove before release.
+    r = admin_client.post(
+        f"/repository/probe-patterns/{pattern['id']}/removal-patches",
+        json={}, headers=h,
+    )
+    patch = r.json()
+    r = admin_client.post(
+        f"/repository/probe-removal-patches/{patch['id']}/apply",
+        json={"confirmed": True, "expected_commit_sha": snapshot["commit_sha"]},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    detail = admin_client.get(
+        f"/repository/probe-patterns/{pattern['id']}", headers=h,
+    ).json()
+    assert detail["points"][0]["status"] == "removed_from_production"
+
+    # Re-development: reconcile (exact against the pinned snapshot) then create
+    # a plan. This must re-attach: the point returns to 'saved'.
+    r = admin_client.post(
+        f"/repository/probe-patterns/{pattern['id']}/reconcile", headers=h,
+    )
+    rec = r.json()
+    assert rec["status"] == "completed"
+    r = admin_client.post(
+        f"/repository/probe-patterns/{pattern['id']}"
+        f"/reconciliations/{rec['id']}/create-plan",
+        json={}, headers=h,
+    )
+    assert r.status_code == 201, r.text
+
+    detail = admin_client.get(
+        f"/repository/probe-patterns/{pattern['id']}", headers=h,
+    ).json()
+    assert detail["points"][0]["status"] == "saved"
+    assert detail["points"][0]["removed_at"] is None
+    assert "reattached" in [e["event_type"] for e in detail["events"]]
+
+    # Round 2: the pre-release removal can run again from the same pattern.
+    r = admin_client.post(
+        f"/repository/probe-patterns/{pattern['id']}/removal-patches",
+        json={}, headers=h,
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["status"] == "generated"
+    assert '-@probe(component_id="total-calculator")' in r.json()["diff"]
+
+
+# ---------------------------------------------------------------------------
+# split_or_merged re-attaches a probe point per target (P2a)
+# ---------------------------------------------------------------------------
+
+
+V2_SPLIT_APP = textwrap.dedent("""\
+    from probe_agent import probe
+
+
+    def compute_subtotal(items: list) -> int:
+        return sum(i["price"] for i in items)
+
+
+    def apply_tax(subtotal: int) -> int:
+        return int(subtotal * 1.1)
+""")
+
+
+class _ReasoningSplitClient:
+    def generate_text(self, messages, *, temperature=None, max_tokens=None):
+        prompt = messages[-1]["content"]
+        point_id = None
+        for line in prompt.splitlines():
+            if line.strip().startswith("- id="):
+                point_id = int(line.split("id=")[1].split(" ")[0])
+        return json.dumps({
+            "points": [{
+                "pattern_point_id": point_id,
+                "classification": "split_or_merged",
+                "targets": [
+                    {"path": "src/app.py", "symbol": "compute_subtotal"},
+                    {"path": "src/app.py", "symbol": "apply_tax"},
+                ],
+                "hypothesis": "calculate_total was split into subtotal and tax.",
+                "explanation": "Two functions now cover the old responsibility.",
+                "question": "Re-attach a probe to each?",
+                "confidence": 0.8,
+                "evidence": [{
+                    "path": "src/app.py",
+                    "start_line": 1,
+                    "end_line": 9,
+                    "summary": "subtotal and tax split apart",
+                }],
+            }],
+        })
+
+
+def test_split_or_merged_reattaches_every_target(
+    admin_client, git_repo, monkeypatch,
+):
+    token = _login(admin_client)
+    system = _create_system(admin_client, token, "recon-split")
+    h = _headers(token, system["id"])
+    _setup_repo(admin_client, h, git_repo)
+    pattern = _make_pattern(admin_client, h, [
+        {"path": "src/app.py", "symbol": "calculate_total",
+         "component_id": "total-calculator", "reason": "Observe totals"},
+    ])
+
+    (git_repo / "src" / "app.py").write_text(V2_SPLIT_APP)
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "split totals")
+    _fresh_snapshot(admin_client, h)
+
+    _enable_reasoning(monkeypatch, _ReasoningSplitClient)
+    r = admin_client.post(
+        f"/repository/probe-patterns/{pattern['id']}/reconcile", headers=h,
+    )
+    assert r.status_code == 201, r.text
+    rec = r.json()
+    point = rec["points"][0]
+    assert point["classification"] == "split_or_merged"
+    assert point["target_symbol"] == "compute_subtotal"
+    assert [t["symbol"] for t in point["additional_targets"]] == ["apply_tax"]
+
+    # Accept, then create a plan: both split targets get a probe point.
+    r = admin_client.put(
+        f"/repository/pattern-reconcile-points/{point['id']}/decision",
+        json={"decision": "accepted"}, headers=h,
+    )
+    assert r.status_code == 200, r.text
+    r = admin_client.post(
+        f"/repository/probe-patterns/{pattern['id']}"
+        f"/reconciliations/{rec['id']}/create-plan",
+        json={}, headers=h,
+    )
+    assert r.status_code == 201, r.text
+    symbols = {(p["path"], p["symbol"]) for p in r.json()["probe_points"]}
+    assert ("src/app.py", "compute_subtotal") in symbols
+    assert ("src/app.py", "apply_tax") in symbols
+
+    # The pattern now tracks both current locations as saved points.
+    detail = admin_client.get(
+        f"/repository/probe-patterns/{pattern['id']}", headers=h,
+    ).json()
+    saved = {(p["path"], p["symbol"]) for p in detail["points"]
+             if p["status"] == "saved"}
+    assert ("src/app.py", "compute_subtotal") in saved
+    assert ("src/app.py", "apply_tax") in saved
+
+
+# ---------------------------------------------------------------------------
+# Investigated 'missing' candidate can be accepted and planned (P2b)
+# ---------------------------------------------------------------------------
+
+
+def test_investigated_missing_can_be_accepted_and_planned(
+    admin_client, git_repo, monkeypatch,
+):
+    token = _login(admin_client)
+    system = _create_system(admin_client, token, "missing-plan")
+    h = _headers(token, system["id"])
+
+    (git_repo / "src" / "report.py").write_text(textwrap.dedent("""\
+        from probe_agent import probe
+
+
+        @probe(component_id="report-fetcher")
+        def fetch_report(id: str) -> dict:
+            return {"id": id}
+    """))
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "report v1")
+    _setup_repo(admin_client, h, git_repo)
+    pattern = _make_pattern(admin_client, h, [
+        {"path": "src/report.py", "symbol": "fetch_report",
+         "component_id": "report-fetcher", "reason": "Observe report loads"},
+    ])
+
+    (git_repo / "src" / "report.py").write_text(textwrap.dedent("""\
+        def load_report(report_id: str) -> dict:
+            report = {"id": report_id, "status": "loaded"}
+            return report
+    """))
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "report v2")
+    _fresh_snapshot(admin_client, h)
+
+    _enable_reasoning(monkeypatch, _ReasoningMissingClient)
+    r = admin_client.post(
+        f"/repository/probe-patterns/{pattern['id']}/reconcile", headers=h,
+    )
+    rec = r.json()
+    point = rec["points"][0]
+    assert point["classification"] == "missing"
+
+    # Without investigation there is no target, so accept is refused.
+    r = admin_client.put(
+        f"/repository/pattern-reconcile-points/{point['id']}/decision",
+        json={"decision": "accepted"}, headers=h,
+    )
+    assert r.status_code == 409
+
+    # Investigate: the reasoning model proposes load_report.
+    _enable_reasoning(monkeypatch, _InvestigationClient)
+    r = admin_client.post(
+        f"/repository/pattern-reconcile-points/{point['id']}/investigate",
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["investigation"]["proposed_target_symbol"] == "load_report"
+
+    # Now the proposal can be accepted; the point is promoted with a target.
+    r = admin_client.put(
+        f"/repository/pattern-reconcile-points/{point['id']}/decision",
+        json={"decision": "accepted"}, headers=h,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["target_symbol"] == "load_report"
+
+    # And the promoted point flows into a Probe Plan.
+    r = admin_client.post(
+        f"/repository/probe-patterns/{pattern['id']}"
+        f"/reconciliations/{rec['id']}/create-plan",
+        json={}, headers=h,
+    )
+    assert r.status_code == 201, r.text
+    symbols = {(p["path"], p["symbol"]) for p in r.json()["probe_points"]}
+    assert ("src/report.py", "load_report") in symbols
+
+
+# ---------------------------------------------------------------------------
 # Unit tests: instrumentation remover
 # ---------------------------------------------------------------------------
 

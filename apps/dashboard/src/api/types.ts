@@ -1328,6 +1328,13 @@ export interface ReconcileEvidenceOut {
   summary: string;
 }
 
+export interface ReconcileTargetOut {
+  path: string;
+  symbol: string;
+  line_start: number | null;
+  line_end: number | null;
+}
+
 export interface PatternInvestigationOut {
   summary: string;
   recommendation: string;
@@ -1348,6 +1355,7 @@ export interface ReconcilePointOut {
   target_symbol: string | null;
   target_line_start: number | null;
   target_line_end: number | null;
+  additional_targets: ReconcileTargetOut[];
   confidence: number;
   explanation: string;
   hypothesis: string;

@@ -1318,6 +1318,13 @@ class ReconcileEvidenceOut(BaseModel):
     summary: str = ""
 
 
+class ReconcileTargetOut(BaseModel):
+    path: str
+    symbol: str
+    line_start: Optional[int] = None
+    line_end: Optional[int] = None
+
+
 class PatternInvestigationOut(BaseModel):
     summary: str
     recommendation: str
@@ -1338,6 +1345,7 @@ class ReconcilePointOut(BaseModel):
     target_symbol: Optional[str] = None
     target_line_start: Optional[int] = None
     target_line_end: Optional[int] = None
+    additional_targets: List[ReconcileTargetOut] = Field(default_factory=list)
     confidence: float = 0.0
     explanation: str = ""
     hypothesis: str = ""
