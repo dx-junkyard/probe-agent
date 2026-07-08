@@ -1,15 +1,16 @@
 """Sample calculator application utilizing @probe for execution tracing and shadow mode.
-Now supports advanced expression parsing (including parenthesis and multiple operators).
+Supports advanced expression parsing (including parenthesis and multiple operators).
 
 Run:
     $env:PROBE_SERVER_URL="http://localhost:8000"
-    uvicorn main:app --reload
+
+    python main.py                # automated demo (default)
+    python main.py --interactive  # interactive REPL
+    python main.py --api          # FastAPI server on port 8080
 """
 
 import sys
 import re
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 from probe_agent import probe, set_candidate
 from components import (
     add, add_v2,
@@ -17,14 +18,6 @@ from components import (
     multiply, multiply_v2,
     divide, divide_v2
 )
-
-app = FastAPI(title="Calculator API", description="API for advanced expression parsing", version="1.0.0")
-
-class CalculationRequest(BaseModel):
-    expression: str
-
-class CalculationResponse(BaseModel):
-    result: float
 
 # 新しい候補(V2)を登録。
 # これにより、PROBE_SERVER 側で shadow モードが有効になった際に比較が行われます。
@@ -131,27 +124,37 @@ class ExpressionEvaluator:
         except ValueError:
             raise ValueError(f"無効な数値です: '{token}'")
 
-    # 別名定義（exprをエントリポイントとする）
-    expr_eval = expr
-
 def evaluate_expression(expression: str) -> float:
     evaluator = ExpressionEvaluator(expression)
-    # expr()を呼び出すラッパー
-    if not evaluator.tokens:
-        raise ValueError("数式が入力されていません。")
-    return evaluator.expr_eval()
+    return evaluator.parse()
 
-@app.post("/calculate", response_model=CalculationResponse)
-def calculate_api(request: CalculationRequest):
-    try:
-        res = evaluate_expression(request.expression)
-        return CalculationResponse(result=res)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except ZeroDivisionError as e:
-        raise HTTPException(status_code=400, detail="0で割ることはできません。")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"エラーが発生しました: {e}")
+def build_app():
+    """Build the FastAPI app. Imported lazily so the demo/interactive
+    modes don't require fastapi/pydantic/uvicorn to be installed."""
+    from fastapi import FastAPI, HTTPException
+    from pydantic import BaseModel
+
+    class CalculationRequest(BaseModel):
+        expression: str
+
+    class CalculationResponse(BaseModel):
+        result: float
+
+    app = FastAPI(title="Calculator API", description="API for advanced expression parsing", version="1.0.0")
+
+    @app.post("/calculate", response_model=CalculationResponse)
+    def calculate_api(request: CalculationRequest):
+        try:
+            res = evaluate_expression(request.expression)
+            return CalculationResponse(result=res)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except ZeroDivisionError:
+            raise HTTPException(status_code=400, detail="0で割ることはできません。")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"エラーが発生しました: {e}")
+
+    return app
 
 def run_interactive():
     print("--- 電卓アプリ (Interactive Mode) ---")
@@ -177,13 +180,27 @@ def run_interactive():
 
 def run_api():
     import uvicorn
-    # Change port to 8080 to avoid conflicts if 8000 is used
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    # Port 8080 avoids clashing with the Control Server's default 8000.
+    uvicorn.run(build_app(), host="0.0.0.0", port=8080)
+
+DEMO_EXPRESSIONS = ["10 + 5", "20 - 8", "6 * 7", "100 / 4", "5 / 0"]
+
+def run_demo():
+    print("--- デモ実行 (Automated Mode) ---")
+    for expr in DEMO_EXPRESSIONS:
+        print(f"実行中: {expr}")
+        try:
+            print(f" -> 結果: {evaluate_expression(expr)}\n")
+        except ValueError as e:
+            print(f" -> エラー (期待通り): {e}\n")
+    print("対話モードを実行するには、以下のように実行してください:")
+    print("  python main.py --interactive")
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--interactive":
+    mode = sys.argv[1] if len(sys.argv) > 1 else None
+    if mode == "--interactive":
         run_interactive()
-    else:
+    elif mode == "--api":
         run_api()
-        print("\n対話モードを実行するには、以下のように実行してください:")
-        print("  python main.py --interactive")
+    else:
+        run_demo()
