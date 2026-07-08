@@ -464,6 +464,15 @@ IntelligenceRunType = Literal[
     # deterministic and not separately audited; only the reasoning
     # reconciliation step that picks confirmation questions is.
     "runtime_reality_check",
+    # Issue #168: Probe Pattern lifecycle. pattern_reconcile classifies saved
+    # pattern points against the latest snapshot (deterministic structural
+    # checks, escalating to reasoning for moved/split/missing);
+    # pattern_investigate is the "I don't know" investigation assistance;
+    # probe_plan_from_pattern records the manual decision that turned an
+    # approved reconciliation into a Probe Plan.
+    "pattern_reconcile",
+    "pattern_investigate",
+    "probe_plan_from_pattern",
 ]
 DecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
 # How a single hierarchy claim was produced. Kept distinct from the audit
@@ -1202,6 +1211,230 @@ class ProbePlansListOut(BaseModel):
     system_id: int
     plans: List[ProbePlanOut] = Field(default_factory=list)
     is_mock: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Probe Pattern lifecycle (Issue #168)
+# ---------------------------------------------------------------------------
+
+ProbePatternStatus = Literal["active", "stale", "archived", "superseded"]
+ProbePatternOrigin = Literal["scan", "probe_plan", "manual"]
+ReconcileClassification = Literal[
+    "exact_match", "moved_match", "changed_signature",
+    "split_or_merged", "missing", "unsafe",
+]
+ReconcileUserDecision = Literal["pending", "accepted", "rejected"]
+
+
+class InstrumentedProbeOut(BaseModel):
+    path: str
+    symbol: str
+    line_start: int
+    line_end: int
+    component_id: Optional[str] = None
+    docstring: Optional[str] = None
+    linked_plan_id: Optional[int] = None
+    linked_feature_id: Optional[str] = None
+    linked_objective: Optional[str] = None
+    linked_reason: Optional[str] = None
+    linked_recommended_mode: Optional[str] = None
+    pattern_ids: List[int] = Field(default_factory=list)
+
+
+class InstrumentationScanOut(BaseModel):
+    system_id: int
+    snapshot_id: int
+    commit_sha: str
+    probes: List[InstrumentedProbeOut] = Field(default_factory=list)
+
+
+class ProbePatternPointIn(BaseModel):
+    path: str
+    symbol: str
+    component_id: str = ""
+    reason: str = ""
+    recommended_mode: str = "trace"
+    side_effect_risk: Literal["low", "medium", "high"] = "low"
+    replayability: str = ""
+
+
+class ProbePatternCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    feature_id: str = ""
+    capability: str = ""
+    objective: str = ""
+    description: str = ""
+    origin: ProbePatternOrigin = "manual"
+    source_plan_id: Optional[int] = None
+    points: List[ProbePatternPointIn] = Field(..., min_length=1)
+
+
+class ProbePatternUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: Optional[str] = Field(None, min_length=1, max_length=200)
+    feature_id: Optional[str] = None
+    capability: Optional[str] = None
+    objective: Optional[str] = None
+    description: Optional[str] = None
+    status: Optional[Literal["active", "archived"]] = None
+
+
+class ProbePatternPointOut(BaseModel):
+    id: int
+    pattern_id: int
+    system_id: int
+    component_id: str
+    path: str
+    symbol: str
+    line_start: int
+    line_end: int
+    reason: str
+    recommended_mode: str
+    side_effect_risk: str
+    replayability: str
+    signature: str = ""
+    symbol_source_hash: Optional[str] = None
+    symbol_body_hash: Optional[str] = None
+    docstring: Optional[str] = None
+    status: str = "saved"
+    removed_at: Optional[float] = None
+    created_at: float
+    updated_at: float
+
+
+class ProbePatternEventOut(BaseModel):
+    id: int
+    pattern_id: int
+    event_type: str
+    detail: dict = Field(default_factory=dict)
+    created_at: float
+
+
+class ReconcileEvidenceOut(BaseModel):
+    path: str
+    start_line: int
+    end_line: int
+    summary: str = ""
+
+
+class PatternInvestigationOut(BaseModel):
+    summary: str
+    recommendation: str
+    proposed_target_path: Optional[str] = None
+    proposed_target_symbol: Optional[str] = None
+    evidence: List[ReconcileEvidenceOut] = Field(default_factory=list)
+    is_mock: bool = False
+    created_at: float
+
+
+class ReconcilePointOut(BaseModel):
+    id: int
+    reconciliation_id: int
+    pattern_point_id: int
+    classification: ReconcileClassification
+    decision_method: Literal["deterministic", "reasoning_llm"]
+    target_path: Optional[str] = None
+    target_symbol: Optional[str] = None
+    target_line_start: Optional[int] = None
+    target_line_end: Optional[int] = None
+    confidence: float = 0.0
+    explanation: str = ""
+    hypothesis: str = ""
+    question: str = ""
+    evidence: List[ReconcileEvidenceOut] = Field(default_factory=list)
+    denylist_hit: Optional[str] = None
+    body_changed: bool = False
+    user_decision: ReconcileUserDecision = "pending"
+    decided_at: Optional[float] = None
+    investigation: Optional[PatternInvestigationOut] = None
+    created_at: float
+    updated_at: float
+
+
+class ProbePatternReconciliationOut(BaseModel):
+    id: int
+    pattern_id: int
+    system_id: int
+    snapshot_id: int
+    commit_sha: str
+    intelligence_run_id: Optional[int] = None
+    status: str
+    error: Optional[str] = None
+    summary: Dict[str, int] = Field(default_factory=dict)
+    points: List[ReconcilePointOut] = Field(default_factory=list)
+    intelligence_run: Optional[IntelligenceRunOut] = None
+    is_mock: bool = False
+    created_at: float
+
+
+class ProbeRemovalPatchOut(BaseModel):
+    id: int
+    pattern_id: int
+    system_id: int
+    snapshot_id: int
+    commit_sha: str
+    diff: str
+    skipped: List[str] = Field(default_factory=list)
+    status: str
+    error: Optional[str] = None
+    cleanup_state: str = "not_attempted"
+    cleanup_error: Optional[str] = None
+    apply_status: str = "not_applied"
+    apply_error: Optional[str] = None
+    applied_at: Optional[float] = None
+    applied_by_user_id: Optional[int] = None
+    created_at: float
+
+
+class ProbeRemovalPatchCreateRequest(BaseModel):
+    point_ids: Optional[List[int]] = None
+
+
+class ProbeRemovalPatchApplyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirmed: Literal[True]
+    expected_commit_sha: str = Field(..., min_length=7, max_length=64)
+
+
+class ReconcileDecisionRequest(BaseModel):
+    decision: Literal["accepted", "rejected"]
+
+
+class CreatePlanFromReconcileRequest(BaseModel):
+    objective: Optional[str] = None
+
+
+class ProbePatternOut(BaseModel):
+    id: int
+    system_id: int
+    name: str
+    feature_id: str = ""
+    capability: str = ""
+    objective: str = ""
+    description: str = ""
+    status: ProbePatternStatus = "active"
+    origin: ProbePatternOrigin = "manual"
+    source_plan_id: Optional[int] = None
+    source_snapshot_id: Optional[int] = None
+    source_commit_sha: str = ""
+    superseded_by_id: Optional[int] = None
+    last_used_at: Optional[float] = None
+    last_reconciled_at: Optional[float] = None
+    point_count: int = 0
+    removed_point_count: int = 0
+    points: List[ProbePatternPointOut] = Field(default_factory=list)
+    events: List[ProbePatternEventOut] = Field(default_factory=list)
+    latest_reconciliation: Optional[ProbePatternReconciliationOut] = None
+    pending_decision_count: int = 0
+    created_at: float
+    updated_at: float
+
+
+class ProbePatternsListOut(BaseModel):
+    system_id: int
+    patterns: List[ProbePatternOut] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

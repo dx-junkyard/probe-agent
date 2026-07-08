@@ -14,6 +14,7 @@ from .routes import (
     experiments,
     generation,
     interview,
+    probe_patterns,
     project_intelligence,
     retention,
     shadow,
@@ -54,6 +55,7 @@ def create_app() -> FastAPI:
     app.include_router(experiments.router, dependencies=_auth)
     app.include_router(generation.router, dependencies=_auth)
     app.include_router(project_intelligence.router, dependencies=_auth)
+    app.include_router(probe_patterns.router, dependencies=_auth)
     app.include_router(connectivity.router, dependencies=_auth)
     app.include_router(diagnostics.router, dependencies=_auth)
     app.include_router(assistant.router, dependencies=_auth)
