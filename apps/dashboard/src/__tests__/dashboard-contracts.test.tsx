@@ -2614,6 +2614,41 @@ describe("Flow Explorer auto-select from URL (Issue #62)", () => {
 
 // ── Context Header tests (Issue #178) ───────────────────────────────
 
+// ── Sidebar navigation ───────────────────────────────────────────────
+
+describe("Sidebar navigation grouping (Issue #179)", () => {
+  beforeEach(() => {
+    mockSystemId = 1;
+  });
+
+  test("renders Hub / Detail views / Other headings and every existing route", async () => {
+    const { Sidebar } = await import("@/components/layout/sidebar");
+    render(
+      <MemoryRouter initialEntries={["/"]}>
+        <Sidebar />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByTestId("sidebar-group-hub")).toBeTruthy();
+    expect(screen.getByTestId("sidebar-group-detail-views")).toBeTruthy();
+    expect(screen.getByTestId("sidebar-group-other")).toBeTruthy();
+
+    const nav = screen.getByTestId("sidebar-nav");
+    // Existing routes/URLs are unchanged — every prior nav item is still present.
+    for (const label of [
+      "Overview", "System Understanding", "Repository", "Capability Map", "Feature Map",
+      "Flow Explorer", "Trace Lineage", "Trace Analyzers", "Probe Planner", "Interview",
+      "Experiments", "Connect SDK", "Generate", "Components", "Decision Workspace", "Settings",
+    ]) {
+      expect(within(nav).getByText(label)).toBeTruthy();
+    }
+
+    // System Understanding is grouped under Hub, not Detail views.
+    expect(within(screen.getByTestId("sidebar-group-hub")).getByText("System Understanding")).toBeTruthy();
+    expect(within(screen.getByTestId("sidebar-group-detail-views")).getByText("Flow Explorer")).toBeTruthy();
+  });
+});
+
 describe("Context Header", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -2983,10 +3018,39 @@ describe("System Understanding page", () => {
     expect(screen.getByText("Generate / validate probe patch")).toBeTruthy();
     expect(screen.getByText("Review experiment decision")).toBeTruthy();
 
-    const nextActions = screen.getByTestId("next-actions");
-    expect(nextActions.textContent).toContain("observe");
-    expect(nextActions.textContent).toContain("instrument");
-    expect(nextActions.textContent).toContain("evaluate");
+    // Issue #179: Next Actions are grouped under their stage section by category.
+    expect(screen.getByTestId("stage-next-actions-observe").textContent).toContain("observe");
+    expect(screen.getByTestId("stage-next-actions-instrument").textContent).toContain("instrument");
+    expect(screen.getByTestId("stage-next-actions-evaluate").textContent).toContain("evaluate");
+  });
+
+  test("renders the 4 hub stage sections with links to detail pages (Issue #179)", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(completeResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("stage-section-understand")).toBeTruthy();
+    });
+
+    expect(screen.getByTestId("stage-title-understand").textContent).toBe("Understand");
+    expect(screen.getByTestId("stage-title-observe").textContent).toBe("Decide Where to Observe");
+    expect(screen.getByTestId("stage-title-instrument").textContent).toBe("Instrument");
+    expect(screen.getByTestId("stage-title-evaluate").textContent).toBe("Evaluate");
+
+    // Existing pipeline checklist / gap worklist / capabilities elements survive the reorganization.
+    expect(screen.getByTestId("pipeline-checklist")).toBeTruthy();
+    expect(screen.getByTestId("metadata-coverage")).toBeTruthy();
+
+    // Each stage links to its detail pages.
+    expect(within(screen.getByTestId("stage-links-observe")).getByText("Flow Explorer")).toBeTruthy();
+    expect(within(screen.getByTestId("stage-links-instrument")).getByText("Probe Planner")).toBeTruthy();
+    expect(within(screen.getByTestId("stage-links-evaluate")).getByText("Experiments")).toBeTruthy();
   });
 
   test("shows no-gaps message when gaps are empty", async () => {
