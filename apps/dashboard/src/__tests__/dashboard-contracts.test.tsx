@@ -2274,7 +2274,7 @@ describe("System Understanding page", () => {
     gaps: [],
     gap_summary: [],
     metadata_coverage: null,
-    next_actions: [{ action: "Configure repository", reason: "No repository configured", link: "/repository" }],
+    next_actions: [{ action: "Configure repository", reason: "No repository configured", category: "understand", link: "/repository" }],
   };
 
   const gapWorklistResponse = {
@@ -2334,7 +2334,12 @@ describe("System Understanding page", () => {
       { gap_type: "docs_only", count: 1 },
     ],
     metadata_coverage: { symbol_count: 42, symbols_with_source_metadata: 5, entrypoint_count: 10, entrypoints_with_capability_link: 3 },
-    next_actions: [{ action: "Review docs-code gaps", reason: "2 gaps found", link: "/system-understanding" }],
+    next_actions: [
+      { action: "Review docs-code gaps", reason: "2 gaps found", category: "understand", link: "/system-understanding" },
+      { action: "Review probe plan", reason: "Probe plan #7 is awaiting review", category: "observe", link: "/probe-planner?plan=7" },
+      { action: "Generate / validate probe patch", reason: "Approved probe plan #8 has no validated patch yet", category: "instrument", link: "/probe-planner?plan=8" },
+      { action: "Review experiment decision", reason: "Experiment #9 completed but has no recorded decision", category: "evaluate", link: "/experiments" },
+    ],
   };
 
   const completeResponse = {
@@ -2382,7 +2387,7 @@ describe("System Understanding page", () => {
       { step: "capability_hierarchy_ready", status: "missing", detail: "Reasoning model required" },
     ],
     next_actions: [
-      { action: "Configure reasoning model", reason: "Required for documentation and capability analysis", link: null },
+      { action: "Configure reasoning model", reason: "Required for documentation and capability analysis", category: "understand", link: null },
     ],
   };
 
@@ -2501,6 +2506,29 @@ describe("System Understanding page", () => {
 
     expect(screen.getByText("Open Interview")).toBeTruthy();
     expect(screen.getByText("Open docs evidence")).toBeTruthy();
+  });
+
+  test("renders category badges for probe plan and experiment next actions", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(gapWorklistResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByText("Review probe plan")).toBeTruthy();
+    });
+
+    expect(screen.getByText("Generate / validate probe patch")).toBeTruthy();
+    expect(screen.getByText("Review experiment decision")).toBeTruthy();
+
+    const nextActions = screen.getByTestId("next-actions");
+    expect(nextActions.textContent).toContain("observe");
+    expect(nextActions.textContent).toContain("instrument");
+    expect(nextActions.textContent).toContain("evaluate");
   });
 
   test("shows no-gaps message when gaps are empty", async () => {

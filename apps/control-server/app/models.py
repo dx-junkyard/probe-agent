@@ -2787,9 +2787,13 @@ class SystemUnderstandingPipelineStepOut(BaseModel):
     detail: Optional[str] = None
 
 
+NextActionCategory = Literal["understand", "observe", "instrument", "evaluate"]
+
+
 class SystemUnderstandingNextActionOut(BaseModel):
     action: str
     reason: str
+    category: NextActionCategory
     link: Optional[str] = None
 
 

@@ -852,7 +852,9 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
             entrypoints_with_capability_link=mc.entrypoints_with_capability_link,
         )
     next_actions = [
-        SystemUnderstandingNextActionOut(action=a.action, reason=a.reason, link=a.link)
+        SystemUnderstandingNextActionOut(
+            action=a.action, reason=a.reason, category=a.category, link=a.link,
+        )
         for a in summary.next_actions
     ]
     return SystemUnderstandingOut(
