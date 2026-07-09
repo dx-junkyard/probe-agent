@@ -17,7 +17,7 @@ probe-agent:
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from .db import get_conn
 
@@ -44,10 +44,16 @@ class PipelineStep:
     detail: Optional[str] = None
 
 
+# Issue #174: finite next-action categories spanning the
+# Understand -> Decide -> Instrument -> Evaluate stages.
+NextActionCategory = Literal["understand", "observe", "instrument", "evaluate"]
+
+
 @dataclass
 class NextAction:
     action: str
     reason: str
+    category: NextActionCategory
     link: Optional[str] = None
 
 
@@ -688,7 +694,14 @@ def _build_next_actions(
     capabilities: List[Dict[str, Any]],
     metadata_coverage: Optional[MetadataCoverage],
     gap_count: int,
+    proposed_plan_ids: Optional[List[int]] = None,
+    approved_plan_ids_without_validated_patch: Optional[List[int]] = None,
+    undecided_completed_experiment_ids: Optional[List[int]] = None,
 ) -> List[NextAction]:
+    proposed_plan_ids = proposed_plan_ids or []
+    approved_plan_ids_without_validated_patch = approved_plan_ids_without_validated_patch or []
+    undecided_completed_experiment_ids = undecided_completed_experiment_ids or []
+
     actions: List[NextAction] = []
     step_map = {s.step: s.status for s in pipeline}
 
@@ -696,6 +709,7 @@ def _build_next_actions(
         actions.append(NextAction(
             action="Configure repository",
             reason="Repository is not configured yet",
+            category="understand",
             link="/repository",
         ))
         return actions
@@ -704,6 +718,7 @@ def _build_next_actions(
         actions.append(NextAction(
             action="Create snapshot",
             reason="No ready snapshot available",
+            category="understand",
             link="/repository",
         ))
         return actions
@@ -712,6 +727,7 @@ def _build_next_actions(
         actions.append(NextAction(
             action="Index code symbols",
             reason="Code symbols have not been indexed",
+            category="understand",
             link="/repository",
         ))
 
@@ -719,6 +735,7 @@ def _build_next_actions(
         actions.append(NextAction(
             action="Build documentation index",
             reason="Documentation files have not been indexed into chunks",
+            category="understand",
             link="/system-understanding",
         ))
 
@@ -726,6 +743,7 @@ def _build_next_actions(
         actions.append(NextAction(
             action="Scan documentation claims",
             reason="Documentation claims have not been scanned",
+            category="understand",
             link="/system-understanding",
         ))
 
@@ -733,6 +751,7 @@ def _build_next_actions(
         actions.append(NextAction(
             action="Discover entrypoints",
             reason="API/CLI/queue entrypoints have not been discovered",
+            category="understand",
             link="/flow-explorer",
         ))
 
@@ -740,6 +759,7 @@ def _build_next_actions(
         actions.append(NextAction(
             action="Reconcile docs and code",
             reason="Documentation and code have not been reconciled",
+            category="understand",
             link="/system-understanding",
         ))
 
@@ -747,6 +767,7 @@ def _build_next_actions(
         actions.append(NextAction(
             action="Generate capability hierarchy",
             reason="Capability hierarchy has not been generated",
+            category="understand",
             link="/capability-map",
         ))
 
@@ -763,6 +784,7 @@ def _build_next_actions(
             actions.append(NextAction(
                 action="Define System Purpose",
                 reason="Pipeline completed, but no system purpose is defined yet.",
+                category="understand",
                 link="/interview",
             ))
 
@@ -774,6 +796,7 @@ def _build_next_actions(
                     "so probe candidates, flow exploration, and improvement "
                     "proposals lack a foundation."
                 ),
+                category="understand",
                 link="/interview",
             ))
 
@@ -783,6 +806,7 @@ def _build_next_actions(
             actions.append(NextAction(
                 action="Add source metadata",
                 reason=f"Only {metadata_coverage.symbols_with_source_metadata} of {metadata_coverage.symbol_count} symbols have probe-agent metadata",
+                category="understand",
                 link="/interview",
             ))
 
@@ -790,27 +814,110 @@ def _build_next_actions(
         actions.append(NextAction(
             action="Review docs-code gaps",
             reason=f"{gap_count} docs-code gaps found",
+            category="understand",
             link="/system-understanding",
+        ))
+
+    # Issue #174: probe plan / experiment status is a downstream, independent
+    # axis from the System Understanding pipeline above — surface it
+    # regardless of pipeline completeness so review-worthy work is never
+    # hidden behind an unrelated pipeline step.
+    for plan_id in proposed_plan_ids:
+        actions.append(NextAction(
+            action="Review probe plan",
+            reason=f"Probe plan #{plan_id} is awaiting review",
+            category="observe",
+            link=f"/probe-planner?plan={plan_id}",
+        ))
+
+    for plan_id in approved_plan_ids_without_validated_patch:
+        actions.append(NextAction(
+            action="Generate / validate probe patch",
+            reason=f"Approved probe plan #{plan_id} has no validated patch yet",
+            category="instrument",
+            link=f"/probe-planner?plan={plan_id}",
+        ))
+
+    for experiment_id in undecided_completed_experiment_ids:
+        actions.append(NextAction(
+            action="Review experiment decision",
+            reason=f"Experiment #{experiment_id} completed but has no recorded decision",
+            category="evaluate",
+            link="/experiments",
         ))
 
     if pipeline_complete and not actions:
         actions.append(NextAction(
             action="Start from Capability",
             reason="System understanding is complete; explore from the Capability Map.",
+            category="observe",
             link="/capability-map",
         ))
         actions.append(NextAction(
             action="Start from Feature",
             reason="System understanding is complete; explore from the Feature Map.",
+            category="observe",
             link="/feature-map",
         ))
         actions.append(NextAction(
             action="Open Flow Explorer",
             reason="System understanding is complete; explore call flows from entrypoints.",
+            category="observe",
             link="/flow-explorer",
         ))
 
     return actions
+
+
+def _plan_has_validated_patch(conn, plan_id: int) -> bool:
+    """A plan's patch is validated when its latest baseline and probed
+    validation runs both succeeded — the same finite condition the patch
+    apply endpoint gates on (Principle 6).
+    """
+    patch_rows = conn.execute(
+        "SELECT id FROM probe_patches WHERE plan_id = ? AND status != 'failed'",
+        (plan_id,),
+    ).fetchall()
+    for patch in patch_rows:
+        val_rows = conn.execute(
+            """SELECT variant, overall_success FROM validation_runs
+               WHERE patch_id = ? ORDER BY id DESC""",
+            (patch["id"],),
+        ).fetchall()
+        latest: Dict[str, bool] = {}
+        for vr in val_rows:
+            latest.setdefault(vr["variant"], bool(vr["overall_success"]))
+        if latest.get("baseline") is True and latest.get("probed") is True:
+            return True
+    return False
+
+
+def _load_pending_plan_action_ids(conn, system_id: int) -> Tuple[List[int], List[int]]:
+    """Return (proposed_plan_ids, approved_plan_ids_without_validated_patch)."""
+    proposed_ids = [
+        r["id"] for r in conn.execute(
+            "SELECT id FROM probe_plans WHERE system_id = ? AND status = 'proposed' ORDER BY id DESC",
+            (system_id,),
+        ).fetchall()
+    ]
+    approved_rows = conn.execute(
+        "SELECT id FROM probe_plans WHERE system_id = ? AND status = 'approved' ORDER BY id DESC",
+        (system_id,),
+    ).fetchall()
+    approved_without_patch_ids = [
+        r["id"] for r in approved_rows if not _plan_has_validated_patch(conn, r["id"])
+    ]
+    return proposed_ids, approved_without_patch_ids
+
+
+def _load_undecided_completed_experiment_ids(conn, system_id: int) -> List[int]:
+    rows = conn.execute(
+        """SELECT id FROM experiments
+           WHERE system_id = ? AND status = 'completed' AND human_decision = 'undecided'
+           ORDER BY id DESC""",
+        (system_id,),
+    ).fetchall()
+    return [r["id"] for r in rows]
 
 
 def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
@@ -838,12 +945,20 @@ def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
             _attach_issue_drafts(conn, system_id, summary.gaps)
             summary.gap_summary = _compute_gap_summary(summary.gaps)
 
+        proposed_plan_ids, approved_plan_ids_without_patch = _load_pending_plan_action_ids(
+            conn, system_id,
+        )
+        undecided_experiment_ids = _load_undecided_completed_experiment_ids(conn, system_id)
+
         summary.next_actions = _build_next_actions(
             pipeline,
             summary.purpose,
             summary.capabilities,
             summary.metadata_coverage,
             len(summary.gaps),
+            proposed_plan_ids,
+            approved_plan_ids_without_patch,
+            undecided_experiment_ids,
         )
         return summary
 

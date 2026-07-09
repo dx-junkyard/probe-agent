@@ -1698,9 +1698,12 @@ export interface SystemUnderstandingPipelineStep {
   detail?: string | null;
 }
 
+export type NextActionCategory = "understand" | "observe" | "instrument" | "evaluate";
+
 export interface SystemUnderstandingNextAction {
   action: string;
   reason: string;
+  category: NextActionCategory;
   link?: string | null;
 }
 

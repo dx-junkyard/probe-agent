@@ -372,6 +372,9 @@ function NextActionsList({ actions }: { actions: SystemUnderstandingNextAction[]
                 a.action
               )}
             </span>
+            <Badge variant="outline" className="ml-2 text-xs" data-testid="next-action-category">
+              {a.category}
+            </Badge>
             <p className="text-muted-foreground text-xs mt-0.5">{a.reason}</p>
           </div>
           {a.link && (
