@@ -15,7 +15,7 @@ import { Select } from "@/components/ui/select";
 import { toast } from "sonner";
 import { formatTimestamp } from "@/lib/utils";
 import { Crosshair, CheckCircle, XCircle, FileCode, Play, Download, GitBranch } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import type { ProbePatchOut } from "@/api/types";
 import { AddToWorkspaceButton } from "@/components/add-to-workspace";
@@ -24,7 +24,9 @@ export default function ProbePlannerPage() {
   const [searchParams] = useSearchParams();
   const draftIdParam = searchParams.get("draft");
   const workspaceIdParam = searchParams.get("workspace");
+  const planIdParam = searchParams.get("plan");
   const draftId = draftIdParam && Number.isInteger(Number(draftIdParam)) ? Number(draftIdParam) : null;
+  const planId = planIdParam && Number.isInteger(Number(planIdParam)) ? Number(planIdParam) : null;
   const { data: workspaceDraft } = useWorkspaceProposalDraft(draftId);
   const { data: featureDrafts } = useLatestDrafts();
   const { data: plansData, isLoading } = useProbePlans();
@@ -35,15 +37,32 @@ export default function ProbePlannerPage() {
   const generatePatch = useGeneratePatch();
   const validatePatch = useValidatePatch();
   const applyPatch = useApplyProbePatch();
-  const [expandedPlan, setExpandedPlan] = useState<number | null>(null);
+  // undefined = no manual selection yet, so a `?plan=` param can still drive it.
+  const [userExpandedPlan, setUserExpandedPlan] = useState<number | null | undefined>(undefined);
   const [applyTarget, setApplyTarget] = useState<ProbePatchOut | null>(null);
   const [applyConfirmation, setApplyConfirmation] = useState("");
   const [showGenerate, setShowGenerate] = useState(false);
   const [draftDismissed, setDraftDismissed] = useState(false);
   const [featureId, setFeatureId] = useState<string | null>(null);
   const [objective, setObjective] = useState<string | null>(null);
+  const cardRefs = useRef<Record<number, HTMLDivElement | null>>({});
+  const planParamNotified = useRef(false);
 
   const plans = plansData?.plans ?? [];
+  const planMatch = planId !== null && plans.some(plan => plan.id === planId);
+  const expandedPlan = userExpandedPlan !== undefined ? userExpandedPlan : (planMatch ? planId : null);
+  const setExpandedPlan = setUserExpandedPlan;
+
+  useEffect(() => {
+    if (planParamNotified.current || planId === null || isLoading) return;
+    planParamNotified.current = true;
+    if (planMatch) {
+      cardRefs.current[planId]?.scrollIntoView?.({ behavior: "smooth", block: "start" });
+    } else {
+      toast.error(`Probe plan #${planId} was not found.`);
+    }
+  }, [planId, isLoading, planMatch]);
+
   const features = featureDrafts?.feature_drafts ?? [];
   const formFeatureId = featureId
     ?? (workspaceDraft?.draft_type === "probe_plan_draft" ? workspaceDraft.payload.feature_id ?? "" : "");
@@ -105,7 +124,7 @@ export default function ProbePlannerPage() {
             const expanded = expandedPlan === plan.id;
             const planPatches = patches?.filter(p => p.plan_id === plan.id) ?? [];
             return (
-              <Card key={plan.id}>
+              <Card key={plan.id} ref={el => { cardRefs.current[plan.id] = el; }}>
                 <CardHeader
                   className="cursor-pointer"
                   onClick={() => setExpandedPlan(expanded ? null : plan.id)}
