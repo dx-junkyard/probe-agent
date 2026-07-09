@@ -3974,6 +3974,32 @@ describe("Per-screen assistant panel", () => {
     );
   });
 
+  test("closed agent button can show a snapshot notice bubble", async () => {
+    const onSnapshotNoticeClick = vi.fn();
+    const { AssistantPanel } = await import("@/components/assistant-panel");
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/system-understanding"]}>
+          <AssistantPanel
+            snapshotNotice="HEAD が最新 snapshot より進んでいます。snapshot を作成してください。"
+            onSnapshotNoticeClick={onSnapshotNoticeClick}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const notice = screen.getByTestId("assistant-snapshot-notice");
+    expect(notice.textContent).toContain("snapshot を作成してください");
+    fireEvent.click(notice);
+    expect(onSnapshotNoticeClick).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByTestId("assistant-button"));
+    expect(screen.queryByTestId("assistant-snapshot-notice")).toBeNull();
+  });
+
   test("asking a question renders the answer with fallback marking, citations, and actions", async () => {
     mockAssistantApi();
     await renderPanelAt("/system-understanding");

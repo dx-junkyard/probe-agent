@@ -83,6 +83,8 @@ from ..models import (
     InterviewProposalOut,
     InterviewProposalProbePlan,
     InterviewProposalRejectRequest,
+    InterviewSnapshotRebaseOut,
+    InterviewSnapshotRebaseRequest,
     InterviewProposalsCreate,
     InterviewQaActorRequest,
     InterviewQaAnswerOut,
@@ -452,6 +454,191 @@ def get_interview_session(
             **_session_out(row).model_dump(),
             messages=[_message_out(m) for m in message_rows],
             proposals=[_proposal_out(conn, p) for p in proposal_rows],
+        )
+
+
+def _latest_ready_snapshot_id(conn, system_id: int) -> Optional[int]:
+    row = conn.execute(
+        """SELECT id FROM repository_snapshots
+           WHERE system_id = ? AND status = 'ready'
+           ORDER BY id DESC LIMIT 1""",
+        (system_id,),
+    ).fetchone()
+    return row["id"] if row else None
+
+
+def _symbol_anchor(conn, system_id: int, snapshot_id: int, path: str, qualified_name: str):
+    return conn.execute(
+        """SELECT id, symbol_source_hash, symbol_body_hash, start_line, end_line
+           FROM code_symbols
+           WHERE system_id = ? AND snapshot_id = ? AND path = ? AND qualified_name = ?
+           ORDER BY id LIMIT 1""",
+        (system_id, snapshot_id, path, qualified_name),
+    ).fetchone()
+
+
+@router.post(
+    "/interview/sessions/{session_id}/rebase-snapshot",
+    response_model=InterviewSnapshotRebaseOut,
+)
+def rebase_interview_snapshot(
+    session_id: int,
+    payload: InterviewSnapshotRebaseRequest,
+    system_id: int = Depends(get_system_id),
+) -> InterviewSnapshotRebaseOut:
+    """Rebase an existing Interview session onto a newer ready snapshot.
+
+    This is deterministic and conservative: previously approved/edited
+    proposals are preserved only when the same path + qualified name exists in
+    the target snapshot and its source hash is unchanged. Changed or missing
+    targets are moved to ``needs_review``, which excludes them from
+    materialization until a human approves or edits them again.
+    """
+    now = time.time()
+    with get_conn() as conn:
+        session = _get_session_or_404(conn, session_id, system_id)
+        from_snapshot_id = session["snapshot_id"]
+        target_snapshot_id = payload.target_snapshot_id or _latest_ready_snapshot_id(conn, system_id)
+        if target_snapshot_id is None:
+            raise HTTPException(status_code=404, detail="No ready target snapshot found")
+
+        target = conn.execute(
+            """SELECT id FROM repository_snapshots
+               WHERE id = ? AND system_id = ? AND status = 'ready'""",
+            (target_snapshot_id, system_id),
+        ).fetchone()
+        if target is None:
+            raise HTTPException(status_code=404, detail="Target ready snapshot not found")
+
+        if target_snapshot_id == from_snapshot_id:
+            return InterviewSnapshotRebaseOut(
+                session_id=session_id,
+                system_id=system_id,
+                from_snapshot_id=from_snapshot_id,
+                to_snapshot_id=target_snapshot_id,
+                message="Session is already pinned to the target snapshot.",
+                session=_session_out(session),
+            )
+
+        proposal_rows = conn.execute(
+            "SELECT * FROM interview_proposal WHERE session_id = ? AND system_id = ? ORDER BY id",
+            (session_id, system_id),
+        ).fetchall()
+
+        preserved = 0
+        needs_review = 0
+        missing_source = 0
+        changed_source = 0
+        details: List[dict] = []
+
+        for proposal in proposal_rows:
+            old_anchor = _symbol_anchor(
+                conn, system_id, from_snapshot_id,
+                proposal["path"], proposal["qualified_name"],
+            )
+            new_anchor = _symbol_anchor(
+                conn, system_id, target_snapshot_id,
+                proposal["path"], proposal["qualified_name"],
+            )
+
+            new_state = proposal["approval_state"]
+            reason = "preserved"
+            new_symbol_id = new_anchor["id"] if new_anchor else None
+
+            if new_anchor is None:
+                missing_source += 1
+                reason = "missing_source"
+                if proposal["approval_state"] in ("approved", "edited", "needs_review"):
+                    new_state = "needs_review"
+                    needs_review += 1
+            elif proposal["approval_state"] in ("approved", "edited", "needs_review"):
+                old_hash = old_anchor["symbol_source_hash"] if old_anchor else None
+                new_hash = new_anchor["symbol_source_hash"]
+                if old_hash and new_hash and old_hash == new_hash:
+                    preserved += 1
+                    reason = "unchanged_source"
+                    new_state = proposal["approval_state"]
+                else:
+                    changed_source += 1
+                    needs_review += 1
+                    reason = "changed_source"
+                    new_state = "needs_review"
+            else:
+                # Pending/rejected proposals are not materialization-eligible.
+                # Move their snapshot anchor forward when the symbol still
+                # resolves, but do not create new review obligations.
+                reason = "unreviewed_or_rejected"
+
+            conn.execute(
+                """UPDATE interview_proposal
+                   SET snapshot_id = ?, symbol_id = ?, approval_state = ?, updated_at = ?
+                   WHERE id = ? AND system_id = ?""",
+                (
+                    target_snapshot_id, new_symbol_id, new_state, now,
+                    proposal["id"], system_id,
+                ),
+            )
+            details.append({
+                "proposal_id": proposal["id"],
+                "path": proposal["path"],
+                "qualified_name": proposal["qualified_name"],
+                "previous_state": proposal["approval_state"],
+                "new_state": new_state,
+                "reason": reason,
+            })
+
+        conn.execute(
+            """UPDATE interview_session
+               SET snapshot_id = ?, materialization_diff = NULL,
+                   materialization_ref = NULL, materialized_at = NULL,
+                   updated_at = ?
+               WHERE id = ? AND system_id = ?""",
+            (target_snapshot_id, now, session_id, system_id),
+        )
+        conn.execute(
+            """INSERT INTO interview_snapshot_rebase
+                (session_id, system_id, from_snapshot_id, to_snapshot_id, actor,
+                 proposals_preserved, proposals_marked_needs_review,
+                 proposals_missing_source, proposals_changed_source,
+                 details_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                session_id, system_id, from_snapshot_id, target_snapshot_id,
+                payload.actor, preserved, needs_review, missing_source,
+                changed_source, json.dumps(details, ensure_ascii=False), now,
+            ),
+        )
+        conn.execute(
+            """INSERT INTO interview_message
+                (session_id, system_id, role, content, created_at)
+               VALUES (?, ?, 'system', ?, ?)""",
+            (
+                session_id,
+                system_id,
+                (
+                    f"Interview snapshot updated from #{from_snapshot_id} to "
+                    f"#{target_snapshot_id}. Preserved {preserved} reviewed "
+                    f"proposal(s); marked {needs_review} for re-review."
+                ),
+                now,
+            ),
+        )
+
+        row = _get_session_or_404(conn, session_id, system_id)
+        return InterviewSnapshotRebaseOut(
+            session_id=session_id,
+            system_id=system_id,
+            from_snapshot_id=from_snapshot_id,
+            to_snapshot_id=target_snapshot_id,
+            proposals_preserved=preserved,
+            proposals_marked_needs_review=needs_review,
+            proposals_missing_source=missing_source,
+            proposals_changed_source=changed_source,
+            message=(
+                f"Updated session to snapshot #{target_snapshot_id}; "
+                f"{needs_review} proposal(s) require re-review."
+            ),
+            session=_session_out(row),
         )
 
 
@@ -1648,12 +1835,15 @@ def _decision_out(row) -> InterviewProposalDecisionOut:
 
 
 def _check_proposal_state(proposal_row) -> None:
-    """Only 'proposed' items can be transitioned."""
+    """Only unreviewed or re-review items can be transitioned."""
     state = proposal_row["approval_state"]
-    if state != "proposed":
+    if state not in ("proposed", "needs_review"):
         raise HTTPException(
             status_code=409,
-            detail=f"Proposal is already '{state}'; only 'proposed' items can be reviewed",
+            detail=(
+                f"Proposal is already '{state}'; only 'proposed' or "
+                "'needs_review' items can be reviewed"
+            ),
         )
 
 
@@ -1863,7 +2053,7 @@ def get_interview_approved_set(
 
         for p in all_proposals:
             state = p["approval_state"]
-            if state == "proposed":
+            if state in ("proposed", "needs_review"):
                 pending_count += 1
                 continue
             elif state == "rejected":

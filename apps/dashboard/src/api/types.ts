@@ -299,7 +299,7 @@ export type InterviewStage =
   | "probe_flow_selection"
   | "proposal_generation";
 export type InterviewDecisionMethod = "deterministic" | "reasoning_llm" | "manual";
-export type InterviewApprovalState = "proposed" | "approved" | "rejected" | "edited";
+export type InterviewApprovalState = "proposed" | "approved" | "rejected" | "edited" | "needs_review";
 export type SourceMetadataElementType =
   | "system" | "core" | "capability" | "element" | "supporting" | "boundary";
 export type SourceMetadataOperationKind =
@@ -446,6 +446,19 @@ export interface InterviewProposalOut {
 export interface InterviewSessionDetailOut extends InterviewSessionOut {
   messages: InterviewMessageOut[];
   proposals: InterviewProposalOut[];
+}
+
+export interface InterviewSnapshotRebaseOut {
+  session_id: number;
+  system_id: number;
+  from_snapshot_id: number;
+  to_snapshot_id: number;
+  proposals_preserved: number;
+  proposals_marked_needs_review: number;
+  proposals_missing_source: number;
+  proposals_changed_source: number;
+  message: string;
+  session: InterviewSessionOut;
 }
 
 export interface InterviewEvidenceLocation {

@@ -2007,7 +2007,9 @@ InterviewStage = Literal[
     "probe_flow_selection",
     "proposal_generation",
 ]
-InterviewProposalApprovalState = Literal["proposed", "approved", "rejected", "edited"]
+InterviewProposalApprovalState = Literal[
+    "proposed", "approved", "rejected", "edited", "needs_review"
+]
 # Finite #54 vocabulary for a single state_effects entry.
 SourceMetadataStateEffect = Literal[
     "none",
@@ -2177,6 +2179,32 @@ class InterviewProposalOut(BaseModel):
 class InterviewSessionDetailOut(InterviewSessionOut):
     messages: List[InterviewMessageOut] = Field(default_factory=list)
     proposals: List[InterviewProposalOut] = Field(default_factory=list)
+
+
+class InterviewSnapshotRebaseRequest(BaseModel):
+    """Move an existing Interview session to a newer snapshot.
+
+    The operation preserves Q&A and understanding text, but reconciles proposal
+    review state against source anchors before any later materialization.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_snapshot_id: Optional[int] = None
+    actor: str = Field(default="dashboard", max_length=200)
+
+
+class InterviewSnapshotRebaseOut(BaseModel):
+    session_id: int
+    system_id: int
+    from_snapshot_id: int
+    to_snapshot_id: int
+    proposals_preserved: int = 0
+    proposals_marked_needs_review: int = 0
+    proposals_missing_source: int = 0
+    proposals_changed_source: int = 0
+    message: str = ""
+    session: InterviewSessionOut
 
 
 # --- Interview Context Pack (Issue #68) -------------------------------------

@@ -132,7 +132,12 @@ function AnswerMessage({ result }: { result: AssistantAskOut }) {
   );
 }
 
-export function AssistantPanel() {
+interface AssistantPanelProps {
+  snapshotNotice?: string | null;
+  onSnapshotNoticeClick?: () => void;
+}
+
+export function AssistantPanel({ snapshotNotice, onSnapshotNoticeClick }: AssistantPanelProps = {}) {
   const location = useLocation();
   const screenId = screenIdFromPath(location.pathname);
   const [open, setOpen] = useState(false);
@@ -176,15 +181,29 @@ export function AssistantPanel() {
 
   if (!open) {
     return (
-      <Button
-        size="icon"
-        onClick={() => setOpen(true)}
-        title="Ask the assistant about this screen"
-        data-testid="assistant-button"
-        className="fixed bottom-6 right-6 z-40 h-11 w-11 rounded-full shadow-lg"
-      >
-        <Bot className="h-5 w-5" />
-      </Button>
+      <div className="fixed bottom-6 right-6 z-40 flex items-end gap-2">
+        {snapshotNotice && (
+          <button
+            type="button"
+            onClick={onSnapshotNoticeClick}
+            className="relative max-w-[min(18rem,calc(100vw-5.5rem))] rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-left text-xs font-medium text-amber-900 shadow-lg transition-colors hover:bg-amber-100 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100 dark:hover:bg-amber-900"
+            title="画面先頭の snapshot 注意書きへ移動"
+            data-testid="assistant-snapshot-notice"
+          >
+            {snapshotNotice}
+            <span className="absolute -right-1 bottom-4 h-2 w-2 rotate-45 border-r border-t border-amber-300 bg-amber-50 dark:border-amber-800 dark:bg-amber-950" />
+          </button>
+        )}
+        <Button
+          size="icon"
+          onClick={() => setOpen(true)}
+          title="Ask the assistant about this screen"
+          data-testid="assistant-button"
+          className="h-11 w-11 rounded-full shadow-lg"
+        >
+          <Bot className="h-5 w-5" />
+        </Button>
+      </div>
     );
   }
 
