@@ -1895,6 +1895,56 @@ describe("Interview page", () => {
     mockSystemId = 1;
   });
 
+  test("preserves diagnostic focus params while auto-selecting an interview session", async () => {
+    mockInterviewApi();
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-diagnostics") {
+        return Promise.resolve({
+          system_id: 1,
+          generated_at: 1750000000,
+          overall_severity: "warning",
+          severity_counts: { ok: 0, warning: 1, error: 0, blocked: 0, unknown: 0 },
+          checks: [{
+            check_id: "system_purpose",
+            category: "understanding",
+            title: "System Purpose の定義",
+            severity: "warning",
+            detail: "System Purpose が未定義です。",
+            impact: "probe 設計の前提情報が欠けています。",
+            remediation: "Interview で System Purpose を定義・確認してください。",
+            related_env: [],
+            related_paths: [],
+            related_pages: ["/system-understanding", "/interview"],
+            related_pipeline_steps: ["capability_hierarchy_ready"],
+            last_observed_error: null,
+            decision_method: "deterministic",
+            fix_kind: "navigate",
+            fix_page: "/interview",
+            fix_anchor: "interview-purpose",
+          }],
+        });
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?diagnostic=system_purpose&fix=interview-purpose"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const callout = await screen.findByTestId("diagnostic-callout-interview-purpose");
+    expect(callout.textContent).toContain("System Purpose の定義");
+    expect(callout.textContent).toContain("Interview で System Purpose");
+  });
+
   test("renders mock reasoning provenance and wires proposal decisions", async () => {
     mockInterviewApi();
     mockApi.post.mockResolvedValue({ id: 1, decision: "approved", decision_method: "manual" });

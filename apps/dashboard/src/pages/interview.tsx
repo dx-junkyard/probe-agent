@@ -31,7 +31,7 @@ import {
 } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
 import { api } from "@/api/client";
-import { DiagnosticFixCallout } from "@/components/diagnostic-fix";
+import { DiagnosticFixCallout, useDiagnosticHighlight } from "@/components/diagnostic-fix";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -937,6 +937,8 @@ export default function InterviewPage() {
   const building = createSession.isPending || updateUnderstanding.isPending;
   const uiState: InterviewUiState | null = session ? deriveUiState(session, building) : null;
   const unlocked = session ? proposalsUnlocked(session) : false;
+  const purposeFixHighlight = useDiagnosticHighlight<HTMLDivElement>("interview-purpose");
+  const capabilitiesFixHighlight = useDiagnosticHighlight<HTMLDivElement>("interview-capabilities");
   // 提案ステージで未回答の絞り込み質問が残っている状態。提案生成を依頼しても
   // 情報不足だった場合、モデルの確認質問が open_questions に残る。
   const proposalNarrowing =
@@ -944,9 +946,11 @@ export default function InterviewPage() {
 
   useEffect(() => {
     if (!selectedSessionId && sortedSessions.length > 0) {
-      setSearchParams({ session: String(sortedSessions[0].id) }, { replace: true });
+      const next = new URLSearchParams(searchParams);
+      next.set("session", String(sortedSessions[0].id));
+      setSearchParams(next, { replace: true });
     }
-  }, [selectedSessionId, sortedSessions, setSearchParams]);
+  }, [selectedSessionId, sortedSessions, searchParams, setSearchParams]);
 
   const answerRevisionReflected =
     answerRevisionReflectedState.sessionId === selectedSessionId
@@ -1247,7 +1251,12 @@ export default function InterviewPage() {
           <Select
             className="w-[240px]"
             value={selectedSessionId ? String(selectedSessionId) : ""}
-            onChange={e => setSearchParams(e.target.value ? { session: e.target.value } : {})}
+            onChange={e => {
+              const next = new URLSearchParams(searchParams);
+              if (e.target.value) next.set("session", e.target.value);
+              else next.delete("session");
+              setSearchParams(next);
+            }}
             disabled={!sortedSessions.length}
             aria-label="インタビューセッション"
           >
@@ -1265,8 +1274,12 @@ export default function InterviewPage() {
         </div>
       </div>
 
-      <DiagnosticFixCallout anchor="interview-purpose" />
-      <DiagnosticFixCallout anchor="interview-capabilities" />
+      <div {...purposeFixHighlight}>
+        <DiagnosticFixCallout anchor="interview-purpose" />
+      </div>
+      <div {...capabilitiesFixHighlight}>
+        <DiagnosticFixCallout anchor="interview-capabilities" />
+      </div>
 
       {!latestSnapshot && !snapshotLoading && (
         <Card>
