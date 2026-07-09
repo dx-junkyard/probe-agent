@@ -6,6 +6,7 @@ import {
   useFlowOverlay, useAnalyzers,
 } from "@/api/hooks";
 import { ApiRoleCard } from "@/components/api-role-card";
+import { ContextHeader } from "@/components/layout/context-header";
 import { ApiError } from "@/api/client";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -121,6 +122,10 @@ export default function FlowExplorerPage() {
   const [searchParams] = useSearchParams();
   const wantType = searchParams.get("entrypoint_type");
   const wantId = searchParams.get("entrypoint_id");
+  // Issue #176: carried from Capability Map / System Understanding so the
+  // developer can return to the originating capability and so the capability
+  // context follows through to the Probe Plan draft created here.
+  const capabilityContext = searchParams.get("capability");
   const autoOpenedRef = useRef<string | null>(null);
 
   const openEntrypoint = async (ep: FlowEntrypointOut) => {
@@ -230,7 +235,10 @@ export default function FlowExplorerPage() {
       toast.success(`Probe Plan draft #${plan.id} created from flow selection`);
       setSelections({});
       setObjective("");
-      navigate(`/probe-planner?plan=${plan.id}`);
+      navigate(
+        `/probe-planner?plan=${plan.id}`
+        + (capabilityContext ? `&capability=${encodeURIComponent(capabilityContext)}` : ""),
+      );
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
         setStale(true);
@@ -258,8 +266,18 @@ export default function FlowExplorerPage() {
 
   return (
     <div className="space-y-6">
+      <ContextHeader />
       <div className="flex items-center justify-between">
         <div>
+          {capabilityContext && (
+            <Link
+              to={`/capability-map?capability=${encodeURIComponent(capabilityContext)}`}
+              className="inline-flex items-center text-xs text-primary hover:underline mb-1"
+              data-testid="back-to-capability"
+            >
+              ← Back to Capability: {capabilityContext}
+            </Link>
+          )}
           <h1 className="text-2xl font-bold tracking-tight flex items-center gap-2">
             <Workflow className="h-6 w-6" /> Flow Explorer
           </h1>

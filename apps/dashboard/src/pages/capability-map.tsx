@@ -9,6 +9,7 @@ import {
   useApiRoleCards, useCodeLinks, useCapabilityContext,
 } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
+import { ContextHeader } from "@/components/layout/context-header";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
@@ -122,10 +123,11 @@ function RefreshPanel({ data }: { data: ExplanationRefreshOut }) {
 }
 
 function DetailsPanel({
-  selected, driftByNode,
+  selected, driftByNode, capabilityKeyByNodeId,
 }: {
   selected: SelectedNode;
   driftByNode: Map<number, AnchorDriftOut>;
+  capabilityKeyByNodeId: Map<number, string>;
 }) {
   const refresh = useRequestExplanationRefresh();
   const [proposal, setProposal] = useState<ExplanationRefreshOut | null>(null);
@@ -155,8 +157,12 @@ function DetailsPanel({
     }
   };
 
+  // Issue #176: carry the enclosing capability so Flow Explorer can show a
+  // way back and hand the same capability off to the resulting Probe Plan.
+  const flowLinkCapabilityKey = capabilityKeyByNodeId.get(data.id) ?? null;
   const flowLink = entrypointType && entrypointRef
     ? `/flow-explorer?entrypoint_type=${encodeURIComponent(entrypointType)}&entrypoint_id=${encodeURIComponent(entrypointRef)}`
+      + (flowLinkCapabilityKey ? `&capability=${encodeURIComponent(flowLinkCapabilityKey)}` : "")
     : null;
 
   return (
@@ -307,7 +313,7 @@ function DetailsPanel({
                   {relatedApis.map((api, i) => (
                     <Link
                       key={i}
-                      to={`/flow-explorer?entrypoint_type=${encodeURIComponent(api.entrypoint_type)}&entrypoint_id=${encodeURIComponent(api.entrypoint_id)}`}
+                      to={`/flow-explorer?entrypoint_type=${encodeURIComponent(api.entrypoint_type)}&entrypoint_id=${encodeURIComponent(api.entrypoint_id)}&capability=${encodeURIComponent(capKey)}`}
                       className="flex items-center gap-1.5 text-[11px] text-primary hover:underline"
                     >
                       <Server className="h-3 w-3 shrink-0" />
@@ -524,6 +530,20 @@ export default function CapabilityMapPage() {
     return map;
   }, [driftData]);
 
+  // Issue #176: map every hierarchy node id to its enclosing capability key,
+  // so Flow Explorer links from elements/supporting nodes can carry the
+  // capability context, not just the top-level "Related APIs" links.
+  const capabilityKeyByNodeId = useMemo(() => {
+    const map = new Map<number, string>();
+    for (const cap of hierarchy?.capabilities ?? []) {
+      const key = cap.capability_key ?? cap.name;
+      map.set(cap.id, key);
+      cap.elements.forEach(el => map.set(el.id, key));
+      cap.supporting_elements.forEach(s => map.set(s.id, key));
+    }
+    return map;
+  }, [hierarchy]);
+
   const run = hierarchy?.intelligence_run;
   const hasHierarchy = !!run && (hierarchy?.capabilities.length || hierarchy?.purpose);
 
@@ -542,6 +562,7 @@ export default function CapabilityMapPage() {
 
   return (
     <div className="space-y-6">
+      <ContextHeader />
       <div className="flex items-center justify-between gap-2 flex-wrap">
         <div>
           <h1 className="text-2xl font-bold tracking-tight flex items-center gap-2">
@@ -737,7 +758,11 @@ export default function CapabilityMapPage() {
           {/* Right: details */}
           <div className="space-y-4">
             {selected ? (
-              <DetailsPanel selected={selected} driftByNode={driftByNode} />
+              <DetailsPanel
+                selected={selected}
+                driftByNode={driftByNode}
+                capabilityKeyByNodeId={capabilityKeyByNodeId}
+              />
             ) : (
               <Card>
                 <CardContent className="py-12 text-center text-sm text-muted-foreground">

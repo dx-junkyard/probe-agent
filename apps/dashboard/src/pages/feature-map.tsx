@@ -9,6 +9,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { toast } from "sonner";
 import { Sparkles, Link2, CheckCircle, XCircle, FileText, Boxes } from "lucide-react";
 import { AddToWorkspaceButton } from "@/components/add-to-workspace";
+import { ContextHeader } from "@/components/layout/context-header";
 
 export default function FeatureMapPage() {
   const { data: drafts, isLoading: draftsLoading } = useLatestDrafts();
@@ -53,6 +54,7 @@ export default function FeatureMapPage() {
 
   return (
     <div className="space-y-6">
+      <ContextHeader />
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold tracking-tight">Feature Map</h1>
         <div className="flex gap-2">

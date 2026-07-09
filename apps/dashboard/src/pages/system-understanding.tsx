@@ -17,6 +17,7 @@ import {
   sysKey,
 } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
+import { ContextHeader } from "@/components/layout/context-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -715,8 +716,11 @@ function GapCard({ gap, snapshotId, commitSha }: {
           ))}
           {gap.entrypoint_refs.map((er, i) => {
             const label = [er.entrypoint_type, er.entrypoint_ref].filter(Boolean).join(": ") || "Unknown entrypoint";
+            // Issue #176: carry the gap's capability key so Flow Explorer shows
+            // a way back to the capability this gap was found under.
             const flowLink = er.entrypoint_type && er.entrypoint_ref
               ? `/flow-explorer?entrypoint_type=${encodeURIComponent(er.entrypoint_type)}&entrypoint_id=${encodeURIComponent(er.entrypoint_ref)}`
+                + (gap.capability_key ? `&capability=${encodeURIComponent(gap.capability_key)}` : "")
               : null;
 
             return (
@@ -1213,6 +1217,7 @@ export default function SystemUnderstandingPage() {
 
   return (
     <div className="space-y-6">
+      <ContextHeader />
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold tracking-tight">System Understanding</h1>

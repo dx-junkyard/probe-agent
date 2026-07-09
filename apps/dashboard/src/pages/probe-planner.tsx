@@ -19,6 +19,7 @@ import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import type { ProbePatchOut } from "@/api/types";
 import { AddToWorkspaceButton } from "@/components/add-to-workspace";
+import { ContextHeader } from "@/components/layout/context-header";
 
 export default function ProbePlannerPage() {
   const [searchParams] = useSearchParams();
@@ -27,6 +28,9 @@ export default function ProbePlannerPage() {
   const planIdParam = searchParams.get("plan");
   const draftId = draftIdParam && Number.isInteger(Number(draftIdParam)) ? Number(draftIdParam) : null;
   const planId = planIdParam && Number.isInteger(Number(planIdParam)) ? Number(planIdParam) : null;
+  // Issue #176: carried from Flow Explorer when the plan was created there
+  // from a capability context, so the developer can navigate back to it.
+  const capabilityContext = searchParams.get("capability");
   const { data: workspaceDraft } = useWorkspaceProposalDraft(draftId);
   const { data: featureDrafts } = useLatestDrafts();
   const { data: plansData, isLoading } = useProbePlans();
@@ -91,6 +95,16 @@ export default function ProbePlannerPage() {
 
   return (
     <div className="space-y-6">
+      <ContextHeader />
+      {capabilityContext && (
+        <Link
+          to={`/capability-map?capability=${encodeURIComponent(capabilityContext)}`}
+          className="inline-flex items-center text-xs text-primary hover:underline"
+          data-testid="back-to-capability"
+        >
+          ← Back to Capability: {capabilityContext}
+        </Link>
+      )}
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold tracking-tight">Probe Planner</h1>
         <Button
