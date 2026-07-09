@@ -37,6 +37,7 @@ probe-agent:
 from __future__ import annotations
 
 import os
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -66,6 +67,13 @@ ANCHOR_SNAPSHOT_CREATE = "snapshot-create"
 ANCHOR_BUILD = "build"
 ANCHOR_INTERVIEW_PURPOSE = "interview-purpose"
 ANCHOR_INTERVIEW_CAPABILITIES = "interview-capabilities"
+
+DOC_PATH_SUFFIXES = (
+    ".md", ".mdx", ".rst", ".txt", ".adoc",
+)
+DOC_PATH_MARKERS = (
+    "readme", "architecture", "design", "spec", "docs/", "doc/",
+)
 
 KNOWN_PROVIDERS = {"openai", "anthropic", "gemini", "mock"}
 
@@ -123,6 +131,20 @@ class SystemDiagnosticsReport:
     overall_severity: str
     severity_counts: Dict[str, int]
     checks: List[DiagnosticCheck] = field(default_factory=list)
+
+
+@dataclass
+class UnderstandingBaseline:
+    snapshot_id: int
+    source: str  # interview | hierarchy | draft
+    purpose_count: int = 0
+    capability_count: int = 0
+
+
+@dataclass
+class UnderstandingDiffImpact:
+    status: str  # unchanged | directly_impacted | possibly_impacted
+    reasons: List[str] = field(default_factory=list)
 
 
 def _worst_severity(severities: List[str]) -> str:
@@ -851,8 +873,322 @@ def _latest_ready_snapshot_id(conn, system_id: int) -> Optional[int]:
     return row["id"] if row else None
 
 
+def _is_doc_path(path: str) -> bool:
+    lower = path.lower()
+    return lower.endswith(DOC_PATH_SUFFIXES) or any(m in lower for m in DOC_PATH_MARKERS)
+
+
+def _load_json_obj(raw: Optional[str]) -> Any:
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return None
+
+
+def _understanding_item_count(understanding: Any, key: str) -> int:
+    if not isinstance(understanding, dict):
+        return 0
+    items = understanding.get(key)
+    return len(items) if isinstance(items, list) else 0
+
+
+def _latest_interview_baseline(
+    conn,
+    system_id: int,
+    *,
+    needs_purpose: bool,
+    needs_capabilities: bool,
+) -> Optional[UnderstandingBaseline]:
+    rows = conn.execute(
+        """
+        SELECT snapshot_id, current_understanding
+          FROM interview_session
+         WHERE system_id = ?
+           AND understanding_confirmed_at IS NOT NULL
+           AND current_understanding IS NOT NULL
+         ORDER BY understanding_confirmed_at DESC, id DESC
+        """,
+        (system_id,),
+    ).fetchall()
+    for row in rows:
+        understanding = _load_json_obj(row["current_understanding"])
+        purpose_count = _understanding_item_count(understanding, "system_purpose")
+        capability_count = _understanding_item_count(understanding, "core_capabilities")
+        if needs_purpose and purpose_count == 0:
+            continue
+        if needs_capabilities and capability_count == 0:
+            continue
+        return UnderstandingBaseline(
+            snapshot_id=row["snapshot_id"],
+            source="interview",
+            purpose_count=purpose_count,
+            capability_count=capability_count,
+        )
+    return None
+
+
+def _latest_hierarchy_baseline(
+    conn,
+    system_id: int,
+    *,
+    needs_purpose: bool,
+    needs_capabilities: bool,
+) -> Optional[UnderstandingBaseline]:
+    rows = conn.execute(
+        """
+        SELECT snapshot_id,
+               SUM(CASE WHEN node_type = 'purpose' THEN 1 ELSE 0 END) AS purpose_count,
+               SUM(CASE WHEN node_type = 'capability' THEN 1 ELSE 0 END) AS capability_count
+          FROM capability_hierarchy_nodes
+         WHERE system_id = ?
+         GROUP BY snapshot_id
+         ORDER BY snapshot_id DESC
+        """,
+        (system_id,),
+    ).fetchall()
+    for row in rows:
+        purpose_count = int(row["purpose_count"] or 0)
+        capability_count = int(row["capability_count"] or 0)
+        if needs_purpose and purpose_count == 0:
+            continue
+        if needs_capabilities and capability_count == 0:
+            continue
+        return UnderstandingBaseline(
+            snapshot_id=row["snapshot_id"],
+            source="hierarchy",
+            purpose_count=purpose_count,
+            capability_count=capability_count,
+        )
+    return None
+
+
+def _latest_draft_baseline(conn, system_id: int) -> Optional[UnderstandingBaseline]:
+    row = conn.execute(
+        """
+        SELECT snapshot_id
+          FROM system_profile_drafts
+         WHERE system_id = ? AND (name <> '' OR purpose <> '')
+         ORDER BY id DESC
+         LIMIT 1
+        """,
+        (system_id,),
+    ).fetchone()
+    if not row:
+        return None
+    return UnderstandingBaseline(
+        snapshot_id=row["snapshot_id"],
+        source="draft",
+        purpose_count=1,
+        capability_count=0,
+    )
+
+
+def _understanding_baseline(
+    conn,
+    system_id: int,
+    *,
+    needs_purpose: bool = False,
+    needs_capabilities: bool = False,
+) -> Optional[UnderstandingBaseline]:
+    """Latest confirmed or generated understanding reusable across snapshots."""
+    baseline = _latest_interview_baseline(
+        conn, system_id,
+        needs_purpose=needs_purpose,
+        needs_capabilities=needs_capabilities,
+    )
+    if baseline:
+        return baseline
+    baseline = _latest_hierarchy_baseline(
+        conn, system_id,
+        needs_purpose=needs_purpose,
+        needs_capabilities=needs_capabilities,
+    )
+    if baseline:
+        return baseline
+    if needs_purpose and not needs_capabilities:
+        return _latest_draft_baseline(conn, system_id)
+    return None
+
+
+def _snapshot_file_hashes(conn, snapshot_id: int) -> Dict[str, Optional[str]]:
+    rows = conn.execute(
+        "SELECT path, content_hash FROM snapshot_files WHERE snapshot_id = ?",
+        (snapshot_id,),
+    ).fetchall()
+    return {row["path"]: row["content_hash"] for row in rows}
+
+
+def _metadata_facts(conn, snapshot_id: int) -> Dict[tuple, tuple]:
+    rows = conn.execute(
+        """
+        SELECT path, qualified_name, role, capability, system_purpose,
+               consumers, raw_block, explanation_hash
+          FROM symbol_source_metadata
+         WHERE snapshot_id = ?
+        """,
+        (snapshot_id,),
+    ).fetchall()
+    facts: Dict[tuple, tuple] = {}
+    for row in rows:
+        facts[(row["path"], row["qualified_name"])] = (
+            row["role"] or "",
+            row["capability"] or "",
+            row["system_purpose"] or "",
+            row["consumers"] or "[]",
+            row["raw_block"] or "",
+            row["explanation_hash"] or "",
+        )
+    return facts
+
+
+def _entrypoint_facts(conn, snapshot_id: int) -> Dict[tuple, tuple]:
+    rows = conn.execute(
+        """
+        SELECT entrypoint_type, entrypoint_id, handler_path,
+               handler_qualified_name, route_method, route_path
+          FROM code_entrypoints
+         WHERE snapshot_id = ?
+        """,
+        (snapshot_id,),
+    ).fetchall()
+    facts: Dict[tuple, tuple] = {}
+    for row in rows:
+        facts[(row["entrypoint_type"], row["entrypoint_id"])] = (
+            row["handler_path"] or "",
+            row["handler_qualified_name"] or "",
+            row["route_method"] or "",
+            row["route_path"] or "",
+        )
+    return facts
+
+
+def _changed_keys(base: Dict[Any, Any], target: Dict[Any, Any]) -> tuple[set, set, set]:
+    base_keys = set(base)
+    target_keys = set(target)
+    added = target_keys - base_keys
+    removed = base_keys - target_keys
+    changed = {k for k in base_keys & target_keys if base[k] != target[k]}
+    return added, removed, changed
+
+
+def _baseline_diff_impact(
+    conn,
+    baseline: UnderstandingBaseline,
+    snapshot_id: int,
+    *,
+    for_capabilities: bool,
+) -> UnderstandingDiffImpact:
+    if baseline.snapshot_id == snapshot_id:
+        return UnderstandingDiffImpact(status="unchanged")
+
+    base_files = _snapshot_file_hashes(conn, baseline.snapshot_id)
+    target_files = _snapshot_file_hashes(conn, snapshot_id)
+    added_paths, removed_paths, changed_paths = _changed_keys(base_files, target_files)
+    doc_paths = sorted(p for p in added_paths | removed_paths | changed_paths if _is_doc_path(str(p)))
+    if doc_paths:
+        sample = ", ".join(doc_paths[:3])
+        suffix = " など" if len(doc_paths) > 3 else ""
+        return UnderstandingDiffImpact(
+            status="directly_impacted",
+            reasons=[f"理解の根拠になりやすいドキュメントが変更されています: {sample}{suffix}。"],
+        )
+
+    base_meta = _metadata_facts(conn, baseline.snapshot_id)
+    target_meta = _metadata_facts(conn, snapshot_id)
+    added_meta, removed_meta, changed_meta = _changed_keys(base_meta, target_meta)
+    metadata_delta = added_meta | removed_meta | changed_meta
+    if metadata_delta:
+        sample_key = sorted(metadata_delta)[0]
+        return UnderstandingDiffImpact(
+            status="directly_impacted",
+            reasons=[
+                "source metadata（system_purpose / capability / role など）が変更されています: "
+                f"{sample_key[0]}:{sample_key[1]}。"
+            ],
+        )
+
+    if for_capabilities:
+        base_entrypoints = _entrypoint_facts(conn, baseline.snapshot_id)
+        target_entrypoints = _entrypoint_facts(conn, snapshot_id)
+        added_eps, removed_eps, changed_eps = _changed_keys(base_entrypoints, target_entrypoints)
+        if added_eps or removed_eps or changed_eps:
+            parts = []
+            if added_eps:
+                parts.append(f"追加 {len(added_eps)} 件")
+            if removed_eps:
+                parts.append(f"削除 {len(removed_eps)} 件")
+            if changed_eps:
+                parts.append(f"変更 {len(changed_eps)} 件")
+            return UnderstandingDiffImpact(
+                status="possibly_impacted",
+                reasons=[f"entrypoint に差分があります（{', '.join(parts)}）。主要機能に含めるか確認してください。"],
+            )
+
+    return UnderstandingDiffImpact(status="unchanged")
+
+
+def _baseline_ok_check(
+    *,
+    base: dict,
+    baseline: UnderstandingBaseline,
+    impact: UnderstandingDiffImpact,
+    purpose: bool,
+) -> DiagnosticCheck:
+    label = "System Purpose" if purpose else "Core Capability"
+    if baseline.snapshot_id == base.get("snapshot_id"):
+        detail = f"{label} は現在の snapshot で確認済みです。"
+    elif impact.status == "unchanged":
+        detail = (
+            f"{label} は snapshot #{baseline.snapshot_id} の確認済み理解を再利用できます。"
+            "今回の差分には再確認が必要な根拠変更は見つかりませんでした。"
+        )
+    else:
+        detail = f"{label} は確認済みです。"
+    payload = {k: v for k, v in base.items() if k != "snapshot_id"}
+    return DiagnosticCheck(
+        severity="ok",
+        detail=detail,
+        impact="",
+        remediation="",
+        **payload,
+    )
+
+
+def _baseline_impacted_check(
+    *,
+    base: dict,
+    baseline: UnderstandingBaseline,
+    impact: UnderstandingDiffImpact,
+    purpose: bool,
+) -> DiagnosticCheck:
+    target = "System Purpose" if purpose else "Core Capabilities"
+    title = "System Purpose の再確認" if purpose else "主な機能 / Core Capabilities の再確認"
+    reason = " ".join(impact.reasons) if impact.reasons else "前回確認済み理解に影響しうる差分があります。"
+    payload = {k: v for k, v in base.items() if k not in {"title", "snapshot_id"}}
+    return DiagnosticCheck(
+        severity="warning",
+        detail=(
+            f"{target} は snapshot #{baseline.snapshot_id} で確認済みですが、"
+            f"最新 snapshot との差分に影響候補があります。{reason}"
+        ),
+        impact=(
+            "確認済み理解をそのまま使えるか判断が必要です。"
+            "目的・主要機能が変わっていない場合は Interview で再確認してください。"
+        ),
+        remediation=f"Interview で {target} を再確認してください。",
+        fix_kind=FIX_KIND_NAVIGATE,
+        fix_page=PAGE_INTERVIEW,
+        fix_anchor=ANCHOR_INTERVIEW_PURPOSE if purpose else ANCHOR_INTERVIEW_CAPABILITIES,
+        title=title,
+        **payload,
+    )
+
+
 def _no_ready_snapshot_check(base: dict) -> DiagnosticCheck:
     """Blocked result shared by every pipeline check when no snapshot is ready."""
+    payload = {k: v for k, v in base.items() if k != "snapshot_id"}
     return DiagnosticCheck(
         severity="blocked",
         detail="ready な snapshot がないため、このステップは実行できません。",
@@ -861,7 +1197,7 @@ def _no_ready_snapshot_check(base: dict) -> DiagnosticCheck:
         fix_kind=FIX_KIND_NAVIGATE,
         fix_page=PAGE_REPOSITORY,
         fix_anchor=ANCHOR_SNAPSHOT_CREATE,
-        **base,
+        **payload,
     )
 
 
@@ -878,6 +1214,7 @@ def _check_system_purpose(conn, system_id: int, snapshot_id: Optional[int]) -> D
         title="System Purpose の定義",
         related_pages=[PAGE_SYSTEM_UNDERSTANDING, PAGE_INTERVIEW],
         related_pipeline_steps=["capability_hierarchy_ready"],
+        snapshot_id=snapshot_id,
     )
     if snapshot_id is None:
         return _no_ready_snapshot_check(base)
@@ -900,7 +1237,19 @@ def _check_system_purpose(conn, system_id: int, snapshot_id: Optional[int]) -> D
             detail="System Purpose が定義されています。",
             impact="",
             remediation="",
-            **base,
+            **{k: v for k, v in base.items() if k != "snapshot_id"},
+        )
+    baseline = _understanding_baseline(conn, system_id, needs_purpose=True)
+    if baseline:
+        impact = _baseline_diff_impact(
+            conn, baseline, snapshot_id, for_capabilities=False,
+        )
+        if impact.status == "unchanged":
+            return _baseline_ok_check(
+                base=base, baseline=baseline, impact=impact, purpose=True,
+            )
+        return _baseline_impacted_check(
+            base=base, baseline=baseline, impact=impact, purpose=True,
         )
     return DiagnosticCheck(
         severity="warning",
@@ -916,7 +1265,7 @@ def _check_system_purpose(conn, system_id: int, snapshot_id: Optional[int]) -> D
         fix_kind=FIX_KIND_NAVIGATE,
         fix_page=PAGE_INTERVIEW,
         fix_anchor=ANCHOR_INTERVIEW_PURPOSE,
-        **base,
+        **{k: v for k, v in base.items() if k != "snapshot_id"},
     )
 
 
@@ -932,6 +1281,7 @@ def _check_system_capabilities(conn, system_id: int, snapshot_id: Optional[int])
         title="主な機能 / Core Capabilities の把握",
         related_pages=[PAGE_SYSTEM_UNDERSTANDING, PAGE_INTERVIEW, PAGE_CAPABILITY_MAP],
         related_pipeline_steps=["capability_hierarchy_ready"],
+        snapshot_id=snapshot_id,
     )
     if snapshot_id is None:
         return _no_ready_snapshot_check(base)
@@ -946,7 +1296,19 @@ def _check_system_capabilities(conn, system_id: int, snapshot_id: Optional[int])
             detail=f"{count} 件の Core Capability が定義されています。",
             impact="",
             remediation="",
-            **base,
+            **{k: v for k, v in base.items() if k != "snapshot_id"},
+        )
+    baseline = _understanding_baseline(conn, system_id, needs_capabilities=True)
+    if baseline:
+        impact = _baseline_diff_impact(
+            conn, baseline, snapshot_id, for_capabilities=True,
+        )
+        if impact.status == "unchanged":
+            return _baseline_ok_check(
+                base=base, baseline=baseline, impact=impact, purpose=False,
+            )
+        return _baseline_impacted_check(
+            base=base, baseline=baseline, impact=impact, purpose=False,
         )
     return DiagnosticCheck(
         severity="warning",
@@ -962,7 +1324,7 @@ def _check_system_capabilities(conn, system_id: int, snapshot_id: Optional[int])
         fix_kind=FIX_KIND_NAVIGATE,
         fix_page=PAGE_INTERVIEW,
         fix_anchor=ANCHOR_INTERVIEW_CAPABILITIES,
-        **base,
+        **{k: v for k, v in base.items() if k != "snapshot_id"},
     )
 
 
