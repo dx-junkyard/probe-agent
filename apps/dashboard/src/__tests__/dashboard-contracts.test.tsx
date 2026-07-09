@@ -422,6 +422,90 @@ describe("Probe Patch application", () => {
   });
 });
 
+// ── Probe Planner ?plan= deep link (Issue #177) ─────────────────────
+
+function mockTwoPlans() {
+  mockApi.get.mockImplementation((path: string) => {
+    if (path === "/repository/probe-plans") {
+      return Promise.resolve({
+        system_id: 1,
+        is_mock: false,
+        plans: [
+          { id: 10, feature_id: "feat-1", objective: "Observe A", status: "proposed", created_at: "2024-01-01", probe_points: [] },
+          { id: 11, feature_id: "feat-2", objective: "Observe B", status: "proposed", created_at: "2024-01-02", probe_points: [] },
+        ],
+      });
+    }
+    if (path === "/repository/probe-patches") return Promise.resolve([]);
+    return Promise.resolve(null);
+  });
+}
+
+function renderProbePlannerAt(route: string) {
+  const qc = new QueryClient({
+    defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+  });
+  return import("@/pages/probe-planner").then(({ default: ProbePlannerPage }) =>
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={[route]}>
+          <ProbePlannerPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    ),
+  );
+}
+
+describe("Probe Planner ?plan= deep link", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("expands the matching plan when ?plan= is present", async () => {
+    mockTwoPlans();
+    await renderProbePlannerAt("/probe-planner?plan=11");
+
+    await waitFor(() => {
+      expect(screen.getByText("Feature: feat-2")).toBeInTheDocument();
+    });
+    // Expanded content (Probe Points section) is rendered only for the open card.
+    await waitFor(() => {
+      expect(screen.getByText("Probe Points (0)")).toBeInTheDocument();
+    });
+    const { toast } = await import("sonner");
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  test("falls back to the normal list without ?plan=", async () => {
+    mockTwoPlans();
+    await renderProbePlannerAt("/probe-planner");
+
+    await waitFor(() => {
+      expect(screen.getByText("Feature: feat-1")).toBeInTheDocument();
+      expect(screen.getByText("Feature: feat-2")).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/Probe Points \(/)).not.toBeInTheDocument();
+    const { toast } = await import("sonner");
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  test("shows a warning and normal list for an unknown plan id", async () => {
+    mockTwoPlans();
+    await renderProbePlannerAt("/probe-planner?plan=999");
+
+    await waitFor(() => {
+      expect(screen.getByText("Feature: feat-1")).toBeInTheDocument();
+      expect(screen.getByText("Feature: feat-2")).toBeInTheDocument();
+    });
+    const { toast } = await import("sonner");
+    await waitFor(() => {
+      expect(toast.error).toHaveBeenCalledWith("Probe plan #999 was not found.");
+    });
+    expect(screen.queryByText(/Probe Points \(/)).not.toBeInTheDocument();
+  });
+});
+
 // ── Repository refresh loop (Issue #158) ────────────────────────────
 
 describe("Repository Refresh Hub", () => {
