@@ -14,7 +14,7 @@ import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { toast } from "sonner";
 import { formatTimestamp } from "@/lib/utils";
-import { Crosshair, CheckCircle, XCircle, FileCode, Play, Download, GitBranch } from "lucide-react";
+import { Crosshair, CheckCircle, XCircle, FileCode, Play, Download, GitBranch, FlaskConical } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import type { ProbePatchOut } from "@/api/types";
@@ -211,6 +211,16 @@ export default function ProbePlannerPage() {
                         <FileCode className="h-4 w-4 mr-1" />
                         Generate Patch
                       </Button>
+                      {capabilityContext && (
+                        <Link
+                          to={`/experiments?capability=${encodeURIComponent(capabilityContext)}`}
+                          className="inline-flex h-8 items-center justify-center gap-2 rounded-md border border-input bg-background px-3 text-xs font-medium shadow-sm hover:bg-accent hover:text-accent-foreground"
+                          data-testid="open-experiments-with-capability"
+                        >
+                          <FlaskConical className="h-4 w-4" />
+                          Experiments
+                        </Link>
+                      )}
                     </div>
 
                     {planPatches.length > 0 && (

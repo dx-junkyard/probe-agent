@@ -948,6 +948,26 @@ class TestNextActionsPriority:
         labels = [a.action for a in actions]
         assert labels == ["Add source metadata", "Review docs-code gaps"]
 
+    def test_gap_summary_surfaces_unclassified_api_and_probe_candidate_actions(self):
+        from app.system_understanding_service import GapSummary, _build_next_actions
+
+        actions = _build_next_actions(
+            self._complete_pipeline(),
+            purpose={"name": "Sys", "summary": "Does things"},
+            capabilities=[{"name": "Cap"}],
+            metadata_coverage=None,
+            gap_count=3,
+            gap_summary=[
+                GapSummary(gap_type="unclassified_entrypoint", count=1),
+                GapSummary(gap_type="missing_probe_flow", count=2),
+            ],
+        )
+        by_label = {a.action: a for a in actions}
+        assert by_label["Unclassified API found"].category == "observe"
+        assert by_label["Unclassified API found"].link == "/capability-map"
+        assert by_label["Probe candidate available"].category == "observe"
+        assert by_label["Probe candidate available"].link == "/flow-explorer"
+
     def test_fully_satisfied_pipeline_offers_exploration_actions(self):
         from app.system_understanding_service import MetadataCoverage, _build_next_actions
 

@@ -393,7 +393,7 @@ function DetailsPanel({
                 {capabilityContext.probe_plans.map((plan) => (
                   <Link
                     key={plan.id}
-                    to={`/probe-planner?plan=${plan.id}`}
+                    to={`/probe-planner?plan=${plan.id}&capability=${encodeURIComponent(selected.data.capability_key ?? selected.data.name)}`}
                     className="flex items-center gap-1.5 text-[11px] text-primary hover:underline"
                   >
                     <Crosshair className="h-3 w-3 shrink-0" />
@@ -409,7 +409,7 @@ function DetailsPanel({
                 {capabilityContext.experiments.map((exp) => (
                   <Link
                     key={exp.id}
-                    to="/experiments"
+                    to={`/experiments?capability=${encodeURIComponent(selected.data.capability_key ?? selected.data.name)}`}
                     className="flex items-center gap-1.5 text-[11px] text-primary hover:underline"
                   >
                     <FlaskConical className="h-3 w-3 shrink-0" />

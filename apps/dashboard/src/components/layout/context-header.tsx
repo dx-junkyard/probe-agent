@@ -27,7 +27,7 @@ export function ContextHeader() {
   const { data: understanding } = useSystemUnderstanding();
 
   const systemName = systems.find((s) => s.id === systemId)?.name ?? null;
-  const commitSha = repoStatus?.current_head ?? repoStatus?.latest_snapshot?.commit_sha ?? null;
+  const commitSha = understanding?.commit_sha ?? repoStatus?.latest_snapshot?.commit_sha ?? null;
   const capability = searchParams.get("capability");
   const entrypointType = searchParams.get("entrypoint_type");
   const entrypointId = searchParams.get("entrypoint_id");

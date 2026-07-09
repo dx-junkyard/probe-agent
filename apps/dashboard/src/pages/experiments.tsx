@@ -40,6 +40,7 @@ export default function ExperimentsPage() {
   const [searchParams] = useSearchParams();
   const draftIdParam = searchParams.get("draft");
   const workspaceIdParam = searchParams.get("workspace");
+  const capabilityContext = searchParams.get("capability");
   const draftId = draftIdParam && Number.isInteger(Number(draftIdParam)) ? Number(draftIdParam) : null;
   const { data: workspaceDraft } = useWorkspaceProposalDraft(draftId);
   const { data: experiments, isLoading } = useExperiments();
@@ -126,6 +127,15 @@ export default function ExperimentsPage() {
   return (
     <div className="space-y-6">
       <ContextHeader />
+      {capabilityContext && (
+        <Link
+          to={`/capability-map?capability=${encodeURIComponent(capabilityContext)}`}
+          className="inline-flex items-center text-xs text-primary hover:underline"
+          data-testid="back-to-capability"
+        >
+          ← Back to Capability: {capabilityContext}
+        </Link>
+      )}
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold tracking-tight">Experiments</h1>
         <Button size="sm" onClick={() => {

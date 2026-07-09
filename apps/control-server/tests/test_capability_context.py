@@ -148,6 +148,22 @@ def _latest_snapshot_id(system_id):
         return row["id"]
 
 
+def _insert_snapshot(system_id, commit_sha="newer-unready", status="indexing"):
+    from app.db import get_conn
+
+    now = 9.0
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO repository_snapshots
+                (system_id, repo_path, commit_sha, status, created_at)
+            VALUES (?, '/tmp/repo', ?, ?, ?)
+            """,
+            (system_id, commit_sha, status, now),
+        )
+        return cur.lastrowid
+
+
 def _insert_probe_plan(system_id, feature_id, status="proposed"):
     from app.db import get_conn
 
@@ -243,6 +259,32 @@ class TestCapabilityContextAPI:
         assert [e["id"] for e in body["experiments"]] == [exp_id]
         assert body["experiments"][0]["feature_id"] == "flow-feature"
         assert body["experiments"][0]["human_decision"] == "adopted"
+
+    def test_uses_latest_ready_snapshot_when_newer_snapshot_is_not_ready(
+        self, admin_client, tmp_path
+    ):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "CtxReadyRule")
+        repo = _make_repo(tmp_path)
+        capability_key = _wire_feature_and_hierarchy(
+            admin_client, token, system, repo, "flow-feature"
+        )
+        ready_snapshot_id = _latest_snapshot_id(system["id"])
+        plan_id = _insert_probe_plan(system["id"], "flow-feature", status="approved")
+        exp_id = _insert_experiment(system["id"], "flow-feature", human_decision="adopted")
+
+        newer_snapshot_id = _insert_snapshot(
+            system["id"], commit_sha="newer-indexing", status="indexing"
+        )
+        assert newer_snapshot_id > ready_snapshot_id
+
+        h = _headers(token, system["id"])
+        body = admin_client.get(
+            f"/repository/capabilities/{capability_key}/context", headers=h
+        ).json()
+
+        assert [p["id"] for p in body["probe_plans"]] == [plan_id]
+        assert [e["id"] for e in body["experiments"]] == [exp_id]
 
     def test_no_probe_plan_without_matching_feature_id(self, admin_client, tmp_path):
         token = _login(admin_client)

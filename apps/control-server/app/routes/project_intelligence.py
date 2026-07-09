@@ -2856,7 +2856,7 @@ def _load_capability_context(system_id: int, capability_key: str) -> CapabilityC
     attaches to a capability's elements); experiments are matched to the
     plans found that way, by ``feature_id``.
     """
-    from ..system_understanding_service import get_system_understanding
+    from ..system_understanding_service import _get_latest_ready_snapshot, get_system_understanding
 
     summary = get_system_understanding(system_id)
     understanding_out = _system_understanding_to_out(summary)
@@ -2865,18 +2865,16 @@ def _load_capability_context(system_id: int, capability_key: str) -> CapabilityC
     probe_plans: List[CapabilityContextProbePlanOut] = []
     experiments: List[CapabilityContextExperimentOut] = []
     with get_conn() as conn:
-        snapshot_row = conn.execute(
-            "SELECT * FROM repository_snapshots WHERE system_id = ? ORDER BY id DESC LIMIT 1",
-            (system_id,),
-        ).fetchone()
+        snapshot_row = _get_latest_ready_snapshot(conn, system_id)
         if snapshot_row is not None:
+            snapshot_id = snapshot_row["id"]
             run_row = conn.execute(
                 """
                 SELECT * FROM intelligence_runs
                 WHERE system_id = ? AND snapshot_id = ? AND run_type = 'capability_hierarchy'
                 ORDER BY id DESC LIMIT 1
                 """,
-                (system_id, snapshot_row["id"]),
+                (system_id, snapshot_id),
             ).fetchone()
             feature_ids: List[str] = []
             if run_row is not None:
@@ -2895,10 +2893,11 @@ def _load_capability_context(system_id: int, capability_key: str) -> CapabilityC
                 plan_rows = conn.execute(
                     f"""
                     SELECT * FROM probe_plans
-                    WHERE system_id = ? AND feature_id IN ({placeholders})
+                    WHERE system_id = ? AND snapshot_id = ?
+                      AND feature_id IN ({placeholders})
                     ORDER BY id DESC
                     """,
-                    (system_id, *feature_ids),
+                    (system_id, snapshot_id, *feature_ids),
                 ).fetchall()
                 probe_plans = [
                     CapabilityContextProbePlanOut(
@@ -2918,10 +2917,11 @@ def _load_capability_context(system_id: int, capability_key: str) -> CapabilityC
                     experiment_rows = conn.execute(
                         f"""
                         SELECT * FROM experiments
-                        WHERE system_id = ? AND feature_id IN ({plan_placeholders})
+                        WHERE system_id = ? AND snapshot_id = ?
+                          AND feature_id IN ({plan_placeholders})
                         ORDER BY id DESC
                         """,
-                        (system_id, *plan_feature_ids),
+                        (system_id, snapshot_id, *plan_feature_ids),
                     ).fetchall()
                     experiments = [
                         CapabilityContextExperimentOut(

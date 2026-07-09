@@ -694,6 +694,7 @@ def _build_next_actions(
     capabilities: List[Dict[str, Any]],
     metadata_coverage: Optional[MetadataCoverage],
     gap_count: int,
+    gap_summary: Optional[List[GapSummary]] = None,
     proposed_plan_ids: Optional[List[int]] = None,
     approved_plan_ids_without_validated_patch: Optional[List[int]] = None,
     undecided_completed_experiment_ids: Optional[List[int]] = None,
@@ -816,6 +817,25 @@ def _build_next_actions(
             reason=f"{gap_count} docs-code gaps found",
             category="understand",
             link="/system-understanding",
+        ))
+
+    gap_counts = {g.gap_type: g.count for g in (gap_summary or [])}
+    unclassified_count = gap_counts.get("unclassified_entrypoint", 0)
+    if unclassified_count > 0:
+        actions.append(NextAction(
+            action="Unclassified API found",
+            reason=f"{unclassified_count} API entrypoint{'s' if unclassified_count != 1 else ''} need capability classification",
+            category="observe",
+            link="/capability-map",
+        ))
+
+    probe_candidate_count = gap_counts.get("missing_probe_flow", 0)
+    if probe_candidate_count > 0:
+        actions.append(NextAction(
+            action="Probe candidate available",
+            reason=f"{probe_candidate_count} classified entrypoint{'s' if probe_candidate_count != 1 else ''} have no probe plan yet",
+            category="observe",
+            link="/flow-explorer",
         ))
 
     # Issue #174: probe plan / experiment status is a downstream, independent
@@ -956,6 +976,7 @@ def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
             summary.capabilities,
             summary.metadata_coverage,
             len(summary.gaps),
+            summary.gap_summary,
             proposed_plan_ids,
             approved_plan_ids_without_patch,
             undecided_experiment_ids,

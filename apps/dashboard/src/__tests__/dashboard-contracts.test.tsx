@@ -278,6 +278,24 @@ describe("Experiment creation", () => {
     const trashIcons = document.querySelectorAll(".lucide-trash-2");
     expect(trashIcons.length).toBe(0);
   });
+
+  test("shows a back link to the capability when ?capability= is present", async () => {
+    setupExperimentMocks();
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: ExperimentsPage } = await import("@/pages/experiments");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/experiments?capability=doc-analysis"]}>
+          <ExperimentsPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const back = await screen.findByTestId("back-to-capability");
+    expect(back).toHaveAttribute("href", "/capability-map?capability=doc-analysis");
+  });
 });
 
 // ── Experiment decision tests ───────────────────────────────────────
@@ -1433,11 +1451,11 @@ describe("Capability Map page", () => {
 
     const planLink = await screen.findByTestId("capability-probe-plans");
     expect(within(planLink).getByText("doc-parsing")).toBeInTheDocument();
-    expect(within(planLink).getByRole("link")).toHaveAttribute("href", "/probe-planner?plan=42");
+    expect(within(planLink).getByRole("link")).toHaveAttribute("href", "/probe-planner?plan=42&capability=doc-analysis");
 
     const expLink = await screen.findByTestId("capability-experiments");
     expect(within(expLink).getByText("adopted")).toBeInTheDocument();
-    expect(within(expLink).getByRole("link")).toHaveAttribute("href", "/experiments");
+    expect(within(expLink).getByRole("link")).toHaveAttribute("href", "/experiments?capability=doc-analysis");
   });
 
   test("does not show Gaps / Probe Plans / Experiments sections when the context has none", async () => {
@@ -1661,6 +1679,15 @@ describe("Probe Planner capability back link (Issue #176)", () => {
 
     await screen.findByText("Feature: feat-1");
     expect(screen.queryByTestId("back-to-capability")).not.toBeInTheDocument();
+  });
+
+  test("carries the capability context through to Experiments", async () => {
+    mockTwoPlans();
+    await renderProbePlannerAt("/probe-planner?plan=11&capability=doc-analysis");
+
+    await screen.findByText("Probe Points (0)");
+    const link = screen.getByTestId("open-experiments-with-capability");
+    expect(link).toHaveAttribute("href", "/experiments?capability=doc-analysis");
   });
 });
 
@@ -2675,9 +2702,10 @@ describe("Context Header", () => {
     mockApi.get.mockImplementation((path: string) => {
       if (path === "/repository/status") {
         return Promise.resolve({
-          configured: true, repo_path: "/repos/a", current_head: "abc1234567",
+          configured: true, repo_path: "/repos/a", current_head: "def5678000",
           head_error: null, working_tree_dirty: false, dirty_file_count: 0,
-          dirty_sample: [], latest_snapshot: null, latest_indexed_snapshot: null,
+          dirty_sample: [], latest_snapshot: { id: 5, commit_sha: "abc1234567", status: "ready" },
+          latest_indexed_snapshot: null,
           understanding_snapshot_id: null, understanding_status: null,
           snapshot_stale: false, symbols_stale: false, next_actions: [],
         });
@@ -2704,6 +2732,7 @@ describe("Context Header", () => {
     expect(await screen.findByTestId("context-header")).toBeInTheDocument();
     expect(screen.getByTestId("context-header-system")).toHaveTextContent("probe-agent");
     expect(screen.getByTestId("context-header-snapshot")).toHaveTextContent("abc12345");
+    expect(screen.getByTestId("context-header-snapshot")).not.toHaveTextContent("def56780");
     expect(screen.getByTestId("context-header-capability")).toHaveTextContent("doc-analysis");
     expect(screen.getByTestId("context-header-entrypoint")).toHaveTextContent("http_route: GET:/flow");
     expect(screen.getByTestId("context-header-status")).toHaveTextContent(
