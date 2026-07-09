@@ -1379,6 +1379,94 @@ describe("Capability Map page", () => {
     );
     expect(screen.getByText("Lists available flows")).toBeInTheDocument();
   });
+
+  test("shows Gaps / Probe Plans / Experiments for the selected capability with deep links (Issue #175)", async () => {
+    const hierarchy = {
+      system_id: 1, snapshot_id: 5,
+      intelligence_run: { id: 1, status: "completed", decision_method: "deterministic" },
+      purpose: null,
+      capabilities: [{
+        id: 2, capability_key: "doc-analysis", name: "Document Analysis",
+        summary: "analysis capability", provenance: provenance(),
+        elements: [],
+        supporting_elements: [],
+      }],
+      unclassified_elements: [], unattached_supporting: [], is_mock: false,
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/capability-hierarchy") return Promise.resolve(hierarchy);
+      if (path === "/repository/capabilities/doc-analysis/context") {
+        return Promise.resolve({
+          capability_key: "doc-analysis",
+          gaps: [{
+            gap_type: "undocumented", severity: "warning", title: "Missing docs for parser",
+            node_name: null, notes: null, capability_key: "doc-analysis",
+            doc_refs: [], symbol_refs: [], entrypoint_refs: [], code_refs: [],
+            next_actions: [], source_id: null, source_key: null, issue_drafts: [],
+          }],
+          probe_plans: [{
+            id: 42, feature_id: "doc-parsing", objective: "trace parsing",
+            status: "approved", created_at: "1", updated_at: "1",
+          }],
+          experiments: [{
+            id: 7, feature_id: "doc-parsing", objective: "compare candidate",
+            status: "completed", human_decision: "adopted",
+            human_decision_variant_key: "candidate-a", created_at: "1",
+          }],
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { default: CapabilityMapPage } = await import("@/pages/capability-map");
+    render(<CapabilityMapPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByText("Document Analysis"));
+
+    const gapLink = await screen.findByText("Missing docs for parser");
+    expect(gapLink.closest("a")).toHaveAttribute("href", "/system-understanding");
+
+    const planLink = await screen.findByTestId("capability-probe-plans");
+    expect(within(planLink).getByText("doc-parsing")).toBeInTheDocument();
+    expect(within(planLink).getByRole("link")).toHaveAttribute("href", "/probe-planner?plan=42");
+
+    const expLink = await screen.findByTestId("capability-experiments");
+    expect(within(expLink).getByText("adopted")).toBeInTheDocument();
+    expect(within(expLink).getByRole("link")).toHaveAttribute("href", "/experiments");
+  });
+
+  test("does not show Gaps / Probe Plans / Experiments sections when the context has none", async () => {
+    const hierarchy = {
+      system_id: 1, snapshot_id: 5,
+      intelligence_run: { id: 1, status: "completed", decision_method: "deterministic" },
+      purpose: null,
+      capabilities: [{
+        id: 2, capability_key: "empty-cap", name: "Empty Capability",
+        summary: "", provenance: provenance(),
+        elements: [], supporting_elements: [],
+      }],
+      unclassified_elements: [], unattached_supporting: [], is_mock: false,
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/capability-hierarchy") return Promise.resolve(hierarchy);
+      if (path === "/repository/capabilities/empty-cap/context") {
+        return Promise.resolve({ capability_key: "empty-cap", gaps: [], probe_plans: [], experiments: [] });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { default: CapabilityMapPage } = await import("@/pages/capability-map");
+    render(<CapabilityMapPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByText("Empty Capability"));
+
+    await waitFor(() => {
+      expect(mockApi.get).toHaveBeenCalledWith("/repository/capabilities/empty-cap/context");
+    });
+    expect(screen.queryByTestId("capability-gaps")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("capability-probe-plans")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("capability-experiments")).not.toBeInTheDocument();
+  });
 });
 
 // ── Interview dashboard tests (Issue #72) ───────────────────────────

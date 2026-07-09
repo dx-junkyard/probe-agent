@@ -561,6 +561,15 @@ provider/model も持つ。
   status/error を保存）。
 - `POST /repository/capability-hierarchy/generate?use_reasoning=true|false` で生成、
   `GET /repository/capability-hierarchy` で最新階層を取得する。
+- `GET /repository/capabilities/{capability_key}/context`（Issue #175）は
+  capability detail パネル向けに gap / probe plan / experiment を集約して返す。
+  新しい表現は発明せず、既存の System Understanding gap 表現（`capability_key`
+  一致でフィルタ）をそのまま再利用する。probe plan / experiment は
+  `capability_hierarchy_nodes.feature_id`（その capability_key を持つ行）との
+  等値結合のみで拾い、experiment はそこで見つかった plan の `feature_id` に
+  等値結合する。曖昧一致・推測マッチはしない（CLAUDE.md 原則 6）。observed
+  traces の集約は component_id ↔ capability の deterministic な対応が未整備の
+  ため対象外。
 
 ### 既存概念との関係
 

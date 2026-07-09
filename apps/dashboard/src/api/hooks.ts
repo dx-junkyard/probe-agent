@@ -32,6 +32,7 @@ import type {
   GitHubIssueStatus,
   IssueDraftUpdateRequest,
   SystemDiagnosticsOut,
+  CapabilityContextOut,
   AssistantScreenContext, AssistantAskRequest, AssistantAskOut,
   AssistantSettingsMetadataOut,
 } from "./types";
@@ -1056,6 +1057,17 @@ export function useSystemUnderstanding() {
     queryKey: sysKey("system-understanding"),
     queryFn: () => api.get<SystemUnderstandingOut>("/repository/system-understanding"),
     enabled: !!getSystemId(),
+  });
+}
+
+export function useCapabilityContext(capabilityKey: string | null) {
+  return useQuery({
+    queryKey: sysKey("capability-context", capabilityKey),
+    queryFn: () =>
+      api.get<CapabilityContextOut>(
+        `/repository/capabilities/${encodeURIComponent(capabilityKey!)}/context`,
+      ),
+    enabled: !!capabilityKey && !!getSystemId(),
   });
 }
 
