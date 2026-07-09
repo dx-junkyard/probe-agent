@@ -19,6 +19,7 @@ import { formatTimestamp } from "@/lib/utils";
 import { Play, Download, Plus, Trash2 } from "lucide-react";
 import type { ExperimentOut } from "@/api/types";
 import { AddToWorkspaceButton } from "@/components/add-to-workspace";
+import { ContextHeader } from "@/components/layout/context-header";
 
 const STATUS_VARIANT: Record<string, "default" | "success" | "destructive" | "secondary" | "warning"> = {
   draft: "secondary",
@@ -124,6 +125,7 @@ export default function ExperimentsPage() {
 
   return (
     <div className="space-y-6">
+      <ContextHeader />
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold tracking-tight">Experiments</h1>
         <Button size="sm" onClick={() => {

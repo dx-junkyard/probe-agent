@@ -13,6 +13,7 @@ const mockApi = {
   delete: vi.fn(),
 };
 let mockSystemId: number | null = 1;
+let mockSystems: { id: number; name: string }[] = [];
 
 class ApiError extends Error {
   status: number;
@@ -39,7 +40,7 @@ vi.mock("@/api/auth", () => ({
     isAdmin: true,
     loading: false,
     systemId: mockSystemId,
-    systems: [],
+    systems: mockSystems,
     login: vi.fn(),
     logout: vi.fn(),
     selectSystem: vi.fn(),
@@ -47,6 +48,10 @@ vi.mock("@/api/auth", () => ({
   }),
   AuthProvider: ({ children }: { children: ReactNode }) => children,
 }));
+
+afterEach(() => {
+  mockSystems = [];
+});
 
 vi.mock("sonner", () => ({
   toast: {
@@ -1375,7 +1380,7 @@ describe("Capability Map page", () => {
     const link = await screen.findByTestId("open-in-flow");
     expect(link).toHaveAttribute(
       "href",
-      "/flow-explorer?entrypoint_type=http_route&entrypoint_id=GET%3A%2Fflow",
+      "/flow-explorer?entrypoint_type=http_route&entrypoint_id=GET%3A%2Fflow&capability=doc-analysis",
     );
     expect(screen.getByText("Lists available flows")).toBeInTheDocument();
   });
@@ -1466,6 +1471,196 @@ describe("Capability Map page", () => {
     expect(screen.queryByTestId("capability-gaps")).not.toBeInTheDocument();
     expect(screen.queryByTestId("capability-probe-plans")).not.toBeInTheDocument();
     expect(screen.queryByTestId("capability-experiments")).not.toBeInTheDocument();
+  });
+
+  test("Related APIs links carry the capability key to Flow Explorer (Issue #176)", async () => {
+    const hierarchy = {
+      system_id: 1, snapshot_id: 5,
+      intelligence_run: { id: 1, status: "completed", decision_method: "deterministic" },
+      purpose: null,
+      capabilities: [{
+        id: 2, capability_key: "doc-analysis", name: "Document Analysis",
+        summary: "analysis capability", provenance: provenance(),
+        elements: [], supporting_elements: [],
+      }],
+      unclassified_elements: [], unattached_supporting: [], is_mock: false,
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/capability-hierarchy") return Promise.resolve(hierarchy);
+      if (path === "/repository/api-role-cards") {
+        return Promise.resolve({
+          system_id: 1, snapshot_id: 5, hierarchy_run: null,
+          base_snapshot_id: 5, target_snapshot_id: 5, drift_available: true,
+          cards: [{
+            entrypoint_type: "http_route", entrypoint_id: "POST:/documents/analyze",
+            label: "POST /documents/analyze", capability_key: "doc-analysis",
+          }],
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { default: CapabilityMapPage } = await import("@/pages/capability-map");
+    render(<CapabilityMapPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByText("Document Analysis"));
+
+    const apiLink = await screen.findByText("POST /documents/analyze");
+    expect(apiLink.closest("a")).toHaveAttribute(
+      "href",
+      "/flow-explorer?entrypoint_type=http_route&entrypoint_id=POST%3A%2Fdocuments%2Fanalyze&capability=doc-analysis",
+    );
+  });
+});
+
+describe("Flow Explorer capability context (Issue #176)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const entrypoint = {
+    entrypoint_type: "http_route", entrypoint_id: "POST:/documents/analyze",
+    label: "POST /documents/analyze", path: "app.py", qualified_name: "analyze_document",
+    line_start: 5, line_end: 11, component_id: null, route_method: "POST",
+    route_path: "/documents/analyze", category: "api", framework: "fastapi",
+    operation: "POST /documents/analyze", confidence: 1.0, evidence: [],
+  };
+
+  function mockEntrypointsAndGraph() {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/flow-entrypoints") {
+        return Promise.resolve({
+          system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
+          total: 1, entrypoints: [entrypoint], functions: [],
+          counts: { api: 1, message_queue: 0, scheduled_job: 0, cli: 0, function: 0 },
+          indexed_function_count: 0, has_backend_entrypoints: true, frameworks: ["fastapi"],
+          diagnostics: [],
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockImplementation((path: string) =>
+      path === "/repository/flow-graphs"
+        ? Promise.resolve({
+            system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
+            entrypoint, nodes: [], edges: [], candidate_paths: [],
+            diagnostics: [], truncated: false,
+          })
+        : Promise.resolve(null));
+  }
+
+  function renderFlowExplorerAt(route: string) {
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    return import("@/pages/flow-explorer").then(({ default: FlowExplorerPage }) =>
+      render(
+        <QueryClientProvider client={qc}>
+          <MemoryRouter initialEntries={[route]}>
+            <FlowExplorerPage />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      ),
+    );
+  }
+
+  test("shows a back link to the capability when ?capability= is present", async () => {
+    mockEntrypointsAndGraph();
+    await renderFlowExplorerAt("/flow-explorer?capability=doc-analysis");
+
+    const back = await screen.findByTestId("back-to-capability");
+    expect(back).toHaveAttribute("href", "/capability-map?capability=doc-analysis");
+  });
+
+  test("does not show a back link without ?capability=", async () => {
+    mockEntrypointsAndGraph();
+    const { default: FlowExplorerPage } = await import("@/pages/flow-explorer");
+    render(<FlowExplorerPage />, { wrapper: createWrapper() });
+
+    await screen.findByText("Flow Explorer");
+    expect(screen.queryByTestId("back-to-capability")).not.toBeInTheDocument();
+  });
+
+  test("carries ?capability= through to the created Probe Plan draft", async () => {
+    mockEntrypointsAndGraph();
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/repository/flow-graphs") {
+        return Promise.resolve({
+          system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
+          entrypoint,
+          nodes: [{
+            node_id: "n1", node_type: "function", qualified_name: "analyze_document",
+            path: "app.py", line_start: 5, line_end: 11, component_id: null,
+            is_external: false, boundary_kind: null, risk: "low", denylist_hit: null,
+            trace_count: 0, error_count: 0, observed: false,
+            evaluation_pass: 0, evaluation_fail: 0,
+            preview: {
+              recommended_mode: "trace", side_effect_risk: "low",
+              captured_data: [], redaction: [], replayability: "yes",
+              estimated_event_volume: "low", denylist_hit: null,
+            },
+          }],
+          edges: [],
+          candidate_paths: [{
+            flow_id: "f1", title: "Main path", node_count: 1, max_depth: 1,
+            confidence: 1, external_boundary_count: 0, unresolved_edge_count: 0,
+            node_ids: ["n1"], observed_node_count: 0, unobserved_node_ids: ["n1"],
+          }],
+          diagnostics: [], truncated: false,
+        });
+      }
+      if (path === "/repository/probe-plans/from-flow") {
+        return Promise.resolve({ id: 55, feature_id: "flow-derived", objective: "", probe_points: [] });
+      }
+      return Promise.resolve(null);
+    });
+
+    await renderFlowExplorerAt("/flow-explorer?capability=doc-analysis");
+
+    fireEvent.click(await screen.findByText("POST /documents/analyze"));
+    fireEvent.click(await screen.findByText("analyze_document"));
+    fireEvent.click(await screen.findByText("Create Probe Plan draft"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/repository/probe-plans/from-flow",
+        expect.any(Object),
+      );
+    });
+  });
+});
+
+describe("Probe Planner capability back link (Issue #176)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("shows a back link to the capability when ?capability= is present", async () => {
+    mockTwoPlans();
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/probe-planner?capability=doc-analysis"]}>
+          <ProbePlannerPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const back = await screen.findByTestId("back-to-capability");
+    expect(back).toHaveAttribute("href", "/capability-map?capability=doc-analysis");
+  });
+
+  test("does not show a back link without ?capability=", async () => {
+    mockTwoPlans();
+    await renderProbePlannerAt("/probe-planner");
+
+    await screen.findByText("Feature: feat-1");
+    expect(screen.queryByTestId("back-to-capability")).not.toBeInTheDocument();
   });
 });
 
@@ -2414,6 +2609,97 @@ describe("Flow Explorer auto-select from URL (Issue #62)", () => {
         entrypoint_id: "POST:/documents/analyze",
       });
     });
+  });
+});
+
+// ── Context Header tests (Issue #178) ───────────────────────────────
+
+describe("Context Header", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+    mockSystems = [{ id: 1, name: "probe-agent" }];
+  });
+
+  function renderWithParams(route: string) {
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    return import("@/components/layout/context-header").then(({ ContextHeader }) =>
+      render(
+        <QueryClientProvider client={qc}>
+          <MemoryRouter initialEntries={[route]}>
+            <ContextHeader />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      ),
+    );
+  }
+
+  test("shows system, snapshot, capability, entrypoint and status when available", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/status") {
+        return Promise.resolve({
+          configured: true, repo_path: "/repos/a", current_head: "abc1234567",
+          head_error: null, working_tree_dirty: false, dirty_file_count: 0,
+          dirty_sample: [], latest_snapshot: null, latest_indexed_snapshot: null,
+          understanding_snapshot_id: null, understanding_status: null,
+          snapshot_stale: false, symbols_stale: false, next_actions: [],
+        });
+      }
+      if (path === "/repository/system-understanding") {
+        return Promise.resolve({
+          system_id: 1, snapshot_id: 5, commit_sha: "abc1234567",
+          pipeline: [
+            { step: "symbols_indexed", status: "complete", detail: null },
+            { step: "entrypoints_discovered", status: "complete", detail: null },
+          ],
+          purpose: null, capabilities: [], entrypoints: [], major_symbols: [],
+          gaps: [{}, {}, {}], gap_summary: [], metadata_coverage: null,
+          next_actions: [],
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    await renderWithParams(
+      "/flow-explorer?capability=doc-analysis&entrypoint_type=http_route&entrypoint_id=GET%3A%2Fflow",
+    );
+
+    expect(await screen.findByTestId("context-header")).toBeInTheDocument();
+    expect(screen.getByTestId("context-header-system")).toHaveTextContent("probe-agent");
+    expect(screen.getByTestId("context-header-snapshot")).toHaveTextContent("abc12345");
+    expect(screen.getByTestId("context-header-capability")).toHaveTextContent("doc-analysis");
+    expect(screen.getByTestId("context-header-entrypoint")).toHaveTextContent("http_route: GET:/flow");
+    expect(screen.getByTestId("context-header-status")).toHaveTextContent(
+      "symbols indexed, entrypoints discovered, 3 gaps",
+    );
+  });
+
+  test("omits missing fields instead of showing empty labels", async () => {
+    mockApi.get.mockResolvedValue(null);
+
+    await renderWithParams("/flow-explorer");
+
+    // System name still resolves from the auth context even with no repo data.
+    expect(await screen.findByTestId("context-header")).toBeInTheDocument();
+    expect(screen.getByTestId("context-header-system")).toBeInTheDocument();
+    expect(screen.queryByTestId("context-header-snapshot")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("context-header-capability")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("context-header-entrypoint")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("context-header-status")).not.toBeInTheDocument();
+  });
+
+  test("renders nothing when no data or params are available at all", async () => {
+    mockSystems = [];
+    mockApi.get.mockResolvedValue(null);
+
+    await renderWithParams("/flow-explorer");
+
+    await waitFor(() => {
+      expect(mockApi.get).toHaveBeenCalled();
+    });
+    expect(screen.queryByTestId("context-header")).not.toBeInTheDocument();
   });
 });
 
