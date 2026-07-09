@@ -6,7 +6,7 @@ import {
   useCapabilityHierarchy, useCapabilityHierarchyDrift,
   useGenerateCapabilityHierarchy, useRequestExplanationRefresh,
   useLatestSnapshot, useSymbols, useLatestDrafts,
-  useSystemUnderstanding, useApiRoleCards, useCodeLinks,
+  useApiRoleCards, useCodeLinks, useCapabilityContext,
 } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button, buttonVariants } from "@/components/ui/button";
@@ -16,7 +16,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import {
   Map as MapIcon, Sparkles, Workflow, RefreshCw, Link2,
   Target, Boxes, Layers, Server, ChevronRight, AlertTriangle,
-  CheckCircle2, Circle, MessageSquareText,
+  CheckCircle2, Circle, MessageSquareText, Crosshair, FlaskConical,
 } from "lucide-react";
 import type {
   CapabilityOut, CapabilityElementOut,
@@ -129,19 +129,17 @@ function DetailsPanel({
 }) {
   const refresh = useRequestExplanationRefresh();
   const [proposal, setProposal] = useState<ExplanationRefreshOut | null>(null);
-  const { data: understanding } = useSystemUnderstanding();
   const { data: roleCardsData } = useApiRoleCards();
   const { data: codeLinksData } = useCodeLinks();
 
   const data = selected.data;
   const provenance = data.provenance;
 
-  const relatedGaps = useMemo(() => {
-    if (!understanding?.gaps) return [];
-    const capName = selected.kind === "capability" ? data.name : null;
-    if (!capName) return [];
-    return understanding.gaps.filter((g) => g.capability_key === capName);
-  }, [understanding?.gaps, selected.kind, data.name]);
+  const capabilityKey = selected.kind === "capability"
+    ? (selected.data.capability_key ?? null)
+    : null;
+  const { data: capabilityContext } = useCapabilityContext(capabilityKey);
+
   const drift = driftByNode.get(data.id);
   const reviewRecommended = drift ? REVIEW_STATUSES.includes(drift.status) : false;
   const entrypointType = provenance.entrypoint_type;
@@ -366,16 +364,56 @@ function DetailsPanel({
           );
         })()}
 
-        {relatedGaps.length > 0 && (
-          <div className="pt-2 space-y-1.5" data-testid="related-gaps">
-            <p className="text-[11px] font-medium text-muted-foreground">Related gaps</p>
-            {relatedGaps.map((g, i) => (
-              <div key={i} className="flex items-center gap-1.5 text-[11px]">
-                <AlertTriangle className="h-3 w-3 text-yellow-600 shrink-0" />
-                <span>{g.title ?? g.node_name ?? g.gap_type}</span>
+        {selected.kind === "capability" && capabilityContext && (
+          <>
+            {capabilityContext.gaps.length > 0 && (
+              <div className="pt-2 space-y-1.5" data-testid="capability-gaps">
+                <p className="text-[11px] font-medium text-muted-foreground">Gaps</p>
+                {capabilityContext.gaps.map((g, i) => (
+                  <Link
+                    key={i}
+                    to="/system-understanding"
+                    className="flex items-center gap-1.5 text-[11px] text-primary hover:underline"
+                  >
+                    <AlertTriangle className="h-3 w-3 text-yellow-600 shrink-0" />
+                    <span>{g.title ?? g.node_name ?? g.gap_type}</span>
+                  </Link>
+                ))}
               </div>
-            ))}
-          </div>
+            )}
+            {capabilityContext.probe_plans.length > 0 && (
+              <div className="pt-2 space-y-1.5" data-testid="capability-probe-plans">
+                <p className="text-[11px] font-medium text-muted-foreground">Probe Plans</p>
+                {capabilityContext.probe_plans.map((plan) => (
+                  <Link
+                    key={plan.id}
+                    to={`/probe-planner?plan=${plan.id}`}
+                    className="flex items-center gap-1.5 text-[11px] text-primary hover:underline"
+                  >
+                    <Crosshair className="h-3 w-3 shrink-0" />
+                    <span>{plan.feature_id}</span>
+                    <Badge variant="outline" className="text-[10px]">{plan.status}</Badge>
+                  </Link>
+                ))}
+              </div>
+            )}
+            {capabilityContext.experiments.length > 0 && (
+              <div className="pt-2 space-y-1.5" data-testid="capability-experiments">
+                <p className="text-[11px] font-medium text-muted-foreground">Experiments</p>
+                {capabilityContext.experiments.map((exp) => (
+                  <Link
+                    key={exp.id}
+                    to="/experiments"
+                    className="flex items-center gap-1.5 text-[11px] text-primary hover:underline"
+                  >
+                    <FlaskConical className="h-3 w-3 shrink-0" />
+                    <span>{exp.feature_id}</span>
+                    <Badge variant="outline" className="text-[10px]">{exp.human_decision}</Badge>
+                  </Link>
+                ))}
+              </div>
+            )}
+          </>
         )}
       </CardContent>
     </Card>

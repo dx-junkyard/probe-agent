@@ -2904,6 +2904,41 @@ class SystemUnderstandingOut(BaseModel):
     next_actions: List[SystemUnderstandingNextActionOut] = Field(default_factory=list)
 
 
+class CapabilityContextProbePlanOut(BaseModel):
+    """Issue #175: lightweight Probe Plan reference for the capability context API."""
+
+    id: int
+    feature_id: str
+    objective: str
+    status: ProbePlanStatus
+    created_at: float
+    updated_at: float
+
+
+class CapabilityContextExperimentOut(BaseModel):
+    """Issue #175: lightweight Experiment reference, with decision state, for the
+    capability context API."""
+
+    id: int
+    feature_id: str
+    objective: str
+    status: str
+    human_decision: str
+    human_decision_variant_key: Optional[str] = None
+    created_at: float
+
+
+class CapabilityContextOut(BaseModel):
+    """Issue #175: gaps / probe plans / experiments explicitly linked to one
+    capability_key, for the Capability detail panel. Every item here is joined
+    by an exact key match (capability_key or feature_id) — never a guess."""
+
+    capability_key: str
+    gaps: List[SystemUnderstandingGapOut] = Field(default_factory=list)
+    probe_plans: List[CapabilityContextProbePlanOut] = Field(default_factory=list)
+    experiments: List[CapabilityContextExperimentOut] = Field(default_factory=list)
+
+
 class SystemUnderstandingBuildStepOut(BaseModel):
     """One orchestrated step of a System Understanding build job (Issue #109)."""
 

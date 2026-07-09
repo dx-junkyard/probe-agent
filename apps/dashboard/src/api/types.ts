@@ -1860,6 +1860,35 @@ export interface SystemUnderstandingOut {
   next_actions: SystemUnderstandingNextAction[];
 }
 
+// Capability context: gaps / probe plans / experiments linked to one
+// capability_key by exact key match only (Issue #175).
+
+export interface CapabilityContextProbePlanOut {
+  id: number;
+  feature_id: string;
+  objective: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CapabilityContextExperimentOut {
+  id: number;
+  feature_id: string;
+  objective: string;
+  status: string;
+  human_decision: string;
+  human_decision_variant_key: string | null;
+  created_at: string;
+}
+
+export interface CapabilityContextOut {
+  capability_key: string;
+  gaps: SystemUnderstandingGap[];
+  probe_plans: CapabilityContextProbePlanOut[];
+  experiments: CapabilityContextExperimentOut[];
+}
+
 // System Understanding build job orchestration (Issue #109)
 
 export interface SystemUnderstandingBuildStep {
