@@ -40,6 +40,37 @@ mapping, planning, and interpretation must call a reasoning model through the
 provider-neutral LLM layer. Do not reuse `app/evaluator.py` as a heuristic
 fallback for intelligence work.
 
+## System State Assessment (issue #193)
+
+- `GET /system-state` (`app/system_state.py`, `routes/system_state.py`)
+  returns the normalized, deterministic, LLM-free state model: a list of
+  `StateItem` (`state_id`, `state_group`, `severity`, `status`,
+  `user_action_kind`, `intervention_timing`, `subject`, `summary`, `detail`,
+  `impact`, `remediation`, `evidence`, `target_ui`, `related_checks`,
+  `related_pipeline_steps`) plus `overall_severity` / `severity_counts`.
+  Phase 1 scope: snapshot readiness, an in-progress interview session pinned
+  to a stale snapshot, System Purpose / Core Capabilities state, and the
+  symbol/entrypoint/documentation/capability-hierarchy pipeline steps.
+- `system_state.py` is the single home for the System Purpose / Core
+  Capabilities baseline-reuse and diff-impact logic
+  (`evaluate_understanding`, `understanding_baseline`,
+  `baseline_diff_impact`). `system_diagnostics._check_system_purpose` /
+  `_check_system_capabilities` call `evaluate_understanding` to build their
+  `DiagnosticCheck` text — do not re-implement baseline/diff logic in
+  `system_diagnostics.py`; extend `system_state.py` instead so Diagnostics
+  and the Assistant screen context (which reads diagnostics checks) keep
+  sharing one evidence source.
+- Deterministic only (Principle 6): no reasoning-model call, derived solely
+  from persisted DB rows for the latest ready snapshot. A missing/blocked
+  state is represented explicitly (e.g. `understanding.purpose.missing_baseline`,
+  `pipeline.capability_hierarchy.blocked_by_reasoning`) rather than guessed.
+- `GET /system-diagnostics` stays backward compatible; it is a projection
+  built on top of `system_state.py`, not replaced by it.
+- Later phases (not yet implemented): projecting `next_actions` and
+  Dashboard page callouts/toasts from the same state items, and covering
+  the `runtime` / `proposal` / `interview` (beyond the one stale-snapshot
+  item) state groups.
+
 ## System settings diagnostics (issue #101)
 
 - `GET /system-diagnostics` (`app/system_diagnostics.py`, `routes/diagnostics.py`)
