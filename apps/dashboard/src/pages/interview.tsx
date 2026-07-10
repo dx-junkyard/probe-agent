@@ -1042,7 +1042,7 @@ export default function InterviewPage() {
 
   const nextActionText = useMemo(() => {
     if (canConfirmStructuredUnderstanding) {
-      return "表示されているシステム理解を確認し、問題なければ「この理解を確認済みにする」を押してください。";
+      return "右側の「現在の理解」パネルに表示されているシステム理解を確認し、問題なければ確認済みにしてください。";
     }
     switch (uiState) {
       case "preparing":
@@ -1508,19 +1508,26 @@ export default function InterviewPage() {
                         </div>
                       )}
                       {(zeroBaseComplete || canConfirmStructuredUnderstanding) && (
-                        <Button
-                          size="sm"
-                          onClick={doConfirmUnderstanding}
-                          disabled={confirmUnderstanding.isPending}
-                          data-testid="confirm-understanding"
-                        >
-                          <CheckCircle className="h-4 w-4 mr-1" />
-                          {confirmUnderstanding.isPending
-                            ? "確定中..."
-                            : zeroBaseComplete
-                              ? "この内容で提案生成に進む"
-                              : "この理解を確認済みにする"}
-                        </Button>
+                        <div className="space-y-1">
+                          {canConfirmStructuredUnderstanding && (
+                            <p className="text-xs text-muted-foreground">
+                              対象: 右側の「現在の理解」パネルに表示されているシステム理解
+                            </p>
+                          )}
+                          <Button
+                            size="sm"
+                            onClick={doConfirmUnderstanding}
+                            disabled={confirmUnderstanding.isPending}
+                            data-testid="confirm-understanding"
+                          >
+                            <CheckCircle className="h-4 w-4 mr-1" />
+                            {confirmUnderstanding.isPending
+                              ? "確定中..."
+                              : zeroBaseComplete
+                                ? "この内容で提案生成に進む"
+                                : "現在の理解を確認済みにする"}
+                          </Button>
+                        </div>
                       )}
                       <Textarea
                         ref={messageInputRef}

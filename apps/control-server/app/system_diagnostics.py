@@ -42,6 +42,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from . import system_state
 from .db import get_conn
 from .llm import PROVIDER_KEY_ENV, is_reasoning_model
 
@@ -67,13 +68,6 @@ ANCHOR_SNAPSHOT_CREATE = "snapshot-create"
 ANCHOR_BUILD = "build"
 ANCHOR_INTERVIEW_PURPOSE = "interview-purpose"
 ANCHOR_INTERVIEW_CAPABILITIES = "interview-capabilities"
-
-DOC_PATH_SUFFIXES = (
-    ".md", ".mdx", ".rst", ".txt", ".adoc",
-)
-DOC_PATH_MARKERS = (
-    "readme", "architecture", "design", "spec", "docs/", "doc/",
-)
 
 KNOWN_PROVIDERS = {"openai", "anthropic", "gemini", "mock"}
 
@@ -131,20 +125,6 @@ class SystemDiagnosticsReport:
     overall_severity: str
     severity_counts: Dict[str, int]
     checks: List[DiagnosticCheck] = field(default_factory=list)
-
-
-@dataclass
-class UnderstandingBaseline:
-    snapshot_id: int
-    source: str  # interview | hierarchy | draft
-    purpose_count: int = 0
-    capability_count: int = 0
-
-
-@dataclass
-class UnderstandingDiffImpact:
-    status: str  # unchanged | directly_impacted | possibly_impacted
-    reasons: List[str] = field(default_factory=list)
 
 
 def _worst_severity(severities: List[str]) -> str:
@@ -865,310 +845,29 @@ def _check_last_reasoning_run(conn, system_id: int) -> DiagnosticCheck:
 
 
 def _latest_ready_snapshot_id(conn, system_id: int) -> Optional[int]:
-    row = conn.execute(
-        "SELECT id FROM repository_snapshots WHERE system_id = ? AND status = 'ready' "
-        "ORDER BY id DESC LIMIT 1",
-        (system_id,),
-    ).fetchone()
-    return row["id"] if row else None
+    return system_state.latest_ready_snapshot_id(conn, system_id)
 
 
-def _is_doc_path(path: str) -> bool:
-    lower = path.lower()
-    return lower.endswith(DOC_PATH_SUFFIXES) or any(m in lower for m in DOC_PATH_MARKERS)
-
-
-def _load_json_obj(raw: Optional[str]) -> Any:
-    if not raw:
-        return None
-    try:
-        return json.loads(raw)
-    except (TypeError, json.JSONDecodeError):
-        return None
-
-
-def _understanding_item_count(understanding: Any, key: str) -> int:
-    if not isinstance(understanding, dict):
-        return 0
-    items = understanding.get(key)
-    return len(items) if isinstance(items, list) else 0
-
-
-def _latest_interview_baseline(
-    conn,
-    system_id: int,
-    *,
-    needs_purpose: bool,
-    needs_capabilities: bool,
-) -> Optional[UnderstandingBaseline]:
-    rows = conn.execute(
-        """
-        SELECT snapshot_id, current_understanding
-          FROM interview_session
-         WHERE system_id = ?
-           AND understanding_confirmed_at IS NOT NULL
-           AND current_understanding IS NOT NULL
-         ORDER BY understanding_confirmed_at DESC, id DESC
-        """,
-        (system_id,),
-    ).fetchall()
-    for row in rows:
-        understanding = _load_json_obj(row["current_understanding"])
-        purpose_count = _understanding_item_count(understanding, "system_purpose")
-        capability_count = _understanding_item_count(understanding, "core_capabilities")
-        if needs_purpose and purpose_count == 0:
-            continue
-        if needs_capabilities and capability_count == 0:
-            continue
-        return UnderstandingBaseline(
-            snapshot_id=row["snapshot_id"],
-            source="interview",
-            purpose_count=purpose_count,
-            capability_count=capability_count,
-        )
-    return None
-
-
-def _latest_unconfirmed_interview_understanding(
-    conn,
-    system_id: int,
-    *,
-    needs_purpose: bool,
-    needs_capabilities: bool,
-) -> Optional[UnderstandingBaseline]:
-    rows = conn.execute(
-        """
-        SELECT snapshot_id, current_understanding
-          FROM interview_session
-         WHERE system_id = ?
-           AND understanding_confirmed_at IS NULL
-           AND current_understanding IS NOT NULL
-         ORDER BY updated_at DESC, id DESC
-        """,
-        (system_id,),
-    ).fetchall()
-    for row in rows:
-        understanding = _load_json_obj(row["current_understanding"])
-        purpose_count = _understanding_item_count(understanding, "system_purpose")
-        capability_count = _understanding_item_count(understanding, "core_capabilities")
-        if needs_purpose and purpose_count == 0:
-            continue
-        if needs_capabilities and capability_count == 0:
-            continue
-        return UnderstandingBaseline(
-            snapshot_id=row["snapshot_id"],
-            source="interview_unconfirmed",
-            purpose_count=purpose_count,
-            capability_count=capability_count,
-        )
-    return None
-
-
-def _latest_hierarchy_baseline(
-    conn,
-    system_id: int,
-    *,
-    needs_purpose: bool,
-    needs_capabilities: bool,
-) -> Optional[UnderstandingBaseline]:
-    rows = conn.execute(
-        """
-        SELECT snapshot_id,
-               SUM(CASE WHEN node_type = 'purpose' THEN 1 ELSE 0 END) AS purpose_count,
-               SUM(CASE WHEN node_type = 'capability' THEN 1 ELSE 0 END) AS capability_count
-          FROM capability_hierarchy_nodes
-         WHERE system_id = ?
-         GROUP BY snapshot_id
-         ORDER BY snapshot_id DESC
-        """,
-        (system_id,),
-    ).fetchall()
-    for row in rows:
-        purpose_count = int(row["purpose_count"] or 0)
-        capability_count = int(row["capability_count"] or 0)
-        if needs_purpose and purpose_count == 0:
-            continue
-        if needs_capabilities and capability_count == 0:
-            continue
-        return UnderstandingBaseline(
-            snapshot_id=row["snapshot_id"],
-            source="hierarchy",
-            purpose_count=purpose_count,
-            capability_count=capability_count,
-        )
-    return None
-
-
-def _latest_draft_baseline(conn, system_id: int) -> Optional[UnderstandingBaseline]:
-    row = conn.execute(
-        """
-        SELECT snapshot_id
-          FROM system_profile_drafts
-         WHERE system_id = ? AND (name <> '' OR purpose <> '')
-         ORDER BY id DESC
-         LIMIT 1
-        """,
-        (system_id,),
-    ).fetchone()
-    if not row:
-        return None
-    return UnderstandingBaseline(
-        snapshot_id=row["snapshot_id"],
-        source="draft",
-        purpose_count=1,
-        capability_count=0,
+def _no_ready_snapshot_check(base: dict) -> DiagnosticCheck:
+    """Blocked result shared by every pipeline check when no snapshot is ready."""
+    payload = {k: v for k, v in base.items() if k != "snapshot_id"}
+    return DiagnosticCheck(
+        severity="blocked",
+        detail="ready な snapshot がないため、このステップは実行できません。",
+        impact="snapshot が作成されるまでこのステップは未実行のままです。",
+        remediation="まず Repository タブから snapshot を作成してください。",
+        fix_kind=FIX_KIND_NAVIGATE,
+        fix_page=PAGE_REPOSITORY,
+        fix_anchor=ANCHOR_SNAPSHOT_CREATE,
+        **payload,
     )
-
-
-def _understanding_baseline(
-    conn,
-    system_id: int,
-    *,
-    needs_purpose: bool = False,
-    needs_capabilities: bool = False,
-) -> Optional[UnderstandingBaseline]:
-    """Latest confirmed or generated understanding reusable across snapshots."""
-    baseline = _latest_interview_baseline(
-        conn, system_id,
-        needs_purpose=needs_purpose,
-        needs_capabilities=needs_capabilities,
-    )
-    if baseline:
-        return baseline
-    baseline = _latest_hierarchy_baseline(
-        conn, system_id,
-        needs_purpose=needs_purpose,
-        needs_capabilities=needs_capabilities,
-    )
-    if baseline:
-        return baseline
-    if needs_purpose and not needs_capabilities:
-        return _latest_draft_baseline(conn, system_id)
-    return None
-
-
-def _snapshot_file_hashes(conn, snapshot_id: int) -> Dict[str, Optional[str]]:
-    rows = conn.execute(
-        "SELECT path, content_hash FROM snapshot_files WHERE snapshot_id = ?",
-        (snapshot_id,),
-    ).fetchall()
-    return {row["path"]: row["content_hash"] for row in rows}
-
-
-def _metadata_facts(conn, snapshot_id: int) -> Dict[tuple, tuple]:
-    rows = conn.execute(
-        """
-        SELECT path, qualified_name, role, capability, system_purpose,
-               consumers, raw_block, explanation_hash
-          FROM symbol_source_metadata
-         WHERE snapshot_id = ?
-        """,
-        (snapshot_id,),
-    ).fetchall()
-    facts: Dict[tuple, tuple] = {}
-    for row in rows:
-        facts[(row["path"], row["qualified_name"])] = (
-            row["role"] or "",
-            row["capability"] or "",
-            row["system_purpose"] or "",
-            row["consumers"] or "[]",
-            row["raw_block"] or "",
-            row["explanation_hash"] or "",
-        )
-    return facts
-
-
-def _entrypoint_facts(conn, snapshot_id: int) -> Dict[tuple, tuple]:
-    rows = conn.execute(
-        """
-        SELECT entrypoint_type, entrypoint_id, handler_path,
-               handler_qualified_name, route_method, route_path
-          FROM code_entrypoints
-         WHERE snapshot_id = ?
-        """,
-        (snapshot_id,),
-    ).fetchall()
-    facts: Dict[tuple, tuple] = {}
-    for row in rows:
-        facts[(row["entrypoint_type"], row["entrypoint_id"])] = (
-            row["handler_path"] or "",
-            row["handler_qualified_name"] or "",
-            row["route_method"] or "",
-            row["route_path"] or "",
-        )
-    return facts
-
-
-def _changed_keys(base: Dict[Any, Any], target: Dict[Any, Any]) -> tuple[set, set, set]:
-    base_keys = set(base)
-    target_keys = set(target)
-    added = target_keys - base_keys
-    removed = base_keys - target_keys
-    changed = {k for k in base_keys & target_keys if base[k] != target[k]}
-    return added, removed, changed
-
-
-def _baseline_diff_impact(
-    conn,
-    baseline: UnderstandingBaseline,
-    snapshot_id: int,
-    *,
-    for_capabilities: bool,
-) -> UnderstandingDiffImpact:
-    if baseline.snapshot_id == snapshot_id:
-        return UnderstandingDiffImpact(status="unchanged")
-
-    base_files = _snapshot_file_hashes(conn, baseline.snapshot_id)
-    target_files = _snapshot_file_hashes(conn, snapshot_id)
-    added_paths, removed_paths, changed_paths = _changed_keys(base_files, target_files)
-    doc_paths = sorted(p for p in added_paths | removed_paths | changed_paths if _is_doc_path(str(p)))
-    if doc_paths:
-        sample = ", ".join(doc_paths[:3])
-        suffix = " など" if len(doc_paths) > 3 else ""
-        return UnderstandingDiffImpact(
-            status="directly_impacted",
-            reasons=[f"理解の根拠になりやすいドキュメントが変更されています: {sample}{suffix}。"],
-        )
-
-    base_meta = _metadata_facts(conn, baseline.snapshot_id)
-    target_meta = _metadata_facts(conn, snapshot_id)
-    added_meta, removed_meta, changed_meta = _changed_keys(base_meta, target_meta)
-    metadata_delta = added_meta | removed_meta | changed_meta
-    if metadata_delta:
-        sample_key = sorted(metadata_delta)[0]
-        return UnderstandingDiffImpact(
-            status="directly_impacted",
-            reasons=[
-                "source metadata（system_purpose / capability / role など）が変更されています: "
-                f"{sample_key[0]}:{sample_key[1]}。"
-            ],
-        )
-
-    if for_capabilities:
-        base_entrypoints = _entrypoint_facts(conn, baseline.snapshot_id)
-        target_entrypoints = _entrypoint_facts(conn, snapshot_id)
-        added_eps, removed_eps, changed_eps = _changed_keys(base_entrypoints, target_entrypoints)
-        if added_eps or removed_eps or changed_eps:
-            parts = []
-            if added_eps:
-                parts.append(f"追加 {len(added_eps)} 件")
-            if removed_eps:
-                parts.append(f"削除 {len(removed_eps)} 件")
-            if changed_eps:
-                parts.append(f"変更 {len(changed_eps)} 件")
-            return UnderstandingDiffImpact(
-                status="possibly_impacted",
-                reasons=[f"entrypoint に差分があります（{', '.join(parts)}）。主要機能に含めるか確認してください。"],
-            )
-
-    return UnderstandingDiffImpact(status="unchanged")
 
 
 def _baseline_ok_check(
     *,
     base: dict,
-    baseline: UnderstandingBaseline,
-    impact: UnderstandingDiffImpact,
+    baseline: "system_state.UnderstandingBaseline",
+    impact: "system_state.UnderstandingDiffImpact",
     purpose: bool,
 ) -> DiagnosticCheck:
     label = "System Purpose" if purpose else "Core Capability"
@@ -1194,8 +893,8 @@ def _baseline_ok_check(
 def _baseline_impacted_check(
     *,
     base: dict,
-    baseline: UnderstandingBaseline,
-    impact: UnderstandingDiffImpact,
+    baseline: "system_state.UnderstandingBaseline",
+    impact: "system_state.UnderstandingDiffImpact",
     purpose: bool,
 ) -> DiagnosticCheck:
     target = "System Purpose" if purpose else "Core Capabilities"
@@ -1224,7 +923,7 @@ def _baseline_impacted_check(
 def _unconfirmed_understanding_check(
     *,
     base: dict,
-    baseline: UnderstandingBaseline,
+    baseline: "system_state.UnderstandingBaseline",
     purpose: bool,
 ) -> DiagnosticCheck:
     target = "System Purpose" if purpose else "Core Capabilities"
@@ -1250,27 +949,18 @@ def _unconfirmed_understanding_check(
     )
 
 
-def _no_ready_snapshot_check(base: dict) -> DiagnosticCheck:
-    """Blocked result shared by every pipeline check when no snapshot is ready."""
-    payload = {k: v for k, v in base.items() if k != "snapshot_id"}
-    return DiagnosticCheck(
-        severity="blocked",
-        detail="ready な snapshot がないため、このステップは実行できません。",
-        impact="snapshot が作成されるまでこのステップは未実行のままです。",
-        remediation="まず Repository タブから snapshot を作成してください。",
-        fix_kind=FIX_KIND_NAVIGATE,
-        fix_page=PAGE_REPOSITORY,
-        fix_anchor=ANCHOR_SNAPSHOT_CREATE,
-        **payload,
-    )
-
-
 def _check_system_purpose(conn, system_id: int, snapshot_id: Optional[int]) -> DiagnosticCheck:
     """Issue #120: System Purpose is a prerequisite for probe design, flow
 
     exploration, and improvement proposals matching user intent, not just a
     blank field on a page — so it is tracked here alongside required
     settings, and its remediation is prioritized ahead of ``llm_last_run``.
+
+    Issue #193: the branch classification (satisfied / baseline_reusable /
+    diff_impacted / unconfirmed / missing_baseline) comes from
+    ``system_state.evaluate_understanding`` so this check and the System
+    State Assessment layer agree on the same evidence; only the Japanese
+    text stays here for backward-compatible ``/system-diagnostics`` output.
     """
     base = dict(
         check_id="system_purpose",
@@ -1282,20 +972,8 @@ def _check_system_purpose(conn, system_id: int, snapshot_id: Optional[int]) -> D
     )
     if snapshot_id is None:
         return _no_ready_snapshot_check(base)
-    node = conn.execute(
-        "SELECT name, summary FROM capability_hierarchy_nodes "
-        "WHERE system_id = ? AND snapshot_id = ? AND node_type = 'purpose' LIMIT 1",
-        (system_id, snapshot_id),
-    ).fetchone()
-    draft = conn.execute(
-        "SELECT name, purpose FROM system_profile_drafts "
-        "WHERE system_id = ? AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
-        (system_id, snapshot_id),
-    ).fetchone()
-    defined = (node is not None and (node["name"] or node["summary"])) or (
-        draft is not None and (draft["name"] or draft["purpose"])
-    )
-    if defined:
+    status = system_state.evaluate_understanding(conn, system_id, snapshot_id, purpose=True)
+    if status.kind == "satisfied_current":
         return DiagnosticCheck(
             severity="ok",
             detail="System Purpose が定義されています。",
@@ -1303,25 +981,12 @@ def _check_system_purpose(conn, system_id: int, snapshot_id: Optional[int]) -> D
             remediation="",
             **{k: v for k, v in base.items() if k != "snapshot_id"},
         )
-    baseline = _understanding_baseline(conn, system_id, needs_purpose=True)
-    if baseline:
-        impact = _baseline_diff_impact(
-            conn, baseline, snapshot_id, for_capabilities=False,
-        )
-        if impact.status == "unchanged":
-            return _baseline_ok_check(
-                base=base, baseline=baseline, impact=impact, purpose=True,
-            )
-        return _baseline_impacted_check(
-            base=base, baseline=baseline, impact=impact, purpose=True,
-        )
-    unconfirmed = _latest_unconfirmed_interview_understanding(
-        conn, system_id, needs_purpose=True, needs_capabilities=False,
-    )
-    if unconfirmed:
-        return _unconfirmed_understanding_check(
-            base=base, baseline=unconfirmed, purpose=True,
-        )
+    if status.kind == "baseline_reusable":
+        return _baseline_ok_check(base=base, baseline=status.baseline, impact=status.impact, purpose=True)
+    if status.kind == "diff_impacted":
+        return _baseline_impacted_check(base=base, baseline=status.baseline, impact=status.impact, purpose=True)
+    if status.kind == "unconfirmed":
+        return _unconfirmed_understanding_check(base=base, baseline=status.baseline, purpose=True)
     return DiagnosticCheck(
         severity="warning",
         detail=(
@@ -1345,6 +1010,9 @@ def _check_system_capabilities(conn, system_id: int, snapshot_id: Optional[int])
 
     prerequisite for probe/flow/improvement work, tracked the same way as
     System Purpose above.
+
+    Issue #193: see ``_check_system_purpose`` — branch classification comes
+    from ``system_state.evaluate_understanding``.
     """
     base = dict(
         check_id="system_capabilities",
@@ -1356,38 +1024,21 @@ def _check_system_capabilities(conn, system_id: int, snapshot_id: Optional[int])
     )
     if snapshot_id is None:
         return _no_ready_snapshot_check(base)
-    count = conn.execute(
-        "SELECT COUNT(*) FROM capability_hierarchy_nodes "
-        "WHERE system_id = ? AND snapshot_id = ? AND node_type = 'capability'",
-        (system_id, snapshot_id),
-    ).fetchone()[0]
-    if count > 0:
+    status = system_state.evaluate_understanding(conn, system_id, snapshot_id, purpose=False)
+    if status.kind == "satisfied_current":
         return DiagnosticCheck(
             severity="ok",
-            detail=f"{count} 件の Core Capability が定義されています。",
+            detail=f"{status.count} 件の Core Capability が定義されています。",
             impact="",
             remediation="",
             **{k: v for k, v in base.items() if k != "snapshot_id"},
         )
-    baseline = _understanding_baseline(conn, system_id, needs_capabilities=True)
-    if baseline:
-        impact = _baseline_diff_impact(
-            conn, baseline, snapshot_id, for_capabilities=True,
-        )
-        if impact.status == "unchanged":
-            return _baseline_ok_check(
-                base=base, baseline=baseline, impact=impact, purpose=False,
-            )
-        return _baseline_impacted_check(
-            base=base, baseline=baseline, impact=impact, purpose=False,
-        )
-    unconfirmed = _latest_unconfirmed_interview_understanding(
-        conn, system_id, needs_purpose=False, needs_capabilities=True,
-    )
-    if unconfirmed:
-        return _unconfirmed_understanding_check(
-            base=base, baseline=unconfirmed, purpose=False,
-        )
+    if status.kind == "baseline_reusable":
+        return _baseline_ok_check(base=base, baseline=status.baseline, impact=status.impact, purpose=False)
+    if status.kind == "diff_impacted":
+        return _baseline_impacted_check(base=base, baseline=status.baseline, impact=status.impact, purpose=False)
+    if status.kind == "unconfirmed":
+        return _unconfirmed_understanding_check(base=base, baseline=status.baseline, purpose=False)
     return DiagnosticCheck(
         severity="warning",
         detail="対象システムの主な機能（Core Capabilities）が未定義・空です。",

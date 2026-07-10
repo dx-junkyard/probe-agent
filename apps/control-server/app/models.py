@@ -3207,6 +3207,60 @@ class AssistantAskRequest(BaseModel):
     visible_check_ids: List[str] = Field(default_factory=list, max_length=50)
 
 
+# ---------------------------------------------------------------------------
+# System State Assessment (Issue #193)
+# ---------------------------------------------------------------------------
+
+StateSeverity = Literal["ok", "info", "warning", "blocked", "error"]
+StateStatus = Literal[
+    "satisfied", "missing", "unconfirmed", "stale", "impacted",
+    "blocked", "running", "failed", "ready",
+]
+StateUserActionKind = Literal[
+    "none", "configure", "create_snapshot", "build", "confirm",
+    "review", "rerun", "inspect", "wait",
+]
+StateInterventionTiming = Literal["now", "before_next_step", "optional", "after_build", "none"]
+StateGroup = Literal[
+    "repository", "snapshot", "pipeline", "understanding", "interview",
+    "runtime", "proposal", "configuration",
+]
+
+
+class SystemStateTargetUiOut(BaseModel):
+    route: str
+    anchor: Optional[str] = None
+    action_label: str = ""
+
+
+class SystemStateItemOut(BaseModel):
+    state_id: str
+    state_group: StateGroup
+    severity: StateSeverity
+    status: StateStatus
+    user_action_kind: StateUserActionKind
+    intervention_timing: StateInterventionTiming
+    subject: str
+    summary: str
+    detail: str
+    impact: str = ""
+    remediation: str = ""
+    evidence: Dict[str, Any] = Field(default_factory=dict)
+    target_ui: Optional[SystemStateTargetUiOut] = None
+    related_checks: List[str] = Field(default_factory=list)
+    related_pipeline_steps: List[str] = Field(default_factory=list)
+    # System State Assessment is deterministic and LLM-free (Issue #193 Phase 1).
+    decision_method: Literal["deterministic"] = "deterministic"
+
+
+class SystemStateAssessmentOut(BaseModel):
+    system_id: int
+    generated_at: float
+    overall_severity: StateSeverity
+    severity_counts: Dict[str, int] = Field(default_factory=dict)
+    items: List[SystemStateItemOut] = Field(default_factory=list)
+
+
 class AssistantActionOut(BaseModel):
     label: str
     kind: Literal["navigate", "configure", "operate"]
