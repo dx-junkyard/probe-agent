@@ -826,3 +826,95 @@ class TestCrossSnapshotChunkReuse:
         prov2 = steps2["claim_scan"]["artifact_provenance"]
         assert prov2["chunks_reused"] == 0
         assert len(scanned) == prov2["chunks_total"]
+
+    def test_shifted_unchanged_chunks_reused_with_remapped_evidence(
+        self, admin_client, tmp_path, monkeypatch
+    ):
+        """Byte-identical sections that moved to different line positions are
+        still reused across snapshots, and the reused claims' chunk_id and
+        evidence line ranges are remapped so they resolve against the new
+        pinned snapshot instead of pointing at the old positions (Issue #195)."""
+        token = _login(admin_client)
+        _, hdrs = _setup_repo(
+            admin_client, token, tmp_path, "job-cross-snap-shift-sys",
+            readme_text=THREE_SECTION_README,
+        )
+
+        import app.system_understanding_service as sus
+        import app.documentation_claim_scanner as scanner_module
+
+        monkeypatch.setattr(sus, "_is_reasoning_model_available", lambda: True)
+        scanned: list = []
+        monkeypatch.setattr(
+            scanner_module, "scan_chunk", self._tracking_scanner(scanner_module, scanned)
+        )
+
+        r1 = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        job1 = _wait_job(admin_client, hdrs, r1.json()["id"])
+        assert job1["status"] == "completed", job1
+        assert len(scanned) == 4, scanned
+
+        # Insert SectionZ before SectionA: SectionA/B/C keep byte-identical
+        # text but shift to later start lines (new chunk_ids).
+        scanned.clear()
+        repo = tmp_path / "repo"
+        (repo / "README.md").write_text(
+            "# Test Project\n\nOverview text.\n\n"
+            "## SectionZ\n\nSectionZ describes a brand-new intake capability "
+            "in detail.\n\n"
+            "## SectionA\n\nSectionA describes the ingestion capability in detail.\n\n"
+            "## SectionB\n\nSectionB describes the reporting capability in detail.\n\n"
+            "## SectionC\n\nSectionC describes the export capability in detail.\n"
+        )
+        subprocess.run(["git", "add", "."], cwd=str(repo), check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "insert section"],
+            cwd=str(repo), check=True, capture_output=True,
+        )
+        sha2 = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo), check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        snap2 = admin_client.post(
+            "/repository/snapshots", json={"commit_sha": sha2}, headers=hdrs
+        )
+        assert snap2.status_code == 201, snap2.text
+        snapshot2_id = snap2.json()["id"]
+
+        r2 = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        job2 = _wait_job(admin_client, hdrs, r2.json()["id"])
+        assert job2["status"] == "completed", job2
+        steps2 = _steps_by_name(job2)
+        prov2 = steps2["claim_scan"]["artifact_provenance"]
+
+        # Only the inserted SectionZ needed an LLM scan; the overview kept
+        # its position and the shifted SectionA/B/C were still reused.
+        assert len(scanned) == 1, scanned
+        assert prov2["chunks_total"] == 5
+        assert prov2["chunks_reused"] == 4
+
+        from app.db import get_conn
+        from app.documentation_indexer import build_documentation_index
+
+        with get_conn() as conn:
+            new_index = build_documentation_index(conn, job2["system_id"], snapshot2_id)
+            task_rows = conn.execute(
+                "SELECT result_json FROM system_understanding_llm_tasks "
+                "WHERE build_id = ? AND reused_existing = 1",
+                (job2["id"],),
+            ).fetchall()
+        chunks_by_id = {c.chunk_id: c for c in new_index.chunks}
+        assert len(task_rows) == 4
+        for row in task_rows:
+            result = scanner_module.ChunkScanResult.model_validate_json(row["result_json"])
+            chunk = chunks_by_id.get(result.chunk_id)
+            assert chunk is not None, (
+                f"reused chunk_id {result.chunk_id} not present in the new "
+                "snapshot's documentation index"
+            )
+            # The tracking scanner recorded the full chunk range as evidence,
+            # so remapped evidence must equal the chunk's *new* line range.
+            for claim in result.claims:
+                assert claim.evidence.path == chunk.path
+                assert claim.evidence.start_line == chunk.start_line
+                assert claim.evidence.end_line == chunk.end_line

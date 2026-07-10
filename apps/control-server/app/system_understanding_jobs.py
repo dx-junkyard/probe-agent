@@ -1060,17 +1060,18 @@ def _run_claim_scan(ctx: StepContext) -> Dict[str, Any]:
     now = time.time()
     max_attempts = _llm_max_attempts()
 
+    chunk_by_id = {c.chunk_id: c for c in chunks}
     with get_conn() as conn:
         for chunk in chunks:
             conn.execute(
                 """INSERT OR IGNORE INTO system_understanding_llm_tasks
                     (build_id, step_id, system_id, snapshot_id, task_type, chunk_id,
-                     chunk_content_hash, chunk_path, prompt_version, schema_version,
-                     max_attempts, created_at)
-                VALUES (?, ?, ?, ?, 'claim_scan_chunk', ?, ?, ?, ?, ?, ?, ?)""",
+                     chunk_content_hash, chunk_path, chunk_start_line,
+                     prompt_version, schema_version, max_attempts, created_at)
+                VALUES (?, ?, ?, ?, 'claim_scan_chunk', ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     ctx.build_id, ctx.step_id, ctx.system_id, ctx.snapshot_id,
-                    chunk.chunk_id, chunk.content_hash, chunk.path,
+                    chunk.chunk_id, chunk.content_hash, chunk.path, chunk.start_line,
                     scanner.PROMPT_VERSION, scanner.SCHEMA_VERSION,
                     max_attempts, now,
                 ),
@@ -1084,36 +1085,61 @@ def _run_claim_scan(ctx: StepContext) -> Dict[str, Any]:
         # chunk_id is not part of the match either (Issue #195 design note):
         # it is derived from path/start_line/heading and can shift when
         # unrelated content moves, while chunk_content_hash is stable for
-        # unchanged text. Deleted chunks never get a pending row for the
-        # current build in the first place (they are not in the current
-        # snapshot's documentation index), so they cannot be pulled into the
-        # graph via this reuse path.
-        conn.execute(
-            """UPDATE system_understanding_llm_tasks AS t
-               SET status = 'completed', reused_existing = 1, completed_at = ?,
-                   result_json = (
-                       SELECT p.result_json FROM system_understanding_llm_tasks p
-                       WHERE p.system_id = t.system_id
-                         AND p.chunk_content_hash = t.chunk_content_hash
-                         AND p.chunk_path = t.chunk_path
-                         AND p.prompt_version = t.prompt_version
-                         AND p.schema_version = t.schema_version
-                         AND p.status = 'completed' AND p.result_json IS NOT NULL
-                         AND p.build_id != t.build_id
-                       ORDER BY p.id DESC LIMIT 1
-                   )
-               WHERE t.build_id = ? AND t.status = 'pending' AND EXISTS (
-                   SELECT 1 FROM system_understanding_llm_tasks p
-                   WHERE p.system_id = t.system_id
-                     AND p.chunk_content_hash = t.chunk_content_hash
-                     AND p.chunk_path = t.chunk_path
-                     AND p.prompt_version = t.prompt_version
-                     AND p.schema_version = t.schema_version
-                     AND p.status = 'completed' AND p.result_json IS NOT NULL
-                     AND p.build_id != t.build_id
-               )""",
-            (now, ctx.build_id),
-        )
+        # unchanged text. Because result_json embeds absolute evidence line
+        # numbers and the source chunk_id, a reused result whose chunk moved
+        # is remapped by the start-line delta (a purely structural offset for
+        # byte-identical text) so evidence still resolves against the current
+        # snapshot. Deleted chunks never get a pending row for the current
+        # build in the first place (they are not in the current snapshot's
+        # documentation index), so they cannot be pulled into the graph via
+        # this reuse path.
+        reusable = conn.execute(
+            "SELECT id, chunk_id FROM system_understanding_llm_tasks "
+            "WHERE build_id = ? AND status = 'pending' ORDER BY id",
+            (ctx.build_id,),
+        ).fetchall()
+        for row in reusable:
+            chunk = chunk_by_id.get(row["chunk_id"])
+            if chunk is None:
+                continue
+            prev = conn.execute(
+                """SELECT result_json, chunk_id, chunk_start_line
+                   FROM system_understanding_llm_tasks
+                   WHERE system_id = ? AND chunk_content_hash = ? AND chunk_path = ?
+                     AND prompt_version = ? AND schema_version = ?
+                     AND status = 'completed' AND result_json IS NOT NULL
+                     AND build_id != ?
+                   ORDER BY id DESC LIMIT 1""",
+                (ctx.system_id, chunk.content_hash, chunk.path,
+                 scanner.PROMPT_VERSION, scanner.SCHEMA_VERSION, ctx.build_id),
+            ).fetchone()
+            if prev is None:
+                continue
+            if prev["chunk_start_line"] is None:
+                # Row predates chunk_start_line: without the original position
+                # the evidence lines can only be trusted when the chunk_id
+                # (path + start_line + heading) is unchanged.
+                if prev["chunk_id"] != chunk.chunk_id:
+                    continue
+                delta = 0
+            else:
+                delta = chunk.start_line - prev["chunk_start_line"]
+            try:
+                result = scanner.ChunkScanResult.model_validate_json(prev["result_json"])
+            except ValueError:
+                continue
+            result.chunk_id = chunk.chunk_id
+            if delta:
+                for claim in result.claims:
+                    claim.evidence.start_line += delta
+                    claim.evidence.end_line += delta
+            conn.execute(
+                """UPDATE system_understanding_llm_tasks
+                   SET status = 'completed', reused_existing = 1,
+                       completed_at = ?, result_json = ?
+                   WHERE id = ?""",
+                (now, result.model_dump_json(), row["id"]),
+            )
         pending = conn.execute(
             "SELECT * FROM system_understanding_llm_tasks "
             "WHERE build_id = ? AND status = 'pending' ORDER BY id",
@@ -1123,7 +1149,6 @@ def _run_claim_scan(ctx: StepContext) -> Dict[str, Any]:
     if pending:
         config = LLMConfig.intelligence_from_env()
         client = create_llm_client(config)
-        chunk_by_id = {c.chunk_id: c for c in chunks}
 
         for task in pending:
             ctx.check_cancelled()

@@ -194,10 +194,17 @@ heuristic result.
   `snapshot_id` and not `chunk_id` (Issue #195). This means an unchanged
   documentation chunk is reused across a Refresh's new `snapshot_id` (same
   content hash), while a chunk whose `chunk_id` is unchanged but whose text
-  changed still gets rescanned (hash differs). Chunks absent from the
-  current snapshot's documentation index never get a pending task row for
-  the current build, so deleted sections cannot leak into the new build's
-  `understanding_graph` via this reuse path.
+  changed still gets rescanned (hash differs). Because `result_json` embeds
+  absolute evidence line numbers and the source `chunk_id`, reuse rewrites
+  the result for the current chunk: `chunk_id` is replaced and evidence
+  start/end lines are offset by the start-line delta against the stored
+  `chunk_start_line` (a structural shift for byte-identical text), so
+  evidence keeps resolving against the pinned current snapshot. Legacy rows
+  without `chunk_start_line` are only reused when `chunk_id` matches
+  exactly. Chunks absent from the current snapshot's documentation index
+  never get a pending task row for the current build, so deleted sections
+  cannot leak into the new build's `understanding_graph` via this reuse
+  path.
 - Jobs and steps persist heartbeats. A queued/running job without a recent
   heartbeat (`SYSTEM_UNDERSTANDING_STUCK_AFTER_SECONDS`, default 300) is
   reported `is_stuck`; `init_db` fails over jobs interrupted by a restart so
