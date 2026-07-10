@@ -1443,8 +1443,15 @@ CREATE INDEX IF NOT EXISTS idx_understanding_build_steps_system
 
 -- Chunk-level LLM tasks for the claim_scan step (Issue #109). Each row is one
 -- documentation chunk scan with unified retry/backoff accounting. Completed
--- results are kept (result_json) so a retry only re-scans failed chunks and a
--- later build for the same snapshot can reuse results by content hash.
+-- results are kept (result_json) so a retry only re-scans failed chunks, a
+-- later build for the same snapshot can reuse results by content hash, and
+-- (Issue #195) a build against a *new* snapshot can also reuse results for
+-- chunks whose path + content_hash + prompt/schema version are unchanged,
+-- so only added/changed documentation is re-scanned by the LLM.
+-- chunk_start_line records where the chunk started in its snapshot: reused
+-- result_json embeds absolute evidence line numbers, so a cross-snapshot
+-- reuse of a chunk that shifted position must offset those lines by the
+-- start-line delta to keep evidence resolvable against the new snapshot.
 CREATE TABLE IF NOT EXISTS system_understanding_llm_tasks (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     build_id           INTEGER NOT NULL,
@@ -1455,6 +1462,7 @@ CREATE TABLE IF NOT EXISTS system_understanding_llm_tasks (
     chunk_id           TEXT NOT NULL,
     chunk_content_hash TEXT NOT NULL DEFAULT '',
     chunk_path         TEXT NOT NULL DEFAULT '',
+    chunk_start_line   INTEGER,
     prompt_version     TEXT NOT NULL DEFAULT '',
     schema_version     TEXT NOT NULL DEFAULT '',
     status             TEXT NOT NULL DEFAULT 'pending',
@@ -1477,6 +1485,12 @@ CREATE INDEX IF NOT EXISTS idx_understanding_llm_tasks_build
 
 CREATE INDEX IF NOT EXISTS idx_understanding_llm_tasks_system
     ON system_understanding_llm_tasks (system_id, snapshot_id, chunk_content_hash);
+
+-- Supports the cross-snapshot completed-result reuse lookup (Issue #195),
+-- which matches on content identity rather than snapshot_id.
+CREATE INDEX IF NOT EXISTS idx_understanding_llm_tasks_reuse
+    ON system_understanding_llm_tasks
+        (system_id, chunk_content_hash, chunk_path, prompt_version, schema_version, status);
 
 -- Issue drafts (Issue #107). probe-agent is the source of truth for issue
 -- drafts generated from System Understanding gaps (and, later, interviews /
@@ -1803,6 +1817,11 @@ def init_db() -> None:
         if "explanation_hash" not in _columns(conn, "symbol_source_metadata"):
             conn.execute(
                 "ALTER TABLE symbol_source_metadata ADD COLUMN explanation_hash TEXT"
+            )
+        if "chunk_start_line" not in _columns(conn, "system_understanding_llm_tasks"):
+            conn.execute(
+                "ALTER TABLE system_understanding_llm_tasks "
+                "ADD COLUMN chunk_start_line INTEGER"
             )
         validation_columns = _columns(conn, "validation_runs")
         if "trace_received" not in validation_columns:
