@@ -1075,14 +1075,25 @@ def _run_claim_scan(ctx: StepContext) -> Dict[str, Any]:
                     max_attempts, now,
                 ),
             )
-        # Reuse completed results from earlier builds of the same snapshot
-        # when chunk content and prompt/schema versions are identical.
+        # Reuse completed results from any earlier build of this system when
+        # chunk content, path, and prompt/schema versions are identical, even
+        # if the snapshot changed (Issue #195). snapshot_id is deliberately
+        # excluded from the match: a Refresh that leaves a documentation
+        # section untouched still hashes to the same chunk_content_hash under
+        # a new snapshot_id, and re-scanning it would be redundant LLM work.
+        # chunk_id is not part of the match either (Issue #195 design note):
+        # it is derived from path/start_line/heading and can shift when
+        # unrelated content moves, while chunk_content_hash is stable for
+        # unchanged text. Deleted chunks never get a pending row for the
+        # current build in the first place (they are not in the current
+        # snapshot's documentation index), so they cannot be pulled into the
+        # graph via this reuse path.
         conn.execute(
             """UPDATE system_understanding_llm_tasks AS t
                SET status = 'completed', reused_existing = 1, completed_at = ?,
                    result_json = (
                        SELECT p.result_json FROM system_understanding_llm_tasks p
-                       WHERE p.system_id = t.system_id AND p.snapshot_id = t.snapshot_id
+                       WHERE p.system_id = t.system_id
                          AND p.chunk_content_hash = t.chunk_content_hash
                          AND p.chunk_path = t.chunk_path
                          AND p.prompt_version = t.prompt_version
@@ -1093,7 +1104,7 @@ def _run_claim_scan(ctx: StepContext) -> Dict[str, Any]:
                    )
                WHERE t.build_id = ? AND t.status = 'pending' AND EXISTS (
                    SELECT 1 FROM system_understanding_llm_tasks p
-                   WHERE p.system_id = t.system_id AND p.snapshot_id = t.snapshot_id
+                   WHERE p.system_id = t.system_id
                      AND p.chunk_content_hash = t.chunk_content_hash
                      AND p.chunk_path = t.chunk_path
                      AND p.prompt_version = t.prompt_version

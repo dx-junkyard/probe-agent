@@ -188,6 +188,16 @@ heuristic result.
   resets only missing/failed/blocked/cancelled steps; completed chunk scan
   results are reused by content hash. Cancel is available per job and per
   step; workers check the flag between steps and between chunks.
+- `claim_scan` chunk reuse (`_run_claim_scan`) matches on `system_id` +
+  `chunk_path` + `chunk_content_hash` + `prompt_version` + `schema_version`
+  + completed status with a non-null `result_json` — deliberately not
+  `snapshot_id` and not `chunk_id` (Issue #195). This means an unchanged
+  documentation chunk is reused across a Refresh's new `snapshot_id` (same
+  content hash), while a chunk whose `chunk_id` is unchanged but whose text
+  changed still gets rescanned (hash differs). Chunks absent from the
+  current snapshot's documentation index never get a pending task row for
+  the current build, so deleted sections cannot leak into the new build's
+  `understanding_graph` via this reuse path.
 - Jobs and steps persist heartbeats. A queued/running job without a recent
   heartbeat (`SYSTEM_UNDERSTANDING_STUCK_AFTER_SECONDS`, default 300) is
   reported `is_stuck`; `init_db` fails over jobs interrupted by a restart so

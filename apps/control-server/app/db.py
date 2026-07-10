@@ -1443,8 +1443,11 @@ CREATE INDEX IF NOT EXISTS idx_understanding_build_steps_system
 
 -- Chunk-level LLM tasks for the claim_scan step (Issue #109). Each row is one
 -- documentation chunk scan with unified retry/backoff accounting. Completed
--- results are kept (result_json) so a retry only re-scans failed chunks and a
--- later build for the same snapshot can reuse results by content hash.
+-- results are kept (result_json) so a retry only re-scans failed chunks, a
+-- later build for the same snapshot can reuse results by content hash, and
+-- (Issue #195) a build against a *new* snapshot can also reuse results for
+-- chunks whose path + content_hash + prompt/schema version are unchanged,
+-- so only added/changed documentation is re-scanned by the LLM.
 CREATE TABLE IF NOT EXISTS system_understanding_llm_tasks (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     build_id           INTEGER NOT NULL,
@@ -1477,6 +1480,12 @@ CREATE INDEX IF NOT EXISTS idx_understanding_llm_tasks_build
 
 CREATE INDEX IF NOT EXISTS idx_understanding_llm_tasks_system
     ON system_understanding_llm_tasks (system_id, snapshot_id, chunk_content_hash);
+
+-- Supports the cross-snapshot completed-result reuse lookup (Issue #195),
+-- which matches on content identity rather than snapshot_id.
+CREATE INDEX IF NOT EXISTS idx_understanding_llm_tasks_reuse
+    ON system_understanding_llm_tasks
+        (system_id, chunk_content_hash, chunk_path, prompt_version, schema_version, status);
 
 -- Issue drafts (Issue #107). probe-agent is the source of truth for issue
 -- drafts generated from System Understanding gaps (and, later, interviews /
