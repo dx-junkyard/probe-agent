@@ -1448,6 +1448,10 @@ CREATE INDEX IF NOT EXISTS idx_understanding_build_steps_system
 -- (Issue #195) a build against a *new* snapshot can also reuse results for
 -- chunks whose path + content_hash + prompt/schema version are unchanged,
 -- so only added/changed documentation is re-scanned by the LLM.
+-- chunk_start_line records where the chunk started in its snapshot: reused
+-- result_json embeds absolute evidence line numbers, so a cross-snapshot
+-- reuse of a chunk that shifted position must offset those lines by the
+-- start-line delta to keep evidence resolvable against the new snapshot.
 CREATE TABLE IF NOT EXISTS system_understanding_llm_tasks (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     build_id           INTEGER NOT NULL,
@@ -1458,6 +1462,7 @@ CREATE TABLE IF NOT EXISTS system_understanding_llm_tasks (
     chunk_id           TEXT NOT NULL,
     chunk_content_hash TEXT NOT NULL DEFAULT '',
     chunk_path         TEXT NOT NULL DEFAULT '',
+    chunk_start_line   INTEGER,
     prompt_version     TEXT NOT NULL DEFAULT '',
     schema_version     TEXT NOT NULL DEFAULT '',
     status             TEXT NOT NULL DEFAULT 'pending',
@@ -1812,6 +1817,11 @@ def init_db() -> None:
         if "explanation_hash" not in _columns(conn, "symbol_source_metadata"):
             conn.execute(
                 "ALTER TABLE symbol_source_metadata ADD COLUMN explanation_hash TEXT"
+            )
+        if "chunk_start_line" not in _columns(conn, "system_understanding_llm_tasks"):
+            conn.execute(
+                "ALTER TABLE system_understanding_llm_tasks "
+                "ADD COLUMN chunk_start_line INTEGER"
             )
         validation_columns = _columns(conn, "validation_runs")
         if "trace_received" not in validation_columns:
