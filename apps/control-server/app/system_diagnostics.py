@@ -37,10 +37,12 @@ probe-agent:
 from __future__ import annotations
 
 import os
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from . import system_state
 from .db import get_conn
 from .llm import PROVIDER_KEY_ENV, is_reasoning_model
 
@@ -843,16 +845,12 @@ def _check_last_reasoning_run(conn, system_id: int) -> DiagnosticCheck:
 
 
 def _latest_ready_snapshot_id(conn, system_id: int) -> Optional[int]:
-    row = conn.execute(
-        "SELECT id FROM repository_snapshots WHERE system_id = ? AND status = 'ready' "
-        "ORDER BY id DESC LIMIT 1",
-        (system_id,),
-    ).fetchone()
-    return row["id"] if row else None
+    return system_state.latest_ready_snapshot_id(conn, system_id)
 
 
 def _no_ready_snapshot_check(base: dict) -> DiagnosticCheck:
     """Blocked result shared by every pipeline check when no snapshot is ready."""
+    payload = {k: v for k, v in base.items() if k != "snapshot_id"}
     return DiagnosticCheck(
         severity="blocked",
         detail="ready な snapshot がないため、このステップは実行できません。",
@@ -861,7 +859,93 @@ def _no_ready_snapshot_check(base: dict) -> DiagnosticCheck:
         fix_kind=FIX_KIND_NAVIGATE,
         fix_page=PAGE_REPOSITORY,
         fix_anchor=ANCHOR_SNAPSHOT_CREATE,
-        **base,
+        **payload,
+    )
+
+
+def _baseline_ok_check(
+    *,
+    base: dict,
+    baseline: "system_state.UnderstandingBaseline",
+    impact: "system_state.UnderstandingDiffImpact",
+    purpose: bool,
+) -> DiagnosticCheck:
+    label = "System Purpose" if purpose else "Core Capability"
+    if baseline.snapshot_id == base.get("snapshot_id"):
+        detail = f"{label} は現在の snapshot で確認済みです。"
+    elif impact.status == "unchanged":
+        detail = (
+            f"{label} は snapshot #{baseline.snapshot_id} の確認済み理解を再利用できます。"
+            "今回の差分には再確認が必要な根拠変更は見つかりませんでした。"
+        )
+    else:
+        detail = f"{label} は確認済みです。"
+    payload = {k: v for k, v in base.items() if k != "snapshot_id"}
+    return DiagnosticCheck(
+        severity="ok",
+        detail=detail,
+        impact="",
+        remediation="",
+        **payload,
+    )
+
+
+def _baseline_impacted_check(
+    *,
+    base: dict,
+    baseline: "system_state.UnderstandingBaseline",
+    impact: "system_state.UnderstandingDiffImpact",
+    purpose: bool,
+) -> DiagnosticCheck:
+    target = "System Purpose" if purpose else "Core Capabilities"
+    title = "System Purpose の再確認" if purpose else "主な機能 / Core Capabilities の再確認"
+    reason = " ".join(impact.reasons) if impact.reasons else "前回確認済み理解に影響しうる差分があります。"
+    payload = {k: v for k, v in base.items() if k not in {"title", "snapshot_id"}}
+    return DiagnosticCheck(
+        severity="warning",
+        detail=(
+            f"{target} は snapshot #{baseline.snapshot_id} で確認済みですが、"
+            f"最新 snapshot との差分に影響候補があります。{reason}"
+        ),
+        impact=(
+            "確認済み理解をそのまま使えるか判断が必要です。"
+            "目的・主要機能が変わっていない場合は Interview で再確認してください。"
+        ),
+        remediation=f"Interview で {target} を再確認してください。",
+        fix_kind=FIX_KIND_NAVIGATE,
+        fix_page=PAGE_INTERVIEW,
+        fix_anchor=ANCHOR_INTERVIEW_PURPOSE if purpose else ANCHOR_INTERVIEW_CAPABILITIES,
+        title=title,
+        **payload,
+    )
+
+
+def _unconfirmed_understanding_check(
+    *,
+    base: dict,
+    baseline: "system_state.UnderstandingBaseline",
+    purpose: bool,
+) -> DiagnosticCheck:
+    target = "System Purpose" if purpose else "Core Capabilities"
+    title = "System Purpose の確認" if purpose else "主な機能 / Core Capabilities の確認"
+    count = baseline.purpose_count if purpose else baseline.capability_count
+    payload = {k: v for k, v in base.items() if k not in {"title", "snapshot_id"}}
+    return DiagnosticCheck(
+        severity="warning",
+        detail=(
+            f"Interview に未確認の {target} 候補が {count} 件あります。"
+            "baseline として再利用するには、開発者による明示的な確認が必要です。"
+        ),
+        impact=(
+            "未確認の理解は、snapshot 更新後の差分診断や probe 設計の前提として"
+            "まだ採用されません。"
+        ),
+        remediation=f"Interview で {target} を確認済みにしてください。",
+        fix_kind=FIX_KIND_NAVIGATE,
+        fix_page=PAGE_INTERVIEW,
+        fix_anchor=ANCHOR_INTERVIEW_PURPOSE if purpose else ANCHOR_INTERVIEW_CAPABILITIES,
+        title=title,
+        **payload,
     )
 
 
@@ -871,6 +955,12 @@ def _check_system_purpose(conn, system_id: int, snapshot_id: Optional[int]) -> D
     exploration, and improvement proposals matching user intent, not just a
     blank field on a page — so it is tracked here alongside required
     settings, and its remediation is prioritized ahead of ``llm_last_run``.
+
+    Issue #193: the branch classification (satisfied / baseline_reusable /
+    diff_impacted / unconfirmed / missing_baseline) comes from
+    ``system_state.evaluate_understanding`` so this check and the System
+    State Assessment layer agree on the same evidence; only the Japanese
+    text stays here for backward-compatible ``/system-diagnostics`` output.
     """
     base = dict(
         check_id="system_purpose",
@@ -878,30 +968,25 @@ def _check_system_purpose(conn, system_id: int, snapshot_id: Optional[int]) -> D
         title="System Purpose の定義",
         related_pages=[PAGE_SYSTEM_UNDERSTANDING, PAGE_INTERVIEW],
         related_pipeline_steps=["capability_hierarchy_ready"],
+        snapshot_id=snapshot_id,
     )
     if snapshot_id is None:
         return _no_ready_snapshot_check(base)
-    node = conn.execute(
-        "SELECT name, summary FROM capability_hierarchy_nodes "
-        "WHERE system_id = ? AND snapshot_id = ? AND node_type = 'purpose' LIMIT 1",
-        (system_id, snapshot_id),
-    ).fetchone()
-    draft = conn.execute(
-        "SELECT name, purpose FROM system_profile_drafts "
-        "WHERE system_id = ? AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
-        (system_id, snapshot_id),
-    ).fetchone()
-    defined = (node is not None and (node["name"] or node["summary"])) or (
-        draft is not None and (draft["name"] or draft["purpose"])
-    )
-    if defined:
+    status = system_state.evaluate_understanding(conn, system_id, snapshot_id, purpose=True)
+    if status.kind == "satisfied_current":
         return DiagnosticCheck(
             severity="ok",
             detail="System Purpose が定義されています。",
             impact="",
             remediation="",
-            **base,
+            **{k: v for k, v in base.items() if k != "snapshot_id"},
         )
+    if status.kind == "baseline_reusable":
+        return _baseline_ok_check(base=base, baseline=status.baseline, impact=status.impact, purpose=True)
+    if status.kind == "diff_impacted":
+        return _baseline_impacted_check(base=base, baseline=status.baseline, impact=status.impact, purpose=True)
+    if status.kind == "unconfirmed":
+        return _unconfirmed_understanding_check(base=base, baseline=status.baseline, purpose=True)
     return DiagnosticCheck(
         severity="warning",
         detail=(
@@ -916,7 +1001,7 @@ def _check_system_purpose(conn, system_id: int, snapshot_id: Optional[int]) -> D
         fix_kind=FIX_KIND_NAVIGATE,
         fix_page=PAGE_INTERVIEW,
         fix_anchor=ANCHOR_INTERVIEW_PURPOSE,
-        **base,
+        **{k: v for k, v in base.items() if k != "snapshot_id"},
     )
 
 
@@ -925,6 +1010,9 @@ def _check_system_capabilities(conn, system_id: int, snapshot_id: Optional[int])
 
     prerequisite for probe/flow/improvement work, tracked the same way as
     System Purpose above.
+
+    Issue #193: see ``_check_system_purpose`` — branch classification comes
+    from ``system_state.evaluate_understanding``.
     """
     base = dict(
         check_id="system_capabilities",
@@ -932,22 +1020,25 @@ def _check_system_capabilities(conn, system_id: int, snapshot_id: Optional[int])
         title="主な機能 / Core Capabilities の把握",
         related_pages=[PAGE_SYSTEM_UNDERSTANDING, PAGE_INTERVIEW, PAGE_CAPABILITY_MAP],
         related_pipeline_steps=["capability_hierarchy_ready"],
+        snapshot_id=snapshot_id,
     )
     if snapshot_id is None:
         return _no_ready_snapshot_check(base)
-    count = conn.execute(
-        "SELECT COUNT(*) FROM capability_hierarchy_nodes "
-        "WHERE system_id = ? AND snapshot_id = ? AND node_type = 'capability'",
-        (system_id, snapshot_id),
-    ).fetchone()[0]
-    if count > 0:
+    status = system_state.evaluate_understanding(conn, system_id, snapshot_id, purpose=False)
+    if status.kind == "satisfied_current":
         return DiagnosticCheck(
             severity="ok",
-            detail=f"{count} 件の Core Capability が定義されています。",
+            detail=f"{status.count} 件の Core Capability が定義されています。",
             impact="",
             remediation="",
-            **base,
+            **{k: v for k, v in base.items() if k != "snapshot_id"},
         )
+    if status.kind == "baseline_reusable":
+        return _baseline_ok_check(base=base, baseline=status.baseline, impact=status.impact, purpose=False)
+    if status.kind == "diff_impacted":
+        return _baseline_impacted_check(base=base, baseline=status.baseline, impact=status.impact, purpose=False)
+    if status.kind == "unconfirmed":
+        return _unconfirmed_understanding_check(base=base, baseline=status.baseline, purpose=False)
     return DiagnosticCheck(
         severity="warning",
         detail="対象システムの主な機能（Core Capabilities）が未定義・空です。",
@@ -962,7 +1053,7 @@ def _check_system_capabilities(conn, system_id: int, snapshot_id: Optional[int])
         fix_kind=FIX_KIND_NAVIGATE,
         fix_page=PAGE_INTERVIEW,
         fix_anchor=ANCHOR_INTERVIEW_CAPABILITIES,
-        **base,
+        **{k: v for k, v in base.items() if k != "snapshot_id"},
     )
 
 

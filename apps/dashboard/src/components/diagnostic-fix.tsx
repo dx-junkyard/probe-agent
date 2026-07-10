@@ -49,7 +49,7 @@ export function useDiagnosticHighlight<T extends HTMLElement>(anchor: string) {
 
   useEffect(() => {
     if (!focusToken) return;
-    ref.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+    ref.current?.scrollIntoView?.({ behavior: "smooth", block: "center" });
     const timer = setTimeout(() => setFadedToken(focusToken), 4000);
     return () => clearTimeout(timer);
   }, [focusToken]);

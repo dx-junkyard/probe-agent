@@ -2007,7 +2007,9 @@ InterviewStage = Literal[
     "probe_flow_selection",
     "proposal_generation",
 ]
-InterviewProposalApprovalState = Literal["proposed", "approved", "rejected", "edited"]
+InterviewProposalApprovalState = Literal[
+    "proposed", "approved", "rejected", "edited", "needs_review"
+]
 # Finite #54 vocabulary for a single state_effects entry.
 SourceMetadataStateEffect = Literal[
     "none",
@@ -2177,6 +2179,32 @@ class InterviewProposalOut(BaseModel):
 class InterviewSessionDetailOut(InterviewSessionOut):
     messages: List[InterviewMessageOut] = Field(default_factory=list)
     proposals: List[InterviewProposalOut] = Field(default_factory=list)
+
+
+class InterviewSnapshotRebaseRequest(BaseModel):
+    """Move an existing Interview session to a newer snapshot.
+
+    The operation preserves Q&A and understanding text, but reconciles proposal
+    review state against source anchors before any later materialization.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_snapshot_id: Optional[int] = None
+    actor: str = Field(default="dashboard", max_length=200)
+
+
+class InterviewSnapshotRebaseOut(BaseModel):
+    session_id: int
+    system_id: int
+    from_snapshot_id: int
+    to_snapshot_id: int
+    proposals_preserved: int = 0
+    proposals_marked_needs_review: int = 0
+    proposals_missing_source: int = 0
+    proposals_changed_source: int = 0
+    message: str = ""
+    session: InterviewSessionOut
 
 
 # --- Interview Context Pack (Issue #68) -------------------------------------
@@ -2787,9 +2815,13 @@ class SystemUnderstandingPipelineStepOut(BaseModel):
     detail: Optional[str] = None
 
 
+NextActionCategory = Literal["understand", "observe", "instrument", "evaluate"]
+
+
 class SystemUnderstandingNextActionOut(BaseModel):
     action: str
     reason: str
+    category: NextActionCategory
     link: Optional[str] = None
 
 
@@ -2898,6 +2930,41 @@ class SystemUnderstandingOut(BaseModel):
     gap_summary: List[SystemUnderstandingGapSummaryOut] = Field(default_factory=list)
     metadata_coverage: Optional[SystemUnderstandingMetadataCoverageOut] = None
     next_actions: List[SystemUnderstandingNextActionOut] = Field(default_factory=list)
+
+
+class CapabilityContextProbePlanOut(BaseModel):
+    """Issue #175: lightweight Probe Plan reference for the capability context API."""
+
+    id: int
+    feature_id: str
+    objective: str
+    status: ProbePlanStatus
+    created_at: float
+    updated_at: float
+
+
+class CapabilityContextExperimentOut(BaseModel):
+    """Issue #175: lightweight Experiment reference, with decision state, for the
+    capability context API."""
+
+    id: int
+    feature_id: str
+    objective: str
+    status: str
+    human_decision: str
+    human_decision_variant_key: Optional[str] = None
+    created_at: float
+
+
+class CapabilityContextOut(BaseModel):
+    """Issue #175: gaps / probe plans / experiments explicitly linked to one
+    capability_key, for the Capability detail panel. Every item here is joined
+    by an exact key match (capability_key or feature_id) — never a guess."""
+
+    capability_key: str
+    gaps: List[SystemUnderstandingGapOut] = Field(default_factory=list)
+    probe_plans: List[CapabilityContextProbePlanOut] = Field(default_factory=list)
+    experiments: List[CapabilityContextExperimentOut] = Field(default_factory=list)
 
 
 class SystemUnderstandingBuildStepOut(BaseModel):
@@ -3138,6 +3205,60 @@ class AssistantAskRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=4000)
     route_params: Dict[str, str] = Field(default_factory=dict)
     visible_check_ids: List[str] = Field(default_factory=list, max_length=50)
+
+
+# ---------------------------------------------------------------------------
+# System State Assessment (Issue #193)
+# ---------------------------------------------------------------------------
+
+StateSeverity = Literal["ok", "info", "warning", "blocked", "error"]
+StateStatus = Literal[
+    "satisfied", "missing", "unconfirmed", "stale", "impacted",
+    "blocked", "running", "failed", "ready",
+]
+StateUserActionKind = Literal[
+    "none", "configure", "create_snapshot", "build", "confirm",
+    "review", "rerun", "inspect", "wait",
+]
+StateInterventionTiming = Literal["now", "before_next_step", "optional", "after_build", "none"]
+StateGroup = Literal[
+    "repository", "snapshot", "pipeline", "understanding", "interview",
+    "runtime", "proposal", "configuration",
+]
+
+
+class SystemStateTargetUiOut(BaseModel):
+    route: str
+    anchor: Optional[str] = None
+    action_label: str = ""
+
+
+class SystemStateItemOut(BaseModel):
+    state_id: str
+    state_group: StateGroup
+    severity: StateSeverity
+    status: StateStatus
+    user_action_kind: StateUserActionKind
+    intervention_timing: StateInterventionTiming
+    subject: str
+    summary: str
+    detail: str
+    impact: str = ""
+    remediation: str = ""
+    evidence: Dict[str, Any] = Field(default_factory=dict)
+    target_ui: Optional[SystemStateTargetUiOut] = None
+    related_checks: List[str] = Field(default_factory=list)
+    related_pipeline_steps: List[str] = Field(default_factory=list)
+    # System State Assessment is deterministic and LLM-free (Issue #193 Phase 1).
+    decision_method: Literal["deterministic"] = "deterministic"
+
+
+class SystemStateAssessmentOut(BaseModel):
+    system_id: int
+    generated_at: float
+    overall_severity: StateSeverity
+    severity_counts: Dict[str, int] = Field(default_factory=dict)
+    items: List[SystemStateItemOut] = Field(default_factory=list)
 
 
 class AssistantActionOut(BaseModel):

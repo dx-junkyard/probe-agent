@@ -13,6 +13,7 @@ const mockApi = {
   delete: vi.fn(),
 };
 let mockSystemId: number | null = 1;
+let mockSystems: { id: number; name: string }[] = [];
 
 class ApiError extends Error {
   status: number;
@@ -39,7 +40,7 @@ vi.mock("@/api/auth", () => ({
     isAdmin: true,
     loading: false,
     systemId: mockSystemId,
-    systems: [],
+    systems: mockSystems,
     login: vi.fn(),
     logout: vi.fn(),
     selectSystem: vi.fn(),
@@ -47,6 +48,10 @@ vi.mock("@/api/auth", () => ({
   }),
   AuthProvider: ({ children }: { children: ReactNode }) => children,
 }));
+
+afterEach(() => {
+  mockSystems = [];
+});
 
 vi.mock("sonner", () => ({
   toast: {
@@ -273,6 +278,24 @@ describe("Experiment creation", () => {
     const trashIcons = document.querySelectorAll(".lucide-trash-2");
     expect(trashIcons.length).toBe(0);
   });
+
+  test("shows a back link to the capability when ?capability= is present", async () => {
+    setupExperimentMocks();
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: ExperimentsPage } = await import("@/pages/experiments");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/experiments?capability=doc-analysis"]}>
+          <ExperimentsPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const back = await screen.findByTestId("back-to-capability");
+    expect(back).toHaveAttribute("href", "/capability-map?capability=doc-analysis");
+  });
 });
 
 // ── Experiment decision tests ───────────────────────────────────────
@@ -419,6 +442,90 @@ describe("Probe Patch application", () => {
         },
       );
     });
+  });
+});
+
+// ── Probe Planner ?plan= deep link (Issue #177) ─────────────────────
+
+function mockTwoPlans() {
+  mockApi.get.mockImplementation((path: string) => {
+    if (path === "/repository/probe-plans") {
+      return Promise.resolve({
+        system_id: 1,
+        is_mock: false,
+        plans: [
+          { id: 10, feature_id: "feat-1", objective: "Observe A", status: "proposed", created_at: "2024-01-01", probe_points: [] },
+          { id: 11, feature_id: "feat-2", objective: "Observe B", status: "proposed", created_at: "2024-01-02", probe_points: [] },
+        ],
+      });
+    }
+    if (path === "/repository/probe-patches") return Promise.resolve([]);
+    return Promise.resolve(null);
+  });
+}
+
+function renderProbePlannerAt(route: string) {
+  const qc = new QueryClient({
+    defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+  });
+  return import("@/pages/probe-planner").then(({ default: ProbePlannerPage }) =>
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={[route]}>
+          <ProbePlannerPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    ),
+  );
+}
+
+describe("Probe Planner ?plan= deep link", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("expands the matching plan when ?plan= is present", async () => {
+    mockTwoPlans();
+    await renderProbePlannerAt("/probe-planner?plan=11");
+
+    await waitFor(() => {
+      expect(screen.getByText("Feature: feat-2")).toBeInTheDocument();
+    });
+    // Expanded content (Probe Points section) is rendered only for the open card.
+    await waitFor(() => {
+      expect(screen.getByText("Probe Points (0)")).toBeInTheDocument();
+    });
+    const { toast } = await import("sonner");
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  test("falls back to the normal list without ?plan=", async () => {
+    mockTwoPlans();
+    await renderProbePlannerAt("/probe-planner");
+
+    await waitFor(() => {
+      expect(screen.getByText("Feature: feat-1")).toBeInTheDocument();
+      expect(screen.getByText("Feature: feat-2")).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/Probe Points \(/)).not.toBeInTheDocument();
+    const { toast } = await import("sonner");
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  test("shows a warning and normal list for an unknown plan id", async () => {
+    mockTwoPlans();
+    await renderProbePlannerAt("/probe-planner?plan=999");
+
+    await waitFor(() => {
+      expect(screen.getByText("Feature: feat-1")).toBeInTheDocument();
+      expect(screen.getByText("Feature: feat-2")).toBeInTheDocument();
+    });
+    const { toast } = await import("sonner");
+    await waitFor(() => {
+      expect(toast.error).toHaveBeenCalledWith("Probe plan #999 was not found.");
+    });
+    expect(screen.queryByText(/Probe Points \(/)).not.toBeInTheDocument();
   });
 });
 
@@ -1291,9 +1398,296 @@ describe("Capability Map page", () => {
     const link = await screen.findByTestId("open-in-flow");
     expect(link).toHaveAttribute(
       "href",
-      "/flow-explorer?entrypoint_type=http_route&entrypoint_id=GET%3A%2Fflow",
+      "/flow-explorer?entrypoint_type=http_route&entrypoint_id=GET%3A%2Fflow&capability=doc-analysis",
     );
     expect(screen.getByText("Lists available flows")).toBeInTheDocument();
+  });
+
+  test("shows Gaps / Probe Plans / Experiments for the selected capability with deep links (Issue #175)", async () => {
+    const hierarchy = {
+      system_id: 1, snapshot_id: 5,
+      intelligence_run: { id: 1, status: "completed", decision_method: "deterministic" },
+      purpose: null,
+      capabilities: [{
+        id: 2, capability_key: "doc-analysis", name: "Document Analysis",
+        summary: "analysis capability", provenance: provenance(),
+        elements: [],
+        supporting_elements: [],
+      }],
+      unclassified_elements: [], unattached_supporting: [], is_mock: false,
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/capability-hierarchy") return Promise.resolve(hierarchy);
+      if (path === "/repository/capabilities/doc-analysis/context") {
+        return Promise.resolve({
+          capability_key: "doc-analysis",
+          gaps: [{
+            gap_type: "undocumented", severity: "warning", title: "Missing docs for parser",
+            node_name: null, notes: null, capability_key: "doc-analysis",
+            doc_refs: [], symbol_refs: [], entrypoint_refs: [], code_refs: [],
+            next_actions: [], source_id: null, source_key: null, issue_drafts: [],
+          }],
+          probe_plans: [{
+            id: 42, feature_id: "doc-parsing", objective: "trace parsing",
+            status: "approved", created_at: "1", updated_at: "1",
+          }],
+          experiments: [{
+            id: 7, feature_id: "doc-parsing", objective: "compare candidate",
+            status: "completed", human_decision: "adopted",
+            human_decision_variant_key: "candidate-a", created_at: "1",
+          }],
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { default: CapabilityMapPage } = await import("@/pages/capability-map");
+    render(<CapabilityMapPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByText("Document Analysis"));
+
+    const gapLink = await screen.findByText("Missing docs for parser");
+    expect(gapLink.closest("a")).toHaveAttribute("href", "/system-understanding");
+
+    const planLink = await screen.findByTestId("capability-probe-plans");
+    expect(within(planLink).getByText("doc-parsing")).toBeInTheDocument();
+    expect(within(planLink).getByRole("link")).toHaveAttribute("href", "/probe-planner?plan=42&capability=doc-analysis");
+
+    const expLink = await screen.findByTestId("capability-experiments");
+    expect(within(expLink).getByText("adopted")).toBeInTheDocument();
+    expect(within(expLink).getByRole("link")).toHaveAttribute("href", "/experiments?capability=doc-analysis");
+  });
+
+  test("does not show Gaps / Probe Plans / Experiments sections when the context has none", async () => {
+    const hierarchy = {
+      system_id: 1, snapshot_id: 5,
+      intelligence_run: { id: 1, status: "completed", decision_method: "deterministic" },
+      purpose: null,
+      capabilities: [{
+        id: 2, capability_key: "empty-cap", name: "Empty Capability",
+        summary: "", provenance: provenance(),
+        elements: [], supporting_elements: [],
+      }],
+      unclassified_elements: [], unattached_supporting: [], is_mock: false,
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/capability-hierarchy") return Promise.resolve(hierarchy);
+      if (path === "/repository/capabilities/empty-cap/context") {
+        return Promise.resolve({ capability_key: "empty-cap", gaps: [], probe_plans: [], experiments: [] });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { default: CapabilityMapPage } = await import("@/pages/capability-map");
+    render(<CapabilityMapPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByText("Empty Capability"));
+
+    await waitFor(() => {
+      expect(mockApi.get).toHaveBeenCalledWith("/repository/capabilities/empty-cap/context");
+    });
+    expect(screen.queryByTestId("capability-gaps")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("capability-probe-plans")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("capability-experiments")).not.toBeInTheDocument();
+  });
+
+  test("Related APIs links carry the capability key to Flow Explorer (Issue #176)", async () => {
+    const hierarchy = {
+      system_id: 1, snapshot_id: 5,
+      intelligence_run: { id: 1, status: "completed", decision_method: "deterministic" },
+      purpose: null,
+      capabilities: [{
+        id: 2, capability_key: "doc-analysis", name: "Document Analysis",
+        summary: "analysis capability", provenance: provenance(),
+        elements: [], supporting_elements: [],
+      }],
+      unclassified_elements: [], unattached_supporting: [], is_mock: false,
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/capability-hierarchy") return Promise.resolve(hierarchy);
+      if (path === "/repository/api-role-cards") {
+        return Promise.resolve({
+          system_id: 1, snapshot_id: 5, hierarchy_run: null,
+          base_snapshot_id: 5, target_snapshot_id: 5, drift_available: true,
+          cards: [{
+            entrypoint_type: "http_route", entrypoint_id: "POST:/documents/analyze",
+            label: "POST /documents/analyze", capability_key: "doc-analysis",
+          }],
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { default: CapabilityMapPage } = await import("@/pages/capability-map");
+    render(<CapabilityMapPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByText("Document Analysis"));
+
+    const apiLink = await screen.findByText("POST /documents/analyze");
+    expect(apiLink.closest("a")).toHaveAttribute(
+      "href",
+      "/flow-explorer?entrypoint_type=http_route&entrypoint_id=POST%3A%2Fdocuments%2Fanalyze&capability=doc-analysis",
+    );
+  });
+});
+
+describe("Flow Explorer capability context (Issue #176)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const entrypoint = {
+    entrypoint_type: "http_route", entrypoint_id: "POST:/documents/analyze",
+    label: "POST /documents/analyze", path: "app.py", qualified_name: "analyze_document",
+    line_start: 5, line_end: 11, component_id: null, route_method: "POST",
+    route_path: "/documents/analyze", category: "api", framework: "fastapi",
+    operation: "POST /documents/analyze", confidence: 1.0, evidence: [],
+  };
+
+  function mockEntrypointsAndGraph() {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/flow-entrypoints") {
+        return Promise.resolve({
+          system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
+          total: 1, entrypoints: [entrypoint], functions: [],
+          counts: { api: 1, message_queue: 0, scheduled_job: 0, cli: 0, function: 0 },
+          indexed_function_count: 0, has_backend_entrypoints: true, frameworks: ["fastapi"],
+          diagnostics: [],
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockImplementation((path: string) =>
+      path === "/repository/flow-graphs"
+        ? Promise.resolve({
+            system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
+            entrypoint, nodes: [], edges: [], candidate_paths: [],
+            diagnostics: [], truncated: false,
+          })
+        : Promise.resolve(null));
+  }
+
+  function renderFlowExplorerAt(route: string) {
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    return import("@/pages/flow-explorer").then(({ default: FlowExplorerPage }) =>
+      render(
+        <QueryClientProvider client={qc}>
+          <MemoryRouter initialEntries={[route]}>
+            <FlowExplorerPage />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      ),
+    );
+  }
+
+  test("shows a back link to the capability when ?capability= is present", async () => {
+    mockEntrypointsAndGraph();
+    await renderFlowExplorerAt("/flow-explorer?capability=doc-analysis");
+
+    const back = await screen.findByTestId("back-to-capability");
+    expect(back).toHaveAttribute("href", "/capability-map?capability=doc-analysis");
+  });
+
+  test("does not show a back link without ?capability=", async () => {
+    mockEntrypointsAndGraph();
+    const { default: FlowExplorerPage } = await import("@/pages/flow-explorer");
+    render(<FlowExplorerPage />, { wrapper: createWrapper() });
+
+    await screen.findByText("Flow Explorer");
+    expect(screen.queryByTestId("back-to-capability")).not.toBeInTheDocument();
+  });
+
+  test("carries ?capability= through to the created Probe Plan draft", async () => {
+    mockEntrypointsAndGraph();
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/repository/flow-graphs") {
+        return Promise.resolve({
+          system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
+          entrypoint,
+          nodes: [{
+            node_id: "n1", node_type: "function", qualified_name: "analyze_document",
+            path: "app.py", line_start: 5, line_end: 11, component_id: null,
+            is_external: false, boundary_kind: null, risk: "low", denylist_hit: null,
+            trace_count: 0, error_count: 0, observed: false,
+            evaluation_pass: 0, evaluation_fail: 0,
+            preview: {
+              recommended_mode: "trace", side_effect_risk: "low",
+              captured_data: [], redaction: [], replayability: "yes",
+              estimated_event_volume: "low", denylist_hit: null,
+            },
+          }],
+          edges: [],
+          candidate_paths: [{
+            flow_id: "f1", title: "Main path", node_count: 1, max_depth: 1,
+            confidence: 1, external_boundary_count: 0, unresolved_edge_count: 0,
+            node_ids: ["n1"], observed_node_count: 0, unobserved_node_ids: ["n1"],
+          }],
+          diagnostics: [], truncated: false,
+        });
+      }
+      if (path === "/repository/probe-plans/from-flow") {
+        return Promise.resolve({ id: 55, feature_id: "flow-derived", objective: "", probe_points: [] });
+      }
+      return Promise.resolve(null);
+    });
+
+    await renderFlowExplorerAt("/flow-explorer?capability=doc-analysis");
+
+    fireEvent.click(await screen.findByText("POST /documents/analyze"));
+    fireEvent.click(await screen.findByText("analyze_document"));
+    fireEvent.click(await screen.findByText("Create Probe Plan draft"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/repository/probe-plans/from-flow",
+        expect.any(Object),
+      );
+    });
+  });
+});
+
+describe("Probe Planner capability back link (Issue #176)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("shows a back link to the capability when ?capability= is present", async () => {
+    mockTwoPlans();
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/probe-planner?capability=doc-analysis"]}>
+          <ProbePlannerPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const back = await screen.findByTestId("back-to-capability");
+    expect(back).toHaveAttribute("href", "/capability-map?capability=doc-analysis");
+  });
+
+  test("does not show a back link without ?capability=", async () => {
+    mockTwoPlans();
+    await renderProbePlannerAt("/probe-planner");
+
+    await screen.findByText("Feature: feat-1");
+    expect(screen.queryByTestId("back-to-capability")).not.toBeInTheDocument();
+  });
+
+  test("carries the capability context through to Experiments", async () => {
+    mockTwoPlans();
+    await renderProbePlannerAt("/probe-planner?plan=11&capability=doc-analysis");
+
+    await screen.findByText("Probe Points (0)");
+    const link = screen.getByTestId("open-experiments-with-capability");
+    expect(link).toHaveAttribute("href", "/experiments?capability=doc-analysis");
   });
 });
 
@@ -1499,6 +1893,56 @@ describe("Interview page", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockSystemId = 1;
+  });
+
+  test("preserves diagnostic focus params while auto-selecting an interview session", async () => {
+    mockInterviewApi();
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-diagnostics") {
+        return Promise.resolve({
+          system_id: 1,
+          generated_at: 1750000000,
+          overall_severity: "warning",
+          severity_counts: { ok: 0, warning: 1, error: 0, blocked: 0, unknown: 0 },
+          checks: [{
+            check_id: "system_purpose",
+            category: "understanding",
+            title: "System Purpose の定義",
+            severity: "warning",
+            detail: "System Purpose が未定義です。",
+            impact: "probe 設計の前提情報が欠けています。",
+            remediation: "Interview で System Purpose を定義・確認してください。",
+            related_env: [],
+            related_paths: [],
+            related_pages: ["/system-understanding", "/interview"],
+            related_pipeline_steps: ["capability_hierarchy_ready"],
+            last_observed_error: null,
+            decision_method: "deterministic",
+            fix_kind: "navigate",
+            fix_page: "/interview",
+            fix_anchor: "interview-purpose",
+          }],
+        });
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?diagnostic=system_purpose&fix=interview-purpose"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const callout = await screen.findByTestId("diagnostic-callout-interview-purpose");
+    expect(callout.textContent).toContain("System Purpose の定義");
+    expect(callout.textContent).toContain("Interview で System Purpose");
   });
 
   test("renders mock reasoning provenance and wires proposal decisions", async () => {
@@ -2071,6 +2515,62 @@ describe("Interview page", () => {
     });
   });
 
+  test("structured understanding can be explicitly confirmed from the interview page", async () => {
+    mockInterviewApi({
+      session: {
+        stage: "proposal_generation",
+        current_understanding: {
+          system_purpose: [understandingItem("Runtime probe platform")],
+          core_capabilities: [understandingItem("Trace ingestion")],
+          capability_elements: [],
+          supporting_elements: [],
+          api_boundaries: [],
+          probe_flow_candidates: [],
+        },
+        understanding_confirmed_at: null,
+        understanding_confirmed_by: null,
+      },
+      proposals: [],
+    });
+    mockApi.post.mockResolvedValue(interviewSession({
+      stage: "proposal_generation",
+      current_understanding: {
+        system_purpose: [understandingItem("Runtime probe platform")],
+        core_capabilities: [understandingItem("Trace ingestion")],
+        capability_elements: [],
+        supporting_elements: [],
+        api_boundaries: [],
+        probe_flow_candidates: [],
+      },
+      understanding_confirmed_at: 9,
+      understanding_confirmed_by: "admin",
+    }));
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const confirmButton = await screen.findByTestId("confirm-understanding");
+    expect(confirmButton).toHaveTextContent("この理解を確認済みにする");
+    expect(screen.getByTestId("next-action")).toHaveTextContent("この理解を確認済みにする");
+
+    fireEvent.click(confirmButton);
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/7/confirm-understanding",
+        { actor: "admin" },
+      );
+    });
+  });
+
   test("answering a gap question passes it to the server for consumption (Issue #123)", async () => {
     mockInterviewApi({
       session: {
@@ -2245,6 +2745,134 @@ describe("Flow Explorer auto-select from URL (Issue #62)", () => {
   });
 });
 
+// ── Context Header tests (Issue #178) ───────────────────────────────
+
+// ── Sidebar navigation ───────────────────────────────────────────────
+
+describe("Sidebar navigation grouping (Issue #179)", () => {
+  beforeEach(() => {
+    mockSystemId = 1;
+  });
+
+  test("renders Hub / Detail views / Other headings and every existing route", async () => {
+    const { Sidebar } = await import("@/components/layout/sidebar");
+    render(
+      <MemoryRouter initialEntries={["/"]}>
+        <Sidebar />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByTestId("sidebar-group-hub")).toBeTruthy();
+    expect(screen.getByTestId("sidebar-group-detail-views")).toBeTruthy();
+    expect(screen.getByTestId("sidebar-group-other")).toBeTruthy();
+
+    const nav = screen.getByTestId("sidebar-nav");
+    // Existing routes/URLs are unchanged — every prior nav item is still present.
+    for (const label of [
+      "Overview", "System Understanding", "Repository", "Capability Map", "Feature Map",
+      "Flow Explorer", "Trace Lineage", "Trace Analyzers", "Probe Planner", "Interview",
+      "Experiments", "Connect SDK", "Generate", "Components", "Decision Workspace", "Settings",
+    ]) {
+      expect(within(nav).getByText(label)).toBeTruthy();
+    }
+
+    // System Understanding is grouped under Hub, not Detail views.
+    expect(within(screen.getByTestId("sidebar-group-hub")).getByText("System Understanding")).toBeTruthy();
+    expect(within(screen.getByTestId("sidebar-group-detail-views")).getByText("Flow Explorer")).toBeTruthy();
+  });
+});
+
+describe("Context Header", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+    mockSystems = [{ id: 1, name: "probe-agent" }];
+  });
+
+  function renderWithParams(route: string) {
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    return import("@/components/layout/context-header").then(({ ContextHeader }) =>
+      render(
+        <QueryClientProvider client={qc}>
+          <MemoryRouter initialEntries={[route]}>
+            <ContextHeader />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      ),
+    );
+  }
+
+  test("shows system, snapshot, capability, entrypoint and status when available", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/status") {
+        return Promise.resolve({
+          configured: true, repo_path: "/repos/a", current_head: "def5678000",
+          head_error: null, working_tree_dirty: false, dirty_file_count: 0,
+          dirty_sample: [], latest_snapshot: { id: 5, commit_sha: "abc1234567", status: "ready" },
+          latest_indexed_snapshot: null,
+          understanding_snapshot_id: null, understanding_status: null,
+          snapshot_stale: false, symbols_stale: false, next_actions: [],
+        });
+      }
+      if (path === "/repository/system-understanding") {
+        return Promise.resolve({
+          system_id: 1, snapshot_id: 5, commit_sha: "abc1234567",
+          pipeline: [
+            { step: "symbols_indexed", status: "complete", detail: null },
+            { step: "entrypoints_discovered", status: "complete", detail: null },
+          ],
+          purpose: null, capabilities: [], entrypoints: [], major_symbols: [],
+          gaps: [{}, {}, {}], gap_summary: [], metadata_coverage: null,
+          next_actions: [],
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    await renderWithParams(
+      "/flow-explorer?capability=doc-analysis&entrypoint_type=http_route&entrypoint_id=GET%3A%2Fflow",
+    );
+
+    expect(await screen.findByTestId("context-header")).toBeInTheDocument();
+    expect(screen.getByTestId("context-header-system")).toHaveTextContent("probe-agent");
+    expect(screen.getByTestId("context-header-snapshot")).toHaveTextContent("abc12345");
+    expect(screen.getByTestId("context-header-snapshot")).not.toHaveTextContent("def56780");
+    expect(screen.getByTestId("context-header-capability")).toHaveTextContent("doc-analysis");
+    expect(screen.getByTestId("context-header-entrypoint")).toHaveTextContent("http_route: GET:/flow");
+    expect(screen.getByTestId("context-header-status")).toHaveTextContent(
+      "symbols indexed, entrypoints discovered, 3 gaps",
+    );
+  });
+
+  test("omits missing fields instead of showing empty labels", async () => {
+    mockApi.get.mockResolvedValue(null);
+
+    await renderWithParams("/flow-explorer");
+
+    // System name still resolves from the auth context even with no repo data.
+    expect(await screen.findByTestId("context-header")).toBeInTheDocument();
+    expect(screen.getByTestId("context-header-system")).toBeInTheDocument();
+    expect(screen.queryByTestId("context-header-snapshot")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("context-header-capability")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("context-header-entrypoint")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("context-header-status")).not.toBeInTheDocument();
+  });
+
+  test("renders nothing when no data or params are available at all", async () => {
+    mockSystems = [];
+    mockApi.get.mockResolvedValue(null);
+
+    await renderWithParams("/flow-explorer");
+
+    await waitFor(() => {
+      expect(mockApi.get).toHaveBeenCalled();
+    });
+    expect(screen.queryByTestId("context-header")).not.toBeInTheDocument();
+  });
+});
+
 // ── System Understanding page tests ─────────────────────────────────
 
 describe("System Understanding page", () => {
@@ -2274,7 +2902,7 @@ describe("System Understanding page", () => {
     gaps: [],
     gap_summary: [],
     metadata_coverage: null,
-    next_actions: [{ action: "Configure repository", reason: "No repository configured", link: "/repository" }],
+    next_actions: [{ action: "Configure repository", reason: "No repository configured", category: "understand", link: "/repository" }],
   };
 
   const gapWorklistResponse = {
@@ -2334,7 +2962,12 @@ describe("System Understanding page", () => {
       { gap_type: "docs_only", count: 1 },
     ],
     metadata_coverage: { symbol_count: 42, symbols_with_source_metadata: 5, entrypoint_count: 10, entrypoints_with_capability_link: 3 },
-    next_actions: [{ action: "Review docs-code gaps", reason: "2 gaps found", link: "/system-understanding" }],
+    next_actions: [
+      { action: "Review docs-code gaps", reason: "2 gaps found", category: "understand", link: "/system-understanding" },
+      { action: "Review probe plan", reason: "Probe plan #7 is awaiting review", category: "observe", link: "/probe-planner?plan=7" },
+      { action: "Generate / validate probe patch", reason: "Approved probe plan #8 has no validated patch yet", category: "instrument", link: "/probe-planner?plan=8" },
+      { action: "Review experiment decision", reason: "Experiment #9 completed but has no recorded decision", category: "evaluate", link: "/experiments" },
+    ],
   };
 
   const completeResponse = {
@@ -2382,7 +3015,7 @@ describe("System Understanding page", () => {
       { step: "capability_hierarchy_ready", status: "missing", detail: "Reasoning model required" },
     ],
     next_actions: [
-      { action: "Configure reasoning model", reason: "Required for documentation and capability analysis", link: null },
+      { action: "Configure reasoning model", reason: "Required for documentation and capability analysis", category: "understand", link: null },
     ],
   };
 
@@ -2501,6 +3134,58 @@ describe("System Understanding page", () => {
 
     expect(screen.getByText("Open Interview")).toBeTruthy();
     expect(screen.getByText("Open docs evidence")).toBeTruthy();
+  });
+
+  test("renders category badges for probe plan and experiment next actions", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(gapWorklistResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByText("Review probe plan")).toBeTruthy();
+    });
+
+    expect(screen.getByText("Generate / validate probe patch")).toBeTruthy();
+    expect(screen.getByText("Review experiment decision")).toBeTruthy();
+
+    // Issue #179: Next Actions are grouped under their stage section by category.
+    expect(screen.getByTestId("stage-next-actions-observe").textContent).toContain("observe");
+    expect(screen.getByTestId("stage-next-actions-instrument").textContent).toContain("instrument");
+    expect(screen.getByTestId("stage-next-actions-evaluate").textContent).toContain("evaluate");
+  });
+
+  test("renders the 4 hub stage sections with links to detail pages (Issue #179)", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(completeResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("stage-section-understand")).toBeTruthy();
+    });
+
+    expect(screen.getByTestId("stage-title-understand").textContent).toBe("Understand");
+    expect(screen.getByTestId("stage-title-observe").textContent).toBe("Decide Where to Observe");
+    expect(screen.getByTestId("stage-title-instrument").textContent).toBe("Instrument");
+    expect(screen.getByTestId("stage-title-evaluate").textContent).toBe("Evaluate");
+
+    // Existing pipeline checklist / gap worklist / capabilities elements survive the reorganization.
+    expect(screen.getByTestId("pipeline-checklist")).toBeTruthy();
+    expect(screen.getByTestId("metadata-coverage")).toBeTruthy();
+
+    // Each stage links to its detail pages.
+    expect(within(screen.getByTestId("stage-links-observe")).getByText("Flow Explorer")).toBeTruthy();
+    expect(within(screen.getByTestId("stage-links-instrument")).getByText("Probe Planner")).toBeTruthy();
+    expect(within(screen.getByTestId("stage-links-evaluate")).getByText("Experiments")).toBeTruthy();
   });
 
   test("shows no-gaps message when gaps are empty", async () => {
@@ -3393,6 +4078,32 @@ describe("Per-screen assistant panel", () => {
     expect(suggestions[0].textContent).toContain(
       "Why is 'Intelligence reasoning model configuration' blocked?",
     );
+  });
+
+  test("closed agent button can show a snapshot notice bubble", async () => {
+    const onSnapshotNoticeClick = vi.fn();
+    const { AssistantPanel } = await import("@/components/assistant-panel");
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/system-understanding"]}>
+          <AssistantPanel
+            snapshotNotice="HEAD が最新 snapshot より進んでいます。snapshot を作成してください。"
+            onSnapshotNoticeClick={onSnapshotNoticeClick}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const notice = screen.getByTestId("assistant-snapshot-notice");
+    expect(notice.textContent).toContain("snapshot を作成してください");
+    fireEvent.click(notice);
+    expect(onSnapshotNoticeClick).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByTestId("assistant-button"));
+    expect(screen.queryByTestId("assistant-snapshot-notice")).toBeNull();
   });
 
   test("asking a question renders the answer with fallback marking, citations, and actions", async () => {

@@ -3,7 +3,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import {
   AlertCircle, CheckCircle, FileCode, GitPullRequest,
-  HelpCircle, Layers, Loader2, MessageSquareText, Pencil, Play, Send,
+  HelpCircle, Layers, Loader2, MessageSquareText, Pencil, Play, RefreshCw, Send,
   Sparkles, XCircle,
 } from "lucide-react";
 import {
@@ -20,6 +20,8 @@ import {
   useInterviewSessions,
   useLatestSnapshot,
   useMaterializeInterview,
+  useRebaseInterviewSnapshot,
+  useRepositoryStatus,
   useRejectInterviewProposal,
   useResumeInterviewQa,
   useRunRuntimeRealityCheck,
@@ -29,7 +31,7 @@ import {
 } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
 import { api } from "@/api/client";
-import { DiagnosticFixCallout } from "@/components/diagnostic-fix";
+import { DiagnosticFixCallout, useDiagnosticHighlight } from "@/components/diagnostic-fix";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -237,7 +239,12 @@ function provenanceVariant(value: string) {
 function approvalVariant(value: string) {
   if (value === "approved" || value === "edited") return "success" as const;
   if (value === "rejected") return "destructive" as const;
+  if (value === "needs_review") return "warning" as const;
   return "secondary" as const;
+}
+
+function proposalReviewable(value: string) {
+  return value === "proposed" || value === "needs_review";
 }
 
 function confidenceVariant(level: string) {
@@ -259,6 +266,10 @@ function csv(items: string[]) {
 
 function splitCsv(value: string) {
   return value.split(",").map(v => v.trim()).filter(Boolean);
+}
+
+function shortSha(value: string | null | undefined) {
+  return value ? value.slice(0, 8) : "unknown";
 }
 
 function openDiff(diff: string, sessionId: number) {
@@ -881,6 +892,7 @@ export default function InterviewPage() {
   const { user } = useAuth();
   const actor = user?.username ?? "dashboard";
 
+  const { data: repositoryStatus, refetch: refetchRepositoryStatus } = useRepositoryStatus();
   const { data: latestSnapshot, isLoading: snapshotLoading } = useLatestSnapshot();
   const { data: sessions, isLoading: sessionsLoading } = useInterviewSessions();
   const createSession = useCreateInterviewSession();
@@ -892,6 +904,7 @@ export default function InterviewPage() {
   const reject = useRejectInterviewProposal(selectedSessionId);
   const edit = useEditInterviewProposal(selectedSessionId);
   const materialize = useMaterializeInterview(selectedSessionId);
+  const rebaseSnapshot = useRebaseInterviewSnapshot(selectedSessionId);
   const updateUnderstanding = useUpdateInterviewUnderstanding();
   const confirmUnderstanding = useConfirmInterviewUnderstanding(selectedSessionId);
 
@@ -900,8 +913,14 @@ export default function InterviewPage() {
   const [editing, setEditing] = useState<InterviewProposalOut | null>(null);
   const [editForm, setEditForm] = useState<EditForm | null>(null);
   const [lastMaterialization, setLastMaterialization] = useState<InterviewMaterializeOut | null>(null);
-  const [answerRevisionReflected, setAnswerRevisionReflected] = useState(false);
-  const [lastEvidenceReads, setLastEvidenceReads] = useState<IntelligenceRunEvidenceOut[]>([]);
+  const [answerRevisionReflectedState, setAnswerRevisionReflectedState] = useState<{
+    sessionId: number | null;
+    value: boolean;
+  }>({ sessionId: null, value: false });
+  const [lastEvidenceReadsState, setLastEvidenceReadsState] = useState<{
+    sessionId: number | null;
+    items: IntelligenceRunEvidenceOut[];
+  }>({ sessionId: null, items: [] });
 
   const sortedSessions = useMemo(() => sessions ?? [], [sessions]);
   const proposals = session?.proposals ?? [];
@@ -910,10 +929,16 @@ export default function InterviewPage() {
   const diff = lastMaterialization?.diff || session?.materialization_diff || "";
   const currentStage = session?.stage ?? "understanding_initialized";
   const isProposalStage = currentStage === "proposal_generation";
+  const sessionSnapshotStale = !!(
+    session && latestSnapshot && session.snapshot_id !== latestSnapshot.id
+  );
+  const repositoryHeadStale = !!(session && repositoryStatus?.snapshot_stale);
 
   const building = createSession.isPending || updateUnderstanding.isPending;
   const uiState: InterviewUiState | null = session ? deriveUiState(session, building) : null;
   const unlocked = session ? proposalsUnlocked(session) : false;
+  const purposeFixHighlight = useDiagnosticHighlight<HTMLDivElement>("interview-purpose");
+  const capabilitiesFixHighlight = useDiagnosticHighlight<HTMLDivElement>("interview-capabilities");
   // 提案ステージで未回答の絞り込み質問が残っている状態。提案生成を依頼しても
   // 情報不足だった場合、モデルの確認質問が open_questions に残る。
   const proposalNarrowing =
@@ -921,17 +946,20 @@ export default function InterviewPage() {
 
   useEffect(() => {
     if (!selectedSessionId && sortedSessions.length > 0) {
-      setSearchParams({ session: String(sortedSessions[0].id) }, { replace: true });
+      const next = new URLSearchParams(searchParams);
+      next.set("session", String(sortedSessions[0].id));
+      setSearchParams(next, { replace: true });
     }
-  }, [selectedSessionId, sortedSessions, setSearchParams]);
+  }, [selectedSessionId, sortedSessions, searchParams, setSearchParams]);
 
-  // Per-session UI state: switching sessions must not carry over the
-  // previous session's "answers reflected" banner (#136) or last-turn
-  // evidence reads (#137) — both describe events in that session only.
-  useEffect(() => {
-    setAnswerRevisionReflected(false);
-    setLastEvidenceReads([]);
-  }, [selectedSessionId]);
+  const answerRevisionReflected =
+    answerRevisionReflectedState.sessionId === selectedSessionId
+      ? answerRevisionReflectedState.value
+      : false;
+  const lastEvidenceReads =
+    lastEvidenceReadsState.sessionId === selectedSessionId
+      ? lastEvidenceReadsState.items
+      : [];
 
   const userMessageCount = useMemo(
     () => (session?.messages ?? []).filter(m => m.role === "user").length,
@@ -943,6 +971,9 @@ export default function InterviewPage() {
   const zeroBaseComplete =
     uiState === "zero_base" &&
     (userMessageCount >= ZERO_BASE_QUESTIONS.length || isProposalStage);
+  const canConfirmStructuredUnderstanding = !!(
+    session?.current_understanding && session.understanding_confirmed_at == null
+  );
 
   // 現在ユーザーに求める「1つの質問/確認」を導出する。
   const focusedQuestion = useMemo<FocusedQuestion | null>(() => {
@@ -998,7 +1029,21 @@ export default function InterviewPage() {
     return { text: focusedQuestion.text, qaId: open[0].qa_id ?? undefined };
   }, [uiState, session, focusedQuestion]);
 
+  const ensureRepositorySnapshotFresh = async (action: string) => {
+    const { data: status } = await refetchRepositoryStatus();
+    if (status?.snapshot_stale) {
+      toast.warning(
+        `${action}の前に最新 HEAD の snapshot を作成してください。Repository 画面で snapshot を作成してから、このインタビューを更新できます。`,
+      );
+      return false;
+    }
+    return true;
+  };
+
   const nextActionText = useMemo(() => {
+    if (canConfirmStructuredUnderstanding) {
+      return "右側の「現在の理解」パネルに表示されているシステム理解を確認し、問題なければ確認済みにしてください。";
+    }
     switch (uiState) {
       case "preparing":
         return "ドキュメントとコードから自動でシステム理解を構築しています。完了までお待ちください。";
@@ -1023,13 +1068,14 @@ export default function InterviewPage() {
       default:
         return "";
     }
-  }, [uiState, approvedCount, zeroBaseComplete, proposalNarrowing]);
+  }, [uiState, approvedCount, zeroBaseComplete, proposalNarrowing, canConfirmStructuredUnderstanding]);
 
   const startSession = async () => {
     if (!latestSnapshot) {
       toast.error("先にリポジトリのスナップショットを作成してください");
       return;
     }
+    if (!(await ensureRepositorySnapshotFresh("インタビュー開始"))) return;
     try {
       const created = await createSession.mutateAsync({
         snapshot_id: latestSnapshot.id,
@@ -1062,7 +1108,10 @@ export default function InterviewPage() {
         toast.error(`理解の更新に失敗しました: ${updated.last_error}`);
         return;
       }
-      setAnswerRevisionReflected(hadAnswerRevision);
+      setAnswerRevisionReflectedState({
+        sessionId: selectedSessionId,
+        value: hadAnswerRevision,
+      });
       try {
         const diff = await api.get<UnderstandingDiffOut>(
           `/interview/sessions/${selectedSessionId}/understanding-diff`,
@@ -1090,17 +1139,22 @@ export default function InterviewPage() {
   const sendText = async (raw: string, opts?: { answerUnknown?: boolean }) => {
     const text = raw.trim();
     if (!text || !selectedSessionId) return;
+    const willGenerateProposals = isProposalStage && unlocked;
+    if (willGenerateProposals && !(await ensureRepositorySnapshotFresh("提案生成"))) return;
     try {
       const result = await dialogueTurn.mutateAsync({
         user_message: text,
-        generate_proposals: isProposalStage && unlocked,
+        generate_proposals: willGenerateProposals,
         answered_question: answeredForTurn.text,
         answered_qa_id: answeredForTurn.qaId,
         actor,
         answer_unknown: opts?.answerUnknown,
       });
       setMessage("");
-      setLastEvidenceReads(result.evidence_reads ?? []);
+      setLastEvidenceReadsState({
+        sessionId: selectedSessionId,
+        items: result.evidence_reads ?? [],
+      });
       if (result.error) toast.error(result.error);
       else if (opts?.answerUnknown) toast.info("「わからない」として記録しました。仮説を立てて確認を続けます。");
       else if (result.proposals.length) toast.success(`${result.proposals.length}件の提案を生成しました`);
@@ -1161,10 +1215,27 @@ export default function InterviewPage() {
 
   const triggerMaterialization = async () => {
     if (!selectedSessionId) return;
+    if (!(await ensureRepositorySnapshotFresh("差分生成"))) return;
     try {
       const result = await materialize.mutateAsync();
       setLastMaterialization(result);
       toast.success(`${result.items_materialized}件を差分化しました`);
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
+  const rebaseToLatestSnapshot = async () => {
+    if (!selectedSessionId || !latestSnapshot) return;
+    if (!(await ensureRepositorySnapshotFresh("インタビュー更新"))) return;
+    try {
+      const result = await rebaseSnapshot.mutateAsync({
+        target_snapshot_id: latestSnapshot.id,
+        actor,
+      });
+      toast.success(
+        `最新 snapshot に更新しました(再レビュー ${result.proposals_marked_needs_review} 件)`,
+      );
     } catch (e) {
       toast.error(String(e));
     }
@@ -1186,7 +1257,12 @@ export default function InterviewPage() {
           <Select
             className="w-[240px]"
             value={selectedSessionId ? String(selectedSessionId) : ""}
-            onChange={e => setSearchParams(e.target.value ? { session: e.target.value } : {})}
+            onChange={e => {
+              const next = new URLSearchParams(searchParams);
+              if (e.target.value) next.set("session", e.target.value);
+              else next.delete("session");
+              setSearchParams(next);
+            }}
             disabled={!sortedSessions.length}
             aria-label="インタビューセッション"
           >
@@ -1204,8 +1280,12 @@ export default function InterviewPage() {
         </div>
       </div>
 
-      <DiagnosticFixCallout anchor="interview-purpose" />
-      <DiagnosticFixCallout anchor="interview-capabilities" />
+      <div {...purposeFixHighlight}>
+        <DiagnosticFixCallout anchor="interview-purpose" />
+      </div>
+      <div {...capabilitiesFixHighlight}>
+        <DiagnosticFixCallout anchor="interview-capabilities" />
+      </div>
 
       {!latestSnapshot && !snapshotLoading && (
         <Card>
@@ -1237,6 +1317,55 @@ export default function InterviewPage() {
         </Card>
       ) : (
         <>
+          {repositoryHeadStale && repositoryStatus && (
+            <div
+              className="rounded-md border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 p-3 text-sm text-amber-900 dark:text-amber-100 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"
+              data-testid="repository-head-stale-banner"
+            >
+              <div>
+                リポジトリの HEAD が最新 snapshot より進んでいます
+                {repositoryStatus.latest_snapshot && (
+                  <>
+                    {" "}(snapshot {repositoryStatus.latest_snapshot.id}:{" "}
+                    <code>{shortSha(repositoryStatus.latest_snapshot.commit_sha)}</code>
+                    {" "}→ HEAD <code>{shortSha(repositoryStatus.current_head)}</code>)
+                  </>
+                )}
+                。新しい snapshot を作成してから、このインタビューを更新してください。
+              </div>
+              <Link
+                to="/repository"
+                className="inline-flex h-8 items-center justify-center gap-2 whitespace-nowrap rounded-md border border-input bg-background px-3 text-xs font-medium shadow-sm hover:bg-accent hover:text-accent-foreground"
+              >
+                <RefreshCw className="h-4 w-4" />
+                Repository で snapshot 作成
+              </Link>
+            </div>
+          )}
+
+          {sessionSnapshotStale && latestSnapshot && (
+            <div
+              className="rounded-md border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 p-3 text-sm text-amber-900 dark:text-amber-100 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"
+              data-testid="interview-snapshot-stale-banner"
+            >
+              <div>
+                このインタビューは snapshot {session.snapshot_id} に固定されています。
+                最新 snapshot {latestSnapshot.id} に更新すると、既存の回答を保持し、
+                影響を受けた提案だけ再レビューに戻します。
+              </div>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={rebaseToLatestSnapshot}
+                disabled={rebaseSnapshot.isPending}
+                data-testid="rebase-interview-snapshot"
+              >
+                <RefreshCw className={`h-4 w-4 mr-1 ${rebaseSnapshot.isPending ? "animate-spin" : ""}`} />
+                {rebaseSnapshot.isPending ? "更新中..." : "最新 snapshot に更新"}
+              </Button>
+            </div>
+          )}
+
           {uiState && <NextActionBanner uiState={uiState} nextAction={nextActionText} />}
 
           <Card>
@@ -1378,16 +1507,27 @@ export default function InterviewPage() {
                           )}
                         </div>
                       )}
-                      {zeroBaseComplete && (
-                        <Button
-                          size="sm"
-                          onClick={doConfirmUnderstanding}
-                          disabled={confirmUnderstanding.isPending}
-                          data-testid="confirm-understanding"
-                        >
-                          <CheckCircle className="h-4 w-4 mr-1" />
-                          {confirmUnderstanding.isPending ? "確定中..." : "この内容で提案生成に進む"}
-                        </Button>
+                      {(zeroBaseComplete || canConfirmStructuredUnderstanding) && (
+                        <div className="space-y-1">
+                          {canConfirmStructuredUnderstanding && (
+                            <p className="text-xs text-muted-foreground">
+                              対象: 右側の「現在の理解」パネルに表示されているシステム理解
+                            </p>
+                          )}
+                          <Button
+                            size="sm"
+                            onClick={doConfirmUnderstanding}
+                            disabled={confirmUnderstanding.isPending}
+                            data-testid="confirm-understanding"
+                          >
+                            <CheckCircle className="h-4 w-4 mr-1" />
+                            {confirmUnderstanding.isPending
+                              ? "確定中..."
+                              : zeroBaseComplete
+                                ? "この内容で提案生成に進む"
+                                : "現在の理解を確認済みにする"}
+                          </Button>
+                        </div>
                       )}
                       <Textarea
                         ref={messageInputRef}
@@ -1489,7 +1629,7 @@ export default function InterviewPage() {
                               size="sm"
                               variant="outline"
                               onClick={() => openEdit(proposal)}
-                              disabled={proposal.approval_state !== "proposed" || edit.isPending}
+                              disabled={!proposalReviewable(proposal.approval_state) || edit.isPending}
                             >
                               <Pencil className="h-4 w-4 mr-1" />
                               編集
@@ -1498,7 +1638,7 @@ export default function InterviewPage() {
                               size="sm"
                               variant="outline"
                               onClick={() => approve.mutateAsync({ proposalId: proposal.id, actor }).then(() => toast.success("提案を承認しました")).catch(e => toast.error(String(e)))}
-                              disabled={proposal.approval_state !== "proposed" || approve.isPending}
+                              disabled={!proposalReviewable(proposal.approval_state) || approve.isPending}
                             >
                               <CheckCircle className="h-4 w-4 mr-1 text-emerald-600" />
                               承認
@@ -1507,7 +1647,7 @@ export default function InterviewPage() {
                               size="sm"
                               variant="outline"
                               onClick={() => reject.mutateAsync({ proposalId: proposal.id, actor }).then(() => toast.success("提案を却下しました")).catch(e => toast.error(String(e)))}
-                              disabled={proposal.approval_state !== "proposed" || reject.isPending}
+                              disabled={!proposalReviewable(proposal.approval_state) || reject.isPending}
                             >
                               <XCircle className="h-4 w-4 mr-1 text-red-500" />
                               却下

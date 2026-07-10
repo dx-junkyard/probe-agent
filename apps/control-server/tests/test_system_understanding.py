@@ -325,6 +325,191 @@ class TestSystemUnderstandingNextActions:
         assert "Create snapshot" in after_actions
 
 
+class TestNextActionsSpanPlanAndExperimentStatus:
+    """Issue #174: Next Actions must surface probe plan / experiment status,
+    not just the System Understanding pipeline."""
+
+    def _setup_system(self, admin_client, tmp_path, name):
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, name)
+        hdrs = _headers(token, sys["id"])
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap_r = admin_client.post(
+            "/repository/snapshots", json={"commit_sha": sha}, headers=hdrs
+        )
+        snapshot_id = snap_r.json()["id"]
+        return sys["id"], hdrs, snapshot_id
+
+    def _insert_intelligence_run(self, system_id, snapshot_id):
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO intelligence_runs
+                       (system_id, snapshot_id, run_type, provider, model,
+                        prompt_version, schema_version, decision_method,
+                        status, is_mock, started_at, completed_at)
+                   VALUES (?, ?, 'probe_plan', 'mock', 'mock-model', 'v1', 'v1',
+                           'reasoning_llm', 'completed', 1, 0, 0)""",
+                (system_id, snapshot_id),
+            )
+            return cur.lastrowid
+
+    def test_proposed_plan_surfaces_review_action(self, admin_client, tmp_path):
+        from app.db import get_conn
+
+        system_id, hdrs, snapshot_id = self._setup_system(
+            admin_client, tmp_path, "plan-review-sys"
+        )
+        run_id = self._insert_intelligence_run(system_id, snapshot_id)
+        with get_conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO probe_plans
+                       (system_id, snapshot_id, intelligence_run_id, feature_id,
+                        objective, status, origin, created_at, updated_at)
+                   VALUES (?, ?, ?, 'feat-1', 'obj', 'proposed', 'manual', 0, 0)""",
+                (system_id, snapshot_id, run_id),
+            )
+            plan_id = cur.lastrowid
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        matching = [
+            a for a in r.json()["next_actions"] if a["action"] == "Review probe plan"
+        ]
+        assert len(matching) == 1
+        assert matching[0]["category"] == "observe"
+        assert matching[0]["link"] == f"/probe-planner?plan={plan_id}"
+
+    def test_approved_plan_without_validated_patch_surfaces_instrument_action(
+        self, admin_client, tmp_path
+    ):
+        from app.db import get_conn
+
+        system_id, hdrs, snapshot_id = self._setup_system(
+            admin_client, tmp_path, "plan-patch-sys"
+        )
+        run_id = self._insert_intelligence_run(system_id, snapshot_id)
+        with get_conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO probe_plans
+                       (system_id, snapshot_id, intelligence_run_id, feature_id,
+                        objective, status, origin, created_at, updated_at)
+                   VALUES (?, ?, ?, 'feat-1', 'obj', 'approved', 'manual', 0, 0)""",
+                (system_id, snapshot_id, run_id),
+            )
+            plan_id = cur.lastrowid
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        matching = [
+            a for a in r.json()["next_actions"]
+            if a["action"] == "Generate / validate probe patch"
+        ]
+        assert len(matching) == 1
+        assert matching[0]["category"] == "instrument"
+        assert matching[0]["link"] == f"/probe-planner?plan={plan_id}"
+
+    def test_approved_plan_with_validated_patch_has_no_pending_action(
+        self, admin_client, tmp_path
+    ):
+        from app.db import get_conn
+
+        system_id, hdrs, snapshot_id = self._setup_system(
+            admin_client, tmp_path, "plan-validated-sys"
+        )
+        run_id = self._insert_intelligence_run(system_id, snapshot_id)
+        with get_conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO probe_plans
+                       (system_id, snapshot_id, intelligence_run_id, feature_id,
+                        objective, status, origin, created_at, updated_at)
+                   VALUES (?, ?, ?, 'feat-1', 'obj', 'approved', 'manual', 0, 0)""",
+                (system_id, snapshot_id, run_id),
+            )
+            plan_id = cur.lastrowid
+            cur = conn.execute(
+                """INSERT INTO probe_patches
+                       (plan_id, system_id, snapshot_id, commit_sha, diff,
+                        skipped, status, cleanup_state, created_at)
+                   VALUES (?, ?, ?, 'deadbeef', 'diff', '[]', 'generated',
+                           'not_attempted', 0)""",
+                (plan_id, system_id, snapshot_id),
+            )
+            patch_id = cur.lastrowid
+            for variant in ("baseline", "probed"):
+                conn.execute(
+                    """INSERT INTO validation_runs
+                           (patch_id, system_id, variant, worktree_path,
+                            overall_success, trace_status, network_isolation,
+                            cleanup_state, created_at)
+                       VALUES (?, ?, ?, '/tmp/x', 1, 'not_checked',
+                               'not_requested', 'not_attempted', 0)""",
+                    (patch_id, system_id, variant),
+                )
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        labels = [a["action"] for a in r.json()["next_actions"]]
+        assert "Generate / validate probe patch" not in labels
+
+    def test_completed_undecided_experiment_surfaces_evaluate_action(
+        self, admin_client, tmp_path
+    ):
+        from app.db import get_conn
+
+        system_id, hdrs, snapshot_id = self._setup_system(
+            admin_client, tmp_path, "experiment-decision-sys"
+        )
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO experiments
+                       (system_id, feature_id, objective, snapshot_id,
+                        baseline_commit, config_revision, execution_config,
+                        status, human_decision, created_at)
+                   VALUES (?, 'feat-1', 'obj', ?, 'deadbeef', 'v1', '{}',
+                           'completed', 'undecided', 0)""",
+                (system_id, snapshot_id),
+            )
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        matching = [
+            a for a in r.json()["next_actions"]
+            if a["action"] == "Review experiment decision"
+        ]
+        assert len(matching) == 1
+        assert matching[0]["category"] == "evaluate"
+        assert matching[0]["link"] == "/experiments"
+
+    def test_decided_experiment_has_no_pending_action(self, admin_client, tmp_path):
+        from app.db import get_conn
+
+        system_id, hdrs, snapshot_id = self._setup_system(
+            admin_client, tmp_path, "experiment-decided-sys"
+        )
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO experiments
+                       (system_id, feature_id, objective, snapshot_id,
+                        baseline_commit, config_revision, execution_config,
+                        status, human_decision, created_at)
+                   VALUES (?, 'feat-1', 'obj', ?, 'deadbeef', 'v1', '{}',
+                           'completed', 'adopted', 0)""",
+                (system_id, snapshot_id),
+            )
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        labels = [a["action"] for a in r.json()["next_actions"]]
+        assert "Review experiment decision" not in labels
+
+
 class TestPipelineStepStatuses:
     def test_all_pipeline_steps_present(self, admin_client, tmp_path):
         token = _login(admin_client)
@@ -763,6 +948,26 @@ class TestNextActionsPriority:
         labels = [a.action for a in actions]
         assert labels == ["Add source metadata", "Review docs-code gaps"]
 
+    def test_gap_summary_surfaces_unclassified_api_and_probe_candidate_actions(self):
+        from app.system_understanding_service import GapSummary, _build_next_actions
+
+        actions = _build_next_actions(
+            self._complete_pipeline(),
+            purpose={"name": "Sys", "summary": "Does things"},
+            capabilities=[{"name": "Cap"}],
+            metadata_coverage=None,
+            gap_count=3,
+            gap_summary=[
+                GapSummary(gap_type="unclassified_entrypoint", count=1),
+                GapSummary(gap_type="missing_probe_flow", count=2),
+            ],
+        )
+        by_label = {a.action: a for a in actions}
+        assert by_label["Unclassified API found"].category == "observe"
+        assert by_label["Unclassified API found"].link == "/capability-map"
+        assert by_label["Probe candidate available"].category == "observe"
+        assert by_label["Probe candidate available"].link == "/flow-explorer"
+
     def test_fully_satisfied_pipeline_offers_exploration_actions(self):
         from app.system_understanding_service import MetadataCoverage, _build_next_actions
 
@@ -775,3 +980,103 @@ class TestNextActionsPriority:
         )
         labels = [a.action for a in actions]
         assert labels == ["Start from Capability", "Start from Feature", "Open Flow Explorer"]
+
+    def test_all_actions_carry_a_finite_category(self):
+        from app.system_understanding_service import MetadataCoverage, _build_next_actions
+
+        actions = _build_next_actions(
+            self._complete_pipeline(),
+            purpose=None,
+            capabilities=[],
+            metadata_coverage=MetadataCoverage(symbol_count=10, symbols_with_source_metadata=0),
+            gap_count=2,
+            proposed_plan_ids=[7],
+            approved_plan_ids_without_validated_patch=[8],
+            undecided_completed_experiment_ids=[9],
+        )
+        assert actions
+        for action in actions:
+            assert action.category in ("understand", "observe", "instrument", "evaluate")
+
+    def test_pipeline_incomplete_still_puts_remediation_first(self):
+        from app.system_understanding_service import _build_next_actions
+
+        actions = _build_next_actions(
+            self._incomplete_pipeline("symbols_indexed"),
+            purpose=None,
+            capabilities=[],
+            metadata_coverage=None,
+            gap_count=0,
+            proposed_plan_ids=[1],
+            approved_plan_ids_without_validated_patch=[2],
+            undecided_completed_experiment_ids=[3],
+        )
+        assert actions[0].action == "Index code symbols"
+        assert actions[0].category == "understand"
+        labels = [a.action for a in actions]
+        assert "Review probe plan" in labels
+        assert "Generate / validate probe patch" in labels
+        assert "Review experiment decision" in labels
+
+    def test_proposed_plan_triggers_review_action(self):
+        from app.system_understanding_service import _build_next_actions
+
+        actions = _build_next_actions(
+            self._complete_pipeline(),
+            purpose={"name": "Sys", "summary": "Does things"},
+            capabilities=[{"name": "Cap"}],
+            metadata_coverage=None,
+            gap_count=0,
+            proposed_plan_ids=[42],
+        )
+        matching = [a for a in actions if a.action == "Review probe plan"]
+        assert len(matching) == 1
+        assert matching[0].category == "observe"
+        assert matching[0].link == "/probe-planner?plan=42"
+
+    def test_approved_plan_without_validated_patch_triggers_instrument_action(self):
+        from app.system_understanding_service import _build_next_actions
+
+        actions = _build_next_actions(
+            self._complete_pipeline(),
+            purpose={"name": "Sys", "summary": "Does things"},
+            capabilities=[{"name": "Cap"}],
+            metadata_coverage=None,
+            gap_count=0,
+            approved_plan_ids_without_validated_patch=[13],
+        )
+        matching = [a for a in actions if a.action == "Generate / validate probe patch"]
+        assert len(matching) == 1
+        assert matching[0].category == "instrument"
+        assert matching[0].link == "/probe-planner?plan=13"
+
+    def test_completed_experiment_without_decision_triggers_evaluate_action(self):
+        from app.system_understanding_service import _build_next_actions
+
+        actions = _build_next_actions(
+            self._complete_pipeline(),
+            purpose={"name": "Sys", "summary": "Does things"},
+            capabilities=[{"name": "Cap"}],
+            metadata_coverage=None,
+            gap_count=0,
+            undecided_completed_experiment_ids=[99],
+        )
+        matching = [a for a in actions if a.action == "Review experiment decision"]
+        assert len(matching) == 1
+        assert matching[0].category == "evaluate"
+        assert matching[0].link == "/experiments"
+
+    def test_no_pending_plan_or_experiment_actions_when_none_exist(self):
+        from app.system_understanding_service import _build_next_actions
+
+        actions = _build_next_actions(
+            self._complete_pipeline(),
+            purpose={"name": "Sys", "summary": "Does things"},
+            capabilities=[{"name": "Cap"}],
+            metadata_coverage=None,
+            gap_count=0,
+        )
+        labels = [a.action for a in actions]
+        assert "Review probe plan" not in labels
+        assert "Generate / validate probe patch" not in labels
+        assert "Review experiment decision" not in labels

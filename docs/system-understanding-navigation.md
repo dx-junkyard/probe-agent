@@ -57,17 +57,50 @@ Probe Planner
 Experiment Workspace
 ```
 
+System Understanding は現在、上記の詳細画面への入口を 4 stage Hub として
+まとめる。
+
+```text
+Understand
+  → Repository / System Understanding / Capability Map / Feature Map
+Decide Where to Observe
+  → Capability Map / Flow Explorer / Probe Planner
+Instrument
+  → Probe Planner / Repository Refresh Hub
+Evaluate
+  → Experiments / Workspaces
+```
+
 ### 各画面の役割
 
 | 画面 | 役割 |
 | --- | --- |
-| System Understanding | Pipeline checklist、System Purpose、Core Capabilities 一覧、metadata coverage、docs-code gap、next actions |
-| Capability Map | System Purpose → Core Capability → Element のツリー表示とドリルダウン |
+| System Understanding | 4 stage Hub、Pipeline checklist、System Purpose、Core Capabilities 一覧、metadata coverage、docs-code gap、Next Actions |
+| Capability Map | System Purpose → Core Capability → Element のツリー表示とドリルダウン。選択 capability の gaps / probe plans / experiments も表示 |
 | Capability Node Detail | 選択したノードの provenance、freshness/drift、source anchor |
 | API Role Card | backend entrypoint の所属 capability、role、consumers、state effects、probe value |
 | Flow Explorer | entrypoint からの候補実行フローの可視化とノード/エッジ選択 |
-| Probe Planner | 選択した観測点の mode・risk・承認状態の管理 |
-| Experiment Workspace | baseline と source patch variants の隔離実行と比較 |
+| Probe Planner | 選択した観測点の mode・risk・承認状態、`?plan=` deep link、patch generation / validation / apply の管理 |
+| Experiments | baseline と source patch variants の隔離実行、比較、human decision |
+
+## Context Header
+
+主要な intelligence ページ（System Understanding、Capability Map、Feature Map、
+Flow Explorer、Probe Planner、Experiments）は共通の Context Header を表示する。
+これは「今見ている分析対象」を明示する read-only strip であり、値は既存 API /
+URL params から取得する。
+
+| 項目 | 取得元 |
+| --- | --- |
+| System | 現在選択中の system |
+| Snapshot | System Understanding summary の `commit_sha`。未構築時のみ latest snapshot の `commit_sha` |
+| Capability | URL の `?capability=` |
+| Entrypoint | URL の `?entrypoint_type=` + `?entrypoint_id=` |
+| Status | 完了済み pipeline step と gap 件数 |
+
+`Snapshot:` は repository の現在 HEAD ではなく、分析済み snapshot の commit を
+表示する。HEAD が進んだ場合は Repository Refresh Hub の stale 表示で扱い、
+Context Header は pinned snapshot の文脈を崩さない。
 
 ## Pipeline Step 名
 
@@ -97,7 +130,7 @@ probe_plans_reviewed       # probe plan がレビューされている
 
 ## ページ間ナビゲーション
 
-Issue #90 で実装されたクロスページリンク:
+クロスページリンク:
 
 | From | To | Mechanism |
 | --- | --- | --- |
@@ -108,9 +141,56 @@ Issue #90 で実装されたクロスページリンク:
 | System Understanding — gap entrypoint_refs | Flow Explorer | `?entrypoint_type=...&entrypoint_id=...` |
 | System Understanding — gap `Create implementation issue` | Issue draft dialog | gap から issue draft を生成・編集・Markdown コピー・外部 URL 登録（#107, probe-agent DB が正本、外部 tracker 連携なし） |
 | Capability Map — element/boundary | Flow Explorer | entrypoint_type + entrypoint_ref で指定 |
+| Capability Map — Related APIs | Flow Explorer | `?entrypoint_type=...&entrypoint_id=...&capability=<key>` |
+| Capability Map — Probe Plans | Probe Planner | `?plan=<id>&capability=<key>` |
+| Capability Map — Experiments | Experiments | `?capability=<key>` |
 | Capability Map — feature_id | Feature Map | `?feature=<id>` でハイライト＋スクロール |
 | Feature Map — related capabilities | Capability Map | `?capability=<key>` で自動選択 |
 | Feature Map — code links (feature_id) | Feature Map | `?feature=<id>` でハイライト |
+| Flow Explorer — Back to Capability | Capability Map | `?capability=<key>` を保持 |
+| Flow Explorer — Create Probe Plan draft | Probe Planner | `?plan=<id>&capability=<key>` |
+| Probe Planner — Back to Capability | Capability Map | `?capability=<key>` を保持 |
+| Probe Planner — Experiments | Experiments | `?capability=<key>` を保持 |
+| Experiments — Back to Capability | Capability Map | `?capability=<key>` を保持 |
+| System Understanding — Next Action `Review probe plan` | Probe Planner | `?plan=<id>` |
+
+`?capability=` は selection state ではなく navigation context である。Flow Explorer、
+Probe Planner、Experiments はこの値を使って Context Header と back link を表示し、
+Capability Map から始めた探索が Evaluate stage まで途切れないようにする。
+
+## Capability Context API
+
+Capability Map の detail panel は
+`GET /repository/capabilities/{capability_key}/context` を使い、選択 capability に
+紐づく gaps / probe plans / experiments を表示する。
+
+この API の結合ルールはすべて exact-key equality である。
+
+| データ | 基準 |
+| --- | --- |
+| gaps | System Understanding の gap list を `capability_key` でフィルタ |
+| probe plans | latest ready snapshot の `capability_hierarchy_nodes.feature_id` と `probe_plans.feature_id` |
+| experiments | 同じ latest ready snapshot 上の plan feature_id と `experiments.feature_id` |
+
+同一レスポンス内で snapshot 規約を混在させない。新しい snapshot が `indexing` /
+`failed` の間も、context API は latest ready snapshot を基準にして、gaps /
+probe plans / experiments を同じ分析文脈で返す。
+
+## Next Actions
+
+System Understanding の Next Actions は 4 stage に分類される。
+
+| Category | Stage | 例 |
+| --- | --- | --- |
+| `understand` | Understand | Configure repository、Create snapshot、Review docs-code gaps |
+| `observe` | Decide Where to Observe | Unclassified API found、Probe candidate available、Review probe plan |
+| `instrument` | Instrument | Generate / validate probe patch |
+| `evaluate` | Evaluate | Review experiment decision |
+
+`Unclassified API found` は `unclassified_entrypoint` gap summary から生成され、
+Capability Map / Interview 経由の分類作業へ誘導する。`Probe candidate available`
+は `missing_probe_flow` gap summary から生成され、Flow Explorer / Probe Planner
+経由で観測計画を作る導線を示す。
 
 ## Feature Map から始める場合
 

@@ -22,6 +22,7 @@ import type {
   InterviewDialogueTurnOut, InterviewProposalDecisionOut,
   InterviewProposalMetadataBlock, InterviewProposalProbePlan,
   InterviewApprovedSetOut, InterviewMaterializeOut,
+  InterviewSnapshotRebaseOut,
   InterviewQaListOut, InterviewQaOut, InterviewQaAnswerOut,
   RuntimeRealityFactsOut, RuntimeRealityCheckRunOut,
   UnderstandingRevisionListOut, UnderstandingDiffOut,
@@ -32,6 +33,7 @@ import type {
   GitHubIssueStatus,
   IssueDraftUpdateRequest,
   SystemDiagnosticsOut,
+  CapabilityContextOut,
   AssistantScreenContext, AssistantAskRequest, AssistantAskOut,
   AssistantSettingsMetadataOut,
 } from "./types";
@@ -780,6 +782,7 @@ export function useAdvanceInterviewStage(sessionId: number | null) {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
       qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
+      qc.invalidateQueries({ queryKey: sysKey("system-diagnostics") });
     },
   });
 }
@@ -795,6 +798,25 @@ export function useConfirmInterviewUnderstanding(sessionId: number | null) {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
       qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
+      qc.invalidateQueries({ queryKey: sysKey("system-diagnostics") });
+    },
+  });
+}
+
+export function useRebaseInterviewSnapshot(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { target_snapshot_id?: number; actor: string }) =>
+      api.post<InterviewSnapshotRebaseOut>(
+        `/interview/sessions/${sessionId}/rebase-snapshot`,
+        data,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+      qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewApprovedSet"), sessionId] });
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewContextPack"), sessionId] });
+      qc.invalidateQueries({ queryKey: [...sysKey("understandingDiff"), sessionId] });
     },
   });
 }
@@ -1056,6 +1078,17 @@ export function useSystemUnderstanding() {
     queryKey: sysKey("system-understanding"),
     queryFn: () => api.get<SystemUnderstandingOut>("/repository/system-understanding"),
     enabled: !!getSystemId(),
+  });
+}
+
+export function useCapabilityContext(capabilityKey: string | null) {
+  return useQuery({
+    queryKey: sysKey("capability-context", capabilityKey),
+    queryFn: () =>
+      api.get<CapabilityContextOut>(
+        `/repository/capabilities/${encodeURIComponent(capabilityKey!)}/context`,
+      ),
+    enabled: !!capabilityKey && !!getSystemId(),
   });
 }
 

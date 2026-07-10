@@ -1192,6 +1192,28 @@ CREATE INDEX IF NOT EXISTS idx_interview_proposal_session
 CREATE INDEX IF NOT EXISTS idx_interview_proposal_system
     ON interview_proposal (system_id, session_id);
 
+CREATE TABLE IF NOT EXISTS interview_snapshot_rebase (
+    id                              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id                      INTEGER NOT NULL,
+    system_id                       INTEGER NOT NULL,
+    from_snapshot_id                INTEGER NOT NULL,
+    to_snapshot_id                  INTEGER NOT NULL,
+    actor                           TEXT NOT NULL DEFAULT '',
+    proposals_preserved             INTEGER NOT NULL DEFAULT 0,
+    proposals_marked_needs_review   INTEGER NOT NULL DEFAULT 0,
+    proposals_missing_source        INTEGER NOT NULL DEFAULT 0,
+    proposals_changed_source        INTEGER NOT NULL DEFAULT 0,
+    details_json                    TEXT NOT NULL DEFAULT '{}',
+    created_at                      REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (from_snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (to_snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_interview_snapshot_rebase_session
+    ON interview_snapshot_rebase (session_id, id DESC);
+
 -- Issue #70: per-item approval gate with manual decision record.
 -- Each decision is a separate row that references — but does not overwrite —
 -- the original reasoning_llm proposal. For edits, the developer-corrected

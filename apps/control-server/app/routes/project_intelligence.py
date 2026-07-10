@@ -95,6 +95,9 @@ from ..models import (
     AnchorDriftOut,
     CapabilityDriftOut,
     CapabilityHierarchyDriftOut,
+    CapabilityContextOut,
+    CapabilityContextProbePlanOut,
+    CapabilityContextExperimentOut,
     DriftCountsOut,
     ApiRoleCardOut,
     ApiRoleCardsOut,
@@ -852,7 +855,9 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
             entrypoints_with_capability_link=mc.entrypoints_with_capability_link,
         )
     next_actions = [
-        SystemUnderstandingNextActionOut(action=a.action, reason=a.reason, link=a.link)
+        SystemUnderstandingNextActionOut(
+            action=a.action, reason=a.reason, category=a.category, link=a.link,
+        )
         for a in summary.next_actions
     ]
     return SystemUnderstandingOut(
@@ -2834,6 +2839,133 @@ def get_capability_hierarchy(
                 system_id=system_id, snapshot_id=snapshot_id,
             )
         return _load_hierarchy_out(conn, system_id, snapshot_id, run_row)
+
+
+# ---------------------------------------------------------------------------
+# Capability context: gaps / probe plans / experiments (Issue #175)
+# ---------------------------------------------------------------------------
+
+
+def _load_capability_context(system_id: int, capability_key: str) -> CapabilityContextOut:
+    """Gaps / Probe Plans / Experiments explicitly linked to one capability_key.
+
+    All joins are exact-key equality, never inference: gaps reuse the existing
+    System Understanding gap list filtered by ``capability_key``; probe plans
+    are matched via ``capability_hierarchy_nodes.feature_id`` rows that carry
+    that ``capability_key`` (the same feature_id the hierarchy already
+    attaches to a capability's elements); experiments are matched to the
+    plans found that way, by ``feature_id``.
+    """
+    from ..system_understanding_service import _get_latest_ready_snapshot, get_system_understanding
+
+    summary = get_system_understanding(system_id)
+    understanding_out = _system_understanding_to_out(summary)
+    gaps = [g for g in understanding_out.gaps if g.capability_key == capability_key]
+
+    probe_plans: List[CapabilityContextProbePlanOut] = []
+    experiments: List[CapabilityContextExperimentOut] = []
+    with get_conn() as conn:
+        snapshot_row = _get_latest_ready_snapshot(conn, system_id)
+        if snapshot_row is not None:
+            snapshot_id = snapshot_row["id"]
+            run_row = conn.execute(
+                """
+                SELECT * FROM intelligence_runs
+                WHERE system_id = ? AND snapshot_id = ? AND run_type = 'capability_hierarchy'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (system_id, snapshot_id),
+            ).fetchone()
+            feature_ids: List[str] = []
+            if run_row is not None:
+                feature_rows = conn.execute(
+                    """
+                    SELECT DISTINCT feature_id FROM capability_hierarchy_nodes
+                    WHERE intelligence_run_id = ? AND capability_key = ?
+                      AND feature_id IS NOT NULL
+                    """,
+                    (run_row["id"], capability_key),
+                ).fetchall()
+                feature_ids = [r["feature_id"] for r in feature_rows]
+
+            if feature_ids:
+                placeholders = ",".join("?" for _ in feature_ids)
+                plan_rows = conn.execute(
+                    f"""
+                    SELECT * FROM probe_plans
+                    WHERE system_id = ? AND snapshot_id = ?
+                      AND feature_id IN ({placeholders})
+                    ORDER BY id DESC
+                    """,
+                    (system_id, snapshot_id, *feature_ids),
+                ).fetchall()
+                probe_plans = [
+                    CapabilityContextProbePlanOut(
+                        id=r["id"],
+                        feature_id=r["feature_id"],
+                        objective=r["objective"],
+                        status=r["status"],
+                        created_at=r["created_at"],
+                        updated_at=r["updated_at"],
+                    )
+                    for r in plan_rows
+                ]
+
+                plan_feature_ids = sorted({r["feature_id"] for r in plan_rows})
+                if plan_feature_ids:
+                    plan_placeholders = ",".join("?" for _ in plan_feature_ids)
+                    experiment_rows = conn.execute(
+                        f"""
+                        SELECT * FROM experiments
+                        WHERE system_id = ? AND snapshot_id = ?
+                          AND feature_id IN ({plan_placeholders})
+                        ORDER BY id DESC
+                        """,
+                        (system_id, snapshot_id, *plan_feature_ids),
+                    ).fetchall()
+                    experiments = [
+                        CapabilityContextExperimentOut(
+                            id=r["id"],
+                            feature_id=r["feature_id"],
+                            objective=r["objective"],
+                            status=r["status"],
+                            human_decision=r["human_decision"],
+                            human_decision_variant_key=r["human_decision_variant_key"],
+                            created_at=r["created_at"],
+                        )
+                        for r in experiment_rows
+                    ]
+
+    return CapabilityContextOut(
+        capability_key=capability_key,
+        gaps=gaps,
+        probe_plans=probe_plans,
+        experiments=experiments,
+    )
+
+
+@router.get(
+    "/repository/capabilities/{capability_key}/context",
+    response_model=CapabilityContextOut,
+)
+def get_capability_context_endpoint(
+    capability_key: str,
+    system_id: int = Depends(get_system_id),
+) -> CapabilityContextOut:
+    """Retrieve gaps / probe plans / experiments explicitly linked to a capability.
+
+    probe-agent:
+      role: API boundary aggregating docs-code gaps, probe plans, and
+        experiments for one capability, by exact key match only
+      capability: capability-mapping
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: verify only exact capability_key/feature_id matches are
+        returned and unrelated capabilities never leak in (Issue #175)
+    """
+    return _load_capability_context(system_id, capability_key)
 
 
 # ---------------------------------------------------------------------------

@@ -68,6 +68,22 @@ def _insert_snapshot(system_id, commit_sha="abc123"):
         return cur.lastrowid
 
 
+def _insert_symbol(system_id, snapshot_id, path, qualified_name, source_hash):
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO code_symbols
+                (snapshot_id, system_id, path, qualified_name, kind,
+                 start_line, end_line, symbol_source_hash, symbol_body_hash)
+            VALUES (?, ?, ?, ?, 'function', 1, 5, ?, ?)
+            """,
+            (snapshot_id, system_id, path, qualified_name, source_hash, source_hash),
+        )
+        return cur.lastrowid
+
+
 def _insert_understanding_graph(system_id, snapshot_id):
     from app.documentation_claim_scanner import ChunkScanResult, ClaimEvidence, DocumentationClaim
     from app.understanding_graph import build_understanding_graph, save_graph_snapshot
@@ -1301,3 +1317,133 @@ def test_proposals_endpoint_rejected_without_understanding_confirmation(admin_cl
         headers=headers,
     )
     assert r.status_code == 201, r.text
+
+
+def test_rebase_snapshot_preserves_unchanged_approved_proposal(admin_client):
+    token, system_id, snapshot_a = _setup(admin_client)
+    headers = _headers(token, system_id)
+    snapshot_b = _insert_snapshot(system_id, "def456")
+    sym_a = _insert_symbol(
+        system_id, snapshot_a, "src/summarize.py",
+        "summarize.summarize_text", "same-source",
+    )
+    sym_b = _insert_symbol(
+        system_id, snapshot_b, "src/summarize.py",
+        "summarize.summarize_text", "same-source",
+    )
+
+    r = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_a, "title": "rebase preserve"},
+        headers=headers,
+    )
+    sid = r.json()["id"]
+    _confirm_and_reach_proposal_generation(admin_client, sid, headers)
+    item = _valid_proposal_item()
+    item["symbol_id"] = sym_a
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/proposals",
+        json={"audit": _valid_audit(), "proposals": [item]},
+        headers=headers,
+    )
+    proposal_id = r.json()[0]["id"]
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/proposals/{proposal_id}/approve",
+        json={"actor": "root"},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/rebase-snapshot",
+        json={"target_snapshot_id": snapshot_b, "actor": "root"},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["from_snapshot_id"] == snapshot_a
+    assert body["to_snapshot_id"] == snapshot_b
+    assert body["proposals_preserved"] == 1
+    assert body["proposals_marked_needs_review"] == 0
+
+    detail = admin_client.get(f"/interview/sessions/{sid}", headers=headers).json()
+    assert detail["snapshot_id"] == snapshot_b
+    assert detail["proposals"][0]["snapshot_id"] == snapshot_b
+    assert detail["proposals"][0]["symbol_id"] == sym_b
+    assert detail["proposals"][0]["approval_state"] == "approved"
+    approved = admin_client.get(
+        f"/interview/sessions/{sid}/approved-set", headers=headers,
+    ).json()
+    assert approved["snapshot_id"] == snapshot_b
+    assert approved["approved_count"] == 1
+
+
+def test_rebase_snapshot_marks_changed_approved_proposal_needs_review(admin_client):
+    token, system_id, snapshot_a = _setup(admin_client)
+    headers = _headers(token, system_id)
+    snapshot_b = _insert_snapshot(system_id, "def456")
+    sym_a = _insert_symbol(
+        system_id, snapshot_a, "src/summarize.py",
+        "summarize.summarize_text", "old-source",
+    )
+    sym_b = _insert_symbol(
+        system_id, snapshot_b, "src/summarize.py",
+        "summarize.summarize_text", "new-source",
+    )
+
+    r = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_a, "title": "rebase changed"},
+        headers=headers,
+    )
+    sid = r.json()["id"]
+    _confirm_and_reach_proposal_generation(admin_client, sid, headers)
+    item = _valid_proposal_item()
+    item["symbol_id"] = sym_a
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/proposals",
+        json={"audit": _valid_audit(), "proposals": [item]},
+        headers=headers,
+    )
+    proposal_id = r.json()[0]["id"]
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/proposals/{proposal_id}/approve",
+        json={"actor": "root"},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/rebase-snapshot",
+        json={"target_snapshot_id": snapshot_b, "actor": "root"},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["proposals_preserved"] == 0
+    assert body["proposals_marked_needs_review"] == 1
+    assert body["proposals_changed_source"] == 1
+
+    detail = admin_client.get(f"/interview/sessions/{sid}", headers=headers).json()
+    assert detail["snapshot_id"] == snapshot_b
+    assert detail["proposals"][0]["snapshot_id"] == snapshot_b
+    assert detail["proposals"][0]["symbol_id"] == sym_b
+    assert detail["proposals"][0]["approval_state"] == "needs_review"
+    approved = admin_client.get(
+        f"/interview/sessions/{sid}/approved-set", headers=headers,
+    ).json()
+    assert approved["approved_count"] == 0
+    assert approved["pending_count"] == 1
+
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/proposals/{proposal_id}/approve",
+        json={"actor": "root"},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    detail = admin_client.get(f"/interview/sessions/{sid}", headers=headers).json()
+    assert detail["proposals"][0]["approval_state"] == "approved"
+    approved = admin_client.get(
+        f"/interview/sessions/{sid}/approved-set", headers=headers,
+    ).json()
+    assert approved["approved_count"] == 1

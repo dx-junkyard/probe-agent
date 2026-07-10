@@ -6,9 +6,10 @@ import {
   useCapabilityHierarchy, useCapabilityHierarchyDrift,
   useGenerateCapabilityHierarchy, useRequestExplanationRefresh,
   useLatestSnapshot, useSymbols, useLatestDrafts,
-  useSystemUnderstanding, useApiRoleCards, useCodeLinks,
+  useApiRoleCards, useCodeLinks, useCapabilityContext,
 } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
+import { ContextHeader } from "@/components/layout/context-header";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
@@ -16,7 +17,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import {
   Map as MapIcon, Sparkles, Workflow, RefreshCw, Link2,
   Target, Boxes, Layers, Server, ChevronRight, AlertTriangle,
-  CheckCircle2, Circle, MessageSquareText,
+  CheckCircle2, Circle, MessageSquareText, Crosshair, FlaskConical,
 } from "lucide-react";
 import type {
   CapabilityOut, CapabilityElementOut,
@@ -122,26 +123,25 @@ function RefreshPanel({ data }: { data: ExplanationRefreshOut }) {
 }
 
 function DetailsPanel({
-  selected, driftByNode,
+  selected, driftByNode, capabilityKeyByNodeId,
 }: {
   selected: SelectedNode;
   driftByNode: Map<number, AnchorDriftOut>;
+  capabilityKeyByNodeId: Map<number, string>;
 }) {
   const refresh = useRequestExplanationRefresh();
   const [proposal, setProposal] = useState<ExplanationRefreshOut | null>(null);
-  const { data: understanding } = useSystemUnderstanding();
   const { data: roleCardsData } = useApiRoleCards();
   const { data: codeLinksData } = useCodeLinks();
 
   const data = selected.data;
   const provenance = data.provenance;
 
-  const relatedGaps = useMemo(() => {
-    if (!understanding?.gaps) return [];
-    const capName = selected.kind === "capability" ? data.name : null;
-    if (!capName) return [];
-    return understanding.gaps.filter((g) => g.capability_key === capName);
-  }, [understanding?.gaps, selected.kind, data.name]);
+  const capabilityKey = selected.kind === "capability"
+    ? (selected.data.capability_key ?? null)
+    : null;
+  const { data: capabilityContext } = useCapabilityContext(capabilityKey);
+
   const drift = driftByNode.get(data.id);
   const reviewRecommended = drift ? REVIEW_STATUSES.includes(drift.status) : false;
   const entrypointType = provenance.entrypoint_type;
@@ -157,8 +157,12 @@ function DetailsPanel({
     }
   };
 
+  // Issue #176: carry the enclosing capability so Flow Explorer can show a
+  // way back and hand the same capability off to the resulting Probe Plan.
+  const flowLinkCapabilityKey = capabilityKeyByNodeId.get(data.id) ?? null;
   const flowLink = entrypointType && entrypointRef
     ? `/flow-explorer?entrypoint_type=${encodeURIComponent(entrypointType)}&entrypoint_id=${encodeURIComponent(entrypointRef)}`
+      + (flowLinkCapabilityKey ? `&capability=${encodeURIComponent(flowLinkCapabilityKey)}` : "")
     : null;
 
   return (
@@ -309,7 +313,7 @@ function DetailsPanel({
                   {relatedApis.map((api, i) => (
                     <Link
                       key={i}
-                      to={`/flow-explorer?entrypoint_type=${encodeURIComponent(api.entrypoint_type)}&entrypoint_id=${encodeURIComponent(api.entrypoint_id)}`}
+                      to={`/flow-explorer?entrypoint_type=${encodeURIComponent(api.entrypoint_type)}&entrypoint_id=${encodeURIComponent(api.entrypoint_id)}&capability=${encodeURIComponent(capKey)}`}
                       className="flex items-center gap-1.5 text-[11px] text-primary hover:underline"
                     >
                       <Server className="h-3 w-3 shrink-0" />
@@ -366,16 +370,56 @@ function DetailsPanel({
           );
         })()}
 
-        {relatedGaps.length > 0 && (
-          <div className="pt-2 space-y-1.5" data-testid="related-gaps">
-            <p className="text-[11px] font-medium text-muted-foreground">Related gaps</p>
-            {relatedGaps.map((g, i) => (
-              <div key={i} className="flex items-center gap-1.5 text-[11px]">
-                <AlertTriangle className="h-3 w-3 text-yellow-600 shrink-0" />
-                <span>{g.title ?? g.node_name ?? g.gap_type}</span>
+        {selected.kind === "capability" && capabilityContext && (
+          <>
+            {capabilityContext.gaps.length > 0 && (
+              <div className="pt-2 space-y-1.5" data-testid="capability-gaps">
+                <p className="text-[11px] font-medium text-muted-foreground">Gaps</p>
+                {capabilityContext.gaps.map((g, i) => (
+                  <Link
+                    key={i}
+                    to="/system-understanding"
+                    className="flex items-center gap-1.5 text-[11px] text-primary hover:underline"
+                  >
+                    <AlertTriangle className="h-3 w-3 text-yellow-600 shrink-0" />
+                    <span>{g.title ?? g.node_name ?? g.gap_type}</span>
+                  </Link>
+                ))}
               </div>
-            ))}
-          </div>
+            )}
+            {capabilityContext.probe_plans.length > 0 && (
+              <div className="pt-2 space-y-1.5" data-testid="capability-probe-plans">
+                <p className="text-[11px] font-medium text-muted-foreground">Probe Plans</p>
+                {capabilityContext.probe_plans.map((plan) => (
+                  <Link
+                    key={plan.id}
+                    to={`/probe-planner?plan=${plan.id}&capability=${encodeURIComponent(selected.data.capability_key ?? selected.data.name)}`}
+                    className="flex items-center gap-1.5 text-[11px] text-primary hover:underline"
+                  >
+                    <Crosshair className="h-3 w-3 shrink-0" />
+                    <span>{plan.feature_id}</span>
+                    <Badge variant="outline" className="text-[10px]">{plan.status}</Badge>
+                  </Link>
+                ))}
+              </div>
+            )}
+            {capabilityContext.experiments.length > 0 && (
+              <div className="pt-2 space-y-1.5" data-testid="capability-experiments">
+                <p className="text-[11px] font-medium text-muted-foreground">Experiments</p>
+                {capabilityContext.experiments.map((exp) => (
+                  <Link
+                    key={exp.id}
+                    to={`/experiments?capability=${encodeURIComponent(selected.data.capability_key ?? selected.data.name)}`}
+                    className="flex items-center gap-1.5 text-[11px] text-primary hover:underline"
+                  >
+                    <FlaskConical className="h-3 w-3 shrink-0" />
+                    <span>{exp.feature_id}</span>
+                    <Badge variant="outline" className="text-[10px]">{exp.human_decision}</Badge>
+                  </Link>
+                ))}
+              </div>
+            )}
+          </>
         )}
       </CardContent>
     </Card>
@@ -486,6 +530,20 @@ export default function CapabilityMapPage() {
     return map;
   }, [driftData]);
 
+  // Issue #176: map every hierarchy node id to its enclosing capability key,
+  // so Flow Explorer links from elements/supporting nodes can carry the
+  // capability context, not just the top-level "Related APIs" links.
+  const capabilityKeyByNodeId = useMemo(() => {
+    const map = new Map<number, string>();
+    for (const cap of hierarchy?.capabilities ?? []) {
+      const key = cap.capability_key ?? cap.name;
+      map.set(cap.id, key);
+      cap.elements.forEach(el => map.set(el.id, key));
+      cap.supporting_elements.forEach(s => map.set(s.id, key));
+    }
+    return map;
+  }, [hierarchy]);
+
   const run = hierarchy?.intelligence_run;
   const hasHierarchy = !!run && (hierarchy?.capabilities.length || hierarchy?.purpose);
 
@@ -504,6 +562,7 @@ export default function CapabilityMapPage() {
 
   return (
     <div className="space-y-6">
+      <ContextHeader />
       <div className="flex items-center justify-between gap-2 flex-wrap">
         <div>
           <h1 className="text-2xl font-bold tracking-tight flex items-center gap-2">
@@ -699,7 +758,11 @@ export default function CapabilityMapPage() {
           {/* Right: details */}
           <div className="space-y-4">
             {selected ? (
-              <DetailsPanel selected={selected} driftByNode={driftByNode} />
+              <DetailsPanel
+                selected={selected}
+                driftByNode={driftByNode}
+                capabilityKeyByNodeId={capabilityKeyByNodeId}
+              />
             ) : (
               <Card>
                 <CardContent className="py-12 text-center text-sm text-muted-foreground">

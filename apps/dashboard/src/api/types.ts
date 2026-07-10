@@ -299,7 +299,7 @@ export type InterviewStage =
   | "probe_flow_selection"
   | "proposal_generation";
 export type InterviewDecisionMethod = "deterministic" | "reasoning_llm" | "manual";
-export type InterviewApprovalState = "proposed" | "approved" | "rejected" | "edited";
+export type InterviewApprovalState = "proposed" | "approved" | "rejected" | "edited" | "needs_review";
 export type SourceMetadataElementType =
   | "system" | "core" | "capability" | "element" | "supporting" | "boundary";
 export type SourceMetadataOperationKind =
@@ -446,6 +446,19 @@ export interface InterviewProposalOut {
 export interface InterviewSessionDetailOut extends InterviewSessionOut {
   messages: InterviewMessageOut[];
   proposals: InterviewProposalOut[];
+}
+
+export interface InterviewSnapshotRebaseOut {
+  session_id: number;
+  system_id: number;
+  from_snapshot_id: number;
+  to_snapshot_id: number;
+  proposals_preserved: number;
+  proposals_marked_needs_review: number;
+  proposals_missing_source: number;
+  proposals_changed_source: number;
+  message: string;
+  session: InterviewSessionOut;
 }
 
 export interface InterviewEvidenceLocation {
@@ -1698,9 +1711,12 @@ export interface SystemUnderstandingPipelineStep {
   detail?: string | null;
 }
 
+export type NextActionCategory = "understand" | "observe" | "instrument" | "evaluate";
+
 export interface SystemUnderstandingNextAction {
   action: string;
   reason: string;
+  category: NextActionCategory;
   link?: string | null;
 }
 
@@ -1855,6 +1871,35 @@ export interface SystemUnderstandingOut {
   gap_summary: SystemUnderstandingGapSummary[];
   metadata_coverage: SystemUnderstandingMetadataCoverage | null;
   next_actions: SystemUnderstandingNextAction[];
+}
+
+// Capability context: gaps / probe plans / experiments linked to one
+// capability_key by exact key match only (Issue #175).
+
+export interface CapabilityContextProbePlanOut {
+  id: number;
+  feature_id: string;
+  objective: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CapabilityContextExperimentOut {
+  id: number;
+  feature_id: string;
+  objective: string;
+  status: string;
+  human_decision: string;
+  human_decision_variant_key: string | null;
+  created_at: string;
+}
+
+export interface CapabilityContextOut {
+  capability_key: string;
+  gaps: SystemUnderstandingGap[];
+  probe_plans: CapabilityContextProbePlanOut[];
+  experiments: CapabilityContextExperimentOut[];
 }
 
 // System Understanding build job orchestration (Issue #109)
