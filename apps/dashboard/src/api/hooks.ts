@@ -36,6 +36,7 @@ import type {
   CapabilityContextOut,
   AssistantScreenContext, AssistantAskRequest, AssistantAskOut,
   AssistantSettingsMetadataOut,
+  ConnectivityStatusOut,
 } from "./types";
 
 export function sysKey(base: string, ...extra: unknown[]) {
@@ -1274,6 +1275,16 @@ export function useSystemDiagnostics() {
     queryFn: () => api.get<SystemDiagnosticsOut>("/system-diagnostics"),
     enabled: !!getSystemId(),
     staleTime: 30_000,
+  });
+}
+
+export function useConnectivityStatus(refetchInterval?: number) {
+  return useQuery({
+    queryKey: sysKey("connectivity-status"),
+    queryFn: () => api.get<ConnectivityStatusOut>("/connectivity/status"),
+    enabled: !!getSystemId(),
+    refetchInterval,
+    staleTime: 10_000,
   });
 }
 

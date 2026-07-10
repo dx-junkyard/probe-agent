@@ -3,6 +3,7 @@ import {
   LayoutDashboard, GitBranch, Map, Crosshair, FlaskConical,
   Plug, Sparkles, Boxes, Settings, Users, ChevronLeft, ChevronRight, MessageSquare,
   Workflow, Network, MessageSquareText, Brain, GitFork, Filter,
+  LifeBuoy,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/api/auth";
@@ -43,6 +44,7 @@ const NAV_GROUPS: NavGroup[] = [
     heading: "Other",
     items: [
       { to: "/connect-sdk", icon: Plug, label: "Connect SDK" },
+      { to: "/setup-guide", icon: LifeBuoy, label: "Setup Guide" },
       { to: "/generation", icon: Sparkles, label: "Generate" },
       { to: "/components", icon: Boxes, label: "Components" },
       { to: "/workspaces", icon: MessageSquare, label: "Decision Workspace" },

@@ -33,6 +33,21 @@ export interface Policy {
   mode: "off" | "trace" | "shadow";
 }
 
+export type ConnectivityState = "no_signal" | "smoke_only" | "receiving";
+
+export interface ConnectivityStatusOut {
+  system_id: number;
+  state: ConnectivityState;
+  total_trace_count: number;
+  smoke_trace_count: number;
+  real_trace_count: number;
+  first_trace_at: number | null;
+  last_trace_at: number | null;
+  last_trace_component_id: string | null;
+  smoke_component_id: string;
+  materialized_session_ids: number[];
+}
+
 // Trace lineage (Issue #145/#146/#147)
 export interface LineageEntity {
   type: string;
@@ -369,6 +384,7 @@ export interface InterviewSessionOut {
   id: number;
   system_id: number;
   snapshot_id: number;
+  snapshot_commit_sha?: string | null;
   title: string;
   focus: string;
   status: InterviewSessionStatus;
@@ -665,6 +681,7 @@ export interface InterviewMaterializeOut {
   session_id: number;
   system_id: number;
   snapshot_id: number;
+  commit_sha?: string | null;
   diff: string;
   files_changed: number;
   items_materialized: number;

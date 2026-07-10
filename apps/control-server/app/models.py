@@ -308,6 +308,28 @@ class SystemOut(BaseModel):
     last_seen: Optional[float] = None
 
 
+# Issue #165: deterministic signal-reception facts for the connectivity
+# warning badge and the setup-guide page. `state` is a finite classification;
+# smoke traces are recognized by exact component_id match against the
+# documented convention (Principle 6: explicit finite set, no heuristics).
+SMOKE_CHECK_COMPONENT_ID = "probe-smoke-check"
+
+ConnectivityState = Literal["no_signal", "smoke_only", "receiving"]
+
+
+class ConnectivityStatusOut(BaseModel):
+    system_id: int
+    state: ConnectivityState
+    total_trace_count: int
+    smoke_trace_count: int
+    real_trace_count: int
+    first_trace_at: Optional[float] = None
+    last_trace_at: Optional[float] = None
+    last_trace_component_id: Optional[str] = None
+    smoke_component_id: str = SMOKE_CHECK_COMPONENT_ID
+    materialized_session_ids: List[int] = Field(default_factory=list)
+
+
 class ComponentProfile(BaseModel):
     component_id: str
     purpose: str = ""
@@ -2038,6 +2060,7 @@ class InterviewSessionOut(BaseModel):
     id: int
     system_id: int
     snapshot_id: int
+    snapshot_commit_sha: Optional[str] = None
     title: str
     focus: str
     status: InterviewSessionStatus
@@ -2794,6 +2817,7 @@ class InterviewMaterializeOut(BaseModel):
     session_id: int
     system_id: int
     snapshot_id: int
+    commit_sha: Optional[str] = None
     diff: str
     files_changed: int
     items_materialized: int
