@@ -172,6 +172,76 @@ def _insert_unconfirmed_understanding(system_id, snapshot_id):
         )
 
 
+def _insert_snapshot(system_id, *, status="indexing", commit_sha="pending"):
+    from app.db import get_conn
+
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO repository_snapshots
+                (system_id, repo_path, commit_sha, status, file_count,
+                 total_size, indexed_size, created_at, completed_at)
+            VALUES (?, '', ?, ?, 0, 0, 0, ?, NULL)
+            """,
+            (system_id, commit_sha, status, now),
+        )
+        return cur.lastrowid
+
+
+def _insert_intelligence_run(system_id, snapshot_id, run_type, status):
+    from app.db import get_conn
+
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO intelligence_runs
+                (system_id, snapshot_id, run_type, provider, model, prompt_version,
+                 schema_version, decision_method, status, error_details, is_mock,
+                 started_at, completed_at)
+            VALUES (?, ?, ?, 'mock', 'mock', 'test', 'test', 'deterministic',
+                    ?, 'boom', 1, ?, ?)
+            """,
+            (system_id, snapshot_id, run_type, status, now, now),
+        )
+        return cur.lastrowid
+
+
+def _insert_active_build(system_id, snapshot_id, *, current_step="symbol_index"):
+    from app.db import get_conn
+
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO system_understanding_builds
+                (system_id, snapshot_id, status, current_step, heartbeat_at,
+                 started_at, created_at)
+            VALUES (?, ?, 'running', ?, ?, ?, ?)
+            """,
+            (system_id, snapshot_id, current_step, now, now, now),
+        )
+        return cur.lastrowid
+
+
+def _insert_build_step(system_id, snapshot_id, build_id, step, status, *, error=None):
+    from app.db import get_conn
+
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO system_understanding_build_steps
+                (build_id, system_id, snapshot_id, step, status, error,
+                 heartbeat_at, started_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (build_id, system_id, snapshot_id, step, status, error, now, now, now),
+        )
+        return cur.lastrowid
+
+
 def _get_state(client, hdrs):
     r = client.get("/system-state", headers=hdrs)
     assert r.status_code == 200, r.text
@@ -312,6 +382,128 @@ class TestUnderstandingState:
         assert "README.md" in purpose["detail"]
         assert purpose["evidence"]["impact_status"] == "directly_impacted"
         assert caps["status"] == "impacted"
+
+
+class TestPipelineState:
+    def test_indexing_snapshot_is_running_wait_state(self, admin_client):
+        _, sys, hdrs = _setup(admin_client)
+        snap_id = _insert_snapshot(sys["id"], status="indexing")
+
+        _, items = _get_state(admin_client, hdrs)
+        item = items["snapshot.ready.running"]
+        assert item["status"] == "running"
+        assert item["severity"] == "info"
+        assert item["user_action_kind"] == "wait"
+        assert item["intervention_timing"] == "none"
+        assert item["evidence"]["latest_snapshot_id"] == snap_id
+        assert "snapshot.ready.missing" not in items
+
+    def test_failed_run_is_failed_error_state(self, admin_client, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "app.system_understanding_service._is_reasoning_model_available",
+            lambda: True,
+        )
+        _, sys, hdrs = _setup(admin_client)
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+        _insert_intelligence_run(sys["id"], snap.json()["id"], "symbol_index", "failed")
+
+        _, items = _get_state(admin_client, hdrs)
+        item = items["pipeline.symbol_index.failed"]
+        assert item["status"] == "failed"
+        assert item["severity"] == "error"
+        assert item["user_action_kind"] == "rerun"
+        assert "pipeline.symbol_index.not_run" not in items
+
+    def test_active_build_without_run_is_running_wait_state(self, admin_client, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "app.system_understanding_service._is_reasoning_model_available",
+            lambda: True,
+        )
+        _, sys, hdrs = _setup(admin_client)
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+        build_id = _insert_active_build(sys["id"], snap.json()["id"], current_step="symbol_index")
+
+        _, items = _get_state(admin_client, hdrs)
+        item = items["pipeline.symbol_index.running"]
+        assert item["status"] == "running"
+        assert item["severity"] == "info"
+        assert item["user_action_kind"] == "wait"
+        assert item["intervention_timing"] == "none"
+        assert item["evidence"]["active_build_id"] == build_id
+
+    def test_running_build_step_is_running_wait_state(self, admin_client, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "app.system_understanding_service._is_reasoning_model_available",
+            lambda: True,
+        )
+        _, sys, hdrs = _setup(admin_client)
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+        build_id = _insert_active_build(sys["id"], snap.json()["id"], current_step="documentation_index")
+        _insert_build_step(sys["id"], snap.json()["id"], build_id, "documentation_index", "running")
+
+        _, items = _get_state(admin_client, hdrs)
+        item = items["pipeline.documentation_index.running"]
+        assert item["status"] == "running"
+        assert item["severity"] == "info"
+        assert item["user_action_kind"] == "wait"
+        assert "pipeline.documentation_index.failed" not in items
+
+    def test_capability_hierarchy_missing_reasoning_is_blocked(self, admin_client, tmp_path):
+        _, sys, hdrs = _setup(admin_client)
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+
+        _, items = _get_state(admin_client, hdrs)
+        item = items["pipeline.capability_hierarchy.blocked_by_reasoning"]
+        assert item["status"] == "blocked"
+        assert item["severity"] == "blocked"
+        assert item["user_action_kind"] == "configure"
+
+    def test_capability_hierarchy_failed_plus_missing_reasoning_stays_blocked(self, admin_client, tmp_path):
+        _, sys, hdrs = _setup(admin_client)
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+        _insert_intelligence_run(sys["id"], snap.json()["id"], "capability_hierarchy", "failed")
+
+        _, items = _get_state(admin_client, hdrs)
+        item = items["pipeline.capability_hierarchy.blocked_by_reasoning"]
+        assert item["status"] == "blocked"
+        assert item["severity"] == "blocked"
+        assert item["user_action_kind"] == "configure"
+        assert "pipeline.capability_hierarchy.failed" not in items
 
 
 class TestDiagnosticsProjectionCompatibility:

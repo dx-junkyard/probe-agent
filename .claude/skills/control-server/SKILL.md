@@ -64,6 +64,14 @@ fallback for intelligence work.
   from persisted DB rows for the latest ready snapshot. A missing/blocked
   state is represented explicitly (e.g. `understanding.purpose.missing_baseline`,
   `pipeline.capability_hierarchy.blocked_by_reasoning`) rather than guessed.
+- Pipeline state ids must name the actual state. Use `.not_run` only for
+  missing/cancelled retryable work, `.running` for queued/running builds or
+  steps (`status=running`, `severity=info`, `user_action_kind=wait`),
+  `.failed` for failed persisted runs (`severity=error`,
+  `user_action_kind=rerun`), and `.blocked` / `.blocked_by_reasoning` for
+  blocked work (`severity=blocked`). Do not collapse pending/running/blocked
+  into failed, and do not use `blocked_by_reasoning` for ordinary not-run or
+  failed states when a reasoning model is available.
 - `GET /system-diagnostics` stays backward compatible; it is a projection
   built on top of `system_state.py`, not replaced by it.
 - Later phases (not yet implemented): projecting `next_actions` and

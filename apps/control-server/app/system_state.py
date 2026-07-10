@@ -31,6 +31,7 @@ probe-agent:
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -38,7 +39,7 @@ from typing import Any, Dict, List, Optional
 from .db import get_conn
 
 # Severity vocabulary shared with system_diagnostics.py. Order = worst first.
-SEVERITY_ORDER = ["error", "blocked", "warning", "info", "unknown", "ok"]
+SEVERITY_ORDER = ["error", "blocked", "warning", "info", "ok"]
 
 STATE_GROUPS = (
     "repository",
@@ -609,6 +610,23 @@ def _snapshot_missing_item(conn, system_id: int) -> Optional[StateItem]:
     ).fetchone()
     if ready is not None:
         return None
+    if latest is not None and latest["status"] == "indexing":
+        return StateItem(
+            state_id="snapshot.ready.running",
+            state_group="snapshot",
+            severity="info",
+            status="running",
+            user_action_kind="wait",
+            intervention_timing="none",
+            subject="Snapshot",
+            summary="Snapshot を作成中です。",
+            detail=f"最新の snapshot #{latest['id']} は作成中です。ready になるまで待機してください。",
+            impact="snapshot が ready になるまで、snapshot の内容を読むパイプラインステップは開始できません。",
+            remediation="Snapshot 作成の完了を待ってください。",
+            evidence={"latest_snapshot_id": latest["id"], "latest_snapshot_status": latest["status"]},
+            related_checks=["snapshot_status"],
+            related_pipeline_steps=["snapshot_ready"],
+        )
     severity = "error" if latest is not None and latest["status"] not in ("ready", "indexing") else "warning"
     return StateItem(
         state_id="snapshot.ready.missing",
@@ -670,8 +688,150 @@ def _snapshot_stale_for_interview_item(conn, system_id: int, snapshot_id: int) -
     )
 
 
+def _stuck_after_seconds() -> float:
+    try:
+        return float(os.getenv("SYSTEM_UNDERSTANDING_STUCK_AFTER_SECONDS", "300"))
+    except ValueError:
+        return 300.0
+
+
+def _is_active_build(row) -> bool:
+    if row is None or row["status"] not in ("queued", "running"):
+        return False
+    last = row["heartbeat_at"] or row["started_at"] or row["created_at"]
+    return last is not None and (time.time() - last) <= _stuck_after_seconds()
+
+
+def _active_build(conn, system_id: int, snapshot_id: int):
+    rows = conn.execute(
+        """SELECT id, status, current_step, heartbeat_at, started_at, created_at
+             FROM system_understanding_builds
+            WHERE system_id = ? AND snapshot_id = ? AND status IN ('queued', 'running')
+            ORDER BY id DESC""",
+        (system_id, snapshot_id),
+    ).fetchall()
+    for row in rows:
+        if _is_active_build(row):
+            return row
+    return None
+
+
+def _pipeline_state_item(
+    *,
+    state_prefix: str,
+    raw_status: Optional[str],
+    subject: str,
+    pipeline_steps: List[str],
+    remediation: str,
+    evidence: Dict[str, Any],
+    active_build=None,
+    blocked_by_reasoning: bool = False,
+) -> Optional[StateItem]:
+    if raw_status == "completed":
+        return None
+    if blocked_by_reasoning:
+        return StateItem(
+            state_id=f"{state_prefix}.blocked_by_reasoning",
+            state_group="pipeline",
+            severity="blocked",
+            status="blocked",
+            user_action_kind="configure",
+            intervention_timing="before_next_step",
+            subject=subject,
+            summary=f"{subject} は reasoning モデル未設定のためブロックされています。",
+            detail="このステップには reasoning モデルが必要ですが、現在は利用可能な reasoning モデルが設定されていません。",
+            impact="System Understanding でこのステップはブロックとして表示されます。",
+            remediation="intelligence 用 reasoning モデル設定を修正してからビルドを実行してください。",
+            evidence=evidence,
+            target_ui=TargetUi(route=PAGE_SYSTEM_UNDERSTANDING, anchor=ANCHOR_BUILD, action_label="LLM 設定を確認"),
+            related_pipeline_steps=pipeline_steps,
+        )
+
+    if raw_status in ("pending", "running") or (raw_status is None and active_build is not None):
+        running_evidence = dict(evidence)
+        if active_build is not None:
+            running_evidence.update({
+                "active_build_id": active_build["id"],
+                "active_build_status": active_build["status"],
+                "active_build_current_step": active_build["current_step"],
+            })
+        return StateItem(
+            state_id=f"{state_prefix}.running",
+            state_group="pipeline",
+            severity="info",
+            status="running",
+            user_action_kind="wait",
+            intervention_timing="none",
+            subject=subject,
+            summary=f"{subject} を実行中です。",
+            detail="System Understanding build がこの snapshot に対して実行中です。完了まで待機してください。",
+            impact="このステップの成果物は build 完了後に利用できます。",
+            remediation="現在の build の完了を待ってください。",
+            evidence=running_evidence,
+            related_pipeline_steps=pipeline_steps,
+        )
+
+    if raw_status == "blocked":
+        return StateItem(
+            state_id=f"{state_prefix}.blocked",
+            state_group="pipeline",
+            severity="blocked",
+            status="blocked",
+            user_action_kind="build",
+            intervention_timing="before_next_step",
+            subject=subject,
+            summary=f"{subject} がブロックされています。",
+            detail="直近のビルドステップは blocked です。依存ステップやビルドステップのエラーを確認してください。",
+            impact="System Understanding でこのステップはブロックとして表示されます。",
+            remediation="ブロック原因を解消してから Build / Refresh を再実行してください。",
+            evidence=evidence,
+            target_ui=TargetUi(route=PAGE_SYSTEM_UNDERSTANDING, anchor=ANCHOR_BUILD, action_label="Build 状態を確認"),
+            related_pipeline_steps=pipeline_steps,
+        )
+
+    if raw_status == "failed":
+        return StateItem(
+            state_id=f"{state_prefix}.failed",
+            state_group="pipeline",
+            severity="error",
+            status="failed",
+            user_action_kind="rerun",
+            intervention_timing="before_next_step",
+            subject=subject,
+            summary=f"{subject} が失敗しています。",
+            detail="直近の実行が failed です。エラーを確認し、原因を修正してから再実行してください。",
+            impact="このステップの成果物が欠落しているか古くなっています。",
+            remediation="System Understanding で Build / Refresh を再実行してください。",
+            evidence=evidence,
+            target_ui=TargetUi(route=PAGE_SYSTEM_UNDERSTANDING, anchor=ANCHOR_BUILD, action_label="Build / Refresh を再実行"),
+            related_pipeline_steps=pipeline_steps,
+        )
+
+    cancelled = raw_status == "cancelled"
+    return StateItem(
+        state_id=f"{state_prefix}.not_run",
+        state_group="pipeline",
+        severity="warning",
+        status="missing",
+        user_action_kind="build",
+        intervention_timing="before_next_step",
+        subject=subject,
+        summary=f"{subject} が未実行です。",
+        detail=(
+            "直近の実行は cancelled です。必要なら Build / Refresh を再実行してください。"
+            if cancelled
+            else "このステップは現在の snapshot に対して実行されていません。"
+        ),
+        impact="System Understanding でこのステップは未実行として表示されます。",
+        remediation=remediation,
+        evidence=evidence,
+        target_ui=TargetUi(route=PAGE_SYSTEM_UNDERSTANDING, anchor=ANCHOR_BUILD, action_label="Build / Refresh を実行"),
+        related_pipeline_steps=pipeline_steps,
+    )
+
+
 def _run_not_run_item(
-    conn, system_id: int, snapshot_id: int, *, state_id: str, run_types: List[str],
+    conn, system_id: int, snapshot_id: int, *, state_prefix: str, run_types: List[str],
     subject: str, pipeline_steps: List[str], remediation: str,
 ) -> Optional[StateItem]:
     placeholders = ",".join("?" for _ in run_types)
@@ -681,61 +841,41 @@ def _run_not_run_item(
         f"ORDER BY id DESC LIMIT 1",
         (system_id, snapshot_id, *run_types),
     ).fetchone()
-    if row is not None and row["status"] == "completed":
-        return None
-    return StateItem(
-        state_id=state_id,
-        state_group="pipeline",
-        severity="warning",
-        status="missing" if row is None else "failed",
-        user_action_kind="build",
-        intervention_timing="before_next_step",
+    evidence = {"snapshot_id": snapshot_id, "run_id": row["id"] if row else None}
+    return _pipeline_state_item(
+        state_prefix=state_prefix,
+        raw_status=row["status"] if row else None,
         subject=subject,
-        summary=f"{subject} が未実行です。" if row is None else f"{subject} が失敗しています。",
-        detail=(
-            "このステップは現在の snapshot に対して実行されていません。"
-            if row is None
-            else f"直近の実行（#{row['id']}）の状態は '{row['status']}' です。"
-        ),
-        impact="System Understanding でこのステップは未実行/失敗として表示されます。",
+        pipeline_steps=pipeline_steps,
         remediation=remediation,
-        evidence={"snapshot_id": snapshot_id, "run_id": row["id"] if row else None},
-        target_ui=TargetUi(route=PAGE_SYSTEM_UNDERSTANDING, anchor=ANCHOR_BUILD, action_label="Build / Refresh を実行"),
-        related_pipeline_steps=pipeline_steps,
+        evidence=evidence,
+        active_build=_active_build(conn, system_id, snapshot_id) if row is None else None,
     )
 
 
 def _build_step_not_run_item(
-    conn, system_id: int, snapshot_id: int, *, state_id: str, step: str,
+    conn, system_id: int, snapshot_id: int, *, state_prefix: str, step: str,
     subject: str, pipeline_steps: List[str], remediation: str,
 ) -> Optional[StateItem]:
     row = conn.execute(
-        """SELECT id, status FROM system_understanding_build_steps
+        """SELECT id, status, error FROM system_understanding_build_steps
            WHERE system_id = ? AND snapshot_id = ? AND step = ?
            ORDER BY id DESC LIMIT 1""",
         (system_id, snapshot_id, step),
     ).fetchone()
-    if row is not None and row["status"] == "completed":
-        return None
-    return StateItem(
-        state_id=state_id,
-        state_group="pipeline",
-        severity="warning",
-        status="missing" if row is None else "failed",
-        user_action_kind="build",
-        intervention_timing="before_next_step",
+    evidence = {
+        "snapshot_id": snapshot_id,
+        "step_run_id": row["id"] if row else None,
+        "step_error": row["error"] if row else None,
+    }
+    return _pipeline_state_item(
+        state_prefix=state_prefix,
+        raw_status=row["status"] if row else None,
         subject=subject,
-        summary=f"{subject} が未実行です。" if row is None else f"{subject} が失敗しています。",
-        detail=(
-            "このビルドステップは現在の snapshot に対して実行されていません。"
-            if row is None
-            else f"直近のビルドステップ（#{row['id']}）の状態は '{row['status']}' です。"
-        ),
-        impact="System Understanding でこのステップは未実行/失敗として表示されます。",
+        pipeline_steps=pipeline_steps,
         remediation=remediation,
-        evidence={"snapshot_id": snapshot_id, "step_run_id": row["id"] if row else None},
-        target_ui=TargetUi(route=PAGE_SYSTEM_UNDERSTANDING, anchor=ANCHOR_BUILD, action_label="Build / Refresh を実行"),
-        related_pipeline_steps=pipeline_steps,
+        evidence=evidence,
+        active_build=_active_build(conn, system_id, snapshot_id) if row is None else None,
     )
 
 
@@ -750,42 +890,16 @@ def _capability_hierarchy_item(
     ).fetchone()
     if row is not None and row["status"] == "completed":
         return None
-    if row is None and not reasoning_available:
-        return StateItem(
-            state_id="pipeline.capability_hierarchy.blocked_by_reasoning",
-            state_group="pipeline",
-            severity="blocked",
-            status="blocked",
-            user_action_kind="configure",
-            intervention_timing="before_next_step",
-            subject="Capability 階層",
-            summary="Capability 階層は reasoning モデル未設定のためブロックされています。",
-            detail="このステップは一度も実行されておらず、reasoning モデルが必要ですが設定されていません。",
-            impact="System Understanding でこのステップはブロック/未実行として表示されます。",
-            remediation="intelligence 用 reasoning モデル設定を修正してからビルドを実行してください。",
-            evidence={"snapshot_id": snapshot_id},
-            target_ui=TargetUi(route=PAGE_SYSTEM_UNDERSTANDING, anchor=ANCHOR_BUILD, action_label="Build / Refresh を実行"),
-            related_pipeline_steps=["capability_hierarchy_ready"],
-        )
-    return StateItem(
-        state_id="pipeline.capability_hierarchy.blocked_by_reasoning",
-        state_group="pipeline",
-        severity="warning",
-        status="missing" if row is None else "failed",
-        user_action_kind="build",
-        intervention_timing="before_next_step",
+    evidence = {"snapshot_id": snapshot_id, "run_id": row["id"] if row else None}
+    return _pipeline_state_item(
+        state_prefix="pipeline.capability_hierarchy",
+        raw_status=row["status"] if row else None,
         subject="Capability 階層",
-        summary="Capability 階層が未実行です。" if row is None else "Capability 階層が失敗しています。",
-        detail=(
-            "このステップは現在の snapshot に対して実行されていません。"
-            if row is None
-            else f"直近の実行（#{row['id']}）の状態は '{row['status']}' です。"
-        ),
-        impact="System Understanding でこのステップは未実行/失敗として表示されます。",
+        pipeline_steps=["capability_hierarchy_ready"],
         remediation="System Understanding で Build / Refresh を実行して capability 階層を生成してください。",
-        evidence={"snapshot_id": snapshot_id, "run_id": row["id"] if row else None},
-        target_ui=TargetUi(route=PAGE_SYSTEM_UNDERSTANDING, anchor=ANCHOR_BUILD, action_label="Build / Refresh を実行"),
-        related_pipeline_steps=["capability_hierarchy_ready"],
+        evidence=evidence,
+        active_build=_active_build(conn, system_id, snapshot_id) if row is None else None,
+        blocked_by_reasoning=not reasoning_available,
     )
 
 
@@ -819,7 +933,7 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
 
             symbol = _run_not_run_item(
                 conn, system_id, snapshot_id,
-                state_id="pipeline.symbol_index.not_run",
+                state_prefix="pipeline.symbol_index",
                 run_types=["symbol_index"],
                 subject="シンボル索引",
                 pipeline_steps=["symbols_indexed"],
@@ -830,7 +944,7 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
 
             entrypoint = _run_not_run_item(
                 conn, system_id, snapshot_id,
-                state_id="pipeline.entrypoint_index.not_run",
+                state_prefix="pipeline.entrypoint_index",
                 run_types=["entrypoint_index"],
                 subject="エントリポイント索引",
                 pipeline_steps=["entrypoints_discovered"],
@@ -841,7 +955,7 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
 
             documentation = _build_step_not_run_item(
                 conn, system_id, snapshot_id,
-                state_id="pipeline.documentation_index.not_run",
+                state_prefix="pipeline.documentation_index",
                 step="documentation_index",
                 subject="ドキュメント索引",
                 pipeline_steps=["documentation_indexed"],
