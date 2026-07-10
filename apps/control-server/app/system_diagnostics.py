@@ -929,6 +929,41 @@ def _latest_interview_baseline(
     return None
 
 
+def _latest_unconfirmed_interview_understanding(
+    conn,
+    system_id: int,
+    *,
+    needs_purpose: bool,
+    needs_capabilities: bool,
+) -> Optional[UnderstandingBaseline]:
+    rows = conn.execute(
+        """
+        SELECT snapshot_id, current_understanding
+          FROM interview_session
+         WHERE system_id = ?
+           AND understanding_confirmed_at IS NULL
+           AND current_understanding IS NOT NULL
+         ORDER BY updated_at DESC, id DESC
+        """,
+        (system_id,),
+    ).fetchall()
+    for row in rows:
+        understanding = _load_json_obj(row["current_understanding"])
+        purpose_count = _understanding_item_count(understanding, "system_purpose")
+        capability_count = _understanding_item_count(understanding, "core_capabilities")
+        if needs_purpose and purpose_count == 0:
+            continue
+        if needs_capabilities and capability_count == 0:
+            continue
+        return UnderstandingBaseline(
+            snapshot_id=row["snapshot_id"],
+            source="interview_unconfirmed",
+            purpose_count=purpose_count,
+            capability_count=capability_count,
+        )
+    return None
+
+
 def _latest_hierarchy_baseline(
     conn,
     system_id: int,
@@ -1186,6 +1221,35 @@ def _baseline_impacted_check(
     )
 
 
+def _unconfirmed_understanding_check(
+    *,
+    base: dict,
+    baseline: UnderstandingBaseline,
+    purpose: bool,
+) -> DiagnosticCheck:
+    target = "System Purpose" if purpose else "Core Capabilities"
+    title = "System Purpose の確認" if purpose else "主な機能 / Core Capabilities の確認"
+    count = baseline.purpose_count if purpose else baseline.capability_count
+    payload = {k: v for k, v in base.items() if k not in {"title", "snapshot_id"}}
+    return DiagnosticCheck(
+        severity="warning",
+        detail=(
+            f"Interview に未確認の {target} 候補が {count} 件あります。"
+            "baseline として再利用するには、開発者による明示的な確認が必要です。"
+        ),
+        impact=(
+            "未確認の理解は、snapshot 更新後の差分診断や probe 設計の前提として"
+            "まだ採用されません。"
+        ),
+        remediation=f"Interview で {target} を確認済みにしてください。",
+        fix_kind=FIX_KIND_NAVIGATE,
+        fix_page=PAGE_INTERVIEW,
+        fix_anchor=ANCHOR_INTERVIEW_PURPOSE if purpose else ANCHOR_INTERVIEW_CAPABILITIES,
+        title=title,
+        **payload,
+    )
+
+
 def _no_ready_snapshot_check(base: dict) -> DiagnosticCheck:
     """Blocked result shared by every pipeline check when no snapshot is ready."""
     payload = {k: v for k, v in base.items() if k != "snapshot_id"}
@@ -1251,6 +1315,13 @@ def _check_system_purpose(conn, system_id: int, snapshot_id: Optional[int]) -> D
         return _baseline_impacted_check(
             base=base, baseline=baseline, impact=impact, purpose=True,
         )
+    unconfirmed = _latest_unconfirmed_interview_understanding(
+        conn, system_id, needs_purpose=True, needs_capabilities=False,
+    )
+    if unconfirmed:
+        return _unconfirmed_understanding_check(
+            base=base, baseline=unconfirmed, purpose=True,
+        )
     return DiagnosticCheck(
         severity="warning",
         detail=(
@@ -1309,6 +1380,13 @@ def _check_system_capabilities(conn, system_id: int, snapshot_id: Optional[int])
             )
         return _baseline_impacted_check(
             base=base, baseline=baseline, impact=impact, purpose=False,
+        )
+    unconfirmed = _latest_unconfirmed_interview_understanding(
+        conn, system_id, needs_purpose=False, needs_capabilities=True,
+    )
+    if unconfirmed:
+        return _unconfirmed_understanding_check(
+            base=base, baseline=unconfirmed, purpose=False,
         )
     return DiagnosticCheck(
         severity="warning",

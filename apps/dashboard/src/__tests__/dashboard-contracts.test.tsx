@@ -2515,6 +2515,62 @@ describe("Interview page", () => {
     });
   });
 
+  test("structured understanding can be explicitly confirmed from the interview page", async () => {
+    mockInterviewApi({
+      session: {
+        stage: "proposal_generation",
+        current_understanding: {
+          system_purpose: [understandingItem("Runtime probe platform")],
+          core_capabilities: [understandingItem("Trace ingestion")],
+          capability_elements: [],
+          supporting_elements: [],
+          api_boundaries: [],
+          probe_flow_candidates: [],
+        },
+        understanding_confirmed_at: null,
+        understanding_confirmed_by: null,
+      },
+      proposals: [],
+    });
+    mockApi.post.mockResolvedValue(interviewSession({
+      stage: "proposal_generation",
+      current_understanding: {
+        system_purpose: [understandingItem("Runtime probe platform")],
+        core_capabilities: [understandingItem("Trace ingestion")],
+        capability_elements: [],
+        supporting_elements: [],
+        api_boundaries: [],
+        probe_flow_candidates: [],
+      },
+      understanding_confirmed_at: 9,
+      understanding_confirmed_by: "admin",
+    }));
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const confirmButton = await screen.findByTestId("confirm-understanding");
+    expect(confirmButton).toHaveTextContent("この理解を確認済みにする");
+    expect(screen.getByTestId("next-action")).toHaveTextContent("この理解を確認済みにする");
+
+    fireEvent.click(confirmButton);
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/7/confirm-understanding",
+        { actor: "admin" },
+      );
+    });
+  });
+
   test("answering a gap question passes it to the server for consumption (Issue #123)", async () => {
     mockInterviewApi({
       session: {

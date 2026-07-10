@@ -782,6 +782,7 @@ export function useAdvanceInterviewStage(sessionId: number | null) {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
       qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
+      qc.invalidateQueries({ queryKey: sysKey("system-diagnostics") });
     },
   });
 }
@@ -797,6 +798,7 @@ export function useConfirmInterviewUnderstanding(sessionId: number | null) {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
       qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
+      qc.invalidateQueries({ queryKey: sysKey("system-diagnostics") });
     },
   });
 }

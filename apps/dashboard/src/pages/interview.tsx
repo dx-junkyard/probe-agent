@@ -971,6 +971,9 @@ export default function InterviewPage() {
   const zeroBaseComplete =
     uiState === "zero_base" &&
     (userMessageCount >= ZERO_BASE_QUESTIONS.length || isProposalStage);
+  const canConfirmStructuredUnderstanding = !!(
+    session?.current_understanding && session.understanding_confirmed_at == null
+  );
 
   // 現在ユーザーに求める「1つの質問/確認」を導出する。
   const focusedQuestion = useMemo<FocusedQuestion | null>(() => {
@@ -1038,6 +1041,9 @@ export default function InterviewPage() {
   };
 
   const nextActionText = useMemo(() => {
+    if (canConfirmStructuredUnderstanding) {
+      return "表示されているシステム理解を確認し、問題なければ「この理解を確認済みにする」を押してください。";
+    }
     switch (uiState) {
       case "preparing":
         return "ドキュメントとコードから自動でシステム理解を構築しています。完了までお待ちください。";
@@ -1062,7 +1068,7 @@ export default function InterviewPage() {
       default:
         return "";
     }
-  }, [uiState, approvedCount, zeroBaseComplete, proposalNarrowing]);
+  }, [uiState, approvedCount, zeroBaseComplete, proposalNarrowing, canConfirmStructuredUnderstanding]);
 
   const startSession = async () => {
     if (!latestSnapshot) {
@@ -1501,7 +1507,7 @@ export default function InterviewPage() {
                           )}
                         </div>
                       )}
-                      {zeroBaseComplete && (
+                      {(zeroBaseComplete || canConfirmStructuredUnderstanding) && (
                         <Button
                           size="sm"
                           onClick={doConfirmUnderstanding}
@@ -1509,7 +1515,11 @@ export default function InterviewPage() {
                           data-testid="confirm-understanding"
                         >
                           <CheckCircle className="h-4 w-4 mr-1" />
-                          {confirmUnderstanding.isPending ? "確定中..." : "この内容で提案生成に進む"}
+                          {confirmUnderstanding.isPending
+                            ? "確定中..."
+                            : zeroBaseComplete
+                              ? "この内容で提案生成に進む"
+                              : "この理解を確認済みにする"}
                         </Button>
                       )}
                       <Textarea

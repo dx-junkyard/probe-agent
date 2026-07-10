@@ -155,6 +155,50 @@ def _insert_confirmed_understanding(system_id, snapshot_id):
         )
 
 
+def _insert_unconfirmed_understanding(system_id, snapshot_id):
+    from app.db import get_conn
+
+    now = time.time()
+    understanding = {
+        "system_purpose": [{
+            "name": "Probe repository inspection",
+            "summary": "Inspect repositories and plan probes.",
+            "confidence": {"level": "likely", "reason": "reasoning"},
+            "evidence": [],
+            "why_core": "",
+            "related_docs": [],
+            "related_apis": [],
+            "children": [],
+        }],
+        "core_capabilities": [{
+            "name": "Repository scanning",
+            "summary": "Create snapshots and index code.",
+            "confidence": {"level": "likely", "reason": "reasoning"},
+            "evidence": [],
+            "why_core": "",
+            "related_docs": [],
+            "related_apis": [],
+            "children": [],
+        }],
+        "capability_elements": [],
+        "supporting_elements": [],
+        "api_boundaries": [],
+        "probe_flow_candidates": [],
+    }
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO interview_session
+                (system_id, snapshot_id, title, focus, status, stage,
+                 current_understanding, understanding_confirmed_at,
+                 understanding_confirmed_by, created_at, updated_at)
+            VALUES (?, ?, 'candidate', '', 'open', 'purpose_confirmation',
+                    ?, NULL, NULL, ?, ?)
+            """,
+            (system_id, snapshot_id, json.dumps(understanding), now, now),
+        )
+
+
 def _get_checks(client, hdrs):
     r = client.get("/system-diagnostics", headers=hdrs)
     assert r.status_code == 200, r.text
@@ -628,6 +672,30 @@ class TestSystemPurposeAndCapabilities:
         assert purpose["fix_page"] == "/interview"
         assert purpose["fix_anchor"] == "interview-purpose"
         assert caps["severity"] == "warning"
+        assert caps["fix_anchor"] == "interview-capabilities"
+
+    def test_unconfirmed_understanding_is_reported_as_confirmation_needed(self, admin_client, tmp_path):
+        _, sys, hdrs = _setup(admin_client)
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+        _insert_unconfirmed_understanding(sys["id"], snap.json()["id"])
+
+        _, checks = _get_checks(admin_client, hdrs)
+        purpose = checks["system_purpose"]
+        caps = checks["system_capabilities"]
+        assert purpose["severity"] == "warning"
+        assert "未確認" in purpose["detail"]
+        assert "候補" in purpose["detail"]
+        assert purpose["fix_anchor"] == "interview-purpose"
+        assert caps["severity"] == "warning"
+        assert "未確認" in caps["detail"]
+        assert "候補" in caps["detail"]
         assert caps["fix_anchor"] == "interview-capabilities"
 
     def test_confirmed_baseline_survives_unrelated_source_change(self, admin_client, tmp_path):
