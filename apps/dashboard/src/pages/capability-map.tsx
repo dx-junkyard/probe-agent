@@ -5,7 +5,6 @@ import { toast } from "sonner";
 import {
   useCapabilityHierarchy, useCapabilityHierarchyDrift,
   useGenerateCapabilityHierarchy, useRequestExplanationRefresh,
-  useLatestSnapshot, useSymbols, useLatestDrafts,
   useApiRoleCards, useCodeLinks, useCapabilityContext,
 } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
@@ -14,10 +13,11 @@ import { Button, buttonVariants } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import { Skeleton } from "@/components/ui/skeleton";
+import { PrerequisiteChecklist } from "@/components/prerequisite-checklist";
 import {
   Map as MapIcon, Sparkles, Workflow, RefreshCw, Link2,
   Target, Boxes, Layers, Server, ChevronRight, AlertTriangle,
-  CheckCircle2, Circle, MessageSquareText, Crosshair, FlaskConical,
+  MessageSquareText, Crosshair, FlaskConical,
 } from "lucide-react";
 import type {
   CapabilityOut, CapabilityElementOut,
@@ -378,7 +378,7 @@ function DetailsPanel({
                 {capabilityContext.gaps.map((g, i) => (
                   <Link
                     key={i}
-                    to="/system-understanding"
+                    to={`/system-understanding?capability=${encodeURIComponent(selected.data.capability_key ?? selected.data.name)}`}
                     className="flex items-center gap-1.5 text-[11px] text-primary hover:underline"
                   >
                     <AlertTriangle className="h-3 w-3 text-yellow-600 shrink-0" />
@@ -457,36 +457,9 @@ function TreeRow({
   );
 }
 
-// Required generation order (#62 follow-up): a snapshot must exist before
-// symbols can be indexed, and a System Profile Draft (for the purpose node)
-// is generated separately on the Repository page. Surfacing this as a
-// checklist replaces a prose explanation that left the order implicit.
-function PrerequisiteChecklist() {
-  const { data: snapshot } = useLatestSnapshot();
-  const { data: symbols } = useSymbols();
-  const { data: drafts } = useLatestDrafts();
-
-  const steps = [
-    { label: "Snapshot created", done: !!snapshot },
-    { label: "Symbols indexed", done: !!symbols && symbols.symbol_count > 0 },
-    { label: "System Profile Draft generated", done: !!drafts?.system_profile_draft },
-  ];
-
-  return (
-    <ul className="text-sm text-left max-w-xs mx-auto space-y-1.5">
-      {steps.map((step) => (
-        <li key={step.label} className="flex items-center gap-2">
-          {step.done ? (
-            <CheckCircle2 className="h-4 w-4 text-emerald-600 shrink-0" />
-          ) : (
-            <Circle className="h-4 w-4 text-muted-foreground shrink-0" />
-          )}
-          <span className={cn(!step.done && "text-muted-foreground")}>{step.label}</span>
-        </li>
-      ))}
-    </ul>
-  );
-}
+// PrerequisiteChecklist moved to components/prerequisite-checklist.tsx
+// (Issue #212) so Feature Map's empty state can reuse the identical,
+// deterministic presence checks instead of duplicating them.
 
 export default function CapabilityMapPage() {
   const { data: hierarchy, isLoading } = useCapabilityHierarchy();

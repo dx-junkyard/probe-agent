@@ -1448,7 +1448,7 @@ describe("Capability Map page", () => {
     fireEvent.click(await screen.findByText("Document Analysis"));
 
     const gapLink = await screen.findByText("Missing docs for parser");
-    expect(gapLink.closest("a")).toHaveAttribute("href", "/system-understanding");
+    expect(gapLink.closest("a")).toHaveAttribute("href", "/system-understanding?capability=doc-analysis");
 
     const planLink = await screen.findByTestId("capability-probe-plans");
     expect(within(planLink).getByText("doc-parsing")).toBeInTheDocument();
@@ -5174,5 +5174,139 @@ describe("Trace Analyzers page", () => {
     expect(within(table).getByText(/1\/2 entities differ/)).toBeInTheDocument();
     expect(within(table).getByText("status")).toBeInTheDocument();
     expect(within(table).getByText("changed")).toBeInTheDocument();
+  });
+});
+
+// ── Cross-page onboarding and navigation links (Issue #212) ─────────
+
+describe("Overview get-started zero state (Issue #212)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+    mockSystems = [{ id: 1, name: "alpha" }];
+  });
+
+  test("renders ordered get-started links when no components exist", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/components") return Promise.resolve([]);
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "ok",
+        severity_counts: {}, items: [], primary_item: null,
+        notification_items: [], page_items: {},
+      });
+      return Promise.resolve(null);
+    });
+
+    const { default: OverviewPage } = await import("@/pages/overview");
+    render(<OverviewPage />, { wrapper: createWrapper() });
+
+    const getStarted = await screen.findByTestId("overview-get-started");
+    expect(within(getStarted).getByTestId("overview-link-repository"))
+      .toHaveAttribute("href", "/repository");
+    expect(within(getStarted).getByTestId("overview-link-system-understanding"))
+      .toHaveAttribute("href", "/system-understanding");
+    expect(within(getStarted).getByTestId("overview-link-connect-sdk"))
+      .toHaveAttribute("href", "/connect-sdk");
+  });
+
+  test("does not render get-started links when components exist", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/components") return Promise.resolve([{
+        component_id: "summarize", mode: "trace", trace_count: 3, last_seen: 1,
+      }]);
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "ok",
+        severity_counts: {}, items: [], primary_item: null,
+        notification_items: [], page_items: {},
+      });
+      return Promise.resolve(null);
+    });
+
+    const { default: OverviewPage } = await import("@/pages/overview");
+    render(<OverviewPage />, { wrapper: createWrapper() });
+
+    await screen.findByText("summarize");
+    expect(screen.queryByTestId("overview-get-started")).not.toBeInTheDocument();
+  });
+});
+
+describe("Probe Planner manual feature-id escape hatch (Issue #212)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  function mockPlannerApis() {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({ plans: [] });
+      if (path === "/repository/drafts/latest") {
+        return Promise.resolve({ system_profile_draft: null, feature_drafts: [] });
+      }
+      return Promise.resolve(null);
+    });
+  }
+
+  test("with no feature drafts, shows prerequisite note and hides free-text input behind toggle", async () => {
+    mockPlannerApis();
+
+    await renderProbePlannerAt("/probe-planner");
+
+    fireEvent.click(await screen.findByText("Generate Plan"));
+
+    const note = await screen.findByTestId("planner-no-drafts-note");
+    expect(within(note).getByText("Feature Map").closest("a"))
+      .toHaveAttribute("href", "/feature-map");
+    expect(within(note).getByText("System Understanding").closest("a"))
+      .toHaveAttribute("href", "/system-understanding");
+    expect(screen.queryByTestId("planner-manual-feature-input")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("planner-manual-feature-toggle"));
+    expect(await screen.findByTestId("planner-manual-feature-input")).toBeInTheDocument();
+  });
+});
+
+describe("Feature Map empty-state prerequisites (Issue #212)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("renders the shared prerequisite checklist when no profile draft exists", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/drafts/latest") {
+        return Promise.resolve({ system_profile_draft: null, feature_drafts: [] });
+      }
+      if (path === "/repository/code-links") return Promise.resolve({ links: [] });
+      if (path === "/repository/snapshots/latest") return Promise.resolve(null);
+      if (path === "/repository/symbols") return Promise.resolve({ symbols: [], symbol_count: 0 });
+      return Promise.resolve(null);
+    });
+
+    const { default: FeatureMapPage } = await import("@/pages/feature-map");
+    render(<FeatureMapPage />, { wrapper: createWrapper() });
+
+    const checklist = await screen.findByTestId("prerequisite-checklist");
+    expect(within(checklist).getByText("Snapshot created")).toBeInTheDocument();
+    expect(within(checklist).getByText("Symbols indexed")).toBeInTheDocument();
+  });
+});
+
+describe("Connect SDK forward link to Setup Guide (Issue #212)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("renders the setup-guide link", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/auth/my-tokens") return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+
+    const { default: ConnectSdkPage } = await import("@/pages/connect-sdk");
+    render(<ConnectSdkPage />, { wrapper: createWrapper() });
+
+    expect(await screen.findByTestId("connect-sdk-setup-guide-link"))
+      .toHaveAttribute("href", "/setup-guide");
   });
 });
