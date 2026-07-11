@@ -2923,6 +2923,20 @@ class SystemUnderstandingGapOut(BaseModel):
     issue_drafts: List[IssueDraftRefOut] = Field(default_factory=list)
 
 
+# Issue #202: finite stage completion status shown as a badge in the Hub.
+# Derived purely from persisted state (system_understanding_service.
+# _derive_stage_statuses); no reasoning model involved (Principle 6).
+SystemUnderstandingStageStatusValue = Literal[
+    "not_started", "in_progress", "blocked", "complete"
+]
+
+
+class SystemUnderstandingStageStatusOut(BaseModel):
+    stage: str
+    status: str
+    counts: Dict[str, int] = Field(default_factory=dict)
+
+
 class SystemUnderstandingOut(BaseModel):
     system_id: int
     snapshot_id: Optional[int] = None
@@ -2941,6 +2955,9 @@ class SystemUnderstandingOut(BaseModel):
     # None when a build job is actively running (the BuildJobPanel already
     # shows progress) so the header CTA and this card never contradict it.
     primary_action: Optional[SystemUnderstandingNextActionOut] = None
+    # Issue #202: deterministic completion status + counts for each of the 4
+    # Hub stages (understand / observe / instrument / evaluate).
+    stages: List[SystemUnderstandingStageStatusOut] = Field(default_factory=list)
 
 
 class CapabilityContextProbePlanOut(BaseModel):

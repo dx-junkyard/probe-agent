@@ -3714,6 +3714,150 @@ describe("System Understanding page", () => {
 
     expect(screen.queryByTestId("primary-action")).toBeNull();
   });
+
+  // ── Stage status badges + counts summary (Issue #202) ──────────────
+
+  test("renders stage status badges and a heading counts line for understand/observe", async () => {
+    const response = {
+      ...completeResponse,
+      stages: [
+        { stage: "understand", status: "complete", counts: { gaps: 0 } },
+        { stage: "observe", status: "in_progress", counts: { entrypoints: 3, unclassified: 1 } },
+        { stage: "instrument", status: "not_started", counts: { proposed: 0, approved_without_patch: 0, validated: 0 } },
+        { stage: "evaluate", status: "not_started", counts: { undecided: 0, decided: 0 } },
+      ],
+    };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(response)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("stage-status-understand")).toBeTruthy();
+    });
+
+    expect(screen.getByTestId("stage-status-understand").textContent).toBe("Complete");
+    expect(screen.getByTestId("stage-status-observe").textContent).toBe("In progress");
+    expect(screen.getByTestId("stage-status-instrument").textContent).toBe("Not started");
+    expect(screen.getByTestId("stage-status-evaluate").textContent).toBe("Not started");
+
+    expect(screen.getByTestId("stage-counts-observe").textContent).toContain("entrypoints: 3");
+    expect(screen.getByTestId("stage-counts-observe").textContent).toContain("unclassified: 1");
+
+    // Instrument/Evaluate show their counts via the dedicated summary block
+    // below instead of the generic heading counts line (no duplication).
+    expect(screen.queryByTestId("stage-counts-instrument")).toBeNull();
+    expect(screen.queryByTestId("stage-counts-evaluate")).toBeNull();
+  });
+
+  test("shows Instrument/Evaluate counts summaries linking to Probe Planner/Experiments when non-zero", async () => {
+    const response = {
+      ...completeResponse,
+      stages: [
+        { stage: "understand", status: "complete", counts: { gaps: 0 } },
+        { stage: "observe", status: "complete", counts: { entrypoints: 3, unclassified: 0 } },
+        { stage: "instrument", status: "in_progress", counts: { proposed: 2, approved_without_patch: 1, validated: 0 } },
+        { stage: "evaluate", status: "in_progress", counts: { undecided: 1, decided: 2 } },
+      ],
+    };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(response)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("stage-summary-instrument")).toBeTruthy();
+    });
+
+    const instrumentSummary = screen.getByTestId("stage-summary-instrument");
+    expect(instrumentSummary.textContent).toContain("Proposed");
+    expect(instrumentSummary.textContent).toContain("2");
+    expect(instrumentSummary.textContent).toContain("Approved without patch");
+    expect(instrumentSummary.textContent).toContain("1");
+    expect(instrumentSummary.textContent).toContain("Validated");
+    const instrumentLinks = within(instrumentSummary).getAllByRole("link");
+    expect(instrumentLinks.length).toBeGreaterThan(0);
+    for (const link of instrumentLinks) {
+      expect(link.getAttribute("href")).toBe("/probe-planner");
+    }
+
+    const evaluateSummary = screen.getByTestId("stage-summary-evaluate");
+    expect(evaluateSummary.textContent).toContain("Undecided");
+    expect(evaluateSummary.textContent).toContain("1");
+    expect(evaluateSummary.textContent).toContain("Decided");
+    expect(evaluateSummary.textContent).toContain("2");
+    const evaluateLinks = within(evaluateSummary).getAllByRole("link");
+    expect(evaluateLinks.length).toBeGreaterThan(0);
+    for (const link of evaluateLinks) {
+      expect(link.getAttribute("href")).toBe("/experiments");
+    }
+  });
+
+  test("falls back to the original description text for Instrument/Evaluate when counts are all zero", async () => {
+    const response = {
+      ...completeResponse,
+      stages: [
+        { stage: "understand", status: "complete", counts: { gaps: 0 } },
+        { stage: "observe", status: "complete", counts: { entrypoints: 3, unclassified: 0 } },
+        { stage: "instrument", status: "not_started", counts: { proposed: 0, approved_without_patch: 0, validated: 0 } },
+        { stage: "evaluate", status: "not_started", counts: { undecided: 0, decided: 0 } },
+      ],
+    };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(response)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("stage-summary-instrument")).toBeTruthy();
+    });
+
+    expect(screen.getByTestId("stage-summary-instrument").textContent).toContain(
+      "Probe plan and patch status live in Probe Planner",
+    );
+    expect(screen.getByTestId("stage-summary-evaluate").textContent).toContain(
+      "Trace comparisons, experiment runs, and adoption decisions live in Experiments",
+    );
+  });
+
+  test("renders with no stage status badges when data.stages is missing (backward compat)", async () => {
+    // completeResponse predates Issue #202 and has no `stages` field.
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(completeResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("stage-section-understand")).toBeTruthy();
+    });
+
+    expect(screen.queryByTestId("stage-status-understand")).toBeNull();
+    expect(screen.queryByTestId("stage-status-observe")).toBeNull();
+    expect(screen.queryByTestId("stage-status-instrument")).toBeNull();
+    expect(screen.queryByTestId("stage-status-evaluate")).toBeNull();
+    expect(screen.getByTestId("stage-summary-instrument").textContent).toContain(
+      "Probe plan and patch status live in Probe Planner",
+    );
+    expect(screen.getByTestId("stage-summary-evaluate").textContent).toContain(
+      "Trace comparisons, experiment runs, and adoption decisions live in Experiments",
+    );
+  });
 });
 
 // ── System settings diagnostics (Issue #101) ────────────────────────

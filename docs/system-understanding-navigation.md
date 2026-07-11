@@ -285,6 +285,48 @@ Refresh ボタン）の直下に、`primary_action` を表示する単一カー�
 Issue #193）へ統合される可能性があるが、本 issue ではまだ統合しない
 （`_derive_primary_action` のコメント参照）。
 
+### Stage Status（Issue #202）
+
+`GET /system-understanding` は `next_actions` / `primary_action` に加えて、
+4 stage それぞれの完了ステータスと件数サマリを `stages`（`stage` /
+`status` / `counts` の配列）として返す。Hub の各 stage 見出しはこの
+`status` をバッジとして表示し（`data-testid="stage-status-<stage>"`）、
+Instrument / Evaluate stage は `counts` を件数サマリとして表示する
+（`data-testid="stage-summary-instrument"` / `"stage-summary-evaluate"`。
+counts が全て 0 のときは従来の説明テキストにフォールバックする）。
+
+導出は `apps/control-server/app/system_understanding_service.py` の
+`_derive_stage_statuses(...)` という純粋関数が担う。入力は `pipeline` と、
+`get_system_understanding` が既に集めている purpose / capabilities /
+gap_summary / plan・experiment id リストだけで、reasoning model は関与し
+ない（Principle 6）。`status` は有限集合
+`not_started | in_progress | blocked | complete` のみ。
+
+各 stage のルールは上から順に評価し、最初に該当したものを採用する:
+
+| stage | `not_started` | `blocked` | `complete` | それ以外 | `counts` |
+| --- | --- | --- | --- | --- | --- |
+| `understand` | 全 pipeline step が `missing` | pipeline に `blocked` / `failed` の step がある（`not_started` 判定より先に評価） | 全 step `complete` かつ purpose 定義済み（`_build_next_actions` と同じ判定）かつ capabilities が 1 件以上 | `in_progress` | `{"gaps": gap 総数}` |
+| `observe` | `entrypoints_discovered` step が `complete` でない | （なし） | entrypoint が 1 件以上 かつ `unclassified_entrypoint` gap が 0 件 | `in_progress` | `{"entrypoints": ..., "unclassified": ...}` |
+| `instrument` | probe plan が 0 件（system 内の総数） | （なし） | approved かつ validated patch 済みの plan が 1 件以上 かつ approved-without-patch が 0 件 | `in_progress` | `{"proposed": ..., "approved_without_patch": ..., "validated": ...}` |
+| `evaluate` | experiment が 0 件（system 内の総数） | （なし） | decision 記録済みの completed experiment が 1 件以上 かつ undecided-completed experiment が 0 件 | `in_progress` | `{"undecided": ..., "decided": ...}` |
+
+`understand` の `blocked` 判定は `not_started` より先に評価される（1 つで
+も blocked/failed step があれば、他が全 missing であっても blocked を優先
+する）。`observe` / `instrument` / `evaluate` に `blocked` はない（有限集合
+上、この 3 stage は入力データに blocked/failed 相当の状態を持たないため）。
+
+`instrument` / `evaluate` の件数取得は、`get_system_understanding` が
+Next Actions 用に既に集めている `proposed_plan_ids` /
+`approved_plan_ids_without_validated_patch` /
+`undecided_completed_experiment_ids` をそのまま再利用し、不足分（plan 総数、
+approved plan 総数、experiment 総数、decision 記録済み experiment 数）だけ
+`probe_plans` / `experiments` テーブルへの追加 COUNT クエリで補う。
+`validated` count は `approved plan 総数 - approved_without_patch 件数` で
+導出し、`decided` count は `undecided_completed_experiment_ids` と同じ
+`status = 'completed' AND human_decision`条件を反転させたクエリ
+（`!= 'undecided'`）で求める。新しい判定基準を発明しない。
+
 ## Feature Map から始める場合
 
 Feature Map は「ユーザー価値」を起点とする探索パスを提供する。

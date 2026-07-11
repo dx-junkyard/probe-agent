@@ -1306,3 +1306,314 @@ class TestDerivePrimaryAction:
         primary = _derive_primary_action(pipeline, next_actions=[], latest_build=None)
 
         assert primary is None
+
+
+class TestDeriveStageStatuses:
+    """Issue #202: ``_derive_stage_statuses`` derives a deterministic
+    not_started / in_progress / blocked / complete status (+ counts) for each
+    of the 4 Hub stages, using the finite rules documented in
+    docs/system-understanding-navigation.md.
+    """
+
+    def _complete_pipeline(self):
+        from app.system_understanding_service import PIPELINE_STEPS, PipelineStep
+
+        return [PipelineStep(step, "complete") for step in PIPELINE_STEPS]
+
+    def _pipeline_with(self, **overrides):
+        from app.system_understanding_service import PIPELINE_STEPS, PipelineStep
+
+        return [
+            PipelineStep(step, overrides.get(step, "complete")) for step in PIPELINE_STEPS
+        ]
+
+    def _derive(self, pipeline, **overrides):
+        from app.system_understanding_service import GapSummary, _derive_stage_statuses
+
+        defaults = dict(
+            purpose={"name": "Sys", "summary": "Does things"},
+            capabilities=[{"name": "Cap"}],
+            gap_count=0,
+            gap_summary=[],
+            entrypoint_count=0,
+            proposed_plan_count=0,
+            approved_without_patch_count=0,
+            validated_plan_count=0,
+            total_plan_count=0,
+            undecided_experiment_count=0,
+            decided_experiment_count=0,
+            total_experiment_count=0,
+        )
+        defaults.update(overrides)
+        stages = _derive_stage_statuses(pipeline, **defaults)
+        return {s.stage: s for s in stages}
+
+    def _gap_summary(self, **counts):
+        from app.system_understanding_service import GapSummary
+
+        return [GapSummary(gap_type=k, count=v) for k, v in counts.items()]
+
+    # --- understand ---
+
+    def test_understand_not_started_when_all_steps_missing(self):
+        from app.system_understanding_service import PIPELINE_STEPS, PipelineStep
+
+        pipeline = [PipelineStep(step, "missing") for step in PIPELINE_STEPS]
+        stages = self._derive(pipeline, purpose=None, capabilities=[])
+
+        assert stages["understand"].status == "not_started"
+
+    def test_understand_blocked_when_any_step_blocked(self):
+        pipeline = self._pipeline_with(symbols_indexed="blocked")
+        stages = self._derive(pipeline)
+
+        assert stages["understand"].status == "blocked"
+
+    def test_understand_blocked_when_any_step_failed(self):
+        pipeline = self._pipeline_with(documentation_indexed="failed")
+        stages = self._derive(pipeline)
+
+        assert stages["understand"].status == "blocked"
+
+    def test_understand_in_progress_when_pipeline_incomplete(self):
+        pipeline = self._pipeline_with(symbols_indexed="missing")
+        stages = self._derive(pipeline)
+
+        assert stages["understand"].status == "in_progress"
+
+    def test_understand_in_progress_when_pipeline_complete_but_no_purpose(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(pipeline, purpose=None, capabilities=[{"name": "Cap"}])
+
+        assert stages["understand"].status == "in_progress"
+
+    def test_understand_in_progress_when_pipeline_complete_but_no_capabilities(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(
+            pipeline, purpose={"name": "Sys", "summary": "s"}, capabilities=[],
+        )
+
+        assert stages["understand"].status == "in_progress"
+
+    def test_understand_complete_when_pipeline_purpose_and_capabilities_all_present(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(pipeline)
+
+        assert stages["understand"].status == "complete"
+
+    def test_understand_counts_gaps(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(pipeline, gap_count=4)
+
+        assert stages["understand"].counts == {"gaps": 4}
+
+    # --- observe ---
+
+    def test_observe_not_started_when_entrypoints_step_incomplete(self):
+        pipeline = self._pipeline_with(entrypoints_discovered="missing")
+        stages = self._derive(pipeline, entrypoint_count=0)
+
+        assert stages["observe"].status == "not_started"
+
+    def test_observe_in_progress_when_no_entrypoints_yet(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(pipeline, entrypoint_count=0)
+
+        assert stages["observe"].status == "in_progress"
+
+    def test_observe_in_progress_when_unclassified_entrypoints_remain(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(
+            pipeline,
+            entrypoint_count=5,
+            gap_summary=self._gap_summary(unclassified_entrypoint=2),
+        )
+
+        assert stages["observe"].status == "in_progress"
+
+    def test_observe_complete_when_entrypoints_exist_and_none_unclassified(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(pipeline, entrypoint_count=5)
+
+        assert stages["observe"].status == "complete"
+
+    def test_observe_counts_entrypoints_and_unclassified(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(
+            pipeline,
+            entrypoint_count=5,
+            gap_summary=self._gap_summary(unclassified_entrypoint=2),
+        )
+
+        assert stages["observe"].counts == {"entrypoints": 5, "unclassified": 2}
+
+    # --- instrument ---
+
+    def test_instrument_not_started_when_no_plans(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(pipeline, total_plan_count=0)
+
+        assert stages["instrument"].status == "not_started"
+
+    def test_instrument_in_progress_when_plans_exist_but_none_validated(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(
+            pipeline, total_plan_count=1, proposed_plan_count=1, validated_plan_count=0,
+        )
+
+        assert stages["instrument"].status == "in_progress"
+
+    def test_instrument_in_progress_when_some_approved_plans_lack_validated_patch(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(
+            pipeline,
+            total_plan_count=2,
+            validated_plan_count=1,
+            approved_without_patch_count=1,
+        )
+
+        assert stages["instrument"].status == "in_progress"
+
+    def test_instrument_complete_when_validated_plan_exists_and_none_pending(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(
+            pipeline,
+            total_plan_count=1,
+            validated_plan_count=1,
+            approved_without_patch_count=0,
+        )
+
+        assert stages["instrument"].status == "complete"
+
+    def test_instrument_counts(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(
+            pipeline,
+            total_plan_count=3,
+            proposed_plan_count=2,
+            approved_without_patch_count=1,
+            validated_plan_count=0,
+        )
+
+        assert stages["instrument"].counts == {
+            "proposed": 2, "approved_without_patch": 1, "validated": 0,
+        }
+
+    # --- evaluate ---
+
+    def test_evaluate_not_started_when_no_experiments(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(pipeline, total_experiment_count=0)
+
+        assert stages["evaluate"].status == "not_started"
+
+    def test_evaluate_in_progress_when_experiments_exist_but_none_decided(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(
+            pipeline, total_experiment_count=1, undecided_experiment_count=1,
+            decided_experiment_count=0,
+        )
+
+        assert stages["evaluate"].status == "in_progress"
+
+    def test_evaluate_in_progress_when_some_completed_experiments_undecided(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(
+            pipeline,
+            total_experiment_count=2,
+            decided_experiment_count=1,
+            undecided_experiment_count=1,
+        )
+
+        assert stages["evaluate"].status == "in_progress"
+
+    def test_evaluate_complete_when_decided_experiment_exists_and_none_pending(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(
+            pipeline,
+            total_experiment_count=1,
+            decided_experiment_count=1,
+            undecided_experiment_count=0,
+        )
+
+        assert stages["evaluate"].status == "complete"
+
+    def test_evaluate_counts(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(
+            pipeline,
+            total_experiment_count=3,
+            decided_experiment_count=2,
+            undecided_experiment_count=1,
+        )
+
+        assert stages["evaluate"].counts == {"undecided": 1, "decided": 2}
+
+
+class TestSystemUnderstandingStagesInApiResponse:
+    """Issue #202: GET /repository/system-understanding includes ``stages``."""
+
+    def test_new_system_reports_four_not_started_stages(self, admin_client, tmp_path):
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "stages-sys")
+        hdrs = _headers(token, sys["id"])
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        stages = r.json()["stages"]
+
+        assert {s["stage"] for s in stages} == {
+            "understand", "observe", "instrument", "evaluate",
+        }
+        by_stage = {s["stage"]: s for s in stages}
+        assert by_stage["understand"]["status"] == "not_started"
+        assert by_stage["observe"]["status"] == "not_started"
+        assert by_stage["instrument"]["status"] == "not_started"
+        assert by_stage["evaluate"]["status"] == "not_started"
+        assert by_stage["instrument"]["counts"] == {
+            "proposed": 0, "approved_without_patch": 0, "validated": 0,
+        }
+        assert by_stage["evaluate"]["counts"] == {"undecided": 0, "decided": 0}
+
+    def test_proposed_plan_surfaces_in_instrument_counts(self, admin_client, tmp_path):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "stages-plan-sys")
+        hdrs = _headers(token, sys["id"])
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap_r = admin_client.post(
+            "/repository/snapshots", json={"commit_sha": sha}, headers=hdrs
+        )
+        snapshot_id = snap_r.json()["id"]
+        system_id = sys["id"]
+
+        with get_conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO intelligence_runs
+                       (system_id, snapshot_id, run_type, provider, model,
+                        prompt_version, schema_version, decision_method,
+                        status, is_mock, started_at, completed_at)
+                   VALUES (?, ?, 'probe_plan', 'mock', 'mock-model', 'v1', 'v1',
+                           'reasoning_llm', 'completed', 1, 0, 0)""",
+                (system_id, snapshot_id),
+            )
+            run_id = cur.lastrowid
+            conn.execute(
+                """INSERT INTO probe_plans
+                       (system_id, snapshot_id, intelligence_run_id, feature_id,
+                        objective, status, origin, created_at, updated_at)
+                   VALUES (?, ?, ?, 'feat-1', 'obj', 'proposed', 'manual', 0, 0)""",
+                (system_id, snapshot_id, run_id),
+            )
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        by_stage = {s["stage"]: s for s in r.json()["stages"]}
+        assert by_stage["instrument"]["status"] == "in_progress"
+        assert by_stage["instrument"]["counts"]["proposed"] == 1

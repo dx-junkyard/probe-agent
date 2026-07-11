@@ -805,6 +805,7 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
         SystemUnderstandingGapSymbolRef,
         SystemUnderstandingGapEntrypointRef,
         IssueDraftRefOut,
+        SystemUnderstandingStageStatusOut,
     )
     pipeline = [
         SystemUnderstandingPipelineStepOut(step=s.step, status=s.status, detail=s.detail)
@@ -868,6 +869,10 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
             action=pa.action, reason=pa.reason, category=pa.category, link=pa.link,
             action_kind=pa.action_kind,
         )
+    stages = [
+        SystemUnderstandingStageStatusOut(stage=s.stage, status=s.status, counts=s.counts)
+        for s in summary.stages
+    ]
     return SystemUnderstandingOut(
         system_id=summary.system_id,
         snapshot_id=summary.snapshot_id,
@@ -882,6 +887,7 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
         metadata_coverage=metadata_coverage,
         next_actions=next_actions,
         primary_action=primary_action,
+        stages=stages,
     )
 
 

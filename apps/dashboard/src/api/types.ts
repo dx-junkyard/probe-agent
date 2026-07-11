@@ -1865,6 +1865,19 @@ export interface GitHubIssueStatus {
   reason?: string | null;
 }
 
+// Issue #202: finite completion status shown as a badge for each Hub stage.
+export type SystemUnderstandingStageStatusValue =
+  | "not_started"
+  | "in_progress"
+  | "blocked"
+  | "complete";
+
+export interface SystemUnderstandingStageStatus {
+  stage: NextActionCategory;
+  status: SystemUnderstandingStageStatusValue | string;
+  counts: Record<string, number>;
+}
+
 export interface SystemUnderstandingOut {
   system_id: number;
   snapshot_id: number | null;
@@ -1881,6 +1894,9 @@ export interface SystemUnderstandingOut {
   // Issue #201: single highest-priority action for the current state; null
   // while a build job is actively running.
   primary_action?: SystemUnderstandingNextAction | null;
+  // Issue #202: per-stage completion status + counts. Optional so existing
+  // fixtures/mocks that predate this field keep working (backward compat).
+  stages?: SystemUnderstandingStageStatus[];
 }
 
 // Capability context: gaps / probe plans / experiments linked to one

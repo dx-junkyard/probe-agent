@@ -69,6 +69,17 @@ class GapSummary:
     count: int
 
 
+# Issue #202: finite completion status for each of the 4 Hub stages.
+StageStatusValue = Literal["not_started", "in_progress", "blocked", "complete"]
+
+
+@dataclass
+class StageStatus:
+    stage: str
+    status: str
+    counts: Dict[str, int] = field(default_factory=dict)
+
+
 @dataclass
 class MetadataCoverage:
     symbol_count: int = 0
@@ -94,6 +105,8 @@ class SystemUnderstandingSummary:
     # Issue #201: single highest-priority action for the current state; None
     # while a build job is actively running.
     primary_action: Optional[NextAction] = None
+    # Issue #202: completion status + counts for each of the 4 Hub stages.
+    stages: List[StageStatus] = field(default_factory=list)
 
 
 def _check_repository_configured(conn, system_id: int) -> PipelineStep:
@@ -987,8 +1000,15 @@ def _plan_has_validated_patch(conn, plan_id: int) -> bool:
     return False
 
 
-def _load_pending_plan_action_ids(conn, system_id: int) -> Tuple[List[int], List[int]]:
-    """Return (proposed_plan_ids, approved_plan_ids_without_validated_patch)."""
+def _load_pending_plan_action_ids(conn, system_id: int) -> Tuple[List[int], List[int], int]:
+    """Return (proposed_plan_ids, approved_plan_ids_without_validated_patch,
+    approved_plan_total_count).
+
+    ``approved_plan_total_count`` is exposed (Issue #202) so the Instrument
+    stage's ``validated`` count can be derived as
+    ``approved_plan_total_count - len(approved_plan_ids_without_validated_patch)``
+    without a second, differently-worded query over the same rows.
+    """
     proposed_ids = [
         r["id"] for r in conn.execute(
             "SELECT id FROM probe_plans WHERE system_id = ? AND status = 'proposed' ORDER BY id DESC",
@@ -1002,7 +1022,7 @@ def _load_pending_plan_action_ids(conn, system_id: int) -> Tuple[List[int], List
     approved_without_patch_ids = [
         r["id"] for r in approved_rows if not _plan_has_validated_patch(conn, r["id"])
     ]
-    return proposed_ids, approved_without_patch_ids
+    return proposed_ids, approved_without_patch_ids, len(approved_rows)
 
 
 def _load_undecided_completed_experiment_ids(conn, system_id: int) -> List[int]:
@@ -1013,6 +1033,120 @@ def _load_undecided_completed_experiment_ids(conn, system_id: int) -> List[int]:
         (system_id,),
     ).fetchall()
     return [r["id"] for r in rows]
+
+
+def _load_decided_completed_experiment_count(conn, system_id: int) -> int:
+    """Count of completed experiments with a recorded decision -- the exact
+    complement of ``_load_undecided_completed_experiment_ids`` (same
+    status/human_decision condition set, Issue #202)."""
+    row = conn.execute(
+        """SELECT COUNT(*) FROM experiments
+           WHERE system_id = ? AND status = 'completed' AND human_decision != 'undecided'""",
+        (system_id,),
+    ).fetchone()
+    return row[0]
+
+
+def _load_total_probe_plan_count(conn, system_id: int) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) FROM probe_plans WHERE system_id = ?", (system_id,)
+    ).fetchone()
+    return row[0]
+
+
+def _load_total_experiment_count(conn, system_id: int) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) FROM experiments WHERE system_id = ?", (system_id,)
+    ).fetchone()
+    return row[0]
+
+
+def _derive_stage_statuses(
+    pipeline: List[PipelineStep],
+    purpose: Optional[Dict[str, Any]],
+    capabilities: List[Dict[str, Any]],
+    gap_count: int,
+    gap_summary: List[GapSummary],
+    entrypoint_count: int,
+    proposed_plan_count: int,
+    approved_without_patch_count: int,
+    validated_plan_count: int,
+    total_plan_count: int,
+    undecided_experiment_count: int,
+    decided_experiment_count: int,
+    total_experiment_count: int,
+) -> List[StageStatus]:
+    """Pure derivation of the 4 Hub stage completion statuses (Issue #202).
+
+    Each stage's rules are evaluated top-to-bottom, first match wins
+    (Principle 6: explicit finite branches over an enumerated set, no
+    reasoning model). See the "Stage status" table in
+    docs/system-understanding-navigation.md for the rule source.
+    """
+    stages: List[StageStatus] = []
+
+    # --- understand ---
+    if any(s.status in ("blocked", "failed") for s in pipeline):
+        understand_status = "blocked"
+    elif all(s.status == "missing" for s in pipeline):
+        understand_status = "not_started"
+    else:
+        purpose_defined = bool(purpose and (purpose.get("summary") or purpose.get("name")))
+        if (
+            all(s.status == "complete" for s in pipeline)
+            and purpose_defined
+            and len(capabilities) > 0
+        ):
+            understand_status = "complete"
+        else:
+            understand_status = "in_progress"
+    stages.append(StageStatus("understand", understand_status, {"gaps": gap_count}))
+
+    # --- observe (Decide Where to Observe) ---
+    step_map = {s.step: s.status for s in pipeline}
+    unclassified_count = next(
+        (g.count for g in gap_summary if g.gap_type == "unclassified_entrypoint"), 0
+    )
+    if step_map.get("entrypoints_discovered") != "complete":
+        observe_status = "not_started"
+    elif entrypoint_count > 0 and unclassified_count == 0:
+        observe_status = "complete"
+    else:
+        observe_status = "in_progress"
+    stages.append(StageStatus(
+        "observe", observe_status,
+        {"entrypoints": entrypoint_count, "unclassified": unclassified_count},
+    ))
+
+    # --- instrument ---
+    if total_plan_count == 0:
+        instrument_status = "not_started"
+    elif validated_plan_count > 0 and approved_without_patch_count == 0:
+        instrument_status = "complete"
+    else:
+        instrument_status = "in_progress"
+    stages.append(StageStatus(
+        "instrument", instrument_status,
+        {
+            "proposed": proposed_plan_count,
+            "approved_without_patch": approved_without_patch_count,
+            "validated": validated_plan_count,
+        },
+    ))
+
+    # --- evaluate ---
+    if total_experiment_count == 0:
+        evaluate_status = "not_started"
+    elif decided_experiment_count > 0 and undecided_experiment_count == 0:
+        evaluate_status = "complete"
+    else:
+        evaluate_status = "in_progress"
+    stages.append(StageStatus(
+        "evaluate", evaluate_status,
+        {"undecided": undecided_experiment_count, "decided": decided_experiment_count},
+    ))
+
+    return stages
 
 
 def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
@@ -1040,8 +1174,8 @@ def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
             _attach_issue_drafts(conn, system_id, summary.gaps)
             summary.gap_summary = _compute_gap_summary(summary.gaps)
 
-        proposed_plan_ids, approved_plan_ids_without_patch = _load_pending_plan_action_ids(
-            conn, system_id,
+        proposed_plan_ids, approved_plan_ids_without_patch, approved_plan_total = (
+            _load_pending_plan_action_ids(conn, system_id)
         )
         undecided_experiment_ids = _load_undecided_completed_experiment_ids(conn, system_id)
 
@@ -1055,6 +1189,32 @@ def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
             proposed_plan_ids,
             approved_plan_ids_without_patch,
             undecided_experiment_ids,
+        )
+
+        # Issue #202: stage status counts reuse the id lists above and add
+        # the small set of totals not already collected for next_actions.
+        total_plan_count = _load_total_probe_plan_count(conn, system_id)
+        total_experiment_count = _load_total_experiment_count(conn, system_id)
+        decided_experiment_count = _load_decided_completed_experiment_count(conn, system_id)
+        validated_plan_count = approved_plan_total - len(approved_plan_ids_without_patch)
+        entrypoint_count = (
+            summary.metadata_coverage.entrypoint_count if summary.metadata_coverage else 0
+        )
+
+        summary.stages = _derive_stage_statuses(
+            pipeline,
+            summary.purpose,
+            summary.capabilities,
+            len(summary.gaps),
+            summary.gap_summary,
+            entrypoint_count,
+            len(proposed_plan_ids),
+            len(approved_plan_ids_without_patch),
+            validated_plan_count,
+            total_plan_count,
+            len(undecided_experiment_ids),
+            decided_experiment_count,
+            total_experiment_count,
         )
 
     # Issue #201: build-job lookup opens its own `get_conn()`, and the DB
