@@ -39,6 +39,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from .llm import LLMClient, LLMConfig, LLMError, PROVIDER_KEY_ENV
 from .settings_metadata import SETTINGS_BY_KEY, SettingMetadata
 from .system_diagnostics import DiagnosticCheck, SystemDiagnosticsReport
+from .system_state import StateItem
 
 PROMPT_VERSION = "v1"
 SCHEMA_VERSION = "v1"
@@ -610,16 +611,19 @@ class ContextPack:
     pipeline_steps: List[str]
     mentioned_setting_keys: List[str]
     mentioned_check_ids: List[str]
+    state_items: List[StateItem] = field(default_factory=list)
+    focused_state_id: Optional[str] = None
 
     def allowed_citation_ids(self) -> Dict[str, set]:
         return {
             "setting": {s.key for s in self.settings},
             "diagnostic_check": {c.check_id for c in self.checks},
             "pipeline_step": set(self.pipeline_steps) | set(PIPELINE_STEP_LABELS),
+            "state_item": {item.state_id for item in self.state_items},
         }
 
     def to_llm_payload(self, report: SystemDiagnosticsReport) -> Dict[str, Any]:
-        return {
+        payload = {
             "screen": {
                 "screen_id": self.screen.screen_id,
                 "title": self.screen.title,
@@ -640,6 +644,17 @@ class ContextPack:
             ],
             "navigable_routes": sorted(KNOWN_ROUTES),
         }
+        if self.state_items:
+            payload["system_state_items"] = [
+                {"state_id": item.state_id, "summary": item.summary,
+                 "detail": item.detail, "impact": item.impact,
+                 "remediation": item.remediation, "severity": item.severity,
+                 "target_ui": ({"route": item.target_ui.route, "anchor": item.target_ui.anchor,
+                                "action_label": item.target_ui.action_label} if item.target_ui else None)}
+                for item in self.state_items
+            ]
+            payload["focused_state_id"] = self.focused_state_id
+        return payload
 
 
 def build_context_pack(
@@ -647,6 +662,8 @@ def build_context_pack(
     question: str,
     report: SystemDiagnosticsReport,
     visible_check_ids: Optional[List[str]] = None,
+    state_items: Optional[List[StateItem]] = None,
+    focused_state_id: Optional[str] = None,
 ) -> ContextPack:
     mentioned_settings = match_settings(question)
     mentioned_checks = match_checks(question, report)
@@ -693,6 +710,8 @@ def build_context_pack(
         pipeline_steps=steps,
         mentioned_setting_keys=[s.key for s in mentioned_settings],
         mentioned_check_ids=mentioned_check_ids,
+        state_items=list(state_items or []),
+        focused_state_id=focused_state_id,
     )
 
 
@@ -709,7 +728,7 @@ class SuggestedAction:
 
 @dataclass
 class Citation:
-    type: str  # setting | diagnostic_check | pipeline_step
+    type: str  # setting | diagnostic_check | pipeline_step | state_item
     id: str
     title: str = ""
     detail: str = ""
@@ -730,6 +749,11 @@ class AssistantAnswer:
 
 
 def _citation_title(pack: ContextPack, ctype: str, cid: str) -> tuple:
+    if ctype == "state_item":
+        for item in pack.state_items:
+            if item.state_id == cid:
+                return (item.summary, item.detail)
+        return (cid, "")
     if ctype == "setting":
         meta = SETTINGS_BY_KEY.get(cid)
         return (meta.display_name if meta else cid, "")
@@ -756,7 +780,7 @@ class _RawAction(BaseModel):
 class _RawCitation(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    type: str = Field(..., pattern="^(setting|diagnostic_check|pipeline_step)$")
+    type: str = Field(..., pattern="^(setting|diagnostic_check|pipeline_step|state_item)$")
     id: str = Field(..., min_length=1, max_length=200)
 
 
@@ -772,8 +796,9 @@ _SYSTEM_PROMPT = """You are the in-app assistant for the probe-agent dashboard.
 You answer questions about one dashboard screen using ONLY the JSON context
 provided by the server: the screen's purpose and sections, static settings
 metadata, the current deterministic diagnostics checks (including verbatim
-last observed run errors), and pipeline steps. Never invent settings, checks,
-file paths, or behavior that is not in the context. Ground explanations in
+last observed run errors), pipeline steps, and canonical system-state items.
+Never invent settings, checks, file paths, system-state items, or behavior
+that is not in the context. Ground explanations in
 the diagnostics results and settings metadata, and prefer concrete next
 actions. Answer in the same language as the user's question.
 
@@ -787,7 +812,7 @@ Respond with ONLY a JSON object (no markdown fence) of this shape:
      "detail": "optional how-to detail"}
   ],
   "citations": [
-    {"type": "setting|diagnostic_check|pipeline_step", "id": "key or id from the context"}
+    {"type": "setting|diagnostic_check|pipeline_step|state_item", "id": "key or id from the context"}
   ]
 }
 Cite every setting, diagnostics check, and pipeline step you rely on.
@@ -949,6 +974,27 @@ def _fallback_actions(
     return actions[:8]
 
 
+def _state_actions(items: List[StateItem]) -> List[SuggestedAction]:
+    """Project canonical state targets without recreating page-specific rules."""
+    actions: List[SuggestedAction] = []
+    seen = set()
+    for item in items:
+        if not item.target_ui:
+            continue
+        kind = "operate" if item.user_action_kind in {"create_snapshot", "build", "rerun"} else "navigate"
+        action = SuggestedAction(
+            label=item.target_ui.action_label or "対応する",
+            kind=kind,
+            target=item.target_ui.route,
+            detail=item.remediation or item.detail,
+        )
+        key = (action.kind, action.target, action.label)
+        if key not in seen:
+            seen.add(key)
+            actions.append(action)
+    return actions
+
+
 def _fallback_answer(
     pack: ContextPack,
     report: SystemDiagnosticsReport,
@@ -970,6 +1016,21 @@ def _fallback_answer(
     sections: List[str] = []
     citations: List[Citation] = []
     action_checks: List[DiagnosticCheck] = []
+
+    focused_item = next(
+        (item for item in pack.state_items if item.state_id == pack.focused_state_id), None
+    )
+    if focused_item:
+        lines = [focused_item.summary, focused_item.detail]
+        if focused_item.impact:
+            lines.append(f"Impact: {focused_item.impact}")
+        if focused_item.remediation:
+            lines.append(f"Recommended next step: {focused_item.remediation}")
+        sections.append("\n".join(lines))
+        citations.append(Citation(
+            type="state_item", id=focused_item.state_id,
+            title=focused_item.summary, detail=focused_item.detail,
+        ))
 
     for meta in mentioned_settings:
         sections.append(_describe_setting(meta, pack.checks))
@@ -1031,9 +1092,10 @@ def _fallback_answer(
 
     return AssistantAnswer(
         answer="\n\n".join(sections),
-        suggested_actions=_fallback_actions(
-            action_checks or pack.checks, mentioned_settings or pack.settings
-        ),
+        suggested_actions=(
+            _state_actions(pack.state_items)
+            + _fallback_actions(action_checks or pack.checks, mentioned_settings or pack.settings)
+        )[:8],
         citations=citations,
         used_fallback=True,
         decision_method="deterministic",
@@ -1053,13 +1115,15 @@ def answer_question(
     config: LLMConfig,
     client: Optional[LLMClient],
     visible_check_ids: Optional[List[str]] = None,
+    state_items: Optional[List[StateItem]] = None,
+    focused_state_id: Optional[str] = None,
 ) -> AssistantAnswer:
     """Answer a screen question; LLM when available, marked fallback otherwise.
 
     `client` is None when no real provider is usable (mock provider or missing
     API key); the caller decides that so tests can inject fake clients.
     """
-    pack = build_context_pack(ctx, question, report, visible_check_ids)
+    pack = build_context_pack(ctx, question, report, visible_check_ids, state_items, focused_state_id)
     if client is None:
         if config.provider == "mock":
             reason = (
@@ -1076,6 +1140,10 @@ def answer_question(
             reason = f"No usable LLM configuration (provider '{config.provider}')."
         return _fallback_answer(pack, report, config, reason)
     try:
-        return _llm_answer(client, config, pack, report, question)
+        answer = _llm_answer(client, config, pack, report, question)
+        state_actions = _state_actions(pack.state_items)
+        if state_actions:
+            answer.suggested_actions = (state_actions + answer.suggested_actions)[:8]
+        return answer
     except LLMError as exc:
         return _fallback_answer(pack, report, config, f"LLM call failed: {exc}")

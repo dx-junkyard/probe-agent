@@ -2334,6 +2334,8 @@ export interface AssistantAskRequest {
   question: string;
   route_params?: Record<string, string>;
   visible_check_ids?: string[];
+  visible_state_ids?: string[];
+  focused_state_id?: string;
 }
 
 export interface AssistantAction {
@@ -2344,7 +2346,7 @@ export interface AssistantAction {
 }
 
 export interface AssistantCitation {
-  type: "setting" | "diagnostic_check" | "pipeline_step";
+  type: "setting" | "diagnostic_check" | "pipeline_step" | "state_item";
   id: string;
   title: string;
   detail: string;

@@ -3505,6 +3505,8 @@ class AssistantAskRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=4000)
     route_params: Dict[str, str] = Field(default_factory=dict)
     visible_check_ids: List[str] = Field(default_factory=list, max_length=50)
+    visible_state_ids: List[str] = Field(default_factory=list, max_length=50)
+    focused_state_id: Optional[str] = Field(default=None, max_length=200)
 
 
 # ---------------------------------------------------------------------------
@@ -3575,7 +3577,7 @@ class AssistantActionOut(BaseModel):
 
 
 class AssistantCitationOut(BaseModel):
-    type: Literal["setting", "diagnostic_check", "pipeline_step"]
+    type: Literal["setting", "diagnostic_check", "pipeline_step", "state_item"]
     id: str
     title: str = ""
     detail: str = ""

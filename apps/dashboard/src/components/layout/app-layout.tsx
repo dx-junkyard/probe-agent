@@ -37,7 +37,7 @@ export function AppLayout() {
         </main>
       </div>
       <AssistantPanel
-        snapshotNotice={primaryNotice?.summary ?? null}
+        focusedStateItem={primaryNotice}
         onSnapshotNoticeClick={() => {
           const target = primaryNotice ? systemStateTarget(primaryNotice) : null;
           if (target) navigate(target);

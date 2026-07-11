@@ -51,6 +51,7 @@ from ..system_diagnostics import (
     _worst_severity,
     run_system_diagnostics,
 )
+from ..system_state import build_system_state
 
 router = APIRouter()
 
@@ -162,6 +163,13 @@ def assistant_ask(
             status_code=404, detail=f"Unknown screen id: {payload.screen_id}"
         )
     report = run_system_diagnostics(system_id)
+    assessment = build_system_state(system_id)
+    state_by_id = {item.state_id: item for item in assessment.items}
+    visible_state_ids = list(dict.fromkeys(payload.visible_state_ids))
+    state_items = [state_by_id[state_id] for state_id in visible_state_ids if state_id in state_by_id]
+    focused_state_id = payload.focused_state_id if payload.focused_state_id in state_by_id else None
+    if focused_state_id and focused_state_id not in {item.state_id for item in state_items}:
+        state_items.insert(0, state_by_id[focused_state_id])
     config = LLMConfig.intelligence_from_env()
     client = _usable_llm_client(config)
     result = answer_question(
@@ -171,6 +179,8 @@ def assistant_ask(
         config,
         client,
         visible_check_ids=payload.visible_check_ids,
+        state_items=state_items,
+        focused_state_id=focused_state_id,
     )
     return AssistantAskOut(
         screen_id=ctx.screen_id,

@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, MemoryRouter } from "react-router-dom";
 import { vi } from "vitest";
 import type { ReactNode } from "react";
+import type { SystemStateItem } from "@/api/types";
 
 const mockApi = {
   get: vi.fn(),
@@ -4646,6 +4647,41 @@ describe("Per-screen assistant panel", () => {
 
     fireEvent.click(screen.getByTestId("assistant-button"));
     expect(screen.queryByTestId("assistant-snapshot-notice")).toBeNull();
+  });
+
+  test("floating notice and panel current issue share one canonical StateItem", async () => {
+    mockAssistantApi();
+    const { AssistantPanel } = await import("@/components/assistant-panel");
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    const stateItem: SystemStateItem = {
+      state_id: "repository.snapshot.stale", state_group: "repository", severity: "warning",
+      status: "stale", user_action_kind: "create_snapshot", intervention_timing: "now",
+      subject: "repository", summary: "HEAD が最新 snapshot より進んでいます。snapshot を作成してください。",
+      detail: "A newer commit is available.", impact: "Understanding is stale.",
+      remediation: "Create a snapshot.", evidence: {},
+      target_ui: { route: "/repository", anchor: "snapshot-create", action_label: "Snapshot を作成" },
+      related_checks: [], related_pipeline_steps: [], source: "system_state", dedupe_key: "stale",
+      scope: "global", decision_method: "deterministic" as const,
+    };
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/system-understanding"]}>
+          <AssistantPanel focusedStateItem={stateItem} />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(screen.getByTestId("assistant-snapshot-notice").textContent).toContain(stateItem.summary);
+    fireEvent.click(screen.getByTestId("assistant-button"));
+    const issue = await screen.findByTestId("assistant-current-issue");
+    expect(issue.textContent).toContain(stateItem.summary);
+    expect(issue.textContent).toContain("Snapshot を作成");
+
+    fireEvent.click(await screen.findByTestId("assistant-focused-state-question"));
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith("/assistant/ask", expect.objectContaining({
+      visible_state_ids: [stateItem.state_id], focused_state_id: stateItem.state_id,
+    })));
   });
 
   test("asking a question renders the answer with fallback marking, citations, and actions", async () => {
