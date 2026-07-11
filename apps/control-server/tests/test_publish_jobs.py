@@ -218,6 +218,29 @@ def _create_system(client, token, name="pub-system"):
     return r.json()
 
 
+def _assign_test_installation(system_id, installation_id=1):
+    """Arrange the explicit Issue #222 authorization required by this suite."""
+    now = "2026-01-01T00:00:00+00:00"
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO github_installations
+                (installation_id, github_account_login, github_account_type, status,
+                 verified_at, created_at, updated_at)
+            VALUES (?, 'acme', 'Organization', 'active', ?, ?, ?)
+            """,
+            (installation_id, now, now, now),
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO github_installation_systems
+                (installation_id, system_id, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (installation_id, system_id, now),
+        )
+
+
 def _setup_ready_patch(
     admin_client, tmp_path, monkeypatch, *, name="pub-sys", token="ghs_faketoken0123456789", pr_number=42
 ):
@@ -226,6 +249,7 @@ def _setup_ready_patch(
     validation -- everything `create_publish_job`'s gate requires."""
     login_token = _login(admin_client)
     system = _create_system(admin_client, login_token, name)
+    _assign_test_installation(system["id"])
     h = _headers(login_token, system["id"])
 
     remote_root = tmp_path / f"{name}-remote-root"
@@ -414,6 +438,20 @@ class TestHappyPath:
 
 
 class TestCreationGate:
+    def test_rejects_publish_when_installation_assignment_is_removed(
+        self, admin_client, tmp_path, monkeypatch
+    ):
+        ctx = _setup_ready_patch(admin_client, tmp_path, monkeypatch, name="unassigned-publish")
+        with get_conn() as conn:
+            conn.execute(
+                "DELETE FROM github_installation_systems WHERE installation_id = 1 AND system_id = ?",
+                (ctx["system_id"],),
+            )
+        with pytest.raises(PublishJobConflict, match="not active and assigned"):
+            publish_job.create_publish_job(
+                ctx["system_id"], ctx["connection_id"], ctx["patch_id"], 1, spawn=False
+            )
+
     def test_requires_green_baseline_and_probed_validation(self, admin_client, tmp_path, monkeypatch):
         ctx = _setup_ready_patch(admin_client, tmp_path, monkeypatch, name="novalid")
         with get_conn() as conn:

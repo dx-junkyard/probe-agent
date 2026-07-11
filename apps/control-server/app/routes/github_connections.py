@@ -27,23 +27,31 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from ..auth import Principal, get_system_id, require_user
+from ..auth import Principal, get_system_id, require_admin, require_user
 from ..db import get_conn
 from ..github_app import (
     GitHubAppError,
+    allowed_organization,
     create_installation_token,
     default_api_base_url,
     default_web_base_url,
     get_repository,
     github_app_configured,
+    get_installation,
     list_installation_repositories,
 )
 from ..models import (
     GithubAppStatusOut,
     GithubConnectionCreate,
     GithubConnectionOut,
+    GithubInstallationOut,
+    GithubInstallationRegister,
     GithubInstallationRepositoryOut,
     GithubRepositoryStatusOut,
+)
+from ..github_installations import (
+    GitHubInstallationAccessError,
+    require_active_installation_assignment,
 )
 from .. import repo_manager
 from ..repo_manager import RepoManagerError
@@ -109,6 +117,36 @@ def _get_connection_or_404(conn: sqlite3.Connection, connection_id: int, system_
     return row
 
 
+def _installation_out(conn: sqlite3.Connection, row: sqlite3.Row) -> GithubInstallationOut:
+    assignments = conn.execute(
+        "SELECT system_id FROM github_installation_systems "
+        "WHERE installation_id = ? ORDER BY system_id",
+        (row["installation_id"],),
+    ).fetchall()
+    return GithubInstallationOut(
+        installation_id=row["installation_id"],
+        github_account_login=row["github_account_login"],
+        github_account_type=row["github_account_type"],
+        status=row["status"],
+        registered_by_user_id=row["registered_by_user_id"],
+        verified_at=row["verified_at"],
+        disabled_by_user_id=row["disabled_by_user_id"],
+        disabled_at=row["disabled_at"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        assigned_system_ids=[assignment["system_id"] for assignment in assignments],
+    )
+
+
+def _require_installation_assignment(
+    conn: sqlite3.Connection, installation_id: int, system_id: int
+) -> None:
+    try:
+        require_active_installation_assignment(conn, installation_id, system_id)
+    except GitHubInstallationAccessError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from None
+
+
 @router.get("/github/app-status", response_model=GithubAppStatusOut)
 def get_app_status(principal: Principal = Depends(require_user)) -> GithubAppStatusOut:
     app_id = os.getenv("GITHUB_APP_ID", "").strip() or None
@@ -117,7 +155,185 @@ def get_app_status(principal: Principal = Depends(require_user)) -> GithubAppSta
         app_id=app_id,
         api_base_url=default_api_base_url(),
         web_base_url=default_web_base_url(),
+        allowed_organization=allowed_organization() or None,
     )
+
+
+@router.get("/github/installations", response_model=List[GithubInstallationOut])
+def list_installations(
+    principal: Principal = Depends(require_admin),
+) -> List[GithubInstallationOut]:
+    """List the administrator-owned installation allowlist and assignments."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM github_installations ORDER BY installation_id"
+        ).fetchall()
+        return [_installation_out(conn, row) for row in rows]
+
+
+@router.post("/github/installations", response_model=GithubInstallationOut, status_code=201)
+def register_installation(
+    payload: GithubInstallationRegister,
+    principal: Principal = Depends(require_admin),
+) -> GithubInstallationOut:
+    """Admin-only registration of an installation after GitHub-side verification."""
+    organization = allowed_organization()
+    if not organization:
+        raise HTTPException(
+            status_code=503,
+            detail="GITHUB_APP_ALLOWED_ORGANIZATION must be configured before registering installations",
+        )
+    try:
+        installation = get_installation(payload.installation_id)
+    except GitHubAppError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from None
+
+    account = installation.get("account") or {}
+    login = account.get("login")
+    account_type = account.get("type")
+    if not isinstance(login, str) or not isinstance(account_type, str):
+        raise HTTPException(status_code=502, detail="GitHub installation response is missing account identity")
+    if account_type != "Organization" or login.casefold() != organization.casefold():
+        raise HTTPException(
+            status_code=422,
+            detail="GitHub installation account must be the configured Organization",
+        )
+
+    now = _now_iso()
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT 1 FROM github_installations WHERE installation_id = ?",
+            (payload.installation_id,),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                """
+                INSERT INTO github_installations (
+                    installation_id, github_account_login, github_account_type, status,
+                    registered_by_user_id, verified_at, disabled_by_user_id, disabled_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, 'active', ?, ?, NULL, NULL, ?, ?)
+                """,
+                (payload.installation_id, login, account_type, principal.user_id, now, now, now),
+            )
+        else:
+            # Re-registration intentionally re-verifies the GitHub account and
+            # is the explicit admin action that re-enables a disabled record.
+            conn.execute(
+                """
+                UPDATE github_installations
+                SET github_account_login = ?, github_account_type = ?, status = 'active',
+                    registered_by_user_id = ?, verified_at = ?, disabled_by_user_id = NULL,
+                    disabled_at = NULL, updated_at = ?
+                WHERE installation_id = ?
+                """,
+                (login, account_type, principal.user_id, now, now, payload.installation_id),
+            )
+        row = conn.execute(
+            "SELECT * FROM github_installations WHERE installation_id = ?",
+            (payload.installation_id,),
+        ).fetchone()
+        return _installation_out(conn, row)
+
+
+@router.post("/github/installations/{installation_id}/disable", response_model=GithubInstallationOut)
+def disable_installation(
+    installation_id: int,
+    principal: Principal = Depends(require_admin),
+) -> GithubInstallationOut:
+    now = _now_iso()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            UPDATE github_installations
+            SET status = 'disabled', disabled_by_user_id = ?, disabled_at = ?, updated_at = ?
+            WHERE installation_id = ? AND status = 'active'
+            """,
+            (principal.user_id, now, now, installation_id),
+        )
+        if cur.rowcount == 0:
+            row = conn.execute(
+                "SELECT * FROM github_installations WHERE installation_id = ?", (installation_id,)
+            ).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="GitHub installation not found")
+            raise HTTPException(status_code=409, detail="GitHub installation is already disabled")
+        row = conn.execute(
+            "SELECT * FROM github_installations WHERE installation_id = ?", (installation_id,)
+        ).fetchone()
+        return _installation_out(conn, row)
+
+
+@router.post(
+    "/github/installations/{installation_id}/systems/{target_system_id}",
+    response_model=GithubInstallationOut,
+)
+def assign_installation_to_system(
+    installation_id: int,
+    target_system_id: int,
+    principal: Principal = Depends(require_admin),
+) -> GithubInstallationOut:
+    now = _now_iso()
+    with get_conn() as conn:
+        installation = conn.execute(
+            "SELECT * FROM github_installations WHERE installation_id = ?", (installation_id,)
+        ).fetchone()
+        if installation is None:
+            raise HTTPException(status_code=404, detail="GitHub installation not found")
+        if installation["status"] != "active":
+            raise HTTPException(status_code=409, detail="GitHub installation is disabled")
+        system = conn.execute("SELECT 1 FROM systems WHERE id = ?", (target_system_id,)).fetchone()
+        if system is None:
+            raise HTTPException(status_code=404, detail="System not found")
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO github_installation_systems
+                (installation_id, system_id, assigned_by_user_id, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (installation_id, target_system_id, principal.user_id, now),
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=409, detail="GitHub installation is already assigned to this System")
+        return _installation_out(conn, installation)
+
+
+@router.delete(
+    "/github/installations/{installation_id}/systems/{target_system_id}",
+    status_code=204,
+)
+def unassign_installation_from_system(
+    installation_id: int,
+    target_system_id: int,
+    principal: Principal = Depends(require_admin),
+) -> None:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM github_installation_systems WHERE installation_id = ? AND system_id = ?",
+            (installation_id, target_system_id),
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="GitHub installation assignment not found")
+
+
+@router.get("/github/system-installations", response_model=List[GithubInstallationOut])
+def list_system_installations(
+    principal: Principal = Depends(require_user),
+    system_id: int = Depends(get_system_id),
+) -> List[GithubInstallationOut]:
+    """List only this System's active assigned installations for connection setup."""
+    with get_conn() as conn:
+        _require_manage(conn, principal, system_id)
+        rows = conn.execute(
+            """
+            SELECT i.* FROM github_installations AS i
+            JOIN github_installation_systems AS s ON s.installation_id = i.installation_id
+            WHERE s.system_id = ? AND i.status = 'active'
+            ORDER BY i.installation_id
+            """,
+            (system_id,),
+        ).fetchall()
+        return [_installation_out(conn, row) for row in rows]
 
 
 @router.get(
@@ -136,6 +352,7 @@ def list_installation_repositories_endpoint(
     ever returned (Principle 5/8)."""
     with get_conn() as conn:
         _require_manage(conn, principal, system_id)
+        _require_installation_assignment(conn, installation_id, system_id)
 
     try:
         installation_token = create_installation_token(installation_id)
@@ -168,6 +385,7 @@ def create_connection(
 
     with get_conn() as conn:
         _require_manage(conn, principal, system_id)
+        _require_installation_assignment(conn, payload.installation_id, system_id)
         try:
             cur = conn.execute(
                 """
@@ -239,6 +457,7 @@ def verify_connection(
     with get_conn() as conn:
         _require_manage(conn, principal, system_id)
         row = _get_connection_or_404(conn, connection_id, system_id)
+        _require_installation_assignment(conn, row["installation_id"], system_id)
 
     now = _now_iso()
     try:
@@ -298,6 +517,7 @@ def sync_connection(
     with get_conn() as conn:
         _require_manage(conn, principal, system_id)
         row = _get_connection_or_404(conn, connection_id, system_id)
+        _require_installation_assignment(conn, row["installation_id"], system_id)
 
     if row["status"] != "connected":
         raise HTTPException(

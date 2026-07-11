@@ -1516,6 +1516,12 @@ publish（明示的な approve 呼び出しでのみ開始）:
 - Installation Token は各フェーズ内でその都度発行し、ローカル変数にのみ
   保持する。`publish_jobs` テーブルにも `error` にも一切書き込まれない
   (`github_app._sanitize` を経由してから persist)。
+- **Installation allowlist (Issue #222)**: GitHub App は単一 Organization
+  所有の private App とし、admin が GitHub API から取得した account
+  login/type を `GITHUB_APP_ALLOWED_ORGANIZATION` と照合して Installation を
+  登録する。登録済みかつ active で、対象 System への明示割当がある場合だけ
+  token を発行できる。この割当は repository 一覧・connection 作成・verify・sync・
+  publish のそれぞれで再検証する。
 - 完了・失敗・cancel のいずれの終端状態でも job worktree を cleanup し、
   `cleanup_state` / `cleanup_error` を記録する。
 - PR 作成はべき等: 同じブランチに対して open な PR が既にあれば

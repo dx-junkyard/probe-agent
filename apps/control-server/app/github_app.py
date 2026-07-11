@@ -78,6 +78,11 @@ def _private_key_path() -> str:
     return os.getenv("GITHUB_APP_PRIVATE_KEY_PATH", "").strip()
 
 
+def allowed_organization() -> str:
+    """Configured GitHub organization for this organization-owned App."""
+    return os.getenv("GITHUB_APP_ALLOWED_ORGANIZATION", "").strip()
+
+
 def default_api_base_url() -> str:
     # MVP supports github.com only.  Connection or environment supplied hosts
     # must never become credential destinations.
@@ -235,6 +240,21 @@ def create_installation_token(
             "GitHub installation token response is missing token/expires_at"
         )
     return InstallationToken(token=token, expires_at=expires_at)
+
+
+def get_installation(installation_id: int) -> Dict[str, Any]:
+    """Fetch an installation's GitHub account using App authentication.
+
+    Registration uses this before persisting an installation, so a user cannot
+    assert a GitHub organization or account type supplied by the browser.
+    """
+    _validate_installation_id(installation_id)
+    app_jwt = generate_app_jwt()
+    url = f"{default_api_base_url().rstrip('/')}/app/installations/{installation_id}"
+    data = _request(url, token=app_jwt, sanitize_secrets=(app_jwt,))
+    if not isinstance(data, dict):
+        raise GitHubAppError("GitHub installation response was invalid")
+    return data
 
 
 def get_repository(

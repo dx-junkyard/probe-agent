@@ -42,6 +42,7 @@ def admin_client(tmp_path, monkeypatch):
     monkeypatch.delenv("CONTROL_API_KEYS", raising=False)
     monkeypatch.delenv("GITHUB_APP_ID", raising=False)
     monkeypatch.delenv("GITHUB_APP_PRIVATE_KEY_PATH", raising=False)
+    monkeypatch.delenv("GITHUB_APP_ALLOWED_ORGANIZATION", raising=False)
     monkeypatch.delenv("GITHUB_API_BASE_URL", raising=False)
     monkeypatch.delenv("GITHUB_WEB_BASE_URL", raising=False)
     from app.main import app
@@ -67,7 +68,33 @@ def _create_system(client, token, name="acme-system"):
         headers=_bearer(token),
     )
     assert r.status_code == 201, r.text
-    return r.json()
+    system = r.json()
+    # Existing Issue #216 tests exercise connection mechanics.  Give each
+    # test System two explicit, active Issue #222 assignments; authorization
+    # negative cases are covered separately below.
+    from app.db import get_conn
+
+    now = "2026-01-01T00:00:00+00:00"
+    with get_conn() as conn:
+        for installation_id in (1, 7):
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO github_installations
+                    (installation_id, github_account_login, github_account_type, status,
+                     verified_at, created_at, updated_at)
+                VALUES (?, 'acme', 'Organization', 'active', ?, ?, ?)
+                """,
+                (installation_id, now, now, now),
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO github_installation_systems
+                    (installation_id, system_id, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (installation_id, system["id"], now),
+            )
+    return system
 
 
 def _create_user(client, admin_token, username, password="pw123456", role="user"):
@@ -681,3 +708,155 @@ class TestInstallationRepositoriesAPI:
     def test_requires_authentication(self, admin_client):
         r = admin_client.get("/github/installations/1/repositories")
         assert r.status_code in (401, 403)
+
+
+# --- Installation registration / System assignment (Issue #222) ------------
+
+
+class TestInstallationAuthorization:
+    def _installation_response(self, login="acme", account_type="Organization"):
+        def fake_urlopen(request, timeout=30):
+            class FakeResponse:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+                def read(self):
+                    if "/app/installations/" in request.full_url:
+                        return json.dumps(
+                            {"id": 42, "account": {"login": login, "type": account_type}}
+                        ).encode("utf-8")
+                    raise AssertionError(f"unexpected token/API request: {request.full_url}")
+
+            return FakeResponse()
+
+        return fake_urlopen
+
+    def test_only_admin_can_register_and_assign_installations(
+        self, admin_client, monkeypatch, rsa_private_key_path
+    ):
+        _configure_app(monkeypatch, rsa_private_key_path)
+        monkeypatch.setenv("GITHUB_APP_ALLOWED_ORGANIZATION", "acme")
+        monkeypatch.setattr("urllib.request.urlopen", self._installation_response())
+        admin_token = _login(admin_client)
+        other = _create_user(admin_client, admin_token, "installation-user")
+        other_token = _login(admin_client, "installation-user", "pw123456")
+        system = _create_system(admin_client, other_token)
+
+        r = admin_client.post(
+            "/github/installations", json={"installation_id": 42}, headers=_bearer(other_token)
+        )
+        assert r.status_code == 403, r.text
+
+        r = admin_client.post(
+            "/github/installations", json={"installation_id": 42}, headers=_bearer(admin_token)
+        )
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["github_account_login"] == "acme"
+        assert body["github_account_type"] == "Organization"
+        assert body["status"] == "active"
+        assert body["registered_by_user_id"] is not None
+
+        r = admin_client.post(
+            f"/github/installations/42/systems/{system['id']}", headers=_bearer(other_token)
+        )
+        assert r.status_code == 403, r.text
+        r = admin_client.post(
+            f"/github/installations/42/systems/{system['id']}", headers=_bearer(admin_token)
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["assigned_system_ids"] == [system["id"]]
+
+    def test_registration_rejects_non_configured_organization(
+        self, admin_client, monkeypatch, rsa_private_key_path
+    ):
+        _configure_app(monkeypatch, rsa_private_key_path)
+        monkeypatch.setenv("GITHUB_APP_ALLOWED_ORGANIZATION", "acme")
+        monkeypatch.setattr(
+            "urllib.request.urlopen", self._installation_response(login="other-org")
+        )
+        token = _login(admin_client)
+        r = admin_client.post(
+            "/github/installations", json={"installation_id": 42}, headers=_bearer(token)
+        )
+        assert r.status_code == 422, r.text
+        assert "configured Organization" in r.json()["detail"]
+
+    def test_unregistered_or_cross_system_installation_cannot_issue_token(
+        self, admin_client, monkeypatch, rsa_private_key_path
+    ):
+        _configure_app(monkeypatch, rsa_private_key_path)
+        monkeypatch.setenv("GITHUB_APP_ALLOWED_ORGANIZATION", "acme")
+        monkeypatch.setattr("urllib.request.urlopen", self._installation_response())
+        token = _login(admin_client)
+        system_a = _create_system(admin_client, token, "installation-system-a")
+        system_b = _create_system(admin_client, token, "installation-system-b")
+        h_a = _headers(token, system_a["id"])
+        h_b = _headers(token, system_b["id"])
+
+        # An arbitrary, unregistered ID is rejected before any token request.
+        r = admin_client.get("/github/installations/999/repositories", headers=h_a)
+        assert r.status_code == 403, r.text
+        r = admin_client.post(
+            "/github/connections",
+            json={"owner": "acme", "repo": "widgets", "installation_id": 999},
+            headers=h_a,
+        )
+        assert r.status_code == 403, r.text
+
+        assert admin_client.post(
+            "/github/installations", json={"installation_id": 42}, headers=_bearer(token)
+        ).status_code == 201
+        assert admin_client.post(
+            f"/github/installations/42/systems/{system_a['id']}", headers=_bearer(token)
+        ).status_code == 200
+
+        # Assignment to System A does not grant System B either repository
+        # enumeration or connection creation access.
+        r = admin_client.get("/github/installations/42/repositories", headers=h_b)
+        assert r.status_code == 403, r.text
+        r = admin_client.post(
+            "/github/connections",
+            json={"owner": "acme", "repo": "widgets", "installation_id": 42},
+            headers=h_b,
+        )
+        assert r.status_code == 403, r.text
+
+        r = admin_client.post(
+            "/github/connections",
+            json={"owner": "acme", "repo": "widgets", "installation_id": 42},
+            headers=h_a,
+        )
+        assert r.status_code == 201, r.text
+
+    def test_disabled_installation_cannot_verify_or_sync_existing_connection(
+        self, admin_client, monkeypatch, rsa_private_key_path
+    ):
+        _configure_app(monkeypatch, rsa_private_key_path)
+        monkeypatch.setenv("GITHUB_APP_ALLOWED_ORGANIZATION", "acme")
+        monkeypatch.setattr("urllib.request.urlopen", self._installation_response())
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "disabled-installation-system")
+        headers = _headers(token, system["id"])
+        assert admin_client.post(
+            "/github/installations", json={"installation_id": 42}, headers=_bearer(token)
+        ).status_code == 201
+        assert admin_client.post(
+            f"/github/installations/42/systems/{system['id']}", headers=_bearer(token)
+        ).status_code == 200
+        connection = admin_client.post(
+            "/github/connections",
+            json={"owner": "acme", "repo": "widgets", "installation_id": 42},
+            headers=headers,
+        ).json()
+        assert admin_client.post(
+            "/github/installations/42/disable", headers=_bearer(token)
+        ).status_code == 200
+
+        r = admin_client.post(f"/github/connections/{connection['id']}/verify", headers=headers)
+        assert r.status_code == 403, r.text
+        r = admin_client.post(f"/github/connections/{connection['id']}/sync", headers=headers)
+        assert r.status_code == 403, r.text

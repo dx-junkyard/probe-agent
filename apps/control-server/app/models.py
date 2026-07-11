@@ -3595,6 +3595,30 @@ class GithubAppStatusOut(BaseModel):
     app_id: Optional[str] = None
     api_base_url: str
     web_base_url: str
+    allowed_organization: Optional[str] = None
+
+
+GithubInstallationStatus = Literal["active", "disabled"]
+
+
+class GithubInstallationRegister(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    installation_id: int = Field(..., gt=0)
+
+
+class GithubInstallationOut(BaseModel):
+    installation_id: int
+    github_account_login: str
+    github_account_type: str
+    status: GithubInstallationStatus
+    registered_by_user_id: Optional[int] = None
+    verified_at: str
+    disabled_by_user_id: Optional[int] = None
+    disabled_at: Optional[str] = None
+    created_at: str
+    updated_at: str
+    assigned_system_ids: List[int] = Field(default_factory=list)
 
 
 class GithubConnectionCreate(BaseModel):

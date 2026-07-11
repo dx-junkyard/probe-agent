@@ -321,6 +321,7 @@ Server に以下を設定する。
 ```env
 GITHUB_APP_ID=<GitHub App の App ID>
 GITHUB_APP_PRIVATE_KEY_PATH=/absolute/path/to/github-app-private-key.pem
+GITHUB_APP_ALLOWED_ORGANIZATION=<GitHub App を所有する Organization の login>
 GIT_REPOSITORY_ROOT=/path/to/managed-git-root
 ```
 
@@ -330,12 +331,15 @@ GIT_REPOSITORY_ROOT=/path/to/managed-git-root
 
 Dashboard の `GitHub` ページでの操作フロー:
 
-1. **Connections** タブで installation ID を入力し、`Load repositories` で
-   その GitHub App installation がアクセスできるリポジトリ一覧から選ぶか、
-   owner/repo を手入力して connection を作成する。
-2. 作成した connection を `Verify`（Installation Token で疎通確認・
+1. admin が **Installations** タブで Installation ID を登録する。Control
+   Server は GitHub から account login/type を読み、設定された Organization
+   と一致するものだけを登録できる。続けて利用を許可する System へ明示割当する。
+2. **Connections** タブでは、その System に割り当て済みの Installation だけを
+   選択し、`Load repositories` 相当の repository picker から connection を作成する。
+   未登録・無効化済み・別 System 専用の Installation は利用できない。
+3. 作成した connection を `Verify`（Installation Token で疎通確認・
    `default_branch` を取得）し、必要なら `Sync`（managed mirror を最新化）する。
-3. **Publish Jobs** タブで connection と validate 済み(baseline/probed とも
+4. **Publish Jobs** タブで connection と validate 済み(baseline/probed とも
    green)の probe patch を選び、publish job を作成する。job は自動で
    `awaiting_approval` まで進み、そこで停止する。
 4. job 詳細で publish 先（owner/repo・base branch・base commit SHA・
@@ -434,6 +438,7 @@ Docker Compose はリポジトリルートの `.env` を読み込む。ローカ
 | `PUBLIC_HOST` | _(未設定)_ | `docker-compose.prod.yml` の Caddy が HTTPS で公開する FQDN |
 | `GITHUB_APP_ID` | _(未設定)_ | Publish workflow (#216) が使う GitHub App の App ID。未設定時は GitHub App 機能全体が fail closed |
 | `GITHUB_APP_PRIVATE_KEY_PATH` | _(未設定)_ | GitHub App の秘密鍵 PEM ファイルの絶対パス（secret mount を想定） |
+| `GITHUB_APP_ALLOWED_ORGANIZATION` | _(未設定)_ | private GitHub App を所有する単一 Organization の login。Installation 登録時に GitHub から得た account login/type と照合し、不一致は拒否する |
 | `GITHUB_API_BASE_URL` | `https://api.github.com` | GitHub REST API のベース URL（GitHub Enterprise Server 向けの上書き） |
 | `GITHUB_WEB_BASE_URL` | `https://github.com` | GitHub の web/clone URL のベース（GitHub Enterprise Server 向けの上書き） |
 | `GIT_REPOSITORY_ROOT` | _(未設定)_ | Publish workflow (#216) の managed clone / worktree 領域のルート。未設定時は repository manager 機能全体が fail closed |

@@ -2378,6 +2378,23 @@ export interface GithubAppStatusOut {
   app_id: string | null;
   api_base_url: string;
   web_base_url: string;
+  allowed_organization: string | null;
+}
+
+export type GithubInstallationStatus = "active" | "disabled";
+
+export interface GithubInstallationOut {
+  installation_id: number;
+  github_account_login: string;
+  github_account_type: string;
+  status: GithubInstallationStatus;
+  registered_by_user_id: number | null;
+  verified_at: string;
+  disabled_by_user_id: number | null;
+  disabled_at: string | null;
+  created_at: string;
+  updated_at: string;
+  assigned_system_ids: number[];
 }
 
 export type GithubConnectionStatus = "pending" | "connected" | "error" | "disconnected";

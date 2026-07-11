@@ -82,6 +82,10 @@ creating incomplete persistence or execution paths for later phases.
    Token broker / connection persistence, then a repository manager
    (mirror clone/fetch/worktree/cleanup), a publish job state machine
    (commit/push/PR), and Dashboard UI, implemented in that order.
+   Issue #222 constrains this workflow to administrator-registered GitHub
+   App installations for the configured Organization. An installation must
+   also be explicitly assigned to a System before any repository listing,
+   connection, verify, sync, or publish token issuance may use it.
 
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and

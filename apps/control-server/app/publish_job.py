@@ -55,6 +55,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from . import github_app, publish_guards, repo_manager
+from .github_installations import (
+    GitHubInstallationAccessError,
+    require_active_installation_assignment,
+)
 from .db import get_conn
 from .github_app import GitHubAppError
 from .patch_generator import apply_unified_diff
@@ -194,6 +198,23 @@ def _remote_branch_sha_or_none(connection_row, token: str, branch: str) -> Optio
         raise
 
 
+def _require_publish_installation_assignment(connection_id: int, system_id: int) -> None:
+    """Re-check the DB authorization immediately before issuing a token."""
+    with get_conn() as conn:
+        connection = conn.execute(
+            "SELECT installation_id FROM github_connections WHERE id = ? AND system_id = ?",
+            (connection_id, system_id),
+        ).fetchone()
+        if connection is None:
+            raise PublishJobNotFound("GitHub connection not found")
+        try:
+            require_active_installation_assignment(
+                conn, connection["installation_id"], system_id
+            )
+        except GitHubInstallationAccessError as exc:
+            raise PublishJobConflict(str(exc)) from None
+
+
 # ---------------------------------------------------------------------------
 # Job creation (validation gate mirrors
 # routes/project_intelligence.py::apply_probe_patch_endpoint)
@@ -218,6 +239,12 @@ def create_publish_job(
         ).fetchone()
         if connection_row is None:
             raise PublishJobNotFound("GitHub connection not found")
+        try:
+            require_active_installation_assignment(
+                conn, connection_row["installation_id"], system_id
+            )
+        except GitHubInstallationAccessError as exc:
+            raise PublishJobConflict(str(exc)) from None
         if connection_row["status"] != "connected":
             raise PublishJobConflict(
                 "GitHub connection must be verified (status=connected) before publishing"
@@ -325,6 +352,7 @@ def _run_prepare_phase(job_id: int) -> None:
         try:
             if not _set_status(job_id, "authenticating"):
                 return
+            _require_publish_installation_assignment(connection_id, job["system_id"])
             token = github_app.create_installation_token(
                 connection_row["installation_id"], api_base_url=connection_row["api_base_url"]
             ).token
@@ -541,6 +569,7 @@ def _run_publish_phase(job_id: int) -> None:
 
             if not _set_status(job_id, "pushing"):
                 return
+            _require_publish_installation_assignment(connection_id, system_id)
             token = github_app.create_installation_token(
                 connection_row["installation_id"], api_base_url=connection_row["api_base_url"]
             ).token

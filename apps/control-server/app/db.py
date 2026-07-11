@@ -1716,6 +1716,40 @@ CREATE TABLE IF NOT EXISTS probe_removal_patches (
 CREATE INDEX IF NOT EXISTS idx_probe_removal_patches_pattern
     ON probe_removal_patches (pattern_id, id DESC);
 
+-- GitHub App installation allowlist (Issue #222).  An Installation Access
+-- Token grants access to the GitHub account, rather than a probe-agent
+-- System, so an installation must be registered by an administrator and
+-- explicitly assigned to each System that may use it.  Tokens are never
+-- persisted here.
+CREATE TABLE IF NOT EXISTS github_installations (
+    installation_id        INTEGER PRIMARY KEY,
+    github_account_login   TEXT NOT NULL,
+    github_account_type    TEXT NOT NULL,
+    status                 TEXT NOT NULL DEFAULT 'active',
+    registered_by_user_id  INTEGER,
+    verified_at            TEXT NOT NULL,
+    disabled_by_user_id    INTEGER,
+    disabled_at            TEXT,
+    created_at             TEXT NOT NULL,
+    updated_at             TEXT NOT NULL,
+    FOREIGN KEY (registered_by_user_id) REFERENCES users (id) ON DELETE SET NULL,
+    FOREIGN KEY (disabled_by_user_id) REFERENCES users (id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS github_installation_systems (
+    installation_id      INTEGER NOT NULL,
+    system_id            INTEGER NOT NULL,
+    assigned_by_user_id  INTEGER,
+    created_at           TEXT NOT NULL,
+    PRIMARY KEY (installation_id, system_id),
+    FOREIGN KEY (installation_id) REFERENCES github_installations (installation_id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (assigned_by_user_id) REFERENCES users (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_github_installation_systems_system
+    ON github_installation_systems (system_id, installation_id);
+
 -- GitHub App connection persistence (Issue #216, sub-task 1). Records which
 -- remote repository a System is connected to for the publish workflow and
 -- through which GitHub App installation, so a later repository manager /

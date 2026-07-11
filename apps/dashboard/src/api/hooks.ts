@@ -42,7 +42,7 @@ import type {
   ProbePatternCreateRequest, ProbePatternReconciliationOut,
   ProbeRemovalPatchOut, ReconcilePointOut,
   GithubAppStatusOut, GithubConnectionOut, GithubConnectionCreateRequest,
-  GithubRepositoryStatusOut, GithubInstallationRepositoryOut,
+  GithubRepositoryStatusOut, GithubInstallationRepositoryOut, GithubInstallationOut,
   PublishJobOut,
 } from "./types";
 
@@ -1463,6 +1463,57 @@ export function useGithubConnections() {
     queryKey: sysKey("githubConnections"),
     queryFn: () => api.get<GithubConnectionOut[]>("/github/connections"),
     enabled: !!getSystemId(),
+  });
+}
+
+export function useSystemGithubInstallations() {
+  return useQuery({
+    queryKey: sysKey("githubSystemInstallations"),
+    queryFn: () => api.get<GithubInstallationOut[]>("/github/system-installations"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useGithubInstallations() {
+  return useQuery({
+    queryKey: ["githubInstallations"],
+    queryFn: () => api.get<GithubInstallationOut[]>("/github/installations"),
+    retry: false,
+  });
+}
+
+export function useRegisterGithubInstallation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (installationId: number) => api.post<GithubInstallationOut>(
+      "/github/installations", { installation_id: installationId },
+    ),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["githubInstallations"] }),
+  });
+}
+
+export function useDisableGithubInstallation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (installationId: number) => api.post<GithubInstallationOut>(
+      `/github/installations/${installationId}/disable`,
+    ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["githubInstallations"] });
+      qc.invalidateQueries({ queryKey: sysKey("githubSystemInstallations") });
+    },
+  });
+}
+
+export function useAssignGithubInstallation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ installationId, systemId }: { installationId: number; systemId: number }) =>
+      api.post<GithubInstallationOut>(`/github/installations/${installationId}/systems/${systemId}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["githubInstallations"] });
+      qc.invalidateQueries({ queryKey: sysKey("githubSystemInstallations") });
+    },
   });
 }
 

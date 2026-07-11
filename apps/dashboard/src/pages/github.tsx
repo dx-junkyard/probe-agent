@@ -4,6 +4,8 @@ import {
   useVerifyGithubConnection, useSyncGithubConnection, useDeleteGithubConnection,
   useInstallationRepositories, usePublishJobs, useCreatePublishJob,
   useApprovePublishJob, useCancelPublishJob, useProbePatches, useUsers,
+  useSystemGithubInstallations, useGithubInstallations, useRegisterGithubInstallation,
+  useDisableGithubInstallation, useAssignGithubInstallation,
 } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
@@ -21,7 +23,7 @@ import {
   GitMerge, RefreshCw, CheckCircle2, XCircle, Trash2, Plus, ExternalLink,
   ShieldCheck, GitPullRequest, AlertTriangle,
 } from "lucide-react";
-import type { GithubConnectionOut, PublishJobOut, ProbePatchOut } from "@/api/types";
+import type { GithubConnectionOut, GithubInstallationOut, PublishJobOut, ProbePatchOut } from "@/api/types";
 
 function shortSha(sha: string | null | undefined): string {
   return sha ? sha.slice(0, 8) : "—";
@@ -66,6 +68,7 @@ function isPatchValidationGreen(patch: ProbePatchOut): boolean {
 export default function GithubPage() {
   const [tab, setTab] = useState("connections");
   const { data: appStatus, isLoading: appStatusLoading } = useGithubAppStatus();
+  const { isAdmin, systemId } = useAuth();
 
   return (
     <div className="space-y-6">
@@ -79,6 +82,7 @@ export default function GithubPage() {
         <TabsList>
           <TabsTrigger value="connections">Connections</TabsTrigger>
           <TabsTrigger value="publish-jobs">Publish Jobs</TabsTrigger>
+          {isAdmin && <TabsTrigger value="installations">Installations</TabsTrigger>}
         </TabsList>
 
         <TabsContent value="connections">
@@ -88,9 +92,64 @@ export default function GithubPage() {
         <TabsContent value="publish-jobs">
           <PublishJobsPanel />
         </TabsContent>
+
+        {isAdmin && <TabsContent value="installations">
+          <InstallationsPanel systemId={systemId} />
+        </TabsContent>}
       </Tabs>
     </div>
   );
+}
+
+function InstallationsPanel({ systemId }: { systemId: number | null }) {
+  const { data: installations, isLoading } = useGithubInstallations();
+  const register = useRegisterGithubInstallation();
+  const disable = useDisableGithubInstallation();
+  const assign = useAssignGithubInstallation();
+  const [installationId, setInstallationId] = useState("");
+
+  const add = async () => {
+    const id = Number(installationId);
+    if (!id) return;
+    try {
+      await register.mutateAsync(id);
+      setInstallationId("");
+      toast.success("Installation registered and verified");
+    } catch (e) { toast.error(String(e)); }
+  };
+
+  return <Card>
+    <CardHeader>
+      <CardTitle className="text-base">Allowed installations</CardTitle>
+      <CardDescription>
+        Only the configured GitHub Organization can be registered. Assign an active installation to this System before it can create a connection.
+      </CardDescription>
+    </CardHeader>
+    <CardContent className="space-y-4">
+      <div className="flex gap-2">
+        <Input value={installationId} onChange={e => setInstallationId(e.target.value)} inputMode="numeric" placeholder="GitHub Installation ID" />
+        <Button onClick={add} disabled={register.isPending || !installationId.trim()}>Register</Button>
+      </div>
+      {isLoading ? <Skeleton className="h-20 w-full" /> : !installations?.length ? (
+        <p className="text-sm text-muted-foreground">No installations are registered.</p>
+      ) : <div className="space-y-2">
+        {installations.map((installation: GithubInstallationOut) => {
+          const assigned = systemId !== null && installation.assigned_system_ids.includes(systemId);
+          return <div key={installation.installation_id} className="rounded-lg border p-3 flex items-center justify-between gap-3">
+            <div className="text-sm">
+              <code>#{installation.installation_id}</code> · {installation.github_account_login}
+              <Badge className="ml-2" variant={installation.status === "active" ? "success" : "destructive"}>{installation.status}</Badge>
+              <div className="text-xs text-muted-foreground mt-1">assigned Systems: {installation.assigned_system_ids.join(", ") || "none"}</div>
+            </div>
+            <div className="flex gap-2">
+              {installation.status === "active" && systemId !== null && !assigned && <Button size="sm" variant="outline" onClick={() => assign.mutateAsync({ installationId: installation.installation_id, systemId }).catch(e => toast.error(String(e)))}>Assign here</Button>}
+              {installation.status === "active" && <Button size="sm" variant="destructive" onClick={() => disable.mutateAsync(installation.installation_id).catch(e => toast.error(String(e)))}>Disable</Button>}
+            </div>
+          </div>;
+        })}
+      </div>}
+    </CardContent>
+  </Card>;
 }
 
 function AppStatusCard({ status, isLoading }: {
@@ -253,26 +312,24 @@ function ConnectionsPanel({ appConfigured }: { appConfigured: boolean }) {
 
 function CreateConnectionDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   const createConnection = useCreateGithubConnection();
-  const [installationId, setInstallationId] = useState("");
-  const [loadedInstallationId, setLoadedInstallationId] = useState<number | null>(null);
+  const { data: installations, isLoading: installationsLoading } = useSystemGithubInstallations();
+  const [installationId, setInstallationId] = useState<number | null>(null);
   const [owner, setOwner] = useState("");
   const [repo, setRepo] = useState("");
   const [manualEntry, setManualEntry] = useState(false);
-  const { data: repos, isLoading: reposLoading, isError: reposError } = useInstallationRepositories(loadedInstallationId);
+  const { data: repos, isLoading: reposLoading, isError: reposError } = useInstallationRepositories(installationId);
 
   const reset = () => {
-    setInstallationId("");
-    setLoadedInstallationId(null);
+    setInstallationId(null);
     setOwner("");
     setRepo("");
     setManualEntry(false);
   };
 
   const submit = async () => {
-    const idNum = Number(installationId);
-    if (!idNum || !owner.trim() || !repo.trim()) return;
+    if (!installationId || !owner.trim() || !repo.trim()) return;
     try {
-      await createConnection.mutateAsync({ owner: owner.trim(), repo: repo.trim(), installation_id: idNum });
+      await createConnection.mutateAsync({ owner: owner.trim(), repo: repo.trim(), installation_id: installationId });
       toast.success("Connection created — verify it next");
       onOpenChange(false);
       reset();
@@ -284,26 +341,23 @@ function CreateConnectionDialog({ open, onOpenChange }: { open: boolean; onOpenC
       <DialogHeader><DialogTitle>New GitHub connection</DialogTitle></DialogHeader>
       <div className="space-y-4">
         <div className="space-y-2">
-          <Label>Installation ID</Label>
-          <div className="flex gap-2">
-            <Input
-              value={installationId}
-              onChange={e => { setInstallationId(e.target.value); setLoadedInstallationId(null); }}
-              placeholder="12345678"
-              inputMode="numeric"
-              data-testid="installation-id-input"
-            />
-            <Button
-              type="button" variant="outline"
-              onClick={() => setLoadedInstallationId(Number(installationId) || null)}
-              disabled={!installationId.trim()}
+          <Label>Assigned installation</Label>
+          {installationsLoading ? <Skeleton className="h-9 w-full" /> : (
+            <Select
+              value={installationId?.toString() ?? ""}
+              onChange={e => { setInstallationId(Number(e.target.value) || null); setOwner(""); setRepo(""); setManualEntry(false); }}
+              data-testid="installation-select"
             >
-              Load repositories
-            </Button>
-          </div>
+              <option value="">Select an assigned installation...</option>
+              {installations?.map(i => <option key={i.installation_id} value={i.installation_id}>
+                #{i.installation_id} · {i.github_account_login}
+              </option>)}
+            </Select>
+          )}
+          {!installationsLoading && !installations?.length && <p className="text-xs text-muted-foreground">An administrator must register and assign an installation to this System first.</p>}
         </div>
 
-        {loadedInstallationId !== null && (
+        {installationId !== null && (
           reposLoading ? (
             <Skeleton className="h-9 w-full" />
           ) : reposError ? (
@@ -332,7 +386,7 @@ function CreateConnectionDialog({ open, onOpenChange }: { open: boolean; onOpenC
           ) : null
         )}
 
-        {(manualEntry || loadedInstallationId === null || (repos && repos.length === 0)) && (
+        {(manualEntry || installationId === null || (repos && repos.length === 0)) && (
           <div className="grid grid-cols-2 gap-2">
             <div className="space-y-2">
               <Label>Owner</Label>
@@ -347,7 +401,7 @@ function CreateConnectionDialog({ open, onOpenChange }: { open: boolean; onOpenC
 
         <Button
           className="w-full" onClick={submit}
-          disabled={createConnection.isPending || !installationId.trim() || !owner.trim() || !repo.trim()}
+          disabled={createConnection.isPending || installationId === null || !owner.trim() || !repo.trim()}
         >
           {createConnection.isPending ? "Creating..." : "Create connection"}
         </Button>
