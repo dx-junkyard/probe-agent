@@ -41,6 +41,9 @@ import type {
   InstrumentationScanOut, ProbePatternsListOut, ProbePatternOut,
   ProbePatternCreateRequest, ProbePatternReconciliationOut,
   ProbeRemovalPatchOut, ReconcilePointOut,
+  GithubAppStatusOut, GithubConnectionOut, GithubConnectionCreateRequest,
+  GithubRepositoryStatusOut, GithubInstallationRepositoryOut,
+  PublishJobOut,
 } from "./types";
 
 export function sysKey(base: string, ...extra: unknown[]) {
@@ -1441,6 +1444,153 @@ export function useApplyRemovalPatch() {
       ),
     onSuccess: () => {
       invalidatePatterns(qc);
+    },
+  });
+}
+
+// ── GitHub App publish workflow (Issue #216) ────────────────────────
+
+export function useGithubAppStatus() {
+  return useQuery({
+    queryKey: ["github-app-status"],
+    queryFn: () => api.get<GithubAppStatusOut>("/github/app-status"),
+    staleTime: 60_000,
+  });
+}
+
+export function useGithubConnections() {
+  return useQuery({
+    queryKey: sysKey("githubConnections"),
+    queryFn: () => api.get<GithubConnectionOut[]>("/github/connections"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useGithubConnection(connectionId: number | null) {
+  return useQuery({
+    queryKey: sysKey("githubConnection", connectionId),
+    queryFn: () => api.get<GithubConnectionOut>(`/github/connections/${connectionId}`),
+    enabled: connectionId !== null && !!getSystemId(),
+  });
+}
+
+export function useCreateGithubConnection() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: GithubConnectionCreateRequest) =>
+      api.post<GithubConnectionOut>("/github/connections", data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("githubConnections") }),
+  });
+}
+
+export function useVerifyGithubConnection() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (connectionId: number) =>
+      api.post<GithubConnectionOut>(`/github/connections/${connectionId}/verify`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("githubConnections") }),
+  });
+}
+
+export function useSyncGithubConnection() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (connectionId: number) =>
+      api.post<GithubConnectionOut>(`/github/connections/${connectionId}/sync`),
+    onSuccess: (_d, connectionId) => {
+      qc.invalidateQueries({ queryKey: sysKey("githubConnections") });
+      qc.invalidateQueries({ queryKey: sysKey("githubRepositoryStatus", connectionId) });
+    },
+  });
+}
+
+export function useGithubRepositoryStatus(connectionId: number | null) {
+  return useQuery({
+    queryKey: sysKey("githubRepositoryStatus", connectionId),
+    queryFn: () => api.get<GithubRepositoryStatusOut>(
+      `/github/connections/${connectionId}/repository-status`,
+    ),
+    enabled: connectionId !== null && !!getSystemId(),
+  });
+}
+
+export function useDeleteGithubConnection() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (connectionId: number) =>
+      api.delete<GithubConnectionOut>(`/github/connections/${connectionId}`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("githubConnections") }),
+  });
+}
+
+export function useInstallationRepositories(installationId: number | null) {
+  return useQuery({
+    queryKey: sysKey("githubInstallationRepositories", installationId),
+    queryFn: () => api.get<GithubInstallationRepositoryOut[]>(
+      `/github/installations/${installationId}/repositories`,
+    ),
+    enabled: installationId !== null && installationId > 0 && !!getSystemId(),
+    retry: false,
+  });
+}
+
+function publishJobInProgress(status: PublishJobOut["status"] | undefined): boolean {
+  return status === "pending" || status === "authenticating" || status === "fetching"
+    || status === "checking_out" || status === "applying_patch" || status === "validating"
+    || status === "committing" || status === "pushing" || status === "creating_pr";
+}
+
+export function usePublishJobs(connectionId: number | null) {
+  return useQuery({
+    queryKey: sysKey("publishJobs", connectionId),
+    queryFn: () => {
+      const qs = connectionId !== null ? `?connection_id=${connectionId}` : "";
+      return api.get<PublishJobOut[]>(`/github/publish-jobs${qs}`);
+    },
+    enabled: !!getSystemId(),
+    refetchInterval: (query) => {
+      const jobs = query.state.data ?? [];
+      return jobs.some(j => publishJobInProgress(j.status)) ? 2000 : false;
+    },
+  });
+}
+
+export function usePublishJob(jobId: number | null) {
+  return useQuery({
+    queryKey: sysKey("publishJob", jobId),
+    queryFn: () => api.get<PublishJobOut>(`/github/publish-jobs/${jobId}`),
+    enabled: jobId !== null && !!getSystemId(),
+    refetchInterval: (query) => (publishJobInProgress(query.state.data?.status) ? 2000 : false),
+  });
+}
+
+export function useCreatePublishJob() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ connectionId, patchId }: { connectionId: number; patchId: number }) =>
+      api.post<PublishJobOut>(`/github/connections/${connectionId}/publish-jobs`, { patch_id: patchId }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("publishJobs") }),
+  });
+}
+
+export function useApprovePublishJob() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (jobId: number) => api.post<PublishJobOut>(`/github/publish-jobs/${jobId}/approve`),
+    onSuccess: (_d, jobId) => {
+      qc.invalidateQueries({ queryKey: sysKey("publishJobs") });
+      qc.invalidateQueries({ queryKey: sysKey("publishJob", jobId) });
+    },
+  });
+}
+
+export function useCancelPublishJob() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (jobId: number) => api.post<PublishJobOut>(`/github/publish-jobs/${jobId}/cancel`),
+    onSuccess: (_d, jobId) => {
+      qc.invalidateQueries({ queryKey: sysKey("publishJobs") });
+      qc.invalidateQueries({ queryKey: sysKey("publishJob", jobId) });
     },
   });
 }

@@ -276,6 +276,57 @@ heuristic result.
   calls are a 422 with a reason; the manual copy/paste URL flow always stays
   available as a fallback. This is still not a target-repository write.
 
+## GitHub App publish workflow (issue #216)
+
+- `app/github_app.py` (JWT signing + Installation Token broker + a few
+  read-only/write GitHub REST calls: `get_repository`,
+  `list_installation_repositories`, `create_pull_request`,
+  `list_open_pull_requests_for_branch`), `app/repo_manager.py` (managed
+  mirror clone/fetch under `GIT_REPOSITORY_ROOT`, per-job worktrees,
+  `connection_lock`, cleanup), `app/publish_job.py` + `app/publish_guards.py`
+  (the two-phase publish state machine and its safety checks), routes in
+  `routes/github_connections.py` and `routes/publish_jobs.py`. See the
+  "GitHub App 公開ワークフロー（Issue #216）" section of
+  `docs/project-intelligence.md` for the full state diagram and safety
+  boundaries — do not duplicate that design narrative here.
+- An installation token, the App JWT, and the private key must never reach a
+  database row, log line, or API response. Always route any exception text
+  that might embed one through `github_app._sanitize` before it is persisted
+  or returned; `publish_jobs.error` is stored pre-sanitized so routes may
+  return it verbatim.
+- `GET /github/installations/{installation_id}/repositories` (sub-task 4) is
+  read-only and uses the same `_require_manage` (admin or System owner)
+  authorization as connection management; it returns
+  `GithubInstallationRepositoryOut` (owner/name/default_branch/private only,
+  never a token) and 502s with a sanitized message on `GitHubAppError`.
+- The push target is always a server-generated `probe/`-prefixed branch
+  (`publish_guards.generate_branch_name` / `validate_push_target`); force
+  push and direct push to the base/default branch are not implemented in
+  this MVP regardless of `GIT_ALLOW_DIRECT_PUSH` / `GIT_ALLOW_FORCE_PUSH`
+  (read but never honored as `true`).
+- `create_publish_job` requires the connection to be `status=connected` and
+  the patch's latest `baseline` + `probed` validation runs to both be
+  `overall_success=true` — this reuses Issue #25's validation gate rather
+  than adding a second one. The remote base-branch SHA is re-resolved and
+  compared against the patch's pinned commit twice (entering `fetching` and
+  again immediately before `pushing`); any mismatch fails the job closed
+  with no auto-rebase.
+- Only files present in the patch diff are staged (`git add`), each
+  structurally validated by `publish_guards.validate_patch_file_path`
+  (rejects paths outside the diff, `.git/`, path traversal, symlinks, secret-
+  name candidates, and `.github/workflows/` unless
+  `GIT_ALLOW_WORKFLOW_CHANGES=true`).
+- Approval only moves `awaiting_approval -> committing`; publishing
+  (commit/push/PR) only ever starts from an explicit `POST
+  /github/publish-jobs/{id}/approve` call. probe-agent never merges or
+  closes the resulting Pull Request itself.
+- Every terminal state (`completed`/`failed`/`cancelled`) cleans up the job
+  worktree and records `cleanup_state`/`cleanup_error`. Tests for this whole
+  area live in `tests/test_github_app.py` (App/connection layer, including
+  the installation-repositories endpoint) and `tests/test_publish_jobs.py`
+  (state machine, staleness, push safety, diff-path guards, idempotency,
+  cleanup, system isolation, secret hygiene).
+
 ## Authentication and user management
 
 - Auth is enabled when any user exists or `CONTROL_API_KEYS` is set; otherwise open (MVP compat).
@@ -389,3 +440,8 @@ Add or update tests for:
 - reasoning-required operations fail closed without heuristic fallback
 - reasoning metadata and structured-output validation
 - target repository unchanged after workspace operations
+- GitHub publish workflow: no installation token/JWT/private key ever
+  persisted or returned, `probe/`-branch + no-force-push enforcement, the
+  Issue #25 validation gate at job creation, the pre-push staleness
+  re-check, approve/cancel idempotency, worktree cleanup on every terminal
+  state, and system isolation

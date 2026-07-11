@@ -305,6 +305,45 @@ DashboardではControl Serverが`/repositories`配下から検出したGit Repos
 選択する。自由度のある draft 生成では reasoning model
 以外を拒否し、LLM failure 時に heuristic へフォールバックしない。
 
+## GitHub 連携（Publish workflow, Issue #216）
+
+Probe Planner で承認・validate 済みの probe patch を、実際の GitHub
+リポジトリへ commit / push / Pull Request 作成できる。probe-agent が対象
+リポジトリの default ブランチへ直接書き込むことは一切なく、常に人間の
+明示承認を経てから `probe/` 接頭辞のサーバー生成ブランチにのみ push し、
+Pull Request のマージ・クローズは開発者が GitHub 上で行う（設計の詳細は
+[`docs/project-intelligence.md`](docs/project-intelligence.md) の
+「GitHub App 公開ワークフロー（Issue #216）」を参照）。
+
+有効化するには、対象リポジトリに GitHub App をインストールし、Control
+Server に以下を設定する。
+
+```env
+GITHUB_APP_ID=<GitHub App の App ID>
+GITHUB_APP_PRIVATE_KEY_PATH=/absolute/path/to/github-app-private-key.pem
+GIT_REPOSITORY_ROOT=/path/to/managed-git-root
+```
+
+いずれか未設定の場合、GitHub 機能全体が fail closed になる（Dashboard の
+`GitHub` ページの App status カードに設定手順が表示される）。両方とも
+未設定なら probe-agent の他機能には一切影響しない。
+
+Dashboard の `GitHub` ページでの操作フロー:
+
+1. **Connections** タブで installation ID を入力し、`Load repositories` で
+   その GitHub App installation がアクセスできるリポジトリ一覧から選ぶか、
+   owner/repo を手入力して connection を作成する。
+2. 作成した connection を `Verify`（Installation Token で疎通確認・
+   `default_branch` を取得）し、必要なら `Sync`（managed mirror を最新化）する。
+3. **Publish Jobs** タブで connection と validate 済み(baseline/probed とも
+   green)の probe patch を選び、publish job を作成する。job は自動で
+   `awaiting_approval` まで進み、そこで停止する。
+4. job 詳細で publish 先（owner/repo・base branch・base commit SHA・
+   生成される branch 名）と patch diff を確認したうえで `Approve` する。
+   承認後、job は自動で commit → push → Pull Request 作成まで進む。
+   `awaiting_approval` の間は `Cancel` もできる。
+5. 作成された Pull Request のレビュー・マージは GitHub 上で行う。
+
 ## 認証と Dashboard のログイン方式
 
 現状の Dashboard にはブラウザ上のログイン画面はない。Dashboard は起動時に
@@ -401,6 +440,12 @@ Docker Compose はリポジトリルートの `.env` を読み込む。ローカ
 | `GIT_CLONE_TIMEOUT` | `300` | managed mirror の `git clone` タイムアウト秒数 |
 | `GIT_FETCH_TIMEOUT` | `120` | managed mirror の `git fetch` / `git ls-remote` タイムアウト秒数 |
 | `GIT_JOB_RETENTION_HOURS` | `24` | この時間を超えて放置された job worktree を `cleanup_expired_jobs` が削除するまでの猶予時間 |
+| `GIT_BRANCH_PREFIX` | `probe/` | Publish job が push する branch 名の接頭辞。この接頭辞のブランチにのみ push する |
+| `GIT_ALLOW_DIRECT_PUSH` | `false` | 読み取るだけで `false` 以外の値でも常に fail closed（direct push は MVP 非実装） |
+| `GIT_ALLOW_FORCE_PUSH` | `false` | 読み取るだけで `false` 以外の値でも常に fail closed（force push は MVP 非実装） |
+| `GIT_ALLOW_WORKFLOW_CHANGES` | `false` | `true` の場合のみ patch diff 内の `.github/workflows/` ファイルを stage 許可 |
+| `GITHUB_APP_BOT_NAME` | `probe-agent[bot]` | publish job が作る commit の author/committer name |
+| `GITHUB_APP_BOT_EMAIL` | `probe-agent[bot]@users.noreply.github.com` | publish job が作る commit の author/committer email |
 
 ## ライセンス
 

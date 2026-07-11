@@ -3638,6 +3638,16 @@ class GithubRepositoryStatusOut(BaseModel):
     last_synced_commit_sha: Optional[str] = None
 
 
+# Read-only installation repository listing (Issue #216, sub-task 4) -- used by
+# the Dashboard's connection-creation form to let the developer pick a repo
+# instead of typing owner/repo by hand. Never carries a token.
+class GithubInstallationRepositoryOut(BaseModel):
+    owner: str
+    name: str
+    default_branch: Optional[str] = None
+    private: bool
+
+
 # Publish job state machine (Issue #216, sub-task 3). `status` is the finite
 # ordered set enforced by app/publish_job.py; no field here ever carries an
 # installation token (Principle 5/8 -- `error` is always sanitized before

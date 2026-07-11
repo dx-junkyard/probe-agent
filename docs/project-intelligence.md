@@ -1441,6 +1441,114 @@ probe-agent の認識を同期させることを最優先にする。
 - 完全自動での probe 復元・古い pattern の無条件適用はしない。
 - ユーザー確認なしの対象リポジトリ書き換えはしない(Principle 5/8 維持)。
 
+## GitHub App 公開ワークフロー（Issue #216）
+
+Issue #25 で承認・validate 済みの probe patch を、明示的な人間承認を経て
+実際のリモートリポジトリへ commit / push / Pull Request 作成する経路。
+Principle 5/8 の「対象リポジトリへ直接書き込まない」原則の唯一の例外で、
+GitHub App の短命 Installation Token を使い、常に承認ゲートを通し、常に
+`probe/` 接頭辞のサーバー生成ブランチにのみ push し、force push は一切しない。
+probe-agent は Pull Request を自らマージ・クローズしない。
+
+実装:
+
+- `app/github_app.py` — App-level JWT 署名(RS256)・Installation Access
+  Token の交換・`get_repository` / `create_pull_request` /
+  `list_open_pull_requests_for_branch` / `list_installation_repositories`。
+  token・JWT・private key は一切永続化しない。`_sanitize` が既知の GitHub
+  token 形状(`gh[a-z]_...` / `github_pat_...`)と JWT 形状を正規表現で
+  エラーメッセージから除去してから `GitHubAppError` に載せる。
+  `github_app_configured()` が構成の有無を判定する唯一の場所(fail-closed、
+  Principle 6 の精神)。
+- `app/repo_manager.py` — `GIT_REPOSITORY_ROOT` 配下に connection ごとの
+  managed mirror(bare clone 相当)を保持し、publish job ごとに独立した
+  job worktree を作る/消す。`connection_lock(connection_id)` が同一
+  connection に対するすべての git/publish 操作を直列化する。
+- `app/publish_job.py` + `app/publish_guards.py` — 2 フェーズの publish job
+  状態機械(下記)。`publish_guards` が branch 名生成・push 先検証・commit
+  message/PR 本文の構造化テンプレート・diff 内ファイルパスの安全検証
+  (`.git/`・path traversal・symlink・workflow ファイル・secret 名候補の
+  拒否)・`assert_no_unsafe_push_config` を提供する。
+- ルーティング: `routes/github_connections.py`
+  (`GET /github/app-status`、connection の CRUD + verify/sync、
+  読み取り専用の `GET /github/installations/{installation_id}/repositories`)
+  と `routes/publish_jobs.py`(publish job の作成/一覧/取得/approve/cancel)。
+  認可は他の system-scoped 管理操作と同じ `_require_manage`
+  (admin または System owner のみ)。
+- Dashboard: `pages/github.tsx`(App status・Connections・Publish Jobs の
+  3 セクション。ナビゲーションは Sidebar の「GitHub」)。
+
+### Publish job の状態遷移
+
+2 フェーズ、間に人間承認を挟む一本道の有限状態機械(per-step テーブルは
+持たず `publish_jobs.status` 自体が state)。
+
+```
+prepare（job 作成時に自動開始）:
+  pending → authenticating → fetching → checking_out
+          → applying_patch → validating → awaiting_approval
+
+publish（明示的な approve 呼び出しでのみ開始）:
+  awaiting_approval → committing → pushing → creating_pr → completed
+
+どちらのフェーズでも失敗時・cancel 時: failed / cancelled
+```
+
+- `create_publish_job` は、connection が `status=connected` かつ
+  `default_branch` を持つこと、patch が failed でなく diff が空でないこと、
+  patch の最新 `validation_runs` で `baseline` と `probed` の両方が
+  `overall_success=true` であることを要求する(Issue #25 の validation
+  ゲートをそのまま再利用。満たさなければ 409)。
+- prepare フェーズは `fetching` で一度、publish フェーズは `pushing` の
+  直前でもう一度、リモート `base_branch` の SHA を解決し、patch が
+  ピン留めした commit SHA と比較する。一致しなければ stale patch として
+  fail closed(自動 rebase はしない。新しい snapshot からの再生成・
+  再 validate を促すエラーメッセージを返す)。
+- push 先ブランチは常に `publish_guards.generate_branch_name` が生成する
+  `probe/` 接頭辞のブランチで、`validate_push_target` が base/default
+  ブランチと一致しないことを検証する。push は
+  `git push origin HEAD:refs/heads/<branch>` の明示 refspec のみで、
+  `--force` は使わない。
+- commit 時は patch diff に含まれるファイルパスのみを構造検証してから
+  `git add` する(diff 外ファイル・`.git/`・secret 名候補・symlink・
+  path traversal を拒否。workflow ファイルは既定で拒否、
+  `GIT_ALLOW_WORKFLOW_CHANGES=true` の時のみ許可)。
+- Installation Token は各フェーズ内でその都度発行し、ローカル変数にのみ
+  保持する。`publish_jobs` テーブルにも `error` にも一切書き込まれない
+  (`github_app._sanitize` を経由してから persist)。
+- 完了・失敗・cancel のいずれの終端状態でも job worktree を cleanup し、
+  `cleanup_state` / `cleanup_error` を記録する。
+- PR 作成はべき等: 同じブランチに対して open な PR が既にあれば
+  再利用し、重複 PR を作らない。
+
+### 安全境界のまとめ
+
+- **承認ゲート**: `awaiting_approval` から先へは `POST
+  /github/publish-jobs/{id}/approve` の明示呼び出しでしか進まない。
+  Dashboard はこの承認の前に publish 先(owner/repo・base branch・
+  base commit SHA・生成される branch 名)と patch diff を必ず表示する。
+- **`probe/` ブランチ強制・force push 不可**: 上記のとおり
+  `publish_guards` が構造的に強制する。
+- **stale fail-closed**: prepare・publish の両方でリモート base branch の
+  SHA を再確認し、ずれていれば失敗させる。自動リベースは実装しない。
+- **token 非永続**: Installation Token・App JWT・private key はいかなる
+  テーブル・ログ・API レスポンスにも現れない。`GithubConnectionOut` /
+  `PublishJobOut` はどちらも token フィールドを持たない。
+- **監査**: `requested_by_user_id` / `approved_by_user_id` /
+  `created_at` / `approved_at` / `completed_at` / `heartbeat_at` /
+  `validation_summary` / sanitized `error` を `publish_jobs` に永続化する。
+- **Issue #25 ゲートとの関係**: publish job は Issue #25 が生成・
+  validate した `probe_patches` / `validation_runs` をそのまま参照するだけで、
+  独自の instrumentation や patch 生成経路は持たない。probe-agent は
+  常に Pull Request を作るところで止まり、マージ・クローズは開発者が
+  GitHub 上で行う。
+
+### 非目標(Issue #216 のとおり)
+
+- default/base ブランチへの直接 push、force push、承認なしの push はしない。
+- probe-agent 自身による PR のマージ・クローズはしない。
+- Installation Token・private key の永続化はしない。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。

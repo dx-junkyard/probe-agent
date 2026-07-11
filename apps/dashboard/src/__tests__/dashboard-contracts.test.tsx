@@ -5414,3 +5414,280 @@ describe("Hub success summary and pipeline collapse (Issue #211)", () => {
     expect(await screen.findByTestId("entry-cards-prereq-note")).toBeInTheDocument();
   });
 });
+
+// ── GitHub page (Issue #216) ────────────────────────────────────────
+
+describe("GitHub page", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const connectionFixture = {
+    id: 1,
+    system_id: 1,
+    api_base_url: "https://api.github.com",
+    web_base_url: "https://github.com",
+    owner: "acme",
+    repo: "widgets",
+    clone_url: "https://github.com/acme/widgets.git",
+    installation_id: 42,
+    default_branch: "main",
+    credential_type: "github_app",
+    status: "connected",
+    last_error: null,
+    last_synced_at: "2024-01-01T00:00:00Z",
+    last_synced_commit_sha: "abc1234567890",
+    created_by_user_id: 1,
+    updated_by_user_id: 1,
+    created_at: "2024-01-01T00:00:00Z",
+    updated_at: "2024-01-01T00:00:00Z",
+  };
+
+  function jobFixture(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 1,
+      system_id: 1,
+      connection_id: 1,
+      patch_id: 20,
+      snapshot_id: 5,
+      base_branch: "main",
+      base_commit_sha: "abc1234567890",
+      branch_name: "probe/publish-1-abc12345",
+      commit_sha: null,
+      pr_url: null,
+      pr_number: null,
+      status: "awaiting_approval",
+      error: null,
+      validation_summary: {
+        baseline: { overall_success: true },
+        probed: { overall_success: true },
+      },
+      requested_by_user_id: 1,
+      approved_by_user_id: null,
+      cleanup_state: "not_attempted",
+      cleanup_error: null,
+      created_at: 1700000000,
+      updated_at: 1700000000,
+      approved_at: null,
+      completed_at: null,
+      heartbeat_at: null,
+      ...overrides,
+    };
+  }
+
+  const patchFixture = {
+    id: 20,
+    plan_id: 10,
+    system_id: 1,
+    snapshot_id: 5,
+    commit_sha: "abc1234567890",
+    diff: "diff --git a/a.py b/a.py",
+    worktree_path: null,
+    skipped: [],
+    status: "generated",
+    error: null,
+    cleanup_state: "removed",
+    cleanup_error: null,
+    apply_status: "not_applied",
+    apply_error: null,
+    applied_at: null,
+    applied_by_user_id: null,
+    validation_runs: [
+      { id: 1, variant: "baseline", overall_success: true, commands: [] },
+      { id: 2, variant: "probed", overall_success: true, commands: [] },
+    ],
+    created_at: "2024-01-01",
+  };
+
+  function mockGithubData(data: {
+    appStatus?: Record<string, unknown>;
+    connections?: Record<string, unknown>[];
+    jobs?: Record<string, unknown>[];
+    patches?: Record<string, unknown>[];
+  }) {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/github/app-status") {
+        return Promise.resolve(
+          data.appStatus ?? {
+            configured: true, app_id: "123",
+            api_base_url: "https://api.github.com", web_base_url: "https://github.com",
+          },
+        );
+      }
+      if (path === "/github/connections") return Promise.resolve(data.connections ?? []);
+      if (path === "/github/publish-jobs") return Promise.resolve(data.jobs ?? []);
+      if (path === "/repository/probe-patches") return Promise.resolve(data.patches ?? []);
+      if (path === "/users") return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+  }
+
+  test("shows the configured app status badge", async () => {
+    mockGithubData({ appStatus: { configured: true, app_id: "999", api_base_url: "https://api.github.com", web_base_url: "https://github.com" } });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("github-app-configured-badge")).toHaveTextContent("Configured"),
+    );
+  });
+
+  test("shows a setup hint when the GitHub App is not configured", async () => {
+    mockGithubData({ appStatus: { configured: false, app_id: null, api_base_url: "https://api.github.com", web_base_url: "https://github.com" } });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("github-app-configured-badge")).toHaveTextContent("Not configured"),
+    );
+    expect(screen.getByText("GITHUB_APP_ID")).toBeInTheDocument();
+    expect(screen.getByTestId("new-connection-button")).toBeDisabled();
+  });
+
+  test("shows the connections list with status and last error", async () => {
+    mockGithubData({
+      connections: [
+        connectionFixture,
+        { ...connectionFixture, id: 2, repo: "gadgets", status: "error", last_error: "installation revoked" },
+      ],
+    });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(screen.getByTestId("connection-1")).toBeInTheDocument());
+    expect(within(screen.getByTestId("connection-1")).getByText("acme/widgets")).toBeInTheDocument();
+    expect(within(screen.getByTestId("connection-1")).getByText("connected")).toBeInTheDocument();
+    expect(within(screen.getByTestId("connection-2")).getByText("error")).toBeInTheDocument();
+    expect(within(screen.getByTestId("connection-2")).getByTestId("connection-2-error")).toHaveTextContent(
+      "installation revoked",
+    );
+  });
+
+  test("shows the publish jobs list with a PR link once created", async () => {
+    mockGithubData({
+      connections: [connectionFixture],
+      jobs: [
+        jobFixture({
+          id: 2, status: "completed", commit_sha: "def4567890",
+          pr_url: "https://github.com/acme/widgets/pull/7", pr_number: 7,
+        }),
+      ],
+    });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-2")).toBeInTheDocument());
+    const row = within(screen.getByTestId("publish-job-2"));
+    expect(row.getByText("completed")).toBeInTheDocument();
+    expect(row.getByText(/PR #7/)).toBeInTheDocument();
+  });
+
+  test("approve button is shown only for a job awaiting approval", async () => {
+    mockGithubData({
+      connections: [connectionFixture],
+      jobs: [jobFixture({ id: 3, status: "awaiting_approval" })],
+      patches: [patchFixture],
+    });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-3")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("publish-job-3"));
+
+    expect(await screen.findByTestId("publish-job-approve-button")).toBeInTheDocument();
+    expect(screen.getByTestId("publish-job-cancel-button")).toBeInTheDocument();
+    // The confirmation dialog shows the publish target before approving.
+    fireEvent.click(screen.getByTestId("publish-job-approve-button"));
+    expect(await screen.findByText("Approve publish")).toBeInTheDocument();
+    expect(screen.getByTestId("publish-job-confirm-approve-button")).toBeInTheDocument();
+  });
+
+  test("approve button is hidden for a completed job", async () => {
+    mockGithubData({
+      connections: [connectionFixture],
+      jobs: [jobFixture({ id: 4, status: "completed", commit_sha: "def4567890" })],
+      patches: [patchFixture],
+    });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-4")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("publish-job-4"));
+
+    await waitFor(() => expect(screen.getByTestId("publish-job-detail")).toBeInTheDocument());
+    expect(screen.queryByTestId("publish-job-approve-button")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("publish-job-cancel-button")).not.toBeInTheDocument();
+  });
+
+  test("confirming approval calls the approve endpoint for the selected job", async () => {
+    mockGithubData({
+      connections: [connectionFixture],
+      jobs: [jobFixture({ id: 5, status: "awaiting_approval" })],
+      patches: [patchFixture],
+    });
+    mockApi.post.mockResolvedValue(jobFixture({ id: 5, status: "committing" }));
+
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-5")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("publish-job-5"));
+    fireEvent.click(await screen.findByTestId("publish-job-approve-button"));
+    fireEvent.click(await screen.findByTestId("publish-job-confirm-approve-button"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/github/publish-jobs/5/approve");
+    });
+  });
+
+  test("cancelling a job calls the cancel endpoint", async () => {
+    mockGithubData({
+      connections: [connectionFixture],
+      jobs: [jobFixture({ id: 6, status: "pending" })],
+      patches: [patchFixture],
+    });
+    mockApi.post.mockResolvedValue(jobFixture({ id: 6, status: "cancelled" }));
+
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-6")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("publish-job-6"));
+    fireEvent.click(await screen.findByTestId("publish-job-cancel-button"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/github/publish-jobs/6/cancel");
+    });
+  });
+
+  test("shows the sanitized error for a failed job in the list and detail view", async () => {
+    mockGithubData({
+      connections: [connectionFixture],
+      jobs: [jobFixture({
+        id: 7, status: "failed",
+        error: "Base branch has moved since the patch was generated/validated",
+      })],
+      patches: [patchFixture],
+    });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-7-error")).toHaveTextContent(
+      "Base branch has moved since the patch was generated/validated",
+    ));
+
+    fireEvent.click(screen.getByTestId("publish-job-7"));
+    expect(await screen.findByTestId("publish-job-detail-error")).toHaveTextContent(
+      "Base branch has moved since the patch was generated/validated",
+    );
+    expect(screen.queryByTestId("publish-job-approve-button")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("publish-job-cancel-button")).not.toBeInTheDocument();
+  });
+});

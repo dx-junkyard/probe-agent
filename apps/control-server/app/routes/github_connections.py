@@ -36,11 +36,13 @@ from ..github_app import (
     default_web_base_url,
     get_repository,
     github_app_configured,
+    list_installation_repositories,
 )
 from ..models import (
     GithubAppStatusOut,
     GithubConnectionCreate,
     GithubConnectionOut,
+    GithubInstallationRepositoryOut,
     GithubRepositoryStatusOut,
 )
 from .. import repo_manager
@@ -116,6 +118,32 @@ def get_app_status(principal: Principal = Depends(require_user)) -> GithubAppSta
         api_base_url=default_api_base_url(),
         web_base_url=default_web_base_url(),
     )
+
+
+@router.get(
+    "/github/installations/{installation_id}/repositories",
+    response_model=List[GithubInstallationRepositoryOut],
+)
+def list_installation_repositories_endpoint(
+    installation_id: int,
+    principal: Principal = Depends(require_user),
+    system_id: int = Depends(get_system_id),
+) -> List[GithubInstallationRepositoryOut]:
+    """Read-only: list repositories reachable by a GitHub App installation, so
+    the Dashboard's connection-creation form can offer a picker instead of
+    requiring the developer to type owner/repo by hand. Same authorization as
+    connection management (admin or system owner); no installation token is
+    ever returned (Principle 5/8)."""
+    with get_conn() as conn:
+        _require_manage(conn, principal, system_id)
+
+    try:
+        installation_token = create_installation_token(installation_id)
+        repositories = list_installation_repositories(installation_token.token)
+    except GitHubAppError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    return [GithubInstallationRepositoryOut(**repo) for repo in repositories]
 
 
 @router.post("/github/connections", response_model=GithubConnectionOut, status_code=201)

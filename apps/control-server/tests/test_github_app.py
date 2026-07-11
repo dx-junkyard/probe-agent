@@ -551,3 +551,91 @@ class TestTokenNeverPersisted:
                 if isinstance(value, str):
                     assert "ghs_supersecrettoken0123456789" not in value
         conn.close()
+
+
+# --- Installation repositories listing (Issue #216, sub-task 4) -------------
+
+
+class TestInstallationRepositoriesAPI:
+    def _fake_urlopen(self, *, token="ghs_faketoken0123456789"):
+        def fake_urlopen(request, timeout=30):
+            class FakeResponse:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+                def read(self):
+                    if "access_tokens" in request.full_url:
+                        return json.dumps(
+                            {"token": token, "expires_at": "2099-01-01T00:00:00Z"}
+                        ).encode("utf-8")
+                    if request.full_url.endswith("/installation/repositories"):
+                        return json.dumps(
+                            {
+                                "repositories": [
+                                    {
+                                        "owner": {"login": "acme"},
+                                        "name": "widgets",
+                                        "default_branch": "main",
+                                        "private": True,
+                                    },
+                                    {
+                                        "owner": {"login": "acme"},
+                                        "name": "gadgets",
+                                        "default_branch": "trunk",
+                                        "private": False,
+                                    },
+                                ]
+                            }
+                        ).encode("utf-8")
+                    return json.dumps({}).encode("utf-8")
+
+            return FakeResponse()
+
+        return fake_urlopen
+
+    def test_lists_repositories_without_leaking_token(
+        self, admin_client, monkeypatch, rsa_private_key_path
+    ):
+        _configure_app(monkeypatch, rsa_private_key_path)
+        token = _login(admin_client)
+        system = _create_system(admin_client, token)
+        h = _headers(token, system["id"])
+
+        monkeypatch.setattr("urllib.request.urlopen", self._fake_urlopen())
+        r = admin_client.get("/github/installations/1/repositories", headers=h)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body == [
+            {"owner": "acme", "name": "widgets", "default_branch": "main", "private": True},
+            {"owner": "acme", "name": "gadgets", "default_branch": "trunk", "private": False},
+        ]
+        assert "ghs_faketoken0123456789" not in r.text
+
+    def test_fails_closed_when_app_not_configured(self, admin_client):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token)
+        h = _headers(token, system["id"])
+
+        r = admin_client.get("/github/installations/1/repositories", headers=h)
+        assert r.status_code == 502, r.text
+        assert "ghs_" not in r.text
+
+    def test_non_owner_forbidden(self, admin_client, monkeypatch, rsa_private_key_path):
+        _configure_app(monkeypatch, rsa_private_key_path)
+        admin_token = _login(admin_client)
+        system = _create_system(admin_client, admin_token)
+        other_user = _create_user(admin_client, admin_token, "bob")
+        other_token = _login(admin_client, "bob", "pw123456")
+
+        r = admin_client.get(
+            "/github/installations/1/repositories",
+            headers=_headers(other_token, system["id"]),
+        )
+        assert r.status_code == 403, r.text
+
+    def test_requires_authentication(self, admin_client):
+        r = admin_client.get("/github/installations/1/repositories")
+        assert r.status_code in (401, 403)
