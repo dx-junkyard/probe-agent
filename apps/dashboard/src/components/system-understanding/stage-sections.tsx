@@ -33,11 +33,13 @@ export const STAGE_DESCRIPTIONS: Record<Stage, string> = {
 export const STAGE_DETAIL_LINKS: Record<Stage, { to: string; label: string }[]> = {
   understand: [
     { to: "/capability-map", label: "Capability Map" },
+    { to: "/interview", label: "Interview" },
     { to: "/feature-map", label: "Feature Map" },
     { to: "/repository", label: "Repository" },
   ],
   observe: [
     { to: "/flow-explorer", label: "Flow Explorer" },
+    { to: "/interview", label: "Interview" },
     { to: "/trace-lineage", label: "Trace Lineage" },
   ],
   instrument: [

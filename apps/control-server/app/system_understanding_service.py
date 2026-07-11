@@ -500,6 +500,13 @@ GAP_TITLE_TEMPLATES: Dict[str, str] = {
     "ambiguous_ownership": "Ambiguous ownership: {name}",
 }
 
+# Issue #199: single source of truth for "gap type -> resolution action(s)".
+# For every gap type, index [0] is the primary resolution — the action a
+# gap card AND the top-level Next Action for that gap type both link to.
+# Principle: work that fixes/completes state (classification, metadata)
+# belongs to Interview; work that only reviews/browses existing state
+# belongs to Capability Map / Flow Explorer. Any additional entries after
+# [0] are secondary/alternate actions shown only on the gap card.
 GAP_NEXT_ACTIONS: Dict[str, List[Dict[str, Optional[str]]]] = {
     "docs_only": [
         {"action": "Open docs evidence", "link": None},
@@ -819,14 +826,22 @@ def _build_next_actions(
             link="/system-understanding",
         ))
 
+    # Issue #199: the link for each gap-type-derived top-level action is
+    # taken from GAP_NEXT_ACTIONS[gap_type][0] (the primary resolution) so
+    # this action and the corresponding gap card never disagree on where to
+    # send the user.
     gap_counts = {g.gap_type: g.count for g in (gap_summary or [])}
     unclassified_count = gap_counts.get("unclassified_entrypoint", 0)
     if unclassified_count > 0:
         actions.append(NextAction(
             action="Unclassified API found",
-            reason=f"{unclassified_count} API entrypoint{'s' if unclassified_count != 1 else ''} need capability classification",
+            reason=(
+                f"{unclassified_count} API entrypoint{'s' if unclassified_count != 1 else ''} "
+                "need capability classification; classify in Interview, then view "
+                "results in Capability Map"
+            ),
             category="observe",
-            link="/capability-map",
+            link=GAP_NEXT_ACTIONS["unclassified_entrypoint"][0]["link"],
         ))
 
     probe_candidate_count = gap_counts.get("missing_probe_flow", 0)
@@ -835,7 +850,7 @@ def _build_next_actions(
             action="Probe candidate available",
             reason=f"{probe_candidate_count} classified entrypoint{'s' if probe_candidate_count != 1 else ''} have no probe plan yet",
             category="observe",
-            link="/flow-explorer",
+            link=GAP_NEXT_ACTIONS["missing_probe_flow"][0]["link"],
         ))
 
     # Issue #174: probe plan / experiment status is a downstream, independent

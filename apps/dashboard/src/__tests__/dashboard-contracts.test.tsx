@@ -2779,6 +2779,13 @@ describe("Sidebar navigation grouping (Issue #179)", () => {
     // System Understanding is grouped under Hub, not Detail views.
     expect(within(screen.getByTestId("sidebar-group-hub")).getByText("System Understanding")).toBeTruthy();
     expect(within(screen.getByTestId("sidebar-group-detail-views")).getByText("Flow Explorer")).toBeTruthy();
+
+    // Issue #199: Interview sits directly after Capability Map in Detail views.
+    const detailLabels = within(screen.getByTestId("sidebar-group-detail-views"))
+      .getAllByRole("link")
+      .map((el) => el.textContent);
+    const capIdx = detailLabels.indexOf("Capability Map");
+    expect(detailLabels[capIdx + 1]).toBe("Interview");
   });
 });
 
@@ -3183,7 +3190,12 @@ describe("System Understanding page", () => {
     expect(screen.getByTestId("metadata-coverage")).toBeTruthy();
 
     // Each stage links to its detail pages.
+    expect(within(screen.getByTestId("stage-links-understand")).getByText("Capability Map")).toBeTruthy();
+    // Issue #199: Interview is reachable from both the Understand and Decide
+    // Where to Observe stages, since its stages map onto both.
+    expect(within(screen.getByTestId("stage-links-understand")).getByText("Interview")).toBeTruthy();
     expect(within(screen.getByTestId("stage-links-observe")).getByText("Flow Explorer")).toBeTruthy();
+    expect(within(screen.getByTestId("stage-links-observe")).getByText("Interview")).toBeTruthy();
     expect(within(screen.getByTestId("stage-links-instrument")).getByText("Probe Planner")).toBeTruthy();
     expect(within(screen.getByTestId("stage-links-evaluate")).getByText("Experiments")).toBeTruthy();
   });

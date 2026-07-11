@@ -964,9 +964,31 @@ class TestNextActionsPriority:
         )
         by_label = {a.action: a for a in actions}
         assert by_label["Unclassified API found"].category == "observe"
-        assert by_label["Unclassified API found"].link == "/capability-map"
+        assert by_label["Unclassified API found"].link == "/interview"
         assert by_label["Probe candidate available"].category == "observe"
         assert by_label["Probe candidate available"].link == "/flow-explorer"
+
+    def test_gap_derived_actions_match_gap_next_actions_primary_link(self):
+        """Issue #199: the top-level Next Action link for each gap-type-derived
+        action must match GAP_NEXT_ACTIONS[gap_type][0]["link"] — the same
+        primary resolution shown on that gap type's card, so the two never
+        disagree on where to send the user."""
+        from app.system_understanding_service import GAP_NEXT_ACTIONS, GapSummary, _build_next_actions
+
+        actions = _build_next_actions(
+            self._complete_pipeline(),
+            purpose={"name": "Sys", "summary": "Does things"},
+            capabilities=[{"name": "Cap"}],
+            metadata_coverage=None,
+            gap_count=3,
+            gap_summary=[
+                GapSummary(gap_type="unclassified_entrypoint", count=1),
+                GapSummary(gap_type="missing_probe_flow", count=2),
+            ],
+        )
+        by_label = {a.action: a for a in actions}
+        assert by_label["Unclassified API found"].link == GAP_NEXT_ACTIONS["unclassified_entrypoint"][0]["link"]
+        assert by_label["Probe candidate available"].link == GAP_NEXT_ACTIONS["missing_probe_flow"][0]["link"]
 
     def test_fully_satisfied_pipeline_offers_exploration_actions(self):
         from app.system_understanding_service import MetadataCoverage, _build_next_actions

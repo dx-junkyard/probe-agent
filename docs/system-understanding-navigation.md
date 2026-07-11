@@ -188,9 +188,42 @@ System Understanding の Next Actions は 4 stage に分類される。
 | `evaluate` | Evaluate | Review experiment decision |
 
 `Unclassified API found` は `unclassified_entrypoint` gap summary から生成され、
-Capability Map / Interview 経由の分類作業へ誘導する。`Probe candidate available`
+Interview 経由の分類作業へ誘導する。`Probe candidate available`
 は `missing_probe_flow` gap summary から生成され、Flow Explorer / Probe Planner
 経由で観測計画を作る導線を示す。
+
+### gap 種別 → 解決手段の対応（Issue #199）
+
+トップレベル Next Action と gap card の解決手段リンクは、
+`apps/control-server/app/system_understanding_service.py` の
+`GAP_NEXT_ACTIONS`（dict、モジュールレベル）を単一ソースとして導出される。
+各 gap 種別のリストの先頭要素が主導線（primary resolution）であり、gap 種別由来の
+トップレベル Next Action の link は必ずこの先頭要素と一致する
+（`_build_next_actions` 内で `GAP_NEXT_ACTIONS[gap_type][0]["link"]` を参照）。
+
+役割の原則は固定されている:
+
+- **状態を修正・補完する作業（分類する、metadata を追加する、曖昧な所有権を
+  明確にする）は Interview** が担当する。例: `unclassified_entrypoint` の
+  主導線は `/interview`（Interview で分類し、結果は Capability Map で確認する）。
+- **既存の状態を確認・閲覧する作業は Capability Map / Flow Explorer** が担当
+  する。例: `missing_probe_flow` の主導線は `/flow-explorer`（観測点を探索し、
+  そこから Probe Planner で plan を作る）。
+
+| gap 種別 | 主導線（`GAP_NEXT_ACTIONS[gap_type][0]`） | 役割 |
+| --- | --- | --- |
+| `unclassified_entrypoint` | Open Interview (`/interview`) | 修正・補完 |
+| `missing_probe_flow` | Open Flow Explorer (`/flow-explorer`) | 確認・閲覧 |
+| `code_only` | Open source symbol (`/repository`) | 確認・閲覧 |
+| `source_doc_mismatch` / `stale_explanation` | Propose explanation refresh (`/capability-map`) | 確認・閲覧 |
+| `missing_evidence` | Improve documentation index (`/repository`) | 確認・閲覧 |
+| `ambiguous_ownership` | Clarify ownership in Interview (`/interview`) | 修正・補完 |
+
+Hub の Understand stage と Decide Where to Observe stage の Related pages には
+どちらも Interview へのリンクが並ぶ。Interview のステージ構成
+（purpose_confirmation / capability_confirmation / element_classification /
+api_boundary_mapping / probe_flow_selection）が Understand と Decide Where to
+Observe の両方に対応するためである。
 
 ## Feature Map から始める場合
 
