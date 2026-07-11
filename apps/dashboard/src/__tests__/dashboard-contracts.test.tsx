@@ -3044,7 +3044,9 @@ describe("System Understanding page", () => {
     metadata_coverage: { symbol_count: 100, symbols_with_source_metadata: 2, entrypoint_count: 20, entrypoints_with_capability_link: 1 },
   };
 
-  test("renders empty state when no snapshot exists", async () => {
+  test("renders pipeline checklist (not a separate empty state) when no snapshot exists", async () => {
+    // Issue #200: EmptyState was folded into PipelineChecklist. The all-missing
+    // pipeline is shown as the checklist itself, with a CTA on the first step.
     mockApi.get.mockImplementation((path: string) =>
       path === "/repository/system-understanding"
         ? Promise.resolve(emptyResponse)
@@ -3055,12 +3057,122 @@ describe("System Understanding page", () => {
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
 
     await waitFor(() => {
-      expect(screen.getByText("System Understanding")).toBeTruthy();
+      expect(screen.getByTestId("pipeline-checklist")).toBeTruthy();
     });
 
+    expect(screen.queryByText("Get started with System Understanding")).toBeNull();
+  });
+
+  test("shows a CTA only on the first incomplete step when the pipeline is all missing", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(emptyResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
     await waitFor(() => {
-      expect(screen.getByText("Get started with System Understanding")).toBeTruthy();
+      expect(screen.getByTestId("pipeline-checklist")).toBeTruthy();
     });
+
+    const cta = screen.getByTestId("pipeline-cta-repository_configured");
+    expect(cta.textContent).toContain("Configure repository");
+    expect(cta.getAttribute("href")).toBe("/repository");
+
+    // No other step gets a CTA.
+    expect(screen.queryByTestId("pipeline-cta-snapshot_ready")).toBeNull();
+    expect(screen.queryByTestId("pipeline-cta-symbols_indexed")).toBeNull();
+  });
+
+  test("CTA targets only the first incomplete step in a mid-pipeline state, and wires to Build", async () => {
+    // snapshot_ready is complete; documentation_indexed is the first incomplete
+    // step, which maps to the Build / Refresh action rather than a repository link.
+    const midResponse = {
+      ...emptyResponse,
+      snapshot_id: 5,
+      commit_sha: "abc12345",
+      pipeline: [
+        { step: "repository_configured", status: "complete" },
+        { step: "snapshot_ready", status: "complete" },
+        { step: "documentation_indexed", status: "missing" },
+        { step: "documentation_claims_scanned", status: "missing" },
+        { step: "symbols_indexed", status: "missing" },
+        { step: "entrypoints_discovered", status: "missing" },
+        { step: "docs_code_reconciled", status: "missing" },
+        { step: "capability_hierarchy_ready", status: "missing" },
+      ],
+    };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(midResponse)
+        : Promise.resolve(null),
+    );
+    mockApi.post.mockImplementation((path: string) =>
+      path === "/repository/system-understanding/build"
+        ? Promise.resolve(completeResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("pipeline-checklist")).toBeTruthy();
+    });
+
+    expect(screen.queryByTestId("pipeline-cta-repository_configured")).toBeNull();
+    expect(screen.queryByTestId("pipeline-cta-snapshot_ready")).toBeNull();
+
+    const cta = screen.getByTestId("pipeline-cta-documentation_indexed");
+    expect(cta.textContent).toContain("Run Build / Refresh");
+    expect(screen.queryByTestId("pipeline-cta-documentation_claims_scanned")).toBeNull();
+
+    fireEvent.click(cta);
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/repository/system-understanding/build");
+    });
+  });
+
+  test("disables the build CTA while a build is running", async () => {
+    const midResponse = {
+      ...emptyResponse,
+      pipeline: [
+        { step: "repository_configured", status: "complete" },
+        { step: "snapshot_ready", status: "complete" },
+        { step: "documentation_indexed", status: "missing" },
+        { step: "documentation_claims_scanned", status: "missing" },
+        { step: "symbols_indexed", status: "missing" },
+        { step: "entrypoints_discovered", status: "missing" },
+        { step: "docs_code_reconciled", status: "missing" },
+        { step: "capability_hierarchy_ready", status: "missing" },
+      ],
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(midResponse);
+      if (path === "/repository/system-understanding/build/latest") {
+        return Promise.resolve({
+          id: 1, job_id: 1, run_id: 1, system_id: 1, snapshot_id: 5,
+          status: "running", current_step: "claim_scan", error: null,
+          cancel_requested: false, is_stuck: false,
+          heartbeat_at: Date.now() / 1000, started_at: Date.now() / 1000,
+          completed_at: null, created_at: Date.now() / 1000,
+          steps: [], llm_tasks: { total: 0, pending: 0, running: 0, completed: 0, failed: 0, cancelled: 0, reused: 0 },
+          artifact_counts: {},
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("pipeline-cta-documentation_indexed")).toBeTruthy();
+    });
+
+    expect(screen.getByTestId("pipeline-cta-documentation_indexed")).toBeDisabled();
   });
 
   test("renders pipeline complete state with all sections", async () => {

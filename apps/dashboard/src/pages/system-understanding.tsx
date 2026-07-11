@@ -28,23 +28,6 @@ import type {
   SystemUnderstandingOut,
 } from "@/api/types";
 
-function EmptyState() {
-  return (
-    <Card>
-      <CardContent className="py-10 text-center">
-        <h3 className="text-lg font-semibold mb-4">Get started with System Understanding</h3>
-        <ol className="text-sm text-muted-foreground space-y-2 text-left max-w-md mx-auto list-decimal list-inside">
-          <li><Link to="/repository" className="hover:underline text-primary">Configure your repository</Link></li>
-          <li>Create a snapshot from a commit</li>
-          <li>Index README/docs and source code</li>
-          <li>Build system understanding</li>
-          <li><Link to="/capability-map" className="hover:underline text-primary">Explore capabilities and API boundaries</Link></li>
-        </ol>
-      </CardContent>
-    </Card>
-  );
-}
-
 function EntryCards() {
   return (
     <div className="grid gap-4 md:grid-cols-2">
@@ -80,9 +63,11 @@ function EntryCards() {
   );
 }
 
-function DataView({ data, checksByStep }: {
+function DataView({ data, checksByStep, onRunBuild, buildDisabled }: {
   data: SystemUnderstandingOut;
   checksByStep: Record<string, SystemDiagnosticCheck[]>;
+  onRunBuild: () => void;
+  buildDisabled: boolean;
 }) {
   const pipeline = data.pipeline ?? [];
   const allMissing = pipeline.every((s) => s.status === "missing");
@@ -102,7 +87,12 @@ function DataView({ data, checksByStep }: {
             </CardDescription>
           </CardHeader>
           <CardContent>
-            {allMissing ? <EmptyState /> : <PipelineChecklist steps={pipeline} checksByStep={checksByStep} />}
+            <PipelineChecklist
+              steps={pipeline}
+              checksByStep={checksByStep}
+              onRunBuild={onRunBuild}
+              buildDisabled={buildDisabled}
+            />
           </CardContent>
         </Card>
 
@@ -421,7 +411,12 @@ export default function SystemUnderstandingPage() {
           {[1, 2, 3].map((i) => <Skeleton key={i} className="h-32 w-full" />)}
         </div>
       ) : data ? (
-        <DataView data={data} checksByStep={checksByStep} />
+        <DataView
+          data={data}
+          checksByStep={checksByStep}
+          onRunBuild={() => build.mutate()}
+          buildDisabled={build.isPending || buildRunning}
+        />
       ) : null}
     </div>
   );

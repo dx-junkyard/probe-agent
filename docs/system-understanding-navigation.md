@@ -128,6 +128,30 @@ probe_plans_reviewed       # probe plan がレビューされている
 | `blocked` | 前提条件が不足（例: reasoning model 未設定） |
 | `failed` | 実行したがエラーで失敗 |
 
+### Pipeline Checklist の Next-Step CTA（Issue #200）
+
+初回ユーザーが Hub を開いたとき（pipeline が全 `missing`）でも、専用の空状態
+UI は表示しない。`PipelineChecklist`
+（`apps/dashboard/src/components/system-understanding/pipeline-checklist.tsx`）
+が常時表示され、配列先頭から見て最初の非 `complete` step にのみ「次の一歩」の
+CTA ボタンが付く。2 つ目以降の未完了 step には CTA を出さない。
+
+step → CTA の対応は固定マッピング（`STEP_CTA`、CLAUDE.md Principle 6 の範囲内）
+であり、推論やヒューリスティックではない:
+
+| step | CTA | 遷移/操作 |
+| --- | --- | --- |
+| `repository_configured` | Configure repository | `/repository` へ遷移 |
+| `snapshot_ready` | Create snapshot | `/repository` へ遷移 |
+| 上記以外の全 step（`symbols_indexed` / `documentation_indexed` /
+  `documentation_claims_scanned` / `entrypoints_discovered` /
+  `docs_code_reconciled` / `capability_hierarchy_ready`） | Run Build / Refresh | ページの `Build / Refresh` ボタンと同じ
+  `build.mutate()` を起動 |
+
+Build 系 CTA はビルド実行中（`build.isPending` または最新ジョブが
+`queued`/`running`）は無効化される。CTA には `pipeline-cta-<step>` の
+`data-testid` が付く。
+
 ## ページ間ナビゲーション
 
 クロスページリンク:
