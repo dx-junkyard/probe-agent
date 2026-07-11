@@ -1715,6 +1715,45 @@ CREATE TABLE IF NOT EXISTS probe_removal_patches (
 
 CREATE INDEX IF NOT EXISTS idx_probe_removal_patches_pattern
     ON probe_removal_patches (pattern_id, id DESC);
+
+-- GitHub App connection persistence (Issue #216, sub-task 1). Records which
+-- remote repository a System is connected to for the publish workflow and
+-- through which GitHub App installation, so a later repository manager /
+-- publish job can look up the installation without re-asking the user.
+-- The Installation Access Token itself is short-lived and is never stored
+-- here or anywhere else (Principle 5/8) -- only this structural connection
+-- metadata is. Soft-deleted (status='disconnected') rather than physically
+-- deleted for audit; the partial unique index below only constrains
+-- non-disconnected rows so the same (system, owner, repo) can be
+-- reconnected as a fresh row.
+CREATE TABLE IF NOT EXISTS github_connections (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id            INTEGER NOT NULL,
+    api_base_url         TEXT NOT NULL,
+    web_base_url         TEXT NOT NULL,
+    owner                TEXT NOT NULL,
+    repo                 TEXT NOT NULL,
+    clone_url            TEXT NOT NULL,
+    installation_id      INTEGER NOT NULL,
+    default_branch       TEXT,
+    credential_type      TEXT NOT NULL DEFAULT 'github_app',
+    status               TEXT NOT NULL DEFAULT 'pending',
+    last_error           TEXT,
+    created_by_user_id   INTEGER,
+    updated_by_user_id   INTEGER,
+    created_at           TEXT NOT NULL,
+    updated_at           TEXT NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (created_by_user_id) REFERENCES users (id) ON DELETE SET NULL,
+    FOREIGN KEY (updated_by_user_id) REFERENCES users (id) ON DELETE SET NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_github_connections_active_unique
+    ON github_connections (system_id, owner, repo)
+    WHERE status != 'disconnected';
+
+CREATE INDEX IF NOT EXISTS idx_github_connections_system
+    ON github_connections (system_id, id DESC);
 """
 
 

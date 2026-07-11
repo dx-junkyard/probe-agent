@@ -3583,6 +3583,47 @@ class AssistantCitationOut(BaseModel):
     detail: str = ""
 
 
+# GitHub App publish workflow (Issue #216, sub-task 1): connection
+# persistence models. `status` is a finite set enforced in the route layer;
+# no field here ever carries an installation token or private key material
+# (Principle 5/8 -- tokens are brokered per-call and never stored).
+GithubConnectionStatus = Literal["pending", "connected", "error", "disconnected"]
+
+
+class GithubAppStatusOut(BaseModel):
+    configured: bool
+    app_id: Optional[str] = None
+    api_base_url: str
+    web_base_url: str
+
+
+class GithubConnectionCreate(BaseModel):
+    owner: str = Field(..., min_length=1)
+    repo: str = Field(..., min_length=1)
+    installation_id: int
+    api_base_url: Optional[str] = None
+    web_base_url: Optional[str] = None
+
+
+class GithubConnectionOut(BaseModel):
+    id: int
+    system_id: int
+    api_base_url: str
+    web_base_url: str
+    owner: str
+    repo: str
+    clone_url: str
+    installation_id: int
+    default_branch: Optional[str] = None
+    credential_type: str
+    status: GithubConnectionStatus
+    last_error: Optional[str] = None
+    created_by_user_id: Optional[int] = None
+    updated_by_user_id: Optional[int] = None
+    created_at: str
+    updated_at: str
+
+
 class AssistantAskOut(BaseModel):
     screen_id: str
     answer: str

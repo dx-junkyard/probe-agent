@@ -393,6 +393,10 @@ Docker Compose はリポジトリルートの `.env` を読み込む。ローカ
 | `CONTROL_ADMIN_PASSWORD` | _(未設定)_ | 起動時に作成する初期管理者パスワード |
 | `CONTROL_REQUIRE_AUTH` | `false` | `true` で、認証を有効化できない状態（admin 未作成かつ `CONTROL_API_KEYS` 空）なら起動を失敗させる |
 | `PUBLIC_HOST` | _(未設定)_ | `docker-compose.prod.yml` の Caddy が HTTPS で公開する FQDN |
+| `GITHUB_APP_ID` | _(未設定)_ | Publish workflow (#216) が使う GitHub App の App ID。未設定時は GitHub App 機能全体が fail closed |
+| `GITHUB_APP_PRIVATE_KEY_PATH` | _(未設定)_ | GitHub App の秘密鍵 PEM ファイルの絶対パス（secret mount を想定） |
+| `GITHUB_API_BASE_URL` | `https://api.github.com` | GitHub REST API のベース URL（GitHub Enterprise Server 向けの上書き） |
+| `GITHUB_WEB_BASE_URL` | `https://github.com` | GitHub の web/clone URL のベース（GitHub Enterprise Server 向けの上書き） |
 
 ## ライセンス
 
