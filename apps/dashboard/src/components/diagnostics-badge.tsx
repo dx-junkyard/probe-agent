@@ -357,21 +357,37 @@ export function DiagnosticsBadge() {
         <Dialog open={open} onOpenChange={setOpen}>
           <DialogHeader><DialogTitle>System State</DialogTitle></DialogHeader>
           <div className="space-y-3">
-            {items.length === 0 ? <p className="text-sm text-muted-foreground">対応が必要な状態はありません。</p> : items.map((item) => (
-              <div key={item.dedupe_key || item.state_id} className="flex items-start justify-between gap-3 rounded-lg border p-3" data-testid={`system-state-item-${item.state_id}`}>
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2"><DiagnosticSeverityIcon severity={item.severity} /><p className="text-sm font-medium">{item.summary}</p></div>
-                  {item.remediation && <p className="mt-1 text-xs text-muted-foreground">{item.remediation}</p>}
+            {items.length === 0 ? <p className="text-sm text-muted-foreground">対応が必要な状態はありません。</p> : items.map((item) => {
+              // Items projected from system_diagnostics whose underlying check has
+              // fix_kind "dialog" (env-var fixes) carry target_ui === null because
+              // those checks have no fix_page. Fall back to the diagnostic check
+              // (via related_checks[0]) so those items still get an action that
+              // opens the env fix dialog, matching the legacy badge's behavior.
+              const relatedCheck =
+                !item.target_ui && item.source === "system_diagnostics"
+                  ? data?.checks.find((c) => c.check_id === item.related_checks[0])
+                  : undefined;
+              return (
+                <div key={item.dedupe_key || item.state_id} className="flex items-start justify-between gap-3 rounded-lg border p-3" data-testid={`system-state-item-${item.state_id}`}>
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2"><DiagnosticSeverityIcon severity={item.severity} /><p className="text-sm font-medium">{item.summary}</p></div>
+                    {item.remediation && <p className="mt-1 text-xs text-muted-foreground">{item.remediation}</p>}
+                  </div>
+                  {item.target_ui && <Button size="sm" onClick={() => {
+                    const target = systemStateTarget(item);
+                    setOpen(false);
+                    if (target) navigate(target);
+                  }}>{item.target_ui.action_label || "対応する"}</Button>}
+                  {!item.target_ui && relatedCheck && <Button size="sm" onClick={() => {
+                    setOpen(false);
+                    activate(relatedCheck);
+                  }}>修正する</Button>}
                 </div>
-                {item.target_ui && <Button size="sm" onClick={() => {
-                  const target = systemStateTarget(item);
-                  setOpen(false);
-                  if (target) navigate(target);
-                }}>{item.target_ui.action_label || "対応する"}</Button>}
-              </div>
-            ))}
+              );
+            })}
           </div>
         </Dialog>
+        <EnvFixDialog check={envCheck} onClose={closeEnv} />
       </>
     );
   }

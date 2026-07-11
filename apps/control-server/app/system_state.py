@@ -957,17 +957,16 @@ def _repository_state_items(conn, system_id: int) -> List[StateItem]:
         )]
 
     items: List[StateItem] = []
-    if latest_ready is None or latest_ready["commit_sha"] != current_head:
+    if latest_ready is not None and latest_ready["commit_sha"] != current_head:
         items.append(StateItem(
             state_id="repository.snapshot.stale", state_group="repository",
             severity="warning", status="stale", user_action_kind="create_snapshot",
             intervention_timing="now", subject="Repository snapshot",
             summary="HEAD が最新 snapshot より進んでいます。",
-            detail=("現在の HEAD に対応する ready snapshot がありません。" if latest_ready is None else
-                    f"HEAD {current_head} は最新 ready snapshot #{latest_ready['id']} ({latest_ready['commit_sha']}) と異なります。"),
+            detail=f"HEAD {current_head} は最新 ready snapshot #{latest_ready['id']} ({latest_ready['commit_sha']}) と異なります。",
             remediation="Repository で新しい snapshot を作成してください。",
-            evidence={"current_head": current_head, "latest_ready_snapshot_id": latest_ready["id"] if latest_ready else None,
-                      "latest_ready_commit": latest_ready["commit_sha"] if latest_ready else None},
+            evidence={"current_head": current_head, "latest_ready_snapshot_id": latest_ready["id"],
+                      "latest_ready_commit": latest_ready["commit_sha"]},
             target_ui=TargetUi(route=PAGE_REPOSITORY, anchor=ANCHOR_SNAPSHOT_CREATE, action_label="Snapshot を作成"),
             related_checks=["snapshot_status"], related_pipeline_steps=["snapshot_ready"],
             dedupe_key="repository.snapshot.freshness",
@@ -987,6 +986,21 @@ def _repository_state_items(conn, system_id: int) -> List[StateItem]:
     return items
 
 
+def _priority_key(item: StateItem) -> tuple:
+    """Deterministic cross-surface priority ordering for one item.
+
+    Shared by ``select_primary_item`` (which additionally prefers items on
+    the current route) and ``notification_items`` (which has no route
+    context and simply wants the globally most important item first).
+    """
+    return (
+        _SEVERITY_RANK.get(item.severity, len(_SEVERITY_RANK)),
+        _TIMING_RANK.get(item.intervention_timing, len(_TIMING_RANK)),
+        _ACTION_RANK.get(item.user_action_kind, len(_ACTION_RANK)),
+        item.state_id,
+    )
+
+
 def select_primary_item(items: List[StateItem], *, route: Optional[str] = None) -> Optional[StateItem]:
     """Select the one user-facing item by the documented deterministic order."""
     actionable = [item for item in items if item.severity != "ok" and item.user_action_kind not in ("none", "wait")]
@@ -994,11 +1008,29 @@ def select_primary_item(items: List[StateItem], *, route: Optional[str] = None) 
         return None
     return min(actionable, key=lambda item: (
         0 if route and item.target_ui and item.target_ui.route == route else 1,
-        _SEVERITY_RANK.get(item.severity, len(_SEVERITY_RANK)),
-        _TIMING_RANK.get(item.intervention_timing, len(_TIMING_RANK)),
-        _ACTION_RANK.get(item.user_action_kind, len(_ACTION_RANK)),
-        item.state_id,
+        *_priority_key(item),
     ))
+
+
+def _build_page_items(items: List[StateItem]) -> Dict[str, List[StateItem]]:
+    """Group actionable (non-``ok``) items by their target route.
+
+    ``page_items[route][0]`` renders as a warning-styled action banner in the
+    dashboard, so an ``ok`` item must never appear here even if it happens to
+    carry a ``target_ui`` (hardening; no current item does both today).
+    """
+    actionable = [item for item in items if item.severity != "ok" and item.target_ui]
+    routes = sorted({item.target_ui.route for item in actionable})
+    return {
+        route: sorted(
+            [item for item in actionable if item.target_ui.route == route],
+            key=lambda item: (
+                _SEVERITY_RANK.get(item.severity, len(_SEVERITY_RANK)),
+                _TIMING_RANK.get(item.intervention_timing, len(_TIMING_RANK)), item.state_id,
+            ),
+        )
+        for route in routes
+    }
 
 
 def _dedupe_items(items: List[StateItem]) -> List[StateItem]:
@@ -1098,9 +1130,22 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
     # actionable diagnostic is also a canonical state item with the same fix
     # target.  Import at call time because diagnostics itself reuses this
     # module's understanding evaluator.
+    #
+    # Several native items above already cover a diagnostic root cause and
+    # declare it via related_checks (e.g. snapshot.ready.missing /
+    # repository.snapshot.stale -> "snapshot_status", repository config ->
+    # "repository_config", understanding items -> "system_purpose" /
+    # "system_capabilities"). Skip projecting those checks a second time so
+    # the same root cause doesn't appear twice in items/notifications with
+    # different dedupe keys (deterministic finite-set skip, Principle 6).
+    covered_check_ids = {
+        check_id for item in items for check_id in item.related_checks
+    }
     from .system_diagnostics import run_system_diagnostics
     for check in run_system_diagnostics(system_id).checks:
         if check.severity == "ok":
+            continue
+        if check.check_id in covered_check_ids:
             continue
         severity = check.severity if check.severity in SEVERITY_ORDER else "warning"
         action = "configure" if check.fix_kind == "dialog" else "inspect"
@@ -1132,13 +1177,9 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
         severity_counts=severity_counts,
         items=items,
         primary_item=select_primary_item(items),
-        notification_items=[item for item in items if item.severity in ("error", "blocked", "warning") and item.scope == "global"],
-        page_items={
-            route: sorted([item for item in items if item.target_ui and item.target_ui.route == route],
-                         key=lambda item: (
-                             _SEVERITY_RANK.get(item.severity, len(_SEVERITY_RANK)),
-                             _TIMING_RANK.get(item.intervention_timing, len(_TIMING_RANK)), item.state_id,
-                         ))
-            for route in sorted({item.target_ui.route for item in items if item.target_ui})
-        },
+        notification_items=sorted(
+            [item for item in items if item.severity in ("error", "blocked", "warning") and item.scope == "global"],
+            key=_priority_key,
+        ),
+        page_items=_build_page_items(items),
     )

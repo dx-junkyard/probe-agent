@@ -290,6 +290,50 @@ class TestSystemStateBasics:
         late = StateItem("late", "repository", "warning", "missing", "configure", "before_next_step", "x", "x", "x")
         assert select_primary_item([late, early]) is early
 
+    def test_notification_items_are_priority_ordered_not_alphabetical(self, admin_client):
+        # Regression for Issue #207/#208: notification_items used to inherit
+        # _dedupe_items' alphabetical-by-state_id order, so the dashboard's
+        # floating notice (notification_items[0]) was not the most important
+        # item. It must now match select_primary_item's own choice.
+        _, _, hdrs = _setup(admin_client)
+        data, _ = _get_state(admin_client, hdrs)
+
+        assert data["primary_item"] is not None
+        assert data["notification_items"]
+        assert data["notification_items"][0]["state_id"] == data["primary_item"]["state_id"]
+
+    def test_priority_key_sorts_severity_before_alphabetical_state_id(self):
+        from app.system_state import StateItem, _priority_key
+
+        # state_id "aaa" would sort first alphabetically, but its severity
+        # (warning) must lose to the blocked item's higher-priority severity.
+        warning_first_alpha = StateItem(
+            "aaa", "repository", "warning", "missing", "configure", "now", "x", "x", "x",
+        )
+        blocked_last_alpha = StateItem(
+            "zzz", "pipeline", "blocked", "blocked", "build", "before_next_step", "x", "x", "x",
+        )
+        ordered = sorted([warning_first_alpha, blocked_last_alpha], key=_priority_key)
+        assert [item.state_id for item in ordered] == ["zzz", "aaa"]
+
+    def test_page_items_excludes_ok_severity_even_with_target_ui(self):
+        # Hardening regression: page_items[route][0] renders as a
+        # warning-styled action banner in the dashboard, so an "ok" item must
+        # never appear there even if it carries a target_ui.
+        from app.system_state import StateItem, TargetUi, _build_page_items
+
+        ok_item = StateItem(
+            "ok.with_ui", "repository", "ok", "satisfied", "none", "none", "x", "x", "x",
+            target_ui=TargetUi(route="/repository", anchor=None, action_label="x"),
+        )
+        warning_item = StateItem(
+            "warning.with_ui", "repository", "warning", "missing", "configure", "now", "x", "x", "x",
+            target_ui=TargetUi(route="/repository", anchor=None, action_label="x"),
+        )
+        page_items = _build_page_items([ok_item, warning_item])
+        state_ids = {item.state_id for item in page_items["/repository"]}
+        assert state_ids == {"warning.with_ui"}
+
     def test_all_items_carry_finite_vocabulary(self, admin_client, tmp_path):
         _, sys, hdrs = _setup(admin_client)
         repo, sha = _init_git_repo(tmp_path)
@@ -434,6 +478,23 @@ class TestPipelineState:
         assert item["evidence"]["latest_snapshot_id"] == snap_id
         assert "snapshot.ready.missing" not in items
 
+    def test_repository_configured_without_snapshot_has_no_stale_item(self, admin_client, tmp_path):
+        # Regression for Issue #207: repository.snapshot.stale used to fire
+        # whenever latest_ready was None, duplicating snapshot.ready.missing
+        # with a misleading "HEAD が最新 snapshot より進んでいます" summary.
+        # It must only fire once a ready snapshot exists and HEAD has moved.
+        _, _, hdrs = _setup(admin_client)
+        repo, _sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+
+        _, items = _get_state(admin_client, hdrs)
+        assert "repository.snapshot.stale" not in items
+        assert "snapshot.ready.missing" in items
+
     def test_failed_run_is_failed_error_state(self, admin_client, tmp_path, monkeypatch):
         monkeypatch.setattr(
             "app.system_understanding_service._is_reasoning_model_available",
@@ -567,6 +628,27 @@ class TestDiagnosticsProjectionCompatibility:
         assert state_items["understanding.purpose.unconfirmed"]["severity"] == "warning"
         assert diag_checks["system_capabilities"]["severity"] == "warning"
         assert state_items["understanding.capabilities.unconfirmed"]["severity"] == "warning"
+
+    def test_diagnostics_covered_by_native_related_checks_are_not_duplicated(self, admin_client):
+        # Regression for Issue #207: the same root cause (no repository
+        # configured, no ready snapshot) used to appear twice in `items`:
+        # once as the native repository.configuration.missing /
+        # snapshot.ready.missing item, and again as diagnostic.repository_config
+        # / diagnostic.snapshot_status, because those native items declare
+        # the check via related_checks but build_system_state projected every
+        # non-ok diagnostic unconditionally.
+        _, _, hdrs = _setup(admin_client)
+
+        _, items = _get_state(admin_client, hdrs)
+
+        assert "repository.configuration.missing" in items
+        assert "snapshot.ready.missing" in items
+        assert "diagnostic.repository_config" not in items
+        assert "diagnostic.snapshot_status" not in items
+        # A diagnostic check with no covering native item must still be
+        # projected. In this default (no LLM configured) test setup the
+        # llm_base_config check reliably fires and has no native counterpart.
+        assert "diagnostic.llm_base_config" in items
 
 
 class TestAssistantScreenContextSharesState:
