@@ -2817,12 +2817,18 @@ class SystemUnderstandingPipelineStepOut(BaseModel):
 
 NextActionCategory = Literal["understand", "observe", "instrument", "evaluate"]
 
+# Issue #201: finite set of how a next action is carried out. "navigate" is the
+# default (link the user somewhere); "build" means the action itself triggers
+# the Build / Refresh job rather than a page link.
+NextActionKind = Literal["navigate", "build"]
+
 
 class SystemUnderstandingNextActionOut(BaseModel):
     action: str
     reason: str
     category: NextActionCategory
     link: Optional[str] = None
+    action_kind: NextActionKind = "navigate"
 
 
 class SystemUnderstandingGapSummaryOut(BaseModel):
@@ -2930,6 +2936,11 @@ class SystemUnderstandingOut(BaseModel):
     gap_summary: List[SystemUnderstandingGapSummaryOut] = Field(default_factory=list)
     metadata_coverage: Optional[SystemUnderstandingMetadataCoverageOut] = None
     next_actions: List[SystemUnderstandingNextActionOut] = Field(default_factory=list)
+    # Issue #201: single highest-priority action for the current state,
+    # derived deterministically in system_understanding_service._derive_primary_action.
+    # None when a build job is actively running (the BuildJobPanel already
+    # shows progress) so the header CTA and this card never contradict it.
+    primary_action: Optional[SystemUnderstandingNextActionOut] = None
 
 
 class CapabilityContextProbePlanOut(BaseModel):

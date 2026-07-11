@@ -857,9 +857,17 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
     next_actions = [
         SystemUnderstandingNextActionOut(
             action=a.action, reason=a.reason, category=a.category, link=a.link,
+            action_kind=a.action_kind,
         )
         for a in summary.next_actions
     ]
+    primary_action = None
+    if summary.primary_action:
+        pa = summary.primary_action
+        primary_action = SystemUnderstandingNextActionOut(
+            action=pa.action, reason=pa.reason, category=pa.category, link=pa.link,
+            action_kind=pa.action_kind,
+        )
     return SystemUnderstandingOut(
         system_id=summary.system_id,
         snapshot_id=summary.snapshot_id,
@@ -873,6 +881,7 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
         gap_summary=gap_summary,
         metadata_coverage=metadata_coverage,
         next_actions=next_actions,
+        primary_action=primary_action,
     )
 
 

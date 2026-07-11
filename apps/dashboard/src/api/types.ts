@@ -1713,11 +1713,18 @@ export interface SystemUnderstandingPipelineStep {
 
 export type NextActionCategory = "understand" | "observe" | "instrument" | "evaluate";
 
+// Issue #201: how the action is carried out. "navigate" (default) links to a
+// page; "build" triggers the Build / Refresh job directly. Optional on the
+// client type (rather than required) so it defaults to "navigate" without
+// forcing every existing next_actions fixture/mock to be updated.
+export type NextActionKind = "navigate" | "build";
+
 export interface SystemUnderstandingNextAction {
   action: string;
   reason: string;
   category: NextActionCategory;
   link?: string | null;
+  action_kind?: NextActionKind;
 }
 
 export interface SystemUnderstandingGapSummary {
@@ -1871,6 +1878,9 @@ export interface SystemUnderstandingOut {
   gap_summary: SystemUnderstandingGapSummary[];
   metadata_coverage: SystemUnderstandingMetadataCoverage | null;
   next_actions: SystemUnderstandingNextAction[];
+  // Issue #201: single highest-priority action for the current state; null
+  // while a build job is actively running.
+  primary_action?: SystemUnderstandingNextAction | null;
 }
 
 // Capability context: gaps / probe plans / experiments linked to one

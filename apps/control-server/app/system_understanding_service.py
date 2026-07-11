@@ -48,6 +48,11 @@ class PipelineStep:
 # Understand -> Decide -> Instrument -> Evaluate stages.
 NextActionCategory = Literal["understand", "observe", "instrument", "evaluate"]
 
+# Issue #201: finite set of how a next action is carried out. "navigate" (the
+# default) links the user to a page; "build" means the action triggers the
+# Build / Refresh job directly instead of navigating anywhere.
+NextActionKind = Literal["navigate", "build"]
+
 
 @dataclass
 class NextAction:
@@ -55,6 +60,7 @@ class NextAction:
     reason: str
     category: NextActionCategory
     link: Optional[str] = None
+    action_kind: NextActionKind = "navigate"
 
 
 @dataclass
@@ -85,6 +91,9 @@ class SystemUnderstandingSummary:
     gap_summary: List[GapSummary] = field(default_factory=list)
     metadata_coverage: Optional[MetadataCoverage] = None
     next_actions: List[NextAction] = field(default_factory=list)
+    # Issue #201: single highest-priority action for the current state; None
+    # while a build job is actively running.
+    primary_action: Optional[NextAction] = None
 
 
 def _check_repository_configured(conn, system_id: int) -> PipelineStep:
@@ -904,6 +913,57 @@ def _build_next_actions(
     return actions
 
 
+def _derive_primary_action(
+    pipeline: List[PipelineStep],
+    next_actions: List[NextAction],
+    latest_build: Optional[Dict[str, Any]],
+) -> Optional[NextAction]:
+    """Pure derivation of the single highest-priority action (Issue #201).
+
+    ``next_actions`` is the already-ordered state machine produced by
+    ``_build_next_actions`` above; this function does not change that
+    ordering, it only picks the one action a Hub header CTA should show,
+    using the explicit finite rules below (evaluated in order, first match
+    wins). Deterministic only (Principle 6) -- no reasoning model involved.
+
+    NOTE: a future phase may fold this into ``system_state.py`` (Issue #193,
+    System State Assessment) as one more state-machine projection alongside
+    ``StateItem``; not merged here, per this issue's non-goals.
+    """
+    step_map = {s.step: s.status for s in pipeline}
+
+    # Rule 1: repository not configured or no ready snapshot -> the existing
+    # first next_action (Configure repository / Create snapshot).
+    if (
+        step_map.get("repository_configured") != "complete"
+        or step_map.get("snapshot_ready") != "complete"
+    ):
+        return next_actions[0] if next_actions else None
+
+    # Rule 2: a build job is actively running/queued -> no primary action;
+    # BuildJobPanel already shows step-by-step progress for it.
+    if latest_build and latest_build.get("status") in ("queued", "running"):
+        return None
+
+    # Rule 3: some pipeline step (beyond repository/snapshot, already
+    # confirmed complete above) is not complete -> point at running a build,
+    # independent of which/how many steps remain.
+    incomplete_steps = [s for s in pipeline if s.status != "complete"]
+    if incomplete_steps:
+        count = len(incomplete_steps)
+        return NextAction(
+            action="Build system understanding",
+            reason=f"{count} pipeline step{'s' if count != 1 else ''} not complete yet",
+            category="understand",
+            link=None,
+            action_kind="build",
+        )
+
+    # Rule 4: everything above is satisfied -> defer to the first next_action
+    # (its generation order/priority is unchanged by this issue).
+    return next_actions[0] if next_actions else None
+
+
 def _plan_has_validated_patch(conn, plan_id: int) -> bool:
     """A plan's patch is validated when its latest baseline and probed
     validation runs both succeeded — the same finite condition the patch
@@ -996,7 +1056,18 @@ def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
             approved_plan_ids_without_patch,
             undecided_experiment_ids,
         )
-        return summary
+
+    # Issue #201: build-job lookup opens its own `get_conn()`, and the DB
+    # lock is non-reentrant, so this must run after the `with get_conn()`
+    # block above has released it (see the issue-drafts nested-lock note
+    # elsewhere in this module for the same constraint).
+    from .system_understanding_jobs import get_latest_job
+
+    latest_build = get_latest_job(system_id)
+    summary.primary_action = _derive_primary_action(
+        pipeline, summary.next_actions, latest_build,
+    )
+    return summary
 
 
 # ---------------------------------------------------------------------------

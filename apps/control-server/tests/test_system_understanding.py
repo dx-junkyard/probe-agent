@@ -139,6 +139,23 @@ class TestSystemUnderstandingGetWithoutSnapshot:
         assert len(data["next_actions"]) > 0
         assert data["next_actions"][0]["action"] == "Configure repository"
 
+    def test_primary_action_matches_configure_repository_next_action(self, admin_client, tmp_path):
+        """Issue #201: GET /repository/system-understanding exposes primary_action,
+        matching the first next_action (Configure repository, action_kind=navigate)
+        when no repository is configured yet."""
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "test-sys-primary")
+        hdrs = _headers(token, sys["id"])
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200
+        data = r.json()
+
+        assert data["primary_action"] is not None
+        assert data["primary_action"]["action"] == "Configure repository"
+        assert data["primary_action"]["action_kind"] == "navigate"
+        assert data["primary_action"] == data["next_actions"][0]
+
     def test_returns_missing_snapshot_after_config(self, admin_client, tmp_path):
         token = _login(admin_client)
         sys = _create_system(admin_client, token, "test-sys-2")
@@ -1102,3 +1119,190 @@ class TestNextActionsPriority:
         assert "Review probe plan" not in labels
         assert "Generate / validate probe patch" not in labels
         assert "Review experiment decision" not in labels
+
+
+class TestDerivePrimaryAction:
+    """Issue #201: ``_derive_primary_action`` picks the single highest-priority
+    action for the current state, using the finite rules documented in
+    docs/system-understanding-navigation.md.
+    """
+
+    def _complete_pipeline(self):
+        from app.system_understanding_service import PIPELINE_STEPS, PipelineStep
+
+        return [PipelineStep(step, "complete") for step in PIPELINE_STEPS]
+
+    def _incomplete_pipeline(self, *missing_steps):
+        from app.system_understanding_service import PipelineStep
+
+        return [
+            PipelineStep(step.step, "missing" if step.step in missing_steps else "complete")
+            for step in self._complete_pipeline()
+        ]
+
+    def test_repository_not_configured_uses_first_next_action(self):
+        from app.system_understanding_service import (
+            PipelineStep, _build_next_actions, _derive_primary_action,
+        )
+
+        pipeline = [
+            PipelineStep("repository_configured", "missing"),
+            PipelineStep("snapshot_ready", "missing"),
+        ]
+        next_actions = _build_next_actions(
+            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+        )
+        primary = _derive_primary_action(pipeline, next_actions, latest_build=None)
+
+        assert primary is not None
+        assert primary.action == "Configure repository"
+        assert primary.action_kind == "navigate"
+
+    def test_snapshot_not_ready_uses_first_next_action(self):
+        from app.system_understanding_service import (
+            PipelineStep, _build_next_actions, _derive_primary_action,
+        )
+
+        pipeline = [
+            PipelineStep("repository_configured", "complete"),
+            PipelineStep("snapshot_ready", "missing"),
+        ]
+        next_actions = _build_next_actions(
+            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+        )
+        primary = _derive_primary_action(pipeline, next_actions, latest_build=None)
+
+        assert primary is not None
+        assert primary.action == "Create snapshot"
+        assert primary.action_kind == "navigate"
+
+    def test_repository_not_configured_wins_even_if_build_is_running(self):
+        """Rule 1 is evaluated before rule 2 (build-running check)."""
+        from app.system_understanding_service import (
+            PipelineStep, _build_next_actions, _derive_primary_action,
+        )
+
+        pipeline = [
+            PipelineStep("repository_configured", "missing"),
+            PipelineStep("snapshot_ready", "missing"),
+        ]
+        next_actions = _build_next_actions(
+            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+        )
+        primary = _derive_primary_action(
+            pipeline, next_actions, latest_build={"status": "running"},
+        )
+
+        assert primary is not None
+        assert primary.action == "Configure repository"
+
+    def test_incomplete_step_with_no_build_running_offers_build_action(self):
+        from app.system_understanding_service import _build_next_actions, _derive_primary_action
+
+        pipeline = self._incomplete_pipeline("symbols_indexed")
+        next_actions = _build_next_actions(
+            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+        )
+        primary = _derive_primary_action(pipeline, next_actions, latest_build=None)
+
+        assert primary is not None
+        assert primary.action == "Build system understanding"
+        assert primary.action_kind == "build"
+        assert primary.link is None
+        assert "1" in primary.reason
+
+    def test_incomplete_step_reason_counts_all_remaining_steps(self):
+        from app.system_understanding_service import _build_next_actions, _derive_primary_action
+
+        pipeline = self._incomplete_pipeline("symbols_indexed", "entrypoints_discovered")
+        next_actions = _build_next_actions(
+            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+        )
+        primary = _derive_primary_action(pipeline, next_actions, latest_build=None)
+
+        assert primary is not None
+        assert primary.action_kind == "build"
+        assert primary.reason.startswith("2 ")
+
+    @pytest.mark.parametrize("status", ["queued", "running"])
+    def test_build_running_or_queued_suppresses_primary_action(self, status):
+        from app.system_understanding_service import _build_next_actions, _derive_primary_action
+
+        pipeline = self._incomplete_pipeline("symbols_indexed")
+        next_actions = _build_next_actions(
+            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+        )
+        primary = _derive_primary_action(
+            pipeline, next_actions, latest_build={"status": status},
+        )
+
+        assert primary is None
+
+    @pytest.mark.parametrize("status", ["completed", "failed", "partial", "cancelled"])
+    def test_settled_build_does_not_suppress_primary_action(self, status):
+        from app.system_understanding_service import _build_next_actions, _derive_primary_action
+
+        pipeline = self._incomplete_pipeline("symbols_indexed")
+        next_actions = _build_next_actions(
+            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+        )
+        primary = _derive_primary_action(
+            pipeline, next_actions, latest_build={"status": status},
+        )
+
+        assert primary is not None
+        assert primary.action_kind == "build"
+
+    def test_pipeline_complete_without_purpose_uses_define_purpose(self):
+        from app.system_understanding_service import _build_next_actions, _derive_primary_action
+
+        pipeline = self._complete_pipeline()
+        next_actions = _build_next_actions(
+            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+        )
+        primary = _derive_primary_action(pipeline, next_actions, latest_build=None)
+
+        assert primary is not None
+        assert primary.action == "Define System Purpose"
+        assert primary.link == "/interview"
+        assert primary.action_kind == "navigate"
+
+    def test_pipeline_complete_without_purpose_with_settled_build_is_unaffected(self):
+        from app.system_understanding_service import _build_next_actions, _derive_primary_action
+
+        pipeline = self._complete_pipeline()
+        next_actions = _build_next_actions(
+            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+        )
+        primary = _derive_primary_action(
+            pipeline, next_actions, latest_build={"status": "completed"},
+        )
+
+        assert primary is not None
+        assert primary.action == "Define System Purpose"
+
+    def test_fully_satisfied_uses_first_next_action(self):
+        from app.system_understanding_service import _build_next_actions, _derive_primary_action
+
+        pipeline = self._complete_pipeline()
+        next_actions = _build_next_actions(
+            pipeline,
+            purpose={"name": "Sys", "summary": "Does things"},
+            capabilities=[{"name": "Cap"}],
+            metadata_coverage=None,
+            gap_count=0,
+        )
+        primary = _derive_primary_action(pipeline, next_actions, latest_build=None)
+
+        assert primary is not None
+        assert primary.action == "Start from Capability"
+        assert primary.link == "/capability-map"
+        assert primary.action_kind == "navigate"
+
+    def test_no_next_actions_returns_none(self):
+        from app.system_understanding_service import _derive_primary_action
+
+        pipeline = self._complete_pipeline()
+        primary = _derive_primary_action(pipeline, next_actions=[], latest_build=None)
+
+        assert primary is None

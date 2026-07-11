@@ -11,9 +11,10 @@ import {
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { ContextHeader } from "@/components/layout/context-header";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useDiagnosticHighlight, DiagnosticFixCallout } from "@/components/diagnostic-fix";
+import { cn } from "@/lib/utils";
 import {
   RefreshCw, Boxes, Target,
 } from "lucide-react";
@@ -25,8 +26,50 @@ import {
 } from "@/components/system-understanding/stage-sections";
 import type {
   SystemDiagnosticCheck,
+  SystemUnderstandingNextAction,
   SystemUnderstandingOut,
 } from "@/api/types";
+
+/**
+ * Issue #201: single highest-priority CTA shown right under the Hub header,
+ * derived server-side (`primary_action`, system_understanding_service._derive_primary_action).
+ * "navigate" actions link somewhere; "build" actions trigger the same
+ * Build / Refresh job as the header button and share its disabled condition.
+ */
+function PrimaryActionCard({ action, onRunBuild, buildDisabled }: {
+  action: SystemUnderstandingNextAction;
+  onRunBuild: () => void;
+  buildDisabled: boolean;
+}) {
+  const kind = action.action_kind ?? "navigate";
+  return (
+    <Card data-testid="primary-action">
+      <CardContent className="py-4 flex items-center justify-between gap-4 flex-wrap">
+        <div>
+          <p className="text-lg font-semibold">{action.action}</p>
+          <p className="text-sm text-muted-foreground mt-1">{action.reason}</p>
+        </div>
+        {kind === "build" ? (
+          <Button
+            onClick={onRunBuild}
+            disabled={buildDisabled}
+            data-testid="primary-action-cta"
+          >
+            {action.action}
+          </Button>
+        ) : action.link ? (
+          <Link
+            to={action.link}
+            data-testid="primary-action-cta"
+            className={cn(buttonVariants({ variant: "default" }))}
+          >
+            {action.action}
+          </Link>
+        ) : null}
+      </CardContent>
+    </Card>
+  );
+}
 
 function EntryCards() {
   return (
@@ -376,6 +419,14 @@ export default function SystemUnderstandingPage() {
           )}
         </Button>
       </div>
+
+      {data?.primary_action && (
+        <PrimaryActionCard
+          action={data.primary_action}
+          onRunBuild={() => build.mutate()}
+          buildDisabled={build.isPending || buildRunning}
+        />
+      )}
 
       <DiagnosticFixCallout anchor="build" />
 

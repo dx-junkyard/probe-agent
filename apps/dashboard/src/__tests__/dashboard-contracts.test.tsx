@@ -3609,6 +3609,111 @@ describe("System Understanding page", () => {
     // Existing draft flips the action button label to "Open issue draft".
     expect(screen.getByText("Open issue draft")).toBeTruthy();
   });
+
+  // ── Primary action card (Issue #201) ──────────────────────────────
+
+  test("renders a navigate primary_action as a link button under the header", async () => {
+    const response = {
+      ...completeResponse,
+      next_actions: [
+        { action: "Define System Purpose", reason: "Pipeline completed, but no system purpose is defined yet.", category: "understand", link: "/interview" },
+      ],
+      primary_action: {
+        action: "Define System Purpose",
+        reason: "Pipeline completed, but no system purpose is defined yet.",
+        category: "understand",
+        link: "/interview",
+        action_kind: "navigate",
+      },
+    };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(response)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("primary-action")).toBeTruthy();
+    });
+
+    const card = screen.getByTestId("primary-action");
+    expect(card.textContent).toContain("Define System Purpose");
+    expect(card.textContent).toContain("Pipeline completed, but no system purpose is defined yet.");
+
+    const cta = screen.getByTestId("primary-action-cta");
+    expect(cta.getAttribute("href")).toBe("/interview");
+  });
+
+  test("renders a build primary_action that triggers build.mutate on click", async () => {
+    const midResponse = {
+      ...emptyResponse,
+      snapshot_id: 5,
+      commit_sha: "abc12345",
+      pipeline: [
+        { step: "repository_configured", status: "complete" },
+        { step: "snapshot_ready", status: "complete" },
+        { step: "documentation_indexed", status: "missing" },
+        { step: "documentation_claims_scanned", status: "missing" },
+        { step: "symbols_indexed", status: "missing" },
+        { step: "entrypoints_discovered", status: "missing" },
+        { step: "docs_code_reconciled", status: "missing" },
+        { step: "capability_hierarchy_ready", status: "missing" },
+      ],
+      primary_action: {
+        action: "Build system understanding",
+        reason: "6 pipeline steps not complete yet",
+        category: "understand",
+        link: null,
+        action_kind: "build",
+      },
+    };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(midResponse)
+        : Promise.resolve(null),
+    );
+    mockApi.post.mockImplementation((path: string) =>
+      path === "/repository/system-understanding/build"
+        ? Promise.resolve(completeResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("primary-action")).toBeTruthy();
+    });
+
+    const cta = screen.getByTestId("primary-action-cta");
+    expect(cta.textContent).toContain("Build system understanding");
+
+    fireEvent.click(cta);
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/repository/system-understanding/build");
+    });
+  });
+
+  test("hides the primary action card when primary_action is null", async () => {
+    const response = { ...completeResponse, primary_action: null };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(response)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByText("Test System")).toBeTruthy();
+    });
+
+    expect(screen.queryByTestId("primary-action")).toBeNull();
+  });
 });
 
 // ── System settings diagnostics (Issue #101) ────────────────────────

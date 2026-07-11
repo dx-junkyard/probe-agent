@@ -249,6 +249,42 @@ Hub の Understand stage と Decide Where to Observe stage の Related pages に
 api_boundary_mapping / probe_flow_selection）が Understand と Decide Where to
 Observe の両方に対応するためである。
 
+### Primary Action（Issue #201）
+
+`GET /system-understanding`（`GET /repository/system-understanding`）は
+`next_actions`（stage 別リスト）に加えて、優先度最上位の action を単一の
+`primary_action` として返す。Hub のページヘッダー（タイトル + Build /
+Refresh ボタン）の直下に、`primary_action` を表示する単一カードが常時
+1 枚だけ表示される（`data-testid="primary-action"`）。`next_actions` の
+内容・順序はこの導入によって変わらない。
+
+`primary_action`（および `next_actions` の各要素）は `action_kind` を持つ:
+有限集合 `{"navigate", "build"}`（既定 `"navigate"`）。`navigate` は
+`link` へのページ遷移、`build` は Build / Refresh ジョブを直接起動する
+ボタンを意味する。
+
+導出は `apps/control-server/app/system_understanding_service.py` の
+`_derive_primary_action(pipeline, next_actions, latest_build)` という純粋関数
+（`_build_next_actions` の結果と最新 build job の状態のみを入力に取る）が
+担い、以下のルールを上から順に評価し、最初に該当したものを返す
+（Principle 6: 有限集合に対する明示的分岐のみ、推論なし）:
+
+| # | 条件 | 結果 |
+| --- | --- | --- |
+| 1 | `repository_configured` または `snapshot_ready` が `complete` でない | `next_actions[0]`（Configure repository / Create snapshot、`action_kind="navigate"`） |
+| 2 | 最新 build job が `queued` / `running` | `primary_action = None`（BuildJobPanel が進捗を表示するため CTA を出さない） |
+| 3 | pipeline に `complete` でない step がある（#1 で対象外の repository/snapshot 以外） | `action="Build system understanding"`, `action_kind="build"`, `link=None`、reason に未完了 step 数を含める。個別 step の修復 action（Index code symbols 等）は従来どおり `next_actions` に残る |
+| 4 | 上記いずれにも該当しない | `next_actions[0]`（現行の生成順のまま。全充足時は `Start from Capability`） |
+
+ルール 2 の build 実行状態は、既存の最新 build job 取得関数
+（`system_understanding_jobs.get_latest_job`）をそのまま再利用する。DB ロックは
+非再入なので、この呼び出しは `get_system_understanding` の
+`with get_conn()` ブロックを抜けたあとに行う。
+
+将来的に `apps/control-server/app/system_state.py`（System State Assessment、
+Issue #193）へ統合される可能性があるが、本 issue ではまだ統合しない
+（`_derive_primary_action` のコメント参照）。
+
 ## Feature Map から始める場合
 
 Feature Map は「ユーザー価値」を起点とする探索パスを提供する。
