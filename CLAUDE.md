@@ -79,10 +79,12 @@ creating incomplete persistence or execution paths for later phases.
      reuses the #25 approval/patch/validate/apply gates
    - see the Issue #168 section in `docs/project-intelligence.md`
 
-The existing `GET /project-intelligence` endpoint and the Repository,
-Feature Map, Probe Planner, and Experiments tabs are explicit mocks. Replace
-each mock only when implementing its owning issue; do not silently present
-mock data as persisted or analyzed data.
+The Repository, Feature Map, Probe Planner, and Experiments tabs are no
+longer whole-page mocks: they call real Control Server endpoints, and
+`is_mock` badges mark mock LLM output per response (provenance labeling,
+not page status). The old `GET /project-intelligence` mock endpoint has
+been removed. The rule that remains: do not silently present mock LLM
+data as persisted or analyzed data — mark it visibly wherever it appears.
 
 A conversational system-understanding interview that proposes `probe-agent:`
 docstring metadata and probe instrumentation together (see Principle 8) is a
