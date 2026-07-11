@@ -364,7 +364,13 @@ function DataView({ data, checksByStep, onRunBuild, buildDisabled }: {
         )}
 
         {/* Docs-Code Gap Worklist */}
-        <GapWorklist gaps={data.gaps} gapSummary={data.gap_summary} snapshotId={data.snapshot_id} commitSha={data.commit_sha} />
+        <GapWorklist
+          gaps={data.gaps}
+          gapSummary={data.gap_summary}
+          gapTrend={data.gap_trend}
+          snapshotId={data.snapshot_id}
+          commitSha={data.commit_sha}
+        />
       </StageSection>
 
       <StageSection
@@ -524,6 +530,33 @@ export default function SystemUnderstandingPage() {
           )}
         </Button>
       </div>
+
+      {/* Issue #203: the improvement-loop banner — a materialized Interview
+          change is newer than the latest completed build, so the current
+          understanding no longer reflects it. Hidden while a build is
+          actively running (the BuildJobPanel already shows progress, and a
+          fresh build is about to make this stale anyway). */}
+      {data?.understanding_refresh_recommended && !buildRunning && (
+        <Card data-testid="refresh-recommended-banner">
+          <CardContent className="py-4 flex items-center justify-between gap-4 flex-wrap">
+            <div>
+              <p className="text-sm font-medium">
+                Interview の変更が理解にまだ反映されていません
+              </p>
+              <p className="text-sm text-muted-foreground mt-1">
+                Interview で確定した変更を反映するには、システム理解を再ビルドしてください。
+              </p>
+            </div>
+            <Button
+              onClick={() => build.mutate()}
+              disabled={build.isPending}
+              data-testid="refresh-recommended-cta"
+            >
+              Build / Refresh
+            </Button>
+          </CardContent>
+        </Card>
+      )}
 
       {data?.primary_action && (
         <PrimaryActionCard

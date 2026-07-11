@@ -3858,6 +3858,124 @@ describe("System Understanding page", () => {
       "Trace comparisons, experiment runs, and adoption decisions live in Experiments",
     );
   });
+
+  // ── Gap trend + refresh recommendation (Issue #203) ─────────────────
+
+  test("shows the refresh-recommended banner when understanding_refresh_recommended is true", async () => {
+    const response = { ...completeResponse, understanding_refresh_recommended: true };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(response)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("refresh-recommended-banner")).toBeTruthy();
+    });
+
+    const cta = screen.getByTestId("refresh-recommended-cta");
+    fireEvent.click(cta);
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/repository/system-understanding/build");
+    });
+  });
+
+  test("hides the refresh-recommended banner while a build is running, even if recommended", async () => {
+    const response = { ...completeResponse, understanding_refresh_recommended: true };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(response);
+      if (path === "/repository/system-understanding/build/latest") {
+        return Promise.resolve({
+          id: 1, job_id: 1, run_id: 1, system_id: 1, snapshot_id: 5,
+          status: "running", current_step: "claim_scan", error: null,
+          cancel_requested: false, is_stuck: false,
+          heartbeat_at: Date.now() / 1000, started_at: Date.now() / 1000,
+          completed_at: null, created_at: Date.now() / 1000,
+          steps: [], llm_tasks: { total: 0, pending: 0, running: 0, completed: 0, failed: 0, cancelled: 0, reused: 0 },
+          artifact_counts: {},
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("build-progress")).toBeTruthy();
+    });
+
+    expect(screen.queryByTestId("refresh-recommended-banner")).toBeNull();
+  });
+
+  test("does not show the refresh-recommended banner when understanding_refresh_recommended is false", async () => {
+    const response = { ...completeResponse, understanding_refresh_recommended: false };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(response)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByText("Test System")).toBeTruthy();
+    });
+
+    expect(screen.queryByTestId("refresh-recommended-banner")).toBeNull();
+  });
+
+  test("renders gap_trend increase/decrease chips in the gap worklist", async () => {
+    const response = {
+      ...gapWorklistResponse,
+      gap_trend: [
+        { gap_type: "docs_only", current: 8, previous: 12 },
+        { gap_type: "code_only", current: 3, previous: 1 },
+      ],
+    };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(response)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("gap-trend")).toBeTruthy();
+    });
+
+    const trend = screen.getByTestId("gap-trend");
+    expect(trend.textContent).toContain("docs_only");
+    expect(trend.textContent).toContain("12");
+    expect(trend.textContent).toContain("8");
+    expect(trend.textContent).toContain("code_only");
+    expect(trend.textContent).toContain("1");
+    expect(trend.textContent).toContain("3");
+  });
+
+  test("renders no gap trend section when gap_trend is empty or missing (backward compat)", async () => {
+    // gapWorklistResponse predates Issue #203 and has no `gap_trend` field.
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(gapWorklistResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("gap-worklist")).toBeTruthy();
+    });
+
+    expect(screen.queryByTestId("gap-trend")).toBeNull();
+  });
 });
 
 // ── System settings diagnostics (Issue #101) ────────────────────────

@@ -327,6 +327,85 @@ approved plan 総数、experiment 総数、decision 記録済み experiment 数�
 `status = 'completed' AND human_decision`条件を反転させたクエリ
 （`!= 'undecided'`）で求める。新しい判定基準を発明しない。
 
+### 改善ループ: Interview → Build / Refresh → gap trend（Issue #203）
+
+Build → gap 確認 → Interview で修正 → 再 Build → gap 減少、という改善サイクル
+の「戻り」を Hub 上で可視化する。ここで扱うのは gap の**件数**の履歴のみで、
+gap の中身（title/evidence 等）は従来どおり毎回 `_collect_gaps` /
+`_compute_gap_summary` で再計算される（履歴化されない）。
+
+#### gap 件数履歴テーブル
+
+`system_understanding_gap_history`（`apps/control-server/app/db.py`、この
+issue が所有する唯一の新規テーブル）は 1 行が「ある build のある
+gap_type の件数」を表す。
+
+```sql
+CREATE TABLE IF NOT EXISTS system_understanding_gap_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id   INTEGER NOT NULL,
+    snapshot_id INTEGER,
+    build_id    INTEGER NOT NULL,
+    gap_type    TEXT NOT NULL,
+    count       INTEGER NOT NULL,
+    created_at  REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (build_id) REFERENCES system_understanding_builds (id) ON DELETE CASCADE
+);
+```
+
+書き込みは `apps/control-server/app/system_understanding_jobs.py` の
+`_finalize_job` が build job を `completed` または `partial` に確定させた
+直後（同じ `get_conn()` ブロック内、既存の build 更新 UPDATE の後）に
+`_record_gap_history` を呼んで行う。`failed` / `cancelled` では書き込まない。
+gap 集計は read パスと全く同じ関数（`_load_gaps_from_reconciler` +
+`_compute_gap_summary`）を再利用し、独自の集計ロジックは持たない。ある
+gap_type の件数が 0 の build は、その gap_type の行を書かない（「行が無い」
+=「0 件」として trend 読み出し側と解釈を揃える。ダミー行は作らない）。
+
+#### gap_trend（トレンド比較）
+
+`GET /system-understanding` は `gap_trend`（`{gap_type, current, previous}`
+の配列）を返す。導出は `system_understanding_service._load_gap_trend` で、
+同一 system 内で `system_understanding_gap_history` に記録された
+**直近 2 つの build_id**（`DISTINCT build_id ORDER BY build_id DESC LIMIT 2`）
+を比較する。snapshot をまたいでも構わない（同一 system 内の直前 build との
+比較であり、snapshot の異同は問わない）。
+
+- 両方の build に存在する gap_type: `previous`/`current` はそれぞれの件数
+- 古い build にのみ存在した gap_type（解消）: `current = 0`
+- 新しい build にのみ存在した gap_type（新出）: `previous = 0`
+- 履歴のある build が 1 つ以下の system は `gap_trend = []`
+
+`gap_trend` は timestamp 比較と件数集計のみの deterministic な結果であり
+（Principle 6）、reasoning model は関与しない。
+
+#### understanding_refresh_recommended（再 Build 促し）
+
+`GET /system-understanding` は `understanding_refresh_recommended`
+（bool）も返す。導出は
+`system_understanding_service._check_understanding_refresh_recommended` で、
+同一 system の `interview_session.materialized_at` の最大値が、最新の
+`status = 'completed'` build の `completed_at` より新しいときに `true` に
+なる。materialize 済みセッションが無い、または `completed` build が一度も
+無い system は `false`。単純な timestamp 比較のみで reasoning model は
+関与しない。
+
+#### Dashboard
+
+- `apps/dashboard/src/pages/system-understanding.tsx`: `understanding_refresh_recommended`
+  が `true` のときヘッダー直下・`PrimaryActionCard` の近くに
+  `data-testid="refresh-recommended-banner"` のバナーを表示する。CTA
+  （`data-testid="refresh-recommended-cta"`）は既存の Build / Refresh
+  ボタンと同じ `build.mutate()` を呼ぶ。build 実行中（`buildRunning`）は
+  バナーごと非表示になる。
+- `apps/dashboard/src/components/system-understanding/gap-worklist.tsx`:
+  `gapTrend` prop（optional）を受け取り、ヘッダー付近に
+  `data-testid="gap-trend"` として gap_type ごとの `previous → current`
+  を表示する。件数が減少（`current < previous`）した gap_type は視覚的に
+  ポジティブな配色にする。`gapTrend` が空または未指定のときは何も描画しない
+  （既存レスポンス/フィクスチャとの後方互換）。
+
 ## Feature Map から始める場合
 
 Feature Map は「ユーザー価値」を起点とする探索パスを提供する。

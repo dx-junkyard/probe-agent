@@ -1617,3 +1617,175 @@ class TestSystemUnderstandingStagesInApiResponse:
         by_stage = {s["stage"]: s for s in r.json()["stages"]}
         assert by_stage["instrument"]["status"] == "in_progress"
         assert by_stage["instrument"]["counts"]["proposed"] == 1
+
+
+class TestGapTrendAndRefreshRecommended:
+    """Issue #203: GET /repository/system-understanding exposes ``gap_trend``
+    (before/after gap counts across the last two settled builds, read back
+    from system_understanding_gap_history) and
+    ``understanding_refresh_recommended`` (a materialized Interview change
+    postdating the latest completed build). Both are plain deterministic
+    reads -- no reasoning model involved."""
+
+    def _setup_system(self, admin_client, tmp_path, name):
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, name)
+        hdrs = _headers(token, sys["id"])
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap_r = admin_client.post(
+            "/repository/snapshots", json={"commit_sha": sha}, headers=hdrs
+        )
+        snapshot_id = snap_r.json()["id"]
+        return sys["id"], hdrs, snapshot_id
+
+    def _insert_build(self, system_id, snapshot_id, status, completed_at=None):
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            return conn.execute(
+                """INSERT INTO system_understanding_builds
+                       (system_id, snapshot_id, status, completed_at, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (system_id, snapshot_id, status, completed_at, completed_at or 0),
+            ).lastrowid
+
+    def _insert_gap_history(self, system_id, snapshot_id, build_id, counts):
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            for gap_type, count in counts.items():
+                conn.execute(
+                    """INSERT INTO system_understanding_gap_history
+                           (system_id, snapshot_id, build_id, gap_type, count, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (system_id, snapshot_id, build_id, gap_type, count, 0),
+                )
+
+    def _insert_materialized_session(self, system_id, snapshot_id, materialized_at):
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO interview_session
+                       (system_id, snapshot_id, materialized_at, created_at, updated_at)
+                   VALUES (?, ?, ?, 0, 0)""",
+                (system_id, snapshot_id, materialized_at),
+            )
+
+    def test_fewer_than_two_settled_builds_returns_empty_trend(self, admin_client, tmp_path):
+        system_id, hdrs, snapshot_id = self._setup_system(admin_client, tmp_path, "gap-trend-one-build")
+        build_id = self._insert_build(system_id, snapshot_id, "completed", completed_at=10)
+        self._insert_gap_history(system_id, snapshot_id, build_id, {"docs_only": 5})
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        assert r.json()["gap_trend"] == []
+
+    def test_two_builds_reports_current_previous_new_and_resolved_gap_types(
+        self, admin_client, tmp_path
+    ):
+        system_id, hdrs, snapshot_id = self._setup_system(admin_client, tmp_path, "gap-trend-two-builds")
+        build1 = self._insert_build(system_id, snapshot_id, "completed", completed_at=10)
+        self._insert_gap_history(
+            system_id, snapshot_id, build1,
+            {"docs_only": 12, "unclassified_entrypoint": 2},
+        )
+        build2 = self._insert_build(system_id, snapshot_id, "partial", completed_at=20)
+        self._insert_gap_history(
+            system_id, snapshot_id, build2,
+            {"docs_only": 8, "code_only": 3},
+        )
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        trend = {t["gap_type"]: t for t in r.json()["gap_trend"]}
+
+        # docs_only: present in both builds -> improved (12 -> 8).
+        assert trend["docs_only"]["previous"] == 12
+        assert trend["docs_only"]["current"] == 8
+        # unclassified_entrypoint: only in the older build -> resolved (current=0).
+        assert trend["unclassified_entrypoint"]["previous"] == 2
+        assert trend["unclassified_entrypoint"]["current"] == 0
+        # code_only: only in the newer build -> newly appeared (previous=0).
+        assert trend["code_only"]["previous"] == 0
+        assert trend["code_only"]["current"] == 3
+
+    def test_gap_trend_uses_the_two_most_recent_settled_builds(self, admin_client, tmp_path):
+        """A third, most-recent build's history supersedes the first two --
+        the comparison is always against the two most recent settled builds,
+        not the first two ever recorded."""
+        system_id, hdrs, snapshot_id = self._setup_system(admin_client, tmp_path, "gap-trend-three-builds")
+        build1 = self._insert_build(system_id, snapshot_id, "completed", completed_at=10)
+        self._insert_gap_history(system_id, snapshot_id, build1, {"docs_only": 20})
+        build2 = self._insert_build(system_id, snapshot_id, "completed", completed_at=20)
+        self._insert_gap_history(system_id, snapshot_id, build2, {"docs_only": 12})
+        build3 = self._insert_build(system_id, snapshot_id, "completed", completed_at=30)
+        self._insert_gap_history(system_id, snapshot_id, build3, {"docs_only": 4})
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        trend = {t["gap_type"]: t for t in r.json()["gap_trend"]}
+        assert trend["docs_only"]["previous"] == 12
+        assert trend["docs_only"]["current"] == 4
+
+    def test_refresh_recommended_true_after_materialize_before_rebuild(self, admin_client, tmp_path):
+        system_id, hdrs, snapshot_id = self._setup_system(admin_client, tmp_path, "refresh-true-sys")
+        self._insert_build(system_id, snapshot_id, "completed", completed_at=10)
+        self._insert_materialized_session(system_id, snapshot_id, materialized_at=20)
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        assert r.json()["understanding_refresh_recommended"] is True
+
+    def test_refresh_recommended_false_after_rebuild_postdates_materialize(self, admin_client, tmp_path):
+        system_id, hdrs, snapshot_id = self._setup_system(admin_client, tmp_path, "refresh-false-sys")
+        self._insert_materialized_session(system_id, snapshot_id, materialized_at=10)
+        self._insert_build(system_id, snapshot_id, "completed", completed_at=20)
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        assert r.json()["understanding_refresh_recommended"] is False
+
+    def test_refresh_recommended_false_without_materialized_session(self, admin_client, tmp_path):
+        system_id, hdrs, snapshot_id = self._setup_system(admin_client, tmp_path, "refresh-no-session-sys")
+        self._insert_build(system_id, snapshot_id, "completed", completed_at=10)
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        assert r.json()["understanding_refresh_recommended"] is False
+
+    def test_refresh_recommended_false_without_completed_build(self, admin_client, tmp_path):
+        system_id, hdrs, snapshot_id = self._setup_system(admin_client, tmp_path, "refresh-no-build-sys")
+        self._insert_materialized_session(system_id, snapshot_id, materialized_at=10)
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        assert r.json()["understanding_refresh_recommended"] is False
+
+    def test_gap_trend_and_refresh_recommended_isolated_by_system(self, admin_client, tmp_path):
+        system_a, hdrs_a, snap_a = self._setup_system(admin_client, tmp_path, "gap-trend-iso-a")
+        build_a1 = self._insert_build(system_a, snap_a, "completed", completed_at=10)
+        self._insert_gap_history(system_a, snap_a, build_a1, {"docs_only": 12})
+        build_a2 = self._insert_build(system_a, snap_a, "completed", completed_at=20)
+        self._insert_gap_history(system_a, snap_a, build_a2, {"docs_only": 8})
+        self._insert_materialized_session(system_a, snap_a, materialized_at=30)
+
+        token = _login(admin_client)
+        sys_b = _create_system(admin_client, token, "gap-trend-iso-b")
+        hdrs_b = _headers(token, sys_b["id"])
+
+        r_a = admin_client.get("/repository/system-understanding", headers=hdrs_a)
+        assert r_a.status_code == 200, r_a.text
+        assert r_a.json()["gap_trend"] != []
+        assert r_a.json()["understanding_refresh_recommended"] is True
+
+        # System B has none of System A's history/materialize state.
+        r_b = admin_client.get("/repository/system-understanding", headers=hdrs_b)
+        assert r_b.status_code == 200, r_b.text
+        assert r_b.json()["gap_trend"] == []
+        assert r_b.json()["understanding_refresh_recommended"] is False

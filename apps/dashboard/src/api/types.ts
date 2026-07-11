@@ -1878,6 +1878,13 @@ export interface SystemUnderstandingStageStatus {
   counts: Record<string, number>;
 }
 
+// Issue #203: before/after gap counts across the last two settled builds.
+export interface SystemUnderstandingGapTrend {
+  gap_type: string;
+  current: number;
+  previous: number;
+}
+
 export interface SystemUnderstandingOut {
   system_id: number;
   snapshot_id: number | null;
@@ -1897,6 +1904,12 @@ export interface SystemUnderstandingOut {
   // Issue #202: per-stage completion status + counts. Optional so existing
   // fixtures/mocks that predate this field keep working (backward compat).
   stages?: SystemUnderstandingStageStatus[];
+  // Issue #203: gap-count trend across the last two settled builds (empty
+  // until 2 builds have recorded history), and whether a materialized
+  // Interview change post-dates the latest completed build. Optional for
+  // backward compat with fixtures/mocks that predate this field.
+  gap_trend?: SystemUnderstandingGapTrend[];
+  understanding_refresh_recommended?: boolean;
 }
 
 // Capability context: gaps / probe plans / experiments linked to one

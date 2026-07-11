@@ -806,6 +806,7 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
         SystemUnderstandingGapEntrypointRef,
         IssueDraftRefOut,
         SystemUnderstandingStageStatusOut,
+        SystemUnderstandingGapTrendOut,
     )
     pipeline = [
         SystemUnderstandingPipelineStepOut(step=s.step, status=s.status, detail=s.detail)
@@ -873,6 +874,10 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
         SystemUnderstandingStageStatusOut(stage=s.stage, status=s.status, counts=s.counts)
         for s in summary.stages
     ]
+    gap_trend = [
+        SystemUnderstandingGapTrendOut(gap_type=gt.gap_type, current=gt.current, previous=gt.previous)
+        for gt in summary.gap_trend
+    ]
     return SystemUnderstandingOut(
         system_id=summary.system_id,
         snapshot_id=summary.snapshot_id,
@@ -888,6 +893,8 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
         next_actions=next_actions,
         primary_action=primary_action,
         stages=stages,
+        gap_trend=gap_trend,
+        understanding_refresh_recommended=summary.understanding_refresh_recommended,
     )
 
 

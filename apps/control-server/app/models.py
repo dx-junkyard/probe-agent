@@ -2937,6 +2937,16 @@ class SystemUnderstandingStageStatusOut(BaseModel):
     counts: Dict[str, int] = Field(default_factory=dict)
 
 
+# Issue #203: deterministic before/after comparison of gap counts between the
+# two most recent settled (completed/partial) builds of the same system,
+# read back from system_understanding_gap_history. A gap_type present in
+# only one of the two builds has 0 on the side where it did not appear.
+class SystemUnderstandingGapTrendOut(BaseModel):
+    gap_type: str
+    current: int
+    previous: int
+
+
 class SystemUnderstandingOut(BaseModel):
     system_id: int
     snapshot_id: Optional[int] = None
@@ -2958,6 +2968,11 @@ class SystemUnderstandingOut(BaseModel):
     # Issue #202: deterministic completion status + counts for each of the 4
     # Hub stages (understand / observe / instrument / evaluate).
     stages: List[SystemUnderstandingStageStatusOut] = Field(default_factory=list)
+    # Issue #203: gap-count trend across the last two settled builds (empty
+    # until 2 builds have recorded history), plus whether a materialized
+    # Interview change is newer than the latest completed build.
+    gap_trend: List[SystemUnderstandingGapTrendOut] = Field(default_factory=list)
+    understanding_refresh_recommended: bool = False
 
 
 class CapabilityContextProbePlanOut(BaseModel):

@@ -80,6 +80,14 @@ class StageStatus:
     counts: Dict[str, int] = field(default_factory=dict)
 
 
+# Issue #203: before/after gap counts across the last two settled builds.
+@dataclass
+class GapTrend:
+    gap_type: str
+    current: int
+    previous: int
+
+
 @dataclass
 class MetadataCoverage:
     symbol_count: int = 0
@@ -107,6 +115,11 @@ class SystemUnderstandingSummary:
     primary_action: Optional[NextAction] = None
     # Issue #202: completion status + counts for each of the 4 Hub stages.
     stages: List[StageStatus] = field(default_factory=list)
+    # Issue #203: gap-count trend across the last two settled builds, and
+    # whether a materialized Interview change post-dates the latest completed
+    # build (both deterministic, no reasoning model involved).
+    gap_trend: List[GapTrend] = field(default_factory=list)
+    understanding_refresh_recommended: bool = False
 
 
 def _check_repository_configured(conn, system_id: int) -> PipelineStep:
@@ -1149,6 +1162,78 @@ def _derive_stage_statuses(
     return stages
 
 
+def _load_gap_trend(conn, system_id: int) -> List[GapTrend]:
+    """Compare per-gap_type counts between the two most recent settled builds
+    that recorded gap history (Issue #203).
+
+    Reads only persisted history rows (written at build finalize time in
+    system_understanding_jobs._record_gap_history) -- it never recomputes
+    gaps here, so the trend reflects what was true for each build's snapshot
+    at the time it settled. Fewer than 2 builds with recorded history yields
+    an empty list. A gap_type present in only one of the two builds gets 0
+    on the side where it is absent (new gap_type: previous=0; resolved
+    gap_type: current=0).
+    """
+    build_rows = conn.execute(
+        """SELECT DISTINCT build_id FROM system_understanding_gap_history
+           WHERE system_id = ? ORDER BY build_id DESC LIMIT 2""",
+        (system_id,),
+    ).fetchall()
+    build_ids = [r["build_id"] for r in build_rows]
+    if len(build_ids) < 2:
+        return []
+    current_build_id, previous_build_id = build_ids[0], build_ids[1]
+
+    def _counts_for(build_id: int) -> Dict[str, int]:
+        rows = conn.execute(
+            """SELECT gap_type, count FROM system_understanding_gap_history
+               WHERE system_id = ? AND build_id = ?""",
+            (system_id, build_id),
+        ).fetchall()
+        return {r["gap_type"]: r["count"] for r in rows}
+
+    current_counts = _counts_for(current_build_id)
+    previous_counts = _counts_for(previous_build_id)
+    gap_types = sorted(set(current_counts) | set(previous_counts))
+    return [
+        GapTrend(
+            gap_type=gt,
+            current=current_counts.get(gt, 0),
+            previous=previous_counts.get(gt, 0),
+        )
+        for gt in gap_types
+    ]
+
+
+def _check_understanding_refresh_recommended(conn, system_id: int) -> bool:
+    """True when a materialized Interview change post-dates the latest
+    completed build (Issue #203) -- a plain timestamp comparison over
+    persisted rows, no reasoning model involved (Principle 6).
+
+    False when no session has been materialized yet, or no build has ever
+    completed for this system.
+    """
+    materialized_row = conn.execute(
+        """SELECT MAX(materialized_at) AS latest FROM interview_session
+           WHERE system_id = ? AND materialized_at IS NOT NULL""",
+        (system_id,),
+    ).fetchone()
+    latest_materialized_at = materialized_row["latest"] if materialized_row else None
+    if latest_materialized_at is None:
+        return False
+
+    build_row = conn.execute(
+        """SELECT completed_at FROM system_understanding_builds
+           WHERE system_id = ? AND status = 'completed'
+           ORDER BY id DESC LIMIT 1""",
+        (system_id,),
+    ).fetchone()
+    if build_row is None or build_row["completed_at"] is None:
+        return False
+
+    return latest_materialized_at > build_row["completed_at"]
+
+
 def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
     """Read-only: aggregate persisted state into a system understanding summary."""
     with get_conn() as conn:
@@ -1215,6 +1300,16 @@ def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
             len(undecided_experiment_ids),
             decided_experiment_count,
             total_experiment_count,
+        )
+
+        # Issue #203: gap-count trend and refresh recommendation are plain
+        # SELECTs against this same connection (system_understanding_builds /
+        # interview_session / system_understanding_gap_history), so they run
+        # inside this block rather than needing a second get_conn() like the
+        # primary_action build-job lookup below.
+        summary.gap_trend = _load_gap_trend(conn, system_id)
+        summary.understanding_refresh_recommended = _check_understanding_refresh_recommended(
+            conn, system_id
         )
 
     # Issue #201: build-job lookup opens its own `get_conn()`, and the DB
