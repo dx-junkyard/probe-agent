@@ -3598,11 +3598,11 @@ class GithubAppStatusOut(BaseModel):
 
 
 class GithubConnectionCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     owner: str = Field(..., min_length=1)
     repo: str = Field(..., min_length=1)
     installation_id: int
-    api_base_url: Optional[str] = None
-    web_base_url: Optional[str] = None
 
 
 class GithubConnectionOut(BaseModel):

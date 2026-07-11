@@ -29,6 +29,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.parse
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Mapping, Optional
 
@@ -126,6 +127,40 @@ def _validate_within_root(path: str, root: str) -> str:
     return path
 
 
+def _validate_clone_url(url: str, *, owner: Optional[str] = None, repo: Optional[str] = None) -> str:
+    """Accept only canonical github.com HTTPS clone URLs without credentials."""
+    if not isinstance(url, str):
+        raise RepoManagerError("Invalid GitHub remote URL")
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        raise RepoManagerError("Invalid GitHub remote URL") from None
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "github.com"
+        or parsed.port not in (None, 443)
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RepoManagerError("GitHub remote destination is not allowed")
+    expected_path = f"/{owner}/{repo}.git" if owner and repo else None
+    if expected_path is not None and parsed.path != expected_path:
+        raise RepoManagerError("GitHub remote does not match the connection")
+    if not re.fullmatch(r"/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.git", parsed.path):
+        raise RepoManagerError("Invalid GitHub remote URL")
+    return url
+
+
+def _connection_clone_url(connection_row: Mapping[str, Any]) -> str:
+    return _validate_clone_url(
+        connection_row.get("clone_url", ""),
+        owner=connection_row.get("owner"),
+        repo=connection_row.get("repo"),
+    )
+
+
 # --- layout ----------------------------------------------------------------
 
 
@@ -212,12 +247,22 @@ def _run_git(
     env_extra: Optional[Dict[str, str]] = None,
 ) -> subprocess.CompletedProcess:
     env = os.environ.copy()
+    env.update({
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+    })
     if env_extra:
         env.update(env_extra)
     secret = (env_extra or {}).get("GIT_PUBLISH_TOKEN", "")
     try:
         return subprocess.run(
-            ["git", "-c", f"safe.directory={cwd}", "-c", "credential.helper=", "-C", cwd] + args,
+            [
+                "git", "-c", f"safe.directory={cwd}",
+                "-c", "credential.helper=", "-c", "core.hooksPath=/dev/null",
+                "-c", "protocol.allow=never", "-c", "protocol.https.allow=always",
+                "-c", "submodule.recurse=false", "-C", cwd,
+            ] + args,
             capture_output=True,
             timeout=timeout,
             env=env,
@@ -234,6 +279,43 @@ def _stderr(result: subprocess.CompletedProcess, *secrets: str) -> str:
     return github_app._sanitize(text, *secrets)
 
 
+def _validate_existing_remote(repo_path: str, expected_url: str) -> None:
+    """Re-check local config immediately before authenticated network access."""
+    expected_url = _validate_clone_url(expected_url)
+    result = _run_git(repo_path, ["config", "--local", "--null", "--list"], timeout=30)
+    if result.returncode != 0:
+        raise RepoManagerError("Cannot inspect repository configuration")
+    entries = result.stdout.decode("utf-8", errors="replace").split("\0")
+    origin_urls: List[str] = []
+    forbidden_prefixes = ("url.", "credential.", "filter.", "include.", "includeif.")
+    for entry in entries:
+        if not entry:
+            continue
+        key, _, value = entry.partition("\n")
+        lower = key.lower()
+        if lower.startswith(forbidden_prefixes) or lower in {
+            "core.hookspath", "core.sshcommand", "remote.origin.uploadpack", "remote.origin.receivepack"
+        }:
+            raise RepoManagerError("Unsafe Git repository configuration")
+        if lower == "remote.origin.url":
+            origin_urls.append(value)
+    if origin_urls != [expected_url]:
+        raise RepoManagerError("Git remote does not match the allowed connection URL")
+
+
+def push(connection_row: Mapping[str, Any], repo_path: str, token: str, refspec: str) -> subprocess.CompletedProcess:
+    """Push to the validated URL, never to a mutable remote name."""
+    clone_url = _connection_clone_url(connection_row)
+    _validate_existing_remote(repo_path, clone_url)
+    with _ephemeral_credentials(token) as env_extra:
+        return _run_git(
+            repo_path,
+            ["push", clone_url, refspec],
+            timeout=fetch_timeout(),
+            env_extra=env_extra,
+        )
+
+
 # --- operations --------------------------------------------------------------
 
 
@@ -245,17 +327,16 @@ def ensure_mirror(connection_row: Mapping[str, Any], token: str) -> None:
     mirror directly.
     """
     connection_id = _validate_id(connection_row["id"], "connection_id")
-    clone_url = connection_row["clone_url"]
-    if not clone_url:
-        raise RepoManagerError("Connection has no clone_url")
+    clone_url = _connection_clone_url(connection_row)
     mirror = mirror_path(connection_id)
 
     with connection_lock(connection_id):
         with _ephemeral_credentials(token) as env_extra:
             if os.path.isdir(os.path.join(mirror, ".git")):
+                _validate_existing_remote(mirror, clone_url)
                 result = _run_git(
                     mirror,
-                    ["fetch", "--no-tags", "origin", "+refs/heads/*:refs/remotes/origin/*"],
+                    ["fetch", "--no-tags", "--no-recurse-submodules", clone_url, "+refs/heads/*:refs/remotes/origin/*"],
                     timeout=fetch_timeout(),
                     env_extra=env_extra,
                 )
@@ -268,12 +349,16 @@ def ensure_mirror(connection_row: Mapping[str, Any], token: str) -> None:
                     shutil.rmtree(mirror)
                 result = _run_git(
                     mirrors_root,
-                    ["clone", "--no-tags", clone_url, mirror],
+                    ["clone", "--no-tags", "--no-recurse-submodules", "--no-checkout", clone_url, mirror],
                     timeout=clone_timeout(),
                     env_extra=env_extra,
                 )
                 if result.returncode != 0:
                     raise RepoManagerError(f"git clone failed: {_stderr(result, token)}")
+                _validate_existing_remote(mirror, clone_url)
+                checkout = _run_git(mirror, ["checkout", "-f"], timeout=clone_timeout())
+                if checkout.returncode != 0:
+                    raise RepoManagerError(f"git checkout failed: {_stderr(checkout, token)}")
     mirror_path(connection_id)  # re-validate no symlink escape was introduced
 
 
@@ -284,9 +369,7 @@ def resolve_remote_branch_sha(connection_row: Mapping[str, Any], token: str, bra
     and as the basis for `sync`'s local `git rev-parse` after fetch.
     """
     branch = _validate_branch(branch)
-    clone_url = connection_row["clone_url"]
-    if not clone_url:
-        raise RepoManagerError("Connection has no clone_url")
+    clone_url = _connection_clone_url(connection_row)
     root = _repository_root()
     with _ephemeral_credentials(token) as env_extra:
         result = _run_git(

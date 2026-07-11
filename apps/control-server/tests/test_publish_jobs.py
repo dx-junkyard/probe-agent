@@ -243,12 +243,29 @@ def _setup_ready_patch(
         "/github/connections",
         json={
             "owner": "acme", "repo": "widgets", "installation_id": 1,
-            "web_base_url": f"file://{remote_root}",
         },
         headers=h,
     )
     assert r.status_code == 201, r.text
     connection_id = r.json()["id"]
+    local_clone_url = f"file://{bare_dir}"
+    from app.db import get_conn
+    from app import repo_manager
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE github_connections SET clone_url = ? WHERE id = ?",
+            (local_clone_url, connection_id),
+        )
+    monkeypatch.setattr(repo_manager, "_connection_clone_url", lambda row: row["clone_url"])
+    monkeypatch.setattr(repo_manager, "_validate_existing_remote", lambda *_args: None)
+    real_run_git = repo_manager._run_git
+    monkeypatch.setattr(
+        repo_manager,
+        "_run_git",
+        lambda cwd, args, **kwargs: real_run_git(
+            cwd, ["-c", "protocol.file.allow=always"] + args, **kwargs
+        ),
+    )
 
     r = admin_client.post(f"/github/connections/{connection_id}/verify", headers=h)
     assert r.status_code == 200, r.text
@@ -534,7 +551,8 @@ class TestPushSafety:
         publish_job._run_publish_phase(job_id)
 
         assert _job_row(job_id)["status"] == "completed"
-        assert captured["args"][:2] == ["push", "origin"]
+        assert captured["args"][0] == "push"
+        assert captured["args"][1] == f"file://{ctx['bare_dir']}"
         assert "--force" not in captured["args"]
         assert "-f" not in captured["args"]
         assert captured["args"][2].startswith("HEAD:refs/heads/probe/job-")

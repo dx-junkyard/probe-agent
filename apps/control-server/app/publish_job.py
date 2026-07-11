@@ -558,13 +558,12 @@ def _run_publish_phase(job_id: int) -> None:
 
             pushed_sha = _remote_branch_sha_or_none(connection_row, token, branch_name)
             if pushed_sha != commit_sha:
-                with repo_manager._ephemeral_credentials(token) as env_extra:
-                    push_result = repo_manager._run_git(
-                        worktree_path,
-                        ["push", "origin", f"HEAD:refs/heads/{branch_name}"],
-                        timeout=repo_manager.fetch_timeout(),
-                        env_extra=env_extra,
-                    )
+                push_result = repo_manager.push(
+                    connection_row,
+                    worktree_path,
+                    token,
+                    f"HEAD:refs/heads/{branch_name}",
+                )
                 if push_result.returncode != 0:
                     raise PublishJobConflict(
                         f"git push failed: {repo_manager._stderr(push_result, token)}"

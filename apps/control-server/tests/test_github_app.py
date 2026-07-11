@@ -140,6 +140,38 @@ class TestAppConfiguration:
 
 
 class TestCreateInstallationToken:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://api.github.com",
+            "https://localhost",
+            "https://127.0.0.1",
+            "https://169.254.169.254",
+            "https://10.0.0.1",
+            "file:///etc/passwd",
+            "ssh://git@github.com/acme/repo.git",
+        ],
+    )
+    def test_rejects_non_github_api_destinations(self, monkeypatch, rsa_private_key_path, url):
+        _configure_app(monkeypatch, rsa_private_key_path)
+        from app.github_app import GitHubAppError, create_installation_token
+
+        with pytest.raises(GitHubAppError):
+            create_installation_token(42, api_base_url=url)
+
+    def test_cross_host_redirect_is_rejected(self):
+        from app.github_app import GitHubAppError, _SameHostRedirectHandler
+
+        handler = _SameHostRedirectHandler()
+        request = __import__("urllib.request").request.Request(
+            "https://api.github.com/app/installations/1/access_tokens",
+            headers={"Authorization": "Bearer secret"},
+        )
+        with pytest.raises(GitHubAppError):
+            handler.redirect_request(
+                request, None, 302, "Found", {}, "https://127.0.0.1/steal"
+            )
+
     def test_success(self, monkeypatch, rsa_private_key_path):
         _configure_app(monkeypatch, rsa_private_key_path)
         from app.github_app import create_installation_token
@@ -247,6 +279,16 @@ class TestGetRepository:
 
 
 class TestConnectionAPI:
+    @pytest.mark.parametrize("field", ["api_base_url", "web_base_url"])
+    def test_create_rejects_connection_url_override(self, admin_client, field):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token)
+        payload = {"owner": "acme", "repo": "widgets", "installation_id": 1, field: "https://evil.example"}
+        response = admin_client.post(
+            "/github/connections", json=payload, headers=_headers(token, system["id"])
+        )
+        assert response.status_code == 422
+
     def test_app_status_reports_configured(self, admin_client, monkeypatch, rsa_private_key_path):
         _configure_app(monkeypatch, rsa_private_key_path, app_id="555")
         token = _login(admin_client)

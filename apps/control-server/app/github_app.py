@@ -79,11 +79,48 @@ def _private_key_path() -> str:
 
 
 def default_api_base_url() -> str:
-    return os.getenv("GITHUB_API_BASE_URL", "").strip() or DEFAULT_API_BASE_URL
+    # MVP supports github.com only.  Connection or environment supplied hosts
+    # must never become credential destinations.
+    return DEFAULT_API_BASE_URL
 
 
 def default_web_base_url() -> str:
-    return os.getenv("GITHUB_WEB_BASE_URL", "").strip() or DEFAULT_WEB_BASE_URL
+    return DEFAULT_WEB_BASE_URL
+
+
+def _validate_api_url(url: str) -> str:
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        raise GitHubAppError("Invalid GitHub API URL") from None
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "api.github.com"
+        or parsed.port not in (None, 443)
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise GitHubAppError("GitHub API destination is not allowed")
+    return url
+
+
+class _SameHostRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_api_url(newurl)
+        if urllib.parse.urlsplit(newurl).hostname != urllib.parse.urlsplit(req.full_url).hostname:
+            raise GitHubAppError("GitHub API redirect destination is not allowed")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_ORIGINAL_URLOPEN = urllib.request.urlopen
+
+
+def _open_request(request: urllib.request.Request, timeout: int):
+    # Preserve the long-standing test seam while production always uses the
+    # restrictive redirect handler above.
+    if urllib.request.urlopen is not _ORIGINAL_URLOPEN:
+        return urllib.request.urlopen(request, timeout=timeout)
+    return urllib.request.build_opener(_SameHostRedirectHandler()).open(request, timeout=timeout)
 
 
 def github_app_configured() -> bool:
@@ -152,6 +189,7 @@ def _request(
     data: Optional[bytes] = None,
     sanitize_secrets: tuple = (),
 ) -> Any:
+    _validate_api_url(url)
     headers = {"Accept": "application/vnd.github+json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -159,7 +197,7 @@ def _request(
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with _open_request(request, timeout=30) as response:
             raw = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")

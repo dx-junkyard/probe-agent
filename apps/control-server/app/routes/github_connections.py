@@ -161,8 +161,8 @@ def create_connection(
     if payload.installation_id <= 0:
         raise HTTPException(status_code=422, detail="installation_id must be a positive integer")
 
-    api_base = (payload.api_base_url or default_api_base_url()).strip().rstrip("/")
-    web_base = (payload.web_base_url or default_web_base_url()).strip().rstrip("/")
+    api_base = default_api_base_url()
+    web_base = default_web_base_url()
     clone_url = f"{web_base}/{owner}/{repo}.git"
     now = _now_iso()
 

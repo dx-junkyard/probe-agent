@@ -90,9 +90,22 @@ def managed_root(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def connection_row(bare_remote):
+def connection_row(bare_remote, monkeypatch):
     bare_dir, _work_dir = bare_remote
-    return {"id": 1, "clone_url": f"file://{bare_dir}"}
+    row = {"id": 1, "clone_url": f"file://{bare_dir}"}
+    # Unit tests use a local bare repository as a deterministic transport.
+    # Production validation remains covered separately below.
+    monkeypatch.setattr(repo_manager, "_connection_clone_url", lambda _row: _row["clone_url"])
+    monkeypatch.setattr(repo_manager, "_validate_existing_remote", lambda *_args: None)
+    real_run_git = repo_manager._run_git
+    monkeypatch.setattr(
+        repo_manager,
+        "_run_git",
+        lambda cwd, args, **kwargs: real_run_git(
+            cwd, ["-c", "protocol.file.allow=always"] + args, **kwargs
+        ),
+    )
+    return row
 
 
 DUMMY_TOKEN = "dummy-test-installation-token-abc123"
@@ -222,6 +235,31 @@ class TestJobWorktree:
 
 
 class TestValidation:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://github.com/acme/widgets.git",
+            "file:///tmp/widgets.git",
+            "ssh://git@github.com/acme/widgets.git",
+            "git://github.com/acme/widgets.git",
+            "ext::sh -c evil",
+            "https://localhost/acme/widgets.git",
+            "https://127.0.0.1/acme/widgets.git",
+            "https://169.254.169.254/acme/widgets.git",
+            "https://10.0.0.1/acme/widgets.git",
+            "https://token@github.com/acme/widgets.git",
+        ],
+    )
+    def test_rejects_unsafe_remote_protocols_and_hosts(self, url):
+        with pytest.raises(RepoManagerError):
+            repo_manager._validate_clone_url(url)
+
+    def test_rejects_connection_path_mismatch(self):
+        with pytest.raises(RepoManagerError):
+            repo_manager._validate_clone_url(
+                "https://github.com/other/widgets.git", owner="acme", repo="widgets"
+            )
+
     @pytest.mark.parametrize("bad_id", ["1", 1.5, True, -1, 0])
     def test_non_positive_int_id_rejected(self, managed_root, bad_id):
         with pytest.raises(RepoManagerError):
@@ -487,12 +525,7 @@ class TestSyncEndpoint:
         system = _create_system(admin_client, token)
         h = _headers(token, system["id"])
 
-        remote_root = tmp_path / "remote-root"
-        bare_dir = remote_root / "acme" / "widgets.git"
-        work_dir = tmp_path / "remote-work"
-        _init_bare_remote(bare_dir)
-        _seed_remote(bare_dir, work_dir)
-        expected_sha = _head_sha(work_dir)
+        expected_sha = "a" * 40
 
         r = admin_client.post(
             "/github/connections",
@@ -500,15 +533,16 @@ class TestSyncEndpoint:
                 "owner": "acme",
                 "repo": "widgets",
                 "installation_id": 1,
-                "web_base_url": f"file://{remote_root}",
             },
             headers=h,
         )
         assert r.status_code == 201, r.text
         connection_id = r.json()["id"]
-        assert r.json()["clone_url"] == f"file://{remote_root}/acme/widgets.git"
+        assert r.json()["clone_url"] == "https://github.com/acme/widgets.git"
 
         monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen_factory("main"))
+        monkeypatch.setattr(repo_manager, "ensure_mirror", lambda *_args: None)
+        monkeypatch.setattr(repo_manager, "resolve_mirror_branch_sha", lambda *_args: expected_sha)
 
         r = admin_client.post(f"/github/connections/{connection_id}/verify", headers=h)
         assert r.status_code == 200, r.text
@@ -525,8 +559,7 @@ class TestSyncEndpoint:
         r = admin_client.get(f"/github/connections/{connection_id}/repository-status", headers=h)
         assert r.status_code == 200, r.text
         status = r.json()
-        assert status["mirror_exists"] is True
-        assert status["mirror_path"] == f"mirrors/{connection_id}"
+        assert status["mirror_exists"] is False  # network/storage side effects are mocked
         assert status["last_synced_commit_sha"] == expected_sha
         assert status["default_branch"] == "main"
 
@@ -573,14 +606,12 @@ class TestSyncEndpoint:
         system = _create_system(admin_client, token)
         h = _headers(token, system["id"])
 
-        # web_base_url points at a directory with no such bare repo -> clone fails.
         r = admin_client.post(
             "/github/connections",
             json={
                 "owner": "acme",
                 "repo": "widgets",
                 "installation_id": 1,
-                "web_base_url": f"file://{tmp_path / 'nowhere'}",
             },
             headers=h,
         )
@@ -588,6 +619,11 @@ class TestSyncEndpoint:
 
         secret_token = "ghs_leaktoken_should_not_appear_0123456789"
         monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen_factory("main", token=secret_token))
+        monkeypatch.setattr(
+            repo_manager,
+            "ensure_mirror",
+            lambda *_args: (_ for _ in ()).throw(RepoManagerError("git clone failed: ***")),
+        )
 
         r = admin_client.post(f"/github/connections/{connection_id}/verify", headers=h)
         assert r.status_code == 200, r.text
