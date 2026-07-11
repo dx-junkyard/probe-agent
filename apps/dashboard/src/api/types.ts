@@ -2366,3 +2366,104 @@ export interface AssistantAskOut {
   schema_version: string;
   generated_at: number;
 }
+
+// ── GitHub App publish workflow (Issue #216) ────────────────────────
+//
+// Connection/publish-job persistence never carries an installation token,
+// private key, or absolute host path (Principle 5/8) -- these types mirror
+// exactly what apps/control-server/app/models.py returns.
+
+export interface GithubAppStatusOut {
+  configured: boolean;
+  app_id: string | null;
+  api_base_url: string;
+  web_base_url: string;
+}
+
+export type GithubConnectionStatus = "pending" | "connected" | "error" | "disconnected";
+
+export interface GithubConnectionOut {
+  id: number;
+  system_id: number;
+  api_base_url: string;
+  web_base_url: string;
+  owner: string;
+  repo: string;
+  clone_url: string;
+  installation_id: number;
+  default_branch: string | null;
+  credential_type: string;
+  status: GithubConnectionStatus;
+  last_error: string | null;
+  last_synced_at: string | null;
+  last_synced_commit_sha: string | null;
+  created_by_user_id: number | null;
+  updated_by_user_id: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface GithubConnectionCreateRequest {
+  owner: string;
+  repo: string;
+  installation_id: number;
+  api_base_url?: string;
+  web_base_url?: string;
+}
+
+export interface GithubRepositoryStatusOut {
+  connection_id: number;
+  mirror_exists: boolean;
+  mirror_path: string | null;
+  default_branch: string | null;
+  last_synced_at: string | null;
+  last_synced_commit_sha: string | null;
+}
+
+export interface GithubInstallationRepositoryOut {
+  owner: string;
+  name: string;
+  default_branch: string | null;
+  private: boolean;
+}
+
+export type PublishJobStatus =
+  | "pending"
+  | "authenticating"
+  | "fetching"
+  | "checking_out"
+  | "applying_patch"
+  | "validating"
+  | "awaiting_approval"
+  | "committing"
+  | "pushing"
+  | "creating_pr"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface PublishJobOut {
+  id: number;
+  system_id: number;
+  connection_id: number;
+  patch_id: number;
+  snapshot_id: number;
+  base_branch: string;
+  base_commit_sha: string | null;
+  branch_name: string | null;
+  commit_sha: string | null;
+  pr_url: string | null;
+  pr_number: number | null;
+  status: PublishJobStatus;
+  error: string | null;
+  validation_summary: Record<string, unknown> | null;
+  requested_by_user_id: number | null;
+  approved_by_user_id: number | null;
+  cleanup_state: string;
+  cleanup_error: string | null;
+  created_at: number;
+  updated_at: number;
+  approved_at: number | null;
+  completed_at: number | null;
+  heartbeat_at: number | null;
+}

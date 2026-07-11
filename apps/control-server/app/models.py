@@ -3583,6 +3583,124 @@ class AssistantCitationOut(BaseModel):
     detail: str = ""
 
 
+# GitHub App publish workflow (Issue #216, sub-task 1): connection
+# persistence models. `status` is a finite set enforced in the route layer;
+# no field here ever carries an installation token or private key material
+# (Principle 5/8 -- tokens are brokered per-call and never stored).
+GithubConnectionStatus = Literal["pending", "connected", "error", "disconnected"]
+
+
+class GithubAppStatusOut(BaseModel):
+    configured: bool
+    app_id: Optional[str] = None
+    api_base_url: str
+    web_base_url: str
+
+
+class GithubConnectionCreate(BaseModel):
+    owner: str = Field(..., min_length=1)
+    repo: str = Field(..., min_length=1)
+    installation_id: int
+    api_base_url: Optional[str] = None
+    web_base_url: Optional[str] = None
+
+
+class GithubConnectionOut(BaseModel):
+    id: int
+    system_id: int
+    api_base_url: str
+    web_base_url: str
+    owner: str
+    repo: str
+    clone_url: str
+    installation_id: int
+    default_branch: Optional[str] = None
+    credential_type: str
+    status: GithubConnectionStatus
+    last_error: Optional[str] = None
+    last_synced_at: Optional[str] = None
+    last_synced_commit_sha: Optional[str] = None
+    created_by_user_id: Optional[int] = None
+    updated_by_user_id: Optional[int] = None
+    created_at: str
+    updated_at: str
+
+
+# Repository manager status (Issue #216, sub-task 2). `mirror_path` is
+# root-relative (never the absolute host path) so it is safe to return to a
+# Dashboard client.
+class GithubRepositoryStatusOut(BaseModel):
+    connection_id: int
+    mirror_exists: bool
+    mirror_path: Optional[str] = None
+    default_branch: Optional[str] = None
+    last_synced_at: Optional[str] = None
+    last_synced_commit_sha: Optional[str] = None
+
+
+# Read-only installation repository listing (Issue #216, sub-task 4) -- used by
+# the Dashboard's connection-creation form to let the developer pick a repo
+# instead of typing owner/repo by hand. Never carries a token.
+class GithubInstallationRepositoryOut(BaseModel):
+    owner: str
+    name: str
+    default_branch: Optional[str] = None
+    private: bool
+
+
+# Publish job state machine (Issue #216, sub-task 3). `status` is the finite
+# ordered set enforced by app/publish_job.py; no field here ever carries an
+# installation token (Principle 5/8 -- `error` is always sanitized before
+# persistence, so it is safe to return verbatim).
+PublishJobStatus = Literal[
+    "pending",
+    "authenticating",
+    "fetching",
+    "checking_out",
+    "applying_patch",
+    "validating",
+    "awaiting_approval",
+    "committing",
+    "pushing",
+    "creating_pr",
+    "completed",
+    "failed",
+    "cancelled",
+]
+
+
+class PublishJobCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    patch_id: int
+
+
+class PublishJobOut(BaseModel):
+    id: int
+    system_id: int
+    connection_id: int
+    patch_id: int
+    snapshot_id: int
+    base_branch: str
+    base_commit_sha: Optional[str] = None
+    branch_name: Optional[str] = None
+    commit_sha: Optional[str] = None
+    pr_url: Optional[str] = None
+    pr_number: Optional[int] = None
+    status: PublishJobStatus
+    error: Optional[str] = None
+    validation_summary: Optional[Dict[str, Any]] = None
+    requested_by_user_id: Optional[int] = None
+    approved_by_user_id: Optional[int] = None
+    cleanup_state: str = "not_attempted"
+    cleanup_error: Optional[str] = None
+    created_at: float
+    updated_at: float
+    approved_at: Optional[float] = None
+    completed_at: Optional[float] = None
+    heartbeat_at: Optional[float] = None
+
+
 class AssistantAskOut(BaseModel):
     screen_id: str
     answer: str

@@ -20,6 +20,7 @@ import SettingsPage from "./pages/settings";
 import AdminPage from "./pages/admin";
 import WorkspacesPage from "./pages/workspaces";
 import SystemUnderstandingPage from "./pages/system-understanding";
+import GithubPage from "./pages/github";
 
 export default function App() {
   return (
@@ -43,6 +44,7 @@ export default function App() {
         <Route path="generation" element={<GenerationPage />} />
         <Route path="components" element={<ComponentsPage />} />
         <Route path="workspaces" element={<WorkspacesPage />} />
+        <Route path="github" element={<GithubPage />} />
         <Route path="settings" element={<SettingsPage />} />
         <Route path="admin" element={<AdminPage />} />
       </Route>

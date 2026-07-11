@@ -13,9 +13,11 @@ from .routes import (
     evaluation,
     experiments,
     generation,
+    github_connections,
     interview,
     probe_patterns,
     project_intelligence,
+    publish_jobs,
     retention,
     shadow,
     systems,
@@ -63,6 +65,8 @@ def create_app() -> FastAPI:
     app.include_router(assistant.router, dependencies=_auth)
     app.include_router(workspaces.router, dependencies=_auth)
     app.include_router(interview.router, dependencies=_auth)
+    app.include_router(github_connections.router, dependencies=_auth)
+    app.include_router(publish_jobs.router, dependencies=_auth)
     return app
 
 

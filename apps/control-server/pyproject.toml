@@ -12,6 +12,7 @@ dependencies = [
     "uvicorn[standard]>=0.27",
     "pydantic>=2.5",
     "PyYAML>=6.0",
+    "PyJWT[crypto]>=2.8",
 ]
 
 [project.optional-dependencies]

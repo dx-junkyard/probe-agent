@@ -152,6 +152,32 @@ The dashboard should support:
   `/setup-guide` (which already links back), closing the one-way link.
   All of the above are deterministic presence/routing checks — no heuristics.
 
+- GitHub publish workflow (Issue #216, `pages/github.tsx`, nav item
+  "GitHub"): App status card (`GET /github/app-status`; shows a setup hint
+  and disables connection creation when not configured); Connections tab
+  (list with status/default_branch/last_synced/last_error, a create dialog
+  that lets the developer pick a repo from
+  `GET /github/installations/{id}/repositories` or type owner/repo, plus
+  verify/sync/disconnect); Publish Jobs tab (list with a status badge, a
+  create dialog that reuses `useProbePatches()` filtered to patches whose
+  latest baseline+probed validation runs both succeeded, and a detail
+  dialog). The detail dialog renders the state machine's current status,
+  `validation_summary`, requested/approved-by (username only when
+  `useAuth().isAdmin`, since `GET /users` is admin-only — otherwise "User
+  #id"), the sanitized `error` verbatim, and branch/commit/PR links built
+  client-side from the connection's `owner`/`repo`/`web_base_url` (the API
+  never returns a token or absolute host path, and the UI must not
+  construct one either). Approve is a confirmation dialog only enabled for
+  `status === "awaiting_approval"` that shows the publish target, branch
+  name, and patch diff before calling
+  `POST /github/publish-jobs/{id}/approve`; Cancel is only offered for
+  `pending`/`awaiting_approval`. `usePublishJobs`/`usePublishJob`
+  (`api/hooks.ts`) poll every 2s while any job is in a non-terminal,
+  non-`awaiting_approval` status (`pending` through `creating_pr`) —
+  `awaiting_approval` itself does not poll since it is a stable
+  human-wait state, matching the System Understanding build-job polling
+  pattern.
+
 ## Authentication model
 
 - The session token from `/auth/login` lives in `st.session_state` only

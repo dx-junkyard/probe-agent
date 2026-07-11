@@ -3,7 +3,7 @@ import {
   LayoutDashboard, GitBranch, Map, Crosshair, FlaskConical,
   Plug, Sparkles, Boxes, Settings, Users, ChevronLeft, ChevronRight, MessageSquare,
   Workflow, Network, MessageSquareText, Brain, GitFork, Filter,
-  LifeBuoy, BookMarked,
+  LifeBuoy, BookMarked, GitMerge,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/api/auth";
@@ -49,6 +49,7 @@ const NAV_GROUPS: NavGroup[] = [
       { to: "/generation", icon: Sparkles, label: "Generate" },
       { to: "/components", icon: Boxes, label: "Components" },
       { to: "/workspaces", icon: MessageSquare, label: "Decision Workspace" },
+      { to: "/github", icon: GitMerge, label: "GitHub" },
       { to: "/settings", icon: Settings, label: "Settings" },
     ],
   },

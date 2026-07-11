@@ -1,3 +1,17 @@
+# Production HTTPS deployment (issue #217).
+#
+# Standalone compose file — intentionally NOT an override of docker-compose.yml.
+# Compose `ports:` entries are merged, not removed, by override files, so a
+# second file cannot un-publish the host ports docker-compose.yml opens for
+# local development. This file fully re-declares control-server, dashboard,
+# and caddy so control-server/dashboard never bind to a host port; only Caddy
+# is exposed to the internet (80/443), terminating TLS via Automatic HTTPS
+# and reverse-proxying to the Dashboard, which in turn proxies `/api/*` to
+# the Control Server (see apps/dashboard/nginx.conf).
+#
+# Usage: see docs/deployment-https.md
+#   docker compose -f docker-compose.prod.yml up -d --build
+
 services:
   control-server:
     build:
@@ -9,6 +23,9 @@ services:
       CONTROL_API_KEYS: ${CONTROL_API_KEYS:-}
       CONTROL_ADMIN_USERNAME: ${CONTROL_ADMIN_USERNAME:-}
       CONTROL_ADMIN_PASSWORD: ${CONTROL_ADMIN_PASSWORD:-}
+      # Fail startup instead of silently running without authentication.
+      # See docs/deployment-https.md "公開前チェック".
+      CONTROL_REQUIRE_AUTH: "true"
       LLM_PROVIDER: ${LLM_PROVIDER:-openai}
       LLM_MODEL: ${LLM_MODEL:-}
       LLM_API_KEY: ${LLM_API_KEY:-}
@@ -40,8 +57,9 @@ services:
     volumes:
       - probe-data:/data
       - ${PROBE_REPOSITORY_HOST_ROOT:?Set PROBE_REPOSITORY_HOST_ROOT}:/repositories:rw
-    ports:
-      - "8000:8000"
+    # No `ports:` — only Caddy is reachable from outside the compose network.
+    expose:
+      - "8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request, sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8000/health', timeout=2).status == 200 else sys.exit(1)"]
       interval: 10s
@@ -56,13 +74,34 @@ services:
     image: probe-agent/dashboard:latest
     container_name: probe-dashboard
     environment:
-      PROBE_CLIENT_SERVER_URL: ${PROBE_CLIENT_SERVER_URL:-http://localhost:8000}
-    ports:
-      - "8501:8501"
+      # Public HTTPS URL of the Control API, e.g. https://probe.example.com/api
+      PROBE_CLIENT_SERVER_URL: ${PROBE_CLIENT_SERVER_URL:?Set PROBE_CLIENT_SERVER_URL}
+    # No `ports:` — only Caddy is reachable from outside the compose network.
+    expose:
+      - "8501"
     depends_on:
       control-server:
         condition: service_healthy
     restart: unless-stopped
 
+  caddy:
+    image: caddy:2-alpine
+    container_name: probe-caddy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST:?Set PUBLIC_HOST}
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - dashboard
+    restart: unless-stopped
+
 volumes:
   probe-data:
+  caddy-data:
+  caddy-config:
