@@ -1,9 +1,12 @@
+import logging
 import os
 import sqlite3
 import threading
 import time
 from contextlib import contextmanager
 from typing import Iterator
+
+logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 
@@ -2192,6 +2195,42 @@ def init_db() -> None:
             conn.execute("ALTER TABLE interview_qa ADD COLUMN runtime_evidence TEXT")
         _ensure_legacy_system(conn)
     _bootstrap_admin()
+    _enforce_auth_requirement()
+
+
+def _enforce_auth_requirement() -> None:
+    """Fail closed on startup when auth is required but cannot be enabled.
+
+    `CONTROL_REQUIRE_AUTH=true` is meant for production deployments (see
+    docs/deployment-https.md): if no admin user exists (bootstrap did not run
+    or already ran without credentials) and `CONTROL_API_KEYS` is empty, the
+    server would otherwise start in the fail-open "no auth" MVP-compat mode.
+    Refuse to start instead, with an explicit error. The default
+    (`CONTROL_REQUIRE_AUTH=false`) keeps existing behavior but still warns.
+    """
+    from .auth import auth_enabled
+
+    require_auth = os.getenv("CONTROL_REQUIRE_AUTH", "false").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if auth_enabled():
+        return
+
+    message = (
+        "No admin user and no CONTROL_API_KEYS are configured; Control "
+        "Server would run without authentication. Set "
+        "CONTROL_ADMIN_USERNAME/CONTROL_ADMIN_PASSWORD (bootstraps an admin "
+        "user) or CONTROL_API_KEYS to enable auth."
+    )
+    if require_auth:
+        raise RuntimeError(
+            "CONTROL_REQUIRE_AUTH=true but authentication cannot be enabled: "
+            + message
+        )
+    logger.warning(message)
 
 
 def _bootstrap_admin() -> None:

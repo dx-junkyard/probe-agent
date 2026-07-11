@@ -1,0 +1,95 @@
+# Production HTTPS deployment (issue #217).
+#
+# Standalone compose file — intentionally NOT an override of docker-compose.yml.
+# Compose `ports:` entries are merged, not removed, by override files, so a
+# second file cannot un-publish the host ports docker-compose.yml opens for
+# local development. This file fully re-declares control-server, dashboard,
+# and caddy so control-server/dashboard never bind to a host port; only Caddy
+# is exposed to the internet (80/443), terminating TLS via Automatic HTTPS
+# and reverse-proxying to the Dashboard, which in turn proxies `/api/*` to
+# the Control Server (see apps/dashboard/nginx.conf).
+#
+# Usage: see docs/deployment-https.md
+#   docker compose -f docker-compose.prod.yml up -d --build
+
+services:
+  control-server:
+    build:
+      context: ./apps/control-server
+    image: probe-agent/control-server:latest
+    container_name: probe-control-server
+    environment:
+      PROBE_DB_PATH: /data/probe.db
+      CONTROL_API_KEYS: ${CONTROL_API_KEYS:-}
+      CONTROL_ADMIN_USERNAME: ${CONTROL_ADMIN_USERNAME:-}
+      CONTROL_ADMIN_PASSWORD: ${CONTROL_ADMIN_PASSWORD:-}
+      # Fail startup instead of silently running without authentication.
+      # See docs/deployment-https.md "公開前チェック".
+      CONTROL_REQUIRE_AUTH: "true"
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-120}
+      INTELLIGENCE_LLM_PROVIDER: ${INTELLIGENCE_LLM_PROVIDER:-}
+      INTELLIGENCE_LLM_MODEL: ${INTELLIGENCE_LLM_MODEL:-}
+      INTELLIGENCE_LLM_TIMEOUT: ${INTELLIGENCE_LLM_TIMEOUT:-120}
+      INTELLIGENCE_MAX_OUTPUT_TOKENS: ${INTELLIGENCE_MAX_OUTPUT_TOKENS:-128000}
+      INTELLIGENCE_REVIEW_MAX_OUTPUT_TOKENS: ${INTELLIGENCE_REVIEW_MAX_OUTPUT_TOKENS:-32768}
+      INTELLIGENCE_REVIEW_MAX_NODES_PER_TYPE: ${INTELLIGENCE_REVIEW_MAX_NODES_PER_TYPE:-5}
+      INTELLIGENCE_REVIEW_MAX_PROMPT_CHARS: ${INTELLIGENCE_REVIEW_MAX_PROMPT_CHARS:-30000}
+      SNAPSHOT_MAX_FILE_SIZE: ${SNAPSHOT_MAX_FILE_SIZE:-524288}
+      WORKSPACE_CONTEXT_MAX_CATEGORY_CHARS: ${WORKSPACE_CONTEXT_MAX_CATEGORY_CHARS:-12000}
+      WORKSPACE_CONTEXT_MAX_CHARS: ${WORKSPACE_CONTEXT_MAX_CHARS:-50000}
+      PROBE_REPOSITORY_ROOTS: /repositories
+    volumes:
+      - probe-data:/data
+      - ${PROBE_REPOSITORY_HOST_ROOT:?Set PROBE_REPOSITORY_HOST_ROOT}:/repositories:rw
+    # No `ports:` — only Caddy is reachable from outside the compose network.
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request, sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8000/health', timeout=2).status == 200 else sys.exit(1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: ./apps/dashboard
+    image: probe-agent/dashboard:latest
+    container_name: probe-dashboard
+    environment:
+      # Public HTTPS URL of the Control API, e.g. https://probe.example.com/api
+      PROBE_CLIENT_SERVER_URL: ${PROBE_CLIENT_SERVER_URL:?Set PROBE_CLIENT_SERVER_URL}
+    # No `ports:` — only Caddy is reachable from outside the compose network.
+    expose:
+      - "8501"
+    depends_on:
+      control-server:
+        condition: service_healthy
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: probe-caddy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST:?Set PUBLIC_HOST}
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - dashboard
+    restart: unless-stopped
+
+volumes:
+  probe-data:
+  caddy-data:
+  caddy-config:

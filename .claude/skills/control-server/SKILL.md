@@ -280,6 +280,14 @@ heuristic result.
 
 - Auth is enabled when any user exists or `CONTROL_API_KEYS` is set; otherwise open (MVP compat).
 - Initial admin is bootstrapped from `CONTROL_ADMIN_USERNAME` / `CONTROL_ADMIN_PASSWORD` at startup.
+- `CONTROL_REQUIRE_AUTH` (default `false`, issue #217) is checked in
+  `app/db.py::_enforce_auth_requirement`, called from `init_db()` right after
+  admin bootstrap. When `true` and auth still cannot be enabled (no admin
+  user, no `CONTROL_API_KEYS`), startup fails closed with `RuntimeError`
+  instead of silently running open; `docker-compose.prod.yml` sets this to
+  `"true"`. When `false` (local/dev default), the fail-open MVP-compat
+  behavior is unchanged but a warning is logged. See
+  `docs/deployment-https.md`.
 - Passwords are hashed with PBKDF2-HMAC-SHA256 (`app/security.py`); never store plaintext.
 - Tokens are random (`secrets.token_urlsafe`) and stored only as SHA-256 hashes in `api_tokens`.
 - Accept credentials via `Authorization: Bearer <token>` or `X-Api-Key: <token>`.

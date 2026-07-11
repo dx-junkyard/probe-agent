@@ -74,6 +74,14 @@ docker compose down          # コンテナのみ停止
 docker compose down -v       # volume (DB) も削除
 ```
 
+### 本番 HTTPS 公開
+
+上記の `docker-compose.yml` はローカル開発用（control-server / dashboard を
+ホストへ直接公開）。インターネットから単一 FQDN + HTTPS で公開するには、
+Caddy が Automatic HTTPS で証明書取得・更新まで行う独立構成
+`docker-compose.prod.yml` を使う。手順・前提条件・公開前チェックリストは
+[`docs/deployment-https.md`](docs/deployment-https.md) を参照。
+
 ## クイックスタート (ローカル Python)
 
 ```bash
@@ -383,6 +391,8 @@ Docker Compose はリポジトリルートの `.env` を読み込む。ローカ
 | `PROBE_SDK_INSTALL_URL` | GitHub の `packages/python-probe` | Dashboard の `Connect SDK` タブに表示する SDK install URL |
 | `CONTROL_ADMIN_USERNAME` | _(未設定)_ | 起動時に作成する初期管理者ユーザー名 |
 | `CONTROL_ADMIN_PASSWORD` | _(未設定)_ | 起動時に作成する初期管理者パスワード |
+| `CONTROL_REQUIRE_AUTH` | `false` | `true` で、認証を有効化できない状態（admin 未作成かつ `CONTROL_API_KEYS` 空）なら起動を失敗させる |
+| `PUBLIC_HOST` | _(未設定)_ | `docker-compose.prod.yml` の Caddy が HTTPS で公開する FQDN |
 
 ## ライセンス
 

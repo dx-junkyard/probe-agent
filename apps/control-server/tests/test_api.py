@@ -352,6 +352,65 @@ def test_health_always_accessible(auth_client):
     assert r.status_code == 200
 
 
+# --- CONTROL_REQUIRE_AUTH startup tests ---
+
+
+def test_require_auth_false_starts_without_credentials(tmp_path, monkeypatch, caplog):
+    """Default (false) preserves fail-open MVP behavior but logs a warning."""
+    monkeypatch.setenv("PROBE_DB_PATH", str(tmp_path / "probe-require-auth-off.db"))
+    monkeypatch.delenv("CONTROL_API_KEYS", raising=False)
+    monkeypatch.delenv("CONTROL_ADMIN_USERNAME", raising=False)
+    monkeypatch.delenv("CONTROL_ADMIN_PASSWORD", raising=False)
+    monkeypatch.delenv("CONTROL_REQUIRE_AUTH", raising=False)
+    from app.main import app  # noqa: WPS433
+
+    with caplog.at_level("WARNING", logger="app.db"):
+        with TestClient(app) as c:
+            r = c.get("/health")
+            assert r.status_code == 200
+    assert any("without authentication" in msg for msg in caplog.messages)
+
+
+def test_require_auth_true_fails_startup_without_admin_or_keys(tmp_path, monkeypatch):
+    """true refuses to start when auth cannot actually be enabled."""
+    monkeypatch.setenv("PROBE_DB_PATH", str(tmp_path / "probe-require-auth-fail.db"))
+    monkeypatch.setenv("CONTROL_REQUIRE_AUTH", "true")
+    monkeypatch.delenv("CONTROL_API_KEYS", raising=False)
+    monkeypatch.delenv("CONTROL_ADMIN_USERNAME", raising=False)
+    monkeypatch.delenv("CONTROL_ADMIN_PASSWORD", raising=False)
+    from app.main import app  # noqa: WPS433
+
+    with pytest.raises(RuntimeError, match="CONTROL_REQUIRE_AUTH=true"):
+        with TestClient(app):
+            pass
+
+
+def test_require_auth_true_starts_with_admin_bootstrapped(tmp_path, monkeypatch):
+    monkeypatch.setenv("PROBE_DB_PATH", str(tmp_path / "probe-require-auth-admin.db"))
+    monkeypatch.setenv("CONTROL_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("CONTROL_ADMIN_USERNAME", "root")
+    monkeypatch.setenv("CONTROL_ADMIN_PASSWORD", "s3cret")
+    monkeypatch.delenv("CONTROL_API_KEYS", raising=False)
+    from app.main import app  # noqa: WPS433
+
+    with TestClient(app) as c:
+        r = c.get("/health")
+        assert r.status_code == 200
+
+
+def test_require_auth_true_starts_with_legacy_keys(tmp_path, monkeypatch):
+    monkeypatch.setenv("PROBE_DB_PATH", str(tmp_path / "probe-require-auth-keys.db"))
+    monkeypatch.setenv("CONTROL_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("CONTROL_API_KEYS", "prod-key")
+    monkeypatch.delenv("CONTROL_ADMIN_USERNAME", raising=False)
+    monkeypatch.delenv("CONTROL_ADMIN_PASSWORD", raising=False)
+    from app.main import app  # noqa: WPS433
+
+    with TestClient(app) as c:
+        r = c.get("/health")
+        assert r.status_code == 200
+
+
 # --- User / token management tests ---
 
 
