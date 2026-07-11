@@ -1330,7 +1330,28 @@ def _run_capability_hierarchy(ctx: StepContext) -> Dict[str, Any]:
         ).fetchone()
 
     if not symbols_h:
-        return {"capability_count": 0, "note": "No code symbols to group"}
+        # Issue #210: still persist a completed intelligence_runs row so the
+        # job-step table (this step "completed") and the intelligence_runs-
+        # derived pipeline checklist / system_state item agree that the run
+        # happened, instead of the checklist showing "missing"/"blocked" for
+        # a build the job panel already reports as done.
+        now = time.time()
+        with get_conn() as conn:
+            run_id = conn.execute(
+                """INSERT INTO intelligence_runs
+                    (system_id, snapshot_id, run_type, provider, model,
+                     prompt_version, schema_version, decision_method,
+                     status, is_mock, started_at, completed_at)
+                VALUES (?, ?, 'capability_hierarchy', 'deterministic', 'none',
+                        ?, ?, 'deterministic', 'completed', 0, ?, ?)""",
+                (ctx.system_id, ctx.snapshot_id, HIERARCHY_PROMPT_VERSION,
+                 HIERARCHY_SCHEMA_VERSION, now, now),
+            ).lastrowid
+        return {
+            "intelligence_run_id": run_id,
+            "capability_count": 0,
+            "note": "No code symbols to group",
+        }
 
     sp_draft = (
         {"id": draft_row["id"], "name": draft_row["name"], "purpose": draft_row["purpose"]}

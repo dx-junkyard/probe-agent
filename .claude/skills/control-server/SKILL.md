@@ -72,6 +72,14 @@ fallback for intelligence work.
   blocked work (`severity=blocked`). Do not collapse pending/running/blocked
   into failed, and do not use `blocked_by_reasoning` for ordinary not-run or
   failed states when a reasoning model is available.
+- A step whose latest run is `completed` but whose deterministic artifact
+  count is zero (e.g. `pipeline.capability_hierarchy.empty`, mirroring
+  `system_understanding_service._check_documentation_indexed`'s "completed
+  but zero chunks" warning) is not "done": return a distinct
+  `.<empty-kind>` state item (`severity=warning`, `status=missing`) instead
+  of `None`, and point `remediation` at fixing the input (e.g. Interview /
+  source metadata) rather than the generic "Build / Refresh を実行してくだ
+  さい" used for not-yet-run/failed/blocked steps — the build already ran.
 - `GET /system-diagnostics` stays backward compatible; it is a projection
   built on top of `system_state.py`, not replaced by it.
 - Later phases (not yet implemented): projecting `next_actions` and

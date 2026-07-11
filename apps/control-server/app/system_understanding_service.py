@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from .db import get_conn
+from .system_state import _capability_count_in_current_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -270,6 +271,23 @@ def _check_capability_hierarchy_ready(conn, system_id: int, snapshot_id: Optiona
     ).fetchone()
     if row:
         if row["status"] == "completed":
+            # Issue #210: a completed run can still produce zero capabilities
+            # (e.g. the target repository has no `probe-agent:` docstring
+            # metadata to group). Mirror the "completed but zero" pattern in
+            # _check_documentation_indexed above instead of reporting
+            # "complete" while the pipeline checklist and the System State
+            # banner disagree about whether the hierarchy is ready.
+            if _capability_count_in_current_snapshot(conn, system_id, snapshot_id) == 0:
+                return PipelineStep(
+                    "capability_hierarchy_ready",
+                    "warning",
+                    detail=(
+                        "Capability hierarchy run completed but produced no capabilities. "
+                        "This happens when no `probe-agent:` docstring metadata was found in "
+                        "the target repository. Use Interview or add source metadata, then "
+                        "re-run Build / Refresh."
+                    ),
+                )
             return PipelineStep("capability_hierarchy_ready", "complete")
         if row["status"] == "failed":
             return PipelineStep("capability_hierarchy_ready", "failed")

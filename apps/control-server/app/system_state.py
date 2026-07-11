@@ -906,6 +906,41 @@ def _capability_hierarchy_item(
         (system_id, snapshot_id),
     ).fetchone()
     if row is not None and row["status"] == "completed":
+        # Issue #210: a completed run with zero capability nodes is not
+        # "done" from the user's perspective (no probe-agent: docstring
+        # metadata was found to group). Report a distinct warning item
+        # instead of silently returning None, so the SystemStateBanner and
+        # the "complete" pipeline checklist agree, and so remediation points
+        # at Interview/metadata instead of re-running the already-completed
+        # Build / Refresh.
+        if _capability_count_in_current_snapshot(conn, system_id, snapshot_id) == 0:
+            return StateItem(
+                state_id="pipeline.capability_hierarchy.empty",
+                state_group="pipeline",
+                severity="warning",
+                status="missing",
+                user_action_kind="confirm",
+                intervention_timing="before_next_step",
+                subject="Capability 階層",
+                summary="Capability 階層は実行済みですが capability が 0 件です。",
+                detail=(
+                    f"capability_hierarchy の実行（#{row['id']}）は完了していますが、"
+                    "現在の snapshot に capability ノードが存在しません。対象リポジトリに"
+                    " `probe-agent:` docstring メタデータが見つからなかったことが原因です。"
+                ),
+                impact="Core Capabilities が未定義のため、probe 設計・flow 探索・改善提案の前提が欠けています。",
+                remediation=(
+                    "Interview で Core Capabilities を確認するか、対象リポジトリに "
+                    "`probe-agent:` メタデータを追加してから Build / Refresh を再実行してください。"
+                ),
+                evidence={"snapshot_id": snapshot_id, "run_id": row["id"], "capability_count": 0},
+                target_ui=TargetUi(
+                    route=PAGE_INTERVIEW,
+                    anchor=ANCHOR_INTERVIEW_CAPABILITIES,
+                    action_label="Interview で Core Capabilities を確認",
+                ),
+                related_pipeline_steps=["capability_hierarchy_ready"],
+            )
         return None
     evidence = {"snapshot_id": snapshot_id, "run_id": row["id"] if row else None}
     return _pipeline_state_item(

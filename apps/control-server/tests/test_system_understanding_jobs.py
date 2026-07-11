@@ -253,6 +253,85 @@ class TestStepStatusAndProvenance:
         assert n == 1, "completed symbol_index must not be re-executed"
 
 
+class TestCapabilityHierarchyZeroSymbols:
+    """Issue #210: _run_capability_hierarchy used to return before inserting
+    an intelligence_runs row when there were no code symbols to group, so the
+    job-step table showed "completed" while the intelligence_runs-derived
+    pipeline checklist showed "missing"/"blocked" for the same build. A
+    completed run row must now be persisted either way."""
+
+    def _setup_repo_without_python_files(self, client, token, tmp_path, name):
+        sys = _create_system(client, token, name)
+        hdrs = _headers(token, sys["id"])
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=str(repo), check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=str(repo), check=True, capture_output=True,
+        )
+        (repo / "README.md").write_text("# Docs-only project\nNo Python source files.\n")
+        subprocess.run(["git", "add", "."], cwd=str(repo), check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "initial"], cwd=str(repo), check=True, capture_output=True,
+        )
+        sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo), check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = client.post(
+            "/repository/snapshots", json={"commit_sha": sha}, headers=hdrs
+        )
+        assert snap.status_code == 201, snap.text
+        return sys, hdrs
+
+    def test_zero_symbol_build_still_persists_completed_run(self, admin_client, tmp_path):
+        token = _login(admin_client)
+        sys, hdrs = self._setup_repo_without_python_files(
+            admin_client, token, tmp_path, "no-symbols-sys"
+        )
+
+        r = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        job = _wait_job(admin_client, hdrs, r.json()["id"])
+        steps = _steps_by_name(job)
+
+        # The build step itself completes (there is nothing to group, not an
+        # error), same as before this fix.
+        assert steps["capability_hierarchy"]["status"] == "completed"
+        assert steps["capability_hierarchy"]["artifact_provenance"]["capability_count"] == 0
+
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            run = conn.execute(
+                "SELECT status, decision_method, provider, model FROM intelligence_runs "
+                "WHERE system_id = ? AND run_type = 'capability_hierarchy' "
+                "ORDER BY id DESC LIMIT 1",
+                (sys["id"],),
+            ).fetchone()
+        assert run is not None, "zero-symbol capability_hierarchy must still insert a run row"
+        assert run["status"] == "completed"
+        assert run["decision_method"] == "deterministic"
+        assert run["provider"] == "deterministic"
+        assert run["model"] == "none"
+
+        # The pipeline checklist must not contradict the completed job step:
+        # zero capabilities is reported as "warning", never "missing"/"blocked".
+        r2 = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r2.status_code == 200, r2.text
+        pipeline = {s["step"]: s["status"] for s in r2.json()["pipeline"]}
+        assert pipeline["capability_hierarchy_ready"] == "warning"
+
+
 class TestLlmChunkQueue:
     def test_llm_failure_keeps_deterministic_steps_complete(
         self, admin_client, tmp_path, monkeypatch

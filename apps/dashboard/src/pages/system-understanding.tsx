@@ -489,6 +489,10 @@ export default function SystemUnderstandingPage() {
     settledBuildId.current = latestBuild.id;
     qc.invalidateQueries({ queryKey: sysKey("system-understanding") });
     qc.invalidateQueries({ queryKey: sysKey("system-diagnostics") });
+    // Issue #210: SystemStateBanner reads useSystemState (sysKey("system-state")),
+    // which was not invalidated here, so it kept showing the pre-build warning
+    // (staleTime 30s) even after the pipeline checklist above refreshed.
+    qc.invalidateQueries({ queryKey: sysKey("system-state") });
   }, [latestBuild, qc]);
 
   const checksByStep = useMemo(() => {
