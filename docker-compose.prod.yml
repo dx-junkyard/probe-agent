@@ -48,6 +48,12 @@ services:
       GITHUB_WEB_BASE_URL: ${GITHUB_WEB_BASE_URL:-}
       # GITHUB_APP_PRIVATE_KEY_PATH must point at a secret file mounted into this container (see .env.example).
       GIT_REPOSITORY_ROOT: /data/git-repositories
+      GIT_BRANCH_PREFIX: ${GIT_BRANCH_PREFIX:-probe/}
+      GIT_ALLOW_DIRECT_PUSH: ${GIT_ALLOW_DIRECT_PUSH:-false}
+      GIT_ALLOW_FORCE_PUSH: ${GIT_ALLOW_FORCE_PUSH:-false}
+      GIT_ALLOW_WORKFLOW_CHANGES: ${GIT_ALLOW_WORKFLOW_CHANGES:-false}
+      GITHUB_APP_BOT_NAME: ${GITHUB_APP_BOT_NAME:-probe-agent[bot]}
+      GITHUB_APP_BOT_EMAIL: ${GITHUB_APP_BOT_EMAIL:-probe-agent[bot]@users.noreply.github.com}
     volumes:
       - probe-data:/data
       - ${PROBE_REPOSITORY_HOST_ROOT:?Set PROBE_REPOSITORY_HOST_ROOT}:/repositories:rw

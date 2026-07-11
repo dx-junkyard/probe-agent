@@ -1758,6 +1758,54 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_github_connections_active_unique
 
 CREATE INDEX IF NOT EXISTS idx_github_connections_system
     ON github_connections (system_id, id DESC);
+
+-- Publish job state machine (Issue #216, sub-task 3): commit/push/PR
+-- creation for an approved probe patch against a connected GitHub
+-- repository. Mirrors probe_patches' explicit-apply-boundary spirit: a
+-- prepare phase (authenticating -> fetching -> checking_out ->
+-- applying_patch -> validating) stops at awaiting_approval, and only an
+-- explicit human approval starts the publish phase (committing -> pushing
+-- -> creating_pr -> completed). `status` is a finite, ordered set enforced
+-- in app/publish_job.py; `error` is always sanitized (github_app._sanitize)
+-- before persistence -- an installation token must never reach this table.
+-- `base_commit_sha` / `branch_name` / `commit_sha` / `pr_url` / `pr_number`
+-- are raw deterministic facts recorded as the job progresses;
+-- `validation_summary` is a structural JSON summary of validation_runs rows
+-- read at the `validating` step (not a re-interpretation).
+CREATE TABLE IF NOT EXISTS publish_jobs (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id              INTEGER NOT NULL,
+    connection_id          INTEGER NOT NULL,
+    patch_id               INTEGER NOT NULL,
+    snapshot_id            INTEGER NOT NULL,
+    base_branch            TEXT NOT NULL,
+    base_commit_sha        TEXT,
+    branch_name            TEXT,
+    commit_sha             TEXT,
+    pr_url                 TEXT,
+    pr_number              INTEGER,
+    status                 TEXT NOT NULL DEFAULT 'pending',
+    error                  TEXT,
+    validation_summary     TEXT,
+    requested_by_user_id   INTEGER,
+    approved_by_user_id    INTEGER,
+    created_at             REAL NOT NULL,
+    updated_at             REAL NOT NULL,
+    approved_at            REAL,
+    completed_at           REAL,
+    heartbeat_at           REAL,
+    cleanup_state          TEXT NOT NULL DEFAULT 'not_attempted',
+    cleanup_error          TEXT,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (connection_id) REFERENCES github_connections (id) ON DELETE CASCADE,
+    FOREIGN KEY (patch_id) REFERENCES probe_patches (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (requested_by_user_id) REFERENCES users (id) ON DELETE SET NULL,
+    FOREIGN KEY (approved_by_user_id) REFERENCES users (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_publish_jobs_system
+    ON publish_jobs (system_id, id DESC);
 """
 
 

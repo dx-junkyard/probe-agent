@@ -149,15 +149,22 @@ def job_path(job_id: int) -> str:
 
 # --- per-connection exclusion -----------------------------------------------
 
+# RLock (not Lock): the publish job state machine (Issue #216, sub-task 3)
+# holds this lock for an entire prepare/publish phase and, within that phase,
+# calls helpers below (`ensure_mirror`, `create_job_worktree`,
+# `resolve_mirror_branch_sha`, `cleanup_job_worktree`) that each also acquire
+# it. A plain Lock would deadlock on that same-thread re-entry; RLock keeps
+# the same per-connection mutual exclusion across *different* threads/jobs
+# while allowing the owning thread to nest calls safely.
 _locks_guard = threading.Lock()
-_connection_locks: Dict[int, threading.Lock] = {}
+_connection_locks: Dict[int, threading.RLock] = {}
 
 
 @contextmanager
 def connection_lock(connection_id: int) -> Iterator[None]:
     cid = _validate_id(connection_id, "connection_id")
     with _locks_guard:
-        lock = _connection_locks.setdefault(cid, threading.Lock())
+        lock = _connection_locks.setdefault(cid, threading.RLock())
     with lock:
         yield
 

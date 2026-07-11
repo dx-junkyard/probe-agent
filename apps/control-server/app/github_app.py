@@ -2,10 +2,11 @@
 
 This module is the deterministic, structural building block for the GitHub
 App publish workflow: it signs the App-level JWT, exchanges it for a
-short-lived Installation Access Token, and makes a couple of read-only
-GitHub REST calls used to verify a connection. It does not clone/fetch a
-repository, does not commit/push, and does not persist tokens anywhere
-(Principle 5/8) — those are later sub-tasks of Issue #216.
+short-lived Installation Access Token, and makes a handful of GitHub REST
+calls (read-only connection verification, and -- added in sub-task 3 --
+listing/creating a Pull Request) used by the repository manager and the
+publish job state machine. It does not clone/fetch a repository, does not
+commit/push, and does not persist tokens anywhere (Principle 5/8).
 
 Configuration is fail-closed (Principle 6 spirit: no heuristic fallback):
 `github_app_configured()` is the single source of truth for whether the App
@@ -25,6 +26,7 @@ import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -147,12 +149,15 @@ def _request(
     *,
     method: str = "GET",
     token: Optional[str] = None,
+    data: Optional[bytes] = None,
     sanitize_secrets: tuple = (),
-) -> Dict[str, Any]:
+) -> Any:
     headers = {"Accept": "application/vnd.github+json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    request = urllib.request.Request(url, headers=headers, method=method)
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             raw = response.read().decode("utf-8")
@@ -202,6 +207,48 @@ def get_repository(
     base = (api_base_url or default_api_base_url()).rstrip("/")
     url = f"{base}/repos/{owner}/{repo}"
     return _request(url, token=token, sanitize_secrets=(token,))
+
+
+def create_pull_request(
+    owner: str,
+    repo: str,
+    token: str,
+    *,
+    title: str,
+    head: str,
+    base: str,
+    body: str,
+    api_base_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Open a Pull Request (used only after explicit human approval, from a
+    server-generated ``probe/``-prefixed branch). probe-agent never merges
+    or closes the PR itself -- see Principle 5/8."""
+    _validate_owner_repo(owner, repo)
+    base_url = (api_base_url or default_api_base_url()).rstrip("/")
+    url = f"{base_url}/repos/{owner}/{repo}/pulls"
+    payload = json.dumps({"title": title, "head": head, "base": base, "body": body}).encode("utf-8")
+    return _request(url, method="POST", token=token, data=payload, sanitize_secrets=(token,))
+
+
+def list_open_pull_requests_for_branch(
+    owner: str,
+    repo: str,
+    token: str,
+    *,
+    head_branch: str,
+    api_base_url: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """List open PRs whose head is ``head_branch`` in this same repository,
+    used to make PR creation idempotent (never open a duplicate PR for a
+    branch a previous, partially-completed publish job already pushed)."""
+    _validate_owner_repo(owner, repo)
+    if not isinstance(head_branch, str) or not head_branch:
+        raise GitHubAppError("Invalid head branch")
+    base_url = (api_base_url or default_api_base_url()).rstrip("/")
+    head_param = urllib.parse.quote(f"{owner}:{head_branch}", safe="")
+    url = f"{base_url}/repos/{owner}/{repo}/pulls?head={head_param}&state=open"
+    data = _request(url, token=token, sanitize_secrets=(token,))
+    return data if isinstance(data, list) else []
 
 
 def list_installation_repositories(

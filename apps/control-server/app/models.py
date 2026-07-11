@@ -3638,6 +3638,59 @@ class GithubRepositoryStatusOut(BaseModel):
     last_synced_commit_sha: Optional[str] = None
 
 
+# Publish job state machine (Issue #216, sub-task 3). `status` is the finite
+# ordered set enforced by app/publish_job.py; no field here ever carries an
+# installation token (Principle 5/8 -- `error` is always sanitized before
+# persistence, so it is safe to return verbatim).
+PublishJobStatus = Literal[
+    "pending",
+    "authenticating",
+    "fetching",
+    "checking_out",
+    "applying_patch",
+    "validating",
+    "awaiting_approval",
+    "committing",
+    "pushing",
+    "creating_pr",
+    "completed",
+    "failed",
+    "cancelled",
+]
+
+
+class PublishJobCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    patch_id: int
+
+
+class PublishJobOut(BaseModel):
+    id: int
+    system_id: int
+    connection_id: int
+    patch_id: int
+    snapshot_id: int
+    base_branch: str
+    base_commit_sha: Optional[str] = None
+    branch_name: Optional[str] = None
+    commit_sha: Optional[str] = None
+    pr_url: Optional[str] = None
+    pr_number: Optional[int] = None
+    status: PublishJobStatus
+    error: Optional[str] = None
+    validation_summary: Optional[Dict[str, Any]] = None
+    requested_by_user_id: Optional[int] = None
+    approved_by_user_id: Optional[int] = None
+    cleanup_state: str = "not_attempted"
+    cleanup_error: Optional[str] = None
+    created_at: float
+    updated_at: float
+    approved_at: Optional[float] = None
+    completed_at: Optional[float] = None
+    heartbeat_at: Optional[float] = None
+
+
 class AssistantAskOut(BaseModel):
     screen_id: str
     answer: str
