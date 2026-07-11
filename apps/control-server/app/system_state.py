@@ -1194,7 +1194,12 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
             subject=check.title, summary=check.title, detail=check.detail,
             impact=check.impact, remediation=check.remediation,
             evidence={"diagnostic_category": check.category, "fix_kind": check.fix_kind},
-            target_ui=(TargetUi(route=check.fix_page, anchor=check.fix_anchor, action_label="修正する") if check.fix_page else None),
+            # Issue #211: name the target instead of a bare 修正する so the
+            # button says what will be fixed before it is clicked. check.title
+            # comes from the finite diagnostics check set, so this stays a
+            # deterministic label, not generated text.
+            target_ui=(TargetUi(route=check.fix_page, anchor=check.fix_anchor,
+                                action_label=f"「{check.title}」を修正") if check.fix_page else None),
             related_checks=[check.check_id], related_pipeline_steps=check.related_pipeline_steps,
             source="system_diagnostics", dedupe_key=f"diagnostic.{check.check_id}",
         ))

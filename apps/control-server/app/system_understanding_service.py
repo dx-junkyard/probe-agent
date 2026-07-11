@@ -844,7 +844,12 @@ def _build_next_actions(
         if not purpose_defined:
             actions.append(NextAction(
                 action="Define System Purpose",
-                reason="Pipeline completed, but no system purpose is defined yet.",
+                reason=(
+                    "Pipeline completed, but no system purpose is defined yet. "
+                    "Defining it in Interview takes a few minutes and gives the "
+                    "Capability Map, observation candidates, and Probe Plans "
+                    "their evaluation basis."
+                ),
                 category="understand",
                 link="/interview",
             ))

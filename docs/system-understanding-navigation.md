@@ -152,6 +152,12 @@ Build 系 CTA はビルド実行中（`build.isPending` または最新ジョブ
 `queued`/`running`）は無効化される。CTA には `pipeline-cta-<step>` の
 `data-testid` が付く。
 
+全 step が `complete` のとき、Pipeline Status カードは既定で折りたたまれ
+（`data-testid="pipeline-collapsed"`、`N/N steps complete` の要約表示）、
+`pipeline-expand` / `pipeline-collapse` ボタンで切り替えられる（Issue #211）。
+`warning` / `blocked` / `failed` / `missing` の step が 1 つでもあれば従来
+どおり展開表示される。判定は step status の有限集合への分岐のみ。
+
 ## ページ間ナビゲーション
 
 クロスページリンク:
@@ -284,6 +290,14 @@ Refresh ボタン）の直下に、`primary_action` を表示する単一カー�
 将来的に `apps/control-server/app/system_state.py`（System State Assessment、
 Issue #193）へ統合される可能性があるが、本 issue ではまだ統合しない
 （`_derive_primary_action` のコメント参照）。
+
+pipeline 全 step が `complete` かつ build 非実行のとき、primary action
+カードは成功サマリ（`data-testid="build-success-summary"`、
+`Analysis complete — N/N steps · X symbols · Y entrypoints`。件数は
+`metadata_coverage` 由来）を CTA の上に表示し、ヘッダーの Build / Refresh
+ボタンは `outline` variant に降格する（Issue #211）。同条件で System
+Purpose 未定義の場合、Start from Capability / Feature カードには前提の
+注記（`data-testid="entry-cards-prereq-note"`）が付く。
 
 ### Stage Status（Issue #202）
 

@@ -113,10 +113,13 @@ pipeline 全 complete かつ purpose 未定義のとき `Define System Purpose`
 - **Build を起動するコントロールが最大 4 つ同時に並ぶ**: ヘッダーの
   Build / Refresh、`PrimaryActionCard`（build kind）、checklist の step CTA、
   `refresh-recommended-cta`。すべて同じ `build.mutate()`。
-- **`Generate capability hierarchy` Next Action の行き止まりリンク**:
-  `link="/capability-map"`（`system_understanding_service.py:809-815`）だが
-  Capability Map は閲覧専用で生成操作がなく、結局 Hub の Build に戻ることになる。
-  checklist 側の同 step CTA は正しく `build.mutate()` を起動しており不一致。
+- ~~**`Generate capability hierarchy` Next Action の行き止まりリンク**~~
+  【訂正】当初「Capability Map は閲覧専用で生成操作がない」と報告したが誤り。
+  Capability Map には `Generate capability hierarchy` ボタンが実在する
+  （`capability-map.tsx:568, 615`、`docs/project-intelligence.md` にも記載）。
+  `link="/capability-map"` は機能する導線であり、行き止まりではない。
+  checklist の step CTA（全体 Build）と Capability Map の個別生成という
+  2 経路が併存する点は #206/#207 の一本化で扱う。
 - **汎用「修正する」ボタン**: `system_state.py:1162`（`action_label="修正する"`）、
   `system-state.tsx:44`（fallback `対応する`）、`diagnostics-badge.tsx:384`。
   遷移先が押す前に分からず、`target_ui=null` の項目では見た目が同じボタンが
@@ -199,8 +202,9 @@ i18n 機構は不在（i18next 等の import ゼロ）。言語の境界は
    主 CTA + ヘッダーの 2 つまでに減らす。
 6. **完了済み Pipeline Status は折りたたむ**（8/8 のとき collapsed、
    失敗・警告時のみ該当行を展開）。
-7. `Generate capability hierarchy` Next Action を `action_kind="build"` に修正
-   （閲覧専用ページへの navigate をやめる）。
+7. ~~`Generate capability hierarchy` Next Action を `action_kind="build"` に修正~~
+   【取り下げ】§3 の訂正どおり Capability Map に生成操作が実在するため、
+   navigate リンクは妥当。変更しない。
 8. 汎用「修正する」を廃し、対象＋操作の具体ラベル（例:
    「Capability 階層を再生成する」）と原因表示に置き換える。
 9. **Purpose 未定義の間は Start from Capability / Feature を補助導線に降格**

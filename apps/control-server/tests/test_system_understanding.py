@@ -1040,7 +1040,11 @@ class TestNextActionsPriority:
             gap_count=3,
         )
         assert actions[0].action == "Define System Purpose"
-        assert actions[0].reason == "Pipeline completed, but no system purpose is defined yet."
+        assert actions[0].reason.startswith(
+            "Pipeline completed, but no system purpose is defined yet."
+        )
+        # Issue #211: the reason also explains why defining it matters.
+        assert "evaluation basis" in actions[0].reason
         assert actions[0].link == "/interview"
 
     def test_complete_pipeline_without_capabilities_after_purpose(self):
