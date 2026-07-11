@@ -619,6 +619,183 @@ class TestSystemIsolation:
         assert cancel.status_code == 404
 
 
+class TestGapHistoryRecording:
+    """Issue #203: system_understanding_gap_history rows are written at build
+    finalize time (system_understanding_jobs._finalize_job ->
+    _record_gap_history), only for completed/partial jobs, reusing the exact
+    same gap computation as the read path (_load_gaps_from_reconciler +
+    _compute_gap_summary)."""
+
+    def _gap_history_rows(self, build_id):
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            return conn.execute(
+                "SELECT gap_type, count, system_id, snapshot_id FROM "
+                "system_understanding_gap_history WHERE build_id = ? ORDER BY gap_type",
+                (build_id,),
+            ).fetchall()
+
+    def test_partial_build_records_gap_history_matching_read_path(
+        self, admin_client, tmp_path
+    ):
+        token = _login(admin_client)
+        sys_, hdrs = _setup_repo(admin_client, token, tmp_path, "gap-hist-partial-sys")
+
+        r = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        job = _wait_job(admin_client, hdrs, r.json()["id"])
+        assert job["status"] == "partial"
+
+        gu_resp = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert gu_resp.status_code == 200, gu_resp.text
+        gap_summary = {
+            g["gap_type"]: g["count"] for g in gu_resp.json()["gap_summary"]
+        }
+
+        rows = self._gap_history_rows(job["id"])
+        recorded = {r["gap_type"]: r["count"] for r in rows}
+        assert recorded == gap_summary
+        for r in rows:
+            assert r["system_id"] == sys_["id"]
+
+    def test_completed_build_records_gap_history(self, admin_client, tmp_path, monkeypatch):
+        token = _login(admin_client)
+        _, hdrs = _setup_repo(
+            admin_client, token, tmp_path, "gap-hist-completed-sys",
+            readme_text=TWO_SECTION_README,
+        )
+
+        import app.system_understanding_service as sus
+        import app.documentation_claim_scanner as scanner_module
+
+        monkeypatch.setattr(sus, "_is_reasoning_model_available", lambda: True)
+        monkeypatch.setattr(
+            scanner_module, "scan_chunk",
+            lambda client, config, chunk, cache=None: _ok_scan_result(scanner_module, chunk),
+        )
+
+        r = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        job = _wait_job(admin_client, hdrs, r.json()["id"])
+        assert job["status"] == "completed"
+
+        gu_resp = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert gu_resp.status_code == 200, gu_resp.text
+        gap_summary = {
+            g["gap_type"]: g["count"] for g in gu_resp.json()["gap_summary"]
+        }
+
+        rows = self._gap_history_rows(job["id"])
+        recorded = {r["gap_type"]: r["count"] for r in rows}
+        # A gap_type row is written for every gap_type currently present
+        # (possibly zero rows if the build has no gaps at all); either way it
+        # must match exactly what the read path (_compute_gap_summary) reports
+        # for this same build/snapshot.
+        assert recorded == gap_summary
+
+    def test_failed_build_does_not_record_gap_history(self, admin_client, tmp_path):
+        import time as time_mod
+
+        from app.db import get_conn
+        import app.system_understanding_jobs as jobs
+
+        token = _login(admin_client)
+        sys_ = _create_system(admin_client, token, "gap-hist-failed-sys")
+        system_id = sys_["id"]
+        now = time_mod.time()
+
+        with get_conn() as conn:
+            build_id = conn.execute(
+                """INSERT INTO system_understanding_builds
+                    (system_id, snapshot_id, status, created_at)
+                   VALUES (?, NULL, 'running', ?)""",
+                (system_id, now),
+            ).lastrowid
+            for step in jobs.STEP_ORDER:
+                conn.execute(
+                    """INSERT INTO system_understanding_build_steps
+                        (build_id, system_id, snapshot_id, step, depends_on,
+                         status, error, created_at)
+                       VALUES (?, ?, NULL, ?, '[]', 'failed', 'boom', ?)""",
+                    (build_id, system_id, step, now),
+                )
+
+        jobs._finalize_job(build_id, cancelled=False)
+
+        with get_conn() as conn:
+            build = conn.execute(
+                "SELECT status FROM system_understanding_builds WHERE id = ?",
+                (build_id,),
+            ).fetchone()
+        assert build["status"] == "failed"
+        assert self._gap_history_rows(build_id) == []
+
+    def test_cancelled_build_does_not_record_gap_history(self, admin_client, tmp_path):
+        import time as time_mod
+
+        from app.db import get_conn
+        import app.system_understanding_jobs as jobs
+
+        token = _login(admin_client)
+        sys_ = _create_system(admin_client, token, "gap-hist-cancelled-sys")
+        system_id = sys_["id"]
+        now = time_mod.time()
+
+        with get_conn() as conn:
+            build_id = conn.execute(
+                """INSERT INTO system_understanding_builds
+                    (system_id, snapshot_id, status, cancel_requested, created_at)
+                   VALUES (?, NULL, 'running', 1, ?)""",
+                (system_id, now),
+            ).lastrowid
+            for step in jobs.STEP_ORDER:
+                conn.execute(
+                    """INSERT INTO system_understanding_build_steps
+                        (build_id, system_id, snapshot_id, step, depends_on,
+                         status, created_at)
+                       VALUES (?, ?, NULL, ?, '[]', 'pending', ?)""",
+                    (build_id, system_id, step, now),
+                )
+
+        jobs._finalize_job(build_id, cancelled=True)
+
+        with get_conn() as conn:
+            build = conn.execute(
+                "SELECT status FROM system_understanding_builds WHERE id = ?",
+                (build_id,),
+            ).fetchone()
+        assert build["status"] == "cancelled"
+        assert self._gap_history_rows(build_id) == []
+
+    def test_gap_history_isolated_by_system(self, admin_client, tmp_path):
+        token = _login(admin_client)
+        sys_a, hdrs_a = _setup_repo(admin_client, token, tmp_path, "gap-hist-iso-a")
+        r_a = admin_client.post("/repository/system-understanding/build", headers=hdrs_a)
+        job_a = _wait_job(admin_client, hdrs_a, r_a.json()["id"])
+        assert job_a["status"] == "partial"
+
+        rows = self._gap_history_rows(job_a["id"])
+        assert all(r["system_id"] == sys_a["id"] for r in rows)
+
+        # A second, unrelated system has no gap history from system A's build
+        # and reports an empty trend (fewer than 2 builds of its own).
+        sys_b = _create_system(admin_client, token, "gap-hist-iso-b")
+        hdrs_b = _headers(token, sys_b["id"])
+
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            leaked = conn.execute(
+                "SELECT COUNT(*) AS n FROM system_understanding_gap_history WHERE system_id = ?",
+                (sys_b["id"],),
+            ).fetchone()
+        assert leaked["n"] == 0
+
+        r_b = admin_client.get("/repository/system-understanding", headers=hdrs_b)
+        assert r_b.status_code == 200
+        assert r_b.json()["gap_trend"] == []
+        assert r_b.json()["understanding_refresh_recommended"] is False
+
+
 THREE_SECTION_README = (
     "# Test Project\n\nOverview text.\n\n"
     "## SectionA\n\nSectionA describes the ingestion capability in detail.\n\n"

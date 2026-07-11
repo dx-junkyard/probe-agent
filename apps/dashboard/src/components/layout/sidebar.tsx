@@ -31,12 +31,12 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { to: "/repository", icon: GitBranch, label: "Repository" },
       { to: "/capability-map", icon: Network, label: "Capability Map" },
+      { to: "/interview", icon: MessageSquareText, label: "Interview" },
       { to: "/feature-map", icon: Map, label: "Feature Map" },
       { to: "/flow-explorer", icon: Workflow, label: "Flow Explorer" },
       { to: "/trace-lineage", icon: GitFork, label: "Trace Lineage" },
       { to: "/trace-analyzers", icon: Filter, label: "Trace Analyzers" },
       { to: "/probe-planner", icon: Crosshair, label: "Probe Planner" },
-      { to: "/interview", icon: MessageSquareText, label: "Interview" },
       { to: "/experiments", icon: FlaskConical, label: "Experiments" },
     ],
   },

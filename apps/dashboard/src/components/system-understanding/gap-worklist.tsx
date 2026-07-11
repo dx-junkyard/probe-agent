@@ -16,12 +16,15 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Select } from "@/components/ui/select";
 import { Label } from "@/components/ui/label";
+import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import {
   XCircle, AlertTriangle, HelpCircle, ExternalLink, FileText, Code, Zap, Copy, FilePlus2,
+  ArrowDown, ArrowUp, Minus,
 } from "lucide-react";
 import type {
   SystemUnderstandingGap,
+  SystemUnderstandingGapTrend,
   IssueDraft,
   IssueDraftRef,
   IssueDraftStatus,
@@ -425,9 +428,46 @@ function GapCard({ gap, snapshotId, commitSha }: {
   );
 }
 
-export function GapWorklist({ gaps, gapSummary, snapshotId, commitSha }: {
+// Issue #203: gap-count trend between the last two settled builds. Fewer
+// gaps than before is the positive direction for a docs-code gap count, so a
+// decrease is styled distinctly from an increase or unchanged/no-history.
+function GapTrendSummary({ gapTrend }: { gapTrend?: SystemUnderstandingGapTrend[] }) {
+  if (!gapTrend || gapTrend.length === 0) return null;
+  return (
+    <div className="flex flex-wrap gap-2" data-testid="gap-trend">
+      {gapTrend.map((t) => {
+        const delta = t.current - t.previous;
+        const improved = delta < 0;
+        const worsened = delta > 0;
+        return (
+          <Badge
+            key={t.gap_type}
+            variant="outline"
+            className={cn(
+              "text-xs flex items-center gap-1",
+              improved && "border-green-600 text-green-700 dark:text-green-400",
+              worsened && "border-red-600 text-red-700 dark:text-red-400",
+            )}
+          >
+            {improved ? (
+              <ArrowDown className="h-3 w-3" />
+            ) : worsened ? (
+              <ArrowUp className="h-3 w-3" />
+            ) : (
+              <Minus className="h-3 w-3" />
+            )}
+            {t.gap_type} {t.previous} → {t.current}
+          </Badge>
+        );
+      })}
+    </div>
+  );
+}
+
+export function GapWorklist({ gaps, gapSummary, gapTrend, snapshotId, commitSha }: {
   gaps: SystemUnderstandingGap[];
   gapSummary: { gap_type: string; count: number }[];
+  gapTrend?: SystemUnderstandingGapTrend[];
   snapshotId: number | null;
   commitSha: string | null;
 }) {
@@ -440,10 +480,11 @@ export function GapWorklist({ gaps, gapSummary, snapshotId, commitSha }: {
         <CardHeader>
           <CardTitle className="text-base">Docs-Code Gaps</CardTitle>
         </CardHeader>
-        <CardContent>
+        <CardContent className="space-y-3">
           <p className="text-sm text-muted-foreground" data-testid="no-gaps-message">
             No significant differences found between documentation and code.
           </p>
+          <GapTrendSummary gapTrend={gapTrend} />
         </CardContent>
       </Card>
     );
@@ -470,6 +511,7 @@ export function GapWorklist({ gaps, gapSummary, snapshotId, commitSha }: {
             <span key={sev}> / {cnt} {sev}</span>
           ))}
         </CardDescription>
+        <GapTrendSummary gapTrend={gapTrend} />
       </CardHeader>
       <CardContent className="space-y-4">
         {/* Summary chips */}

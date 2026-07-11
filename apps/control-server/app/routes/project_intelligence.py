@@ -805,6 +805,8 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
         SystemUnderstandingGapSymbolRef,
         SystemUnderstandingGapEntrypointRef,
         IssueDraftRefOut,
+        SystemUnderstandingStageStatusOut,
+        SystemUnderstandingGapTrendOut,
     )
     pipeline = [
         SystemUnderstandingPipelineStepOut(step=s.step, status=s.status, detail=s.detail)
@@ -857,8 +859,24 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
     next_actions = [
         SystemUnderstandingNextActionOut(
             action=a.action, reason=a.reason, category=a.category, link=a.link,
+            action_kind=a.action_kind,
         )
         for a in summary.next_actions
+    ]
+    primary_action = None
+    if summary.primary_action:
+        pa = summary.primary_action
+        primary_action = SystemUnderstandingNextActionOut(
+            action=pa.action, reason=pa.reason, category=pa.category, link=pa.link,
+            action_kind=pa.action_kind,
+        )
+    stages = [
+        SystemUnderstandingStageStatusOut(stage=s.stage, status=s.status, counts=s.counts)
+        for s in summary.stages
+    ]
+    gap_trend = [
+        SystemUnderstandingGapTrendOut(gap_type=gt.gap_type, current=gt.current, previous=gt.previous)
+        for gt in summary.gap_trend
     ]
     return SystemUnderstandingOut(
         system_id=summary.system_id,
@@ -873,6 +891,10 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
         gap_summary=gap_summary,
         metadata_coverage=metadata_coverage,
         next_actions=next_actions,
+        primary_action=primary_action,
+        stages=stages,
+        gap_trend=gap_trend,
+        understanding_refresh_recommended=summary.understanding_refresh_recommended,
     )
 
 

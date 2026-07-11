@@ -2779,6 +2779,13 @@ describe("Sidebar navigation grouping (Issue #179)", () => {
     // System Understanding is grouped under Hub, not Detail views.
     expect(within(screen.getByTestId("sidebar-group-hub")).getByText("System Understanding")).toBeTruthy();
     expect(within(screen.getByTestId("sidebar-group-detail-views")).getByText("Flow Explorer")).toBeTruthy();
+
+    // Issue #199: Interview sits directly after Capability Map in Detail views.
+    const detailLabels = within(screen.getByTestId("sidebar-group-detail-views"))
+      .getAllByRole("link")
+      .map((el) => el.textContent);
+    const capIdx = detailLabels.indexOf("Capability Map");
+    expect(detailLabels[capIdx + 1]).toBe("Interview");
   });
 });
 
@@ -3037,7 +3044,9 @@ describe("System Understanding page", () => {
     metadata_coverage: { symbol_count: 100, symbols_with_source_metadata: 2, entrypoint_count: 20, entrypoints_with_capability_link: 1 },
   };
 
-  test("renders empty state when no snapshot exists", async () => {
+  test("renders pipeline checklist (not a separate empty state) when no snapshot exists", async () => {
+    // Issue #200: EmptyState was folded into PipelineChecklist. The all-missing
+    // pipeline is shown as the checklist itself, with a CTA on the first step.
     mockApi.get.mockImplementation((path: string) =>
       path === "/repository/system-understanding"
         ? Promise.resolve(emptyResponse)
@@ -3048,12 +3057,122 @@ describe("System Understanding page", () => {
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
 
     await waitFor(() => {
-      expect(screen.getByText("System Understanding")).toBeTruthy();
+      expect(screen.getByTestId("pipeline-checklist")).toBeTruthy();
     });
 
+    expect(screen.queryByText("Get started with System Understanding")).toBeNull();
+  });
+
+  test("shows a CTA only on the first incomplete step when the pipeline is all missing", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(emptyResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
     await waitFor(() => {
-      expect(screen.getByText("Get started with System Understanding")).toBeTruthy();
+      expect(screen.getByTestId("pipeline-checklist")).toBeTruthy();
     });
+
+    const cta = screen.getByTestId("pipeline-cta-repository_configured");
+    expect(cta.textContent).toContain("Configure repository");
+    expect(cta.getAttribute("href")).toBe("/repository");
+
+    // No other step gets a CTA.
+    expect(screen.queryByTestId("pipeline-cta-snapshot_ready")).toBeNull();
+    expect(screen.queryByTestId("pipeline-cta-symbols_indexed")).toBeNull();
+  });
+
+  test("CTA targets only the first incomplete step in a mid-pipeline state, and wires to Build", async () => {
+    // snapshot_ready is complete; documentation_indexed is the first incomplete
+    // step, which maps to the Build / Refresh action rather than a repository link.
+    const midResponse = {
+      ...emptyResponse,
+      snapshot_id: 5,
+      commit_sha: "abc12345",
+      pipeline: [
+        { step: "repository_configured", status: "complete" },
+        { step: "snapshot_ready", status: "complete" },
+        { step: "documentation_indexed", status: "missing" },
+        { step: "documentation_claims_scanned", status: "missing" },
+        { step: "symbols_indexed", status: "missing" },
+        { step: "entrypoints_discovered", status: "missing" },
+        { step: "docs_code_reconciled", status: "missing" },
+        { step: "capability_hierarchy_ready", status: "missing" },
+      ],
+    };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(midResponse)
+        : Promise.resolve(null),
+    );
+    mockApi.post.mockImplementation((path: string) =>
+      path === "/repository/system-understanding/build"
+        ? Promise.resolve(completeResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("pipeline-checklist")).toBeTruthy();
+    });
+
+    expect(screen.queryByTestId("pipeline-cta-repository_configured")).toBeNull();
+    expect(screen.queryByTestId("pipeline-cta-snapshot_ready")).toBeNull();
+
+    const cta = screen.getByTestId("pipeline-cta-documentation_indexed");
+    expect(cta.textContent).toContain("Run Build / Refresh");
+    expect(screen.queryByTestId("pipeline-cta-documentation_claims_scanned")).toBeNull();
+
+    fireEvent.click(cta);
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/repository/system-understanding/build");
+    });
+  });
+
+  test("disables the build CTA while a build is running", async () => {
+    const midResponse = {
+      ...emptyResponse,
+      pipeline: [
+        { step: "repository_configured", status: "complete" },
+        { step: "snapshot_ready", status: "complete" },
+        { step: "documentation_indexed", status: "missing" },
+        { step: "documentation_claims_scanned", status: "missing" },
+        { step: "symbols_indexed", status: "missing" },
+        { step: "entrypoints_discovered", status: "missing" },
+        { step: "docs_code_reconciled", status: "missing" },
+        { step: "capability_hierarchy_ready", status: "missing" },
+      ],
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(midResponse);
+      if (path === "/repository/system-understanding/build/latest") {
+        return Promise.resolve({
+          id: 1, job_id: 1, run_id: 1, system_id: 1, snapshot_id: 5,
+          status: "running", current_step: "claim_scan", error: null,
+          cancel_requested: false, is_stuck: false,
+          heartbeat_at: Date.now() / 1000, started_at: Date.now() / 1000,
+          completed_at: null, created_at: Date.now() / 1000,
+          steps: [], llm_tasks: { total: 0, pending: 0, running: 0, completed: 0, failed: 0, cancelled: 0, reused: 0 },
+          artifact_counts: {},
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("pipeline-cta-documentation_indexed")).toBeTruthy();
+    });
+
+    expect(screen.getByTestId("pipeline-cta-documentation_indexed")).toBeDisabled();
   });
 
   test("renders pipeline complete state with all sections", async () => {
@@ -3183,7 +3302,12 @@ describe("System Understanding page", () => {
     expect(screen.getByTestId("metadata-coverage")).toBeTruthy();
 
     // Each stage links to its detail pages.
+    expect(within(screen.getByTestId("stage-links-understand")).getByText("Capability Map")).toBeTruthy();
+    // Issue #199: Interview is reachable from both the Understand and Decide
+    // Where to Observe stages, since its stages map onto both.
+    expect(within(screen.getByTestId("stage-links-understand")).getByText("Interview")).toBeTruthy();
     expect(within(screen.getByTestId("stage-links-observe")).getByText("Flow Explorer")).toBeTruthy();
+    expect(within(screen.getByTestId("stage-links-observe")).getByText("Interview")).toBeTruthy();
     expect(within(screen.getByTestId("stage-links-instrument")).getByText("Probe Planner")).toBeTruthy();
     expect(within(screen.getByTestId("stage-links-evaluate")).getByText("Experiments")).toBeTruthy();
   });
@@ -3484,6 +3608,373 @@ describe("System Understanding page", () => {
     expect(link.getAttribute("href")).toBe("https://x.test/1");
     // Existing draft flips the action button label to "Open issue draft".
     expect(screen.getByText("Open issue draft")).toBeTruthy();
+  });
+
+  // ── Primary action card (Issue #201) ──────────────────────────────
+
+  test("renders a navigate primary_action as a link button under the header", async () => {
+    const response = {
+      ...completeResponse,
+      next_actions: [
+        { action: "Define System Purpose", reason: "Pipeline completed, but no system purpose is defined yet.", category: "understand", link: "/interview" },
+      ],
+      primary_action: {
+        action: "Define System Purpose",
+        reason: "Pipeline completed, but no system purpose is defined yet.",
+        category: "understand",
+        link: "/interview",
+        action_kind: "navigate",
+      },
+    };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(response)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("primary-action")).toBeTruthy();
+    });
+
+    const card = screen.getByTestId("primary-action");
+    expect(card.textContent).toContain("Define System Purpose");
+    expect(card.textContent).toContain("Pipeline completed, but no system purpose is defined yet.");
+
+    const cta = screen.getByTestId("primary-action-cta");
+    expect(cta.getAttribute("href")).toBe("/interview");
+  });
+
+  test("renders a build primary_action that triggers build.mutate on click", async () => {
+    const midResponse = {
+      ...emptyResponse,
+      snapshot_id: 5,
+      commit_sha: "abc12345",
+      pipeline: [
+        { step: "repository_configured", status: "complete" },
+        { step: "snapshot_ready", status: "complete" },
+        { step: "documentation_indexed", status: "missing" },
+        { step: "documentation_claims_scanned", status: "missing" },
+        { step: "symbols_indexed", status: "missing" },
+        { step: "entrypoints_discovered", status: "missing" },
+        { step: "docs_code_reconciled", status: "missing" },
+        { step: "capability_hierarchy_ready", status: "missing" },
+      ],
+      primary_action: {
+        action: "Build system understanding",
+        reason: "6 pipeline steps not complete yet",
+        category: "understand",
+        link: null,
+        action_kind: "build",
+      },
+    };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(midResponse)
+        : Promise.resolve(null),
+    );
+    mockApi.post.mockImplementation((path: string) =>
+      path === "/repository/system-understanding/build"
+        ? Promise.resolve(completeResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("primary-action")).toBeTruthy();
+    });
+
+    const cta = screen.getByTestId("primary-action-cta");
+    expect(cta.textContent).toContain("Build system understanding");
+
+    fireEvent.click(cta);
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/repository/system-understanding/build");
+    });
+  });
+
+  test("hides the primary action card when primary_action is null", async () => {
+    const response = { ...completeResponse, primary_action: null };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(response)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByText("Test System")).toBeTruthy();
+    });
+
+    expect(screen.queryByTestId("primary-action")).toBeNull();
+  });
+
+  // ── Stage status badges + counts summary (Issue #202) ──────────────
+
+  test("renders stage status badges and a heading counts line for understand/observe", async () => {
+    const response = {
+      ...completeResponse,
+      stages: [
+        { stage: "understand", status: "complete", counts: { gaps: 0 } },
+        { stage: "observe", status: "in_progress", counts: { entrypoints: 3, unclassified: 1 } },
+        { stage: "instrument", status: "not_started", counts: { proposed: 0, approved_without_patch: 0, validated: 0 } },
+        { stage: "evaluate", status: "not_started", counts: { undecided: 0, decided: 0 } },
+      ],
+    };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(response)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("stage-status-understand")).toBeTruthy();
+    });
+
+    expect(screen.getByTestId("stage-status-understand").textContent).toBe("Complete");
+    expect(screen.getByTestId("stage-status-observe").textContent).toBe("In progress");
+    expect(screen.getByTestId("stage-status-instrument").textContent).toBe("Not started");
+    expect(screen.getByTestId("stage-status-evaluate").textContent).toBe("Not started");
+
+    expect(screen.getByTestId("stage-counts-observe").textContent).toContain("entrypoints: 3");
+    expect(screen.getByTestId("stage-counts-observe").textContent).toContain("unclassified: 1");
+
+    // Instrument/Evaluate show their counts via the dedicated summary block
+    // below instead of the generic heading counts line (no duplication).
+    expect(screen.queryByTestId("stage-counts-instrument")).toBeNull();
+    expect(screen.queryByTestId("stage-counts-evaluate")).toBeNull();
+  });
+
+  test("shows Instrument/Evaluate counts summaries linking to Probe Planner/Experiments when non-zero", async () => {
+    const response = {
+      ...completeResponse,
+      stages: [
+        { stage: "understand", status: "complete", counts: { gaps: 0 } },
+        { stage: "observe", status: "complete", counts: { entrypoints: 3, unclassified: 0 } },
+        { stage: "instrument", status: "in_progress", counts: { proposed: 2, approved_without_patch: 1, validated: 0 } },
+        { stage: "evaluate", status: "in_progress", counts: { undecided: 1, decided: 2 } },
+      ],
+    };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(response)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("stage-summary-instrument")).toBeTruthy();
+    });
+
+    const instrumentSummary = screen.getByTestId("stage-summary-instrument");
+    expect(instrumentSummary.textContent).toContain("Proposed");
+    expect(instrumentSummary.textContent).toContain("2");
+    expect(instrumentSummary.textContent).toContain("Approved without patch");
+    expect(instrumentSummary.textContent).toContain("1");
+    expect(instrumentSummary.textContent).toContain("Validated");
+    const instrumentLinks = within(instrumentSummary).getAllByRole("link");
+    expect(instrumentLinks.length).toBeGreaterThan(0);
+    for (const link of instrumentLinks) {
+      expect(link.getAttribute("href")).toBe("/probe-planner");
+    }
+
+    const evaluateSummary = screen.getByTestId("stage-summary-evaluate");
+    expect(evaluateSummary.textContent).toContain("Undecided");
+    expect(evaluateSummary.textContent).toContain("1");
+    expect(evaluateSummary.textContent).toContain("Decided");
+    expect(evaluateSummary.textContent).toContain("2");
+    const evaluateLinks = within(evaluateSummary).getAllByRole("link");
+    expect(evaluateLinks.length).toBeGreaterThan(0);
+    for (const link of evaluateLinks) {
+      expect(link.getAttribute("href")).toBe("/experiments");
+    }
+  });
+
+  test("falls back to the original description text for Instrument/Evaluate when counts are all zero", async () => {
+    const response = {
+      ...completeResponse,
+      stages: [
+        { stage: "understand", status: "complete", counts: { gaps: 0 } },
+        { stage: "observe", status: "complete", counts: { entrypoints: 3, unclassified: 0 } },
+        { stage: "instrument", status: "not_started", counts: { proposed: 0, approved_without_patch: 0, validated: 0 } },
+        { stage: "evaluate", status: "not_started", counts: { undecided: 0, decided: 0 } },
+      ],
+    };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(response)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("stage-summary-instrument")).toBeTruthy();
+    });
+
+    expect(screen.getByTestId("stage-summary-instrument").textContent).toContain(
+      "Probe plan and patch status live in Probe Planner",
+    );
+    expect(screen.getByTestId("stage-summary-evaluate").textContent).toContain(
+      "Trace comparisons, experiment runs, and adoption decisions live in Experiments",
+    );
+  });
+
+  test("renders with no stage status badges when data.stages is missing (backward compat)", async () => {
+    // completeResponse predates Issue #202 and has no `stages` field.
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(completeResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("stage-section-understand")).toBeTruthy();
+    });
+
+    expect(screen.queryByTestId("stage-status-understand")).toBeNull();
+    expect(screen.queryByTestId("stage-status-observe")).toBeNull();
+    expect(screen.queryByTestId("stage-status-instrument")).toBeNull();
+    expect(screen.queryByTestId("stage-status-evaluate")).toBeNull();
+    expect(screen.getByTestId("stage-summary-instrument").textContent).toContain(
+      "Probe plan and patch status live in Probe Planner",
+    );
+    expect(screen.getByTestId("stage-summary-evaluate").textContent).toContain(
+      "Trace comparisons, experiment runs, and adoption decisions live in Experiments",
+    );
+  });
+
+  // ── Gap trend + refresh recommendation (Issue #203) ─────────────────
+
+  test("shows the refresh-recommended banner when understanding_refresh_recommended is true", async () => {
+    const response = { ...completeResponse, understanding_refresh_recommended: true };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(response)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("refresh-recommended-banner")).toBeTruthy();
+    });
+
+    const cta = screen.getByTestId("refresh-recommended-cta");
+    fireEvent.click(cta);
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/repository/system-understanding/build");
+    });
+  });
+
+  test("hides the refresh-recommended banner while a build is running, even if recommended", async () => {
+    const response = { ...completeResponse, understanding_refresh_recommended: true };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(response);
+      if (path === "/repository/system-understanding/build/latest") {
+        return Promise.resolve({
+          id: 1, job_id: 1, run_id: 1, system_id: 1, snapshot_id: 5,
+          status: "running", current_step: "claim_scan", error: null,
+          cancel_requested: false, is_stuck: false,
+          heartbeat_at: Date.now() / 1000, started_at: Date.now() / 1000,
+          completed_at: null, created_at: Date.now() / 1000,
+          steps: [], llm_tasks: { total: 0, pending: 0, running: 0, completed: 0, failed: 0, cancelled: 0, reused: 0 },
+          artifact_counts: {},
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("build-progress")).toBeTruthy();
+    });
+
+    expect(screen.queryByTestId("refresh-recommended-banner")).toBeNull();
+  });
+
+  test("does not show the refresh-recommended banner when understanding_refresh_recommended is false", async () => {
+    const response = { ...completeResponse, understanding_refresh_recommended: false };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(response)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByText("Test System")).toBeTruthy();
+    });
+
+    expect(screen.queryByTestId("refresh-recommended-banner")).toBeNull();
+  });
+
+  test("renders gap_trend increase/decrease chips in the gap worklist", async () => {
+    const response = {
+      ...gapWorklistResponse,
+      gap_trend: [
+        { gap_type: "docs_only", current: 8, previous: 12 },
+        { gap_type: "code_only", current: 3, previous: 1 },
+      ],
+    };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(response)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("gap-trend")).toBeTruthy();
+    });
+
+    const trend = screen.getByTestId("gap-trend");
+    expect(trend.textContent).toContain("docs_only");
+    expect(trend.textContent).toContain("12");
+    expect(trend.textContent).toContain("8");
+    expect(trend.textContent).toContain("code_only");
+    expect(trend.textContent).toContain("1");
+    expect(trend.textContent).toContain("3");
+  });
+
+  test("renders no gap trend section when gap_trend is empty or missing (backward compat)", async () => {
+    // gapWorklistResponse predates Issue #203 and has no `gap_trend` field.
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(gapWorklistResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("gap-worklist")).toBeTruthy();
+    });
+
+    expect(screen.queryByTestId("gap-trend")).toBeNull();
   });
 });
 

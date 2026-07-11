@@ -476,12 +476,40 @@ def _execute_job(build_id: int, system_id: int) -> None:
     _finalize_job(build_id, cancelled)
 
 
+def _record_gap_history(
+    conn, system_id: int, snapshot_id: Optional[int], build_id: int, now: float
+) -> None:
+    """Persist per-gap_type counts for a settled build (Issue #203).
+
+    Reuses the exact same gap computation the read path uses
+    (`_load_gaps_from_reconciler` + `_compute_gap_summary`) so history never
+    diverges from what the Hub displays for the same build/snapshot. Only
+    called for completed/partial jobs; a gap_type with zero gaps simply gets
+    no row (equivalent to a stored count of 0 when the trend is read back).
+    """
+    if snapshot_id is None:
+        return
+    from .system_understanding_service import _compute_gap_summary, _load_gaps_from_reconciler
+
+    gaps = _load_gaps_from_reconciler(conn, system_id, snapshot_id)
+    gap_summary = _compute_gap_summary(gaps)
+    for gs in gap_summary:
+        conn.execute(
+            """INSERT INTO system_understanding_gap_history
+                (system_id, snapshot_id, build_id, gap_type, count, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            (system_id, snapshot_id, build_id, gs.gap_type, gs.count, now),
+        )
+
+
 def _finalize_job(build_id: int, cancelled: bool) -> None:
     now = time.time()
     with get_conn() as conn:
         job = conn.execute(
             "SELECT * FROM system_understanding_builds WHERE id = ?", (build_id,)
         ).fetchone()
+        system_id = job["system_id"]
+        snapshot_id = job["snapshot_id"]
         cancelled = cancelled or bool(job["cancel_requested"])
         if cancelled:
             conn.execute(
@@ -529,6 +557,8 @@ def _finalize_job(build_id: int, cancelled: bool) -> None:
             (status, error, now, now, build_id),
         )
         _close_open_runs(conn, build_id, status)
+        if status in ("completed", "partial"):
+            _record_gap_history(conn, system_id, snapshot_id, build_id, now)
     logger.info("system_understanding job %s finished with status=%s", build_id, status)
 
 

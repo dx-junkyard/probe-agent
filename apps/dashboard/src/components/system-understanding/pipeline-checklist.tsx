@@ -1,9 +1,10 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { DiagnosticCheckCard, EnvFixDialog } from "@/components/diagnostics-badge";
 import { useDiagnosticActivate } from "@/components/diagnostic-fix";
+import { cn } from "@/lib/utils";
 import {
   CheckCircle2, XCircle, AlertTriangle, Ban, HelpCircle, Stethoscope,
 } from "lucide-react";
@@ -32,6 +33,27 @@ const STEP_LINKS: Record<string, string> = {
   docs_code_reconciled: "/system-understanding",
 };
 
+/**
+ * Issue #200: fixed step -> CTA mapping for the "next single action" hint on
+ * the first incomplete pipeline step. This is a deterministic, explicitly
+ * enumerated mapping (CLAUDE.md Principle 6) — not an inferred suggestion.
+ * `repository_configured` / `snapshot_ready` link to the Repository page
+ * where the repo/snapshot is set up; every other known step is resolved by
+ * running the Build / Refresh job, so its CTA connects to that action.
+ */
+type StepCta = { kind: "repository" | "build"; label: string };
+
+const STEP_CTA: Record<string, StepCta> = {
+  repository_configured: { kind: "repository", label: "Configure repository" },
+  snapshot_ready: { kind: "repository", label: "Create snapshot" },
+  symbols_indexed: { kind: "build", label: "Run Build / Refresh" },
+  documentation_indexed: { kind: "build", label: "Run Build / Refresh" },
+  documentation_claims_scanned: { kind: "build", label: "Run Build / Refresh" },
+  entrypoints_discovered: { kind: "build", label: "Run Build / Refresh" },
+  docs_code_reconciled: { kind: "build", label: "Run Build / Refresh" },
+  capability_hierarchy_ready: { kind: "build", label: "Run Build / Refresh" },
+};
+
 export function StatusIcon({ status }: { status: string }) {
   switch (status) {
     case "complete":
@@ -57,12 +79,24 @@ export function statusVariant(status: string): "default" | "secondary" | "destru
   }
 }
 
-export function PipelineChecklist({ steps, checksByStep }: {
+export function PipelineChecklist({ steps, checksByStep, onRunBuild, buildDisabled }: {
   steps: SystemUnderstandingPipelineStep[];
   checksByStep: Record<string, SystemDiagnosticCheck[]>;
+  /** Issue #200: runs the Build / Refresh job, wired to the first incomplete
+   * step's CTA when that step's fix is "run a build" rather than "go
+   * configure the repository". */
+  onRunBuild?: () => void;
+  /** Disables the build CTA while a build is already running/pending. */
+  buildDisabled?: boolean;
 }) {
   const [expandedStep, setExpandedStep] = useState<string | null>(null);
   const { activate, envCheck, closeEnv } = useDiagnosticActivate();
+
+  // Issue #200: the CTA appears on the first non-complete step only (array
+  // order, deterministic), so onboarding always highlights exactly one
+  // "next action" instead of a wall of steps.
+  const firstIncompleteStep = steps.find((s) => s.status !== "complete")?.step ?? null;
+
   return (
     <>
     <ul className="space-y-2" data-testid="pipeline-checklist">
@@ -71,6 +105,7 @@ export function PipelineChecklist({ steps, checksByStep }: {
         const label = STEP_LABELS[s.step] ?? s.step;
         const relatedChecks = s.status === "complete" ? [] : (checksByStep[s.step] ?? []);
         const expanded = expandedStep === s.step;
+        const cta = s.step === firstIncompleteStep ? STEP_CTA[s.step] : undefined;
         return (
           <li key={s.step} className="text-sm">
             <div className="flex items-center gap-3">
@@ -87,6 +122,26 @@ export function PipelineChecklist({ steps, checksByStep }: {
               </Badge>
               {s.detail && (
                 <span className="text-xs text-muted-foreground ml-1">{s.detail}</span>
+              )}
+              {cta && cta.kind === "repository" && (
+                <Link
+                  to="/repository"
+                  data-testid={`pipeline-cta-${s.step}`}
+                  className={cn(buttonVariants({ size: "sm" }), "h-7 text-xs")}
+                >
+                  {cta.label}
+                </Link>
+              )}
+              {cta && cta.kind === "build" && (
+                <Button
+                  size="sm"
+                  className="h-7 text-xs"
+                  data-testid={`pipeline-cta-${s.step}`}
+                  onClick={onRunBuild}
+                  disabled={buildDisabled}
+                >
+                  {cta.label}
+                </Button>
               )}
               {relatedChecks.length > 0 && (
                 <Button

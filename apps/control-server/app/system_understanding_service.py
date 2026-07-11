@@ -48,6 +48,11 @@ class PipelineStep:
 # Understand -> Decide -> Instrument -> Evaluate stages.
 NextActionCategory = Literal["understand", "observe", "instrument", "evaluate"]
 
+# Issue #201: finite set of how a next action is carried out. "navigate" (the
+# default) links the user to a page; "build" means the action triggers the
+# Build / Refresh job directly instead of navigating anywhere.
+NextActionKind = Literal["navigate", "build"]
+
 
 @dataclass
 class NextAction:
@@ -55,12 +60,32 @@ class NextAction:
     reason: str
     category: NextActionCategory
     link: Optional[str] = None
+    action_kind: NextActionKind = "navigate"
 
 
 @dataclass
 class GapSummary:
     gap_type: str
     count: int
+
+
+# Issue #202: finite completion status for each of the 4 Hub stages.
+StageStatusValue = Literal["not_started", "in_progress", "blocked", "complete"]
+
+
+@dataclass
+class StageStatus:
+    stage: str
+    status: str
+    counts: Dict[str, int] = field(default_factory=dict)
+
+
+# Issue #203: before/after gap counts across the last two settled builds.
+@dataclass
+class GapTrend:
+    gap_type: str
+    current: int
+    previous: int
 
 
 @dataclass
@@ -85,6 +110,16 @@ class SystemUnderstandingSummary:
     gap_summary: List[GapSummary] = field(default_factory=list)
     metadata_coverage: Optional[MetadataCoverage] = None
     next_actions: List[NextAction] = field(default_factory=list)
+    # Issue #201: single highest-priority action for the current state; None
+    # while a build job is actively running.
+    primary_action: Optional[NextAction] = None
+    # Issue #202: completion status + counts for each of the 4 Hub stages.
+    stages: List[StageStatus] = field(default_factory=list)
+    # Issue #203: gap-count trend across the last two settled builds, and
+    # whether a materialized Interview change post-dates the latest completed
+    # build (both deterministic, no reasoning model involved).
+    gap_trend: List[GapTrend] = field(default_factory=list)
+    understanding_refresh_recommended: bool = False
 
 
 def _check_repository_configured(conn, system_id: int) -> PipelineStep:
@@ -500,6 +535,13 @@ GAP_TITLE_TEMPLATES: Dict[str, str] = {
     "ambiguous_ownership": "Ambiguous ownership: {name}",
 }
 
+# Issue #199: single source of truth for "gap type -> resolution action(s)".
+# For every gap type, index [0] is the primary resolution — the action a
+# gap card AND the top-level Next Action for that gap type both link to.
+# Principle: work that fixes/completes state (classification, metadata)
+# belongs to Interview; work that only reviews/browses existing state
+# belongs to Capability Map / Flow Explorer. Any additional entries after
+# [0] are secondary/alternate actions shown only on the gap card.
 GAP_NEXT_ACTIONS: Dict[str, List[Dict[str, Optional[str]]]] = {
     "docs_only": [
         {"action": "Open docs evidence", "link": None},
@@ -819,14 +861,22 @@ def _build_next_actions(
             link="/system-understanding",
         ))
 
+    # Issue #199: the link for each gap-type-derived top-level action is
+    # taken from GAP_NEXT_ACTIONS[gap_type][0] (the primary resolution) so
+    # this action and the corresponding gap card never disagree on where to
+    # send the user.
     gap_counts = {g.gap_type: g.count for g in (gap_summary or [])}
     unclassified_count = gap_counts.get("unclassified_entrypoint", 0)
     if unclassified_count > 0:
         actions.append(NextAction(
             action="Unclassified API found",
-            reason=f"{unclassified_count} API entrypoint{'s' if unclassified_count != 1 else ''} need capability classification",
+            reason=(
+                f"{unclassified_count} API entrypoint{'s' if unclassified_count != 1 else ''} "
+                "need capability classification; classify in Interview, then view "
+                "results in Capability Map"
+            ),
             category="observe",
-            link="/capability-map",
+            link=GAP_NEXT_ACTIONS["unclassified_entrypoint"][0]["link"],
         ))
 
     probe_candidate_count = gap_counts.get("missing_probe_flow", 0)
@@ -835,7 +885,7 @@ def _build_next_actions(
             action="Probe candidate available",
             reason=f"{probe_candidate_count} classified entrypoint{'s' if probe_candidate_count != 1 else ''} have no probe plan yet",
             category="observe",
-            link="/flow-explorer",
+            link=GAP_NEXT_ACTIONS["missing_probe_flow"][0]["link"],
         ))
 
     # Issue #174: probe plan / experiment status is a downstream, independent
@@ -889,6 +939,57 @@ def _build_next_actions(
     return actions
 
 
+def _derive_primary_action(
+    pipeline: List[PipelineStep],
+    next_actions: List[NextAction],
+    latest_build: Optional[Dict[str, Any]],
+) -> Optional[NextAction]:
+    """Pure derivation of the single highest-priority action (Issue #201).
+
+    ``next_actions`` is the already-ordered state machine produced by
+    ``_build_next_actions`` above; this function does not change that
+    ordering, it only picks the one action a Hub header CTA should show,
+    using the explicit finite rules below (evaluated in order, first match
+    wins). Deterministic only (Principle 6) -- no reasoning model involved.
+
+    NOTE: a future phase may fold this into ``system_state.py`` (Issue #193,
+    System State Assessment) as one more state-machine projection alongside
+    ``StateItem``; not merged here, per this issue's non-goals.
+    """
+    step_map = {s.step: s.status for s in pipeline}
+
+    # Rule 1: repository not configured or no ready snapshot -> the existing
+    # first next_action (Configure repository / Create snapshot).
+    if (
+        step_map.get("repository_configured") != "complete"
+        or step_map.get("snapshot_ready") != "complete"
+    ):
+        return next_actions[0] if next_actions else None
+
+    # Rule 2: a build job is actively running/queued -> no primary action;
+    # BuildJobPanel already shows step-by-step progress for it.
+    if latest_build and latest_build.get("status") in ("queued", "running"):
+        return None
+
+    # Rule 3: some pipeline step (beyond repository/snapshot, already
+    # confirmed complete above) is not complete -> point at running a build,
+    # independent of which/how many steps remain.
+    incomplete_steps = [s for s in pipeline if s.status != "complete"]
+    if incomplete_steps:
+        count = len(incomplete_steps)
+        return NextAction(
+            action="Build system understanding",
+            reason=f"{count} pipeline step{'s' if count != 1 else ''} not complete yet",
+            category="understand",
+            link=None,
+            action_kind="build",
+        )
+
+    # Rule 4: everything above is satisfied -> defer to the first next_action
+    # (its generation order/priority is unchanged by this issue).
+    return next_actions[0] if next_actions else None
+
+
 def _plan_has_validated_patch(conn, plan_id: int) -> bool:
     """A plan's patch is validated when its latest baseline and probed
     validation runs both succeeded — the same finite condition the patch
@@ -912,8 +1013,15 @@ def _plan_has_validated_patch(conn, plan_id: int) -> bool:
     return False
 
 
-def _load_pending_plan_action_ids(conn, system_id: int) -> Tuple[List[int], List[int]]:
-    """Return (proposed_plan_ids, approved_plan_ids_without_validated_patch)."""
+def _load_pending_plan_action_ids(conn, system_id: int) -> Tuple[List[int], List[int], int]:
+    """Return (proposed_plan_ids, approved_plan_ids_without_validated_patch,
+    approved_plan_total_count).
+
+    ``approved_plan_total_count`` is exposed (Issue #202) so the Instrument
+    stage's ``validated`` count can be derived as
+    ``approved_plan_total_count - len(approved_plan_ids_without_validated_patch)``
+    without a second, differently-worded query over the same rows.
+    """
     proposed_ids = [
         r["id"] for r in conn.execute(
             "SELECT id FROM probe_plans WHERE system_id = ? AND status = 'proposed' ORDER BY id DESC",
@@ -927,7 +1035,7 @@ def _load_pending_plan_action_ids(conn, system_id: int) -> Tuple[List[int], List
     approved_without_patch_ids = [
         r["id"] for r in approved_rows if not _plan_has_validated_patch(conn, r["id"])
     ]
-    return proposed_ids, approved_without_patch_ids
+    return proposed_ids, approved_without_patch_ids, len(approved_rows)
 
 
 def _load_undecided_completed_experiment_ids(conn, system_id: int) -> List[int]:
@@ -938,6 +1046,192 @@ def _load_undecided_completed_experiment_ids(conn, system_id: int) -> List[int]:
         (system_id,),
     ).fetchall()
     return [r["id"] for r in rows]
+
+
+def _load_decided_completed_experiment_count(conn, system_id: int) -> int:
+    """Count of completed experiments with a recorded decision -- the exact
+    complement of ``_load_undecided_completed_experiment_ids`` (same
+    status/human_decision condition set, Issue #202)."""
+    row = conn.execute(
+        """SELECT COUNT(*) FROM experiments
+           WHERE system_id = ? AND status = 'completed' AND human_decision != 'undecided'""",
+        (system_id,),
+    ).fetchone()
+    return row[0]
+
+
+def _load_total_probe_plan_count(conn, system_id: int) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) FROM probe_plans WHERE system_id = ?", (system_id,)
+    ).fetchone()
+    return row[0]
+
+
+def _load_total_experiment_count(conn, system_id: int) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) FROM experiments WHERE system_id = ?", (system_id,)
+    ).fetchone()
+    return row[0]
+
+
+def _derive_stage_statuses(
+    pipeline: List[PipelineStep],
+    purpose: Optional[Dict[str, Any]],
+    capabilities: List[Dict[str, Any]],
+    gap_count: int,
+    gap_summary: List[GapSummary],
+    entrypoint_count: int,
+    proposed_plan_count: int,
+    approved_without_patch_count: int,
+    validated_plan_count: int,
+    total_plan_count: int,
+    undecided_experiment_count: int,
+    decided_experiment_count: int,
+    total_experiment_count: int,
+) -> List[StageStatus]:
+    """Pure derivation of the 4 Hub stage completion statuses (Issue #202).
+
+    Each stage's rules are evaluated top-to-bottom, first match wins
+    (Principle 6: explicit finite branches over an enumerated set, no
+    reasoning model). See the "Stage status" table in
+    docs/system-understanding-navigation.md for the rule source.
+    """
+    stages: List[StageStatus] = []
+
+    # --- understand ---
+    if any(s.status in ("blocked", "failed") for s in pipeline):
+        understand_status = "blocked"
+    elif all(s.status == "missing" for s in pipeline):
+        understand_status = "not_started"
+    else:
+        purpose_defined = bool(purpose and (purpose.get("summary") or purpose.get("name")))
+        if (
+            all(s.status == "complete" for s in pipeline)
+            and purpose_defined
+            and len(capabilities) > 0
+        ):
+            understand_status = "complete"
+        else:
+            understand_status = "in_progress"
+    stages.append(StageStatus("understand", understand_status, {"gaps": gap_count}))
+
+    # --- observe (Decide Where to Observe) ---
+    step_map = {s.step: s.status for s in pipeline}
+    unclassified_count = next(
+        (g.count for g in gap_summary if g.gap_type == "unclassified_entrypoint"), 0
+    )
+    if step_map.get("entrypoints_discovered") != "complete":
+        observe_status = "not_started"
+    elif entrypoint_count > 0 and unclassified_count == 0:
+        observe_status = "complete"
+    else:
+        observe_status = "in_progress"
+    stages.append(StageStatus(
+        "observe", observe_status,
+        {"entrypoints": entrypoint_count, "unclassified": unclassified_count},
+    ))
+
+    # --- instrument ---
+    if total_plan_count == 0:
+        instrument_status = "not_started"
+    elif validated_plan_count > 0 and approved_without_patch_count == 0:
+        instrument_status = "complete"
+    else:
+        instrument_status = "in_progress"
+    stages.append(StageStatus(
+        "instrument", instrument_status,
+        {
+            "proposed": proposed_plan_count,
+            "approved_without_patch": approved_without_patch_count,
+            "validated": validated_plan_count,
+        },
+    ))
+
+    # --- evaluate ---
+    if total_experiment_count == 0:
+        evaluate_status = "not_started"
+    elif decided_experiment_count > 0 and undecided_experiment_count == 0:
+        evaluate_status = "complete"
+    else:
+        evaluate_status = "in_progress"
+    stages.append(StageStatus(
+        "evaluate", evaluate_status,
+        {"undecided": undecided_experiment_count, "decided": decided_experiment_count},
+    ))
+
+    return stages
+
+
+def _load_gap_trend(conn, system_id: int) -> List[GapTrend]:
+    """Compare per-gap_type counts between the two most recent settled builds
+    that recorded gap history (Issue #203).
+
+    Reads only persisted history rows (written at build finalize time in
+    system_understanding_jobs._record_gap_history) -- it never recomputes
+    gaps here, so the trend reflects what was true for each build's snapshot
+    at the time it settled. Fewer than 2 builds with recorded history yields
+    an empty list. A gap_type present in only one of the two builds gets 0
+    on the side where it is absent (new gap_type: previous=0; resolved
+    gap_type: current=0).
+    """
+    build_rows = conn.execute(
+        """SELECT DISTINCT build_id FROM system_understanding_gap_history
+           WHERE system_id = ? ORDER BY build_id DESC LIMIT 2""",
+        (system_id,),
+    ).fetchall()
+    build_ids = [r["build_id"] for r in build_rows]
+    if len(build_ids) < 2:
+        return []
+    current_build_id, previous_build_id = build_ids[0], build_ids[1]
+
+    def _counts_for(build_id: int) -> Dict[str, int]:
+        rows = conn.execute(
+            """SELECT gap_type, count FROM system_understanding_gap_history
+               WHERE system_id = ? AND build_id = ?""",
+            (system_id, build_id),
+        ).fetchall()
+        return {r["gap_type"]: r["count"] for r in rows}
+
+    current_counts = _counts_for(current_build_id)
+    previous_counts = _counts_for(previous_build_id)
+    gap_types = sorted(set(current_counts) | set(previous_counts))
+    return [
+        GapTrend(
+            gap_type=gt,
+            current=current_counts.get(gt, 0),
+            previous=previous_counts.get(gt, 0),
+        )
+        for gt in gap_types
+    ]
+
+
+def _check_understanding_refresh_recommended(conn, system_id: int) -> bool:
+    """True when a materialized Interview change post-dates the latest
+    completed build (Issue #203) -- a plain timestamp comparison over
+    persisted rows, no reasoning model involved (Principle 6).
+
+    False when no session has been materialized yet, or no build has ever
+    completed for this system.
+    """
+    materialized_row = conn.execute(
+        """SELECT MAX(materialized_at) AS latest FROM interview_session
+           WHERE system_id = ? AND materialized_at IS NOT NULL""",
+        (system_id,),
+    ).fetchone()
+    latest_materialized_at = materialized_row["latest"] if materialized_row else None
+    if latest_materialized_at is None:
+        return False
+
+    build_row = conn.execute(
+        """SELECT completed_at FROM system_understanding_builds
+           WHERE system_id = ? AND status = 'completed'
+           ORDER BY id DESC LIMIT 1""",
+        (system_id,),
+    ).fetchone()
+    if build_row is None or build_row["completed_at"] is None:
+        return False
+
+    return latest_materialized_at > build_row["completed_at"]
 
 
 def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
@@ -965,8 +1259,8 @@ def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
             _attach_issue_drafts(conn, system_id, summary.gaps)
             summary.gap_summary = _compute_gap_summary(summary.gaps)
 
-        proposed_plan_ids, approved_plan_ids_without_patch = _load_pending_plan_action_ids(
-            conn, system_id,
+        proposed_plan_ids, approved_plan_ids_without_patch, approved_plan_total = (
+            _load_pending_plan_action_ids(conn, system_id)
         )
         undecided_experiment_ids = _load_undecided_completed_experiment_ids(conn, system_id)
 
@@ -981,7 +1275,54 @@ def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
             approved_plan_ids_without_patch,
             undecided_experiment_ids,
         )
-        return summary
+
+        # Issue #202: stage status counts reuse the id lists above and add
+        # the small set of totals not already collected for next_actions.
+        total_plan_count = _load_total_probe_plan_count(conn, system_id)
+        total_experiment_count = _load_total_experiment_count(conn, system_id)
+        decided_experiment_count = _load_decided_completed_experiment_count(conn, system_id)
+        validated_plan_count = approved_plan_total - len(approved_plan_ids_without_patch)
+        entrypoint_count = (
+            summary.metadata_coverage.entrypoint_count if summary.metadata_coverage else 0
+        )
+
+        summary.stages = _derive_stage_statuses(
+            pipeline,
+            summary.purpose,
+            summary.capabilities,
+            len(summary.gaps),
+            summary.gap_summary,
+            entrypoint_count,
+            len(proposed_plan_ids),
+            len(approved_plan_ids_without_patch),
+            validated_plan_count,
+            total_plan_count,
+            len(undecided_experiment_ids),
+            decided_experiment_count,
+            total_experiment_count,
+        )
+
+        # Issue #203: gap-count trend and refresh recommendation are plain
+        # SELECTs against this same connection (system_understanding_builds /
+        # interview_session / system_understanding_gap_history), so they run
+        # inside this block rather than needing a second get_conn() like the
+        # primary_action build-job lookup below.
+        summary.gap_trend = _load_gap_trend(conn, system_id)
+        summary.understanding_refresh_recommended = _check_understanding_refresh_recommended(
+            conn, system_id
+        )
+
+    # Issue #201: build-job lookup opens its own `get_conn()`, and the DB
+    # lock is non-reentrant, so this must run after the `with get_conn()`
+    # block above has released it (see the issue-drafts nested-lock note
+    # elsewhere in this module for the same constraint).
+    from .system_understanding_jobs import get_latest_job
+
+    latest_build = get_latest_job(system_id)
+    summary.primary_action = _derive_primary_action(
+        pipeline, summary.next_actions, latest_build,
+    )
+    return summary
 
 
 # ---------------------------------------------------------------------------

@@ -1524,6 +1524,28 @@ CREATE INDEX IF NOT EXISTS idx_issue_drafts_system
 
 CREATE INDEX IF NOT EXISTS idx_issue_drafts_source
     ON issue_drafts (system_id, source_key);
+
+-- Gap count history (Issue #203). One row per (build, gap_type) recorded
+-- when a System Understanding build job settles as completed or partial
+-- (never failed/cancelled). Read alongside the existing per-request gap
+-- computation (`_collect_gaps` / `_compute_gap_summary`) to show a
+-- before/after trend across builds without re-deriving history. A build with
+-- zero gaps of a given type simply has no row for that gap_type; "no row"
+-- and "count 0" are equivalent when reading a build's history back.
+CREATE TABLE IF NOT EXISTS system_understanding_gap_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id   INTEGER NOT NULL,
+    snapshot_id INTEGER,
+    build_id    INTEGER NOT NULL,
+    gap_type    TEXT NOT NULL,
+    count       INTEGER NOT NULL,
+    created_at  REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (build_id) REFERENCES system_understanding_builds (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_su_gap_history_system
+    ON system_understanding_gap_history (system_id, build_id DESC);
 """
 
 
