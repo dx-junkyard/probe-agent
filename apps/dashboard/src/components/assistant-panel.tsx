@@ -8,7 +8,8 @@ import { DiagnosticSeverityIcon } from "@/components/diagnostics-badge";
 import {
   ArrowRight, Bot, ExternalLink, Loader2, Send, Settings2, Wrench, X,
 } from "lucide-react";
-import type { AssistantAskOut, AssistantCitation } from "@/api/types";
+import type { AssistantAskOut, AssistantCitation, SystemStateItem } from "@/api/types";
+import { systemStateTarget } from "@/components/system-state";
 
 // Per-screen assistant (Issue #102): floating agent button + right-side panel.
 // Answers come from POST /assistant/ask and are grounded in screen context,
@@ -133,12 +134,14 @@ function AnswerMessage({ result }: { result: AssistantAskOut }) {
 }
 
 interface AssistantPanelProps {
+  focusedStateItem?: SystemStateItem | null;
   snapshotNotice?: string | null;
   onSnapshotNoticeClick?: () => void;
 }
 
-export function AssistantPanel({ snapshotNotice, onSnapshotNoticeClick }: AssistantPanelProps = {}) {
+export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNoticeClick }: AssistantPanelProps = {}) {
   const location = useLocation();
+  const navigate = useNavigate();
   const screenId = screenIdFromPath(location.pathname);
   const [open, setOpen] = useState(false);
   const [question, setQuestion] = useState("");
@@ -154,11 +157,22 @@ export function AssistantPanel({ snapshotNotice, onSnapshotNoticeClick }: Assist
     () => (ctx?.screen_checks ?? []).filter((c) => c.severity !== "ok"),
     [ctx],
   );
+  const noticeText = focusedStateItem?.summary ?? snapshotNotice ?? null;
+  const handleNoticeClick = onSnapshotNoticeClick ?? (() => {
+    const target = focusedStateItem ? systemStateTarget(focusedStateItem) : null;
+    if (target) navigate(target);
+  });
+  const focusedQuestion = focusedStateItem
+    ? `What should I do about: ${focusedStateItem.summary}`
+    : null;
 
   const appendMessages = (id: string, msgs: ChatMessage[]) => {
     setThreads((prev) => ({ ...prev, [id]: [...(prev[id] ?? []), ...msgs] }));
     requestAnimationFrame(() => {
-      listRef.current?.scrollTo({ top: listRef.current.scrollHeight });
+      const list = listRef.current;
+      if (list && typeof list.scrollTo === "function") {
+        list.scrollTo({ top: list.scrollHeight });
+      }
     });
   };
 
@@ -172,6 +186,10 @@ export function AssistantPanel({ snapshotNotice, onSnapshotNoticeClick }: Assist
         screen_id: screenId,
         question: trimmed,
         visible_check_ids: failingChecks.map((c) => c.check_id),
+        ...(focusedStateItem ? {
+          visible_state_ids: [focusedStateItem.state_id],
+          focused_state_id: focusedStateItem.state_id,
+        } : {}),
       });
       appendMessages(screenId, [{ role: "assistant", text: result.answer, result }]);
     } catch (err) {
@@ -182,15 +200,15 @@ export function AssistantPanel({ snapshotNotice, onSnapshotNoticeClick }: Assist
   if (!open) {
     return (
       <div className="fixed bottom-6 right-6 z-40 flex items-end gap-2">
-        {snapshotNotice && (
+        {noticeText && (
           <button
             type="button"
-            onClick={onSnapshotNoticeClick}
+            onClick={handleNoticeClick}
             className="relative max-w-[min(18rem,calc(100vw-5.5rem))] rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-left text-xs font-medium text-amber-900 shadow-lg transition-colors hover:bg-amber-100 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100 dark:hover:bg-amber-900"
-            title="画面先頭の snapshot 注意書きへ移動"
+            title="対応する画面へ移動"
             data-testid="assistant-snapshot-notice"
           >
-            {snapshotNotice}
+            {noticeText}
             <span className="absolute -right-1 bottom-4 h-2 w-2 rotate-45 border-r border-t border-amber-300 bg-amber-50 dark:border-amber-800 dark:bg-amber-950" />
           </button>
         )}
@@ -234,6 +252,19 @@ export function AssistantPanel({ snapshotNotice, onSnapshotNoticeClick }: Assist
       </div>
 
       <div ref={listRef} className="flex-1 overflow-y-auto p-4 space-y-3">
+        {focusedStateItem && (
+          <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 space-y-2 dark:border-amber-800 dark:bg-amber-950" data-testid="assistant-current-issue">
+            <p className="text-xs font-medium">Current issue</p>
+            <p className="text-sm font-medium">{focusedStateItem.summary}</p>
+            <p className="text-xs text-muted-foreground">{focusedStateItem.detail}</p>
+            {focusedStateItem.remediation && <p className="text-xs">{focusedStateItem.remediation}</p>}
+            {focusedStateItem.target_ui && (
+              <Button size="sm" onClick={() => navigate(systemStateTarget(focusedStateItem) ?? focusedStateItem.target_ui!.route)} data-testid="assistant-current-issue-action">
+                {focusedStateItem.target_ui.action_label || "対応する"}
+              </Button>
+            )}
+          </div>
+        )}
         {ctx && (
           <div className="rounded-lg border bg-card p-3 space-y-2" data-testid="assistant-state-summary">
             <div className="flex items-center gap-1.5">
@@ -259,6 +290,15 @@ export function AssistantPanel({ snapshotNotice, onSnapshotNoticeClick }: Assist
           <div className="space-y-1">
             <p className="text-[11px] font-medium text-muted-foreground">Suggested questions</p>
             <div className="flex flex-col items-start gap-1">
+              {focusedQuestion && (
+                <button
+                  className="text-left text-xs text-primary hover:underline cursor-pointer"
+                  onClick={() => submit(focusedQuestion)}
+                  data-testid="assistant-focused-state-question"
+                >
+                  {focusedQuestion}
+                </button>
+              )}
               {ctx.suggested_questions.slice(0, 6).map((q) => (
                 <button
                   key={q.question}

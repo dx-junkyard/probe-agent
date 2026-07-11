@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -6,14 +6,17 @@ import {
   useBuildSystemUnderstanding,
   useLatestSystemUnderstandingBuild,
   useSystemDiagnostics,
+  useSystemState,
   sysKey,
 } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { ContextHeader } from "@/components/layout/context-header";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useDiagnosticHighlight, DiagnosticFixCallout } from "@/components/diagnostic-fix";
+import { cn } from "@/lib/utils";
+import { SystemStateBanner } from "@/components/system-state";
 import {
   RefreshCw, Boxes, Target,
 } from "lucide-react";
@@ -25,29 +28,154 @@ import {
 } from "@/components/system-understanding/stage-sections";
 import type {
   SystemDiagnosticCheck,
+  SystemUnderstandingNextAction,
   SystemUnderstandingOut,
+  SystemUnderstandingStageStatus,
 } from "@/api/types";
 
-function EmptyState() {
+/**
+ * Issue #201: single highest-priority CTA shown right under the Hub header,
+ * derived server-side (`primary_action`, system_understanding_service._derive_primary_action).
+ * "navigate" actions link somewhere; "build" actions trigger the same
+ * Build / Refresh job as the header button and share its disabled condition.
+ */
+function PrimaryActionCard({ action, onRunBuild, buildDisabled, successSummary }: {
+  action: SystemUnderstandingNextAction;
+  onRunBuild: () => void;
+  buildDisabled: boolean;
+  /** Issue #211: shown above the CTA when the whole pipeline completed, so
+   * the primary action reads as "analysis succeeded, here is the next step"
+   * instead of yet another problem banner. */
+  successSummary?: string;
+}) {
+  const kind = action.action_kind ?? "navigate";
   return (
-    <Card>
-      <CardContent className="py-10 text-center">
-        <h3 className="text-lg font-semibold mb-4">Get started with System Understanding</h3>
-        <ol className="text-sm text-muted-foreground space-y-2 text-left max-w-md mx-auto list-decimal list-inside">
-          <li><Link to="/repository" className="hover:underline text-primary">Configure your repository</Link></li>
-          <li>Create a snapshot from a commit</li>
-          <li>Index README/docs and source code</li>
-          <li>Build system understanding</li>
-          <li><Link to="/capability-map" className="hover:underline text-primary">Explore capabilities and API boundaries</Link></li>
-        </ol>
+    <Card data-testid="primary-action">
+      <CardContent className="py-4 space-y-3">
+        {successSummary && (
+          <p
+            className="text-sm font-medium text-emerald-600 dark:text-emerald-400"
+            data-testid="build-success-summary"
+          >
+            {successSummary}
+          </p>
+        )}
+        <div className="flex items-center justify-between gap-4 flex-wrap">
+          <div>
+            <p className="text-lg font-semibold">{action.action}</p>
+            <p className="text-sm text-muted-foreground mt-1">{action.reason}</p>
+          </div>
+          {kind === "build" ? (
+            <Button
+              onClick={onRunBuild}
+              disabled={buildDisabled}
+              data-testid="primary-action-cta"
+            >
+              {action.action}
+            </Button>
+          ) : action.link ? (
+            <Link
+              to={action.link}
+              data-testid="primary-action-cta"
+              className={cn(buttonVariants({ variant: "default" }))}
+            >
+              {action.action}
+            </Link>
+          ) : null}
+        </div>
       </CardContent>
     </Card>
   );
 }
 
-function EntryCards() {
+function findStage(
+  stages: SystemUnderstandingStageStatus[] | undefined,
+  stage: "understand" | "observe" | "instrument" | "evaluate",
+): SystemUnderstandingStageStatus | undefined {
+  return stages?.find((s) => s.stage === stage);
+}
+
+/**
+ * Issue #202: Instrument stage summary. Replaces the previous static
+ * description with a counts-based summary (Proposed / Approved without
+ * patch / Validated) linking to Probe Planner, falling back to the original
+ * description text when counts are all zero (or absent, e.g. an older
+ * response without `stages`).
+ */
+function InstrumentSummary({ counts }: { counts?: Record<string, number> }) {
+  const proposed = counts?.proposed ?? 0;
+  const approvedWithoutPatch = counts?.approved_without_patch ?? 0;
+  const validated = counts?.validated ?? 0;
+  const hasCounts = proposed > 0 || approvedWithoutPatch > 0 || validated > 0;
+
+  if (!hasCounts) {
+    return (
+      <p className="text-sm text-muted-foreground" data-testid="stage-summary-instrument">
+        Probe plan and patch status live in Probe Planner. Approve a plan and validate
+        its patch there once observation points are chosen above.
+      </p>
+    );
+  }
+
   return (
-    <div className="grid gap-4 md:grid-cols-2">
+    <ul className="text-sm space-y-1" data-testid="stage-summary-instrument">
+      <li>
+        <Link to="/probe-planner" className="text-primary hover:underline">Proposed</Link>
+        : {proposed}
+      </li>
+      <li>
+        <Link to="/probe-planner" className="text-primary hover:underline">Approved without patch</Link>
+        : {approvedWithoutPatch}
+      </li>
+      <li>
+        <Link to="/probe-planner" className="text-primary hover:underline">Validated</Link>
+        : {validated}
+      </li>
+    </ul>
+  );
+}
+
+/**
+ * Issue #202: Evaluate stage summary. Same counts-with-fallback pattern as
+ * InstrumentSummary, linking to Experiments.
+ */
+function EvaluateSummary({ counts }: { counts?: Record<string, number> }) {
+  const undecided = counts?.undecided ?? 0;
+  const decided = counts?.decided ?? 0;
+  const hasCounts = undecided > 0 || decided > 0;
+
+  if (!hasCounts) {
+    return (
+      <p className="text-sm text-muted-foreground" data-testid="stage-summary-evaluate">
+        Trace comparisons, experiment runs, and adoption decisions live in Experiments.
+      </p>
+    );
+  }
+
+  return (
+    <ul className="text-sm space-y-1" data-testid="stage-summary-evaluate">
+      <li>
+        <Link to="/experiments" className="text-primary hover:underline">Undecided</Link>
+        : {undecided}
+      </li>
+      <li>
+        <Link to="/experiments" className="text-primary hover:underline">Decided</Link>
+        : {decided}
+      </li>
+    </ul>
+  );
+}
+
+function EntryCards({ purposeDefined }: { purposeDefined: boolean }) {
+  return (
+    <div className="space-y-2">
+      {!purposeDefined && (
+        <p className="text-xs text-muted-foreground" data-testid="entry-cards-prereq-note">
+          Best used after the System Purpose is defined — the purpose gives
+          capabilities, observation candidates, and probe plans their meaning.
+        </p>
+      )}
+      <div className={cn("grid gap-4 md:grid-cols-2", !purposeDefined && "opacity-70")}>
       <Link to="/capability-map" className="block group">
         <Card className="h-full transition-colors group-hover:border-primary/50">
           <CardHeader className="pb-2">
@@ -76,37 +204,95 @@ function EntryCards() {
           </CardContent>
         </Card>
       </Link>
+      </div>
     </div>
   );
 }
 
-function DataView({ data, checksByStep }: {
+function DataView({ data, checksByStep, onRunBuild, buildDisabled }: {
   data: SystemUnderstandingOut;
   checksByStep: Record<string, SystemDiagnosticCheck[]>;
+  onRunBuild: () => void;
+  buildDisabled: boolean;
 }) {
   const pipeline = data.pipeline ?? [];
   const allMissing = pipeline.every((s) => s.status === "missing");
+  const allComplete = pipeline.length > 0 && pipeline.every((s) => s.status === "complete");
+  // Issue #211: a fully complete pipeline is maintenance detail, not the
+  // page's main content — collapse it by default and let the user expand.
+  // null = no manual choice yet (auto-collapse only when everything is
+  // complete); any warning/blocked/failed/missing step keeps it expanded.
+  const [pipelineExpandedByUser, setPipelineExpandedByUser] = useState<boolean | null>(null);
+  const pipelineCollapsed = pipelineExpandedByUser === null ? allComplete : !pipelineExpandedByUser;
   const actionsByStage = groupNextActionsByStage(data.next_actions);
+  const understandStage = findStage(data.stages, "understand");
+  const observeStage = findStage(data.stages, "observe");
+  const instrumentStage = findStage(data.stages, "instrument");
+  const evaluateStage = findStage(data.stages, "evaluate");
 
   return (
     <div className="space-y-10">
-      <StageSection stage="understand" index={1} actions={actionsByStage.understand}>
+      <StageSection
+        stage="understand"
+        index={1}
+        actions={actionsByStage.understand}
+        status={understandStage?.status}
+        counts={understandStage?.counts}
+      >
         {/* Pipeline Checklist */}
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-base">Pipeline Status</CardTitle>
-            <CardDescription>
-              Progress through the system understanding pipeline. Steps that are
-              missing or blocked show a "Why?" button when a configuration
-              diagnostic or a recent run failure explains them.
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            {allMissing ? <EmptyState /> : <PipelineChecklist steps={pipeline} checksByStep={checksByStep} />}
-          </CardContent>
-        </Card>
+        {pipelineCollapsed ? (
+          <Card data-testid="pipeline-collapsed">
+            <CardContent className="py-3 flex items-center justify-between gap-4 flex-wrap">
+              <p className="text-sm">
+                <span className="font-medium">Pipeline Status</span>{" "}
+                <span className="text-muted-foreground">
+                  — {pipeline.length}/{pipeline.length} steps complete
+                </span>
+              </p>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setPipelineExpandedByUser(true)}
+                data-testid="pipeline-expand"
+              >
+                Show details
+              </Button>
+            </CardContent>
+          </Card>
+        ) : (
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base flex items-center justify-between gap-4">
+                Pipeline Status
+                {allComplete && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setPipelineExpandedByUser(false)}
+                    data-testid="pipeline-collapse"
+                  >
+                    Collapse
+                  </Button>
+                )}
+              </CardTitle>
+              <CardDescription>
+                Progress through the system understanding pipeline. Steps that are
+                missing or blocked show a "Why?" button when a configuration
+                diagnostic or a recent run failure explains them.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <PipelineChecklist
+                steps={pipeline}
+                checksByStep={checksByStep}
+                onRunBuild={onRunBuild}
+                buildDisabled={buildDisabled}
+              />
+            </CardContent>
+          </Card>
+        )}
 
-        {!allMissing && <EntryCards />}
+        {!allMissing && <EntryCards purposeDefined={!!data.purpose} />}
 
         <div className="grid gap-6 lg:grid-cols-2">
           {/* System Purpose */}
@@ -242,10 +428,22 @@ function DataView({ data, checksByStep }: {
         )}
 
         {/* Docs-Code Gap Worklist */}
-        <GapWorklist gaps={data.gaps} gapSummary={data.gap_summary} snapshotId={data.snapshot_id} commitSha={data.commit_sha} />
+        <GapWorklist
+          gaps={data.gaps}
+          gapSummary={data.gap_summary}
+          gapTrend={data.gap_trend}
+          snapshotId={data.snapshot_id}
+          commitSha={data.commit_sha}
+        />
       </StageSection>
 
-      <StageSection stage="observe" index={2} actions={actionsByStage.observe}>
+      <StageSection
+        stage="observe"
+        index={2}
+        actions={actionsByStage.observe}
+        status={observeStage?.status}
+        counts={observeStage?.counts}
+      >
         {/* Key Entrypoints */}
         {data.entrypoints.length > 0 ? (
           <Card>
@@ -306,17 +504,27 @@ function DataView({ data, checksByStep }: {
         )}
       </StageSection>
 
-      <StageSection stage="instrument" index={3} actions={actionsByStage.instrument}>
-        <p className="text-sm text-muted-foreground">
-          Probe plan and patch status live in Probe Planner. Approve a plan and validate
-          its patch there once observation points are chosen above.
-        </p>
+      {/*
+        Issue #202: instrument/evaluate render their counts in a dedicated
+        summary block below (InstrumentSummary / EvaluateSummary) instead of
+        the generic heading counts line, so the numbers aren't shown twice.
+      */}
+      <StageSection
+        stage="instrument"
+        index={3}
+        actions={actionsByStage.instrument}
+        status={instrumentStage?.status}
+      >
+        <InstrumentSummary counts={instrumentStage?.counts} />
       </StageSection>
 
-      <StageSection stage="evaluate" index={4} actions={actionsByStage.evaluate}>
-        <p className="text-sm text-muted-foreground">
-          Trace comparisons, experiment runs, and adoption decisions live in Experiments.
-        </p>
+      <StageSection
+        stage="evaluate"
+        index={4}
+        actions={actionsByStage.evaluate}
+        status={evaluateStage?.status}
+      >
+        <EvaluateSummary counts={evaluateStage?.counts} />
       </StageSection>
     </div>
   );
@@ -325,6 +533,7 @@ function DataView({ data, checksByStep }: {
 export default function SystemUnderstandingPage() {
   const { data, isLoading, error } = useSystemUnderstanding();
   const { data: diagnostics } = useSystemDiagnostics();
+  const { data: systemState } = useSystemState();
   const build = useBuildSystemUnderstanding();
   const { data: latestBuild } = useLatestSystemUnderstandingBuild();
   const qc = useQueryClient();
@@ -332,6 +541,19 @@ export default function SystemUnderstandingPage() {
 
   const buildRunning = latestBuild?.status === "queued" || latestBuild?.status === "running";
   const buildHighlight = useDiagnosticHighlight<HTMLButtonElement>("build");
+  const pageItem = systemState?.page_items["/system-understanding"]?.[0] ?? systemState?.primary_item;
+  // Issue #211: with everything complete, Build / Refresh is a maintenance
+  // action, not the page's protagonist — demote it visually and hand the
+  // headline over to the success summary on the primary-action card.
+  const pipelineAllComplete = (data?.pipeline?.length ?? 0) > 0 &&
+    (data?.pipeline ?? []).every((s) => s.status === "complete");
+  const successSummary = pipelineAllComplete && !buildRunning
+    ? [
+        `Analysis complete — ${data!.pipeline.length}/${data!.pipeline.length} steps`,
+        data?.metadata_coverage ? `${data.metadata_coverage.symbol_count} symbols` : null,
+        data?.metadata_coverage ? `${data.metadata_coverage.entrypoint_count} entrypoints` : null,
+      ].filter(Boolean).join(" · ")
+    : undefined;
 
   // Refresh the aggregated view and diagnostics once a build job settles.
   useEffect(() => {
@@ -341,6 +563,10 @@ export default function SystemUnderstandingPage() {
     settledBuildId.current = latestBuild.id;
     qc.invalidateQueries({ queryKey: sysKey("system-understanding") });
     qc.invalidateQueries({ queryKey: sysKey("system-diagnostics") });
+    // Issue #210: SystemStateBanner reads useSystemState (sysKey("system-state")),
+    // which was not invalidated here, so it kept showing the pre-build warning
+    // (staleTime 30s) even after the pipeline checklist above refreshed.
+    qc.invalidateQueries({ queryKey: sysKey("system-state") });
   }, [latestBuild, qc]);
 
   const checksByStep = useMemo(() => {
@@ -370,7 +596,7 @@ export default function SystemUnderstandingPage() {
           {...buildHighlight}
           onClick={() => build.mutate()}
           disabled={build.isPending || buildRunning}
-          variant="default"
+          variant={pipelineAllComplete && !buildRunning ? "outline" : "default"}
           data-testid="build-button"
         >
           {build.isPending || buildRunning ? (
@@ -386,6 +612,52 @@ export default function SystemUnderstandingPage() {
           )}
         </Button>
       </div>
+
+      <SystemStateBanner
+        item={pageItem}
+        onAction={pageItem?.user_action_kind === "build" ? () => build.mutate() : undefined}
+        disabled={pageItem?.user_action_kind === "build" && (build.isPending || buildRunning)}
+      />
+
+      {/* Issue #203: the improvement-loop banner — a materialized Interview
+          change is newer than the latest completed build, so the current
+          understanding no longer reflects it. Hidden while a build is
+          actively running (the BuildJobPanel already shows progress, and a
+          fresh build is about to make this stale anyway). Also hidden when
+          the canonical SystemStateBanner above is already showing this same
+          root cause (Issue #206-208 review): the canonical banner wins so
+          the same cause is never duplicated. */}
+      {data?.understanding_refresh_recommended && !buildRunning &&
+        pageItem?.state_id !== "interview.materialized.rebuild_required" && (
+        <Card data-testid="refresh-recommended-banner">
+          <CardContent className="py-4 flex items-center justify-between gap-4 flex-wrap">
+            <div>
+              <p className="text-sm font-medium">
+                Interview の変更が理解にまだ反映されていません
+              </p>
+              <p className="text-sm text-muted-foreground mt-1">
+                Interview で確定した変更を反映するには、システム理解を再ビルドしてください。
+              </p>
+            </div>
+            <Button
+              onClick={() => build.mutate()}
+              disabled={build.isPending}
+              data-testid="refresh-recommended-cta"
+            >
+              Build / Refresh
+            </Button>
+          </CardContent>
+        </Card>
+      )}
+
+      {data?.primary_action && (
+        <PrimaryActionCard
+          action={data.primary_action}
+          onRunBuild={() => build.mutate()}
+          buildDisabled={build.isPending || buildRunning}
+          successSummary={successSummary}
+        />
+      )}
 
       <DiagnosticFixCallout anchor="build" />
 
@@ -421,7 +693,12 @@ export default function SystemUnderstandingPage() {
           {[1, 2, 3].map((i) => <Skeleton key={i} className="h-32 w-full" />)}
         </div>
       ) : data ? (
-        <DataView data={data} checksByStep={checksByStep} />
+        <DataView
+          data={data}
+          checksByStep={checksByStep}
+          onRunBuild={() => build.mutate()}
+          buildDisabled={build.isPending || buildRunning}
+        />
       ) : null}
     </div>
   );

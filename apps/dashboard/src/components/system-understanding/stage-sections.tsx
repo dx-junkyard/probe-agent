@@ -28,16 +28,40 @@ export const STAGE_DESCRIPTIONS: Record<Stage, string> = {
   evaluate: "Traces, experiments, and the decisions recorded from them.",
 };
 
+// Issue #202: finite stage completion status, badged next to each stage
+// heading. Derived server-side (system_understanding_service.
+// _derive_stage_statuses) -- purely a display mapping here, no logic.
+export type StageStatusValue = "not_started" | "in_progress" | "blocked" | "complete";
+
+export const STAGE_STATUS_LABELS: Record<StageStatusValue, string> = {
+  not_started: "Not started",
+  in_progress: "In progress",
+  blocked: "Blocked",
+  complete: "Complete",
+};
+
+export const STAGE_STATUS_BADGE_VARIANT: Record<
+  StageStatusValue,
+  "outline" | "secondary" | "destructive" | "success"
+> = {
+  not_started: "outline",
+  in_progress: "secondary",
+  blocked: "destructive",
+  complete: "success",
+};
+
 // Detail pages linked from each stage. Existing routes only — Issue #179 does
 // not add or change routing.
 export const STAGE_DETAIL_LINKS: Record<Stage, { to: string; label: string }[]> = {
   understand: [
     { to: "/capability-map", label: "Capability Map" },
+    { to: "/interview", label: "Interview" },
     { to: "/feature-map", label: "Feature Map" },
     { to: "/repository", label: "Repository" },
   ],
   observe: [
     { to: "/flow-explorer", label: "Flow Explorer" },
+    { to: "/interview", label: "Interview" },
     { to: "/trace-lineage", label: "Trace Lineage" },
   ],
   instrument: [
@@ -94,22 +118,49 @@ export function NextActionsList({ actions, testId = "next-actions" }: {
   );
 }
 
-export function StageSection({ stage, index, actions, children }: {
+export function StageSection({ stage, index, actions, status, counts, children }: {
   stage: Stage;
   index: number;
   actions: SystemUnderstandingNextAction[];
+  // Issue #202: deterministic completion status/counts for this stage. Both
+  // optional so callers/fixtures that predate stage status keep rendering
+  // (no badge, no counts line) instead of breaking.
+  status?: string;
+  counts?: Record<string, number>;
   children: ReactNode;
 }) {
   const links = STAGE_DETAIL_LINKS[stage];
+  const statusLabel = status ? STAGE_STATUS_LABELS[status as StageStatusValue] : undefined;
+  const statusVariant = status ? STAGE_STATUS_BADGE_VARIANT[status as StageStatusValue] : undefined;
+  const countEntries = counts ? Object.entries(counts) : [];
   return (
     <section className="space-y-4" data-testid={`stage-section-${stage}`}>
       <div className="flex items-baseline gap-2">
         <Badge variant="secondary" className="text-xs shrink-0">{index}</Badge>
         <div>
-          <h2 className="text-lg font-semibold" data-testid={`stage-title-${stage}`}>
-            {STAGE_LABELS[stage]}
-          </h2>
+          <div className="flex items-center gap-2">
+            <h2 className="text-lg font-semibold" data-testid={`stage-title-${stage}`}>
+              {STAGE_LABELS[stage]}
+            </h2>
+            {status && (
+              <Badge
+                variant={statusVariant ?? "outline"}
+                className="text-xs"
+                data-testid={`stage-status-${stage}`}
+              >
+                {statusLabel ?? status}
+              </Badge>
+            )}
+          </div>
           <p className="text-sm text-muted-foreground">{STAGE_DESCRIPTIONS[stage]}</p>
+          {countEntries.length > 0 && (
+            <p
+              className="text-xs text-muted-foreground mt-0.5"
+              data-testid={`stage-counts-${stage}`}
+            >
+              {countEntries.map(([k, v]) => `${k}: ${v}`).join(" · ")}
+            </p>
+          )}
         </div>
       </div>
 

@@ -7,11 +7,13 @@ import FeatureMapPage from "./pages/feature-map";
 import CapabilityMapPage from "./pages/capability-map";
 import InterviewPage from "./pages/interview";
 import ProbePlannerPage from "./pages/probe-planner";
+import ProbePatternsPage from "./pages/probe-patterns";
 import FlowExplorerPage from "./pages/flow-explorer";
 import TraceLineagePage from "./pages/trace-lineage";
 import TraceAnalyzersPage from "./pages/trace-analyzers";
 import ExperimentsPage from "./pages/experiments";
 import ConnectSdkPage from "./pages/connect-sdk";
+import SetupGuidePage from "./pages/setup-guide";
 import GenerationPage from "./pages/generation";
 import ComponentsPage from "./pages/components";
 import SettingsPage from "./pages/settings";
@@ -34,8 +36,10 @@ export default function App() {
         <Route path="trace-lineage" element={<TraceLineagePage />} />
         <Route path="trace-analyzers" element={<TraceAnalyzersPage />} />
         <Route path="probe-planner" element={<ProbePlannerPage />} />
+        <Route path="probe-patterns" element={<ProbePatternsPage />} />
         <Route path="experiments" element={<ExperimentsPage />} />
         <Route path="connect-sdk" element={<ConnectSdkPage />} />
+        <Route path="setup-guide" element={<SetupGuidePage />} />
         <Route path="generation" element={<GenerationPage />} />
         <Route path="components" element={<ComponentsPage />} />
         <Route path="workspaces" element={<WorkspacesPage />} />

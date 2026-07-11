@@ -476,12 +476,40 @@ def _execute_job(build_id: int, system_id: int) -> None:
     _finalize_job(build_id, cancelled)
 
 
+def _record_gap_history(
+    conn, system_id: int, snapshot_id: Optional[int], build_id: int, now: float
+) -> None:
+    """Persist per-gap_type counts for a settled build (Issue #203).
+
+    Reuses the exact same gap computation the read path uses
+    (`_load_gaps_from_reconciler` + `_compute_gap_summary`) so history never
+    diverges from what the Hub displays for the same build/snapshot. Only
+    called for completed/partial jobs; a gap_type with zero gaps simply gets
+    no row (equivalent to a stored count of 0 when the trend is read back).
+    """
+    if snapshot_id is None:
+        return
+    from .system_understanding_service import _compute_gap_summary, _load_gaps_from_reconciler
+
+    gaps = _load_gaps_from_reconciler(conn, system_id, snapshot_id)
+    gap_summary = _compute_gap_summary(gaps)
+    for gs in gap_summary:
+        conn.execute(
+            """INSERT INTO system_understanding_gap_history
+                (system_id, snapshot_id, build_id, gap_type, count, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            (system_id, snapshot_id, build_id, gs.gap_type, gs.count, now),
+        )
+
+
 def _finalize_job(build_id: int, cancelled: bool) -> None:
     now = time.time()
     with get_conn() as conn:
         job = conn.execute(
             "SELECT * FROM system_understanding_builds WHERE id = ?", (build_id,)
         ).fetchone()
+        system_id = job["system_id"]
+        snapshot_id = job["snapshot_id"]
         cancelled = cancelled or bool(job["cancel_requested"])
         if cancelled:
             conn.execute(
@@ -529,6 +557,8 @@ def _finalize_job(build_id: int, cancelled: bool) -> None:
             (status, error, now, now, build_id),
         )
         _close_open_runs(conn, build_id, status)
+        if status in ("completed", "partial"):
+            _record_gap_history(conn, system_id, snapshot_id, build_id, now)
     logger.info("system_understanding job %s finished with status=%s", build_id, status)
 
 
@@ -1060,49 +1090,86 @@ def _run_claim_scan(ctx: StepContext) -> Dict[str, Any]:
     now = time.time()
     max_attempts = _llm_max_attempts()
 
+    chunk_by_id = {c.chunk_id: c for c in chunks}
     with get_conn() as conn:
         for chunk in chunks:
             conn.execute(
                 """INSERT OR IGNORE INTO system_understanding_llm_tasks
                     (build_id, step_id, system_id, snapshot_id, task_type, chunk_id,
-                     chunk_content_hash, chunk_path, prompt_version, schema_version,
-                     max_attempts, created_at)
-                VALUES (?, ?, ?, ?, 'claim_scan_chunk', ?, ?, ?, ?, ?, ?, ?)""",
+                     chunk_content_hash, chunk_path, chunk_start_line,
+                     prompt_version, schema_version, max_attempts, created_at)
+                VALUES (?, ?, ?, ?, 'claim_scan_chunk', ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     ctx.build_id, ctx.step_id, ctx.system_id, ctx.snapshot_id,
-                    chunk.chunk_id, chunk.content_hash, chunk.path,
+                    chunk.chunk_id, chunk.content_hash, chunk.path, chunk.start_line,
                     scanner.PROMPT_VERSION, scanner.SCHEMA_VERSION,
                     max_attempts, now,
                 ),
             )
-        # Reuse completed results from earlier builds of the same snapshot
-        # when chunk content and prompt/schema versions are identical.
-        conn.execute(
-            """UPDATE system_understanding_llm_tasks AS t
-               SET status = 'completed', reused_existing = 1, completed_at = ?,
-                   result_json = (
-                       SELECT p.result_json FROM system_understanding_llm_tasks p
-                       WHERE p.system_id = t.system_id AND p.snapshot_id = t.snapshot_id
-                         AND p.chunk_content_hash = t.chunk_content_hash
-                         AND p.chunk_path = t.chunk_path
-                         AND p.prompt_version = t.prompt_version
-                         AND p.schema_version = t.schema_version
-                         AND p.status = 'completed' AND p.result_json IS NOT NULL
-                         AND p.build_id != t.build_id
-                       ORDER BY p.id DESC LIMIT 1
-                   )
-               WHERE t.build_id = ? AND t.status = 'pending' AND EXISTS (
-                   SELECT 1 FROM system_understanding_llm_tasks p
-                   WHERE p.system_id = t.system_id AND p.snapshot_id = t.snapshot_id
-                     AND p.chunk_content_hash = t.chunk_content_hash
-                     AND p.chunk_path = t.chunk_path
-                     AND p.prompt_version = t.prompt_version
-                     AND p.schema_version = t.schema_version
-                     AND p.status = 'completed' AND p.result_json IS NOT NULL
-                     AND p.build_id != t.build_id
-               )""",
-            (now, ctx.build_id),
-        )
+        # Reuse completed results from any earlier build of this system when
+        # chunk content, path, and prompt/schema versions are identical, even
+        # if the snapshot changed (Issue #195). snapshot_id is deliberately
+        # excluded from the match: a Refresh that leaves a documentation
+        # section untouched still hashes to the same chunk_content_hash under
+        # a new snapshot_id, and re-scanning it would be redundant LLM work.
+        # chunk_id is not part of the match either (Issue #195 design note):
+        # it is derived from path/start_line/heading and can shift when
+        # unrelated content moves, while chunk_content_hash is stable for
+        # unchanged text. Because result_json embeds absolute evidence line
+        # numbers and the source chunk_id, a reused result whose chunk moved
+        # is remapped by the start-line delta (a purely structural offset for
+        # byte-identical text) so evidence still resolves against the current
+        # snapshot. Deleted chunks never get a pending row for the current
+        # build in the first place (they are not in the current snapshot's
+        # documentation index), so they cannot be pulled into the graph via
+        # this reuse path.
+        reusable = conn.execute(
+            "SELECT id, chunk_id FROM system_understanding_llm_tasks "
+            "WHERE build_id = ? AND status = 'pending' ORDER BY id",
+            (ctx.build_id,),
+        ).fetchall()
+        for row in reusable:
+            chunk = chunk_by_id.get(row["chunk_id"])
+            if chunk is None:
+                continue
+            prev = conn.execute(
+                """SELECT result_json, chunk_id, chunk_start_line
+                   FROM system_understanding_llm_tasks
+                   WHERE system_id = ? AND chunk_content_hash = ? AND chunk_path = ?
+                     AND prompt_version = ? AND schema_version = ?
+                     AND status = 'completed' AND result_json IS NOT NULL
+                     AND build_id != ?
+                   ORDER BY id DESC LIMIT 1""",
+                (ctx.system_id, chunk.content_hash, chunk.path,
+                 scanner.PROMPT_VERSION, scanner.SCHEMA_VERSION, ctx.build_id),
+            ).fetchone()
+            if prev is None:
+                continue
+            if prev["chunk_start_line"] is None:
+                # Row predates chunk_start_line: without the original position
+                # the evidence lines can only be trusted when the chunk_id
+                # (path + start_line + heading) is unchanged.
+                if prev["chunk_id"] != chunk.chunk_id:
+                    continue
+                delta = 0
+            else:
+                delta = chunk.start_line - prev["chunk_start_line"]
+            try:
+                result = scanner.ChunkScanResult.model_validate_json(prev["result_json"])
+            except ValueError:
+                continue
+            result.chunk_id = chunk.chunk_id
+            if delta:
+                for claim in result.claims:
+                    claim.evidence.start_line += delta
+                    claim.evidence.end_line += delta
+            conn.execute(
+                """UPDATE system_understanding_llm_tasks
+                   SET status = 'completed', reused_existing = 1,
+                       completed_at = ?, result_json = ?
+                   WHERE id = ?""",
+                (now, result.model_dump_json(), row["id"]),
+            )
         pending = conn.execute(
             "SELECT * FROM system_understanding_llm_tasks "
             "WHERE build_id = ? AND status = 'pending' ORDER BY id",
@@ -1112,7 +1179,6 @@ def _run_claim_scan(ctx: StepContext) -> Dict[str, Any]:
     if pending:
         config = LLMConfig.intelligence_from_env()
         client = create_llm_client(config)
-        chunk_by_id = {c.chunk_id: c for c in chunks}
 
         for task in pending:
             ctx.check_cancelled()
@@ -1264,7 +1330,28 @@ def _run_capability_hierarchy(ctx: StepContext) -> Dict[str, Any]:
         ).fetchone()
 
     if not symbols_h:
-        return {"capability_count": 0, "note": "No code symbols to group"}
+        # Issue #210: still persist a completed intelligence_runs row so the
+        # job-step table (this step "completed") and the intelligence_runs-
+        # derived pipeline checklist / system_state item agree that the run
+        # happened, instead of the checklist showing "missing"/"blocked" for
+        # a build the job panel already reports as done.
+        now = time.time()
+        with get_conn() as conn:
+            run_id = conn.execute(
+                """INSERT INTO intelligence_runs
+                    (system_id, snapshot_id, run_type, provider, model,
+                     prompt_version, schema_version, decision_method,
+                     status, is_mock, started_at, completed_at)
+                VALUES (?, ?, 'capability_hierarchy', 'deterministic', 'none',
+                        ?, ?, 'deterministic', 'completed', 0, ?, ?)""",
+                (ctx.system_id, ctx.snapshot_id, HIERARCHY_PROMPT_VERSION,
+                 HIERARCHY_SCHEMA_VERSION, now, now),
+            ).lastrowid
+        return {
+            "intelligence_run_id": run_id,
+            "capability_count": 0,
+            "note": "No code symbols to group",
+        }
 
     sp_draft = (
         {"id": draft_row["id"], "name": draft_row["name"], "purpose": draft_row["purpose"]}

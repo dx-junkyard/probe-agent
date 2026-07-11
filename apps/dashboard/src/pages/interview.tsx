@@ -2,8 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import {
-  AlertCircle, CheckCircle, FileCode, GitPullRequest,
-  HelpCircle, Layers, Loader2, MessageSquareText, Pencil, Play, RefreshCw, Send,
+  AlertCircle, CheckCircle, Download, FileCode, GitPullRequest,
+  HelpCircle, Layers, LifeBuoy, Loader2, MessageSquareText, Pencil, Play, RefreshCw, Send,
   Sparkles, XCircle,
 } from "lucide-react";
 import {
@@ -42,6 +42,7 @@ import { Select } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { formatTimestamp } from "@/lib/utils";
+import { buildPatchFilename, downloadTextFile } from "@/lib/patch";
 import type {
   CurrentUnderstanding,
   GapItem,
@@ -927,6 +928,9 @@ export default function InterviewPage() {
   const pendingCount = proposals.filter(p => p.approval_state === "proposed").length;
   const approvedCount = approvedSet?.approved_count ?? 0;
   const diff = lastMaterialization?.diff || session?.materialization_diff || "";
+  // The generated patch applies to the session's pinned snapshot. Prefer the
+  // current materialization response, then fall back to the session detail.
+  const patchCommitSha = lastMaterialization?.commit_sha || session?.snapshot_commit_sha || null;
   const currentStage = session?.stage ?? "understanding_initialized";
   const isProposalStage = currentStage === "proposal_generation";
   const sessionSnapshotStale = !!(
@@ -1042,7 +1046,7 @@ export default function InterviewPage() {
 
   const nextActionText = useMemo(() => {
     if (canConfirmStructuredUnderstanding) {
-      return "右側の「現在の理解」パネルに表示されているシステム理解を確認し、問題なければ確認済みにしてください。";
+      return "右側の「現在の理解」パネルに表示されているシステム理解を確認し、問題なければ「この理解を確認済みにする」を押してください。";
     }
     switch (uiState) {
       case "preparing":
@@ -1219,10 +1223,23 @@ export default function InterviewPage() {
     try {
       const result = await materialize.mutateAsync();
       setLastMaterialization(result);
-      toast.success(`${result.items_materialized}件を差分化しました`);
+      toast.success(`${result.items_materialized}件を差分化しました。内容をレビューし、.patch の保存と適用へ進めます。`);
     } catch (e) {
       toast.error(String(e));
     }
+  };
+
+  const downloadPatch = () => {
+    if (!diff || !session) return;
+    downloadTextFile(
+      diff,
+      buildPatchFilename({
+        systemId: session.system_id,
+        sessionId: session.id,
+        snapshotId: session.snapshot_id,
+        commitSha: patchCommitSha,
+      }),
+    );
   };
 
   const rebaseToLatestSnapshot = async () => {
@@ -1525,7 +1542,7 @@ export default function InterviewPage() {
                               ? "確定中..."
                               : zeroBaseComplete
                                 ? "この内容で提案生成に進む"
-                                : "現在の理解を確認済みにする"}
+                                : "この理解を確認済みにする"}
                           </Button>
                         </div>
                       )}
@@ -1665,13 +1682,42 @@ export default function InterviewPage() {
                           <CardTitle className="text-sm">レビュー用差分</CardTitle>
                           <CardDescription>差分の生成までで停止し、適用は開発者がレビューして行います。</CardDescription>
                         </div>
-                        <Button size="sm" variant="outline" onClick={() => openDiff(diff, session.id)} disabled={!diff}>
-                          <GitPullRequest className="h-4 w-4 mr-1" />
-                          差分を開く
-                        </Button>
+                        <div className="flex items-center gap-2">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={downloadPatch}
+                            disabled={!diff}
+                            data-testid="download-patch-button"
+                            title={diff ? undefined : "差分が未生成のためダウンロードできません"}
+                          >
+                            <Download className="h-4 w-4 mr-1" />
+                            .patch をダウンロード
+                          </Button>
+                          <Button size="sm" variant="outline" onClick={() => openDiff(diff, session.id)} disabled={!diff}>
+                            <GitPullRequest className="h-4 w-4 mr-1" />
+                            差分を開く
+                          </Button>
+                        </div>
                       </div>
                     </CardHeader>
                     <CardContent className="space-y-3">
+                      <div className="rounded-md bg-muted/50 p-3 text-xs space-y-1" data-testid="patch-provenance">
+                        <p className="font-medium">この差分について</p>
+                        <ul className="list-disc pl-4 space-y-0.5 text-muted-foreground">
+                          <li>承認済みのインタビュー提案から生成された、レビュー用の patch です。</li>
+                          <li>
+                            snapshot {session.snapshot_id}
+                            {patchCommitSha && (
+                              <> (commit <code className="font-mono">{patchCommitSha.slice(0, 8)}</code>)</>
+                            )}{" "}
+                            に対する差分です。適用時も同じ commit をベースにしてください。
+                          </li>
+                          <li>変更内容は probe-agent: docstring メタデータと @probe 計装です。</li>
+                          <li>対象リポジトリのブランチや実ファイルは自動では変更されていません。</li>
+                          <li>内容をレビューし、妥当な場合に開発者が手動で適用します。</li>
+                        </ul>
+                      </div>
                       {lastMaterialization?.skipped?.length ? (
                         <div className="rounded-md border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 p-3 text-xs text-amber-900 dark:text-amber-100">
                           {lastMaterialization.skipped.join("; ")}
@@ -1684,7 +1730,56 @@ export default function InterviewPage() {
                       ) : (
                         <div className="rounded-md border p-6 text-center text-sm text-muted-foreground">
                           提案を1件以上承認してから「差分を生成」を押すと、まとめて1つの差分が生成されます。
+                          差分が未生成の間は .patch のダウンロードはできません。
                         </div>
+                      )}
+                      {diff && (
+                        <>
+                          <details className="rounded-md border p-3 text-xs" data-testid="patch-apply-commands">
+                            <summary className="cursor-pointer font-medium text-sm">
+                              適用手順とコマンド例
+                            </summary>
+                            <pre className="mt-2 overflow-x-auto rounded-md bg-muted p-3 font-mono whitespace-pre">
+{`# 対象リポジトリで、差分生成時と同じ commit をベースにする
+git switch -c probe-instrumentation ${patchCommitSha ? patchCommitSha.slice(0, 8) : "<commit-sha>"}
+
+# 適用できるか事前に確認する
+git apply --check path/to/downloaded.patch
+
+# patch を適用する
+git apply path/to/downloaded.patch
+
+# 変更内容を確認する
+git diff
+
+# 必要なテストや疎通確認を実行する(接続ガイド参照)
+
+# 問題なければ通常の開発フローで commit / PR へ進む
+git status
+git add -p
+git commit`}
+                            </pre>
+                          </details>
+                          <div
+                            className="rounded-md border border-primary/40 bg-primary/5 p-3 text-sm flex items-start gap-2"
+                            data-testid="setup-guide-next-action"
+                          >
+                            <LifeBuoy className="h-4 w-4 mt-0.5 shrink-0" />
+                            <div>
+                              <p className="font-medium">次のステップ: 監視対象の設定と疎通確認</p>
+                              <p className="text-xs text-muted-foreground mt-0.5">
+                                patch の適用だけでは監視は始まりません。監視対象側の環境変数・トークン・接続先の設定と、
+                                trace が届くことの確認が必要です。
+                              </p>
+                              <Link
+                                className="inline-flex items-center text-sm underline mt-1"
+                                to={`/setup-guide?session=${session.id}`}
+                              >
+                                接続セットアップガイドを開く(このセッションの文脈付き)
+                              </Link>
+                            </div>
+                          </div>
+                        </>
                       )}
                       {session.materialization_ref && (
                         <a className="inline-flex items-center text-sm underline" href={session.materialization_ref} target="_blank" rel="noreferrer">

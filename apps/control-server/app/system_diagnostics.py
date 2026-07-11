@@ -39,7 +39,7 @@ from __future__ import annotations
 import os
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional
 
 from . import system_state
@@ -1158,6 +1158,50 @@ def _run_backed_pipeline_check(
     )
 
 
+def _check_capability_hierarchy_pipeline(
+    conn,
+    system_id: int,
+    snapshot_id: Optional[int],
+    *,
+    reasoning_available: bool,
+) -> DiagnosticCheck:
+    """Issue #210: same run-status check as ``_run_backed_pipeline_check``,
+    but a completed run with zero capability nodes is downgraded from "ok" to
+    "warning" instead of contradicting ``_check_system_capabilities`` (which
+    already reports zero capabilities as a warning) by calling the same
+    completed-but-empty run "ok" here.
+    """
+    check = _run_backed_pipeline_check(
+        conn, system_id, snapshot_id,
+        check_id="pipeline_capability_hierarchy",
+        title="capability 階層の実行",
+        run_types=["capability_hierarchy"],
+        pipeline_steps=["capability_hierarchy_ready"],
+        requires_reasoning=True,
+        reasoning_available=reasoning_available,
+        not_run_remediation="System Understanding で Build / Refresh を実行して capability 階層を生成してください。",
+    )
+    if (
+        check.severity == "ok"
+        and snapshot_id is not None
+        and system_state._capability_count_in_current_snapshot(conn, system_id, snapshot_id) == 0
+    ):
+        return replace(
+            check,
+            severity="warning",
+            detail=check.detail + " ただし capability ノードが 0 件のため、Core Capabilities は未定義のままです。",
+            impact="Core Capabilities が未定義のため、probe 設計や flow 探索の前提が欠けています。",
+            remediation=(
+                "Interview で Core Capabilities を確認するか、対象リポジトリに "
+                "`probe-agent:` メタデータを追加してから Build / Refresh を再実行してください。"
+            ),
+            fix_kind=FIX_KIND_NAVIGATE,
+            fix_page=PAGE_INTERVIEW,
+            fix_anchor=ANCHOR_INTERVIEW_CAPABILITIES,
+        )
+    return check
+
+
 def _artifact_backed_pipeline_check(
     conn,
     system_id: int,
@@ -1357,15 +1401,9 @@ def run_system_diagnostics(system_id: int) -> SystemDiagnosticsReport:
             )
         )
         checks.append(
-            _run_backed_pipeline_check(
+            _check_capability_hierarchy_pipeline(
                 conn, system_id, snapshot_id,
-                check_id="pipeline_capability_hierarchy",
-                title="capability 階層の実行",
-                run_types=["capability_hierarchy"],
-                pipeline_steps=["capability_hierarchy_ready"],
-                requires_reasoning=True,
                 reasoning_available=reasoning_available,
-                not_run_remediation="System Understanding で Build / Refresh を実行して capability 階層を生成してください。",
             )
         )
 

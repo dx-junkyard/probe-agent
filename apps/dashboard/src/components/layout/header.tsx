@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useCreateSystem } from "@/api/hooks";
 import { DiagnosticsBadge } from "@/components/diagnostics-badge";
+import { ConnectivityBadge } from "@/components/connectivity-badge";
 import { toast } from "sonner";
 
 function initTheme() {
@@ -82,6 +83,7 @@ export function Header() {
       </div>
 
       <div className="flex items-center gap-2">
+        <ConnectivityBadge />
         <DiagnosticsBadge />
         <ThemeToggle />
         {user && (

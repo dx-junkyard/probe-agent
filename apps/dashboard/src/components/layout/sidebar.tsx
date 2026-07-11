@@ -3,6 +3,7 @@ import {
   LayoutDashboard, GitBranch, Map, Crosshair, FlaskConical,
   Plug, Sparkles, Boxes, Settings, Users, ChevronLeft, ChevronRight, MessageSquare,
   Workflow, Network, MessageSquareText, Brain, GitFork, Filter,
+  LifeBuoy, BookMarked,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/api/auth";
@@ -30,12 +31,13 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { to: "/repository", icon: GitBranch, label: "Repository" },
       { to: "/capability-map", icon: Network, label: "Capability Map" },
+      { to: "/interview", icon: MessageSquareText, label: "Interview" },
       { to: "/feature-map", icon: Map, label: "Feature Map" },
       { to: "/flow-explorer", icon: Workflow, label: "Flow Explorer" },
       { to: "/trace-lineage", icon: GitFork, label: "Trace Lineage" },
       { to: "/trace-analyzers", icon: Filter, label: "Trace Analyzers" },
       { to: "/probe-planner", icon: Crosshair, label: "Probe Planner" },
-      { to: "/interview", icon: MessageSquareText, label: "Interview" },
+      { to: "/probe-patterns", icon: BookMarked, label: "Probe Patterns" },
       { to: "/experiments", icon: FlaskConical, label: "Experiments" },
     ],
   },
@@ -43,6 +45,7 @@ const NAV_GROUPS: NavGroup[] = [
     heading: "Other",
     items: [
       { to: "/connect-sdk", icon: Plug, label: "Connect SDK" },
+      { to: "/setup-guide", icon: LifeBuoy, label: "Setup Guide" },
       { to: "/generation", icon: Sparkles, label: "Generate" },
       { to: "/components", icon: Boxes, label: "Components" },
       { to: "/workspaces", icon: MessageSquare, label: "Decision Workspace" },

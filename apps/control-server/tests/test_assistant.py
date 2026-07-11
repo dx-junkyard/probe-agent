@@ -263,6 +263,35 @@ def test_ask_generic_question_returns_screen_overview_without_guessing(admin_cli
     assert "fallback" in body["answer"]
 
 
+def test_ask_with_focused_canonical_state_returns_its_citation_and_target(admin_client):
+    """Issue #208: a visible StateItem remains the assistant's current issue."""
+    token = _login(admin_client)
+    system = _create_system(admin_client, token)
+    headers = _headers(token, system["id"])
+    assessment = admin_client.get("/system-state", headers=headers).json()
+    state = next(item for item in assessment["items"] if item["state_id"] == "snapshot.ready.missing")
+
+    r = admin_client.post(
+        "/assistant/ask",
+        json={
+            "screen_id": "overview",
+            "question": "What should I do about this current issue?",
+            "visible_state_ids": [state["state_id"]],
+            "focused_state_id": state["state_id"],
+        },
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert state["summary"] in body["answer"]
+    assert {c["id"] for c in body["citations"]} >= {state["state_id"]}
+    assert any(
+        action["target"] == state["target_ui"]["route"]
+        and action["label"] == state["target_ui"]["action_label"]
+        for action in body["suggested_actions"]
+    )
+
+
 def test_ask_unknown_screen_404(admin_client):
     token = _login(admin_client)
     system = _create_system(admin_client, token)

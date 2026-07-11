@@ -27,6 +27,21 @@ The dashboard should support:
 - Repository tab
 - Feature Map tab
 - Probe Planner tab
+- Probe Patterns tab (Issue #168, `pages/probe-patterns.tsx`): pattern
+  list/detail with status (`active`/`stale`/`archived`/`superseded`),
+  objective, point counts, source commit, lifecycle history, and the latest
+  reconciliation summary. The pre-release flow scans the latest snapshot's
+  `@probe` instrumentation, saves selected probes as a pattern (inheriting
+  probe-plan context), then generates a removal diff that is applied only
+  after a typed confirmation (REMOVE) against the pinned commit. The
+  re-development flow reconciles a pattern against the latest snapshot and
+  renders each point's classification badge, decision method, evidence, and
+  hypothesis with a short confirm question — はい (accept) / いいえ
+  (reject) / わからないので調べる (investigate; renders the returned
+  implementation-state summary + recommendation). Exact matches need no
+  decision; `unsafe`/`missing` can never be accepted. "Create Probe Plan"
+  hands off to the existing Probe Planner gates and links there — the page
+  itself never applies instrumentation.
 - Experiments tab
 - Decision Workspace tab (Issue #38): workspace list/create/switch, a
   conversation thread with grounded findings/assumptions/missing information
@@ -119,6 +134,23 @@ The dashboard should support:
   re-requests proposal generation. When a requested turn yields no proposals
   and no error, show an informational toast (narrowing continues) — never a
   bare success toast that implies proposals were created.
+- Cross-page onboarding and navigation (Issue #212): Overview's zero-component
+  state shows a deterministic, ordered get-started list (Repository →
+  System Understanding → Connect SDK), optionally preceded by
+  `useSystemState()`'s `page_items["/"]` primary item via the canonical
+  `SystemStateBanner` when the server ever routes an item there. Probe
+  Planner's Feature field falls back to a prerequisite note (links to
+  `/feature-map` and `/system-understanding`) plus an explicit
+  "Enter feature id manually (advanced)" toggle when no Feature Map drafts
+  exist, instead of silently exposing free-text entry — this does not change
+  the generate API or block generation. The `PrerequisiteChecklist`
+  (`components/prerequisite-checklist.tsx`, snapshot / symbols indexed /
+  profile draft presence) is shared between Capability Map's and Feature
+  Map's empty states rather than duplicated. Capability Map's gap links to
+  `/system-understanding` carry `?capability=<key>` like other
+  capability-context links on that page. Connect SDK links forward to
+  `/setup-guide` (which already links back), closing the one-way link.
+  All of the above are deterministic presence/routing checks — no heuristics.
 
 ## Authentication model
 

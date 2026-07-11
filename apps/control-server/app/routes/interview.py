@@ -442,6 +442,10 @@ def get_interview_session(
 ) -> InterviewSessionDetailOut:
     with get_conn() as conn:
         row = _get_session_or_404(conn, session_id, system_id)
+        snapshot_row = conn.execute(
+            "SELECT commit_sha FROM repository_snapshots WHERE id = ? AND system_id = ?",
+            (row["snapshot_id"], system_id),
+        ).fetchone()
         message_rows = conn.execute(
             "SELECT * FROM interview_message WHERE session_id = ? ORDER BY id",
             (session_id,),
@@ -450,8 +454,12 @@ def get_interview_session(
             "SELECT * FROM interview_proposal WHERE session_id = ? ORDER BY id",
             (session_id,),
         ).fetchall()
+        session_fields = _session_out(row).model_dump()
+        session_fields["snapshot_commit_sha"] = (
+            snapshot_row["commit_sha"] if snapshot_row else None
+        )
         return InterviewSessionDetailOut(
-            **_session_out(row).model_dump(),
+            **session_fields,
             messages=[_message_out(m) for m in message_rows],
             proposals=[_proposal_out(conn, p) for p in proposal_rows],
         )
@@ -2250,6 +2258,7 @@ def materialize_interview_session(
         session_id=session_id,
         system_id=system_id,
         snapshot_id=snapshot_id,
+        commit_sha=commit_sha,
         diff=result.diff,
         files_changed=result.files_changed,
         items_materialized=result.items_applied,

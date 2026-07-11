@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from .db import get_conn
+from .git_ops import GitError, resolve_head, working_tree_status
 
 # Severity vocabulary shared with system_diagnostics.py. Order = worst first.
 SEVERITY_ORDER = ["error", "blocked", "warning", "info", "ok"]
@@ -58,6 +59,16 @@ USER_ACTION_KINDS = (
 )
 
 INTERVENTION_TIMINGS = ("now", "before_next_step", "optional", "after_build", "none")
+
+# These rankings are deliberately data-free.  Keeping selection separate from
+# state collection makes the "what should I do first?" decision deterministic
+# and directly unit-testable.
+_SEVERITY_RANK = {value: index for index, value in enumerate(SEVERITY_ORDER)}
+_TIMING_RANK = {value: index for index, value in enumerate(INTERVENTION_TIMINGS)}
+_ACTION_RANK = {
+    "configure": 0, "create_snapshot": 1, "build": 2, "confirm": 3,
+    "review": 4, "rerun": 5, "inspect": 6, "wait": 7, "none": 8,
+}
 
 STATUS_VALUES = (
     "satisfied", "missing", "unconfirmed", "stale", "impacted",
@@ -108,6 +119,9 @@ class StateItem:
     target_ui: Optional[TargetUi] = None
     related_checks: List[str] = field(default_factory=list)
     related_pipeline_steps: List[str] = field(default_factory=list)
+    source: str = "system_state"
+    dedupe_key: str = ""
+    scope: str = "global"
 
 
 @dataclass
@@ -117,6 +131,9 @@ class SystemStateAssessment:
     overall_severity: str
     severity_counts: Dict[str, int]
     items: List[StateItem] = field(default_factory=list)
+    primary_item: Optional[StateItem] = None
+    notification_items: List[StateItem] = field(default_factory=list)
+    page_items: Dict[str, List[StateItem]] = field(default_factory=dict)
 
 
 # --- Understanding baseline / diff-impact evaluation ------------------------
@@ -889,6 +906,41 @@ def _capability_hierarchy_item(
         (system_id, snapshot_id),
     ).fetchone()
     if row is not None and row["status"] == "completed":
+        # Issue #210: a completed run with zero capability nodes is not
+        # "done" from the user's perspective (no probe-agent: docstring
+        # metadata was found to group). Report a distinct warning item
+        # instead of silently returning None, so the SystemStateBanner and
+        # the "complete" pipeline checklist agree, and so remediation points
+        # at Interview/metadata instead of re-running the already-completed
+        # Build / Refresh.
+        if _capability_count_in_current_snapshot(conn, system_id, snapshot_id) == 0:
+            return StateItem(
+                state_id="pipeline.capability_hierarchy.empty",
+                state_group="pipeline",
+                severity="warning",
+                status="missing",
+                user_action_kind="confirm",
+                intervention_timing="before_next_step",
+                subject="Capability 階層",
+                summary="Capability 階層は実行済みですが capability が 0 件です。",
+                detail=(
+                    f"capability_hierarchy の実行（#{row['id']}）は完了していますが、"
+                    "現在の snapshot に capability ノードが存在しません。対象リポジトリに"
+                    " `probe-agent:` docstring メタデータが見つからなかったことが原因です。"
+                ),
+                impact="Core Capabilities が未定義のため、probe 設計・flow 探索・改善提案の前提が欠けています。",
+                remediation=(
+                    "Interview で Core Capabilities を確認するか、対象リポジトリに "
+                    "`probe-agent:` メタデータを追加してから Build / Refresh を再実行してください。"
+                ),
+                evidence={"snapshot_id": snapshot_id, "run_id": row["id"], "capability_count": 0},
+                target_ui=TargetUi(
+                    route=PAGE_INTERVIEW,
+                    anchor=ANCHOR_INTERVIEW_CAPABILITIES,
+                    action_label="Interview で Core Capabilities を確認",
+                ),
+                related_pipeline_steps=["capability_hierarchy_ready"],
+            )
         return None
     evidence = {"snapshot_id": snapshot_id, "run_id": row["id"] if row else None}
     return _pipeline_state_item(
@@ -903,16 +955,143 @@ def _capability_hierarchy_item(
     )
 
 
+def _repository_state_items(conn, system_id: int) -> List[StateItem]:
+    """Collect repository freshness state once for every consumer projection."""
+    config = conn.execute(
+        "SELECT repo_path FROM repository_configs WHERE system_id = ?", (system_id,)
+    ).fetchone()
+    if config is None or not config["repo_path"]:
+        return [StateItem(
+            state_id="repository.configuration.missing", state_group="repository",
+            severity="warning", status="missing", user_action_kind="configure",
+            intervention_timing="now", subject="Repository",
+            summary="対象 repository が設定されていません。",
+            detail="Snapshot と System Understanding を開始するには対象 repository の設定が必要です。",
+            remediation="Repository タブで対象 repository を設定してください。",
+            target_ui=TargetUi(route=PAGE_REPOSITORY, anchor="repo-config", action_label="Repository を設定"),
+            related_checks=["repository_config"], dedupe_key="repository.configuration",
+        )]
+
+    latest_ready = conn.execute(
+        "SELECT id, commit_sha FROM repository_snapshots WHERE system_id = ? AND status = 'ready' "
+        "ORDER BY id DESC LIMIT 1", (system_id,),
+    ).fetchone()
+    try:
+        current_head = resolve_head(config["repo_path"])
+        working_tree = working_tree_status(config["repo_path"])
+    except GitError as exc:
+        return [StateItem(
+            state_id="repository.head.unreadable", state_group="repository",
+            severity="error", status="failed", user_action_kind="configure",
+            intervention_timing="now", subject="Repository HEAD",
+            summary="Repository HEAD を読み取れません。", detail=str(exc),
+            remediation="Repository のパスとアクセス権を確認してください。",
+            evidence={"repo_path": config["repo_path"]},
+            target_ui=TargetUi(route=PAGE_REPOSITORY, anchor="repo-config", action_label="Repository 設定を確認"),
+            related_checks=["repository_path"], dedupe_key="repository.head",
+        )]
+
+    items: List[StateItem] = []
+    if latest_ready is not None and latest_ready["commit_sha"] != current_head:
+        items.append(StateItem(
+            state_id="repository.snapshot.stale", state_group="repository",
+            severity="warning", status="stale", user_action_kind="create_snapshot",
+            intervention_timing="now", subject="Repository snapshot",
+            summary="HEAD が最新 snapshot より進んでいます。",
+            detail=f"HEAD {current_head} は最新 ready snapshot #{latest_ready['id']} ({latest_ready['commit_sha']}) と異なります。",
+            remediation="Repository で新しい snapshot を作成してください。",
+            evidence={"current_head": current_head, "latest_ready_snapshot_id": latest_ready["id"],
+                      "latest_ready_commit": latest_ready["commit_sha"]},
+            target_ui=TargetUi(route=PAGE_REPOSITORY, anchor=ANCHOR_SNAPSHOT_CREATE, action_label="Snapshot を作成"),
+            related_checks=["snapshot_status"], related_pipeline_steps=["snapshot_ready"],
+            dedupe_key="repository.snapshot.freshness",
+        ))
+    if not working_tree.clean:
+        items.append(StateItem(
+            state_id="repository.working_tree.dirty", state_group="repository",
+            severity="warning", status="impacted", user_action_kind="review",
+            intervention_timing="before_next_step", subject="Working tree",
+            summary="未コミット差分があります。",
+            detail=f"Working tree に {working_tree.dirty_file_count} 件の未コミット変更があります。",
+            remediation="patch 適用や snapshot の前に commit、stash、または差分の確認をしてください。",
+            evidence={"dirty_file_count": working_tree.dirty_file_count, "dirty_sample": working_tree.sample},
+            target_ui=TargetUi(route=PAGE_REPOSITORY, anchor=ANCHOR_SNAPSHOT_CREATE, action_label="Repository を確認"),
+            related_checks=["working_tree"], dedupe_key="repository.working_tree",
+        ))
+    return items
+
+
+def _priority_key(item: StateItem) -> tuple:
+    """Deterministic cross-surface priority ordering for one item.
+
+    Shared by ``select_primary_item`` (which additionally prefers items on
+    the current route) and ``notification_items`` (which has no route
+    context and simply wants the globally most important item first).
+    """
+    return (
+        _SEVERITY_RANK.get(item.severity, len(_SEVERITY_RANK)),
+        _TIMING_RANK.get(item.intervention_timing, len(_TIMING_RANK)),
+        _ACTION_RANK.get(item.user_action_kind, len(_ACTION_RANK)),
+        item.state_id,
+    )
+
+
+def select_primary_item(items: List[StateItem], *, route: Optional[str] = None) -> Optional[StateItem]:
+    """Select the one user-facing item by the documented deterministic order."""
+    actionable = [item for item in items if item.severity != "ok" and item.user_action_kind not in ("none", "wait")]
+    if not actionable:
+        return None
+    return min(actionable, key=lambda item: (
+        0 if route and item.target_ui and item.target_ui.route == route else 1,
+        *_priority_key(item),
+    ))
+
+
+def _build_page_items(items: List[StateItem]) -> Dict[str, List[StateItem]]:
+    """Group actionable (non-``ok``) items by their target route.
+
+    ``page_items[route][0]`` renders as a warning-styled action banner in the
+    dashboard, so an ``ok`` item must never appear here even if it happens to
+    carry a ``target_ui`` (hardening; no current item does both today).
+    """
+    actionable = [item for item in items if item.severity != "ok" and item.target_ui]
+    routes = sorted({item.target_ui.route for item in actionable})
+    return {
+        route: sorted(
+            [item for item in actionable if item.target_ui.route == route],
+            key=lambda item: (
+                _SEVERITY_RANK.get(item.severity, len(_SEVERITY_RANK)),
+                _TIMING_RANK.get(item.intervention_timing, len(_TIMING_RANK)), item.state_id,
+            ),
+        )
+        for route in routes
+    }
+
+
+def _dedupe_items(items: List[StateItem]) -> List[StateItem]:
+    """Keep the highest priority representative for a shared root cause."""
+    result: Dict[str, StateItem] = {}
+    for item in items:
+        key = item.dedupe_key or item.state_id
+        old = result.get(key)
+        if old is None or select_primary_item([item, old]) is item:
+            result[key] = item
+    return sorted(result.values(), key=lambda item: item.state_id)
+
+
 def build_system_state(system_id: int) -> SystemStateAssessment:
     """Build the deterministic state assessment for one system.
 
     Read-only, LLM-free (Principle 6). Every item is derived from persisted
     database records for the latest ready snapshot.
     """
-    from .system_understanding_service import _is_reasoning_model_available
+    from .system_understanding_service import (
+        _check_understanding_refresh_recommended, _is_reasoning_model_available,
+    )
 
     items: List[StateItem] = []
     with get_conn() as conn:
+        items.extend(_repository_state_items(conn, system_id))
         snapshot_id = latest_ready_snapshot_id(conn, system_id)
 
         missing = _snapshot_missing_item(conn, system_id)
@@ -920,6 +1099,17 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
             items.append(missing)
 
         if snapshot_id is not None:
+            if _check_understanding_refresh_recommended(conn, system_id):
+                items.append(StateItem(
+                    state_id="interview.materialized.rebuild_required", state_group="interview",
+                    severity="warning", status="stale", user_action_kind="build",
+                    intervention_timing="after_build", subject="Interview materialization",
+                    summary="Interview の反映後に System Understanding の再 build が必要です。",
+                    detail="最新の Interview materialization が直近の完了済み build より新しいため、理解結果を更新する必要があります。",
+                    remediation="System Understanding で Build / Refresh を実行してください。",
+                    target_ui=TargetUi(route=PAGE_SYSTEM_UNDERSTANDING, anchor=ANCHOR_BUILD, action_label="Build / Refresh を実行"),
+                    related_pipeline_steps=["capability_hierarchy_ready"], dedupe_key="interview.materialization.build",
+                ))
             stale = _snapshot_stale_for_interview_item(conn, system_id, snapshot_id)
             if stale:
                 items.append(stale)
@@ -971,6 +1161,51 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
             if hierarchy:
                 items.append(hierarchy)
 
+    # Diagnostics remains its own backward-compatible endpoint, but each
+    # actionable diagnostic is also a canonical state item with the same fix
+    # target.  Import at call time because diagnostics itself reuses this
+    # module's understanding evaluator.
+    #
+    # Several native items above already cover a diagnostic root cause and
+    # declare it via related_checks (e.g. snapshot.ready.missing /
+    # repository.snapshot.stale -> "snapshot_status", repository config ->
+    # "repository_config", understanding items -> "system_purpose" /
+    # "system_capabilities"). Skip projecting those checks a second time so
+    # the same root cause doesn't appear twice in items/notifications with
+    # different dedupe keys (deterministic finite-set skip, Principle 6).
+    covered_check_ids = {
+        check_id for item in items for check_id in item.related_checks
+    }
+    from .system_diagnostics import run_system_diagnostics
+    for check in run_system_diagnostics(system_id).checks:
+        if check.severity == "ok":
+            continue
+        if check.check_id in covered_check_ids:
+            continue
+        severity = check.severity if check.severity in SEVERITY_ORDER else "warning"
+        action = "configure" if check.fix_kind == "dialog" else "inspect"
+        items.append(StateItem(
+            state_id=f"diagnostic.{check.check_id}",
+            state_group="configuration" if check.category in ("auth", "database", "llm", "configuration") else "runtime",
+            severity=severity,
+            status="failed" if severity == "error" else ("blocked" if severity == "blocked" else "missing"),
+            user_action_kind=action,
+            intervention_timing="now" if severity in ("error", "blocked") else "before_next_step",
+            subject=check.title, summary=check.title, detail=check.detail,
+            impact=check.impact, remediation=check.remediation,
+            evidence={"diagnostic_category": check.category, "fix_kind": check.fix_kind},
+            # Issue #211: name the target instead of a bare 修正する so the
+            # button says what will be fixed before it is clicked. check.title
+            # comes from the finite diagnostics check set, so this stays a
+            # deterministic label, not generated text.
+            target_ui=(TargetUi(route=check.fix_page, anchor=check.fix_anchor,
+                                action_label=f"「{check.title}」を修正") if check.fix_page else None),
+            related_checks=[check.check_id], related_pipeline_steps=check.related_pipeline_steps,
+            source="system_diagnostics", dedupe_key=f"diagnostic.{check.check_id}",
+        ))
+
+    items = _dedupe_items(items)
+
     severity_counts: Dict[str, int] = {level: 0 for level in SEVERITY_ORDER}
     for item in items:
         severity_counts[item.severity] = severity_counts.get(item.severity, 0) + 1
@@ -981,4 +1216,10 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
         overall_severity=overall,
         severity_counts=severity_counts,
         items=items,
+        primary_item=select_primary_item(items),
+        notification_items=sorted(
+            [item for item in items if item.severity in ("error", "blocked", "warning") and item.scope == "global"],
+            key=_priority_key,
+        ),
+        page_items=_build_page_items(items),
     )

@@ -139,6 +139,23 @@ class TestSystemUnderstandingGetWithoutSnapshot:
         assert len(data["next_actions"]) > 0
         assert data["next_actions"][0]["action"] == "Configure repository"
 
+    def test_primary_action_matches_configure_repository_next_action(self, admin_client, tmp_path):
+        """Issue #201: GET /repository/system-understanding exposes primary_action,
+        matching the first next_action (Configure repository, action_kind=navigate)
+        when no repository is configured yet."""
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "test-sys-primary")
+        hdrs = _headers(token, sys["id"])
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200
+        data = r.json()
+
+        assert data["primary_action"] is not None
+        assert data["primary_action"]["action"] == "Configure repository"
+        assert data["primary_action"]["action_kind"] == "navigate"
+        assert data["primary_action"] == data["next_actions"][0]
+
     def test_returns_missing_snapshot_after_config(self, admin_client, tmp_path):
         token = _login(admin_client)
         sys = _create_system(admin_client, token, "test-sys-2")
@@ -226,8 +243,12 @@ class TestSystemUnderstandingReportsReasoningModelBlocked:
         # documentation step that requires a reasoning model.
         assert pipeline["documentation_indexed"] == "complete"
         assert pipeline["documentation_claims_scanned"] == "blocked"
-        # Capability hierarchy has a deterministic base that runs without reasoning
-        assert pipeline["capability_hierarchy_ready"] in ("complete", "blocked")
+        # Capability hierarchy has a deterministic base that runs without reasoning.
+        # Issue #210: the fixture repo carries no `probe-agent:` docstring
+        # metadata, so the run completes with zero capability nodes, which is
+        # reported as "warning" (not silently "complete") rather than blocked
+        # on the (unrelated) reasoning-model requirement.
+        assert pipeline["capability_hierarchy_ready"] in ("warning", "blocked")
 
     def test_documentation_indexed_reflects_build_step_not_draft_generation(
         self, admin_client, tmp_path
@@ -256,6 +277,106 @@ class TestSystemUnderstandingReportsReasoningModelBlocked:
         assert r.status_code == 200
         pipeline = {s["step"]: s["status"] for s in r.json()["pipeline"]}
         assert pipeline["documentation_indexed"] == "complete"
+
+
+class TestCapabilityHierarchyReadyStatus:
+    """Issue #210: capability_hierarchy_ready must not report "complete" for a
+    completed run that produced zero capability nodes (no `probe-agent:`
+    docstring metadata found in the target repo), since that used to
+    contradict the SystemStateBanner's "generate the capability hierarchy"
+    warning for the same build.
+    """
+
+    def _setup_with_snapshot(self, admin_client, tmp_path, name):
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, name)
+        hdrs = _headers(token, sys["id"])
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post(
+            "/repository/snapshots", json={"commit_sha": sha}, headers=hdrs
+        )
+        assert snap.status_code == 201, snap.text
+        return sys, hdrs, snap.json()["id"]
+
+    def _insert_capability_run(self, system_id, snapshot_id, status):
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO intelligence_runs
+                       (system_id, snapshot_id, run_type, provider, model,
+                        prompt_version, schema_version, decision_method,
+                        status, is_mock, started_at, completed_at)
+                   VALUES (?, ?, 'capability_hierarchy', 'deterministic', 'none',
+                           'v1', 'v1', 'deterministic', ?, 0, 0, 0)""",
+                (system_id, snapshot_id, status),
+            )
+            return cur.lastrowid
+
+    def _insert_capability_node(self, system_id, snapshot_id, run_id):
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO capability_hierarchy_nodes
+                       (system_id, snapshot_id, intelligence_run_id, node_type, name, created_at)
+                   VALUES (?, ?, ?, 'capability', 'Some capability', 0)""",
+                (system_id, snapshot_id, run_id),
+            )
+
+    def test_no_run_and_reasoning_available_is_missing(self, admin_client, tmp_path, monkeypatch):
+        """Regression: no run + reasoning available -> plain "missing"."""
+        monkeypatch.setattr(
+            "app.system_understanding_service._is_reasoning_model_available",
+            lambda: True,
+        )
+        sys, hdrs, snapshot_id = self._setup_with_snapshot(admin_client, tmp_path, "chr-no-run-sys")
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200
+        pipeline = {s["step"]: s["status"] for s in r.json()["pipeline"]}
+        assert pipeline["capability_hierarchy_ready"] == "missing"
+
+    def test_no_run_and_reasoning_unavailable_is_blocked(self, admin_client, tmp_path):
+        """Regression: no run + no reasoning model configured -> "blocked"
+        (the admin_client fixture defaults to LLM_PROVIDER=mock)."""
+        sys, hdrs, snapshot_id = self._setup_with_snapshot(admin_client, tmp_path, "chr-no-run-blocked-sys")
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200
+        pipeline = {s["step"]: s["status"] for s in r.json()["pipeline"]}
+        assert pipeline["capability_hierarchy_ready"] == "blocked"
+
+    def test_completed_with_zero_capabilities_is_warning(self, admin_client, tmp_path):
+        sys, hdrs, snapshot_id = self._setup_with_snapshot(admin_client, tmp_path, "chr-zero-sys")
+        self._insert_capability_run(sys["id"], snapshot_id, "completed")
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200
+        pipeline = {s["step"]: s for s in r.json()["pipeline"]}
+        step = pipeline["capability_hierarchy_ready"]
+        assert step["status"] == "warning"
+        assert "probe-agent" in step["detail"]
+
+    def test_completed_with_at_least_one_capability_is_complete(self, admin_client, tmp_path):
+        sys, hdrs, snapshot_id = self._setup_with_snapshot(admin_client, tmp_path, "chr-nonzero-sys")
+        run_id = self._insert_capability_run(sys["id"], snapshot_id, "completed")
+        self._insert_capability_node(sys["id"], snapshot_id, run_id)
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200
+        pipeline = {s["step"]: s["status"] for s in r.json()["pipeline"]}
+        assert pipeline["capability_hierarchy_ready"] == "complete"
+
+        # And system_state must not surface a capability-hierarchy item for a
+        # genuinely completed, non-empty run.
+        state_r = admin_client.get("/system-state", headers=hdrs)
+        assert state_r.status_code == 200, state_r.text
+        state_ids = [i["state_id"] for i in state_r.json()["items"]]
+        assert not any(s.startswith("pipeline.capability_hierarchy.") for s in state_ids)
 
 
 class TestSystemUnderstandingReportsMetadataCoverage:
@@ -919,7 +1040,11 @@ class TestNextActionsPriority:
             gap_count=3,
         )
         assert actions[0].action == "Define System Purpose"
-        assert actions[0].reason == "Pipeline completed, but no system purpose is defined yet."
+        assert actions[0].reason.startswith(
+            "Pipeline completed, but no system purpose is defined yet."
+        )
+        # Issue #211: the reason also explains why defining it matters.
+        assert "evaluation basis" in actions[0].reason
         assert actions[0].link == "/interview"
 
     def test_complete_pipeline_without_capabilities_after_purpose(self):
@@ -964,9 +1089,31 @@ class TestNextActionsPriority:
         )
         by_label = {a.action: a for a in actions}
         assert by_label["Unclassified API found"].category == "observe"
-        assert by_label["Unclassified API found"].link == "/capability-map"
+        assert by_label["Unclassified API found"].link == "/interview"
         assert by_label["Probe candidate available"].category == "observe"
         assert by_label["Probe candidate available"].link == "/flow-explorer"
+
+    def test_gap_derived_actions_match_gap_next_actions_primary_link(self):
+        """Issue #199: the top-level Next Action link for each gap-type-derived
+        action must match GAP_NEXT_ACTIONS[gap_type][0]["link"] — the same
+        primary resolution shown on that gap type's card, so the two never
+        disagree on where to send the user."""
+        from app.system_understanding_service import GAP_NEXT_ACTIONS, GapSummary, _build_next_actions
+
+        actions = _build_next_actions(
+            self._complete_pipeline(),
+            purpose={"name": "Sys", "summary": "Does things"},
+            capabilities=[{"name": "Cap"}],
+            metadata_coverage=None,
+            gap_count=3,
+            gap_summary=[
+                GapSummary(gap_type="unclassified_entrypoint", count=1),
+                GapSummary(gap_type="missing_probe_flow", count=2),
+            ],
+        )
+        by_label = {a.action: a for a in actions}
+        assert by_label["Unclassified API found"].link == GAP_NEXT_ACTIONS["unclassified_entrypoint"][0]["link"]
+        assert by_label["Probe candidate available"].link == GAP_NEXT_ACTIONS["missing_probe_flow"][0]["link"]
 
     def test_fully_satisfied_pipeline_offers_exploration_actions(self):
         from app.system_understanding_service import MetadataCoverage, _build_next_actions
@@ -1080,3 +1227,673 @@ class TestNextActionsPriority:
         assert "Review probe plan" not in labels
         assert "Generate / validate probe patch" not in labels
         assert "Review experiment decision" not in labels
+
+
+class TestDerivePrimaryAction:
+    """Issue #201: ``_derive_primary_action`` picks the single highest-priority
+    action for the current state, using the finite rules documented in
+    docs/system-understanding-navigation.md.
+    """
+
+    def _complete_pipeline(self):
+        from app.system_understanding_service import PIPELINE_STEPS, PipelineStep
+
+        return [PipelineStep(step, "complete") for step in PIPELINE_STEPS]
+
+    def _incomplete_pipeline(self, *missing_steps):
+        from app.system_understanding_service import PipelineStep
+
+        return [
+            PipelineStep(step.step, "missing" if step.step in missing_steps else "complete")
+            for step in self._complete_pipeline()
+        ]
+
+    def test_repository_not_configured_uses_first_next_action(self):
+        from app.system_understanding_service import (
+            PipelineStep, _build_next_actions, _derive_primary_action,
+        )
+
+        pipeline = [
+            PipelineStep("repository_configured", "missing"),
+            PipelineStep("snapshot_ready", "missing"),
+        ]
+        next_actions = _build_next_actions(
+            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+        )
+        primary = _derive_primary_action(pipeline, next_actions, latest_build=None)
+
+        assert primary is not None
+        assert primary.action == "Configure repository"
+        assert primary.action_kind == "navigate"
+
+    def test_snapshot_not_ready_uses_first_next_action(self):
+        from app.system_understanding_service import (
+            PipelineStep, _build_next_actions, _derive_primary_action,
+        )
+
+        pipeline = [
+            PipelineStep("repository_configured", "complete"),
+            PipelineStep("snapshot_ready", "missing"),
+        ]
+        next_actions = _build_next_actions(
+            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+        )
+        primary = _derive_primary_action(pipeline, next_actions, latest_build=None)
+
+        assert primary is not None
+        assert primary.action == "Create snapshot"
+        assert primary.action_kind == "navigate"
+
+    def test_repository_not_configured_wins_even_if_build_is_running(self):
+        """Rule 1 is evaluated before rule 2 (build-running check)."""
+        from app.system_understanding_service import (
+            PipelineStep, _build_next_actions, _derive_primary_action,
+        )
+
+        pipeline = [
+            PipelineStep("repository_configured", "missing"),
+            PipelineStep("snapshot_ready", "missing"),
+        ]
+        next_actions = _build_next_actions(
+            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+        )
+        primary = _derive_primary_action(
+            pipeline, next_actions, latest_build={"status": "running"},
+        )
+
+        assert primary is not None
+        assert primary.action == "Configure repository"
+
+    def test_incomplete_step_with_no_build_running_offers_build_action(self):
+        from app.system_understanding_service import _build_next_actions, _derive_primary_action
+
+        pipeline = self._incomplete_pipeline("symbols_indexed")
+        next_actions = _build_next_actions(
+            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+        )
+        primary = _derive_primary_action(pipeline, next_actions, latest_build=None)
+
+        assert primary is not None
+        assert primary.action == "Build system understanding"
+        assert primary.action_kind == "build"
+        assert primary.link is None
+        assert "1" in primary.reason
+
+    def test_incomplete_step_reason_counts_all_remaining_steps(self):
+        from app.system_understanding_service import _build_next_actions, _derive_primary_action
+
+        pipeline = self._incomplete_pipeline("symbols_indexed", "entrypoints_discovered")
+        next_actions = _build_next_actions(
+            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+        )
+        primary = _derive_primary_action(pipeline, next_actions, latest_build=None)
+
+        assert primary is not None
+        assert primary.action_kind == "build"
+        assert primary.reason.startswith("2 ")
+
+    @pytest.mark.parametrize("status", ["queued", "running"])
+    def test_build_running_or_queued_suppresses_primary_action(self, status):
+        from app.system_understanding_service import _build_next_actions, _derive_primary_action
+
+        pipeline = self._incomplete_pipeline("symbols_indexed")
+        next_actions = _build_next_actions(
+            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+        )
+        primary = _derive_primary_action(
+            pipeline, next_actions, latest_build={"status": status},
+        )
+
+        assert primary is None
+
+    @pytest.mark.parametrize("status", ["completed", "failed", "partial", "cancelled"])
+    def test_settled_build_does_not_suppress_primary_action(self, status):
+        from app.system_understanding_service import _build_next_actions, _derive_primary_action
+
+        pipeline = self._incomplete_pipeline("symbols_indexed")
+        next_actions = _build_next_actions(
+            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+        )
+        primary = _derive_primary_action(
+            pipeline, next_actions, latest_build={"status": status},
+        )
+
+        assert primary is not None
+        assert primary.action_kind == "build"
+
+    def test_pipeline_complete_without_purpose_uses_define_purpose(self):
+        from app.system_understanding_service import _build_next_actions, _derive_primary_action
+
+        pipeline = self._complete_pipeline()
+        next_actions = _build_next_actions(
+            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+        )
+        primary = _derive_primary_action(pipeline, next_actions, latest_build=None)
+
+        assert primary is not None
+        assert primary.action == "Define System Purpose"
+        assert primary.link == "/interview"
+        assert primary.action_kind == "navigate"
+
+    def test_pipeline_complete_without_purpose_with_settled_build_is_unaffected(self):
+        from app.system_understanding_service import _build_next_actions, _derive_primary_action
+
+        pipeline = self._complete_pipeline()
+        next_actions = _build_next_actions(
+            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+        )
+        primary = _derive_primary_action(
+            pipeline, next_actions, latest_build={"status": "completed"},
+        )
+
+        assert primary is not None
+        assert primary.action == "Define System Purpose"
+
+    def test_fully_satisfied_uses_first_next_action(self):
+        from app.system_understanding_service import _build_next_actions, _derive_primary_action
+
+        pipeline = self._complete_pipeline()
+        next_actions = _build_next_actions(
+            pipeline,
+            purpose={"name": "Sys", "summary": "Does things"},
+            capabilities=[{"name": "Cap"}],
+            metadata_coverage=None,
+            gap_count=0,
+        )
+        primary = _derive_primary_action(pipeline, next_actions, latest_build=None)
+
+        assert primary is not None
+        assert primary.action == "Start from Capability"
+        assert primary.link == "/capability-map"
+        assert primary.action_kind == "navigate"
+
+    def test_no_next_actions_returns_none(self):
+        from app.system_understanding_service import _derive_primary_action
+
+        pipeline = self._complete_pipeline()
+        primary = _derive_primary_action(pipeline, next_actions=[], latest_build=None)
+
+        assert primary is None
+
+
+class TestDeriveStageStatuses:
+    """Issue #202: ``_derive_stage_statuses`` derives a deterministic
+    not_started / in_progress / blocked / complete status (+ counts) for each
+    of the 4 Hub stages, using the finite rules documented in
+    docs/system-understanding-navigation.md.
+    """
+
+    def _complete_pipeline(self):
+        from app.system_understanding_service import PIPELINE_STEPS, PipelineStep
+
+        return [PipelineStep(step, "complete") for step in PIPELINE_STEPS]
+
+    def _pipeline_with(self, **overrides):
+        from app.system_understanding_service import PIPELINE_STEPS, PipelineStep
+
+        return [
+            PipelineStep(step, overrides.get(step, "complete")) for step in PIPELINE_STEPS
+        ]
+
+    def _derive(self, pipeline, **overrides):
+        from app.system_understanding_service import GapSummary, _derive_stage_statuses
+
+        defaults = dict(
+            purpose={"name": "Sys", "summary": "Does things"},
+            capabilities=[{"name": "Cap"}],
+            gap_count=0,
+            gap_summary=[],
+            entrypoint_count=0,
+            proposed_plan_count=0,
+            approved_without_patch_count=0,
+            validated_plan_count=0,
+            total_plan_count=0,
+            undecided_experiment_count=0,
+            decided_experiment_count=0,
+            total_experiment_count=0,
+        )
+        defaults.update(overrides)
+        stages = _derive_stage_statuses(pipeline, **defaults)
+        return {s.stage: s for s in stages}
+
+    def _gap_summary(self, **counts):
+        from app.system_understanding_service import GapSummary
+
+        return [GapSummary(gap_type=k, count=v) for k, v in counts.items()]
+
+    # --- understand ---
+
+    def test_understand_not_started_when_all_steps_missing(self):
+        from app.system_understanding_service import PIPELINE_STEPS, PipelineStep
+
+        pipeline = [PipelineStep(step, "missing") for step in PIPELINE_STEPS]
+        stages = self._derive(pipeline, purpose=None, capabilities=[])
+
+        assert stages["understand"].status == "not_started"
+
+    def test_understand_blocked_when_any_step_blocked(self):
+        pipeline = self._pipeline_with(symbols_indexed="blocked")
+        stages = self._derive(pipeline)
+
+        assert stages["understand"].status == "blocked"
+
+    def test_understand_blocked_when_any_step_failed(self):
+        pipeline = self._pipeline_with(documentation_indexed="failed")
+        stages = self._derive(pipeline)
+
+        assert stages["understand"].status == "blocked"
+
+    def test_understand_in_progress_when_pipeline_incomplete(self):
+        pipeline = self._pipeline_with(symbols_indexed="missing")
+        stages = self._derive(pipeline)
+
+        assert stages["understand"].status == "in_progress"
+
+    def test_understand_in_progress_when_pipeline_complete_but_no_purpose(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(pipeline, purpose=None, capabilities=[{"name": "Cap"}])
+
+        assert stages["understand"].status == "in_progress"
+
+    def test_understand_in_progress_when_pipeline_complete_but_no_capabilities(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(
+            pipeline, purpose={"name": "Sys", "summary": "s"}, capabilities=[],
+        )
+
+        assert stages["understand"].status == "in_progress"
+
+    def test_understand_complete_when_pipeline_purpose_and_capabilities_all_present(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(pipeline)
+
+        assert stages["understand"].status == "complete"
+
+    def test_understand_counts_gaps(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(pipeline, gap_count=4)
+
+        assert stages["understand"].counts == {"gaps": 4}
+
+    # --- observe ---
+
+    def test_observe_not_started_when_entrypoints_step_incomplete(self):
+        pipeline = self._pipeline_with(entrypoints_discovered="missing")
+        stages = self._derive(pipeline, entrypoint_count=0)
+
+        assert stages["observe"].status == "not_started"
+
+    def test_observe_in_progress_when_no_entrypoints_yet(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(pipeline, entrypoint_count=0)
+
+        assert stages["observe"].status == "in_progress"
+
+    def test_observe_in_progress_when_unclassified_entrypoints_remain(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(
+            pipeline,
+            entrypoint_count=5,
+            gap_summary=self._gap_summary(unclassified_entrypoint=2),
+        )
+
+        assert stages["observe"].status == "in_progress"
+
+    def test_observe_complete_when_entrypoints_exist_and_none_unclassified(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(pipeline, entrypoint_count=5)
+
+        assert stages["observe"].status == "complete"
+
+    def test_observe_counts_entrypoints_and_unclassified(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(
+            pipeline,
+            entrypoint_count=5,
+            gap_summary=self._gap_summary(unclassified_entrypoint=2),
+        )
+
+        assert stages["observe"].counts == {"entrypoints": 5, "unclassified": 2}
+
+    # --- instrument ---
+
+    def test_instrument_not_started_when_no_plans(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(pipeline, total_plan_count=0)
+
+        assert stages["instrument"].status == "not_started"
+
+    def test_instrument_in_progress_when_plans_exist_but_none_validated(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(
+            pipeline, total_plan_count=1, proposed_plan_count=1, validated_plan_count=0,
+        )
+
+        assert stages["instrument"].status == "in_progress"
+
+    def test_instrument_in_progress_when_some_approved_plans_lack_validated_patch(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(
+            pipeline,
+            total_plan_count=2,
+            validated_plan_count=1,
+            approved_without_patch_count=1,
+        )
+
+        assert stages["instrument"].status == "in_progress"
+
+    def test_instrument_complete_when_validated_plan_exists_and_none_pending(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(
+            pipeline,
+            total_plan_count=1,
+            validated_plan_count=1,
+            approved_without_patch_count=0,
+        )
+
+        assert stages["instrument"].status == "complete"
+
+    def test_instrument_counts(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(
+            pipeline,
+            total_plan_count=3,
+            proposed_plan_count=2,
+            approved_without_patch_count=1,
+            validated_plan_count=0,
+        )
+
+        assert stages["instrument"].counts == {
+            "proposed": 2, "approved_without_patch": 1, "validated": 0,
+        }
+
+    # --- evaluate ---
+
+    def test_evaluate_not_started_when_no_experiments(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(pipeline, total_experiment_count=0)
+
+        assert stages["evaluate"].status == "not_started"
+
+    def test_evaluate_in_progress_when_experiments_exist_but_none_decided(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(
+            pipeline, total_experiment_count=1, undecided_experiment_count=1,
+            decided_experiment_count=0,
+        )
+
+        assert stages["evaluate"].status == "in_progress"
+
+    def test_evaluate_in_progress_when_some_completed_experiments_undecided(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(
+            pipeline,
+            total_experiment_count=2,
+            decided_experiment_count=1,
+            undecided_experiment_count=1,
+        )
+
+        assert stages["evaluate"].status == "in_progress"
+
+    def test_evaluate_complete_when_decided_experiment_exists_and_none_pending(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(
+            pipeline,
+            total_experiment_count=1,
+            decided_experiment_count=1,
+            undecided_experiment_count=0,
+        )
+
+        assert stages["evaluate"].status == "complete"
+
+    def test_evaluate_counts(self):
+        pipeline = self._complete_pipeline()
+        stages = self._derive(
+            pipeline,
+            total_experiment_count=3,
+            decided_experiment_count=2,
+            undecided_experiment_count=1,
+        )
+
+        assert stages["evaluate"].counts == {"undecided": 1, "decided": 2}
+
+
+class TestSystemUnderstandingStagesInApiResponse:
+    """Issue #202: GET /repository/system-understanding includes ``stages``."""
+
+    def test_new_system_reports_four_not_started_stages(self, admin_client, tmp_path):
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "stages-sys")
+        hdrs = _headers(token, sys["id"])
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        stages = r.json()["stages"]
+
+        assert {s["stage"] for s in stages} == {
+            "understand", "observe", "instrument", "evaluate",
+        }
+        by_stage = {s["stage"]: s for s in stages}
+        assert by_stage["understand"]["status"] == "not_started"
+        assert by_stage["observe"]["status"] == "not_started"
+        assert by_stage["instrument"]["status"] == "not_started"
+        assert by_stage["evaluate"]["status"] == "not_started"
+        assert by_stage["instrument"]["counts"] == {
+            "proposed": 0, "approved_without_patch": 0, "validated": 0,
+        }
+        assert by_stage["evaluate"]["counts"] == {"undecided": 0, "decided": 0}
+
+    def test_proposed_plan_surfaces_in_instrument_counts(self, admin_client, tmp_path):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "stages-plan-sys")
+        hdrs = _headers(token, sys["id"])
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap_r = admin_client.post(
+            "/repository/snapshots", json={"commit_sha": sha}, headers=hdrs
+        )
+        snapshot_id = snap_r.json()["id"]
+        system_id = sys["id"]
+
+        with get_conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO intelligence_runs
+                       (system_id, snapshot_id, run_type, provider, model,
+                        prompt_version, schema_version, decision_method,
+                        status, is_mock, started_at, completed_at)
+                   VALUES (?, ?, 'probe_plan', 'mock', 'mock-model', 'v1', 'v1',
+                           'reasoning_llm', 'completed', 1, 0, 0)""",
+                (system_id, snapshot_id),
+            )
+            run_id = cur.lastrowid
+            conn.execute(
+                """INSERT INTO probe_plans
+                       (system_id, snapshot_id, intelligence_run_id, feature_id,
+                        objective, status, origin, created_at, updated_at)
+                   VALUES (?, ?, ?, 'feat-1', 'obj', 'proposed', 'manual', 0, 0)""",
+                (system_id, snapshot_id, run_id),
+            )
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        by_stage = {s["stage"]: s for s in r.json()["stages"]}
+        assert by_stage["instrument"]["status"] == "in_progress"
+        assert by_stage["instrument"]["counts"]["proposed"] == 1
+
+
+class TestGapTrendAndRefreshRecommended:
+    """Issue #203: GET /repository/system-understanding exposes ``gap_trend``
+    (before/after gap counts across the last two settled builds, read back
+    from system_understanding_gap_history) and
+    ``understanding_refresh_recommended`` (a materialized Interview change
+    postdating the latest completed build). Both are plain deterministic
+    reads -- no reasoning model involved."""
+
+    def _setup_system(self, admin_client, tmp_path, name):
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, name)
+        hdrs = _headers(token, sys["id"])
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap_r = admin_client.post(
+            "/repository/snapshots", json={"commit_sha": sha}, headers=hdrs
+        )
+        snapshot_id = snap_r.json()["id"]
+        return sys["id"], hdrs, snapshot_id
+
+    def _insert_build(self, system_id, snapshot_id, status, completed_at=None):
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            return conn.execute(
+                """INSERT INTO system_understanding_builds
+                       (system_id, snapshot_id, status, completed_at, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (system_id, snapshot_id, status, completed_at, completed_at or 0),
+            ).lastrowid
+
+    def _insert_gap_history(self, system_id, snapshot_id, build_id, counts):
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            for gap_type, count in counts.items():
+                conn.execute(
+                    """INSERT INTO system_understanding_gap_history
+                           (system_id, snapshot_id, build_id, gap_type, count, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (system_id, snapshot_id, build_id, gap_type, count, 0),
+                )
+
+    def _insert_materialized_session(self, system_id, snapshot_id, materialized_at):
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO interview_session
+                       (system_id, snapshot_id, materialized_at, created_at, updated_at)
+                   VALUES (?, ?, ?, 0, 0)""",
+                (system_id, snapshot_id, materialized_at),
+            )
+
+    def test_fewer_than_two_settled_builds_returns_empty_trend(self, admin_client, tmp_path):
+        system_id, hdrs, snapshot_id = self._setup_system(admin_client, tmp_path, "gap-trend-one-build")
+        build_id = self._insert_build(system_id, snapshot_id, "completed", completed_at=10)
+        self._insert_gap_history(system_id, snapshot_id, build_id, {"docs_only": 5})
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        assert r.json()["gap_trend"] == []
+
+    def test_two_builds_reports_current_previous_new_and_resolved_gap_types(
+        self, admin_client, tmp_path
+    ):
+        system_id, hdrs, snapshot_id = self._setup_system(admin_client, tmp_path, "gap-trend-two-builds")
+        build1 = self._insert_build(system_id, snapshot_id, "completed", completed_at=10)
+        self._insert_gap_history(
+            system_id, snapshot_id, build1,
+            {"docs_only": 12, "unclassified_entrypoint": 2},
+        )
+        build2 = self._insert_build(system_id, snapshot_id, "partial", completed_at=20)
+        self._insert_gap_history(
+            system_id, snapshot_id, build2,
+            {"docs_only": 8, "code_only": 3},
+        )
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        trend = {t["gap_type"]: t for t in r.json()["gap_trend"]}
+
+        # docs_only: present in both builds -> improved (12 -> 8).
+        assert trend["docs_only"]["previous"] == 12
+        assert trend["docs_only"]["current"] == 8
+        # unclassified_entrypoint: only in the older build -> resolved (current=0).
+        assert trend["unclassified_entrypoint"]["previous"] == 2
+        assert trend["unclassified_entrypoint"]["current"] == 0
+        # code_only: only in the newer build -> newly appeared (previous=0).
+        assert trend["code_only"]["previous"] == 0
+        assert trend["code_only"]["current"] == 3
+
+    def test_gap_trend_uses_the_two_most_recent_settled_builds(self, admin_client, tmp_path):
+        """A third, most-recent build's history supersedes the first two --
+        the comparison is always against the two most recent settled builds,
+        not the first two ever recorded."""
+        system_id, hdrs, snapshot_id = self._setup_system(admin_client, tmp_path, "gap-trend-three-builds")
+        build1 = self._insert_build(system_id, snapshot_id, "completed", completed_at=10)
+        self._insert_gap_history(system_id, snapshot_id, build1, {"docs_only": 20})
+        build2 = self._insert_build(system_id, snapshot_id, "completed", completed_at=20)
+        self._insert_gap_history(system_id, snapshot_id, build2, {"docs_only": 12})
+        build3 = self._insert_build(system_id, snapshot_id, "completed", completed_at=30)
+        self._insert_gap_history(system_id, snapshot_id, build3, {"docs_only": 4})
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        trend = {t["gap_type"]: t for t in r.json()["gap_trend"]}
+        assert trend["docs_only"]["previous"] == 12
+        assert trend["docs_only"]["current"] == 4
+
+    def test_refresh_recommended_true_after_materialize_before_rebuild(self, admin_client, tmp_path):
+        system_id, hdrs, snapshot_id = self._setup_system(admin_client, tmp_path, "refresh-true-sys")
+        self._insert_build(system_id, snapshot_id, "completed", completed_at=10)
+        self._insert_materialized_session(system_id, snapshot_id, materialized_at=20)
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        assert r.json()["understanding_refresh_recommended"] is True
+
+    def test_refresh_recommended_false_after_rebuild_postdates_materialize(self, admin_client, tmp_path):
+        system_id, hdrs, snapshot_id = self._setup_system(admin_client, tmp_path, "refresh-false-sys")
+        self._insert_materialized_session(system_id, snapshot_id, materialized_at=10)
+        self._insert_build(system_id, snapshot_id, "completed", completed_at=20)
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        assert r.json()["understanding_refresh_recommended"] is False
+
+    def test_refresh_recommended_false_without_materialized_session(self, admin_client, tmp_path):
+        system_id, hdrs, snapshot_id = self._setup_system(admin_client, tmp_path, "refresh-no-session-sys")
+        self._insert_build(system_id, snapshot_id, "completed", completed_at=10)
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        assert r.json()["understanding_refresh_recommended"] is False
+
+    def test_refresh_recommended_false_without_completed_build(self, admin_client, tmp_path):
+        system_id, hdrs, snapshot_id = self._setup_system(admin_client, tmp_path, "refresh-no-build-sys")
+        self._insert_materialized_session(system_id, snapshot_id, materialized_at=10)
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        assert r.json()["understanding_refresh_recommended"] is False
+
+    def test_gap_trend_and_refresh_recommended_isolated_by_system(self, admin_client, tmp_path):
+        system_a, hdrs_a, snap_a = self._setup_system(admin_client, tmp_path, "gap-trend-iso-a")
+        build_a1 = self._insert_build(system_a, snap_a, "completed", completed_at=10)
+        self._insert_gap_history(system_a, snap_a, build_a1, {"docs_only": 12})
+        build_a2 = self._insert_build(system_a, snap_a, "completed", completed_at=20)
+        self._insert_gap_history(system_a, snap_a, build_a2, {"docs_only": 8})
+        self._insert_materialized_session(system_a, snap_a, materialized_at=30)
+
+        token = _login(admin_client)
+        sys_b = _create_system(admin_client, token, "gap-trend-iso-b")
+        hdrs_b = _headers(token, sys_b["id"])
+
+        r_a = admin_client.get("/repository/system-understanding", headers=hdrs_a)
+        assert r_a.status_code == 200, r_a.text
+        assert r_a.json()["gap_trend"] != []
+        assert r_a.json()["understanding_refresh_recommended"] is True
+
+        # System B has none of System A's history/materialize state.
+        r_b = admin_client.get("/repository/system-understanding", headers=hdrs_b)
+        assert r_b.status_code == 200, r_b.text
+        assert r_b.json()["gap_trend"] == []
+        assert r_b.json()["understanding_refresh_recommended"] is False

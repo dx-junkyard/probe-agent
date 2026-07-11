@@ -23,6 +23,20 @@ from ..system_state import build_system_state
 router = APIRouter()
 
 
+def _item_out(item) -> SystemStateItemOut:
+    return SystemStateItemOut(
+        state_id=item.state_id, state_group=item.state_group, severity=item.severity,
+        status=item.status, user_action_kind=item.user_action_kind,
+        intervention_timing=item.intervention_timing, subject=item.subject,
+        summary=item.summary, detail=item.detail, impact=item.impact,
+        remediation=item.remediation, evidence=item.evidence,
+        target_ui=(SystemStateTargetUiOut(route=item.target_ui.route, anchor=item.target_ui.anchor,
+                                          action_label=item.target_ui.action_label) if item.target_ui else None),
+        related_checks=item.related_checks, related_pipeline_steps=item.related_pipeline_steps,
+        source=item.source, dedupe_key=item.dedupe_key, scope=item.scope,
+    )
+
+
 @router.get("/system-state", response_model=SystemStateAssessmentOut)
 def get_system_state_assessment(
     system_id: int = Depends(get_system_id),
@@ -33,32 +47,8 @@ def get_system_state_assessment(
         generated_at=assessment.generated_at,
         overall_severity=assessment.overall_severity,
         severity_counts=assessment.severity_counts,
-        items=[
-            SystemStateItemOut(
-                state_id=item.state_id,
-                state_group=item.state_group,
-                severity=item.severity,
-                status=item.status,
-                user_action_kind=item.user_action_kind,
-                intervention_timing=item.intervention_timing,
-                subject=item.subject,
-                summary=item.summary,
-                detail=item.detail,
-                impact=item.impact,
-                remediation=item.remediation,
-                evidence=item.evidence,
-                target_ui=(
-                    SystemStateTargetUiOut(
-                        route=item.target_ui.route,
-                        anchor=item.target_ui.anchor,
-                        action_label=item.target_ui.action_label,
-                    )
-                    if item.target_ui
-                    else None
-                ),
-                related_checks=item.related_checks,
-                related_pipeline_steps=item.related_pipeline_steps,
-            )
-            for item in assessment.items
-        ],
+        items=[_item_out(item) for item in assessment.items],
+        primary_item=_item_out(assessment.primary_item) if assessment.primary_item else None,
+        notification_items=[_item_out(item) for item in assessment.notification_items],
+        page_items={route: [_item_out(item) for item in items] for route, items in assessment.page_items.items()},
     )

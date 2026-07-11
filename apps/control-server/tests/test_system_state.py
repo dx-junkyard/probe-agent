@@ -208,6 +208,21 @@ def _insert_intelligence_run(system_id, snapshot_id, run_type, status):
         return cur.lastrowid
 
 
+def _insert_capability_node(system_id, snapshot_id, run_id, *, node_type="capability", name="Cap"):
+    from app.db import get_conn
+
+    now = time.time()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO capability_hierarchy_nodes
+                (system_id, snapshot_id, intelligence_run_id, node_type, name, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (system_id, snapshot_id, run_id, node_type, name, now),
+        )
+
+
 def _insert_active_build(system_id, snapshot_id, *, current_step="symbol_index"):
     from app.db import get_conn
 
@@ -269,6 +284,70 @@ class TestSystemStateBasics:
         assert item["decision_method"] == "deterministic"
         # No ready snapshot means understanding/pipeline items are not evaluated.
         assert not any(i.startswith("understanding.") for i in items)
+
+    def test_response_projects_primary_notifications_and_page_items(self, admin_client):
+        _, _, hdrs = _setup(admin_client)
+        data, items = _get_state(admin_client, hdrs)
+
+        assert data["primary_item"] is not None
+        assert data["primary_item"]["state_id"] in items
+        assert data["notification_items"]
+        assert "/repository" in data["page_items"]
+        assert any(item["state_id"] == data["primary_item"]["state_id"] for item in data["items"])
+
+    def test_primary_selection_is_deterministic_and_prioritizes_severity_then_timing(self):
+        from app.system_state import StateItem, select_primary_item
+
+        warning_now = StateItem("warning", "repository", "warning", "missing", "configure", "now", "x", "x", "x")
+        error_later = StateItem("error", "pipeline", "error", "failed", "rerun", "before_next_step", "x", "x", "x")
+        assert select_primary_item([warning_now, error_later]) is error_later
+        early = StateItem("early", "repository", "warning", "missing", "configure", "now", "x", "x", "x")
+        late = StateItem("late", "repository", "warning", "missing", "configure", "before_next_step", "x", "x", "x")
+        assert select_primary_item([late, early]) is early
+
+    def test_notification_items_are_priority_ordered_not_alphabetical(self, admin_client):
+        # Regression for Issue #207/#208: notification_items used to inherit
+        # _dedupe_items' alphabetical-by-state_id order, so the dashboard's
+        # floating notice (notification_items[0]) was not the most important
+        # item. It must now match select_primary_item's own choice.
+        _, _, hdrs = _setup(admin_client)
+        data, _ = _get_state(admin_client, hdrs)
+
+        assert data["primary_item"] is not None
+        assert data["notification_items"]
+        assert data["notification_items"][0]["state_id"] == data["primary_item"]["state_id"]
+
+    def test_priority_key_sorts_severity_before_alphabetical_state_id(self):
+        from app.system_state import StateItem, _priority_key
+
+        # state_id "aaa" would sort first alphabetically, but its severity
+        # (warning) must lose to the blocked item's higher-priority severity.
+        warning_first_alpha = StateItem(
+            "aaa", "repository", "warning", "missing", "configure", "now", "x", "x", "x",
+        )
+        blocked_last_alpha = StateItem(
+            "zzz", "pipeline", "blocked", "blocked", "build", "before_next_step", "x", "x", "x",
+        )
+        ordered = sorted([warning_first_alpha, blocked_last_alpha], key=_priority_key)
+        assert [item.state_id for item in ordered] == ["zzz", "aaa"]
+
+    def test_page_items_excludes_ok_severity_even_with_target_ui(self):
+        # Hardening regression: page_items[route][0] renders as a
+        # warning-styled action banner in the dashboard, so an "ok" item must
+        # never appear there even if it carries a target_ui.
+        from app.system_state import StateItem, TargetUi, _build_page_items
+
+        ok_item = StateItem(
+            "ok.with_ui", "repository", "ok", "satisfied", "none", "none", "x", "x", "x",
+            target_ui=TargetUi(route="/repository", anchor=None, action_label="x"),
+        )
+        warning_item = StateItem(
+            "warning.with_ui", "repository", "warning", "missing", "configure", "now", "x", "x", "x",
+            target_ui=TargetUi(route="/repository", anchor=None, action_label="x"),
+        )
+        page_items = _build_page_items([ok_item, warning_item])
+        state_ids = {item.state_id for item in page_items["/repository"]}
+        assert state_ids == {"warning.with_ui"}
 
     def test_all_items_carry_finite_vocabulary(self, admin_client, tmp_path):
         _, sys, hdrs = _setup(admin_client)
@@ -385,6 +464,22 @@ class TestUnderstandingState:
 
 
 class TestPipelineState:
+    def test_head_ahead_of_snapshot_is_canonical_repository_state(self, admin_client, tmp_path):
+        _, _, hdrs = _setup(admin_client)
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put("/repository", json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []}, headers=hdrs)
+        created = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert created.status_code == 201, created.text
+        _commit_file(repo, "main.py", "def run():\n    return 2\n")
+
+        data, items = _get_state(admin_client, hdrs)
+        stale = items["repository.snapshot.stale"]
+        assert stale["user_action_kind"] == "create_snapshot"
+        assert stale["target_ui"] == {"route": "/repository", "anchor": "snapshot-create", "action_label": "Snapshot を作成"}
+        # A blocking configuration diagnostic may correctly outrank this item;
+        # regardless, stale HEAD is part of the global notification projection.
+        assert "repository.snapshot.stale" in {item["state_id"] for item in data["notification_items"]}
+
     def test_indexing_snapshot_is_running_wait_state(self, admin_client):
         _, sys, hdrs = _setup(admin_client)
         snap_id = _insert_snapshot(sys["id"], status="indexing")
@@ -397,6 +492,23 @@ class TestPipelineState:
         assert item["intervention_timing"] == "none"
         assert item["evidence"]["latest_snapshot_id"] == snap_id
         assert "snapshot.ready.missing" not in items
+
+    def test_repository_configured_without_snapshot_has_no_stale_item(self, admin_client, tmp_path):
+        # Regression for Issue #207: repository.snapshot.stale used to fire
+        # whenever latest_ready was None, duplicating snapshot.ready.missing
+        # with a misleading "HEAD が最新 snapshot より進んでいます" summary.
+        # It must only fire once a ready snapshot exists and HEAD has moved.
+        _, _, hdrs = _setup(admin_client)
+        repo, _sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+
+        _, items = _get_state(admin_client, hdrs)
+        assert "repository.snapshot.stale" not in items
+        assert "snapshot.ready.missing" in items
 
     def test_failed_run_is_failed_error_state(self, admin_client, tmp_path, monkeypatch):
         monkeypatch.setattr(
@@ -505,6 +617,86 @@ class TestPipelineState:
         assert item["user_action_kind"] == "configure"
         assert "pipeline.capability_hierarchy.failed" not in items
 
+    def test_capability_hierarchy_not_run_with_reasoning_available_is_missing(
+        self, admin_client, tmp_path, monkeypatch
+    ):
+        """Regression: no run + reasoning available -> plain "not_run"
+        (missing), not blocked_by_reasoning and not the new empty-result item."""
+        monkeypatch.setattr(
+            "app.system_understanding_service._is_reasoning_model_available",
+            lambda: True,
+        )
+        _, sys, hdrs = _setup(admin_client)
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+
+        _, items = _get_state(admin_client, hdrs)
+        item = items["pipeline.capability_hierarchy.not_run"]
+        assert item["status"] == "missing"
+        assert item["severity"] == "warning"
+        assert "pipeline.capability_hierarchy.blocked_by_reasoning" not in items
+        assert "pipeline.capability_hierarchy.empty" not in items
+
+    def test_capability_hierarchy_completed_zero_capabilities_is_warning_item(
+        self, admin_client, tmp_path
+    ):
+        """Issue #210: a completed run with zero capability nodes must not
+        silently disappear (return None, same as a genuinely "done" run).
+        It gets a distinct state_id whose remediation points at
+        Interview/metadata, not the generic "Build / Refresh を実行してください"
+        used for not-yet-run/failed/blocked pipeline steps."""
+        _, sys, hdrs = _setup(admin_client)
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+        _insert_intelligence_run(sys["id"], snap.json()["id"], "capability_hierarchy", "completed")
+
+        _, items = _get_state(admin_client, hdrs)
+        assert "pipeline.capability_hierarchy.blocked_by_reasoning" not in items
+        assert "pipeline.capability_hierarchy.not_run" not in items
+        item = items["pipeline.capability_hierarchy.empty"]
+        assert item["status"] == "missing"
+        assert item["severity"] == "warning"
+        assert item["user_action_kind"] == "confirm"
+        assert "Build / Refresh を実行してください" not in item["remediation"]
+        assert "Interview" in item["remediation"]
+
+    def test_capability_hierarchy_completed_with_capabilities_returns_no_item(
+        self, admin_client, tmp_path
+    ):
+        """Regression: a completed run that actually produced capabilities
+        stays "done" (no state item), same as before this issue."""
+        _, sys, hdrs = _setup(admin_client)
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+        snapshot_id = snap.json()["id"]
+        run_id = _insert_intelligence_run(
+            sys["id"], snapshot_id, "capability_hierarchy", "completed"
+        )
+        _insert_capability_node(sys["id"], snapshot_id, run_id)
+
+        _, items = _get_state(admin_client, hdrs)
+        assert "pipeline.capability_hierarchy.empty" not in items
+        assert "pipeline.capability_hierarchy.blocked_by_reasoning" not in items
+        assert "pipeline.capability_hierarchy.not_run" not in items
+
 
 class TestDiagnosticsProjectionCompatibility:
     """Diagnostics stays backward compatible while sharing evidence with state assessment."""
@@ -531,6 +723,27 @@ class TestDiagnosticsProjectionCompatibility:
         assert state_items["understanding.purpose.unconfirmed"]["severity"] == "warning"
         assert diag_checks["system_capabilities"]["severity"] == "warning"
         assert state_items["understanding.capabilities.unconfirmed"]["severity"] == "warning"
+
+    def test_diagnostics_covered_by_native_related_checks_are_not_duplicated(self, admin_client):
+        # Regression for Issue #207: the same root cause (no repository
+        # configured, no ready snapshot) used to appear twice in `items`:
+        # once as the native repository.configuration.missing /
+        # snapshot.ready.missing item, and again as diagnostic.repository_config
+        # / diagnostic.snapshot_status, because those native items declare
+        # the check via related_checks but build_system_state projected every
+        # non-ok diagnostic unconditionally.
+        _, _, hdrs = _setup(admin_client)
+
+        _, items = _get_state(admin_client, hdrs)
+
+        assert "repository.configuration.missing" in items
+        assert "snapshot.ready.missing" in items
+        assert "diagnostic.repository_config" not in items
+        assert "diagnostic.snapshot_status" not in items
+        # A diagnostic check with no covering native item must still be
+        # projected. In this default (no LLM configured) test setup the
+        # llm_base_config check reliably fires and has no native counterpart.
+        assert "diagnostic.llm_base_config" in items
 
 
 class TestAssistantScreenContextSharesState:

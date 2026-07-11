@@ -253,6 +253,85 @@ class TestStepStatusAndProvenance:
         assert n == 1, "completed symbol_index must not be re-executed"
 
 
+class TestCapabilityHierarchyZeroSymbols:
+    """Issue #210: _run_capability_hierarchy used to return before inserting
+    an intelligence_runs row when there were no code symbols to group, so the
+    job-step table showed "completed" while the intelligence_runs-derived
+    pipeline checklist showed "missing"/"blocked" for the same build. A
+    completed run row must now be persisted either way."""
+
+    def _setup_repo_without_python_files(self, client, token, tmp_path, name):
+        sys = _create_system(client, token, name)
+        hdrs = _headers(token, sys["id"])
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=str(repo), check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=str(repo), check=True, capture_output=True,
+        )
+        (repo / "README.md").write_text("# Docs-only project\nNo Python source files.\n")
+        subprocess.run(["git", "add", "."], cwd=str(repo), check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "initial"], cwd=str(repo), check=True, capture_output=True,
+        )
+        sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo), check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = client.post(
+            "/repository/snapshots", json={"commit_sha": sha}, headers=hdrs
+        )
+        assert snap.status_code == 201, snap.text
+        return sys, hdrs
+
+    def test_zero_symbol_build_still_persists_completed_run(self, admin_client, tmp_path):
+        token = _login(admin_client)
+        sys, hdrs = self._setup_repo_without_python_files(
+            admin_client, token, tmp_path, "no-symbols-sys"
+        )
+
+        r = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        job = _wait_job(admin_client, hdrs, r.json()["id"])
+        steps = _steps_by_name(job)
+
+        # The build step itself completes (there is nothing to group, not an
+        # error), same as before this fix.
+        assert steps["capability_hierarchy"]["status"] == "completed"
+        assert steps["capability_hierarchy"]["artifact_provenance"]["capability_count"] == 0
+
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            run = conn.execute(
+                "SELECT status, decision_method, provider, model FROM intelligence_runs "
+                "WHERE system_id = ? AND run_type = 'capability_hierarchy' "
+                "ORDER BY id DESC LIMIT 1",
+                (sys["id"],),
+            ).fetchone()
+        assert run is not None, "zero-symbol capability_hierarchy must still insert a run row"
+        assert run["status"] == "completed"
+        assert run["decision_method"] == "deterministic"
+        assert run["provider"] == "deterministic"
+        assert run["model"] == "none"
+
+        # The pipeline checklist must not contradict the completed job step:
+        # zero capabilities is reported as "warning", never "missing"/"blocked".
+        r2 = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r2.status_code == 200, r2.text
+        pipeline = {s["step"]: s["status"] for s in r2.json()["pipeline"]}
+        assert pipeline["capability_hierarchy_ready"] == "warning"
+
+
 class TestLlmChunkQueue:
     def test_llm_failure_keeps_deterministic_steps_complete(
         self, admin_client, tmp_path, monkeypatch
@@ -617,3 +696,481 @@ class TestSystemIsolation:
             f"/repository/system-understanding/jobs/{job['id']}/cancel", headers=hdrs_b
         )
         assert cancel.status_code == 404
+
+
+class TestGapHistoryRecording:
+    """Issue #203: system_understanding_gap_history rows are written at build
+    finalize time (system_understanding_jobs._finalize_job ->
+    _record_gap_history), only for completed/partial jobs, reusing the exact
+    same gap computation as the read path (_load_gaps_from_reconciler +
+    _compute_gap_summary)."""
+
+    def _gap_history_rows(self, build_id):
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            return conn.execute(
+                "SELECT gap_type, count, system_id, snapshot_id FROM "
+                "system_understanding_gap_history WHERE build_id = ? ORDER BY gap_type",
+                (build_id,),
+            ).fetchall()
+
+    def test_partial_build_records_gap_history_matching_read_path(
+        self, admin_client, tmp_path
+    ):
+        token = _login(admin_client)
+        sys_, hdrs = _setup_repo(admin_client, token, tmp_path, "gap-hist-partial-sys")
+
+        r = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        job = _wait_job(admin_client, hdrs, r.json()["id"])
+        assert job["status"] == "partial"
+
+        gu_resp = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert gu_resp.status_code == 200, gu_resp.text
+        gap_summary = {
+            g["gap_type"]: g["count"] for g in gu_resp.json()["gap_summary"]
+        }
+
+        rows = self._gap_history_rows(job["id"])
+        recorded = {r["gap_type"]: r["count"] for r in rows}
+        assert recorded == gap_summary
+        for r in rows:
+            assert r["system_id"] == sys_["id"]
+
+    def test_completed_build_records_gap_history(self, admin_client, tmp_path, monkeypatch):
+        token = _login(admin_client)
+        _, hdrs = _setup_repo(
+            admin_client, token, tmp_path, "gap-hist-completed-sys",
+            readme_text=TWO_SECTION_README,
+        )
+
+        import app.system_understanding_service as sus
+        import app.documentation_claim_scanner as scanner_module
+
+        monkeypatch.setattr(sus, "_is_reasoning_model_available", lambda: True)
+        monkeypatch.setattr(
+            scanner_module, "scan_chunk",
+            lambda client, config, chunk, cache=None: _ok_scan_result(scanner_module, chunk),
+        )
+
+        r = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        job = _wait_job(admin_client, hdrs, r.json()["id"])
+        assert job["status"] == "completed"
+
+        gu_resp = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert gu_resp.status_code == 200, gu_resp.text
+        gap_summary = {
+            g["gap_type"]: g["count"] for g in gu_resp.json()["gap_summary"]
+        }
+
+        rows = self._gap_history_rows(job["id"])
+        recorded = {r["gap_type"]: r["count"] for r in rows}
+        # A gap_type row is written for every gap_type currently present
+        # (possibly zero rows if the build has no gaps at all); either way it
+        # must match exactly what the read path (_compute_gap_summary) reports
+        # for this same build/snapshot.
+        assert recorded == gap_summary
+
+    def test_failed_build_does_not_record_gap_history(self, admin_client, tmp_path):
+        import time as time_mod
+
+        from app.db import get_conn
+        import app.system_understanding_jobs as jobs
+
+        token = _login(admin_client)
+        sys_ = _create_system(admin_client, token, "gap-hist-failed-sys")
+        system_id = sys_["id"]
+        now = time_mod.time()
+
+        with get_conn() as conn:
+            build_id = conn.execute(
+                """INSERT INTO system_understanding_builds
+                    (system_id, snapshot_id, status, created_at)
+                   VALUES (?, NULL, 'running', ?)""",
+                (system_id, now),
+            ).lastrowid
+            for step in jobs.STEP_ORDER:
+                conn.execute(
+                    """INSERT INTO system_understanding_build_steps
+                        (build_id, system_id, snapshot_id, step, depends_on,
+                         status, error, created_at)
+                       VALUES (?, ?, NULL, ?, '[]', 'failed', 'boom', ?)""",
+                    (build_id, system_id, step, now),
+                )
+
+        jobs._finalize_job(build_id, cancelled=False)
+
+        with get_conn() as conn:
+            build = conn.execute(
+                "SELECT status FROM system_understanding_builds WHERE id = ?",
+                (build_id,),
+            ).fetchone()
+        assert build["status"] == "failed"
+        assert self._gap_history_rows(build_id) == []
+
+    def test_cancelled_build_does_not_record_gap_history(self, admin_client, tmp_path):
+        import time as time_mod
+
+        from app.db import get_conn
+        import app.system_understanding_jobs as jobs
+
+        token = _login(admin_client)
+        sys_ = _create_system(admin_client, token, "gap-hist-cancelled-sys")
+        system_id = sys_["id"]
+        now = time_mod.time()
+
+        with get_conn() as conn:
+            build_id = conn.execute(
+                """INSERT INTO system_understanding_builds
+                    (system_id, snapshot_id, status, cancel_requested, created_at)
+                   VALUES (?, NULL, 'running', 1, ?)""",
+                (system_id, now),
+            ).lastrowid
+            for step in jobs.STEP_ORDER:
+                conn.execute(
+                    """INSERT INTO system_understanding_build_steps
+                        (build_id, system_id, snapshot_id, step, depends_on,
+                         status, created_at)
+                       VALUES (?, ?, NULL, ?, '[]', 'pending', ?)""",
+                    (build_id, system_id, step, now),
+                )
+
+        jobs._finalize_job(build_id, cancelled=True)
+
+        with get_conn() as conn:
+            build = conn.execute(
+                "SELECT status FROM system_understanding_builds WHERE id = ?",
+                (build_id,),
+            ).fetchone()
+        assert build["status"] == "cancelled"
+        assert self._gap_history_rows(build_id) == []
+
+    def test_gap_history_isolated_by_system(self, admin_client, tmp_path):
+        token = _login(admin_client)
+        sys_a, hdrs_a = _setup_repo(admin_client, token, tmp_path, "gap-hist-iso-a")
+        r_a = admin_client.post("/repository/system-understanding/build", headers=hdrs_a)
+        job_a = _wait_job(admin_client, hdrs_a, r_a.json()["id"])
+        assert job_a["status"] == "partial"
+
+        rows = self._gap_history_rows(job_a["id"])
+        assert all(r["system_id"] == sys_a["id"] for r in rows)
+
+        # A second, unrelated system has no gap history from system A's build
+        # and reports an empty trend (fewer than 2 builds of its own).
+        sys_b = _create_system(admin_client, token, "gap-hist-iso-b")
+        hdrs_b = _headers(token, sys_b["id"])
+
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            leaked = conn.execute(
+                "SELECT COUNT(*) AS n FROM system_understanding_gap_history WHERE system_id = ?",
+                (sys_b["id"],),
+            ).fetchone()
+        assert leaked["n"] == 0
+
+        r_b = admin_client.get("/repository/system-understanding", headers=hdrs_b)
+        assert r_b.status_code == 200
+        assert r_b.json()["gap_trend"] == []
+        assert r_b.json()["understanding_refresh_recommended"] is False
+
+
+THREE_SECTION_README = (
+    "# Test Project\n\nOverview text.\n\n"
+    "## SectionA\n\nSectionA describes the ingestion capability in detail.\n\n"
+    "## SectionB\n\nSectionB describes the reporting capability in detail.\n\n"
+    "## SectionC\n\nSectionC describes the export capability in detail.\n"
+)
+
+# SectionA and the overview are byte-identical to THREE_SECTION_README (same
+# chunk_id, same chunk_content_hash) and start at the same line, so their
+# claim_scan tasks are expected to be reused. SectionB keeps the same
+# chunk_id (same heading/start_line) but different text, so its content hash
+# changes and it must be rescanned. SectionC is removed and SectionD is a
+# brand-new section, so it must be scanned and SectionC's old result must not
+# appear in the new build's graph.
+UPDATED_THREE_SECTION_README = (
+    "# Test Project\n\nOverview text.\n\n"
+    "## SectionA\n\nSectionA describes the ingestion capability in detail.\n\n"
+    "## SectionB\n\nSectionB now describes the reporting and analytics "
+    "capability in much more detail.\n\n"
+    "## SectionD\n\nSectionD describes the notification capability in detail.\n"
+)
+
+
+class TestCrossSnapshotChunkReuse:
+    """Issue #195: claim_scan chunk results are reused across a Refresh's new
+    snapshot_id when chunk content is unchanged, and never for chunks whose
+    content changed or that no longer exist."""
+
+    def _tracking_scanner(self, scanner_module, scanned):
+        def _scan(client, config, chunk, cache=None):
+            scanned.append(chunk.chunk_id)
+            heading = chunk.heading_path[-1] if chunk.heading_path else chunk.path
+            return scanner_module.ChunkScanResult(
+                chunk_id=chunk.chunk_id,
+                chunk_content_hash=chunk.content_hash,
+                prompt_version=scanner_module.PROMPT_VERSION,
+                schema_version=scanner_module.SCHEMA_VERSION,
+                claims=[
+                    scanner_module.DocumentationClaim(
+                        claim_type="capability_element",
+                        summary=f"chunk:{heading}",
+                        evidence=scanner_module.ClaimEvidence(
+                            path=chunk.path,
+                            start_line=chunk.start_line,
+                            end_line=chunk.end_line,
+                        ),
+                        confidence=0.9,
+                    )
+                ],
+            )
+        return _scan
+
+    def test_unchanged_chunks_reused_changed_and_new_chunks_rescanned(
+        self, admin_client, tmp_path, monkeypatch
+    ):
+        token = _login(admin_client)
+        _, hdrs = _setup_repo(
+            admin_client, token, tmp_path, "job-cross-snap-sys",
+            readme_text=THREE_SECTION_README,
+        )
+
+        import app.system_understanding_service as sus
+        import app.documentation_claim_scanner as scanner_module
+
+        monkeypatch.setattr(sus, "_is_reasoning_model_available", lambda: True)
+
+        scanned: list = []
+        monkeypatch.setattr(
+            scanner_module, "scan_chunk", self._tracking_scanner(scanner_module, scanned)
+        )
+
+        # --- Build snapshot A: every chunk is freshly scanned. ---
+        r1 = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        job1 = _wait_job(admin_client, hdrs, r1.json()["id"])
+        assert job1["status"] == "completed", job1
+        snapshot1_id = job1["snapshot_id"]
+        assert len(scanned) == 4, scanned  # overview, SectionA, SectionB, SectionC
+
+        # --- Refresh: snapshot B changes SectionB, drops SectionC, adds SectionD. ---
+        scanned.clear()
+        repo = tmp_path / "repo"
+        (repo / "README.md").write_text(UPDATED_THREE_SECTION_README)
+        subprocess.run(["git", "add", "."], cwd=str(repo), check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "refresh docs"],
+            cwd=str(repo), check=True, capture_output=True,
+        )
+        sha2 = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo), check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        snap2 = admin_client.post(
+            "/repository/snapshots", json={"commit_sha": sha2}, headers=hdrs
+        )
+        assert snap2.status_code == 201, snap2.text
+        snapshot2_id = snap2.json()["id"]
+        assert snapshot2_id != snapshot1_id
+
+        r2 = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        job2 = _wait_job(admin_client, hdrs, r2.json()["id"])
+        assert job2["status"] == "completed", job2
+        assert job2["snapshot_id"] == snapshot2_id
+        steps2 = _steps_by_name(job2)
+        assert steps2["claim_scan"]["status"] == "completed"
+
+        # Acceptance: only the changed (SectionB) and new (SectionD) chunks
+        # were scanned by the LLM; the unchanged overview and SectionA chunks
+        # were reused from snapshot A's completed results.
+        assert len(scanned) == 2, scanned
+        prov2 = steps2["claim_scan"]["artifact_provenance"]
+        assert prov2["chunks_total"] == 4
+        assert prov2["chunks_completed"] == 4
+        assert prov2["chunks_reused"] == 2
+
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            task_rows = conn.execute(
+                "SELECT status, reused_existing, result_json FROM "
+                "system_understanding_llm_tasks WHERE build_id = ?",
+                (job2["id"],),
+            ).fetchall()
+        reused_summaries = set()
+        fresh_summaries = set()
+        for row in task_rows:
+            assert row["status"] == "completed"
+            result = scanner_module.ChunkScanResult.model_validate_json(row["result_json"])
+            summary = result.claims[0].summary
+            (reused_summaries if row["reused_existing"] else fresh_summaries).add(summary)
+        assert reused_summaries == {"chunk:Test Project", "chunk:SectionA"}
+        assert fresh_summaries == {"chunk:SectionB", "chunk:SectionD"}
+
+        # Acceptance: reused chunks still feed understanding_graph for the
+        # new build, and the deleted SectionC chunk does not leak into it.
+        with get_conn() as conn:
+            graph_row = conn.execute(
+                "SELECT graph_json FROM understanding_graph_snapshots "
+                "WHERE system_id = ? AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
+                (job2["system_id"], snapshot2_id),
+            ).fetchone()
+        assert graph_row is not None
+        import json as _json
+
+        graph = _json.loads(graph_row["graph_json"])
+        node_summaries = {n["summary"] for n in graph["nodes"].values()}
+        assert node_summaries == {
+            "chunk:Test Project", "chunk:SectionA", "chunk:SectionB", "chunk:SectionD",
+        }
+        assert "chunk:SectionC" not in node_summaries
+
+    def test_prompt_version_change_forces_rescan(
+        self, admin_client, tmp_path, monkeypatch
+    ):
+        """If prompt/schema version changes, previously completed results for
+        identical chunk content must not be reused (Issue #195)."""
+        token = _login(admin_client)
+        _, hdrs = _setup_repo(
+            admin_client, token, tmp_path, "job-cross-snap-version-sys",
+            readme_text=THREE_SECTION_README,
+        )
+
+        import app.system_understanding_service as sus
+        import app.documentation_claim_scanner as scanner_module
+
+        monkeypatch.setattr(sus, "_is_reasoning_model_available", lambda: True)
+        scanned: list = []
+        monkeypatch.setattr(
+            scanner_module, "scan_chunk", self._tracking_scanner(scanner_module, scanned)
+        )
+
+        r1 = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        job1 = _wait_job(admin_client, hdrs, r1.json()["id"])
+        assert job1["status"] == "completed", job1
+
+        # Bump the prompt version so identical chunk content is no longer an
+        # acceptable reuse match.
+        monkeypatch.setattr(scanner_module, "PROMPT_VERSION", "claim-scanner-v2")
+
+        scanned.clear()
+        repo = tmp_path / "repo"
+        # Touch an unrelated (non-documentation) file so a new snapshot is
+        # created while every documentation chunk's content stays byte
+        # identical; only the prompt version should determine reuse here.
+        (repo / "src" / "main.py").write_text(
+            (repo / "src" / "main.py").read_text() + "\n# trivial change\n"
+        )
+        subprocess.run(["git", "add", "."], cwd=str(repo), check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "trivial change"],
+            cwd=str(repo), check=True, capture_output=True,
+        )
+        sha2 = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo), check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        snap2 = admin_client.post(
+            "/repository/snapshots", json={"commit_sha": sha2}, headers=hdrs
+        )
+        assert snap2.status_code == 201, snap2.text
+
+        r2 = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        job2 = _wait_job(admin_client, hdrs, r2.json()["id"])
+        assert job2["status"] == "completed", job2
+        steps2 = _steps_by_name(job2)
+        prov2 = steps2["claim_scan"]["artifact_provenance"]
+        assert prov2["chunks_reused"] == 0
+        assert len(scanned) == prov2["chunks_total"]
+
+    def test_shifted_unchanged_chunks_reused_with_remapped_evidence(
+        self, admin_client, tmp_path, monkeypatch
+    ):
+        """Byte-identical sections that moved to different line positions are
+        still reused across snapshots, and the reused claims' chunk_id and
+        evidence line ranges are remapped so they resolve against the new
+        pinned snapshot instead of pointing at the old positions (Issue #195)."""
+        token = _login(admin_client)
+        _, hdrs = _setup_repo(
+            admin_client, token, tmp_path, "job-cross-snap-shift-sys",
+            readme_text=THREE_SECTION_README,
+        )
+
+        import app.system_understanding_service as sus
+        import app.documentation_claim_scanner as scanner_module
+
+        monkeypatch.setattr(sus, "_is_reasoning_model_available", lambda: True)
+        scanned: list = []
+        monkeypatch.setattr(
+            scanner_module, "scan_chunk", self._tracking_scanner(scanner_module, scanned)
+        )
+
+        r1 = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        job1 = _wait_job(admin_client, hdrs, r1.json()["id"])
+        assert job1["status"] == "completed", job1
+        assert len(scanned) == 4, scanned
+
+        # Insert SectionZ before SectionA: SectionA/B/C keep byte-identical
+        # text but shift to later start lines (new chunk_ids).
+        scanned.clear()
+        repo = tmp_path / "repo"
+        (repo / "README.md").write_text(
+            "# Test Project\n\nOverview text.\n\n"
+            "## SectionZ\n\nSectionZ describes a brand-new intake capability "
+            "in detail.\n\n"
+            "## SectionA\n\nSectionA describes the ingestion capability in detail.\n\n"
+            "## SectionB\n\nSectionB describes the reporting capability in detail.\n\n"
+            "## SectionC\n\nSectionC describes the export capability in detail.\n"
+        )
+        subprocess.run(["git", "add", "."], cwd=str(repo), check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "insert section"],
+            cwd=str(repo), check=True, capture_output=True,
+        )
+        sha2 = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo), check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        snap2 = admin_client.post(
+            "/repository/snapshots", json={"commit_sha": sha2}, headers=hdrs
+        )
+        assert snap2.status_code == 201, snap2.text
+        snapshot2_id = snap2.json()["id"]
+
+        r2 = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        job2 = _wait_job(admin_client, hdrs, r2.json()["id"])
+        assert job2["status"] == "completed", job2
+        steps2 = _steps_by_name(job2)
+        prov2 = steps2["claim_scan"]["artifact_provenance"]
+
+        # Only the inserted SectionZ needed an LLM scan; the overview kept
+        # its position and the shifted SectionA/B/C were still reused.
+        assert len(scanned) == 1, scanned
+        assert prov2["chunks_total"] == 5
+        assert prov2["chunks_reused"] == 4
+
+        from app.db import get_conn
+        from app.documentation_indexer import build_documentation_index
+
+        with get_conn() as conn:
+            new_index = build_documentation_index(conn, job2["system_id"], snapshot2_id)
+            task_rows = conn.execute(
+                "SELECT result_json FROM system_understanding_llm_tasks "
+                "WHERE build_id = ? AND reused_existing = 1",
+                (job2["id"],),
+            ).fetchall()
+        chunks_by_id = {c.chunk_id: c for c in new_index.chunks}
+        assert len(task_rows) == 4
+        for row in task_rows:
+            result = scanner_module.ChunkScanResult.model_validate_json(row["result_json"])
+            chunk = chunks_by_id.get(result.chunk_id)
+            assert chunk is not None, (
+                f"reused chunk_id {result.chunk_id} not present in the new "
+                "snapshot's documentation index"
+            )
+            # The tracking scanner recorded the full chunk range as evidence,
+            # so remapped evidence must equal the chunk's *new* line range.
+            for claim in result.claims:
+                assert claim.evidence.path == chunk.path
+                assert claim.evidence.start_line == chunk.start_line
+                assert claim.evidence.end_line == chunk.end_line

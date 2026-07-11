@@ -308,6 +308,28 @@ class SystemOut(BaseModel):
     last_seen: Optional[float] = None
 
 
+# Issue #165: deterministic signal-reception facts for the connectivity
+# warning badge and the setup-guide page. `state` is a finite classification;
+# smoke traces are recognized by exact component_id match against the
+# documented convention (Principle 6: explicit finite set, no heuristics).
+SMOKE_CHECK_COMPONENT_ID = "probe-smoke-check"
+
+ConnectivityState = Literal["no_signal", "smoke_only", "receiving"]
+
+
+class ConnectivityStatusOut(BaseModel):
+    system_id: int
+    state: ConnectivityState
+    total_trace_count: int
+    smoke_trace_count: int
+    real_trace_count: int
+    first_trace_at: Optional[float] = None
+    last_trace_at: Optional[float] = None
+    last_trace_component_id: Optional[str] = None
+    smoke_component_id: str = SMOKE_CHECK_COMPONENT_ID
+    materialized_session_ids: List[int] = Field(default_factory=list)
+
+
 class ComponentProfile(BaseModel):
     component_id: str
     purpose: str = ""
@@ -440,6 +462,15 @@ IntelligenceRunType = Literal[
     # deterministic and not separately audited; only the reasoning
     # reconciliation step that picks confirmation questions is.
     "runtime_reality_check",
+    # Issue #168: Probe Pattern lifecycle. pattern_reconcile classifies saved
+    # pattern points against the latest snapshot (deterministic structural
+    # checks, escalating to reasoning for moved/split/missing);
+    # pattern_investigate is the "I don't know" investigation assistance;
+    # probe_plan_from_pattern records the manual decision that turned an
+    # approved reconciliation into a Probe Plan.
+    "pattern_reconcile",
+    "pattern_investigate",
+    "probe_plan_from_pattern",
 ]
 DecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
 # How a single hierarchy claim was produced. Kept distinct from the audit
@@ -1178,6 +1209,230 @@ class ProbePlansListOut(BaseModel):
     system_id: int
     plans: List[ProbePlanOut] = Field(default_factory=list)
     is_mock: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Probe Pattern lifecycle (Issue #168)
+# ---------------------------------------------------------------------------
+
+ProbePatternStatus = Literal["active", "stale", "archived", "superseded"]
+ProbePatternOrigin = Literal["scan", "probe_plan", "manual"]
+ReconcileClassification = Literal[
+    "exact_match", "moved_match", "changed_signature",
+    "split_or_merged", "missing", "unsafe",
+]
+ReconcileUserDecision = Literal["pending", "accepted", "rejected"]
+
+
+class InstrumentedProbeOut(BaseModel):
+    path: str
+    symbol: str
+    line_start: int
+    line_end: int
+    component_id: Optional[str] = None
+    docstring: Optional[str] = None
+    linked_plan_id: Optional[int] = None
+    linked_feature_id: Optional[str] = None
+    linked_objective: Optional[str] = None
+    linked_reason: Optional[str] = None
+    linked_recommended_mode: Optional[str] = None
+    pattern_ids: List[int] = Field(default_factory=list)
+
+
+class InstrumentationScanOut(BaseModel):
+    system_id: int
+    snapshot_id: int
+    commit_sha: str
+    probes: List[InstrumentedProbeOut] = Field(default_factory=list)
+
+
+class ProbePatternPointIn(BaseModel):
+    path: str
+    symbol: str
+    component_id: str = ""
+    reason: str = ""
+    recommended_mode: str = "trace"
+    side_effect_risk: Literal["low", "medium", "high"] = "low"
+    replayability: str = ""
+
+
+class ProbePatternCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    feature_id: str = ""
+    capability: str = ""
+    objective: str = ""
+    description: str = ""
+    origin: ProbePatternOrigin = "manual"
+    source_plan_id: Optional[int] = None
+    points: List[ProbePatternPointIn] = Field(..., min_length=1)
+
+
+class ProbePatternUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: Optional[str] = Field(None, min_length=1, max_length=200)
+    feature_id: Optional[str] = None
+    capability: Optional[str] = None
+    objective: Optional[str] = None
+    description: Optional[str] = None
+    status: Optional[Literal["active", "archived"]] = None
+
+
+class ProbePatternPointOut(BaseModel):
+    id: int
+    pattern_id: int
+    system_id: int
+    component_id: str
+    path: str
+    symbol: str
+    line_start: int
+    line_end: int
+    reason: str
+    recommended_mode: str
+    side_effect_risk: str
+    replayability: str
+    signature: str = ""
+    symbol_source_hash: Optional[str] = None
+    symbol_body_hash: Optional[str] = None
+    docstring: Optional[str] = None
+    status: str = "saved"
+    removed_at: Optional[float] = None
+    created_at: float
+    updated_at: float
+
+
+class ProbePatternEventOut(BaseModel):
+    id: int
+    pattern_id: int
+    event_type: str
+    detail: dict = Field(default_factory=dict)
+    created_at: float
+
+
+class ReconcileEvidenceOut(BaseModel):
+    path: str
+    start_line: int
+    end_line: int
+    summary: str = ""
+
+
+class PatternInvestigationOut(BaseModel):
+    summary: str
+    recommendation: str
+    proposed_target_path: Optional[str] = None
+    proposed_target_symbol: Optional[str] = None
+    evidence: List[ReconcileEvidenceOut] = Field(default_factory=list)
+    is_mock: bool = False
+    created_at: float
+
+
+class ReconcilePointOut(BaseModel):
+    id: int
+    reconciliation_id: int
+    pattern_point_id: int
+    classification: ReconcileClassification
+    decision_method: Literal["deterministic", "reasoning_llm"]
+    target_path: Optional[str] = None
+    target_symbol: Optional[str] = None
+    target_line_start: Optional[int] = None
+    target_line_end: Optional[int] = None
+    confidence: float = 0.0
+    explanation: str = ""
+    hypothesis: str = ""
+    question: str = ""
+    evidence: List[ReconcileEvidenceOut] = Field(default_factory=list)
+    denylist_hit: Optional[str] = None
+    body_changed: bool = False
+    user_decision: ReconcileUserDecision = "pending"
+    decided_at: Optional[float] = None
+    investigation: Optional[PatternInvestigationOut] = None
+    created_at: float
+    updated_at: float
+
+
+class ProbePatternReconciliationOut(BaseModel):
+    id: int
+    pattern_id: int
+    system_id: int
+    snapshot_id: int
+    commit_sha: str
+    intelligence_run_id: Optional[int] = None
+    status: str
+    error: Optional[str] = None
+    summary: Dict[str, int] = Field(default_factory=dict)
+    points: List[ReconcilePointOut] = Field(default_factory=list)
+    intelligence_run: Optional[IntelligenceRunOut] = None
+    is_mock: bool = False
+    created_at: float
+
+
+class ProbeRemovalPatchOut(BaseModel):
+    id: int
+    pattern_id: int
+    system_id: int
+    snapshot_id: int
+    commit_sha: str
+    diff: str
+    skipped: List[str] = Field(default_factory=list)
+    status: str
+    error: Optional[str] = None
+    cleanup_state: str = "not_attempted"
+    cleanup_error: Optional[str] = None
+    apply_status: str = "not_applied"
+    apply_error: Optional[str] = None
+    applied_at: Optional[float] = None
+    applied_by_user_id: Optional[int] = None
+    created_at: float
+
+
+class ProbeRemovalPatchCreateRequest(BaseModel):
+    point_ids: Optional[List[int]] = None
+
+
+class ProbeRemovalPatchApplyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirmed: Literal[True]
+    expected_commit_sha: str = Field(..., min_length=7, max_length=64)
+
+
+class ReconcileDecisionRequest(BaseModel):
+    decision: Literal["accepted", "rejected"]
+
+
+class CreatePlanFromReconcileRequest(BaseModel):
+    objective: Optional[str] = None
+
+
+class ProbePatternOut(BaseModel):
+    id: int
+    system_id: int
+    name: str
+    feature_id: str = ""
+    capability: str = ""
+    objective: str = ""
+    description: str = ""
+    status: ProbePatternStatus = "active"
+    origin: ProbePatternOrigin = "manual"
+    source_plan_id: Optional[int] = None
+    source_snapshot_id: Optional[int] = None
+    source_commit_sha: str = ""
+    superseded_by_id: Optional[int] = None
+    last_used_at: Optional[float] = None
+    last_reconciled_at: Optional[float] = None
+    point_count: int = 0
+    removed_point_count: int = 0
+    points: List[ProbePatternPointOut] = Field(default_factory=list)
+    events: List[ProbePatternEventOut] = Field(default_factory=list)
+    latest_reconciliation: Optional[ProbePatternReconciliationOut] = None
+    pending_decision_count: int = 0
+    created_at: float
+    updated_at: float
+
+
+class ProbePatternsListOut(BaseModel):
+    system_id: int
+    patterns: List[ProbePatternOut] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -2038,6 +2293,7 @@ class InterviewSessionOut(BaseModel):
     id: int
     system_id: int
     snapshot_id: int
+    snapshot_commit_sha: Optional[str] = None
     title: str
     focus: str
     status: InterviewSessionStatus
@@ -2794,6 +3050,7 @@ class InterviewMaterializeOut(BaseModel):
     session_id: int
     system_id: int
     snapshot_id: int
+    commit_sha: Optional[str] = None
     diff: str
     files_changed: int
     items_materialized: int
@@ -2817,12 +3074,18 @@ class SystemUnderstandingPipelineStepOut(BaseModel):
 
 NextActionCategory = Literal["understand", "observe", "instrument", "evaluate"]
 
+# Issue #201: finite set of how a next action is carried out. "navigate" is the
+# default (link the user somewhere); "build" means the action itself triggers
+# the Build / Refresh job rather than a page link.
+NextActionKind = Literal["navigate", "build"]
+
 
 class SystemUnderstandingNextActionOut(BaseModel):
     action: str
     reason: str
     category: NextActionCategory
     link: Optional[str] = None
+    action_kind: NextActionKind = "navigate"
 
 
 class SystemUnderstandingGapSummaryOut(BaseModel):
@@ -2917,6 +3180,30 @@ class SystemUnderstandingGapOut(BaseModel):
     issue_drafts: List[IssueDraftRefOut] = Field(default_factory=list)
 
 
+# Issue #202: finite stage completion status shown as a badge in the Hub.
+# Derived purely from persisted state (system_understanding_service.
+# _derive_stage_statuses); no reasoning model involved (Principle 6).
+SystemUnderstandingStageStatusValue = Literal[
+    "not_started", "in_progress", "blocked", "complete"
+]
+
+
+class SystemUnderstandingStageStatusOut(BaseModel):
+    stage: str
+    status: str
+    counts: Dict[str, int] = Field(default_factory=dict)
+
+
+# Issue #203: deterministic before/after comparison of gap counts between the
+# two most recent settled (completed/partial) builds of the same system,
+# read back from system_understanding_gap_history. A gap_type present in
+# only one of the two builds has 0 on the side where it did not appear.
+class SystemUnderstandingGapTrendOut(BaseModel):
+    gap_type: str
+    current: int
+    previous: int
+
+
 class SystemUnderstandingOut(BaseModel):
     system_id: int
     snapshot_id: Optional[int] = None
@@ -2930,6 +3217,19 @@ class SystemUnderstandingOut(BaseModel):
     gap_summary: List[SystemUnderstandingGapSummaryOut] = Field(default_factory=list)
     metadata_coverage: Optional[SystemUnderstandingMetadataCoverageOut] = None
     next_actions: List[SystemUnderstandingNextActionOut] = Field(default_factory=list)
+    # Issue #201: single highest-priority action for the current state,
+    # derived deterministically in system_understanding_service._derive_primary_action.
+    # None when a build job is actively running (the BuildJobPanel already
+    # shows progress) so the header CTA and this card never contradict it.
+    primary_action: Optional[SystemUnderstandingNextActionOut] = None
+    # Issue #202: deterministic completion status + counts for each of the 4
+    # Hub stages (understand / observe / instrument / evaluate).
+    stages: List[SystemUnderstandingStageStatusOut] = Field(default_factory=list)
+    # Issue #203: gap-count trend across the last two settled builds (empty
+    # until 2 builds have recorded history), plus whether a materialized
+    # Interview change is newer than the latest completed build.
+    gap_trend: List[SystemUnderstandingGapTrendOut] = Field(default_factory=list)
+    understanding_refresh_recommended: bool = False
 
 
 class CapabilityContextProbePlanOut(BaseModel):
@@ -3205,6 +3505,8 @@ class AssistantAskRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=4000)
     route_params: Dict[str, str] = Field(default_factory=dict)
     visible_check_ids: List[str] = Field(default_factory=list, max_length=50)
+    visible_state_ids: List[str] = Field(default_factory=list, max_length=50)
+    focused_state_id: Optional[str] = Field(default=None, max_length=200)
 
 
 # ---------------------------------------------------------------------------
@@ -3249,6 +3551,9 @@ class SystemStateItemOut(BaseModel):
     target_ui: Optional[SystemStateTargetUiOut] = None
     related_checks: List[str] = Field(default_factory=list)
     related_pipeline_steps: List[str] = Field(default_factory=list)
+    source: str = "system_state"
+    dedupe_key: str = ""
+    scope: str = "global"
     # System State Assessment is deterministic and LLM-free (Issue #193 Phase 1).
     decision_method: Literal["deterministic"] = "deterministic"
 
@@ -3259,6 +3564,9 @@ class SystemStateAssessmentOut(BaseModel):
     overall_severity: StateSeverity
     severity_counts: Dict[str, int] = Field(default_factory=dict)
     items: List[SystemStateItemOut] = Field(default_factory=list)
+    primary_item: Optional[SystemStateItemOut] = None
+    notification_items: List[SystemStateItemOut] = Field(default_factory=list)
+    page_items: Dict[str, List[SystemStateItemOut]] = Field(default_factory=dict)
 
 
 class AssistantActionOut(BaseModel):
@@ -3269,7 +3577,7 @@ class AssistantActionOut(BaseModel):
 
 
 class AssistantCitationOut(BaseModel):
-    type: Literal["setting", "diagnostic_check", "pipeline_step"]
+    type: Literal["setting", "diagnostic_check", "pipeline_step", "state_item"]
     id: str
     title: str = ""
     detail: str = ""
