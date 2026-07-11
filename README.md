@@ -397,6 +397,10 @@ Docker Compose はリポジトリルートの `.env` を読み込む。ローカ
 | `GITHUB_APP_PRIVATE_KEY_PATH` | _(未設定)_ | GitHub App の秘密鍵 PEM ファイルの絶対パス（secret mount を想定） |
 | `GITHUB_API_BASE_URL` | `https://api.github.com` | GitHub REST API のベース URL（GitHub Enterprise Server 向けの上書き） |
 | `GITHUB_WEB_BASE_URL` | `https://github.com` | GitHub の web/clone URL のベース（GitHub Enterprise Server 向けの上書き） |
+| `GIT_REPOSITORY_ROOT` | _(未設定)_ | Publish workflow (#216) の managed clone / worktree 領域のルート。未設定時は repository manager 機能全体が fail closed |
+| `GIT_CLONE_TIMEOUT` | `300` | managed mirror の `git clone` タイムアウト秒数 |
+| `GIT_FETCH_TIMEOUT` | `120` | managed mirror の `git fetch` / `git ls-remote` タイムアウト秒数 |
+| `GIT_JOB_RETENTION_HOURS` | `24` | この時間を超えて放置された job worktree を `cleanup_expired_jobs` が削除するまでの猶予時間 |
 
 ## ライセンス
 

@@ -37,7 +37,14 @@ from ..github_app import (
     get_repository,
     github_app_configured,
 )
-from ..models import GithubAppStatusOut, GithubConnectionCreate, GithubConnectionOut
+from ..models import (
+    GithubAppStatusOut,
+    GithubConnectionCreate,
+    GithubConnectionOut,
+    GithubRepositoryStatusOut,
+)
+from .. import repo_manager
+from ..repo_manager import RepoManagerError
 
 router = APIRouter()
 
@@ -81,6 +88,8 @@ def _connection_out(row: sqlite3.Row) -> GithubConnectionOut:
         credential_type=row["credential_type"],
         status=row["status"],
         last_error=row["last_error"],
+        last_synced_at=row["last_synced_at"],
+        last_synced_commit_sha=row["last_synced_commit_sha"],
         created_by_user_id=row["created_by_user_id"],
         updated_by_user_id=row["updated_by_user_id"],
         created_at=row["created_at"],
@@ -245,6 +254,100 @@ def verify_connection(
     with get_conn() as conn:
         row = _get_connection_or_404(conn, connection_id, system_id)
     return _connection_out(row)
+
+
+@router.post("/github/connections/{connection_id}/sync", response_model=GithubConnectionOut)
+def sync_connection(
+    connection_id: int,
+    principal: Principal = Depends(require_user),
+    system_id: int = Depends(get_system_id),
+) -> GithubConnectionOut:
+    """Bring the managed mirror up to date and record the resolved default
+    branch commit SHA. Requires a verified connection (status='connected');
+    on failure the connection is marked status='error' with a sanitized
+    (token-free) `last_error` (repo_manager.RepoManagerError / GitHubAppError
+    text never contains the installation token)."""
+    with get_conn() as conn:
+        _require_manage(conn, principal, system_id)
+        row = _get_connection_or_404(conn, connection_id, system_id)
+
+    if row["status"] != "connected":
+        raise HTTPException(
+            status_code=409,
+            detail="Connection must be verified (status=connected) before sync",
+        )
+
+    now = _now_iso()
+    try:
+        installation_token = create_installation_token(
+            row["installation_id"], api_base_url=row["api_base_url"]
+        )
+        repo_manager.ensure_mirror(row, installation_token.token)
+        branch = row["default_branch"]
+        if not branch:
+            raise RepoManagerError(
+                "Connection has no default_branch; verify the connection first"
+            )
+        commit_sha = repo_manager.resolve_mirror_branch_sha(connection_id, branch)
+    except (GitHubAppError, RepoManagerError) as exc:
+        with get_conn() as conn:
+            conn.execute(
+                """
+                UPDATE github_connections
+                SET status = 'error', last_error = ?, updated_by_user_id = ?, updated_at = ?
+                WHERE id = ? AND system_id = ?
+                """,
+                (str(exc), principal.user_id, now, connection_id, system_id),
+            )
+            row = _get_connection_or_404(conn, connection_id, system_id)
+        return _connection_out(row)
+
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE github_connections
+            SET last_synced_at = ?, last_synced_commit_sha = ?, last_error = NULL,
+                updated_by_user_id = ?, updated_at = ?
+            WHERE id = ? AND system_id = ?
+            """,
+            (now, commit_sha, principal.user_id, now, connection_id, system_id),
+        )
+        row = _get_connection_or_404(conn, connection_id, system_id)
+    return _connection_out(row)
+
+
+@router.get(
+    "/github/connections/{connection_id}/repository-status",
+    response_model=GithubRepositoryStatusOut,
+)
+def get_repository_status(
+    connection_id: int,
+    principal: Principal = Depends(require_user),
+    system_id: int = Depends(get_system_id),
+) -> GithubRepositoryStatusOut:
+    with get_conn() as conn:
+        _require_manage(conn, principal, system_id)
+        row = _get_connection_or_404(conn, connection_id, system_id)
+
+    mirror_exists = False
+    mirror_rel_path: Optional[str] = None
+    try:
+        mirror = repo_manager.mirror_path(connection_id)
+        root = repo_manager.repository_root()
+        mirror_exists = os.path.isdir(os.path.join(mirror, ".git"))
+        mirror_rel_path = os.path.relpath(mirror, root).replace(os.sep, "/")
+    except RepoManagerError:
+        mirror_exists = False
+        mirror_rel_path = None
+
+    return GithubRepositoryStatusOut(
+        connection_id=connection_id,
+        mirror_exists=mirror_exists,
+        mirror_path=mirror_rel_path,
+        default_branch=row["default_branch"],
+        last_synced_at=row["last_synced_at"],
+        last_synced_commit_sha=row["last_synced_commit_sha"],
+    )
 
 
 @router.delete("/github/connections/{connection_id}", response_model=GithubConnectionOut)

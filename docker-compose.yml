@@ -25,6 +25,12 @@ services:
       WORKSPACE_CONTEXT_MAX_CATEGORY_CHARS: ${WORKSPACE_CONTEXT_MAX_CATEGORY_CHARS:-12000}
       WORKSPACE_CONTEXT_MAX_CHARS: ${WORKSPACE_CONTEXT_MAX_CHARS:-50000}
       PROBE_REPOSITORY_ROOTS: /repositories
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_APP_PRIVATE_KEY_PATH: ${GITHUB_APP_PRIVATE_KEY_PATH:-}
+      GITHUB_API_BASE_URL: ${GITHUB_API_BASE_URL:-}
+      GITHUB_WEB_BASE_URL: ${GITHUB_WEB_BASE_URL:-}
+      # GITHUB_APP_PRIVATE_KEY_PATH must point at a secret file mounted into this container (see .env.example).
+      GIT_REPOSITORY_ROOT: /data/git-repositories
     volumes:
       - probe-data:/data
       - ${PROBE_REPOSITORY_HOST_ROOT:?Set PROBE_REPOSITORY_HOST_ROOT}:/repositories:rw

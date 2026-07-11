@@ -1739,6 +1739,10 @@ CREATE TABLE IF NOT EXISTS github_connections (
     credential_type      TEXT NOT NULL DEFAULT 'github_app',
     status               TEXT NOT NULL DEFAULT 'pending',
     last_error           TEXT,
+    -- Set by the repo manager's sync endpoint (Issue #216 sub-task 2) after
+    -- `ensure_mirror` + resolving the default branch's local commit SHA.
+    last_synced_at          TEXT,
+    last_synced_commit_sha  TEXT,
     created_by_user_id   INTEGER,
     updated_by_user_id   INTEGER,
     created_at           TEXT NOT NULL,
@@ -2232,6 +2236,14 @@ def init_db() -> None:
             # Issue #135: raw trace-aggregate + metadata-provenance JSON for
             # question_source = 'runtime' rows; existing rows stay NULL.
             conn.execute("ALTER TABLE interview_qa ADD COLUMN runtime_evidence TEXT")
+        github_conn_cols = _columns(conn, "github_connections")
+        if github_conn_cols and "last_synced_at" not in github_conn_cols:
+            # Issue #216 sub-task 2: repo manager sync bookkeeping.
+            conn.execute("ALTER TABLE github_connections ADD COLUMN last_synced_at TEXT")
+        if github_conn_cols and "last_synced_commit_sha" not in github_conn_cols:
+            conn.execute(
+                "ALTER TABLE github_connections ADD COLUMN last_synced_commit_sha TEXT"
+            )
         _ensure_legacy_system(conn)
     _bootstrap_admin()
     _enforce_auth_requirement()

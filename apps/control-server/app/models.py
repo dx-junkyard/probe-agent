@@ -3618,10 +3618,24 @@ class GithubConnectionOut(BaseModel):
     credential_type: str
     status: GithubConnectionStatus
     last_error: Optional[str] = None
+    last_synced_at: Optional[str] = None
+    last_synced_commit_sha: Optional[str] = None
     created_by_user_id: Optional[int] = None
     updated_by_user_id: Optional[int] = None
     created_at: str
     updated_at: str
+
+
+# Repository manager status (Issue #216, sub-task 2). `mirror_path` is
+# root-relative (never the absolute host path) so it is safe to return to a
+# Dashboard client.
+class GithubRepositoryStatusOut(BaseModel):
+    connection_id: int
+    mirror_exists: bool
+    mirror_path: Optional[str] = None
+    default_branch: Optional[str] = None
+    last_synced_at: Optional[str] = None
+    last_synced_commit_sha: Optional[str] = None
 
 
 class AssistantAskOut(BaseModel):
