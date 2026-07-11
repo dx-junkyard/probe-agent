@@ -3549,6 +3549,9 @@ class SystemStateItemOut(BaseModel):
     target_ui: Optional[SystemStateTargetUiOut] = None
     related_checks: List[str] = Field(default_factory=list)
     related_pipeline_steps: List[str] = Field(default_factory=list)
+    source: str = "system_state"
+    dedupe_key: str = ""
+    scope: str = "global"
     # System State Assessment is deterministic and LLM-free (Issue #193 Phase 1).
     decision_method: Literal["deterministic"] = "deterministic"
 
@@ -3559,6 +3562,9 @@ class SystemStateAssessmentOut(BaseModel):
     overall_severity: StateSeverity
     severity_counts: Dict[str, int] = Field(default_factory=dict)
     items: List[SystemStateItemOut] = Field(default_factory=list)
+    primary_item: Optional[SystemStateItemOut] = None
+    notification_items: List[SystemStateItemOut] = Field(default_factory=list)
+    page_items: Dict[str, List[SystemStateItemOut]] = Field(default_factory=dict)
 
 
 class AssistantActionOut(BaseModel):

@@ -1,6 +1,6 @@
 import { Outlet, Navigate } from "react-router-dom";
 import { useAuth } from "@/api/auth";
-import { useRepositoryStatus } from "@/api/hooks";
+import { useSystemState } from "@/api/hooks";
 import { Sidebar } from "./sidebar";
 import { Header } from "./header";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -10,7 +10,8 @@ import { useRef } from "react";
 export function AppLayout() {
   const { user, loading } = useAuth();
   const mainRef = useRef<HTMLElement>(null);
-  const { data: repositoryStatus } = useRepositoryStatus();
+  const { data: systemState } = useSystemState();
+  const primaryNotice = systemState?.primary_item ?? null;
 
   if (loading) {
     return (
@@ -36,13 +37,7 @@ export function AppLayout() {
         </main>
       </div>
       <AssistantPanel
-        snapshotNotice={
-          repositoryStatus?.snapshot_stale
-            ? "HEAD が最新 snapshot より進んでいます。snapshot を作成してください。"
-            : repositoryStatus?.working_tree_dirty
-              ? "未コミット差分があります。snapshot の前提を確認してください。"
-              : null
-        }
+        snapshotNotice={primaryNotice?.summary ?? null}
         onSnapshotNoticeClick={() => {
           mainRef.current?.scrollTo({ top: 0, behavior: "smooth" });
         }}

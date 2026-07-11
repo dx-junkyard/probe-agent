@@ -270,6 +270,26 @@ class TestSystemStateBasics:
         # No ready snapshot means understanding/pipeline items are not evaluated.
         assert not any(i.startswith("understanding.") for i in items)
 
+    def test_response_projects_primary_notifications_and_page_items(self, admin_client):
+        _, _, hdrs = _setup(admin_client)
+        data, items = _get_state(admin_client, hdrs)
+
+        assert data["primary_item"] is not None
+        assert data["primary_item"]["state_id"] in items
+        assert data["notification_items"]
+        assert "/repository" in data["page_items"]
+        assert any(item["state_id"] == data["primary_item"]["state_id"] for item in data["items"])
+
+    def test_primary_selection_is_deterministic_and_prioritizes_severity_then_timing(self):
+        from app.system_state import StateItem, select_primary_item
+
+        warning_now = StateItem("warning", "repository", "warning", "missing", "configure", "now", "x", "x", "x")
+        error_later = StateItem("error", "pipeline", "error", "failed", "rerun", "before_next_step", "x", "x", "x")
+        assert select_primary_item([warning_now, error_later]) is error_later
+        early = StateItem("early", "repository", "warning", "missing", "configure", "now", "x", "x", "x")
+        late = StateItem("late", "repository", "warning", "missing", "configure", "before_next_step", "x", "x", "x")
+        assert select_primary_item([late, early]) is early
+
     def test_all_items_carry_finite_vocabulary(self, admin_client, tmp_path):
         _, sys, hdrs = _setup(admin_client)
         repo, sha = _init_git_repo(tmp_path)
@@ -385,6 +405,22 @@ class TestUnderstandingState:
 
 
 class TestPipelineState:
+    def test_head_ahead_of_snapshot_is_canonical_repository_state(self, admin_client, tmp_path):
+        _, _, hdrs = _setup(admin_client)
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put("/repository", json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []}, headers=hdrs)
+        created = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert created.status_code == 201, created.text
+        _commit_file(repo, "main.py", "def run():\n    return 2\n")
+
+        data, items = _get_state(admin_client, hdrs)
+        stale = items["repository.snapshot.stale"]
+        assert stale["user_action_kind"] == "create_snapshot"
+        assert stale["target_ui"] == {"route": "/repository", "anchor": "snapshot-create", "action_label": "Snapshot を作成"}
+        # A blocking configuration diagnostic may correctly outrank this item;
+        # regardless, stale HEAD is part of the global notification projection.
+        assert "repository.snapshot.stale" in {item["state_id"] for item in data["notification_items"]}
+
     def test_indexing_snapshot_is_running_wait_state(self, admin_client):
         _, sys, hdrs = _setup(admin_client)
         snap_id = _insert_snapshot(sys["id"], status="indexing")

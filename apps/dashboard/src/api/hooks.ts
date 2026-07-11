@@ -4,6 +4,7 @@ import type {
   SystemOut, ComponentSummary, TraceEvent, Policy,
   LineageOut, TraceAnalyzer, AnalysisRun, AnalyzerContext,
   RepositoryStatus,
+  SystemStateAssessment,
   FlowOverlayOut, FlowOverlayRequest,
   ShadowResult, ComponentProfile, UserOut, TokenOut,
   RepositoryCandidateOut, RepositoryConfigOut, SnapshotOut, LatestDraftsOut,
@@ -343,6 +344,16 @@ export function useRepositoryStatus() {
   });
 }
 
+// Canonical user-facing state and notification projection (Issue #206).
+export function useSystemState() {
+  return useQuery({
+    queryKey: sysKey("system-state"),
+    queryFn: () => api.get<SystemStateAssessment>("/system-state"),
+    enabled: !!getSystemId(),
+    staleTime: 30_000,
+  });
+}
+
 export function useLatestSnapshot() {
   return useQuery({
     queryKey: sysKey("latestSnapshot"),
@@ -359,6 +370,7 @@ export function useCreateSnapshot() {
       qc.invalidateQueries({ queryKey: sysKey("snapshots") });
       qc.invalidateQueries({ queryKey: sysKey("latestSnapshot") });
       qc.invalidateQueries({ queryKey: sysKey("repositoryStatus") });
+      qc.invalidateQueries({ queryKey: sysKey("system-state") });
     },
   });
 }

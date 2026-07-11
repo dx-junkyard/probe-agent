@@ -303,6 +303,45 @@ export interface RepositoryStatus {
   next_actions: string[];
 }
 
+export interface SystemStateTargetUi {
+  route: string;
+  anchor: string | null;
+  action_label: string;
+}
+
+export interface SystemStateItem {
+  state_id: string;
+  state_group: string;
+  severity: "ok" | "info" | "warning" | "blocked" | "error";
+  status: string;
+  user_action_kind: string;
+  intervention_timing: string;
+  subject: string;
+  summary: string;
+  detail: string;
+  impact: string;
+  remediation: string;
+  evidence: Record<string, unknown>;
+  target_ui: SystemStateTargetUi | null;
+  related_checks: string[];
+  related_pipeline_steps: string[];
+  source: string;
+  dedupe_key: string;
+  scope: string;
+  decision_method: "deterministic";
+}
+
+export interface SystemStateAssessment {
+  system_id: number;
+  generated_at: number;
+  overall_severity: SystemStateItem["severity"];
+  severity_counts: Record<string, number>;
+  items: SystemStateItem[];
+  primary_item: SystemStateItem | null;
+  notification_items: SystemStateItem[];
+  page_items: Record<string, SystemStateItem[]>;
+}
+
 export type InterviewSessionStatus = "open" | "proposals_ready" | "materialized" | "closed";
 export type InterviewMessageRole = "user" | "assistant" | "system";
 export type InterviewStage =
