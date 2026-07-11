@@ -10,6 +10,7 @@ import { toast } from "sonner";
 import { Sparkles, Link2, CheckCircle, XCircle, FileText, Boxes } from "lucide-react";
 import { AddToWorkspaceButton } from "@/components/add-to-workspace";
 import { ContextHeader } from "@/components/layout/context-header";
+import { PrerequisiteChecklist } from "@/components/prerequisite-checklist";
 
 export default function FeatureMapPage() {
   const { data: drafts, isLoading: draftsLoading } = useLatestDrafts();
@@ -105,7 +106,14 @@ export default function FeatureMapPage() {
               {draftsLoading ? (
                 <div className="space-y-3">{[1,2,3,4].map(i=><Skeleton key={i} className="h-6 w-full"/>)}</div>
               ) : !profile ? (
-                <p className="text-sm text-muted-foreground text-center py-8">No profile draft yet. Generate drafts to start.</p>
+                <div className="py-8 text-center space-y-2">
+                  <p className="text-sm text-muted-foreground">No profile draft yet. Generate drafts to start.</p>
+                  <p className="text-xs text-muted-foreground max-w-sm mx-auto">
+                    Complete these steps on the{" "}
+                    <Link to="/repository" className="underline">Repository</Link> page, then Generate Drafts above.
+                  </p>
+                  <PrerequisiteChecklist />
+                </div>
               ) : (
                 <dl className="space-y-4 text-sm">
                   {([
@@ -145,7 +153,16 @@ export default function FeatureMapPage() {
           {draftsLoading ? (
             <div className="space-y-3">{[1,2,3].map(i=><Skeleton key={i} className="h-32 w-full"/>)}</div>
           ) : !features.length ? (
-            <Card><CardContent className="py-8 text-center text-sm text-muted-foreground">No features discovered yet</CardContent></Card>
+            <Card>
+              <CardContent className="py-8 text-center space-y-2 text-sm text-muted-foreground">
+                <p>No features discovered yet</p>
+                <p className="text-xs">
+                  Generate Drafts above once the{" "}
+                  <Link to="/repository" className="underline">Repository</Link> prerequisites
+                  (snapshot, indexed symbols) are complete.
+                </p>
+              </CardContent>
+            </Card>
           ) : (
             <div className="grid gap-4 md:grid-cols-2">
               {features.map(f => {
@@ -232,7 +249,14 @@ export default function FeatureMapPage() {
               {linksLoading ? (
                 <div className="space-y-2">{[1,2,3].map(i=><Skeleton key={i} className="h-12 w-full"/>)}</div>
               ) : !codeLinks?.links?.length ? (
-                <p className="text-sm text-muted-foreground text-center py-8">No code links generated yet</p>
+                <div className="py-8 text-center space-y-2 text-sm text-muted-foreground">
+                  <p>No code links generated yet</p>
+                  <p className="text-xs">
+                    Generate Code Links above once features exist and the{" "}
+                    <Link to="/repository" className="underline">Repository</Link> prerequisites
+                    (snapshot, indexed symbols) are complete.
+                  </p>
+                </div>
               ) : (
                 <div className="overflow-x-auto">
                   <table className="w-full text-sm">

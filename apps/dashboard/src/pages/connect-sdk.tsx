@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import { useMyTokens, useIssueToken, useRevokeMyToken } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
@@ -9,7 +10,7 @@ import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "sonner";
 import { formatTimestamp } from "@/lib/utils";
-import { Copy, Key, Trash2 } from "lucide-react";
+import { Copy, Key, Trash2, ArrowRight } from "lucide-react";
 import { getClientServerUrl } from "@/lib/env";
 
 export default function ConnectSdkPage() {
@@ -165,6 +166,15 @@ def summarize(text: str) -> str:
           )}
         </CardContent>
       </Card>
+
+      <Link
+        to="/setup-guide"
+        className="inline-flex items-center gap-1.5 text-sm text-primary hover:underline"
+        data-testid="connect-sdk-setup-guide-link"
+      >
+        Verify the connection in the Setup Guide
+        <ArrowRight className="h-3.5 w-3.5" />
+      </Link>
     </div>
   );
 }

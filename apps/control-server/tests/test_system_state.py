@@ -208,6 +208,21 @@ def _insert_intelligence_run(system_id, snapshot_id, run_type, status):
         return cur.lastrowid
 
 
+def _insert_capability_node(system_id, snapshot_id, run_id, *, node_type="capability", name="Cap"):
+    from app.db import get_conn
+
+    now = time.time()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO capability_hierarchy_nodes
+                (system_id, snapshot_id, intelligence_run_id, node_type, name, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (system_id, snapshot_id, run_id, node_type, name, now),
+        )
+
+
 def _insert_active_build(system_id, snapshot_id, *, current_step="symbol_index"):
     from app.db import get_conn
 
@@ -601,6 +616,86 @@ class TestPipelineState:
         assert item["severity"] == "blocked"
         assert item["user_action_kind"] == "configure"
         assert "pipeline.capability_hierarchy.failed" not in items
+
+    def test_capability_hierarchy_not_run_with_reasoning_available_is_missing(
+        self, admin_client, tmp_path, monkeypatch
+    ):
+        """Regression: no run + reasoning available -> plain "not_run"
+        (missing), not blocked_by_reasoning and not the new empty-result item."""
+        monkeypatch.setattr(
+            "app.system_understanding_service._is_reasoning_model_available",
+            lambda: True,
+        )
+        _, sys, hdrs = _setup(admin_client)
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+
+        _, items = _get_state(admin_client, hdrs)
+        item = items["pipeline.capability_hierarchy.not_run"]
+        assert item["status"] == "missing"
+        assert item["severity"] == "warning"
+        assert "pipeline.capability_hierarchy.blocked_by_reasoning" not in items
+        assert "pipeline.capability_hierarchy.empty" not in items
+
+    def test_capability_hierarchy_completed_zero_capabilities_is_warning_item(
+        self, admin_client, tmp_path
+    ):
+        """Issue #210: a completed run with zero capability nodes must not
+        silently disappear (return None, same as a genuinely "done" run).
+        It gets a distinct state_id whose remediation points at
+        Interview/metadata, not the generic "Build / Refresh を実行してください"
+        used for not-yet-run/failed/blocked pipeline steps."""
+        _, sys, hdrs = _setup(admin_client)
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+        _insert_intelligence_run(sys["id"], snap.json()["id"], "capability_hierarchy", "completed")
+
+        _, items = _get_state(admin_client, hdrs)
+        assert "pipeline.capability_hierarchy.blocked_by_reasoning" not in items
+        assert "pipeline.capability_hierarchy.not_run" not in items
+        item = items["pipeline.capability_hierarchy.empty"]
+        assert item["status"] == "missing"
+        assert item["severity"] == "warning"
+        assert item["user_action_kind"] == "confirm"
+        assert "Build / Refresh を実行してください" not in item["remediation"]
+        assert "Interview" in item["remediation"]
+
+    def test_capability_hierarchy_completed_with_capabilities_returns_no_item(
+        self, admin_client, tmp_path
+    ):
+        """Regression: a completed run that actually produced capabilities
+        stays "done" (no state item), same as before this issue."""
+        _, sys, hdrs = _setup(admin_client)
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+        snapshot_id = snap.json()["id"]
+        run_id = _insert_intelligence_run(
+            sys["id"], snapshot_id, "capability_hierarchy", "completed"
+        )
+        _insert_capability_node(sys["id"], snapshot_id, run_id)
+
+        _, items = _get_state(admin_client, hdrs)
+        assert "pipeline.capability_hierarchy.empty" not in items
+        assert "pipeline.capability_hierarchy.blocked_by_reasoning" not in items
+        assert "pipeline.capability_hierarchy.not_run" not in items
 
 
 class TestDiagnosticsProjectionCompatibility:

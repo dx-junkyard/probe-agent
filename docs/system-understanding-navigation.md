@@ -152,6 +152,12 @@ Build 系 CTA はビルド実行中（`build.isPending` または最新ジョブ
 `queued`/`running`）は無効化される。CTA には `pipeline-cta-<step>` の
 `data-testid` が付く。
 
+全 step が `complete` のとき、Pipeline Status カードは既定で折りたたまれ
+（`data-testid="pipeline-collapsed"`、`N/N steps complete` の要約表示）、
+`pipeline-expand` / `pipeline-collapse` ボタンで切り替えられる（Issue #211）。
+`warning` / `blocked` / `failed` / `missing` の step が 1 つでもあれば従来
+どおり展開表示される。判定は step status の有限集合への分岐のみ。
+
 ## ページ間ナビゲーション
 
 クロスページリンク:
@@ -199,6 +205,26 @@ Capability Map の detail panel は
 同一レスポンス内で snapshot 規約を混在させない。新しい snapshot が `indexing` /
 `failed` の間も、context API は latest ready snapshot を基準にして、gaps /
 probe plans / experiments を同じ分析文脈で返す。
+
+## 状態通知の構成（現状 2 系統と統合方針）
+
+ユーザー向けの「次の一歩」表示は現在 2 系統が併存する（Issue #215 調査、
+`docs/ux-gap-analysis-system-understanding.md` §2.4）。
+
+1. `system_understanding_service._derive_primary_action` →
+   `GET /system-understanding` の `primary_action` → Hub の
+   `PrimaryActionCard`（本ドキュメント「Primary Action (Issue #201)」節）
+2. `system_state.build_system_state` / `select_primary_item` →
+   `GET /system-state` の `primary_item` / `page_items` →
+   `SystemStateBanner` とヘッダーの `DiagnosticsBadge`
+
+前者は現 snapshot のみを参照し、後者は Interview baseline の snapshot
+跨ぎ再利用に対応するなど、判定材料が完全には一致しない。統合（前者を
+後者へ吸収し、Hub の表示も canonical `StateItem` から投影する）は
+Issue #206 / #207 が所有する。それまでの間、両系統の判定条件を変える
+変更は必ず両方（`system_understanding_service` / `system_state` /
+`system_diagnostics`）へ同時に適用する（Issue #210 の
+capability_hierarchy 0 件 warning が先例）。
 
 ## Next Actions
 
@@ -284,6 +310,14 @@ Refresh ボタン）の直下に、`primary_action` を表示する単一カー�
 将来的に `apps/control-server/app/system_state.py`（System State Assessment、
 Issue #193）へ統合される可能性があるが、本 issue ではまだ統合しない
 （`_derive_primary_action` のコメント参照）。
+
+pipeline 全 step が `complete` かつ build 非実行のとき、primary action
+カードは成功サマリ（`data-testid="build-success-summary"`、
+`Analysis complete — N/N steps · X symbols · Y entrypoints`。件数は
+`metadata_coverage` 由来）を CTA の上に表示し、ヘッダーの Build / Refresh
+ボタンは `outline` variant に降格する（Issue #211）。同条件で System
+Purpose 未定義の場合、Start from Capability / Feature カードには前提の
+注記（`data-testid="entry-cards-prereq-note"`）が付く。
 
 ### Stage Status（Issue #202）
 

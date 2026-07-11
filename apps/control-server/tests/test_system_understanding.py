@@ -243,8 +243,12 @@ class TestSystemUnderstandingReportsReasoningModelBlocked:
         # documentation step that requires a reasoning model.
         assert pipeline["documentation_indexed"] == "complete"
         assert pipeline["documentation_claims_scanned"] == "blocked"
-        # Capability hierarchy has a deterministic base that runs without reasoning
-        assert pipeline["capability_hierarchy_ready"] in ("complete", "blocked")
+        # Capability hierarchy has a deterministic base that runs without reasoning.
+        # Issue #210: the fixture repo carries no `probe-agent:` docstring
+        # metadata, so the run completes with zero capability nodes, which is
+        # reported as "warning" (not silently "complete") rather than blocked
+        # on the (unrelated) reasoning-model requirement.
+        assert pipeline["capability_hierarchy_ready"] in ("warning", "blocked")
 
     def test_documentation_indexed_reflects_build_step_not_draft_generation(
         self, admin_client, tmp_path
@@ -273,6 +277,106 @@ class TestSystemUnderstandingReportsReasoningModelBlocked:
         assert r.status_code == 200
         pipeline = {s["step"]: s["status"] for s in r.json()["pipeline"]}
         assert pipeline["documentation_indexed"] == "complete"
+
+
+class TestCapabilityHierarchyReadyStatus:
+    """Issue #210: capability_hierarchy_ready must not report "complete" for a
+    completed run that produced zero capability nodes (no `probe-agent:`
+    docstring metadata found in the target repo), since that used to
+    contradict the SystemStateBanner's "generate the capability hierarchy"
+    warning for the same build.
+    """
+
+    def _setup_with_snapshot(self, admin_client, tmp_path, name):
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, name)
+        hdrs = _headers(token, sys["id"])
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post(
+            "/repository/snapshots", json={"commit_sha": sha}, headers=hdrs
+        )
+        assert snap.status_code == 201, snap.text
+        return sys, hdrs, snap.json()["id"]
+
+    def _insert_capability_run(self, system_id, snapshot_id, status):
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO intelligence_runs
+                       (system_id, snapshot_id, run_type, provider, model,
+                        prompt_version, schema_version, decision_method,
+                        status, is_mock, started_at, completed_at)
+                   VALUES (?, ?, 'capability_hierarchy', 'deterministic', 'none',
+                           'v1', 'v1', 'deterministic', ?, 0, 0, 0)""",
+                (system_id, snapshot_id, status),
+            )
+            return cur.lastrowid
+
+    def _insert_capability_node(self, system_id, snapshot_id, run_id):
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO capability_hierarchy_nodes
+                       (system_id, snapshot_id, intelligence_run_id, node_type, name, created_at)
+                   VALUES (?, ?, ?, 'capability', 'Some capability', 0)""",
+                (system_id, snapshot_id, run_id),
+            )
+
+    def test_no_run_and_reasoning_available_is_missing(self, admin_client, tmp_path, monkeypatch):
+        """Regression: no run + reasoning available -> plain "missing"."""
+        monkeypatch.setattr(
+            "app.system_understanding_service._is_reasoning_model_available",
+            lambda: True,
+        )
+        sys, hdrs, snapshot_id = self._setup_with_snapshot(admin_client, tmp_path, "chr-no-run-sys")
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200
+        pipeline = {s["step"]: s["status"] for s in r.json()["pipeline"]}
+        assert pipeline["capability_hierarchy_ready"] == "missing"
+
+    def test_no_run_and_reasoning_unavailable_is_blocked(self, admin_client, tmp_path):
+        """Regression: no run + no reasoning model configured -> "blocked"
+        (the admin_client fixture defaults to LLM_PROVIDER=mock)."""
+        sys, hdrs, snapshot_id = self._setup_with_snapshot(admin_client, tmp_path, "chr-no-run-blocked-sys")
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200
+        pipeline = {s["step"]: s["status"] for s in r.json()["pipeline"]}
+        assert pipeline["capability_hierarchy_ready"] == "blocked"
+
+    def test_completed_with_zero_capabilities_is_warning(self, admin_client, tmp_path):
+        sys, hdrs, snapshot_id = self._setup_with_snapshot(admin_client, tmp_path, "chr-zero-sys")
+        self._insert_capability_run(sys["id"], snapshot_id, "completed")
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200
+        pipeline = {s["step"]: s for s in r.json()["pipeline"]}
+        step = pipeline["capability_hierarchy_ready"]
+        assert step["status"] == "warning"
+        assert "probe-agent" in step["detail"]
+
+    def test_completed_with_at_least_one_capability_is_complete(self, admin_client, tmp_path):
+        sys, hdrs, snapshot_id = self._setup_with_snapshot(admin_client, tmp_path, "chr-nonzero-sys")
+        run_id = self._insert_capability_run(sys["id"], snapshot_id, "completed")
+        self._insert_capability_node(sys["id"], snapshot_id, run_id)
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200
+        pipeline = {s["step"]: s["status"] for s in r.json()["pipeline"]}
+        assert pipeline["capability_hierarchy_ready"] == "complete"
+
+        # And system_state must not surface a capability-hierarchy item for a
+        # genuinely completed, non-empty run.
+        state_r = admin_client.get("/system-state", headers=hdrs)
+        assert state_r.status_code == 200, state_r.text
+        state_ids = [i["state_id"] for i in state_r.json()["items"]]
+        assert not any(s.startswith("pipeline.capability_hierarchy.") for s in state_ids)
 
 
 class TestSystemUnderstandingReportsMetadataCoverage:
@@ -936,7 +1040,11 @@ class TestNextActionsPriority:
             gap_count=3,
         )
         assert actions[0].action == "Define System Purpose"
-        assert actions[0].reason == "Pipeline completed, but no system purpose is defined yet."
+        assert actions[0].reason.startswith(
+            "Pipeline completed, but no system purpose is defined yet."
+        )
+        # Issue #211: the reason also explains why defining it matters.
+        assert "evaluation basis" in actions[0].reason
         assert actions[0].link == "/interview"
 
     def test_complete_pipeline_without_capabilities_after_purpose(self):

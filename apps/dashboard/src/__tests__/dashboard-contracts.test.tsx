@@ -1448,7 +1448,7 @@ describe("Capability Map page", () => {
     fireEvent.click(await screen.findByText("Document Analysis"));
 
     const gapLink = await screen.findByText("Missing docs for parser");
-    expect(gapLink.closest("a")).toHaveAttribute("href", "/system-understanding");
+    expect(gapLink.closest("a")).toHaveAttribute("href", "/system-understanding?capability=doc-analysis");
 
     const planLink = await screen.findByTestId("capability-probe-plans");
     expect(within(planLink).getByText("doc-parsing")).toBeInTheDocument();
@@ -3298,8 +3298,11 @@ describe("System Understanding page", () => {
     expect(screen.getByTestId("stage-title-instrument").textContent).toBe("Instrument");
     expect(screen.getByTestId("stage-title-evaluate").textContent).toBe("Evaluate");
 
-    // Existing pipeline checklist / gap worklist / capabilities elements survive the reorganization.
-    expect(screen.getByTestId("pipeline-checklist")).toBeTruthy();
+    // Existing pipeline checklist / gap worklist / capabilities elements
+    // survive the reorganization. With every step complete the checklist is
+    // collapsed by default (Issue #211) and expands on demand.
+    fireEvent.click(screen.getByTestId("pipeline-expand"));
+    expect(await screen.findByTestId("pipeline-checklist")).toBeTruthy();
     expect(screen.getByTestId("metadata-coverage")).toBeTruthy();
 
     // Each stage links to its detail pages.
@@ -5174,5 +5177,240 @@ describe("Trace Analyzers page", () => {
     expect(within(table).getByText(/1\/2 entities differ/)).toBeInTheDocument();
     expect(within(table).getByText("status")).toBeInTheDocument();
     expect(within(table).getByText("changed")).toBeInTheDocument();
+  });
+});
+
+// ── Cross-page onboarding and navigation links (Issue #212) ─────────
+
+describe("Overview get-started zero state (Issue #212)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+    mockSystems = [{ id: 1, name: "alpha" }];
+  });
+
+  test("renders ordered get-started links when no components exist", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/components") return Promise.resolve([]);
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "ok",
+        severity_counts: {}, items: [], primary_item: null,
+        notification_items: [], page_items: {},
+      });
+      return Promise.resolve(null);
+    });
+
+    const { default: OverviewPage } = await import("@/pages/overview");
+    render(<OverviewPage />, { wrapper: createWrapper() });
+
+    const getStarted = await screen.findByTestId("overview-get-started");
+    expect(within(getStarted).getByTestId("overview-link-repository"))
+      .toHaveAttribute("href", "/repository");
+    expect(within(getStarted).getByTestId("overview-link-system-understanding"))
+      .toHaveAttribute("href", "/system-understanding");
+    expect(within(getStarted).getByTestId("overview-link-connect-sdk"))
+      .toHaveAttribute("href", "/connect-sdk");
+  });
+
+  test("does not render get-started links when components exist", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/components") return Promise.resolve([{
+        component_id: "summarize", mode: "trace", trace_count: 3, last_seen: 1,
+      }]);
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "ok",
+        severity_counts: {}, items: [], primary_item: null,
+        notification_items: [], page_items: {},
+      });
+      return Promise.resolve(null);
+    });
+
+    const { default: OverviewPage } = await import("@/pages/overview");
+    render(<OverviewPage />, { wrapper: createWrapper() });
+
+    await screen.findByText("summarize");
+    expect(screen.queryByTestId("overview-get-started")).not.toBeInTheDocument();
+  });
+});
+
+describe("Probe Planner manual feature-id escape hatch (Issue #212)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  function mockPlannerApis() {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({ plans: [] });
+      if (path === "/repository/drafts/latest") {
+        return Promise.resolve({ system_profile_draft: null, feature_drafts: [] });
+      }
+      return Promise.resolve(null);
+    });
+  }
+
+  test("with no feature drafts, shows prerequisite note and hides free-text input behind toggle", async () => {
+    mockPlannerApis();
+
+    await renderProbePlannerAt("/probe-planner");
+
+    fireEvent.click(await screen.findByText("Generate Plan"));
+
+    const note = await screen.findByTestId("planner-no-drafts-note");
+    expect(within(note).getByText("Feature Map").closest("a"))
+      .toHaveAttribute("href", "/feature-map");
+    expect(within(note).getByText("System Understanding").closest("a"))
+      .toHaveAttribute("href", "/system-understanding");
+    expect(screen.queryByTestId("planner-manual-feature-input")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("planner-manual-feature-toggle"));
+    expect(await screen.findByTestId("planner-manual-feature-input")).toBeInTheDocument();
+  });
+});
+
+describe("Feature Map empty-state prerequisites (Issue #212)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("renders the shared prerequisite checklist when no profile draft exists", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/drafts/latest") {
+        return Promise.resolve({ system_profile_draft: null, feature_drafts: [] });
+      }
+      if (path === "/repository/code-links") return Promise.resolve({ links: [] });
+      if (path === "/repository/snapshots/latest") return Promise.resolve(null);
+      if (path === "/repository/symbols") return Promise.resolve({ symbols: [], symbol_count: 0 });
+      return Promise.resolve(null);
+    });
+
+    const { default: FeatureMapPage } = await import("@/pages/feature-map");
+    render(<FeatureMapPage />, { wrapper: createWrapper() });
+
+    const checklist = await screen.findByTestId("prerequisite-checklist");
+    expect(within(checklist).getByText("Snapshot created")).toBeInTheDocument();
+    expect(within(checklist).getByText("Symbols indexed")).toBeInTheDocument();
+  });
+});
+
+describe("Connect SDK forward link to Setup Guide (Issue #212)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("renders the setup-guide link", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/auth/my-tokens") return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+
+    const { default: ConnectSdkPage } = await import("@/pages/connect-sdk");
+    render(<ConnectSdkPage />, { wrapper: createWrapper() });
+
+    expect(await screen.findByTestId("connect-sdk-setup-guide-link"))
+      .toHaveAttribute("href", "/setup-guide");
+  });
+});
+
+// ── Build success summary and pipeline collapse (Issue #211) ────────
+
+describe("Hub success summary and pipeline collapse (Issue #211)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const allCompletePipeline = [
+    { step: "repository_configured", status: "complete" },
+    { step: "snapshot_ready", status: "complete" },
+    { step: "documentation_indexed", status: "complete" },
+    { step: "documentation_claims_scanned", status: "complete" },
+    { step: "symbols_indexed", status: "complete" },
+    { step: "entrypoints_discovered", status: "complete" },
+    { step: "docs_code_reconciled", status: "complete" },
+    { step: "capability_hierarchy_ready", status: "complete" },
+  ];
+
+  const baseResponse = {
+    system_id: 1,
+    snapshot_id: 5,
+    commit_sha: "abc12345def",
+    pipeline: allCompletePipeline,
+    purpose: { name: "Test System", summary: "A test system", provenance_kind: "manual" },
+    capabilities: [],
+    entrypoints: [],
+    major_symbols: [],
+    gaps: [],
+    gap_summary: [],
+    metadata_coverage: { symbol_count: 42, symbols_with_source_metadata: 5, entrypoint_count: 10, entrypoints_with_capability_link: 3 },
+    next_actions: [],
+    primary_action: {
+      action: "Start from Capability", reason: "Everything is ready.",
+      category: "understand", link: "/capability-map", action_kind: "navigate",
+    },
+  };
+
+  function mockSuApis(response: Record<string, unknown>) {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(response)
+        : Promise.resolve(null),
+    );
+  }
+
+  test("all-complete pipeline shows the success summary and collapses the checklist", async () => {
+    mockSuApis(baseResponse);
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const summary = await screen.findByTestId("build-success-summary");
+    expect(summary.textContent).toContain("8/8 steps");
+    expect(summary.textContent).toContain("42 symbols");
+    expect(summary.textContent).toContain("10 entrypoints");
+
+    const collapsed = screen.getByTestId("pipeline-collapsed");
+    expect(collapsed.textContent).toContain("8/8 steps complete");
+
+    // Purpose is defined, so the entry cards carry no prerequisite note.
+    expect(screen.queryByTestId("entry-cards-prereq-note")).not.toBeInTheDocument();
+
+    // Expanding restores the full checklist with a collapse control.
+    fireEvent.click(screen.getByTestId("pipeline-expand"));
+    expect(await screen.findByTestId("pipeline-checklist")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("pipeline-collapse"));
+    expect(await screen.findByTestId("pipeline-collapsed")).toBeInTheDocument();
+  });
+
+  test("incomplete pipeline keeps the checklist expanded without a success summary", async () => {
+    mockSuApis({
+      ...baseResponse,
+      pipeline: [
+        ...allCompletePipeline.slice(0, 7),
+        { step: "capability_hierarchy_ready", status: "warning", detail: "0 capabilities" },
+      ],
+      primary_action: {
+        action: "Build system understanding", reason: "1 step incomplete",
+        category: "understand", link: null, action_kind: "build",
+      },
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    expect(await screen.findByTestId("pipeline-checklist")).toBeInTheDocument();
+    expect(screen.queryByTestId("pipeline-collapsed")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("build-success-summary")).not.toBeInTheDocument();
+  });
+
+  test("undefined purpose adds the prerequisite note to the entry cards", async () => {
+    mockSuApis({ ...baseResponse, purpose: null });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    expect(await screen.findByTestId("entry-cards-prereq-note")).toBeInTheDocument();
   });
 });

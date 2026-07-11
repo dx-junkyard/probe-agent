@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -39,36 +39,50 @@ import type {
  * "navigate" actions link somewhere; "build" actions trigger the same
  * Build / Refresh job as the header button and share its disabled condition.
  */
-function PrimaryActionCard({ action, onRunBuild, buildDisabled }: {
+function PrimaryActionCard({ action, onRunBuild, buildDisabled, successSummary }: {
   action: SystemUnderstandingNextAction;
   onRunBuild: () => void;
   buildDisabled: boolean;
+  /** Issue #211: shown above the CTA when the whole pipeline completed, so
+   * the primary action reads as "analysis succeeded, here is the next step"
+   * instead of yet another problem banner. */
+  successSummary?: string;
 }) {
   const kind = action.action_kind ?? "navigate";
   return (
     <Card data-testid="primary-action">
-      <CardContent className="py-4 flex items-center justify-between gap-4 flex-wrap">
-        <div>
-          <p className="text-lg font-semibold">{action.action}</p>
-          <p className="text-sm text-muted-foreground mt-1">{action.reason}</p>
+      <CardContent className="py-4 space-y-3">
+        {successSummary && (
+          <p
+            className="text-sm font-medium text-emerald-600 dark:text-emerald-400"
+            data-testid="build-success-summary"
+          >
+            {successSummary}
+          </p>
+        )}
+        <div className="flex items-center justify-between gap-4 flex-wrap">
+          <div>
+            <p className="text-lg font-semibold">{action.action}</p>
+            <p className="text-sm text-muted-foreground mt-1">{action.reason}</p>
+          </div>
+          {kind === "build" ? (
+            <Button
+              onClick={onRunBuild}
+              disabled={buildDisabled}
+              data-testid="primary-action-cta"
+            >
+              {action.action}
+            </Button>
+          ) : action.link ? (
+            <Link
+              to={action.link}
+              data-testid="primary-action-cta"
+              className={cn(buttonVariants({ variant: "default" }))}
+            >
+              {action.action}
+            </Link>
+          ) : null}
         </div>
-        {kind === "build" ? (
-          <Button
-            onClick={onRunBuild}
-            disabled={buildDisabled}
-            data-testid="primary-action-cta"
-          >
-            {action.action}
-          </Button>
-        ) : action.link ? (
-          <Link
-            to={action.link}
-            data-testid="primary-action-cta"
-            className={cn(buttonVariants({ variant: "default" }))}
-          >
-            {action.action}
-          </Link>
-        ) : null}
       </CardContent>
     </Card>
   );
@@ -152,9 +166,16 @@ function EvaluateSummary({ counts }: { counts?: Record<string, number> }) {
   );
 }
 
-function EntryCards() {
+function EntryCards({ purposeDefined }: { purposeDefined: boolean }) {
   return (
-    <div className="grid gap-4 md:grid-cols-2">
+    <div className="space-y-2">
+      {!purposeDefined && (
+        <p className="text-xs text-muted-foreground" data-testid="entry-cards-prereq-note">
+          Best used after the System Purpose is defined — the purpose gives
+          capabilities, observation candidates, and probe plans their meaning.
+        </p>
+      )}
+      <div className={cn("grid gap-4 md:grid-cols-2", !purposeDefined && "opacity-70")}>
       <Link to="/capability-map" className="block group">
         <Card className="h-full transition-colors group-hover:border-primary/50">
           <CardHeader className="pb-2">
@@ -183,6 +204,7 @@ function EntryCards() {
           </CardContent>
         </Card>
       </Link>
+      </div>
     </div>
   );
 }
@@ -195,6 +217,13 @@ function DataView({ data, checksByStep, onRunBuild, buildDisabled }: {
 }) {
   const pipeline = data.pipeline ?? [];
   const allMissing = pipeline.every((s) => s.status === "missing");
+  const allComplete = pipeline.length > 0 && pipeline.every((s) => s.status === "complete");
+  // Issue #211: a fully complete pipeline is maintenance detail, not the
+  // page's main content — collapse it by default and let the user expand.
+  // null = no manual choice yet (auto-collapse only when everything is
+  // complete); any warning/blocked/failed/missing step keeps it expanded.
+  const [pipelineExpandedByUser, setPipelineExpandedByUser] = useState<boolean | null>(null);
+  const pipelineCollapsed = pipelineExpandedByUser === null ? allComplete : !pipelineExpandedByUser;
   const actionsByStage = groupNextActionsByStage(data.next_actions);
   const understandStage = findStage(data.stages, "understand");
   const observeStage = findStage(data.stages, "observe");
@@ -211,26 +240,59 @@ function DataView({ data, checksByStep, onRunBuild, buildDisabled }: {
         counts={understandStage?.counts}
       >
         {/* Pipeline Checklist */}
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-base">Pipeline Status</CardTitle>
-            <CardDescription>
-              Progress through the system understanding pipeline. Steps that are
-              missing or blocked show a "Why?" button when a configuration
-              diagnostic or a recent run failure explains them.
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <PipelineChecklist
-              steps={pipeline}
-              checksByStep={checksByStep}
-              onRunBuild={onRunBuild}
-              buildDisabled={buildDisabled}
-            />
-          </CardContent>
-        </Card>
+        {pipelineCollapsed ? (
+          <Card data-testid="pipeline-collapsed">
+            <CardContent className="py-3 flex items-center justify-between gap-4 flex-wrap">
+              <p className="text-sm">
+                <span className="font-medium">Pipeline Status</span>{" "}
+                <span className="text-muted-foreground">
+                  — {pipeline.length}/{pipeline.length} steps complete
+                </span>
+              </p>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setPipelineExpandedByUser(true)}
+                data-testid="pipeline-expand"
+              >
+                Show details
+              </Button>
+            </CardContent>
+          </Card>
+        ) : (
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base flex items-center justify-between gap-4">
+                Pipeline Status
+                {allComplete && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setPipelineExpandedByUser(false)}
+                    data-testid="pipeline-collapse"
+                  >
+                    Collapse
+                  </Button>
+                )}
+              </CardTitle>
+              <CardDescription>
+                Progress through the system understanding pipeline. Steps that are
+                missing or blocked show a "Why?" button when a configuration
+                diagnostic or a recent run failure explains them.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <PipelineChecklist
+                steps={pipeline}
+                checksByStep={checksByStep}
+                onRunBuild={onRunBuild}
+                buildDisabled={buildDisabled}
+              />
+            </CardContent>
+          </Card>
+        )}
 
-        {!allMissing && <EntryCards />}
+        {!allMissing && <EntryCards purposeDefined={!!data.purpose} />}
 
         <div className="grid gap-6 lg:grid-cols-2">
           {/* System Purpose */}
@@ -480,6 +542,18 @@ export default function SystemUnderstandingPage() {
   const buildRunning = latestBuild?.status === "queued" || latestBuild?.status === "running";
   const buildHighlight = useDiagnosticHighlight<HTMLButtonElement>("build");
   const pageItem = systemState?.page_items["/system-understanding"]?.[0] ?? systemState?.primary_item;
+  // Issue #211: with everything complete, Build / Refresh is a maintenance
+  // action, not the page's protagonist — demote it visually and hand the
+  // headline over to the success summary on the primary-action card.
+  const pipelineAllComplete = (data?.pipeline?.length ?? 0) > 0 &&
+    (data?.pipeline ?? []).every((s) => s.status === "complete");
+  const successSummary = pipelineAllComplete && !buildRunning
+    ? [
+        `Analysis complete — ${data!.pipeline.length}/${data!.pipeline.length} steps`,
+        data?.metadata_coverage ? `${data.metadata_coverage.symbol_count} symbols` : null,
+        data?.metadata_coverage ? `${data.metadata_coverage.entrypoint_count} entrypoints` : null,
+      ].filter(Boolean).join(" · ")
+    : undefined;
 
   // Refresh the aggregated view and diagnostics once a build job settles.
   useEffect(() => {
@@ -489,6 +563,10 @@ export default function SystemUnderstandingPage() {
     settledBuildId.current = latestBuild.id;
     qc.invalidateQueries({ queryKey: sysKey("system-understanding") });
     qc.invalidateQueries({ queryKey: sysKey("system-diagnostics") });
+    // Issue #210: SystemStateBanner reads useSystemState (sysKey("system-state")),
+    // which was not invalidated here, so it kept showing the pre-build warning
+    // (staleTime 30s) even after the pipeline checklist above refreshed.
+    qc.invalidateQueries({ queryKey: sysKey("system-state") });
   }, [latestBuild, qc]);
 
   const checksByStep = useMemo(() => {
@@ -518,7 +596,7 @@ export default function SystemUnderstandingPage() {
           {...buildHighlight}
           onClick={() => build.mutate()}
           disabled={build.isPending || buildRunning}
-          variant="default"
+          variant={pipelineAllComplete && !buildRunning ? "outline" : "default"}
           data-testid="build-button"
         >
           {build.isPending || buildRunning ? (
@@ -577,6 +655,7 @@ export default function SystemUnderstandingPage() {
           action={data.primary_action}
           onRunBuild={() => build.mutate()}
           buildDisabled={build.isPending || buildRunning}
+          successSummary={successSummary}
         />
       )}
 

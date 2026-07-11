@@ -49,6 +49,11 @@ export default function ProbePlannerPage() {
   const [draftDismissed, setDraftDismissed] = useState(false);
   const [featureId, setFeatureId] = useState<string | null>(null);
   const [objective, setObjective] = useState<string | null>(null);
+  // Issue #212: when no Feature Map drafts exist, free-text feature id entry
+  // is an explicit escape hatch the developer must opt into, not the default
+  // control — otherwise a plan can be generated unconnected to any
+  // capability/purpose. Deterministic presence check only (drafts.length).
+  const [manualFeatureEntry, setManualFeatureEntry] = useState(false);
   const cardRefs = useRef<Record<number, HTMLDivElement | null>>({});
   const planParamNotified = useRef(false);
 
@@ -75,6 +80,12 @@ export default function ProbePlannerPage() {
   const draftOpen = !!workspaceDraft
     && workspaceDraft.draft_type === "probe_plan_draft"
     && !draftDismissed;
+  // A Decision Workspace draft carries an already-decided feature id, not a
+  // free-text guess, so it is shown even before the developer opts into
+  // manual entry.
+  const hasWorkspaceFeaturePrefill = workspaceDraft?.draft_type === "probe_plan_draft"
+    && !!workspaceDraft.payload.feature_id;
+  const showManualFeatureInput = manualFeatureEntry || hasWorkspaceFeaturePrefill;
 
   const generate = async () => {
     if (!formFeatureId.trim()) return;
@@ -88,6 +99,7 @@ export default function ProbePlannerPage() {
       setDraftDismissed(true);
       setFeatureId(null);
       setObjective(null);
+      setManualFeatureEntry(false);
     } catch (e) {
       toast.error(String(e));
     }
@@ -113,6 +125,7 @@ export default function ProbePlannerPage() {
             setDraftDismissed(true);
             setFeatureId("");
             setObjective("");
+            setManualFeatureEntry(false);
             setShowGenerate(true);
           }}
           disabled={generatePlan.isPending}
@@ -339,6 +352,7 @@ export default function ProbePlannerPage() {
             setDraftDismissed(true);
             setFeatureId(null);
             setObjective(null);
+            setManualFeatureEntry(false);
           }
         }}
       >
@@ -379,7 +393,34 @@ export default function ProbePlannerPage() {
                 ))}
               </Select>
             ) : (
-              <Input value={formFeatureId} onChange={e => setFeatureId(e.target.value)} placeholder="feature-id" />
+              <div className="space-y-2" data-testid="planner-no-drafts-note">
+                <div className="rounded-md border border-amber-200 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
+                  No Feature Map drafts yet, so there is nothing to select a feature from. Generate
+                  drafts on the{" "}
+                  <Link to="/feature-map" className="underline">Feature Map</Link> page — build{" "}
+                  <Link to="/system-understanding" className="underline">System Understanding</Link>{" "}
+                  first if no snapshot or analysis exists yet.
+                </div>
+                {showManualFeatureInput ? (
+                  <Input
+                    value={formFeatureId}
+                    onChange={e => setFeatureId(e.target.value)}
+                    placeholder="feature-id"
+                    data-testid="planner-manual-feature-input"
+                  />
+                ) : (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    className="text-xs"
+                    onClick={() => setManualFeatureEntry(true)}
+                    data-testid="planner-manual-feature-toggle"
+                  >
+                    Enter feature id manually (advanced)
+                  </Button>
+                )}
+              </div>
             )}
           </div>
           <div className="space-y-2">

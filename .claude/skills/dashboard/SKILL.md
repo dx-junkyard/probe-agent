@@ -134,6 +134,23 @@ The dashboard should support:
   re-requests proposal generation. When a requested turn yields no proposals
   and no error, show an informational toast (narrowing continues) — never a
   bare success toast that implies proposals were created.
+- Cross-page onboarding and navigation (Issue #212): Overview's zero-component
+  state shows a deterministic, ordered get-started list (Repository →
+  System Understanding → Connect SDK), optionally preceded by
+  `useSystemState()`'s `page_items["/"]` primary item via the canonical
+  `SystemStateBanner` when the server ever routes an item there. Probe
+  Planner's Feature field falls back to a prerequisite note (links to
+  `/feature-map` and `/system-understanding`) plus an explicit
+  "Enter feature id manually (advanced)" toggle when no Feature Map drafts
+  exist, instead of silently exposing free-text entry — this does not change
+  the generate API or block generation. The `PrerequisiteChecklist`
+  (`components/prerequisite-checklist.tsx`, snapshot / symbols indexed /
+  profile draft presence) is shared between Capability Map's and Feature
+  Map's empty states rather than duplicated. Capability Map's gap links to
+  `/system-understanding` carry `?capability=<key>` like other
+  capability-context links on that page. Connect SDK links forward to
+  `/setup-guide` (which already links back), closing the one-way link.
+  All of the above are deterministic presence/routing checks — no heuristics.
 
 ## Authentication model
 

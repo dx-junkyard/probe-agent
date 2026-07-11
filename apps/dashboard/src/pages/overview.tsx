@@ -1,10 +1,22 @@
-import { useComponents } from "@/api/hooks";
+import { Link } from "react-router-dom";
+import { useComponents, useSystemState } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Boxes, Activity, Clock } from "lucide-react";
+import { SystemStateBanner } from "@/components/system-state";
+import { Boxes, Activity, Clock, FolderCog, Compass, Plug } from "lucide-react";
 import { formatTimestamp } from "@/lib/utils";
+
+// Deterministic, ordered get-started steps for a brand-new System with zero
+// components (Issue #212). This is a static fallback list, not a heuristic
+// recommendation — every System needs the repository configured, System
+// Understanding built, and the SDK connected, in this order.
+const GET_STARTED_STEPS = [
+  { to: "/repository", label: "1. Configure the repository", icon: FolderCog, testId: "overview-link-repository" },
+  { to: "/system-understanding", label: "2. Build System Understanding", icon: Compass, testId: "overview-link-system-understanding" },
+  { to: "/connect-sdk", label: "3. Connect the SDK", icon: Plug, testId: "overview-link-connect-sdk" },
+] as const;
 
 const MODE_VARIANT = {
   off: "secondary",
@@ -15,6 +27,12 @@ const MODE_VARIANT = {
 export default function OverviewPage() {
   const { systems, systemId } = useAuth();
   const { data: components, isLoading } = useComponents();
+  // Canonical state projection (Issue #206); "/" carries no server-side
+  // items today (no rule targets the Overview route), so this is a cheap,
+  // optional primary item and the static ordered list below is always the
+  // deterministic fallback (Issue #212).
+  const { data: systemState } = useSystemState();
+  const primaryOverviewItem = systemState?.page_items["/"]?.[0] ?? null;
 
   const system = systems.find((s) => s.id === systemId);
   const totalTraces = components?.reduce((s, c) => s + c.trace_count, 0) ?? 0;
@@ -69,9 +87,28 @@ export default function OverviewPage() {
               {[1, 2, 3].map((i) => <Skeleton key={i} className="h-12 w-full" />)}
             </div>
           ) : !components?.length ? (
-            <p className="text-sm text-muted-foreground py-4 text-center">
-              No components registered yet. Connect the SDK to start tracing.
-            </p>
+            <div className="space-y-4 py-4" data-testid="overview-get-started">
+              {primaryOverviewItem && (
+                <SystemStateBanner item={primaryOverviewItem} testId="overview-primary-item" />
+              )}
+              <p className="text-sm text-muted-foreground text-center">
+                No components registered yet. Connect the SDK to start tracing.
+              </p>
+              <ol className="mx-auto max-w-sm space-y-2 text-sm">
+                {GET_STARTED_STEPS.map(({ to, label, icon: Icon, testId }) => (
+                  <li key={to}>
+                    <Link
+                      to={to}
+                      data-testid={testId}
+                      className="flex items-center gap-2 rounded-md border px-3 py-2 text-primary hover:bg-accent hover:underline"
+                    >
+                      <Icon className="h-4 w-4 shrink-0" />
+                      <span>{label}</span>
+                    </Link>
+                  </li>
+                ))}
+              </ol>
+            </div>
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
