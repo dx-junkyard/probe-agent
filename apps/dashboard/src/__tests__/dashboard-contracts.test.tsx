@@ -4374,6 +4374,57 @@ describe("System settings diagnostics", () => {
     expect(screen.queryByTestId("diagnostics-badge-count")).toBeNull();
   });
 
+  test("canonical StateItem keeps the same snapshot target in the badge and page banner", async () => {
+    window.history.pushState({}, "", "/system-understanding");
+    const snapshotState = {
+      state_id: "repository.snapshot.stale",
+      state_group: "repository",
+      severity: "warning" as const,
+      status: "stale",
+      user_action_kind: "create_snapshot",
+      intervention_timing: "now",
+      subject: "Repository snapshot",
+      summary: "HEAD が最新 snapshot より進んでいます。",
+      detail: "現在の HEAD に対応する ready snapshot がありません。",
+      impact: "理解結果が古い可能性があります。",
+      remediation: "Repository で新しい snapshot を作成してください。",
+      evidence: {},
+      target_ui: { route: "/repository", anchor: "snapshot-create", action_label: "Snapshot を作成" },
+      related_checks: ["snapshot_status"],
+      related_pipeline_steps: ["snapshot_ready"],
+      source: "system_state",
+      dedupe_key: "repository.snapshot.freshness",
+      scope: "global",
+      decision_method: "deterministic" as const,
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "warning",
+        severity_counts: { warning: 1 }, items: [snapshotState], primary_item: snapshotState,
+        notification_items: [snapshotState], page_items: { "/system-understanding": [snapshotState] },
+      });
+      return Promise.resolve(null);
+    });
+
+    const { DiagnosticsBadge } = await import("@/components/diagnostics-badge");
+    const { SystemStateBanner } = await import("@/components/system-state");
+    render(<><DiagnosticsBadge /><SystemStateBanner item={snapshotState} /></>, { wrapper: createWrapper() });
+
+    const bannerCta = await screen.findByTestId("system-state-action-repository.snapshot.stale");
+    expect(bannerCta.textContent).toBe("Snapshot を作成");
+    fireEvent.click(bannerCta);
+    await waitFor(() => expect(window.location.pathname).toBe("/repository"));
+    expect(new URLSearchParams(window.location.search).get("fix")).toBe("snapshot-create");
+
+    window.history.pushState({}, "", "/system-understanding");
+    fireEvent.click(screen.getByTestId("diagnostics-badge"));
+    const badgeItem = await screen.findByTestId("system-state-item-repository.snapshot.stale");
+    const badgeCta = within(badgeItem).getByRole("button", { name: "Snapshot を作成" });
+    fireEvent.click(badgeCta);
+    await waitFor(() => expect(window.location.pathname).toBe("/repository"));
+    expect(new URLSearchParams(window.location.search).get("fix")).toBe("snapshot-create");
+  });
+
   test("System Understanding pipeline rows link missing/blocked steps to diagnostics", async () => {
     const suResponse = {
       system_id: 1,

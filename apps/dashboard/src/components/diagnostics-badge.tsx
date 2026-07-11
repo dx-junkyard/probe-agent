@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
-import { useSystemDiagnostics } from "@/api/hooks";
+import { useSystemDiagnostics, useSystemState } from "@/api/hooks";
+import { useNavigate } from "react-router-dom";
 import { useDiagnosticActivate } from "@/components/diagnostic-fix";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -8,6 +9,7 @@ import {
   AlertTriangle, Ban, CheckCircle2, ChevronRight, HelpCircle, ShieldAlert, XCircle,
 } from "lucide-react";
 import type { DiagnosticSeverity, SystemDiagnosticCheck } from "@/api/types";
+import { systemStateTarget } from "@/components/system-state";
 
 const SEVERITY_ORDER: DiagnosticSeverity[] = ["error", "blocked", "warning", "unknown", "ok"];
 
@@ -320,8 +322,59 @@ export function DiagnosticsDialogContent({ checks, onActivate }: {
 
 export function DiagnosticsBadge() {
   const { data } = useSystemDiagnostics();
+  const { data: systemState } = useSystemState();
   const [open, setOpen] = useState(false);
   const { activate, envCheck, closeEnv } = useDiagnosticActivate();
+  const navigate = useNavigate();
+
+  // system-state is the canonical projection. Keep the legacy endpoint as a
+  // fallback while older control servers are being rolled out.
+  if (systemState) {
+    const items = Array.from(
+      new Map(
+        systemState.items
+          .filter((item) => item.severity !== "ok")
+          .map((item) => [item.dedupe_key || item.state_id, item]),
+      ).values(),
+    );
+    const errorCount = items.filter((item) => item.severity === "error" || item.severity === "blocked").length;
+    const warningCount = items.filter((item) => item.severity === "warning").length;
+    const attention = items.length;
+
+    return (
+      <>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => setOpen(true)}
+          title="System state"
+          data-testid="diagnostics-badge"
+          className="relative gap-1.5"
+        >
+          <ShieldAlert className={`h-4 w-4 ${errorCount > 0 ? "text-red-600" : warningCount > 0 ? "text-yellow-600" : "text-muted-foreground"}`} />
+          {attention > 0 && <span data-testid="diagnostics-badge-count" className={`text-xs font-semibold ${errorCount > 0 ? "text-red-600" : "text-yellow-600"}`}>{attention}</span>}
+        </Button>
+        <Dialog open={open} onOpenChange={setOpen}>
+          <DialogHeader><DialogTitle>System State</DialogTitle></DialogHeader>
+          <div className="space-y-3">
+            {items.length === 0 ? <p className="text-sm text-muted-foreground">対応が必要な状態はありません。</p> : items.map((item) => (
+              <div key={item.dedupe_key || item.state_id} className="flex items-start justify-between gap-3 rounded-lg border p-3" data-testid={`system-state-item-${item.state_id}`}>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2"><DiagnosticSeverityIcon severity={item.severity} /><p className="text-sm font-medium">{item.summary}</p></div>
+                  {item.remediation && <p className="mt-1 text-xs text-muted-foreground">{item.remediation}</p>}
+                </div>
+                {item.target_ui && <Button size="sm" onClick={() => {
+                  const target = systemStateTarget(item);
+                  setOpen(false);
+                  if (target) navigate(target);
+                }}>{item.target_ui.action_label || "対応する"}</Button>}
+              </div>
+            ))}
+          </div>
+        </Dialog>
+      </>
+    );
+  }
 
   if (!data) return null;
 

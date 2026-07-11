@@ -2,7 +2,7 @@ import { useState } from "react";
 import {
   useRepositoryCandidates, useRepositoryConfig, useUpdateRepositoryConfig,
   useSnapshots, useLatestSnapshot, useCreateSnapshot, useSymbols, useIndexSymbols,
-  useApiScanResult, useRunApiScan, useRepositoryStatus,
+  useApiScanResult, useRunApiScan, useRepositoryStatus, useSystemState,
 } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
 import {
@@ -20,6 +20,7 @@ import { toast } from "sonner";
 import { formatTimestamp, formatBytes } from "@/lib/utils";
 import { GitCommit, FolderTree, Code2, RefreshCw, AlertTriangle, ScanSearch, Sparkles, GitBranch, CheckCircle2 } from "lucide-react";
 import type { RepositoryCandidateOut, RepositoryConfigOut } from "@/api/types";
+import { SystemStateBanner } from "@/components/system-state";
 
 function patternsToText(patterns: string[] | undefined): string {
   return (patterns ?? []).join("\n");
@@ -39,6 +40,8 @@ export default function RepositoryPage() {
   const createSnapshot = useCreateSnapshot();
   const { data: symbolIndex, isLoading: symLoading } = useSymbols();
   const indexSymbols = useIndexSymbols();
+  const { data: systemState } = useSystemState();
+  const pageItem = systemState?.page_items["/repository"]?.[0] ?? systemState?.primary_item;
 
   const configKey = systemId != null ? `${systemId}-${config?.repo_path ?? ""}` : "empty";
 
@@ -71,6 +74,13 @@ export default function RepositoryPage() {
   return (
     <div className="space-y-6">
       <h1 className="text-2xl font-bold tracking-tight">Repository</h1>
+
+      <SystemStateBanner
+        item={pageItem}
+        onAction={pageItem?.user_action_kind === "create_snapshot" ? () =>
+          createSnapshot.mutateAsync().then(() => setTab("snapshots")).catch(e => toast.error(String(e))) : undefined}
+        disabled={pageItem?.user_action_kind === "create_snapshot" && createSnapshot.isPending}
+      />
 
       <RepositoryRefreshHub
         onCreateSnapshot={() =>

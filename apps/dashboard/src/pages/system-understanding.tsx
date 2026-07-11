@@ -6,6 +6,7 @@ import {
   useBuildSystemUnderstanding,
   useLatestSystemUnderstandingBuild,
   useSystemDiagnostics,
+  useSystemState,
   sysKey,
 } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
@@ -15,6 +16,7 @@ import { Button, buttonVariants } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useDiagnosticHighlight, DiagnosticFixCallout } from "@/components/diagnostic-fix";
 import { cn } from "@/lib/utils";
+import { SystemStateBanner } from "@/components/system-state";
 import {
   RefreshCw, Boxes, Target,
 } from "lucide-react";
@@ -469,6 +471,7 @@ function DataView({ data, checksByStep, onRunBuild, buildDisabled }: {
 export default function SystemUnderstandingPage() {
   const { data, isLoading, error } = useSystemUnderstanding();
   const { data: diagnostics } = useSystemDiagnostics();
+  const { data: systemState } = useSystemState();
   const build = useBuildSystemUnderstanding();
   const { data: latestBuild } = useLatestSystemUnderstandingBuild();
   const qc = useQueryClient();
@@ -476,6 +479,7 @@ export default function SystemUnderstandingPage() {
 
   const buildRunning = latestBuild?.status === "queued" || latestBuild?.status === "running";
   const buildHighlight = useDiagnosticHighlight<HTMLButtonElement>("build");
+  const pageItem = systemState?.page_items["/system-understanding"]?.[0] ?? systemState?.primary_item;
 
   // Refresh the aggregated view and diagnostics once a build job settles.
   useEffect(() => {
@@ -530,6 +534,12 @@ export default function SystemUnderstandingPage() {
           )}
         </Button>
       </div>
+
+      <SystemStateBanner
+        item={pageItem}
+        onAction={pageItem?.user_action_kind === "build" ? () => build.mutate() : undefined}
+        disabled={pageItem?.user_action_kind === "build" && (build.isPending || buildRunning)}
+      />
 
       {/* Issue #203: the improvement-loop banner — a materialized Interview
           change is newer than the latest completed build, so the current

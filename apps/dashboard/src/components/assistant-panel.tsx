@@ -187,7 +187,7 @@ export function AssistantPanel({ snapshotNotice, onSnapshotNoticeClick }: Assist
             type="button"
             onClick={onSnapshotNoticeClick}
             className="relative max-w-[min(18rem,calc(100vw-5.5rem))] rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-left text-xs font-medium text-amber-900 shadow-lg transition-colors hover:bg-amber-100 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100 dark:hover:bg-amber-900"
-            title="画面先頭の snapshot 注意書きへ移動"
+            title="対応する画面へ移動"
             data-testid="assistant-snapshot-notice"
           >
             {snapshotNotice}
