@@ -289,6 +289,55 @@ heuristic result.
 - Role changes must not demote the last active admin (409).
 - Revoked/expired/inactive tokens return 401.
 
+## Probe Pattern lifecycle (issue #168)
+
+- Routes live in `routes/probe_patterns.py`; core logic in
+  `instrumentation_remover.py` (removal patches) and `pattern_reconciler.py`
+  (classification). Tables: `probe_patterns`, `probe_pattern_points`,
+  `probe_pattern_events`, `probe_pattern_reconciliations`,
+  `probe_pattern_reconcile_points`, `probe_removal_patches` — all
+  system-scoped.
+- `GET /repository/probe-instrumentation` is a deterministic scan of the
+  latest indexed snapshot for `@probe`-decorated symbols (decorator presence
+  from `code_symbols` is a structural fact). Each hit links back to its
+  probe plan point and patterns so removal keeps its context.
+- Saving a pattern captures structural facts from the pinned snapshot:
+  extracted signature, `symbol_source_hash` / `symbol_body_hash`, docstring,
+  line range, and the source commit. These make later `exact_match` /
+  `changed_signature` reconcile decisions deterministic.
+- Removal patches mirror instrumentation patches: generated in an isolated
+  worktree, reviewable diff, applied only via the explicit
+  commit-sha-confirmed endpoint against a clean tree. A successful apply
+  marks the covered points `removed_from_production`.
+- Reconciliation classification splits per Principle 6. Deterministic:
+  `exact_match` (same path+symbol, same extracted signature),
+  `changed_signature` (same path+symbol, different signature), `unsafe`
+  (denylist), and verbatim relocation (identical body hash at exactly one
+  new location → `moved_match`). Everything else (`moved_match`,
+  `split_or_merged`, `missing`, non-verbatim renames) requires the reasoning
+  model with candidate retrieval as hints only; LLM failure fails the run
+  (`pattern_reconcile` intelligence run) while deterministic points stay
+  persisted. Never fall back to heuristics.
+- LLM reconcile output is strictly validated: classifications from the
+  finite set only, targets must be indexed symbols, evidence must reference
+  snapshot paths, and denylist hits on resolved targets override to
+  `unsafe`.
+- Reconcile decisions are per-point manual records
+  (`accepted` / `rejected`); `unsafe` and `missing` can never be accepted.
+  The "I don't know" flow calls `POST
+  /pattern-reconcile-points/{id}/investigate` (run_type
+  `pattern_investigate`), which reads bounded excerpts from the pinned
+  snapshot only.
+- `create-plan` converts a completed latest reconciliation into a normal
+  probe plan (origin `probe_pattern`, run_type `probe_plan_from_pattern`,
+  decision_method `manual`): exact matches automatically, non-exact points
+  only when accepted. Re-attachment then reuses the existing plan → approve
+  → patch → validate → apply gates; never add a shortcut apply path.
+- Pattern status is a finite set (`active` / `stale` / `archived` /
+  `superseded`): a completed reconcile sets `active` (all exact) or `stale`
+  (any non-exact); archive/restore are manual. Lifecycle events are
+  append-only rows in `probe_pattern_events`.
+
 ## Rules
 
 - Validate incoming payloads.

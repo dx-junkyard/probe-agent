@@ -3,7 +3,7 @@ import {
   LayoutDashboard, GitBranch, Map, Crosshair, FlaskConical,
   Plug, Sparkles, Boxes, Settings, Users, ChevronLeft, ChevronRight, MessageSquare,
   Workflow, Network, MessageSquareText, Brain, GitFork, Filter,
-  LifeBuoy,
+  LifeBuoy, BookMarked,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/api/auth";
@@ -37,6 +37,7 @@ const NAV_GROUPS: NavGroup[] = [
       { to: "/trace-lineage", icon: GitFork, label: "Trace Lineage" },
       { to: "/trace-analyzers", icon: Filter, label: "Trace Analyzers" },
       { to: "/probe-planner", icon: Crosshair, label: "Probe Planner" },
+      { to: "/probe-patterns", icon: BookMarked, label: "Probe Patterns" },
       { to: "/experiments", icon: FlaskConical, label: "Experiments" },
     ],
   },

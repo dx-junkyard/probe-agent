@@ -37,6 +37,9 @@ import type {
   AssistantScreenContext, AssistantAskRequest, AssistantAskOut,
   AssistantSettingsMetadataOut,
   ConnectivityStatusOut,
+  InstrumentationScanOut, ProbePatternsListOut, ProbePatternOut,
+  ProbePatternCreateRequest, ProbePatternReconciliationOut,
+  ProbeRemovalPatchOut, ReconcilePointOut,
 } from "./types";
 
 export function sysKey(base: string, ...extra: unknown[]) {
@@ -1297,4 +1300,154 @@ export function useLogin() {
 
 export function useLogout() {
   return useMutation({ mutationFn: () => api.post("/auth/logout") });
+}
+
+// ── Probe Pattern lifecycle (Issue #168) ────────────────────────────
+
+export function useInstrumentationScan(enabled: boolean) {
+  return useQuery({
+    queryKey: sysKey("probeInstrumentation"),
+    queryFn: () => api.get<InstrumentationScanOut>("/repository/probe-instrumentation"),
+    enabled: enabled && !!getSystemId(),
+    retry: false,
+  });
+}
+
+export function useProbePatterns() {
+  return useQuery({
+    queryKey: sysKey("probePatterns"),
+    queryFn: () => api.get<ProbePatternsListOut>("/repository/probe-patterns"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useProbePattern(patternId: number | null) {
+  return useQuery({
+    queryKey: sysKey("probePattern", patternId),
+    queryFn: () => api.get<ProbePatternOut>(`/repository/probe-patterns/${patternId}`),
+    enabled: patternId !== null && !!getSystemId(),
+  });
+}
+
+function invalidatePatterns(qc: ReturnType<typeof useQueryClient>) {
+  qc.invalidateQueries({ queryKey: sysKey("probePatterns") });
+  qc.invalidateQueries({ queryKey: [ "probePattern" ], exact: false });
+  qc.invalidateQueries({ queryKey: sysKey("probeInstrumentation") });
+}
+
+export function useCreateProbePattern() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: ProbePatternCreateRequest) =>
+      api.post<ProbePatternOut>("/repository/probe-patterns", data),
+    onSuccess: () => invalidatePatterns(qc),
+  });
+}
+
+export function useUpdateProbePattern() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ patternId, ...data }: {
+      patternId: number;
+      name?: string;
+      feature_id?: string;
+      capability?: string;
+      objective?: string;
+      description?: string;
+      status?: "active" | "archived";
+    }) => api.patch<ProbePatternOut>(`/repository/probe-patterns/${patternId}`, data),
+    onSuccess: () => invalidatePatterns(qc),
+  });
+}
+
+export function useReconcileProbePattern() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (patternId: number) =>
+      api.post<ProbePatternReconciliationOut>(
+        `/repository/probe-patterns/${patternId}/reconcile`,
+      ),
+    onSuccess: () => invalidatePatterns(qc),
+  });
+}
+
+export function useReconcilePointDecision() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ pointId, decision }: { pointId: number; decision: "accepted" | "rejected" }) =>
+      api.put<ReconcilePointOut>(
+        `/repository/pattern-reconcile-points/${pointId}/decision`,
+        { decision },
+      ),
+    onSuccess: () => invalidatePatterns(qc),
+  });
+}
+
+export function useInvestigateReconcilePoint() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (pointId: number) =>
+      api.post<ReconcilePointOut>(
+        `/repository/pattern-reconcile-points/${pointId}/investigate`,
+      ),
+    onSuccess: () => invalidatePatterns(qc),
+  });
+}
+
+export function usePatternRemovalPatches(patternId: number | null) {
+  return useQuery({
+    queryKey: sysKey("patternRemovalPatches", patternId),
+    queryFn: () => api.get<ProbeRemovalPatchOut[]>(
+      `/repository/probe-patterns/${patternId}/removal-patches`,
+    ),
+    enabled: patternId !== null && !!getSystemId(),
+  });
+}
+
+export function useGenerateRemovalPatch() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ patternId, pointIds }: { patternId: number; pointIds?: number[] }) =>
+      api.post<ProbeRemovalPatchOut>(
+        `/repository/probe-patterns/${patternId}/removal-patches`,
+        pointIds ? { point_ids: pointIds } : {},
+      ),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: sysKey("patternRemovalPatches", vars.patternId) });
+      invalidatePatterns(qc);
+    },
+  });
+}
+
+export function useApplyRemovalPatch() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ patchId, expectedCommitSha }: { patchId: number; expectedCommitSha: string }) =>
+      api.post<ProbeRemovalPatchOut>(
+        `/repository/probe-removal-patches/${patchId}/apply`,
+        { confirmed: true, expected_commit_sha: expectedCommitSha },
+      ),
+    onSuccess: () => {
+      invalidatePatterns(qc);
+    },
+  });
+}
+
+export function useCreatePlanFromReconciliation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ patternId, reconciliationId, objective }: {
+      patternId: number;
+      reconciliationId: number;
+      objective?: string;
+    }) =>
+      api.post<ProbePlanOut>(
+        `/repository/probe-patterns/${patternId}/reconciliations/${reconciliationId}/create-plan`,
+        objective ? { objective } : {},
+      ),
+    onSuccess: () => {
+      invalidatePatterns(qc);
+      qc.invalidateQueries({ queryKey: sysKey("probePlans") });
+    },
+  });
 }
