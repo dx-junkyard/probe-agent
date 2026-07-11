@@ -206,6 +206,26 @@ Capability Map の detail panel は
 `failed` の間も、context API は latest ready snapshot を基準にして、gaps /
 probe plans / experiments を同じ分析文脈で返す。
 
+## 状態通知の構成（現状 2 系統と統合方針）
+
+ユーザー向けの「次の一歩」表示は現在 2 系統が併存する（Issue #215 調査、
+`docs/ux-gap-analysis-system-understanding.md` §2.4）。
+
+1. `system_understanding_service._derive_primary_action` →
+   `GET /system-understanding` の `primary_action` → Hub の
+   `PrimaryActionCard`（本ドキュメント「Primary Action (Issue #201)」節）
+2. `system_state.build_system_state` / `select_primary_item` →
+   `GET /system-state` の `primary_item` / `page_items` →
+   `SystemStateBanner` とヘッダーの `DiagnosticsBadge`
+
+前者は現 snapshot のみを参照し、後者は Interview baseline の snapshot
+跨ぎ再利用に対応するなど、判定材料が完全には一致しない。統合（前者を
+後者へ吸収し、Hub の表示も canonical `StateItem` から投影する）は
+Issue #206 / #207 が所有する。それまでの間、両系統の判定条件を変える
+変更は必ず両方（`system_understanding_service` / `system_state` /
+`system_diagnostics`）へ同時に適用する（Issue #210 の
+capability_hierarchy 0 件 warning が先例）。
+
 ## Next Actions
 
 System Understanding の Next Actions は 4 stage に分類される。
