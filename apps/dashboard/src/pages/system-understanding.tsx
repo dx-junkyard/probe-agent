@@ -545,8 +545,12 @@ export default function SystemUnderstandingPage() {
           change is newer than the latest completed build, so the current
           understanding no longer reflects it. Hidden while a build is
           actively running (the BuildJobPanel already shows progress, and a
-          fresh build is about to make this stale anyway). */}
-      {data?.understanding_refresh_recommended && !buildRunning && (
+          fresh build is about to make this stale anyway). Also hidden when
+          the canonical SystemStateBanner above is already showing this same
+          root cause (Issue #206-208 review): the canonical banner wins so
+          the same cause is never duplicated. */}
+      {data?.understanding_refresh_recommended && !buildRunning &&
+        pageItem?.state_id !== "interview.materialized.rebuild_required" && (
         <Card data-testid="refresh-recommended-banner">
           <CardContent className="py-4 flex items-center justify-between gap-4 flex-wrap">
             <div>

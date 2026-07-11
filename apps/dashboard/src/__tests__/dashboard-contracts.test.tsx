@@ -3930,6 +3930,75 @@ describe("System Understanding page", () => {
     expect(screen.queryByTestId("refresh-recommended-banner")).toBeNull();
   });
 
+  // ── Canonical banner de-duplication (Issues #206-#208 review) ───────
+
+  test("suppresses the legacy refresh-recommended banner when the canonical SystemStateBanner shows the same rebuild-required cause", async () => {
+    const response = { ...completeResponse, understanding_refresh_recommended: true };
+    const rebuildItem: SystemStateItem = {
+      state_id: "interview.materialized.rebuild_required",
+      state_group: "interview",
+      severity: "warning",
+      status: "rebuild_required",
+      user_action_kind: "build",
+      intervention_timing: "now",
+      subject: "System Understanding",
+      summary: "Interview 反映後の再 build が必要です。",
+      detail: "Materialized interview changes are newer than the latest completed build.",
+      impact: "現在の理解には確定済みの Interview の変更が反映されていません。",
+      remediation: "Build / Refresh を実行してください。",
+      evidence: {},
+      target_ui: { route: "/system-understanding", anchor: "build", action_label: "Build / Refresh" },
+      related_checks: [],
+      related_pipeline_steps: [],
+      source: "system_state",
+      dedupe_key: "interview.materialized.rebuild_required",
+      scope: "global",
+      decision_method: "deterministic",
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(response);
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "warning",
+        severity_counts: { warning: 1 }, items: [rebuildItem], primary_item: rebuildItem,
+        notification_items: [rebuildItem], page_items: { "/system-understanding": [rebuildItem] },
+      });
+      return Promise.resolve(null);
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    // The canonical banner renders the same root cause...
+    await waitFor(() => {
+      expect(screen.getByTestId("system-state-banner")).toBeTruthy();
+    });
+    expect(screen.getByTestId("system-state-banner").textContent).toContain(rebuildItem.summary);
+
+    // ...and the legacy Issue #203 banner is suppressed so the cause is not duplicated.
+    expect(screen.queryByTestId("refresh-recommended-banner")).toBeNull();
+  });
+
+  test("still shows the legacy refresh-recommended banner when system-state has no matching rebuild-required item for this page", async () => {
+    const response = { ...completeResponse, understanding_refresh_recommended: true };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(response);
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "ok",
+        severity_counts: {}, items: [], primary_item: null,
+        notification_items: [], page_items: {},
+      });
+      return Promise.resolve(null);
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("refresh-recommended-banner")).toBeTruthy();
+    });
+    expect(screen.queryByTestId("system-state-banner")).toBeNull();
+  });
+
   test("renders gap_trend increase/decrease chips in the gap worklist", async () => {
     const response = {
       ...gapWorklistResponse,
@@ -4424,6 +4493,81 @@ describe("System settings diagnostics", () => {
     fireEvent.click(badgeCta);
     await waitFor(() => expect(window.location.pathname).toBe("/repository"));
     expect(new URLSearchParams(window.location.search).get("fix")).toBe("snapshot-create");
+  });
+
+  test("system-state items projected from a dialog-kind diagnostic (no target_ui) still open the env fix dialog", async () => {
+    window.history.pushState({}, "", "/");
+    const repositoryRootsCheck = {
+      check_id: "repository_roots",
+      category: "repository",
+      title: "Repository root allowlist",
+      severity: "error" as const,
+      detail: "PROBE_REPOSITORY_ROOTS is empty.",
+      impact: "No repository can be registered until an allowlisted root is configured.",
+      remediation: "Set PROBE_REPOSITORY_ROOTS to the allowed repository parent directories.",
+      related_env: ["PROBE_REPOSITORY_ROOTS"],
+      related_paths: [],
+      related_pages: [],
+      related_pipeline_steps: [],
+      last_observed_error: null,
+      decision_method: "deterministic" as const,
+      fix_kind: "dialog" as const,
+      fix_page: null,
+      fix_anchor: null,
+    };
+    // Projected from system_diagnostics: dialog-kind checks have no fix_page,
+    // so the server sets target_ui to null (Issue #206-208 review, Defect A).
+    const diagnosticItem: SystemStateItem = {
+      state_id: "diagnostic.repository_roots",
+      state_group: "repository",
+      severity: "error",
+      status: "error",
+      user_action_kind: "configure_env",
+      intervention_timing: "now",
+      subject: "Repository root allowlist",
+      summary: "PROBE_REPOSITORY_ROOTS is empty.",
+      detail: "PROBE_REPOSITORY_ROOTS is empty.",
+      impact: "No repository can be registered until an allowlisted root is configured.",
+      remediation: "Set PROBE_REPOSITORY_ROOTS to the allowed repository parent directories.",
+      evidence: {},
+      target_ui: null,
+      related_checks: ["repository_roots"],
+      related_pipeline_steps: [],
+      source: "system_diagnostics",
+      dedupe_key: "diagnostic.repository_roots",
+      scope: "global",
+      decision_method: "deterministic",
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "error",
+        severity_counts: { error: 1 }, items: [diagnosticItem], primary_item: diagnosticItem,
+        notification_items: [diagnosticItem], page_items: {},
+      });
+      if (path === "/system-diagnostics") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "error",
+        severity_counts: { ok: 0, warning: 0, error: 1, blocked: 0, unknown: 0 },
+        checks: [repositoryRootsCheck],
+      });
+      return Promise.resolve(null);
+    });
+
+    const { DiagnosticsBadge } = await import("@/components/diagnostics-badge");
+    render(<DiagnosticsBadge />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByTestId("diagnostics-badge"));
+    const badgeItem = await screen.findByTestId("system-state-item-diagnostic.repository_roots");
+
+    // No navigable target_ui, but a 修正する action derived from the related check.
+    const fixButton = within(badgeItem).getByRole("button", { name: "修正する" });
+    fireEvent.click(fixButton);
+
+    const envDialog = await screen.findByTestId("diagnostic-env-dialog");
+    expect(envDialog.textContent).toContain("PROBE_REPOSITORY_ROOTS");
+    expect(envDialog.textContent).toContain("Repository root allowlist");
+    // Did not navigate away, and the list dialog closed so the modals don't stack.
+    expect(window.location.pathname).toBe("/");
+    expect(screen.queryByText("System State")).toBeNull();
   });
 
   test("System Understanding pipeline rows link missing/blocked steps to diagnostics", async () => {
