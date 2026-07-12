@@ -284,8 +284,9 @@ def _check_capability_hierarchy_ready(conn, system_id: int, snapshot_id: Optiona
                     detail=(
                         "Capability hierarchy run completed but produced no capabilities. "
                         "This happens when no `probe-agent:` docstring metadata was found in "
-                        "the target repository. Use Interview or add source metadata, then "
-                        "re-run Build / Refresh."
+                        "the target repository. Review and approve Interview proposals, generate "
+                        "the review patch, apply it to the target repository, create a new snapshot, "
+                        "then run Build / Refresh."
                     ),
                 )
             return PipelineStep("capability_hierarchy_ready", "complete")

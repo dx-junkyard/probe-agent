@@ -41,6 +41,8 @@ from .settings_metadata import SETTINGS_BY_KEY, SettingMetadata
 from .system_diagnostics import DiagnosticCheck, SystemDiagnosticsReport
 from .system_state import StateItem
 
+from probe_agent import probe
+
 PROMPT_VERSION = "v1"
 SCHEMA_VERSION = "v1"
 
@@ -479,7 +481,19 @@ CHECK_OPERATIONS: Dict[str, tuple] = {
 }
 
 
+@probe(component_id="get_screen_context")
 def get_screen_context(screen_id: str) -> Optional[ScreenContext]:
+    """
+    probe-agent:
+      role: 画面単位の文脈を返す導線分岐の起点
+      capability: system understanding／assistant 導線の画面別コンテキスト解決
+      system_purpose: 利用者の現在位置に応じて適切な理解支援情報を出し分ける
+      probe_value: "system understanding と system-state など複数画面系統の責務境界を、画面文脈の分岐で比較しやすい"
+      element_type: element
+      operation_kind: read
+      consumers: [build_context_pack, assistant 画面別導線]
+      state_effects: [none]
+    """
     return SCREENS_BY_ID.get(screen_id)
 
 
@@ -495,10 +509,22 @@ def checks_for_screen(
     ]
 
 
+@probe(component_id="suggested_questions")
 def suggested_questions(
     ctx: ScreenContext, screen_checks: List[DiagnosticCheck]
 ) -> List[Dict[str, str]]:
-    """Failing-check questions first (Issue #102 UI requirement), then static ones."""
+    """Failing-check questions first (Issue #102 UI requirement), then static ones.
+
+    probe-agent:
+      role: 画面や状態に応じた推奨質問候補を生成する導線補助ロジック
+      capability: system understanding／assistant 導線のナビゲーション
+      system_purpose: 利用者が次に何を確認すべきかを明示し、システム理解フローを前進させる
+      probe_value: 『next step』相当の誘導ロジックが assistant 側にどの程度寄っているかを確認できる
+      element_type: capability
+      operation_kind: analysis
+      consumers: [利用者向け assistant UI または関連API]
+      state_effects: [none]
+    """
     questions: List[Dict[str, str]] = []
     for check in screen_checks:
         if check.severity in ("error", "blocked", "warning"):
@@ -657,6 +683,7 @@ class ContextPack:
         return payload
 
 
+@probe(component_id="build_context_pack")
 def build_context_pack(
     ctx: ScreenContext,
     question: str,
@@ -665,6 +692,17 @@ def build_context_pack(
     state_items: Optional[List[StateItem]] = None,
     focused_state_id: Optional[str] = None,
 ) -> ContextPack:
+    """
+    probe-agent:
+      role: 画面文脈や許可された引用集合をLLM向けのコンテキストパックへ組み立てる中核ロジック
+      capability: system understanding／assistant 導線の文脈構築
+      system_purpose: システム理解のドッグフーディング基盤として、利用者が証拠付きで状況理解できるようにする
+      probe_value: どの入力条件でコンテキスト量や引用許可集合が変わるかを把握でき、理解導線の正本判定や出力品質の差分確認に役立つ
+      element_type: core
+      operation_kind: orchestration
+      consumers: [answer_question, Control Server 配下の system understanding／assistant 導線]
+      state_effects: [none]
+    """
     mentioned_settings = match_settings(question)
     mentioned_checks = match_checks(question, report)
     mentioned_steps = match_pipeline_steps(question)
@@ -1108,6 +1146,7 @@ def _fallback_answer(
 # --- Entry point -------------------------------------------------------------
 
 
+@probe(component_id="answer_question")
 def answer_question(
     ctx: ScreenContext,
     question: str,
@@ -1122,6 +1161,17 @@ def answer_question(
 
     `client` is None when no real provider is usable (mock provider or missing
     API key); the caller decides that so tests can inject fake clients.
+    
+
+    probe-agent:
+      role: 質問応答の最終オーケストレーションを担い、LLM応答またはフォールバック応答を返す入口
+      capability: system understanding／assistant 導線の回答生成
+      system_purpose: 人間が実測や証拠を見て判断できるよう、理解結果を対話形式で提示する
+      probe_value: 利用者向け理解導線の実際の入口として、文脈構築・回答生成・フォールバック分岐のどこが主経路かを観測できる
+      element_type: boundary
+      operation_kind: orchestration
+      consumers: [利用者向け assistant 質問応答フロー]
+      state_effects: [external-api]
     """
     pack = build_context_pack(ctx, question, report, visible_check_ids, state_items, focused_state_id)
     if client is None:

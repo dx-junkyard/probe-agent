@@ -32,6 +32,7 @@ def _item_out(item) -> SystemStateItemOut:
         remediation=item.remediation, evidence=item.evidence,
         target_ui=(SystemStateTargetUiOut(route=item.target_ui.route, anchor=item.target_ui.anchor,
                                           action_label=item.target_ui.action_label) if item.target_ui else None),
+        display_routes=item.display_routes,
         related_checks=item.related_checks, related_pipeline_steps=item.related_pipeline_steps,
         source=item.source, dedupe_key=item.dedupe_key, scope=item.scope,
     )

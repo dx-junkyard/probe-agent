@@ -1441,6 +1441,260 @@ probe-agent の認識を同期させることを最優先にする。
 - 完全自動での probe 復元・古い pattern の無条件適用はしない。
 - ユーザー確認なしの対象リポジトリ書き換えはしない(Principle 5/8 維持)。
 
+## GitHub App 公開ワークフロー（Issue #216）
+
+Issue #25 で承認・validate 済みの probe patch を、明示的な人間承認を経て
+実際のリモートリポジトリへ commit / push / Pull Request 作成する経路。
+Principle 5/8 の「対象リポジトリへ直接書き込まない」原則の唯一の例外で、
+GitHub App の短命 Installation Token を使い、常に承認ゲートを通し、常に
+`probe/` 接頭辞のサーバー生成ブランチにのみ push し、force push は一切しない。
+probe-agent は Pull Request を自らマージ・クローズしない。
+
+実装:
+
+- `app/github_app.py` — App-level JWT 署名(RS256)・Installation Access
+  Token の交換・`get_repository` / `create_pull_request` /
+  `list_open_pull_requests_for_branch` / `list_installation_repositories`。
+  token・JWT・private key は一切永続化しない。`_sanitize` が既知の GitHub
+  token 形状(`gh[a-z]_...` / `github_pat_...`)と JWT 形状を正規表現で
+  エラーメッセージから除去してから `GitHubAppError` に載せる。
+  `github_app_configured()` が構成の有無を判定する唯一の場所(fail-closed、
+  Principle 6 の精神)。
+- `app/repo_manager.py` — `GIT_REPOSITORY_ROOT` 配下に connection ごとの
+  managed mirror(bare clone 相当)を保持し、publish job ごとに独立した
+  job worktree を作る/消す。`connection_lock(connection_id)` が同一
+  connection に対するすべての git/publish 操作を直列化する。
+- `app/publish_job.py` + `app/publish_guards.py` — 2 フェーズの publish job
+  状態機械(下記)。`publish_guards` が branch 名生成・push 先検証・commit
+  message/PR 本文の構造化テンプレート・diff 内ファイルパスの安全検証
+  (`.git/`・path traversal・symlink・workflow ファイル・secret 名候補の
+  拒否)・`assert_no_unsafe_push_config` を提供する。
+- ルーティング: `routes/github_connections.py`
+  (`GET /github/app-status`、connection の CRUD + verify/sync、
+  読み取り専用の `GET /github/installations/{installation_id}/repositories`)
+  と `routes/publish_jobs.py`(publish job の作成/一覧/取得/approve/cancel)。
+  認可は他の system-scoped 管理操作と同じ `_require_manage`
+  (admin または System owner のみ)。
+- Dashboard: `pages/github.tsx`(App status・Connections・Publish Jobs の
+  3 セクション。ナビゲーションは Sidebar の「GitHub」)。
+
+### Publish job の状態遷移
+
+2 フェーズ、間に人間承認を挟む一本道の有限状態機械(per-step テーブルは
+持たず `publish_jobs.status` 自体が state)。
+
+```
+prepare（job 作成時に自動開始）:
+  pending → authenticating → fetching → checking_out
+          → applying_patch → validating → awaiting_approval
+
+publish（明示的な approve 呼び出しでのみ開始）:
+  awaiting_approval → committing → pushing → creating_pr → completed
+
+どちらのフェーズでも失敗時・cancel 時: failed / cancelled
+```
+
+- `create_publish_job` は、connection が `status=connected` かつ
+  `default_branch` を持つこと、patch が failed でなく diff が空でないこと、
+  patch の最新 `validation_runs` で `baseline` と `probed` の両方が
+  `overall_success=true` であることを要求する(Issue #25 の validation
+  ゲートをそのまま再利用。満たさなければ 409)。
+- prepare フェーズは `fetching` で一度、publish フェーズは `pushing` の
+  直前でもう一度、リモート `base_branch` の SHA を解決し、patch が
+  ピン留めした commit SHA と比較する。一致しなければ stale patch として
+  fail closed(自動 rebase はしない。新しい snapshot からの再生成・
+  再 validate を促すエラーメッセージを返す)。
+- push 先ブランチは常に `publish_guards.generate_branch_name` が生成する
+  `probe/` 接頭辞のブランチで、`validate_push_target` が base/default
+  ブランチと一致しないことを検証する。push は
+  `git push origin HEAD:refs/heads/<branch>` の明示 refspec のみで、
+  `--force` は使わない。
+- commit 時は patch diff に含まれるファイルパスのみを構造検証してから
+  `git add` する(diff 外ファイル・`.git/`・secret 名候補・symlink・
+  path traversal を拒否。workflow ファイルは既定で拒否、
+  `GIT_ALLOW_WORKFLOW_CHANGES=true` の時のみ許可)。
+- Installation Token は各フェーズ内でその都度発行し、ローカル変数にのみ
+  保持する。`publish_jobs` テーブルにも `error` にも一切書き込まれない
+  (`github_app._sanitize` を経由してから persist)。
+- **Installation allowlist (Issue #222)**: GitHub App は単一 Organization
+  所有の private App とし、admin が GitHub API から取得した account
+  login/type を `GITHUB_APP_ALLOWED_ORGANIZATION` と照合して Installation を
+  登録する。登録済みかつ active で、対象 System への明示割当がある場合だけ
+  token を発行できる。この割当は repository 一覧・connection 作成・verify・sync・
+  publish のそれぞれで再検証する。
+- 完了・失敗・cancel のいずれの終端状態でも job worktree を cleanup し、
+  `cleanup_state` / `cleanup_error` を記録する。
+- PR 作成はべき等: 同じブランチに対して open な PR が既にあれば
+  再利用し、重複 PR を作らない。
+
+### 安全境界のまとめ
+
+- **承認ゲート**: `awaiting_approval` から先へは `POST
+  /github/publish-jobs/{id}/approve` の明示呼び出しでしか進まない。
+  Dashboard はこの承認の前に publish 先(owner/repo・base branch・
+  base commit SHA・生成される branch 名)と patch diff を必ず表示する。
+- **`probe/` ブランチ強制・force push 不可**: 上記のとおり
+  `publish_guards` が構造的に強制する。
+- **stale fail-closed**: prepare・publish の両方でリモート base branch の
+  SHA を再確認し、ずれていれば失敗させる。自動リベースは実装しない。
+- **token 非永続**: Installation Token・App JWT・private key はいかなる
+  テーブル・ログ・API レスポンスにも現れない。`GithubConnectionOut` /
+  `PublishJobOut` はどちらも token フィールドを持たない。
+- **監査**: `requested_by_user_id` / `approved_by_user_id` /
+  `created_at` / `approved_at` / `completed_at` / `heartbeat_at` /
+  `validation_summary` / sanitized `error` を `publish_jobs` に永続化する。
+- **Issue #25 ゲートとの関係**: publish job は Issue #25 が生成・
+  validate した `probe_patches` / `validation_runs` をそのまま参照するだけで、
+  独自の instrumentation や patch 生成経路は持たない。probe-agent は
+  常に Pull Request を作るところで止まり、マージ・クローズは開発者が
+  GitHub 上で行う。
+
+### 非目標(Issue #216 のとおり)
+
+- default/base ブランチへの直接 push、force push、承認なしの push はしない。
+- probe-agent 自身による PR のマージ・クローズはしない。
+- Installation Token・private key の永続化はしない。
+
+### Disconnect 時の即時失効(Issue #227)
+
+`DELETE /github/connections/{id}` による明示的な Disconnect は、connection
+を `status='disconnected'` にする soft delete であると同時に、その
+connection に紐づく publish 権限を即座に失効させる。承認済みだが未 push の
+job が Disconnect 後も approve → token 発行 → push まで進めてしまわないよう、
+以下をすべて `routes/github_connections.py::delete_connection` の 1 つの
+トランザクション内で行う:
+
+- 404: connection が存在しない。
+- 409: 既に `disconnected`。
+- 409: この connection の publish job が `committing` / `pushing` /
+  `creating_pr`(in-flight な publish フェーズ)にある場合、push 途中で
+  中断させるのではなく Disconnect 自体を拒否する。
+- それ以外は connection を compare-and-set で `disconnected` にし、同じ
+  connection の `pending` / `authenticating` / `fetching` /
+  `checking_out` / `applying_patch` / `validating` / `awaiting_approval`
+  にある job をすべて `cancelled` にする(`error` は固定文言)。実行中の
+  prepare フェーズスレッドには追加のシグナルを送らない -- `_set_status` が
+  終端状態(`cancelled` を含む)を上書きしないという既存の仕組みだけで、次に
+  スレッドが状態遷移しようとした時点で自然に停止する。
+- worktree の cleanup はトランザクションコミット後にベストエフォートで行う
+  (`publish_job._safe_cleanup_worktree` を再利用。単体 job の cancel と同じ
+  経路)。
+- リモートブランチや既に作成済みの Pull Request は削除・クローズしない。
+  `pr_url` / `branch_name` は job 行に残るので、Dashboard から既存 PR への
+  リンクは Disconnect 後も参照できる。
+
+再検証ポイント(token 発行直前・push 直前に必ず接続状態を見る):
+
+- `approve_publish_job` の UPDATE は
+  `WHERE id = ? AND status = 'awaiting_approval' AND (SELECT status FROM
+  github_connections WHERE id = publish_jobs.connection_id) = 'connected'`
+  という compare-and-set を正としており、承認と Disconnect が競合しても
+  どちらか一方だけが成立する。
+- `_require_publish_installation_assignment` (prepare/publish 両フェーズの
+  token 発行直前に必ず呼ばれる)は installation 割当だけでなく connection の
+  `status='connected'` も再確認する。
+- `_require_connection_still_connected` を prepare/publish 両フェーズの
+  開始時、および publish フェーズの実際の push 直前にも呼び、Disconnect が
+  間に割り込んだケースを fail closed にする。
+
+監査: 新しい追記専用テーブル `publish_audit_events`
+(`app/publish_audit.py::record_publish_audit_event`)に
+`connection_disconnected`(cancelled_job_ids・件数)、job ごとの
+`publish_job_cancelled`(reason)、cleanup 完了後の `publish_job_cleanup`
+(cleanup_state のみ、path は含めない)を記録する。token・path を `detail`
+に書かないのは Principle 5/8 のまま。このテーブルは Issue #226 で
+publish job のステータス遷移一般の記録にもそのまま拡張される想定。
+
+Reconnect は既存どおり「同じ owner/repo で新しい connection 行を作る」で
+実現する(`idx_github_connections_active_unique` が `status != 'disconnected'`
+のみを対象にした部分ユニークインデックスなので、disconnect 済みの行がある
+状態でも新規作成が通る)。`verify` / `sync` / 新規 publish job 作成は
+Disconnect 後の connection に対しては 409 で拒否する。
+
+### Publish job の retry / recovery(Issue #226)
+
+承認後(post-approval)の失敗は、これまで一律で終端 `failed` になり
+worktree も削除されていたため、push 後・PR 作成前にクラッシュすると
+リモートに孤立ブランチだけが残り、同じ job で再開する手段がなかった。
+Issue #226 はこれを、同じ job・同じ(サーバー生成済みの)ブランチのまま
+retry できるようにする。新しい auto-rebase やコンフリクト解消、default
+ブランチへの直接 push、孤立リモートブランチの自動削除は非目標のまま。
+
+**新しい状態**: `retryable_failed` / `reconciling` /
+`manual_intervention_required`。`_TERMINAL_STATUSES` は
+`("completed", "failed", "cancelled")` のまま変えず、この 3 つは「休止/
+作業中」状態として扱う -- 抜けるのは retry・cancel・disconnect の
+compare-and-set のみ。
+
+**承認後の失敗分類**(`_run_publish_phase` / `_run_reconcile_phase` の
+except 節): stale base branch(既存の "Base branch moved..." ケース)と、
+接続が Disconnect された場合(`ConnectionRevokedError` -- reconnect は
+常に新しい connection 行を作るので、同じ `connection_id` は二度と
+`connected` に戻らない)は、そのまま終端 `failed`。それ以外の
+`GitHubAppError` / `RepoManagerError` / push 失敗 / PR 作成失敗 / 想定外
+例外はすべて `retryable_failed` になる。準備フェーズ(prepare)の失敗は
+今までどおり `failed` のまま(まだ何も push していないので reconcile する
+対象がない)。`retryable_failed` になった時点でも worktree の cleanup は
+今までどおり実行する -- reconcile 時に `base_commit_sha` + patch diff から
+決定的に再作成できるため。
+
+**Reconcile フェーズ**(`_run_reconcile_phase`、retry から
+`reconciling` になった job に対してのみ実行): まず DB 上の
+`publish_connection_leases`(connection ごとに 1 行、owner・
+acquired_at・expires_at)を取得する -- `repo_manager.connection_lock` は
+プロセス内 RLock でしかないため、複数プロセス/レプリカが同じ connection
+を同時に retry しないための追加ガード。取得できなければ git/API 操作を
+一切行わずに `reconciling -> retryable_failed`(監査 reason
+`lease_held`)に戻して終了する。取得できたら:
+
+1. connection が `connected` であること・installation 割当を再確認する。
+2. リモートの base branch SHA を解決し、`base_commit_sha` と比較する。
+   ずれていれば stale として終端 `failed`(既存の prepare/publish と同じ
+   メッセージ様式)。
+3. ブランチ名(既存の `branch_name`、なければ生成)のリモート SHA を解決し、
+   決定表に従って分岐する:
+
+| リモートブランチ | job.commit_sha | 挙動 |
+| --- | --- | --- |
+| 存在し、SHA が一致 | 設定済み | commit/push は一切やり直さない。同じ head の open PR を検索し、あれば `pr_url`/`pr_number` を回収、なければ PR を新規作成して `completed` |
+| 存在するが SHA が不一致、または `commit_sha` が未設定 | -- | `manual_intervention_required`。上書き・force push は絶対にしない |
+| 存在しない | -- | ローカル worktree が(前回の cleanup で)無ければ `base_commit_sha` から再作成して patch diff を再適用し(適用失敗は `manual_intervention_required`)、`reconciling -> committing` として通常の commit/push/creating_pr/completed シーケンス(`_publish_steps`、承認直後の publish フェーズと共通)を実行する |
+
+**auto retry**: `app/publish_recovery.py::auto_retry_eligible_jobs` が
+`retryable_failed` かつ `retry_count < PUBLISH_AUTO_RETRY_MAX`(既定 3)の
+job を 1 件ずつ同期的に retry する。`manual_intervention_required` は
+自動 retry の対象に絶対にしない。手動 retry
+(`POST /github/publish-jobs/{id}/retry`)は `retry_count` の上限を無視する
+-- 上限は自動 retry にのみ適用される。
+
+**起動時 / 定期リカバリ**(`app/publish_recovery.py`、`app/main.py` の
+lifespan から起動): サーバー再起動やクラッシュでワーカースレッドが
+失われた job を、`heartbeat_at` が `PUBLISH_STUCK_THRESHOLD_SECONDS`
+(既定 900 秒)より古いことを条件に fail over する -- 準備フェーズの
+in-flight 状態は終端 `failed`、公開フェーズの in-flight 状態と
+`reconciling` は `retryable_failed`。起動時に一度同期的に実行した後、
+`PUBLISH_RECOVERY_INTERVAL_SECONDS`(既定 300 秒、0 以下でワーカー自体を
+無効化)ごとに動くバックグラウンドスレッドが同じ repair と auto retry を
+繰り返す。
+
+**監査**: job のあらゆる状態遷移が、その遷移を行うのと同じトランザクション
+内で `publish_audit_events` に `publish_job_status_transition`
+(`{"from": ..., "to": ..., "reason"?: ...}`)として追記される
+(`_set_status` と、approve/cancel/retry の明示的な compare-and-set の
+両方から)。加えてアクターイベント `publish_job_requested` /
+`publish_job_approved` / `publish_job_retry_requested`
+(手動 retry の呼び出し元)/ `publish_job_auto_retry`
+(自動 retry、actor は NULL、detail に `retry_count`)を記録する。
+`GET /github/publish-jobs/{id}/events` でこの job の監査ログをそのまま
+参照できる。
+
+**#227 との統合**: `_IN_FLIGHT_PUBLISH_STATUSES` に `reconciling` を追加し
+(reconcile 中の disconnect は 409 で拒否)、`_CANCELLABLE_JOB_STATUSES` と
+`cancel_publish_job` の許可集合に `retryable_failed` /
+`manual_intervention_required` を追加した(disconnect はこれらの job も
+自動 cancel し、手動 cancel でも諦められる。リモートブランチ・PR は
+どちらの場合も一切変更しない)。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。

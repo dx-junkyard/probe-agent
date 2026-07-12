@@ -78,6 +78,14 @@ creating incomplete persistence or execution paths for later phases.
      moved/split/missing, no heuristic fallback), and plan creation that
      reuses the #25 approval/patch/validate/apply gates
    - see the Issue #168 section in `docs/project-intelligence.md`
+7. Issue #216 — GitHub App publish workflow: GitHub App auth / Installation
+   Token broker / connection persistence, then a repository manager
+   (mirror clone/fetch/worktree/cleanup), a publish job state machine
+   (commit/push/PR), and Dashboard UI, implemented in that order.
+   Issue #222 constrains this workflow to administrator-registered GitHub
+   App installations for the configured Organization. An installation must
+   also be explicitly assigned to a System before any repository listing,
+   connection, verify, sync, or publish token issuance may use it.
 
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
@@ -126,6 +134,14 @@ instead of being bolted onto an unrelated issue's scope.
      metadata/probe authoring flow in Principle 8, which writes only inside
      an isolated worktree and stops at a reviewable diff/PR — the developer
      performs the final apply/merge into the real repository.
+   - Issue #216's GitHub App publish workflow extends this same exception to
+     a remote repository: only after an explicit human approval may
+     probe-agent, using a short-lived GitHub App Installation Token, commit
+     and push to a server-generated `probe/`-prefixed branch and open a Pull
+     Request. Direct pushes to the default/base branch, force pushes, and
+     any push without prior human approval remain forbidden. The developer
+     always performs the merge on GitHub — probe-agent never merges or
+     closes the PR itself.
 
 6. Limit deterministic decisions to explicit finite sets.
    - Deterministic rules are allowed only when the result belongs to a small,
@@ -163,6 +179,14 @@ instead of being bolted onto an unrelated issue's scope.
      repository's tracked branches itself. The developer reviews the diff/PR
      and performs the merge — this keeps the "no direct write to target
      repo" boundary (Principle 5) while removing manual transcription work.
+   - Issue #216's GitHub App publish workflow is the sanctioned way to turn
+     an approved isolated-worktree patch into a real commit/push/PR against
+     a remote repository: approval gates the push, the push target is always
+     a server-generated `probe/`-prefixed branch (never default/base, never
+     force-pushed), and Installation Tokens are short-lived and never
+     persisted. This does not relax the isolation rule above — instrumentation
+     and source variants still only ever run and get patched inside temporary
+     worktrees/workspaces.
    - This does not relax Principle 6: which capability an element belongs to,
      what its role/probe value is, and what to instrument remain
      reasoning-model proposals, never heuristic free-text guesses, and the

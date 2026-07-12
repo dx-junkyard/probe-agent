@@ -201,6 +201,7 @@ def test_confirm_understanding_message_is_english_when_configured(admin_client, 
     assert r.status_code == 200, r.text
 
     detail = admin_client.get(f"/interview/sessions/{session['id']}", headers=headers).json()
+    assert detail["messages"][-1]["role"] == "system"
     assert detail["messages"][-1]["content"] == (
         "Confirmed the answers so far; proceeding to proposal generation."
     )
@@ -226,6 +227,7 @@ def test_confirm_understanding_message_is_japanese_by_default(admin_client):
     assert r.status_code == 200, r.text
 
     detail = admin_client.get(f"/interview/sessions/{session['id']}", headers=headers).json()
+    assert detail["messages"][-1]["role"] == "system"
     assert detail["messages"][-1]["content"] == "これまでの回答内容を確定し、提案生成に進みます。"
 
 

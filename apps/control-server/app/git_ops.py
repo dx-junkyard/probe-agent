@@ -133,15 +133,30 @@ def working_tree_status(repo_path: str, *, sample_limit: int = 20) -> WorkingTre
 
 def _allowed_repository_roots() -> List[str]:
     raw = os.getenv("PROBE_REPOSITORY_ROOTS", "").strip()
-    if not raw:
+    roots = (
+        [
+            os.path.realpath(root.strip())
+            for root in raw.split(os.pathsep)
+            if root.strip()
+        ]
+        if raw
+        else []
+    )
+
+    # Additive (Issue #216 sub-task 2): the repo manager's managed clone area
+    # is a legitimate snapshot/worktree source once explicitly configured, so
+    # existing repository_configs/snapshot/probe-plan/patch flows can target
+    # managed mirrors without a separate allow-list entry. Only added when
+    # set; both unset still fails closed below, matching prior behavior.
+    managed_root = os.getenv("GIT_REPOSITORY_ROOT", "").strip()
+    if managed_root:
+        roots.append(os.path.realpath(managed_root))
+
+    if not roots:
         raise GitError(
             "PROBE_REPOSITORY_ROOTS is not configured; repository access is disabled"
         )
-    return [
-        os.path.realpath(root.strip())
-        for root in raw.split(os.pathsep)
-        if root.strip()
-    ]
+    return roots
 
 
 def _validate_repo_path(repo_path: str) -> str:

@@ -33,7 +33,7 @@ from typing import List, Optional
 REQUIREDNESS_VALUES = ("required", "conditional", "optional")
 
 # Categories align with diagnostics check categories where possible.
-SETTING_CATEGORIES = ("repository", "database", "llm", "intelligence", "auth")
+SETTING_CATEGORIES = ("repository", "database", "llm", "intelligence", "auth", "github")
 
 
 @dataclass(frozen=True)
@@ -357,6 +357,77 @@ SETTINGS_METADATA: List[SettingMetadata] = [
         remediation="Set CONTROL_API_KEYS, or bootstrap an admin user instead.",
         related_checks=["auth_scope"],
         related_pages=["/admin"],
+    ),
+    SettingMetadata(
+        key="GITHUB_APP_ID",
+        display_name="GitHub App ID",
+        category="github",
+        requiredness="conditional",
+        description=(
+            "App ID of the GitHub App used by the publish workflow (Issue "
+            "#216) to broker short-lived Installation Access Tokens. Required "
+            "together with GITHUB_APP_PRIVATE_KEY_PATH."
+        ),
+        impact=(
+            "Without it, GitHub App connections cannot be verified or used: "
+            "token issuance fails closed with an explicit error."
+        ),
+        remediation=(
+            "Set GITHUB_APP_ID to the numeric App ID from the GitHub App "
+            "settings page and restart the Control Server."
+        ),
+        validation_rule="Effective only together with GITHUB_APP_PRIVATE_KEY_PATH.",
+        related_pages=["/github"],
+    ),
+    SettingMetadata(
+        key="GITHUB_APP_PRIVATE_KEY_PATH",
+        display_name="GitHub App private key path",
+        category="github",
+        requiredness="conditional",
+        description=(
+            "Filesystem path to the GitHub App's PEM private key (mounted as "
+            "a Docker/Kubernetes secret), used to sign the App JWT for "
+            "Installation Access Token exchange."
+        ),
+        impact=(
+            "Without a readable key file, GitHub App connections cannot be "
+            "verified or used: token issuance fails closed with an explicit "
+            "error."
+        ),
+        remediation=(
+            "Mount the App's private key PEM file and set "
+            "GITHUB_APP_PRIVATE_KEY_PATH to its path, then restart the "
+            "Control Server."
+        ),
+        validation_rule="File must exist and be readable; effective only together with GITHUB_APP_ID.",
+        related_pages=["/github"],
+    ),
+    SettingMetadata(
+        key="GITHUB_API_BASE_URL",
+        display_name="GitHub API base URL",
+        category="github",
+        requiredness="optional",
+        description=(
+            "Override for the GitHub REST API base URL (GitHub Enterprise "
+            "Server). Defaults to https://api.github.com."
+        ),
+        impact="A wrong URL makes every GitHub App API call fail at request time.",
+        remediation="Leave empty for github.com, or set your GHES API base URL.",
+        related_pages=["/github"],
+    ),
+    SettingMetadata(
+        key="GITHUB_WEB_BASE_URL",
+        display_name="GitHub web base URL",
+        category="github",
+        requiredness="optional",
+        description=(
+            "Override for the GitHub web/clone base URL (GitHub Enterprise "
+            "Server). Defaults to https://github.com; used to derive the "
+            "stored clone_url for a connection."
+        ),
+        impact="A wrong URL produces an unusable clone_url for the connected repository.",
+        remediation="Leave empty for github.com, or set your GHES web base URL.",
+        related_pages=["/github"],
     ),
 ]
 

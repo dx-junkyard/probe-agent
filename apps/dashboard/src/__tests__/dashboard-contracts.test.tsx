@@ -54,6 +54,84 @@ afterEach(() => {
   mockSystems = [];
 });
 
+// ── Components trace signal details ────────────────────────────────
+
+describe("Components page trace details", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("expands a trace to show its input, output, and error", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/components") {
+        return Promise.resolve([
+          { component_id: "order-validator", mode: "trace", trace_count: 1, last_seen: 1000 },
+        ]);
+      }
+      if (path === "/components/order-validator/traces?limit=20") {
+        return Promise.resolve([{
+          trace_id: "trace-1234567890",
+          component_id: "order-validator",
+          mode: "trace",
+          input: { args: [{ order_id: "order-42" }], kwargs: { strict: "True" } },
+          output: "{'valid': False}",
+          error: "ValidationError: missing customer",
+          duration_ms: 12.5,
+          timestamp: 1000,
+        }]);
+      }
+      if (path === "/components/order-validator/profile") {
+        return Promise.resolve(null);
+      }
+      if (path === "/components/order-validator/shadow-results?limit=20") {
+        return Promise.resolve([]);
+      }
+      if (path === "/components/order-validator/criteria") {
+        return Promise.resolve([]);
+      }
+      return Promise.resolve(null);
+    });
+
+    const { default: ComponentsPage } = await import("@/pages/components");
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/components?component=order-validator"]}>
+          <ComponentsPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const detailsButton = await screen.findByRole("button", {
+      name: "Show signal details for trace trace-1234567890",
+    });
+    expect(screen.queryByText("ValidationError: missing customer")).not.toBeInTheDocument();
+
+    fireEvent.click(detailsButton);
+
+    expect(screen.getByRole("button", {
+      name: "Hide signal details for trace trace-1234567890",
+    })).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(screen.getByRole("button", { name: /0.*object/ }));
+    expect(screen.getByText(/order-42/)).toBeInTheDocument();
+    expect(screen.getByText("{'valid': False}")).toBeInTheDocument();
+    expect(screen.getByText("ValidationError: missing customer")).toBeInTheDocument();
+    expect(screen.getByText("trace-1234567890")).toBeInTheDocument();
+
+    await waitFor(() => {
+      const componentRefreshes = mockApi.get.mock.calls.filter(([path]) => path === "/components");
+      const traceRefreshes = mockApi.get.mock.calls.filter(
+        ([path]) => path === "/components/order-validator/traces?limit=20",
+      );
+      expect(componentRefreshes.length).toBeGreaterThanOrEqual(2);
+      expect(traceRefreshes.length).toBeGreaterThanOrEqual(2);
+    }, { timeout: 3_000 });
+  });
+});
+
 vi.mock("sonner", () => ({
   toast: {
     success: vi.fn(),
@@ -2126,12 +2204,35 @@ describe("Interview page", () => {
     );
 
     const refreshButton = await screen.findByRole("button", { name: /理解を更新/ });
+    expect(refreshButton).not.toBeDisabled();
     fireEvent.click(refreshButton);
 
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith("/interview/sessions/7/update-understanding", {});
     });
     expect(await screen.findByTestId("answer-revision-reflected-banner")).toBeInTheDocument();
+  });
+
+  test("disables understanding refresh after confirmation until an answer is revised (Issue #229)", async () => {
+    mockInterviewApi();
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const refreshButton = await screen.findByRole("button", { name: /理解を更新/ });
+    expect(refreshButton).toBeDisabled();
+    expect(refreshButton).toHaveAttribute("title", "回答を修正した場合にのみ、理解を再構築できます");
+    expect(await screen.findByTestId("understanding-refresh-blocked-reason"))
+      .toHaveTextContent("次は提案を生成またはレビューしてください");
+    expect(screen.getByTestId("next-action")).toHaveTextContent("各提案を承認・編集・却下してください");
   });
 
   test("shows all evidence read for a turn, even when uncited (Issue #137)", async () => {
@@ -4002,6 +4103,55 @@ describe("System Understanding page", () => {
     expect(screen.queryByTestId("system-state-banner")).toBeNull();
   });
 
+  test("shows the capability-empty canonical guidance on System Understanding and keeps its Interview CTA", async () => {
+    window.history.pushState({}, "", "/system-understanding");
+    const capabilityEmptyItem: SystemStateItem = {
+      state_id: "pipeline.capability_hierarchy.empty",
+      state_group: "pipeline",
+      severity: "warning",
+      status: "missing",
+      user_action_kind: "confirm",
+      intervention_timing: "before_next_step",
+      subject: "Capability hierarchy",
+      summary: "Capability hierarchy completed, but has 0 capabilities.",
+      detail: "No capability nodes were generated.",
+      impact: "Core Capabilities are not yet defined.",
+      remediation: "Interview で Core Capabilities を確認してください。",
+      evidence: { capability_count: 0 },
+      target_ui: { route: "/interview", anchor: "interview-capabilities", action_label: "Interview で Core Capabilities を確認" },
+      display_routes: ["/system-understanding"],
+      related_checks: [],
+      related_pipeline_steps: ["capability_hierarchy_ready"],
+      source: "system_state",
+      dedupe_key: "",
+      scope: "global",
+      decision_method: "deterministic",
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(completeResponse);
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "warning",
+        severity_counts: { warning: 1 }, items: [capabilityEmptyItem], primary_item: capabilityEmptyItem,
+        notification_items: [capabilityEmptyItem],
+        page_items: {
+          "/system-understanding": [capabilityEmptyItem],
+          "/interview": [capabilityEmptyItem],
+        },
+      });
+      return Promise.resolve(null);
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    expect(await screen.findByTestId("system-state-banner")).toHaveTextContent(capabilityEmptyItem.summary);
+    const cta = screen.getByTestId("system-state-action-pipeline.capability_hierarchy.empty");
+    expect(cta).toHaveTextContent("Interview で Core Capabilities を確認");
+    fireEvent.click(cta);
+    await waitFor(() => expect(window.location.pathname).toBe("/interview"));
+    expect(new URLSearchParams(window.location.search).get("fix")).toBe("interview-capabilities");
+  });
+
   test("renders gap_trend increase/decrease chips in the gap worklist", async () => {
     const response = {
       ...gapWorklistResponse,
@@ -4487,7 +4637,9 @@ describe("System settings diagnostics", () => {
     expect(bannerCta.textContent).toBe("Snapshot を作成");
     fireEvent.click(bannerCta);
     await waitFor(() => expect(window.location.pathname).toBe("/repository"));
-    expect(new URLSearchParams(window.location.search).get("fix")).toBe("snapshot-create");
+    let targetParams = new URLSearchParams(window.location.search);
+    expect(targetParams.get("fix")).toBe("snapshot-create");
+    expect(targetParams.get("diagnostic")).toBe("snapshot_status");
 
     window.history.pushState({}, "", "/system-understanding");
     fireEvent.click(screen.getByTestId("diagnostics-badge"));
@@ -4495,7 +4647,9 @@ describe("System settings diagnostics", () => {
     const badgeCta = within(badgeItem).getByRole("button", { name: "Snapshot を作成" });
     fireEvent.click(badgeCta);
     await waitFor(() => expect(window.location.pathname).toBe("/repository"));
-    expect(new URLSearchParams(window.location.search).get("fix")).toBe("snapshot-create");
+    targetParams = new URLSearchParams(window.location.search);
+    expect(targetParams.get("fix")).toBe("snapshot-create");
+    expect(targetParams.get("diagnostic")).toBe("snapshot_status");
   });
 
   test("system-state items projected from a dialog-kind diagnostic (no target_ui) still open the env fix dialog", async () => {
@@ -5352,12 +5506,12 @@ describe("Hub success summary and pipeline collapse (Issue #211)", () => {
     },
   };
 
-  function mockSuApis(response: Record<string, unknown>) {
-    mockApi.get.mockImplementation((path: string) =>
-      path === "/repository/system-understanding"
-        ? Promise.resolve(response)
-        : Promise.resolve(null),
-    );
+  function mockSuApis(response: Record<string, unknown>, diagnostics?: Record<string, unknown>) {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(response);
+      if (path === "/system-diagnostics") return Promise.resolve(diagnostics ?? null);
+      return Promise.resolve(null);
+    });
   }
 
   test("all-complete pipeline shows the success summary and collapses the checklist", async () => {
@@ -5384,17 +5538,47 @@ describe("Hub success summary and pipeline collapse (Issue #211)", () => {
     expect(await screen.findByTestId("pipeline-collapsed")).toBeInTheDocument();
   });
 
+  // The empty-capability-hierarchy diagnostic exactly as the server emits it:
+  // the structured fix target (fix_page "/interview") is what drives the
+  // pipeline row's Interview CTA — never the free-text detail.
+  const capabilityEmptyCheck = {
+    check_id: "pipeline_capability_hierarchy",
+    category: "pipeline",
+    title: "capability 階層の実行",
+    severity: "warning",
+    detail: "実行は完了しましたが capability ノードが 0 件です。",
+    impact: "Core Capabilities が未定義です。",
+    remediation: "Interview で Core Capabilities を確認してください。",
+    related_env: [],
+    related_paths: [],
+    related_pages: ["/system-understanding", "/interview"],
+    related_pipeline_steps: ["capability_hierarchy_ready"],
+    last_observed_error: null,
+    decision_method: "deterministic",
+    fix_kind: "navigate",
+    fix_page: "/interview",
+    fix_anchor: "interview-capabilities",
+  };
+
+  const incompleteCapabilityResponse = {
+    ...baseResponse,
+    pipeline: [
+      ...allCompletePipeline.slice(0, 7),
+      { step: "capability_hierarchy_ready", status: "warning", detail: "0 capabilities" },
+    ],
+    primary_action: {
+      action: "Build system understanding", reason: "1 step incomplete",
+      category: "understand", link: null, action_kind: "build",
+    },
+  };
+
   test("incomplete pipeline keeps the checklist expanded without a success summary", async () => {
-    mockSuApis({
-      ...baseResponse,
-      pipeline: [
-        ...allCompletePipeline.slice(0, 7),
-        { step: "capability_hierarchy_ready", status: "warning", detail: "0 capabilities" },
-      ],
-      primary_action: {
-        action: "Build system understanding", reason: "1 step incomplete",
-        category: "understand", link: null, action_kind: "build",
-      },
+    mockSuApis(incompleteCapabilityResponse, {
+      system_id: 1,
+      generated_at: 1750000000,
+      overall_severity: "warning",
+      severity_counts: { ok: 0, warning: 1, error: 0, blocked: 0, unknown: 0 },
+      checks: [capabilityEmptyCheck],
     });
 
     const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
@@ -5403,6 +5587,22 @@ describe("Hub success summary and pipeline collapse (Issue #211)", () => {
     expect(await screen.findByTestId("pipeline-checklist")).toBeInTheDocument();
     expect(screen.queryByTestId("pipeline-collapsed")).not.toBeInTheDocument();
     expect(screen.queryByTestId("build-success-summary")).not.toBeInTheDocument();
+    const cta = await screen.findByTestId("pipeline-cta-capability_hierarchy_ready");
+    expect(cta).toHaveTextContent("Review interview proposals");
+    expect(cta).toHaveAttribute("href", "/interview");
+  });
+
+  test("interview CTA requires the structured diagnostic, not the detail text", async () => {
+    // Same pipeline detail text, but no pipeline_capability_hierarchy check
+    // pointing at /interview: the CTA falls back to the step's generic
+    // Build action instead of regex-guessing intent from the free text.
+    mockSuApis(incompleteCapabilityResponse);
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const cta = await screen.findByTestId("pipeline-cta-capability_hierarchy_ready");
+    expect(cta).toHaveTextContent("Run Build / Refresh");
   });
 
   test("undefined purpose adds the prerequisite note to the entry cards", async () => {
@@ -5412,5 +5612,403 @@ describe("Hub success summary and pipeline collapse (Issue #211)", () => {
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
 
     expect(await screen.findByTestId("entry-cards-prereq-note")).toBeInTheDocument();
+  });
+});
+
+// ── Diagnostic fix callout anchor collision ─────────────────────────
+
+describe("Diagnostic fix callout with a shared anchor", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  function diagCheck(overrides: Record<string, unknown>) {
+    return {
+      category: "pipeline",
+      title: "check",
+      detail: "detail",
+      impact: "",
+      remediation: "",
+      related_env: [],
+      related_paths: [],
+      related_pages: [],
+      related_pipeline_steps: [],
+      last_observed_error: null,
+      decision_method: "deterministic",
+      fix_kind: "navigate",
+      fix_page: "/system-understanding",
+      fix_anchor: "build",
+      ...overrides,
+    };
+  }
+
+  test("anchor-only focus picks the most severe check, not backend array order", async () => {
+    // llm_last_run ("no reasoning run recorded yet", informational `unknown`)
+    // is emitted BEFORE the pipeline checks and shares fix_anchor "build".
+    // A deep link with only ?fix=build must surface the actionable warning,
+    // not the informational check that happens to come first.
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-diagnostics") {
+        return Promise.resolve({
+          system_id: 1,
+          generated_at: 1750000000,
+          overall_severity: "warning",
+          severity_counts: { ok: 0, warning: 1, error: 0, blocked: 0, unknown: 1 },
+          checks: [
+            diagCheck({
+              check_id: "llm_last_run",
+              category: "llm",
+              title: "直近の reasoning モデル実行",
+              severity: "unknown",
+            }),
+            diagCheck({
+              check_id: "pipeline_understanding_graph",
+              title: "理解グラフの実行",
+              severity: "warning",
+              related_pipeline_steps: ["docs_code_reconciled"],
+            }),
+          ],
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/system-understanding?fix=build"]}>
+          <SystemUnderstandingPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const callout = await screen.findByTestId("diagnostic-callout-build");
+    expect(callout.textContent).toContain("理解グラフの実行");
+    expect(callout.textContent).not.toContain("直近の reasoning モデル実行");
+  });
+
+  test("an explicit ?diagnostic= id still wins over severity ranking", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-diagnostics") {
+        return Promise.resolve({
+          system_id: 1,
+          generated_at: 1750000000,
+          overall_severity: "warning",
+          severity_counts: { ok: 0, warning: 1, error: 0, blocked: 0, unknown: 1 },
+          checks: [
+            diagCheck({
+              check_id: "llm_last_run",
+              category: "llm",
+              title: "直近の reasoning モデル実行",
+              severity: "unknown",
+            }),
+            diagCheck({
+              check_id: "pipeline_understanding_graph",
+              title: "理解グラフの実行",
+              severity: "warning",
+            }),
+          ],
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/system-understanding?fix=build&diagnostic=llm_last_run"]}>
+          <SystemUnderstandingPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const callout = await screen.findByTestId("diagnostic-callout-build");
+    expect(callout.textContent).toContain("直近の reasoning モデル実行");
+  });
+});
+
+// ── GitHub page (Issue #216) ────────────────────────────────────────
+
+describe("GitHub page", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const connectionFixture = {
+    id: 1,
+    system_id: 1,
+    api_base_url: "https://api.github.com",
+    web_base_url: "https://github.com",
+    owner: "acme",
+    repo: "widgets",
+    clone_url: "https://github.com/acme/widgets.git",
+    installation_id: 42,
+    default_branch: "main",
+    credential_type: "github_app",
+    status: "connected",
+    last_error: null,
+    last_synced_at: "2024-01-01T00:00:00Z",
+    last_synced_commit_sha: "abc1234567890",
+    created_by_user_id: 1,
+    updated_by_user_id: 1,
+    created_at: "2024-01-01T00:00:00Z",
+    updated_at: "2024-01-01T00:00:00Z",
+  };
+
+  function jobFixture(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 1,
+      system_id: 1,
+      connection_id: 1,
+      patch_id: 20,
+      snapshot_id: 5,
+      base_branch: "main",
+      base_commit_sha: "abc1234567890",
+      branch_name: "probe/publish-1-abc12345",
+      commit_sha: null,
+      pr_url: null,
+      pr_number: null,
+      status: "awaiting_approval",
+      error: null,
+      validation_summary: {
+        baseline: { overall_success: true },
+        probed: { overall_success: true },
+      },
+      requested_by_user_id: 1,
+      approved_by_user_id: null,
+      cleanup_state: "not_attempted",
+      cleanup_error: null,
+      created_at: 1700000000,
+      updated_at: 1700000000,
+      approved_at: null,
+      completed_at: null,
+      heartbeat_at: null,
+      retry_count: 0,
+      last_attempt_at: null,
+      ...overrides,
+    };
+  }
+
+  const patchFixture = {
+    id: 20,
+    plan_id: 10,
+    system_id: 1,
+    snapshot_id: 5,
+    commit_sha: "abc1234567890",
+    diff: "diff --git a/a.py b/a.py",
+    worktree_path: null,
+    skipped: [],
+    status: "generated",
+    error: null,
+    cleanup_state: "removed",
+    cleanup_error: null,
+    apply_status: "not_applied",
+    apply_error: null,
+    applied_at: null,
+    applied_by_user_id: null,
+    validation_runs: [
+      { id: 1, variant: "baseline", overall_success: true, commands: [] },
+      { id: 2, variant: "probed", overall_success: true, commands: [] },
+    ],
+    created_at: "2024-01-01",
+  };
+
+  function mockGithubData(data: {
+    appStatus?: Record<string, unknown>;
+    connections?: Record<string, unknown>[];
+    jobs?: Record<string, unknown>[];
+    patches?: Record<string, unknown>[];
+  }) {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/github/app-status") {
+        return Promise.resolve(
+          data.appStatus ?? {
+            configured: true, app_id: "123",
+            api_base_url: "https://api.github.com", web_base_url: "https://github.com",
+          },
+        );
+      }
+      if (path === "/github/connections") return Promise.resolve(data.connections ?? []);
+      if (path === "/github/publish-jobs") return Promise.resolve(data.jobs ?? []);
+      if (path === "/repository/probe-patches") return Promise.resolve(data.patches ?? []);
+      if (path === "/users") return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+  }
+
+  test("shows the configured app status badge", async () => {
+    mockGithubData({ appStatus: { configured: true, app_id: "999", api_base_url: "https://api.github.com", web_base_url: "https://github.com" } });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("github-app-configured-badge")).toHaveTextContent("Configured"),
+    );
+  });
+
+  test("shows a setup hint when the GitHub App is not configured", async () => {
+    mockGithubData({ appStatus: { configured: false, app_id: null, api_base_url: "https://api.github.com", web_base_url: "https://github.com" } });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("github-app-configured-badge")).toHaveTextContent("Not configured"),
+    );
+    expect(screen.getByText("GITHUB_APP_ID")).toBeInTheDocument();
+    expect(screen.getByTestId("new-connection-button")).toBeDisabled();
+  });
+
+  test("shows the connections list with status and last error", async () => {
+    mockGithubData({
+      connections: [
+        connectionFixture,
+        { ...connectionFixture, id: 2, repo: "gadgets", status: "error", last_error: "installation revoked" },
+      ],
+    });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(screen.getByTestId("connection-1")).toBeInTheDocument());
+    expect(within(screen.getByTestId("connection-1")).getByText("acme/widgets")).toBeInTheDocument();
+    expect(within(screen.getByTestId("connection-1")).getByText("connected")).toBeInTheDocument();
+    expect(within(screen.getByTestId("connection-2")).getByText("error")).toBeInTheDocument();
+    expect(within(screen.getByTestId("connection-2")).getByTestId("connection-2-error")).toHaveTextContent(
+      "installation revoked",
+    );
+  });
+
+  test("shows the publish jobs list with a PR link once created", async () => {
+    mockGithubData({
+      connections: [connectionFixture],
+      jobs: [
+        jobFixture({
+          id: 2, status: "completed", commit_sha: "def4567890",
+          pr_url: "https://github.com/acme/widgets/pull/7", pr_number: 7,
+        }),
+      ],
+    });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-2")).toBeInTheDocument());
+    const row = within(screen.getByTestId("publish-job-2"));
+    expect(row.getByText("completed")).toBeInTheDocument();
+    expect(row.getByText(/PR #7/)).toBeInTheDocument();
+  });
+
+  test("approve button is shown only for a job awaiting approval", async () => {
+    mockGithubData({
+      connections: [connectionFixture],
+      jobs: [jobFixture({ id: 3, status: "awaiting_approval" })],
+      patches: [patchFixture],
+    });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-3")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("publish-job-3"));
+
+    expect(await screen.findByTestId("publish-job-approve-button")).toBeInTheDocument();
+    expect(screen.getByTestId("publish-job-cancel-button")).toBeInTheDocument();
+    // The confirmation dialog shows the publish target before approving.
+    fireEvent.click(screen.getByTestId("publish-job-approve-button"));
+    expect(await screen.findByText("Approve publish")).toBeInTheDocument();
+    expect(screen.getByTestId("publish-job-confirm-approve-button")).toBeInTheDocument();
+  });
+
+  test("approve button is hidden for a completed job", async () => {
+    mockGithubData({
+      connections: [connectionFixture],
+      jobs: [jobFixture({ id: 4, status: "completed", commit_sha: "def4567890" })],
+      patches: [patchFixture],
+    });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-4")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("publish-job-4"));
+
+    await waitFor(() => expect(screen.getByTestId("publish-job-detail")).toBeInTheDocument());
+    expect(screen.queryByTestId("publish-job-approve-button")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("publish-job-cancel-button")).not.toBeInTheDocument();
+  });
+
+  test("confirming approval calls the approve endpoint for the selected job", async () => {
+    mockGithubData({
+      connections: [connectionFixture],
+      jobs: [jobFixture({ id: 5, status: "awaiting_approval" })],
+      patches: [patchFixture],
+    });
+    mockApi.post.mockResolvedValue(jobFixture({ id: 5, status: "committing" }));
+
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-5")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("publish-job-5"));
+    fireEvent.click(await screen.findByTestId("publish-job-approve-button"));
+    fireEvent.click(await screen.findByTestId("publish-job-confirm-approve-button"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/github/publish-jobs/5/approve");
+    });
+  });
+
+  test("cancelling a job calls the cancel endpoint", async () => {
+    mockGithubData({
+      connections: [connectionFixture],
+      jobs: [jobFixture({ id: 6, status: "pending" })],
+      patches: [patchFixture],
+    });
+    mockApi.post.mockResolvedValue(jobFixture({ id: 6, status: "cancelled" }));
+
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-6")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("publish-job-6"));
+    fireEvent.click(await screen.findByTestId("publish-job-cancel-button"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/github/publish-jobs/6/cancel");
+    });
+  });
+
+  test("shows the sanitized error for a failed job in the list and detail view", async () => {
+    mockGithubData({
+      connections: [connectionFixture],
+      jobs: [jobFixture({
+        id: 7, status: "failed",
+        error: "Base branch has moved since the patch was generated/validated",
+      })],
+      patches: [patchFixture],
+    });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-7-error")).toHaveTextContent(
+      "Base branch has moved since the patch was generated/validated",
+    ));
+
+    fireEvent.click(screen.getByTestId("publish-job-7"));
+    expect(await screen.findByTestId("publish-job-detail-error")).toHaveTextContent(
+      "Base branch has moved since the patch was generated/validated",
+    );
+    expect(screen.queryByTestId("publish-job-approve-button")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("publish-job-cancel-button")).not.toBeInTheDocument();
   });
 });

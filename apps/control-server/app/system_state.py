@@ -117,6 +117,10 @@ class StateItem:
     remediation: str = ""
     evidence: Dict[str, Any] = field(default_factory=dict)
     target_ui: Optional[TargetUi] = None
+    # Pages where this state is observed.  ``target_ui`` remains the place
+    # where the user performs the remediation; it is deliberately not
+    # overloaded with presentation routing.
+    display_routes: List[str] = field(default_factory=list)
     related_checks: List[str] = field(default_factory=list)
     related_pipeline_steps: List[str] = field(default_factory=list)
     source: str = "system_state"
@@ -568,6 +572,7 @@ def _understanding_state_item(status: UnderstandingStatus, *, purpose: bool) -> 
             target_ui=TargetUi(
                 route=PAGE_INTERVIEW, anchor=anchor, action_label=f"Interview で{subject}を再確認",
             ),
+            display_routes=[PAGE_SYSTEM_UNDERSTANDING],
             related_checks=["system_purpose" if purpose else "system_capabilities"],
         )
     if status.kind == "unconfirmed":
@@ -592,6 +597,7 @@ def _understanding_state_item(status: UnderstandingStatus, *, purpose: bool) -> 
             target_ui=TargetUi(
                 route=PAGE_INTERVIEW, anchor=anchor, action_label=f"Interview で{subject}を確認",
             ),
+            display_routes=[PAGE_SYSTEM_UNDERSTANDING],
             related_checks=["system_purpose" if purpose else "system_capabilities"],
         )
     # missing_baseline
@@ -610,6 +616,7 @@ def _understanding_state_item(status: UnderstandingStatus, *, purpose: bool) -> 
         target_ui=TargetUi(
             route=PAGE_INTERVIEW, anchor=anchor, action_label=f"Interview で{subject}を定義",
         ),
+        display_routes=[PAGE_SYSTEM_UNDERSTANDING],
         related_checks=["system_purpose" if purpose else "system_capabilities"],
     )
 
@@ -702,6 +709,7 @@ def _snapshot_stale_for_interview_item(conn, system_id: int, snapshot_id: int) -
         remediation="最新 snapshot を基準に Interview を見直してください。",
         evidence={"interview_session_id": row["id"], "interview_snapshot_id": row["snapshot_id"], "latest_snapshot_id": snapshot_id},
         target_ui=TargetUi(route=PAGE_INTERVIEW, anchor=None, action_label="Interview を確認"),
+        display_routes=[PAGE_SYSTEM_UNDERSTANDING],
     )
 
 
@@ -914,6 +922,56 @@ def _capability_hierarchy_item(
         # at Interview/metadata instead of re-running the already-completed
         # Build / Refresh.
         if _capability_count_in_current_snapshot(conn, system_id, snapshot_id) == 0:
+            proposal_state = conn.execute(
+                """SELECT s.id AS session_id, s.materialized_at,
+                          SUM(CASE WHEN p.approval_state = 'needs_review' THEN 1 ELSE 0 END) AS needs_review_count,
+                          SUM(CASE WHEN p.approval_state IN ('approved', 'edited') THEN 1 ELSE 0 END) AS approved_count
+                   FROM interview_session s
+                   LEFT JOIN interview_proposal p ON p.session_id = s.id AND p.system_id = s.system_id
+                   WHERE s.system_id = ?
+                   GROUP BY s.id
+                   HAVING needs_review_count > 0 OR approved_count > 0 OR s.materialized_at IS NOT NULL
+                   ORDER BY s.updated_at DESC, s.id DESC LIMIT 1""",
+                (system_id,),
+            ).fetchone()
+            if proposal_state is not None and proposal_state["needs_review_count"]:
+                session_id = proposal_state["session_id"]
+                needs_review = proposal_state["needs_review_count"]
+                detail = (
+                    f"capability_hierarchy の実行（#{row['id']}）は完了していますが、現在の snapshot に "
+                    "`probe-agent:` docstring メタデータがありません。"
+                    f"Interview session #{session_id} の提案 {needs_review} 件は再レビュー待ちです。"
+                )
+                remediation = (
+                    f"Interview session #{session_id} で提案を再レビューして承認し、レビュー用差分を生成してください。"
+                    "差分を対象リポジトリへ適用して新しい snapshot を作成した後、Build / Refresh を実行してください。"
+                )
+                target_route = f"{PAGE_INTERVIEW}?session={session_id}"
+                action_label = "Interview の提案を再レビュー"
+            elif proposal_state is not None and proposal_state["approved_count"]:
+                session_id = proposal_state["session_id"]
+                detail = (
+                    f"capability_hierarchy の実行（#{row['id']}）は完了していますが、現在の snapshot に "
+                    "`probe-agent:` docstring メタデータがありません。承認済み Interview 提案はまだソースに反映されていません。"
+                )
+                remediation = (
+                    f"Interview session #{session_id} でレビュー用差分を生成し、対象リポジトリへ適用してください。"
+                    "その後、新しい snapshot を作成して Build / Refresh を実行してください。"
+                )
+                target_route = f"{PAGE_INTERVIEW}?session={session_id}"
+                action_label = "Interview で差分を生成"
+            else:
+                detail = (
+                    f"capability_hierarchy の実行（#{row['id']}）は完了していますが、"
+                    "現在の snapshot に capability ノードが存在しません。対象リポジトリに"
+                    " `probe-agent:` docstring メタデータが見つからなかったことが原因です。"
+                )
+                remediation = (
+                    "Interview で Core Capabilities を確認して提案を生成・承認し、レビュー用差分を対象リポジトリへ適用してください。"
+                    "新しい snapshot を作成した後、Build / Refresh を実行してください。"
+                )
+                target_route = PAGE_INTERVIEW
+                action_label = "Interview で Core Capabilities を確認"
             return StateItem(
                 state_id="pipeline.capability_hierarchy.empty",
                 state_group="pipeline",
@@ -923,22 +981,16 @@ def _capability_hierarchy_item(
                 intervention_timing="before_next_step",
                 subject="Capability 階層",
                 summary="Capability 階層は実行済みですが capability が 0 件です。",
-                detail=(
-                    f"capability_hierarchy の実行（#{row['id']}）は完了していますが、"
-                    "現在の snapshot に capability ノードが存在しません。対象リポジトリに"
-                    " `probe-agent:` docstring メタデータが見つからなかったことが原因です。"
-                ),
+                detail=detail,
                 impact="Core Capabilities が未定義のため、probe 設計・flow 探索・改善提案の前提が欠けています。",
-                remediation=(
-                    "Interview で Core Capabilities を確認するか、対象リポジトリに "
-                    "`probe-agent:` メタデータを追加してから Build / Refresh を再実行してください。"
-                ),
+                remediation=remediation,
                 evidence={"snapshot_id": snapshot_id, "run_id": row["id"], "capability_count": 0},
                 target_ui=TargetUi(
-                    route=PAGE_INTERVIEW,
+                    route=target_route,
                     anchor=ANCHOR_INTERVIEW_CAPABILITIES,
-                    action_label="Interview で Core Capabilities を確認",
+                    action_label=action_label,
                 ),
+                display_routes=[PAGE_SYSTEM_UNDERSTANDING],
                 related_pipeline_steps=["capability_hierarchy_ready"],
             )
         return None
@@ -1048,17 +1100,21 @@ def select_primary_item(items: List[StateItem], *, route: Optional[str] = None) 
 
 
 def _build_page_items(items: List[StateItem]) -> Dict[str, List[StateItem]]:
-    """Group actionable (non-``ok``) items by their target route.
+    """Group actionable items by explicit observation routes and fix route.
 
     ``page_items[route][0]`` renders as a warning-styled action banner in the
     dashboard, so an ``ok`` item must never appear here even if it happens to
     carry a ``target_ui`` (hardening; no current item does both today).
     """
     actionable = [item for item in items if item.severity != "ok" and item.target_ui]
-    routes = sorted({item.target_ui.route for item in actionable})
+    item_routes = {
+        id(item): set(item.display_routes) | {item.target_ui.route}
+        for item in actionable
+    }
+    routes = sorted({route for routes in item_routes.values() for route in routes})
     return {
         route: sorted(
-            [item for item in actionable if item.target_ui.route == route],
+            [item for item in actionable if route in item_routes[id(item)]],
             key=lambda item: (
                 _SEVERITY_RANK.get(item.severity, len(_SEVERITY_RANK)),
                 _TIMING_RANK.get(item.intervention_timing, len(_TIMING_RANK)), item.state_id,
@@ -1077,6 +1133,39 @@ def _dedupe_items(items: List[StateItem]) -> List[StateItem]:
         if old is None or select_primary_item([item, old]) is item:
             result[key] = item
     return sorted(result.values(), key=lambda item: item.state_id)
+
+
+def _diagnostic_state_item(check: Any) -> StateItem:
+    """Project one diagnostics check without promoting informational state."""
+    # Diagnostics uses ``unknown`` for an informational observation (for
+    # example, no reasoning run has been recorded yet).  State Assessment has
+    # the equivalent explicit vocabulary, ``info``.
+    severity = "info" if check.severity == "unknown" else check.severity
+    action = (
+        "none" if check.severity == "unknown"
+        else ("configure" if check.fix_kind == "dialog" else "inspect")
+    )
+    return StateItem(
+        state_id=f"diagnostic.{check.check_id}",
+        state_group="configuration" if check.category in ("auth", "database", "llm", "configuration") else "runtime",
+        severity=severity,
+        status=(
+            "failed" if severity == "error"
+            else ("blocked" if severity == "blocked" else ("unconfirmed" if severity == "info" else "missing"))
+        ),
+        user_action_kind=action,
+        intervention_timing="now" if severity in ("error", "blocked") else "before_next_step",
+        subject=check.title, summary=check.title, detail=check.detail,
+        impact=check.impact, remediation=check.remediation,
+        evidence={"diagnostic_category": check.category, "fix_kind": check.fix_kind},
+        target_ui=(
+            TargetUi(route=check.fix_page, anchor=check.fix_anchor,
+                     action_label=f"「{check.title}」を修正")
+            if check.fix_page and check.severity != "unknown" else None
+        ),
+        related_checks=[check.check_id], related_pipeline_steps=check.related_pipeline_steps,
+        source="system_diagnostics", dedupe_key=f"diagnostic.{check.check_id}",
+    )
 
 
 def build_system_state(system_id: int) -> SystemStateAssessment:
@@ -1182,27 +1271,7 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
             continue
         if check.check_id in covered_check_ids:
             continue
-        severity = check.severity if check.severity in SEVERITY_ORDER else "warning"
-        action = "configure" if check.fix_kind == "dialog" else "inspect"
-        items.append(StateItem(
-            state_id=f"diagnostic.{check.check_id}",
-            state_group="configuration" if check.category in ("auth", "database", "llm", "configuration") else "runtime",
-            severity=severity,
-            status="failed" if severity == "error" else ("blocked" if severity == "blocked" else "missing"),
-            user_action_kind=action,
-            intervention_timing="now" if severity in ("error", "blocked") else "before_next_step",
-            subject=check.title, summary=check.title, detail=check.detail,
-            impact=check.impact, remediation=check.remediation,
-            evidence={"diagnostic_category": check.category, "fix_kind": check.fix_kind},
-            # Issue #211: name the target instead of a bare 修正する so the
-            # button says what will be fixed before it is clicked. check.title
-            # comes from the finite diagnostics check set, so this stays a
-            # deterministic label, not generated text.
-            target_ui=(TargetUi(route=check.fix_page, anchor=check.fix_anchor,
-                                action_label=f"「{check.title}」を修正") if check.fix_page else None),
-            related_checks=[check.check_id], related_pipeline_steps=check.related_pipeline_steps,
-            source="system_diagnostics", dedupe_key=f"diagnostic.{check.check_id}",
-        ))
+        items.append(_diagnostic_state_item(check))
 
     items = _dedupe_items(items)
 

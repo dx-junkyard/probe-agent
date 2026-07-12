@@ -713,12 +713,18 @@ function QaPanel({
             onClick={handleRuntimeRealityCheck}
             disabled={runRealityCheck.isPending || approvedCount === 0}
             data-testid="run-runtime-reality-check"
+            title={approvedCount === 0 ? "先に提案を1件以上承認してください" : undefined}
           >
             {runRealityCheck.isPending ? "実行中..." : "実態チェックを実行"}
           </Button>
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
+        {approvedCount === 0 && (
+          <p className="text-xs text-muted-foreground" data-testid="runtime-reality-prerequisite">
+            実態チェックには承認済みの提案が必要です。先に提案を確認して少なくとも1件を承認してください。
+          </p>
+        )}
         {qaList.answers_revised_at && (
           <div
             className="rounded-md border border-amber-500 bg-amber-500/10 p-3 text-sm flex items-start gap-2"
@@ -941,6 +947,14 @@ export default function InterviewPage() {
   const building = createSession.isPending || updateUnderstanding.isPending;
   const uiState: InterviewUiState | null = session ? deriveUiState(session, building) : null;
   const unlocked = session ? proposalsUnlocked(session) : false;
+  // A confirmed proposal-stage session is already at its next workflow step.
+  // Rebuild only after a Q&A correction has marked the understanding stale.
+  const refreshBlockedUntilAnswerRevision = (
+    isProposalStage
+    && session?.understanding_confirmed_at != null
+    && !session.answers_revised_at
+  );
+  const canRefreshUnderstanding = !refreshBlockedUntilAnswerRevision;
   const purposeFixHighlight = useDiagnosticHighlight<HTMLDivElement>("interview-purpose");
   const capabilitiesFixHighlight = useDiagnosticHighlight<HTMLDivElement>("interview-capabilities");
   // 提案ステージで未回答の絞り込み質問が残っている状態。提案生成を依頼しても
@@ -1603,6 +1617,7 @@ export default function InterviewPage() {
                           variant="outline"
                           onClick={triggerMaterialization}
                           disabled={materialize.isPending || approvedCount === 0}
+                          title={approvedCount === 0 ? "先に提案を1件以上承認してください" : undefined}
                         >
                           <Play className="h-4 w-4 mr-1" />
                           {materialize.isPending ? "生成中..." : "差分を生成"}
@@ -1610,6 +1625,11 @@ export default function InterviewPage() {
                       </div>
                     </CardHeader>
                     <CardContent className="space-y-3">
+                      {approvedCount === 0 && (
+                        <p className="text-xs text-muted-foreground" data-testid="materialize-prerequisite">
+                          差分を生成するには、各提案を確認して少なくとも1件を承認してください。
+                        </p>
+                      )}
                       {proposals.length === 0 ? (
                         <div className="text-sm text-muted-foreground" data-testid="no-proposals-yet">
                           まだ提案はありません。会話から「送信して提案を生成」でレビュー項目を生成してください。
@@ -1694,7 +1714,13 @@ export default function InterviewPage() {
                             <Download className="h-4 w-4 mr-1" />
                             .patch をダウンロード
                           </Button>
-                          <Button size="sm" variant="outline" onClick={() => openDiff(diff, session.id)} disabled={!diff}>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => openDiff(diff, session.id)}
+                            disabled={!diff}
+                            title={diff ? undefined : "先に承認済み提案から差分を生成してください"}
+                          >
                             <GitPullRequest className="h-4 w-4 mr-1" />
                             差分を開く
                           </Button>
@@ -1849,19 +1875,30 @@ git commit`}
                       size="sm"
                       variant="outline"
                       onClick={refreshUnderstanding}
-                      disabled={building}
+                      disabled={building || !canRefreshUnderstanding}
+                      title={refreshBlockedUntilAnswerRevision
+                        ? "回答を修正した場合にのみ、理解を再構築できます"
+                        : undefined}
                     >
                       <Sparkles className="h-4 w-4 mr-1" />
                       {updateUnderstanding.isPending ? "分析中..." : "理解を更新"}
                     </Button>
                   </div>
+                  {refreshBlockedUntilAnswerRevision && (
+                    <p
+                      className="mt-2 text-xs text-muted-foreground"
+                      data-testid="understanding-refresh-blocked-reason"
+                    >
+                      理解は確認済みです。次は提案を生成またはレビューしてください。内容を変える場合は、先に回答を修正すると理解を更新できます。
+                    </p>
+                  )}
                 </CardHeader>
                 <CardContent>
                   {session.last_error && (
                     <div className="rounded-md border border-destructive bg-destructive/10 p-3 mb-3 text-sm text-destructive flex items-start gap-2">
                       <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
                       <div>
-                        <div className="font-medium">理解の構築に失敗しました</div>
+                        <div className="font-medium">直近の処理でエラーが発生しました</div>
                         <div className="text-xs mt-1">{session.last_error}</div>
                       </div>
                     </div>

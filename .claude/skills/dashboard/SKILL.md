@@ -66,6 +66,16 @@ The dashboard should support:
   `DiagnosticFixCallout` (`components/diagnostic-fix.tsx`) that highlights the
   control and shows 原因 / 次の操作 verbatim from the diagnostic — no
   client-side interpretation.
+  Several checks may share one `fix_anchor` (e.g. `llm_last_run` and the
+  pipeline checks all fix at "build"): an exact `?diagnostic=<id>` match
+  always wins, but the anchor-only fallback in `useFocusedCheck` picks the
+  most severe check by the finite `SEVERITY_ORDER` (exported from
+  `diagnostics-badge.tsx`), never backend array order — an informational
+  `unknown` check must not shadow an actionable warning/error.
+  The pipeline checklist's "Review interview proposals" CTA is driven by the
+  structured `pipeline_capability_hierarchy` check (`fix_kind: navigate`,
+  `fix_page: /interview` — the same object shown in the row's "Why?" list),
+  never by regex-matching the step's free-text `detail`.
 - Per-screen assistant (Issue #102): a floating agent button rendered by the
   app layout on every page (`components/assistant-panel.tsx`). It opens a
   right-side panel showing the screen's purpose, the current diagnostics
@@ -151,6 +161,32 @@ The dashboard should support:
   capability-context links on that page. Connect SDK links forward to
   `/setup-guide` (which already links back), closing the one-way link.
   All of the above are deterministic presence/routing checks — no heuristics.
+
+- GitHub publish workflow (Issue #216, `pages/github.tsx`, nav item
+  "GitHub"): App status card (`GET /github/app-status`; shows a setup hint
+  and disables connection creation when not configured); Connections tab
+  (list with status/default_branch/last_synced/last_error, a create dialog
+  that lets the developer pick a repo from
+  `GET /github/installations/{id}/repositories` or type owner/repo, plus
+  verify/sync/disconnect); Publish Jobs tab (list with a status badge, a
+  create dialog that reuses `useProbePatches()` filtered to patches whose
+  latest baseline+probed validation runs both succeeded, and a detail
+  dialog). The detail dialog renders the state machine's current status,
+  `validation_summary`, requested/approved-by (username only when
+  `useAuth().isAdmin`, since `GET /users` is admin-only — otherwise "User
+  #id"), the sanitized `error` verbatim, and branch/commit/PR links built
+  client-side from the connection's `owner`/`repo`/`web_base_url` (the API
+  never returns a token or absolute host path, and the UI must not
+  construct one either). Approve is a confirmation dialog only enabled for
+  `status === "awaiting_approval"` that shows the publish target, branch
+  name, and patch diff before calling
+  `POST /github/publish-jobs/{id}/approve`; Cancel is only offered for
+  `pending`/`awaiting_approval`. `usePublishJobs`/`usePublishJob`
+  (`api/hooks.ts`) poll every 2s while any job is in a non-terminal,
+  non-`awaiting_approval` status (`pending` through `creating_pr`) —
+  `awaiting_approval` itself does not poll since it is a stable
+  human-wait state, matching the System Understanding build-job polling
+  pattern.
 
 ## Authentication model
 

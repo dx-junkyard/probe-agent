@@ -113,6 +113,15 @@ fallback for intelligence work.
   branch — never inferred — and must be kept in sync with the `diag-anchor`
   attributes rendered by the Dashboard. Identifiers embedded in `detail`
   (env var names, model ids, paths) stay verbatim.
+- An informational branch (severity `unknown`, e.g. `llm_last_run`'s "no
+  reasoning run recorded yet") must say so in its own text: it must not
+  present itself as the cause of other warning/error checks, its remediation
+  must name the operations that actually change its state (build claim scan /
+  draft generation / Interview dialogue — not a generic "run Build"), and it
+  must carry `related_pipeline_steps` for the steps it actually gates so
+  consumers can scope and rank it below actionable checks sharing the same
+  `fix_anchor`. The Dashboard resolves anchor-only deep links by severity,
+  so a misleading generic branch would otherwise win the fix callout.
 
 ## Per-screen assistant (issue #102)
 
@@ -276,10 +285,129 @@ heuristic result.
   calls are a 422 with a reason; the manual copy/paste URL flow always stays
   available as a fallback. This is still not a target-repository write.
 
+## GitHub App publish workflow (issue #216)
+
+- `app/github_app.py` (JWT signing + Installation Token broker + a few
+  read-only/write GitHub REST calls: `get_repository`,
+  `list_installation_repositories`, `create_pull_request`,
+  `list_open_pull_requests_for_branch`), `app/repo_manager.py` (managed
+  mirror clone/fetch under `GIT_REPOSITORY_ROOT`, per-job worktrees,
+  `connection_lock`, cleanup), `app/publish_job.py` + `app/publish_guards.py`
+  (the two-phase publish state machine and its safety checks), routes in
+  `routes/github_connections.py` and `routes/publish_jobs.py`. See the
+  "GitHub App 公開ワークフロー（Issue #216）" section of
+  `docs/project-intelligence.md` for the full state diagram and safety
+  boundaries — do not duplicate that design narrative here.
+- An installation token, the App JWT, and the private key must never reach a
+  database row, log line, or API response. Always route any exception text
+  that might embed one through `github_app._sanitize` before it is persisted
+  or returned; `publish_jobs.error` is stored pre-sanitized so routes may
+  return it verbatim.
+- `GET /github/installations/{installation_id}/repositories` (sub-task 4) is
+  read-only and uses the same `_require_manage` (admin or System owner)
+  authorization as connection management; it returns
+  `GithubInstallationRepositoryOut` (owner/name/default_branch/private only,
+  never a token) and 502s with a sanitized message on `GitHubAppError`.
+- The push target is always a server-generated `probe/`-prefixed branch
+  (`publish_guards.generate_branch_name` / `validate_push_target`); force
+  push and direct push to the base/default branch are not implemented in
+  this MVP regardless of `GIT_ALLOW_DIRECT_PUSH` / `GIT_ALLOW_FORCE_PUSH`
+  (read but never honored as `true`).
+- `create_publish_job` requires the connection to be `status=connected` and
+  the patch's latest `baseline` + `probed` validation runs to both be
+  `overall_success=true` — this reuses Issue #25's validation gate rather
+  than adding a second one. The remote base-branch SHA is re-resolved and
+  compared against the patch's pinned commit twice (entering `fetching` and
+  again immediately before `pushing`); any mismatch fails the job closed
+  with no auto-rebase.
+- Only files present in the patch diff are staged (`git add`), each
+  structurally validated by `publish_guards.validate_patch_file_path`
+  (rejects paths outside the diff, `.git/`, path traversal, symlinks, secret-
+  name candidates, and `.github/workflows/` unless
+  `GIT_ALLOW_WORKFLOW_CHANGES=true`).
+- Approval only moves `awaiting_approval -> committing`; publishing
+  (commit/push/PR) only ever starts from an explicit `POST
+  /github/publish-jobs/{id}/approve` call. probe-agent never merges or
+  closes the resulting Pull Request itself.
+- Every terminal state (`completed`/`failed`/`cancelled`) cleans up the job
+  worktree and records `cleanup_state`/`cleanup_error`. Tests for this whole
+  area live in `tests/test_github_app.py` (App/connection layer, including
+  the installation-repositories endpoint) and `tests/test_publish_jobs.py`
+  (state machine, staleness, push safety, diff-path guards, idempotency,
+  cleanup, system isolation, secret hygiene).
+- **Compose secret + `GITHUB_PUBLISH_ENABLED` startup validation (Issue
+  #224)**: `docker-compose.prod.yml` mounts the private key as a Docker
+  Compose secret (`github_app_private_key`, file path from
+  `GITHUB_APP_PRIVATE_KEY_HOST_PATH`, default `/dev/null`) and fixes
+  `GITHUB_APP_PRIVATE_KEY_PATH` in-container to
+  `/run/secrets/github_app_private_key` — never a host path. `GITHUB_PUBLISH_ENABLED`
+  (finite set `{"", true, false, 1, 0, yes, no, on, off}`, case-insensitive;
+  anything else fails startup) is the declared-intent switch:
+  `github_app.validate_publish_startup_config()`, called from
+  `db.init_db()` right after `_validate_startup_environment()` (Issue #225's
+  pattern), raises `RuntimeError` when it is true but `GITHUB_APP_ID` is
+  empty, or `GITHUB_APP_PRIVATE_KEY_PATH` does not point at a readable,
+  non-empty file that parses as a PEM private key
+  (`cryptography...load_pem_private_key`). Error messages name only the env
+  var, never the key bytes or the path value. `github_app_configured()`
+  also now requires the key file to be non-empty (`os.path.getsize(...) > 0`)
+  so the `/dev/null`-default secret reads as "not configured" instead of
+  failing later inside JWT signing. See
+  `docs/github-app-deployment.md` for the deployment runbook (registration,
+  host placement, rotation).
+- **Disconnect revokes publish permission immediately (Issue #227)**:
+  `routes/github_connections.py::delete_connection` cancels every
+  non-terminal publish job of a connection (prepare phase or
+  `awaiting_approval`) in the same transaction as the disconnect, and
+  refuses (409) if a job is already in an in-flight publish phase
+  (`committing`/`pushing`/`creating_pr`). `approve_publish_job`'s
+  compare-and-set requires the connection to still be `connected`, and
+  `publish_job._require_connection_still_connected` re-checks at phase
+  entry and immediately before the push, on top of
+  `_require_publish_installation_assignment`'s existing check right before
+  every token issuance. `verify_connection` / `sync_connection` /
+  `create_publish_job` all 409 on a disconnected connection; reconnect is
+  always a new `github_connections` row. Audit events (append-only
+  `publish_audit_events`, `app/publish_audit.py`) never carry a token or
+  filesystem path. See the "Disconnect 時の即時失効(Issue #227)" subsection
+  of `docs/project-intelligence.md` for the full design; tests live in
+  `tests/test_publish_disconnect.py`.
+- **Publish job retry/recovery (Issue #226)**: a post-approval failure rests
+  in `retryable_failed` (or `manual_intervention_required` if the remote
+  branch exists but does not match the job's recorded commit) instead of
+  always dead-ending at terminal `failed` -- stale-base-branch conflicts and
+  a mid-flight disconnect (`ConnectionRevokedError`) are the only
+  post-approval failures that still stay terminal `failed`. `POST
+  /github/publish-jobs/{id}/retry` (`publish_job.retry_publish_job`) and the
+  periodic worker's `auto_retry_eligible_jobs` (capped by
+  `PUBLISH_AUTO_RETRY_MAX`, `manual_intervention_required` never included)
+  both compare-and-set the job to `reconciling` and run
+  `publish_job._run_reconcile_phase`, which re-derives the next step from
+  the actual remote branch/commit state under the same job id and the same
+  server-generated branch -- never a new branch, never a force push. A
+  DB-backed lease (`publish_connection_leases`) guards a connection across
+  process restarts on top of `repo_manager.connection_lock`'s in-process
+  lock. `app/publish_recovery.py` also fails over jobs whose worker thread
+  died (stale `heartbeat_at`) at startup and on a periodic tick. Every
+  status transition is recorded append-only in `publish_audit_events` in
+  the same transaction that performs it (`GET
+  /github/publish-jobs/{id}/events` reads it back). See
+  `docs/project-intelligence.md`'s "Publish job の retry / recovery(Issue
+  #226)" subsection for the full reconcile decision table; tests live in
+  `tests/test_publish_retry.py`.
+
 ## Authentication and user management
 
 - Auth is enabled when any user exists or `CONTROL_API_KEYS` is set; otherwise open (MVP compat).
 - Initial admin is bootstrapped from `CONTROL_ADMIN_USERNAME` / `CONTROL_ADMIN_PASSWORD` at startup.
+- `CONTROL_REQUIRE_AUTH` (default `false`, issue #217) is checked in
+  `app/db.py::_enforce_auth_requirement`, called from `init_db()` right after
+  admin bootstrap. When `true` and auth still cannot be enabled (no admin
+  user, no `CONTROL_API_KEYS`), startup fails closed with `RuntimeError`
+  instead of silently running open; `docker-compose.prod.yml` sets this to
+  `"true"`. When `false` (local/dev default), the fail-open MVP-compat
+  behavior is unchanged but a warning is logged. See
+  `docs/deployment-https.md`.
 - Passwords are hashed with PBKDF2-HMAC-SHA256 (`app/security.py`); never store plaintext.
 - Tokens are random (`secrets.token_urlsafe`) and stored only as SHA-256 hashes in `api_tokens`.
 - Accept credentials via `Authorization: Bearer <token>` or `X-Api-Key: <token>`.
@@ -296,6 +424,31 @@ heuristic result.
   revoke the user's session tokens (API tokens stay valid).
 - Role changes must not demote the last active admin (409).
 - Revoked/expired/inactive tokens return 401.
+- `require_user` / `require_admin` reject `token_kind == "api"` unconditionally
+  (403, "SDK API tokens cannot access management APIs; use a login session"),
+  not just in production: SDK API tokens are for data-plane routes (traces,
+  policies, ...) that depend on `get_principal`/`get_system_id` only, never
+  management/connection/publish routes.
+- `CONTROL_ENV` (`app/environment.py`, Issue #225; default `development`,
+  finite set `{development, production}`, anything else fails startup)
+  drives a strict fail-closed production mode checked in `app/db.py`
+  (`_validate_startup_environment`, before `_bootstrap_admin`, and the
+  production branch of `_enforce_auth_requirement`, after). In production:
+  `CONTROL_REQUIRE_AUTH` is forced on (explicitly disabling it fails
+  startup); `CONTROL_API_KEYS` must be empty (legacy keys are forbidden --
+  `auth.auth_enabled()`/`auth._legacy_keys()` also force this at runtime,
+  independent of startup validation); `CONTROL_ADMIN_PASSWORD` (when
+  `CONTROL_ADMIN_USERNAME` is also set) must pass
+  `security.validate_production_password` (>=16 chars, not in the
+  case-insensitive sample-value denylist, not equal to the username) even
+  if the admin row already exists from an earlier boot; and startup fails
+  unless at least one active admin user exists afterward. `create_user` /
+  `reset_password` (`routes/auth.py`) apply the same password validator in
+  production, returning 422 with the reason. Development is unchanged
+  (permissive, warning-only). A successful env-bootstrap of the admin user
+  writes one append-only `auth_audit_events` row
+  (`event_type='admin_bootstrapped'`); `detail` is structural JSON only,
+  never a password or hash.
 
 ## Probe Pattern lifecycle (issue #168)
 
@@ -381,3 +534,8 @@ Add or update tests for:
 - reasoning-required operations fail closed without heuristic fallback
 - reasoning metadata and structured-output validation
 - target repository unchanged after workspace operations
+- GitHub publish workflow: no installation token/JWT/private key ever
+  persisted or returned, `probe/`-branch + no-force-push enforcement, the
+  Issue #25 validation gate at job creation, the pre-push staleness
+  re-check, approve/cancel idempotency, worktree cleanup on every terminal
+  state, and system isolation

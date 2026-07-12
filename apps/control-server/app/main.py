@@ -4,6 +4,7 @@ from fastapi import Depends, FastAPI
 
 from .auth import get_principal
 from .db import init_db
+from . import publish_recovery
 from .routes import (
     assistant,
     auth,
@@ -13,9 +14,11 @@ from .routes import (
     evaluation,
     experiments,
     generation,
+    github_connections,
     interview,
     probe_patterns,
     project_intelligence,
+    publish_jobs,
     retention,
     shadow,
     systems,
@@ -32,7 +35,15 @@ _auth = [Depends(get_principal)]
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
-    yield
+    # Fail over publish jobs interrupted by a previous crash/restart before
+    # the periodic worker's first tick (Issue #226); the periodic worker
+    # (started below) covers everything that goes stale afterwards.
+    publish_recovery.repair_interrupted_jobs(reason="startup_recovery")
+    publish_recovery.start_worker()
+    try:
+        yield
+    finally:
+        publish_recovery.stop_worker()
 
 
 def create_app() -> FastAPI:
@@ -63,6 +74,8 @@ def create_app() -> FastAPI:
     app.include_router(assistant.router, dependencies=_auth)
     app.include_router(workspaces.router, dependencies=_auth)
     app.include_router(interview.router, dependencies=_auth)
+    app.include_router(github_connections.router, dependencies=_auth)
+    app.include_router(publish_jobs.router, dependencies=_auth)
     return app
 
 

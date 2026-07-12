@@ -621,6 +621,75 @@ def test_dialogue_turn_records_llm_config_failure(admin_client, monkeypatch):
         f"/interview/sessions/{session['id']}", headers=headers
     ).json()
     assert [m["role"] for m in detail["messages"]] == ["user"]
+    assert detail["last_error"]
+    assert "ANTHROPIC_API_KEY" in detail["last_error"]
+
+
+def test_dialogue_turn_failure_persists_last_error_and_success_clears_it(
+    admin_client, monkeypatch
+):
+    """A structured-response validation failure (e.g. the model returning too
+    many answer_options) must not just flash a toast: it has to be readable
+    from the session afterwards, and a later successful turn must clear it."""
+    from app.routes import interview as interview_routes
+    from app.interview_agent import EvidenceSelectionResult, InterviewTurnResult
+
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "parse failure"},
+        headers=headers,
+    ).json()
+    sid = session["id"]
+
+    monkeypatch.setattr(
+        interview_routes, "create_llm_client", lambda config: object()
+    )
+    monkeypatch.setattr(
+        interview_routes,
+        "select_evidence_targets",
+        lambda client, config, **kwargs: EvidenceSelectionResult(
+            provider="anthropic", model="claude-sonnet-4-5", is_mock=False,
+            need_evidence=False,
+        ),
+    )
+    monkeypatch.setattr(
+        interview_routes,
+        "generate_interview_turn",
+        lambda client, config, **kwargs: InterviewTurnResult(
+            provider="anthropic",
+            model="claude-sonnet-4-5",
+            is_mock=False,
+            error=(
+                "Failed to parse structured response: next_questions.0.answer_options "
+                "List should have at most 4 items after validation, not 5"
+            ),
+        ),
+    )
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/dialogue-turn",
+        json={"user_message": "このシステムを説明して"},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["error"]
+
+    detail = admin_client.get(f"/interview/sessions/{sid}", headers=headers).json()
+    assert detail["last_error"]
+    assert "answer_options" in detail["last_error"]
+
+    _stub_reasoning_turn(monkeypatch)
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/dialogue-turn",
+        json={"user_message": "続けます"},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["error"] is None
+
+    detail = admin_client.get(f"/interview/sessions/{sid}", headers=headers).json()
+    assert detail["last_error"] is None
 
 
 def test_update_understanding_records_llm_config_failure(admin_client, monkeypatch):
@@ -663,7 +732,7 @@ def test_update_understanding_records_llm_config_failure(admin_client, monkeypat
     assert run is not None
     assert run["status"] == "failed"
     assert "ANTHROPIC_API_KEY" in run["error_details"]
-    assert run["prompt_version"] == "understanding-review-v2"
+    assert run["prompt_version"] == "understanding-review-v3"
     assert detail["messages"][-1]["intelligence_run_id"] == run["id"]
 
 
@@ -807,7 +876,7 @@ def test_update_understanding_records_run_and_reviewer_qa_rows(admin_client, mon
         ).fetchone()
     assert run is not None
     assert run["status"] == "completed"
-    assert run["prompt_version"] == "understanding-review-v2"
+    assert run["prompt_version"] == "understanding-review-v3"
     assert run["decision_method"] == "reasoning_llm"
 
     qa_listing = admin_client.get(
@@ -874,6 +943,86 @@ def test_update_understanding_without_graph_fails_fast(admin_client, monkeypatch
     body = r.json()
     assert body["last_error"]
     assert "理解グラフが未構築" in body["last_error"]
+
+
+def test_update_understanding_is_rejected_after_confirmation_without_revision(admin_client, monkeypatch):
+    """A direct refresh must not re-run the reviewer in proposal stage."""
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setenv("LLM_MODEL", "mock")
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "confirmed session"},
+        headers=headers,
+    ).json()
+    _confirm_and_reach_proposal_generation(admin_client, session["id"], headers)
+
+    repeated_confirm = admin_client.post(
+        f"/interview/sessions/{session['id']}/confirm-understanding",
+        json={"actor": "another-user"},
+        headers=headers,
+    )
+    assert repeated_confirm.status_code == 200, repeated_confirm.text
+    detail = admin_client.get(
+        f"/interview/sessions/{session['id']}", headers=headers,
+    ).json()
+    assert [m["role"] for m in detail["messages"]] == ["user", "system"]
+
+    r = admin_client.post(
+        f"/interview/sessions/{session['id']}/update-understanding",
+        headers=headers,
+    )
+
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"] == {
+        "code": "understanding_update_not_available",
+        "message": "Understanding is already confirmed. Update it after correcting an interview answer.",
+        "next_action": "generate_or_review_proposals",
+    }
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        runs = conn.execute(
+            """SELECT COUNT(*) AS n FROM intelligence_runs
+               WHERE system_id = ? AND run_type = 'understanding_review'""",
+            (system_id,),
+        ).fetchone()["n"]
+    assert runs == 0
+
+    # A real answer correction re-enables the route. The mock client keeps
+    # this check local; the missing graph then returns the normal session
+    # error rather than the stage guard.
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE interview_session SET answers_revised_at = ? WHERE id = ?",
+            (time.time(), session["id"]),
+        )
+    allowed = admin_client.post(
+        f"/interview/sessions/{session['id']}/update-understanding",
+        headers=headers,
+    )
+    assert allowed.status_code == 200, allowed.text
+    assert allowed.json()["last_error"] != ""
+
+
+def test_review_history_excludes_confirmation_control_events():
+    """Control/audit messages must not be interpreted as developer evidence."""
+    from app.routes.interview import _review_history
+
+    history = _review_history([
+        {"role": "user", "content": "対象は API サーバーです。"},
+        {"role": "system", "content": "Interview snapshot updated from #1 to #2."},
+        # Legacy sessions persisted this workflow event with role=user.
+        {"role": "user", "content": "これまでの回答内容を確定し、提案生成に進みます。"},
+        {"role": "assistant", "content": "目的を確認してください。"},
+    ])
+
+    assert history == [
+        {"role": "user", "content": "対象は API サーバーです。"},
+        {"role": "assistant", "content": "目的を確認してください。"},
+    ]
 
 
 def test_proposals_rejected_before_proposal_stage(admin_client):

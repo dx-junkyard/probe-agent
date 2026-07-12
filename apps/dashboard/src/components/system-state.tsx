@@ -7,8 +7,10 @@ import type { SystemStateItem } from "@/api/types";
 export function systemStateTarget(item: SystemStateItem): string | null {
   if (!item.target_ui) return null;
   const params = new URLSearchParams();
-  // Reuse the established diagnostic focus contract without inventing a
-  // competing navigation format. State IDs are intentionally not diagnostic IDs.
+  // Reuse the established diagnostic focus contract. A projected diagnostic
+  // (or native item with one linked check) must preserve its specific check
+  // across navigation: multiple checks can share an anchor such as "build".
+  if (item.related_checks.length === 1) params.set("diagnostic", item.related_checks[0]);
   if (item.target_ui.anchor) params.set("fix", item.target_ui.anchor);
   const query = params.toString();
   return `${item.target_ui.route}${query ? `?${query}` : ""}`;

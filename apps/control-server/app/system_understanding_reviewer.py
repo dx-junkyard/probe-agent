@@ -37,7 +37,7 @@ from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient, is_reasoning_mod
 from .understanding_graph import UnderstandingGraph, GraphNode, EvidenceRef
 
 # v2: configurable output language for questions/summaries (Issue #127).
-PROMPT_VERSION = "understanding-review-v2"
+PROMPT_VERSION = "understanding-review-v3"
 SCHEMA_VERSION = "understanding-review-v1"
 DEFAULT_REVIEW_MAX_OUTPUT_TOKENS = 32_768
 DEFAULT_REVIEW_MAX_NODES_PER_TYPE = 5
@@ -170,7 +170,7 @@ matching exactly this shape:
   "probe_flow_candidates": [...same shape...],
   "gap_analysis": [{"gap_type": "docs_only|code_only|source_doc_mismatch|stale_explanation|ambiguous_ownership|unclassified_entrypoint|missing_probe_flow", "name": "...", "summary": "...", "severity": "low|medium|high"}],
   "open_questions": [{"question": "...", "category": "purpose|capability|api|probe_flow|general", "priority": "high|medium|low"}],
-  "suggested_next_action": "..."
+  "suggested_next_action": "confirm_purpose|review_capabilities|review_elements|review_api_boundaries|review_probe_flows|resolve_conflicts|resolve_open_questions|ready_for_proposal|"
 }
 
 Rules:
@@ -178,6 +178,9 @@ Rules:
 - Preserve evidence and provenance for all major understanding items.
 - Order open questions from top-level purpose toward API/probe flow details.
 - Do NOT generate metadata or probe proposals — this is understanding only.
+- For suggested_next_action, return exactly one of the literal enum values
+  shown in the schema. Do not return a sentence, a translated value, or a
+  proposal-generation instruction.
 - Use only the evidence provided in the input; do not invent facts.
 - Keep each top-level list to the most important 8 items.
 - Keep evidence to the strongest 3 references per item.
@@ -197,6 +200,16 @@ Your previous response was not valid complete JSON, likely because it was too
 long or truncated. Regenerate the same schema as one compact JSON object only.
 Use at most 5 items in each top-level list, at most 2 evidence references per
 item, and concise one-sentence summaries.
+"""
+
+
+_SCHEMA_RETRY_PROMPT = """\
+Your previous response did not satisfy the required JSON schema. Regenerate
+the complete JSON object only. In particular, suggested_next_action MUST be
+exactly one of: confirm_purpose, review_capabilities, review_elements,
+review_api_boundaries, review_probe_flows, resolve_conflicts,
+resolve_open_questions, ready_for_proposal, or an empty string. Do not use
+prose, translated values, or proposal-generation instructions.
 """
 
 
@@ -414,31 +427,38 @@ def generate_understanding_review(
 
     try:
         validated = _parse_review_response(raw)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValidationError) as first_error:
+        retry_prompt = (
+            _COMPACT_RETRY_PROMPT
+            if isinstance(first_error, json.JSONDecodeError)
+            else _SCHEMA_RETRY_PROMPT
+        )
         try:
             raw = client.generate_text(
                 [
-                    {"role": "system", "content": f"{system_prompt}\n\n{_COMPACT_RETRY_PROMPT}"},
+                    {"role": "system", "content": f"{system_prompt}\n\n{retry_prompt}"},
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.1,
                 max_tokens=max_output_tokens,
             )
             validated = _parse_review_response(raw)
-        except (json.JSONDecodeError, ValidationError, LLMError) as exc:
+        except (json.JSONDecodeError, ValidationError, LLMError):
             return ReviewResult(
                 provider=config.provider,
                 model=config.model,
                 is_mock=False,
-                error=f"Failed to parse review response: {exc}",
+                error=interview_message("invalid_review_response", language),
             )
-    except (json.JSONDecodeError, ValidationError) as exc:
-        return ReviewResult(
-            provider=config.provider,
-            model=config.model,
-            is_mock=False,
-            error=f"Failed to parse review response: {exc}",
-        )
+        except Exception:
+            # Keep an unexpected retry failure fail-closed without exposing
+            # provider/Pydantic internals in the session UI.
+            return ReviewResult(
+                provider=config.provider,
+                model=config.model,
+                is_mock=False,
+                error=interview_message("invalid_review_response", language),
+            )
 
     _EVIDENCE_REQUIRED_SECTIONS = (
         "system_purpose", "core_capabilities", "capability_elements", "api_boundaries",

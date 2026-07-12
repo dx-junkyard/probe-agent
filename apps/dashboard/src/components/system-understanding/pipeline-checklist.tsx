@@ -41,7 +41,7 @@ const STEP_LINKS: Record<string, string> = {
  * where the repo/snapshot is set up; every other known step is resolved by
  * running the Build / Refresh job, so its CTA connects to that action.
  */
-type StepCta = { kind: "repository" | "build"; label: string };
+type StepCta = { kind: "repository" | "build" | "interview"; label: string };
 
 const STEP_CTA: Record<string, StepCta> = {
   repository_configured: { kind: "repository", label: "Configure repository" },
@@ -105,7 +105,23 @@ export function PipelineChecklist({ steps, checksByStep, onRunBuild, buildDisabl
         const label = STEP_LABELS[s.step] ?? s.step;
         const relatedChecks = s.status === "complete" ? [] : (checksByStep[s.step] ?? []);
         const expanded = expandedStep === s.step;
-        const cta = s.step === firstIncompleteStep ? STEP_CTA[s.step] : undefined;
+        // The Interview CTA is driven by the same structured diagnostic that
+        // backs this row's "Why?" list and the settings dialog: the server
+        // sets fix_page="/interview" on `pipeline_capability_hierarchy`
+        // exactly when the run completed but produced zero capabilities (a
+        // finite structural branch, Principle 6). Never re-derive that state
+        // from the free-text `detail`.
+        const interviewFix = relatedChecks.some(
+          (c) =>
+            c.check_id === "pipeline_capability_hierarchy"
+            && c.fix_kind === "navigate"
+            && c.fix_page === "/interview",
+        );
+        const cta = s.step === firstIncompleteStep
+          ? (interviewFix
+            ? { kind: "interview" as const, label: "Review interview proposals" }
+            : STEP_CTA[s.step])
+          : undefined;
         return (
           <li key={s.step} className="text-sm">
             <div className="flex items-center gap-3">
@@ -142,6 +158,15 @@ export function PipelineChecklist({ steps, checksByStep, onRunBuild, buildDisabl
                 >
                   {cta.label}
                 </Button>
+              )}
+              {cta && cta.kind === "interview" && (
+                <Link
+                  to="/interview"
+                  data-testid={`pipeline-cta-${s.step}`}
+                  className={cn(buttonVariants({ size: "sm" }), "h-7 text-xs")}
+                >
+                  {cta.label}
+                </Link>
               )}
               {relatedChecks.length > 0 && (
                 <Button
