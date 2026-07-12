@@ -36,10 +36,24 @@ function headers(): Record<string, string> {
 export class ApiError extends Error {
   status: number;
   detail: string;
-  constructor(status: number, detail: string) {
-    super(detail);
+  code?: string;
+  nextAction?: string;
+  constructor(status: number, detail: unknown) {
+    const structured = detail && typeof detail === "object"
+      ? detail as { message?: unknown; code?: unknown; next_action?: unknown }
+      : null;
+    const message = typeof structured?.message === "string"
+      ? structured.message
+      : typeof detail === "string"
+        ? detail
+        : "Request failed";
+    super(message);
     this.status = status;
-    this.detail = detail;
+    this.detail = message;
+    this.code = typeof structured?.code === "string" ? structured.code : undefined;
+    this.nextAction = typeof structured?.next_action === "string"
+      ? structured.next_action
+      : undefined;
   }
 }
 

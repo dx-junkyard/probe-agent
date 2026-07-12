@@ -46,6 +46,7 @@ from ..interview_evidence import (
     read_evidence_snippets,
 )
 from ..interview_language import (
+    INTERVIEW_MESSAGES,
     get_interview_language,
     interview_message,
     resolve_message_language,
@@ -139,6 +140,24 @@ def _advance_stage(current_stage: str, target: str) -> str:
     except ValueError:
         return current_stage
     return target if target_idx > current_idx else current_stage
+
+
+def _review_history(rows) -> List[dict]:
+    """Return conversation evidence only for an understanding review.
+
+    Confirmation and snapshot events are workflow-control/audit records, not
+    developer-provided evidence. Older sessions wrote the confirmation text as
+    a user message, so filter every localized legacy value as well.
+    """
+    confirmation_messages = set(
+        INTERVIEW_MESSAGES["confirm_understanding_message"].values()
+    )
+    return [
+        {"role": row["role"], "content": row["content"]}
+        for row in rows
+        if row["role"] in ("user", "assistant")
+        and row["content"] not in confirmation_messages
+    ]
 
 
 def _question_entry(question) -> dict:
@@ -2302,6 +2321,12 @@ def confirm_interview_understanding(
     with get_conn() as conn:
         session = _get_session_or_404(conn, session_id, system_id)
 
+        # The Dashboard hides the confirmation control once complete. Keep a
+        # direct/retried API request idempotent so it cannot append another
+        # workflow event or alter the recorded decision.
+        if session["understanding_confirmed_at"] is not None:
+            return _session_out(session)
+
         user_turns = conn.execute(
             "SELECT COUNT(*) AS n FROM interview_message WHERE session_id = ? AND role = 'user'",
             (session_id,),
@@ -2329,7 +2354,7 @@ def confirm_interview_understanding(
         conn.execute(
             """INSERT INTO interview_message
                 (session_id, system_id, role, content, created_at)
-            VALUES (?, ?, 'user', ?, ?)""",
+            VALUES (?, ?, 'system', ?, ?)""",
             (
                 session_id,
                 system_id,
@@ -2417,6 +2442,26 @@ def update_interview_understanding(
     with get_conn() as conn:
         session = _get_session_or_404(conn, session_id, system_id)
         snapshot_id = session["snapshot_id"]
+
+        # After manual confirmation, rebuilding is meaningful only when an
+        # answer correction is waiting to be reflected. Keep this guard at
+        # the API boundary as well as in the Dashboard.
+        if (
+            (session["stage"] or "understanding_initialized") == "proposal_generation"
+            and session["understanding_confirmed_at"] is not None
+            and session["answers_revised_at"] is None
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "understanding_update_not_available",
+                    "message": (
+                        "Understanding is already confirmed. Update it after "
+                        "correcting an interview answer."
+                    ),
+                    "next_action": "generate_or_review_proposals",
+                },
+            )
 
         from ..docs_code_reconciler import reconcile
         from ..system_understanding_service import _load_graph_for_snapshot
@@ -2517,7 +2562,7 @@ def update_interview_understanding(
             "SELECT role, content FROM interview_message WHERE session_id = ? ORDER BY id",
             (session_id,),
         ).fetchall()
-        history = [{"role": r["role"], "content": r["content"]} for r in history_rows]
+        history = _review_history(history_rows)
 
         review = generate_understanding_review(
             client, config,

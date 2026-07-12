@@ -288,6 +288,23 @@ class TestReviewGeneration:
         assert len(client.calls) == 2
         assert "compact JSON object" in client.calls[1]["messages"][0]["content"]
 
+    def test_invalid_next_action_retries_with_literal_enum(self):
+        response = dict(VALID_REVIEW_RESPONSE)
+        response["suggested_next_action"] = "Generate probe proposals now"
+        client = CapturingReasoningClient([response, VALID_REVIEW_RESPONSE])
+
+        result = generate_understanding_review(
+            client, _reasoning_config(),
+            graph=_build_graph([_claim()]), reconciliation=_empty_reconciliation(),
+        )
+
+        assert result.error is None
+        assert result.suggested_next_action == "confirm_purpose"
+        assert len(client.calls) == 2
+        retry_system_prompt = client.calls[1]["messages"][0]["content"]
+        assert "suggested_next_action MUST be" in retry_system_prompt
+        assert "ready_for_proposal" in retry_system_prompt
+
     def test_runs_without_raw_documents(self):
         """Verify review runs from graph + reconciliation, not raw doc content."""
         graph = _build_graph([_claim()])
@@ -507,7 +524,8 @@ class TestOutputLanguage:
         system_msg = client.calls[0]["messages"][0]["content"]
         assert "in Japanese" in system_msg
         assert "enum values" in system_msg
-        assert result.prompt_version == "understanding-review-v2"
+        assert result.prompt_version == "understanding-review-v3"
+        assert "review_capabilities" in system_msg
 
     def test_english_directive(self, monkeypatch):
         monkeypatch.setenv("INTERVIEW_LANGUAGE", "en")

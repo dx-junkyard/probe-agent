@@ -2126,12 +2126,35 @@ describe("Interview page", () => {
     );
 
     const refreshButton = await screen.findByRole("button", { name: /理解を更新/ });
+    expect(refreshButton).not.toBeDisabled();
     fireEvent.click(refreshButton);
 
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith("/interview/sessions/7/update-understanding", {});
     });
     expect(await screen.findByTestId("answer-revision-reflected-banner")).toBeInTheDocument();
+  });
+
+  test("disables understanding refresh after confirmation until an answer is revised (Issue #229)", async () => {
+    mockInterviewApi();
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const refreshButton = await screen.findByRole("button", { name: /理解を更新/ });
+    expect(refreshButton).toBeDisabled();
+    expect(refreshButton).toHaveAttribute("title", "回答を修正した場合にのみ、理解を再構築できます");
+    expect(await screen.findByTestId("understanding-refresh-blocked-reason"))
+      .toHaveTextContent("次は提案を生成またはレビューしてください");
+    expect(screen.getByTestId("next-action")).toHaveTextContent("各提案を承認・編集・却下してください");
   });
 
   test("shows all evidence read for a turn, even when uncited (Issue #137)", async () => {

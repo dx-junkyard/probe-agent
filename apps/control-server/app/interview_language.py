@@ -65,6 +65,10 @@ INTERVIEW_MESSAGES: dict = {
         "ja": "理解のレビューに失敗しました: {error}",
         "en": "Failed to review understanding: {error}",
     },
+    "invalid_review_response": {
+        "ja": "理解レビューの応答形式が不正です。もう一度「理解を更新」を実行してください。",
+        "en": "The understanding review returned an invalid response. Run Update Understanding again.",
+    },
     "understanding_built_intro": {
         "ja": "ドキュメントとコードを分析し、初期理解を構築しました。",
         "en": "Analyzed the documentation and code and built an initial understanding.",
