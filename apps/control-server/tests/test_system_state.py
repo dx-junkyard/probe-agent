@@ -745,6 +745,32 @@ class TestDiagnosticsProjectionCompatibility:
         # llm_base_config check reliably fires and has no native counterpart.
         assert "diagnostic.llm_base_config" in items
 
+    def test_reasoning_not_run_stays_informational_while_pipeline_warning_is_primary(self):
+        # Issue #232: no reasoning run is an observation, while the missing
+        # symbol index is a real pipeline warning. The former must not become
+        # a warning/banner/CTA merely because it is projected into System State.
+        from app.system_state import StateItem, TargetUi, _diagnostic_state_item, select_primary_item
+        from app.system_diagnostics import DiagnosticCheck
+        check = DiagnosticCheck(
+            check_id="llm_last_run", category="llm",
+            title="直近の reasoning モデル実行", severity="unknown",
+            detail="reasoning 実行は未記録です。", impact="",
+            remediation="任意で reasoning 機能の疎通を確認できます。",
+            fix_kind="navigate", fix_page="/system-understanding", fix_anchor="build",
+        )
+        reasoning = _diagnostic_state_item(check)
+        pipeline = StateItem(
+            "pipeline.symbol_index.not_run", "pipeline", "warning", "missing", "build",
+            "before_next_step", "シンボル索引", "シンボル索引が未実行です。", "未実行です。",
+            target_ui=TargetUi("/system-understanding", "build", "Build / Refresh を実行"),
+        )
+
+        assert reasoning.severity == "info"
+        assert reasoning.status == "unconfirmed"
+        assert reasoning.user_action_kind == "none"
+        assert reasoning.target_ui is None
+        assert select_primary_item([reasoning, pipeline]) is pipeline
+
 
 class TestAssistantScreenContextSharesState:
     def test_screen_context_reflects_unconfirmed_understanding_severity(self, admin_client, tmp_path):

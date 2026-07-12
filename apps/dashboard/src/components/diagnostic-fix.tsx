@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useSystemDiagnostics } from "@/api/hooks";
-import { DiagnosticSeverityIcon } from "@/components/diagnostics-badge";
+import { DiagnosticSeverityIcon, SEVERITY_ORDER } from "@/components/diagnostics-badge";
 import { cn } from "@/lib/utils";
 import type { SystemDiagnosticCheck } from "@/api/types";
 
@@ -19,16 +19,30 @@ export function useDiagnosticFocus(): { anchor: string | null; checkId: string |
  * Returns the diagnostic check the current focus points at, matched by check id
  * first and falling back to the anchor. Only returns a check while the focus
  * anchor matches, so a screen highlights at most one location at a time.
+ *
+ * Several checks can share one anchor (e.g. `llm_last_run` and the pipeline
+ * checks all fix at "build"), so the anchor-only fallback picks the most
+ * severe check by the finite SEVERITY_ORDER rather than backend array order —
+ * an informational `unknown` check must never shadow an actionable
+ * warning/error in the callout.
  */
 export function useFocusedCheck(anchor: string): SystemDiagnosticCheck | null {
   const focus = useDiagnosticFocus();
   const { data } = useSystemDiagnostics();
   if (focus.anchor !== anchor) return null;
   const checks = data?.checks ?? [];
+  const exact = checks.find(
+    (c) => c.check_id === focus.checkId && c.fix_anchor === anchor,
+  );
+  if (exact) return exact;
+  const severityRank = (c: SystemDiagnosticCheck) => {
+    const rank = SEVERITY_ORDER.indexOf(c.severity);
+    return rank === -1 ? SEVERITY_ORDER.length : rank;
+  };
   return (
-    checks.find((c) => c.check_id === focus.checkId && c.fix_anchor === anchor) ??
-    checks.find((c) => c.fix_anchor === anchor) ??
-    null
+    checks
+      .filter((c) => c.fix_anchor === anchor)
+      .sort((a, b) => severityRank(a) - severityRank(b))[0] ?? null
   );
 }
 

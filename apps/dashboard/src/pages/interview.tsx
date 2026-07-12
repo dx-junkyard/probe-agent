@@ -1898,7 +1898,7 @@ git commit`}
                     <div className="rounded-md border border-destructive bg-destructive/10 p-3 mb-3 text-sm text-destructive flex items-start gap-2">
                       <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
                       <div>
-                        <div className="font-medium">理解の構築に失敗しました</div>
+                        <div className="font-medium">直近の処理でエラーが発生しました</div>
                         <div className="text-xs mt-1">{session.last_error}</div>
                       </div>
                     </div>

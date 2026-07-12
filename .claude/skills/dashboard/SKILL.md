@@ -66,6 +66,16 @@ The dashboard should support:
   `DiagnosticFixCallout` (`components/diagnostic-fix.tsx`) that highlights the
   control and shows 原因 / 次の操作 verbatim from the diagnostic — no
   client-side interpretation.
+  Several checks may share one `fix_anchor` (e.g. `llm_last_run` and the
+  pipeline checks all fix at "build"): an exact `?diagnostic=<id>` match
+  always wins, but the anchor-only fallback in `useFocusedCheck` picks the
+  most severe check by the finite `SEVERITY_ORDER` (exported from
+  `diagnostics-badge.tsx`), never backend array order — an informational
+  `unknown` check must not shadow an actionable warning/error.
+  The pipeline checklist's "Review interview proposals" CTA is driven by the
+  structured `pipeline_capability_hierarchy` check (`fix_kind: navigate`,
+  `fix_page: /interview` — the same object shown in the row's "Why?" list),
+  never by regex-matching the step's free-text `detail`.
 - Per-screen assistant (Issue #102): a floating agent button rendered by the
   app layout on every page (`components/assistant-panel.tsx`). It opens a
   right-side panel showing the screen's purpose, the current diagnostics

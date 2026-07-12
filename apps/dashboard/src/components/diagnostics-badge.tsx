@@ -11,7 +11,7 @@ import {
 import type { DiagnosticSeverity, SystemDiagnosticCheck } from "@/api/types";
 import { systemStateTarget } from "@/components/system-state";
 
-const SEVERITY_ORDER: DiagnosticSeverity[] = ["error", "blocked", "warning", "unknown", "ok"];
+export const SEVERITY_ORDER: DiagnosticSeverity[] = ["error", "blocked", "warning", "unknown", "ok"];
 
 interface GroupedCheck {
   representative: SystemDiagnosticCheck;

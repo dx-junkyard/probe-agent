@@ -621,6 +621,75 @@ def test_dialogue_turn_records_llm_config_failure(admin_client, monkeypatch):
         f"/interview/sessions/{session['id']}", headers=headers
     ).json()
     assert [m["role"] for m in detail["messages"]] == ["user"]
+    assert detail["last_error"]
+    assert "ANTHROPIC_API_KEY" in detail["last_error"]
+
+
+def test_dialogue_turn_failure_persists_last_error_and_success_clears_it(
+    admin_client, monkeypatch
+):
+    """A structured-response validation failure (e.g. the model returning too
+    many answer_options) must not just flash a toast: it has to be readable
+    from the session afterwards, and a later successful turn must clear it."""
+    from app.routes import interview as interview_routes
+    from app.interview_agent import EvidenceSelectionResult, InterviewTurnResult
+
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "parse failure"},
+        headers=headers,
+    ).json()
+    sid = session["id"]
+
+    monkeypatch.setattr(
+        interview_routes, "create_llm_client", lambda config: object()
+    )
+    monkeypatch.setattr(
+        interview_routes,
+        "select_evidence_targets",
+        lambda client, config, **kwargs: EvidenceSelectionResult(
+            provider="anthropic", model="claude-sonnet-4-5", is_mock=False,
+            need_evidence=False,
+        ),
+    )
+    monkeypatch.setattr(
+        interview_routes,
+        "generate_interview_turn",
+        lambda client, config, **kwargs: InterviewTurnResult(
+            provider="anthropic",
+            model="claude-sonnet-4-5",
+            is_mock=False,
+            error=(
+                "Failed to parse structured response: next_questions.0.answer_options "
+                "List should have at most 4 items after validation, not 5"
+            ),
+        ),
+    )
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/dialogue-turn",
+        json={"user_message": "このシステムを説明して"},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["error"]
+
+    detail = admin_client.get(f"/interview/sessions/{sid}", headers=headers).json()
+    assert detail["last_error"]
+    assert "answer_options" in detail["last_error"]
+
+    _stub_reasoning_turn(monkeypatch)
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/dialogue-turn",
+        json={"user_message": "続けます"},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["error"] is None
+
+    detail = admin_client.get(f"/interview/sessions/{sid}", headers=headers).json()
+    assert detail["last_error"] is None
 
 
 def test_update_understanding_records_llm_config_failure(admin_client, monkeypatch):
