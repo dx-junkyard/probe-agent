@@ -1277,8 +1277,10 @@ def interview_dialogue_turn(
 
             if turn.error:
                 conn.execute(
-                    "UPDATE interview_session SET updated_at = ? WHERE id = ? AND system_id = ?",
-                    (now, session_id, system_id),
+                    """UPDATE interview_session
+                       SET last_error = ?, updated_at = ?
+                       WHERE id = ? AND system_id = ?""",
+                    (turn.error, now, session_id, system_id),
                 )
                 conn.execute("COMMIT")
                 return InterviewDialogueTurnOut(
@@ -1510,6 +1512,7 @@ def interview_dialogue_turn(
                 except ValueError:
                     pass
 
+            stage_updates.append("last_error = NULL")
             stage_params.extend([session_id, system_id])
             conn.execute(
                 f"UPDATE interview_session SET {', '.join(stage_updates)} WHERE id = ? AND system_id = ?",
