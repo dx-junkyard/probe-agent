@@ -1,10 +1,13 @@
 services:
   control-server:
     build:
-      context: ./apps/control-server
+      context: .
+      dockerfile: apps/control-server/Dockerfile
     image: probe-agent/control-server:latest
     container_name: probe-control-server
     environment:
+      PROBE_SERVER_URL: http://control-server:8000
+      PROBE_API_KEY: ${PROBE_API_KEY:-}
       PROBE_DB_PATH: /data/probe.db
       CONTROL_API_KEYS: ${CONTROL_API_KEYS:-}
       CONTROL_ADMIN_USERNAME: ${CONTROL_ADMIN_USERNAME:-}

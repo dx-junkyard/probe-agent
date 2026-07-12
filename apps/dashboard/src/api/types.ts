@@ -22,7 +22,7 @@ export interface TraceEvent {
   trace_id: string;
   component_id: string;
   mode: string;
-  input: string | null;
+  input: unknown | null;
   output: string | null;
   error: string | null;
   duration_ms: number | null;

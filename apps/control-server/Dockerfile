@@ -11,8 +11,18 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends bubblewrap git \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml ./
-COPY app ./app
+#COPY pyproject.toml ./
+#COPY app ./app
+
+#-------
+COPY apps/control-server/pyproject.toml ./
+COPY apps/control-server/app ./app
+COPY packages/python-probe /opt/probe-agent/packages/python-probe
+RUN pip install --upgrade pip \
+    && pip install . \
+    && pip install /opt/probe-agent/packages/python-probe
+#-------
+
 
 RUN pip install --upgrade pip && pip install .
 

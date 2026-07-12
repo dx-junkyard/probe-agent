@@ -54,6 +54,84 @@ afterEach(() => {
   mockSystems = [];
 });
 
+// ── Components trace signal details ────────────────────────────────
+
+describe("Components page trace details", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("expands a trace to show its input, output, and error", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/components") {
+        return Promise.resolve([
+          { component_id: "order-validator", mode: "trace", trace_count: 1, last_seen: 1000 },
+        ]);
+      }
+      if (path === "/components/order-validator/traces?limit=20") {
+        return Promise.resolve([{
+          trace_id: "trace-1234567890",
+          component_id: "order-validator",
+          mode: "trace",
+          input: { args: [{ order_id: "order-42" }], kwargs: { strict: "True" } },
+          output: "{'valid': False}",
+          error: "ValidationError: missing customer",
+          duration_ms: 12.5,
+          timestamp: 1000,
+        }]);
+      }
+      if (path === "/components/order-validator/profile") {
+        return Promise.resolve(null);
+      }
+      if (path === "/components/order-validator/shadow-results?limit=20") {
+        return Promise.resolve([]);
+      }
+      if (path === "/components/order-validator/criteria") {
+        return Promise.resolve([]);
+      }
+      return Promise.resolve(null);
+    });
+
+    const { default: ComponentsPage } = await import("@/pages/components");
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/components?component=order-validator"]}>
+          <ComponentsPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const detailsButton = await screen.findByRole("button", {
+      name: "Show signal details for trace trace-1234567890",
+    });
+    expect(screen.queryByText("ValidationError: missing customer")).not.toBeInTheDocument();
+
+    fireEvent.click(detailsButton);
+
+    expect(screen.getByRole("button", {
+      name: "Hide signal details for trace trace-1234567890",
+    })).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(screen.getByRole("button", { name: /0.*object/ }));
+    expect(screen.getByText(/order-42/)).toBeInTheDocument();
+    expect(screen.getByText("{'valid': False}")).toBeInTheDocument();
+    expect(screen.getByText("ValidationError: missing customer")).toBeInTheDocument();
+    expect(screen.getByText("trace-1234567890")).toBeInTheDocument();
+
+    await waitFor(() => {
+      const componentRefreshes = mockApi.get.mock.calls.filter(([path]) => path === "/components");
+      const traceRefreshes = mockApi.get.mock.calls.filter(
+        ([path]) => path === "/components/order-validator/traces?limit=20",
+      );
+      expect(componentRefreshes.length).toBeGreaterThanOrEqual(2);
+      expect(traceRefreshes.length).toBeGreaterThanOrEqual(2);
+    }, { timeout: 3_000 });
+  });
+});
+
 vi.mock("sonner", () => ({
   toast: {
     success: vi.fn(),
