@@ -233,10 +233,24 @@ probe plans / experiments を同じ分析文脈で返す。
 前者は現 snapshot のみを参照し、後者は Interview baseline の snapshot
 跨ぎ再利用に対応するなど、判定材料が完全には一致しない。統合（前者を
 後者へ吸収し、Hub の表示も canonical `StateItem` から投影する）は
-Issue #206 / #207 が所有する。それまでの間、両系統の判定条件を変える
+Issue #235 の Sub 3（#238）/ Sub 4（#239）が所有する（旧 #206 / #207 は
+#235 に集約して閉じられた）。それまでの間、両系統の判定条件を変える
 変更は必ず両方（`system_understanding_service` / `system_state` /
 `system_diagnostics`）へ同時に適用する（Issue #210 の
 capability_hierarchy 0 件 warning が先例）。
+
+Issue #236 はこの「両系統」の事実取得を `app/state_facts.py` に一本化し、
+`system_understanding_service._build_next_actions` / `_derive_stage_statuses`
+が独自に持っていた単純な `purpose_defined` 判定（`_load_purpose` の dict
+から `bool(name or summary)` を取る簡易版）を、`system_state.evaluate_understanding`
+の 5 分岐（`satisfied_current | baseline_reusable | diff_impacted |
+unconfirmed | missing_baseline`）の `kind == "satisfied_current"` への
+縮約に置き換えた（`_purpose_defined_from_understanding_status`）。これに
+より「現 snapshot で Purpose/Capabilities が定義されているか」の一次判定
+は 3 モジュールで完全に共有される。ただし `_derive_primary_action` /
+`_build_next_actions` 自体（baseline 再利用や diff_impacted を経路に含め
+た出し分け）を `StateItem` の投影に置き換える統合は Issue #235 の
+Sub 3（#238）の領分であり、#236 は対象外。
 
 ## Next Actions
 

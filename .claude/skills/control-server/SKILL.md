@@ -40,6 +40,48 @@ mapping, planning, and interpretation must call a reasoning model through the
 provider-neutral LLM layer. Do not reuse `app/evaluator.py` as a heuristic
 fallback for intelligence work.
 
+## Shared state-fact retrieval layer (issue #236)
+
+- `app/state_facts.py` is the single home for raw, System-scoped DB reads
+  used to derive user-facing state: repository configuration, HEAD / working
+  tree state (via `git_ops`), ready/latest snapshot lookup, pipeline step
+  rows (`intelligence_runs` / `system_understanding_build_steps` /
+  `code_entrypoints` / `understanding_graph_snapshots` / `code_symbols`
+  presence), the Purpose/Capabilities base facts
+  (`purpose_defined_in_snapshot`, `capability_count_in_snapshot`), build-job
+  running/stuck detection, and SDK connectivity counts +
+  `classify_connectivity_state`. Every function is a pure `(conn, ...) ->
+  value` reader; it never builds a `StateItem` / `PipelineStep` / API
+  response and never calls a reasoning model (Principle 6). `system_state.py`
+  (`StateItem` construction, `evaluate_understanding` and its baseline/diff
+  orchestration), `system_understanding_service.py` (`PipelineStep` /
+  `NextAction` / `StageStatus` construction), and
+  `routes/connectivity.py` all read facts from here instead of writing their
+  own SQL. When adding a new fact these three surfaces would otherwise want
+  independently, add the getter to `state_facts.py` first.
+- `system_state.evaluate_understanding` (System Purpose / Core Capabilities
+  baseline-reuse and diff-impact) stays the canonical orchestrator in
+  `system_state.py` per the System State Assessment section below; it now
+  calls `state_facts.purpose_defined_in_snapshot` /
+  `state_facts.capability_count_in_snapshot` for its per-snapshot base
+  facts. `system_understanding_service._build_next_actions` /
+  `_derive_stage_statuses` take a `purpose_defined: bool` (not the purpose
+  dict) computed once in `get_system_understanding` via
+  `_purpose_defined_from_understanding_status(evaluate_understanding(...))`
+  -- a reduction of the 5-way `UnderstandingStatus.kind` to a bool where only
+  `satisfied_current` is `True` (matching the pre-#236 local formula's
+  actual behavior; see `tests/test_state_facts.py`'s
+  `TestPurposeDefinedReductionEquivalence` for the equivalence proof and its
+  one documented narrow edge case). Do not reintroduce a second local
+  purpose-definedness formula in `system_understanding_service.py` --
+  compute it via `evaluate_understanding` and the reduction helper.
+- Tests: `tests/test_state_facts.py` covers each getter directly plus System
+  isolation; regression coverage for the three consuming APIs across
+  representative scenarios (unconfigured / snapshot only / pipeline
+  complete / connectivity with traces) lives in each API's own existing test
+  file (`test_system_state.py`, `test_system_understanding.py`,
+  `test_connectivity.py`).
+
 ## System State Assessment (issue #193)
 
 - `GET /system-state` (`app/system_state.py`, `routes/system_state.py`)

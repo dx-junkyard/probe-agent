@@ -19,8 +19,9 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
+from . import state_facts
 from .db import get_conn
-from .system_state import _capability_count_in_current_snapshot
+from .system_state import UnderstandingStatus, evaluate_understanding
 
 logger = logging.getLogger(__name__)
 
@@ -124,19 +125,13 @@ class SystemUnderstandingSummary:
 
 
 def _check_repository_configured(conn, system_id: int) -> PipelineStep:
-    row = conn.execute(
-        "SELECT 1 FROM repository_configs WHERE system_id = ?", (system_id,)
-    ).fetchone()
-    if row:
+    if state_facts.has_repository_configured(conn, system_id):
         return PipelineStep("repository_configured", "complete")
     return PipelineStep("repository_configured", "missing")
 
 
 def _get_latest_ready_snapshot(conn, system_id: int):
-    return conn.execute(
-        "SELECT * FROM repository_snapshots WHERE system_id = ? AND status = 'ready' ORDER BY id DESC LIMIT 1",
-        (system_id,),
-    ).fetchone()
+    return state_facts.get_latest_ready_snapshot(conn, system_id)
 
 
 def _check_snapshot_ready(conn, system_id: int, snapshot_row) -> PipelineStep:
@@ -160,13 +155,7 @@ def _is_reasoning_model_available() -> bool:
 def _check_documentation_indexed(conn, system_id: int, snapshot_id: Optional[int]) -> PipelineStep:
     if snapshot_id is None:
         return PipelineStep("documentation_indexed", "missing")
-    job_step = conn.execute(
-        """SELECT status, error, artifact_provenance
-           FROM system_understanding_build_steps
-           WHERE system_id = ? AND snapshot_id = ? AND step = 'documentation_index'
-           ORDER BY id DESC LIMIT 1""",
-        (system_id, snapshot_id),
-    ).fetchone()
+    job_step = state_facts.get_latest_build_step(conn, system_id, snapshot_id, "documentation_index")
     if job_step:
         if job_step["status"] == "completed":
             try:
@@ -193,10 +182,9 @@ def _check_documentation_indexed(conn, system_id: int, snapshot_id: Optional[int
                 "blocked",
                 detail=job_step["error"] or "documentation_index blocked",
             )
-    row = conn.execute(
-        "SELECT id, status FROM intelligence_runs WHERE system_id = ? AND run_type IN ('draft_generation', 'repository_drafts') AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
-        (system_id, snapshot_id),
-    ).fetchone()
+    row = state_facts.get_latest_intelligence_run(
+        conn, system_id, snapshot_id, ["draft_generation", "repository_drafts"]
+    )
     if row:
         if row["status"] == "completed":
             return PipelineStep("documentation_indexed", "complete")
@@ -207,11 +195,7 @@ def _check_documentation_indexed(conn, system_id: int, snapshot_id: Optional[int
 def _check_documentation_claims_scanned(conn, system_id: int, snapshot_id: Optional[int]) -> PipelineStep:
     if snapshot_id is None:
         return PipelineStep("documentation_claims_scanned", "missing")
-    row = conn.execute(
-        "SELECT id FROM understanding_graph_snapshots WHERE system_id = ? AND snapshot_id = ? LIMIT 1",
-        (system_id, snapshot_id),
-    ).fetchone()
-    if row:
+    if state_facts.has_understanding_graph_snapshot(conn, system_id, snapshot_id):
         return PipelineStep("documentation_claims_scanned", "complete")
     if not _is_reasoning_model_available():
         return PipelineStep("documentation_claims_scanned", "blocked", detail="Reasoning model not configured")
@@ -221,10 +205,7 @@ def _check_documentation_claims_scanned(conn, system_id: int, snapshot_id: Optio
 def _check_symbols_indexed(conn, system_id: int, snapshot_id: Optional[int]) -> PipelineStep:
     if snapshot_id is None:
         return PipelineStep("symbols_indexed", "missing")
-    row = conn.execute(
-        "SELECT id, status FROM intelligence_runs WHERE system_id = ? AND run_type = 'symbol_index' AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
-        (system_id, snapshot_id),
-    ).fetchone()
+    row = state_facts.get_latest_intelligence_run(conn, system_id, snapshot_id, ["symbol_index"])
     if row:
         if row["status"] == "completed":
             return PipelineStep("symbols_indexed", "complete")
@@ -235,11 +216,7 @@ def _check_symbols_indexed(conn, system_id: int, snapshot_id: Optional[int]) -> 
 def _check_entrypoints_discovered(conn, system_id: int, snapshot_id: Optional[int]) -> PipelineStep:
     if snapshot_id is None:
         return PipelineStep("entrypoints_discovered", "missing")
-    row = conn.execute(
-        "SELECT id FROM code_entrypoints WHERE system_id = ? AND snapshot_id = ? LIMIT 1",
-        (system_id, snapshot_id),
-    ).fetchone()
-    if row:
+    if state_facts.has_code_entrypoints(conn, system_id, snapshot_id):
         return PipelineStep("entrypoints_discovered", "complete")
     return PipelineStep("entrypoints_discovered", "missing")
 
@@ -247,17 +224,11 @@ def _check_entrypoints_discovered(conn, system_id: int, snapshot_id: Optional[in
 def _check_docs_code_reconciled(conn, system_id: int, snapshot_id: Optional[int]) -> PipelineStep:
     if snapshot_id is None:
         return PipelineStep("docs_code_reconciled", "missing")
-    graph_row = conn.execute(
-        "SELECT id FROM understanding_graph_snapshots WHERE system_id = ? AND snapshot_id = ? LIMIT 1",
-        (system_id, snapshot_id),
-    ).fetchone()
-    sym_row = conn.execute(
-        "SELECT id FROM code_symbols WHERE system_id = ? AND snapshot_id = ? LIMIT 1",
-        (system_id, snapshot_id),
-    ).fetchone()
-    if graph_row and sym_row:
+    has_graph = state_facts.has_understanding_graph_snapshot(conn, system_id, snapshot_id)
+    has_symbols = state_facts.has_code_symbols(conn, system_id, snapshot_id)
+    if has_graph and has_symbols:
         return PipelineStep("docs_code_reconciled", "complete")
-    if graph_row or sym_row:
+    if has_graph or has_symbols:
         return PipelineStep("docs_code_reconciled", "warning", detail="Partial data available")
     return PipelineStep("docs_code_reconciled", "missing")
 
@@ -265,10 +236,7 @@ def _check_docs_code_reconciled(conn, system_id: int, snapshot_id: Optional[int]
 def _check_capability_hierarchy_ready(conn, system_id: int, snapshot_id: Optional[int]) -> PipelineStep:
     if snapshot_id is None:
         return PipelineStep("capability_hierarchy_ready", "missing")
-    row = conn.execute(
-        "SELECT id, status FROM intelligence_runs WHERE system_id = ? AND run_type = 'capability_hierarchy' AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
-        (system_id, snapshot_id),
-    ).fetchone()
+    row = state_facts.get_latest_intelligence_run(conn, system_id, snapshot_id, ["capability_hierarchy"])
     if row:
         if row["status"] == "completed":
             # Issue #210: a completed run can still produce zero capabilities
@@ -277,7 +245,7 @@ def _check_capability_hierarchy_ready(conn, system_id: int, snapshot_id: Optiona
             # _check_documentation_indexed above instead of reporting
             # "complete" while the pipeline checklist and the System State
             # banner disagree about whether the hierarchy is ready.
-            if _capability_count_in_current_snapshot(conn, system_id, snapshot_id) == 0:
+            if state_facts.capability_count_in_snapshot(conn, system_id, snapshot_id) == 0:
                 return PipelineStep(
                     "capability_hierarchy_ready",
                     "warning",
@@ -751,7 +719,7 @@ def _compute_gap_summary(gaps: List[Dict[str, Any]]) -> List[GapSummary]:
 
 def _build_next_actions(
     pipeline: List[PipelineStep],
-    purpose: Optional[Dict[str, Any]],
+    purpose_defined: bool,
     capabilities: List[Dict[str, Any]],
     metadata_coverage: Optional[MetadataCoverage],
     gap_count: int,
@@ -841,7 +809,6 @@ def _build_next_actions(
     pipeline_complete = all(s.status == "complete" for s in pipeline)
 
     if pipeline_complete:
-        purpose_defined = bool(purpose and (purpose.get("summary") or purpose.get("name")))
         if not purpose_defined:
             actions.append(NextAction(
                 action="Define System Purpose",
@@ -1100,7 +1067,7 @@ def _load_total_experiment_count(conn, system_id: int) -> int:
 
 def _derive_stage_statuses(
     pipeline: List[PipelineStep],
-    purpose: Optional[Dict[str, Any]],
+    purpose_defined: bool,
     capabilities: List[Dict[str, Any]],
     gap_count: int,
     gap_summary: List[GapSummary],
@@ -1128,7 +1095,6 @@ def _derive_stage_statuses(
     elif all(s.status == "missing" for s in pipeline):
         understand_status = "not_started"
     else:
-        purpose_defined = bool(purpose and (purpose.get("summary") or purpose.get("name")))
         if (
             all(s.status == "complete" for s in pipeline)
             and purpose_defined
@@ -1258,6 +1224,27 @@ def _check_understanding_refresh_recommended(conn, system_id: int) -> bool:
     return latest_materialized_at > build_row["completed_at"]
 
 
+def _purpose_defined_from_understanding_status(status: UnderstandingStatus) -> bool:
+    """Reduce ``evaluate_understanding``'s 5-way classification to the single
+    bool this module's next-actions / stage-status derivation needs
+    (Issue #236).
+
+    Only ``satisfied_current`` means System Purpose is structurally present
+    for *this* snapshot right now -- the same condition the pre-#236 local
+    check (``bool(purpose and (purpose.get("summary") or purpose.get("name")))``
+    over ``_load_purpose``'s dict) tested, which is exactly
+    ``state_facts.purpose_defined_in_snapshot`` (see
+    ``evaluate_understanding``'s ``defined`` variable). The other four
+    branches (``baseline_reusable``, ``diff_impacted``, ``unconfirmed``,
+    ``missing_baseline``) all mean "not defined for this snapshot" here --
+    this call site never consulted cross-snapshot baseline reuse before
+    #236 and must not start now (behavior-preserving refactor). See
+    ``tests/test_state_facts.py`` for the equivalence proof against the old
+    formula.
+    """
+    return status.kind == "satisfied_current"
+
+
 def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
     """Read-only: aggregate persisted state into a system understanding summary."""
     with get_conn() as conn:
@@ -1269,6 +1256,7 @@ def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
             pipeline=pipeline,
         )
 
+        purpose_defined = False
         if snapshot_row:
             snapshot_id = snapshot_row["id"]
             summary.snapshot_id = snapshot_id
@@ -1283,6 +1271,10 @@ def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
             _attach_issue_drafts(conn, system_id, summary.gaps)
             summary.gap_summary = _compute_gap_summary(summary.gaps)
 
+            purpose_defined = _purpose_defined_from_understanding_status(
+                evaluate_understanding(conn, system_id, snapshot_id, purpose=True)
+            )
+
         proposed_plan_ids, approved_plan_ids_without_patch, approved_plan_total = (
             _load_pending_plan_action_ids(conn, system_id)
         )
@@ -1290,7 +1282,7 @@ def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
 
         summary.next_actions = _build_next_actions(
             pipeline,
-            summary.purpose,
+            purpose_defined,
             summary.capabilities,
             summary.metadata_coverage,
             len(summary.gaps),
@@ -1312,7 +1304,7 @@ def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
 
         summary.stages = _derive_stage_statuses(
             pipeline,
-            summary.purpose,
+            purpose_defined,
             summary.capabilities,
             len(summary.gaps),
             summary.gap_summary,

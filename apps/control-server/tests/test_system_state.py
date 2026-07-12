@@ -823,3 +823,85 @@ class TestAssistantScreenContextSharesState:
         checks_by_id = {c["check_id"]: c for c in ctx["screen_checks"]}
         assert checks_by_id["system_purpose"]["severity"] == "warning"
         assert checks_by_id["system_capabilities"]["severity"] == "warning"
+
+
+class TestIssue236FactsExtractionRegression:
+    """Issue #236: repository config, ready-snapshot, pipeline-step, and
+    Purpose/Capabilities facts were consolidated into app/state_facts.py.
+    This pins GET /system-state's response shape across representative
+    scenarios (unconfigured / snapshot only / pipeline complete) so a
+    regression in the shared facts layer is caught here.
+    """
+
+    def test_unconfigured_system_response_shape(self, admin_client):
+        _, _, hdrs = _setup(admin_client)
+        _, items = _get_state(admin_client, hdrs)
+
+        assert items["repository.configuration.missing"]["status"] == "missing"
+        assert items["snapshot.ready.missing"]["status"] == "missing"
+        assert not any(i.startswith("pipeline.") for i in items)
+        assert not any(i.startswith("understanding.") for i in items)
+
+    def test_snapshot_only_response_shape(self, admin_client, tmp_path):
+        _, sys, hdrs = _setup(admin_client)
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+
+        _, items = _get_state(admin_client, hdrs)
+        assert "repository.configuration.missing" not in items
+        assert "snapshot.ready.missing" not in items
+        assert "repository.snapshot.stale" not in items
+        assert items["understanding.purpose.missing_baseline"]["status"] == "missing"
+        assert items["understanding.capabilities.missing_baseline"]["status"] == "missing"
+        assert items["pipeline.symbol_index.not_run"]["status"] == "missing"
+
+    def test_pipeline_complete_response_shape(self, admin_client, tmp_path):
+        """Every pipeline step system_state.py tracks is complete and
+        Purpose/Core Capabilities are satisfied for the current snapshot --
+        the highest-risk scenario for state_facts.py since every pipeline
+        raw-fact getter and both purpose/capability base facts are exercised
+        for a non-empty result at once."""
+        _, sys, hdrs = _setup(admin_client)
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+        snapshot_id = snap.json()["id"]
+
+        _insert_intelligence_run(sys["id"], snapshot_id, "symbol_index", "completed")
+        _insert_intelligence_run(sys["id"], snapshot_id, "entrypoint_index", "completed")
+        build_id = _insert_active_build(sys["id"], snapshot_id)
+        _insert_build_step(sys["id"], snapshot_id, build_id, "documentation_index", "completed")
+        run_id = _insert_intelligence_run(sys["id"], snapshot_id, "capability_hierarchy", "completed")
+        _insert_capability_node(sys["id"], snapshot_id, run_id, node_type="purpose", name="Test system")
+        _insert_capability_node(sys["id"], snapshot_id, run_id, node_type="capability", name="Item management")
+
+        data, items = _get_state(admin_client, hdrs)
+        assert not any(i.startswith("pipeline.") for i in items)
+        assert "repository.configuration.missing" not in items
+        assert "snapshot.ready.missing" not in items
+        assert "repository.snapshot.stale" not in items
+        assert items["understanding.purpose.satisfied"]["status"] == "satisfied"
+        assert items["understanding.purpose.satisfied"]["severity"] == "ok"
+        assert items["understanding.capabilities.satisfied"]["status"] == "satisfied"
+        assert items["understanding.capabilities.satisfied"]["severity"] == "ok"
+
+        # /repository/system-understanding agrees: no purpose/capabilities gap.
+        su_r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert su_r.status_code == 200, su_r.text
+        su_data = su_r.json()
+        assert su_data["purpose"]["name"] == "Test system"
+        assert len(su_data["capabilities"]) == 1
+        labels = [a["action"] for a in su_data["next_actions"]]
+        assert "Define System Purpose" not in labels
+        assert "Identify main system capabilities" not in labels

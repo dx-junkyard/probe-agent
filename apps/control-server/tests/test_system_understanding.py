@@ -994,7 +994,7 @@ class TestNextActionsPriority:
 
         actions = _build_next_actions(
             self._incomplete_pipeline("symbols_indexed"),
-            purpose=None,
+            purpose_defined=False,
             capabilities=[],
             metadata_coverage=None,
             gap_count=0,
@@ -1008,7 +1008,7 @@ class TestNextActionsPriority:
 
         actions = _build_next_actions(
             self._incomplete_pipeline("documentation_claims_scanned"),
-            purpose={"name": "Sys", "summary": "Does things"},
+            purpose_defined=True,
             capabilities=[{"name": "Cap"}],
             metadata_coverage=MetadataCoverage(symbol_count=10, symbols_with_source_metadata=10),
             gap_count=0,
@@ -1021,7 +1021,7 @@ class TestNextActionsPriority:
 
         actions = _build_next_actions(
             self._incomplete_pipeline("docs_code_reconciled"),
-            purpose={"name": "Sys", "summary": "Does things"},
+            purpose_defined=True,
             capabilities=[{"name": "Cap"}],
             metadata_coverage=MetadataCoverage(symbol_count=10, symbols_with_source_metadata=10),
             gap_count=0,
@@ -1034,7 +1034,7 @@ class TestNextActionsPriority:
 
         actions = _build_next_actions(
             self._complete_pipeline(),
-            purpose=None,
+            purpose_defined=False,
             capabilities=[{"name": "Do things"}],
             metadata_coverage=None,
             gap_count=3,
@@ -1052,7 +1052,7 @@ class TestNextActionsPriority:
 
         actions = _build_next_actions(
             self._complete_pipeline(),
-            purpose={"name": "Sys", "summary": "Does things"},
+            purpose_defined=True,
             capabilities=[],
             metadata_coverage=None,
             gap_count=0,
@@ -1065,7 +1065,7 @@ class TestNextActionsPriority:
 
         actions = _build_next_actions(
             self._complete_pipeline(),
-            purpose={"name": "Sys", "summary": "Does things"},
+            purpose_defined=True,
             capabilities=[{"name": "Cap"}],
             metadata_coverage=MetadataCoverage(symbol_count=10, symbols_with_source_metadata=0),
             gap_count=2,
@@ -1078,7 +1078,7 @@ class TestNextActionsPriority:
 
         actions = _build_next_actions(
             self._complete_pipeline(),
-            purpose={"name": "Sys", "summary": "Does things"},
+            purpose_defined=True,
             capabilities=[{"name": "Cap"}],
             metadata_coverage=None,
             gap_count=3,
@@ -1102,7 +1102,7 @@ class TestNextActionsPriority:
 
         actions = _build_next_actions(
             self._complete_pipeline(),
-            purpose={"name": "Sys", "summary": "Does things"},
+            purpose_defined=True,
             capabilities=[{"name": "Cap"}],
             metadata_coverage=None,
             gap_count=3,
@@ -1120,7 +1120,7 @@ class TestNextActionsPriority:
 
         actions = _build_next_actions(
             self._complete_pipeline(),
-            purpose={"name": "Sys", "summary": "Does things"},
+            purpose_defined=True,
             capabilities=[{"name": "Cap"}],
             metadata_coverage=MetadataCoverage(symbol_count=10, symbols_with_source_metadata=10),
             gap_count=0,
@@ -1133,7 +1133,7 @@ class TestNextActionsPriority:
 
         actions = _build_next_actions(
             self._complete_pipeline(),
-            purpose=None,
+            purpose_defined=False,
             capabilities=[],
             metadata_coverage=MetadataCoverage(symbol_count=10, symbols_with_source_metadata=0),
             gap_count=2,
@@ -1150,7 +1150,7 @@ class TestNextActionsPriority:
 
         actions = _build_next_actions(
             self._incomplete_pipeline("symbols_indexed"),
-            purpose=None,
+            purpose_defined=False,
             capabilities=[],
             metadata_coverage=None,
             gap_count=0,
@@ -1170,7 +1170,7 @@ class TestNextActionsPriority:
 
         actions = _build_next_actions(
             self._complete_pipeline(),
-            purpose={"name": "Sys", "summary": "Does things"},
+            purpose_defined=True,
             capabilities=[{"name": "Cap"}],
             metadata_coverage=None,
             gap_count=0,
@@ -1186,7 +1186,7 @@ class TestNextActionsPriority:
 
         actions = _build_next_actions(
             self._complete_pipeline(),
-            purpose={"name": "Sys", "summary": "Does things"},
+            purpose_defined=True,
             capabilities=[{"name": "Cap"}],
             metadata_coverage=None,
             gap_count=0,
@@ -1202,7 +1202,7 @@ class TestNextActionsPriority:
 
         actions = _build_next_actions(
             self._complete_pipeline(),
-            purpose={"name": "Sys", "summary": "Does things"},
+            purpose_defined=True,
             capabilities=[{"name": "Cap"}],
             metadata_coverage=None,
             gap_count=0,
@@ -1218,7 +1218,7 @@ class TestNextActionsPriority:
 
         actions = _build_next_actions(
             self._complete_pipeline(),
-            purpose={"name": "Sys", "summary": "Does things"},
+            purpose_defined=True,
             capabilities=[{"name": "Cap"}],
             metadata_coverage=None,
             gap_count=0,
@@ -1258,7 +1258,7 @@ class TestDerivePrimaryAction:
             PipelineStep("snapshot_ready", "missing"),
         ]
         next_actions = _build_next_actions(
-            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+            pipeline, purpose_defined=False, capabilities=[], metadata_coverage=None, gap_count=0,
         )
         primary = _derive_primary_action(pipeline, next_actions, latest_build=None)
 
@@ -1276,7 +1276,7 @@ class TestDerivePrimaryAction:
             PipelineStep("snapshot_ready", "missing"),
         ]
         next_actions = _build_next_actions(
-            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+            pipeline, purpose_defined=False, capabilities=[], metadata_coverage=None, gap_count=0,
         )
         primary = _derive_primary_action(pipeline, next_actions, latest_build=None)
 
@@ -1295,7 +1295,7 @@ class TestDerivePrimaryAction:
             PipelineStep("snapshot_ready", "missing"),
         ]
         next_actions = _build_next_actions(
-            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+            pipeline, purpose_defined=False, capabilities=[], metadata_coverage=None, gap_count=0,
         )
         primary = _derive_primary_action(
             pipeline, next_actions, latest_build={"status": "running"},
@@ -1309,7 +1309,7 @@ class TestDerivePrimaryAction:
 
         pipeline = self._incomplete_pipeline("symbols_indexed")
         next_actions = _build_next_actions(
-            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+            pipeline, purpose_defined=False, capabilities=[], metadata_coverage=None, gap_count=0,
         )
         primary = _derive_primary_action(pipeline, next_actions, latest_build=None)
 
@@ -1324,7 +1324,7 @@ class TestDerivePrimaryAction:
 
         pipeline = self._incomplete_pipeline("symbols_indexed", "entrypoints_discovered")
         next_actions = _build_next_actions(
-            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+            pipeline, purpose_defined=False, capabilities=[], metadata_coverage=None, gap_count=0,
         )
         primary = _derive_primary_action(pipeline, next_actions, latest_build=None)
 
@@ -1338,7 +1338,7 @@ class TestDerivePrimaryAction:
 
         pipeline = self._incomplete_pipeline("symbols_indexed")
         next_actions = _build_next_actions(
-            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+            pipeline, purpose_defined=False, capabilities=[], metadata_coverage=None, gap_count=0,
         )
         primary = _derive_primary_action(
             pipeline, next_actions, latest_build={"status": status},
@@ -1352,7 +1352,7 @@ class TestDerivePrimaryAction:
 
         pipeline = self._incomplete_pipeline("symbols_indexed")
         next_actions = _build_next_actions(
-            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+            pipeline, purpose_defined=False, capabilities=[], metadata_coverage=None, gap_count=0,
         )
         primary = _derive_primary_action(
             pipeline, next_actions, latest_build={"status": status},
@@ -1366,7 +1366,7 @@ class TestDerivePrimaryAction:
 
         pipeline = self._complete_pipeline()
         next_actions = _build_next_actions(
-            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+            pipeline, purpose_defined=False, capabilities=[], metadata_coverage=None, gap_count=0,
         )
         primary = _derive_primary_action(pipeline, next_actions, latest_build=None)
 
@@ -1380,7 +1380,7 @@ class TestDerivePrimaryAction:
 
         pipeline = self._complete_pipeline()
         next_actions = _build_next_actions(
-            pipeline, purpose=None, capabilities=[], metadata_coverage=None, gap_count=0,
+            pipeline, purpose_defined=False, capabilities=[], metadata_coverage=None, gap_count=0,
         )
         primary = _derive_primary_action(
             pipeline, next_actions, latest_build={"status": "completed"},
@@ -1395,7 +1395,7 @@ class TestDerivePrimaryAction:
         pipeline = self._complete_pipeline()
         next_actions = _build_next_actions(
             pipeline,
-            purpose={"name": "Sys", "summary": "Does things"},
+            purpose_defined=True,
             capabilities=[{"name": "Cap"}],
             metadata_coverage=None,
             gap_count=0,
@@ -1439,7 +1439,7 @@ class TestDeriveStageStatuses:
         from app.system_understanding_service import GapSummary, _derive_stage_statuses
 
         defaults = dict(
-            purpose={"name": "Sys", "summary": "Does things"},
+            purpose_defined=True,
             capabilities=[{"name": "Cap"}],
             gap_count=0,
             gap_summary=[],
@@ -1467,7 +1467,7 @@ class TestDeriveStageStatuses:
         from app.system_understanding_service import PIPELINE_STEPS, PipelineStep
 
         pipeline = [PipelineStep(step, "missing") for step in PIPELINE_STEPS]
-        stages = self._derive(pipeline, purpose=None, capabilities=[])
+        stages = self._derive(pipeline, purpose_defined=False, capabilities=[])
 
         assert stages["understand"].status == "not_started"
 
@@ -1491,14 +1491,14 @@ class TestDeriveStageStatuses:
 
     def test_understand_in_progress_when_pipeline_complete_but_no_purpose(self):
         pipeline = self._complete_pipeline()
-        stages = self._derive(pipeline, purpose=None, capabilities=[{"name": "Cap"}])
+        stages = self._derive(pipeline, purpose_defined=False, capabilities=[{"name": "Cap"}])
 
         assert stages["understand"].status == "in_progress"
 
     def test_understand_in_progress_when_pipeline_complete_but_no_capabilities(self):
         pipeline = self._complete_pipeline()
         stages = self._derive(
-            pipeline, purpose={"name": "Sys", "summary": "s"}, capabilities=[],
+            pipeline, purpose_defined=True, capabilities=[],
         )
 
         assert stages["understand"].status == "in_progress"
@@ -1897,3 +1897,228 @@ class TestGapTrendAndRefreshRecommended:
         assert r_b.status_code == 200, r_b.text
         assert r_b.json()["gap_trend"] == []
         assert r_b.json()["understanding_refresh_recommended"] is False
+
+
+class TestIssue236FactsExtractionRegression:
+    """Issue #236: state-fact retrieval was consolidated into app/state_facts.py
+    and system_understanding_service's own local ``purpose_defined`` check was
+    replaced by a reduction of system_state.evaluate_understanding's 5-way
+    classification. These tests pin GET /repository/system-understanding's
+    response shape across representative scenarios (unconfigured / snapshot
+    only / pipeline complete) so a regression in the shared facts layer or in
+    the purpose_defined reduction is caught here, not just in unit tests of
+    the private helpers.
+    """
+
+    def _insert_intelligence_run(self, system_id, snapshot_id, run_type, status):
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO intelligence_runs
+                       (system_id, snapshot_id, run_type, provider, model,
+                        prompt_version, schema_version, decision_method,
+                        status, is_mock, started_at, completed_at)
+                   VALUES (?, ?, ?, 'deterministic', 'none',
+                           'v1', 'v1', 'deterministic', ?, 0, 0, 0)""",
+                (system_id, snapshot_id, run_type, status),
+            )
+            return cur.lastrowid
+
+    def _insert_build_step(self, system_id, snapshot_id, step, status):
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            build = conn.execute(
+                """INSERT INTO system_understanding_builds
+                       (system_id, snapshot_id, status, current_step, heartbeat_at, started_at, created_at)
+                   VALUES (?, ?, 'completed', NULL, 0, 0, 0)""",
+                (system_id, snapshot_id),
+            )
+            conn.execute(
+                """INSERT INTO system_understanding_build_steps
+                       (build_id, system_id, snapshot_id, step, status, artifact_provenance,
+                        heartbeat_at, started_at, created_at)
+                   VALUES (?, ?, ?, ?, ?, '{"chunk_count": 1}', 0, 0, 0)""",
+                (build.lastrowid, system_id, snapshot_id, step, status),
+            )
+
+    def _insert_understanding_graph_snapshot(self, system_id, snapshot_id):
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO understanding_graph_snapshots
+                       (system_id, snapshot_id, graph_json, source_hash, claim_count,
+                        confidence_summary, created_at)
+                   VALUES (?, ?, '{}', '', 0, '{}', 0)""",
+                (system_id, snapshot_id),
+            )
+
+    def _insert_code_symbol(self, system_id, snapshot_id):
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO code_symbols
+                       (snapshot_id, system_id, path, qualified_name, kind, start_line, end_line)
+                   VALUES (?, ?, 'src/main.py', 'list_items', 'function', 1, 2)""",
+                (snapshot_id, system_id),
+            )
+
+    def _insert_code_entrypoint(self, system_id, snapshot_id):
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO code_entrypoints
+                       (system_id, snapshot_id, entrypoint_type, entrypoint_id, category, label,
+                        handler_path, handler_qualified_name, line_start, line_end, created_at)
+                   VALUES (?, ?, 'api', 'GET /items', 'api', 'List items',
+                           'src/main.py', 'list_items', 1, 2, 0)""",
+                (system_id, snapshot_id),
+            )
+
+    def _insert_purpose_and_capability_nodes(self, system_id, snapshot_id, run_id):
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO capability_hierarchy_nodes
+                       (system_id, snapshot_id, intelligence_run_id, node_type, name, summary, created_at)
+                   VALUES (?, ?, ?, 'purpose', 'Test system', 'Serves test items.', 0)""",
+                (system_id, snapshot_id, run_id),
+            )
+            conn.execute(
+                """INSERT INTO capability_hierarchy_nodes
+                       (system_id, snapshot_id, intelligence_run_id, node_type, name, summary,
+                        entrypoint_id, created_at)
+                   VALUES (?, ?, ?, 'capability', 'Item management', 'Manages items.',
+                           (SELECT id FROM code_entrypoints WHERE system_id = ? AND snapshot_id = ? LIMIT 1), 0)""",
+                (system_id, snapshot_id, run_id, system_id, snapshot_id),
+            )
+
+    def test_unconfigured_system_response_shape(self, admin_client):
+        """未設定: no repository configured at all."""
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "issue236-unconfigured")
+        hdrs = _headers(token, sys["id"])
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["snapshot_id"] is None
+        assert data["purpose"] is None
+        assert data["capabilities"] == []
+        pipeline = {s["step"]: s["status"] for s in data["pipeline"]}
+        assert pipeline["repository_configured"] == "missing"
+        assert pipeline["snapshot_ready"] == "missing"
+        assert data["next_actions"][0]["action"] == "Configure repository"
+        assert data["stages"][0]["stage"] == "understand"
+        assert data["stages"][0]["status"] == "not_started"
+
+    def test_snapshot_only_response_shape(self, admin_client, tmp_path):
+        """snapshot のみ: repository configured and a ready snapshot exists,
+        but no build has run yet -- pipeline steps stay missing/blocked."""
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "issue236-snapshot-only")
+        hdrs = _headers(token, sys["id"])
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["snapshot_id"] == snap.json()["id"]
+        assert data["commit_sha"] == sha
+        assert data["purpose"] is None
+        assert data["capabilities"] == []
+        pipeline = {s["step"]: s["status"] for s in data["pipeline"]}
+        assert pipeline["repository_configured"] == "complete"
+        assert pipeline["snapshot_ready"] == "complete"
+        assert pipeline["symbols_indexed"] == "missing"
+        assert data["stages"][0]["stage"] == "understand"
+        # documentation_claims_scanned is blocked (no reasoning model under
+        # the mock provider), which _derive_stage_statuses ranks above
+        # in_progress -- both are "not complete yet", which is what this
+        # scenario asserts; the exact branch is covered by
+        # TestDeriveStageStatuses's unit tests.
+        assert data["stages"][0]["status"] in ("in_progress", "blocked")
+
+        # /system-state agrees: no ready-snapshot blocker, but pipeline items remain.
+        state_r = admin_client.get("/system-state", headers=hdrs)
+        assert state_r.status_code == 200, state_r.text
+        state_ids = {i["state_id"] for i in state_r.json()["items"]}
+        assert "snapshot.ready.missing" not in state_ids
+        assert "understanding.purpose.missing_baseline" in state_ids
+
+    def test_pipeline_complete_response_shape(self, admin_client, tmp_path):
+        """pipeline 完了: every pipeline step is complete and Purpose/Core
+        Capabilities are defined for the current snapshot. This is the
+        highest-risk scenario for the purpose_defined reduction (Issue #236)
+        since it is the only branch where next_actions/stages consult it."""
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "issue236-pipeline-complete")
+        system_id = sys["id"]
+        hdrs = _headers(token, system_id)
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+        snapshot_id = snap.json()["id"]
+
+        self._insert_intelligence_run(system_id, snapshot_id, "symbol_index", "completed")
+        self._insert_code_symbol(system_id, snapshot_id)
+        self._insert_code_entrypoint(system_id, snapshot_id)
+        self._insert_build_step(system_id, snapshot_id, "documentation_index", "completed")
+        self._insert_understanding_graph_snapshot(system_id, snapshot_id)
+        run_id = self._insert_intelligence_run(system_id, snapshot_id, "capability_hierarchy", "completed")
+        self._insert_purpose_and_capability_nodes(system_id, snapshot_id, run_id)
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        data = r.json()
+        pipeline = {s["step"]: s["status"] for s in data["pipeline"]}
+        assert pipeline["repository_configured"] == "complete"
+        assert pipeline["snapshot_ready"] == "complete"
+        assert pipeline["documentation_indexed"] == "complete"
+        assert pipeline["symbols_indexed"] == "complete"
+        assert pipeline["entrypoints_discovered"] == "complete"
+        assert pipeline["docs_code_reconciled"] == "complete"
+        assert pipeline["capability_hierarchy_ready"] == "complete"
+
+        assert data["purpose"]["name"] == "Test system"
+        assert len(data["capabilities"]) == 1
+
+        stages = {s["stage"]: s for s in data["stages"]}
+        # documentation_claims_scanned is the one reasoning-only step and
+        # stays blocked under the mock provider, so "understand" cannot
+        # reach complete purely from this fixture -- but purpose_defined
+        # being wrong would make this fail differently (missing "Define
+        # System Purpose"/"Identify main system capabilities" actions),
+        # which the assertions below rule out directly.
+        assert stages["understand"].get("status") in ("in_progress", "blocked", "complete")
+
+        labels = [a["action"] for a in data["next_actions"]]
+        assert "Define System Purpose" not in labels
+        assert "Identify main system capabilities" not in labels
+
+        # /system-state agrees: Purpose/Capabilities are satisfied, not
+        # missing/unconfirmed/impacted.
+        state_r = admin_client.get("/system-state", headers=hdrs)
+        assert state_r.status_code == 200, state_r.text
+        state_ids = {i["state_id"] for i in state_r.json()["items"]}
+        assert "understanding.purpose.satisfied" in state_ids
+        assert "understanding.capabilities.satisfied" in state_ids
+        assert not any(s.startswith("pipeline.symbol_index.") for s in state_ids)
+        assert not any(s.startswith("pipeline.capability_hierarchy.") for s in state_ids)

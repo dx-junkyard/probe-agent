@@ -31,13 +31,13 @@ probe-agent:
 from __future__ import annotations
 
 import json
-import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from . import state_facts
 from .db import get_conn
-from .git_ops import GitError, resolve_head, working_tree_status
+from .git_ops import GitError
 
 # Severity vocabulary shared with system_diagnostics.py. Order = worst first.
 SEVERITY_ORDER = ["error", "blocked", "warning", "info", "ok"]
@@ -193,12 +193,7 @@ def _understanding_item_count(understanding: Any, key: str) -> int:
 
 
 def latest_ready_snapshot_id(conn, system_id: int) -> Optional[int]:
-    row = conn.execute(
-        "SELECT id FROM repository_snapshots WHERE system_id = ? AND status = 'ready' "
-        "ORDER BY id DESC LIMIT 1",
-        (system_id,),
-    ).fetchone()
-    return row["id"] if row else None
+    return state_facts.get_latest_ready_snapshot_id(conn, system_id)
 
 
 def _latest_interview_baseline(
@@ -445,27 +440,11 @@ def baseline_diff_impact(
 
 
 def _purpose_defined_in_current_snapshot(conn, system_id: int, snapshot_id: int) -> bool:
-    node = conn.execute(
-        "SELECT name, summary FROM capability_hierarchy_nodes "
-        "WHERE system_id = ? AND snapshot_id = ? AND node_type = 'purpose' LIMIT 1",
-        (system_id, snapshot_id),
-    ).fetchone()
-    draft = conn.execute(
-        "SELECT name, purpose FROM system_profile_drafts "
-        "WHERE system_id = ? AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
-        (system_id, snapshot_id),
-    ).fetchone()
-    return (node is not None and bool(node["name"] or node["summary"])) or (
-        draft is not None and bool(draft["name"] or draft["purpose"])
-    )
+    return state_facts.purpose_defined_in_snapshot(conn, system_id, snapshot_id)
 
 
 def _capability_count_in_current_snapshot(conn, system_id: int, snapshot_id: int) -> int:
-    return conn.execute(
-        "SELECT COUNT(*) FROM capability_hierarchy_nodes "
-        "WHERE system_id = ? AND snapshot_id = ? AND node_type = 'capability'",
-        (system_id, snapshot_id),
-    ).fetchone()[0]
+    return state_facts.capability_count_in_snapshot(conn, system_id, snapshot_id)
 
 
 def evaluate_understanding(
@@ -622,16 +601,8 @@ def _understanding_state_item(status: UnderstandingStatus, *, purpose: bool) -> 
 
 
 def _snapshot_missing_item(conn, system_id: int) -> Optional[StateItem]:
-    latest = conn.execute(
-        "SELECT id, status FROM repository_snapshots WHERE system_id = ? "
-        "ORDER BY id DESC LIMIT 1",
-        (system_id,),
-    ).fetchone()
-    ready = conn.execute(
-        "SELECT id FROM repository_snapshots WHERE system_id = ? AND status = 'ready' "
-        "ORDER BY id DESC LIMIT 1",
-        (system_id,),
-    ).fetchone()
+    latest = state_facts.get_latest_snapshot(conn, system_id)
+    ready = state_facts.get_latest_ready_snapshot(conn, system_id)
     if ready is not None:
         return None
     if latest is not None and latest["status"] == "indexing":
@@ -713,32 +684,8 @@ def _snapshot_stale_for_interview_item(conn, system_id: int, snapshot_id: int) -
     )
 
 
-def _stuck_after_seconds() -> float:
-    try:
-        return float(os.getenv("SYSTEM_UNDERSTANDING_STUCK_AFTER_SECONDS", "300"))
-    except ValueError:
-        return 300.0
-
-
-def _is_active_build(row) -> bool:
-    if row is None or row["status"] not in ("queued", "running"):
-        return False
-    last = row["heartbeat_at"] or row["started_at"] or row["created_at"]
-    return last is not None and (time.time() - last) <= _stuck_after_seconds()
-
-
 def _active_build(conn, system_id: int, snapshot_id: int):
-    rows = conn.execute(
-        """SELECT id, status, current_step, heartbeat_at, started_at, created_at
-             FROM system_understanding_builds
-            WHERE system_id = ? AND snapshot_id = ? AND status IN ('queued', 'running')
-            ORDER BY id DESC""",
-        (system_id, snapshot_id),
-    ).fetchall()
-    for row in rows:
-        if _is_active_build(row):
-            return row
-    return None
+    return state_facts.get_active_build(conn, system_id, snapshot_id)
 
 
 def _pipeline_state_item(
@@ -859,13 +806,7 @@ def _run_not_run_item(
     conn, system_id: int, snapshot_id: int, *, state_prefix: str, run_types: List[str],
     subject: str, pipeline_steps: List[str], remediation: str,
 ) -> Optional[StateItem]:
-    placeholders = ",".join("?" for _ in run_types)
-    row = conn.execute(
-        f"SELECT id, status FROM intelligence_runs "
-        f"WHERE system_id = ? AND snapshot_id = ? AND run_type IN ({placeholders}) "
-        f"ORDER BY id DESC LIMIT 1",
-        (system_id, snapshot_id, *run_types),
-    ).fetchone()
+    row = state_facts.get_latest_intelligence_run(conn, system_id, snapshot_id, run_types)
     evidence = {"snapshot_id": snapshot_id, "run_id": row["id"] if row else None}
     return _pipeline_state_item(
         state_prefix=state_prefix,
@@ -882,12 +823,7 @@ def _build_step_not_run_item(
     conn, system_id: int, snapshot_id: int, *, state_prefix: str, step: str,
     subject: str, pipeline_steps: List[str], remediation: str,
 ) -> Optional[StateItem]:
-    row = conn.execute(
-        """SELECT id, status, error FROM system_understanding_build_steps
-           WHERE system_id = ? AND snapshot_id = ? AND step = ?
-           ORDER BY id DESC LIMIT 1""",
-        (system_id, snapshot_id, step),
-    ).fetchone()
+    row = state_facts.get_latest_build_step(conn, system_id, snapshot_id, step)
     evidence = {
         "snapshot_id": snapshot_id,
         "step_run_id": row["id"] if row else None,
@@ -907,12 +843,9 @@ def _build_step_not_run_item(
 def _capability_hierarchy_item(
     conn, system_id: int, snapshot_id: int, *, reasoning_available: bool,
 ) -> Optional[StateItem]:
-    row = conn.execute(
-        "SELECT id, status FROM intelligence_runs "
-        "WHERE system_id = ? AND snapshot_id = ? AND run_type = 'capability_hierarchy' "
-        "ORDER BY id DESC LIMIT 1",
-        (system_id, snapshot_id),
-    ).fetchone()
+    row = state_facts.get_latest_intelligence_run(
+        conn, system_id, snapshot_id, ["capability_hierarchy"]
+    )
     if row is not None and row["status"] == "completed":
         # Issue #210: a completed run with zero capability nodes is not
         # "done" from the user's perspective (no probe-agent: docstring
@@ -1009,9 +942,7 @@ def _capability_hierarchy_item(
 
 def _repository_state_items(conn, system_id: int) -> List[StateItem]:
     """Collect repository freshness state once for every consumer projection."""
-    config = conn.execute(
-        "SELECT repo_path FROM repository_configs WHERE system_id = ?", (system_id,)
-    ).fetchone()
+    config = state_facts.get_repository_config(conn, system_id)
     if config is None or not config["repo_path"]:
         return [StateItem(
             state_id="repository.configuration.missing", state_group="repository",
@@ -1024,13 +955,9 @@ def _repository_state_items(conn, system_id: int) -> List[StateItem]:
             related_checks=["repository_config"], dedupe_key="repository.configuration",
         )]
 
-    latest_ready = conn.execute(
-        "SELECT id, commit_sha FROM repository_snapshots WHERE system_id = ? AND status = 'ready' "
-        "ORDER BY id DESC LIMIT 1", (system_id,),
-    ).fetchone()
+    latest_ready = state_facts.get_latest_ready_snapshot(conn, system_id)
     try:
-        current_head = resolve_head(config["repo_path"])
-        working_tree = working_tree_status(config["repo_path"])
+        head_state = state_facts.resolve_repository_head_state(config["repo_path"])
     except GitError as exc:
         return [StateItem(
             state_id="repository.head.unreadable", state_group="repository",
@@ -1042,6 +969,7 @@ def _repository_state_items(conn, system_id: int) -> List[StateItem]:
             target_ui=TargetUi(route=PAGE_REPOSITORY, anchor="repo-config", action_label="Repository 設定を確認"),
             related_checks=["repository_path"], dedupe_key="repository.head",
         )]
+    current_head = head_state.current_head
 
     items: List[StateItem] = []
     if latest_ready is not None and latest_ready["commit_sha"] != current_head:
@@ -1058,15 +986,16 @@ def _repository_state_items(conn, system_id: int) -> List[StateItem]:
             related_checks=["snapshot_status"], related_pipeline_steps=["snapshot_ready"],
             dedupe_key="repository.snapshot.freshness",
         ))
-    if not working_tree.clean:
+    if not head_state.working_tree_clean:
         items.append(StateItem(
             state_id="repository.working_tree.dirty", state_group="repository",
             severity="warning", status="impacted", user_action_kind="review",
             intervention_timing="before_next_step", subject="Working tree",
             summary="未コミット差分があります。",
-            detail=f"Working tree に {working_tree.dirty_file_count} 件の未コミット変更があります。",
+            detail=f"Working tree に {head_state.working_tree_dirty_file_count} 件の未コミット変更があります。",
             remediation="patch 適用や snapshot の前に commit、stash、または差分の確認をしてください。",
-            evidence={"dirty_file_count": working_tree.dirty_file_count, "dirty_sample": working_tree.sample},
+            evidence={"dirty_file_count": head_state.working_tree_dirty_file_count,
+                      "dirty_sample": head_state.working_tree_dirty_sample},
             target_ui=TargetUi(route=PAGE_REPOSITORY, anchor=ANCHOR_SNAPSHOT_CREATE, action_label="Repository を確認"),
             related_checks=["working_tree"], dedupe_key="repository.working_tree",
         ))
