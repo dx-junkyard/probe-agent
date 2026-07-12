@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import {
   useComponents, useTraces, useUpdatePolicy,
@@ -17,22 +17,25 @@ import { toast } from "sonner";
 import { formatTimestamp } from "@/lib/utils";
 import { cn } from "@/lib/utils";
 import { AddToWorkspaceButton } from "@/components/add-to-workspace";
+import { JsonTree } from "@/components/json-tree";
 
 const MODES = ["off", "trace", "shadow"] as const;
 const EVALUATIONS = ["unknown", "better", "worse", "same"];
+const SIGNAL_REFRESH_INTERVAL_MS = 2_000;
 const MODE_VARIANT: Record<string, "secondary" | "success" | "warning"> = {
   off: "secondary", trace: "success", shadow: "warning",
 };
 
 export default function ComponentsPage() {
   const [searchParams] = useSearchParams();
-  const { data: components, isLoading } = useComponents();
+  const { data: components, isLoading } = useComponents(SIGNAL_REFRESH_INTERVAL_MS);
   // Deep link from Trace Lineage / analyzer results: /components?component=<id>
   const [selected, setSelected] = useState<string | null>(
     searchParams.get("component"),
   );
+  const [expandedTraceId, setExpandedTraceId] = useState<string | null>(null);
   const updatePolicy = useUpdatePolicy();
-  const { data: traces } = useTraces(selected, 20);
+  const { data: traces } = useTraces(selected, 20, SIGNAL_REFRESH_INTERVAL_MS);
   const { data: profile } = useComponentProfile(selected);
   const updateProfile = useUpdateComponentProfile();
   const { data: shadows } = useShadowResults(selected, 20);
@@ -79,7 +82,7 @@ export default function ComponentsPage() {
                 "w-full text-left rounded-lg px-3 py-2 text-sm transition-colors cursor-pointer",
                 selected === c.component_id ? "bg-secondary text-foreground" : "hover:bg-secondary/50 text-muted-foreground",
               )}
-              onClick={() => { setSelected(c.component_id); setProfForm({}); }}
+              onClick={() => { setSelected(c.component_id); setExpandedTraceId(null); setProfForm({}); }}
             >
               <div className="font-mono text-xs truncate">{c.component_id}</div>
               <div className="flex items-center gap-2 mt-1">
@@ -142,17 +145,60 @@ export default function ComponentsPage() {
                             </tr>
                           </thead>
                           <tbody>
-                            {traces.map(t => (
-                              <tr key={t.trace_id} className="border-b last:border-0">
-                                <td className="py-2 font-mono text-xs">{t.trace_id.slice(0, 12)}</td>
-                                <td className="py-2"><Badge variant="outline">{t.mode}</Badge></td>
-                                <td className="py-2 text-xs">{t.duration_ms != null ? `${t.duration_ms}ms` : "—"}</td>
-                                <td className="py-2">
-                                  {t.error ? <Badge variant="destructive">error</Badge> : <Badge variant="success">ok</Badge>}
-                                </td>
-                                <td className="py-2 text-right text-xs text-muted-foreground">{formatTimestamp(t.timestamp)}</td>
-                              </tr>
-                            ))}
+                            {traces.map(t => {
+                              const expanded = expandedTraceId === t.trace_id;
+                              return (
+                                <Fragment key={t.trace_id}>
+                                  <tr className="border-b last:border-0">
+                                    <td className="py-2 font-mono text-xs">
+                                      <button
+                                        type="button"
+                                        className="inline-flex items-center gap-1 rounded px-1 py-0.5 hover:bg-secondary cursor-pointer"
+                                        aria-label={`${expanded ? "Hide" : "Show"} signal details for trace ${t.trace_id}`}
+                                        aria-expanded={expanded}
+                                        onClick={() => setExpandedTraceId(expanded ? null : t.trace_id)}
+                                      >
+                                        <span className="text-muted-foreground" aria-hidden="true">{expanded ? "▾" : "▸"}</span>
+                                        {t.trace_id.slice(0, 12)}
+                                      </button>
+                                    </td>
+                                    <td className="py-2"><Badge variant="outline">{t.mode}</Badge></td>
+                                    <td className="py-2 text-xs">{t.duration_ms != null ? `${t.duration_ms}ms` : "—"}</td>
+                                    <td className="py-2">
+                                      {t.error ? <Badge variant="destructive">error</Badge> : <Badge variant="success">ok</Badge>}
+                                    </td>
+                                    <td className="py-2 text-right text-xs text-muted-foreground">{formatTimestamp(t.timestamp)}</td>
+                                  </tr>
+                                  {expanded && (
+                                    <tr key={`${t.trace_id}-details`} className="border-b bg-muted/20">
+                                      <td colSpan={5} className="p-4">
+                                        <div className="mb-3 text-xs text-muted-foreground">
+                                          Full trace ID: <span className="font-mono text-foreground">{t.trace_id}</span>
+                                        </div>
+                                        <div className="grid gap-4 lg:grid-cols-2">
+                                          <div className="min-w-0">
+                                            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Input</h3>
+                                            <div className="max-h-64 overflow-auto rounded-md border bg-card p-3">
+                                              <JsonTree data={t.input} defaultExpanded />
+                                            </div>
+                                          </div>
+                                          <div className="min-w-0">
+                                            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Output</h3>
+                                            <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border bg-card p-3 font-mono text-xs">{t.output ?? "—"}</pre>
+                                          </div>
+                                        </div>
+                                        {t.error && (
+                                          <div className="mt-4">
+                                            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-destructive">Error</h3>
+                                            <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border border-destructive/40 bg-destructive/5 p-3 font-mono text-xs text-destructive">{t.error}</pre>
+                                          </div>
+                                        )}
+                                      </td>
+                                    </tr>
+                                  )}
+                                </Fragment>
+                              );
+                            })}
                           </tbody>
                         </table>
                       </div>

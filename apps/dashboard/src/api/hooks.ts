@@ -84,19 +84,21 @@ export function useUpdateSystem() {
   });
 }
 
-export function useComponents() {
+export function useComponents(refetchInterval?: number) {
   return useQuery({
     queryKey: sysKey("components"),
     queryFn: () => api.get<ComponentSummary[]>("/components"),
     enabled: !!getSystemId(),
+    refetchInterval,
   });
 }
 
-export function useTraces(componentId: string | null, limit = 50) {
+export function useTraces(componentId: string | null, limit = 50, refetchInterval?: number) {
   return useQuery({
     queryKey: [...sysKey("traces"), componentId, limit],
     queryFn: () => api.get<TraceEvent[]>(`/components/${componentId}/traces?limit=${limit}`),
     enabled: !!componentId && !!getSystemId(),
+    refetchInterval,
   });
 }
 
