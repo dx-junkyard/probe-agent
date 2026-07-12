@@ -1122,6 +1122,39 @@ def _dedupe_items(items: List[StateItem]) -> List[StateItem]:
     return sorted(result.values(), key=lambda item: item.state_id)
 
 
+def _diagnostic_state_item(check: Any) -> StateItem:
+    """Project one diagnostics check without promoting informational state."""
+    # Diagnostics uses ``unknown`` for an informational observation (for
+    # example, no reasoning run has been recorded yet).  State Assessment has
+    # the equivalent explicit vocabulary, ``info``.
+    severity = "info" if check.severity == "unknown" else check.severity
+    action = (
+        "none" if check.severity == "unknown"
+        else ("configure" if check.fix_kind == "dialog" else "inspect")
+    )
+    return StateItem(
+        state_id=f"diagnostic.{check.check_id}",
+        state_group="configuration" if check.category in ("auth", "database", "llm", "configuration") else "runtime",
+        severity=severity,
+        status=(
+            "failed" if severity == "error"
+            else ("blocked" if severity == "blocked" else ("unconfirmed" if severity == "info" else "missing"))
+        ),
+        user_action_kind=action,
+        intervention_timing="now" if severity in ("error", "blocked") else "before_next_step",
+        subject=check.title, summary=check.title, detail=check.detail,
+        impact=check.impact, remediation=check.remediation,
+        evidence={"diagnostic_category": check.category, "fix_kind": check.fix_kind},
+        target_ui=(
+            TargetUi(route=check.fix_page, anchor=check.fix_anchor,
+                     action_label=f"「{check.title}」を修正")
+            if check.fix_page and check.severity != "unknown" else None
+        ),
+        related_checks=[check.check_id], related_pipeline_steps=check.related_pipeline_steps,
+        source="system_diagnostics", dedupe_key=f"diagnostic.{check.check_id}",
+    )
+
+
 def build_system_state(system_id: int) -> SystemStateAssessment:
     """Build the deterministic state assessment for one system.
 
@@ -1225,27 +1258,7 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
             continue
         if check.check_id in covered_check_ids:
             continue
-        severity = check.severity if check.severity in SEVERITY_ORDER else "warning"
-        action = "configure" if check.fix_kind == "dialog" else "inspect"
-        items.append(StateItem(
-            state_id=f"diagnostic.{check.check_id}",
-            state_group="configuration" if check.category in ("auth", "database", "llm", "configuration") else "runtime",
-            severity=severity,
-            status="failed" if severity == "error" else ("blocked" if severity == "blocked" else "missing"),
-            user_action_kind=action,
-            intervention_timing="now" if severity in ("error", "blocked") else "before_next_step",
-            subject=check.title, summary=check.title, detail=check.detail,
-            impact=check.impact, remediation=check.remediation,
-            evidence={"diagnostic_category": check.category, "fix_kind": check.fix_kind},
-            # Issue #211: name the target instead of a bare 修正する so the
-            # button says what will be fixed before it is clicked. check.title
-            # comes from the finite diagnostics check set, so this stays a
-            # deterministic label, not generated text.
-            target_ui=(TargetUi(route=check.fix_page, anchor=check.fix_anchor,
-                                action_label=f"「{check.title}」を修正") if check.fix_page else None),
-            related_checks=[check.check_id], related_pipeline_steps=check.related_pipeline_steps,
-            source="system_diagnostics", dedupe_key=f"diagnostic.{check.check_id}",
-        ))
+        items.append(_diagnostic_state_item(check))
 
     items = _dedupe_items(items)
 

@@ -4510,7 +4510,9 @@ describe("System settings diagnostics", () => {
     expect(bannerCta.textContent).toBe("Snapshot を作成");
     fireEvent.click(bannerCta);
     await waitFor(() => expect(window.location.pathname).toBe("/repository"));
-    expect(new URLSearchParams(window.location.search).get("fix")).toBe("snapshot-create");
+    let targetParams = new URLSearchParams(window.location.search);
+    expect(targetParams.get("fix")).toBe("snapshot-create");
+    expect(targetParams.get("diagnostic")).toBe("snapshot_status");
 
     window.history.pushState({}, "", "/system-understanding");
     fireEvent.click(screen.getByTestId("diagnostics-badge"));
@@ -4518,7 +4520,9 @@ describe("System settings diagnostics", () => {
     const badgeCta = within(badgeItem).getByRole("button", { name: "Snapshot を作成" });
     fireEvent.click(badgeCta);
     await waitFor(() => expect(window.location.pathname).toBe("/repository"));
-    expect(new URLSearchParams(window.location.search).get("fix")).toBe("snapshot-create");
+    targetParams = new URLSearchParams(window.location.search);
+    expect(targetParams.get("fix")).toBe("snapshot-create");
+    expect(targetParams.get("diagnostic")).toBe("snapshot_status");
   });
 
   test("system-state items projected from a dialog-kind diagnostic (no target_ui) still open the env fix dialog", async () => {
