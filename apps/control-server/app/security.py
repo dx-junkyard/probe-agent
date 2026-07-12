@@ -42,3 +42,36 @@ def generate_token() -> str:
 
 def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+# Production password policy (Issue #225). Kept independent of
+# `is_production()` so it stays a plain, deterministic, unit-testable
+# validator; callers decide *when* to invoke it (only when
+# `environment.is_production()` is true).
+PRODUCTION_PASSWORD_MIN_LENGTH = 16
+PRODUCTION_PASSWORD_DENYLIST = {
+    "change-me",
+    "dev-secret-key",
+    "password",
+    "admin",
+    "example",
+}
+
+
+def validate_production_password(username: str, password: str) -> None:
+    """Reject sample/placeholder/weak passwords used in production.
+
+    Raises `ValueError` with a human-readable reason on rejection. This is a
+    structural, finite-set check (CLAUDE.md Principle 6): minimum length,
+    an exact-match (case-insensitive) denylist of known sample values, and
+    a case-insensitive equality check against the username.
+    """
+    if len(password) < PRODUCTION_PASSWORD_MIN_LENGTH:
+        raise ValueError(
+            f"password must be at least {PRODUCTION_PASSWORD_MIN_LENGTH} "
+            "characters in production"
+        )
+    if password.casefold() in PRODUCTION_PASSWORD_DENYLIST:
+        raise ValueError("password is a known sample/placeholder value")
+    if password.casefold() == username.casefold():
+        raise ValueError("password must not match the username")

@@ -37,8 +37,9 @@ internet --80/443--> Caddy --8501--> Dashboard (nginx) --/api/*--> Control Serve
    ```env
    PUBLIC_HOST=probe.example.com
    PROBE_CLIENT_SERVER_URL=https://probe.example.com/api
+   CONTROL_ENV=production
    CONTROL_ADMIN_USERNAME=admin
-   CONTROL_ADMIN_PASSWORD=<強いパスワード>
+   CONTROL_ADMIN_PASSWORD=<強いパスワード（16文字以上）>
    CONTROL_API_KEYS=
    CONTROL_REQUIRE_AUTH=true
    PROBE_REPOSITORY_HOST_ROOT=/absolute/path/to/repositories
@@ -46,7 +47,9 @@ internet --80/443--> Caddy --8501--> Dashboard (nginx) --/api/*--> Control Serve
 
    `change-me` や `.env.example` に書かれた開発用の初期値
    (`CONTROL_ADMIN_PASSWORD=change-me` 相当、`dev-secret-key` など) を
-   そのまま使わない。
+   そのまま使わない。`docker-compose.prod.yml` は `CONTROL_ENV=production`
+   を固定で設定しているため、下記の起動時チェック (Issue #225) が必ず
+   働く。
 
 2. 起動する。
 
@@ -54,12 +57,26 @@ internet --80/443--> Caddy --8501--> Dashboard (nginx) --/api/*--> Control Serve
    docker compose -f docker-compose.prod.yml up -d --build
    ```
 
-   `control-server` は起動時に `CONTROL_REQUIRE_AUTH=true` を検証する。
-   admin ユーザーも `CONTROL_API_KEYS` も存在しない状態では、明確なエラー
-   メッセージを出して **起動そのものが失敗する**（認証なしのまま
-   インターネットへ公開されることを防ぐフェイルセーフ）。起動が失敗した
-   場合は `CONTROL_ADMIN_USERNAME` / `CONTROL_ADMIN_PASSWORD` または
-   `CONTROL_API_KEYS` を設定してから再実行する。
+   `control-server` は起動時に `CONTROL_ENV=production`（Issue #225）を
+   検証し、以下のいずれかに該当すると明確なエラーメッセージを出して
+   **起動そのものが失敗する**（認証なし、または sample secret のまま
+   インターネットへ公開されることを防ぐフェイルセーフ）。
+
+   - `CONTROL_REQUIRE_AUTH` が明示的に `false`（または `0`/`no`/`off`）に
+     設定されている（production は認証必須と矛盾するため）
+   - `CONTROL_API_KEYS` が空でない（production では legacy shared key は
+     禁止。system 単位の API token を使う）
+   - `CONTROL_ADMIN_USERNAME` と `CONTROL_ADMIN_PASSWORD` を設定していて、
+     そのパスワードが 16 文字未満、`change-me` / `dev-secret-key` /
+     `password` / `admin` / `example`（大文字小文字を区別しない）などの
+     サンプル値と一致する、またはユーザー名と一致する -- 同名の admin が
+     既に存在していても失敗する（環境変数に sample secret が残っている
+     こと自体が問題のため）
+   - 上記を満たして起動した後も、アクティブな admin ユーザーが 1 人も
+     存在しない（`CONTROL_ADMIN_USERNAME`/`CONTROL_ADMIN_PASSWORD` を
+     設定していない、かつ他の手段でも admin を作っていない場合など）
+
+   起動が失敗した場合は該当する環境変数を修正してから再実行する。
 
 ## 証明書発行の確認
 
@@ -132,17 +149,23 @@ volume 名の prefix (`probe-agent_`) は compose project 名に依存する。
 
 ## 公開前チェック
 
+- [ ] `CONTROL_ENV=production` になっている（`docker-compose.prod.yml` は
+      固定でこれを設定する）。確認方法:
+      `docker compose -f docker-compose.prod.yml exec control-server env |
+      grep CONTROL_ENV` で `production` が返ること
 - [ ] 初期管理者ユーザーが作成済み（`CONTROL_ADMIN_USERNAME` /
       `CONTROL_ADMIN_PASSWORD` で起動し、admin でログインできることを
       確認した）
 - [ ] `.env` の値が `change-me` や `dev-secret-key` などの開発用初期値の
-      ままになっていない
+      ままになっていない（`CONTROL_ENV=production` はこれらのサンプル値を
+      パスワードとして拒否し起動そのものを失敗させるので、そのまま使うと
+      デプロイできない）
 - [ ] SDK からの接続には system 単位で発行した API token
       (`PROBE_API_KEY`) を使い、`CONTROL_API_KEYS` の共有 legacy key を
       本番の SDK 接続に使い回していない
-- [ ] `CONTROL_API_KEYS` は空にしている（legacy key は admin 扱いされず
-      User Management も表示されないため、通常運用では不要。空にすることで
-      共有シークレットの漏洩経路を減らす）
+- [ ] `CONTROL_API_KEYS` は空にしている（`CONTROL_ENV=production` では
+      legacy key は起動時に明示的に禁止されており、空でなければ起動が
+      失敗する）
 - [ ] `CONTROL_REQUIRE_AUTH=true` になっている。確認方法:
       `docker compose -f docker-compose.prod.yml exec control-server env |
       grep CONTROL_REQUIRE_AUTH` で `true` が返ること、かつ

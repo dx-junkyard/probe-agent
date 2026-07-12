@@ -372,6 +372,31 @@ heuristic result.
   revoke the user's session tokens (API tokens stay valid).
 - Role changes must not demote the last active admin (409).
 - Revoked/expired/inactive tokens return 401.
+- `require_user` / `require_admin` reject `token_kind == "api"` unconditionally
+  (403, "SDK API tokens cannot access management APIs; use a login session"),
+  not just in production: SDK API tokens are for data-plane routes (traces,
+  policies, ...) that depend on `get_principal`/`get_system_id` only, never
+  management/connection/publish routes.
+- `CONTROL_ENV` (`app/environment.py`, Issue #225; default `development`,
+  finite set `{development, production}`, anything else fails startup)
+  drives a strict fail-closed production mode checked in `app/db.py`
+  (`_validate_startup_environment`, before `_bootstrap_admin`, and the
+  production branch of `_enforce_auth_requirement`, after). In production:
+  `CONTROL_REQUIRE_AUTH` is forced on (explicitly disabling it fails
+  startup); `CONTROL_API_KEYS` must be empty (legacy keys are forbidden --
+  `auth.auth_enabled()`/`auth._legacy_keys()` also force this at runtime,
+  independent of startup validation); `CONTROL_ADMIN_PASSWORD` (when
+  `CONTROL_ADMIN_USERNAME` is also set) must pass
+  `security.validate_production_password` (>=16 chars, not in the
+  case-insensitive sample-value denylist, not equal to the username) even
+  if the admin row already exists from an earlier boot; and startup fails
+  unless at least one active admin user exists afterward. `create_user` /
+  `reset_password` (`routes/auth.py`) apply the same password validator in
+  production, returning 422 with the reason. Development is unchanged
+  (permissive, warning-only). A successful env-bootstrap of the admin user
+  writes one append-only `auth_audit_events` row
+  (`event_type='admin_bootstrapped'`); `detail` is structural JSON only,
+  never a password or hash.
 
 ## Probe Pattern lifecycle (issue #168)
 

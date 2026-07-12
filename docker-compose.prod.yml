@@ -20,11 +20,16 @@ services:
     container_name: probe-control-server
     environment:
       PROBE_DB_PATH: /data/probe.db
-      CONTROL_API_KEYS: ${CONTROL_API_KEYS:-}
       CONTROL_ADMIN_USERNAME: ${CONTROL_ADMIN_USERNAME:-}
       CONTROL_ADMIN_PASSWORD: ${CONTROL_ADMIN_PASSWORD:-}
+      # Issue #225: strict fail-closed production mode. Startup refuses to
+      # boot without an active admin, refuses CONTROL_API_KEYS (legacy
+      # shared keys are forbidden -- removed below on purpose), and rejects
+      # sample/weak CONTROL_ADMIN_PASSWORD values. See
+      # docs/deployment-https.md "公開前チェック".
+      CONTROL_ENV: "production"
       # Fail startup instead of silently running without authentication.
-      # See docs/deployment-https.md "公開前チェック".
+      # Forced on for CONTROL_ENV=production anyway; kept explicit here.
       CONTROL_REQUIRE_AUTH: "true"
       LLM_PROVIDER: ${LLM_PROVIDER:-openai}
       LLM_MODEL: ${LLM_MODEL:-}

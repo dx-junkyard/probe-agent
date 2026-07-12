@@ -1866,6 +1866,18 @@ CREATE INDEX IF NOT EXISTS idx_publish_audit_events_system
     ON publish_audit_events (system_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_publish_audit_events_job
     ON publish_audit_events (job_id, id DESC);
+
+-- Append-only audit trail for one-time auth startup operations (Issue #225),
+-- currently just the env-var admin bootstrap. `detail` is a small JSON
+-- object of structural facts only -- never a password, password hash, or
+-- token (Principle 5/8 secret-hygiene rule extends here).
+CREATE TABLE IF NOT EXISTS auth_audit_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type  TEXT NOT NULL,
+    username    TEXT,
+    detail      TEXT,          -- JSON, never a password/hash/token
+    created_at  REAL NOT NULL
+);
 """
 
 
@@ -2353,8 +2365,65 @@ def init_db() -> None:
                 "ALTER TABLE github_connections ADD COLUMN last_synced_commit_sha TEXT"
             )
         _ensure_legacy_system(conn)
+    _validate_startup_environment()
     _bootstrap_admin()
     _enforce_auth_requirement()
+
+
+def _validate_startup_environment() -> None:
+    """Fail closed on invalid/contradictory startup configuration.
+
+    Runs before `_bootstrap_admin` (Issue #225) so a sample/weak password
+    supplied via `CONTROL_ADMIN_PASSWORD` fails startup even when an admin
+    row with that username already exists from an earlier boot -- the
+    sample secret sitting in the environment is itself the problem,
+    independent of whether bootstrap would insert a new row this time.
+
+    `control_env()` itself enforces the finite `{development, production}`
+    set (CLAUDE.md Principle 6) and always runs, regardless of environment.
+    The remaining checks only apply when `CONTROL_ENV=production`; the
+    `development` default keeps existing permissive behavior untouched.
+    """
+    from .environment import control_env
+    from .security import validate_production_password
+
+    env = control_env()  # raises RuntimeError for an unrecognized value
+    if env != "production":
+        return
+
+    require_auth_raw = os.getenv("CONTROL_REQUIRE_AUTH")
+    if require_auth_raw is not None and require_auth_raw.strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        raise RuntimeError(
+            "CONTROL_ENV=production requires authentication, but "
+            f"CONTROL_REQUIRE_AUTH={require_auth_raw!r} explicitly disables "
+            "it. Remove CONTROL_REQUIRE_AUTH (or set it to a truthy value) "
+            "to resolve the contradiction."
+        )
+
+    if os.getenv("CONTROL_API_KEYS", "").strip():
+        raise RuntimeError(
+            "CONTROL_ENV=production forbids CONTROL_API_KEYS (legacy shared "
+            "service keys are never accepted in production). Remove it; "
+            "SDKs must use System-scoped API tokens issued via "
+            "POST /tokens/me instead."
+        )
+
+    username = os.getenv("CONTROL_ADMIN_USERNAME", "").strip()
+    password = os.getenv("CONTROL_ADMIN_PASSWORD", "")
+    if username and password:
+        try:
+            validate_production_password(username, password)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"CONTROL_ENV=production rejects CONTROL_ADMIN_PASSWORD: "
+                f"{exc}. Set a unique password with at least 16 characters "
+                "and restart."
+            ) from exc
 
 
 def _enforce_auth_requirement() -> None:
@@ -2366,15 +2435,37 @@ def _enforce_auth_requirement() -> None:
     server would otherwise start in the fail-open "no auth" MVP-compat mode.
     Refuse to start instead, with an explicit error. The default
     (`CONTROL_REQUIRE_AUTH=false`) keeps existing behavior but still warns.
+
+    `CONTROL_ENV=production` (Issue #225) forces `CONTROL_REQUIRE_AUTH` on
+    (contradictions were already rejected in `_validate_startup_environment`)
+    and additionally requires bootstrap to have produced at least one active
+    admin user -- `auth.auth_enabled()` is unconditionally `True` in
+    production, so the DB is checked directly here instead of relying on it.
     """
     from .auth import auth_enabled
+    from .environment import is_production
 
-    require_auth = os.getenv("CONTROL_REQUIRE_AUTH", "false").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+    production = is_production()
+    require_auth = production or os.getenv(
+        "CONTROL_REQUIRE_AUTH", "false"
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+    if production:
+        with get_conn() as conn:
+            user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            admin_count = conn.execute(
+                "SELECT COUNT(*) FROM users WHERE role = 'admin' AND is_active = 1"
+            ).fetchone()[0]
+        if user_count == 0 or admin_count == 0:
+            raise RuntimeError(
+                "CONTROL_ENV=production requires at least one active admin "
+                "user; no active admin user exists. Set "
+                "CONTROL_ADMIN_USERNAME/CONTROL_ADMIN_PASSWORD to bootstrap "
+                "one, or create one via POST /users with an existing admin "
+                "session, then restart."
+            )
+        return
+
     if auth_enabled():
         return
 
@@ -2394,6 +2485,8 @@ def _enforce_auth_requirement() -> None:
 
 def _bootstrap_admin() -> None:
     """Create an initial admin from env vars if no such user exists yet."""
+    import json
+
     from .security import hash_password
 
     username = os.getenv("CONTROL_ADMIN_USERNAME", "").strip()
@@ -2412,4 +2505,13 @@ def _bootstrap_admin() -> None:
             VALUES (?, ?, 'admin', 1, ?)
             """,
             (username, hash_password(password), time.time()),
+        )
+        # One-time bootstrap audit event (Issue #225). Only recorded when a
+        # row is actually created; never contains the password or its hash.
+        conn.execute(
+            """
+            INSERT INTO auth_audit_events (event_type, username, detail, created_at)
+            VALUES ('admin_bootstrapped', ?, ?, ?)
+            """,
+            (username, json.dumps({"source": "env_bootstrap"}), time.time()),
         )
