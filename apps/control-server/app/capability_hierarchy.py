@@ -34,6 +34,8 @@ from typing import Dict, List, Optional
 
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient
 
+from probe_agent import probe
+
 PROMPT_VERSION = "v1"
 SCHEMA_VERSION = "v1"
 
@@ -166,6 +168,7 @@ def _apply_handler_provenance(node: HierarchyNode, handler: Optional[SymbolRecor
     node.explanation_hash = handler.explanation_hash
 
 
+@probe(component_id="build_hierarchy")
 def build_hierarchy(
     symbols: List[SymbolRecord],
     entrypoints: List[EntrypointRecord],
@@ -181,6 +184,17 @@ def build_hierarchy(
     ``feature_links`` maps ``symbol_id -> feature_id`` for accepted
     Feature-to-Code links (#24), connecting hierarchy nodes back to the existing
     Feature Map. It is a deterministic structural link, not a new claim.
+    
+
+    probe-agent:
+      role: シンボルやエントリポイントから能力階層を構築する中心処理
+      capability: "capability-mapping"
+      system_purpose: システム理解のドッグフーディング基盤として、リポジトリ理解を能力単位に整理する
+      probe_value: system understanding 内部エンジンの中核として、どの入力が能力ノード生成に効くかを観測できる
+      element_type: core
+      operation_kind: analysis
+      consumers: [repository-understanding 系フロー, 能力マッピング結果利用箇所]
+      state_effects: [none]
     """
     feature_links = feature_links or {}
 
