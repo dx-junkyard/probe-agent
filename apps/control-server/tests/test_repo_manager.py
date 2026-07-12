@@ -459,6 +459,34 @@ def _headers(token, system_id):
     return {**_bearer(token), "X-Probe-System-Id": str(system_id)}
 
 
+def _assign_test_installation(system_id, installation_id=1):
+    """Arrange the explicit Issue #222 authorization required by this suite
+    (same helper as tests/test_publish_jobs.py): creating a connection is
+    rejected unless the installation is registered and assigned to the
+    System."""
+    from app.db import get_conn
+
+    now = "2026-01-01T00:00:00+00:00"
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO github_installations
+                (installation_id, github_account_login, github_account_type, status,
+                 verified_at, created_at, updated_at)
+            VALUES (?, 'acme', 'Organization', 'active', ?, ?, ?)
+            """,
+            (installation_id, now, now, now),
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO github_installation_systems
+                (installation_id, system_id, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (installation_id, system_id, now),
+        )
+
+
 def _configure_app(monkeypatch, key_path, app_id="123"):
     monkeypatch.setenv("GITHUB_APP_ID", app_id)
     monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY_PATH", key_path)
@@ -489,6 +517,7 @@ class TestSyncEndpoint:
     def test_requires_connected_status(self, admin_client):
         token = _login(admin_client)
         system = _create_system(admin_client, token)
+        _assign_test_installation(system["id"])
         h = _headers(token, system["id"])
         r = admin_client.post(
             "/github/connections",
@@ -504,6 +533,7 @@ class TestSyncEndpoint:
         token = _login(admin_client)
         system_a = _create_system(admin_client, token, "system-a")
         system_b = _create_system(admin_client, token, "system-b")
+        _assign_test_installation(system_a["id"])
         h_a = _headers(token, system_a["id"])
         h_b = _headers(token, system_b["id"])
 
@@ -523,6 +553,7 @@ class TestSyncEndpoint:
         _configure_app(monkeypatch, rsa_private_key_path)
         token = _login(admin_client)
         system = _create_system(admin_client, token)
+        _assign_test_installation(system["id"])
         h = _headers(token, system["id"])
 
         expected_sha = "a" * 40
@@ -566,6 +597,7 @@ class TestSyncEndpoint:
     def test_repository_status_before_sync_reports_no_mirror(self, admin_client):
         token = _login(admin_client)
         system = _create_system(admin_client, token)
+        _assign_test_installation(system["id"])
         h = _headers(token, system["id"])
         r = admin_client.post(
             "/github/connections",
@@ -583,6 +615,7 @@ class TestSyncEndpoint:
     def test_repository_status_gracefully_degrades_without_root(self, admin_client, monkeypatch):
         token = _login(admin_client)
         system = _create_system(admin_client, token)
+        _assign_test_installation(system["id"])
         h = _headers(token, system["id"])
         r = admin_client.post(
             "/github/connections",
@@ -604,6 +637,7 @@ class TestSyncEndpoint:
         _configure_app(monkeypatch, rsa_private_key_path)
         token = _login(admin_client)
         system = _create_system(admin_client, token)
+        _assign_test_installation(system["id"])
         h = _headers(token, system["id"])
 
         r = admin_client.post(

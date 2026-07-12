@@ -326,6 +326,66 @@ heuristic result.
   the installation-repositories endpoint) and `tests/test_publish_jobs.py`
   (state machine, staleness, push safety, diff-path guards, idempotency,
   cleanup, system isolation, secret hygiene).
+- **Compose secret + `GITHUB_PUBLISH_ENABLED` startup validation (Issue
+  #224)**: `docker-compose.prod.yml` mounts the private key as a Docker
+  Compose secret (`github_app_private_key`, file path from
+  `GITHUB_APP_PRIVATE_KEY_HOST_PATH`, default `/dev/null`) and fixes
+  `GITHUB_APP_PRIVATE_KEY_PATH` in-container to
+  `/run/secrets/github_app_private_key` — never a host path. `GITHUB_PUBLISH_ENABLED`
+  (finite set `{"", true, false, 1, 0, yes, no, on, off}`, case-insensitive;
+  anything else fails startup) is the declared-intent switch:
+  `github_app.validate_publish_startup_config()`, called from
+  `db.init_db()` right after `_validate_startup_environment()` (Issue #225's
+  pattern), raises `RuntimeError` when it is true but `GITHUB_APP_ID` is
+  empty, or `GITHUB_APP_PRIVATE_KEY_PATH` does not point at a readable,
+  non-empty file that parses as a PEM private key
+  (`cryptography...load_pem_private_key`). Error messages name only the env
+  var, never the key bytes or the path value. `github_app_configured()`
+  also now requires the key file to be non-empty (`os.path.getsize(...) > 0`)
+  so the `/dev/null`-default secret reads as "not configured" instead of
+  failing later inside JWT signing. See
+  `docs/github-app-deployment.md` for the deployment runbook (registration,
+  host placement, rotation).
+- **Disconnect revokes publish permission immediately (Issue #227)**:
+  `routes/github_connections.py::delete_connection` cancels every
+  non-terminal publish job of a connection (prepare phase or
+  `awaiting_approval`) in the same transaction as the disconnect, and
+  refuses (409) if a job is already in an in-flight publish phase
+  (`committing`/`pushing`/`creating_pr`). `approve_publish_job`'s
+  compare-and-set requires the connection to still be `connected`, and
+  `publish_job._require_connection_still_connected` re-checks at phase
+  entry and immediately before the push, on top of
+  `_require_publish_installation_assignment`'s existing check right before
+  every token issuance. `verify_connection` / `sync_connection` /
+  `create_publish_job` all 409 on a disconnected connection; reconnect is
+  always a new `github_connections` row. Audit events (append-only
+  `publish_audit_events`, `app/publish_audit.py`) never carry a token or
+  filesystem path. See the "Disconnect 時の即時失効(Issue #227)" subsection
+  of `docs/project-intelligence.md` for the full design; tests live in
+  `tests/test_publish_disconnect.py`.
+- **Publish job retry/recovery (Issue #226)**: a post-approval failure rests
+  in `retryable_failed` (or `manual_intervention_required` if the remote
+  branch exists but does not match the job's recorded commit) instead of
+  always dead-ending at terminal `failed` -- stale-base-branch conflicts and
+  a mid-flight disconnect (`ConnectionRevokedError`) are the only
+  post-approval failures that still stay terminal `failed`. `POST
+  /github/publish-jobs/{id}/retry` (`publish_job.retry_publish_job`) and the
+  periodic worker's `auto_retry_eligible_jobs` (capped by
+  `PUBLISH_AUTO_RETRY_MAX`, `manual_intervention_required` never included)
+  both compare-and-set the job to `reconciling` and run
+  `publish_job._run_reconcile_phase`, which re-derives the next step from
+  the actual remote branch/commit state under the same job id and the same
+  server-generated branch -- never a new branch, never a force push. A
+  DB-backed lease (`publish_connection_leases`) guards a connection across
+  process restarts on top of `repo_manager.connection_lock`'s in-process
+  lock. `app/publish_recovery.py` also fails over jobs whose worker thread
+  died (stale `heartbeat_at`) at startup and on a periodic tick. Every
+  status transition is recorded append-only in `publish_audit_events` in
+  the same transaction that performs it (`GET
+  /github/publish-jobs/{id}/events` reads it back). See
+  `docs/project-intelligence.md`'s "Publish job の retry / recovery(Issue
+  #226)" subsection for the full reconcile decision table; tests live in
+  `tests/test_publish_retry.py`.
 
 ## Authentication and user management
 
@@ -355,6 +415,31 @@ heuristic result.
   revoke the user's session tokens (API tokens stay valid).
 - Role changes must not demote the last active admin (409).
 - Revoked/expired/inactive tokens return 401.
+- `require_user` / `require_admin` reject `token_kind == "api"` unconditionally
+  (403, "SDK API tokens cannot access management APIs; use a login session"),
+  not just in production: SDK API tokens are for data-plane routes (traces,
+  policies, ...) that depend on `get_principal`/`get_system_id` only, never
+  management/connection/publish routes.
+- `CONTROL_ENV` (`app/environment.py`, Issue #225; default `development`,
+  finite set `{development, production}`, anything else fails startup)
+  drives a strict fail-closed production mode checked in `app/db.py`
+  (`_validate_startup_environment`, before `_bootstrap_admin`, and the
+  production branch of `_enforce_auth_requirement`, after). In production:
+  `CONTROL_REQUIRE_AUTH` is forced on (explicitly disabling it fails
+  startup); `CONTROL_API_KEYS` must be empty (legacy keys are forbidden --
+  `auth.auth_enabled()`/`auth._legacy_keys()` also force this at runtime,
+  independent of startup validation); `CONTROL_ADMIN_PASSWORD` (when
+  `CONTROL_ADMIN_USERNAME` is also set) must pass
+  `security.validate_production_password` (>=16 chars, not in the
+  case-insensitive sample-value denylist, not equal to the username) even
+  if the admin row already exists from an earlier boot; and startup fails
+  unless at least one active admin user exists afterward. `create_user` /
+  `reset_password` (`routes/auth.py`) apply the same password validator in
+  production, returning 422 with the reason. Development is unchanged
+  (permissive, warning-only). A successful env-bootstrap of the admin user
+  writes one append-only `auth_audit_events` row
+  (`event_type='admin_bootstrapped'`); `detail` is structural JSON only,
+  never a password or hash.
 
 ## Probe Pattern lifecycle (issue #168)
 

@@ -27,6 +27,13 @@ class Principal:
 
 
 def _legacy_keys() -> Optional[set]:
+    from .environment import is_production
+
+    if is_production():
+        # Legacy shared keys are forbidden in production (Issue #225); even
+        # if CONTROL_API_KEYS is somehow set at runtime, never accept it as
+        # a credential. Startup validation also refuses to boot with it set.
+        return None
     raw = os.getenv("CONTROL_API_KEYS", "").strip()
     if not raw:
         return None
@@ -40,7 +47,18 @@ def _users_exist() -> bool:
 
 
 def auth_enabled() -> bool:
-    """Auth is active once any user exists or legacy keys are configured."""
+    """Auth is active once any user exists or legacy keys are configured.
+
+    In production (`CONTROL_ENV=production`) auth is always considered
+    enabled, regardless of DB state: startup (`db._enforce_auth_requirement`)
+    already refuses to boot without an active admin, and this keeps
+    `get_principal` fail-closed (never the anonymous no-auth MVP-compat mode)
+    if that invariant were ever violated later at runtime.
+    """
+    from .environment import is_production
+
+    if is_production():
+        return True
     return _users_exist() or _legacy_keys() is not None
 
 
@@ -110,14 +128,29 @@ async def get_principal(
     raise HTTPException(status_code=401, detail="Invalid or revoked credentials")
 
 
+_SDK_TOKEN_REJECTED_DETAIL = (
+    "SDK API tokens cannot access management APIs; use a login session"
+)
+
+
 async def require_admin(principal: Principal = Depends(get_principal)) -> Principal:
+    if principal.token_kind == "api":
+        raise HTTPException(status_code=403, detail=_SDK_TOKEN_REJECTED_DETAIL)
     if not principal.is_admin:
         raise HTTPException(status_code=403, detail="Administrator privileges required")
     return principal
 
 
 async def require_user(principal: Principal = Depends(get_principal)) -> Principal:
-    """Require a caller backed by a user account (legacy keys/anonymous fail)."""
+    """Require a caller backed by a user (login) session.
+
+    SDK API tokens (`token_kind == "api"`) are rejected unconditionally, not
+    just in production: they are scoped to data-plane routes only (traces,
+    policies, ...), which depend on `get_principal`/`get_system_id` instead.
+    Legacy keys and anonymous callers (no `user_id`) also fail.
+    """
+    if principal.token_kind == "api":
+        raise HTTPException(status_code=403, detail=_SDK_TOKEN_REJECTED_DETAIL)
     if principal.user_id is None:
         raise HTTPException(status_code=403, detail="A user account is required")
     return principal

@@ -26,10 +26,13 @@ services:
       WORKSPACE_CONTEXT_MAX_CHARS: ${WORKSPACE_CONTEXT_MAX_CHARS:-50000}
       PROBE_REPOSITORY_ROOTS: /repositories
       GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      # Local dev: a plain host path is fine (no Compose secret needed).
+      # docker-compose.prod.yml fixes this to a Compose secret path instead
+      # (Issue #224) -- see the comment there and docs/github-app-deployment.md.
       GITHUB_APP_PRIVATE_KEY_PATH: ${GITHUB_APP_PRIVATE_KEY_PATH:-}
+      GITHUB_PUBLISH_ENABLED: ${GITHUB_PUBLISH_ENABLED:-false}
       GITHUB_API_BASE_URL: ${GITHUB_API_BASE_URL:-}
       GITHUB_WEB_BASE_URL: ${GITHUB_WEB_BASE_URL:-}
-      # GITHUB_APP_PRIVATE_KEY_PATH must point at a secret file mounted into this container (see .env.example).
       GIT_REPOSITORY_ROOT: /data/git-repositories
       GIT_BRANCH_PREFIX: ${GIT_BRANCH_PREFIX:-probe/}
       GIT_ALLOW_DIRECT_PUSH: ${GIT_ALLOW_DIRECT_PUSH:-false}

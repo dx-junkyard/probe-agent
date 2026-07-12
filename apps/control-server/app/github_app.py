@@ -129,12 +129,143 @@ def _open_request(request: urllib.request.Request, timeout: int):
 
 
 def github_app_configured() -> bool:
-    """Structural, finite check: app id set, key path set, key file exists."""
+    """Structural, finite check: app id set, key path set, key file exists
+    and is non-empty.
+
+    The empty-file case matters in production: `docker-compose.prod.yml`
+    mounts the private key as a Compose secret that defaults to `/dev/null`
+    when the publish workflow is not enabled, so an empty mounted file must
+    read as "not configured" here rather than failing later inside JWT
+    signing (Issue #224).
+    """
     app_id = _app_id()
     key_path = _private_key_path()
     if not app_id or not key_path:
         return False
-    return os.path.isfile(key_path)
+    if not os.path.isfile(key_path):
+        return False
+    try:
+        return os.path.getsize(key_path) > 0
+    except OSError:
+        return False
+
+
+# --- Issue #224: GITHUB_PUBLISH_ENABLED startup validation -------------------
+
+_PUBLISH_ENABLED_TRUE = {"true", "1", "yes", "on"}
+_PUBLISH_ENABLED_FALSE = {"", "false", "0", "no", "off"}
+
+
+def _publish_enabled_raw() -> str:
+    return os.getenv("GITHUB_PUBLISH_ENABLED", "").strip().lower()
+
+
+def publish_enabled() -> bool:
+    """Parse `GITHUB_PUBLISH_ENABLED` from its finite allowed set.
+
+    Per CLAUDE.md Principle 6 this is a deterministic decision over a small
+    explicit set, not a heuristic truthy/falsey coercion: empty/unset is
+    `false`, any value outside the set raises so an operator typo fails
+    startup instead of silently disabling (or enabling) the publish
+    workflow.
+    """
+    raw = _publish_enabled_raw()
+    if raw in _PUBLISH_ENABLED_TRUE:
+        return True
+    if raw in _PUBLISH_ENABLED_FALSE:
+        return False
+    raise RuntimeError(
+        f"GITHUB_PUBLISH_ENABLED={raw!r} is not a recognized value; expected "
+        "one of '', true, false, 1, 0, yes, no, on, off (case-insensitive)."
+    )
+
+
+def _looks_like_pem_private_key(data: bytes) -> bool:
+    return b"-----BEGIN" in data and b"PRIVATE KEY-----" in data
+
+
+def _parses_as_pem_private_key(data: bytes) -> bool:
+    """Structural validation that `data` is a usable PEM private key.
+
+    Prefers `cryptography.hazmat.primitives.serialization.load_pem_private_key`
+    (cryptography is already a transitive dependency via `PyJWT[crypto]`). If
+    the import is unavailable for some reason, falls back to a structural PEM
+    header check plus attempting to actually sign with `jwt.encode` -- this is
+    still a direct structural/finite check (does it parse or not), not a
+    heuristic inference (Principle 6).
+    """
+    try:
+        from cryptography.hazmat.primitives.serialization import (
+            load_pem_private_key,
+        )
+    except ImportError:
+        if not _looks_like_pem_private_key(data):
+            return False
+        try:
+            jwt.encode({"a": 1}, data, algorithm="RS256")
+        except Exception:
+            return False
+        return True
+
+    try:
+        load_pem_private_key(data, password=None)
+    except Exception:
+        return False
+    return True
+
+
+def validate_publish_startup_config() -> None:
+    """Fail closed at startup when `GITHUB_PUBLISH_ENABLED=true` but the
+    GitHub App is not actually usable (Issue #224).
+
+    Mirrors the Issue #225 `_validate_startup_environment` pattern in
+    `app/db.py`: called from `init_db()` right after that check. When
+    `GITHUB_PUBLISH_ENABLED` is false/unset, this function is a no-op --
+    `github_app_configured()` remains the runtime gate, unchanged.
+
+    Error messages never include the key bytes or the configured path value
+    (only the env var name), since the path may be a host path in
+    development.
+    """
+    if not publish_enabled():
+        return
+
+    app_id = _app_id()
+    if not app_id:
+        raise RuntimeError(
+            "GITHUB_PUBLISH_ENABLED=true but GITHUB_APP_ID is not set."
+        )
+
+    key_path = _private_key_path()
+    if not key_path:
+        raise RuntimeError(
+            "GITHUB_PUBLISH_ENABLED=true but GITHUB_APP_PRIVATE_KEY_PATH is "
+            "not set."
+        )
+
+    generic_error = (
+        "GITHUB_PUBLISH_ENABLED=true but GITHUB_APP_PRIVATE_KEY_PATH does "
+        "not point to a readable, non-empty PEM private key."
+    )
+
+    if not os.path.isfile(key_path):
+        raise RuntimeError(generic_error)
+
+    try:
+        size = os.path.getsize(key_path)
+    except OSError:
+        raise RuntimeError(generic_error) from None
+    if size == 0:
+        raise RuntimeError(generic_error)
+
+    try:
+        with open(key_path, "rb") as handle:
+            data = handle.read()
+    except OSError:
+        raise RuntimeError(generic_error) from None
+
+    if not _parses_as_pem_private_key(data):
+        raise RuntimeError(generic_error)
 
 
 def _require_configured() -> None:

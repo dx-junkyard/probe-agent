@@ -1588,7 +1588,8 @@ export function useInstallationRepositories(installationId: number | null) {
 function publishJobInProgress(status: PublishJobOut["status"] | undefined): boolean {
   return status === "pending" || status === "authenticating" || status === "fetching"
     || status === "checking_out" || status === "applying_patch" || status === "validating"
-    || status === "committing" || status === "pushing" || status === "creating_pr";
+    || status === "committing" || status === "pushing" || status === "creating_pr"
+    || status === "reconciling";
 }
 
 export function usePublishJobs(connectionId: number | null) {
@@ -1639,6 +1640,17 @@ export function useCancelPublishJob() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (jobId: number) => api.post<PublishJobOut>(`/github/publish-jobs/${jobId}/cancel`),
+    onSuccess: (_d, jobId) => {
+      qc.invalidateQueries({ queryKey: sysKey("publishJobs") });
+      qc.invalidateQueries({ queryKey: sysKey("publishJob", jobId) });
+    },
+  });
+}
+
+export function useRetryPublishJob() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (jobId: number) => api.post<PublishJobOut>(`/github/publish-jobs/${jobId}/retry`),
     onSuccess: (_d, jobId) => {
       qc.invalidateQueries({ queryKey: sysKey("publishJobs") });
       qc.invalidateQueries({ queryKey: sysKey("publishJob", jobId) });

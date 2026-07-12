@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 
 from ..auth import Principal, get_principal, require_admin, require_user
 from ..db import get_conn
+from ..environment import is_production
 from ..models import (
     LoginRequest,
     MeResponse,
@@ -18,7 +19,13 @@ from ..models import (
     UserCreate,
     UserOut,
 )
-from ..security import generate_token, hash_password, hash_token, verify_password
+from ..security import (
+    generate_token,
+    hash_password,
+    hash_token,
+    validate_production_password,
+    verify_password,
+)
 
 router = APIRouter()
 
@@ -174,6 +181,11 @@ def list_users(_: Principal = Depends(require_admin)) -> List[UserOut]:
 
 @router.post("/users", response_model=UserOut, status_code=201)
 def create_user(payload: UserCreate, _: Principal = Depends(require_admin)) -> UserOut:
+    if is_production():
+        try:
+            validate_production_password(payload.username, payload.password)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
     with get_conn() as conn:
         existing = conn.execute(
             "SELECT 1 FROM users WHERE username = ?", (payload.username,)
@@ -231,10 +243,15 @@ def reset_password(
 ) -> UserOut:
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT id FROM users WHERE id = ?", (user_id,)
+            "SELECT id, username FROM users WHERE id = ?", (user_id,)
         ).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="User not found")
+        if is_production():
+            try:
+                validate_production_password(row["username"], payload.password)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
         conn.execute(
             "UPDATE users SET password_hash = ? WHERE id = ?",
             (hash_password(payload.password), user_id),
