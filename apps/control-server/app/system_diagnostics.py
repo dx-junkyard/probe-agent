@@ -769,13 +769,35 @@ def _last_run_failure_guidance(run_type: str, error: Optional[str]) -> Dict[str,
     }
 
 
-def _check_last_reasoning_run(conn, system_id: int) -> DiagnosticCheck:
+def _check_last_reasoning_run(
+    conn, system_id: int, snapshot_id: Optional[int],
+) -> DiagnosticCheck:
+    """Report only a reasoning failure that belongs to the current snapshot.
+
+    A historical Interview review must not turn a later deterministic System
+    Understanding build red.  Each snapshot is an immutable evidence scope,
+    so the diagnostic is scoped to the latest ready snapshot as well.
+    """
+    if snapshot_id is None:
+        return DiagnosticCheck(
+            check_id="llm_last_run",
+            category="llm",
+            title="直近の reasoning モデル実行",
+            severity="unknown",
+            detail="最新 snapshot がないため、この snapshot に紐づく reasoning 実行はありません。",
+            impact="snapshot を作成後に reasoning 実行の状態を確認できます。",
+            remediation="Repository で snapshot を作成してください。",
+            related_pages=[PAGE_REPOSITORY],
+            fix_kind=FIX_KIND_NAVIGATE,
+            fix_page=PAGE_REPOSITORY,
+            fix_anchor=ANCHOR_SNAPSHOT_CREATE,
+        )
     row = conn.execute(
         "SELECT id, run_type, status, error_details, completed_at, started_at, is_mock "
         "FROM intelligence_runs "
-        "WHERE system_id = ? AND decision_method = 'reasoning_llm' "
+        "WHERE system_id = ? AND snapshot_id = ? AND decision_method = 'reasoning_llm' "
         "ORDER BY id DESC LIMIT 1",
-        (system_id,),
+        (system_id, snapshot_id),
     ).fetchone()
     if row is None:
         return DiagnosticCheck(
@@ -1349,7 +1371,7 @@ def run_system_diagnostics(system_id: int) -> SystemDiagnosticsReport:
         checks.append(_check_system_purpose(conn, system_id, snapshot_id))
         checks.append(_check_system_capabilities(conn, system_id, snapshot_id))
 
-        checks.append(_check_last_reasoning_run(conn, system_id))
+        checks.append(_check_last_reasoning_run(conn, system_id, snapshot_id))
 
         checks.append(
             _run_backed_pipeline_check(

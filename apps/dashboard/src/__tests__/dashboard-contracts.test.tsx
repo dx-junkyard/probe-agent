@@ -5426,6 +5426,9 @@ describe("Hub success summary and pipeline collapse (Issue #211)", () => {
     expect(await screen.findByTestId("pipeline-checklist")).toBeInTheDocument();
     expect(screen.queryByTestId("pipeline-collapsed")).not.toBeInTheDocument();
     expect(screen.queryByTestId("build-success-summary")).not.toBeInTheDocument();
+    const cta = screen.getByTestId("pipeline-cta-capability_hierarchy_ready");
+    expect(cta).toHaveTextContent("Review interview proposals");
+    expect(cta).toHaveAttribute("href", "/interview");
   });
 
   test("undefined purpose adds the prerequisite note to the entry cards", async () => {

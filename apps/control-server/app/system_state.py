@@ -914,6 +914,56 @@ def _capability_hierarchy_item(
         # at Interview/metadata instead of re-running the already-completed
         # Build / Refresh.
         if _capability_count_in_current_snapshot(conn, system_id, snapshot_id) == 0:
+            proposal_state = conn.execute(
+                """SELECT s.id AS session_id, s.materialized_at,
+                          SUM(CASE WHEN p.approval_state = 'needs_review' THEN 1 ELSE 0 END) AS needs_review_count,
+                          SUM(CASE WHEN p.approval_state IN ('approved', 'edited') THEN 1 ELSE 0 END) AS approved_count
+                   FROM interview_session s
+                   LEFT JOIN interview_proposal p ON p.session_id = s.id AND p.system_id = s.system_id
+                   WHERE s.system_id = ?
+                   GROUP BY s.id
+                   HAVING needs_review_count > 0 OR approved_count > 0 OR s.materialized_at IS NOT NULL
+                   ORDER BY s.updated_at DESC, s.id DESC LIMIT 1""",
+                (system_id,),
+            ).fetchone()
+            if proposal_state is not None and proposal_state["needs_review_count"]:
+                session_id = proposal_state["session_id"]
+                needs_review = proposal_state["needs_review_count"]
+                detail = (
+                    f"capability_hierarchy の実行（#{row['id']}）は完了していますが、現在の snapshot に "
+                    "`probe-agent:` docstring メタデータがありません。"
+                    f"Interview session #{session_id} の提案 {needs_review} 件は再レビュー待ちです。"
+                )
+                remediation = (
+                    f"Interview session #{session_id} で提案を再レビューして承認し、レビュー用差分を生成してください。"
+                    "差分を対象リポジトリへ適用して新しい snapshot を作成した後、Build / Refresh を実行してください。"
+                )
+                target_route = f"{PAGE_INTERVIEW}?session={session_id}"
+                action_label = "Interview の提案を再レビュー"
+            elif proposal_state is not None and proposal_state["approved_count"]:
+                session_id = proposal_state["session_id"]
+                detail = (
+                    f"capability_hierarchy の実行（#{row['id']}）は完了していますが、現在の snapshot に "
+                    "`probe-agent:` docstring メタデータがありません。承認済み Interview 提案はまだソースに反映されていません。"
+                )
+                remediation = (
+                    f"Interview session #{session_id} でレビュー用差分を生成し、対象リポジトリへ適用してください。"
+                    "その後、新しい snapshot を作成して Build / Refresh を実行してください。"
+                )
+                target_route = f"{PAGE_INTERVIEW}?session={session_id}"
+                action_label = "Interview で差分を生成"
+            else:
+                detail = (
+                    f"capability_hierarchy の実行（#{row['id']}）は完了していますが、"
+                    "現在の snapshot に capability ノードが存在しません。対象リポジトリに"
+                    " `probe-agent:` docstring メタデータが見つからなかったことが原因です。"
+                )
+                remediation = (
+                    "Interview で Core Capabilities を確認して提案を生成・承認し、レビュー用差分を対象リポジトリへ適用してください。"
+                    "新しい snapshot を作成した後、Build / Refresh を実行してください。"
+                )
+                target_route = PAGE_INTERVIEW
+                action_label = "Interview で Core Capabilities を確認"
             return StateItem(
                 state_id="pipeline.capability_hierarchy.empty",
                 state_group="pipeline",
@@ -923,21 +973,14 @@ def _capability_hierarchy_item(
                 intervention_timing="before_next_step",
                 subject="Capability 階層",
                 summary="Capability 階層は実行済みですが capability が 0 件です。",
-                detail=(
-                    f"capability_hierarchy の実行（#{row['id']}）は完了していますが、"
-                    "現在の snapshot に capability ノードが存在しません。対象リポジトリに"
-                    " `probe-agent:` docstring メタデータが見つからなかったことが原因です。"
-                ),
+                detail=detail,
                 impact="Core Capabilities が未定義のため、probe 設計・flow 探索・改善提案の前提が欠けています。",
-                remediation=(
-                    "Interview で Core Capabilities を確認するか、対象リポジトリに "
-                    "`probe-agent:` メタデータを追加してから Build / Refresh を再実行してください。"
-                ),
+                remediation=remediation,
                 evidence={"snapshot_id": snapshot_id, "run_id": row["id"], "capability_count": 0},
                 target_ui=TargetUi(
-                    route=PAGE_INTERVIEW,
+                    route=target_route,
                     anchor=ANCHOR_INTERVIEW_CAPABILITIES,
-                    action_label="Interview で Core Capabilities を確認",
+                    action_label=action_label,
                 ),
                 related_pipeline_steps=["capability_hierarchy_ready"],
             )

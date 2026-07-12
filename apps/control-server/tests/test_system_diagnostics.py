@@ -526,6 +526,32 @@ class TestLastObservedFailures:
         assert checks_a["llm_last_run"]["severity"] == "error"
         assert checks_b["llm_last_run"]["severity"] == "unknown"
 
+    def test_failed_reasoning_run_from_older_snapshot_is_not_current_error(
+        self, admin_client, tmp_path,
+    ):
+        """A stale Interview failure must not make a newer build red."""
+        _, sys, hdrs = _setup(admin_client)
+        _insert_snapshot_and_run(
+            str(tmp_path / "probe-diag-test.db"), sys["id"],
+            run_type="understanding_review", status="failed",
+            error_details="old response validation failure",
+        )
+        conn = sqlite3.connect(str(tmp_path / "probe-diag-test.db"))
+        try:
+            now = time.time()
+            conn.execute(
+                """INSERT INTO repository_snapshots
+                   (system_id, repo_path, commit_sha, status, created_at, completed_at)
+                   VALUES (?, '/tmp/repo', 'newer-snapshot', 'ready', ?, ?)""",
+                (sys["id"], now, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        _, checks = _get_checks(admin_client, hdrs)
+        assert checks["llm_last_run"]["severity"] == "unknown"
+
 
 class TestPipelinePrerequisites:
     def test_no_snapshot_blocks_pipeline_checks(self, admin_client):

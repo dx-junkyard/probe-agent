@@ -669,8 +669,8 @@ class TestPipelineState:
         assert item["status"] == "missing"
         assert item["severity"] == "warning"
         assert item["user_action_kind"] == "confirm"
-        assert "Build / Refresh を実行してください" not in item["remediation"]
         assert "Interview" in item["remediation"]
+        assert "新しい snapshot" in item["remediation"]
 
     def test_capability_hierarchy_completed_with_capabilities_returns_no_item(
         self, admin_client, tmp_path
