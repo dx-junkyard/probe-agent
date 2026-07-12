@@ -323,6 +323,8 @@ export interface SystemStateItem {
   remediation: string;
   evidence: Record<string, unknown>;
   target_ui: SystemStateTargetUi | null;
+  /** Pages where this item is displayed; target_ui remains the fix destination. */
+  display_routes?: string[];
   related_checks: string[];
   related_pipeline_steps: string[];
   source: string;

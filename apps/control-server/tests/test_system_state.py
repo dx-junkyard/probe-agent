@@ -349,6 +349,27 @@ class TestSystemStateBasics:
         state_ids = {item.state_id for item in page_items["/repository"]}
         assert state_ids == {"warning.with_ui"}
 
+    def test_page_items_projects_explicit_display_route_and_keeps_target_route(self):
+        from app.system_state import StateItem, TargetUi, _build_page_items
+
+        item = StateItem(
+            "observed.elsewhere", "pipeline", "warning", "missing", "confirm", "before_next_step", "x", "x", "x",
+            target_ui=TargetUi(route="/interview", anchor=None, action_label="Fix"),
+            display_routes=["/system-understanding"],
+        )
+        page_items = _build_page_items([item])
+        assert page_items["/system-understanding"] == [item]
+        assert page_items["/interview"] == [item]
+
+    def test_page_items_without_display_routes_remain_target_only(self):
+        from app.system_state import StateItem, TargetUi, _build_page_items
+
+        item = StateItem(
+            "target.only", "repository", "warning", "missing", "configure", "now", "x", "x", "x",
+            target_ui=TargetUi(route="/repository", anchor=None, action_label="Fix"),
+        )
+        assert _build_page_items([item]) == {"/repository": [item]}
+
     def test_all_items_carry_finite_vocabulary(self, admin_client, tmp_path):
         _, sys, hdrs = _setup(admin_client)
         repo, sha = _init_git_repo(tmp_path)
@@ -671,6 +692,16 @@ class TestPipelineState:
         assert item["user_action_kind"] == "confirm"
         assert "Interview" in item["remediation"]
         assert "新しい snapshot" in item["remediation"]
+        assert item["display_routes"] == ["/system-understanding"]
+
+        assessment = admin_client.get("/system-state", headers=hdrs).json()
+        page_items = assessment["page_items"]
+        assert "pipeline.capability_hierarchy.empty" in {
+            projected["state_id"] for projected in page_items["/system-understanding"]
+        }
+        assert "pipeline.capability_hierarchy.empty" in {
+            projected["state_id"] for projected in page_items["/interview"]
+        }
 
     def test_capability_hierarchy_completed_with_capabilities_returns_no_item(
         self, admin_client, tmp_path

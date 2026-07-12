@@ -4025,6 +4025,55 @@ describe("System Understanding page", () => {
     expect(screen.queryByTestId("system-state-banner")).toBeNull();
   });
 
+  test("shows the capability-empty canonical guidance on System Understanding and keeps its Interview CTA", async () => {
+    window.history.pushState({}, "", "/system-understanding");
+    const capabilityEmptyItem: SystemStateItem = {
+      state_id: "pipeline.capability_hierarchy.empty",
+      state_group: "pipeline",
+      severity: "warning",
+      status: "missing",
+      user_action_kind: "confirm",
+      intervention_timing: "before_next_step",
+      subject: "Capability hierarchy",
+      summary: "Capability hierarchy completed, but has 0 capabilities.",
+      detail: "No capability nodes were generated.",
+      impact: "Core Capabilities are not yet defined.",
+      remediation: "Interview で Core Capabilities を確認してください。",
+      evidence: { capability_count: 0 },
+      target_ui: { route: "/interview", anchor: "interview-capabilities", action_label: "Interview で Core Capabilities を確認" },
+      display_routes: ["/system-understanding"],
+      related_checks: [],
+      related_pipeline_steps: ["capability_hierarchy_ready"],
+      source: "system_state",
+      dedupe_key: "",
+      scope: "global",
+      decision_method: "deterministic",
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(completeResponse);
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "warning",
+        severity_counts: { warning: 1 }, items: [capabilityEmptyItem], primary_item: capabilityEmptyItem,
+        notification_items: [capabilityEmptyItem],
+        page_items: {
+          "/system-understanding": [capabilityEmptyItem],
+          "/interview": [capabilityEmptyItem],
+        },
+      });
+      return Promise.resolve(null);
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    expect(await screen.findByTestId("system-state-banner")).toHaveTextContent(capabilityEmptyItem.summary);
+    const cta = screen.getByTestId("system-state-action-pipeline.capability_hierarchy.empty");
+    expect(cta).toHaveTextContent("Interview で Core Capabilities を確認");
+    fireEvent.click(cta);
+    await waitFor(() => expect(window.location.pathname).toBe("/interview"));
+    expect(new URLSearchParams(window.location.search).get("fix")).toBe("interview-capabilities");
+  });
+
   test("renders gap_trend increase/decrease chips in the gap worklist", async () => {
     const response = {
       ...gapWorklistResponse,

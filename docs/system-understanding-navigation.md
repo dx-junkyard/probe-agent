@@ -216,7 +216,19 @@ probe plans / experiments を同じ分析文脈で返す。
    `PrimaryActionCard`（本ドキュメント「Primary Action (Issue #201)」節）
 2. `system_state.build_system_state` / `select_primary_item` →
    `GET /system-state` の `primary_item` / `page_items` →
-   `SystemStateBanner` とヘッダーの `DiagnosticsBadge`
+  `SystemStateBanner` とヘッダーの `DiagnosticsBadge`
+
+`StateItem.target_ui` は修正を実行する画面を表す。一方、問題を観測する
+画面は `display_routes` で明示し、`page_items` には
+`display_routes ∪ {target_ui.route}` を投影する（Issue #231）。現時点で
+観測/修正が異なる item は次の有限集合であり、推測による自動付与はしない。
+
+| StateItem | 観測画面 (`display_routes`) | 修正画面 (`target_ui.route`) |
+| --- | --- | --- |
+| `understanding.purpose.diff_impacted` / `.unconfirmed` / `.missing_baseline` | `/system-understanding` | `/interview` |
+| `understanding.capabilities.diff_impacted` / `.unconfirmed` / `.missing_baseline` | `/system-understanding` | `/interview` |
+| `snapshot.latest.stale_for_interview` | `/system-understanding` | `/interview` |
+| `pipeline.capability_hierarchy.empty` | `/system-understanding` | `/interview`（session query 付きの場合を含む） |
 
 前者は現 snapshot のみを参照し、後者は Interview baseline の snapshot
 跨ぎ再利用に対応するなど、判定材料が完全には一致しない。統合（前者を

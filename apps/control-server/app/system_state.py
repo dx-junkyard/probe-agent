@@ -117,6 +117,10 @@ class StateItem:
     remediation: str = ""
     evidence: Dict[str, Any] = field(default_factory=dict)
     target_ui: Optional[TargetUi] = None
+    # Pages where this state is observed.  ``target_ui`` remains the place
+    # where the user performs the remediation; it is deliberately not
+    # overloaded with presentation routing.
+    display_routes: List[str] = field(default_factory=list)
     related_checks: List[str] = field(default_factory=list)
     related_pipeline_steps: List[str] = field(default_factory=list)
     source: str = "system_state"
@@ -568,6 +572,7 @@ def _understanding_state_item(status: UnderstandingStatus, *, purpose: bool) -> 
             target_ui=TargetUi(
                 route=PAGE_INTERVIEW, anchor=anchor, action_label=f"Interview で{subject}を再確認",
             ),
+            display_routes=[PAGE_SYSTEM_UNDERSTANDING],
             related_checks=["system_purpose" if purpose else "system_capabilities"],
         )
     if status.kind == "unconfirmed":
@@ -592,6 +597,7 @@ def _understanding_state_item(status: UnderstandingStatus, *, purpose: bool) -> 
             target_ui=TargetUi(
                 route=PAGE_INTERVIEW, anchor=anchor, action_label=f"Interview で{subject}を確認",
             ),
+            display_routes=[PAGE_SYSTEM_UNDERSTANDING],
             related_checks=["system_purpose" if purpose else "system_capabilities"],
         )
     # missing_baseline
@@ -610,6 +616,7 @@ def _understanding_state_item(status: UnderstandingStatus, *, purpose: bool) -> 
         target_ui=TargetUi(
             route=PAGE_INTERVIEW, anchor=anchor, action_label=f"Interview で{subject}を定義",
         ),
+        display_routes=[PAGE_SYSTEM_UNDERSTANDING],
         related_checks=["system_purpose" if purpose else "system_capabilities"],
     )
 
@@ -702,6 +709,7 @@ def _snapshot_stale_for_interview_item(conn, system_id: int, snapshot_id: int) -
         remediation="最新 snapshot を基準に Interview を見直してください。",
         evidence={"interview_session_id": row["id"], "interview_snapshot_id": row["snapshot_id"], "latest_snapshot_id": snapshot_id},
         target_ui=TargetUi(route=PAGE_INTERVIEW, anchor=None, action_label="Interview を確認"),
+        display_routes=[PAGE_SYSTEM_UNDERSTANDING],
     )
 
 
@@ -982,6 +990,7 @@ def _capability_hierarchy_item(
                     anchor=ANCHOR_INTERVIEW_CAPABILITIES,
                     action_label=action_label,
                 ),
+                display_routes=[PAGE_SYSTEM_UNDERSTANDING],
                 related_pipeline_steps=["capability_hierarchy_ready"],
             )
         return None
@@ -1091,17 +1100,21 @@ def select_primary_item(items: List[StateItem], *, route: Optional[str] = None) 
 
 
 def _build_page_items(items: List[StateItem]) -> Dict[str, List[StateItem]]:
-    """Group actionable (non-``ok``) items by their target route.
+    """Group actionable items by explicit observation routes and fix route.
 
     ``page_items[route][0]`` renders as a warning-styled action banner in the
     dashboard, so an ``ok`` item must never appear here even if it happens to
     carry a ``target_ui`` (hardening; no current item does both today).
     """
     actionable = [item for item in items if item.severity != "ok" and item.target_ui]
-    routes = sorted({item.target_ui.route for item in actionable})
+    item_routes = {
+        id(item): set(item.display_routes) | {item.target_ui.route}
+        for item in actionable
+    }
+    routes = sorted({route for routes in item_routes.values() for route in routes})
     return {
         route: sorted(
-            [item for item in actionable if item.target_ui.route == route],
+            [item for item in actionable if route in item_routes[id(item)]],
             key=lambda item: (
                 _SEVERITY_RANK.get(item.severity, len(_SEVERITY_RANK)),
                 _TIMING_RANK.get(item.intervention_timing, len(_TIMING_RANK)), item.state_id,

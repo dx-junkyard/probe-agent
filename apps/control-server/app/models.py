@@ -3549,6 +3549,7 @@ class SystemStateItemOut(BaseModel):
     remediation: str = ""
     evidence: Dict[str, Any] = Field(default_factory=dict)
     target_ui: Optional[SystemStateTargetUiOut] = None
+    display_routes: List[str] = Field(default_factory=list)
     related_checks: List[str] = Field(default_factory=list)
     related_pipeline_steps: List[str] = Field(default_factory=list)
     source: str = "system_state"
