@@ -43,6 +43,17 @@ Git/GitHub-API safety, all fail-closed (Principle 5/6/8):
   ``error`` is always passed through ``github_app._sanitize`` first.
 * Every terminal state (completed/failed/cancelled) cleans up the job
   worktree in a ``finally``-equivalent path and records ``cleanup_state``.
+* Explicit Disconnect revokes publish permission immediately (Issue #227,
+  enforced in ``routes/github_connections.py::delete_connection``): every
+  job still in the prepare phase or awaiting approval is cancelled in the
+  same transaction as the disconnect, ``approve_publish_job``'s
+  compare-and-set requires the connection to still be ``connected``, and
+  ``_require_connection_still_connected`` re-checks the connection at phase
+  entry and immediately before the push, on top of
+  ``_require_publish_installation_assignment``'s check right before every
+  token issuance. A job that has already reached an in-flight publish phase
+  (committing/pushing/creating_pr) blocks the disconnect instead of being
+  interrupted mid-push.
 """
 
 from __future__ import annotations
@@ -199,20 +210,46 @@ def _remote_branch_sha_or_none(connection_row, token: str, branch: str) -> Optio
 
 
 def _require_publish_installation_assignment(connection_id: int, system_id: int) -> None:
-    """Re-check the DB authorization immediately before issuing a token."""
+    """Re-check the DB authorization immediately before issuing a token.
+
+    Also re-checks the connection itself is still ``connected`` (Issue #227):
+    this function runs immediately before every installation-token issuance
+    in both phases, so it is the enforcement point for "re-validate right
+    before push/token"."""
     with get_conn() as conn:
         connection = conn.execute(
-            "SELECT installation_id FROM github_connections WHERE id = ? AND system_id = ?",
+            "SELECT installation_id, status FROM github_connections WHERE id = ? AND system_id = ?",
             (connection_id, system_id),
         ).fetchone()
         if connection is None:
             raise PublishJobNotFound("GitHub connection not found")
+        if connection["status"] != "connected":
+            raise PublishJobConflict(
+                f"GitHub connection is no longer connected (status={connection['status']})"
+            )
         try:
             require_active_installation_assignment(
                 conn, connection["installation_id"], system_id
             )
         except GitHubInstallationAccessError as exc:
             raise PublishJobConflict(str(exc)) from None
+
+
+def _require_connection_still_connected(connection_id: int) -> None:
+    """Fail closed if the connection was disconnected since this phase last
+    checked (Issue #227). Used at phase entry and immediately before the
+    push, in addition to `_require_publish_installation_assignment`'s check
+    right before every token issuance."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT status FROM github_connections WHERE id = ?", (connection_id,)
+        ).fetchone()
+    status = row["status"] if row is not None else "missing"
+    if status != "connected":
+        raise PublishJobConflict(
+            f"GitHub connection is no longer connected (status={status}); "
+            "publish was cancelled by a disconnect"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +387,10 @@ def _run_prepare_phase(job_id: int) -> None:
     error: Optional[str] = None
     with repo_manager.connection_lock(connection_id):
         try:
+            # Phase re-entry check (Issue #227): the connection may have been
+            # disconnected between job creation and this thread actually
+            # starting/resuming, even before the first status transition.
+            _require_connection_still_connected(connection_id)
             if not _set_status(job_id, "authenticating"):
                 return
             _require_publish_installation_assignment(connection_id, job["system_id"])
@@ -428,6 +469,16 @@ def approve_publish_job(
     *,
     spawn: bool = True,
 ) -> None:
+    """Move ``awaiting_approval -> committing``.
+
+    The compare-and-set below is the authority (Issue #227): it only applies
+    when the job is still ``awaiting_approval`` *and* its connection is
+    still ``status='connected'`` at the same instant, so a disconnect that
+    races with an approval call can never let the approval through. The
+    explicit checks above the CAS exist only to give a more specific 409
+    message in the common (non-racy) case; they must not be relied on for
+    correctness on their own.
+    """
     now = _now()
     with get_conn() as conn:
         job = conn.execute(
@@ -439,17 +490,41 @@ def approve_publish_job(
             raise PublishJobConflict(
                 f"Publish job is not awaiting approval (status={job['status']})"
             )
+        connection = conn.execute(
+            "SELECT status FROM github_connections WHERE id = ?", (job["connection_id"],)
+        ).fetchone()
+        if connection is None or connection["status"] != "connected":
+            status = connection["status"] if connection is not None else "missing"
+            raise PublishJobConflict(
+                f"GitHub connection is not connected (status={status}); cannot approve"
+            )
+
         cur = conn.execute(
             """
             UPDATE publish_jobs
             SET status = 'committing', approved_by_user_id = ?, approved_at = ?,
                 updated_at = ?, heartbeat_at = ?
             WHERE id = ? AND status = 'awaiting_approval'
+              AND (SELECT status FROM github_connections
+                   WHERE id = publish_jobs.connection_id) = 'connected'
             """,
             (approved_by_user_id, now, now, now, job_id),
         )
         if cur.rowcount == 0:
-            raise PublishJobConflict("Publish job approval state changed concurrently")
+            job = conn.execute(
+                "SELECT * FROM publish_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            connection = conn.execute(
+                "SELECT status FROM github_connections WHERE id = ?", (job["connection_id"],)
+            ).fetchone()
+            if connection is None or connection["status"] != "connected":
+                status = connection["status"] if connection is not None else "missing"
+                raise PublishJobConflict(
+                    f"GitHub connection is not connected (status={status}); cannot approve"
+                )
+            raise PublishJobConflict(
+                f"Publish job approval state changed concurrently (status={job['status']})"
+            )
 
     if spawn:
         _spawn_publish(job_id)
@@ -504,6 +579,12 @@ def _run_publish_phase(job_id: int) -> None:
     error: Optional[str] = None
     with repo_manager.connection_lock(connection_id):
         try:
+            # Phase re-entry check (Issue #227): approve() already moved the
+            # job to 'committing', so this is not the first status
+            # transition of the phase -- but it is the first opportunity
+            # this thread has to see a disconnect that happened between
+            # approval and the thread actually starting/resuming.
+            _require_connection_still_connected(connection_id)
             if not _set_status(job_id, "committing"):
                 return
 
@@ -587,6 +668,10 @@ def _run_publish_phase(job_id: int) -> None:
 
             pushed_sha = _remote_branch_sha_or_none(connection_row, token, branch_name)
             if pushed_sha != commit_sha:
+                # Last re-validation point (Issue #227), immediately before
+                # the actual push: a disconnect could have landed after the
+                # token-issuance check above but before this line.
+                _require_connection_still_connected(connection_id)
                 push_result = repo_manager.push(
                     connection_row,
                     worktree_path,

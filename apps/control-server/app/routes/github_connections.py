@@ -22,13 +22,16 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+import time
 from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from .. import publish_job
 from ..auth import Principal, get_system_id, require_admin, require_user
 from ..db import get_conn
+from ..publish_audit import record_publish_audit_event
 from ..github_app import (
     GitHubAppError,
     allowed_organization,
@@ -457,6 +460,11 @@ def verify_connection(
     with get_conn() as conn:
         _require_manage(conn, principal, system_id)
         row = _get_connection_or_404(conn, connection_id, system_id)
+        if row["status"] == "disconnected":
+            raise HTTPException(
+                status_code=409,
+                detail="Connection is disconnected; reconnect by creating a new connection",
+            )
         _require_installation_assignment(conn, row["installation_id"], system_id)
 
     now = _now_iso()
@@ -598,23 +606,147 @@ def get_repository_status(
     )
 
 
+_CANCELLABLE_JOB_STATUSES = (
+    "pending",
+    "authenticating",
+    "fetching",
+    "checking_out",
+    "applying_patch",
+    "validating",
+    "awaiting_approval",
+)
+_IN_FLIGHT_PUBLISH_STATUSES = ("committing", "pushing", "creating_pr")
+
+
 @router.delete("/github/connections/{connection_id}", response_model=GithubConnectionOut)
 def delete_connection(
     connection_id: int,
     principal: Principal = Depends(require_user),
     system_id: int = Depends(get_system_id),
 ) -> GithubConnectionOut:
+    """Explicit disconnect (Issue #227): soft-deletes the connection and
+    revokes publish permission immediately.
+
+    A publish job that has already progressed past approval into an
+    in-flight publish phase (committing/pushing/creating_pr) blocks the
+    disconnect (409) instead of being interrupted mid-push. Every other
+    non-terminal job of this connection (still in the prepare phase, or
+    waiting for approval) is cancelled in the same transaction as the
+    disconnect. The running prepare-phase thread for a cancelled job (if
+    any) needs no extra signal: it stops itself the next time it calls
+    `publish_job._set_status`, which refuses to leave a terminal status.
+    This route only has to (a) flip status to cancelled here and (b)
+    best-effort clean up the job worktree afterwards, exactly like
+    `publish_job.cancel_publish_job` does for a single job. Remote branches
+    and any already-created Pull Requests are intentionally left alone --
+    `pr_url` / `branch_name` stay on the job row so a Dashboard link to an
+    already-opened PR keeps resolving after disconnect.
+    """
     now = _now_iso()
+    now_ts = time.time()
     with get_conn() as conn:
         _require_manage(conn, principal, system_id)
-        _get_connection_or_404(conn, connection_id, system_id)
-        conn.execute(
+        row = _get_connection_or_404(conn, connection_id, system_id)
+        if row["status"] == "disconnected":
+            raise HTTPException(status_code=409, detail="Connection is already disconnected")
+
+        in_flight = conn.execute(
+            f"""
+            SELECT 1 FROM publish_jobs
+            WHERE connection_id = ? AND status IN
+                ({", ".join("?" for _ in _IN_FLIGHT_PUBLISH_STATUSES)})
+            LIMIT 1
+            """,
+            (connection_id, *_IN_FLIGHT_PUBLISH_STATUSES),
+        ).fetchone()
+        if in_flight is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Cannot disconnect while a publish job is committing, pushing, or "
+                    "creating a Pull Request; wait for it to finish"
+                ),
+            )
+
+        cur = conn.execute(
             """
             UPDATE github_connections
             SET status = 'disconnected', updated_by_user_id = ?, updated_at = ?
-            WHERE id = ? AND system_id = ?
+            WHERE id = ? AND system_id = ? AND status != 'disconnected'
             """,
             (principal.user_id, now, connection_id, system_id),
         )
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=409, detail="Connection state changed concurrently")
+
+        cancellable = conn.execute(
+            f"""
+            SELECT id FROM publish_jobs
+            WHERE connection_id = ? AND status IN
+                ({", ".join("?" for _ in _CANCELLABLE_JOB_STATUSES)})
+            """,
+            (connection_id, *_CANCELLABLE_JOB_STATUSES),
+        ).fetchall()
+        cancelled_job_ids = [job_row["id"] for job_row in cancellable]
+
+        if cancelled_job_ids:
+            placeholders = ", ".join("?" for _ in cancelled_job_ids)
+            status_placeholders = ", ".join("?" for _ in _CANCELLABLE_JOB_STATUSES)
+            conn.execute(
+                f"""
+                UPDATE publish_jobs
+                SET status = 'cancelled',
+                    error = 'Cancelled because the GitHub connection was disconnected',
+                    completed_at = ?, updated_at = ?
+                WHERE id IN ({placeholders}) AND status IN ({status_placeholders})
+                """,
+                [now_ts, now_ts, *cancelled_job_ids, *_CANCELLABLE_JOB_STATUSES],
+            )
+
+        record_publish_audit_event(
+            conn,
+            system_id=system_id,
+            connection_id=connection_id,
+            event_type="connection_disconnected",
+            actor_user_id=principal.user_id,
+            detail={
+                "cancelled_job_ids": cancelled_job_ids,
+                "cancelled_job_count": len(cancelled_job_ids),
+            },
+        )
+        for job_id in cancelled_job_ids:
+            record_publish_audit_event(
+                conn,
+                system_id=system_id,
+                connection_id=connection_id,
+                job_id=job_id,
+                event_type="publish_job_cancelled",
+                actor_user_id=principal.user_id,
+                detail={"reason": "connection_disconnected"},
+            )
+
         row = _get_connection_or_404(conn, connection_id, system_id)
+
+    # Best-effort cleanup after the transaction commits -- mirrors
+    # `publish_job.cancel_publish_job`'s own post-commit cleanup step for a
+    # single job. `_safe_cleanup_worktree` acquires
+    # `repo_manager.connection_lock`, so this blocks (briefly) behind a
+    # concurrently-running prepare-phase thread for the same job until that
+    # thread next checks `_set_status` and returns.
+    for job_id in cancelled_job_ids:
+        cleanup = publish_job._safe_cleanup_worktree(connection_id, job_id)
+        publish_job._update_job(job_id, cleanup_state=cleanup.state, cleanup_error=cleanup.error)
+        with get_conn() as audit_conn:
+            record_publish_audit_event(
+                audit_conn,
+                system_id=system_id,
+                connection_id=connection_id,
+                job_id=job_id,
+                event_type="publish_job_cleanup",
+                actor_user_id=principal.user_id,
+                # cleanup_error may embed a local filesystem path -- keep
+                # only the finite cleanup_state in the audit detail.
+                detail={"cleanup_state": cleanup.state},
+            )
+
     return _connection_out(row)

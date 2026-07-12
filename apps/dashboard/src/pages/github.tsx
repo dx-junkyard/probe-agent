@@ -290,8 +290,10 @@ function ConnectionsPanel({ appConfigured }: { appConfigured: boolean }) {
           <div className="space-y-4">
             <p className="text-sm">
               This disconnects <code className="font-mono">{disconnectTarget.owner}/{disconnectTarget.repo}</code> from
-              this System (soft delete). Existing publish jobs are kept for audit; new ones cannot be created
-              until reconnected.
+              this System (soft delete). Any publish job still pending or awaiting approval is
+              cancelled immediately; jobs already committing, pushing, or creating a Pull Request
+              block the disconnect until they finish. Completed jobs and their Pull Request links
+              are kept for audit; new publish jobs cannot be created until reconnected.
             </p>
             <Button
               variant="destructive" className="w-full"

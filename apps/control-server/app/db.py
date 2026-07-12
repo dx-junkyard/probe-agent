@@ -1840,6 +1840,32 @@ CREATE TABLE IF NOT EXISTS publish_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_publish_jobs_system
     ON publish_jobs (system_id, id DESC);
+
+-- Append-only audit trail for the GitHub publish workflow (Issue #227:
+-- connection disconnect / auto-cancel; Issue #226 is expected to extend
+-- this same table with publish_jobs status-transition events rather than
+-- adding a parallel one). Written via
+-- `app/publish_audit.py::record_publish_audit_event`, which takes an
+-- already-open connection so the audit row lands inside the caller's own
+-- transaction. `detail` is a small JSON object of structural facts only
+-- (job ids, counts, a fixed reason string, a cleanup_state value) -- never
+-- an installation token, JWT, private key, or filesystem path
+-- (Principle 5/8).
+CREATE TABLE IF NOT EXISTS publish_audit_events (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id      INTEGER NOT NULL,
+    connection_id  INTEGER,
+    job_id         INTEGER,
+    event_type     TEXT NOT NULL,
+    actor_user_id  INTEGER,
+    detail         TEXT,          -- JSON
+    created_at     REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_publish_audit_events_system
+    ON publish_audit_events (system_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_publish_audit_events_job
+    ON publish_audit_events (job_id, id DESC);
 """
 
 

@@ -326,6 +326,23 @@ heuristic result.
   the installation-repositories endpoint) and `tests/test_publish_jobs.py`
   (state machine, staleness, push safety, diff-path guards, idempotency,
   cleanup, system isolation, secret hygiene).
+- **Disconnect revokes publish permission immediately (Issue #227)**:
+  `routes/github_connections.py::delete_connection` cancels every
+  non-terminal publish job of a connection (prepare phase or
+  `awaiting_approval`) in the same transaction as the disconnect, and
+  refuses (409) if a job is already in an in-flight publish phase
+  (`committing`/`pushing`/`creating_pr`). `approve_publish_job`'s
+  compare-and-set requires the connection to still be `connected`, and
+  `publish_job._require_connection_still_connected` re-checks at phase
+  entry and immediately before the push, on top of
+  `_require_publish_installation_assignment`'s existing check right before
+  every token issuance. `verify_connection` / `sync_connection` /
+  `create_publish_job` all 409 on a disconnected connection; reconnect is
+  always a new `github_connections` row. Audit events (append-only
+  `publish_audit_events`, `app/publish_audit.py`) never carry a token or
+  filesystem path. See the "Disconnect 時の即時失効(Issue #227)" subsection
+  of `docs/project-intelligence.md` for the full design; tests live in
+  `tests/test_publish_disconnect.py`.
 
 ## Authentication and user management
 
