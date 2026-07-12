@@ -1830,6 +1830,8 @@ CREATE TABLE IF NOT EXISTS publish_jobs (
     heartbeat_at           REAL,
     cleanup_state          TEXT NOT NULL DEFAULT 'not_attempted',
     cleanup_error          TEXT,
+    retry_count            INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at        REAL,
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
     FOREIGN KEY (connection_id) REFERENCES github_connections (id) ON DELETE CASCADE,
     FOREIGN KEY (patch_id) REFERENCES probe_patches (id) ON DELETE CASCADE,
@@ -1840,6 +1842,20 @@ CREATE TABLE IF NOT EXISTS publish_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_publish_jobs_system
     ON publish_jobs (system_id, id DESC);
+
+-- Cross-process lease on a connection's retry/reconcile work (Issue #226):
+-- `repo_manager.connection_lock` is an in-process RLock only, so it cannot
+-- prevent two separate server processes/replicas from both reconciling the
+-- same connection at once. One row per connection; a live (unexpired) row
+-- for a different owner blocks acquisition (see
+-- `app/publish_job.py::_acquire_connection_lease`). `owner` is a structural
+-- process/thread identifier only, never a secret.
+CREATE TABLE IF NOT EXISTS publish_connection_leases (
+    connection_id INTEGER PRIMARY KEY,
+    owner         TEXT NOT NULL,
+    acquired_at   REAL NOT NULL,
+    expires_at    REAL NOT NULL
+);
 
 -- Append-only audit trail for the GitHub publish workflow (Issue #227:
 -- connection disconnect / auto-cancel; Issue #226 is expected to extend
@@ -2364,6 +2380,14 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE github_connections ADD COLUMN last_synced_commit_sha TEXT"
             )
+        publish_job_cols = _columns(conn, "publish_jobs")
+        if publish_job_cols and "retry_count" not in publish_job_cols:
+            # Issue #226: publish job retry/recovery.
+            conn.execute(
+                "ALTER TABLE publish_jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if publish_job_cols and "last_attempt_at" not in publish_job_cols:
+            conn.execute("ALTER TABLE publish_jobs ADD COLUMN last_attempt_at REAL")
         _ensure_legacy_system(conn)
     _validate_startup_environment()
     _validate_publish_startup_config()

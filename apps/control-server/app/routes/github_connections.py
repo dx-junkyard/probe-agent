@@ -614,8 +614,13 @@ _CANCELLABLE_JOB_STATUSES = (
     "applying_patch",
     "validating",
     "awaiting_approval",
+    # Issue #226: resting states after a publish-phase failure or a retry
+    # that hasn't started -- disconnect gives up on them like any other
+    # non-in-flight job.
+    "retryable_failed",
+    "manual_intervention_required",
 )
-_IN_FLIGHT_PUBLISH_STATUSES = ("committing", "pushing", "creating_pr")
+_IN_FLIGHT_PUBLISH_STATUSES = ("committing", "pushing", "creating_pr", "reconciling")
 
 
 @router.delete("/github/connections/{connection_id}", response_model=GithubConnectionOut)
@@ -681,13 +686,14 @@ def delete_connection(
 
         cancellable = conn.execute(
             f"""
-            SELECT id FROM publish_jobs
+            SELECT id, status FROM publish_jobs
             WHERE connection_id = ? AND status IN
                 ({", ".join("?" for _ in _CANCELLABLE_JOB_STATUSES)})
             """,
             (connection_id, *_CANCELLABLE_JOB_STATUSES),
         ).fetchall()
         cancelled_job_ids = [job_row["id"] for job_row in cancellable]
+        cancelled_job_from_status = {job_row["id"]: job_row["status"] for job_row in cancellable}
 
         if cancelled_job_ids:
             placeholders = ", ".join("?" for _ in cancelled_job_ids)
@@ -715,6 +721,14 @@ def delete_connection(
             },
         )
         for job_id in cancelled_job_ids:
+            record_publish_audit_event(
+                conn,
+                system_id=system_id,
+                connection_id=connection_id,
+                job_id=job_id,
+                event_type="publish_job_status_transition",
+                detail={"from": cancelled_job_from_status[job_id], "to": "cancelled"},
+            )
             record_publish_audit_event(
                 conn,
                 system_id=system_id,

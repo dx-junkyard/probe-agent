@@ -363,6 +363,29 @@ heuristic result.
   filesystem path. See the "Disconnect 時の即時失効(Issue #227)" subsection
   of `docs/project-intelligence.md` for the full design; tests live in
   `tests/test_publish_disconnect.py`.
+- **Publish job retry/recovery (Issue #226)**: a post-approval failure rests
+  in `retryable_failed` (or `manual_intervention_required` if the remote
+  branch exists but does not match the job's recorded commit) instead of
+  always dead-ending at terminal `failed` -- stale-base-branch conflicts and
+  a mid-flight disconnect (`ConnectionRevokedError`) are the only
+  post-approval failures that still stay terminal `failed`. `POST
+  /github/publish-jobs/{id}/retry` (`publish_job.retry_publish_job`) and the
+  periodic worker's `auto_retry_eligible_jobs` (capped by
+  `PUBLISH_AUTO_RETRY_MAX`, `manual_intervention_required` never included)
+  both compare-and-set the job to `reconciling` and run
+  `publish_job._run_reconcile_phase`, which re-derives the next step from
+  the actual remote branch/commit state under the same job id and the same
+  server-generated branch -- never a new branch, never a force push. A
+  DB-backed lease (`publish_connection_leases`) guards a connection across
+  process restarts on top of `repo_manager.connection_lock`'s in-process
+  lock. `app/publish_recovery.py` also fails over jobs whose worker thread
+  died (stale `heartbeat_at`) at startup and on a periodic tick. Every
+  status transition is recorded append-only in `publish_audit_events` in
+  the same transaction that performs it (`GET
+  /github/publish-jobs/{id}/events` reads it back). See
+  `docs/project-intelligence.md`'s "Publish job の retry / recovery(Issue
+  #226)" subsection for the full reconcile decision table; tests live in
+  `tests/test_publish_retry.py`.
 
 ## Authentication and user management
 

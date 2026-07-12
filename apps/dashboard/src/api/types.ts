@@ -2457,7 +2457,13 @@ export type PublishJobStatus =
   | "creating_pr"
   | "completed"
   | "failed"
-  | "cancelled";
+  | "cancelled"
+  // Issue #226: resting/active states a publish-phase failure or a retry
+  // can land in. Not terminal -- only retry/cancel/disconnect move a job
+  // out of them.
+  | "retryable_failed"
+  | "reconciling"
+  | "manual_intervention_required";
 
 export interface PublishJobOut {
   id: number;
@@ -2483,4 +2489,17 @@ export interface PublishJobOut {
   approved_at: number | null;
   completed_at: number | null;
   heartbeat_at: number | null;
+  retry_count: number;
+  last_attempt_at: number | null;
+}
+
+// Append-only audit trail entry (Issues #227/#226) -- never a token or path.
+export interface PublishAuditEventOut {
+  id: number;
+  job_id: number | null;
+  connection_id: number | null;
+  event_type: string;
+  actor_user_id: number | null;
+  detail: Record<string, unknown> | null;
+  created_at: number;
 }

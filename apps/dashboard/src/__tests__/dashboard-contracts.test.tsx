@@ -5472,6 +5472,8 @@ describe("GitHub page", () => {
       approved_at: null,
       completed_at: null,
       heartbeat_at: null,
+      retry_count: 0,
+      last_attempt_at: null,
       ...overrides,
     };
   }

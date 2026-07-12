@@ -3690,6 +3690,12 @@ PublishJobStatus = Literal[
     "completed",
     "failed",
     "cancelled",
+    # Issue #226: resting/active states a publish-phase failure or a retry
+    # can land in. `retryable_failed` / `manual_intervention_required` are
+    # not terminal -- only retry/cancel/disconnect move a job out of them.
+    "retryable_failed",
+    "reconciling",
+    "manual_intervention_required",
 ]
 
 
@@ -3723,6 +3729,22 @@ class PublishJobOut(BaseModel):
     approved_at: Optional[float] = None
     completed_at: Optional[float] = None
     heartbeat_at: Optional[float] = None
+    retry_count: int = 0
+    last_attempt_at: Optional[float] = None
+
+
+# Append-only audit trail entry for the GitHub publish workflow (Issues
+# #227/#226) -- `detail` is parsed JSON (or None), never a raw token/path
+# (Principle 5/8; `publish_audit.record_publish_audit_event` already
+# enforces that at write time).
+class PublishAuditEventOut(BaseModel):
+    id: int
+    job_id: Optional[int] = None
+    connection_id: Optional[int] = None
+    event_type: str
+    actor_user_id: Optional[int] = None
+    detail: Optional[Dict[str, Any]] = None
+    created_at: float
 
 
 class AssistantAskOut(BaseModel):

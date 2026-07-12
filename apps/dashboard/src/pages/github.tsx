@@ -3,7 +3,7 @@ import {
   useGithubAppStatus, useGithubConnections, useCreateGithubConnection,
   useVerifyGithubConnection, useSyncGithubConnection, useDeleteGithubConnection,
   useInstallationRepositories, usePublishJobs, useCreatePublishJob,
-  useApprovePublishJob, useCancelPublishJob, useProbePatches, useUsers,
+  useApprovePublishJob, useCancelPublishJob, useRetryPublishJob, useProbePatches, useUsers,
   useSystemGithubInstallations, useGithubInstallations, useRegisterGithubInstallation,
   useDisableGithubInstallation, useAssignGithubInstallation,
 } from "@/api/hooks";
@@ -21,7 +21,7 @@ import { toast } from "sonner";
 import { formatTimestamp } from "@/lib/utils";
 import {
   GitMerge, RefreshCw, CheckCircle2, XCircle, Trash2, Plus, ExternalLink,
-  ShieldCheck, GitPullRequest, AlertTriangle,
+  ShieldCheck, GitPullRequest, AlertTriangle, RotateCcw,
 } from "lucide-react";
 import type { GithubConnectionOut, GithubInstallationOut, PublishJobOut, ProbePatchOut } from "@/api/types";
 
@@ -38,13 +38,15 @@ function connectionStatusVariant(status: GithubConnectionOut["status"]) {
 
 const IN_PROGRESS_STATUSES = new Set<PublishJobOut["status"]>([
   "pending", "authenticating", "fetching", "checking_out", "applying_patch",
-  "validating", "committing", "pushing", "creating_pr",
+  "validating", "committing", "pushing", "creating_pr", "reconciling",
 ]);
 
 function publishJobStatusVariant(status: PublishJobOut["status"]) {
   if (status === "completed") return "success" as const;
-  if (status === "failed" || status === "cancelled") return "destructive" as const;
-  if (status === "awaiting_approval") return "warning" as const;
+  if (status === "failed" || status === "cancelled" || status === "manual_intervention_required") {
+    return "destructive" as const;
+  }
+  if (status === "awaiting_approval" || status === "retryable_failed") return "warning" as const;
   if (IN_PROGRESS_STATUSES.has(status)) return "secondary" as const;
   return "outline" as const;
 }
@@ -487,6 +489,9 @@ function PublishJobsPanel() {
                           {connection ? `${connection.owner}/${connection.repo}` : `connection #${job.connection_id}`}
                         </span>
                         {job.branch_name && <code className="text-xs text-muted-foreground">{job.branch_name}</code>}
+                        {job.retry_count > 0 && (
+                          <span className="text-xs text-muted-foreground">retries: {job.retry_count}</span>
+                        )}
                       </div>
                       <div className="flex items-center gap-2 text-xs text-muted-foreground">
                         <span>base {shortSha(job.base_commit_sha)}</span>
@@ -619,6 +624,7 @@ function PublishJobDetailDialog({ job, connection, onClose }: {
   const { data: patches } = useProbePatches();
   const approve = useApprovePublishJob();
   const cancel = useCancelPublishJob();
+  const retry = useRetryPublishJob();
   const [showApprove, setShowApprove] = useState(false);
 
   const usernames = useMemo(() => {
@@ -649,6 +655,9 @@ function PublishJobDetailDialog({ job, connection, onClose }: {
           <div><span className="text-muted-foreground">Commit:</span> <code className="font-mono">{shortSha(job.commit_sha)}</code></div>
           <div><span className="text-muted-foreground">Requested by:</span> {userLabel(job.requested_by_user_id, usernames)}</div>
           <div><span className="text-muted-foreground">Approved by:</span> {userLabel(job.approved_by_user_id, usernames)}</div>
+          {job.retry_count > 0 && (
+            <div><span className="text-muted-foreground">Retries:</span> {job.retry_count}</div>
+          )}
         </div>
 
         {connection && job.branch_name && (
@@ -723,7 +732,17 @@ function PublishJobDetailDialog({ job, connection, onClose }: {
               <CheckCircle2 className="h-4 w-4 mr-1" /> Approve
             </Button>
           )}
-          {(job.status === "pending" || job.status === "awaiting_approval") && (
+          {(job.status === "retryable_failed" || job.status === "manual_intervention_required") && (
+            <Button
+              onClick={() => retry.mutateAsync(job.id).then(() => toast.success("Retrying publish job")).catch(e => toast.error(String(e)))}
+              disabled={retry.isPending}
+              data-testid="publish-job-retry-button"
+            >
+              <RotateCcw className="h-4 w-4 mr-1" /> Retry
+            </Button>
+          )}
+          {(job.status === "pending" || job.status === "awaiting_approval"
+            || job.status === "retryable_failed" || job.status === "manual_intervention_required") && (
             <Button
               variant="outline"
               onClick={() => cancel.mutateAsync(job.id).then(() => toast.success("Publish job cancelled")).catch(e => toast.error(String(e)))}

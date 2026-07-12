@@ -29,7 +29,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from ..auth import Principal, get_system_id, require_user
 from ..db import get_conn
 from .. import publish_job
-from ..models import PublishJobCreate, PublishJobOut
+from ..models import PublishAuditEventOut, PublishJobCreate, PublishJobOut
 from ..publish_job import PublishJobConflict, PublishJobNotFound
 from .github_connections import _get_connection_or_404, _require_manage
 
@@ -61,6 +61,8 @@ def _job_out(row) -> PublishJobOut:
         approved_at=row["approved_at"],
         completed_at=row["completed_at"],
         heartbeat_at=row["heartbeat_at"],
+        retry_count=row["retry_count"],
+        last_attempt_at=row["last_attempt_at"],
     )
 
 
@@ -177,3 +179,59 @@ def cancel_publish_job_endpoint(
     with get_conn() as conn:
         row = _get_job_or_404(conn, job_id, system_id)
     return _job_out(row)
+
+
+@router.post("/github/publish-jobs/{job_id}/retry", response_model=PublishJobOut)
+def retry_publish_job_endpoint(
+    job_id: int,
+    principal: Principal = Depends(require_user),
+    system_id: int = Depends(get_system_id),
+) -> PublishJobOut:
+    """Retry a `retryable_failed` / `manual_intervention_required` job under
+    the same job id and the same server-generated branch (Issue #226); never
+    a new branch, never a force push. Runs the reconcile phase, which
+    re-derives the correct next step from the actual remote state."""
+    with get_conn() as conn:
+        _require_manage(conn, principal, system_id)
+
+    try:
+        publish_job.retry_publish_job(job_id, system_id, principal.user_id)
+    except PublishJobNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except PublishJobConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    with get_conn() as conn:
+        row = _get_job_or_404(conn, job_id, system_id)
+    return _job_out(row)
+
+
+@router.get("/github/publish-jobs/{job_id}/events", response_model=List[PublishAuditEventOut])
+def list_publish_job_events(
+    job_id: int,
+    principal: Principal = Depends(require_user),
+    system_id: int = Depends(get_system_id),
+) -> List[PublishAuditEventOut]:
+    """System-scoped, append-only audit trail for this job (Issue #226):
+    every status transition plus the requested/approved/retried actor
+    events. `detail` never carries a token or filesystem path
+    (`app/publish_audit.py`)."""
+    with get_conn() as conn:
+        _require_manage(conn, principal, system_id)
+        _get_job_or_404(conn, job_id, system_id)
+        rows = conn.execute(
+            "SELECT * FROM publish_audit_events WHERE job_id = ? AND system_id = ? ORDER BY id",
+            (job_id, system_id),
+        ).fetchall()
+    return [
+        PublishAuditEventOut(
+            id=row["id"],
+            job_id=row["job_id"],
+            connection_id=row["connection_id"],
+            event_type=row["event_type"],
+            actor_user_id=row["actor_user_id"],
+            detail=json.loads(row["detail"]) if row["detail"] else None,
+            created_at=row["created_at"],
+        )
+        for row in rows
+    ]
