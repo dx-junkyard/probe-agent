@@ -326,6 +326,26 @@ heuristic result.
   the installation-repositories endpoint) and `tests/test_publish_jobs.py`
   (state machine, staleness, push safety, diff-path guards, idempotency,
   cleanup, system isolation, secret hygiene).
+- **Compose secret + `GITHUB_PUBLISH_ENABLED` startup validation (Issue
+  #224)**: `docker-compose.prod.yml` mounts the private key as a Docker
+  Compose secret (`github_app_private_key`, file path from
+  `GITHUB_APP_PRIVATE_KEY_HOST_PATH`, default `/dev/null`) and fixes
+  `GITHUB_APP_PRIVATE_KEY_PATH` in-container to
+  `/run/secrets/github_app_private_key` — never a host path. `GITHUB_PUBLISH_ENABLED`
+  (finite set `{"", true, false, 1, 0, yes, no, on, off}`, case-insensitive;
+  anything else fails startup) is the declared-intent switch:
+  `github_app.validate_publish_startup_config()`, called from
+  `db.init_db()` right after `_validate_startup_environment()` (Issue #225's
+  pattern), raises `RuntimeError` when it is true but `GITHUB_APP_ID` is
+  empty, or `GITHUB_APP_PRIVATE_KEY_PATH` does not point at a readable,
+  non-empty file that parses as a PEM private key
+  (`cryptography...load_pem_private_key`). Error messages name only the env
+  var, never the key bytes or the path value. `github_app_configured()`
+  also now requires the key file to be non-empty (`os.path.getsize(...) > 0`)
+  so the `/dev/null`-default secret reads as "not configured" instead of
+  failing later inside JWT signing. See
+  `docs/github-app-deployment.md` for the deployment runbook (registration,
+  host placement, rotation).
 - **Disconnect revokes publish permission immediately (Issue #227)**:
   `routes/github_connections.py::delete_connection` cancels every
   non-terminal publish job of a connection (prepare phase or

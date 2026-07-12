@@ -140,6 +140,19 @@ class TestAppConfiguration:
 
         assert github_app_configured() is True
 
+    def test_not_configured_with_empty_key_file(self, tmp_path, monkeypatch):
+        # Issue #224: docker-compose.prod.yml mounts the Compose secret from
+        # /dev/null by default when the publish workflow is not enabled, so
+        # an empty (but existing) key file must read as "not configured",
+        # not crash later inside JWT signing.
+        empty_key = tmp_path / "empty.pem"
+        empty_key.write_bytes(b"")
+        monkeypatch.setenv("GITHUB_APP_ID", "123")
+        monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY_PATH", str(empty_key))
+        from app.github_app import github_app_configured
+
+        assert github_app_configured() is False
+
     def test_generate_app_jwt_fails_closed_when_not_configured(self, monkeypatch):
         monkeypatch.delenv("GITHUB_APP_ID", raising=False)
         monkeypatch.delenv("GITHUB_APP_PRIVATE_KEY_PATH", raising=False)

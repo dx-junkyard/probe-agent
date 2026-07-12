@@ -78,6 +78,16 @@ internet --80/443--> Caddy --8501--> Dashboard (nginx) --/api/*--> Control Serve
 
    起動が失敗した場合は該当する環境変数を修正してから再実行する。
 
+## GitHub App 公開ワークフローを有効化する場合（任意）
+
+GitHub App 公開ワークフロー（Issue #216）を使う場合は、秘密鍵を
+Compose secret としてマウントする必要がある（Issue #224）。GitHub App の
+登録手順、秘密鍵のホスト配置、`GITHUB_PUBLISH_ENABLED` の起動時検証、
+鍵ローテーションの runbook は
+[`docs/github-app-deployment.md`](github-app-deployment.md) を参照。
+使わない場合はこの節は無視してよい（`GITHUB_APP_PRIVATE_KEY_HOST_PATH` /
+`GITHUB_PUBLISH_ENABLED` とも未設定のままで安全に起動できる）。
+
 ## 証明書発行の確認
 
 ```bash

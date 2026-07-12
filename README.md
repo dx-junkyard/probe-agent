@@ -329,6 +329,12 @@ GIT_REPOSITORY_ROOT=/path/to/managed-git-root
 `GitHub` ページの App status カードに設定手順が表示される）。両方とも
 未設定なら probe-agent の他機能には一切影響しない。
 
+`docker-compose.prod.yml` を使った本番デプロイでは、秘密鍵は Compose
+secret としてマウントし、`GITHUB_PUBLISH_ENABLED=true` を明示的に設定した
+場合のみ起動時にキーの妥当性を検証する（Issue #224）。GitHub App の登録
+手順、秘密鍵のホスト配置・ローテーション手順は
+[`docs/github-app-deployment.md`](docs/github-app-deployment.md) を参照。
+
 Dashboard の `GitHub` ページでの操作フロー:
 
 1. admin が **Installations** タブで Installation ID を登録する。Control
@@ -437,7 +443,9 @@ Docker Compose はリポジトリルートの `.env` を読み込む。ローカ
 | `CONTROL_REQUIRE_AUTH` | `false` | `true` で、認証を有効化できない状態（admin 未作成かつ `CONTROL_API_KEYS` 空）なら起動を失敗させる |
 | `PUBLIC_HOST` | _(未設定)_ | `docker-compose.prod.yml` の Caddy が HTTPS で公開する FQDN |
 | `GITHUB_APP_ID` | _(未設定)_ | Publish workflow (#216) が使う GitHub App の App ID。未設定時は GitHub App 機能全体が fail closed |
-| `GITHUB_APP_PRIVATE_KEY_PATH` | _(未設定)_ | GitHub App の秘密鍵 PEM ファイルの絶対パス（secret mount を想定） |
+| `GITHUB_APP_PRIVATE_KEY_PATH` | _(未設定)_ | コンテナ内から見た GitHub App 秘密鍵 PEM のパス。`docker-compose.prod.yml` では `/run/secrets/github_app_private_key` に固定（Compose外実行時のみ本変数を使う）。本番でのキー配置・ローテーション手順は [`docs/github-app-deployment.md`](docs/github-app-deployment.md) 参照 |
+| `GITHUB_APP_PRIVATE_KEY_HOST_PATH` | _(未設定 = `/dev/null`)_ | `docker-compose.prod.yml` が secret にマウントするホスト側 PEM の絶対パス。未設定なら空ファイルがマウントされ publish workflow は無効のまま |
+| `GITHUB_PUBLISH_ENABLED` | `false` | GitHub App publish workflow を有効化する意思表示 (`true`/`false` 等の有限集合)。`true` の場合、起動時に App ID とキーの妥当性を検証し、不備があれば起動失敗 |
 | `GITHUB_APP_ALLOWED_ORGANIZATION` | _(未設定)_ | private GitHub App を所有する単一 Organization の login。Installation 登録時に GitHub から得た account login/type と照合し、不一致は拒否する |
 | `GITHUB_API_BASE_URL` | `https://api.github.com` | GitHub REST API のベース URL（GitHub Enterprise Server 向けの上書き） |
 | `GITHUB_WEB_BASE_URL` | `https://github.com` | GitHub の web/clone URL のベース（GitHub Enterprise Server 向けの上書き） |

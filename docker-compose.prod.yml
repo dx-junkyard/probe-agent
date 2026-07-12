@@ -48,10 +48,16 @@ services:
       WORKSPACE_CONTEXT_MAX_CHARS: ${WORKSPACE_CONTEXT_MAX_CHARS:-50000}
       PROBE_REPOSITORY_ROOTS: /repositories
       GITHUB_APP_ID: ${GITHUB_APP_ID:-}
-      GITHUB_APP_PRIVATE_KEY_PATH: ${GITHUB_APP_PRIVATE_KEY_PATH:-}
+      # Fixed in-container path of the Compose secret mounted below -- never
+      # a host path. Compose mounts secrets read-only by default. See
+      # docs/github-app-deployment.md for placing the PEM on the host and
+      # for key rotation; the PEM must NOT live under
+      # PROBE_REPOSITORY_HOST_ROOT or on the probe-data volume, so
+      # repository mounts and DB/volume backups never contain it.
+      GITHUB_APP_PRIVATE_KEY_PATH: /run/secrets/github_app_private_key
+      GITHUB_PUBLISH_ENABLED: ${GITHUB_PUBLISH_ENABLED:-false}
       GITHUB_API_BASE_URL: ${GITHUB_API_BASE_URL:-}
       GITHUB_WEB_BASE_URL: ${GITHUB_WEB_BASE_URL:-}
-      # GITHUB_APP_PRIVATE_KEY_PATH must point at a secret file mounted into this container (see .env.example).
       GIT_REPOSITORY_ROOT: /data/git-repositories
       GIT_BRANCH_PREFIX: ${GIT_BRANCH_PREFIX:-probe/}
       GIT_ALLOW_DIRECT_PUSH: ${GIT_ALLOW_DIRECT_PUSH:-false}
@@ -62,6 +68,8 @@ services:
     volumes:
       - probe-data:/data
       - ${PROBE_REPOSITORY_HOST_ROOT:?Set PROBE_REPOSITORY_HOST_ROOT}:/repositories:rw
+    secrets:
+      - github_app_private_key
     # No `ports:` — only Caddy is reachable from outside the compose network.
     expose:
       - "8000"
@@ -110,3 +118,19 @@ volumes:
   probe-data:
   caddy-data:
   caddy-config:
+
+# GitHub App private key (Issue #224). Compose mounts secrets read-only by
+# default; the container only ever sees it at GITHUB_APP_PRIVATE_KEY_PATH
+# above (/run/secrets/github_app_private_key), never as a host path. The
+# /dev/null default lets publish-disabled deployments start with no PEM on
+# the host at all -- the secret mounts as an empty file, and
+# `github_app_configured()` treats an empty key file as "not configured"
+# (Issue #224) rather than failing later inside JWT signing. Point
+# GITHUB_APP_PRIVATE_KEY_HOST_PATH at the real PEM (see
+# docs/github-app-deployment.md) only once the publish workflow should be
+# enabled. The PEM file itself must never be placed under
+# PROBE_REPOSITORY_HOST_ROOT or on the probe-data volume, so that repository
+# mounts and DB/volume backups never contain it.
+secrets:
+  github_app_private_key:
+    file: ${GITHUB_APP_PRIVATE_KEY_HOST_PATH:-/dev/null}

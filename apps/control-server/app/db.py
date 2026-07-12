@@ -2366,6 +2366,7 @@ def init_db() -> None:
             )
         _ensure_legacy_system(conn)
     _validate_startup_environment()
+    _validate_publish_startup_config()
     _bootstrap_admin()
     _enforce_auth_requirement()
 
@@ -2424,6 +2425,22 @@ def _validate_startup_environment() -> None:
                 f"{exc}. Set a unique password with at least 16 characters "
                 "and restart."
             ) from exc
+
+
+def _validate_publish_startup_config() -> None:
+    """Fail closed at startup when the GitHub App publish workflow (Issue
+    #216) is declared enabled but not actually usable (Issue #224).
+
+    Runs right after `_validate_startup_environment()`, before admin
+    bootstrap, for the same reason: a misconfigured `GITHUB_PUBLISH_ENABLED`
+    is itself the problem, independent of anything else startup does. A
+    no-op when `GITHUB_PUBLISH_ENABLED` is false/unset -- the existing
+    fail-closed runtime gate (`github_app.github_app_configured()`) is
+    unchanged.
+    """
+    from .github_app import validate_publish_startup_config
+
+    validate_publish_startup_config()
 
 
 def _enforce_auth_requirement() -> None:
