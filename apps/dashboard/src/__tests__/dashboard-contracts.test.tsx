@@ -5375,12 +5375,12 @@ describe("Hub success summary and pipeline collapse (Issue #211)", () => {
     },
   };
 
-  function mockSuApis(response: Record<string, unknown>) {
-    mockApi.get.mockImplementation((path: string) =>
-      path === "/repository/system-understanding"
-        ? Promise.resolve(response)
-        : Promise.resolve(null),
-    );
+  function mockSuApis(response: Record<string, unknown>, diagnostics?: Record<string, unknown>) {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(response);
+      if (path === "/system-diagnostics") return Promise.resolve(diagnostics ?? null);
+      return Promise.resolve(null);
+    });
   }
 
   test("all-complete pipeline shows the success summary and collapses the checklist", async () => {
@@ -5407,17 +5407,47 @@ describe("Hub success summary and pipeline collapse (Issue #211)", () => {
     expect(await screen.findByTestId("pipeline-collapsed")).toBeInTheDocument();
   });
 
+  // The empty-capability-hierarchy diagnostic exactly as the server emits it:
+  // the structured fix target (fix_page "/interview") is what drives the
+  // pipeline row's Interview CTA — never the free-text detail.
+  const capabilityEmptyCheck = {
+    check_id: "pipeline_capability_hierarchy",
+    category: "pipeline",
+    title: "capability 階層の実行",
+    severity: "warning",
+    detail: "実行は完了しましたが capability ノードが 0 件です。",
+    impact: "Core Capabilities が未定義です。",
+    remediation: "Interview で Core Capabilities を確認してください。",
+    related_env: [],
+    related_paths: [],
+    related_pages: ["/system-understanding", "/interview"],
+    related_pipeline_steps: ["capability_hierarchy_ready"],
+    last_observed_error: null,
+    decision_method: "deterministic",
+    fix_kind: "navigate",
+    fix_page: "/interview",
+    fix_anchor: "interview-capabilities",
+  };
+
+  const incompleteCapabilityResponse = {
+    ...baseResponse,
+    pipeline: [
+      ...allCompletePipeline.slice(0, 7),
+      { step: "capability_hierarchy_ready", status: "warning", detail: "0 capabilities" },
+    ],
+    primary_action: {
+      action: "Build system understanding", reason: "1 step incomplete",
+      category: "understand", link: null, action_kind: "build",
+    },
+  };
+
   test("incomplete pipeline keeps the checklist expanded without a success summary", async () => {
-    mockSuApis({
-      ...baseResponse,
-      pipeline: [
-        ...allCompletePipeline.slice(0, 7),
-        { step: "capability_hierarchy_ready", status: "warning", detail: "0 capabilities" },
-      ],
-      primary_action: {
-        action: "Build system understanding", reason: "1 step incomplete",
-        category: "understand", link: null, action_kind: "build",
-      },
+    mockSuApis(incompleteCapabilityResponse, {
+      system_id: 1,
+      generated_at: 1750000000,
+      overall_severity: "warning",
+      severity_counts: { ok: 0, warning: 1, error: 0, blocked: 0, unknown: 0 },
+      checks: [capabilityEmptyCheck],
     });
 
     const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
@@ -5426,9 +5456,22 @@ describe("Hub success summary and pipeline collapse (Issue #211)", () => {
     expect(await screen.findByTestId("pipeline-checklist")).toBeInTheDocument();
     expect(screen.queryByTestId("pipeline-collapsed")).not.toBeInTheDocument();
     expect(screen.queryByTestId("build-success-summary")).not.toBeInTheDocument();
-    const cta = screen.getByTestId("pipeline-cta-capability_hierarchy_ready");
+    const cta = await screen.findByTestId("pipeline-cta-capability_hierarchy_ready");
     expect(cta).toHaveTextContent("Review interview proposals");
     expect(cta).toHaveAttribute("href", "/interview");
+  });
+
+  test("interview CTA requires the structured diagnostic, not the detail text", async () => {
+    // Same pipeline detail text, but no pipeline_capability_hierarchy check
+    // pointing at /interview: the CTA falls back to the step's generic
+    // Build action instead of regex-guessing intent from the free text.
+    mockSuApis(incompleteCapabilityResponse);
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const cta = await screen.findByTestId("pipeline-cta-capability_hierarchy_ready");
+    expect(cta).toHaveTextContent("Run Build / Refresh");
   });
 
   test("undefined purpose adds the prerequisite note to the entry cards", async () => {
@@ -5438,6 +5481,125 @@ describe("Hub success summary and pipeline collapse (Issue #211)", () => {
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
 
     expect(await screen.findByTestId("entry-cards-prereq-note")).toBeInTheDocument();
+  });
+});
+
+// ── Diagnostic fix callout anchor collision ─────────────────────────
+
+describe("Diagnostic fix callout with a shared anchor", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  function diagCheck(overrides: Record<string, unknown>) {
+    return {
+      category: "pipeline",
+      title: "check",
+      detail: "detail",
+      impact: "",
+      remediation: "",
+      related_env: [],
+      related_paths: [],
+      related_pages: [],
+      related_pipeline_steps: [],
+      last_observed_error: null,
+      decision_method: "deterministic",
+      fix_kind: "navigate",
+      fix_page: "/system-understanding",
+      fix_anchor: "build",
+      ...overrides,
+    };
+  }
+
+  test("anchor-only focus picks the most severe check, not backend array order", async () => {
+    // llm_last_run ("no reasoning run recorded yet", informational `unknown`)
+    // is emitted BEFORE the pipeline checks and shares fix_anchor "build".
+    // A deep link with only ?fix=build must surface the actionable warning,
+    // not the informational check that happens to come first.
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-diagnostics") {
+        return Promise.resolve({
+          system_id: 1,
+          generated_at: 1750000000,
+          overall_severity: "warning",
+          severity_counts: { ok: 0, warning: 1, error: 0, blocked: 0, unknown: 1 },
+          checks: [
+            diagCheck({
+              check_id: "llm_last_run",
+              category: "llm",
+              title: "直近の reasoning モデル実行",
+              severity: "unknown",
+            }),
+            diagCheck({
+              check_id: "pipeline_understanding_graph",
+              title: "理解グラフの実行",
+              severity: "warning",
+              related_pipeline_steps: ["docs_code_reconciled"],
+            }),
+          ],
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/system-understanding?fix=build"]}>
+          <SystemUnderstandingPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const callout = await screen.findByTestId("diagnostic-callout-build");
+    expect(callout.textContent).toContain("理解グラフの実行");
+    expect(callout.textContent).not.toContain("直近の reasoning モデル実行");
+  });
+
+  test("an explicit ?diagnostic= id still wins over severity ranking", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-diagnostics") {
+        return Promise.resolve({
+          system_id: 1,
+          generated_at: 1750000000,
+          overall_severity: "warning",
+          severity_counts: { ok: 0, warning: 1, error: 0, blocked: 0, unknown: 1 },
+          checks: [
+            diagCheck({
+              check_id: "llm_last_run",
+              category: "llm",
+              title: "直近の reasoning モデル実行",
+              severity: "unknown",
+            }),
+            diagCheck({
+              check_id: "pipeline_understanding_graph",
+              title: "理解グラフの実行",
+              severity: "warning",
+            }),
+          ],
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/system-understanding?fix=build&diagnostic=llm_last_run"]}>
+          <SystemUnderstandingPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const callout = await screen.findByTestId("diagnostic-callout-build");
+    expect(callout.textContent).toContain("直近の reasoning モデル実行");
   });
 });
 

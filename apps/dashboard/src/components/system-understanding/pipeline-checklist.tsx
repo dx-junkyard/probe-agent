@@ -105,13 +105,20 @@ export function PipelineChecklist({ steps, checksByStep, onRunBuild, buildDisabl
         const label = STEP_LABELS[s.step] ?? s.step;
         const relatedChecks = s.status === "complete" ? [] : (checksByStep[s.step] ?? []);
         const expanded = expandedStep === s.step;
-        const isEmptyCapabilityHierarchy = (
-          s.step === "capability_hierarchy_ready"
-          && s.status === "warning"
-          && /no capabilities|0 capabilities|capability が 0/i.test(s.detail ?? "")
+        // The Interview CTA is driven by the same structured diagnostic that
+        // backs this row's "Why?" list and the settings dialog: the server
+        // sets fix_page="/interview" on `pipeline_capability_hierarchy`
+        // exactly when the run completed but produced zero capabilities (a
+        // finite structural branch, Principle 6). Never re-derive that state
+        // from the free-text `detail`.
+        const interviewFix = relatedChecks.some(
+          (c) =>
+            c.check_id === "pipeline_capability_hierarchy"
+            && c.fix_kind === "navigate"
+            && c.fix_page === "/interview",
         );
         const cta = s.step === firstIncompleteStep
-          ? (isEmptyCapabilityHierarchy
+          ? (interviewFix
             ? { kind: "interview" as const, label: "Review interview proposals" }
             : STEP_CTA[s.step])
           : undefined;

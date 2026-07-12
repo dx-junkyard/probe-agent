@@ -113,6 +113,15 @@ fallback for intelligence work.
   branch — never inferred — and must be kept in sync with the `diag-anchor`
   attributes rendered by the Dashboard. Identifiers embedded in `detail`
   (env var names, model ids, paths) stay verbatim.
+- An informational branch (severity `unknown`, e.g. `llm_last_run`'s "no
+  reasoning run recorded yet") must say so in its own text: it must not
+  present itself as the cause of other warning/error checks, its remediation
+  must name the operations that actually change its state (build claim scan /
+  draft generation / Interview dialogue — not a generic "run Build"), and it
+  must carry `related_pipeline_steps` for the steps it actually gates so
+  consumers can scope and rank it below actionable checks sharing the same
+  `fix_anchor`. The Dashboard resolves anchor-only deep links by severity,
+  so a misleading generic branch would otherwise win the fix callout.
 
 ## Per-screen assistant (issue #102)
 

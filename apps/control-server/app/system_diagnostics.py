@@ -800,6 +800,12 @@ def _check_last_reasoning_run(
         (system_id, snapshot_id),
     ).fetchone()
     if row is None:
+        # Informational state, not a defect: nothing has exercised the
+        # configured reasoning model yet. This check must not present itself
+        # as the cause of other warnings (e.g. an empty capability hierarchy,
+        # whose build is deterministic and would not record a reasoning run),
+        # and its remediation must name the operations that actually record
+        # reasoning runs instead of a generic "run Build".
         return DiagnosticCheck(
             check_id="llm_last_run",
             category="llm",
@@ -808,14 +814,21 @@ def _check_last_reasoning_run(
             detail=(
                 "このシステムではまだ reasoning モデルの実行が記録されていないため、"
                 "実行時の問題（タイムアウト・認証・不正なモデル・パースエラー）は"
-                "観測されていません。"
+                "観測されていません。これは設定したモデルの疎通が未確認という"
+                "情報であり、他の warning / error 診断の原因を示すものではありません。"
             ),
             impact="設定は正しく見えても、呼び出し時に失敗する可能性があります。",
             remediation=(
-                "System Understanding のビルドまたはドラフト生成を実行して、"
-                "設定したモデルを動作確認してください。"
+                "reasoning モデルの実行は、System Understanding のビルド"
+                "（ドキュメント主張スキャン）・ドラフト生成・Interview の対話で"
+                "記録されます。他に warning / error の診断が表示されている場合は、"
+                "先にそちらの『次の操作』を実施してください。"
             ),
             related_pages=[PAGE_SYSTEM_UNDERSTANDING],
+            related_pipeline_steps=[
+                "documentation_claims_scanned",
+                "docs_code_reconciled",
+            ],
             fix_kind=FIX_KIND_NAVIGATE,
             fix_page=PAGE_SYSTEM_UNDERSTANDING,
             fix_anchor=ANCHOR_BUILD,

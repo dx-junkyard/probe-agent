@@ -511,6 +511,34 @@ class TestLastObservedFailures:
         _, checks = _get_checks(admin_client, hdrs)
         assert checks["llm_last_run"]["severity"] == "unknown"
 
+    def test_no_reasoning_run_is_presented_as_informational(
+        self, admin_client, tmp_path,
+    ):
+        """The "no run recorded yet" state is a connectivity note, not a
+        defect: it must not present itself as the cause of other warnings
+        (e.g. an empty capability hierarchy, whose build is deterministic),
+        must name the operations that actually record reasoning runs, and
+        must be scoped to the reasoning-dependent pipeline steps so
+        consumers can rank it below actionable checks sharing its anchor."""
+        _, sys, hdrs = _setup(admin_client)
+        # A ready snapshot with only a deterministic run: reasoning is still
+        # unrecorded for this snapshot.
+        _insert_snapshot_and_run(
+            str(tmp_path / "probe-diag-test.db"), sys["id"],
+            run_type="capability_hierarchy", status="completed",
+            decision_method="deterministic",
+        )
+        _, checks = _get_checks(admin_client, hdrs)
+        c = checks["llm_last_run"]
+        assert "他の warning / error 診断の原因を示すものではありません" in c["detail"]
+        assert "ドラフト生成" in c["remediation"]
+        assert "Interview" in c["remediation"]
+        assert "先にそちらの『次の操作』を実施してください" in c["remediation"]
+        assert c["related_pipeline_steps"] == [
+            "documentation_claims_scanned",
+            "docs_code_reconciled",
+        ]
+
     def test_failed_run_isolated_per_system(self, admin_client, tmp_path):
         token, sys_a, hdrs_a = _setup(admin_client, "diag-a")
         sys_b = _create_system(admin_client, token, "diag-b")
