@@ -41,7 +41,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 from .git_ops import GitError, resolve_head, working_tree_status
 
@@ -69,6 +69,9 @@ __all__ = [
     "classify_connectivity_state",
     "count_approved_probe_plans",
     "count_undecided_completed_experiments",
+    "plan_has_validated_patch",
+    "count_proposed_probe_plans",
+    "count_approved_probe_plans_without_validated_patch",
 ]
 
 
@@ -379,3 +382,60 @@ def count_undecided_completed_experiments(conn, system_id: int) -> int:
            WHERE system_id = ? AND status = 'completed' AND human_decision = 'undecided'""",
         (system_id,),
     ).fetchone()[0]
+
+
+# --- Probe plan review/patch facts (Issue #238) ---------------------------
+#
+# These back the two probe-plan-shaped "next step" StateItems
+# (proposal.probe_plans.proposed / proposal.probe_plans.approved_without_patch)
+# that consolidate system_understanding_service._build_next_actions'
+# "Review probe plan" / "Generate / validate probe patch" NextAction sources
+# into system_state.py. plan_has_validated_patch is moved here (behavior-
+# preserving) from system_understanding_service._plan_has_validated_patch so
+# both surfaces share one query instead of keeping independent copies.
+
+
+def plan_has_validated_patch(conn, plan_id: int) -> bool:
+    """A plan's patch is validated when its latest baseline and probed
+    validation runs both succeeded -- the same finite condition the patch
+    apply endpoint gates on (Principle 6).
+    """
+    patch_rows = conn.execute(
+        "SELECT id FROM probe_patches WHERE plan_id = ? AND status != 'failed'",
+        (plan_id,),
+    ).fetchall()
+    for patch in patch_rows:
+        val_rows = conn.execute(
+            """SELECT variant, overall_success FROM validation_runs
+               WHERE patch_id = ? ORDER BY id DESC""",
+            (patch["id"],),
+        ).fetchall()
+        latest: Dict[str, bool] = {}
+        for vr in val_rows:
+            latest.setdefault(vr["variant"], bool(vr["overall_success"]))
+        if latest.get("baseline") is True and latest.get("probed") is True:
+            return True
+    return False
+
+
+def count_proposed_probe_plans(conn, system_id: int) -> int:
+    """Count of ``probe_plans`` rows with ``status = 'proposed'`` for one system."""
+    return conn.execute(
+        "SELECT COUNT(*) FROM probe_plans WHERE system_id = ? AND status = 'proposed'",
+        (system_id,),
+    ).fetchone()[0]
+
+
+def count_approved_probe_plans_without_validated_patch(conn, system_id: int) -> int:
+    """Count of approved probe plans whose latest patch has not passed both
+    baseline and probed validation -- the same condition
+    ``system_understanding_service._load_pending_plan_action_ids`` uses to
+    build its ``approved_plan_ids_without_validated_patch`` NextAction list,
+    reproduced here as a count via the shared ``plan_has_validated_patch``
+    so system_state.py's StateItem agrees without a second traversal.
+    """
+    rows = conn.execute(
+        "SELECT id FROM probe_plans WHERE system_id = ? AND status = 'approved'",
+        (system_id,),
+    ).fetchall()
+    return sum(1 for r in rows if not plan_has_validated_patch(conn, r["id"]))

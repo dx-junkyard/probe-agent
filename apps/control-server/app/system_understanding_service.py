@@ -981,29 +981,6 @@ def _derive_primary_action(
     return next_actions[0] if next_actions else None
 
 
-def _plan_has_validated_patch(conn, plan_id: int) -> bool:
-    """A plan's patch is validated when its latest baseline and probed
-    validation runs both succeeded — the same finite condition the patch
-    apply endpoint gates on (Principle 6).
-    """
-    patch_rows = conn.execute(
-        "SELECT id FROM probe_patches WHERE plan_id = ? AND status != 'failed'",
-        (plan_id,),
-    ).fetchall()
-    for patch in patch_rows:
-        val_rows = conn.execute(
-            """SELECT variant, overall_success FROM validation_runs
-               WHERE patch_id = ? ORDER BY id DESC""",
-            (patch["id"],),
-        ).fetchall()
-        latest: Dict[str, bool] = {}
-        for vr in val_rows:
-            latest.setdefault(vr["variant"], bool(vr["overall_success"]))
-        if latest.get("baseline") is True and latest.get("probed") is True:
-            return True
-    return False
-
-
 def _load_pending_plan_action_ids(conn, system_id: int) -> Tuple[List[int], List[int], int]:
     """Return (proposed_plan_ids, approved_plan_ids_without_validated_patch,
     approved_plan_total_count).
@@ -1012,6 +989,11 @@ def _load_pending_plan_action_ids(conn, system_id: int) -> Tuple[List[int], List
     stage's ``validated`` count can be derived as
     ``approved_plan_total_count - len(approved_plan_ids_without_validated_patch)``
     without a second, differently-worded query over the same rows.
+
+    The "has this plan's patch been validated" check itself lives in
+    ``state_facts.plan_has_validated_patch`` (Issue #238) so this module and
+    ``system_state.py``'s ``proposal.probe_plans.approved_without_patch``
+    StateItem agree on one query instead of two independent copies.
     """
     proposed_ids = [
         r["id"] for r in conn.execute(
@@ -1024,7 +1006,7 @@ def _load_pending_plan_action_ids(conn, system_id: int) -> Tuple[List[int], List
         (system_id,),
     ).fetchall()
     approved_without_patch_ids = [
-        r["id"] for r in approved_rows if not _plan_has_validated_patch(conn, r["id"])
+        r["id"] for r in approved_rows if not state_facts.plan_has_validated_patch(conn, r["id"])
     ]
     return proposed_ids, approved_without_patch_ids, len(approved_rows)
 

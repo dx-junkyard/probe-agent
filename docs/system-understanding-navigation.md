@@ -252,6 +252,46 @@ unconfirmed | missing_baseline`）の `kind == "satisfied_current"` への
 た出し分け）を `StateItem` の投影に置き換える統合は Issue #235 の
 Sub 3（#238）の領分であり、#236 は対象外。
 
+### primary_item への統合（Issue #238）— `primary_action` は deprecated
+
+「次の一歩」の正本は `system_state.select_primary_item` が返す
+`GET /system-state` の `primary_item` である。`GET /repository/system-understanding`
+の `primary_action` / `next_actions` / `understanding_refresh_recommended`
+は **deprecated** で、Dashboard の消費切替（Issue #235 の Sub 4 / #239）と
+同一コミットでレスポンスから撤去される予定であり、それまでの間はレスポンス
+に残る（この issue の判断: 切替と撤去を同一 PR で行う）。新規のクライアント
+コードはこれらのフィールドではなく `GET /system-state` の `primary_item` /
+`page_items` を参照すること。
+
+`_derive_primary_action` / `_build_next_actions` が考慮していた判定要素の
+うち、`StateItem` として表現されていなかったものを Issue #238 で吸収した:
+
+| 判定要素（旧: `_build_next_actions` / `_derive_primary_action`） | 対応する StateItem |
+| --- | --- |
+| repository 未設定・snapshot 未 ready（rule 1） | `repository.configuration.missing` / `snapshot.ready.*`（既存） |
+| ビルド実行中は CTA を出さない（rule 2） | 新規追加なし。実行中のステップは既存の `.running`（`user_action_kind="wait"`）が `select_primary_item` の候補から除外される。ただし旧 rule 2 はビルド状態に関係なく無条件に CTA 全体を抑制するのに対し、新方式はビルドと無関係な項目（例: レビュー待ち probe plan）までは抑制しない — 既知の意図的な差分（後述） |
+| symbols_indexed 等の未完了ステップ（rule 3 / 個別 NextAction） | `pipeline.symbol_index.*` / `pipeline.entrypoint_index.*` / `pipeline.documentation_index.*` / `pipeline.capability_hierarchy.*`（既存） |
+| documentation_claims_scanned 未完了 | 既存の `diagnostic.pipeline_understanding_graph`（診断投影、`understanding_graph_snapshots` の有無を reasoning 要求付きでチェック）が同一条件を既にカバーしている。ネイティブ項目は追加していない |
+| docs_code_reconciled 未完了（has_understanding_graph **かつ** has_code_symbols） | 新規 `pipeline.docs_code_reconcile.not_run` / `.partial`。既存の `diagnostic.pipeline_understanding_graph` は graph の有無のみを見るため、symbol 側の欠落を拾えない差分をネイティブ項目で埋めた |
+| purpose 未定義 / capabilities 空（rule 3 の pipeline_complete 分岐） | `understanding.purpose.*` / `understanding.capabilities.*`（既存） |
+| "Review probe plan"（proposed_plan_ids） | 新規 `proposal.probe_plans.proposed`（`phase="preparation"` を明示上書き — 承認は preparation 完了条件の一方の経路のため） |
+| "Generate / validate probe patch"（approved_plan_ids_without_validated_patch） | 新規 `proposal.probe_plans.approved_without_patch`（`state_group="proposal"` の既定どおり `phase="diagnosis"`） |
+| "Review experiment decision"（undecided_completed_experiment_ids） | `proposal.experiments.undecided`（既存、Issue #237） |
+| 全完了時の "Start from Capability" 等の探索導線（rule 4 のフォールバック） | 対応する StateItem を追加しない（意図的）。`select_primary_item` は `severity != "ok"` の項目のみを候補とするため、問題が無ければ `primary_item = None` になる。旧系の「探索を促す」導線と新系の「沈黙」は意味的に異なる（前者は次にやることの提案、後者は「今は何も直すことがない」の表明）ため、統合対象は前者ではなく後者を正とする |
+
+新旧一致の契約テストは
+`apps/control-server/tests/test_next_step_parity.py`
+（`TestPrimaryRecommendationParity` / `TestBuildRunningSuppression` /
+`TestUnderstandingRefreshRecommendedMatchesStateItem`）にある。repository
+未設定・snapshot 未 ready・単一ステップ未完了・purpose 未定義・probe plan
+レビュー待ち・approved plan の patch 未生成の各代表ケースで、新旧が同じ
+修正先ルートを指すことを固定している。全完了時と build 実行中時は、上表
+のとおり意図的な差分があるため厳密な一致ではなく期待される挙動として
+固定している。`understanding_refresh_recommended` は
+`interview.materialized.rebuild_required` StateItem の存在と常に一致する
+ことも同ファイルで固定した（両者とも `_check_understanding_refresh_recommended`
+という同一関数を読んでいるため、構造的に一致する）。
+
 ### user_phase とフェーズ抑制（Issue #237）
 
 `GET /system-state` は上記 `StateItem` 一覧に加えて、ユーザーが今どの
@@ -305,6 +345,15 @@ human_decision 未記録の experiment のレビュー促し、diagnosis タグ�
 
 ## Next Actions
 
+> **Deprecated（Issue #238）**: 本節が説明する `next_actions` /
+> `primary_action` / `understanding_refresh_recommended` は、`GET
+> /repository/system-understanding` のレスポンスに引き続き含まれるが、
+> 「次の一歩」の正本ではなくなった。正本は `GET /system-state` の
+> `primary_item`（`system_state.select_primary_item`）である。詳細と
+> 判定要素の対応表は「primary_item への統合（Issue #238）」節を参照。
+> これらのフィールドは Dashboard の消費切替（Issue #235 Sub 4 / #239）と
+> 同一コミットでレスポンスから撤去される。
+
 System Understanding の Next Actions は 4 stage に分類される。
 
 | Category | Stage | 例 |
@@ -352,7 +401,10 @@ Hub の Understand stage と Decide Where to Observe stage の Related pages に
 api_boundary_mapping / probe_flow_selection）が Understand と Decide Where to
 Observe の両方に対応するためである。
 
-### Primary Action（Issue #201）
+### Primary Action（Issue #201、Issue #238 により deprecated）
+
+> `primary_action` は Issue #238 で `system_state.primary_item` に統合され、
+> deprecated になった（撤去は #239）。以下は現行レスポンスの説明として残す。
 
 `GET /system-understanding`（`GET /repository/system-understanding`）は
 `next_actions`（stage 別リスト）に加えて、優先度最上位の action を単一の
@@ -491,7 +543,7 @@ gap_type の件数が 0 の build は、その gap_type の行を書かない（
 `gap_trend` は timestamp 比較と件数集計のみの deterministic な結果であり
 （Principle 6）、reasoning model は関与しない。
 
-#### understanding_refresh_recommended（再 Build 促し）
+#### understanding_refresh_recommended（再 Build 促し、Issue #238 により deprecated）
 
 `GET /system-understanding` は `understanding_refresh_recommended`
 （bool）も返す。導出は
@@ -501,6 +553,13 @@ gap_type の件数が 0 の build は、その gap_type の行を書かない（
 なる。materialize 済みセッションが無い、または `completed` build が一度も
 無い system は `false`。単純な timestamp 比較のみで reasoning model は
 関与しない。
+
+Issue #238: このフラグの正本は `system_state.py` の
+`interview.materialized.rebuild_required` StateItem であり、両者は同じ
+`_check_understanding_refresh_recommended` 呼び出しから導出されるため常に
+一致する（`tests/test_next_step_parity.py` の
+`TestUnderstandingRefreshRecommendedMatchesStateItem` で固定）。フラグ自体は
+Dashboard の消費切替（#239）と同一コミットでレスポンスから撤去される。
 
 #### Dashboard
 

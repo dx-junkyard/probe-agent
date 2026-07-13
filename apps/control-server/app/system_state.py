@@ -106,6 +106,15 @@ STATE_ID_PHASE_OVERRIDES: Dict[str, str] = {
     "diagnostic.pipeline_capability_hierarchy": "preparation",
     "diagnostic.system_purpose": "preparation",
     "diagnostic.system_capabilities": "preparation",
+    # Issue #238: reviewing/approving a proposed probe plan is one of the two
+    # ways to satisfy derive_user_phase's "an approved probe plan OR
+    # non-no_signal connectivity" preparation-completion signal -- see
+    # _probe_plan_proposed_state_item's docstring. Its sibling
+    # proposal.probe_plans.approved_without_patch is deliberately NOT listed
+    # here: an approved plan already satisfies that signal regardless of
+    # patch validation, so it stays at the state_group="proposal" default
+    # ("diagnosis").
+    "proposal.probe_plans.proposed": "preparation",
 }
 
 # Diagnostic categories (system_diagnostics.DiagnosticCheck.category) that
@@ -1017,6 +1026,76 @@ def _capability_hierarchy_item(
     )
 
 
+# --- docs_code_reconciled pipeline step (Issue #238) -----------------------
+#
+# system_understanding_service._check_documentation_claims_scanned's
+# "documentation_claims_scanned" factor is already represented as a
+# StateItem: the existing diagnostics-projected
+# ``diagnostic.pipeline_understanding_graph`` check (system_diagnostics.py,
+# artifact-backed on ``understanding_graph_snapshots`` presence, requires
+# reasoning) tests exactly the same condition and is already phase-tagged
+# "preparation" via STATE_ID_PHASE_OVERRIDES below -- no separate native item
+# is needed for that factor.
+#
+# _check_docs_code_reconciled is not fully covered by that diagnostic,
+# though: it requires BOTH an understanding graph AND code symbols, while
+# the diagnostic only checks the graph. This item reproduces the stricter
+# two-fact structural check natively so a symbol-index gap while the graph
+# is otherwise ready is not silently missed by StateItem consumers.
+
+
+def _docs_code_reconcile_state_item(conn, system_id: int, snapshot_id: int) -> Optional[StateItem]:
+    has_graph = state_facts.has_understanding_graph_snapshot(conn, system_id, snapshot_id)
+    has_symbols = state_facts.has_code_symbols(conn, system_id, snapshot_id)
+    if has_graph and has_symbols:
+        return None
+    evidence = {
+        "snapshot_id": snapshot_id,
+        "has_understanding_graph": has_graph,
+        "has_code_symbols": has_symbols,
+    }
+    target_ui = TargetUi(route=PAGE_SYSTEM_UNDERSTANDING, anchor=ANCHOR_BUILD, action_label="Build / Refresh を実行")
+    if has_graph or has_symbols:
+        return StateItem(
+            state_id="pipeline.docs_code_reconcile.partial",
+            state_group="pipeline",
+            severity="warning",
+            status="missing",
+            user_action_kind="build",
+            intervention_timing="before_next_step",
+            subject="Docs-code 照合",
+            summary="Docs-code 照合に必要なデータの一部のみが揃っています。",
+            detail=(
+                "ドキュメントの主張とコードシンボルのどちらか一方のみが揃っています。"
+                "docs-code 照合には両方が必要です。"
+            ),
+            impact="System Understanding で docs-code 照合が未完了として表示されます。",
+            remediation="System Understanding で Build / Refresh を実行してください。",
+            evidence=evidence,
+            target_ui=target_ui,
+            related_pipeline_steps=["docs_code_reconciled"],
+        )
+    return StateItem(
+        state_id="pipeline.docs_code_reconcile.not_run",
+        state_group="pipeline",
+        severity="warning",
+        status="missing",
+        user_action_kind="build",
+        intervention_timing="before_next_step",
+        subject="Docs-code 照合",
+        summary="Docs-code 照合が未実行です。",
+        detail=(
+            "ドキュメントの主張とコードシンボルのどちらも揃っていないため、"
+            "docs-code 照合は未実行です。"
+        ),
+        impact="System Understanding で docs-code 照合が未完了として表示されます。",
+        remediation="System Understanding で Build / Refresh を実行してください。",
+        evidence=evidence,
+        target_ui=target_ui,
+        related_pipeline_steps=["docs_code_reconciled"],
+    )
+
+
 # --- runtime / proposal representative items (Issue #237) -----------------
 #
 # Phase 1 (Issue #193) intentionally left the runtime/proposal state_groups
@@ -1090,6 +1169,75 @@ def _undecided_experiments_item(undecided_completed_experiment_count: int) -> Op
         remediation="Experiments で完了した experiment の decision を記録してください。",
         evidence={"undecided_completed_experiment_count": count},
         target_ui=TargetUi(route="/experiments", anchor=None, action_label="Experiments を確認"),
+    )
+
+
+# --- probe plan review / patch state items (Issue #238) --------------------
+#
+# Absorb the two probe-plan-shaped NextAction sources
+# system_understanding_service._build_next_actions generates from
+# _load_pending_plan_action_ids: "Review probe plan" (proposed_plan_ids) and
+# "Generate / validate probe patch" (approved_plan_ids_without_validated_patch).
+# Both are aggregate/count-based (one item per condition, not one per plan
+# id) to match this module's existing style for proposal-group items
+# (_undecided_experiments_item above), rather than exploding into an
+# unbounded number of items for systems with many pending plans.
+
+
+def _probe_plan_proposed_state_item(proposed_count: int) -> Optional[StateItem]:
+    """A proposed-but-not-yet-approved probe plan awaiting review.
+
+    Tagged phase="preparation" via STATE_ID_PHASE_OVERRIDES (not the
+    state_group="proposal" default of "diagnosis"): an approved probe plan
+    is one of the two OR'd preparation-completion signals in
+    derive_user_phase, and reviewing/approving a proposed plan is how a user
+    reaches that signal through this path -- the same rationale
+    runtime.connectivity.no_signal already documents for the other path.
+    """
+    if proposed_count == 0:
+        return None
+    return StateItem(
+        state_id="proposal.probe_plans.proposed",
+        state_group="proposal",
+        severity="warning",
+        status="unconfirmed",
+        user_action_kind="review",
+        intervention_timing="before_next_step",
+        subject="Probe plan review",
+        summary=f"レビュー待ちの probe plan が {proposed_count} 件あります。",
+        detail=f"{proposed_count} 件の probe plan が提案されたまま、レビュー・承認されていません。",
+        impact="承認されるまで、計装（instrumentation）経路の確立に寄与しません。",
+        remediation="Probe Planner でレビューして承認してください。",
+        evidence={"proposed_probe_plan_count": proposed_count},
+        target_ui=TargetUi(route="/probe-planner", anchor=None, action_label="Probe Planner でレビュー"),
+        related_pipeline_steps=["probe_plans_reviewed"],
+    )
+
+
+def _probe_plan_patch_pending_state_item(approved_without_patch_count: int) -> Optional[StateItem]:
+    """An approved probe plan whose patch has not passed baseline+probed
+    validation yet. Stays at the state_group="proposal" default phase
+    ("diagnosis"): an approved plan already satisfies the preparation
+    instrumentation-path signal regardless of patch validation, so this item
+    is refinement work rather than a preparation blocker.
+    """
+    if approved_without_patch_count == 0:
+        return None
+    return StateItem(
+        state_id="proposal.probe_plans.approved_without_patch",
+        state_group="proposal",
+        severity="info",
+        status="missing",
+        user_action_kind="review",
+        intervention_timing="optional",
+        subject="Probe patch generation",
+        summary=f"検証済みパッチが未生成の承認済み probe plan が {approved_without_patch_count} 件あります。",
+        detail=f"承認済み probe plan のうち {approved_without_patch_count} 件に、検証済みの patch がまだありません。",
+        impact="patch が検証されるまで、対象リポジトリへの計装は完了しません。",
+        remediation="Probe Planner で patch を生成・検証してください。",
+        evidence={"approved_probe_plan_without_patch_count": approved_without_patch_count},
+        target_ui=TargetUi(route="/probe-planner", anchor=None, action_label="Probe Planner で patch を生成"),
+        related_pipeline_steps=["probe_plans_reviewed"],
     )
 
 
@@ -1440,6 +1588,10 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
             if hierarchy:
                 items.append(hierarchy)
 
+            docs_code_reconcile = _docs_code_reconcile_state_item(conn, system_id, snapshot_id)
+            if docs_code_reconcile:
+                items.append(docs_code_reconcile)
+
             # Raw run/step statuses (not "item is None") for the preparation
             # phase's "pipeline 全ステップ complete" fact: the capability
             # hierarchy step can be raw-status "completed" while still
@@ -1469,6 +1621,17 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
         undecided_item = _undecided_experiments_item(undecided_experiment_count)
         if undecided_item:
             items.append(undecided_item)
+
+        proposed_probe_plan_count = state_facts.count_proposed_probe_plans(conn, system_id)
+        approved_probe_plan_without_patch_count = (
+            state_facts.count_approved_probe_plans_without_validated_patch(conn, system_id)
+        )
+        proposed_item = _probe_plan_proposed_state_item(proposed_probe_plan_count)
+        if proposed_item:
+            items.append(proposed_item)
+        patch_pending_item = _probe_plan_patch_pending_state_item(approved_probe_plan_without_patch_count)
+        if patch_pending_item:
+            items.append(patch_pending_item)
 
     # Diagnostics remains its own backward-compatible endpoint, but each
     # actionable diagnostic is also a canonical state item with the same fix

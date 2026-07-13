@@ -124,10 +124,11 @@ fallback for intelligence work.
   さい" used for not-yet-run/failed/blocked steps — the build already ran.
 - `GET /system-diagnostics` stays backward compatible; it is a projection
   built on top of `system_state.py`, not replaced by it.
-- Later phases (not yet implemented): projecting `next_actions` and
-  Dashboard page callouts/toasts from the same state items, and covering
-  the `runtime` / `proposal` / `interview` (beyond the one stale-snapshot
-  item) state groups.
+- Later phases: Dashboard page callouts/toasts sourced from the same state
+  items (not yet implemented), and covering more of the `runtime` /
+  `proposal` / `interview` state groups beyond the representative items
+  Issue #237 and Issue #238 added. `next_actions` projection is done -- see
+  the Issue #238 bullet below.
 - **`user_phase` (Issue #237)**: `GET /system-state` also returns
   `user_phase` (`setup | preparation | diagnosis`) and `phases` (each
   phase's completion condition). `system_state.derive_user_phase(facts:
@@ -162,6 +163,58 @@ fallback for intelligence work.
   cases) plus `state_facts.count_approved_probe_plans` /
   `count_undecided_completed_experiments` coverage (including System
   isolation) in `tests/test_state_facts.py`.
+- **`primary_item` absorbs `primary_action` (Issue #238)**: `select_primary_item`
+  is now the canonical "what should the user do next" derivation;
+  `system_understanding_service._derive_primary_action` /
+  `_build_next_actions` (and the `primary_action` / `next_actions` /
+  `understanding_refresh_recommended` fields on `GET
+  /repository/system-understanding`) are deprecated but still returned --
+  removal is Issue #235 Sub 4 (#239), in the same commit as the Dashboard
+  consumption switch. Do not add new callers of the deprecated fields; read
+  `primary_item` / `page_items` from `GET /system-state` instead. Two new
+  native `state_group="pipeline"` items close a gap the pipeline-step
+  factors weren't fully covered by: `pipeline.docs_code_reconcile.not_run` /
+  `.partial` (mirrors `system_understanding_service._check_docs_code_reconciled`'s
+  "has an understanding graph AND has code symbols" condition -- the
+  pre-existing `diagnostic.pipeline_understanding_graph` diagnostic check
+  only tests graph presence, so it already covers
+  `documentation_claims_scanned` but not the code-symbols half of
+  `docs_code_reconciled`, hence no separate native item for the former).
+  Two new `state_group="proposal"` items close the probe-plan-review gap:
+  `proposal.probe_plans.proposed` (count of `status = 'proposed'` plans,
+  `phase="preparation"` override -- reviewing/approving one is how a user
+  reaches the approved-plan half of `derive_user_phase`'s instrumentation-path
+  OR condition, same rationale as `runtime.connectivity.no_signal`'s
+  override) and `proposal.probe_plans.approved_without_patch` (count of
+  approved plans whose latest patch has not passed both `baseline` and
+  `probed` validation, default `phase="diagnosis"` since an approved plan
+  already satisfies that OR condition regardless of patch status). The
+  "has this plan's patch been validated" check moved from
+  `system_understanding_service._plan_has_validated_patch` to
+  `state_facts.plan_has_validated_patch` (plus new
+  `state_facts.count_proposed_probe_plans` /
+  `count_approved_probe_plans_without_validated_patch`) so both surfaces
+  share one query. No `StateItem` was added for the terminal "everything
+  satisfied, explore from here" `next_actions` fallback (`Start from
+  Capability` / `Start from Feature` / `Open Flow Explorer`):
+  `select_primary_item` only ever selects `severity != "ok"` items, so a
+  fully-satisfied system correctly yields `primary_item = None` there
+  instead of a decorative nudge -- an intentional divergence from the old
+  field's behavior, not a gap. A second intentional divergence: the old
+  `_derive_primary_action` rule 2 unconditionally blanks `primary_action`
+  while any build is queued/running, regardless of cause; the new model has
+  no equivalent blanket rule -- only the pipeline step(s) an active build is
+  actually processing become `user_action_kind="wait"` (excluded from
+  `select_primary_item` candidacy), so an unrelated outstanding item (e.g. a
+  probe plan awaiting review) is not suppressed just because a System
+  Understanding build happens to be running concurrently. Contract tests
+  pinning old/new agreement for the representative cases where they are
+  expected to agree (repository unconfigured, snapshot not ready, a single
+  incomplete pipeline step, purpose undefined, proposed/approved-without-patch
+  probe plans, a genuinely idle active build) plus both intentional
+  divergences and the `understanding_refresh_recommended` ==
+  `interview.materialized.rebuild_required`-presence equivalence live in
+  `tests/test_next_step_parity.py`.
 
 ## System settings diagnostics (issue #101)
 
