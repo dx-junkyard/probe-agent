@@ -388,9 +388,10 @@ def count_undecided_completed_experiments(conn, system_id: int) -> int:
 #
 # These back the two probe-plan-shaped "next step" StateItems
 # (proposal.probe_plans.proposed / proposal.probe_plans.approved_without_patch)
-# that consolidate system_understanding_service._build_next_actions'
-# "Review probe plan" / "Generate / validate probe patch" NextAction sources
-# into system_state.py. plan_has_validated_patch is moved here (behavior-
+# that consolidate the now-removed (Issue #239)
+# system_understanding_service._build_next_actions' "Review probe plan" /
+# "Generate / validate probe patch" NextAction sources into system_state.py.
+# plan_has_validated_patch is moved here (behavior-
 # preserving) from system_understanding_service._plan_has_validated_patch so
 # both surfaces share one query instead of keeping independent copies.
 

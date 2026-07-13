@@ -1133,15 +1133,15 @@ class TestIssue236FactsExtractionRegression:
         assert items["understanding.capabilities.satisfied"]["status"] == "satisfied"
         assert items["understanding.capabilities.satisfied"]["severity"] == "ok"
 
-        # /repository/system-understanding agrees: no purpose/capabilities gap.
+        # /repository/system-understanding agrees: no purpose/capabilities gap
+        # (Issue #239 removed this response's own next_actions projection;
+        # the items["understanding.*.satisfied"] assertions above are the
+        # canonical check for "no purpose/capabilities gap" now).
         su_r = admin_client.get("/repository/system-understanding", headers=hdrs)
         assert su_r.status_code == 200, su_r.text
         su_data = su_r.json()
         assert su_data["purpose"]["name"] == "Test system"
         assert len(su_data["capabilities"]) == 1
-        labels = [a["action"] for a in su_data["next_actions"]]
-        assert "Define System Purpose" not in labels
-        assert "Identify main system capabilities" not in labels
 
 
 class TestDeriveUserPhase:

@@ -1,7 +1,6 @@
-"""Issue #238: contract tests pinning that the two "what should the user do
-next" systems agree, for a set of representative scenarios, while both are
-still returned from the API (Sub 3(a) of Issue #235's consolidation plan --
-old fields are not removed yet; that is Sub 4 / Issue #239).
+"""Issue #238 built these as contract tests pinning that two "what should the
+user do next" systems agreed, for a set of representative scenarios, while
+both were still returned from the API:
 
 - ``system_understanding_service._derive_primary_action`` /
   ``_build_next_actions`` -> ``GET /repository/system-understanding``'s
@@ -9,30 +8,36 @@ old fields are not removed yet; that is Sub 4 / Issue #239).
 - ``system_state.select_primary_item`` -> ``GET /system-state``'s
   ``primary_item``.
 
-Where the two systems are expected to point at the same remediation route,
-this file asserts that agreement directly. Two divergences are known and
-intentional (not bugs), and are pinned as such rather than asserted equal:
+Issue #239 removed the old fields/functions (Sub 4 of Issue #235's
+consolidation plan) once the Dashboard's notification surfaces switched to
+consuming ``primary_item`` / ``page_items`` exclusively. The old-vs-new
+comparisons this file used to assert are no longer possible (the old side is
+gone), so these tests were narrowed to pin that ``select_primary_item``
+alone picks the expected item for each representative scenario the parity
+tests used to cover -- the scenarios and fixtures are unchanged, only the
+old-system half of each assertion was dropped. Two outcomes that used to be
+pinned as *intentional divergences* from the old system are now simply the
+expected new-system behavior:
 
-1. A "fully satisfied, nothing left to review" system: the old system still
-   offers an exploration nudge (next_actions' terminal "Start from
-   Capability" / "Start from Feature" / "Open Flow Explorer" fallback);
-   ``select_primary_item`` only ever returns problem/follow-up items
-   (``severity != "ok"``), so it returns ``None`` -- silence, not a
-   decorative CTA. This is the acceptance criterion's "全完了...primary_item
-   が期待どおり選ばれる" case: expected == None.
-2. An active build suppresses the CTA unconditionally in the old system
-   (rule 2 of ``_derive_primary_action``), regardless of what else is wrong.
-   The new system only marks the specific pipeline step(s) the active build
-   is working on as "running"/wait (excluded from primary-item candidacy);
-   an unrelated outstanding item (e.g. a proposed probe plan awaiting
-   review) is NOT suppressed just because a System Understanding build
-   happens to be running concurrently. This file only asserts agreement for
-   the case with no such unrelated confounder (see
-   ``test_build_running_suppresses_pipeline_cta_in_both_systems``).
+1. A "fully satisfied, nothing left to review" system: ``select_primary_item``
+   only ever returns problem/follow-up items (``severity != "ok"``), so it
+   returns ``None`` -- silence, not a decorative "explore further" nudge.
+2. An active build does not unconditionally suppress ``primary_item``: only
+   the specific pipeline step(s) the active build is working on become
+   "running"/wait (excluded from primary-item candidacy); an unrelated
+   outstanding item (e.g. a proposed probe plan awaiting review) is NOT
+   suppressed just because a System Understanding build happens to be
+   running concurrently. This file only exercises the case with no such
+   unrelated confounder (see
+   ``test_build_running_suppresses_pipeline_cta``).
 
-This also pins the ``understanding_refresh_recommended`` == presence of
-``interview.materialized.rebuild_required`` equivalence required by this
-issue's Scope item 2 ("正本が state 項目であることの固定").
+This also pins that the ``interview.materialized.rebuild_required``
+StateItem -- now the sole, canonical source for what used to be the
+``understanding_refresh_recommended`` flag -- appears/disappears exactly
+when the underlying materialize-vs-build-completion fact says it should
+(``_check_understanding_refresh_recommended``, unchanged, still lives in
+``system_understanding_service.py`` and is called directly by
+``system_state.py``).
 """
 
 import time
@@ -327,12 +332,6 @@ def _insert_active_build(system_id, snapshot_id, *, current_step="symbol_index")
         return cur.lastrowid
 
 
-def _get_primary_action(client, hdrs):
-    r = client.get("/repository/system-understanding", headers=hdrs)
-    assert r.status_code == 200, r.text
-    return r.json()
-
-
 def _get_primary_item(client, hdrs):
     r = client.get("/system-state", headers=hdrs)
     assert r.status_code == 200, r.text
@@ -358,9 +357,9 @@ def _full_pipeline(client, hdrs, tmp_path, system_id):
 
 
 class TestPrimaryRecommendationParity:
-    """Representative cases where old primary_action and new primary_item
-    are expected to point at the same remediation route (Issue #238 Scope
-    item 3(a)).
+    """Representative cases pinning that ``select_primary_item`` picks the
+    expected item (Issue #239 narrowed this from an old-vs-new comparison --
+    see module docstring).
     """
 
     def test_repository_not_configured(self, admin_client, monkeypatch):
@@ -371,9 +370,6 @@ class TestPrimaryRecommendationParity:
         # would otherwise win regardless of what this test is isolating).
         _configure_reasoning_llm(monkeypatch)
         sys, hdrs = _setup(admin_client)
-
-        old = _get_primary_action(admin_client, hdrs)
-        assert old["primary_action"]["link"] == "/repository"
 
         new = _get_primary_item(admin_client, hdrs)
         assert new["primary_item"]["state_id"] == "repository.configuration.missing"
@@ -389,26 +385,22 @@ class TestPrimaryRecommendationParity:
             headers=hdrs,
         )
 
-        old = _get_primary_action(admin_client, hdrs)
-        assert old["primary_action"]["link"] == "/repository"
-
         new = _get_primary_item(admin_client, hdrs)
-        # Pre-existing (pre-#238) behavior, not something this issue changes:
-        # every diagnostic.pipeline_* check reports severity="blocked" (not
+        # Every diagnostic.pipeline_* check reports severity="blocked" (not
         # "warning") when no ready snapshot exists
         # (system_diagnostics._no_ready_snapshot_check), which outranks the
         # native snapshot.ready.missing item (severity="warning") in
         # select_primary_item's priority order. Both still target the same
-        # remediation route.
+        # remediation route (kept as a documented, not asserted-equal, detail
+        # since only one item is selected).
         assert new["primary_item"]["state_id"].startswith("diagnostic.pipeline_")
         assert new["primary_item"]["target_ui"]["route"] == "/repository"
         assert new["primary_item"]["target_ui"]["anchor"] == "snapshot-create"
 
     def test_symbols_not_indexed_only(self, admin_client, tmp_path, monkeypatch):
-        """A single incomplete pipeline step: old falls back to the generic
-        "Build system understanding" CTA (rule 3); new points at the
-        specific pipeline.symbol_index item. Both target the System
-        Understanding build action.
+        """A single incomplete pipeline step selects the specific
+        pipeline.symbol_index item, targeting the System Understanding build
+        action.
         """
         _configure_reasoning_llm(monkeypatch)
         sys, hdrs = _setup(admin_client)
@@ -424,9 +416,6 @@ class TestPrimaryRecommendationParity:
         # documentation, capability hierarchy, docs-code reconciliation) is
         # satisfied so this is the only outstanding pipeline step.
 
-        old = _get_primary_action(admin_client, hdrs)
-        assert old["primary_action"]["action_kind"] == "build"
-
         new = _get_primary_item(admin_client, hdrs)
         assert new["primary_item"]["state_id"].startswith("pipeline.symbol_index.")
         assert new["primary_item"]["target_ui"]["anchor"] == "build"
@@ -435,10 +424,9 @@ class TestPrimaryRecommendationParity:
         """Every pipeline step complete (capability_hierarchy_ready only
         requires capability_count > 0, not a purpose node -- see
         _check_capability_hierarchy_ready / _capability_count_in_snapshot),
-        but no purpose node/draft exists for this snapshot: old's
-        pipeline_complete branch offers "Define System Purpose" (/interview);
-        new's understanding.purpose.missing_baseline item targets the same
-        route.
+        but no purpose node/draft exists for this snapshot: the
+        understanding.purpose.missing_baseline item is selected, targeting
+        Interview.
         """
         from app.db import get_conn
 
@@ -463,10 +451,6 @@ class TestPrimaryRecommendationParity:
                 (sys["id"], snapshot_id, run_id, entrypoint_db_id),
             )
 
-        old = _get_primary_action(admin_client, hdrs)
-        assert old["primary_action"]["action"] == "Define System Purpose"
-        assert old["primary_action"]["link"] == "/interview"
-
         new = _get_primary_item(admin_client, hdrs)
         assert new["primary_item"]["state_id"] == "understanding.purpose.missing_baseline"
         assert new["primary_item"]["target_ui"]["route"] == "/interview"
@@ -476,11 +460,7 @@ class TestPrimaryRecommendationParity:
         sys, hdrs = _setup(admin_client)
         snapshot_id = _full_pipeline(admin_client, hdrs, tmp_path, sys["id"])
         plan_run_id = _insert_intelligence_run(sys["id"], snapshot_id, "probe_plan", "completed")
-        plan_id = _insert_probe_plan(sys["id"], snapshot_id, plan_run_id, status="proposed")
-
-        old = _get_primary_action(admin_client, hdrs)
-        assert old["primary_action"]["action"] == "Review probe plan"
-        assert old["primary_action"]["link"] == f"/probe-planner?plan={plan_id}"
+        _insert_probe_plan(sys["id"], snapshot_id, plan_run_id, status="proposed")
 
         new = _get_primary_item(admin_client, hdrs)
         assert new["primary_item"]["state_id"] == "proposal.probe_plans.proposed"
@@ -491,22 +471,16 @@ class TestPrimaryRecommendationParity:
         sys, hdrs = _setup(admin_client)
         snapshot_id = _full_pipeline(admin_client, hdrs, tmp_path, sys["id"])
         plan_run_id = _insert_intelligence_run(sys["id"], snapshot_id, "probe_plan", "completed")
-        plan_id = _insert_probe_plan(sys["id"], snapshot_id, plan_run_id, status="approved")
-
-        old = _get_primary_action(admin_client, hdrs)
-        assert old["primary_action"]["action"] == "Generate / validate probe patch"
-        assert old["primary_action"]["link"] == f"/probe-planner?plan={plan_id}"
+        _insert_probe_plan(sys["id"], snapshot_id, plan_run_id, status="approved")
 
         new = _get_primary_item(admin_client, hdrs)
         assert new["primary_item"]["state_id"] == "proposal.probe_plans.approved_without_patch"
         assert new["primary_item"]["target_ui"]["route"] == "/probe-planner"
 
-    def test_fully_satisfied_old_nudges_new_is_silent(self, admin_client, tmp_path, monkeypatch):
-        """Known, intentional divergence (see module docstring #1): once
-        every problem/follow-up condition is satisfied, old still offers an
-        exploration nudge while new returns no primary_item at all. Pinned
-        here as the expected "全完了" outcome, not asserted equal.
-        """
+    def test_fully_satisfied_is_silent(self, admin_client, tmp_path, monkeypatch):
+        """Once every problem/follow-up condition is satisfied,
+        select_primary_item returns no primary_item at all -- silence, not a
+        decorative "explore further" nudge (see module docstring #1)."""
         _configure_reasoning_llm(monkeypatch)
         sys, hdrs = _setup(admin_client)
         snapshot_id = _full_pipeline(admin_client, hdrs, tmp_path, sys["id"])
@@ -515,26 +489,23 @@ class TestPrimaryRecommendationParity:
         _insert_validated_patch(plan_id, sys["id"], snapshot_id)
         _insert_trace(sys["id"])
 
-        old = _get_primary_action(admin_client, hdrs)
-        assert old["primary_action"] is not None
-        assert old["primary_action"]["action"] == "Start from Capability"
-
         new = _get_primary_item(admin_client, hdrs)
         assert new["primary_item"] is None
 
 
 class TestBuildRunningSuppression:
-    def test_build_running_suppresses_pipeline_cta_in_both_systems(
+    def test_build_running_suppresses_pipeline_cta(
         self, admin_client, tmp_path, monkeypatch,
     ):
-        """Old rule 2 unconditionally suppresses the CTA whenever the latest
-        build is queued/running, regardless of pipeline completeness. New
-        has no equivalent blanket rule, but reaches the same None outcome
-        here because nothing is actually outstanding: every pipeline step,
-        Purpose/Capabilities, and the instrumentation-path signal are all
-        already satisfied, so a newly queued/running Refresh build (which
-        has not yet produced any new run/step rows of its own) does not by
-        itself introduce any actionable StateItem.
+        """A queued/running build only marks the pipeline step(s) it is
+        actively working on as "running"/wait (excluded from primary-item
+        candidacy); it has no blanket suppression rule. This test reaches
+        primary_item == None because nothing else is actually outstanding:
+        every pipeline step, Purpose/Capabilities, and the
+        instrumentation-path signal are all already satisfied, so a newly
+        queued/running Refresh build (which has not yet produced any new
+        run/step rows of its own) does not by itself introduce any
+        actionable StateItem (see module docstring #2).
         """
         _configure_reasoning_llm(monkeypatch)
         sys, hdrs = _setup(admin_client)
@@ -552,20 +523,17 @@ class TestBuildRunningSuppression:
         # the previously completed rows are still each step's latest.
         _insert_active_build(sys["id"], snapshot_id, current_step="symbol_index")
 
-        old = _get_primary_action(admin_client, hdrs)
-        assert old["primary_action"] is None
-
         new = _get_primary_item(admin_client, hdrs)
         assert new["primary_item"] is None
 
 
-class TestUnderstandingRefreshRecommendedMatchesStateItem:
-    """Issue #238 Scope item 2: understanding_refresh_recommended's flag
-    value must equal the presence of the
-    interview.materialized.rebuild_required StateItem -- the state item is
-    the canonical source, the flag is a read of the same underlying
-    _check_understanding_refresh_recommended fact (still returned in the
-    response per this step's instructions; removal is Issue #239's scope).
+class TestRebuildRequiredStateItem:
+    """Issue #239: the interview.materialized.rebuild_required StateItem is
+    the sole, canonical source for what the deleted
+    ``understanding_refresh_recommended`` API flag used to expose. Its
+    presence/absence must still track the same underlying fact
+    (``_check_understanding_refresh_recommended``, unchanged) that used to
+    back the flag.
     """
 
     def _insert_materialized_session(self, system_id, snapshot_id, materialized_at):
@@ -590,41 +558,48 @@ class TestUnderstandingRefreshRecommendedMatchesStateItem:
                 (system_id, snapshot_id, status, completed_at, completed_at or 0),
             )
 
-    def test_recommended_true_matches_item_present(self, admin_client, tmp_path):
+    def test_item_present_when_materialize_postdates_build(self, admin_client, tmp_path):
+        from app.db import get_conn
+        from app.system_understanding_service import _check_understanding_refresh_recommended
+
         sys, hdrs = _setup(admin_client)
         snapshot_id = _configure_repo_and_snapshot(admin_client, hdrs, tmp_path)
         self._insert_build(sys["id"], snapshot_id, "completed", completed_at=10)
         self._insert_materialized_session(sys["id"], snapshot_id, materialized_at=20)
 
-        old = _get_primary_action(admin_client, hdrs)
-        new = _get_primary_item(admin_client, hdrs)
+        with get_conn() as conn:
+            assert _check_understanding_refresh_recommended(conn, sys["id"]) is True
 
-        assert old["understanding_refresh_recommended"] is True
-        assert old["understanding_refresh_recommended"] == any(
+        new = _get_primary_item(admin_client, hdrs)
+        assert any(
             i["state_id"] == "interview.materialized.rebuild_required" for i in new["items"]
         )
 
-    def test_recommended_false_matches_item_absent(self, admin_client, tmp_path):
+    def test_item_absent_when_build_postdates_materialize(self, admin_client, tmp_path):
+        from app.db import get_conn
+        from app.system_understanding_service import _check_understanding_refresh_recommended
+
         sys, hdrs = _setup(admin_client)
         snapshot_id = _configure_repo_and_snapshot(admin_client, hdrs, tmp_path)
         self._insert_build(sys["id"], snapshot_id, "completed", completed_at=20)
         self._insert_materialized_session(sys["id"], snapshot_id, materialized_at=10)
 
-        old = _get_primary_action(admin_client, hdrs)
-        new = _get_primary_item(admin_client, hdrs)
+        with get_conn() as conn:
+            assert _check_understanding_refresh_recommended(conn, sys["id"]) is False
 
-        assert old["understanding_refresh_recommended"] is False
+        new = _get_primary_item(admin_client, hdrs)
         assert not any(i["state_id"] == "interview.materialized.rebuild_required" for i in new["items"])
 
-    def test_recommended_false_without_materialized_session_matches_item_absent(
-        self, admin_client, tmp_path,
-    ):
+    def test_item_absent_without_materialized_session(self, admin_client, tmp_path):
+        from app.db import get_conn
+        from app.system_understanding_service import _check_understanding_refresh_recommended
+
         sys, hdrs = _setup(admin_client)
         snapshot_id = _configure_repo_and_snapshot(admin_client, hdrs, tmp_path)
         self._insert_build(sys["id"], snapshot_id, "completed", completed_at=10)
 
-        old = _get_primary_action(admin_client, hdrs)
-        new = _get_primary_item(admin_client, hdrs)
+        with get_conn() as conn:
+            assert _check_understanding_refresh_recommended(conn, sys["id"]) is False
 
-        assert old["understanding_refresh_recommended"] is False
+        new = _get_primary_item(admin_client, hdrs)
         assert not any(i["state_id"] == "interview.materialized.rebuild_required" for i in new["items"])

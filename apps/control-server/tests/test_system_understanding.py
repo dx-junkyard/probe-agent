@@ -136,25 +136,12 @@ class TestSystemUnderstandingGetWithoutSnapshot:
         assert pipeline["snapshot_ready"] == "missing"
         assert pipeline["symbols_indexed"] == "missing"
 
-        assert len(data["next_actions"]) > 0
-        assert data["next_actions"][0]["action"] == "Configure repository"
-
-    def test_primary_action_matches_configure_repository_next_action(self, admin_client, tmp_path):
-        """Issue #201: GET /repository/system-understanding exposes primary_action,
-        matching the first next_action (Configure repository, action_kind=navigate)
-        when no repository is configured yet."""
-        token = _login(admin_client)
-        sys = _create_system(admin_client, token, "test-sys-primary")
-        hdrs = _headers(token, sys["id"])
-
-        r = admin_client.get("/repository/system-understanding", headers=hdrs)
-        assert r.status_code == 200
-        data = r.json()
-
-        assert data["primary_action"] is not None
-        assert data["primary_action"]["action"] == "Configure repository"
-        assert data["primary_action"]["action_kind"] == "navigate"
-        assert data["primary_action"] == data["next_actions"][0]
+        # Issue #239: `next_actions` / `primary_action` were removed from this
+        # response. The canonical "what should the user do next" projection
+        # is `GET /system-state`'s `primary_item` -- see
+        # TestPrimaryRecommendationParity in test_next_step_parity.py for the
+        # "Configure repository" case, and test_system_state.py for
+        # `repository.configuration.missing` item coverage.
 
     def test_returns_missing_snapshot_after_config(self, admin_client, tmp_path):
         token = _login(admin_client)
@@ -408,227 +395,6 @@ class TestSystemUnderstandingReportsMetadataCoverage:
         assert mc["symbols_with_source_metadata"] >= 0
         assert mc["entrypoint_count"] >= 0
         assert mc["entrypoints_with_capability_link"] >= 0
-
-
-class TestSystemUnderstandingNextActions:
-    def test_next_actions_are_deterministic(self, admin_client, tmp_path):
-        token = _login(admin_client)
-        sys = _create_system(admin_client, token, "actions-sys")
-        hdrs = _headers(token, sys["id"])
-
-        r1 = admin_client.get("/repository/system-understanding", headers=hdrs)
-        r2 = admin_client.get("/repository/system-understanding", headers=hdrs)
-
-        assert r1.status_code == 200
-        assert r2.status_code == 200
-
-        assert r1.json()["next_actions"] == r2.json()["next_actions"]
-
-    def test_next_actions_change_with_state(self, admin_client, tmp_path):
-        token = _login(admin_client)
-        sys = _create_system(admin_client, token, "actions-sys-2")
-        hdrs = _headers(token, sys["id"])
-        repo, sha = _init_git_repo(tmp_path)
-
-        r_before = admin_client.get("/repository/system-understanding", headers=hdrs)
-        before_actions = [a["action"] for a in r_before.json()["next_actions"]]
-        assert "Configure repository" in before_actions
-
-        admin_client.put(
-            "/repository",
-            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
-            headers=hdrs,
-        )
-
-        r_after = admin_client.get("/repository/system-understanding", headers=hdrs)
-        after_actions = [a["action"] for a in r_after.json()["next_actions"]]
-        assert "Configure repository" not in after_actions
-        assert "Create snapshot" in after_actions
-
-
-class TestNextActionsSpanPlanAndExperimentStatus:
-    """Issue #174: Next Actions must surface probe plan / experiment status,
-    not just the System Understanding pipeline."""
-
-    def _setup_system(self, admin_client, tmp_path, name):
-        token = _login(admin_client)
-        sys = _create_system(admin_client, token, name)
-        hdrs = _headers(token, sys["id"])
-        repo, sha = _init_git_repo(tmp_path)
-        admin_client.put(
-            "/repository",
-            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
-            headers=hdrs,
-        )
-        snap_r = admin_client.post(
-            "/repository/snapshots", json={"commit_sha": sha}, headers=hdrs
-        )
-        snapshot_id = snap_r.json()["id"]
-        return sys["id"], hdrs, snapshot_id
-
-    def _insert_intelligence_run(self, system_id, snapshot_id):
-        from app.db import get_conn
-
-        with get_conn() as conn:
-            cur = conn.execute(
-                """INSERT INTO intelligence_runs
-                       (system_id, snapshot_id, run_type, provider, model,
-                        prompt_version, schema_version, decision_method,
-                        status, is_mock, started_at, completed_at)
-                   VALUES (?, ?, 'probe_plan', 'mock', 'mock-model', 'v1', 'v1',
-                           'reasoning_llm', 'completed', 1, 0, 0)""",
-                (system_id, snapshot_id),
-            )
-            return cur.lastrowid
-
-    def test_proposed_plan_surfaces_review_action(self, admin_client, tmp_path):
-        from app.db import get_conn
-
-        system_id, hdrs, snapshot_id = self._setup_system(
-            admin_client, tmp_path, "plan-review-sys"
-        )
-        run_id = self._insert_intelligence_run(system_id, snapshot_id)
-        with get_conn() as conn:
-            cur = conn.execute(
-                """INSERT INTO probe_plans
-                       (system_id, snapshot_id, intelligence_run_id, feature_id,
-                        objective, status, origin, created_at, updated_at)
-                   VALUES (?, ?, ?, 'feat-1', 'obj', 'proposed', 'manual', 0, 0)""",
-                (system_id, snapshot_id, run_id),
-            )
-            plan_id = cur.lastrowid
-
-        r = admin_client.get("/repository/system-understanding", headers=hdrs)
-        assert r.status_code == 200, r.text
-        matching = [
-            a for a in r.json()["next_actions"] if a["action"] == "Review probe plan"
-        ]
-        assert len(matching) == 1
-        assert matching[0]["category"] == "observe"
-        assert matching[0]["link"] == f"/probe-planner?plan={plan_id}"
-
-    def test_approved_plan_without_validated_patch_surfaces_instrument_action(
-        self, admin_client, tmp_path
-    ):
-        from app.db import get_conn
-
-        system_id, hdrs, snapshot_id = self._setup_system(
-            admin_client, tmp_path, "plan-patch-sys"
-        )
-        run_id = self._insert_intelligence_run(system_id, snapshot_id)
-        with get_conn() as conn:
-            cur = conn.execute(
-                """INSERT INTO probe_plans
-                       (system_id, snapshot_id, intelligence_run_id, feature_id,
-                        objective, status, origin, created_at, updated_at)
-                   VALUES (?, ?, ?, 'feat-1', 'obj', 'approved', 'manual', 0, 0)""",
-                (system_id, snapshot_id, run_id),
-            )
-            plan_id = cur.lastrowid
-
-        r = admin_client.get("/repository/system-understanding", headers=hdrs)
-        assert r.status_code == 200, r.text
-        matching = [
-            a for a in r.json()["next_actions"]
-            if a["action"] == "Generate / validate probe patch"
-        ]
-        assert len(matching) == 1
-        assert matching[0]["category"] == "instrument"
-        assert matching[0]["link"] == f"/probe-planner?plan={plan_id}"
-
-    def test_approved_plan_with_validated_patch_has_no_pending_action(
-        self, admin_client, tmp_path
-    ):
-        from app.db import get_conn
-
-        system_id, hdrs, snapshot_id = self._setup_system(
-            admin_client, tmp_path, "plan-validated-sys"
-        )
-        run_id = self._insert_intelligence_run(system_id, snapshot_id)
-        with get_conn() as conn:
-            cur = conn.execute(
-                """INSERT INTO probe_plans
-                       (system_id, snapshot_id, intelligence_run_id, feature_id,
-                        objective, status, origin, created_at, updated_at)
-                   VALUES (?, ?, ?, 'feat-1', 'obj', 'approved', 'manual', 0, 0)""",
-                (system_id, snapshot_id, run_id),
-            )
-            plan_id = cur.lastrowid
-            cur = conn.execute(
-                """INSERT INTO probe_patches
-                       (plan_id, system_id, snapshot_id, commit_sha, diff,
-                        skipped, status, cleanup_state, created_at)
-                   VALUES (?, ?, ?, 'deadbeef', 'diff', '[]', 'generated',
-                           'not_attempted', 0)""",
-                (plan_id, system_id, snapshot_id),
-            )
-            patch_id = cur.lastrowid
-            for variant in ("baseline", "probed"):
-                conn.execute(
-                    """INSERT INTO validation_runs
-                           (patch_id, system_id, variant, worktree_path,
-                            overall_success, trace_status, network_isolation,
-                            cleanup_state, created_at)
-                       VALUES (?, ?, ?, '/tmp/x', 1, 'not_checked',
-                               'not_requested', 'not_attempted', 0)""",
-                    (patch_id, system_id, variant),
-                )
-
-        r = admin_client.get("/repository/system-understanding", headers=hdrs)
-        assert r.status_code == 200, r.text
-        labels = [a["action"] for a in r.json()["next_actions"]]
-        assert "Generate / validate probe patch" not in labels
-
-    def test_completed_undecided_experiment_surfaces_evaluate_action(
-        self, admin_client, tmp_path
-    ):
-        from app.db import get_conn
-
-        system_id, hdrs, snapshot_id = self._setup_system(
-            admin_client, tmp_path, "experiment-decision-sys"
-        )
-        with get_conn() as conn:
-            conn.execute(
-                """INSERT INTO experiments
-                       (system_id, feature_id, objective, snapshot_id,
-                        baseline_commit, config_revision, execution_config,
-                        status, human_decision, created_at)
-                   VALUES (?, 'feat-1', 'obj', ?, 'deadbeef', 'v1', '{}',
-                           'completed', 'undecided', 0)""",
-                (system_id, snapshot_id),
-            )
-
-        r = admin_client.get("/repository/system-understanding", headers=hdrs)
-        assert r.status_code == 200, r.text
-        matching = [
-            a for a in r.json()["next_actions"]
-            if a["action"] == "Review experiment decision"
-        ]
-        assert len(matching) == 1
-        assert matching[0]["category"] == "evaluate"
-        assert matching[0]["link"] == "/experiments"
-
-    def test_decided_experiment_has_no_pending_action(self, admin_client, tmp_path):
-        from app.db import get_conn
-
-        system_id, hdrs, snapshot_id = self._setup_system(
-            admin_client, tmp_path, "experiment-decided-sys"
-        )
-        with get_conn() as conn:
-            conn.execute(
-                """INSERT INTO experiments
-                       (system_id, feature_id, objective, snapshot_id,
-                        baseline_commit, config_revision, execution_config,
-                        status, human_decision, created_at)
-                   VALUES (?, 'feat-1', 'obj', ?, 'deadbeef', 'v1', '{}',
-                           'completed', 'adopted', 0)""",
-                (system_id, snapshot_id),
-            )
-
-        r = admin_client.get("/repository/system-understanding", headers=hdrs)
-        assert r.status_code == 200, r.text
-        labels = [a["action"] for a in r.json()["next_actions"]]
-        assert "Review experiment decision" not in labels
 
 
 class TestPipelineStepStatuses:
@@ -963,457 +729,6 @@ class TestBuildDoesNotBlockOtherRequests:
                 break
             time.sleep(0.05)
         assert status == "completed"
-
-
-class TestNextActionsPriority:
-    """Issue #120: purpose/capabilities take priority over pipeline-complete.
-
-    Unit tests against ``_build_next_actions`` directly since a fully
-    "complete" pipeline (including the reasoning-only claim-scan step)
-    cannot be produced under the mock LLM provider used by the API tests
-    above.
-    """
-
-    def _complete_pipeline(self):
-        from app.system_understanding_service import PIPELINE_STEPS, PipelineStep
-
-        return [PipelineStep(step, "complete") for step in PIPELINE_STEPS]
-
-    def _incomplete_pipeline(self, missing_step):
-        from app.system_understanding_service import PipelineStep
-
-        steps = []
-        for step in self._complete_pipeline():
-            steps.append(
-                PipelineStep(step.step, "missing" if step.step == missing_step else "complete")
-            )
-        return steps
-
-    def test_incomplete_pipeline_step_takes_priority_over_purpose(self):
-        from app.system_understanding_service import _build_next_actions
-
-        actions = _build_next_actions(
-            self._incomplete_pipeline("symbols_indexed"),
-            purpose_defined=False,
-            capabilities=[],
-            metadata_coverage=None,
-            gap_count=0,
-        )
-        labels = [a.action for a in actions]
-        assert "Index code symbols" in labels
-        assert "Define System Purpose" not in labels
-
-    def test_claim_scan_blocked_does_not_offer_exploration(self):
-        from app.system_understanding_service import MetadataCoverage, _build_next_actions
-
-        actions = _build_next_actions(
-            self._incomplete_pipeline("documentation_claims_scanned"),
-            purpose_defined=True,
-            capabilities=[{"name": "Cap"}],
-            metadata_coverage=MetadataCoverage(symbol_count=10, symbols_with_source_metadata=10),
-            gap_count=0,
-        )
-        labels = [a.action for a in actions]
-        assert labels == ["Scan documentation claims"]
-
-    def test_docs_code_reconcile_missing_does_not_offer_exploration(self):
-        from app.system_understanding_service import MetadataCoverage, _build_next_actions
-
-        actions = _build_next_actions(
-            self._incomplete_pipeline("docs_code_reconciled"),
-            purpose_defined=True,
-            capabilities=[{"name": "Cap"}],
-            metadata_coverage=MetadataCoverage(symbol_count=10, symbols_with_source_metadata=10),
-            gap_count=0,
-        )
-        labels = [a.action for a in actions]
-        assert labels == ["Reconcile docs and code"]
-
-    def test_complete_pipeline_without_purpose_is_top_priority(self):
-        from app.system_understanding_service import _build_next_actions
-
-        actions = _build_next_actions(
-            self._complete_pipeline(),
-            purpose_defined=False,
-            capabilities=[{"name": "Do things"}],
-            metadata_coverage=None,
-            gap_count=3,
-        )
-        assert actions[0].action == "Define System Purpose"
-        assert actions[0].reason.startswith(
-            "Pipeline completed, but no system purpose is defined yet."
-        )
-        # Issue #211: the reason also explains why defining it matters.
-        assert "evaluation basis" in actions[0].reason
-        assert actions[0].link == "/interview"
-
-    def test_complete_pipeline_without_capabilities_after_purpose(self):
-        from app.system_understanding_service import _build_next_actions
-
-        actions = _build_next_actions(
-            self._complete_pipeline(),
-            purpose_defined=True,
-            capabilities=[],
-            metadata_coverage=None,
-            gap_count=0,
-        )
-        assert actions[0].action == "Identify main system capabilities"
-        assert actions[0].link == "/interview"
-
-    def test_metadata_coverage_and_gaps_after_purpose_and_capabilities(self):
-        from app.system_understanding_service import MetadataCoverage, _build_next_actions
-
-        actions = _build_next_actions(
-            self._complete_pipeline(),
-            purpose_defined=True,
-            capabilities=[{"name": "Cap"}],
-            metadata_coverage=MetadataCoverage(symbol_count=10, symbols_with_source_metadata=0),
-            gap_count=2,
-        )
-        labels = [a.action for a in actions]
-        assert labels == ["Add source metadata", "Review docs-code gaps"]
-
-    def test_gap_summary_surfaces_unclassified_api_and_probe_candidate_actions(self):
-        from app.system_understanding_service import GapSummary, _build_next_actions
-
-        actions = _build_next_actions(
-            self._complete_pipeline(),
-            purpose_defined=True,
-            capabilities=[{"name": "Cap"}],
-            metadata_coverage=None,
-            gap_count=3,
-            gap_summary=[
-                GapSummary(gap_type="unclassified_entrypoint", count=1),
-                GapSummary(gap_type="missing_probe_flow", count=2),
-            ],
-        )
-        by_label = {a.action: a for a in actions}
-        assert by_label["Unclassified API found"].category == "observe"
-        assert by_label["Unclassified API found"].link == "/interview"
-        assert by_label["Probe candidate available"].category == "observe"
-        assert by_label["Probe candidate available"].link == "/flow-explorer"
-
-    def test_gap_derived_actions_match_gap_next_actions_primary_link(self):
-        """Issue #199: the top-level Next Action link for each gap-type-derived
-        action must match GAP_NEXT_ACTIONS[gap_type][0]["link"] — the same
-        primary resolution shown on that gap type's card, so the two never
-        disagree on where to send the user."""
-        from app.system_understanding_service import GAP_NEXT_ACTIONS, GapSummary, _build_next_actions
-
-        actions = _build_next_actions(
-            self._complete_pipeline(),
-            purpose_defined=True,
-            capabilities=[{"name": "Cap"}],
-            metadata_coverage=None,
-            gap_count=3,
-            gap_summary=[
-                GapSummary(gap_type="unclassified_entrypoint", count=1),
-                GapSummary(gap_type="missing_probe_flow", count=2),
-            ],
-        )
-        by_label = {a.action: a for a in actions}
-        assert by_label["Unclassified API found"].link == GAP_NEXT_ACTIONS["unclassified_entrypoint"][0]["link"]
-        assert by_label["Probe candidate available"].link == GAP_NEXT_ACTIONS["missing_probe_flow"][0]["link"]
-
-    def test_fully_satisfied_pipeline_offers_exploration_actions(self):
-        from app.system_understanding_service import MetadataCoverage, _build_next_actions
-
-        actions = _build_next_actions(
-            self._complete_pipeline(),
-            purpose_defined=True,
-            capabilities=[{"name": "Cap"}],
-            metadata_coverage=MetadataCoverage(symbol_count=10, symbols_with_source_metadata=10),
-            gap_count=0,
-        )
-        labels = [a.action for a in actions]
-        assert labels == ["Start from Capability", "Start from Feature", "Open Flow Explorer"]
-
-    def test_all_actions_carry_a_finite_category(self):
-        from app.system_understanding_service import MetadataCoverage, _build_next_actions
-
-        actions = _build_next_actions(
-            self._complete_pipeline(),
-            purpose_defined=False,
-            capabilities=[],
-            metadata_coverage=MetadataCoverage(symbol_count=10, symbols_with_source_metadata=0),
-            gap_count=2,
-            proposed_plan_ids=[7],
-            approved_plan_ids_without_validated_patch=[8],
-            undecided_completed_experiment_ids=[9],
-        )
-        assert actions
-        for action in actions:
-            assert action.category in ("understand", "observe", "instrument", "evaluate")
-
-    def test_pipeline_incomplete_still_puts_remediation_first(self):
-        from app.system_understanding_service import _build_next_actions
-
-        actions = _build_next_actions(
-            self._incomplete_pipeline("symbols_indexed"),
-            purpose_defined=False,
-            capabilities=[],
-            metadata_coverage=None,
-            gap_count=0,
-            proposed_plan_ids=[1],
-            approved_plan_ids_without_validated_patch=[2],
-            undecided_completed_experiment_ids=[3],
-        )
-        assert actions[0].action == "Index code symbols"
-        assert actions[0].category == "understand"
-        labels = [a.action for a in actions]
-        assert "Review probe plan" in labels
-        assert "Generate / validate probe patch" in labels
-        assert "Review experiment decision" in labels
-
-    def test_proposed_plan_triggers_review_action(self):
-        from app.system_understanding_service import _build_next_actions
-
-        actions = _build_next_actions(
-            self._complete_pipeline(),
-            purpose_defined=True,
-            capabilities=[{"name": "Cap"}],
-            metadata_coverage=None,
-            gap_count=0,
-            proposed_plan_ids=[42],
-        )
-        matching = [a for a in actions if a.action == "Review probe plan"]
-        assert len(matching) == 1
-        assert matching[0].category == "observe"
-        assert matching[0].link == "/probe-planner?plan=42"
-
-    def test_approved_plan_without_validated_patch_triggers_instrument_action(self):
-        from app.system_understanding_service import _build_next_actions
-
-        actions = _build_next_actions(
-            self._complete_pipeline(),
-            purpose_defined=True,
-            capabilities=[{"name": "Cap"}],
-            metadata_coverage=None,
-            gap_count=0,
-            approved_plan_ids_without_validated_patch=[13],
-        )
-        matching = [a for a in actions if a.action == "Generate / validate probe patch"]
-        assert len(matching) == 1
-        assert matching[0].category == "instrument"
-        assert matching[0].link == "/probe-planner?plan=13"
-
-    def test_completed_experiment_without_decision_triggers_evaluate_action(self):
-        from app.system_understanding_service import _build_next_actions
-
-        actions = _build_next_actions(
-            self._complete_pipeline(),
-            purpose_defined=True,
-            capabilities=[{"name": "Cap"}],
-            metadata_coverage=None,
-            gap_count=0,
-            undecided_completed_experiment_ids=[99],
-        )
-        matching = [a for a in actions if a.action == "Review experiment decision"]
-        assert len(matching) == 1
-        assert matching[0].category == "evaluate"
-        assert matching[0].link == "/experiments"
-
-    def test_no_pending_plan_or_experiment_actions_when_none_exist(self):
-        from app.system_understanding_service import _build_next_actions
-
-        actions = _build_next_actions(
-            self._complete_pipeline(),
-            purpose_defined=True,
-            capabilities=[{"name": "Cap"}],
-            metadata_coverage=None,
-            gap_count=0,
-        )
-        labels = [a.action for a in actions]
-        assert "Review probe plan" not in labels
-        assert "Generate / validate probe patch" not in labels
-        assert "Review experiment decision" not in labels
-
-
-class TestDerivePrimaryAction:
-    """Issue #201: ``_derive_primary_action`` picks the single highest-priority
-    action for the current state, using the finite rules documented in
-    docs/system-understanding-navigation.md.
-    """
-
-    def _complete_pipeline(self):
-        from app.system_understanding_service import PIPELINE_STEPS, PipelineStep
-
-        return [PipelineStep(step, "complete") for step in PIPELINE_STEPS]
-
-    def _incomplete_pipeline(self, *missing_steps):
-        from app.system_understanding_service import PipelineStep
-
-        return [
-            PipelineStep(step.step, "missing" if step.step in missing_steps else "complete")
-            for step in self._complete_pipeline()
-        ]
-
-    def test_repository_not_configured_uses_first_next_action(self):
-        from app.system_understanding_service import (
-            PipelineStep, _build_next_actions, _derive_primary_action,
-        )
-
-        pipeline = [
-            PipelineStep("repository_configured", "missing"),
-            PipelineStep("snapshot_ready", "missing"),
-        ]
-        next_actions = _build_next_actions(
-            pipeline, purpose_defined=False, capabilities=[], metadata_coverage=None, gap_count=0,
-        )
-        primary = _derive_primary_action(pipeline, next_actions, latest_build=None)
-
-        assert primary is not None
-        assert primary.action == "Configure repository"
-        assert primary.action_kind == "navigate"
-
-    def test_snapshot_not_ready_uses_first_next_action(self):
-        from app.system_understanding_service import (
-            PipelineStep, _build_next_actions, _derive_primary_action,
-        )
-
-        pipeline = [
-            PipelineStep("repository_configured", "complete"),
-            PipelineStep("snapshot_ready", "missing"),
-        ]
-        next_actions = _build_next_actions(
-            pipeline, purpose_defined=False, capabilities=[], metadata_coverage=None, gap_count=0,
-        )
-        primary = _derive_primary_action(pipeline, next_actions, latest_build=None)
-
-        assert primary is not None
-        assert primary.action == "Create snapshot"
-        assert primary.action_kind == "navigate"
-
-    def test_repository_not_configured_wins_even_if_build_is_running(self):
-        """Rule 1 is evaluated before rule 2 (build-running check)."""
-        from app.system_understanding_service import (
-            PipelineStep, _build_next_actions, _derive_primary_action,
-        )
-
-        pipeline = [
-            PipelineStep("repository_configured", "missing"),
-            PipelineStep("snapshot_ready", "missing"),
-        ]
-        next_actions = _build_next_actions(
-            pipeline, purpose_defined=False, capabilities=[], metadata_coverage=None, gap_count=0,
-        )
-        primary = _derive_primary_action(
-            pipeline, next_actions, latest_build={"status": "running"},
-        )
-
-        assert primary is not None
-        assert primary.action == "Configure repository"
-
-    def test_incomplete_step_with_no_build_running_offers_build_action(self):
-        from app.system_understanding_service import _build_next_actions, _derive_primary_action
-
-        pipeline = self._incomplete_pipeline("symbols_indexed")
-        next_actions = _build_next_actions(
-            pipeline, purpose_defined=False, capabilities=[], metadata_coverage=None, gap_count=0,
-        )
-        primary = _derive_primary_action(pipeline, next_actions, latest_build=None)
-
-        assert primary is not None
-        assert primary.action == "Build system understanding"
-        assert primary.action_kind == "build"
-        assert primary.link is None
-        assert "1" in primary.reason
-
-    def test_incomplete_step_reason_counts_all_remaining_steps(self):
-        from app.system_understanding_service import _build_next_actions, _derive_primary_action
-
-        pipeline = self._incomplete_pipeline("symbols_indexed", "entrypoints_discovered")
-        next_actions = _build_next_actions(
-            pipeline, purpose_defined=False, capabilities=[], metadata_coverage=None, gap_count=0,
-        )
-        primary = _derive_primary_action(pipeline, next_actions, latest_build=None)
-
-        assert primary is not None
-        assert primary.action_kind == "build"
-        assert primary.reason.startswith("2 ")
-
-    @pytest.mark.parametrize("status", ["queued", "running"])
-    def test_build_running_or_queued_suppresses_primary_action(self, status):
-        from app.system_understanding_service import _build_next_actions, _derive_primary_action
-
-        pipeline = self._incomplete_pipeline("symbols_indexed")
-        next_actions = _build_next_actions(
-            pipeline, purpose_defined=False, capabilities=[], metadata_coverage=None, gap_count=0,
-        )
-        primary = _derive_primary_action(
-            pipeline, next_actions, latest_build={"status": status},
-        )
-
-        assert primary is None
-
-    @pytest.mark.parametrize("status", ["completed", "failed", "partial", "cancelled"])
-    def test_settled_build_does_not_suppress_primary_action(self, status):
-        from app.system_understanding_service import _build_next_actions, _derive_primary_action
-
-        pipeline = self._incomplete_pipeline("symbols_indexed")
-        next_actions = _build_next_actions(
-            pipeline, purpose_defined=False, capabilities=[], metadata_coverage=None, gap_count=0,
-        )
-        primary = _derive_primary_action(
-            pipeline, next_actions, latest_build={"status": status},
-        )
-
-        assert primary is not None
-        assert primary.action_kind == "build"
-
-    def test_pipeline_complete_without_purpose_uses_define_purpose(self):
-        from app.system_understanding_service import _build_next_actions, _derive_primary_action
-
-        pipeline = self._complete_pipeline()
-        next_actions = _build_next_actions(
-            pipeline, purpose_defined=False, capabilities=[], metadata_coverage=None, gap_count=0,
-        )
-        primary = _derive_primary_action(pipeline, next_actions, latest_build=None)
-
-        assert primary is not None
-        assert primary.action == "Define System Purpose"
-        assert primary.link == "/interview"
-        assert primary.action_kind == "navigate"
-
-    def test_pipeline_complete_without_purpose_with_settled_build_is_unaffected(self):
-        from app.system_understanding_service import _build_next_actions, _derive_primary_action
-
-        pipeline = self._complete_pipeline()
-        next_actions = _build_next_actions(
-            pipeline, purpose_defined=False, capabilities=[], metadata_coverage=None, gap_count=0,
-        )
-        primary = _derive_primary_action(
-            pipeline, next_actions, latest_build={"status": "completed"},
-        )
-
-        assert primary is not None
-        assert primary.action == "Define System Purpose"
-
-    def test_fully_satisfied_uses_first_next_action(self):
-        from app.system_understanding_service import _build_next_actions, _derive_primary_action
-
-        pipeline = self._complete_pipeline()
-        next_actions = _build_next_actions(
-            pipeline,
-            purpose_defined=True,
-            capabilities=[{"name": "Cap"}],
-            metadata_coverage=None,
-            gap_count=0,
-        )
-        primary = _derive_primary_action(pipeline, next_actions, latest_build=None)
-
-        assert primary is not None
-        assert primary.action == "Start from Capability"
-        assert primary.link == "/capability-map"
-        assert primary.action_kind == "navigate"
-
-    def test_no_next_actions_returns_none(self):
-        from app.system_understanding_service import _derive_primary_action
-
-        pipeline = self._complete_pipeline()
-        primary = _derive_primary_action(pipeline, next_actions=[], latest_build=None)
-
-        assert primary is None
 
 
 class TestDeriveStageStatuses:
@@ -1841,39 +1156,48 @@ class TestGapTrendAndRefreshRecommended:
         assert trend["docs_only"]["previous"] == 12
         assert trend["docs_only"]["current"] == 4
 
+    # Issue #239: `understanding_refresh_recommended` was removed from the
+    # GET /repository/system-understanding response (the canonical projection
+    # is now the `interview.materialized.rebuild_required` StateItem from
+    # GET /system-state -- see test_system_state.py /
+    # test_next_step_parity.py's TestUnderstandingRefreshRecommendedMatchesStateItem
+    # for that side). `_check_understanding_refresh_recommended` itself is
+    # unchanged and still lives in system_understanding_service.py (system_state.py
+    # calls it directly to build that StateItem), so these scenario tests now
+    # call it directly instead of reading it off the deleted API field.
+
+    def _refresh_recommended(self, system_id):
+        from app.db import get_conn
+        from app.system_understanding_service import _check_understanding_refresh_recommended
+
+        with get_conn() as conn:
+            return _check_understanding_refresh_recommended(conn, system_id)
+
     def test_refresh_recommended_true_after_materialize_before_rebuild(self, admin_client, tmp_path):
         system_id, hdrs, snapshot_id = self._setup_system(admin_client, tmp_path, "refresh-true-sys")
         self._insert_build(system_id, snapshot_id, "completed", completed_at=10)
         self._insert_materialized_session(system_id, snapshot_id, materialized_at=20)
 
-        r = admin_client.get("/repository/system-understanding", headers=hdrs)
-        assert r.status_code == 200, r.text
-        assert r.json()["understanding_refresh_recommended"] is True
+        assert self._refresh_recommended(system_id) is True
 
     def test_refresh_recommended_false_after_rebuild_postdates_materialize(self, admin_client, tmp_path):
         system_id, hdrs, snapshot_id = self._setup_system(admin_client, tmp_path, "refresh-false-sys")
         self._insert_materialized_session(system_id, snapshot_id, materialized_at=10)
         self._insert_build(system_id, snapshot_id, "completed", completed_at=20)
 
-        r = admin_client.get("/repository/system-understanding", headers=hdrs)
-        assert r.status_code == 200, r.text
-        assert r.json()["understanding_refresh_recommended"] is False
+        assert self._refresh_recommended(system_id) is False
 
     def test_refresh_recommended_false_without_materialized_session(self, admin_client, tmp_path):
         system_id, hdrs, snapshot_id = self._setup_system(admin_client, tmp_path, "refresh-no-session-sys")
         self._insert_build(system_id, snapshot_id, "completed", completed_at=10)
 
-        r = admin_client.get("/repository/system-understanding", headers=hdrs)
-        assert r.status_code == 200, r.text
-        assert r.json()["understanding_refresh_recommended"] is False
+        assert self._refresh_recommended(system_id) is False
 
     def test_refresh_recommended_false_without_completed_build(self, admin_client, tmp_path):
         system_id, hdrs, snapshot_id = self._setup_system(admin_client, tmp_path, "refresh-no-build-sys")
         self._insert_materialized_session(system_id, snapshot_id, materialized_at=10)
 
-        r = admin_client.get("/repository/system-understanding", headers=hdrs)
-        assert r.status_code == 200, r.text
-        assert r.json()["understanding_refresh_recommended"] is False
+        assert self._refresh_recommended(system_id) is False
 
     def test_gap_trend_and_refresh_recommended_isolated_by_system(self, admin_client, tmp_path):
         system_a, hdrs_a, snap_a = self._setup_system(admin_client, tmp_path, "gap-trend-iso-a")
@@ -1886,17 +1210,18 @@ class TestGapTrendAndRefreshRecommended:
         token = _login(admin_client)
         sys_b = _create_system(admin_client, token, "gap-trend-iso-b")
         hdrs_b = _headers(token, sys_b["id"])
+        system_b = sys_b["id"]
 
         r_a = admin_client.get("/repository/system-understanding", headers=hdrs_a)
         assert r_a.status_code == 200, r_a.text
         assert r_a.json()["gap_trend"] != []
-        assert r_a.json()["understanding_refresh_recommended"] is True
+        assert self._refresh_recommended(system_a) is True
 
         # System B has none of System A's history/materialize state.
         r_b = admin_client.get("/repository/system-understanding", headers=hdrs_b)
         assert r_b.status_code == 200, r_b.text
         assert r_b.json()["gap_trend"] == []
-        assert r_b.json()["understanding_refresh_recommended"] is False
+        assert self._refresh_recommended(system_b) is False
 
 
 class TestIssue236FactsExtractionRegression:
@@ -2013,9 +1338,15 @@ class TestIssue236FactsExtractionRegression:
         pipeline = {s["step"]: s["status"] for s in data["pipeline"]}
         assert pipeline["repository_configured"] == "missing"
         assert pipeline["snapshot_ready"] == "missing"
-        assert data["next_actions"][0]["action"] == "Configure repository"
         assert data["stages"][0]["stage"] == "understand"
         assert data["stages"][0]["status"] == "not_started"
+
+        # Issue #239: the canonical "next step" guidance projection lives at
+        # GET /system-state now, not on this response.
+        state_r = admin_client.get("/system-state", headers=hdrs)
+        assert state_r.status_code == 200, state_r.text
+        state_ids = {i["state_id"] for i in state_r.json()["items"]}
+        assert "repository.configuration.missing" in state_ids
 
     def test_snapshot_only_response_shape(self, admin_client, tmp_path):
         """snapshot のみ: repository configured and a ready snapshot exists,
@@ -2104,14 +1435,10 @@ class TestIssue236FactsExtractionRegression:
         # documentation_claims_scanned is the one reasoning-only step and
         # stays blocked under the mock provider, so "understand" cannot
         # reach complete purely from this fixture -- but purpose_defined
-        # being wrong would make this fail differently (missing "Define
-        # System Purpose"/"Identify main system capabilities" actions),
-        # which the assertions below rule out directly.
+        # being wrong would make this fail differently (below, via
+        # /system-state's understanding.purpose.satisfied item, since Issue
+        # #239 removed this response's own next_actions projection).
         assert stages["understand"].get("status") in ("in_progress", "blocked", "complete")
-
-        labels = [a["action"] for a in data["next_actions"]]
-        assert "Define System Purpose" not in labels
-        assert "Identify main system capabilities" not in labels
 
         # /system-state agrees: Purpose/Capabilities are satisfied, not
         # missing/unconfirmed/impacted.

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { useSystemDiagnostics, useSystemState } from "@/api/hooks";
 import { useNavigate } from "react-router-dom";
 import { useDiagnosticActivate } from "@/components/diagnostic-fix";
@@ -9,32 +9,9 @@ import {
   AlertTriangle, Ban, CheckCircle2, ChevronRight, HelpCircle, ShieldAlert, XCircle,
 } from "lucide-react";
 import type { DiagnosticSeverity, SystemDiagnosticCheck } from "@/api/types";
-import { systemStateTarget } from "@/components/system-state";
+import { isItemInCurrentPhaseScope, systemStateTarget } from "@/components/system-state";
 
 export const SEVERITY_ORDER: DiagnosticSeverity[] = ["error", "blocked", "warning", "unknown", "ok"];
-
-interface GroupedCheck {
-  representative: SystemDiagnosticCheck;
-  titles: string[];
-  check_ids: string[];
-}
-
-function groupChecksByRootCause(checks: SystemDiagnosticCheck[]): GroupedCheck[] {
-  const groups: GroupedCheck[] = [];
-  const keyMap = new Map<string, number>();
-  for (const c of checks) {
-    const key = `${c.detail}\0${c.impact}\0${c.remediation}\0${c.fix_page ?? ""}\0${c.fix_anchor ?? ""}`;
-    const idx = keyMap.get(key);
-    if (idx !== undefined) {
-      groups[idx].titles.push(c.title);
-      groups[idx].check_ids.push(c.check_id);
-    } else {
-      keyMap.set(key, groups.length);
-      groups.push({ representative: c, titles: [c.title], check_ids: [c.check_id] });
-    }
-  }
-  return groups;
-}
 
 const CATEGORY_LABELS: Record<string, string> = {
   repository: "リポジトリ",
@@ -258,153 +235,68 @@ export function EnvFixDialog({ check, onClose }: { check: SystemDiagnosticCheck 
   );
 }
 
-export function DiagnosticsDialogContent({ checks, onActivate }: {
-  checks: SystemDiagnosticCheck[];
-  onActivate?: (check: SystemDiagnosticCheck) => void;
-}) {
-  const sorted = useMemo(
-    () =>
-      [...checks].sort(
-        (a, b) =>
-          SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity),
-      ),
-    [checks],
-  );
-  const problems = sorted.filter((c) => c.severity !== "ok");
-  const healthy = sorted.filter((c) => c.severity === "ok");
-  const grouped = useMemo(() => groupChecksByRootCause(problems), [problems]);
+/**
+ * Issue #239: `system-state` is the sole data source for the badge (the
+ * `system-diagnostics` direct-read fallback is removed -- diagnostics are
+ * still consulted, but only to look up one specific check's detail for the
+ * env-fix dialog, via `related_checks`, never as a source of the badge's own
+ * item list). When `GET /system-state` cannot be loaded, the badge shows a
+ * deliberately distinct degraded state instead of silently falling back to
+ * a different derivation: a muted/error icon with no count (there is no
+ * reliable count to show), and clicking it opens a dialog that says so
+ * rather than presenting stale or reconstructed data as current.
+ */
+function DegradedBadge() {
+  const [open, setOpen] = useState(false);
   return (
-    <div className="space-y-4">
-      {problems.length === 0 ? (
-        <p className="text-sm text-muted-foreground">
-          すべての設定チェックに合格しました。不足・不正な必須設定はありません。
+    <>
+      <Button
+        variant="ghost"
+        size="sm"
+        onClick={() => setOpen(true)}
+        title="System state unavailable"
+        data-testid="diagnostics-badge"
+        data-state="error"
+        className="relative gap-1.5"
+      >
+        <ShieldAlert className="h-4 w-4 text-muted-foreground" />
+        <span data-testid="diagnostics-badge-error" className="text-xs font-semibold text-muted-foreground">?</span>
+      </Button>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogHeader><DialogTitle>System State</DialogTitle></DialogHeader>
+        <p className="text-sm text-muted-foreground" data-testid="diagnostics-badge-error-message">
+          System state could not be loaded. Check the Control Server connection and retry.
         </p>
-      ) : (
-        <>
-          <p className="text-xs text-muted-foreground">
-            各項目をクリックすると、修正できる問題は該当画面へ移動します。画面で直接
-            修正できない設定はダイアログで対応手順を表示します。
-          </p>
-          <div className="space-y-2" data-testid="diagnostics-problems">
-            {grouped.map((g) => (
-              <DiagnosticCheckCard
-                key={g.check_ids.join(",")}
-                check={g.representative}
-                onActivate={onActivate}
-                groupedTitles={g.titles}
-              />
-            ))}
-          </div>
-        </>
-      )}
-      {healthy.length > 0 && (
-        <div>
-          <p className="text-xs font-medium text-muted-foreground mb-1.5">
-            正常なチェック
-          </p>
-          <ul className="space-y-1">
-            {healthy.map((c) => (
-              <li key={c.check_id} className="flex items-center gap-2 text-xs text-muted-foreground">
-                <DiagnosticSeverityIcon severity="ok" className="h-3.5 w-3.5" />
-                {c.title}
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-      <p className="text-[11px] text-muted-foreground">
-        すべてのチェックは決定的（LLM 不使用）です。実行時の失敗は直近の実行記録から
-        そのまま表示しています。
-      </p>
-    </div>
+      </Dialog>
+    </>
   );
 }
 
 export function DiagnosticsBadge() {
+  const { data: systemState, isLoading, isError } = useSystemState();
   const { data } = useSystemDiagnostics();
-  const { data: systemState } = useSystemState();
   const [open, setOpen] = useState(false);
   const { activate, envCheck, closeEnv } = useDiagnosticActivate();
   const navigate = useNavigate();
 
-  // system-state is the canonical projection. Keep the legacy endpoint as a
-  // fallback while older control servers are being rolled out.
-  if (systemState) {
-    const items = Array.from(
-      new Map(
-        systemState.items
-          .filter((item) => item.severity !== "ok")
-          .map((item) => [item.dedupe_key || item.state_id, item]),
-      ).values(),
-    );
-    const errorCount = items.filter((item) => item.severity === "error" || item.severity === "blocked").length;
-    const warningCount = items.filter((item) => item.severity === "warning").length;
-    const attention = items.length;
+  if (isError) return <DegradedBadge />;
+  if (isLoading || !systemState) return null;
 
-    return (
-      <>
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={() => setOpen(true)}
-          title="System state"
-          data-testid="diagnostics-badge"
-          className="relative gap-1.5"
-        >
-          <ShieldAlert className={`h-4 w-4 ${errorCount > 0 ? "text-red-600" : warningCount > 0 ? "text-yellow-600" : "text-muted-foreground"}`} />
-          {attention > 0 && <span data-testid="diagnostics-badge-count" className={`text-xs font-semibold ${errorCount > 0 ? "text-red-600" : "text-yellow-600"}`}>{attention}</span>}
-        </Button>
-        <Dialog open={open} onOpenChange={setOpen}>
-          <DialogHeader><DialogTitle>System State</DialogTitle></DialogHeader>
-          <div className="space-y-3">
-            {items.length === 0 ? <p className="text-sm text-muted-foreground">対応が必要な状態はありません。</p> : items.map((item) => {
-              // Items projected from system_diagnostics whose underlying check has
-              // fix_kind "dialog" (env-var fixes) carry target_ui === null because
-              // those checks have no fix_page. Fall back to the diagnostic check
-              // (via related_checks[0]) so those items still get an action that
-              // opens the env fix dialog, matching the legacy badge's behavior.
-              const relatedCheck =
-                !item.target_ui && item.source === "system_diagnostics"
-                  ? data?.checks.find((c) => c.check_id === item.related_checks[0])
-                  : undefined;
-              return (
-                <div key={item.dedupe_key || item.state_id} className="flex items-start justify-between gap-3 rounded-lg border p-3" data-testid={`system-state-item-${item.state_id}`}>
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2"><DiagnosticSeverityIcon severity={item.severity} /><p className="text-sm font-medium">{item.summary}</p></div>
-                    {item.remediation && <p className="mt-1 text-xs text-muted-foreground">{item.remediation}</p>}
-                  </div>
-                  {item.target_ui && <Button size="sm" onClick={() => {
-                    const target = systemStateTarget(item);
-                    setOpen(false);
-                    if (target) navigate(target);
-                  }}>{item.target_ui.action_label || "対応する"}</Button>}
-                  {!item.target_ui && relatedCheck && <Button size="sm" onClick={() => {
-                    setOpen(false);
-                    activate(relatedCheck);
-                  }}>修正する</Button>}
-                </div>
-              );
-            })}
-          </div>
-        </Dialog>
-        <EnvFixDialog check={envCheck} onClose={closeEnv} />
-      </>
-    );
-  }
-
-  if (!data) return null;
-
-  const errorCount =
-    (data.severity_counts["error"] ?? 0) + (data.severity_counts["blocked"] ?? 0);
-  const warningCount = data.severity_counts["warning"] ?? 0;
-  const attention = errorCount + warningCount;
-
-  // Close the list dialog before routing or opening the env dialog so the two
-  // modals never stack.
-  const handleActivate = (check: SystemDiagnosticCheck) => {
-    setOpen(false);
-    activate(check);
-  };
+  // Issue #239: `items` is the unfiltered audit list, so the badge applies
+  // the same phase withdrawal rule the server already applies to
+  // notification_items/page_items — items of a phase after the current one
+  // must not appear on any notification surface (parent issue #235).
+  const items = Array.from(
+    new Map(
+      systemState.items
+        .filter((item) => item.severity !== "ok")
+        .filter((item) => isItemInCurrentPhaseScope(item, systemState.user_phase))
+        .map((item) => [item.dedupe_key || item.state_id, item]),
+    ).values(),
+  );
+  const errorCount = items.filter((item) => item.severity === "error" || item.severity === "blocked").length;
+  const warningCount = items.filter((item) => item.severity === "warning").length;
+  const attention = items.length;
 
   return (
     <>
@@ -412,35 +304,46 @@ export function DiagnosticsBadge() {
         variant="ghost"
         size="sm"
         onClick={() => setOpen(true)}
-        title="System settings diagnostics"
+        title="System state"
         data-testid="diagnostics-badge"
         className="relative gap-1.5"
       >
-        <ShieldAlert
-          className={`h-4 w-4 ${
-            errorCount > 0
-              ? "text-red-600"
-              : warningCount > 0
-                ? "text-yellow-600"
-                : "text-muted-foreground"
-          }`}
-        />
-        {attention > 0 && (
-          <span
-            data-testid="diagnostics-badge-count"
-            className={`text-xs font-semibold ${
-              errorCount > 0 ? "text-red-600" : "text-yellow-600"
-            }`}
-          >
-            {attention}
-          </span>
-        )}
+        <ShieldAlert className={`h-4 w-4 ${errorCount > 0 ? "text-red-600" : warningCount > 0 ? "text-yellow-600" : "text-muted-foreground"}`} />
+        {attention > 0 && <span data-testid="diagnostics-badge-count" className={`text-xs font-semibold ${errorCount > 0 ? "text-red-600" : "text-yellow-600"}`}>{attention}</span>}
       </Button>
       <Dialog open={open} onOpenChange={setOpen}>
-        <DialogHeader>
-          <DialogTitle>System Settings Diagnostics</DialogTitle>
-        </DialogHeader>
-        <DiagnosticsDialogContent checks={data.checks} onActivate={handleActivate} />
+        <DialogHeader><DialogTitle>System State</DialogTitle></DialogHeader>
+        <div className="space-y-3">
+          {items.length === 0 ? <p className="text-sm text-muted-foreground">対応が必要な状態はありません。</p> : items.map((item) => {
+            // Items projected from system_diagnostics whose underlying check has
+            // fix_kind "dialog" (env-var fixes) carry target_ui === null because
+            // those checks have no fix_page. Fall back to the diagnostic check
+            // (via related_checks[0], not as a data-source fallback for the
+            // badge itself) so those items still get an action that opens the
+            // env fix dialog.
+            const relatedCheck =
+              !item.target_ui && item.source === "system_diagnostics"
+                ? data?.checks.find((c) => c.check_id === item.related_checks[0])
+                : undefined;
+            return (
+              <div key={item.dedupe_key || item.state_id} className="flex items-start justify-between gap-3 rounded-lg border p-3" data-testid={`system-state-item-${item.state_id}`}>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2"><DiagnosticSeverityIcon severity={item.severity} /><p className="text-sm font-medium">{item.summary}</p></div>
+                  {item.remediation && <p className="mt-1 text-xs text-muted-foreground">{item.remediation}</p>}
+                </div>
+                {item.target_ui && <Button size="sm" onClick={() => {
+                  const target = systemStateTarget(item);
+                  setOpen(false);
+                  if (target) navigate(target);
+                }}>{item.target_ui.action_label || "対応する"}</Button>}
+                {!item.target_ui && relatedCheck && <Button size="sm" onClick={() => {
+                  setOpen(false);
+                  activate(relatedCheck);
+                }}>修正する</Button>}
+              </div>
+            );
+          })}
+        </div>
       </Dialog>
       <EnvFixDialog check={envCheck} onClose={closeEnv} />
     </>

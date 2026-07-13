@@ -1174,10 +1174,11 @@ def _undecided_experiments_item(undecided_completed_experiment_count: int) -> Op
 
 # --- probe plan review / patch state items (Issue #238) --------------------
 #
-# Absorb the two probe-plan-shaped NextAction sources
-# system_understanding_service._build_next_actions generates from
-# _load_pending_plan_action_ids: "Review probe plan" (proposed_plan_ids) and
-# "Generate / validate probe patch" (approved_plan_ids_without_validated_patch).
+# Absorb the two probe-plan-shaped NextAction sources the now-removed (Issue
+# #239) system_understanding_service._build_next_actions used to generate
+# from _load_pending_plan_action_ids: "Review probe plan" (proposed_plan_ids)
+# and "Generate / validate probe patch"
+# (approved_plan_ids_without_validated_patch).
 # Both are aggregate/count-based (one item per condition, not one per plan
 # id) to match this module's existing style for proposal-group items
 # (_undecided_experiments_item above), rather than exploding into an

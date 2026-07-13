@@ -3011,7 +3011,6 @@ describe("System Understanding page", () => {
     gaps: [],
     gap_summary: [],
     metadata_coverage: null,
-    next_actions: [{ action: "Configure repository", reason: "No repository configured", category: "understand", link: "/repository" }],
   };
 
   const gapWorklistResponse = {
@@ -3071,12 +3070,6 @@ describe("System Understanding page", () => {
       { gap_type: "docs_only", count: 1 },
     ],
     metadata_coverage: { symbol_count: 42, symbols_with_source_metadata: 5, entrypoint_count: 10, entrypoints_with_capability_link: 3 },
-    next_actions: [
-      { action: "Review docs-code gaps", reason: "2 gaps found", category: "understand", link: "/system-understanding" },
-      { action: "Review probe plan", reason: "Probe plan #7 is awaiting review", category: "observe", link: "/probe-planner?plan=7" },
-      { action: "Generate / validate probe patch", reason: "Approved probe plan #8 has no validated patch yet", category: "instrument", link: "/probe-planner?plan=8" },
-      { action: "Review experiment decision", reason: "Experiment #9 completed but has no recorded decision", category: "evaluate", link: "/experiments" },
-    ],
   };
 
   const completeResponse = {
@@ -3106,7 +3099,6 @@ describe("System Understanding page", () => {
     gaps: [],
     gap_summary: [],
     metadata_coverage: { symbol_count: 42, symbols_with_source_metadata: 5, entrypoint_count: 10, entrypoints_with_capability_link: 3 },
-    next_actions: [],
   };
 
   const blockedResponse = {
@@ -3122,9 +3114,6 @@ describe("System Understanding page", () => {
       { step: "entrypoints_discovered", status: "complete" },
       { step: "docs_code_reconciled", status: "missing" },
       { step: "capability_hierarchy_ready", status: "missing", detail: "Reasoning model required" },
-    ],
-    next_actions: [
-      { action: "Configure reasoning model", reason: "Required for documentation and capability analysis", category: "understand", link: null },
     ],
   };
 
@@ -3357,10 +3346,24 @@ describe("System Understanding page", () => {
     expect(screen.getByText("Open docs evidence")).toBeTruthy();
   });
 
-  test("renders category badges for probe plan and experiment next actions", async () => {
+  test("ignores legacy next-step fields from an old server response (Issue #239 removal contract)", async () => {
+    // A response that still carries the removed fields (e.g. an older
+    // Control Server): the UI must not resurrect any of the legacy
+    // projections from them -- no per-stage Next Actions list, no
+    // primary-action card, no refresh-recommended banner. The canonical
+    // next-step surface is the SystemStateBanner fed by /system-state,
+    // which is absent here, so no next-step CTA of any kind renders.
+    const legacyResponse = {
+      ...gapWorklistResponse,
+      next_actions: [
+        { action: "Review probe plan", reason: "Probe plan #7 is awaiting review", category: "observe", link: "/probe-planner?plan=7" },
+      ],
+      primary_action: { action: "Review probe plan", reason: "…", category: "observe", link: "/probe-planner?plan=7" },
+      understanding_refresh_recommended: true,
+    };
     mockApi.get.mockImplementation((path: string) =>
       path === "/repository/system-understanding"
-        ? Promise.resolve(gapWorklistResponse)
+        ? Promise.resolve(legacyResponse)
         : Promise.resolve(null),
     );
 
@@ -3368,16 +3371,14 @@ describe("System Understanding page", () => {
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
 
     await waitFor(() => {
-      expect(screen.getByText("Review probe plan")).toBeTruthy();
+      expect(screen.getByTestId("stage-section-understand")).toBeTruthy();
     });
 
-    expect(screen.getByText("Generate / validate probe patch")).toBeTruthy();
-    expect(screen.getByText("Review experiment decision")).toBeTruthy();
-
-    // Issue #179: Next Actions are grouped under their stage section by category.
-    expect(screen.getByTestId("stage-next-actions-observe").textContent).toContain("observe");
-    expect(screen.getByTestId("stage-next-actions-instrument").textContent).toContain("instrument");
-    expect(screen.getByTestId("stage-next-actions-evaluate").textContent).toContain("evaluate");
+    expect(screen.queryByText("Review probe plan")).toBeNull();
+    expect(screen.queryByTestId("stage-next-actions-observe")).toBeNull();
+    expect(screen.queryByTestId("primary-action")).toBeNull();
+    expect(screen.queryByTestId("refresh-recommended-banner")).toBeNull();
+    expect(screen.queryByTestId("system-state-banner")).toBeNull();
   });
 
   test("renders the 4 hub stage sections with links to detail pages (Issue #179)", async () => {
@@ -3715,71 +3716,99 @@ describe("System Understanding page", () => {
     expect(screen.getByText("Open issue draft")).toBeTruthy();
   });
 
-  // ── Primary action card (Issue #201) ──────────────────────────────
+  // ── Canonical page banner replaces the primary action card (Issue #239) ──
 
-  test("renders a navigate primary_action as a link button under the header", async () => {
-    const response = {
-      ...completeResponse,
-      next_actions: [
-        { action: "Define System Purpose", reason: "Pipeline completed, but no system purpose is defined yet.", category: "understand", link: "/interview" },
-      ],
-      primary_action: {
-        action: "Define System Purpose",
-        reason: "Pipeline completed, but no system purpose is defined yet.",
-        category: "understand",
-        link: "/interview",
-        action_kind: "navigate",
-      },
-    };
-    mockApi.get.mockImplementation((path: string) =>
-      path === "/repository/system-understanding"
-        ? Promise.resolve(response)
-        : Promise.resolve(null),
-    );
+  const purposeMissingItem: SystemStateItem = {
+    state_id: "understanding.purpose.missing_baseline",
+    state_group: "understanding",
+    severity: "warning",
+    status: "missing",
+    user_action_kind: "confirm",
+    intervention_timing: "before_next_step",
+    subject: "System Purpose",
+    summary: "System Purpose が未定義です。",
+    detail: "System Purpose が未定義です。確認済み・未確認いずれの baseline もありません。",
+    impact: "",
+    remediation: "Interview で System Purpose を定義・確認してください。",
+    evidence: {},
+    target_ui: { route: "/interview", anchor: "interview-purpose", action_label: "Interview でSystem Purposeを定義" },
+    display_routes: ["/system-understanding"],
+    related_checks: ["system_purpose"],
+    related_pipeline_steps: [],
+    source: "system_state",
+    dedupe_key: "",
+    scope: "global",
+    decision_method: "deterministic",
+    phase: "preparation",
+  };
+
+  test("renders a navigate-kind page item as the canonical banner with its server target", async () => {
+    window.history.pushState({}, "", "/system-understanding");
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(completeResponse);
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "warning",
+        severity_counts: { warning: 1 }, items: [purposeMissingItem],
+        primary_item: purposeMissingItem, notification_items: [purposeMissingItem],
+        page_items: { "/system-understanding": [purposeMissingItem], "/interview": [purposeMissingItem] },
+        user_phase: "preparation",
+        phases: [
+          { phase: "setup", complete: true },
+          { phase: "preparation", complete: false },
+          { phase: "diagnosis", complete: false },
+        ],
+      });
+      return Promise.resolve(null);
+    });
 
     const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
 
-    await waitFor(() => {
-      expect(screen.getByTestId("primary-action")).toBeTruthy();
-    });
+    const banner = await screen.findByTestId("system-state-banner");
+    expect(banner.textContent).toContain(purposeMissingItem.summary);
+    expect(banner.textContent).toContain(purposeMissingItem.remediation);
 
-    const card = screen.getByTestId("primary-action");
-    expect(card.textContent).toContain("Define System Purpose");
-    expect(card.textContent).toContain("Pipeline completed, but no system purpose is defined yet.");
-
-    const cta = screen.getByTestId("primary-action-cta");
-    expect(cta.getAttribute("href")).toBe("/interview");
+    const cta = screen.getByTestId("system-state-action-understanding.purpose.missing_baseline");
+    expect(cta.textContent).toBe("Interview でSystem Purposeを定義");
+    fireEvent.click(cta);
+    await waitFor(() => expect(window.location.pathname).toBe("/interview"));
+    const params = new URLSearchParams(window.location.search);
+    expect(params.get("fix")).toBe("interview-purpose");
+    expect(params.get("diagnostic")).toBe("system_purpose");
   });
 
-  test("renders a build primary_action that triggers build.mutate on click", async () => {
-    const midResponse = {
-      ...emptyResponse,
-      snapshot_id: 5,
-      commit_sha: "abc12345",
-      pipeline: [
-        { step: "repository_configured", status: "complete" },
-        { step: "snapshot_ready", status: "complete" },
-        { step: "documentation_indexed", status: "missing" },
-        { step: "documentation_claims_scanned", status: "missing" },
-        { step: "symbols_indexed", status: "missing" },
-        { step: "entrypoints_discovered", status: "missing" },
-        { step: "docs_code_reconciled", status: "missing" },
-        { step: "capability_hierarchy_ready", status: "missing" },
-      ],
-      primary_action: {
-        action: "Build system understanding",
-        reason: "6 pipeline steps not complete yet",
-        category: "understand",
-        link: null,
-        action_kind: "build",
-      },
+  test("a build-kind page item's banner action triggers build.mutate", async () => {
+    const rebuildItem: SystemStateItem = {
+      state_id: "interview.materialized.rebuild_required",
+      state_group: "interview",
+      severity: "warning",
+      status: "stale",
+      user_action_kind: "build",
+      intervention_timing: "after_build",
+      subject: "Interview materialization",
+      summary: "Interview の反映後に System Understanding の再 build が必要です。",
+      detail: "最新の Interview materialization が直近の完了済み build より新しいため、理解結果を更新する必要があります。",
+      impact: "",
+      remediation: "System Understanding で Build / Refresh を実行してください。",
+      evidence: {},
+      target_ui: { route: "/system-understanding", anchor: "build", action_label: "Build / Refresh を実行" },
+      related_checks: [],
+      related_pipeline_steps: ["capability_hierarchy_ready"],
+      source: "system_state",
+      dedupe_key: "interview.materialization.build",
+      scope: "global",
+      decision_method: "deterministic",
+      phase: "preparation",
     };
-    mockApi.get.mockImplementation((path: string) =>
-      path === "/repository/system-understanding"
-        ? Promise.resolve(midResponse)
-        : Promise.resolve(null),
-    );
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(completeResponse);
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "warning",
+        severity_counts: { warning: 1 }, items: [rebuildItem], primary_item: rebuildItem,
+        notification_items: [rebuildItem], page_items: { "/system-understanding": [rebuildItem] },
+      });
+      return Promise.resolve(null);
+    });
     mockApi.post.mockImplementation((path: string) =>
       path === "/repository/system-understanding/build"
         ? Promise.resolve(completeResponse)
@@ -3789,12 +3818,8 @@ describe("System Understanding page", () => {
     const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
 
-    await waitFor(() => {
-      expect(screen.getByTestId("primary-action")).toBeTruthy();
-    });
-
-    const cta = screen.getByTestId("primary-action-cta");
-    expect(cta.textContent).toContain("Build system understanding");
+    const cta = await screen.findByTestId("system-state-action-interview.materialized.rebuild_required");
+    expect(cta.textContent).toBe("Build / Refresh を実行");
 
     fireEvent.click(cta);
     await waitFor(() => {
@@ -3802,13 +3827,16 @@ describe("System Understanding page", () => {
     });
   });
 
-  test("hides the primary action card when primary_action is null", async () => {
-    const response = { ...completeResponse, primary_action: null };
-    mockApi.get.mockImplementation((path: string) =>
-      path === "/repository/system-understanding"
-        ? Promise.resolve(response)
-        : Promise.resolve(null),
-    );
+  test("shows no banner when system-state has no item for this page", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(completeResponse);
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "ok",
+        severity_counts: {}, items: [], primary_item: null,
+        notification_items: [], page_items: {},
+      });
+      return Promise.resolve(null);
+    });
 
     const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
@@ -3817,6 +3845,7 @@ describe("System Understanding page", () => {
       expect(screen.getByText("Test System")).toBeTruthy();
     });
 
+    expect(screen.queryByTestId("system-state-banner")).toBeNull();
     expect(screen.queryByTestId("primary-action")).toBeNull();
   });
 
@@ -3964,45 +3993,33 @@ describe("System Understanding page", () => {
     );
   });
 
-  // ── Gap trend + refresh recommendation (Issue #203) ─────────────────
+  // ── Banner behavior while a build is running (Issue #239) ───────────
+  //
+  // The removed primary_action's rule 2 blanked the CTA whenever a build was
+  // queued/running, unconditionally. The new frontend condition suppresses
+  // only warning/info-level page items while the BuildJobPanel is showing
+  // progress; error/blocked items always stay visible.
 
-  test("shows the refresh-recommended banner when understanding_refresh_recommended is true", async () => {
-    const response = { ...completeResponse, understanding_refresh_recommended: true };
-    mockApi.get.mockImplementation((path: string) =>
-      path === "/repository/system-understanding"
-        ? Promise.resolve(response)
-        : Promise.resolve(null),
-    );
+  const runningBuildResponse = {
+    id: 1, job_id: 1, run_id: 1, system_id: 1, snapshot_id: 5,
+    status: "running", current_step: "claim_scan", error: null,
+    cancel_requested: false, is_stuck: false,
+    heartbeat_at: Date.now() / 1000, started_at: Date.now() / 1000,
+    completed_at: null, created_at: Date.now() / 1000,
+    steps: [], llm_tasks: { total: 0, pending: 0, running: 0, completed: 0, failed: 0, cancelled: 0, reused: 0 },
+    artifact_counts: {},
+  };
 
-    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
-    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
-
-    await waitFor(() => {
-      expect(screen.getByTestId("refresh-recommended-banner")).toBeTruthy();
-    });
-
-    const cta = screen.getByTestId("refresh-recommended-cta");
-    fireEvent.click(cta);
-    await waitFor(() => {
-      expect(mockApi.post).toHaveBeenCalledWith("/repository/system-understanding/build");
-    });
-  });
-
-  test("hides the refresh-recommended banner while a build is running, even if recommended", async () => {
-    const response = { ...completeResponse, understanding_refresh_recommended: true };
+  test("suppresses a warning-level page banner while a build is running", async () => {
     mockApi.get.mockImplementation((path: string) => {
-      if (path === "/repository/system-understanding") return Promise.resolve(response);
-      if (path === "/repository/system-understanding/build/latest") {
-        return Promise.resolve({
-          id: 1, job_id: 1, run_id: 1, system_id: 1, snapshot_id: 5,
-          status: "running", current_step: "claim_scan", error: null,
-          cancel_requested: false, is_stuck: false,
-          heartbeat_at: Date.now() / 1000, started_at: Date.now() / 1000,
-          completed_at: null, created_at: Date.now() / 1000,
-          steps: [], llm_tasks: { total: 0, pending: 0, running: 0, completed: 0, failed: 0, cancelled: 0, reused: 0 },
-          artifact_counts: {},
-        });
-      }
+      if (path === "/repository/system-understanding") return Promise.resolve(completeResponse);
+      if (path === "/repository/system-understanding/build/latest") return Promise.resolve(runningBuildResponse);
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "warning",
+        severity_counts: { warning: 1 }, items: [purposeMissingItem],
+        primary_item: purposeMissingItem, notification_items: [purposeMissingItem],
+        page_items: { "/system-understanding": [purposeMissingItem] },
+      });
       return Promise.resolve(null);
     });
 
@@ -4013,31 +4030,49 @@ describe("System Understanding page", () => {
       expect(screen.getByTestId("build-progress")).toBeTruthy();
     });
 
-    expect(screen.queryByTestId("refresh-recommended-banner")).toBeNull();
+    expect(screen.queryByTestId("system-state-banner")).toBeNull();
   });
 
-  test("does not show the refresh-recommended banner when understanding_refresh_recommended is false", async () => {
-    const response = { ...completeResponse, understanding_refresh_recommended: false };
-    mockApi.get.mockImplementation((path: string) =>
-      path === "/repository/system-understanding"
-        ? Promise.resolve(response)
-        : Promise.resolve(null),
-    );
+  test("keeps an error-level page banner visible while a build is running", async () => {
+    const errorItem: SystemStateItem = {
+      ...purposeMissingItem,
+      state_id: "repository.head.unreadable",
+      state_group: "repository",
+      severity: "error",
+      status: "failed",
+      user_action_kind: "configure",
+      summary: "Repository HEAD を読み取れません。",
+      remediation: "Repository のパスとアクセス権を確認してください。",
+      target_ui: { route: "/repository", anchor: "repo-config", action_label: "Repository 設定を確認" },
+      related_checks: ["repository_path"],
+      dedupe_key: "repository.head",
+      phase: "setup",
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(completeResponse);
+      if (path === "/repository/system-understanding/build/latest") return Promise.resolve(runningBuildResponse);
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "error",
+        severity_counts: { error: 1 }, items: [errorItem],
+        primary_item: errorItem, notification_items: [errorItem],
+        page_items: { "/system-understanding": [errorItem] },
+      });
+      return Promise.resolve(null);
+    });
 
     const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
 
     await waitFor(() => {
-      expect(screen.getByText("Test System")).toBeTruthy();
+      expect(screen.getByTestId("build-progress")).toBeTruthy();
     });
 
-    expect(screen.queryByTestId("refresh-recommended-banner")).toBeNull();
+    expect(screen.getByTestId("system-state-banner").textContent).toContain(errorItem.summary);
   });
 
-  // ── Canonical banner de-duplication (Issues #206-#208 review) ───────
+  // ── Canonical banner is the only rebuild-required surface (Issue #239) ──
 
-  test("suppresses the legacy refresh-recommended banner when the canonical SystemStateBanner shows the same rebuild-required cause", async () => {
-    const response = { ...completeResponse, understanding_refresh_recommended: true };
+  test("renders the rebuild-required cause once, via the canonical SystemStateBanner only", async () => {
     const rebuildItem: SystemStateItem = {
       state_id: "interview.materialized.rebuild_required",
       state_group: "interview",
@@ -4060,7 +4095,7 @@ describe("System Understanding page", () => {
       decision_method: "deterministic",
     };
     mockApi.get.mockImplementation((path: string) => {
-      if (path === "/repository/system-understanding") return Promise.resolve(response);
+      if (path === "/repository/system-understanding") return Promise.resolve(completeResponse);
       if (path === "/system-state") return Promise.resolve({
         system_id: 1, generated_at: 1, overall_severity: "warning",
         severity_counts: { warning: 1 }, items: [rebuildItem], primary_item: rebuildItem,
@@ -4072,35 +4107,16 @@ describe("System Understanding page", () => {
     const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
 
-    // The canonical banner renders the same root cause...
+    // The canonical banner renders the root cause...
     await waitFor(() => {
       expect(screen.getByTestId("system-state-banner")).toBeTruthy();
     });
     expect(screen.getByTestId("system-state-banner").textContent).toContain(rebuildItem.summary);
 
-    // ...and the legacy Issue #203 banner is suppressed so the cause is not duplicated.
+    // ...exactly once: the legacy Issue #203 banner no longer exists at all
+    // (Issue #239 removed it with the understanding_refresh_recommended field).
     expect(screen.queryByTestId("refresh-recommended-banner")).toBeNull();
-  });
-
-  test("still shows the legacy refresh-recommended banner when system-state has no matching rebuild-required item for this page", async () => {
-    const response = { ...completeResponse, understanding_refresh_recommended: true };
-    mockApi.get.mockImplementation((path: string) => {
-      if (path === "/repository/system-understanding") return Promise.resolve(response);
-      if (path === "/system-state") return Promise.resolve({
-        system_id: 1, generated_at: 1, overall_severity: "ok",
-        severity_counts: {}, items: [], primary_item: null,
-        notification_items: [], page_items: {},
-      });
-      return Promise.resolve(null);
-    });
-
-    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
-    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
-
-    await waitFor(() => {
-      expect(screen.getByTestId("refresh-recommended-banner")).toBeTruthy();
-    });
-    expect(screen.queryByTestId("system-state-banner")).toBeNull();
+    expect(screen.getAllByText(rebuildItem.summary)).toHaveLength(1);
   });
 
   test("shows the capability-empty canonical guidance on System Understanding and keeps its Interview CTA", async () => {
@@ -4492,47 +4508,169 @@ describe("System settings diagnostics", () => {
     ],
   };
 
-  test("badge shows attention count and opens detail dialog with remediation and last error", async () => {
-    mockApi.get.mockImplementation((path: string) =>
-      path === "/system-diagnostics"
-        ? Promise.resolve(diagnosticsResponse)
-        : Promise.resolve(null),
-    );
+  // Issue #239: the badge consumes GET /system-state only. Diagnostic checks
+  // reach it as server-projected `diagnostic.<check_id>` StateItems; the
+  // `/system-diagnostics` response is consulted solely to open the env-fix
+  // dialog for a dialog-kind check referenced by `related_checks`.
+
+  const projectedStateItem = (
+    overrides: Partial<SystemStateItem> & Pick<SystemStateItem, "state_id" | "severity" | "summary">,
+  ): SystemStateItem => ({
+    state_group: "configuration",
+    status: "missing",
+    user_action_kind: "inspect",
+    intervention_timing: "before_next_step",
+    subject: overrides.summary,
+    detail: overrides.summary,
+    impact: "",
+    remediation: "",
+    evidence: {},
+    target_ui: null,
+    related_checks: [],
+    related_pipeline_steps: [],
+    source: "system_diagnostics",
+    dedupe_key: `diagnostic.${overrides.state_id}`,
+    scope: "global",
+    decision_method: "deterministic",
+    ...overrides,
+  });
+
+  const llmItem = projectedStateItem({
+    state_id: "diagnostic.intelligence_llm_config",
+    severity: "error",
+    summary: "Intelligence reasoning model configuration",
+    remediation: "Set INTELLIGENCE_LLM_PROVIDER and INTELLIGENCE_LLM_MODEL to a reasoning-capable pair.",
+    user_action_kind: "configure",
+    related_checks: ["intelligence_llm_config"],
+    dedupe_key: "diagnostic.intelligence_llm_config",
+  });
+  const snapshotItem = projectedStateItem({
+    state_id: "diagnostic.snapshot_status",
+    severity: "warning",
+    summary: "Ready repository snapshot",
+    remediation: "Review the include/exclude patterns in the Repository tab.",
+    target_ui: { route: "/repository", anchor: "repo-patterns", action_label: "「Ready repository snapshot」を修正" },
+    related_checks: ["snapshot_status"],
+    dedupe_key: "diagnostic.snapshot_status",
+  });
+  const docIndexItem = projectedStateItem({
+    state_id: "diagnostic.pipeline_documentation_index",
+    severity: "warning",
+    summary: "Documentation index build step",
+    remediation: "Run Build / Refresh in System Understanding to index documentation chunks.",
+    target_ui: { route: "/system-understanding", anchor: "build", action_label: "「Documentation index build step」を修正" },
+    related_checks: ["pipeline_documentation_index"],
+    dedupe_key: "diagnostic.pipeline_documentation_index",
+  });
+
+  const stateResponse = (items: SystemStateItem[]) => ({
+    system_id: 1,
+    generated_at: 1,
+    overall_severity: items.some((i) => i.severity === "error") ? "error"
+      : items.some((i) => i.severity === "warning") ? "warning" : "ok",
+    severity_counts: {},
+    items,
+    primary_item: items[0] ?? null,
+    notification_items: items.filter((i) => i.severity !== "ok"),
+    page_items: {},
+  });
+
+  test("badge shows attention count from system-state items and opens the item dialog", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-state") return Promise.resolve(stateResponse([llmItem, snapshotItem, docIndexItem]));
+      if (path === "/system-diagnostics") return Promise.resolve(diagnosticsResponse);
+      return Promise.resolve(null);
+    });
 
     const { DiagnosticsBadge } = await import("@/components/diagnostics-badge");
     render(<DiagnosticsBadge />, { wrapper: createWrapper() });
 
     const badge = await screen.findByTestId("diagnostics-badge");
-    // error(1) + warning(2) = 3
+    // error(1) + warning(2) = 3 deduped non-ok items
     expect(screen.getByTestId("diagnostics-badge-count").textContent).toBe("3");
 
     fireEvent.click(badge);
 
     await waitFor(() => {
-      expect(screen.getByText("System Settings Diagnostics")).toBeTruthy();
+      expect(screen.getByText("System State")).toBeTruthy();
     });
 
-    // Problems are listed with detail, impact, remediation, related env.
-    expect(screen.getByText(/INTELLIGENCE_LLM_PROVIDER is empty/)).toBeTruthy();
+    // Items render the server's summary and remediation verbatim.
+    expect(screen.getByText("Intelligence reasoning model configuration")).toBeTruthy();
     expect(
       screen.getByText(/Set INTELLIGENCE_LLM_PROVIDER and INTELLIGENCE_LLM_MODEL/),
     ).toBeTruthy();
-    // Last observed runtime failure is shown verbatim.
-    const lastError = screen.getByTestId("diagnostic-last-error");
-    expect(lastError.textContent).toContain("HTTP 401: invalid api key");
-    expect(lastError.textContent).toContain("intelligence_runs#12:repository_drafts");
-    // Passing checks are still visible as passing.
-    expect(screen.getByText("正常なチェック")).toBeTruthy();
-    expect(screen.getByText("Database storage")).toBeTruthy();
+    expect(screen.getByTestId("system-state-item-diagnostic.snapshot_status")).toBeTruthy();
   });
 
-  test("clicking a navigate check routes to its fix page with focus params", async () => {
-    window.history.pushState({}, "", "/");
+  test("badge dedupes items sharing a dedupe_key in its count", async () => {
+    const duplicate = { ...snapshotItem, state_id: "snapshot.ready.missing" };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-state") return Promise.resolve(stateResponse([snapshotItem, duplicate]));
+      return Promise.resolve(null);
+    });
+
+    const { DiagnosticsBadge } = await import("@/components/diagnostics-badge");
+    render(<DiagnosticsBadge />, { wrapper: createWrapper() });
+
+    await screen.findByTestId("diagnostics-badge");
+    expect(screen.getByTestId("diagnostics-badge-count").textContent).toBe("1");
+  });
+
+  test("badge suppresses items of a phase after the current user_phase (Issue #239)", async () => {
+    // `items` is the server's unfiltered audit list, so the badge applies
+    // the same phase withdrawal rule the server applies to
+    // notification_items/page_items: a setup-phase user must not see a
+    // diagnosis-phase warning in the badge, but the same item counts once
+    // the user reaches diagnosis.
+    const setupItem = { ...snapshotItem, phase: "setup" as const };
+    const diagnosisItem = projectedStateItem({
+      state_id: "proposal.experiments.undecided",
+      severity: "warning",
+      summary: "評価待ちの experiment があります。",
+      remediation: "Experiments でレビューしてください。",
+      target_ui: { route: "/experiments", anchor: null, action_label: "Experiments でレビュー" },
+      related_checks: [],
+      dedupe_key: "proposal.experiments.undecided",
+    });
+    diagnosisItem.phase = "diagnosis";
+    const scoped = (userPhase: "setup" | "diagnosis") => ({
+      ...stateResponse([setupItem, diagnosisItem]),
+      user_phase: userPhase,
+      phases: [
+        { phase: "setup", complete: userPhase !== "setup" },
+        { phase: "preparation", complete: userPhase === "diagnosis" },
+        { phase: "diagnosis", complete: false },
+      ],
+    });
+
     mockApi.get.mockImplementation((path: string) =>
-      path === "/system-diagnostics"
-        ? Promise.resolve(diagnosticsResponse)
-        : Promise.resolve(null),
+      path === "/system-state" ? Promise.resolve(scoped("setup")) : Promise.resolve(null),
     );
+    const { DiagnosticsBadge } = await import("@/components/diagnostics-badge");
+    const first = render(<DiagnosticsBadge />, { wrapper: createWrapper() });
+    await screen.findByTestId("diagnostics-badge");
+    // Only the setup-phase item is counted while user_phase is "setup".
+    expect(screen.getByTestId("diagnostics-badge-count").textContent).toBe("1");
+    first.unmount();
+
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-state" ? Promise.resolve(scoped("diagnosis")) : Promise.resolve(null),
+    );
+    render(<DiagnosticsBadge />, { wrapper: createWrapper() });
+    await screen.findByTestId("diagnostics-badge");
+    await waitFor(() => {
+      expect(screen.getByTestId("diagnostics-badge-count").textContent).toBe("2");
+    });
+  });
+
+  test("clicking a navigate-kind item routes to its fix page with focus params", async () => {
+    window.history.pushState({}, "", "/");
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-state") return Promise.resolve(stateResponse([snapshotItem]));
+      if (path === "/system-diagnostics") return Promise.resolve(diagnosticsResponse);
+      return Promise.resolve(null);
+    });
 
     const { DiagnosticsBadge } = await import("@/components/diagnostics-badge");
     render(<DiagnosticsBadge />, { wrapper: createWrapper() });
@@ -4540,9 +4678,8 @@ describe("System settings diagnostics", () => {
     const badge = await screen.findByTestId("diagnostics-badge");
     fireEvent.click(badge);
 
-    // snapshot_status is a navigate check → click its card.
-    const snapshotDetail = await screen.findByText(/0 indexed files/);
-    fireEvent.click(snapshotDetail);
+    const item = await screen.findByTestId("system-state-item-diagnostic.snapshot_status");
+    fireEvent.click(within(item).getByRole("button"));
 
     await waitFor(() => {
       expect(window.location.pathname).toBe("/repository");
@@ -4552,13 +4689,13 @@ describe("System settings diagnostics", () => {
     expect(params.get("fix")).toBe("repo-patterns");
   });
 
-  test("clicking an env-only check opens a remediation dialog instead of navigating", async () => {
+  test("clicking an env-only item opens the remediation dialog instead of navigating", async () => {
     window.history.pushState({}, "", "/");
-    mockApi.get.mockImplementation((path: string) =>
-      path === "/system-diagnostics"
-        ? Promise.resolve(diagnosticsResponse)
-        : Promise.resolve(null),
-    );
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-state") return Promise.resolve(stateResponse([llmItem]));
+      if (path === "/system-diagnostics") return Promise.resolve(diagnosticsResponse);
+      return Promise.resolve(null);
+    });
 
     const { DiagnosticsBadge } = await import("@/components/diagnostics-badge");
     render(<DiagnosticsBadge />, { wrapper: createWrapper() });
@@ -4566,35 +4703,60 @@ describe("System settings diagnostics", () => {
     const badge = await screen.findByTestId("diagnostics-badge");
     fireEvent.click(badge);
 
-    // intelligence_llm_config is a dialog check → click its card.
-    const llmDetail = await screen.findByText(/INTELLIGENCE_LLM_PROVIDER is empty/);
-    fireEvent.click(llmDetail);
+    // intelligence_llm_config projects with target_ui null (dialog-kind fix);
+    // the badge opens the env-fix dialog from the related diagnostic check.
+    const item = await screen.findByTestId("system-state-item-diagnostic.intelligence_llm_config");
+    fireEvent.click(within(item).getByRole("button", { name: "修正する" }));
 
     const envDialog = await screen.findByTestId("diagnostic-env-dialog");
     expect(envDialog.textContent).toContain("設定が必要な環境変数");
     // Did not navigate away.
     expect(window.location.pathname).toBe("/");
     // The list dialog closed so the two modals don't stack.
-    expect(screen.queryByText("System Settings Diagnostics")).toBeNull();
+    expect(screen.queryByText("System State")).toBeNull();
   });
 
-  test("badge renders without count when everything is ok", async () => {
-    mockApi.get.mockImplementation((path: string) =>
-      path === "/system-diagnostics"
-        ? Promise.resolve({
-            ...diagnosticsResponse,
-            overall_severity: "ok",
-            severity_counts: { ok: 4, warning: 0, error: 0, blocked: 0, unknown: 0 },
-            checks: [diagnosticsResponse.checks[3]],
-          })
-        : Promise.resolve(null),
-    );
+  test("badge renders without count when no item needs attention", async () => {
+    const okItem = projectedStateItem({
+      state_id: "understanding.purpose.satisfied",
+      severity: "ok",
+      summary: "System Purpose は現在の snapshot で確認済みです。",
+      source: "system_state",
+      dedupe_key: "",
+    });
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-state") return Promise.resolve(stateResponse([okItem]));
+      return Promise.resolve(null);
+    });
 
     const { DiagnosticsBadge } = await import("@/components/diagnostics-badge");
     render(<DiagnosticsBadge />, { wrapper: createWrapper() });
 
     await screen.findByTestId("diagnostics-badge");
     expect(screen.queryByTestId("diagnostics-badge-count")).toBeNull();
+  });
+
+  test("badge shows a degraded error state when system-state cannot be loaded (Issue #239)", async () => {
+    // The removed system-diagnostics fallback must NOT resurrect: even with a
+    // perfectly healthy /system-diagnostics response available, a failed
+    // /system-state read renders the explicit degraded badge, never a count
+    // derived from another source.
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-state") return Promise.reject(new ApiError(500, "boom"));
+      if (path === "/system-diagnostics") return Promise.resolve(diagnosticsResponse);
+      return Promise.resolve(null);
+    });
+
+    const { DiagnosticsBadge } = await import("@/components/diagnostics-badge");
+    render(<DiagnosticsBadge />, { wrapper: createWrapper() });
+
+    const badge = await screen.findByTestId("diagnostics-badge");
+    expect(badge.getAttribute("data-state")).toBe("error");
+    expect(screen.getByTestId("diagnostics-badge-error")).toBeTruthy();
+    expect(screen.queryByTestId("diagnostics-badge-count")).toBeNull();
+
+    fireEvent.click(badge);
+    expect(await screen.findByTestId("diagnostics-badge-error-message")).toBeTruthy();
   });
 
   test("canonical StateItem keeps the same snapshot target in the badge and page banner", async () => {
@@ -5504,17 +5666,17 @@ describe("Hub success summary and pipeline collapse (Issue #211)", () => {
     gaps: [],
     gap_summary: [],
     metadata_coverage: { symbol_count: 42, symbols_with_source_metadata: 5, entrypoint_count: 10, entrypoints_with_capability_link: 3 },
-    next_actions: [],
-    primary_action: {
-      action: "Start from Capability", reason: "Everything is ready.",
-      category: "understand", link: "/capability-map", action_kind: "navigate",
-    },
   };
 
-  function mockSuApis(response: Record<string, unknown>, diagnostics?: Record<string, unknown>) {
+  function mockSuApis(
+    response: Record<string, unknown>,
+    diagnostics?: Record<string, unknown>,
+    systemState?: Record<string, unknown>,
+  ) {
     mockApi.get.mockImplementation((path: string) => {
       if (path === "/repository/system-understanding") return Promise.resolve(response);
       if (path === "/system-diagnostics") return Promise.resolve(diagnostics ?? null);
+      if (path === "/system-state") return Promise.resolve(systemState ?? null);
       return Promise.resolve(null);
     });
   }
@@ -5571,20 +5733,56 @@ describe("Hub success summary and pipeline collapse (Issue #211)", () => {
       ...allCompletePipeline.slice(0, 7),
       { step: "capability_hierarchy_ready", status: "warning", detail: "0 capabilities" },
     ],
-    primary_action: {
-      action: "Build system understanding", reason: "1 step incomplete",
-      category: "understand", link: null, action_kind: "build",
-    },
+  };
+
+  // Issue #239: the canonical capability-hierarchy-empty StateItem exactly as
+  // the server projects it into page_items — the checklist CTA consumes its
+  // action_label / target_ui verbatim (same source as the banner and badge).
+  const capabilityEmptyStateItem: SystemStateItem = {
+    state_id: "pipeline.capability_hierarchy.empty",
+    state_group: "pipeline",
+    severity: "warning",
+    status: "missing",
+    user_action_kind: "confirm",
+    intervention_timing: "before_next_step",
+    subject: "Capability 階層",
+    summary: "Capability 階層は実行済みですが capability が 0 件です。",
+    detail: "現在の snapshot に capability ノードが存在しません。",
+    impact: "Core Capabilities が未定義です。",
+    remediation: "Interview で Core Capabilities を確認してください。",
+    evidence: { capability_count: 0 },
+    target_ui: { route: "/interview", anchor: "interview-capabilities", action_label: "Interview で Core Capabilities を確認" },
+    display_routes: ["/system-understanding"],
+    related_checks: [],
+    related_pipeline_steps: ["capability_hierarchy_ready"],
+    source: "system_state",
+    dedupe_key: "",
+    scope: "global",
+    decision_method: "deterministic",
+    phase: "preparation",
   };
 
   test("incomplete pipeline keeps the checklist expanded without a success summary", async () => {
-    mockSuApis(incompleteCapabilityResponse, {
-      system_id: 1,
-      generated_at: 1750000000,
-      overall_severity: "warning",
-      severity_counts: { ok: 0, warning: 1, error: 0, blocked: 0, unknown: 0 },
-      checks: [capabilityEmptyCheck],
-    });
+    mockSuApis(
+      incompleteCapabilityResponse,
+      {
+        system_id: 1,
+        generated_at: 1750000000,
+        overall_severity: "warning",
+        severity_counts: { ok: 0, warning: 1, error: 0, blocked: 0, unknown: 0 },
+        checks: [capabilityEmptyCheck],
+      },
+      {
+        system_id: 1, generated_at: 1, overall_severity: "warning",
+        severity_counts: { warning: 1 }, items: [capabilityEmptyStateItem],
+        primary_item: capabilityEmptyStateItem,
+        notification_items: [capabilityEmptyStateItem],
+        page_items: {
+          "/system-understanding": [capabilityEmptyStateItem],
+          "/interview": [capabilityEmptyStateItem],
+        },
+      },
+    );
 
     const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
@@ -5592,15 +5790,18 @@ describe("Hub success summary and pipeline collapse (Issue #211)", () => {
     expect(await screen.findByTestId("pipeline-checklist")).toBeInTheDocument();
     expect(screen.queryByTestId("pipeline-collapsed")).not.toBeInTheDocument();
     expect(screen.queryByTestId("build-success-summary")).not.toBeInTheDocument();
+    // Issue #239: the CTA is the matching StateItem's action, verbatim — the
+    // same text and destination the banner/badge show for this root cause.
     const cta = await screen.findByTestId("pipeline-cta-capability_hierarchy_ready");
-    expect(cta).toHaveTextContent("Review interview proposals");
-    expect(cta).toHaveAttribute("href", "/interview");
+    expect(cta).toHaveTextContent("Interview で Core Capabilities を確認");
+    expect(cta).toHaveAttribute("href", "/interview?fix=interview-capabilities");
   });
 
-  test("interview CTA requires the structured diagnostic, not the detail text", async () => {
-    // Same pipeline detail text, but no pipeline_capability_hierarchy check
-    // pointing at /interview: the CTA falls back to the step's generic
-    // Build action instead of regex-guessing intent from the free text.
+  test("pipeline CTA falls back to the generic Build action when no StateItem names the step", async () => {
+    // Same pipeline detail text, but no matching StateItem in page_items:
+    // the CTA falls back to the fixed STEP_CTA map instead of guessing
+    // intent from the free-text detail (Issue #239; formerly the Interview
+    // CTA was derived from the structured diagnostic).
     mockSuApis(incompleteCapabilityResponse);
 
     const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
@@ -5617,6 +5818,207 @@ describe("Hub success summary and pipeline collapse (Issue #211)", () => {
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
 
     expect(await screen.findByTestId("entry-cards-prereq-note")).toBeInTheDocument();
+  });
+});
+
+// ── Notification surfaces consume one canonical StateItem (Issue #239) ──
+
+describe("Notification surface consistency (Issue #239)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const canonicalItem: SystemStateItem = {
+    state_id: "pipeline.capability_hierarchy.empty",
+    state_group: "pipeline",
+    severity: "warning",
+    status: "missing",
+    user_action_kind: "confirm",
+    intervention_timing: "before_next_step",
+    subject: "Capability 階層",
+    summary: "Capability 階層は実行済みですが capability が 0 件です。",
+    detail: "現在の snapshot に capability ノードが存在しません。",
+    impact: "Core Capabilities が未定義です。",
+    remediation: "Interview で Core Capabilities を確認してください。",
+    evidence: { capability_count: 0 },
+    target_ui: { route: "/interview", anchor: "interview-capabilities", action_label: "Interview で Core Capabilities を確認" },
+    display_routes: ["/system-understanding"],
+    related_checks: [],
+    related_pipeline_steps: ["capability_hierarchy_ready"],
+    source: "system_state",
+    dedupe_key: "",
+    scope: "global",
+    decision_method: "deterministic",
+    phase: "preparation",
+  };
+  const expectedTarget = "/interview?fix=interview-capabilities";
+
+  const stateResponse = {
+    system_id: 1, generated_at: 1, overall_severity: "warning",
+    severity_counts: { warning: 1 }, items: [canonicalItem],
+    primary_item: canonicalItem, notification_items: [canonicalItem],
+    page_items: {
+      "/system-understanding": [canonicalItem],
+      "/interview": [canonicalItem],
+    },
+  };
+
+  test("badge, page banner, and floating notice show the same summary and resolve the same target", async () => {
+    window.history.pushState({}, "", "/system-understanding");
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-state") return Promise.resolve(stateResponse);
+      return Promise.resolve(null);
+    });
+
+    const { DiagnosticsBadge } = await import("@/components/diagnostics-badge");
+    const { SystemStateBanner } = await import("@/components/system-state");
+    const { AssistantPanel } = await import("@/components/assistant-panel");
+    render(
+      <>
+        <DiagnosticsBadge />
+        <SystemStateBanner item={canonicalItem} />
+        <AssistantPanel focusedStateItem={canonicalItem} />
+      </>,
+      { wrapper: createWrapper() },
+    );
+
+    // Every surface renders the server's summary verbatim.
+    const banner = await screen.findByTestId("system-state-banner");
+    expect(banner.textContent).toContain(canonicalItem.summary);
+    expect(screen.getByTestId("assistant-snapshot-notice").textContent)
+      .toContain(canonicalItem.summary);
+    fireEvent.click(await screen.findByTestId("diagnostics-badge"));
+    const badgeItem = await screen.findByTestId(
+      `system-state-item-${canonicalItem.state_id}`,
+    );
+    expect(badgeItem.textContent).toContain(canonicalItem.summary);
+
+    // ...and every surface's action resolves to the same target URL.
+    fireEvent.click(within(badgeItem).getByRole("button", { name: canonicalItem.target_ui!.action_label }));
+    await waitFor(() => expect(window.location.pathname + window.location.search).toBe(expectedTarget));
+
+    window.history.pushState({}, "", "/system-understanding");
+    fireEvent.click(screen.getByTestId(`system-state-action-${canonicalItem.state_id}`));
+    await waitFor(() => expect(window.location.pathname + window.location.search).toBe(expectedTarget));
+
+    window.history.pushState({}, "", "/system-understanding");
+    fireEvent.click(screen.getByTestId("assistant-snapshot-notice"));
+    await waitFor(() => expect(window.location.pathname + window.location.search).toBe(expectedTarget));
+  });
+
+  test("pipeline checklist CTA resolves the same StateItem to the same target as the other surfaces", async () => {
+    window.history.pushState({}, "", "/system-understanding");
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-state") return Promise.resolve(stateResponse);
+      if (path === "/repository/system-understanding") return Promise.resolve({
+        system_id: 1, snapshot_id: 5, commit_sha: "abc12345def",
+        pipeline: [
+          { step: "repository_configured", status: "complete" },
+          { step: "snapshot_ready", status: "complete" },
+          { step: "documentation_indexed", status: "complete" },
+          { step: "documentation_claims_scanned", status: "complete" },
+          { step: "symbols_indexed", status: "complete" },
+          { step: "entrypoints_discovered", status: "complete" },
+          { step: "docs_code_reconciled", status: "complete" },
+          { step: "capability_hierarchy_ready", status: "warning", detail: "0 capabilities" },
+        ],
+        purpose: null, capabilities: [], entrypoints: [], major_symbols: [],
+        gaps: [], gap_summary: [], metadata_coverage: null,
+      });
+      return Promise.resolve(null);
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const cta = await screen.findByTestId("pipeline-cta-capability_hierarchy_ready");
+    expect(cta).toHaveTextContent(canonicalItem.target_ui!.action_label);
+    expect(cta).toHaveAttribute("href", expectedTarget);
+  });
+});
+
+// ── User phase indicator (Issue #239) ───────────────────────────────
+
+describe("User phase indicator (Issue #239)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const stateWithPhase = (userPhase: string, phases: { phase: string; complete: boolean }[]) => ({
+    system_id: 1, generated_at: 1, overall_severity: "ok",
+    severity_counts: {}, items: [], primary_item: null,
+    notification_items: [], page_items: {},
+    user_phase: userPhase, phases,
+  });
+
+  test("shows the current phase and per-phase completion from the server", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-state"
+        ? Promise.resolve(stateWithPhase("preparation", [
+            { phase: "setup", complete: true },
+            { phase: "preparation", complete: false },
+            { phase: "diagnosis", complete: false },
+          ]))
+        : Promise.resolve(null),
+    );
+
+    const { UserPhaseIndicator } = await import("@/components/system-state");
+    render(<UserPhaseIndicator />, { wrapper: createWrapper() });
+
+    const indicator = await screen.findByTestId("user-phase-indicator");
+    expect(indicator.getAttribute("data-current-phase")).toBe("preparation");
+
+    const setup = screen.getByTestId("user-phase-setup");
+    expect(setup.getAttribute("data-complete")).toBe("true");
+    expect(setup.getAttribute("data-current")).toBe("false");
+
+    const preparation = screen.getByTestId("user-phase-preparation");
+    expect(preparation.getAttribute("data-complete")).toBe("false");
+    expect(preparation.getAttribute("data-current")).toBe("true");
+
+    expect(screen.getByTestId("user-phase-diagnosis").getAttribute("data-current")).toBe("false");
+  });
+
+  test("display switches when the server-derived phase changes", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-state"
+        ? Promise.resolve(stateWithPhase("diagnosis", [
+            { phase: "setup", complete: true },
+            { phase: "preparation", complete: true },
+            { phase: "diagnosis", complete: false },
+          ]))
+        : Promise.resolve(null),
+    );
+
+    const { UserPhaseIndicator } = await import("@/components/system-state");
+    render(<UserPhaseIndicator />, { wrapper: createWrapper() });
+
+    const indicator = await screen.findByTestId("user-phase-indicator");
+    expect(indicator.getAttribute("data-current-phase")).toBe("diagnosis");
+    expect(screen.getByTestId("user-phase-preparation").getAttribute("data-complete")).toBe("true");
+    expect(screen.getByTestId("user-phase-diagnosis").getAttribute("data-current")).toBe("true");
+  });
+
+  test("renders nothing when the server does not provide a phase", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-state"
+        ? Promise.resolve({
+            system_id: 1, generated_at: 1, overall_severity: "ok",
+            severity_counts: {}, items: [], primary_item: null,
+            notification_items: [], page_items: {},
+          })
+        : Promise.resolve(null),
+    );
+
+    const { UserPhaseIndicator } = await import("@/components/system-state");
+    const { container } = render(<UserPhaseIndicator />, { wrapper: createWrapper() });
+
+    // Wait a tick for the query to settle, then assert nothing rendered.
+    await waitFor(() => expect(mockApi.get).toHaveBeenCalled());
+    expect(container.firstChild).toBeNull();
+    expect(screen.queryByTestId("user-phase-indicator")).toBeNull();
   });
 });
 

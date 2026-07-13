@@ -136,8 +136,19 @@ UI は表示しない。`PipelineChecklist`
 が常時表示され、配列先頭から見て最初の非 `complete` step にのみ「次の一歩」の
 CTA ボタンが付く。2 つ目以降の未完了 step には CTA を出さない。
 
-step → CTA の対応は固定マッピング（`STEP_CTA`、CLAUDE.md Principle 6 の範囲内）
-であり、推論やヒューリスティックではない:
+CTA の出所は Issue #239 で `GET /system-state` に統一された: 最初の非
+`complete` step に対応する `StateItem`（`related_pipeline_steps` がその
+step 名を含む項目。`page_items["/system-understanding"]` はサーバー側で
+優先度順・フェーズ抑制済み）の `target_ui` / `systemStateTarget()` を
+そのまま消費する。これによりバッジ・バナー・notice と同じ root cause が
+このページでだけ別文言・別遷移先になることがない。
+
+`STEP_CTA` の固定マッピング（Issue #200、CLAUDE.md Principle 6 の範囲内）
+は「対応する StateItem が無い step」の最終手段フォールバックとしてのみ
+残る（#239 時点で該当するのは repository 未設定時の
+`repository_configured` のみ — ネイティブ項目
+`repository.configuration.missing` は `related_pipeline_steps` を持たず、
+それを持つ診断投影は covered 済みとして抑制されるため）:
 
 | step | CTA | 遷移/操作 |
 | --- | --- | --- |
@@ -206,17 +217,26 @@ Capability Map の detail panel は
 `failed` の間も、context API は latest ready snapshot を基準にして、gaps /
 probe plans / experiments を同じ分析文脈で返す。
 
-## 状態通知の構成（現状 2 系統と統合方針）
+## 状態通知の構成（Issue #239 で system-state に統一済み）
 
-ユーザー向けの「次の一歩」表示は現在 2 系統が併存する（Issue #215 調査、
-`docs/ux-gap-analysis-system-understanding.md` §2.4）。
+かつてはユーザー向けの「次の一歩」表示が 2 系統併存していた（Issue #215
+調査、`docs/ux-gap-analysis-system-understanding.md` §2.4:
+`_derive_primary_action` → `primary_action` → `PrimaryActionCard` と、
+`select_primary_item` → `primary_item` → `SystemStateBanner`）。Issue #239
+で全通知面のデータソースは `GET /system-state` のみに統一され、面ごとの
+責務は次のとおり確定した:
 
-1. `system_understanding_service._derive_primary_action` →
-   `GET /system-understanding` の `primary_action` → Hub の
-   `PrimaryActionCard`（本ドキュメント「Primary Action (Issue #201)」節）
-2. `system_state.build_system_state` / `select_primary_item` →
-   `GET /system-state` の `primary_item` / `page_items` →
-  `SystemStateBanner` とヘッダーの `DiagnosticsBadge`
+| 通知面 | 消費する投影 |
+| --- | --- |
+| ページ内バナー（`SystemStateBanner`） | `page_items[currentRoute][0]`、なければ `primary_item`。System Understanding ではビルド実行中、severity が `error` / `blocked` 以外の項目を表示保留にする（BuildJobPanel が進捗を表示しているため。決定論的条件のみ） |
+| 右上バッジ（`DiagnosticsBadge`） | `items` の `severity != ok`（`dedupe_key` で重複排除、フェーズ抑制反映）。`system-diagnostics` 直接参照のフォールバックは撤去。診断詳細（EnvFixDialog）は `related_checks` 経由で該当 check を引く。`system-state` 取得失敗時は独自導出へ回帰せず、専用の縮退表示（`?` バッジ + エラーダイアログ）を出す |
+| 右下常駐 notice（`assistant-panel.tsx`） | `notification_items[0]`（フェーズ抑制済み） |
+| Pipeline Checklist の CTA | 該当 step を `related_pipeline_steps` に持つ `StateItem` の `target_ui`（前節参照） |
+| ヘッダーのフェーズ表示（`UserPhaseIndicator`） | `user_phase` / `phases`（サーバー値のみ。クライアント側でフェーズを導出しない） |
+
+通知の取り下げは (a) 状態解消による項目消滅と (b) フェーズ抑制のみで
+行われ、ユーザー操作による dismiss フラグは存在しない（親 issue #235 の
+確定事項）。
 
 `StateItem.target_ui` は修正を実行する画面を表す。一方、問題を観測する
 画面は `display_routes` で明示し、`page_items` には
@@ -252,16 +272,18 @@ unconfirmed | missing_baseline`）の `kind == "satisfied_current"` への
 た出し分け）を `StateItem` の投影に置き換える統合は Issue #235 の
 Sub 3（#238）の領分であり、#236 は対象外。
 
-### primary_item への統合（Issue #238）— `primary_action` は deprecated
+### primary_item への統合（Issue #238）— 旧フィールドは #239 で撤去済み
 
 「次の一歩」の正本は `system_state.select_primary_item` が返す
 `GET /system-state` の `primary_item` である。`GET /repository/system-understanding`
 の `primary_action` / `next_actions` / `understanding_refresh_recommended`
-は **deprecated** で、Dashboard の消費切替（Issue #235 の Sub 4 / #239）と
-同一コミットでレスポンスから撤去される予定であり、それまでの間はレスポンス
-に残る（この issue の判断: 切替と撤去を同一 PR で行う）。新規のクライアント
-コードはこれらのフィールドではなく `GET /system-state` の `primary_item` /
-`page_items` を参照すること。
+は Issue #239 でレスポンス・型定義・UI から**撤去済み**
+（`_derive_primary_action` / `_build_next_actions` も削除。
+`_check_understanding_refresh_recommended` は
+`interview.materialized.rebuild_required` state 項目の導出用として存続）。
+クライアントは `GET /system-state` の `primary_item` / `page_items` を
+参照すること。旧フィールドを含む古いレスポンスを受け取っても UI が旧投影
+を復活させないことは契約テストで固定されている。
 
 `_derive_primary_action` / `_build_next_actions` が考慮していた判定要素の
 うち、`StateItem` として表現されていなかったものを Issue #238 で吸収した:
@@ -345,14 +367,14 @@ human_decision 未記録の experiment のレビュー促し、diagnosis タグ�
 
 ## Next Actions
 
-> **Deprecated（Issue #238）**: 本節が説明する `next_actions` /
-> `primary_action` / `understanding_refresh_recommended` は、`GET
-> /repository/system-understanding` のレスポンスに引き続き含まれるが、
-> 「次の一歩」の正本ではなくなった。正本は `GET /system-state` の
-> `primary_item`（`system_state.select_primary_item`）である。詳細と
-> 判定要素の対応表は「primary_item への統合（Issue #238）」節を参照。
-> これらのフィールドは Dashboard の消費切替（Issue #235 Sub 4 / #239）と
-> 同一コミットでレスポンスから撤去される。
+> **撤去済み（Issue #238 → #239）**: 本節が説明していたトップレベルの
+> `next_actions` / `primary_action` / `understanding_refresh_recommended`
+> は Issue #239 で `GET /repository/system-understanding` のレスポンスから
+> 撤去された。「次の一歩」の正本は `GET /system-state` の
+> `primary_item`（`system_state.select_primary_item`）。判定要素の対応表
+> は「primary_item への統合（Issue #238）」節を参照。以下の 4 stage 分類
+> は表示専用の `stages` と gap 単位の解決手段リンク（`GAP_NEXT_ACTIONS`、
+> gap card / issue draft で使用）の語彙として存続する。
 
 System Understanding の Next Actions は 4 stage に分類される。
 
@@ -401,10 +423,14 @@ Hub の Understand stage と Decide Where to Observe stage の Related pages に
 api_boundary_mapping / probe_flow_selection）が Understand と Decide Where to
 Observe の両方に対応するためである。
 
-### Primary Action（Issue #201、Issue #238 により deprecated）
+### Primary Action（Issue #201、Issue #239 で撤去済み）
 
 > `primary_action` は Issue #238 で `system_state.primary_item` に統合され、
-> deprecated になった（撤去は #239）。以下は現行レスポンスの説明として残す。
+> Issue #239 でレスポンスから撤去された（`_derive_primary_action` も削除）。
+> 以下は統合時に吸収した意味論の歴史的記録として残す。旧 rule 2（ビルド
+> 実行中の無条件 CTA 抑制）は、System Understanding ページのバナー側で
+> 「ビルド実行中は severity が `error` / `blocked` 以外の項目を表示保留」
+> という決定論的表示条件として引き継がれた。
 
 `GET /system-understanding`（`GET /repository/system-understanding`）は
 `next_actions`（stage 別リスト）に加えて、優先度最上位の action を単一の

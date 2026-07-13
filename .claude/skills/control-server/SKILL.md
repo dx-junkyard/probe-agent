@@ -163,15 +163,17 @@ fallback for intelligence work.
   cases) plus `state_facts.count_approved_probe_plans` /
   `count_undecided_completed_experiments` coverage (including System
   isolation) in `tests/test_state_facts.py`.
-- **`primary_item` absorbs `primary_action` (Issue #238)**: `select_primary_item`
-  is now the canonical "what should the user do next" derivation;
-  `system_understanding_service._derive_primary_action` /
-  `_build_next_actions` (and the `primary_action` / `next_actions` /
+- **`primary_item` absorbs `primary_action` (Issue #238, removal completed
+  in #239)**: `select_primary_item` is the canonical "what should the user
+  do next" derivation. `system_understanding_service._derive_primary_action`
+  / `_build_next_actions` and the `primary_action` / `next_actions` /
   `understanding_refresh_recommended` fields on `GET
-  /repository/system-understanding`) are deprecated but still returned --
-  removal is Issue #235 Sub 4 (#239), in the same commit as the Dashboard
-  consumption switch. Do not add new callers of the deprecated fields; read
-  `primary_item` / `page_items` from `GET /system-state` instead. Two new
+  /repository/system-understanding` were removed in Issue #239 (the
+  Dashboard consumption switch happened in the same commit;
+  `_check_understanding_refresh_recommended` survives only as the source of
+  the `interview.materialized.rebuild_required` state item). Do not
+  reintroduce these fields; read `primary_item` / `page_items` from
+  `GET /system-state` instead. Two new
   native `state_group="pipeline"` items close a gap the pipeline-step
   factors weren't fully covered by: `pipeline.docs_code_reconcile.not_run` /
   `.partial` (mirrors `system_understanding_service._check_docs_code_reconciled`'s
