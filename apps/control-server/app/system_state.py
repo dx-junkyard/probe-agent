@@ -31,13 +31,14 @@ probe-agent:
 from __future__ import annotations
 
 import json
-import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from . import state_facts
 from .db import get_conn
-from .git_ops import GitError, resolve_head, working_tree_status
+from .git_ops import GitError
+from .models import SMOKE_CHECK_COMPONENT_ID
 
 # Severity vocabulary shared with system_diagnostics.py. Order = worst first.
 SEVERITY_ORDER = ["error", "blocked", "warning", "info", "ok"]
@@ -52,6 +53,66 @@ STATE_GROUPS = (
     "proposal",
     "configuration",
 )
+
+# User phase (Issue #237): which of the three phases a state item belongs to.
+# ``setup`` gates repository/environment readiness, ``preparation`` gates
+# analysis + instrumentation readiness, ``diagnosis`` is the terminal
+# ongoing-operation phase. See ``derive_user_phase`` below for how the
+# *current* phase is computed; this tuple is only the display/suppression
+# ordering.
+PHASE_ORDER = ("setup", "preparation", "diagnosis")
+_PHASE_RANK = {phase: index for index, phase in enumerate(PHASE_ORDER)}
+
+# Default state_group -> phase mapping (Issue #237 issue body, table under
+# "Scope (含む)" item 3). Applied to every StateItem unless overridden below.
+STATE_GROUP_PHASE: Dict[str, str] = {
+    "repository": "setup",
+    "configuration": "setup",
+    "snapshot": "preparation",
+    "pipeline": "preparation",
+    "understanding": "preparation",
+    "interview": "preparation",
+    "runtime": "diagnosis",
+    "proposal": "diagnosis",
+}
+
+# Explicit, finite per-state_id overrides where the state_group default above
+# would misclassify an item's role in the phase model. Kept as a small,
+# hand-enumerated map (Principle 6) -- never inferred from free text.
+STATE_ID_PHASE_OVERRIDES: Dict[str, str] = {
+    # SDK connectivity is one of the two OR'd preparation-completion signals
+    # (an approved probe plan OR non-"no_signal" connectivity -- see
+    # derive_user_phase), so tagging it "diagnosis" (the state_group=
+    # "runtime" default) would suppress it from notification_items/
+    # page_items during preparation and leave no guidance on how to finish
+    # that phase.
+    "runtime.connectivity.no_signal": "preparation",
+    # _diagnostic_state_item collapses every diagnostic category outside
+    # auth/database/llm/configuration into state_group="runtime" (Issue
+    # #193), so repository/pipeline/understanding diagnostics would
+    # otherwise default to "diagnosis" here too. Their real phase follows
+    # the same category grouping derive_user_phase uses for the setup and
+    # preparation completion gates (repository -> setup;
+    # pipeline/understanding -> preparation) -- otherwise a genuine setup
+    # blocker (e.g. an unset PROBE_REPOSITORY_ROOTS) would be silently
+    # suppressed during setup.
+    "diagnostic.repository_roots": "setup",
+    "diagnostic.repository_config": "setup",
+    "diagnostic.snapshot_status": "setup",
+    "diagnostic.pipeline_symbol_index": "preparation",
+    "diagnostic.pipeline_entrypoint_index": "preparation",
+    "diagnostic.pipeline_documentation_index": "preparation",
+    "diagnostic.pipeline_understanding_graph": "preparation",
+    "diagnostic.pipeline_capability_hierarchy": "preparation",
+    "diagnostic.system_purpose": "preparation",
+    "diagnostic.system_capabilities": "preparation",
+}
+
+# Diagnostic categories (system_diagnostics.DiagnosticCheck.category) that
+# gate the "setup" phase completion condition (Issue #237): a blocking
+# repository/database/auth/llm diagnostic means the environment itself is
+# not ready yet, independent of any snapshot/pipeline/understanding work.
+SETUP_DIAGNOSTIC_CATEGORIES = ("repository", "database", "auth", "llm")
 
 USER_ACTION_KINDS = (
     "none", "configure", "create_snapshot", "build", "confirm",
@@ -126,6 +187,19 @@ class StateItem:
     source: str = "system_state"
     dedupe_key: str = ""
     scope: str = "global"
+    # User phase (Issue #237): one of PHASE_ORDER. Assigned centrally by
+    # build_system_state via _phase_for_item after every item is collected,
+    # so individual constructors above do not need to pass it explicitly.
+    # Items built directly in tests (bypassing build_system_state) keep the
+    # "" default -- callers that care about phase go through
+    # build_system_state or call _phase_for_item themselves.
+    phase: str = ""
+
+
+@dataclass
+class PhaseCompletion:
+    phase: str  # one of PHASE_ORDER
+    complete: bool
 
 
 @dataclass
@@ -138,6 +212,9 @@ class SystemStateAssessment:
     primary_item: Optional[StateItem] = None
     notification_items: List[StateItem] = field(default_factory=list)
     page_items: Dict[str, List[StateItem]] = field(default_factory=dict)
+    # User phase (Issue #237).
+    user_phase: str = "setup"
+    phases: List[PhaseCompletion] = field(default_factory=list)
 
 
 # --- Understanding baseline / diff-impact evaluation ------------------------
@@ -193,12 +270,7 @@ def _understanding_item_count(understanding: Any, key: str) -> int:
 
 
 def latest_ready_snapshot_id(conn, system_id: int) -> Optional[int]:
-    row = conn.execute(
-        "SELECT id FROM repository_snapshots WHERE system_id = ? AND status = 'ready' "
-        "ORDER BY id DESC LIMIT 1",
-        (system_id,),
-    ).fetchone()
-    return row["id"] if row else None
+    return state_facts.get_latest_ready_snapshot_id(conn, system_id)
 
 
 def _latest_interview_baseline(
@@ -445,27 +517,11 @@ def baseline_diff_impact(
 
 
 def _purpose_defined_in_current_snapshot(conn, system_id: int, snapshot_id: int) -> bool:
-    node = conn.execute(
-        "SELECT name, summary FROM capability_hierarchy_nodes "
-        "WHERE system_id = ? AND snapshot_id = ? AND node_type = 'purpose' LIMIT 1",
-        (system_id, snapshot_id),
-    ).fetchone()
-    draft = conn.execute(
-        "SELECT name, purpose FROM system_profile_drafts "
-        "WHERE system_id = ? AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
-        (system_id, snapshot_id),
-    ).fetchone()
-    return (node is not None and bool(node["name"] or node["summary"])) or (
-        draft is not None and bool(draft["name"] or draft["purpose"])
-    )
+    return state_facts.purpose_defined_in_snapshot(conn, system_id, snapshot_id)
 
 
 def _capability_count_in_current_snapshot(conn, system_id: int, snapshot_id: int) -> int:
-    return conn.execute(
-        "SELECT COUNT(*) FROM capability_hierarchy_nodes "
-        "WHERE system_id = ? AND snapshot_id = ? AND node_type = 'capability'",
-        (system_id, snapshot_id),
-    ).fetchone()[0]
+    return state_facts.capability_count_in_snapshot(conn, system_id, snapshot_id)
 
 
 def evaluate_understanding(
@@ -622,16 +678,8 @@ def _understanding_state_item(status: UnderstandingStatus, *, purpose: bool) -> 
 
 
 def _snapshot_missing_item(conn, system_id: int) -> Optional[StateItem]:
-    latest = conn.execute(
-        "SELECT id, status FROM repository_snapshots WHERE system_id = ? "
-        "ORDER BY id DESC LIMIT 1",
-        (system_id,),
-    ).fetchone()
-    ready = conn.execute(
-        "SELECT id FROM repository_snapshots WHERE system_id = ? AND status = 'ready' "
-        "ORDER BY id DESC LIMIT 1",
-        (system_id,),
-    ).fetchone()
+    latest = state_facts.get_latest_snapshot(conn, system_id)
+    ready = state_facts.get_latest_ready_snapshot(conn, system_id)
     if ready is not None:
         return None
     if latest is not None and latest["status"] == "indexing":
@@ -713,32 +761,8 @@ def _snapshot_stale_for_interview_item(conn, system_id: int, snapshot_id: int) -
     )
 
 
-def _stuck_after_seconds() -> float:
-    try:
-        return float(os.getenv("SYSTEM_UNDERSTANDING_STUCK_AFTER_SECONDS", "300"))
-    except ValueError:
-        return 300.0
-
-
-def _is_active_build(row) -> bool:
-    if row is None or row["status"] not in ("queued", "running"):
-        return False
-    last = row["heartbeat_at"] or row["started_at"] or row["created_at"]
-    return last is not None and (time.time() - last) <= _stuck_after_seconds()
-
-
 def _active_build(conn, system_id: int, snapshot_id: int):
-    rows = conn.execute(
-        """SELECT id, status, current_step, heartbeat_at, started_at, created_at
-             FROM system_understanding_builds
-            WHERE system_id = ? AND snapshot_id = ? AND status IN ('queued', 'running')
-            ORDER BY id DESC""",
-        (system_id, snapshot_id),
-    ).fetchall()
-    for row in rows:
-        if _is_active_build(row):
-            return row
-    return None
+    return state_facts.get_active_build(conn, system_id, snapshot_id)
 
 
 def _pipeline_state_item(
@@ -859,13 +883,7 @@ def _run_not_run_item(
     conn, system_id: int, snapshot_id: int, *, state_prefix: str, run_types: List[str],
     subject: str, pipeline_steps: List[str], remediation: str,
 ) -> Optional[StateItem]:
-    placeholders = ",".join("?" for _ in run_types)
-    row = conn.execute(
-        f"SELECT id, status FROM intelligence_runs "
-        f"WHERE system_id = ? AND snapshot_id = ? AND run_type IN ({placeholders}) "
-        f"ORDER BY id DESC LIMIT 1",
-        (system_id, snapshot_id, *run_types),
-    ).fetchone()
+    row = state_facts.get_latest_intelligence_run(conn, system_id, snapshot_id, run_types)
     evidence = {"snapshot_id": snapshot_id, "run_id": row["id"] if row else None}
     return _pipeline_state_item(
         state_prefix=state_prefix,
@@ -882,12 +900,7 @@ def _build_step_not_run_item(
     conn, system_id: int, snapshot_id: int, *, state_prefix: str, step: str,
     subject: str, pipeline_steps: List[str], remediation: str,
 ) -> Optional[StateItem]:
-    row = conn.execute(
-        """SELECT id, status, error FROM system_understanding_build_steps
-           WHERE system_id = ? AND snapshot_id = ? AND step = ?
-           ORDER BY id DESC LIMIT 1""",
-        (system_id, snapshot_id, step),
-    ).fetchone()
+    row = state_facts.get_latest_build_step(conn, system_id, snapshot_id, step)
     evidence = {
         "snapshot_id": snapshot_id,
         "step_run_id": row["id"] if row else None,
@@ -907,12 +920,9 @@ def _build_step_not_run_item(
 def _capability_hierarchy_item(
     conn, system_id: int, snapshot_id: int, *, reasoning_available: bool,
 ) -> Optional[StateItem]:
-    row = conn.execute(
-        "SELECT id, status FROM intelligence_runs "
-        "WHERE system_id = ? AND snapshot_id = ? AND run_type = 'capability_hierarchy' "
-        "ORDER BY id DESC LIMIT 1",
-        (system_id, snapshot_id),
-    ).fetchone()
+    row = state_facts.get_latest_intelligence_run(
+        conn, system_id, snapshot_id, ["capability_hierarchy"]
+    )
     if row is not None and row["status"] == "completed":
         # Issue #210: a completed run with zero capability nodes is not
         # "done" from the user's perspective (no probe-agent: docstring
@@ -1007,11 +1017,85 @@ def _capability_hierarchy_item(
     )
 
 
+# --- runtime / proposal representative items (Issue #237) -----------------
+#
+# Phase 1 (Issue #193) intentionally left the runtime/proposal state_groups
+# declared-but-unused. Issue #237 adds one representative item per group --
+# not exhaustive coverage -- to give the preparation and diagnosis phases at
+# least one concrete, actionable item each.
+
+
+def _connectivity_state_item(connectivity_state: str, approved_probe_plan_count: int) -> Optional[StateItem]:
+    """SDK instrumentation guidance when no trace has ever been received.
+
+    Tagged phase="preparation" via STATE_ID_PHASE_OVERRIDES (not the
+    state_group="runtime" default) because non-"no_signal" connectivity is
+    one of the two OR'd preparation-completion signals in
+    derive_user_phase. Severity/timing soften once an approved probe plan
+    already satisfies that OR condition through the other branch.
+    """
+    if connectivity_state != "no_signal":
+        return None
+    blocking = approved_probe_plan_count == 0
+    return StateItem(
+        state_id="runtime.connectivity.no_signal",
+        state_group="runtime",
+        severity="warning" if blocking else "info",
+        status="missing",
+        user_action_kind="review",
+        intervention_timing="before_next_step" if blocking else "optional",
+        subject="SDK connectivity",
+        summary="SDK からのトレースをまだ受信していません。",
+        detail=(
+            "このシステムでは probe SDK からのトレースを一度も受信していません。"
+            + (
+                "承認済みの probe plan もまだありません。"
+                if blocking
+                else "承認済みの probe plan は既にありますが、SDK からのトレースはまだ届いていません。"
+            )
+        ),
+        impact="計装経路（承認済み probe plan または実際のトレース受信）が確立していません。",
+        remediation=(
+            "Probe Planner で probe plan を作成・承認するか、対象アプリケーションに "
+            "@probe を組み込んで Control Server に接続してください。"
+        ),
+        evidence={
+            "connectivity_state": connectivity_state,
+            "approved_probe_plan_count": approved_probe_plan_count,
+        },
+        target_ui=TargetUi(route="/probe-planner", anchor=None, action_label="Probe Planner を確認"),
+        related_pipeline_steps=["probe_plans_reviewed"],
+    )
+
+
+def _undecided_experiments_item(undecided_completed_experiment_count: int) -> Optional[StateItem]:
+    """Diagnosis-phase prompt to record a decision on completed experiments."""
+    count = undecided_completed_experiment_count
+    if count == 0:
+        return None
+    return StateItem(
+        state_id="proposal.experiments.undecided",
+        state_group="proposal",
+        severity="warning",
+        status="unconfirmed",
+        user_action_kind="review",
+        intervention_timing="before_next_step",
+        subject="Experiment decisions",
+        summary=f"未評価の experiment が {count} 件あります。",
+        detail=(
+            f"完了した experiment のうち {count} 件は、まだ human decision"
+            "（adopted / rejected / needs_more_data）が記録されていません。"
+        ),
+        impact="評価が確定するまで、候補実装の採否判断が完了しません。",
+        remediation="Experiments で完了した experiment の decision を記録してください。",
+        evidence={"undecided_completed_experiment_count": count},
+        target_ui=TargetUi(route="/experiments", anchor=None, action_label="Experiments を確認"),
+    )
+
+
 def _repository_state_items(conn, system_id: int) -> List[StateItem]:
     """Collect repository freshness state once for every consumer projection."""
-    config = conn.execute(
-        "SELECT repo_path FROM repository_configs WHERE system_id = ?", (system_id,)
-    ).fetchone()
+    config = state_facts.get_repository_config(conn, system_id)
     if config is None or not config["repo_path"]:
         return [StateItem(
             state_id="repository.configuration.missing", state_group="repository",
@@ -1024,13 +1108,9 @@ def _repository_state_items(conn, system_id: int) -> List[StateItem]:
             related_checks=["repository_config"], dedupe_key="repository.configuration",
         )]
 
-    latest_ready = conn.execute(
-        "SELECT id, commit_sha FROM repository_snapshots WHERE system_id = ? AND status = 'ready' "
-        "ORDER BY id DESC LIMIT 1", (system_id,),
-    ).fetchone()
+    latest_ready = state_facts.get_latest_ready_snapshot(conn, system_id)
     try:
-        current_head = resolve_head(config["repo_path"])
-        working_tree = working_tree_status(config["repo_path"])
+        head_state = state_facts.resolve_repository_head_state(config["repo_path"])
     except GitError as exc:
         return [StateItem(
             state_id="repository.head.unreadable", state_group="repository",
@@ -1042,6 +1122,7 @@ def _repository_state_items(conn, system_id: int) -> List[StateItem]:
             target_ui=TargetUi(route=PAGE_REPOSITORY, anchor="repo-config", action_label="Repository 設定を確認"),
             related_checks=["repository_path"], dedupe_key="repository.head",
         )]
+    current_head = head_state.current_head
 
     items: List[StateItem] = []
     if latest_ready is not None and latest_ready["commit_sha"] != current_head:
@@ -1058,19 +1139,113 @@ def _repository_state_items(conn, system_id: int) -> List[StateItem]:
             related_checks=["snapshot_status"], related_pipeline_steps=["snapshot_ready"],
             dedupe_key="repository.snapshot.freshness",
         ))
-    if not working_tree.clean:
+    if not head_state.working_tree_clean:
         items.append(StateItem(
             state_id="repository.working_tree.dirty", state_group="repository",
             severity="warning", status="impacted", user_action_kind="review",
             intervention_timing="before_next_step", subject="Working tree",
             summary="未コミット差分があります。",
-            detail=f"Working tree に {working_tree.dirty_file_count} 件の未コミット変更があります。",
+            detail=f"Working tree に {head_state.working_tree_dirty_file_count} 件の未コミット変更があります。",
             remediation="patch 適用や snapshot の前に commit、stash、または差分の確認をしてください。",
-            evidence={"dirty_file_count": working_tree.dirty_file_count, "dirty_sample": working_tree.sample},
+            evidence={"dirty_file_count": head_state.working_tree_dirty_file_count,
+                      "dirty_sample": head_state.working_tree_dirty_sample},
             target_ui=TargetUi(route=PAGE_REPOSITORY, anchor=ANCHOR_SNAPSHOT_CREATE, action_label="Repository を確認"),
             related_checks=["working_tree"], dedupe_key="repository.working_tree",
         ))
     return items
+
+
+def _phase_for_item(item: StateItem) -> str:
+    """Deterministic phase tag for one state item (Issue #237).
+
+    Looks up STATE_ID_PHASE_OVERRIDES first (a small, explicit exception
+    list); falls back to the STATE_GROUP_PHASE default for the item's
+    ``state_group``. Both maps are finite and hand-authored (Principle 6) --
+    nothing here is inferred from item text.
+    """
+    return STATE_ID_PHASE_OVERRIDES.get(
+        item.state_id, STATE_GROUP_PHASE.get(item.state_group, "diagnosis"),
+    )
+
+
+@dataclass(frozen=True)
+class UserPhaseFacts:
+    """Deterministic inputs to ``derive_user_phase`` (Issue #237).
+
+    Every field is already a finite-set/boolean/count fact -- no reasoning
+    model output, no free text -- gathered by ``build_system_state`` from
+    ``state_facts`` and ``system_diagnostics`` before calling
+    ``derive_user_phase``. Keeping this as a plain frozen dataclass (rather
+    than passing a raw dict or individual positional args) makes
+    ``derive_user_phase`` directly unit-testable without a database.
+
+    Every field defaults to the conservative ("earlier phase") value, so a
+    caller that cannot determine a fact and passes the default does not
+    accidentally advance the phase -- matching the "判定に迷う入力は前の
+    フェーズに倒す" rule from Issue #235/#237.
+    """
+
+    repository_configured: bool = False
+    setup_diagnostics_blocking: bool = False
+    ready_snapshot_exists: bool = False
+    pipeline_all_complete: bool = False
+    purpose_satisfied: bool = False
+    capabilities_satisfied: bool = False
+    approved_probe_plan_count: int = 0
+    connectivity_state: str = "no_signal"
+
+
+@dataclass(frozen=True)
+class UserPhaseResult:
+    user_phase: str  # one of PHASE_ORDER
+    phases: List[PhaseCompletion]
+
+
+def derive_user_phase(facts: UserPhaseFacts) -> UserPhaseResult:
+    """Pure deterministic derivation of the current user phase (Issue #237).
+
+    Phase definitions (fixed by Issue #235, not re-litigated here):
+
+    - ``setup``: the target repository is registered, and no
+      repository/database/auth/llm diagnostic is ``error``/``blocked``.
+    - ``preparation``: a ready snapshot exists, every deterministic pipeline
+      step (symbol index, entrypoint index, documentation index, capability
+      hierarchy) has completed for it, System Purpose and Core Capabilities
+      are each ``satisfied_current`` or ``baseline_reusable``, and an
+      instrumentation path is established -- at least one *approved* probe
+      plan, or SDK connectivity that is not ``no_signal``.
+    - ``diagnosis``: terminal; no completion condition.
+
+    The current phase is the first phase (in ``PHASE_ORDER``) whose
+    completion condition is not met. Because every ``UserPhaseFacts`` field
+    defaults to its "not yet satisfied" value, missing/unknown facts fall
+    back into an earlier phase rather than a later one.
+    """
+    setup_complete = facts.repository_configured and not facts.setup_diagnostics_blocking
+    preparation_complete = (
+        setup_complete
+        and facts.ready_snapshot_exists
+        and facts.pipeline_all_complete
+        and facts.purpose_satisfied
+        and facts.capabilities_satisfied
+        and (facts.approved_probe_plan_count > 0 or facts.connectivity_state != "no_signal")
+    )
+
+    if not setup_complete:
+        user_phase = "setup"
+    elif not preparation_complete:
+        user_phase = "preparation"
+    else:
+        user_phase = "diagnosis"
+
+    return UserPhaseResult(
+        user_phase=user_phase,
+        phases=[
+            PhaseCompletion(phase="setup", complete=setup_complete),
+            PhaseCompletion(phase="preparation", complete=preparation_complete),
+            PhaseCompletion(phase="diagnosis", complete=False),
+        ],
+    )
 
 
 def _priority_key(item: StateItem) -> tuple:
@@ -1179,9 +1354,24 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
     )
 
     items: List[StateItem] = []
+    repository_configured = False
+    ready_snapshot_exists = False
+    pipeline_all_complete = False
+    purpose_satisfied = False
+    capabilities_satisfied = False
+    approved_probe_plan_count = 0
+    connectivity_state = "no_signal"
+
     with get_conn() as conn:
         items.extend(_repository_state_items(conn, system_id))
+        # Same truthiness rule as _repository_state_items (a row with an
+        # empty repo_path is "not configured"), so the setup phase and the
+        # repository.configuration.missing item never disagree.
+        config_row = state_facts.get_repository_config(conn, system_id)
+        repository_configured = config_row is not None and bool(config_row["repo_path"])
+
         snapshot_id = latest_ready_snapshot_id(conn, system_id)
+        ready_snapshot_exists = snapshot_id is not None
 
         missing = _snapshot_missing_item(conn, system_id)
         if missing:
@@ -1203,12 +1393,12 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
             if stale:
                 items.append(stale)
 
-            items.append(_understanding_state_item(
-                evaluate_understanding(conn, system_id, snapshot_id, purpose=True), purpose=True,
-            ))
-            items.append(_understanding_state_item(
-                evaluate_understanding(conn, system_id, snapshot_id, purpose=False), purpose=False,
-            ))
+            purpose_status = evaluate_understanding(conn, system_id, snapshot_id, purpose=True)
+            capabilities_status = evaluate_understanding(conn, system_id, snapshot_id, purpose=False)
+            items.append(_understanding_state_item(purpose_status, purpose=True))
+            items.append(_understanding_state_item(capabilities_status, purpose=False))
+            purpose_satisfied = purpose_status.kind in ("satisfied_current", "baseline_reusable")
+            capabilities_satisfied = capabilities_status.kind in ("satisfied_current", "baseline_reusable")
 
             symbol = _run_not_run_item(
                 conn, system_id, snapshot_id,
@@ -1250,6 +1440,36 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
             if hierarchy:
                 items.append(hierarchy)
 
+            # Raw run/step statuses (not "item is None") for the preparation
+            # phase's "pipeline 全ステップ complete" fact: the capability
+            # hierarchy step can be raw-status "completed" while still
+            # producing a StateItem (Issue #210's empty-result warning), so
+            # "no item" is not an equivalent signal here.
+            pipeline_all_complete = all(
+                row is not None and row["status"] == "completed"
+                for row in (
+                    state_facts.get_latest_intelligence_run(conn, system_id, snapshot_id, ["symbol_index"]),
+                    state_facts.get_latest_intelligence_run(conn, system_id, snapshot_id, ["entrypoint_index"]),
+                    state_facts.get_latest_build_step(conn, system_id, snapshot_id, "documentation_index"),
+                    state_facts.get_latest_intelligence_run(conn, system_id, snapshot_id, ["capability_hierarchy"]),
+                )
+            )
+
+        approved_probe_plan_count = state_facts.count_approved_probe_plans(conn, system_id)
+        undecided_experiment_count = state_facts.count_undecided_completed_experiments(conn, system_id)
+        connectivity_facts = state_facts.get_connectivity_facts(conn, system_id, SMOKE_CHECK_COMPONENT_ID)
+        connectivity_state = state_facts.classify_connectivity_state(
+            real_trace_count=connectivity_facts.real_trace_count,
+            smoke_trace_count=connectivity_facts.smoke_trace_count,
+        )
+
+        connectivity_item = _connectivity_state_item(connectivity_state, approved_probe_plan_count)
+        if connectivity_item:
+            items.append(connectivity_item)
+        undecided_item = _undecided_experiments_item(undecided_experiment_count)
+        if undecided_item:
+            items.append(undecided_item)
+
     # Diagnostics remains its own backward-compatible endpoint, but each
     # actionable diagnostic is also a canonical state item with the same fix
     # target.  Import at call time because diagnostics itself reuses this
@@ -1266,14 +1486,51 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
         check_id for item in items for check_id in item.related_checks
     }
     from .system_diagnostics import run_system_diagnostics
-    for check in run_system_diagnostics(system_id).checks:
+    diagnostics_report = run_system_diagnostics(system_id)
+    for check in diagnostics_report.checks:
         if check.severity == "ok":
             continue
         if check.check_id in covered_check_ids:
             continue
         items.append(_diagnostic_state_item(check))
 
+    setup_diagnostics_blocking = any(
+        check.category in SETUP_DIAGNOSTIC_CATEGORIES and check.severity in ("error", "blocked")
+        for check in diagnostics_report.checks
+    )
+
     items = _dedupe_items(items)
+    for item in items:
+        item.phase = _phase_for_item(item)
+
+    phase_result = derive_user_phase(UserPhaseFacts(
+        repository_configured=repository_configured,
+        setup_diagnostics_blocking=setup_diagnostics_blocking,
+        ready_snapshot_exists=ready_snapshot_exists,
+        pipeline_all_complete=pipeline_all_complete,
+        purpose_satisfied=purpose_satisfied,
+        capabilities_satisfied=capabilities_satisfied,
+        approved_probe_plan_count=approved_probe_plan_count,
+        connectivity_state=connectivity_state,
+    ))
+
+    # Phase suppression (Issue #237, parent #235's fixed withdrawal rule):
+    # items belonging to a phase after the current one are excluded from
+    # every notification projection -- primary_item, notification_items, and
+    # page_items -- but never from `items` itself (audit trail stays
+    # complete). Phase scope is the OUTERMOST criterion of the fixed
+    # priority order (phase scope -> severity -> intervention_timing ->
+    # user_action_kind -> state_id), so primary selection also happens
+    # within the scoped set. Note this means a setup-phase user (e.g. with
+    # LLM diagnostics blocked, including LLM_PROVIDER=mock which is
+    # test/local-smoke mode per Principle 7) sees setup guidance on page
+    # banners instead of later-phase pipeline warnings -- by design: the
+    # later-phase facts remain in `items`, and phase-based prerequisite
+    # guidance for such pages is Issue #241's scope.
+    current_rank = _PHASE_RANK.get(phase_result.user_phase, len(PHASE_ORDER) - 1)
+    phase_scoped_items = [
+        item for item in items if _PHASE_RANK.get(item.phase, current_rank) <= current_rank
+    ]
 
     severity_counts: Dict[str, int] = {level: 0 for level in SEVERITY_ORDER}
     for item in items:
@@ -1285,10 +1542,12 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
         overall_severity=overall,
         severity_counts=severity_counts,
         items=items,
-        primary_item=select_primary_item(items),
+        primary_item=select_primary_item(phase_scoped_items),
         notification_items=sorted(
-            [item for item in items if item.severity in ("error", "blocked", "warning") and item.scope == "global"],
+            [item for item in phase_scoped_items if item.severity in ("error", "blocked", "warning") and item.scope == "global"],
             key=_priority_key,
         ),
-        page_items=_build_page_items(items),
+        page_items=_build_page_items(phase_scoped_items),
+        user_phase=phase_result.user_phase,
+        phases=phase_result.phases,
     )

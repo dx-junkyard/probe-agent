@@ -233,10 +233,75 @@ probe plans / experiments を同じ分析文脈で返す。
 前者は現 snapshot のみを参照し、後者は Interview baseline の snapshot
 跨ぎ再利用に対応するなど、判定材料が完全には一致しない。統合（前者を
 後者へ吸収し、Hub の表示も canonical `StateItem` から投影する）は
-Issue #206 / #207 が所有する。それまでの間、両系統の判定条件を変える
+Issue #235 の Sub 3（#238）/ Sub 4（#239）が所有する（旧 #206 / #207 は
+#235 に集約して閉じられた）。それまでの間、両系統の判定条件を変える
 変更は必ず両方（`system_understanding_service` / `system_state` /
 `system_diagnostics`）へ同時に適用する（Issue #210 の
 capability_hierarchy 0 件 warning が先例）。
+
+Issue #236 はこの「両系統」の事実取得を `app/state_facts.py` に一本化し、
+`system_understanding_service._build_next_actions` / `_derive_stage_statuses`
+が独自に持っていた単純な `purpose_defined` 判定（`_load_purpose` の dict
+から `bool(name or summary)` を取る簡易版）を、`system_state.evaluate_understanding`
+の 5 分岐（`satisfied_current | baseline_reusable | diff_impacted |
+unconfirmed | missing_baseline`）の `kind == "satisfied_current"` への
+縮約に置き換えた（`_purpose_defined_from_understanding_status`）。これに
+より「現 snapshot で Purpose/Capabilities が定義されているか」の一次判定
+は 3 モジュールで完全に共有される。ただし `_derive_primary_action` /
+`_build_next_actions` 自体（baseline 再利用や diff_impacted を経路に含め
+た出し分け）を `StateItem` の投影に置き換える統合は Issue #235 の
+Sub 3（#238）の領分であり、#236 は対象外。
+
+### user_phase とフェーズ抑制（Issue #237）
+
+`GET /system-state` は上記 `StateItem` 一覧に加えて、ユーザーが今どの
+段階にいるかを表す `user_phase`（`"setup" | "preparation" | "diagnosis"`）
+と、各フェーズの完了可否 `phases: [{phase, complete}]` を返す。
+
+| フェーズ | 完了条件 |
+| --- | --- |
+| `setup` | 対象リポジトリ登録済み、かつ repository / database / auth / llm 系診断（`system_diagnostics.DiagnosticCheck.category`）に `error` / `blocked` が無い |
+| `preparation` | ready snapshot 存在、決定的パイプライン全ステップ（symbol_index / entrypoint_index / documentation_index / capability_hierarchy）が `completed`、Purpose / Capabilities が `evaluate_understanding` の `satisfied_current` または `baseline_reusable`、かつ計装経路確立（承認済み probe plan が 1 件以上、または SDK 接続状態が `no_signal` でない） |
+| `diagnosis` | 終端フェーズ（完了条件なし） |
+
+現在フェーズ = 完了条件を満たさない最初のフェーズ。導出は
+`system_state.derive_user_phase(facts: UserPhaseFacts)` という DB 非依存の
+純粋関数が担う（`build_system_state` が `state_facts` / diagnostics から
+facts を集めて渡す）。入力が不明な場合は常に前のフェーズに倒れる
+（`UserPhaseFacts` の全フィールドが「未達成」側をデフォルトにしている
+ため）。
+
+各 `StateItem` は `phase` フィールドを持つ。既定は `state_group` → フェー
+ズの固定マッピング（`repository` / `configuration` → `setup`、
+`snapshot` / `pipeline` / `understanding` / `interview` → `preparation`、
+`runtime` / `proposal` → `diagnosis`）だが、`system_state.
+STATE_ID_PHASE_OVERRIDES` という小さな明示的辞書がこれを上書きする場合が
+ある。例えば `runtime.connectivity.no_signal`（state_group は
+`runtime`）は SDK 接続確立が preparation の完了条件そのものであるため
+`preparation` タグになる。同様に、診断由来の `StateItem`
+（`diagnostic.<check_id>`）は `_diagnostic_state_item` が
+auth/database/llm/configuration 以外のカテゴリを一律 `state_group=
+"runtime"` に畳み込む（Issue #193）ため、repository / pipeline /
+understanding カテゴリの check だけは診断カテゴリに合わせて
+`setup` / `preparation` に個別上書きしている。
+
+フェーズ抑制（親 issue #235 の確定取り下げ規則）は通知投影の全面——
+`primary_item` / `notification_items` / `page_items`——に適用され、現在
+フェーズより後のフェーズの項目を除外する。フェーズスコープは確定優先度
+規則（フェーズ → severity → intervention_timing → user_action_kind →
+state_id）の最外殻であり、`primary_item` の選択もスコープ内で行われる。
+`items`（監査用の全項目）は一切除外しない。したがって
+`LLM_PROVIDER=mock`（Principle 7 のテスト/ローカル動作確認用データ）の
+ように `llm` 系診断が `blocked` になる構成ではフェーズが `setup` に留ま
+り、ページバナーには後フェーズの pipeline/understanding 項目ではなく
+setup の解消案内が出る——これは設計どおりで、後フェーズの事実は `items`
+に残り、前提未達ページへのフェーズ由来ガイドは Issue #241 が担う。
+
+`runtime` / `proposal` グループは Issue #193 Phase 1 では宣言のみで未使用
+だったが、Issue #237 で代表項目を 1 件ずつ追加した（網羅は狙わない）:
+`runtime.connectivity.no_signal`（トレース未受信時の計装案内、
+preparation タグ）と `proposal.experiments.undecided`（完了済みだが
+human_decision 未記録の experiment のレビュー促し、diagnosis タグ）。
 
 ## Next Actions
 

@@ -10,6 +10,7 @@ arrived — it only reports what was observed.
 
 from fastapi import APIRouter, Depends
 
+from .. import state_facts
 from ..auth import get_system_id
 from ..db import get_conn
 from ..models import (
@@ -25,62 +26,21 @@ def get_connectivity_status(
     system_id: int = Depends(get_system_id),
 ) -> ConnectivityStatusOut:
     with get_conn() as conn:
-        counts = conn.execute(
-            """
-            SELECT
-                COUNT(*) AS total,
-                SUM(CASE WHEN component_id = ? THEN 1 ELSE 0 END) AS smoke,
-                MIN(timestamp) AS first_at,
-                MAX(timestamp) AS last_at
-            FROM traces
-            WHERE system_id = ?
-            """,
-            (SMOKE_CHECK_COMPONENT_ID, system_id),
-        ).fetchone()
+        facts = state_facts.get_connectivity_facts(conn, system_id, SMOKE_CHECK_COMPONENT_ID)
 
-        total = counts["total"] or 0
-        smoke = counts["smoke"] or 0
-        real = total - smoke
-
-        last_component = None
-        if total > 0:
-            last_row = conn.execute(
-                """
-                SELECT component_id FROM traces
-                WHERE system_id = ?
-                ORDER BY timestamp DESC, rowid DESC
-                LIMIT 1
-                """,
-                (system_id,),
-            ).fetchone()
-            last_component = last_row["component_id"] if last_row else None
-
-        materialized_rows = conn.execute(
-            """
-            SELECT id FROM interview_session
-            WHERE system_id = ?
-              AND materialization_diff IS NOT NULL
-              AND materialization_diff != ''
-            ORDER BY id
-            """,
-            (system_id,),
-        ).fetchall()
-
-    if real > 0:
-        state = "receiving"
-    elif smoke > 0:
-        state = "smoke_only"
-    else:
-        state = "no_signal"
+    state = state_facts.classify_connectivity_state(
+        real_trace_count=facts.real_trace_count,
+        smoke_trace_count=facts.smoke_trace_count,
+    )
 
     return ConnectivityStatusOut(
         system_id=system_id,
         state=state,
-        total_trace_count=total,
-        smoke_trace_count=smoke,
-        real_trace_count=real,
-        first_trace_at=counts["first_at"],
-        last_trace_at=counts["last_at"],
-        last_trace_component_id=last_component,
-        materialized_session_ids=[r["id"] for r in materialized_rows],
+        total_trace_count=facts.total_trace_count,
+        smoke_trace_count=facts.smoke_trace_count,
+        real_trace_count=facts.real_trace_count,
+        first_trace_at=facts.first_trace_at,
+        last_trace_at=facts.last_trace_at,
+        last_trace_component_id=facts.last_trace_component_id,
+        materialized_session_ids=facts.materialized_session_ids,
     )
