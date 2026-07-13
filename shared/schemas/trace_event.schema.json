@@ -56,6 +56,37 @@
         },
         "additionalProperties": false
       }
+    },
+    "input_capture": {
+      "type": ["object", "null"],
+      "description": "Structured, canonically JSON-encoded call arguments captured for replay (Issue #242 Phase A / #243; opt-in via @probe(replay_capture=...)). Values are JSON-native (null/bool/number/string/array/object with string keys). Non-JSON-native values use a reserved single-marker-key object keyed by \"__probe__\": tuple/set/frozenset -> {\"__probe__\": \"tuple\"|\"set\"|\"frozenset\", \"items\": [...]} (set items sorted by their canonical JSON serialization); bytes -> {\"__probe__\": \"bytes\", \"b64\": \"<base64>\"}; non-finite float -> {\"__probe__\": \"float\", \"value\": \"nan\"|\"inf\"|\"-inf\"}; a dict with non-string keys or one literally containing a \"__probe__\" key -> {\"__probe__\": \"dict\", \"items\": [[key, value], ...]} (so plain decoded objects never contain \"__probe__\" and decoding is unambiguous); any other value -> {\"__probe__\": \"unsupported\", \"type\": \"<TypeName>\"} — never the raw value or its repr. args/kwargs may each be the redaction mask string when a redact path masked the whole slot.",
+      "required": ["args", "kwargs"],
+      "properties": {
+        "args":   { "type": ["array", "string"], "description": "Encoded positional arguments (a string only when fully redacted)." },
+        "kwargs": { "type": ["object", "string"], "description": "Encoded keyword arguments by name (a string only when fully redacted)." }
+      },
+      "additionalProperties": false
+    },
+    "replayability": {
+      "type": ["string", "null"],
+      "enum": ["replayable", "partial", "unreplayable", null],
+      "description": "Deterministic structural classification of whether input_capture can mechanically restore the call inputs (finite set; direct structural checks only, no heuristics). null on pre-Phase-A traces and on components not opted into replay capture."
+    },
+    "replay_reasons": {
+      "type": ["array", "null"],
+      "description": "Structural reason codes explaining a partial/unreplayable classification (finite set). Empty for replayable; null when replay capture is not opted in.",
+      "items": {
+        "type": "string",
+        "enum": [
+          "unsupported_type",
+          "redacted",
+          "depth_limit_exceeded",
+          "size_limit_exceeded",
+          "round_trip_failed",
+          "capture_failed",
+          "redaction_blocked"
+        ]
+      }
     }
   },
   "additionalProperties": false

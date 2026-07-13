@@ -23,6 +23,7 @@ class ProbeConfig:
     ENV_TIMEOUT = "PROBE_HTTP_TIMEOUT"
     ENV_SHUTDOWN_TIMEOUT = "PROBE_SHUTDOWN_TIMEOUT"
     ENV_API_KEY = "PROBE_API_KEY"
+    ENV_REPLAY_CAPTURE_MAX_BYTES = "PROBE_REPLAY_CAPTURE_MAX_BYTES"
 
     @classmethod
     def enabled(cls) -> bool:
@@ -61,3 +62,16 @@ class ProbeConfig:
     @classmethod
     def api_key(cls) -> Optional[str]:
         return os.getenv(cls.ENV_API_KEY) or None
+
+    @classmethod
+    def replay_capture_max_bytes(cls) -> int:
+        """Max serialized byte size of a structured input capture (Issue #243).
+
+        A capture whose canonical JSON exceeds this is dropped entirely
+        (a truncated capture cannot round-trip), classifying the trace as
+        ``unreplayable`` with reason ``size_limit_exceeded``.
+        """
+        try:
+            return int(os.getenv(cls.ENV_REPLAY_CAPTURE_MAX_BYTES, "65536"))
+        except ValueError:
+            return 65536

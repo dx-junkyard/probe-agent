@@ -1695,6 +1695,51 @@ in-flight 状態は終端 `failed`、公開フェーズの in-flight 状態と
 自動 cancel し、手動 cancel でも諦められる。リモートブランチ・PR は
 どちらの場合も一切変更しない)。
 
+## Replay / Simulation（Issue #242）
+
+トレースされた入力を後から機械的に復元し、リプレイ実行やオフライン shadow に使う
+ための track。Phase A（#243）が再実行可能キャプチャ基盤、Phase B 以降（リプレイ
+実行・パッチ variant・Workbench UI）は未実装の非目標。
+
+### Phase A 実装状態（#243: 再実行可能キャプチャ基盤）
+
+- **SDK**（`probe_agent/replay_capture.py`）: `@probe(..., replay_capture=True |
+  {"redact": [...]})` による **component 単位 opt-in** の構造化入力キャプチャ。
+  root は `{"args": [...], "kwargs": {...}}`、値は canonical JSON にエンコードする。
+  JSON 非ネイティブ型は予約キー `"__probe__"` の明示エンコード
+  （`tuple` / `set` / `frozenset`〔items は canonical JSON でソート〕/ `bytes`(b64) /
+  非有限 `float` / 非文字列キー dict / `unsupported`〔型名のみ、raw 値や repr は
+  埋め込まない〕）。デコードの曖昧さを排除するため、`"__probe__"` キーを含む dict は
+  常に `dict` マーカーでエンコードする。既存の repr ベース `input` / `output` は不変。
+  キャプチャは fn 実行**前**（pre-mutation、shadow snapshot と同じ根拠）に行い、
+  失敗は常に非致命（返値・例外・trace 送信に影響しない）。opt-out 時は None チェック
+  1 回のみで新フィールドも付かない。
+- **replayability 分類（決定的・有限集合、Principle 6）**: 劣化フラグなし →
+  `replayable`、キャプチャ保存済みで一部劣化 → `partial`、使用可能なキャプチャなし →
+  `unreplayable`。理由コードは `unsupported_type` / `redacted` /
+  `depth_limit_exceeded` / `size_limit_exceeded` / `round_trip_failed` /
+  `capture_failed` / `redaction_blocked` の有限集合。エンコード後に decode → 構造
+  比較の round-trip 検証を行う（NaN は isnan 比較）。LLM・ヒューリスティックは
+  一切使わない。
+- **redact / サイズ上限**: `redact` は projection と同じパス文法・マスク文字列を
+  再利用し、エンコード前に root へ適用。構造的に置換できないパスは **fail closed で
+  キャプチャ全体を破棄**（`redaction_blocked`）。`PROBE_REPLAY_CAPTURE_MAX_BYTES`
+  （既定 65536）超過もキャプチャ全体を破棄（切り詰めた JSON は round-trip 不能な
+  ため部分保存しない）。ネスト深さ上限は 20。
+- **スキーマ（Principle 3、同時更新）**: `trace_event.schema.json` に additive の
+  `input_capture` / `replayability` / `replay_reasons` を追加。また既存サーバー
+  モデル `ShadowResult` と SDK の shadow ペイロードを契約化した
+  `shared/schemas/shadow_result.schema.json` を新設（手動 `evaluation` は
+  サーバー側状態でありイベントには含まれない）。
+- **Control Server**: `traces` テーブルに additive の `input_capture_json` /
+  `replayability` / `replay_reasons_json` カラム（既存 DB は ALTER TABLE で移行、
+  既存行は NULL のまま = pre-Phase-A。一括再分類はしない）。`POST /traces` が
+  新フィールドを検証（`replayability` / `replay_reasons` は有限 enum、未知値は
+  422）して保存し、`GET /components/{id}/traces` が返す。
+- **非目標（後続フェーズ）**: リプレイ実行（Phase B）、パッチ variant（Phase C）、
+  Workbench UI（Phase D）、構造化 output キャプチャ、旧トレースの一括 backfill、
+  live-shadow の SDK 挙動変更。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。

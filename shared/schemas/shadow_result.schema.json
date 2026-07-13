@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://probe-agent.dev/schemas/shadow_result.json",
+  "title": "ShadowResult",
+  "description": "Ingest contract for POST /components/{component_id}/shadow-results: the payload the SDK's shadow thread sends after running the registered candidate on a snapshot of the inputs. The manual `evaluation` verdict (better/worse/same/unknown) is server-side state set later via PUT /shadow-results/{id}/evaluation and is not part of this event.",
+  "type": "object",
+  "required": ["trace_id", "component_id", "timestamp"],
+  "properties": {
+    "trace_id":     { "type": "string", "description": "trace_id of the production trace this shadow run belongs to." },
+    "component_id": { "type": "string", "description": "Must match the component_id in the request path." },
+    "current_output": {
+      "type": ["string", "null"],
+      "description": "repr of the production (current) implementation's output."
+    },
+    "candidate_output": {
+      "type": ["string", "null"],
+      "description": "repr of the candidate implementation's output; null when the candidate raised."
+    },
+    "candidate_error": {
+      "type": ["string", "null"],
+      "description": "\"ExceptionType: message\" when the candidate raised; null on success."
+    },
+    "candidate_duration_ms": { "type": "number", "minimum": 0 },
+    "timestamp": { "type": "number" },
+    "projections": {
+      "type": ["array", "null"],
+      "description": "Projection extraction results for the shadow comparison (Issue #150). The SDK sends phases shadow_current (extracted in the caller's thread) and shadow_candidate (extracted in the shadow thread; omitted when the candidate raised); input/output phases are accepted for contract parity with the server model but normally arrive on the trace event.",
+      "items": {
+        "type": "object",
+        "required": ["projection_name"],
+        "properties": {
+          "projection_name": { "type": "string" },
+          "phase": { "type": "string", "enum": ["input", "output", "shadow_current", "shadow_candidate"] },
+          "fields":  { "type": "object" },
+          "metrics": { "type": "object" },
+          "samples": { "type": "object" },
+          "data_hash": { "type": ["string", "null"] },
+          "truncated": { "type": "boolean" },
+          "error": { "type": ["string", "null"], "description": "Non-fatal extraction diagnostic; set when extraction failed and fields/metrics/samples are empty." }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

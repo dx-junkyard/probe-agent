@@ -91,6 +91,12 @@ CREATE TABLE IF NOT EXISTS traces (
     error        TEXT,
     duration_ms  REAL,
     timestamp    REAL NOT NULL,
+    -- Replay capture (Issue #242 Phase A / #243), all additive. NULL means
+    -- the trace predates Phase A or its component is not opted into replay
+    -- capture; old rows are never bulk-reclassified.
+    input_capture_json  TEXT,
+    replayability       TEXT,
+    replay_reasons_json TEXT,
     PRIMARY KEY (system_id, trace_id),
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
 );
@@ -2388,6 +2394,16 @@ def init_db() -> None:
             )
         if publish_job_cols and "last_attempt_at" not in publish_job_cols:
             conn.execute("ALTER TABLE publish_jobs ADD COLUMN last_attempt_at REAL")
+        # Issue #242 Phase A / #243: replay-capture columns on traces. Existing
+        # rows stay NULL (= pre-Phase-A / capture not opted in); no bulk
+        # reclassification of old traces.
+        trace_cols = _columns(conn, "traces")
+        if "input_capture_json" not in trace_cols:
+            conn.execute("ALTER TABLE traces ADD COLUMN input_capture_json TEXT")
+        if "replayability" not in trace_cols:
+            conn.execute("ALTER TABLE traces ADD COLUMN replayability TEXT")
+        if "replay_reasons_json" not in trace_cols:
+            conn.execute("ALTER TABLE traces ADD COLUMN replay_reasons_json TEXT")
         _ensure_legacy_system(conn)
     _validate_startup_environment()
     _validate_publish_startup_config()

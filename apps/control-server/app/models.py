@@ -11,6 +11,21 @@ EntityRole = Literal["source", "derived", "related"]
 # Projection phases: input/output (Issue #146); shadow_* added in Issue #150.
 ProjectionPhase = Literal["input", "output", "shadow_current", "shadow_candidate"]
 
+# Replay capture (Issue #242 Phase A / #243): deterministic structural
+# classification of whether a trace's structured input capture can
+# mechanically restore the call inputs. Finite sets shared with
+# shared/schemas/trace_event.schema.json and the SDK's replay_capture module.
+Replayability = Literal["replayable", "partial", "unreplayable"]
+ReplayReason = Literal[
+    "unsupported_type",
+    "redacted",
+    "depth_limit_exceeded",
+    "size_limit_exceeded",
+    "round_trip_failed",
+    "capture_failed",
+    "redaction_blocked",
+]
+
 
 class TraceEntity(BaseModel):
     type: str
@@ -48,6 +63,14 @@ class TraceEvent(BaseModel):
     entities: Optional[List[TraceEntity]] = None
     # Phase 2 projections (Issue #146) — optional extraction results.
     projections: Optional[List[TraceProjectionIn]] = None
+    # Replay capture (Issue #242 Phase A / #243) — all optional, additive.
+    # input_capture is the canonical JSON-encoded {"args": [...], "kwargs":
+    # {...}} structure (see trace_event.schema.json for the "__probe__"
+    # marker encoding); replayability/replay_reasons are enum-validated so
+    # unknown values are rejected with 422.
+    input_capture: Optional[Any] = None
+    replayability: Optional[Replayability] = None
+    replay_reasons: Optional[List[ReplayReason]] = None
 
 
 class ProjectionOut(BaseModel):

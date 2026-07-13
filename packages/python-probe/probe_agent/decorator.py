@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Optional, Set
 
 from . import context as _lineage
 from . import projection as _projection
+from . import replay_capture as _replay
 from .client import ControlClient
 from .config import ProbeConfig
 from .policy import PolicyCache
@@ -142,6 +143,7 @@ def probe(
     entities: Optional[List[Any]] = None,
     projection: Optional[Any] = None,
     sample_rate: Optional[float] = None,
+    replay_capture: Optional[Any] = None,
 ):
     """Wrap a function so its input/output/error/duration are reported.
 
@@ -163,12 +165,27 @@ def probe(
     function runs (reflecting the arguments as received); the output phase
     after it returns. ``sample_rate`` (Issue #152) deterministically thins
     lineage + projections by trace_id hash; the trace body is always sent.
+
+    ``replay_capture`` (Issue #242 Phase A / #243) opts this component into
+    structured, JSON round-trip-able input capture. Pass ``True`` for the
+    defaults or a mapping like ``{"redact": ["$.kwargs.password"]}``
+    (projection path grammar; fail-closed validation at decoration time).
+    ``None`` / ``False`` (the default) disables capture entirely: the trace
+    payload carries none of the new keys and no capture code runs. Capture is
+    best-effort and never affects the wrapped function's return value,
+    exceptions, or trace sending.
     """
     if candidate is not None:
         set_candidate(component_id, candidate)
     if projection is not None:
         # Fail-closed at decoration time on an invalid spec.
         set_projection(component_id, projection)
+    # Fail-closed at decoration time on an invalid replay_capture spec.
+    replay_spec = (
+        _replay.compile_spec(replay_capture)
+        if replay_capture is not None and replay_capture is not False
+        else None
+    )
     static_entities = _lineage._normalize_entities(entities)
 
     def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -210,6 +227,27 @@ def probe(
             # lineage. contextvars are not inherited by threads otherwise.
             shadow_ctx = contextvars.copy_context() if run_shadow else None
 
+            # Structured input capture (Issue #242 Phase A / #243). Opt-in
+            # only: when not opted in, this is a single None check and the
+            # trace payload carries none of the new keys. Runs BEFORE fn so
+            # the capture reflects the arguments as received (pre-mutation,
+            # same rationale as the shadow input snapshot). Best-effort: any
+            # failure degrades to unreplayable/capture_failed and never
+            # affects fn's return value, exceptions, or trace sending.
+            capture_payload = None
+            capture_replayability: Optional[str] = None
+            capture_reasons: Optional[List[str]] = None
+            if replay_spec is not None and mode in ("trace", "shadow"):
+                try:
+                    capture_payload, capture_replayability, capture_reasons = (
+                        _replay.capture_input(args, kwargs, replay_spec)
+                    )
+                except Exception:  # noqa: BLE001 — capture must never break fn
+                    logger.debug("replay capture failed", exc_info=True)
+                    capture_payload = None
+                    capture_replayability = _replay.UNREPLAYABLE
+                    capture_reasons = [_replay.REASON_CAPTURE_FAILED]
+
             spec = _get_projection(component_id) if keep_enrichment else None
             proj_payloads: List[Dict[str, Any]] = []
             proj_entities: List[Dict[str, str]] = []
@@ -250,6 +288,10 @@ def probe(
             }
             if keep_enrichment:
                 trace.update(lineage)
+            if capture_replayability is not None:
+                trace["input_capture"] = capture_payload
+                trace["replayability"] = capture_replayability
+                trace["replay_reasons"] = capture_reasons
 
             if spec is not None and raised is None:
                 # Output projection (the input phase was extracted pre-call).
