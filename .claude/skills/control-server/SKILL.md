@@ -128,6 +128,40 @@ fallback for intelligence work.
   Dashboard page callouts/toasts from the same state items, and covering
   the `runtime` / `proposal` / `interview` (beyond the one stale-snapshot
   item) state groups.
+- **`user_phase` (Issue #237)**: `GET /system-state` also returns
+  `user_phase` (`setup | preparation | diagnosis`) and `phases` (each
+  phase's completion condition). `system_state.derive_user_phase(facts:
+  UserPhaseFacts) -> UserPhaseResult` is a pure, DB-free function --
+  `build_system_state` gathers `UserPhaseFacts` from `state_facts` (plus
+  two new getters, `count_approved_probe_plans` /
+  `count_undecided_completed_experiments`) and from
+  `system_diagnostics.run_system_diagnostics`'s checks, filtered to
+  categories `repository | database | auth | llm`
+  (`SETUP_DIAGNOSTIC_CATEGORIES`) for the setup gate. Current phase = the
+  first phase (in `PHASE_ORDER`) whose completion condition is unmet;
+  `UserPhaseFacts` defaults are all "not yet satisfied" so an unknown fact
+  never advances the phase. Every `StateItem` carries a `phase` field:
+  `system_state.STATE_GROUP_PHASE` is the default `state_group -> phase`
+  mapping, and `STATE_ID_PHASE_OVERRIDES` is a small explicit per-`state_id`
+  exception list (e.g. `runtime.connectivity.no_signal` tags `preparation`,
+  not the `runtime` group default, because SDK connectivity is one of the
+  two OR'd preparation-completion signals). Phase suppression applies to
+  every notification projection -- `primary_item`, `notification_items`,
+  and `page_items` all exclude items whose phase is later than the current
+  `user_phase` (phase scope is the outermost criterion of the fixed
+  priority order); `items` keeps everything for audit. Note that
+  `LLM_PROVIDER=mock` pins `intelligence_llm_config` to `blocked` and thus
+  `user_phase` to `setup` -- tests that assert later-phase items in
+  `page_items` must configure a real reasoning provider via env (see
+  `TestUserPhaseIntegration._configure_reasoning_llm`). Two new
+  representative items exercise the previously-unused `runtime`/`proposal`
+  groups: `runtime.connectivity.no_signal` (preparation-tagged) and
+  `proposal.experiments.undecided` (diagnosis-tagged, completed experiments
+  with `human_decision = 'undecided'`). Tests: `TestDeriveUserPhase` /
+  `TestPhaseTagging` in `tests/test_system_state.py` (pure-function boundary
+  cases) plus `state_facts.count_approved_probe_plans` /
+  `count_undecided_completed_experiments` coverage (including System
+  isolation) in `tests/test_state_facts.py`.
 
 ## System settings diagnostics (issue #101)
 

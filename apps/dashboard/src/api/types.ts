@@ -309,6 +309,9 @@ export interface SystemStateTargetUi {
   action_label: string;
 }
 
+/** User phase (Issue #237): setup -> preparation -> diagnosis (terminal). */
+export type UserPhase = "setup" | "preparation" | "diagnosis";
+
 export interface SystemStateItem {
   state_id: string;
   state_group: string;
@@ -331,6 +334,13 @@ export interface SystemStateItem {
   dedupe_key: string;
   scope: string;
   decision_method: "deterministic";
+  /** Fixed state_group -> phase mapping plus a small per-item override list (Issue #237). */
+  phase?: UserPhase;
+}
+
+export interface SystemStatePhaseCompletion {
+  phase: UserPhase;
+  complete: boolean;
 }
 
 export interface SystemStateAssessment {
@@ -342,6 +352,9 @@ export interface SystemStateAssessment {
   primary_item: SystemStateItem | null;
   notification_items: SystemStateItem[];
   page_items: Record<string, SystemStateItem[]>;
+  /** Current user phase and each phase's completion condition (Issue #237). */
+  user_phase?: UserPhase;
+  phases?: SystemStatePhaseCompletion[];
 }
 
 export type InterviewSessionStatus = "open" | "proposals_ready" | "materialized" | "closed";

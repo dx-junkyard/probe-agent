@@ -665,13 +665,21 @@ class TestPipelineState:
         assert "pipeline.capability_hierarchy.empty" not in items
 
     def test_capability_hierarchy_completed_zero_capabilities_is_warning_item(
-        self, admin_client, tmp_path
+        self, admin_client, tmp_path, monkeypatch
     ):
         """Issue #210: a completed run with zero capability nodes must not
         silently disappear (return None, same as a genuinely "done" run).
         It gets a distinct state_id whose remediation points at
         Interview/metadata, not the generic "Build / Refresh を実行してください"
         used for not-yet-run/failed/blocked pipeline steps."""
+        # Issue #237: page_items is phase-suppressed. A real reasoning LLM
+        # config completes the setup phase (LLM_PROVIDER=mock pins
+        # intelligence_llm_config to "blocked" and thus user_phase to
+        # "setup", which would hide this preparation-phase item from
+        # page_items -- the item itself is still asserted via `items`).
+        monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+        monkeypatch.setenv("LLM_MODEL", "claude-opus-4-20250514")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         _, sys, hdrs = _setup(admin_client)
         repo, sha = _init_git_repo(tmp_path)
         admin_client.put(
@@ -905,3 +913,375 @@ class TestIssue236FactsExtractionRegression:
         labels = [a["action"] for a in su_data["next_actions"]]
         assert "Define System Purpose" not in labels
         assert "Identify main system capabilities" not in labels
+
+
+class TestDeriveUserPhase:
+    """Issue #237: derive_user_phase is a pure, DB-free function of
+    UserPhaseFacts. Boundary cases mirror the issue's required test list
+    (未設定 / 環境診断 error / snapshot のみ / pipeline 途中 / Purpose 未確定
+    / capability 0 件 / probe plan 承認済みでトレース無し / 受信中)."""
+
+    def _facts(self, **overrides):
+        from app.system_state import UserPhaseFacts
+
+        base = dict(
+            repository_configured=True,
+            setup_diagnostics_blocking=False,
+            ready_snapshot_exists=True,
+            pipeline_all_complete=True,
+            purpose_satisfied=True,
+            capabilities_satisfied=True,
+            approved_probe_plan_count=0,
+            connectivity_state="no_signal",
+        )
+        base.update(overrides)
+        return UserPhaseFacts(**base)
+
+    def test_repository_not_configured_is_setup(self):
+        from app.system_state import derive_user_phase
+
+        result = derive_user_phase(self._facts(repository_configured=False))
+        assert result.user_phase == "setup"
+        by_phase = {p.phase: p.complete for p in result.phases}
+        assert by_phase == {"setup": False, "preparation": False, "diagnosis": False}
+
+    def test_blocking_environment_diagnostic_is_setup(self):
+        from app.system_state import derive_user_phase
+
+        result = derive_user_phase(
+            self._facts(repository_configured=True, setup_diagnostics_blocking=True)
+        )
+        assert result.user_phase == "setup"
+        by_phase = {p.phase: p.complete for p in result.phases}
+        assert by_phase["setup"] is False
+
+    def test_snapshot_only_no_pipeline_is_preparation(self):
+        from app.system_state import derive_user_phase
+
+        result = derive_user_phase(self._facts(
+            ready_snapshot_exists=True, pipeline_all_complete=False,
+            purpose_satisfied=False, capabilities_satisfied=False,
+        ))
+        assert result.user_phase == "preparation"
+        by_phase = {p.phase: p.complete for p in result.phases}
+        assert by_phase["setup"] is True
+        assert by_phase["preparation"] is False
+
+    def test_pipeline_partial_is_preparation(self):
+        from app.system_state import derive_user_phase
+
+        result = derive_user_phase(self._facts(pipeline_all_complete=False))
+        assert result.user_phase == "preparation"
+
+    def test_purpose_unconfirmed_is_preparation(self):
+        from app.system_state import derive_user_phase
+
+        result = derive_user_phase(self._facts(purpose_satisfied=False))
+        assert result.user_phase == "preparation"
+
+    def test_zero_capabilities_is_preparation(self):
+        from app.system_state import derive_user_phase
+
+        result = derive_user_phase(self._facts(capabilities_satisfied=False))
+        assert result.user_phase == "preparation"
+
+    def test_no_instrumentation_signal_stays_preparation(self):
+        from app.system_state import derive_user_phase
+
+        # Every other condition satisfied, but neither an approved probe
+        # plan nor non-"no_signal" connectivity exists yet.
+        result = derive_user_phase(self._facts())
+        assert result.user_phase == "preparation"
+        by_phase = {p.phase: p.complete for p in result.phases}
+        assert by_phase == {"setup": True, "preparation": False, "diagnosis": False}
+
+    def test_approved_plan_without_traces_reaches_diagnosis(self):
+        from app.system_state import derive_user_phase
+
+        result = derive_user_phase(
+            self._facts(approved_probe_plan_count=1, connectivity_state="no_signal")
+        )
+        assert result.user_phase == "diagnosis"
+        by_phase = {p.phase: p.complete for p in result.phases}
+        assert by_phase == {"setup": True, "preparation": True, "diagnosis": False}
+
+    def test_receiving_traces_without_approved_plan_reaches_diagnosis(self):
+        from app.system_state import derive_user_phase
+
+        result = derive_user_phase(
+            self._facts(approved_probe_plan_count=0, connectivity_state="receiving")
+        )
+        assert result.user_phase == "diagnosis"
+
+    def test_smoke_only_connectivity_also_satisfies_instrumentation_signal(self):
+        # Issue #237's completion rule is "connectivity != no_signal", not
+        # "connectivity == receiving": a smoke-check trace still proves the
+        # instrumentation path is wired up structurally.
+        from app.system_state import derive_user_phase
+
+        result = derive_user_phase(self._facts(connectivity_state="smoke_only"))
+        assert result.user_phase == "diagnosis"
+
+    def test_setup_incomplete_forces_preparation_incomplete_regardless_of_other_facts(self):
+        # Preparation cannot be "complete" while setup itself is not --
+        # otherwise the phases list would report a later phase done while an
+        # earlier one is not, which is incoherent for a strict progression.
+        from app.system_state import derive_user_phase
+
+        result = derive_user_phase(self._facts(
+            repository_configured=False,
+            approved_probe_plan_count=1, connectivity_state="receiving",
+        ))
+        assert result.user_phase == "setup"
+        by_phase = {p.phase: p.complete for p in result.phases}
+        assert by_phase["preparation"] is False
+
+
+class TestPhaseTagging:
+    """Issue #237: _phase_for_item applies STATE_GROUP_PHASE by default, with
+    STATE_ID_PHASE_OVERRIDES taking precedence for a small, explicit
+    exception list."""
+
+    def test_default_group_mapping(self):
+        from app.system_state import StateItem, _phase_for_item
+
+        cases = {
+            "repository": "setup",
+            "configuration": "setup",
+            "snapshot": "preparation",
+            "pipeline": "preparation",
+            "understanding": "preparation",
+            "interview": "preparation",
+            "runtime": "diagnosis",
+            "proposal": "diagnosis",
+        }
+        for group, expected in cases.items():
+            item = StateItem(f"x.{group}", group, "warning", "missing", "none", "none", "s", "s", "s")
+            assert _phase_for_item(item) == expected, group
+
+    def test_connectivity_no_signal_overrides_to_preparation(self):
+        from app.system_state import StateItem, _phase_for_item
+
+        item = StateItem(
+            "runtime.connectivity.no_signal", "runtime", "warning", "missing",
+            "review", "before_next_step", "s", "s", "s",
+        )
+        assert _phase_for_item(item) == "preparation"
+
+    def test_repository_diagnostic_overrides_to_setup(self):
+        from app.system_state import StateItem, _phase_for_item
+
+        for check_id in ("repository_roots", "repository_config", "snapshot_status"):
+            item = StateItem(
+                f"diagnostic.{check_id}", "runtime", "error", "failed",
+                "configure", "now", "s", "s", "s",
+            )
+            assert _phase_for_item(item) == "setup", check_id
+
+    def test_pipeline_and_understanding_diagnostics_override_to_preparation(self):
+        from app.system_state import StateItem, _phase_for_item
+
+        for check_id in (
+            "pipeline_symbol_index", "pipeline_entrypoint_index",
+            "pipeline_documentation_index", "pipeline_understanding_graph",
+            "pipeline_capability_hierarchy", "system_purpose", "system_capabilities",
+        ):
+            item = StateItem(
+                f"diagnostic.{check_id}", "runtime", "warning", "missing",
+                "inspect", "before_next_step", "s", "s", "s",
+            )
+            assert _phase_for_item(item) == "preparation", check_id
+
+    def test_llm_and_auth_and_database_diagnostics_use_configuration_group_default(self):
+        # These already land in state_group="configuration" (not "runtime")
+        # via _diagnostic_state_item, so the group default alone (no
+        # override needed) already yields "setup".
+        from app.system_state import StateItem, _phase_for_item
+
+        for check_id in ("llm_base_config", "intelligence_llm_config", "llm_last_run", "auth_scope", "database_storage"):
+            item = StateItem(
+                f"diagnostic.{check_id}", "configuration", "warning", "missing",
+                "configure", "before_next_step", "s", "s", "s",
+            )
+            assert _phase_for_item(item) == "setup", check_id
+
+    def test_unrelated_runtime_diagnostic_stays_diagnosis(self):
+        from app.system_state import StateItem, _phase_for_item
+
+        item = StateItem(
+            "diagnostic.some_future_check", "runtime", "warning", "missing",
+            "inspect", "before_next_step", "s", "s", "s",
+        )
+        assert _phase_for_item(item) == "diagnosis"
+
+
+class TestUserPhaseIntegration:
+    """Issue #237: GET /system-state's user_phase / phases / notification
+    suppression, exercised end-to-end through the API."""
+
+    def _configure_reasoning_llm(self, monkeypatch):
+        # A non-mock, reasoning-capable LLM config so the setup-phase llm
+        # diagnostics (llm_base_config / intelligence_llm_config) come back
+        # "ok" instead of the "blocked" severity LLM_PROVIDER=mock always
+        # produces for intelligence_llm_config.
+        monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+        monkeypatch.setenv("LLM_MODEL", "claude-opus-4-20250514")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+
+    def _insert_probe_plan(self, system_id, snapshot_id, run_id, *, status="proposed"):
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO probe_plans
+                       (system_id, snapshot_id, intelligence_run_id, feature_id,
+                        objective, status, origin, created_at, updated_at)
+                   VALUES (?, ?, ?, 'feat-1', 'obj', ?, 'manual', 0, 0)""",
+                (system_id, snapshot_id, run_id, status),
+            )
+
+    def _insert_experiment(self, system_id, snapshot_id, *, status="completed", human_decision="undecided"):
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO experiments
+                       (system_id, feature_id, objective, snapshot_id,
+                        baseline_commit, config_revision, execution_config,
+                        status, human_decision, created_at)
+                   VALUES (?, 'feat-1', 'obj', ?, 'deadbeef', 'v1', '{}', ?, ?, 0)""",
+                (system_id, snapshot_id, status, human_decision),
+            )
+
+    def _insert_trace(self, system_id, component_id):
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO traces
+                       (system_id, trace_id, component_id, mode, input_json,
+                        output_text, error, duration_ms, timestamp)
+                   VALUES (?, ?, ?, 'trace', '{}', 'ok', NULL, 1.0, ?)""",
+                (system_id, f"trace-{component_id}", component_id, time.time()),
+            )
+
+    def _complete_pipeline(self, admin_client, sys, hdrs, tmp_path):
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+        snapshot_id = snap.json()["id"]
+
+        _insert_intelligence_run(sys["id"], snapshot_id, "symbol_index", "completed")
+        _insert_intelligence_run(sys["id"], snapshot_id, "entrypoint_index", "completed")
+        build_id = _insert_active_build(sys["id"], snapshot_id)
+        _insert_build_step(sys["id"], snapshot_id, build_id, "documentation_index", "completed")
+        run_id = _insert_intelligence_run(sys["id"], snapshot_id, "capability_hierarchy", "completed")
+        _insert_capability_node(sys["id"], snapshot_id, run_id, node_type="purpose", name="Test system")
+        _insert_capability_node(sys["id"], snapshot_id, run_id, node_type="capability", name="Item management")
+        return snapshot_id
+
+    def test_unconfigured_repository_is_setup_and_suppresses_later_phase_items(self, admin_client):
+        _, _, hdrs = _setup(admin_client)
+
+        data, items = _get_state(admin_client, hdrs)
+        assert data["user_phase"] == "setup"
+        by_phase = {p["phase"]: p["complete"] for p in data["phases"]}
+        assert by_phase == {"setup": False, "preparation": False, "diagnosis": False}
+
+        # runtime.connectivity.no_signal is preparation-tagged: present in
+        # `items` (audit trail) but suppressed from every notification
+        # projection (notification_items / page_items / primary_item) while
+        # user_phase is still "setup".
+        assert "runtime.connectivity.no_signal" in items
+        notif_ids = {i["state_id"] for i in data["notification_items"]}
+        assert "runtime.connectivity.no_signal" not in notif_ids
+        for notif in data["notification_items"]:
+            assert notif["phase"] == "setup"
+        page_ids = {
+            projected["state_id"]
+            for route_items in data["page_items"].values()
+            for projected in route_items
+        }
+        assert "runtime.connectivity.no_signal" not in page_ids
+        assert data["primary_item"]["phase"] == "setup"
+
+    def test_pipeline_complete_without_instrumentation_is_preparation(self, admin_client, tmp_path, monkeypatch):
+        self._configure_reasoning_llm(monkeypatch)
+        _, sys, hdrs = _setup(admin_client)
+        snapshot_id = self._complete_pipeline(admin_client, sys, hdrs, tmp_path)
+        # A completed, undecided experiment gives a concrete diagnosis-tagged
+        # item to prove it stays suppressed while still in "preparation".
+        self._insert_experiment(sys["id"], snapshot_id)
+
+        data, items = _get_state(admin_client, hdrs)
+        assert data["user_phase"] == "preparation"
+        by_phase = {p["phase"]: p["complete"] for p in data["phases"]}
+        assert by_phase["setup"] is True
+        assert by_phase["preparation"] is False
+
+        assert "proposal.experiments.undecided" in items
+        notif_ids = {i["state_id"] for i in data["notification_items"]}
+        assert "proposal.experiments.undecided" not in notif_ids
+        # Suppression covers page_items and primary_item too (Issue #237:
+        # phase scope is the outermost criterion of every projection).
+        page_ids = {
+            projected["state_id"]
+            for route_items in data["page_items"].values()
+            for projected in route_items
+        }
+        assert "proposal.experiments.undecided" not in page_ids
+        if data["primary_item"] is not None:
+            assert data["primary_item"]["phase"] in ("setup", "preparation")
+        # preparation-phase items stay visible while user_phase is
+        # "preparation" itself.
+        assert "runtime.connectivity.no_signal" in notif_ids
+
+    def test_approved_probe_plan_reaches_diagnosis(self, admin_client, tmp_path, monkeypatch):
+        self._configure_reasoning_llm(monkeypatch)
+        _, sys, hdrs = _setup(admin_client)
+        snapshot_id = self._complete_pipeline(admin_client, sys, hdrs, tmp_path)
+        self._insert_experiment(sys["id"], snapshot_id)
+        plan_run_id = _insert_intelligence_run(sys["id"], snapshot_id, "probe_plan", "completed")
+        self._insert_probe_plan(sys["id"], snapshot_id, plan_run_id, status="approved")
+
+        data, items = _get_state(admin_client, hdrs)
+        assert data["user_phase"] == "diagnosis"
+        by_phase = {p["phase"]: p["complete"] for p in data["phases"]}
+        assert by_phase == {"setup": True, "preparation": True, "diagnosis": False}
+
+        # Diagnosis-phase items are now visible in notification_items too.
+        notif_ids = {i["state_id"] for i in data["notification_items"]}
+        assert "proposal.experiments.undecided" in notif_ids
+        # An approved plan already satisfies the instrumentation-path
+        # condition, so the still-no_signal connectivity item softens from
+        # "warning"/blocking to "info".
+        assert items["runtime.connectivity.no_signal"]["severity"] == "info"
+
+    def test_receiving_traces_without_probe_plan_reaches_diagnosis(self, admin_client, tmp_path, monkeypatch):
+        self._configure_reasoning_llm(monkeypatch)
+        _, sys, hdrs = _setup(admin_client)
+        self._complete_pipeline(admin_client, sys, hdrs, tmp_path)
+        self._insert_trace(sys["id"], "worker-component")
+
+        data, items = _get_state(admin_client, hdrs)
+        assert data["user_phase"] == "diagnosis"
+        # Real traces mean connectivity_state != "no_signal", so the
+        # connectivity item no longer fires at all.
+        assert "runtime.connectivity.no_signal" not in items
+
+    def test_proposed_but_not_approved_probe_plan_does_not_satisfy_instrumentation(
+        self, admin_client, tmp_path, monkeypatch
+    ):
+        self._configure_reasoning_llm(monkeypatch)
+        _, sys, hdrs = _setup(admin_client)
+        snapshot_id = self._complete_pipeline(admin_client, sys, hdrs, tmp_path)
+        plan_run_id = _insert_intelligence_run(sys["id"], snapshot_id, "probe_plan", "completed")
+        self._insert_probe_plan(sys["id"], snapshot_id, plan_run_id, status="proposed")
+
+        data, _items = _get_state(admin_client, hdrs)
+        assert data["user_phase"] == "preparation"

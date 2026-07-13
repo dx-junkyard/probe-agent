@@ -3527,6 +3527,8 @@ StateGroup = Literal[
     "repository", "snapshot", "pipeline", "understanding", "interview",
     "runtime", "proposal", "configuration",
 ]
+# User phase (Issue #237): setup -> preparation -> diagnosis (terminal).
+UserPhase = Literal["setup", "preparation", "diagnosis"]
 
 
 class SystemStateTargetUiOut(BaseModel):
@@ -3557,6 +3559,14 @@ class SystemStateItemOut(BaseModel):
     scope: str = "global"
     # System State Assessment is deterministic and LLM-free (Issue #193 Phase 1).
     decision_method: Literal["deterministic"] = "deterministic"
+    # Fixed state_group -> phase mapping plus a small explicit per-item
+    # override list (Issue #237); see system_state._phase_for_item.
+    phase: UserPhase = "diagnosis"
+
+
+class SystemStatePhaseCompletionOut(BaseModel):
+    phase: UserPhase
+    complete: bool
 
 
 class SystemStateAssessmentOut(BaseModel):
@@ -3568,6 +3578,10 @@ class SystemStateAssessmentOut(BaseModel):
     primary_item: Optional[SystemStateItemOut] = None
     notification_items: List[SystemStateItemOut] = Field(default_factory=list)
     page_items: Dict[str, List[SystemStateItemOut]] = Field(default_factory=dict)
+    # User phase (Issue #237): the current phase plus each phase's
+    # completion condition. Additive; existing fields above are unchanged.
+    user_phase: UserPhase = "setup"
+    phases: List[SystemStatePhaseCompletionOut] = Field(default_factory=list)
 
 
 class AssistantActionOut(BaseModel):

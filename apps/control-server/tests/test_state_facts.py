@@ -574,6 +574,75 @@ class TestConnectivityFacts:
         assert facts.materialized_session_ids == [materialized_id]
 
 
+# --- Probe plan / experiment review facts (Issue #237) ---------------------------
+
+
+def _insert_probe_plan(get_conn, system_id, snapshot_id, run_id, *, status="proposed"):
+    now = time.time()
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO probe_plans
+                   (system_id, snapshot_id, intelligence_run_id, feature_id,
+                    objective, status, origin, created_at, updated_at)
+               VALUES (?, ?, ?, 'feat-1', 'obj', ?, 'manual', ?, ?)""",
+            (system_id, snapshot_id, run_id, status, now, now),
+        )
+
+
+def _insert_experiment(get_conn, system_id, snapshot_id, *, status="completed", human_decision="undecided"):
+    now = time.time()
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO experiments
+                   (system_id, feature_id, objective, snapshot_id,
+                    baseline_commit, config_revision, execution_config,
+                    status, human_decision, created_at)
+               VALUES (?, 'feat-1', 'obj', ?, 'deadbeef', 'v1', '{}', ?, ?, ?)""",
+            (system_id, snapshot_id, status, human_decision, now),
+        )
+
+
+class TestProbePlanAndExperimentReviewFacts:
+    def test_count_approved_probe_plans_only_counts_approved_status(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+        run_id = _insert_intelligence_run(conn_factory, system_id, snapshot_id, "probe_plan", "completed")
+        with conn_factory() as conn:
+            assert state_facts.count_approved_probe_plans(conn, system_id) == 0
+
+        _insert_probe_plan(conn_factory, system_id, snapshot_id, run_id, status="proposed")
+        _insert_probe_plan(conn_factory, system_id, snapshot_id, run_id, status="rejected")
+        with conn_factory() as conn:
+            assert state_facts.count_approved_probe_plans(conn, system_id) == 0
+
+        _insert_probe_plan(conn_factory, system_id, snapshot_id, run_id, status="approved")
+        _insert_probe_plan(conn_factory, system_id, snapshot_id, run_id, status="approved")
+        with conn_factory() as conn:
+            assert state_facts.count_approved_probe_plans(conn, system_id) == 2
+
+    def test_count_undecided_completed_experiments_requires_both_conditions(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+        with conn_factory() as conn:
+            assert state_facts.count_undecided_completed_experiments(conn, system_id) == 0
+
+        # completed but decided -- does not count.
+        _insert_experiment(conn_factory, system_id, snapshot_id, status="completed", human_decision="adopted")
+        # undecided but not completed -- does not count.
+        _insert_experiment(conn_factory, system_id, snapshot_id, status="running", human_decision="undecided")
+        with conn_factory() as conn:
+            assert state_facts.count_undecided_completed_experiments(conn, system_id) == 0
+
+        # completed and undecided -- counts.
+        _insert_experiment(conn_factory, system_id, snapshot_id, status="completed", human_decision="undecided")
+        with conn_factory() as conn:
+            assert state_facts.count_undecided_completed_experiments(conn, system_id) == 1
+
+
 # --- System isolation -------------------------------------------------------------
 
 
@@ -596,6 +665,8 @@ class TestSystemIsolation:
         _insert_capability_node(conn_factory, sys_a, snapshot_a, run_a, node_type="capability", name="Cap A")
         _insert_build(conn_factory, sys_a, snapshot_a, status="running")
         _insert_trace(conn_factory, sys_a, "worker", "ta")
+        _insert_probe_plan(conn_factory, sys_a, snapshot_a, run_a, status="approved")
+        _insert_experiment(conn_factory, sys_a, snapshot_a, status="completed", human_decision="undecided")
 
         with conn_factory() as conn:
             # System B sees none of System A's facts.
@@ -610,6 +681,8 @@ class TestSystemIsolation:
             assert state_facts.purpose_defined_in_snapshot(conn, sys_b, snapshot_a) is False
             assert state_facts.capability_count_in_snapshot(conn, sys_b, snapshot_a) == 0
             assert state_facts.get_active_build(conn, sys_b, snapshot_a) is None
+            assert state_facts.count_approved_probe_plans(conn, sys_b) == 0
+            assert state_facts.count_undecided_completed_experiments(conn, sys_b) == 0
 
             facts_b = state_facts.get_connectivity_facts(conn, sys_b, "probe-smoke-check")
             assert facts_b.total_trace_count == 0
@@ -618,6 +691,8 @@ class TestSystemIsolation:
             assert state_facts.get_repository_config(conn, sys_a)["repo_path"] == "/repo/a"
             assert state_facts.get_latest_ready_snapshot(conn, sys_a)["id"] == snapshot_a
             assert state_facts.purpose_defined_in_snapshot(conn, sys_a, snapshot_a) is True
+            assert state_facts.count_approved_probe_plans(conn, sys_a) == 1
+            assert state_facts.count_undecided_completed_experiments(conn, sys_a) == 1
             assert state_facts.capability_count_in_snapshot(conn, sys_a, snapshot_a) == 1
             facts_a = state_facts.get_connectivity_facts(conn, sys_a, "probe-smoke-check")
             assert facts_a.total_trace_count == 1

@@ -67,6 +67,8 @@ __all__ = [
     "ConnectivityFacts",
     "get_connectivity_facts",
     "classify_connectivity_state",
+    "count_approved_probe_plans",
+    "count_undecided_completed_experiments",
 ]
 
 
@@ -343,3 +345,37 @@ def classify_connectivity_state(*, real_trace_count: int, smoke_trace_count: int
     if smoke_trace_count > 0:
         return "smoke_only"
     return "no_signal"
+
+
+# --- Probe plan / experiment review facts (Issue #237) -------------------------
+#
+# These back the "instrumentation path established" preparation-phase
+# completion signal in system_state.derive_user_phase: an approved probe
+# plan is one of the two ways preparation can be considered done (the other
+# being non-no_signal SDK connectivity, via classify_connectivity_state
+# above). Status values match the finite sets in models.py
+# (``ProbePlanStatus = proposed | approved | rejected``,
+# ``ExperimentStatus = draft | running | completed | failed``, and
+# ``human_decision`` defaulting to ``undecided`` until a human records
+# adopted/rejected/needs_more_data) -- the same condition
+# ``system_understanding_service._load_pending_plan_action_ids`` /
+# ``_load_undecided_completed_experiment_ids`` already use for the
+# Instrument/Evaluate stage counts, reproduced here byte-for-byte so both
+# call sites agree on what "approved" / "undecided" mean.
+
+
+def count_approved_probe_plans(conn, system_id: int) -> int:
+    """Count of ``probe_plans`` rows with ``status = 'approved'`` for one system."""
+    return conn.execute(
+        "SELECT COUNT(*) FROM probe_plans WHERE system_id = ? AND status = 'approved'",
+        (system_id,),
+    ).fetchone()[0]
+
+
+def count_undecided_completed_experiments(conn, system_id: int) -> int:
+    """Count of completed experiments with no recorded human decision yet."""
+    return conn.execute(
+        """SELECT COUNT(*) FROM experiments
+           WHERE system_id = ? AND status = 'completed' AND human_decision = 'undecided'""",
+        (system_id,),
+    ).fetchone()[0]
