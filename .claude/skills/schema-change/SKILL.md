@@ -8,9 +8,12 @@ description: Use when changing shared schemas, trace payloads, policy definition
 
 Use this skill when changing:
 
-- `TraceEvent`
+- `TraceEvent` (incl. the Issue #243 additive replay fields
+  `input_capture` / `replayability` / `replay_reasons`)
 - `ControlPolicy`
-- `ShadowResult`
+- `ShadowResult` (now contracted in `shared/schemas/shadow_result.schema.json`,
+  added in Issue #243 — keep it consistent with the server model and the SDK
+  shadow payload)
 - component_id rules
 - mode definitions
 - API payloads

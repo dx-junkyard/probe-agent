@@ -575,6 +575,44 @@ heuristic result.
   (any non-exact); archive/restore are manual. Lifecycle events are
   append-only rows in `probe_pattern_events`.
 
+## Replay / Simulation (issue #242)
+
+- Modules: `app/replay_harness.py` (the standalone worktree harness SCRIPT +
+  `write_harness_files` / `run_inline_candidate`; `REPLAY_HARNESS_VERSION`),
+  `app/replay_runner.py` (worktree lifecycle, `_run_command` sandbox reuse,
+  deterministic input restoration + baseline-vs-recorded comparison),
+  `app/replay_variants.py` (baseline-replay-vs-candidate-replay finite
+  classification), `app/replay_draft.py` (LLM candidate draft →
+  deterministic git-diff), `app/comparison.py` (the shared `field_equal` /
+  `value_equal` / `diff_fields` extracted from `trace_analyzer.py`; #150's
+  `test_shadow_diff.py` must stay green). Routes in `app/routes/replay.py`.
+- Tables (System-scoped, cascade FKs, additive CREATE-only): `replay_sets`,
+  `replay_runs`, `replay_case_results` (#244), `replay_variants`,
+  `replay_variant_case_results`, `replay_variant_drafts` (#245), plus
+  `replay_approvals` (the approval gate). `traces` gained additive
+  `input_capture_json` / `replayability` / `replay_reasons_json` columns
+  (#243). No new tables in Phase D (#246).
+- The replay approval gate is a human `decision_method: manual` record;
+  `POST /replay-runs` / `POST /replay-variant-runs` return 403 without an
+  active (non-revoked) approval. Risk context shown at approval time reuses
+  persisted probe-plan `side_effect_risk` / `replayability` labels (display
+  only — no new reasoning run) plus the fixed Principle-4 warning.
+- Execution goes through `validation_runner._run_command` so network-off /
+  env-allowlist / no-sandbox fail-closed are inherited unchanged;
+  `PROBE_ENABLED=false` + `PYTHONHASHSEED=0` are injected; worktrees are
+  always cleaned up. Comparison and classification are finite sets only
+  (Principle 6); LLM candidate drafts / interpretations are `reasoning_llm`,
+  fail-closed, `is_mock` surfaced, with raw deterministic results kept
+  separate (drafts store provenance via an `intelligence_runs` row).
+- Recorded-error traces ARE executed against candidates on this offline side
+  (`error_to_success` etc.); the live SDK shadow asymmetry is unchanged.
+- Phase D adds only two DETERMINISTIC endpoints (no judgement):
+  `GET /replay-sets/{id}/source` and `POST /replay-source-diff` — both read
+  the pinned snapshot only (Principle 5), never the working tree.
+- New env vars: `PROBE_REPLAY_WORKSPACE_BASE`, `PROBE_REPLAY_TIMEOUT_SECONDS`
+  (server); `PROBE_REPLAY_CAPTURE_MAX_BYTES` (SDK). See the Issue #242
+  section of `docs/project-intelligence.md`.
+
 ## Rules
 
 - Validate incoming payloads.
