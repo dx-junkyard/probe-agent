@@ -3044,8 +3044,8 @@ describe("System Understanding page", () => {
         entrypoint_refs: [{ entrypoint_type: "http_route", entrypoint_ref: "GET:/items" }],
         code_refs: [],
         next_actions: [
-          { action: "Open Interview", link: "/interview" },
-          { action: "Add source metadata", link: "/interview" },
+          { action: "Interview を開く", link: "/interview" },
+          { action: "ソースメタデータを追加", link: "/interview" },
         ],
       },
       {
@@ -3060,8 +3060,8 @@ describe("System Understanding page", () => {
         entrypoint_refs: [],
         code_refs: [],
         next_actions: [
-          { action: "Open docs evidence", link: null },
-          { action: "Create implementation issue", link: null },
+          { action: "ドキュメントの根拠を確認", link: null },
+          { action: "実装 issue を作成", link: null },
         ],
       },
     ],
@@ -3125,7 +3125,7 @@ describe("System Understanding page", () => {
         node_name: "Feature X", notes: null, capability_key: null,
         doc_refs: [{ path: "README.md", start_line: 1, end_line: 5 }],
         symbol_refs: [], entrypoint_refs: [], code_refs: [],
-        next_actions: [{ action: "Open docs evidence", link: null }],
+        next_actions: [{ action: "ドキュメントの根拠を確認", link: null }],
       },
     ],
     gap_summary: [
@@ -3342,8 +3342,8 @@ describe("System Understanding page", () => {
       expect(screen.getByTestId("gap-worklist")).toBeTruthy();
     });
 
-    expect(screen.getByText("Open Interview")).toBeTruthy();
-    expect(screen.getByText("Open docs evidence")).toBeTruthy();
+    expect(screen.getByText("Interview を開く")).toBeTruthy();
+    expect(screen.getByText("ドキュメントの根拠を確認")).toBeTruthy();
   });
 
   test("ignores legacy next-step fields from an old server response (Issue #239 removal contract)", async () => {
@@ -3590,8 +3590,8 @@ describe("System Understanding page", () => {
     entrypoint_refs: [],
     code_refs: [],
     next_actions: [
-      { action: "Open docs evidence", link: null },
-      { action: "Create implementation issue", link: null },
+      { action: "ドキュメントの根拠を確認", link: null },
+      { action: "実装 issue を作成", link: null },
     ],
     source_key: "system_understanding_gap:docs_only:Auth",
     issue_drafts: [],
@@ -5666,6 +5666,9 @@ describe("Hub success summary and pipeline collapse (Issue #211)", () => {
     gaps: [],
     gap_summary: [],
     metadata_coverage: { symbol_count: 42, symbols_with_source_metadata: 5, entrypoint_count: 10, entrypoints_with_capability_link: 3 },
+    // Issue #240: the success summary is now server-supplied (Japanese)
+    // instead of assembled client-side.
+    success_summary: "分析完了 — 8/8 ステップ ・ 42 シンボル ・ 10 エントリポイント",
   };
 
   function mockSuApis(
@@ -5688,9 +5691,9 @@ describe("Hub success summary and pipeline collapse (Issue #211)", () => {
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
 
     const summary = await screen.findByTestId("build-success-summary");
-    expect(summary.textContent).toContain("8/8 steps");
-    expect(summary.textContent).toContain("42 symbols");
-    expect(summary.textContent).toContain("10 entrypoints");
+    expect(summary.textContent).toContain("8/8 ステップ");
+    expect(summary.textContent).toContain("42 シンボル");
+    expect(summary.textContent).toContain("10 エントリポイント");
 
     const collapsed = screen.getByTestId("pipeline-collapsed");
     expect(collapsed.textContent).toContain("8/8 steps complete");

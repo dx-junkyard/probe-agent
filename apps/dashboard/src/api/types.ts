@@ -2148,6 +2148,11 @@ export interface SystemUnderstandingStageStatus {
   stage: NextActionCategory;
   status: SystemUnderstandingStageStatusValue | string;
   counts: Record<string, number>;
+  // Issue #240: server-supplied Japanese display copy. Optional so existing
+  // fixtures/mocks that predate these fields keep working; the UI prefers
+  // them over its local STAGE_LABELS/STAGE_DESCRIPTIONS fallback.
+  label?: string;
+  description?: string;
 }
 
 // Issue #203: before/after gap counts across the last two settled builds.
@@ -2181,6 +2186,10 @@ export interface SystemUnderstandingOut {
   // The canonical "what should the user do next" projection is now
   // `GET /system-state`'s `primary_item` / `page_items` (see useSystemState
   // in api/hooks.ts and SystemStateBanner in components/system-state.tsx).
+  // Issue #240: server-supplied Japanese success summary shown when the whole
+  // pipeline is complete (null/absent otherwise). Optional for backward
+  // compat with fixtures that predate it.
+  success_summary?: string | null;
 }
 
 // Capability context: gaps / probe plans / experiments linked to one

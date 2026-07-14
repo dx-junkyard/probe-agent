@@ -365,6 +365,37 @@ setup の解消案内が出る——これは設計どおりで、後フェー�
 preparation タグ）と `proposal.experiments.undecided`（完了済みだが
 human_decision 未記録の experiment のレビュー促し、diagnosis タグ）。
 
+### 状態メッセージのカタログ化と日本語統一（Issue #240）
+
+状態メッセージ（summary / detail / impact / remediation / action_label、
+pipeline step / stage の表示名、gap のタイトル/next-action、成功サマリ）は
+サーバー側の単一カタログ `app/state_messages.py` に集約され、表示言語は
+日本語に統一されている。`system_state.py` / `system_diagnostics.py` /
+`system_understanding_service.py` はこのカタログから文言を引き、モジュール
+内に f-string の文言を持たない。
+
+- カタログのキーは `state_id` / `check_id`（および必要な variant）を正と
+  する。動的埋め込みは件数・snapshot id・raw な upstream status/error など
+  の事実値のみ（`str.format` の名前付きパラメータ、Principle 6）。LLM に
+  よる文言生成はしない。
+- アクセサ（`state_message` / `pipeline_family_message` /
+  `understanding_message` / `check_title` / `check_message` /
+  `shared_check_message` / `stage_message` / `pipeline_step_detail` 等）は
+  キー欠落時に `KeyError` を送出し、黙って英語/空文字へフォールバックし
+  ない。`phase_label` のみ、サーバー検証済み enum のため未知値でトークンを
+  返す（英語化はしない）。
+- 新しい `StateItem` / `DiagnosticCheck` / pipeline step / stage を追加する
+  ときは、対応するカタログキーを同時に追加する。欠落は
+  `tests/test_state_messages.py`（全 `ALL_*` キーの解決検証 + 実プロデューサ
+  を駆動した網羅検証 + 代表文言スナップショット）が検出する。
+- Dashboard は状態文言を生成しない。stage ラベル/説明・成功サマリ
+  （`SystemUnderstandingOut.success_summary`）・フェーズ表示ラベル・gap
+  アクションはサーバー供給値を消費し、`STAGE_LABELS` /
+  `USER_PHASE_LABELS` / `STEP_CTA` 等の固定ラベルはサーバー文言欠落時の
+  最終手段フォールバックとしてのみ残す。gap の「実装 issue を作成」
+  アクションはラベル一致で識別するため、フロントの `CREATE_ISSUE_ACTION`
+  はカタログの `GAP_CREATE_ISSUE_ACTION` と一致させる。
+
 ## Next Actions
 
 > **撤去済み（Issue #238 → #239）**: 本節が説明していたトップレベルの

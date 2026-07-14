@@ -217,6 +217,30 @@ fallback for intelligence work.
   divergences and the `understanding_refresh_recommended` ==
   `interview.materialized.rebuild_required`-presence equivalence live in
   `tests/test_next_step_parity.py`.
+- **Message catalog (Issue #240)**: all user-facing state copy (summary /
+  detail / impact / remediation / action_label, pipeline-step / stage
+  display names, gap titles / next-actions, the Hub success summary) lives
+  in one server-side catalog, `app/state_messages.py`, and the display
+  language is Japanese. `system_state.py`, `system_diagnostics.py`, and
+  `system_understanding_service.py` look copy up from the catalog by
+  `state_id` / `check_id` (+ variant) instead of holding f-strings.
+  Accessors (`state_message`, `pipeline_family_message`,
+  `understanding_message`, `check_title`, `check_message`,
+  `shared_check_message`, `stage_message`, `pipeline_step_detail`,
+  `gap_title`, `gap_note`, `pipeline_not_run_remediation`, `success_summary`)
+  raise `KeyError` on a missing key -- never a silent English/blank fallback
+  (`phase_label` is the one deliberate exception: it returns the raw token
+  for a server-validated enum). **When you add a new `StateItem` /
+  `DiagnosticCheck` / pipeline step / stage, add its catalog key in the same
+  change** -- `tests/test_state_messages.py` fails otherwise (it verifies
+  every `ALL_*` key resolves, drives the real `run_system_diagnostics` /
+  `build_system_state` producers asserting every emitted id resolves to
+  Japanese, and snapshots representative strings). Dynamic content stays
+  limited to finite facts (counts, snapshot ids, raw upstream status/error)
+  interpolated as named `str.format` params; no reasoning model authors
+  copy. Dashboard consumes server copy (stage `label`/`description`,
+  `SystemUnderstandingOut.success_summary`, `user_phase` labels, gap
+  actions) and keeps its local label maps only as a last-resort fallback.
 
 ## System settings diagnostics (issue #101)
 

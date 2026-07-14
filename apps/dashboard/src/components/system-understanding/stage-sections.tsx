@@ -72,7 +72,7 @@ export const STAGE_DETAIL_LINKS: Record<Stage, { to: string; label: string }[]> 
   ],
 };
 
-export function StageSection({ stage, index, status, counts, children }: {
+export function StageSection({ stage, index, status, counts, label, description, children }: {
   stage: Stage;
   index: number;
   // Issue #202: deterministic completion status/counts for this stage. Both
@@ -80,6 +80,10 @@ export function StageSection({ stage, index, status, counts, children }: {
   // (no badge, no counts line) instead of breaking.
   status?: string;
   counts?: Record<string, number>;
+  // Issue #240: server-supplied Japanese label/description. When absent
+  // (older server or a fixture), fall back to the local English maps.
+  label?: string;
+  description?: string;
   children: ReactNode;
 }) {
   const links = STAGE_DETAIL_LINKS[stage];
@@ -93,7 +97,7 @@ export function StageSection({ stage, index, status, counts, children }: {
         <div>
           <div className="flex items-center gap-2">
             <h2 className="text-lg font-semibold" data-testid={`stage-title-${stage}`}>
-              {STAGE_LABELS[stage]}
+              {label || STAGE_LABELS[stage]}
             </h2>
             {status && (
               <Badge
@@ -105,7 +109,7 @@ export function StageSection({ stage, index, status, counts, children }: {
               </Badge>
             )}
           </div>
-          <p className="text-sm text-muted-foreground">{STAGE_DESCRIPTIONS[stage]}</p>
+          <p className="text-sm text-muted-foreground">{description || STAGE_DESCRIPTIONS[stage]}</p>
           {countEntries.length > 0 && (
             <p
               className="text-xs text-muted-foreground mt-0.5"

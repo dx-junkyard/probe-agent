@@ -856,7 +856,10 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
             entrypoints_with_capability_link=mc.entrypoints_with_capability_link,
         )
     stages = [
-        SystemUnderstandingStageStatusOut(stage=s.stage, status=s.status, counts=s.counts)
+        SystemUnderstandingStageStatusOut(
+            stage=s.stage, status=s.status, counts=s.counts,
+            label=s.label, description=s.description,
+        )
         for s in summary.stages
     ]
     gap_trend = [
@@ -877,6 +880,7 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
         metadata_coverage=metadata_coverage,
         stages=stages,
         gap_trend=gap_trend,
+        success_summary=summary.success_summary,
     )
 
 

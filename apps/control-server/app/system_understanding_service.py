@@ -19,7 +19,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
-from . import state_facts
+from . import state_facts, state_messages
 from .db import get_conn
 from .system_state import UnderstandingStatus, evaluate_understanding
 
@@ -61,6 +61,17 @@ class StageStatus:
     stage: str
     status: str
     counts: Dict[str, int] = field(default_factory=dict)
+    # Issue #240: server-supplied Japanese display copy. Filled from the
+    # shared catalog by stage id so the Dashboard renders one canonical
+    # label/description instead of its own English STAGE_LABELS map.
+    label: str = ""
+    description: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.label or not self.description:
+            msg = state_messages.stage_message(self.stage)
+            self.label = self.label or msg["label"]
+            self.description = self.description or msg["description"]
 
 
 # Issue #203: before/after gap counts across the last two settled builds.
@@ -105,6 +116,11 @@ class SystemUnderstandingSummary:
     # `_check_understanding_refresh_recommended` below, which is kept because
     # `system_state.py` still calls it to build the
     # `interview.materialized.rebuild_required` StateItem.
+    # Issue #240: server-supplied Japanese success summary shown when the
+    # whole pipeline is complete (replaces the Dashboard's English
+    # client-assembled `successSummary`). None while the pipeline is not
+    # complete.
+    success_summary: Optional[str] = None
 
 
 def _check_repository_configured(conn, system_id: int) -> PipelineStep:
@@ -150,20 +166,22 @@ def _check_documentation_indexed(conn, system_id: int, snapshot_id: Optional[int
                 return PipelineStep(
                     "documentation_indexed",
                     "warning",
-                    detail="No documentation chunks found",
+                    detail=state_messages.pipeline_step_detail("documentation_indexed.no_chunks"),
                 )
             return PipelineStep("documentation_indexed", "complete")
         if job_step["status"] == "failed":
             return PipelineStep(
                 "documentation_indexed",
                 "failed",
-                detail=job_step["error"] or "documentation_index failed",
+                detail=job_step["error"]
+                or state_messages.pipeline_step_detail("documentation_indexed.build_step_failed_default"),
             )
         if job_step["status"] == "blocked":
             return PipelineStep(
                 "documentation_indexed",
                 "blocked",
-                detail=job_step["error"] or "documentation_index blocked",
+                detail=job_step["error"]
+                or state_messages.pipeline_step_detail("documentation_indexed.build_step_blocked_default"),
             )
     row = state_facts.get_latest_intelligence_run(
         conn, system_id, snapshot_id, ["draft_generation", "repository_drafts"]
@@ -171,7 +189,11 @@ def _check_documentation_indexed(conn, system_id: int, snapshot_id: Optional[int
     if row:
         if row["status"] == "completed":
             return PipelineStep("documentation_indexed", "complete")
-        return PipelineStep("documentation_indexed", "failed", detail=f"run status: {row['status']}")
+        return PipelineStep(
+            "documentation_indexed",
+            "failed",
+            detail=state_messages.pipeline_step_detail("documentation_indexed.run_status", status=row["status"]),
+        )
     return PipelineStep("documentation_indexed", "missing")
 
 
@@ -181,7 +203,11 @@ def _check_documentation_claims_scanned(conn, system_id: int, snapshot_id: Optio
     if state_facts.has_understanding_graph_snapshot(conn, system_id, snapshot_id):
         return PipelineStep("documentation_claims_scanned", "complete")
     if not _is_reasoning_model_available():
-        return PipelineStep("documentation_claims_scanned", "blocked", detail="Reasoning model not configured")
+        return PipelineStep(
+            "documentation_claims_scanned",
+            "blocked",
+            detail=state_messages.pipeline_step_detail("documentation_claims_scanned.blocked"),
+        )
     return PipelineStep("documentation_claims_scanned", "missing")
 
 
@@ -192,7 +218,11 @@ def _check_symbols_indexed(conn, system_id: int, snapshot_id: Optional[int]) -> 
     if row:
         if row["status"] == "completed":
             return PipelineStep("symbols_indexed", "complete")
-        return PipelineStep("symbols_indexed", "failed", detail=f"run status: {row['status']}")
+        return PipelineStep(
+            "symbols_indexed",
+            "failed",
+            detail=state_messages.pipeline_step_detail("symbols_indexed.run_status", status=row["status"]),
+        )
     return PipelineStep("symbols_indexed", "missing")
 
 
@@ -212,7 +242,11 @@ def _check_docs_code_reconciled(conn, system_id: int, snapshot_id: Optional[int]
     if has_graph and has_symbols:
         return PipelineStep("docs_code_reconciled", "complete")
     if has_graph or has_symbols:
-        return PipelineStep("docs_code_reconciled", "warning", detail="Partial data available")
+        return PipelineStep(
+            "docs_code_reconciled",
+            "warning",
+            detail=state_messages.pipeline_step_detail("docs_code_reconciled.partial"),
+        )
     return PipelineStep("docs_code_reconciled", "missing")
 
 
@@ -232,20 +266,22 @@ def _check_capability_hierarchy_ready(conn, system_id: int, snapshot_id: Optiona
                 return PipelineStep(
                     "capability_hierarchy_ready",
                     "warning",
-                    detail=(
-                        "Capability hierarchy run completed but produced no capabilities. "
-                        "This happens when no `probe-agent:` docstring metadata was found in "
-                        "the target repository. Review and approve Interview proposals, generate "
-                        "the review patch, apply it to the target repository, create a new snapshot, "
-                        "then run Build / Refresh."
-                    ),
+                    detail=state_messages.pipeline_step_detail("capability_hierarchy_ready.empty"),
                 )
             return PipelineStep("capability_hierarchy_ready", "complete")
         if row["status"] == "failed":
             return PipelineStep("capability_hierarchy_ready", "failed")
-        return PipelineStep("capability_hierarchy_ready", "warning", detail=f"status: {row['status']}")
+        return PipelineStep(
+            "capability_hierarchy_ready",
+            "warning",
+            detail=state_messages.pipeline_step_detail("capability_hierarchy_ready.status", status=row["status"]),
+        )
     if not _is_reasoning_model_available():
-        return PipelineStep("capability_hierarchy_ready", "blocked", detail="Reasoning model not configured")
+        return PipelineStep(
+            "capability_hierarchy_ready",
+            "blocked",
+            detail=state_messages.pipeline_step_detail("capability_hierarchy_ready.blocked"),
+        )
     return PipelineStep("capability_hierarchy_ready", "missing")
 
 
@@ -494,54 +530,14 @@ GAP_SEVERITY: Dict[str, str] = {
     "ambiguous_ownership": "warning",
 }
 
-GAP_TITLE_TEMPLATES: Dict[str, str] = {
-    "docs_only": "Documented but no matching implementation found: {name}",
-    "code_only": "Implemented but not documented: {name}",
-    "source_doc_mismatch": "Source metadata and docs disagree: {name}",
-    "stale_explanation": "Explanation may be outdated: {name}",
-    "unclassified_entrypoint": "Entrypoint not classified in capability hierarchy: {name}",
-    "missing_probe_flow": "No probe flow defined: {name}",
-    "missing_evidence": "Documentation claim lacks path/line evidence: {name}",
-    "ambiguous_ownership": "Ambiguous ownership: {name}",
-}
-
-# Issue #199: single source of truth for "gap type -> resolution action(s)".
-# For every gap type, index [0] is the primary resolution — the action a
-# gap card AND the top-level Next Action for that gap type both link to.
-# Principle: work that fixes/completes state (classification, metadata)
-# belongs to Interview; work that only reviews/browses existing state
-# belongs to Capability Map / Flow Explorer. Any additional entries after
-# [0] are secondary/alternate actions shown only on the gap card.
-GAP_NEXT_ACTIONS: Dict[str, List[Dict[str, Optional[str]]]] = {
-    "docs_only": [
-        {"action": "Open docs evidence", "link": None},
-        {"action": "Create implementation issue", "link": None},
-    ],
-    "code_only": [
-        {"action": "Open source symbol", "link": "/repository"},
-        {"action": "Add docs or source metadata", "link": "/interview"},
-    ],
-    "source_doc_mismatch": [
-        {"action": "Propose explanation refresh", "link": "/capability-map"},
-    ],
-    "stale_explanation": [
-        {"action": "Propose explanation refresh", "link": "/capability-map"},
-    ],
-    "unclassified_entrypoint": [
-        {"action": "Open Interview", "link": "/interview"},
-        {"action": "Add source metadata", "link": "/interview"},
-    ],
-    "missing_probe_flow": [
-        {"action": "Open Flow Explorer", "link": "/flow-explorer"},
-        {"action": "Create Probe Plan", "link": "/probe-planner"},
-    ],
-    "missing_evidence": [
-        {"action": "Improve documentation index", "link": "/repository"},
-    ],
-    "ambiguous_ownership": [
-        {"action": "Clarify ownership in Interview", "link": "/interview"},
-    ],
-}
+# Issue #199 / #240: the gap-type -> title and gap-type -> resolution action
+# copy now lives in the shared Japanese catalog (state_messages.GAP_*). This
+# module keeps only the ordering/role contract (index [0] is the primary
+# resolution the gap card AND the top-level Next Action both link to; work
+# that fixes/completes state belongs to Interview, review/browse belongs to
+# Capability Map / Flow Explorer). GAP_NEXT_ACTIONS is re-exported for
+# backward-compatible imports/tests that read the structure.
+GAP_NEXT_ACTIONS = state_messages.GAP_NEXT_ACTIONS
 
 
 def _gap_severity(gap_type: Optional[str]) -> str:
@@ -549,12 +545,11 @@ def _gap_severity(gap_type: Optional[str]) -> str:
 
 
 def _gap_title(gap_type: Optional[str], node_name: Optional[str]) -> str:
-    template = GAP_TITLE_TEMPLATES.get(gap_type or "", "Gap: {name}")
-    return template.format(name=node_name or "unknown")
+    return state_messages.gap_title(gap_type or "", node_name or "unknown")
 
 
 def _gap_next_actions(gap_type: Optional[str]) -> List[Dict[str, Optional[str]]]:
-    return list(GAP_NEXT_ACTIONS.get(gap_type or "", []))
+    return state_messages.gap_next_actions(gap_type or "")
 
 
 def _detect_extra_gaps(conn, system_id: int, snapshot_id: int) -> List[Dict[str, Any]]:
@@ -579,7 +574,11 @@ def _detect_extra_gaps(conn, system_id: int, snapshot_id: int) -> List[Dict[str,
             "severity": "info",
             "title": _gap_title("unclassified_entrypoint", ep_label),
             "node_name": ep_label,
-            "notes": f"Entrypoint {uc['entrypoint_type']}:{uc['entrypoint_id']} has no capability classification",
+            "notes": state_messages.gap_note(
+                "unclassified_entrypoint",
+                entrypoint_type=uc["entrypoint_type"],
+                entrypoint_id=uc["entrypoint_id"],
+            ),
             "capability_key": None,
             "doc_refs": [],
             "symbol_refs": [{"path": uc["handler_path"], "qualified_name": uc["handler_qualified_name"]}] if uc["handler_qualified_name"] else [],
@@ -611,7 +610,11 @@ def _detect_extra_gaps(conn, system_id: int, snapshot_id: int) -> List[Dict[str,
             "severity": _gap_severity("missing_probe_flow"),
             "title": _gap_title("missing_probe_flow", ep_label),
             "node_name": ep_label,
-            "notes": f"Entrypoint {ep['entrypoint_type']}:{ep['entrypoint_id']} is classified but has no probe plan",
+            "notes": state_messages.gap_note(
+                "missing_probe_flow",
+                entrypoint_type=ep["entrypoint_type"],
+                entrypoint_id=ep["entrypoint_id"],
+            ),
             "capability_key": ep["capability_key"],
             "doc_refs": [],
             "symbol_refs": [{"path": ep["handler_path"], "qualified_name": ep["handler_qualified_name"]}] if ep["handler_qualified_name"] else [],
@@ -642,7 +645,7 @@ def _detect_extra_gaps(conn, system_id: int, snapshot_id: int) -> List[Dict[str,
                         "severity": _gap_severity("missing_evidence"),
                         "title": _gap_title("missing_evidence", node_name),
                         "node_name": node_name,
-                        "notes": f"Documentation claim '{node_name}' has no file/line evidence",
+                        "notes": state_messages.gap_note("missing_evidence", name=node_name),
                         "capability_key": None,
                         "doc_refs": [],
                         "symbol_refs": [],
@@ -1015,6 +1018,18 @@ def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
         # Issue #203: gap-count trend is a plain SELECT against this same
         # connection (system_understanding_gap_history).
         summary.gap_trend = _load_gap_trend(conn, system_id)
+
+        # Issue #240: build the success summary server-side (Japanese) when
+        # every pipeline step is complete, so the Dashboard renders it
+        # verbatim instead of assembling its own English string.
+        if pipeline and all(s.status == "complete" for s in pipeline):
+            coverage = summary.metadata_coverage
+            summary.success_summary = state_messages.success_summary(
+                done=len(pipeline),
+                total=len(pipeline),
+                symbol_count=coverage.symbol_count if coverage else 0,
+                entrypoint_count=coverage.entrypoint_count if coverage else 0,
+            )
 
     return summary
 

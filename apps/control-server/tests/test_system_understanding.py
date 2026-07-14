@@ -535,7 +535,7 @@ class TestGapWorklist:
             assert len(unclassified_gaps) > 0
             for ug in unclassified_gaps:
                 assert ug["severity"] == "info"
-                assert any(a["action"] == "Open Interview" for a in ug["next_actions"])
+                assert any(a["action"] == "Interview を開く" for a in ug["next_actions"])
 
     def test_no_gaps_returns_empty_list(self, admin_client, tmp_path):
         """When no snapshot exists, gaps should be an empty list."""

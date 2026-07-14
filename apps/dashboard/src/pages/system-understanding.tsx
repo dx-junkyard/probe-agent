@@ -182,6 +182,8 @@ function DataView({ data, checksByStep, pageItems, onRunBuild, buildDisabled }: 
         index={1}
         status={understandStage?.status}
         counts={understandStage?.counts}
+        label={understandStage?.label}
+        description={understandStage?.description}
       >
         {/* Pipeline Checklist */}
         {pipelineCollapsed ? (
@@ -387,6 +389,8 @@ function DataView({ data, checksByStep, pageItems, onRunBuild, buildDisabled }: 
         index={2}
         status={observeStage?.status}
         counts={observeStage?.counts}
+        label={observeStage?.label}
+        description={observeStage?.description}
       >
         {/* Key Entrypoints */}
         {data.entrypoints.length > 0 ? (
@@ -457,6 +461,8 @@ function DataView({ data, checksByStep, pageItems, onRunBuild, buildDisabled }: 
         stage="instrument"
         index={3}
         status={instrumentStage?.status}
+        label={instrumentStage?.label}
+        description={instrumentStage?.description}
       >
         <InstrumentSummary counts={instrumentStage?.counts} />
       </StageSection>
@@ -465,6 +471,8 @@ function DataView({ data, checksByStep, pageItems, onRunBuild, buildDisabled }: 
         stage="evaluate"
         index={4}
         status={evaluateStage?.status}
+        label={evaluateStage?.label}
+        description={evaluateStage?.description}
       >
         <EvaluateSummary counts={evaluateStage?.counts} />
       </StageSection>
@@ -506,14 +514,12 @@ export default function SystemUnderstandingPage() {
   // action, not the page's protagonist — demote it visually and show a
   // standalone success summary instead (previously part of the now-removed
   // primary_action card, Issue #239).
+  // Issue #240: the summary text is now supplied by the server
+  // (`success_summary`, Japanese) instead of being assembled here in English.
   const pipelineAllComplete = (data?.pipeline?.length ?? 0) > 0 &&
     (data?.pipeline ?? []).every((s) => s.status === "complete");
   const successSummary = pipelineAllComplete && !buildRunning
-    ? [
-        `Analysis complete — ${data!.pipeline.length}/${data!.pipeline.length} steps`,
-        data?.metadata_coverage ? `${data.metadata_coverage.symbol_count} symbols` : null,
-        data?.metadata_coverage ? `${data.metadata_coverage.entrypoint_count} entrypoints` : null,
-      ].filter(Boolean).join(" · ")
+    ? (data?.success_summary ?? undefined)
     : undefined;
 
   // Refresh the aggregated view and diagnostics once a build job settles.

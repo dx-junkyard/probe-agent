@@ -3201,6 +3201,11 @@ class SystemUnderstandingStageStatusOut(BaseModel):
     stage: str
     status: str
     counts: Dict[str, int] = Field(default_factory=dict)
+    # Issue #240: server-supplied Japanese display copy (optional so existing
+    # dashboard contract tests that build this object without them stay valid;
+    # the Dashboard prefers these over its local STAGE_LABELS fallback).
+    label: str = ""
+    description: str = ""
 
 
 # Issue #203: deterministic before/after comparison of gap counts between the
@@ -3235,6 +3240,10 @@ class SystemUnderstandingOut(BaseModel):
     # #203's `understanding_refresh_recommended` were removed in Issue #239.
     # The canonical "what should the user do next" projection is now
     # `GET /system-state`'s `primary_item` / `page_items` (Issue #238).
+    # Issue #240: server-supplied Japanese summary shown when the whole
+    # pipeline is complete (None otherwise); replaces the Dashboard's
+    # client-assembled English success string.
+    success_summary: Optional[str] = None
 
 
 class CapabilityContextProbePlanOut(BaseModel):

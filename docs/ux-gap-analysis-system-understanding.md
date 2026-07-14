@@ -150,17 +150,21 @@ pipeline 全 complete かつ purpose 未定義のとき `Define System Purpose`
 
 ### 表示言語
 
-i18n 機構は不在（i18next 等の import ゼロ）。言語の境界は
-**どのバックエンドモジュールが文字列を生成したかに一致**している:
+**（Issue #240 で解消済み）** かつては i18n 機構が不在で、言語の境界が
+「どのバックエンドモジュールが文字列を生成したか」に一致しており、
+`system_state.py` / `system_diagnostics.py` は日本語、
+`system_understanding_service.py` の pipeline / NextAction / stage 文言は
+英語で、同一画面に英日が混在していた。
 
-- 日本語: `system_state.py` / `system_diagnostics.py` の全メッセージ、
-  Interview ページ全体、Setup Guide ページ全体、
-  `system-understanding.tsx:558-561` のインライン日本語バナー。
-- 英語: pipeline checklist、`system_understanding_service.py` の
-  NextAction 文言、Capability Map / Flow Explorer / Probe Planner 等。
-
-結果として同一画面内で「Capability hierarchy ready — complete」（英）と
-「…capability 階層を生成してください。」（日）が並ぶ。
+Issue #240 で状態メッセージ（summary / detail / impact / remediation /
+action_label、pipeline step / stage / gap の表示文言、成功サマリ）を
+サーバー側の単一カタログ `app/state_messages.py` に集約し、表示言語を
+**日本語に統一**した。カタログのキーは `state_id` / `check_id` を正とし、
+キー欠落は `tests/test_state_messages.py` が検出する（黙って英語/空文字へ
+フォールバックしない）。フロントは文言を生成せず、stage ラベル・成功
+サマリ・フェーズ表示・gap アクションはサーバー供給値を消費する（欠落時の
+固定ラベルのみ最終手段フォールバックとして残す）。i18n フレームワーク
+（多言語切替）の導入は引き続き対象外。
 
 ### ドキュメント負債
 
@@ -222,10 +226,11 @@ i18n 機構は不在（i18next 等の import ゼロ）。言語の境界は
 
 ### P4 — 言語ポリシー
 
-15. 表示言語を 1 つに決め（現状の利用者に合わせるなら日本語）、
-    固有概念は初出のみ併記（例: システム目的（System Purpose））。
-    バックエンド発の文言（`system_state` / `system_diagnostics` / NextAction）を
-    同一言語に揃えることが先決。フロントの i18n 基盤導入はその後でよい。
+15. **（Issue #240 で対応済み）** 表示言語を日本語に統一し、バックエンド
+    発の文言（`system_state` / `system_diagnostics` /
+    `system_understanding_service` の pipeline / stage / gap 文言）を
+    サーバー側カタログ `app/state_messages.py` に集約した。固有概念の初出
+    併記や i18n 基盤導入は引き続き対象外。
 
 ### 付随タスク
 
