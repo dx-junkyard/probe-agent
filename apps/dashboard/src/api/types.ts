@@ -1993,21 +1993,11 @@ export interface SystemUnderstandingPipelineStep {
   detail?: string | null;
 }
 
+// Still used by SystemUnderstandingStageStatus.stage (the 4 Hub stages).
+// Issue #239 removed SystemUnderstandingNextAction / NextActionKind, which
+// used to be this type's only other consumer (the deprecated top-level
+// next_actions / primary_action fields).
 export type NextActionCategory = "understand" | "observe" | "instrument" | "evaluate";
-
-// Issue #201: how the action is carried out. "navigate" (default) links to a
-// page; "build" triggers the Build / Refresh job directly. Optional on the
-// client type (rather than required) so it defaults to "navigate" without
-// forcing every existing next_actions fixture/mock to be updated.
-export type NextActionKind = "navigate" | "build";
-
-export interface SystemUnderstandingNextAction {
-  action: string;
-  reason: string;
-  category: NextActionCategory;
-  link?: string | null;
-  action_kind?: NextActionKind;
-}
 
 export interface SystemUnderstandingGapSummary {
   gap_type: string;
@@ -2158,6 +2148,11 @@ export interface SystemUnderstandingStageStatus {
   stage: NextActionCategory;
   status: SystemUnderstandingStageStatusValue | string;
   counts: Record<string, number>;
+  // Issue #240: server-supplied Japanese display copy. Optional so existing
+  // fixtures/mocks that predate these fields keep working; the UI prefers
+  // them over its local STAGE_LABELS/STAGE_DESCRIPTIONS fallback.
+  label?: string;
+  description?: string;
 }
 
 // Issue #203: before/after gap counts across the last two settled builds.
@@ -2179,19 +2174,22 @@ export interface SystemUnderstandingOut {
   gaps: SystemUnderstandingGap[];
   gap_summary: SystemUnderstandingGapSummary[];
   metadata_coverage: SystemUnderstandingMetadataCoverage | null;
-  next_actions: SystemUnderstandingNextAction[];
-  // Issue #201: single highest-priority action for the current state; null
-  // while a build job is actively running.
-  primary_action?: SystemUnderstandingNextAction | null;
   // Issue #202: per-stage completion status + counts. Optional so existing
   // fixtures/mocks that predate this field keep working (backward compat).
   stages?: SystemUnderstandingStageStatus[];
   // Issue #203: gap-count trend across the last two settled builds (empty
-  // until 2 builds have recorded history), and whether a materialized
-  // Interview change post-dates the latest completed build. Optional for
-  // backward compat with fixtures/mocks that predate this field.
+  // until 2 builds have recorded history). Optional for backward compat with
+  // fixtures/mocks that predate this field.
   gap_trend?: SystemUnderstandingGapTrend[];
-  understanding_refresh_recommended?: boolean;
+  // Issue #201's `primary_action`, Issue #174's `next_actions`, and Issue
+  // #203's `understanding_refresh_recommended` were removed in Issue #239.
+  // The canonical "what should the user do next" projection is now
+  // `GET /system-state`'s `primary_item` / `page_items` (see useSystemState
+  // in api/hooks.ts and SystemStateBanner in components/system-state.tsx).
+  // Issue #240: server-supplied Japanese success summary shown when the whole
+  // pipeline is complete (null/absent otherwise). Optional for backward
+  // compat with fixtures that predate it.
+  success_summary?: string | null;
 }
 
 // Capability context: gaps / probe plans / experiments linked to one

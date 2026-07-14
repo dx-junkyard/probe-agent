@@ -236,6 +236,16 @@ curl -sS -w "\\nHTTP %{http_code}\\n" -X POST "$PROBE_SERVER_URL/traces" \\
           レビュー用 patch の適用から、監視対象アプリの設定、probe-agent との疎通確認までを一続きで案内します。
           自分の実行形態に近いパターンを選んで進めてください。
         </p>
+        {/* Issue #241: bidirectional Connect SDK ↔ Setup Guide navigation.
+            Connect SDK links here ("Verify the connection in the Setup
+            Guide"); this is the reverse direction — back to token issuance. */}
+        <Link
+          to="/connect-sdk"
+          data-testid="setup-guide-connect-sdk-link"
+          className="mt-2 inline-block text-sm text-primary underline"
+        >
+          ← Connect SDK でトークンを発行する
+        </Link>
       </div>
 
       {sessionId && <SessionContextBanner sessionId={sessionId} />}

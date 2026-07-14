@@ -264,6 +264,48 @@ def _get_state(client, hdrs):
     return data, {i["state_id"]: i for i in data["items"]}
 
 
+def _insert_probe_plan(system_id, snapshot_id, run_id, *, status="proposed"):
+    from app.db import get_conn
+
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO probe_plans
+                   (system_id, snapshot_id, intelligence_run_id, feature_id,
+                    objective, status, origin, created_at, updated_at)
+               VALUES (?, ?, ?, 'feat-1', 'obj', ?, 'manual', ?, ?)""",
+            (system_id, snapshot_id, run_id, status, now, now),
+        )
+        return cur.lastrowid
+
+
+def _insert_probe_patch(plan_id, system_id, snapshot_id, *, status="generated"):
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO probe_patches
+                   (plan_id, system_id, snapshot_id, commit_sha, diff,
+                    skipped, status, cleanup_state, created_at)
+               VALUES (?, ?, ?, 'deadbeef', 'diff', '[]', ?, 'not_attempted', 0)""",
+            (plan_id, system_id, snapshot_id, status),
+        )
+        return cur.lastrowid
+
+
+def _insert_validation_run(patch_id, system_id, variant, *, overall_success=True):
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO validation_runs
+                   (patch_id, system_id, variant, worktree_path, overall_success,
+                    trace_status, network_isolation, cleanup_state, created_at)
+               VALUES (?, ?, ?, '/tmp/x', ?, 'not_checked', 'not_requested', 'not_attempted', 0)""",
+            (patch_id, system_id, variant, 1 if overall_success else 0),
+        )
+
+
 class TestSystemStateBasics:
     def test_requires_auth(self, admin_client):
         r = admin_client.get("/system-state")
@@ -737,6 +779,171 @@ class TestPipelineState:
         assert "pipeline.capability_hierarchy.not_run" not in items
 
 
+class TestDocsCodeReconcileState:
+    """Issue #238: pipeline.docs_code_reconcile.* absorbs
+    system_understanding_service._check_docs_code_reconciled's "has an
+    understanding graph AND has code symbols" structural condition, which
+    the existing diagnostic.pipeline_understanding_graph check (graph
+    presence only) does not fully cover.
+    """
+
+    def _snapshot(self, admin_client, hdrs, tmp_path):
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+        return snap.json()["id"]
+
+    def test_neither_graph_nor_symbols_is_not_run(self, admin_client, tmp_path):
+        _, sys, hdrs = _setup(admin_client)
+        self._snapshot(admin_client, hdrs, tmp_path)
+
+        _, items = _get_state(admin_client, hdrs)
+        item = items["pipeline.docs_code_reconcile.not_run"]
+        assert item["severity"] == "warning"
+        assert item["status"] == "missing"
+        assert item["user_action_kind"] == "build"
+        assert "pipeline.docs_code_reconcile.partial" not in items
+
+    def test_only_graph_is_partial(self, admin_client, tmp_path):
+        from app.db import get_conn
+
+        _, sys, hdrs = _setup(admin_client)
+        snapshot_id = self._snapshot(admin_client, hdrs, tmp_path)
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO understanding_graph_snapshots
+                       (system_id, snapshot_id, graph_json, source_hash, claim_count,
+                        confidence_summary, created_at)
+                   VALUES (?, ?, '{}', '', 0, '{}', 0)""",
+                (sys["id"], snapshot_id),
+            )
+
+        _, items = _get_state(admin_client, hdrs)
+        item = items["pipeline.docs_code_reconcile.partial"]
+        assert item["severity"] == "warning"
+        assert item["evidence"]["has_understanding_graph"] is True
+        assert item["evidence"]["has_code_symbols"] is False
+        assert "pipeline.docs_code_reconcile.not_run" not in items
+
+    def test_only_symbols_is_partial(self, admin_client, tmp_path):
+        from app.db import get_conn
+
+        _, sys, hdrs = _setup(admin_client)
+        snapshot_id = self._snapshot(admin_client, hdrs, tmp_path)
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO code_symbols
+                       (snapshot_id, system_id, path, qualified_name, kind, start_line, end_line)
+                   VALUES (?, ?, 'a.py', 'mod.fn', 'function', 1, 2)""",
+                (snapshot_id, sys["id"]),
+            )
+
+        _, items = _get_state(admin_client, hdrs)
+        item = items["pipeline.docs_code_reconcile.partial"]
+        assert item["evidence"]["has_understanding_graph"] is False
+        assert item["evidence"]["has_code_symbols"] is True
+
+    def test_both_present_returns_no_item(self, admin_client, tmp_path):
+        from app.db import get_conn
+
+        _, sys, hdrs = _setup(admin_client)
+        snapshot_id = self._snapshot(admin_client, hdrs, tmp_path)
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO understanding_graph_snapshots
+                       (system_id, snapshot_id, graph_json, source_hash, claim_count,
+                        confidence_summary, created_at)
+                   VALUES (?, ?, '{}', '', 0, '{}', 0)""",
+                (sys["id"], snapshot_id),
+            )
+            conn.execute(
+                """INSERT INTO code_symbols
+                       (snapshot_id, system_id, path, qualified_name, kind, start_line, end_line)
+                   VALUES (?, ?, 'a.py', 'mod.fn', 'function', 1, 2)""",
+                (snapshot_id, sys["id"]),
+            )
+
+        _, items = _get_state(admin_client, hdrs)
+        assert "pipeline.docs_code_reconcile.not_run" not in items
+        assert "pipeline.docs_code_reconcile.partial" not in items
+
+
+class TestProbePlanReviewState:
+    """Issue #238: proposal.probe_plans.proposed /
+    .approved_without_patch absorb system_understanding_service's
+    "Review probe plan" / "Generate / validate probe patch" NextAction
+    sources into system_state.py.
+    """
+
+    def _snapshot(self, admin_client, hdrs, tmp_path):
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+        return snap.json()["id"]
+
+    def test_proposed_plan_surfaces_review_item(self, admin_client, tmp_path):
+        _, sys, hdrs = _setup(admin_client)
+        snapshot_id = self._snapshot(admin_client, hdrs, tmp_path)
+        run_id = _insert_intelligence_run(sys["id"], snapshot_id, "probe_plan", "completed")
+        _insert_probe_plan(sys["id"], snapshot_id, run_id, status="proposed")
+
+        _, items = _get_state(admin_client, hdrs)
+        item = items["proposal.probe_plans.proposed"]
+        assert item["severity"] == "warning"
+        assert item["user_action_kind"] == "review"
+        assert item["evidence"]["proposed_probe_plan_count"] == 1
+        assert item["target_ui"]["route"] == "/probe-planner"
+        assert "proposal.probe_plans.approved_without_patch" not in items
+
+    def test_approved_without_patch_surfaces_patch_pending_item(self, admin_client, tmp_path):
+        _, sys, hdrs = _setup(admin_client)
+        snapshot_id = self._snapshot(admin_client, hdrs, tmp_path)
+        run_id = _insert_intelligence_run(sys["id"], snapshot_id, "probe_plan", "completed")
+        _insert_probe_plan(sys["id"], snapshot_id, run_id, status="approved")
+
+        _, items = _get_state(admin_client, hdrs)
+        item = items["proposal.probe_plans.approved_without_patch"]
+        assert item["severity"] == "info"
+        assert item["evidence"]["approved_probe_plan_without_patch_count"] == 1
+        assert "proposal.probe_plans.proposed" not in items
+
+    def test_approved_with_validated_patch_has_no_item(self, admin_client, tmp_path):
+        _, sys, hdrs = _setup(admin_client)
+        snapshot_id = self._snapshot(admin_client, hdrs, tmp_path)
+        run_id = _insert_intelligence_run(sys["id"], snapshot_id, "probe_plan", "completed")
+        plan_id = _insert_probe_plan(sys["id"], snapshot_id, run_id, status="approved")
+        patch_id = _insert_probe_patch(plan_id, sys["id"], snapshot_id)
+        _insert_validation_run(patch_id, sys["id"], "baseline")
+        _insert_validation_run(patch_id, sys["id"], "probed")
+
+        _, items = _get_state(admin_client, hdrs)
+        assert "proposal.probe_plans.approved_without_patch" not in items
+
+    def test_proposed_item_is_tagged_preparation_phase(self, admin_client, tmp_path):
+        """Issue #238: reviewing a proposed plan is one of the two ways to
+        satisfy derive_user_phase's instrumentation-path OR condition, so
+        this item must not default to the state_group="proposal" phase
+        ("diagnosis") the way approved_without_patch does.
+        """
+        _, sys, hdrs = _setup(admin_client)
+        snapshot_id = self._snapshot(admin_client, hdrs, tmp_path)
+        run_id = _insert_intelligence_run(sys["id"], snapshot_id, "probe_plan", "completed")
+        _insert_probe_plan(sys["id"], snapshot_id, run_id, status="proposed")
+
+        _, items = _get_state(admin_client, hdrs)
+        assert items["proposal.probe_plans.proposed"]["phase"] == "preparation"
+
+
 class TestDiagnosticsProjectionCompatibility:
     """Diagnostics stays backward compatible while sharing evidence with state assessment."""
 
@@ -874,7 +1081,15 @@ class TestIssue236FactsExtractionRegression:
         Purpose/Core Capabilities are satisfied for the current snapshot --
         the highest-risk scenario for state_facts.py since every pipeline
         raw-fact getter and both purpose/capability base facts are exercised
-        for a non-empty result at once."""
+        for a non-empty result at once.
+
+        Issue #238: also seeds an understanding graph snapshot and a code
+        symbol so pipeline.docs_code_reconcile.* (added by this issue) is
+        satisfied too -- otherwise this "every pipeline step complete"
+        scenario would no longer be true.
+        """
+        from app.db import get_conn
+
         _, sys, hdrs = _setup(admin_client)
         repo, sha = _init_git_repo(tmp_path)
         admin_client.put(
@@ -893,6 +1108,20 @@ class TestIssue236FactsExtractionRegression:
         run_id = _insert_intelligence_run(sys["id"], snapshot_id, "capability_hierarchy", "completed")
         _insert_capability_node(sys["id"], snapshot_id, run_id, node_type="purpose", name="Test system")
         _insert_capability_node(sys["id"], snapshot_id, run_id, node_type="capability", name="Item management")
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO understanding_graph_snapshots
+                       (system_id, snapshot_id, graph_json, source_hash, claim_count,
+                        confidence_summary, created_at)
+                   VALUES (?, ?, '{}', '', 0, '{}', 0)""",
+                (sys["id"], snapshot_id),
+            )
+            conn.execute(
+                """INSERT INTO code_symbols
+                       (snapshot_id, system_id, path, qualified_name, kind, start_line, end_line)
+                   VALUES (?, ?, 'a.py', 'mod.fn', 'function', 1, 2)""",
+                (snapshot_id, sys["id"]),
+            )
 
         data, items = _get_state(admin_client, hdrs)
         assert not any(i.startswith("pipeline.") for i in items)
@@ -904,15 +1133,15 @@ class TestIssue236FactsExtractionRegression:
         assert items["understanding.capabilities.satisfied"]["status"] == "satisfied"
         assert items["understanding.capabilities.satisfied"]["severity"] == "ok"
 
-        # /repository/system-understanding agrees: no purpose/capabilities gap.
+        # /repository/system-understanding agrees: no purpose/capabilities gap
+        # (Issue #239 removed this response's own next_actions projection;
+        # the items["understanding.*.satisfied"] assertions above are the
+        # canonical check for "no purpose/capabilities gap" now).
         su_r = admin_client.get("/repository/system-understanding", headers=hdrs)
         assert su_r.status_code == 200, su_r.text
         su_data = su_r.json()
         assert su_data["purpose"]["name"] == "Test system"
         assert len(su_data["capabilities"]) == 1
-        labels = [a["action"] for a in su_data["next_actions"]]
-        assert "Define System Purpose" not in labels
-        assert "Identify main system capabilities" not in labels
 
 
 class TestDeriveUserPhase:

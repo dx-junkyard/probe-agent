@@ -38,7 +38,10 @@ function SeverityIcon({ severity }: { severity: string }) {
   }
 }
 
-const CREATE_ISSUE_ACTION = "Create implementation issue";
+// Issue #240: the gap next-action copy is now server-supplied Japanese
+// (state_messages.GAP_CREATE_ISSUE_ACTION). This must match that catalog
+// value exactly, since the create-issue action is identified by its label.
+const CREATE_ISSUE_ACTION = "実装 issue を作成";
 
 const ISSUE_DRAFT_STATUS_LABELS: Record<IssueDraftStatus, string> = {
   draft: "Draft",

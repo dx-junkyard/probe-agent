@@ -9,6 +9,7 @@ import { Label } from "@/components/ui/label";
 import { useCreateSystem } from "@/api/hooks";
 import { DiagnosticsBadge } from "@/components/diagnostics-badge";
 import { ConnectivityBadge } from "@/components/connectivity-badge";
+import { UserPhaseIndicator } from "@/components/system-state";
 import { toast } from "sonner";
 
 function initTheme() {
@@ -83,6 +84,9 @@ export function Header() {
       </div>
 
       <div className="flex items-center gap-2">
+        {/* Issue #239: current user phase (setup -> preparation -> diagnosis)
+            with per-phase completion, straight from GET /system-state. */}
+        <UserPhaseIndicator />
         <ConnectivityBadge />
         <DiagnosticsBadge />
         <ThemeToggle />

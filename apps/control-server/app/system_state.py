@@ -35,7 +35,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from . import state_facts
+from . import state_facts, state_messages
 from .db import get_conn
 from .git_ops import GitError
 from .models import SMOKE_CHECK_COMPONENT_ID
@@ -106,6 +106,15 @@ STATE_ID_PHASE_OVERRIDES: Dict[str, str] = {
     "diagnostic.pipeline_capability_hierarchy": "preparation",
     "diagnostic.system_purpose": "preparation",
     "diagnostic.system_capabilities": "preparation",
+    # Issue #238: reviewing/approving a proposed probe plan is one of the two
+    # ways to satisfy derive_user_phase's "an approved probe plan OR
+    # non-no_signal connectivity" preparation-completion signal -- see
+    # _probe_plan_proposed_state_item's docstring. Its sibling
+    # proposal.probe_plans.approved_without_patch is deliberately NOT listed
+    # here: an approved plan already satisfies that signal regardless of
+    # patch validation, so it stays at the state_group="proposal" default
+    # ("diagnosis").
+    "proposal.probe_plans.proposed": "preparation",
 }
 
 # Diagnostic categories (system_diagnostics.DiagnosticCheck.category) that
@@ -200,6 +209,11 @@ class StateItem:
 class PhaseCompletion:
     phase: str  # one of PHASE_ORDER
     complete: bool
+    # Japanese display label (Issue #240), sourced from
+    # state_messages.PHASE_LABELS -- additive; the Dashboard's
+    # USER_PHASE_LABELS map is now only a last-resort fallback for an older
+    # Control Server response that predates this field.
+    label: str = ""
 
 
 @dataclass
@@ -572,53 +586,53 @@ def _understanding_state_item(status: UnderstandingStatus, *, purpose: bool) -> 
     anchor = ANCHOR_INTERVIEW_PURPOSE if purpose else ANCHOR_INTERVIEW_CAPABILITIES
 
     if status.kind == "satisfied_current":
+        state_id = f"{prefix}.satisfied"
+        msg = state_messages.understanding_message(state_id)
         return StateItem(
-            state_id=f"{prefix}.satisfied",
+            state_id=state_id,
             state_group="understanding",
             severity="ok",
             status="satisfied",
             user_action_kind="none",
             intervention_timing="none",
             subject=subject,
-            summary=f"{subject} は現在の snapshot で確認済みです。",
-            detail=f"{subject} は現在の snapshot で定義されています。",
+            summary=msg["summary"],
+            detail=msg["detail"],
         )
     if status.kind == "baseline_reusable":
         baseline = status.baseline
+        state_id = f"{prefix}.baseline_reusable"
+        msg = state_messages.understanding_message(state_id)
         return StateItem(
-            state_id=f"{prefix}.baseline_reusable",
+            state_id=state_id,
             state_group="understanding",
             severity="ok",
             status="satisfied",
             user_action_kind="none",
             intervention_timing="none",
             subject=subject,
-            summary=f"{subject} は確認済み baseline を再利用できます。",
-            detail=(
-                f"{subject} は snapshot #{baseline.snapshot_id} の確認済み理解を再利用できます。"
-                "今回の差分には再確認が必要な根拠変更は見つかりませんでした。"
-            ),
+            summary=msg["summary"],
+            detail=msg["detail"].format(baseline_snapshot_id=baseline.snapshot_id),
             evidence={"baseline_snapshot_id": baseline.snapshot_id, "source": baseline.source},
         )
     if status.kind == "diff_impacted":
         baseline = status.baseline
         impact = status.impact
         reason = " ".join(impact.reasons) if impact and impact.reasons else "前回確認済み理解に影響しうる差分があります。"
+        state_id = f"{prefix}.diff_impacted"
+        msg = state_messages.understanding_message(state_id)
         return StateItem(
-            state_id=f"{prefix}.diff_impacted",
+            state_id=state_id,
             state_group="understanding",
             severity="warning",
             status="impacted",
             user_action_kind="confirm",
             intervention_timing="before_next_step",
             subject=subject,
-            summary=f"{subject} は最新 snapshot との差分で再確認が必要です。",
-            detail=(
-                f"{subject} は snapshot #{baseline.snapshot_id} で確認済みですが、"
-                f"最新 snapshot との差分に影響候補があります。{reason}"
-            ),
-            impact="確認済み理解をそのまま使えるか判断が必要です。",
-            remediation=f"Interview で {subject} を再確認してください。",
+            summary=msg["summary"],
+            detail=msg["detail"].format(baseline_snapshot_id=baseline.snapshot_id, reason=reason),
+            impact=msg["impact"],
+            remediation=msg["remediation"],
             evidence={
                 "baseline_snapshot_id": baseline.snapshot_id,
                 "source": baseline.source,
@@ -626,7 +640,7 @@ def _understanding_state_item(status: UnderstandingStatus, *, purpose: bool) -> 
                 "reasons": impact.reasons if impact else [],
             },
             target_ui=TargetUi(
-                route=PAGE_INTERVIEW, anchor=anchor, action_label=f"Interview で{subject}を再確認",
+                route=PAGE_INTERVIEW, anchor=anchor, action_label=msg["action_label"],
             ),
             display_routes=[PAGE_SYSTEM_UNDERSTANDING],
             related_checks=["system_purpose" if purpose else "system_capabilities"],
@@ -634,43 +648,44 @@ def _understanding_state_item(status: UnderstandingStatus, *, purpose: bool) -> 
     if status.kind == "unconfirmed":
         baseline = status.baseline
         count = baseline.purpose_count if purpose else baseline.capability_count
+        state_id = f"{prefix}.unconfirmed"
+        msg = state_messages.understanding_message(state_id)
         return StateItem(
-            state_id=f"{prefix}.unconfirmed",
+            state_id=state_id,
             state_group="understanding",
             severity="warning",
             status="unconfirmed",
             user_action_kind="confirm",
             intervention_timing="before_next_step",
             subject=subject,
-            summary=f"{subject} に未確認の候補があります。",
-            detail=(
-                f"Interview に未確認の {subject} 候補が {count} 件あります。"
-                "baseline として再利用するには、開発者による明示的な確認が必要です。"
-            ),
-            impact="未確認の理解は、snapshot 更新後の差分診断や probe 設計の前提としてまだ採用されません。",
-            remediation=f"Interview で {subject} を確認済みにしてください。",
+            summary=msg["summary"],
+            detail=msg["detail"].format(count=count),
+            impact=msg["impact"],
+            remediation=msg["remediation"],
             evidence={"unconfirmed_snapshot_id": baseline.snapshot_id, "candidate_count": count},
             target_ui=TargetUi(
-                route=PAGE_INTERVIEW, anchor=anchor, action_label=f"Interview で{subject}を確認",
+                route=PAGE_INTERVIEW, anchor=anchor, action_label=msg["action_label"],
             ),
             display_routes=[PAGE_SYSTEM_UNDERSTANDING],
             related_checks=["system_purpose" if purpose else "system_capabilities"],
         )
     # missing_baseline
+    state_id = f"{prefix}.missing_baseline"
+    msg = state_messages.understanding_message(state_id)
     return StateItem(
-        state_id=f"{prefix}.missing_baseline",
+        state_id=state_id,
         state_group="understanding",
         severity="warning",
         status="missing",
         user_action_kind="confirm",
         intervention_timing="before_next_step",
         subject=subject,
-        summary=f"{subject} が未定義です。",
-        detail=f"{subject} が未定義です。確認済み・未確認いずれの baseline もありません。",
-        impact="probe 設計・flow 探索・改善提案・ユーザー意図との整合の前提となる根幹情報が欠けています。",
-        remediation=f"Interview で {subject} を定義・確認してください。",
+        summary=msg["summary"],
+        detail=msg["detail"],
+        impact=msg["impact"],
+        remediation=msg["remediation"],
         target_ui=TargetUi(
-            route=PAGE_INTERVIEW, anchor=anchor, action_label=f"Interview で{subject}を定義",
+            route=PAGE_INTERVIEW, anchor=anchor, action_label=msg["action_label"],
         ),
         display_routes=[PAGE_SYSTEM_UNDERSTANDING],
         related_checks=["system_purpose" if purpose else "system_capabilities"],
@@ -683,6 +698,7 @@ def _snapshot_missing_item(conn, system_id: int) -> Optional[StateItem]:
     if ready is not None:
         return None
     if latest is not None and latest["status"] == "indexing":
+        msg = state_messages.state_message("snapshot.ready.running")
         return StateItem(
             state_id="snapshot.ready.running",
             state_group="snapshot",
@@ -691,15 +707,21 @@ def _snapshot_missing_item(conn, system_id: int) -> Optional[StateItem]:
             user_action_kind="wait",
             intervention_timing="none",
             subject="Snapshot",
-            summary="Snapshot を作成中です。",
-            detail=f"最新の snapshot #{latest['id']} は作成中です。ready になるまで待機してください。",
-            impact="snapshot が ready になるまで、snapshot の内容を読むパイプラインステップは開始できません。",
-            remediation="Snapshot 作成の完了を待ってください。",
+            summary=msg["summary"],
+            detail=msg["detail"].format(latest_id=latest["id"]),
+            impact=msg["impact"],
+            remediation=msg["remediation"],
             evidence={"latest_snapshot_id": latest["id"], "latest_snapshot_status": latest["status"]},
             related_checks=["snapshot_status"],
             related_pipeline_steps=["snapshot_ready"],
         )
     severity = "error" if latest is not None and latest["status"] not in ("ready", "indexing") else "warning"
+    msg = state_messages.state_message("snapshot.ready.missing")
+    detail = (
+        msg["detail_no_latest"]
+        if latest is None
+        else msg["detail_with_latest"].format(latest_id=latest["id"], latest_status=latest["status"])
+    )
     return StateItem(
         state_id="snapshot.ready.missing",
         state_group="snapshot",
@@ -708,16 +730,12 @@ def _snapshot_missing_item(conn, system_id: int) -> Optional[StateItem]:
         user_action_kind="create_snapshot",
         intervention_timing="now",
         subject="Snapshot",
-        summary="ready な snapshot がありません。",
-        detail=(
-            "このシステムではまだ snapshot が作成されていません。"
-            if latest is None
-            else f"ready な snapshot がありません。最新の snapshot #{latest['id']} の状態は '{latest['status']}' です。"
-        ),
-        impact="snapshot の内容を読むすべてのパイプラインステップがブロックされます。",
-        remediation="Repository タブの Snapshots から snapshot を作成してください。",
+        summary=msg["summary"],
+        detail=detail,
+        impact=msg["impact"],
+        remediation=msg["remediation"],
         evidence={"latest_snapshot_id": latest["id"] if latest else None},
-        target_ui=TargetUi(route=PAGE_REPOSITORY, anchor=ANCHOR_SNAPSHOT_CREATE, action_label="Snapshot を作成"),
+        target_ui=TargetUi(route=PAGE_REPOSITORY, anchor=ANCHOR_SNAPSHOT_CREATE, action_label=msg["action_label"]),
         related_checks=["snapshot_status"],
         related_pipeline_steps=["snapshot_ready"],
     )
@@ -740,6 +758,7 @@ def _snapshot_stale_for_interview_item(conn, system_id: int, snapshot_id: int) -
     ).fetchone()
     if row is None:
         return None
+    msg = state_messages.state_message("snapshot.latest.stale_for_interview")
     return StateItem(
         state_id="snapshot.latest.stale_for_interview",
         state_group="snapshot",
@@ -748,15 +767,16 @@ def _snapshot_stale_for_interview_item(conn, system_id: int, snapshot_id: int) -
         user_action_kind="review",
         intervention_timing="optional",
         subject="Interview snapshot",
-        summary="Interview は古い snapshot に基づいています。",
-        detail=(
-            f"進行中の Interview session #{row['id']} は snapshot #{row['snapshot_id']} を"
-            f"基準にしていますが、最新の ready snapshot は #{snapshot_id} です。"
+        summary=msg["summary"],
+        detail=msg["detail"].format(
+            interview_session_id=row["id"],
+            interview_snapshot_id=row["snapshot_id"],
+            latest_snapshot_id=snapshot_id,
         ),
-        impact="Interview の根拠が最新 snapshot と一致していない可能性があります。",
-        remediation="最新 snapshot を基準に Interview を見直してください。",
+        impact=msg["impact"],
+        remediation=msg["remediation"],
         evidence={"interview_session_id": row["id"], "interview_snapshot_id": row["snapshot_id"], "latest_snapshot_id": snapshot_id},
-        target_ui=TargetUi(route=PAGE_INTERVIEW, anchor=None, action_label="Interview を確認"),
+        target_ui=TargetUi(route=PAGE_INTERVIEW, anchor=None, action_label=msg["action_label"]),
         display_routes=[PAGE_SYSTEM_UNDERSTANDING],
     )
 
@@ -771,7 +791,6 @@ def _pipeline_state_item(
     raw_status: Optional[str],
     subject: str,
     pipeline_steps: List[str],
-    remediation: str,
     evidence: Dict[str, Any],
     active_build=None,
     blocked_by_reasoning: bool = False,
@@ -779,6 +798,7 @@ def _pipeline_state_item(
     if raw_status == "completed":
         return None
     if blocked_by_reasoning:
+        msg = state_messages.pipeline_family_message(f"{state_prefix}.blocked_by_reasoning")
         return StateItem(
             state_id=f"{state_prefix}.blocked_by_reasoning",
             state_group="pipeline",
@@ -787,12 +807,12 @@ def _pipeline_state_item(
             user_action_kind="configure",
             intervention_timing="before_next_step",
             subject=subject,
-            summary=f"{subject} は reasoning モデル未設定のためブロックされています。",
-            detail="このステップには reasoning モデルが必要ですが、現在は利用可能な reasoning モデルが設定されていません。",
-            impact="System Understanding でこのステップはブロックとして表示されます。",
-            remediation="intelligence 用 reasoning モデル設定を修正してからビルドを実行してください。",
+            summary=msg["summary"],
+            detail=msg["detail"],
+            impact=msg["impact"],
+            remediation=msg["remediation"],
             evidence=evidence,
-            target_ui=TargetUi(route=PAGE_SYSTEM_UNDERSTANDING, anchor=ANCHOR_BUILD, action_label="LLM 設定を確認"),
+            target_ui=TargetUi(route=PAGE_SYSTEM_UNDERSTANDING, anchor=ANCHOR_BUILD, action_label=msg["action_label"]),
             related_pipeline_steps=pipeline_steps,
         )
 
@@ -804,6 +824,7 @@ def _pipeline_state_item(
                 "active_build_status": active_build["status"],
                 "active_build_current_step": active_build["current_step"],
             })
+        msg = state_messages.pipeline_family_message(f"{state_prefix}.running")
         return StateItem(
             state_id=f"{state_prefix}.running",
             state_group="pipeline",
@@ -812,15 +833,16 @@ def _pipeline_state_item(
             user_action_kind="wait",
             intervention_timing="none",
             subject=subject,
-            summary=f"{subject} を実行中です。",
-            detail="System Understanding build がこの snapshot に対して実行中です。完了まで待機してください。",
-            impact="このステップの成果物は build 完了後に利用できます。",
-            remediation="現在の build の完了を待ってください。",
+            summary=msg["summary"],
+            detail=msg["detail"],
+            impact=msg["impact"],
+            remediation=msg["remediation"],
             evidence=running_evidence,
             related_pipeline_steps=pipeline_steps,
         )
 
     if raw_status == "blocked":
+        msg = state_messages.pipeline_family_message(f"{state_prefix}.blocked")
         return StateItem(
             state_id=f"{state_prefix}.blocked",
             state_group="pipeline",
@@ -829,16 +851,17 @@ def _pipeline_state_item(
             user_action_kind="build",
             intervention_timing="before_next_step",
             subject=subject,
-            summary=f"{subject} がブロックされています。",
-            detail="直近のビルドステップは blocked です。依存ステップやビルドステップのエラーを確認してください。",
-            impact="System Understanding でこのステップはブロックとして表示されます。",
-            remediation="ブロック原因を解消してから Build / Refresh を再実行してください。",
+            summary=msg["summary"],
+            detail=msg["detail"],
+            impact=msg["impact"],
+            remediation=msg["remediation"],
             evidence=evidence,
-            target_ui=TargetUi(route=PAGE_SYSTEM_UNDERSTANDING, anchor=ANCHOR_BUILD, action_label="Build 状態を確認"),
+            target_ui=TargetUi(route=PAGE_SYSTEM_UNDERSTANDING, anchor=ANCHOR_BUILD, action_label=msg["action_label"]),
             related_pipeline_steps=pipeline_steps,
         )
 
     if raw_status == "failed":
+        msg = state_messages.pipeline_family_message(f"{state_prefix}.failed")
         return StateItem(
             state_id=f"{state_prefix}.failed",
             state_group="pipeline",
@@ -847,16 +870,17 @@ def _pipeline_state_item(
             user_action_kind="rerun",
             intervention_timing="before_next_step",
             subject=subject,
-            summary=f"{subject} が失敗しています。",
-            detail="直近の実行が failed です。エラーを確認し、原因を修正してから再実行してください。",
-            impact="このステップの成果物が欠落しているか古くなっています。",
-            remediation="System Understanding で Build / Refresh を再実行してください。",
+            summary=msg["summary"],
+            detail=msg["detail"],
+            impact=msg["impact"],
+            remediation=msg["remediation"],
             evidence=evidence,
-            target_ui=TargetUi(route=PAGE_SYSTEM_UNDERSTANDING, anchor=ANCHOR_BUILD, action_label="Build / Refresh を再実行"),
+            target_ui=TargetUi(route=PAGE_SYSTEM_UNDERSTANDING, anchor=ANCHOR_BUILD, action_label=msg["action_label"]),
             related_pipeline_steps=pipeline_steps,
         )
 
     cancelled = raw_status == "cancelled"
+    msg = state_messages.pipeline_family_message(f"{state_prefix}.not_run")
     return StateItem(
         state_id=f"{state_prefix}.not_run",
         state_group="pipeline",
@@ -865,23 +889,22 @@ def _pipeline_state_item(
         user_action_kind="build",
         intervention_timing="before_next_step",
         subject=subject,
-        summary=f"{subject} が未実行です。",
-        detail=(
-            "直近の実行は cancelled です。必要なら Build / Refresh を再実行してください。"
-            if cancelled
-            else "このステップは現在の snapshot に対して実行されていません。"
-        ),
-        impact="System Understanding でこのステップは未実行として表示されます。",
-        remediation=remediation,
+        summary=msg["summary"],
+        detail=msg["detail_cancelled"] if cancelled else msg["detail_default"],
+        impact=msg["impact"],
+        # The concrete action ("index code symbols", "detect entrypoints",
+        # ...) is already baked into this template per state_prefix via
+        # state_messages._PIPELINE_STEP_PARAMS's not_run_action.
+        remediation=msg["remediation"],
         evidence=evidence,
-        target_ui=TargetUi(route=PAGE_SYSTEM_UNDERSTANDING, anchor=ANCHOR_BUILD, action_label="Build / Refresh を実行"),
+        target_ui=TargetUi(route=PAGE_SYSTEM_UNDERSTANDING, anchor=ANCHOR_BUILD, action_label=msg["action_label"]),
         related_pipeline_steps=pipeline_steps,
     )
 
 
 def _run_not_run_item(
     conn, system_id: int, snapshot_id: int, *, state_prefix: str, run_types: List[str],
-    subject: str, pipeline_steps: List[str], remediation: str,
+    subject: str, pipeline_steps: List[str],
 ) -> Optional[StateItem]:
     row = state_facts.get_latest_intelligence_run(conn, system_id, snapshot_id, run_types)
     evidence = {"snapshot_id": snapshot_id, "run_id": row["id"] if row else None}
@@ -890,7 +913,6 @@ def _run_not_run_item(
         raw_status=row["status"] if row else None,
         subject=subject,
         pipeline_steps=pipeline_steps,
-        remediation=remediation,
         evidence=evidence,
         active_build=_active_build(conn, system_id, snapshot_id) if row is None else None,
     )
@@ -898,7 +920,7 @@ def _run_not_run_item(
 
 def _build_step_not_run_item(
     conn, system_id: int, snapshot_id: int, *, state_prefix: str, step: str,
-    subject: str, pipeline_steps: List[str], remediation: str,
+    subject: str, pipeline_steps: List[str],
 ) -> Optional[StateItem]:
     row = state_facts.get_latest_build_step(conn, system_id, snapshot_id, step)
     evidence = {
@@ -911,7 +933,6 @@ def _build_step_not_run_item(
         raw_status=row["status"] if row else None,
         subject=subject,
         pipeline_steps=pipeline_steps,
-        remediation=remediation,
         evidence=evidence,
         active_build=_active_build(conn, system_id, snapshot_id) if row is None else None,
     )
@@ -944,44 +965,28 @@ def _capability_hierarchy_item(
                    ORDER BY s.updated_at DESC, s.id DESC LIMIT 1""",
                 (system_id,),
             ).fetchone()
+            shared = state_messages.capability_hierarchy_empty_message("_shared")
             if proposal_state is not None and proposal_state["needs_review_count"]:
                 session_id = proposal_state["session_id"]
                 needs_review = proposal_state["needs_review_count"]
-                detail = (
-                    f"capability_hierarchy の実行（#{row['id']}）は完了していますが、現在の snapshot に "
-                    "`probe-agent:` docstring メタデータがありません。"
-                    f"Interview session #{session_id} の提案 {needs_review} 件は再レビュー待ちです。"
-                )
-                remediation = (
-                    f"Interview session #{session_id} で提案を再レビューして承認し、レビュー用差分を生成してください。"
-                    "差分を対象リポジトリへ適用して新しい snapshot を作成した後、Build / Refresh を実行してください。"
-                )
+                variant = state_messages.capability_hierarchy_empty_message("needs_review")
+                detail = variant["detail"].format(run_id=row["id"], session_id=session_id, needs_review=needs_review)
+                remediation = variant["remediation"].format(session_id=session_id)
                 target_route = f"{PAGE_INTERVIEW}?session={session_id}"
-                action_label = "Interview の提案を再レビュー"
+                action_label = variant["action_label"]
             elif proposal_state is not None and proposal_state["approved_count"]:
                 session_id = proposal_state["session_id"]
-                detail = (
-                    f"capability_hierarchy の実行（#{row['id']}）は完了していますが、現在の snapshot に "
-                    "`probe-agent:` docstring メタデータがありません。承認済み Interview 提案はまだソースに反映されていません。"
-                )
-                remediation = (
-                    f"Interview session #{session_id} でレビュー用差分を生成し、対象リポジトリへ適用してください。"
-                    "その後、新しい snapshot を作成して Build / Refresh を実行してください。"
-                )
+                variant = state_messages.capability_hierarchy_empty_message("approved")
+                detail = variant["detail"].format(run_id=row["id"])
+                remediation = variant["remediation"].format(session_id=session_id)
                 target_route = f"{PAGE_INTERVIEW}?session={session_id}"
-                action_label = "Interview で差分を生成"
+                action_label = variant["action_label"]
             else:
-                detail = (
-                    f"capability_hierarchy の実行（#{row['id']}）は完了していますが、"
-                    "現在の snapshot に capability ノードが存在しません。対象リポジトリに"
-                    " `probe-agent:` docstring メタデータが見つからなかったことが原因です。"
-                )
-                remediation = (
-                    "Interview で Core Capabilities を確認して提案を生成・承認し、レビュー用差分を対象リポジトリへ適用してください。"
-                    "新しい snapshot を作成した後、Build / Refresh を実行してください。"
-                )
+                variant = state_messages.capability_hierarchy_empty_message("none")
+                detail = variant["detail"].format(run_id=row["id"])
+                remediation = variant["remediation"]
                 target_route = PAGE_INTERVIEW
-                action_label = "Interview で Core Capabilities を確認"
+                action_label = variant["action_label"]
             return StateItem(
                 state_id="pipeline.capability_hierarchy.empty",
                 state_group="pipeline",
@@ -990,9 +995,9 @@ def _capability_hierarchy_item(
                 user_action_kind="confirm",
                 intervention_timing="before_next_step",
                 subject="Capability 階層",
-                summary="Capability 階層は実行済みですが capability が 0 件です。",
+                summary=shared["summary"],
                 detail=detail,
-                impact="Core Capabilities が未定義のため、probe 設計・flow 探索・改善提案の前提が欠けています。",
+                impact=shared["impact"],
                 remediation=remediation,
                 evidence={"snapshot_id": snapshot_id, "run_id": row["id"], "capability_count": 0},
                 target_ui=TargetUi(
@@ -1010,10 +1015,76 @@ def _capability_hierarchy_item(
         raw_status=row["status"] if row else None,
         subject="Capability 階層",
         pipeline_steps=["capability_hierarchy_ready"],
-        remediation="System Understanding で Build / Refresh を実行して capability 階層を生成してください。",
         evidence=evidence,
         active_build=_active_build(conn, system_id, snapshot_id) if row is None else None,
         blocked_by_reasoning=not reasoning_available,
+    )
+
+
+# --- docs_code_reconciled pipeline step (Issue #238) -----------------------
+#
+# system_understanding_service._check_documentation_claims_scanned's
+# "documentation_claims_scanned" factor is already represented as a
+# StateItem: the existing diagnostics-projected
+# ``diagnostic.pipeline_understanding_graph`` check (system_diagnostics.py,
+# artifact-backed on ``understanding_graph_snapshots`` presence, requires
+# reasoning) tests exactly the same condition and is already phase-tagged
+# "preparation" via STATE_ID_PHASE_OVERRIDES below -- no separate native item
+# is needed for that factor.
+#
+# _check_docs_code_reconciled is not fully covered by that diagnostic,
+# though: it requires BOTH an understanding graph AND code symbols, while
+# the diagnostic only checks the graph. This item reproduces the stricter
+# two-fact structural check natively so a symbol-index gap while the graph
+# is otherwise ready is not silently missed by StateItem consumers.
+
+
+def _docs_code_reconcile_state_item(conn, system_id: int, snapshot_id: int) -> Optional[StateItem]:
+    has_graph = state_facts.has_understanding_graph_snapshot(conn, system_id, snapshot_id)
+    has_symbols = state_facts.has_code_symbols(conn, system_id, snapshot_id)
+    if has_graph and has_symbols:
+        return None
+    evidence = {
+        "snapshot_id": snapshot_id,
+        "has_understanding_graph": has_graph,
+        "has_code_symbols": has_symbols,
+    }
+    if has_graph or has_symbols:
+        msg = state_messages.state_message("pipeline.docs_code_reconcile.partial")
+        target_ui = TargetUi(route=PAGE_SYSTEM_UNDERSTANDING, anchor=ANCHOR_BUILD, action_label=msg["action_label"])
+        return StateItem(
+            state_id="pipeline.docs_code_reconcile.partial",
+            state_group="pipeline",
+            severity="warning",
+            status="missing",
+            user_action_kind="build",
+            intervention_timing="before_next_step",
+            subject="Docs-code 照合",
+            summary=msg["summary"],
+            detail=msg["detail"],
+            impact=msg["impact"],
+            remediation=msg["remediation"],
+            evidence=evidence,
+            target_ui=target_ui,
+            related_pipeline_steps=["docs_code_reconciled"],
+        )
+    msg = state_messages.state_message("pipeline.docs_code_reconcile.not_run")
+    target_ui = TargetUi(route=PAGE_SYSTEM_UNDERSTANDING, anchor=ANCHOR_BUILD, action_label=msg["action_label"])
+    return StateItem(
+        state_id="pipeline.docs_code_reconcile.not_run",
+        state_group="pipeline",
+        severity="warning",
+        status="missing",
+        user_action_kind="build",
+        intervention_timing="before_next_step",
+        subject="Docs-code 照合",
+        summary=msg["summary"],
+        detail=msg["detail"],
+        impact=msg["impact"],
+        remediation=msg["remediation"],
+        evidence=evidence,
+        target_ui=target_ui,
+        related_pipeline_steps=["docs_code_reconciled"],
     )
 
 
@@ -1037,6 +1108,7 @@ def _connectivity_state_item(connectivity_state: str, approved_probe_plan_count:
     if connectivity_state != "no_signal":
         return None
     blocking = approved_probe_plan_count == 0
+    msg = state_messages.state_message("runtime.connectivity.no_signal")
     return StateItem(
         state_id="runtime.connectivity.no_signal",
         state_group="runtime",
@@ -1045,25 +1117,15 @@ def _connectivity_state_item(connectivity_state: str, approved_probe_plan_count:
         user_action_kind="review",
         intervention_timing="before_next_step" if blocking else "optional",
         subject="SDK connectivity",
-        summary="SDK からのトレースをまだ受信していません。",
-        detail=(
-            "このシステムでは probe SDK からのトレースを一度も受信していません。"
-            + (
-                "承認済みの probe plan もまだありません。"
-                if blocking
-                else "承認済みの probe plan は既にありますが、SDK からのトレースはまだ届いていません。"
-            )
-        ),
-        impact="計装経路（承認済み probe plan または実際のトレース受信）が確立していません。",
-        remediation=(
-            "Probe Planner で probe plan を作成・承認するか、対象アプリケーションに "
-            "@probe を組み込んで Control Server に接続してください。"
-        ),
+        summary=msg["summary"],
+        detail=msg["detail_blocking"] if blocking else msg["detail_nonblocking"],
+        impact=msg["impact"],
+        remediation=msg["remediation"],
         evidence={
             "connectivity_state": connectivity_state,
             "approved_probe_plan_count": approved_probe_plan_count,
         },
-        target_ui=TargetUi(route="/probe-planner", anchor=None, action_label="Probe Planner を確認"),
+        target_ui=TargetUi(route="/probe-planner", anchor=None, action_label=msg["action_label"]),
         related_pipeline_steps=["probe_plans_reviewed"],
     )
 
@@ -1073,6 +1135,7 @@ def _undecided_experiments_item(undecided_completed_experiment_count: int) -> Op
     count = undecided_completed_experiment_count
     if count == 0:
         return None
+    msg = state_messages.state_message("proposal.experiments.undecided")
     return StateItem(
         state_id="proposal.experiments.undecided",
         state_group="proposal",
@@ -1081,15 +1144,84 @@ def _undecided_experiments_item(undecided_completed_experiment_count: int) -> Op
         user_action_kind="review",
         intervention_timing="before_next_step",
         subject="Experiment decisions",
-        summary=f"未評価の experiment が {count} 件あります。",
-        detail=(
-            f"完了した experiment のうち {count} 件は、まだ human decision"
-            "（adopted / rejected / needs_more_data）が記録されていません。"
-        ),
-        impact="評価が確定するまで、候補実装の採否判断が完了しません。",
-        remediation="Experiments で完了した experiment の decision を記録してください。",
+        summary=msg["summary"].format(count=count),
+        detail=msg["detail"].format(count=count),
+        impact=msg["impact"],
+        remediation=msg["remediation"],
         evidence={"undecided_completed_experiment_count": count},
-        target_ui=TargetUi(route="/experiments", anchor=None, action_label="Experiments を確認"),
+        target_ui=TargetUi(route="/experiments", anchor=None, action_label=msg["action_label"]),
+    )
+
+
+# --- probe plan review / patch state items (Issue #238) --------------------
+#
+# Absorb the two probe-plan-shaped NextAction sources the now-removed (Issue
+# #239) system_understanding_service._build_next_actions used to generate
+# from _load_pending_plan_action_ids: "Review probe plan" (proposed_plan_ids)
+# and "Generate / validate probe patch"
+# (approved_plan_ids_without_validated_patch).
+# Both are aggregate/count-based (one item per condition, not one per plan
+# id) to match this module's existing style for proposal-group items
+# (_undecided_experiments_item above), rather than exploding into an
+# unbounded number of items for systems with many pending plans.
+
+
+def _probe_plan_proposed_state_item(proposed_count: int) -> Optional[StateItem]:
+    """A proposed-but-not-yet-approved probe plan awaiting review.
+
+    Tagged phase="preparation" via STATE_ID_PHASE_OVERRIDES (not the
+    state_group="proposal" default of "diagnosis"): an approved probe plan
+    is one of the two OR'd preparation-completion signals in
+    derive_user_phase, and reviewing/approving a proposed plan is how a user
+    reaches that signal through this path -- the same rationale
+    runtime.connectivity.no_signal already documents for the other path.
+    """
+    if proposed_count == 0:
+        return None
+    msg = state_messages.state_message("proposal.probe_plans.proposed")
+    return StateItem(
+        state_id="proposal.probe_plans.proposed",
+        state_group="proposal",
+        severity="warning",
+        status="unconfirmed",
+        user_action_kind="review",
+        intervention_timing="before_next_step",
+        subject="Probe plan review",
+        summary=msg["summary"].format(count=proposed_count),
+        detail=msg["detail"].format(count=proposed_count),
+        impact=msg["impact"],
+        remediation=msg["remediation"],
+        evidence={"proposed_probe_plan_count": proposed_count},
+        target_ui=TargetUi(route="/probe-planner", anchor=None, action_label=msg["action_label"]),
+        related_pipeline_steps=["probe_plans_reviewed"],
+    )
+
+
+def _probe_plan_patch_pending_state_item(approved_without_patch_count: int) -> Optional[StateItem]:
+    """An approved probe plan whose patch has not passed baseline+probed
+    validation yet. Stays at the state_group="proposal" default phase
+    ("diagnosis"): an approved plan already satisfies the preparation
+    instrumentation-path signal regardless of patch validation, so this item
+    is refinement work rather than a preparation blocker.
+    """
+    if approved_without_patch_count == 0:
+        return None
+    msg = state_messages.state_message("proposal.probe_plans.approved_without_patch")
+    return StateItem(
+        state_id="proposal.probe_plans.approved_without_patch",
+        state_group="proposal",
+        severity="info",
+        status="missing",
+        user_action_kind="review",
+        intervention_timing="optional",
+        subject="Probe patch generation",
+        summary=msg["summary"].format(count=approved_without_patch_count),
+        detail=msg["detail"].format(count=approved_without_patch_count),
+        impact=msg["impact"],
+        remediation=msg["remediation"],
+        evidence={"approved_probe_plan_without_patch_count": approved_without_patch_count},
+        target_ui=TargetUi(route="/probe-planner", anchor=None, action_label=msg["action_label"]),
+        related_pipeline_steps=["probe_plans_reviewed"],
     )
 
 
@@ -1097,14 +1229,15 @@ def _repository_state_items(conn, system_id: int) -> List[StateItem]:
     """Collect repository freshness state once for every consumer projection."""
     config = state_facts.get_repository_config(conn, system_id)
     if config is None or not config["repo_path"]:
+        msg = state_messages.state_message("repository.configuration.missing")
         return [StateItem(
             state_id="repository.configuration.missing", state_group="repository",
             severity="warning", status="missing", user_action_kind="configure",
             intervention_timing="now", subject="Repository",
-            summary="対象 repository が設定されていません。",
-            detail="Snapshot と System Understanding を開始するには対象 repository の設定が必要です。",
-            remediation="Repository タブで対象 repository を設定してください。",
-            target_ui=TargetUi(route=PAGE_REPOSITORY, anchor="repo-config", action_label="Repository を設定"),
+            summary=msg["summary"],
+            detail=msg["detail"],
+            remediation=msg["remediation"],
+            target_ui=TargetUi(route=PAGE_REPOSITORY, anchor="repo-config", action_label=msg["action_label"]),
             related_checks=["repository_config"], dedupe_key="repository.configuration",
         )]
 
@@ -1112,44 +1245,51 @@ def _repository_state_items(conn, system_id: int) -> List[StateItem]:
     try:
         head_state = state_facts.resolve_repository_head_state(config["repo_path"])
     except GitError as exc:
+        msg = state_messages.state_message("repository.head.unreadable")
         return [StateItem(
             state_id="repository.head.unreadable", state_group="repository",
             severity="error", status="failed", user_action_kind="configure",
             intervention_timing="now", subject="Repository HEAD",
-            summary="Repository HEAD を読み取れません。", detail=str(exc),
-            remediation="Repository のパスとアクセス権を確認してください。",
+            summary=msg["summary"], detail=str(exc),
+            remediation=msg["remediation"],
             evidence={"repo_path": config["repo_path"]},
-            target_ui=TargetUi(route=PAGE_REPOSITORY, anchor="repo-config", action_label="Repository 設定を確認"),
+            target_ui=TargetUi(route=PAGE_REPOSITORY, anchor="repo-config", action_label=msg["action_label"]),
             related_checks=["repository_path"], dedupe_key="repository.head",
         )]
     current_head = head_state.current_head
 
     items: List[StateItem] = []
     if latest_ready is not None and latest_ready["commit_sha"] != current_head:
+        msg = state_messages.state_message("repository.snapshot.stale")
         items.append(StateItem(
             state_id="repository.snapshot.stale", state_group="repository",
             severity="warning", status="stale", user_action_kind="create_snapshot",
             intervention_timing="now", subject="Repository snapshot",
-            summary="HEAD が最新 snapshot より進んでいます。",
-            detail=f"HEAD {current_head} は最新 ready snapshot #{latest_ready['id']} ({latest_ready['commit_sha']}) と異なります。",
-            remediation="Repository で新しい snapshot を作成してください。",
+            summary=msg["summary"],
+            detail=msg["detail"].format(
+                current_head=current_head,
+                snapshot_id=latest_ready["id"],
+                commit_sha=latest_ready["commit_sha"],
+            ),
+            remediation=msg["remediation"],
             evidence={"current_head": current_head, "latest_ready_snapshot_id": latest_ready["id"],
                       "latest_ready_commit": latest_ready["commit_sha"]},
-            target_ui=TargetUi(route=PAGE_REPOSITORY, anchor=ANCHOR_SNAPSHOT_CREATE, action_label="Snapshot を作成"),
+            target_ui=TargetUi(route=PAGE_REPOSITORY, anchor=ANCHOR_SNAPSHOT_CREATE, action_label=msg["action_label"]),
             related_checks=["snapshot_status"], related_pipeline_steps=["snapshot_ready"],
             dedupe_key="repository.snapshot.freshness",
         ))
     if not head_state.working_tree_clean:
+        msg = state_messages.state_message("repository.working_tree.dirty")
         items.append(StateItem(
             state_id="repository.working_tree.dirty", state_group="repository",
             severity="warning", status="impacted", user_action_kind="review",
             intervention_timing="before_next_step", subject="Working tree",
-            summary="未コミット差分があります。",
-            detail=f"Working tree に {head_state.working_tree_dirty_file_count} 件の未コミット変更があります。",
-            remediation="patch 適用や snapshot の前に commit、stash、または差分の確認をしてください。",
+            summary=msg["summary"],
+            detail=msg["detail"].format(dirty_count=head_state.working_tree_dirty_file_count),
+            remediation=msg["remediation"],
             evidence={"dirty_file_count": head_state.working_tree_dirty_file_count,
                       "dirty_sample": head_state.working_tree_dirty_sample},
-            target_ui=TargetUi(route=PAGE_REPOSITORY, anchor=ANCHOR_SNAPSHOT_CREATE, action_label="Repository を確認"),
+            target_ui=TargetUi(route=PAGE_REPOSITORY, anchor=ANCHOR_SNAPSHOT_CREATE, action_label=msg["action_label"]),
             related_checks=["working_tree"], dedupe_key="repository.working_tree",
         ))
     return items
@@ -1241,9 +1381,12 @@ def derive_user_phase(facts: UserPhaseFacts) -> UserPhaseResult:
     return UserPhaseResult(
         user_phase=user_phase,
         phases=[
-            PhaseCompletion(phase="setup", complete=setup_complete),
-            PhaseCompletion(phase="preparation", complete=preparation_complete),
-            PhaseCompletion(phase="diagnosis", complete=False),
+            PhaseCompletion(phase="setup", complete=setup_complete, label=state_messages.phase_label("setup")),
+            PhaseCompletion(
+                phase="preparation", complete=preparation_complete,
+                label=state_messages.phase_label("preparation"),
+            ),
+            PhaseCompletion(phase="diagnosis", complete=False, label=state_messages.phase_label("diagnosis")),
         ],
     )
 
@@ -1334,8 +1477,10 @@ def _diagnostic_state_item(check: Any) -> StateItem:
         impact=check.impact, remediation=check.remediation,
         evidence={"diagnostic_category": check.category, "fix_kind": check.fix_kind},
         target_ui=(
-            TargetUi(route=check.fix_page, anchor=check.fix_anchor,
-                     action_label=f"「{check.title}」を修正")
+            TargetUi(
+                route=check.fix_page, anchor=check.fix_anchor,
+                action_label=state_messages.DIAGNOSTIC_STATE_ACTION_LABEL_TEMPLATE.format(title=check.title),
+            )
             if check.fix_page and check.severity != "unknown" else None
         ),
         related_checks=[check.check_id], related_pipeline_steps=check.related_pipeline_steps,
@@ -1379,14 +1524,18 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
 
         if snapshot_id is not None:
             if _check_understanding_refresh_recommended(conn, system_id):
+                rebuild_msg = state_messages.state_message("interview.materialized.rebuild_required")
                 items.append(StateItem(
                     state_id="interview.materialized.rebuild_required", state_group="interview",
                     severity="warning", status="stale", user_action_kind="build",
                     intervention_timing="after_build", subject="Interview materialization",
-                    summary="Interview の反映後に System Understanding の再 build が必要です。",
-                    detail="最新の Interview materialization が直近の完了済み build より新しいため、理解結果を更新する必要があります。",
-                    remediation="System Understanding で Build / Refresh を実行してください。",
-                    target_ui=TargetUi(route=PAGE_SYSTEM_UNDERSTANDING, anchor=ANCHOR_BUILD, action_label="Build / Refresh を実行"),
+                    summary=rebuild_msg["summary"],
+                    detail=rebuild_msg["detail"],
+                    remediation=rebuild_msg["remediation"],
+                    target_ui=TargetUi(
+                        route=PAGE_SYSTEM_UNDERSTANDING, anchor=ANCHOR_BUILD,
+                        action_label=rebuild_msg["action_label"],
+                    ),
                     related_pipeline_steps=["capability_hierarchy_ready"], dedupe_key="interview.materialization.build",
                 ))
             stale = _snapshot_stale_for_interview_item(conn, system_id, snapshot_id)
@@ -1406,7 +1555,6 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
                 run_types=["symbol_index"],
                 subject="シンボル索引",
                 pipeline_steps=["symbols_indexed"],
-                remediation="System Understanding で Build / Refresh を実行してコードシンボルを索引付けしてください。",
             )
             if symbol:
                 items.append(symbol)
@@ -1417,7 +1565,6 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
                 run_types=["entrypoint_index"],
                 subject="エントリポイント索引",
                 pipeline_steps=["entrypoints_discovered"],
-                remediation="System Understanding で Build / Refresh を実行してエントリポイントを検出してください。",
             )
             if entrypoint:
                 items.append(entrypoint)
@@ -1428,7 +1575,6 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
                 step="documentation_index",
                 subject="ドキュメント索引",
                 pipeline_steps=["documentation_indexed"],
-                remediation="System Understanding で Build / Refresh を実行してドキュメントチャンクを索引付けしてください。",
             )
             if documentation:
                 items.append(documentation)
@@ -1439,6 +1585,10 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
             )
             if hierarchy:
                 items.append(hierarchy)
+
+            docs_code_reconcile = _docs_code_reconcile_state_item(conn, system_id, snapshot_id)
+            if docs_code_reconcile:
+                items.append(docs_code_reconcile)
 
             # Raw run/step statuses (not "item is None") for the preparation
             # phase's "pipeline 全ステップ complete" fact: the capability
@@ -1469,6 +1619,17 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
         undecided_item = _undecided_experiments_item(undecided_experiment_count)
         if undecided_item:
             items.append(undecided_item)
+
+        proposed_probe_plan_count = state_facts.count_proposed_probe_plans(conn, system_id)
+        approved_probe_plan_without_patch_count = (
+            state_facts.count_approved_probe_plans_without_validated_patch(conn, system_id)
+        )
+        proposed_item = _probe_plan_proposed_state_item(proposed_probe_plan_count)
+        if proposed_item:
+            items.append(proposed_item)
+        patch_pending_item = _probe_plan_patch_pending_state_item(approved_probe_plan_without_patch_count)
+        if patch_pending_item:
+            items.append(patch_pending_item)
 
     # Diagnostics remains its own backward-compatible endpoint, but each
     # actionable diagnostic is also a canonical state item with the same fix

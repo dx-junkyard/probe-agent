@@ -19,7 +19,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
-from . import state_facts
+from . import state_facts, state_messages
 from .db import get_conn
 from .system_state import UnderstandingStatus, evaluate_understanding
 
@@ -46,25 +46,6 @@ class PipelineStep:
     detail: Optional[str] = None
 
 
-# Issue #174: finite next-action categories spanning the
-# Understand -> Decide -> Instrument -> Evaluate stages.
-NextActionCategory = Literal["understand", "observe", "instrument", "evaluate"]
-
-# Issue #201: finite set of how a next action is carried out. "navigate" (the
-# default) links the user to a page; "build" means the action triggers the
-# Build / Refresh job directly instead of navigating anywhere.
-NextActionKind = Literal["navigate", "build"]
-
-
-@dataclass
-class NextAction:
-    action: str
-    reason: str
-    category: NextActionCategory
-    link: Optional[str] = None
-    action_kind: NextActionKind = "navigate"
-
-
 @dataclass
 class GapSummary:
     gap_type: str
@@ -80,6 +61,17 @@ class StageStatus:
     stage: str
     status: str
     counts: Dict[str, int] = field(default_factory=dict)
+    # Issue #240: server-supplied Japanese display copy. Filled from the
+    # shared catalog by stage id so the Dashboard renders one canonical
+    # label/description instead of its own English STAGE_LABELS map.
+    label: str = ""
+    description: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.label or not self.description:
+            msg = state_messages.stage_message(self.stage)
+            self.label = self.label or msg["label"]
+            self.description = self.description or msg["description"]
 
 
 # Issue #203: before/after gap counts across the last two settled builds.
@@ -111,17 +103,24 @@ class SystemUnderstandingSummary:
     gaps: List[Dict[str, Any]] = field(default_factory=list)
     gap_summary: List[GapSummary] = field(default_factory=list)
     metadata_coverage: Optional[MetadataCoverage] = None
-    next_actions: List[NextAction] = field(default_factory=list)
-    # Issue #201: single highest-priority action for the current state; None
-    # while a build job is actively running.
-    primary_action: Optional[NextAction] = None
     # Issue #202: completion status + counts for each of the 4 Hub stages.
     stages: List[StageStatus] = field(default_factory=list)
-    # Issue #203: gap-count trend across the last two settled builds, and
-    # whether a materialized Interview change post-dates the latest completed
-    # build (both deterministic, no reasoning model involved).
+    # Issue #203: gap-count trend across the last two settled builds (still
+    # deterministic, no reasoning model involved).
     gap_trend: List[GapTrend] = field(default_factory=list)
-    understanding_refresh_recommended: bool = False
+    # Issue #201/#203's `primary_action` / `next_actions` /
+    # `understanding_refresh_recommended` fields were removed in Issue #239:
+    # the canonical "what should the user do next" projection is now
+    # `system_state.select_primary_item` / `GET /system-state`'s
+    # `primary_item` / `page_items` (Issue #238). See
+    # `_check_understanding_refresh_recommended` below, which is kept because
+    # `system_state.py` still calls it to build the
+    # `interview.materialized.rebuild_required` StateItem.
+    # Issue #240: server-supplied Japanese success summary shown when the
+    # whole pipeline is complete (replaces the Dashboard's English
+    # client-assembled `successSummary`). None while the pipeline is not
+    # complete.
+    success_summary: Optional[str] = None
 
 
 def _check_repository_configured(conn, system_id: int) -> PipelineStep:
@@ -167,20 +166,22 @@ def _check_documentation_indexed(conn, system_id: int, snapshot_id: Optional[int
                 return PipelineStep(
                     "documentation_indexed",
                     "warning",
-                    detail="No documentation chunks found",
+                    detail=state_messages.pipeline_step_detail("documentation_indexed.no_chunks"),
                 )
             return PipelineStep("documentation_indexed", "complete")
         if job_step["status"] == "failed":
             return PipelineStep(
                 "documentation_indexed",
                 "failed",
-                detail=job_step["error"] or "documentation_index failed",
+                detail=job_step["error"]
+                or state_messages.pipeline_step_detail("documentation_indexed.build_step_failed_default"),
             )
         if job_step["status"] == "blocked":
             return PipelineStep(
                 "documentation_indexed",
                 "blocked",
-                detail=job_step["error"] or "documentation_index blocked",
+                detail=job_step["error"]
+                or state_messages.pipeline_step_detail("documentation_indexed.build_step_blocked_default"),
             )
     row = state_facts.get_latest_intelligence_run(
         conn, system_id, snapshot_id, ["draft_generation", "repository_drafts"]
@@ -188,7 +189,11 @@ def _check_documentation_indexed(conn, system_id: int, snapshot_id: Optional[int
     if row:
         if row["status"] == "completed":
             return PipelineStep("documentation_indexed", "complete")
-        return PipelineStep("documentation_indexed", "failed", detail=f"run status: {row['status']}")
+        return PipelineStep(
+            "documentation_indexed",
+            "failed",
+            detail=state_messages.pipeline_step_detail("documentation_indexed.run_status", status=row["status"]),
+        )
     return PipelineStep("documentation_indexed", "missing")
 
 
@@ -198,7 +203,11 @@ def _check_documentation_claims_scanned(conn, system_id: int, snapshot_id: Optio
     if state_facts.has_understanding_graph_snapshot(conn, system_id, snapshot_id):
         return PipelineStep("documentation_claims_scanned", "complete")
     if not _is_reasoning_model_available():
-        return PipelineStep("documentation_claims_scanned", "blocked", detail="Reasoning model not configured")
+        return PipelineStep(
+            "documentation_claims_scanned",
+            "blocked",
+            detail=state_messages.pipeline_step_detail("documentation_claims_scanned.blocked"),
+        )
     return PipelineStep("documentation_claims_scanned", "missing")
 
 
@@ -209,7 +218,11 @@ def _check_symbols_indexed(conn, system_id: int, snapshot_id: Optional[int]) -> 
     if row:
         if row["status"] == "completed":
             return PipelineStep("symbols_indexed", "complete")
-        return PipelineStep("symbols_indexed", "failed", detail=f"run status: {row['status']}")
+        return PipelineStep(
+            "symbols_indexed",
+            "failed",
+            detail=state_messages.pipeline_step_detail("symbols_indexed.run_status", status=row["status"]),
+        )
     return PipelineStep("symbols_indexed", "missing")
 
 
@@ -229,7 +242,11 @@ def _check_docs_code_reconciled(conn, system_id: int, snapshot_id: Optional[int]
     if has_graph and has_symbols:
         return PipelineStep("docs_code_reconciled", "complete")
     if has_graph or has_symbols:
-        return PipelineStep("docs_code_reconciled", "warning", detail="Partial data available")
+        return PipelineStep(
+            "docs_code_reconciled",
+            "warning",
+            detail=state_messages.pipeline_step_detail("docs_code_reconciled.partial"),
+        )
     return PipelineStep("docs_code_reconciled", "missing")
 
 
@@ -249,20 +266,22 @@ def _check_capability_hierarchy_ready(conn, system_id: int, snapshot_id: Optiona
                 return PipelineStep(
                     "capability_hierarchy_ready",
                     "warning",
-                    detail=(
-                        "Capability hierarchy run completed but produced no capabilities. "
-                        "This happens when no `probe-agent:` docstring metadata was found in "
-                        "the target repository. Review and approve Interview proposals, generate "
-                        "the review patch, apply it to the target repository, create a new snapshot, "
-                        "then run Build / Refresh."
-                    ),
+                    detail=state_messages.pipeline_step_detail("capability_hierarchy_ready.empty"),
                 )
             return PipelineStep("capability_hierarchy_ready", "complete")
         if row["status"] == "failed":
             return PipelineStep("capability_hierarchy_ready", "failed")
-        return PipelineStep("capability_hierarchy_ready", "warning", detail=f"status: {row['status']}")
+        return PipelineStep(
+            "capability_hierarchy_ready",
+            "warning",
+            detail=state_messages.pipeline_step_detail("capability_hierarchy_ready.status", status=row["status"]),
+        )
     if not _is_reasoning_model_available():
-        return PipelineStep("capability_hierarchy_ready", "blocked", detail="Reasoning model not configured")
+        return PipelineStep(
+            "capability_hierarchy_ready",
+            "blocked",
+            detail=state_messages.pipeline_step_detail("capability_hierarchy_ready.blocked"),
+        )
     return PipelineStep("capability_hierarchy_ready", "missing")
 
 
@@ -511,54 +530,14 @@ GAP_SEVERITY: Dict[str, str] = {
     "ambiguous_ownership": "warning",
 }
 
-GAP_TITLE_TEMPLATES: Dict[str, str] = {
-    "docs_only": "Documented but no matching implementation found: {name}",
-    "code_only": "Implemented but not documented: {name}",
-    "source_doc_mismatch": "Source metadata and docs disagree: {name}",
-    "stale_explanation": "Explanation may be outdated: {name}",
-    "unclassified_entrypoint": "Entrypoint not classified in capability hierarchy: {name}",
-    "missing_probe_flow": "No probe flow defined: {name}",
-    "missing_evidence": "Documentation claim lacks path/line evidence: {name}",
-    "ambiguous_ownership": "Ambiguous ownership: {name}",
-}
-
-# Issue #199: single source of truth for "gap type -> resolution action(s)".
-# For every gap type, index [0] is the primary resolution — the action a
-# gap card AND the top-level Next Action for that gap type both link to.
-# Principle: work that fixes/completes state (classification, metadata)
-# belongs to Interview; work that only reviews/browses existing state
-# belongs to Capability Map / Flow Explorer. Any additional entries after
-# [0] are secondary/alternate actions shown only on the gap card.
-GAP_NEXT_ACTIONS: Dict[str, List[Dict[str, Optional[str]]]] = {
-    "docs_only": [
-        {"action": "Open docs evidence", "link": None},
-        {"action": "Create implementation issue", "link": None},
-    ],
-    "code_only": [
-        {"action": "Open source symbol", "link": "/repository"},
-        {"action": "Add docs or source metadata", "link": "/interview"},
-    ],
-    "source_doc_mismatch": [
-        {"action": "Propose explanation refresh", "link": "/capability-map"},
-    ],
-    "stale_explanation": [
-        {"action": "Propose explanation refresh", "link": "/capability-map"},
-    ],
-    "unclassified_entrypoint": [
-        {"action": "Open Interview", "link": "/interview"},
-        {"action": "Add source metadata", "link": "/interview"},
-    ],
-    "missing_probe_flow": [
-        {"action": "Open Flow Explorer", "link": "/flow-explorer"},
-        {"action": "Create Probe Plan", "link": "/probe-planner"},
-    ],
-    "missing_evidence": [
-        {"action": "Improve documentation index", "link": "/repository"},
-    ],
-    "ambiguous_ownership": [
-        {"action": "Clarify ownership in Interview", "link": "/interview"},
-    ],
-}
+# Issue #199 / #240: the gap-type -> title and gap-type -> resolution action
+# copy now lives in the shared Japanese catalog (state_messages.GAP_*). This
+# module keeps only the ordering/role contract (index [0] is the primary
+# resolution the gap card AND the top-level Next Action both link to; work
+# that fixes/completes state belongs to Interview, review/browse belongs to
+# Capability Map / Flow Explorer). GAP_NEXT_ACTIONS is re-exported for
+# backward-compatible imports/tests that read the structure.
+GAP_NEXT_ACTIONS = state_messages.GAP_NEXT_ACTIONS
 
 
 def _gap_severity(gap_type: Optional[str]) -> str:
@@ -566,12 +545,11 @@ def _gap_severity(gap_type: Optional[str]) -> str:
 
 
 def _gap_title(gap_type: Optional[str], node_name: Optional[str]) -> str:
-    template = GAP_TITLE_TEMPLATES.get(gap_type or "", "Gap: {name}")
-    return template.format(name=node_name or "unknown")
+    return state_messages.gap_title(gap_type or "", node_name or "unknown")
 
 
 def _gap_next_actions(gap_type: Optional[str]) -> List[Dict[str, Optional[str]]]:
-    return list(GAP_NEXT_ACTIONS.get(gap_type or "", []))
+    return state_messages.gap_next_actions(gap_type or "")
 
 
 def _detect_extra_gaps(conn, system_id: int, snapshot_id: int) -> List[Dict[str, Any]]:
@@ -596,7 +574,11 @@ def _detect_extra_gaps(conn, system_id: int, snapshot_id: int) -> List[Dict[str,
             "severity": "info",
             "title": _gap_title("unclassified_entrypoint", ep_label),
             "node_name": ep_label,
-            "notes": f"Entrypoint {uc['entrypoint_type']}:{uc['entrypoint_id']} has no capability classification",
+            "notes": state_messages.gap_note(
+                "unclassified_entrypoint",
+                entrypoint_type=uc["entrypoint_type"],
+                entrypoint_id=uc["entrypoint_id"],
+            ),
             "capability_key": None,
             "doc_refs": [],
             "symbol_refs": [{"path": uc["handler_path"], "qualified_name": uc["handler_qualified_name"]}] if uc["handler_qualified_name"] else [],
@@ -628,7 +610,11 @@ def _detect_extra_gaps(conn, system_id: int, snapshot_id: int) -> List[Dict[str,
             "severity": _gap_severity("missing_probe_flow"),
             "title": _gap_title("missing_probe_flow", ep_label),
             "node_name": ep_label,
-            "notes": f"Entrypoint {ep['entrypoint_type']}:{ep['entrypoint_id']} is classified but has no probe plan",
+            "notes": state_messages.gap_note(
+                "missing_probe_flow",
+                entrypoint_type=ep["entrypoint_type"],
+                entrypoint_id=ep["entrypoint_id"],
+            ),
             "capability_key": ep["capability_key"],
             "doc_refs": [],
             "symbol_refs": [{"path": ep["handler_path"], "qualified_name": ep["handler_qualified_name"]}] if ep["handler_qualified_name"] else [],
@@ -659,7 +645,7 @@ def _detect_extra_gaps(conn, system_id: int, snapshot_id: int) -> List[Dict[str,
                         "severity": _gap_severity("missing_evidence"),
                         "title": _gap_title("missing_evidence", node_name),
                         "node_name": node_name,
-                        "notes": f"Documentation claim '{node_name}' has no file/line evidence",
+                        "notes": state_messages.gap_note("missing_evidence", name=node_name),
                         "capability_key": None,
                         "doc_refs": [],
                         "symbol_refs": [],
@@ -717,293 +703,6 @@ def _compute_gap_summary(gaps: List[Dict[str, Any]]) -> List[GapSummary]:
     return [GapSummary(gap_type=k, count=v) for k, v in sorted(counts.items())]
 
 
-def _build_next_actions(
-    pipeline: List[PipelineStep],
-    purpose_defined: bool,
-    capabilities: List[Dict[str, Any]],
-    metadata_coverage: Optional[MetadataCoverage],
-    gap_count: int,
-    gap_summary: Optional[List[GapSummary]] = None,
-    proposed_plan_ids: Optional[List[int]] = None,
-    approved_plan_ids_without_validated_patch: Optional[List[int]] = None,
-    undecided_completed_experiment_ids: Optional[List[int]] = None,
-) -> List[NextAction]:
-    proposed_plan_ids = proposed_plan_ids or []
-    approved_plan_ids_without_validated_patch = approved_plan_ids_without_validated_patch or []
-    undecided_completed_experiment_ids = undecided_completed_experiment_ids or []
-
-    actions: List[NextAction] = []
-    step_map = {s.step: s.status for s in pipeline}
-
-    if step_map.get("repository_configured") != "complete":
-        actions.append(NextAction(
-            action="Configure repository",
-            reason="Repository is not configured yet",
-            category="understand",
-            link="/repository",
-        ))
-        return actions
-
-    if step_map.get("snapshot_ready") != "complete":
-        actions.append(NextAction(
-            action="Create snapshot",
-            reason="No ready snapshot available",
-            category="understand",
-            link="/repository",
-        ))
-        return actions
-
-    if step_map.get("symbols_indexed") != "complete":
-        actions.append(NextAction(
-            action="Index code symbols",
-            reason="Code symbols have not been indexed",
-            category="understand",
-            link="/repository",
-        ))
-
-    if step_map.get("documentation_indexed") != "complete":
-        actions.append(NextAction(
-            action="Build documentation index",
-            reason="Documentation files have not been indexed into chunks",
-            category="understand",
-            link="/system-understanding",
-        ))
-
-    if step_map.get("documentation_claims_scanned") != "complete":
-        actions.append(NextAction(
-            action="Scan documentation claims",
-            reason="Documentation claims have not been scanned",
-            category="understand",
-            link="/system-understanding",
-        ))
-
-    if step_map.get("entrypoints_discovered") != "complete":
-        actions.append(NextAction(
-            action="Discover entrypoints",
-            reason="API/CLI/queue entrypoints have not been discovered",
-            category="understand",
-            link="/flow-explorer",
-        ))
-
-    if step_map.get("docs_code_reconciled") != "complete":
-        actions.append(NextAction(
-            action="Reconcile docs and code",
-            reason="Documentation and code have not been reconciled",
-            category="understand",
-            link="/system-understanding",
-        ))
-
-    if step_map.get("capability_hierarchy_ready") != "complete":
-        actions.append(NextAction(
-            action="Generate capability hierarchy",
-            reason="Capability hierarchy has not been generated",
-            category="understand",
-            link="/capability-map",
-        ))
-
-    # Issue #120: pipeline step remediation (above) always takes priority
-    # while the pipeline is incomplete or blocked/failed. Once every step is
-    # complete, a completed pipeline is not the same as a usable system
-    # understanding — System Purpose and main capabilities are the highest
-    # priority next actions, ahead of metadata coverage and docs-code gaps.
-    pipeline_complete = all(s.status == "complete" for s in pipeline)
-
-    if pipeline_complete:
-        if not purpose_defined:
-            actions.append(NextAction(
-                action="Define System Purpose",
-                reason=(
-                    "Pipeline completed, but no system purpose is defined yet. "
-                    "Defining it in Interview takes a few minutes and gives the "
-                    "Capability Map, observation candidates, and Probe Plans "
-                    "their evaluation basis."
-                ),
-                category="understand",
-                link="/interview",
-            ))
-
-        if not capabilities:
-            actions.append(NextAction(
-                action="Identify main system capabilities",
-                reason=(
-                    "System purpose and main capabilities are not identified yet, "
-                    "so probe candidates, flow exploration, and improvement "
-                    "proposals lack a foundation."
-                ),
-                category="understand",
-                link="/interview",
-            ))
-
-    if metadata_coverage and metadata_coverage.symbol_count > 0:
-        ratio = metadata_coverage.symbols_with_source_metadata / metadata_coverage.symbol_count
-        if ratio < 0.1:
-            actions.append(NextAction(
-                action="Add source metadata",
-                reason=f"Only {metadata_coverage.symbols_with_source_metadata} of {metadata_coverage.symbol_count} symbols have probe-agent metadata",
-                category="understand",
-                link="/interview",
-            ))
-
-    if gap_count > 0:
-        actions.append(NextAction(
-            action="Review docs-code gaps",
-            reason=f"{gap_count} docs-code gaps found",
-            category="understand",
-            link="/system-understanding",
-        ))
-
-    # Issue #199: the link for each gap-type-derived top-level action is
-    # taken from GAP_NEXT_ACTIONS[gap_type][0] (the primary resolution) so
-    # this action and the corresponding gap card never disagree on where to
-    # send the user.
-    gap_counts = {g.gap_type: g.count for g in (gap_summary or [])}
-    unclassified_count = gap_counts.get("unclassified_entrypoint", 0)
-    if unclassified_count > 0:
-        actions.append(NextAction(
-            action="Unclassified API found",
-            reason=(
-                f"{unclassified_count} API entrypoint{'s' if unclassified_count != 1 else ''} "
-                "need capability classification; classify in Interview, then view "
-                "results in Capability Map"
-            ),
-            category="observe",
-            link=GAP_NEXT_ACTIONS["unclassified_entrypoint"][0]["link"],
-        ))
-
-    probe_candidate_count = gap_counts.get("missing_probe_flow", 0)
-    if probe_candidate_count > 0:
-        actions.append(NextAction(
-            action="Probe candidate available",
-            reason=f"{probe_candidate_count} classified entrypoint{'s' if probe_candidate_count != 1 else ''} have no probe plan yet",
-            category="observe",
-            link=GAP_NEXT_ACTIONS["missing_probe_flow"][0]["link"],
-        ))
-
-    # Issue #174: probe plan / experiment status is a downstream, independent
-    # axis from the System Understanding pipeline above — surface it
-    # regardless of pipeline completeness so review-worthy work is never
-    # hidden behind an unrelated pipeline step.
-    for plan_id in proposed_plan_ids:
-        actions.append(NextAction(
-            action="Review probe plan",
-            reason=f"Probe plan #{plan_id} is awaiting review",
-            category="observe",
-            link=f"/probe-planner?plan={plan_id}",
-        ))
-
-    for plan_id in approved_plan_ids_without_validated_patch:
-        actions.append(NextAction(
-            action="Generate / validate probe patch",
-            reason=f"Approved probe plan #{plan_id} has no validated patch yet",
-            category="instrument",
-            link=f"/probe-planner?plan={plan_id}",
-        ))
-
-    for experiment_id in undecided_completed_experiment_ids:
-        actions.append(NextAction(
-            action="Review experiment decision",
-            reason=f"Experiment #{experiment_id} completed but has no recorded decision",
-            category="evaluate",
-            link="/experiments",
-        ))
-
-    if pipeline_complete and not actions:
-        actions.append(NextAction(
-            action="Start from Capability",
-            reason="System understanding is complete; explore from the Capability Map.",
-            category="observe",
-            link="/capability-map",
-        ))
-        actions.append(NextAction(
-            action="Start from Feature",
-            reason="System understanding is complete; explore from the Feature Map.",
-            category="observe",
-            link="/feature-map",
-        ))
-        actions.append(NextAction(
-            action="Open Flow Explorer",
-            reason="System understanding is complete; explore call flows from entrypoints.",
-            category="observe",
-            link="/flow-explorer",
-        ))
-
-    return actions
-
-
-def _derive_primary_action(
-    pipeline: List[PipelineStep],
-    next_actions: List[NextAction],
-    latest_build: Optional[Dict[str, Any]],
-) -> Optional[NextAction]:
-    """Pure derivation of the single highest-priority action (Issue #201).
-
-    ``next_actions`` is the already-ordered state machine produced by
-    ``_build_next_actions`` above; this function does not change that
-    ordering, it only picks the one action a Hub header CTA should show,
-    using the explicit finite rules below (evaluated in order, first match
-    wins). Deterministic only (Principle 6) -- no reasoning model involved.
-
-    NOTE: a future phase may fold this into ``system_state.py`` (Issue #193,
-    System State Assessment) as one more state-machine projection alongside
-    ``StateItem``; not merged here, per this issue's non-goals.
-    """
-    step_map = {s.step: s.status for s in pipeline}
-
-    # Rule 1: repository not configured or no ready snapshot -> the existing
-    # first next_action (Configure repository / Create snapshot).
-    if (
-        step_map.get("repository_configured") != "complete"
-        or step_map.get("snapshot_ready") != "complete"
-    ):
-        return next_actions[0] if next_actions else None
-
-    # Rule 2: a build job is actively running/queued -> no primary action;
-    # BuildJobPanel already shows step-by-step progress for it.
-    if latest_build and latest_build.get("status") in ("queued", "running"):
-        return None
-
-    # Rule 3: some pipeline step (beyond repository/snapshot, already
-    # confirmed complete above) is not complete -> point at running a build,
-    # independent of which/how many steps remain.
-    incomplete_steps = [s for s in pipeline if s.status != "complete"]
-    if incomplete_steps:
-        count = len(incomplete_steps)
-        return NextAction(
-            action="Build system understanding",
-            reason=f"{count} pipeline step{'s' if count != 1 else ''} not complete yet",
-            category="understand",
-            link=None,
-            action_kind="build",
-        )
-
-    # Rule 4: everything above is satisfied -> defer to the first next_action
-    # (its generation order/priority is unchanged by this issue).
-    return next_actions[0] if next_actions else None
-
-
-def _plan_has_validated_patch(conn, plan_id: int) -> bool:
-    """A plan's patch is validated when its latest baseline and probed
-    validation runs both succeeded — the same finite condition the patch
-    apply endpoint gates on (Principle 6).
-    """
-    patch_rows = conn.execute(
-        "SELECT id FROM probe_patches WHERE plan_id = ? AND status != 'failed'",
-        (plan_id,),
-    ).fetchall()
-    for patch in patch_rows:
-        val_rows = conn.execute(
-            """SELECT variant, overall_success FROM validation_runs
-               WHERE patch_id = ? ORDER BY id DESC""",
-            (patch["id"],),
-        ).fetchall()
-        latest: Dict[str, bool] = {}
-        for vr in val_rows:
-            latest.setdefault(vr["variant"], bool(vr["overall_success"]))
-        if latest.get("baseline") is True and latest.get("probed") is True:
-            return True
-    return False
-
-
 def _load_pending_plan_action_ids(conn, system_id: int) -> Tuple[List[int], List[int], int]:
     """Return (proposed_plan_ids, approved_plan_ids_without_validated_patch,
     approved_plan_total_count).
@@ -1012,6 +711,11 @@ def _load_pending_plan_action_ids(conn, system_id: int) -> Tuple[List[int], List
     stage's ``validated`` count can be derived as
     ``approved_plan_total_count - len(approved_plan_ids_without_validated_patch)``
     without a second, differently-worded query over the same rows.
+
+    The "has this plan's patch been validated" check itself lives in
+    ``state_facts.plan_has_validated_patch`` (Issue #238) so this module and
+    ``system_state.py``'s ``proposal.probe_plans.approved_without_patch``
+    StateItem agree on one query instead of two independent copies.
     """
     proposed_ids = [
         r["id"] for r in conn.execute(
@@ -1024,7 +728,7 @@ def _load_pending_plan_action_ids(conn, system_id: int) -> Tuple[List[int], List
         (system_id,),
     ).fetchall()
     approved_without_patch_ids = [
-        r["id"] for r in approved_rows if not _plan_has_validated_patch(conn, r["id"])
+        r["id"] for r in approved_rows if not state_facts.plan_has_validated_patch(conn, r["id"])
     ]
     return proposed_ids, approved_without_patch_ids, len(approved_rows)
 
@@ -1275,25 +979,18 @@ def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
                 evaluate_understanding(conn, system_id, snapshot_id, purpose=True)
             )
 
+        # Issue #238/#239: these id lists used to also feed the deprecated
+        # `_build_next_actions` ("Review probe plan" / "Generate / validate
+        # probe patch" / "Review experiment decision"); that projection is
+        # gone, but the lists (and their lengths) are still the Issue #202
+        # stage-status counts below, so the queries stay.
         proposed_plan_ids, approved_plan_ids_without_patch, approved_plan_total = (
             _load_pending_plan_action_ids(conn, system_id)
         )
         undecided_experiment_ids = _load_undecided_completed_experiment_ids(conn, system_id)
 
-        summary.next_actions = _build_next_actions(
-            pipeline,
-            purpose_defined,
-            summary.capabilities,
-            summary.metadata_coverage,
-            len(summary.gaps),
-            summary.gap_summary,
-            proposed_plan_ids,
-            approved_plan_ids_without_patch,
-            undecided_experiment_ids,
-        )
-
         # Issue #202: stage status counts reuse the id lists above and add
-        # the small set of totals not already collected for next_actions.
+        # the small set of totals not already collected elsewhere.
         total_plan_count = _load_total_probe_plan_count(conn, system_id)
         total_experiment_count = _load_total_experiment_count(conn, system_id)
         decided_experiment_count = _load_decided_completed_experiment_count(conn, system_id)
@@ -1318,26 +1015,22 @@ def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
             total_experiment_count,
         )
 
-        # Issue #203: gap-count trend and refresh recommendation are plain
-        # SELECTs against this same connection (system_understanding_builds /
-        # interview_session / system_understanding_gap_history), so they run
-        # inside this block rather than needing a second get_conn() like the
-        # primary_action build-job lookup below.
+        # Issue #203: gap-count trend is a plain SELECT against this same
+        # connection (system_understanding_gap_history).
         summary.gap_trend = _load_gap_trend(conn, system_id)
-        summary.understanding_refresh_recommended = _check_understanding_refresh_recommended(
-            conn, system_id
-        )
 
-    # Issue #201: build-job lookup opens its own `get_conn()`, and the DB
-    # lock is non-reentrant, so this must run after the `with get_conn()`
-    # block above has released it (see the issue-drafts nested-lock note
-    # elsewhere in this module for the same constraint).
-    from .system_understanding_jobs import get_latest_job
+        # Issue #240: build the success summary server-side (Japanese) when
+        # every pipeline step is complete, so the Dashboard renders it
+        # verbatim instead of assembling its own English string.
+        if pipeline and all(s.status == "complete" for s in pipeline):
+            coverage = summary.metadata_coverage
+            summary.success_summary = state_messages.success_summary(
+                done=len(pipeline),
+                total=len(pipeline),
+                symbol_count=coverage.symbol_count if coverage else 0,
+                entrypoint_count=coverage.entrypoint_count if coverage else 0,
+            )
 
-    latest_build = get_latest_job(system_id)
-    summary.primary_action = _derive_primary_action(
-        pipeline, summary.next_actions, latest_build,
-    )
     return summary
 
 

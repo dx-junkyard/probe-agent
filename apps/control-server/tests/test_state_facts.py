@@ -643,6 +643,136 @@ class TestProbePlanAndExperimentReviewFacts:
             assert state_facts.count_undecided_completed_experiments(conn, system_id) == 1
 
 
+# --- Probe plan review / patch facts (Issue #238) ---------------------------
+
+
+def _insert_probe_patch(get_conn, plan_id, system_id, snapshot_id, *, status="generated"):
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO probe_patches
+                   (plan_id, system_id, snapshot_id, commit_sha, diff,
+                    skipped, status, cleanup_state, created_at)
+               VALUES (?, ?, ?, 'deadbeef', 'diff', '[]', ?, 'not_attempted', 0)""",
+            (plan_id, system_id, snapshot_id, status),
+        )
+        return cur.lastrowid
+
+
+def _insert_validation_run(get_conn, patch_id, system_id, variant, *, overall_success=True):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO validation_runs
+                   (patch_id, system_id, variant, worktree_path, overall_success,
+                    trace_status, network_isolation, cleanup_state, created_at)
+               VALUES (?, ?, ?, '/tmp/x', ?, 'not_checked', 'not_requested', 'not_attempted', 0)""",
+            (patch_id, system_id, variant, 1 if overall_success else 0),
+        )
+
+
+class TestProbePlanReviewAndPatchFacts:
+    """Issue #238: facts backing system_state.py's
+    proposal.probe_plans.proposed / .approved_without_patch StateItems, and
+    the shared plan_has_validated_patch primitive moved here from
+    system_understanding_service._plan_has_validated_patch.
+    """
+
+    def test_plan_has_validated_patch_requires_both_baseline_and_probed_success(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+        run_id = _insert_intelligence_run(conn_factory, system_id, snapshot_id, "probe_plan", "completed")
+        _insert_probe_plan(conn_factory, system_id, snapshot_id, run_id, status="approved")
+        with conn_factory() as conn:
+            plan_id = conn.execute(
+                "SELECT id FROM probe_plans WHERE system_id = ?", (system_id,)
+            ).fetchone()["id"]
+            assert state_facts.plan_has_validated_patch(conn, plan_id) is False
+
+        patch_id = _insert_probe_patch(conn_factory, plan_id, system_id, snapshot_id)
+        _insert_validation_run(conn_factory, patch_id, system_id, "baseline", overall_success=True)
+        with conn_factory() as conn:
+            # Only baseline succeeded so far -- not validated yet.
+            assert state_facts.plan_has_validated_patch(conn, plan_id) is False
+
+        _insert_validation_run(conn_factory, patch_id, system_id, "probed", overall_success=True)
+        with conn_factory() as conn:
+            assert state_facts.plan_has_validated_patch(conn, plan_id) is True
+
+    def test_plan_has_validated_patch_uses_latest_run_per_variant(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+        run_id = _insert_intelligence_run(conn_factory, system_id, snapshot_id, "probe_plan", "completed")
+        _insert_probe_plan(conn_factory, system_id, snapshot_id, run_id, status="approved")
+        with conn_factory() as conn:
+            plan_id = conn.execute(
+                "SELECT id FROM probe_plans WHERE system_id = ?", (system_id,)
+            ).fetchone()["id"]
+        patch_id = _insert_probe_patch(conn_factory, plan_id, system_id, snapshot_id)
+        # An earlier failed baseline run followed by a later successful one
+        # -- the *latest* run per variant must win.
+        _insert_validation_run(conn_factory, patch_id, system_id, "baseline", overall_success=False)
+        _insert_validation_run(conn_factory, patch_id, system_id, "baseline", overall_success=True)
+        _insert_validation_run(conn_factory, patch_id, system_id, "probed", overall_success=True)
+        with conn_factory() as conn:
+            assert state_facts.plan_has_validated_patch(conn, plan_id) is True
+
+    def test_count_proposed_probe_plans_only_counts_proposed_status(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+        run_id = _insert_intelligence_run(conn_factory, system_id, snapshot_id, "probe_plan", "completed")
+        with conn_factory() as conn:
+            assert state_facts.count_proposed_probe_plans(conn, system_id) == 0
+
+        _insert_probe_plan(conn_factory, system_id, snapshot_id, run_id, status="approved")
+        _insert_probe_plan(conn_factory, system_id, snapshot_id, run_id, status="rejected")
+        with conn_factory() as conn:
+            assert state_facts.count_proposed_probe_plans(conn, system_id) == 0
+
+        _insert_probe_plan(conn_factory, system_id, snapshot_id, run_id, status="proposed")
+        _insert_probe_plan(conn_factory, system_id, snapshot_id, run_id, status="proposed")
+        with conn_factory() as conn:
+            assert state_facts.count_proposed_probe_plans(conn, system_id) == 2
+
+    def test_count_approved_probe_plans_without_validated_patch(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+        run_id = _insert_intelligence_run(conn_factory, system_id, snapshot_id, "probe_plan", "completed")
+        with conn_factory() as conn:
+            assert state_facts.count_approved_probe_plans_without_validated_patch(conn, system_id) == 0
+
+        # Approved with no patch at all -- counts.
+        _insert_probe_plan(conn_factory, system_id, snapshot_id, run_id, status="approved")
+        with conn_factory() as conn:
+            assert state_facts.count_approved_probe_plans_without_validated_patch(conn, system_id) == 1
+
+        # A second approved plan with a fully validated patch -- does not count.
+        _insert_probe_plan(conn_factory, system_id, snapshot_id, run_id, status="approved")
+        with conn_factory() as conn:
+            plan_ids = [
+                r["id"] for r in conn.execute(
+                    "SELECT id FROM probe_plans WHERE system_id = ? ORDER BY id", (system_id,)
+                ).fetchall()
+            ]
+        validated_plan_id = plan_ids[1]
+        patch_id = _insert_probe_patch(conn_factory, validated_plan_id, system_id, snapshot_id)
+        _insert_validation_run(conn_factory, patch_id, system_id, "baseline", overall_success=True)
+        _insert_validation_run(conn_factory, patch_id, system_id, "probed", overall_success=True)
+        with conn_factory() as conn:
+            assert state_facts.count_approved_probe_plans_without_validated_patch(conn, system_id) == 1
+
+        # A proposed (not approved) plan is not counted either way.
+        _insert_probe_plan(conn_factory, system_id, snapshot_id, run_id, status="proposed")
+        with conn_factory() as conn:
+            assert state_facts.count_approved_probe_plans_without_validated_patch(conn, system_id) == 1
+
+
 # --- System isolation -------------------------------------------------------------
 
 
@@ -666,6 +796,7 @@ class TestSystemIsolation:
         _insert_build(conn_factory, sys_a, snapshot_a, status="running")
         _insert_trace(conn_factory, sys_a, "worker", "ta")
         _insert_probe_plan(conn_factory, sys_a, snapshot_a, run_a, status="approved")
+        _insert_probe_plan(conn_factory, sys_a, snapshot_a, run_a, status="proposed")
         _insert_experiment(conn_factory, sys_a, snapshot_a, status="completed", human_decision="undecided")
 
         with conn_factory() as conn:
@@ -683,6 +814,8 @@ class TestSystemIsolation:
             assert state_facts.get_active_build(conn, sys_b, snapshot_a) is None
             assert state_facts.count_approved_probe_plans(conn, sys_b) == 0
             assert state_facts.count_undecided_completed_experiments(conn, sys_b) == 0
+            assert state_facts.count_proposed_probe_plans(conn, sys_b) == 0
+            assert state_facts.count_approved_probe_plans_without_validated_patch(conn, sys_b) == 0
 
             facts_b = state_facts.get_connectivity_facts(conn, sys_b, "probe-smoke-check")
             assert facts_b.total_trace_count == 0
@@ -693,6 +826,8 @@ class TestSystemIsolation:
             assert state_facts.purpose_defined_in_snapshot(conn, sys_a, snapshot_a) is True
             assert state_facts.count_approved_probe_plans(conn, sys_a) == 1
             assert state_facts.count_undecided_completed_experiments(conn, sys_a) == 1
+            assert state_facts.count_proposed_probe_plans(conn, sys_a) == 1
+            assert state_facts.count_approved_probe_plans_without_validated_patch(conn, sys_a) == 1
             assert state_facts.capability_count_in_snapshot(conn, sys_a, snapshot_a) == 1
             facts_a = state_facts.get_connectivity_facts(conn, sys_a, "probe-smoke-check")
             assert facts_a.total_trace_count == 1

@@ -11,6 +11,7 @@ import { Sparkles, Link2, CheckCircle, XCircle, FileText, Boxes } from "lucide-r
 import { AddToWorkspaceButton } from "@/components/add-to-workspace";
 import { ContextHeader } from "@/components/layout/context-header";
 import { PrerequisiteChecklist } from "@/components/prerequisite-checklist";
+import { PrerequisiteGuide } from "@/components/prerequisite-guide";
 
 export default function FeatureMapPage() {
   const { data: drafts, isLoading: draftsLoading } = useLatestDrafts();
@@ -154,13 +155,16 @@ export default function FeatureMapPage() {
             <div className="space-y-3">{[1,2,3].map(i=><Skeleton key={i} className="h-32 w-full"/>)}</div>
           ) : !features.length ? (
             <Card>
-              <CardContent className="py-8 text-center space-y-2 text-sm text-muted-foreground">
+              <CardContent className="py-8 text-center space-y-3 text-sm text-muted-foreground">
                 <p>No features discovered yet</p>
                 <p className="text-xs">
                   Generate Drafts above once the{" "}
                   <Link to="/repository" className="underline">Repository</Link> prerequisites
                   (snapshot, indexed symbols) are complete.
                 </p>
+                {/* Issue #241: phase-driven prerequisite guide — why this is
+                    empty and where to go next, from GET /system-state. */}
+                <PrerequisiteGuide testId="feature-map-prerequisite-guide" />
               </CardContent>
             </Card>
           ) : (

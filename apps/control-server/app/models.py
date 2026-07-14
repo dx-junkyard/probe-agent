@@ -3097,22 +3097,6 @@ class SystemUnderstandingPipelineStepOut(BaseModel):
     detail: Optional[str] = None
 
 
-NextActionCategory = Literal["understand", "observe", "instrument", "evaluate"]
-
-# Issue #201: finite set of how a next action is carried out. "navigate" is the
-# default (link the user somewhere); "build" means the action itself triggers
-# the Build / Refresh job rather than a page link.
-NextActionKind = Literal["navigate", "build"]
-
-
-class SystemUnderstandingNextActionOut(BaseModel):
-    action: str
-    reason: str
-    category: NextActionCategory
-    link: Optional[str] = None
-    action_kind: NextActionKind = "navigate"
-
-
 class SystemUnderstandingGapSummaryOut(BaseModel):
     gap_type: str
     count: int
@@ -3217,6 +3201,11 @@ class SystemUnderstandingStageStatusOut(BaseModel):
     stage: str
     status: str
     counts: Dict[str, int] = Field(default_factory=dict)
+    # Issue #240: server-supplied Japanese display copy (optional so existing
+    # dashboard contract tests that build this object without them stay valid;
+    # the Dashboard prefers these over its local STAGE_LABELS fallback).
+    label: str = ""
+    description: str = ""
 
 
 # Issue #203: deterministic before/after comparison of gap counts between the
@@ -3241,20 +3230,20 @@ class SystemUnderstandingOut(BaseModel):
     gaps: List[SystemUnderstandingGapOut] = Field(default_factory=list)
     gap_summary: List[SystemUnderstandingGapSummaryOut] = Field(default_factory=list)
     metadata_coverage: Optional[SystemUnderstandingMetadataCoverageOut] = None
-    next_actions: List[SystemUnderstandingNextActionOut] = Field(default_factory=list)
-    # Issue #201: single highest-priority action for the current state,
-    # derived deterministically in system_understanding_service._derive_primary_action.
-    # None when a build job is actively running (the BuildJobPanel already
-    # shows progress) so the header CTA and this card never contradict it.
-    primary_action: Optional[SystemUnderstandingNextActionOut] = None
     # Issue #202: deterministic completion status + counts for each of the 4
     # Hub stages (understand / observe / instrument / evaluate).
     stages: List[SystemUnderstandingStageStatusOut] = Field(default_factory=list)
     # Issue #203: gap-count trend across the last two settled builds (empty
-    # until 2 builds have recorded history), plus whether a materialized
-    # Interview change is newer than the latest completed build.
+    # until 2 builds have recorded history).
     gap_trend: List[SystemUnderstandingGapTrendOut] = Field(default_factory=list)
-    understanding_refresh_recommended: bool = False
+    # Issue #201's `primary_action`, Issue #174's `next_actions`, and Issue
+    # #203's `understanding_refresh_recommended` were removed in Issue #239.
+    # The canonical "what should the user do next" projection is now
+    # `GET /system-state`'s `primary_item` / `page_items` (Issue #238).
+    # Issue #240: server-supplied Japanese summary shown when the whole
+    # pipeline is complete (None otherwise); replaces the Dashboard's
+    # client-assembled English success string.
+    success_summary: Optional[str] = None
 
 
 class CapabilityContextProbePlanOut(BaseModel):

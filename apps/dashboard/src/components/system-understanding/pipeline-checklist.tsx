@@ -4,12 +4,14 @@ import { Badge } from "@/components/ui/badge";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { DiagnosticCheckCard, EnvFixDialog } from "@/components/diagnostics-badge";
 import { useDiagnosticActivate } from "@/components/diagnostic-fix";
+import { systemStateTarget } from "@/components/system-state";
 import { cn } from "@/lib/utils";
 import {
   CheckCircle2, XCircle, AlertTriangle, Ban, HelpCircle, Stethoscope,
 } from "lucide-react";
 import type {
   SystemDiagnosticCheck,
+  SystemStateItem,
   SystemUnderstandingPipelineStep,
 } from "@/api/types";
 
@@ -34,14 +36,24 @@ const STEP_LINKS: Record<string, string> = {
 };
 
 /**
- * Issue #200: fixed step -> CTA mapping for the "next single action" hint on
- * the first incomplete pipeline step. This is a deterministic, explicitly
- * enumerated mapping (CLAUDE.md Principle 6) — not an inferred suggestion.
- * `repository_configured` / `snapshot_ready` link to the Repository page
- * where the repo/snapshot is set up; every other known step is resolved by
- * running the Build / Refresh job, so its CTA connects to that action.
+ * Issue #200 introduced a fixed step -> CTA mapping for the "next single
+ * action" hint on the first incomplete pipeline step. Issue #239 replaced it
+ * as the primary source: the CTA now comes from the `SystemStateItem` whose
+ * `related_pipeline_steps` names this step (`stateItemForStep` below), reusing
+ * the same `target_ui` / `systemStateTarget()` every other notification
+ * surface (badge, banner, notice) already consumes — so the same root cause
+ * never shows different text or a different destination on this page vs.
+ * elsewhere (CLAUDE.md Principle 6: the StateItem's fields are themselves a
+ * finite, server-computed set; nothing is inferred here).
+ *
+ * This fixed map is kept only as the last-resort fallback for a step that
+ * has no matching StateItem (as of #239, only `repository_configured` in the
+ * "repository not configured for this System" case: its native item,
+ * `repository.configuration.missing`, does not carry `related_pipeline_steps`,
+ * and the diagnostic checks that do are suppressed as already-covered
+ * duplicates — see docs/system-understanding-navigation.md).
  */
-type StepCta = { kind: "repository" | "build" | "interview"; label: string };
+type StepCta = { kind: "repository" | "build"; label: string };
 
 const STEP_CTA: Record<string, StepCta> = {
   repository_configured: { kind: "repository", label: "Configure repository" },
@@ -53,6 +65,14 @@ const STEP_CTA: Record<string, StepCta> = {
   docs_code_reconciled: { kind: "build", label: "Run Build / Refresh" },
   capability_hierarchy_ready: { kind: "build", label: "Run Build / Refresh" },
 };
+
+/**
+ * The first (highest-priority; `pageItems` arrives pre-sorted by the server)
+ * StateItem whose `related_pipeline_steps` names this pipeline step.
+ */
+function stateItemForStep(items: SystemStateItem[], step: string): SystemStateItem | undefined {
+  return items.find((item) => item.related_pipeline_steps.includes(step));
+}
 
 export function StatusIcon({ status }: { status: string }) {
   switch (status) {
@@ -79,9 +99,14 @@ export function statusVariant(status: string): "default" | "secondary" | "destru
   }
 }
 
-export function PipelineChecklist({ steps, checksByStep, onRunBuild, buildDisabled }: {
+export function PipelineChecklist({ steps, checksByStep, pageItems, onRunBuild, buildDisabled }: {
   steps: SystemUnderstandingPipelineStep[];
   checksByStep: Record<string, SystemDiagnosticCheck[]>;
+  /** Issue #239: `GET /system-state`'s `page_items["/system-understanding"]`,
+   * already phase-scoped and deduped by the server. Used to drive the CTA on
+   * the first incomplete step (`stateItemForStep`); falls back to `STEP_CTA`
+   * only when no item matches this step. */
+  pageItems?: SystemStateItem[];
   /** Issue #200: runs the Build / Refresh job, wired to the first incomplete
    * step's CTA when that step's fix is "run a build" rather than "go
    * configure the repository". */
@@ -105,23 +130,18 @@ export function PipelineChecklist({ steps, checksByStep, onRunBuild, buildDisabl
         const label = STEP_LABELS[s.step] ?? s.step;
         const relatedChecks = s.status === "complete" ? [] : (checksByStep[s.step] ?? []);
         const expanded = expandedStep === s.step;
-        // The Interview CTA is driven by the same structured diagnostic that
-        // backs this row's "Why?" list and the settings dialog: the server
-        // sets fix_page="/interview" on `pipeline_capability_hierarchy`
-        // exactly when the run completed but produced zero capabilities (a
-        // finite structural branch, Principle 6). Never re-derive that state
-        // from the free-text `detail`.
-        const interviewFix = relatedChecks.some(
-          (c) =>
-            c.check_id === "pipeline_capability_hierarchy"
-            && c.fix_kind === "navigate"
-            && c.fix_page === "/interview",
-        );
-        const cta = s.step === firstIncompleteStep
-          ? (interviewFix
-            ? { kind: "interview" as const, label: "Review interview proposals" }
-            : STEP_CTA[s.step])
-          : undefined;
+        const isFirstIncomplete = s.step === firstIncompleteStep;
+        // Issue #239: the CTA's text and destination come from the matching
+        // StateItem (same source the badge/banner/notice already read), not
+        // a hardcoded per-step label. `user_action_kind === "build"` is the
+        // one finite signal that means "trigger Build / Refresh directly"
+        // rather than "navigate somewhere" -- every other kind (confirm,
+        // review, rerun, configure, inspect, ...) renders as a link to
+        // target_ui, even when that link happens to be this same page (it
+        // still highlights the right control via the diagnostic-focus
+        // query params).
+        const stateItem = isFirstIncomplete ? stateItemForStep(pageItems ?? [], s.step) : undefined;
+        const fallbackCta = isFirstIncomplete && !stateItem ? STEP_CTA[s.step] : undefined;
         return (
           <li key={s.step} className="text-sm">
             <div className="flex items-center gap-3">
@@ -139,16 +159,7 @@ export function PipelineChecklist({ steps, checksByStep, onRunBuild, buildDisabl
               {s.detail && (
                 <span className="text-xs text-muted-foreground ml-1">{s.detail}</span>
               )}
-              {cta && cta.kind === "repository" && (
-                <Link
-                  to="/repository"
-                  data-testid={`pipeline-cta-${s.step}`}
-                  className={cn(buttonVariants({ size: "sm" }), "h-7 text-xs")}
-                >
-                  {cta.label}
-                </Link>
-              )}
-              {cta && cta.kind === "build" && (
+              {stateItem && stateItem.user_action_kind === "build" && (
                 <Button
                   size="sm"
                   className="h-7 text-xs"
@@ -156,17 +167,37 @@ export function PipelineChecklist({ steps, checksByStep, onRunBuild, buildDisabl
                   onClick={onRunBuild}
                   disabled={buildDisabled}
                 >
-                  {cta.label}
+                  {stateItem.target_ui?.action_label || "Run Build / Refresh"}
                 </Button>
               )}
-              {cta && cta.kind === "interview" && (
+              {stateItem && stateItem.user_action_kind !== "build" && (
                 <Link
-                  to="/interview"
+                  to={systemStateTarget(stateItem) ?? stateItem.target_ui?.route ?? "#"}
                   data-testid={`pipeline-cta-${s.step}`}
                   className={cn(buttonVariants({ size: "sm" }), "h-7 text-xs")}
                 >
-                  {cta.label}
+                  {stateItem.target_ui?.action_label || "対応する"}
                 </Link>
+              )}
+              {fallbackCta && fallbackCta.kind === "repository" && (
+                <Link
+                  to="/repository"
+                  data-testid={`pipeline-cta-${s.step}`}
+                  className={cn(buttonVariants({ size: "sm" }), "h-7 text-xs")}
+                >
+                  {fallbackCta.label}
+                </Link>
+              )}
+              {fallbackCta && fallbackCta.kind === "build" && (
+                <Button
+                  size="sm"
+                  className="h-7 text-xs"
+                  data-testid={`pipeline-cta-${s.step}`}
+                  onClick={onRunBuild}
+                  disabled={buildDisabled}
+                >
+                  {fallbackCta.label}
+                </Button>
               )}
               {relatedChecks.length > 0 && (
                 <Button

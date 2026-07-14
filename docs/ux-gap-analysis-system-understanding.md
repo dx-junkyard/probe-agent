@@ -131,36 +131,46 @@ pipeline 全 complete かつ purpose 未定義のとき `Define System Purpose`
 
 ### 画面横断
 
-- **Overview が新規ユーザーの行き止まり**（`overview.tsx:71-74`）:
-  ログイン直後の画面に Repository / System Understanding / Connect SDK への
-  導線が一切ない。
-- **Probe Planner に上流ゲートがない**（`probe-planner.tsx:79-94, 372-383`）:
-  Feature Map 未生成時は自由入力の feature id でプラン生成でき、
-  System Purpose / capability / entrypoint と無関係なプランが作れてしまう。
-  意図された「capability 確認 → flow 選択 → plan 作成」順序の最大の抜け道。
+以下のうち Overview 行き止まり・Probe Planner 上流ゲート・Feature Map
+空状態・Connect SDK ↔ Setup Guide 双方向リンクは **Issue #241 で解消済み**
+（共通 `PrerequisiteGuide` コンポーネントと双方向リンク追加）。
+
+- **Overview が新規ユーザーの行き止まり**（`overview.tsx`）: →（#241）
+  コンポーネント 0 件かつ `user_phase != diagnosis` の場合に、フェーズに
+  応じた開始導線（`PrerequisiteGuide`）を表示する。既存の get-started 固定
+  リストは全前提充足後のフォールバックとして残す。
+- **Probe Planner に上流ゲートがない**（`probe-planner.tsx`）: →（#241）
+  診断準備（preparation）未完了時、生成ダイアログに `PrerequisiteGuide`
+  を表示する。自由入力 feature id は従来どおり明示的な escape hatch
+  （既定で折りたたみ）であり、プラン生成 API 自体は拒否しない
+  （後方互換、強制ブロックではない）。
 - **Capability Map の詳細パネル内 gap リンクが `?capability=` を失う**
   （`capability-map.tsx:379-388`）: すべて素の `/system-understanding` に戻り、
   ユーザーは同じ gap を探し直す。ナビ設計ドキュメントの
-  「`?capability=` は途切れない navigation context」原則に違反。
-- **Feature Map の空状態に前提条件への導線がない**
-  （`feature-map.tsx:108, 148, 235`）: Capability Map の空状態
-  （`capability-map.tsx:611-646`、PrerequisiteChecklist あり）と非対称。
-- **Connect SDK → Setup Guide が一方通行**（`setup-guide.tsx:416` は
-  connect-sdk へリンクするが逆方向がない）。
+  「`?capability=` は途切れない navigation context」原則に違反。（#241 対象外）
+- **Feature Map の空状態に前提条件への導線がない**（`feature-map.tsx`）:
+  →（#241）features 空状態に `PrerequisiteGuide` を追加。
+- **Connect SDK → Setup Guide が一方通行**: →（#241）Setup Guide に
+  Connect SDK への逆方向リンク（`setup-guide-connect-sdk-link`）を追加し
+  双方向化。
 
 ### 表示言語
 
-i18n 機構は不在（i18next 等の import ゼロ）。言語の境界は
-**どのバックエンドモジュールが文字列を生成したかに一致**している:
+**（Issue #240 で解消済み）** かつては i18n 機構が不在で、言語の境界が
+「どのバックエンドモジュールが文字列を生成したか」に一致しており、
+`system_state.py` / `system_diagnostics.py` は日本語、
+`system_understanding_service.py` の pipeline / NextAction / stage 文言は
+英語で、同一画面に英日が混在していた。
 
-- 日本語: `system_state.py` / `system_diagnostics.py` の全メッセージ、
-  Interview ページ全体、Setup Guide ページ全体、
-  `system-understanding.tsx:558-561` のインライン日本語バナー。
-- 英語: pipeline checklist、`system_understanding_service.py` の
-  NextAction 文言、Capability Map / Flow Explorer / Probe Planner 等。
-
-結果として同一画面内で「Capability hierarchy ready — complete」（英）と
-「…capability 階層を生成してください。」（日）が並ぶ。
+Issue #240 で状態メッセージ（summary / detail / impact / remediation /
+action_label、pipeline step / stage / gap の表示文言、成功サマリ）を
+サーバー側の単一カタログ `app/state_messages.py` に集約し、表示言語を
+**日本語に統一**した。カタログのキーは `state_id` / `check_id` を正とし、
+キー欠落は `tests/test_state_messages.py` が検出する（黙って英語/空文字へ
+フォールバックしない）。フロントは文言を生成せず、stage ラベル・成功
+サマリ・フェーズ表示・gap アクションはサーバー供給値を消費する（欠落時の
+固定ラベルのみ最終手段フォールバックとして残す）。i18n フレームワーク
+（多言語切替）の導入は引き続き対象外。
 
 ### ドキュメント負債
 
@@ -212,20 +222,23 @@ i18n 機構は不在（i18next 等の import ゼロ）。言語の境界は
 
 ### P3 — 画面横断の導線
 
-10. Overview に zero-state の get-started 導線（Repository 設定 / Connect SDK /
-    System Understanding）を追加。
-11. Probe Planner に上流ゲート（capability hierarchy / entrypoint 由来の選択を
-    前提にし、自由入力 feature id は明示の escape hatch に降格）。
-12. Capability Map 詳細パネルの gap リンクに `?capability=` を付与。
-13. Feature Map 空状態に PrerequisiteChecklist 相当を追加。
-14. Connect SDK → Setup Guide の順方向リンクを追加。
+10. **（Issue #241 で対応済み）** Overview に zero-state の開始導線
+    （フェーズ由来の共通 `PrerequisiteGuide`）を追加。
+11. **（Issue #241 で対応済み）** Probe Planner に上流ゲート（診断準備未完了
+    時の `PrerequisiteGuide` 表示、自由入力 feature id は escape hatch に
+    降格。API 拒否はしない）。
+12. Capability Map 詳細パネルの gap リンクに `?capability=` を付与。（未対応）
+13. **（Issue #241 で対応済み）** Feature Map 空状態に `PrerequisiteGuide`
+    を追加。
+14. **（Issue #241 で対応済み）** Connect SDK ↔ Setup Guide の双方向リンク。
 
 ### P4 — 言語ポリシー
 
-15. 表示言語を 1 つに決め（現状の利用者に合わせるなら日本語）、
-    固有概念は初出のみ併記（例: システム目的（System Purpose））。
-    バックエンド発の文言（`system_state` / `system_diagnostics` / NextAction）を
-    同一言語に揃えることが先決。フロントの i18n 基盤導入はその後でよい。
+15. **（Issue #240 で対応済み）** 表示言語を日本語に統一し、バックエンド
+    発の文言（`system_state` / `system_diagnostics` /
+    `system_understanding_service` の pipeline / stage / gap 文言）を
+    サーバー側カタログ `app/state_messages.py` に集約した。固有概念の初出
+    併記や i18n 基盤導入は引き続き対象外。
 
 ### 付随タスク
 

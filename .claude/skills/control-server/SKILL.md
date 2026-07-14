@@ -124,10 +124,11 @@ fallback for intelligence work.
   さい" used for not-yet-run/failed/blocked steps — the build already ran.
 - `GET /system-diagnostics` stays backward compatible; it is a projection
   built on top of `system_state.py`, not replaced by it.
-- Later phases (not yet implemented): projecting `next_actions` and
-  Dashboard page callouts/toasts from the same state items, and covering
-  the `runtime` / `proposal` / `interview` (beyond the one stale-snapshot
-  item) state groups.
+- Later phases: Dashboard page callouts/toasts sourced from the same state
+  items (not yet implemented), and covering more of the `runtime` /
+  `proposal` / `interview` state groups beyond the representative items
+  Issue #237 and Issue #238 added. `next_actions` projection is done -- see
+  the Issue #238 bullet below.
 - **`user_phase` (Issue #237)**: `GET /system-state` also returns
   `user_phase` (`setup | preparation | diagnosis`) and `phases` (each
   phase's completion condition). `system_state.derive_user_phase(facts:
@@ -162,6 +163,84 @@ fallback for intelligence work.
   cases) plus `state_facts.count_approved_probe_plans` /
   `count_undecided_completed_experiments` coverage (including System
   isolation) in `tests/test_state_facts.py`.
+- **`primary_item` absorbs `primary_action` (Issue #238, removal completed
+  in #239)**: `select_primary_item` is the canonical "what should the user
+  do next" derivation. `system_understanding_service._derive_primary_action`
+  / `_build_next_actions` and the `primary_action` / `next_actions` /
+  `understanding_refresh_recommended` fields on `GET
+  /repository/system-understanding` were removed in Issue #239 (the
+  Dashboard consumption switch happened in the same commit;
+  `_check_understanding_refresh_recommended` survives only as the source of
+  the `interview.materialized.rebuild_required` state item). Do not
+  reintroduce these fields; read `primary_item` / `page_items` from
+  `GET /system-state` instead. Two new
+  native `state_group="pipeline"` items close a gap the pipeline-step
+  factors weren't fully covered by: `pipeline.docs_code_reconcile.not_run` /
+  `.partial` (mirrors `system_understanding_service._check_docs_code_reconciled`'s
+  "has an understanding graph AND has code symbols" condition -- the
+  pre-existing `diagnostic.pipeline_understanding_graph` diagnostic check
+  only tests graph presence, so it already covers
+  `documentation_claims_scanned` but not the code-symbols half of
+  `docs_code_reconciled`, hence no separate native item for the former).
+  Two new `state_group="proposal"` items close the probe-plan-review gap:
+  `proposal.probe_plans.proposed` (count of `status = 'proposed'` plans,
+  `phase="preparation"` override -- reviewing/approving one is how a user
+  reaches the approved-plan half of `derive_user_phase`'s instrumentation-path
+  OR condition, same rationale as `runtime.connectivity.no_signal`'s
+  override) and `proposal.probe_plans.approved_without_patch` (count of
+  approved plans whose latest patch has not passed both `baseline` and
+  `probed` validation, default `phase="diagnosis"` since an approved plan
+  already satisfies that OR condition regardless of patch status). The
+  "has this plan's patch been validated" check moved from
+  `system_understanding_service._plan_has_validated_patch` to
+  `state_facts.plan_has_validated_patch` (plus new
+  `state_facts.count_proposed_probe_plans` /
+  `count_approved_probe_plans_without_validated_patch`) so both surfaces
+  share one query. No `StateItem` was added for the terminal "everything
+  satisfied, explore from here" `next_actions` fallback (`Start from
+  Capability` / `Start from Feature` / `Open Flow Explorer`):
+  `select_primary_item` only ever selects `severity != "ok"` items, so a
+  fully-satisfied system correctly yields `primary_item = None` there
+  instead of a decorative nudge -- an intentional divergence from the old
+  field's behavior, not a gap. A second intentional divergence: the old
+  `_derive_primary_action` rule 2 unconditionally blanks `primary_action`
+  while any build is queued/running, regardless of cause; the new model has
+  no equivalent blanket rule -- only the pipeline step(s) an active build is
+  actually processing become `user_action_kind="wait"` (excluded from
+  `select_primary_item` candidacy), so an unrelated outstanding item (e.g. a
+  probe plan awaiting review) is not suppressed just because a System
+  Understanding build happens to be running concurrently. Contract tests
+  pinning old/new agreement for the representative cases where they are
+  expected to agree (repository unconfigured, snapshot not ready, a single
+  incomplete pipeline step, purpose undefined, proposed/approved-without-patch
+  probe plans, a genuinely idle active build) plus both intentional
+  divergences and the `understanding_refresh_recommended` ==
+  `interview.materialized.rebuild_required`-presence equivalence live in
+  `tests/test_next_step_parity.py`.
+- **Message catalog (Issue #240)**: all user-facing state copy (summary /
+  detail / impact / remediation / action_label, pipeline-step / stage
+  display names, gap titles / next-actions, the Hub success summary) lives
+  in one server-side catalog, `app/state_messages.py`, and the display
+  language is Japanese. `system_state.py`, `system_diagnostics.py`, and
+  `system_understanding_service.py` look copy up from the catalog by
+  `state_id` / `check_id` (+ variant) instead of holding f-strings.
+  Accessors (`state_message`, `pipeline_family_message`,
+  `understanding_message`, `check_title`, `check_message`,
+  `shared_check_message`, `stage_message`, `pipeline_step_detail`,
+  `gap_title`, `gap_note`, `pipeline_not_run_remediation`, `success_summary`)
+  raise `KeyError` on a missing key -- never a silent English/blank fallback
+  (`phase_label` is the one deliberate exception: it returns the raw token
+  for a server-validated enum). **When you add a new `StateItem` /
+  `DiagnosticCheck` / pipeline step / stage, add its catalog key in the same
+  change** -- `tests/test_state_messages.py` fails otherwise (it verifies
+  every `ALL_*` key resolves, drives the real `run_system_diagnostics` /
+  `build_system_state` producers asserting every emitted id resolves to
+  Japanese, and snapshots representative strings). Dynamic content stays
+  limited to finite facts (counts, snapshot ids, raw upstream status/error)
+  interpolated as named `str.format` params; no reasoning model authors
+  copy. Dashboard consumes server copy (stage `label`/`description`,
+  `SystemUnderstandingOut.success_summary`, `user_phase` labels, gap
+  actions) and keeps its local label maps only as a last-resort fallback.
 
 ## System settings diagnostics (issue #101)
 
