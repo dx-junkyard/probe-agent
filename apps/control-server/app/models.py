@@ -116,6 +116,8 @@ class LineageStepOut(BaseModel):
     timestamp: float
     output: Optional[str] = None
     error: Optional[str] = None
+    replayability: Optional[Replayability] = None
+    replay_reasons: List[ReplayReason] = Field(default_factory=list)
     entities: List[LineageEntityOut] = Field(default_factory=list)
     projections: List[LineageProjectionOut] = Field(default_factory=list)
 
@@ -3969,7 +3971,7 @@ class ReplayVariantRunCreate(BaseModel):
 
     replay_set_id: int
     snapshot_id: Optional[int] = None
-    variants: List[ReplayVariantCreate] = Field(..., min_length=1, max_length=10)
+    variants: List[ReplayVariantCreate] = Field(..., min_length=1, max_length=20)
 
 
 class ReplayVariantCaseResultOut(BaseModel):
@@ -4090,6 +4092,34 @@ class ReplayVariantExperimentPayloadOut(BaseModel):
     source: str = "replay_variant"
     risk_note: str = ""
     origin: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReplayRegressionScaffoldCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    replay_run_id: int
+    replay_variant_id: int
+    trace_id: str = Field(..., min_length=1)
+
+
+class ReplayRegressionScaffoldOut(BaseModel):
+    id: int
+    intelligence_run_id: int
+    replay_run_id: int
+    replay_variant_id: int
+    replay_set_id: int
+    trace_id: str
+    snapshot_id: int
+    scaffold_text: str = ""
+    status: Literal["proposed", "failed"]
+    error: Optional[str] = None
+    provider: str
+    model: str
+    prompt_version: str
+    schema_version: str
+    decision_method: Literal["reasoning_llm"] = "reasoning_llm"
+    is_mock: bool = False
+    created_at: float
 
 
 # --- Replay source & diff helpers (Issue #242 Phase D / #246) ----------------

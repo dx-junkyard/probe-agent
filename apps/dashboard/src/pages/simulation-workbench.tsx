@@ -10,6 +10,7 @@ import {
   useReplayVariantRun,
   useReplayVariantRuns,
   useCreateReplayVariantDraft,
+  useCreateReplayRegressionScaffold,
   useReplayApproval,
   useApproveReplay,
   useRevokeReplayApproval,
@@ -20,6 +21,7 @@ import type {
   ReplayVariantCaseResultOut,
   ReplayVariantAggregateOut,
   ReplayVariantDraftOut,
+  ReplayRegressionScaffoldOut,
   ReplaySetTraceOut,
   TraceEvent,
 } from "@/api/types";
@@ -83,9 +85,14 @@ export default function SimulationWorkbenchPage() {
   // render (React's documented pattern for "resetting state when a prop
   // changes") rather than in an effect, so user edits survive re-renders
   // that don't change the underlying source.
-  const [lastLoadedSource, setLastLoadedSource] = useState<string | undefined>(undefined);
-  if (source?.source != null && source.source !== lastLoadedSource) {
-    setLastLoadedSource(source.source);
+  const sourceIdentity = source
+    ? `${source.snapshot_id}:${source.commit_sha}:${source.path}`
+    : undefined;
+  const [lastLoadedSourceIdentity, setLastLoadedSourceIdentity] = useState<string | undefined>(
+    undefined,
+  );
+  if (source?.source != null && sourceIdentity !== lastLoadedSourceIdentity) {
+    setLastLoadedSourceIdentity(sourceIdentity);
     setEditedSource(source.source);
   }
 
@@ -93,6 +100,7 @@ export default function SimulationWorkbenchPage() {
   const [draftTraceId, setDraftTraceId] = useState<string | null>(null);
   const [draftObjective, setDraftObjective] = useState("");
   const [lastDraft, setLastDraft] = useState<ReplayVariantDraftOut | null>(null);
+  const activeDraft = lastDraft?.replay_set_id === selectedSetId ? lastDraft : null;
 
   const sourceDiff = useReplaySourceDiff();
   const createVariantRun = useCreateReplayVariantRun();
@@ -117,14 +125,16 @@ export default function SimulationWorkbenchPage() {
   const canRun = !!approvalState?.active;
 
   const handleRunDirectEdit = async () => {
-    if (!selectedSetId) return;
+    if (!selectedSetId || !source) return;
     try {
       const diff = await sourceDiff.mutateAsync({
         replay_set_id: selectedSetId,
+        snapshot_id: source?.snapshot_id,
         edited_source: editedSource,
       });
       const run = await createVariantRun.mutateAsync({
         replay_set_id: selectedSetId,
+        snapshot_id: source?.snapshot_id,
         variants: [{ label: "Direct edit", patch_text: diff.patch_text, source: "manual" }],
       });
       setActiveRunId(run.id);
@@ -135,10 +145,11 @@ export default function SimulationWorkbenchPage() {
   };
 
   const handleRunPastedPatch = async () => {
-    if (!selectedSetId || !pastedPatch.trim()) return;
+    if (!selectedSetId || !source || !pastedPatch.trim()) return;
     try {
       const run = await createVariantRun.mutateAsync({
         replay_set_id: selectedSetId,
+        snapshot_id: source?.snapshot_id,
         variants: [{ label: "Pasted patch", patch_text: pastedPatch, source: "pasted" }],
       });
       setActiveRunId(run.id);
@@ -149,12 +160,13 @@ export default function SimulationWorkbenchPage() {
   };
 
   const handleGenerateDraft = async () => {
-    if (!selectedSetId || !draftTraceId || !draftObjective.trim()) return;
+    if (!selectedSetId || !source || !draftTraceId || !draftObjective.trim()) return;
     try {
       const draft = await createDraft.mutateAsync({
         replay_set_id: selectedSetId,
         trace_id: draftTraceId,
         objective: draftObjective.trim(),
+        snapshot_id: source?.snapshot_id,
       });
       setLastDraft(draft);
       if (draft.status === "failed") toast.error(draft.error || "Draft generation failed");
@@ -164,14 +176,15 @@ export default function SimulationWorkbenchPage() {
   };
 
   const handleRunDraft = async () => {
-    if (!selectedSetId || !lastDraft?.patch_text) return;
+    if (!selectedSetId || !activeDraft?.patch_text) return;
     try {
       const run = await createVariantRun.mutateAsync({
         replay_set_id: selectedSetId,
+        snapshot_id: activeDraft.snapshot_id,
         variants: [
           {
-            label: `LLM draft: ${lastDraft.objective.slice(0, 40)}`,
-            patch_text: lastDraft.patch_text,
+            label: `LLM draft: ${activeDraft.objective.slice(0, 40)}`,
+            patch_text: activeDraft.patch_text,
             source: "llm_draft",
           },
         ],
@@ -276,7 +289,13 @@ export default function SimulationWorkbenchPage() {
                         <Button
                           size="sm"
                           onClick={handleRunDirectEdit}
-                          disabled={!canRun || !source || sourceDiff.isPending || createVariantRun.isPending}
+                          disabled={
+                            !canRun ||
+                            !source ||
+                            editedSource === source.source ||
+                            sourceDiff.isPending ||
+                            createVariantRun.isPending
+                          }
                         >
                           {sourceDiff.isPending || createVariantRun.isPending ? "Running..." : "Run"}
                         </Button>
@@ -294,7 +313,7 @@ export default function SimulationWorkbenchPage() {
                         <Button
                           size="sm"
                           onClick={handleRunPastedPatch}
-                          disabled={!canRun || !pastedPatch.trim() || createVariantRun.isPending}
+                          disabled={!canRun || !source || !pastedPatch.trim() || createVariantRun.isPending}
                         >
                           {createVariantRun.isPending ? "Running..." : "Run"}
                         </Button>
@@ -325,30 +344,30 @@ export default function SimulationWorkbenchPage() {
                         <Button
                           size="sm"
                           onClick={handleGenerateDraft}
-                          disabled={!draftTraceId || !draftObjective.trim() || createDraft.isPending}
+                          disabled={!source || !draftTraceId || !draftObjective.trim() || createDraft.isPending}
                         >
                           {createDraft.isPending ? "Generating..." : "Generate draft"}
                         </Button>
-                        {lastDraft && (
+                        {activeDraft && (
                           <div className="space-y-2 rounded-md border p-3">
                             <div className="flex flex-wrap items-center gap-1">
-                              {lastDraft.is_mock && <Badge variant="warning">mock LLM</Badge>}
-                              <Badge variant="outline">{lastDraft.decision_method ?? "reasoning_llm"}</Badge>
-                              {lastDraft.provider && (
+                              {activeDraft.is_mock && <Badge variant="warning">mock LLM</Badge>}
+                              <Badge variant="outline">{activeDraft.decision_method ?? "reasoning_llm"}</Badge>
+                              {activeDraft.provider && (
                                 <Badge variant="outline">
-                                  {lastDraft.provider}/{lastDraft.model}
+                                  {activeDraft.provider}/{activeDraft.model}
                                 </Badge>
                               )}
-                              <Badge variant={lastDraft.status === "proposed" ? "success" : "destructive"}>
-                                {lastDraft.status}
+                              <Badge variant={activeDraft.status === "proposed" ? "success" : "destructive"}>
+                                {activeDraft.status}
                               </Badge>
                             </div>
-                            {lastDraft.status === "failed" ? (
-                              <p className="text-xs text-destructive">{lastDraft.error}</p>
+                            {activeDraft.status === "failed" ? (
+                              <p className="text-xs text-destructive">{activeDraft.error}</p>
                             ) : (
                               <>
                                 <Textarea
-                                  value={lastDraft.patch_text}
+                                  value={activeDraft.patch_text}
                                   readOnly
                                   rows={8}
                                   className="font-mono text-xs"
@@ -356,7 +375,11 @@ export default function SimulationWorkbenchPage() {
                                 <Button
                                   size="sm"
                                   onClick={handleRunDraft}
-                                  disabled={!canRun || createVariantRun.isPending}
+                                  disabled={
+                                    !canRun ||
+                                    !activeDraft.patch_text ||
+                                    createVariantRun.isPending
+                                  }
                                 >
                                   {createVariantRun.isPending ? "Running..." : "Run this draft"}
                                 </Button>
@@ -391,7 +414,12 @@ export default function SimulationWorkbenchPage() {
 
           <ResultMatrix run={activeRun} recordedByTraceId={recordedByTraceId} />
 
-          <EscalationPanel run={activeRun} componentId={componentId} source={source ?? null} />
+          <EscalationPanel
+            run={activeRun}
+            componentId={componentId}
+            source={source ?? null}
+            selectedTraceId={draftTraceId}
+          />
         </div>
       )}
     </div>
@@ -625,7 +653,7 @@ function MatrixTable({
   recordedByTraceId: Map<string, TraceEvent>;
 }) {
   const candidates = run.variants.filter((v) => !v.is_baseline);
-  const rows = candidates[0]?.cases ?? [];
+  const rows = candidates.find((candidate) => candidate.cases.length > 0)?.cases ?? [];
 
   if (candidates.length === 0 || rows.length === 0) {
     return <p className="text-sm text-muted-foreground">No cases to compare for this run.</p>;
@@ -659,7 +687,7 @@ function MatrixTable({
                 </td>
                 <td className="p-2 max-w-[16rem]">
                   <pre className="whitespace-pre-wrap break-words">
-                    {row.baseline_output ?? "—"}
+                    {row.recorded_error ?? row.baseline_output ?? "—"}
                   </pre>
                 </td>
                 {candidates.map((v) => {
@@ -730,51 +758,32 @@ function AggregateCell({ aggregate }: { aggregate: ReplayVariantAggregateOut }) 
 
 // --- Escalation panel ---------------------------------------------------------
 
-function buildRegressionScaffold(params: {
-  path: string;
-  qualifiedName: string;
-  traceId: string;
-  recorded?: TraceEvent;
-}): string {
-  const simpleName = params.qualifiedName.split(".").pop() || params.qualifiedName;
-  const moduleGuess = params.path.replace(/\.py$/, "").replace(/\//g, ".");
-  const lines = [
-    "# Deterministic starting point generated client-side from the resolved",
-    "# symbol and the recorded trace -- NOT reasoning-model output.",
-    "# Review and complete before use.",
-    `# Source: ${params.path} :: ${params.qualifiedName} (trace ${params.traceId})`,
-    "",
-    `from ${moduleGuess} import ${simpleName}`,
-    "",
-    "",
-    `def test_${simpleName}_regression():`,
-    "    # TODO: fill in the exact args/kwargs from this trace's structured input capture.",
-    `    result = ${simpleName}(...)`,
-  ];
-  if (params.recorded?.error) {
-    lines.push(`    # Recorded error for this trace: ${params.recorded.error}`);
-  } else {
-    lines.push(
-      `    assert result == ${JSON.stringify(params.recorded?.output ?? "")}  # TODO: adjust once verified`,
-    );
-  }
-  return lines.join("\n") + "\n";
-}
-
 function EscalationPanel({
   run,
   componentId,
   source,
+  selectedTraceId,
 }: {
   run: ReplayVariantRunOut | undefined;
   componentId: string | null;
   source: { path: string; qualified_name: string } | null;
+  selectedTraceId: string | null;
 }) {
   const navigate = useNavigate();
   const candidates = run?.variants.filter((v) => !v.is_baseline) ?? [];
-  const [scaffold, setScaffold] = useState<string | null>(null);
+  const createScaffold = useCreateReplayRegressionScaffold();
+  const [scaffold, setScaffold] = useState<ReplayRegressionScaffoldOut | null>(null);
 
-  const firstRow = candidates[0]?.cases[0];
+  const scaffoldCandidate = candidates.find(
+    (candidate) =>
+      candidate.status === "completed" &&
+      candidate.apply_status === "applied" &&
+      candidate.cases.length > 0,
+  );
+  const firstRow =
+    scaffoldCandidate?.cases.find((row) => row.trace_id === selectedTraceId) ??
+    scaffoldCandidate?.cases[0];
+  const activeScaffold = scaffold?.replay_run_id === run?.id ? scaffold : null;
 
   return (
     <Card>
@@ -793,7 +802,9 @@ function EscalationPanel({
                   key={v.id}
                   size="sm"
                   variant="outline"
-                  disabled={!v.patch_text}
+                  disabled={
+                    !v.patch_text || v.status !== "completed" || v.apply_status !== "applied"
+                  }
                   onClick={() =>
                     navigate(`/experiments?replay_run_id=${run.id}&replay_variant_id=${v.id}`)
                   }
@@ -813,27 +824,57 @@ function EscalationPanel({
         <div className="space-y-2 border-t pt-3">
           <p className="font-medium">Regression-test scaffold</p>
           <p className="text-muted-foreground">
-            A deterministic starting point generated client-side from the resolved symbol and the
-            recorded trace -- NOT reasoning-model output. Review and complete it before use.
+            A review-only reasoning-model draft grounded in the pinned symbol, captured trace, and
+            candidate patch. It is never written to the target repository automatically.
           </p>
           <Button
             size="sm"
             variant="outline"
-            disabled={!source || !firstRow}
-            onClick={() => {
-              if (!source || !firstRow) return;
-              setScaffold(
-                buildRegressionScaffold({
-                  path: source.path,
-                  qualifiedName: source.qualified_name,
-                  traceId: firstRow.trace_id,
-                }),
-              );
+            disabled={!source || !run || !scaffoldCandidate || !firstRow || createScaffold.isPending}
+            onClick={async () => {
+              if (!run || !scaffoldCandidate || !firstRow) return;
+              try {
+                const result = await createScaffold.mutateAsync({
+                  replay_run_id: run.id,
+                  replay_variant_id: scaffoldCandidate.id,
+                  trace_id: firstRow.trace_id,
+                });
+                setScaffold(result);
+                if (result.status === "failed") {
+                  toast.error(result.error || "Regression scaffold generation failed");
+                }
+              } catch (error) {
+                toast.error(String(error));
+              }
             }}
           >
-            Generate regression-test scaffold
+            {createScaffold.isPending ? "Generating..." : "Generate regression-test scaffold"}
           </Button>
-          {scaffold && <Textarea value={scaffold} readOnly rows={10} className="font-mono text-xs" />}
+          {activeScaffold && (
+            <div className="space-y-2 rounded border p-2">
+              <div className="flex items-center gap-1 flex-wrap">
+                {activeScaffold.is_mock && <Badge variant="warning">mock LLM</Badge>}
+                <Badge variant="outline">{activeScaffold.decision_method}</Badge>
+                <Badge variant="outline">{activeScaffold.provider}/{activeScaffold.model}</Badge>
+                <Badge variant={activeScaffold.status === "proposed" ? "success" : "destructive"}>
+                  {activeScaffold.status}
+                </Badge>
+                <span className="text-muted-foreground">
+                  run #{activeScaffold.intelligence_run_id} · {activeScaffold.prompt_version}
+                </span>
+              </div>
+              {activeScaffold.status === "failed" ? (
+                <p className="text-destructive">{activeScaffold.error}</p>
+              ) : (
+                <Textarea
+                  value={activeScaffold.scaffold_text}
+                  readOnly
+                  rows={10}
+                  className="font-mono text-xs"
+                />
+              )}
+            </div>
+          )}
         </div>
 
         <div className="space-y-2 border-t pt-3">

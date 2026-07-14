@@ -589,14 +589,19 @@ heuristic result.
 - Tables (System-scoped, cascade FKs, additive CREATE-only): `replay_sets`,
   `replay_runs`, `replay_case_results` (#244), `replay_variants`,
   `replay_variant_case_results`, `replay_variant_drafts` (#245), plus
-  `replay_approvals` (the approval gate). `traces` gained additive
+  `replay_approvals` (the approval gate) and
+  `replay_regression_scaffolds` (review-only #246 reasoning drafts).
+  `traces` gained additive
   `input_capture_json` / `replayability` / `replay_reasons_json` columns
-  (#243). No new tables in Phase D (#246).
+  (#243).
 - The replay approval gate is a human `decision_method: manual` record;
   `POST /replay-runs` / `POST /replay-variant-runs` return 403 without an
   active (non-revoked) approval. Risk context shown at approval time reuses
   persisted probe-plan `side_effect_risk` / `replayability` labels (display
   only — no new reasoning run) plus the fixed Principle-4 warning.
+- Replay routes are management-plane APIs and require a user session. SDK API
+  tokens remain data-plane only and must not read source, create Replay Sets,
+  draft patches, or trigger replay execution.
 - Execution goes through `validation_runner._run_command` so network-off /
   env-allowlist / no-sandbox fail-closed are inherited unchanged;
   `PROBE_ENABLED=false` + `PYTHONHASHSEED=0` are injected; worktrees are
@@ -604,11 +609,18 @@ heuristic result.
   (Principle 6); LLM candidate drafts / interpretations are `reasoning_llm`,
   fail-closed, `is_mock` surfaced, with raw deterministic results kept
   separate (drafts store provenance via an `intelligence_runs` row).
+- The standalone harness resolves a symbol using its real package-qualified
+  module name when the snapshot path is inside a Python package, so ordinary
+  relative imports keep working inside the isolated pinned worktree.
 - Recorded-error traces ARE executed against candidates on this offline side
   (`error_to_success` etc.); the live SDK shadow asymmetry is unchanged.
 - Phase D adds only two DETERMINISTIC endpoints (no judgement):
   `GET /replay-sets/{id}/source` and `POST /replay-source-diff` — both read
   the pinned snapshot only (Principle 5), never the working tree.
+- `POST /replay-regression-scaffolds` is the separate `reasoning_llm`
+  boundary: it accepts only a completed/applied variant case, persists both
+  success and failure provenance in `intelligence_runs`, stores review-only
+  generated text separately, and never writes to the target repository.
 - New env vars: `PROBE_REPLAY_WORKSPACE_BASE`, `PROBE_REPLAY_TIMEOUT_SECONDS`
   (server); `PROBE_REPLAY_CAPTURE_MAX_BYTES` (SDK). See the Issue #242
   section of `docs/project-intelligence.md`.

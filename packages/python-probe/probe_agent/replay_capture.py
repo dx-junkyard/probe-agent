@@ -171,13 +171,18 @@ def encode_value(value: Any, flags: Optional[Set[str]] = None, depth: int = 0) -
     if isinstance(value, dict):
         string_keys = all(isinstance(k, str) for k in value.keys())
         if string_keys and MARKER not in value:
-            return {k: encode_value(v, flags, depth + 1) for k, v in value.items()}
+            return {
+                k: encode_value(v, flags, depth + 1)
+                for k, v in sorted(value.items(), key=lambda item: item[0])
+            }
+        items = [
+            [encode_value(k, flags, depth + 1), encode_value(v, flags, depth + 1)]
+            for k, v in value.items()
+        ]
+        items.sort(key=_sort_key)
         return {
             MARKER: "dict",
-            "items": [
-                [encode_value(k, flags, depth + 1), encode_value(v, flags, depth + 1)]
-                for k, v in value.items()
-            ],
+            "items": items,
         }
     flags.add(REASON_UNSUPPORTED_TYPE)
     # Never embed the raw value or its repr — it may contain sensitive data.
@@ -327,7 +332,7 @@ def capture_input(
 
         encoded = encode_value(root, flags, 0)
 
-        payload = json.dumps(encoded, ensure_ascii=False)
+        payload = json.dumps(encoded, sort_keys=True, ensure_ascii=False)
         if len(payload.encode("utf-8")) > ProbeConfig.replay_capture_max_bytes():
             # A truncated JSON capture cannot round-trip; never store one.
             return None, UNREPLAYABLE, [REASON_SIZE_LIMIT]

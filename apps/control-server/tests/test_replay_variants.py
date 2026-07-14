@@ -27,7 +27,9 @@ import time
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
+from app.models import ReplayVariantRunCreate
 from app.replay_variants import (
     CASE_CANDIDATE_ERROR,
     CASE_DIFF,
@@ -46,6 +48,14 @@ from app.replay_variants import (
 # ---------------------------------------------------------------------------
 # Unit: classify_variant_case (the deterministic finite matrix)
 # ---------------------------------------------------------------------------
+
+
+def test_variant_run_accepts_up_to_twenty_candidates():
+    candidate = {"label": "candidate", "patch_text": "diff", "source": "manual"}
+    payload = ReplayVariantRunCreate(replay_set_id=1, variants=[candidate] * 20)
+    assert len(payload.variants) == 20
+    with pytest.raises(ValidationError):
+        ReplayVariantRunCreate(replay_set_id=1, variants=[candidate] * 21)
 
 
 def _planned():
@@ -473,6 +483,12 @@ def test_variant_invalid_patch_isolated_from_others(admin_client, replay_repo):
     assert bad_variant["status"] == "failed"
     assert bad_variant["apply_error"]
     assert bad_variant["cases"] == []
+    denied = admin_client.get(
+        f"/replay-variant-runs/{run['id']}/variants/{bad_variant['id']}"
+        "/experiment-payload",
+        headers=headers,
+    )
+    assert denied.status_code == 422
 
     # The good variant and the baseline are entirely unaffected.
     good_variant = _variant(run, "variant-2")
@@ -582,6 +598,31 @@ def test_variant_run_determinism_and_order_independence(admin_client, replay_rep
     assert by_label(run1) == by_label(run2)
 
 
+def test_twenty_candidate_run_meets_ten_second_target(admin_client, replay_repo):
+    _, _, headers, _ = _prepare(admin_client, replay_repo)
+    _post_trace(admin_client, headers, "t1", "norm", args=("abc",),
+                output="{'kind': 'a', 'size': 3}")
+    replay_set = _create_set(admin_client, headers, ["t1"], "norm")
+    _approve(admin_client, headers, "norm")
+    patch = _make_patch(
+        replay_repo,
+        "svc.py",
+        lambda source: source.replace('"kind": "a"', '"kind": "b"'),
+    )
+    variants = [
+        {"label": f"candidate-{index}", "patch_text": patch, "source": "manual"}
+        for index in range(20)
+    ]
+
+    started = time.perf_counter()
+    response = _run_variants(admin_client, headers, replay_set["id"], variants)
+    elapsed = time.perf_counter() - started
+
+    assert response.status_code == 201, response.text
+    assert len([v for v in response.json()["variants"] if not v["is_baseline"]]) == 20
+    assert elapsed < 10.0, f"20-candidate replay took {elapsed:.2f}s"
+
+
 def _first_field_diffs(variant):
     return tuple(variant["cases"][0]["field_diffs"]) if variant["cases"] else ()
 
@@ -599,6 +640,35 @@ def test_variant_run_requires_approval(admin_client, replay_repo):
     ])
     assert response.status_code == 403
     assert "not approved" in response.json()["detail"]
+
+
+def test_variant_baseline_import_failure_is_audited_not_500(admin_client, replay_repo):
+    source = replay_repo / "svc.py"
+    source.write_text("import module_that_does_not_exist\n" + source.read_text())
+    _git(replay_repo, "add", "svc.py")
+    _git(replay_repo, "commit", "-m", "broken import")
+
+    _, _, headers, _ = _prepare(admin_client, replay_repo)
+    _post_trace(admin_client, headers, "t1", "norm", args=("x",),
+                output="{'kind': 'a', 'size': 1}")
+    replay_set = _create_set(admin_client, headers, ["t1"], "norm")
+    _approve(admin_client, headers, "norm")
+    patch = _make_patch(
+        replay_repo, "svc.py", lambda text: text.replace('"kind": "a"', '"kind": "b"')
+    )
+
+    response = _run_variants(admin_client, headers, replay_set["id"], [
+        {"label": "candidate", "patch_text": patch, "source": "manual"},
+    ])
+    assert response.status_code == 201, response.text
+    run = response.json()
+    assert run["status"] == "failed"
+    assert "ModuleNotFoundError" in (run["error"] or "")
+    assert _variant(run, "baseline")["status"] == "failed"
+    candidate = _variant(run, "variant-1")
+    assert candidate["status"] == "failed"
+    assert "baseline replay failed" in (candidate["error"] or "")
+    assert candidate["cases"] == []
 
 
 def test_variant_experiment_promotion_payload(admin_client, replay_repo):
@@ -670,6 +740,67 @@ def test_llm_draft_success_records_provenance_and_is_mock(admin_client, replay_r
     assert variant["aggregate"]["diff"] == 1
 
 
+def test_llm_draft_trace_must_belong_to_replay_set(admin_client, replay_repo):
+    _, _, headers, _ = _prepare(admin_client, replay_repo)
+    _post_trace(admin_client, headers, "in-set", "cls", args=("a",), output="'class-a'")
+    _post_trace(admin_client, headers, "outside", "cls", args=("b",), output="'class-b'")
+    replay_set = _create_set(admin_client, headers, ["in-set"], "cls")
+
+    response = admin_client.post(
+        "/replay-variant-drafts",
+        json={"replay_set_id": replay_set["id"], "trace_id": "outside",
+              "objective": "change behavior"},
+        headers=headers,
+    )
+    assert response.status_code == 422
+    assert "belong" in response.json()["detail"]
+
+
+def test_regression_scaffold_uses_reasoning_llm_and_persists_provenance(
+    admin_client, replay_repo, db_file
+):
+    _, _, headers, _ = _prepare(admin_client, replay_repo)
+    _post_trace(admin_client, headers, "t1", "norm", args=("x",),
+                output="{'kind': 'a', 'size': 1}")
+    replay_set = _create_set(admin_client, headers, ["t1"], "norm")
+    _approve(admin_client, headers, "norm")
+    patch = _make_patch(
+        replay_repo, "svc.py", lambda text: text.replace('"kind": "a"', '"kind": "b"')
+    )
+    run = _run_variants(admin_client, headers, replay_set["id"], [
+        {"label": "candidate", "patch_text": patch, "source": "manual"},
+    ]).json()
+    variant = _variant(run, "variant-1")
+
+    response = admin_client.post(
+        "/replay-regression-scaffolds",
+        json={"replay_run_id": run["id"], "replay_variant_id": variant["id"],
+              "trace_id": "t1"},
+        headers=headers,
+    )
+    assert response.status_code == 201, response.text
+    scaffold = response.json()
+    assert scaffold["status"] == "proposed"
+    assert scaffold["decision_method"] == "reasoning_llm"
+    assert scaffold["is_mock"] is True
+    assert "def test_" in scaffold["scaffold_text"]
+
+    conn = sqlite3.connect(str(db_file))
+    try:
+        audit = conn.execute(
+            "SELECT run_type, status, decision_method FROM intelligence_runs WHERE id = ?",
+            (scaffold["intelligence_run_id"],),
+        ).fetchone()
+        persisted = conn.execute(
+            "SELECT scaffold_text, status FROM replay_regression_scaffolds WHERE id = ?",
+            (scaffold["id"],),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert audit == ("replay_regression_scaffold", "completed", "reasoning_llm")
+    assert persisted == (scaffold["scaffold_text"], "proposed")
+
+
 def test_llm_draft_failure_fails_closed_and_raw_results_survive(
     admin_client, replay_repo, monkeypatch
 ):
@@ -712,6 +843,43 @@ def test_llm_draft_failure_fails_closed_and_raw_results_survive(
     ).json()
     assert reread["status"] == "completed"
     assert _variant(reread, "variant-1")["aggregate"]["diff"] == 1
+
+
+def test_llm_draft_client_creation_failure_is_persisted(
+    admin_client, replay_repo, monkeypatch, db_file
+):
+    _, _, headers, _ = _prepare(admin_client, replay_repo)
+    _post_trace(admin_client, headers, "t1", "cls", args=("hi",), output="'class-hi'")
+    replay_set = _create_set(admin_client, headers, ["t1"], "cls")
+
+    from app.llm import LLMError
+    from app.routes import replay as replay_routes
+
+    def fail_to_create_client():
+        raise LLMError("missing provider credential")
+
+    monkeypatch.setattr(replay_routes, "get_llm_client", fail_to_create_client)
+    response = admin_client.post(
+        "/replay-variant-drafts",
+        json={"replay_set_id": replay_set["id"], "trace_id": "t1",
+              "objective": "change behavior"},
+        headers=headers,
+    )
+    assert response.status_code == 201, response.text
+    draft = response.json()
+    assert draft["status"] == "failed"
+    assert "missing provider credential" in draft["error"]
+    assert draft["patch_text"] == ""
+
+    conn = sqlite3.connect(str(db_file))
+    try:
+        audit = conn.execute(
+            "SELECT status, error_details FROM intelligence_runs "
+            "WHERE run_type = 'replay_variant_draft' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert audit == ("failed", "missing provider credential")
 
 
 # ---------------------------------------------------------------------------
@@ -772,7 +940,7 @@ def test_fresh_db_has_variant_tables(admin_client, db_file):
     finally:
         conn.close()
     assert {"replay_variants", "replay_variant_case_results",
-            "replay_variant_drafts"} <= names
+            "replay_variant_drafts", "replay_regression_scaffolds"} <= names
 
 
 def test_existing_db_gains_variant_tables_idempotent(tmp_path, monkeypatch):
@@ -817,4 +985,4 @@ def test_existing_db_gains_variant_tables_idempotent(tmp_path, monkeypatch):
     finally:
         conn.close()
     assert {"replay_variants", "replay_variant_case_results",
-            "replay_variant_drafts"} <= names
+            "replay_variant_drafts", "replay_regression_scaffolds"} <= names

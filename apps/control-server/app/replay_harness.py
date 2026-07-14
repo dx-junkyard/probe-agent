@@ -22,12 +22,13 @@ imports probe-agent server code. Contract:
   * Target kinds (finite):
       - ``{"kind": "symbol", "path": "<repo-relative .py>",
          "qualified_name": "func | Class.method"}`` — the module is loaded
-        via ``importlib.util.spec_from_file_location`` with the workspace
-        root (the harness working directory) inserted at ``sys.path[0]`` so
-        intra-repo absolute imports resolve; the qualified name parts are
-        then resolved by getattr chaining. Symbol targets get the real
-        Python environment because isolation comes from the sandboxed
-        subprocess, not a builtins jail.
+        via ``importlib.util.spec_from_file_location``. Package paths are
+        loaded under their real package-qualified module name with the
+        package root on ``sys.path`` so both relative and intra-repo absolute
+        imports resolve; standalone modules use a private module name. The
+        qualified name parts are then resolved by getattr chaining. Symbol
+        targets get the real Python environment because isolation comes from
+        the sandboxed subprocess, not a builtins jail.
       - ``{"kind": "inline_code", "code": "..."}`` — LLM-authored code keeps
         the tighter jail: it is exec'd with the same restricted
         ``SAFE_BUILTINS`` namespace the generation endpoint has always used
@@ -209,6 +210,29 @@ def _structured_output(value):
     return decoded, True
 
 
+def _module_identity(module_path, workspace_root):
+    """Return (import name, package search locations) for a snapshot file."""
+    module_dir = os.path.dirname(module_path)
+    package_parts = []
+    cursor = module_dir
+    while os.path.isfile(os.path.join(cursor, "__init__.py")):
+        package_parts.append(os.path.basename(cursor))
+        cursor = os.path.dirname(cursor)
+    if package_parts:
+        # ``cursor`` is the import root (for src/pkg/mod.py this is ``src``).
+        if cursor not in sys.path:
+            sys.path.insert(0, cursor)
+        parts = list(reversed(package_parts))
+        stem = os.path.splitext(os.path.basename(module_path))[0]
+        if stem != "__init__":
+            parts.append(stem)
+            return ".".join(parts), None
+        return ".".join(parts), [module_dir]
+    if workspace_root not in sys.path:
+        sys.path.insert(0, workspace_root)
+    return "_probe_replay_target", None
+
+
 def _resolve_target(target, workspace_root):
     kind = target.get("kind")
     if kind == "inline_code":
@@ -221,11 +245,12 @@ def _resolve_target(target, workspace_root):
     if kind == "symbol":
         rel_path = target["path"]
         module_path = os.path.join(workspace_root, rel_path)
-        # Workspace root first so intra-repo absolute imports resolve.
-        if workspace_root not in sys.path:
-            sys.path.insert(0, workspace_root)
-        module_name = "_probe_replay_target"
-        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        module_name, package_locations = _module_identity(module_path, workspace_root)
+        spec = importlib.util.spec_from_file_location(
+            module_name,
+            module_path,
+            submodule_search_locations=package_locations,
+        )
         if spec is None or spec.loader is None:
             raise ImportError("cannot load module from %s" % rel_path)
         module = importlib.util.module_from_spec(spec)

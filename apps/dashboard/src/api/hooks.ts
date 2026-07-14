@@ -47,7 +47,7 @@ import type {
   ReplaySetOut, ReplaySourceOut, ReplaySourceDiffOut,
   ReplayVariantRunOut, ReplayVariantDraftOut,
   ReplayApprovalStateOut, ReplayApprovalOut,
-  ReplayVariantExperimentPayloadOut,
+  ReplayVariantExperimentPayloadOut, ReplayRegressionScaffoldOut,
 } from "./types";
 
 export function sysKey(base: string, ...extra: unknown[]) {
@@ -1775,6 +1775,16 @@ export function useCreateReplayVariantDraft() {
       objective: string;
       snapshot_id?: number | null;
     }) => api.post<ReplayVariantDraftOut>("/replay-variant-drafts", data),
+  });
+}
+
+export function useCreateReplayRegressionScaffold() {
+  return useMutation({
+    mutationFn: (data: {
+      replay_run_id: number;
+      replay_variant_id: number;
+      trace_id: string;
+    }) => api.post<ReplayRegressionScaffoldOut>("/replay-regression-scaffolds", data),
   });
 }
 

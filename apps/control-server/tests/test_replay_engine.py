@@ -346,6 +346,34 @@ def test_harness_symbol_target_resolves_intra_repo_imports(
     assert case["duration_ms"] >= 0
 
 
+def test_harness_symbol_target_resolves_package_relative_imports(tmp_path):
+    workspace = tmp_path / "package-target"
+    package = workspace / "myapp"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (package / "helper.py").write_text(
+        "def wrap(value):\n    return 'relative-' + str(value)\n"
+    )
+    (package / "service.py").write_text(
+        "from .helper import wrap\n\ndef classify(value):\n    return wrap(value)\n"
+    )
+    capture, replayability, _ = _capture(args=("a",))
+    assert replayability == "replayable"
+
+    result = _run_harness(
+        tmp_path / "relative-harness",
+        {
+            "kind": "symbol",
+            "path": "myapp/service.py",
+            "qualified_name": "classify",
+        },
+        [{"input_kind": "structured", "capture": capture}],
+        cwd=workspace,
+    )
+    assert result["target_error"] is None
+    assert result["cases"][0]["output"] == "'relative-a'"
+
+
 def test_harness_is_deterministic_across_runs(tmp_path, harness_module_dir):
     capture_ok, _, _ = _capture(args=("a",))
     capture_boom, _, _ = _capture(args=("boom",))

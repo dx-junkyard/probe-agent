@@ -2158,6 +2158,34 @@ CREATE INDEX IF NOT EXISTS idx_replay_variant_drafts_system
     ON replay_variant_drafts (system_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_replay_variant_drafts_set
     ON replay_variant_drafts (system_id, replay_set_id, id DESC);
+
+-- Review-only regression-test scaffolds generated from one completed replay
+-- variant case (Issue #246). The reasoning audit/provenance lives in
+-- intelligence_runs; this table persists the generated content and exact raw
+-- replay context identifiers. Nothing here is ever written to the target repo.
+CREATE TABLE IF NOT EXISTS replay_regression_scaffolds (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    intelligence_run_id INTEGER NOT NULL,
+    replay_run_id       INTEGER NOT NULL,
+    replay_variant_id   INTEGER NOT NULL,
+    replay_set_id       INTEGER NOT NULL,
+    trace_id            TEXT NOT NULL,
+    snapshot_id         INTEGER NOT NULL,
+    scaffold_text       TEXT NOT NULL DEFAULT '',
+    status              TEXT NOT NULL DEFAULT 'proposed',
+    error               TEXT,
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE CASCADE,
+    FOREIGN KEY (replay_run_id) REFERENCES replay_runs (id) ON DELETE CASCADE,
+    FOREIGN KEY (replay_variant_id) REFERENCES replay_variants (id) ON DELETE CASCADE,
+    FOREIGN KEY (replay_set_id) REFERENCES replay_sets (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_replay_regression_scaffolds_system
+    ON replay_regression_scaffolds (system_id, id DESC);
 """
 
 

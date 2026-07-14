@@ -14,9 +14,8 @@ import type { Replayability } from "@/api/types";
 // Reusable trace row actions for the Simulation Workbench (Issue #242 Phase D
 // / #246): a replayability badge (with a reason-code tooltip) plus the three
 // one-click actions that get a trace into the Workbench or Experiments flow.
-// Components' Traces tab is the required home; Trace Lineage / analyzer
-// example rows can reuse this same component wherever a trace_id + its
-// owning component_id are both available.
+// Reused by Components' Traces tab, Trace Lineage, and analyzer example rows
+// wherever a trace_id + its owning component_id are both available.
 
 const REPLAYABILITY_VARIANT: Record<string, "success" | "warning" | "secondary"> = {
   replayable: "success",

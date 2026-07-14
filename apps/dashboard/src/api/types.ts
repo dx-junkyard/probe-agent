@@ -97,6 +97,8 @@ export interface LineageStep {
   timestamp: number;
   output: string | null;
   error: string | null;
+  replayability: Replayability | null;
+  replay_reasons: ReplayReason[];
   entities: LineageEntity[];
   projections: LineageProjection[];
 }
@@ -2725,6 +2727,26 @@ export interface ReplayVariantExperimentPayloadOut {
   source: string;
   risk_note: string;
   origin: Record<string, unknown>;
+}
+
+export interface ReplayRegressionScaffoldOut {
+  id: number;
+  intelligence_run_id: number;
+  replay_run_id: number;
+  replay_variant_id: number;
+  replay_set_id: number;
+  trace_id: string;
+  snapshot_id: number;
+  scaffold_text: string;
+  status: "proposed" | "failed";
+  error: string | null;
+  provider: string;
+  model: string;
+  prompt_version: string;
+  schema_version: string;
+  decision_method: "reasoning_llm";
+  is_mock: boolean;
+  created_at: number;
 }
 
 // Two small deterministic backend helpers for the Workbench's Direct-edit

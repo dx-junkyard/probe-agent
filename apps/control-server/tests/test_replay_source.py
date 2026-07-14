@@ -123,6 +123,26 @@ def _prepare(client, repo, name="source-system"):
     return token, system, headers, snapshot.json()
 
 
+def test_replay_management_routes_reject_sdk_api_tokens(admin_client, replay_repo):
+    token, system, headers, _ = _prepare(admin_client, replay_repo)
+    issued = admin_client.post(
+        "/tokens/me",
+        json={"name": "sdk-only", "system_id": system["id"]},
+        headers=headers,
+    )
+    assert issued.status_code == 201, issued.text
+    sdk_headers = {
+        "Authorization": f"Bearer {issued.json()['token']}",
+        "X-Probe-System-Id": str(system["id"]),
+    }
+
+    response = admin_client.get("/replay-sets", headers=sdk_headers)
+    assert response.status_code == 403
+    assert response.json()["detail"] == (
+        "SDK API tokens cannot access management APIs; use a login session"
+    )
+
+
 def _post_trace(client, headers, trace_id, component_id, *, args=(), output=None):
     import time
 

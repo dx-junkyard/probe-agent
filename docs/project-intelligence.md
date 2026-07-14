@@ -1932,9 +1932,9 @@ error だった trace も候補に対して実行するため「候補は失敗�
 
 観測点（トレース）から一クリックで検証に入り、「トレース選択 → ソース編集
 （diff 自動生成）→ Run → diff マトリクス確認 → Experiment へ昇格」を
-Dashboard 上で完結させる。Phase D は表示と構成のみ（Principle 6/8）――判定・
-実行・比較はすべて Phase A〜C の既存 API を呼ぶだけで、新しい判定/実行ロジック
-は追加しない。
+Dashboard 上で完結させる。Replay の判定・実行・比較はすべて Phase A〜C の既存
+API を呼ぶだけで、新しい判定/実行ロジックは追加しない。例外は review-only の
+regression-test scaffold 下書きで、独立した `reasoning_llm` 境界として扱う。
 
 - **トレース行アクション（Components の Traces タブ、
   `components/replay-row-actions.tsx`）**: 各トレース行に
@@ -1945,14 +1945,14 @@ Dashboard 上で完結させる。Phase D は表示と構成のみ（Principle 6
   「Create Experiment from this trace」（Experiments へ `?from_trace=&
   from_component=` でコンテキストのみ prefill――patch は渡さない）を表示する。
   Replay Set は既存 `POST /replay-sets` の外に "trace を追加する" API がない
-  ため（Phase D は新規テーブル/エンドポイントを持たない）、既存セットへの
+  ため（Replay Set 自体を更新する mutation endpoint はない）、既存セットへの
   追加は「その Set の `trace_ids` を読み取り、新規 trace id を足して同じ
   `component_id` で `POST /replay-sets` を再実行する」という構成のみの操作
   として実現している（Replay Set は不変の軽量スナップショットである前提と
   整合）。`AddToWorkspaceButton itemType="trace"` もここで配線する
-  （型は #35 で追加済みだが UI 未配線だった）。Components が必須の設置場所、
-  Trace Lineage / analyzer example rows への同一コンポーネント再利用は本フェーズ
-  では見送り（フォローアップ）。
+  （型は #35 で追加済みだが UI 未配線だった）。同じアクションを Components、
+  Trace Lineage、analyzer example trace rows に配置し、観測点から Workbench への
+  導線を画面によって欠落させない。
 - **Simulation Workbench（`pages/simulation-workbench.tsx`、
   `/simulation-workbench`、サイドバー "Detail views" に `Beaker` アイコン）**:
   3ペイン構成。左は Replay Set のトレース一覧（`GET /replay-sets/{id}` が返す
@@ -1989,16 +1989,16 @@ Dashboard 上で完結させる。Phase D は表示と構成のみ（Principle 6
   `?replay_run_id=&replay_variant_id=` で、Experiments 側がその id から
   改めて payload を取得して prefill する（自動で Experiment を作成・採用は
   しない）。
-  (b) regression-test scaffold — Phase D はここでは新しい reasoning_llm
-  エンドポイントを追加しない（本フェーズが許可する新規バックエンドは
-  source/diff の2エンドポイントのみのため）。代わりに、解決済みシンボルの
-  path/qualified_name と録画済みトレースからクライアント側で決定的に
-  pytest の雛形を生成し、「reasoning-model の出力ではない、たたき台」と
-  明記して表示する（最小サーフェス優先の選択）。
+  (b) regression-test scaffold — 選択した trace の捕捉入力、記録結果、解決済み
+  symbol と採用候補 patch を `reasoning_llm` に渡し、pytest 雛形を下書きする。
+  LLM 由来であること、provider/model/prompt/schema/intelligence run の provenance、
+  `is_mock` を明示し、設定・呼び出し・応答検証の失敗は fail-closed の失敗結果として
+  `intelligence_runs` と `replay_regression_scaffolds` に監査行を残す。生成物を対象
+  リポジトリへ自動書き込みしない。
   (c) live-shadow 誘導 — `from probe_agent import set_candidate; set_candidate(...)`
   のスニペットと、Components タブでの mode 切り替え手順を静的テキストで示す
   （バックエンド呼び出しなし、SDK 挙動は無変更）。
-- **新規 DETERMINISTIC バックエンド追加（この2つのみ、Principle 6）**:
+- **新規 DETERMINISTIC バックエンド追加（Principle 6）**:
   `GET /replay-sets/{id}/source`（`?snapshot_id=` 省略時は最新 ready
   snapshot。`_resolve_snapshot` + `_resolve_component_symbol` を再利用して
   シンボルを解決し、`read_file_at_commit` で pinned commit のファイル内容を
@@ -2012,15 +2012,18 @@ Dashboard 上で完結させる。Phase D は表示と構成のみ（Principle 6
   （`app/models.py`）+ 対応する react-query hooks
   (`useReplaySetSource`/`useReplaySourceDiff`) を追加。テストは
   `tests/test_replay_source.py`（pinned ファイル内容+span の取得、
-  適用可能な diff の生成、非 Python 入力の 422、System 分離）。
+  適用可能な diff の生成、非 Python 入力の 422、System 分離）。これらを含む replay
+  管理 API は user session 必須であり、SDK API token からは呼び出せない。
 - **warm-start（任意、見送り）**: worktree/sandbox セッションの使い回しは
   本フェーズでは実装しない。Run のたびに独立した worktree を作る Phase B/C
   の規約をそのまま使うほうが、隔離・後始末の保証を壊さず正しさを優先できる
-  ため。将来、10秒目標を安定して満たせない場合のフォローアップとする。
+  ため。API は最大20候補を受け付け、20候補・1 trace の統合テストで10秒目標を
+  ガードする。対象リポジトリや sandbox 環境によって安定して満たせない場合は
+  warm-start をフォローアップとする。
 - **非目標（Phase D）**: 新しい判定・実行・比較ロジック（Phase A〜C の呼び出し
   のみ）、対象リポジトリの追跡ブランチへの書き込みを伴う UI（エスカレーションは
   既存の human gate 経由のみ — Experiment decision / #216 publish）、本格的な
-  IDE/LSP エディタ、live-shadow の SDK/UI 変更、新規 DB テーブル。
+  IDE/LSP エディタ、live-shadow の SDK/UI 変更。
 
 ## リポジトリ設定案
 

@@ -103,6 +103,16 @@ def test_set_encoding_is_deterministic_across_insertion_orders():
     assert enc_a == enc_b
 
 
+def test_dict_encoding_is_canonical_across_insertion_orders():
+    plain_a = {"z": 1, "a": {"y": 2, "b": 3}}
+    plain_b = {"a": {"b": 3, "y": 2}, "z": 1}
+    assert encode_value(plain_a, set()) == encode_value(plain_b, set())
+
+    keyed_a = {2: "two", 1: "one"}
+    keyed_b = {1: "one", 2: "two"}
+    assert encode_value(keyed_a, set()) == encode_value(keyed_b, set())
+
+
 def test_unsupported_type_marker_never_embeds_value_or_repr():
     class Secretive:
         def __repr__(self):

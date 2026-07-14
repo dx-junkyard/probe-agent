@@ -322,6 +322,16 @@ class MockLLMClient(LLMClient):
         max_tokens: Optional[int] = None,
     ) -> str:
         joined = "\n".join(m.get("content", "") for m in messages)
+        if "REGRESSION_SCAFFOLD_RESPONSE_JSON" in joined:
+            return json.dumps(
+                {
+                    "scaffold": (
+                        "def test_replay_regression():\n"
+                        "    # Mock reasoning output; review captured inputs.\n"
+                        "    assert True\n"
+                    )
+                }
+            )
         if "EVALUATION_RESPONSE_JSON" in joined:
             return json.dumps(
                 {

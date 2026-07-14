@@ -28,7 +28,8 @@ def _assemble(conn, system_id: int, ordered: List[Tuple[str, float]]) -> List[Li
     for trace_id, _ts in ordered:
         trow = conn.execute(
             """
-            SELECT trace_id, component_id, mode, output_text, error, duration_ms, timestamp
+            SELECT trace_id, component_id, mode, output_text, error, duration_ms,
+                   timestamp, replayability, replay_reasons_json
             FROM traces WHERE system_id = ? AND trace_id = ?
             """,
             (system_id, trace_id),
@@ -78,6 +79,12 @@ def _assemble(conn, system_id: int, ordered: List[Tuple[str, float]]) -> List[Li
                 error=p["extract_error"],
             ))
         if trow is not None:
+            try:
+                replay_reasons = json.loads(trow["replay_reasons_json"] or "[]")
+                if not isinstance(replay_reasons, list):
+                    replay_reasons = []
+            except (json.JSONDecodeError, TypeError):
+                replay_reasons = []
             step = LineageStepOut(
                 trace_id=trow["trace_id"],
                 component_id=trow["component_id"],
@@ -86,6 +93,8 @@ def _assemble(conn, system_id: int, ordered: List[Tuple[str, float]]) -> List[Li
                 timestamp=trow["timestamp"],
                 output=trow["output_text"],
                 error=trow["error"],
+                replayability=trow["replayability"] or None,
+                replay_reasons=replay_reasons,
                 span_id=srow["span_id"] if srow else None,
                 parent_span_id=srow["parent_span_id"] if srow else None,
                 flow_id=srow["flow_id"] if srow else None,

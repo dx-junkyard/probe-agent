@@ -5063,6 +5063,7 @@ describe("Trace Lineage Explorer page", () => {
           trace_id: "trace-aaaa1111", component_id: "validate", mode: "trace",
           span_id: "s1", parent_span_id: null, flow_id: "f1", correlation_id: "c1",
           duration_ms: 2, timestamp: 100, output: "'ok'", error: null,
+          replayability: "replayable", replay_reasons: [],
           entities: [{ type: "order", id: "o-1", role: "source" }],
           projections: [{
             projection_name: "orders", phase: "output",
@@ -5074,6 +5075,7 @@ describe("Trace Lineage Explorer page", () => {
           trace_id: "trace-bbbb2222", component_id: "charge", mode: "trace",
           span_id: "s2", parent_span_id: "s1", flow_id: "f1", correlation_id: "c1",
           duration_ms: 3, timestamp: 200, output: "'ok'", error: null,
+          replayability: "partial", replay_reasons: ["redacted"],
           entities: [{ type: "order", id: "o-1", role: "related" }],
           projections: [{
             projection_name: "orders", phase: "output",
@@ -5105,6 +5107,8 @@ describe("Trace Lineage Explorer page", () => {
     // Projected field values are shown.
     expect(screen.getByText(/pending/)).toBeInTheDocument();
     expect(screen.getByText(/charged/)).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: /Replay$/ }).length).toBe(2);
+    expect(screen.getByText("partial")).toBeInTheDocument();
   });
 
   test("changed projected field between steps is highlighted", async () => {
@@ -5331,6 +5335,7 @@ describe("Trace Analyzers page", () => {
     expect(within(table).getByText(/1\/2 entities differ/)).toBeInTheDocument();
     expect(within(table).getByText("status")).toBeInTheDocument();
     expect(within(table).getByText("changed")).toBeInTheDocument();
+    expect(within(table).getByRole("button", { name: /Replay$/ })).toBeInTheDocument();
   });
 });
 
@@ -6390,7 +6395,7 @@ describe("Simulation Workbench (Issue #246)", () => {
 
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith("/replay-variant-drafts", expect.objectContaining({
-        replay_set_id: 1, trace_id: "t1", objective: "Uppercase the result",
+        replay_set_id: 1, trace_id: "t1", objective: "Uppercase the result", snapshot_id: 5,
       }));
     });
     expect(await screen.findByText("mock LLM")).toBeInTheDocument();
@@ -6420,12 +6425,14 @@ describe("Simulation Workbench (Issue #246)", () => {
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith("/replay-source-diff", expect.objectContaining({
         replay_set_id: 1,
+        snapshot_id: 5,
         edited_source: 'def normalize(payload):\n    return {"kind": "b"}\n',
       }));
     });
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith("/replay-variant-runs", expect.objectContaining({
         replay_set_id: 1,
+        snapshot_id: 5,
         variants: [{ label: "Direct edit", patch_text: "diff --git a/svc.py b/svc.py\n...", source: "manual" }],
       }));
     });
@@ -6462,5 +6469,35 @@ describe("Simulation Workbench (Issue #246)", () => {
     });
     const patchTextarea = screen.getAllByPlaceholderText("Patch text (unified diff format)")[0];
     expect((patchTextarea as HTMLTextAreaElement).value).toContain("diff --git a/svc.py");
+  });
+
+  test("regression scaffold uses reasoning_llm and surfaces provenance", async () => {
+    setupWorkbenchMocks();
+    await renderWorkbenchAt("/simulation-workbench?replay_set_id=1");
+    mockApi.post.mockResolvedValue({
+      id: 7, intelligence_run_id: 8, replay_run_id: 1, replay_variant_id: 11,
+      replay_set_id: 1, trace_id: "t1", snapshot_id: 5,
+      scaffold_text: "def test_normalize_regression():\n    assert True\n",
+      status: "proposed", error: null, provider: "mock", model: "mock",
+      prompt_version: "replay-regression-scaffold-v1",
+      schema_version: "replay-regression-scaffold-v1",
+      decision_method: "reasoning_llm", is_mock: true, created_at: 1,
+    });
+
+    const generate = await screen.findByRole("button", {
+      name: "Generate regression-test scaffold",
+    });
+    await waitFor(() => expect(generate).toBeEnabled());
+    fireEvent.click(generate);
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/replay-regression-scaffolds", {
+        replay_run_id: 1,
+        replay_variant_id: 11,
+        trace_id: "t1",
+      });
+    });
+    expect(await screen.findByText("mock LLM")).toBeInTheDocument();
+    expect(screen.getByText("run #8 · replay-regression-scaffold-v1")).toBeInTheDocument();
   });
 });

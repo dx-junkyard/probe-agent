@@ -22,7 +22,7 @@ from ..auth import Principal, get_system_id, require_user
 from ..db import get_conn
 from ..experiment_runner import patch_hash
 from ..git_ops import GitError, read_file_at_commit
-from ..llm import LLMConfig, get_llm_client
+from ..llm import LLMConfig, LLMError, MockLLMClient, create_llm_client, get_llm_client
 from ..models import (
     ReplayApprovalCreate,
     ReplayApprovalOut,
@@ -32,6 +32,8 @@ from ..models import (
     ReplayRiskPointOut,
     ReplayRunCreate,
     ReplayRunOut,
+    ReplayRegressionScaffoldCreate,
+    ReplayRegressionScaffoldOut,
     ReplaySetCreate,
     ReplaySetOut,
     ReplaySetTraceOut,
@@ -49,10 +51,12 @@ from ..models import (
     ReplayVariantRunOut,
 )
 from ..replay_draft import (
+    DRAFT_FAILED,
     DRAFT_PROPOSED,
     PROMPT_VERSION as DRAFT_PROMPT_VERSION,
     SCHEMA_VERSION as DRAFT_SCHEMA_VERSION,
     DraftError,
+    DraftResult,
     _diff_against_snapshot as diff_source_against_snapshot,
     generate_variant_draft,
 )
@@ -77,7 +81,10 @@ from ..replay_variants import (
 )
 from ..trace_analyzer import max_examples
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_user)])
+
+REGRESSION_SCAFFOLD_PROMPT_VERSION = "replay-regression-scaffold-v1"
+REGRESSION_SCAFFOLD_SCHEMA_VERSION = "replay-regression-scaffold-v1"
 
 # Cap on traces per Replay Set (enforced at the API; Phase B runs replays
 # synchronously, so sets stay small and bounded).
@@ -1171,9 +1178,13 @@ def create_replay_variant_run(
                 baseline_by_position[plan.position] = next(executed)
 
     with get_conn() as conn:
-        _persist_replay_case_results(
-            conn, system_id, run_id, plans, baseline_execution, completed_at
-        )
+        # A failed harness has no one-to-one case result stream. Persisting it
+        # through _persist_replay_case_results would exhaust the iterator and
+        # turn the intended audited failure response into an unhandled 500.
+        if baseline_execution.status == "completed":
+            _persist_replay_case_results(
+                conn, system_id, run_id, plans, baseline_execution, completed_at
+            )
         run_status = "completed" if baseline_execution.status == "completed" else "failed"
         conn.execute(
             """
@@ -1433,6 +1444,17 @@ def get_replay_variant_experiment_payload(
                 status_code=422,
                 detail="This variant has no patch to promote (baseline has none)",
             )
+        if (
+            variant_row["status"] != "completed"
+            or variant_row["apply_status"] != APPLY_APPLIED
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Only a successfully applied and completed replay variant "
+                    "can be promoted to an Experiment"
+                ),
+            )
         return ReplayVariantExperimentPayloadOut(
             label=variant_row["label"] or variant_row["variant_key"],
             patch_text=variant_row["patch_text"],
@@ -1453,6 +1475,231 @@ def get_replay_variant_experiment_payload(
                 "apply_status": variant_row["apply_status"],
             },
         )
+
+
+@router.post(
+    "/replay-regression-scaffolds",
+    response_model=ReplayRegressionScaffoldOut,
+    status_code=201,
+)
+def create_replay_regression_scaffold(
+    payload: ReplayRegressionScaffoldCreate,
+    system_id: int = Depends(get_system_id),
+) -> ReplayRegressionScaffoldOut:
+    """Draft a review-only pytest regression scaffold through reasoning_llm.
+
+    The prompt is grounded in one completed/applied candidate case, its
+    recorded trace, resolved symbol, pinned snapshot, and candidate patch.
+    Success and failure are both persisted; generated text is never written
+    to the target repository.
+    """
+    started_at = time.time()
+    with get_conn() as conn:
+        run = _get_variant_run_or_404(conn, payload.replay_run_id, system_id)
+        variant = conn.execute(
+            """
+            SELECT * FROM replay_variants
+            WHERE id = ? AND replay_run_id = ? AND system_id = ?
+            """,
+            (payload.replay_variant_id, payload.replay_run_id, system_id),
+        ).fetchone()
+        if variant is None:
+            raise HTTPException(status_code=404, detail="Replay variant not found")
+        if (
+            variant["is_baseline"]
+            or variant["status"] != "completed"
+            or variant["apply_status"] != APPLY_APPLIED
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Regression scaffolds require a successfully applied and "
+                    "completed candidate variant"
+                ),
+            )
+        case = conn.execute(
+            """
+            SELECT * FROM replay_variant_case_results
+            WHERE replay_variant_id = ? AND replay_run_id = ?
+              AND system_id = ? AND trace_id = ?
+            """,
+            (
+                variant["id"],
+                run["id"],
+                system_id,
+                payload.trace_id,
+            ),
+        ).fetchone()
+        if case is None:
+            raise HTTPException(
+                status_code=422,
+                detail="trace_id is not a completed case for this variant",
+            )
+        trace = conn.execute(
+            """
+            SELECT trace_id, input_json, input_capture_json, output_text, error
+            FROM traces
+            WHERE system_id = ? AND component_id = ? AND trace_id = ?
+            """,
+            (system_id, run["component_id"], payload.trace_id),
+        ).fetchone()
+        if trace is None:
+            raise HTTPException(status_code=404, detail="trace not found")
+
+        context = {
+            "snapshot": {
+                "id": run["snapshot_id"],
+                "commit_sha": run["commit_sha"],
+            },
+            "symbol": {
+                "path": run["symbol_path"],
+                "qualified_name": run["symbol_qualified_name"],
+            },
+            "recorded_trace": {
+                "trace_id": trace["trace_id"],
+                "input_capture_json": trace["input_capture_json"],
+                "legacy_input_json": trace["input_json"],
+                "output": trace["output_text"],
+                "error": trace["error"],
+            },
+            "candidate_case": {
+                "case_status": case["case_status"],
+                "candidate_output": case["candidate_output"],
+                "candidate_error": case["candidate_error"],
+                "field_diffs_json": case["field_diffs_json"],
+            },
+            "candidate_patch": variant["patch_text"],
+        }
+
+    config = LLMConfig.intelligence_from_env()
+    provider = config.provider
+    model = config.model
+    is_mock = False
+    scaffold_text = ""
+    error: Optional[str] = None
+    try:
+        if config.provider not in {"mock", "openai", "anthropic", "gemini"}:
+            raise LLMError(f"Unsupported LLM provider: {config.provider}")
+        client = create_llm_client(config)
+        is_mock = isinstance(client, MockLLMClient)
+        if is_mock:
+            provider, model = "mock", "mock"
+        raw = client.generate_text(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You draft review-only Python pytest regression tests. "
+                        "Use only the supplied pinned replay context. Return "
+                        "REGRESSION_SCAFFOLD_RESPONSE_JSON as strict JSON with "
+                        "exactly one string field named scaffold. Do not claim "
+                        "the test was executed and do not use network access."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(context, ensure_ascii=False, sort_keys=True),
+                },
+            ],
+            temperature=0.1,
+            max_tokens=1800,
+        )
+        from .generation import _extract_json_object
+
+        parsed = _extract_json_object(raw)
+        if set(parsed) != {"scaffold"}:
+            raise LLMError(
+                "reasoning response must contain exactly the scaffold field"
+            )
+        scaffold = parsed.get("scaffold")
+        if not isinstance(scaffold, str) or not scaffold.strip():
+            raise LLMError("reasoning response must contain a non-empty scaffold string")
+        if len(scaffold) > 100_000:
+            raise LLMError("reasoning response scaffold exceeds 100000 characters")
+        try:
+            tree = ast.parse(scaffold)
+        except SyntaxError as exc:
+            raise LLMError(f"generated scaffold is not valid Python: {exc}") from exc
+        if not any(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith("test_")
+            for node in ast.walk(tree)
+        ):
+            raise LLMError("generated scaffold must define at least one test_ function")
+        scaffold_text = scaffold
+    except (LLMError, HTTPException, ValueError) as exc:
+        error = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+
+    completed_at = time.time()
+    status = "proposed" if error is None else "failed"
+    run_status = "completed" if error is None else "failed"
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO intelligence_runs
+                (system_id, snapshot_id, run_type, provider, model,
+                 prompt_version, schema_version, decision_method, status,
+                 error_details, is_mock, started_at, completed_at)
+            VALUES (?, ?, 'replay_regression_scaffold', ?, ?, ?, ?,
+                    'reasoning_llm', ?, ?, ?, ?, ?)
+            """,
+            (
+                system_id,
+                run["snapshot_id"],
+                provider,
+                model,
+                REGRESSION_SCAFFOLD_PROMPT_VERSION,
+                REGRESSION_SCAFFOLD_SCHEMA_VERSION,
+                run_status,
+                error,
+                1 if is_mock else 0,
+                started_at,
+                completed_at,
+            ),
+        )
+        intelligence_run_id = cur.lastrowid
+        cur = conn.execute(
+            """
+            INSERT INTO replay_regression_scaffolds
+                (system_id, intelligence_run_id, replay_run_id,
+                 replay_variant_id, replay_set_id, trace_id, snapshot_id,
+                 scaffold_text, status, error, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                system_id,
+                intelligence_run_id,
+                run["id"],
+                variant["id"],
+                run["replay_set_id"],
+                payload.trace_id,
+                run["snapshot_id"],
+                scaffold_text,
+                status,
+                error,
+                completed_at,
+            ),
+        )
+        scaffold_id = cur.lastrowid
+
+    return ReplayRegressionScaffoldOut(
+        id=scaffold_id,
+        intelligence_run_id=intelligence_run_id,
+        replay_run_id=run["id"],
+        replay_variant_id=variant["id"],
+        replay_set_id=run["replay_set_id"],
+        trace_id=payload.trace_id,
+        snapshot_id=run["snapshot_id"],
+        scaffold_text=scaffold_text,
+        status=status,
+        error=error,
+        provider=provider,
+        model=model,
+        prompt_version=REGRESSION_SCAFFOLD_PROMPT_VERSION,
+        schema_version=REGRESSION_SCAFFOLD_SCHEMA_VERSION,
+        is_mock=is_mock,
+        created_at=completed_at,
+    )
 
 
 # --- LLM candidate drafts (Issue #245) ---------------------------------------
@@ -1505,6 +1752,12 @@ def create_replay_variant_draft(
     with get_conn() as conn:
         replay_set = _get_set_or_404(conn, payload.replay_set_id, system_id)
         component_id = replay_set["component_id"]
+        trace_ids = json.loads(replay_set["trace_ids_json"] or "[]")
+        if payload.trace_id not in trace_ids:
+            raise HTTPException(
+                status_code=422,
+                detail="trace_id must belong to the referenced Replay Set",
+            )
         snapshot = _resolve_snapshot(conn, system_id, payload.snapshot_id)
         symbol = _resolve_component_symbol(
             conn, system_id, snapshot["id"], component_id
@@ -1549,20 +1802,35 @@ def create_replay_variant_draft(
         snapshot_id = snapshot["id"]
 
     config = LLMConfig.from_env()
-    client = get_llm_client()
-    draft = generate_variant_draft(
-        client,
-        config,
-        repo_path=repo_path,
-        commit_sha=commit_sha,
-        symbol_path=symbol["path"],
-        symbol_qualified_name=symbol["qualified_name"],
-        start_line=symbol["start_line"],
-        end_line=symbol["end_line"],
-        trace_context=trace_context,
-        objective=payload.objective,
-        worktree_base=os.path.join(replay_workspace_base(), "drafts"),
-    )
+    try:
+        if config.provider not in {"mock", "openai", "anthropic", "gemini"}:
+            raise LLMError(f"Unsupported LLM provider: {config.provider}")
+        client = get_llm_client()
+    except LLMError as exc:
+        # Client construction (for example, a missing API key) is part of the
+        # reasoning attempt and must leave the same failed audit trail as a
+        # provider-call or response-validation failure.
+        draft = DraftResult(
+            provider=config.provider,
+            model=config.model,
+            is_mock=config.provider == "mock",
+            status=DRAFT_FAILED,
+            error=str(exc),
+        )
+    else:
+        draft = generate_variant_draft(
+            client,
+            config,
+            repo_path=repo_path,
+            commit_sha=commit_sha,
+            symbol_path=symbol["path"],
+            symbol_qualified_name=symbol["qualified_name"],
+            start_line=symbol["start_line"],
+            end_line=symbol["end_line"],
+            trace_context=trace_context,
+            objective=payload.objective,
+            worktree_base=os.path.join(replay_workspace_base(), "drafts"),
+        )
     completed_at = time.time()
     run_status = "completed" if draft.status == DRAFT_PROPOSED else "failed"
 
