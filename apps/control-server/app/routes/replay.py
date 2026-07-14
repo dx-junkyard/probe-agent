@@ -10,6 +10,7 @@ reasoning model anywhere.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import time
@@ -20,6 +21,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from ..auth import Principal, get_system_id, require_user
 from ..db import get_conn
 from ..experiment_runner import patch_hash
+from ..git_ops import GitError, read_file_at_commit
 from ..llm import LLMConfig, get_llm_client
 from ..models import (
     ReplayApprovalCreate,
@@ -33,6 +35,9 @@ from ..models import (
     ReplaySetCreate,
     ReplaySetOut,
     ReplaySetTraceOut,
+    ReplaySourceDiffCreate,
+    ReplaySourceDiffOut,
+    ReplaySourceOut,
     ReplayVariantAggregateOut,
     ReplayVariantCaseResultOut,
     ReplayVariantCreate,
@@ -47,6 +52,8 @@ from ..replay_draft import (
     DRAFT_PROPOSED,
     PROMPT_VERSION as DRAFT_PROMPT_VERSION,
     SCHEMA_VERSION as DRAFT_SCHEMA_VERSION,
+    DraftError,
+    _diff_against_snapshot as diff_source_against_snapshot,
     generate_variant_draft,
 )
 from ..replay_runner import (
@@ -1678,3 +1685,114 @@ def get_replay_variant_draft(
 ) -> ReplayVariantDraftOut:
     with get_conn() as conn:
         return _draft_out(*_get_draft_with_run(conn, draft_id, system_id))
+
+
+# =============================================================================
+# Source & diff helpers (Issue #242 Phase D / #246)
+#
+# Two small DETERMINISTIC additions backing the Simulation Workbench's
+# "Direct edit" flow: read the pinned-snapshot source for the Replay Set's
+# resolved symbol, and turn a developer-edited copy of it into a unified
+# diff. No judgement here (Principle 6) -- both reuse the exact
+# snapshot/symbol resolution POST /replay-runs already uses and the same
+# worktree + ``git diff`` mechanism ``replay_draft`` uses for LLM drafts.
+# =============================================================================
+
+
+@router.get("/replay-sets/{replay_set_id}/source", response_model=ReplaySourceOut)
+def get_replay_set_source(
+    replay_set_id: int,
+    snapshot_id: Optional[int] = None,
+    system_id: int = Depends(get_system_id),
+) -> ReplaySourceOut:
+    with get_conn() as conn:
+        replay_set = _get_set_or_404(conn, replay_set_id, system_id)
+        component_id = replay_set["component_id"]
+        snapshot = _resolve_snapshot(conn, system_id, snapshot_id)
+        symbol = _resolve_component_symbol(
+            conn, system_id, snapshot["id"], component_id
+        )
+        repo_path = snapshot["repo_path"]
+        commit_sha = snapshot["commit_sha"]
+        resolved_snapshot_id = snapshot["id"]
+        path = symbol["path"]
+        qualified_name = symbol["qualified_name"]
+        start_line = symbol["start_line"]
+        end_line = symbol["end_line"]
+
+    try:
+        raw = read_file_at_commit(repo_path, commit_sha, path)
+    except GitError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Could not read {path} at {commit_sha}: {exc}",
+        )
+    try:
+        source = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(
+            status_code=409, detail=f"{path} is not valid UTF-8: {exc}"
+        )
+
+    return ReplaySourceOut(
+        replay_set_id=replay_set["id"],
+        component_id=component_id,
+        snapshot_id=resolved_snapshot_id,
+        commit_sha=commit_sha,
+        path=path,
+        qualified_name=qualified_name,
+        start_line=start_line,
+        end_line=end_line,
+        source=source,
+    )
+
+
+@router.post("/replay-source-diff", response_model=ReplaySourceDiffOut)
+def create_replay_source_diff(
+    payload: ReplaySourceDiffCreate,
+    system_id: int = Depends(get_system_id),
+) -> ReplaySourceDiffOut:
+    """Deterministically diff a developer-edited copy of the resolved
+    symbol's file against the pinned snapshot (Workbench "Direct edit" ->
+    Run). Rejects non-Python ``edited_source`` with a 422, mirroring
+    ``replay_draft``'s own ``ast.parse`` structural validity check --
+    never a hand-written diff."""
+    try:
+        ast.parse(payload.edited_source)
+    except SyntaxError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"edited_source is not valid Python: {exc}",
+        )
+
+    with get_conn() as conn:
+        replay_set = _get_set_or_404(conn, payload.replay_set_id, system_id)
+        component_id = replay_set["component_id"]
+        snapshot = _resolve_snapshot(conn, system_id, payload.snapshot_id)
+        symbol = _resolve_component_symbol(
+            conn, system_id, snapshot["id"], component_id
+        )
+        repo_path = snapshot["repo_path"]
+        commit_sha = snapshot["commit_sha"]
+        symbol_path = symbol["path"]
+
+    try:
+        patch_text = diff_source_against_snapshot(
+            repo_path,
+            commit_sha,
+            symbol_path,
+            payload.edited_source,
+            os.path.join(replay_workspace_base(), "source-diffs"),
+        )
+    except (DraftError, GitError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    if not patch_text.strip():
+        raise HTTPException(
+            status_code=422,
+            detail="edited_source produced no changes against the pinned snapshot",
+        )
+
+    return ReplaySourceDiffOut(
+        patch_text=patch_text, patch_hash=patch_hash(patch_text)
+    )

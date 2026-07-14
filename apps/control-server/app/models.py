@@ -4090,3 +4090,46 @@ class ReplayVariantExperimentPayloadOut(BaseModel):
     source: str = "replay_variant"
     risk_note: str = ""
     origin: Dict[str, Any] = Field(default_factory=dict)
+
+
+# --- Replay source & diff helpers (Issue #242 Phase D / #246) ----------------
+#
+# Two small DETERMINISTIC helpers backing the Simulation Workbench's "Direct
+# edit" flow (Principle 6 -- no judgement here, just pinned-snapshot reads and
+# structural text diffing reusing the same worktree+git-diff mechanism
+# app/replay_draft.py already uses for LLM drafts).
+
+
+class ReplaySourceOut(BaseModel):
+    """Read-only pinned-snapshot source for the resolved Replay Set symbol's
+    file. ``source`` is the full file content at the pinned commit -- never
+    the working tree (Principle 5); start_line/end_line locate the resolved
+    symbol within it so the UI can scroll to / highlight it."""
+
+    replay_set_id: int
+    component_id: str
+    snapshot_id: int
+    commit_sha: str
+    path: str
+    qualified_name: str
+    start_line: int
+    end_line: int
+    source: str
+
+
+class ReplaySourceDiffCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    replay_set_id: int
+    snapshot_id: Optional[int] = None
+    edited_source: str = Field(..., min_length=1, max_length=2_000_000)
+
+
+class ReplaySourceDiffOut(BaseModel):
+    """Deterministic unified diff between the pinned-snapshot file and a
+    developer-edited copy of it. No judgement -- pure structural text
+    diffing (the same worktree + ``git diff`` mechanism
+    ``replay_draft._diff_against_snapshot`` uses for LLM drafts)."""
+
+    patch_text: str
+    patch_hash: str

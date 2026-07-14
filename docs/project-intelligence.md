@@ -1928,6 +1928,100 @@ error だった trace も候補に対して実行するため「候補は失敗�
   採用・rollout・replace、live shadow SDK 変更、Workbench UI（Phase D）、分散
   実行。
 
+### Phase D 実装状態（#246: Simulation Workbench UI）
+
+観測点（トレース）から一クリックで検証に入り、「トレース選択 → ソース編集
+（diff 自動生成）→ Run → diff マトリクス確認 → Experiment へ昇格」を
+Dashboard 上で完結させる。Phase D は表示と構成のみ（Principle 6/8）――判定・
+実行・比較はすべて Phase A〜C の既存 API を呼ぶだけで、新しい判定/実行ロジック
+は追加しない。
+
+- **トレース行アクション（Components の Traces タブ、
+  `components/replay-row-actions.tsx`）**: 各トレース行に
+  `replayability`/`replay_reasons`（Phase A 由来、`GET /components/{id}/traces`
+  が既に返す）から決定的に導く replayability バッジ（reason コードは
+  tooltip）、「▶ Replay」（新規または既存 Replay Set にこのトレースを追加して
+  Workbench へ遷移）、「+ Add to Replay Set」（同上だが遷移しない）、
+  「Create Experiment from this trace」（Experiments へ `?from_trace=&
+  from_component=` でコンテキストのみ prefill――patch は渡さない）を表示する。
+  Replay Set は既存 `POST /replay-sets` の外に "trace を追加する" API がない
+  ため（Phase D は新規テーブル/エンドポイントを持たない）、既存セットへの
+  追加は「その Set の `trace_ids` を読み取り、新規 trace id を足して同じ
+  `component_id` で `POST /replay-sets` を再実行する」という構成のみの操作
+  として実現している（Replay Set は不変の軽量スナップショットである前提と
+  整合）。`AddToWorkspaceButton itemType="trace"` もここで配線する
+  （型は #35 で追加済みだが UI 未配線だった）。Components が必須の設置場所、
+  Trace Lineage / analyzer example rows への同一コンポーネント再利用は本フェーズ
+  では見送り（フォローアップ）。
+- **Simulation Workbench（`pages/simulation-workbench.tsx`、
+  `/simulation-workbench`、サイドバー "Detail views" に `Beaker` アイコン）**:
+  3ペイン構成。左は Replay Set のトレース一覧（`GET /replay-sets/{id}` が返す
+  per-trace の `replayability`/`replay_reasons`/`input_source`/`skip_reason`
+  をそのままバッジ表示 — runner と同一規則、Phase B からの再利用）で、
+  展開すると `input_capture`（`JsonTree`）と録画済み output/error を
+  `GET /components/{id}/traces` との突き合わせで表示する（新規 API なし、
+  既存レスポンスの構成のみ）。中央は解決済みシンボルの pinned snapshot ソース
+  （新設 `GET /replay-sets/{id}/source`）を Textarea で表示・編集するタブ:
+  「Direct edit」（編集 → Run で新設 `POST /replay-source-diff` が決定的に
+  unified diff を生成 — 手書き diff ではない）、「Paste patch」（貼り付けた
+  diff をそのまま variant として実行）、「LLM draft」（`POST
+  /replay-variant-drafts` を呼び、provenance + is_mock バッジ付きで返却された
+  patch を確認してから Run できる）。右/下は結果マトリクス:
+  `POST /replay-variant-runs` + `GET /replay-variant-runs/{id}` を消費し、
+  行=trace、列=recorded/baseline replay/各 candidate。`case_status`
+  （match/diff/candidate_error/error_to_success 等）を色分けバッジで区別し、
+  `field_diffs`・`duration_delta_ms`・variant ごとの集計
+  （`aggregate.match`/`diff`/`candidate_error`/`error_to_success`/…/
+  `avg_duration_delta_ms`）を表示する。結果の直上には「これはシミュレーション
+  であり本番相当ではない（環境・外部状態の差異があり得る）」という常設の
+  注意書きを置く。
+- **状態ガイダンス**: 対象コンポーネントの replay 承認が無い場合、実行不可の
+  理由と次の操作（承認レビュー）を明示し、`GET /components/{id}/replay-approval`
+  のリスクコンテキスト（probe plan point の `side_effect_risk`/`replayability`
+  転記 + 固定 Principle-4 警告文）を承認確認ダイアログに表示してから
+  `POST /components/{id}/replay-approval` を呼ぶ（Revoke も配線）。
+  `unreplayable`/skip 対象のトレースには有限 `skip_reason` ごとの次の操作
+  （別トレースを選ぶ／replay_capture を opt-in する等）をインラインで示す。
+- **エスカレーション（人間ゲートは既存のまま、Phase D は導線のみ）**:
+  (a) variant を Experiment へ昇格 — `GET .../variants/{variant_id}/
+  experiment-payload` を呼び、その patch を Experiments の作成フローへ
+  引き渡す。導線は既存の `?draft=` prefill パターンを踏襲した
+  `?replay_run_id=&replay_variant_id=` で、Experiments 側がその id から
+  改めて payload を取得して prefill する（自動で Experiment を作成・採用は
+  しない）。
+  (b) regression-test scaffold — Phase D はここでは新しい reasoning_llm
+  エンドポイントを追加しない（本フェーズが許可する新規バックエンドは
+  source/diff の2エンドポイントのみのため）。代わりに、解決済みシンボルの
+  path/qualified_name と録画済みトレースからクライアント側で決定的に
+  pytest の雛形を生成し、「reasoning-model の出力ではない、たたき台」と
+  明記して表示する（最小サーフェス優先の選択）。
+  (c) live-shadow 誘導 — `from probe_agent import set_candidate; set_candidate(...)`
+  のスニペットと、Components タブでの mode 切り替え手順を静的テキストで示す
+  （バックエンド呼び出しなし、SDK 挙動は無変更）。
+- **新規 DETERMINISTIC バックエンド追加（この2つのみ、Principle 6）**:
+  `GET /replay-sets/{id}/source`（`?snapshot_id=` 省略時は最新 ready
+  snapshot。`_resolve_snapshot` + `_resolve_component_symbol` を再利用して
+  シンボルを解決し、`read_file_at_commit` で pinned commit のファイル内容を
+  読む — working tree は一切読まない、Principle 5）と `POST
+  /replay-source-diff`（`{replay_set_id, snapshot_id?, edited_source}` →
+  同じシンボル解決 → 一時 worktree に `edited_source` を書いて `git diff`
+  — `replay_draft._diff_against_snapshot` をそのまま再利用。`edited_source`
+  が Python として parse できない場合は 422、既存スナップショットと差分が
+  無い場合も 422）。どちらも承認ゲート不要（コードを実行しない）。
+  `ReplaySourceOut`/`ReplaySourceDiffCreate`/`ReplaySourceDiffOut`
+  （`app/models.py`）+ 対応する react-query hooks
+  (`useReplaySetSource`/`useReplaySourceDiff`) を追加。テストは
+  `tests/test_replay_source.py`（pinned ファイル内容+span の取得、
+  適用可能な diff の生成、非 Python 入力の 422、System 分離）。
+- **warm-start（任意、見送り）**: worktree/sandbox セッションの使い回しは
+  本フェーズでは実装しない。Run のたびに独立した worktree を作る Phase B/C
+  の規約をそのまま使うほうが、隔離・後始末の保証を壊さず正しさを優先できる
+  ため。将来、10秒目標を安定して満たせない場合のフォローアップとする。
+- **非目標（Phase D）**: 新しい判定・実行・比較ロジック（Phase A〜C の呼び出し
+  のみ）、対象リポジトリの追跡ブランチへの書き込みを伴う UI（エスカレーションは
+  既存の human gate 経由のみ — Experiment decision / #216 publish）、本格的な
+  IDE/LSP エディタ、live-shadow の SDK/UI 変更、新規 DB テーブル。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。
