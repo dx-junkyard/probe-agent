@@ -299,6 +299,16 @@ def _build_pipeline(conn, system_id: int, snapshot_row) -> List[PipelineStep]:
     ]
 
 
+def compute_pipeline_steps(conn, system_id: int, snapshot_row) -> List[PipelineStep]:
+    """Canonical deterministic 8-step Pipeline Checklist for one snapshot.
+
+    Single source shared by the Pipeline Checklist API and system_state's
+    preparation-phase completion gate (Issue #237), so the banner/phase and
+    the checklist can never disagree about completion.
+    """
+    return _build_pipeline(conn, system_id, snapshot_row)
+
+
 def _load_purpose(conn, system_id: int, snapshot_id: int) -> Optional[Dict[str, Any]]:
     """Load system purpose from hierarchy or drafts."""
     node = conn.execute(

@@ -3095,6 +3095,7 @@ class SystemUnderstandingPipelineStepOut(BaseModel):
     step: str
     status: PipelineStepStatus
     detail: Optional[str] = None
+    label: str = ""
 
 
 class SystemUnderstandingGapSummaryOut(BaseModel):
@@ -3581,6 +3582,7 @@ class SystemStateItemOut(BaseModel):
 class SystemStatePhaseCompletionOut(BaseModel):
     phase: UserPhase
     complete: bool
+    label: str = ""
 
 
 class SystemStateAssessmentOut(BaseModel):

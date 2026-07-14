@@ -492,24 +492,14 @@ export default function SystemUnderstandingPage() {
   const buildRunning = latestBuild?.status === "queued" || latestBuild?.status === "running";
   const buildHighlight = useDiagnosticHighlight<HTMLButtonElement>("build");
   const pageItem = systemState?.page_items["/system-understanding"]?.[0] ?? systemState?.primary_item;
-  // Issue #239: unlike the deprecated `primary_action`'s rule 2 (which
-  // unconditionally blanked the CTA whenever a build was queued/running,
-  // regardless of cause), `primary_item` only excludes the pipeline step(s)
-  // the active build is actually processing (its `.running` items). Every
-  // *other* outstanding item -- e.g. a proposed probe plan awaiting review,
-  // an unrelated diagnostic -- stays selectable, so BuildJobPanel's step
-  // progress (rendered below while buildRunning) and this banner could show
-  // side by side. That reads as excessive for anything below error/blocked
-  // severity: the developer is already watching build progress, so warning/
-  // info-level guidance can wait until the build settles. Error/blocked
-  // items always stay visible regardless of an in-flight build (a safety
-  // concern such as a broken repository path or database write failure
-  // matters independent of what the running build happens to be doing).
-  // This is a deterministic condition over existing fields (buildRunning,
-  // severity) -- no heuristic text matching.
-  const bannerSuppressedDuringBuild = buildRunning
-    && !!pageItem && pageItem.severity !== "error" && pageItem.severity !== "blocked";
-  const bannerItem = bannerSuppressedDuringBuild ? null : pageItem;
+  // Issue #239: the banner shows the exact same canonical projection as
+  // every other surface on this page -- `page_items[route][0]` (falling
+  // back to `primary_item`). An item only disappears here when the
+  // underlying fact is resolved or the server itself suppresses it by
+  // phase; there is no client-side suppression keyed on `buildRunning` or
+  // any other local condition, so the banner and the Pipeline Checklist
+  // below never disagree about which item is outstanding.
+  const bannerItem = pageItem;
   // Issue #211: with everything complete, Build / Refresh is a maintenance
   // action, not the page's protagonist — demote it visually and show a
   // standalone success summary instead (previously part of the now-removed

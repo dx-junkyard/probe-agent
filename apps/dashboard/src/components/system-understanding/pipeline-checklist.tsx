@@ -38,7 +38,7 @@ const STEP_LINKS: Record<string, string> = {
 /**
  * Issue #200 introduced a fixed step -> CTA mapping for the "next single
  * action" hint on the first incomplete pipeline step. Issue #239 replaced it
- * as the primary source: the CTA now comes from the `SystemStateItem` whose
+ * as the sole source: the CTA comes solely from the `SystemStateItem` whose
  * `related_pipeline_steps` names this step (`stateItemForStep` below), reusing
  * the same `target_ui` / `systemStateTarget()` every other notification
  * surface (badge, banner, notice) already consumes — so the same root cause
@@ -46,25 +46,15 @@ const STEP_LINKS: Record<string, string> = {
  * elsewhere (CLAUDE.md Principle 6: the StateItem's fields are themselves a
  * finite, server-computed set; nothing is inferred here).
  *
- * This fixed map is kept only as the last-resort fallback for a step that
- * has no matching StateItem (as of #239, only `repository_configured` in the
- * "repository not configured for this System" case: its native item,
- * `repository.configuration.missing`, does not carry `related_pipeline_steps`,
- * and the diagnostic checks that do are suppressed as already-covered
- * duplicates — see docs/system-understanding-navigation.md).
+ * There is no hardcoded fallback map. `repository_configured` — the one step
+ * that used to fall through to a hardcoded CTA when the repository was
+ * unconfigured — is covered because `repository.configuration.missing` now
+ * carries `related_pipeline_steps: ["repository_configured"]`, so it matches
+ * `stateItemForStep` like every other step. If a step's first-incomplete
+ * StateItem is ever missing, no CTA button renders for that step (the status
+ * badge and any "Why?" diagnostics still do) rather than showing stale or
+ * inconsistent hardcoded text.
  */
-type StepCta = { kind: "repository" | "build"; label: string };
-
-const STEP_CTA: Record<string, StepCta> = {
-  repository_configured: { kind: "repository", label: "Configure repository" },
-  snapshot_ready: { kind: "repository", label: "Create snapshot" },
-  symbols_indexed: { kind: "build", label: "Run Build / Refresh" },
-  documentation_indexed: { kind: "build", label: "Run Build / Refresh" },
-  documentation_claims_scanned: { kind: "build", label: "Run Build / Refresh" },
-  entrypoints_discovered: { kind: "build", label: "Run Build / Refresh" },
-  docs_code_reconciled: { kind: "build", label: "Run Build / Refresh" },
-  capability_hierarchy_ready: { kind: "build", label: "Run Build / Refresh" },
-};
 
 /**
  * The first (highest-priority; `pageItems` arrives pre-sorted by the server)
@@ -104,8 +94,8 @@ export function PipelineChecklist({ steps, checksByStep, pageItems, onRunBuild, 
   checksByStep: Record<string, SystemDiagnosticCheck[]>;
   /** Issue #239: `GET /system-state`'s `page_items["/system-understanding"]`,
    * already phase-scoped and deduped by the server. Used to drive the CTA on
-   * the first incomplete step (`stateItemForStep`); falls back to `STEP_CTA`
-   * only when no item matches this step. */
+   * the first incomplete step (`stateItemForStep`); if no item matches this
+   * step, no CTA renders (Issue #239 — no hardcoded fallback). */
   pageItems?: SystemStateItem[];
   /** Issue #200: runs the Build / Refresh job, wired to the first incomplete
    * step's CTA when that step's fix is "run a build" rather than "go
@@ -127,7 +117,9 @@ export function PipelineChecklist({ steps, checksByStep, pageItems, onRunBuild, 
     <ul className="space-y-2" data-testid="pipeline-checklist">
       {steps.map((s) => {
         const link = STEP_LINKS[s.step];
-        const label = STEP_LABELS[s.step] ?? s.step;
+        // Issue #240: the server-provided `label` is canonical; `STEP_LABELS`
+        // is only a client-side fallback for older servers that don't send it.
+        const label = s.label || STEP_LABELS[s.step] || s.step;
         const relatedChecks = s.status === "complete" ? [] : (checksByStep[s.step] ?? []);
         const expanded = expandedStep === s.step;
         const isFirstIncomplete = s.step === firstIncompleteStep;
@@ -141,7 +133,6 @@ export function PipelineChecklist({ steps, checksByStep, pageItems, onRunBuild, 
         // still highlights the right control via the diagnostic-focus
         // query params).
         const stateItem = isFirstIncomplete ? stateItemForStep(pageItems ?? [], s.step) : undefined;
-        const fallbackCta = isFirstIncomplete && !stateItem ? STEP_CTA[s.step] : undefined;
         return (
           <li key={s.step} className="text-sm">
             <div className="flex items-center gap-3">
@@ -178,26 +169,6 @@ export function PipelineChecklist({ steps, checksByStep, pageItems, onRunBuild, 
                 >
                   {stateItem.target_ui?.action_label || "対応する"}
                 </Link>
-              )}
-              {fallbackCta && fallbackCta.kind === "repository" && (
-                <Link
-                  to="/repository"
-                  data-testid={`pipeline-cta-${s.step}`}
-                  className={cn(buttonVariants({ size: "sm" }), "h-7 text-xs")}
-                >
-                  {fallbackCta.label}
-                </Link>
-              )}
-              {fallbackCta && fallbackCta.kind === "build" && (
-                <Button
-                  size="sm"
-                  className="h-7 text-xs"
-                  data-testid={`pipeline-cta-${s.step}`}
-                  onClick={onRunBuild}
-                  disabled={buildDisabled}
-                >
-                  {fallbackCta.label}
-                </Button>
               )}
               {relatedChecks.length > 0 && (
                 <Button

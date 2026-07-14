@@ -432,6 +432,26 @@ class TestPipelineStepStatuses:
         for step in data["pipeline"]:
             assert step["status"] in valid_statuses, f"Invalid status for {step['step']}: {step['status']}"
 
+    def test_pipeline_steps_carry_japanese_catalog_label(self, admin_client, tmp_path):
+        """Finding #4: the server-side Japanese catalog
+        (state_messages.PIPELINE_STEP_LABELS / pipeline_step_label) must be
+        serialized onto each pipeline step so the Dashboard renders it
+        verbatim instead of generating its own English text."""
+        from app import state_messages
+
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "pipeline-label-sys")
+        hdrs = _headers(token, sys["id"])
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200
+        data = r.json()
+
+        assert data["pipeline"], "expected at least one pipeline step"
+        for step in data["pipeline"]:
+            assert step["label"], f"missing label for step={step['step']}"
+            assert step["label"] == state_messages.pipeline_step_label(step["step"])
+
 
 class TestGapWorklist:
     def test_gaps_include_structured_fields(self, admin_client, tmp_path):

@@ -789,6 +789,7 @@ def _build_out(job: dict) -> SystemUnderstandingBuildOut:
 
 
 def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
+    from .. import state_messages
     from ..models import (
         SystemUnderstandingOut,
         SystemUnderstandingPipelineStepOut,
@@ -808,7 +809,10 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
         SystemUnderstandingGapTrendOut,
     )
     pipeline = [
-        SystemUnderstandingPipelineStepOut(step=s.step, status=s.status, detail=s.detail)
+        SystemUnderstandingPipelineStepOut(
+            step=s.step, status=s.status, detail=s.detail,
+            label=state_messages.pipeline_step_label(s.step),
+        )
         for s in summary.pipeline
     ]
     purpose = None
