@@ -1,7 +1,7 @@
 /// <reference types="vitest/globals" />
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, MemoryRouter } from "react-router-dom";
+import { BrowserRouter, MemoryRouter, Routes, Route } from "react-router-dom";
 import { vi } from "vitest";
 import type { ReactNode } from "react";
 import type { SystemStateItem } from "@/api/types";
@@ -5063,6 +5063,7 @@ describe("Trace Lineage Explorer page", () => {
           trace_id: "trace-aaaa1111", component_id: "validate", mode: "trace",
           span_id: "s1", parent_span_id: null, flow_id: "f1", correlation_id: "c1",
           duration_ms: 2, timestamp: 100, output: "'ok'", error: null,
+          replayability: "replayable", replay_reasons: [],
           entities: [{ type: "order", id: "o-1", role: "source" }],
           projections: [{
             projection_name: "orders", phase: "output",
@@ -5074,6 +5075,7 @@ describe("Trace Lineage Explorer page", () => {
           trace_id: "trace-bbbb2222", component_id: "charge", mode: "trace",
           span_id: "s2", parent_span_id: "s1", flow_id: "f1", correlation_id: "c1",
           duration_ms: 3, timestamp: 200, output: "'ok'", error: null,
+          replayability: "partial", replay_reasons: ["redacted"],
           entities: [{ type: "order", id: "o-1", role: "related" }],
           projections: [{
             projection_name: "orders", phase: "output",
@@ -5105,6 +5107,8 @@ describe("Trace Lineage Explorer page", () => {
     // Projected field values are shown.
     expect(screen.getByText(/pending/)).toBeInTheDocument();
     expect(screen.getByText(/charged/)).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: /Replay$/ }).length).toBe(2);
+    expect(screen.getByText("partial")).toBeInTheDocument();
   });
 
   test("changed projected field between steps is highlighted", async () => {
@@ -5331,6 +5335,7 @@ describe("Trace Analyzers page", () => {
     expect(within(table).getByText(/1\/2 entities differ/)).toBeInTheDocument();
     expect(within(table).getByText("status")).toBeInTheDocument();
     expect(within(table).getByText("changed")).toBeInTheDocument();
+    expect(within(table).getByRole("button", { name: /Replay$/ })).toBeInTheDocument();
   });
 });
 
@@ -6010,5 +6015,489 @@ describe("GitHub page", () => {
     );
     expect(screen.queryByTestId("publish-job-approve-button")).not.toBeInTheDocument();
     expect(screen.queryByTestId("publish-job-cancel-button")).not.toBeInTheDocument();
+  });
+});
+
+// ── Replay / Simulation Workbench (Issue #242 Phase D / #246) ──────────────
+
+function replayComponentsFixture() {
+  return [{ component_id: "norm", mode: "trace", trace_count: 2, last_seen: 1000 }];
+}
+
+function replayTracesFixture() {
+  return [
+    {
+      trace_id: "trace-replayable-0001",
+      component_id: "norm",
+      mode: "trace",
+      input: { args: ["hi"], kwargs: {} },
+      output: "{'kind': 'a'}",
+      error: null,
+      duration_ms: 3,
+      timestamp: 1000,
+      input_capture: { args: ["hi"], kwargs: {} },
+      replayability: "replayable",
+      replay_reasons: [],
+    },
+    {
+      trace_id: "trace-unreplayable-0002",
+      component_id: "norm",
+      mode: "trace",
+      input: { args: ["big"], kwargs: {} },
+      output: null,
+      error: "ValueError: boom",
+      duration_ms: 4,
+      timestamp: 1001,
+      input_capture: null,
+      replayability: "unreplayable",
+      replay_reasons: ["size_limit_exceeded"],
+    },
+  ];
+}
+
+function setupComponentsPageForReplay(extra: Record<string, unknown> = {}) {
+  mockApi.get.mockImplementation((path: string) => {
+    if (path === "/components") return Promise.resolve(replayComponentsFixture());
+    if (path === "/components/norm/traces?limit=20") return Promise.resolve(replayTracesFixture());
+    if (path === "/components/norm/profile") return Promise.resolve(null);
+    if (path === "/components/norm/shadow-results?limit=20") return Promise.resolve([]);
+    if (path === "/components/norm/criteria") return Promise.resolve([]);
+    if (path === "/replay-sets?component_id=norm") return Promise.resolve([]);
+    if (path === "/experiments") return Promise.resolve([]);
+    if (path === "/repository/snapshots") return Promise.resolve([]);
+    if (path === "/repository/drafts/latest") return Promise.resolve({ feature_drafts: [] });
+    if (path in extra) return Promise.resolve(extra[path]);
+    return Promise.resolve(null);
+  });
+}
+
+describe("Components trace row: Replay actions (Issue #246)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  async function renderExpanded() {
+    setupComponentsPageForReplay();
+    const { default: ComponentsPage } = await import("@/pages/components");
+    const { default: SimulationWorkbenchPage } = await import("@/pages/simulation-workbench");
+    const { default: ExperimentsPage } = await import("@/pages/experiments");
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/components?component=norm"]}>
+          <Routes>
+            <Route path="/components" element={<ComponentsPage />} />
+            <Route path="/simulation-workbench" element={<SimulationWorkbenchPage />} />
+            <Route path="/experiments" element={<ExperimentsPage />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    const expandButton = await screen.findByRole("button", {
+      name: "Show signal details for trace trace-replayable-0001",
+    });
+    fireEvent.click(expandButton);
+    return within(expandButton.closest("tr")!.nextElementSibling as HTMLElement);
+  }
+
+  test("renders the replayability badge with a reason tooltip, row actions, and the trace workspace pin", async () => {
+    setupComponentsPageForReplay();
+    const { default: ComponentsPage } = await import("@/pages/components");
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/components?component=norm"]}>
+          <ComponentsPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // Base row badges (before expanding) show replayable / unreplayable.
+    expect(await screen.findByText("replayable")).toBeInTheDocument();
+    const unreplayableBadge = screen.getByText("unreplayable");
+    expect(unreplayableBadge).toHaveAttribute("title", "Reasons: size_limit_exceeded");
+
+    const expandButton = await screen.findByRole("button", {
+      name: "Show signal details for trace trace-replayable-0001",
+    });
+    fireEvent.click(expandButton);
+    const row = within(expandButton.closest("tr")!.nextElementSibling as HTMLElement);
+
+    expect(row.getByText("Replay")).toBeInTheDocument();
+    expect(row.getByText("Add to Replay Set")).toBeInTheDocument();
+    expect(row.getByText("Create Experiment")).toBeInTheDocument();
+    expect(row.getByText("Add to Workspace")).toBeInTheDocument();
+  });
+
+  test("Replay adds the trace to a new Replay Set and navigates to the Workbench", async () => {
+    const row = await renderExpanded();
+    mockApi.post.mockResolvedValue({
+      id: 77, system_id: 1, component_id: "norm", name: "Replay set: norm",
+      source: "manual", source_analyzer_run_id: null,
+      trace_ids: ["trace-replayable-0001"], traces: [], created_at: 1,
+    });
+
+    fireEvent.click(row.getByText("Replay"));
+    const replayButtons = await screen.findAllByText("Replay", { selector: "button" });
+    fireEvent.click(replayButtons[replayButtons.length - 1]);
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/replay-sets", expect.objectContaining({
+        component_id: "norm",
+        trace_ids: ["trace-replayable-0001"],
+      }));
+    });
+    await waitFor(() => {
+      expect(screen.getByText("Simulation Workbench")).toBeInTheDocument();
+    });
+  });
+
+  test("Add to Replay Set posts without navigating away from Components", async () => {
+    const row = await renderExpanded();
+    mockApi.post.mockResolvedValue({
+      id: 78, system_id: 1, component_id: "norm", name: "Replay set: norm",
+      source: "manual", source_analyzer_run_id: null,
+      trace_ids: ["trace-replayable-0001"], traces: [], created_at: 1,
+    });
+
+    fireEvent.click(row.getByText("Add to Replay Set"));
+    fireEvent.click(await screen.findByText("Add", { selector: "button" }));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/replay-sets", expect.objectContaining({
+        component_id: "norm",
+        trace_ids: ["trace-replayable-0001"],
+      }));
+    });
+    expect(screen.queryByText("Simulation Workbench")).not.toBeInTheDocument();
+  });
+
+  test("Create Experiment from this trace routes to Experiments with prefilled context", async () => {
+    const row = await renderExpanded();
+    fireEvent.click(row.getByText("Create Experiment"));
+
+    await waitFor(() => {
+      expect(screen.getByText(/Prefilled context from trace/)).toBeInTheDocument();
+    });
+    expect(
+      screen.getByPlaceholderText("What are you trying to learn?"),
+    ).toHaveValue("Investigate trace trace-replayable-0001 (component norm)");
+  });
+});
+
+// --- Simulation Workbench page ----------------------------------------------
+
+function replaySetFixture(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 1, system_id: 1, component_id: "norm", name: "My Replay Set",
+    source: "manual", source_analyzer_run_id: null,
+    trace_ids: ["t1", "t2"],
+    traces: [
+      { trace_id: "t1", exists: true, replayability: "replayable", replay_reasons: [], input_source: "structured", skip_reason: null },
+      { trace_id: "t2", exists: true, replayability: "unreplayable", replay_reasons: ["redacted"], input_source: null, skip_reason: "unreplayable_capture" },
+    ],
+    created_at: 1,
+    ...overrides,
+  };
+}
+
+function replayApprovalFixture(active: boolean, overrides: Record<string, unknown> = {}) {
+  return {
+    component_id: "norm",
+    active,
+    approval: active
+      ? { id: 1, system_id: 1, component_id: "norm", status: "approved", reason: "ok", approved_by_user_id: 1, decision_method: "manual", risk_context: null, created_at: 1, revoked_at: null, revoked_by_user_id: null }
+      : null,
+    risk_context: {
+      probe_plan_points: [],
+      warning: "Replay re-executes recorded inputs against the component's real implementation...",
+    },
+    ...overrides,
+  };
+}
+
+function replaySourceFixture(overrides: Record<string, unknown> = {}) {
+  return {
+    replay_set_id: 1, component_id: "norm", snapshot_id: 5, commit_sha: "abcdef1234567890",
+    path: "svc.py", qualified_name: "normalize", start_line: 5, end_line: 6,
+    source: 'def normalize(payload):\n    return {"kind": "a"}\n',
+    ...overrides,
+  };
+}
+
+function variantRunFixture(overrides: Record<string, unknown> = {}) {
+  const cases = [
+    { id: 1, trace_id: "t1", position: 0, case_status: "match", comparison_mode: "structured", baseline_output: "A", candidate_output: "A", candidate_error: null, recorded_error: null, duration_ms: 1, duration_delta_ms: 0.1, field_diffs: [], output_truncated: false, created_at: 1 },
+    { id: 2, trace_id: "t2", position: 1, case_status: "diff", comparison_mode: "structured", baseline_output: "A", candidate_output: "B", candidate_error: null, recorded_error: null, duration_ms: 1, duration_delta_ms: 0.2, field_diffs: ["kind"], output_truncated: false, created_at: 1 },
+    { id: 3, trace_id: "t3", position: 2, case_status: "candidate_error", comparison_mode: null, baseline_output: "A", candidate_output: null, candidate_error: "RuntimeError: boom", recorded_error: null, duration_ms: 1, duration_delta_ms: null, field_diffs: [], output_truncated: false, created_at: 1 },
+    { id: 4, trace_id: "t4", position: 3, case_status: "error_to_success", comparison_mode: "structured", baseline_output: null, candidate_output: "fixed", candidate_error: null, recorded_error: "ValueError: boom", duration_ms: 1, duration_delta_ms: -0.5, field_diffs: [], output_truncated: false, created_at: 1 },
+  ];
+  const baseline = {
+    id: 10, replay_run_id: 1, variant_key: "baseline", label: "Baseline", is_baseline: true,
+    patch_text: "", patch_hash: "h0", source: "manual", apply_status: "not_applicable",
+    apply_error: null, status: "completed", error: null, workspace_path: null,
+    cleanup_state: "removed", cleanup_error: null,
+    aggregate: { match: 0, diff: 0, candidate_error: 0, error_to_success: 0, error_to_same_error: 0, error_to_different_error: 0, skipped: 0, total: 0, avg_duration_delta_ms: null, examples: {} },
+    cases: [], created_at: 1, started_at: 1, completed_at: 1,
+  };
+  const candidate = {
+    id: 11, replay_run_id: 1, variant_key: "variant-1", label: "My candidate", is_baseline: false,
+    patch_text: "diff --git a/svc.py b/svc.py\n@@ -1,2 +1,2 @@\n-a\n+b\n", patch_hash: "h1",
+    source: "manual", apply_status: "applied", apply_error: null, status: "completed", error: null,
+    workspace_path: null, cleanup_state: "removed", cleanup_error: null,
+    aggregate: { match: 1, diff: 1, candidate_error: 1, error_to_success: 1, error_to_same_error: 0, error_to_different_error: 0, skipped: 0, total: 4, avg_duration_delta_ms: -0.05, examples: {} },
+    cases, created_at: 1, started_at: 1, completed_at: 1,
+  };
+  return {
+    id: 1, system_id: 1, replay_set_id: 1, component_id: "norm", snapshot_id: 5,
+    commit_sha: "abcdef1234567890", symbol_path: "svc.py", symbol_qualified_name: "normalize",
+    status: "completed", error: null, trace_set_hash: "hash", sandbox_config: {}, approval_id: 1,
+    variants: [baseline, candidate], created_at: 1, started_at: 1, completed_at: 1,
+    ...overrides,
+  };
+}
+
+function setupWorkbenchMocks(opts: {
+  approved?: boolean;
+  run?: Record<string, unknown> | null;
+  extraGet?: Record<string, unknown>;
+} = {}) {
+  const approved = opts.approved ?? true;
+  const run = opts.run === undefined ? variantRunFixture() : opts.run;
+  mockApi.get.mockImplementation((path: string) => {
+    if (path === "/replay-sets") return Promise.resolve([replaySetFixture()]);
+    if (path === "/replay-sets/1") return Promise.resolve(replaySetFixture());
+    if (path === "/components/norm/replay-approval") return Promise.resolve(replayApprovalFixture(approved));
+    if (path === "/components/norm/traces?limit=500") return Promise.resolve([]);
+    if (path === "/replay-sets/1/source") return Promise.resolve(replaySourceFixture());
+    if (path === "/replay-variant-runs?replay_set_id=1") return Promise.resolve(run ? [run] : []);
+    if (path === "/replay-variant-runs/1") return Promise.resolve(run);
+    if (path === "/replay-variant-runs/1/variants/11/experiment-payload") {
+      const candidate = (run as Record<string, unknown> | null)?.variants
+        ? ((run as { variants: Record<string, unknown>[] }).variants.find(v => v.id === 11))
+        : undefined;
+      return Promise.resolve({
+        label: (candidate?.label as string) ?? "My candidate",
+        patch_text: (candidate?.patch_text as string) ?? "",
+        patch_hash: (candidate?.patch_hash as string) ?? "",
+        source: "replay_variant",
+        risk_note: "Promoted from replay-variant-run 1, variant variant-1 (component 'norm', snapshot 5).",
+        origin: { replay_variant_run_id: 1, replay_variant_id: 11 },
+      });
+    }
+    if (path === "/experiments") return Promise.resolve([]);
+    if (path === "/repository/snapshots") return Promise.resolve([]);
+    if (path === "/repository/drafts/latest") return Promise.resolve({ feature_drafts: [] });
+    if (opts.extraGet && path in opts.extraGet) return Promise.resolve(opts.extraGet[path]);
+    return Promise.resolve(null);
+  });
+}
+
+async function renderWorkbenchAt(route: string) {
+  const { default: SimulationWorkbenchPage } = await import("@/pages/simulation-workbench");
+  const qc = new QueryClient({
+    defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+  });
+  render(
+    <QueryClientProvider client={qc}>
+      <MemoryRouter initialEntries={[route]}>
+        <SimulationWorkbenchPage />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
+describe("Simulation Workbench (Issue #246)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("renders the three panes, the diff matrix distinctions, and the simulation disclaimer", async () => {
+    setupWorkbenchMocks();
+    await renderWorkbenchAt("/simulation-workbench?replay_set_id=1");
+
+    await waitFor(() => {
+      expect(screen.getByTestId("workbench-left-pane")).toBeInTheDocument();
+      expect(screen.getByTestId("workbench-center-pane")).toBeInTheDocument();
+      expect(screen.getByTestId("workbench-result-matrix")).toBeInTheDocument();
+    });
+
+    // Simulation disclaimer is always shown alongside the results.
+    expect(screen.getByText(/Simulation only/)).toBeInTheDocument();
+
+    // The diff matrix distinguishes match / diff / candidate error / rescued.
+    await waitFor(() => {
+      expect(screen.getByText("match")).toBeInTheDocument();
+    });
+    expect(screen.getByText("diff")).toBeInTheDocument();
+    expect(screen.getByText("candidate error")).toBeInTheDocument();
+    expect(screen.getByText("rescued")).toBeInTheDocument();
+
+    // The unreplayable trace's next-step guidance is shown in the left pane.
+    expect(screen.getByText(/Next step: pick a different trace, or adjust replay_capture/)).toBeInTheDocument();
+  });
+
+  test("unapproved component shows the not-approved next step and Approve posts", async () => {
+    setupWorkbenchMocks({ approved: false, run: null });
+    await renderWorkbenchAt("/simulation-workbench?replay_set_id=1");
+
+    await waitFor(() => {
+      expect(screen.getByText(/Replay is not approved for "norm"/)).toBeInTheDocument();
+    });
+    expect(screen.getByText(/Next step: review the risk context and approve/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("Review & Approve"));
+    fireEvent.change(
+      await screen.findByPlaceholderText("Why is replay safe to approve for this component?"),
+      { target: { value: "It only normalizes text." } },
+    );
+    mockApi.post.mockResolvedValue({
+      id: 1, system_id: 1, component_id: "norm", status: "approved", reason: "It only normalizes text.",
+      approved_by_user_id: 1, decision_method: "manual", risk_context: null, created_at: 1,
+      revoked_at: null, revoked_by_user_id: null,
+    });
+    fireEvent.click(screen.getByText("Approve", { selector: "button" }));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/components/norm/replay-approval",
+        { reason: "It only normalizes text." },
+      );
+    });
+  });
+
+  test("LLM draft tab shows the provenance / is_mock badge", async () => {
+    setupWorkbenchMocks({ run: null });
+    await renderWorkbenchAt("/simulation-workbench?replay_set_id=1");
+
+    fireEvent.click(await screen.findByText("LLM draft"));
+    fireEvent.change(screen.getByRole("combobox", { name: "Trace for the LLM draft" }), { target: { value: "t1" } });
+    fireEvent.change(
+      screen.getByPlaceholderText("What should the candidate do differently?"),
+      { target: { value: "Uppercase the result" } },
+    );
+    mockApi.post.mockResolvedValue({
+      id: 1, system_id: 1, replay_set_id: 1, component_id: "norm", trace_id: "t1",
+      objective: "Uppercase the result", snapshot_id: 5, symbol_path: "svc.py",
+      symbol_qualified_name: "normalize", generated_code: "def normalize(x): ...",
+      patch_text: "diff --git a/svc.py b/svc.py\n@@ -1,2 +1,2 @@\n-a\n+b\n", patch_hash: "hh",
+      notes: "", status: "proposed", error: null, provider: "mock", model: "mock",
+      prompt_version: "v1", schema_version: "v1", decision_method: "reasoning_llm",
+      is_mock: true, created_at: 1,
+    });
+    fireEvent.click(screen.getByText("Generate draft"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/replay-variant-drafts", expect.objectContaining({
+        replay_set_id: 1, trace_id: "t1", objective: "Uppercase the result", snapshot_id: 5,
+      }));
+    });
+    expect(await screen.findByText("mock LLM")).toBeInTheDocument();
+    expect(screen.getByText("reasoning_llm")).toBeInTheDocument();
+  });
+
+  test("Direct edit -> Run calls the diff endpoint then the variant-run endpoint with the returned patch", async () => {
+    setupWorkbenchMocks({ run: null });
+    await renderWorkbenchAt("/simulation-workbench?replay_set_id=1");
+
+    const textarea = await screen.findByDisplayValue(/def normalize/);
+    fireEvent.change(textarea, {
+      target: { value: 'def normalize(payload):\n    return {"kind": "b"}\n' },
+    });
+
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/replay-source-diff") {
+        return Promise.resolve({ patch_text: "diff --git a/svc.py b/svc.py\n...", patch_hash: "phash" });
+      }
+      if (path === "/replay-variant-runs") return Promise.resolve(variantRunFixture());
+      return Promise.resolve(null);
+    });
+
+    const runButtons = screen.getAllByText("Run");
+    fireEvent.click(runButtons[0]);
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/replay-source-diff", expect.objectContaining({
+        replay_set_id: 1,
+        snapshot_id: 5,
+        edited_source: 'def normalize(payload):\n    return {"kind": "b"}\n',
+      }));
+    });
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/replay-variant-runs", expect.objectContaining({
+        replay_set_id: 1,
+        snapshot_id: 5,
+        variants: [{ label: "Direct edit", patch_text: "diff --git a/svc.py b/svc.py\n...", source: "manual" }],
+      }));
+    });
+  });
+
+  test("Promote routes to Experiments with the patch fetched and prefilled", async () => {
+    setupWorkbenchMocks();
+    const { default: SimulationWorkbenchPage } = await import("@/pages/simulation-workbench");
+    const { default: ExperimentsPage } = await import("@/pages/experiments");
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/simulation-workbench?replay_set_id=1"]}>
+          <Routes>
+            <Route path="/simulation-workbench" element={<SimulationWorkbenchPage />} />
+            <Route path="/experiments" element={<ExperimentsPage />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const promoteBtn = await screen.findByText('Promote "My candidate"');
+    fireEvent.click(promoteBtn);
+
+    await waitFor(() => {
+      expect(mockApi.get).toHaveBeenCalledWith(
+        "/replay-variant-runs/1/variants/11/experiment-payload",
+      );
+    });
+    await waitFor(() => {
+      expect(screen.getByText(/Prefilled from Replay Variant run #1/)).toBeInTheDocument();
+    });
+    const patchTextarea = screen.getAllByPlaceholderText("Patch text (unified diff format)")[0];
+    expect((patchTextarea as HTMLTextAreaElement).value).toContain("diff --git a/svc.py");
+  });
+
+  test("regression scaffold uses reasoning_llm and surfaces provenance", async () => {
+    setupWorkbenchMocks();
+    await renderWorkbenchAt("/simulation-workbench?replay_set_id=1");
+    mockApi.post.mockResolvedValue({
+      id: 7, intelligence_run_id: 8, replay_run_id: 1, replay_variant_id: 11,
+      replay_set_id: 1, trace_id: "t1", snapshot_id: 5,
+      scaffold_text: "def test_normalize_regression():\n    assert True\n",
+      status: "proposed", error: null, provider: "mock", model: "mock",
+      prompt_version: "replay-regression-scaffold-v1",
+      schema_version: "replay-regression-scaffold-v1",
+      decision_method: "reasoning_llm", is_mock: true, created_at: 1,
+    });
+
+    const generate = await screen.findByRole("button", {
+      name: "Generate regression-test scaffold",
+    });
+    await waitFor(() => expect(generate).toBeEnabled());
+    fireEvent.click(generate);
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/replay-regression-scaffolds", {
+        replay_run_id: 1,
+        replay_variant_id: 11,
+        trace_id: "t1",
+      });
+    });
+    expect(await screen.findByText("mock LLM")).toBeInTheDocument();
+    expect(screen.getByText("run #8 · replay-regression-scaffold-v1")).toBeInTheDocument();
   });
 });

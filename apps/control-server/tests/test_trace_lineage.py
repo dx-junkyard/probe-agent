@@ -116,6 +116,23 @@ def test_lineage_includes_projections(client):
     assert steps[1]["projections"][0]["fields"] == {"status": "charged"}
 
 
+def test_lineage_includes_replayability_for_workbench_actions(client):
+    event = _trace(
+        "replayable-trace",
+        correlation_id="replay-correlation",
+        replayability="partial",
+        replay_reasons=["redacted"],
+        input_capture={"args": ["[REDACTED]"], "kwargs": {}},
+    )
+    assert client.post("/traces", json=event).status_code == 201
+
+    step = client.get(
+        "/trace-lineage/correlations/replay-correlation"
+    ).json()["steps"][0]
+    assert step["replayability"] == "partial"
+    assert step["replay_reasons"] == ["redacted"]
+
+
 def test_repost_replaces_entities(client):
     client.post("/traces", json=_trace(
         "t1", entities=[{"type": "order", "id": "old"}]))

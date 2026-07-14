@@ -35,7 +35,11 @@ def run_classify(text: str) -> str:
     return classify(text)
 
 
-@probe(component_id="json-normalizer")
+# replay_capture=True (Issue #242 Phase A) opts this pure component into
+# structured, JSON round-trip-able input capture so later replay phases can
+# mechanically restore its inputs. Purely additive: traces gain
+# input_capture / replayability / replay_reasons fields.
+@probe(component_id="json-normalizer", replay_capture=True)
 def run_normalize(payload: str) -> str:
     return normalize_json(payload)
 

@@ -8,6 +8,8 @@ import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
+import { AddToWorkspaceButton } from "@/components/add-to-workspace";
+import { ReplayabilityBadge, ReplayRowActions } from "@/components/replay-row-actions";
 import { formatTimestamp, cn } from "@/lib/utils";
 
 type SearchKind = "entity" | "correlation" | "flow" | "analyzer";
@@ -309,6 +311,12 @@ export default function TraceLineagePage() {
                         <span className="font-mono text-sm font-semibold">{step.component_id || "(pruned)"}</span>
                         {step.mode && <Badge variant="outline">{step.mode}</Badge>}
                         {step.error && <Badge variant="destructive">error</Badge>}
+                        {step.component_id && (
+                          <ReplayabilityBadge
+                            replayability={step.replayability}
+                            reasons={step.replay_reasons}
+                          />
+                        )}
                       </div>
                       <span className="text-xs text-muted-foreground">{formatTimestamp(step.timestamp)}</span>
                     </div>
@@ -382,6 +390,19 @@ export default function TraceLineagePage() {
                       </Link>
                       <Link to="/flow-explorer" className="text-primary underline">Flow Explorer</Link>
                     </div>
+                    {step.component_id && (
+                      <div className="flex items-center gap-1 flex-wrap border-t pt-2">
+                        <ReplayRowActions
+                          componentId={step.component_id}
+                          traceId={step.trace_id}
+                        />
+                        <AddToWorkspaceButton
+                          itemType="trace"
+                          itemId={step.trace_id}
+                          label={`Trace ${step.trace_id.slice(0, 12)} (${step.component_id})`}
+                        />
+                      </div>
+                    )}
                   </CardContent>
                 </Card>
               </li>

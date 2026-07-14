@@ -18,6 +18,20 @@ export interface ComponentSummary {
   last_seen: number | null;
 }
 
+// Replay capture (Issue #242 Phase A / #243): deterministic, finite-set
+// classification of whether a trace's structured input capture can
+// mechanically restore the call inputs. See docs/project-intelligence.md's
+// Replay / Simulation section for the full reason-code semantics.
+export type Replayability = "replayable" | "partial" | "unreplayable";
+export type ReplayReason =
+  | "unsupported_type"
+  | "redacted"
+  | "depth_limit_exceeded"
+  | "size_limit_exceeded"
+  | "round_trip_failed"
+  | "capture_failed"
+  | "redaction_blocked";
+
 export interface TraceEvent {
   trace_id: string;
   component_id: string;
@@ -27,6 +41,11 @@ export interface TraceEvent {
   error: string | null;
   duration_ms: number | null;
   timestamp: number;
+  // Replay capture (Issue #242 Phase A / #243) -- present since Phase A;
+  // null on pre-Phase-A rows or components not opted into replay_capture.
+  input_capture?: unknown | null;
+  replayability?: Replayability | null;
+  replay_reasons?: ReplayReason[] | null;
 }
 
 export interface Policy {
@@ -78,6 +97,8 @@ export interface LineageStep {
   timestamp: number;
   output: string | null;
   error: string | null;
+  replayability: Replayability | null;
+  replay_reasons: ReplayReason[];
   entities: LineageEntity[];
   projections: LineageProjection[];
 }
@@ -2517,4 +2538,233 @@ export interface PublishAuditEventOut {
   actor_user_id: number | null;
   detail: Record<string, unknown> | null;
   created_at: number;
+}
+
+// ── Replay / Simulation (Issue #242, Phase D Workbench UI / #246) ──────────
+// Field names mirror app/models.py exactly (Phases A-C: #243-#245).
+
+export type ReplayInputSource = "structured" | "repr_partial";
+export type ReplaySkipReason =
+  | "unreplayable_capture"
+  | "repr_parse_failed"
+  | "undecodable_input"
+  | "trace_missing";
+export type ReplaySetSourceKind = "manual" | "analyzer_run";
+export type ReplayApprovalStatus = "approved" | "revoked";
+
+export interface ReplaySetTraceOut {
+  trace_id: string;
+  exists: boolean;
+  replayability: Replayability | null;
+  replay_reasons: string[];
+  // The input_source/skip_reason a replay run would deterministically use
+  // for this trace (same rule as the runner) -- drives the Workbench badges.
+  input_source: ReplayInputSource | null;
+  skip_reason: ReplaySkipReason | null;
+}
+
+export interface ReplaySetOut {
+  id: number;
+  system_id: number;
+  component_id: string;
+  name: string;
+  source: ReplaySetSourceKind;
+  source_analyzer_run_id: number | null;
+  trace_ids: string[];
+  traces: ReplaySetTraceOut[];
+  created_at: number;
+}
+
+export interface ReplayRiskPointOut {
+  point_id: number;
+  plan_id: number;
+  side_effect_risk: string | null;
+  replayability: string | null;
+}
+
+export interface ReplayRiskContextOut {
+  probe_plan_points: ReplayRiskPointOut[];
+  warning: string;
+}
+
+export interface ReplayApprovalOut {
+  id: number;
+  system_id: number;
+  component_id: string;
+  status: ReplayApprovalStatus;
+  reason: string;
+  approved_by_user_id: number | null;
+  decision_method: string;
+  risk_context: Record<string, unknown> | null;
+  created_at: number;
+  revoked_at: number | null;
+  revoked_by_user_id: number | null;
+}
+
+export interface ReplayApprovalStateOut {
+  component_id: string;
+  active: boolean;
+  approval: ReplayApprovalOut | null;
+  risk_context: ReplayRiskContextOut;
+}
+
+export type ReplayVariantCaseStatus =
+  | "match"
+  | "diff"
+  | "candidate_error"
+  | "error_to_success"
+  | "error_to_same_error"
+  | "error_to_different_error"
+  | "skipped";
+export type ReplayVariantComparisonMode = "structured" | "repr";
+export type ReplayVariantSource = "manual" | "pasted" | "llm_draft";
+export type ReplayVariantApplyStatus = "applied" | "invalid_patch" | "not_applicable";
+export type ReplayVariantRunStatus = "running" | "completed" | "failed";
+export type ReplayVariantDraftStatus = "proposed" | "failed";
+
+export interface ReplayVariantCaseResultOut {
+  id: number;
+  trace_id: string;
+  position: number;
+  case_status: ReplayVariantCaseStatus;
+  comparison_mode: ReplayVariantComparisonMode | null;
+  baseline_output: string | null;
+  candidate_output: string | null;
+  candidate_error: string | null;
+  recorded_error: string | null;
+  duration_ms: number | null;
+  duration_delta_ms: number | null;
+  field_diffs: string[];
+  output_truncated: boolean;
+  created_at: number;
+}
+
+export interface ReplayVariantAggregateOut {
+  match: number;
+  diff: number;
+  candidate_error: number;
+  error_to_success: number;
+  error_to_same_error: number;
+  error_to_different_error: number;
+  skipped: number;
+  total: number;
+  avg_duration_delta_ms: number | null;
+  examples: Record<string, string[]>;
+}
+
+export interface ReplayVariantOut {
+  id: number;
+  replay_run_id: number;
+  variant_key: string;
+  label: string;
+  is_baseline: boolean;
+  patch_text: string;
+  patch_hash: string;
+  source: string;
+  apply_status: ReplayVariantApplyStatus;
+  apply_error: string | null;
+  status: ReplayVariantRunStatus;
+  error: string | null;
+  workspace_path: string | null;
+  cleanup_state: string;
+  cleanup_error: string | null;
+  aggregate: ReplayVariantAggregateOut;
+  cases: ReplayVariantCaseResultOut[];
+  created_at: number;
+  started_at: number | null;
+  completed_at: number | null;
+}
+
+export interface ReplayVariantRunOut {
+  id: number;
+  system_id: number;
+  replay_set_id: number;
+  component_id: string;
+  snapshot_id: number;
+  commit_sha: string;
+  symbol_path: string;
+  symbol_qualified_name: string;
+  status: ReplayVariantRunStatus;
+  error: string | null;
+  trace_set_hash: string;
+  sandbox_config: Record<string, unknown>;
+  approval_id: number | null;
+  variants: ReplayVariantOut[];
+  created_at: number;
+  started_at: number | null;
+  completed_at: number | null;
+}
+
+export interface ReplayVariantDraftOut {
+  id: number;
+  system_id: number;
+  replay_set_id: number;
+  component_id: string;
+  trace_id: string;
+  objective: string;
+  snapshot_id: number;
+  symbol_path: string;
+  symbol_qualified_name: string;
+  generated_code: string;
+  patch_text: string;
+  patch_hash: string;
+  notes: string;
+  status: ReplayVariantDraftStatus;
+  error: string | null;
+  provider: string | null;
+  model: string | null;
+  prompt_version: string | null;
+  schema_version: string | null;
+  decision_method: "deterministic" | "reasoning_llm" | "manual" | null;
+  is_mock: boolean;
+  created_at: number;
+}
+
+export interface ReplayVariantExperimentPayloadOut {
+  label: string;
+  patch_text: string;
+  patch_hash: string;
+  source: string;
+  risk_note: string;
+  origin: Record<string, unknown>;
+}
+
+export interface ReplayRegressionScaffoldOut {
+  id: number;
+  intelligence_run_id: number;
+  replay_run_id: number;
+  replay_variant_id: number;
+  replay_set_id: number;
+  trace_id: string;
+  snapshot_id: number;
+  scaffold_text: string;
+  status: "proposed" | "failed";
+  error: string | null;
+  provider: string;
+  model: string;
+  prompt_version: string;
+  schema_version: string;
+  decision_method: "reasoning_llm";
+  is_mock: boolean;
+  created_at: number;
+}
+
+// Two small deterministic backend helpers for the Workbench's Direct-edit
+// flow (Issue #246): read the pinned-snapshot source, then diff an edited
+// copy of it. No judgement -- structural reads/text diffing only.
+export interface ReplaySourceOut {
+  replay_set_id: number;
+  component_id: string;
+  snapshot_id: number;
+  commit_sha: string;
+  path: string;
+  qualified_name: string;
+  start_line: number;
+  end_line: number;
+  source: string;
+}
+
+export interface ReplaySourceDiffOut {
+  patch_text: string;
+  patch_hash: string;
 }

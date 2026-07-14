@@ -86,6 +86,33 @@ creating incomplete persistence or execution paths for later phases.
    App installations for the configured Organization. An installation must
    also be explicitly assigned to a System before any repository listing,
    connection, verify, sync, or publish token issuance may use it.
+8. Issue #242 — Replay / Simulation track (sub-issues #243-#246): replay a
+   probe's captured real inputs against pinned-snapshot code (baseline
+   simulation) and against edited/patched code (offline shadow), then promote
+   promising candidates into the existing Experiment / live-shadow / test
+   gates. Implement sub-issues in dependency order:
+   - #243 (Phase A): opt-in structured input capture (`@probe(...,
+     replay_capture=...)`, canonical JSON with a `"__probe__"` marker) +
+     deterministic replayability classification + `shadow_result.schema.json`.
+   - #244 (Phase B): a shared worktree/sandbox harness that imports the
+     resolved symbol and calls it with restored inputs, a human replay
+     approval gate (`decision_method: manual`), and the deterministic
+     comparison of replay output vs recorded output. `generation.py`'s
+     candidate execution is migrated onto this harness.
+   - #245 (Phase C): patch variants (baseline + N candidates) run in
+     independent worktrees with a finite diff matrix (match / diff /
+     candidate_error / error_to_success / …), the `_field_equal` rules
+     extracted to `app/comparison.py`, and LLM candidate drafts
+     (`reasoning_llm`, fail-closed).
+   - #246 (Phase D): the Simulation Workbench UI (`/simulation-workbench`),
+     trace-row actions + replayability badges, and two deterministic
+     source/diff endpoints for the edit→diff flow.
+   See the Issue #242 section in `docs/project-intelligence.md`. Recorded-error
+   traces are executed against candidates on the OFFLINE side only; the live
+   SDK shadow asymmetry (`decorator.py`'s `run_shadow and raised is None`) is
+   intentionally unchanged. Replay never runs an unapproved component, never
+   writes to the target repo, and (Principle 4) targets pure-ish components
+   only — payment/email/DB-write/auth are discouraged even with approval.
 
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and

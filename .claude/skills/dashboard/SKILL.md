@@ -43,6 +43,28 @@ The dashboard should support:
   hands off to the existing Probe Planner gates and links there — the page
   itself never applies instrumentation.
 - Experiments tab
+- Simulation Workbench (Issue #242 Phase D / #246,
+  `pages/simulation-workbench.tsx`, route `/simulation-workbench`): trace-row
+  actions on Components Traces, Trace Lineage, and analyzer example rows
+  (`components/replay-row-actions.tsx`:
+  `ReplayabilityBadge` + Replay / Add-to-Replay-Set / Create-Experiment,
+  plus the `trace` `AddToWorkspaceButton`), and a 3-pane page — Replay Set
+  (traces + `JsonTree` input_capture + recorded output + per-trace
+  input_source/skip guidance), a center editor (pinned-snapshot source in a
+  Textarea; Direct edit → auto-diff via `POST /replay-source-diff` / Paste
+  patch / LLM draft with provenance + `is_mock` badges), and the result
+  matrix (match / diff / candidate_error / error_to_success distinctly
+  badged, `field_diffs`, duration Δ, aggregate row). An always-visible
+  simulation disclaimer, a confirm-gated Approve/Revoke approval panel
+  showing the deterministic risk context, and escalations that only ever go
+  through existing human gates (only successfully applied/completed variants
+  may be promoted to Experiment via patch prefill; a provenance-bearing,
+  fail-closed `reasoning_llm` regression-test scaffold; a static
+  `set_candidate` live-shadow snippet). Source edits, pasted patches, and LLM
+  drafts always carry the source/draft's pinned `snapshot_id`. Replay
+  judgement/execution stays in the Phase A–C APIs; the regression scaffold is
+  the isolated review-only reasoning boundary. The UI never writes to the
+  target repo.
 - Decision Workspace tab (Issue #38): workspace list/create/switch, a
   conversation thread with grounded findings/assumptions/missing information
   visually distinguished, pinned context with links back to the owning

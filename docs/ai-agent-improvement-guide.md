@@ -202,6 +202,20 @@ DB更新、メール送信、課金、キュー投入などの副作用を持つ
 
 ## 5. AIエージェントの標準改善サイクル
 
+**Workbench-first（Issue #242 Phase D / #246）**: Step 5〜7（候補作成→shadow登録→
+複数トレース評価）は、本番トラフィックに候補を晒す前に、まず Dashboard の
+Simulation Workbench（`/simulation-workbench`）でオフライン・sandboxed に試す方が
+速く安全である。Workbench は Components の Traces タブから「▶ Replay」または
+「+ Add to Replay Set」で選んだ捕捉済みトレース集合に対し、候補ソースの直接編集
+／貼り付けパッチ／LLM下書きのいずれかを baseline と同じ隔離 worktree・同じ
+sandbox 条件で再実行し、per-trace の diff（match / diff / candidate_error /
+error_to_success 等）と実行時間差を即座に返す（目標: N≤20 で10秒程度)。
+本番相当ではない旨のディスクレーマーが結果に常設される。ここで問題なしと判断
+できた候補だけを Step 6 の live shadow 登録に進める、または Workbench から直接
+Experiment へ昇格して Step 7 相当の判断記録を残す。詳細は
+`docs/project-intelligence.md`の「Replay / Simulation（Issue #242）」Phase D
+節を参照。live shadow（Step 6）自体の挙動やSDK APIは変更されていない。
+
 ### Step 1: ベースラインを固定する
 
 変更前に以下を記録する。

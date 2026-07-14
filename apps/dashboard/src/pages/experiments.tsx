@@ -3,7 +3,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import {
   useExperiments, useRunExperiment, useExperimentDecision,
   useCreateExperiment, useSnapshots, useLatestDrafts,
-  useWorkspaceProposalDraft,
+  useWorkspaceProposalDraft, useVariantExperimentPayload,
 } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -43,6 +43,23 @@ export default function ExperimentsPage() {
   const capabilityContext = searchParams.get("capability");
   const draftId = draftIdParam && Number.isInteger(Number(draftIdParam)) ? Number(draftIdParam) : null;
   const { data: workspaceDraft } = useWorkspaceProposalDraft(draftId);
+
+  // Escalation from the Simulation Workbench (Issue #242 Phase D / #246):
+  // ?replay_run_id=&replay_variant_id= mirrors the ?draft= mechanism above --
+  // the id round-trips through the URL and this page fetches the full patch
+  // payload itself, so a page refresh still resolves the prefill.
+  const replayRunIdParam = searchParams.get("replay_run_id");
+  const replayVariantIdParam = searchParams.get("replay_variant_id");
+  const replayRunId = replayRunIdParam && Number.isInteger(Number(replayRunIdParam))
+    ? Number(replayRunIdParam) : null;
+  const replayVariantId = replayVariantIdParam && Number.isInteger(Number(replayVariantIdParam))
+    ? Number(replayVariantIdParam) : null;
+  const { data: replayPayload } = useVariantExperimentPayload(replayRunId, replayVariantId);
+
+  // "Create Experiment from this trace" (Components Traces tab row action):
+  // prefill context only, never a patch -- the developer fills in the rest.
+  const fromTraceParam = searchParams.get("from_trace");
+  const fromComponentParam = searchParams.get("from_component");
   const { data: experiments, isLoading } = useExperiments();
   const runExperiment = useRunExperiment();
   const makeDecision = useExperimentDecision();
@@ -70,14 +87,26 @@ export default function ExperimentsPage() {
   while (draftVariants.length < 2) {
     draftVariants.push({ label: "", patch_text: "", risk_note: "" });
   }
+  const replayVariants = replayPayload
+    ? [{ label: replayPayload.label, patch_text: replayPayload.patch_text, risk_note: replayPayload.risk_note }]
+    : [];
+  while (replayVariants.length < 2) {
+    replayVariants.push({ label: "", patch_text: "", risk_note: "" });
+  }
   const formFeatureId = newFeatureId
     ?? (workspaceDraft?.draft_type === "experiment_draft" ? workspaceDraft.payload.feature_id ?? "" : "");
-  const formObjective = newObjective
-    ?? (workspaceDraft?.draft_type === "experiment_draft" ? workspaceDraft.payload.objective ?? "" : "");
-  const formVariants = variants ?? draftVariants;
+  const defaultObjective = workspaceDraft?.draft_type === "experiment_draft"
+    ? workspaceDraft.payload.objective ?? ""
+    : fromTraceParam
+      ? `Investigate trace ${fromTraceParam}${fromComponentParam ? ` (component ${fromComponentParam})` : ""}`
+      : "";
+  const formObjective = newObjective ?? defaultObjective;
+  const formVariants = variants ?? (replayPayload ? replayVariants : draftVariants);
   const draftOpen = !!workspaceDraft
     && workspaceDraft.draft_type === "experiment_draft"
     && !draftDismissed;
+  const replayPrefillOpen = !!replayPayload && !draftDismissed;
+  const fromTraceOpen = !!fromTraceParam && !draftDismissed && !workspaceDraft && !replayPayload;
 
   const resetForm = () => {
     setNewFeatureId(null);
@@ -172,7 +201,7 @@ export default function ExperimentsPage() {
         </div>
       )}
 
-      <Dialog open={showCreate || draftOpen} onOpenChange={(open) => {
+      <Dialog open={showCreate || draftOpen || replayPrefillOpen || fromTraceOpen} onOpenChange={(open) => {
         setShowCreate(open);
         if (!open) {
           setDraftDismissed(true);
@@ -183,6 +212,22 @@ export default function ExperimentsPage() {
           <DialogTitle>Create Experiment</DialogTitle>
         </DialogHeader>
         <div className="space-y-4 max-h-[60vh] overflow-y-auto">
+          {replayPayload && (
+            <div className="rounded-md border bg-secondary/30 px-3 py-2 text-xs">
+              Prefilled from Replay Variant run #{replayRunId}, variant #{replayVariantId} ({replayPayload.source}).
+              {replayPayload.risk_note && <span className="ml-2">{replayPayload.risk_note}</span>}
+              <span className="ml-1 text-muted-foreground">Complete: feature, objective, snapshot.</span>
+            </div>
+          )}
+          {!replayPayload && fromTraceParam && (
+            <div className="rounded-md border bg-secondary/30 px-3 py-2 text-xs">
+              Prefilled context from trace <span className="font-mono">{fromTraceParam}</span>
+              {fromComponentParam && (
+                <> (component <span className="font-mono">{fromComponentParam}</span>)</>
+              )}.
+              <span className="ml-1 text-muted-foreground">Complete: feature, snapshot, and variants.</span>
+            </div>
+          )}
           {workspaceDraft?.draft_type === "experiment_draft" && (
             <div className="rounded-md border bg-secondary/30 px-3 py-2 text-xs">
               Prefilled from Decision Workspace proposal #{workspaceDraft.proposal_id}.
