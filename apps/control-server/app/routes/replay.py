@@ -19,6 +19,8 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from ..auth import Principal, get_system_id, require_user
 from ..db import get_conn
+from ..experiment_runner import patch_hash
+from ..llm import LLMConfig, get_llm_client
 from ..models import (
     ReplayApprovalCreate,
     ReplayApprovalOut,
@@ -31,6 +33,21 @@ from ..models import (
     ReplaySetCreate,
     ReplaySetOut,
     ReplaySetTraceOut,
+    ReplayVariantAggregateOut,
+    ReplayVariantCaseResultOut,
+    ReplayVariantCreate,
+    ReplayVariantDraftCreate,
+    ReplayVariantDraftOut,
+    ReplayVariantExperimentPayloadOut,
+    ReplayVariantOut,
+    ReplayVariantRunCreate,
+    ReplayVariantRunOut,
+)
+from ..replay_draft import (
+    DRAFT_PROPOSED,
+    PROMPT_VERSION as DRAFT_PROMPT_VERSION,
+    SCHEMA_VERSION as DRAFT_SCHEMA_VERSION,
+    generate_variant_draft,
 )
 from ..replay_runner import (
     ReplayExecution,
@@ -44,6 +61,14 @@ from ..replay_runner import (
     restoration_for_trace,
     summarize_cases,
 )
+from ..replay_variants import (
+    APPLY_APPLIED,
+    APPLY_INVALID_PATCH,
+    APPLY_NOT_APPLICABLE,
+    classify_variant_case,
+    summarize_variant_cases,
+)
+from ..trace_analyzer import max_examples
 
 router = APIRouter()
 
@@ -646,6 +671,46 @@ def _get_run_or_404(conn, run_id: int, system_id: int):
     return row
 
 
+def _persist_replay_case_results(
+    conn, system_id: int, run_id: int, plans, execution: ReplayExecution, created_at: float
+) -> None:
+    """Baseline-vs-recorded classification + persistence (Phase B). Shared by
+    ``POST /replay-runs`` and the baseline half of ``POST
+    /replay-variant-runs`` so both endpoints classify identically."""
+    executed = iter(execution.case_results)
+    for plan in plans:
+        harness_case = next(executed) if plan.harness_case is not None else None
+        classified = classify_case(plan, harness_case)
+        conn.execute(
+            """
+            INSERT INTO replay_case_results
+                (system_id, replay_run_id, trace_id, position,
+                 case_status, input_source, skip_reason, replay_output,
+                 replay_error, recorded_output, recorded_error,
+                 duration_ms, output_truncated, comparison_mode,
+                 created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                system_id,
+                run_id,
+                classified["trace_id"],
+                classified["position"],
+                classified["case_status"],
+                classified["input_source"],
+                classified["skip_reason"],
+                classified["replay_output"],
+                classified["replay_error"],
+                classified["recorded_output"],
+                classified["recorded_error"],
+                classified["duration_ms"],
+                1 if classified["output_truncated"] else 0,
+                classified["comparison_mode"],
+                created_at,
+            ),
+        )
+
+
 @router.post("/replay-runs", response_model=ReplayRunOut, status_code=201)
 def create_replay_run(
     payload: ReplayRunCreate,
@@ -752,40 +817,9 @@ def create_replay_run(
                 ),
             )
         else:
-            executed = iter(execution.case_results)
-            for plan in plans:
-                harness_case = (
-                    next(executed) if plan.harness_case is not None else None
-                )
-                classified = classify_case(plan, harness_case)
-                conn.execute(
-                    """
-                    INSERT INTO replay_case_results
-                        (system_id, replay_run_id, trace_id, position,
-                         case_status, input_source, skip_reason, replay_output,
-                         replay_error, recorded_output, recorded_error,
-                         duration_ms, output_truncated, comparison_mode,
-                         created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        system_id,
-                        run_id,
-                        classified["trace_id"],
-                        classified["position"],
-                        classified["case_status"],
-                        classified["input_source"],
-                        classified["skip_reason"],
-                        classified["replay_output"],
-                        classified["replay_error"],
-                        classified["recorded_output"],
-                        classified["recorded_error"],
-                        classified["duration_ms"],
-                        1 if classified["output_truncated"] else 0,
-                        classified["comparison_mode"],
-                        completed_at,
-                    ),
-                )
+            _persist_replay_case_results(
+                conn, system_id, run_id, plans, execution, completed_at
+            )
             conn.execute(
                 """
                 UPDATE replay_runs
@@ -843,3 +877,804 @@ def get_replay_run(
     with get_conn() as conn:
         row = _get_run_or_404(conn, run_id, system_id)
         return _replay_run_out(conn, row)
+
+
+# =============================================================================
+# Replay variants (Issue #242 Phase C / #245)
+#
+# A "variant replay run" IS a replay_runs row (same snapshot/symbol/approval
+# resolution, same trace_set_hash, same replay_case_results baseline-vs-
+# recorded classification as Phase B) that additionally has one or more
+# replay_variants rows hanging off it via replay_run_id. POST /replay-runs
+# (Phase B, above) never creates replay_variants rows, so a plain baseline-
+# only run 404s from the /replay-variant-runs/{id} endpoints below --
+# EXISTS(SELECT 1 FROM replay_variants WHERE replay_run_id = ...) is the
+# marker, not a new column on replay_runs.
+# =============================================================================
+
+
+def _variant_case_row_out(row) -> ReplayVariantCaseResultOut:
+    try:
+        field_diffs = json.loads(row["field_diffs_json"] or "[]")
+    except json.JSONDecodeError:
+        field_diffs = []
+    if not isinstance(field_diffs, list):
+        field_diffs = []
+    return ReplayVariantCaseResultOut(
+        id=row["id"],
+        trace_id=row["trace_id"],
+        position=row["position"],
+        case_status=row["case_status"],
+        comparison_mode=row["comparison_mode"],
+        baseline_output=row["baseline_output"],
+        candidate_output=row["candidate_output"],
+        candidate_error=row["candidate_error"],
+        recorded_error=row["recorded_error"],
+        duration_ms=row["duration_ms"],
+        duration_delta_ms=row["duration_delta_ms"],
+        field_diffs=field_diffs,
+        output_truncated=bool(row["output_truncated"]),
+        created_at=row["created_at"],
+    )
+
+
+def _variant_out(conn, row, include_cases: bool = True) -> ReplayVariantOut:
+    case_rows = conn.execute(
+        """
+        SELECT * FROM replay_variant_case_results
+        WHERE replay_variant_id = ? AND system_id = ?
+        ORDER BY position
+        """,
+        (row["id"], row["system_id"]),
+    ).fetchall()
+    cases = [_variant_case_row_out(case_row) for case_row in case_rows]
+    summary, examples, avg_delta = summarize_variant_cases(
+        [case.model_dump() for case in cases], max_examples()
+    )
+    aggregate = ReplayVariantAggregateOut(
+        match=summary.get("match", 0),
+        diff=summary.get("diff", 0),
+        candidate_error=summary.get("candidate_error", 0),
+        error_to_success=summary.get("error_to_success", 0),
+        error_to_same_error=summary.get("error_to_same_error", 0),
+        error_to_different_error=summary.get("error_to_different_error", 0),
+        skipped=summary.get("skipped", 0),
+        total=summary.get("total", 0),
+        avg_duration_delta_ms=avg_delta,
+        examples=examples,
+    )
+    return ReplayVariantOut(
+        id=row["id"],
+        replay_run_id=row["replay_run_id"],
+        variant_key=row["variant_key"],
+        label=row["label"] or "",
+        is_baseline=bool(row["is_baseline"]),
+        patch_text=row["patch_text"] or "",
+        patch_hash=row["patch_hash"],
+        source=row["source"],
+        apply_status=row["apply_status"],
+        apply_error=row["apply_error"],
+        status=row["status"],
+        error=row["error"],
+        workspace_path=row["workspace_path"],
+        cleanup_state=row["cleanup_state"],
+        cleanup_error=row["cleanup_error"],
+        aggregate=aggregate,
+        cases=cases if include_cases else [],
+        created_at=row["created_at"],
+        started_at=row["started_at"],
+        completed_at=row["completed_at"],
+    )
+
+
+def _variant_run_out(conn, row, include_cases: bool = True) -> ReplayVariantRunOut:
+    try:
+        sandbox_config = json.loads(row["sandbox_config_json"] or "{}")
+    except json.JSONDecodeError:
+        sandbox_config = {}
+    variant_rows = conn.execute(
+        """
+        SELECT * FROM replay_variants
+        WHERE replay_run_id = ? AND system_id = ?
+        ORDER BY id
+        """,
+        (row["id"], row["system_id"]),
+    ).fetchall()
+    variants = [
+        _variant_out(conn, variant_row, include_cases=include_cases)
+        for variant_row in variant_rows
+    ]
+    return ReplayVariantRunOut(
+        id=row["id"],
+        system_id=row["system_id"],
+        replay_set_id=row["replay_set_id"],
+        component_id=row["component_id"],
+        snapshot_id=row["snapshot_id"],
+        commit_sha=row["commit_sha"],
+        symbol_path=row["symbol_path"],
+        symbol_qualified_name=row["symbol_qualified_name"],
+        status=row["status"],
+        error=row["error"],
+        trace_set_hash=row["trace_set_hash"],
+        sandbox_config=sandbox_config,
+        approval_id=row["approval_id"],
+        variants=variants,
+        created_at=row["created_at"],
+        started_at=row["started_at"],
+        completed_at=row["completed_at"],
+    )
+
+
+def _get_variant_run_or_404(conn, run_id: int, system_id: int):
+    row = _get_run_or_404(conn, run_id, system_id)
+    has_variants = conn.execute(
+        "SELECT 1 FROM replay_variants WHERE replay_run_id = ? AND system_id = ? LIMIT 1",
+        (run_id, system_id),
+    ).fetchone()
+    if has_variants is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Replay run exists but was not created via "
+                "POST /replay-variant-runs (no variants attached)"
+            ),
+        )
+    return row
+
+
+@router.post(
+    "/replay-variant-runs", response_model=ReplayVariantRunOut, status_code=201
+)
+def create_replay_variant_run(
+    payload: ReplayVariantRunCreate,
+    system_id: int = Depends(get_system_id),
+) -> ReplayVariantRunOut:
+    """Run baseline + N patch variants together against the SAME Replay Set
+    and SAME sandbox conditions, producing a per-trace + aggregate diff
+    matrix (Issue #245). Reuses Phase B's approval gate, snapshot
+    resolution, and symbol resolution verbatim; ``POST /replay-runs``
+    (baseline-only) is unchanged."""
+    now = time.time()
+    timeout_seconds = replay_timeout_seconds()
+    with get_conn() as conn:
+        replay_set = _get_set_or_404(conn, payload.replay_set_id, system_id)
+        component_id = replay_set["component_id"]
+
+        approval = _active_approval(conn, system_id, component_id)
+        if approval is None:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"Replay is not approved for component '{component_id}'. "
+                    "A human must approve it first via POST /components/"
+                    f"{component_id}/replay-approval (a revoked approval also "
+                    "refuses)."
+                ),
+            )
+
+        snapshot = _resolve_snapshot(conn, system_id, payload.snapshot_id)
+        symbol = _resolve_component_symbol(
+            conn, system_id, snapshot["id"], component_id
+        )
+
+        trace_ids = json.loads(replay_set["trace_ids_json"] or "[]")
+        plans, trace_set_hash = build_case_plans(
+            conn, system_id, component_id, trace_ids
+        )
+        sandbox_config = build_sandbox_config(
+            timeout_seconds, build_replay_env("")
+        )
+        cur = conn.execute(
+            """
+            INSERT INTO replay_runs
+                (system_id, replay_set_id, component_id, snapshot_id,
+                 commit_sha, symbol_path, symbol_qualified_name, status,
+                 trace_set_hash, sandbox_config_json, approval_id,
+                 created_at, started_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?)
+            """,
+            (
+                system_id,
+                replay_set["id"],
+                component_id,
+                snapshot["id"],
+                snapshot["commit_sha"],
+                symbol["path"],
+                symbol["qualified_name"],
+                trace_set_hash,
+                json.dumps(sandbox_config, ensure_ascii=False),
+                approval["id"],
+                now,
+                now,
+            ),
+        )
+        run_id = cur.lastrowid
+        repo_path = snapshot["repo_path"]
+        commit_sha = snapshot["commit_sha"]
+        target = {
+            "kind": "symbol",
+            "path": symbol["path"],
+            "qualified_name": symbol["qualified_name"],
+        }
+
+        # Insert baseline + variant rows up front (status='running') so a
+        # crash mid-execution leaves an honest partial audit trail, mirroring
+        # replay_runs' own insert-then-update pattern.
+        cur = conn.execute(
+            """
+            INSERT INTO replay_variants
+                (system_id, replay_run_id, variant_key, label, is_baseline,
+                 patch_text, patch_hash, source, apply_status, status,
+                 created_at, started_at)
+            VALUES (?, ?, 'baseline', 'Baseline', 1, '', ?, 'manual', ?,
+                    'running', ?, ?)
+            """,
+            (system_id, run_id, patch_hash(""), APPLY_NOT_APPLICABLE, now, now),
+        )
+        baseline_variant_id = cur.lastrowid
+
+        variant_plan: List[Any] = []
+        for index, variant in enumerate(payload.variants, start=1):
+            cur = conn.execute(
+                """
+                INSERT INTO replay_variants
+                    (system_id, replay_run_id, variant_key, label, is_baseline,
+                     patch_text, patch_hash, source, apply_status, status,
+                     created_at, started_at)
+                VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, 'running', ?, ?)
+                """,
+                (
+                    system_id,
+                    run_id,
+                    f"variant-{index}",
+                    variant.label,
+                    variant.patch_text,
+                    patch_hash(variant.patch_text),
+                    variant.source,
+                    APPLY_NOT_APPLICABLE,
+                    now,
+                    now,
+                ),
+            )
+            variant_plan.append((cur.lastrowid, variant))
+
+    harness_cases = [
+        plan.harness_case for plan in plans if plan.harness_case is not None
+    ]
+    workspace_root = os.path.join(replay_workspace_base(), str(run_id))
+
+    if harness_cases:
+        baseline_execution = execute_harness(
+            repo_path=repo_path,
+            commit_sha=commit_sha,
+            run_workspace_base=os.path.join(workspace_root, "baseline"),
+            target=target,
+            harness_cases=harness_cases,
+            timeout_seconds=timeout_seconds,
+        )
+    else:
+        baseline_execution = ReplayExecution(status="completed", case_results=[])
+
+    completed_at = time.time()
+    baseline_by_position: Dict[int, Dict[str, Any]] = {}
+    if baseline_execution.status == "completed":
+        executed = iter(baseline_execution.case_results)
+        for plan in plans:
+            if plan.harness_case is not None:
+                baseline_by_position[plan.position] = next(executed)
+
+    with get_conn() as conn:
+        _persist_replay_case_results(
+            conn, system_id, run_id, plans, baseline_execution, completed_at
+        )
+        run_status = "completed" if baseline_execution.status == "completed" else "failed"
+        conn.execute(
+            """
+            UPDATE replay_runs
+            SET status = ?, error = ?, workspace_path = ?, cleanup_state = ?,
+                cleanup_error = ?, completed_at = ?
+            WHERE id = ?
+            """,
+            (
+                run_status,
+                baseline_execution.error,
+                baseline_execution.workspace_path,
+                baseline_execution.cleanup_state,
+                baseline_execution.cleanup_error,
+                completed_at,
+                run_id,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE replay_variants
+            SET status = ?, apply_status = ?, error = ?, workspace_path = ?,
+                cleanup_state = ?, cleanup_error = ?, completed_at = ?
+            WHERE id = ?
+            """,
+            (
+                run_status,
+                APPLY_NOT_APPLICABLE,
+                baseline_execution.error,
+                baseline_execution.workspace_path,
+                baseline_execution.cleanup_state,
+                baseline_execution.cleanup_error,
+                completed_at,
+                baseline_variant_id,
+            ),
+        )
+        if baseline_execution.status != "completed":
+            # No baseline to compare against in this run -- every variant is
+            # marked failed with a clear reason and NONE of them execute.
+            # This never touches other runs; only this run's own variants.
+            for variant_id, _variant in variant_plan:
+                conn.execute(
+                    """
+                    UPDATE replay_variants
+                    SET status = 'failed',
+                        error = ?,
+                        completed_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        "baseline replay failed in this run: "
+                        + (baseline_execution.error or "unknown error"),
+                        completed_at,
+                        variant_id,
+                    ),
+                )
+            row = _get_run_or_404(conn, run_id, system_id)
+            return _variant_run_out(conn, row)
+
+    # Execute each variant independently: its own worktree, its own patch
+    # apply, its own harness run. Ordering never matters -- nothing is shared
+    # between iterations besides the read-only baseline_by_position map.
+    for variant_id, variant in variant_plan:
+        if harness_cases:
+            execution = execute_harness(
+                repo_path=repo_path,
+                commit_sha=commit_sha,
+                run_workspace_base=os.path.join(workspace_root, f"variant-{variant_id}"),
+                target=target,
+                harness_cases=harness_cases,
+                timeout_seconds=timeout_seconds,
+                patch_text=variant.patch_text,
+            )
+        else:
+            execution = ReplayExecution(status="completed", case_results=[])
+        variant_completed_at = time.time()
+
+        if execution.status == "invalid_patch":
+            with get_conn() as conn:
+                conn.execute(
+                    """
+                    UPDATE replay_variants
+                    SET status = 'failed', apply_status = ?, apply_error = ?,
+                        workspace_path = ?, cleanup_state = ?,
+                        cleanup_error = ?, completed_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        APPLY_INVALID_PATCH,
+                        execution.error,
+                        execution.workspace_path,
+                        execution.cleanup_state,
+                        execution.cleanup_error,
+                        variant_completed_at,
+                        variant_id,
+                    ),
+                )
+            continue
+
+        if execution.status != "completed":
+            with get_conn() as conn:
+                conn.execute(
+                    """
+                    UPDATE replay_variants
+                    SET status = 'failed', apply_status = ?, error = ?,
+                        workspace_path = ?, cleanup_state = ?,
+                        cleanup_error = ?, completed_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        APPLY_APPLIED,
+                        execution.error,
+                        execution.workspace_path,
+                        execution.cleanup_state,
+                        execution.cleanup_error,
+                        variant_completed_at,
+                        variant_id,
+                    ),
+                )
+            continue
+
+        candidate_by_position: Dict[int, Dict[str, Any]] = {}
+        executed = iter(execution.case_results)
+        for plan in plans:
+            if plan.harness_case is not None:
+                candidate_by_position[plan.position] = next(executed)
+
+        with get_conn() as conn:
+            for plan in plans:
+                classified = classify_variant_case(
+                    plan.trace_id,
+                    plan.position,
+                    plan.harness_case,
+                    baseline_by_position.get(plan.position),
+                    candidate_by_position.get(plan.position),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO replay_variant_case_results
+                        (system_id, replay_variant_id, replay_run_id, trace_id,
+                         position, case_status, comparison_mode,
+                         baseline_output, candidate_output, candidate_error,
+                         recorded_error, duration_ms, duration_delta_ms,
+                         field_diffs_json, output_truncated, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        system_id,
+                        variant_id,
+                        run_id,
+                        classified["trace_id"],
+                        classified["position"],
+                        classified["case_status"],
+                        classified["comparison_mode"],
+                        classified["baseline_output"],
+                        classified["candidate_output"],
+                        classified["candidate_error"],
+                        classified["recorded_error"],
+                        classified["duration_ms"],
+                        classified["duration_delta_ms"],
+                        json.dumps(classified["field_diffs"], ensure_ascii=False),
+                        1 if classified["output_truncated"] else 0,
+                        variant_completed_at,
+                    ),
+                )
+            conn.execute(
+                """
+                UPDATE replay_variants
+                SET status = 'completed', apply_status = ?, workspace_path = ?,
+                    cleanup_state = ?, cleanup_error = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                (
+                    APPLY_APPLIED,
+                    execution.workspace_path,
+                    execution.cleanup_state,
+                    execution.cleanup_error,
+                    variant_completed_at,
+                    variant_id,
+                ),
+            )
+
+    with get_conn() as conn:
+        row = _get_run_or_404(conn, run_id, system_id)
+        return _variant_run_out(conn, row)
+
+
+@router.get("/replay-variant-runs", response_model=List[ReplayVariantRunOut])
+def list_replay_variant_runs(
+    replay_set_id: Optional[int] = None,
+    component_id: Optional[str] = None,
+    limit: int = 20,
+    system_id: int = Depends(get_system_id),
+) -> List[ReplayVariantRunOut]:
+    limit = max(1, min(limit, 100))
+    where = [
+        "r.system_id = ?",
+        "EXISTS (SELECT 1 FROM replay_variants v WHERE v.replay_run_id = r.id)",
+    ]
+    params: List[Any] = [system_id]
+    if replay_set_id is not None:
+        where.append("r.replay_set_id = ?")
+        params.append(replay_set_id)
+    if component_id:
+        where.append("r.component_id = ?")
+        params.append(component_id)
+    params.append(limit)
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT r.* FROM replay_runs r
+            WHERE {' AND '.join(where)}
+            ORDER BY r.id DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return [_variant_run_out(conn, row, include_cases=False) for row in rows]
+
+
+@router.get("/replay-variant-runs/{run_id}", response_model=ReplayVariantRunOut)
+def get_replay_variant_run(
+    run_id: int,
+    system_id: int = Depends(get_system_id),
+) -> ReplayVariantRunOut:
+    with get_conn() as conn:
+        row = _get_variant_run_or_404(conn, run_id, system_id)
+        return _variant_run_out(conn, row)
+
+
+@router.get(
+    "/replay-variant-runs/{run_id}/variants/{variant_id}/experiment-payload",
+    response_model=ReplayVariantExperimentPayloadOut,
+)
+def get_replay_variant_experiment_payload(
+    run_id: int,
+    variant_id: int,
+    system_id: int = Depends(get_system_id),
+) -> ReplayVariantExperimentPayloadOut:
+    """Shape a variant's patch for ``POST /experiments`` prefill (Issue #245).
+    API shape only: this never creates an experiment or auto-adopts
+    anything -- the Workbench UI wiring (drag this into the experiment
+    creation form) is Phase D."""
+    with get_conn() as conn:
+        run_row = _get_variant_run_or_404(conn, run_id, system_id)
+        variant_row = conn.execute(
+            """
+            SELECT * FROM replay_variants
+            WHERE id = ? AND replay_run_id = ? AND system_id = ?
+            """,
+            (variant_id, run_id, system_id),
+        ).fetchone()
+        if variant_row is None:
+            raise HTTPException(status_code=404, detail="Replay variant not found")
+        if not variant_row["patch_text"]:
+            raise HTTPException(
+                status_code=422,
+                detail="This variant has no patch to promote (baseline has none)",
+            )
+        return ReplayVariantExperimentPayloadOut(
+            label=variant_row["label"] or variant_row["variant_key"],
+            patch_text=variant_row["patch_text"],
+            patch_hash=variant_row["patch_hash"],
+            source="replay_variant",
+            risk_note=(
+                f"Promoted from replay-variant-run {run_id}, variant "
+                f"{variant_row['variant_key']} (component "
+                f"'{run_row['component_id']}', snapshot {run_row['snapshot_id']})."
+            ),
+            origin={
+                "replay_variant_run_id": run_id,
+                "replay_variant_id": variant_id,
+                "variant_key": variant_row["variant_key"],
+                "component_id": run_row["component_id"],
+                "snapshot_id": run_row["snapshot_id"],
+                "commit_sha": run_row["commit_sha"],
+                "apply_status": variant_row["apply_status"],
+            },
+        )
+
+
+# --- LLM candidate drafts (Issue #245) ---------------------------------------
+
+
+def _draft_out(draft_row, run_row) -> ReplayVariantDraftOut:
+    return ReplayVariantDraftOut(
+        id=draft_row["id"],
+        system_id=draft_row["system_id"],
+        replay_set_id=draft_row["replay_set_id"],
+        component_id=draft_row["component_id"],
+        trace_id=draft_row["trace_id"],
+        objective=draft_row["objective"],
+        snapshot_id=draft_row["snapshot_id"],
+        symbol_path=draft_row["symbol_path"],
+        symbol_qualified_name=draft_row["symbol_qualified_name"],
+        generated_code=draft_row["generated_code"] or "",
+        patch_text=draft_row["patch_text"] or "",
+        patch_hash=draft_row["patch_hash"] or "",
+        notes=draft_row["notes"] or "",
+        status=draft_row["status"],
+        error=draft_row["error"],
+        provider=run_row["provider"] if run_row is not None else None,
+        model=run_row["model"] if run_row is not None else None,
+        prompt_version=run_row["prompt_version"] if run_row is not None else None,
+        schema_version=run_row["schema_version"] if run_row is not None else None,
+        decision_method=run_row["decision_method"] if run_row is not None else None,
+        is_mock=bool(run_row["is_mock"]) if run_row is not None else False,
+        created_at=draft_row["created_at"],
+    )
+
+
+@router.post(
+    "/replay-variant-drafts", response_model=ReplayVariantDraftOut, status_code=201
+)
+def create_replay_variant_draft(
+    payload: ReplayVariantDraftCreate,
+    system_id: int = Depends(get_system_id),
+) -> ReplayVariantDraftOut:
+    """Connects the existing Generate & Evaluate flow as a "candidate draft"
+    source (Issue #245): runs the SAME candidate-generation reasoning-model
+    prompt ``POST /generation-runs`` uses, then deterministically turns the
+    result into a unified diff against the resolved symbol's pinned-snapshot
+    source. Does NOT execute anything -- the caller runs the returned
+    ``patch_text`` as a variant via ``POST /replay-variant-runs``. Fails
+    closed on any LLM configuration/call/parse failure (Principle 6): no
+    heuristic fallback, and the failed attempt is still persisted (Principle
+    7) so it is auditable."""
+    now = time.time()
+    with get_conn() as conn:
+        replay_set = _get_set_or_404(conn, payload.replay_set_id, system_id)
+        component_id = replay_set["component_id"]
+        snapshot = _resolve_snapshot(conn, system_id, payload.snapshot_id)
+        symbol = _resolve_component_symbol(
+            conn, system_id, snapshot["id"], component_id
+        )
+        trace = conn.execute(
+            """
+            SELECT trace_id, component_id, input_json, output_text, error
+            FROM traces
+            WHERE system_id = ? AND component_id = ? AND trace_id = ?
+            """,
+            (system_id, component_id, payload.trace_id),
+        ).fetchone()
+        if trace is None:
+            raise HTTPException(status_code=404, detail="trace not found")
+        system_profile = conn.execute(
+            "SELECT * FROM system_profile WHERE system_id = ?", (system_id,)
+        ).fetchone()
+        component_profile = conn.execute(
+            """
+            SELECT * FROM component_profiles
+            WHERE system_id = ? AND component_id = ?
+            """,
+            (system_id, component_id),
+        ).fetchone()
+        criteria = conn.execute(
+            """
+            SELECT name, description, criterion_type, expected_value, weight
+            FROM evaluation_criteria
+            WHERE system_id = ? AND component_id = ? AND enabled = 1
+            ORDER BY id
+            """,
+            (system_id, component_id),
+        ).fetchall()
+        trace_context = {
+            "trace": dict(trace),
+            "system_profile": dict(system_profile) if system_profile else {},
+            "component_profile": dict(component_profile) if component_profile else {},
+            "criteria": [dict(row) for row in criteria],
+        }
+        repo_path = snapshot["repo_path"]
+        commit_sha = snapshot["commit_sha"]
+        snapshot_id = snapshot["id"]
+
+    config = LLMConfig.from_env()
+    client = get_llm_client()
+    draft = generate_variant_draft(
+        client,
+        config,
+        repo_path=repo_path,
+        commit_sha=commit_sha,
+        symbol_path=symbol["path"],
+        symbol_qualified_name=symbol["qualified_name"],
+        start_line=symbol["start_line"],
+        end_line=symbol["end_line"],
+        trace_context=trace_context,
+        objective=payload.objective,
+        worktree_base=os.path.join(replay_workspace_base(), "drafts"),
+    )
+    completed_at = time.time()
+    run_status = "completed" if draft.status == DRAFT_PROPOSED else "failed"
+
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO intelligence_runs
+                (system_id, snapshot_id, run_type, provider, model,
+                 prompt_version, schema_version, decision_method,
+                 status, error_details, is_mock, started_at, completed_at)
+            VALUES (?, ?, 'replay_variant_draft', ?, ?, ?, ?, 'reasoning_llm',
+                    ?, ?, ?, ?, ?)
+            """,
+            (
+                system_id,
+                snapshot_id,
+                draft.provider,
+                draft.model,
+                DRAFT_PROMPT_VERSION,
+                DRAFT_SCHEMA_VERSION,
+                run_status,
+                draft.error,
+                1 if draft.is_mock else 0,
+                now,
+                completed_at,
+            ),
+        )
+        intelligence_run_id = cur.lastrowid
+        cur = conn.execute(
+            """
+            INSERT INTO replay_variant_drafts
+                (system_id, intelligence_run_id, replay_set_id, component_id,
+                 trace_id, objective, snapshot_id, symbol_path,
+                 symbol_qualified_name, generated_code, patch_text,
+                 patch_hash, notes, status, error, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                system_id,
+                intelligence_run_id,
+                replay_set["id"],
+                component_id,
+                payload.trace_id,
+                payload.objective,
+                snapshot_id,
+                symbol["path"],
+                symbol["qualified_name"],
+                draft.generated_code,
+                draft.patch_text,
+                draft.patch_hash,
+                draft.notes,
+                draft.status,
+                draft.error,
+                completed_at,
+            ),
+        )
+        draft_id = cur.lastrowid
+        draft_row = conn.execute(
+            "SELECT * FROM replay_variant_drafts WHERE id = ? AND system_id = ?",
+            (draft_id, system_id),
+        ).fetchone()
+        run_row = conn.execute(
+            "SELECT * FROM intelligence_runs WHERE id = ? AND system_id = ?",
+            (intelligence_run_id, system_id),
+        ).fetchone()
+        return _draft_out(draft_row, run_row)
+
+
+def _get_draft_with_run(conn, draft_id: int, system_id: int):
+    draft_row = conn.execute(
+        "SELECT * FROM replay_variant_drafts WHERE id = ? AND system_id = ?",
+        (draft_id, system_id),
+    ).fetchone()
+    if draft_row is None:
+        raise HTTPException(status_code=404, detail="Replay variant draft not found")
+    run_row = conn.execute(
+        "SELECT * FROM intelligence_runs WHERE id = ? AND system_id = ?",
+        (draft_row["intelligence_run_id"], system_id),
+    ).fetchone()
+    return draft_row, run_row
+
+
+@router.get("/replay-variant-drafts", response_model=List[ReplayVariantDraftOut])
+def list_replay_variant_drafts(
+    replay_set_id: Optional[int] = None,
+    trace_id: Optional[str] = None,
+    limit: int = 20,
+    system_id: int = Depends(get_system_id),
+) -> List[ReplayVariantDraftOut]:
+    limit = max(1, min(limit, 100))
+    where = ["system_id = ?"]
+    params: List[Any] = [system_id]
+    if replay_set_id is not None:
+        where.append("replay_set_id = ?")
+        params.append(replay_set_id)
+    if trace_id:
+        where.append("trace_id = ?")
+        params.append(trace_id)
+    params.append(limit)
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM replay_variant_drafts
+            WHERE {' AND '.join(where)}
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return [
+            _draft_out(*_get_draft_with_run(conn, row["id"], system_id))
+            for row in rows
+        ]
+
+
+@router.get("/replay-variant-drafts/{draft_id}", response_model=ReplayVariantDraftOut)
+def get_replay_variant_draft(
+    draft_id: int,
+    system_id: int = Depends(get_system_id),
+) -> ReplayVariantDraftOut:
+    with get_conn() as conn:
+        return _draft_out(*_get_draft_with_run(conn, draft_id, system_id))

@@ -57,6 +57,21 @@ imports probe-agent server code. Contract:
     ``duration_ms``. A per-case try/except guarantees one case's exception
     never kills the batch; cases run in payload order in one process and no
     global state is mutated between cases.
+  * Version 2 (Issue #245 Phase C) additively records a ``structured_output``
+    key on ``ok`` cases: a best-effort JSON-native form of the raw return
+    value, computed as ``json.loads(json.dumps(output, sort_keys=True))``
+    (no ``"__probe__"`` encoding — that domain stays repr-only). The key is
+    OMITTED entirely (not set to ``None``) when the value cannot be
+    serialized this way (``TypeError`` — e.g. a custom object, a ``set``),
+    so callers must check for key presence, not truthiness, to tell "no
+    structured form" apart from a legitimately ``null``/``0``/``false``
+    structured value. Non-standard JSON tokens (``NaN`` / ``Infinity`` /
+    ``-Infinity``) round-trip through Python's ``json`` module by default,
+    so a NaN-bearing output still gets a ``structured_output`` whose nested
+    NaN a caller's field-equality rules can classify as "never equal" —
+    Phase B's repr-only comparison is unaffected either way (Phase B never
+    reads this key). This is purely additive: every Phase B result field
+    keeps its exact meaning and shape.
   * Target resolution failure (import error, syntax error, missing symbol,
     non-callable) is a RUN-level failure: the result file carries
     ``target_error`` / ``target_traceback`` and no cases are executed.
@@ -71,7 +86,7 @@ import sys
 import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
-REPLAY_HARNESS_VERSION = "1"
+REPLAY_HARNESS_VERSION = "2"
 
 HARNESS_FILENAME = "harness.py"
 PAYLOAD_FILENAME = "payload.json"
@@ -80,7 +95,7 @@ RESULT_FILENAME = "result.json"
 # Timeout for the legacy candidate-generation path (unchanged: 5 seconds).
 CANDIDATE_TIMEOUT_SECONDS = 5
 
-HARNESS_SCRIPT = r'''"""probe-agent replay harness (standalone; version 1).
+HARNESS_SCRIPT = r'''"""probe-agent replay harness (standalone; version 2).
 
 Reads a JSON payload from argv[1] and writes a JSON result to argv[2].
 stdout/stderr are diagnostics only. See app/replay_harness.py for the
@@ -95,7 +110,7 @@ import sys
 import time
 import traceback
 
-HARNESS_VERSION = "1"
+HARNESS_VERSION = "2"
 MARKER = "__probe__"
 
 # Same restricted builtins namespace the generation endpoint has always used
@@ -170,6 +185,28 @@ def _error_first_line(exc):
         return "%s: %s" % (type(exc).__name__, exc)
     except Exception:
         return type(exc).__name__
+
+
+def _structured_output(value):
+    """Best-effort JSON-native form of ``value`` (Issue #245 Phase C).
+
+    ``(structured_value, ok)``: ``ok`` is False when ``value`` cannot be
+    round-tripped through ``json.dumps`` / ``json.loads`` (e.g. a custom
+    object, a ``set``) -- callers must then omit the ``structured_output``
+    key entirely rather than store a placeholder. ``sort_keys=True`` keeps
+    the serialization deterministic; ``allow_nan`` stays at its default
+    (True) so a NaN nested in the output still round-trips into a real
+    Python NaN a caller's field-equality rules can classify.
+    """
+    try:
+        text = json.dumps(value, sort_keys=True)
+    except (TypeError, ValueError):
+        return None, False
+    try:
+        decoded = json.loads(text)
+    except ValueError:
+        return None, False
+    return decoded, True
 
 
 def _resolve_target(target, workspace_root):
@@ -273,7 +310,7 @@ def _run_case(func, case):
             "duration_ms": duration_ms,
         }
     duration_ms = (time.perf_counter() - start) * 1000.0
-    return {
+    result = {
         "status": "ok",
         "skip_reason": None,
         "output": _safe_repr(output),
@@ -281,6 +318,10 @@ def _run_case(func, case):
         "traceback": None,
         "duration_ms": duration_ms,
     }
+    structured, structurable = _structured_output(output)
+    if structurable:
+        result["structured_output"] = structured
+    return result
 
 
 def main():

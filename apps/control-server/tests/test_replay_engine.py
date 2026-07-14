@@ -339,7 +339,7 @@ def test_harness_symbol_target_resolves_intra_repo_imports(
         cwd=harness_module_dir,
     )
     assert result["target_error"] is None
-    assert result["harness_version"] == "1"
+    assert result["harness_version"] == "2"
     case = result["cases"][0]
     assert case["status"] == "ok"
     assert case["output"] == "'class-a'"
@@ -600,7 +600,7 @@ def test_replay_run_classification_matrix(admin_client, replay_repo, db_file):
     assert run["symbol_qualified_name"] == "classify"
     assert len(run["trace_set_hash"]) == 64
     assert run["approval_id"] == approval["id"]
-    assert run["sandbox_config"]["harness_version"] == "1"
+    assert run["sandbox_config"]["harness_version"] == "2"
     assert run["sandbox_config"]["network"] is False
     assert run["sandbox_config"]["timeout_seconds"] == 60
     assert "PROBE_ENABLED" in run["sandbox_config"]["env_keys"]

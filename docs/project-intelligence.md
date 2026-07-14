@@ -1849,6 +1849,85 @@ Phase B に reasoning run は存在しない — すべて決定的な有限集�
   オンライン依存インストール、async 関数の replay、構造化 output 比較
   （比較は repr のみ）。
 
+### Phase C 実装状態（#245: オフライン shadow シミュレーション）
+
+unified diff patch で表現された候補実装を、baseline と同一の Replay Set・
+同一 sandbox 条件で再実行し、per-trace／集計の差分マトリクスを返す。記録上
+error だった trace も候補に対して実行するため「候補は失敗入力を救えるか」が
+答えられる（live SDK shadow の `decorator.py` の
+`if run_shadow and raised is None` 非対称を**オフライン側で**解消する。SDK
+自体は変更しない — 範囲外）。Phase C の決定的判定はすべて有限集合（Principle
+6）。
+
+- **共有比較ライブラリ（`app/comparison.py`）**: #150 の `_field_equal` /
+  `_ABSENT` を `trace_analyzer.py` から抽出し、`field_equal` / `value_equal` /
+  `diff_fields` として一本化（欠落キー vs null は不一致、二重欠落は一致、NaN
+  は常に不一致、それ以外は `==`）。`trace_analyzer.py` はこれを import する
+  だけになり、`tests/test_shadow_diff.py`（#150）は無変更で通る。replay の
+  baseline 出力 vs candidate 出力のフィールド比較も同じ規約を再利用する。
+- **variant 概念**: 1 回の variant run は baseline（patch なし）+ 1..N の patch
+  variant を、**それぞれ独立した worktree** で同一 Replay Set・同一 sandbox
+  設定で実行する（実行順序が結果に影響しない、#26 と同じ規約）。patch 適用は
+  `experiment_runner._apply_patch` の `git apply --check` → `git apply` 規約を
+  再利用し、`replay_runner.execute_harness` に `patch_text` を渡す形で
+  worktree 生成後・harness 書き込み前に適用。適用失敗は
+  `status='invalid_patch'` で harness を実行せずに返り、その variant だけが
+  `apply_status='invalid_patch'` として記録される（baseline・他 variant は
+  一切影響を受けない）。patch_hash（sha256）を監査に残す。
+- **harness v2（`REPLAY_HARNESS_VERSION="2"`）**: `ok` case に additive で
+  `structured_output` を付与する — `json.loads(json.dumps(output,
+  sort_keys=True))` による best-effort な JSON ネイティブ形（`"__probe__"`
+  エンコードは使わない）。JSON 化できない値（set・カスタムオブジェクト等）は
+  **キー自体を省略**（None を入れない）ので、呼び出し側はキーの有無で「構造化
+  形なし」と「正当な null/0/false」を区別する。Phase B は本キーを読まないので
+  挙動は不変。
+- **決定的な case 分類（有限 7 要素）**: baseline REPLAY 出力 vs candidate
+  REPLAY 出力を比較する（記録済み production トレースではなく、同じ run 内で
+  無改変スナップショットを再実行した baseline replay）。`match`（両成功・出力
+  一致）/ `diff`（両成功・出力相違）/ `candidate_error`（baseline 成功・
+  candidate 例外）/ `error_to_success`（baseline 例外・candidate 成功 = 救済）
+  / `error_to_same_error` / `error_to_different_error`（両例外・first line の
+  異同）/ `skipped`（server 側 skip または harness skip）。`comparison_mode`
+  は `match`/`diff` のみで意味を持つ有限集合: `structured`（両側に
+  `structured_output` あり。dict は top-level キーの和集合で `diff_fields`、
+  非 dict は `value_equal`）/ `repr`（片側に構造化形なし → Phase B の repr
+  文字列一致にフォールバック）。server 側 skip は baseline と全 variant で同一
+  の `harness_cases` を実行するため、両側で同一に skip される。
+- **集計**: variant ごとに各 case_status の件数 + 例示 trace id（`max_examples`
+  規約を共有）+ 平均 `duration_delta_ms`（candidate − baseline）。
+- **LLM candidate 下書き（`app/replay_draft.py`）**: 既存 Generate & Evaluate
+  の候補生成プロンプトを「candidate draft」ソースとして接続する。「候補コード
+  はどうあるべきか」は reasoning model のみ（`LLM_PROVIDER=mock` は
+  generation.py 同様に許容し、`is_mock=true` を可視化。LLM 設定/呼び出し/
+  parse 失敗は draft を fail-closed にする — heuristic fallback なし、Principle
+  6）。「そのコードをどう diff にするか」は決定的な構造的テキスト差し込み
+  （`code_symbols` の `[start_line, end_line]` を生成関数本体で置換し、
+  一時 worktree で `git diff` を取る — 手書き diff 形式ではない）。provenance
+  は共有の `intelligence_runs`（provider/model/prompt_version/schema_version/
+  decision_method/is_mock）に記録し、決定的な raw 結果（各 case の出力・diff・
+  集計）とは別テーブルに分離する。draft は何も実行しない — 返した
+  `patch_text` を呼び出し側が variant として実行する。
+- **Experiment 昇格（API のみ）**: `GET /replay-variant-runs/{id}/variants/
+  {variant_id}/experiment-payload` が variant の patch を既存 `POST
+  /experiments` の variant prefill 形で返す（experiment を自動作成・自動採用は
+  しない。UI 導線は Phase D）。
+- **テーブル（System-scoped、additive、cascade FK）**: `replay_variants`
+  （baseline + variant 行、apply_status/patch_hash/cleanup 状態）、
+  `replay_variant_case_results`（上記有限分類の per-trace 行、field_diffs_json /
+  comparison_mode / duration_delta_ms）、`replay_variant_drafts`（LLM 下書きの
+  結果、provenance は `intelligence_run_id` 経由）。Phase B の
+  `replay_case_results`（baseline vs 記録出力）はそのまま残り、variant 側は
+  baseline replay vs candidate replay を持つ。
+- **API**: `POST /replay-variant-runs`（baseline + variants を同時実行、Phase B
+  の承認ゲート 403・シンボル解決 409 を再利用）、`GET /replay-variant-runs`
+  /`/{id}`、`GET .../variants/{variant_id}/experiment-payload`、`POST
+  /replay-variant-drafts`（LLM 下書き、fail-closed）、`GET
+  /replay-variant-drafts` /`/{id}`。Phase B の `POST /replay-runs`（baseline
+  のみ）は無変更。
+- **非目標（Phase C）**: 意味的同等性・許容誤差比較（決定的等値のみ）、自動
+  採用・rollout・replace、live shadow SDK 変更、Workbench UI（Phase D）、分散
+  実行。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。

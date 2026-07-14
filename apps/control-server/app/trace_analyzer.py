@@ -15,6 +15,13 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+# _field_equal / _ABSENT used to be defined in this module (Issue #150). They
+# were extracted into app/comparison.py for Issue #245 (Replay Phase C),
+# which needs the identical missing-key/null/NaN rules for baseline-vs-
+# candidate replay comparison. Re-imported under their original names so the
+# rest of this module is unchanged.
+from .comparison import ABSENT as _ABSENT, field_equal as _field_equal
+
 _SEGMENT_RE = re.compile(r"\.([A-Za-z0-9_\-]+)|\[([0-9]+)\]|\[(\*)\]")
 _PHASES = ("input", "output", "shadow_current", "shadow_candidate")
 _MISSING = object()
@@ -354,31 +361,6 @@ def run_analyzer(conn, system_id: int, spec: AnalyzerSpec) -> Dict[str, Any]:
             f"output {len(encoded.encode('utf-8'))} bytes exceeds limit {max_output_bytes()}"
         )
     return result
-
-
-_ABSENT = object()
-
-
-def _field_equal(a: Any, b: Any) -> bool:
-    """Deterministic field equality for shadow diffing (Issue #150).
-
-    Rules (documented + tested):
-      * a missing key and an explicit ``null`` are NOT equal (presence differs);
-      * two missing keys are equal;
-      * NaN is never equal to anything (including NaN);
-      * otherwise standard ``==`` on the JSON-decoded values.
-    """
-    a_present = a is not _ABSENT
-    b_present = b is not _ABSENT
-    if a_present != b_present:
-        return False
-    if not a_present:
-        return True
-    if isinstance(a, float) and a != a:  # NaN
-        return False
-    if isinstance(b, float) and b != b:
-        return False
-    return a == b
 
 
 def _compare_query(system_id: int, spec: AnalyzerSpec) -> Tuple[str, list]:

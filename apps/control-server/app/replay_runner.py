@@ -37,7 +37,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from .experiment_runner import _load_artifact
+from .experiment_runner import _apply_patch, _load_artifact
 from .patch_generator import cleanup_worktree, create_worktree
 from .replay_harness import (
     PAYLOAD_FILENAME,
@@ -245,7 +245,7 @@ def build_case_plans(
 
 @dataclass
 class ReplayExecution:
-    status: str = "failed"  # 'completed' | 'failed'
+    status: str = "failed"  # 'completed' | 'failed' | 'invalid_patch'
     error: Optional[str] = None
     workspace_path: Optional[str] = None
     cleanup_state: str = "not_attempted"
@@ -286,13 +286,31 @@ def execute_harness(
     target: Dict[str, Any],
     harness_cases: List[Dict[str, Any]],
     timeout_seconds: int,
+    patch_text: Optional[str] = None,
 ) -> ReplayExecution:
-    """Run the harness against a fresh worktree; always clean the worktree up."""
+    """Run the harness against a fresh worktree; always clean the worktree up.
+
+    ``patch_text`` (Issue #245 Phase C) is applied to the worktree AFTER
+    ``create_worktree`` and BEFORE the harness is written, via the same
+    ``git apply --check`` -> ``git apply`` convention
+    ``experiment_runner._apply_patch`` uses. A patch that fails to apply
+    never runs the harness: the execution is reported ``status='invalid_patch'``
+    with the apply error, so one variant's bad patch can never affect the
+    baseline or any other variant (each gets its own independent worktree and
+    its own ``execute_harness`` call). Passing no ``patch_text`` (the
+    default) reproduces Phase B's baseline-only behavior exactly.
+    """
     execution = ReplayExecution()
     workspace: Optional[str] = None
     try:
         workspace = create_worktree(repo_path, commit_sha, run_workspace_base)
         execution.workspace_path = workspace
+        if patch_text:
+            apply_error = _apply_patch(workspace, patch_text)
+            if apply_error:
+                execution.status = "invalid_patch"
+                execution.error = apply_error
+                return execution
         harness_dir = os.path.join(workspace, HARNESS_DIRNAME)
         write_harness_files(harness_dir, target, harness_cases)
         env = build_replay_env(workspace)

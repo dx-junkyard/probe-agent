@@ -2025,6 +2025,139 @@ CREATE INDEX IF NOT EXISTS idx_replay_case_results_run
     ON replay_case_results (replay_run_id, position);
 CREATE INDEX IF NOT EXISTS idx_replay_case_results_system
     ON replay_case_results (system_id, replay_run_id);
+
+-- Replay variants (Issue #242 Phase C / #245). A "variant replay run" is a
+-- normal Phase B replay_runs row (baseline: same snapshot/symbol/approval-
+-- gate/trace_set_hash resolution, same replay_case_results baseline-vs-
+-- recorded classification) that ALSO gets one or more patched variants
+-- replayed in the SAME run against the SAME Replay Set + sandbox config.
+-- replay_variants hangs off that replay_runs row via replay_run_id; the
+-- baseline itself gets a row too (variant_key='baseline', is_baseline=1,
+-- patch_text='', apply_status='not_applicable') purely so one query lists
+-- everything the run covers (mirrors experiment_variants' own baseline row).
+-- variant_key is finite ('baseline' | 'variant-N'); source is finite
+-- ('manual' | 'pasted' | 'llm_draft'); apply_status is finite
+-- ('applied' | 'invalid_patch' | 'not_applicable'). Each variant is applied
+-- and executed in its OWN independent worktree (workspace_path/cleanup_*
+-- below), so one variant's bad patch or timeout never touches the baseline
+-- or any other variant -- see app/replay_runner.py's execute_harness
+-- patch_text parameter and app/replay_variants.py's classification.
+CREATE TABLE IF NOT EXISTS replay_variants (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id      INTEGER NOT NULL,
+    replay_run_id  INTEGER NOT NULL,
+    variant_key    TEXT NOT NULL,
+    label          TEXT NOT NULL DEFAULT '',
+    is_baseline    INTEGER NOT NULL DEFAULT 0,
+    patch_text     TEXT NOT NULL DEFAULT '',
+    patch_hash     TEXT NOT NULL,
+    source         TEXT NOT NULL DEFAULT 'manual',
+    apply_status   TEXT NOT NULL DEFAULT 'not_applicable',
+    apply_error    TEXT,
+    status         TEXT NOT NULL DEFAULT 'running',  -- 'running'|'completed'|'failed'
+    error          TEXT,
+    workspace_path TEXT,
+    cleanup_state  TEXT NOT NULL DEFAULT 'not_attempted',
+    cleanup_error  TEXT,
+    created_at     REAL NOT NULL,
+    started_at     REAL,
+    completed_at   REAL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (replay_run_id) REFERENCES replay_runs (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_replay_variants_run
+    ON replay_variants (replay_run_id, id);
+CREATE INDEX IF NOT EXISTS idx_replay_variants_system
+    ON replay_variants (system_id, replay_run_id);
+
+-- Per-trace baseline-replay-vs-candidate-replay comparison for one variant
+-- (Issue #245). Keep Phase B's replay_case_results as the baseline-vs-
+-- RECORDED record; this table holds baseline-REPLAY-vs-candidate instead,
+-- so it also carries replay_run_id (joinable back to replay_case_results by
+-- replay_run_id + trace_id + position for the originally-recorded output/
+-- error, without duplicating those columns here).
+--
+-- case_status is the finite 7-member set documented in
+-- app/replay_variants.py's module docstring (match / diff / candidate_error
+-- / error_to_success / error_to_same_error / error_to_different_error /
+-- skipped). comparison_mode is finite ('structured' | 'repr') and NULL
+-- when the classification did not depend on an output-equality mode
+-- (candidate_error / error_to_* / skipped). field_diffs_json is only
+-- populated for a 'diff' produced in 'structured' mode (changed top-level
+-- field names). recorded_error here is the BASELINE REPLAY's own error
+-- first line (this run's baseline execution, not the historical production
+-- trace -- that stays on replay_case_results.recorded_error, reachable via
+-- the replay_run_id + trace_id join above); candidate_error is the
+-- candidate's error first line. duration_delta_ms is candidate duration
+-- minus baseline duration for this run.
+CREATE TABLE IF NOT EXISTS replay_variant_case_results (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    replay_variant_id INTEGER NOT NULL,
+    replay_run_id     INTEGER NOT NULL,
+    trace_id          TEXT NOT NULL,
+    position          INTEGER NOT NULL,
+    case_status       TEXT NOT NULL,
+    comparison_mode   TEXT,
+    baseline_output   TEXT,
+    candidate_output  TEXT,
+    candidate_error   TEXT,
+    recorded_error    TEXT,
+    duration_ms       REAL,
+    duration_delta_ms REAL,
+    field_diffs_json  TEXT,
+    output_truncated  INTEGER NOT NULL DEFAULT 0,
+    created_at        REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (replay_variant_id) REFERENCES replay_variants (id) ON DELETE CASCADE,
+    FOREIGN KEY (replay_run_id) REFERENCES replay_runs (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_replay_variant_case_results_variant
+    ON replay_variant_case_results (replay_variant_id, position);
+CREATE INDEX IF NOT EXISTS idx_replay_variant_case_results_system
+    ON replay_variant_case_results (system_id, replay_variant_id);
+
+-- LLM candidate-draft provenance for Replay variants (Issue #245). Mirrors
+-- the established intelligence_runs + per-feature-draft-table pattern used
+-- throughout #23-#26 (e.g. system_profile_drafts): the audit record
+-- (provider/model/prompt_version/schema_version/decision_method/is_mock/
+-- status/error/timestamps) lives in intelligence_runs
+-- (run_type='replay_variant_draft'); this table holds only the draft's own
+-- content (deterministically spliced patch_text, generated_code, and the
+-- context it was drafted from), kept separate from raw deterministic replay
+-- results per the CLAUDE.md storage-separation rule. A draft is proposed
+-- standalone (no replay_run_id -- it has not been run as a variant yet);
+-- the caller copies patch_text into POST /replay-variant-runs to try it.
+CREATE TABLE IF NOT EXISTS replay_variant_drafts (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    intelligence_run_id   INTEGER NOT NULL,
+    replay_set_id         INTEGER NOT NULL,
+    component_id          TEXT NOT NULL,
+    trace_id              TEXT NOT NULL,
+    objective             TEXT NOT NULL DEFAULT '',
+    snapshot_id           INTEGER NOT NULL,
+    symbol_path           TEXT NOT NULL,
+    symbol_qualified_name TEXT NOT NULL,
+    generated_code        TEXT NOT NULL DEFAULT '',
+    patch_text            TEXT NOT NULL DEFAULT '',
+    patch_hash            TEXT NOT NULL DEFAULT '',
+    notes                 TEXT NOT NULL DEFAULT '',
+    status                TEXT NOT NULL DEFAULT 'proposed',  -- 'proposed'|'failed'
+    error                 TEXT,
+    created_at            REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE CASCADE,
+    FOREIGN KEY (replay_set_id) REFERENCES replay_sets (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_replay_variant_drafts_system
+    ON replay_variant_drafts (system_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_replay_variant_drafts_set
+    ON replay_variant_drafts (system_id, replay_set_id, id DESC);
 """
 
 
