@@ -204,6 +204,18 @@ The dashboard should support:
   capability-context links on that page. Connect SDK links forward to
   `/setup-guide` (which already links back), closing the one-way link.
   All of the above are deterministic presence/routing checks — no heuristics.
+- Phase-based prerequisite guide (Issue #241): `PrerequisiteGuide`
+  (`components/prerequisite-guide.tsx`) answers "why is this empty / where do
+  I go next" from `GET /system-state` alone — it shows the current
+  `user_phase` (via `USER_PHASE_LABELS`) and the phase-scoped `primary_item`'s
+  server copy + `systemStateTarget` CTA, and renders nothing at the terminal
+  `diagnosis` phase (so it disappears as the phase advances). Used in
+  Overview's zero-component state, Feature Map's empty features state, and the
+  Probe Planner generate dialog when `phases`'s `preparation` is not
+  complete. The Probe Planner use is a steer, not a block: the manual
+  feature-id escape hatch and the generate API are unchanged. Setup Guide now
+  also links back to Connect SDK (`setup-guide-connect-sdk-link`), making that
+  pair bidirectional. Never derive phase or state copy client-side.
 
 - GitHub publish workflow (Issue #216, `pages/github.tsx`, nav item
   "GitHub"): App status card (`GET /github/app-status`; shows a setup hint

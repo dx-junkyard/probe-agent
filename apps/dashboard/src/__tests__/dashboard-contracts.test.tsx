@@ -6906,3 +6906,124 @@ describe("Simulation Workbench (Issue #246)", () => {
     expect(screen.getByText("run #8 · replay-regression-scaffold-v1")).toBeInTheDocument();
   });
 });
+
+// ── Phase-based prerequisite guide (Issue #241) ─────────────────────
+
+describe("PrerequisiteGuide (Issue #241)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const guidePrimaryItem = {
+    state_id: "repository.configuration.missing",
+    state_group: "repository",
+    severity: "warning",
+    status: "missing",
+    user_action_kind: "configure",
+    intervention_timing: "now",
+    subject: "リポジトリ設定",
+    summary: "対象リポジトリが未設定です。",
+    detail: "対象リポジトリが未設定です。",
+    impact: "",
+    remediation: "Repository タブでリポジトリを設定してください。",
+    evidence: {},
+    target_ui: { route: "/repository", anchor: "repo-config", action_label: "リポジトリを設定" },
+    related_checks: [],
+    related_pipeline_steps: [],
+    source: "system_state",
+    dedupe_key: "repository.configuration",
+    scope: "global",
+    decision_method: "deterministic",
+    phase: "setup",
+  };
+
+  const stateWith = (userPhase: string, primaryItem: unknown = guidePrimaryItem) => ({
+    system_id: 1,
+    generated_at: 1,
+    overall_severity: "warning",
+    severity_counts: {},
+    items: [],
+    primary_item: primaryItem,
+    notification_items: [],
+    page_items: {},
+    user_phase: userPhase,
+    phases: [
+      { phase: "setup", complete: userPhase !== "setup" },
+      { phase: "preparation", complete: userPhase === "diagnosis" },
+      { phase: "diagnosis", complete: false },
+    ],
+  });
+
+  test("renders phase + next-step from system-state during setup", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-state" ? Promise.resolve(stateWith("setup")) : Promise.resolve(null),
+    );
+    const { PrerequisiteGuide } = await import("@/components/prerequisite-guide");
+    render(<PrerequisiteGuide />, { wrapper: createWrapper() });
+
+    const guide = await screen.findByTestId("prerequisite-guide");
+    expect(guide.getAttribute("data-current-phase")).toBe("setup");
+    // Phase name and the server StateItem copy are shown verbatim.
+    expect(screen.getByTestId("prerequisite-guide-phase").textContent).toContain("必要最低限の設定");
+    expect(screen.getByText("対象リポジトリが未設定です。")).toBeTruthy();
+    expect(screen.getByText("Repository タブでリポジトリを設定してください。")).toBeTruthy();
+    // CTA carries the server-supplied action label.
+    expect(screen.getByTestId("prerequisite-guide-cta").textContent).toContain("リポジトリを設定");
+  });
+
+  test("disappears at the terminal diagnosis phase", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-state" ? Promise.resolve(stateWith("diagnosis", null)) : Promise.resolve(null),
+    );
+    const { PrerequisiteGuide } = await import("@/components/prerequisite-guide");
+    const { container } = render(<PrerequisiteGuide />, { wrapper: createWrapper() });
+
+    // Give the query a tick to resolve, then assert nothing rendered.
+    await waitFor(() => expect(mockApi.get).toHaveBeenCalledWith("/system-state"));
+    expect(screen.queryByTestId("prerequisite-guide")).not.toBeInTheDocument();
+    expect(container.textContent).toBe("");
+  });
+
+  test("CTA navigates to the StateItem target", async () => {
+    window.history.pushState({}, "", "/");
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-state" ? Promise.resolve(stateWith("setup")) : Promise.resolve(null),
+    );
+    const { PrerequisiteGuide } = await import("@/components/prerequisite-guide");
+    render(<PrerequisiteGuide />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByTestId("prerequisite-guide-cta"));
+    await waitFor(() => {
+      expect(window.location.pathname).toBe("/repository");
+    });
+  });
+
+  test("Probe Planner shows the gate in its generate dialog when preparation is incomplete", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-state") return Promise.resolve(stateWith("preparation"));
+      if (path === "/probe-plans") return Promise.resolve({ plans: [], is_mock: false });
+      return Promise.resolve(null);
+    });
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByText("Generate Plan"));
+    expect(await screen.findByTestId("planner-prerequisite-guide")).toBeInTheDocument();
+  });
+
+  test("Probe Planner hides the gate once preparation is complete", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-state") return Promise.resolve(stateWith("diagnosis", null));
+      if (path === "/probe-plans") return Promise.resolve({ plans: [], is_mock: false });
+      return Promise.resolve(null);
+    });
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByText("Generate Plan"));
+    // Dialog opened (feature label present) but no prerequisite gate.
+    expect(await screen.findByText("Feature")).toBeInTheDocument();
+    expect(screen.queryByTestId("planner-prerequisite-guide")).not.toBeInTheDocument();
+  });
+});

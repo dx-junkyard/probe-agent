@@ -396,6 +396,29 @@ pipeline step / stage の表示名、gap のタイトル/next-action、成功サ
   アクションはラベル一致で識別するため、フロントの `CREATE_ISSUE_ACTION`
   はカタログの `GAP_CREATE_ISSUE_ACTION` と一致させる。
 
+### フェーズ由来の前提ガイド（Issue #241）
+
+前提が満たされていない画面に「なぜ空か・次にどこで何をするか」を示す共通
+コンポーネント `PrerequisiteGuide`（`components/prerequisite-guide.tsx`）を
+追加した。データソースは `GET /system-state` のみ:
+
+- 現在フェーズ（`user_phase`）を `USER_PHASE_LABELS` で表示し、フェーズを
+  進めるための「次の一歩」はフェーズ抑制済みの `primary_item`（サーバー
+  計算の最上位 actionable 項目）の summary / remediation / target_ui を
+  そのまま消費する。クライアントはフェーズも状態文言も導出しない。
+- 終端フェーズ `diagnosis` では前提がすべて満たされるため何も描画しない
+  ——フェーズが進むと自動的に消える。
+- 配置: Overview の zero-state（コンポーネント 0 件かつ非 diagnosis）、
+  Feature Map の features 空状態、Probe Planner の生成ダイアログ（診断準備
+  未完了時）。Probe Planner のゲートは導線であり強制ブロックではない
+  （自由入力 feature id は既定折りたたみの escape hatch、プラン生成 API は
+  拒否しない）。強制が必要になった場合はサーバー側バリデーションとして
+  別途起票する。
+- Connect SDK ↔ Setup Guide は双方向リンク（`connect-sdk-setup-guide-link`
+  ／ `setup-guide-connect-sdk-link`）で相互遷移できる。
+- 表示分岐は `user_phase` ・ `phases[].complete` ・既存 API の有無
+  （component 件数 0、features 空 等）の決定論的判定のみ（Principle 6）。
+
 ## Next Actions
 
 > **撤去済み（Issue #238 → #239）**: 本節が説明していたトップレベルの

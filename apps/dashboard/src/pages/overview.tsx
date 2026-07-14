@@ -5,6 +5,7 @@ import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { SystemStateBanner } from "@/components/system-state";
+import { PrerequisiteGuide } from "@/components/prerequisite-guide";
 import { Boxes, Activity, Clock, FolderCog, Compass, Plug } from "lucide-react";
 import { formatTimestamp } from "@/lib/utils";
 
@@ -91,6 +92,12 @@ export default function OverviewPage() {
               {primaryOverviewItem && (
                 <SystemStateBanner item={primaryOverviewItem} testId="overview-primary-item" />
               )}
+              {/* Issue #241: phase-appropriate start guide for a System that
+                  has not reached the diagnosis phase yet. It renders nothing
+                  once every prerequisite is met (terminal phase), so the
+                  ordered fallback list below is what a fully-set-up System
+                  with no components still sees. */}
+              <PrerequisiteGuide testId="overview-prerequisite-guide" />
               <p className="text-sm text-muted-foreground text-center">
                 No components registered yet. Connect the SDK to start tracing.
               </p>

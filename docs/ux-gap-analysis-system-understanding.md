@@ -131,22 +131,28 @@ pipeline 全 complete かつ purpose 未定義のとき `Define System Purpose`
 
 ### 画面横断
 
-- **Overview が新規ユーザーの行き止まり**（`overview.tsx:71-74`）:
-  ログイン直後の画面に Repository / System Understanding / Connect SDK への
-  導線が一切ない。
-- **Probe Planner に上流ゲートがない**（`probe-planner.tsx:79-94, 372-383`）:
-  Feature Map 未生成時は自由入力の feature id でプラン生成でき、
-  System Purpose / capability / entrypoint と無関係なプランが作れてしまう。
-  意図された「capability 確認 → flow 選択 → plan 作成」順序の最大の抜け道。
+以下のうち Overview 行き止まり・Probe Planner 上流ゲート・Feature Map
+空状態・Connect SDK ↔ Setup Guide 双方向リンクは **Issue #241 で解消済み**
+（共通 `PrerequisiteGuide` コンポーネントと双方向リンク追加）。
+
+- **Overview が新規ユーザーの行き止まり**（`overview.tsx`）: →（#241）
+  コンポーネント 0 件かつ `user_phase != diagnosis` の場合に、フェーズに
+  応じた開始導線（`PrerequisiteGuide`）を表示する。既存の get-started 固定
+  リストは全前提充足後のフォールバックとして残す。
+- **Probe Planner に上流ゲートがない**（`probe-planner.tsx`）: →（#241）
+  診断準備（preparation）未完了時、生成ダイアログに `PrerequisiteGuide`
+  を表示する。自由入力 feature id は従来どおり明示的な escape hatch
+  （既定で折りたたみ）であり、プラン生成 API 自体は拒否しない
+  （後方互換、強制ブロックではない）。
 - **Capability Map の詳細パネル内 gap リンクが `?capability=` を失う**
   （`capability-map.tsx:379-388`）: すべて素の `/system-understanding` に戻り、
   ユーザーは同じ gap を探し直す。ナビ設計ドキュメントの
-  「`?capability=` は途切れない navigation context」原則に違反。
-- **Feature Map の空状態に前提条件への導線がない**
-  （`feature-map.tsx:108, 148, 235`）: Capability Map の空状態
-  （`capability-map.tsx:611-646`、PrerequisiteChecklist あり）と非対称。
-- **Connect SDK → Setup Guide が一方通行**（`setup-guide.tsx:416` は
-  connect-sdk へリンクするが逆方向がない）。
+  「`?capability=` は途切れない navigation context」原則に違反。（#241 対象外）
+- **Feature Map の空状態に前提条件への導線がない**（`feature-map.tsx`）:
+  →（#241）features 空状態に `PrerequisiteGuide` を追加。
+- **Connect SDK → Setup Guide が一方通行**: →（#241）Setup Guide に
+  Connect SDK への逆方向リンク（`setup-guide-connect-sdk-link`）を追加し
+  双方向化。
 
 ### 表示言語
 
@@ -216,13 +222,15 @@ action_label、pipeline step / stage / gap の表示文言、成功サマリ）�
 
 ### P3 — 画面横断の導線
 
-10. Overview に zero-state の get-started 導線（Repository 設定 / Connect SDK /
-    System Understanding）を追加。
-11. Probe Planner に上流ゲート（capability hierarchy / entrypoint 由来の選択を
-    前提にし、自由入力 feature id は明示の escape hatch に降格）。
-12. Capability Map 詳細パネルの gap リンクに `?capability=` を付与。
-13. Feature Map 空状態に PrerequisiteChecklist 相当を追加。
-14. Connect SDK → Setup Guide の順方向リンクを追加。
+10. **（Issue #241 で対応済み）** Overview に zero-state の開始導線
+    （フェーズ由来の共通 `PrerequisiteGuide`）を追加。
+11. **（Issue #241 で対応済み）** Probe Planner に上流ゲート（診断準備未完了
+    時の `PrerequisiteGuide` 表示、自由入力 feature id は escape hatch に
+    降格。API 拒否はしない）。
+12. Capability Map 詳細パネルの gap リンクに `?capability=` を付与。（未対応）
+13. **（Issue #241 で対応済み）** Feature Map 空状態に `PrerequisiteGuide`
+    を追加。
+14. **（Issue #241 で対応済み）** Connect SDK ↔ Setup Guide の双方向リンク。
 
 ### P4 — 言語ポリシー
 
