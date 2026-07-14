@@ -1,8 +1,5 @@
 import ast
 import json
-import subprocess
-import sys
-import textwrap
 import time
 from typing import Any, Dict, List, Optional
 
@@ -12,6 +9,7 @@ from ..auth import get_system_id
 from ..db import get_conn
 from ..llm import LLMError, get_llm_client
 from ..models import GenerationRun, GenerationRunCreate
+from ..replay_harness import CANDIDATE_TIMEOUT_SECONDS, run_inline_candidate
 
 router = APIRouter()
 
@@ -203,54 +201,19 @@ def _build_evaluation_prompt(
 
 
 def _run_candidate(code: str, input_value: Any) -> tuple[Optional[str], Optional[str]]:
+    """Execute candidate code through the shared replay harness.
+
+    The legacy repr parsing (``_trace_call_args``: ast.literal_eval with a
+    raw-string fallback) stays here on the server side; the harness receives
+    pre-decoded values (input_kind ``values``) so generation's observable
+    behavior is unchanged. Execution semantics (``python -I -S`` direct
+    subprocess, SAFE_BUILTINS jail, 5s timeout, legacy error strings) are
+    preserved by ``run_inline_candidate``.
+    """
     args, kwargs = _trace_call_args(input_value)
-    runner = textwrap.dedent(
-        """
-        import json
-        import traceback
-
-        SAFE_BUILTINS = {
-            "abs": abs, "all": all, "any": any, "bool": bool, "dict": dict,
-            "enumerate": enumerate, "float": float, "int": int, "len": len,
-            "list": list, "max": max, "min": min, "range": range, "repr": repr,
-            "round": round, "set": set, "sorted": sorted, "str": str, "sum": sum,
-            "tuple": tuple, "zip": zip,
-        }
-
-        payload = json.loads(input())
-        namespace = {"__builtins__": SAFE_BUILTINS}
-        result = {"output": None, "error": None}
-        try:
-            exec(payload["code"], namespace, namespace)
-            candidate = namespace.get("candidate")
-            if not callable(candidate):
-                raise RuntimeError("generated code must define callable candidate")
-            output = candidate(*payload["args"], **payload["kwargs"])
-            result["output"] = repr(output)
-        except BaseException:
-            result["error"] = traceback.format_exc(limit=8)
-        print(json.dumps(result, ensure_ascii=False))
-        """
+    return run_inline_candidate(
+        code, args, kwargs, timeout_seconds=CANDIDATE_TIMEOUT_SECONDS
     )
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-I", "-S", "-c", runner],
-            input=json.dumps(
-                {"code": code, "args": args, "kwargs": kwargs}, ensure_ascii=False
-            ),
-            text=True,
-            capture_output=True,
-            timeout=5,
-        )
-    except subprocess.TimeoutExpired:
-        return None, "candidate execution timed out"
-    if proc.returncode != 0:
-        return None, (proc.stderr or proc.stdout or "candidate runner failed")[:4000]
-    try:
-        result = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        return None, f"candidate runner returned invalid JSON: {proc.stdout[:1000]}"
-    return result.get("output"), result.get("error")
 
 
 @router.post("/generation-runs", response_model=GenerationRun, status_code=201)

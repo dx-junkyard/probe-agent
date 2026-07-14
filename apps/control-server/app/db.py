@@ -1900,6 +1900,131 @@ CREATE TABLE IF NOT EXISTS auth_audit_events (
     detail      TEXT,          -- JSON, never a password/hash/token
     created_at  REAL NOT NULL
 );
+
+-- Replay engine (Issue #242 Phase B / #244). System-scoped.
+--
+-- replay_approvals is the human replay-approval gate this phase's acceptance
+-- criteria require (a persisted `decision_method: manual` record that
+-- POST /replay-runs enforces). The issue's DB-ownership list names only the
+-- three replay_* tables below; this table is the approval-gate persistence
+-- for Phase B itself, not a speculative later-phase table.
+-- risk_context_json is the deterministic risk context (persisted probe plan
+-- point labels + the fixed Principle-4 warning) shown at approval time.
+CREATE TABLE IF NOT EXISTS replay_approvals (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    component_id        TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'approved',  -- 'approved' | 'revoked'
+    reason              TEXT NOT NULL DEFAULT '',
+    approved_by_user_id INTEGER,
+    decision_method     TEXT NOT NULL DEFAULT 'manual',
+    risk_context_json   TEXT,
+    created_at          REAL NOT NULL,
+    revoked_at          REAL,
+    revoked_by_user_id  INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (approved_by_user_id) REFERENCES users (id) ON DELETE SET NULL,
+    FOREIGN KEY (revoked_by_user_id) REFERENCES users (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_replay_approvals_component
+    ON replay_approvals (system_id, component_id, id DESC);
+
+-- A Replay Set is an ordered selection of captured trace inputs for one
+-- component. trace_ids_json is a JSON array capped at 50 entries
+-- (MAX_REPLAY_SET_SIZE, enforced at the API); source is finite
+-- ('manual' | 'analyzer_run').
+CREATE TABLE IF NOT EXISTS replay_sets (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id              INTEGER NOT NULL,
+    component_id           TEXT NOT NULL,
+    name                   TEXT NOT NULL DEFAULT '',
+    trace_ids_json         TEXT NOT NULL DEFAULT '[]',
+    source                 TEXT NOT NULL DEFAULT 'manual',
+    source_analyzer_run_id INTEGER,
+    created_at             REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (source_analyzer_run_id)
+        REFERENCES trace_analysis_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_replay_sets_system
+    ON replay_sets (system_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_replay_sets_component
+    ON replay_sets (system_id, component_id, id DESC);
+
+-- One synchronous replay execution of a Replay Set against the pinned
+-- snapshot's real implementation in an isolated sandboxed worktree. Audit
+-- fields (Principle 7): commit_sha, resolved symbol, trace_set_hash (sha256
+-- over the ordered trace ids + each trace's input payload), sandbox config
+-- (timeout / network isolation / harness version / env keys), approval
+-- linkage, timestamps, failure details, and worktree cleanup state.
+CREATE TABLE IF NOT EXISTS replay_runs (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    replay_set_id         INTEGER NOT NULL,
+    component_id          TEXT NOT NULL,
+    snapshot_id           INTEGER NOT NULL,
+    commit_sha            TEXT NOT NULL,
+    symbol_path           TEXT NOT NULL,
+    symbol_qualified_name TEXT NOT NULL,
+    status                TEXT NOT NULL DEFAULT 'running',  -- 'running' | 'completed' | 'failed'
+    error                 TEXT,
+    trace_set_hash        TEXT NOT NULL,
+    sandbox_config_json   TEXT NOT NULL DEFAULT '{}',
+    approval_id           INTEGER,
+    workspace_path        TEXT,
+    cleanup_state         TEXT NOT NULL DEFAULT 'not_attempted',
+    cleanup_error         TEXT,
+    created_at            REAL NOT NULL,
+    started_at            REAL,
+    completed_at          REAL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (replay_set_id) REFERENCES replay_sets (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (approval_id) REFERENCES replay_approvals (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_replay_runs_system
+    ON replay_runs (system_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_replay_runs_set
+    ON replay_runs (system_id, replay_set_id, id DESC);
+
+-- Per-trace deterministic comparison of replay output vs recorded output.
+-- case_status is finite ('match' | 'mismatch' | 'error' | 'skipped');
+-- input_source is finite ('structured' | 'repr_partial', NULL for skipped
+-- cases without an executable input); skip_reason is finite
+-- ('unreplayable_capture' | 'repr_parse_failed' | 'undecodable_input' |
+-- 'trace_missing'). recorded_error stores the recorded error's FIRST LINE
+-- ("Type: msg") — the deterministic comparison basis; the full recorded
+-- error (with traceback) stays on the traces row. comparison_mode is fixed
+-- 'repr' in Phase B; output_truncated notes that repr equality on truncated
+-- values is prefix-bounded.
+CREATE TABLE IF NOT EXISTS replay_case_results (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id        INTEGER NOT NULL,
+    replay_run_id    INTEGER NOT NULL,
+    trace_id         TEXT NOT NULL,
+    position         INTEGER NOT NULL,
+    case_status      TEXT NOT NULL,
+    input_source     TEXT,
+    skip_reason      TEXT,
+    replay_output    TEXT,
+    replay_error     TEXT,
+    recorded_output  TEXT,
+    recorded_error   TEXT,
+    duration_ms      REAL,
+    output_truncated INTEGER NOT NULL DEFAULT 0,
+    comparison_mode  TEXT NOT NULL DEFAULT 'repr',
+    created_at       REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (replay_run_id) REFERENCES replay_runs (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_replay_case_results_run
+    ON replay_case_results (replay_run_id, position);
+CREATE INDEX IF NOT EXISTS idx_replay_case_results_system
+    ON replay_case_results (system_id, replay_run_id);
 """
 
 

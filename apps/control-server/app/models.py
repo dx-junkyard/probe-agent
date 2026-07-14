@@ -3798,3 +3798,138 @@ class AssistantAskOut(BaseModel):
     prompt_version: str
     schema_version: str
     generated_at: float
+
+
+# --- Replay engine (Issue #242 Phase B / #244) -------------------------------
+
+# Finite classification sets (Principle 6). Kept in sync with
+# app/replay_runner.py and the replay_case_results table comments.
+ReplayCaseStatus = Literal["match", "mismatch", "error", "skipped"]
+ReplayInputSource = Literal["structured", "repr_partial"]
+ReplaySkipReason = Literal[
+    "unreplayable_capture",
+    "repr_parse_failed",
+    "undecodable_input",
+    "trace_missing",
+]
+ReplaySetSource = Literal["manual", "analyzer_run"]
+ReplayApprovalStatus = Literal["approved", "revoked"]
+
+
+class ReplayApprovalCreate(BaseModel):
+    reason: str = Field(..., min_length=1)
+
+
+class ReplayRiskPointOut(BaseModel):
+    """A persisted probe plan point label reused as display-only risk context.
+
+    No new reasoning run and no heuristic inference: these are verbatim
+    stored labels; absent labels are returned as absent (None)."""
+
+    point_id: int
+    plan_id: int
+    side_effect_risk: Optional[str] = None
+    replayability: Optional[str] = None
+
+
+class ReplayRiskContextOut(BaseModel):
+    probe_plan_points: List[ReplayRiskPointOut] = Field(default_factory=list)
+    warning: str
+
+
+class ReplayApprovalOut(BaseModel):
+    id: int
+    system_id: int
+    component_id: str
+    status: ReplayApprovalStatus
+    reason: str = ""
+    approved_by_user_id: Optional[int] = None
+    decision_method: str = "manual"
+    risk_context: Optional[Dict[str, Any]] = None
+    created_at: float
+    revoked_at: Optional[float] = None
+    revoked_by_user_id: Optional[int] = None
+
+
+class ReplayApprovalStateOut(BaseModel):
+    component_id: str
+    active: bool
+    approval: Optional[ReplayApprovalOut] = None
+    risk_context: ReplayRiskContextOut
+
+
+class ReplaySetCreate(BaseModel):
+    component_id: str = Field(..., min_length=1)
+    name: str = ""
+    trace_ids: Optional[List[str]] = None
+    analyzer_run_id: Optional[int] = None
+
+
+class ReplaySetTraceOut(BaseModel):
+    """Per-trace replay preview: recorded replayability plus the input source
+    a replay would deterministically use (same rule as the runner)."""
+
+    trace_id: str
+    exists: bool
+    replayability: Optional[str] = None
+    replay_reasons: List[str] = Field(default_factory=list)
+    input_source: Optional[ReplayInputSource] = None
+    skip_reason: Optional[ReplaySkipReason] = None
+
+
+class ReplaySetOut(BaseModel):
+    id: int
+    system_id: int
+    component_id: str
+    name: str = ""
+    source: ReplaySetSource
+    source_analyzer_run_id: Optional[int] = None
+    trace_ids: List[str] = Field(default_factory=list)
+    traces: List[ReplaySetTraceOut] = Field(default_factory=list)
+    created_at: float
+
+
+class ReplayRunCreate(BaseModel):
+    replay_set_id: int
+    snapshot_id: Optional[int] = None
+
+
+class ReplayCaseResultOut(BaseModel):
+    id: int
+    trace_id: str
+    position: int
+    case_status: ReplayCaseStatus
+    input_source: Optional[ReplayInputSource] = None
+    skip_reason: Optional[ReplaySkipReason] = None
+    replay_output: Optional[str] = None
+    replay_error: Optional[str] = None
+    recorded_output: Optional[str] = None
+    recorded_error: Optional[str] = None
+    duration_ms: Optional[float] = None
+    output_truncated: bool = False
+    comparison_mode: str = "repr"
+    created_at: float
+
+
+class ReplayRunOut(BaseModel):
+    id: int
+    system_id: int
+    replay_set_id: int
+    component_id: str
+    snapshot_id: int
+    commit_sha: str
+    symbol_path: str
+    symbol_qualified_name: str
+    status: Literal["running", "completed", "failed"]
+    error: Optional[str] = None
+    trace_set_hash: str
+    sandbox_config: Dict[str, Any] = Field(default_factory=dict)
+    approval_id: Optional[int] = None
+    workspace_path: Optional[str] = None
+    cleanup_state: str = "not_attempted"
+    cleanup_error: Optional[str] = None
+    summary: Dict[str, int] = Field(default_factory=dict)
+    cases: List[ReplayCaseResultOut] = Field(default_factory=list)
+    created_at: float
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None

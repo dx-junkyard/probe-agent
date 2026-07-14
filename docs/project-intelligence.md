@@ -1740,6 +1740,115 @@ in-flight 状態は終端 `failed`、公開フェーズの in-flight 状態と
   Workbench UI（Phase D）、構造化 output キャプチャ、旧トレースの一括 backfill、
   live-shadow の SDK 挙動変更。
 
+### Phase B 実装状態（#244: Replay Engine）
+
+人間が replay を承認したコンポーネントについて、Replay Set（捕捉入力の集合）を
+pinned snapshot の実関数に対して隔離 sandbox で再実行し、記録出力との
+一致/不一致/エラー/skip を per-trace で確認できる（API レベル。UI は Phase D）。
+Phase B に reasoning run は存在しない — すべて決定的な有限集合分類
+（Principle 6）。
+
+- **共有 harness（`app/replay_harness.py`、`REPLAY_HARNESS_VERSION = "1"`）**:
+  スタンドアロンな Python スクリプト文字列。payload JSON を `argv[1]` から読み、
+  結果 JSON を `argv[2]` に書く（結果は常にファイル経由。stdout/stderr は診断
+  のみで runner が切り詰める）。target kind は有限:
+  `{"kind": "symbol", "path", "qualified_name"}`（workspace root を
+  `sys.path[0]` に挿入して `importlib.util.spec_from_file_location` でロード →
+  getattr 連鎖。隔離は sandbox 側が担うため builtins は実環境）と
+  `{"kind": "inline_code", "code"}`（generation が従来使ってきた
+  `SAFE_BUILTINS` jail を維持。`candidate` を定義しなければ RuntimeError）。
+  case input kind も有限: `structured`（Phase A の `"__probe__"` エンコードを
+  harness 内蔵デコーダで復元。`unsupported` マーカー・未知マーカー・不正
+  エンコードは関数を**呼ばずに** `undecodable_input` で skip）、`repr`
+  （文字列値を harness 内で `ast.literal_eval`。パース失敗は
+  `repr_parse_failed` で skip — 黙って劣化しない）、`values`
+  （デコード済み値をそのまま渡す。generation 移行専用で replay は使わない）。
+  per-case で出力を SDK `_safe_repr` と同一規則で正規化（repr / unrepr-able
+  マーカー / 4000 文字 + `...<truncated>`）、error は `"Type: msg"` の
+  first-line 形式、`traceback` は generation 互換用に保持、`duration_ms` を
+  記録。case ごとの try/except で 1 case の例外が batch を殺さない。target
+  解決失敗（import error / SyntaxError / シンボル欠落 / 非 callable）は
+  **run-level 失敗**（`target_error` / `target_traceback`、case は実行しない）。
+- **replay runner（`app/replay_runner.py` + `routes/replay.py`）**: snapshot
+  解決（payload の `snapshot_id`、省略時は repo_path を持つ最新 ready
+  snapshot）→ `code_symbols` からの決定的 component→symbol 解決
+  （`snapshot_id` + `system_id` + `component_id`、function 系 kind。0 件 /
+  複数件 / async は明示的 409）→ `patch_generator.create_worktree` で
+  `PROBE_REPLAY_WORKSPACE_BASE`（既定 `/tmp/probe-replays`）`/<run_id>` 配下に
+  一時 worktree → `.probe-replay/` に harness/payload を書き
+  `validation_runner._run_command`（`python3 -I ...`）で実行 —
+  bwrap/network-off/sandbox 不在時 fail-closed の意味論をそのまま継承。env は
+  `_build_env` の最小 allowlist + `PROBE_ENABLED=false`（対象リポジトリの
+  @probe を replay 中は不活性化）+ `PYTHONHASHSEED=0`（set の repr 順序を
+  replay 間で再現的に）。timeout は `PROBE_REPLAY_TIMEOUT_SECONDS`（既定 60、
+  1..300 に clamp）。結果ファイルは experiment と同じ safe-path + 1 MiB cap で
+  読み戻し、欠落/不正時は run 失敗としてコマンド stderr を記録。worktree は
+  finally で必ず cleanup（cleanup_state / cleanup_error を記録）。
+- **入力復元（server 側の決定的規則、Replay Set のプレビューと同一）**:
+  trace 行に `input_capture_json` があり `replayability` が
+  `replayable`/`partial` → `structured`（`input_source='structured'`）;
+  `replayability='unreplayable'`（または分類のみ残った不整合行 — fail
+  closed）→ skip `unreplayable_capture`; capture カラムが NULL（pre-Phase-A /
+  未 opt-in）→ 記録済み repr 入力から `input_source='repr_partial'` で実行
+  （harness 側 literal_eval 失敗は `repr_parse_failed` で skip）; trace 行
+  自体が消えている → skip `trace_missing`。
+- **決定的比較（有限集合、`comparison_mode='repr'` 固定）**: 記録 error は
+  FIRST LINE（保存形式 "Type: msg\ntraceback" の 1 行目）だけを比較根拠に
+  し、その first line を `replay_case_results.recorded_error` に永続化する。
+  マトリクス: 両方成功 → repr 文字列一致で `match`/`mismatch`; 記録成功 +
+  replay 例外 → `error`; 記録 error + replay 例外 → first line 一致で
+  `match` そうでなければ `mismatch`; 記録 error + replay 成功 → `mismatch`。
+  skip は `skipped` + 有限 `skip_reason`（`unreplayable_capture` /
+  `repr_parse_failed` / `undecodable_input` / `trace_missing`）。
+  `output_truncated` フラグは切り詰め済み repr の一致が **prefix 有界の
+  正直さ**でしかないこと（4000 文字プレフィクスの比較）を明示する。
+- **承認ゲート（`replay_approvals`）**: `POST
+  /components/{component_id}/replay-approval` が human 承認を
+  `decision_method='manual'`（Principle 7）で永続化し、承認時に表示された
+  決定的リスクコンテキスト（そのコンポーネントの最新 probe plan point の
+  `side_effect_risk` / `replayability` ラベルの転記 — 表示のみ、新規
+  reasoning run なし、ラベル欠落は欠落のまま — と固定の Principle-4 警告文:
+  pure-ish コンポーネント限定、payment/email/DB write/auth は承認があっても
+  強く非推奨）を snapshot として保存する。`GET .../replay-approval` は現在
+  状態 + リスクコンテキストを返し、`POST .../replay-approval/revoke` で失効。
+  `POST /replay-runs` は active な承認がなければ 403（revoked も同様に拒否）。
+  **所有権ノート**: Issue #244 の DB 所有リストは replay_sets / replay_runs /
+  replay_case_results の 3 テーブルを挙げるが、`replay_approvals` は本フェーズ
+  の受け入れ条件（manual 承認の永続化）そのものを担う承認ゲート永続化であり、
+  後続フェーズ用の投機的テーブルではない。
+- **テーブル（すべて System-scoped、additive、SCHEMA の CREATE TABLE IF NOT
+  EXISTS のみで移行完了）**: `replay_sets`（trace_ids_json は JSON 配列、
+  API で 50 件 cap = `MAX_REPLAY_SET_SIZE`。source は有限
+  `'manual'|'analyzer_run'`）、`replay_runs`（commit_sha / 解決シンボル /
+  trace_set_hash〔順序付き trace id + 各入力 payload の sha256〕/
+  sandbox_config_json〔timeout / network / harness_version / env keys〕/
+  approval_id / cleanup 状態 / タイムスタンプ / 失敗詳細 — Principle 7 の
+  監査メタデータ）、`replay_case_results`（上記有限分類の per-trace 行）、
+  `replay_approvals`（上記）。
+- **API**: `POST /replay-sets`（手動 trace 選択 または trace analyzer 実行の
+  保存済み結果からの決定的 trace id 抽出 — `compare.examples` → `rows` →
+  `groups[].rows` の保存済み id のみ、再計算なし。手動リストは存在 /
+  component 一致 / 重複 / 50 件 cap を 422 で検証）、`GET /replay-sets` /
+  `GET /replay-sets/{id}`（per-trace の replayability / replay_reasons と、
+  runner と同一規則で決定した使用予定 input_source / skip_reason を返す —
+  Phase D のバッジ用）、`POST /replay-runs`（N≤50 の同期実行。承認なし 403、
+  シンボル未解決/曖昧/async・snapshot 不備は 409）、`GET /replay-runs/{id}`
+  （cases 付き）、`GET /replay-runs?replay_set_id=&component_id=`（一覧、
+  cases なし + summary）。
+- **generation.py の移行**: `POST /generation-runs` の候補コード実行は共有
+  harness の `inline_code` + `values` 入力経路
+  （`replay_harness.run_inline_candidate`）に移行した。観測可能な挙動は不変:
+  `python -I -S` 直接 subprocess（bwrap ではない）、`SAFE_BUILTINS` jail、
+  5 秒 timeout、legacy エラー文字列（"candidate execution timed out" など）、
+  そして repr パース失敗時に生文字列へフォールバックする legacy 意味論
+  （server 側 `_trace_call_args` に残置 — replay の厳格な `repr_parse_failed`
+  skip とは別物）。移行前に `tests/test_generation.py` の回帰テストで現行
+  挙動をピン留めし、移行後も同一テストが無変更で通る。
+- **非目標（Phase B）**: パッチ variant / variant 比較（Phase C）、Dashboard
+  UI（Phase D）、自動承認・LLM のみの承認、分散実行、長寿命 worktree、
+  オンライン依存インストール、async 関数の replay、構造化 output 比較
+  （比較は repr のみ）。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。
