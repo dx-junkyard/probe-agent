@@ -84,8 +84,10 @@ def _string_list(value: Any) -> List[str]:
         return []
     items: List[str] = []
     for entry in value:
-        if isinstance(entry, str) and entry.strip():
-            items.append(entry.strip())
+        if isinstance(entry, str):
+            # Blank / whitespace-only strings are dropped, not coerced.
+            if entry.strip():
+                items.append(entry.strip())
         elif entry is not None and not isinstance(entry, (list, dict)):
             items.append(str(entry))
         if len(items) >= MAX_LIST_ITEMS:
