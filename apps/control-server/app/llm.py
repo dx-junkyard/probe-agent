@@ -322,6 +322,25 @@ class MockLLMClient(LLMClient):
         max_tokens: Optional[int] = None,
     ) -> str:
         joined = "\n".join(m.get("content", "") for m in messages)
+        if "CANDIDATE_STUDIO_PROPOSAL_JSON" in joined:
+            return json.dumps(
+                {
+                    "summary": "Mock candidate: uppercase the first argument.",
+                    "assumptions": [
+                        "No external LLM was called; this is deterministic mock output."
+                    ],
+                    "changed_symbols": ["candidate"],
+                    "generated_code": (
+                        "def candidate(*args, **kwargs):\n"
+                        "    text = args[0] if args else ''\n"
+                        "    return str(text).upper()\n"
+                    ),
+                    "risks": ["Mock proposal — review captured inputs before adoption."],
+                    "suggested_tests": [
+                        "Assert candidate('a') == 'A' against recorded traces."
+                    ],
+                }
+            )
         if "REGRESSION_SCAFFOLD_RESPONSE_JSON" in joined:
             return json.dumps(
                 {

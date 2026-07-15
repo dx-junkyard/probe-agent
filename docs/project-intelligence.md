@@ -2029,3 +2029,97 @@ regression-test scaffold 下書きで、独立した `reasoning_llm` 境界と�
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。
 実行コマンドは自動推測せず、この設定で明示する。
+
+## AI Candidate Studio（Issue #252）
+
+会話（チャット）で、プローブ済み関数の baseline コードを基に AI が候補実装を
+生成し、既存の隔離 Replay で評価する **AI Candidate Studio**。対象コンポーネント
+または具体的な Trace から開始し、自然言語で改善目的・制約を伝えるだけで、候補
+生成 → 差分確認 → Replay 評価 → 反復修正 → Experiment への引き渡しまで一つの
+画面で進められる。
+
+### 設計原則: 新しい判定・実行・比較ロジックを足さない
+
+Studio は #242（Phase A〜C）と #245 の既存基盤の上に立つ **会話 + バージョン
+管理レイヤ** であり、判定/実行/比較の新規ロジックは追加しない。
+
+- **候補生成（reasoning_llm）**: `app/candidate_studio.py`。固定 snapshot の
+  対象シンボルソース・最小限の近傍情報（Component/System Profile・Evaluation
+  Criteria・選択 Trace の記録入出力）を文脈に、reasoning model が **構造化
+  proposal**（`summary` / `assumptions` / `changed_symbols` / `generated_code`
+  / `risks` / `suggested_tests`、`shared/schemas/candidate_proposal.schema.json`、
+  prompt/schema version `candidate-studio-proposal-v1`）を返す。自由形式コードは
+  受け取らない。patch 自体は #245 と同じ **決定的な splice→git diff**
+  （`replay_draft.splice_symbol_source` + `_diff_against_snapshot` を再利用）で
+  生成し、決定的な scope 検証で「対象シンボルのファイルのみ変更」を強制する
+  （範囲拡大は既定で不可）。LLM 設定・呼び出し・parse・scope/size 検証の失敗は
+  すべて fail-closed（heuristic fallback なし、Principle 6）で、失敗も
+  `intelligence_runs`（`run_type='candidate_studio_proposal'`）に監査記録する
+  （Principle 7）。`LLM_PROVIDER=mock` は許可（`is_mock` を明示）。
+- **候補の Replay 評価**: `POST /candidate-versions/{id}/replay` は既存の
+  `POST /replay-variant-runs` を **そのまま関数として呼ぶ**。人手の replay 承認
+  ゲート（`GET/POST /components/{id}/replay-approval`）、network-off の独立
+  worktree sandbox、最小環境変数、timeout、必ず cleanup、有限 diff マトリクス
+  （match / diff / candidate_error / error_to_success / …）をすべて継承する。
+  未承認・sandbox 未確立は fail closed（403）。legacy の inline-code 実行経路は
+  Studio では一切使わない。
+- **Experiment への昇格**: `POST /candidate-versions/{id}/promote` は #245 の
+  variant experiment-payload（`get_replay_variant_experiment_payload`）を再利用し、
+  レビュー済み patch を既存の Experiment 作成フローへ渡す payload を返すのみ。
+  Experiment の自動作成・自動採用・PR 作成/マージ・本番配布・live shadow の
+  自動有効化は行わない（Principle 7）。評価済み（replay completed）候補のみ昇格
+  可能。
+
+### バージョンと会話の扱い
+
+- `candidate_sessions` は component・固定 baseline snapshot（commit + 解決済み
+  シンボル）・Replay Set・会話をまとめる。入口は「component」「trace_ids」
+  「単一 trace_id」のいずれか一つ（trace 指定時は既存 `POST /replay-sets` の検証
+  を再利用して Replay Set を作成）。
+- `candidate_versions` は **patch が実際に生成された場合のみ** 作られる不変
+  バージョン。`parent_version_id` により選択中バージョンを親にして分岐でき
+  （セッションごとに木構造）、追加指示は親候補の `generated_code` を出発点として
+  LLM に見せるが、生成される patch は常に **pinned snapshot に対する差分** なので
+  各バージョンは独立に適用・Replay できる。会話メッセージ自体はバージョンを
+  作らない。生成失敗は version 行を作らず、`intelligence_runs` の監査行 + assistant
+  メッセージ + 502 で fail closed。
+- `candidate_messages` は会話ターン（`user` / `assistant`）。assistant の「理解した
+  条件」echo は決定的な表示テキスト（Principle 6）で推論ではない。AI の実際の
+  理解は候補の `summary` / `assumptions` に現れる。
+
+### API
+
+```
+POST /candidate-sessions                     セッション開始（対象情報を自動設定）
+GET  /candidate-sessions            一覧
+GET  /candidate-sessions/{id}       会話 + 候補バージョンつき詳細
+POST /candidate-sessions/{id}/messages       会話ターン追加（版は作らない）
+POST /candidate-sessions/{id}/generate       候補バージョン生成（reasoning_llm）
+GET  /candidate-sessions/{id}/events         状態タイムライン（ポーリング）
+GET  /candidate-sessions/{id}/versions       候補一覧
+GET  /candidate-versions/{id}                候補詳細
+POST /candidate-versions/{id}/replay         隔離 Replay 評価（承認ゲート）
+POST /candidate-versions/{id}/promote        Experiment 引き渡し payload
+```
+
+生成・Replay は同期実行（Replay スタック全体と同じ規約）。`events` は永続化した
+バージョン状態から決定的に導く状態タイムラインで、生成の
+`context_preparing`/`generating`/`validating_patch` は terminal な version
+`status`（`proposed`/`failed`）に、Replay 進行は `replay_status`
+（`not_run`/`running`/`completed`/`failed`）に対応する。
+
+### UI（`pages/candidate-studio.tsx`、`/candidate-studio?session_id=...`）
+
+- 左ペイン: 会話履歴と入力欄。右ペイン: 選択中 Candidate の
+  `差分 / 全コード / 評価結果` タブ。上部に component・baseline commit・Replay
+  承認状態・候補バージョン・現在状態。
+- 状態ごとの主操作は1つ: 条件入力済み→**候補を生成**、生成済み→**Replayで確認**、
+  評価失敗→**AIに修正を依頼**、評価済み→**Experimentへ送る**。高度な設定
+  （生 patch・Replay Set 選択・ソース全文）は折りたたむ。
+- 入口: Components の component 詳細 / Trace 行、Simulation Workbench から
+  「会話で候補を改善」。
+
+### 非目標
+
+LLM のみでの自動採用、任意コードの本番プロセスへの動的配布・実行、対象リポジトリの
+自動編集、本番相当性の保証、live shadow SDK の動的候補ロード。

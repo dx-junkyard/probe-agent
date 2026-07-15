@@ -2770,3 +2770,110 @@ export interface ReplaySourceDiffOut {
   patch_text: string;
   patch_hash: string;
 }
+
+// ── AI Candidate Studio (Issue #252) ────────────────────────────────────────
+// A conversation + candidate-versioning layer over the EXISTING isolated
+// Replay stack (#243-#246): generation is a reasoning-model structured
+// proposal + deterministic splice->diff (fail-closed); replaying a version
+// reuses POST /replay-variant-runs verbatim (approval gate, sandbox, diff
+// matrix); promotion reuses the variant experiment-payload shape and never
+// creates an experiment/merges/deploys (Principle 7). Field names mirror
+// app/models.py exactly.
+
+export type CandidateSessionStatus = "active" | "archived";
+export type CandidateMessageRole = "user" | "assistant";
+export type CandidateVersionStatus = "proposed" | "failed";
+export type CandidateReplayStatus = "not_run" | "running" | "completed" | "failed";
+
+export interface CandidateMessageOut {
+  id: number;
+  session_id: number;
+  role: CandidateMessageRole;
+  content: string;
+  version_id: number | null;
+  created_at: number;
+}
+
+export interface CandidateVersionOut {
+  id: number;
+  system_id: number;
+  session_id: number;
+  parent_version_id: number | null;
+  version_number: number;
+  instruction: string;
+  status: CandidateVersionStatus;
+  summary: string;
+  assumptions: string[];
+  changed_symbols: string[];
+  risks: string[];
+  suggested_tests: string[];
+  generated_code: string;
+  patch_text: string;
+  patch_hash: string;
+  error: string | null;
+  replay_status: CandidateReplayStatus;
+  replay_run_id: number | null;
+  replay_variant_id: number | null;
+  promoted_at: number | null;
+  // Reasoning provenance (from the linked intelligence_runs row).
+  provider: string | null;
+  model: string | null;
+  prompt_version: string | null;
+  schema_version: string | null;
+  decision_method: "deterministic" | "reasoning_llm" | "manual" | null;
+  is_mock: boolean;
+  created_at: number;
+}
+
+export interface CandidateSessionOut {
+  id: number;
+  system_id: number;
+  component_id: string;
+  snapshot_id: number;
+  commit_sha: string;
+  symbol_path: string;
+  symbol_qualified_name: string;
+  replay_set_id: number;
+  objective: string;
+  status: CandidateSessionStatus;
+  created_at: number;
+  updated_at: number;
+  // Empty on the list endpoint (GET /candidate-sessions); populated on the
+  // single-session endpoint (GET /candidate-sessions/{id}).
+  messages: CandidateMessageOut[];
+  versions: CandidateVersionOut[];
+}
+
+export interface CandidateSessionCreateRequest {
+  component_id: string;
+  replay_set_id?: number;
+  trace_ids?: string[];
+  trace_id?: string;
+  snapshot_id?: number;
+  objective?: string;
+}
+
+export interface CandidatePromotionOut {
+  candidate_version_id: number;
+  label: string;
+  patch_text: string;
+  patch_hash: string;
+  source: string;
+  risk_note: string;
+  origin: Record<string, unknown>;
+}
+
+export interface CandidateEventOut {
+  version_id: number;
+  version_number: number;
+  phase: "generating" | "validating_patch" | "completed" | "failed" | "replaying";
+  status: string;
+  replay_status: CandidateReplayStatus;
+  detail: string;
+  created_at: number;
+}
+
+export interface CandidateEventsOut {
+  session_id: number;
+  events: CandidateEventOut[];
+}

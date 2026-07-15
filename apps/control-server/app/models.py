@@ -4154,3 +4154,165 @@ class ReplaySourceDiffOut(BaseModel):
 
     patch_text: str
     patch_hash: str
+
+
+# --- AI Candidate Studio (Issue #252) ----------------------------------------
+#
+# A conversation + versioning layer over the existing isolated-Replay stack.
+# Finite sets (Principle 6): a version's generate lifecycle terminal status,
+# its replay lifecycle status, and message roles.
+
+CandidateVersionStatus = Literal["proposed", "failed"]
+CandidateReplayStatus = Literal["not_run", "running", "completed", "failed"]
+CandidateMessageRole = Literal["user", "assistant"]
+CandidateSessionStatus = Literal["active", "archived"]
+
+
+class CandidateSessionCreate(BaseModel):
+    """Start a Studio session for a component. Exactly one input selection is
+    required: an existing ``replay_set_id``, an explicit ``trace_ids`` list, or
+    a single ``trace_id`` (the "improve from this input" entry). When trace ids
+    are given, a Replay Set is created for them (reusing POST /replay-sets'
+    validation). ``snapshot_id`` defaults to the latest ready snapshot."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    component_id: str = Field(..., min_length=1, max_length=500)
+    replay_set_id: Optional[int] = None
+    trace_ids: Optional[List[str]] = None
+    trace_id: Optional[str] = None
+    snapshot_id: Optional[int] = None
+    objective: str = Field(default="", max_length=5000)
+
+
+class CandidateProposal(BaseModel):
+    """Structured candidate proposal (never free-form code): the reasoning
+    model returns summary / assumptions / changed_symbols / generated_code /
+    risks / suggested_tests; the patch itself is produced deterministically by
+    splicing ``generated_code`` into the resolved symbol span and diffing
+    against the pinned snapshot (app/candidate_studio.py)."""
+
+    summary: str = ""
+    assumptions: List[str] = Field(default_factory=list)
+    changed_symbols: List[str] = Field(default_factory=list)
+    risks: List[str] = Field(default_factory=list)
+    suggested_tests: List[str] = Field(default_factory=list)
+
+
+class CandidateVersionOut(BaseModel):
+    id: int
+    system_id: int
+    session_id: int
+    parent_version_id: Optional[int] = None
+    version_number: int
+    instruction: str = ""
+    status: CandidateVersionStatus
+    summary: str = ""
+    assumptions: List[str] = Field(default_factory=list)
+    changed_symbols: List[str] = Field(default_factory=list)
+    risks: List[str] = Field(default_factory=list)
+    suggested_tests: List[str] = Field(default_factory=list)
+    generated_code: str = ""
+    patch_text: str = ""
+    patch_hash: str = ""
+    error: Optional[str] = None
+    replay_status: CandidateReplayStatus = "not_run"
+    replay_run_id: Optional[int] = None
+    replay_variant_id: Optional[int] = None
+    promoted_at: Optional[float] = None
+    # Reasoning provenance (from the linked intelligence_runs row).
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    prompt_version: Optional[str] = None
+    schema_version: Optional[str] = None
+    decision_method: Optional[DecisionMethod] = None
+    is_mock: bool = False
+    created_at: float
+
+
+class CandidateMessageOut(BaseModel):
+    id: int
+    session_id: int
+    role: CandidateMessageRole
+    content: str = ""
+    version_id: Optional[int] = None
+    created_at: float
+
+
+class CandidateSessionOut(BaseModel):
+    id: int
+    system_id: int
+    component_id: str
+    snapshot_id: int
+    commit_sha: str
+    symbol_path: str
+    symbol_qualified_name: str
+    replay_set_id: int
+    objective: str = ""
+    status: CandidateSessionStatus = "active"
+    created_at: float
+    updated_at: float
+    messages: List[CandidateMessageOut] = Field(default_factory=list)
+    versions: List[CandidateVersionOut] = Field(default_factory=list)
+
+
+class CandidateMessageCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    content: str = Field(..., min_length=1, max_length=10000)
+
+
+class CandidateGenerateCreate(BaseModel):
+    """Generate the next immutable CandidateVersion. ``instruction`` is the
+    improvement goal / constraints; ``parent_version_id`` branches off a
+    selected version (None = branch off the baseline)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    instruction: str = Field(..., min_length=1, max_length=5000)
+    parent_version_id: Optional[int] = None
+
+
+class CandidateReplayCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    snapshot_id: Optional[int] = None
+
+
+class CandidatePromotionOut(BaseModel):
+    """Hands a reviewed candidate patch to the existing Experiment creation
+    flow (Issue #245's variant experiment-payload shape). API shape only --
+    this never creates an experiment, auto-adopts, merges, or deploys
+    anything (Principle 7)."""
+
+    candidate_version_id: int
+    label: str
+    patch_text: str
+    patch_hash: str
+    source: str = "candidate_studio"
+    risk_note: str = ""
+    origin: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CandidateEventOut(BaseModel):
+    """One entry of a session's job/status timeline (polling contract for the
+    events endpoint). Derived deterministically from persisted version state:
+    generate transitions (``context_preparing`` -> ``generating`` ->
+    ``validating_patch`` -> ``completed`` / ``failed``) collapse to the
+    version's terminal ``status``; replay transitions surface
+    ``replay_status``."""
+
+    version_id: int
+    version_number: int
+    phase: Literal[
+        "generating", "validating_patch", "completed", "failed", "replaying"
+    ]
+    status: str
+    replay_status: CandidateReplayStatus = "not_run"
+    detail: str = ""
+    created_at: float
+
+
+class CandidateEventsOut(BaseModel):
+    session_id: int
+    events: List[CandidateEventOut] = Field(default_factory=list)

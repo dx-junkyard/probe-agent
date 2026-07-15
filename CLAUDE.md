@@ -114,6 +114,24 @@ creating incomplete persistence or execution paths for later phases.
    writes to the target repo, and (Principle 4) targets pure-ish components
    only — payment/email/DB-write/auth are discouraged even with approval.
 
+9. Issue #252 — AI Candidate Studio: a conversation-oriented workflow that,
+   from a component or a specific Trace, prepares baseline commit / target
+   symbol / Component Profile / Evaluation Criteria / Replay Set, lets the
+   developer describe an improvement goal in natural language, and generates
+   immutable candidate versions evaluated in the EXISTING isolated Replay
+   infrastructure. It adds no new judgement/execution/comparison path:
+   candidate-proposal generation is the reasoning-model structured proposal
+   (summary / assumptions / changed_symbols / generated_code / risks /
+   suggested_tests) + deterministic splice→diff of `app/candidate_studio.py`
+   (built on `replay_draft`, fail-closed); replaying a version reuses `POST
+   /replay-variant-runs` verbatim (its human replay-approval gate, network-off
+   worktree sandbox, always-cleanup, finite diff matrix); promotion reuses the
+   variant experiment-payload shape and never creates an experiment, writes to
+   the target repo, opens/merges a PR, deploys, or enables live shadow. Only a
+   successfully generated & validated patch creates a `CandidateVersion`; chat
+   messages never do. See the Issue #252 section in
+   `docs/project-intelligence.md`.
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,

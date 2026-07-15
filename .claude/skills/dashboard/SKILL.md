@@ -65,6 +65,28 @@ The dashboard should support:
   judgement/execution stays in the Phase A–C APIs; the regression scaffold is
   the isolated review-only reasoning boundary. The UI never writes to the
   target repo.
+- AI Candidate Studio (Issue #252, `pages/candidate-studio.tsx`, route
+  `/candidate-studio?session_id=...`, nav item under "Detail views", `Bot`
+  icon): a conversation + candidate-versioning page over the same isolated
+  Replay stack. A start view picks a component (and optionally a trace, or an
+  advanced-collapsed existing Replay Set) then `POST /candidate-sessions`; the
+  studio view has a left conversation pane (`POST .../messages`) and a right
+  pane with `差分`/`全コード`/`評価結果` tabs for the selected
+  `CandidateVersion`. The evaluation tab reuses the extracted
+  `components/replay-result-matrix.tsx` (`ResultMatrix`, fetched from the
+  existing `GET /replay-variant-runs/{replay_run_id}`) and the approval gate
+  reuses the extracted `components/replay-approval-panel.tsx` (`ApprovalPanel`)
+  — both shared verbatim with the Simulation Workbench. Exactly one
+  state-driven primary action is shown: 候補を生成 (`POST .../generate`) →
+  Replayで確認 (`POST /candidate-versions/{id}/replay`) → AIに修正を依頼
+  (generate with `parent_version_id`, on a failed replay) → Experimentへ送る
+  (`POST /candidate-versions/{id}/promote`, navigating via the existing
+  `/experiments?replay_run_id=&replay_variant_id=` prefill). `is_mock` badges
+  mark mock LLM output. Entry points: a component-level "AIで別バージョンを
+  作る" (`pages/components.tsx`) and a trace-level "この入力から改善する"
+  (`components/replay-row-actions.tsx`). No new judgement/execution/comparison
+  logic; promotion never auto-creates an experiment and the UI never writes to
+  the target repo.
 - Decision Workspace tab (Issue #38): workspace list/create/switch, a
   conversation thread with grounded findings/assumptions/missing information
   visually distinguished, pinned context with links back to the owning

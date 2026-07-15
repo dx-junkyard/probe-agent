@@ -12,14 +12,10 @@ import {
   useCreateReplayVariantDraft,
   useCreateReplayRegressionScaffold,
   useReplayApproval,
-  useApproveReplay,
-  useRevokeReplayApproval,
   useTraces,
 } from "@/api/hooks";
 import type {
   ReplayVariantRunOut,
-  ReplayVariantCaseResultOut,
-  ReplayVariantAggregateOut,
   ReplayVariantDraftOut,
   ReplayRegressionScaffoldOut,
   ReplaySetTraceOut,
@@ -30,13 +26,13 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
-import { Dialog, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { JsonTree } from "@/components/json-tree";
 import { ReplayabilityBadge } from "@/components/replay-row-actions";
+import { ApprovalPanel } from "@/components/replay-approval-panel";
+import { ResultMatrix } from "@/components/replay-result-matrix";
 
 // Simulation Workbench (Issue #242 Phase D / #246). Display + composition
 // only: every judgement/execution/comparison decision below is made by the
@@ -412,7 +408,9 @@ export default function SimulationWorkbenchPage() {
             </div>
           )}
 
-          <ResultMatrix run={activeRun} recordedByTraceId={recordedByTraceId} />
+          <div data-testid="workbench-result-matrix">
+            <ResultMatrix run={activeRun} recordedByTraceId={recordedByTraceId} />
+          </div>
 
           <EscalationPanel
             run={activeRun}
@@ -501,256 +499,6 @@ function TraceRow({
             </div>
           )}
         </div>
-      )}
-    </div>
-  );
-}
-
-// --- Approval panel (state guidance + approve/revoke gate) -------------------
-
-function ApprovalPanel({ componentId }: { componentId: string }) {
-  const { data: approvalState } = useReplayApproval(componentId);
-  const approve = useApproveReplay();
-  const revoke = useRevokeReplayApproval();
-  const [confirmOpen, setConfirmOpen] = useState(false);
-  const [reason, setReason] = useState("");
-
-  if (!approvalState) return <Skeleton className="h-14 w-full" />;
-
-  if (!approvalState.active) {
-    return (
-      <div className="rounded-md border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 p-3 text-xs space-y-2">
-        <p className="font-medium text-amber-900 dark:text-amber-100">
-          Replay is not approved for "{componentId}" -- runs are blocked until a human approves it.
-        </p>
-        <p className="text-muted-foreground">
-          Next step: review the risk context and approve replay for this component.
-        </p>
-        <Button size="sm" onClick={() => setConfirmOpen(true)}>
-          Review &amp; Approve
-        </Button>
-        <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
-          <DialogHeader>
-            <DialogTitle>Approve replay for "{componentId}"</DialogTitle>
-          </DialogHeader>
-          <div className="space-y-3 text-sm">
-            <p className="text-muted-foreground">{approvalState.risk_context.warning}</p>
-            {approvalState.risk_context.probe_plan_points.length > 0 && (
-              <ul className="text-xs space-y-1">
-                {approvalState.risk_context.probe_plan_points.map((p) => (
-                  <li key={p.point_id}>
-                    plan #{p.plan_id}: side_effect_risk={p.side_effect_risk ?? "unknown"}, replayability=
-                    {p.replayability ?? "unknown"}
-                  </li>
-                ))}
-              </ul>
-            )}
-            <div className="space-y-1">
-              <Label>Reason</Label>
-              <Input
-                value={reason}
-                onChange={(e) => setReason(e.target.value)}
-                placeholder="Why is replay safe to approve for this component?"
-              />
-            </div>
-            <Button
-              className="w-full"
-              disabled={!reason.trim() || approve.isPending}
-              onClick={async () => {
-                try {
-                  await approve.mutateAsync({ componentId, reason: reason.trim() });
-                  toast.success("Replay approved");
-                  setConfirmOpen(false);
-                  setReason("");
-                } catch (e) {
-                  toast.error(String(e));
-                }
-              }}
-            >
-              {approve.isPending ? "Approving..." : "Approve"}
-            </Button>
-          </div>
-        </Dialog>
-      </div>
-    );
-  }
-
-  return (
-    <div className="flex items-center justify-between rounded-md border p-2 text-xs">
-      <span className="text-muted-foreground">Replay approved for "{componentId}".</span>
-      <Button
-        size="sm"
-        variant="outline"
-        onClick={() =>
-          revoke
-            .mutateAsync(componentId)
-            .then(() => toast.success("Approval revoked"))
-            .catch((e) => toast.error(String(e)))
-        }
-        disabled={revoke.isPending}
-      >
-        Revoke
-      </Button>
-    </div>
-  );
-}
-
-// --- Result matrix ------------------------------------------------------------
-
-const CASE_STATUS_VARIANT: Record<string, "success" | "warning" | "destructive" | "secondary" | "outline"> = {
-  match: "success",
-  diff: "warning",
-  candidate_error: "destructive",
-  error_to_success: "success",
-  error_to_same_error: "secondary",
-  error_to_different_error: "warning",
-  skipped: "outline",
-};
-
-const CASE_STATUS_LABEL: Record<string, string> = {
-  match: "match",
-  diff: "diff",
-  candidate_error: "candidate error",
-  error_to_success: "rescued",
-  error_to_same_error: "same error",
-  error_to_different_error: "different error",
-  skipped: "skipped",
-};
-
-function ResultMatrix({
-  run,
-  recordedByTraceId,
-}: {
-  run: ReplayVariantRunOut | undefined;
-  recordedByTraceId: Map<string, TraceEvent>;
-}) {
-  return (
-    <div data-testid="workbench-result-matrix" className="space-y-3">
-      <div className="rounded-md border border-blue-200 bg-blue-50 dark:bg-blue-950/20 dark:border-blue-800 px-3 py-2 text-xs text-blue-900 dark:text-blue-100">
-        Simulation only: replay executes in an isolated, network-off sandbox against the pinned
-        snapshot. Results can differ from production (environment, external services,
-        time-dependent state) -- this is not a production-equivalence guarantee.
-      </div>
-      {!run ? (
-        <p className="text-sm text-muted-foreground">Run a variant to see the diff matrix.</p>
-      ) : run.status !== "completed" ? (
-        <p className="text-sm text-muted-foreground">
-          Run #{run.id}: {run.status}
-          {run.error ? ` -- ${run.error}` : ""}
-        </p>
-      ) : (
-        <MatrixTable run={run} recordedByTraceId={recordedByTraceId} />
-      )}
-    </div>
-  );
-}
-
-function MatrixTable({
-  run,
-  recordedByTraceId,
-}: {
-  run: ReplayVariantRunOut;
-  recordedByTraceId: Map<string, TraceEvent>;
-}) {
-  const candidates = run.variants.filter((v) => !v.is_baseline);
-  const rows = candidates.find((candidate) => candidate.cases.length > 0)?.cases ?? [];
-
-  if (candidates.length === 0 || rows.length === 0) {
-    return <p className="text-sm text-muted-foreground">No cases to compare for this run.</p>;
-  }
-
-  return (
-    <div className="overflow-x-auto rounded-md border">
-      <table className="w-full text-xs">
-        <thead className="bg-muted/40">
-          <tr className="text-left">
-            <th className="p-2">Trace</th>
-            <th className="p-2">Recorded</th>
-            <th className="p-2">Baseline replay</th>
-            {candidates.map((v) => (
-              <th key={v.id} className="p-2">
-                {v.label || v.variant_key}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row) => {
-            const recorded = recordedByTraceId.get(row.trace_id);
-            return (
-              <tr key={row.trace_id} className="border-t align-top">
-                <td className="p-2 font-mono">{row.trace_id.slice(0, 10)}</td>
-                <td className="p-2 max-w-[16rem]">
-                  <pre className="whitespace-pre-wrap break-words">
-                    {recorded?.error ?? recorded?.output ?? "—"}
-                  </pre>
-                </td>
-                <td className="p-2 max-w-[16rem]">
-                  <pre className="whitespace-pre-wrap break-words">
-                    {row.recorded_error ?? row.baseline_output ?? "—"}
-                  </pre>
-                </td>
-                {candidates.map((v) => {
-                  const caseResult = v.cases.find((c) => c.position === row.position);
-                  return (
-                    <td key={v.id} className="p-2 max-w-[16rem]">
-                      {caseResult ? <CaseCell caseResult={caseResult} /> : "—"}
-                    </td>
-                  );
-                })}
-              </tr>
-            );
-          })}
-        </tbody>
-        <tfoot>
-          <tr className="border-t bg-muted/20 font-medium">
-            <td className="p-2" colSpan={3}>
-              Aggregate
-            </td>
-            {candidates.map((v) => (
-              <td key={v.id} className="p-2">
-                <AggregateCell aggregate={v.aggregate} />
-              </td>
-            ))}
-          </tr>
-        </tfoot>
-      </table>
-    </div>
-  );
-}
-
-function CaseCell({ caseResult }: { caseResult: ReplayVariantCaseResultOut }) {
-  return (
-    <div className="space-y-1">
-      <Badge variant={CASE_STATUS_VARIANT[caseResult.case_status] ?? "outline"} className="text-[10px]">
-        {CASE_STATUS_LABEL[caseResult.case_status] ?? caseResult.case_status}
-      </Badge>
-      <pre className="whitespace-pre-wrap break-words">
-        {caseResult.candidate_error ?? caseResult.candidate_output ?? "—"}
-      </pre>
-      {caseResult.field_diffs.length > 0 && (
-        <p className="text-muted-foreground">fields: {caseResult.field_diffs.join(", ")}</p>
-      )}
-      {caseResult.duration_delta_ms != null && (
-        <p className="text-muted-foreground">Δ {caseResult.duration_delta_ms.toFixed(1)}ms</p>
-      )}
-    </div>
-  );
-}
-
-function AggregateCell({ aggregate }: { aggregate: ReplayVariantAggregateOut }) {
-  return (
-    <div className="space-y-0.5 text-[11px]">
-      <div>
-        match {aggregate.match} / diff {aggregate.diff}
-      </div>
-      <div>candidate_error {aggregate.candidate_error}</div>
-      <div>rescued (error→success) {aggregate.error_to_success}</div>
-      <div>
-        skipped {aggregate.skipped} / total {aggregate.total}
-      </div>
-      {aggregate.avg_duration_delta_ms != null && (
-        <div>avg Δ {aggregate.avg_duration_delta_ms.toFixed(1)}ms</div>
       )}
     </div>
   );

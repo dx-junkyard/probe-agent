@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
-import { Play, ListPlus, FlaskConical } from "lucide-react";
+import { Play, ListPlus, FlaskConical, Bot } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Dialog, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -101,6 +101,19 @@ export function ReplayRowActions({
         }
       >
         <FlaskConical className="h-3 w-3 mr-1" /> Create Experiment
+      </Button>
+      <Button
+        size="sm"
+        variant="ghost"
+        className="h-7 px-2 text-xs"
+        title="Start an AI Candidate Studio session grounded in this trace's input"
+        onClick={() =>
+          navigate(
+            `/candidate-studio?component_id=${encodeURIComponent(componentId)}&trace_id=${encodeURIComponent(traceId)}`,
+          )
+        }
+      >
+        <Bot className="h-3 w-3 mr-1" /> この入力から改善する
       </Button>
       {dialogMode && (
         <ReplaySetDialog

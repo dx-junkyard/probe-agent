@@ -1,5 +1,5 @@
 import { Fragment, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   useComponents, useTraces, useUpdatePolicy,
   useComponentProfile, useUpdateComponentProfile,
@@ -16,6 +16,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { toast } from "sonner";
 import { formatTimestamp } from "@/lib/utils";
 import { cn } from "@/lib/utils";
+import { Bot } from "lucide-react";
 import { AddToWorkspaceButton } from "@/components/add-to-workspace";
 import { JsonTree } from "@/components/json-tree";
 import { ReplayabilityBadge, ReplayRowActions } from "@/components/replay-row-actions";
@@ -28,6 +29,7 @@ const MODE_VARIANT: Record<string, "secondary" | "success" | "warning"> = {
 };
 
 export default function ComponentsPage() {
+  const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const { data: components, isLoading } = useComponents(SIGNAL_REFRESH_INTERVAL_MS);
   // Deep link from Trace Lineage / analyzer results: /components?component=<id>
@@ -106,6 +108,14 @@ export default function ComponentsPage() {
               <h2 className="text-lg font-bold font-mono">{selected}</h2>
               <div className="flex items-center gap-2">
                 <AddToWorkspaceButton itemType="component" itemId={selected} label={selected} />
+                <Button
+                  size="sm"
+                  variant="outline"
+                  title="Start an AI Candidate Studio session for this component"
+                  onClick={() => navigate(`/candidate-studio?component_id=${encodeURIComponent(selected)}`)}
+                >
+                  <Bot className="h-4 w-4 mr-1" /> AIで別バージョンを作る
+                </Button>
                 {MODES.map(m => (
                   <Button
                     key={m}
