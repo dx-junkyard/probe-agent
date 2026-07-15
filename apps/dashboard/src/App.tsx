@@ -17,6 +17,7 @@ import SetupGuidePage from "./pages/setup-guide";
 import GenerationPage from "./pages/generation";
 import ComponentsPage from "./pages/components";
 import SimulationWorkbenchPage from "./pages/simulation-workbench";
+import CandidateStudioPage from "./pages/candidate-studio";
 import SettingsPage from "./pages/settings";
 import AdminPage from "./pages/admin";
 import WorkspacesPage from "./pages/workspaces";
@@ -45,6 +46,7 @@ export default function App() {
         <Route path="generation" element={<GenerationPage />} />
         <Route path="components" element={<ComponentsPage />} />
         <Route path="simulation-workbench" element={<SimulationWorkbenchPage />} />
+        <Route path="candidate-studio" element={<CandidateStudioPage />} />
         <Route path="workspaces" element={<WorkspacesPage />} />
         <Route path="github" element={<GithubPage />} />
         <Route path="settings" element={<SettingsPage />} />
