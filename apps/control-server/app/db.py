@@ -2186,6 +2186,119 @@ CREATE TABLE IF NOT EXISTS replay_regression_scaffolds (
 
 CREATE INDEX IF NOT EXISTS idx_replay_regression_scaffolds_system
     ON replay_regression_scaffolds (system_id, id DESC);
+
+-- =========================================================================
+-- AI Candidate Studio (Issue #252)
+--
+-- A conversation-oriented wrapper over the EXISTING isolated-Replay
+-- infrastructure (#242 Phase B/C): a CandidateSession groups a component, a
+-- pinned baseline snapshot, a Replay Set (the evaluation inputs), and the
+-- chat; every time a patch is actually generated an IMMUTABLE CandidateVersion
+-- is created (chat messages alone never create versions). Nothing here adds a
+-- new judgement, execution, or comparison path -- proposal generation reuses
+-- the reasoning-model candidate prompt + deterministic splice->diff from
+-- app/candidate_studio.py (built on replay_draft's mechanism), replay reuses
+-- POST /replay-variant-runs verbatim (same approval gate, network-off
+-- worktree sandbox, always-cleanup, finite diff matrix), and promotion reuses
+-- the variant experiment-payload shape. The LLM never adopts/merges/deploys
+-- anything: promotion only hands a reviewed patch to the existing Experiment
+-- creation flow (Principle 7).
+-- =========================================================================
+CREATE TABLE IF NOT EXISTS candidate_sessions (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    component_id          TEXT NOT NULL,
+    snapshot_id           INTEGER NOT NULL,
+    commit_sha            TEXT NOT NULL,
+    symbol_path           TEXT NOT NULL,
+    symbol_qualified_name TEXT NOT NULL,
+    replay_set_id         INTEGER NOT NULL,
+    objective             TEXT NOT NULL DEFAULT '',
+    status                TEXT NOT NULL DEFAULT 'active',  -- 'active' | 'archived'
+    created_at            REAL NOT NULL,
+    updated_at            REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (replay_set_id) REFERENCES replay_sets (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_candidate_sessions_system
+    ON candidate_sessions (system_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_candidate_sessions_component
+    ON candidate_sessions (system_id, component_id, id DESC);
+
+-- One immutable candidate version per generated patch. parent_version_id
+-- makes additional instructions branch off the selected version (a tree per
+-- session). The reasoning-model provenance lives in intelligence_runs
+-- (run_type='candidate_studio_proposal'); this table holds the structured
+-- proposal content (summary / assumptions / changed_symbols / risks /
+-- suggested_tests) plus the deterministically spliced patch, kept separate
+-- from raw replay results (CLAUDE.md storage-separation rule). status is
+-- finite: the generate job lifecycle terminal state
+-- ('proposed' = patch generated & validated | 'failed' = LLM/patch/scope/
+-- validation failure, fail-closed). replay_status is finite
+-- ('not_run' | 'running' | 'completed' | 'failed'); replay_run_id / candidate
+-- variant point at the reused replay_variant_run when replayed. promoted_at
+-- records that the reviewed patch was handed to the Experiment flow (never an
+-- auto-adoption).
+CREATE TABLE IF NOT EXISTS candidate_versions (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    session_id          INTEGER NOT NULL,
+    parent_version_id   INTEGER,
+    version_number      INTEGER NOT NULL,
+    intelligence_run_id INTEGER NOT NULL,
+    instruction         TEXT NOT NULL DEFAULT '',
+    status              TEXT NOT NULL DEFAULT 'failed',  -- 'proposed' | 'failed'
+    summary             TEXT NOT NULL DEFAULT '',
+    assumptions_json    TEXT NOT NULL DEFAULT '[]',
+    changed_symbols_json TEXT NOT NULL DEFAULT '[]',
+    risks_json          TEXT NOT NULL DEFAULT '[]',
+    suggested_tests_json TEXT NOT NULL DEFAULT '[]',
+    generated_code      TEXT NOT NULL DEFAULT '',
+    patch_text          TEXT NOT NULL DEFAULT '',
+    patch_hash          TEXT NOT NULL DEFAULT '',
+    error               TEXT,
+    replay_status       TEXT NOT NULL DEFAULT 'not_run',
+    replay_run_id       INTEGER,
+    replay_variant_id   INTEGER,
+    promoted_at         REAL,
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES candidate_sessions (id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_version_id) REFERENCES candidate_versions (id) ON DELETE SET NULL,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE CASCADE,
+    FOREIGN KEY (replay_run_id) REFERENCES replay_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_candidate_versions_session
+    ON candidate_versions (session_id, version_number);
+CREATE INDEX IF NOT EXISTS idx_candidate_versions_system
+    ON candidate_versions (system_id, session_id, id DESC);
+
+-- Conversation turns. role is finite ('user' | 'assistant'); an assistant
+-- turn may reference the version its request produced (version_id), but a
+-- message never itself creates a version -- only POST .../generate does.
+-- The assistant's "understood conditions" echo is DETERMINISTIC display text
+-- (Principle 6), not an inference; the LLM's actual understanding is surfaced
+-- inside a CandidateVersion's proposal (summary / assumptions).
+CREATE TABLE IF NOT EXISTS candidate_messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id   INTEGER NOT NULL,
+    session_id  INTEGER NOT NULL,
+    role        TEXT NOT NULL,  -- 'user' | 'assistant'
+    content     TEXT NOT NULL DEFAULT '',
+    version_id  INTEGER,
+    created_at  REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES candidate_sessions (id) ON DELETE CASCADE,
+    FOREIGN KEY (version_id) REFERENCES candidate_versions (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_candidate_messages_session
+    ON candidate_messages (session_id, id);
+CREATE INDEX IF NOT EXISTS idx_candidate_messages_system
+    ON candidate_messages (system_id, session_id);
 """
 
 
