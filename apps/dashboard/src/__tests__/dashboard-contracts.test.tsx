@@ -3154,12 +3154,44 @@ describe("System Understanding page", () => {
     expect(screen.queryByText("Get started with System Understanding")).toBeNull();
   });
 
+  // Issue #239/#240: `repository.configuration.missing` now carries
+  // `related_pipeline_steps: ["repository_configured"]`, so its CTA is
+  // driven by the matching SystemStateItem like every other step -- there is
+  // no hardcoded fallback map.
+  const repositoryMissingItem: SystemStateItem = {
+    state_id: "repository.configuration.missing",
+    state_group: "repository",
+    severity: "warning",
+    status: "missing",
+    user_action_kind: "configure",
+    intervention_timing: "now",
+    subject: "リポジトリ設定",
+    summary: "対象リポジトリが未設定です。",
+    detail: "対象リポジトリが未設定です。",
+    impact: "",
+    remediation: "Repository タブでリポジトリを設定してください。",
+    evidence: {},
+    target_ui: { route: "/repository", anchor: "repo-config", action_label: "Configure repository" },
+    related_checks: [],
+    related_pipeline_steps: ["repository_configured"],
+    source: "system_state",
+    dedupe_key: "repository.configuration",
+    scope: "global",
+    decision_method: "deterministic",
+    phase: "setup",
+  };
+
   test("shows a CTA only on the first incomplete step when the pipeline is all missing", async () => {
-    mockApi.get.mockImplementation((path: string) =>
-      path === "/repository/system-understanding"
-        ? Promise.resolve(emptyResponse)
-        : Promise.resolve(null),
-    );
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(emptyResponse);
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "warning",
+        severity_counts: { warning: 1 }, items: [repositoryMissingItem],
+        primary_item: repositoryMissingItem, notification_items: [repositoryMissingItem],
+        page_items: { "/system-understanding": [repositoryMissingItem] },
+      });
+      return Promise.resolve(null);
+    });
 
     const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
@@ -3169,8 +3201,8 @@ describe("System Understanding page", () => {
     });
 
     const cta = screen.getByTestId("pipeline-cta-repository_configured");
-    expect(cta.textContent).toContain("Configure repository");
-    expect(cta.getAttribute("href")).toBe("/repository");
+    expect(cta.textContent).toContain(repositoryMissingItem.target_ui!.action_label!);
+    expect(cta.getAttribute("href")).toBe("/repository?fix=repo-config");
 
     // No other step gets a CTA.
     expect(screen.queryByTestId("pipeline-cta-snapshot_ready")).toBeNull();
@@ -3195,11 +3227,38 @@ describe("System Understanding page", () => {
         { step: "capability_hierarchy_ready", status: "missing" },
       ],
     };
-    mockApi.get.mockImplementation((path: string) =>
-      path === "/repository/system-understanding"
-        ? Promise.resolve(midResponse)
-        : Promise.resolve(null),
-    );
+    const buildAvailableItem: SystemStateItem = {
+      state_id: "pipeline.documentation_indexed.missing",
+      state_group: "pipeline",
+      severity: "warning",
+      status: "missing",
+      user_action_kind: "build",
+      intervention_timing: "now",
+      subject: "Documentation indexed",
+      summary: "Documentation がまだ index されていません。",
+      detail: "",
+      impact: "",
+      remediation: "Build / Refresh を実行してください。",
+      evidence: {},
+      target_ui: { route: "/system-understanding", anchor: null, action_label: "Run Build / Refresh" },
+      related_checks: [],
+      related_pipeline_steps: ["documentation_indexed"],
+      source: "system_state",
+      dedupe_key: "pipeline.documentation_indexed",
+      scope: "global",
+      decision_method: "deterministic",
+      phase: "preparation",
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(midResponse);
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "warning",
+        severity_counts: { warning: 1 }, items: [buildAvailableItem],
+        primary_item: buildAvailableItem, notification_items: [buildAvailableItem],
+        page_items: { "/system-understanding": [buildAvailableItem] },
+      });
+      return Promise.resolve(null);
+    });
     mockApi.post.mockImplementation((path: string) =>
       path === "/repository/system-understanding/build"
         ? Promise.resolve(completeResponse)
@@ -3240,6 +3299,28 @@ describe("System Understanding page", () => {
         { step: "capability_hierarchy_ready", status: "missing" },
       ],
     };
+    const buildAvailableItem: SystemStateItem = {
+      state_id: "pipeline.documentation_indexed.missing",
+      state_group: "pipeline",
+      severity: "warning",
+      status: "missing",
+      user_action_kind: "build",
+      intervention_timing: "now",
+      subject: "Documentation indexed",
+      summary: "Documentation がまだ index されていません。",
+      detail: "",
+      impact: "",
+      remediation: "Build / Refresh を実行してください。",
+      evidence: {},
+      target_ui: { route: "/system-understanding", anchor: null, action_label: "Run Build / Refresh" },
+      related_checks: [],
+      related_pipeline_steps: ["documentation_indexed"],
+      source: "system_state",
+      dedupe_key: "pipeline.documentation_indexed",
+      scope: "global",
+      decision_method: "deterministic",
+      phase: "preparation",
+    };
     mockApi.get.mockImplementation((path: string) => {
       if (path === "/repository/system-understanding") return Promise.resolve(midResponse);
       if (path === "/repository/system-understanding/build/latest") {
@@ -3253,6 +3334,12 @@ describe("System Understanding page", () => {
           artifact_counts: {},
         });
       }
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "warning",
+        severity_counts: { warning: 1 }, items: [buildAvailableItem],
+        primary_item: buildAvailableItem, notification_items: [buildAvailableItem],
+        page_items: { "/system-understanding": [buildAvailableItem] },
+      });
       return Promise.resolve(null);
     });
 
@@ -3286,6 +3373,32 @@ describe("System Understanding page", () => {
     expect(screen.getByText("list_items")).toBeTruthy();
     expect(screen.getByText("42")).toBeTruthy();
     expect(screen.getByText("10")).toBeTruthy();
+  });
+
+  test("prefers the server-provided pipeline step label over the client fallback map (Issue #240)", async () => {
+    // One step carries a server `label`; the rest omit it, proving the
+    // client-side STEP_LABELS map still covers steps an older server
+    // doesn't label yet.
+    const labeledResponse = {
+      ...completeResponse,
+      pipeline: completeResponse.pipeline.map((s) =>
+        s.step === "symbols_indexed" ? { ...s, label: "コードシンボル索引" } : s,
+      ),
+    };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(labeledResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByTestId("pipeline-expand"));
+    const checklist = await screen.findByTestId("pipeline-checklist");
+    expect(checklist.textContent).toContain("コードシンボル索引");
+    // A step without a server label still falls back to STEP_LABELS.
+    expect(checklist.textContent).toContain("Snapshot ready");
   });
 
   test("renders reasoning model blocked state without heuristic fallback", async () => {
@@ -3996,9 +4109,11 @@ describe("System Understanding page", () => {
   // ── Banner behavior while a build is running (Issue #239) ───────────
   //
   // The removed primary_action's rule 2 blanked the CTA whenever a build was
-  // queued/running, unconditionally. The new frontend condition suppresses
-  // only warning/info-level page items while the BuildJobPanel is showing
-  // progress; error/blocked items always stay visible.
+  // queued/running, unconditionally. The banner now shows the exact same
+  // canonical page_items[route][0]/primary_item projection as every other
+  // surface (e.g. the Pipeline Checklist) with no client-side suppression
+  // keyed on buildRunning -- an item only disappears when the server itself
+  // resolves or phase-suppresses it.
 
   const runningBuildResponse = {
     id: 1, job_id: 1, run_id: 1, system_id: 1, snapshot_id: 5,
@@ -4010,7 +4125,7 @@ describe("System Understanding page", () => {
     artifact_counts: {},
   };
 
-  test("suppresses a warning-level page banner while a build is running", async () => {
+  test("keeps a warning-level page banner visible while a build is running", async () => {
     mockApi.get.mockImplementation((path: string) => {
       if (path === "/repository/system-understanding") return Promise.resolve(completeResponse);
       if (path === "/repository/system-understanding/build/latest") return Promise.resolve(runningBuildResponse);
@@ -4030,7 +4145,7 @@ describe("System Understanding page", () => {
       expect(screen.getByTestId("build-progress")).toBeTruthy();
     });
 
-    expect(screen.queryByTestId("system-state-banner")).toBeNull();
+    expect(screen.getByTestId("system-state-banner").textContent).toContain(purposeMissingItem.summary);
   });
 
   test("keeps an error-level page banner visible while a build is running", async () => {
@@ -5800,18 +5915,19 @@ describe("Hub success summary and pipeline collapse (Issue #211)", () => {
     expect(cta).toHaveAttribute("href", "/interview?fix=interview-capabilities");
   });
 
-  test("pipeline CTA falls back to the generic Build action when no StateItem names the step", async () => {
+  test("pipeline CTA renders nothing when no StateItem names the step", async () => {
     // Same pipeline detail text, but no matching StateItem in page_items:
-    // the CTA falls back to the fixed STEP_CTA map instead of guessing
-    // intent from the free-text detail (Issue #239; formerly the Interview
-    // CTA was derived from the structured diagnostic).
+    // there is no hardcoded fallback map (Issue #239), so no CTA button
+    // renders for the step -- the status badge still does. Formerly the
+    // Interview CTA was derived from the structured diagnostic; now the CTA
+    // is sourced solely from the matching SystemStateItem.
     mockSuApis(incompleteCapabilityResponse);
 
     const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
 
-    const cta = await screen.findByTestId("pipeline-cta-capability_hierarchy_ready");
-    expect(cta).toHaveTextContent("Run Build / Refresh");
+    expect(await screen.findByTestId("pipeline-checklist")).toBeInTheDocument();
+    expect(screen.queryByTestId("pipeline-cta-capability_hierarchy_ready")).toBeNull();
   });
 
   test("undefined purpose adds the prerequisite note to the entry cards", async () => {
@@ -5949,7 +6065,10 @@ describe("User phase indicator (Issue #239)", () => {
     mockSystemId = 1;
   });
 
-  const stateWithPhase = (userPhase: string, phases: { phase: string; complete: boolean }[]) => ({
+  const stateWithPhase = (
+    userPhase: string,
+    phases: { phase: string; complete: boolean; label?: string }[],
+  ) => ({
     system_id: 1, generated_at: 1, overall_severity: "ok",
     severity_counts: {}, items: [], primary_item: null,
     notification_items: [], page_items: {},
@@ -5982,6 +6101,30 @@ describe("User phase indicator (Issue #239)", () => {
     expect(preparation.getAttribute("data-current")).toBe("true");
 
     expect(screen.getByTestId("user-phase-diagnosis").getAttribute("data-current")).toBe("false");
+  });
+
+  test("prefers the server-provided phase label over the client fallback map (Issue #240)", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-state"
+        ? Promise.resolve(stateWithPhase("preparation", [
+            { phase: "setup", complete: true, label: "セットアップ完了" },
+            { phase: "preparation", complete: false, label: "準備" },
+            // No server label for this entry: proves the client fallback
+            // (USER_PHASE_LABELS) still applies when the server omits it.
+            { phase: "diagnosis", complete: false },
+          ]))
+        : Promise.resolve(null),
+    );
+
+    const { UserPhaseIndicator, USER_PHASE_LABELS } = await import("@/components/system-state");
+    render(<UserPhaseIndicator />, { wrapper: createWrapper() });
+
+    const indicator = await screen.findByTestId("user-phase-indicator");
+    expect(indicator.getAttribute("title")).toBe("現在のフェーズ: 準備");
+    expect(screen.getByTestId("user-phase-setup").textContent).toContain("セットアップ完了");
+    expect(screen.getByTestId("user-phase-preparation").textContent).toContain("準備");
+    expect(screen.getByTestId("user-phase-diagnosis").textContent)
+      .toContain(USER_PHASE_LABELS.diagnosis);
   });
 
   test("display switches when the server-derived phase changes", async () => {
@@ -6938,7 +7081,11 @@ describe("PrerequisiteGuide (Issue #241)", () => {
     phase: "setup",
   };
 
-  const stateWith = (userPhase: string, primaryItem: unknown = guidePrimaryItem) => ({
+  const stateWith = (
+    userPhase: string,
+    primaryItem: unknown = guidePrimaryItem,
+    phaseLabels?: Record<string, string>,
+  ) => ({
     system_id: 1,
     generated_at: 1,
     overall_severity: "warning",
@@ -6949,9 +7096,9 @@ describe("PrerequisiteGuide (Issue #241)", () => {
     page_items: {},
     user_phase: userPhase,
     phases: [
-      { phase: "setup", complete: userPhase !== "setup" },
-      { phase: "preparation", complete: userPhase === "diagnosis" },
-      { phase: "diagnosis", complete: false },
+      { phase: "setup", complete: userPhase !== "setup", label: phaseLabels?.setup },
+      { phase: "preparation", complete: userPhase === "diagnosis", label: phaseLabels?.preparation },
+      { phase: "diagnosis", complete: false, label: phaseLabels?.diagnosis },
     ],
   });
 
@@ -6970,6 +7117,20 @@ describe("PrerequisiteGuide (Issue #241)", () => {
     expect(screen.getByText("Repository タブでリポジトリを設定してください。")).toBeTruthy();
     // CTA carries the server-supplied action label.
     expect(screen.getByTestId("prerequisite-guide-cta").textContent).toContain("リポジトリを設定");
+  });
+
+  test("prefers the server-provided phase label over the client fallback map (Issue #240)", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-state"
+        ? Promise.resolve(stateWith("setup", guidePrimaryItem, { setup: "セットアップ完了" }))
+        : Promise.resolve(null),
+    );
+    const { PrerequisiteGuide } = await import("@/components/prerequisite-guide");
+    render(<PrerequisiteGuide />, { wrapper: createWrapper() });
+
+    const guide = await screen.findByTestId("prerequisite-guide");
+    expect(guide.getAttribute("data-current-phase")).toBe("setup");
+    expect(screen.getByTestId("prerequisite-guide-phase").textContent).toContain("セットアップ完了");
   });
 
   test("disappears at the terminal diagnosis phase", async () => {

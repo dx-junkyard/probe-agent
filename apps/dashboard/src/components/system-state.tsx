@@ -65,6 +65,10 @@ export function SystemStateAction({
  * the client (kept in one place so Issue #240's copy pass can consolidate
  * it). Falls back to the raw token for an unknown value rather than
  * guessing.
+ *
+ * Issue #240: `phases[].label` (server-provided, Japanese) is now the
+ * canonical label. This map is only the fallback used when a phase entry
+ * has no `label` (older Control Server).
  */
 export const USER_PHASE_LABELS: Record<UserPhase, string> = {
   setup: "必要最低限の設定",
@@ -106,12 +110,18 @@ export function isItemInCurrentPhaseScope(
 export function UserPhaseIndicator() {
   const { data } = useSystemState();
   if (!data?.user_phase || !data.phases?.length) return null;
+  // Issue #240: prefer the server-provided label for the current phase
+  // (looked up from the same `phases` entries rendered below), falling back
+  // to the fixed client-side map, then the raw token.
+  const currentPhaseLabel = data.phases.find((p) => p.phase === data.user_phase)?.label
+    ?? USER_PHASE_LABELS[data.user_phase]
+    ?? data.user_phase;
   return (
     <div
       className="hidden items-center gap-1 md:flex"
       data-testid="user-phase-indicator"
       data-current-phase={data.user_phase}
-      title={`現在のフェーズ: ${USER_PHASE_LABELS[data.user_phase] ?? data.user_phase}`}
+      title={`現在のフェーズ: ${currentPhaseLabel}`}
     >
       {data.phases.map((p, i) => {
         const isCurrent = p.phase === data.user_phase;
@@ -132,7 +142,7 @@ export function UserPhaseIndicator() {
               data-current={isCurrent}
             >
               {p.complete && <CheckCircle2 className="h-3 w-3 text-green-600" />}
-              {USER_PHASE_LABELS[p.phase] ?? p.phase}
+              {p.label || USER_PHASE_LABELS[p.phase] || p.phase}
             </span>
           </span>
         );

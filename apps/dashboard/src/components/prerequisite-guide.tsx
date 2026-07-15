@@ -37,7 +37,12 @@ export function PrerequisiteGuide({
   // prerequisites met (terminal phase): render nothing.
   if (!data?.user_phase || data.user_phase === "diagnosis") return null;
 
-  const phaseLabel = USER_PHASE_LABELS[data.user_phase] ?? data.user_phase;
+  // Issue #240: prefer the server-provided label for the current phase
+  // (from the matching `phases` entry), falling back to the fixed
+  // client-side map, then the raw token.
+  const phaseLabel = data.phases?.find((p) => p.phase === data.user_phase)?.label
+    ?? USER_PHASE_LABELS[data.user_phase]
+    ?? data.user_phase;
   const item = data.primary_item ?? null;
   const target = item ? systemStateTarget(item) : null;
 

@@ -1057,6 +1057,17 @@ class TestIssue236FactsExtractionRegression:
         assert not any(i.startswith("pipeline.") for i in items)
         assert not any(i.startswith("understanding.") for i in items)
 
+    def test_repository_configuration_missing_carries_related_pipeline_step(self, admin_client):
+        # Finding #3: without this, the Dashboard Pipeline Checklist has no
+        # way to drive the repository_configured step's CTA from
+        # system-state -- it falls back to a hardcoded map.
+        _, _, hdrs = _setup(admin_client)
+        _, items = _get_state(admin_client, hdrs)
+
+        assert items["repository.configuration.missing"]["related_pipeline_steps"] == [
+            "repository_configured"
+        ]
+
     def test_snapshot_only_response_shape(self, admin_client, tmp_path):
         _, sys, hdrs = _setup(admin_client)
         repo, sha = _init_git_repo(tmp_path)
@@ -1395,6 +1406,8 @@ class TestUserPhaseIntegration:
             )
 
     def _complete_pipeline(self, admin_client, sys, hdrs, tmp_path):
+        from app.db import get_conn
+
         repo, sha = _init_git_repo(tmp_path)
         admin_client.put(
             "/repository",
@@ -1412,7 +1425,51 @@ class TestUserPhaseIntegration:
         run_id = _insert_intelligence_run(sys["id"], snapshot_id, "capability_hierarchy", "completed")
         _insert_capability_node(sys["id"], snapshot_id, run_id, node_type="purpose", name="Test system")
         _insert_capability_node(sys["id"], snapshot_id, run_id, node_type="capability", name="Item management")
+        # Issue #237 fix: pipeline_all_complete is now derived from the full
+        # 8-step Pipeline Checklist (compute_pipeline_steps), which also
+        # requires documentation_claims_scanned (an understanding graph
+        # snapshot), entrypoints_discovered (an actual code_entrypoints row
+        # -- distinct from the "entrypoint_index" intelligence_run row the 4
+        # legacy runs above already insert), and docs_code_reconciled (graph
+        # + code symbols both present) to be "complete" -- not just the 4
+        # legacy run/build rows above. Seed all three so tests that reach
+        # "diagnosis" via this helper keep doing so under the corrected,
+        # stricter gate.
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO understanding_graph_snapshots
+                       (system_id, snapshot_id, graph_json, source_hash, claim_count,
+                        confidence_summary, created_at)
+                   VALUES (?, ?, '{}', '', 0, '{}', 0)""",
+                (sys["id"], snapshot_id),
+            )
+            conn.execute(
+                """INSERT INTO code_symbols
+                       (snapshot_id, system_id, path, qualified_name, kind, start_line, end_line)
+                   VALUES (?, ?, 'a.py', 'mod.fn', 'function', 1, 2)""",
+                (snapshot_id, sys["id"]),
+            )
+            conn.execute(
+                """INSERT INTO code_entrypoints
+                       (system_id, snapshot_id, entrypoint_type, entrypoint_id, category, label,
+                        handler_path, handler_qualified_name, line_start, line_end, created_at)
+                   VALUES (?, ?, 'api', 'GET /items', 'api', 'label', 'a.py', 'mod.fn', 1, 2, 0)""",
+                (sys["id"], snapshot_id),
+            )
         return snapshot_id
+
+    def test_phases_carry_japanese_catalog_label(self, admin_client):
+        """Finding #4: state_messages.PHASE_LABELS / phase_label must be
+        serialized onto each phase completion entry."""
+        from app import state_messages
+
+        _, _, hdrs = _setup(admin_client)
+        data, _items = _get_state(admin_client, hdrs)
+
+        assert data["phases"]
+        for phase in data["phases"]:
+            assert phase["label"], f"missing label for phase={phase['phase']}"
+            assert phase["label"] == state_messages.phase_label(phase["phase"])
 
     def test_unconfigured_repository_is_setup_and_suppresses_later_phase_items(self, admin_client):
         _, _, hdrs = _setup(admin_client)
@@ -1514,3 +1571,112 @@ class TestUserPhaseIntegration:
 
         data, _items = _get_state(admin_client, hdrs)
         assert data["user_phase"] == "preparation"
+
+    def _four_legacy_runs_only(self, admin_client, sys, hdrs, tmp_path):
+        """Seed only the 4 legacy run/build rows the pre-fix
+        ``pipeline_all_complete`` looked at (symbol_index, entrypoint_index,
+        documentation_index build step, capability_hierarchy) -- deliberately
+        WITHOUT an understanding graph snapshot, code symbols, or a code
+        entrypoint, so ``documentation_claims_scanned``,
+        ``entrypoints_discovered``, and ``docs_code_reconciled`` all stay
+        incomplete on the canonical 8-step Pipeline Checklist.
+        """
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+        snapshot_id = snap.json()["id"]
+
+        _insert_intelligence_run(sys["id"], snapshot_id, "symbol_index", "completed")
+        _insert_intelligence_run(sys["id"], snapshot_id, "entrypoint_index", "completed")
+        build_id = _insert_active_build(sys["id"], snapshot_id)
+        _insert_build_step(sys["id"], snapshot_id, build_id, "documentation_index", "completed")
+        run_id = _insert_intelligence_run(sys["id"], snapshot_id, "capability_hierarchy", "completed")
+        _insert_capability_node(sys["id"], snapshot_id, run_id, node_type="purpose", name="Test system")
+        _insert_capability_node(sys["id"], snapshot_id, run_id, node_type="capability", name="Item management")
+        return snapshot_id
+
+    def test_legacy_four_row_completion_alone_does_not_reach_diagnosis(
+        self, admin_client, tmp_path, monkeypatch
+    ):
+        """Finding #1 regression: before the fix, ``pipeline_all_complete``
+        only checked these same 4 rows, so an approved probe plan on top of
+        them alone was enough to reach "diagnosis" -- even though the
+        canonical 8-step Pipeline Checklist (documentation_claims_scanned /
+        entrypoints_discovered / docs_code_reconciled) was still incomplete.
+        The fixed derivation must keep this at "preparation".
+        """
+        self._configure_reasoning_llm(monkeypatch)
+        _, sys, hdrs = _setup(admin_client)
+        snapshot_id = self._four_legacy_runs_only(admin_client, sys, hdrs, tmp_path)
+        plan_run_id = _insert_intelligence_run(sys["id"], snapshot_id, "probe_plan", "completed")
+        self._insert_probe_plan(sys["id"], snapshot_id, plan_run_id, status="approved")
+
+        data, items = _get_state(admin_client, hdrs)
+        assert data["user_phase"] == "preparation"
+        by_phase = {p["phase"]: p["complete"] for p in data["phases"]}
+        assert by_phase["setup"] is True
+        assert by_phase["preparation"] is False
+
+    def test_empty_capability_hierarchy_warning_does_not_reach_diagnosis(
+        self, admin_client, tmp_path, monkeypatch
+    ):
+        """Finding #1 regression: a completed capability_hierarchy run with
+        zero capabilities is a ``warning`` on the canonical checklist (Issue
+        #210), not "complete" -- so it must not count toward
+        ``pipeline_all_complete`` even though the raw run status is
+        "completed".
+        """
+        self._configure_reasoning_llm(monkeypatch)
+        _, sys, hdrs = _setup(admin_client)
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        snapshot_id = snap.json()["id"]
+
+        _insert_intelligence_run(sys["id"], snapshot_id, "symbol_index", "completed")
+        _insert_intelligence_run(sys["id"], snapshot_id, "entrypoint_index", "completed")
+        build_id = _insert_active_build(sys["id"], snapshot_id)
+        _insert_build_step(sys["id"], snapshot_id, build_id, "documentation_index", "completed")
+        # capability_hierarchy run completes but produces zero capability
+        # nodes -- the "completed but empty" warning branch.
+        _insert_intelligence_run(sys["id"], snapshot_id, "capability_hierarchy", "completed")
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO understanding_graph_snapshots
+                       (system_id, snapshot_id, graph_json, source_hash, claim_count,
+                        confidence_summary, created_at)
+                   VALUES (?, ?, '{}', '', 0, '{}', 0)""",
+                (sys["id"], snapshot_id),
+            )
+            conn.execute(
+                """INSERT INTO code_symbols
+                       (snapshot_id, system_id, path, qualified_name, kind, start_line, end_line)
+                   VALUES (?, ?, 'a.py', 'mod.fn', 'function', 1, 2)""",
+                (snapshot_id, sys["id"]),
+            )
+            conn.execute(
+                """INSERT INTO code_entrypoints
+                       (system_id, snapshot_id, entrypoint_type, entrypoint_id, category, label,
+                        handler_path, handler_qualified_name, line_start, line_end, created_at)
+                   VALUES (?, ?, 'api', 'GET /items', 'api', 'label', 'a.py', 'mod.fn', 1, 2, 0)""",
+                (sys["id"], snapshot_id),
+            )
+        plan_run_id = _insert_intelligence_run(sys["id"], snapshot_id, "probe_plan", "completed")
+        self._insert_probe_plan(sys["id"], snapshot_id, plan_run_id, status="approved")
+
+        data, items = _get_state(admin_client, hdrs)
+        assert items["pipeline.capability_hierarchy.empty"]["severity"] == "warning"
+        assert data["user_phase"] == "preparation"
+        by_phase = {p["phase"]: p["complete"] for p in data["phases"]}
+        assert by_phase["preparation"] is False

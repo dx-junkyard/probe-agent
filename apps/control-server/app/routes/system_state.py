@@ -56,7 +56,7 @@ def get_system_state_assessment(
         page_items={route: [_item_out(item) for item in items] for route, items in assessment.page_items.items()},
         user_phase=assessment.user_phase,
         phases=[
-            SystemStatePhaseCompletionOut(phase=p.phase, complete=p.complete)
+            SystemStatePhaseCompletionOut(phase=p.phase, complete=p.complete, label=p.label)
             for p in assessment.phases
         ],
     )

@@ -143,25 +143,28 @@ step 名を含む項目。`page_items["/system-understanding"]` はサーバー�
 そのまま消費する。これによりバッジ・バナー・notice と同じ root cause が
 このページでだけ別文言・別遷移先になることがない。
 
-`STEP_CTA` の固定マッピング（Issue #200、CLAUDE.md Principle 6 の範囲内）
-は「対応する StateItem が無い step」の最終手段フォールバックとしてのみ
-残る（#239 時点で該当するのは repository 未設定時の
-`repository_configured` のみ — ネイティブ項目
-`repository.configuration.missing` は `related_pipeline_steps` を持たず、
-それを持つ診断投影は covered 済みとして抑制されるため）:
+`STEP_CTA` の固定マッピング（Issue #200）は撤去された。CTA は例外なく
+`GET /system-state` の `StateItem` から導出され、ハードコードのフォール
+バックは持たない。以前フォールバックに落ちていた唯一の step
+`repository_configured` は、ネイティブ項目 `repository.configuration.missing`
+が `related_pipeline_steps: ["repository_configured"]` を持つようになった
+ため、他の step と同様 `stateItemForStep` でマッチする。ある step の
+最初の非 `complete` 項目が万一欠けている場合は、その step には CTA
+ボタンを出さない（status バッジと「Why?」診断は従来どおり表示）—
+古い固定文言・固定遷移先を出すよりも一貫性を優先する。
 
-| step | CTA | 遷移/操作 |
-| --- | --- | --- |
-| `repository_configured` | Configure repository | `/repository` へ遷移 |
-| `snapshot_ready` | Create snapshot | `/repository` へ遷移 |
-| 上記以外の全 step（`symbols_indexed` / `documentation_indexed` /
-  `documentation_claims_scanned` / `entrypoints_discovered` /
-  `docs_code_reconciled` / `capability_hierarchy_ready`） | Run Build / Refresh | ページの `Build / Refresh` ボタンと同じ
-  `build.mutate()` を起動 |
+CTA の文言・遷移先は該当 `StateItem` の `target_ui`
+（`action_label` / `systemStateTarget()`）から取る。`user_action_kind ===
+"build"` の項目だけはページの `Build / Refresh` ボタンと同じ
+`build.mutate()` を起動し、ビルド実行中（`build.isPending` または最新ジョブが
+`queued`/`running`）は無効化される。それ以外の項目は `target_ui.route`
+への遷移リンクになる。CTA には `pipeline-cta-<step>` の `data-testid`
+が付く。
 
-Build 系 CTA はビルド実行中（`build.isPending` または最新ジョブが
-`queued`/`running`）は無効化される。CTA には `pipeline-cta-<step>` の
-`data-testid` が付く。
+Pipeline Checklist の各 step ラベルは Issue #240 でサーバー正本化された:
+`GET /system-understanding` の各 step が返す `label`（`state_messages.PIPELINE_STEP_LABELS`
+由来の日本語）を UI はそのまま表示し、クライアント側の `STEP_LABELS` は
+サーバー文言欠落時（旧サーバー）のフォールバックとしてのみ残る。
 
 全 step が `complete` のとき、Pipeline Status カードは既定で折りたたまれ
 （`data-testid="pipeline-collapsed"`、`N/N steps complete` の要約表示）、
@@ -323,7 +326,7 @@ Sub 3（#238）の領分であり、#236 は対象外。
 | フェーズ | 完了条件 |
 | --- | --- |
 | `setup` | 対象リポジトリ登録済み、かつ repository / database / auth / llm 系診断（`system_diagnostics.DiagnosticCheck.category`）に `error` / `blocked` が無い |
-| `preparation` | ready snapshot 存在、決定的パイプライン全ステップ（symbol_index / entrypoint_index / documentation_index / capability_hierarchy）が `completed`、Purpose / Capabilities が `evaluate_understanding` の `satisfied_current` または `baseline_reusable`、かつ計装経路確立（承認済み probe plan が 1 件以上、または SDK 接続状態が `no_signal` でない） |
+| `preparation` | ready snapshot 存在、決定的 8 ステップ Pipeline Checklist（`system_understanding_service.compute_pipeline_steps` — repository_configured / snapshot_ready / documentation_indexed / documentation_claims_scanned / symbols_indexed / entrypoints_discovered / docs_code_reconciled / capability_hierarchy_ready）が全て `complete`（Issue #237）、Purpose / Capabilities が `evaluate_understanding` の `satisfied_current` または `baseline_reusable`、かつ計装経路確立（承認済み probe plan が 1 件以上、または SDK 接続状態が `no_signal` でない）。`pipeline_all_complete` は Pipeline Checklist と同一の共有関数から導出されるため、Checklist に未完了 step（`warning` / `blocked` / `missing`、例: 空の capability hierarchy）が残る限り `diagnosis` へ進まない |
 | `diagnosis` | 終端フェーズ（完了条件なし） |
 
 現在フェーズ = 完了条件を満たさない最初のフェーズ。導出は
@@ -389,10 +392,13 @@ pipeline step / stage の表示名、gap のタイトル/next-action、成功サ
   `tests/test_state_messages.py`（全 `ALL_*` キーの解決検証 + 実プロデューサ
   を駆動した網羅検証 + 代表文言スナップショット）が検出する。
 - Dashboard は状態文言を生成しない。stage ラベル/説明・成功サマリ
-  （`SystemUnderstandingOut.success_summary`）・フェーズ表示ラベル・gap
+  （`SystemUnderstandingOut.success_summary`）・フェーズ表示ラベル
+  （`SystemStatePhaseCompletion.label`, Issue #240）・pipeline step ラベル
+  （`SystemUnderstandingPipelineStep.label`, Issue #240）・gap
   アクションはサーバー供給値を消費し、`STAGE_LABELS` /
-  `USER_PHASE_LABELS` / `STEP_CTA` 等の固定ラベルはサーバー文言欠落時の
-  最終手段フォールバックとしてのみ残す。gap の「実装 issue を作成」
+  `USER_PHASE_LABELS` / `STEP_LABELS` 等の固定ラベルはサーバー文言欠落時の
+  最終手段フォールバックとしてのみ残す（`STEP_CTA` の固定 CTA マップは
+  Issue #239 で撤去済み — CTA は `StateItem` からのみ導出）。gap の「実装 issue を作成」
   アクションはラベル一致で識別するため、フロントの `CREATE_ISSUE_ACTION`
   はカタログの `GAP_CREATE_ISSUE_ACTION` と一致させる。
 

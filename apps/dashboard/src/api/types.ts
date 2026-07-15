@@ -362,6 +362,8 @@ export interface SystemStateItem {
 export interface SystemStatePhaseCompletion {
   phase: UserPhase;
   complete: boolean;
+  /** Issue #240: server-provided display label (Japanese) for this phase. */
+  label?: string;
 }
 
 export interface SystemStateAssessment {
@@ -1991,6 +1993,8 @@ export interface SystemUnderstandingPipelineStep {
   step: string;
   status: "complete" | "missing" | "warning" | "blocked" | "failed";
   detail?: string | null;
+  /** Issue #240: server-provided display label (Japanese) for this step. */
+  label?: string;
 }
 
 // Still used by SystemUnderstandingStageStatus.stage (the 4 Hub stages).

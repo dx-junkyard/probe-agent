@@ -1238,7 +1238,8 @@ def _repository_state_items(conn, system_id: int) -> List[StateItem]:
             detail=msg["detail"],
             remediation=msg["remediation"],
             target_ui=TargetUi(route=PAGE_REPOSITORY, anchor="repo-config", action_label=msg["action_label"]),
-            related_checks=["repository_config"], dedupe_key="repository.configuration",
+            related_checks=["repository_config"], related_pipeline_steps=["repository_configured"],
+            dedupe_key="repository.configuration",
         )]
 
     latest_ready = state_facts.get_latest_ready_snapshot(conn, system_id)
@@ -1348,12 +1349,16 @@ def derive_user_phase(facts: UserPhaseFacts) -> UserPhaseResult:
 
     - ``setup``: the target repository is registered, and no
       repository/database/auth/llm diagnostic is ``error``/``blocked``.
-    - ``preparation``: a ready snapshot exists, every deterministic pipeline
-      step (symbol index, entrypoint index, documentation index, capability
-      hierarchy) has completed for it, System Purpose and Core Capabilities
-      are each ``satisfied_current`` or ``baseline_reusable``, and an
-      instrumentation path is established -- at least one *approved* probe
-      plan, or SDK connectivity that is not ``no_signal``.
+    - ``preparation``: a ready snapshot exists, every step of the
+      deterministic 8-step Pipeline Checklist
+      (``system_understanding_service.compute_pipeline_steps`` --
+      repository_configured, snapshot_ready, documentation_indexed,
+      documentation_claims_scanned, symbols_indexed, entrypoints_discovered,
+      docs_code_reconciled, capability_hierarchy_ready) is ``complete`` for
+      it, System Purpose and Core Capabilities are each ``satisfied_current``
+      or ``baseline_reusable``, and an instrumentation path is established --
+      at least one *approved* probe plan, or SDK connectivity that is not
+      ``no_signal``.
     - ``diagnosis``: terminal; no completion condition.
 
     The current phase is the first phase (in ``PHASE_ORDER``) whose
@@ -1590,20 +1595,16 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
             if docs_code_reconcile:
                 items.append(docs_code_reconcile)
 
-            # Raw run/step statuses (not "item is None") for the preparation
-            # phase's "pipeline 全ステップ complete" fact: the capability
-            # hierarchy step can be raw-status "completed" while still
-            # producing a StateItem (Issue #210's empty-result warning), so
-            # "no item" is not an equivalent signal here.
-            pipeline_all_complete = all(
-                row is not None and row["status"] == "completed"
-                for row in (
-                    state_facts.get_latest_intelligence_run(conn, system_id, snapshot_id, ["symbol_index"]),
-                    state_facts.get_latest_intelligence_run(conn, system_id, snapshot_id, ["entrypoint_index"]),
-                    state_facts.get_latest_build_step(conn, system_id, snapshot_id, "documentation_index"),
-                    state_facts.get_latest_intelligence_run(conn, system_id, snapshot_id, ["capability_hierarchy"]),
-                )
-            )
+            # Preparation "pipeline 全ステップ complete" is derived from the SAME
+            # canonical 8-step Pipeline Checklist the System Understanding page and
+            # its badges render (Issue #237/#239), so the user_phase gate and the
+            # checklist can never disagree. A "warning"/"blocked"/"missing" step
+            # (e.g. empty capability hierarchy, unreconciled docs-code, ungraphed
+            # claims) counts as NOT complete -- matching the checklist exactly.
+            from .system_understanding_service import compute_pipeline_steps
+            snapshot_row = state_facts.get_latest_ready_snapshot(conn, system_id)
+            pipeline_steps = compute_pipeline_steps(conn, system_id, snapshot_row)
+            pipeline_all_complete = all(step.status == "complete" for step in pipeline_steps)
 
         approved_probe_plan_count = state_facts.count_approved_probe_plans(conn, system_id)
         undecided_experiment_count = state_facts.count_undecided_completed_experiments(conn, system_id)
