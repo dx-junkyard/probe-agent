@@ -21,6 +21,8 @@ import { formatTimestamp, formatBytes } from "@/lib/utils";
 import { GitCommit, FolderTree, Code2, RefreshCw, AlertTriangle, ScanSearch, Sparkles, GitBranch, CheckCircle2 } from "lucide-react";
 import type { RepositoryCandidateOut, RepositoryConfigOut } from "@/api/types";
 import { SystemStateBanner } from "@/components/system-state";
+import { useRepositoryConfiguredGate } from "@/components/repository-gate";
+import { Link } from "react-router-dom";
 
 function patternsToText(patterns: string[] | undefined): string {
   return (patterns ?? []).join("\n");
@@ -47,6 +49,11 @@ export default function RepositoryPage() {
   const { data: repoStatus } = useRepositoryStatus();
   const { data: systemState } = useSystemState();
   const pageItem = systemState?.page_items["/repository"]?.[0] ?? systemState?.primary_item;
+  // Issue #258: gating "no ready snapshot yet" here would be a chicken-and-
+  // egg deadlock -- creating the first snapshot IS the fix -- so this only
+  // gates on the repository being definitively unconfigured (two-stage rule:
+  // stays unblocked while status is loading/unknown).
+  const configGate = useRepositoryConfiguredGate();
 
   const configKey = systemId != null ? `${systemId}-${config?.repo_path ?? ""}` : "empty";
 
@@ -163,13 +170,22 @@ export default function RepositoryPage() {
                     });
                   }
                 }).catch(e => toast.error(String(e)))}
-                disabled={createSnapshot.isPending}
+                disabled={createSnapshot.isPending || configGate.blocked}
+                title={configGate.blocked ? [configGate.summary, configGate.remediation].filter(Boolean).join(" ") : undefined}
               >
                 <RefreshCw className={`h-4 w-4 mr-1 ${createSnapshot.isPending ? "animate-spin" : ""}`} />
                 Create Snapshot
               </Button>
             </CardHeader>
             <CardContent>
+              {configGate.blocked && (
+                <p className="text-xs text-muted-foreground mb-3" data-testid="create-snapshot-not-configured-reason">
+                  {configGate.summary} {configGate.remediation}{" "}
+                  {configGate.to && (
+                    <Link to={configGate.to} className="underline">{configGate.actionLabel ?? "Go to Repository"}</Link>
+                  )}
+                </p>
+              )}
               {snapsLoading ? (
                 <div className="space-y-2">{[1,2,3].map(i=><Skeleton key={i} className="h-16 w-full"/>)}</div>
               ) : !snapshots?.length ? (

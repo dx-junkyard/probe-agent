@@ -22,6 +22,7 @@ import { AddToWorkspaceButton } from "@/components/add-to-workspace";
 import { ContextHeader } from "@/components/layout/context-header";
 import { PrerequisiteGuide } from "@/components/prerequisite-guide";
 import { useSystemState } from "@/api/hooks";
+import { useRepositoryReadySnapshotGate } from "@/components/repository-gate";
 
 export default function ProbePlannerPage() {
   const [searchParams] = useSearchParams();
@@ -49,6 +50,13 @@ export default function ProbePlannerPage() {
   const { data: systemState } = useSystemState();
   const preparationComplete =
     systemState?.phases?.find((p) => p.phase === "preparation")?.complete ?? false;
+  // Issue #258: a harder, definitive gate than the phase-based
+  // PrerequisiteGuide above -- generate_probe_plan_endpoint 400s outright
+  // when there is no ready snapshot, regardless of feature id, so block the
+  // button rather than let it reach a guaranteed server error. Two-stage
+  // rule preserved: repoGate.blocked stays false while status is
+  // loading/unknown (escape hatch), only flipping true on a definitive fact.
+  const repoGate = useRepositoryReadySnapshotGate();
   const generatePatch = useGeneratePatch();
   const validatePatch = useValidatePatch();
   const applyPatch = useApplyProbePatch();
@@ -139,12 +147,22 @@ export default function ProbePlannerPage() {
             setManualFeatureEntry(false);
             setShowGenerate(true);
           }}
-          disabled={generatePlan.isPending}
+          disabled={generatePlan.isPending || repoGate.blocked}
+          title={repoGate.blocked ? [repoGate.summary, repoGate.remediation].filter(Boolean).join(" ") : undefined}
         >
           <Crosshair className="h-4 w-4 mr-1" />
           {generatePlan.isPending ? "Generating..." : "Generate Plan"}
         </Button>
       </div>
+
+      {repoGate.blocked && (
+        <p className="text-xs text-destructive" data-testid="generate-plan-blocked-reason">
+          {repoGate.summary} {repoGate.remediation}{" "}
+          {repoGate.to && (
+            <Link to={repoGate.to} className="underline">{repoGate.actionLabel ?? "Go to Repository"}</Link>
+          )}
+        </p>
+      )}
 
       {plansData?.is_mock && (
         <div className="rounded-md border border-amber-200 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 px-4 py-3 text-sm text-amber-800 dark:text-amber-200">
@@ -161,6 +179,15 @@ export default function ProbePlannerPage() {
           {plans.map(plan => {
             const expanded = expandedPlan === plan.id;
             const planPatches = patches?.filter(p => p.plan_id === plan.id) ?? [];
+            // Issue #258: mirrors generate_patch_endpoint's own precondition
+            // exactly (point_rows query: `status = 'approved' AND
+            // denylist_hit IS NULL`) -- plan.status itself is never set to
+            // "approved" anywhere server-side, so the real, exact gate is
+            // "at least one approved, non-denylisted probe point", not the
+            // plan's own status.
+            const canGeneratePatch = plan.probe_points.some(
+              pt => pt.status === "approved" && !pt.denylist_hit,
+            );
             return (
               <Card key={plan.id} ref={el => { cardRefs.current[plan.id] = el; }}>
                 <CardHeader
@@ -230,7 +257,8 @@ export default function ProbePlannerPage() {
                       <Button
                         size="sm" variant="outline"
                         onClick={() => generatePatch.mutateAsync(plan.id).then(() => toast.success("Patch generated")).catch(e => toast.error(String(e)))}
-                        disabled={generatePatch.isPending}
+                        disabled={generatePatch.isPending || !canGeneratePatch}
+                        title={!canGeneratePatch ? "Approve at least one non-denylisted probe point before generating a patch." : undefined}
                       >
                         <FileCode className="h-4 w-4 mr-1" />
                         Generate Patch
@@ -246,6 +274,12 @@ export default function ProbePlannerPage() {
                         </Link>
                       )}
                     </div>
+                    {!canGeneratePatch && (
+                      <p className="text-xs text-muted-foreground" data-testid="generate-patch-no-points-reason">
+                        No approved probe points yet — approve at least one point above (denylisted
+                        points cannot be used) before generating a patch.
+                      </p>
+                    )}
 
                     {planPatches.length > 0 && (
                       <div>
@@ -278,7 +312,8 @@ export default function ProbePlannerPage() {
                                 <Button
                                   size="sm" variant="outline"
                                   onClick={() => validatePatch.mutateAsync(patch.id).then(() => toast.success("Validation started")).catch(e => toast.error(String(e)))}
-                                  disabled={validatePatch.isPending}
+                                  disabled={validatePatch.isPending || patch.status === "failed"}
+                                  title={patch.status === "failed" ? "Cannot validate a failed patch." : undefined}
                                 >
                                   <Play className="h-3 w-3 mr-1" />
                                   Validate
@@ -317,6 +352,12 @@ export default function ProbePlannerPage() {
                             {patchStale && (
                               <p className="text-xs text-destructive" data-testid="patch-apply-stale-reason">
                                 This patch is for commit {patch.commit_sha?.slice(0, 8)}. Regenerate it before applying.
+                              </p>
+                            )}
+                            {patch.status === "failed" && (
+                              <p className="text-xs text-destructive" data-testid="validate-patch-failed-reason">
+                                Cannot validate a failed patch{patch.error ? `: ${patch.error}` : "."} Regenerate
+                                the patch after resolving the error.
                               </p>
                             )}
                             {patch.diff && (
@@ -394,6 +435,21 @@ export default function ProbePlannerPage() {
           {!preparationComplete && (
             <PrerequisiteGuide testId="planner-prerequisite-guide" />
           )}
+          {/* Issue #258: unlike the soft PrerequisiteGuide above, this is a
+              hard, definitive block -- shown here too because the dialog can
+              also open via a Decision Workspace draft (draftOpen), bypassing
+              the header button's own disabled state. */}
+          {repoGate.blocked && (
+            <div
+              className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800 dark:border-red-800 dark:bg-red-950/20 dark:text-red-200"
+              data-testid="planner-repo-gate-reason"
+            >
+              {repoGate.summary} {repoGate.remediation}{" "}
+              {repoGate.to && (
+                <Link to={repoGate.to} className="underline">{repoGate.actionLabel ?? "Go to Repository"}</Link>
+              )}
+            </div>
+          )}
           {workspaceDraft?.draft_type === "probe_plan_draft" && (
             <div className="rounded-md border bg-secondary/30 px-3 py-2 text-xs">
               Prefilled from Decision Workspace proposal #{workspaceDraft.proposal_id}.
@@ -466,7 +522,11 @@ export default function ProbePlannerPage() {
               rows={3}
             />
           </div>
-          <Button className="w-full" onClick={generate} disabled={!formFeatureId.trim() || generatePlan.isPending}>
+          <Button
+            className="w-full"
+            onClick={generate}
+            disabled={!formFeatureId.trim() || generatePlan.isPending || repoGate.blocked}
+          >
             {generatePlan.isPending ? "Generating..." : "Generate Plan"}
           </Button>
         </div>

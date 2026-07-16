@@ -9,6 +9,7 @@ import {
   useSystemState,
   sysKey,
 } from "@/api/hooks";
+import { useRepositoryConfiguredGate } from "@/components/repository-gate";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { ContextHeader } from "@/components/layout/context-header";
 import { Badge } from "@/components/ui/badge";
@@ -488,6 +489,14 @@ export default function SystemUnderstandingPage() {
   const { data: latestBuild } = useLatestSystemUnderstandingBuild();
   const qc = useQueryClient();
   const settledBuildId = useRef<number | null>(null);
+  // Issue #258: build_system_understanding_endpoint has no snapshot-readiness
+  // precondition (it enqueues an async job unconditionally and lets each
+  // pipeline step report its own missing/blocked status), so only a
+  // definitively unconfigured repository is a real, unrecoverable-from-here
+  // precondition to gate on here -- unlike Probe Plan generation, which 400s
+  // outright without a ready snapshot. Two-stage rule: stays unblocked while
+  // status is loading/unknown.
+  const repoGate = useRepositoryConfiguredGate();
 
   const buildRunning = latestBuild?.status === "queued" || latestBuild?.status === "running";
   const buildHighlight = useDiagnosticHighlight<HTMLButtonElement>("build");
@@ -552,9 +561,10 @@ export default function SystemUnderstandingPage() {
         <Button
           {...buildHighlight}
           onClick={() => build.mutate()}
-          disabled={build.isPending || buildRunning}
+          disabled={build.isPending || buildRunning || repoGate.blocked}
           variant={pipelineAllComplete && !buildRunning ? "outline" : "default"}
           data-testid="build-button"
+          title={repoGate.blocked ? [repoGate.summary, repoGate.remediation].filter(Boolean).join(" ") : undefined}
         >
           {build.isPending || buildRunning ? (
             <>
@@ -569,6 +579,15 @@ export default function SystemUnderstandingPage() {
           )}
         </Button>
       </div>
+
+      {repoGate.blocked && (
+        <p className="text-xs text-destructive" data-testid="build-blocked-reason">
+          {repoGate.summary} {repoGate.remediation}{" "}
+          {repoGate.to && (
+            <Link to={repoGate.to} className="underline">{repoGate.actionLabel ?? "Go to Repository"}</Link>
+          )}
+        </p>
+      )}
 
       <SystemStateBanner
         item={bannerItem}

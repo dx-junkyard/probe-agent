@@ -7547,3 +7547,470 @@ describe("Dashboard action gating (Issue #255)", () => {
     expect(screen.getByRole("button", { name: "Index Symbols" })).toBeDisabled();
   });
 });
+
+// ── Prerequisite-based action gating (Issue #258) ───────────────────
+//
+// Several generate/execute buttons were previously disabled only while a
+// mutation was `isPending`, so a user could click straight into a
+// guaranteed server rejection (no ready snapshot, no approved probe point,
+// a failed patch, a component with zero recorded traces). Each case below
+// asserts the button is disabled AND a reason + link/next-step is visible,
+// that an unknown/loading precondition never blocks (escape hatch), and
+// that satisfying the precondition re-enables the button without any
+// manual refetch.
+
+describe("Prerequisite-based action gating (Issue #258)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  function repoStatusFixture(overrides: Record<string, unknown> = {}) {
+    return {
+      configured: true, repo_path: "/repos/alpha",
+      current_head: "abc1234000", head_error: null,
+      working_tree_dirty: false, dirty_file_count: 0, dirty_sample: [],
+      latest_snapshot: { id: 1, commit_sha: "abc1234000", status: "ready", created_at: 1 },
+      latest_indexed_snapshot: null,
+      understanding_snapshot_id: null, understanding_status: null,
+      snapshot_stale: false, symbols_stale: false, next_actions: [],
+      ...overrides,
+    };
+  }
+
+  const repoConfigMissingItem = {
+    state_id: "repository.configuration.missing",
+    state_group: "repository",
+    severity: "warning",
+    status: "missing",
+    user_action_kind: "configure",
+    intervention_timing: "now",
+    subject: "Repository",
+    summary: "対象リポジトリが未設定です。",
+    detail: "対象リポジトリが未設定です。",
+    impact: "",
+    remediation: "Repository タブでリポジトリを設定してください。",
+    evidence: {},
+    target_ui: { route: "/repository", anchor: "repo-config", action_label: "リポジトリを設定" },
+    related_checks: [],
+    related_pipeline_steps: [],
+    source: "system_state",
+    dedupe_key: "repository.configuration",
+    scope: "global",
+    decision_method: "deterministic",
+    phase: "setup",
+  };
+
+  function systemStateFixture(pageItems: Record<string, unknown[]> = {}) {
+    return {
+      system_id: 1, generated_at: 1, overall_severity: "ok",
+      severity_counts: {}, items: [], primary_item: null,
+      notification_items: [], page_items: pageItems,
+    };
+  }
+
+  // ── Probe Planner: Generate Plan ──────────────────────────────────
+
+  test("Probe Planner: Generate Plan is disabled with a reason when the repository is unconfigured", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({ system_id: 1, is_mock: false, plans: [] });
+      if (path === "/repository/status") return Promise.resolve(
+        repoStatusFixture({ configured: false, repo_path: null, latest_snapshot: null }),
+      );
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    const button = await screen.findByRole("button", { name: "Generate Plan" });
+    await waitFor(() => expect(button).toBeDisabled());
+    expect(await screen.findByTestId("generate-plan-blocked-reason")).toBeInTheDocument();
+
+    // Clicking a disabled button must not open the dialog / reach the mutation.
+    fireEvent.click(button);
+    expect(screen.queryByText("Observation objective")).not.toBeInTheDocument();
+  });
+
+  test("Probe Planner: Generate Plan's reason reuses the repository.configuration.missing catalog copy when present", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({ system_id: 1, is_mock: false, plans: [] });
+      if (path === "/repository/status") return Promise.resolve(
+        repoStatusFixture({ configured: false, repo_path: null, latest_snapshot: null }),
+      );
+      if (path === "/system-state") return Promise.resolve(
+        systemStateFixture({ "/repository": [repoConfigMissingItem] }),
+      );
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    const reason = await screen.findByTestId("generate-plan-blocked-reason");
+    expect(reason).toHaveTextContent("対象リポジトリが未設定です。");
+    expect(reason).toHaveTextContent("Repository タブでリポジトリを設定してください。");
+    const link = within(reason).getByRole("link", { name: "リポジトリを設定" });
+    expect(link).toHaveAttribute("href", "/repository?fix=repo-config");
+  });
+
+  test("Probe Planner: Generate Plan is disabled with a reason when there is no ready snapshot", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({ system_id: 1, is_mock: false, plans: [] });
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture({ latest_snapshot: null }));
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    const button = await screen.findByRole("button", { name: "Generate Plan" });
+    await waitFor(() => expect(button).toBeDisabled());
+    expect(await screen.findByTestId("generate-plan-blocked-reason")).toHaveTextContent(
+      /no ready repository snapshot/i,
+    );
+  });
+
+  test("Probe Planner: Generate Plan stays enabled when repository status is unknown (escape hatch)", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({ system_id: 1, is_mock: false, plans: [] });
+      // /repository/status intentionally left unhandled -> resolves to null,
+      // an indeterminate state that must never block the button.
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(mockApi.get).toHaveBeenCalledWith("/repository/status"));
+    const button = await screen.findByRole("button", { name: "Generate Plan" });
+    expect(button).not.toBeDisabled();
+    expect(screen.queryByTestId("generate-plan-blocked-reason")).not.toBeInTheDocument();
+  });
+
+  test("Probe Planner: Generate Plan is enabled once the repository is configured with a ready snapshot", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({ system_id: 1, is_mock: false, plans: [] });
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture());
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    const button = await screen.findByRole("button", { name: "Generate Plan" });
+    await waitFor(() => expect(button).not.toBeDisabled());
+    expect(screen.queryByTestId("generate-plan-blocked-reason")).not.toBeInTheDocument();
+  });
+
+  // ── Probe Planner: Generate Patch / Validate ──────────────────────
+
+  function probePointFixture(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 100, plan_id: 10, system_id: 1, component_id: "comp-a", feature_id: "feat-1",
+      path: "a.py", symbol: "foo", line_start: 1, line_end: 5, reason: "observe",
+      recommended_mode: "trace", side_effect_risk: "low", replayability: "safe",
+      denylist_hit: null, status: "proposed", created_at: "2024-01-01", updated_at: "2024-01-01",
+      ...overrides,
+    };
+  }
+
+  test("Probe Planner: Generate Patch is disabled with a reason when the plan has no approved probe points", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({
+        system_id: 1, is_mock: false,
+        plans: [{
+          id: 10, feature_id: "feat-1", objective: "Observe", status: "proposed", created_at: "2024-01-01",
+          probe_points: [probePointFixture({ status: "proposed" })],
+        }],
+      });
+      if (path === "/repository/probe-patches") return Promise.resolve([]);
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture());
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Feature: feat-1"));
+
+    const genPatchButton = await screen.findByRole("button", { name: /Generate Patch/ });
+    expect(genPatchButton).toBeDisabled();
+    expect(await screen.findByTestId("generate-patch-no-points-reason")).toBeInTheDocument();
+  });
+
+  test("Probe Planner: Generate Patch is disabled when the only approved point is safety-denylisted", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({
+        system_id: 1, is_mock: false,
+        plans: [{
+          id: 10, feature_id: "feat-1", objective: "Observe", status: "proposed", created_at: "2024-01-01",
+          probe_points: [probePointFixture({ status: "approved", denylist_hit: "payment write" })],
+        }],
+      });
+      if (path === "/repository/probe-patches") return Promise.resolve([]);
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture());
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Feature: feat-1"));
+
+    const genPatchButton = await screen.findByRole("button", { name: /Generate Patch/ });
+    expect(genPatchButton).toBeDisabled();
+    expect(await screen.findByTestId("generate-patch-no-points-reason")).toBeInTheDocument();
+  });
+
+  test("Probe Planner: Generate Patch is enabled once at least one non-denylisted probe point is approved", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({
+        system_id: 1, is_mock: false,
+        plans: [{
+          id: 10, feature_id: "feat-1", objective: "Observe", status: "proposed", created_at: "2024-01-01",
+          probe_points: [
+            probePointFixture({ id: 101, status: "rejected" }),
+            probePointFixture({ id: 102, status: "approved", denylist_hit: null }),
+          ],
+        }],
+      });
+      if (path === "/repository/probe-patches") return Promise.resolve([]);
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture());
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Feature: feat-1"));
+
+    const genPatchButton = await screen.findByRole("button", { name: /Generate Patch/ });
+    await waitFor(() => expect(genPatchButton).not.toBeDisabled());
+    expect(screen.queryByTestId("generate-patch-no-points-reason")).not.toBeInTheDocument();
+  });
+
+  test("Probe Planner: Validate is disabled with a reason when the patch failed to generate", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({
+        system_id: 1, is_mock: false,
+        plans: [{ id: 10, feature_id: "feat-1", objective: "Observe", status: "proposed", created_at: "2024-01-01", probe_points: [] }],
+      });
+      if (path === "/repository/probe-patches") return Promise.resolve([{
+        id: 20, plan_id: 10, system_id: 1, snapshot_id: 5,
+        commit_sha: "abcdef1234567890", diff: "", worktree_path: null, skipped: [],
+        status: "failed", error: "git apply failed", cleanup_state: "removed", cleanup_error: null,
+        apply_status: "not_applied", apply_error: null, applied_at: null,
+        applied_by_user_id: null, validation_runs: [], created_at: "2024-01-01",
+      }]);
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture());
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Feature: feat-1"));
+
+    const validateButton = await screen.findByRole("button", { name: /Validate/ });
+    expect(validateButton).toBeDisabled();
+    const reason = await screen.findByTestId("validate-patch-failed-reason");
+    expect(reason).toHaveTextContent("git apply failed");
+  });
+
+  test("Probe Planner: Validate is enabled for a successfully generated patch", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({
+        system_id: 1, is_mock: false,
+        plans: [{ id: 10, feature_id: "feat-1", objective: "Observe", status: "proposed", created_at: "2024-01-01", probe_points: [] }],
+      });
+      if (path === "/repository/probe-patches") return Promise.resolve([{
+        id: 20, plan_id: 10, system_id: 1, snapshot_id: 5,
+        commit_sha: "abcdef1234567890", diff: "diff --git a/a.py b/a.py", worktree_path: null, skipped: [],
+        status: "generated", error: null, cleanup_state: "removed", cleanup_error: null,
+        apply_status: "not_applied", apply_error: null, applied_at: null,
+        applied_by_user_id: null, validation_runs: [], created_at: "2024-01-01",
+      }]);
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture());
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Feature: feat-1"));
+
+    const validateButton = await screen.findByRole("button", { name: /Validate/ });
+    await waitFor(() => expect(validateButton).not.toBeDisabled());
+    expect(screen.queryByTestId("validate-patch-failed-reason")).not.toBeInTheDocument();
+  });
+
+  // ── System Understanding: Build / Refresh ─────────────────────────
+
+  test("System Understanding: Build / Refresh is disabled with a reason when the repository is unconfigured", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/status") return Promise.resolve(
+        repoStatusFixture({ configured: false, repo_path: null, latest_snapshot: null }),
+      );
+      if (path === "/repository/system-understanding") return Promise.resolve(null);
+      if (path === "/repository/system-understanding/build/latest") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const button = await screen.findByTestId("build-button");
+    await waitFor(() => expect(button).toBeDisabled());
+    expect(await screen.findByTestId("build-blocked-reason")).toBeInTheDocument();
+  });
+
+  test("System Understanding: Build / Refresh stays enabled with no ready snapshot (narrower gate than Probe Planner)", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture({ latest_snapshot: null }));
+      if (path === "/repository/system-understanding") return Promise.resolve(null);
+      if (path === "/repository/system-understanding/build/latest") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const button = await screen.findByTestId("build-button");
+    await waitFor(() => expect(mockApi.get).toHaveBeenCalledWith("/repository/status"));
+    expect(button).not.toBeDisabled();
+    expect(screen.queryByTestId("build-blocked-reason")).not.toBeInTheDocument();
+  });
+
+  test("System Understanding: Build / Refresh stays enabled when repository status is unknown (escape hatch)", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      // /repository/status intentionally left unhandled -> resolves to null.
+      if (path === "/repository/system-understanding") return Promise.resolve(null);
+      if (path === "/repository/system-understanding/build/latest") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(mockApi.get).toHaveBeenCalledWith("/repository/status"));
+    const button = await screen.findByTestId("build-button");
+    expect(button).not.toBeDisabled();
+  });
+
+  test("System Understanding: Build / Refresh is enabled once the repository is configured", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture());
+      if (path === "/repository/system-understanding") return Promise.resolve(null);
+      if (path === "/repository/system-understanding/build/latest") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const button = await screen.findByTestId("build-button");
+    await waitFor(() => expect(button).not.toBeDisabled());
+    expect(screen.queryByTestId("build-blocked-reason")).not.toBeInTheDocument();
+  });
+
+  // ── Repository: Create Snapshot (Snapshots tab) ───────────────────
+
+  function repositoryBaseGet(status: Record<string, unknown>) {
+    return (path: string) => {
+      if (path === "/repository") return Promise.resolve(
+        status.configured
+          ? { id: 1, system_id: 1, repo_path: "/repos/alpha", include_patterns: [], exclude_patterns: [] }
+          : null,
+      );
+      if (path === "/repository-candidates") return Promise.resolve([{ name: "alpha", path: "/repos/alpha" }]);
+      if (path === "/repository/snapshots") return Promise.resolve([]);
+      if (path === "/repository/symbols") return Promise.resolve({ symbols: [], symbol_count: 0 });
+      if (path === "/repository/status") return Promise.resolve(status);
+      return Promise.resolve(null);
+    };
+  }
+
+  test("Repository: Create Snapshot (Snapshots tab) is disabled with a reason when the repository is unconfigured", async () => {
+    mockApi.get.mockImplementation(repositoryBaseGet(
+      repoStatusFixture({ configured: false, repo_path: null, latest_snapshot: null }),
+    ));
+
+    const { default: RepositoryPage } = await import("@/pages/repository");
+    render(<RepositoryPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Snapshots" }));
+    const button = await screen.findByRole("button", { name: /Create Snapshot/ });
+    await waitFor(() => expect(button).toBeDisabled());
+    expect(await screen.findByTestId("create-snapshot-not-configured-reason")).toBeInTheDocument();
+  });
+
+  test("Repository: Create Snapshot (Snapshots tab) is enabled when configured even with zero snapshots (no chicken-and-egg gate)", async () => {
+    mockApi.get.mockImplementation(repositoryBaseGet(
+      repoStatusFixture({ latest_snapshot: null }),
+    ));
+
+    const { default: RepositoryPage } = await import("@/pages/repository");
+    render(<RepositoryPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Snapshots" }));
+    const button = await screen.findByRole("button", { name: /Create Snapshot/ });
+    await waitFor(() => expect(button).not.toBeDisabled());
+    expect(screen.queryByTestId("create-snapshot-not-configured-reason")).not.toBeInTheDocument();
+  });
+
+  // ── Components: candidate generation / shadow mode vs. trace count ─
+
+  function componentsGet(component: Record<string, unknown>) {
+    return (path: string) => {
+      if (path === "/components") return Promise.resolve([component]);
+      if (path.startsWith("/components/") && path.includes("/traces")) return Promise.resolve([]);
+      if (path.endsWith("/profile")) return Promise.resolve(null);
+      if (path.endsWith("/shadow-results?limit=20")) return Promise.resolve([]);
+      if (path.endsWith("/criteria")) return Promise.resolve([]);
+      return Promise.resolve(null);
+    };
+  }
+
+  test("Components: AI candidate generation and shadow mode are disabled with a reason for a zero-trace component", async () => {
+    window.history.pushState({}, "", "/components?component=comp-a");
+    mockApi.get.mockImplementation(
+      componentsGet({ component_id: "comp-a", mode: "off", trace_count: 0, last_seen: null }),
+    );
+
+    const { default: ComponentsPage } = await import("@/pages/components");
+    render(<ComponentsPage />, { wrapper: createWrapper() });
+
+    const aiButton = await screen.findByRole("button", { name: /AIで別バージョンを作る/ });
+    await waitFor(() => expect(aiButton).toBeDisabled());
+    const shadowButton = screen.getByRole("button", { name: "shadow" });
+    expect(shadowButton).toBeDisabled();
+    expect(await screen.findByTestId("component-zero-traces-reason")).toBeInTheDocument();
+
+    // The escape hatch for mode switching stays open: off/trace must never
+    // be gated on trace count, since switching to trace is how a component
+    // starts collecting its first traces.
+    expect(screen.getByRole("button", { name: "off" })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "trace" })).not.toBeDisabled();
+  });
+
+  test("Components: AI candidate generation and shadow mode are enabled once the component has recorded traces", async () => {
+    window.history.pushState({}, "", "/components?component=comp-a");
+    mockApi.get.mockImplementation(
+      componentsGet({ component_id: "comp-a", mode: "trace", trace_count: 5, last_seen: 1000 }),
+    );
+
+    const { default: ComponentsPage } = await import("@/pages/components");
+    render(<ComponentsPage />, { wrapper: createWrapper() });
+
+    const aiButton = await screen.findByRole("button", { name: /AIで別バージョンを作る/ });
+    await waitFor(() => expect(aiButton).not.toBeDisabled());
+    expect(screen.getByRole("button", { name: "shadow" })).not.toBeDisabled();
+    expect(screen.queryByTestId("component-zero-traces-reason")).not.toBeInTheDocument();
+  });
+});
