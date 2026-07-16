@@ -250,7 +250,17 @@ export default function ProbePlannerPage() {
                     {planPatches.length > 0 && (
                       <div>
                         <h4 className="text-sm font-medium mb-2">Patches</h4>
-                        {planPatches.map(patch => (
+                        {planPatches.map(patch => {
+                          // Issue #255: the same staleness condition drives both the
+                          // badge and the Apply button's disabled state, so the button
+                          // can never be clicked in a state where the server would
+                          // reject it for a HEAD mismatch.
+                          const patchStale = !!(
+                            repoStatus?.current_head
+                            && repoStatus.current_head !== patch.commit_sha
+                            && patch.apply_status !== "applied"
+                          );
+                          return (
                           <div key={patch.id} className="rounded-lg border p-3 space-y-2">
                             <div className="flex items-center justify-between">
                               <div className="flex items-center gap-2">
@@ -260,9 +270,7 @@ export default function ProbePlannerPage() {
                                 <span className="font-mono text-xs" title="Generated for this commit">
                                   {patch.commit_sha?.slice(0, 8)}
                                 </span>
-                                {repoStatus?.current_head
-                                  && repoStatus.current_head !== patch.commit_sha
-                                  && patch.apply_status !== "applied" && (
+                                {patchStale && (
                                   <Badge variant="destructive" data-testid="patch-stale-badge">HEAD changed</Badge>
                                 )}
                               </div>
@@ -283,7 +291,8 @@ export default function ProbePlannerPage() {
                                       setApplyTarget(patch);
                                       setApplyConfirmation("");
                                     }}
-                                    disabled={applyPatch.isPending}
+                                    disabled={applyPatch.isPending || patchStale}
+                                    title={patchStale ? "Regenerate the patch before applying — HEAD has changed." : undefined}
                                   >
                                     <GitBranch className="h-3 w-3 mr-1" />
                                     Apply
@@ -305,6 +314,11 @@ export default function ProbePlannerPage() {
                                 )}
                               </div>
                             </div>
+                            {patchStale && (
+                              <p className="text-xs text-destructive" data-testid="patch-apply-stale-reason">
+                                This patch is for commit {patch.commit_sha?.slice(0, 8)}. Regenerate it before applying.
+                              </p>
+                            )}
                             {patch.diff && (
                               <pre className="overflow-x-auto rounded-md bg-muted p-3 text-xs font-mono max-h-64 overflow-y-auto">
                                 {patch.diff}
@@ -344,7 +358,8 @@ export default function ProbePlannerPage() {
                               </div>
                             )}
                           </div>
-                        ))}
+                          );
+                        })}
                       </div>
                     )}
                   </CardContent>

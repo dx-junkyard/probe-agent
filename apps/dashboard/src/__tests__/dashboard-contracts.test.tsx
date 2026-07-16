@@ -7248,3 +7248,117 @@ describe("PrerequisiteGuide (Issue #241)", () => {
     expect(screen.queryByTestId("planner-prerequisite-guide")).not.toBeInTheDocument();
   });
 });
+
+// ── Dangerous/no-op action gating (Issue #255) ──────────────────────
+//
+// Three dashboard actions were previously clickable in states where they
+// could not succeed (or were dangerous), because state that was already
+// fetched for display was never wired into the button's disabled condition.
+// Each case below asserts the button is disabled AND a reason is visible —
+// never a silent no-op and never a dangerous apply.
+
+describe("Dashboard action gating (Issue #255)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("Probe Planner: Apply is disabled with a visible reason when the patch is stale vs HEAD", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({
+        system_id: 1, is_mock: false,
+        plans: [{ id: 10, feature_id: "feat-1", objective: "Observe", status: "proposed", created_at: "2024-01-01", probe_points: [] }],
+      });
+      if (path === "/repository/probe-patches") return Promise.resolve([{
+        id: 20, plan_id: 10, system_id: 1, snapshot_id: 5,
+        commit_sha: "abcdef1234567890", diff: "diff --git a/a.py b/a.py",
+        worktree_path: null, skipped: [], status: "generated", error: null,
+        cleanup_state: "removed", cleanup_error: null,
+        apply_status: "not_applied", apply_error: null, applied_at: null,
+        applied_by_user_id: null, validation_runs: [], created_at: "2024-01-01",
+      }]);
+      if (path === "/repository/status") return Promise.resolve({
+        configured: true, repo_path: "/repos/alpha",
+        current_head: "9999999999", head_error: null,
+        working_tree_dirty: false, dirty_file_count: 0, dirty_sample: [],
+        latest_snapshot: null, latest_indexed_snapshot: null,
+        understanding_snapshot_id: null, understanding_status: null,
+        snapshot_stale: true, symbols_stale: false, next_actions: [],
+      });
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Feature: feat-1"));
+
+    expect(await screen.findByTestId("patch-stale-badge")).toBeInTheDocument();
+    const reason = await screen.findByTestId("patch-apply-stale-reason");
+    expect(reason).toHaveTextContent(/abcdef12/);
+    expect(screen.getByRole("button", { name: /Apply/ })).toBeDisabled();
+
+    const { toast } = await import("sonner");
+    expect(toast.success).not.toHaveBeenCalledWith("Patch applied to repository");
+  });
+
+  test("Connect SDK: Issue Token is disabled with a visible reason when no System is selected", async () => {
+    mockSystemId = null;
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/auth/my-tokens") return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+
+    const { default: ConnectSdkPage } = await import("@/pages/connect-sdk");
+    render(<ConnectSdkPage />, { wrapper: createWrapper() });
+
+    const nameInput = await screen.findByPlaceholderText("my-service");
+    fireEvent.change(nameInput, { target: { value: "my-new-token" } });
+
+    expect(screen.getByTestId("issue-token-no-system-reason")).toBeInTheDocument();
+    const issueButton = screen.getByRole("button", { name: "Issue Token" });
+    expect(issueButton).toBeDisabled();
+
+    // Even though the name is filled in, clicking the disabled button must
+    // not silently reach handleIssue's early-return guard.
+    fireEvent.click(issueButton);
+    expect(mockApi.post).not.toHaveBeenCalled();
+    const { toast } = await import("sonner");
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  test("Repository: Symbols tab Index Symbols is disabled under the same condition as the Refresh Hub", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository") return Promise.resolve({
+        id: 1, system_id: 1, repo_path: "/repos/alpha", include_patterns: [], exclude_patterns: [],
+      });
+      if (path === "/repository-candidates") return Promise.resolve([{ name: "alpha", path: "/repos/alpha" }]);
+      if (path === "/repository/snapshots") return Promise.resolve([]);
+      if (path === "/repository/symbols") return Promise.resolve({ symbols: [], symbol_count: 0 });
+      if (path === "/repository/status") return Promise.resolve({
+        configured: true, repo_path: "/repos/alpha",
+        current_head: "abc1234000", head_error: null,
+        working_tree_dirty: false, dirty_file_count: 0, dirty_sample: [],
+        latest_snapshot: null, latest_indexed_snapshot: null,
+        understanding_snapshot_id: null, understanding_status: null,
+        snapshot_stale: true, symbols_stale: false, next_actions: [],
+      });
+      return Promise.resolve(null);
+    });
+
+    const { default: RepositoryPage } = await import("@/pages/repository");
+    render(<RepositoryPage />, { wrapper: createWrapper() });
+
+    // Refresh Hub's own button is disabled when there is no snapshot.
+    const hub = await screen.findByTestId("refresh-hub");
+    expect(within(hub).getByRole("button", { name: "Index symbols" })).toBeDisabled();
+
+    // The Symbols tab's button must be gated the same way instead of being
+    // clickable with nothing to index.
+    fireEvent.click(screen.getByRole("button", { name: "Symbols" }));
+    expect(await screen.findByTestId("index-symbols-no-snapshot-reason")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Index Symbols" })).toBeDisabled();
+  });
+});

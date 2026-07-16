@@ -40,6 +40,11 @@ export default function RepositoryPage() {
   const createSnapshot = useCreateSnapshot();
   const { data: symbolIndex, isLoading: symLoading } = useSymbols();
   const indexSymbols = useIndexSymbols();
+  // Issue #255: reuse the already-fetched Refresh Hub status here so the
+  // Symbols-tab button is gated by the same `!latest_snapshot` condition as
+  // the Refresh Hub's own "Index symbols" button, instead of being clickable
+  // with nothing to index.
+  const { data: repoStatus } = useRepositoryStatus();
   const { data: systemState } = useSystemState();
   const pageItem = systemState?.page_items["/repository"]?.[0] ?? systemState?.primary_item;
 
@@ -267,13 +272,19 @@ export default function RepositoryPage() {
               <Button
                 size="sm"
                 onClick={() => indexSymbols.mutateAsync().then(() => toast.success("Symbols indexed")).catch(e => toast.error(String(e)))}
-                disabled={indexSymbols.isPending}
+                disabled={indexSymbols.isPending || !repoStatus?.latest_snapshot}
+                title={!repoStatus?.latest_snapshot ? "Create a snapshot before indexing symbols" : undefined}
               >
                 <Code2 className={`h-4 w-4 mr-1 ${indexSymbols.isPending ? "animate-spin" : ""}`} />
                 Index Symbols
               </Button>
             </CardHeader>
             <CardContent>
+              {!repoStatus?.latest_snapshot && (
+                <p className="text-xs text-muted-foreground mb-3" data-testid="index-symbols-no-snapshot-reason">
+                  No snapshot yet — create one in the Snapshots tab before indexing symbols.
+                </p>
+              )}
               {symLoading ? (
                 <div className="space-y-2">{[1,2,3].map(i=><Skeleton key={i} className="h-10 w-full"/>)}</div>
               ) : !symbolIndex?.symbols?.length ? (
