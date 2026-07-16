@@ -84,8 +84,9 @@ export function Header() {
       </div>
 
       <div className="flex items-center gap-2">
-        {/* Issue #239: current user phase (setup -> preparation -> diagnosis)
-            with per-phase completion, straight from GET /system-state. */}
+        {/* Issue #239: current user phase (setup -> preparation ->
+            instrumentation -> observation -> evaluation -> publish, Issue
+            #256) with per-phase completion, straight from GET /system-state. */}
         <UserPhaseIndicator />
         <ConnectivityBadge />
         <DiagnosticsBadge />

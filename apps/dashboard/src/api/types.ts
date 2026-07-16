@@ -330,8 +330,16 @@ export interface SystemStateTargetUi {
   action_label: string;
 }
 
-/** User phase (Issue #237): setup -> preparation -> diagnosis (terminal). */
-export type UserPhase = "setup" | "preparation" | "diagnosis";
+/** User phase (Issue #237; extended to the full 6-step improvement flow by
+ * Issue #256): setup -> preparation -> instrumentation -> observation ->
+ * evaluation -> publish (terminal display phase). */
+export type UserPhase =
+  | "setup"
+  | "preparation"
+  | "instrumentation"
+  | "observation"
+  | "evaluation"
+  | "publish";
 
 export interface SystemStateItem {
   state_id: string;

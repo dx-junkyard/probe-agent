@@ -59,12 +59,13 @@ export function SystemStateAction({
 }
 
 /**
- * Issue #239: fixed display labels for the three server-derived user phases
- * (`GET /system-state`'s `user_phase` / `phases`, Issue #237). The phase
- * *value* is always the server's; only this tiny value->label map lives on
- * the client (kept in one place so Issue #240's copy pass can consolidate
- * it). Falls back to the raw token for an unknown value rather than
- * guessing.
+ * Issue #239: fixed display labels for the server-derived user phases
+ * (`GET /system-state`'s `user_phase` / `phases`, Issue #237; extended to
+ * the full 6-step flow by Issue #256). The phase *value* is always the
+ * server's; only this tiny value->label map lives on the client (kept in
+ * one place so Issue #240's copy pass can consolidate it, and mirrors the
+ * server's `state_messages.PHASE_LABELS` exactly). Falls back to the raw
+ * token for an unknown value rather than guessing.
  *
  * Issue #240: `phases[].label` (server-provided, Japanese) is now the
  * canonical label. This map is only the fallback used when a phase entry
@@ -72,13 +73,18 @@ export function SystemStateAction({
  */
 export const USER_PHASE_LABELS: Record<UserPhase, string> = {
   setup: "必要最低限の設定",
-  preparation: "診断準備",
-  diagnosis: "診断",
+  preparation: "分析準備",
+  instrumentation: "プローブ設定",
+  observation: "観測",
+  evaluation: "候補評価",
+  publish: "公開",
 };
 
-/** Mirrors the server's fixed PHASE_ORDER (Issue #237) — a finite enum
- * ordering, not client-side state derivation. */
-const PHASE_ORDER: UserPhase[] = ["setup", "preparation", "diagnosis"];
+/** Mirrors the server's fixed PHASE_ORDER (Issue #237; extended to 6 phases
+ * by Issue #256) — a finite enum ordering, not client-side state derivation. */
+const PHASE_ORDER: UserPhase[] = [
+  "setup", "preparation", "instrumentation", "observation", "evaluation", "publish",
+];
 
 /**
  * Phase suppression for surfaces that project the raw `items` audit list

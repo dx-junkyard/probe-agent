@@ -3868,7 +3868,10 @@ describe("System Understanding page", () => {
         phases: [
           { phase: "setup", complete: true },
           { phase: "preparation", complete: false },
-          { phase: "diagnosis", complete: false },
+          { phase: "instrumentation", complete: false },
+          { phase: "observation", complete: false },
+          { phase: "evaluation", complete: false },
+          { phase: "publish", complete: false },
         ],
       });
       return Promise.resolve(null);
@@ -4743,7 +4746,10 @@ describe("System settings diagnostics", () => {
     // withdrawal in `notification_items`; the badge must consume that
     // projection verbatim instead of re-deriving phase visibility.
     const setupItem = { ...snapshotItem, phase: "setup" as const };
-    const diagnosisItem = projectedStateItem({
+    // proposal.probe_plans.*/proposal.experiments.* items default to
+    // phase="evaluation" (Issue #256's state_group="proposal" default) --
+    // a real later-phase token, not an arbitrary placeholder.
+    const evaluationItem = projectedStateItem({
       state_id: "proposal.experiments.undecided",
       severity: "warning",
       summary: "評価待ちの experiment があります。",
@@ -4752,17 +4758,20 @@ describe("System settings diagnostics", () => {
       related_checks: [],
       dedupe_key: "proposal.experiments.undecided",
     });
-    diagnosisItem.phase = "diagnosis";
-    const scoped = (userPhase: "setup" | "diagnosis") => ({
-      ...stateResponse([setupItem, diagnosisItem]),
+    evaluationItem.phase = "evaluation";
+    const scoped = (userPhase: "setup" | "evaluation") => ({
+      ...stateResponse([setupItem, evaluationItem]),
       notification_items: userPhase === "setup"
         ? [setupItem]
-        : [setupItem, diagnosisItem],
+        : [setupItem, evaluationItem],
       user_phase: userPhase,
       phases: [
         { phase: "setup", complete: userPhase !== "setup" },
-        { phase: "preparation", complete: userPhase === "diagnosis" },
-        { phase: "diagnosis", complete: false },
+        { phase: "preparation", complete: userPhase === "evaluation" },
+        { phase: "instrumentation", complete: userPhase === "evaluation" },
+        { phase: "observation", complete: userPhase === "evaluation" },
+        { phase: "evaluation", complete: false },
+        { phase: "publish", complete: false },
       ],
     });
 
@@ -4777,7 +4786,7 @@ describe("System settings diagnostics", () => {
     first.unmount();
 
     mockApi.get.mockImplementation((path: string) =>
-      path === "/system-state" ? Promise.resolve(scoped("diagnosis")) : Promise.resolve(null),
+      path === "/system-state" ? Promise.resolve(scoped("evaluation")) : Promise.resolve(null),
     );
     render(<DiagnosticsBadge />, { wrapper: createWrapper() });
     await screen.findByTestId("diagnostics-badge");
@@ -6141,7 +6150,10 @@ describe("User phase indicator (Issue #239)", () => {
         ? Promise.resolve(stateWithPhase("preparation", [
             { phase: "setup", complete: true },
             { phase: "preparation", complete: false },
-            { phase: "diagnosis", complete: false },
+            { phase: "instrumentation", complete: false },
+            { phase: "observation", complete: false },
+            { phase: "evaluation", complete: false },
+            { phase: "publish", complete: false },
           ]))
         : Promise.resolve(null),
     );
@@ -6160,7 +6172,13 @@ describe("User phase indicator (Issue #239)", () => {
     expect(preparation.getAttribute("data-complete")).toBe("false");
     expect(preparation.getAttribute("data-current")).toBe("true");
 
-    expect(screen.getByTestId("user-phase-diagnosis").getAttribute("data-current")).toBe("false");
+    // All 6 phase chips render (Issue #256), and none of the later ones is
+    // mistaken for the current phase.
+    for (const phase of ["instrumentation", "observation", "evaluation", "publish"]) {
+      const chip = screen.getByTestId(`user-phase-${phase}`);
+      expect(chip.getAttribute("data-complete")).toBe("false");
+      expect(chip.getAttribute("data-current")).toBe("false");
+    }
   });
 
   test("prefers the server-provided phase label over the client fallback map (Issue #240)", async () => {
@@ -6169,9 +6187,12 @@ describe("User phase indicator (Issue #239)", () => {
         ? Promise.resolve(stateWithPhase("preparation", [
             { phase: "setup", complete: true, label: "セットアップ完了" },
             { phase: "preparation", complete: false, label: "準備" },
+            { phase: "instrumentation", complete: false, label: "計装" },
+            { phase: "observation", complete: false, label: "観測中" },
+            { phase: "evaluation", complete: false, label: "評価" },
             // No server label for this entry: proves the client fallback
             // (USER_PHASE_LABELS) still applies when the server omits it.
-            { phase: "diagnosis", complete: false },
+            { phase: "publish", complete: false },
           ]))
         : Promise.resolve(null),
     );
@@ -6183,17 +6204,20 @@ describe("User phase indicator (Issue #239)", () => {
     expect(indicator.getAttribute("title")).toBe("現在のフェーズ: 準備");
     expect(screen.getByTestId("user-phase-setup").textContent).toContain("セットアップ完了");
     expect(screen.getByTestId("user-phase-preparation").textContent).toContain("準備");
-    expect(screen.getByTestId("user-phase-diagnosis").textContent)
-      .toContain(USER_PHASE_LABELS.diagnosis);
+    expect(screen.getByTestId("user-phase-publish").textContent)
+      .toContain(USER_PHASE_LABELS.publish);
   });
 
   test("display switches when the server-derived phase changes", async () => {
     mockApi.get.mockImplementation((path: string) =>
       path === "/system-state"
-        ? Promise.resolve(stateWithPhase("diagnosis", [
+        ? Promise.resolve(stateWithPhase("publish", [
             { phase: "setup", complete: true },
             { phase: "preparation", complete: true },
-            { phase: "diagnosis", complete: false },
+            { phase: "instrumentation", complete: true },
+            { phase: "observation", complete: true },
+            { phase: "evaluation", complete: true },
+            { phase: "publish", complete: false },
           ]))
         : Promise.resolve(null),
     );
@@ -6202,9 +6226,10 @@ describe("User phase indicator (Issue #239)", () => {
     render(<UserPhaseIndicator />, { wrapper: createWrapper() });
 
     const indicator = await screen.findByTestId("user-phase-indicator");
-    expect(indicator.getAttribute("data-current-phase")).toBe("diagnosis");
+    expect(indicator.getAttribute("data-current-phase")).toBe("publish");
     expect(screen.getByTestId("user-phase-preparation").getAttribute("data-complete")).toBe("true");
-    expect(screen.getByTestId("user-phase-diagnosis").getAttribute("data-current")).toBe("true");
+    expect(screen.getByTestId("user-phase-evaluation").getAttribute("data-complete")).toBe("true");
+    expect(screen.getByTestId("user-phase-publish").getAttribute("data-current")).toBe("true");
   });
 
   test("renders nothing when the server does not provide a phase", async () => {
@@ -7141,6 +7166,11 @@ describe("PrerequisiteGuide (Issue #241)", () => {
     phase: "setup",
   };
 
+  // Issue #256: preparation counts complete for any phase past
+  // "setup"/"preparation" themselves (the later instrumentation / observation
+  // / evaluation / publish phases all chain on preparation being done); the
+  // later phases themselves are left incomplete here since none of these
+  // tests need to distinguish between them.
   const stateWith = (
     userPhase: string,
     primaryItem: unknown = guidePrimaryItem,
@@ -7157,8 +7187,15 @@ describe("PrerequisiteGuide (Issue #241)", () => {
     user_phase: userPhase,
     phases: [
       { phase: "setup", complete: userPhase !== "setup", label: phaseLabels?.setup },
-      { phase: "preparation", complete: userPhase === "diagnosis", label: phaseLabels?.preparation },
-      { phase: "diagnosis", complete: false, label: phaseLabels?.diagnosis },
+      {
+        phase: "preparation",
+        complete: userPhase !== "setup" && userPhase !== "preparation",
+        label: phaseLabels?.preparation,
+      },
+      { phase: "instrumentation", complete: false, label: phaseLabels?.instrumentation },
+      { phase: "observation", complete: false, label: phaseLabels?.observation },
+      { phase: "evaluation", complete: false, label: phaseLabels?.evaluation },
+      { phase: "publish", complete: false, label: phaseLabels?.publish },
     ],
   });
 
@@ -7193,9 +7230,9 @@ describe("PrerequisiteGuide (Issue #241)", () => {
     expect(screen.getByTestId("prerequisite-guide-phase").textContent).toContain("セットアップ完了");
   });
 
-  test("disappears at the terminal diagnosis phase", async () => {
+  test("disappears once preparation is complete (instrumentation phase onward)", async () => {
     mockApi.get.mockImplementation((path: string) =>
-      path === "/system-state" ? Promise.resolve(stateWith("diagnosis", null)) : Promise.resolve(null),
+      path === "/system-state" ? Promise.resolve(stateWith("instrumentation", null)) : Promise.resolve(null),
     );
     const { PrerequisiteGuide } = await import("@/components/prerequisite-guide");
     const { container } = render(<PrerequisiteGuide />, { wrapper: createWrapper() });
@@ -7204,6 +7241,26 @@ describe("PrerequisiteGuide (Issue #241)", () => {
     await waitFor(() => expect(mockApi.get).toHaveBeenCalledWith("/system-state"));
     expect(screen.queryByTestId("prerequisite-guide")).not.toBeInTheDocument();
     expect(container.textContent).toBe("");
+  });
+
+  test("renders nothing for any later phase without authored copy (Issue #256)", async () => {
+    // instrumentation / observation / evaluation / publish have no guide
+    // copy of their own (that guidance UX belongs to sibling sub-issues
+    // #257/#258) -- the guide must stay silent, not render a broken/empty
+    // card, for every one of them.
+    for (const phase of ["instrumentation", "observation", "evaluation", "publish"]) {
+      vi.clearAllMocks();
+      mockApi.get.mockImplementation((path: string) =>
+        path === "/system-state" ? Promise.resolve(stateWith(phase, null)) : Promise.resolve(null),
+      );
+      const { PrerequisiteGuide } = await import("@/components/prerequisite-guide");
+      const { container, unmount } = render(<PrerequisiteGuide />, { wrapper: createWrapper() });
+
+      await waitFor(() => expect(mockApi.get).toHaveBeenCalledWith("/system-state"));
+      expect(screen.queryByTestId("prerequisite-guide")).not.toBeInTheDocument();
+      expect(container.textContent).toBe("");
+      unmount();
+    }
   });
 
   test("CTA navigates to the StateItem target", async () => {
@@ -7235,7 +7292,7 @@ describe("PrerequisiteGuide (Issue #241)", () => {
 
   test("Probe Planner hides the gate once preparation is complete", async () => {
     mockApi.get.mockImplementation((path: string) => {
-      if (path === "/system-state") return Promise.resolve(stateWith("diagnosis", null));
+      if (path === "/system-state") return Promise.resolve(stateWith("instrumentation", null));
       if (path === "/probe-plans") return Promise.resolve({ plans: [], is_mock: false });
       return Promise.resolve(null);
     });

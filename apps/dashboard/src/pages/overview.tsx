@@ -93,10 +93,11 @@ export default function OverviewPage() {
                 <SystemStateBanner item={primaryOverviewItem} testId="overview-primary-item" />
               )}
               {/* Issue #241: phase-appropriate start guide for a System that
-                  has not reached the diagnosis phase yet. It renders nothing
-                  once every prerequisite is met (terminal phase), so the
-                  ordered fallback list below is what a fully-set-up System
-                  with no components still sees. */}
+                  is still in setup/preparation. It renders nothing once
+                  preparation is complete (Issue #256's later
+                  instrumentation/observation/evaluation/publish phases), so
+                  the ordered fallback list below is what a fully-set-up
+                  System with no components still sees. */}
               <PrerequisiteGuide testId="overview-prerequisite-guide" />
               <p className="text-sm text-muted-foreground text-center">
                 No components registered yet. Connect the SDK to start tracing.
