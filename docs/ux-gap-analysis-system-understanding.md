@@ -1,6 +1,8 @@
 # System Understanding UX ギャップ調査と改善提案
 
-Status: 調査・提案のみ（実装は未着手）。
+Status: 大半の提案は実装済み。各項目の注記を参照。未対応項目は P2-4/5 の一部
+（build 起動経路が 3 箇所残存: ヘッダー `build-button` / `SystemStateBanner`
+onAction / Pipeline Checklist の step CTA）など。
 Scope: 「Build / Refresh 実行後に次に何をすべきか分からない」問題の根本原因の特定と、
 ダッシュボード全体の同種の UX ギャップの棚卸し・改善提案。
 
@@ -124,6 +126,11 @@ pipeline 全 complete かつ purpose 未定義のとき `Define System Purpose`
   `system-state.tsx:44`（fallback `対応する`）、`diagnostics-badge.tsx:384`。
   遷移先が押す前に分からず、`target_ui=null` の項目では見た目が同じボタンが
   ダイアログを開くなど挙動も分岐する。
+  **（commit `c2266f0`、2026-07-16 で対応済み）** `diagnostics-badge.tsx` の
+  ダイアログ系ボタンは `「${item.subject}」の対処方法` という件名付きラベルに
+  変更された（同ファイル 342-345 行目）。ただし `target_ui.action_label`
+  欠落時のフォールバック文言「対応する」は `diagnostics-badge.tsx:341` と
+  `system-state.tsx:56` に残存する。
 - **ヘッダーの DiagnosticsBadge と画面内バナーの重複**: 同じ根本原因が
   別 dedupe ロジックで 2 箇所に出て、件数・文言が食い違いうる。
 - **build 実行中は `primary_action=None`（rule 2）**だが、実行中 job が別
@@ -147,7 +154,11 @@ pipeline 全 complete かつ purpose 未定義のとき `Define System Purpose`
 - **Capability Map の詳細パネル内 gap リンクが `?capability=` を失う**
   （`capability-map.tsx:379-388`）: すべて素の `/system-understanding` に戻り、
   ユーザーは同じ gap を探し直す。ナビ設計ドキュメントの
-  「`?capability=` は途切れない navigation context」原則に違反。（#241 対象外）
+  「`?capability=` は途切れない navigation context」原則に違反。（#241 対象外。
+  **Issue #212（commit `de99e34`）で対応済み**: 現行コードでは
+  `capability-map.tsx:381` の gap リンクが
+  `` `/system-understanding?capability=${encodeURIComponent(...)}` `` を
+  付与している）
 - **Feature Map の空状態に前提条件への導線がない**（`feature-map.tsx`）:
   →（#241）features 空状態に `PrerequisiteGuide` を追加。
 - **Connect SDK → Setup Guide が一方通行**: →（#241）Setup Guide に
@@ -177,6 +188,11 @@ action_label、pipeline step / stage / gap の表示文言、成功サマリ）�
 - CLAUDE.md の「Repository / Feature Map / Probe Planner / Experiments タブは
   explicit mocks」という記述は実装より古い。4 ページとも実エンドポイントを
   呼んでおり、`is_mock` バッジは LLM 応答単位の provenance 表示に変わっている。
+  **（対応済み。commit `7967ccb`「Update stale CLAUDE.md note about mock tabs
+  and removed mock endpoint」（#214 の一部）で CLAUDE.md を更新済み。現行
+  CLAUDE.md:135-137 は「no longer whole-page mocks: they call real Control
+  Server endpoints, and `is_mock` badges mark mock LLM output per response」
+  という記述になっている）**
 
 ### テスト不足
 
@@ -217,6 +233,9 @@ action_label、pipeline step / stage / gap の表示文言、成功サマリ）�
    navigate リンクは妥当。変更しない。
 8. 汎用「修正する」を廃し、対象＋操作の具体ラベル（例:
    「Capability 階層を再生成する」）と原因表示に置き換える。
+   **（commit `c2266f0` で主要部分（ダイアログ系ボタン）は対応済み。
+   `target_ui.action_label` 欠落時のフォールバック「対応する」は
+   `system-state.tsx` 等に残存）**
 9. **Purpose 未定義の間は Start from Capability / Feature を補助導線に降格**
    し、「目的を定義した後に利用できます」を明示する。
 
@@ -227,7 +246,8 @@ action_label、pipeline step / stage / gap の表示文言、成功サマリ）�
 11. **（Issue #241 で対応済み）** Probe Planner に上流ゲート（診断準備未完了
     時の `PrerequisiteGuide` 表示、自由入力 feature id は escape hatch に
     降格。API 拒否はしない）。
-12. Capability Map 詳細パネルの gap リンクに `?capability=` を付与。（未対応）
+12. **（Issue #212 で対応済み、commit `de99e34`）** Capability Map 詳細パネルの
+    gap リンクに `?capability=` を付与。
 13. **（Issue #241 で対応済み）** Feature Map 空状態に `PrerequisiteGuide`
     を追加。
 14. **（Issue #241 で対応済み）** Connect SDK ↔ Setup Guide の双方向リンク。
@@ -242,7 +262,7 @@ action_label、pipeline step / stage / gap の表示文言、成功サマリ）�
 
 ### 付随タスク
 
-- CLAUDE.md の「explicit mocks」記述の更新。
+- CLAUDE.md の「explicit mocks」記述の更新。**（対応済み。commit `7967ccb`）**
 - `docs/system-understanding-navigation.md` への状態モデル統合方針の追記。
 - §3 テスト不足シナリオの回帰テスト追加。
 
