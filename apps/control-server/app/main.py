@@ -8,6 +8,7 @@ from . import publish_recovery
 from .routes import (
     assistant,
     auth,
+    candidate_studio,
     components,
     connectivity,
     diagnostics,
@@ -19,6 +20,7 @@ from .routes import (
     probe_patterns,
     project_intelligence,
     publish_jobs,
+    replay,
     retention,
     shadow,
     systems,
@@ -66,6 +68,8 @@ def create_app() -> FastAPI:
     app.include_router(evaluation.router, dependencies=_auth)
     app.include_router(experiments.router, dependencies=_auth)
     app.include_router(generation.router, dependencies=_auth)
+    app.include_router(replay.router, dependencies=_auth)
+    app.include_router(candidate_studio.router, dependencies=_auth)
     app.include_router(project_intelligence.router, dependencies=_auth)
     app.include_router(probe_patterns.router, dependencies=_auth)
     app.include_router(connectivity.router, dependencies=_auth)

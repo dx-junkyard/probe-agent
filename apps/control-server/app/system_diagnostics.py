@@ -42,7 +42,7 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional
 
-from . import system_state
+from . import state_messages, system_state
 from .db import get_conn
 from .llm import PROVIDER_KEY_ENV, is_reasoning_model
 
@@ -158,24 +158,18 @@ def _model_family_matches(provider: str, model: str) -> Optional[bool]:
 
 
 def _check_repository_roots() -> DiagnosticCheck:
+    title = state_messages.check_title("repository_roots")
     raw = os.getenv("PROBE_REPOSITORY_ROOTS", "").strip()
     if not raw:
+        msg = state_messages.check_message("repository_roots", "missing_env")
         return DiagnosticCheck(
             check_id="repository_roots",
             category="repository",
-            title="リポジトリルートの設定",
+            title=title,
             severity="error",
-            detail="環境変数 PROBE_REPOSITORY_ROOTS が設定されていません。",
-            impact=(
-                "リポジトリへのアクセスがすべて無効になり、リポジトリ設定・"
-                "snapshot 作成・コードを読む System Understanding の各ステップが"
-                "失敗または未実行のままになります。"
-            ),
-            remediation=(
-                "Git リポジトリが置かれている絶対パスを PROBE_REPOSITORY_ROOTS に"
-                "設定し（複数指定はパス区切り文字で連結）、Control Server を"
-                "再起動してください。"
-            ),
+            detail=msg["detail"],
+            impact=msg["impact"],
+            remediation=msg["remediation"],
             related_env=["PROBE_REPOSITORY_ROOTS"],
             related_pages=[PAGE_REPOSITORY],
             related_pipeline_steps=["repository_configured", "snapshot_ready"],
@@ -189,32 +183,33 @@ def _check_repository_roots() -> DiagnosticCheck:
     if missing or unreadable:
         problems = []
         if missing:
-            problems.append(f"存在しないディレクトリ: {', '.join(missing)}")
+            problems.append(state_messages.check_problem_fragment(
+                "repository_roots.missing_dirs", dirs=", ".join(missing)))
         if unreadable:
-            problems.append(f"読み取りできないディレクトリ: {', '.join(unreadable)}")
+            problems.append(state_messages.check_problem_fragment(
+                "repository_roots.unreadable_dirs", dirs=", ".join(unreadable)))
+        msg = state_messages.check_message("repository_roots", "problems")
         return DiagnosticCheck(
             check_id="repository_roots",
             category="repository",
-            title="リポジトリルートの設定",
+            title=title,
             severity="error",
-            detail=f"PROBE_REPOSITORY_ROOTS に問題があります: {'; '.join(problems)}。",
-            impact="これらのルート配下のリポジトリを検出・snapshot 化できません。",
-            remediation=(
-                "PROBE_REPOSITORY_ROOTS のパスを修正するか、ディレクトリを作成して"
-                "Control Server プロセスに読み取り権限を付与してください。"
-            ),
+            detail=msg["detail"].format(problems="; ".join(problems)),
+            impact=msg["impact"],
+            remediation=msg["remediation"],
             related_env=["PROBE_REPOSITORY_ROOTS"],
             related_paths=missing + unreadable,
             related_pages=[PAGE_REPOSITORY],
             related_pipeline_steps=["repository_configured", "snapshot_ready"],
             fix_kind=FIX_KIND_DIALOG,
         )
+    msg = state_messages.check_message("repository_roots", "ok")
     return DiagnosticCheck(
         check_id="repository_roots",
         category="repository",
-        title="リポジトリルートの設定",
+        title=title,
         severity="ok",
-        detail=f"{len(roots)} 個のリポジトリルートが存在し、読み取り可能です。",
+        detail=msg["detail"].format(count=len(roots)),
         impact="",
         remediation="",
         related_env=["PROBE_REPOSITORY_ROOTS"],
@@ -225,22 +220,21 @@ def _check_repository_roots() -> DiagnosticCheck:
 
 
 def _check_repository_config(conn, system_id: int) -> DiagnosticCheck:
+    title = state_messages.check_title("repository_config")
     row = conn.execute(
         "SELECT repo_path FROM repository_configs WHERE system_id = ?",
         (system_id,),
     ).fetchone()
     if row is None:
+        msg = state_messages.check_message("repository_config", "missing")
         return DiagnosticCheck(
             check_id="repository_config",
             category="repository",
-            title="このシステムのリポジトリ設定",
+            title=title,
             severity="warning",
-            detail="選択中のシステムに解析対象のリポジトリが設定されていません。",
-            impact=(
-                "snapshot を作成できないため、System Understanding パイプライン"
-                "全体が未実行のままになります。"
-            ),
-            remediation="Repository タブを開き、解析対象のリポジトリパスを選択してください。",
+            detail=msg["detail"],
+            impact=msg["impact"],
+            remediation=msg["remediation"],
             related_pages=[PAGE_REPOSITORY],
             related_pipeline_steps=["repository_configured", "snapshot_ready"],
             fix_kind=FIX_KIND_NAVIGATE,
@@ -250,25 +244,22 @@ def _check_repository_config(conn, system_id: int) -> DiagnosticCheck:
     repo_path = row["repo_path"]
     problems: List[str] = []
     if not os.path.isdir(repo_path):
-        problems.append("パスが存在しないかディレクトリではありません")
+        problems.append(state_messages.check_problem_fragment("repository_config.not_a_dir"))
     else:
         if not os.access(repo_path, os.R_OK):
-            problems.append("パスを読み取りできません")
+            problems.append(state_messages.check_problem_fragment("repository_config.unreadable"))
         if not os.path.exists(os.path.join(repo_path, ".git")):
-            problems.append("Git リポジトリではありません（.git がありません）")
+            problems.append(state_messages.check_problem_fragment("repository_config.not_git"))
     if problems:
+        msg = state_messages.check_message("repository_config", "invalid")
         return DiagnosticCheck(
             check_id="repository_config",
             category="repository",
-            title="このシステムのリポジトリ設定",
+            title=title,
             severity="error",
-            detail=f"設定されたリポジトリパス {repo_path}: {'; '.join(problems)}。",
-            impact="このシステムでの新規 snapshot 作成とリポジトリ読み取りが失敗します。",
-            remediation=(
-                "設定したリポジトリが存在し、読み取り可能で、Git リポジトリになる"
-                "ようにマウント/パスを修正するか、Repository タブでリポジトリを"
-                "設定し直してください。"
-            ),
+            detail=msg["detail"].format(repo_path=repo_path, problems="; ".join(problems)),
+            impact=msg["impact"],
+            remediation=msg["remediation"],
             related_env=["PROBE_REPOSITORY_ROOTS"],
             related_paths=[repo_path],
             related_pages=[PAGE_REPOSITORY],
@@ -277,12 +268,13 @@ def _check_repository_config(conn, system_id: int) -> DiagnosticCheck:
             fix_page=PAGE_REPOSITORY,
             fix_anchor=ANCHOR_REPO_CONFIG,
         )
+    msg = state_messages.check_message("repository_config", "ok")
     return DiagnosticCheck(
         check_id="repository_config",
         category="repository",
-        title="このシステムのリポジトリ設定",
+        title=title,
         severity="ok",
-        detail=f"リポジトリパス {repo_path} は存在し、読み取り可能な Git リポジトリです。",
+        detail=msg["detail"].format(repo_path=repo_path),
         impact="",
         remediation="",
         related_paths=[repo_path],
@@ -312,19 +304,18 @@ def _check_snapshot_status(conn, system_id: int) -> DiagnosticCheck:
             observed_at=latest["completed_at"] or latest["created_at"],
         )
 
+    title = state_messages.check_title("snapshot_status")
     if ready is None:
         if latest is None:
+            msg = state_messages.check_message("snapshot_status", "no_snapshot")
             return DiagnosticCheck(
                 check_id="snapshot_status",
                 category="repository",
-                title="利用可能なリポジトリ snapshot",
+                title=title,
                 severity="warning",
-                detail="このシステムではまだ snapshot が作成されていません。",
-                impact=(
-                    "ドキュメント索引・シンボル索引・エントリポイント検出・"
-                    "capability 階層の生成には ready 状態の snapshot が必要です。"
-                ),
-                remediation="Repository タブの Snapshots から snapshot を作成してください。",
+                detail=msg["detail"],
+                impact=msg["impact"],
+                remediation=msg["remediation"],
                 related_pages=[PAGE_REPOSITORY],
                 related_pipeline_steps=["snapshot_ready"],
                 fix_kind=FIX_KIND_NAVIGATE,
@@ -332,21 +323,15 @@ def _check_snapshot_status(conn, system_id: int) -> DiagnosticCheck:
                 fix_anchor=ANCHOR_SNAPSHOT_CREATE,
             )
         severity = "error" if last_error else "warning"
+        msg = state_messages.check_message("snapshot_status", "not_ready")
         return DiagnosticCheck(
             check_id="snapshot_status",
             category="repository",
-            title="利用可能なリポジトリ snapshot",
+            title=title,
             severity=severity,
-            detail=(
-                f"ready な snapshot がありません。最新の snapshot #{latest['id']} の"
-                f"状態は '{latest['status']}' です。"
-            ),
-            impact="snapshot の内容を読むすべてのパイプラインステップがブロックされます。",
-            remediation=(
-                "Repository タブの Snapshots から snapshot 作成を再試行してください。"
-                "失敗が続く場合は、下記の直近のエラーとリポジトリパスの診断を"
-                "確認してください。"
-            ),
+            detail=msg["detail"].format(latest_id=latest["id"], latest_status=latest["status"]),
+            impact=msg["impact"],
+            remediation=msg["remediation"],
             related_pages=[PAGE_REPOSITORY],
             related_pipeline_steps=["snapshot_ready"],
             last_observed_error=last_error,
@@ -360,23 +345,15 @@ def _check_snapshot_status(conn, system_id: int) -> DiagnosticCheck:
         (ready["id"],),
     ).fetchone()[0]
     if indexed_count == 0:
+        msg = state_messages.check_message("snapshot_status", "zero_indexed")
         return DiagnosticCheck(
             check_id="snapshot_status",
             category="repository",
-            title="利用可能なリポジトリ snapshot",
+            title=title,
             severity="warning",
-            detail=(
-                f"最新の ready snapshot #{ready['id']} には索引付けされたファイルが "
-                "0 件しかありません。include/exclude パターンですべて除外されている"
-                "可能性があります。"
-            ),
-            impact=(
-                "ドラフト生成・シンボル索引・エントリポイント検出の結果が空になります。"
-            ),
-            remediation=(
-                "Repository タブの include/exclude パターンを見直し、snapshot を"
-                "作成し直してください。"
-            ),
+            detail=msg["detail"].format(ready_id=ready["id"]),
+            impact=msg["impact"],
+            remediation=msg["remediation"],
             related_pages=[PAGE_REPOSITORY],
             related_pipeline_steps=["snapshot_ready", "symbols_indexed", "documentation_indexed"],
             last_observed_error=last_error,
@@ -384,12 +361,13 @@ def _check_snapshot_status(conn, system_id: int) -> DiagnosticCheck:
             fix_page=PAGE_REPOSITORY,
             fix_anchor=ANCHOR_REPO_PATTERNS,
         )
+    msg = state_messages.check_message("snapshot_status", "ok")
     return DiagnosticCheck(
         check_id="snapshot_status",
         category="repository",
-        title="利用可能なリポジトリ snapshot",
+        title=title,
         severity="ok",
-        detail=f"最新の ready snapshot #{ready['id']} には索引付けされたファイルが {indexed_count} 件あります。",
+        detail=msg["detail"].format(ready_id=ready["id"], indexed_count=indexed_count),
         impact="",
         remediation="",
         related_pages=[PAGE_REPOSITORY],
@@ -405,40 +383,39 @@ def _check_database_storage() -> DiagnosticCheck:
     directory = os.path.dirname(os.path.abspath(path)) or "."
     problems: List[str] = []
     if not os.path.isdir(directory):
-        problems.append(f"データベースのディレクトリが存在しません: {directory}")
+        problems.append(state_messages.check_problem_fragment(
+            "database_storage.dir_missing", directory=directory))
     else:
         if not os.access(directory, os.W_OK):
-            problems.append(f"データベースのディレクトリに書き込みできません: {directory}")
+            problems.append(state_messages.check_problem_fragment(
+                "database_storage.dir_unwritable", directory=directory))
         if os.path.exists(path):
             if not os.access(path, os.R_OK):
-                problems.append("データベースファイルを読み取りできません")
+                problems.append(state_messages.check_problem_fragment("database_storage.file_unreadable"))
             if not os.access(path, os.W_OK):
-                problems.append("データベースファイルに書き込みできません")
+                problems.append(state_messages.check_problem_fragment("database_storage.file_unwritable"))
+    title = state_messages.check_title("database_storage")
     if problems:
+        msg = state_messages.check_message("database_storage", "problems")
         return DiagnosticCheck(
             check_id="database_storage",
             category="database",
-            title="データベースストレージ",
+            title=title,
             severity="error",
             detail="; ".join(problems) + "。",
-            impact=(
-                "トレース・ポリシー・snapshot・intelligence run を永続化できず、"
-                "ほとんどの書き込み操作が失敗します。"
-            ),
-            remediation=(
-                "PROBE_DB_PATH を書き込み可能な場所に設定するか、ディレクトリ/"
-                "ファイルの権限を修正してください。"
-            ),
+            impact=msg["impact"],
+            remediation=msg["remediation"],
             related_env=["PROBE_DB_PATH"],
             related_paths=[path],
             fix_kind=FIX_KIND_DIALOG,
         )
+    msg = state_messages.check_message("database_storage", "ok")
     return DiagnosticCheck(
         check_id="database_storage",
         category="database",
-        title="データベースストレージ",
+        title=title,
         severity="ok",
-        detail=f"データベースパス {path} は読み書き可能です。",
+        detail=msg["detail"].format(path=path),
         impact="",
         remediation="",
         related_env=["PROBE_DB_PATH"],
@@ -452,33 +429,30 @@ def _check_auth_scope(conn, system_id: int) -> DiagnosticCheck:
     system_row = conn.execute(
         "SELECT id, name FROM systems WHERE id = ?", (system_id,)
     ).fetchone()
+    title = state_messages.check_title("auth_scope")
     if system_row is None:
         # get_system_id normally guarantees existence; keep a defensive branch.
+        msg = state_messages.check_message("auth_scope", "unknown_system")
         return DiagnosticCheck(
             check_id="auth_scope",
             category="auth",
-            title="認証とシステムスコープ",
+            title=title,
             severity="error",
-            detail=f"選択中のシステム id {system_id} が存在しません。",
-            impact="システムスコープのリクエストがすべて 404 になります。",
-            remediation="ヘッダーで既存のシステムを選択するか、新しいシステムを作成してください。",
+            detail=msg["detail"].format(system_id=system_id),
+            impact=msg["impact"],
+            remediation=msg["remediation"],
             fix_kind=FIX_KIND_DIALOG,
         )
     if users == 0 and not legacy_keys:
+        msg = state_messages.check_message("auth_scope", "open_mode")
         return DiagnosticCheck(
             check_id="auth_scope",
             category="auth",
-            title="認証とシステムスコープ",
+            title=title,
             severity="warning",
-            detail=(
-                "アクティブなユーザーがおらず CONTROL_API_KEYS も未設定です。"
-                "サーバーは認証なし（MVP 互換モード）で動作しています。"
-            ),
-            impact="Control Server に到達できる誰もが全アクセス権を持ちます。",
-            remediation=(
-                "CONTROL_ADMIN_USERNAME / CONTROL_ADMIN_PASSWORD を設定して管理者"
-                "ユーザーを初期化するか、CONTROL_API_KEYS を設定してください。"
-            ),
+            detail=msg["detail"],
+            impact=msg["impact"],
+            remediation=msg["remediation"],
             related_env=[
                 "CONTROL_ADMIN_USERNAME",
                 "CONTROL_ADMIN_PASSWORD",
@@ -487,16 +461,16 @@ def _check_auth_scope(conn, system_id: int) -> DiagnosticCheck:
             related_pages=[PAGE_ADMIN],
             fix_kind=FIX_KIND_DIALOG,
         )
+    msg = state_messages.check_message("auth_scope", "ok")
     return DiagnosticCheck(
         check_id="auth_scope",
         category="auth",
-        title="認証とシステムスコープ",
+        title=title,
         severity="ok",
-        detail=(
-            f"選択中のシステム '{system_row['name']}' は存在します。"
-            f"アクティブユーザー {users} 名"
-            + ("、レガシー API キー設定済み" if legacy_keys else "")
-            + "。"
+        detail=msg["detail"].format(
+            system_name=system_row["name"],
+            users=users,
+            legacy_note=msg["legacy_note"] if legacy_keys else "",
         ),
         impact="",
         remediation="",
@@ -548,8 +522,9 @@ def _check_llm_base_config() -> DiagnosticCheck:
 
     if provider not in KNOWN_PROVIDERS:
         problems.append(
-            f"LLM_PROVIDER={provider!r} はサポートされていないプロバイダです"
-            f"（{', '.join(sorted(KNOWN_PROVIDERS))}）"
+            state_messages.check_message("llm_base_config", "unsupported_provider")["detail_fragment"].format(
+                provider=provider, known=", ".join(sorted(KNOWN_PROVIDERS)),
+            )
         )
         severity = "error"
     elif provider != "mock":
@@ -564,37 +539,31 @@ def _check_llm_base_config() -> DiagnosticCheck:
         if severity == "ok":
             severity = "warning"
 
+    ok_msg = state_messages.check_message("llm_base_config", "ok")
+    problems_msg = state_messages.check_message("llm_base_config", "problems")
     detail = (
         "; ".join(problems) + "。"
         if problems
-        else f"LLM_PROVIDER={provider} と使用可能な API キー設定です。"
+        else ok_msg["detail"].format(provider=provider)
     )
     if provider == "mock" and not problems:
         severity = "warning"
-        detail = (
-            "LLM_PROVIDER=mock: すべての LLM 出力はテスト/ローカル動作確認用の"
-            "決定的なモックデータで、reasoning が必要なパイプラインステップは"
-            "ブロックされます。"
-        )
+        mock_msg = state_messages.check_message("llm_base_config", "mock")
+        detail = mock_msg["detail"]
+    impact = (
+        problems_msg["impact"]
+        if severity == "error"
+        else (state_messages.check_message("llm_base_config", "mock")["impact"] if provider == "mock" else "")
+    )
+    remediation = problems_msg["remediation"] if (problems or provider == "mock") else ""
     return DiagnosticCheck(
         check_id="llm_base_config",
         category="llm",
-        title="LLM プロバイダ設定",
+        title=state_messages.check_title("llm_base_config"),
         severity=severity,
         detail=detail,
-        impact=(
-            "プロバイダや API キーが不正な場合、Generate & Evaluate とすべての "
-            "reasoning モデル機能が呼び出し時に失敗します。"
-            if severity == "error"
-            else ("モック出力を実際の解析として扱わないでください。" if provider == "mock" else "")
-        ),
-        remediation=(
-            "LLM_PROVIDER を openai/anthropic/gemini/mock のいずれかに設定し、"
-            "mock 以外のプロバイダでは LLM_API_KEY（またはプロバイダ固有のキー）を"
-            "設定してください。"
-            if problems or provider == "mock"
-            else ""
-        ),
+        impact=impact,
+        remediation=remediation,
         related_env=["LLM_PROVIDER", "LLM_API_KEY", "LLM_MODEL", "LLM_TIMEOUT"],
         related_pages=["/generation"],
         fix_kind=FIX_KIND_DIALOG,
@@ -627,40 +596,32 @@ def _check_intelligence_llm_config() -> DiagnosticCheck:
     problems: List[str] = []
     severity = "ok"
 
+    def _fragment(variant: str) -> str:
+        return state_messages.check_message("intelligence_llm_config", variant)["detail_fragment"]
+
     if provider not in KNOWN_PROVIDERS:
         problems.append(
-            f"実効的な intelligence プロバイダ {provider!r}{fallback_note} は"
-            f"サポートされていません（{', '.join(sorted(KNOWN_PROVIDERS))}）"
+            _fragment("unsupported_provider").format(
+                provider=provider, fallback_note=fallback_note, known=", ".join(sorted(KNOWN_PROVIDERS)),
+            )
         )
         severity = "error"
     else:
         family = _model_family_matches(provider, model)
         if family is False:
             problems.append(
-                f"モデル {model!r} は実効プロバイダ {provider!r}{fallback_note} とは"
-                "別プロバイダのモデルファミリに属しています"
+                _fragment("wrong_family").format(model=model, provider=provider, fallback_note=fallback_note)
             )
             severity = "error"
         elif family is None and provider != "mock":
-            problems.append(
-                f"モデル {model!r} はプロバイダ {provider!r} の既知のモデルファミリに"
-                "一致しません。不正なモデル ID の可能性があり、reasoning 能力を"
-                "静的に検証できません"
-            )
+            problems.append(_fragment("unknown_family").format(model=model, provider=provider))
             severity = "warning"
 
         if provider == "mock":
-            problems.append(
-                "実効的な intelligence プロバイダが 'mock' です。reasoning が必要な"
-                "ステップはブロックされ、出力は明示的なモックデータです"
-            )
+            problems.append(_fragment("mock"))
             severity = _worst_severity([severity, "blocked"])
         elif family is True and severity != "error" and not is_reasoning_model(provider, model):
-            problems.append(
-                f"モデル {model!r} は reasoning 非対応です。ドキュメント索引・"
-                "claim スキャン・capability 階層の生成には reasoning モデルが必要で、"
-                "ブロックされます"
-            )
+            problems.append(_fragment("not_reasoning_model").format(model=model))
             severity = _worst_severity([severity, "blocked"])
 
         if provider != "mock":
@@ -679,36 +640,23 @@ def _check_intelligence_llm_config() -> DiagnosticCheck:
             severity = _worst_severity([severity, "warning"])
 
     if not explicit_model and not explicit_provider and severity == "ok":
-        problems.append(
-            "INTELLIGENCE_LLM_* が未設定です。intelligence 機能は汎用の "
-            "LLM_PROVIDER/LLM_MODEL 設定を使用します"
-        )
+        problems.append(_fragment("unset_defaults_to_generic"))
 
+    ok_msg = state_messages.check_message("intelligence_llm_config", "ok")
     detail = (
         "; ".join(problems) + "。"
         if problems
-        else f"実効的な intelligence モデル: {provider}/{model}{fallback_note}。"
+        else ok_msg["detail"].format(provider=provider, model=model, fallback_note=fallback_note)
     )
+    problems_msg = state_messages.check_message("intelligence_llm_config", "problems")
     return DiagnosticCheck(
         check_id="intelligence_llm_config",
         category="llm",
-        title="Intelligence 用 reasoning モデル設定",
+        title=state_messages.check_title("intelligence_llm_config"),
         severity=severity,
         detail=detail,
-        impact=(
-            "有効な reasoning モデルがないと claim スキャン・docs-code 照合・"
-            "capability 階層の生成が失敗またはブロックされ、ヒューリスティックな"
-            "フォールバックはありません。"
-            if severity in ("error", "blocked", "warning")
-            else ""
-        ),
-        remediation=(
-            "INTELLIGENCE_LLM_PROVIDER と INTELLIGENCE_LLM_MODEL を reasoning 対応の"
-            "プロバイダ/モデルの組み合わせ（および対応する API キー）に設定し、"
-            "System Understanding のビルドを再実行してください。"
-            if severity in ("error", "blocked", "warning")
-            else ""
-        ),
+        impact=problems_msg["impact"] if severity in ("error", "blocked", "warning") else "",
+        remediation=problems_msg["remediation"] if severity in ("error", "blocked", "warning") else "",
         related_env=related_env,
         related_pages=[PAGE_SYSTEM_UNDERSTANDING, PAGE_REPOSITORY],
         related_pipeline_steps=reasoning_steps,
@@ -733,13 +681,9 @@ def _last_run_failure_guidance(run_type: str, error: Optional[str]) -> Dict[str,
             ]
         )
         return {
-            "remediation": (
-                "下記の直近のエラーは API キー・モデル ID・タイムアウト設定ではなく、"
-                "reasoning モデルの構造化出力に含まれる evidence_refs が許可された"
-                "snapshot 範囲外だったことを示しています。無効な evidence_refs は保存前に"
-                "破棄されるべきなので、該当機能を再実行し、同じ validation error が続く"
-                "場合は evidence_refs の生成/検証ロジックを確認してください。"
-            ),
+            "remediation": state_messages.check_message(
+                "llm_last_run", "failure_guidance_evidence"
+            )["remediation"],
             "related_env": [],
             "related_pages": pages,
             "related_pipeline_steps": steps,
@@ -747,11 +691,9 @@ def _last_run_failure_guidance(run_type: str, error: Optional[str]) -> Dict[str,
             "fix_anchor": None,
         }
     return {
-        "remediation": (
-            "下記の直近のエラーを確認し、指し示す設定（API キー・モデル ID・"
-            "タイムアウト）を修正してから、System Understanding でビルドを"
-            "再実行してください。"
-        ),
+        "remediation": state_messages.check_message(
+            "llm_last_run", "failure_guidance_generic"
+        )["remediation"],
         "related_env": [
             "INTELLIGENCE_LLM_PROVIDER",
             "INTELLIGENCE_LLM_MODEL",
@@ -778,15 +720,17 @@ def _check_last_reasoning_run(
     Understanding build red.  Each snapshot is an immutable evidence scope,
     so the diagnostic is scoped to the latest ready snapshot as well.
     """
+    llm_last_run_title = state_messages.check_title("llm_last_run")
     if snapshot_id is None:
+        msg = state_messages.check_message("llm_last_run", "no_snapshot")
         return DiagnosticCheck(
             check_id="llm_last_run",
             category="llm",
-            title="直近の reasoning モデル実行",
+            title=llm_last_run_title,
             severity="unknown",
-            detail="最新 snapshot がないため、この snapshot に紐づく reasoning 実行はありません。",
-            impact="snapshot を作成後に reasoning 実行の状態を確認できます。",
-            remediation="Repository で snapshot を作成してください。",
+            detail=msg["detail"],
+            impact=msg["impact"],
+            remediation=msg["remediation"],
             related_pages=[PAGE_REPOSITORY],
             fix_kind=FIX_KIND_NAVIGATE,
             fix_page=PAGE_REPOSITORY,
@@ -806,24 +750,15 @@ def _check_last_reasoning_run(
         # whose build is deterministic and would not record a reasoning run),
         # and its remediation must name the operations that actually record
         # reasoning runs instead of a generic "run Build".
+        msg = state_messages.check_message("llm_last_run", "no_run_yet")
         return DiagnosticCheck(
             check_id="llm_last_run",
             category="llm",
-            title="直近の reasoning モデル実行",
+            title=llm_last_run_title,
             severity="unknown",
-            detail=(
-                "このシステムではまだ reasoning モデルの実行が記録されていないため、"
-                "実行時の問題（タイムアウト・認証・不正なモデル・パースエラー）は"
-                "観測されていません。これは設定したモデルの疎通が未確認という"
-                "情報であり、他の warning / error 診断の原因を示すものではありません。"
-            ),
-            impact="設定は正しく見えても、呼び出し時に失敗する可能性があります。",
-            remediation=(
-                "reasoning モデルの実行は、System Understanding のビルド"
-                "（ドキュメント主張スキャン）・ドラフト生成・Interview の対話で"
-                "記録されます。他に warning / error の診断が表示されている場合は、"
-                "先にそちらの『次の操作』を実施してください。"
-            ),
+            detail=msg["detail"],
+            impact=msg["impact"],
+            remediation=msg["remediation"],
             related_pages=[PAGE_SYSTEM_UNDERSTANDING],
             related_pipeline_steps=[
                 "documentation_claims_scanned",
@@ -836,19 +771,14 @@ def _check_last_reasoning_run(
     observed_at = row["completed_at"] or row["started_at"]
     if row["status"] == "failed":
         guidance = _last_run_failure_guidance(row["run_type"], row["error_details"])
+        msg = state_messages.check_message("llm_last_run", "failed")
         return DiagnosticCheck(
             check_id="llm_last_run",
             category="llm",
-            title="直近の reasoning モデル実行",
+            title=llm_last_run_title,
             severity="error",
-            detail=(
-                f"直近の reasoning 実行（#{row['id']}, {row['run_type']}）が"
-                "失敗しました。"
-            ),
-            impact=(
-                "reasoning に基づく成果物（ドラフト・claim・capability 階層）が"
-                "生成されていないか、古くなっています。"
-            ),
+            detail=msg["detail"].format(run_id=row["id"], run_type=row["run_type"]),
+            impact=msg["impact"],
             remediation=guidance["remediation"],
             related_env=guidance["related_env"],
             related_pages=guidance["related_pages"],
@@ -864,14 +794,14 @@ def _check_last_reasoning_run(
             fix_anchor=guidance["fix_anchor"],
         )
     mock_note = "（モック実行）" if row["is_mock"] else ""
+    msg = state_messages.check_message("llm_last_run", "ok")
     return DiagnosticCheck(
         check_id="llm_last_run",
         category="llm",
-        title="直近の reasoning モデル実行",
+        title=llm_last_run_title,
         severity="ok",
-        detail=(
-            f"直近の reasoning 実行（#{row['id']}, {row['run_type']}）の状態は "
-            f"'{row['status']}'{mock_note} です。"
+        detail=msg["detail"].format(
+            run_id=row["id"], run_type=row["run_type"], status=row["status"], mock_note=mock_note
         ),
         impact="",
         remediation="",
@@ -886,11 +816,12 @@ def _latest_ready_snapshot_id(conn, system_id: int) -> Optional[int]:
 def _no_ready_snapshot_check(base: dict) -> DiagnosticCheck:
     """Blocked result shared by every pipeline check when no snapshot is ready."""
     payload = {k: v for k, v in base.items() if k != "snapshot_id"}
+    msg = state_messages.shared_check_message("no_ready_snapshot")
     return DiagnosticCheck(
         severity="blocked",
-        detail="ready な snapshot がないため、このステップは実行できません。",
-        impact="snapshot が作成されるまでこのステップは未実行のままです。",
-        remediation="まず Repository タブから snapshot を作成してください。",
+        detail=msg["detail"],
+        impact=msg["impact"],
+        remediation=msg["remediation"],
         fix_kind=FIX_KIND_NAVIGATE,
         fix_page=PAGE_REPOSITORY,
         fix_anchor=ANCHOR_SNAPSHOT_CREATE,
@@ -907,14 +838,13 @@ def _baseline_ok_check(
 ) -> DiagnosticCheck:
     label = "System Purpose" if purpose else "Core Capability"
     if baseline.snapshot_id == base.get("snapshot_id"):
-        detail = f"{label} は現在の snapshot で確認済みです。"
+        detail = state_messages.shared_check_message("baseline_ok.current")["detail"].format(label=label)
     elif impact.status == "unchanged":
-        detail = (
-            f"{label} は snapshot #{baseline.snapshot_id} の確認済み理解を再利用できます。"
-            "今回の差分には再確認が必要な根拠変更は見つかりませんでした。"
+        detail = state_messages.shared_check_message("baseline_ok.reusable")["detail"].format(
+            label=label, baseline_snapshot_id=baseline.snapshot_id
         )
     else:
-        detail = f"{label} は確認済みです。"
+        detail = state_messages.shared_check_message("baseline_ok.other")["detail"].format(label=label)
     payload = {k: v for k, v in base.items() if k != "snapshot_id"}
     return DiagnosticCheck(
         severity="ok",
@@ -932,21 +862,16 @@ def _baseline_impacted_check(
     impact: "system_state.UnderstandingDiffImpact",
     purpose: bool,
 ) -> DiagnosticCheck:
+    msg = state_messages.shared_check_message("baseline_impacted")
     target = "System Purpose" if purpose else "Core Capabilities"
-    title = "System Purpose の再確認" if purpose else "主な機能 / Core Capabilities の再確認"
-    reason = " ".join(impact.reasons) if impact.reasons else "前回確認済み理解に影響しうる差分があります。"
+    title = msg["title_purpose"] if purpose else msg["title_capabilities"]
+    reason = " ".join(impact.reasons) if impact.reasons else msg["default_reason"]
     payload = {k: v for k, v in base.items() if k not in {"title", "snapshot_id"}}
     return DiagnosticCheck(
         severity="warning",
-        detail=(
-            f"{target} は snapshot #{baseline.snapshot_id} で確認済みですが、"
-            f"最新 snapshot との差分に影響候補があります。{reason}"
-        ),
-        impact=(
-            "確認済み理解をそのまま使えるか判断が必要です。"
-            "目的・主要機能が変わっていない場合は Interview で再確認してください。"
-        ),
-        remediation=f"Interview で {target} を再確認してください。",
+        detail=msg["detail"].format(target=target, baseline_snapshot_id=baseline.snapshot_id, reason=reason),
+        impact=msg["impact"],
+        remediation=msg["remediation"].format(target=target),
         fix_kind=FIX_KIND_NAVIGATE,
         fix_page=PAGE_INTERVIEW,
         fix_anchor=ANCHOR_INTERVIEW_PURPOSE if purpose else ANCHOR_INTERVIEW_CAPABILITIES,
@@ -961,21 +886,16 @@ def _unconfirmed_understanding_check(
     baseline: "system_state.UnderstandingBaseline",
     purpose: bool,
 ) -> DiagnosticCheck:
+    msg = state_messages.shared_check_message("unconfirmed_understanding")
     target = "System Purpose" if purpose else "Core Capabilities"
-    title = "System Purpose の確認" if purpose else "主な機能 / Core Capabilities の確認"
+    title = msg["title_purpose"] if purpose else msg["title_capabilities"]
     count = baseline.purpose_count if purpose else baseline.capability_count
     payload = {k: v for k, v in base.items() if k not in {"title", "snapshot_id"}}
     return DiagnosticCheck(
         severity="warning",
-        detail=(
-            f"Interview に未確認の {target} 候補が {count} 件あります。"
-            "baseline として再利用するには、開発者による明示的な確認が必要です。"
-        ),
-        impact=(
-            "未確認の理解は、snapshot 更新後の差分診断や probe 設計の前提として"
-            "まだ採用されません。"
-        ),
-        remediation=f"Interview で {target} を確認済みにしてください。",
+        detail=msg["detail"].format(target=target, count=count),
+        impact=msg["impact"],
+        remediation=msg["remediation"].format(target=target),
         fix_kind=FIX_KIND_NAVIGATE,
         fix_page=PAGE_INTERVIEW,
         fix_anchor=ANCHOR_INTERVIEW_PURPOSE if purpose else ANCHOR_INTERVIEW_CAPABILITIES,
@@ -1000,7 +920,7 @@ def _check_system_purpose(conn, system_id: int, snapshot_id: Optional[int]) -> D
     base = dict(
         check_id="system_purpose",
         category="understanding",
-        title="System Purpose の定義",
+        title=state_messages.check_title("system_purpose"),
         related_pages=[PAGE_SYSTEM_UNDERSTANDING, PAGE_INTERVIEW],
         related_pipeline_steps=["capability_hierarchy_ready"],
         snapshot_id=snapshot_id,
@@ -1011,7 +931,7 @@ def _check_system_purpose(conn, system_id: int, snapshot_id: Optional[int]) -> D
     if status.kind == "satisfied_current":
         return DiagnosticCheck(
             severity="ok",
-            detail="System Purpose が定義されています。",
+            detail=state_messages.shared_check_message("system_purpose.satisfied")["detail"],
             impact="",
             remediation="",
             **{k: v for k, v in base.items() if k != "snapshot_id"},
@@ -1022,17 +942,12 @@ def _check_system_purpose(conn, system_id: int, snapshot_id: Optional[int]) -> D
         return _baseline_impacted_check(base=base, baseline=status.baseline, impact=status.impact, purpose=True)
     if status.kind == "unconfirmed":
         return _unconfirmed_understanding_check(base=base, baseline=status.baseline, purpose=True)
+    msg = state_messages.shared_check_message("system_purpose.missing")
     return DiagnosticCheck(
         severity="warning",
-        detail=(
-            "System Purpose が未定義です。Pipeline のステップが完了していても、"
-            "このシステムが何のためのものかが定義されていません。"
-        ),
-        impact=(
-            "probe 設計・flow 探索・改善提案・ユーザー意図との整合の前提となる"
-            "根幹情報が欠けています。"
-        ),
-        remediation="Interview で System Purpose を定義・確認してください。",
+        detail=msg["detail"],
+        impact=msg["impact"],
+        remediation=msg["remediation"],
         fix_kind=FIX_KIND_NAVIGATE,
         fix_page=PAGE_INTERVIEW,
         fix_anchor=ANCHOR_INTERVIEW_PURPOSE,
@@ -1052,7 +967,7 @@ def _check_system_capabilities(conn, system_id: int, snapshot_id: Optional[int])
     base = dict(
         check_id="system_capabilities",
         category="understanding",
-        title="主な機能 / Core Capabilities の把握",
+        title=state_messages.check_title("system_capabilities"),
         related_pages=[PAGE_SYSTEM_UNDERSTANDING, PAGE_INTERVIEW, PAGE_CAPABILITY_MAP],
         related_pipeline_steps=["capability_hierarchy_ready"],
         snapshot_id=snapshot_id,
@@ -1063,7 +978,7 @@ def _check_system_capabilities(conn, system_id: int, snapshot_id: Optional[int])
     if status.kind == "satisfied_current":
         return DiagnosticCheck(
             severity="ok",
-            detail=f"{status.count} 件の Core Capability が定義されています。",
+            detail=state_messages.shared_check_message("system_capabilities.satisfied")["detail"].format(count=status.count),
             impact="",
             remediation="",
             **{k: v for k, v in base.items() if k != "snapshot_id"},
@@ -1074,17 +989,12 @@ def _check_system_capabilities(conn, system_id: int, snapshot_id: Optional[int])
         return _baseline_impacted_check(base=base, baseline=status.baseline, impact=status.impact, purpose=False)
     if status.kind == "unconfirmed":
         return _unconfirmed_understanding_check(base=base, baseline=status.baseline, purpose=False)
+    msg = state_messages.shared_check_message("system_capabilities.missing")
     return DiagnosticCheck(
         severity="warning",
-        detail="対象システムの主な機能（Core Capabilities）が未定義・空です。",
-        impact=(
-            "probe 候補選定・flow 探索・改善提案の前提となる、システムの主要な"
-            "機能の把握ができていません。"
-        ),
-        remediation=(
-            "Interview で主な機能を特定するか、Capability Map で capability 階層を"
-            "確認してください。"
-        ),
+        detail=msg["detail"],
+        impact=msg["impact"],
+        remediation=msg["remediation"],
         fix_kind=FIX_KIND_NAVIGATE,
         fix_page=PAGE_INTERVIEW,
         fix_anchor=ANCHOR_INTERVIEW_CAPABILITIES,
@@ -1097,14 +1007,12 @@ def _reasoning_unavailable_check(base: dict, *, detail: str) -> DiagnosticCheck:
 
     ``detail`` differs per pipeline step; everything else is shared.
     """
+    shared = state_messages.shared_check_message("reasoning_unavailable")
     return DiagnosticCheck(
         severity="blocked",
         detail=detail,
-        impact="System Understanding でこのステップはブロック/未実行として表示されます。",
-        remediation=(
-            "intelligence 用 reasoning モデル設定（上記の LLM チェックを参照）を"
-            "修正してからビルドを実行してください。"
-        ),
+        impact=shared["impact"],
+        remediation=shared["remediation"],
         fix_kind=FIX_KIND_NAVIGATE,
         fix_page=PAGE_SYSTEM_UNDERSTANDING,
         fix_anchor=ANCHOR_BUILD,
@@ -1146,15 +1054,13 @@ def _run_backed_pipeline_check(
         if requires_reasoning and not reasoning_available:
             return _reasoning_unavailable_check(
                 base,
-                detail=(
-                    "このステップは一度も実行されておらず、reasoning モデルが"
-                    "必要ですが設定されていません。"
-                ),
+                detail=state_messages.shared_check_message("run_backed.not_run_blocked_reasoning")["detail"],
             )
+        not_run = state_messages.shared_check_message("run_backed.not_run")
         return DiagnosticCheck(
             severity="warning",
-            detail="このステップは現在の snapshot に対して実行されていません。",
-            impact="System Understanding でこのステップは未実行として表示されます。",
+            detail=not_run["detail"],
+            impact=not_run["impact"],
             remediation=not_run_remediation,
             fix_kind=FIX_KIND_NAVIGATE,
             fix_page=PAGE_SYSTEM_UNDERSTANDING,
@@ -1164,22 +1070,19 @@ def _run_backed_pipeline_check(
     if row["status"] == "completed":
         return DiagnosticCheck(
             severity="ok",
-            detail=f"直近の実行（#{row['id']}, {row['run_type']}）は完了しました。",
+            detail=state_messages.shared_check_message("run_backed.completed")["detail"].format(
+                run_id=row["id"], run_type=row["run_type"]
+            ),
             impact="",
             remediation="",
             **base,
         )
+    err = state_messages.shared_check_message("run_backed.error")
     return DiagnosticCheck(
         severity="error",
-        detail=(
-            f"直近の実行（#{row['id']}, {row['run_type']}）の状態は "
-            f"'{row['status']}' です。"
-        ),
-        impact="このステップの成果物が欠落しているか古くなっています。",
-        remediation=(
-            "下記の直近のエラーを確認し、根本原因を修正してから、System "
-            "Understanding でビルドを再実行してください。"
-        ),
+        detail=err["detail"].format(run_id=row["id"], run_type=row["run_type"], status=row["status"]),
+        impact=err["impact"],
+        remediation=err["remediation"],
         last_observed_error=LastObservedError(
             source=f"intelligence_runs#{row['id']}:{row['run_type']}",
             status=row["status"],
@@ -1209,27 +1112,25 @@ def _check_capability_hierarchy_pipeline(
     check = _run_backed_pipeline_check(
         conn, system_id, snapshot_id,
         check_id="pipeline_capability_hierarchy",
-        title="capability 階層の実行",
+        title=state_messages.check_title("pipeline_capability_hierarchy"),
         run_types=["capability_hierarchy"],
         pipeline_steps=["capability_hierarchy_ready"],
         requires_reasoning=True,
         reasoning_available=reasoning_available,
-        not_run_remediation="System Understanding で Build / Refresh を実行して capability 階層を生成してください。",
+        not_run_remediation=state_messages.pipeline_not_run_remediation("pipeline_capability_hierarchy"),
     )
     if (
         check.severity == "ok"
         and snapshot_id is not None
         and system_state._capability_count_in_current_snapshot(conn, system_id, snapshot_id) == 0
     ):
+        empty = state_messages.check_message("pipeline_capability_hierarchy", "zero_capabilities")
         return replace(
             check,
             severity="warning",
-            detail=check.detail + " ただし capability ノードが 0 件のため、Core Capabilities は未定義のままです。",
-            impact="Core Capabilities が未定義のため、probe 設計や flow 探索の前提が欠けています。",
-            remediation=(
-                "Interview で Core Capabilities を確認するか、対象リポジトリに "
-                "`probe-agent:` メタデータを追加してから Build / Refresh を再実行してください。"
-            ),
+            detail=check.detail + empty["detail_suffix"],
+            impact=empty["impact"],
+            remediation=empty["remediation"],
             fix_kind=FIX_KIND_NAVIGATE,
             fix_page=PAGE_INTERVIEW,
             fix_anchor=ANCHOR_INTERVIEW_CAPABILITIES,
@@ -1264,15 +1165,13 @@ def _artifact_backed_pipeline_check(
         if requires_reasoning and not reasoning_available:
             return _reasoning_unavailable_check(
                 base,
-                detail=(
-                    "現在の snapshot に対する成果物がなく、必要な reasoning モデルが"
-                    "設定されていません。"
-                ),
+                detail=state_messages.shared_check_message("artifact_backed.not_run_blocked_reasoning")["detail"],
             )
+        not_run = state_messages.shared_check_message("artifact_backed.not_run")
         return DiagnosticCheck(
             severity="warning",
-            detail="現在の snapshot に対する成果物がありません。",
-            impact="System Understanding でこのステップは未実行として表示されます。",
+            detail=not_run["detail"],
+            impact=not_run["impact"],
             remediation=not_run_remediation,
             fix_kind=FIX_KIND_NAVIGATE,
             fix_page=PAGE_SYSTEM_UNDERSTANDING,
@@ -1281,7 +1180,7 @@ def _artifact_backed_pipeline_check(
         )
     return DiagnosticCheck(
         severity="ok",
-        detail="現在の snapshot に対する成果物が存在します。",
+        detail=state_messages.shared_check_message("artifact_backed.ok")["detail"],
         impact="",
         remediation="",
         **base,
@@ -1316,10 +1215,11 @@ def _build_step_pipeline_check(
         (system_id, snapshot_id, step),
     ).fetchone()
     if row is None:
+        not_run = state_messages.shared_check_message("build_step.not_run")
         return DiagnosticCheck(
             severity="warning",
-            detail="このビルドステップは現在の snapshot に対して実行されていません。",
-            impact="System Understanding でこのステップは未実行として表示されます。",
+            detail=not_run["detail"],
+            impact=not_run["impact"],
             remediation=not_run_remediation,
             fix_kind=FIX_KIND_NAVIGATE,
             fix_page=PAGE_SYSTEM_UNDERSTANDING,
@@ -1329,7 +1229,9 @@ def _build_step_pipeline_check(
     if row["status"] == "completed":
         return DiagnosticCheck(
             severity="ok",
-            detail=f"直近のビルドステップ（#{row['id']}, {step}）は完了しました。",
+            detail=state_messages.shared_check_message("build_step.completed")["detail"].format(
+                run_id=row["id"], step=step
+            ),
             impact="",
             remediation="",
             **base,
@@ -1340,11 +1242,12 @@ def _build_step_pipeline_check(
         severity = "error"
     else:
         severity = "warning"
+    err = state_messages.shared_check_message("build_step.error")
     return DiagnosticCheck(
         severity=severity,
-        detail=f"直近のビルドステップ（#{row['id']}, {step}）の状態は '{row['status']}' です。",
-        impact="このステップの成果物が欠落しているか古くなっています。",
-        remediation="下記のビルドステップのエラーを確認し、根本原因を修正してからビルドを再実行してください。",
+        detail=err["detail"].format(run_id=row["id"], step=step, status=row["status"]),
+        impact=err["impact"],
+        remediation=err["remediation"],
         last_observed_error=LastObservedError(
             source=f"system_understanding_build_steps#{row['id']}:{step}",
             status=row["status"],
@@ -1390,41 +1293,41 @@ def run_system_diagnostics(system_id: int) -> SystemDiagnosticsReport:
             _run_backed_pipeline_check(
                 conn, system_id, snapshot_id,
                 check_id="pipeline_symbol_index",
-                title="シンボル索引の実行",
+                title=state_messages.check_title("pipeline_symbol_index"),
                 run_types=["symbol_index"],
                 pipeline_steps=["symbols_indexed"],
                 requires_reasoning=False,
                 reasoning_available=reasoning_available,
-                not_run_remediation="System Understanding で Build / Refresh を実行してコードシンボルを索引付けしてください。",
+                not_run_remediation=state_messages.pipeline_not_run_remediation("pipeline_symbol_index"),
             )
         )
         checks.append(
             _run_backed_pipeline_check(
                 conn, system_id, snapshot_id,
                 check_id="pipeline_entrypoint_index",
-                title="エントリポイント索引の実行",
+                title=state_messages.check_title("pipeline_entrypoint_index"),
                 run_types=["entrypoint_index"],
                 pipeline_steps=["entrypoints_discovered"],
                 requires_reasoning=False,
                 reasoning_available=reasoning_available,
-                not_run_remediation="System Understanding で Build / Refresh を実行してエントリポイントを検出してください。",
+                not_run_remediation=state_messages.pipeline_not_run_remediation("pipeline_entrypoint_index"),
             )
         )
         checks.append(
             _build_step_pipeline_check(
                 conn, system_id, snapshot_id,
                 check_id="pipeline_documentation_index",
-                title="ドキュメント索引のビルドステップ",
+                title=state_messages.check_title("pipeline_documentation_index"),
                 step="documentation_index",
                 pipeline_steps=["documentation_indexed"],
-                not_run_remediation="System Understanding で Build / Refresh を実行してドキュメントチャンクを索引付けしてください。",
+                not_run_remediation=state_messages.pipeline_not_run_remediation("pipeline_documentation_index"),
             )
         )
         checks.append(
             _artifact_backed_pipeline_check(
                 conn, system_id, snapshot_id,
                 check_id="pipeline_understanding_graph",
-                title="Understanding グラフ（ドキュメントの主張）",
+                title=state_messages.check_title("pipeline_understanding_graph"),
                 artifact_sql=(
                     "SELECT id FROM understanding_graph_snapshots "
                     "WHERE system_id = ? AND snapshot_id = ? LIMIT 1"
@@ -1432,7 +1335,7 @@ def run_system_diagnostics(system_id: int) -> SystemDiagnosticsReport:
                 pipeline_steps=["documentation_claims_scanned", "docs_code_reconciled"],
                 requires_reasoning=True,
                 reasoning_available=reasoning_available,
-                not_run_remediation="System Understanding で Build / Refresh を実行してドキュメントの主張をスキャンしてください。",
+                not_run_remediation=state_messages.pipeline_not_run_remediation("pipeline_understanding_graph"),
             )
         )
         checks.append(

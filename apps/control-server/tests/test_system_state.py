@@ -264,6 +264,48 @@ def _get_state(client, hdrs):
     return data, {i["state_id"]: i for i in data["items"]}
 
 
+def _insert_probe_plan(system_id, snapshot_id, run_id, *, status="proposed"):
+    from app.db import get_conn
+
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO probe_plans
+                   (system_id, snapshot_id, intelligence_run_id, feature_id,
+                    objective, status, origin, created_at, updated_at)
+               VALUES (?, ?, ?, 'feat-1', 'obj', ?, 'manual', ?, ?)""",
+            (system_id, snapshot_id, run_id, status, now, now),
+        )
+        return cur.lastrowid
+
+
+def _insert_probe_patch(plan_id, system_id, snapshot_id, *, status="generated"):
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO probe_patches
+                   (plan_id, system_id, snapshot_id, commit_sha, diff,
+                    skipped, status, cleanup_state, created_at)
+               VALUES (?, ?, ?, 'deadbeef', 'diff', '[]', ?, 'not_attempted', 0)""",
+            (plan_id, system_id, snapshot_id, status),
+        )
+        return cur.lastrowid
+
+
+def _insert_validation_run(patch_id, system_id, variant, *, overall_success=True):
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO validation_runs
+                   (patch_id, system_id, variant, worktree_path, overall_success,
+                    trace_status, network_isolation, cleanup_state, created_at)
+               VALUES (?, ?, ?, '/tmp/x', ?, 'not_checked', 'not_requested', 'not_attempted', 0)""",
+            (patch_id, system_id, variant, 1 if overall_success else 0),
+        )
+
+
 class TestSystemStateBasics:
     def test_requires_auth(self, admin_client):
         r = admin_client.get("/system-state")
@@ -665,13 +707,21 @@ class TestPipelineState:
         assert "pipeline.capability_hierarchy.empty" not in items
 
     def test_capability_hierarchy_completed_zero_capabilities_is_warning_item(
-        self, admin_client, tmp_path
+        self, admin_client, tmp_path, monkeypatch
     ):
         """Issue #210: a completed run with zero capability nodes must not
         silently disappear (return None, same as a genuinely "done" run).
         It gets a distinct state_id whose remediation points at
         Interview/metadata, not the generic "Build / Refresh を実行してください"
         used for not-yet-run/failed/blocked pipeline steps."""
+        # Issue #237: page_items is phase-suppressed. A real reasoning LLM
+        # config completes the setup phase (LLM_PROVIDER=mock pins
+        # intelligence_llm_config to "blocked" and thus user_phase to
+        # "setup", which would hide this preparation-phase item from
+        # page_items -- the item itself is still asserted via `items`).
+        monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+        monkeypatch.setenv("LLM_MODEL", "claude-opus-4-20250514")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         _, sys, hdrs = _setup(admin_client)
         repo, sha = _init_git_repo(tmp_path)
         admin_client.put(
@@ -727,6 +777,171 @@ class TestPipelineState:
         assert "pipeline.capability_hierarchy.empty" not in items
         assert "pipeline.capability_hierarchy.blocked_by_reasoning" not in items
         assert "pipeline.capability_hierarchy.not_run" not in items
+
+
+class TestDocsCodeReconcileState:
+    """Issue #238: pipeline.docs_code_reconcile.* absorbs
+    system_understanding_service._check_docs_code_reconciled's "has an
+    understanding graph AND has code symbols" structural condition, which
+    the existing diagnostic.pipeline_understanding_graph check (graph
+    presence only) does not fully cover.
+    """
+
+    def _snapshot(self, admin_client, hdrs, tmp_path):
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+        return snap.json()["id"]
+
+    def test_neither_graph_nor_symbols_is_not_run(self, admin_client, tmp_path):
+        _, sys, hdrs = _setup(admin_client)
+        self._snapshot(admin_client, hdrs, tmp_path)
+
+        _, items = _get_state(admin_client, hdrs)
+        item = items["pipeline.docs_code_reconcile.not_run"]
+        assert item["severity"] == "warning"
+        assert item["status"] == "missing"
+        assert item["user_action_kind"] == "build"
+        assert "pipeline.docs_code_reconcile.partial" not in items
+
+    def test_only_graph_is_partial(self, admin_client, tmp_path):
+        from app.db import get_conn
+
+        _, sys, hdrs = _setup(admin_client)
+        snapshot_id = self._snapshot(admin_client, hdrs, tmp_path)
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO understanding_graph_snapshots
+                       (system_id, snapshot_id, graph_json, source_hash, claim_count,
+                        confidence_summary, created_at)
+                   VALUES (?, ?, '{}', '', 0, '{}', 0)""",
+                (sys["id"], snapshot_id),
+            )
+
+        _, items = _get_state(admin_client, hdrs)
+        item = items["pipeline.docs_code_reconcile.partial"]
+        assert item["severity"] == "warning"
+        assert item["evidence"]["has_understanding_graph"] is True
+        assert item["evidence"]["has_code_symbols"] is False
+        assert "pipeline.docs_code_reconcile.not_run" not in items
+
+    def test_only_symbols_is_partial(self, admin_client, tmp_path):
+        from app.db import get_conn
+
+        _, sys, hdrs = _setup(admin_client)
+        snapshot_id = self._snapshot(admin_client, hdrs, tmp_path)
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO code_symbols
+                       (snapshot_id, system_id, path, qualified_name, kind, start_line, end_line)
+                   VALUES (?, ?, 'a.py', 'mod.fn', 'function', 1, 2)""",
+                (snapshot_id, sys["id"]),
+            )
+
+        _, items = _get_state(admin_client, hdrs)
+        item = items["pipeline.docs_code_reconcile.partial"]
+        assert item["evidence"]["has_understanding_graph"] is False
+        assert item["evidence"]["has_code_symbols"] is True
+
+    def test_both_present_returns_no_item(self, admin_client, tmp_path):
+        from app.db import get_conn
+
+        _, sys, hdrs = _setup(admin_client)
+        snapshot_id = self._snapshot(admin_client, hdrs, tmp_path)
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO understanding_graph_snapshots
+                       (system_id, snapshot_id, graph_json, source_hash, claim_count,
+                        confidence_summary, created_at)
+                   VALUES (?, ?, '{}', '', 0, '{}', 0)""",
+                (sys["id"], snapshot_id),
+            )
+            conn.execute(
+                """INSERT INTO code_symbols
+                       (snapshot_id, system_id, path, qualified_name, kind, start_line, end_line)
+                   VALUES (?, ?, 'a.py', 'mod.fn', 'function', 1, 2)""",
+                (snapshot_id, sys["id"]),
+            )
+
+        _, items = _get_state(admin_client, hdrs)
+        assert "pipeline.docs_code_reconcile.not_run" not in items
+        assert "pipeline.docs_code_reconcile.partial" not in items
+
+
+class TestProbePlanReviewState:
+    """Issue #238: proposal.probe_plans.proposed /
+    .approved_without_patch absorb system_understanding_service's
+    "Review probe plan" / "Generate / validate probe patch" NextAction
+    sources into system_state.py.
+    """
+
+    def _snapshot(self, admin_client, hdrs, tmp_path):
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+        return snap.json()["id"]
+
+    def test_proposed_plan_surfaces_review_item(self, admin_client, tmp_path):
+        _, sys, hdrs = _setup(admin_client)
+        snapshot_id = self._snapshot(admin_client, hdrs, tmp_path)
+        run_id = _insert_intelligence_run(sys["id"], snapshot_id, "probe_plan", "completed")
+        _insert_probe_plan(sys["id"], snapshot_id, run_id, status="proposed")
+
+        _, items = _get_state(admin_client, hdrs)
+        item = items["proposal.probe_plans.proposed"]
+        assert item["severity"] == "warning"
+        assert item["user_action_kind"] == "review"
+        assert item["evidence"]["proposed_probe_plan_count"] == 1
+        assert item["target_ui"]["route"] == "/probe-planner"
+        assert "proposal.probe_plans.approved_without_patch" not in items
+
+    def test_approved_without_patch_surfaces_patch_pending_item(self, admin_client, tmp_path):
+        _, sys, hdrs = _setup(admin_client)
+        snapshot_id = self._snapshot(admin_client, hdrs, tmp_path)
+        run_id = _insert_intelligence_run(sys["id"], snapshot_id, "probe_plan", "completed")
+        _insert_probe_plan(sys["id"], snapshot_id, run_id, status="approved")
+
+        _, items = _get_state(admin_client, hdrs)
+        item = items["proposal.probe_plans.approved_without_patch"]
+        assert item["severity"] == "info"
+        assert item["evidence"]["approved_probe_plan_without_patch_count"] == 1
+        assert "proposal.probe_plans.proposed" not in items
+
+    def test_approved_with_validated_patch_has_no_item(self, admin_client, tmp_path):
+        _, sys, hdrs = _setup(admin_client)
+        snapshot_id = self._snapshot(admin_client, hdrs, tmp_path)
+        run_id = _insert_intelligence_run(sys["id"], snapshot_id, "probe_plan", "completed")
+        plan_id = _insert_probe_plan(sys["id"], snapshot_id, run_id, status="approved")
+        patch_id = _insert_probe_patch(plan_id, sys["id"], snapshot_id)
+        _insert_validation_run(patch_id, sys["id"], "baseline")
+        _insert_validation_run(patch_id, sys["id"], "probed")
+
+        _, items = _get_state(admin_client, hdrs)
+        assert "proposal.probe_plans.approved_without_patch" not in items
+
+    def test_proposed_item_is_tagged_preparation_phase(self, admin_client, tmp_path):
+        """Issue #238: reviewing a proposed plan is one of the two ways to
+        satisfy derive_user_phase's instrumentation-path OR condition, so
+        this item must not default to the state_group="proposal" phase
+        ("diagnosis") the way approved_without_patch does.
+        """
+        _, sys, hdrs = _setup(admin_client)
+        snapshot_id = self._snapshot(admin_client, hdrs, tmp_path)
+        run_id = _insert_intelligence_run(sys["id"], snapshot_id, "probe_plan", "completed")
+        _insert_probe_plan(sys["id"], snapshot_id, run_id, status="proposed")
+
+        _, items = _get_state(admin_client, hdrs)
+        assert items["proposal.probe_plans.proposed"]["phase"] == "preparation"
 
 
 class TestDiagnosticsProjectionCompatibility:
@@ -823,3 +1038,645 @@ class TestAssistantScreenContextSharesState:
         checks_by_id = {c["check_id"]: c for c in ctx["screen_checks"]}
         assert checks_by_id["system_purpose"]["severity"] == "warning"
         assert checks_by_id["system_capabilities"]["severity"] == "warning"
+
+
+class TestIssue236FactsExtractionRegression:
+    """Issue #236: repository config, ready-snapshot, pipeline-step, and
+    Purpose/Capabilities facts were consolidated into app/state_facts.py.
+    This pins GET /system-state's response shape across representative
+    scenarios (unconfigured / snapshot only / pipeline complete) so a
+    regression in the shared facts layer is caught here.
+    """
+
+    def test_unconfigured_system_response_shape(self, admin_client):
+        _, _, hdrs = _setup(admin_client)
+        _, items = _get_state(admin_client, hdrs)
+
+        assert items["repository.configuration.missing"]["status"] == "missing"
+        assert items["snapshot.ready.missing"]["status"] == "missing"
+        assert not any(i.startswith("pipeline.") for i in items)
+        assert not any(i.startswith("understanding.") for i in items)
+
+    def test_repository_configuration_missing_carries_related_pipeline_step(self, admin_client):
+        # Finding #3: without this, the Dashboard Pipeline Checklist has no
+        # way to drive the repository_configured step's CTA from
+        # system-state -- it falls back to a hardcoded map.
+        _, _, hdrs = _setup(admin_client)
+        _, items = _get_state(admin_client, hdrs)
+
+        assert items["repository.configuration.missing"]["related_pipeline_steps"] == [
+            "repository_configured"
+        ]
+
+    def test_snapshot_only_response_shape(self, admin_client, tmp_path):
+        _, sys, hdrs = _setup(admin_client)
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+
+        _, items = _get_state(admin_client, hdrs)
+        assert "repository.configuration.missing" not in items
+        assert "snapshot.ready.missing" not in items
+        assert "repository.snapshot.stale" not in items
+        assert items["understanding.purpose.missing_baseline"]["status"] == "missing"
+        assert items["understanding.capabilities.missing_baseline"]["status"] == "missing"
+        assert items["pipeline.symbol_index.not_run"]["status"] == "missing"
+
+    def test_pipeline_complete_response_shape(self, admin_client, tmp_path):
+        """Every pipeline step system_state.py tracks is complete and
+        Purpose/Core Capabilities are satisfied for the current snapshot --
+        the highest-risk scenario for state_facts.py since every pipeline
+        raw-fact getter and both purpose/capability base facts are exercised
+        for a non-empty result at once.
+
+        Issue #238: also seeds an understanding graph snapshot and a code
+        symbol so pipeline.docs_code_reconcile.* (added by this issue) is
+        satisfied too -- otherwise this "every pipeline step complete"
+        scenario would no longer be true.
+        """
+        from app.db import get_conn
+
+        _, sys, hdrs = _setup(admin_client)
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+        snapshot_id = snap.json()["id"]
+
+        _insert_intelligence_run(sys["id"], snapshot_id, "symbol_index", "completed")
+        _insert_intelligence_run(sys["id"], snapshot_id, "entrypoint_index", "completed")
+        build_id = _insert_active_build(sys["id"], snapshot_id)
+        _insert_build_step(sys["id"], snapshot_id, build_id, "documentation_index", "completed")
+        run_id = _insert_intelligence_run(sys["id"], snapshot_id, "capability_hierarchy", "completed")
+        _insert_capability_node(sys["id"], snapshot_id, run_id, node_type="purpose", name="Test system")
+        _insert_capability_node(sys["id"], snapshot_id, run_id, node_type="capability", name="Item management")
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO understanding_graph_snapshots
+                       (system_id, snapshot_id, graph_json, source_hash, claim_count,
+                        confidence_summary, created_at)
+                   VALUES (?, ?, '{}', '', 0, '{}', 0)""",
+                (sys["id"], snapshot_id),
+            )
+            conn.execute(
+                """INSERT INTO code_symbols
+                       (snapshot_id, system_id, path, qualified_name, kind, start_line, end_line)
+                   VALUES (?, ?, 'a.py', 'mod.fn', 'function', 1, 2)""",
+                (snapshot_id, sys["id"]),
+            )
+
+        data, items = _get_state(admin_client, hdrs)
+        assert not any(i.startswith("pipeline.") for i in items)
+        assert "repository.configuration.missing" not in items
+        assert "snapshot.ready.missing" not in items
+        assert "repository.snapshot.stale" not in items
+        assert items["understanding.purpose.satisfied"]["status"] == "satisfied"
+        assert items["understanding.purpose.satisfied"]["severity"] == "ok"
+        assert items["understanding.capabilities.satisfied"]["status"] == "satisfied"
+        assert items["understanding.capabilities.satisfied"]["severity"] == "ok"
+
+        # /repository/system-understanding agrees: no purpose/capabilities gap
+        # (Issue #239 removed this response's own next_actions projection;
+        # the items["understanding.*.satisfied"] assertions above are the
+        # canonical check for "no purpose/capabilities gap" now).
+        su_r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert su_r.status_code == 200, su_r.text
+        su_data = su_r.json()
+        assert su_data["purpose"]["name"] == "Test system"
+        assert len(su_data["capabilities"]) == 1
+
+
+class TestDeriveUserPhase:
+    """Issue #237: derive_user_phase is a pure, DB-free function of
+    UserPhaseFacts. Boundary cases mirror the issue's required test list
+    (未設定 / 環境診断 error / snapshot のみ / pipeline 途中 / Purpose 未確定
+    / capability 0 件 / probe plan 承認済みでトレース無し / 受信中)."""
+
+    def _facts(self, **overrides):
+        from app.system_state import UserPhaseFacts
+
+        base = dict(
+            repository_configured=True,
+            setup_diagnostics_blocking=False,
+            ready_snapshot_exists=True,
+            pipeline_all_complete=True,
+            purpose_satisfied=True,
+            capabilities_satisfied=True,
+            approved_probe_plan_count=0,
+            connectivity_state="no_signal",
+        )
+        base.update(overrides)
+        return UserPhaseFacts(**base)
+
+    def test_repository_not_configured_is_setup(self):
+        from app.system_state import derive_user_phase
+
+        result = derive_user_phase(self._facts(repository_configured=False))
+        assert result.user_phase == "setup"
+        by_phase = {p.phase: p.complete for p in result.phases}
+        assert by_phase == {"setup": False, "preparation": False, "diagnosis": False}
+
+    def test_blocking_environment_diagnostic_is_setup(self):
+        from app.system_state import derive_user_phase
+
+        result = derive_user_phase(
+            self._facts(repository_configured=True, setup_diagnostics_blocking=True)
+        )
+        assert result.user_phase == "setup"
+        by_phase = {p.phase: p.complete for p in result.phases}
+        assert by_phase["setup"] is False
+
+    def test_snapshot_only_no_pipeline_is_preparation(self):
+        from app.system_state import derive_user_phase
+
+        result = derive_user_phase(self._facts(
+            ready_snapshot_exists=True, pipeline_all_complete=False,
+            purpose_satisfied=False, capabilities_satisfied=False,
+        ))
+        assert result.user_phase == "preparation"
+        by_phase = {p.phase: p.complete for p in result.phases}
+        assert by_phase["setup"] is True
+        assert by_phase["preparation"] is False
+
+    def test_pipeline_partial_is_preparation(self):
+        from app.system_state import derive_user_phase
+
+        result = derive_user_phase(self._facts(pipeline_all_complete=False))
+        assert result.user_phase == "preparation"
+
+    def test_purpose_unconfirmed_is_preparation(self):
+        from app.system_state import derive_user_phase
+
+        result = derive_user_phase(self._facts(purpose_satisfied=False))
+        assert result.user_phase == "preparation"
+
+    def test_zero_capabilities_is_preparation(self):
+        from app.system_state import derive_user_phase
+
+        result = derive_user_phase(self._facts(capabilities_satisfied=False))
+        assert result.user_phase == "preparation"
+
+    def test_no_instrumentation_signal_stays_preparation(self):
+        from app.system_state import derive_user_phase
+
+        # Every other condition satisfied, but neither an approved probe
+        # plan nor non-"no_signal" connectivity exists yet.
+        result = derive_user_phase(self._facts())
+        assert result.user_phase == "preparation"
+        by_phase = {p.phase: p.complete for p in result.phases}
+        assert by_phase == {"setup": True, "preparation": False, "diagnosis": False}
+
+    def test_approved_plan_without_traces_reaches_diagnosis(self):
+        from app.system_state import derive_user_phase
+
+        result = derive_user_phase(
+            self._facts(approved_probe_plan_count=1, connectivity_state="no_signal")
+        )
+        assert result.user_phase == "diagnosis"
+        by_phase = {p.phase: p.complete for p in result.phases}
+        assert by_phase == {"setup": True, "preparation": True, "diagnosis": False}
+
+    def test_receiving_traces_without_approved_plan_reaches_diagnosis(self):
+        from app.system_state import derive_user_phase
+
+        result = derive_user_phase(
+            self._facts(approved_probe_plan_count=0, connectivity_state="receiving")
+        )
+        assert result.user_phase == "diagnosis"
+
+    def test_smoke_only_connectivity_also_satisfies_instrumentation_signal(self):
+        # Issue #237's completion rule is "connectivity != no_signal", not
+        # "connectivity == receiving": a smoke-check trace still proves the
+        # instrumentation path is wired up structurally.
+        from app.system_state import derive_user_phase
+
+        result = derive_user_phase(self._facts(connectivity_state="smoke_only"))
+        assert result.user_phase == "diagnosis"
+
+    def test_setup_incomplete_forces_preparation_incomplete_regardless_of_other_facts(self):
+        # Preparation cannot be "complete" while setup itself is not --
+        # otherwise the phases list would report a later phase done while an
+        # earlier one is not, which is incoherent for a strict progression.
+        from app.system_state import derive_user_phase
+
+        result = derive_user_phase(self._facts(
+            repository_configured=False,
+            approved_probe_plan_count=1, connectivity_state="receiving",
+        ))
+        assert result.user_phase == "setup"
+        by_phase = {p.phase: p.complete for p in result.phases}
+        assert by_phase["preparation"] is False
+
+
+class TestPhaseTagging:
+    """Issue #237: _phase_for_item applies STATE_GROUP_PHASE by default, with
+    STATE_ID_PHASE_OVERRIDES taking precedence for a small, explicit
+    exception list."""
+
+    def test_default_group_mapping(self):
+        from app.system_state import StateItem, _phase_for_item
+
+        cases = {
+            "repository": "setup",
+            "configuration": "setup",
+            "snapshot": "preparation",
+            "pipeline": "preparation",
+            "understanding": "preparation",
+            "interview": "preparation",
+            "runtime": "diagnosis",
+            "proposal": "diagnosis",
+        }
+        for group, expected in cases.items():
+            item = StateItem(f"x.{group}", group, "warning", "missing", "none", "none", "s", "s", "s")
+            assert _phase_for_item(item) == expected, group
+
+    def test_connectivity_no_signal_overrides_to_preparation(self):
+        from app.system_state import StateItem, _phase_for_item
+
+        item = StateItem(
+            "runtime.connectivity.no_signal", "runtime", "warning", "missing",
+            "review", "before_next_step", "s", "s", "s",
+        )
+        assert _phase_for_item(item) == "preparation"
+
+    def test_repository_diagnostic_overrides_to_setup(self):
+        from app.system_state import StateItem, _phase_for_item
+
+        for check_id in ("repository_roots", "repository_config", "snapshot_status"):
+            item = StateItem(
+                f"diagnostic.{check_id}", "runtime", "error", "failed",
+                "configure", "now", "s", "s", "s",
+            )
+            assert _phase_for_item(item) == "setup", check_id
+
+    def test_pipeline_and_understanding_diagnostics_override_to_preparation(self):
+        from app.system_state import StateItem, _phase_for_item
+
+        for check_id in (
+            "pipeline_symbol_index", "pipeline_entrypoint_index",
+            "pipeline_documentation_index", "pipeline_understanding_graph",
+            "pipeline_capability_hierarchy", "system_purpose", "system_capabilities",
+        ):
+            item = StateItem(
+                f"diagnostic.{check_id}", "runtime", "warning", "missing",
+                "inspect", "before_next_step", "s", "s", "s",
+            )
+            assert _phase_for_item(item) == "preparation", check_id
+
+    def test_llm_and_auth_and_database_diagnostics_use_configuration_group_default(self):
+        # These already land in state_group="configuration" (not "runtime")
+        # via _diagnostic_state_item, so the group default alone (no
+        # override needed) already yields "setup".
+        from app.system_state import StateItem, _phase_for_item
+
+        for check_id in ("llm_base_config", "intelligence_llm_config", "llm_last_run", "auth_scope", "database_storage"):
+            item = StateItem(
+                f"diagnostic.{check_id}", "configuration", "warning", "missing",
+                "configure", "before_next_step", "s", "s", "s",
+            )
+            assert _phase_for_item(item) == "setup", check_id
+
+    def test_unrelated_runtime_diagnostic_stays_diagnosis(self):
+        from app.system_state import StateItem, _phase_for_item
+
+        item = StateItem(
+            "diagnostic.some_future_check", "runtime", "warning", "missing",
+            "inspect", "before_next_step", "s", "s", "s",
+        )
+        assert _phase_for_item(item) == "diagnosis"
+
+
+class TestUserPhaseIntegration:
+    """Issue #237: GET /system-state's user_phase / phases / notification
+    suppression, exercised end-to-end through the API."""
+
+    def _configure_reasoning_llm(self, monkeypatch):
+        # A non-mock, reasoning-capable LLM config so the setup-phase llm
+        # diagnostics (llm_base_config / intelligence_llm_config) come back
+        # "ok" instead of the "blocked" severity LLM_PROVIDER=mock always
+        # produces for intelligence_llm_config.
+        monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+        monkeypatch.setenv("LLM_MODEL", "claude-opus-4-20250514")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+
+    def _insert_probe_plan(self, system_id, snapshot_id, run_id, *, status="proposed"):
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO probe_plans
+                       (system_id, snapshot_id, intelligence_run_id, feature_id,
+                        objective, status, origin, created_at, updated_at)
+                   VALUES (?, ?, ?, 'feat-1', 'obj', ?, 'manual', 0, 0)""",
+                (system_id, snapshot_id, run_id, status),
+            )
+
+    def _insert_experiment(self, system_id, snapshot_id, *, status="completed", human_decision="undecided"):
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO experiments
+                       (system_id, feature_id, objective, snapshot_id,
+                        baseline_commit, config_revision, execution_config,
+                        status, human_decision, created_at)
+                   VALUES (?, 'feat-1', 'obj', ?, 'deadbeef', 'v1', '{}', ?, ?, 0)""",
+                (system_id, snapshot_id, status, human_decision),
+            )
+
+    def _insert_trace(self, system_id, component_id):
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO traces
+                       (system_id, trace_id, component_id, mode, input_json,
+                        output_text, error, duration_ms, timestamp)
+                   VALUES (?, ?, ?, 'trace', '{}', 'ok', NULL, 1.0, ?)""",
+                (system_id, f"trace-{component_id}", component_id, time.time()),
+            )
+
+    def _complete_pipeline(self, admin_client, sys, hdrs, tmp_path):
+        from app.db import get_conn
+
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+        snapshot_id = snap.json()["id"]
+
+        _insert_intelligence_run(sys["id"], snapshot_id, "symbol_index", "completed")
+        _insert_intelligence_run(sys["id"], snapshot_id, "entrypoint_index", "completed")
+        build_id = _insert_active_build(sys["id"], snapshot_id)
+        _insert_build_step(sys["id"], snapshot_id, build_id, "documentation_index", "completed")
+        run_id = _insert_intelligence_run(sys["id"], snapshot_id, "capability_hierarchy", "completed")
+        _insert_capability_node(sys["id"], snapshot_id, run_id, node_type="purpose", name="Test system")
+        _insert_capability_node(sys["id"], snapshot_id, run_id, node_type="capability", name="Item management")
+        # Issue #237 fix: pipeline_all_complete is now derived from the full
+        # 8-step Pipeline Checklist (compute_pipeline_steps), which also
+        # requires documentation_claims_scanned (an understanding graph
+        # snapshot), entrypoints_discovered (an actual code_entrypoints row
+        # -- distinct from the "entrypoint_index" intelligence_run row the 4
+        # legacy runs above already insert), and docs_code_reconciled (graph
+        # + code symbols both present) to be "complete" -- not just the 4
+        # legacy run/build rows above. Seed all three so tests that reach
+        # "diagnosis" via this helper keep doing so under the corrected,
+        # stricter gate.
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO understanding_graph_snapshots
+                       (system_id, snapshot_id, graph_json, source_hash, claim_count,
+                        confidence_summary, created_at)
+                   VALUES (?, ?, '{}', '', 0, '{}', 0)""",
+                (sys["id"], snapshot_id),
+            )
+            conn.execute(
+                """INSERT INTO code_symbols
+                       (snapshot_id, system_id, path, qualified_name, kind, start_line, end_line)
+                   VALUES (?, ?, 'a.py', 'mod.fn', 'function', 1, 2)""",
+                (snapshot_id, sys["id"]),
+            )
+            conn.execute(
+                """INSERT INTO code_entrypoints
+                       (system_id, snapshot_id, entrypoint_type, entrypoint_id, category, label,
+                        handler_path, handler_qualified_name, line_start, line_end, created_at)
+                   VALUES (?, ?, 'api', 'GET /items', 'api', 'label', 'a.py', 'mod.fn', 1, 2, 0)""",
+                (sys["id"], snapshot_id),
+            )
+        return snapshot_id
+
+    def test_phases_carry_japanese_catalog_label(self, admin_client):
+        """Finding #4: state_messages.PHASE_LABELS / phase_label must be
+        serialized onto each phase completion entry."""
+        from app import state_messages
+
+        _, _, hdrs = _setup(admin_client)
+        data, _items = _get_state(admin_client, hdrs)
+
+        assert data["phases"]
+        for phase in data["phases"]:
+            assert phase["label"], f"missing label for phase={phase['phase']}"
+            assert phase["label"] == state_messages.phase_label(phase["phase"])
+
+    def test_unconfigured_repository_is_setup_and_suppresses_later_phase_items(self, admin_client):
+        _, _, hdrs = _setup(admin_client)
+
+        data, items = _get_state(admin_client, hdrs)
+        assert data["user_phase"] == "setup"
+        by_phase = {p["phase"]: p["complete"] for p in data["phases"]}
+        assert by_phase == {"setup": False, "preparation": False, "diagnosis": False}
+
+        # runtime.connectivity.no_signal is preparation-tagged: present in
+        # `items` (audit trail) but suppressed from every notification
+        # projection (notification_items / page_items / primary_item) while
+        # user_phase is still "setup".
+        assert "runtime.connectivity.no_signal" in items
+        notif_ids = {i["state_id"] for i in data["notification_items"]}
+        assert "runtime.connectivity.no_signal" not in notif_ids
+        for notif in data["notification_items"]:
+            assert notif["phase"] == "setup"
+        page_ids = {
+            projected["state_id"]
+            for route_items in data["page_items"].values()
+            for projected in route_items
+        }
+        assert "runtime.connectivity.no_signal" not in page_ids
+        assert data["primary_item"]["phase"] == "setup"
+
+    def test_pipeline_complete_without_instrumentation_is_preparation(self, admin_client, tmp_path, monkeypatch):
+        self._configure_reasoning_llm(monkeypatch)
+        _, sys, hdrs = _setup(admin_client)
+        snapshot_id = self._complete_pipeline(admin_client, sys, hdrs, tmp_path)
+        # A completed, undecided experiment gives a concrete diagnosis-tagged
+        # item to prove it stays suppressed while still in "preparation".
+        self._insert_experiment(sys["id"], snapshot_id)
+
+        data, items = _get_state(admin_client, hdrs)
+        assert data["user_phase"] == "preparation"
+        by_phase = {p["phase"]: p["complete"] for p in data["phases"]}
+        assert by_phase["setup"] is True
+        assert by_phase["preparation"] is False
+
+        assert "proposal.experiments.undecided" in items
+        notif_ids = {i["state_id"] for i in data["notification_items"]}
+        assert "proposal.experiments.undecided" not in notif_ids
+        # Suppression covers page_items and primary_item too (Issue #237:
+        # phase scope is the outermost criterion of every projection).
+        page_ids = {
+            projected["state_id"]
+            for route_items in data["page_items"].values()
+            for projected in route_items
+        }
+        assert "proposal.experiments.undecided" not in page_ids
+        if data["primary_item"] is not None:
+            assert data["primary_item"]["phase"] in ("setup", "preparation")
+        # preparation-phase items stay visible while user_phase is
+        # "preparation" itself.
+        assert "runtime.connectivity.no_signal" in notif_ids
+
+    def test_approved_probe_plan_reaches_diagnosis(self, admin_client, tmp_path, monkeypatch):
+        self._configure_reasoning_llm(monkeypatch)
+        _, sys, hdrs = _setup(admin_client)
+        snapshot_id = self._complete_pipeline(admin_client, sys, hdrs, tmp_path)
+        self._insert_experiment(sys["id"], snapshot_id)
+        plan_run_id = _insert_intelligence_run(sys["id"], snapshot_id, "probe_plan", "completed")
+        self._insert_probe_plan(sys["id"], snapshot_id, plan_run_id, status="approved")
+
+        data, items = _get_state(admin_client, hdrs)
+        assert data["user_phase"] == "diagnosis"
+        by_phase = {p["phase"]: p["complete"] for p in data["phases"]}
+        assert by_phase == {"setup": True, "preparation": True, "diagnosis": False}
+
+        # Diagnosis-phase items are now visible in notification_items too.
+        notif_ids = {i["state_id"] for i in data["notification_items"]}
+        assert "proposal.experiments.undecided" in notif_ids
+        # An approved plan already satisfies the instrumentation-path
+        # condition, so the still-no_signal connectivity item softens from
+        # "warning"/blocking to "info".
+        assert items["runtime.connectivity.no_signal"]["severity"] == "info"
+
+    def test_receiving_traces_without_probe_plan_reaches_diagnosis(self, admin_client, tmp_path, monkeypatch):
+        self._configure_reasoning_llm(monkeypatch)
+        _, sys, hdrs = _setup(admin_client)
+        self._complete_pipeline(admin_client, sys, hdrs, tmp_path)
+        self._insert_trace(sys["id"], "worker-component")
+
+        data, items = _get_state(admin_client, hdrs)
+        assert data["user_phase"] == "diagnosis"
+        # Real traces mean connectivity_state != "no_signal", so the
+        # connectivity item no longer fires at all.
+        assert "runtime.connectivity.no_signal" not in items
+
+    def test_proposed_but_not_approved_probe_plan_does_not_satisfy_instrumentation(
+        self, admin_client, tmp_path, monkeypatch
+    ):
+        self._configure_reasoning_llm(monkeypatch)
+        _, sys, hdrs = _setup(admin_client)
+        snapshot_id = self._complete_pipeline(admin_client, sys, hdrs, tmp_path)
+        plan_run_id = _insert_intelligence_run(sys["id"], snapshot_id, "probe_plan", "completed")
+        self._insert_probe_plan(sys["id"], snapshot_id, plan_run_id, status="proposed")
+
+        data, _items = _get_state(admin_client, hdrs)
+        assert data["user_phase"] == "preparation"
+
+    def _four_legacy_runs_only(self, admin_client, sys, hdrs, tmp_path):
+        """Seed only the 4 legacy run/build rows the pre-fix
+        ``pipeline_all_complete`` looked at (symbol_index, entrypoint_index,
+        documentation_index build step, capability_hierarchy) -- deliberately
+        WITHOUT an understanding graph snapshot, code symbols, or a code
+        entrypoint, so ``documentation_claims_scanned``,
+        ``entrypoints_discovered``, and ``docs_code_reconciled`` all stay
+        incomplete on the canonical 8-step Pipeline Checklist.
+        """
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+        snapshot_id = snap.json()["id"]
+
+        _insert_intelligence_run(sys["id"], snapshot_id, "symbol_index", "completed")
+        _insert_intelligence_run(sys["id"], snapshot_id, "entrypoint_index", "completed")
+        build_id = _insert_active_build(sys["id"], snapshot_id)
+        _insert_build_step(sys["id"], snapshot_id, build_id, "documentation_index", "completed")
+        run_id = _insert_intelligence_run(sys["id"], snapshot_id, "capability_hierarchy", "completed")
+        _insert_capability_node(sys["id"], snapshot_id, run_id, node_type="purpose", name="Test system")
+        _insert_capability_node(sys["id"], snapshot_id, run_id, node_type="capability", name="Item management")
+        return snapshot_id
+
+    def test_legacy_four_row_completion_alone_does_not_reach_diagnosis(
+        self, admin_client, tmp_path, monkeypatch
+    ):
+        """Finding #1 regression: before the fix, ``pipeline_all_complete``
+        only checked these same 4 rows, so an approved probe plan on top of
+        them alone was enough to reach "diagnosis" -- even though the
+        canonical 8-step Pipeline Checklist (documentation_claims_scanned /
+        entrypoints_discovered / docs_code_reconciled) was still incomplete.
+        The fixed derivation must keep this at "preparation".
+        """
+        self._configure_reasoning_llm(monkeypatch)
+        _, sys, hdrs = _setup(admin_client)
+        snapshot_id = self._four_legacy_runs_only(admin_client, sys, hdrs, tmp_path)
+        plan_run_id = _insert_intelligence_run(sys["id"], snapshot_id, "probe_plan", "completed")
+        self._insert_probe_plan(sys["id"], snapshot_id, plan_run_id, status="approved")
+
+        data, items = _get_state(admin_client, hdrs)
+        assert data["user_phase"] == "preparation"
+        by_phase = {p["phase"]: p["complete"] for p in data["phases"]}
+        assert by_phase["setup"] is True
+        assert by_phase["preparation"] is False
+
+    def test_empty_capability_hierarchy_warning_does_not_reach_diagnosis(
+        self, admin_client, tmp_path, monkeypatch
+    ):
+        """Finding #1 regression: a completed capability_hierarchy run with
+        zero capabilities is a ``warning`` on the canonical checklist (Issue
+        #210), not "complete" -- so it must not count toward
+        ``pipeline_all_complete`` even though the raw run status is
+        "completed".
+        """
+        self._configure_reasoning_llm(monkeypatch)
+        _, sys, hdrs = _setup(admin_client)
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        snapshot_id = snap.json()["id"]
+
+        _insert_intelligence_run(sys["id"], snapshot_id, "symbol_index", "completed")
+        _insert_intelligence_run(sys["id"], snapshot_id, "entrypoint_index", "completed")
+        build_id = _insert_active_build(sys["id"], snapshot_id)
+        _insert_build_step(sys["id"], snapshot_id, build_id, "documentation_index", "completed")
+        # capability_hierarchy run completes but produces zero capability
+        # nodes -- the "completed but empty" warning branch.
+        _insert_intelligence_run(sys["id"], snapshot_id, "capability_hierarchy", "completed")
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO understanding_graph_snapshots
+                       (system_id, snapshot_id, graph_json, source_hash, claim_count,
+                        confidence_summary, created_at)
+                   VALUES (?, ?, '{}', '', 0, '{}', 0)""",
+                (sys["id"], snapshot_id),
+            )
+            conn.execute(
+                """INSERT INTO code_symbols
+                       (snapshot_id, system_id, path, qualified_name, kind, start_line, end_line)
+                   VALUES (?, ?, 'a.py', 'mod.fn', 'function', 1, 2)""",
+                (snapshot_id, sys["id"]),
+            )
+            conn.execute(
+                """INSERT INTO code_entrypoints
+                       (system_id, snapshot_id, entrypoint_type, entrypoint_id, category, label,
+                        handler_path, handler_qualified_name, line_start, line_end, created_at)
+                   VALUES (?, ?, 'api', 'GET /items', 'api', 'label', 'a.py', 'mod.fn', 1, 2, 0)""",
+                (sys["id"], snapshot_id),
+            )
+        plan_run_id = _insert_intelligence_run(sys["id"], snapshot_id, "probe_plan", "completed")
+        self._insert_probe_plan(sys["id"], snapshot_id, plan_run_id, status="approved")
+
+        data, items = _get_state(admin_client, hdrs)
+        assert items["pipeline.capability_hierarchy.empty"]["severity"] == "warning"
+        assert data["user_phase"] == "preparation"
+        by_phase = {p["phase"]: p["complete"] for p in data["phases"]}
+        assert by_phase["preparation"] is False

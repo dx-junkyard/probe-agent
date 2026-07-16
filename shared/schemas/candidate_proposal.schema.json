@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://probe-agent.dev/schemas/candidate_proposal.json",
+  "title": "CandidateProposal",
+  "description": "Versioned structured output contract for the AI Candidate Studio's reasoning-model candidate generation (Issue #252, prompt/schema version candidate-studio-proposal-v1). The model returns this object as strict JSON; probe-agent NEVER treats free-form model text as code. `generated_code` must define a single top-level `def candidate(*args, **kwargs)` drop-in replacement for the target symbol; the applied patch is produced DETERMINISTICALLY by splicing that function into the resolved symbol's pinned-snapshot span and diffing (app/candidate_studio.py) — the model never emits a diff directly, and the diff is scope-validated to touch only the target symbol's file. A missing required field, any invalid field type, a missing candidate function, an over-size body, or an out-of-scope/empty diff fails the proposal closed (no heuristic fallback). The reasoning provenance (provider/model/prompt_version/schema_version/decision_method/is_mock/status) is persisted separately in intelligence_runs (Principle 7).",
+  "type": "object",
+  "required": ["generated_code"],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "One- or two-sentence description of what the candidate changes and why."
+    },
+    "assumptions": {
+      "type": "array",
+      "description": "Assumptions the model made about inputs/behavior that a reviewer should confirm.",
+      "items": { "type": "string" }
+    },
+    "changed_symbols": {
+      "type": "array",
+      "description": "Symbols the model intends to change. Advisory metadata only; the enforced scope is the single target symbol (the deterministic splice can only ever change that one function's file).",
+      "items": { "type": "string" }
+    },
+    "generated_code": {
+      "type": "string",
+      "description": "A single top-level `def candidate(*args, **kwargs)` that is a drop-in replacement for the target function. No imports, file/network/subprocess/env access."
+    },
+    "risks": {
+      "type": "array",
+      "description": "Risks or edge cases the reviewer should weigh before adopting the candidate.",
+      "items": { "type": "string" }
+    },
+    "suggested_tests": {
+      "type": "array",
+      "description": "Review-only test ideas grounded in the recorded traces; never executed or written to the target repository by generation.",
+      "items": { "type": "string" }
+    }
+  },
+  "additionalProperties": true
+}

@@ -16,6 +16,7 @@ from ..auth import get_system_id
 from ..models import (
     SystemStateAssessmentOut,
     SystemStateItemOut,
+    SystemStatePhaseCompletionOut,
     SystemStateTargetUiOut,
 )
 from ..system_state import build_system_state
@@ -35,6 +36,7 @@ def _item_out(item) -> SystemStateItemOut:
         display_routes=item.display_routes,
         related_checks=item.related_checks, related_pipeline_steps=item.related_pipeline_steps,
         source=item.source, dedupe_key=item.dedupe_key, scope=item.scope,
+        phase=item.phase,
     )
 
 
@@ -52,4 +54,9 @@ def get_system_state_assessment(
         primary_item=_item_out(assessment.primary_item) if assessment.primary_item else None,
         notification_items=[_item_out(item) for item in assessment.notification_items],
         page_items={route: [_item_out(item) for item in items] for route, items in assessment.page_items.items()},
+        user_phase=assessment.user_phase,
+        phases=[
+            SystemStatePhaseCompletionOut(phase=p.phase, complete=p.complete, label=p.label)
+            for p in assessment.phases
+        ],
     )

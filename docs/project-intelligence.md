@@ -1695,7 +1695,431 @@ in-flight 状態は終端 `failed`、公開フェーズの in-flight 状態と
 自動 cancel し、手動 cancel でも諦められる。リモートブランチ・PR は
 どちらの場合も一切変更しない)。
 
+## Replay / Simulation（Issue #242）
+
+トレースされた入力を後から機械的に復元し、リプレイ実行やオフライン shadow に使う
+ための track。Phase A（#243）が再実行可能キャプチャ基盤、Phase B 以降（リプレイ
+実行・パッチ variant・Workbench UI）は未実装の非目標。
+
+### Phase A 実装状態（#243: 再実行可能キャプチャ基盤）
+
+- **SDK**（`probe_agent/replay_capture.py`）: `@probe(..., replay_capture=True |
+  {"redact": [...]})` による **component 単位 opt-in** の構造化入力キャプチャ。
+  root は `{"args": [...], "kwargs": {...}}`、値は canonical JSON にエンコードする。
+  JSON 非ネイティブ型は予約キー `"__probe__"` の明示エンコード
+  （`tuple` / `set` / `frozenset`〔items は canonical JSON でソート〕/ `bytes`(b64) /
+  非有限 `float` / 非文字列キー dict / `unsupported`〔型名のみ、raw 値や repr は
+  埋め込まない〕）。デコードの曖昧さを排除するため、`"__probe__"` キーを含む dict は
+  常に `dict` マーカーでエンコードする。既存の repr ベース `input` / `output` は不変。
+  キャプチャは fn 実行**前**（pre-mutation、shadow snapshot と同じ根拠）に行い、
+  失敗は常に非致命（返値・例外・trace 送信に影響しない）。opt-out 時は None チェック
+  1 回のみで新フィールドも付かない。
+- **replayability 分類（決定的・有限集合、Principle 6）**: 劣化フラグなし →
+  `replayable`、キャプチャ保存済みで一部劣化 → `partial`、使用可能なキャプチャなし →
+  `unreplayable`。理由コードは `unsupported_type` / `redacted` /
+  `depth_limit_exceeded` / `size_limit_exceeded` / `round_trip_failed` /
+  `capture_failed` / `redaction_blocked` の有限集合。エンコード後に decode → 構造
+  比較の round-trip 検証を行う（NaN は isnan 比較）。LLM・ヒューリスティックは
+  一切使わない。
+- **redact / サイズ上限**: `redact` は projection と同じパス文法・マスク文字列を
+  再利用し、エンコード前に root へ適用。構造的に置換できないパスは **fail closed で
+  キャプチャ全体を破棄**（`redaction_blocked`）。`PROBE_REPLAY_CAPTURE_MAX_BYTES`
+  （既定 65536）超過もキャプチャ全体を破棄（切り詰めた JSON は round-trip 不能な
+  ため部分保存しない）。ネスト深さ上限は 20。
+- **スキーマ（Principle 3、同時更新）**: `trace_event.schema.json` に additive の
+  `input_capture` / `replayability` / `replay_reasons` を追加。また既存サーバー
+  モデル `ShadowResult` と SDK の shadow ペイロードを契約化した
+  `shared/schemas/shadow_result.schema.json` を新設（手動 `evaluation` は
+  サーバー側状態でありイベントには含まれない）。
+- **Control Server**: `traces` テーブルに additive の `input_capture_json` /
+  `replayability` / `replay_reasons_json` カラム（既存 DB は ALTER TABLE で移行、
+  既存行は NULL のまま = pre-Phase-A。一括再分類はしない）。`POST /traces` が
+  新フィールドを検証（`replayability` / `replay_reasons` は有限 enum、未知値は
+  422）して保存し、`GET /components/{id}/traces` が返す。
+- **非目標（後続フェーズ）**: リプレイ実行（Phase B）、パッチ variant（Phase C）、
+  Workbench UI（Phase D）、構造化 output キャプチャ、旧トレースの一括 backfill、
+  live-shadow の SDK 挙動変更。
+
+### Phase B 実装状態（#244: Replay Engine）
+
+人間が replay を承認したコンポーネントについて、Replay Set（捕捉入力の集合）を
+pinned snapshot の実関数に対して隔離 sandbox で再実行し、記録出力との
+一致/不一致/エラー/skip を per-trace で確認できる（API レベル。UI は Phase D）。
+Phase B に reasoning run は存在しない — すべて決定的な有限集合分類
+（Principle 6）。
+
+- **共有 harness（`app/replay_harness.py`、`REPLAY_HARNESS_VERSION = "1"`）**:
+  スタンドアロンな Python スクリプト文字列。payload JSON を `argv[1]` から読み、
+  結果 JSON を `argv[2]` に書く（結果は常にファイル経由。stdout/stderr は診断
+  のみで runner が切り詰める）。target kind は有限:
+  `{"kind": "symbol", "path", "qualified_name"}`（workspace root を
+  `sys.path[0]` に挿入して `importlib.util.spec_from_file_location` でロード →
+  getattr 連鎖。隔離は sandbox 側が担うため builtins は実環境）と
+  `{"kind": "inline_code", "code"}`（generation が従来使ってきた
+  `SAFE_BUILTINS` jail を維持。`candidate` を定義しなければ RuntimeError）。
+  case input kind も有限: `structured`（Phase A の `"__probe__"` エンコードを
+  harness 内蔵デコーダで復元。`unsupported` マーカー・未知マーカー・不正
+  エンコードは関数を**呼ばずに** `undecodable_input` で skip）、`repr`
+  （文字列値を harness 内で `ast.literal_eval`。パース失敗は
+  `repr_parse_failed` で skip — 黙って劣化しない）、`values`
+  （デコード済み値をそのまま渡す。generation 移行専用で replay は使わない）。
+  per-case で出力を SDK `_safe_repr` と同一規則で正規化（repr / unrepr-able
+  マーカー / 4000 文字 + `...<truncated>`）、error は `"Type: msg"` の
+  first-line 形式、`traceback` は generation 互換用に保持、`duration_ms` を
+  記録。case ごとの try/except で 1 case の例外が batch を殺さない。target
+  解決失敗（import error / SyntaxError / シンボル欠落 / 非 callable）は
+  **run-level 失敗**（`target_error` / `target_traceback`、case は実行しない）。
+- **replay runner（`app/replay_runner.py` + `routes/replay.py`）**: snapshot
+  解決（payload の `snapshot_id`、省略時は repo_path を持つ最新 ready
+  snapshot）→ `code_symbols` からの決定的 component→symbol 解決
+  （`snapshot_id` + `system_id` + `component_id`、function 系 kind。0 件 /
+  複数件 / async は明示的 409）→ `patch_generator.create_worktree` で
+  `PROBE_REPLAY_WORKSPACE_BASE`（既定 `/tmp/probe-replays`）`/<run_id>` 配下に
+  一時 worktree → `.probe-replay/` に harness/payload を書き
+  `validation_runner._run_command`（`python3 -I ...`）で実行 —
+  bwrap/network-off/sandbox 不在時 fail-closed の意味論をそのまま継承。env は
+  `_build_env` の最小 allowlist + `PROBE_ENABLED=false`（対象リポジトリの
+  @probe を replay 中は不活性化）+ `PYTHONHASHSEED=0`（set の repr 順序を
+  replay 間で再現的に）。timeout は `PROBE_REPLAY_TIMEOUT_SECONDS`（既定 60、
+  1..300 に clamp）。結果ファイルは experiment と同じ safe-path + 1 MiB cap で
+  読み戻し、欠落/不正時は run 失敗としてコマンド stderr を記録。worktree は
+  finally で必ず cleanup（cleanup_state / cleanup_error を記録）。
+- **入力復元（server 側の決定的規則、Replay Set のプレビューと同一）**:
+  trace 行に `input_capture_json` があり `replayability` が
+  `replayable`/`partial` → `structured`（`input_source='structured'`）;
+  `replayability='unreplayable'`（または分類のみ残った不整合行 — fail
+  closed）→ skip `unreplayable_capture`; capture カラムが NULL（pre-Phase-A /
+  未 opt-in）→ 記録済み repr 入力から `input_source='repr_partial'` で実行
+  （harness 側 literal_eval 失敗は `repr_parse_failed` で skip）; trace 行
+  自体が消えている → skip `trace_missing`。
+- **決定的比較（有限集合、`comparison_mode='repr'` 固定）**: 記録 error は
+  FIRST LINE（保存形式 "Type: msg\ntraceback" の 1 行目）だけを比較根拠に
+  し、その first line を `replay_case_results.recorded_error` に永続化する。
+  マトリクス: 両方成功 → repr 文字列一致で `match`/`mismatch`; 記録成功 +
+  replay 例外 → `error`; 記録 error + replay 例外 → first line 一致で
+  `match` そうでなければ `mismatch`; 記録 error + replay 成功 → `mismatch`。
+  skip は `skipped` + 有限 `skip_reason`（`unreplayable_capture` /
+  `repr_parse_failed` / `undecodable_input` / `trace_missing`）。
+  `output_truncated` フラグは切り詰め済み repr の一致が **prefix 有界の
+  正直さ**でしかないこと（4000 文字プレフィクスの比較）を明示する。
+- **承認ゲート（`replay_approvals`）**: `POST
+  /components/{component_id}/replay-approval` が human 承認を
+  `decision_method='manual'`（Principle 7）で永続化し、承認時に表示された
+  決定的リスクコンテキスト（そのコンポーネントの最新 probe plan point の
+  `side_effect_risk` / `replayability` ラベルの転記 — 表示のみ、新規
+  reasoning run なし、ラベル欠落は欠落のまま — と固定の Principle-4 警告文:
+  pure-ish コンポーネント限定、payment/email/DB write/auth は承認があっても
+  強く非推奨）を snapshot として保存する。`GET .../replay-approval` は現在
+  状態 + リスクコンテキストを返し、`POST .../replay-approval/revoke` で失効。
+  `POST /replay-runs` は active な承認がなければ 403（revoked も同様に拒否）。
+  **所有権ノート**: Issue #244 の DB 所有リストは replay_sets / replay_runs /
+  replay_case_results の 3 テーブルを挙げるが、`replay_approvals` は本フェーズ
+  の受け入れ条件（manual 承認の永続化）そのものを担う承認ゲート永続化であり、
+  後続フェーズ用の投機的テーブルではない。
+- **テーブル（すべて System-scoped、additive、SCHEMA の CREATE TABLE IF NOT
+  EXISTS のみで移行完了）**: `replay_sets`（trace_ids_json は JSON 配列、
+  API で 50 件 cap = `MAX_REPLAY_SET_SIZE`。source は有限
+  `'manual'|'analyzer_run'`）、`replay_runs`（commit_sha / 解決シンボル /
+  trace_set_hash〔順序付き trace id + 各入力 payload の sha256〕/
+  sandbox_config_json〔timeout / network / harness_version / env keys〕/
+  approval_id / cleanup 状態 / タイムスタンプ / 失敗詳細 — Principle 7 の
+  監査メタデータ）、`replay_case_results`（上記有限分類の per-trace 行）、
+  `replay_approvals`（上記）。
+- **API**: `POST /replay-sets`（手動 trace 選択 または trace analyzer 実行の
+  保存済み結果からの決定的 trace id 抽出 — `compare.examples` → `rows` →
+  `groups[].rows` の保存済み id のみ、再計算なし。手動リストは存在 /
+  component 一致 / 重複 / 50 件 cap を 422 で検証）、`GET /replay-sets` /
+  `GET /replay-sets/{id}`（per-trace の replayability / replay_reasons と、
+  runner と同一規則で決定した使用予定 input_source / skip_reason を返す —
+  Phase D のバッジ用）、`POST /replay-runs`（N≤50 の同期実行。承認なし 403、
+  シンボル未解決/曖昧/async・snapshot 不備は 409）、`GET /replay-runs/{id}`
+  （cases 付き）、`GET /replay-runs?replay_set_id=&component_id=`（一覧、
+  cases なし + summary）。
+- **generation.py の移行**: `POST /generation-runs` の候補コード実行は共有
+  harness の `inline_code` + `values` 入力経路
+  （`replay_harness.run_inline_candidate`）に移行した。観測可能な挙動は不変:
+  `python -I -S` 直接 subprocess（bwrap ではない）、`SAFE_BUILTINS` jail、
+  5 秒 timeout、legacy エラー文字列（"candidate execution timed out" など）、
+  そして repr パース失敗時に生文字列へフォールバックする legacy 意味論
+  （server 側 `_trace_call_args` に残置 — replay の厳格な `repr_parse_failed`
+  skip とは別物）。移行前に `tests/test_generation.py` の回帰テストで現行
+  挙動をピン留めし、移行後も同一テストが無変更で通る。
+- **非目標（Phase B）**: パッチ variant / variant 比較（Phase C）、Dashboard
+  UI（Phase D）、自動承認・LLM のみの承認、分散実行、長寿命 worktree、
+  オンライン依存インストール、async 関数の replay、構造化 output 比較
+  （比較は repr のみ）。
+
+### Phase C 実装状態（#245: オフライン shadow シミュレーション）
+
+unified diff patch で表現された候補実装を、baseline と同一の Replay Set・
+同一 sandbox 条件で再実行し、per-trace／集計の差分マトリクスを返す。記録上
+error だった trace も候補に対して実行するため「候補は失敗入力を救えるか」が
+答えられる（live SDK shadow の `decorator.py` の
+`if run_shadow and raised is None` 非対称を**オフライン側で**解消する。SDK
+自体は変更しない — 範囲外）。Phase C の決定的判定はすべて有限集合（Principle
+6）。
+
+- **共有比較ライブラリ（`app/comparison.py`）**: #150 の `_field_equal` /
+  `_ABSENT` を `trace_analyzer.py` から抽出し、`field_equal` / `value_equal` /
+  `diff_fields` として一本化（欠落キー vs null は不一致、二重欠落は一致、NaN
+  は常に不一致、それ以外は `==`）。`trace_analyzer.py` はこれを import する
+  だけになり、`tests/test_shadow_diff.py`（#150）は無変更で通る。replay の
+  baseline 出力 vs candidate 出力のフィールド比較も同じ規約を再利用する。
+- **variant 概念**: 1 回の variant run は baseline（patch なし）+ 1..N の patch
+  variant を、**それぞれ独立した worktree** で同一 Replay Set・同一 sandbox
+  設定で実行する（実行順序が結果に影響しない、#26 と同じ規約）。patch 適用は
+  `experiment_runner._apply_patch` の `git apply --check` → `git apply` 規約を
+  再利用し、`replay_runner.execute_harness` に `patch_text` を渡す形で
+  worktree 生成後・harness 書き込み前に適用。適用失敗は
+  `status='invalid_patch'` で harness を実行せずに返り、その variant だけが
+  `apply_status='invalid_patch'` として記録される（baseline・他 variant は
+  一切影響を受けない）。patch_hash（sha256）を監査に残す。
+- **harness v2（`REPLAY_HARNESS_VERSION="2"`）**: `ok` case に additive で
+  `structured_output` を付与する — `json.loads(json.dumps(output,
+  sort_keys=True))` による best-effort な JSON ネイティブ形（`"__probe__"`
+  エンコードは使わない）。JSON 化できない値（set・カスタムオブジェクト等）は
+  **キー自体を省略**（None を入れない）ので、呼び出し側はキーの有無で「構造化
+  形なし」と「正当な null/0/false」を区別する。Phase B は本キーを読まないので
+  挙動は不変。
+- **決定的な case 分類（有限 7 要素）**: baseline REPLAY 出力 vs candidate
+  REPLAY 出力を比較する（記録済み production トレースではなく、同じ run 内で
+  無改変スナップショットを再実行した baseline replay）。`match`（両成功・出力
+  一致）/ `diff`（両成功・出力相違）/ `candidate_error`（baseline 成功・
+  candidate 例外）/ `error_to_success`（baseline 例外・candidate 成功 = 救済）
+  / `error_to_same_error` / `error_to_different_error`（両例外・first line の
+  異同）/ `skipped`（server 側 skip または harness skip）。`comparison_mode`
+  は `match`/`diff` のみで意味を持つ有限集合: `structured`（両側に
+  `structured_output` あり。dict は top-level キーの和集合で `diff_fields`、
+  非 dict は `value_equal`）/ `repr`（片側に構造化形なし → Phase B の repr
+  文字列一致にフォールバック）。server 側 skip は baseline と全 variant で同一
+  の `harness_cases` を実行するため、両側で同一に skip される。
+- **集計**: variant ごとに各 case_status の件数 + 例示 trace id（`max_examples`
+  規約を共有）+ 平均 `duration_delta_ms`（candidate − baseline）。
+- **LLM candidate 下書き（`app/replay_draft.py`）**: 既存 Generate & Evaluate
+  の候補生成プロンプトを「candidate draft」ソースとして接続する。「候補コード
+  はどうあるべきか」は reasoning model のみ（`LLM_PROVIDER=mock` は
+  generation.py 同様に許容し、`is_mock=true` を可視化。LLM 設定/呼び出し/
+  parse 失敗は draft を fail-closed にする — heuristic fallback なし、Principle
+  6）。「そのコードをどう diff にするか」は決定的な構造的テキスト差し込み
+  （`code_symbols` の `[start_line, end_line]` を生成関数本体で置換し、
+  一時 worktree で `git diff` を取る — 手書き diff 形式ではない）。provenance
+  は共有の `intelligence_runs`（provider/model/prompt_version/schema_version/
+  decision_method/is_mock）に記録し、決定的な raw 結果（各 case の出力・diff・
+  集計）とは別テーブルに分離する。draft は何も実行しない — 返した
+  `patch_text` を呼び出し側が variant として実行する。
+- **Experiment 昇格（API のみ）**: `GET /replay-variant-runs/{id}/variants/
+  {variant_id}/experiment-payload` が variant の patch を既存 `POST
+  /experiments` の variant prefill 形で返す（experiment を自動作成・自動採用は
+  しない。UI 導線は Phase D）。
+- **テーブル（System-scoped、additive、cascade FK）**: `replay_variants`
+  （baseline + variant 行、apply_status/patch_hash/cleanup 状態）、
+  `replay_variant_case_results`（上記有限分類の per-trace 行、field_diffs_json /
+  comparison_mode / duration_delta_ms）、`replay_variant_drafts`（LLM 下書きの
+  結果、provenance は `intelligence_run_id` 経由）。Phase B の
+  `replay_case_results`（baseline vs 記録出力）はそのまま残り、variant 側は
+  baseline replay vs candidate replay を持つ。
+- **API**: `POST /replay-variant-runs`（baseline + variants を同時実行、Phase B
+  の承認ゲート 403・シンボル解決 409 を再利用）、`GET /replay-variant-runs`
+  /`/{id}`、`GET .../variants/{variant_id}/experiment-payload`、`POST
+  /replay-variant-drafts`（LLM 下書き、fail-closed）、`GET
+  /replay-variant-drafts` /`/{id}`。Phase B の `POST /replay-runs`（baseline
+  のみ）は無変更。
+- **非目標（Phase C）**: 意味的同等性・許容誤差比較（決定的等値のみ）、自動
+  採用・rollout・replace、live shadow SDK 変更、Workbench UI（Phase D）、分散
+  実行。
+
+### Phase D 実装状態（#246: Simulation Workbench UI）
+
+観測点（トレース）から一クリックで検証に入り、「トレース選択 → ソース編集
+（diff 自動生成）→ Run → diff マトリクス確認 → Experiment へ昇格」を
+Dashboard 上で完結させる。Replay の判定・実行・比較はすべて Phase A〜C の既存
+API を呼ぶだけで、新しい判定/実行ロジックは追加しない。例外は review-only の
+regression-test scaffold 下書きで、独立した `reasoning_llm` 境界として扱う。
+
+- **トレース行アクション（Components の Traces タブ、
+  `components/replay-row-actions.tsx`）**: 各トレース行に
+  `replayability`/`replay_reasons`（Phase A 由来、`GET /components/{id}/traces`
+  が既に返す）から決定的に導く replayability バッジ（reason コードは
+  tooltip）、「▶ Replay」（新規または既存 Replay Set にこのトレースを追加して
+  Workbench へ遷移）、「+ Add to Replay Set」（同上だが遷移しない）、
+  「Create Experiment from this trace」（Experiments へ `?from_trace=&
+  from_component=` でコンテキストのみ prefill――patch は渡さない）を表示する。
+  Replay Set は既存 `POST /replay-sets` の外に "trace を追加する" API がない
+  ため（Replay Set 自体を更新する mutation endpoint はない）、既存セットへの
+  追加は「その Set の `trace_ids` を読み取り、新規 trace id を足して同じ
+  `component_id` で `POST /replay-sets` を再実行する」という構成のみの操作
+  として実現している（Replay Set は不変の軽量スナップショットである前提と
+  整合）。`AddToWorkspaceButton itemType="trace"` もここで配線する
+  （型は #35 で追加済みだが UI 未配線だった）。同じアクションを Components、
+  Trace Lineage、analyzer example trace rows に配置し、観測点から Workbench への
+  導線を画面によって欠落させない。
+- **Simulation Workbench（`pages/simulation-workbench.tsx`、
+  `/simulation-workbench`、サイドバー "Detail views" に `Beaker` アイコン）**:
+  3ペイン構成。左は Replay Set のトレース一覧（`GET /replay-sets/{id}` が返す
+  per-trace の `replayability`/`replay_reasons`/`input_source`/`skip_reason`
+  をそのままバッジ表示 — runner と同一規則、Phase B からの再利用）で、
+  展開すると `input_capture`（`JsonTree`）と録画済み output/error を
+  `GET /components/{id}/traces` との突き合わせで表示する（新規 API なし、
+  既存レスポンスの構成のみ）。中央は解決済みシンボルの pinned snapshot ソース
+  （新設 `GET /replay-sets/{id}/source`）を Textarea で表示・編集するタブ:
+  「Direct edit」（編集 → Run で新設 `POST /replay-source-diff` が決定的に
+  unified diff を生成 — 手書き diff ではない）、「Paste patch」（貼り付けた
+  diff をそのまま variant として実行）、「LLM draft」（`POST
+  /replay-variant-drafts` を呼び、provenance + is_mock バッジ付きで返却された
+  patch を確認してから Run できる）。右/下は結果マトリクス:
+  `POST /replay-variant-runs` + `GET /replay-variant-runs/{id}` を消費し、
+  行=trace、列=recorded/baseline replay/各 candidate。`case_status`
+  （match/diff/candidate_error/error_to_success 等）を色分けバッジで区別し、
+  `field_diffs`・`duration_delta_ms`・variant ごとの集計
+  （`aggregate.match`/`diff`/`candidate_error`/`error_to_success`/…/
+  `avg_duration_delta_ms`）を表示する。結果の直上には「これはシミュレーション
+  であり本番相当ではない（環境・外部状態の差異があり得る）」という常設の
+  注意書きを置く。
+- **状態ガイダンス**: 対象コンポーネントの replay 承認が無い場合、実行不可の
+  理由と次の操作（承認レビュー）を明示し、`GET /components/{id}/replay-approval`
+  のリスクコンテキスト（probe plan point の `side_effect_risk`/`replayability`
+  転記 + 固定 Principle-4 警告文）を承認確認ダイアログに表示してから
+  `POST /components/{id}/replay-approval` を呼ぶ（Revoke も配線）。
+  `unreplayable`/skip 対象のトレースには有限 `skip_reason` ごとの次の操作
+  （別トレースを選ぶ／replay_capture を opt-in する等）をインラインで示す。
+- **エスカレーション（人間ゲートは既存のまま、Phase D は導線のみ）**:
+  (a) variant を Experiment へ昇格 — `GET .../variants/{variant_id}/
+  experiment-payload` を呼び、その patch を Experiments の作成フローへ
+  引き渡す。導線は既存の `?draft=` prefill パターンを踏襲した
+  `?replay_run_id=&replay_variant_id=` で、Experiments 側がその id から
+  改めて payload を取得して prefill する（自動で Experiment を作成・採用は
+  しない）。
+  (b) regression-test scaffold — 選択した trace の捕捉入力、記録結果、解決済み
+  symbol と採用候補 patch を `reasoning_llm` に渡し、pytest 雛形を下書きする。
+  LLM 由来であること、provider/model/prompt/schema/intelligence run の provenance、
+  `is_mock` を明示し、設定・呼び出し・応答検証の失敗は fail-closed の失敗結果として
+  `intelligence_runs` と `replay_regression_scaffolds` に監査行を残す。生成物を対象
+  リポジトリへ自動書き込みしない。
+  (c) live-shadow 誘導 — `from probe_agent import set_candidate; set_candidate(...)`
+  のスニペットと、Components タブでの mode 切り替え手順を静的テキストで示す
+  （バックエンド呼び出しなし、SDK 挙動は無変更）。
+- **新規 DETERMINISTIC バックエンド追加（Principle 6）**:
+  `GET /replay-sets/{id}/source`（`?snapshot_id=` 省略時は最新 ready
+  snapshot。`_resolve_snapshot` + `_resolve_component_symbol` を再利用して
+  シンボルを解決し、`read_file_at_commit` で pinned commit のファイル内容を
+  読む — working tree は一切読まない、Principle 5）と `POST
+  /replay-source-diff`（`{replay_set_id, snapshot_id?, edited_source}` →
+  同じシンボル解決 → 一時 worktree に `edited_source` を書いて `git diff`
+  — `replay_draft._diff_against_snapshot` をそのまま再利用。`edited_source`
+  が Python として parse できない場合は 422、既存スナップショットと差分が
+  無い場合も 422）。どちらも承認ゲート不要（コードを実行しない）。
+  `ReplaySourceOut`/`ReplaySourceDiffCreate`/`ReplaySourceDiffOut`
+  （`app/models.py`）+ 対応する react-query hooks
+  (`useReplaySetSource`/`useReplaySourceDiff`) を追加。テストは
+  `tests/test_replay_source.py`（pinned ファイル内容+span の取得、
+  適用可能な diff の生成、非 Python 入力の 422、System 分離）。これらを含む replay
+  管理 API は user session 必須であり、SDK API token からは呼び出せない。
+- **warm-start（任意、見送り）**: worktree/sandbox セッションの使い回しは
+  本フェーズでは実装しない。Run のたびに独立した worktree を作る Phase B/C
+  の規約をそのまま使うほうが、隔離・後始末の保証を壊さず正しさを優先できる
+  ため。API は最大20候補を受け付け、20候補・1 trace の統合テストで10秒目標を
+  ガードする。対象リポジトリや sandbox 環境によって安定して満たせない場合は
+  warm-start をフォローアップとする。
+- **非目標（Phase D）**: 新しい判定・実行・比較ロジック（Phase A〜C の呼び出し
+  のみ）、対象リポジトリの追跡ブランチへの書き込みを伴う UI（エスカレーションは
+  既存の human gate 経由のみ — Experiment decision / #216 publish）、本格的な
+  IDE/LSP エディタ、live-shadow の SDK/UI 変更。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。
 実行コマンドは自動推測せず、この設定で明示する。
+
+## AI Candidate Studio（Issue #252）
+
+会話（チャット）で、プローブ済み関数の baseline コードを基に AI が候補実装を
+生成し、既存の隔離 Replay で評価する **AI Candidate Studio**。対象コンポーネント
+または具体的な Trace から開始し、自然言語で改善目的・制約を伝えるだけで、候補
+生成 → 差分確認 → Replay 評価 → 反復修正 → Experiment への引き渡しまで一つの
+画面で進められる。
+
+### 設計原則: 新しい判定・実行・比較ロジックを足さない
+
+Studio は #242（Phase A〜C）と #245 の既存基盤の上に立つ **会話 + バージョン
+管理レイヤ** であり、判定/実行/比較の新規ロジックは追加しない。
+
+- **候補生成（reasoning_llm）**: `app/candidate_studio.py`。固定 snapshot の
+  対象シンボルソース・最小限の近傍情報（Component/System Profile・Evaluation
+  Criteria・選択 Trace の記録入出力）を文脈に、reasoning model が **構造化
+  proposal**（`summary` / `assumptions` / `changed_symbols` / `generated_code`
+  / `risks` / `suggested_tests`、`shared/schemas/candidate_proposal.schema.json`、
+  prompt/schema version `candidate-studio-proposal-v1`）を返す。自由形式コードは
+  受け取らない。patch 自体は #245 と同じ **決定的な splice→git diff**
+  （`replay_draft.splice_symbol_source` + `_diff_against_snapshot` を再利用）で
+  生成し、決定的な scope 検証で「対象シンボルのファイルのみ変更」を強制する
+  （範囲拡大は既定で不可）。LLM 設定・呼び出し・parse・scope/size 検証の失敗は
+  すべて fail-closed（heuristic fallback なし、Principle 6）で、失敗も
+  `intelligence_runs`（`run_type='candidate_studio_proposal'`）に監査記録する
+  （Principle 7）。`LLM_PROVIDER=mock` は許可（`is_mock` を明示）。
+- **候補の Replay 評価**: `POST /candidate-versions/{id}/replay` は既存の
+  `POST /replay-variant-runs` を **そのまま関数として呼ぶ**。人手の replay 承認
+  ゲート（`GET/POST /components/{id}/replay-approval`）、network-off の独立
+  worktree sandbox、最小環境変数、timeout、必ず cleanup、有限 diff マトリクス
+  （match / diff / candidate_error / error_to_success / …）をすべて継承する。
+  未承認・sandbox 未確立は fail closed（403）。legacy の inline-code 実行経路は
+  Studio では一切使わない。
+- **Experiment への昇格**: `POST /candidate-versions/{id}/promote` は #245 の
+  variant experiment-payload（`get_replay_variant_experiment_payload`）を再利用し、
+  レビュー済み patch を既存の Experiment 作成フローへ渡す payload を返すのみ。
+  Experiment の自動作成・自動採用・PR 作成/マージ・本番配布・live shadow の
+  自動有効化は行わない（Principle 7）。評価済み（replay completed）候補のみ昇格
+  可能。
+
+### バージョンと会話の扱い
+
+- `candidate_sessions` は component・固定 baseline snapshot（commit + 解決済み
+  シンボル）・Replay Set・会話をまとめる。入口は「component」「trace_ids」
+  「単一 trace_id」のいずれか一つ（trace 指定時は既存 `POST /replay-sets` の検証
+  を再利用して Replay Set を作成）。
+- `candidate_versions` は **patch が実際に生成された場合のみ** 作られる不変
+  バージョン。`parent_version_id` により選択中バージョンを親にして分岐でき
+  （セッションごとに木構造）、追加指示は親候補の `generated_code` を出発点として
+  LLM に見せるが、生成される patch は常に **pinned snapshot に対する差分** なので
+  各バージョンは独立に適用・Replay できる。会話メッセージ自体はバージョンを
+  作らない。生成失敗は version 行を作らず、`intelligence_runs` の監査行 + assistant
+  メッセージ + 502 で fail closed。
+- `candidate_messages` は会話ターン（`user` / `assistant`）。assistant の「理解した
+  条件」echo は決定的な表示テキスト（Principle 6）で推論ではない。AI の実際の
+  理解は候補の `summary` / `assumptions` に現れる。
+
+### API
+
+```
+POST /candidate-sessions                     セッション開始（対象情報を自動設定）
+GET  /candidate-sessions            一覧
+GET  /candidate-sessions/{id}       会話 + 候補バージョンつき詳細
+POST /candidate-sessions/{id}/messages       会話ターン追加（版は作らない）
+POST /candidate-sessions/{id}/generate       候補バージョン生成（reasoning_llm）
+GET  /candidate-sessions/{id}/events         状態タイムライン（ポーリング）
+GET  /candidate-sessions/{id}/versions       候補一覧
+GET  /candidate-versions/{id}                候補詳細
+POST /candidate-versions/{id}/replay         隔離 Replay 評価（承認ゲート）
+POST /candidate-versions/{id}/promote        Experiment 引き渡し payload
+```
+
+生成・Replay は同期実行（Replay スタック全体と同じ規約）。`events` は永続化した
+バージョン状態から決定的に導く状態タイムラインで、生成の
+`context_preparing`/`generating`/`validating_patch` は terminal な version
+`status`（`proposed`/`failed`）に、Replay 進行は `replay_status`
+（`not_run`/`running`/`completed`/`failed`）に対応する。
+
+### UI（`pages/candidate-studio.tsx`、`/candidate-studio?session_id=...`）
+
+- 左ペイン: 会話履歴と入力欄。右ペイン: 選択中 Candidate の
+  `差分 / 全コード / 評価結果` タブ。上部に component・baseline commit・Replay
+  承認状態・候補バージョン・現在状態。
+- 状態ごとの主操作は1つ: 条件入力済み→**候補を生成**、生成済み→**Replayで確認**、
+  評価失敗→**AIに修正を依頼**、評価済み→**Experimentへ送る**。高度な設定
+  （生 patch・Replay Set 選択・ソース全文）は折りたたむ。
+- 入口: Components の component 詳細 / Trace 行、Simulation Workbench から
+  「会話で候補を改善」。
+
+### 非目標
+
+LLM のみでの自動採用、任意コードの本番プロセスへの動的配布・実行、対象リポジトリの
+自動編集、本番相当性の保証、live shadow SDK の動的候補ロード。

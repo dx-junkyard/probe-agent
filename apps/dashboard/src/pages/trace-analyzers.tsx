@@ -15,6 +15,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { AddToWorkspaceButton } from "@/components/add-to-workspace";
+import { ReplayRowActions } from "@/components/replay-row-actions";
 import { JsonTree } from "@/components/json-tree";
 import {
   ANALYZER_TEMPLATES, EMPTY_BUILDER_STATE, buildSpec, summarizeSpec,
@@ -703,22 +704,29 @@ function ShadowCompareTable({ compare }: { compare: CompareSummary }) {
                 ) : (
                   <span className="font-mono text-muted-foreground">{cls}</span>
                 )}
-                {traces.map((t) => (
+                {traces.map((t) =>
                   component ? (
-                    <Link
-                      key={t}
-                      to={`/components?component=${encodeURIComponent(component)}`}
-                      className="font-mono text-primary underline"
-                      title={`${t} — open ${component} traces`}
-                    >
-                      {t.slice(0, 12)}
-                    </Link>
+                    <div key={t} className="flex items-center gap-1 flex-wrap rounded border p-1">
+                      <Link
+                        to={`/components?component=${encodeURIComponent(component)}`}
+                        className="font-mono text-primary underline"
+                        title={`${t} — open ${component} traces`}
+                      >
+                        {t.slice(0, 12)}
+                      </Link>
+                      <ReplayRowActions componentId={component} traceId={t} />
+                      <AddToWorkspaceButton
+                        itemType="trace"
+                        itemId={t}
+                        label={`Trace ${t.slice(0, 12)} (${component})`}
+                      />
+                    </div>
                   ) : (
                     <span key={t} className="font-mono text-muted-foreground" title={t}>
                       {t.slice(0, 12)}
                     </span>
-                  )
-                ))}
+                  ),
+                )}
               </div>
             );
           })}

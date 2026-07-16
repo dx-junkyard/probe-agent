@@ -91,6 +91,12 @@ CREATE TABLE IF NOT EXISTS traces (
     error        TEXT,
     duration_ms  REAL,
     timestamp    REAL NOT NULL,
+    -- Replay capture (Issue #242 Phase A / #243), all additive. NULL means
+    -- the trace predates Phase A or its component is not opted into replay
+    -- capture; old rows are never bulk-reclassified.
+    input_capture_json  TEXT,
+    replayability       TEXT,
+    replay_reasons_json TEXT,
     PRIMARY KEY (system_id, trace_id),
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
 );
@@ -1894,6 +1900,405 @@ CREATE TABLE IF NOT EXISTS auth_audit_events (
     detail      TEXT,          -- JSON, never a password/hash/token
     created_at  REAL NOT NULL
 );
+
+-- Replay engine (Issue #242 Phase B / #244). System-scoped.
+--
+-- replay_approvals is the human replay-approval gate this phase's acceptance
+-- criteria require (a persisted `decision_method: manual` record that
+-- POST /replay-runs enforces). The issue's DB-ownership list names only the
+-- three replay_* tables below; this table is the approval-gate persistence
+-- for Phase B itself, not a speculative later-phase table.
+-- risk_context_json is the deterministic risk context (persisted probe plan
+-- point labels + the fixed Principle-4 warning) shown at approval time.
+CREATE TABLE IF NOT EXISTS replay_approvals (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    component_id        TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'approved',  -- 'approved' | 'revoked'
+    reason              TEXT NOT NULL DEFAULT '',
+    approved_by_user_id INTEGER,
+    decision_method     TEXT NOT NULL DEFAULT 'manual',
+    risk_context_json   TEXT,
+    created_at          REAL NOT NULL,
+    revoked_at          REAL,
+    revoked_by_user_id  INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (approved_by_user_id) REFERENCES users (id) ON DELETE SET NULL,
+    FOREIGN KEY (revoked_by_user_id) REFERENCES users (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_replay_approvals_component
+    ON replay_approvals (system_id, component_id, id DESC);
+
+-- A Replay Set is an ordered selection of captured trace inputs for one
+-- component. trace_ids_json is a JSON array capped at 50 entries
+-- (MAX_REPLAY_SET_SIZE, enforced at the API); source is finite
+-- ('manual' | 'analyzer_run').
+CREATE TABLE IF NOT EXISTS replay_sets (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id              INTEGER NOT NULL,
+    component_id           TEXT NOT NULL,
+    name                   TEXT NOT NULL DEFAULT '',
+    trace_ids_json         TEXT NOT NULL DEFAULT '[]',
+    source                 TEXT NOT NULL DEFAULT 'manual',
+    source_analyzer_run_id INTEGER,
+    created_at             REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (source_analyzer_run_id)
+        REFERENCES trace_analysis_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_replay_sets_system
+    ON replay_sets (system_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_replay_sets_component
+    ON replay_sets (system_id, component_id, id DESC);
+
+-- One synchronous replay execution of a Replay Set against the pinned
+-- snapshot's real implementation in an isolated sandboxed worktree. Audit
+-- fields (Principle 7): commit_sha, resolved symbol, trace_set_hash (sha256
+-- over the ordered trace ids + each trace's input payload), sandbox config
+-- (timeout / network isolation / harness version / env keys), approval
+-- linkage, timestamps, failure details, and worktree cleanup state.
+CREATE TABLE IF NOT EXISTS replay_runs (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    replay_set_id         INTEGER NOT NULL,
+    component_id          TEXT NOT NULL,
+    snapshot_id           INTEGER NOT NULL,
+    commit_sha            TEXT NOT NULL,
+    symbol_path           TEXT NOT NULL,
+    symbol_qualified_name TEXT NOT NULL,
+    status                TEXT NOT NULL DEFAULT 'running',  -- 'running' | 'completed' | 'failed'
+    error                 TEXT,
+    trace_set_hash        TEXT NOT NULL,
+    sandbox_config_json   TEXT NOT NULL DEFAULT '{}',
+    approval_id           INTEGER,
+    workspace_path        TEXT,
+    cleanup_state         TEXT NOT NULL DEFAULT 'not_attempted',
+    cleanup_error         TEXT,
+    created_at            REAL NOT NULL,
+    started_at            REAL,
+    completed_at          REAL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (replay_set_id) REFERENCES replay_sets (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (approval_id) REFERENCES replay_approvals (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_replay_runs_system
+    ON replay_runs (system_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_replay_runs_set
+    ON replay_runs (system_id, replay_set_id, id DESC);
+
+-- Per-trace deterministic comparison of replay output vs recorded output.
+-- case_status is finite ('match' | 'mismatch' | 'error' | 'skipped');
+-- input_source is finite ('structured' | 'repr_partial', NULL for skipped
+-- cases without an executable input); skip_reason is finite
+-- ('unreplayable_capture' | 'repr_parse_failed' | 'undecodable_input' |
+-- 'trace_missing'). recorded_error stores the recorded error's FIRST LINE
+-- ("Type: msg") — the deterministic comparison basis; the full recorded
+-- error (with traceback) stays on the traces row. comparison_mode is fixed
+-- 'repr' in Phase B; output_truncated notes that repr equality on truncated
+-- values is prefix-bounded.
+CREATE TABLE IF NOT EXISTS replay_case_results (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id        INTEGER NOT NULL,
+    replay_run_id    INTEGER NOT NULL,
+    trace_id         TEXT NOT NULL,
+    position         INTEGER NOT NULL,
+    case_status      TEXT NOT NULL,
+    input_source     TEXT,
+    skip_reason      TEXT,
+    replay_output    TEXT,
+    replay_error     TEXT,
+    recorded_output  TEXT,
+    recorded_error   TEXT,
+    duration_ms      REAL,
+    output_truncated INTEGER NOT NULL DEFAULT 0,
+    comparison_mode  TEXT NOT NULL DEFAULT 'repr',
+    created_at       REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (replay_run_id) REFERENCES replay_runs (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_replay_case_results_run
+    ON replay_case_results (replay_run_id, position);
+CREATE INDEX IF NOT EXISTS idx_replay_case_results_system
+    ON replay_case_results (system_id, replay_run_id);
+
+-- Replay variants (Issue #242 Phase C / #245). A "variant replay run" is a
+-- normal Phase B replay_runs row (baseline: same snapshot/symbol/approval-
+-- gate/trace_set_hash resolution, same replay_case_results baseline-vs-
+-- recorded classification) that ALSO gets one or more patched variants
+-- replayed in the SAME run against the SAME Replay Set + sandbox config.
+-- replay_variants hangs off that replay_runs row via replay_run_id; the
+-- baseline itself gets a row too (variant_key='baseline', is_baseline=1,
+-- patch_text='', apply_status='not_applicable') purely so one query lists
+-- everything the run covers (mirrors experiment_variants' own baseline row).
+-- variant_key is finite ('baseline' | 'variant-N'); source is finite
+-- ('manual' | 'pasted' | 'llm_draft'); apply_status is finite
+-- ('applied' | 'invalid_patch' | 'not_applicable'). Each variant is applied
+-- and executed in its OWN independent worktree (workspace_path/cleanup_*
+-- below), so one variant's bad patch or timeout never touches the baseline
+-- or any other variant -- see app/replay_runner.py's execute_harness
+-- patch_text parameter and app/replay_variants.py's classification.
+CREATE TABLE IF NOT EXISTS replay_variants (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id      INTEGER NOT NULL,
+    replay_run_id  INTEGER NOT NULL,
+    variant_key    TEXT NOT NULL,
+    label          TEXT NOT NULL DEFAULT '',
+    is_baseline    INTEGER NOT NULL DEFAULT 0,
+    patch_text     TEXT NOT NULL DEFAULT '',
+    patch_hash     TEXT NOT NULL,
+    source         TEXT NOT NULL DEFAULT 'manual',
+    apply_status   TEXT NOT NULL DEFAULT 'not_applicable',
+    apply_error    TEXT,
+    status         TEXT NOT NULL DEFAULT 'running',  -- 'running'|'completed'|'failed'
+    error          TEXT,
+    workspace_path TEXT,
+    cleanup_state  TEXT NOT NULL DEFAULT 'not_attempted',
+    cleanup_error  TEXT,
+    created_at     REAL NOT NULL,
+    started_at     REAL,
+    completed_at   REAL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (replay_run_id) REFERENCES replay_runs (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_replay_variants_run
+    ON replay_variants (replay_run_id, id);
+CREATE INDEX IF NOT EXISTS idx_replay_variants_system
+    ON replay_variants (system_id, replay_run_id);
+
+-- Per-trace baseline-replay-vs-candidate-replay comparison for one variant
+-- (Issue #245). Keep Phase B's replay_case_results as the baseline-vs-
+-- RECORDED record; this table holds baseline-REPLAY-vs-candidate instead,
+-- so it also carries replay_run_id (joinable back to replay_case_results by
+-- replay_run_id + trace_id + position for the originally-recorded output/
+-- error, without duplicating those columns here).
+--
+-- case_status is the finite 7-member set documented in
+-- app/replay_variants.py's module docstring (match / diff / candidate_error
+-- / error_to_success / error_to_same_error / error_to_different_error /
+-- skipped). comparison_mode is finite ('structured' | 'repr') and NULL
+-- when the classification did not depend on an output-equality mode
+-- (candidate_error / error_to_* / skipped). field_diffs_json is only
+-- populated for a 'diff' produced in 'structured' mode (changed top-level
+-- field names). recorded_error here is the BASELINE REPLAY's own error
+-- first line (this run's baseline execution, not the historical production
+-- trace -- that stays on replay_case_results.recorded_error, reachable via
+-- the replay_run_id + trace_id join above); candidate_error is the
+-- candidate's error first line. duration_delta_ms is candidate duration
+-- minus baseline duration for this run.
+CREATE TABLE IF NOT EXISTS replay_variant_case_results (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    replay_variant_id INTEGER NOT NULL,
+    replay_run_id     INTEGER NOT NULL,
+    trace_id          TEXT NOT NULL,
+    position          INTEGER NOT NULL,
+    case_status       TEXT NOT NULL,
+    comparison_mode   TEXT,
+    baseline_output   TEXT,
+    candidate_output  TEXT,
+    candidate_error   TEXT,
+    recorded_error    TEXT,
+    duration_ms       REAL,
+    duration_delta_ms REAL,
+    field_diffs_json  TEXT,
+    output_truncated  INTEGER NOT NULL DEFAULT 0,
+    created_at        REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (replay_variant_id) REFERENCES replay_variants (id) ON DELETE CASCADE,
+    FOREIGN KEY (replay_run_id) REFERENCES replay_runs (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_replay_variant_case_results_variant
+    ON replay_variant_case_results (replay_variant_id, position);
+CREATE INDEX IF NOT EXISTS idx_replay_variant_case_results_system
+    ON replay_variant_case_results (system_id, replay_variant_id);
+
+-- LLM candidate-draft provenance for Replay variants (Issue #245). Mirrors
+-- the established intelligence_runs + per-feature-draft-table pattern used
+-- throughout #23-#26 (e.g. system_profile_drafts): the audit record
+-- (provider/model/prompt_version/schema_version/decision_method/is_mock/
+-- status/error/timestamps) lives in intelligence_runs
+-- (run_type='replay_variant_draft'); this table holds only the draft's own
+-- content (deterministically spliced patch_text, generated_code, and the
+-- context it was drafted from), kept separate from raw deterministic replay
+-- results per the CLAUDE.md storage-separation rule. A draft is proposed
+-- standalone (no replay_run_id -- it has not been run as a variant yet);
+-- the caller copies patch_text into POST /replay-variant-runs to try it.
+CREATE TABLE IF NOT EXISTS replay_variant_drafts (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    intelligence_run_id   INTEGER NOT NULL,
+    replay_set_id         INTEGER NOT NULL,
+    component_id          TEXT NOT NULL,
+    trace_id              TEXT NOT NULL,
+    objective             TEXT NOT NULL DEFAULT '',
+    snapshot_id           INTEGER NOT NULL,
+    symbol_path           TEXT NOT NULL,
+    symbol_qualified_name TEXT NOT NULL,
+    generated_code        TEXT NOT NULL DEFAULT '',
+    patch_text            TEXT NOT NULL DEFAULT '',
+    patch_hash            TEXT NOT NULL DEFAULT '',
+    notes                 TEXT NOT NULL DEFAULT '',
+    status                TEXT NOT NULL DEFAULT 'proposed',  -- 'proposed'|'failed'
+    error                 TEXT,
+    created_at            REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE CASCADE,
+    FOREIGN KEY (replay_set_id) REFERENCES replay_sets (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_replay_variant_drafts_system
+    ON replay_variant_drafts (system_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_replay_variant_drafts_set
+    ON replay_variant_drafts (system_id, replay_set_id, id DESC);
+
+-- Review-only regression-test scaffolds generated from one completed replay
+-- variant case (Issue #246). The reasoning audit/provenance lives in
+-- intelligence_runs; this table persists the generated content and exact raw
+-- replay context identifiers. Nothing here is ever written to the target repo.
+CREATE TABLE IF NOT EXISTS replay_regression_scaffolds (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    intelligence_run_id INTEGER NOT NULL,
+    replay_run_id       INTEGER NOT NULL,
+    replay_variant_id   INTEGER NOT NULL,
+    replay_set_id       INTEGER NOT NULL,
+    trace_id            TEXT NOT NULL,
+    snapshot_id         INTEGER NOT NULL,
+    scaffold_text       TEXT NOT NULL DEFAULT '',
+    status              TEXT NOT NULL DEFAULT 'proposed',
+    error               TEXT,
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE CASCADE,
+    FOREIGN KEY (replay_run_id) REFERENCES replay_runs (id) ON DELETE CASCADE,
+    FOREIGN KEY (replay_variant_id) REFERENCES replay_variants (id) ON DELETE CASCADE,
+    FOREIGN KEY (replay_set_id) REFERENCES replay_sets (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_replay_regression_scaffolds_system
+    ON replay_regression_scaffolds (system_id, id DESC);
+
+-- =========================================================================
+-- AI Candidate Studio (Issue #252)
+--
+-- A conversation-oriented wrapper over the EXISTING isolated-Replay
+-- infrastructure (#242 Phase B/C): a CandidateSession groups a component, a
+-- pinned baseline snapshot, a Replay Set (the evaluation inputs), and the
+-- chat; every time a patch is actually generated an IMMUTABLE CandidateVersion
+-- is created (chat messages alone never create versions). Nothing here adds a
+-- new judgement, execution, or comparison path -- proposal generation reuses
+-- the reasoning-model candidate prompt + deterministic splice->diff from
+-- app/candidate_studio.py (built on replay_draft's mechanism), replay reuses
+-- POST /replay-variant-runs verbatim (same approval gate, network-off
+-- worktree sandbox, always-cleanup, finite diff matrix), and promotion reuses
+-- the variant experiment-payload shape. The LLM never adopts/merges/deploys
+-- anything: promotion only hands a reviewed patch to the existing Experiment
+-- creation flow (Principle 7).
+-- =========================================================================
+CREATE TABLE IF NOT EXISTS candidate_sessions (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    component_id          TEXT NOT NULL,
+    snapshot_id           INTEGER NOT NULL,
+    commit_sha            TEXT NOT NULL,
+    symbol_path           TEXT NOT NULL,
+    symbol_qualified_name TEXT NOT NULL,
+    replay_set_id         INTEGER NOT NULL,
+    objective             TEXT NOT NULL DEFAULT '',
+    status                TEXT NOT NULL DEFAULT 'active',  -- 'active' | 'archived'
+    created_at            REAL NOT NULL,
+    updated_at            REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (replay_set_id) REFERENCES replay_sets (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_candidate_sessions_system
+    ON candidate_sessions (system_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_candidate_sessions_component
+    ON candidate_sessions (system_id, component_id, id DESC);
+
+-- One immutable candidate version per generated patch. parent_version_id
+-- makes additional instructions branch off the selected version (a tree per
+-- session). The reasoning-model provenance lives in intelligence_runs
+-- (run_type='candidate_studio_proposal'); this table holds the structured
+-- proposal content (summary / assumptions / changed_symbols / risks /
+-- suggested_tests) plus the deterministically spliced patch, kept separate
+-- from raw replay results (CLAUDE.md storage-separation rule). status is
+-- finite: the generate job lifecycle terminal state
+-- ('proposed' = patch generated & validated | 'failed' = LLM/patch/scope/
+-- validation failure, fail-closed). replay_status is finite
+-- ('not_run' | 'running' | 'completed' | 'failed'); replay_run_id / candidate
+-- variant point at the reused replay_variant_run when replayed. promoted_at
+-- records that the reviewed patch was handed to the Experiment flow (never an
+-- auto-adoption).
+CREATE TABLE IF NOT EXISTS candidate_versions (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    session_id          INTEGER NOT NULL,
+    parent_version_id   INTEGER,
+    version_number      INTEGER NOT NULL,
+    intelligence_run_id INTEGER NOT NULL,
+    instruction         TEXT NOT NULL DEFAULT '',
+    status              TEXT NOT NULL DEFAULT 'failed',  -- 'proposed' | 'failed'
+    summary             TEXT NOT NULL DEFAULT '',
+    assumptions_json    TEXT NOT NULL DEFAULT '[]',
+    changed_symbols_json TEXT NOT NULL DEFAULT '[]',
+    risks_json          TEXT NOT NULL DEFAULT '[]',
+    suggested_tests_json TEXT NOT NULL DEFAULT '[]',
+    generated_code      TEXT NOT NULL DEFAULT '',
+    patch_text          TEXT NOT NULL DEFAULT '',
+    patch_hash          TEXT NOT NULL DEFAULT '',
+    error               TEXT,
+    replay_status       TEXT NOT NULL DEFAULT 'not_run',
+    replay_run_id       INTEGER,
+    replay_variant_id   INTEGER,
+    promoted_at         REAL,
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES candidate_sessions (id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_version_id) REFERENCES candidate_versions (id) ON DELETE SET NULL,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE CASCADE,
+    FOREIGN KEY (replay_run_id) REFERENCES replay_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_candidate_versions_session
+    ON candidate_versions (session_id, version_number);
+CREATE INDEX IF NOT EXISTS idx_candidate_versions_system
+    ON candidate_versions (system_id, session_id, id DESC);
+
+-- Conversation turns. role is finite ('user' | 'assistant'); an assistant
+-- turn may reference the version its request produced (version_id), but a
+-- message never itself creates a version -- only POST .../generate does.
+-- The assistant's "understood conditions" echo is DETERMINISTIC display text
+-- (Principle 6), not an inference; the LLM's actual understanding is surfaced
+-- inside a CandidateVersion's proposal (summary / assumptions).
+CREATE TABLE IF NOT EXISTS candidate_messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id   INTEGER NOT NULL,
+    session_id  INTEGER NOT NULL,
+    role        TEXT NOT NULL,  -- 'user' | 'assistant'
+    content     TEXT NOT NULL DEFAULT '',
+    version_id  INTEGER,
+    created_at  REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES candidate_sessions (id) ON DELETE CASCADE,
+    FOREIGN KEY (version_id) REFERENCES candidate_versions (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_candidate_messages_session
+    ON candidate_messages (session_id, id);
+CREATE INDEX IF NOT EXISTS idx_candidate_messages_system
+    ON candidate_messages (system_id, session_id);
 """
 
 
@@ -2388,6 +2793,16 @@ def init_db() -> None:
             )
         if publish_job_cols and "last_attempt_at" not in publish_job_cols:
             conn.execute("ALTER TABLE publish_jobs ADD COLUMN last_attempt_at REAL")
+        # Issue #242 Phase A / #243: replay-capture columns on traces. Existing
+        # rows stay NULL (= pre-Phase-A / capture not opted in); no bulk
+        # reclassification of old traces.
+        trace_cols = _columns(conn, "traces")
+        if "input_capture_json" not in trace_cols:
+            conn.execute("ALTER TABLE traces ADD COLUMN input_capture_json TEXT")
+        if "replayability" not in trace_cols:
+            conn.execute("ALTER TABLE traces ADD COLUMN replayability TEXT")
+        if "replay_reasons_json" not in trace_cols:
+            conn.execute("ALTER TABLE traces ADD COLUMN replay_reasons_json TEXT")
         _ensure_legacy_system(conn)
     _validate_startup_environment()
     _validate_publish_startup_config()

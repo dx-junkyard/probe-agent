@@ -136,21 +136,35 @@ UI は表示しない。`PipelineChecklist`
 が常時表示され、配列先頭から見て最初の非 `complete` step にのみ「次の一歩」の
 CTA ボタンが付く。2 つ目以降の未完了 step には CTA を出さない。
 
-step → CTA の対応は固定マッピング（`STEP_CTA`、CLAUDE.md Principle 6 の範囲内）
-であり、推論やヒューリスティックではない:
+CTA の出所は Issue #239 で `GET /system-state` に統一された: 最初の非
+`complete` step に対応する `StateItem`（`related_pipeline_steps` がその
+step 名を含む項目。`page_items["/system-understanding"]` はサーバー側で
+優先度順・フェーズ抑制済み）の `target_ui` / `systemStateTarget()` を
+そのまま消費する。これによりバッジ・バナー・notice と同じ root cause が
+このページでだけ別文言・別遷移先になることがない。
 
-| step | CTA | 遷移/操作 |
-| --- | --- | --- |
-| `repository_configured` | Configure repository | `/repository` へ遷移 |
-| `snapshot_ready` | Create snapshot | `/repository` へ遷移 |
-| 上記以外の全 step（`symbols_indexed` / `documentation_indexed` /
-  `documentation_claims_scanned` / `entrypoints_discovered` /
-  `docs_code_reconciled` / `capability_hierarchy_ready`） | Run Build / Refresh | ページの `Build / Refresh` ボタンと同じ
-  `build.mutate()` を起動 |
+`STEP_CTA` の固定マッピング（Issue #200）は撤去された。CTA は例外なく
+`GET /system-state` の `StateItem` から導出され、ハードコードのフォール
+バックは持たない。以前フォールバックに落ちていた唯一の step
+`repository_configured` は、ネイティブ項目 `repository.configuration.missing`
+が `related_pipeline_steps: ["repository_configured"]` を持つようになった
+ため、他の step と同様 `stateItemForStep` でマッチする。ある step の
+最初の非 `complete` 項目が万一欠けている場合は、その step には CTA
+ボタンを出さない（status バッジと「Why?」診断は従来どおり表示）—
+古い固定文言・固定遷移先を出すよりも一貫性を優先する。
 
-Build 系 CTA はビルド実行中（`build.isPending` または最新ジョブが
-`queued`/`running`）は無効化される。CTA には `pipeline-cta-<step>` の
-`data-testid` が付く。
+CTA の文言・遷移先は該当 `StateItem` の `target_ui`
+（`action_label` / `systemStateTarget()`）から取る。`user_action_kind ===
+"build"` の項目だけはページの `Build / Refresh` ボタンと同じ
+`build.mutate()` を起動し、ビルド実行中（`build.isPending` または最新ジョブが
+`queued`/`running`）は無効化される。それ以外の項目は `target_ui.route`
+への遷移リンクになる。CTA には `pipeline-cta-<step>` の `data-testid`
+が付く。
+
+Pipeline Checklist の各 step ラベルは Issue #240 でサーバー正本化された:
+`GET /system-understanding` の各 step が返す `label`（`state_messages.PIPELINE_STEP_LABELS`
+由来の日本語）を UI はそのまま表示し、クライアント側の `STEP_LABELS` は
+サーバー文言欠落時（旧サーバー）のフォールバックとしてのみ残る。
 
 全 step が `complete` のとき、Pipeline Status カードは既定で折りたたまれ
 （`data-testid="pipeline-collapsed"`、`N/N steps complete` の要約表示）、
@@ -206,17 +220,26 @@ Capability Map の detail panel は
 `failed` の間も、context API は latest ready snapshot を基準にして、gaps /
 probe plans / experiments を同じ分析文脈で返す。
 
-## 状態通知の構成（現状 2 系統と統合方針）
+## 状態通知の構成（Issue #239 で system-state に統一済み）
 
-ユーザー向けの「次の一歩」表示は現在 2 系統が併存する（Issue #215 調査、
-`docs/ux-gap-analysis-system-understanding.md` §2.4）。
+かつてはユーザー向けの「次の一歩」表示が 2 系統併存していた（Issue #215
+調査、`docs/ux-gap-analysis-system-understanding.md` §2.4:
+`_derive_primary_action` → `primary_action` → `PrimaryActionCard` と、
+`select_primary_item` → `primary_item` → `SystemStateBanner`）。Issue #239
+で全通知面のデータソースは `GET /system-state` のみに統一され、面ごとの
+責務は次のとおり確定した:
 
-1. `system_understanding_service._derive_primary_action` →
-   `GET /system-understanding` の `primary_action` → Hub の
-   `PrimaryActionCard`（本ドキュメント「Primary Action (Issue #201)」節）
-2. `system_state.build_system_state` / `select_primary_item` →
-   `GET /system-state` の `primary_item` / `page_items` →
-  `SystemStateBanner` とヘッダーの `DiagnosticsBadge`
+| 通知面 | 消費する投影 |
+| --- | --- |
+| ページ内バナー（`SystemStateBanner`） | `page_items[currentRoute][0]`、なければ `primary_item`。System Understanding ではビルド実行中、severity が `error` / `blocked` 以外の項目を表示保留にする（BuildJobPanel が進捗を表示しているため。決定論的条件のみ） |
+| 右上バッジ（`DiagnosticsBadge`） | `notification_items`（severity・scope・フェーズ抑制済み）をそのまま消費し、監査用 `items` から通知を再導出しない。`user_action_kind=none` / `wait` では CTA を表示しない。dialog-kind の canonical item に限り、`system-diagnostics` は `related_checks` 経由で EnvFixDialog の内容と実行手段だけを供給する。`system-state` 取得失敗時は独自導出へ回帰せず、専用の縮退表示（`?` バッジ + エラーダイアログ）を出す |
+| 右下常駐 notice（`assistant-panel.tsx`） | `notification_items[0]`（フェーズ抑制済み） |
+| Pipeline Checklist の CTA | 該当 step を `related_pipeline_steps` に持つ `StateItem` の `target_ui`（前節参照） |
+| ヘッダーのフェーズ表示（`UserPhaseIndicator`） | `user_phase` / `phases`（サーバー値のみ。クライアント側でフェーズを導出しない） |
+
+通知の取り下げは (a) 状態解消による項目消滅と (b) フェーズ抑制のみで
+行われ、ユーザー操作による dismiss フラグは存在しない（親 issue #235 の
+確定事項）。
 
 `StateItem.target_ui` は修正を実行する画面を表す。一方、問題を観測する
 画面は `display_routes` で明示し、`page_items` には
@@ -233,12 +256,185 @@ probe plans / experiments を同じ分析文脈で返す。
 前者は現 snapshot のみを参照し、後者は Interview baseline の snapshot
 跨ぎ再利用に対応するなど、判定材料が完全には一致しない。統合（前者を
 後者へ吸収し、Hub の表示も canonical `StateItem` から投影する）は
-Issue #206 / #207 が所有する。それまでの間、両系統の判定条件を変える
+Issue #235 の Sub 3（#238）/ Sub 4（#239）が所有する（旧 #206 / #207 は
+#235 に集約して閉じられた）。それまでの間、両系統の判定条件を変える
 変更は必ず両方（`system_understanding_service` / `system_state` /
 `system_diagnostics`）へ同時に適用する（Issue #210 の
 capability_hierarchy 0 件 warning が先例）。
 
+Issue #236 はこの「両系統」の事実取得を `app/state_facts.py` に一本化し、
+`system_understanding_service._build_next_actions` / `_derive_stage_statuses`
+が独自に持っていた単純な `purpose_defined` 判定（`_load_purpose` の dict
+から `bool(name or summary)` を取る簡易版）を、`system_state.evaluate_understanding`
+の 5 分岐（`satisfied_current | baseline_reusable | diff_impacted |
+unconfirmed | missing_baseline`）の `kind == "satisfied_current"` への
+縮約に置き換えた（`_purpose_defined_from_understanding_status`）。これに
+より「現 snapshot で Purpose/Capabilities が定義されているか」の一次判定
+は 3 モジュールで完全に共有される。ただし `_derive_primary_action` /
+`_build_next_actions` 自体（baseline 再利用や diff_impacted を経路に含め
+た出し分け）を `StateItem` の投影に置き換える統合は Issue #235 の
+Sub 3（#238）の領分であり、#236 は対象外。
+
+### primary_item への統合（Issue #238）— 旧フィールドは #239 で撤去済み
+
+「次の一歩」の正本は `system_state.select_primary_item` が返す
+`GET /system-state` の `primary_item` である。`GET /repository/system-understanding`
+の `primary_action` / `next_actions` / `understanding_refresh_recommended`
+は Issue #239 でレスポンス・型定義・UI から**撤去済み**
+（`_derive_primary_action` / `_build_next_actions` も削除。
+`_check_understanding_refresh_recommended` は
+`interview.materialized.rebuild_required` state 項目の導出用として存続）。
+クライアントは `GET /system-state` の `primary_item` / `page_items` を
+参照すること。旧フィールドを含む古いレスポンスを受け取っても UI が旧投影
+を復活させないことは契約テストで固定されている。
+
+`_derive_primary_action` / `_build_next_actions` が考慮していた判定要素の
+うち、`StateItem` として表現されていなかったものを Issue #238 で吸収した:
+
+| 判定要素（旧: `_build_next_actions` / `_derive_primary_action`） | 対応する StateItem |
+| --- | --- |
+| repository 未設定・snapshot 未 ready（rule 1） | `repository.configuration.missing` / `snapshot.ready.*`（既存） |
+| ビルド実行中は CTA を出さない（rule 2） | 新規追加なし。実行中のステップは既存の `.running`（`user_action_kind="wait"`）が `select_primary_item` の候補から除外される。ただし旧 rule 2 はビルド状態に関係なく無条件に CTA 全体を抑制するのに対し、新方式はビルドと無関係な項目（例: レビュー待ち probe plan）までは抑制しない — 既知の意図的な差分（後述） |
+| symbols_indexed 等の未完了ステップ（rule 3 / 個別 NextAction） | `pipeline.symbol_index.*` / `pipeline.entrypoint_index.*` / `pipeline.documentation_index.*` / `pipeline.capability_hierarchy.*`（既存） |
+| documentation_claims_scanned 未完了 | 既存の `diagnostic.pipeline_understanding_graph`（診断投影、`understanding_graph_snapshots` の有無を reasoning 要求付きでチェック）が同一条件を既にカバーしている。ネイティブ項目は追加していない |
+| docs_code_reconciled 未完了（has_understanding_graph **かつ** has_code_symbols） | 新規 `pipeline.docs_code_reconcile.not_run` / `.partial`。既存の `diagnostic.pipeline_understanding_graph` は graph の有無のみを見るため、symbol 側の欠落を拾えない差分をネイティブ項目で埋めた |
+| purpose 未定義 / capabilities 空（rule 3 の pipeline_complete 分岐） | `understanding.purpose.*` / `understanding.capabilities.*`（既存） |
+| "Review probe plan"（proposed_plan_ids） | 新規 `proposal.probe_plans.proposed`（`phase="preparation"` を明示上書き — 承認は preparation 完了条件の一方の経路のため） |
+| "Generate / validate probe patch"（approved_plan_ids_without_validated_patch） | 新規 `proposal.probe_plans.approved_without_patch`（`state_group="proposal"` の既定どおり `phase="diagnosis"`） |
+| "Review experiment decision"（undecided_completed_experiment_ids） | `proposal.experiments.undecided`（既存、Issue #237） |
+| 全完了時の "Start from Capability" 等の探索導線（rule 4 のフォールバック） | 対応する StateItem を追加しない（意図的）。`select_primary_item` は `severity != "ok"` の項目のみを候補とするため、問題が無ければ `primary_item = None` になる。旧系の「探索を促す」導線と新系の「沈黙」は意味的に異なる（前者は次にやることの提案、後者は「今は何も直すことがない」の表明）ため、統合対象は前者ではなく後者を正とする |
+
+新旧一致の契約テストは
+`apps/control-server/tests/test_next_step_parity.py`
+（`TestPrimaryRecommendationParity` / `TestBuildRunningSuppression` /
+`TestUnderstandingRefreshRecommendedMatchesStateItem`）にある。repository
+未設定・snapshot 未 ready・単一ステップ未完了・purpose 未定義・probe plan
+レビュー待ち・approved plan の patch 未生成の各代表ケースで、新旧が同じ
+修正先ルートを指すことを固定している。全完了時と build 実行中時は、上表
+のとおり意図的な差分があるため厳密な一致ではなく期待される挙動として
+固定している。`understanding_refresh_recommended` は
+`interview.materialized.rebuild_required` StateItem の存在と常に一致する
+ことも同ファイルで固定した（両者とも `_check_understanding_refresh_recommended`
+という同一関数を読んでいるため、構造的に一致する）。
+
+### user_phase とフェーズ抑制（Issue #237）
+
+`GET /system-state` は上記 `StateItem` 一覧に加えて、ユーザーが今どの
+段階にいるかを表す `user_phase`（`"setup" | "preparation" | "diagnosis"`）
+と、各フェーズの完了可否 `phases: [{phase, complete}]` を返す。
+
+| フェーズ | 完了条件 |
+| --- | --- |
+| `setup` | 対象リポジトリ登録済み、かつ repository / database / auth / llm 系診断（`system_diagnostics.DiagnosticCheck.category`）に `error` / `blocked` が無い |
+| `preparation` | ready snapshot 存在、決定的 8 ステップ Pipeline Checklist（`system_understanding_service.compute_pipeline_steps` — repository_configured / snapshot_ready / documentation_indexed / documentation_claims_scanned / symbols_indexed / entrypoints_discovered / docs_code_reconciled / capability_hierarchy_ready）が全て `complete`（Issue #237）、Purpose / Capabilities が `evaluate_understanding` の `satisfied_current` または `baseline_reusable`、かつ計装経路確立（承認済み probe plan が 1 件以上、または SDK 接続状態が `no_signal` でない）。`pipeline_all_complete` は Pipeline Checklist と同一の共有関数から導出されるため、Checklist に未完了 step（`warning` / `blocked` / `missing`、例: 空の capability hierarchy）が残る限り `diagnosis` へ進まない |
+| `diagnosis` | 終端フェーズ（完了条件なし） |
+
+現在フェーズ = 完了条件を満たさない最初のフェーズ。導出は
+`system_state.derive_user_phase(facts: UserPhaseFacts)` という DB 非依存の
+純粋関数が担う（`build_system_state` が `state_facts` / diagnostics から
+facts を集めて渡す）。入力が不明な場合は常に前のフェーズに倒れる
+（`UserPhaseFacts` の全フィールドが「未達成」側をデフォルトにしている
+ため）。
+
+各 `StateItem` は `phase` フィールドを持つ。既定は `state_group` → フェー
+ズの固定マッピング（`repository` / `configuration` → `setup`、
+`snapshot` / `pipeline` / `understanding` / `interview` → `preparation`、
+`runtime` / `proposal` → `diagnosis`）だが、`system_state.
+STATE_ID_PHASE_OVERRIDES` という小さな明示的辞書がこれを上書きする場合が
+ある。例えば `runtime.connectivity.no_signal`（state_group は
+`runtime`）は SDK 接続確立が preparation の完了条件そのものであるため
+`preparation` タグになる。同様に、診断由来の `StateItem`
+（`diagnostic.<check_id>`）は `_diagnostic_state_item` が
+auth/database/llm/configuration 以外のカテゴリを一律 `state_group=
+"runtime"` に畳み込む（Issue #193）ため、repository / pipeline /
+understanding カテゴリの check だけは診断カテゴリに合わせて
+`setup` / `preparation` に個別上書きしている。
+
+フェーズ抑制（親 issue #235 の確定取り下げ規則）は通知投影の全面——
+`primary_item` / `notification_items` / `page_items`——に適用され、現在
+フェーズより後のフェーズの項目を除外する。フェーズスコープは確定優先度
+規則（フェーズ → severity → intervention_timing → user_action_kind →
+state_id）の最外殻であり、`primary_item` の選択もスコープ内で行われる。
+`items`（監査用の全項目）は一切除外しない。したがって
+`LLM_PROVIDER=mock`（Principle 7 のテスト/ローカル動作確認用データ）の
+ように `llm` 系診断が `blocked` になる構成ではフェーズが `setup` に留ま
+り、ページバナーには後フェーズの pipeline/understanding 項目ではなく
+setup の解消案内が出る——これは設計どおりで、後フェーズの事実は `items`
+に残り、前提未達ページへのフェーズ由来ガイドは Issue #241 が担う。
+
+`runtime` / `proposal` グループは Issue #193 Phase 1 では宣言のみで未使用
+だったが、Issue #237 で代表項目を 1 件ずつ追加した（網羅は狙わない）:
+`runtime.connectivity.no_signal`（トレース未受信時の計装案内、
+preparation タグ）と `proposal.experiments.undecided`（完了済みだが
+human_decision 未記録の experiment のレビュー促し、diagnosis タグ）。
+
+### 状態メッセージのカタログ化と日本語統一（Issue #240）
+
+状態メッセージ（summary / detail / impact / remediation / action_label、
+pipeline step / stage の表示名、gap のタイトル/next-action、成功サマリ）は
+サーバー側の単一カタログ `app/state_messages.py` に集約され、表示言語は
+日本語に統一されている。`system_state.py` / `system_diagnostics.py` /
+`system_understanding_service.py` はこのカタログから文言を引き、モジュール
+内に f-string の文言を持たない。
+
+- カタログのキーは `state_id` / `check_id`（および必要な variant）を正と
+  する。動的埋め込みは件数・snapshot id・raw な upstream status/error など
+  の事実値のみ（`str.format` の名前付きパラメータ、Principle 6）。LLM に
+  よる文言生成はしない。
+- アクセサ（`state_message` / `pipeline_family_message` /
+  `understanding_message` / `check_title` / `check_message` /
+  `shared_check_message` / `stage_message` / `pipeline_step_detail` 等）は
+  キー欠落時に `KeyError` を送出し、黙って英語/空文字へフォールバックし
+  ない。`phase_label` のみ、サーバー検証済み enum のため未知値でトークンを
+  返す（英語化はしない）。
+- 新しい `StateItem` / `DiagnosticCheck` / pipeline step / stage を追加する
+  ときは、対応するカタログキーを同時に追加する。欠落は
+  `tests/test_state_messages.py`（全 `ALL_*` キーの解決検証 + 実プロデューサ
+  を駆動した網羅検証 + 代表文言スナップショット）が検出する。
+- Dashboard は状態文言を生成しない。stage ラベル/説明・成功サマリ
+  （`SystemUnderstandingOut.success_summary`）・フェーズ表示ラベル
+  （`SystemStatePhaseCompletion.label`, Issue #240）・pipeline step ラベル
+  （`SystemUnderstandingPipelineStep.label`, Issue #240）・gap
+  アクションはサーバー供給値を消費し、`STAGE_LABELS` /
+  `USER_PHASE_LABELS` / `STEP_LABELS` 等の固定ラベルはサーバー文言欠落時の
+  最終手段フォールバックとしてのみ残す（`STEP_CTA` の固定 CTA マップは
+  Issue #239 で撤去済み — CTA は `StateItem` からのみ導出）。gap の「実装 issue を作成」
+  アクションはラベル一致で識別するため、フロントの `CREATE_ISSUE_ACTION`
+  はカタログの `GAP_CREATE_ISSUE_ACTION` と一致させる。
+
+### フェーズ由来の前提ガイド（Issue #241）
+
+前提が満たされていない画面に「なぜ空か・次にどこで何をするか」を示す共通
+コンポーネント `PrerequisiteGuide`（`components/prerequisite-guide.tsx`）を
+追加した。データソースは `GET /system-state` のみ:
+
+- 現在フェーズ（`user_phase`）を `USER_PHASE_LABELS` で表示し、フェーズを
+  進めるための「次の一歩」はフェーズ抑制済みの `primary_item`（サーバー
+  計算の最上位 actionable 項目）の summary / remediation / target_ui を
+  そのまま消費する。クライアントはフェーズも状態文言も導出しない。
+- 終端フェーズ `diagnosis` では前提がすべて満たされるため何も描画しない
+  ——フェーズが進むと自動的に消える。
+- 配置: Overview の zero-state（コンポーネント 0 件かつ非 diagnosis）、
+  Feature Map の features 空状態、Probe Planner の生成ダイアログ（診断準備
+  未完了時）。Probe Planner のゲートは導線であり強制ブロックではない
+  （自由入力 feature id は既定折りたたみの escape hatch、プラン生成 API は
+  拒否しない）。強制が必要になった場合はサーバー側バリデーションとして
+  別途起票する。
+- Connect SDK ↔ Setup Guide は双方向リンク（`connect-sdk-setup-guide-link`
+  ／ `setup-guide-connect-sdk-link`）で相互遷移できる。
+- 表示分岐は `user_phase` ・ `phases[].complete` ・既存 API の有無
+  （component 件数 0、features 空 等）の決定論的判定のみ（Principle 6）。
+
 ## Next Actions
+
+> **撤去済み（Issue #238 → #239）**: 本節が説明していたトップレベルの
+> `next_actions` / `primary_action` / `understanding_refresh_recommended`
+> は Issue #239 で `GET /repository/system-understanding` のレスポンスから
+> 撤去された。「次の一歩」の正本は `GET /system-state` の
+> `primary_item`（`system_state.select_primary_item`）。判定要素の対応表
+> は「primary_item への統合（Issue #238）」節を参照。以下の 4 stage 分類
+> は表示専用の `stages` と gap 単位の解決手段リンク（`GAP_NEXT_ACTIONS`、
+> gap card / issue draft で使用）の語彙として存続する。
 
 System Understanding の Next Actions は 4 stage に分類される。
 
@@ -287,7 +483,14 @@ Hub の Understand stage と Decide Where to Observe stage の Related pages に
 api_boundary_mapping / probe_flow_selection）が Understand と Decide Where to
 Observe の両方に対応するためである。
 
-### Primary Action（Issue #201）
+### Primary Action（Issue #201、Issue #239 で撤去済み）
+
+> `primary_action` は Issue #238 で `system_state.primary_item` に統合され、
+> Issue #239 でレスポンスから撤去された（`_derive_primary_action` も削除）。
+> 以下は統合時に吸収した意味論の歴史的記録として残す。旧 rule 2（ビルド
+> 実行中の無条件 CTA 抑制）は、System Understanding ページのバナー側で
+> 「ビルド実行中は severity が `error` / `blocked` 以外の項目を表示保留」
+> という決定論的表示条件として引き継がれた。
 
 `GET /system-understanding`（`GET /repository/system-understanding`）は
 `next_actions`（stage 別リスト）に加えて、優先度最上位の action を単一の
@@ -426,7 +629,7 @@ gap_type の件数が 0 の build は、その gap_type の行を書かない（
 `gap_trend` は timestamp 比較と件数集計のみの deterministic な結果であり
 （Principle 6）、reasoning model は関与しない。
 
-#### understanding_refresh_recommended（再 Build 促し）
+#### understanding_refresh_recommended（再 Build 促し、Issue #238 により deprecated）
 
 `GET /system-understanding` は `understanding_refresh_recommended`
 （bool）も返す。導出は
@@ -436,6 +639,13 @@ gap_type の件数が 0 の build は、その gap_type の行を書かない（
 なる。materialize 済みセッションが無い、または `completed` build が一度も
 無い system は `false`。単純な timestamp 比較のみで reasoning model は
 関与しない。
+
+Issue #238: このフラグの正本は `system_state.py` の
+`interview.materialized.rebuild_required` StateItem であり、両者は同じ
+`_check_understanding_refresh_recommended` 呼び出しから導出されるため常に
+一致する（`tests/test_next_step_parity.py` の
+`TestUnderstandingRefreshRecommendedMatchesStateItem` で固定）。フラグ自体は
+Dashboard の消費切替（#239）と同一コミットでレスポンスから撤去される。
 
 #### Dashboard
 

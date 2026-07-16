@@ -135,8 +135,9 @@ def post_trace(
             """
             INSERT OR REPLACE INTO traces
                 (system_id, trace_id, component_id, mode, input_json, output_text,
-                 error, duration_ms, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 error, duration_ms, timestamp,
+                 input_capture_json, replayability, replay_reasons_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 system_id,
@@ -148,6 +149,13 @@ def post_trace(
                 event.error,
                 event.duration_ms,
                 event.timestamp,
+                # Replay capture (Issue #242 Phase A / #243): stored verbatim as
+                # JSON; NULL when the SDK did not opt this component in.
+                json.dumps(event.input_capture, ensure_ascii=False)
+                if event.input_capture is not None else None,
+                event.replayability,
+                json.dumps(event.replay_reasons, ensure_ascii=False)
+                if event.replay_reasons is not None else None,
             ),
         )
         _write_lineage(conn, system_id, event)
@@ -226,7 +234,8 @@ def list_traces(
         rows = conn.execute(
             """
             SELECT trace_id, component_id, mode, input_json, output_text,
-                   error, duration_ms, timestamp
+                   error, duration_ms, timestamp,
+                   input_capture_json, replayability, replay_reasons_json
             FROM traces
             WHERE system_id = ? AND component_id = ?
             ORDER BY timestamp DESC
@@ -247,5 +256,18 @@ def list_traces(
             d["input"] = None
         d.pop("input_json", None)
         d["output"] = d.pop("output_text", None)
+        # Replay capture (Issue #242 Phase A / #243): NULL columns (pre-Phase-A
+        # rows or components not opted in) surface as explicit nulls.
+        d["input_capture"] = _load_json_or_none(d.pop("input_capture_json", None))
+        d["replay_reasons"] = _load_json_or_none(d.pop("replay_reasons_json", None))
         result.append(d)
     return result
+
+
+def _load_json_or_none(raw):
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None

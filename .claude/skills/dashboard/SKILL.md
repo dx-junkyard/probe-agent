@@ -43,6 +43,50 @@ The dashboard should support:
   hands off to the existing Probe Planner gates and links there — the page
   itself never applies instrumentation.
 - Experiments tab
+- Simulation Workbench (Issue #242 Phase D / #246,
+  `pages/simulation-workbench.tsx`, route `/simulation-workbench`): trace-row
+  actions on Components Traces, Trace Lineage, and analyzer example rows
+  (`components/replay-row-actions.tsx`:
+  `ReplayabilityBadge` + Replay / Add-to-Replay-Set / Create-Experiment,
+  plus the `trace` `AddToWorkspaceButton`), and a 3-pane page — Replay Set
+  (traces + `JsonTree` input_capture + recorded output + per-trace
+  input_source/skip guidance), a center editor (pinned-snapshot source in a
+  Textarea; Direct edit → auto-diff via `POST /replay-source-diff` / Paste
+  patch / LLM draft with provenance + `is_mock` badges), and the result
+  matrix (match / diff / candidate_error / error_to_success distinctly
+  badged, `field_diffs`, duration Δ, aggregate row). An always-visible
+  simulation disclaimer, a confirm-gated Approve/Revoke approval panel
+  showing the deterministic risk context, and escalations that only ever go
+  through existing human gates (only successfully applied/completed variants
+  may be promoted to Experiment via patch prefill; a provenance-bearing,
+  fail-closed `reasoning_llm` regression-test scaffold; a static
+  `set_candidate` live-shadow snippet). Source edits, pasted patches, and LLM
+  drafts always carry the source/draft's pinned `snapshot_id`. Replay
+  judgement/execution stays in the Phase A–C APIs; the regression scaffold is
+  the isolated review-only reasoning boundary. The UI never writes to the
+  target repo.
+- AI Candidate Studio (Issue #252, `pages/candidate-studio.tsx`, route
+  `/candidate-studio?session_id=...`, nav item under "Detail views", `Bot`
+  icon): a conversation + candidate-versioning page over the same isolated
+  Replay stack. A start view picks a component (and optionally a trace, or an
+  advanced-collapsed existing Replay Set) then `POST /candidate-sessions`; the
+  studio view has a left conversation pane (`POST .../messages`) and a right
+  pane with `差分`/`全コード`/`評価結果` tabs for the selected
+  `CandidateVersion`. The evaluation tab reuses the extracted
+  `components/replay-result-matrix.tsx` (`ResultMatrix`, fetched from the
+  existing `GET /replay-variant-runs/{replay_run_id}`) and the approval gate
+  reuses the extracted `components/replay-approval-panel.tsx` (`ApprovalPanel`)
+  — both shared verbatim with the Simulation Workbench. Exactly one
+  state-driven primary action is shown: 候補を生成 (`POST .../generate`) →
+  Replayで確認 (`POST /candidate-versions/{id}/replay`) → AIに修正を依頼
+  (generate with `parent_version_id`, on a failed replay) → Experimentへ送る
+  (`POST /candidate-versions/{id}/promote`, navigating via the existing
+  `/experiments?replay_run_id=&replay_variant_id=` prefill). `is_mock` badges
+  mark mock LLM output. Entry points: a component-level "AIで別バージョンを
+  作る" (`pages/components.tsx`) and a trace-level "この入力から改善する"
+  (`components/replay-row-actions.tsx`). No new judgement/execution/comparison
+  logic; promotion never auto-creates an experiment and the UI never writes to
+  the target repo.
 - Decision Workspace tab (Issue #38): workspace list/create/switch, a
   conversation thread with grounded findings/assumptions/missing information
   visually distinguished, pinned context with links back to the owning
@@ -50,14 +94,23 @@ The dashboard should support:
   accept/reject with a required reason. There is no "defer" decision or
   proposal-edit action in the API (Issue #35 only exposes accept/reject); do
   not add UI controls for actions the API does not support.
-- System settings diagnostics (Issue #101): a header alert badge
-  (`components/diagnostics-badge.tsx`) fed by `GET /system-diagnostics`.
-  The badge count is error+blocked+warning checks; clicking opens a dialog
-  showing each check's detail, impact, remediation, related env vars, and
-  the verbatim last observed run error. The System Understanding page shows
-  a "Why?" button on missing/blocked pipeline rows that expands the related
-  diagnostics. Diagnostics are deterministic server output — never decorate
-  them with client-side heuristic explanations.
+- System settings diagnostics (Issue #101; badge source unified in #239): a
+  header alert badge (`components/diagnostics-badge.tsx`) fed by
+  `GET /system-state` `notification_items` (severity/scope/phase-filtered by
+  the server and defensively deduped by `dedupe_key`) — never re-derived from
+  audit-only `items`. The former `GET /system-diagnostics` direct
+  read/fallback was removed in Issue #239. Diagnostics are still consulted
+  only when an actionable canonical StateItem explicitly has
+  `evidence.fix_kind=dialog`, to resolve that check's EnvFixDialog contents
+  via `related_checks`; they never create the CTA. `user_action_kind=none`
+  and `wait` items have no CTA. When `/system-state` cannot be loaded the
+  badge shows an explicit degraded state (`?` + error dialog,
+  `data-testid="diagnostics-badge-error"`); it never re-derives state
+  client-side. Clicking an item navigates via `systemStateTarget()`. The
+  System Understanding page shows a "Why?" button on missing/blocked
+  pipeline rows that expands the related diagnostics. Diagnostics are
+  deterministic server output — never decorate them with client-side
+  heuristic explanations.
   Issue #115: the dialog text is Japanese and each problem is clickable.
   A `fix_kind: navigate` check routes to `fix_page?diagnostic=<id>&fix=<anchor>`
   and closes the dialog; a `fix_kind: dialog` check opens an env-var
@@ -76,6 +129,22 @@ The dashboard should support:
   structured `pipeline_capability_hierarchy` check (`fix_kind: navigate`,
   `fix_page: /interview` — the same object shown in the row's "Why?" list),
   never by regex-matching the step's free-text `detail`.
+- Notification surfaces (Issue #239): every notification surface consumes
+  `GET /system-state` projections only — page banner
+  (`SystemStateBanner`) reads `page_items[currentRoute][0] ?? primary_item`
+  (on System Understanding, non-error/blocked items are held back while a
+  build is running, a deterministic condition); the header badge reads
+  deduped `notification_items`; the persistent notice reads
+  `notification_items[0]`; the
+  Pipeline Checklist CTA reads the `StateItem` whose
+  `related_pipeline_steps` names the first incomplete step (the old
+  `STEP_CTA` map survives only as last-resort fallback); the header
+  `UserPhaseIndicator` renders `user_phase` / `phases` verbatim. Never
+  derive state, phase, or copy client-side; withdrawal is only fact
+  resolution or phase suppression (no dismiss flags). A legacy server
+  response still carrying the removed `primary_action` / `next_actions` /
+  `understanding_refresh_recommended` fields must not resurrect old
+  projections (contract-tested).
 - Per-screen assistant (Issue #102): a floating agent button rendered by the
   app layout on every page (`components/assistant-panel.tsx`). It opens a
   right-side panel showing the screen's purpose, the current diagnostics
@@ -161,6 +230,18 @@ The dashboard should support:
   capability-context links on that page. Connect SDK links forward to
   `/setup-guide` (which already links back), closing the one-way link.
   All of the above are deterministic presence/routing checks — no heuristics.
+- Phase-based prerequisite guide (Issue #241): `PrerequisiteGuide`
+  (`components/prerequisite-guide.tsx`) answers "why is this empty / where do
+  I go next" from `GET /system-state` alone — it shows the current
+  `user_phase` (via `USER_PHASE_LABELS`) and the phase-scoped `primary_item`'s
+  server copy + `systemStateTarget` CTA, and renders nothing at the terminal
+  `diagnosis` phase (so it disappears as the phase advances). Used in
+  Overview's zero-component state, Feature Map's empty features state, and the
+  Probe Planner generate dialog when `phases`'s `preparation` is not
+  complete. The Probe Planner use is a steer, not a block: the manual
+  feature-id escape hatch and the generate API are unchanged. Setup Guide now
+  also links back to Connect SDK (`setup-guide-connect-sdk-link`), making that
+  pair bidirectional. Never derive phase or state copy client-side.
 
 - GitHub publish workflow (Issue #216, `pages/github.tsx`, nav item
   "GitHub"): App status card (`GET /github/app-status`; shows a setup hint

@@ -872,7 +872,6 @@ class TestGapHistoryRecording:
         r_b = admin_client.get("/repository/system-understanding", headers=hdrs_b)
         assert r_b.status_code == 200
         assert r_b.json()["gap_trend"] == []
-        assert r_b.json()["understanding_refresh_recommended"] is False
 
 
 THREE_SECTION_README = (

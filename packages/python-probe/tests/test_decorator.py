@@ -19,6 +19,7 @@ def sdk(monkeypatch):
         "probe_agent.policy",
         "probe_agent.client",
         "probe_agent.config",
+        "probe_agent.replay_capture",
         "probe_agent",
     ]:
         sys.modules.pop(mod, None)
@@ -346,3 +347,174 @@ def test_shadow_in_subprocess_delivers_result(tmp_path):
     shadow_payload = next(payload for path, payload in received if "/shadow-results" in path)
     assert shadow_payload["current_output"] == "6"
     assert shadow_payload["candidate_output"] == "50"
+
+
+# --- structured replay capture (Issue #242 Phase A / #243) -------------------
+
+_REPLAY_KEYS = ("input_capture", "replayability", "replay_reasons")
+
+
+def test_replay_capture_opt_in_records_structured_input(sdk):
+    import json
+
+    probe = sdk["decorator_mod"].probe
+
+    @probe(component_id="capt", replay_capture=True)
+    def f(point, tag=None):
+        return "ok"
+
+    assert f((1, 2), tag={"ids": {3, 1}}) == "ok"
+
+    t = sdk["traces"][0]
+    assert t["replayability"] == "replayable"
+    assert t["replay_reasons"] == []
+    cap = t["input_capture"]
+    assert cap["args"] == [{"__probe__": "tuple", "items": [1, 2]}]
+    assert cap["kwargs"]["tag"]["ids"] == {"__probe__": "set", "items": [1, 3]}
+    # Existing repr-based fields are unchanged.
+    assert t["input"]["args"] == ["(1, 2)"]
+    assert json.dumps(cap)  # capture is pure JSON
+
+
+def test_replay_capture_opt_out_has_no_keys_and_is_not_invoked(sdk, monkeypatch):
+    from probe_agent import replay_capture as rc
+
+    def boom(*_a, **_k):
+        raise AssertionError("capture_input must not run when opted out")
+
+    monkeypatch.setattr(rc, "capture_input", boom)
+    probe = sdk["decorator_mod"].probe
+
+    @probe(component_id="noopt")
+    def f(x):
+        return x + 1
+
+    assert f(1) == 2
+    t = sdk["traces"][0]
+    for key in _REPLAY_KEYS:
+        assert key not in t
+
+
+def test_replay_capture_failure_is_non_fatal(sdk, monkeypatch):
+    from probe_agent import replay_capture as rc
+
+    def boom(*_a, **_k):
+        raise RuntimeError("capture exploded")
+
+    monkeypatch.setattr(rc, "capture_input", boom)
+    probe = sdk["decorator_mod"].probe
+
+    @probe(component_id="capt-fail", replay_capture=True)
+    def f(x):
+        return x * 2
+
+    assert f(4) == 8  # return value preserved
+    t = sdk["traces"][0]
+    assert t["input_capture"] is None
+    assert t["replayability"] == "unreplayable"
+    assert t["replay_reasons"] == ["capture_failed"]
+
+
+def test_replay_capture_preserves_exceptions(sdk):
+    probe = sdk["decorator_mod"].probe
+
+    @probe(component_id="capt-err", replay_capture=True)
+    def f(x):
+        raise ValueError("nope")
+
+    with pytest.raises(ValueError):
+        f(1)
+
+    t = sdk["traces"][0]
+    assert "ValueError" in t["error"]
+    assert t["replayability"] == "replayable"
+    assert t["input_capture"]["args"] == [1]
+
+
+def test_replay_capture_redaction_never_leaks_raw_value(sdk):
+    import json
+
+    probe = sdk["decorator_mod"].probe
+
+    @probe(component_id="capt-redact",
+           replay_capture={"redact": ["$.kwargs.password"]})
+    def login(user, password=None):
+        return True
+
+    assert login("u1", password="hunter2") is True
+    t = sdk["traces"][0]
+    assert t["replayability"] == "partial"
+    assert t["replay_reasons"] == ["redacted"]
+    assert "hunter2" not in json.dumps(t["input_capture"], ensure_ascii=False)
+    # NOTE: the legacy repr `input` field is unaffected by replay redaction;
+    # this assertion is about the structured capture only.
+
+
+def test_replay_capture_invalid_spec_raises_at_decoration(sdk):
+    probe = sdk["decorator_mod"].probe
+    from probe_agent import replay_capture as rc
+
+    with pytest.raises(rc.ReplayCaptureError):
+        @probe(component_id="bad-spec", replay_capture={"bogus": 1})
+        def f(x):
+            return x
+
+    with pytest.raises(ValueError):  # invalid redact path (fail closed)
+        @probe(component_id="bad-path", replay_capture={"redact": ["nope"]})
+        def g(x):
+            return x
+
+
+def test_replay_capture_env_size_cap(sdk, monkeypatch):
+    monkeypatch.setenv("PROBE_REPLAY_CAPTURE_MAX_BYTES", "16")
+    probe = sdk["decorator_mod"].probe
+
+    @probe(component_id="capt-size", replay_capture=True)
+    def f(payload):
+        return len(payload)
+
+    assert f("x" * 100) == 100
+    t = sdk["traces"][0]
+    assert t["input_capture"] is None
+    assert t["replayability"] == "unreplayable"
+    assert t["replay_reasons"] == ["size_limit_exceeded"]
+
+
+def test_replay_capture_in_shadow_mode_keeps_production_value(sdk):
+    sdk["set_mode"]("shadow")
+    probe = sdk["decorator_mod"].probe
+    set_candidate = sdk["decorator_mod"].set_candidate
+    set_candidate("capt-shadow", lambda x: x + 100)
+
+    @probe(component_id="capt-shadow", replay_capture=True)
+    def f(x):
+        return x * 2
+
+    assert f(5) == 10  # production value unchanged
+    sdk["decorator_mod"].flush(timeout=3.0)
+
+    t = sdk["traces"][0]
+    assert t["replayability"] == "replayable"
+    assert t["input_capture"]["args"] == [5]
+    # The shadow payload itself is unchanged by Phase A.
+    s = sdk["shadows"][0]
+    for key in _REPLAY_KEYS:
+        assert key not in s
+
+
+def test_replay_capture_off_mode_skips_capture(sdk, monkeypatch):
+    from probe_agent import replay_capture as rc
+
+    def boom(*_a, **_k):
+        raise AssertionError("capture_input must not run in off mode")
+
+    monkeypatch.setattr(rc, "capture_input", boom)
+    sdk["set_mode"]("off")
+    probe = sdk["decorator_mod"].probe
+
+    @probe(component_id="capt-off", replay_capture=True)
+    def f(x):
+        return x
+
+    assert f(1) == 1
+    assert sdk["traces"] == []

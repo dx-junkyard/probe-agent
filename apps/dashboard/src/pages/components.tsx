@@ -1,5 +1,5 @@
 import { Fragment, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   useComponents, useTraces, useUpdatePolicy,
   useComponentProfile, useUpdateComponentProfile,
@@ -16,8 +16,10 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { toast } from "sonner";
 import { formatTimestamp } from "@/lib/utils";
 import { cn } from "@/lib/utils";
+import { Bot } from "lucide-react";
 import { AddToWorkspaceButton } from "@/components/add-to-workspace";
 import { JsonTree } from "@/components/json-tree";
+import { ReplayabilityBadge, ReplayRowActions } from "@/components/replay-row-actions";
 
 const MODES = ["off", "trace", "shadow"] as const;
 const EVALUATIONS = ["unknown", "better", "worse", "same"];
@@ -27,15 +29,21 @@ const MODE_VARIANT: Record<string, "secondary" | "success" | "warning"> = {
 };
 
 export default function ComponentsPage() {
+  const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const { data: components, isLoading } = useComponents(SIGNAL_REFRESH_INTERVAL_MS);
   // Deep link from Trace Lineage / analyzer results: /components?component=<id>
   const [selected, setSelected] = useState<string | null>(
     searchParams.get("component"),
   );
-  const [expandedTraceId, setExpandedTraceId] = useState<string | null>(null);
+  const requestedTraceId = searchParams.get("trace");
+  const [expandedTraceId, setExpandedTraceId] = useState<string | null>(requestedTraceId);
   const updatePolicy = useUpdatePolicy();
-  const { data: traces } = useTraces(selected, 20, SIGNAL_REFRESH_INTERVAL_MS);
+  const { data: traces } = useTraces(
+    selected,
+    requestedTraceId ? 500 : 20,
+    SIGNAL_REFRESH_INTERVAL_MS,
+  );
   const { data: profile } = useComponentProfile(selected);
   const updateProfile = useUpdateComponentProfile();
   const { data: shadows } = useShadowResults(selected, 20);
@@ -105,6 +113,14 @@ export default function ComponentsPage() {
               <h2 className="text-lg font-bold font-mono">{selected}</h2>
               <div className="flex items-center gap-2">
                 <AddToWorkspaceButton itemType="component" itemId={selected} label={selected} />
+                <Button
+                  size="sm"
+                  variant="outline"
+                  title="Start an AI Candidate Studio session for this component"
+                  onClick={() => navigate(`/candidate-studio?component_id=${encodeURIComponent(selected)}`)}
+                >
+                  <Bot className="h-4 w-4 mr-1" /> AIで別バージョンを作る
+                </Button>
                 {MODES.map(m => (
                   <Button
                     key={m}
@@ -141,6 +157,7 @@ export default function ComponentsPage() {
                               <th className="pb-2 font-medium text-muted-foreground">Mode</th>
                               <th className="pb-2 font-medium text-muted-foreground">Duration</th>
                               <th className="pb-2 font-medium text-muted-foreground">Status</th>
+                              <th className="pb-2 font-medium text-muted-foreground">Replay</th>
                               <th className="pb-2 font-medium text-muted-foreground text-right">Time</th>
                             </tr>
                           </thead>
@@ -149,7 +166,12 @@ export default function ComponentsPage() {
                               const expanded = expandedTraceId === t.trace_id;
                               return (
                                 <Fragment key={t.trace_id}>
-                                  <tr className="border-b last:border-0">
+                                  <tr
+                                    className={cn(
+                                      "border-b last:border-0",
+                                      requestedTraceId === t.trace_id && "bg-amber-50 dark:bg-amber-950/20",
+                                    )}
+                                  >
                                     <td className="py-2 font-mono text-xs">
                                       <button
                                         type="button"
@@ -167,13 +189,26 @@ export default function ComponentsPage() {
                                     <td className="py-2">
                                       {t.error ? <Badge variant="destructive">error</Badge> : <Badge variant="success">ok</Badge>}
                                     </td>
+                                    <td className="py-2">
+                                      <ReplayabilityBadge replayability={t.replayability} reasons={t.replay_reasons} />
+                                    </td>
                                     <td className="py-2 text-right text-xs text-muted-foreground">{formatTimestamp(t.timestamp)}</td>
                                   </tr>
                                   {expanded && (
                                     <tr key={`${t.trace_id}-details`} className="border-b bg-muted/20">
-                                      <td colSpan={5} className="p-4">
-                                        <div className="mb-3 text-xs text-muted-foreground">
-                                          Full trace ID: <span className="font-mono text-foreground">{t.trace_id}</span>
+                                      <td colSpan={6} className="p-4">
+                                        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                                          <span className="text-xs text-muted-foreground">
+                                            Full trace ID: <span className="font-mono text-foreground">{t.trace_id}</span>
+                                          </span>
+                                          <div className="flex items-center gap-1 flex-wrap">
+                                            <ReplayRowActions componentId={selected} traceId={t.trace_id} />
+                                            <AddToWorkspaceButton
+                                              itemType="trace"
+                                              itemId={t.trace_id}
+                                              label={`Trace ${t.trace_id.slice(0, 12)} (${selected})`}
+                                            />
+                                          </div>
                                         </div>
                                         <div className="grid gap-4 lg:grid-cols-2">
                                           <div className="min-w-0">

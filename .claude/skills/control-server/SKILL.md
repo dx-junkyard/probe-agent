@@ -40,6 +40,48 @@ mapping, planning, and interpretation must call a reasoning model through the
 provider-neutral LLM layer. Do not reuse `app/evaluator.py` as a heuristic
 fallback for intelligence work.
 
+## Shared state-fact retrieval layer (issue #236)
+
+- `app/state_facts.py` is the single home for raw, System-scoped DB reads
+  used to derive user-facing state: repository configuration, HEAD / working
+  tree state (via `git_ops`), ready/latest snapshot lookup, pipeline step
+  rows (`intelligence_runs` / `system_understanding_build_steps` /
+  `code_entrypoints` / `understanding_graph_snapshots` / `code_symbols`
+  presence), the Purpose/Capabilities base facts
+  (`purpose_defined_in_snapshot`, `capability_count_in_snapshot`), build-job
+  running/stuck detection, and SDK connectivity counts +
+  `classify_connectivity_state`. Every function is a pure `(conn, ...) ->
+  value` reader; it never builds a `StateItem` / `PipelineStep` / API
+  response and never calls a reasoning model (Principle 6). `system_state.py`
+  (`StateItem` construction, `evaluate_understanding` and its baseline/diff
+  orchestration), `system_understanding_service.py` (`PipelineStep` /
+  `NextAction` / `StageStatus` construction), and
+  `routes/connectivity.py` all read facts from here instead of writing their
+  own SQL. When adding a new fact these three surfaces would otherwise want
+  independently, add the getter to `state_facts.py` first.
+- `system_state.evaluate_understanding` (System Purpose / Core Capabilities
+  baseline-reuse and diff-impact) stays the canonical orchestrator in
+  `system_state.py` per the System State Assessment section below; it now
+  calls `state_facts.purpose_defined_in_snapshot` /
+  `state_facts.capability_count_in_snapshot` for its per-snapshot base
+  facts. `system_understanding_service._build_next_actions` /
+  `_derive_stage_statuses` take a `purpose_defined: bool` (not the purpose
+  dict) computed once in `get_system_understanding` via
+  `_purpose_defined_from_understanding_status(evaluate_understanding(...))`
+  -- a reduction of the 5-way `UnderstandingStatus.kind` to a bool where only
+  `satisfied_current` is `True` (matching the pre-#236 local formula's
+  actual behavior; see `tests/test_state_facts.py`'s
+  `TestPurposeDefinedReductionEquivalence` for the equivalence proof and its
+  one documented narrow edge case). Do not reintroduce a second local
+  purpose-definedness formula in `system_understanding_service.py` --
+  compute it via `evaluate_understanding` and the reduction helper.
+- Tests: `tests/test_state_facts.py` covers each getter directly plus System
+  isolation; regression coverage for the three consuming APIs across
+  representative scenarios (unconfigured / snapshot only / pipeline
+  complete / connectivity with traces) lives in each API's own existing test
+  file (`test_system_state.py`, `test_system_understanding.py`,
+  `test_connectivity.py`).
+
 ## System State Assessment (issue #193)
 
 - `GET /system-state` (`app/system_state.py`, `routes/system_state.py`)
@@ -82,10 +124,123 @@ fallback for intelligence work.
   さい" used for not-yet-run/failed/blocked steps — the build already ran.
 - `GET /system-diagnostics` stays backward compatible; it is a projection
   built on top of `system_state.py`, not replaced by it.
-- Later phases (not yet implemented): projecting `next_actions` and
-  Dashboard page callouts/toasts from the same state items, and covering
-  the `runtime` / `proposal` / `interview` (beyond the one stale-snapshot
-  item) state groups.
+- Later phases: Dashboard page callouts/toasts sourced from the same state
+  items (not yet implemented), and covering more of the `runtime` /
+  `proposal` / `interview` state groups beyond the representative items
+  Issue #237 and Issue #238 added. `next_actions` projection is done -- see
+  the Issue #238 bullet below.
+- **`user_phase` (Issue #237)**: `GET /system-state` also returns
+  `user_phase` (`setup | preparation | diagnosis`) and `phases` (each
+  phase's completion condition). `system_state.derive_user_phase(facts:
+  UserPhaseFacts) -> UserPhaseResult` is a pure, DB-free function --
+  `build_system_state` gathers `UserPhaseFacts` from `state_facts` (plus
+  two new getters, `count_approved_probe_plans` /
+  `count_undecided_completed_experiments`) and from
+  `system_diagnostics.run_system_diagnostics`'s checks, filtered to
+  categories `repository | database | auth | llm`
+  (`SETUP_DIAGNOSTIC_CATEGORIES`) for the setup gate. Current phase = the
+  first phase (in `PHASE_ORDER`) whose completion condition is unmet;
+  `UserPhaseFacts` defaults are all "not yet satisfied" so an unknown fact
+  never advances the phase. Every `StateItem` carries a `phase` field:
+  `system_state.STATE_GROUP_PHASE` is the default `state_group -> phase`
+  mapping, and `STATE_ID_PHASE_OVERRIDES` is a small explicit per-`state_id`
+  exception list (e.g. `runtime.connectivity.no_signal` tags `preparation`,
+  not the `runtime` group default, because SDK connectivity is one of the
+  two OR'd preparation-completion signals). Phase suppression applies to
+  every notification projection -- `primary_item`, `notification_items`,
+  and `page_items` all exclude items whose phase is later than the current
+  `user_phase` (phase scope is the outermost criterion of the fixed
+  priority order); `items` keeps everything for audit. Note that
+  `LLM_PROVIDER=mock` pins `intelligence_llm_config` to `blocked` and thus
+  `user_phase` to `setup` -- tests that assert later-phase items in
+  `page_items` must configure a real reasoning provider via env (see
+  `TestUserPhaseIntegration._configure_reasoning_llm`). Two new
+  representative items exercise the previously-unused `runtime`/`proposal`
+  groups: `runtime.connectivity.no_signal` (preparation-tagged) and
+  `proposal.experiments.undecided` (diagnosis-tagged, completed experiments
+  with `human_decision = 'undecided'`). Tests: `TestDeriveUserPhase` /
+  `TestPhaseTagging` in `tests/test_system_state.py` (pure-function boundary
+  cases) plus `state_facts.count_approved_probe_plans` /
+  `count_undecided_completed_experiments` coverage (including System
+  isolation) in `tests/test_state_facts.py`.
+- **`primary_item` absorbs `primary_action` (Issue #238, removal completed
+  in #239)**: `select_primary_item` is the canonical "what should the user
+  do next" derivation. `system_understanding_service._derive_primary_action`
+  / `_build_next_actions` and the `primary_action` / `next_actions` /
+  `understanding_refresh_recommended` fields on `GET
+  /repository/system-understanding` were removed in Issue #239 (the
+  Dashboard consumption switch happened in the same commit;
+  `_check_understanding_refresh_recommended` survives only as the source of
+  the `interview.materialized.rebuild_required` state item). Do not
+  reintroduce these fields; read `primary_item` / `page_items` from
+  `GET /system-state` instead. Two new
+  native `state_group="pipeline"` items close a gap the pipeline-step
+  factors weren't fully covered by: `pipeline.docs_code_reconcile.not_run` /
+  `.partial` (mirrors `system_understanding_service._check_docs_code_reconciled`'s
+  "has an understanding graph AND has code symbols" condition -- the
+  pre-existing `diagnostic.pipeline_understanding_graph` diagnostic check
+  only tests graph presence, so it already covers
+  `documentation_claims_scanned` but not the code-symbols half of
+  `docs_code_reconciled`, hence no separate native item for the former).
+  Two new `state_group="proposal"` items close the probe-plan-review gap:
+  `proposal.probe_plans.proposed` (count of `status = 'proposed'` plans,
+  `phase="preparation"` override -- reviewing/approving one is how a user
+  reaches the approved-plan half of `derive_user_phase`'s instrumentation-path
+  OR condition, same rationale as `runtime.connectivity.no_signal`'s
+  override) and `proposal.probe_plans.approved_without_patch` (count of
+  approved plans whose latest patch has not passed both `baseline` and
+  `probed` validation, default `phase="diagnosis"` since an approved plan
+  already satisfies that OR condition regardless of patch status). The
+  "has this plan's patch been validated" check moved from
+  `system_understanding_service._plan_has_validated_patch` to
+  `state_facts.plan_has_validated_patch` (plus new
+  `state_facts.count_proposed_probe_plans` /
+  `count_approved_probe_plans_without_validated_patch`) so both surfaces
+  share one query. No `StateItem` was added for the terminal "everything
+  satisfied, explore from here" `next_actions` fallback (`Start from
+  Capability` / `Start from Feature` / `Open Flow Explorer`):
+  `select_primary_item` only ever selects `severity != "ok"` items, so a
+  fully-satisfied system correctly yields `primary_item = None` there
+  instead of a decorative nudge -- an intentional divergence from the old
+  field's behavior, not a gap. A second intentional divergence: the old
+  `_derive_primary_action` rule 2 unconditionally blanks `primary_action`
+  while any build is queued/running, regardless of cause; the new model has
+  no equivalent blanket rule -- only the pipeline step(s) an active build is
+  actually processing become `user_action_kind="wait"` (excluded from
+  `select_primary_item` candidacy), so an unrelated outstanding item (e.g. a
+  probe plan awaiting review) is not suppressed just because a System
+  Understanding build happens to be running concurrently. Contract tests
+  pinning old/new agreement for the representative cases where they are
+  expected to agree (repository unconfigured, snapshot not ready, a single
+  incomplete pipeline step, purpose undefined, proposed/approved-without-patch
+  probe plans, a genuinely idle active build) plus both intentional
+  divergences and the `understanding_refresh_recommended` ==
+  `interview.materialized.rebuild_required`-presence equivalence live in
+  `tests/test_next_step_parity.py`.
+- **Message catalog (Issue #240)**: all user-facing state copy (summary /
+  detail / impact / remediation / action_label, pipeline-step / stage
+  display names, gap titles / next-actions, the Hub success summary) lives
+  in one server-side catalog, `app/state_messages.py`, and the display
+  language is Japanese. `system_state.py`, `system_diagnostics.py`, and
+  `system_understanding_service.py` look copy up from the catalog by
+  `state_id` / `check_id` (+ variant) instead of holding f-strings.
+  Accessors (`state_message`, `pipeline_family_message`,
+  `understanding_message`, `check_title`, `check_message`,
+  `shared_check_message`, `stage_message`, `pipeline_step_detail`,
+  `gap_title`, `gap_note`, `pipeline_not_run_remediation`, `success_summary`)
+  raise `KeyError` on a missing key -- never a silent English/blank fallback
+  (`phase_label` is the one deliberate exception: it returns the raw token
+  for a server-validated enum). **When you add a new `StateItem` /
+  `DiagnosticCheck` / pipeline step / stage, add its catalog key in the same
+  change** -- `tests/test_state_messages.py` fails otherwise (it verifies
+  every `ALL_*` key resolves, drives the real `run_system_diagnostics` /
+  `build_system_state` producers asserting every emitted id resolves to
+  Japanese, and snapshots representative strings). Dynamic content stays
+  limited to finite facts (counts, snapshot ids, raw upstream status/error)
+  interpolated as named `str.format` params; no reasoning model authors
+  copy. Dashboard consumes server copy (stage `label`/`description`,
+  `SystemUnderstandingOut.success_summary`, `user_phase` labels, gap
+  actions) and keeps its local label maps only as a last-resort fallback.
 
 ## System settings diagnostics (issue #101)
 
@@ -498,6 +653,56 @@ heuristic result.
   `superseded`): a completed reconcile sets `active` (all exact) or `stale`
   (any non-exact); archive/restore are manual. Lifecycle events are
   append-only rows in `probe_pattern_events`.
+
+## Replay / Simulation (issue #242)
+
+- Modules: `app/replay_harness.py` (the standalone worktree harness SCRIPT +
+  `write_harness_files` / `run_inline_candidate`; `REPLAY_HARNESS_VERSION`),
+  `app/replay_runner.py` (worktree lifecycle, `_run_command` sandbox reuse,
+  deterministic input restoration + baseline-vs-recorded comparison),
+  `app/replay_variants.py` (baseline-replay-vs-candidate-replay finite
+  classification), `app/replay_draft.py` (LLM candidate draft →
+  deterministic git-diff), `app/comparison.py` (the shared `field_equal` /
+  `value_equal` / `diff_fields` extracted from `trace_analyzer.py`; #150's
+  `test_shadow_diff.py` must stay green). Routes in `app/routes/replay.py`.
+- Tables (System-scoped, cascade FKs, additive CREATE-only): `replay_sets`,
+  `replay_runs`, `replay_case_results` (#244), `replay_variants`,
+  `replay_variant_case_results`, `replay_variant_drafts` (#245), plus
+  `replay_approvals` (the approval gate) and
+  `replay_regression_scaffolds` (review-only #246 reasoning drafts).
+  `traces` gained additive
+  `input_capture_json` / `replayability` / `replay_reasons_json` columns
+  (#243).
+- The replay approval gate is a human `decision_method: manual` record;
+  `POST /replay-runs` / `POST /replay-variant-runs` return 403 without an
+  active (non-revoked) approval. Risk context shown at approval time reuses
+  persisted probe-plan `side_effect_risk` / `replayability` labels (display
+  only — no new reasoning run) plus the fixed Principle-4 warning.
+- Replay routes are management-plane APIs and require a user session. SDK API
+  tokens remain data-plane only and must not read source, create Replay Sets,
+  draft patches, or trigger replay execution.
+- Execution goes through `validation_runner._run_command` so network-off /
+  env-allowlist / no-sandbox fail-closed are inherited unchanged;
+  `PROBE_ENABLED=false` + `PYTHONHASHSEED=0` are injected; worktrees are
+  always cleaned up. Comparison and classification are finite sets only
+  (Principle 6); LLM candidate drafts / interpretations are `reasoning_llm`,
+  fail-closed, `is_mock` surfaced, with raw deterministic results kept
+  separate (drafts store provenance via an `intelligence_runs` row).
+- The standalone harness resolves a symbol using its real package-qualified
+  module name when the snapshot path is inside a Python package, so ordinary
+  relative imports keep working inside the isolated pinned worktree.
+- Recorded-error traces ARE executed against candidates on this offline side
+  (`error_to_success` etc.); the live SDK shadow asymmetry is unchanged.
+- Phase D adds only two DETERMINISTIC endpoints (no judgement):
+  `GET /replay-sets/{id}/source` and `POST /replay-source-diff` — both read
+  the pinned snapshot only (Principle 5), never the working tree.
+- `POST /replay-regression-scaffolds` is the separate `reasoning_llm`
+  boundary: it accepts only a completed/applied variant case, persists both
+  success and failure provenance in `intelligence_runs`, stores review-only
+  generated text separately, and never writes to the target repository.
+- New env vars: `PROBE_REPLAY_WORKSPACE_BASE`, `PROBE_REPLAY_TIMEOUT_SECONDS`
+  (server); `PROBE_REPLAY_CAPTURE_MAX_BYTES` (SDK). See the Issue #242
+  section of `docs/project-intelligence.md`.
 
 ## Rules
 

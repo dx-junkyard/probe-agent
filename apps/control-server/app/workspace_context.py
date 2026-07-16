@@ -52,7 +52,11 @@ MAX_CONTEXT_CHARS = int(os.getenv("WORKSPACE_CONTEXT_MAX_CHARS", "50000"))
 _SENSITIVE_VALUE_PATTERNS = [
     re.compile(
         r'(?i)(["\']?(?:api[_-]?key|access[_-]?token|password|passwd|secret)'
-        r'["\']?\s*[:=]\s*["\']?)([^"\'\s,}]+)'
+        # Stored trace inputs often contain repr strings inside JSON, e.g.
+        # ``"api_key": "'value'"``.  Consume both quote layers before the
+        # sensitive value so the existing context redaction policy covers that
+        # representation too.
+        r'["\']?\s*[:=]\s*["\']*)([^"\'\s,}]+)'
     ),
     re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)([^\s,\"'}]+)"),
 ]

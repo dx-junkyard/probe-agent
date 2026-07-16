@@ -1,7 +1,7 @@
 /// <reference types="vitest/globals" />
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, MemoryRouter } from "react-router-dom";
+import { BrowserRouter, MemoryRouter, Routes, Route } from "react-router-dom";
 import { vi } from "vitest";
 import type { ReactNode } from "react";
 import type { SystemStateItem } from "@/api/types";
@@ -3011,7 +3011,6 @@ describe("System Understanding page", () => {
     gaps: [],
     gap_summary: [],
     metadata_coverage: null,
-    next_actions: [{ action: "Configure repository", reason: "No repository configured", category: "understand", link: "/repository" }],
   };
 
   const gapWorklistResponse = {
@@ -3045,8 +3044,8 @@ describe("System Understanding page", () => {
         entrypoint_refs: [{ entrypoint_type: "http_route", entrypoint_ref: "GET:/items" }],
         code_refs: [],
         next_actions: [
-          { action: "Open Interview", link: "/interview" },
-          { action: "Add source metadata", link: "/interview" },
+          { action: "Interview を開く", link: "/interview" },
+          { action: "ソースメタデータを追加", link: "/interview" },
         ],
       },
       {
@@ -3061,8 +3060,8 @@ describe("System Understanding page", () => {
         entrypoint_refs: [],
         code_refs: [],
         next_actions: [
-          { action: "Open docs evidence", link: null },
-          { action: "Create implementation issue", link: null },
+          { action: "ドキュメントの根拠を確認", link: null },
+          { action: "実装 issue を作成", link: null },
         ],
       },
     ],
@@ -3071,12 +3070,6 @@ describe("System Understanding page", () => {
       { gap_type: "docs_only", count: 1 },
     ],
     metadata_coverage: { symbol_count: 42, symbols_with_source_metadata: 5, entrypoint_count: 10, entrypoints_with_capability_link: 3 },
-    next_actions: [
-      { action: "Review docs-code gaps", reason: "2 gaps found", category: "understand", link: "/system-understanding" },
-      { action: "Review probe plan", reason: "Probe plan #7 is awaiting review", category: "observe", link: "/probe-planner?plan=7" },
-      { action: "Generate / validate probe patch", reason: "Approved probe plan #8 has no validated patch yet", category: "instrument", link: "/probe-planner?plan=8" },
-      { action: "Review experiment decision", reason: "Experiment #9 completed but has no recorded decision", category: "evaluate", link: "/experiments" },
-    ],
   };
 
   const completeResponse = {
@@ -3106,7 +3099,6 @@ describe("System Understanding page", () => {
     gaps: [],
     gap_summary: [],
     metadata_coverage: { symbol_count: 42, symbols_with_source_metadata: 5, entrypoint_count: 10, entrypoints_with_capability_link: 3 },
-    next_actions: [],
   };
 
   const blockedResponse = {
@@ -3123,9 +3115,6 @@ describe("System Understanding page", () => {
       { step: "docs_code_reconciled", status: "missing" },
       { step: "capability_hierarchy_ready", status: "missing", detail: "Reasoning model required" },
     ],
-    next_actions: [
-      { action: "Configure reasoning model", reason: "Required for documentation and capability analysis", category: "understand", link: null },
-    ],
   };
 
   const gapResponse = {
@@ -3136,7 +3125,7 @@ describe("System Understanding page", () => {
         node_name: "Feature X", notes: null, capability_key: null,
         doc_refs: [{ path: "README.md", start_line: 1, end_line: 5 }],
         symbol_refs: [], entrypoint_refs: [], code_refs: [],
-        next_actions: [{ action: "Open docs evidence", link: null }],
+        next_actions: [{ action: "ドキュメントの根拠を確認", link: null }],
       },
     ],
     gap_summary: [
@@ -3165,12 +3154,44 @@ describe("System Understanding page", () => {
     expect(screen.queryByText("Get started with System Understanding")).toBeNull();
   });
 
+  // Issue #239/#240: `repository.configuration.missing` now carries
+  // `related_pipeline_steps: ["repository_configured"]`, so its CTA is
+  // driven by the matching SystemStateItem like every other step -- there is
+  // no hardcoded fallback map.
+  const repositoryMissingItem: SystemStateItem = {
+    state_id: "repository.configuration.missing",
+    state_group: "repository",
+    severity: "warning",
+    status: "missing",
+    user_action_kind: "configure",
+    intervention_timing: "now",
+    subject: "リポジトリ設定",
+    summary: "対象リポジトリが未設定です。",
+    detail: "対象リポジトリが未設定です。",
+    impact: "",
+    remediation: "Repository タブでリポジトリを設定してください。",
+    evidence: {},
+    target_ui: { route: "/repository", anchor: "repo-config", action_label: "Configure repository" },
+    related_checks: [],
+    related_pipeline_steps: ["repository_configured"],
+    source: "system_state",
+    dedupe_key: "repository.configuration",
+    scope: "global",
+    decision_method: "deterministic",
+    phase: "setup",
+  };
+
   test("shows a CTA only on the first incomplete step when the pipeline is all missing", async () => {
-    mockApi.get.mockImplementation((path: string) =>
-      path === "/repository/system-understanding"
-        ? Promise.resolve(emptyResponse)
-        : Promise.resolve(null),
-    );
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(emptyResponse);
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "warning",
+        severity_counts: { warning: 1 }, items: [repositoryMissingItem],
+        primary_item: repositoryMissingItem, notification_items: [repositoryMissingItem],
+        page_items: { "/system-understanding": [repositoryMissingItem] },
+      });
+      return Promise.resolve(null);
+    });
 
     const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
@@ -3180,8 +3201,8 @@ describe("System Understanding page", () => {
     });
 
     const cta = screen.getByTestId("pipeline-cta-repository_configured");
-    expect(cta.textContent).toContain("Configure repository");
-    expect(cta.getAttribute("href")).toBe("/repository");
+    expect(cta.textContent).toContain(repositoryMissingItem.target_ui!.action_label!);
+    expect(cta.getAttribute("href")).toBe("/repository?fix=repo-config");
 
     // No other step gets a CTA.
     expect(screen.queryByTestId("pipeline-cta-snapshot_ready")).toBeNull();
@@ -3206,11 +3227,38 @@ describe("System Understanding page", () => {
         { step: "capability_hierarchy_ready", status: "missing" },
       ],
     };
-    mockApi.get.mockImplementation((path: string) =>
-      path === "/repository/system-understanding"
-        ? Promise.resolve(midResponse)
-        : Promise.resolve(null),
-    );
+    const buildAvailableItem: SystemStateItem = {
+      state_id: "pipeline.documentation_indexed.missing",
+      state_group: "pipeline",
+      severity: "warning",
+      status: "missing",
+      user_action_kind: "build",
+      intervention_timing: "now",
+      subject: "Documentation indexed",
+      summary: "Documentation がまだ index されていません。",
+      detail: "",
+      impact: "",
+      remediation: "Build / Refresh を実行してください。",
+      evidence: {},
+      target_ui: { route: "/system-understanding", anchor: null, action_label: "Run Build / Refresh" },
+      related_checks: [],
+      related_pipeline_steps: ["documentation_indexed"],
+      source: "system_state",
+      dedupe_key: "pipeline.documentation_indexed",
+      scope: "global",
+      decision_method: "deterministic",
+      phase: "preparation",
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(midResponse);
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "warning",
+        severity_counts: { warning: 1 }, items: [buildAvailableItem],
+        primary_item: buildAvailableItem, notification_items: [buildAvailableItem],
+        page_items: { "/system-understanding": [buildAvailableItem] },
+      });
+      return Promise.resolve(null);
+    });
     mockApi.post.mockImplementation((path: string) =>
       path === "/repository/system-understanding/build"
         ? Promise.resolve(completeResponse)
@@ -3251,6 +3299,28 @@ describe("System Understanding page", () => {
         { step: "capability_hierarchy_ready", status: "missing" },
       ],
     };
+    const buildAvailableItem: SystemStateItem = {
+      state_id: "pipeline.documentation_indexed.missing",
+      state_group: "pipeline",
+      severity: "warning",
+      status: "missing",
+      user_action_kind: "build",
+      intervention_timing: "now",
+      subject: "Documentation indexed",
+      summary: "Documentation がまだ index されていません。",
+      detail: "",
+      impact: "",
+      remediation: "Build / Refresh を実行してください。",
+      evidence: {},
+      target_ui: { route: "/system-understanding", anchor: null, action_label: "Run Build / Refresh" },
+      related_checks: [],
+      related_pipeline_steps: ["documentation_indexed"],
+      source: "system_state",
+      dedupe_key: "pipeline.documentation_indexed",
+      scope: "global",
+      decision_method: "deterministic",
+      phase: "preparation",
+    };
     mockApi.get.mockImplementation((path: string) => {
       if (path === "/repository/system-understanding") return Promise.resolve(midResponse);
       if (path === "/repository/system-understanding/build/latest") {
@@ -3264,6 +3334,12 @@ describe("System Understanding page", () => {
           artifact_counts: {},
         });
       }
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "warning",
+        severity_counts: { warning: 1 }, items: [buildAvailableItem],
+        primary_item: buildAvailableItem, notification_items: [buildAvailableItem],
+        page_items: { "/system-understanding": [buildAvailableItem] },
+      });
       return Promise.resolve(null);
     });
 
@@ -3297,6 +3373,32 @@ describe("System Understanding page", () => {
     expect(screen.getByText("list_items")).toBeTruthy();
     expect(screen.getByText("42")).toBeTruthy();
     expect(screen.getByText("10")).toBeTruthy();
+  });
+
+  test("prefers the server-provided pipeline step label over the client fallback map (Issue #240)", async () => {
+    // One step carries a server `label`; the rest omit it, proving the
+    // client-side STEP_LABELS map still covers steps an older server
+    // doesn't label yet.
+    const labeledResponse = {
+      ...completeResponse,
+      pipeline: completeResponse.pipeline.map((s) =>
+        s.step === "symbols_indexed" ? { ...s, label: "コードシンボル索引" } : s,
+      ),
+    };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(labeledResponse)
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByTestId("pipeline-expand"));
+    const checklist = await screen.findByTestId("pipeline-checklist");
+    expect(checklist.textContent).toContain("コードシンボル索引");
+    // A step without a server label still falls back to STEP_LABELS.
+    expect(checklist.textContent).toContain("Snapshot ready");
   });
 
   test("renders reasoning model blocked state without heuristic fallback", async () => {
@@ -3353,14 +3455,28 @@ describe("System Understanding page", () => {
       expect(screen.getByTestId("gap-worklist")).toBeTruthy();
     });
 
-    expect(screen.getByText("Open Interview")).toBeTruthy();
-    expect(screen.getByText("Open docs evidence")).toBeTruthy();
+    expect(screen.getByText("Interview を開く")).toBeTruthy();
+    expect(screen.getByText("ドキュメントの根拠を確認")).toBeTruthy();
   });
 
-  test("renders category badges for probe plan and experiment next actions", async () => {
+  test("ignores legacy next-step fields from an old server response (Issue #239 removal contract)", async () => {
+    // A response that still carries the removed fields (e.g. an older
+    // Control Server): the UI must not resurrect any of the legacy
+    // projections from them -- no per-stage Next Actions list, no
+    // primary-action card, no refresh-recommended banner. The canonical
+    // next-step surface is the SystemStateBanner fed by /system-state,
+    // which is absent here, so no next-step CTA of any kind renders.
+    const legacyResponse = {
+      ...gapWorklistResponse,
+      next_actions: [
+        { action: "Review probe plan", reason: "Probe plan #7 is awaiting review", category: "observe", link: "/probe-planner?plan=7" },
+      ],
+      primary_action: { action: "Review probe plan", reason: "…", category: "observe", link: "/probe-planner?plan=7" },
+      understanding_refresh_recommended: true,
+    };
     mockApi.get.mockImplementation((path: string) =>
       path === "/repository/system-understanding"
-        ? Promise.resolve(gapWorklistResponse)
+        ? Promise.resolve(legacyResponse)
         : Promise.resolve(null),
     );
 
@@ -3368,16 +3484,14 @@ describe("System Understanding page", () => {
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
 
     await waitFor(() => {
-      expect(screen.getByText("Review probe plan")).toBeTruthy();
+      expect(screen.getByTestId("stage-section-understand")).toBeTruthy();
     });
 
-    expect(screen.getByText("Generate / validate probe patch")).toBeTruthy();
-    expect(screen.getByText("Review experiment decision")).toBeTruthy();
-
-    // Issue #179: Next Actions are grouped under their stage section by category.
-    expect(screen.getByTestId("stage-next-actions-observe").textContent).toContain("observe");
-    expect(screen.getByTestId("stage-next-actions-instrument").textContent).toContain("instrument");
-    expect(screen.getByTestId("stage-next-actions-evaluate").textContent).toContain("evaluate");
+    expect(screen.queryByText("Review probe plan")).toBeNull();
+    expect(screen.queryByTestId("stage-next-actions-observe")).toBeNull();
+    expect(screen.queryByTestId("primary-action")).toBeNull();
+    expect(screen.queryByTestId("refresh-recommended-banner")).toBeNull();
+    expect(screen.queryByTestId("system-state-banner")).toBeNull();
   });
 
   test("renders the 4 hub stage sections with links to detail pages (Issue #179)", async () => {
@@ -3589,8 +3703,8 @@ describe("System Understanding page", () => {
     entrypoint_refs: [],
     code_refs: [],
     next_actions: [
-      { action: "Open docs evidence", link: null },
-      { action: "Create implementation issue", link: null },
+      { action: "ドキュメントの根拠を確認", link: null },
+      { action: "実装 issue を作成", link: null },
     ],
     source_key: "system_understanding_gap:docs_only:Auth",
     issue_drafts: [],
@@ -3715,71 +3829,99 @@ describe("System Understanding page", () => {
     expect(screen.getByText("Open issue draft")).toBeTruthy();
   });
 
-  // ── Primary action card (Issue #201) ──────────────────────────────
+  // ── Canonical page banner replaces the primary action card (Issue #239) ──
 
-  test("renders a navigate primary_action as a link button under the header", async () => {
-    const response = {
-      ...completeResponse,
-      next_actions: [
-        { action: "Define System Purpose", reason: "Pipeline completed, but no system purpose is defined yet.", category: "understand", link: "/interview" },
-      ],
-      primary_action: {
-        action: "Define System Purpose",
-        reason: "Pipeline completed, but no system purpose is defined yet.",
-        category: "understand",
-        link: "/interview",
-        action_kind: "navigate",
-      },
-    };
-    mockApi.get.mockImplementation((path: string) =>
-      path === "/repository/system-understanding"
-        ? Promise.resolve(response)
-        : Promise.resolve(null),
-    );
+  const purposeMissingItem: SystemStateItem = {
+    state_id: "understanding.purpose.missing_baseline",
+    state_group: "understanding",
+    severity: "warning",
+    status: "missing",
+    user_action_kind: "confirm",
+    intervention_timing: "before_next_step",
+    subject: "System Purpose",
+    summary: "System Purpose が未定義です。",
+    detail: "System Purpose が未定義です。確認済み・未確認いずれの baseline もありません。",
+    impact: "",
+    remediation: "Interview で System Purpose を定義・確認してください。",
+    evidence: {},
+    target_ui: { route: "/interview", anchor: "interview-purpose", action_label: "Interview でSystem Purposeを定義" },
+    display_routes: ["/system-understanding"],
+    related_checks: ["system_purpose"],
+    related_pipeline_steps: [],
+    source: "system_state",
+    dedupe_key: "",
+    scope: "global",
+    decision_method: "deterministic",
+    phase: "preparation",
+  };
+
+  test("renders a navigate-kind page item as the canonical banner with its server target", async () => {
+    window.history.pushState({}, "", "/system-understanding");
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(completeResponse);
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "warning",
+        severity_counts: { warning: 1 }, items: [purposeMissingItem],
+        primary_item: purposeMissingItem, notification_items: [purposeMissingItem],
+        page_items: { "/system-understanding": [purposeMissingItem], "/interview": [purposeMissingItem] },
+        user_phase: "preparation",
+        phases: [
+          { phase: "setup", complete: true },
+          { phase: "preparation", complete: false },
+          { phase: "diagnosis", complete: false },
+        ],
+      });
+      return Promise.resolve(null);
+    });
 
     const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
 
-    await waitFor(() => {
-      expect(screen.getByTestId("primary-action")).toBeTruthy();
-    });
+    const banner = await screen.findByTestId("system-state-banner");
+    expect(banner.textContent).toContain(purposeMissingItem.summary);
+    expect(banner.textContent).toContain(purposeMissingItem.remediation);
 
-    const card = screen.getByTestId("primary-action");
-    expect(card.textContent).toContain("Define System Purpose");
-    expect(card.textContent).toContain("Pipeline completed, but no system purpose is defined yet.");
-
-    const cta = screen.getByTestId("primary-action-cta");
-    expect(cta.getAttribute("href")).toBe("/interview");
+    const cta = screen.getByTestId("system-state-action-understanding.purpose.missing_baseline");
+    expect(cta.textContent).toBe("Interview でSystem Purposeを定義");
+    fireEvent.click(cta);
+    await waitFor(() => expect(window.location.pathname).toBe("/interview"));
+    const params = new URLSearchParams(window.location.search);
+    expect(params.get("fix")).toBe("interview-purpose");
+    expect(params.get("diagnostic")).toBe("system_purpose");
   });
 
-  test("renders a build primary_action that triggers build.mutate on click", async () => {
-    const midResponse = {
-      ...emptyResponse,
-      snapshot_id: 5,
-      commit_sha: "abc12345",
-      pipeline: [
-        { step: "repository_configured", status: "complete" },
-        { step: "snapshot_ready", status: "complete" },
-        { step: "documentation_indexed", status: "missing" },
-        { step: "documentation_claims_scanned", status: "missing" },
-        { step: "symbols_indexed", status: "missing" },
-        { step: "entrypoints_discovered", status: "missing" },
-        { step: "docs_code_reconciled", status: "missing" },
-        { step: "capability_hierarchy_ready", status: "missing" },
-      ],
-      primary_action: {
-        action: "Build system understanding",
-        reason: "6 pipeline steps not complete yet",
-        category: "understand",
-        link: null,
-        action_kind: "build",
-      },
+  test("a build-kind page item's banner action triggers build.mutate", async () => {
+    const rebuildItem: SystemStateItem = {
+      state_id: "interview.materialized.rebuild_required",
+      state_group: "interview",
+      severity: "warning",
+      status: "stale",
+      user_action_kind: "build",
+      intervention_timing: "after_build",
+      subject: "Interview materialization",
+      summary: "Interview の反映後に System Understanding の再 build が必要です。",
+      detail: "最新の Interview materialization が直近の完了済み build より新しいため、理解結果を更新する必要があります。",
+      impact: "",
+      remediation: "System Understanding で Build / Refresh を実行してください。",
+      evidence: {},
+      target_ui: { route: "/system-understanding", anchor: "build", action_label: "Build / Refresh を実行" },
+      related_checks: [],
+      related_pipeline_steps: ["capability_hierarchy_ready"],
+      source: "system_state",
+      dedupe_key: "interview.materialization.build",
+      scope: "global",
+      decision_method: "deterministic",
+      phase: "preparation",
     };
-    mockApi.get.mockImplementation((path: string) =>
-      path === "/repository/system-understanding"
-        ? Promise.resolve(midResponse)
-        : Promise.resolve(null),
-    );
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(completeResponse);
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "warning",
+        severity_counts: { warning: 1 }, items: [rebuildItem], primary_item: rebuildItem,
+        notification_items: [rebuildItem], page_items: { "/system-understanding": [rebuildItem] },
+      });
+      return Promise.resolve(null);
+    });
     mockApi.post.mockImplementation((path: string) =>
       path === "/repository/system-understanding/build"
         ? Promise.resolve(completeResponse)
@@ -3789,12 +3931,8 @@ describe("System Understanding page", () => {
     const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
 
-    await waitFor(() => {
-      expect(screen.getByTestId("primary-action")).toBeTruthy();
-    });
-
-    const cta = screen.getByTestId("primary-action-cta");
-    expect(cta.textContent).toContain("Build system understanding");
+    const cta = await screen.findByTestId("system-state-action-interview.materialized.rebuild_required");
+    expect(cta.textContent).toBe("Build / Refresh を実行");
 
     fireEvent.click(cta);
     await waitFor(() => {
@@ -3802,13 +3940,16 @@ describe("System Understanding page", () => {
     });
   });
 
-  test("hides the primary action card when primary_action is null", async () => {
-    const response = { ...completeResponse, primary_action: null };
-    mockApi.get.mockImplementation((path: string) =>
-      path === "/repository/system-understanding"
-        ? Promise.resolve(response)
-        : Promise.resolve(null),
-    );
+  test("shows no banner when system-state has no item for this page", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(completeResponse);
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "ok",
+        severity_counts: {}, items: [], primary_item: null,
+        notification_items: [], page_items: {},
+      });
+      return Promise.resolve(null);
+    });
 
     const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
@@ -3817,6 +3958,7 @@ describe("System Understanding page", () => {
       expect(screen.getByText("Test System")).toBeTruthy();
     });
 
+    expect(screen.queryByTestId("system-state-banner")).toBeNull();
     expect(screen.queryByTestId("primary-action")).toBeNull();
   });
 
@@ -3964,45 +4106,35 @@ describe("System Understanding page", () => {
     );
   });
 
-  // ── Gap trend + refresh recommendation (Issue #203) ─────────────────
+  // ── Banner behavior while a build is running (Issue #239) ───────────
+  //
+  // The removed primary_action's rule 2 blanked the CTA whenever a build was
+  // queued/running, unconditionally. The banner now shows the exact same
+  // canonical page_items[route][0]/primary_item projection as every other
+  // surface (e.g. the Pipeline Checklist) with no client-side suppression
+  // keyed on buildRunning -- an item only disappears when the server itself
+  // resolves or phase-suppresses it.
 
-  test("shows the refresh-recommended banner when understanding_refresh_recommended is true", async () => {
-    const response = { ...completeResponse, understanding_refresh_recommended: true };
-    mockApi.get.mockImplementation((path: string) =>
-      path === "/repository/system-understanding"
-        ? Promise.resolve(response)
-        : Promise.resolve(null),
-    );
+  const runningBuildResponse = {
+    id: 1, job_id: 1, run_id: 1, system_id: 1, snapshot_id: 5,
+    status: "running", current_step: "claim_scan", error: null,
+    cancel_requested: false, is_stuck: false,
+    heartbeat_at: Date.now() / 1000, started_at: Date.now() / 1000,
+    completed_at: null, created_at: Date.now() / 1000,
+    steps: [], llm_tasks: { total: 0, pending: 0, running: 0, completed: 0, failed: 0, cancelled: 0, reused: 0 },
+    artifact_counts: {},
+  };
 
-    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
-    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
-
-    await waitFor(() => {
-      expect(screen.getByTestId("refresh-recommended-banner")).toBeTruthy();
-    });
-
-    const cta = screen.getByTestId("refresh-recommended-cta");
-    fireEvent.click(cta);
-    await waitFor(() => {
-      expect(mockApi.post).toHaveBeenCalledWith("/repository/system-understanding/build");
-    });
-  });
-
-  test("hides the refresh-recommended banner while a build is running, even if recommended", async () => {
-    const response = { ...completeResponse, understanding_refresh_recommended: true };
+  test("keeps a warning-level page banner visible while a build is running", async () => {
     mockApi.get.mockImplementation((path: string) => {
-      if (path === "/repository/system-understanding") return Promise.resolve(response);
-      if (path === "/repository/system-understanding/build/latest") {
-        return Promise.resolve({
-          id: 1, job_id: 1, run_id: 1, system_id: 1, snapshot_id: 5,
-          status: "running", current_step: "claim_scan", error: null,
-          cancel_requested: false, is_stuck: false,
-          heartbeat_at: Date.now() / 1000, started_at: Date.now() / 1000,
-          completed_at: null, created_at: Date.now() / 1000,
-          steps: [], llm_tasks: { total: 0, pending: 0, running: 0, completed: 0, failed: 0, cancelled: 0, reused: 0 },
-          artifact_counts: {},
-        });
-      }
+      if (path === "/repository/system-understanding") return Promise.resolve(completeResponse);
+      if (path === "/repository/system-understanding/build/latest") return Promise.resolve(runningBuildResponse);
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "warning",
+        severity_counts: { warning: 1 }, items: [purposeMissingItem],
+        primary_item: purposeMissingItem, notification_items: [purposeMissingItem],
+        page_items: { "/system-understanding": [purposeMissingItem] },
+      });
       return Promise.resolve(null);
     });
 
@@ -4013,31 +4145,49 @@ describe("System Understanding page", () => {
       expect(screen.getByTestId("build-progress")).toBeTruthy();
     });
 
-    expect(screen.queryByTestId("refresh-recommended-banner")).toBeNull();
+    expect(screen.getByTestId("system-state-banner").textContent).toContain(purposeMissingItem.summary);
   });
 
-  test("does not show the refresh-recommended banner when understanding_refresh_recommended is false", async () => {
-    const response = { ...completeResponse, understanding_refresh_recommended: false };
-    mockApi.get.mockImplementation((path: string) =>
-      path === "/repository/system-understanding"
-        ? Promise.resolve(response)
-        : Promise.resolve(null),
-    );
+  test("keeps an error-level page banner visible while a build is running", async () => {
+    const errorItem: SystemStateItem = {
+      ...purposeMissingItem,
+      state_id: "repository.head.unreadable",
+      state_group: "repository",
+      severity: "error",
+      status: "failed",
+      user_action_kind: "configure",
+      summary: "Repository HEAD を読み取れません。",
+      remediation: "Repository のパスとアクセス権を確認してください。",
+      target_ui: { route: "/repository", anchor: "repo-config", action_label: "Repository 設定を確認" },
+      related_checks: ["repository_path"],
+      dedupe_key: "repository.head",
+      phase: "setup",
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(completeResponse);
+      if (path === "/repository/system-understanding/build/latest") return Promise.resolve(runningBuildResponse);
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "error",
+        severity_counts: { error: 1 }, items: [errorItem],
+        primary_item: errorItem, notification_items: [errorItem],
+        page_items: { "/system-understanding": [errorItem] },
+      });
+      return Promise.resolve(null);
+    });
 
     const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
 
     await waitFor(() => {
-      expect(screen.getByText("Test System")).toBeTruthy();
+      expect(screen.getByTestId("build-progress")).toBeTruthy();
     });
 
-    expect(screen.queryByTestId("refresh-recommended-banner")).toBeNull();
+    expect(screen.getByTestId("system-state-banner").textContent).toContain(errorItem.summary);
   });
 
-  // ── Canonical banner de-duplication (Issues #206-#208 review) ───────
+  // ── Canonical banner is the only rebuild-required surface (Issue #239) ──
 
-  test("suppresses the legacy refresh-recommended banner when the canonical SystemStateBanner shows the same rebuild-required cause", async () => {
-    const response = { ...completeResponse, understanding_refresh_recommended: true };
+  test("renders the rebuild-required cause once, via the canonical SystemStateBanner only", async () => {
     const rebuildItem: SystemStateItem = {
       state_id: "interview.materialized.rebuild_required",
       state_group: "interview",
@@ -4060,7 +4210,7 @@ describe("System Understanding page", () => {
       decision_method: "deterministic",
     };
     mockApi.get.mockImplementation((path: string) => {
-      if (path === "/repository/system-understanding") return Promise.resolve(response);
+      if (path === "/repository/system-understanding") return Promise.resolve(completeResponse);
       if (path === "/system-state") return Promise.resolve({
         system_id: 1, generated_at: 1, overall_severity: "warning",
         severity_counts: { warning: 1 }, items: [rebuildItem], primary_item: rebuildItem,
@@ -4072,35 +4222,16 @@ describe("System Understanding page", () => {
     const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
 
-    // The canonical banner renders the same root cause...
+    // The canonical banner renders the root cause...
     await waitFor(() => {
       expect(screen.getByTestId("system-state-banner")).toBeTruthy();
     });
     expect(screen.getByTestId("system-state-banner").textContent).toContain(rebuildItem.summary);
 
-    // ...and the legacy Issue #203 banner is suppressed so the cause is not duplicated.
+    // ...exactly once: the legacy Issue #203 banner no longer exists at all
+    // (Issue #239 removed it with the understanding_refresh_recommended field).
     expect(screen.queryByTestId("refresh-recommended-banner")).toBeNull();
-  });
-
-  test("still shows the legacy refresh-recommended banner when system-state has no matching rebuild-required item for this page", async () => {
-    const response = { ...completeResponse, understanding_refresh_recommended: true };
-    mockApi.get.mockImplementation((path: string) => {
-      if (path === "/repository/system-understanding") return Promise.resolve(response);
-      if (path === "/system-state") return Promise.resolve({
-        system_id: 1, generated_at: 1, overall_severity: "ok",
-        severity_counts: {}, items: [], primary_item: null,
-        notification_items: [], page_items: {},
-      });
-      return Promise.resolve(null);
-    });
-
-    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
-    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
-
-    await waitFor(() => {
-      expect(screen.getByTestId("refresh-recommended-banner")).toBeTruthy();
-    });
-    expect(screen.queryByTestId("system-state-banner")).toBeNull();
+    expect(screen.getAllByText(rebuildItem.summary)).toHaveLength(1);
   });
 
   test("shows the capability-empty canonical guidance on System Understanding and keeps its Interview CTA", async () => {
@@ -4492,47 +4623,176 @@ describe("System settings diagnostics", () => {
     ],
   };
 
-  test("badge shows attention count and opens detail dialog with remediation and last error", async () => {
-    mockApi.get.mockImplementation((path: string) =>
-      path === "/system-diagnostics"
-        ? Promise.resolve(diagnosticsResponse)
-        : Promise.resolve(null),
+  // Issue #239: the badge consumes GET /system-state only. Diagnostic checks
+  // reach it as server-projected `diagnostic.<check_id>` StateItems; the
+  // `/system-diagnostics` response is consulted solely to open the env-fix
+  // dialog for a dialog-kind check referenced by `related_checks`.
+
+  const projectedStateItem = (
+    overrides: Partial<SystemStateItem> & Pick<SystemStateItem, "state_id" | "severity" | "summary">,
+  ): SystemStateItem => ({
+    state_group: "configuration",
+    status: "missing",
+    user_action_kind: "inspect",
+    intervention_timing: "before_next_step",
+    subject: overrides.summary,
+    detail: overrides.summary,
+    impact: "",
+    remediation: "",
+    evidence: {},
+    target_ui: null,
+    related_checks: [],
+    related_pipeline_steps: [],
+    source: "system_diagnostics",
+    dedupe_key: `diagnostic.${overrides.state_id}`,
+    scope: "global",
+    decision_method: "deterministic",
+    ...overrides,
+  });
+
+  const llmItem = projectedStateItem({
+    state_id: "diagnostic.intelligence_llm_config",
+    severity: "error",
+    summary: "Intelligence reasoning model configuration",
+    remediation: "Set INTELLIGENCE_LLM_PROVIDER and INTELLIGENCE_LLM_MODEL to a reasoning-capable pair.",
+    user_action_kind: "configure",
+    evidence: { diagnostic_category: "llm", fix_kind: "dialog" },
+    related_checks: ["intelligence_llm_config"],
+    dedupe_key: "diagnostic.intelligence_llm_config",
+  });
+  const snapshotItem = projectedStateItem({
+    state_id: "diagnostic.snapshot_status",
+    severity: "warning",
+    summary: "Ready repository snapshot",
+    remediation: "Review the include/exclude patterns in the Repository tab.",
+    target_ui: { route: "/repository", anchor: "repo-patterns", action_label: "「Ready repository snapshot」を修正" },
+    related_checks: ["snapshot_status"],
+    dedupe_key: "diagnostic.snapshot_status",
+  });
+  const docIndexItem = projectedStateItem({
+    state_id: "diagnostic.pipeline_documentation_index",
+    severity: "warning",
+    summary: "Documentation index build step",
+    remediation: "Run Build / Refresh in System Understanding to index documentation chunks.",
+    target_ui: { route: "/system-understanding", anchor: "build", action_label: "「Documentation index build step」を修正" },
+    related_checks: ["pipeline_documentation_index"],
+    dedupe_key: "diagnostic.pipeline_documentation_index",
+  });
+
+  const stateResponse = (items: SystemStateItem[]) => {
+    const notificationItems = items.filter(
+      (i) => ["error", "blocked", "warning"].includes(i.severity) && i.scope === "global",
     );
+    return {
+      system_id: 1,
+      generated_at: 1,
+      overall_severity: items.some((i) => i.severity === "error") ? "error"
+        : items.some((i) => i.severity === "warning") ? "warning" : "ok",
+      severity_counts: {},
+      items,
+      primary_item: notificationItems[0] ?? null,
+      notification_items: notificationItems,
+      page_items: {},
+    };
+  };
+
+  test("badge shows attention count from canonical notification items and opens the item dialog", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-state") return Promise.resolve(stateResponse([llmItem, snapshotItem, docIndexItem]));
+      if (path === "/system-diagnostics") return Promise.resolve(diagnosticsResponse);
+      return Promise.resolve(null);
+    });
 
     const { DiagnosticsBadge } = await import("@/components/diagnostics-badge");
     render(<DiagnosticsBadge />, { wrapper: createWrapper() });
 
     const badge = await screen.findByTestId("diagnostics-badge");
-    // error(1) + warning(2) = 3
+    // error(1) + warning(2) = 3 deduped canonical notifications.
     expect(screen.getByTestId("diagnostics-badge-count").textContent).toBe("3");
 
     fireEvent.click(badge);
 
     await waitFor(() => {
-      expect(screen.getByText("System Settings Diagnostics")).toBeTruthy();
+      expect(screen.getByText("System State")).toBeTruthy();
     });
 
-    // Problems are listed with detail, impact, remediation, related env.
-    expect(screen.getByText(/INTELLIGENCE_LLM_PROVIDER is empty/)).toBeTruthy();
+    // Items render the server's summary and remediation verbatim.
+    expect(screen.getByText("Intelligence reasoning model configuration")).toBeTruthy();
     expect(
       screen.getByText(/Set INTELLIGENCE_LLM_PROVIDER and INTELLIGENCE_LLM_MODEL/),
     ).toBeTruthy();
-    // Last observed runtime failure is shown verbatim.
-    const lastError = screen.getByTestId("diagnostic-last-error");
-    expect(lastError.textContent).toContain("HTTP 401: invalid api key");
-    expect(lastError.textContent).toContain("intelligence_runs#12:repository_drafts");
-    // Passing checks are still visible as passing.
-    expect(screen.getByText("正常なチェック")).toBeTruthy();
-    expect(screen.getByText("Database storage")).toBeTruthy();
+    expect(screen.getByTestId("system-state-item-diagnostic.snapshot_status")).toBeTruthy();
   });
 
-  test("clicking a navigate check routes to its fix page with focus params", async () => {
-    window.history.pushState({}, "", "/");
+  test("badge dedupes items sharing a dedupe_key in its count", async () => {
+    const duplicate = { ...snapshotItem, state_id: "snapshot.ready.missing" };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-state") return Promise.resolve(stateResponse([snapshotItem, duplicate]));
+      return Promise.resolve(null);
+    });
+
+    const { DiagnosticsBadge } = await import("@/components/diagnostics-badge");
+    render(<DiagnosticsBadge />, { wrapper: createWrapper() });
+
+    await screen.findByTestId("diagnostics-badge");
+    expect(screen.getByTestId("diagnostics-badge-count").textContent).toBe("1");
+  });
+
+  test("badge consumes the server's phase-scoped notification projection (Issue #239)", async () => {
+    // `items` remains the complete audit list. The server owns phase
+    // withdrawal in `notification_items`; the badge must consume that
+    // projection verbatim instead of re-deriving phase visibility.
+    const setupItem = { ...snapshotItem, phase: "setup" as const };
+    const diagnosisItem = projectedStateItem({
+      state_id: "proposal.experiments.undecided",
+      severity: "warning",
+      summary: "評価待ちの experiment があります。",
+      remediation: "Experiments でレビューしてください。",
+      target_ui: { route: "/experiments", anchor: null, action_label: "Experiments でレビュー" },
+      related_checks: [],
+      dedupe_key: "proposal.experiments.undecided",
+    });
+    diagnosisItem.phase = "diagnosis";
+    const scoped = (userPhase: "setup" | "diagnosis") => ({
+      ...stateResponse([setupItem, diagnosisItem]),
+      notification_items: userPhase === "setup"
+        ? [setupItem]
+        : [setupItem, diagnosisItem],
+      user_phase: userPhase,
+      phases: [
+        { phase: "setup", complete: userPhase !== "setup" },
+        { phase: "preparation", complete: userPhase === "diagnosis" },
+        { phase: "diagnosis", complete: false },
+      ],
+    });
+
     mockApi.get.mockImplementation((path: string) =>
-      path === "/system-diagnostics"
-        ? Promise.resolve(diagnosticsResponse)
-        : Promise.resolve(null),
+      path === "/system-state" ? Promise.resolve(scoped("setup")) : Promise.resolve(null),
     );
+    const { DiagnosticsBadge } = await import("@/components/diagnostics-badge");
+    const first = render(<DiagnosticsBadge />, { wrapper: createWrapper() });
+    await screen.findByTestId("diagnostics-badge");
+    // Only the setup-phase item is counted while user_phase is "setup".
+    expect(screen.getByTestId("diagnostics-badge-count").textContent).toBe("1");
+    first.unmount();
+
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-state" ? Promise.resolve(scoped("diagnosis")) : Promise.resolve(null),
+    );
+    render(<DiagnosticsBadge />, { wrapper: createWrapper() });
+    await screen.findByTestId("diagnostics-badge");
+    await waitFor(() => {
+      expect(screen.getByTestId("diagnostics-badge-count").textContent).toBe("2");
+    });
+  });
+
+  test("clicking a navigate-kind item routes to its fix page with focus params", async () => {
+    window.history.pushState({}, "", "/");
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-state") return Promise.resolve(stateResponse([snapshotItem]));
+      if (path === "/system-diagnostics") return Promise.resolve(diagnosticsResponse);
+      return Promise.resolve(null);
+    });
 
     const { DiagnosticsBadge } = await import("@/components/diagnostics-badge");
     render(<DiagnosticsBadge />, { wrapper: createWrapper() });
@@ -4540,9 +4800,8 @@ describe("System settings diagnostics", () => {
     const badge = await screen.findByTestId("diagnostics-badge");
     fireEvent.click(badge);
 
-    // snapshot_status is a navigate check → click its card.
-    const snapshotDetail = await screen.findByText(/0 indexed files/);
-    fireEvent.click(snapshotDetail);
+    const item = await screen.findByTestId("system-state-item-diagnostic.snapshot_status");
+    fireEvent.click(within(item).getByRole("button"));
 
     await waitFor(() => {
       expect(window.location.pathname).toBe("/repository");
@@ -4552,13 +4811,13 @@ describe("System settings diagnostics", () => {
     expect(params.get("fix")).toBe("repo-patterns");
   });
 
-  test("clicking an env-only check opens a remediation dialog instead of navigating", async () => {
+  test("clicking an env-only item opens the remediation dialog instead of navigating", async () => {
     window.history.pushState({}, "", "/");
-    mockApi.get.mockImplementation((path: string) =>
-      path === "/system-diagnostics"
-        ? Promise.resolve(diagnosticsResponse)
-        : Promise.resolve(null),
-    );
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-state") return Promise.resolve(stateResponse([llmItem]));
+      if (path === "/system-diagnostics") return Promise.resolve(diagnosticsResponse);
+      return Promise.resolve(null);
+    });
 
     const { DiagnosticsBadge } = await import("@/components/diagnostics-badge");
     render(<DiagnosticsBadge />, { wrapper: createWrapper() });
@@ -4566,35 +4825,110 @@ describe("System settings diagnostics", () => {
     const badge = await screen.findByTestId("diagnostics-badge");
     fireEvent.click(badge);
 
-    // intelligence_llm_config is a dialog check → click its card.
-    const llmDetail = await screen.findByText(/INTELLIGENCE_LLM_PROVIDER is empty/);
-    fireEvent.click(llmDetail);
+    // intelligence_llm_config projects with target_ui null (dialog-kind fix);
+    // the badge opens the env-fix dialog from the related diagnostic check.
+    const item = await screen.findByTestId("system-state-item-diagnostic.intelligence_llm_config");
+    fireEvent.click(within(item).getByRole("button", {
+      name: "「Intelligence reasoning model configuration」の対処方法",
+    }));
 
     const envDialog = await screen.findByTestId("diagnostic-env-dialog");
     expect(envDialog.textContent).toContain("設定が必要な環境変数");
     // Did not navigate away.
     expect(window.location.pathname).toBe("/");
     // The list dialog closed so the two modals don't stack.
-    expect(screen.queryByText("System Settings Diagnostics")).toBeNull();
+    expect(screen.queryByText("System State")).toBeNull();
   });
 
-  test("badge renders without count when everything is ok", async () => {
-    mockApi.get.mockImplementation((path: string) =>
-      path === "/system-diagnostics"
-        ? Promise.resolve({
-            ...diagnosticsResponse,
-            overall_severity: "ok",
-            severity_counts: { ok: 4, warning: 0, error: 0, blocked: 0, unknown: 0 },
-            checks: [diagnosticsResponse.checks[3]],
-          })
-        : Promise.resolve(null),
-    );
+  test("badge renders without count when no item needs attention", async () => {
+    const okItem = projectedStateItem({
+      state_id: "understanding.purpose.satisfied",
+      severity: "ok",
+      summary: "System Purpose は現在の snapshot で確認済みです。",
+      source: "system_state",
+      dedupe_key: "",
+    });
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-state") return Promise.resolve(stateResponse([okItem]));
+      return Promise.resolve(null);
+    });
 
     const { DiagnosticsBadge } = await import("@/components/diagnostics-badge");
     render(<DiagnosticsBadge />, { wrapper: createWrapper() });
 
     await screen.findByTestId("diagnostics-badge");
     expect(screen.queryByTestId("diagnostics-badge-count")).toBeNull();
+  });
+
+  test("informational no-action audit items never become notifications or CTAs", async () => {
+    const reasoningNotRun = projectedStateItem({
+      state_id: "diagnostic.llm_last_run",
+      severity: "info",
+      status: "unconfirmed",
+      user_action_kind: "none",
+      intervention_timing: "before_next_step",
+      subject: "直近の reasoning モデル実行",
+      summary: "直近の reasoning モデル実行",
+      remediation: "他に warning / error がある場合は、先にそちらの次の操作を実施してください。",
+      evidence: { diagnostic_category: "llm", fix_kind: "navigate" },
+      target_ui: null,
+      related_checks: ["llm_last_run"],
+      dedupe_key: "diagnostic.llm_last_run",
+      phase: "setup",
+    });
+    const response = stateResponse([reasoningNotRun]);
+    expect(response.notification_items).toEqual([]);
+
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-state") return Promise.resolve(response);
+      if (path === "/system-diagnostics") {
+        return Promise.resolve({
+          ...diagnosticsResponse,
+          checks: [{
+            ...diagnosticsResponse.checks[1],
+            check_id: "llm_last_run",
+            title: "直近の reasoning モデル実行",
+            severity: "unknown",
+            fix_page: "/system-understanding",
+            fix_anchor: "build",
+          }],
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { DiagnosticsBadge } = await import("@/components/diagnostics-badge");
+    render(<DiagnosticsBadge />, { wrapper: createWrapper() });
+
+    const badge = await screen.findByTestId("diagnostics-badge");
+    expect(screen.queryByTestId("diagnostics-badge-count")).toBeNull();
+    fireEvent.click(badge);
+    expect(await screen.findByText("対応が必要な状態はありません。")).toBeTruthy();
+    expect(screen.queryByText("直近の reasoning モデル実行")).toBeNull();
+    expect(screen.queryByRole("button", { name: "修正する" })).toBeNull();
+  });
+
+  test("badge shows a degraded error state when system-state cannot be loaded (Issue #239)", async () => {
+    // The removed system-diagnostics fallback must NOT resurrect: even with a
+    // perfectly healthy /system-diagnostics response available, a failed
+    // /system-state read renders the explicit degraded badge, never a count
+    // derived from another source.
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-state") return Promise.reject(new ApiError(500, "boom"));
+      if (path === "/system-diagnostics") return Promise.resolve(diagnosticsResponse);
+      return Promise.resolve(null);
+    });
+
+    const { DiagnosticsBadge } = await import("@/components/diagnostics-badge");
+    render(<DiagnosticsBadge />, { wrapper: createWrapper() });
+
+    const badge = await screen.findByTestId("diagnostics-badge");
+    expect(badge.getAttribute("data-state")).toBe("error");
+    expect(screen.getByTestId("diagnostics-badge-error")).toBeTruthy();
+    expect(screen.queryByTestId("diagnostics-badge-count")).toBeNull();
+
+    fireEvent.click(badge);
+    expect(await screen.findByTestId("diagnostics-badge-error-message")).toBeTruthy();
   });
 
   test("canonical StateItem keeps the same snapshot target in the badge and page banner", async () => {
@@ -4686,7 +5020,7 @@ describe("System settings diagnostics", () => {
       detail: "PROBE_REPOSITORY_ROOTS is empty.",
       impact: "No repository can be registered until an allowlisted root is configured.",
       remediation: "Set PROBE_REPOSITORY_ROOTS to the allowed repository parent directories.",
-      evidence: {},
+      evidence: { diagnostic_category: "repository", fix_kind: "dialog" },
       target_ui: null,
       related_checks: ["repository_roots"],
       related_pipeline_steps: [],
@@ -4715,8 +5049,11 @@ describe("System settings diagnostics", () => {
     fireEvent.click(await screen.findByTestId("diagnostics-badge"));
     const badgeItem = await screen.findByTestId("system-state-item-diagnostic.repository_roots");
 
-    // No navigable target_ui, but a 修正する action derived from the related check.
-    const fixButton = within(badgeItem).getByRole("button", { name: "修正する" });
+    // The canonical item declares a dialog action; the related check supplies
+    // only the remediation dialog contents.
+    const fixButton = within(badgeItem).getByRole("button", {
+      name: "「Repository root allowlist」の対処方法",
+    });
     fireEvent.click(fixButton);
 
     const envDialog = await screen.findByTestId("diagnostic-env-dialog");
@@ -5063,6 +5400,7 @@ describe("Trace Lineage Explorer page", () => {
           trace_id: "trace-aaaa1111", component_id: "validate", mode: "trace",
           span_id: "s1", parent_span_id: null, flow_id: "f1", correlation_id: "c1",
           duration_ms: 2, timestamp: 100, output: "'ok'", error: null,
+          replayability: "replayable", replay_reasons: [],
           entities: [{ type: "order", id: "o-1", role: "source" }],
           projections: [{
             projection_name: "orders", phase: "output",
@@ -5074,6 +5412,7 @@ describe("Trace Lineage Explorer page", () => {
           trace_id: "trace-bbbb2222", component_id: "charge", mode: "trace",
           span_id: "s2", parent_span_id: "s1", flow_id: "f1", correlation_id: "c1",
           duration_ms: 3, timestamp: 200, output: "'ok'", error: null,
+          replayability: "partial", replay_reasons: ["redacted"],
           entities: [{ type: "order", id: "o-1", role: "related" }],
           projections: [{
             projection_name: "orders", phase: "output",
@@ -5105,6 +5444,8 @@ describe("Trace Lineage Explorer page", () => {
     // Projected field values are shown.
     expect(screen.getByText(/pending/)).toBeInTheDocument();
     expect(screen.getByText(/charged/)).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: /Replay$/ }).length).toBe(2);
+    expect(screen.getByText("partial")).toBeInTheDocument();
   });
 
   test("changed projected field between steps is highlighted", async () => {
@@ -5331,6 +5672,7 @@ describe("Trace Analyzers page", () => {
     expect(within(table).getByText(/1\/2 entities differ/)).toBeInTheDocument();
     expect(within(table).getByText("status")).toBeInTheDocument();
     expect(within(table).getByText("changed")).toBeInTheDocument();
+    expect(within(table).getByRole("button", { name: /Replay$/ })).toBeInTheDocument();
   });
 });
 
@@ -5499,17 +5841,20 @@ describe("Hub success summary and pipeline collapse (Issue #211)", () => {
     gaps: [],
     gap_summary: [],
     metadata_coverage: { symbol_count: 42, symbols_with_source_metadata: 5, entrypoint_count: 10, entrypoints_with_capability_link: 3 },
-    next_actions: [],
-    primary_action: {
-      action: "Start from Capability", reason: "Everything is ready.",
-      category: "understand", link: "/capability-map", action_kind: "navigate",
-    },
+    // Issue #240: the success summary is now server-supplied (Japanese)
+    // instead of assembled client-side.
+    success_summary: "分析完了 — 8/8 ステップ ・ 42 シンボル ・ 10 エントリポイント",
   };
 
-  function mockSuApis(response: Record<string, unknown>, diagnostics?: Record<string, unknown>) {
+  function mockSuApis(
+    response: Record<string, unknown>,
+    diagnostics?: Record<string, unknown>,
+    systemState?: Record<string, unknown>,
+  ) {
     mockApi.get.mockImplementation((path: string) => {
       if (path === "/repository/system-understanding") return Promise.resolve(response);
       if (path === "/system-diagnostics") return Promise.resolve(diagnostics ?? null);
+      if (path === "/system-state") return Promise.resolve(systemState ?? null);
       return Promise.resolve(null);
     });
   }
@@ -5521,9 +5866,9 @@ describe("Hub success summary and pipeline collapse (Issue #211)", () => {
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
 
     const summary = await screen.findByTestId("build-success-summary");
-    expect(summary.textContent).toContain("8/8 steps");
-    expect(summary.textContent).toContain("42 symbols");
-    expect(summary.textContent).toContain("10 entrypoints");
+    expect(summary.textContent).toContain("8/8 ステップ");
+    expect(summary.textContent).toContain("42 シンボル");
+    expect(summary.textContent).toContain("10 エントリポイント");
 
     const collapsed = screen.getByTestId("pipeline-collapsed");
     expect(collapsed.textContent).toContain("8/8 steps complete");
@@ -5566,20 +5911,56 @@ describe("Hub success summary and pipeline collapse (Issue #211)", () => {
       ...allCompletePipeline.slice(0, 7),
       { step: "capability_hierarchy_ready", status: "warning", detail: "0 capabilities" },
     ],
-    primary_action: {
-      action: "Build system understanding", reason: "1 step incomplete",
-      category: "understand", link: null, action_kind: "build",
-    },
+  };
+
+  // Issue #239: the canonical capability-hierarchy-empty StateItem exactly as
+  // the server projects it into page_items — the checklist CTA consumes its
+  // action_label / target_ui verbatim (same source as the banner and badge).
+  const capabilityEmptyStateItem: SystemStateItem = {
+    state_id: "pipeline.capability_hierarchy.empty",
+    state_group: "pipeline",
+    severity: "warning",
+    status: "missing",
+    user_action_kind: "confirm",
+    intervention_timing: "before_next_step",
+    subject: "Capability 階層",
+    summary: "Capability 階層は実行済みですが capability が 0 件です。",
+    detail: "現在の snapshot に capability ノードが存在しません。",
+    impact: "Core Capabilities が未定義です。",
+    remediation: "Interview で Core Capabilities を確認してください。",
+    evidence: { capability_count: 0 },
+    target_ui: { route: "/interview", anchor: "interview-capabilities", action_label: "Interview で Core Capabilities を確認" },
+    display_routes: ["/system-understanding"],
+    related_checks: [],
+    related_pipeline_steps: ["capability_hierarchy_ready"],
+    source: "system_state",
+    dedupe_key: "",
+    scope: "global",
+    decision_method: "deterministic",
+    phase: "preparation",
   };
 
   test("incomplete pipeline keeps the checklist expanded without a success summary", async () => {
-    mockSuApis(incompleteCapabilityResponse, {
-      system_id: 1,
-      generated_at: 1750000000,
-      overall_severity: "warning",
-      severity_counts: { ok: 0, warning: 1, error: 0, blocked: 0, unknown: 0 },
-      checks: [capabilityEmptyCheck],
-    });
+    mockSuApis(
+      incompleteCapabilityResponse,
+      {
+        system_id: 1,
+        generated_at: 1750000000,
+        overall_severity: "warning",
+        severity_counts: { ok: 0, warning: 1, error: 0, blocked: 0, unknown: 0 },
+        checks: [capabilityEmptyCheck],
+      },
+      {
+        system_id: 1, generated_at: 1, overall_severity: "warning",
+        severity_counts: { warning: 1 }, items: [capabilityEmptyStateItem],
+        primary_item: capabilityEmptyStateItem,
+        notification_items: [capabilityEmptyStateItem],
+        page_items: {
+          "/system-understanding": [capabilityEmptyStateItem],
+          "/interview": [capabilityEmptyStateItem],
+        },
+      },
+    );
 
     const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
@@ -5587,22 +5968,26 @@ describe("Hub success summary and pipeline collapse (Issue #211)", () => {
     expect(await screen.findByTestId("pipeline-checklist")).toBeInTheDocument();
     expect(screen.queryByTestId("pipeline-collapsed")).not.toBeInTheDocument();
     expect(screen.queryByTestId("build-success-summary")).not.toBeInTheDocument();
+    // Issue #239: the CTA is the matching StateItem's action, verbatim — the
+    // same text and destination the banner/badge show for this root cause.
     const cta = await screen.findByTestId("pipeline-cta-capability_hierarchy_ready");
-    expect(cta).toHaveTextContent("Review interview proposals");
-    expect(cta).toHaveAttribute("href", "/interview");
+    expect(cta).toHaveTextContent("Interview で Core Capabilities を確認");
+    expect(cta).toHaveAttribute("href", "/interview?fix=interview-capabilities");
   });
 
-  test("interview CTA requires the structured diagnostic, not the detail text", async () => {
-    // Same pipeline detail text, but no pipeline_capability_hierarchy check
-    // pointing at /interview: the CTA falls back to the step's generic
-    // Build action instead of regex-guessing intent from the free text.
+  test("pipeline CTA renders nothing when no StateItem names the step", async () => {
+    // Same pipeline detail text, but no matching StateItem in page_items:
+    // there is no hardcoded fallback map (Issue #239), so no CTA button
+    // renders for the step -- the status badge still does. Formerly the
+    // Interview CTA was derived from the structured diagnostic; now the CTA
+    // is sourced solely from the matching SystemStateItem.
     mockSuApis(incompleteCapabilityResponse);
 
     const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
 
-    const cta = await screen.findByTestId("pipeline-cta-capability_hierarchy_ready");
-    expect(cta).toHaveTextContent("Run Build / Refresh");
+    expect(await screen.findByTestId("pipeline-checklist")).toBeInTheDocument();
+    expect(screen.queryByTestId("pipeline-cta-capability_hierarchy_ready")).toBeNull();
   });
 
   test("undefined purpose adds the prerequisite note to the entry cards", async () => {
@@ -5612,6 +5997,234 @@ describe("Hub success summary and pipeline collapse (Issue #211)", () => {
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
 
     expect(await screen.findByTestId("entry-cards-prereq-note")).toBeInTheDocument();
+  });
+});
+
+// ── Notification surfaces consume one canonical StateItem (Issue #239) ──
+
+describe("Notification surface consistency (Issue #239)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const canonicalItem: SystemStateItem = {
+    state_id: "pipeline.capability_hierarchy.empty",
+    state_group: "pipeline",
+    severity: "warning",
+    status: "missing",
+    user_action_kind: "confirm",
+    intervention_timing: "before_next_step",
+    subject: "Capability 階層",
+    summary: "Capability 階層は実行済みですが capability が 0 件です。",
+    detail: "現在の snapshot に capability ノードが存在しません。",
+    impact: "Core Capabilities が未定義です。",
+    remediation: "Interview で Core Capabilities を確認してください。",
+    evidence: { capability_count: 0 },
+    target_ui: { route: "/interview", anchor: "interview-capabilities", action_label: "Interview で Core Capabilities を確認" },
+    display_routes: ["/system-understanding"],
+    related_checks: [],
+    related_pipeline_steps: ["capability_hierarchy_ready"],
+    source: "system_state",
+    dedupe_key: "",
+    scope: "global",
+    decision_method: "deterministic",
+    phase: "preparation",
+  };
+  const expectedTarget = "/interview?fix=interview-capabilities";
+
+  const stateResponse = {
+    system_id: 1, generated_at: 1, overall_severity: "warning",
+    severity_counts: { warning: 1 }, items: [canonicalItem],
+    primary_item: canonicalItem, notification_items: [canonicalItem],
+    page_items: {
+      "/system-understanding": [canonicalItem],
+      "/interview": [canonicalItem],
+    },
+  };
+
+  test("badge, page banner, and floating notice show the same summary and resolve the same target", async () => {
+    window.history.pushState({}, "", "/system-understanding");
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-state") return Promise.resolve(stateResponse);
+      return Promise.resolve(null);
+    });
+
+    const { DiagnosticsBadge } = await import("@/components/diagnostics-badge");
+    const { SystemStateBanner } = await import("@/components/system-state");
+    const { AssistantPanel } = await import("@/components/assistant-panel");
+    render(
+      <>
+        <DiagnosticsBadge />
+        <SystemStateBanner item={canonicalItem} />
+        <AssistantPanel focusedStateItem={canonicalItem} />
+      </>,
+      { wrapper: createWrapper() },
+    );
+
+    // Every surface renders the server's summary verbatim.
+    const banner = await screen.findByTestId("system-state-banner");
+    expect(banner.textContent).toContain(canonicalItem.summary);
+    expect(screen.getByTestId("assistant-snapshot-notice").textContent)
+      .toContain(canonicalItem.summary);
+    fireEvent.click(await screen.findByTestId("diagnostics-badge"));
+    const badgeItem = await screen.findByTestId(
+      `system-state-item-${canonicalItem.state_id}`,
+    );
+    expect(badgeItem.textContent).toContain(canonicalItem.summary);
+
+    // ...and every surface's action resolves to the same target URL.
+    fireEvent.click(within(badgeItem).getByRole("button", { name: canonicalItem.target_ui!.action_label }));
+    await waitFor(() => expect(window.location.pathname + window.location.search).toBe(expectedTarget));
+
+    window.history.pushState({}, "", "/system-understanding");
+    fireEvent.click(screen.getByTestId(`system-state-action-${canonicalItem.state_id}`));
+    await waitFor(() => expect(window.location.pathname + window.location.search).toBe(expectedTarget));
+
+    window.history.pushState({}, "", "/system-understanding");
+    fireEvent.click(screen.getByTestId("assistant-snapshot-notice"));
+    await waitFor(() => expect(window.location.pathname + window.location.search).toBe(expectedTarget));
+  });
+
+  test("pipeline checklist CTA resolves the same StateItem to the same target as the other surfaces", async () => {
+    window.history.pushState({}, "", "/system-understanding");
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-state") return Promise.resolve(stateResponse);
+      if (path === "/repository/system-understanding") return Promise.resolve({
+        system_id: 1, snapshot_id: 5, commit_sha: "abc12345def",
+        pipeline: [
+          { step: "repository_configured", status: "complete" },
+          { step: "snapshot_ready", status: "complete" },
+          { step: "documentation_indexed", status: "complete" },
+          { step: "documentation_claims_scanned", status: "complete" },
+          { step: "symbols_indexed", status: "complete" },
+          { step: "entrypoints_discovered", status: "complete" },
+          { step: "docs_code_reconciled", status: "complete" },
+          { step: "capability_hierarchy_ready", status: "warning", detail: "0 capabilities" },
+        ],
+        purpose: null, capabilities: [], entrypoints: [], major_symbols: [],
+        gaps: [], gap_summary: [], metadata_coverage: null,
+      });
+      return Promise.resolve(null);
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const cta = await screen.findByTestId("pipeline-cta-capability_hierarchy_ready");
+    expect(cta).toHaveTextContent(canonicalItem.target_ui!.action_label);
+    expect(cta).toHaveAttribute("href", expectedTarget);
+  });
+});
+
+// ── User phase indicator (Issue #239) ───────────────────────────────
+
+describe("User phase indicator (Issue #239)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const stateWithPhase = (
+    userPhase: string,
+    phases: { phase: string; complete: boolean; label?: string }[],
+  ) => ({
+    system_id: 1, generated_at: 1, overall_severity: "ok",
+    severity_counts: {}, items: [], primary_item: null,
+    notification_items: [], page_items: {},
+    user_phase: userPhase, phases,
+  });
+
+  test("shows the current phase and per-phase completion from the server", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-state"
+        ? Promise.resolve(stateWithPhase("preparation", [
+            { phase: "setup", complete: true },
+            { phase: "preparation", complete: false },
+            { phase: "diagnosis", complete: false },
+          ]))
+        : Promise.resolve(null),
+    );
+
+    const { UserPhaseIndicator } = await import("@/components/system-state");
+    render(<UserPhaseIndicator />, { wrapper: createWrapper() });
+
+    const indicator = await screen.findByTestId("user-phase-indicator");
+    expect(indicator.getAttribute("data-current-phase")).toBe("preparation");
+
+    const setup = screen.getByTestId("user-phase-setup");
+    expect(setup.getAttribute("data-complete")).toBe("true");
+    expect(setup.getAttribute("data-current")).toBe("false");
+
+    const preparation = screen.getByTestId("user-phase-preparation");
+    expect(preparation.getAttribute("data-complete")).toBe("false");
+    expect(preparation.getAttribute("data-current")).toBe("true");
+
+    expect(screen.getByTestId("user-phase-diagnosis").getAttribute("data-current")).toBe("false");
+  });
+
+  test("prefers the server-provided phase label over the client fallback map (Issue #240)", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-state"
+        ? Promise.resolve(stateWithPhase("preparation", [
+            { phase: "setup", complete: true, label: "セットアップ完了" },
+            { phase: "preparation", complete: false, label: "準備" },
+            // No server label for this entry: proves the client fallback
+            // (USER_PHASE_LABELS) still applies when the server omits it.
+            { phase: "diagnosis", complete: false },
+          ]))
+        : Promise.resolve(null),
+    );
+
+    const { UserPhaseIndicator, USER_PHASE_LABELS } = await import("@/components/system-state");
+    render(<UserPhaseIndicator />, { wrapper: createWrapper() });
+
+    const indicator = await screen.findByTestId("user-phase-indicator");
+    expect(indicator.getAttribute("title")).toBe("現在のフェーズ: 準備");
+    expect(screen.getByTestId("user-phase-setup").textContent).toContain("セットアップ完了");
+    expect(screen.getByTestId("user-phase-preparation").textContent).toContain("準備");
+    expect(screen.getByTestId("user-phase-diagnosis").textContent)
+      .toContain(USER_PHASE_LABELS.diagnosis);
+  });
+
+  test("display switches when the server-derived phase changes", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-state"
+        ? Promise.resolve(stateWithPhase("diagnosis", [
+            { phase: "setup", complete: true },
+            { phase: "preparation", complete: true },
+            { phase: "diagnosis", complete: false },
+          ]))
+        : Promise.resolve(null),
+    );
+
+    const { UserPhaseIndicator } = await import("@/components/system-state");
+    render(<UserPhaseIndicator />, { wrapper: createWrapper() });
+
+    const indicator = await screen.findByTestId("user-phase-indicator");
+    expect(indicator.getAttribute("data-current-phase")).toBe("diagnosis");
+    expect(screen.getByTestId("user-phase-preparation").getAttribute("data-complete")).toBe("true");
+    expect(screen.getByTestId("user-phase-diagnosis").getAttribute("data-current")).toBe("true");
+  });
+
+  test("renders nothing when the server does not provide a phase", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-state"
+        ? Promise.resolve({
+            system_id: 1, generated_at: 1, overall_severity: "ok",
+            severity_counts: {}, items: [], primary_item: null,
+            notification_items: [], page_items: {},
+          })
+        : Promise.resolve(null),
+    );
+
+    const { UserPhaseIndicator } = await import("@/components/system-state");
+    const { container } = render(<UserPhaseIndicator />, { wrapper: createWrapper() });
+
+    // Wait a tick for the query to settle, then assert nothing rendered.
+    await waitFor(() => expect(mockApi.get).toHaveBeenCalled());
+    expect(container.firstChild).toBeNull();
+    expect(screen.queryByTestId("user-phase-indicator")).toBeNull();
   });
 });
 
@@ -6010,5 +6623,628 @@ describe("GitHub page", () => {
     );
     expect(screen.queryByTestId("publish-job-approve-button")).not.toBeInTheDocument();
     expect(screen.queryByTestId("publish-job-cancel-button")).not.toBeInTheDocument();
+  });
+});
+
+// ── Replay / Simulation Workbench (Issue #242 Phase D / #246) ──────────────
+
+function replayComponentsFixture() {
+  return [{ component_id: "norm", mode: "trace", trace_count: 2, last_seen: 1000 }];
+}
+
+function replayTracesFixture() {
+  return [
+    {
+      trace_id: "trace-replayable-0001",
+      component_id: "norm",
+      mode: "trace",
+      input: { args: ["hi"], kwargs: {} },
+      output: "{'kind': 'a'}",
+      error: null,
+      duration_ms: 3,
+      timestamp: 1000,
+      input_capture: { args: ["hi"], kwargs: {} },
+      replayability: "replayable",
+      replay_reasons: [],
+    },
+    {
+      trace_id: "trace-unreplayable-0002",
+      component_id: "norm",
+      mode: "trace",
+      input: { args: ["big"], kwargs: {} },
+      output: null,
+      error: "ValueError: boom",
+      duration_ms: 4,
+      timestamp: 1001,
+      input_capture: null,
+      replayability: "unreplayable",
+      replay_reasons: ["size_limit_exceeded"],
+    },
+  ];
+}
+
+function setupComponentsPageForReplay(extra: Record<string, unknown> = {}) {
+  mockApi.get.mockImplementation((path: string) => {
+    if (path === "/components") return Promise.resolve(replayComponentsFixture());
+    if (path === "/components/norm/traces?limit=20") return Promise.resolve(replayTracesFixture());
+    if (path === "/components/norm/profile") return Promise.resolve(null);
+    if (path === "/components/norm/shadow-results?limit=20") return Promise.resolve([]);
+    if (path === "/components/norm/criteria") return Promise.resolve([]);
+    if (path === "/replay-sets?component_id=norm") return Promise.resolve([]);
+    if (path === "/experiments") return Promise.resolve([]);
+    if (path === "/repository/snapshots") return Promise.resolve([]);
+    if (path === "/repository/drafts/latest") return Promise.resolve({ feature_drafts: [] });
+    if (path in extra) return Promise.resolve(extra[path]);
+    return Promise.resolve(null);
+  });
+}
+
+describe("Components trace row: Replay actions (Issue #246)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  async function renderExpanded() {
+    setupComponentsPageForReplay();
+    const { default: ComponentsPage } = await import("@/pages/components");
+    const { default: SimulationWorkbenchPage } = await import("@/pages/simulation-workbench");
+    const { default: ExperimentsPage } = await import("@/pages/experiments");
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/components?component=norm"]}>
+          <Routes>
+            <Route path="/components" element={<ComponentsPage />} />
+            <Route path="/simulation-workbench" element={<SimulationWorkbenchPage />} />
+            <Route path="/experiments" element={<ExperimentsPage />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    const expandButton = await screen.findByRole("button", {
+      name: "Show signal details for trace trace-replayable-0001",
+    });
+    fireEvent.click(expandButton);
+    return within(expandButton.closest("tr")!.nextElementSibling as HTMLElement);
+  }
+
+  test("renders the replayability badge with a reason tooltip, row actions, and the trace workspace pin", async () => {
+    setupComponentsPageForReplay();
+    const { default: ComponentsPage } = await import("@/pages/components");
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/components?component=norm"]}>
+          <ComponentsPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // Base row badges (before expanding) show replayable / unreplayable.
+    expect(await screen.findByText("replayable")).toBeInTheDocument();
+    const unreplayableBadge = screen.getByText("unreplayable");
+    expect(unreplayableBadge).toHaveAttribute("title", "Reasons: size_limit_exceeded");
+
+    const expandButton = await screen.findByRole("button", {
+      name: "Show signal details for trace trace-replayable-0001",
+    });
+    fireEvent.click(expandButton);
+    const row = within(expandButton.closest("tr")!.nextElementSibling as HTMLElement);
+
+    expect(row.getByText("Replay")).toBeInTheDocument();
+    expect(row.getByText("Add to Replay Set")).toBeInTheDocument();
+    expect(row.getByText("Create Experiment")).toBeInTheDocument();
+    expect(row.getByText("Add to Workspace")).toBeInTheDocument();
+  });
+
+  test("Replay adds the trace to a new Replay Set and navigates to the Workbench", async () => {
+    const row = await renderExpanded();
+    mockApi.post.mockResolvedValue({
+      id: 77, system_id: 1, component_id: "norm", name: "Replay set: norm",
+      source: "manual", source_analyzer_run_id: null,
+      trace_ids: ["trace-replayable-0001"], traces: [], created_at: 1,
+    });
+
+    fireEvent.click(row.getByText("Replay"));
+    const replayButtons = await screen.findAllByText("Replay", { selector: "button" });
+    fireEvent.click(replayButtons[replayButtons.length - 1]);
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/replay-sets", expect.objectContaining({
+        component_id: "norm",
+        trace_ids: ["trace-replayable-0001"],
+      }));
+    });
+    await waitFor(() => {
+      expect(screen.getByText("Simulation Workbench")).toBeInTheDocument();
+    });
+  });
+
+  test("Add to Replay Set posts without navigating away from Components", async () => {
+    const row = await renderExpanded();
+    mockApi.post.mockResolvedValue({
+      id: 78, system_id: 1, component_id: "norm", name: "Replay set: norm",
+      source: "manual", source_analyzer_run_id: null,
+      trace_ids: ["trace-replayable-0001"], traces: [], created_at: 1,
+    });
+
+    fireEvent.click(row.getByText("Add to Replay Set"));
+    fireEvent.click(await screen.findByText("Add", { selector: "button" }));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/replay-sets", expect.objectContaining({
+        component_id: "norm",
+        trace_ids: ["trace-replayable-0001"],
+      }));
+    });
+    expect(screen.queryByText("Simulation Workbench")).not.toBeInTheDocument();
+  });
+
+  test("Create Experiment from this trace routes to Experiments with prefilled context", async () => {
+    const row = await renderExpanded();
+    fireEvent.click(row.getByText("Create Experiment"));
+
+    await waitFor(() => {
+      expect(screen.getByText(/Prefilled context from trace/)).toBeInTheDocument();
+    });
+    expect(
+      screen.getByPlaceholderText("What are you trying to learn?"),
+    ).toHaveValue("Investigate trace trace-replayable-0001 (component norm)");
+  });
+});
+
+// --- Simulation Workbench page ----------------------------------------------
+
+function replaySetFixture(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 1, system_id: 1, component_id: "norm", name: "My Replay Set",
+    source: "manual", source_analyzer_run_id: null,
+    trace_ids: ["t1", "t2"],
+    traces: [
+      { trace_id: "t1", exists: true, replayability: "replayable", replay_reasons: [], input_source: "structured", skip_reason: null },
+      { trace_id: "t2", exists: true, replayability: "unreplayable", replay_reasons: ["redacted"], input_source: null, skip_reason: "unreplayable_capture" },
+    ],
+    created_at: 1,
+    ...overrides,
+  };
+}
+
+function replayApprovalFixture(active: boolean, overrides: Record<string, unknown> = {}) {
+  return {
+    component_id: "norm",
+    active,
+    approval: active
+      ? { id: 1, system_id: 1, component_id: "norm", status: "approved", reason: "ok", approved_by_user_id: 1, decision_method: "manual", risk_context: null, created_at: 1, revoked_at: null, revoked_by_user_id: null }
+      : null,
+    risk_context: {
+      probe_plan_points: [],
+      warning: "Replay re-executes recorded inputs against the component's real implementation...",
+    },
+    ...overrides,
+  };
+}
+
+function replaySourceFixture(overrides: Record<string, unknown> = {}) {
+  return {
+    replay_set_id: 1, component_id: "norm", snapshot_id: 5, commit_sha: "abcdef1234567890",
+    path: "svc.py", qualified_name: "normalize", start_line: 5, end_line: 6,
+    source: 'def normalize(payload):\n    return {"kind": "a"}\n',
+    ...overrides,
+  };
+}
+
+function variantRunFixture(overrides: Record<string, unknown> = {}) {
+  const cases = [
+    { id: 1, trace_id: "t1", position: 0, case_status: "match", comparison_mode: "structured", baseline_output: "A", candidate_output: "A", candidate_error: null, recorded_error: null, duration_ms: 1, duration_delta_ms: 0.1, field_diffs: [], output_truncated: false, created_at: 1 },
+    { id: 2, trace_id: "t2", position: 1, case_status: "diff", comparison_mode: "structured", baseline_output: "A", candidate_output: "B", candidate_error: null, recorded_error: null, duration_ms: 1, duration_delta_ms: 0.2, field_diffs: ["kind"], output_truncated: false, created_at: 1 },
+    { id: 3, trace_id: "t3", position: 2, case_status: "candidate_error", comparison_mode: null, baseline_output: "A", candidate_output: null, candidate_error: "RuntimeError: boom", recorded_error: null, duration_ms: 1, duration_delta_ms: null, field_diffs: [], output_truncated: false, created_at: 1 },
+    { id: 4, trace_id: "t4", position: 3, case_status: "error_to_success", comparison_mode: "structured", baseline_output: null, candidate_output: "fixed", candidate_error: null, recorded_error: "ValueError: boom", duration_ms: 1, duration_delta_ms: -0.5, field_diffs: [], output_truncated: false, created_at: 1 },
+  ];
+  const baseline = {
+    id: 10, replay_run_id: 1, variant_key: "baseline", label: "Baseline", is_baseline: true,
+    patch_text: "", patch_hash: "h0", source: "manual", apply_status: "not_applicable",
+    apply_error: null, status: "completed", error: null, workspace_path: null,
+    cleanup_state: "removed", cleanup_error: null,
+    aggregate: { match: 0, diff: 0, candidate_error: 0, error_to_success: 0, error_to_same_error: 0, error_to_different_error: 0, skipped: 0, total: 0, avg_duration_delta_ms: null, examples: {} },
+    cases: [], created_at: 1, started_at: 1, completed_at: 1,
+  };
+  const candidate = {
+    id: 11, replay_run_id: 1, variant_key: "variant-1", label: "My candidate", is_baseline: false,
+    patch_text: "diff --git a/svc.py b/svc.py\n@@ -1,2 +1,2 @@\n-a\n+b\n", patch_hash: "h1",
+    source: "manual", apply_status: "applied", apply_error: null, status: "completed", error: null,
+    workspace_path: null, cleanup_state: "removed", cleanup_error: null,
+    aggregate: { match: 1, diff: 1, candidate_error: 1, error_to_success: 1, error_to_same_error: 0, error_to_different_error: 0, skipped: 0, total: 4, avg_duration_delta_ms: -0.05, examples: {} },
+    cases, created_at: 1, started_at: 1, completed_at: 1,
+  };
+  return {
+    id: 1, system_id: 1, replay_set_id: 1, component_id: "norm", snapshot_id: 5,
+    commit_sha: "abcdef1234567890", symbol_path: "svc.py", symbol_qualified_name: "normalize",
+    status: "completed", error: null, trace_set_hash: "hash", sandbox_config: {}, approval_id: 1,
+    variants: [baseline, candidate], created_at: 1, started_at: 1, completed_at: 1,
+    ...overrides,
+  };
+}
+
+function setupWorkbenchMocks(opts: {
+  approved?: boolean;
+  run?: Record<string, unknown> | null;
+  extraGet?: Record<string, unknown>;
+} = {}) {
+  const approved = opts.approved ?? true;
+  const run = opts.run === undefined ? variantRunFixture() : opts.run;
+  mockApi.get.mockImplementation((path: string) => {
+    if (path === "/replay-sets") return Promise.resolve([replaySetFixture()]);
+    if (path === "/replay-sets/1") return Promise.resolve(replaySetFixture());
+    if (path === "/components/norm/replay-approval") return Promise.resolve(replayApprovalFixture(approved));
+    if (path === "/components/norm/traces?limit=500") return Promise.resolve([]);
+    if (path === "/replay-sets/1/source") return Promise.resolve(replaySourceFixture());
+    if (path === "/replay-variant-runs?replay_set_id=1") return Promise.resolve(run ? [run] : []);
+    if (path === "/replay-variant-runs/1") return Promise.resolve(run);
+    if (path === "/replay-variant-runs/1/variants/11/experiment-payload") {
+      const candidate = (run as Record<string, unknown> | null)?.variants
+        ? ((run as { variants: Record<string, unknown>[] }).variants.find(v => v.id === 11))
+        : undefined;
+      return Promise.resolve({
+        label: (candidate?.label as string) ?? "My candidate",
+        patch_text: (candidate?.patch_text as string) ?? "",
+        patch_hash: (candidate?.patch_hash as string) ?? "",
+        source: "replay_variant",
+        risk_note: "Promoted from replay-variant-run 1, variant variant-1 (component 'norm', snapshot 5).",
+        origin: { replay_variant_run_id: 1, replay_variant_id: 11 },
+      });
+    }
+    if (path === "/experiments") return Promise.resolve([]);
+    if (path === "/repository/snapshots") return Promise.resolve([]);
+    if (path === "/repository/drafts/latest") return Promise.resolve({ feature_drafts: [] });
+    if (opts.extraGet && path in opts.extraGet) return Promise.resolve(opts.extraGet[path]);
+    return Promise.resolve(null);
+  });
+}
+
+async function renderWorkbenchAt(route: string) {
+  const { default: SimulationWorkbenchPage } = await import("@/pages/simulation-workbench");
+  const qc = new QueryClient({
+    defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+  });
+  render(
+    <QueryClientProvider client={qc}>
+      <MemoryRouter initialEntries={[route]}>
+        <SimulationWorkbenchPage />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
+describe("Simulation Workbench (Issue #246)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("renders the three panes, the diff matrix distinctions, and the simulation disclaimer", async () => {
+    setupWorkbenchMocks();
+    await renderWorkbenchAt("/simulation-workbench?replay_set_id=1");
+
+    await waitFor(() => {
+      expect(screen.getByTestId("workbench-left-pane")).toBeInTheDocument();
+      expect(screen.getByTestId("workbench-center-pane")).toBeInTheDocument();
+      expect(screen.getByTestId("workbench-result-matrix")).toBeInTheDocument();
+    });
+
+    // Simulation disclaimer is always shown alongside the results.
+    expect(screen.getByText(/Simulation only/)).toBeInTheDocument();
+
+    // The diff matrix distinguishes match / diff / candidate error / rescued.
+    await waitFor(() => {
+      expect(screen.getByText("match")).toBeInTheDocument();
+    });
+    expect(screen.getByText("diff")).toBeInTheDocument();
+    expect(screen.getByText("candidate error")).toBeInTheDocument();
+    expect(screen.getByText("rescued")).toBeInTheDocument();
+
+    // The unreplayable trace's next-step guidance is shown in the left pane.
+    expect(screen.getByText(/Next step: pick a different trace, or adjust replay_capture/)).toBeInTheDocument();
+  });
+
+  test("unapproved component shows the not-approved next step and Approve posts", async () => {
+    setupWorkbenchMocks({ approved: false, run: null });
+    await renderWorkbenchAt("/simulation-workbench?replay_set_id=1");
+
+    await waitFor(() => {
+      expect(screen.getByText(/Replay is not approved for "norm"/)).toBeInTheDocument();
+    });
+    expect(screen.getByText(/Next step: review the risk context and approve/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("Review & Approve"));
+    fireEvent.change(
+      await screen.findByPlaceholderText("Why is replay safe to approve for this component?"),
+      { target: { value: "It only normalizes text." } },
+    );
+    mockApi.post.mockResolvedValue({
+      id: 1, system_id: 1, component_id: "norm", status: "approved", reason: "It only normalizes text.",
+      approved_by_user_id: 1, decision_method: "manual", risk_context: null, created_at: 1,
+      revoked_at: null, revoked_by_user_id: null,
+    });
+    fireEvent.click(screen.getByText("Approve", { selector: "button" }));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/components/norm/replay-approval",
+        { reason: "It only normalizes text." },
+      );
+    });
+  });
+
+  test("LLM draft tab shows the provenance / is_mock badge", async () => {
+    setupWorkbenchMocks({ run: null });
+    await renderWorkbenchAt("/simulation-workbench?replay_set_id=1");
+
+    fireEvent.click(await screen.findByText("LLM draft"));
+    fireEvent.change(screen.getByRole("combobox", { name: "Trace for the LLM draft" }), { target: { value: "t1" } });
+    fireEvent.change(
+      screen.getByPlaceholderText("What should the candidate do differently?"),
+      { target: { value: "Uppercase the result" } },
+    );
+    mockApi.post.mockResolvedValue({
+      id: 1, system_id: 1, replay_set_id: 1, component_id: "norm", trace_id: "t1",
+      objective: "Uppercase the result", snapshot_id: 5, symbol_path: "svc.py",
+      symbol_qualified_name: "normalize", generated_code: "def normalize(x): ...",
+      patch_text: "diff --git a/svc.py b/svc.py\n@@ -1,2 +1,2 @@\n-a\n+b\n", patch_hash: "hh",
+      notes: "", status: "proposed", error: null, provider: "mock", model: "mock",
+      prompt_version: "v1", schema_version: "v1", decision_method: "reasoning_llm",
+      is_mock: true, created_at: 1,
+    });
+    fireEvent.click(screen.getByText("Generate draft"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/replay-variant-drafts", expect.objectContaining({
+        replay_set_id: 1, trace_id: "t1", objective: "Uppercase the result", snapshot_id: 5,
+      }));
+    });
+    expect(await screen.findByText("mock LLM")).toBeInTheDocument();
+    expect(screen.getByText("reasoning_llm")).toBeInTheDocument();
+  });
+
+  test("Direct edit -> Run calls the diff endpoint then the variant-run endpoint with the returned patch", async () => {
+    setupWorkbenchMocks({ run: null });
+    await renderWorkbenchAt("/simulation-workbench?replay_set_id=1");
+
+    const textarea = await screen.findByDisplayValue(/def normalize/);
+    fireEvent.change(textarea, {
+      target: { value: 'def normalize(payload):\n    return {"kind": "b"}\n' },
+    });
+
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/replay-source-diff") {
+        return Promise.resolve({ patch_text: "diff --git a/svc.py b/svc.py\n...", patch_hash: "phash" });
+      }
+      if (path === "/replay-variant-runs") return Promise.resolve(variantRunFixture());
+      return Promise.resolve(null);
+    });
+
+    const runButtons = screen.getAllByText("Run");
+    fireEvent.click(runButtons[0]);
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/replay-source-diff", expect.objectContaining({
+        replay_set_id: 1,
+        snapshot_id: 5,
+        edited_source: 'def normalize(payload):\n    return {"kind": "b"}\n',
+      }));
+    });
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/replay-variant-runs", expect.objectContaining({
+        replay_set_id: 1,
+        snapshot_id: 5,
+        variants: [{ label: "Direct edit", patch_text: "diff --git a/svc.py b/svc.py\n...", source: "manual" }],
+      }));
+    });
+  });
+
+  test("Promote routes to Experiments with the patch fetched and prefilled", async () => {
+    setupWorkbenchMocks();
+    const { default: SimulationWorkbenchPage } = await import("@/pages/simulation-workbench");
+    const { default: ExperimentsPage } = await import("@/pages/experiments");
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/simulation-workbench?replay_set_id=1"]}>
+          <Routes>
+            <Route path="/simulation-workbench" element={<SimulationWorkbenchPage />} />
+            <Route path="/experiments" element={<ExperimentsPage />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const promoteBtn = await screen.findByText('Promote "My candidate"');
+    fireEvent.click(promoteBtn);
+
+    await waitFor(() => {
+      expect(mockApi.get).toHaveBeenCalledWith(
+        "/replay-variant-runs/1/variants/11/experiment-payload",
+      );
+    });
+    await waitFor(() => {
+      expect(screen.getByText(/Prefilled from Replay Variant run #1/)).toBeInTheDocument();
+    });
+    const patchTextarea = screen.getAllByPlaceholderText("Patch text (unified diff format)")[0];
+    expect((patchTextarea as HTMLTextAreaElement).value).toContain("diff --git a/svc.py");
+  });
+
+  test("regression scaffold uses reasoning_llm and surfaces provenance", async () => {
+    setupWorkbenchMocks();
+    await renderWorkbenchAt("/simulation-workbench?replay_set_id=1");
+    mockApi.post.mockResolvedValue({
+      id: 7, intelligence_run_id: 8, replay_run_id: 1, replay_variant_id: 11,
+      replay_set_id: 1, trace_id: "t1", snapshot_id: 5,
+      scaffold_text: "def test_normalize_regression():\n    assert True\n",
+      status: "proposed", error: null, provider: "mock", model: "mock",
+      prompt_version: "replay-regression-scaffold-v1",
+      schema_version: "replay-regression-scaffold-v1",
+      decision_method: "reasoning_llm", is_mock: true, created_at: 1,
+    });
+
+    const generate = await screen.findByRole("button", {
+      name: "Generate regression-test scaffold",
+    });
+    await waitFor(() => expect(generate).toBeEnabled());
+    fireEvent.click(generate);
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/replay-regression-scaffolds", {
+        replay_run_id: 1,
+        replay_variant_id: 11,
+        trace_id: "t1",
+      });
+    });
+    expect(await screen.findByText("mock LLM")).toBeInTheDocument();
+    expect(screen.getByText("run #8 · replay-regression-scaffold-v1")).toBeInTheDocument();
+  });
+});
+
+// ── Phase-based prerequisite guide (Issue #241) ─────────────────────
+
+describe("PrerequisiteGuide (Issue #241)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const guidePrimaryItem = {
+    state_id: "repository.configuration.missing",
+    state_group: "repository",
+    severity: "warning",
+    status: "missing",
+    user_action_kind: "configure",
+    intervention_timing: "now",
+    subject: "リポジトリ設定",
+    summary: "対象リポジトリが未設定です。",
+    detail: "対象リポジトリが未設定です。",
+    impact: "",
+    remediation: "Repository タブでリポジトリを設定してください。",
+    evidence: {},
+    target_ui: { route: "/repository", anchor: "repo-config", action_label: "リポジトリを設定" },
+    related_checks: [],
+    related_pipeline_steps: [],
+    source: "system_state",
+    dedupe_key: "repository.configuration",
+    scope: "global",
+    decision_method: "deterministic",
+    phase: "setup",
+  };
+
+  const stateWith = (
+    userPhase: string,
+    primaryItem: unknown = guidePrimaryItem,
+    phaseLabels?: Record<string, string>,
+  ) => ({
+    system_id: 1,
+    generated_at: 1,
+    overall_severity: "warning",
+    severity_counts: {},
+    items: [],
+    primary_item: primaryItem,
+    notification_items: [],
+    page_items: {},
+    user_phase: userPhase,
+    phases: [
+      { phase: "setup", complete: userPhase !== "setup", label: phaseLabels?.setup },
+      { phase: "preparation", complete: userPhase === "diagnosis", label: phaseLabels?.preparation },
+      { phase: "diagnosis", complete: false, label: phaseLabels?.diagnosis },
+    ],
+  });
+
+  test("renders phase + next-step from system-state during setup", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-state" ? Promise.resolve(stateWith("setup")) : Promise.resolve(null),
+    );
+    const { PrerequisiteGuide } = await import("@/components/prerequisite-guide");
+    render(<PrerequisiteGuide />, { wrapper: createWrapper() });
+
+    const guide = await screen.findByTestId("prerequisite-guide");
+    expect(guide.getAttribute("data-current-phase")).toBe("setup");
+    // Phase name and the server StateItem copy are shown verbatim.
+    expect(screen.getByTestId("prerequisite-guide-phase").textContent).toContain("必要最低限の設定");
+    expect(screen.getByText("対象リポジトリが未設定です。")).toBeTruthy();
+    expect(screen.getByText("Repository タブでリポジトリを設定してください。")).toBeTruthy();
+    // CTA carries the server-supplied action label.
+    expect(screen.getByTestId("prerequisite-guide-cta").textContent).toContain("リポジトリを設定");
+  });
+
+  test("prefers the server-provided phase label over the client fallback map (Issue #240)", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-state"
+        ? Promise.resolve(stateWith("setup", guidePrimaryItem, { setup: "セットアップ完了" }))
+        : Promise.resolve(null),
+    );
+    const { PrerequisiteGuide } = await import("@/components/prerequisite-guide");
+    render(<PrerequisiteGuide />, { wrapper: createWrapper() });
+
+    const guide = await screen.findByTestId("prerequisite-guide");
+    expect(guide.getAttribute("data-current-phase")).toBe("setup");
+    expect(screen.getByTestId("prerequisite-guide-phase").textContent).toContain("セットアップ完了");
+  });
+
+  test("disappears at the terminal diagnosis phase", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-state" ? Promise.resolve(stateWith("diagnosis", null)) : Promise.resolve(null),
+    );
+    const { PrerequisiteGuide } = await import("@/components/prerequisite-guide");
+    const { container } = render(<PrerequisiteGuide />, { wrapper: createWrapper() });
+
+    // Give the query a tick to resolve, then assert nothing rendered.
+    await waitFor(() => expect(mockApi.get).toHaveBeenCalledWith("/system-state"));
+    expect(screen.queryByTestId("prerequisite-guide")).not.toBeInTheDocument();
+    expect(container.textContent).toBe("");
+  });
+
+  test("CTA navigates to the StateItem target", async () => {
+    window.history.pushState({}, "", "/");
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-state" ? Promise.resolve(stateWith("setup")) : Promise.resolve(null),
+    );
+    const { PrerequisiteGuide } = await import("@/components/prerequisite-guide");
+    render(<PrerequisiteGuide />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByTestId("prerequisite-guide-cta"));
+    await waitFor(() => {
+      expect(window.location.pathname).toBe("/repository");
+    });
+  });
+
+  test("Probe Planner shows the gate in its generate dialog when preparation is incomplete", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-state") return Promise.resolve(stateWith("preparation"));
+      if (path === "/probe-plans") return Promise.resolve({ plans: [], is_mock: false });
+      return Promise.resolve(null);
+    });
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByText("Generate Plan"));
+    expect(await screen.findByTestId("planner-prerequisite-guide")).toBeInTheDocument();
+  });
+
+  test("Probe Planner hides the gate once preparation is complete", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-state") return Promise.resolve(stateWith("diagnosis", null));
+      if (path === "/probe-plans") return Promise.resolve({ plans: [], is_mock: false });
+      return Promise.resolve(null);
+    });
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByText("Generate Plan"));
+    // Dialog opened (feature label present) but no prerequisite gate.
+    expect(await screen.findByText("Feature")).toBeInTheDocument();
+    expect(screen.queryByTestId("planner-prerequisite-guide")).not.toBeInTheDocument();
   });
 });

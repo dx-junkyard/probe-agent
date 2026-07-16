@@ -18,6 +18,20 @@ export interface ComponentSummary {
   last_seen: number | null;
 }
 
+// Replay capture (Issue #242 Phase A / #243): deterministic, finite-set
+// classification of whether a trace's structured input capture can
+// mechanically restore the call inputs. See docs/project-intelligence.md's
+// Replay / Simulation section for the full reason-code semantics.
+export type Replayability = "replayable" | "partial" | "unreplayable";
+export type ReplayReason =
+  | "unsupported_type"
+  | "redacted"
+  | "depth_limit_exceeded"
+  | "size_limit_exceeded"
+  | "round_trip_failed"
+  | "capture_failed"
+  | "redaction_blocked";
+
 export interface TraceEvent {
   trace_id: string;
   component_id: string;
@@ -27,6 +41,11 @@ export interface TraceEvent {
   error: string | null;
   duration_ms: number | null;
   timestamp: number;
+  // Replay capture (Issue #242 Phase A / #243) -- present since Phase A;
+  // null on pre-Phase-A rows or components not opted into replay_capture.
+  input_capture?: unknown | null;
+  replayability?: Replayability | null;
+  replay_reasons?: ReplayReason[] | null;
 }
 
 export interface Policy {
@@ -78,6 +97,8 @@ export interface LineageStep {
   timestamp: number;
   output: string | null;
   error: string | null;
+  replayability: Replayability | null;
+  replay_reasons: ReplayReason[];
   entities: LineageEntity[];
   projections: LineageProjection[];
 }
@@ -309,6 +330,9 @@ export interface SystemStateTargetUi {
   action_label: string;
 }
 
+/** User phase (Issue #237): setup -> preparation -> diagnosis (terminal). */
+export type UserPhase = "setup" | "preparation" | "diagnosis";
+
 export interface SystemStateItem {
   state_id: string;
   state_group: string;
@@ -331,6 +355,15 @@ export interface SystemStateItem {
   dedupe_key: string;
   scope: string;
   decision_method: "deterministic";
+  /** Fixed state_group -> phase mapping plus a small per-item override list (Issue #237). */
+  phase?: UserPhase;
+}
+
+export interface SystemStatePhaseCompletion {
+  phase: UserPhase;
+  complete: boolean;
+  /** Issue #240: server-provided display label (Japanese) for this phase. */
+  label?: string;
 }
 
 export interface SystemStateAssessment {
@@ -342,6 +375,9 @@ export interface SystemStateAssessment {
   primary_item: SystemStateItem | null;
   notification_items: SystemStateItem[];
   page_items: Record<string, SystemStateItem[]>;
+  /** Current user phase and each phase's completion condition (Issue #237). */
+  user_phase?: UserPhase;
+  phases?: SystemStatePhaseCompletion[];
 }
 
 export type InterviewSessionStatus = "open" | "proposals_ready" | "materialized" | "closed";
@@ -1957,23 +1993,15 @@ export interface SystemUnderstandingPipelineStep {
   step: string;
   status: "complete" | "missing" | "warning" | "blocked" | "failed";
   detail?: string | null;
+  /** Issue #240: server-provided display label (Japanese) for this step. */
+  label?: string;
 }
 
+// Still used by SystemUnderstandingStageStatus.stage (the 4 Hub stages).
+// Issue #239 removed SystemUnderstandingNextAction / NextActionKind, which
+// used to be this type's only other consumer (the deprecated top-level
+// next_actions / primary_action fields).
 export type NextActionCategory = "understand" | "observe" | "instrument" | "evaluate";
-
-// Issue #201: how the action is carried out. "navigate" (default) links to a
-// page; "build" triggers the Build / Refresh job directly. Optional on the
-// client type (rather than required) so it defaults to "navigate" without
-// forcing every existing next_actions fixture/mock to be updated.
-export type NextActionKind = "navigate" | "build";
-
-export interface SystemUnderstandingNextAction {
-  action: string;
-  reason: string;
-  category: NextActionCategory;
-  link?: string | null;
-  action_kind?: NextActionKind;
-}
 
 export interface SystemUnderstandingGapSummary {
   gap_type: string;
@@ -2124,6 +2152,11 @@ export interface SystemUnderstandingStageStatus {
   stage: NextActionCategory;
   status: SystemUnderstandingStageStatusValue | string;
   counts: Record<string, number>;
+  // Issue #240: server-supplied Japanese display copy. Optional so existing
+  // fixtures/mocks that predate these fields keep working; the UI prefers
+  // them over its local STAGE_LABELS/STAGE_DESCRIPTIONS fallback.
+  label?: string;
+  description?: string;
 }
 
 // Issue #203: before/after gap counts across the last two settled builds.
@@ -2145,19 +2178,22 @@ export interface SystemUnderstandingOut {
   gaps: SystemUnderstandingGap[];
   gap_summary: SystemUnderstandingGapSummary[];
   metadata_coverage: SystemUnderstandingMetadataCoverage | null;
-  next_actions: SystemUnderstandingNextAction[];
-  // Issue #201: single highest-priority action for the current state; null
-  // while a build job is actively running.
-  primary_action?: SystemUnderstandingNextAction | null;
   // Issue #202: per-stage completion status + counts. Optional so existing
   // fixtures/mocks that predate this field keep working (backward compat).
   stages?: SystemUnderstandingStageStatus[];
   // Issue #203: gap-count trend across the last two settled builds (empty
-  // until 2 builds have recorded history), and whether a materialized
-  // Interview change post-dates the latest completed build. Optional for
-  // backward compat with fixtures/mocks that predate this field.
+  // until 2 builds have recorded history). Optional for backward compat with
+  // fixtures/mocks that predate this field.
   gap_trend?: SystemUnderstandingGapTrend[];
-  understanding_refresh_recommended?: boolean;
+  // Issue #201's `primary_action`, Issue #174's `next_actions`, and Issue
+  // #203's `understanding_refresh_recommended` were removed in Issue #239.
+  // The canonical "what should the user do next" projection is now
+  // `GET /system-state`'s `primary_item` / `page_items` (see useSystemState
+  // in api/hooks.ts and SystemStateBanner in components/system-state.tsx).
+  // Issue #240: server-supplied Japanese success summary shown when the whole
+  // pipeline is complete (null/absent otherwise). Optional for backward
+  // compat with fixtures that predate it.
+  success_summary?: string | null;
 }
 
 // Capability context: gaps / probe plans / experiments linked to one
@@ -2504,4 +2540,342 @@ export interface PublishAuditEventOut {
   actor_user_id: number | null;
   detail: Record<string, unknown> | null;
   created_at: number;
+}
+
+// ── Replay / Simulation (Issue #242, Phase D Workbench UI / #246) ──────────
+// Field names mirror app/models.py exactly (Phases A-C: #243-#245).
+
+export type ReplayInputSource = "structured" | "repr_partial";
+export type ReplaySkipReason =
+  | "unreplayable_capture"
+  | "repr_parse_failed"
+  | "undecodable_input"
+  | "trace_missing";
+export type ReplaySetSourceKind = "manual" | "analyzer_run";
+export type ReplayApprovalStatus = "approved" | "revoked";
+
+export interface ReplaySetTraceOut {
+  trace_id: string;
+  exists: boolean;
+  replayability: Replayability | null;
+  replay_reasons: string[];
+  // The input_source/skip_reason a replay run would deterministically use
+  // for this trace (same rule as the runner) -- drives the Workbench badges.
+  input_source: ReplayInputSource | null;
+  skip_reason: ReplaySkipReason | null;
+}
+
+export interface ReplaySetOut {
+  id: number;
+  system_id: number;
+  component_id: string;
+  name: string;
+  source: ReplaySetSourceKind;
+  source_analyzer_run_id: number | null;
+  trace_ids: string[];
+  traces: ReplaySetTraceOut[];
+  created_at: number;
+}
+
+export interface ReplayRiskPointOut {
+  point_id: number;
+  plan_id: number;
+  side_effect_risk: string | null;
+  replayability: string | null;
+}
+
+export interface ReplayRiskContextOut {
+  probe_plan_points: ReplayRiskPointOut[];
+  warning: string;
+}
+
+export interface ReplayApprovalOut {
+  id: number;
+  system_id: number;
+  component_id: string;
+  status: ReplayApprovalStatus;
+  reason: string;
+  approved_by_user_id: number | null;
+  decision_method: string;
+  risk_context: Record<string, unknown> | null;
+  created_at: number;
+  revoked_at: number | null;
+  revoked_by_user_id: number | null;
+}
+
+export interface ReplayApprovalStateOut {
+  component_id: string;
+  active: boolean;
+  approval: ReplayApprovalOut | null;
+  risk_context: ReplayRiskContextOut;
+}
+
+export type ReplayVariantCaseStatus =
+  | "match"
+  | "diff"
+  | "candidate_error"
+  | "error_to_success"
+  | "error_to_same_error"
+  | "error_to_different_error"
+  | "skipped";
+export type ReplayVariantComparisonMode = "structured" | "repr";
+export type ReplayVariantSource = "manual" | "pasted" | "llm_draft";
+export type ReplayVariantApplyStatus = "applied" | "invalid_patch" | "not_applicable";
+export type ReplayVariantRunStatus = "running" | "completed" | "failed";
+export type ReplayVariantDraftStatus = "proposed" | "failed";
+
+export interface ReplayVariantCaseResultOut {
+  id: number;
+  trace_id: string;
+  position: number;
+  case_status: ReplayVariantCaseStatus;
+  comparison_mode: ReplayVariantComparisonMode | null;
+  baseline_output: string | null;
+  candidate_output: string | null;
+  candidate_error: string | null;
+  recorded_error: string | null;
+  duration_ms: number | null;
+  duration_delta_ms: number | null;
+  field_diffs: string[];
+  output_truncated: boolean;
+  created_at: number;
+}
+
+export interface ReplayVariantAggregateOut {
+  match: number;
+  diff: number;
+  candidate_error: number;
+  error_to_success: number;
+  error_to_same_error: number;
+  error_to_different_error: number;
+  skipped: number;
+  total: number;
+  avg_duration_delta_ms: number | null;
+  examples: Record<string, string[]>;
+}
+
+export interface ReplayVariantOut {
+  id: number;
+  replay_run_id: number;
+  variant_key: string;
+  label: string;
+  is_baseline: boolean;
+  patch_text: string;
+  patch_hash: string;
+  source: string;
+  apply_status: ReplayVariantApplyStatus;
+  apply_error: string | null;
+  status: ReplayVariantRunStatus;
+  error: string | null;
+  workspace_path: string | null;
+  cleanup_state: string;
+  cleanup_error: string | null;
+  aggregate: ReplayVariantAggregateOut;
+  cases: ReplayVariantCaseResultOut[];
+  created_at: number;
+  started_at: number | null;
+  completed_at: number | null;
+}
+
+export interface ReplayVariantRunOut {
+  id: number;
+  system_id: number;
+  replay_set_id: number;
+  component_id: string;
+  snapshot_id: number;
+  commit_sha: string;
+  symbol_path: string;
+  symbol_qualified_name: string;
+  status: ReplayVariantRunStatus;
+  error: string | null;
+  trace_set_hash: string;
+  sandbox_config: Record<string, unknown>;
+  approval_id: number | null;
+  variants: ReplayVariantOut[];
+  created_at: number;
+  started_at: number | null;
+  completed_at: number | null;
+}
+
+export interface ReplayVariantDraftOut {
+  id: number;
+  system_id: number;
+  replay_set_id: number;
+  component_id: string;
+  trace_id: string;
+  objective: string;
+  snapshot_id: number;
+  symbol_path: string;
+  symbol_qualified_name: string;
+  generated_code: string;
+  patch_text: string;
+  patch_hash: string;
+  notes: string;
+  status: ReplayVariantDraftStatus;
+  error: string | null;
+  provider: string | null;
+  model: string | null;
+  prompt_version: string | null;
+  schema_version: string | null;
+  decision_method: "deterministic" | "reasoning_llm" | "manual" | null;
+  is_mock: boolean;
+  created_at: number;
+}
+
+export interface ReplayVariantExperimentPayloadOut {
+  label: string;
+  patch_text: string;
+  patch_hash: string;
+  source: string;
+  risk_note: string;
+  origin: Record<string, unknown>;
+}
+
+export interface ReplayRegressionScaffoldOut {
+  id: number;
+  intelligence_run_id: number;
+  replay_run_id: number;
+  replay_variant_id: number;
+  replay_set_id: number;
+  trace_id: string;
+  snapshot_id: number;
+  scaffold_text: string;
+  status: "proposed" | "failed";
+  error: string | null;
+  provider: string;
+  model: string;
+  prompt_version: string;
+  schema_version: string;
+  decision_method: "reasoning_llm";
+  is_mock: boolean;
+  created_at: number;
+}
+
+// Two small deterministic backend helpers for the Workbench's Direct-edit
+// flow (Issue #246): read the pinned-snapshot source, then diff an edited
+// copy of it. No judgement -- structural reads/text diffing only.
+export interface ReplaySourceOut {
+  replay_set_id: number;
+  component_id: string;
+  snapshot_id: number;
+  commit_sha: string;
+  path: string;
+  qualified_name: string;
+  start_line: number;
+  end_line: number;
+  source: string;
+}
+
+export interface ReplaySourceDiffOut {
+  patch_text: string;
+  patch_hash: string;
+}
+
+// ── AI Candidate Studio (Issue #252) ────────────────────────────────────────
+// A conversation + candidate-versioning layer over the EXISTING isolated
+// Replay stack (#243-#246): generation is a reasoning-model structured
+// proposal + deterministic splice->diff (fail-closed); replaying a version
+// reuses POST /replay-variant-runs verbatim (approval gate, sandbox, diff
+// matrix); promotion reuses the variant experiment-payload shape and never
+// creates an experiment/merges/deploys (Principle 7). Field names mirror
+// app/models.py exactly.
+
+export type CandidateSessionStatus = "active" | "archived";
+export type CandidateMessageRole = "user" | "assistant";
+export type CandidateVersionStatus = "proposed" | "failed";
+export type CandidateReplayStatus = "not_run" | "running" | "completed" | "failed";
+
+export interface CandidateMessageOut {
+  id: number;
+  session_id: number;
+  role: CandidateMessageRole;
+  content: string;
+  version_id: number | null;
+  created_at: number;
+}
+
+export interface CandidateVersionOut {
+  id: number;
+  system_id: number;
+  session_id: number;
+  parent_version_id: number | null;
+  version_number: number;
+  instruction: string;
+  status: CandidateVersionStatus;
+  summary: string;
+  assumptions: string[];
+  changed_symbols: string[];
+  risks: string[];
+  suggested_tests: string[];
+  generated_code: string;
+  patch_text: string;
+  patch_hash: string;
+  error: string | null;
+  replay_status: CandidateReplayStatus;
+  replay_run_id: number | null;
+  replay_variant_id: number | null;
+  promoted_at: number | null;
+  // Reasoning provenance (from the linked intelligence_runs row).
+  provider: string | null;
+  model: string | null;
+  prompt_version: string | null;
+  schema_version: string | null;
+  decision_method: "deterministic" | "reasoning_llm" | "manual" | null;
+  is_mock: boolean;
+  created_at: number;
+}
+
+export interface CandidateSessionOut {
+  id: number;
+  system_id: number;
+  component_id: string;
+  snapshot_id: number;
+  commit_sha: string;
+  symbol_path: string;
+  symbol_qualified_name: string;
+  replay_set_id: number;
+  objective: string;
+  status: CandidateSessionStatus;
+  created_at: number;
+  updated_at: number;
+  // Empty on the list endpoint (GET /candidate-sessions); populated on the
+  // single-session endpoint (GET /candidate-sessions/{id}).
+  messages: CandidateMessageOut[];
+  versions: CandidateVersionOut[];
+}
+
+export interface CandidateSessionCreateRequest {
+  component_id: string;
+  // With no replay/trace selection, the server creates a set from up to 50
+  // recent traces for the component.
+  replay_set_id?: number;
+  trace_ids?: string[];
+  trace_id?: string;
+  snapshot_id?: number;
+  objective?: string;
+}
+
+export interface CandidatePromotionOut {
+  candidate_version_id: number;
+  label: string;
+  patch_text: string;
+  patch_hash: string;
+  source: string;
+  risk_note: string;
+  origin: Record<string, unknown>;
+}
+
+export interface CandidateEventOut {
+  version_id: number;
+  version_number: number;
+  phase: "generating" | "validating_patch" | "completed" | "failed" | "replaying";
+  status: string;
+  replay_status: CandidateReplayStatus;
+  detail: string;
+  created_at: number;
+}
+
+export interface CandidateEventsOut {
+  session_id: number;
+  events: CandidateEventOut[];
 }

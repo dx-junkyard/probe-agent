@@ -20,6 +20,8 @@ import { Link, useSearchParams } from "react-router-dom";
 import type { ProbePatchOut } from "@/api/types";
 import { AddToWorkspaceButton } from "@/components/add-to-workspace";
 import { ContextHeader } from "@/components/layout/context-header";
+import { PrerequisiteGuide } from "@/components/prerequisite-guide";
+import { useSystemState } from "@/api/hooks";
 
 export default function ProbePlannerPage() {
   const [searchParams] = useSearchParams();
@@ -38,6 +40,15 @@ export default function ProbePlannerPage() {
   const updatePointStatus = useUpdateProbePointStatus();
   const { data: patches } = useProbePatches();
   const { data: repoStatus } = useRepositoryStatus();
+  // Issue #241: an upstream gate (informational, never a hard block). The
+  // intended journey reaches the Probe Planner only after diagnosis-prep is
+  // done; when the System is still in setup/preparation, the generate dialog
+  // shows a phase prerequisite guide. The `phases` completion comes straight
+  // from GET /system-state (deterministic, server-computed) — no client
+  // derivation.
+  const { data: systemState } = useSystemState();
+  const preparationComplete =
+    systemState?.phases?.find((p) => p.phase === "preparation")?.complete ?? false;
   const generatePatch = useGeneratePatch();
   const validatePatch = useValidatePatch();
   const applyPatch = useApplyProbePatch();
@@ -360,6 +371,14 @@ export default function ProbePlannerPage() {
           <DialogTitle>Generate Probe Plan</DialogTitle>
         </DialogHeader>
         <div className="space-y-4">
+          {/* Issue #241: when diagnosis preparation is not complete, explain
+              the missing prerequisite and link to the next step. This does
+              NOT disable generation (the free-text feature id below stays the
+              explicit escape hatch) — it just steers the developer back onto
+              the intended journey. */}
+          {!preparationComplete && (
+            <PrerequisiteGuide testId="planner-prerequisite-guide" />
+          )}
           {workspaceDraft?.draft_type === "probe_plan_draft" && (
             <div className="rounded-md border bg-secondary/30 px-3 py-2 text-xs">
               Prefilled from Decision Workspace proposal #{workspaceDraft.proposal_id}.

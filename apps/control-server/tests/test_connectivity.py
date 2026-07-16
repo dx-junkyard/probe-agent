@@ -79,6 +79,45 @@ def test_smoke_detection_is_exact_match_only(client):
     assert body["real_trace_count"] == 1
 
 
+def test_materialized_session_ids_reflect_non_empty_materialization_diff(client):
+    # Issue #236 regression: get_connectivity_facts (app/state_facts.py) took
+    # over this query from routes/connectivity.py verbatim -- pin that a real
+    # materialized session round-trips through the response.
+    from app.db import get_conn
+
+    client.post("/traces", json=_trace("summarizer", "t1"))
+    with get_conn() as conn:
+        system_id = conn.execute(
+            "SELECT system_id FROM traces WHERE trace_id = 't1'"
+        ).fetchone()["system_id"]
+        now = time.time()
+        snap = conn.execute(
+            """INSERT INTO repository_snapshots
+                   (system_id, repo_path, commit_sha, status, file_count,
+                    total_size, indexed_size, created_at, completed_at)
+               VALUES (?, '', 'sha', 'ready', 0, 0, 0, ?, ?)""",
+            (system_id, now, now),
+        )
+        conn.execute(
+            """INSERT INTO interview_session
+                   (system_id, snapshot_id, title, focus, status, stage,
+                    materialization_diff, created_at, updated_at)
+               VALUES (?, ?, '', '', 'open', 'understanding_initialized', 'diff --git a b', ?, ?)""",
+            (system_id, snap.lastrowid, now, now),
+        )
+        empty_diff_session = conn.execute(
+            """INSERT INTO interview_session
+                   (system_id, snapshot_id, title, focus, status, stage,
+                    materialization_diff, created_at, updated_at)
+               VALUES (?, ?, '', '', 'open', 'understanding_initialized', '', ?, ?)""",
+            (system_id, snap.lastrowid, now, now),
+        )
+
+    body = client.get("/connectivity/status").json()
+    assert len(body["materialized_session_ids"]) == 1
+    assert empty_diff_session.lastrowid not in body["materialized_session_ids"]
+
+
 # --- System isolation -------------------------------------------------------
 
 

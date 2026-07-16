@@ -108,6 +108,59 @@ def handler(x):
 - `None`(既定)は全件保持。`0.0` は lineage/projection を全て落とす。
 - 保存済みデータの期間・件数 retention は Control Server 側の設定(`/retention/*`)で行う。
 
+## 再実行可能な入力キャプチャ（Issue #242 Phase A / #243）
+
+`@probe(replay_capture=...)` で **component 単位の opt-in** により、呼び出し引数を
+JSON で往復（round-trip）可能な構造として記録できる。後続フェーズ（リプレイ実行・
+オフライン shadow）が入力を機械的に復元するための基盤で、既存の `input` / `output`
+（repr 文字列）はそのまま変わらない。
+
+```python
+from probe_agent import probe
+
+@probe(component_id="normalizer", replay_capture=True)
+def normalize(payload):
+    ...
+
+# redact 付き（パス文法は projection と同一。登録時に fail closed で検証）
+@probe(component_id="auth-check", replay_capture={"redact": ["$.kwargs.password"]})
+def check(user, password=None):
+    ...
+```
+
+- 未指定（`None` / `False`）なら**一切のキャプチャ処理を行わず**、trace ペイロードに
+  新フィールドは付かない。opt-in 済みでも失敗は常に非致命（対象関数の返値・例外・
+  trace 送信に影響しない）。
+- キャプチャの root は `{"args": [...], "kwargs": {...}}`。値は canonical JSON に
+  エンコードされる。JSON ネイティブ型（`None`/`bool`/`int`/`str`/有限 `float`/`list`/
+  文字列キー `dict`）はそのまま、非ネイティブ型は予約キー `"__probe__"` の明示
+  エンコードを使う:
+  - `tuple` → `{"__probe__": "tuple", "items": [...]}`
+  - `set` / `frozenset` → `{"__probe__": "set"|"frozenset", "items": [...]}`
+    （items は canonical JSON 表現で決定的にソート）
+  - `bytes` → `{"__probe__": "bytes", "b64": "..."}`
+  - 非有限 float → `{"__probe__": "float", "value": "nan"|"inf"|"-inf"}`
+  - 非文字列キー dict / `"__probe__"` キーを含む dict →
+    `{"__probe__": "dict", "items": [[k, v], ...]}`（decode の曖昧さを排除）
+  - 上記以外 → `{"__probe__": "unsupported", "type": "<型名>"}`（raw 値や repr は
+    **決して埋め込まない**）
+- **replayability 分類（決定的・有限集合、Principle 6）**: 劣化なし →
+  `replayable`、キャプチャは保存されたが一部の値が劣化 → `partial`、キャプチャを
+  保存できない → `unreplayable`。理由コードは
+  `unsupported_type` / `redacted` / `depth_limit_exceeded` / `size_limit_exceeded` /
+  `round_trip_failed` / `capture_failed` / `redaction_blocked` の有限集合。
+- `redact` は projection と同じパス文法・同じマスク文字列を使い、**エンコード前**に
+  root へ適用する。構造的に置換できない redact パスは **fail closed でキャプチャ全体を
+  破棄**し `unreplayable` / `redaction_blocked` になる（マスク漏れより破棄を選ぶ）。
+- サイズ上限（`PROBE_REPLAY_CAPTURE_MAX_BYTES`、既定 65536）超過時はキャプチャ全体を
+  破棄して `unreplayable` / `size_limit_exceeded`（**切り詰めた JSON は round-trip
+  できないため部分保存はしない**）。ネスト深さは 20 段まで（超過ノードは
+  `unsupported` マーカー化 + `depth_limit_exceeded`）。
+- エンコード後に decode → 元値と構造比較する round-trip 検証を行い、不一致は
+  `round_trip_failed` として `partial` に落とす（NaN は isnan で比較）。
+- trace には `input_capture` / `replayability` / `replay_reasons` が追加される
+  （契約は `shared/schemas/trace_event.schema.json`）。
+
 ## 環境変数
 
 | 名前 | デフォルト | 説明 |
@@ -121,6 +174,7 @@ def handler(x):
 | `PROBE_PROJECTION_MAX_BYTES` | `8192` | projection データの最大バイト数（超過で決定的に truncate） |
 | `PROBE_PROJECTION_MAX_FIELDS` | `64` | projection の最大フィールド数 |
 | `PROBE_PROJECTION_MAX_SAMPLES` | `20` | sample の最大要素数 |
+| `PROBE_REPLAY_CAPTURE_MAX_BYTES` | `65536` | replay capture（canonical JSON）の最大バイト数。超過でキャプチャ全体を破棄し `unreplayable` / `size_limit_exceeded`（部分保存はしない） |
 
 ## 設計メモ
 

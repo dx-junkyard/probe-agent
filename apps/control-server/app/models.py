@@ -11,6 +11,21 @@ EntityRole = Literal["source", "derived", "related"]
 # Projection phases: input/output (Issue #146); shadow_* added in Issue #150.
 ProjectionPhase = Literal["input", "output", "shadow_current", "shadow_candidate"]
 
+# Replay capture (Issue #242 Phase A / #243): deterministic structural
+# classification of whether a trace's structured input capture can
+# mechanically restore the call inputs. Finite sets shared with
+# shared/schemas/trace_event.schema.json and the SDK's replay_capture module.
+Replayability = Literal["replayable", "partial", "unreplayable"]
+ReplayReason = Literal[
+    "unsupported_type",
+    "redacted",
+    "depth_limit_exceeded",
+    "size_limit_exceeded",
+    "round_trip_failed",
+    "capture_failed",
+    "redaction_blocked",
+]
+
 
 class TraceEntity(BaseModel):
     type: str
@@ -48,6 +63,14 @@ class TraceEvent(BaseModel):
     entities: Optional[List[TraceEntity]] = None
     # Phase 2 projections (Issue #146) — optional extraction results.
     projections: Optional[List[TraceProjectionIn]] = None
+    # Replay capture (Issue #242 Phase A / #243) — all optional, additive.
+    # input_capture is the canonical JSON-encoded {"args": [...], "kwargs":
+    # {...}} structure (see trace_event.schema.json for the "__probe__"
+    # marker encoding); replayability/replay_reasons are enum-validated so
+    # unknown values are rejected with 422.
+    input_capture: Optional[Any] = None
+    replayability: Optional[Replayability] = None
+    replay_reasons: Optional[List[ReplayReason]] = None
 
 
 class ProjectionOut(BaseModel):
@@ -93,6 +116,8 @@ class LineageStepOut(BaseModel):
     timestamp: float
     output: Optional[str] = None
     error: Optional[str] = None
+    replayability: Optional[Replayability] = None
+    replay_reasons: List[ReplayReason] = Field(default_factory=list)
     entities: List[LineageEntityOut] = Field(default_factory=list)
     projections: List[LineageProjectionOut] = Field(default_factory=list)
 
@@ -3070,22 +3095,7 @@ class SystemUnderstandingPipelineStepOut(BaseModel):
     step: str
     status: PipelineStepStatus
     detail: Optional[str] = None
-
-
-NextActionCategory = Literal["understand", "observe", "instrument", "evaluate"]
-
-# Issue #201: finite set of how a next action is carried out. "navigate" is the
-# default (link the user somewhere); "build" means the action itself triggers
-# the Build / Refresh job rather than a page link.
-NextActionKind = Literal["navigate", "build"]
-
-
-class SystemUnderstandingNextActionOut(BaseModel):
-    action: str
-    reason: str
-    category: NextActionCategory
-    link: Optional[str] = None
-    action_kind: NextActionKind = "navigate"
+    label: str = ""
 
 
 class SystemUnderstandingGapSummaryOut(BaseModel):
@@ -3192,6 +3202,11 @@ class SystemUnderstandingStageStatusOut(BaseModel):
     stage: str
     status: str
     counts: Dict[str, int] = Field(default_factory=dict)
+    # Issue #240: server-supplied Japanese display copy (optional so existing
+    # dashboard contract tests that build this object without them stay valid;
+    # the Dashboard prefers these over its local STAGE_LABELS fallback).
+    label: str = ""
+    description: str = ""
 
 
 # Issue #203: deterministic before/after comparison of gap counts between the
@@ -3216,20 +3231,20 @@ class SystemUnderstandingOut(BaseModel):
     gaps: List[SystemUnderstandingGapOut] = Field(default_factory=list)
     gap_summary: List[SystemUnderstandingGapSummaryOut] = Field(default_factory=list)
     metadata_coverage: Optional[SystemUnderstandingMetadataCoverageOut] = None
-    next_actions: List[SystemUnderstandingNextActionOut] = Field(default_factory=list)
-    # Issue #201: single highest-priority action for the current state,
-    # derived deterministically in system_understanding_service._derive_primary_action.
-    # None when a build job is actively running (the BuildJobPanel already
-    # shows progress) so the header CTA and this card never contradict it.
-    primary_action: Optional[SystemUnderstandingNextActionOut] = None
     # Issue #202: deterministic completion status + counts for each of the 4
     # Hub stages (understand / observe / instrument / evaluate).
     stages: List[SystemUnderstandingStageStatusOut] = Field(default_factory=list)
     # Issue #203: gap-count trend across the last two settled builds (empty
-    # until 2 builds have recorded history), plus whether a materialized
-    # Interview change is newer than the latest completed build.
+    # until 2 builds have recorded history).
     gap_trend: List[SystemUnderstandingGapTrendOut] = Field(default_factory=list)
-    understanding_refresh_recommended: bool = False
+    # Issue #201's `primary_action`, Issue #174's `next_actions`, and Issue
+    # #203's `understanding_refresh_recommended` were removed in Issue #239.
+    # The canonical "what should the user do next" projection is now
+    # `GET /system-state`'s `primary_item` / `page_items` (Issue #238).
+    # Issue #240: server-supplied Japanese summary shown when the whole
+    # pipeline is complete (None otherwise); replaces the Dashboard's
+    # client-assembled English success string.
+    success_summary: Optional[str] = None
 
 
 class CapabilityContextProbePlanOut(BaseModel):
@@ -3527,6 +3542,8 @@ StateGroup = Literal[
     "repository", "snapshot", "pipeline", "understanding", "interview",
     "runtime", "proposal", "configuration",
 ]
+# User phase (Issue #237): setup -> preparation -> diagnosis (terminal).
+UserPhase = Literal["setup", "preparation", "diagnosis"]
 
 
 class SystemStateTargetUiOut(BaseModel):
@@ -3557,6 +3574,15 @@ class SystemStateItemOut(BaseModel):
     scope: str = "global"
     # System State Assessment is deterministic and LLM-free (Issue #193 Phase 1).
     decision_method: Literal["deterministic"] = "deterministic"
+    # Fixed state_group -> phase mapping plus a small explicit per-item
+    # override list (Issue #237); see system_state._phase_for_item.
+    phase: UserPhase = "diagnosis"
+
+
+class SystemStatePhaseCompletionOut(BaseModel):
+    phase: UserPhase
+    complete: bool
+    label: str = ""
 
 
 class SystemStateAssessmentOut(BaseModel):
@@ -3568,6 +3594,10 @@ class SystemStateAssessmentOut(BaseModel):
     primary_item: Optional[SystemStateItemOut] = None
     notification_items: List[SystemStateItemOut] = Field(default_factory=list)
     page_items: Dict[str, List[SystemStateItemOut]] = Field(default_factory=dict)
+    # User phase (Issue #237): the current phase plus each phase's
+    # completion condition. Additive; existing fields above are unchanged.
+    user_phase: UserPhase = "setup"
+    phases: List[SystemStatePhaseCompletionOut] = Field(default_factory=list)
 
 
 class AssistantActionOut(BaseModel):
@@ -3761,3 +3791,532 @@ class AssistantAskOut(BaseModel):
     prompt_version: str
     schema_version: str
     generated_at: float
+
+
+# --- Replay engine (Issue #242 Phase B / #244) -------------------------------
+
+# Finite classification sets (Principle 6). Kept in sync with
+# app/replay_runner.py and the replay_case_results table comments.
+ReplayCaseStatus = Literal["match", "mismatch", "error", "skipped"]
+ReplayInputSource = Literal["structured", "repr_partial"]
+ReplaySkipReason = Literal[
+    "unreplayable_capture",
+    "repr_parse_failed",
+    "undecodable_input",
+    "trace_missing",
+]
+ReplaySetSource = Literal["manual", "analyzer_run"]
+ReplayApprovalStatus = Literal["approved", "revoked"]
+
+
+class ReplayApprovalCreate(BaseModel):
+    reason: str = Field(..., min_length=1)
+
+
+class ReplayRiskPointOut(BaseModel):
+    """A persisted probe plan point label reused as display-only risk context.
+
+    No new reasoning run and no heuristic inference: these are verbatim
+    stored labels; absent labels are returned as absent (None)."""
+
+    point_id: int
+    plan_id: int
+    side_effect_risk: Optional[str] = None
+    replayability: Optional[str] = None
+
+
+class ReplayRiskContextOut(BaseModel):
+    probe_plan_points: List[ReplayRiskPointOut] = Field(default_factory=list)
+    warning: str
+
+
+class ReplayApprovalOut(BaseModel):
+    id: int
+    system_id: int
+    component_id: str
+    status: ReplayApprovalStatus
+    reason: str = ""
+    approved_by_user_id: Optional[int] = None
+    decision_method: str = "manual"
+    risk_context: Optional[Dict[str, Any]] = None
+    created_at: float
+    revoked_at: Optional[float] = None
+    revoked_by_user_id: Optional[int] = None
+
+
+class ReplayApprovalStateOut(BaseModel):
+    component_id: str
+    active: bool
+    approval: Optional[ReplayApprovalOut] = None
+    risk_context: ReplayRiskContextOut
+
+
+class ReplaySetCreate(BaseModel):
+    component_id: str = Field(..., min_length=1)
+    name: str = ""
+    trace_ids: Optional[List[str]] = None
+    analyzer_run_id: Optional[int] = None
+
+
+class ReplaySetTraceOut(BaseModel):
+    """Per-trace replay preview: recorded replayability plus the input source
+    a replay would deterministically use (same rule as the runner)."""
+
+    trace_id: str
+    exists: bool
+    replayability: Optional[str] = None
+    replay_reasons: List[str] = Field(default_factory=list)
+    input_source: Optional[ReplayInputSource] = None
+    skip_reason: Optional[ReplaySkipReason] = None
+
+
+class ReplaySetOut(BaseModel):
+    id: int
+    system_id: int
+    component_id: str
+    name: str = ""
+    source: ReplaySetSource
+    source_analyzer_run_id: Optional[int] = None
+    trace_ids: List[str] = Field(default_factory=list)
+    traces: List[ReplaySetTraceOut] = Field(default_factory=list)
+    created_at: float
+
+
+class ReplayRunCreate(BaseModel):
+    replay_set_id: int
+    snapshot_id: Optional[int] = None
+
+
+class ReplayCaseResultOut(BaseModel):
+    id: int
+    trace_id: str
+    position: int
+    case_status: ReplayCaseStatus
+    input_source: Optional[ReplayInputSource] = None
+    skip_reason: Optional[ReplaySkipReason] = None
+    replay_output: Optional[str] = None
+    replay_error: Optional[str] = None
+    recorded_output: Optional[str] = None
+    recorded_error: Optional[str] = None
+    duration_ms: Optional[float] = None
+    output_truncated: bool = False
+    comparison_mode: str = "repr"
+    created_at: float
+
+
+class ReplayRunOut(BaseModel):
+    id: int
+    system_id: int
+    replay_set_id: int
+    component_id: str
+    snapshot_id: int
+    commit_sha: str
+    symbol_path: str
+    symbol_qualified_name: str
+    status: Literal["running", "completed", "failed"]
+    error: Optional[str] = None
+    trace_set_hash: str
+    sandbox_config: Dict[str, Any] = Field(default_factory=dict)
+    approval_id: Optional[int] = None
+    workspace_path: Optional[str] = None
+    cleanup_state: str = "not_attempted"
+    cleanup_error: Optional[str] = None
+    summary: Dict[str, int] = Field(default_factory=dict)
+    cases: List[ReplayCaseResultOut] = Field(default_factory=list)
+    created_at: float
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
+
+
+# --- Replay variants (Issue #242 Phase C / #245) -----------------------------
+
+# Finite classification sets (Principle 6). Kept in sync with
+# app/replay_variants.py's module docstring and the replay_variant* table
+# comments in app/db.py.
+ReplayVariantCaseStatus = Literal[
+    "match",
+    "diff",
+    "candidate_error",
+    "error_to_success",
+    "error_to_same_error",
+    "error_to_different_error",
+    "skipped",
+]
+ReplayVariantComparisonMode = Literal["structured", "repr"]
+ReplayVariantSource = Literal["manual", "pasted", "llm_draft"]
+ReplayVariantApplyStatus = Literal["applied", "invalid_patch", "not_applicable"]
+ReplayVariantRunStatus = Literal["running", "completed", "failed"]
+ReplayVariantDraftStatus = Literal["proposed", "failed"]
+
+
+class ReplayVariantCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    label: str = Field(..., min_length=1, max_length=200)
+    patch_text: str = Field(..., min_length=1, max_length=1_000_000)
+    source: ReplayVariantSource = "manual"
+
+
+class ReplayVariantRunCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    replay_set_id: int
+    snapshot_id: Optional[int] = None
+    variants: List[ReplayVariantCreate] = Field(..., min_length=1, max_length=20)
+
+
+class ReplayVariantCaseResultOut(BaseModel):
+    id: int
+    trace_id: str
+    position: int
+    case_status: ReplayVariantCaseStatus
+    comparison_mode: Optional[ReplayVariantComparisonMode] = None
+    baseline_output: Optional[str] = None
+    candidate_output: Optional[str] = None
+    candidate_error: Optional[str] = None
+    recorded_error: Optional[str] = None
+    duration_ms: Optional[float] = None
+    duration_delta_ms: Optional[float] = None
+    field_diffs: List[str] = Field(default_factory=list)
+    output_truncated: bool = False
+    created_at: float
+
+
+class ReplayVariantAggregateOut(BaseModel):
+    match: int = 0
+    diff: int = 0
+    candidate_error: int = 0
+    error_to_success: int = 0
+    error_to_same_error: int = 0
+    error_to_different_error: int = 0
+    skipped: int = 0
+    total: int = 0
+    avg_duration_delta_ms: Optional[float] = None
+    examples: Dict[str, List[str]] = Field(default_factory=dict)
+
+
+class ReplayVariantOut(BaseModel):
+    id: int
+    replay_run_id: int
+    variant_key: str
+    label: str = ""
+    is_baseline: bool
+    patch_text: str = ""
+    patch_hash: str
+    source: str = "manual"
+    apply_status: ReplayVariantApplyStatus = "not_applicable"
+    apply_error: Optional[str] = None
+    status: ReplayVariantRunStatus = "running"
+    error: Optional[str] = None
+    workspace_path: Optional[str] = None
+    cleanup_state: str = "not_attempted"
+    cleanup_error: Optional[str] = None
+    aggregate: ReplayVariantAggregateOut = Field(default_factory=ReplayVariantAggregateOut)
+    cases: List[ReplayVariantCaseResultOut] = Field(default_factory=list)
+    created_at: float
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
+
+
+class ReplayVariantRunOut(BaseModel):
+    id: int
+    system_id: int
+    replay_set_id: int
+    component_id: str
+    snapshot_id: int
+    commit_sha: str
+    symbol_path: str
+    symbol_qualified_name: str
+    status: ReplayVariantRunStatus
+    error: Optional[str] = None
+    trace_set_hash: str
+    sandbox_config: Dict[str, Any] = Field(default_factory=dict)
+    approval_id: Optional[int] = None
+    variants: List[ReplayVariantOut] = Field(default_factory=list)
+    created_at: float
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
+
+
+class ReplayVariantDraftCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    replay_set_id: int
+    trace_id: str = Field(..., min_length=1)
+    objective: str = Field(..., min_length=1, max_length=5000)
+    snapshot_id: Optional[int] = None
+
+
+class ReplayVariantDraftOut(BaseModel):
+    id: int
+    system_id: int
+    replay_set_id: int
+    component_id: str
+    trace_id: str
+    objective: str
+    snapshot_id: int
+    symbol_path: str
+    symbol_qualified_name: str
+    generated_code: str = ""
+    patch_text: str = ""
+    patch_hash: str = ""
+    notes: str = ""
+    status: ReplayVariantDraftStatus
+    error: Optional[str] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    prompt_version: Optional[str] = None
+    schema_version: Optional[str] = None
+    decision_method: Optional[DecisionMethod] = None
+    is_mock: bool = False
+    created_at: float
+
+
+class ReplayVariantExperimentPayloadOut(BaseModel):
+    """Shapes a Replay variant's patch for POST /experiments prefill
+    (Issue #245). API shape only -- this never creates an experiment;
+    the caller copies this into an ExperimentVariantCreate."""
+
+    label: str
+    patch_text: str
+    patch_hash: str
+    source: str = "replay_variant"
+    risk_note: str = ""
+    origin: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReplayRegressionScaffoldCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    replay_run_id: int
+    replay_variant_id: int
+    trace_id: str = Field(..., min_length=1)
+
+
+class ReplayRegressionScaffoldOut(BaseModel):
+    id: int
+    intelligence_run_id: int
+    replay_run_id: int
+    replay_variant_id: int
+    replay_set_id: int
+    trace_id: str
+    snapshot_id: int
+    scaffold_text: str = ""
+    status: Literal["proposed", "failed"]
+    error: Optional[str] = None
+    provider: str
+    model: str
+    prompt_version: str
+    schema_version: str
+    decision_method: Literal["reasoning_llm"] = "reasoning_llm"
+    is_mock: bool = False
+    created_at: float
+
+
+# --- Replay source & diff helpers (Issue #242 Phase D / #246) ----------------
+#
+# Two small DETERMINISTIC helpers backing the Simulation Workbench's "Direct
+# edit" flow (Principle 6 -- no judgement here, just pinned-snapshot reads and
+# structural text diffing reusing the same worktree+git-diff mechanism
+# app/replay_draft.py already uses for LLM drafts).
+
+
+class ReplaySourceOut(BaseModel):
+    """Read-only pinned-snapshot source for the resolved Replay Set symbol's
+    file. ``source`` is the full file content at the pinned commit -- never
+    the working tree (Principle 5); start_line/end_line locate the resolved
+    symbol within it so the UI can scroll to / highlight it."""
+
+    replay_set_id: int
+    component_id: str
+    snapshot_id: int
+    commit_sha: str
+    path: str
+    qualified_name: str
+    start_line: int
+    end_line: int
+    source: str
+
+
+class ReplaySourceDiffCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    replay_set_id: int
+    snapshot_id: Optional[int] = None
+    edited_source: str = Field(..., min_length=1, max_length=2_000_000)
+
+
+class ReplaySourceDiffOut(BaseModel):
+    """Deterministic unified diff between the pinned-snapshot file and a
+    developer-edited copy of it. No judgement -- pure structural text
+    diffing (the same worktree + ``git diff`` mechanism
+    ``replay_draft._diff_against_snapshot`` uses for LLM drafts)."""
+
+    patch_text: str
+    patch_hash: str
+
+
+# --- AI Candidate Studio (Issue #252) ----------------------------------------
+#
+# A conversation + versioning layer over the existing isolated-Replay stack.
+# Finite sets (Principle 6): a version's generate lifecycle terminal status,
+# its replay lifecycle status, and message roles.
+
+CandidateVersionStatus = Literal["proposed", "failed"]
+CandidateReplayStatus = Literal["not_run", "running", "completed", "failed"]
+CandidateMessageRole = Literal["user", "assistant"]
+CandidateSessionStatus = Literal["active", "archived"]
+
+
+class CandidateSessionCreate(BaseModel):
+    """Start a Studio session for a component. At most one input selection
+    may be supplied: an existing ``replay_set_id``, an explicit ``trace_ids``
+    list, or a single ``trace_id`` (the "improve from this input" entry). With
+    no selection, the component entry point uses up to 50 recent traces. When
+    trace ids are selected, a Replay Set is created for them (reusing POST
+    /replay-sets' validation). ``snapshot_id`` defaults to the latest ready
+    snapshot."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    component_id: str = Field(..., min_length=1, max_length=500)
+    replay_set_id: Optional[int] = None
+    trace_ids: Optional[List[str]] = None
+    trace_id: Optional[str] = None
+    snapshot_id: Optional[int] = None
+    objective: str = Field(default="", max_length=5000)
+
+
+class CandidateProposal(BaseModel):
+    """Structured candidate proposal (never free-form code): the reasoning
+    model returns summary / assumptions / changed_symbols / generated_code /
+    risks / suggested_tests; the patch itself is produced deterministically by
+    splicing ``generated_code`` into the resolved symbol span and diffing
+    against the pinned snapshot (app/candidate_studio.py)."""
+
+    summary: str = ""
+    assumptions: List[str] = Field(default_factory=list)
+    changed_symbols: List[str] = Field(default_factory=list)
+    risks: List[str] = Field(default_factory=list)
+    suggested_tests: List[str] = Field(default_factory=list)
+
+
+class CandidateVersionOut(BaseModel):
+    id: int
+    system_id: int
+    session_id: int
+    parent_version_id: Optional[int] = None
+    version_number: int
+    instruction: str = ""
+    status: CandidateVersionStatus
+    summary: str = ""
+    assumptions: List[str] = Field(default_factory=list)
+    changed_symbols: List[str] = Field(default_factory=list)
+    risks: List[str] = Field(default_factory=list)
+    suggested_tests: List[str] = Field(default_factory=list)
+    generated_code: str = ""
+    patch_text: str = ""
+    patch_hash: str = ""
+    error: Optional[str] = None
+    replay_status: CandidateReplayStatus = "not_run"
+    replay_run_id: Optional[int] = None
+    replay_variant_id: Optional[int] = None
+    promoted_at: Optional[float] = None
+    # Reasoning provenance (from the linked intelligence_runs row).
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    prompt_version: Optional[str] = None
+    schema_version: Optional[str] = None
+    decision_method: Optional[DecisionMethod] = None
+    is_mock: bool = False
+    created_at: float
+
+
+class CandidateMessageOut(BaseModel):
+    id: int
+    session_id: int
+    role: CandidateMessageRole
+    content: str = ""
+    version_id: Optional[int] = None
+    created_at: float
+
+
+class CandidateSessionOut(BaseModel):
+    id: int
+    system_id: int
+    component_id: str
+    snapshot_id: int
+    commit_sha: str
+    symbol_path: str
+    symbol_qualified_name: str
+    replay_set_id: int
+    objective: str = ""
+    status: CandidateSessionStatus = "active"
+    created_at: float
+    updated_at: float
+    messages: List[CandidateMessageOut] = Field(default_factory=list)
+    versions: List[CandidateVersionOut] = Field(default_factory=list)
+
+
+class CandidateMessageCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    content: str = Field(..., min_length=1, max_length=10000)
+
+
+class CandidateGenerateCreate(BaseModel):
+    """Generate the next immutable CandidateVersion. ``instruction`` is the
+    improvement goal / constraints; ``parent_version_id`` branches off a
+    selected version (None = branch off the baseline)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    instruction: str = Field(..., min_length=1, max_length=5000)
+    parent_version_id: Optional[int] = None
+
+
+class CandidateReplayCreate(BaseModel):
+    """Replay against the session's pinned snapshot.  ``snapshot_id`` remains
+    accepted for compatibility, but a different value is rejected."""
+    model_config = ConfigDict(extra="forbid")
+
+    snapshot_id: Optional[int] = None
+
+
+class CandidatePromotionOut(BaseModel):
+    """Hands a reviewed candidate patch to the existing Experiment creation
+    flow (Issue #245's variant experiment-payload shape). API shape only --
+    this never creates an experiment, auto-adopts, merges, or deploys
+    anything (Principle 7)."""
+
+    candidate_version_id: int
+    label: str
+    patch_text: str
+    patch_hash: str
+    source: str = "candidate_studio"
+    risk_note: str = ""
+    origin: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CandidateEventOut(BaseModel):
+    """One entry of a session's job/status timeline (polling contract for the
+    events endpoint). Derived deterministically from persisted version state:
+    generate transitions (``context_preparing`` -> ``generating`` ->
+    ``validating_patch`` -> ``completed`` / ``failed``) collapse to the
+    version's terminal ``status``; replay transitions surface
+    ``replay_status``."""
+
+    version_id: int
+    version_number: int
+    phase: Literal[
+        "generating", "validating_patch", "completed", "failed", "replaying"
+    ]
+    status: str
+    replay_status: CandidateReplayStatus = "not_run"
+    detail: str = ""
+    created_at: float
+
+
+class CandidateEventsOut(BaseModel):
+    session_id: int
+    events: List[CandidateEventOut] = Field(default_factory=list)

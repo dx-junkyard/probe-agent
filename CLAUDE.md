@@ -86,6 +86,51 @@ creating incomplete persistence or execution paths for later phases.
    App installations for the configured Organization. An installation must
    also be explicitly assigned to a System before any repository listing,
    connection, verify, sync, or publish token issuance may use it.
+8. Issue #242 — Replay / Simulation track (sub-issues #243-#246): replay a
+   probe's captured real inputs against pinned-snapshot code (baseline
+   simulation) and against edited/patched code (offline shadow), then promote
+   promising candidates into the existing Experiment / live-shadow / test
+   gates. Implement sub-issues in dependency order:
+   - #243 (Phase A): opt-in structured input capture (`@probe(...,
+     replay_capture=...)`, canonical JSON with a `"__probe__"` marker) +
+     deterministic replayability classification + `shadow_result.schema.json`.
+   - #244 (Phase B): a shared worktree/sandbox harness that imports the
+     resolved symbol and calls it with restored inputs, a human replay
+     approval gate (`decision_method: manual`), and the deterministic
+     comparison of replay output vs recorded output. `generation.py`'s
+     candidate execution is migrated onto this harness.
+   - #245 (Phase C): patch variants (baseline + N candidates) run in
+     independent worktrees with a finite diff matrix (match / diff /
+     candidate_error / error_to_success / …), the `_field_equal` rules
+     extracted to `app/comparison.py`, and LLM candidate drafts
+     (`reasoning_llm`, fail-closed).
+   - #246 (Phase D): the Simulation Workbench UI (`/simulation-workbench`),
+     trace-row actions + replayability badges, and two deterministic
+     source/diff endpoints for the edit→diff flow.
+   See the Issue #242 section in `docs/project-intelligence.md`. Recorded-error
+   traces are executed against candidates on the OFFLINE side only; the live
+   SDK shadow asymmetry (`decorator.py`'s `run_shadow and raised is None`) is
+   intentionally unchanged. Replay never runs an unapproved component, never
+   writes to the target repo, and (Principle 4) targets pure-ish components
+   only — payment/email/DB-write/auth are discouraged even with approval.
+
+9. Issue #252 — AI Candidate Studio: a conversation-oriented workflow that,
+   from a component or a specific Trace, prepares baseline commit / target
+   symbol / Component Profile / Evaluation Criteria / Replay Set, lets the
+   developer describe an improvement goal in natural language, and generates
+   immutable candidate versions evaluated in the EXISTING isolated Replay
+   infrastructure. It adds no new judgement/execution/comparison path:
+   candidate-proposal generation is the reasoning-model structured proposal
+   (summary / assumptions / changed_symbols / generated_code / risks /
+   suggested_tests) + deterministic splice→diff of `app/candidate_studio.py`
+   (built on `replay_draft`, fail-closed); replaying a version reuses `POST
+   /replay-variant-runs` verbatim (its human replay-approval gate, network-off
+   worktree sandbox, always-cleanup, finite diff matrix); promotion reuses the
+   variant experiment-payload shape and never creates an experiment, writes to
+   the target repo, opens/merges a PR, deploys, or enables live shadow. Only a
+   successfully generated & validated patch creates a `CandidateVersion`; chat
+   messages never do. See the Issue #252 section in
+   `docs/project-intelligence.md`.
 
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and

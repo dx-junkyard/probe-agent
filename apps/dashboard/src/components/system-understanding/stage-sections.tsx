@@ -1,9 +1,8 @@
 import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
-import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { ArrowRight, ExternalLink } from "lucide-react";
-import type { NextActionCategory, SystemUnderstandingNextAction } from "@/api/types";
+import { ExternalLink } from "lucide-react";
+import type { NextActionCategory } from "@/api/types";
 
 // Issue #179: System Understanding is reorganized into 4 fixed stages that
 // mirror the product vision (System Understanding -> Capability Map -> Flow
@@ -73,60 +72,18 @@ export const STAGE_DETAIL_LINKS: Record<Stage, { to: string; label: string }[]> 
   ],
 };
 
-export function groupNextActionsByStage(
-  actions: SystemUnderstandingNextAction[],
-): Record<Stage, SystemUnderstandingNextAction[]> {
-  const grouped: Record<Stage, SystemUnderstandingNextAction[]> = {
-    understand: [], observe: [], instrument: [], evaluate: [],
-  };
-  for (const action of actions) {
-    (grouped[action.category] ??= []).push(action);
-  }
-  return grouped;
-}
-
-export function NextActionsList({ actions, testId = "next-actions" }: {
-  actions: SystemUnderstandingNextAction[];
-  testId?: string;
-}) {
-  return (
-    <ul className="space-y-2" data-testid={testId}>
-      {actions.map((a, i) => (
-        <li key={i} className="flex items-start gap-3 text-sm">
-          <ArrowRight className="h-4 w-4 text-primary mt-0.5 shrink-0" />
-          <div className="flex-1">
-            <span className="font-medium">
-              {a.link ? (
-                <Link to={a.link} className="hover:underline">{a.action}</Link>
-              ) : (
-                a.action
-              )}
-            </span>
-            <Badge variant="outline" className="ml-2 text-xs" data-testid="next-action-category">
-              {a.category}
-            </Badge>
-            <p className="text-muted-foreground text-xs mt-0.5">{a.reason}</p>
-          </div>
-          {a.link && (
-            <Link to={a.link}>
-              <ExternalLink className="h-3.5 w-3.5 text-muted-foreground hover:text-foreground" />
-            </Link>
-          )}
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-export function StageSection({ stage, index, actions, status, counts, children }: {
+export function StageSection({ stage, index, status, counts, label, description, children }: {
   stage: Stage;
   index: number;
-  actions: SystemUnderstandingNextAction[];
   // Issue #202: deterministic completion status/counts for this stage. Both
   // optional so callers/fixtures that predate stage status keep rendering
   // (no badge, no counts line) instead of breaking.
   status?: string;
   counts?: Record<string, number>;
+  // Issue #240: server-supplied Japanese label/description. When absent
+  // (older server or a fixture), fall back to the local English maps.
+  label?: string;
+  description?: string;
   children: ReactNode;
 }) {
   const links = STAGE_DETAIL_LINKS[stage];
@@ -140,7 +97,7 @@ export function StageSection({ stage, index, actions, status, counts, children }
         <div>
           <div className="flex items-center gap-2">
             <h2 className="text-lg font-semibold" data-testid={`stage-title-${stage}`}>
-              {STAGE_LABELS[stage]}
+              {label || STAGE_LABELS[stage]}
             </h2>
             {status && (
               <Badge
@@ -152,7 +109,7 @@ export function StageSection({ stage, index, actions, status, counts, children }
               </Badge>
             )}
           </div>
-          <p className="text-sm text-muted-foreground">{STAGE_DESCRIPTIONS[stage]}</p>
+          <p className="text-sm text-muted-foreground">{description || STAGE_DESCRIPTIONS[stage]}</p>
           {countEntries.length > 0 && (
             <p
               className="text-xs text-muted-foreground mt-0.5"
@@ -180,18 +137,6 @@ export function StageSection({ stage, index, actions, status, counts, children }
             </Link>
           ))}
         </div>
-      )}
-
-      {actions.length > 0 && (
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm">Next Actions</CardTitle>
-            <CardDescription>Unfinished work for this stage</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <NextActionsList actions={actions} testId={`stage-next-actions-${stage}`} />
-          </CardContent>
-        </Card>
       )}
     </section>
   );

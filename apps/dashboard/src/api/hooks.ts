@@ -44,6 +44,12 @@ import type {
   GithubAppStatusOut, GithubConnectionOut, GithubConnectionCreateRequest,
   GithubRepositoryStatusOut, GithubInstallationRepositoryOut, GithubInstallationOut,
   PublishJobOut,
+  ReplaySetOut, ReplaySourceOut, ReplaySourceDiffOut,
+  ReplayVariantRunOut, ReplayVariantDraftOut,
+  ReplayApprovalStateOut, ReplayApprovalOut,
+  ReplayVariantExperimentPayloadOut, ReplayRegressionScaffoldOut,
+  CandidateSessionOut, CandidateSessionCreateRequest, CandidateVersionOut,
+  CandidatePromotionOut,
 } from "./types";
 
 export function sysKey(base: string, ...extra: unknown[]) {
@@ -1676,5 +1682,248 @@ export function useCreatePlanFromReconciliation() {
       invalidatePatterns(qc);
       qc.invalidateQueries({ queryKey: sysKey("probePlans") });
     },
+  });
+}
+
+// ── Replay / Simulation Workbench (Issue #242 Phase D / #246) ──────────────
+// Display + composition only: every judgement/execution/comparison decision
+// is made by the Phase A-C APIs below. The two source/diff endpoints are
+// the only new backend surface (deterministic, Principle 6).
+
+export function useReplaySets(componentId?: string | null) {
+  return useQuery({
+    queryKey: sysKey("replaySets", componentId ?? null),
+    queryFn: () => {
+      const qs = componentId ? `?component_id=${encodeURIComponent(componentId)}` : "";
+      return api.get<ReplaySetOut[]>(`/replay-sets${qs}`);
+    },
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useCreateReplaySet() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { component_id: string; name?: string; trace_ids: string[] }) =>
+      api.post<ReplaySetOut>("/replay-sets", data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("replaySets") }),
+  });
+}
+
+export function useReplaySet(id: number | null) {
+  return useQuery({
+    queryKey: sysKey("replaySet", id),
+    queryFn: () => api.get<ReplaySetOut>(`/replay-sets/${id}`),
+    enabled: id !== null && !!getSystemId(),
+  });
+}
+
+export function useReplaySetSource(replaySetId: number | null, snapshotId?: number | null) {
+  return useQuery({
+    queryKey: sysKey("replaySetSource", replaySetId, snapshotId ?? null),
+    queryFn: () => {
+      const qs = snapshotId ? `?snapshot_id=${snapshotId}` : "";
+      return api.get<ReplaySourceOut>(`/replay-sets/${replaySetId}/source${qs}`);
+    },
+    enabled: replaySetId !== null && !!getSystemId(),
+  });
+}
+
+export function useReplaySourceDiff() {
+  return useMutation({
+    mutationFn: (data: { replay_set_id: number; snapshot_id?: number | null; edited_source: string }) =>
+      api.post<ReplaySourceDiffOut>("/replay-source-diff", data),
+  });
+}
+
+export function useCreateReplayVariantRun() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: {
+      replay_set_id: number;
+      snapshot_id?: number | null;
+      variants: { label: string; patch_text: string; source?: string }[];
+    }) => api.post<ReplayVariantRunOut>("/replay-variant-runs", data),
+    onSuccess: (_d, vars) =>
+      qc.invalidateQueries({ queryKey: sysKey("replayVariantRuns", vars.replay_set_id) }),
+  });
+}
+
+export function useReplayVariantRun(id: number | null) {
+  return useQuery({
+    queryKey: sysKey("replayVariantRun", id),
+    queryFn: () => api.get<ReplayVariantRunOut>(`/replay-variant-runs/${id}`),
+    enabled: id !== null && !!getSystemId(),
+    refetchInterval: false,
+  });
+}
+
+export function useReplayVariantRuns(replaySetId: number | null) {
+  return useQuery({
+    queryKey: sysKey("replayVariantRuns", replaySetId),
+    queryFn: () => {
+      const qs = replaySetId ? `?replay_set_id=${replaySetId}` : "";
+      return api.get<ReplayVariantRunOut[]>(`/replay-variant-runs${qs}`);
+    },
+    enabled: replaySetId !== null && !!getSystemId(),
+  });
+}
+
+export function useCreateReplayVariantDraft() {
+  return useMutation({
+    mutationFn: (data: {
+      replay_set_id: number;
+      trace_id: string;
+      objective: string;
+      snapshot_id?: number | null;
+    }) => api.post<ReplayVariantDraftOut>("/replay-variant-drafts", data),
+  });
+}
+
+export function useCreateReplayRegressionScaffold() {
+  return useMutation({
+    mutationFn: (data: {
+      replay_run_id: number;
+      replay_variant_id: number;
+      trace_id: string;
+    }) => api.post<ReplayRegressionScaffoldOut>("/replay-regression-scaffolds", data),
+  });
+}
+
+export function useReplayApproval(componentId: string | null) {
+  return useQuery({
+    queryKey: sysKey("replayApproval", componentId),
+    queryFn: () => api.get<ReplayApprovalStateOut>(`/components/${componentId}/replay-approval`),
+    enabled: !!componentId && !!getSystemId(),
+  });
+}
+
+export function useApproveReplay() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ componentId, reason }: { componentId: string; reason: string }) =>
+      api.post<ReplayApprovalOut>(`/components/${componentId}/replay-approval`, { reason }),
+    onSuccess: (_d, vars) =>
+      qc.invalidateQueries({ queryKey: sysKey("replayApproval", vars.componentId) }),
+  });
+}
+
+export function useRevokeReplayApproval() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (componentId: string) =>
+      api.post<ReplayApprovalOut>(`/components/${componentId}/replay-approval/revoke`),
+    onSuccess: (_d, componentId) =>
+      qc.invalidateQueries({ queryKey: sysKey("replayApproval", componentId) }),
+  });
+}
+
+export function useVariantExperimentPayload(runId: number | null, variantId: number | null) {
+  return useQuery({
+    queryKey: sysKey("replayVariantExperimentPayload", runId, variantId),
+    queryFn: () => api.get<ReplayVariantExperimentPayloadOut>(
+      `/replay-variant-runs/${runId}/variants/${variantId}/experiment-payload`,
+    ),
+    enabled: runId !== null && variantId !== null && !!getSystemId(),
+  });
+}
+
+// ── AI Candidate Studio (Issue #252) ────────────────────────────────
+// A conversation + versioning layer over the existing isolated-Replay stack
+// above -- reuses useReplayApproval/useReplayVariantRun for the approval
+// gate and evaluation matrix, so no new judgement/execution path is added
+// here (see api/types.ts's Candidate* section for the full contract).
+
+export function useCandidateSessions(componentId?: string | null) {
+  return useQuery({
+    queryKey: sysKey("candidateSessions", componentId ?? null),
+    queryFn: () => {
+      const qs = componentId ? `?component_id=${encodeURIComponent(componentId)}` : "";
+      return api.get<CandidateSessionOut[]>(`/candidate-sessions${qs}`);
+    },
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useCandidateSession(id: number | null) {
+  return useQuery({
+    queryKey: sysKey("candidateSession", id),
+    queryFn: () => api.get<CandidateSessionOut>(`/candidate-sessions/${id}`),
+    enabled: id !== null && !!getSystemId(),
+  });
+}
+
+export function useCreateCandidateSession() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: CandidateSessionCreateRequest) =>
+      api.post<CandidateSessionOut>("/candidate-sessions", data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("candidateSessions") }),
+  });
+}
+
+export function useSendCandidateMessage() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ sessionId, content }: { sessionId: number; content: string }) =>
+      api.post<CandidateSessionOut>(`/candidate-sessions/${sessionId}/messages`, { content }),
+    onSuccess: (_d, vars) =>
+      qc.invalidateQueries({ queryKey: sysKey("candidateSession", vars.sessionId) }),
+  });
+}
+
+export function useGenerateCandidateVersion() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ sessionId, instruction, parent_version_id }: {
+      sessionId: number;
+      instruction: string;
+      parent_version_id?: number | null;
+    }) =>
+      api.post<CandidateVersionOut>(`/candidate-sessions/${sessionId}/generate`, {
+        instruction,
+        parent_version_id: parent_version_id ?? undefined,
+      }),
+    onSuccess: (_d, vars) =>
+      qc.invalidateQueries({ queryKey: sysKey("candidateSession", vars.sessionId) }),
+  });
+}
+
+export function useCandidateVersions(sessionId: number | null) {
+  return useQuery({
+    queryKey: sysKey("candidateVersions", sessionId),
+    queryFn: () => api.get<CandidateVersionOut[]>(`/candidate-sessions/${sessionId}/versions`),
+    enabled: sessionId !== null && !!getSystemId(),
+  });
+}
+
+export function useCandidateVersion(versionId: number | null) {
+  return useQuery({
+    queryKey: sysKey("candidateVersion", versionId),
+    queryFn: () => api.get<CandidateVersionOut>(`/candidate-versions/${versionId}`),
+    enabled: versionId !== null && !!getSystemId(),
+  });
+}
+
+export function useReplayCandidateVersion() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ versionId }: {
+      versionId: number;
+      sessionId: number;
+    }) =>
+      api.post<CandidateVersionOut>(`/candidate-versions/${versionId}/replay`, {}),
+    onSuccess: (_d, vars) =>
+      qc.invalidateQueries({ queryKey: sysKey("candidateSession", vars.sessionId) }),
+  });
+}
+
+export function usePromoteCandidateVersion() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ versionId }: { versionId: number; sessionId: number }) =>
+      api.post<CandidatePromotionOut>(`/candidate-versions/${versionId}/promote`),
+    onSuccess: (_d, vars) =>
+      qc.invalidateQueries({ queryKey: sysKey("candidateSession", vars.sessionId) }),
   });
 }

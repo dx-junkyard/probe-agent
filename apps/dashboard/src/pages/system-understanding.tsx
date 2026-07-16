@@ -12,7 +12,7 @@ import {
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { ContextHeader } from "@/components/layout/context-header";
 import { Badge } from "@/components/ui/badge";
-import { Button, buttonVariants } from "@/components/ui/button";
+import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useDiagnosticHighlight, DiagnosticFixCallout } from "@/components/diagnostic-fix";
 import { cn } from "@/lib/utils";
@@ -23,70 +23,13 @@ import {
 import { PipelineChecklist } from "@/components/system-understanding/pipeline-checklist";
 import { BuildJobPanel, TERMINAL_JOB_STATUSES } from "@/components/system-understanding/build-job-panel";
 import { GapWorklist } from "@/components/system-understanding/gap-worklist";
-import {
-  StageSection, groupNextActionsByStage,
-} from "@/components/system-understanding/stage-sections";
+import { StageSection } from "@/components/system-understanding/stage-sections";
 import type {
   SystemDiagnosticCheck,
-  SystemUnderstandingNextAction,
+  SystemStateItem,
   SystemUnderstandingOut,
   SystemUnderstandingStageStatus,
 } from "@/api/types";
-
-/**
- * Issue #201: single highest-priority CTA shown right under the Hub header,
- * derived server-side (`primary_action`, system_understanding_service._derive_primary_action).
- * "navigate" actions link somewhere; "build" actions trigger the same
- * Build / Refresh job as the header button and share its disabled condition.
- */
-function PrimaryActionCard({ action, onRunBuild, buildDisabled, successSummary }: {
-  action: SystemUnderstandingNextAction;
-  onRunBuild: () => void;
-  buildDisabled: boolean;
-  /** Issue #211: shown above the CTA when the whole pipeline completed, so
-   * the primary action reads as "analysis succeeded, here is the next step"
-   * instead of yet another problem banner. */
-  successSummary?: string;
-}) {
-  const kind = action.action_kind ?? "navigate";
-  return (
-    <Card data-testid="primary-action">
-      <CardContent className="py-4 space-y-3">
-        {successSummary && (
-          <p
-            className="text-sm font-medium text-emerald-600 dark:text-emerald-400"
-            data-testid="build-success-summary"
-          >
-            {successSummary}
-          </p>
-        )}
-        <div className="flex items-center justify-between gap-4 flex-wrap">
-          <div>
-            <p className="text-lg font-semibold">{action.action}</p>
-            <p className="text-sm text-muted-foreground mt-1">{action.reason}</p>
-          </div>
-          {kind === "build" ? (
-            <Button
-              onClick={onRunBuild}
-              disabled={buildDisabled}
-              data-testid="primary-action-cta"
-            >
-              {action.action}
-            </Button>
-          ) : action.link ? (
-            <Link
-              to={action.link}
-              data-testid="primary-action-cta"
-              className={cn(buttonVariants({ variant: "default" }))}
-            >
-              {action.action}
-            </Link>
-          ) : null}
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
 
 function findStage(
   stages: SystemUnderstandingStageStatus[] | undefined,
@@ -209,9 +152,12 @@ function EntryCards({ purposeDefined }: { purposeDefined: boolean }) {
   );
 }
 
-function DataView({ data, checksByStep, onRunBuild, buildDisabled }: {
+function DataView({ data, checksByStep, pageItems, onRunBuild, buildDisabled }: {
   data: SystemUnderstandingOut;
   checksByStep: Record<string, SystemDiagnosticCheck[]>;
+  /** Issue #239: `page_items["/system-understanding"]` from GET /system-state,
+   * forwarded to PipelineChecklist so its CTA is StateItem-driven. */
+  pageItems: SystemStateItem[];
   onRunBuild: () => void;
   buildDisabled: boolean;
 }) {
@@ -224,7 +170,6 @@ function DataView({ data, checksByStep, onRunBuild, buildDisabled }: {
   // complete); any warning/blocked/failed/missing step keeps it expanded.
   const [pipelineExpandedByUser, setPipelineExpandedByUser] = useState<boolean | null>(null);
   const pipelineCollapsed = pipelineExpandedByUser === null ? allComplete : !pipelineExpandedByUser;
-  const actionsByStage = groupNextActionsByStage(data.next_actions);
   const understandStage = findStage(data.stages, "understand");
   const observeStage = findStage(data.stages, "observe");
   const instrumentStage = findStage(data.stages, "instrument");
@@ -235,9 +180,10 @@ function DataView({ data, checksByStep, onRunBuild, buildDisabled }: {
       <StageSection
         stage="understand"
         index={1}
-        actions={actionsByStage.understand}
         status={understandStage?.status}
         counts={understandStage?.counts}
+        label={understandStage?.label}
+        description={understandStage?.description}
       >
         {/* Pipeline Checklist */}
         {pipelineCollapsed ? (
@@ -285,6 +231,7 @@ function DataView({ data, checksByStep, onRunBuild, buildDisabled }: {
               <PipelineChecklist
                 steps={pipeline}
                 checksByStep={checksByStep}
+                pageItems={pageItems}
                 onRunBuild={onRunBuild}
                 buildDisabled={buildDisabled}
               />
@@ -440,9 +387,10 @@ function DataView({ data, checksByStep, onRunBuild, buildDisabled }: {
       <StageSection
         stage="observe"
         index={2}
-        actions={actionsByStage.observe}
         status={observeStage?.status}
         counts={observeStage?.counts}
+        label={observeStage?.label}
+        description={observeStage?.description}
       >
         {/* Key Entrypoints */}
         {data.entrypoints.length > 0 ? (
@@ -512,8 +460,9 @@ function DataView({ data, checksByStep, onRunBuild, buildDisabled }: {
       <StageSection
         stage="instrument"
         index={3}
-        actions={actionsByStage.instrument}
         status={instrumentStage?.status}
+        label={instrumentStage?.label}
+        description={instrumentStage?.description}
       >
         <InstrumentSummary counts={instrumentStage?.counts} />
       </StageSection>
@@ -521,8 +470,9 @@ function DataView({ data, checksByStep, onRunBuild, buildDisabled }: {
       <StageSection
         stage="evaluate"
         index={4}
-        actions={actionsByStage.evaluate}
         status={evaluateStage?.status}
+        label={evaluateStage?.label}
+        description={evaluateStage?.description}
       >
         <EvaluateSummary counts={evaluateStage?.counts} />
       </StageSection>
@@ -542,17 +492,24 @@ export default function SystemUnderstandingPage() {
   const buildRunning = latestBuild?.status === "queued" || latestBuild?.status === "running";
   const buildHighlight = useDiagnosticHighlight<HTMLButtonElement>("build");
   const pageItem = systemState?.page_items["/system-understanding"]?.[0] ?? systemState?.primary_item;
+  // Issue #239: the banner shows the exact same canonical projection as
+  // every other surface on this page -- `page_items[route][0]` (falling
+  // back to `primary_item`). An item only disappears here when the
+  // underlying fact is resolved or the server itself suppresses it by
+  // phase; there is no client-side suppression keyed on `buildRunning` or
+  // any other local condition, so the banner and the Pipeline Checklist
+  // below never disagree about which item is outstanding.
+  const bannerItem = pageItem;
   // Issue #211: with everything complete, Build / Refresh is a maintenance
-  // action, not the page's protagonist — demote it visually and hand the
-  // headline over to the success summary on the primary-action card.
+  // action, not the page's protagonist — demote it visually and show a
+  // standalone success summary instead (previously part of the now-removed
+  // primary_action card, Issue #239).
+  // Issue #240: the summary text is now supplied by the server
+  // (`success_summary`, Japanese) instead of being assembled here in English.
   const pipelineAllComplete = (data?.pipeline?.length ?? 0) > 0 &&
     (data?.pipeline ?? []).every((s) => s.status === "complete");
   const successSummary = pipelineAllComplete && !buildRunning
-    ? [
-        `Analysis complete — ${data!.pipeline.length}/${data!.pipeline.length} steps`,
-        data?.metadata_coverage ? `${data.metadata_coverage.symbol_count} symbols` : null,
-        data?.metadata_coverage ? `${data.metadata_coverage.entrypoint_count} entrypoints` : null,
-      ].filter(Boolean).join(" · ")
+    ? (data?.success_summary ?? undefined)
     : undefined;
 
   // Refresh the aggregated view and diagnostics once a build job settles.
@@ -614,49 +571,30 @@ export default function SystemUnderstandingPage() {
       </div>
 
       <SystemStateBanner
-        item={pageItem}
-        onAction={pageItem?.user_action_kind === "build" ? () => build.mutate() : undefined}
-        disabled={pageItem?.user_action_kind === "build" && (build.isPending || buildRunning)}
+        item={bannerItem}
+        onAction={bannerItem?.user_action_kind === "build" ? () => build.mutate() : undefined}
+        disabled={bannerItem?.user_action_kind === "build" && (build.isPending || buildRunning)}
       />
 
-      {/* Issue #203: the improvement-loop banner — a materialized Interview
-          change is newer than the latest completed build, so the current
-          understanding no longer reflects it. Hidden while a build is
-          actively running (the BuildJobPanel already shows progress, and a
-          fresh build is about to make this stale anyway). Also hidden when
-          the canonical SystemStateBanner above is already showing this same
-          root cause (Issue #206-208 review): the canonical banner wins so
-          the same cause is never duplicated. */}
-      {data?.understanding_refresh_recommended && !buildRunning &&
-        pageItem?.state_id !== "interview.materialized.rebuild_required" && (
-        <Card data-testid="refresh-recommended-banner">
-          <CardContent className="py-4 flex items-center justify-between gap-4 flex-wrap">
-            <div>
-              <p className="text-sm font-medium">
-                Interview の変更が理解にまだ反映されていません
-              </p>
-              <p className="text-sm text-muted-foreground mt-1">
-                Interview で確定した変更を反映するには、システム理解を再ビルドしてください。
-              </p>
-            </div>
-            <Button
-              onClick={() => build.mutate()}
-              disabled={build.isPending}
-              data-testid="refresh-recommended-cta"
+      {/* Issue #211/#239: shown once the whole pipeline is complete and no
+          build is running, standing in for the header's demoted Build /
+          Refresh button. Previously embedded in the removed primary_action
+          card; the underlying Interview-vs-build-completion guidance this
+          replaced (the deprecated understanding_refresh_recommended banner)
+          is now covered by the canonical SystemStateBanner above via the
+          interview.materialized.rebuild_required StateItem, so it is not
+          duplicated here. */}
+      {successSummary && (
+        <Card data-testid="success-summary-card">
+          <CardContent className="py-3">
+            <p
+              className="text-sm font-medium text-emerald-600 dark:text-emerald-400"
+              data-testid="build-success-summary"
             >
-              Build / Refresh
-            </Button>
+              {successSummary}
+            </p>
           </CardContent>
         </Card>
-      )}
-
-      {data?.primary_action && (
-        <PrimaryActionCard
-          action={data.primary_action}
-          onRunBuild={() => build.mutate()}
-          buildDisabled={build.isPending || buildRunning}
-          successSummary={successSummary}
-        />
       )}
 
       <DiagnosticFixCallout anchor="build" />
@@ -696,6 +634,7 @@ export default function SystemUnderstandingPage() {
         <DataView
           data={data}
           checksByStep={checksByStep}
+          pageItems={systemState?.page_items["/system-understanding"] ?? []}
           onRunBuild={() => build.mutate()}
           buildDisabled={build.isPending || buildRunning}
         />
