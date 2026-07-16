@@ -4656,6 +4656,7 @@ describe("System settings diagnostics", () => {
     summary: "Intelligence reasoning model configuration",
     remediation: "Set INTELLIGENCE_LLM_PROVIDER and INTELLIGENCE_LLM_MODEL to a reasoning-capable pair.",
     user_action_kind: "configure",
+    evidence: { diagnostic_category: "llm", fix_kind: "dialog" },
     related_checks: ["intelligence_llm_config"],
     dedupe_key: "diagnostic.intelligence_llm_config",
   });
@@ -4678,19 +4679,24 @@ describe("System settings diagnostics", () => {
     dedupe_key: "diagnostic.pipeline_documentation_index",
   });
 
-  const stateResponse = (items: SystemStateItem[]) => ({
-    system_id: 1,
-    generated_at: 1,
-    overall_severity: items.some((i) => i.severity === "error") ? "error"
-      : items.some((i) => i.severity === "warning") ? "warning" : "ok",
-    severity_counts: {},
-    items,
-    primary_item: items[0] ?? null,
-    notification_items: items.filter((i) => i.severity !== "ok"),
-    page_items: {},
-  });
+  const stateResponse = (items: SystemStateItem[]) => {
+    const notificationItems = items.filter(
+      (i) => ["error", "blocked", "warning"].includes(i.severity) && i.scope === "global",
+    );
+    return {
+      system_id: 1,
+      generated_at: 1,
+      overall_severity: items.some((i) => i.severity === "error") ? "error"
+        : items.some((i) => i.severity === "warning") ? "warning" : "ok",
+      severity_counts: {},
+      items,
+      primary_item: notificationItems[0] ?? null,
+      notification_items: notificationItems,
+      page_items: {},
+    };
+  };
 
-  test("badge shows attention count from system-state items and opens the item dialog", async () => {
+  test("badge shows attention count from canonical notification items and opens the item dialog", async () => {
     mockApi.get.mockImplementation((path: string) => {
       if (path === "/system-state") return Promise.resolve(stateResponse([llmItem, snapshotItem, docIndexItem]));
       if (path === "/system-diagnostics") return Promise.resolve(diagnosticsResponse);
@@ -4701,7 +4707,7 @@ describe("System settings diagnostics", () => {
     render(<DiagnosticsBadge />, { wrapper: createWrapper() });
 
     const badge = await screen.findByTestId("diagnostics-badge");
-    // error(1) + warning(2) = 3 deduped non-ok items
+    // error(1) + warning(2) = 3 deduped canonical notifications.
     expect(screen.getByTestId("diagnostics-badge-count").textContent).toBe("3");
 
     fireEvent.click(badge);
@@ -4732,12 +4738,10 @@ describe("System settings diagnostics", () => {
     expect(screen.getByTestId("diagnostics-badge-count").textContent).toBe("1");
   });
 
-  test("badge suppresses items of a phase after the current user_phase (Issue #239)", async () => {
-    // `items` is the server's unfiltered audit list, so the badge applies
-    // the same phase withdrawal rule the server applies to
-    // notification_items/page_items: a setup-phase user must not see a
-    // diagnosis-phase warning in the badge, but the same item counts once
-    // the user reaches diagnosis.
+  test("badge consumes the server's phase-scoped notification projection (Issue #239)", async () => {
+    // `items` remains the complete audit list. The server owns phase
+    // withdrawal in `notification_items`; the badge must consume that
+    // projection verbatim instead of re-deriving phase visibility.
     const setupItem = { ...snapshotItem, phase: "setup" as const };
     const diagnosisItem = projectedStateItem({
       state_id: "proposal.experiments.undecided",
@@ -4751,6 +4755,9 @@ describe("System settings diagnostics", () => {
     diagnosisItem.phase = "diagnosis";
     const scoped = (userPhase: "setup" | "diagnosis") => ({
       ...stateResponse([setupItem, diagnosisItem]),
+      notification_items: userPhase === "setup"
+        ? [setupItem]
+        : [setupItem, diagnosisItem],
       user_phase: userPhase,
       phases: [
         { phase: "setup", complete: userPhase !== "setup" },
@@ -4821,7 +4828,9 @@ describe("System settings diagnostics", () => {
     // intelligence_llm_config projects with target_ui null (dialog-kind fix);
     // the badge opens the env-fix dialog from the related diagnostic check.
     const item = await screen.findByTestId("system-state-item-diagnostic.intelligence_llm_config");
-    fireEvent.click(within(item).getByRole("button", { name: "修正する" }));
+    fireEvent.click(within(item).getByRole("button", {
+      name: "「Intelligence reasoning model configuration」の対処方法",
+    }));
 
     const envDialog = await screen.findByTestId("diagnostic-env-dialog");
     expect(envDialog.textContent).toContain("設定が必要な環境変数");
@@ -4849,6 +4858,54 @@ describe("System settings diagnostics", () => {
 
     await screen.findByTestId("diagnostics-badge");
     expect(screen.queryByTestId("diagnostics-badge-count")).toBeNull();
+  });
+
+  test("informational no-action audit items never become notifications or CTAs", async () => {
+    const reasoningNotRun = projectedStateItem({
+      state_id: "diagnostic.llm_last_run",
+      severity: "info",
+      status: "unconfirmed",
+      user_action_kind: "none",
+      intervention_timing: "before_next_step",
+      subject: "直近の reasoning モデル実行",
+      summary: "直近の reasoning モデル実行",
+      remediation: "他に warning / error がある場合は、先にそちらの次の操作を実施してください。",
+      evidence: { diagnostic_category: "llm", fix_kind: "navigate" },
+      target_ui: null,
+      related_checks: ["llm_last_run"],
+      dedupe_key: "diagnostic.llm_last_run",
+      phase: "setup",
+    });
+    const response = stateResponse([reasoningNotRun]);
+    expect(response.notification_items).toEqual([]);
+
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-state") return Promise.resolve(response);
+      if (path === "/system-diagnostics") {
+        return Promise.resolve({
+          ...diagnosticsResponse,
+          checks: [{
+            ...diagnosticsResponse.checks[1],
+            check_id: "llm_last_run",
+            title: "直近の reasoning モデル実行",
+            severity: "unknown",
+            fix_page: "/system-understanding",
+            fix_anchor: "build",
+          }],
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { DiagnosticsBadge } = await import("@/components/diagnostics-badge");
+    render(<DiagnosticsBadge />, { wrapper: createWrapper() });
+
+    const badge = await screen.findByTestId("diagnostics-badge");
+    expect(screen.queryByTestId("diagnostics-badge-count")).toBeNull();
+    fireEvent.click(badge);
+    expect(await screen.findByText("対応が必要な状態はありません。")).toBeTruthy();
+    expect(screen.queryByText("直近の reasoning モデル実行")).toBeNull();
+    expect(screen.queryByRole("button", { name: "修正する" })).toBeNull();
   });
 
   test("badge shows a degraded error state when system-state cannot be loaded (Issue #239)", async () => {
@@ -4963,7 +5020,7 @@ describe("System settings diagnostics", () => {
       detail: "PROBE_REPOSITORY_ROOTS is empty.",
       impact: "No repository can be registered until an allowlisted root is configured.",
       remediation: "Set PROBE_REPOSITORY_ROOTS to the allowed repository parent directories.",
-      evidence: {},
+      evidence: { diagnostic_category: "repository", fix_kind: "dialog" },
       target_ui: null,
       related_checks: ["repository_roots"],
       related_pipeline_steps: [],
@@ -4992,8 +5049,11 @@ describe("System settings diagnostics", () => {
     fireEvent.click(await screen.findByTestId("diagnostics-badge"));
     const badgeItem = await screen.findByTestId("system-state-item-diagnostic.repository_roots");
 
-    // No navigable target_ui, but a 修正する action derived from the related check.
-    const fixButton = within(badgeItem).getByRole("button", { name: "修正する" });
+    // The canonical item declares a dialog action; the related check supplies
+    // only the remediation dialog contents.
+    const fixButton = within(badgeItem).getByRole("button", {
+      name: "「Repository root allowlist」の対処方法",
+    });
     fireEvent.click(fixButton);
 
     const envDialog = await screen.findByTestId("diagnostic-env-dialog");

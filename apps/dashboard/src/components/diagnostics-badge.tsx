@@ -9,7 +9,7 @@ import {
   AlertTriangle, Ban, CheckCircle2, ChevronRight, HelpCircle, ShieldAlert, XCircle,
 } from "lucide-react";
 import type { DiagnosticSeverity, SystemDiagnosticCheck } from "@/api/types";
-import { isItemInCurrentPhaseScope, systemStateTarget } from "@/components/system-state";
+import { systemStateTarget } from "@/components/system-state";
 
 export const SEVERITY_ORDER: DiagnosticSeverity[] = ["error", "blocked", "warning", "unknown", "ok"];
 
@@ -282,15 +282,13 @@ export function DiagnosticsBadge() {
   if (isError) return <DegradedBadge />;
   if (isLoading || !systemState) return null;
 
-  // Issue #239: `items` is the unfiltered audit list, so the badge applies
-  // the same phase withdrawal rule the server already applies to
-  // notification_items/page_items — items of a phase after the current one
-  // must not appear on any notification surface (parent issue #235).
+  // `items` is an audit trail and deliberately includes informational states.
+  // The badge is a notification surface, so consume the server's canonical,
+  // severity- and phase-filtered projection instead of re-deriving attention
+  // state on the client.
   const items = Array.from(
     new Map(
-      systemState.items
-        .filter((item) => item.severity !== "ok")
-        .filter((item) => isItemInCurrentPhaseScope(item, systemState.user_phase))
+      systemState.notification_items
         .map((item) => [item.dedupe_key || item.state_id, item]),
     ).values(),
   );
@@ -315,15 +313,20 @@ export function DiagnosticsBadge() {
         <DialogHeader><DialogTitle>System State</DialogTitle></DialogHeader>
         <div className="space-y-3">
           {items.length === 0 ? <p className="text-sm text-muted-foreground">対応が必要な状態はありません。</p> : items.map((item) => {
-            // Items projected from system_diagnostics whose underlying check has
-            // fix_kind "dialog" (env-var fixes) carry target_ui === null because
-            // those checks have no fix_page. Fall back to the diagnostic check
-            // (via related_checks[0], not as a data-source fallback for the
-            // badge itself) so those items still get an action that opens the
-            // env fix dialog.
-            const relatedCheck =
-              !item.target_ui && item.source === "system_diagnostics"
-                ? data?.checks.find((c) => c.check_id === item.related_checks[0])
+            const actionable = item.user_action_kind !== "none" && item.user_action_kind !== "wait";
+            // Dialog-kind diagnostics have no navigable target_ui. The
+            // canonical StateItem must still explicitly say the item is
+            // actionable and that its fix kind is a dialog; system-diagnostics
+            // supplies only the dialog contents/executor, never the decision to
+            // create a CTA.
+            const relatedDialogCheck =
+              actionable
+              && !item.target_ui
+              && item.source === "system_diagnostics"
+              && item.evidence.fix_kind === "dialog"
+                ? data?.checks.find(
+                    (c) => c.check_id === item.related_checks[0] && c.fix_kind === "dialog",
+                  )
                 : undefined;
             return (
               <div key={item.dedupe_key || item.state_id} className="flex items-start justify-between gap-3 rounded-lg border p-3" data-testid={`system-state-item-${item.state_id}`}>
@@ -331,15 +334,15 @@ export function DiagnosticsBadge() {
                   <div className="flex items-center gap-2"><DiagnosticSeverityIcon severity={item.severity} /><p className="text-sm font-medium">{item.summary}</p></div>
                   {item.remediation && <p className="mt-1 text-xs text-muted-foreground">{item.remediation}</p>}
                 </div>
-                {item.target_ui && <Button size="sm" onClick={() => {
+                {actionable && item.target_ui && <Button size="sm" onClick={() => {
                   const target = systemStateTarget(item);
                   setOpen(false);
                   if (target) navigate(target);
                 }}>{item.target_ui.action_label || "対応する"}</Button>}
-                {!item.target_ui && relatedCheck && <Button size="sm" onClick={() => {
+                {relatedDialogCheck && <Button size="sm" onClick={() => {
                   setOpen(false);
-                  activate(relatedCheck);
-                }}>修正する</Button>}
+                  activate(relatedDialogCheck);
+                }}>{`「${item.subject}」の対処方法`}</Button>}
               </div>
             );
           })}

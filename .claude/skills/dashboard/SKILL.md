@@ -96,11 +96,14 @@ The dashboard should support:
   not add UI controls for actions the API does not support.
 - System settings diagnostics (Issue #101; badge source unified in #239): a
   header alert badge (`components/diagnostics-badge.tsx`) fed by
-  `GET /system-state` `items` (`severity != ok`, deduped by `dedupe_key`,
-  phase-suppressed) — the former `GET /system-diagnostics` direct
-  read/fallback was removed in Issue #239. Diagnostics are still consulted,
-  but only to resolve one check's detail for the env-fix dialog via a
-  StateItem's `related_checks`. When `/system-state` cannot be loaded the
+  `GET /system-state` `notification_items` (severity/scope/phase-filtered by
+  the server and defensively deduped by `dedupe_key`) — never re-derived from
+  audit-only `items`. The former `GET /system-diagnostics` direct
+  read/fallback was removed in Issue #239. Diagnostics are still consulted
+  only when an actionable canonical StateItem explicitly has
+  `evidence.fix_kind=dialog`, to resolve that check's EnvFixDialog contents
+  via `related_checks`; they never create the CTA. `user_action_kind=none`
+  and `wait` items have no CTA. When `/system-state` cannot be loaded the
   badge shows an explicit degraded state (`?` + error dialog,
   `data-testid="diagnostics-badge-error"`); it never re-derives state
   client-side. Clicking an item navigates via `systemStateTarget()`. The
@@ -131,7 +134,8 @@ The dashboard should support:
   (`SystemStateBanner`) reads `page_items[currentRoute][0] ?? primary_item`
   (on System Understanding, non-error/blocked items are held back while a
   build is running, a deterministic condition); the header badge reads
-  deduped `items`; the persistent notice reads `notification_items[0]`; the
+  deduped `notification_items`; the persistent notice reads
+  `notification_items[0]`; the
   Pipeline Checklist CTA reads the `StateItem` whose
   `related_pipeline_steps` names the first incomplete step (the old
   `STEP_CTA` map survives only as last-resort fallback); the header

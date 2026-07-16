@@ -232,7 +232,7 @@ probe plans / experiments を同じ分析文脈で返す。
 | 通知面 | 消費する投影 |
 | --- | --- |
 | ページ内バナー（`SystemStateBanner`） | `page_items[currentRoute][0]`、なければ `primary_item`。System Understanding ではビルド実行中、severity が `error` / `blocked` 以外の項目を表示保留にする（BuildJobPanel が進捗を表示しているため。決定論的条件のみ） |
-| 右上バッジ（`DiagnosticsBadge`） | `items` の `severity != ok`（`dedupe_key` で重複排除、フェーズ抑制反映）。`system-diagnostics` 直接参照のフォールバックは撤去。診断詳細（EnvFixDialog）は `related_checks` 経由で該当 check を引く。`system-state` 取得失敗時は独自導出へ回帰せず、専用の縮退表示（`?` バッジ + エラーダイアログ）を出す |
+| 右上バッジ（`DiagnosticsBadge`） | `notification_items`（severity・scope・フェーズ抑制済み）をそのまま消費し、監査用 `items` から通知を再導出しない。`user_action_kind=none` / `wait` では CTA を表示しない。dialog-kind の canonical item に限り、`system-diagnostics` は `related_checks` 経由で EnvFixDialog の内容と実行手段だけを供給する。`system-state` 取得失敗時は独自導出へ回帰せず、専用の縮退表示（`?` バッジ + エラーダイアログ）を出す |
 | 右下常駐 notice（`assistant-panel.tsx`） | `notification_items[0]`（フェーズ抑制済み） |
 | Pipeline Checklist の CTA | 該当 step を `related_pipeline_steps` に持つ `StateItem` の `target_ui`（前節参照） |
 | ヘッダーのフェーズ表示（`UserPhaseIndicator`） | `user_phase` / `phases`（サーバー値のみ。クライアント側でフェーズを導出しない） |
