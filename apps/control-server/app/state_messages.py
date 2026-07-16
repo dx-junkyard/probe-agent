@@ -448,12 +448,20 @@ DIAGNOSTIC_STATE_ACTION_LABEL_TEMPLATE = "「{title}」を修正"
 # ---------------------------------------------------------------------------
 # system_state.py: user_phase display labels (Issue #240 -- additive
 # `phases[].label`; the Dashboard's USER_PHASE_LABELS becomes a fallback).
+# Issue #256 replaced the single terminal "diagnosis" placeholder with the
+# four remaining steps of the 6-step improvement flow (instrumentation /
+# observation / evaluation / publish); "preparation"'s label was also
+# updated since it used to read as "prep for diagnosis" ("診断準備"), which
+# no longer makes sense with "diagnosis" gone from the phase model.
 # ---------------------------------------------------------------------------
 
 PHASE_LABELS: Dict[str, str] = {
     "setup": "必要最低限の設定",
-    "preparation": "診断準備",
-    "diagnosis": "診断",
+    "preparation": "分析準備",
+    "instrumentation": "プローブ設定",
+    "observation": "観測",
+    "evaluation": "候補評価",
+    "publish": "公開",
 }
 
 

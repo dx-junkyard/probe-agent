@@ -773,6 +773,170 @@ class TestProbePlanReviewAndPatchFacts:
             assert state_facts.count_approved_probe_plans_without_validated_patch(conn, system_id) == 1
 
 
+# --- Instrumentation / observation / evaluation / publish milestone facts
+# (Issue #256) -----------------------------------------------------------------
+
+
+def _insert_replay_set(get_conn, system_id, *, component_id="comp-1"):
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO replay_sets
+                   (system_id, component_id, name, trace_ids_json, source, created_at)
+               VALUES (?, ?, 'set', '[]', 'manual', ?)""",
+            (system_id, component_id, now),
+        )
+        return cur.lastrowid
+
+
+def _insert_replay_run(get_conn, system_id, replay_set_id, snapshot_id, *, component_id="comp-1"):
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO replay_runs
+                   (system_id, replay_set_id, component_id, snapshot_id, commit_sha,
+                    symbol_path, symbol_qualified_name, status, trace_set_hash, created_at)
+               VALUES (?, ?, ?, ?, 'deadbeef', 'a.py', 'mod.fn', 'completed', 'hash', ?)""",
+            (system_id, replay_set_id, component_id, snapshot_id, now),
+        )
+        return cur.lastrowid
+
+
+def _insert_replay_variant(get_conn, system_id, replay_run_id, *, is_baseline=False, status="completed"):
+    now = time.time()
+    variant_key = "baseline" if is_baseline else "variant-1"
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO replay_variants
+                   (system_id, replay_run_id, variant_key, is_baseline, patch_hash, status, created_at)
+               VALUES (?, ?, ?, ?, 'hash', ?, ?)""",
+            (system_id, replay_run_id, variant_key, 1 if is_baseline else 0, status, now),
+        )
+        return cur.lastrowid
+
+
+def _insert_github_connection(get_conn, system_id):
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO github_connections
+                   (system_id, api_base_url, web_base_url, owner, repo, clone_url,
+                    installation_id, status, created_at, updated_at)
+               VALUES (?, 'https://api.github.com', 'https://github.com', 'o', 'r',
+                       'https://github.com/o/r.git', 1, 'connected', ?, ?)""",
+            (system_id, now, now),
+        )
+        return cur.lastrowid
+
+
+def _insert_publish_job(get_conn, system_id, connection_id, patch_id, snapshot_id, *, status="pending"):
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO publish_jobs
+                   (system_id, connection_id, patch_id, snapshot_id, base_branch,
+                    status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, 'main', ?, ?, ?)""",
+            (system_id, connection_id, patch_id, snapshot_id, status, now, now),
+        )
+        return cur.lastrowid
+
+
+class TestInstrumentationEvaluationPublishFacts:
+    """Issue #256: facts backing derive_user_phase's instrumentation /
+    observation / evaluation / publish completion conditions."""
+
+    def test_has_applied_probe_patch_requires_applied_status(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+        run_id = _insert_intelligence_run(conn_factory, system_id, snapshot_id, "probe_plan", "completed")
+        _insert_probe_plan(conn_factory, system_id, snapshot_id, run_id, status="approved")
+        with conn_factory() as conn:
+            plan_id = conn.execute(
+                "SELECT id FROM probe_plans WHERE system_id = ?", (system_id,)
+            ).fetchone()["id"]
+            assert state_facts.has_applied_probe_patch(conn, system_id) is False
+
+        patch_id = _insert_probe_patch(conn_factory, plan_id, system_id, snapshot_id, status="generated")
+        with conn_factory() as conn:
+            # Generated but not yet applied -- does not count.
+            assert state_facts.has_applied_probe_patch(conn, system_id) is False
+
+        with conn_factory() as conn:
+            conn.execute(
+                "UPDATE probe_patches SET apply_status = 'applied' WHERE id = ?", (patch_id,)
+            )
+        with conn_factory() as conn:
+            assert state_facts.has_applied_probe_patch(conn, system_id) is True
+
+    def test_has_decided_experiment_requires_non_undecided_human_decision(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+        with conn_factory() as conn:
+            assert state_facts.has_decided_experiment(conn, system_id) is False
+
+        _insert_experiment(conn_factory, system_id, snapshot_id, status="running", human_decision="undecided")
+        with conn_factory() as conn:
+            assert state_facts.has_decided_experiment(conn, system_id) is False
+
+        _insert_experiment(conn_factory, system_id, snapshot_id, status="completed", human_decision="adopted")
+        with conn_factory() as conn:
+            assert state_facts.has_decided_experiment(conn, system_id) is True
+
+    def test_has_completed_replay_variant_run_excludes_baseline_and_incomplete(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+        replay_set_id = _insert_replay_set(conn_factory, system_id)
+        replay_run_id = _insert_replay_run(conn_factory, system_id, replay_set_id, snapshot_id)
+        with conn_factory() as conn:
+            assert state_facts.has_completed_replay_variant_run(conn, system_id) is False
+
+        # A completed BASELINE row alone does not count -- only a candidate
+        # (non-baseline) variant proves a candidate was actually evaluated.
+        _insert_replay_variant(conn_factory, system_id, replay_run_id, is_baseline=True, status="completed")
+        with conn_factory() as conn:
+            assert state_facts.has_completed_replay_variant_run(conn, system_id) is False
+
+        # A running (not yet completed) candidate variant does not count.
+        _insert_replay_variant(conn_factory, system_id, replay_run_id, is_baseline=False, status="running")
+        with conn_factory() as conn:
+            assert state_facts.has_completed_replay_variant_run(conn, system_id) is False
+
+        _insert_replay_variant(conn_factory, system_id, replay_run_id, is_baseline=False, status="completed")
+        with conn_factory() as conn:
+            assert state_facts.has_completed_replay_variant_run(conn, system_id) is True
+
+    def test_has_succeeded_publish_job_requires_completed_status(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+        run_id = _insert_intelligence_run(conn_factory, system_id, snapshot_id, "probe_plan", "completed")
+        _insert_probe_plan(conn_factory, system_id, snapshot_id, run_id, status="approved")
+        with conn_factory() as conn:
+            plan_id = conn.execute(
+                "SELECT id FROM probe_plans WHERE system_id = ?", (system_id,)
+            ).fetchone()["id"]
+        patch_id = _insert_probe_patch(conn_factory, plan_id, system_id, snapshot_id)
+        connection_id = _insert_github_connection(conn_factory, system_id)
+        with conn_factory() as conn:
+            assert state_facts.has_succeeded_publish_job(conn, system_id) is False
+
+        _insert_publish_job(conn_factory, system_id, connection_id, patch_id, snapshot_id, status="pushing")
+        with conn_factory() as conn:
+            assert state_facts.has_succeeded_publish_job(conn, system_id) is False
+
+        _insert_publish_job(conn_factory, system_id, connection_id, patch_id, snapshot_id, status="completed")
+        with conn_factory() as conn:
+            assert state_facts.has_succeeded_publish_job(conn, system_id) is True
+
+
 # --- System isolation -------------------------------------------------------------
 
 
@@ -798,6 +962,19 @@ class TestSystemIsolation:
         _insert_probe_plan(conn_factory, sys_a, snapshot_a, run_a, status="approved")
         _insert_probe_plan(conn_factory, sys_a, snapshot_a, run_a, status="proposed")
         _insert_experiment(conn_factory, sys_a, snapshot_a, status="completed", human_decision="undecided")
+        _insert_experiment(conn_factory, sys_a, snapshot_a, status="completed", human_decision="adopted")
+        with conn_factory() as conn:
+            approved_plan_id = conn.execute(
+                "SELECT id FROM probe_plans WHERE system_id = ? AND status = 'approved'", (sys_a,)
+            ).fetchone()["id"]
+        patch_id_a = _insert_probe_patch(conn_factory, approved_plan_id, sys_a, snapshot_a)
+        with conn_factory() as conn:
+            conn.execute("UPDATE probe_patches SET apply_status = 'applied' WHERE id = ?", (patch_id_a,))
+        connection_id_a = _insert_github_connection(conn_factory, sys_a)
+        _insert_publish_job(conn_factory, sys_a, connection_id_a, patch_id_a, snapshot_a, status="completed")
+        replay_set_a = _insert_replay_set(conn_factory, sys_a)
+        replay_run_a = _insert_replay_run(conn_factory, sys_a, replay_set_a, snapshot_a)
+        _insert_replay_variant(conn_factory, sys_a, replay_run_a, is_baseline=False, status="completed")
 
         with conn_factory() as conn:
             # System B sees none of System A's facts.
@@ -816,6 +993,10 @@ class TestSystemIsolation:
             assert state_facts.count_undecided_completed_experiments(conn, sys_b) == 0
             assert state_facts.count_proposed_probe_plans(conn, sys_b) == 0
             assert state_facts.count_approved_probe_plans_without_validated_patch(conn, sys_b) == 0
+            assert state_facts.has_applied_probe_patch(conn, sys_b) is False
+            assert state_facts.has_decided_experiment(conn, sys_b) is False
+            assert state_facts.has_completed_replay_variant_run(conn, sys_b) is False
+            assert state_facts.has_succeeded_publish_job(conn, sys_b) is False
 
             facts_b = state_facts.get_connectivity_facts(conn, sys_b, "probe-smoke-check")
             assert facts_b.total_trace_count == 0
@@ -828,6 +1009,10 @@ class TestSystemIsolation:
             assert state_facts.count_undecided_completed_experiments(conn, sys_a) == 1
             assert state_facts.count_proposed_probe_plans(conn, sys_a) == 1
             assert state_facts.count_approved_probe_plans_without_validated_patch(conn, sys_a) == 1
+            assert state_facts.has_applied_probe_patch(conn, sys_a) is True
+            assert state_facts.has_decided_experiment(conn, sys_a) is True
+            assert state_facts.has_completed_replay_variant_run(conn, sys_a) is True
+            assert state_facts.has_succeeded_publish_job(conn, sys_a) is True
             assert state_facts.capability_count_in_snapshot(conn, sys_a, snapshot_a) == 1
             facts_a = state_facts.get_connectivity_facts(conn, sys_a, "probe-smoke-check")
             assert facts_a.total_trace_count == 1
