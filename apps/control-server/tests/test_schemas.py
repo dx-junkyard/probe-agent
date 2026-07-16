@@ -36,6 +36,11 @@ def shadow_result_schema() -> dict:
     return _schema("shadow_result.schema.json")
 
 
+@pytest.fixture(scope="module")
+def candidate_proposal_schema() -> dict:
+    return _schema("candidate_proposal.schema.json")
+
+
 # --- example payloads ---------------------------------------------------------
 
 def test_old_style_trace_event_validates(trace_event_schema):
@@ -114,6 +119,22 @@ def test_unknown_replay_enum_values_fail_schema(trace_event_schema):
     event["replay_reasons"] = ["not-a-reason"]
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(event, trace_event_schema)
+
+
+def test_candidate_proposal_schema_rejects_unstructured_fields(candidate_proposal_schema):
+    proposal = {
+        "summary": "Preserve the contract while improving normalization.",
+        "assumptions": ["Inputs are JSON-like."],
+        "changed_symbols": ["normalize"],
+        "generated_code": "def candidate(*args, **kwargs):\n    return {}\n",
+        "risks": ["Review empty inputs."],
+        "suggested_tests": ["Replay captured empty input."],
+    }
+    jsonschema.validate(proposal, candidate_proposal_schema)
+
+    invalid = dict(proposal, risks=[123])
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(invalid, candidate_proposal_schema)
 
 
 def test_sdk_shaped_shadow_result_validates(shadow_result_schema):

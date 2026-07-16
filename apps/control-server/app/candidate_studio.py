@@ -34,6 +34,7 @@ replays the returned patch as a variant via POST /replay-variant-runs.
 
 from __future__ import annotations
 
+import ast
 import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -59,6 +60,12 @@ MAX_PATCH_CHARS = 200_000
 MAX_BASELINE_SOURCE_CHARS = 60_000
 MAX_EXAMPLE_TRACES = 5
 MAX_LIST_ITEMS = 20
+PROPOSAL_LIST_FIELDS = (
+    "assumptions",
+    "changed_symbols",
+    "risks",
+    "suggested_tests",
+)
 
 
 @dataclass
@@ -112,14 +119,15 @@ def build_proposal_prompt(
         "component_profile": context.get("component_profile", {}),
         "evaluation_criteria": context.get("criteria", []),
         "example_traces": context.get("example_traces", []),
+        "conversation_history": context.get("conversation_history", []),
     }
     return [
         {
             "role": "system",
             "content": (
                 "You improve an existing Python function for probe-agent. You "
-                "are given the function's EXACT current source at a pinned "
-                "commit, its component/system profile, evaluation criteria, and "
+                "are given a redacted current-source excerpt at a pinned commit, "
+                "its component/system profile, evaluation criteria, and "
                 "recorded example traces. Propose a drop-in replacement. Return "
                 "ONLY JSON. The generated_code MUST define a single top-level "
                 "`def candidate(*args, **kwargs)` that preserves the original "
@@ -140,6 +148,71 @@ def build_proposal_prompt(
             ),
         },
     ]
+
+
+def _validate_generated_code(generated_code: str) -> None:
+    """Validate the structural contract that the LLM cannot be trusted to
+    enforce by prompt alone.
+
+    A proposal may replace exactly one target function.  Extra module-level
+    statements would be spliced into the target file and therefore widen the
+    requested change range even though the resulting diff still touched only
+    one file.  Imports are also forbidden by the proposal contract, including
+    imports nested inside the function.
+    """
+    try:
+        module = ast.parse(generated_code)
+    except SyntaxError as exc:
+        raise DraftError(f"generated candidate is not valid Python: {exc}") from exc
+
+    if len(module.body) != 1:
+        raise DraftError(
+            "generated code must contain exactly one top-level candidate function"
+        )
+    function = module.body[0]
+    if not isinstance(function, ast.FunctionDef) or function.name != "candidate":
+        raise DraftError(
+            "generated code must define exactly one top-level 'def candidate(' function"
+        )
+    if function.decorator_list:
+        raise DraftError("generated candidate must not contain decorators")
+    arguments = function.args
+    if (
+        arguments.posonlyargs
+        or arguments.args
+        or arguments.kwonlyargs
+        or arguments.defaults
+        or arguments.kw_defaults
+        or arguments.vararg is None
+        or arguments.vararg.arg != "args"
+        or arguments.kwarg is None
+        or arguments.kwarg.arg != "kwargs"
+    ):
+        raise DraftError(
+            "generated candidate must use the exact signature "
+            "'def candidate(*args, **kwargs)'"
+        )
+    if any(isinstance(node, (ast.Import, ast.ImportFrom)) for node in ast.walk(function)):
+        raise DraftError("generated candidate must not contain import statements")
+
+
+def _validate_proposal_shape(proposal: Dict[str, Any]) -> None:
+    """Validate the shared candidate-proposal schema without adding a runtime
+    jsonschema dependency to the control server."""
+    if not isinstance(proposal.get("generated_code"), str):
+        raise DraftError("candidate proposal generated_code must be a string")
+    if "summary" in proposal and not isinstance(proposal["summary"], str):
+        raise DraftError("candidate proposal summary must be a string")
+    for field_name in PROPOSAL_LIST_FIELDS:
+        if field_name not in proposal:
+            continue
+        value = proposal[field_name]
+        if not isinstance(value, list) or any(
+            not isinstance(item, str) for item in value
+        ):
+            raise DraftError(
+                f"candidate proposal {field_name} must be an array of strings"
+            )
 
 
 def _validate_patch_scope(patch_text: str, symbol_path: str) -> None:
@@ -214,17 +287,28 @@ def generate_candidate_proposal(
     except ValueError as exc:  # includes json.JSONDecodeError
         return _fail(f"Failed to parse LLM response: {exc}")
 
-    generated_code = str(proposal.get("generated_code") or "").strip()
+    try:
+        _validate_proposal_shape(proposal)
+    except DraftError as exc:
+        return _fail(str(exc))
+
+    generated_code = (proposal.get("generated_code") or "").strip()
     if "def candidate" not in generated_code:
         return _fail("LLM response did not define a candidate function")
     if len(generated_code) > MAX_CODE_CHARS:
         return _fail(
             f"generated candidate exceeds {MAX_CODE_CHARS} characters"
         )
+    try:
+        _validate_generated_code(generated_code)
+    except DraftError as exc:
+        return _fail(str(exc))
 
-    summary = str(proposal.get("summary") or "")
+    summary = proposal.get("summary") or ""
     assumptions = _string_list(proposal.get("assumptions"))
-    changed_symbols = _string_list(proposal.get("changed_symbols"))
+    # The patch builder, rather than the untrusted LLM response, is the source
+    # of truth for which symbol changes.
+    changed_symbols = [symbol_qualified_name]
     risks = _string_list(proposal.get("risks"))
     suggested_tests = _string_list(proposal.get("suggested_tests"))
 

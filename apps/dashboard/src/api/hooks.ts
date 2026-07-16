@@ -1908,14 +1908,11 @@ export function useCandidateVersion(versionId: number | null) {
 export function useReplayCandidateVersion() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ versionId, snapshot_id }: {
+    mutationFn: ({ versionId }: {
       versionId: number;
       sessionId: number;
-      snapshot_id?: number | null;
     }) =>
-      api.post<CandidateVersionOut>(`/candidate-versions/${versionId}/replay`, {
-        snapshot_id: snapshot_id ?? undefined,
-      }),
+      api.post<CandidateVersionOut>(`/candidate-versions/${versionId}/replay`, {}),
     onSuccess: (_d, vars) =>
       qc.invalidateQueries({ queryKey: sysKey("candidateSession", vars.sessionId) }),
   });

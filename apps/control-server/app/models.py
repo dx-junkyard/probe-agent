@@ -4169,11 +4169,13 @@ CandidateSessionStatus = Literal["active", "archived"]
 
 
 class CandidateSessionCreate(BaseModel):
-    """Start a Studio session for a component. Exactly one input selection is
-    required: an existing ``replay_set_id``, an explicit ``trace_ids`` list, or
-    a single ``trace_id`` (the "improve from this input" entry). When trace ids
-    are given, a Replay Set is created for them (reusing POST /replay-sets'
-    validation). ``snapshot_id`` defaults to the latest ready snapshot."""
+    """Start a Studio session for a component. At most one input selection
+    may be supplied: an existing ``replay_set_id``, an explicit ``trace_ids``
+    list, or a single ``trace_id`` (the "improve from this input" entry). With
+    no selection, the component entry point uses up to 50 recent traces. When
+    trace ids are selected, a Replay Set is created for them (reusing POST
+    /replay-sets' validation). ``snapshot_id`` defaults to the latest ready
+    snapshot."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -4274,6 +4276,8 @@ class CandidateGenerateCreate(BaseModel):
 
 
 class CandidateReplayCreate(BaseModel):
+    """Replay against the session's pinned snapshot.  ``snapshot_id`` remains
+    accepted for compatibility, but a different value is rejected."""
     model_config = ConfigDict(extra="forbid")
 
     snapshot_id: Optional[int] = None

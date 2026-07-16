@@ -30,6 +30,7 @@ import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { JsonTree } from "@/components/json-tree";
+import { Bot } from "lucide-react";
 import { ReplayabilityBadge } from "@/components/replay-row-actions";
 import { ApprovalPanel } from "@/components/replay-approval-panel";
 import { ResultMatrix } from "@/components/replay-result-matrix";
@@ -53,6 +54,7 @@ const SKIP_GUIDANCE: Record<string, string> = {
 };
 
 export default function SimulationWorkbenchPage() {
+  const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const replaySetIdParam = searchParams.get("replay_set_id");
   const selectedSetId =
@@ -194,20 +196,35 @@ export default function SimulationWorkbenchPage() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-3">
         <h1 className="text-2xl font-bold tracking-tight">Simulation Workbench</h1>
-        <div className="w-72">
-          <Select
-            value={selectedSetId ? String(selectedSetId) : ""}
-            onChange={(e) => e.target.value && selectSet(Number(e.target.value))}
-          >
-            <option value="">Select a Replay Set...</option>
-            {sets?.map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.name || `Set #${s.id}`} — {s.component_id} ({s.trace_ids.length})
-              </option>
-            ))}
-          </Select>
+        <div className="flex items-center gap-2">
+          {selectedSetId && componentId && (
+            <Button
+              variant="outline"
+              onClick={() =>
+                navigate(
+                  `/candidate-studio?component_id=${encodeURIComponent(componentId)}` +
+                    `&replay_set_id=${selectedSetId}`,
+                )
+              }
+            >
+              <Bot className="mr-1 h-4 w-4" /> 会話で候補を改善
+            </Button>
+          )}
+          <div className="w-72">
+            <Select
+              value={selectedSetId ? String(selectedSetId) : ""}
+              onChange={(e) => e.target.value && selectSet(Number(e.target.value))}
+            >
+              <option value="">Select a Replay Set...</option>
+              {sets?.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.name || `Set #${s.id}`} — {s.component_id} ({s.trace_ids.length})
+                </option>
+              ))}
+            </Select>
+          </div>
         </div>
       </div>
 

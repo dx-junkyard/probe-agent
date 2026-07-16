@@ -17,6 +17,7 @@ import {
 import type {
   CandidateSessionCreateRequest,
   CandidateVersionOut,
+  ReplayVariantCaseResultOut,
   TraceEvent,
 } from "@/api/types";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
@@ -81,6 +82,7 @@ export default function CandidateStudioPage() {
       <StartView
         prefillComponentId={searchParams.get("component_id")}
         prefillTraceId={searchParams.get("trace_id")}
+        prefillReplaySetId={searchParams.get("replay_set_id")}
       />
     );
   }
@@ -92,23 +94,25 @@ export default function CandidateStudioPage() {
 function StartView({
   prefillComponentId,
   prefillTraceId,
+  prefillReplaySetId,
 }: {
   prefillComponentId: string | null;
   prefillTraceId: string | null;
+  prefillReplaySetId: string | null;
 }) {
   const navigate = useNavigate();
   const { data: components } = useComponents();
   const [componentId, setComponentId] = useState(prefillComponentId ?? "");
   const [traceId, setTraceId] = useState(prefillTraceId ?? "");
   const [objective, setObjective] = useState("");
-  const [advancedOpen, setAdvancedOpen] = useState(false);
-  const [replaySetId, setReplaySetId] = useState("");
+  const [advancedOpen, setAdvancedOpen] = useState(!!prefillReplaySetId);
+  const [replaySetId, setReplaySetId] = useState(prefillReplaySetId ?? "");
 
   const { data: traces } = useTraces(componentId || null, 50);
   const { data: replaySets } = useReplaySets(componentId || null);
   const createSession = useCreateCandidateSession();
 
-  const canStart = !!componentId && (!!replaySetId || !!traceId) && !createSession.isPending;
+  const canStart = !!componentId && !createSession.isPending;
 
   const handleStart = async () => {
     const payload: CandidateSessionCreateRequest = {
@@ -117,7 +121,7 @@ function StartView({
     };
     if (replaySetId) {
       payload.replay_set_id = Number(replaySetId);
-    } else {
+    } else if (traceId) {
       payload.trace_id = traceId;
     }
     try {
@@ -166,7 +170,7 @@ function StartView({
 
           {componentId && (
             <div className="space-y-2">
-              <Label>Trace (the input to improve from)</Label>
+              <Label>Trace (optional: the input to improve from)</Label>
               <Select value={traceId} onChange={(e) => setTraceId(e.target.value)} disabled={!!replaySetId}>
                 <option value="">Select a trace...</option>
                 {traces?.map((t) => (
@@ -178,6 +182,11 @@ function StartView({
               {!traces?.length && (
                 <p className="text-xs text-muted-foreground">
                   No traces recorded for this component yet.
+                </p>
+              )}
+              {!traceId && !replaySetId && !!traces?.length && (
+                <p className="text-xs text-muted-foreground">
+                  No selection uses up to 50 recent traces for this component automatically.
                 </p>
               )}
             </div>
@@ -243,9 +252,10 @@ function StudioView({ sessionId }: { sessionId: number }) {
   // most recent version whenever the session changes or a new version is
   // generated, same approach as the Simulation Workbench's active-run state.
   let effectiveSelectedVersionId = selectedVersionId;
-  if (sessionId !== trackedSessionId) {
+  if (session && sessionId !== trackedSessionId) {
     setTrackedSessionId(sessionId);
     setSelectedVersionId(null);
+    setDraftText(session.objective);
     effectiveSelectedVersionId = null;
   } else if (
     versions.length > 0 &&
@@ -472,7 +482,17 @@ function StudioView({ sessionId }: { sessionId: number }) {
                     </CodeBlock>
                   </TabsContent>
                   <TabsContent value="eval">
-                    <EvaluationTab version={selectedVersion} componentId={session.component_id} />
+                    <EvaluationTab
+                      version={selectedVersion}
+                      componentId={session.component_id}
+                      onRequestFix={(caseResult) => {
+                        const failure = caseResult.candidate_error ?? caseResult.case_status;
+                        setDraftText(
+                          `Trace ${caseResult.trace_id} の評価結果（${failure}）を修正してください。`,
+                        );
+                        toast.info("修正指示を会話入力欄へ追加しました");
+                      }}
+                    />
                   </TabsContent>
                 </Tabs>
               </div>
@@ -531,9 +551,11 @@ function VersionNotes({ version }: { version: CandidateVersionOut }) {
 function EvaluationTab({
   version,
   componentId,
+  onRequestFix,
 }: {
   version: CandidateVersionOut;
   componentId: string;
+  onRequestFix: (caseResult: ReplayVariantCaseResultOut) => void;
 }) {
   const { data: run } = useReplayVariantRun(version.replay_run_id);
   const { data: traces } = useTraces(componentId, 500);
@@ -553,7 +575,16 @@ function EvaluationTab({
   if (version.replay_status === "running") {
     return <Skeleton className="h-32 w-full" />;
   }
-  return <ResultMatrix run={run} recordedByTraceId={recordedByTraceId} />;
+  return (
+    <ResultMatrix
+      run={run}
+      recordedByTraceId={recordedByTraceId}
+      traceHref={(traceId) =>
+        `/components?component=${encodeURIComponent(componentId)}&trace=${encodeURIComponent(traceId)}`
+      }
+      onRequestFix={onRequestFix}
+    />
+  );
 }
 
 function PrimaryAction({
@@ -600,6 +631,13 @@ function PrimaryAction({
     return (
       <Button onClick={onRegenerate} disabled={!draftText.trim() || generatePending}>
         {generatePending ? "生成中..." : "AIに修正を依頼"}
+      </Button>
+    );
+  }
+  if ((state === "evaluated" || state === "promoted") && draftText.trim()) {
+    return (
+      <Button onClick={onRegenerate} disabled={generatePending}>
+        {generatePending ? "生成中..." : "AIに追加修正を依頼"}
       </Button>
     );
   }

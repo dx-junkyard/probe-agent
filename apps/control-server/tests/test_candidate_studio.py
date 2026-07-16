@@ -2,8 +2,9 @@
 
 A conversation + versioning layer over the existing isolated-Replay stack
 (#242 Phase B/C). Covers: session creation from a single trace_id / an
-explicit trace_ids list / an existing replay_set_id, the exactly-one-selection
-validation, the 409 when a component has no indexed function symbol, the
+    explicit trace_ids list / an existing replay_set_id / automatic recent
+    component traces, the at-most-one-selection validation, the 409 when a
+    component has no indexed function symbol, the
 deterministic opening messages, mock-provider generation creating an
 immutable proposed version with full reasoning provenance, messages never
 creating a version, branch/switch via parent_version_id, fail-closed
@@ -14,6 +15,7 @@ after), System isolation, and the ``app.candidate_studio`` unit surface
 (``_validate_patch_scope``, ``_string_list``).
 """
 
+import json
 import sqlite3
 import subprocess
 import time
@@ -21,7 +23,12 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from app.candidate_studio import _string_list, _validate_patch_scope
+from app.candidate_studio import (
+    _string_list,
+    _validate_generated_code,
+    _validate_patch_scope,
+    _validate_proposal_shape,
+)
 from app.replay_draft import DraftError
 
 
@@ -281,15 +288,26 @@ def test_session_from_existing_replay_set_id(admin_client, replay_repo):
     assert session["replay_set_id"] == existing_set["id"]
 
 
-def test_session_selection_validation_zero_or_multiple_is_422(admin_client, replay_repo):
+def test_session_without_selection_uses_recent_component_traces(admin_client, replay_repo):
+    _, _, headers, _ = _prepare(admin_client, replay_repo)
+    _post_trace(admin_client, headers, "t1", "norm", args=("x",),
+                output="{'kind': 'a', 'size': 1}")
+    _post_trace(admin_client, headers, "t2", "norm", args=("xx",),
+                output="{'kind': 'a', 'size': 2}")
+
+    response = _create_session(admin_client, headers)
+    assert response.status_code == 201, response.text
+    replay_set = admin_client.get(
+        f"/replay-sets/{response.json()['replay_set_id']}", headers=headers
+    ).json()
+    assert replay_set["trace_ids"] == ["t2", "t1"]
+
+
+def test_session_selection_validation_multiple_is_422(admin_client, replay_repo):
     _, _, headers, _ = _prepare(admin_client, replay_repo)
     _post_trace(admin_client, headers, "t1", "norm", args=("x",),
                 output="{'kind': 'a', 'size': 1}")
     existing_set = _create_set(admin_client, headers, ["t1"], "norm")
-
-    # Zero selections given.
-    zero = _create_session(admin_client, headers)
-    assert zero.status_code == 422
 
     # Two selections given at once.
     two = _create_session(
@@ -370,7 +388,7 @@ def test_generate_creates_proposed_version_with_reasoning_provenance(
     assert version["prompt_version"] == "candidate-studio-proposal-v1"
     assert version["schema_version"] == "candidate-studio-proposal-v1"
     assert version["decision_method"] == "reasoning_llm"
-    assert version["changed_symbols"] == ["candidate"]
+    assert version["changed_symbols"] == ["normalize"]
     assert version["patch_text"].strip()
     assert "diff --git" in version["patch_text"]
 
@@ -394,6 +412,55 @@ def test_generate_creates_proposed_version_with_reasoning_provenance(
         m["role"] == "assistant" and m["version_id"] == version["id"]
         for m in refreshed["messages"]
     )
+
+
+def test_generation_context_redacts_trace_secrets_and_includes_prior_user_messages(
+    admin_client, replay_repo, monkeypatch
+):
+    _, _, headers, _ = _prepare(admin_client, replay_repo)
+    secret = "sk-super-secret-value"
+    _post_trace(
+        admin_client,
+        headers,
+        "t-secret",
+        "norm",
+        kwargs={"api_key": secret},
+        output=f"password={secret}",
+    )
+    session = _create_session(admin_client, headers, trace_id="t-secret").json()
+    prior_message = "返り値の型は変更しないでください"
+    sent = admin_client.post(
+        f"/candidate-sessions/{session['id']}/messages",
+        json={"content": prior_message},
+        headers=headers,
+    )
+    assert sent.status_code == 200, sent.text
+
+    captured = {}
+
+    class CapturingClient:
+        def generate_text(self, messages, **_kwargs):
+            captured["prompt"] = "\n".join(message["content"] for message in messages)
+            return json.dumps(
+                {
+                    "summary": "safe",
+                    "assumptions": [],
+                    "changed_symbols": ["candidate"],
+                    "generated_code": "def candidate(*args, **kwargs):\n    return {}\n",
+                    "risks": [],
+                    "suggested_tests": [],
+                }
+            )
+
+    monkeypatch.setattr(
+        "app.routes.candidate_studio.create_llm_client",
+        lambda _config: CapturingClient(),
+    )
+    generated = _generate(admin_client, headers, session["id"], "生成してください")
+    assert generated.status_code == 201, generated.text
+    assert prior_message in captured["prompt"]
+    assert secret not in captured["prompt"]
+    assert "[REDACTED]" in captured["prompt"]
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +598,65 @@ def test_replay_requires_approval_then_completes_after_approval(
     )
     assert diff_matrix.status_code == 200, diff_matrix.text
     assert diff_matrix.json()["status"] == "completed"
+
+
+def test_replay_rejects_snapshot_other_than_session_baseline(admin_client, replay_repo):
+    _, _, headers, _ = _prepare(admin_client, replay_repo)
+    _post_trace(admin_client, headers, "t1", "norm", args=("hello",), output="ok")
+    session = _create_session(admin_client, headers, trace_id="t1").json()
+    version = _generate(admin_client, headers, session["id"]).json()
+    _approve(admin_client, headers, "norm")
+
+    with open(replay_repo / "svc.py", "a", encoding="utf-8") as handle:
+        handle.write("\n# second snapshot\n")
+    _git(replay_repo, "add", "svc.py")
+    _git(replay_repo, "commit", "-m", "second snapshot")
+    second = admin_client.post("/repository/snapshots", headers=headers)
+    assert second.status_code == 201, second.text
+    assert admin_client.post(
+        "/repository/symbols/index", headers=headers
+    ).status_code == 201
+
+    response = admin_client.post(
+        f"/candidate-versions/{version['id']}/replay",
+        json={"snapshot_id": second.json()["id"]},
+        headers=headers,
+    )
+    assert response.status_code == 422, response.text
+    assert "pinned baseline snapshot" in response.json()["detail"]
+
+
+def test_failed_candidate_variant_sets_failed_status_and_event(
+    admin_client, replay_repo, db_file
+):
+    _, _, headers, _ = _prepare(admin_client, replay_repo)
+    _post_trace(admin_client, headers, "t1", "norm", args=("hello",), output="ok")
+    session = _create_session(admin_client, headers, trace_id="t1").json()
+    version = _generate(admin_client, headers, session["id"]).json()
+    _approve(admin_client, headers, "norm")
+
+    # Simulate a corrupted persisted patch so the shared variant runner audits
+    # an invalid_patch candidate while its baseline run still completes.
+    conn = sqlite3.connect(str(db_file))
+    try:
+        conn.execute(
+            "UPDATE candidate_versions SET patch_text = ? WHERE id = ?",
+            ("not a unified diff", version["id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    replayed = admin_client.post(
+        f"/candidate-versions/{version['id']}/replay", json={}, headers=headers
+    )
+    assert replayed.status_code == 200, replayed.text
+    assert replayed.json()["replay_status"] == "failed"
+
+    events = admin_client.get(
+        f"/candidate-sessions/{session['id']}/events", headers=headers
+    ).json()
+    assert events["events"][-1]["phase"] == "failed"
 
 
 def test_replay_rejects_a_non_proposed_or_patchless_version(admin_client, replay_repo):
@@ -675,3 +801,36 @@ def test_string_list_bounds_and_coerces():
     assert len(bounded) == 20
     assert bounded[0] == "item-0"
     assert bounded[-1] == "item-19"
+
+
+def test_generated_code_must_be_one_function_without_imports():
+    _validate_generated_code("def candidate(*args, **kwargs):\n    return 1\n")
+
+    with pytest.raises(DraftError, match="exactly one top-level"):
+        _validate_generated_code(
+            "x = 1\ndef candidate(*args, **kwargs):\n    return x\n"
+        )
+    with pytest.raises(DraftError, match="must not contain import"):
+        _validate_generated_code(
+            "def candidate(*args, **kwargs):\n    import os\n    return os.getcwd()\n"
+        )
+    with pytest.raises(DraftError, match="must not contain decorators"):
+        _validate_generated_code(
+            "@staticmethod\ndef candidate(*args, **kwargs):\n    return 1\n"
+        )
+    with pytest.raises(DraftError, match="exact signature"):
+        _validate_generated_code("def candidate(value):\n    return value\n")
+
+
+def test_candidate_proposal_shape_fails_closed_on_wrong_field_types():
+    _validate_proposal_shape(
+        {
+            "generated_code": "def candidate():\n    return 1\n",
+            "summary": "valid",
+            "risks": ["valid"],
+        }
+    )
+    with pytest.raises(DraftError, match="generated_code must be a string"):
+        _validate_proposal_shape({"generated_code": 123})
+    with pytest.raises(DraftError, match="risks must be an array of strings"):
+        _validate_proposal_shape({"generated_code": "def candidate(): pass", "risks": [1]})

@@ -36,9 +36,14 @@ export default function ComponentsPage() {
   const [selected, setSelected] = useState<string | null>(
     searchParams.get("component"),
   );
-  const [expandedTraceId, setExpandedTraceId] = useState<string | null>(null);
+  const requestedTraceId = searchParams.get("trace");
+  const [expandedTraceId, setExpandedTraceId] = useState<string | null>(requestedTraceId);
   const updatePolicy = useUpdatePolicy();
-  const { data: traces } = useTraces(selected, 20, SIGNAL_REFRESH_INTERVAL_MS);
+  const { data: traces } = useTraces(
+    selected,
+    requestedTraceId ? 500 : 20,
+    SIGNAL_REFRESH_INTERVAL_MS,
+  );
   const { data: profile } = useComponentProfile(selected);
   const updateProfile = useUpdateComponentProfile();
   const { data: shadows } = useShadowResults(selected, 20);
@@ -161,7 +166,12 @@ export default function ComponentsPage() {
                               const expanded = expandedTraceId === t.trace_id;
                               return (
                                 <Fragment key={t.trace_id}>
-                                  <tr className="border-b last:border-0">
+                                  <tr
+                                    className={cn(
+                                      "border-b last:border-0",
+                                      requestedTraceId === t.trace_id && "bg-amber-50 dark:bg-amber-950/20",
+                                    )}
+                                  >
                                     <td className="py-2 font-mono text-xs">
                                       <button
                                         type="button"

@@ -30,6 +30,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from ..auth import get_system_id
 from ..candidate_studio import (
+    MAX_BASELINE_SOURCE_CHARS,
     PROMPT_VERSION,
     PROPOSAL_PROPOSED,
     SCHEMA_VERSION,
@@ -53,7 +54,9 @@ from ..models import (
     ReplayVariantRunCreate,
 )
 from ..replay_runner import replay_workspace_base
+from ..workspace_context import _redact_and_truncate
 from .replay import (
+    MAX_REPLAY_SET_SIZE,
     _active_approval,
     _resolve_component_symbol,
     _resolve_snapshot,
@@ -65,6 +68,8 @@ from .replay import (
 router = APIRouter()
 
 MAX_EXAMPLE_TRACES = 5
+MAX_CONVERSATION_MESSAGES = 20
+MAX_CONTEXT_FIELD_CHARS = 2_000
 
 
 # --- serialization helpers ----------------------------------------------------
@@ -227,10 +232,10 @@ def create_candidate_session(
         payload.trace_ids is not None,
         payload.trace_id is not None,
     ]
-    if sum(1 for s in selections if s) != 1:
+    if sum(1 for s in selections if s) > 1:
         raise HTTPException(
             status_code=422,
-            detail="Provide exactly one of replay_set_id, trace_ids, or trace_id",
+            detail="Provide at most one of replay_set_id, trace_ids, or trace_id",
         )
 
     now = time.time()
@@ -251,6 +256,7 @@ def create_candidate_session(
         symbol_path = symbol["path"]
         symbol_qualified_name = symbol["qualified_name"]
         replay_set_id: Optional[int] = None
+        trace_ids: Optional[List[str]] = None
         if payload.replay_set_id is not None:
             replay_set = conn.execute(
                 "SELECT * FROM replay_sets WHERE id = ? AND system_id = ?",
@@ -264,20 +270,42 @@ def create_candidate_session(
                     detail="Replay set belongs to a different component",
                 )
             replay_set_id = replay_set["id"]
+        elif payload.trace_ids is not None:
+            trace_ids = [str(trace_id) for trace_id in payload.trace_ids]
+        elif payload.trace_id is not None:
+            trace_ids = [str(payload.trace_id)]
+        else:
+            # The component-detail entry point deliberately supplies only a
+            # component.  Build a deterministic evaluation set from its most
+            # recent captured inputs so that entry point is actually usable.
+            recent = conn.execute(
+                """
+                SELECT trace_id FROM traces
+                WHERE system_id = ? AND component_id = ?
+                ORDER BY timestamp DESC, trace_id
+                LIMIT ?
+                """,
+                (system_id, payload.component_id, MAX_REPLAY_SET_SIZE),
+            ).fetchall()
+            trace_ids = [row["trace_id"] for row in recent]
+            if not trace_ids:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Component '{payload.component_id}' has no captured traces; "
+                        "provide a Replay Set or capture a trace first"
+                    ),
+                )
 
     # Phase 2: create the Replay Set from trace ids (its own connection),
     # reusing POST /replay-sets validation (existence, dedupe, size cap).
     if replay_set_id is None:
-        trace_ids = (
-            payload.trace_ids
-            if payload.trace_ids is not None
-            else [payload.trace_id]
-        )
+        assert trace_ids is not None
         replay_set_out = create_replay_set(
             ReplaySetCreate(
                 component_id=payload.component_id,
                 name=f"Candidate Studio ({payload.component_id})",
-                trace_ids=[str(t) for t in trace_ids],
+                trace_ids=trace_ids,
             ),
             system_id=system_id,
         )
@@ -362,10 +390,23 @@ def post_candidate_message(
     with get_conn() as conn:
         row = _get_session_or_404(conn, session_id, system_id)
         _add_message(conn, system_id, session_id, "user", payload.content, None, now)
-        # Deterministic acknowledgement only; a message never creates a version.
+        # Deterministically confirm the concrete condition and pinned change
+        # boundary.  A message never creates a version; actual reasoning and
+        # proposal generation still happen only after the explicit Generate
+        # action.
         _add_message(
             conn, system_id, session_id, "assistant",
-            "承知しました。「候補を生成」で patch を作成します。", None, now,
+            (
+                "理解した条件:\n"
+                f"- {payload.content.strip()}\n"
+                "変更方針:\n"
+                f"- baseline {row['commit_sha'][:12]} の "
+                f"{row['symbol_path']}:{row['symbol_qualified_name']} のみを変更\n"
+                "- 既存 Replay Set で比較可能な候補として生成\n"
+                "内容を確認し、「候補を生成」で patch を作成してください。"
+            ),
+            None,
+            now,
         )
         conn.execute(
             "UPDATE candidate_sessions SET updated_at = ? WHERE id = ?",
@@ -418,23 +459,46 @@ def _build_generation_context(
         example_traces.append(
             {
                 "trace_id": trace_id,
-                "input": trace["input_json"],
-                "output": trace["output_text"],
-                "error": trace["error"],
+                "input": _redact_and_truncate(
+                    trace["input_json"], MAX_CONTEXT_FIELD_CHARS
+                ),
+                "output": _redact_and_truncate(
+                    trace["output_text"], MAX_CONTEXT_FIELD_CHARS
+                ),
+                "error": _redact_and_truncate(
+                    trace["error"], MAX_CONTEXT_FIELD_CHARS
+                ),
             }
         )
+    conversation_rows = conn.execute(
+        """
+        SELECT content FROM candidate_messages
+        WHERE session_id = ? AND system_id = ? AND role = 'user'
+        ORDER BY id DESC LIMIT ?
+        """,
+        (session_row["id"], system_id, MAX_CONVERSATION_MESSAGES),
+    ).fetchall()
+    conversation_history = [
+        _redact_and_truncate(row["content"], MAX_CONTEXT_FIELD_CHARS)
+        for row in reversed(conversation_rows)
+    ]
     return {
-        "objective": session_row["objective"] or "",
+        "objective": _redact_and_truncate(
+            session_row["objective"] or "", MAX_CONTEXT_FIELD_CHARS
+        ),
         "component_id": component_id,
         "target_symbol": {
             "path": symbol["path"],
             "qualified_name": symbol["qualified_name"],
         },
-        "baseline_source": baseline_source,
+        "baseline_source": _redact_and_truncate(
+            baseline_source, MAX_BASELINE_SOURCE_CHARS
+        ),
         "system_profile": dict(system_profile) if system_profile else {},
         "component_profile": dict(component_profile) if component_profile else {},
         "criteria": [dict(c) for c in criteria],
         "example_traces": example_traces,
+        "conversation_history": conversation_history,
     }
 
 
@@ -514,15 +578,6 @@ def generate_candidate_version(
         end_line = symbol["end_line"]
         symbol_path = symbol["path"]
         symbol_qualified_name = symbol["qualified_name"]
-        next_number = (
-            conn.execute(
-                "SELECT COALESCE(MAX(version_number), 0) FROM candidate_versions "
-                "WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()[0]
-            + 1
-        )
-
     # Reasoning attempt (outside the DB lock). Fail closed on any config/call/
     # parse/scope/size failure -- no heuristic fallback (Principle 6).
     config = LLMConfig.from_env()
@@ -603,6 +658,17 @@ def generate_candidate_version(
             )
             raise HTTPException(status_code=502, detail=proposal.error or "generation failed")
 
+        # Allocate the display number only after the slow LLM operation, while
+        # holding the same write transaction that inserts the version.  This
+        # prevents concurrent generations from reusing a stale MAX value.
+        next_number = (
+            conn.execute(
+                "SELECT COALESCE(MAX(version_number), 0) FROM candidate_versions "
+                "WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0]
+            + 1
+        )
         cur = conn.execute(
             """
             INSERT INTO candidate_versions
@@ -690,7 +756,12 @@ def get_candidate_events(
     events: List[CandidateEventOut] = []
     for v in versions:
         replay_status = v["replay_status"]
-        phase = "replaying" if replay_status == "running" else "completed"
+        if replay_status == "running":
+            phase = "replaying"
+        elif v["status"] == "failed" or replay_status == "failed":
+            phase = "failed"
+        else:
+            phase = "completed"
         events.append(
             CandidateEventOut(
                 version_id=v["id"],
@@ -714,7 +785,6 @@ def replay_candidate_version(
     payload: CandidateReplayCreate,
     system_id: int = Depends(get_system_id),
 ) -> CandidateVersionOut:
-    now = time.time()
     with get_conn() as conn:
         version = _get_version_or_404(conn, version_id, system_id)
         if version["status"] != PROPOSAL_PROPOSED or not version["patch_text"]:
@@ -725,7 +795,18 @@ def replay_candidate_version(
         session_row = _get_session_or_404(conn, version["session_id"], system_id)
         replay_set_id = session_row["replay_set_id"]
         component_id = session_row["component_id"]
-        snapshot_id = payload.snapshot_id or session_row["snapshot_id"]
+        if (
+            payload.snapshot_id is not None
+            and payload.snapshot_id != session_row["snapshot_id"]
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Candidate replay must use the session's pinned baseline snapshot "
+                    f"({session_row['snapshot_id']})"
+                ),
+            )
+        snapshot_id = session_row["snapshot_id"]
         version_number = version["version_number"]
         patch_text = version["patch_text"]
         # Surface the human replay-approval gate here too (fail closed before
@@ -764,11 +845,30 @@ def replay_candidate_version(
                 (version_id,),
             )
         raise
+    except Exception:
+        # Unexpected runner failures must not strand the immutable candidate in
+        # a permanent 'running' state.
+        with get_conn() as conn:
+            conn.execute(
+                "UPDATE candidate_versions SET replay_status = 'failed' WHERE id = ?",
+                (version_id,),
+            )
+        raise
 
     candidate_variant = next(
         (v for v in run.variants if not v.is_baseline), None
     )
-    replay_status = "completed" if run.status == "completed" else "failed"
+    replay_status = (
+        "completed"
+        if (
+            run.status == "completed"
+            and candidate_variant is not None
+            and candidate_variant.status == "completed"
+            and candidate_variant.apply_status == "applied"
+        )
+        else "failed"
+    )
+    completed_at = time.time()
     with get_conn() as conn:
         conn.execute(
             """
@@ -785,7 +885,7 @@ def replay_candidate_version(
         )
         conn.execute(
             "UPDATE candidate_sessions SET updated_at = ? WHERE id = ?",
-            (now, version["session_id"]),
+            (completed_at, version["session_id"]),
         )
         return _version_out(conn, _get_version_or_404(conn, version_id, system_id))
 

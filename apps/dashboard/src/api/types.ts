@@ -2846,6 +2846,8 @@ export interface CandidateSessionOut {
 
 export interface CandidateSessionCreateRequest {
   component_id: string;
+  // With no replay/trace selection, the server creates a set from up to 50
+  // recent traces for the component.
   replay_set_id?: number;
   trace_ids?: string[];
   trace_id?: string;

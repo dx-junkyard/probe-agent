@@ -5,6 +5,8 @@ import type {
   TraceEvent,
 } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Link } from "react-router-dom";
 
 // Shared replay-variant diff matrix, extracted from the Simulation Workbench
 // (Issue #242 Phase D / #246) so AI Candidate Studio (Issue #252) can reuse
@@ -35,10 +37,16 @@ const CASE_STATUS_LABEL: Record<string, string> = {
 export function ResultMatrix({
   run,
   recordedByTraceId,
+  traceHref,
+  onRequestFix,
 }: {
   run: ReplayVariantRunOut | undefined;
   recordedByTraceId: Map<string, TraceEvent>;
+  traceHref?: (traceId: string) => string;
+  onRequestFix?: (caseResult: ReplayVariantCaseResultOut) => void;
 }) {
+  const failedCandidates =
+    run?.variants.filter((variant) => !variant.is_baseline && variant.status === "failed") ?? [];
   return (
     <div data-testid="replay-result-matrix" className="space-y-3">
       <div className="rounded-md border border-blue-200 bg-blue-50 dark:bg-blue-950/20 dark:border-blue-800 px-3 py-2 text-xs text-blue-900 dark:text-blue-100">
@@ -46,6 +54,14 @@ export function ResultMatrix({
         snapshot. Results can differ from production (environment, external services,
         time-dependent state) -- this is not a production-equivalence guarantee.
       </div>
+      {failedCandidates.map((variant) => (
+        <div
+          key={variant.id}
+          className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+        >
+          {variant.label || variant.variant_key}: {variant.apply_error ?? variant.error ?? "Replay failed"}
+        </div>
+      ))}
       {!run ? (
         <p className="text-sm text-muted-foreground">Run a variant to see the diff matrix.</p>
       ) : run.status !== "completed" ? (
@@ -54,7 +70,12 @@ export function ResultMatrix({
           {run.error ? ` -- ${run.error}` : ""}
         </p>
       ) : (
-        <MatrixTable run={run} recordedByTraceId={recordedByTraceId} />
+        <MatrixTable
+          run={run}
+          recordedByTraceId={recordedByTraceId}
+          traceHref={traceHref}
+          onRequestFix={onRequestFix}
+        />
       )}
     </div>
   );
@@ -63,9 +84,13 @@ export function ResultMatrix({
 function MatrixTable({
   run,
   recordedByTraceId,
+  traceHref,
+  onRequestFix,
 }: {
   run: ReplayVariantRunOut;
   recordedByTraceId: Map<string, TraceEvent>;
+  traceHref?: (traceId: string) => string;
+  onRequestFix?: (caseResult: ReplayVariantCaseResultOut) => void;
 }) {
   const candidates = run.variants.filter((v) => !v.is_baseline);
   const rows = candidates.find((candidate) => candidate.cases.length > 0)?.cases ?? [];
@@ -94,7 +119,15 @@ function MatrixTable({
             const recorded = recordedByTraceId.get(row.trace_id);
             return (
               <tr key={row.trace_id} className="border-t align-top">
-                <td className="p-2 font-mono">{row.trace_id.slice(0, 10)}</td>
+                <td className="p-2 font-mono">
+                  {traceHref ? (
+                    <Link className="text-primary underline" to={traceHref(row.trace_id)}>
+                      {row.trace_id.slice(0, 10)}
+                    </Link>
+                  ) : (
+                    row.trace_id.slice(0, 10)
+                  )}
+                </td>
                 <td className="p-2 max-w-[16rem]">
                   <pre className="whitespace-pre-wrap break-words">
                     {recorded?.error ?? recorded?.output ?? "—"}
@@ -109,7 +142,11 @@ function MatrixTable({
                   const caseResult = v.cases.find((c) => c.position === row.position);
                   return (
                     <td key={v.id} className="p-2 max-w-[16rem]">
-                      {caseResult ? <CaseCell caseResult={caseResult} /> : "—"}
+                      {caseResult ? (
+                        <CaseCell caseResult={caseResult} onRequestFix={onRequestFix} />
+                      ) : (
+                        "—"
+                      )}
                     </td>
                   );
                 })}
@@ -134,7 +171,14 @@ function MatrixTable({
   );
 }
 
-function CaseCell({ caseResult }: { caseResult: ReplayVariantCaseResultOut }) {
+function CaseCell({
+  caseResult,
+  onRequestFix,
+}: {
+  caseResult: ReplayVariantCaseResultOut;
+  onRequestFix?: (caseResult: ReplayVariantCaseResultOut) => void;
+}) {
+  const canRequestFix = caseResult.case_status !== "match" && caseResult.case_status !== "skipped";
   return (
     <div className="space-y-1">
       <Badge variant={CASE_STATUS_VARIANT[caseResult.case_status] ?? "outline"} className="text-[10px]">
@@ -148,6 +192,11 @@ function CaseCell({ caseResult }: { caseResult: ReplayVariantCaseResultOut }) {
       )}
       {caseResult.duration_delta_ms != null && (
         <p className="text-muted-foreground">Δ {caseResult.duration_delta_ms.toFixed(1)}ms</p>
+      )}
+      {canRequestFix && onRequestFix && (
+        <Button size="sm" variant="outline" onClick={() => onRequestFix(caseResult)}>
+          このTraceを修正
+        </Button>
       )}
     </div>
   );
