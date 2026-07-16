@@ -443,6 +443,108 @@ describe("Experiment decision (adopted)", () => {
   });
 });
 
+// ── Experiment decision next-action (Issue #259) ────────────────────
+
+describe("Experiment decision next-action (Issue #259)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  function decidedExperimentFixture(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 1, feature_id: "feat-1", objective: "Test", status: "completed",
+      human_decision: "adopted", human_decision_variant_key: "opt-v1", human_decision_note: "note",
+      created_at: "2024-01-01T00:00:00Z",
+      variants: [
+        { id: 1, variant_key: "baseline", label: "Baseline", is_baseline: true, status: "completed", patch_text: null, risk_note: null, error: null, metrics: {} },
+      ],
+      comparison: {},
+      ...overrides,
+    };
+  }
+
+  function setupDecidedExperiment(exp: Record<string, unknown>, github: {
+    appStatus?: Record<string, unknown>;
+    connections?: Record<string, unknown>[];
+  } = {}) {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/experiments") return Promise.resolve([exp]);
+      if (path === "/repository/snapshots") return Promise.resolve([]);
+      if (path === "/repository/drafts/latest") return Promise.resolve({ feature_drafts: [] });
+      if (path === "/github/app-status") return Promise.resolve(
+        github.appStatus ?? { configured: false, app_id: null, api_base_url: "", web_base_url: "" },
+      );
+      if (path === "/github/connections") return Promise.resolve(github.connections ?? []);
+      return Promise.resolve(null);
+    });
+  }
+
+  async function renderAndExpand() {
+    const { default: ExperimentsPage } = await import("@/pages/experiments");
+    render(<ExperimentsPage />, { wrapper: createWrapper() });
+    await waitFor(() => expect(screen.getByText(/Experiment #1/)).toBeInTheDocument());
+    fireEvent.click(screen.getByText(/Experiment #1/).closest("[class*=cursor-pointer]")!);
+  }
+
+  test("adopted decision shows GitHub publish + Probe Planner next actions when GitHub is configured", async () => {
+    setupDecidedExperiment(decidedExperimentFixture(), {
+      appStatus: { configured: true, app_id: "1", api_base_url: "https://api.github.com", web_base_url: "https://github.com" },
+      connections: [{ id: 1, status: "connected" }],
+    });
+    await renderAndExpand();
+
+    const githubLink = await screen.findByTestId("experiment-github-publish-link");
+    expect(githubLink).toHaveAttribute("href", "/github");
+    expect(screen.getByTestId("experiment-probe-planner-link")).toHaveAttribute("href", "/probe-planner");
+  });
+
+  test("adopted decision hides the GitHub publish link (but keeps Probe Planner) when GitHub is not configured", async () => {
+    setupDecidedExperiment(decidedExperimentFixture());
+    await renderAndExpand();
+
+    expect(await screen.findByTestId("experiment-probe-planner-link")).toBeInTheDocument();
+    expect(screen.queryByTestId("experiment-github-publish-link")).not.toBeInTheDocument();
+  });
+
+  test("adopted decision also hides the GitHub publish link when configured but no connection is connected", async () => {
+    setupDecidedExperiment(decidedExperimentFixture(), {
+      appStatus: { configured: true, app_id: "1", api_base_url: "https://api.github.com", web_base_url: "https://github.com" },
+      connections: [{ id: 1, status: "error" }],
+    });
+    await renderAndExpand();
+
+    expect(await screen.findByTestId("experiment-probe-planner-link")).toBeInTheDocument();
+    expect(screen.queryByTestId("experiment-github-publish-link")).not.toBeInTheDocument();
+  });
+
+  test("rejected decision links to AI Candidate Studio", async () => {
+    setupDecidedExperiment(decidedExperimentFixture({ human_decision: "rejected", human_decision_variant_key: null }));
+    await renderAndExpand();
+
+    const link = await screen.findByTestId("experiment-candidate-studio-link");
+    expect(link).toHaveAttribute("href", "/candidate-studio");
+    expect(screen.queryByTestId("experiment-github-publish-link")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("experiment-probe-planner-link")).not.toBeInTheDocument();
+  });
+
+  test("needs_more_data decision also links to AI Candidate Studio", async () => {
+    setupDecidedExperiment(decidedExperimentFixture({ human_decision: "needs_more_data", human_decision_variant_key: null }));
+    await renderAndExpand();
+
+    expect(await screen.findByTestId("experiment-candidate-studio-link")).toBeInTheDocument();
+  });
+
+  test("undecided experiment shows no next-action card", async () => {
+    setupDecidedExperiment(decidedExperimentFixture({ human_decision: null, human_decision_variant_key: null }));
+    await renderAndExpand();
+
+    await waitFor(() => expect(screen.getByText("Decision")).toBeInTheDocument());
+    expect(screen.queryByTestId("experiment-next-action-adopted")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("experiment-next-action-candidate-studio")).not.toBeInTheDocument();
+  });
+});
+
 // ── Probe Patch explicit apply tests ────────────────────────────────
 
 describe("Probe Patch application", () => {
@@ -521,6 +623,90 @@ describe("Probe Patch application", () => {
         },
       );
     });
+  });
+});
+
+// ── Probe Patch apply-success next action (Issue #259) ──────────────
+
+describe("Probe Patch apply-success next action (Issue #259)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  function mockAppliedPatch(github: {
+    appStatus?: Record<string, unknown>;
+    connections?: Record<string, unknown>[];
+  } = {}) {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") {
+        return Promise.resolve({
+          system_id: 1, is_mock: false,
+          plans: [{
+            id: 10, feature_id: "feat-1", objective: "Observe behavior", status: "proposed",
+            created_at: "2024-01-01", probe_points: [],
+          }],
+        });
+      }
+      if (path === "/repository/probe-patches") {
+        return Promise.resolve([{
+          id: 20, plan_id: 10, system_id: 1, snapshot_id: 5,
+          commit_sha: "abcdef1234567890", diff: "diff --git a/a.py b/a.py",
+          worktree_path: null, skipped: [], status: "generated", error: null,
+          cleanup_state: "removed", cleanup_error: null,
+          apply_status: "applied", apply_error: null,
+          applied_at: "2024-01-02T00:00:00Z", applied_by_user_id: 1,
+          validation_runs: [
+            { id: 1, variant: "baseline", overall_success: true, commands: [] },
+            { id: 2, variant: "probed", overall_success: true, commands: [] },
+          ],
+          created_at: "2024-01-01",
+        }]);
+      }
+      if (path === "/github/app-status") return Promise.resolve(
+        github.appStatus ?? { configured: false, app_id: null, api_base_url: "", web_base_url: "" },
+      );
+      if (path === "/github/connections") return Promise.resolve(github.connections ?? []);
+      return Promise.resolve(null);
+    });
+  }
+
+  async function renderAndExpand() {
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+    await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Feature: feat-1"));
+  }
+
+  test("shows a Create Publish Job link targeting ?patch=<id> when GitHub publish is configured and connected", async () => {
+    mockAppliedPatch({
+      appStatus: { configured: true, app_id: "1", api_base_url: "https://api.github.com", web_base_url: "https://github.com" },
+      connections: [{ id: 1, status: "connected" }],
+    });
+    await renderAndExpand();
+
+    const link = await screen.findByTestId("patch-publish-link");
+    expect(link).toHaveAttribute("href", "/github?patch=20");
+    expect(screen.queryByTestId("patch-manual-git-instructions")).not.toBeInTheDocument();
+  });
+
+  test("falls back to manual git instructions when GitHub is not configured", async () => {
+    mockAppliedPatch();
+    await renderAndExpand();
+
+    expect(await screen.findByTestId("patch-manual-git-instructions")).toBeInTheDocument();
+    expect(screen.queryByTestId("patch-publish-link")).not.toBeInTheDocument();
+  });
+
+  test("falls back to manual git instructions when GitHub is configured but has no connected connection", async () => {
+    mockAppliedPatch({
+      appStatus: { configured: true, app_id: "1", api_base_url: "https://api.github.com", web_base_url: "https://github.com" },
+      connections: [{ id: 1, status: "error" }],
+    });
+    await renderAndExpand();
+
+    expect(await screen.findByTestId("patch-manual-git-instructions")).toBeInTheDocument();
+    expect(screen.queryByTestId("patch-publish-link")).not.toBeInTheDocument();
   });
 });
 
@@ -5866,6 +6052,60 @@ describe("Overview get-started zero state (Issue #212)", () => {
   });
 });
 
+// ── Overview 4th get-started step (Issue #259) ──────────────────────
+
+describe("Overview 4th get-started step (Issue #259)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+    mockSystems = [{ id: 1, name: "alpha" }];
+  });
+
+  function setupOverview(connectivityState: string | null) {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/components") return Promise.resolve([]);
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "ok",
+        severity_counts: {}, items: [], primary_item: null,
+        notification_items: [], page_items: {},
+      });
+      if (path === "/connectivity/status") {
+        return connectivityState
+          ? Promise.resolve({
+            system_id: 1, state: connectivityState, total_trace_count: 5, smoke_trace_count: 1,
+            real_trace_count: 4, first_trace_at: 1, last_trace_at: 2,
+            last_trace_component_id: "comp", smoke_component_id: "smoke", materialized_session_ids: [],
+          })
+          : Promise.resolve(null);
+      }
+      return Promise.resolve(null);
+    });
+  }
+
+  test("shows the 4th step linking to /components, incomplete while not receiving", async () => {
+    setupOverview("no_signal");
+    const { default: OverviewPage } = await import("@/pages/overview");
+    render(<OverviewPage />, { wrapper: createWrapper() });
+
+    const getStarted = await screen.findByTestId("overview-get-started");
+    const step4 = within(getStarted).getByTestId("overview-link-view-traces");
+    expect(step4).toHaveAttribute("href", "/components");
+    await waitFor(() => expect(step4).toHaveAttribute("data-done", "false"));
+    expect(within(getStarted).queryByTestId("overview-link-view-traces-done")).not.toBeInTheDocument();
+  });
+
+  test("marks the 4th step complete once connectivity state is receiving", async () => {
+    setupOverview("receiving");
+    const { default: OverviewPage } = await import("@/pages/overview");
+    render(<OverviewPage />, { wrapper: createWrapper() });
+
+    const getStarted = await screen.findByTestId("overview-get-started");
+    const step4 = within(getStarted).getByTestId("overview-link-view-traces");
+    await waitFor(() => expect(step4).toHaveAttribute("data-done", "true"));
+    expect(within(getStarted).getByTestId("overview-link-view-traces-done")).toBeInTheDocument();
+  });
+});
+
 describe("Probe Planner manual feature-id escape hatch (Issue #212)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -6776,6 +7016,109 @@ describe("GitHub page", () => {
     );
     expect(screen.queryByTestId("publish-job-approve-button")).not.toBeInTheDocument();
     expect(screen.queryByTestId("publish-job-cancel-button")).not.toBeInTheDocument();
+  });
+});
+
+// ── GitHub ?patch= preselection (Issue #259) ────────────────────────
+
+describe("GitHub ?patch= preselection (Issue #259)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const connectedConnectionFixture = {
+    id: 1, system_id: 1,
+    api_base_url: "https://api.github.com", web_base_url: "https://github.com",
+    owner: "acme", repo: "widgets", clone_url: "https://github.com/acme/widgets.git",
+    installation_id: 42, default_branch: "main", credential_type: "github_app",
+    status: "connected", last_error: null, last_synced_at: null, last_synced_commit_sha: null,
+    created_by_user_id: 1, updated_by_user_id: 1,
+    created_at: "2024-01-01T00:00:00Z", updated_at: "2024-01-01T00:00:00Z",
+  };
+
+  function greenPatchFixture(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 20, plan_id: 10, system_id: 1, snapshot_id: 5,
+      commit_sha: "abc1234567890", diff: "diff --git a/a.py b/a.py",
+      worktree_path: null, skipped: [], status: "generated", error: null,
+      cleanup_state: "removed", cleanup_error: null,
+      apply_status: "applied", apply_error: null, applied_at: null, applied_by_user_id: null,
+      validation_runs: [
+        { id: 1, variant: "baseline", overall_success: true, commands: [] },
+        { id: 2, variant: "probed", overall_success: true, commands: [] },
+      ],
+      created_at: "2024-01-01",
+      ...overrides,
+    };
+  }
+
+  function mockGithubForPatchParam(data: {
+    connections?: Record<string, unknown>[];
+    patches?: Record<string, unknown>[];
+  }) {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/github/app-status") return Promise.resolve({
+        configured: true, app_id: "1", api_base_url: "https://api.github.com", web_base_url: "https://github.com",
+      });
+      if (path === "/github/connections") return Promise.resolve(data.connections ?? []);
+      if (path === "/github/publish-jobs") return Promise.resolve([]);
+      if (path === "/repository/probe-patches") return Promise.resolve(data.patches ?? []);
+      if (path === "/users") return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+  }
+
+  function renderGithubAt(route: string) {
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    return import("@/pages/github").then(({ default: GithubPage }) =>
+      render(
+        <QueryClientProvider client={qc}>
+          <MemoryRouter initialEntries={[route]}>
+            <GithubPage />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      ),
+    );
+  }
+
+  test("preselects a valid, green patch from ?patch= and opens the create-job dialog on the Publish Jobs tab", async () => {
+    mockGithubForPatchParam({
+      connections: [connectedConnectionFixture],
+      patches: [greenPatchFixture()],
+    });
+    await renderGithubAt("/github?patch=20");
+
+    const select = await screen.findByTestId("publish-job-patch-select") as HTMLSelectElement;
+    expect(select.value).toBe("20");
+  });
+
+  test("ignores ?patch= for a patch that fails the green-validation gate", async () => {
+    mockGithubForPatchParam({
+      connections: [connectedConnectionFixture],
+      patches: [greenPatchFixture({
+        validation_runs: [{ id: 1, variant: "baseline", overall_success: false, commands: [] }],
+      })],
+    });
+    await renderGithubAt("/github?patch=20");
+
+    // Still lands on the Publish Jobs tab (the button below is proof of that)
+    // but does not auto-open the create dialog for an invalid patch.
+    await waitFor(() => expect(screen.getByTestId("new-publish-job-button")).toBeInTheDocument());
+    expect(screen.queryByTestId("publish-job-patch-select")).not.toBeInTheDocument();
+  });
+
+  test("ignores ?patch= for a patch id that does not exist", async () => {
+    mockGithubForPatchParam({
+      connections: [connectedConnectionFixture],
+      patches: [greenPatchFixture({ id: 99 })],
+    });
+    await renderGithubAt("/github?patch=20");
+
+    await waitFor(() => expect(screen.getByTestId("new-publish-job-button")).toBeInTheDocument());
+    expect(screen.queryByTestId("publish-job-patch-select")).not.toBeInTheDocument();
   });
 });
 

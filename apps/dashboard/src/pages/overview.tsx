@@ -1,22 +1,29 @@
 import { Link } from "react-router-dom";
-import { useComponents, useSystemState } from "@/api/hooks";
+import { useComponents, useSystemState, useConnectivityStatus } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { SystemStateBanner } from "@/components/system-state";
 import { PrerequisiteGuide } from "@/components/prerequisite-guide";
-import { Boxes, Activity, Clock, FolderCog, Compass, Plug } from "lucide-react";
+import { Boxes, Activity, Clock, FolderCog, Compass, Plug, RadioTower, CheckCircle2 } from "lucide-react";
 import { formatTimestamp } from "@/lib/utils";
 
 // Deterministic, ordered get-started steps for a brand-new System with zero
 // components (Issue #212). This is a static fallback list, not a heuristic
 // recommendation — every System needs the repository configured, System
 // Understanding built, and the SDK connected, in this order.
+// Issue #259: closes the dead end at step 3 -- once the SDK is connected
+// there was previously no onward link telling the developer where to go
+// look at the traces that start arriving. Step 4 is the only one with a
+// deterministic completion signal today (ConnectivityStatus, the same
+// finite state machine the header connectivity badge already reads, Issue
+// #165); the first three steps stay plain links, unchanged.
 const GET_STARTED_STEPS = [
   { to: "/repository", label: "1. Configure the repository", icon: FolderCog, testId: "overview-link-repository" },
   { to: "/system-understanding", label: "2. Build System Understanding", icon: Compass, testId: "overview-link-system-understanding" },
   { to: "/connect-sdk", label: "3. Connect the SDK", icon: Plug, testId: "overview-link-connect-sdk" },
+  { to: "/components", label: "4. View traces in Components", icon: RadioTower, testId: "overview-link-view-traces" },
 ] as const;
 
 const MODE_VARIANT = {
@@ -34,6 +41,10 @@ export default function OverviewPage() {
   // deterministic fallback (Issue #212).
   const { data: systemState } = useSystemState();
   const primaryOverviewItem = systemState?.page_items["/"]?.[0] ?? null;
+  // Issue #259: drives step 4's completion below -- "receiving" is the same
+  // state the header ConnectivityBadge treats as "done" (it hides itself
+  // once real, non-smoke traces have arrived).
+  const { data: connectivity } = useConnectivityStatus();
 
   const system = systems.find((s) => s.id === systemId);
   const totalTraces = components?.reduce((s, c) => s + c.trace_count, 0) ?? 0;
@@ -103,18 +114,27 @@ export default function OverviewPage() {
                 No components registered yet. Connect the SDK to start tracing.
               </p>
               <ol className="mx-auto max-w-sm space-y-2 text-sm">
-                {GET_STARTED_STEPS.map(({ to, label, icon: Icon, testId }) => (
-                  <li key={to}>
-                    <Link
-                      to={to}
-                      data-testid={testId}
-                      className="flex items-center gap-2 rounded-md border px-3 py-2 text-primary hover:bg-accent hover:underline"
-                    >
-                      <Icon className="h-4 w-4 shrink-0" />
-                      <span>{label}</span>
-                    </Link>
-                  </li>
-                ))}
+                {GET_STARTED_STEPS.map(({ to, label, icon: Icon, testId }) => {
+                  // Issue #259: only step 4 has a completion signal today.
+                  const done = to === "/components" && connectivity?.state === "receiving";
+                  return (
+                    <li key={to}>
+                      <Link
+                        to={to}
+                        data-testid={testId}
+                        data-done={done}
+                        className="flex items-center gap-2 rounded-md border px-3 py-2 text-primary hover:bg-accent hover:underline"
+                      >
+                        {done ? (
+                          <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" data-testid={`${testId}-done`} />
+                        ) : (
+                          <Icon className="h-4 w-4 shrink-0" />
+                        )}
+                        <span>{label}</span>
+                      </Link>
+                    </li>
+                  );
+                })}
               </ol>
             </div>
           ) : (

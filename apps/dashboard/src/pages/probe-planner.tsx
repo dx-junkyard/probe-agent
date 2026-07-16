@@ -2,6 +2,7 @@ import {
   useProbePlans, useGenerateProbePlan, useUpdateProbePointStatus,
   useProbePatches, useGeneratePatch, useValidatePatch, useApplyProbePatch,
   useLatestDrafts, useWorkspaceProposalDraft, useRepositoryStatus,
+  useGithubAppStatus, useGithubConnections,
 } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -14,7 +15,7 @@ import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { toast } from "sonner";
 import { formatTimestamp } from "@/lib/utils";
-import { Crosshair, CheckCircle, XCircle, FileCode, Play, Download, GitBranch, FlaskConical } from "lucide-react";
+import { Crosshair, CheckCircle, XCircle, FileCode, Play, Download, GitBranch, FlaskConical, GitPullRequest } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import type { ProbePatchOut } from "@/api/types";
@@ -60,6 +61,17 @@ export default function ProbePlannerPage() {
   const generatePatch = useGeneratePatch();
   const validatePatch = useValidatePatch();
   const applyPatch = useApplyProbePatch();
+  // Issue #259: connects the apply-success dead end to the GitHub publish
+  // workflow (Issue #216). Availability mirrors github.tsx's own gate for
+  // creating a publish job exactly (GithubPage's `connectedConnections`
+  // filter) -- an App that is configured but has zero connected repos is
+  // just as much a dead end as one that isn't configured at all, so both
+  // must fall back to the manual git instructions rather than show a link
+  // that leads nowhere.
+  const { data: githubAppStatus } = useGithubAppStatus();
+  const { data: githubConnections } = useGithubConnections();
+  const githubPublishAvailable = !!githubAppStatus?.configured
+    && (githubConnections ?? []).some(c => c.status === "connected");
   // undefined = no manual selection yet, so a `?plan=` param can still drive it.
   const [userExpandedPlan, setUserExpandedPlan] = useState<number | null | undefined>(undefined);
   const [applyTarget, setApplyTarget] = useState<ProbePatchOut | null>(null);
@@ -368,14 +380,34 @@ export default function ProbePlannerPage() {
                             {patch.apply_status === "applied" && (
                               <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/20 dark:text-emerald-200 space-y-1">
                                 <div className="font-medium">Applied to the repository working tree (no commit created).</div>
-                                <ol className="list-decimal pl-4 space-y-0.5">
-                                  <li>Review the patched files and run tests.</li>
-                                  <li>Commit the changes in the repository.</li>
-                                  <li>
-                                    Create a new snapshot and rebuild analysis from the{" "}
-                                    <Link to="/repository" className="underline">Repository Refresh Hub</Link>.
-                                  </li>
-                                </ol>
+                                {/* Issue #259: when the GitHub publish workflow is actually
+                                    usable, forward to it instead of only describing manual git
+                                    steps -- otherwise the manual instructions remain the
+                                    fallback branch, unchanged. */}
+                                {githubPublishAvailable ? (
+                                  <div className="space-y-1" data-testid="patch-publish-next-action">
+                                    <p>
+                                      The GitHub publish workflow can commit this validated patch, push it
+                                      to a new branch, and open a Pull Request for review.
+                                    </p>
+                                    <Link
+                                      to={`/github?patch=${patch.id}`}
+                                      className="inline-flex items-center gap-1 font-medium underline"
+                                      data-testid="patch-publish-link"
+                                    >
+                                      <GitPullRequest className="h-3 w-3" /> Create Publish Job
+                                    </Link>
+                                  </div>
+                                ) : (
+                                  <ol className="list-decimal pl-4 space-y-0.5" data-testid="patch-manual-git-instructions">
+                                    <li>Review the patched files and run tests.</li>
+                                    <li>Commit the changes in the repository.</li>
+                                    <li>
+                                      Create a new snapshot and rebuild analysis from the{" "}
+                                      <Link to="/repository" className="underline">Repository Refresh Hub</Link>.
+                                    </li>
+                                  </ol>
+                                )}
                               </div>
                             )}
                             <PatchRecovery patch={patch} currentHead={repoStatus?.current_head ?? null} />

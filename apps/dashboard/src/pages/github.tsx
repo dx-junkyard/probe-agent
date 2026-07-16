@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import {
   useGithubAppStatus, useGithubConnections, useCreateGithubConnection,
   useVerifyGithubConnection, useSyncGithubConnection, useDeleteGithubConnection,
@@ -68,7 +69,15 @@ function isPatchValidationGreen(patch: ProbePatchOut): boolean {
 }
 
 export default function GithubPage() {
-  const [tab, setTab] = useState("connections");
+  const [searchParams] = useSearchParams();
+  // Issue #259: forward link from the Probe Planner apply-success next-action
+  // (`/github?patch=<id>`) -- land directly on the Publish Jobs tab so the
+  // preselected patch (validated in PublishJobsPanel below) is visible
+  // without an extra click, following the same cross-page context-passing
+  // precedent as `?plan=` / `?capability=` elsewhere.
+  const patchIdParam = searchParams.get("patch");
+  const patchIdFromUrl = patchIdParam && Number.isInteger(Number(patchIdParam)) ? Number(patchIdParam) : null;
+  const [tab, setTab] = useState(() => (patchIdFromUrl !== null ? "publish-jobs" : "connections"));
   const { data: appStatus, isLoading: appStatusLoading } = useGithubAppStatus();
   const { isAdmin, systemId } = useAuth();
 
@@ -92,7 +101,7 @@ export default function GithubPage() {
         </TabsContent>
 
         <TabsContent value="publish-jobs">
-          <PublishJobsPanel />
+          <PublishJobsPanel prefillPatchId={patchIdFromUrl} />
         </TabsContent>
 
         {isAdmin && <TabsContent value="installations">
@@ -416,11 +425,21 @@ function CreateConnectionDialog({ open, onOpenChange }: { open: boolean; onOpenC
 
 // ── Publish jobs ─────────────────────────────────────────────────────
 
-function PublishJobsPanel() {
+function PublishJobsPanel({ prefillPatchId }: { prefillPatchId: number | null }) {
   const { data: connections } = useGithubConnections();
+  const { data: patches } = useProbePatches();
   const [connectionFilter, setConnectionFilter] = useState<number | null>(null);
   const { data: jobs, isLoading } = usePublishJobs(connectionFilter);
+  // Issue #259: only preselect the patch carried in `?patch=` (and only
+  // auto-open the create dialog for it) when it still exists and still
+  // passes the same green-validation gate the manual patch picker enforces
+  // below -- a stale or invalid id must fall back to the ordinary empty
+  // create flow, not a broken preselection.
+  const prefillPatch = prefillPatchId !== null
+    ? (patches ?? []).find(p => p.id === prefillPatchId && isPatchValidationGreen(p)) ?? null
+    : null;
   const [showCreate, setShowCreate] = useState(false);
+  const [prefillDismissed, setPrefillDismissed] = useState(false);
   const [selectedJobId, setSelectedJobId] = useState<number | null>(null);
 
   const connectionById = useMemo(() => {
@@ -431,6 +450,7 @@ function PublishJobsPanel() {
 
   const selectedJob = jobs?.find(j => j.id === selectedJobId) ?? null;
   const connectedConnections = (connections ?? []).filter(c => c.status === "connected");
+  const prefillOpen = prefillPatch !== null && !prefillDismissed;
 
   return (
     <div className="space-y-4">
@@ -520,10 +540,14 @@ function PublishJobsPanel() {
       </Card>
 
       <CreatePublishJobDialog
-        open={showCreate}
-        onOpenChange={setShowCreate}
+        open={showCreate || prefillOpen}
+        onOpenChange={(open) => {
+          setShowCreate(open);
+          if (!open) setPrefillDismissed(true);
+        }}
         connections={connectedConnections}
         defaultConnectionId={connectionFilter}
+        prefillPatchId={prefillPatch?.id ?? null}
       />
 
       <PublishJobDetailDialog
@@ -535,16 +559,23 @@ function PublishJobsPanel() {
   );
 }
 
-function CreatePublishJobDialog({ open, onOpenChange, connections, defaultConnectionId }: {
+function CreatePublishJobDialog({ open, onOpenChange, connections, defaultConnectionId, prefillPatchId }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   connections: GithubConnectionOut[];
   defaultConnectionId: number | null;
+  prefillPatchId: number | null;
 }) {
   const { data: patches } = useProbePatches();
   const createJob = useCreatePublishJob();
   const [connectionId, setConnectionId] = useState<number | null>(defaultConnectionId);
-  const [patchId, setPatchId] = useState<number | null>(null);
+  // Issue #259: undefined = no manual selection yet, so `prefillPatchId` (from
+  // `?patch=` in the URL, resolved by the caller) can still drive it -- the
+  // same two-stage override pattern probe-planner.tsx uses for `?plan=`.
+  // Once the developer touches the select (even back to blank), that choice
+  // wins for the rest of this dialog's life.
+  const [patchIdOverride, setPatchIdOverride] = useState<number | null | undefined>(undefined);
+  const patchId = patchIdOverride !== undefined ? patchIdOverride : prefillPatchId;
 
   const readyPatches = (patches ?? []).filter(isPatchValidationGreen);
 
@@ -554,7 +585,7 @@ function CreatePublishJobDialog({ open, onOpenChange, connections, defaultConnec
       await createJob.mutateAsync({ connectionId, patchId });
       toast.success("Publish job created — it will pause for approval once prepared");
       onOpenChange(false);
-      setPatchId(null);
+      setPatchIdOverride(null);
     } catch (e) { toast.error(String(e)); }
   };
 
@@ -586,7 +617,7 @@ function CreatePublishJobDialog({ open, onOpenChange, connections, defaultConnec
           ) : (
             <Select
               value={patchId?.toString() ?? ""}
-              onChange={e => setPatchId(e.target.value ? Number(e.target.value) : null)}
+              onChange={e => setPatchIdOverride(e.target.value ? Number(e.target.value) : null)}
               data-testid="publish-job-patch-select"
             >
               <option value="">Select patch...</option>
