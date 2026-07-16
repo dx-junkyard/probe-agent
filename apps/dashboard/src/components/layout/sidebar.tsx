@@ -7,15 +7,34 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/api/auth";
+import { useSystemState } from "@/api/hooks";
+import type { UserPhase } from "@/api/types";
 import { useState } from "react";
 
-type NavItem = { to: string; icon: typeof LayoutDashboard; label: string };
+// Issue #179 introduced fixed, explicit headings (Hub / Detail views /
+// Other). Issue #257 re-groups the same routes along the phase axis instead:
+// each group below (other than Overview/Other) lines up with one or more of
+// the server-derived `user_phase` values (Issue #256's 6-phase
+// setup -> preparation -> instrumentation -> observation -> evaluation ->
+// publish flow) and reuses #173's stage terms (Understand / Instrument /
+// Evaluate). No route or URL changes -- only how the existing list is
+// grouped, ordered, and (via `phases` + `phaseGroupState` below) visually
+// emphasized or dimmed for the developer's current phase.
+type NavItem = {
+  to: string;
+  icon: typeof LayoutDashboard;
+  label: string;
+  // Issue #257 (Generate, decision b): a deprecated-but-kept page gets a
+  // small "Legacy" badge plus an explanatory tooltip pointing at its
+  // replacement, instead of being removed or given a new landing page.
+  legacy?: boolean;
+  title?: string;
+};
 
-// Issue #179: routes are grouped under fixed, explicit headings — no route or
-// URL changes, just how the existing list is presented. "Hub" is the System
-// Understanding work hub; "Detail views" are the specialist pages it links
-// out to; everything else stays under "Other".
-type NavGroup = { heading: string | null; items: NavItem[] };
+// Issue #257: a group carries `phases` only when it has phase meaning.
+// Overview and Other opt out entirely (no `phases` field) since neither
+// belongs to a single step of the improvement flow.
+type NavGroup = { heading: string | null; items: NavItem[]; phases?: UserPhase[] };
 
 const NAV_GROUPS: NavGroup[] = [
   {
@@ -23,44 +42,121 @@ const NAV_GROUPS: NavGroup[] = [
     items: [{ to: "/", icon: LayoutDashboard, label: "Overview" }],
   },
   {
-    heading: "Hub",
-    items: [{ to: "/system-understanding", icon: Brain, label: "System Understanding" }],
+    heading: "Setup",
+    phases: ["setup"],
+    items: [
+      { to: "/setup-guide", icon: LifeBuoy, label: "Setup Guide" },
+      { to: "/repository", icon: GitBranch, label: "Repository" },
+      { to: "/settings", icon: Settings, label: "Settings" },
+    ],
   },
   {
-    heading: "Detail views",
+    heading: "Understand",
+    phases: ["preparation"],
     items: [
-      { to: "/repository", icon: GitBranch, label: "Repository" },
+      { to: "/system-understanding", icon: Brain, label: "System Understanding" },
       { to: "/capability-map", icon: Network, label: "Capability Map" },
-      { to: "/interview", icon: MessageSquareText, label: "Interview" },
       { to: "/feature-map", icon: Map, label: "Feature Map" },
       { to: "/flow-explorer", icon: Workflow, label: "Flow Explorer" },
+      { to: "/interview", icon: MessageSquareText, label: "Interview" },
+    ],
+  },
+  {
+    heading: "Instrument",
+    phases: ["instrumentation"],
+    items: [
+      { to: "/probe-planner", icon: Crosshair, label: "Probe Planner" },
+      // Issue #257 AC ("Probe Patterns にサイドバー以外の到達経路がある、
+      // または適切なフェーズグループに属する"): membership in this phase
+      // group is the chosen resolution -- probe-planner.tsx itself is not
+      // touched here (owned by other in-flight sub-issues).
+      { to: "/probe-patterns", icon: BookMarked, label: "Probe Patterns" },
+      { to: "/connect-sdk", icon: Plug, label: "Connect SDK" },
+    ],
+  },
+  {
+    heading: "Observe & Evaluate",
+    // Two server phases share one group: observation (trace/shadow
+    // watching) and evaluation (candidate judging) both live on these same
+    // pages, so splitting them into two nav groups would not match the UI.
+    phases: ["observation", "evaluation"],
+    items: [
+      // Issue #257 label improvement: "Components" alone didn't say this is
+      // also the trace/observation view.
+      { to: "/components", icon: Boxes, label: "Components / Traces" },
       { to: "/trace-lineage", icon: GitFork, label: "Trace Lineage" },
       { to: "/trace-analyzers", icon: Filter, label: "Trace Analyzers" },
-      { to: "/probe-planner", icon: Crosshair, label: "Probe Planner" },
-      { to: "/probe-patterns", icon: BookMarked, label: "Probe Patterns" },
       { to: "/experiments", icon: FlaskConical, label: "Experiments" },
       { to: "/simulation-workbench", icon: Beaker, label: "Simulation Workbench" },
       { to: "/candidate-studio", icon: Bot, label: "AI Candidate Studio" },
+      { to: "/workspaces", icon: MessageSquare, label: "Decision Workspace" },
     ],
+  },
+  {
+    heading: "Publish",
+    phases: ["publish"],
+    items: [{ to: "/github", icon: GitMerge, label: "GitHub" }],
   },
   {
     heading: "Other",
     items: [
-      { to: "/connect-sdk", icon: Plug, label: "Connect SDK" },
-      { to: "/setup-guide", icon: LifeBuoy, label: "Setup Guide" },
-      { to: "/generation", icon: Sparkles, label: "Generate" },
-      { to: "/components", icon: Boxes, label: "Components" },
-      { to: "/workspaces", icon: MessageSquare, label: "Decision Workspace" },
-      { to: "/github", icon: GitMerge, label: "GitHub" },
-      { to: "/settings", icon: Settings, label: "Settings" },
+      // Issue #257 (Generate, decision b): option (a) removal is out of
+      // scope ("ページの機能変更・削除は含まない") and option (c) would add
+      // a lane to a superseded flow that duplicates AI Candidate Studio /
+      // Simulation Workbench, so the page is kept but demoted: bottom of
+      // Other, a visible "Legacy" badge, and a tooltip pointing at its
+      // replacement. No functional change to the page itself.
+      {
+        to: "/generation", icon: Sparkles, label: "Generate", legacy: true,
+        title: "旧世代の候補生成。AI Candidate Studio を推奨",
+      },
     ],
   },
 ];
+
+// Issue #257: mirrors the server's fixed PHASE_ORDER (also duplicated
+// client-side in components/system-state.tsx) -- a finite enum ordering,
+// never client-side state derivation (Principle 6). Only the *mapping* from
+// nav group to phase(s) is a new client-side constant; the phase values and
+// their order still come from the server contract.
+const PHASE_ORDER: UserPhase[] = [
+  "setup", "preparation", "instrumentation", "observation", "evaluation", "publish",
+];
+
+type PhaseGroupState = "current" | "reached" | "future" | "none";
+
+/**
+ * Deterministic comparison of a group's phase(s) against the current
+ * `user_phase`: "current" when `user_phase` falls within the group's phase
+ * range, "reached" when the whole range is before it (already passed),
+ * "future" when the whole range is after it (not yet reached), and "none"
+ * when the group has no phase mapping or the server hasn't provided
+ * `user_phase` (older Control Server, loading, or error) -- graceful
+ * degradation, never a guessed phase.
+ */
+function phaseGroupState(
+  groupPhases: UserPhase[] | undefined,
+  userPhase: UserPhase | undefined,
+): PhaseGroupState {
+  if (!groupPhases || groupPhases.length === 0 || !userPhase) return "none";
+  const currentRank = PHASE_ORDER.indexOf(userPhase);
+  const ranks = groupPhases.map((p) => PHASE_ORDER.indexOf(p));
+  if (currentRank === -1 || ranks.some((r) => r === -1)) return "none";
+  const minRank = Math.min(...ranks);
+  const maxRank = Math.max(...ranks);
+  if (currentRank >= minRank && currentRank <= maxRank) return "current";
+  return currentRank > maxRank ? "reached" : "future";
+}
 
 export function Sidebar() {
   const { isAdmin } = useAuth();
   const location = useLocation();
   const [collapsed, setCollapsed] = useState(false);
+  // Issue #257: drives phase-linked emphasis/dimming below. Missing data
+  // (older server, loading, error) falls through to `phaseGroupState`'s
+  // "none" branch, which renders every group normally.
+  const { data: systemState } = useSystemState();
+  const userPhase = systemState?.user_phase;
 
   const groups: NavGroup[] = isAdmin
     ? NAV_GROUPS.map((g, i) =>
@@ -85,37 +181,71 @@ export function Sidebar() {
       </div>
 
       <nav className="flex-1 overflow-y-auto py-2 px-2 space-y-3" data-testid="sidebar-nav">
-        {groups.map((group, gi) => (
-          <div key={group.heading ?? `group-${gi}`} className="space-y-0.5" data-testid={group.heading ? `sidebar-group-${group.heading.toLowerCase().replace(/\s+/g, "-")}` : undefined}>
-            {group.heading && !collapsed && (
-              <p className="px-3 pb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground/70">
-                {group.heading}
-              </p>
-            )}
-            {group.items.map((item) => {
-              const isActive = item.to === "/"
-                ? location.pathname === "/"
-                : location.pathname.startsWith(item.to);
-              return (
-                <NavLink
-                  key={item.to}
-                  to={item.to}
+        {groups.map((group, gi) => {
+          const slug = group.heading ? group.heading.toLowerCase().replace(/\s+/g, "-") : undefined;
+          const phaseState = phaseGroupState(group.phases, userPhase);
+          return (
+            <div
+              key={group.heading ?? `group-${gi}`}
+              className={cn("space-y-0.5", phaseState === "future" && "opacity-50")}
+              data-testid={slug ? `sidebar-group-${slug}` : undefined}
+              // Issue #257: only phase-linked groups (Setup/Understand/
+              // Instrument/Observe & Evaluate/Publish) carry this attribute;
+              // Overview and Other have no phase and stay undefined.
+              data-phase-state={group.phases ? phaseState : undefined}
+            >
+              {group.heading && !collapsed && (
+                <p
                   className={cn(
-                    "flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors",
-                    isActive
-                      ? "bg-secondary text-foreground"
-                      : "text-muted-foreground hover:bg-secondary/50 hover:text-foreground",
-                    collapsed && "justify-center px-2",
+                    "flex items-center gap-1.5 px-3 pb-1 text-xs font-semibold uppercase tracking-wide",
+                    phaseState === "current" ? "text-primary" : "text-muted-foreground/70",
                   )}
-                  title={collapsed ? item.label : undefined}
                 >
-                  <item.icon className="h-4 w-4 shrink-0" />
-                  {!collapsed && <span>{item.label}</span>}
-                </NavLink>
-              );
-            })}
-          </div>
-        ))}
+                  {group.heading}
+                  {phaseState === "current" && (
+                    <span className="rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium normal-case tracking-normal text-primary">
+                      現在
+                    </span>
+                  )}
+                </p>
+              )}
+              {group.items.map((item) => {
+                const isActive = item.to === "/"
+                  ? location.pathname === "/"
+                  : location.pathname.startsWith(item.to);
+                return (
+                  <NavLink
+                    key={item.to}
+                    to={item.to}
+                    className={cn(
+                      "flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors",
+                      isActive
+                        ? "bg-secondary text-foreground"
+                        : "text-muted-foreground hover:bg-secondary/50 hover:text-foreground",
+                      collapsed && "justify-center px-2",
+                    )}
+                    title={item.title ?? (collapsed ? item.label : undefined)}
+                  >
+                    <item.icon className="h-4 w-4 shrink-0" />
+                    {!collapsed && (
+                      <span className="flex items-center gap-1.5">
+                        <span>{item.label}</span>
+                        {item.legacy && (
+                          <span
+                            className="rounded bg-muted px-1 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground"
+                            data-testid="sidebar-legacy-badge"
+                          >
+                            Legacy
+                          </span>
+                        )}
+                      </span>
+                    )}
+                  </NavLink>
+                );
+              })}
+            </div>
+          );
+        })}
       </nav>
 
       <button

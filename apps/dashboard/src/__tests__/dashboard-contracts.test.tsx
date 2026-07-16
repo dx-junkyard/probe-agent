@@ -2851,43 +2851,171 @@ describe("Flow Explorer auto-select from URL (Issue #62)", () => {
 
 // ── Sidebar navigation ───────────────────────────────────────────────
 
-describe("Sidebar navigation grouping (Issue #179)", () => {
+describe("Sidebar phase-linked navigation (Issue #257)", () => {
   beforeEach(() => {
+    vi.clearAllMocks();
     mockSystemId = 1;
   });
 
-  test("renders Hub / Detail views / Other headings and every existing route", async () => {
-    const { Sidebar } = await import("@/components/layout/sidebar");
-    render(
-      <MemoryRouter initialEntries={["/"]}>
-        <Sidebar />
-      </MemoryRouter>,
-    );
+  function stateWithPhase(userPhase: string) {
+    return {
+      system_id: 1, generated_at: 1, overall_severity: "ok",
+      severity_counts: {}, items: [], primary_item: null,
+      notification_items: [], page_items: {},
+      user_phase: userPhase,
+      phases: [
+        { phase: "setup", complete: true },
+        { phase: "preparation", complete: true },
+        { phase: "instrumentation", complete: true },
+        { phase: "observation", complete: true },
+        { phase: "evaluation", complete: true },
+        { phase: "publish", complete: true },
+      ],
+    };
+  }
 
-    expect(screen.getByTestId("sidebar-group-hub")).toBeTruthy();
-    expect(screen.getByTestId("sidebar-group-detail-views")).toBeTruthy();
+  // Renders the Sidebar with /system-state resolving to `stateResponse`
+  // (or null, simulating an older server / not-yet-loaded / errored state).
+  async function renderSidebar(stateResponse: unknown | null) {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-state" ? Promise.resolve(stateResponse) : Promise.resolve(null),
+    );
+    const { Sidebar } = await import("@/components/layout/sidebar");
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const result = render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/"]}>
+          <Sidebar />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    // Let the /system-state query settle before assertions.
+    await waitFor(() => expect(mockApi.get).toHaveBeenCalledWith("/system-state"));
+    return result;
+  }
+
+  test("renders the new Setup/Understand/Instrument/Observe & Evaluate/Publish/Other groups with every existing route", async () => {
+    await renderSidebar(null);
+
+    expect(screen.getByTestId("sidebar-group-setup")).toBeTruthy();
+    expect(screen.getByTestId("sidebar-group-understand")).toBeTruthy();
+    expect(screen.getByTestId("sidebar-group-instrument")).toBeTruthy();
+    // "Observe & Evaluate" slugifies (lowercase, whitespace runs -> "-") to
+    // exactly this — the ampersand itself is not stripped by the existing
+    // slug logic in sidebar.tsx.
+    expect(screen.getByTestId("sidebar-group-observe-&-evaluate")).toBeTruthy();
+    expect(screen.getByTestId("sidebar-group-publish")).toBeTruthy();
     expect(screen.getByTestId("sidebar-group-other")).toBeTruthy();
 
     const nav = screen.getByTestId("sidebar-nav");
-    // Existing routes/URLs are unchanged — every prior nav item is still present.
     for (const label of [
-      "Overview", "System Understanding", "Repository", "Capability Map", "Feature Map",
-      "Flow Explorer", "Trace Lineage", "Trace Analyzers", "Probe Planner", "Interview",
-      "Experiments", "Connect SDK", "Generate", "Components", "Decision Workspace", "Settings",
+      "Overview", "Setup Guide", "Repository", "Settings",
+      "System Understanding", "Capability Map", "Feature Map", "Flow Explorer", "Interview",
+      "Probe Planner", "Probe Patterns", "Connect SDK",
+      "Components / Traces", "Trace Lineage", "Trace Analyzers", "Experiments",
+      "Simulation Workbench", "AI Candidate Studio", "Decision Workspace",
+      "GitHub", "Generate",
     ]) {
       expect(within(nav).getByText(label)).toBeTruthy();
     }
+    // Old label is gone, replaced by "Components / Traces".
+    expect(within(nav).queryByText("Components")).toBeNull();
 
-    // System Understanding is grouped under Hub, not Detail views.
-    expect(within(screen.getByTestId("sidebar-group-hub")).getByText("System Understanding")).toBeTruthy();
-    expect(within(screen.getByTestId("sidebar-group-detail-views")).getByText("Flow Explorer")).toBeTruthy();
+    // Group membership per the #257 design mapping.
+    expect(within(screen.getByTestId("sidebar-group-instrument")).getByText("Probe Patterns")).toBeTruthy();
+    expect(within(screen.getByTestId("sidebar-group-publish")).getByText("GitHub")).toBeTruthy();
+    expect(within(screen.getByTestId("sidebar-group-other")).getByText("Generate")).toBeTruthy();
+  });
 
-    // Issue #199: Interview sits directly after Capability Map in Detail views.
-    const detailLabels = within(screen.getByTestId("sidebar-group-detail-views"))
-      .getAllByRole("link")
-      .map((el) => el.textContent);
-    const capIdx = detailLabels.indexOf("Capability Map");
-    expect(detailLabels[capIdx + 1]).toBe("Interview");
+  test("preparation phase: Understand is current, Setup is reached, later groups are future and dimmed", async () => {
+    await renderSidebar(stateWithPhase("preparation"));
+
+    const setup = screen.getByTestId("sidebar-group-setup");
+    const understand = screen.getByTestId("sidebar-group-understand");
+    const instrument = screen.getByTestId("sidebar-group-instrument");
+    const observeEvaluate = screen.getByTestId("sidebar-group-observe-&-evaluate");
+    const publish = screen.getByTestId("sidebar-group-publish");
+
+    // /system-state resolves asynchronously; wait for the re-render it
+    // triggers (these DOM nodes are stable across the update, so the same
+    // references keep working once settled).
+    await waitFor(() => expect(understand.getAttribute("data-phase-state")).toBe("current"));
+
+    expect(setup.getAttribute("data-phase-state")).toBe("reached");
+    expect(instrument.getAttribute("data-phase-state")).toBe("future");
+    expect(observeEvaluate.getAttribute("data-phase-state")).toBe("future");
+    expect(publish.getAttribute("data-phase-state")).toBe("future");
+
+    // Dimmed (future) groups carry a reduced-opacity class; reached/current do not.
+    expect(instrument.className).toMatch(/opacity-50/);
+    expect(observeEvaluate.className).toMatch(/opacity-50/);
+    expect(publish.className).toMatch(/opacity-50/);
+    expect(setup.className).not.toMatch(/opacity-50/);
+    expect(understand.className).not.toMatch(/opacity-50/);
+
+    // The current group's heading shows the sidebar's own 現在地表示 marker.
+    expect(within(understand).getByText("現在")).toBeTruthy();
+    expect(within(setup).queryByText("現在")).toBeNull();
+
+    // Never hidden: every item in a dimmed, not-yet-reached group is still a
+    // clickable link with its real href.
+    const probePlannerLink = within(instrument).getByText("Probe Planner").closest("a");
+    expect(probePlannerLink).toBeTruthy();
+    expect(probePlannerLink?.getAttribute("href")).toBe("/probe-planner");
+  });
+
+  test("publish phase: nothing is dimmed (Publish is current, everything else already reached)", async () => {
+    await renderSidebar(stateWithPhase("publish"));
+
+    const publish = screen.getByTestId("sidebar-group-publish");
+    // /system-state resolves asynchronously; wait for the re-render it triggers.
+    await waitFor(() => expect(publish.getAttribute("data-phase-state")).toBe("current"));
+
+    for (const testId of [
+      "sidebar-group-setup", "sidebar-group-understand", "sidebar-group-instrument",
+      "sidebar-group-observe-&-evaluate",
+    ]) {
+      const group = screen.getByTestId(testId);
+      expect(group.getAttribute("data-phase-state")).toBe("reached");
+      expect(group.className).not.toMatch(/opacity-50/);
+    }
+    expect(publish.getAttribute("data-phase-state")).toBe("current");
+    expect(publish.className).not.toMatch(/opacity-50/);
+    expect(within(publish).getByText("現在")).toBeTruthy();
+  });
+
+  test("no system-state data: every group's data-phase-state is absent or none, and nothing is dimmed", async () => {
+    await renderSidebar(null);
+
+    for (const testId of [
+      "sidebar-group-setup", "sidebar-group-understand", "sidebar-group-instrument",
+      "sidebar-group-observe-&-evaluate", "sidebar-group-publish",
+    ]) {
+      const group = screen.getByTestId(testId);
+      const state = group.getAttribute("data-phase-state");
+      expect(state === null || state === "none").toBe(true);
+      expect(group.className).not.toMatch(/opacity-50/);
+    }
+    expect(screen.queryByText("現在")).toBeNull();
+
+    // Every route is still rendered as a real, clickable link.
+    const nav = screen.getByTestId("sidebar-nav");
+    expect(within(nav).getAllByRole("link").length).toBeGreaterThan(15);
+  });
+
+  test("Generate carries a Legacy badge, a pointer to AI Candidate Studio, and lives in Other", async () => {
+    await renderSidebar(null);
+
+    const other = screen.getByTestId("sidebar-group-other");
+    expect(within(other).getByText("Generate")).toBeTruthy();
+    const badge = within(other).getByTestId("sidebar-legacy-badge");
+    expect(badge.textContent).toBe("Legacy");
+
+    const generateLink = within(other).getByText("Generate").closest("a");
+    expect(generateLink?.getAttribute("href")).toBe("/generation");
+    expect(generateLink?.getAttribute("title")).toBe("旧世代の候補生成。AI Candidate Studio を推奨");
   });
 });
 
