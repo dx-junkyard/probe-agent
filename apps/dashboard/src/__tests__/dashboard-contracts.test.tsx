@@ -6932,6 +6932,29 @@ describe("GitHub page", () => {
     expect(screen.getByTestId("publish-job-confirm-approve-button")).toBeInTheDocument();
   });
 
+  test("approval confirmation dialog shows the patch diff alongside the approve action (Issue #264)", async () => {
+    mockGithubData({
+      connections: [connectionFixture],
+      jobs: [jobFixture({ id: 3, status: "awaiting_approval" })],
+      patches: [patchFixture],
+    });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-3")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("publish-job-3"));
+    fireEvent.click(await screen.findByTestId("publish-job-approve-button"));
+
+    // The confirmation dialog is on screen at the same time as the diff and
+    // the approve action -- the diff must not only exist in the parent
+    // dialog, which is covered by the confirmation overlay.
+    expect(await screen.findByText("Approve publish")).toBeInTheDocument();
+    const confirmDiff = await screen.findByTestId("publish-job-confirm-diff");
+    expect(confirmDiff).toHaveTextContent(patchFixture.diff);
+    expect(screen.getByTestId("publish-job-confirm-approve-button")).toBeInTheDocument();
+  });
+
   test("approve button is hidden for a completed job", async () => {
     mockGithubData({
       connections: [connectionFixture],

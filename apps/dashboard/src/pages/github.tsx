@@ -800,6 +800,16 @@ function PublishJobDetailDialog({ job, connection, onClose }: {
             <div>Base branch: <code className="font-mono">{job.base_branch}</code> at <code className="font-mono">{shortSha(job.base_commit_sha)}</code></div>
             <div>New branch: <code className="font-mono">{job.branch_name ?? "(generated on approval)"}</code></div>
           </div>
+
+          {patch?.diff && (
+            <details className="text-xs" open data-testid="publish-job-confirm-diff">
+              <summary className="cursor-pointer text-muted-foreground">Patch diff to be published</summary>
+              <pre className="mt-2 overflow-x-auto rounded-md bg-muted p-3 text-xs font-mono max-h-64 overflow-y-auto">
+                {patch.diff}
+              </pre>
+            </details>
+          )}
+
           <Button
             className="w-full"
             onClick={() => approve.mutateAsync(job.id).then(() => {
