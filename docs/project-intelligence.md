@@ -899,6 +899,42 @@ dedupe)、`open_questions` JSON のエントリに `qa_id` を付与する。ま
 共有スキーマ: `InterviewQA` / `InterviewQaEvidenceRef` / `InterviewQaAnswerOut`
 （[shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json)）。
 
+## Q&A パネル回答の理解レビューへの還流とゲート拡張(Issue #263)
+
+#129 の Q&A パネル(`interview_qa`)経由の回答は、対話ターン
+(`generate_interview_turn`)のプロンプトには `answered_qa` / `unconfirmed_qa`
+として注入されていたが、`update-understanding` が呼ぶ理解レビュー
+(`generate_understanding_review`)には一切渡っていなかった。パネルでのみ
+回答された質問は `interview_message` に書かれないため、対話ターンを経由
+しない限り理解に反映されない欠落があった。
+
+- **共有ヘルパー**: `routes/interview.py::_load_qa_pairs(conn, session_id,
+  system_id)` が、対話ターンにインライン実装されていた `answered_qa` /
+  `unconfirmed_qa` の取得・整形(#129/#142 と同じ SQL・同じ shape)を1箇所に
+  切り出し、対話ターンと `update-understanding` の両方が同じ関数を呼ぶ。
+  整形ルール自体は変更しない。
+- **理解レビューへの注入**: `generate_understanding_review` が
+  `answered_qa` / `unconfirmed_qa` を任意引数として受け取り、
+  `interview_agent._trim_json` と同じ JSON-trim 方式(新設の
+  `system_understanding_reviewer._trim_json` /
+  `QA_PROMPT_MAX_CHARS = 4_000`、`interview_agent.GAP_AND_QUESTION_MAX_CHARS`
+  と同じ予算)でプロンプトに追加する。プロンプトが変わるため
+  `PROMPT_VERSION` を `understanding-review-v3` から `understanding-review-v4`
+  に上げる(Principle 7 の監査可能性)。
+- **確定後ゲートの拡張**: `update-understanding` の 409 ゲートは、これまで
+  `answers_revised_at`(訂正パスでのみセット)だけを見ていたため、確定後の
+  **初回**回答や、確定後に新規発行された Runtime Reality Check 質問への回答は
+  ゲートを開かなかった。決定的な構造チェック(Principle 6、日時/行存在の
+  比較のみ)として、そのセッションの `interview_qa` に
+  `created_at > understanding_confirmed_at` または
+  `answered_at > understanding_confirmed_at` の行が1件でもあれば
+  `answers_revised_at` と同様に再構築を許可する。該当行が無ければ
+  従来どおり 409 のまま(ヒューリスティックや自由文解釈は行わない)。
+
+**含まない:** 409 のレスポンス形状変更、無効化ボタンなどの UI 変更、ターン
+ごとの `current_understanding` 差分更新、`understanding_graph._is_similar_name`
+の変更(いずれも Issue #229 のスコープ)。
+
 ## サーバー生成固定文言の INTERVIEW_LANGUAGE 対応(Issue #138)
 
 #127 は LLM 生成テキストの出力言語を `INTERVIEW_LANGUAGE`(既定 `ja`)に従わせたが、

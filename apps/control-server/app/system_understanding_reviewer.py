@@ -37,12 +37,16 @@ from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient, is_reasoning_mod
 from .understanding_graph import UnderstandingGraph, GraphNode, EvidenceRef
 
 # v2: configurable output language for questions/summaries (Issue #127).
-PROMPT_VERSION = "understanding-review-v3"
+# v4: injects answered_qa / unconfirmed_qa from the Q&A panel, same as the
+# interview-turn prompt (Issue #263).
+PROMPT_VERSION = "understanding-review-v4"
 SCHEMA_VERSION = "understanding-review-v1"
 DEFAULT_REVIEW_MAX_OUTPUT_TOKENS = 32_768
 DEFAULT_REVIEW_MAX_NODES_PER_TYPE = 5
 DEFAULT_REVIEW_MAX_PROMPT_CHARS = 30_000
 DEFAULT_REVIEW_MAX_EVIDENCE_PER_NODE = 2
+# Same budget interview_agent.py uses for Q&A JSON-trim (GAP_AND_QUESTION_MAX_CHARS).
+QA_PROMPT_MAX_CHARS = 4_000
 
 
 CONFIDENCE_LEVELS = {"confirmed", "likely", "uncertain", "conflicting"}
@@ -230,6 +234,14 @@ def _trim(text: str, max_chars: int) -> str:
     return text[: max(0, max_chars - 3)].rstrip() + "..."
 
 
+def _trim_json(value: Any, max_chars: int) -> str:
+    """Same JSON-trim style as interview_agent._trim_json (Issue #263)."""
+    text = json.dumps(value, ensure_ascii=False)
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 30)] + "…[truncated to budget]"
+
+
 def _review_node_score(node: GraphNode) -> tuple:
     return (
         1 if not node.is_weak else 0,
@@ -275,6 +287,8 @@ def _build_review_prompt(
     graph: UnderstandingGraph,
     reconciliation: ReconciliationResult,
     history: Optional[List[Dict[str, str]]] = None,
+    answered_qa: Optional[List[Dict[str, Any]]] = None,
+    unconfirmed_qa: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Build the review prompt from graph + code facts."""
     parts: List[str] = []
@@ -325,6 +339,23 @@ def _build_review_prompt(
             parts.append(
                 f"- [{gap.gap_type}] {_trim(gap.node_name, 140)}: {_trim(gap.notes, 180)}"
             )
+
+    if answered_qa:
+        parts.append(
+            "\n## Confirmed Q&A (latest revisions of already-answered interview "
+            "questions, including answers given only through the Q&A panel; "
+            "treat the answers as established facts)"
+        )
+        parts.append(_trim_json(answered_qa, QA_PROMPT_MAX_CHARS))
+
+    if unconfirmed_qa:
+        parts.append(
+            "\n## Unconfirmed Q&A (the developer explicitly could NOT confirm "
+            "these topics — 「わかりません」/不明. Treat each as an OPEN "
+            "hypothesis, never as an established fact, and keep it as an open "
+            "question or gap rather than treating it as resolved.)"
+        )
+        parts.append(_trim_json(unconfirmed_qa, QA_PROMPT_MAX_CHARS))
 
     if history:
         parts.append("\n## Interview History\n")
@@ -380,8 +411,16 @@ def generate_understanding_review(
     graph: UnderstandingGraph,
     reconciliation: ReconciliationResult,
     history: Optional[List[Dict[str, str]]] = None,
+    answered_qa: Optional[List[Dict[str, Any]]] = None,
+    unconfirmed_qa: Optional[List[Dict[str, Any]]] = None,
 ) -> ReviewResult:
     """Generate a system understanding review from graph + code facts.
+
+    ``answered_qa`` / ``unconfirmed_qa`` (Issue #263) carry the session's
+    Q&A-panel answers into the review the same way they are already fed into
+    the conversational interview turn, so an answer given only via the Q&A
+    panel (never posted as an ``interview_message``) still reaches
+    ``current_understanding`` regeneration.
 
     Fail-closed: mock clients and non-reasoning models return an error.
     No proposals are generated.
@@ -395,7 +434,10 @@ def generate_understanding_review(
             error="Understanding review requires a configured reasoning model",
         )
 
-    prompt = _build_review_prompt(graph, reconciliation, history)
+    prompt = _build_review_prompt(
+        graph, reconciliation, history,
+        answered_qa=answered_qa, unconfirmed_qa=unconfirmed_qa,
+    )
     try:
         max_output_tokens = _review_max_output_tokens()
         language = get_interview_language()

@@ -160,6 +160,47 @@ def _review_history(rows) -> List[dict]:
     ]
 
 
+def _load_qa_pairs(
+    conn, session_id: int, system_id: int
+) -> tuple[Optional[List[dict]], List[dict]]:
+    """Fetch and shape the session's answered/unconfirmed interview_qa rows.
+
+    Single source of the Issue #129/#142 fetch+shaping rule, shared by the
+    conversational interview-turn route and the understanding-review rebuild
+    (Issue #263) so an answer given only through the Q&A panel reaches the
+    review the same way a conversational answer already does. Returns
+    ``(answered_qa_pairs, unconfirmed_qa_pairs)``: ``answered_qa_pairs`` is
+    ``None`` when there are none (matching the existing prompt-injection
+    convention); ``unconfirmed_qa_pairs`` is always a list so callers may
+    merge additional turn-local entries (e.g. the current turn's "I don't
+    know" answer) before use.
+    """
+    answered_qa_rows = conn.execute(
+        """SELECT question_text, answer_text FROM interview_qa
+           WHERE session_id = ? AND system_id = ?
+             AND superseded_by_id IS NULL AND status = 'answered'
+           ORDER BY id""",
+        (session_id, system_id),
+    ).fetchall()
+    answered_qa_pairs = [
+        {"question": r["question_text"], "answer": r["answer_text"]}
+        for r in answered_qa_rows
+    ] or None
+
+    unconfirmed_qa_rows = conn.execute(
+        """SELECT question_text, answer_text FROM interview_qa
+           WHERE session_id = ? AND system_id = ?
+             AND superseded_by_id IS NULL AND status = 'unconfirmed'
+           ORDER BY id""",
+        (session_id, system_id),
+    ).fetchall()
+    unconfirmed_qa_pairs = [
+        {"question": r["question_text"], "answer": r["answer_text"]}
+        for r in unconfirmed_qa_rows
+    ]
+    return answered_qa_pairs, unconfirmed_qa_pairs
+
+
 def _question_entry(question) -> dict:
     """Normalize a turn question (structured object or legacy string) into
     the open_questions JSON entry shape."""
@@ -992,33 +1033,14 @@ def interview_dialogue_turn(
         # Issue #129: the latest revisions of already-answered Q&A pairs are
         # injected into the prompt with a do-not-re-ask rule, so semantic
         # re-asking is suppressed by the reasoning model (never by fuzzy
-        # text matching — Principle 6).
-        answered_qa_rows = conn.execute(
-            """SELECT question_text, answer_text FROM interview_qa
-               WHERE session_id = ? AND system_id = ?
-                 AND superseded_by_id IS NULL AND status = 'answered'
-               ORDER BY id""",
-            (session_id, system_id),
-        ).fetchall()
-        answered_qa_pairs = [
-            {"question": r["question_text"], "answer": r["answer_text"]}
-            for r in answered_qa_rows
-        ] or None
-
-        # Issue #142: rows the developer explicitly could not confirm ("I
-        # don't know"). They are valid, recorded input — fed back as open
-        # hypotheses the model must re-confirm, never as established facts.
-        unconfirmed_qa_rows = conn.execute(
-            """SELECT question_text, answer_text FROM interview_qa
-               WHERE session_id = ? AND system_id = ?
-                 AND superseded_by_id IS NULL AND status = 'unconfirmed'
-               ORDER BY id""",
-            (session_id, system_id),
-        ).fetchall()
-        unconfirmed_qa_pairs = [
-            {"question": r["question_text"], "answer": r["answer_text"]}
-            for r in unconfirmed_qa_rows
-        ]
+        # text matching — Principle 6). Issue #142: rows the developer
+        # explicitly could not confirm ("I don't know") are valid, recorded
+        # input — fed back as open hypotheses the model must re-confirm,
+        # never as established facts. Shared with the update-understanding
+        # review via _load_qa_pairs (Issue #263).
+        answered_qa_pairs, unconfirmed_qa_pairs = _load_qa_pairs(
+            conn, session_id, system_id
+        )
 
         # Issue #142: when THIS turn is an explicit "I don't know" answer, the
         # question being answered is still 'open' (it is only marked
@@ -2449,22 +2471,44 @@ def update_interview_understanding(
         # After manual confirmation, rebuilding is meaningful only when an
         # answer correction is waiting to be reflected. Keep this guard at
         # the API boundary as well as in the Dashboard.
+        #
+        # Issue #263: `answers_revised_at` alone only covers the correction
+        # path (an already-answered question re-answered). It misses a
+        # first-time answer given after confirmation and a newly issued
+        # Runtime Reality Check question answered after confirmation — both
+        # only ever touch `interview_qa`, never `answers_revised_at`. Widen
+        # the gate with a deterministic, structural check (Principle 6): any
+        # interview_qa row for this session created OR answered strictly
+        # after understanding_confirmed_at means there is new developer
+        # input the confirmed understanding has not seen yet.
+        confirmed_at = session["understanding_confirmed_at"]
         if (
             (session["stage"] or "understanding_initialized") == "proposal_generation"
-            and session["understanding_confirmed_at"] is not None
+            and confirmed_at is not None
             and session["answers_revised_at"] is None
         ):
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "understanding_update_not_available",
-                    "message": (
-                        "Understanding is already confirmed. Update it after "
-                        "correcting an interview answer."
-                    ),
-                    "next_action": "generate_or_review_proposals",
-                },
-            )
+            new_qa_since_confirmation = conn.execute(
+                """SELECT 1 FROM interview_qa
+                   WHERE session_id = ? AND system_id = ?
+                     AND (
+                       created_at > ?
+                       OR (answered_at IS NOT NULL AND answered_at > ?)
+                     )
+                   LIMIT 1""",
+                (session_id, system_id, confirmed_at, confirmed_at),
+            ).fetchone()
+            if new_qa_since_confirmation is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "understanding_update_not_available",
+                        "message": (
+                            "Understanding is already confirmed. Update it after "
+                            "correcting an interview answer."
+                        ),
+                        "next_action": "generate_or_review_proposals",
+                    },
+                )
 
         from ..docs_code_reconciler import reconcile
         from ..system_understanding_service import _load_graph_for_snapshot
@@ -2567,11 +2611,20 @@ def update_interview_understanding(
         ).fetchall()
         history = _review_history(history_rows)
 
+        # Issue #263: also feed the Q&A-panel answers into the review, same
+        # as the conversational interview turn already does — an answer
+        # given only via the Q&A panel never becomes an interview_message.
+        answered_qa_pairs, unconfirmed_qa_pairs = _load_qa_pairs(
+            conn, session_id, system_id
+        )
+
         review = generate_understanding_review(
             client, config,
             graph=graph,
             reconciliation=reconciliation,
             history=history or None,
+            answered_qa=answered_qa_pairs,
+            unconfirmed_qa=unconfirmed_qa_pairs or None,
         )
 
         if review.error:
