@@ -1974,6 +1974,10 @@ function interviewSession(overrides: Record<string, unknown> = {}) {
     last_error: null,
     understanding_confirmed_at: 3,
     understanding_confirmed_by: "admin",
+    // Issue #229: mirrors the server's update-understanding gate. Defaults
+    // to blocked, matching this session's default confirmed/no-revision
+    // shape; tests exercising the unblocked path override it explicitly.
+    understanding_update_available: false,
     materialization_diff: null,
     materialization_ref: null,
     materialized_at: null,
@@ -2360,7 +2364,7 @@ describe("Interview page", () => {
 
   test("shows 'your answer correction was reflected' after rebuilding from a revised answer (Issue #136)", async () => {
     mockInterviewApi({
-      session: { answers_revised_at: 123 },
+      session: { answers_revised_at: 123, understanding_update_available: true },
       understandingDiff: {
         session_id: 7,
         system_id: 1,
@@ -2372,7 +2376,11 @@ describe("Interview page", () => {
     });
     mockApi.post.mockImplementation((path: string) => {
       if (path === "/interview/sessions/7/update-understanding") {
-        return Promise.resolve(interviewSession({ answers_revised_at: null, last_error: null }));
+        return Promise.resolve(interviewSession({
+          answers_revised_at: null,
+          last_error: null,
+          understanding_update_available: false,
+        }));
       }
       return Promise.resolve({ id: 1, decision: "approved", decision_method: "manual" });
     });
@@ -2415,10 +2423,39 @@ describe("Interview page", () => {
 
     const refreshButton = await screen.findByRole("button", { name: /理解を更新/ });
     expect(refreshButton).toBeDisabled();
-    expect(refreshButton).toHaveAttribute("title", "回答を修正した場合にのみ、理解を再構築できます");
+    expect(refreshButton).toHaveAttribute(
+      "title", "新しい回答(修正・追加回答)がある場合にのみ、理解を再構築できます",
+    );
     expect(await screen.findByTestId("understanding-refresh-blocked-reason"))
       .toHaveTextContent("次は提案を生成またはレビューしてください");
     expect(screen.getByTestId("next-action")).toHaveTextContent("各提案を承認・編集・却下してください");
+  });
+
+  test("re-enables understanding refresh when the server reports new Q&A activity since confirmation, even without answers_revised_at (Issue #229/#263)", async () => {
+    // The server's understanding_update_available flag (single source of
+    // truth shared with the update-understanding 409 gate) can open from a
+    // first-time Q&A-panel answer or a new Runtime Reality Check answer
+    // given after confirmation -- neither ever sets answers_revised_at. The
+    // Dashboard must trust this server-computed flag rather than
+    // re-deriving availability from answers_revised_at alone.
+    mockInterviewApi({
+      session: { answers_revised_at: null, understanding_update_available: true },
+    });
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const refreshButton = await screen.findByRole("button", { name: /理解を更新/ });
+    expect(refreshButton).not.toBeDisabled();
+    expect(screen.queryByTestId("understanding-refresh-blocked-reason")).not.toBeInTheDocument();
   });
 
   test("shows all evidence read for a turn, even when uncited (Issue #137)", async () => {

@@ -230,6 +230,14 @@ class TestReviewGeneration:
             graph=graph, reconciliation=recon,
         )
         assert result.error is not None
+        # Issue #229: even after the schema-reminder retry also fails, the
+        # session-facing error must stay a catalog message the Dashboard can
+        # show as-is -- never a raw Pydantic ValidationError repr (field
+        # paths, "validation error for...", etc).
+        lowered = result.error.lower()
+        assert "validationerror" not in lowered
+        assert "pydantic" not in lowered
+        assert "field required" not in lowered
 
     def test_llm_error_captured(self):
         graph = _build_graph([_claim()])

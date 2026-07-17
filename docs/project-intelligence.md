@@ -935,6 +935,44 @@ dedupe)、`open_questions` JSON のエントリに `qa_id` を付与する。ま
 ごとの `current_understanding` 差分更新、`understanding_graph._is_similar_name`
 の変更(いずれも Issue #229 のスコープ)。
 
+## 状態に応じた無効操作抑止の完了(Issue #229)
+
+Issue #229 の大半(409 構造化・`confirm-understanding` の role 分離・
+`理解を更新`/`差分を生成`/`実態チェックを実行`/`差分を開く` の disabled+理由
+表示)は commit `35f1bbc`ですでに実装済みだった。#263 が確定後ゲートを
+「`answers_revised_at` のみ」から「確認済み時刻以降に作成/回答された
+`interview_qa` 行の有無」へ拡張した際、Dashboard 側の disabled 条件
+(`answers_revised_at` のみを見るローカル判定)は追随していなかった —
+Q&A パネルのみで初回回答した場合や新規 Runtime Reality Check 質問に回答した
+場合、サーバーは 200 を返すのに UI は無効のまま、というズレが残っていた。
+
+- **単一の判定関数**: `routes/interview.py::_understanding_update_blocked(conn,
+  session, system_id)` が、`update-understanding` の 409 チェックと
+  `InterviewSessionOut.understanding_update_available` の両方から呼ばれる
+  唯一の判定になった(以前は 409 チェック内にインライン実装されていた
+  #263 拡張後の SQL をそのまま関数へ抽出しただけで、判定ルール自体は変更
+  していない)。決定的な stage/timestamp/行存在チェックのみ(Principle 6)。
+- **セッションシリアライザへの反映**: `_session_out` は `conn` を受け取るように
+  なり(全 14 箇所の呼び出しを更新)、`understanding_update_available: bool`
+  を返す。これにより Dashboard は 409 になるかどうかをローカルで再計算せず、
+  サーバーが計算した同じ値を読むだけになる。
+- **Dashboard**: `pages/interview.tsx` の `canRefreshUnderstanding` は
+  `session.understanding_update_available` を直接使う(以前の
+  `answers_revised_at` のみのローカル判定を置き換え)。理由文言・title は
+  「新しい回答(修正・追加回答)がある場合にのみ、理解を再構築できます」に
+  更新し、修正だけでなく初回回答/Reality Check 回答でも開くことを示す。
+- **エラー表面化(項目C)**: `generate_understanding_review` はスキーマ検証
+  失敗時、リトライ後も失敗した場合は catalog メッセージ
+  (`invalid_review_response`)を返す実装がすでに存在し、生の Pydantic
+  `ValidationError` 文字列が session の `last_error` に漏れることはない
+  (回帰テストを追加して固定)。409 応答はすでに構造化されている
+  (`code` / `message` / `next_action`)。
+
+**含まない:** `understanding_update_not_available` 応答へ新しいフィールドを
+追加すること、`ApiError.code`/`nextAction` を使った専用のエラー UI(現状は
+disabled 化で 409 パスにほぼ到達しないため、既存のトースト表示のままで
+充分と判断)。
+
 ## サーバー生成固定文言の INTERVIEW_LANGUAGE 対応(Issue #138)
 
 #127 は LLM 生成テキストの出力言語を `INTERVIEW_LANGUAGE`(既定 `ja`)に従わせたが、

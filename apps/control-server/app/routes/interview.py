@@ -160,6 +160,46 @@ def _review_history(rows) -> List[dict]:
     ]
 
 
+def _understanding_update_blocked(conn, session, system_id: int) -> bool:
+    """True when ``update-understanding`` would currently be rejected (409).
+
+    Single source of truth for the confirmed-proposal-stage rebuild gate
+    (Issue #229, widened by Issue #263): both the API's 409 check and the
+    session serializer's ``understanding_update_available`` flag call this
+    function so they can never disagree. Deterministic only (Principle 6):
+    a stage/timestamp/row-existence check, no reasoning model involved.
+
+    Rebuilding is blocked only when all of the following hold:
+    - the session has reached ``proposal_generation``,
+    - the understanding was manually confirmed
+      (``understanding_confirmed_at`` is set), and
+    - no developer input has arrived since confirmation: no answer
+      correction (``answers_revised_at``) and no ``interview_qa`` row
+      created or answered after ``understanding_confirmed_at`` (a first-time
+      answer given only through the Q&A panel, or an answer to a newly
+      issued Runtime Reality Check question, both of which never touch
+      ``answers_revised_at``).
+    """
+    if (session["stage"] or "understanding_initialized") != "proposal_generation":
+        return False
+    confirmed_at = session["understanding_confirmed_at"]
+    if confirmed_at is None:
+        return False
+    if session["answers_revised_at"] is not None:
+        return False
+    new_qa_since_confirmation = conn.execute(
+        """SELECT 1 FROM interview_qa
+           WHERE session_id = ? AND system_id = ?
+             AND (
+               created_at > ?
+               OR (answered_at IS NOT NULL AND answered_at > ?)
+             )
+           LIMIT 1""",
+        (session["id"], system_id, confirmed_at, confirmed_at),
+    ).fetchone()
+    return new_qa_since_confirmation is None
+
+
 def _load_qa_pairs(
     conn, session_id: int, system_id: int
 ) -> tuple[Optional[List[dict]], List[dict]]:
@@ -228,7 +268,7 @@ def _question_out(question) -> InterviewStructuredQuestion:
 router = APIRouter()
 
 
-def _session_out(row) -> InterviewSessionOut:
+def _session_out(conn, row) -> InterviewSessionOut:
     import json as _json
     return InterviewSessionOut(
         id=row["id"],
@@ -253,6 +293,9 @@ def _session_out(row) -> InterviewSessionOut:
         ),
         answers_revised_at=(
             row["answers_revised_at"] if "answers_revised_at" in row.keys() else None
+        ),
+        understanding_update_available=not _understanding_update_blocked(
+            conn, row, row["system_id"]
         ),
         materialization_diff=row["materialization_diff"],
         materialization_ref=row["materialization_ref"],
@@ -446,7 +489,7 @@ def list_interview_sessions(
             "SELECT * FROM interview_session WHERE system_id = ? ORDER BY id DESC",
             (system_id,),
         ).fetchall()
-        return [_session_out(r) for r in rows]
+        return [_session_out(conn, r) for r in rows]
 
 
 @router.post(
@@ -489,7 +532,7 @@ def create_interview_session(
             (system_id, payload.snapshot_id, payload.title, payload.focus, now, now),
         )
         row = _get_session_or_404(conn, cur.lastrowid, system_id)
-        return _session_out(row)
+        return _session_out(conn, row)
 
 
 @router.get(
@@ -514,7 +557,7 @@ def get_interview_session(
             "SELECT * FROM interview_proposal WHERE session_id = ? ORDER BY id",
             (session_id,),
         ).fetchall()
-        session_fields = _session_out(row).model_dump()
+        session_fields = _session_out(conn, row).model_dump()
         session_fields["snapshot_commit_sha"] = (
             snapshot_row["commit_sha"] if snapshot_row else None
         )
@@ -585,7 +628,7 @@ def rebase_interview_snapshot(
                 from_snapshot_id=from_snapshot_id,
                 to_snapshot_id=target_snapshot_id,
                 message="Session is already pinned to the target snapshot.",
-                session=_session_out(session),
+                session=_session_out(conn, session),
             )
 
         proposal_rows = conn.execute(
@@ -706,7 +749,7 @@ def rebase_interview_snapshot(
                 f"Updated session to snapshot #{target_snapshot_id}; "
                 f"{needs_review} proposal(s) require re-review."
             ),
-            session=_session_out(row),
+            session=_session_out(conn, row),
         )
 
 
@@ -1547,7 +1590,7 @@ def interview_dialogue_turn(
 
         # Re-read session for latest understanding state.
         updated_row = _get_session_or_404(conn, session_id, system_id)
-        updated_session = _session_out(updated_row)
+        updated_session = _session_out(conn, updated_row)
 
         return InterviewDialogueTurnOut(
             assistant_message=turn.assistant_message,
@@ -2350,7 +2393,7 @@ def confirm_interview_understanding(
         # direct/retried API request idempotent so it cannot append another
         # workflow event or alter the recorded decision.
         if session["understanding_confirmed_at"] is not None:
-            return _session_out(session)
+            return _session_out(conn, session)
 
         user_turns = conn.execute(
             "SELECT COUNT(*) AS n FROM interview_message WHERE session_id = ? AND role = 'user'",
@@ -2388,7 +2431,7 @@ def confirm_interview_understanding(
             ),
         )
         row = _get_session_or_404(conn, session_id, system_id)
-        return _session_out(row)
+        return _session_out(conn, row)
 
 
 # --- Stage Advancement (Issue #82) -------------------------------------------
@@ -2432,7 +2475,7 @@ def advance_interview_stage(
             params,
         )
         row = _get_session_or_404(conn, session_id, system_id)
-        return _session_out(row)
+        return _session_out(conn, row)
 
 
 @router.post(
@@ -2468,47 +2511,25 @@ def update_interview_understanding(
         session = _get_session_or_404(conn, session_id, system_id)
         snapshot_id = session["snapshot_id"]
 
-        # After manual confirmation, rebuilding is meaningful only when an
-        # answer correction is waiting to be reflected. Keep this guard at
-        # the API boundary as well as in the Dashboard.
-        #
-        # Issue #263: `answers_revised_at` alone only covers the correction
-        # path (an already-answered question re-answered). It misses a
-        # first-time answer given after confirmation and a newly issued
-        # Runtime Reality Check question answered after confirmation — both
-        # only ever touch `interview_qa`, never `answers_revised_at`. Widen
-        # the gate with a deterministic, structural check (Principle 6): any
-        # interview_qa row for this session created OR answered strictly
-        # after understanding_confirmed_at means there is new developer
-        # input the confirmed understanding has not seen yet.
-        confirmed_at = session["understanding_confirmed_at"]
-        if (
-            (session["stage"] or "understanding_initialized") == "proposal_generation"
-            and confirmed_at is not None
-            and session["answers_revised_at"] is None
-        ):
-            new_qa_since_confirmation = conn.execute(
-                """SELECT 1 FROM interview_qa
-                   WHERE session_id = ? AND system_id = ?
-                     AND (
-                       created_at > ?
-                       OR (answered_at IS NOT NULL AND answered_at > ?)
-                     )
-                   LIMIT 1""",
-                (session_id, system_id, confirmed_at, confirmed_at),
-            ).fetchone()
-            if new_qa_since_confirmation is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "understanding_update_not_available",
-                        "message": (
-                            "Understanding is already confirmed. Update it after "
-                            "correcting an interview answer."
-                        ),
-                        "next_action": "generate_or_review_proposals",
-                    },
-                )
+        # After manual confirmation, rebuilding is meaningful only when new
+        # developer input is waiting to be reflected. Keep this guard at the
+        # API boundary as well as in the Dashboard; both sides evaluate the
+        # exact same predicate (Issue #229/#263 — see
+        # `_understanding_update_blocked` for the full condition) so the
+        # session's `understanding_update_available` flag and this 409 can
+        # never disagree.
+        if _understanding_update_blocked(conn, session, system_id):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "understanding_update_not_available",
+                    "message": (
+                        "Understanding is already confirmed. Update it after "
+                        "correcting an interview answer."
+                    ),
+                    "next_action": "generate_or_review_proposals",
+                },
+            )
 
         from ..docs_code_reconciler import reconcile
         from ..system_understanding_service import _load_graph_for_snapshot
@@ -2577,7 +2598,7 @@ def update_interview_understanding(
                 ),
             )
             row = _get_session_or_404(conn, session_id, system_id)
-            return _session_out(row)
+            return _session_out(conn, row)
 
         graph = _load_graph_for_snapshot(conn, system_id, snapshot_id)
         if graph is None:
@@ -2599,7 +2620,7 @@ def update_interview_understanding(
                 ),
             )
             row = _get_session_or_404(conn, session_id, system_id)
-            return _session_out(row)
+            return _session_out(conn, row)
 
         reconciliation = reconcile(conn, system_id, snapshot_id, graph)
 
@@ -2649,7 +2670,7 @@ def update_interview_understanding(
                 ),
             )
             row = _get_session_or_404(conn, session_id, system_id)
-            return _session_out(row)
+            return _session_out(conn, row)
 
         run_id = _record_review_run(
             "completed", None, review.provider, review.model, review.is_mock,
@@ -2797,7 +2818,7 @@ def update_interview_understanding(
                 )
 
         row = _get_session_or_404(conn, session_id, system_id)
-        return _session_out(row)
+        return _session_out(conn, row)
 
 
 # --- Evidence read audit (Issue #137) ----------------------------------------

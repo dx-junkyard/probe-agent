@@ -2334,6 +2334,12 @@ class InterviewSessionOut(BaseModel):
     # Never cleared automatically by the revision itself — only a successful
     # understanding rebuild (update-understanding) clears it.
     answers_revised_at: Optional[float] = None
+    # Issue #229/#263: deterministic mirror of the update-understanding 409
+    # gate (`routes.interview._understanding_update_blocked`) — the single
+    # source of truth for both. The Dashboard uses this instead of
+    # re-deriving the confirmed-proposal-stage rebuild condition locally, so
+    # UI availability can never drift from what the API will actually allow.
+    understanding_update_available: bool = True
     materialization_diff: Optional[str] = None
     materialization_ref: Optional[str] = None
     materialized_at: Optional[float] = None

@@ -545,6 +545,9 @@ def test_session_understanding_fields_initially_null(admin_client):
     assert data["gap_analysis"] is None
     assert data["open_questions"] is None
     assert data["user_intent"] is None
+    # Issue #229: a fresh (not yet confirmed) session is never blocked from
+    # rebuilding its understanding.
+    assert data["understanding_update_available"] is True
 
 
 def test_invalid_stage_rejected(admin_client):
@@ -968,6 +971,9 @@ def test_update_understanding_is_rejected_after_confirmation_without_revision(ad
         f"/interview/sessions/{session['id']}", headers=headers,
     ).json()
     assert [m["role"] for m in detail["messages"]] == ["user", "system"]
+    # Issue #229: the session serializer must mirror the API gate exactly so
+    # the Dashboard can disable the button without a second source of truth.
+    assert detail["understanding_update_available"] is False
 
     r = admin_client.post(
         f"/interview/sessions/{session['id']}/update-understanding",
@@ -999,6 +1005,13 @@ def test_update_understanding_is_rejected_after_confirmation_without_revision(ad
             "UPDATE interview_session SET answers_revised_at = ? WHERE id = ?",
             (time.time(), session["id"]),
         )
+    # The flag flips to available purely from the DB state, before the
+    # rebuild endpoint is ever called again.
+    reopened = admin_client.get(
+        f"/interview/sessions/{session['id']}", headers=headers,
+    ).json()
+    assert reopened["understanding_update_available"] is True
+
     allowed = admin_client.post(
         f"/interview/sessions/{session['id']}/update-understanding",
         headers=headers,
@@ -1046,6 +1059,10 @@ def test_update_understanding_opens_gate_on_first_time_answer_after_confirmation
         f"/interview/sessions/{sid}/update-understanding", headers=headers,
     )
     assert still_blocked.status_code == 409, still_blocked.text
+    blocked_detail = admin_client.get(
+        f"/interview/sessions/{sid}", headers=headers,
+    ).json()
+    assert blocked_detail["understanding_update_available"] is False
 
     time.sleep(0.01)
     answer = admin_client.post(
@@ -1057,6 +1074,15 @@ def test_update_understanding_opens_gate_on_first_time_answer_after_confirmation
     assert answer.json()["qa"]["status"] == "answered"
     # Confirms this really is the first-answer branch, not a correction.
     assert answer.json()["previous"] is None
+
+    # The session flag opens as soon as the Q&A answer lands — a first-time
+    # answer never touches `answers_revised_at`, so this proves the flag
+    # tracks the same widened Issue #263 condition as the API gate rather
+    # than re-deriving the pre-#263 `answers_revised_at`-only check.
+    reopened_detail = admin_client.get(
+        f"/interview/sessions/{sid}", headers=headers,
+    ).json()
+    assert reopened_detail["understanding_update_available"] is True
 
     allowed = admin_client.post(
         f"/interview/sessions/{sid}/update-understanding", headers=headers,

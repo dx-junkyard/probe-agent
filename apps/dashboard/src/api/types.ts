@@ -484,6 +484,10 @@ export interface InterviewSessionOut {
   // Issue #129: set when an answered interview_qa question is corrected;
   // cleared only by a successful understanding rebuild.
   answers_revised_at: number | null;
+  // Issue #229/#263: server-computed mirror of the update-understanding 409
+  // gate. Use this instead of re-deriving the confirmed/no-new-QA condition
+  // client-side so the disabled state can never drift from the API.
+  understanding_update_available: boolean;
   materialization_diff: string | null;
   materialization_ref: string | null;
   materialized_at: number | null;
