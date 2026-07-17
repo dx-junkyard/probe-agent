@@ -70,13 +70,26 @@ export default function OverviewPage() {
   // Issue #267: deterministic completion facts for steps 1-3, reusing the
   // same hooks/pattern as `PrerequisiteChecklist` (snapshot presence, System
   // Profile Draft presence) plus `connect-sdk.tsx`'s own token list.
+  // GET /tokens/me (auth.py) returns every api_tokens row for the user,
+  // including the `kind="session"` login token issued on every login
+  // (auth.py:119) -- that row is not an SDK/API credential and must not
+  // count here. Only `kind="api"` tokens (auth.py:366) that are not revoked,
+  // not expired, and scoped to the current System (or unscoped) represent an
+  // actual SDK connection.
   const { data: latestSnapshot } = useLatestSnapshot();
   const { data: latestDrafts } = useLatestDrafts();
   const { data: myTokens } = useMyTokens();
+  const now = Date.now();
+  const hasActiveSdkToken = (myTokens ?? []).some((t) =>
+    t.kind === "api" &&
+    !t.revoked &&
+    (t.expires_at == null || Number(t.expires_at) * 1000 > now) &&
+    (t.system_id == null || t.system_id === systemId)
+  );
   const stepDone: Record<string, boolean> = {
     "/repository": !!latestSnapshot,
     "/system-understanding": !!latestDrafts?.system_profile_draft,
-    "/connect-sdk": (myTokens?.length ?? 0) > 0,
+    "/connect-sdk": hasActiveSdkToken,
     "/components": connectivity?.state === "receiving",
   };
 

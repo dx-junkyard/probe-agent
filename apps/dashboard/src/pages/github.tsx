@@ -136,7 +136,15 @@ function InstallationsPanel({ systemId }: { systemId: number | null }) {
       <CardTitle className="text-base">許可されたInstallation</CardTitle>
       <CardDescription>
         設定済みのGitHub Organizationのみ登録できます。Connectionを作成する前に、有効なInstallationをこのSystemに割り当ててください。
-        セットアップ手順の詳細は<code className="mx-1">docs/github-app-deployment.md</code>を参照してください。
+        セットアップ手順の詳細は
+        <a
+          href="https://github.com/dx-junkyard/probe-agent/blob/main/docs/github-app-deployment.md"
+          target="_blank" rel="noreferrer"
+          className="mx-1 inline-flex items-center gap-1 text-primary hover:underline"
+        >
+          docs/github-app-deployment.md <ExternalLink className="h-3 w-3" />
+        </a>
+        を参照してください。
       </CardDescription>
     </CardHeader>
     <CardContent className="space-y-4">
@@ -668,7 +676,7 @@ function PublishJobDetailDialog({ job, connection, onClose }: {
 }) {
   const { isAdmin } = useAuth();
   const { data: users } = useUsers();
-  const { data: patches } = useProbePatches();
+  const { data: patches, isLoading: patchesLoading, isError: patchesError } = useProbePatches();
   const approve = useApprovePublishJob();
   const cancel = useCancelPublishJob();
   const retry = useRetryPublishJob();
@@ -862,13 +870,30 @@ function PublishJobDetailDialog({ job, connection, onClose }: {
             <div>New branch: <code className="font-mono">{job.branch_name ?? "(承認時に生成されます)"}</code></div>
           </div>
 
-          {patch?.diff && (
+          {patchesLoading ? (
+            <div className="space-y-1" data-testid="publish-job-confirm-diff-loading">
+              <div className="text-xs text-muted-foreground">Patch diffを読み込み中...</div>
+              <Skeleton className="h-16 w-full" />
+            </div>
+          ) : patch?.diff ? (
             <details className="text-xs" open data-testid="publish-job-confirm-diff">
               <summary className="cursor-pointer text-muted-foreground">publish予定のPatch diff</summary>
               <pre className="mt-2 overflow-x-auto rounded-md bg-muted p-3 text-xs font-mono max-h-64 overflow-y-auto">
                 {patch.diff}
               </pre>
             </details>
+          ) : (
+            <div
+              className="flex items-start gap-1.5 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-800 dark:bg-amber-950/20 dark:text-amber-200"
+              data-testid="publish-job-confirm-diff-unavailable"
+            >
+              <AlertTriangle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+              <span>
+                {patchesError
+                  ? "Patch diffの取得に失敗したため、承認できません。"
+                  : "Patch diffを取得できないため、承認できません。"}
+              </span>
+            </div>
           )}
 
           <Button
@@ -877,7 +902,7 @@ function PublishJobDetailDialog({ job, connection, onClose }: {
               toast.success("承認しました — publishを実行中です");
               setShowApprove(false);
             }).catch(e => toast.error(String(e)))}
-            disabled={approve.isPending}
+            disabled={approve.isPending || !patch?.diff}
             data-testid="publish-job-confirm-approve-button"
           >
             {approve.isPending ? "承認中..." : "承認してpublish"}
