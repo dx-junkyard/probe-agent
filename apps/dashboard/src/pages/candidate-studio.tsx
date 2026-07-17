@@ -414,6 +414,13 @@ function StudioView({ sessionId }: { sessionId: number }) {
               rows={3}
               placeholder="改善の目的・制約・修正指示を入力..."
             />
+            {/* Issue #267 item 4: "送信" only appends a chat message and never
+                creates a CandidateVersion -- only a successful generate call
+                does that (CLAUDE.md Issue #252 section). */}
+            <p className="text-xs text-muted-foreground" data-testid="candidate-studio-send-vs-generate-note">
+              「送信」は会話に追加するだけで、候補versionは作成しません。候補versionを
+              作るには「候補を生成」を使ってください。
+            </p>
             <div className="flex flex-wrap items-center justify-between gap-2">
               <Button
                 size="sm"

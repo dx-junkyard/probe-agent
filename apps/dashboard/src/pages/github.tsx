@@ -6,7 +6,8 @@ import {
   useInstallationRepositories, usePublishJobs, useCreatePublishJob,
   useApprovePublishJob, useCancelPublishJob, useRetryPublishJob, useProbePatches, useUsers,
   useSystemGithubInstallations, useGithubInstallations, useRegisterGithubInstallation,
-  useDisableGithubInstallation, useAssignGithubInstallation,
+  useDisableGithubInstallation, useAssignGithubInstallation, useUnassignGithubInstallation,
+  usePublishJobEvents,
 } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
@@ -22,7 +23,7 @@ import { toast } from "sonner";
 import { formatTimestamp } from "@/lib/utils";
 import {
   GitMerge, RefreshCw, CheckCircle2, XCircle, Trash2, Plus, ExternalLink,
-  ShieldCheck, GitPullRequest, AlertTriangle, RotateCcw,
+  ShieldCheck, GitPullRequest, AlertTriangle, RotateCcw, History,
 } from "lucide-react";
 import type { GithubConnectionOut, GithubInstallationOut, PublishJobOut, ProbePatchOut } from "@/api/types";
 
@@ -117,6 +118,7 @@ function InstallationsPanel({ systemId }: { systemId: number | null }) {
   const register = useRegisterGithubInstallation();
   const disable = useDisableGithubInstallation();
   const assign = useAssignGithubInstallation();
+  const unassign = useUnassignGithubInstallation();
   const [installationId, setInstallationId] = useState("");
 
   const add = async () => {
@@ -134,6 +136,7 @@ function InstallationsPanel({ systemId }: { systemId: number | null }) {
       <CardTitle className="text-base">許可されたInstallation</CardTitle>
       <CardDescription>
         設定済みのGitHub Organizationのみ登録できます。Connectionを作成する前に、有効なInstallationをこのSystemに割り当ててください。
+        セットアップ手順の詳細は<code className="mx-1">docs/github-app-deployment.md</code>を参照してください。
       </CardDescription>
     </CardHeader>
     <CardContent className="space-y-4">
@@ -154,6 +157,18 @@ function InstallationsPanel({ systemId }: { systemId: number | null }) {
             </div>
             <div className="flex gap-2">
               {installation.status === "active" && systemId !== null && !assigned && <Button size="sm" variant="outline" onClick={() => assign.mutateAsync({ installationId: installation.installation_id, systemId }).catch(e => toast.error(String(e)))}>このSystemに割り当て</Button>}
+              {systemId !== null && assigned && (
+                <Button
+                  size="sm" variant="outline"
+                  data-testid={`installation-${installation.installation_id}-unassign`}
+                  onClick={() => unassign.mutateAsync({ installationId: installation.installation_id, systemId })
+                    .then(() => toast.success("このSystemの割り当てを解除しました"))
+                    .catch(e => toast.error(String(e)))}
+                  disabled={unassign.isPending}
+                >
+                  このSystemの割り当てを解除
+                </Button>
+              )}
               {installation.status === "active" && <Button size="sm" variant="destructive" onClick={() => disable.mutateAsync(installation.installation_id).catch(e => toast.error(String(e)))}>無効化</Button>}
             </div>
           </div>;
@@ -195,6 +210,7 @@ function AppStatusCard({ status, isLoading }: {
             （既存のprivate keyファイルを指す）を設定し、再起動してください。任意:
             <code className="ml-1">GITHUB_API_BASE_URL</code> / <code>GITHUB_WEB_BASE_URL</code>
             （GitHub Enterprise向け）。これらが設定されるまでConnectionとpublish jobは利用できません。
+            手順の詳細は<code className="mx-1">docs/github-app-deployment.md</code>を参照してください。
           </div>
         )}
       </CardContent>
@@ -656,6 +672,7 @@ function PublishJobDetailDialog({ job, connection, onClose }: {
   const approve = useApprovePublishJob();
   const cancel = useCancelPublishJob();
   const retry = useRetryPublishJob();
+  const { data: events } = usePublishJobEvents(job?.id ?? null);
   const [showApprove, setShowApprove] = useState(false);
 
   const usernames = useMemo(() => {
@@ -739,6 +756,19 @@ function PublishJobDetailDialog({ job, connection, onClose }: {
           </div>
         )}
 
+        {job.status === "manual_intervention_required" && (
+          <div
+            className="flex items-start gap-1.5 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-800 dark:bg-amber-950/20 dark:text-amber-200"
+            data-testid="publish-job-manual-intervention-note"
+          >
+            <AlertTriangle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+            <span>
+              remote branchが既存で、記録済みcommitと一致しません。単純な再試行では解決しない
+              可能性があります — GitHub上でこのbranchの状態を確認してから再試行してください。
+            </span>
+          </div>
+        )}
+
         {job.cleanup_state && job.cleanup_state !== "not_attempted" && job.cleanup_state !== "removed" && (
           <div className="text-xs text-amber-700 dark:text-amber-300">
             Worktree cleanup: {job.cleanup_state}{job.cleanup_error ? ` — ${job.cleanup_error}` : ""}
@@ -754,6 +784,35 @@ function PublishJobDetailDialog({ job, connection, onClose }: {
           </details>
         )}
 
+        {/* Issue #267 item 5: publish_recovery.py's auto-retry/reconcile
+            history was previously invisible in the Dashboard -- this reads
+            the append-only publish_audit_events trail verbatim (no
+            client-side interpretation). */}
+        <details className="text-xs" data-testid="publish-job-events">
+          <summary className="cursor-pointer text-muted-foreground flex items-center gap-1">
+            <History className="h-3.5 w-3.5" /> イベント履歴{events?.length ? ` (${events.length})` : ""}
+          </summary>
+          <div className="mt-2 space-y-1.5 max-h-64 overflow-y-auto">
+            {!events?.length ? (
+              <p className="text-muted-foreground">イベントはまだありません。</p>
+            ) : (
+              events.map(ev => (
+                <div key={ev.id} className="rounded-md border p-2" data-testid={`publish-job-event-${ev.id}`}>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-mono">{ev.event_type}</span>
+                    <span className="text-muted-foreground">{formatTimestamp(ev.created_at)}</span>
+                  </div>
+                  {ev.detail && (
+                    <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-words text-[11px] text-muted-foreground">
+                      {JSON.stringify(ev.detail)}
+                    </pre>
+                  )}
+                </div>
+              ))
+            )}
+          </div>
+        </details>
+
         <div className="flex gap-2">
           {job.status === "awaiting_approval" && (
             <Button
@@ -765,11 +824,13 @@ function PublishJobDetailDialog({ job, connection, onClose }: {
           )}
           {(job.status === "retryable_failed" || job.status === "manual_intervention_required") && (
             <Button
+              variant={job.status === "manual_intervention_required" ? "outline" : "default"}
               onClick={() => retry.mutateAsync(job.id).then(() => toast.success("Publish jobを再試行しています")).catch(e => toast.error(String(e)))}
               disabled={retry.isPending}
               data-testid="publish-job-retry-button"
             >
-              <RotateCcw className="h-4 w-4 mr-1" /> 再試行
+              <RotateCcw className="h-4 w-4 mr-1" />
+              {job.status === "manual_intervention_required" ? "再試行(要確認)" : "再試行"}
             </Button>
           )}
           {(job.status === "pending" || job.status === "awaiting_approval"

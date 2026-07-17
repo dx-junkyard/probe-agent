@@ -176,6 +176,16 @@ export default function ComponentsPage() {
                 <span className="font-medium">trace</span> モードに切り替えて収集を開始してください。
               </p>
             )}
+            {/* Issue #267 item 3: the mode toggle's meaning was previously
+                explained only in the Simulation Workbench's EscalationPanel
+                (Principle 1's shadow guarantee) -- surface the same
+                guarantee here, next to the switch itself. */}
+            <p className="text-xs text-muted-foreground" data-testid="component-mode-explanation">
+              <span className="font-mono">off</span>=記録なし ·{" "}
+              <span className="font-mono">trace</span>=入出力・エラー・durationを記録 ·{" "}
+              <span className="font-mono">shadow</span>=候補実装も並行実行して比較記録。
+              shadow modeは本番の戻り値を変更しません（Principle 1）。
+            </p>
 
             <Tabs defaultValue="traces">
               <TabsList>

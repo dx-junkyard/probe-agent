@@ -43,7 +43,7 @@ import type {
   ProbeRemovalPatchOut, ReconcilePointOut,
   GithubAppStatusOut, GithubConnectionOut, GithubConnectionCreateRequest,
   GithubRepositoryStatusOut, GithubInstallationRepositoryOut, GithubInstallationOut,
-  PublishJobOut,
+  PublishJobOut, PublishAuditEventOut,
   ReplaySetOut, ReplaySourceOut, ReplaySourceDiffOut,
   ReplayVariantRunOut, ReplayVariantDraftOut,
   ReplayApprovalStateOut, ReplayApprovalOut,
@@ -1676,6 +1676,31 @@ export function useRetryPublishJob() {
     onSuccess: (_d, jobId) => {
       qc.invalidateQueries({ queryKey: sysKey("publishJobs") });
       qc.invalidateQueries({ queryKey: sysKey("publishJob", jobId) });
+    },
+  });
+}
+
+// Append-only audit trail for a publish job (Issues #226/#227), surfaced in
+// the Dashboard by Issue #267 item 5 -- previously the retry/recovery
+// history existed server-side (publish_recovery.py) with no UI.
+export function usePublishJobEvents(jobId: number | null) {
+  return useQuery({
+    queryKey: sysKey("publishJobEvents", jobId),
+    queryFn: () => api.get<PublishAuditEventOut[]>(`/github/publish-jobs/${jobId}/events`),
+    enabled: jobId !== null && !!getSystemId(),
+  });
+}
+
+// Issue #267 item 6: `DELETE /github/installations/{id}/systems/{sid}`
+// existed server-side (Issue #216) with no Dashboard hook/UI.
+export function useUnassignGithubInstallation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ installationId, systemId }: { installationId: number; systemId: number }) =>
+      api.delete<void>(`/github/installations/${installationId}/systems/${systemId}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["githubInstallations"] });
+      qc.invalidateQueries({ queryKey: sysKey("githubSystemInstallations") });
     },
   });
 }
