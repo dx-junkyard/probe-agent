@@ -545,6 +545,9 @@ def test_session_understanding_fields_initially_null(admin_client):
     assert data["gap_analysis"] is None
     assert data["open_questions"] is None
     assert data["user_intent"] is None
+    # Issue #229: a fresh (not yet confirmed) session is never blocked from
+    # rebuilding its understanding.
+    assert data["understanding_update_available"] is True
 
 
 def test_invalid_stage_rejected(admin_client):
@@ -732,7 +735,7 @@ def test_update_understanding_records_llm_config_failure(admin_client, monkeypat
     assert run is not None
     assert run["status"] == "failed"
     assert "ANTHROPIC_API_KEY" in run["error_details"]
-    assert run["prompt_version"] == "understanding-review-v3"
+    assert run["prompt_version"] == "understanding-review-v4"
     assert detail["messages"][-1]["intelligence_run_id"] == run["id"]
 
 
@@ -876,7 +879,7 @@ def test_update_understanding_records_run_and_reviewer_qa_rows(admin_client, mon
         ).fetchone()
     assert run is not None
     assert run["status"] == "completed"
-    assert run["prompt_version"] == "understanding-review-v3"
+    assert run["prompt_version"] == "understanding-review-v4"
     assert run["decision_method"] == "reasoning_llm"
 
     qa_listing = admin_client.get(
@@ -968,6 +971,9 @@ def test_update_understanding_is_rejected_after_confirmation_without_revision(ad
         f"/interview/sessions/{session['id']}", headers=headers,
     ).json()
     assert [m["role"] for m in detail["messages"]] == ["user", "system"]
+    # Issue #229: the session serializer must mirror the API gate exactly so
+    # the Dashboard can disable the button without a second source of truth.
+    assert detail["understanding_update_available"] is False
 
     r = admin_client.post(
         f"/interview/sessions/{session['id']}/update-understanding",
@@ -999,12 +1005,326 @@ def test_update_understanding_is_rejected_after_confirmation_without_revision(ad
             "UPDATE interview_session SET answers_revised_at = ? WHERE id = ?",
             (time.time(), session["id"]),
         )
+    # The flag flips to available purely from the DB state, before the
+    # rebuild endpoint is ever called again.
+    reopened = admin_client.get(
+        f"/interview/sessions/{session['id']}", headers=headers,
+    ).json()
+    assert reopened["understanding_update_available"] is True
+
     allowed = admin_client.post(
         f"/interview/sessions/{session['id']}/update-understanding",
         headers=headers,
     )
     assert allowed.status_code == 200, allowed.text
     assert allowed.json()["last_error"] != ""
+
+
+# --- Issue #263: Q&A panel answers reach the review + widened rebuild gate --
+
+
+def test_update_understanding_opens_gate_on_first_time_answer_after_confirmation(
+    admin_client, monkeypatch,
+):
+    """A first-time answer (open -> answered) given after confirmation must
+    open the rebuild gate, even though `answers_revised_at` is only ever set
+    by the *correction* path (Issue #263)."""
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setenv("LLM_MODEL", "mock")
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "first answer after confirm"},
+        headers=headers,
+    ).json()
+    sid = session["id"]
+
+    # The question already existed (e.g. from an earlier review pass) before
+    # confirmation -- only its *answer* is new.
+    qa = admin_client.post(
+        f"/interview/sessions/{sid}/qa",
+        json={
+            "question_text": "対象コンポーネントは何ですか?",
+            "question_category": "purpose",
+            "question_source": "reviewer",
+        },
+        headers=headers,
+    ).json()
+
+    time.sleep(0.01)
+    _confirm_and_reach_proposal_generation(admin_client, sid, headers)
+
+    still_blocked = admin_client.post(
+        f"/interview/sessions/{sid}/update-understanding", headers=headers,
+    )
+    assert still_blocked.status_code == 409, still_blocked.text
+    blocked_detail = admin_client.get(
+        f"/interview/sessions/{sid}", headers=headers,
+    ).json()
+    assert blocked_detail["understanding_update_available"] is False
+
+    time.sleep(0.01)
+    answer = admin_client.post(
+        f"/interview/sessions/{sid}/qa/{qa['id']}/answer",
+        json={"answer_text": "APIサーバーです", "actor": "root"},
+        headers=headers,
+    )
+    assert answer.status_code == 200, answer.text
+    assert answer.json()["qa"]["status"] == "answered"
+    # Confirms this really is the first-answer branch, not a correction.
+    assert answer.json()["previous"] is None
+
+    # The session flag opens as soon as the Q&A answer lands — a first-time
+    # answer never touches `answers_revised_at`, so this proves the flag
+    # tracks the same widened Issue #263 condition as the API gate rather
+    # than re-deriving the pre-#263 `answers_revised_at`-only check.
+    reopened_detail = admin_client.get(
+        f"/interview/sessions/{sid}", headers=headers,
+    ).json()
+    assert reopened_detail["understanding_update_available"] is True
+
+    allowed = admin_client.post(
+        f"/interview/sessions/{sid}/update-understanding", headers=headers,
+    )
+    assert allowed.status_code == 200, allowed.text
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT answers_revised_at FROM interview_session WHERE id = ?", (sid,),
+        ).fetchone()
+    assert row["answers_revised_at"] is None  # this branch never sets it
+
+
+def test_update_understanding_opens_gate_on_answer_revision(admin_client, monkeypatch):
+    """Correcting an already-answered question after confirmation opens the
+    gate via the existing `answers_revised_at` path, driven end-to-end
+    through the real answer/correction routes rather than a direct DB poke."""
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setenv("LLM_MODEL", "mock")
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "revision after confirm"},
+        headers=headers,
+    ).json()
+    sid = session["id"]
+
+    qa = admin_client.post(
+        f"/interview/sessions/{sid}/qa",
+        json={
+            "question_text": "対象コンポーネントは何ですか?",
+            "question_category": "purpose",
+            "question_source": "reviewer",
+        },
+        headers=headers,
+    ).json()
+    admin_client.post(
+        f"/interview/sessions/{sid}/qa/{qa['id']}/answer",
+        json={"answer_text": "APIサーバーです", "actor": "root"},
+        headers=headers,
+    )
+
+    _confirm_and_reach_proposal_generation(admin_client, sid, headers)
+
+    still_blocked = admin_client.post(
+        f"/interview/sessions/{sid}/update-understanding", headers=headers,
+    )
+    assert still_blocked.status_code == 409, still_blocked.text
+
+    correction = admin_client.post(
+        f"/interview/sessions/{sid}/qa/{qa['id']}/answer",
+        json={"answer_text": "バッチジョブサーバーです", "actor": "root"},
+        headers=headers,
+    )
+    assert correction.status_code == 200, correction.text
+    assert correction.json()["previous"] is not None
+
+    allowed = admin_client.post(
+        f"/interview/sessions/{sid}/update-understanding", headers=headers,
+    )
+    assert allowed.status_code == 200, allowed.text
+
+
+def test_update_understanding_opens_gate_on_runtime_check_answer_after_confirmation(
+    admin_client, monkeypatch,
+):
+    """A Runtime Reality Check question (question_source='runtime') answered
+    after confirmation must open the gate the same way a reviewer question
+    does (Issue #263)."""
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setenv("LLM_MODEL", "mock")
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "runtime check after confirm"},
+        headers=headers,
+    ).json()
+    sid = session["id"]
+
+    qa = admin_client.post(
+        f"/interview/sessions/{sid}/qa",
+        json={
+            "question_text": "実行時にこの関数は本当に呼ばれていますか?",
+            "question_category": "general",
+            "question_source": "runtime",
+        },
+        headers=headers,
+    ).json()
+
+    time.sleep(0.01)
+    _confirm_and_reach_proposal_generation(admin_client, sid, headers)
+
+    still_blocked = admin_client.post(
+        f"/interview/sessions/{sid}/update-understanding", headers=headers,
+    )
+    assert still_blocked.status_code == 409, still_blocked.text
+
+    time.sleep(0.01)
+    answer = admin_client.post(
+        f"/interview/sessions/{sid}/qa/{qa['id']}/answer",
+        json={"answer_text": "はい、1日あたり数百回呼ばれています", "actor": "root"},
+        headers=headers,
+    )
+    assert answer.status_code == 200, answer.text
+
+    allowed = admin_client.post(
+        f"/interview/sessions/{sid}/update-understanding", headers=headers,
+    )
+    assert allowed.status_code == 200, allowed.text
+
+
+def test_update_understanding_stays_blocked_with_no_new_qa_activity(
+    admin_client, monkeypatch,
+):
+    """Confirmed with no answer/correction/new question at all: the gate
+    must stay closed exactly as before (Issue #263 must not loosen this
+    case)."""
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setenv("LLM_MODEL", "mock")
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "no new info"},
+        headers=headers,
+    ).json()
+    sid = session["id"]
+
+    # A question exists but is answered BEFORE confirmation -- ordinary,
+    # already-incorporated input, not "new info" relative to confirmation.
+    qa = admin_client.post(
+        f"/interview/sessions/{sid}/qa",
+        json={
+            "question_text": "対象コンポーネントは何ですか?",
+            "question_category": "purpose",
+            "question_source": "reviewer",
+        },
+        headers=headers,
+    ).json()
+    admin_client.post(
+        f"/interview/sessions/{sid}/qa/{qa['id']}/answer",
+        json={"answer_text": "APIサーバーです", "actor": "root"},
+        headers=headers,
+    )
+
+    _confirm_and_reach_proposal_generation(admin_client, sid, headers)
+
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/update-understanding", headers=headers,
+    )
+    assert r.status_code == 409, r.text
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        runs = conn.execute(
+            """SELECT COUNT(*) AS n FROM intelligence_runs
+               WHERE system_id = ? AND run_type = 'understanding_review'""",
+            (system_id,),
+        ).fetchone()["n"]
+    assert runs == 0
+
+
+def test_update_understanding_injects_qa_panel_only_answer(admin_client, monkeypatch):
+    """An answer given ONLY through the Q&A panel (no interview_message row
+    is ever created for it) must still reach the review prompt (Issue
+    #263)."""
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("LLM_MODEL", "o3-mini")
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+    token, system_id, snapshot_id = _setup(admin_client)
+    _insert_understanding_graph(system_id, snapshot_id)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "qa panel only"},
+        headers=headers,
+    ).json()
+    sid = session["id"]
+
+    qa = admin_client.post(
+        f"/interview/sessions/{sid}/qa",
+        json={
+            "question_text": "このコンポーネントのオーナーは誰ですか?",
+            "question_category": "general",
+            "question_source": "reviewer",
+        },
+        headers=headers,
+    ).json()
+    answer = admin_client.post(
+        f"/interview/sessions/{sid}/qa/{qa['id']}/answer",
+        json={"answer_text": "プラットフォームチームです", "actor": "root"},
+        headers=headers,
+    )
+    assert answer.status_code == 200, answer.text
+
+    # No interview_message was ever posted for this session.
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        message_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM interview_message WHERE session_id = ?",
+            (sid,),
+        ).fetchone()["n"]
+    assert message_count == 0
+
+    captured = {}
+
+    class CapturingReviewClient:
+        def generate_text(self, messages, *, temperature=None, max_tokens=None):
+            import json
+
+            captured["messages"] = messages
+            return json.dumps({
+                "system_purpose": [],
+                "core_capabilities": [],
+                "capability_elements": [],
+                "supporting_elements": [],
+                "api_boundaries": [],
+                "probe_flow_candidates": [],
+                "gap_analysis": [],
+                "open_questions": [],
+                "suggested_next_action": "confirm_purpose",
+            })
+
+    import app.routes.interview as interview_route
+
+    monkeypatch.setattr(interview_route, "create_llm_client", lambda config: CapturingReviewClient())
+
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/update-understanding", headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["last_error"] is None
+
+    user_prompt = captured["messages"][1]["content"]
+    assert "このコンポーネントのオーナーは誰ですか?" in user_prompt
+    assert "プラットフォームチームです" in user_prompt
 
 
 def test_review_history_excludes_confirmation_control_events():

@@ -566,7 +566,10 @@ def _run_prepare_phase(job_id: int) -> None:
                     "Base branch has moved since the patch was generated/validated "
                     f"(patch is pinned to {patch_row['commit_sha']}, remote {job['base_branch']} "
                     f"is now at {remote_sha}); create a new snapshot, regenerate the probe "
-                    "patch, and re-validate before publishing"
+                    "patch, and re-validate before publishing. If this happens immediately "
+                    "after creating the connection, double-check that this GitHub connection "
+                    "(owner/repo) actually points at the same repository this analysis is "
+                    "based on -- a mismatched connection always looks like a moved base branch."
                 )
             base_commit_sha = remote_sha
             _update_job(job_id, base_commit_sha=base_commit_sha)
@@ -1089,7 +1092,11 @@ def _run_reconcile_phase(job_id: int) -> None:
                     "Base branch has moved since the patch was pinned "
                     f"(patch is pinned to {job['base_commit_sha']}, remote {job['base_branch']} "
                     f"is now at {remote_base_sha}); create a new snapshot, regenerate the "
-                    "probe patch, and re-validate before publishing"
+                    "probe patch, and re-validate before publishing. If this happens "
+                    "immediately after creating the connection, double-check that this "
+                    "GitHub connection (owner/repo) actually points at the same repository "
+                    "this analysis is based on -- a mismatched connection always looks like "
+                    "a moved base branch."
                 )
 
             branch_name = job["branch_name"] or publish_guards.generate_branch_name(

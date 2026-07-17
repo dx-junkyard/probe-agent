@@ -4,9 +4,11 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Response
 
 from ..auth import Principal, get_principal, require_admin, require_user
+from ..bootstrap_status import get_bootstrap_status
 from ..db import get_conn
 from ..environment import is_production
 from ..models import (
+    BootstrapStatusOut,
     LoginRequest,
     MeResponse,
     PasswordResetRequest,
@@ -78,6 +80,25 @@ def _issue_token(
         (hash_token(raw), name, kind, user_id, system_id, time.time(), expires_at),
     )
     return raw
+
+
+@router.get("/auth/bootstrap-status", response_model=BootstrapStatusOut)
+def bootstrap_status() -> BootstrapStatusOut:
+    """Issue #265: the one endpoint reachable with no credentials and no
+    System, so the pre-login / zero-System "phase 0" screens (login page,
+    Overview/Settings/header empty states) have something deterministic to
+    show instead of a dead end. Deliberately takes no dependencies (no
+    `get_principal`, no `get_system_id`) and returns only finite facts --
+    never a username, key value, path, or hostname (see
+    `bootstrap_status.get_bootstrap_status`).
+    """
+    status = get_bootstrap_status()
+    return BootstrapStatusOut(
+        admin_exists=status.admin_exists,
+        auth_mode=status.auth_mode,
+        llm_configured=status.llm_configured,
+        environment=status.environment,
+    )
 
 
 @router.post("/auth/login", response_model=TokenResponse)

@@ -1,5 +1,8 @@
 import { Link } from "react-router-dom";
-import { useComponents, useSystemState, useConnectivityStatus } from "@/api/hooks";
+import {
+  useComponents, useSystemState, useConnectivityStatus,
+  useLatestSnapshot, useLatestDrafts, useMyTokens,
+} from "@/api/hooks";
 import { useAuth } from "@/api/auth";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -19,11 +22,30 @@ import { formatTimestamp } from "@/lib/utils";
 // deterministic completion signal today (ConnectivityStatus, the same
 // finite state machine the header connectivity badge already reads, Issue
 // #165); the first three steps stay plain links, unchanged.
+// Issue #267: every step now gets its own deterministic completion signal
+// (previously only step 4 did), reusing the same presence-check pattern as
+// `components/prerequisite-checklist.tsx` -- no heuristic inference, just
+// existing API facts. `required` marks steps that are NOT technically
+// necessary to reach step 3->4 (connect-sdk.tsx's token issuance does not
+// depend on Repository/System Understanding being done first), per Issue
+// #267 item 2.
 const GET_STARTED_STEPS = [
-  { to: "/repository", label: "1. Configure the repository", icon: FolderCog, testId: "overview-link-repository" },
-  { to: "/system-understanding", label: "2. Build System Understanding", icon: Compass, testId: "overview-link-system-understanding" },
-  { to: "/connect-sdk", label: "3. Connect the SDK", icon: Plug, testId: "overview-link-connect-sdk" },
-  { to: "/components", label: "4. View traces in Components", icon: RadioTower, testId: "overview-link-view-traces" },
+  {
+    to: "/repository", label: "1. Configure the repository", icon: FolderCog,
+    testId: "overview-link-repository", required: false,
+  },
+  {
+    to: "/system-understanding", label: "2. Build System Understanding", icon: Compass,
+    testId: "overview-link-system-understanding", required: false,
+  },
+  {
+    to: "/connect-sdk", label: "3. Connect the SDK", icon: Plug,
+    testId: "overview-link-connect-sdk", required: true,
+  },
+  {
+    to: "/components", label: "4. View traces in Components", icon: RadioTower,
+    testId: "overview-link-view-traces", required: true,
+  },
 ] as const;
 
 const MODE_VARIANT = {
@@ -45,6 +67,18 @@ export default function OverviewPage() {
   // state the header ConnectivityBadge treats as "done" (it hides itself
   // once real, non-smoke traces have arrived).
   const { data: connectivity } = useConnectivityStatus();
+  // Issue #267: deterministic completion facts for steps 1-3, reusing the
+  // same hooks/pattern as `PrerequisiteChecklist` (snapshot presence, System
+  // Profile Draft presence) plus `connect-sdk.tsx`'s own token list.
+  const { data: latestSnapshot } = useLatestSnapshot();
+  const { data: latestDrafts } = useLatestDrafts();
+  const { data: myTokens } = useMyTokens();
+  const stepDone: Record<string, boolean> = {
+    "/repository": !!latestSnapshot,
+    "/system-understanding": !!latestDrafts?.system_profile_draft,
+    "/connect-sdk": (myTokens?.length ?? 0) > 0,
+    "/components": connectivity?.state === "receiving",
+  };
 
   const system = systems.find((s) => s.id === systemId);
   const totalTraces = components?.reduce((s, c) => s + c.trace_count, 0) ?? 0;
@@ -94,7 +128,19 @@ export default function OverviewPage() {
           <CardTitle className="text-base">Components</CardTitle>
         </CardHeader>
         <CardContent>
-          {isLoading ? (
+          {systems.length === 0 ? (
+            // Issue #265: distinct from the zero-*components* state below --
+            // there is no System selected at all yet, so components/traces
+            // cannot exist. Point at the header's "System を作成" control
+            // instead of showing the (System-scoped) get-started list.
+            <div className="space-y-2 py-8 text-center" data-testid="overview-no-systems">
+              <p className="text-sm font-medium">System を作成してください。</p>
+              <p className="text-sm text-muted-foreground">
+                トレースやコンポーネントを表示するには、まずヘッダーの
+                「System を作成」から System を作成してください。
+              </p>
+            </div>
+          ) : isLoading ? (
             <div className="space-y-3">
               {[1, 2, 3].map((i) => <Skeleton key={i} className="h-12 w-full" />)}
             </div>
@@ -113,10 +159,17 @@ export default function OverviewPage() {
               <p className="text-sm text-muted-foreground text-center">
                 No components registered yet. Connect the SDK to start tracing.
               </p>
+              {/* Issue #267 item 2: the numbered order below is a suggested
+                  path, not a technical dependency -- SDK token issuance
+                  (step 3, connect-sdk.tsx) does not require the repository or
+                  System Understanding to be configured first. */}
+              <p className="text-xs text-muted-foreground text-center" data-testid="overview-get-started-shortest-path-note">
+                最短でTraceを見るには手順3→4だけで十分です。手順1・2は
+                <span className="font-medium">推奨（必須ではありません）</span>。
+              </p>
               <ol className="mx-auto max-w-sm space-y-2 text-sm">
-                {GET_STARTED_STEPS.map(({ to, label, icon: Icon, testId }) => {
-                  // Issue #259: only step 4 has a completion signal today.
-                  const done = to === "/components" && connectivity?.state === "receiving";
+                {GET_STARTED_STEPS.map(({ to, label, icon: Icon, testId, required }) => {
+                  const done = stepDone[to] ?? false;
                   return (
                     <li key={to}>
                       <Link
@@ -130,7 +183,14 @@ export default function OverviewPage() {
                         ) : (
                           <Icon className="h-4 w-4 shrink-0" />
                         )}
-                        <span>{label}</span>
+                        <span>
+                          {label}
+                          {!required && (
+                            <span className="ml-1.5 text-xs text-muted-foreground">
+                              推奨(必須ではない)
+                            </span>
+                          )}
+                        </span>
                       </Link>
                     </li>
                   );

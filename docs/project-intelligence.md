@@ -899,6 +899,80 @@ dedupe)、`open_questions` JSON のエントリに `qa_id` を付与する。ま
 共有スキーマ: `InterviewQA` / `InterviewQaEvidenceRef` / `InterviewQaAnswerOut`
 （[shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json)）。
 
+## Q&A パネル回答の理解レビューへの還流とゲート拡張(Issue #263)
+
+#129 の Q&A パネル(`interview_qa`)経由の回答は、対話ターン
+(`generate_interview_turn`)のプロンプトには `answered_qa` / `unconfirmed_qa`
+として注入されていたが、`update-understanding` が呼ぶ理解レビュー
+(`generate_understanding_review`)には一切渡っていなかった。パネルでのみ
+回答された質問は `interview_message` に書かれないため、対話ターンを経由
+しない限り理解に反映されない欠落があった。
+
+- **共有ヘルパー**: `routes/interview.py::_load_qa_pairs(conn, session_id,
+  system_id)` が、対話ターンにインライン実装されていた `answered_qa` /
+  `unconfirmed_qa` の取得・整形(#129/#142 と同じ SQL・同じ shape)を1箇所に
+  切り出し、対話ターンと `update-understanding` の両方が同じ関数を呼ぶ。
+  整形ルール自体は変更しない。
+- **理解レビューへの注入**: `generate_understanding_review` が
+  `answered_qa` / `unconfirmed_qa` を任意引数として受け取り、
+  `interview_agent._trim_json` と同じ JSON-trim 方式(新設の
+  `system_understanding_reviewer._trim_json` /
+  `QA_PROMPT_MAX_CHARS = 4_000`、`interview_agent.GAP_AND_QUESTION_MAX_CHARS`
+  と同じ予算)でプロンプトに追加する。プロンプトが変わるため
+  `PROMPT_VERSION` を `understanding-review-v3` から `understanding-review-v4`
+  に上げる(Principle 7 の監査可能性)。
+- **確定後ゲートの拡張**: `update-understanding` の 409 ゲートは、これまで
+  `answers_revised_at`(訂正パスでのみセット)だけを見ていたため、確定後の
+  **初回**回答や、確定後に新規発行された Runtime Reality Check 質問への回答は
+  ゲートを開かなかった。決定的な構造チェック(Principle 6、日時/行存在の
+  比較のみ)として、そのセッションの `interview_qa` に
+  `created_at > understanding_confirmed_at` または
+  `answered_at > understanding_confirmed_at` の行が1件でもあれば
+  `answers_revised_at` と同様に再構築を許可する。該当行が無ければ
+  従来どおり 409 のまま(ヒューリスティックや自由文解釈は行わない)。
+
+**含まない:** 409 のレスポンス形状変更、無効化ボタンなどの UI 変更、ターン
+ごとの `current_understanding` 差分更新、`understanding_graph._is_similar_name`
+の変更(いずれも Issue #229 のスコープ)。
+
+## 状態に応じた無効操作抑止の完了(Issue #229)
+
+Issue #229 の大半(409 構造化・`confirm-understanding` の role 分離・
+`理解を更新`/`差分を生成`/`実態チェックを実行`/`差分を開く` の disabled+理由
+表示)は commit `35f1bbc`ですでに実装済みだった。#263 が確定後ゲートを
+「`answers_revised_at` のみ」から「確認済み時刻以降に作成/回答された
+`interview_qa` 行の有無」へ拡張した際、Dashboard 側の disabled 条件
+(`answers_revised_at` のみを見るローカル判定)は追随していなかった —
+Q&A パネルのみで初回回答した場合や新規 Runtime Reality Check 質問に回答した
+場合、サーバーは 200 を返すのに UI は無効のまま、というズレが残っていた。
+
+- **単一の判定関数**: `routes/interview.py::_understanding_update_blocked(conn,
+  session, system_id)` が、`update-understanding` の 409 チェックと
+  `InterviewSessionOut.understanding_update_available` の両方から呼ばれる
+  唯一の判定になった(以前は 409 チェック内にインライン実装されていた
+  #263 拡張後の SQL をそのまま関数へ抽出しただけで、判定ルール自体は変更
+  していない)。決定的な stage/timestamp/行存在チェックのみ(Principle 6)。
+- **セッションシリアライザへの反映**: `_session_out` は `conn` を受け取るように
+  なり(全 14 箇所の呼び出しを更新)、`understanding_update_available: bool`
+  を返す。これにより Dashboard は 409 になるかどうかをローカルで再計算せず、
+  サーバーが計算した同じ値を読むだけになる。
+- **Dashboard**: `pages/interview.tsx` の `canRefreshUnderstanding` は
+  `session.understanding_update_available` を直接使う(以前の
+  `answers_revised_at` のみのローカル判定を置き換え)。理由文言・title は
+  「新しい回答(修正・追加回答)がある場合にのみ、理解を再構築できます」に
+  更新し、修正だけでなく初回回答/Reality Check 回答でも開くことを示す。
+- **エラー表面化(項目C)**: `generate_understanding_review` はスキーマ検証
+  失敗時、リトライ後も失敗した場合は catalog メッセージ
+  (`invalid_review_response`)を返す実装がすでに存在し、生の Pydantic
+  `ValidationError` 文字列が session の `last_error` に漏れることはない
+  (回帰テストを追加して固定)。409 応答はすでに構造化されている
+  (`code` / `message` / `next_action`)。
+
+**含まない:** `understanding_update_not_available` 応答へ新しいフィールドを
+追加すること、`ApiError.code`/`nextAction` を使った専用のエラー UI(現状は
+disabled 化で 409 パスにほぼ到達しないため、既存のトースト表示のままで
+充分と判断)。
+
 ## サーバー生成固定文言の INTERVIEW_LANGUAGE 対応(Issue #138)
 
 #127 は LLM 生成テキストの出力言語を `INTERVIEW_LANGUAGE`(既定 `ja`)に従わせたが、
@@ -2123,3 +2197,56 @@ POST /candidate-versions/{id}/promote        Experiment 引き渡し payload
 
 LLM のみでの自動採用、任意コードの本番プロセスへの動的配布・実行、対象リポジトリの
 自動編集、本番相当性の保証、live shadow SDK の動的候補ロード。
+
+## フェーズ0(System 作成前)の状態案内(Issue #265)
+
+`GET /system-state` を土台にした案内スタック(6 フェーズ、`PrerequisiteGuide`、
+`DiagnosticsBadge`)は、いずれも `X-Probe-System-Id` を要求するため、ログイン前
+および「System が 0 件」の状態では一切機能しない。0 admin(初回ブートでまだ
+`CONTROL_ADMIN_USERNAME`/`CONTROL_ADMIN_PASSWORD` が設定・再起動されていない)
+状態からは UI/API 経由で管理者を作成する手段が無く(`POST /users` は admin 専用)、
+ログイン画面はその案内すら出していなかった。
+
+- **`GET /auth/bootstrap-status`**(`app/bootstrap_status.py`、
+  `routes/auth.py`): 認証なし・System なしで呼べる、唯一の決定的な事実だけを
+  返すエンドポイント。`admin_exists`(`role='admin' AND is_active=1` の行の
+  有無。`system_diagnostics._check_auth_scope` の「0 admin」判定は system_id
+  付きで *任意ユーザー* の有無を見るのに対し、こちらは system_id を取らない
+  独立ヘルパーで、判定対象も admin ロールに絞っている)、`auth_mode`
+  (`auth.auth_enabled()` と同じ判定を `"anonymous" | "user"` で表現)、
+  `llm_configured`(`LLM_PROVIDER` が既知の値か、`mock` か、鍵環境変数が
+  *存在するか* だけを見る -- 値の検証はしない)、`environment`
+  (`environment.control_env()` -- Issue #225 の本番判定をそのまま流用)の
+  4 つの bool/finite token のみを返す。ユーザー名・鍵の値・パス・ホスト名は
+  一切含まない。`KNOWN_PROVIDERS` は `system_diagnostics.py` の重複定義を
+  `llm.py` に一本化し、両方がそこから import する。
+- **ログイン画面**(`pages/login.tsx`): `admin_exists=false` のとき、ログイン
+  フォームの代わりに(すでに存在しない admin では絶対に成功しない画面を出して
+  も意味が無いため)、環境変数 `CONTROL_ADMIN_USERNAME`/`CONTROL_ADMIN_PASSWORD`
+  を設定して Control Server を再起動する、という静的な案内を表示する。この
+  文言は純粋にクライアント側固定文字列(サーバーから配信される copy ではない)
+  なので #240/#266 の方針どおり `state_messages.py` には追加せず、そのまま
+  日本語で `login.tsx` に置く。Issue #225 の fail-closed 本番方針との整合として、
+  `environment=production` のときは具体的な環境変数名を出さず
+  (`login-bootstrap-guide-production`)、「システム管理者に問い合わせてください」
+  という一般化した文言のみを出す -- 本番で未認証の任意の呼び出し元に、内部の
+  設定手順(変数名)を晒さないため。`llm_configured=false` の場合は開発環境の
+  案内の中に、LLM_PROVIDER/LLM_API_KEY も合わせて設定する旨の補足を出す
+  (blocking ではない)。
+- **0 System の空状態**: ヘッダー(`components/layout/header.tsx`)は
+  `systems.length === 0` のとき、アイコンのみの「+」ボタン(見落としやすい
+  死角だった)をやめ、「System が未作成です」というテキストと「System を作成」
+  というラベル付きボタンを表示する。Overview(`pages/overview.tsx`)は
+  Components カード内で、0-*components*(既存、Issue #212)とは別の分岐として
+  `systems.length === 0` を先に判定し、System 作成へ誘導する文言のみを表示する
+  (System スコープの get-started リストは System が無ければ無意味なため)。
+  Settings(`pages/settings.tsx`)は、これまで見出しだけの空白画面だったのを、
+  `connect-sdk.tsx` の no-System 案内文と同じパターン(`<p>` + `data-testid`)
+  で修正し、System が 1 件以上あるが未選択の場合の文言も追加した。
+- ここでの分岐はすべて決定的な有無判定(Principle 6)であり、新しい
+  `user_phase` 値は追加しない -- `user_phase`/`phases` は System 選択後にしか
+  評価できない既存の仕組みのままで、フェーズ0はこのエンドポイントとクライアント
+  側の表示分岐だけで完結する。
+
+**含まない:** UI からの管理者作成・signup フロー(env + restart のブート方式は
+そのまま)、LLM 設定を書き込む UI(表示・診断のみ)、新しい DB テーブル。

@@ -29,6 +29,11 @@ type NavItem = {
   // replacement, instead of being removed or given a new landing page.
   legacy?: boolean;
   title?: string;
+  // Issue #267 item 11: a short usage-distinction subtext shown under the
+  // label (currently only populated for "Observe & Evaluate" -- several of
+  // its 7 pages look similar at a glance, e.g. Simulation Workbench vs AI
+  // Candidate Studio).
+  subtitle?: string;
 };
 
 // Issue #257: a group carries `phases` only when it has phase meaning.
@@ -83,13 +88,34 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       // Issue #257 label improvement: "Components" alone didn't say this is
       // also the trace/observation view.
-      { to: "/components", icon: Boxes, label: "Components / Traces" },
-      { to: "/trace-lineage", icon: GitFork, label: "Trace Lineage" },
-      { to: "/trace-analyzers", icon: Filter, label: "Trace Analyzers" },
-      { to: "/experiments", icon: FlaskConical, label: "Experiments" },
-      { to: "/simulation-workbench", icon: Beaker, label: "Simulation Workbench" },
-      { to: "/candidate-studio", icon: Bot, label: "AI Candidate Studio" },
-      { to: "/workspaces", icon: MessageSquare, label: "Decision Workspace" },
+      {
+        to: "/components", icon: Boxes, label: "Components / Traces",
+        subtitle: "Trace記録とpolicy切替",
+      },
+      {
+        to: "/trace-lineage", icon: GitFork, label: "Trace Lineage",
+        subtitle: "Traceのつながりを俯瞰",
+      },
+      {
+        to: "/trace-analyzers", icon: Filter, label: "Trace Analyzers",
+        subtitle: "パターン抽出とshadow diff検出",
+      },
+      {
+        to: "/experiments", icon: FlaskConical, label: "Experiments",
+        subtitle: "候補のバッチ実行と評価",
+      },
+      {
+        to: "/simulation-workbench", icon: Beaker, label: "Simulation Workbench",
+        subtitle: "手動でdiffを編集して検証",
+      },
+      {
+        to: "/candidate-studio", icon: Bot, label: "AI Candidate Studio",
+        subtitle: "会話でAIに指示して候補生成",
+      },
+      {
+        to: "/workspaces", icon: MessageSquare, label: "Decision Workspace",
+        subtitle: "意思決定の記録と提案レビュー",
+      },
     ],
   },
   {
@@ -228,14 +254,25 @@ export function Sidebar() {
                   >
                     <item.icon className="h-4 w-4 shrink-0" />
                     {!collapsed && (
-                      <span className="flex items-center gap-1.5">
-                        <span>{item.label}</span>
-                        {item.legacy && (
+                      <span className="flex flex-col min-w-0">
+                        <span className="flex items-center gap-1.5">
+                          <span>{item.label}</span>
+                          {item.legacy && (
+                            <span
+                              className="rounded bg-muted px-1 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground"
+                              data-testid="sidebar-legacy-badge"
+                            >
+                              Legacy
+                            </span>
+                          )}
+                        </span>
+                        {/* Issue #267 item 11: usage-distinction subtext. */}
+                        {item.subtitle && (
                           <span
-                            className="rounded bg-muted px-1 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground"
-                            data-testid="sidebar-legacy-badge"
+                            className="truncate text-[11px] font-normal normal-case tracking-normal text-muted-foreground/80"
+                            data-testid={`sidebar-item-subtitle-${item.to.replace(/\//g, "")}`}
                           >
-                            Legacy
+                            {item.subtitle}
                           </span>
                         )}
                       </span>

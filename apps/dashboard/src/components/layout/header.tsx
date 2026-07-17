@@ -65,7 +65,7 @@ export function Header() {
   return (
     <header className="flex items-center justify-between border-b bg-card px-6 h-14">
       <div className="flex items-center gap-3">
-        {systems.length > 0 && (
+        {systems.length > 0 ? (
           <Select
             value={String(systemId ?? "")}
             onChange={(e) => selectSystem(Number(e.target.value))}
@@ -77,9 +77,24 @@ export function Header() {
               </option>
             ))}
           </Select>
+        ) : (
+          // Issue #265: previously this was a lone icon-only "+" button with
+          // no indication anything was missing -- a dead end for a
+          // brand-new install with zero Systems. Make the empty state and
+          // the path out of it explicit.
+          <span className="text-sm text-muted-foreground" data-testid="header-no-systems-hint">
+            System が未作成です。
+          </span>
         )}
-        <Button variant="ghost" size="icon" onClick={() => setShowCreate(true)} title="New system">
+        <Button
+          variant={systems.length === 0 ? "default" : "ghost"}
+          size={systems.length === 0 ? "sm" : "icon"}
+          onClick={() => setShowCreate(true)}
+          title="New system"
+          data-testid="header-create-system-button"
+        >
           <Plus className="h-4 w-4" />
+          {systems.length === 0 && <span className="ml-1">System を作成</span>}
         </Button>
       </div>
 

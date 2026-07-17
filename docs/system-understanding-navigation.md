@@ -13,6 +13,15 @@
 | Probe Flow | 観測点の候補、観測理由、mode、risk、次の実験への接続 |
 | Feature | ユーザー価値・業務フローとして見た機能 |
 
+**日英対応・初出併記の方針（Issue #266）**: この表の用語は英語の正式名称を
+そのまま用語として使い、意味・説明文は日本語で書く（初出のみ併記、以降は
+英語表記のみで通す）。Dashboard の UI コピー全般に適用される日本語統一方針
+（`CLAUDE.md` の「Dashboard UI言語規約」、`.claude/skills/dashboard/SKILL.md`）
+は、この用語表がすでに実践しているスタイル——固有名詞・技術識別子
+（System / Trace / Replay / Experiment / Snapshot / Capability / Feature 等）
+は英語のまま、周辺の説明・ボタン文言・見出しは日本語——を Dashboard 画面全体
+に一般化したものであり、新しい語彙規則を導入するものではない。
+
 ### Feature と Capability の違い
 
 ```text

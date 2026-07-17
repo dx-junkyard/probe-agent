@@ -948,13 +948,18 @@ export default function InterviewPage() {
   const uiState: InterviewUiState | null = session ? deriveUiState(session, building) : null;
   const unlocked = session ? proposalsUnlocked(session) : false;
   // A confirmed proposal-stage session is already at its next workflow step.
-  // Rebuild only after a Q&A correction has marked the understanding stale.
+  // Rebuild only once new developer input (an answer correction, or a
+  // first-time / Runtime-Reality-Check Q&A answer given after confirmation)
+  // is waiting to be reflected. `understanding_update_available` is the
+  // server's own evaluation of this same condition (Issue #229/#263's
+  // shared `_understanding_update_blocked` predicate) so this flag can never
+  // drift from what `update-understanding` will actually accept.
+  const canRefreshUnderstanding = session ? session.understanding_update_available : true;
   const refreshBlockedUntilAnswerRevision = (
     isProposalStage
     && session?.understanding_confirmed_at != null
-    && !session.answers_revised_at
+    && !canRefreshUnderstanding
   );
-  const canRefreshUnderstanding = !refreshBlockedUntilAnswerRevision;
   const purposeFixHighlight = useDiagnosticHighlight<HTMLDivElement>("interview-purpose");
   const capabilitiesFixHighlight = useDiagnosticHighlight<HTMLDivElement>("interview-capabilities");
   // 提案ステージで未回答の絞り込み質問が残っている状態。提案生成を依頼しても
@@ -1877,7 +1882,7 @@ git commit`}
                       onClick={refreshUnderstanding}
                       disabled={building || !canRefreshUnderstanding}
                       title={refreshBlockedUntilAnswerRevision
-                        ? "回答を修正した場合にのみ、理解を再構築できます"
+                        ? "新しい回答(修正・追加回答)がある場合にのみ、理解を再構築できます"
                         : undefined}
                     >
                       <Sparkles className="h-4 w-4 mr-1" />
@@ -1889,7 +1894,7 @@ git commit`}
                       className="mt-2 text-xs text-muted-foreground"
                       data-testid="understanding-refresh-blocked-reason"
                     >
-                      理解は確認済みです。次は提案を生成またはレビューしてください。内容を変える場合は、先に回答を修正すると理解を更新できます。
+                      理解は確認済みです。次は提案を生成またはレビューしてください。内容を変える場合は、回答を修正するか、未回答の質問に新しく回答すると理解を更新できます。
                     </p>
                   )}
                 </CardHeader>

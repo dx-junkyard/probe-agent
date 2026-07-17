@@ -1912,6 +1912,20 @@ class MeResponse(BaseModel):
     system_id: Optional[int] = None
 
 
+class BootstrapStatusOut(BaseModel):
+    """Issue #265: deterministic pre-login / pre-System "phase 0" facts.
+
+    Callable without auth and without a System. Carries no secrets --
+    booleans/finite tokens only, never a username, key value, path, or
+    hostname.
+    """
+
+    admin_exists: bool
+    auth_mode: str = Field(..., description="anonymous | user")
+    llm_configured: bool
+    environment: str = Field(..., description="development | production")
+
+
 class TokenCreate(BaseModel):
     name: Optional[str] = None
     system_id: Optional[int] = None
@@ -2334,6 +2348,12 @@ class InterviewSessionOut(BaseModel):
     # Never cleared automatically by the revision itself — only a successful
     # understanding rebuild (update-understanding) clears it.
     answers_revised_at: Optional[float] = None
+    # Issue #229/#263: deterministic mirror of the update-understanding 409
+    # gate (`routes.interview._understanding_update_blocked`) — the single
+    # source of truth for both. The Dashboard uses this instead of
+    # re-deriving the confirmed-proposal-stage rebuild condition locally, so
+    # UI availability can never drift from what the API will actually allow.
+    understanding_update_available: bool = True
     materialization_diff: Optional[str] = None
     materialization_ref: Optional[str] = None
     materialized_at: Optional[float] = None

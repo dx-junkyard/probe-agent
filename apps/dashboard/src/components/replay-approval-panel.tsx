@@ -27,17 +27,17 @@ export function ApprovalPanel({ componentId }: { componentId: string }) {
     return (
       <div className="rounded-md border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 p-3 text-xs space-y-2">
         <p className="font-medium text-amber-900 dark:text-amber-100">
-          Replay is not approved for "{componentId}" -- runs are blocked until a human approves it.
+          「{componentId}」のReplayは未承認です -- 人による承認があるまで実行はブロックされます。
         </p>
         <p className="text-muted-foreground">
-          Next step: review the risk context and approve replay for this component.
+          次の一歩: リスクの内容を確認し、このcomponentのReplayを承認してください。
         </p>
         <Button size="sm" onClick={() => setConfirmOpen(true)}>
-          Review &amp; Approve
+          確認して承認する
         </Button>
         <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
           <DialogHeader>
-            <DialogTitle>Approve replay for "{componentId}"</DialogTitle>
+            <DialogTitle>「{componentId}」のReplayを承認する</DialogTitle>
           </DialogHeader>
           <div className="space-y-3 text-sm">
             <p className="text-muted-foreground">{approvalState.risk_context.warning}</p>
@@ -52,11 +52,11 @@ export function ApprovalPanel({ componentId }: { componentId: string }) {
               </ul>
             )}
             <div className="space-y-1">
-              <Label>Reason</Label>
+              <Label>承認理由</Label>
               <Input
                 value={reason}
                 onChange={(e) => setReason(e.target.value)}
-                placeholder="Why is replay safe to approve for this component?"
+                placeholder="このcomponentのReplayがなぜ安全か"
               />
             </div>
             <Button
@@ -65,7 +65,7 @@ export function ApprovalPanel({ componentId }: { componentId: string }) {
               onClick={async () => {
                 try {
                   await approve.mutateAsync({ componentId, reason: reason.trim() });
-                  toast.success("Replay approved");
+                  toast.success("Replayを承認しました");
                   setConfirmOpen(false);
                   setReason("");
                 } catch (e) {
@@ -73,7 +73,7 @@ export function ApprovalPanel({ componentId }: { componentId: string }) {
                 }
               }}
             >
-              {approve.isPending ? "Approving..." : "Approve"}
+              {approve.isPending ? "承認中..." : "承認する"}
             </Button>
           </div>
         </Dialog>
@@ -83,19 +83,19 @@ export function ApprovalPanel({ componentId }: { componentId: string }) {
 
   return (
     <div className="flex items-center justify-between rounded-md border p-2 text-xs">
-      <span className="text-muted-foreground">Replay approved for "{componentId}".</span>
+      <span className="text-muted-foreground">「{componentId}」のReplayは承認済みです。</span>
       <Button
         size="sm"
         variant="outline"
         onClick={() =>
           revoke
             .mutateAsync(componentId)
-            .then(() => toast.success("Approval revoked"))
+            .then(() => toast.success("承認を取り消しました"))
             .catch((e) => toast.error(String(e)))
         }
         disabled={revoke.isPending}
       >
-        Revoke
+        承認を取り消す
       </Button>
     </div>
   );

@@ -106,14 +106,14 @@ describe("Components page trace details", () => {
     );
 
     const detailsButton = await screen.findByRole("button", {
-      name: "Show signal details for trace trace-1234567890",
+      name: "Trace trace-1234567890 の詳細を表示",
     });
     expect(screen.queryByText("ValidationError: missing customer")).not.toBeInTheDocument();
 
     fireEvent.click(detailsButton);
 
     expect(screen.getByRole("button", {
-      name: "Hide signal details for trace trace-1234567890",
+      name: "Trace trace-1234567890 の詳細を隠す",
     })).toHaveAttribute("aria-expanded", "true");
     fireEvent.click(screen.getByRole("button", { name: /0.*object/ }));
     expect(screen.getByText(/order-42/)).toBeInTheDocument();
@@ -1974,6 +1974,10 @@ function interviewSession(overrides: Record<string, unknown> = {}) {
     last_error: null,
     understanding_confirmed_at: 3,
     understanding_confirmed_by: "admin",
+    // Issue #229: mirrors the server's update-understanding gate. Defaults
+    // to blocked, matching this session's default confirmed/no-revision
+    // shape; tests exercising the unblocked path override it explicitly.
+    understanding_update_available: false,
     materialization_diff: null,
     materialization_ref: null,
     materialized_at: null,
@@ -2360,7 +2364,7 @@ describe("Interview page", () => {
 
   test("shows 'your answer correction was reflected' after rebuilding from a revised answer (Issue #136)", async () => {
     mockInterviewApi({
-      session: { answers_revised_at: 123 },
+      session: { answers_revised_at: 123, understanding_update_available: true },
       understandingDiff: {
         session_id: 7,
         system_id: 1,
@@ -2372,7 +2376,11 @@ describe("Interview page", () => {
     });
     mockApi.post.mockImplementation((path: string) => {
       if (path === "/interview/sessions/7/update-understanding") {
-        return Promise.resolve(interviewSession({ answers_revised_at: null, last_error: null }));
+        return Promise.resolve(interviewSession({
+          answers_revised_at: null,
+          last_error: null,
+          understanding_update_available: false,
+        }));
       }
       return Promise.resolve({ id: 1, decision: "approved", decision_method: "manual" });
     });
@@ -2415,10 +2423,39 @@ describe("Interview page", () => {
 
     const refreshButton = await screen.findByRole("button", { name: /理解を更新/ });
     expect(refreshButton).toBeDisabled();
-    expect(refreshButton).toHaveAttribute("title", "回答を修正した場合にのみ、理解を再構築できます");
+    expect(refreshButton).toHaveAttribute(
+      "title", "新しい回答(修正・追加回答)がある場合にのみ、理解を再構築できます",
+    );
     expect(await screen.findByTestId("understanding-refresh-blocked-reason"))
       .toHaveTextContent("次は提案を生成またはレビューしてください");
     expect(screen.getByTestId("next-action")).toHaveTextContent("各提案を承認・編集・却下してください");
+  });
+
+  test("re-enables understanding refresh when the server reports new Q&A activity since confirmation, even without answers_revised_at (Issue #229/#263)", async () => {
+    // The server's understanding_update_available flag (single source of
+    // truth shared with the update-understanding 409 gate) can open from a
+    // first-time Q&A-panel answer or a new Runtime Reality Check answer
+    // given after confirmation -- neither ever sets answers_revised_at. The
+    // Dashboard must trust this server-computed flag rather than
+    // re-deriving availability from answers_revised_at alone.
+    mockInterviewApi({
+      session: { answers_revised_at: null, understanding_update_available: true },
+    });
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const refreshButton = await screen.findByRole("button", { name: /理解を更新/ });
+    expect(refreshButton).not.toBeDisabled();
+    expect(screen.queryByTestId("understanding-refresh-blocked-reason")).not.toBeInTheDocument();
   });
 
   test("shows all evidence read for a turn, even when uncited (Issue #137)", async () => {
@@ -6856,7 +6893,7 @@ describe("GitHub page", () => {
     render(<GithubPage />, { wrapper: createWrapper() });
 
     await waitFor(() =>
-      expect(screen.getByTestId("github-app-configured-badge")).toHaveTextContent("Configured"),
+      expect(screen.getByTestId("github-app-configured-badge")).toHaveTextContent("設定済み"),
     );
   });
 
@@ -6866,7 +6903,7 @@ describe("GitHub page", () => {
     render(<GithubPage />, { wrapper: createWrapper() });
 
     await waitFor(() =>
-      expect(screen.getByTestId("github-app-configured-badge")).toHaveTextContent("Not configured"),
+      expect(screen.getByTestId("github-app-configured-badge")).toHaveTextContent("未設定"),
     );
     expect(screen.getByText("GITHUB_APP_ID")).toBeInTheDocument();
     expect(screen.getByTestId("new-connection-button")).toBeDisabled();
@@ -6928,7 +6965,30 @@ describe("GitHub page", () => {
     expect(screen.getByTestId("publish-job-cancel-button")).toBeInTheDocument();
     // The confirmation dialog shows the publish target before approving.
     fireEvent.click(screen.getByTestId("publish-job-approve-button"));
-    expect(await screen.findByText("Approve publish")).toBeInTheDocument();
+    expect(await screen.findByText("Publishを承認")).toBeInTheDocument();
+    expect(screen.getByTestId("publish-job-confirm-approve-button")).toBeInTheDocument();
+  });
+
+  test("approval confirmation dialog shows the patch diff alongside the approve action (Issue #264)", async () => {
+    mockGithubData({
+      connections: [connectionFixture],
+      jobs: [jobFixture({ id: 3, status: "awaiting_approval" })],
+      patches: [patchFixture],
+    });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-3")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("publish-job-3"));
+    fireEvent.click(await screen.findByTestId("publish-job-approve-button"));
+
+    // The confirmation dialog is on screen at the same time as the diff and
+    // the approve action -- the diff must not only exist in the parent
+    // dialog, which is covered by the confirmation overlay.
+    expect(await screen.findByText("Publishを承認")).toBeInTheDocument();
+    const confirmDiff = await screen.findByTestId("publish-job-confirm-diff");
+    expect(confirmDiff).toHaveTextContent(patchFixture.diff);
     expect(screen.getByTestId("publish-job-confirm-approve-button")).toBeInTheDocument();
   });
 
@@ -7201,7 +7261,7 @@ describe("Components trace row: Replay actions (Issue #246)", () => {
       </QueryClientProvider>,
     );
     const expandButton = await screen.findByRole("button", {
-      name: "Show signal details for trace trace-replayable-0001",
+      name: "Trace trace-replayable-0001 の詳細を表示",
     });
     fireEvent.click(expandButton);
     return within(expandButton.closest("tr")!.nextElementSibling as HTMLElement);
@@ -7227,15 +7287,15 @@ describe("Components trace row: Replay actions (Issue #246)", () => {
     expect(unreplayableBadge).toHaveAttribute("title", "Reasons: size_limit_exceeded");
 
     const expandButton = await screen.findByRole("button", {
-      name: "Show signal details for trace trace-replayable-0001",
+      name: "Trace trace-replayable-0001 の詳細を表示",
     });
     fireEvent.click(expandButton);
     const row = within(expandButton.closest("tr")!.nextElementSibling as HTMLElement);
 
     expect(row.getByText("Replay")).toBeInTheDocument();
-    expect(row.getByText("Add to Replay Set")).toBeInTheDocument();
-    expect(row.getByText("Create Experiment")).toBeInTheDocument();
-    expect(row.getByText("Add to Workspace")).toBeInTheDocument();
+    expect(row.getByText("Replay Setに追加")).toBeInTheDocument();
+    expect(row.getByText("Experimentを作成")).toBeInTheDocument();
+    expect(row.getByText("Workspaceに追加")).toBeInTheDocument();
   });
 
   test("Replay adds the trace to a new Replay Set and navigates to the Workbench", async () => {
@@ -7269,8 +7329,8 @@ describe("Components trace row: Replay actions (Issue #246)", () => {
       trace_ids: ["trace-replayable-0001"], traces: [], created_at: 1,
     });
 
-    fireEvent.click(row.getByText("Add to Replay Set"));
-    fireEvent.click(await screen.findByText("Add", { selector: "button" }));
+    fireEvent.click(row.getByText("Replay Setに追加"));
+    fireEvent.click(await screen.findByText("追加", { selector: "button" }));
 
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith("/replay-sets", expect.objectContaining({
@@ -7283,7 +7343,7 @@ describe("Components trace row: Replay actions (Issue #246)", () => {
 
   test("Create Experiment from this trace routes to Experiments with prefilled context", async () => {
     const row = await renderExpanded();
-    fireEvent.click(row.getByText("Create Experiment"));
+    fireEvent.click(row.getByText("Experimentを作成"));
 
     await waitFor(() => {
       expect(screen.getByText(/Prefilled context from trace/)).toBeInTheDocument();
@@ -7433,7 +7493,7 @@ describe("Simulation Workbench (Issue #246)", () => {
     });
 
     // Simulation disclaimer is always shown alongside the results.
-    expect(screen.getByText(/Simulation only/)).toBeInTheDocument();
+    expect(screen.getByText(/シミュレーションのみ/)).toBeInTheDocument();
 
     // The diff matrix distinguishes match / diff / candidate error / rescued.
     await waitFor(() => {
@@ -7444,7 +7504,7 @@ describe("Simulation Workbench (Issue #246)", () => {
     expect(screen.getByText("rescued")).toBeInTheDocument();
 
     // The unreplayable trace's next-step guidance is shown in the left pane.
-    expect(screen.getByText(/Next step: pick a different trace, or adjust replay_capture/)).toBeInTheDocument();
+    expect(screen.getByText(/次の一歩: 別のTraceを選ぶか/)).toBeInTheDocument();
   });
 
   test("unapproved component shows the not-approved next step and Approve posts", async () => {
@@ -7452,13 +7512,13 @@ describe("Simulation Workbench (Issue #246)", () => {
     await renderWorkbenchAt("/simulation-workbench?replay_set_id=1");
 
     await waitFor(() => {
-      expect(screen.getByText(/Replay is not approved for "norm"/)).toBeInTheDocument();
+      expect(screen.getByText(/「norm」のReplayは未承認です/)).toBeInTheDocument();
     });
-    expect(screen.getByText(/Next step: review the risk context and approve/)).toBeInTheDocument();
+    expect(screen.getByText(/次の一歩: リスクの内容を確認し/)).toBeInTheDocument();
 
-    fireEvent.click(screen.getByText("Review & Approve"));
+    fireEvent.click(screen.getByText("確認して承認する"));
     fireEvent.change(
-      await screen.findByPlaceholderText("Why is replay safe to approve for this component?"),
+      await screen.findByPlaceholderText("このcomponentのReplayがなぜ安全か"),
       { target: { value: "It only normalizes text." } },
     );
     mockApi.post.mockResolvedValue({
@@ -7466,7 +7526,7 @@ describe("Simulation Workbench (Issue #246)", () => {
       approved_by_user_id: 1, decision_method: "manual", risk_context: null, created_at: 1,
       revoked_at: null, revoked_by_user_id: null,
     });
-    fireEvent.click(screen.getByText("Approve", { selector: "button" }));
+    fireEvent.click(screen.getByText("承認する", { selector: "button" }));
 
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith(
@@ -7483,7 +7543,7 @@ describe("Simulation Workbench (Issue #246)", () => {
     fireEvent.click(await screen.findByText("LLM draft"));
     fireEvent.change(screen.getByRole("combobox", { name: "Trace for the LLM draft" }), { target: { value: "t1" } });
     fireEvent.change(
-      screen.getByPlaceholderText("What should the candidate do differently?"),
+      screen.getByPlaceholderText("候補コードにどう変わってほしいか"),
       { target: { value: "Uppercase the result" } },
     );
     mockApi.post.mockResolvedValue({
@@ -7495,7 +7555,7 @@ describe("Simulation Workbench (Issue #246)", () => {
       prompt_version: "v1", schema_version: "v1", decision_method: "reasoning_llm",
       is_mock: true, created_at: 1,
     });
-    fireEvent.click(screen.getByText("Generate draft"));
+    fireEvent.click(screen.getByText("Draftを生成"));
 
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith("/replay-variant-drafts", expect.objectContaining({
@@ -7560,7 +7620,7 @@ describe("Simulation Workbench (Issue #246)", () => {
       </QueryClientProvider>,
     );
 
-    const promoteBtn = await screen.findByText('Promote "My candidate"');
+    const promoteBtn = await screen.findByText('「My candidate」をpromote');
     fireEvent.click(promoteBtn);
 
     await waitFor(() => {
@@ -7589,7 +7649,7 @@ describe("Simulation Workbench (Issue #246)", () => {
     });
 
     const generate = await screen.findByRole("button", {
-      name: "Generate regression-test scaffold",
+      name: "回帰テストscaffoldを生成",
     });
     await waitFor(() => expect(generate).toBeEnabled());
     fireEvent.click(generate);
@@ -8355,5 +8415,361 @@ describe("Prerequisite-based action gating (Issue #258)", () => {
     await waitFor(() => expect(aiButton).not.toBeDisabled());
     expect(screen.getByRole("button", { name: "shadow" })).not.toBeDisabled();
     expect(screen.queryByTestId("component-zero-traces-reason")).not.toBeInTheDocument();
+  });
+
+  // ── Issue #267 item 3: mode explanation next to the policy toggle ──
+
+  test("Components: mode toggle shows an explanation of off/trace/shadow and the shadow guarantee", async () => {
+    window.history.pushState({}, "", "/components?component=comp-a");
+    mockApi.get.mockImplementation(
+      componentsGet({ component_id: "comp-a", mode: "trace", trace_count: 5, last_seen: 1000 }),
+    );
+
+    const { default: ComponentsPage } = await import("@/pages/components");
+    render(<ComponentsPage />, { wrapper: createWrapper() });
+
+    const note = await screen.findByTestId("component-mode-explanation");
+    expect(note).toHaveTextContent("本番の戻り値を変更しません");
+  });
+});
+
+// ── Issue #267 item 4: 送信 vs 候補を生成 note in AI Candidate Studio ──
+
+describe("AI Candidate Studio send-vs-generate note (Issue #267)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("shows a note distinguishing 送信 (conversation only) from 候補を生成", async () => {
+    window.history.pushState({}, "", "/candidate-studio?session_id=1");
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/candidate-sessions/1") {
+        return Promise.resolve({
+          id: 1, system_id: 1, component_id: "comp-a", snapshot_id: 1,
+          commit_sha: "abc123", symbol_path: "a.py", symbol_qualified_name: "comp_a",
+          replay_set_id: 1, objective: "improve accuracy",
+          status: "active", created_at: 1, updated_at: 1,
+          messages: [], versions: [],
+        });
+      }
+      if (path.endsWith("/replay-approval")) return Promise.resolve({ active: false });
+      return Promise.resolve(null);
+    });
+
+    const { default: CandidateStudioPage } = await import("@/pages/candidate-studio");
+    render(<CandidateStudioPage />, { wrapper: createWrapper() });
+
+    const note = await screen.findByTestId("candidate-studio-send-vs-generate-note");
+    expect(note).toHaveTextContent("候補versionは作成しません");
+  });
+});
+
+// ── Issue #267 item 10: legacy Generate page banner ─────────────────
+
+describe("Generate page legacy banner (Issue #267)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("points to AI Candidate Studio", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/components") return Promise.resolve([]);
+      if (path === "/generation-runs") return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+
+    const { default: GenerationPage } = await import("@/pages/generation");
+    render(<GenerationPage />, { wrapper: createWrapper() });
+
+    const link = await screen.findByTestId("generation-legacy-banner-link");
+    expect(link).toHaveAttribute("href", "/candidate-studio");
+  });
+});
+
+// ── Issue #267 item 11: Observe & Evaluate sidebar subtexts ─────────
+
+describe("Sidebar Observe & Evaluate subtexts (Issue #267)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("renders a usage-distinction subtext for each of the 7 pages", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-state") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    const { Sidebar } = await import("@/components/layout/sidebar");
+    render(<Sidebar />, { wrapper: createWrapper() });
+
+    const group = screen.getByTestId("sidebar-group-observe-&-evaluate");
+    expect(within(group).getByText("手動でdiffを編集して検証")).toBeInTheDocument();
+    expect(within(group).getByText("会話でAIに指示して候補生成")).toBeInTheDocument();
+  });
+});
+
+// ── Issue #267 items 5-9: GitHub publish workflow UX gaps ───────────
+
+describe("GitHub publish workflow UX gaps (Issue #267)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const connectionFixture267 = {
+    id: 1, system_id: 1,
+    api_base_url: "https://api.github.com", web_base_url: "https://github.com",
+    owner: "acme", repo: "widgets", clone_url: "https://github.com/acme/widgets.git",
+    installation_id: 42, default_branch: "main", credential_type: "github_app",
+    status: "connected", last_error: null, last_synced_at: null, last_synced_commit_sha: null,
+    created_by_user_id: 1, updated_by_user_id: 1,
+    created_at: "2024-01-01T00:00:00Z", updated_at: "2024-01-01T00:00:00Z",
+  };
+
+  function jobFixture267(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 1, system_id: 1, connection_id: 1, patch_id: 20, snapshot_id: 5,
+      base_branch: "main", base_commit_sha: "abc1234567890",
+      branch_name: "probe/publish-1-abc12345", commit_sha: null,
+      pr_url: null, pr_number: null, status: "retryable_failed", error: "temporary network error",
+      validation_summary: null, requested_by_user_id: 1, approved_by_user_id: null,
+      cleanup_state: "not_attempted", cleanup_error: null,
+      created_at: 1700000000, updated_at: 1700000000, approved_at: null, completed_at: null,
+      heartbeat_at: null, retry_count: 1, last_attempt_at: null,
+      ...overrides,
+    };
+  }
+
+  function mockGithubData267(data: {
+    appStatus?: Record<string, unknown>;
+    connections?: Record<string, unknown>[];
+    jobs?: Record<string, unknown>[];
+    installations?: Record<string, unknown>[];
+    events?: Record<string, unknown>[];
+  }) {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/github/app-status") {
+        return Promise.resolve(
+          data.appStatus ?? {
+            configured: false, app_id: null,
+            api_base_url: "https://api.github.com", web_base_url: "https://github.com",
+          },
+        );
+      }
+      if (path === "/github/connections") return Promise.resolve(data.connections ?? []);
+      if (path === "/github/publish-jobs") return Promise.resolve(data.jobs ?? []);
+      if (path === "/repository/probe-patches") return Promise.resolve([]);
+      if (path === "/users") return Promise.resolve([]);
+      if (path === "/github/installations") return Promise.resolve(data.installations ?? []);
+      if (path.endsWith("/events")) return Promise.resolve(data.events ?? []);
+      return Promise.resolve(null);
+    });
+  }
+
+  test("item 9: not-configured banner links to the deployment doc", async () => {
+    mockGithubData267({ appStatus: { configured: false, app_id: null, api_base_url: "https://api.github.com", web_base_url: "https://github.com" } });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    await screen.findByTestId("github-app-configured-badge");
+    expect(screen.getAllByText(/github-app-deployment\.md/).length).toBeGreaterThan(0);
+  });
+
+  test("item 9: installations panel also references the deployment doc", async () => {
+    mockGithubData267({});
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Installations"));
+    expect(await screen.findByText(/github-app-deployment\.md/)).toBeInTheDocument();
+  });
+
+  test("item 6: unassign button calls the unassign endpoint for an assigned installation", async () => {
+    mockGithubData267({
+      installations: [{
+        installation_id: 42, github_account_login: "acme", github_account_type: "Organization",
+        status: "active", registered_by_user_id: 1, verified_at: "2024-01-01",
+        disabled_by_user_id: null, disabled_at: null,
+        created_at: "2024-01-01", updated_at: "2024-01-01",
+        assigned_system_ids: [1],
+      }],
+    });
+    mockApi.delete.mockResolvedValue(undefined);
+
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Installations"));
+    const unassignButton = await screen.findByTestId("installation-42-unassign");
+    fireEvent.click(unassignButton);
+
+    await waitFor(() => {
+      expect(mockApi.delete).toHaveBeenCalledWith("/github/installations/42/systems/1");
+    });
+  });
+
+  test("item 7: manual_intervention_required shows a distinct retry label and a warning note", async () => {
+    mockGithubData267({
+      appStatus: { configured: true, app_id: "1", api_base_url: "https://api.github.com", web_base_url: "https://github.com" },
+      connections: [connectionFixture267],
+      jobs: [jobFixture267({ id: 9, status: "manual_intervention_required", error: "remote branch mismatch" })],
+    });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-9")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("publish-job-9"));
+
+    const retryButton = await screen.findByTestId("publish-job-retry-button");
+    expect(retryButton).toHaveTextContent("再試行(要確認)");
+    expect(await screen.findByTestId("publish-job-manual-intervention-note")).toBeInTheDocument();
+  });
+
+  test("item 7: retryable_failed shows the plain retry label without the warning note", async () => {
+    mockGithubData267({
+      appStatus: { configured: true, app_id: "1", api_base_url: "https://api.github.com", web_base_url: "https://github.com" },
+      connections: [connectionFixture267],
+      jobs: [jobFixture267({ id: 10, status: "retryable_failed" })],
+    });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-10")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("publish-job-10"));
+
+    const retryButton = await screen.findByTestId("publish-job-retry-button");
+    expect(retryButton).toHaveTextContent("再試行");
+    expect(retryButton).not.toHaveTextContent("要確認");
+    expect(screen.queryByTestId("publish-job-manual-intervention-note")).not.toBeInTheDocument();
+  });
+
+  test("item 5: renders the publish job's audit event timeline", async () => {
+    mockGithubData267({
+      appStatus: { configured: true, app_id: "1", api_base_url: "https://api.github.com", web_base_url: "https://github.com" },
+      connections: [connectionFixture267],
+      jobs: [jobFixture267({ id: 11, status: "completed" })],
+      events: [
+        { id: 1, job_id: 11, connection_id: 1, event_type: "status_changed:pending", actor_user_id: null, detail: null, created_at: 1700000000 },
+        { id: 2, job_id: 11, connection_id: 1, event_type: "retry_requested", actor_user_id: 1, detail: { reason: "manual" }, created_at: 1700000100 },
+      ],
+    });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-11")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("publish-job-11"));
+
+    const timeline = await screen.findByTestId("publish-job-events");
+    fireEvent.click(within(timeline).getByText(/イベント履歴/));
+    expect(await screen.findByTestId("publish-job-event-1")).toHaveTextContent("status_changed:pending");
+    expect(screen.getByTestId("publish-job-event-2")).toHaveTextContent("retry_requested");
+  });
+
+  test("item 5: shows an empty-state message when there are no events yet", async () => {
+    mockGithubData267({
+      appStatus: { configured: true, app_id: "1", api_base_url: "https://api.github.com", web_base_url: "https://github.com" },
+      connections: [connectionFixture267],
+      jobs: [jobFixture267({ id: 12, status: "completed" })],
+      events: [],
+    });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-12")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("publish-job-12"));
+
+    const timeline = await screen.findByTestId("publish-job-events");
+    expect(within(timeline).getByText("イベントはまだありません。")).toBeInTheDocument();
+  });
+});
+
+// ── Issue #267 items 1-2: Overview get-started per-step completion ──
+
+describe("Overview get-started per-step completion (Issue #267)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+    mockSystems = [{ id: 1, name: "alpha" }];
+  });
+
+  function mockOverview267(data: {
+    snapshot?: unknown;
+    drafts?: unknown;
+    tokens?: unknown[];
+    connectivityState?: string | null;
+  }) {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/components") return Promise.resolve([]);
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "ok",
+        severity_counts: {}, items: [], primary_item: null,
+        notification_items: [], page_items: {},
+      });
+      if (path === "/repository/snapshots/latest") return Promise.resolve(data.snapshot ?? null);
+      if (path === "/repository/drafts/latest") return Promise.resolve(data.drafts ?? { system_profile_draft: null, feature_drafts: [] });
+      if (path === "/tokens/me") return Promise.resolve(data.tokens ?? []);
+      if (path === "/connectivity/status") {
+        return data.connectivityState
+          ? Promise.resolve({
+            system_id: 1, state: data.connectivityState, total_trace_count: 5, smoke_trace_count: 1,
+            real_trace_count: 4, first_trace_at: 1, last_trace_at: 2,
+            last_trace_component_id: "comp", smoke_component_id: "smoke", materialized_session_ids: [],
+          })
+          : Promise.resolve(null);
+      }
+      return Promise.resolve(null);
+    });
+  }
+
+  test("marks step 1 done once a snapshot exists", async () => {
+    mockOverview267({ snapshot: { id: 1, system_id: 1, commit_sha: "abc", created_at: 1 } });
+    const { default: OverviewPage } = await import("@/pages/overview");
+    render(<OverviewPage />, { wrapper: createWrapper() });
+
+    const getStarted = await screen.findByTestId("overview-get-started");
+    const step1 = within(getStarted).getByTestId("overview-link-repository");
+    await waitFor(() => expect(step1).toHaveAttribute("data-done", "true"));
+  });
+
+  test("marks step 2 done once a System Profile Draft exists", async () => {
+    mockOverview267({ drafts: { system_profile_draft: { id: 1 }, feature_drafts: [] } });
+    const { default: OverviewPage } = await import("@/pages/overview");
+    render(<OverviewPage />, { wrapper: createWrapper() });
+
+    const getStarted = await screen.findByTestId("overview-get-started");
+    const step2 = within(getStarted).getByTestId("overview-link-system-understanding");
+    await waitFor(() => expect(step2).toHaveAttribute("data-done", "true"));
+  });
+
+  test("marks step 3 done once at least one SDK token has been issued", async () => {
+    mockOverview267({ tokens: [{ id: 1, name: "svc", kind: "user", created_at: 1, expires_at: null, revoked: false }] });
+    const { default: OverviewPage } = await import("@/pages/overview");
+    render(<OverviewPage />, { wrapper: createWrapper() });
+
+    const getStarted = await screen.findByTestId("overview-get-started");
+    const step3 = within(getStarted).getByTestId("overview-link-connect-sdk");
+    await waitFor(() => expect(step3).toHaveAttribute("data-done", "true"));
+  });
+
+  test("steps 1 and 2 stay not-done and are labeled recommended-not-required when nothing exists yet", async () => {
+    mockOverview267({});
+    const { default: OverviewPage } = await import("@/pages/overview");
+    render(<OverviewPage />, { wrapper: createWrapper() });
+
+    const getStarted = await screen.findByTestId("overview-get-started");
+    const step1 = within(getStarted).getByTestId("overview-link-repository");
+    const step2 = within(getStarted).getByTestId("overview-link-system-understanding");
+    await waitFor(() => expect(step1).toHaveAttribute("data-done", "false"));
+    expect(step2).toHaveAttribute("data-done", "false");
+    expect(within(step1).getByText("推奨(必須ではない)")).toBeInTheDocument();
+    expect(within(step2).getByText("推奨(必須ではない)")).toBeInTheDocument();
+    expect(await screen.findByTestId("overview-get-started-shortest-path-note")).toBeInTheDocument();
   });
 });

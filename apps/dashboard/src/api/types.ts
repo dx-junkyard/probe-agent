@@ -260,6 +260,15 @@ export interface MeResponse {
   system_id: number | null;
 }
 
+// Issue #265: deterministic, credential-free, System-id-free "phase 0"
+// facts from `GET /auth/bootstrap-status`. Never carries a secret.
+export interface BootstrapStatusOut {
+  admin_exists: boolean;
+  auth_mode: "anonymous" | "user";
+  llm_configured: boolean;
+  environment: "development" | "production";
+}
+
 export interface RepositoryConfigOut {
   system_id: number;
   repo_path: string;
@@ -484,6 +493,10 @@ export interface InterviewSessionOut {
   // Issue #129: set when an answered interview_qa question is corrected;
   // cleared only by a successful understanding rebuild.
   answers_revised_at: number | null;
+  // Issue #229/#263: server-computed mirror of the update-understanding 409
+  // gate. Use this instead of re-deriving the confirmed/no-new-QA condition
+  // client-side so the disabled state can never drift from the API.
+  understanding_update_available: boolean;
   materialization_diff: string | null;
   materialization_ref: string | null;
   materialized_at: number | null;

@@ -27,6 +27,13 @@ const SIGNAL_REFRESH_INTERVAL_MS = 2_000;
 const MODE_VARIANT: Record<string, "secondary" | "success" | "warning"> = {
   off: "secondary", trace: "success", shadow: "warning",
 };
+const PROFILE_FIELD_LABELS_JA: Record<string, string> = {
+  purpose: "目的",
+  responsibility: "責務",
+  expected_input: "想定入力",
+  expected_output: "想定出力",
+  failure_impact: "失敗時の影響",
+};
 
 export default function ComponentsPage() {
   const navigate = useNavigate();
@@ -79,7 +86,7 @@ export default function ComponentsPage() {
         created_at: profile?.created_at ?? "",
         updated_at: profile?.updated_at ?? "",
       });
-      toast.success("Profile saved");
+      toast.success("Profileを保存しました");
     } catch (err) { toast.error(String(err)); }
   };
 
@@ -90,7 +97,7 @@ export default function ComponentsPage() {
         {isLoading ? (
           <div className="space-y-2">{[1,2,3].map(i => <Skeleton key={i} className="h-10 w-full" />)}</div>
         ) : !components?.length ? (
-          <p className="text-xs text-muted-foreground px-2 py-4">No components</p>
+          <p className="text-xs text-muted-foreground px-2 py-4">componentがありません</p>
         ) : (
           components.map(c => (
             <button
@@ -114,7 +121,7 @@ export default function ComponentsPage() {
       <div className="flex-1 overflow-y-auto">
         {!selected ? (
           <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
-            Select a component to view details
+            componentを選択すると詳細が表示されます
           </div>
         ) : (
           <div className="space-y-6">
@@ -126,8 +133,8 @@ export default function ComponentsPage() {
                   size="sm"
                   variant="outline"
                   title={zeroTraces
-                    ? "No traces recorded yet for this component — candidate generation needs example inputs/outputs to work from."
-                    : "Start an AI Candidate Studio session for this component"}
+                    ? "このcomponentのTraceがまだ記録されていません — 候補生成には入出力の実例が必要です。"
+                    : "このcomponentのAI Candidate Studioセッションを開始する"}
                   disabled={zeroTraces}
                   onClick={() => navigate(`/candidate-studio?component_id=${encodeURIComponent(selected)}`)}
                 >
@@ -153,7 +160,7 @@ export default function ComponentsPage() {
                       onClick={() => updatePolicy.mutateAsync({ componentId: selected, mode: m }).then(() => toast.success(`Mode: ${m}`)).catch(e => toast.error(String(e)))}
                       disabled={updatePolicy.isPending || shadowBlocked}
                       title={shadowBlocked
-                        ? "Shadow comparison needs recorded traces first — switch to trace mode to start collecting them."
+                        ? "shadow比較には記録済みのTraceが必要です — traceモードに切り替えて収集を開始してください。"
                         : undefined}
                     >
                       {m}
@@ -164,11 +171,21 @@ export default function ComponentsPage() {
             </div>
             {zeroTraces && (
               <p className="text-xs text-muted-foreground" data-testid="component-zero-traces-reason">
-                No traces recorded yet for <span className="font-mono">{selected}</span> — AI candidate
-                generation and shadow mode need example traffic first. Switch to{" "}
-                <span className="font-medium">trace</span> mode to start collecting it.
+                <span className="font-mono">{selected}</span> のTraceはまだ記録されていません —
+                AI候補生成とshadow modeには先に実例のトラフィックが必要です。{" "}
+                <span className="font-medium">trace</span> モードに切り替えて収集を開始してください。
               </p>
             )}
+            {/* Issue #267 item 3: the mode toggle's meaning was previously
+                explained only in the Simulation Workbench's EscalationPanel
+                (Principle 1's shadow guarantee) -- surface the same
+                guarantee here, next to the switch itself. */}
+            <p className="text-xs text-muted-foreground" data-testid="component-mode-explanation">
+              <span className="font-mono">off</span>=記録なし ·{" "}
+              <span className="font-mono">trace</span>=入出力・エラー・durationを記録 ·{" "}
+              <span className="font-mono">shadow</span>=候補実装も並行実行して比較記録。
+              shadow modeは本番の戻り値を変更しません（Principle 1）。
+            </p>
 
             <Tabs defaultValue="traces">
               <TabsList>
@@ -182,7 +199,7 @@ export default function ComponentsPage() {
                 <Card>
                   <CardContent className="pt-6">
                     {!traces?.length ? (
-                      <p className="text-sm text-muted-foreground text-center py-8">No traces yet</p>
+                      <p className="text-sm text-muted-foreground text-center py-8">Traceがまだありません</p>
                     ) : (
                       <div className="overflow-x-auto max-h-96 overflow-y-auto">
                         <table className="w-full text-sm">
@@ -211,7 +228,7 @@ export default function ComponentsPage() {
                                       <button
                                         type="button"
                                         className="inline-flex items-center gap-1 rounded px-1 py-0.5 hover:bg-secondary cursor-pointer"
-                                        aria-label={`${expanded ? "Hide" : "Show"} signal details for trace ${t.trace_id}`}
+                                        aria-label={`Trace ${t.trace_id} の詳細を${expanded ? "隠す" : "表示"}`}
                                         aria-expanded={expanded}
                                         onClick={() => setExpandedTraceId(expanded ? null : t.trace_id)}
                                       >
@@ -234,7 +251,7 @@ export default function ComponentsPage() {
                                       <td colSpan={6} className="p-4">
                                         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
                                           <span className="text-xs text-muted-foreground">
-                                            Full trace ID: <span className="font-mono text-foreground">{t.trace_id}</span>
+                                            Trace ID（全体）: <span className="font-mono text-foreground">{t.trace_id}</span>
                                           </span>
                                           <div className="flex items-center gap-1 flex-wrap">
                                             <ReplayRowActions componentId={selected} traceId={t.trace_id} />
@@ -247,19 +264,19 @@ export default function ComponentsPage() {
                                         </div>
                                         <div className="grid gap-4 lg:grid-cols-2">
                                           <div className="min-w-0">
-                                            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Input</h3>
+                                            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">入力</h3>
                                             <div className="max-h-64 overflow-auto rounded-md border bg-card p-3">
                                               <JsonTree data={t.input} defaultExpanded />
                                             </div>
                                           </div>
                                           <div className="min-w-0">
-                                            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Output</h3>
+                                            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">出力</h3>
                                             <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border bg-card p-3 font-mono text-xs">{t.output ?? "—"}</pre>
                                           </div>
                                         </div>
                                         {t.error && (
                                           <div className="mt-4">
-                                            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-destructive">Error</h3>
+                                            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-destructive">エラー</h3>
                                             <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border border-destructive/40 bg-destructive/5 p-3 font-mono text-xs text-destructive">{t.error}</pre>
                                           </div>
                                         )}
@@ -281,7 +298,7 @@ export default function ComponentsPage() {
                 <Card>
                   <CardContent className="pt-6">
                     {!shadows?.length ? (
-                      <p className="text-sm text-muted-foreground text-center py-8">No shadow results yet</p>
+                      <p className="text-sm text-muted-foreground text-center py-8">Shadow Resultsはまだありません</p>
                     ) : (
                       <div className="space-y-3">
                         {shadows.map(s => (
@@ -304,11 +321,11 @@ export default function ComponentsPage() {
                             </div>
                             <div className="grid gap-2 md:grid-cols-2 text-xs">
                               <div>
-                                <span className="font-medium text-muted-foreground">Current:</span>
+                                <span className="font-medium text-muted-foreground">現在の出力:</span>
                                 <pre className="mt-1 rounded bg-muted p-2 overflow-x-auto max-h-24 overflow-y-auto">{s.current_output ?? "—"}</pre>
                               </div>
                               <div>
-                                <span className="font-medium text-muted-foreground">Candidate:</span>
+                                <span className="font-medium text-muted-foreground">候補の出力:</span>
                                 <pre className="mt-1 rounded bg-muted p-2 overflow-x-auto max-h-24 overflow-y-auto">{s.candidate_output ?? s.candidate_error ?? "—"}</pre>
                               </div>
                             </div>
@@ -328,7 +345,7 @@ export default function ComponentsPage() {
                   <CardContent className="space-y-4">
                     {profileFields.map(f => (
                       <div key={f} className="space-y-2">
-                        <Label className="capitalize">{f.replace("_", " ")}</Label>
+                        <Label>{PROFILE_FIELD_LABELS_JA[f] ?? f}</Label>
                         <Textarea
                           value={getField(f)}
                           onChange={e => setProfForm(prev => ({ ...prev, [f]: e.target.value }))}
@@ -337,7 +354,7 @@ export default function ComponentsPage() {
                       </div>
                     ))}
                     <Button onClick={saveProfile} disabled={updateProfile.isPending}>
-                      {updateProfile.isPending ? "Saving..." : "Save Profile"}
+                      {updateProfile.isPending ? "保存中..." : "Profileを保存"}
                     </Button>
                   </CardContent>
                 </Card>
@@ -350,7 +367,7 @@ export default function ComponentsPage() {
                   </CardHeader>
                   <CardContent>
                     {!criteria?.length ? (
-                      <p className="text-sm text-muted-foreground text-center py-8">No criteria defined</p>
+                      <p className="text-sm text-muted-foreground text-center py-8">Criteriaが未定義です</p>
                     ) : (
                       <div className="space-y-2">
                         {criteria.map(c => (

@@ -242,6 +242,30 @@ The dashboard should support:
   feature-id escape hatch and the generate API are unchanged. Setup Guide now
   also links back to Connect SDK (`setup-guide-connect-sdk-link`), making that
   pair bidirectional. Never derive phase or state copy client-side.
+- **"Phase 0" pre-login / zero-System guidance (Issue #265)**: everything
+  above (`GET /system-state`, `PrerequisiteGuide`, `DiagnosticsBadge`) needs
+  a selected System, so it is all disabled before login and while
+  `systems.length === 0`. `useBootstrapStatus()` (`api/hooks.ts`, `GET
+  /auth/bootstrap-status`) is the one hook not gated on `getSystemId()`, and
+  is the only source for this phase's copy: `pages/login.tsx` replaces the
+  username/password form with static bootstrap instructions
+  (`CONTROL_ADMIN_USERNAME`/`CONTROL_ADMIN_PASSWORD` + restart) when
+  `admin_exists === false`, reducing detail in production
+  (`environment === "production"` hides the specific env var names and
+  shows a generic "ask your administrator" message instead — Issue #225's
+  fail-closed spirit applied to wording, not to the fact itself).
+  `components/layout/header.tsx`, `pages/overview.tsx`, and
+  `pages/settings.tsx` each add an explicit `systems.length === 0` branch
+  (`data-testid`s `header-no-systems-hint`/`header-create-system-button`,
+  `overview-no-systems`, `settings-no-systems-reason`) pointing at the
+  header's "System を作成" control, instead of the icon-only "+" dead end /
+  the System-scoped get-started list / the heading-only blank screen that
+  existed before. This bootstrap copy is purely client-fixed (not returned
+  by the endpoint, which is facts-only), so per the #240/#266 catalog policy
+  it stays plain Japanese literals in the tsx files rather than new
+  `state_messages.py` entries. No new `user_phase` value: phase 0 is
+  client-side display branching on this one endpoint's booleans, layered in
+  front of the existing System-scoped phase model, not a change to it.
 
 - GitHub publish workflow (Issue #216, `pages/github.tsx`, nav item
   "GitHub"): App status card (`GET /github/app-status`; shows a setup hint
@@ -268,6 +292,48 @@ The dashboard should support:
   `awaiting_approval` itself does not poll since it is a stable
   human-wait state, matching the System Understanding build-job polling
   pattern.
+
+## UI Language Convention (Issue #266)
+
+Dashboard-side hardcoded UI copy follows the same Japanese-canonical
+convention as the server's `state_messages.py` catalog (#240). The rule
+(codified in `CLAUDE.md`'s "Dashboard UI言語規約" section): user-visible copy
+is Japanese; technical identifiers/proper nouns (System, Trace, Replay,
+Experiment, Snapshot, Capability, `off`/`trace`/`shadow`, GitHub, PR, branch
+names, HTTP codes, env var names, and established product-concept page/
+feature names) stay as-is.
+
+Operational notes when touching a screen:
+
+- **Same-screen CTA groups must not mix languages.** Before adding or
+  changing a button/toast/heading, check every other user-visible string
+  rendered on the same screen state (including shared components mounted
+  there, e.g. `ApprovalPanel`, `AddToWorkspaceButton`, `ResultMatrix`,
+  `ReplayRowActions`) — translating only the page-local strings while a
+  shared component next to it stays English recreates the same mixing bug.
+- **Constant-coupling**: some client literals are paired with a server
+  catalog key by exact string match, not by API contract. Known pairs:
+  `gap-worklist.tsx`'s `CREATE_ISSUE_ACTION` must stay identical to
+  `state_messages.GAP_CREATE_ISSUE_ACTION`. Before renaming/retranslating any
+  string that also appears in `apps/control-server/app/state_messages.py` (or
+  is compared against a server response elsewhere), grep both sides first.
+- **Finite-set/enum-shaped labels** (case status values like `match`/`diff`/
+  `candidate_error`, replayability values, policy modes) may stay in their
+  English canonical spelling even in an otherwise-Japanese screen — they are
+  technical identifiers, not prose, per the identifier exception above.
+- **Client-side fallback strings** (used only when a server field is missing,
+  e.g. `STEP_LABELS`/`USER_PHASE_LABELS` last-resort maps) must be Japanese
+  too — a fallback is still user-visible copy.
+- Do not touch `apps/control-server/app/state_messages.py` contents for this
+  convention — that catalog is already Japanese and owned by #240; report
+  any genuinely-English leftover found there instead of editing it here.
+- `data-testid`, API field names, schema fields, and log lines are not
+  user-visible copy and are out of scope for this rule.
+- Exhaustive translation of every minor label in a single change is not
+  required; the acceptance bar is that no single screen/CTA group mixes
+  languages. When leaving a string in English for effort reasons, prefer
+  whole uniformly-English pages (no existing Japanese on that screen) over
+  leaving a partial mix.
 
 ## Authentication model
 

@@ -230,6 +230,14 @@ class TestReviewGeneration:
             graph=graph, reconciliation=recon,
         )
         assert result.error is not None
+        # Issue #229: even after the schema-reminder retry also fails, the
+        # session-facing error must stay a catalog message the Dashboard can
+        # show as-is -- never a raw Pydantic ValidationError repr (field
+        # paths, "validation error for...", etc).
+        lowered = result.error.lower()
+        assert "validationerror" not in lowered
+        assert "pydantic" not in lowered
+        assert "field required" not in lowered
 
     def test_llm_error_captured(self):
         graph = _build_graph([_claim()])
@@ -375,6 +383,63 @@ class TestReviewGeneration:
         )
         assert result.error is None
         assert len(result.open_questions) > 0
+
+
+class TestQaInjection:
+    """Issue #263: Q&A-panel answers must reach the understanding review the
+    same way conversational answers already do."""
+
+    def test_prompt_includes_answered_qa(self):
+        graph = _build_graph([_claim()])
+        recon = _empty_reconciliation()
+        answered_qa = [
+            {"question": "What does this system do?", "answer": "It runs probes."}
+        ]
+        prompt = _build_review_prompt(graph, recon, answered_qa=answered_qa)
+        assert "Confirmed Q&A" in prompt
+        assert "What does this system do?" in prompt
+        assert "It runs probes." in prompt
+
+    def test_prompt_includes_unconfirmed_qa(self):
+        graph = _build_graph([_claim()])
+        recon = _empty_reconciliation()
+        unconfirmed_qa = [
+            {"question": "Who owns this component?", "answer": "わかりません"}
+        ]
+        prompt = _build_review_prompt(graph, recon, unconfirmed_qa=unconfirmed_qa)
+        assert "Unconfirmed Q&A" in prompt
+        assert "Who owns this component?" in prompt
+        assert "わかりません" in prompt
+
+    def test_prompt_omits_qa_sections_when_absent(self):
+        graph = _build_graph([_claim()])
+        recon = _empty_reconciliation()
+        prompt = _build_review_prompt(graph, recon)
+        assert "Confirmed Q&A" not in prompt
+        assert "Unconfirmed Q&A" not in prompt
+
+    def test_generate_understanding_review_forwards_qa_to_prompt(self):
+        graph = _build_graph([_claim()])
+        recon = _empty_reconciliation()
+        client = CapturingReasoningClient([VALID_REVIEW_RESPONSE])
+        answered_qa = [{"question": "Panel Q1", "answer": "Panel A1"}]
+        unconfirmed_qa = [{"question": "Panel Q2", "answer": "不明"}]
+
+        result = generate_understanding_review(
+            client, _reasoning_config(),
+            graph=graph, reconciliation=recon,
+            answered_qa=answered_qa, unconfirmed_qa=unconfirmed_qa,
+        )
+
+        assert result.error is None
+        user_prompt = client.calls[0]["messages"][1]["content"]
+        assert "Panel Q1" in user_prompt
+        assert "Panel A1" in user_prompt
+        assert "Panel Q2" in user_prompt
+        assert "不明" in user_prompt
+
+    def test_prompt_version_bumped_for_qa_injection(self):
+        assert PROMPT_VERSION == "understanding-review-v4"
 
 
 class TestEnumValidation:
@@ -524,7 +589,7 @@ class TestOutputLanguage:
         system_msg = client.calls[0]["messages"][0]["content"]
         assert "in Japanese" in system_msg
         assert "enum values" in system_msg
-        assert result.prompt_version == "understanding-review-v3"
+        assert result.prompt_version == "understanding-review-v4"
         assert "review_capabilities" in system_msg
 
     def test_english_directive(self, monkeypatch):

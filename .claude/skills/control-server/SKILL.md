@@ -604,6 +604,22 @@ heuristic result.
   writes one append-only `auth_audit_events` row
   (`event_type='admin_bootstrapped'`); `detail` is structural JSON only,
   never a password or hash.
+- **`GET /auth/bootstrap-status` (Issue #265)**: the one endpoint reachable
+  with no credentials and no System (`app/bootstrap_status.py`,
+  `routes/auth.py`) -- everything else (`GET /system-state`,
+  `system_diagnostics`, and every Dashboard component built on them) needs
+  `X-Probe-System-Id`, so a pre-login / zero-System install had no
+  deterministic state to show. Returns exactly four finite facts:
+  `admin_exists` (a System-id-free `role='admin' AND is_active=1` check,
+  independent from `system_diagnostics._check_auth_scope`'s system-scoped
+  "any active user" check), `auth_mode` (`"anonymous" | "user"`, mirrors
+  `auth.auth_enabled()`), `llm_configured` (env-presence only, never
+  validates the key -- mirrors `_api_key_status`'s presence logic without
+  reusing that private helper), and `environment`
+  (`environment.control_env()`). Never a username, key value, path, or
+  hostname. `llm.KNOWN_PROVIDERS` is the single source of truth for the
+  provider finite set; `system_diagnostics.py` imports it rather than
+  duplicating it.
 
 ## Probe Pattern lifecycle (issue #168)
 

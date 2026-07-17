@@ -137,16 +137,15 @@ function StartView({
       <div>
         <h1 className="text-2xl font-bold tracking-tight">AI Candidate Studio</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          Start a conversation to generate and evaluate candidate versions of a component,
-          grounded in a real captured trace. This is a simulation over the isolated Replay
-          stack -- it never runs against production and never adopts a candidate
-          automatically.
+          会話を通じて、記録済みの実際のTraceを起点にcomponentの候補versionを生成・評価します。
+          これは隔離されたReplay基盤上のシミュレーションであり、本番環境に対して実行されることは
+          なく、候補が自動的に採用されることもありません。
         </p>
       </div>
 
       <Card>
         <CardHeader>
-          <CardTitle className="text-sm">Start a session</CardTitle>
+          <CardTitle className="text-sm">セッションを開始</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="space-y-2">
@@ -159,7 +158,7 @@ function StartView({
                 setReplaySetId("");
               }}
             >
-              <option value="">Select a component...</option>
+              <option value="">componentを選択...</option>
               {components?.map((c) => (
                 <option key={c.component_id} value={c.component_id}>
                   {c.component_id} ({c.trace_count} traces)
@@ -170,9 +169,9 @@ function StartView({
 
           {componentId && (
             <div className="space-y-2">
-              <Label>Trace (optional: the input to improve from)</Label>
+              <Label>Trace（任意: 改善の起点にする入力）</Label>
               <Select value={traceId} onChange={(e) => setTraceId(e.target.value)} disabled={!!replaySetId}>
-                <option value="">Select a trace...</option>
+                <option value="">Traceを選択...</option>
                 {traces?.map((t) => (
                   <option key={t.trace_id} value={t.trace_id}>
                     {t.trace_id.slice(0, 20)} @ {formatTimestamp(t.timestamp)}
@@ -181,24 +180,24 @@ function StartView({
               </Select>
               {!traces?.length && (
                 <p className="text-xs text-muted-foreground">
-                  No traces recorded for this component yet.
+                  このcomponentのTraceはまだ記録されていません。
                 </p>
               )}
               {!traceId && !replaySetId && !!traces?.length && (
                 <p className="text-xs text-muted-foreground">
-                  No selection uses up to 50 recent traces for this component automatically.
+                  未選択の場合、このcomponentの直近最大50件のTraceが自動的に使われます。
                 </p>
               )}
             </div>
           )}
 
           <div className="space-y-2">
-            <Label>Objective (optional)</Label>
+            <Label>改善目標（任意）</Label>
             <Textarea
               value={objective}
               onChange={(e) => setObjective(e.target.value)}
               rows={2}
-              placeholder="What should the candidate version do differently?"
+              placeholder="候補versionにどう変わってほしいか"
             />
           </div>
 
@@ -207,13 +206,13 @@ function StartView({
             className="text-xs text-muted-foreground underline cursor-pointer"
             onClick={() => setAdvancedOpen((v) => !v)}
           >
-            {advancedOpen ? "Hide advanced settings" : "Advanced settings"}
+            {advancedOpen ? "詳細設定を隠す" : "詳細設定"}
           </button>
           {advancedOpen && componentId && (
             <div className="space-y-2 rounded-md border p-3">
-              <Label>Use an existing Replay Set instead of a single trace</Label>
+              <Label>単一Traceの代わりに既存のReplay Setを使う</Label>
               <Select value={replaySetId} onChange={(e) => setReplaySetId(e.target.value)}>
-                <option value="">(none -- use the trace selected above)</option>
+                <option value="">（なし -- 上で選択したTraceを使う）</option>
                 {replaySets?.map((s) => (
                   <option key={s.id} value={s.id}>
                     {s.name || `Set #${s.id}`} ({s.trace_ids.length} traces)
@@ -224,7 +223,7 @@ function StartView({
           )}
 
           <Button onClick={handleStart} disabled={!canStart}>
-            {createSession.isPending ? "Starting..." : "Start session"}
+            {createSession.isPending ? "開始中..." : "セッションを開始"}
           </Button>
         </CardContent>
       </Card>
@@ -280,7 +279,7 @@ function StudioView({ sessionId }: { sessionId: number }) {
 
   const handleGenerate = async (parentVersionId: number | null) => {
     if (!draftText.trim()) {
-      toast.error("Enter an instruction first.");
+      toast.error("先に指示を入力してください。");
       return;
     }
     try {
@@ -291,7 +290,7 @@ function StudioView({ sessionId }: { sessionId: number }) {
       });
       setDraftText("");
       setSelectedVersionId(version.id);
-      toast.success(`Generated candidate v${version.version_number}`);
+      toast.success(`候補 v${version.version_number} を生成しました`);
     } catch (e) {
       toast.error(String(e));
     }
@@ -313,9 +312,9 @@ function StudioView({ sessionId }: { sessionId: number }) {
       const version = await replay.mutateAsync({ versionId: selectedVersion.id, sessionId });
       setSelectedVersionId(version.id);
       if (version.replay_status === "failed") {
-        toast.error("Replay completed but the run did not succeed -- see 評価結果.");
+        toast.error("Replayは完了しましたが、runは成功しませんでした -- 評価結果を確認してください。");
       } else {
-        toast.success("Replay completed");
+        toast.success("Replayが完了しました");
       }
     } catch (e) {
       toast.error(String(e));
@@ -326,7 +325,7 @@ function StudioView({ sessionId }: { sessionId: number }) {
     if (!selectedVersion) return;
     try {
       await promote.mutateAsync({ versionId: selectedVersion.id, sessionId });
-      toast.success("Promoted -- opening the Experiments create flow");
+      toast.success("送信しました -- Experiments作成フローを開きます");
       navigate(
         `/experiments?replay_run_id=${selectedVersion.replay_run_id}` +
           `&replay_variant_id=${selectedVersion.replay_variant_id}`,
@@ -348,7 +347,7 @@ function StudioView({ sessionId }: { sessionId: number }) {
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Badge variant={canRun ? "success" : "warning"}>
-            {canRun ? "Replay approved" : "Replay not approved"}
+            {canRun ? "Replay承認済み" : "Replay未承認"}
           </Badge>
           <Badge variant="outline">{STATE_LABEL_JA[state]}</Badge>
           {versions.length > 0 && (
@@ -369,10 +368,10 @@ function StudioView({ sessionId }: { sessionId: number }) {
       </div>
 
       <div className="rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-900 dark:border-blue-800 dark:bg-blue-950/20 dark:text-blue-100">
-        Simulation only: candidate code is generated and replayed in an isolated, network-off
-        sandbox against the pinned snapshot. Nothing here is production-equivalent, and nothing
-        is adopted, merged, or deployed automatically -- promotion only hands a reviewed patch to
-        the Experiments create flow for review.
+        シミュレーションのみ: 候補コードはpinされたsnapshotに対して隔離されたnetwork-offの
+        sandbox内で生成・Replayされます。ここには本番同等のものは何もなく、自動的に採用・
+        マージ・デプロイされることもありません -- promoteはレビュー済みのpatchを
+        Experiments作成フローへ渡すだけです。
       </div>
 
       {!canRun && componentId && <ApprovalPanel componentId={componentId} />}
@@ -380,7 +379,7 @@ function StudioView({ sessionId }: { sessionId: number }) {
       <div className="grid gap-4 lg:grid-cols-2">
         <Card data-testid="candidate-studio-conversation">
           <CardHeader>
-            <CardTitle className="text-sm">Conversation</CardTitle>
+            <CardTitle className="text-sm">会話</CardTitle>
           </CardHeader>
           <CardContent className="space-y-3">
             <div className="max-h-96 space-y-2 overflow-y-auto">
@@ -393,7 +392,7 @@ function StudioView({ sessionId }: { sessionId: number }) {
                   )}
                 >
                   <div className="mb-1 text-muted-foreground">
-                    {m.role === "user" ? "You" : "Assistant"}
+                    {m.role === "user" ? "あなた" : "Assistant"}
                     {m.version_id != null && (
                       <span>
                         {" "}
@@ -415,6 +414,13 @@ function StudioView({ sessionId }: { sessionId: number }) {
               rows={3}
               placeholder="改善の目的・制約・修正指示を入力..."
             />
+            {/* Issue #267 item 4: "送信" only appends a chat message and never
+                creates a CandidateVersion -- only a successful generate call
+                does that (CLAUDE.md Issue #252 section). */}
+            <p className="text-xs text-muted-foreground" data-testid="candidate-studio-send-vs-generate-note">
+              「送信」は会話に追加するだけで、候補versionは作成しません。候補versionを
+              作るには「候補を生成」を使ってください。
+            </p>
             <div className="flex flex-wrap items-center justify-between gap-2">
               <Button
                 size="sm"
@@ -422,7 +428,7 @@ function StudioView({ sessionId }: { sessionId: number }) {
                 onClick={handleSend}
                 disabled={!draftText.trim() || sendMessage.isPending}
               >
-                {sendMessage.isPending ? "Sending..." : "Send"}
+                {sendMessage.isPending ? "送信中..." : "送信"}
               </Button>
               <PrimaryAction
                 state={state}
@@ -443,7 +449,7 @@ function StudioView({ sessionId }: { sessionId: number }) {
         <Card data-testid="candidate-studio-version-panel">
           <CardHeader>
             <CardTitle className="text-sm">
-              Candidate version {selectedVersion ? `v${selectedVersion.version_number}` : ""}
+              候補version {selectedVersion ? `v${selectedVersion.version_number}` : ""}
             </CardTitle>
           </CardHeader>
           <CardContent>
@@ -473,12 +479,12 @@ function StudioView({ sessionId }: { sessionId: number }) {
                     <TabsTrigger value="eval">評価結果</TabsTrigger>
                   </TabsList>
                   <TabsContent value="diff">
-                    <CodeBlock lang="diff">{selectedVersion.patch_text || "(no patch)"}</CodeBlock>
+                    <CodeBlock lang="diff">{selectedVersion.patch_text || "(patchなし)"}</CodeBlock>
                     <VersionNotes version={selectedVersion} />
                   </TabsContent>
                   <TabsContent value="code">
                     <CodeBlock lang="python">
-                      {selectedVersion.generated_code || "(no generated code)"}
+                      {selectedVersion.generated_code || "(生成コードなし)"}
                     </CodeBlock>
                   </TabsContent>
                   <TabsContent value="eval">
@@ -516,7 +522,7 @@ function VersionNotes({ version }: { version: CandidateVersionOut }) {
     <div className="mt-3 grid gap-3 text-xs md:grid-cols-3">
       {version.assumptions.length > 0 && (
         <div>
-          <p className="mb-1 font-medium">Assumptions</p>
+          <p className="mb-1 font-medium">前提</p>
           <ul className="list-disc space-y-0.5 pl-4">
             {version.assumptions.map((a, i) => (
               <li key={i}>{a}</li>
@@ -526,7 +532,7 @@ function VersionNotes({ version }: { version: CandidateVersionOut }) {
       )}
       {version.risks.length > 0 && (
         <div>
-          <p className="mb-1 font-medium">Risks</p>
+          <p className="mb-1 font-medium">リスク</p>
           <ul className="list-disc space-y-0.5 pl-4">
             {version.risks.map((r, i) => (
               <li key={i}>{r}</li>
@@ -536,7 +542,7 @@ function VersionNotes({ version }: { version: CandidateVersionOut }) {
       )}
       {version.suggested_tests.length > 0 && (
         <div>
-          <p className="mb-1 font-medium">Suggested tests</p>
+          <p className="mb-1 font-medium">推奨テスト</p>
           <ul className="list-disc space-y-0.5 pl-4">
             {version.suggested_tests.map((t, i) => (
               <li key={i}>{t}</li>
@@ -619,7 +625,7 @@ function PrimaryAction({
   }
   if (state === "generated") {
     return (
-      <Button onClick={onReplay} disabled={!canRun || replayPending} title={!canRun ? "Replay is not approved for this component yet" : undefined}>
+      <Button onClick={onReplay} disabled={!canRun || replayPending} title={!canRun ? "このcomponentのReplayはまだ承認されていません" : undefined}>
         {replayPending ? "実行中..." : "Replayで確認"}
       </Button>
     );
