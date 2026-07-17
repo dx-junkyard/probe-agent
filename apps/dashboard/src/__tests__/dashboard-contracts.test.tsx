@@ -106,14 +106,14 @@ describe("Components page trace details", () => {
     );
 
     const detailsButton = await screen.findByRole("button", {
-      name: "Show signal details for trace trace-1234567890",
+      name: "Trace trace-1234567890 の詳細を表示",
     });
     expect(screen.queryByText("ValidationError: missing customer")).not.toBeInTheDocument();
 
     fireEvent.click(detailsButton);
 
     expect(screen.getByRole("button", {
-      name: "Hide signal details for trace trace-1234567890",
+      name: "Trace trace-1234567890 の詳細を隠す",
     })).toHaveAttribute("aria-expanded", "true");
     fireEvent.click(screen.getByRole("button", { name: /0.*object/ }));
     expect(screen.getByText(/order-42/)).toBeInTheDocument();
@@ -6893,7 +6893,7 @@ describe("GitHub page", () => {
     render(<GithubPage />, { wrapper: createWrapper() });
 
     await waitFor(() =>
-      expect(screen.getByTestId("github-app-configured-badge")).toHaveTextContent("Configured"),
+      expect(screen.getByTestId("github-app-configured-badge")).toHaveTextContent("設定済み"),
     );
   });
 
@@ -6903,7 +6903,7 @@ describe("GitHub page", () => {
     render(<GithubPage />, { wrapper: createWrapper() });
 
     await waitFor(() =>
-      expect(screen.getByTestId("github-app-configured-badge")).toHaveTextContent("Not configured"),
+      expect(screen.getByTestId("github-app-configured-badge")).toHaveTextContent("未設定"),
     );
     expect(screen.getByText("GITHUB_APP_ID")).toBeInTheDocument();
     expect(screen.getByTestId("new-connection-button")).toBeDisabled();
@@ -6965,7 +6965,7 @@ describe("GitHub page", () => {
     expect(screen.getByTestId("publish-job-cancel-button")).toBeInTheDocument();
     // The confirmation dialog shows the publish target before approving.
     fireEvent.click(screen.getByTestId("publish-job-approve-button"));
-    expect(await screen.findByText("Approve publish")).toBeInTheDocument();
+    expect(await screen.findByText("Publishを承認")).toBeInTheDocument();
     expect(screen.getByTestId("publish-job-confirm-approve-button")).toBeInTheDocument();
   });
 
@@ -6986,7 +6986,7 @@ describe("GitHub page", () => {
     // The confirmation dialog is on screen at the same time as the diff and
     // the approve action -- the diff must not only exist in the parent
     // dialog, which is covered by the confirmation overlay.
-    expect(await screen.findByText("Approve publish")).toBeInTheDocument();
+    expect(await screen.findByText("Publishを承認")).toBeInTheDocument();
     const confirmDiff = await screen.findByTestId("publish-job-confirm-diff");
     expect(confirmDiff).toHaveTextContent(patchFixture.diff);
     expect(screen.getByTestId("publish-job-confirm-approve-button")).toBeInTheDocument();
@@ -7261,7 +7261,7 @@ describe("Components trace row: Replay actions (Issue #246)", () => {
       </QueryClientProvider>,
     );
     const expandButton = await screen.findByRole("button", {
-      name: "Show signal details for trace trace-replayable-0001",
+      name: "Trace trace-replayable-0001 の詳細を表示",
     });
     fireEvent.click(expandButton);
     return within(expandButton.closest("tr")!.nextElementSibling as HTMLElement);
@@ -7287,15 +7287,15 @@ describe("Components trace row: Replay actions (Issue #246)", () => {
     expect(unreplayableBadge).toHaveAttribute("title", "Reasons: size_limit_exceeded");
 
     const expandButton = await screen.findByRole("button", {
-      name: "Show signal details for trace trace-replayable-0001",
+      name: "Trace trace-replayable-0001 の詳細を表示",
     });
     fireEvent.click(expandButton);
     const row = within(expandButton.closest("tr")!.nextElementSibling as HTMLElement);
 
     expect(row.getByText("Replay")).toBeInTheDocument();
-    expect(row.getByText("Add to Replay Set")).toBeInTheDocument();
-    expect(row.getByText("Create Experiment")).toBeInTheDocument();
-    expect(row.getByText("Add to Workspace")).toBeInTheDocument();
+    expect(row.getByText("Replay Setに追加")).toBeInTheDocument();
+    expect(row.getByText("Experimentを作成")).toBeInTheDocument();
+    expect(row.getByText("Workspaceに追加")).toBeInTheDocument();
   });
 
   test("Replay adds the trace to a new Replay Set and navigates to the Workbench", async () => {
@@ -7329,8 +7329,8 @@ describe("Components trace row: Replay actions (Issue #246)", () => {
       trace_ids: ["trace-replayable-0001"], traces: [], created_at: 1,
     });
 
-    fireEvent.click(row.getByText("Add to Replay Set"));
-    fireEvent.click(await screen.findByText("Add", { selector: "button" }));
+    fireEvent.click(row.getByText("Replay Setに追加"));
+    fireEvent.click(await screen.findByText("追加", { selector: "button" }));
 
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith("/replay-sets", expect.objectContaining({
@@ -7343,7 +7343,7 @@ describe("Components trace row: Replay actions (Issue #246)", () => {
 
   test("Create Experiment from this trace routes to Experiments with prefilled context", async () => {
     const row = await renderExpanded();
-    fireEvent.click(row.getByText("Create Experiment"));
+    fireEvent.click(row.getByText("Experimentを作成"));
 
     await waitFor(() => {
       expect(screen.getByText(/Prefilled context from trace/)).toBeInTheDocument();
@@ -7493,7 +7493,7 @@ describe("Simulation Workbench (Issue #246)", () => {
     });
 
     // Simulation disclaimer is always shown alongside the results.
-    expect(screen.getByText(/Simulation only/)).toBeInTheDocument();
+    expect(screen.getByText(/シミュレーションのみ/)).toBeInTheDocument();
 
     // The diff matrix distinguishes match / diff / candidate error / rescued.
     await waitFor(() => {
@@ -7504,7 +7504,7 @@ describe("Simulation Workbench (Issue #246)", () => {
     expect(screen.getByText("rescued")).toBeInTheDocument();
 
     // The unreplayable trace's next-step guidance is shown in the left pane.
-    expect(screen.getByText(/Next step: pick a different trace, or adjust replay_capture/)).toBeInTheDocument();
+    expect(screen.getByText(/次の一歩: 別のTraceを選ぶか/)).toBeInTheDocument();
   });
 
   test("unapproved component shows the not-approved next step and Approve posts", async () => {
@@ -7512,13 +7512,13 @@ describe("Simulation Workbench (Issue #246)", () => {
     await renderWorkbenchAt("/simulation-workbench?replay_set_id=1");
 
     await waitFor(() => {
-      expect(screen.getByText(/Replay is not approved for "norm"/)).toBeInTheDocument();
+      expect(screen.getByText(/「norm」のReplayは未承認です/)).toBeInTheDocument();
     });
-    expect(screen.getByText(/Next step: review the risk context and approve/)).toBeInTheDocument();
+    expect(screen.getByText(/次の一歩: リスクの内容を確認し/)).toBeInTheDocument();
 
-    fireEvent.click(screen.getByText("Review & Approve"));
+    fireEvent.click(screen.getByText("確認して承認する"));
     fireEvent.change(
-      await screen.findByPlaceholderText("Why is replay safe to approve for this component?"),
+      await screen.findByPlaceholderText("このcomponentのReplayがなぜ安全か"),
       { target: { value: "It only normalizes text." } },
     );
     mockApi.post.mockResolvedValue({
@@ -7526,7 +7526,7 @@ describe("Simulation Workbench (Issue #246)", () => {
       approved_by_user_id: 1, decision_method: "manual", risk_context: null, created_at: 1,
       revoked_at: null, revoked_by_user_id: null,
     });
-    fireEvent.click(screen.getByText("Approve", { selector: "button" }));
+    fireEvent.click(screen.getByText("承認する", { selector: "button" }));
 
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith(
@@ -7543,7 +7543,7 @@ describe("Simulation Workbench (Issue #246)", () => {
     fireEvent.click(await screen.findByText("LLM draft"));
     fireEvent.change(screen.getByRole("combobox", { name: "Trace for the LLM draft" }), { target: { value: "t1" } });
     fireEvent.change(
-      screen.getByPlaceholderText("What should the candidate do differently?"),
+      screen.getByPlaceholderText("候補コードにどう変わってほしいか"),
       { target: { value: "Uppercase the result" } },
     );
     mockApi.post.mockResolvedValue({
@@ -7555,7 +7555,7 @@ describe("Simulation Workbench (Issue #246)", () => {
       prompt_version: "v1", schema_version: "v1", decision_method: "reasoning_llm",
       is_mock: true, created_at: 1,
     });
-    fireEvent.click(screen.getByText("Generate draft"));
+    fireEvent.click(screen.getByText("Draftを生成"));
 
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith("/replay-variant-drafts", expect.objectContaining({
@@ -7620,7 +7620,7 @@ describe("Simulation Workbench (Issue #246)", () => {
       </QueryClientProvider>,
     );
 
-    const promoteBtn = await screen.findByText('Promote "My candidate"');
+    const promoteBtn = await screen.findByText('「My candidate」をpromote');
     fireEvent.click(promoteBtn);
 
     await waitFor(() => {
@@ -7649,7 +7649,7 @@ describe("Simulation Workbench (Issue #246)", () => {
     });
 
     const generate = await screen.findByRole("button", {
-      name: "Generate regression-test scaffold",
+      name: "回帰テストscaffoldを生成",
     });
     await waitFor(() => expect(generate).toBeEnabled());
     fireEvent.click(generate);

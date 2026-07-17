@@ -50,20 +50,20 @@ export function ResultMatrix({
   return (
     <div data-testid="replay-result-matrix" className="space-y-3">
       <div className="rounded-md border border-blue-200 bg-blue-50 dark:bg-blue-950/20 dark:border-blue-800 px-3 py-2 text-xs text-blue-900 dark:text-blue-100">
-        Simulation only: replay executes in an isolated, network-off sandbox against the pinned
-        snapshot. Results can differ from production (environment, external services,
-        time-dependent state) -- this is not a production-equivalence guarantee.
+        シミュレーションのみ: Replayはpinされたsnapshotに対して隔離されたnetwork-offの
+        sandbox内で実行されます。結果は本番環境（environment、外部サービス、
+        時間依存の状態）と異なる場合があり、本番同等性を保証するものではありません。
       </div>
       {failedCandidates.map((variant) => (
         <div
           key={variant.id}
           className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive"
         >
-          {variant.label || variant.variant_key}: {variant.apply_error ?? variant.error ?? "Replay failed"}
+          {variant.label || variant.variant_key}: {variant.apply_error ?? variant.error ?? "Replayに失敗しました"}
         </div>
       ))}
       {!run ? (
-        <p className="text-sm text-muted-foreground">Run a variant to see the diff matrix.</p>
+        <p className="text-sm text-muted-foreground">variantを実行するとdiff matrixが表示されます。</p>
       ) : run.status !== "completed" ? (
         <p className="text-sm text-muted-foreground">
           Run #{run.id}: {run.status}
@@ -96,7 +96,7 @@ function MatrixTable({
   const rows = candidates.find((candidate) => candidate.cases.length > 0)?.cases ?? [];
 
   if (candidates.length === 0 || rows.length === 0) {
-    return <p className="text-sm text-muted-foreground">No cases to compare for this run.</p>;
+    return <p className="text-sm text-muted-foreground">このrunで比較できるcaseがありません。</p>;
   }
 
   return (
@@ -105,7 +105,7 @@ function MatrixTable({
         <thead className="bg-muted/40">
           <tr className="text-left">
             <th className="p-2">Trace</th>
-            <th className="p-2">Recorded</th>
+            <th className="p-2">記録済み出力</th>
             <th className="p-2">Baseline replay</th>
             {candidates.map((v) => (
               <th key={v.id} className="p-2">
@@ -157,7 +157,7 @@ function MatrixTable({
         <tfoot>
           <tr className="border-t bg-muted/20 font-medium">
             <td className="p-2" colSpan={3}>
-              Aggregate
+              集計
             </td>
             {candidates.map((v) => (
               <td key={v.id} className="p-2">

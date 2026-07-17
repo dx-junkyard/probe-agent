@@ -309,6 +309,38 @@ Do not rely only on manual testing when behavior can be covered by unit tests.
 
 ---
 
+## Dashboard UI言語規約 (Issue #266)
+
+Server-supplied state strings are already unified to Japanese via
+`apps/control-server/app/state_messages.py` (#240). This rule extends the
+same convention to dashboard-side hardcoded UI copy, so a screen never mixes
+English and Japanese within the same CTA group, heading, empty state, or
+toast.
+
+- User-visible UI copy in `apps/dashboard/src` (buttons, headings, empty
+  states, toasts, dialogs, placeholders): Japanese.
+- Technical identifiers and proper nouns stay in their canonical form and are
+  never translated: System, Trace, Replay, Experiment, Snapshot, Capability,
+  policy modes (`off` / `trace` / `shadow`), GitHub, PR, branch names, HTTP
+  status codes, env var names. Established product-concept names (e.g.
+  Capability Map, Flow Explorer, AI Candidate Studio) may remain as-is when
+  they ARE the concept, following the 初出のみ併記 style already used in
+  `docs/system-understanding-navigation.md`'s terminology table (English term
+  once at first mention, Japanese prose around it).
+- `state_messages.py`-supplied server strings remain the canonical source of
+  truth; any client-side fallback string (used only when a server field is
+  absent, e.g. an older Control Server) must also be Japanese, never an
+  English default.
+- No i18n framework and no language switcher are introduced by this rule —
+  it is a plain-literal convention, enforced by review and by keeping
+  text-matching tests in sync with the copy they assert on.
+- Exhaustive translation of every minor label in one pass is not required;
+  the binding acceptance bar is that no single screen/CTA group mixes
+  languages. See `.claude/skills/dashboard/SKILL.md` for the operational
+  detail (constant-coupling caveats, shared-component scope, etc).
+
+---
+
 ## Verification Checklist
 
 Before finishing a task, run the relevant checks when available:

@@ -44,13 +44,13 @@ import { ResultMatrix } from "@/components/replay-result-matrix";
 
 const SKIP_GUIDANCE: Record<string, string> = {
   unreplayable_capture:
-    "This trace's captured input could not be structurally restored (redacted, oversized, or an unsupported type). Next step: pick a different trace, or adjust replay_capture redaction/size limits for this component.",
+    "このTraceの記録済み入力は構造的に復元できませんでした（redact済み、サイズ超過、または未対応の型）。次の一歩: 別のTraceを選ぶか、このcomponentのreplay_captureのredaction/サイズ制限を調整してください。",
   repr_parse_failed:
-    "No structured capture was recorded and the legacy repr input could not be parsed back into a call. Next step: opt this component into replay_capture=True so future traces are replayable.",
+    "構造化capture が記録されておらず、旧式のrepr入力を呼び出しに復元できませんでした。次の一歩: このcomponentをreplay_capture=Trueにopt-inし、今後のTraceをreplayable にしてください。",
   undecodable_input:
-    "The stored structured capture used an encoding the harness could not decode. Next step: re-capture this trace.",
+    "保存された構造化captureがharnessでデコードできないencodingでした。次の一歩: このTraceを再captureしてください。",
   trace_missing:
-    "This trace no longer exists in this System. Next step: remove it from the Replay Set.",
+    "このTraceはこのSystemにはもう存在しません。次の一歩: Replay Setから削除してください。",
 };
 
 export default function SimulationWorkbenchPage() {
@@ -136,7 +136,7 @@ export default function SimulationWorkbenchPage() {
         variants: [{ label: "Direct edit", patch_text: diff.patch_text, source: "manual" }],
       });
       setActiveRunId(run.id);
-      toast.success("Replay variant run completed");
+      toast.success("Replay variant runが完了しました");
     } catch (e) {
       toast.error(String(e));
     }
@@ -151,7 +151,7 @@ export default function SimulationWorkbenchPage() {
         variants: [{ label: "Pasted patch", patch_text: pastedPatch, source: "pasted" }],
       });
       setActiveRunId(run.id);
-      toast.success("Replay variant run completed");
+      toast.success("Replay variant runが完了しました");
     } catch (e) {
       toast.error(String(e));
     }
@@ -167,7 +167,7 @@ export default function SimulationWorkbenchPage() {
         snapshot_id: source?.snapshot_id,
       });
       setLastDraft(draft);
-      if (draft.status === "failed") toast.error(draft.error || "Draft generation failed");
+      if (draft.status === "failed") toast.error(draft.error || "Draftの生成に失敗しました");
     } catch (e) {
       toast.error(String(e));
     }
@@ -188,7 +188,7 @@ export default function SimulationWorkbenchPage() {
         ],
       });
       setActiveRunId(run.id);
-      toast.success("Replay variant run completed");
+      toast.success("Replay variant runが完了しました");
     } catch (e) {
       toast.error(String(e));
     }
@@ -217,7 +217,7 @@ export default function SimulationWorkbenchPage() {
               value={selectedSetId ? String(selectedSetId) : ""}
               onChange={(e) => e.target.value && selectSet(Number(e.target.value))}
             >
-              <option value="">Select a Replay Set...</option>
+              <option value="">Replay Setを選択...</option>
               {sets?.map((s) => (
                 <option key={s.id} value={s.id}>
                   {s.name || `Set #${s.id}`} — {s.component_id} ({s.trace_ids.length})
@@ -231,7 +231,7 @@ export default function SimulationWorkbenchPage() {
       {!selectedSetId ? (
         <Card>
           <CardContent className="py-8 text-center text-sm text-muted-foreground">
-            Select a Replay Set above, or use "Replay" on a trace in the Components tab.
+            上でReplay Setを選択するか、Components タブのTraceで「Replay」を使ってください。
           </CardContent>
         </Card>
       ) : setLoading || !replaySet ? (
@@ -250,7 +250,7 @@ export default function SimulationWorkbenchPage() {
                 </CardHeader>
                 <CardContent className="space-y-2 max-h-96 overflow-y-auto">
                   {replaySet.traces.length === 0 ? (
-                    <p className="text-sm text-muted-foreground">No traces in this set.</p>
+                    <p className="text-sm text-muted-foreground">このSetにTraceはありません。</p>
                   ) : (
                     replaySet.traces.map((t) => (
                       <TraceRow
@@ -269,7 +269,7 @@ export default function SimulationWorkbenchPage() {
             <div data-testid="workbench-center-pane">
               <Card>
                 <CardHeader>
-                  <CardTitle className="text-sm">Candidate source</CardTitle>
+                  <CardTitle className="text-sm">候補ソース</CardTitle>
                 </CardHeader>
                 <CardContent className="space-y-3">
                   {source && (
@@ -280,14 +280,13 @@ export default function SimulationWorkbenchPage() {
                   )}
                   {!canRun && (
                     <p className="text-xs text-amber-700 dark:text-amber-300">
-                      Replay is not approved for this component -- Run is disabled until it is
-                      approved above.
+                      このcomponentのReplayは未承認です -- 上で承認されるまでRunは無効化されます。
                     </p>
                   )}
                   <Tabs defaultValue="direct">
                     <TabsList>
-                      <TabsTrigger value="direct">Direct edit</TabsTrigger>
-                      <TabsTrigger value="paste">Paste patch</TabsTrigger>
+                      <TabsTrigger value="direct">直接編集</TabsTrigger>
+                      <TabsTrigger value="paste">パッチを貼り付け</TabsTrigger>
                       <TabsTrigger value="draft">LLM draft</TabsTrigger>
                     </TabsList>
                     <TabsContent value="direct">
@@ -310,7 +309,7 @@ export default function SimulationWorkbenchPage() {
                             createVariantRun.isPending
                           }
                         >
-                          {sourceDiff.isPending || createVariantRun.isPending ? "Running..." : "Run"}
+                          {sourceDiff.isPending || createVariantRun.isPending ? "実行中..." : "Run"}
                         </Button>
                       </div>
                     </TabsContent>
@@ -321,14 +320,14 @@ export default function SimulationWorkbenchPage() {
                           onChange={(e) => setPastedPatch(e.target.value)}
                           rows={14}
                           className="font-mono text-xs"
-                          placeholder="Paste a unified diff (git diff format)..."
+                          placeholder="unified diff (git diff形式) を貼り付け..."
                         />
                         <Button
                           size="sm"
                           onClick={handleRunPastedPatch}
                           disabled={!canRun || !source || !pastedPatch.trim() || createVariantRun.isPending}
                         >
-                          {createVariantRun.isPending ? "Running..." : "Run"}
+                          {createVariantRun.isPending ? "実行中..." : "Run"}
                         </Button>
                       </div>
                     </TabsContent>
@@ -340,26 +339,26 @@ export default function SimulationWorkbenchPage() {
                           value={draftTraceId ?? ""}
                           onChange={(e) => setDraftTraceId(e.target.value || null)}
                         >
-                          <option value="">Select a trace...</option>
+                          <option value="">Traceを選択...</option>
                           {replaySet.trace_ids.map((id) => (
                             <option key={id} value={id}>
                               {id}
                             </option>
                           ))}
                         </Select>
-                        <Label>Objective</Label>
+                        <Label>改善目標</Label>
                         <Textarea
                           value={draftObjective}
                           onChange={(e) => setDraftObjective(e.target.value)}
                           rows={2}
-                          placeholder="What should the candidate do differently?"
+                          placeholder="候補コードにどう変わってほしいか"
                         />
                         <Button
                           size="sm"
                           onClick={handleGenerateDraft}
                           disabled={!source || !draftTraceId || !draftObjective.trim() || createDraft.isPending}
                         >
-                          {createDraft.isPending ? "Generating..." : "Generate draft"}
+                          {createDraft.isPending ? "生成中..." : "Draftを生成"}
                         </Button>
                         {activeDraft && (
                           <div className="space-y-2 rounded-md border p-3">
@@ -394,7 +393,7 @@ export default function SimulationWorkbenchPage() {
                                     createVariantRun.isPending
                                   }
                                 >
-                                  {createVariantRun.isPending ? "Running..." : "Run this draft"}
+                                  {createVariantRun.isPending ? "実行中..." : "このDraftを実行"}
                                 </Button>
                               </>
                             )}
@@ -464,7 +463,7 @@ function TraceRow({
           type="button"
           className="font-mono cursor-pointer hover:underline text-left"
           onClick={onSelect}
-          title="Use this trace for an LLM draft"
+          title="このTraceをLLM draftに使う"
         >
           {trace.trace_id.slice(0, 14)}
         </button>
@@ -476,13 +475,13 @@ function TraceRow({
             </Badge>
           ) : (
             <Badge variant="secondary" className="text-[10px]">
-              will skip
+              skipされます
             </Badge>
           )}
           <button
             type="button"
             className="text-muted-foreground cursor-pointer"
-            aria-label={`${expanded ? "Hide" : "Show"} trace ${trace.trace_id} details`}
+            aria-label={`Trace ${trace.trace_id} の詳細を${expanded ? "隠す" : "表示"}`}
             aria-expanded={expanded}
             onClick={() => setExpanded((v) => !v)}
           >
@@ -492,13 +491,13 @@ function TraceRow({
       </div>
       {trace.skip_reason && (
         <p className="text-amber-700 dark:text-amber-300">
-          {SKIP_GUIDANCE[trace.skip_reason] ?? `This trace will be skipped: ${trace.skip_reason}.`}
+          {SKIP_GUIDANCE[trace.skip_reason] ?? `このTraceはskipされます: ${trace.skip_reason}`}
         </p>
       )}
       {expanded && (
         <div className="space-y-2 pt-1 border-t">
           <div>
-            <span className="text-muted-foreground">Input capture:</span>
+            <span className="text-muted-foreground">入力capture:</span>
             {recorded?.input_capture != null ? (
               <JsonTree data={recorded.input_capture} defaultExpanded={false} />
             ) : (
@@ -506,12 +505,12 @@ function TraceRow({
             )}
           </div>
           <div>
-            <span className="text-muted-foreground">Recorded output:</span>
+            <span className="text-muted-foreground">記録済み出力:</span>
             <pre className="whitespace-pre-wrap break-words">{recorded?.output ?? "—"}</pre>
           </div>
           {recorded?.error && (
             <div>
-              <span className="text-destructive">Recorded error:</span>
+              <span className="text-destructive">記録済みエラー:</span>
               <pre className="whitespace-pre-wrap break-words text-destructive">{recorded.error}</pre>
             </div>
           )}
@@ -553,13 +552,13 @@ function EscalationPanel({
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="text-sm">Escalate</CardTitle>
+        <CardTitle className="text-sm">エスカレーション</CardTitle>
       </CardHeader>
       <CardContent className="space-y-4 text-xs">
         <div className="space-y-2">
-          <p className="font-medium">Promote a variant to an Experiment</p>
+          <p className="font-medium">variantをExperimentへpromoteする</p>
           {!run || candidates.length === 0 ? (
-            <p className="text-muted-foreground">Run a candidate variant first.</p>
+            <p className="text-muted-foreground">先に候補variantを実行してください。</p>
           ) : (
             <div className="flex flex-wrap gap-2">
               {candidates.map((v) => (
@@ -574,23 +573,22 @@ function EscalationPanel({
                     navigate(`/experiments?replay_run_id=${run.id}&replay_variant_id=${v.id}`)
                   }
                 >
-                  Promote "{v.label || v.variant_key}"
+                  「{v.label || v.variant_key}」をpromote
                 </Button>
               ))}
             </div>
           )}
           <p className="text-muted-foreground">
-            Hands the variant's patch to the Experiments create flow for review -- this never
-            creates or adopts an Experiment automatically. The developer decides on the
-            Experiments tab.
+            variantのpatchをExperiments作成フローへ渡すだけです -- 自動的にExperimentを
+            作成・採用することはありません。開発者がExperimentsタブで判断します。
           </p>
         </div>
 
         <div className="space-y-2 border-t pt-3">
-          <p className="font-medium">Regression-test scaffold</p>
+          <p className="font-medium">回帰テストscaffold</p>
           <p className="text-muted-foreground">
-            A review-only reasoning-model draft grounded in the pinned symbol, captured trace, and
-            candidate patch. It is never written to the target repository automatically.
+            pinされたsymbol・記録済みTrace・候補patchに基づく、レビュー専用のreasoning-model
+            draftです。対象repositoryへ自動的に書き込まれることはありません。
           </p>
           <Button
             size="sm"
@@ -606,14 +604,14 @@ function EscalationPanel({
                 });
                 setScaffold(result);
                 if (result.status === "failed") {
-                  toast.error(result.error || "Regression scaffold generation failed");
+                  toast.error(result.error || "回帰テストscaffoldの生成に失敗しました");
                 }
               } catch (error) {
                 toast.error(String(error));
               }
             }}
           >
-            {createScaffold.isPending ? "Generating..." : "Generate regression-test scaffold"}
+            {createScaffold.isPending ? "生成中..." : "回帰テストscaffoldを生成"}
           </Button>
           {activeScaffold && (
             <div className="space-y-2 rounded border p-2">
@@ -645,15 +643,16 @@ function EscalationPanel({
         <div className="space-y-2 border-t pt-3">
           <p className="font-medium">Live shadow (SDK)</p>
           <p className="text-muted-foreground">
-            To try a candidate against real traffic instead of a simulation, register it as the
-            shadow candidate and switch the component to shadow mode:
+            シミュレーションではなく実際のトラフィックに対して候補を試すには、shadow候補として
+            登録し、componentをshadow modeに切り替えてください:
           </p>
           <pre className="rounded-md bg-muted p-2 overflow-x-auto">
             {`from probe_agent import set_candidate\n\nset_candidate("${componentId ?? "<component_id>"}", candidate_fn)`}
           </pre>
           <p className="text-muted-foreground">
-            Then set this component's mode to <span className="font-mono">shadow</span> on the
-            Components tab. Shadow mode never changes the returned production value (Principle 1).
+            その後、Components タブでこのcomponentのmodeを{" "}
+            <span className="font-mono">shadow</span> に設定してください。shadow
+            modeは本番の戻り値を変更しません（Principle 1）。
           </p>
         </div>
       </CardContent>

@@ -75,7 +75,7 @@ export function ReplayRowActions({
         size="sm"
         variant="ghost"
         className="h-7 px-2 text-xs"
-        title="Add this trace to a Replay Set and open the Simulation Workbench"
+        title="このTraceをReplay Setに追加し、Simulation Workbenchを開く"
         onClick={() => setDialogMode("replay")}
       >
         <Play className="h-3 w-3 mr-1" /> Replay
@@ -84,29 +84,29 @@ export function ReplayRowActions({
         size="sm"
         variant="ghost"
         className="h-7 px-2 text-xs"
-        title="Add this trace to a new or existing Replay Set"
+        title="このTraceを新規または既存のReplay Setに追加する"
         onClick={() => setDialogMode("add")}
       >
-        <ListPlus className="h-3 w-3 mr-1" /> Add to Replay Set
+        <ListPlus className="h-3 w-3 mr-1" /> Replay Setに追加
       </Button>
       <Button
         size="sm"
         variant="ghost"
         className="h-7 px-2 text-xs"
-        title="Create an Experiment from this trace"
+        title="このTraceからExperimentを作成する"
         onClick={() =>
           navigate(
             `/experiments?from_trace=${encodeURIComponent(traceId)}&from_component=${encodeURIComponent(componentId)}`,
           )
         }
       >
-        <FlaskConical className="h-3 w-3 mr-1" /> Create Experiment
+        <FlaskConical className="h-3 w-3 mr-1" /> Experimentを作成
       </Button>
       <Button
         size="sm"
         variant="ghost"
         className="h-7 px-2 text-xs"
-        title="Start an AI Candidate Studio session grounded in this trace's input"
+        title="このTraceの入力を起点にAI Candidate Studioセッションを開始する"
         onClick={() =>
           navigate(
             `/candidate-studio?component_id=${encodeURIComponent(componentId)}&trace_id=${encodeURIComponent(traceId)}`,
@@ -166,7 +166,7 @@ function ReplaySetDialog({
         name,
         trace_ids: traceIds,
       });
-      toast.success(mode === "replay" ? "Replay set ready" : "Added to Replay Set");
+      toast.success(mode === "replay" ? "Replay Setを準備しました" : "Replay Setに追加しました");
       onOpenChange(false);
       if (mode === "replay") {
         navigate(`/simulation-workbench?replay_set_id=${created.id}`);
@@ -181,7 +181,7 @@ function ReplaySetDialog({
   return (
     <Dialog open onOpenChange={onOpenChange}>
       <DialogHeader>
-        <DialogTitle>{mode === "replay" ? "Replay this trace" : "Add to Replay Set"}</DialogTitle>
+        <DialogTitle>{mode === "replay" ? "このTraceをReplayする" : "Replay Setに追加"}</DialogTitle>
       </DialogHeader>
       <div className="space-y-4">
         <p className="text-sm text-muted-foreground">
@@ -193,7 +193,7 @@ function ReplaySetDialog({
             variant={pickMode === "new" ? "default" : "outline"}
             onClick={() => setPickMode("new")}
           >
-            New Replay Set
+            新しいReplay Set
           </Button>
           <Button
             size="sm"
@@ -201,14 +201,14 @@ function ReplaySetDialog({
             onClick={() => setPickMode("existing")}
             disabled={!sets?.length}
           >
-            Existing Set
+            既存のSet
           </Button>
         </div>
         {pickMode === "existing" ? (
           <div className="space-y-2">
             <Label>Replay Set</Label>
             <Select value={selectedId} onChange={(e) => setSelectedId(e.target.value)}>
-              <option value="">Select a replay set...</option>
+              <option value="">Replay Setを選択...</option>
               {sets?.map((s) => (
                 <option key={s.id} value={s.id}>
                   {s.name || `Set #${s.id}`} ({s.trace_ids.length} traces)
@@ -218,7 +218,7 @@ function ReplaySetDialog({
           </div>
         ) : (
           <div className="space-y-2">
-            <Label>Name</Label>
+            <Label>名前</Label>
             <Input
               value={newName}
               onChange={(e) => setNewName(e.target.value)}
@@ -231,7 +231,7 @@ function ReplaySetDialog({
           disabled={submitting || (pickMode === "existing" && !selectedId)}
           onClick={handleSubmit}
         >
-          {submitting ? "Saving..." : mode === "replay" ? "Replay" : "Add"}
+          {submitting ? "保存中..." : mode === "replay" ? "Replay" : "追加"}
         </Button>
       </div>
     </Dialog>

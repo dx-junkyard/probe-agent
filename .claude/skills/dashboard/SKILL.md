@@ -293,6 +293,48 @@ The dashboard should support:
   human-wait state, matching the System Understanding build-job polling
   pattern.
 
+## UI Language Convention (Issue #266)
+
+Dashboard-side hardcoded UI copy follows the same Japanese-canonical
+convention as the server's `state_messages.py` catalog (#240). The rule
+(codified in `CLAUDE.md`'s "Dashboard UI言語規約" section): user-visible copy
+is Japanese; technical identifiers/proper nouns (System, Trace, Replay,
+Experiment, Snapshot, Capability, `off`/`trace`/`shadow`, GitHub, PR, branch
+names, HTTP codes, env var names, and established product-concept page/
+feature names) stay as-is.
+
+Operational notes when touching a screen:
+
+- **Same-screen CTA groups must not mix languages.** Before adding or
+  changing a button/toast/heading, check every other user-visible string
+  rendered on the same screen state (including shared components mounted
+  there, e.g. `ApprovalPanel`, `AddToWorkspaceButton`, `ResultMatrix`,
+  `ReplayRowActions`) — translating only the page-local strings while a
+  shared component next to it stays English recreates the same mixing bug.
+- **Constant-coupling**: some client literals are paired with a server
+  catalog key by exact string match, not by API contract. Known pairs:
+  `gap-worklist.tsx`'s `CREATE_ISSUE_ACTION` must stay identical to
+  `state_messages.GAP_CREATE_ISSUE_ACTION`. Before renaming/retranslating any
+  string that also appears in `apps/control-server/app/state_messages.py` (or
+  is compared against a server response elsewhere), grep both sides first.
+- **Finite-set/enum-shaped labels** (case status values like `match`/`diff`/
+  `candidate_error`, replayability values, policy modes) may stay in their
+  English canonical spelling even in an otherwise-Japanese screen — they are
+  technical identifiers, not prose, per the identifier exception above.
+- **Client-side fallback strings** (used only when a server field is missing,
+  e.g. `STEP_LABELS`/`USER_PHASE_LABELS` last-resort maps) must be Japanese
+  too — a fallback is still user-visible copy.
+- Do not touch `apps/control-server/app/state_messages.py` contents for this
+  convention — that catalog is already Japanese and owned by #240; report
+  any genuinely-English leftover found there instead of editing it here.
+- `data-testid`, API field names, schema fields, and log lines are not
+  user-visible copy and are out of scope for this rule.
+- Exhaustive translation of every minor label in a single change is not
+  required; the acceptance bar is that no single screen/CTA group mixes
+  languages. When leaving a string in English for effort reasons, prefer
+  whole uniformly-English pages (no existing Japanese on that screen) over
+  leaving a partial mix.
+
 ## Authentication model
 
 - The session token from `/auth/login` lives in `st.session_state` only

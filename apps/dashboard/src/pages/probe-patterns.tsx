@@ -32,27 +32,27 @@ const CLASSIFICATION_META: Record<ReconcileClassification, {
 }> = {
   exact_match: {
     label: "exact match", variant: "success",
-    hint: "Same path and signature — can be re-attached as-is.",
+    hint: "pathとsignatureが一致 — そのまま再接続できます。",
   },
   moved_match: {
     label: "moved", variant: "secondary",
-    hint: "The implementation likely moved or was renamed.",
+    hint: "実装が移動またはrenameされた可能性があります。",
   },
   changed_signature: {
     label: "signature changed", variant: "warning",
-    hint: "Same role, but the interface changed since the pattern was saved.",
+    hint: "役割は同じですが、pattern保存後にinterfaceが変わっています。",
   },
   split_or_merged: {
     label: "split / merged", variant: "warning",
-    hint: "The responsibility appears split across or merged into other symbols.",
+    hint: "責務が他のsymbolに分割または統合されたようです。",
   },
   missing: {
     label: "missing", variant: "destructive",
-    hint: "No current counterpart was found.",
+    hint: "現在対応するものが見つかりませんでした。",
   },
   unsafe: {
     label: "unsafe", variant: "destructive",
-    hint: "The current target hits the side-effect safety denylist.",
+    hint: "現在のtargetがside-effect safety denylistに該当します。",
   },
 };
 
@@ -356,8 +356,8 @@ function PatternDetail({ patternId }: { patternId: number }) {
   const runReconcile = () =>
     reconcile.mutateAsync(pattern.id)
       .then(r => {
-        if (r.status === "failed") toast.error(`Reconcile failed: ${r.error}`);
-        else toast.success("Reconciled against the latest snapshot");
+        if (r.status === "failed") toast.error(`Reconcileに失敗しました: ${r.error}`);
+        else toast.success("最新snapshotとreconcileしました");
       })
       .catch(e => toast.error(String(e)));
 
@@ -366,21 +366,21 @@ function PatternDetail({ patternId }: { patternId: number }) {
       <div className="flex gap-2 flex-wrap">
         <Button size="sm" onClick={runReconcile} disabled={reconcile.isPending || archived}>
           <RefreshCw className="h-4 w-4 mr-1" />
-          {reconcile.isPending ? "Reconciling..." : "Reconcile with latest snapshot"}
+          {reconcile.isPending ? "Reconcile中..." : "最新snapshotとReconcile"}
         </Button>
         <Button size="sm" variant="outline" onClick={() => setEditOpen(true)}>
-          <Pencil className="h-4 w-4 mr-1" /> Edit
+          <Pencil className="h-4 w-4 mr-1" /> 編集
         </Button>
         <Button
           size="sm" variant="outline"
           onClick={() =>
             update.mutateAsync({ patternId: pattern.id, status: archived ? "active" : "archived" })
-              .then(() => toast.success(archived ? "Pattern restored" : "Pattern archived"))
+              .then(() => toast.success(archived ? "Patternを復元しました" : "Patternをarchiveしました"))
               .catch(e => toast.error(String(e)))
           }
         >
           {archived
-            ? <><ArchiveRestore className="h-4 w-4 mr-1" /> Restore</>
+            ? <><ArchiveRestore className="h-4 w-4 mr-1" /> 復元</>
             : <><Archive className="h-4 w-4 mr-1" /> Archive</>}
         </Button>
         <Button
@@ -389,13 +389,13 @@ function PatternDetail({ patternId }: { patternId: number }) {
           onClick={() =>
             generateRemoval.mutateAsync({ patternId: pattern.id })
               .then(p => {
-                if (p.status === "failed") toast.error(`Patch generation failed: ${p.error}`);
-                else toast.success("Removal patch generated — review the diff below");
+                if (p.status === "failed") toast.error(`パッチ生成に失敗しました: ${p.error}`);
+                else toast.success("除去パッチを生成しました — 下のdiffを確認してください");
               })
               .catch(e => toast.error(String(e)))
           }
         >
-          <Eraser className="h-4 w-4 mr-1" /> Generate removal patch
+          <Eraser className="h-4 w-4 mr-1" /> 除去パッチを生成
         </Button>
       </div>
 
@@ -618,7 +618,7 @@ function ReconcilePointCard({ point, patternPoint }: {
         {moved && <span> → {point.target_path}:{point.target_symbol}</span>}
       </div>
 
-      {point.hypothesis && <div className="text-xs"><span className="font-medium">Hypothesis:</span> {point.hypothesis}</div>}
+      {point.hypothesis && <div className="text-xs"><span className="font-medium">仮説:</span> {point.hypothesis}</div>}
       {point.explanation && <div className="text-xs text-muted-foreground">{point.explanation}</div>}
       {point.denylist_hit && (
         <div className="text-xs text-red-600 dark:text-red-400">Denylist: {point.denylist_hit}</div>
@@ -664,7 +664,7 @@ function ReconcilePointCard({ point, patternPoint }: {
               disabled={investigate.isPending}
               onClick={() =>
                 investigate.mutateAsync(point.id)
-                  .then(() => toast.success("Investigation complete"))
+                  .then(() => toast.success("調査が完了しました"))
                   .catch(e => toast.error(String(e)))
               }
             >
@@ -677,12 +677,12 @@ function ReconcilePointCard({ point, patternPoint }: {
 
       {point.investigation && (
         <div className="rounded-md border border-sky-200 bg-sky-50 dark:border-sky-800 dark:bg-sky-950/20 p-3 space-y-1 text-xs">
-          <div className="font-medium">Investigation</div>
+          <div className="font-medium">調査結果</div>
           <div>{point.investigation.summary}</div>
-          <div><span className="font-medium">Recommendation:</span> {point.investigation.recommendation}</div>
+          <div><span className="font-medium">推奨:</span> {point.investigation.recommendation}</div>
           {point.investigation.proposed_target_symbol && (
             <div className="font-mono">
-              Proposed target: {point.investigation.proposed_target_path}:{point.investigation.proposed_target_symbol}
+              提案先: {point.investigation.proposed_target_path}:{point.investigation.proposed_target_symbol}
             </div>
           )}
           {point.investigation.evidence.map((ev, i) => (
@@ -706,7 +706,7 @@ function RemovalPatchesSection({ patches }: { patches: ProbeRemovalPatchOut[] })
 
   return (
     <div>
-      <h4 className="text-sm font-medium mb-2">Removal Patches</h4>
+      <h4 className="text-sm font-medium mb-2">除去パッチ</h4>
       <div className="space-y-2">
         {patches.map(patch => (
           <div key={patch.id} className="rounded-lg border p-3 space-y-2">
@@ -725,7 +725,7 @@ function RemovalPatchesSection({ patches }: { patches: ProbeRemovalPatchOut[] })
                     onClick={() => { setApplyTarget(patch); setConfirmation(""); }}
                     disabled={applyPatch.isPending}
                   >
-                    Apply
+                    適用
                   </Button>
                 )}
                 {patch.diff && (
@@ -739,7 +739,7 @@ function RemovalPatchesSection({ patches }: { patches: ProbeRemovalPatchOut[] })
                       URL.revokeObjectURL(url);
                     }}
                   >
-                    <Download className="h-3 w-3 mr-1" /> Download
+                    <Download className="h-3 w-3 mr-1" /> ダウンロード
                   </Button>
                 )}
               </div>
@@ -749,7 +749,7 @@ function RemovalPatchesSection({ patches }: { patches: ProbeRemovalPatchOut[] })
             )}
             {patch.apply_error && (
               <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800 dark:border-red-800 dark:bg-red-950/20 dark:text-red-200">
-                Apply failed: {patch.apply_error}
+                適用に失敗しました: {patch.apply_error}
               </div>
             )}
             {patch.diff && (
@@ -759,8 +759,8 @@ function RemovalPatchesSection({ patches }: { patches: ProbeRemovalPatchOut[] })
             )}
             {patch.apply_status === "applied" && (
               <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/20 dark:text-emerald-200">
-                Probes removed from the working tree (no commit created). Review,
-                run tests, commit, and create a fresh snapshot before release.
+                working tree からprobeを除去しました（commitは作成していません）。レビュー・
+                テスト実行・commit・新しいsnapshotの作成をリリース前に行ってください。
               </div>
             )}
           </div>
@@ -772,21 +772,20 @@ function RemovalPatchesSection({ patches }: { patches: ProbeRemovalPatchOut[] })
         onOpenChange={(open) => { if (!open) { setApplyTarget(null); setConfirmation(""); } }}
       >
         <DialogHeader>
-          <DialogTitle>Apply Removal Patch to Repository</DialogTitle>
+          <DialogTitle>除去パッチをRepositoryに適用</DialogTitle>
         </DialogHeader>
         {applyTarget && (
           <div className="space-y-4">
             <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/20 dark:text-amber-100">
-              This removes the @probe instrumentation from the source repository
-              working tree. The pattern keeps the observation context so the
-              probes can be re-attached later.
+              対象repositoryのworking treeから@probe計装を除去します。patternは観測
+              文脈を保持するため、probeは後で再接続できます。
             </div>
             <div className="space-y-1 text-sm">
               <div>Snapshot commit: <code className="font-mono text-xs">{applyTarget.commit_sha}</code></div>
-              <div>The repository HEAD must match this commit and the working tree must be clean.</div>
+              <div>repositoryのHEADがこのcommitと一致し、working treeがcleanである必要があります。</div>
             </div>
             <div className="space-y-2">
-              <label className="text-sm font-medium">Type REMOVE to confirm</label>
+              <label className="text-sm font-medium">確認のため REMOVE と入力してください</label>
               <Input value={confirmation} onChange={e => setConfirmation(e.target.value)} placeholder="REMOVE" />
             </div>
             <Button
@@ -798,13 +797,13 @@ function RemovalPatchesSection({ patches }: { patches: ProbeRemovalPatchOut[] })
                   patchId: applyTarget.id,
                   expectedCommitSha: applyTarget.commit_sha,
                 }).then(() => {
-                  toast.success("Removal patch applied");
+                  toast.success("除去パッチを適用しました");
                   setApplyTarget(null);
                   setConfirmation("");
                 }).catch(e => toast.error(String(e)))
               }
             >
-              {applyPatch.isPending ? "Applying..." : "Remove probes from repository"}
+              {applyPatch.isPending ? "適用中..." : "repositoryからprobeを除去"}
             </Button>
           </div>
         )}

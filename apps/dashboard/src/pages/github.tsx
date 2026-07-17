@@ -125,24 +125,24 @@ function InstallationsPanel({ systemId }: { systemId: number | null }) {
     try {
       await register.mutateAsync(id);
       setInstallationId("");
-      toast.success("Installation registered and verified");
+      toast.success("Installationを登録・検証しました");
     } catch (e) { toast.error(String(e)); }
   };
 
   return <Card>
     <CardHeader>
-      <CardTitle className="text-base">Allowed installations</CardTitle>
+      <CardTitle className="text-base">許可されたInstallation</CardTitle>
       <CardDescription>
-        Only the configured GitHub Organization can be registered. Assign an active installation to this System before it can create a connection.
+        設定済みのGitHub Organizationのみ登録できます。Connectionを作成する前に、有効なInstallationをこのSystemに割り当ててください。
       </CardDescription>
     </CardHeader>
     <CardContent className="space-y-4">
       <div className="flex gap-2">
         <Input value={installationId} onChange={e => setInstallationId(e.target.value)} inputMode="numeric" placeholder="GitHub Installation ID" />
-        <Button onClick={add} disabled={register.isPending || !installationId.trim()}>Register</Button>
+        <Button onClick={add} disabled={register.isPending || !installationId.trim()}>登録</Button>
       </div>
       {isLoading ? <Skeleton className="h-20 w-full" /> : !installations?.length ? (
-        <p className="text-sm text-muted-foreground">No installations are registered.</p>
+        <p className="text-sm text-muted-foreground">登録されているInstallationはありません。</p>
       ) : <div className="space-y-2">
         {installations.map((installation: GithubInstallationOut) => {
           const assigned = systemId !== null && installation.assigned_system_ids.includes(systemId);
@@ -150,11 +150,11 @@ function InstallationsPanel({ systemId }: { systemId: number | null }) {
             <div className="text-sm">
               <code>#{installation.installation_id}</code> · {installation.github_account_login}
               <Badge className="ml-2" variant={installation.status === "active" ? "success" : "destructive"}>{installation.status}</Badge>
-              <div className="text-xs text-muted-foreground mt-1">assigned Systems: {installation.assigned_system_ids.join(", ") || "none"}</div>
+              <div className="text-xs text-muted-foreground mt-1">割り当て済みSystem: {installation.assigned_system_ids.join(", ") || "なし"}</div>
             </div>
             <div className="flex gap-2">
-              {installation.status === "active" && systemId !== null && !assigned && <Button size="sm" variant="outline" onClick={() => assign.mutateAsync({ installationId: installation.installation_id, systemId }).catch(e => toast.error(String(e)))}>Assign here</Button>}
-              {installation.status === "active" && <Button size="sm" variant="destructive" onClick={() => disable.mutateAsync(installation.installation_id).catch(e => toast.error(String(e)))}>Disable</Button>}
+              {installation.status === "active" && systemId !== null && !assigned && <Button size="sm" variant="outline" onClick={() => assign.mutateAsync({ installationId: installation.installation_id, systemId }).catch(e => toast.error(String(e)))}>このSystemに割り当て</Button>}
+              {installation.status === "active" && <Button size="sm" variant="destructive" onClick={() => disable.mutateAsync(installation.installation_id).catch(e => toast.error(String(e)))}>無効化</Button>}
             </div>
           </div>;
         })}
@@ -176,12 +176,12 @@ function AppStatusCard({ status, isLoading }: {
         <div>
           <CardTitle className="text-base">GitHub App</CardTitle>
           <CardDescription>
-            Short-lived Installation Tokens broker commit/push/PR creation for the publish workflow.
-            No token is ever persisted or shown here.
+            短命のInstallation Tokenがpublishワークフローのcommit/push/PR作成を仲介します。
+            tokenはここに永続化・表示されることはありません。
           </CardDescription>
         </div>
         <Badge variant={status.configured ? "success" : "destructive"} data-testid="github-app-configured-badge">
-          {status.configured ? "Configured" : "Not configured"}
+          {status.configured ? "設定済み" : "未設定"}
         </Badge>
       </CardHeader>
       <CardContent className="space-y-2 text-sm">
@@ -191,10 +191,10 @@ function AppStatusCard({ status, isLoading }: {
           </div>
         ) : (
           <div className="rounded-md border border-amber-200 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
-            Set <code>GITHUB_APP_ID</code> and <code>GITHUB_APP_PRIVATE_KEY_PATH</code> (pointing at an
-            existing private key file) on the Control Server, then restart it. Optional:
-            <code className="ml-1">GITHUB_API_BASE_URL</code> / <code>GITHUB_WEB_BASE_URL</code> for
-            GitHub Enterprise. Connections and publish jobs stay unavailable until this is set.
+            Control Server上で <code>GITHUB_APP_ID</code> と <code>GITHUB_APP_PRIVATE_KEY_PATH</code>
+            （既存のprivate keyファイルを指す）を設定し、再起動してください。任意:
+            <code className="ml-1">GITHUB_API_BASE_URL</code> / <code>GITHUB_WEB_BASE_URL</code>
+            （GitHub Enterprise向け）。これらが設定されるまでConnectionとpublish jobは利用できません。
           </div>
         )}
       </CardContent>
@@ -217,10 +217,10 @@ function ConnectionsPanel({ appConfigured }: { appConfigured: boolean }) {
       <CardHeader className="flex flex-row items-center justify-between gap-4">
         <div>
           <CardTitle className="text-base">Connections</CardTitle>
-          <CardDescription>Remote repositories this System may publish approved patches to.</CardDescription>
+          <CardDescription>このSystemが承認済みpatchをpublishできるremote repository。</CardDescription>
         </div>
         <Button size="sm" onClick={() => setShowCreate(true)} disabled={!appConfigured} data-testid="new-connection-button">
-          <Plus className="h-4 w-4 mr-1" /> New connection
+          <Plus className="h-4 w-4 mr-1" /> 新規Connection
         </Button>
       </CardHeader>
       <CardContent>
@@ -228,7 +228,7 @@ function ConnectionsPanel({ appConfigured }: { appConfigured: boolean }) {
           <div className="space-y-2">{[1, 2].map(i => <Skeleton key={i} className="h-20 w-full" />)}</div>
         ) : !connections?.length ? (
           <p className="text-sm text-muted-foreground text-center py-8">
-            No GitHub connections yet. Create one to enable the publish workflow.
+            GitHub connectionがまだありません。publishワークフローを有効にするには作成してください。
           </p>
         ) : (
           <div className="space-y-3" data-testid="connections-list">
@@ -244,9 +244,9 @@ function ConnectionsPanel({ appConfigured }: { appConfigured: boolean }) {
                       default branch: <code>{c.default_branch ?? "—"}</code> · installation #{c.installation_id}
                     </div>
                     <div className="text-xs text-muted-foreground">
-                      last synced: {c.last_synced_commit_sha ? (
+                      最終sync: {c.last_synced_commit_sha ? (
                         <code className="font-mono">{shortSha(c.last_synced_commit_sha)}</code>
-                      ) : "never"} {c.last_synced_at ? `(${formatTimestamp(c.last_synced_at)})` : ""}
+                      ) : "未実行"} {c.last_synced_at ? `(${formatTimestamp(c.last_synced_at)})` : ""}
                     </div>
                     {c.last_error && (
                       <div className="flex items-start gap-1.5 text-xs text-destructive">
@@ -259,18 +259,18 @@ function ConnectionsPanel({ appConfigured }: { appConfigured: boolean }) {
                     <Button
                       size="sm" variant="outline"
                       onClick={() => verify.mutateAsync(c.id).then(r => {
-                        if (r.status === "connected") toast.success("Connection verified");
-                        else toast.error(r.last_error ?? "Verification failed");
+                        if (r.status === "connected") toast.success("Connectionを検証しました");
+                        else toast.error(r.last_error ?? "検証に失敗しました");
                       }).catch(e => toast.error(String(e)))}
                       disabled={verify.isPending || c.status === "disconnected"}
                     >
-                      <ShieldCheck className="h-3.5 w-3.5 mr-1" /> Verify
+                      <ShieldCheck className="h-3.5 w-3.5 mr-1" /> 検証
                     </Button>
                     <Button
                       size="sm" variant="outline"
                       onClick={() => sync.mutateAsync(c.id).then(r => {
-                        if (r.last_synced_commit_sha) toast.success("Mirror synced");
-                        else toast.error(r.last_error ?? "Sync failed");
+                        if (r.last_synced_commit_sha) toast.success("Mirrorをsyncしました");
+                        else toast.error(r.last_error ?? "syncに失敗しました");
                       }).catch(e => toast.error(String(e)))}
                       disabled={sync.isPending || c.status !== "connected"}
                     >
@@ -296,25 +296,25 @@ function ConnectionsPanel({ appConfigured }: { appConfigured: boolean }) {
       <CreateConnectionDialog open={showCreate} onOpenChange={setShowCreate} />
 
       <Dialog open={disconnectTarget !== null} onOpenChange={(open) => { if (!open) setDisconnectTarget(null); }}>
-        <DialogHeader><DialogTitle>Disconnect repository</DialogTitle></DialogHeader>
+        <DialogHeader><DialogTitle>Repositoryをdisconnect</DialogTitle></DialogHeader>
         {disconnectTarget && (
           <div className="space-y-4">
             <p className="text-sm">
-              This disconnects <code className="font-mono">{disconnectTarget.owner}/{disconnectTarget.repo}</code> from
-              this System (soft delete). Any publish job still pending or awaiting approval is
-              cancelled immediately; jobs already committing, pushing, or creating a Pull Request
-              block the disconnect until they finish. Completed jobs and their Pull Request links
-              are kept for audit; new publish jobs cannot be created until reconnected.
+              <code className="font-mono">{disconnectTarget.owner}/{disconnectTarget.repo}</code> をこの
+              Systemからdisconnectします（soft delete）。pending中または承認待ちのpublish jobは
+              直ちにcancelされます。commit・push・Pull Request作成中のjobは完了するまで
+              disconnectをblockします。完了済みjobとそのPull Requestリンクは監査のため保持され、
+              再接続するまで新しいpublish jobは作成できません。
             </p>
             <Button
               variant="destructive" className="w-full"
               onClick={() => disconnect.mutateAsync(disconnectTarget.id).then(() => {
-                toast.success("Connection disconnected");
+                toast.success("Connectionをdisconnectしました");
                 setDisconnectTarget(null);
               }).catch(e => toast.error(String(e)))}
               disabled={disconnect.isPending}
             >
-              {disconnect.isPending ? "Disconnecting..." : "Disconnect"}
+              {disconnect.isPending ? "disconnect中..." : "Disconnect"}
             </Button>
           </div>
         )}
@@ -343,7 +343,7 @@ function CreateConnectionDialog({ open, onOpenChange }: { open: boolean; onOpenC
     if (!installationId || !owner.trim() || !repo.trim()) return;
     try {
       await createConnection.mutateAsync({ owner: owner.trim(), repo: repo.trim(), installation_id: installationId });
-      toast.success("Connection created — verify it next");
+      toast.success("Connectionを作成しました — 次に検証してください");
       onOpenChange(false);
       reset();
     } catch (e) { toast.error(String(e)); }
@@ -351,23 +351,23 @@ function CreateConnectionDialog({ open, onOpenChange }: { open: boolean; onOpenC
 
   return (
     <Dialog open={open} onOpenChange={(o) => { onOpenChange(o); if (!o) reset(); }}>
-      <DialogHeader><DialogTitle>New GitHub connection</DialogTitle></DialogHeader>
+      <DialogHeader><DialogTitle>新規GitHub connection</DialogTitle></DialogHeader>
       <div className="space-y-4">
         <div className="space-y-2">
-          <Label>Assigned installation</Label>
+          <Label>割り当て済みInstallation</Label>
           {installationsLoading ? <Skeleton className="h-9 w-full" /> : (
             <Select
               value={installationId?.toString() ?? ""}
               onChange={e => { setInstallationId(Number(e.target.value) || null); setOwner(""); setRepo(""); setManualEntry(false); }}
               data-testid="installation-select"
             >
-              <option value="">Select an assigned installation...</option>
+              <option value="">割り当て済みInstallationを選択...</option>
               {installations?.map(i => <option key={i.installation_id} value={i.installation_id}>
                 #{i.installation_id} · {i.github_account_login}
               </option>)}
             </Select>
           )}
-          {!installationsLoading && !installations?.length && <p className="text-xs text-muted-foreground">An administrator must register and assign an installation to this System first.</p>}
+          {!installationsLoading && !installations?.length && <p className="text-xs text-muted-foreground">管理者が先にInstallationを登録し、このSystemに割り当てる必要があります。</p>}
         </div>
 
         {installationId !== null && (
@@ -375,7 +375,7 @@ function CreateConnectionDialog({ open, onOpenChange }: { open: boolean; onOpenC
             <Skeleton className="h-9 w-full" />
           ) : reposError ? (
             <p className="text-xs text-destructive">
-              Could not list repositories for this installation. Enter owner/repo manually below.
+              このInstallationのrepository一覧を取得できませんでした。下でowner/repoを手動入力してください。
             </p>
           ) : repos && repos.length > 0 && !manualEntry ? (
             <div className="space-y-2">
@@ -385,7 +385,7 @@ function CreateConnectionDialog({ open, onOpenChange }: { open: boolean; onOpenC
                 onChange={e => { const [o, r] = e.target.value.split("/"); setOwner(o ?? ""); setRepo(r ?? ""); }}
                 data-testid="installation-repo-select"
               >
-                <option value="">Select repository...</option>
+                <option value="">repositoryを選択...</option>
                 {repos.map(r => (
                   <option key={`${r.owner}/${r.name}`} value={`${r.owner}/${r.name}`}>
                     {r.owner}/{r.name}{r.private ? " (private)" : ""}
@@ -393,7 +393,7 @@ function CreateConnectionDialog({ open, onOpenChange }: { open: boolean; onOpenC
                 ))}
               </Select>
               <Button type="button" variant="ghost" size="sm" className="text-xs" onClick={() => setManualEntry(true)}>
-                Enter owner/repo manually
+                owner/repoを手動入力
               </Button>
             </div>
           ) : null
@@ -416,7 +416,7 @@ function CreateConnectionDialog({ open, onOpenChange }: { open: boolean; onOpenC
           className="w-full" onClick={submit}
           disabled={createConnection.isPending || installationId === null || !owner.trim() || !repo.trim()}
         >
-          {createConnection.isPending ? "Creating..." : "Create connection"}
+          {createConnection.isPending ? "作成中..." : "Connectionを作成"}
         </Button>
       </div>
     </Dialog>
@@ -459,9 +459,9 @@ function PublishJobsPanel({ prefillPatchId }: { prefillPatchId: number | null })
           <div>
             <CardTitle className="text-base">Publish Jobs</CardTitle>
             <CardDescription>
-              Commit/push/PR creation for an approved, validated probe patch. Publishing always
-              requires an explicit approval and pushes only to a server-generated <code>probe/</code>
-              branch — never the default branch, never a force push.
+              承認・検証済みprobe patchのcommit/push/PR作成。Publishには常に明示的な承認が
+              必要で、pushはサーバー生成の<code>probe/</code>branchにのみ行われます —
+              default branchへのpushやforce pushは行いません。
             </CardDescription>
           </div>
           <Button
@@ -469,7 +469,7 @@ function PublishJobsPanel({ prefillPatchId }: { prefillPatchId: number | null })
             disabled={connectedConnections.length === 0}
             data-testid="new-publish-job-button"
           >
-            <Plus className="h-4 w-4 mr-1" /> New publish job
+            <Plus className="h-4 w-4 mr-1" /> 新規Publish Job
           </Button>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -479,7 +479,7 @@ function PublishJobsPanel({ prefillPatchId }: { prefillPatchId: number | null })
               onChange={e => setConnectionFilter(e.target.value ? Number(e.target.value) : null)}
               data-testid="publish-job-connection-filter"
             >
-              <option value="">All connections</option>
+              <option value="">すべてのConnection</option>
               {(connections ?? []).map(c => (
                 <option key={c.id} value={c.id}>{c.owner}/{c.repo}</option>
               ))}
@@ -489,7 +489,7 @@ function PublishJobsPanel({ prefillPatchId }: { prefillPatchId: number | null })
           {isLoading ? (
             <div className="space-y-2">{[1, 2].map(i => <Skeleton key={i} className="h-14 w-full" />)}</div>
           ) : !jobs?.length ? (
-            <p className="text-sm text-muted-foreground text-center py-8">No publish jobs yet.</p>
+            <p className="text-sm text-muted-foreground text-center py-8">Publish Jobはまだありません。</p>
           ) : (
             <div className="space-y-2" data-testid="publish-jobs-list">
               {jobs.map(job => {
@@ -583,7 +583,7 @@ function CreatePublishJobDialog({ open, onOpenChange, connections, defaultConnec
     if (!connectionId || !patchId) return;
     try {
       await createJob.mutateAsync({ connectionId, patchId });
-      toast.success("Publish job created — it will pause for approval once prepared");
+      toast.success("Publish jobを作成しました — 準備完了後、承認待ちで一時停止します");
       onOpenChange(false);
       setPatchIdOverride(null);
     } catch (e) { toast.error(String(e)); }
@@ -591,7 +591,7 @@ function CreatePublishJobDialog({ open, onOpenChange, connections, defaultConnec
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogHeader><DialogTitle>New publish job</DialogTitle></DialogHeader>
+      <DialogHeader><DialogTitle>新規Publish Job</DialogTitle></DialogHeader>
       <div className="space-y-4">
         <div className="space-y-2">
           <Label>Connection</Label>
@@ -600,19 +600,19 @@ function CreatePublishJobDialog({ open, onOpenChange, connections, defaultConnec
             onChange={e => setConnectionId(e.target.value ? Number(e.target.value) : null)}
             data-testid="publish-job-connection-select"
           >
-            <option value="">Select connection...</option>
+            <option value="">Connectionを選択...</option>
             {connections.map(c => <option key={c.id} value={c.id}>{c.owner}/{c.repo}</option>)}
           </Select>
           {connections.length === 0 && (
-            <p className="text-xs text-muted-foreground">No verified (connected) connections yet.</p>
+            <p className="text-xs text-muted-foreground">検証済み（connected）のConnectionがまだありません。</p>
           )}
         </div>
         <div className="space-y-2">
           <Label>Probe patch</Label>
           {readyPatches.length === 0 ? (
             <p className="text-xs text-muted-foreground">
-              No patch with a green baseline + probed validation yet. Validate a patch on the{" "}
-              <span className="font-medium">Probe Planner</span> page first.
+              baseline・probed両方の検証がgreenのpatchがまだありません。先に{" "}
+              <span className="font-medium">Probe Planner</span> ページでpatchを検証してください。
             </p>
           ) : (
             <Select
@@ -620,7 +620,7 @@ function CreatePublishJobDialog({ open, onOpenChange, connections, defaultConnec
               onChange={e => setPatchIdOverride(e.target.value ? Number(e.target.value) : null)}
               data-testid="publish-job-patch-select"
             >
-              <option value="">Select patch...</option>
+              <option value="">patchを選択...</option>
               {readyPatches.map(p => (
                 <option key={p.id} value={p.id}>
                   Patch #{p.id} · plan #{p.plan_id} · {shortSha(p.commit_sha)}
@@ -633,7 +633,7 @@ function CreatePublishJobDialog({ open, onOpenChange, connections, defaultConnec
           className="w-full" onClick={submit}
           disabled={createJob.isPending || !connectionId || !patchId}
         >
-          {createJob.isPending ? "Creating..." : "Create publish job"}
+          {createJob.isPending ? "作成中..." : "Publish Jobを作成"}
         </Button>
       </div>
     </Dialog>
@@ -684,10 +684,10 @@ function PublishJobDetailDialog({ job, connection, onClose }: {
           <div><span className="text-muted-foreground">Base commit:</span> <code className="font-mono">{shortSha(job.base_commit_sha)}</code></div>
           <div><span className="text-muted-foreground">Publish branch:</span> {job.branch_name ?? "—"}</div>
           <div><span className="text-muted-foreground">Commit:</span> <code className="font-mono">{shortSha(job.commit_sha)}</code></div>
-          <div><span className="text-muted-foreground">Requested by:</span> {userLabel(job.requested_by_user_id, usernames)}</div>
-          <div><span className="text-muted-foreground">Approved by:</span> {userLabel(job.approved_by_user_id, usernames)}</div>
+          <div><span className="text-muted-foreground">申請者:</span> {userLabel(job.requested_by_user_id, usernames)}</div>
+          <div><span className="text-muted-foreground">承認者:</span> {userLabel(job.approved_by_user_id, usernames)}</div>
           {job.retry_count > 0 && (
-            <div><span className="text-muted-foreground">Retries:</span> {job.retry_count}</div>
+            <div><span className="text-muted-foreground">Retry回数:</span> {job.retry_count}</div>
           )}
         </div>
 
@@ -722,7 +722,7 @@ function PublishJobDetailDialog({ job, connection, onClose }: {
 
         {summary && (
           <div className="space-y-1">
-            <div className="text-xs font-medium">Validation summary</div>
+            <div className="text-xs font-medium">検証サマリ</div>
             <div className="flex gap-2 text-xs">
               {Object.entries(summary).map(([variant, result]) => (
                 <Badge key={variant} variant={result.overall_success ? "success" : "destructive"}>
@@ -747,7 +747,7 @@ function PublishJobDetailDialog({ job, connection, onClose }: {
 
         {job.status === "awaiting_approval" && patch?.diff && (
           <details className="text-xs">
-            <summary className="cursor-pointer text-muted-foreground">Patch diff to be published</summary>
+            <summary className="cursor-pointer text-muted-foreground">publish予定のPatch diff</summary>
             <pre className="mt-2 overflow-x-auto rounded-md bg-muted p-3 text-xs font-mono max-h-64 overflow-y-auto">
               {patch.diff}
             </pre>
@@ -760,23 +760,23 @@ function PublishJobDetailDialog({ job, connection, onClose }: {
               onClick={() => setShowApprove(true)}
               data-testid="publish-job-approve-button"
             >
-              <CheckCircle2 className="h-4 w-4 mr-1" /> Approve
+              <CheckCircle2 className="h-4 w-4 mr-1" /> 承認
             </Button>
           )}
           {(job.status === "retryable_failed" || job.status === "manual_intervention_required") && (
             <Button
-              onClick={() => retry.mutateAsync(job.id).then(() => toast.success("Retrying publish job")).catch(e => toast.error(String(e)))}
+              onClick={() => retry.mutateAsync(job.id).then(() => toast.success("Publish jobを再試行しています")).catch(e => toast.error(String(e)))}
               disabled={retry.isPending}
               data-testid="publish-job-retry-button"
             >
-              <RotateCcw className="h-4 w-4 mr-1" /> Retry
+              <RotateCcw className="h-4 w-4 mr-1" /> 再試行
             </Button>
           )}
           {(job.status === "pending" || job.status === "awaiting_approval"
             || job.status === "retryable_failed" || job.status === "manual_intervention_required") && (
             <Button
               variant="outline"
-              onClick={() => cancel.mutateAsync(job.id).then(() => toast.success("Publish job cancelled")).catch(e => toast.error(String(e)))}
+              onClick={() => cancel.mutateAsync(job.id).then(() => toast.success("Publish jobをcancelしました")).catch(e => toast.error(String(e)))}
               disabled={cancel.isPending}
               data-testid="publish-job-cancel-button"
             >
@@ -787,23 +787,23 @@ function PublishJobDetailDialog({ job, connection, onClose }: {
       </div>
 
       <Dialog open={showApprove} onOpenChange={setShowApprove}>
-        <DialogHeader><DialogTitle>Approve publish</DialogTitle></DialogHeader>
+        <DialogHeader><DialogTitle>Publishを承認</DialogTitle></DialogHeader>
         <div className="space-y-4">
           <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/20 dark:text-amber-100">
-            This commits the validated patch to a new branch and pushes it to{" "}
-            <code className="font-mono">{connection?.owner}/{connection?.repo}</code>, then opens a Pull
-            Request against <code className="font-mono">{job.base_branch}</code>. probe-agent never merges
-            the PR — you review and merge it on GitHub.
+            検証済みpatchを新しいbranchにcommitし、{" "}
+            <code className="font-mono">{connection?.owner}/{connection?.repo}</code> にpushした上で、
+            <code className="font-mono">{job.base_branch}</code> に対してPull Requestを開きます。
+            probe-agentはPRをmergeしません — GitHub上でレビューしてmergeしてください。
           </div>
           <div className="space-y-1 text-sm">
             <div>Target: <code className="font-mono">{connection?.owner}/{connection?.repo}</code></div>
             <div>Base branch: <code className="font-mono">{job.base_branch}</code> at <code className="font-mono">{shortSha(job.base_commit_sha)}</code></div>
-            <div>New branch: <code className="font-mono">{job.branch_name ?? "(generated on approval)"}</code></div>
+            <div>New branch: <code className="font-mono">{job.branch_name ?? "(承認時に生成されます)"}</code></div>
           </div>
 
           {patch?.diff && (
             <details className="text-xs" open data-testid="publish-job-confirm-diff">
-              <summary className="cursor-pointer text-muted-foreground">Patch diff to be published</summary>
+              <summary className="cursor-pointer text-muted-foreground">publish予定のPatch diff</summary>
               <pre className="mt-2 overflow-x-auto rounded-md bg-muted p-3 text-xs font-mono max-h-64 overflow-y-auto">
                 {patch.diff}
               </pre>
@@ -813,13 +813,13 @@ function PublishJobDetailDialog({ job, connection, onClose }: {
           <Button
             className="w-full"
             onClick={() => approve.mutateAsync(job.id).then(() => {
-              toast.success("Approved — publishing in progress");
+              toast.success("承認しました — publishを実行中です");
               setShowApprove(false);
             }).catch(e => toast.error(String(e)))}
             disabled={approve.isPending}
             data-testid="publish-job-confirm-approve-button"
           >
-            {approve.isPending ? "Approving..." : "Approve and publish"}
+            {approve.isPending ? "承認中..." : "承認してpublish"}
           </Button>
         </div>
       </Dialog>
