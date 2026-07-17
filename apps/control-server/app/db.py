@@ -2707,6 +2707,21 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE interview_session ADD COLUMN answers_revised_at REAL"
             )
+        if "understanding_rebuilt_at" not in session_cols:
+            # Review-finding fix: last-successful-rebuild watermark for the
+            # `_understanding_update_blocked` gate. Without this, the
+            # interview_qa "new answer since confirmation" check always
+            # compared against the original `understanding_confirmed_at`,
+            # which never advances, so once a single Q&A row was
+            # created/answered after confirmation the gate stayed open
+            # forever even after a successful rebuild had already consumed
+            # that answer. Set only on a SUCCESSFUL
+            # `update_interview_understanding` rebuild; left NULL on existing
+            # rows and on failed rebuilds so the gate keeps its current
+            # (open) behavior until the next successful rebuild.
+            conn.execute(
+                "ALTER TABLE interview_session ADD COLUMN understanding_rebuilt_at REAL"
+            )
         proposal_cols = _columns(conn, "interview_proposal")
         if proposal_cols and "graph_node_id" not in proposal_cols:
             conn.execute("ALTER TABLE interview_proposal ADD COLUMN graph_node_id TEXT")

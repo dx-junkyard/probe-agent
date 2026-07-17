@@ -6989,7 +6989,58 @@ describe("GitHub page", () => {
     expect(await screen.findByText("Publishを承認")).toBeInTheDocument();
     const confirmDiff = await screen.findByTestId("publish-job-confirm-diff");
     expect(confirmDiff).toHaveTextContent(patchFixture.diff);
+    expect(screen.queryByTestId("publish-job-confirm-diff-unavailable")).not.toBeInTheDocument();
     expect(screen.getByTestId("publish-job-confirm-approve-button")).toBeInTheDocument();
+    expect(screen.getByTestId("publish-job-confirm-approve-button")).not.toBeDisabled();
+  });
+
+  test("approval confirmation button stays disabled and warns when the patch diff cannot be found (fail-closed)", async () => {
+    mockGithubData({
+      connections: [connectionFixture],
+      jobs: [jobFixture({ id: 3, status: "awaiting_approval" })],
+      patches: [], // job.patch_id (20) is not present in the probe-patches list
+    });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-3")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("publish-job-3"));
+    fireEvent.click(await screen.findByTestId("publish-job-approve-button"));
+
+    expect(await screen.findByTestId("publish-job-confirm-diff-unavailable")).toHaveTextContent(
+      "Patch diffを取得できないため、承認できません。",
+    );
+    expect(screen.queryByTestId("publish-job-confirm-diff")).not.toBeInTheDocument();
+    expect(screen.getByTestId("publish-job-confirm-approve-button")).toBeDisabled();
+  });
+
+  test("approval confirmation button stays disabled and warns when the probe-patches fetch fails (fail-closed)", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/github/app-status") {
+        return Promise.resolve({
+          configured: true, app_id: "123",
+          api_base_url: "https://api.github.com", web_base_url: "https://github.com",
+        });
+      }
+      if (path === "/github/connections") return Promise.resolve([connectionFixture]);
+      if (path === "/github/publish-jobs") return Promise.resolve([jobFixture({ id: 3, status: "awaiting_approval" })]);
+      if (path === "/repository/probe-patches") return Promise.reject(new ApiError(500, "boom"));
+      if (path === "/users") return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-3")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("publish-job-3"));
+    fireEvent.click(await screen.findByTestId("publish-job-approve-button"));
+
+    expect(await screen.findByTestId("publish-job-confirm-diff-unavailable")).toHaveTextContent(
+      "Patch diffの取得に失敗したため、承認できません。",
+    );
+    expect(screen.getByTestId("publish-job-confirm-approve-button")).toBeDisabled();
   });
 
   test("approve button is hidden for a completed job", async () => {
@@ -8749,13 +8800,48 @@ describe("Overview get-started per-step completion (Issue #267)", () => {
   });
 
   test("marks step 3 done once at least one SDK token has been issued", async () => {
-    mockOverview267({ tokens: [{ id: 1, name: "svc", kind: "user", created_at: 1, expires_at: null, revoked: false }] });
+    mockOverview267({ tokens: [{ id: 1, name: "svc", kind: "api", system_id: 1, user_id: 1, created_at: 1, expires_at: null, revoked: false }] });
     const { default: OverviewPage } = await import("@/pages/overview");
     render(<OverviewPage />, { wrapper: createWrapper() });
 
     const getStarted = await screen.findByTestId("overview-get-started");
     const step3 = within(getStarted).getByTestId("overview-link-connect-sdk");
     await waitFor(() => expect(step3).toHaveAttribute("data-done", "true"));
+  });
+
+  test("does not mark step 3 done from a session-kind token alone (login session, not an SDK token)", async () => {
+    mockOverview267({ tokens: [{ id: 2, name: "login session", kind: "session", system_id: null, user_id: 1, created_at: 1, expires_at: null, revoked: false }] });
+    const { default: OverviewPage } = await import("@/pages/overview");
+    render(<OverviewPage />, { wrapper: createWrapper() });
+
+    const getStarted = await screen.findByTestId("overview-get-started");
+    const step3 = within(getStarted).getByTestId("overview-link-connect-sdk");
+    await waitFor(() => expect(step3).toHaveAttribute("data-done", "false"));
+  });
+
+  test("does not mark step 3 done from a revoked or expired SDK token", async () => {
+    mockOverview267({
+      tokens: [
+        { id: 3, name: "revoked-svc", kind: "api", system_id: 1, user_id: 1, created_at: 1, expires_at: null, revoked: true },
+        { id: 4, name: "expired-svc", kind: "api", system_id: 1, user_id: 1, created_at: 1, expires_at: 1, revoked: false },
+      ],
+    });
+    const { default: OverviewPage } = await import("@/pages/overview");
+    render(<OverviewPage />, { wrapper: createWrapper() });
+
+    const getStarted = await screen.findByTestId("overview-get-started");
+    const step3 = within(getStarted).getByTestId("overview-link-connect-sdk");
+    await waitFor(() => expect(step3).toHaveAttribute("data-done", "false"));
+  });
+
+  test("does not mark step 3 done from an SDK token scoped to a different System", async () => {
+    mockOverview267({ tokens: [{ id: 5, name: "other-system-svc", kind: "api", system_id: 2, user_id: 1, created_at: 1, expires_at: null, revoked: false }] });
+    const { default: OverviewPage } = await import("@/pages/overview");
+    render(<OverviewPage />, { wrapper: createWrapper() });
+
+    const getStarted = await screen.findByTestId("overview-get-started");
+    const step3 = within(getStarted).getByTestId("overview-link-connect-sdk");
+    await waitFor(() => expect(step3).toHaveAttribute("data-done", "false"));
   });
 
   test("steps 1 and 2 stay not-done and are labeled recommended-not-required when nothing exists yet", async () => {

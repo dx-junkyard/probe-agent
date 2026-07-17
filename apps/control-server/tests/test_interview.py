@@ -1250,6 +1250,181 @@ def test_update_understanding_stays_blocked_with_no_new_qa_activity(
     assert runs == 0
 
 
+# --- Review-finding fix: last-successful-rebuild watermark ------------------
+
+
+def test_update_understanding_gate_closes_after_successful_rebuild(admin_client, monkeypatch):
+    """A new Q&A answer given after confirmation opens the rebuild gate
+    (Issue #263). Once a rebuild actually SUCCEEDS and consumes that answer,
+    the gate must close again -- without this fix, the interview_qa
+    condition kept comparing against the original confirmation timestamp
+    forever, so the same already-consumed row kept the gate open even after
+    a successful rebuild."""
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("LLM_MODEL", "o3-mini")
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+    token, system_id, snapshot_id = _setup(admin_client)
+    _insert_understanding_graph(system_id, snapshot_id)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "gate closes after rebuild"},
+        headers=headers,
+    ).json()
+    sid = session["id"]
+
+    qa = admin_client.post(
+        f"/interview/sessions/{sid}/qa",
+        json={
+            "question_text": "対象コンポーネントは何ですか?",
+            "question_category": "purpose",
+            "question_source": "reviewer",
+        },
+        headers=headers,
+    ).json()
+
+    time.sleep(0.01)
+    _confirm_and_reach_proposal_generation(admin_client, sid, headers)
+
+    time.sleep(0.01)
+    answer = admin_client.post(
+        f"/interview/sessions/{sid}/qa/{qa['id']}/answer",
+        json={"answer_text": "APIサーバーです", "actor": "root"},
+        headers=headers,
+    )
+    assert answer.status_code == 200, answer.text
+
+    opened = admin_client.get(f"/interview/sessions/{sid}", headers=headers).json()
+    assert opened["understanding_update_available"] is True
+
+    class FakeReviewClient:
+        def generate_text(self, messages, *, temperature=None, max_tokens=None):
+            import json as _json
+
+            return _json.dumps({
+                "system_purpose": [{
+                    "name": "Probe repository inspection",
+                    "summary": "Inspects probe agent repositories",
+                    "confidence": {"level": "likely", "reason": "README evidence"},
+                    "evidence": [{
+                        "path": "README.md",
+                        "start_line": 1,
+                        "end_line": 5,
+                        "summary": "README states purpose",
+                    }],
+                    "why_core": "",
+                    "related_docs": ["README.md"],
+                    "related_apis": [],
+                    "children": [],
+                }],
+                "core_capabilities": [],
+                "capability_elements": [],
+                "supporting_elements": [],
+                "api_boundaries": [],
+                "probe_flow_candidates": [],
+                "gap_analysis": [],
+                "open_questions": [],
+                "suggested_next_action": "confirm_purpose",
+            })
+
+    import app.routes.interview as interview_route
+
+    monkeypatch.setattr(interview_route, "create_llm_client", lambda config: FakeReviewClient())
+
+    rebuild = admin_client.post(
+        f"/interview/sessions/{sid}/update-understanding", headers=headers,
+    )
+    assert rebuild.status_code == 200, rebuild.text
+    assert rebuild.json()["last_error"] is None
+
+    # The successful rebuild consumed the new answer -- the gate must close
+    # again with no further developer input.
+    closed = admin_client.get(f"/interview/sessions/{sid}", headers=headers).json()
+    assert closed["understanding_update_available"] is False
+
+    blocked_again = admin_client.post(
+        f"/interview/sessions/{sid}/update-understanding", headers=headers,
+    )
+    assert blocked_again.status_code == 409, blocked_again.text
+    assert blocked_again.json()["detail"]["code"] == "understanding_update_not_available"
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT understanding_rebuilt_at FROM interview_session WHERE id = ?",
+            (sid,),
+        ).fetchone()
+    assert row["understanding_rebuilt_at"] is not None
+
+
+def test_update_understanding_failed_rebuild_leaves_gate_open(admin_client, monkeypatch):
+    """A FAILED rebuild (missing graph) must not advance the watermark: the
+    same new Q&A answer that opened the gate must keep it open until a
+    rebuild actually succeeds."""
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setenv("LLM_MODEL", "mock")
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    # No _insert_understanding_graph call -- update-understanding hits the
+    # graph_not_built failure path below.
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "failed rebuild keeps gate open"},
+        headers=headers,
+    ).json()
+    sid = session["id"]
+
+    qa = admin_client.post(
+        f"/interview/sessions/{sid}/qa",
+        json={
+            "question_text": "対象コンポーネントは何ですか?",
+            "question_category": "purpose",
+            "question_source": "reviewer",
+        },
+        headers=headers,
+    ).json()
+
+    time.sleep(0.01)
+    _confirm_and_reach_proposal_generation(admin_client, sid, headers)
+
+    time.sleep(0.01)
+    answer = admin_client.post(
+        f"/interview/sessions/{sid}/qa/{qa['id']}/answer",
+        json={"answer_text": "APIサーバーです", "actor": "root"},
+        headers=headers,
+    )
+    assert answer.status_code == 200, answer.text
+
+    opened = admin_client.get(f"/interview/sessions/{sid}", headers=headers).json()
+    assert opened["understanding_update_available"] is True
+
+    failed = admin_client.post(
+        f"/interview/sessions/{sid}/update-understanding", headers=headers,
+    )
+    assert failed.status_code == 200, failed.text
+    assert failed.json()["last_error"]
+    assert "理解グラフが未構築" in failed.json()["last_error"]
+
+    # The failure must not have closed the gate.
+    still_open = admin_client.get(f"/interview/sessions/{sid}", headers=headers).json()
+    assert still_open["understanding_update_available"] is True
+
+    retried = admin_client.post(
+        f"/interview/sessions/{sid}/update-understanding", headers=headers,
+    )
+    assert retried.status_code == 200, retried.text
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT understanding_rebuilt_at FROM interview_session WHERE id = ?",
+            (sid,),
+        ).fetchone()
+    assert row["understanding_rebuilt_at"] is None
+
+
 def test_update_understanding_injects_qa_panel_only_answer(admin_client, monkeypatch):
     """An answer given ONLY through the Q&A panel (no interview_message row
     is ever created for it) must still reach the review prompt (Issue

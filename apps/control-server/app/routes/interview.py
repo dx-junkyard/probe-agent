@@ -173,12 +173,24 @@ def _understanding_update_blocked(conn, session, system_id: int) -> bool:
     - the session has reached ``proposal_generation``,
     - the understanding was manually confirmed
       (``understanding_confirmed_at`` is set), and
-    - no developer input has arrived since confirmation: no answer
+    - no developer input has arrived since the rebuild watermark: no answer
       correction (``answers_revised_at``) and no ``interview_qa`` row
-      created or answered after ``understanding_confirmed_at`` (a first-time
-      answer given only through the Q&A panel, or an answer to a newly
-      issued Runtime Reality Check question, both of which never touch
+      created or answered after the watermark (a first-time answer given
+      only through the Q&A panel, or an answer to a newly issued Runtime
+      Reality Check question, both of which never touch
       ``answers_revised_at``).
+
+    The watermark is ``understanding_rebuilt_at`` when set, else
+    ``understanding_confirmed_at``. This fixes a once-opened-never-closes
+    bug: comparing the ``interview_qa`` rows against the original
+    confirmation timestamp alone meant that a single Q&A row created or
+    answered after confirmation kept the gate open forever, even after a
+    successful rebuild had already consumed that row's input into a new
+    understanding. ``understanding_rebuilt_at`` is set only on a
+    *successful* rebuild (never on a failed one), so a failed rebuild
+    correctly leaves the gate open, and each successful rebuild advances the
+    watermark so only genuinely new input (arriving after that rebuild)
+    reopens it.
     """
     if (session["stage"] or "understanding_initialized") != "proposal_generation":
         return False
@@ -187,7 +199,12 @@ def _understanding_update_blocked(conn, session, system_id: int) -> bool:
         return False
     if session["answers_revised_at"] is not None:
         return False
-    new_qa_since_confirmation = conn.execute(
+    rebuilt_at = (
+        session["understanding_rebuilt_at"]
+        if "understanding_rebuilt_at" in session.keys() else None
+    )
+    watermark = max(confirmed_at, rebuilt_at) if rebuilt_at is not None else confirmed_at
+    new_qa_since_watermark = conn.execute(
         """SELECT 1 FROM interview_qa
            WHERE session_id = ? AND system_id = ?
              AND (
@@ -195,9 +212,9 @@ def _understanding_update_blocked(conn, session, system_id: int) -> bool:
                OR (answered_at IS NOT NULL AND answered_at > ?)
              )
            LIMIT 1""",
-        (session["id"], system_id, confirmed_at, confirmed_at),
+        (session["id"], system_id, watermark, watermark),
     ).fetchone()
-    return new_qa_since_confirmation is None
+    return new_qa_since_watermark is None
 
 
 def _load_qa_pairs(
@@ -2732,9 +2749,10 @@ def update_interview_understanding(
         conn.execute(
             """UPDATE interview_session
                SET current_understanding = ?, gap_analysis = ?, open_questions = ?,
-                   stage = ?, last_error = NULL, answers_revised_at = NULL, updated_at = ?
+                   stage = ?, last_error = NULL, answers_revised_at = NULL,
+                   understanding_rebuilt_at = ?, updated_at = ?
                WHERE id = ? AND system_id = ?""",
-            (understanding_json, gap_json, questions_json, new_stage, now, session_id, system_id),
+            (understanding_json, gap_json, questions_json, new_stage, now, now, session_id, system_id),
         )
 
         # Issue #136: an existing session whose understanding was built before

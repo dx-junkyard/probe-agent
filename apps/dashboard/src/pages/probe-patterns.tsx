@@ -69,14 +69,13 @@ export default function ProbePatternsPage() {
         <div>
           <h1 className="text-2xl font-bold tracking-tight">Probe Patterns</h1>
           <p className="text-sm text-muted-foreground mt-1">
-            Reusable observation units: save probes before a production
-            release, then reconcile them against the changed implementation
-            when development resumes.
+            再利用可能な観測ユニットです。本番releaseの前にprobeをpatternとして
+            保存し、開発再開時に変更後の実装とreconcileしてください。
           </p>
         </div>
         <Button size="sm" onClick={() => setScanOpen(v => !v)}>
           <ScanSearch className="h-4 w-4 mr-1" />
-          {scanOpen ? "Hide Scan" : "Scan Instrumentation"}
+          {scanOpen ? "スキャンを隠す" : "計装をスキャン"}
         </Button>
       </div>
 
@@ -87,8 +86,8 @@ export default function ProbePatternsPage() {
       ) : !patterns.length ? (
         <Card>
           <CardContent className="py-8 text-center text-sm text-muted-foreground">
-            No probe patterns yet. Scan the current instrumentation and save
-            probes as a pattern before removing them for release.
+            まだProbe Patternがありません。現在の計装をスキャンし、releaseで
+            除去する前にprobeをpatternとして保存してください。
           </CardContent>
         </Card>
       ) : (
@@ -154,7 +153,7 @@ function InstrumentationScanPanel({ patterns }: { patterns: ProbePatternOut[] })
           recommended_mode: p.linked_recommended_mode ?? "trace",
         })),
       });
-      toast.success("Pattern saved");
+      toast.success("Patternを保存しました");
       setSaveOpen(false);
       setSelected(new Set());
       setName("");
@@ -169,13 +168,13 @@ function InstrumentationScanPanel({ patterns }: { patterns: ProbePatternOut[] })
       <CardHeader>
         <CardTitle className="text-sm flex items-center gap-2">
           <Eraser className="h-4 w-4" />
-          Pre-release probe removal
+          リリース前のprobe除去
         </CardTitle>
         <CardDescription>
-          Probes found in the latest committed snapshot
-          {data && <> (<code className="font-mono text-xs">{data.commit_sha.slice(0, 8)}</code>)</>}.
-          Save them as a pattern first so their purpose survives the removal,
-          then generate the removal patch from the pattern below.
+          最新のcommit済みsnapshotで見つかったprobeです
+          {data && <> (<code className="font-mono text-xs">{data.commit_sha.slice(0, 8)}</code>)</>}。
+          除去後もその目的が失われないよう、まずpatternとして保存し、
+          その後下のpatternからremoval patchを生成してください。
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
@@ -187,7 +186,7 @@ function InstrumentationScanPanel({ patterns }: { patterns: ProbePatternOut[] })
           </div>
         ) : !probes.length ? (
           <div className="text-sm text-muted-foreground">
-            No @probe instrumentation found in the latest snapshot.
+            最新のsnapshotに@probe計装が見つかりません。
           </div>
         ) : (
           <>
@@ -210,7 +209,7 @@ function InstrumentationScanPanel({ patterns }: { patterns: ProbePatternOut[] })
                     <div className="space-y-1 min-w-0">
                       <div className="font-mono text-xs">{p.path}:{p.symbol}</div>
                       <div className="text-xs text-muted-foreground">
-                        Lines {p.line_start}–{p.line_end}
+                        {p.line_start}–{p.line_end}行目
                         {p.component_id && <> · component: {p.component_id}</>}
                       </div>
                       {p.linked_reason && (
@@ -221,7 +220,7 @@ function InstrumentationScanPanel({ patterns }: { patterns: ProbePatternOut[] })
                       )}
                       {inPatterns.length > 0 && (
                         <div className="text-xs text-muted-foreground">
-                          Already in pattern: {inPatterns.join(", ")}
+                          既にpatternに含まれています: {inPatterns.join(", ")}
                         </div>
                       )}
                     </div>
@@ -231,7 +230,7 @@ function InstrumentationScanPanel({ patterns }: { patterns: ProbePatternOut[] })
             </div>
             <Button size="sm" disabled={selected.size === 0} onClick={openSave}>
               <BookMarked className="h-4 w-4 mr-1" />
-              Save {selected.size || ""} selected as pattern
+              選択した{selected.size || ""}件をpatternとして保存
             </Button>
           </>
         )}
@@ -239,28 +238,28 @@ function InstrumentationScanPanel({ patterns }: { patterns: ProbePatternOut[] })
 
       <Dialog open={saveOpen} onOpenChange={setSaveOpen}>
         <DialogHeader>
-          <DialogTitle>Save Probe Pattern</DialogTitle>
+          <DialogTitle>Probe Patternを保存</DialogTitle>
         </DialogHeader>
         <div className="space-y-4">
           <div className="space-y-2">
-            <Label>Name</Label>
+            <Label>名前</Label>
             <Input value={name} onChange={e => setName(e.target.value)} placeholder="invoice-total-observation" />
           </div>
           <div className="space-y-2">
             <Label>Feature</Label>
-            <Input value={featureId} onChange={e => setFeatureId(e.target.value)} placeholder="feature-id (optional)" />
+            <Input value={featureId} onChange={e => setFeatureId(e.target.value)} placeholder="feature-id (任意)" />
           </div>
           <div className="space-y-2">
-            <Label>What does this pattern observe, and why?</Label>
+            <Label>このpatternが観測する対象と、その目的</Label>
             <Textarea
               value={objective}
               onChange={e => setObjective(e.target.value)}
-              placeholder="e.g. Verify invoice totals stay correct across tax/discount changes"
+              placeholder="例: tax/discountの変更後もinvoice合計が正しいことを検証する"
               rows={3}
             />
           </div>
           <div className="space-y-2">
-            <Label>Notes</Label>
+            <Label>メモ</Label>
             <Textarea value={description} onChange={e => setDescription(e.target.value)} rows={2} />
           </div>
           <Button
@@ -268,7 +267,7 @@ function InstrumentationScanPanel({ patterns }: { patterns: ProbePatternOut[] })
             disabled={!name.trim() || createPattern.isPending}
             onClick={save}
           >
-            {createPattern.isPending ? "Saving..." : "Save Pattern"}
+            {createPattern.isPending ? "保存中..." : "Patternを保存"}
           </Button>
         </div>
       </Dialog>
@@ -298,23 +297,23 @@ function PatternCard({ pattern, expanded, onToggle }: {
               <Badge variant={statusVariant}>{pattern.status}</Badge>
               <Badge variant="outline" className="text-[10px]">{pattern.origin}</Badge>
               {pattern.pending_decision_count > 0 && (
-                <Badge variant="warning">{pattern.pending_decision_count} to decide</Badge>
+                <Badge variant="warning">{pattern.pending_decision_count}件 決定待ち</Badge>
               )}
             </CardTitle>
             <CardDescription className="mt-1">
               {pattern.feature_id && <span className="mr-2">Feature: {pattern.feature_id}</span>}
-              {pattern.objective || "No objective recorded"}
+              {pattern.objective || "objectiveが記録されていません"}
             </CardDescription>
             <div className="mt-2 flex items-center gap-2 flex-wrap text-xs text-muted-foreground">
-              <span>{pattern.point_count} probe point{pattern.point_count === 1 ? "" : "s"}</span>
+              <span>Probe Point {pattern.point_count}件</span>
               {pattern.removed_point_count > 0 && (
-                <span>· {pattern.removed_point_count} removed from production</span>
+                <span>· {pattern.removed_point_count}件が本番から除去済み</span>
               )}
               {pattern.last_reconciled_at && (
-                <span>· reconciled {formatTimestamp(pattern.last_reconciled_at)}</span>
+                <span>· {formatTimestamp(pattern.last_reconciled_at)}にreconcile済み</span>
               )}
               {pattern.last_used_at && (
-                <span>· used {formatTimestamp(pattern.last_used_at)}</span>
+                <span>· {formatTimestamp(pattern.last_used_at)}に使用</span>
               )}
             </div>
             {rec && rec.status === "completed" && (
@@ -331,7 +330,7 @@ function PatternCard({ pattern, expanded, onToggle }: {
             )}
           </div>
           <span className="text-xs text-muted-foreground shrink-0">
-            saved from <code className="font-mono">{pattern.source_commit_sha.slice(0, 8)}</code>
+            <code className="font-mono">{pattern.source_commit_sha.slice(0, 8)}</code>から保存
           </span>
         </div>
       </CardHeader>
@@ -375,13 +374,13 @@ function PatternDetail({ patternId }: { patternId: number }) {
           size="sm" variant="outline"
           onClick={() =>
             update.mutateAsync({ patternId: pattern.id, status: archived ? "active" : "archived" })
-              .then(() => toast.success(archived ? "Patternを復元しました" : "Patternをarchiveしました"))
+              .then(() => toast.success(archived ? "Patternを復元しました" : "Patternをアーカイブしました"))
               .catch(e => toast.error(String(e)))
           }
         >
           {archived
             ? <><ArchiveRestore className="h-4 w-4 mr-1" /> 復元</>
-            : <><Archive className="h-4 w-4 mr-1" /> Archive</>}
+            : <><Archive className="h-4 w-4 mr-1" /> アーカイブ</>}
         </Button>
         <Button
           size="sm" variant="outline"
@@ -407,13 +406,13 @@ function PatternDetail({ patternId }: { patternId: number }) {
               <div className="flex items-center justify-between gap-2">
                 <span className="font-mono text-xs">{pt.path}:{pt.symbol}</span>
                 <Badge variant={pt.status === "saved" ? "secondary" : "outline"}>
-                  {pt.status === "saved" ? "saved" : "removed from production"}
+                  {pt.status === "saved" ? "保存済み" : "本番から除去済み"}
                 </Badge>
               </div>
               <div className="text-xs text-muted-foreground">
-                Mode: {pt.recommended_mode} · Risk: {pt.side_effect_risk}
+                モード: {pt.recommended_mode} · リスク: {pt.side_effect_risk}
                 {pt.signature && <> · <code className="font-mono">{pt.signature}</code></>}
-                {pt.removed_at && <> · removed {formatTimestamp(pt.removed_at)}</>}
+                {pt.removed_at && <> · {formatTimestamp(pt.removed_at)}に除去</>}
               </div>
               {pt.reason && <div className="text-xs">{pt.reason}</div>}
             </div>
@@ -430,7 +429,7 @@ function PatternDetail({ patternId }: { patternId: number }) {
               reconciliationId: rec.id,
               objective,
             })
-              .then(plan => toast.success(`Probe plan #${plan.id} created — approve its points in the Probe Planner`))
+              .then(plan => toast.success(`Probe plan #${plan.id} を作成しました — Probe Plannerでpointを承認してください`))
               .catch(e => toast.error(String(e)))
           }
           createPending={createPlan.isPending}
@@ -443,7 +442,7 @@ function PatternDetail({ patternId }: { patternId: number }) {
 
       {pattern.events.length > 0 && (
         <div>
-          <h4 className="text-sm font-medium mb-2">History</h4>
+          <h4 className="text-sm font-medium mb-2">履歴</h4>
           <div className="space-y-1">
             {pattern.events.map(e => (
               <div key={e.id} className="text-xs text-muted-foreground flex gap-2">
@@ -480,11 +479,11 @@ function EditPatternDialog({ pattern, open, onOpenChange }: {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogHeader>
-        <DialogTitle>Edit Pattern</DialogTitle>
+        <DialogTitle>Patternを編集</DialogTitle>
       </DialogHeader>
       <div className="space-y-4">
         <div className="space-y-2">
-          <Label>Name</Label>
+          <Label>名前</Label>
           <Input value={name} onChange={e => setName(e.target.value)} />
         </div>
         <div className="space-y-2">
@@ -492,11 +491,11 @@ function EditPatternDialog({ pattern, open, onOpenChange }: {
           <Input value={featureId} onChange={e => setFeatureId(e.target.value)} />
         </div>
         <div className="space-y-2">
-          <Label>Objective</Label>
+          <Label>目的</Label>
           <Textarea value={objective} onChange={e => setObjective(e.target.value)} rows={3} />
         </div>
         <div className="space-y-2">
-          <Label>Notes</Label>
+          <Label>メモ</Label>
           <Textarea value={description} onChange={e => setDescription(e.target.value)} rows={2} />
         </div>
         <Button
@@ -510,11 +509,11 @@ function EditPatternDialog({ pattern, open, onOpenChange }: {
               objective,
               description,
             })
-              .then(() => { toast.success("Pattern updated"); onOpenChange(false); })
+              .then(() => { toast.success("Patternを更新しました"); onOpenChange(false); })
               .catch(e => toast.error(String(e)))
           }
         >
-          {update.isPending ? "Saving..." : "Save"}
+          {update.isPending ? "保存中..." : "保存"}
         </Button>
       </div>
     </Dialog>
@@ -540,28 +539,28 @@ function ReconciliationSection({ pattern, onCreatePlan, createPending }: {
     <div className="space-y-3">
       <div className="flex items-center justify-between">
         <h4 className="text-sm font-medium">
-          Latest reconciliation
+          最新のreconciliation
           <span className="ml-2 text-xs text-muted-foreground font-normal">
-            against <code className="font-mono">{rec.commit_sha.slice(0, 8)}</code> · {formatTimestamp(rec.created_at)}
+            対象: <code className="font-mono">{rec.commit_sha.slice(0, 8)}</code> · {formatTimestamp(rec.created_at)}
           </span>
         </h4>
         {rec.status === "completed" && (
           <Button size="sm" disabled={!eligible || createPending} onClick={() => onCreatePlan()}>
             <FileCode className="h-4 w-4 mr-1" />
-            {createPending ? "Creating..." : "Create Probe Plan"}
+            {createPending ? "作成中..." : "Probe Planを作成"}
           </Button>
         )}
       </div>
 
       {rec.status === "failed" && (
         <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800 dark:border-red-800 dark:bg-red-950/20 dark:text-red-200">
-          Reconciliation failed: {rec.error}. Deterministic results below remain
-          valid; configure a reasoning model and reconcile again for the rest.
+          Reconciliationに失敗しました: {rec.error}。以下のdeterministicな結果は
+          引き続き有効です。reasoning modelを設定し、残りを再度reconcileしてください。
         </div>
       )}
       {rec.is_mock && (
         <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-800 dark:bg-amber-950/20 dark:text-amber-200">
-          Mock provider — reasoning classifications are unavailable.
+          Mock provider — reasoning classificationは利用できません。
         </div>
       )}
 
@@ -575,10 +574,10 @@ function ReconciliationSection({ pattern, onCreatePlan, createPending }: {
         ))}
       </div>
       <p className="text-xs text-muted-foreground">
-        Exact matches are included in a new plan automatically; moved / changed
-        points need your confirmation first. The plan still goes through the
-        normal approval, validation, and apply gates in the{" "}
-        <Link to="/probe-planner" className="underline">Probe Planner</Link>.
+        exact matchは自動的に新しいplanに含まれます。moved / changedのpointは
+        先に確認が必要です。planは引き続き{" "}
+        <Link to="/probe-planner" className="underline">Probe Planner</Link>
+        内の通常のapproval・validation・apply gateを経由します。
       </p>
     </div>
   );
@@ -603,7 +602,7 @@ function ReconcilePointCard({ point, patternPoint }: {
         <Badge variant={meta.variant}>{meta.label}</Badge>
         <Badge variant="outline" className="text-[10px]">{point.decision_method}</Badge>
         {point.body_changed && (
-          <Badge variant="outline" className="text-[10px]">body changed</Badge>
+          <Badge variant="outline" className="text-[10px]">本文変更あり</Badge>
         )}
         {point.user_decision !== "pending" && (
           <Badge variant={point.user_decision === "accepted" ? "success" : "destructive"}>
@@ -745,7 +744,7 @@ function RemovalPatchesSection({ patches }: { patches: ProbeRemovalPatchOut[] })
               </div>
             </div>
             {patch.skipped.length > 0 && (
-              <div className="text-xs text-muted-foreground">Skipped: {patch.skipped.join("; ")}</div>
+              <div className="text-xs text-muted-foreground">スキップ: {patch.skipped.join("; ")}</div>
             )}
             {patch.apply_error && (
               <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800 dark:border-red-800 dark:bg-red-950/20 dark:text-red-200">
