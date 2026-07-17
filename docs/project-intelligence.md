@@ -2197,3 +2197,56 @@ POST /candidate-versions/{id}/promote        Experiment 引き渡し payload
 
 LLM のみでの自動採用、任意コードの本番プロセスへの動的配布・実行、対象リポジトリの
 自動編集、本番相当性の保証、live shadow SDK の動的候補ロード。
+
+## フェーズ0(System 作成前)の状態案内(Issue #265)
+
+`GET /system-state` を土台にした案内スタック(6 フェーズ、`PrerequisiteGuide`、
+`DiagnosticsBadge`)は、いずれも `X-Probe-System-Id` を要求するため、ログイン前
+および「System が 0 件」の状態では一切機能しない。0 admin(初回ブートでまだ
+`CONTROL_ADMIN_USERNAME`/`CONTROL_ADMIN_PASSWORD` が設定・再起動されていない)
+状態からは UI/API 経由で管理者を作成する手段が無く(`POST /users` は admin 専用)、
+ログイン画面はその案内すら出していなかった。
+
+- **`GET /auth/bootstrap-status`**(`app/bootstrap_status.py`、
+  `routes/auth.py`): 認証なし・System なしで呼べる、唯一の決定的な事実だけを
+  返すエンドポイント。`admin_exists`(`role='admin' AND is_active=1` の行の
+  有無。`system_diagnostics._check_auth_scope` の「0 admin」判定は system_id
+  付きで *任意ユーザー* の有無を見るのに対し、こちらは system_id を取らない
+  独立ヘルパーで、判定対象も admin ロールに絞っている)、`auth_mode`
+  (`auth.auth_enabled()` と同じ判定を `"anonymous" | "user"` で表現)、
+  `llm_configured`(`LLM_PROVIDER` が既知の値か、`mock` か、鍵環境変数が
+  *存在するか* だけを見る -- 値の検証はしない)、`environment`
+  (`environment.control_env()` -- Issue #225 の本番判定をそのまま流用)の
+  4 つの bool/finite token のみを返す。ユーザー名・鍵の値・パス・ホスト名は
+  一切含まない。`KNOWN_PROVIDERS` は `system_diagnostics.py` の重複定義を
+  `llm.py` に一本化し、両方がそこから import する。
+- **ログイン画面**(`pages/login.tsx`): `admin_exists=false` のとき、ログイン
+  フォームの代わりに(すでに存在しない admin では絶対に成功しない画面を出して
+  も意味が無いため)、環境変数 `CONTROL_ADMIN_USERNAME`/`CONTROL_ADMIN_PASSWORD`
+  を設定して Control Server を再起動する、という静的な案内を表示する。この
+  文言は純粋にクライアント側固定文字列(サーバーから配信される copy ではない)
+  なので #240/#266 の方針どおり `state_messages.py` には追加せず、そのまま
+  日本語で `login.tsx` に置く。Issue #225 の fail-closed 本番方針との整合として、
+  `environment=production` のときは具体的な環境変数名を出さず
+  (`login-bootstrap-guide-production`)、「システム管理者に問い合わせてください」
+  という一般化した文言のみを出す -- 本番で未認証の任意の呼び出し元に、内部の
+  設定手順(変数名)を晒さないため。`llm_configured=false` の場合は開発環境の
+  案内の中に、LLM_PROVIDER/LLM_API_KEY も合わせて設定する旨の補足を出す
+  (blocking ではない)。
+- **0 System の空状態**: ヘッダー(`components/layout/header.tsx`)は
+  `systems.length === 0` のとき、アイコンのみの「+」ボタン(見落としやすい
+  死角だった)をやめ、「System が未作成です」というテキストと「System を作成」
+  というラベル付きボタンを表示する。Overview(`pages/overview.tsx`)は
+  Components カード内で、0-*components*(既存、Issue #212)とは別の分岐として
+  `systems.length === 0` を先に判定し、System 作成へ誘導する文言のみを表示する
+  (System スコープの get-started リストは System が無ければ無意味なため)。
+  Settings(`pages/settings.tsx`)は、これまで見出しだけの空白画面だったのを、
+  `connect-sdk.tsx` の no-System 案内文と同じパターン(`<p>` + `data-testid`)
+  で修正し、System が 1 件以上あるが未選択の場合の文言も追加した。
+- ここでの分岐はすべて決定的な有無判定(Principle 6)であり、新しい
+  `user_phase` 値は追加しない -- `user_phase`/`phases` は System 選択後にしか
+  評価できない既存の仕組みのままで、フェーズ0はこのエンドポイントとクライアント
+  側の表示分岐だけで完結する。
+
+**含まない:** UI からの管理者作成・signup フロー(env + restart のブート方式は
+そのまま)、LLM 設定を書き込む UI(表示・診断のみ)、新しい DB テーブル。

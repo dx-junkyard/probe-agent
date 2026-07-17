@@ -94,7 +94,19 @@ export default function OverviewPage() {
           <CardTitle className="text-base">Components</CardTitle>
         </CardHeader>
         <CardContent>
-          {isLoading ? (
+          {systems.length === 0 ? (
+            // Issue #265: distinct from the zero-*components* state below --
+            // there is no System selected at all yet, so components/traces
+            // cannot exist. Point at the header's "System を作成" control
+            // instead of showing the (System-scoped) get-started list.
+            <div className="space-y-2 py-8 text-center" data-testid="overview-no-systems">
+              <p className="text-sm font-medium">System を作成してください。</p>
+              <p className="text-sm text-muted-foreground">
+                トレースやコンポーネントを表示するには、まずヘッダーの
+                「System を作成」から System を作成してください。
+              </p>
+            </div>
+          ) : isLoading ? (
             <div className="space-y-3">
               {[1, 2, 3].map((i) => <Skeleton key={i} className="h-12 w-full" />)}
             </div>

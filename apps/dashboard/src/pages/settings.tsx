@@ -22,7 +22,16 @@ export default function SettingsPage() {
     <div className="space-y-6 max-w-2xl">
       <h1 className="text-2xl font-bold tracking-tight">Settings</h1>
 
-      {system && (
+      {systems.length === 0 ? (
+        // Issue #265: this used to be a heading-only blank screen when no
+        // System exists yet -- there was nothing to configure and nothing
+        // saying why. Same guidance pattern as connect-sdk.tsx's
+        // no-System reason text.
+        <p className="text-sm text-muted-foreground" data-testid="settings-no-systems-reason">
+          System が作成されていません。ヘッダーの「System を作成」から
+          System を作成すると、ここでその設定を編集できます。
+        </p>
+      ) : system ? (
         <SettingsForm
           key={system.id}
           system={system}
@@ -33,6 +42,12 @@ export default function SettingsPage() {
           }}
           isPending={updateSystem.isPending}
         />
+      ) : (
+        // systems.length > 0 but none selected yet (e.g. still loading the
+        // selection) -- distinct from the zero-System case above.
+        <p className="text-sm text-muted-foreground" data-testid="settings-no-system-selected-reason">
+          ヘッダーから System を選択してください。
+        </p>
       )}
     </div>
   );

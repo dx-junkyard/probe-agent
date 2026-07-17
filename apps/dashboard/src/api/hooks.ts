@@ -50,6 +50,7 @@ import type {
   ReplayVariantExperimentPayloadOut, ReplayRegressionScaffoldOut,
   CandidateSessionOut, CandidateSessionCreateRequest, CandidateVersionOut,
   CandidatePromotionOut,
+  BootstrapStatusOut,
 } from "./types";
 
 export function sysKey(base: string, ...extra: unknown[]) {
@@ -62,6 +63,19 @@ export function useMe() {
     queryFn: () => api.get<MeResponse>("/auth/me"),
     retry: false,
     staleTime: 60_000,
+  });
+}
+
+// Issue #265: pre-login / zero-System "phase 0" facts. Deliberately not
+// gated on `getSystemId()` (unlike almost every other query in this file) --
+// the whole point is that it must resolve before any System is selected or
+// any session token exists.
+export function useBootstrapStatus() {
+  return useQuery({
+    queryKey: ["bootstrap-status"],
+    queryFn: () => api.get<BootstrapStatusOut>("/auth/bootstrap-status"),
+    retry: false,
+    staleTime: 30_000,
   });
 }
 

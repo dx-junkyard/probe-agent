@@ -27,6 +27,11 @@ PROVIDER_KEY_ENV: Dict[str, str] = {
     "gemini": "GEMINI_API_KEY",
 }
 
+# Finite set of recognized `LLM_PROVIDER` values (also used by
+# system_diagnostics and bootstrap_status). "mock" is a real, supported
+# value (deterministic test/local-smoke output), not an error state.
+KNOWN_PROVIDERS = frozenset(PROVIDER_KEY_ENV) | {"mock"}
+
 
 @dataclass(frozen=True)
 class LLMConfig:

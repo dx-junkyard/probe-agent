@@ -44,7 +44,7 @@ from typing import Any, Dict, List, Optional
 
 from . import state_messages, system_state
 from .db import get_conn
-from .llm import PROVIDER_KEY_ENV, is_reasoning_model
+from .llm import KNOWN_PROVIDERS, PROVIDER_KEY_ENV, is_reasoning_model
 
 # Severity vocabulary from Issue #101. Order = worst first.
 SEVERITY_ORDER = ["error", "blocked", "warning", "unknown", "ok"]
@@ -68,8 +68,6 @@ ANCHOR_SNAPSHOT_CREATE = "snapshot-create"
 ANCHOR_BUILD = "build"
 ANCHOR_INTERVIEW_PURPOSE = "interview-purpose"
 ANCHOR_INTERVIEW_CAPABILITIES = "interview-capabilities"
-
-KNOWN_PROVIDERS = {"openai", "anthropic", "gemini", "mock"}
 
 # Known model-family prefixes per provider. Membership here is a finite
 # structural check; it does not guarantee the model id is valid upstream —

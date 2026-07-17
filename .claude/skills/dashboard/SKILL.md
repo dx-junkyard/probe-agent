@@ -242,6 +242,30 @@ The dashboard should support:
   feature-id escape hatch and the generate API are unchanged. Setup Guide now
   also links back to Connect SDK (`setup-guide-connect-sdk-link`), making that
   pair bidirectional. Never derive phase or state copy client-side.
+- **"Phase 0" pre-login / zero-System guidance (Issue #265)**: everything
+  above (`GET /system-state`, `PrerequisiteGuide`, `DiagnosticsBadge`) needs
+  a selected System, so it is all disabled before login and while
+  `systems.length === 0`. `useBootstrapStatus()` (`api/hooks.ts`, `GET
+  /auth/bootstrap-status`) is the one hook not gated on `getSystemId()`, and
+  is the only source for this phase's copy: `pages/login.tsx` replaces the
+  username/password form with static bootstrap instructions
+  (`CONTROL_ADMIN_USERNAME`/`CONTROL_ADMIN_PASSWORD` + restart) when
+  `admin_exists === false`, reducing detail in production
+  (`environment === "production"` hides the specific env var names and
+  shows a generic "ask your administrator" message instead — Issue #225's
+  fail-closed spirit applied to wording, not to the fact itself).
+  `components/layout/header.tsx`, `pages/overview.tsx`, and
+  `pages/settings.tsx` each add an explicit `systems.length === 0` branch
+  (`data-testid`s `header-no-systems-hint`/`header-create-system-button`,
+  `overview-no-systems`, `settings-no-systems-reason`) pointing at the
+  header's "System を作成" control, instead of the icon-only "+" dead end /
+  the System-scoped get-started list / the heading-only blank screen that
+  existed before. This bootstrap copy is purely client-fixed (not returned
+  by the endpoint, which is facts-only), so per the #240/#266 catalog policy
+  it stays plain Japanese literals in the tsx files rather than new
+  `state_messages.py` entries. No new `user_phase` value: phase 0 is
+  client-side display branching on this one endpoint's booleans, layered in
+  front of the existing System-scoped phase model, not a change to it.
 
 - GitHub publish workflow (Issue #216, `pages/github.tsx`, nav item
   "GitHub"): App status card (`GET /github/app-status`; shows a setup hint

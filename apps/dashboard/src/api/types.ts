@@ -260,6 +260,15 @@ export interface MeResponse {
   system_id: number | null;
 }
 
+// Issue #265: deterministic, credential-free, System-id-free "phase 0"
+// facts from `GET /auth/bootstrap-status`. Never carries a secret.
+export interface BootstrapStatusOut {
+  admin_exists: boolean;
+  auth_mode: "anonymous" | "user";
+  llm_configured: boolean;
+  environment: "development" | "production";
+}
+
 export interface RepositoryConfigOut {
   system_id: number;
   repo_path: string;

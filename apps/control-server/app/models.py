@@ -1912,6 +1912,20 @@ class MeResponse(BaseModel):
     system_id: Optional[int] = None
 
 
+class BootstrapStatusOut(BaseModel):
+    """Issue #265: deterministic pre-login / pre-System "phase 0" facts.
+
+    Callable without auth and without a System. Carries no secrets --
+    booleans/finite tokens only, never a username, key value, path, or
+    hostname.
+    """
+
+    admin_exists: bool
+    auth_mode: str = Field(..., description="anonymous | user")
+    llm_configured: bool
+    environment: str = Field(..., description="development | production")
+
+
 class TokenCreate(BaseModel):
     name: Optional[str] = None
     system_id: Optional[int] = None
