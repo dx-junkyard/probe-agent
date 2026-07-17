@@ -72,6 +72,10 @@ __all__ = [
     "plan_has_validated_patch",
     "count_proposed_probe_plans",
     "count_approved_probe_plans_without_validated_patch",
+    "has_applied_probe_patch",
+    "has_decided_experiment",
+    "has_completed_replay_variant_run",
+    "has_succeeded_publish_job",
 ]
 
 
@@ -440,3 +444,85 @@ def count_approved_probe_plans_without_validated_patch(conn, system_id: int) -> 
         (system_id,),
     ).fetchall()
     return sum(1 for r in rows if not plan_has_validated_patch(conn, r["id"]))
+
+
+# --- Instrumentation / observation / evaluation / publish milestone facts
+# (Issue #256) ---------------------------------------------------------------
+#
+# These back the four new phases derive_user_phase's PHASE_ORDER gained past
+# "preparation" (instrumentation / observation / evaluation / publish). Each
+# is a plain existence check against an already-finite persisted status
+# column -- no new table, no new decision, matching Principle 6 and the
+# "projection from existing tables only" constraint in Issue #256.
+
+
+def has_applied_probe_patch(conn, system_id: int) -> bool:
+    """Has any ``probe_patches`` row for this system reached
+    ``apply_status = 'applied'``.
+
+    ``apply_status`` is a finite column (default ``'not_applied'``; see
+    ``db.py``'s ``probe_patches`` table) written to ``'applied'`` only by the
+    explicit, commit-sha-confirmed patch-apply endpoints
+    (``routes/probe_patterns.py`` / ``routes/project_intelligence.py``, both
+    ``UPDATE probe_patches SET apply_status = 'applied', ...``) after a
+    successful apply against a clean working tree. ``probe_patches`` already
+    carries ``system_id`` directly (no join through ``probe_plans`` needed).
+    """
+    row = conn.execute(
+        "SELECT id FROM probe_patches WHERE system_id = ? AND apply_status = 'applied' LIMIT 1",
+        (system_id,),
+    ).fetchone()
+    return row is not None
+
+
+def has_decided_experiment(conn, system_id: int) -> bool:
+    """Has any ``experiments`` row for this system recorded a human decision.
+
+    ``human_decision`` defaults to ``'undecided'`` (see ``db.py``'s
+    ``experiments`` table) until a human records ``adopted`` / ``rejected`` /
+    ``needs_more_data``; this checks the finite "anything other than the
+    default" condition regardless of the experiment's own ``status``.
+    """
+    row = conn.execute(
+        "SELECT id FROM experiments WHERE system_id = ? AND human_decision != 'undecided' LIMIT 1",
+        (system_id,),
+    ).fetchone()
+    return row is not None
+
+
+def has_completed_replay_variant_run(conn, system_id: int) -> bool:
+    """Has any non-baseline ``replay_variants`` row for this system reached
+    ``status = 'completed'``.
+
+    ``replay_variants.status`` is a finite ``'running' | 'completed' |
+    'failed'`` column (``db.py``); ``routes/replay.py``'s
+    ``POST /replay-variant-runs`` sets a patched variant's row to
+    ``'completed'`` once its harness execution and case classification
+    finish. ``is_baseline = 0`` excludes the baseline row every variant run
+    also writes (``variant_key = 'baseline'``) -- the evaluation milestone is
+    "a candidate was actually replayed and evaluated", not merely "the
+    baseline replay succeeded".
+    """
+    row = conn.execute(
+        """SELECT id FROM replay_variants
+           WHERE system_id = ? AND status = 'completed' AND is_baseline = 0
+           LIMIT 1""",
+        (system_id,),
+    ).fetchone()
+    return row is not None
+
+
+def has_succeeded_publish_job(conn, system_id: int) -> bool:
+    """Has any ``publish_jobs`` row for this system reached ``status =
+    'completed'`` -- the terminal-success value in ``publish_job.py``'s
+    status vocabulary (``pending`` -> ... -> ``pushing`` -> ``creating_pr``
+    -> ``completed``; see ``_set_status(job_id, "completed", ...)`` at the
+    end of ``_run_publish_phase`` / ``_run_reconcile_phase``). Distinct from
+    the terminal failure states (``failed`` / ``cancelled``) and from the
+    retryable states (``retryable_failed`` / ``manual_intervention_required``).
+    """
+    row = conn.execute(
+        "SELECT id FROM publish_jobs WHERE system_id = ? AND status = 'completed' LIMIT 1",
+        (system_id,),
+    ).fetchone()
+    return row is not None

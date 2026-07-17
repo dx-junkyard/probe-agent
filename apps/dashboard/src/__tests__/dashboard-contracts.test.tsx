@@ -443,6 +443,108 @@ describe("Experiment decision (adopted)", () => {
   });
 });
 
+// ── Experiment decision next-action (Issue #259) ────────────────────
+
+describe("Experiment decision next-action (Issue #259)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  function decidedExperimentFixture(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 1, feature_id: "feat-1", objective: "Test", status: "completed",
+      human_decision: "adopted", human_decision_variant_key: "opt-v1", human_decision_note: "note",
+      created_at: "2024-01-01T00:00:00Z",
+      variants: [
+        { id: 1, variant_key: "baseline", label: "Baseline", is_baseline: true, status: "completed", patch_text: null, risk_note: null, error: null, metrics: {} },
+      ],
+      comparison: {},
+      ...overrides,
+    };
+  }
+
+  function setupDecidedExperiment(exp: Record<string, unknown>, github: {
+    appStatus?: Record<string, unknown>;
+    connections?: Record<string, unknown>[];
+  } = {}) {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/experiments") return Promise.resolve([exp]);
+      if (path === "/repository/snapshots") return Promise.resolve([]);
+      if (path === "/repository/drafts/latest") return Promise.resolve({ feature_drafts: [] });
+      if (path === "/github/app-status") return Promise.resolve(
+        github.appStatus ?? { configured: false, app_id: null, api_base_url: "", web_base_url: "" },
+      );
+      if (path === "/github/connections") return Promise.resolve(github.connections ?? []);
+      return Promise.resolve(null);
+    });
+  }
+
+  async function renderAndExpand() {
+    const { default: ExperimentsPage } = await import("@/pages/experiments");
+    render(<ExperimentsPage />, { wrapper: createWrapper() });
+    await waitFor(() => expect(screen.getByText(/Experiment #1/)).toBeInTheDocument());
+    fireEvent.click(screen.getByText(/Experiment #1/).closest("[class*=cursor-pointer]")!);
+  }
+
+  test("adopted decision shows GitHub publish + Probe Planner next actions when GitHub is configured", async () => {
+    setupDecidedExperiment(decidedExperimentFixture(), {
+      appStatus: { configured: true, app_id: "1", api_base_url: "https://api.github.com", web_base_url: "https://github.com" },
+      connections: [{ id: 1, status: "connected" }],
+    });
+    await renderAndExpand();
+
+    const githubLink = await screen.findByTestId("experiment-github-publish-link");
+    expect(githubLink).toHaveAttribute("href", "/github");
+    expect(screen.getByTestId("experiment-probe-planner-link")).toHaveAttribute("href", "/probe-planner");
+  });
+
+  test("adopted decision hides the GitHub publish link (but keeps Probe Planner) when GitHub is not configured", async () => {
+    setupDecidedExperiment(decidedExperimentFixture());
+    await renderAndExpand();
+
+    expect(await screen.findByTestId("experiment-probe-planner-link")).toBeInTheDocument();
+    expect(screen.queryByTestId("experiment-github-publish-link")).not.toBeInTheDocument();
+  });
+
+  test("adopted decision also hides the GitHub publish link when configured but no connection is connected", async () => {
+    setupDecidedExperiment(decidedExperimentFixture(), {
+      appStatus: { configured: true, app_id: "1", api_base_url: "https://api.github.com", web_base_url: "https://github.com" },
+      connections: [{ id: 1, status: "error" }],
+    });
+    await renderAndExpand();
+
+    expect(await screen.findByTestId("experiment-probe-planner-link")).toBeInTheDocument();
+    expect(screen.queryByTestId("experiment-github-publish-link")).not.toBeInTheDocument();
+  });
+
+  test("rejected decision links to AI Candidate Studio", async () => {
+    setupDecidedExperiment(decidedExperimentFixture({ human_decision: "rejected", human_decision_variant_key: null }));
+    await renderAndExpand();
+
+    const link = await screen.findByTestId("experiment-candidate-studio-link");
+    expect(link).toHaveAttribute("href", "/candidate-studio");
+    expect(screen.queryByTestId("experiment-github-publish-link")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("experiment-probe-planner-link")).not.toBeInTheDocument();
+  });
+
+  test("needs_more_data decision also links to AI Candidate Studio", async () => {
+    setupDecidedExperiment(decidedExperimentFixture({ human_decision: "needs_more_data", human_decision_variant_key: null }));
+    await renderAndExpand();
+
+    expect(await screen.findByTestId("experiment-candidate-studio-link")).toBeInTheDocument();
+  });
+
+  test("undecided experiment shows no next-action card", async () => {
+    setupDecidedExperiment(decidedExperimentFixture({ human_decision: null, human_decision_variant_key: null }));
+    await renderAndExpand();
+
+    await waitFor(() => expect(screen.getByText("Decision")).toBeInTheDocument());
+    expect(screen.queryByTestId("experiment-next-action-adopted")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("experiment-next-action-candidate-studio")).not.toBeInTheDocument();
+  });
+});
+
 // ── Probe Patch explicit apply tests ────────────────────────────────
 
 describe("Probe Patch application", () => {
@@ -521,6 +623,90 @@ describe("Probe Patch application", () => {
         },
       );
     });
+  });
+});
+
+// ── Probe Patch apply-success next action (Issue #259) ──────────────
+
+describe("Probe Patch apply-success next action (Issue #259)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  function mockAppliedPatch(github: {
+    appStatus?: Record<string, unknown>;
+    connections?: Record<string, unknown>[];
+  } = {}) {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") {
+        return Promise.resolve({
+          system_id: 1, is_mock: false,
+          plans: [{
+            id: 10, feature_id: "feat-1", objective: "Observe behavior", status: "proposed",
+            created_at: "2024-01-01", probe_points: [],
+          }],
+        });
+      }
+      if (path === "/repository/probe-patches") {
+        return Promise.resolve([{
+          id: 20, plan_id: 10, system_id: 1, snapshot_id: 5,
+          commit_sha: "abcdef1234567890", diff: "diff --git a/a.py b/a.py",
+          worktree_path: null, skipped: [], status: "generated", error: null,
+          cleanup_state: "removed", cleanup_error: null,
+          apply_status: "applied", apply_error: null,
+          applied_at: "2024-01-02T00:00:00Z", applied_by_user_id: 1,
+          validation_runs: [
+            { id: 1, variant: "baseline", overall_success: true, commands: [] },
+            { id: 2, variant: "probed", overall_success: true, commands: [] },
+          ],
+          created_at: "2024-01-01",
+        }]);
+      }
+      if (path === "/github/app-status") return Promise.resolve(
+        github.appStatus ?? { configured: false, app_id: null, api_base_url: "", web_base_url: "" },
+      );
+      if (path === "/github/connections") return Promise.resolve(github.connections ?? []);
+      return Promise.resolve(null);
+    });
+  }
+
+  async function renderAndExpand() {
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+    await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Feature: feat-1"));
+  }
+
+  test("shows a Create Publish Job link targeting ?patch=<id> when GitHub publish is configured and connected", async () => {
+    mockAppliedPatch({
+      appStatus: { configured: true, app_id: "1", api_base_url: "https://api.github.com", web_base_url: "https://github.com" },
+      connections: [{ id: 1, status: "connected" }],
+    });
+    await renderAndExpand();
+
+    const link = await screen.findByTestId("patch-publish-link");
+    expect(link).toHaveAttribute("href", "/github?patch=20");
+    expect(screen.queryByTestId("patch-manual-git-instructions")).not.toBeInTheDocument();
+  });
+
+  test("falls back to manual git instructions when GitHub is not configured", async () => {
+    mockAppliedPatch();
+    await renderAndExpand();
+
+    expect(await screen.findByTestId("patch-manual-git-instructions")).toBeInTheDocument();
+    expect(screen.queryByTestId("patch-publish-link")).not.toBeInTheDocument();
+  });
+
+  test("falls back to manual git instructions when GitHub is configured but has no connected connection", async () => {
+    mockAppliedPatch({
+      appStatus: { configured: true, app_id: "1", api_base_url: "https://api.github.com", web_base_url: "https://github.com" },
+      connections: [{ id: 1, status: "error" }],
+    });
+    await renderAndExpand();
+
+    expect(await screen.findByTestId("patch-manual-git-instructions")).toBeInTheDocument();
+    expect(screen.queryByTestId("patch-publish-link")).not.toBeInTheDocument();
   });
 });
 
@@ -2851,43 +3037,171 @@ describe("Flow Explorer auto-select from URL (Issue #62)", () => {
 
 // ── Sidebar navigation ───────────────────────────────────────────────
 
-describe("Sidebar navigation grouping (Issue #179)", () => {
+describe("Sidebar phase-linked navigation (Issue #257)", () => {
   beforeEach(() => {
+    vi.clearAllMocks();
     mockSystemId = 1;
   });
 
-  test("renders Hub / Detail views / Other headings and every existing route", async () => {
-    const { Sidebar } = await import("@/components/layout/sidebar");
-    render(
-      <MemoryRouter initialEntries={["/"]}>
-        <Sidebar />
-      </MemoryRouter>,
-    );
+  function stateWithPhase(userPhase: string) {
+    return {
+      system_id: 1, generated_at: 1, overall_severity: "ok",
+      severity_counts: {}, items: [], primary_item: null,
+      notification_items: [], page_items: {},
+      user_phase: userPhase,
+      phases: [
+        { phase: "setup", complete: true },
+        { phase: "preparation", complete: true },
+        { phase: "instrumentation", complete: true },
+        { phase: "observation", complete: true },
+        { phase: "evaluation", complete: true },
+        { phase: "publish", complete: true },
+      ],
+    };
+  }
 
-    expect(screen.getByTestId("sidebar-group-hub")).toBeTruthy();
-    expect(screen.getByTestId("sidebar-group-detail-views")).toBeTruthy();
+  // Renders the Sidebar with /system-state resolving to `stateResponse`
+  // (or null, simulating an older server / not-yet-loaded / errored state).
+  async function renderSidebar(stateResponse: unknown | null) {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-state" ? Promise.resolve(stateResponse) : Promise.resolve(null),
+    );
+    const { Sidebar } = await import("@/components/layout/sidebar");
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const result = render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/"]}>
+          <Sidebar />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    // Let the /system-state query settle before assertions.
+    await waitFor(() => expect(mockApi.get).toHaveBeenCalledWith("/system-state"));
+    return result;
+  }
+
+  test("renders the new Setup/Understand/Instrument/Observe & Evaluate/Publish/Other groups with every existing route", async () => {
+    await renderSidebar(null);
+
+    expect(screen.getByTestId("sidebar-group-setup")).toBeTruthy();
+    expect(screen.getByTestId("sidebar-group-understand")).toBeTruthy();
+    expect(screen.getByTestId("sidebar-group-instrument")).toBeTruthy();
+    // "Observe & Evaluate" slugifies (lowercase, whitespace runs -> "-") to
+    // exactly this — the ampersand itself is not stripped by the existing
+    // slug logic in sidebar.tsx.
+    expect(screen.getByTestId("sidebar-group-observe-&-evaluate")).toBeTruthy();
+    expect(screen.getByTestId("sidebar-group-publish")).toBeTruthy();
     expect(screen.getByTestId("sidebar-group-other")).toBeTruthy();
 
     const nav = screen.getByTestId("sidebar-nav");
-    // Existing routes/URLs are unchanged — every prior nav item is still present.
     for (const label of [
-      "Overview", "System Understanding", "Repository", "Capability Map", "Feature Map",
-      "Flow Explorer", "Trace Lineage", "Trace Analyzers", "Probe Planner", "Interview",
-      "Experiments", "Connect SDK", "Generate", "Components", "Decision Workspace", "Settings",
+      "Overview", "Setup Guide", "Repository", "Settings",
+      "System Understanding", "Capability Map", "Feature Map", "Flow Explorer", "Interview",
+      "Probe Planner", "Probe Patterns", "Connect SDK",
+      "Components / Traces", "Trace Lineage", "Trace Analyzers", "Experiments",
+      "Simulation Workbench", "AI Candidate Studio", "Decision Workspace",
+      "GitHub", "Generate",
     ]) {
       expect(within(nav).getByText(label)).toBeTruthy();
     }
+    // Old label is gone, replaced by "Components / Traces".
+    expect(within(nav).queryByText("Components")).toBeNull();
 
-    // System Understanding is grouped under Hub, not Detail views.
-    expect(within(screen.getByTestId("sidebar-group-hub")).getByText("System Understanding")).toBeTruthy();
-    expect(within(screen.getByTestId("sidebar-group-detail-views")).getByText("Flow Explorer")).toBeTruthy();
+    // Group membership per the #257 design mapping.
+    expect(within(screen.getByTestId("sidebar-group-instrument")).getByText("Probe Patterns")).toBeTruthy();
+    expect(within(screen.getByTestId("sidebar-group-publish")).getByText("GitHub")).toBeTruthy();
+    expect(within(screen.getByTestId("sidebar-group-other")).getByText("Generate")).toBeTruthy();
+  });
 
-    // Issue #199: Interview sits directly after Capability Map in Detail views.
-    const detailLabels = within(screen.getByTestId("sidebar-group-detail-views"))
-      .getAllByRole("link")
-      .map((el) => el.textContent);
-    const capIdx = detailLabels.indexOf("Capability Map");
-    expect(detailLabels[capIdx + 1]).toBe("Interview");
+  test("preparation phase: Understand is current, Setup is reached, later groups are future and dimmed", async () => {
+    await renderSidebar(stateWithPhase("preparation"));
+
+    const setup = screen.getByTestId("sidebar-group-setup");
+    const understand = screen.getByTestId("sidebar-group-understand");
+    const instrument = screen.getByTestId("sidebar-group-instrument");
+    const observeEvaluate = screen.getByTestId("sidebar-group-observe-&-evaluate");
+    const publish = screen.getByTestId("sidebar-group-publish");
+
+    // /system-state resolves asynchronously; wait for the re-render it
+    // triggers (these DOM nodes are stable across the update, so the same
+    // references keep working once settled).
+    await waitFor(() => expect(understand.getAttribute("data-phase-state")).toBe("current"));
+
+    expect(setup.getAttribute("data-phase-state")).toBe("reached");
+    expect(instrument.getAttribute("data-phase-state")).toBe("future");
+    expect(observeEvaluate.getAttribute("data-phase-state")).toBe("future");
+    expect(publish.getAttribute("data-phase-state")).toBe("future");
+
+    // Dimmed (future) groups carry a reduced-opacity class; reached/current do not.
+    expect(instrument.className).toMatch(/opacity-50/);
+    expect(observeEvaluate.className).toMatch(/opacity-50/);
+    expect(publish.className).toMatch(/opacity-50/);
+    expect(setup.className).not.toMatch(/opacity-50/);
+    expect(understand.className).not.toMatch(/opacity-50/);
+
+    // The current group's heading shows the sidebar's own 現在地表示 marker.
+    expect(within(understand).getByText("現在")).toBeTruthy();
+    expect(within(setup).queryByText("現在")).toBeNull();
+
+    // Never hidden: every item in a dimmed, not-yet-reached group is still a
+    // clickable link with its real href.
+    const probePlannerLink = within(instrument).getByText("Probe Planner").closest("a");
+    expect(probePlannerLink).toBeTruthy();
+    expect(probePlannerLink?.getAttribute("href")).toBe("/probe-planner");
+  });
+
+  test("publish phase: nothing is dimmed (Publish is current, everything else already reached)", async () => {
+    await renderSidebar(stateWithPhase("publish"));
+
+    const publish = screen.getByTestId("sidebar-group-publish");
+    // /system-state resolves asynchronously; wait for the re-render it triggers.
+    await waitFor(() => expect(publish.getAttribute("data-phase-state")).toBe("current"));
+
+    for (const testId of [
+      "sidebar-group-setup", "sidebar-group-understand", "sidebar-group-instrument",
+      "sidebar-group-observe-&-evaluate",
+    ]) {
+      const group = screen.getByTestId(testId);
+      expect(group.getAttribute("data-phase-state")).toBe("reached");
+      expect(group.className).not.toMatch(/opacity-50/);
+    }
+    expect(publish.getAttribute("data-phase-state")).toBe("current");
+    expect(publish.className).not.toMatch(/opacity-50/);
+    expect(within(publish).getByText("現在")).toBeTruthy();
+  });
+
+  test("no system-state data: every group's data-phase-state is absent or none, and nothing is dimmed", async () => {
+    await renderSidebar(null);
+
+    for (const testId of [
+      "sidebar-group-setup", "sidebar-group-understand", "sidebar-group-instrument",
+      "sidebar-group-observe-&-evaluate", "sidebar-group-publish",
+    ]) {
+      const group = screen.getByTestId(testId);
+      const state = group.getAttribute("data-phase-state");
+      expect(state === null || state === "none").toBe(true);
+      expect(group.className).not.toMatch(/opacity-50/);
+    }
+    expect(screen.queryByText("現在")).toBeNull();
+
+    // Every route is still rendered as a real, clickable link.
+    const nav = screen.getByTestId("sidebar-nav");
+    expect(within(nav).getAllByRole("link").length).toBeGreaterThan(15);
+  });
+
+  test("Generate carries a Legacy badge, a pointer to AI Candidate Studio, and lives in Other", async () => {
+    await renderSidebar(null);
+
+    const other = screen.getByTestId("sidebar-group-other");
+    expect(within(other).getByText("Generate")).toBeTruthy();
+    const badge = within(other).getByTestId("sidebar-legacy-badge");
+    expect(badge.textContent).toBe("Legacy");
+
+    const generateLink = within(other).getByText("Generate").closest("a");
+    expect(generateLink?.getAttribute("href")).toBe("/generation");
+    expect(generateLink?.getAttribute("title")).toBe("旧世代の候補生成。AI Candidate Studio を推奨");
   });
 });
 
@@ -3868,7 +4182,10 @@ describe("System Understanding page", () => {
         phases: [
           { phase: "setup", complete: true },
           { phase: "preparation", complete: false },
-          { phase: "diagnosis", complete: false },
+          { phase: "instrumentation", complete: false },
+          { phase: "observation", complete: false },
+          { phase: "evaluation", complete: false },
+          { phase: "publish", complete: false },
         ],
       });
       return Promise.resolve(null);
@@ -4743,7 +5060,10 @@ describe("System settings diagnostics", () => {
     // withdrawal in `notification_items`; the badge must consume that
     // projection verbatim instead of re-deriving phase visibility.
     const setupItem = { ...snapshotItem, phase: "setup" as const };
-    const diagnosisItem = projectedStateItem({
+    // proposal.probe_plans.*/proposal.experiments.* items default to
+    // phase="evaluation" (Issue #256's state_group="proposal" default) --
+    // a real later-phase token, not an arbitrary placeholder.
+    const evaluationItem = projectedStateItem({
       state_id: "proposal.experiments.undecided",
       severity: "warning",
       summary: "評価待ちの experiment があります。",
@@ -4752,17 +5072,20 @@ describe("System settings diagnostics", () => {
       related_checks: [],
       dedupe_key: "proposal.experiments.undecided",
     });
-    diagnosisItem.phase = "diagnosis";
-    const scoped = (userPhase: "setup" | "diagnosis") => ({
-      ...stateResponse([setupItem, diagnosisItem]),
+    evaluationItem.phase = "evaluation";
+    const scoped = (userPhase: "setup" | "evaluation") => ({
+      ...stateResponse([setupItem, evaluationItem]),
       notification_items: userPhase === "setup"
         ? [setupItem]
-        : [setupItem, diagnosisItem],
+        : [setupItem, evaluationItem],
       user_phase: userPhase,
       phases: [
         { phase: "setup", complete: userPhase !== "setup" },
-        { phase: "preparation", complete: userPhase === "diagnosis" },
-        { phase: "diagnosis", complete: false },
+        { phase: "preparation", complete: userPhase === "evaluation" },
+        { phase: "instrumentation", complete: userPhase === "evaluation" },
+        { phase: "observation", complete: userPhase === "evaluation" },
+        { phase: "evaluation", complete: false },
+        { phase: "publish", complete: false },
       ],
     });
 
@@ -4777,7 +5100,7 @@ describe("System settings diagnostics", () => {
     first.unmount();
 
     mockApi.get.mockImplementation((path: string) =>
-      path === "/system-state" ? Promise.resolve(scoped("diagnosis")) : Promise.resolve(null),
+      path === "/system-state" ? Promise.resolve(scoped("evaluation")) : Promise.resolve(null),
     );
     render(<DiagnosticsBadge />, { wrapper: createWrapper() });
     await screen.findByTestId("diagnostics-badge");
@@ -5729,6 +6052,60 @@ describe("Overview get-started zero state (Issue #212)", () => {
   });
 });
 
+// ── Overview 4th get-started step (Issue #259) ──────────────────────
+
+describe("Overview 4th get-started step (Issue #259)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+    mockSystems = [{ id: 1, name: "alpha" }];
+  });
+
+  function setupOverview(connectivityState: string | null) {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/components") return Promise.resolve([]);
+      if (path === "/system-state") return Promise.resolve({
+        system_id: 1, generated_at: 1, overall_severity: "ok",
+        severity_counts: {}, items: [], primary_item: null,
+        notification_items: [], page_items: {},
+      });
+      if (path === "/connectivity/status") {
+        return connectivityState
+          ? Promise.resolve({
+            system_id: 1, state: connectivityState, total_trace_count: 5, smoke_trace_count: 1,
+            real_trace_count: 4, first_trace_at: 1, last_trace_at: 2,
+            last_trace_component_id: "comp", smoke_component_id: "smoke", materialized_session_ids: [],
+          })
+          : Promise.resolve(null);
+      }
+      return Promise.resolve(null);
+    });
+  }
+
+  test("shows the 4th step linking to /components, incomplete while not receiving", async () => {
+    setupOverview("no_signal");
+    const { default: OverviewPage } = await import("@/pages/overview");
+    render(<OverviewPage />, { wrapper: createWrapper() });
+
+    const getStarted = await screen.findByTestId("overview-get-started");
+    const step4 = within(getStarted).getByTestId("overview-link-view-traces");
+    expect(step4).toHaveAttribute("href", "/components");
+    await waitFor(() => expect(step4).toHaveAttribute("data-done", "false"));
+    expect(within(getStarted).queryByTestId("overview-link-view-traces-done")).not.toBeInTheDocument();
+  });
+
+  test("marks the 4th step complete once connectivity state is receiving", async () => {
+    setupOverview("receiving");
+    const { default: OverviewPage } = await import("@/pages/overview");
+    render(<OverviewPage />, { wrapper: createWrapper() });
+
+    const getStarted = await screen.findByTestId("overview-get-started");
+    const step4 = within(getStarted).getByTestId("overview-link-view-traces");
+    await waitFor(() => expect(step4).toHaveAttribute("data-done", "true"));
+    expect(within(getStarted).getByTestId("overview-link-view-traces-done")).toBeInTheDocument();
+  });
+});
+
 describe("Probe Planner manual feature-id escape hatch (Issue #212)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -6141,7 +6518,10 @@ describe("User phase indicator (Issue #239)", () => {
         ? Promise.resolve(stateWithPhase("preparation", [
             { phase: "setup", complete: true },
             { phase: "preparation", complete: false },
-            { phase: "diagnosis", complete: false },
+            { phase: "instrumentation", complete: false },
+            { phase: "observation", complete: false },
+            { phase: "evaluation", complete: false },
+            { phase: "publish", complete: false },
           ]))
         : Promise.resolve(null),
     );
@@ -6160,7 +6540,13 @@ describe("User phase indicator (Issue #239)", () => {
     expect(preparation.getAttribute("data-complete")).toBe("false");
     expect(preparation.getAttribute("data-current")).toBe("true");
 
-    expect(screen.getByTestId("user-phase-diagnosis").getAttribute("data-current")).toBe("false");
+    // All 6 phase chips render (Issue #256), and none of the later ones is
+    // mistaken for the current phase.
+    for (const phase of ["instrumentation", "observation", "evaluation", "publish"]) {
+      const chip = screen.getByTestId(`user-phase-${phase}`);
+      expect(chip.getAttribute("data-complete")).toBe("false");
+      expect(chip.getAttribute("data-current")).toBe("false");
+    }
   });
 
   test("prefers the server-provided phase label over the client fallback map (Issue #240)", async () => {
@@ -6169,9 +6555,12 @@ describe("User phase indicator (Issue #239)", () => {
         ? Promise.resolve(stateWithPhase("preparation", [
             { phase: "setup", complete: true, label: "セットアップ完了" },
             { phase: "preparation", complete: false, label: "準備" },
+            { phase: "instrumentation", complete: false, label: "計装" },
+            { phase: "observation", complete: false, label: "観測中" },
+            { phase: "evaluation", complete: false, label: "評価" },
             // No server label for this entry: proves the client fallback
             // (USER_PHASE_LABELS) still applies when the server omits it.
-            { phase: "diagnosis", complete: false },
+            { phase: "publish", complete: false },
           ]))
         : Promise.resolve(null),
     );
@@ -6183,17 +6572,20 @@ describe("User phase indicator (Issue #239)", () => {
     expect(indicator.getAttribute("title")).toBe("現在のフェーズ: 準備");
     expect(screen.getByTestId("user-phase-setup").textContent).toContain("セットアップ完了");
     expect(screen.getByTestId("user-phase-preparation").textContent).toContain("準備");
-    expect(screen.getByTestId("user-phase-diagnosis").textContent)
-      .toContain(USER_PHASE_LABELS.diagnosis);
+    expect(screen.getByTestId("user-phase-publish").textContent)
+      .toContain(USER_PHASE_LABELS.publish);
   });
 
   test("display switches when the server-derived phase changes", async () => {
     mockApi.get.mockImplementation((path: string) =>
       path === "/system-state"
-        ? Promise.resolve(stateWithPhase("diagnosis", [
+        ? Promise.resolve(stateWithPhase("publish", [
             { phase: "setup", complete: true },
             { phase: "preparation", complete: true },
-            { phase: "diagnosis", complete: false },
+            { phase: "instrumentation", complete: true },
+            { phase: "observation", complete: true },
+            { phase: "evaluation", complete: true },
+            { phase: "publish", complete: false },
           ]))
         : Promise.resolve(null),
     );
@@ -6202,9 +6594,10 @@ describe("User phase indicator (Issue #239)", () => {
     render(<UserPhaseIndicator />, { wrapper: createWrapper() });
 
     const indicator = await screen.findByTestId("user-phase-indicator");
-    expect(indicator.getAttribute("data-current-phase")).toBe("diagnosis");
+    expect(indicator.getAttribute("data-current-phase")).toBe("publish");
     expect(screen.getByTestId("user-phase-preparation").getAttribute("data-complete")).toBe("true");
-    expect(screen.getByTestId("user-phase-diagnosis").getAttribute("data-current")).toBe("true");
+    expect(screen.getByTestId("user-phase-evaluation").getAttribute("data-complete")).toBe("true");
+    expect(screen.getByTestId("user-phase-publish").getAttribute("data-current")).toBe("true");
   });
 
   test("renders nothing when the server does not provide a phase", async () => {
@@ -6623,6 +7016,109 @@ describe("GitHub page", () => {
     );
     expect(screen.queryByTestId("publish-job-approve-button")).not.toBeInTheDocument();
     expect(screen.queryByTestId("publish-job-cancel-button")).not.toBeInTheDocument();
+  });
+});
+
+// ── GitHub ?patch= preselection (Issue #259) ────────────────────────
+
+describe("GitHub ?patch= preselection (Issue #259)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const connectedConnectionFixture = {
+    id: 1, system_id: 1,
+    api_base_url: "https://api.github.com", web_base_url: "https://github.com",
+    owner: "acme", repo: "widgets", clone_url: "https://github.com/acme/widgets.git",
+    installation_id: 42, default_branch: "main", credential_type: "github_app",
+    status: "connected", last_error: null, last_synced_at: null, last_synced_commit_sha: null,
+    created_by_user_id: 1, updated_by_user_id: 1,
+    created_at: "2024-01-01T00:00:00Z", updated_at: "2024-01-01T00:00:00Z",
+  };
+
+  function greenPatchFixture(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 20, plan_id: 10, system_id: 1, snapshot_id: 5,
+      commit_sha: "abc1234567890", diff: "diff --git a/a.py b/a.py",
+      worktree_path: null, skipped: [], status: "generated", error: null,
+      cleanup_state: "removed", cleanup_error: null,
+      apply_status: "applied", apply_error: null, applied_at: null, applied_by_user_id: null,
+      validation_runs: [
+        { id: 1, variant: "baseline", overall_success: true, commands: [] },
+        { id: 2, variant: "probed", overall_success: true, commands: [] },
+      ],
+      created_at: "2024-01-01",
+      ...overrides,
+    };
+  }
+
+  function mockGithubForPatchParam(data: {
+    connections?: Record<string, unknown>[];
+    patches?: Record<string, unknown>[];
+  }) {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/github/app-status") return Promise.resolve({
+        configured: true, app_id: "1", api_base_url: "https://api.github.com", web_base_url: "https://github.com",
+      });
+      if (path === "/github/connections") return Promise.resolve(data.connections ?? []);
+      if (path === "/github/publish-jobs") return Promise.resolve([]);
+      if (path === "/repository/probe-patches") return Promise.resolve(data.patches ?? []);
+      if (path === "/users") return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+  }
+
+  function renderGithubAt(route: string) {
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    return import("@/pages/github").then(({ default: GithubPage }) =>
+      render(
+        <QueryClientProvider client={qc}>
+          <MemoryRouter initialEntries={[route]}>
+            <GithubPage />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      ),
+    );
+  }
+
+  test("preselects a valid, green patch from ?patch= and opens the create-job dialog on the Publish Jobs tab", async () => {
+    mockGithubForPatchParam({
+      connections: [connectedConnectionFixture],
+      patches: [greenPatchFixture()],
+    });
+    await renderGithubAt("/github?patch=20");
+
+    const select = await screen.findByTestId("publish-job-patch-select") as HTMLSelectElement;
+    expect(select.value).toBe("20");
+  });
+
+  test("ignores ?patch= for a patch that fails the green-validation gate", async () => {
+    mockGithubForPatchParam({
+      connections: [connectedConnectionFixture],
+      patches: [greenPatchFixture({
+        validation_runs: [{ id: 1, variant: "baseline", overall_success: false, commands: [] }],
+      })],
+    });
+    await renderGithubAt("/github?patch=20");
+
+    // Still lands on the Publish Jobs tab (the button below is proof of that)
+    // but does not auto-open the create dialog for an invalid patch.
+    await waitFor(() => expect(screen.getByTestId("new-publish-job-button")).toBeInTheDocument());
+    expect(screen.queryByTestId("publish-job-patch-select")).not.toBeInTheDocument();
+  });
+
+  test("ignores ?patch= for a patch id that does not exist", async () => {
+    mockGithubForPatchParam({
+      connections: [connectedConnectionFixture],
+      patches: [greenPatchFixture({ id: 99 })],
+    });
+    await renderGithubAt("/github?patch=20");
+
+    await waitFor(() => expect(screen.getByTestId("new-publish-job-button")).toBeInTheDocument());
+    expect(screen.queryByTestId("publish-job-patch-select")).not.toBeInTheDocument();
   });
 });
 
@@ -7141,6 +7637,11 @@ describe("PrerequisiteGuide (Issue #241)", () => {
     phase: "setup",
   };
 
+  // Issue #256: preparation counts complete for any phase past
+  // "setup"/"preparation" themselves (the later instrumentation / observation
+  // / evaluation / publish phases all chain on preparation being done); the
+  // later phases themselves are left incomplete here since none of these
+  // tests need to distinguish between them.
   const stateWith = (
     userPhase: string,
     primaryItem: unknown = guidePrimaryItem,
@@ -7157,8 +7658,15 @@ describe("PrerequisiteGuide (Issue #241)", () => {
     user_phase: userPhase,
     phases: [
       { phase: "setup", complete: userPhase !== "setup", label: phaseLabels?.setup },
-      { phase: "preparation", complete: userPhase === "diagnosis", label: phaseLabels?.preparation },
-      { phase: "diagnosis", complete: false, label: phaseLabels?.diagnosis },
+      {
+        phase: "preparation",
+        complete: userPhase !== "setup" && userPhase !== "preparation",
+        label: phaseLabels?.preparation,
+      },
+      { phase: "instrumentation", complete: false, label: phaseLabels?.instrumentation },
+      { phase: "observation", complete: false, label: phaseLabels?.observation },
+      { phase: "evaluation", complete: false, label: phaseLabels?.evaluation },
+      { phase: "publish", complete: false, label: phaseLabels?.publish },
     ],
   });
 
@@ -7193,9 +7701,9 @@ describe("PrerequisiteGuide (Issue #241)", () => {
     expect(screen.getByTestId("prerequisite-guide-phase").textContent).toContain("セットアップ完了");
   });
 
-  test("disappears at the terminal diagnosis phase", async () => {
+  test("disappears once preparation is complete (instrumentation phase onward)", async () => {
     mockApi.get.mockImplementation((path: string) =>
-      path === "/system-state" ? Promise.resolve(stateWith("diagnosis", null)) : Promise.resolve(null),
+      path === "/system-state" ? Promise.resolve(stateWith("instrumentation", null)) : Promise.resolve(null),
     );
     const { PrerequisiteGuide } = await import("@/components/prerequisite-guide");
     const { container } = render(<PrerequisiteGuide />, { wrapper: createWrapper() });
@@ -7204,6 +7712,26 @@ describe("PrerequisiteGuide (Issue #241)", () => {
     await waitFor(() => expect(mockApi.get).toHaveBeenCalledWith("/system-state"));
     expect(screen.queryByTestId("prerequisite-guide")).not.toBeInTheDocument();
     expect(container.textContent).toBe("");
+  });
+
+  test("renders nothing for any later phase without authored copy (Issue #256)", async () => {
+    // instrumentation / observation / evaluation / publish have no guide
+    // copy of their own (that guidance UX belongs to sibling sub-issues
+    // #257/#258) -- the guide must stay silent, not render a broken/empty
+    // card, for every one of them.
+    for (const phase of ["instrumentation", "observation", "evaluation", "publish"]) {
+      vi.clearAllMocks();
+      mockApi.get.mockImplementation((path: string) =>
+        path === "/system-state" ? Promise.resolve(stateWith(phase, null)) : Promise.resolve(null),
+      );
+      const { PrerequisiteGuide } = await import("@/components/prerequisite-guide");
+      const { container, unmount } = render(<PrerequisiteGuide />, { wrapper: createWrapper() });
+
+      await waitFor(() => expect(mockApi.get).toHaveBeenCalledWith("/system-state"));
+      expect(screen.queryByTestId("prerequisite-guide")).not.toBeInTheDocument();
+      expect(container.textContent).toBe("");
+      unmount();
+    }
   });
 
   test("CTA navigates to the StateItem target", async () => {
@@ -7235,7 +7763,7 @@ describe("PrerequisiteGuide (Issue #241)", () => {
 
   test("Probe Planner hides the gate once preparation is complete", async () => {
     mockApi.get.mockImplementation((path: string) => {
-      if (path === "/system-state") return Promise.resolve(stateWith("diagnosis", null));
+      if (path === "/system-state") return Promise.resolve(stateWith("instrumentation", null));
       if (path === "/probe-plans") return Promise.resolve({ plans: [], is_mock: false });
       return Promise.resolve(null);
     });
@@ -7246,5 +7774,586 @@ describe("PrerequisiteGuide (Issue #241)", () => {
     // Dialog opened (feature label present) but no prerequisite gate.
     expect(await screen.findByText("Feature")).toBeInTheDocument();
     expect(screen.queryByTestId("planner-prerequisite-guide")).not.toBeInTheDocument();
+  });
+});
+
+// ── Dangerous/no-op action gating (Issue #255) ──────────────────────
+//
+// Three dashboard actions were previously clickable in states where they
+// could not succeed (or were dangerous), because state that was already
+// fetched for display was never wired into the button's disabled condition.
+// Each case below asserts the button is disabled AND a reason is visible —
+// never a silent no-op and never a dangerous apply.
+
+describe("Dashboard action gating (Issue #255)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("Probe Planner: Apply is disabled with a visible reason when the patch is stale vs HEAD", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({
+        system_id: 1, is_mock: false,
+        plans: [{ id: 10, feature_id: "feat-1", objective: "Observe", status: "proposed", created_at: "2024-01-01", probe_points: [] }],
+      });
+      if (path === "/repository/probe-patches") return Promise.resolve([{
+        id: 20, plan_id: 10, system_id: 1, snapshot_id: 5,
+        commit_sha: "abcdef1234567890", diff: "diff --git a/a.py b/a.py",
+        worktree_path: null, skipped: [], status: "generated", error: null,
+        cleanup_state: "removed", cleanup_error: null,
+        apply_status: "not_applied", apply_error: null, applied_at: null,
+        applied_by_user_id: null, validation_runs: [], created_at: "2024-01-01",
+      }]);
+      if (path === "/repository/status") return Promise.resolve({
+        configured: true, repo_path: "/repos/alpha",
+        current_head: "9999999999", head_error: null,
+        working_tree_dirty: false, dirty_file_count: 0, dirty_sample: [],
+        latest_snapshot: null, latest_indexed_snapshot: null,
+        understanding_snapshot_id: null, understanding_status: null,
+        snapshot_stale: true, symbols_stale: false, next_actions: [],
+      });
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Feature: feat-1"));
+
+    expect(await screen.findByTestId("patch-stale-badge")).toBeInTheDocument();
+    const reason = await screen.findByTestId("patch-apply-stale-reason");
+    expect(reason).toHaveTextContent(/abcdef12/);
+    expect(screen.getByRole("button", { name: /Apply/ })).toBeDisabled();
+
+    const { toast } = await import("sonner");
+    expect(toast.success).not.toHaveBeenCalledWith("Patch applied to repository");
+  });
+
+  test("Connect SDK: Issue Token is disabled with a visible reason when no System is selected", async () => {
+    mockSystemId = null;
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/auth/my-tokens") return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+
+    const { default: ConnectSdkPage } = await import("@/pages/connect-sdk");
+    render(<ConnectSdkPage />, { wrapper: createWrapper() });
+
+    const nameInput = await screen.findByPlaceholderText("my-service");
+    fireEvent.change(nameInput, { target: { value: "my-new-token" } });
+
+    expect(screen.getByTestId("issue-token-no-system-reason")).toBeInTheDocument();
+    const issueButton = screen.getByRole("button", { name: "Issue Token" });
+    expect(issueButton).toBeDisabled();
+
+    // Even though the name is filled in, clicking the disabled button must
+    // not silently reach handleIssue's early-return guard.
+    fireEvent.click(issueButton);
+    expect(mockApi.post).not.toHaveBeenCalled();
+    const { toast } = await import("sonner");
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  test("Repository: Symbols tab Index Symbols is disabled under the same condition as the Refresh Hub", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository") return Promise.resolve({
+        id: 1, system_id: 1, repo_path: "/repos/alpha", include_patterns: [], exclude_patterns: [],
+      });
+      if (path === "/repository-candidates") return Promise.resolve([{ name: "alpha", path: "/repos/alpha" }]);
+      if (path === "/repository/snapshots") return Promise.resolve([]);
+      if (path === "/repository/symbols") return Promise.resolve({ symbols: [], symbol_count: 0 });
+      if (path === "/repository/status") return Promise.resolve({
+        configured: true, repo_path: "/repos/alpha",
+        current_head: "abc1234000", head_error: null,
+        working_tree_dirty: false, dirty_file_count: 0, dirty_sample: [],
+        latest_snapshot: null, latest_indexed_snapshot: null,
+        understanding_snapshot_id: null, understanding_status: null,
+        snapshot_stale: true, symbols_stale: false, next_actions: [],
+      });
+      return Promise.resolve(null);
+    });
+
+    const { default: RepositoryPage } = await import("@/pages/repository");
+    render(<RepositoryPage />, { wrapper: createWrapper() });
+
+    // Refresh Hub's own button is disabled when there is no snapshot.
+    const hub = await screen.findByTestId("refresh-hub");
+    expect(within(hub).getByRole("button", { name: "Index symbols" })).toBeDisabled();
+
+    // The Symbols tab's button must be gated the same way instead of being
+    // clickable with nothing to index.
+    fireEvent.click(screen.getByRole("button", { name: "Symbols" }));
+    expect(await screen.findByTestId("index-symbols-no-snapshot-reason")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Index Symbols" })).toBeDisabled();
+  });
+});
+
+// ── Prerequisite-based action gating (Issue #258) ───────────────────
+//
+// Several generate/execute buttons were previously disabled only while a
+// mutation was `isPending`, so a user could click straight into a
+// guaranteed server rejection (no ready snapshot, no approved probe point,
+// a failed patch, a component with zero recorded traces). Each case below
+// asserts the button is disabled AND a reason + link/next-step is visible,
+// that an unknown/loading precondition never blocks (escape hatch), and
+// that satisfying the precondition re-enables the button without any
+// manual refetch.
+
+describe("Prerequisite-based action gating (Issue #258)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  function repoStatusFixture(overrides: Record<string, unknown> = {}) {
+    return {
+      configured: true, repo_path: "/repos/alpha",
+      current_head: "abc1234000", head_error: null,
+      working_tree_dirty: false, dirty_file_count: 0, dirty_sample: [],
+      latest_snapshot: { id: 1, commit_sha: "abc1234000", status: "ready", created_at: 1 },
+      latest_indexed_snapshot: null,
+      understanding_snapshot_id: null, understanding_status: null,
+      snapshot_stale: false, symbols_stale: false, next_actions: [],
+      ...overrides,
+    };
+  }
+
+  const repoConfigMissingItem = {
+    state_id: "repository.configuration.missing",
+    state_group: "repository",
+    severity: "warning",
+    status: "missing",
+    user_action_kind: "configure",
+    intervention_timing: "now",
+    subject: "Repository",
+    summary: "対象リポジトリが未設定です。",
+    detail: "対象リポジトリが未設定です。",
+    impact: "",
+    remediation: "Repository タブでリポジトリを設定してください。",
+    evidence: {},
+    target_ui: { route: "/repository", anchor: "repo-config", action_label: "リポジトリを設定" },
+    related_checks: [],
+    related_pipeline_steps: [],
+    source: "system_state",
+    dedupe_key: "repository.configuration",
+    scope: "global",
+    decision_method: "deterministic",
+    phase: "setup",
+  };
+
+  function systemStateFixture(pageItems: Record<string, unknown[]> = {}) {
+    return {
+      system_id: 1, generated_at: 1, overall_severity: "ok",
+      severity_counts: {}, items: [], primary_item: null,
+      notification_items: [], page_items: pageItems,
+    };
+  }
+
+  // ── Probe Planner: Generate Plan ──────────────────────────────────
+
+  test("Probe Planner: Generate Plan is disabled with a reason when the repository is unconfigured", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({ system_id: 1, is_mock: false, plans: [] });
+      if (path === "/repository/status") return Promise.resolve(
+        repoStatusFixture({ configured: false, repo_path: null, latest_snapshot: null }),
+      );
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    const button = await screen.findByRole("button", { name: "Generate Plan" });
+    await waitFor(() => expect(button).toBeDisabled());
+    expect(await screen.findByTestId("generate-plan-blocked-reason")).toBeInTheDocument();
+
+    // Clicking a disabled button must not open the dialog / reach the mutation.
+    fireEvent.click(button);
+    expect(screen.queryByText("Observation objective")).not.toBeInTheDocument();
+  });
+
+  test("Probe Planner: Generate Plan's reason reuses the repository.configuration.missing catalog copy when present", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({ system_id: 1, is_mock: false, plans: [] });
+      if (path === "/repository/status") return Promise.resolve(
+        repoStatusFixture({ configured: false, repo_path: null, latest_snapshot: null }),
+      );
+      if (path === "/system-state") return Promise.resolve(
+        systemStateFixture({ "/repository": [repoConfigMissingItem] }),
+      );
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    const reason = await screen.findByTestId("generate-plan-blocked-reason");
+    expect(reason).toHaveTextContent("対象リポジトリが未設定です。");
+    expect(reason).toHaveTextContent("Repository タブでリポジトリを設定してください。");
+    const link = within(reason).getByRole("link", { name: "リポジトリを設定" });
+    expect(link).toHaveAttribute("href", "/repository?fix=repo-config");
+  });
+
+  test("Probe Planner: Generate Plan is disabled with a reason when there is no ready snapshot", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({ system_id: 1, is_mock: false, plans: [] });
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture({ latest_snapshot: null }));
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    const button = await screen.findByRole("button", { name: "Generate Plan" });
+    await waitFor(() => expect(button).toBeDisabled());
+    expect(await screen.findByTestId("generate-plan-blocked-reason")).toHaveTextContent(
+      /no ready repository snapshot/i,
+    );
+  });
+
+  test("Probe Planner: Generate Plan stays enabled when repository status is unknown (escape hatch)", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({ system_id: 1, is_mock: false, plans: [] });
+      // /repository/status intentionally left unhandled -> resolves to null,
+      // an indeterminate state that must never block the button.
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(mockApi.get).toHaveBeenCalledWith("/repository/status"));
+    const button = await screen.findByRole("button", { name: "Generate Plan" });
+    expect(button).not.toBeDisabled();
+    expect(screen.queryByTestId("generate-plan-blocked-reason")).not.toBeInTheDocument();
+  });
+
+  test("Probe Planner: Generate Plan is enabled once the repository is configured with a ready snapshot", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({ system_id: 1, is_mock: false, plans: [] });
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture());
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    const button = await screen.findByRole("button", { name: "Generate Plan" });
+    await waitFor(() => expect(button).not.toBeDisabled());
+    expect(screen.queryByTestId("generate-plan-blocked-reason")).not.toBeInTheDocument();
+  });
+
+  // ── Probe Planner: Generate Patch / Validate ──────────────────────
+
+  function probePointFixture(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 100, plan_id: 10, system_id: 1, component_id: "comp-a", feature_id: "feat-1",
+      path: "a.py", symbol: "foo", line_start: 1, line_end: 5, reason: "observe",
+      recommended_mode: "trace", side_effect_risk: "low", replayability: "safe",
+      denylist_hit: null, status: "proposed", created_at: "2024-01-01", updated_at: "2024-01-01",
+      ...overrides,
+    };
+  }
+
+  test("Probe Planner: Generate Patch is disabled with a reason when the plan has no approved probe points", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({
+        system_id: 1, is_mock: false,
+        plans: [{
+          id: 10, feature_id: "feat-1", objective: "Observe", status: "proposed", created_at: "2024-01-01",
+          probe_points: [probePointFixture({ status: "proposed" })],
+        }],
+      });
+      if (path === "/repository/probe-patches") return Promise.resolve([]);
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture());
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Feature: feat-1"));
+
+    const genPatchButton = await screen.findByRole("button", { name: /Generate Patch/ });
+    expect(genPatchButton).toBeDisabled();
+    expect(await screen.findByTestId("generate-patch-no-points-reason")).toBeInTheDocument();
+  });
+
+  test("Probe Planner: Generate Patch is disabled when the only approved point is safety-denylisted", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({
+        system_id: 1, is_mock: false,
+        plans: [{
+          id: 10, feature_id: "feat-1", objective: "Observe", status: "proposed", created_at: "2024-01-01",
+          probe_points: [probePointFixture({ status: "approved", denylist_hit: "payment write" })],
+        }],
+      });
+      if (path === "/repository/probe-patches") return Promise.resolve([]);
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture());
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Feature: feat-1"));
+
+    const genPatchButton = await screen.findByRole("button", { name: /Generate Patch/ });
+    expect(genPatchButton).toBeDisabled();
+    expect(await screen.findByTestId("generate-patch-no-points-reason")).toBeInTheDocument();
+  });
+
+  test("Probe Planner: Generate Patch is enabled once at least one non-denylisted probe point is approved", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({
+        system_id: 1, is_mock: false,
+        plans: [{
+          id: 10, feature_id: "feat-1", objective: "Observe", status: "proposed", created_at: "2024-01-01",
+          probe_points: [
+            probePointFixture({ id: 101, status: "rejected" }),
+            probePointFixture({ id: 102, status: "approved", denylist_hit: null }),
+          ],
+        }],
+      });
+      if (path === "/repository/probe-patches") return Promise.resolve([]);
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture());
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Feature: feat-1"));
+
+    const genPatchButton = await screen.findByRole("button", { name: /Generate Patch/ });
+    await waitFor(() => expect(genPatchButton).not.toBeDisabled());
+    expect(screen.queryByTestId("generate-patch-no-points-reason")).not.toBeInTheDocument();
+  });
+
+  test("Probe Planner: Validate is disabled with a reason when the patch failed to generate", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({
+        system_id: 1, is_mock: false,
+        plans: [{ id: 10, feature_id: "feat-1", objective: "Observe", status: "proposed", created_at: "2024-01-01", probe_points: [] }],
+      });
+      if (path === "/repository/probe-patches") return Promise.resolve([{
+        id: 20, plan_id: 10, system_id: 1, snapshot_id: 5,
+        commit_sha: "abcdef1234567890", diff: "", worktree_path: null, skipped: [],
+        status: "failed", error: "git apply failed", cleanup_state: "removed", cleanup_error: null,
+        apply_status: "not_applied", apply_error: null, applied_at: null,
+        applied_by_user_id: null, validation_runs: [], created_at: "2024-01-01",
+      }]);
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture());
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Feature: feat-1"));
+
+    const validateButton = await screen.findByRole("button", { name: /Validate/ });
+    expect(validateButton).toBeDisabled();
+    const reason = await screen.findByTestId("validate-patch-failed-reason");
+    expect(reason).toHaveTextContent("git apply failed");
+  });
+
+  test("Probe Planner: Validate is enabled for a successfully generated patch", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({
+        system_id: 1, is_mock: false,
+        plans: [{ id: 10, feature_id: "feat-1", objective: "Observe", status: "proposed", created_at: "2024-01-01", probe_points: [] }],
+      });
+      if (path === "/repository/probe-patches") return Promise.resolve([{
+        id: 20, plan_id: 10, system_id: 1, snapshot_id: 5,
+        commit_sha: "abcdef1234567890", diff: "diff --git a/a.py b/a.py", worktree_path: null, skipped: [],
+        status: "generated", error: null, cleanup_state: "removed", cleanup_error: null,
+        apply_status: "not_applied", apply_error: null, applied_at: null,
+        applied_by_user_id: null, validation_runs: [], created_at: "2024-01-01",
+      }]);
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture());
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Feature: feat-1"));
+
+    const validateButton = await screen.findByRole("button", { name: /Validate/ });
+    await waitFor(() => expect(validateButton).not.toBeDisabled());
+    expect(screen.queryByTestId("validate-patch-failed-reason")).not.toBeInTheDocument();
+  });
+
+  // ── System Understanding: Build / Refresh ─────────────────────────
+
+  test("System Understanding: Build / Refresh is disabled with a reason when the repository is unconfigured", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/status") return Promise.resolve(
+        repoStatusFixture({ configured: false, repo_path: null, latest_snapshot: null }),
+      );
+      if (path === "/repository/system-understanding") return Promise.resolve(null);
+      if (path === "/repository/system-understanding/build/latest") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const button = await screen.findByTestId("build-button");
+    await waitFor(() => expect(button).toBeDisabled());
+    expect(await screen.findByTestId("build-blocked-reason")).toBeInTheDocument();
+  });
+
+  test("System Understanding: Build / Refresh stays enabled with no ready snapshot (narrower gate than Probe Planner)", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture({ latest_snapshot: null }));
+      if (path === "/repository/system-understanding") return Promise.resolve(null);
+      if (path === "/repository/system-understanding/build/latest") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const button = await screen.findByTestId("build-button");
+    await waitFor(() => expect(mockApi.get).toHaveBeenCalledWith("/repository/status"));
+    expect(button).not.toBeDisabled();
+    expect(screen.queryByTestId("build-blocked-reason")).not.toBeInTheDocument();
+  });
+
+  test("System Understanding: Build / Refresh stays enabled when repository status is unknown (escape hatch)", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      // /repository/status intentionally left unhandled -> resolves to null.
+      if (path === "/repository/system-understanding") return Promise.resolve(null);
+      if (path === "/repository/system-understanding/build/latest") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(mockApi.get).toHaveBeenCalledWith("/repository/status"));
+    const button = await screen.findByTestId("build-button");
+    expect(button).not.toBeDisabled();
+  });
+
+  test("System Understanding: Build / Refresh is enabled once the repository is configured", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture());
+      if (path === "/repository/system-understanding") return Promise.resolve(null);
+      if (path === "/repository/system-understanding/build/latest") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const button = await screen.findByTestId("build-button");
+    await waitFor(() => expect(button).not.toBeDisabled());
+    expect(screen.queryByTestId("build-blocked-reason")).not.toBeInTheDocument();
+  });
+
+  // ── Repository: Create Snapshot (Snapshots tab) ───────────────────
+
+  function repositoryBaseGet(status: Record<string, unknown>) {
+    return (path: string) => {
+      if (path === "/repository") return Promise.resolve(
+        status.configured
+          ? { id: 1, system_id: 1, repo_path: "/repos/alpha", include_patterns: [], exclude_patterns: [] }
+          : null,
+      );
+      if (path === "/repository-candidates") return Promise.resolve([{ name: "alpha", path: "/repos/alpha" }]);
+      if (path === "/repository/snapshots") return Promise.resolve([]);
+      if (path === "/repository/symbols") return Promise.resolve({ symbols: [], symbol_count: 0 });
+      if (path === "/repository/status") return Promise.resolve(status);
+      return Promise.resolve(null);
+    };
+  }
+
+  test("Repository: Create Snapshot (Snapshots tab) is disabled with a reason when the repository is unconfigured", async () => {
+    mockApi.get.mockImplementation(repositoryBaseGet(
+      repoStatusFixture({ configured: false, repo_path: null, latest_snapshot: null }),
+    ));
+
+    const { default: RepositoryPage } = await import("@/pages/repository");
+    render(<RepositoryPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Snapshots" }));
+    const button = await screen.findByRole("button", { name: /Create Snapshot/ });
+    await waitFor(() => expect(button).toBeDisabled());
+    expect(await screen.findByTestId("create-snapshot-not-configured-reason")).toBeInTheDocument();
+  });
+
+  test("Repository: Create Snapshot (Snapshots tab) is enabled when configured even with zero snapshots (no chicken-and-egg gate)", async () => {
+    mockApi.get.mockImplementation(repositoryBaseGet(
+      repoStatusFixture({ latest_snapshot: null }),
+    ));
+
+    const { default: RepositoryPage } = await import("@/pages/repository");
+    render(<RepositoryPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Snapshots" }));
+    const button = await screen.findByRole("button", { name: /Create Snapshot/ });
+    await waitFor(() => expect(button).not.toBeDisabled());
+    expect(screen.queryByTestId("create-snapshot-not-configured-reason")).not.toBeInTheDocument();
+  });
+
+  // ── Components: candidate generation / shadow mode vs. trace count ─
+
+  function componentsGet(component: Record<string, unknown>) {
+    return (path: string) => {
+      if (path === "/components") return Promise.resolve([component]);
+      if (path.startsWith("/components/") && path.includes("/traces")) return Promise.resolve([]);
+      if (path.endsWith("/profile")) return Promise.resolve(null);
+      if (path.endsWith("/shadow-results?limit=20")) return Promise.resolve([]);
+      if (path.endsWith("/criteria")) return Promise.resolve([]);
+      return Promise.resolve(null);
+    };
+  }
+
+  test("Components: AI candidate generation and shadow mode are disabled with a reason for a zero-trace component", async () => {
+    window.history.pushState({}, "", "/components?component=comp-a");
+    mockApi.get.mockImplementation(
+      componentsGet({ component_id: "comp-a", mode: "off", trace_count: 0, last_seen: null }),
+    );
+
+    const { default: ComponentsPage } = await import("@/pages/components");
+    render(<ComponentsPage />, { wrapper: createWrapper() });
+
+    const aiButton = await screen.findByRole("button", { name: /AIで別バージョンを作る/ });
+    await waitFor(() => expect(aiButton).toBeDisabled());
+    const shadowButton = screen.getByRole("button", { name: "shadow" });
+    expect(shadowButton).toBeDisabled();
+    expect(await screen.findByTestId("component-zero-traces-reason")).toBeInTheDocument();
+
+    // The escape hatch for mode switching stays open: off/trace must never
+    // be gated on trace count, since switching to trace is how a component
+    // starts collecting its first traces.
+    expect(screen.getByRole("button", { name: "off" })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "trace" })).not.toBeDisabled();
+  });
+
+  test("Components: AI candidate generation and shadow mode are enabled once the component has recorded traces", async () => {
+    window.history.pushState({}, "", "/components?component=comp-a");
+    mockApi.get.mockImplementation(
+      componentsGet({ component_id: "comp-a", mode: "trace", trace_count: 5, last_seen: 1000 }),
+    );
+
+    const { default: ComponentsPage } = await import("@/pages/components");
+    render(<ComponentsPage />, { wrapper: createWrapper() });
+
+    const aiButton = await screen.findByRole("button", { name: /AIで別バージョンを作る/ });
+    await waitFor(() => expect(aiButton).not.toBeDisabled());
+    expect(screen.getByRole("button", { name: "shadow" })).not.toBeDisabled();
+    expect(screen.queryByTestId("component-zero-traces-reason")).not.toBeInTheDocument();
   });
 });

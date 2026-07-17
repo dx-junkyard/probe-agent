@@ -3542,8 +3542,12 @@ StateGroup = Literal[
     "repository", "snapshot", "pipeline", "understanding", "interview",
     "runtime", "proposal", "configuration",
 ]
-# User phase (Issue #237): setup -> preparation -> diagnosis (terminal).
-UserPhase = Literal["setup", "preparation", "diagnosis"]
+# User phase (Issue #237; extended to the full 6-step improvement flow by
+# Issue #256): setup -> preparation -> instrumentation -> observation ->
+# evaluation -> publish (terminal display phase).
+UserPhase = Literal[
+    "setup", "preparation", "instrumentation", "observation", "evaluation", "publish",
+]
 
 
 class SystemStateTargetUiOut(BaseModel):
@@ -3575,8 +3579,10 @@ class SystemStateItemOut(BaseModel):
     # System State Assessment is deterministic and LLM-free (Issue #193 Phase 1).
     decision_method: Literal["deterministic"] = "deterministic"
     # Fixed state_group -> phase mapping plus a small explicit per-item
-    # override list (Issue #237); see system_state._phase_for_item.
-    phase: UserPhase = "diagnosis"
+    # override list (Issue #237); see system_state._phase_for_item. Default
+    # is the terminal display phase (Issue #256), matching
+    # system_state._phase_for_item's own fallback default.
+    phase: UserPhase = "publish"
 
 
 class SystemStatePhaseCompletionOut(BaseModel):

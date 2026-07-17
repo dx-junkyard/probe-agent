@@ -2,6 +2,7 @@ import {
   useProbePlans, useGenerateProbePlan, useUpdateProbePointStatus,
   useProbePatches, useGeneratePatch, useValidatePatch, useApplyProbePatch,
   useLatestDrafts, useWorkspaceProposalDraft, useRepositoryStatus,
+  useGithubAppStatus, useGithubConnections,
 } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -14,7 +15,7 @@ import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { toast } from "sonner";
 import { formatTimestamp } from "@/lib/utils";
-import { Crosshair, CheckCircle, XCircle, FileCode, Play, Download, GitBranch, FlaskConical } from "lucide-react";
+import { Crosshair, CheckCircle, XCircle, FileCode, Play, Download, GitBranch, FlaskConical, GitPullRequest } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import type { ProbePatchOut } from "@/api/types";
@@ -22,6 +23,7 @@ import { AddToWorkspaceButton } from "@/components/add-to-workspace";
 import { ContextHeader } from "@/components/layout/context-header";
 import { PrerequisiteGuide } from "@/components/prerequisite-guide";
 import { useSystemState } from "@/api/hooks";
+import { useRepositoryReadySnapshotGate } from "@/components/repository-gate";
 
 export default function ProbePlannerPage() {
   const [searchParams] = useSearchParams();
@@ -41,7 +43,7 @@ export default function ProbePlannerPage() {
   const { data: patches } = useProbePatches();
   const { data: repoStatus } = useRepositoryStatus();
   // Issue #241: an upstream gate (informational, never a hard block). The
-  // intended journey reaches the Probe Planner only after diagnosis-prep is
+  // intended journey reaches the Probe Planner only after preparation is
   // done; when the System is still in setup/preparation, the generate dialog
   // shows a phase prerequisite guide. The `phases` completion comes straight
   // from GET /system-state (deterministic, server-computed) — no client
@@ -49,9 +51,27 @@ export default function ProbePlannerPage() {
   const { data: systemState } = useSystemState();
   const preparationComplete =
     systemState?.phases?.find((p) => p.phase === "preparation")?.complete ?? false;
+  // Issue #258: a harder, definitive gate than the phase-based
+  // PrerequisiteGuide above -- generate_probe_plan_endpoint 400s outright
+  // when there is no ready snapshot, regardless of feature id, so block the
+  // button rather than let it reach a guaranteed server error. Two-stage
+  // rule preserved: repoGate.blocked stays false while status is
+  // loading/unknown (escape hatch), only flipping true on a definitive fact.
+  const repoGate = useRepositoryReadySnapshotGate();
   const generatePatch = useGeneratePatch();
   const validatePatch = useValidatePatch();
   const applyPatch = useApplyProbePatch();
+  // Issue #259: connects the apply-success dead end to the GitHub publish
+  // workflow (Issue #216). Availability mirrors github.tsx's own gate for
+  // creating a publish job exactly (GithubPage's `connectedConnections`
+  // filter) -- an App that is configured but has zero connected repos is
+  // just as much a dead end as one that isn't configured at all, so both
+  // must fall back to the manual git instructions rather than show a link
+  // that leads nowhere.
+  const { data: githubAppStatus } = useGithubAppStatus();
+  const { data: githubConnections } = useGithubConnections();
+  const githubPublishAvailable = !!githubAppStatus?.configured
+    && (githubConnections ?? []).some(c => c.status === "connected");
   // undefined = no manual selection yet, so a `?plan=` param can still drive it.
   const [userExpandedPlan, setUserExpandedPlan] = useState<number | null | undefined>(undefined);
   const [applyTarget, setApplyTarget] = useState<ProbePatchOut | null>(null);
@@ -139,12 +159,22 @@ export default function ProbePlannerPage() {
             setManualFeatureEntry(false);
             setShowGenerate(true);
           }}
-          disabled={generatePlan.isPending}
+          disabled={generatePlan.isPending || repoGate.blocked}
+          title={repoGate.blocked ? [repoGate.summary, repoGate.remediation].filter(Boolean).join(" ") : undefined}
         >
           <Crosshair className="h-4 w-4 mr-1" />
           {generatePlan.isPending ? "Generating..." : "Generate Plan"}
         </Button>
       </div>
+
+      {repoGate.blocked && (
+        <p className="text-xs text-destructive" data-testid="generate-plan-blocked-reason">
+          {repoGate.summary} {repoGate.remediation}{" "}
+          {repoGate.to && (
+            <Link to={repoGate.to} className="underline">{repoGate.actionLabel ?? "Go to Repository"}</Link>
+          )}
+        </p>
+      )}
 
       {plansData?.is_mock && (
         <div className="rounded-md border border-amber-200 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 px-4 py-3 text-sm text-amber-800 dark:text-amber-200">
@@ -161,6 +191,15 @@ export default function ProbePlannerPage() {
           {plans.map(plan => {
             const expanded = expandedPlan === plan.id;
             const planPatches = patches?.filter(p => p.plan_id === plan.id) ?? [];
+            // Issue #258: mirrors generate_patch_endpoint's own precondition
+            // exactly (point_rows query: `status = 'approved' AND
+            // denylist_hit IS NULL`) -- plan.status itself is never set to
+            // "approved" anywhere server-side, so the real, exact gate is
+            // "at least one approved, non-denylisted probe point", not the
+            // plan's own status.
+            const canGeneratePatch = plan.probe_points.some(
+              pt => pt.status === "approved" && !pt.denylist_hit,
+            );
             return (
               <Card key={plan.id} ref={el => { cardRefs.current[plan.id] = el; }}>
                 <CardHeader
@@ -230,7 +269,8 @@ export default function ProbePlannerPage() {
                       <Button
                         size="sm" variant="outline"
                         onClick={() => generatePatch.mutateAsync(plan.id).then(() => toast.success("Patch generated")).catch(e => toast.error(String(e)))}
-                        disabled={generatePatch.isPending}
+                        disabled={generatePatch.isPending || !canGeneratePatch}
+                        title={!canGeneratePatch ? "Approve at least one non-denylisted probe point before generating a patch." : undefined}
                       >
                         <FileCode className="h-4 w-4 mr-1" />
                         Generate Patch
@@ -246,11 +286,27 @@ export default function ProbePlannerPage() {
                         </Link>
                       )}
                     </div>
+                    {!canGeneratePatch && (
+                      <p className="text-xs text-muted-foreground" data-testid="generate-patch-no-points-reason">
+                        No approved probe points yet — approve at least one point above (denylisted
+                        points cannot be used) before generating a patch.
+                      </p>
+                    )}
 
                     {planPatches.length > 0 && (
                       <div>
                         <h4 className="text-sm font-medium mb-2">Patches</h4>
-                        {planPatches.map(patch => (
+                        {planPatches.map(patch => {
+                          // Issue #255: the same staleness condition drives both the
+                          // badge and the Apply button's disabled state, so the button
+                          // can never be clicked in a state where the server would
+                          // reject it for a HEAD mismatch.
+                          const patchStale = !!(
+                            repoStatus?.current_head
+                            && repoStatus.current_head !== patch.commit_sha
+                            && patch.apply_status !== "applied"
+                          );
+                          return (
                           <div key={patch.id} className="rounded-lg border p-3 space-y-2">
                             <div className="flex items-center justify-between">
                               <div className="flex items-center gap-2">
@@ -260,9 +316,7 @@ export default function ProbePlannerPage() {
                                 <span className="font-mono text-xs" title="Generated for this commit">
                                   {patch.commit_sha?.slice(0, 8)}
                                 </span>
-                                {repoStatus?.current_head
-                                  && repoStatus.current_head !== patch.commit_sha
-                                  && patch.apply_status !== "applied" && (
+                                {patchStale && (
                                   <Badge variant="destructive" data-testid="patch-stale-badge">HEAD changed</Badge>
                                 )}
                               </div>
@@ -270,7 +324,8 @@ export default function ProbePlannerPage() {
                                 <Button
                                   size="sm" variant="outline"
                                   onClick={() => validatePatch.mutateAsync(patch.id).then(() => toast.success("Validation started")).catch(e => toast.error(String(e)))}
-                                  disabled={validatePatch.isPending}
+                                  disabled={validatePatch.isPending || patch.status === "failed"}
+                                  title={patch.status === "failed" ? "Cannot validate a failed patch." : undefined}
                                 >
                                   <Play className="h-3 w-3 mr-1" />
                                   Validate
@@ -283,7 +338,8 @@ export default function ProbePlannerPage() {
                                       setApplyTarget(patch);
                                       setApplyConfirmation("");
                                     }}
-                                    disabled={applyPatch.isPending}
+                                    disabled={applyPatch.isPending || patchStale}
+                                    title={patchStale ? "Regenerate the patch before applying — HEAD has changed." : undefined}
                                   >
                                     <GitBranch className="h-3 w-3 mr-1" />
                                     Apply
@@ -305,6 +361,17 @@ export default function ProbePlannerPage() {
                                 )}
                               </div>
                             </div>
+                            {patchStale && (
+                              <p className="text-xs text-destructive" data-testid="patch-apply-stale-reason">
+                                This patch is for commit {patch.commit_sha?.slice(0, 8)}. Regenerate it before applying.
+                              </p>
+                            )}
+                            {patch.status === "failed" && (
+                              <p className="text-xs text-destructive" data-testid="validate-patch-failed-reason">
+                                Cannot validate a failed patch{patch.error ? `: ${patch.error}` : "."} Regenerate
+                                the patch after resolving the error.
+                              </p>
+                            )}
                             {patch.diff && (
                               <pre className="overflow-x-auto rounded-md bg-muted p-3 text-xs font-mono max-h-64 overflow-y-auto">
                                 {patch.diff}
@@ -313,14 +380,34 @@ export default function ProbePlannerPage() {
                             {patch.apply_status === "applied" && (
                               <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/20 dark:text-emerald-200 space-y-1">
                                 <div className="font-medium">Applied to the repository working tree (no commit created).</div>
-                                <ol className="list-decimal pl-4 space-y-0.5">
-                                  <li>Review the patched files and run tests.</li>
-                                  <li>Commit the changes in the repository.</li>
-                                  <li>
-                                    Create a new snapshot and rebuild analysis from the{" "}
-                                    <Link to="/repository" className="underline">Repository Refresh Hub</Link>.
-                                  </li>
-                                </ol>
+                                {/* Issue #259: when the GitHub publish workflow is actually
+                                    usable, forward to it instead of only describing manual git
+                                    steps -- otherwise the manual instructions remain the
+                                    fallback branch, unchanged. */}
+                                {githubPublishAvailable ? (
+                                  <div className="space-y-1" data-testid="patch-publish-next-action">
+                                    <p>
+                                      The GitHub publish workflow can commit this validated patch, push it
+                                      to a new branch, and open a Pull Request for review.
+                                    </p>
+                                    <Link
+                                      to={`/github?patch=${patch.id}`}
+                                      className="inline-flex items-center gap-1 font-medium underline"
+                                      data-testid="patch-publish-link"
+                                    >
+                                      <GitPullRequest className="h-3 w-3" /> Create Publish Job
+                                    </Link>
+                                  </div>
+                                ) : (
+                                  <ol className="list-decimal pl-4 space-y-0.5" data-testid="patch-manual-git-instructions">
+                                    <li>Review the patched files and run tests.</li>
+                                    <li>Commit the changes in the repository.</li>
+                                    <li>
+                                      Create a new snapshot and rebuild analysis from the{" "}
+                                      <Link to="/repository" className="underline">Repository Refresh Hub</Link>.
+                                    </li>
+                                  </ol>
+                                )}
                               </div>
                             )}
                             <PatchRecovery patch={patch} currentHead={repoStatus?.current_head ?? null} />
@@ -344,7 +431,8 @@ export default function ProbePlannerPage() {
                               </div>
                             )}
                           </div>
-                        ))}
+                          );
+                        })}
                       </div>
                     )}
                   </CardContent>
@@ -371,13 +459,28 @@ export default function ProbePlannerPage() {
           <DialogTitle>Generate Probe Plan</DialogTitle>
         </DialogHeader>
         <div className="space-y-4">
-          {/* Issue #241: when diagnosis preparation is not complete, explain
-              the missing prerequisite and link to the next step. This does
-              NOT disable generation (the free-text feature id below stays the
+          {/* Issue #241: when preparation is not complete, explain the
+              missing prerequisite and link to the next step. This does NOT
+              disable generation (the free-text feature id below stays the
               explicit escape hatch) — it just steers the developer back onto
               the intended journey. */}
           {!preparationComplete && (
             <PrerequisiteGuide testId="planner-prerequisite-guide" />
+          )}
+          {/* Issue #258: unlike the soft PrerequisiteGuide above, this is a
+              hard, definitive block -- shown here too because the dialog can
+              also open via a Decision Workspace draft (draftOpen), bypassing
+              the header button's own disabled state. */}
+          {repoGate.blocked && (
+            <div
+              className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800 dark:border-red-800 dark:bg-red-950/20 dark:text-red-200"
+              data-testid="planner-repo-gate-reason"
+            >
+              {repoGate.summary} {repoGate.remediation}{" "}
+              {repoGate.to && (
+                <Link to={repoGate.to} className="underline">{repoGate.actionLabel ?? "Go to Repository"}</Link>
+              )}
+            </div>
           )}
           {workspaceDraft?.draft_type === "probe_plan_draft" && (
             <div className="rounded-md border bg-secondary/30 px-3 py-2 text-xs">
@@ -451,7 +554,11 @@ export default function ProbePlannerPage() {
               rows={3}
             />
           </div>
-          <Button className="w-full" onClick={generate} disabled={!formFeatureId.trim() || generatePlan.isPending}>
+          <Button
+            className="w-full"
+            onClick={generate}
+            disabled={!formFeatureId.trim() || generatePlan.isPending || repoGate.blocked}
+          >
             {generatePlan.isPending ? "Generating..." : "Generate Plan"}
           </Button>
         </div>

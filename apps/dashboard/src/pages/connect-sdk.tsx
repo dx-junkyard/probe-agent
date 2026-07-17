@@ -95,10 +95,20 @@ def summarize(text: str) -> str:
               <Label>Expires (days)</Label>
               <Input type="number" value={expDays} onChange={e => setExpDays(Number(e.target.value))} min={1} />
             </div>
-            <Button onClick={handleIssue} disabled={issueToken.isPending || !newTokenName.trim()}>
+            <Button
+              onClick={handleIssue}
+              disabled={issueToken.isPending || !newTokenName.trim() || !systemId}
+              title={!systemId ? "Select a System before issuing a token" : undefined}
+            >
               Issue Token
             </Button>
           </div>
+
+          {!systemId && (
+            <p className="text-xs text-destructive" data-testid="issue-token-no-system-reason">
+              Select a System from the header before issuing a token.
+            </p>
+          )}
 
           {issuedToken && (
             <div className="rounded-md border border-emerald-200 bg-emerald-50 dark:bg-emerald-950/20 dark:border-emerald-800 p-4">

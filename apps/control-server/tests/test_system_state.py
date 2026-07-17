@@ -929,11 +929,11 @@ class TestProbePlanReviewState:
         _, items = _get_state(admin_client, hdrs)
         assert "proposal.probe_plans.approved_without_patch" not in items
 
-    def test_proposed_item_is_tagged_preparation_phase(self, admin_client, tmp_path):
-        """Issue #238: reviewing a proposed plan is one of the two ways to
-        satisfy derive_user_phase's instrumentation-path OR condition, so
-        this item must not default to the state_group="proposal" phase
-        ("diagnosis") the way approved_without_patch does.
+    def test_proposed_item_is_tagged_instrumentation_phase(self, admin_client, tmp_path):
+        """Issue #238/#256: reviewing a proposed plan is one of the ways to
+        satisfy derive_user_phase's instrumentation-completion OR condition,
+        so this item must not default to the state_group="proposal" phase
+        ("evaluation").
         """
         _, sys, hdrs = _setup(admin_client)
         snapshot_id = self._snapshot(admin_client, hdrs, tmp_path)
@@ -941,7 +941,7 @@ class TestProbePlanReviewState:
         _insert_probe_plan(sys["id"], snapshot_id, run_id, status="proposed")
 
         _, items = _get_state(admin_client, hdrs)
-        assert items["proposal.probe_plans.proposed"]["phase"] == "preparation"
+        assert items["proposal.probe_plans.proposed"]["phase"] == "instrumentation"
 
 
 class TestDiagnosticsProjectionCompatibility:
@@ -1156,10 +1156,17 @@ class TestIssue236FactsExtractionRegression:
 
 
 class TestDeriveUserPhase:
-    """Issue #237: derive_user_phase is a pure, DB-free function of
-    UserPhaseFacts. Boundary cases mirror the issue's required test list
-    (未設定 / 環境診断 error / snapshot のみ / pipeline 途中 / Purpose 未確定
-    / capability 0 件 / probe plan 承認済みでトレース無し / 受信中)."""
+    """Issue #237 (extended to the full 6-step improvement flow --
+    instrumentation / observation / evaluation / publish -- by Issue #256):
+    derive_user_phase is a pure, DB-free function of UserPhaseFacts.
+    Boundary cases cover every phase transition, the first-incomplete-phase
+    selection rule, all-complete -> "publish", and that conservative (unset)
+    defaults keep the result in an earlier phase rather than a later one."""
+
+    ALL_FALSE = {
+        "setup": False, "preparation": False, "instrumentation": False,
+        "observation": False, "evaluation": False, "publish": False,
+    }
 
     def _facts(self, **overrides):
         from app.system_state import UserPhaseFacts
@@ -1173,6 +1180,10 @@ class TestDeriveUserPhase:
             capabilities_satisfied=True,
             approved_probe_plan_count=0,
             connectivity_state="no_signal",
+            applied_patch_exists=False,
+            decided_experiment_exists=False,
+            completed_replay_variant_run_exists=False,
+            publish_job_succeeded=False,
         )
         base.update(overrides)
         return UserPhaseFacts(**base)
@@ -1183,7 +1194,7 @@ class TestDeriveUserPhase:
         result = derive_user_phase(self._facts(repository_configured=False))
         assert result.user_phase == "setup"
         by_phase = {p.phase: p.complete for p in result.phases}
-        assert by_phase == {"setup": False, "preparation": False, "diagnosis": False}
+        assert by_phase == self.ALL_FALSE
 
     def test_blocking_environment_diagnostic_is_setup(self):
         from app.system_state import derive_user_phase
@@ -1225,56 +1236,142 @@ class TestDeriveUserPhase:
         result = derive_user_phase(self._facts(capabilities_satisfied=False))
         assert result.user_phase == "preparation"
 
-    def test_no_instrumentation_signal_stays_preparation(self):
+    def test_full_pipeline_without_instrumentation_signal_reaches_instrumentation(self):
+        """Issue #256: preparation no longer carries an instrumentation-path
+        OR-clause of its own (that signal moved to "instrumentation"), so a
+        system with every preparation fact satisfied advances past
+        "preparation" instead of staying stuck there.
+        """
         from app.system_state import derive_user_phase
 
-        # Every other condition satisfied, but neither an approved probe
-        # plan nor non-"no_signal" connectivity exists yet.
+        # Every preparation condition satisfied, but no applied patch,
+        # approved probe plan, or non-"no_signal" connectivity yet.
         result = derive_user_phase(self._facts())
-        assert result.user_phase == "preparation"
+        assert result.user_phase == "instrumentation"
         by_phase = {p.phase: p.complete for p in result.phases}
-        assert by_phase == {"setup": True, "preparation": False, "diagnosis": False}
+        assert by_phase["setup"] is True
+        assert by_phase["preparation"] is True
+        assert by_phase["instrumentation"] is False
+        assert by_phase["observation"] is False
+        assert by_phase["evaluation"] is False
+        assert by_phase["publish"] is False
 
-    def test_approved_plan_without_traces_reaches_diagnosis(self):
+    def test_applied_patch_alone_satisfies_instrumentation(self):
+        from app.system_state import derive_user_phase
+
+        result = derive_user_phase(self._facts(applied_patch_exists=True))
+        assert result.user_phase == "observation"
+        by_phase = {p.phase: p.complete for p in result.phases}
+        assert by_phase["instrumentation"] is True
+        assert by_phase["observation"] is False
+
+    def test_approved_plan_without_traces_reaches_observation(self):
         from app.system_state import derive_user_phase
 
         result = derive_user_phase(
             self._facts(approved_probe_plan_count=1, connectivity_state="no_signal")
         )
-        assert result.user_phase == "diagnosis"
+        assert result.user_phase == "observation"
         by_phase = {p.phase: p.complete for p in result.phases}
-        assert by_phase == {"setup": True, "preparation": True, "diagnosis": False}
+        assert by_phase["setup"] is True
+        assert by_phase["preparation"] is True
+        assert by_phase["instrumentation"] is True
+        assert by_phase["observation"] is False
 
-    def test_receiving_traces_without_approved_plan_reaches_diagnosis(self):
+    def test_smoke_only_connectivity_satisfies_instrumentation_but_not_observation(self):
+        # The instrumentation-completion rule is "connectivity != no_signal",
+        # not "connectivity == receiving": a smoke-check trace proves the
+        # instrumentation path is wired up structurally, but observation
+        # requires actually-receiving real traces.
+        from app.system_state import derive_user_phase
+
+        result = derive_user_phase(self._facts(connectivity_state="smoke_only"))
+        assert result.user_phase == "observation"
+        by_phase = {p.phase: p.complete for p in result.phases}
+        assert by_phase["instrumentation"] is True
+        assert by_phase["observation"] is False
+
+    def test_receiving_traces_without_approved_plan_reaches_evaluation(self):
+        """Receiving real traces alone satisfies both instrumentation's
+        "connectivity != no_signal" OR-clause and observation's own
+        "connectivity == receiving" condition directly, so this reaches all
+        the way to "evaluation" (no decided experiment / completed replay
+        variant run recorded yet).
+        """
         from app.system_state import derive_user_phase
 
         result = derive_user_phase(
             self._facts(approved_probe_plan_count=0, connectivity_state="receiving")
         )
-        assert result.user_phase == "diagnosis"
+        assert result.user_phase == "evaluation"
+        by_phase = {p.phase: p.complete for p in result.phases}
+        assert by_phase["instrumentation"] is True
+        assert by_phase["observation"] is True
+        assert by_phase["evaluation"] is False
 
-    def test_smoke_only_connectivity_also_satisfies_instrumentation_signal(self):
-        # Issue #237's completion rule is "connectivity != no_signal", not
-        # "connectivity == receiving": a smoke-check trace still proves the
-        # instrumentation path is wired up structurally.
+    def test_decided_experiment_reaches_publish(self):
         from app.system_state import derive_user_phase
 
-        result = derive_user_phase(self._facts(connectivity_state="smoke_only"))
-        assert result.user_phase == "diagnosis"
+        result = derive_user_phase(self._facts(
+            connectivity_state="receiving", decided_experiment_exists=True,
+        ))
+        assert result.user_phase == "publish"
+        by_phase = {p.phase: p.complete for p in result.phases}
+        assert by_phase["evaluation"] is True
+        assert by_phase["publish"] is False
 
-    def test_setup_incomplete_forces_preparation_incomplete_regardless_of_other_facts(self):
-        # Preparation cannot be "complete" while setup itself is not --
-        # otherwise the phases list would report a later phase done while an
-        # earlier one is not, which is incoherent for a strict progression.
+    def test_completed_replay_variant_run_also_satisfies_evaluation(self):
+        from app.system_state import derive_user_phase
+
+        result = derive_user_phase(self._facts(
+            connectivity_state="receiving", completed_replay_variant_run_exists=True,
+        ))
+        assert result.user_phase == "publish"
+        by_phase = {p.phase: p.complete for p in result.phases}
+        assert by_phase["evaluation"] is True
+
+    def test_publish_job_succeeded_completes_every_phase(self):
+        from app.system_state import derive_user_phase
+
+        result = derive_user_phase(self._facts(
+            connectivity_state="receiving", decided_experiment_exists=True,
+            publish_job_succeeded=True,
+        ))
+        assert result.user_phase == "publish"
+        by_phase = {p.phase: p.complete for p in result.phases}
+        assert by_phase == {
+            "setup": True, "preparation": True, "instrumentation": True,
+            "observation": True, "evaluation": True, "publish": True,
+        }
+
+    def test_publish_job_alone_without_evaluation_signal_does_not_skip_ahead(self):
+        # A conservative-default check: publish_job_succeeded=True cannot by
+        # itself vault past an unmet evaluation condition.
+        from app.system_state import derive_user_phase
+
+        result = derive_user_phase(self._facts(
+            connectivity_state="receiving", publish_job_succeeded=True,
+        ))
+        assert result.user_phase == "evaluation"
+        by_phase = {p.phase: p.complete for p in result.phases}
+        assert by_phase["evaluation"] is False
+        assert by_phase["publish"] is False
+
+    def test_setup_incomplete_forces_every_later_phase_incomplete(self):
+        # Earlier-phase incompleteness cannot be "rescued" by later-phase
+        # facts -- otherwise the phases list would report a later phase done
+        # while an earlier one is not, which is incoherent for a strict
+        # progression.
         from app.system_state import derive_user_phase
 
         result = derive_user_phase(self._facts(
             repository_configured=False,
             approved_probe_plan_count=1, connectivity_state="receiving",
+            decided_experiment_exists=True, publish_job_succeeded=True,
         ))
         assert result.user_phase == "setup"
         by_phase = {p.phase: p.complete for p in result.phases}
-        assert by_phase["preparation"] is False
+        assert by_phase == self.ALL_FALSE
 
 
 class TestPhaseTagging:
@@ -1292,21 +1389,21 @@ class TestPhaseTagging:
             "pipeline": "preparation",
             "understanding": "preparation",
             "interview": "preparation",
-            "runtime": "diagnosis",
-            "proposal": "diagnosis",
+            "runtime": "observation",
+            "proposal": "evaluation",
         }
         for group, expected in cases.items():
             item = StateItem(f"x.{group}", group, "warning", "missing", "none", "none", "s", "s", "s")
             assert _phase_for_item(item) == expected, group
 
-    def test_connectivity_no_signal_overrides_to_preparation(self):
+    def test_connectivity_no_signal_overrides_to_instrumentation(self):
         from app.system_state import StateItem, _phase_for_item
 
         item = StateItem(
             "runtime.connectivity.no_signal", "runtime", "warning", "missing",
             "review", "before_next_step", "s", "s", "s",
         )
-        assert _phase_for_item(item) == "preparation"
+        assert _phase_for_item(item) == "instrumentation"
 
     def test_repository_diagnostic_overrides_to_setup(self):
         from app.system_state import StateItem, _phase_for_item
@@ -1345,14 +1442,42 @@ class TestPhaseTagging:
             )
             assert _phase_for_item(item) == "setup", check_id
 
-    def test_unrelated_runtime_diagnostic_stays_diagnosis(self):
+    def test_unrelated_runtime_diagnostic_stays_observation(self):
         from app.system_state import StateItem, _phase_for_item
 
         item = StateItem(
             "diagnostic.some_future_check", "runtime", "warning", "missing",
             "inspect", "before_next_step", "s", "s", "s",
         )
-        assert _phase_for_item(item) == "diagnosis"
+        assert _phase_for_item(item) == "observation"
+
+    def test_probe_plan_proposed_overrides_to_instrumentation(self):
+        # Issue #256: reviewing/approving a proposed probe plan is one of
+        # the instrumentation-completion OR-clause's signals, so it must not
+        # default to the state_group="proposal" default of "evaluation".
+        from app.system_state import StateItem, _phase_for_item
+
+        item = StateItem(
+            "proposal.probe_plans.proposed", "proposal", "warning", "unconfirmed",
+            "review", "before_next_step", "s", "s", "s",
+        )
+        assert _phase_for_item(item) == "instrumentation"
+
+    def test_probe_plan_approved_without_patch_overrides_to_instrumentation(self):
+        # Issue #256: generating/validating a probe patch is instrumentation
+        # work, even though an approved plan alone already satisfies
+        # instrumentation_complete's OR-clause regardless of patch status --
+        # this item used to be deliberately left at the state_group default
+        # (which was the plain terminal "diagnosis" phase); now that
+        # "proposal" defaults to the later "evaluation" phase, it needs its
+        # own override to stay in "instrumentation".
+        from app.system_state import StateItem, _phase_for_item
+
+        item = StateItem(
+            "proposal.probe_plans.approved_without_patch", "proposal", "info", "missing",
+            "review", "optional", "s", "s", "s",
+        )
+        assert _phase_for_item(item) == "instrumentation"
 
 
 class TestUserPhaseIntegration:
@@ -1432,8 +1557,8 @@ class TestUserPhaseIntegration:
         # -- distinct from the "entrypoint_index" intelligence_run row the 4
         # legacy runs above already insert), and docs_code_reconciled (graph
         # + code symbols both present) to be "complete" -- not just the 4
-        # legacy run/build rows above. Seed all three so tests that reach
-        # "diagnosis" via this helper keep doing so under the corrected,
+        # legacy run/build rows above. Seed all three so tests that reach a
+        # later phase via this helper keep doing so under the corrected,
         # stricter gate.
         with get_conn() as conn:
             conn.execute(
@@ -1477,10 +1602,13 @@ class TestUserPhaseIntegration:
         data, items = _get_state(admin_client, hdrs)
         assert data["user_phase"] == "setup"
         by_phase = {p["phase"]: p["complete"] for p in data["phases"]}
-        assert by_phase == {"setup": False, "preparation": False, "diagnosis": False}
+        assert by_phase == {
+            "setup": False, "preparation": False, "instrumentation": False,
+            "observation": False, "evaluation": False, "publish": False,
+        }
 
-        # runtime.connectivity.no_signal is preparation-tagged: present in
-        # `items` (audit trail) but suppressed from every notification
+        # runtime.connectivity.no_signal is instrumentation-tagged: present
+        # in `items` (audit trail) but suppressed from every notification
         # projection (notification_items / page_items / primary_item) while
         # user_phase is still "setup".
         assert "runtime.connectivity.no_signal" in items
@@ -1496,19 +1624,28 @@ class TestUserPhaseIntegration:
         assert "runtime.connectivity.no_signal" not in page_ids
         assert data["primary_item"]["phase"] == "setup"
 
-    def test_pipeline_complete_without_instrumentation_is_preparation(self, admin_client, tmp_path, monkeypatch):
+    def test_pipeline_complete_without_instrumentation_reaches_instrumentation(
+        self, admin_client, tmp_path, monkeypatch
+    ):
+        """Issue #256: preparation no longer has an instrumentation-path
+        OR-clause of its own, so a fully-prepared system with no applied
+        patch / approved plan / live connectivity advances to
+        "instrumentation" instead of staying stuck at "preparation".
+        """
         self._configure_reasoning_llm(monkeypatch)
         _, sys, hdrs = _setup(admin_client)
         snapshot_id = self._complete_pipeline(admin_client, sys, hdrs, tmp_path)
-        # A completed, undecided experiment gives a concrete diagnosis-tagged
-        # item to prove it stays suppressed while still in "preparation".
+        # A completed, undecided experiment gives a concrete evaluation-
+        # tagged item to prove it stays suppressed this far from
+        # "evaluation".
         self._insert_experiment(sys["id"], snapshot_id)
 
         data, items = _get_state(admin_client, hdrs)
-        assert data["user_phase"] == "preparation"
+        assert data["user_phase"] == "instrumentation"
         by_phase = {p["phase"]: p["complete"] for p in data["phases"]}
         assert by_phase["setup"] is True
-        assert by_phase["preparation"] is False
+        assert by_phase["preparation"] is True
+        assert by_phase["instrumentation"] is False
 
         assert "proposal.experiments.undecided" in items
         notif_ids = {i["state_id"] for i in data["notification_items"]}
@@ -1522,12 +1659,12 @@ class TestUserPhaseIntegration:
         }
         assert "proposal.experiments.undecided" not in page_ids
         if data["primary_item"] is not None:
-            assert data["primary_item"]["phase"] in ("setup", "preparation")
-        # preparation-phase items stay visible while user_phase is
-        # "preparation" itself.
+            assert data["primary_item"]["phase"] in ("setup", "preparation", "instrumentation")
+        # instrumentation-phase items stay visible while user_phase is
+        # "instrumentation" itself.
         assert "runtime.connectivity.no_signal" in notif_ids
 
-    def test_approved_probe_plan_reaches_diagnosis(self, admin_client, tmp_path, monkeypatch):
+    def test_approved_probe_plan_without_traces_reaches_observation(self, admin_client, tmp_path, monkeypatch):
         self._configure_reasoning_llm(monkeypatch)
         _, sys, hdrs = _setup(admin_client)
         snapshot_id = self._complete_pipeline(admin_client, sys, hdrs, tmp_path)
@@ -1536,29 +1673,56 @@ class TestUserPhaseIntegration:
         self._insert_probe_plan(sys["id"], snapshot_id, plan_run_id, status="approved")
 
         data, items = _get_state(admin_client, hdrs)
-        assert data["user_phase"] == "diagnosis"
+        assert data["user_phase"] == "observation"
         by_phase = {p["phase"]: p["complete"] for p in data["phases"]}
-        assert by_phase == {"setup": True, "preparation": True, "diagnosis": False}
+        assert by_phase["setup"] is True
+        assert by_phase["preparation"] is True
+        assert by_phase["instrumentation"] is True
+        assert by_phase["observation"] is False
 
-        # Diagnosis-phase items are now visible in notification_items too.
-        notif_ids = {i["state_id"] for i in data["notification_items"]}
-        assert "proposal.experiments.undecided" in notif_ids
-        # An approved plan already satisfies the instrumentation-path
+        # An approved plan already satisfies the instrumentation-completion
         # condition, so the still-no_signal connectivity item softens from
-        # "warning"/blocking to "info".
+        # "warning"/blocking to "info" -- which means it no longer qualifies
+        # for notification_items (severity must be error/blocked/warning),
+        # but it stays visible in page_items (instrumentation <= observation,
+        # and page_items only requires severity != "ok") since real traces
+        # still are not being received.
         assert items["runtime.connectivity.no_signal"]["severity"] == "info"
+        page_ids = {
+            projected["state_id"]
+            for route_items in data["page_items"].values()
+            for projected in route_items
+        }
+        assert "runtime.connectivity.no_signal" in page_ids
+        # The evaluation-phase experiment item stays suppressed: reaching
+        # instrumentation completion via an approved plan alone does not
+        # also reveal evaluation-phase guidance -- finer-grained gating
+        # than the old single terminal "diagnosis" phase gave.
+        notif_ids = {i["state_id"] for i in data["notification_items"]}
+        assert "proposal.experiments.undecided" not in notif_ids
+        assert "proposal.experiments.undecided" not in page_ids
 
-    def test_receiving_traces_without_probe_plan_reaches_diagnosis(self, admin_client, tmp_path, monkeypatch):
+    def test_receiving_traces_without_probe_plan_reaches_evaluation(self, admin_client, tmp_path, monkeypatch):
         self._configure_reasoning_llm(monkeypatch)
         _, sys, hdrs = _setup(admin_client)
-        self._complete_pipeline(admin_client, sys, hdrs, tmp_path)
+        snapshot_id = self._complete_pipeline(admin_client, sys, hdrs, tmp_path)
         self._insert_trace(sys["id"], "worker-component")
+        self._insert_experiment(sys["id"], snapshot_id)
 
         data, items = _get_state(admin_client, hdrs)
-        assert data["user_phase"] == "diagnosis"
+        assert data["user_phase"] == "evaluation"
+        by_phase = {p["phase"]: p["complete"] for p in data["phases"]}
+        assert by_phase["instrumentation"] is True
+        assert by_phase["observation"] is True
+        assert by_phase["evaluation"] is False
         # Real traces mean connectivity_state != "no_signal", so the
         # connectivity item no longer fires at all.
         assert "runtime.connectivity.no_signal" not in items
+
+        # Now that user_phase has reached "evaluation", the evaluation-phase
+        # experiment item becomes visible in notification_items too.
+        notif_ids = {i["state_id"] for i in data["notification_items"]}
+        assert "proposal.experiments.undecided" in notif_ids
 
     def test_proposed_but_not_approved_probe_plan_does_not_satisfy_instrumentation(
         self, admin_client, tmp_path, monkeypatch
@@ -1570,7 +1734,7 @@ class TestUserPhaseIntegration:
         self._insert_probe_plan(sys["id"], snapshot_id, plan_run_id, status="proposed")
 
         data, _items = _get_state(admin_client, hdrs)
-        assert data["user_phase"] == "preparation"
+        assert data["user_phase"] == "instrumentation"
 
     def _four_legacy_runs_only(self, admin_client, sys, hdrs, tmp_path):
         """Seed only the 4 legacy run/build rows the pre-fix
@@ -1600,15 +1764,17 @@ class TestUserPhaseIntegration:
         _insert_capability_node(sys["id"], snapshot_id, run_id, node_type="capability", name="Item management")
         return snapshot_id
 
-    def test_legacy_four_row_completion_alone_does_not_reach_diagnosis(
+    def test_legacy_four_row_completion_alone_does_not_reach_instrumentation(
         self, admin_client, tmp_path, monkeypatch
     ):
-        """Finding #1 regression: before the fix, ``pipeline_all_complete``
-        only checked these same 4 rows, so an approved probe plan on top of
-        them alone was enough to reach "diagnosis" -- even though the
-        canonical 8-step Pipeline Checklist (documentation_claims_scanned /
-        entrypoints_discovered / docs_code_reconciled) was still incomplete.
-        The fixed derivation must keep this at "preparation".
+        """Finding #1 regression (Issue #237): before that fix,
+        ``pipeline_all_complete`` only checked these same 4 rows, so an
+        approved probe plan on top of them alone was enough to advance past
+        "preparation" -- even though the canonical 8-step Pipeline Checklist
+        (documentation_claims_scanned / entrypoints_discovered /
+        docs_code_reconciled) was still incomplete. The derivation must keep
+        this at "preparation" (and therefore also below "instrumentation",
+        since instrumentation_complete chains on preparation_complete).
         """
         self._configure_reasoning_llm(monkeypatch)
         _, sys, hdrs = _setup(admin_client)
@@ -1621,8 +1787,9 @@ class TestUserPhaseIntegration:
         by_phase = {p["phase"]: p["complete"] for p in data["phases"]}
         assert by_phase["setup"] is True
         assert by_phase["preparation"] is False
+        assert by_phase["instrumentation"] is False
 
-    def test_empty_capability_hierarchy_warning_does_not_reach_diagnosis(
+    def test_empty_capability_hierarchy_warning_does_not_reach_instrumentation(
         self, admin_client, tmp_path, monkeypatch
     ):
         """Finding #1 regression: a completed capability_hierarchy run with
@@ -1680,3 +1847,4 @@ class TestUserPhaseIntegration:
         assert data["user_phase"] == "preparation"
         by_phase = {p["phase"]: p["complete"] for p in data["phases"]}
         assert by_phase["preparation"] is False
+        assert by_phase["instrumentation"] is False

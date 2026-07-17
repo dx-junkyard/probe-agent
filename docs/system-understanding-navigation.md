@@ -81,7 +81,32 @@ Evaluate
 | API Role Card | backend entrypoint の所属 capability、role、consumers、state effects、probe value |
 | Flow Explorer | entrypoint からの候補実行フローの可視化とノード/エッジ選択 |
 | Probe Planner | 選択した観測点の mode・risk・承認状態、`?plan=` deep link、patch generation / validation / apply の管理 |
-| Experiments | baseline と source patch variants の隔離実行、比較、human decision |
+| Experiments | baseline と source patch variants の隔離実行、比較、human decision。decision 保存後は `human_decision` の値に応じた Next step カードを表示する（Issue #259、後述） |
+| Components | フロー後半の観測 + 運用の画面。選択した component の Traces / Shadow Results / Profile / Criteria をタブで表示し、mode（`off` / `trace` / `shadow`）を切り替える。`off` ↔ `trace` の切替は常に許可されるが、`shadow` への切替と AI Candidate Studio への遷移（「AIで別バージョンを作る」ボタン）は `trace_count === 0` の component では disabled になる（Issue #258。理由表示は `data-testid="component-zero-traces-reason"`）。`?component=<id>&trace=<id>` で Trace Lineage / analyzer 結果からの deep link を受ける |
+| Simulation Workbench | 記録済み trace の captured input を、pinned snapshot 上のコード（baseline）または編集した候補コード（patch variants、最大 N 件）に対して独立した worktree で再実行し、有限集合の diff matrix（match / diff / candidate_error / error_to_success 等）で比較する（Issue #242 Phase A-D、#243-#246）。実行には component 単位の human replay 承認（`decision_method: manual`）が前提。`?replay_set_id=<id>` で対象 Replay Set を選択する |
+| AI Candidate Studio | component（+ 任意で trace / Replay Set）を起点に、開発者が自然言語で改善目標を伝える会話から候補コード（immutable `CandidateVersion`）を生成し、Simulation Workbench と同じ隔離 Replay 基盤で評価する（Issue #252）。候補生成は reasoning-model の構造化提案＋決定的 splice→diff、Replay は Simulation Workbench の実行系（human 承認・worktree サンドボックス・diff matrix）をそのまま再利用しており、新しい判断・実行・比較経路は追加しない。`?component_id=`（新規セッション prefill）/ `?trace_id=` / `?replay_set_id=` / `?session_id=`（既存セッション再開） |
+| GitHub | GitHub App 接続・repository connection・publish job（commit → push → PR）を管理する。publish は常に人による承認が前提で、push 先は毎回サーバー生成の `probe/` prefix ブランチのみ（default branch への直接 push・force push は不可）。Probe Planner のパッチ適用成功後や Experiments の `adopted` decision から遷移すると、GitHub App 設定済み＋connected connection が 1 件以上の場合に限り `?patch=<id>` 付きで Publish Jobs タブが選択され、対象パッチが検証済みの場合のみ prefill される（Issue #259） |
+| Probe Patterns | 承認・適用済み instrumentation（probe pattern）の一覧、リリース前の除去パッチ生成・適用、最新 snapshot に対する reconciliation（構造的に一致 / moved / split / missing の判定は決定的チェックを優先し、判別できない場合のみ reasoning model。ヒューリスティックへのフォールバックはしない）を扱う（Issue #168）。他ページからのリンクは無く、サイドバー Instrument グループへの所属が唯一の到達経路（Issue #257） |
+| Generate (Legacy) | component + trace + objective から単発の候補コードを生成する旧世代ページ。内部の実行基盤は Simulation Workbench / AI Candidate Studio と同じ共有 harness（`replay_harness.run_inline_candidate`、Issue #244 で移行済み）だが、会話・複数候補比較・immutable version 管理を持たない。AI Candidate Studio に機能面で置き換えられ、サイドバーで `Legacy` バッジ付き・Other グループ末尾に降格されている（Issue #257 決定 b）。ページ自体の機能変更・削除は行われていない |
+
+### 観測・評価まわりの使い分け（Issue #260）
+
+- **Components vs Simulation Workbench / AI Candidate Studio**: Components は
+  「今のトラフィックを見る・mode を変える」観測 + 運用の入口である。個別
+  trace はそこから Replay Set 化して Simulation Workbench に送る、または
+  Candidate Studio セッションを開始できる。この行アクション
+  （`components/replay-row-actions.tsx` の `ReplayRowActions`）は Components
+  の Traces タブ・Trace Lineage・analyzer 結果で共通利用される。
+- **Simulation Workbench vs AI Candidate Studio**: 両者は同じ Replay 実行系・
+  diff matrix・Experiments への promote 導線を共有する。Workbench は開発者
+  自身がソースを編集して diff を確認する手動フロー、Candidate Studio は
+  自然言語の改善目標から reasoning model が patch を提案する会話フロー。
+  Workbench の「会話で候補を改善」ボタンで Candidate Studio に切り替えら
+  れ、どちらで承認した replay 承認も component 単位のため両ページで共有
+  される。
+- **Generate (Legacy) vs AI Candidate Studio**: 実行基盤（harness）は共通だ
+  が、Generate は単発生成のみで会話・複数候補比較・promotion を持たない。
+  新規に使う場合は AI Candidate Studio を使う。
 
 ## Context Header
 
@@ -197,10 +222,64 @@ Pipeline Checklist の各 step ラベルは Issue #240 でサーバー正本化�
 | Probe Planner — Experiments | Experiments | `?capability=<key>` を保持 |
 | Experiments — Back to Capability | Capability Map | `?capability=<key>` を保持 |
 | System Understanding — Next Action `Review probe plan` | Probe Planner | `?plan=<id>` |
+| Components — Traces タブの行アクション「Replay」 | Simulation Workbench | trace を新規/既存 Replay Set に追加後 `?replay_set_id=<id>` で遷移（`ReplayRowActions`。Trace Lineage / analyzer 結果でも共通利用、Issue #242/#246） |
+| Components — Traces タブの行アクション「この入力から改善する」 | AI Candidate Studio | `?component_id=<id>&trace_id=<id>` |
+| Components — Traces タブの行アクション「Create Experiment」 | Experiments | `?from_trace=<id>&from_component=<id>`（patch を伴わないコンテキスト prefill のみ） |
+| Components — ヘッダーの「AIで別バージョンを作る」 | AI Candidate Studio | `?component_id=<id>`（新規セッション prefill。`trace_count === 0` の component では disabled） |
+| Simulation Workbench — 「会話で候補を改善」 | AI Candidate Studio | `?component_id=<id>&replay_set_id=<id>` |
+| Simulation Workbench — variant の Promote | Experiments | `?replay_run_id=<id>&replay_variant_id=<id>`（patch payload はサーバー側で解決。`?draft=` と同じ prefill 機構、Issue #242 Phase D） |
+| AI Candidate Studio — 「Experimentへ送る」（promote） | Experiments | `?replay_run_id=<id>&replay_variant_id=<id>`（Simulation Workbench の promote と同じ機構を再利用、Issue #252） |
+| Probe Planner — パッチ apply 成功 | GitHub（Publish Jobs タブ） | `?patch=<id>`。GitHub App 設定済み **かつ** connected connection が 1 件以上のときのみ表示（`data-testid="patch-publish-link"`）。それ以外は手動 git 手順を表示する（`data-testid="patch-manual-git-instructions"`、Issue #259） |
+| Experiments — decision `adopted` | GitHub | 遷移リンク（`data-testid="experiment-github-publish-link"`）。`?patch=` は付与されない（Publish Jobs タブで対象パッチを手動選択する）。githubPublishAvailable のときのみ表示 |
+| Experiments — decision `adopted` | Probe Planner | 「次の probe サイクルを開始」（`data-testid="experiment-probe-planner-link"`）。`?capability=<key>` があれば引き継ぐ |
+| Experiments — decision `rejected` / `needs_more_data` | AI Candidate Studio | 遷移リンクのみ（`data-testid="experiment-candidate-studio-link"`）。Experiment は `component_id` を持たないため prefill はしない |
+| Overview — Get Started ステップ 4「View traces in Components」 | Components | `/components`。SDK 接続後にトレースを見に行く導線。connectivity `receiving` で完了マーク（`data-done`、Issue #259） |
 
 `?capability=` は selection state ではなく navigation context である。Flow Explorer、
 Probe Planner、Experiments はこの値を使って Context Header と back link を表示し、
 Capability Map から始めた探索が Evaluate stage まで途切れないようにする。
+
+### サイドバー: フェーズ連動グループ化（Issue #257）
+
+サイドバー（`apps/dashboard/src/components/layout/sidebar.tsx`）は、Issue
+#173/#179 が導入した固定見出し（Hub / Detail views / Other）から、
+`GET /system-state` の `user_phase`（6 フェーズ）の軸に沿ったグループ化へ
+再編された。**ルーティング自体（URL・ページ機能）は変更していない**。
+
+| サイドバー見出し | 対応する `phases` | 画面 |
+| --- | --- | --- |
+| (見出しなし) | — | Overview |
+| Setup | `setup` | Setup Guide, Repository, Settings |
+| Understand | `preparation` | System Understanding, Capability Map, Feature Map, Flow Explorer, Interview |
+| Instrument | `instrumentation` | Probe Planner, Probe Patterns, Connect SDK |
+| Observe & Evaluate | `observation`, `evaluation`（1 グループが 2 フェーズを担当） | Components / Traces, Trace Lineage, Trace Analyzers, Experiments, Simulation Workbench, AI Candidate Studio, Decision Workspace |
+| Publish | `publish` | GitHub |
+| Other | — | Generate（`Legacy` バッジ付き）、(admin のみ) Admin |
+
+- 現在の `user_phase` を含むグループの見出しには「現在」バッジが付き
+  （`data-phase-state="current"`）、現在フェーズより後のグループは
+  `opacity-50` で dimmed 表示される。dimmed でもクリックは常に可能で、
+  遷移をブロックすることはない。`user_phase` が未取得（旧サーバー・
+  loading・error）のときは全グループが通常表示される
+  （`phaseGroupState` の `"none"` 分岐、Principle 6 の二段階ルールに沿っ
+  た graceful degradation）。
+- グループの `data-testid` は `sidebar-group-<見出しの小文字・空白→ハイ
+  フン>`（例: `sidebar-group-setup`, `sidebar-group-observe-&-evaluate`）。
+  Overview / Other は phase を持たないため `data-phase-state` は付かな
+  い。
+- Generate は削除・機能変更されず、`data-testid="sidebar-legacy-badge"`
+  の `Legacy` バッジ + ツールチップ（AI Candidate Studio を推奨）付きで
+  Other 末尾に降格された（Issue #257 決定 b）。Probe Patterns はページ自
+  体を変更せず、Instrument グループへの所属で到達経路を確保している
+  （他ページからのリンクは無い）。
+
+**#189 との分担**: この「サイドバーのフェーズ連動グループ」は、ナビゲー
+ション枠（サイドバー）の並び替えに閉じている。本 doc の「目標 UI 導線」
+節が説明する System Understanding ページ**内部**の 4 stage Hub
+（Understand / Decide Where to Observe / Instrument / Evaluate、Issue
+#173/#179 の Hub 再編）とは別の軸であり、両者の見出し文言が偶然重なる
+箇所があっても同じものではない。後者（Hub 再編に伴う本 doc の既存記述の
+更新）は #189 のスコープであり、本 issue (#260) では扱わない。
 
 ## Capability Context API
 
@@ -299,8 +378,8 @@ Sub 3（#238）の領分であり、#236 は対象外。
 | documentation_claims_scanned 未完了 | 既存の `diagnostic.pipeline_understanding_graph`（診断投影、`understanding_graph_snapshots` の有無を reasoning 要求付きでチェック）が同一条件を既にカバーしている。ネイティブ項目は追加していない |
 | docs_code_reconciled 未完了（has_understanding_graph **かつ** has_code_symbols） | 新規 `pipeline.docs_code_reconcile.not_run` / `.partial`。既存の `diagnostic.pipeline_understanding_graph` は graph の有無のみを見るため、symbol 側の欠落を拾えない差分をネイティブ項目で埋めた |
 | purpose 未定義 / capabilities 空（rule 3 の pipeline_complete 分岐） | `understanding.purpose.*` / `understanding.capabilities.*`（既存） |
-| "Review probe plan"（proposed_plan_ids） | 新規 `proposal.probe_plans.proposed`（`phase="preparation"` を明示上書き — 承認は preparation 完了条件の一方の経路のため） |
-| "Generate / validate probe patch"（approved_plan_ids_without_validated_patch） | 新規 `proposal.probe_plans.approved_without_patch`（`state_group="proposal"` の既定どおり `phase="diagnosis"`） |
+| "Review probe plan"（proposed_plan_ids） | 新規 `proposal.probe_plans.proposed`（策定時点は `phase="preparation"` を明示上書き — 承認が preparation 完了条件の OR 経路の一つだったため。Issue #256 でその OR 経路自体が `instrumentation` へ移り、上書き先も `instrumentation` に更新された。現在の値は前節「user_phase とフェーズ抑制」参照） |
+| "Generate / validate probe patch"（approved_plan_ids_without_validated_patch） | 新規 `proposal.probe_plans.approved_without_patch`（策定時点は `state_group="proposal"` の既定どおり `phase="diagnosis"`。Issue #256 で明示上書き `instrumentation` に変更 — 計装作業そのものであるため。現在の値は前節参照） |
 | "Review experiment decision"（undecided_completed_experiment_ids） | `proposal.experiments.undecided`（既存、Issue #237） |
 | 全完了時の "Start from Capability" 等の探索導線（rule 4 のフォールバック） | 対応する StateItem を追加しない（意図的）。`select_primary_item` は `severity != "ok"` の項目のみを候補とするため、問題が無ければ `primary_item = None` になる。旧系の「探索を促す」導線と新系の「沈黙」は意味的に異なる（前者は次にやることの提案、後者は「今は何も直すことがない」の表明）ため、統合対象は前者ではなく後者を正とする |
 
@@ -317,35 +396,55 @@ Sub 3（#238）の領分であり、#236 は対象外。
 ことも同ファイルで固定した（両者とも `_check_understanding_refresh_recommended`
 という同一関数を読んでいるため、構造的に一致する）。
 
-### user_phase とフェーズ抑制（Issue #237）
+### user_phase とフェーズ抑制（Issue #237; Issue #256 で 6 フェーズへ拡張）
 
 `GET /system-state` は上記 `StateItem` 一覧に加えて、ユーザーが今どの
-段階にいるかを表す `user_phase`（`"setup" | "preparation" | "diagnosis"`）
-と、各フェーズの完了可否 `phases: [{phase, complete}]` を返す。
+段階にいるかを表す `user_phase` と、各フェーズの完了可否
+`phases: [{phase, complete, label}]` を返す。Issue #256 で、旧
+`"setup" | "preparation" | "diagnosis"` の 3 フェーズから、計装・観測・
+評価・公開までを表す 6 フェーズへ拡張された（旧終端フェーズ `diagnosis`
+は撤去）。
 
-| フェーズ | 完了条件 |
-| --- | --- |
-| `setup` | 対象リポジトリ登録済み、かつ repository / database / auth / llm 系診断（`system_diagnostics.DiagnosticCheck.category`）に `error` / `blocked` が無い |
-| `preparation` | ready snapshot 存在、決定的 8 ステップ Pipeline Checklist（`system_understanding_service.compute_pipeline_steps` — repository_configured / snapshot_ready / documentation_indexed / documentation_claims_scanned / symbols_indexed / entrypoints_discovered / docs_code_reconciled / capability_hierarchy_ready）が全て `complete`（Issue #237）、Purpose / Capabilities が `evaluate_understanding` の `satisfied_current` または `baseline_reusable`、かつ計装経路確立（承認済み probe plan が 1 件以上、または SDK 接続状態が `no_signal` でない）。`pipeline_all_complete` は Pipeline Checklist と同一の共有関数から導出されるため、Checklist に未完了 step（`warning` / `blocked` / `missing`、例: 空の capability hierarchy）が残る限り `diagnosis` へ進まない |
-| `diagnosis` | 終端フェーズ（完了条件なし） |
+| フェーズ | ラベル（`state_messages.phase_label`） | 完了条件 |
+| --- | --- | --- |
+| `setup` | 必要最低限の設定 | 対象リポジトリ登録済み、かつ repository / database / auth / llm 系診断（`system_diagnostics.DiagnosticCheck.category`）に `error` / `blocked` が無い |
+| `preparation` | 分析準備 | setup 完了、かつ ready snapshot 存在、かつ決定的 8 ステップ Pipeline Checklist（`system_understanding_service.compute_pipeline_steps` — repository_configured / snapshot_ready / documentation_indexed / documentation_claims_scanned / symbols_indexed / entrypoints_discovered / docs_code_reconciled / capability_hierarchy_ready）が全て `complete`、かつ Purpose / Capabilities が `evaluate_understanding` の `satisfied_current` または `baseline_reusable`。Issue #256 で計装経路確立の OR 条件は `instrumentation` フェーズへ移り、preparation 自体の完了条件からは外れた |
+| `instrumentation` | プローブ設定 | preparation 完了、かつ（適用済み probe patch が存在 **または** 承認済み probe plan が 1 件以上 **または** SDK 接続状態が `no_signal` でない）のいずれか |
+| `observation` | 観測 | instrumentation 完了、かつ SDK 接続状態が実際に `receiving`（`no_signal` はもちろん `smoke_only` でも満たさない） |
+| `evaluation` | 候補評価 | observation 完了、かつ（human_decision が記録された experiment が 1 件以上 **または** 完了した replay variant run が 1 件以上） |
+| `publish` | 公開 | evaluation 完了、かつ publish job が `completed`。全フェーズ充足時の表示上の終端フェーズでもある（この場合 `user_phase` は `"publish"` を返すが、`phases[-1].complete` 自体は publish job が実際に成功するまで `false` のまま） |
 
-現在フェーズ = 完了条件を満たさない最初のフェーズ。導出は
-`system_state.derive_user_phase(facts: UserPhaseFacts)` という DB 非依存の
-純粋関数が担う（`build_system_state` が `state_facts` / diagnostics から
-facts を集めて渡す）。入力が不明な場合は常に前のフェーズに倒れる
-（`UserPhaseFacts` の全フィールドが「未達成」側をデフォルトにしている
-ため）。
+現在フェーズ = 完了条件を満たさない最初のフェーズ（全て満たせば表示上の
+終端 `"publish"`）。導出は `system_state.derive_user_phase(facts:
+UserPhaseFacts)` という DB 非依存の純粋関数が担う（`build_system_state`
+が `state_facts` / diagnostics から facts を集めて渡す）。入力が不明な場
+合は常に前のフェーズに倒れる（`UserPhaseFacts` の全フィールドが「未達
+成」側をデフォルトにしているため）。
+
+**`phases[].complete` は「一度でも到達したか」を表す一方向の marker**
+であり、「今それをやっている最中か」ではない。`observation` /
+`evaluation` は運用上サイクリック（トレースは来続け、実験は積み重なる）
+だが、一度 `true` になった `complete` が後から `false` に戻ることはな
+い。`user_phase` は「次に到達すべき最初の未達成マイルストーン」を指す進
+捗ポインタであり、「今この瞬間何をしているか」のライブ指標ではない。
 
 各 `StateItem` は `phase` フィールドを持つ。既定は `state_group` → フェー
 ズの固定マッピング（`repository` / `configuration` → `setup`、
 `snapshot` / `pipeline` / `understanding` / `interview` → `preparation`、
-`runtime` / `proposal` → `diagnosis`）だが、`system_state.
-STATE_ID_PHASE_OVERRIDES` という小さな明示的辞書がこれを上書きする場合が
-ある。例えば `runtime.connectivity.no_signal`（state_group は
-`runtime`）は SDK 接続確立が preparation の完了条件そのものであるため
-`preparation` タグになる。同様に、診断由来の `StateItem`
-（`diagnostic.<check_id>`）は `_diagnostic_state_item` が
-auth/database/llm/configuration 以外のカテゴリを一律 `state_group=
+`runtime` → `observation`、`proposal` → `evaluation`。Issue #256 が
+`runtime` / `proposal` の既定先を、両グループが共有していた旧終端
+`diagnosis` から新設の `observation` / `evaluation` へ付け替えた）だが、
+`system_state.STATE_ID_PHASE_OVERRIDES` という小さな明示的辞書がこれを
+上書きする場合がある。例えば `runtime.connectivity.no_signal`
+（state_group は `runtime`）は SDK 接続確立が `instrumentation` の OR
+条件の一つであるため `instrumentation` タグになる（Issue #256 で
+`preparation` から付け替え——preparation はもう独自の OR 条件を持たな
+い）。同様に `proposal.probe_plans.proposed` /
+`proposal.probe_plans.approved_without_patch`（probe plan のレビュー待
+ち・承認済みだが patch 未生成）も `proposal` の既定 `evaluation` ではな
+く `instrumentation` に上書きされている（計装作業そのものであるため）。
+診断由来の `StateItem`（`diagnostic.<check_id>`）は `_diagnostic_state_item`
+が auth/database/llm/configuration 以外のカテゴリを一律 `state_group=
 "runtime"` に畳み込む（Issue #193）ため、repository / pipeline /
 understanding カテゴリの check だけは診断カテゴリに合わせて
 `setup` / `preparation` に個別上書きしている。
@@ -364,9 +463,10 @@ setup の解消案内が出る——これは設計どおりで、後フェー�
 
 `runtime` / `proposal` グループは Issue #193 Phase 1 では宣言のみで未使用
 だったが、Issue #237 で代表項目を 1 件ずつ追加した（網羅は狙わない）:
-`runtime.connectivity.no_signal`（トレース未受信時の計装案内、
-preparation タグ）と `proposal.experiments.undecided`（完了済みだが
-human_decision 未記録の experiment のレビュー促し、diagnosis タグ）。
+`runtime.connectivity.no_signal`（トレース未受信時の計装案内、上記のとお
+り `instrumentation` タグ）と `proposal.experiments.undecided`（完了済み
+だが human_decision 未記録の experiment のレビュー促し、`evaluation` タ
+グ——Issue #256 で旧 `diagnosis` から付け替え）。
 
 ### 状態メッセージのカタログ化と日本語統一（Issue #240）
 
@@ -412,11 +512,17 @@ pipeline step / stage の表示名、gap のタイトル/next-action、成功サ
   進めるための「次の一歩」はフェーズ抑制済みの `primary_item`（サーバー
   計算の最上位 actionable 項目）の summary / remediation / target_ui を
   そのまま消費する。クライアントはフェーズも状態文言も導出しない。
-- 終端フェーズ `diagnosis` では前提がすべて満たされるため何も描画しない
-  ——フェーズが進むと自動的に消える。
-- 配置: Overview の zero-state（コンポーネント 0 件かつ非 diagnosis）、
-  Feature Map の features 空状態、Probe Planner の生成ダイアログ（診断準備
-  未完了時）。Probe Planner のゲートは導線であり強制ブロックではない
+- Issue #256 で `user_phase` が 6 フェーズへ拡張された後も、このガイドが
+  描画するのは `setup` / `preparation` のときだけである
+  （`SUPPORTED_PREREQUISITE_PHASES`、単一の終端フェーズ判定ではなく明示的
+  な有限集合へのメンバーシップ判定）。`instrumentation` 以降（計装・観測・
+  評価・公開）は setup/preparation の前提が定義上すでに満たされているため
+  何も描画しない——フェーズが進むと自動的に消える。後続フェーズ向けの
+  ガイド UX は #257/#258 が別途担当する。
+- 配置: Overview の zero-state（コンポーネント 0 件）、Feature Map の
+  features 空状態、Probe Planner の生成ダイアログ（準備未完了時）。呼び出
+  し側はフェーズを判定せず常にマウントし、上記のフェーズ判定はガイド内部
+  のみで行う。Probe Planner のゲートは導線であり強制ブロックではない
   （自由入力 feature id は既定折りたたみの escape hatch、プラン生成 API は
   拒否しない）。強制が必要になった場合はサーバー側バリデーションとして
   別途起票する。

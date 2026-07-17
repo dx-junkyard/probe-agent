@@ -51,6 +51,15 @@ export default function ComponentsPage() {
   const { data: criteria } = useCriteria(selected);
 
   const current = components?.find(c => c.component_id === selected);
+  // Issue #258: `components` rows are created (mode='trace' by default) via
+  // GET/PUT .../policy before any traffic ever arrives (see
+  // apps/control-server/app/routes/components.py get_policy/put_policy), and
+  // /components itself LEFT JOINs traces and COUNTs them -- so a 0-trace
+  // component is a real, reachable state, not just a defensive edge case.
+  // `current === undefined` (list still loading, or a stale ?component= that
+  // no longer resolves) is treated as "unknown", per the escape hatch --
+  // only a definitive trace_count === 0 blocks.
+  const zeroTraces = current !== undefined && current.trace_count === 0;
 
   const [profForm, setProfForm] = useState<Record<string, string>>({});
   const profileFields = ["purpose", "responsibility", "expected_input", "expected_output", "failure_impact"] as const;
@@ -116,24 +125,50 @@ export default function ComponentsPage() {
                 <Button
                   size="sm"
                   variant="outline"
-                  title="Start an AI Candidate Studio session for this component"
+                  title={zeroTraces
+                    ? "No traces recorded yet for this component — candidate generation needs example inputs/outputs to work from."
+                    : "Start an AI Candidate Studio session for this component"}
+                  disabled={zeroTraces}
                   onClick={() => navigate(`/candidate-studio?component_id=${encodeURIComponent(selected)}`)}
                 >
                   <Bot className="h-4 w-4 mr-1" /> AIで別バージョンを作る
                 </Button>
-                {MODES.map(m => (
-                  <Button
-                    key={m}
-                    size="sm"
-                    variant={current?.mode === m ? "default" : "outline"}
-                    onClick={() => updatePolicy.mutateAsync({ componentId: selected, mode: m }).then(() => toast.success(`Mode: ${m}`)).catch(e => toast.error(String(e)))}
-                    disabled={updatePolicy.isPending}
-                  >
-                    {m}
-                  </Button>
-                ))}
+                {MODES.map(m => {
+                  // Issue #258 (orchestrator's interpretation of the
+                  // components-page gating AC): only the "shadow" mode
+                  // switch is gated on trace_count === 0 -- shadow
+                  // comparison is meaningless without recorded traffic to
+                  // compare a candidate against. "off" <-> "trace" must
+                  // NEVER be gated on trace count: switching to "trace" is
+                  // precisely how a component starts collecting its first
+                  // traces, so gating it here would create a
+                  // chicken-and-egg deadlock the escape-hatch AC warns
+                  // against.
+                  const shadowBlocked = m === "shadow" && zeroTraces;
+                  return (
+                    <Button
+                      key={m}
+                      size="sm"
+                      variant={current?.mode === m ? "default" : "outline"}
+                      onClick={() => updatePolicy.mutateAsync({ componentId: selected, mode: m }).then(() => toast.success(`Mode: ${m}`)).catch(e => toast.error(String(e)))}
+                      disabled={updatePolicy.isPending || shadowBlocked}
+                      title={shadowBlocked
+                        ? "Shadow comparison needs recorded traces first — switch to trace mode to start collecting them."
+                        : undefined}
+                    >
+                      {m}
+                    </Button>
+                  );
+                })}
               </div>
             </div>
+            {zeroTraces && (
+              <p className="text-xs text-muted-foreground" data-testid="component-zero-traces-reason">
+                No traces recorded yet for <span className="font-mono">{selected}</span> — AI candidate
+                generation and shadow mode need example traffic first. Switch to{" "}
+                <span className="font-medium">trace</span> mode to start collecting it.
+              </p>
+            )}
 
             <Tabs defaultValue="traces">
               <TabsList>

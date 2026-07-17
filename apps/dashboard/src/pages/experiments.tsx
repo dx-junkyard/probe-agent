@@ -4,6 +4,7 @@ import {
   useExperiments, useRunExperiment, useExperimentDecision,
   useCreateExperiment, useSnapshots, useLatestDrafts,
   useWorkspaceProposalDraft, useVariantExperimentPayload,
+  useGithubAppStatus, useGithubConnections,
 } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -16,7 +17,7 @@ import { Label } from "@/components/ui/label";
 import { Dialog, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { toast } from "sonner";
 import { formatTimestamp } from "@/lib/utils";
-import { Play, Download, Plus, Trash2 } from "lucide-react";
+import { Play, Download, Plus, Trash2, GitPullRequest, Crosshair, Bot } from "lucide-react";
 import type { ExperimentOut } from "@/api/types";
 import { AddToWorkspaceButton } from "@/components/add-to-workspace";
 import { ContextHeader } from "@/components/layout/context-header";
@@ -64,6 +65,14 @@ export default function ExperimentsPage() {
   const runExperiment = useRunExperiment();
   const makeDecision = useExperimentDecision();
   const createExperiment = useCreateExperiment();
+  // Issue #259: connects "decision saved" to the GitHub publish workflow
+  // (Issue #216). Same availability rule as the Probe Planner apply-success
+  // next-action -- App configured AND at least one connected repo -- so the
+  // developer is never handed a link that leads nowhere.
+  const { data: githubAppStatus } = useGithubAppStatus();
+  const { data: githubConnections } = useGithubConnections();
+  const githubPublishAvailable = !!githubAppStatus?.configured
+    && (githubConnections ?? []).some(c => c.status === "connected");
   const { data: snapshots } = useSnapshots();
   const { data: drafts } = useLatestDrafts();
   const [expandedId, setExpandedId] = useState<number | null>(null);
@@ -196,6 +205,8 @@ export default function ExperimentsPage() {
               onToggle={() => setExpandedId(expandedId === exp.id ? null : exp.id)}
               runExperiment={runExperiment}
               makeDecision={makeDecision}
+              githubPublishAvailable={githubPublishAvailable}
+              capabilityContext={capabilityContext}
             />
           ))}
         </div>
@@ -325,12 +336,16 @@ export default function ExperimentsPage() {
   );
 }
 
-function ExperimentCard({ exp, expanded, onToggle, runExperiment, makeDecision }: {
+function ExperimentCard({
+  exp, expanded, onToggle, runExperiment, makeDecision, githubPublishAvailable, capabilityContext,
+}: {
   exp: ExperimentOut;
   expanded: boolean;
   onToggle: () => void;
   runExperiment: ReturnType<typeof useRunExperiment>;
   makeDecision: ReturnType<typeof useExperimentDecision>;
+  githubPublishAvailable: boolean;
+  capabilityContext: string | null;
 }) {
   const [decisionVal, setDecisionVal] = useState(exp.human_decision ?? "undecided");
   const [decisionVariant, setDecisionVariant] = useState(exp.human_decision_variant_key ?? "");
@@ -439,6 +454,15 @@ function ExperimentCard({ exp, expanded, onToggle, runExperiment, makeDecision }
             </div>
           )}
 
+          {/* Issue #259: driven by the experiment's persisted `human_decision`
+              (not local save-button state) so this also shows for decisions
+              made earlier, on every load -- deterministic and simple. */}
+          <ExperimentNextAction
+            humanDecision={exp.human_decision}
+            githubPublishAvailable={githubPublishAvailable}
+            capabilityContext={capabilityContext}
+          />
+
           {exp.variants?.length > 0 && (
             <div>
               <h4 className="text-sm font-medium mb-2">Variants</h4>
@@ -508,4 +532,62 @@ function ExperimentCard({ exp, expanded, onToggle, runExperiment, makeDecision }
       )}
     </Card>
   );
+}
+
+// Issue #259: closes the "decision saved -> dead end" gap. `Candidate Studio`
+// never gets a `component_id` prefill here -- an Experiment record (and its
+// variants) carries only `feature_id`, never a `component_id`, in any typed
+// field, so there is nothing deterministic to prefill (Principle 6); linking
+// bare to /candidate-studio lets the developer pick the component there.
+function ExperimentNextAction({ humanDecision, githubPublishAvailable, capabilityContext }: {
+  humanDecision: string | null;
+  githubPublishAvailable: boolean;
+  capabilityContext: string | null;
+}) {
+  if (humanDecision === "adopted") {
+    const probePlannerHref = capabilityContext
+      ? `/probe-planner?capability=${encodeURIComponent(capabilityContext)}`
+      : "/probe-planner";
+    return (
+      <div className="rounded-lg border p-3 space-y-2 text-xs" data-testid="experiment-next-action-adopted">
+        <div className="text-sm font-medium">Next step</div>
+        {/* GitHub publish link only appears when the workflow is actually
+            usable (App configured + at least one connected repo) -- shown
+            or hidden by the caller's githubPublishAvailable, never here. */}
+        {githubPublishAvailable && (
+          <Link
+            to="/github"
+            className="flex items-center gap-1.5 text-primary hover:underline"
+            data-testid="experiment-github-publish-link"
+          >
+            <GitPullRequest className="h-3.5 w-3.5" /> Publish the adopted change via GitHub
+          </Link>
+        )}
+        <Link
+          to={probePlannerHref}
+          className="flex items-center gap-1.5 text-primary hover:underline"
+          data-testid="experiment-probe-planner-link"
+        >
+          <Crosshair className="h-3.5 w-3.5" /> Start the next probe cycle in Probe Planner
+        </Link>
+      </div>
+    );
+  }
+
+  if (humanDecision === "rejected" || humanDecision === "needs_more_data") {
+    return (
+      <div className="rounded-lg border p-3 space-y-2 text-xs" data-testid="experiment-next-action-candidate-studio">
+        <div className="text-sm font-medium">Next step</div>
+        <Link
+          to="/candidate-studio"
+          className="flex items-center gap-1.5 text-primary hover:underline"
+          data-testid="experiment-candidate-studio-link"
+        >
+          <Bot className="h-3.5 w-3.5" /> Try an AI-generated candidate in Candidate Studio
+        </Link>
+      </div>
+    );
+  }
+
+  return null;
 }
