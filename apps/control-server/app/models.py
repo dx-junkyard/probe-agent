@@ -46,6 +46,14 @@ class TraceProjectionIn(BaseModel):
     error: Optional[str] = None
 
 
+class SDKTransportSummary(BaseModel):
+    """Bounded SDK queue/breaker loss summary emitted by Issue #272."""
+
+    dropped_count: int = Field(ge=0, le=9_223_372_036_854_775_807)
+    failure_count: int = Field(ge=0, le=9_223_372_036_854_775_807)
+    state: Literal["closed", "open", "half_open"]
+
+
 class TraceEvent(BaseModel):
     trace_id: str
     component_id: str
@@ -71,6 +79,7 @@ class TraceEvent(BaseModel):
     input_capture: Optional[Any] = None
     replayability: Optional[Replayability] = None
     replay_reasons: Optional[List[ReplayReason]] = None
+    sdk_transport: Optional[SDKTransportSummary] = None
 
 
 class ProjectionOut(BaseModel):
@@ -583,9 +592,35 @@ class RepositoryStatusOut(BaseModel):
     # True when the latest snapshot's commit differs from current HEAD, so a new
     # snapshot should be created before generating new analysis/patches.
     snapshot_stale: bool = False
+    # Finite relationship of the latest ready snapshot to HEAD. A lag count is
+    # available only for same/behind; failures and missing commits are unknown.
+    head_relation: Literal["same", "behind", "diverged", "unknown"] = "unknown"
+    commits_behind: Optional[int] = None
     # True when a ready snapshot exists but has no completed symbol index.
     symbols_stale: bool = False
     next_actions: List[str] = Field(default_factory=list)
+
+
+RepositoryResyncStatus = Literal[
+    "queued",
+    "snapshotting",
+    "indexing",
+    "completed",
+    "snapshot_failed",
+    "index_failed",
+]
+
+
+class RepositoryResyncJobOut(BaseModel):
+    id: int
+    system_id: int
+    snapshot_id: Optional[int] = None
+    status: RepositoryResyncStatus
+    error: Optional[str] = None
+    stale_capability_count: int = 0
+    created_at: float
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
 
 
 class IntelligenceRunOut(BaseModel):
@@ -1887,8 +1922,6 @@ class LoginRequest(BaseModel):
 
 
 class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
     expires_at: Optional[float] = None
 
 
@@ -1910,6 +1943,9 @@ class MeResponse(BaseModel):
     user: Optional[UserOut] = None
     auth: str = Field(..., description="token | legacy_api_key | anonymous")
     system_id: Optional[int] = None
+    transport: str = Field(
+        ..., description="authorization | x_api_key | cookie | legacy_api_key | anonymous"
+    )
 
 
 class BootstrapStatusOut(BaseModel):
@@ -3188,6 +3224,8 @@ SystemUnderstandingPurposeConfirmationStaleReason = Literal[
 class SystemUnderstandingPurposeConfirmationOut(BaseModel):
     id: int
     snapshot_id: int
+    understanding_build_id: Optional[int] = None
+    decided_by_user_id: Optional[int] = None
     decision_method: str
     manual_purpose: str
     ai_purpose_name: Optional[str] = None
@@ -3204,13 +3242,14 @@ class SystemUnderstandingPurposeConfirmationCreate(BaseModel):
     """Record a human 'confirmed' decision between the manual system_profile
     purpose and the current AI/source-derived purpose view.
 
-    `snapshot_id`, when provided, must match the latest ready snapshot (same
-    staleness pattern as `IssueDraftCreateRequest.snapshot_id`) so a
-    confirmation never embeds a snapshot that disagrees with the purpose
-    views the caller was looking at.
+    Both ids are optional only for wire-level backward compatibility. The
+    endpoint fail-closes with 409 unless `snapshot_id` matches the latest
+    ready snapshot and `understanding_build_id` matches its latest completed
+    build, so a confirmation cannot race a rebuild after the view was read.
     """
 
     snapshot_id: Optional[int] = None
+    understanding_build_id: Optional[int] = None
     note: Optional[str] = Field(default=None, max_length=2000)
 
 
@@ -3244,6 +3283,33 @@ class IssueDraftRefOut(BaseModel):
     title: str
 
 
+GapTriageStatus = Literal["open", "acknowledged", "dismissed", "resolved"]
+GapTriageDecisionMethod = Literal["manual", "deterministic"]
+GapTriageReopenReason = Literal["content_changed", "resolved_gap_reappeared"]
+
+
+class GapTriageDecisionOut(BaseModel):
+    id: int
+    system_id: int
+    snapshot_id: Optional[int] = None
+    gap_key: str
+    content_fingerprint: str
+    status: GapTriageStatus
+    decided_by_user_id: Optional[int] = None
+    decision_method: GapTriageDecisionMethod
+    note: Optional[str] = None
+    created_at: float
+
+
+class GapTriageUpdateRequest(BaseModel):
+    gap_key: str = Field(min_length=1, max_length=4000)
+    content_fingerprint: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    status: GapTriageStatus
+    note: Optional[str] = Field(default=None, max_length=1000)
+
+
 class SystemUnderstandingGapOut(BaseModel):
     gap_type: Optional[str] = None
     severity: str = "info"
@@ -3264,6 +3330,19 @@ class SystemUnderstandingGapOut(BaseModel):
     source_id: Optional[str] = None
     source_key: Optional[str] = None
     issue_drafts: List[IssueDraftRefOut] = Field(default_factory=list)
+    # Issue #276: human-readable, snapshot-stable locator and a separate
+    # semantic content fingerprint. ``triage_status`` is the effective state;
+    # it becomes open when a dismissed gap's fingerprint changes even before
+    # the deterministic reopen audit row is materialized by the next action.
+    # Optional on the shared model for backward compatibility with the
+    # existing POST /issue-drafts payload, which accepts caller-supplied gaps
+    # created before Issue #276. Server-generated System Understanding gaps
+    # always populate both fields in `_system_understanding_to_out`.
+    gap_key: Optional[str] = None
+    content_fingerprint: Optional[str] = None
+    triage_status: GapTriageStatus = "open"
+    triage_decision: Optional[GapTriageDecisionOut] = None
+    triage_reopen_reason: Optional[GapTriageReopenReason] = None
 
 
 # Issue #202: finite stage completion status shown as a badge in the Hub.
@@ -3298,6 +3377,7 @@ class SystemUnderstandingGapTrendOut(BaseModel):
 class SystemUnderstandingOut(BaseModel):
     system_id: int
     snapshot_id: Optional[int] = None
+    understanding_build_id: Optional[int] = None
     commit_sha: Optional[str] = None
     pipeline: List[SystemUnderstandingPipelineStepOut] = Field(default_factory=list)
     purpose: Optional[SystemUnderstandingPurposeOut] = None

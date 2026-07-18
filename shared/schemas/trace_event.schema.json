@@ -87,6 +87,17 @@
           "redaction_blocked"
         ]
       }
+    },
+    "sdk_transport": {
+      "type": ["object", "null"],
+      "description": "Bounded queue/circuit-breaker loss summary acknowledged by the Control Server (Issues #272/#273).",
+      "required": ["dropped_count", "failure_count", "state"],
+      "properties": {
+        "dropped_count": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
+        "failure_count": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
+        "state": { "type": "string", "enum": ["closed", "open", "half_open"] }
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false

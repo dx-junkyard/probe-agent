@@ -104,7 +104,7 @@ def admin_client(tmp_path, monkeypatch):
 
 def test_projections_system_scoped(admin_client):
     r = admin_client.post("/auth/login", json={"username": "root", "password": "s3cret"})
-    token = r.json()["access_token"]
+    token = r.cookies.get("probe_session")
 
     def mk(name):
         rr = admin_client.post("/systems", json={"name": name},

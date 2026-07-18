@@ -1,3 +1,4 @@
+import math
 import os
 from typing import Optional
 
@@ -23,7 +24,13 @@ class ProbeConfig:
     ENV_TIMEOUT = "PROBE_HTTP_TIMEOUT"
     ENV_SHUTDOWN_TIMEOUT = "PROBE_SHUTDOWN_TIMEOUT"
     ENV_API_KEY = "PROBE_API_KEY"
+    ENV_PAYLOAD_MODE = "PROBE_PAYLOAD_MODE"
     ENV_REPLAY_CAPTURE_MAX_BYTES = "PROBE_REPLAY_CAPTURE_MAX_BYTES"
+    ENV_SEND_QUEUE_MAX = "PROBE_SEND_QUEUE_MAX"
+    ENV_BREAKER_FAILURE_THRESHOLD = "PROBE_BREAKER_FAILURE_THRESHOLD"
+    ENV_BREAKER_RESET_SECONDS = "PROBE_BREAKER_RESET_SECONDS"
+
+    PAYLOAD_MODES = ("metadata", "redacted", "full")
 
     @classmethod
     def enabled(cls) -> bool:
@@ -64,6 +71,12 @@ class ProbeConfig:
         return os.getenv(cls.ENV_API_KEY) or None
 
     @classmethod
+    def payload_mode(cls) -> str:
+        """Telemetry payload mode; unknown values use mandatory redaction."""
+        mode = os.getenv(cls.ENV_PAYLOAD_MODE, "redacted").strip().lower()
+        return mode if mode in cls.PAYLOAD_MODES else "redacted"
+
+    @classmethod
     def replay_capture_max_bytes(cls) -> int:
         """Max serialized byte size of a structured input capture (Issue #243).
 
@@ -75,3 +88,30 @@ class ProbeConfig:
             return int(os.getenv(cls.ENV_REPLAY_CAPTURE_MAX_BYTES, "65536"))
         except ValueError:
             return 65536
+
+    @classmethod
+    def send_queue_max(cls) -> int:
+        try:
+            return max(1, int(os.getenv(cls.ENV_SEND_QUEUE_MAX, "1000")))
+        except ValueError:
+            return 1000
+
+    @classmethod
+    def breaker_failure_threshold(cls) -> int:
+        try:
+            return max(
+                1,
+                int(os.getenv(cls.ENV_BREAKER_FAILURE_THRESHOLD, "5")),
+            )
+        except ValueError:
+            return 5
+
+    @classmethod
+    def breaker_reset_seconds(cls) -> float:
+        try:
+            value = float(os.getenv(cls.ENV_BREAKER_RESET_SECONDS, "30"))
+            if not math.isfinite(value):
+                return 30.0
+            return max(0.1, value)
+        except ValueError:
+            return 30.0

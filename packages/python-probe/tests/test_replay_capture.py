@@ -258,3 +258,35 @@ def test_redaction_inside_nested_structures():
     assert RC.REASON_REDACTED in reasons
     assert "tok-123" not in json.dumps(cap, ensure_ascii=False)
     assert cap["args"][0][0]["id"] == 7
+
+
+def test_mandatory_denylist_applies_without_explicit_redact_paths():
+    cap, replayability, reasons = _capture(
+        args=({"Password": "p1", "password_hint": "visible"},),
+        kwargs={"session": "s1"},
+    )
+    assert replayability == PARTIAL
+    assert reasons == [RC.REASON_REDACTED]
+    assert cap["args"][0]["Password"] == P._REDACTED
+    assert cap["args"][0]["password_hint"] == "visible"
+    assert cap["kwargs"]["session"] == P._REDACTED
+    serialized = json.dumps(cap, ensure_ascii=False)
+    assert "p1" not in serialized
+    assert "s1" not in serialized
+
+
+def test_literal_redaction_marker_round_trips_without_collision():
+    literal = P._REDACTED
+    cap, replayability, reasons = _capture(
+        kwargs={"value": literal, "secret": "hidden"},
+    )
+    assert replayability == PARTIAL
+    assert reasons == [RC.REASON_REDACTED]
+    assert cap["kwargs"]["value"] == {
+        RC.MARKER: "literal",
+        "value": literal,
+    }
+    assert cap["kwargs"]["secret"] == literal
+    decoded = RC.decode_value(cap)
+    assert decoded["kwargs"]["value"] == literal
+    assert decoded["kwargs"]["secret"] is not decoded["kwargs"]["value"]

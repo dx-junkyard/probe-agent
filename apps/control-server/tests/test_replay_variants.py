@@ -303,7 +303,7 @@ def _login(client):
         "/auth/login", json={"username": "root", "password": "s3cret"}
     )
     assert response.status_code == 200, response.text
-    return response.json()["access_token"]
+    return response.cookies.get("probe_session")
 
 
 def _headers(token, system_id=None):

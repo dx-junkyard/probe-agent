@@ -82,10 +82,16 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 import tempfile
 from typing import Any, Dict, List, Optional, Tuple
+
+from .execution_backend import (
+    ExecutionBackend,
+    ExecutionRequest,
+    WorkerExecutionBackend,
+    get_execution_backend,
+)
 
 REPLAY_HARNESS_VERSION = "2"
 
@@ -423,6 +429,7 @@ def run_inline_candidate(
     args: List[Any],
     kwargs: Dict[str, Any],
     timeout_seconds: int = CANDIDATE_TIMEOUT_SECONDS,
+    backend: Optional[ExecutionBackend] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     """Execute LLM-authored candidate code through the shared harness.
 
@@ -434,21 +441,45 @@ def run_inline_candidate(
 
     Returns ``(candidate_output_repr, execution_error)``.
     """
-    with tempfile.TemporaryDirectory(prefix="probe-generation-") as workdir:
+    selected_backend = backend or get_execution_backend()
+    temp_root = (
+        selected_backend.workspace_root
+        if isinstance(selected_backend, WorkerExecutionBackend)
+        else None
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="probe-generation-", dir=temp_root
+    ) as workdir:
         harness_path, payload_path, result_path = write_harness_files(
             workdir,
             {"kind": "inline_code", "code": code},
             [{"input_kind": "values", "args": args, "kwargs": kwargs}],
         )
-        try:
-            proc = subprocess.run(
-                [sys.executable, "-I", "-S", harness_path, payload_path, result_path],
-                capture_output=True,
+        proc = selected_backend.execute(
+            ExecutionRequest(
+                command=[
+                    sys.executable,
+                    "-I",
+                    "-S",
+                    harness_path,
+                    payload_path,
+                    result_path,
+                ],
+                # Preserve the legacy direct subprocess working directory;
+                # all three harness paths are absolute.
+                worktree_path=None,
+                env=None,
+                timeout_seconds=timeout_seconds,
+                shell=False,
                 text=True,
-                timeout=timeout_seconds,
+                network_off=False,
+                workspace_path=workdir,
             )
-        except subprocess.TimeoutExpired:
+        )
+        if proc.timed_out:
             return None, "candidate execution timed out"
+        if proc.error is not None:
+            return None, proc.error[:4000]
         if proc.returncode != 0:
             return None, (proc.stderr or proc.stdout or "candidate runner failed")[:4000]
         try:

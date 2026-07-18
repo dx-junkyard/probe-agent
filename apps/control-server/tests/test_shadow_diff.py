@@ -149,9 +149,10 @@ def admin_client(tmp_path, monkeypatch):
 
 
 def test_analyzer_run_can_be_pinned_to_workspace(admin_client):
-    token = admin_client.post(
+    login = admin_client.post(
         "/auth/login", json={"username": "root", "password": "s3cret"}
-    ).json()["access_token"]
+    )
+    token = login.cookies.get("probe_session")
     sid = admin_client.post(
         "/systems", json={"name": "A"}, headers={"Authorization": f"Bearer {token}"}
     ).json()["id"]

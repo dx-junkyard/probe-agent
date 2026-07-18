@@ -30,8 +30,6 @@ vi.mock("@/api/client", () => ({
   api: mockApi,
   getSystemId: () => mockSystemId,
   setSystemId: (id: number | null) => { mockSystemId = id; },
-  getSessionToken: () => "fake-token",
-  setSessionToken: vi.fn(),
   ApiError,
 }));
 
@@ -822,6 +820,7 @@ describe("Repository Refresh Hub", () => {
       latest_indexed_snapshot: null,
       understanding_snapshot_id: null, understanding_status: null,
       snapshot_stale: true, symbols_stale: false,
+      head_relation: "behind", commits_behind: 3,
       next_actions: ["Repository HEAD changed; create a new snapshot before generating new analysis or patches."],
     }));
 
@@ -830,6 +829,7 @@ describe("Repository Refresh Hub", () => {
 
     const hub = await screen.findByTestId("refresh-hub");
     expect(within(hub).getByTestId("snapshot-stale-badge")).toBeInTheDocument();
+    expect(within(hub).getByTestId("repository-lag")).toHaveTextContent("3 commits behind");
     // The next-steps list echoes the server's actionable guidance verbatim.
     expect(
       within(hub).getByText(/create a new snapshot before generating new analysis or patches/i),
@@ -844,6 +844,7 @@ describe("Repository Refresh Hub", () => {
       latest_snapshot: { id: 12, commit_sha: "abc1234000", status: "ready", created_at: 1 },
       latest_indexed_snapshot: { id: 12, commit_sha: "abc1234000", status: "ready", created_at: 1 },
       understanding_snapshot_id: 12, understanding_status: "completed",
+      head_relation: "same", commits_behind: 0,
       snapshot_stale: false, symbols_stale: false, next_actions: [],
     }));
 
@@ -852,6 +853,62 @@ describe("Repository Refresh Hub", () => {
 
     const hub = await screen.findByTestId("refresh-hub");
     expect(within(hub).getByText("Up to date")).toBeInTheDocument();
+    expect(within(hub).getByTestId("repository-lag")).toHaveTextContent("Latest");
+  });
+
+  test("starts the explicit snapshot and symbol resync from one button", async () => {
+    mockApi.get.mockImplementation(baseGet({
+      configured: true, repo_path: "/repos/alpha",
+      current_head: "abc1234000", head_error: null,
+      working_tree_dirty: false, dirty_file_count: 0, dirty_sample: [],
+      latest_snapshot: { id: 12, commit_sha: "abc1234000", status: "ready", created_at: 1 },
+      latest_indexed_snapshot: null,
+      understanding_snapshot_id: null, understanding_status: null,
+      head_relation: "same", commits_behind: 0,
+      snapshot_stale: false, symbols_stale: true, next_actions: [],
+    }));
+    mockApi.post.mockResolvedValue({
+      id: 7, system_id: 1, snapshot_id: null, status: "queued", error: null,
+      stale_capability_count: 0, created_at: 1, started_at: null, completed_at: null,
+    });
+
+    const { default: RepositoryPage } = await import("@/pages/repository");
+    render(<RepositoryPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByTestId("repository-resync-button"));
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/repository/resync");
+    });
+  });
+
+  test("guides capability review and understanding build after resync", async () => {
+    const getBase = baseGet({
+      configured: true, repo_path: "/repos/alpha",
+      current_head: "def5678000", head_error: null,
+      working_tree_dirty: false, dirty_file_count: 0, dirty_sample: [],
+      latest_snapshot: { id: 13, commit_sha: "def5678000", status: "ready", created_at: 2 },
+      latest_indexed_snapshot: { id: 13, commit_sha: "def5678000", status: "ready", created_at: 2 },
+      understanding_snapshot_id: 12, understanding_status: "completed",
+      head_relation: "same", commits_behind: 0,
+      snapshot_stale: false, symbols_stale: false, next_actions: [],
+    });
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/resync/latest") return Promise.resolve({
+        id: 7, system_id: 1, snapshot_id: 13, status: "completed", error: null,
+        stale_capability_count: 2, created_at: 1, started_at: 1, completed_at: 2,
+      });
+      return getBase(path);
+    });
+
+    const { default: RepositoryPage } = await import("@/pages/repository");
+    render(<RepositoryPage />, { wrapper: createWrapper() });
+
+    const guidance = await screen.findByTestId("stale-capability-guidance");
+    expect(guidance).toHaveTextContent("2 capabilities still use an older snapshot");
+    expect(within(guidance).getByText("Review Capability Map").closest("a"))
+      .toHaveAttribute("href", "/capability-map");
+    expect(within(guidance).getByText("Build System Understanding").closest("a"))
+      .toHaveAttribute("href", "/system-understanding?fix=build");
   });
 });
 
@@ -3273,6 +3330,7 @@ describe("Context Header", () => {
           dirty_sample: [], latest_snapshot: { id: 5, commit_sha: "abc1234567", status: "ready" },
           latest_indexed_snapshot: null,
           understanding_snapshot_id: null, understanding_status: null,
+          head_relation: "behind", commits_behind: 2,
           snapshot_stale: false, symbols_stale: false, next_actions: [],
         });
       }
@@ -3301,6 +3359,7 @@ describe("Context Header", () => {
     expect(screen.getByTestId("context-header-snapshot")).not.toHaveTextContent("def56780");
     expect(screen.getByTestId("context-header-capability")).toHaveTextContent("doc-analysis");
     expect(screen.getByTestId("context-header-entrypoint")).toHaveTextContent("http_route: GET:/flow");
+    expect(screen.getByTestId("context-header-freshness")).toHaveTextContent("2 commits behind");
     expect(screen.getByTestId("context-header-status")).toHaveTextContent(
       "symbols indexed, entrypoints discovered, 3 gaps",
     );
@@ -3790,6 +3849,59 @@ describe("System Understanding page", () => {
 
     const cards = screen.getAllByTestId("gap-card");
     expect(cards.length).toBe(2);
+  });
+
+  test("gap worklist defaults to untriaged, exposes all filter, and records manual triage", async () => {
+    const triageResponse = {
+      ...gapWorklistResponse,
+      gaps: gapWorklistResponse.gaps.map((gap, index) => ({
+        ...gap,
+        gap_key: index === 0
+          ? "unclassified_entrypoint|entrypoint|http_route:GET /items"
+          : "docs_only|document|docs/design.md::Auth [node:abc]",
+        content_fingerprint: index === 0 ? "a".repeat(64) : "b".repeat(64),
+        triage_status: index === 0 ? "open" : "dismissed",
+        triage_decision: index === 0 ? null : {
+          id: 2, system_id: 1, snapshot_id: 5,
+          gap_key: "docs_only|document|docs/design.md::Auth [node:abc]",
+          content_fingerprint: "b".repeat(64), status: "dismissed",
+          decided_by_user_id: 1, decision_method: "manual", created_at: 1,
+        },
+      })),
+      gap_summary: [{ gap_type: "unclassified_entrypoint", count: 1 }],
+    };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(triageResponse)
+        : Promise.resolve(null),
+    );
+    mockApi.post.mockResolvedValue({
+      id: 3, system_id: 1, snapshot_id: 5,
+      gap_key: triageResponse.gaps[0].gap_key,
+      content_fingerprint: "a".repeat(64), status: "acknowledged",
+      decided_by_user_id: 1, decision_method: "manual", created_at: 2,
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    expect(await screen.findByTestId("gap-filter-open")).toHaveTextContent("Untriaged (1)");
+    expect(screen.getAllByTestId("gap-card")).toHaveLength(1);
+    expect(screen.getByTestId("gap-triage-status")).toHaveTextContent("open");
+
+    fireEvent.click(screen.getByTestId("gap-filter-all"));
+    expect(screen.getAllByTestId("gap-card")).toHaveLength(2);
+    expect(screen.getAllByTestId("gap-triage-status")[1]).toHaveTextContent("dismissed");
+
+    fireEvent.click(screen.getByTestId("gap-triage-acknowledge"));
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/repository/system-understanding/gap-triage",
+      {
+        gap_key: triageResponse.gaps[0].gap_key,
+        content_fingerprint: "a".repeat(64),
+        status: "acknowledged",
+      },
+    ));
   });
 
   test("renders gap next action buttons", async () => {
@@ -6437,6 +6549,7 @@ describe("System Purpose side-by-side views (Issue #94/#275)", () => {
     return {
       system_id: 1,
       snapshot_id: 5,
+      understanding_build_id: 9,
       commit_sha: "abc12345def",
       pipeline: completePipeline,
       purpose: null,
@@ -6556,7 +6669,7 @@ describe("System Purpose side-by-side views (Issue #94/#275)", () => {
 
     await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
       "/repository/system-understanding/purpose-confirmation",
-      { snapshot_id: 5 },
+      { snapshot_id: 5, understanding_build_id: 9 },
     ));
 
     const { toast } = await import("sonner");
@@ -6581,6 +6694,25 @@ describe("System Purpose side-by-side views (Issue #94/#275)", () => {
     const confirmed = await screen.findByTestId("purpose-confirmed");
     expect(confirmed.textContent).toContain("確認済み");
     expect(screen.queryByTestId("purpose-confirm-button")).not.toBeInTheDocument();
+  });
+
+  test("confirmation stays disabled until a completed understanding build is present", async () => {
+    mockApis(purposeResponse({
+      understanding_build_id: null,
+      purpose_views: [
+        { source: "system_profile", provenance_kind: "manual", name: "Manual purpose" },
+        { source: "capability_hierarchy", provenance_kind: "reasoning_llm", name: "AI purpose" },
+      ],
+    }));
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    expect(await screen.findByTestId("purpose-confirm-button")).toBeDisabled();
+    expect(screen.getByTestId("purpose-confirm-build-required")).toHaveTextContent(
+      "System Understanding の Build 完了後に確認できます。",
+    );
+    expect(mockApi.post).not.toHaveBeenCalled();
   });
 
   test("stale confirmation shows the reason note and the confirm button again", async () => {

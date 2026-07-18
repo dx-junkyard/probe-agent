@@ -1,8 +1,10 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   useRepositoryCandidates, useRepositoryConfig, useUpdateRepositoryConfig,
   useSnapshots, useLatestSnapshot, useCreateSnapshot, useSymbols, useIndexSymbols,
   useApiScanResult, useRunApiScan, useRepositoryStatus, useSystemState,
+  useLatestRepositoryResync, useStartRepositoryResync, sysKey,
 } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
 import {
@@ -19,7 +21,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { toast } from "sonner";
 import { formatTimestamp, formatBytes } from "@/lib/utils";
 import { GitCommit, FolderTree, Code2, RefreshCw, AlertTriangle, ScanSearch, Sparkles, GitBranch, CheckCircle2 } from "lucide-react";
-import type { RepositoryCandidateOut, RepositoryConfigOut } from "@/api/types";
+import type { RepositoryCandidateOut, RepositoryConfigOut, RepositoryStatus } from "@/api/types";
 import { SystemStateBanner } from "@/components/system-state";
 import { useRepositoryConfiguredGate } from "@/components/repository-gate";
 import { Link } from "react-router-dom";
@@ -348,6 +350,15 @@ function shortSha(sha: string | null | undefined): string {
   return sha ? sha.slice(0, 8) : "—";
 }
 
+function repositoryLagLabel(status: RepositoryStatus): string {
+  if (status.head_relation === "same") return "Latest";
+  if (status.head_relation === "behind" && status.commits_behind != null) {
+    return `${status.commits_behind} commit${status.commits_behind === 1 ? "" : "s"} behind`;
+  }
+  if (status.head_relation === "diverged") return "History diverged";
+  return "Lag unknown";
+}
+
 function RepositoryRefreshHub({
   onCreateSnapshot, creatingSnapshot, onIndexSymbols, indexingSymbols,
 }: {
@@ -357,6 +368,26 @@ function RepositoryRefreshHub({
   indexingSymbols: boolean;
 }) {
   const { data: status, isLoading, refetch, isFetching } = useRepositoryStatus();
+  const { data: resyncJob } = useLatestRepositoryResync();
+  const startResync = useStartRepositoryResync();
+  const queryClient = useQueryClient();
+  const refreshedTerminalJob = useRef<number | null>(null);
+
+  const resyncActive = resyncJob?.status === "queued"
+    || resyncJob?.status === "snapshotting"
+    || resyncJob?.status === "indexing";
+  const resyncTerminal = resyncJob?.status === "completed"
+    || resyncJob?.status === "snapshot_failed"
+    || resyncJob?.status === "index_failed";
+
+  useEffect(() => {
+    if (!resyncJob || !resyncTerminal || refreshedTerminalJob.current === resyncJob.id) return;
+    refreshedTerminalJob.current = resyncJob.id;
+    void refetch();
+    for (const key of ["snapshots", "latestSnapshot", "symbols", "system-state", "capabilityHierarchy"]) {
+      void queryClient.invalidateQueries({ queryKey: sysKey(key) });
+    }
+  }, [queryClient, refetch, resyncJob, resyncTerminal]);
 
   if (isLoading) {
     return <Card><CardContent className="py-6"><Skeleton className="h-24 w-full" /></CardContent></Card>;
@@ -397,7 +428,7 @@ function RepositoryRefreshHub({
         </Button>
       </CardHeader>
       <CardContent className="space-y-4">
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 text-sm">
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5 text-sm">
           <div className="space-y-0.5">
             <div className="text-xs text-muted-foreground">Current HEAD</div>
             <div className="font-mono">{shortSha(status.current_head)}</div>
@@ -422,6 +453,12 @@ function RepositoryRefreshHub({
               {status.understanding_snapshot_id
                 ? `#${status.understanding_snapshot_id} (${status.understanding_status ?? "?"})`
                 : "none"}
+            </div>
+          </div>
+          <div className="space-y-0.5">
+            <div className="text-xs text-muted-foreground">Snapshot vs HEAD</div>
+            <div className="font-medium" data-testid="repository-lag">
+              {repositoryLagLabel(status)}
             </div>
           </div>
         </div>
@@ -476,8 +513,57 @@ function RepositoryRefreshHub({
           </div>
         )}
 
+        {resyncJob && (
+          <div className="rounded-md border bg-muted/30 px-3 py-2 text-xs space-y-1" data-testid="resync-job-status">
+            {resyncActive && (
+              <div className="flex items-center gap-2">
+                <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                <span>
+                  {resyncJob.status === "indexing"
+                    ? `Indexing symbols for snapshot #${resyncJob.snapshot_id ?? "…"}`
+                    : "Creating a committed repository snapshot"}
+                </span>
+              </div>
+            )}
+            {resyncJob.status === "completed" && (
+              <div className="space-y-1">
+                <div className="text-emerald-700 dark:text-emerald-300">
+                  Snapshot #{resyncJob.snapshot_id} and its symbol index are ready.
+                </div>
+                {resyncJob.stale_capability_count > 0 && (
+                  <div data-testid="stale-capability-guidance">
+                    <span>{resyncJob.stale_capability_count} capabilit{resyncJob.stale_capability_count === 1 ? "y" : "ies"} still use an older snapshot. </span>
+                    <Link className="text-primary hover:underline" to="/capability-map">Review Capability Map</Link>
+                    <span> · </span>
+                    <Link className="text-primary hover:underline" to="/system-understanding?fix=build">Build System Understanding</Link>
+                  </div>
+                )}
+              </div>
+            )}
+            {resyncJob.status === "snapshot_failed" && (
+              <div className="text-destructive">Snapshot failed: {resyncJob.error ?? "unknown error"}</div>
+            )}
+            {resyncJob.status === "index_failed" && (
+              <div className="text-destructive">
+                Symbol index failed for retained snapshot #{resyncJob.snapshot_id}: {resyncJob.error ?? "unknown error"}
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Guided actions: the whole refresh flow in one place instead of scattered buttons. */}
         <div className="flex flex-wrap gap-2">
+          <Button
+            size="sm"
+            data-testid="repository-resync-button"
+            onClick={() => startResync.mutateAsync()
+              .then(() => toast.success("Repository refresh started"))
+              .catch((e) => toast.error(String(e)))}
+            disabled={startResync.isPending || resyncActive}
+          >
+            <RefreshCw className={`h-4 w-4 mr-1 ${startResync.isPending || resyncActive ? "animate-spin" : ""}`} />
+            {resyncActive ? "Refreshing snapshot + symbols" : "Refresh snapshot + symbols"}
+          </Button>
           <Button size="sm" onClick={onCreateSnapshot} disabled={creatingSnapshot}>
             <RefreshCw className={`h-4 w-4 mr-1 ${creatingSnapshot ? "animate-spin" : ""}`} />
             {status.snapshot_stale ? "Create new snapshot" : "Re-snapshot"}

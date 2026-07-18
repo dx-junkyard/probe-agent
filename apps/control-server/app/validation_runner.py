@@ -7,16 +7,22 @@ Network is disabled by default; environment variables are allowlisted.
 from __future__ import annotations
 
 import os
-import platform
 import re
+# Compatibility: tests and integrations historically patched
+# ``validation_runner.shutil.which``.  ``shutil`` is the same module object
+# used by execution_backend, so keep this alias during the backend migration.
 import shutil
-import subprocess
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import yaml
 
+from .execution_backend import (
+    ExecutionBackend,
+    ExecutionRequest,
+    get_execution_backend,
+)
 from .git_ops import GitError
 
 MAX_OUTPUT_BYTES = 64 * 1024  # 64 KiB stdout/stderr truncation
@@ -187,9 +193,8 @@ def _run_command(
     env: Dict[str, str],
     timeout: int,
     network: bool = False,
+    backend: Optional[ExecutionBackend] = None,
 ) -> CommandResult:
-    start = time.monotonic()
-    timed_out = False
     if network:
         return CommandResult(
             command=command,
@@ -198,110 +203,70 @@ def _run_command(
             stdout="",
             stderr="Network-enabled execution is prohibited",
         )
-    try:
-        argv: Any = command
-        use_shell = True
-        if not network:
-            if os.getenv("PROBE_UNSAFE_ALLOW_HOST_EXECUTION", "").lower() in (
-                "1",
-                "true",
-                "yes",
-            ):
-                pass
-            elif platform.system() == "Darwin" and shutil.which("sandbox-exec"):
-                escaped = worktree_path.replace('"', '\\"')
-                argv = [
-                    "sandbox-exec",
-                    "-p",
-                    (
-                        "(version 1) (deny default) "
-                        "(allow process*) (allow file-read*) "
-                        f'(allow file-write* (subpath "{escaped}") (subpath "/tmp")) '
-                        "(deny network*)"
-                    ),
-                    "/bin/sh",
-                    "-c",
-                    command,
-                ]
-                use_shell = False
-            elif shutil.which("bwrap"):
-                argv = [
-                    "bwrap",
-                    "--die-with-parent",
-                    "--new-session",
-                    "--unshare-net",
-                    "--ro-bind",
-                    "/",
-                    "/",
-                    "--tmpfs",
-                    "/tmp",
-                    "--tmpfs",
-                    "/data",
-                    "--tmpfs",
-                    "/root",
-                    "--tmpfs",
-                    "/repositories",
-                    "--bind",
-                    worktree_path,
-                    "/workspace",
-                    "--chdir",
-                    "/workspace",
-                    "/bin/sh",
-                    "-c",
-                    command,
-                ]
-                use_shell = False
-            else:
-                return CommandResult(
-                    command=command,
-                    exit_code=-1,
-                    duration_ms=0.0,
-                    stdout="",
-                    stderr=(
-                        "Network isolation was requested but no supported "
-                        "sandbox backend is available"
-                    ),
-                )
-        result = subprocess.run(
-            argv,
-            shell=use_shell,
-            cwd=worktree_path,
-            env=env,
-            capture_output=True,
-            timeout=timeout,
-        )
-        duration_ms = (time.monotonic() - start) * 1000
-
-        stdout_raw = result.stdout.decode("utf-8", errors="replace")
-        stderr_raw = result.stderr.decode("utf-8", errors="replace")
-        stdout, stdout_truncated = _truncate(stdout_raw)
-        stderr, stderr_truncated = _truncate(stderr_raw)
-
-        return CommandResult(
+    raw = (backend or get_execution_backend()).execute(
+        ExecutionRequest(
             command=command,
-            exit_code=result.returncode,
-            duration_ms=duration_ms,
-            stdout=stdout,
-            stderr=stderr,
-            stdout_truncated=stdout_truncated,
-            stderr_truncated=stderr_truncated,
+            worktree_path=worktree_path,
+            env=env,
+            timeout_seconds=timeout,
+            shell=True,
+            text=False,
+            network_off=True,
+            workspace_path=worktree_path,
         )
-    except subprocess.TimeoutExpired:
-        duration_ms = (time.monotonic() - start) * 1000
+    )
+    if raw.timed_out:
         return CommandResult(
             command=command,
             exit_code=-1,
-            duration_ms=duration_ms,
+            duration_ms=raw.duration_ms,
             stdout="",
             stderr=f"Command timed out after {timeout}s",
             timed_out=True,
         )
-    except Exception as exc:
-        duration_ms = (time.monotonic() - start) * 1000
+    if raw.error is not None:
         return CommandResult(
             command=command,
             exit_code=-1,
-            duration_ms=duration_ms,
+            duration_ms=raw.duration_ms,
+            stdout="",
+            stderr=raw.error,
+        )
+
+    try:
+        stdout_raw = (
+            raw.stdout
+            if isinstance(raw.stdout, str)
+            else raw.stdout.decode("utf-8", errors="replace")
+        )
+        stderr_raw = (
+            raw.stderr
+            if isinstance(raw.stderr, str)
+            else raw.stderr.decode("utf-8", errors="replace")
+        )
+        stdout, stdout_truncated = _truncate(stdout_raw)
+        stderr, stderr_truncated = _truncate(stderr_raw)
+        # A remote worker caps output before serializing it.  Restore the
+        # marker the in-process adapter would have added after the next byte.
+        if raw.stdout_truncated and not stdout_truncated:
+            stdout += "\n... [truncated]"
+        if raw.stderr_truncated and not stderr_truncated:
+            stderr += "\n... [truncated]"
+
+        return CommandResult(
+            command=command,
+            exit_code=raw.returncode,
+            duration_ms=raw.duration_ms,
+            stdout=stdout,
+            stderr=stderr,
+            stdout_truncated=stdout_truncated or raw.stdout_truncated,
+            stderr_truncated=stderr_truncated or raw.stderr_truncated,
+        )
+    except Exception as exc:
+        return CommandResult(
+            command=command,
+            exit_code=-1,
+            duration_ms=raw.duration_ms,
             stdout="",
             stderr=str(exc),
         )
@@ -311,6 +276,7 @@ def run_validation(
     variant: str,
     worktree_path: str,
     config: ValidationConfig,
+    backend: Optional[ExecutionBackend] = None,
 ) -> ValidationResult:
     if not os.path.isdir(worktree_path):
         return ValidationResult(
@@ -341,7 +307,12 @@ def run_validation(
     isolation_failed = False
     for command, phase in all_commands:
         cmd_result = _run_command(
-            command, worktree_path, env, config.timeout_seconds, config.network,
+            command,
+            worktree_path,
+            env,
+            config.timeout_seconds,
+            config.network,
+            backend=backend,
         )
         results.append(cmd_result)
         if not config.network and (

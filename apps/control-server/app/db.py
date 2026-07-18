@@ -104,6 +104,42 @@ CREATE TABLE IF NOT EXISTS traces (
 CREATE INDEX IF NOT EXISTS idx_traces_component_ts
     ON traces (system_id, component_id, timestamp DESC);
 
+-- Issue #273: durable, System-isolated resource counters and observations.
+CREATE TABLE IF NOT EXISTS llm_daily_usage (
+    system_id       INTEGER NOT NULL,
+    usage_date      TEXT NOT NULL,
+    execution_count INTEGER NOT NULL DEFAULT 0,
+    updated_at      REAL NOT NULL,
+    PRIMARY KEY (system_id, usage_date),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS trace_quota_status (
+    system_id       INTEGER PRIMARY KEY,
+    trace_rows      INTEGER NOT NULL DEFAULT 0,
+    trace_bytes     INTEGER NOT NULL DEFAULT 0,
+    rejected_reason TEXT,
+    rejected_at     REAL,
+    updated_at      REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS sdk_transport_observations (
+    system_id      INTEGER NOT NULL,
+    trace_id       TEXT NOT NULL,
+    dropped_count  INTEGER NOT NULL DEFAULT 0,
+    failure_count  INTEGER NOT NULL DEFAULT 0,
+    state          TEXT NOT NULL CHECK (state IN ('closed', 'open', 'half_open')),
+    observed_at    REAL NOT NULL,
+    PRIMARY KEY (system_id, trace_id),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id, trace_id)
+        REFERENCES traces (system_id, trace_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_sdk_transport_observations_system
+    ON sdk_transport_observations (system_id, observed_at DESC);
+
 CREATE TABLE IF NOT EXISTS shadow_results (
     id                     INTEGER PRIMARY KEY AUTOINCREMENT,
     system_id              INTEGER NOT NULL,
@@ -385,6 +421,31 @@ CREATE TABLE IF NOT EXISTS repository_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_snapshots_system
     ON repository_snapshots (system_id, id DESC);
+
+-- Explicit repository refresh jobs (Issue #277). The target repository is
+-- read-only; jobs persist orchestration state and generated DB artifacts only.
+CREATE TABLE IF NOT EXISTS repository_resync_jobs (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                INTEGER NOT NULL,
+    snapshot_id              INTEGER,
+    status                   TEXT NOT NULL DEFAULT 'queued'
+        CHECK (status IN ('queued', 'snapshotting', 'indexing', 'completed',
+                          'snapshot_failed', 'index_failed')),
+    error                    TEXT,
+    stale_capability_count   INTEGER NOT NULL DEFAULT 0,
+    created_at               REAL NOT NULL,
+    started_at               REAL,
+    completed_at             REAL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_repository_resync_jobs_system
+    ON repository_resync_jobs (system_id, id DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_repository_resync_jobs_active_system
+    ON repository_resync_jobs (system_id)
+    WHERE status IN ('queued', 'snapshotting', 'indexing');
 
 CREATE TABLE IF NOT EXISTS snapshot_files (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1539,8 +1600,9 @@ CREATE INDEX IF NOT EXISTS idx_issue_drafts_source
 -- (never failed/cancelled). Read alongside the existing per-request gap
 -- computation (`_collect_gaps` / `_compute_gap_summary`) to show a
 -- before/after trend across builds without re-deriving history. A build with
--- zero gaps of a given type simply has no row for that gap_type; "no row"
--- and "count 0" are equivalent when reading a build's history back.
+-- zero gaps of a given type has no row for that type. When a build has no
+-- open gaps at all, one reserved ``__no_open_gaps__`` marker row preserves
+-- the build boundary; loaders exclude that marker from user-visible types.
 CREATE TABLE IF NOT EXISTS system_understanding_gap_history (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     system_id   INTEGER NOT NULL,
@@ -1555,6 +1617,37 @@ CREATE TABLE IF NOT EXISTS system_understanding_gap_history (
 
 CREATE INDEX IF NOT EXISTS idx_su_gap_history_system
     ON system_understanding_gap_history (system_id, build_id DESC);
+
+-- Human triage lifecycle for docs-code gaps (Issue #276). Rows are
+-- append-only audit decisions. ``gap_key`` is the snapshot-stable,
+-- human-readable locator; ``content_fingerprint`` is stored separately so a
+-- dismissed gap can deterministically reopen when its semantic content
+-- changes. Automatic reopen rows use decision_method=deterministic; every
+-- human transition records the user and decision_method=manual.
+CREATE TABLE IF NOT EXISTS gap_triage_decisions (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    snapshot_id         INTEGER,
+    gap_key             TEXT NOT NULL,
+    content_fingerprint TEXT NOT NULL,
+    status              TEXT NOT NULL
+        CHECK (status IN ('open', 'acknowledged', 'dismissed', 'resolved')),
+    decided_by_user_id  INTEGER,
+    decision_method     TEXT NOT NULL
+        CHECK (decision_method IN ('manual', 'deterministic')),
+    note                TEXT,
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL,
+    FOREIGN KEY (decided_by_user_id) REFERENCES users (id) ON DELETE SET NULL,
+    CHECK (
+        (decision_method = 'manual' AND decided_by_user_id IS NOT NULL)
+        OR decision_method = 'deterministic'
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_gap_triage_system_key
+    ON gap_triage_decisions (system_id, gap_key, id DESC);
 
 -- Probe Patterns (Issue #168). A pattern is a reusable observation unit that
 -- survives pre-release probe removal: what feature it observes, which probe
@@ -2310,6 +2403,8 @@ CREATE TABLE IF NOT EXISTS system_purpose_confirmations (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     system_id           INTEGER NOT NULL,
     snapshot_id         INTEGER NOT NULL,
+    understanding_build_id INTEGER,
+    decided_by_user_id  INTEGER,
     manual_purpose      TEXT NOT NULL,
     manual_profile_name TEXT,
     ai_purpose_name     TEXT,
@@ -2319,7 +2414,9 @@ CREATE TABLE IF NOT EXISTS system_purpose_confirmations (
     note                TEXT,
     decision_method     TEXT NOT NULL DEFAULT 'manual',
     created_at          REAL NOT NULL,
-    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (understanding_build_id) REFERENCES system_understanding_builds (id) ON DELETE SET NULL,
+    FOREIGN KEY (decided_by_user_id) REFERENCES users (id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_system_purpose_confirmations_system
@@ -2843,11 +2940,41 @@ def init_db() -> None:
             conn.execute("ALTER TABLE traces ADD COLUMN replayability TEXT")
         if "replay_reasons_json" not in trace_cols:
             conn.execute("ALTER TABLE traces ADD COLUMN replay_reasons_json TEXT")
+        purpose_confirmation_cols = _columns(conn, "system_purpose_confirmations")
+        if (
+            purpose_confirmation_cols
+            and "understanding_build_id" not in purpose_confirmation_cols
+        ):
+            # Issue #275: legacy confirmation rows remain NULL and are treated
+            # as stale until a human confirms the current completed build.
+            conn.execute(
+                "ALTER TABLE system_purpose_confirmations "
+                "ADD COLUMN understanding_build_id INTEGER "
+                "REFERENCES system_understanding_builds(id) ON DELETE SET NULL"
+            )
+        if purpose_confirmation_cols and "decided_by_user_id" not in purpose_confirmation_cols:
+            # Existing manual decisions predate actor attribution and stay
+            # NULL; all new API-created confirmations require a real user.
+            conn.execute(
+                "ALTER TABLE system_purpose_confirmations "
+                "ADD COLUMN decided_by_user_id INTEGER "
+                "REFERENCES users(id) ON DELETE SET NULL"
+            )
         _ensure_legacy_system(conn)
     _validate_startup_environment()
     _validate_publish_startup_config()
     _bootstrap_admin()
     _enforce_auth_requirement()
+    # Issue #270: production must never silently fall back to host execution.
+    # Run after auth checks so an auth misconfiguration remains the first,
+    # most actionable startup error when both settings are invalid.
+    from .execution_backend import validate_execution_backend_startup
+
+    validate_execution_backend_startup()
+    from .environment import is_production
+    from .resource_limits import validate_resource_limit_config
+
+    validate_resource_limit_config(production=is_production())
 
 
 def _validate_startup_environment() -> None:

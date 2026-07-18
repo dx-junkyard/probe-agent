@@ -1,6 +1,6 @@
 import { createContext, useContext, useState, useCallback, useEffect, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { setSessionToken, getSessionToken, setSystemId, getSystemId, api } from "./client";
+import { setSystemId, getSystemId, api } from "./client";
 import type { MeResponse, UserOut, SystemOut } from "./types";
 
 interface AuthState {
@@ -30,7 +30,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setUser(me.user);
     } catch {
       setUser(null);
-      setSessionToken(null);
     }
   }, []);
 
@@ -47,24 +46,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     (async () => {
-      if (getSessionToken()) {
-        await fetchMe();
+      await fetchMe();
+      try {
         await refreshSystems();
-      }
+      } catch { /* unauthenticated */ }
       setLoading(false);
     })();
   }, [fetchMe, refreshSystems]);
 
   const login = useCallback(async (username: string, password: string) => {
-    const res = await api.post<{ access_token: string }>("/auth/login", { username, password });
-    setSessionToken(res.access_token);
+    await api.post<{ expires_at: number }>("/auth/login", { username, password });
     await fetchMe();
     await refreshSystems();
   }, [fetchMe, refreshSystems]);
 
   const logout = useCallback(async () => {
     try { await api.post("/auth/logout"); } catch { /* ignore */ }
-    setSessionToken(null);
     setSystemId(null);
     setUser(null);
     setSystems([]);

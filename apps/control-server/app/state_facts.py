@@ -77,8 +77,10 @@ __all__ = [
     "has_completed_replay_variant_run",
     "has_succeeded_publish_job",
     "get_system_profile_row",
+    "get_latest_completed_capability_hierarchy_run",
     "load_ai_purpose_view",
     "get_latest_purpose_confirmation",
+    "get_latest_completed_understanding_build",
     "purpose_confirmation_staleness",
 ]
 
@@ -224,11 +226,15 @@ def purpose_defined_in_snapshot(conn, system_id: int, snapshot_id: int) -> bool:
     ``system_profile_drafts`` row with a non-empty name/purpose exists for
     this snapshot. Does not consider any other snapshot's baseline.
     """
-    node = conn.execute(
-        "SELECT name, summary FROM capability_hierarchy_nodes "
-        "WHERE system_id = ? AND snapshot_id = ? AND node_type = 'purpose' LIMIT 1",
-        (system_id, snapshot_id),
-    ).fetchone()
+    run = get_latest_completed_capability_hierarchy_run(conn, system_id, snapshot_id)
+    node = None
+    if run is not None:
+        node = conn.execute(
+            "SELECT name, summary FROM capability_hierarchy_nodes "
+            "WHERE system_id = ? AND snapshot_id = ? AND intelligence_run_id = ? "
+            "AND node_type = 'purpose' ORDER BY id LIMIT 1",
+            (system_id, snapshot_id, run["id"]),
+        ).fetchone()
     draft = conn.execute(
         "SELECT name, purpose FROM system_profile_drafts "
         "WHERE system_id = ? AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
@@ -240,10 +246,14 @@ def purpose_defined_in_snapshot(conn, system_id: int, snapshot_id: int) -> bool:
 
 
 def capability_count_in_snapshot(conn, system_id: int, snapshot_id: int) -> int:
+    run = get_latest_completed_capability_hierarchy_run(conn, system_id, snapshot_id)
+    if run is None:
+        return 0
     return conn.execute(
         "SELECT COUNT(*) FROM capability_hierarchy_nodes "
-        "WHERE system_id = ? AND snapshot_id = ? AND node_type = 'capability'",
-        (system_id, snapshot_id),
+        "WHERE system_id = ? AND snapshot_id = ? AND intelligence_run_id = ? "
+        "AND node_type = 'capability'",
+        (system_id, snapshot_id, run["id"]),
     ).fetchone()[0]
 
 
@@ -529,23 +539,41 @@ def get_system_profile_row(conn, system_id: int):
     ).fetchone()
 
 
+def get_latest_completed_capability_hierarchy_run(
+    conn, system_id: int, snapshot_id: int
+):
+    """Latest usable capability hierarchy run for one exact System/snapshot."""
+    return conn.execute(
+        "SELECT * FROM intelligence_runs "
+        "WHERE system_id = ? AND snapshot_id = ? "
+        "AND run_type = 'capability_hierarchy' AND status = 'completed' "
+        "ORDER BY id DESC LIMIT 1",
+        (system_id, snapshot_id),
+    ).fetchone()
+
+
 def load_ai_purpose_view(conn, system_id: int, snapshot_id: int) -> Optional[Dict[str, Any]]:
     """The AI/source-derived purpose view for one snapshot (Issue #94/#275).
 
-    Reproduces ``system_understanding_service._load_purpose``'s two-query
-    fallback chain byte-for-byte (capability_hierarchy purpose node, else the
-    latest system_profile_drafts row), with an added ``source`` key
+    Reads the purpose node from this System/snapshot's latest *completed*
+    capability-hierarchy run, falling back to the latest
+    ``system_profile_drafts`` row when that run has no purpose. Newer failed
+    runs and older completed-run nodes are ignored. The added ``source`` key
     (``"capability_hierarchy"`` | ``"system_profile_draft"``) so callers can
     tell the two apart without re-deriving it from ``provenance_kind`` (which
     can independently be ``"structural"`` on either source).
     ``_load_purpose`` delegates to this and drops the ``source`` key to keep
     its own public return shape unchanged.
     """
-    node = conn.execute(
-        "SELECT * FROM capability_hierarchy_nodes "
-        "WHERE system_id = ? AND snapshot_id = ? AND node_type = 'purpose' LIMIT 1",
-        (system_id, snapshot_id),
-    ).fetchone()
+    run = get_latest_completed_capability_hierarchy_run(conn, system_id, snapshot_id)
+    node = None
+    if run is not None:
+        node = conn.execute(
+            "SELECT * FROM capability_hierarchy_nodes "
+            "WHERE system_id = ? AND snapshot_id = ? AND intelligence_run_id = ? "
+            "AND node_type = 'purpose' ORDER BY id LIMIT 1",
+            (system_id, snapshot_id, run["id"]),
+        ).fetchone()
     if node:
         return {
             "source": "capability_hierarchy",
@@ -579,6 +607,16 @@ def get_latest_purpose_confirmation(conn, system_id: int):
     ).fetchone()
 
 
+def get_latest_completed_understanding_build(conn, system_id: int, snapshot_id: int):
+    """Latest completed System Understanding build for this exact System/snapshot."""
+    return conn.execute(
+        "SELECT * FROM system_understanding_builds "
+        "WHERE system_id = ? AND snapshot_id = ? AND status = 'completed' "
+        "ORDER BY id DESC LIMIT 1",
+        (system_id, snapshot_id),
+    ).fetchone()
+
+
 def purpose_confirmation_staleness(
     conn, system_id: int, current_ready_snapshot_id: Optional[int]
 ) -> Optional[str]:
@@ -591,9 +629,11 @@ def purpose_confirmation_staleness(
        current latest ready snapshot id -> ``"snapshot_changed"``;
     2. else the confirmation's stored ``manual_purpose`` no longer matches
        the current ``system_profile.purpose`` text -> ``"profile_updated"``;
-    3. else the confirmation's stored AI name/summary no longer match the
+    3. else the confirmation is legacy (no build id), or its pinned completed
+       build is no longer the latest completed build -> ``"ai_updated"``;
+    4. else the confirmation's stored AI name/summary no longer match the
        current AI purpose view's name/summary -> ``"ai_updated"``;
-    4. else valid (``None``).
+    5. else valid (``None``).
     """
     confirmation = get_latest_purpose_confirmation(conn, system_id)
     if confirmation is None:
@@ -606,6 +646,17 @@ def purpose_confirmation_staleness(
     current_purpose = (profile["purpose"] or "") if profile is not None else ""
     if (confirmation["manual_purpose"] or "") != current_purpose:
         return "profile_updated"
+
+    current_build = get_latest_completed_understanding_build(
+        conn, system_id, current_ready_snapshot_id
+    )
+    pinned_build_id = confirmation["understanding_build_id"]
+    if (
+        pinned_build_id is None
+        or current_build is None
+        or pinned_build_id != current_build["id"]
+    ):
+        return "ai_updated"
 
     ai_view = load_ai_purpose_view(conn, system_id, current_ready_snapshot_id)
     ai_name = ai_view["name"] if ai_view else None

@@ -47,7 +47,7 @@ def admin_client(tmp_path, monkeypatch):
 def _login(client, username="root", password="s3cret"):
     r = client.post("/auth/login", json={"username": username, "password": password})
     assert r.status_code == 200, r.text
-    return r.json()["access_token"]
+    return r.cookies.get("probe_session")
 
 
 def _create_system(client, token, name):
@@ -543,6 +543,14 @@ class TestManualPurposeUnconfirmedItem:
         snapshot_id = snap.json()["id"]
         run_id = _insert_intelligence_run(sys["id"], snapshot_id, "capability_hierarchy", "completed")
         _insert_capability_node(sys["id"], snapshot_id, run_id, node_type="purpose", name=name)
+        from app.db import get_conn
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO system_understanding_builds
+                       (system_id, snapshot_id, status, completed_at, created_at)
+                   VALUES (?, ?, 'completed', ?, ?)""",
+                (sys["id"], snapshot_id, time.time(), time.time()),
+            )
         return snapshot_id
 
     def test_appears_when_manual_and_ai_purpose_both_exist_unconfirmed(self, admin_client, tmp_path):
@@ -591,8 +599,16 @@ class TestManualPurposeUnconfirmedItem:
         _, items_before = _get_state(admin_client, hdrs)
         assert "understanding.purpose.manual_profile_unconfirmed" in items_before
 
+        understanding = admin_client.get(
+            "/repository/system-understanding", headers=hdrs
+        ).json()
         confirm = admin_client.post(
-            "/repository/system-understanding/purpose-confirmation", json={}, headers=hdrs
+            "/repository/system-understanding/purpose-confirmation",
+            json={
+                "snapshot_id": understanding["snapshot_id"],
+                "understanding_build_id": understanding["understanding_build_id"],
+            },
+            headers=hdrs,
         )
         assert confirm.status_code == 201, confirm.text
 

@@ -1,7 +1,9 @@
 # probe-agent (Python Probe SDK)
 
 軽量な Python SDK。任意の関数に `@probe(component_id=...)` を付けるだけで、
-入出力・エラー・実行時間を Control Server に送信できる。
+既定ではdenylistを強制適用した入出力reprと、component・エラー種別・実行時間などを
+Control Serverへ送信できる。従来互換の詳細な例外情報は `full` の明示指定が必要で、
+入出力値自体を抑制したい場合は `metadata` を指定する。
 
 ```python
 from probe_agent import probe, set_candidate
@@ -13,6 +15,59 @@ def summarize(text: str) -> str:
 # 代替実装を登録すると shadow モードで比較できる
 set_candidate("summarizer", summarize_v2)
 ```
+
+## Telemetry payload mode（Issue #271）
+
+`PROBE_PAYLOAD_MODE` は送信する入出力の範囲を有限3モードから選ぶ。未指定・不正値は
+denylistを強制適用する `redacted` になる。
+
+| mode | input / output | error |
+| --- | --- | --- |
+| `metadata` | `null`（raw値を送信しない） | 例外の型名のみ |
+| `redacted`（既定） | reprを送信。ただし下記denylistを再帰的に強制マスク | 例外の型名のみ（メッセージ・tracebackなし） |
+| `full` | 非機微値のraw reprを送信。ただし下記denylistは強制マスク | 従来互換の例外メッセージ・traceback |
+
+denylistは `password` / `passwd` / `secret` / `token` / `authorization` /
+`api_key` / `cookie` / `session` の有限集合で、dict/kwargsとネストした
+dict/list/tuple/set/frozensetへ適用する。キーは小文字化した**完全一致**だけで判定する
+（`Password` は対象、`password_hint` や `access_token` は対象外）。`full` でも解除できない。
+位置引数は、関数シグネチャ上の引数名がdenylistと一致すると値全体をマスクする。
+
+マスク文字列はprojection/replay captureと共通の `██redacted██`。
+同じ文字列を利用者データが含む場合も、内部sentinelとreplayのliteral encodingにより
+本当のマスクと区別して扱う。redactionや送信の失敗は、対象関数の返値・例外に影響しない。
+
+互換性上の注意: #271以前はraw reprが暗黙に送信された。従来と同じ表示が必要な環境は
+`PROBE_PAYLOAD_MODE=full` を明示する。ただしdenylistキーだけは常にマスクされる。
+
+## 非同期送信とcircuit breaker（Issue #272）
+
+traceとshadow resultのPOSTは、固定1本のdaemon workerとbounded FIFO queueで送信する。
+対象関数のスレッドは `put_nowait` だけを行い、HTTP応答を待たない。queue満杯時の規則は
+決定的な `drop_newest`（既存queueを維持して新規イベントを破棄）で、対象関数をblock/raise
+させない。policy GETは従来どおり同期で、queueとbreakerの対象外。
+
+circuit breakerは `closed` / `open` / `half_open` の有限3状態。連続失敗が閾値へ達すると
+`open` になり、cooldown中のprobeはtrace ID生成・sampling・serializationより前に計測処理を
+省略して対象関数だけを実行する。cooldown後は1イベントだけを `half_open` trialとして送り、
+成功なら `closed`、失敗なら `open` に戻る。HTTP 2xx（空bodyを含む）は成功、429・timeout・
+接続失敗は失敗として数える。
+
+`probe_agent.transport_stats()` は以下のthread-safe snapshotを返す。
+
+```python
+{
+    "dropped_count": 0,       # 次回成功まで未ackのdrop数
+    "failure_count": 0,       # 次回成功まで未ackの送信失敗数
+    "state": "closed",
+    "consecutive_failures": 0,
+    "queue_size": 0,
+}
+```
+
+drop/failureがある場合は次の送信payloadへ `sdk_transport` summaryを付与し、その送信が
+成功したときだけ該当snapshot分をackする。失敗時や同時発生した新しいcountは失われない。
+`flush(timeout=...)` とatexitはshadow thread完了後にqueueもbounded waitする。
 
 ## トレース系譜メタデータ（Issue #145 / Phase 1）
 
@@ -112,8 +167,8 @@ def handler(x):
 
 `@probe(replay_capture=...)` で **component 単位の opt-in** により、呼び出し引数を
 JSON で往復（round-trip）可能な構造として記録できる。後続フェーズ（リプレイ実行・
-オフライン shadow）が入力を機械的に復元するための基盤で、既存の `input` / `output`
-（repr 文字列）はそのまま変わらない。
+オフライン shadow）が入力を機械的に復元するための基盤。通常の `input` / `output` は
+上記payload modeに従い、replay capture自体はcomponent単位の明示的opt-inとして扱う。
 
 ```python
 from probe_agent import probe
@@ -152,6 +207,8 @@ def check(user, password=None):
 - `redact` は projection と同じパス文法・同じマスク文字列を使い、**エンコード前**に
   root へ適用する。構造的に置換できない redact パスは **fail closed でキャプチャ全体を
   破棄**し `unreplayable` / `redaction_blocked` になる（マスク漏れより破棄を選ぶ）。
+- 明示的な `redact` パスに加え、SDKのdenylistは常に再帰適用される。
+  `replay_capture=True` や `PROBE_PAYLOAD_MODE=full` でも解除できない。
 - サイズ上限（`PROBE_REPLAY_CAPTURE_MAX_BYTES`、既定 65536）超過時はキャプチャ全体を
   破棄して `unreplayable` / `size_limit_exceeded`（**切り詰めた JSON は round-trip
   できないため部分保存はしない**）。ネスト深さは 20 段まで（超過ノードは
@@ -171,6 +228,10 @@ def check(user, password=None):
 | `PROBE_POLICY_TTL` | `10` | policy キャッシュ秒数 |
 | `PROBE_HTTP_TIMEOUT` | `2` | HTTP リクエストのタイムアウト秒数 |
 | `PROBE_SHUTDOWN_TIMEOUT` | `10` | atexit 時に shadow 完了を待つ最大秒数 |
+| `PROBE_PAYLOAD_MODE` | `redacted` | telemetry payload (`metadata`/`redacted`/`full`)。不正値は `redacted`。`full` でもdenylistを強制マスク |
+| `PROBE_SEND_QUEUE_MAX` | `1000` | trace/shadow POSTのbounded FIFO件数（最小1）。満杯時は新規イベントをdrop |
+| `PROBE_BREAKER_FAILURE_THRESHOLD` | `5` | breakerをopenにする連続送信失敗数（最小1） |
+| `PROBE_BREAKER_RESET_SECONDS` | `30` | openからhalf-open trialまでの秒数（最小0.1） |
 | `PROBE_PROJECTION_MAX_BYTES` | `8192` | projection データの最大バイト数（超過で決定的に truncate） |
 | `PROBE_PROJECTION_MAX_FIELDS` | `64` | projection の最大フィールド数 |
 | `PROBE_PROJECTION_MAX_SAMPLES` | `20` | sample の最大要素数 |
@@ -182,4 +243,4 @@ def check(user, password=None):
 - Control Server が落ちていても元関数の実行は影響を受けない
 - shadow 実行はバックグラウンドスレッドで行い、返値は常に元コンポーネント
 - shadow 入力は呼び出し時点で `deepcopy` され、呼び出し元の事後変更の影響を受けない（deepcopy 不能な値は参照を渡す fail-safe フォールバック）
-- 短命プロセスでも `atexit` フックが `flush()` を呼び、shadow 結果送信完了を待つ（最大 `PROBE_SHUTDOWN_TIMEOUT` 秒）
+- 短命プロセスでも `atexit` フックが `flush()` を呼び、shadow処理と受理済み送信queueの完了を待つ（最大 `PROBE_SHUTDOWN_TIMEOUT` 秒、workerはdaemon）

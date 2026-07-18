@@ -79,6 +79,21 @@ DB ファイルは `PROBE_DB_PATH` (既定 `./probe.db`) で切り替えられ�
 | `ANALYZER_MAX_EXAMPLES` | `5` | shadow diff の diff クラスごとに保持する例示トレース数(#150) |
 | `RETENTION_BATCH_SIZE` | `1000` | retention 削除のバッチ上限(長時間ロック回避、#152) |
 
+### Rate limit / resource quota
+
+| 変数 | 開発既定 | 説明 |
+| --- | --- | --- |
+| `CONTROL_TRACE_RATE_LIMIT_PER_SECOND` | `1000` | SDK API token ごとの `/traces` 1秒固定窓上限。超過は 429 |
+| `CONTROL_MANAGEMENT_RATE_LIMIT_PER_MINUTE` | `600` | login user ごとの管理 API 1分固定窓上限。超過は 429 |
+| `CONTROL_LLM_DAILY_EXECUTION_LIMIT` | `1000` | System ごとの UTC 1日あたり LLM 実行回数。超過は fail-closed |
+| `CONTROL_TRACE_MAX_ROWS_PER_SYSTEM` | `1000000` | System ごとの Trace 最大行数 |
+| `CONTROL_TRACE_MAX_BYTES_PER_SYSTEM` | `1073741824` | System ごとの Trace 概算 bytes 上限 |
+
+すべて正の整数で指定する。`CONTROL_ENV=production` では5項目すべてが
+必須で、未設定・不正値なら起動を拒否する。Trace 容量超過は 429 で拒否され、
+`GET /system-state` に警告が投影される。SDK の queue/breaker が報告した drop/
+failure は `GET /sdk-transport/status` で System 単位に観測できる。
+
 SDK 側の projection 上限(`PROBE_PROJECTION_MAX_*`)は `packages/python-probe/README.md` を参照。
 
 ## LLM 設定

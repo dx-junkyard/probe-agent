@@ -40,8 +40,6 @@ vi.mock("@/api/client", () => ({
   api: mockApi,
   getSystemId: () => mockSystemId,
   setSystemId: (id: number | null) => { mockSystemId = id; },
-  getSessionToken: () => (mockUser ? "fake-token" : null),
-  setSessionToken: vi.fn(),
   ApiError,
 }));
 

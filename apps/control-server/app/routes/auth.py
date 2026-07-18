@@ -3,7 +3,14 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 
-from ..auth import Principal, get_principal, require_admin, require_user
+from ..auth import (
+    CSRF_COOKIE_NAME,
+    SESSION_COOKIE_NAME,
+    Principal,
+    get_principal,
+    require_admin,
+    require_user,
+)
 from ..bootstrap_status import get_bootstrap_status
 from ..db import get_conn
 from ..environment import is_production
@@ -101,8 +108,49 @@ def bootstrap_status() -> BootstrapStatusOut:
     )
 
 
+def _set_session_cookies(response: Response, session: str, csrf: str) -> None:
+    secure = is_production()
+    common = {
+        "max_age": _SESSION_TTL_SECONDS,
+        "path": "/",
+        "secure": secure,
+        "samesite": "lax",
+    }
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session,
+        httponly=True,
+        **common,
+    )
+    response.set_cookie(
+        key=CSRF_COOKIE_NAME,
+        value=csrf,
+        httponly=False,
+        **common,
+    )
+    response.headers["Cache-Control"] = "no-store"
+
+
+def _clear_session_cookies(response: Response) -> None:
+    secure = is_production()
+    response.delete_cookie(
+        SESSION_COOKIE_NAME,
+        path="/",
+        secure=secure,
+        httponly=True,
+        samesite="lax",
+    )
+    response.delete_cookie(
+        CSRF_COOKIE_NAME,
+        path="/",
+        secure=secure,
+        httponly=False,
+        samesite="lax",
+    )
+
+
 @router.post("/auth/login", response_model=TokenResponse)
-def login(payload: LoginRequest) -> TokenResponse:
+def login(payload: LoginRequest, response: Response) -> TokenResponse:
     with get_conn() as conn:
         row = conn.execute(
             "SELECT id, password_hash, is_active FROM users WHERE username = ?",
@@ -120,7 +168,8 @@ def login(payload: LoginRequest) -> TokenResponse:
             name="login session",
             expires_at=expires_at,
         )
-    return TokenResponse(access_token=raw, expires_at=expires_at)
+    _set_session_cookies(response, raw, generate_token())
+    return TokenResponse(expires_at=expires_at)
 
 
 @router.post("/auth/logout", status_code=204)
@@ -132,13 +181,21 @@ def logout(principal: Principal = Depends(get_principal)) -> Response:
             conn.execute(
                 "UPDATE api_tokens SET revoked = 1 WHERE id = ?", (principal.token_id,)
             )
-    return Response(status_code=204)
+    response = Response(status_code=204)
+    _clear_session_cookies(response)
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @router.get("/auth/me", response_model=MeResponse)
 def me(principal: Principal = Depends(get_principal)) -> MeResponse:
     if principal.user_id is None:
-        return MeResponse(user=None, auth=principal.auth, system_id=principal.system_id)
+        return MeResponse(
+            user=None,
+            auth=principal.auth,
+            system_id=principal.system_id,
+            transport=principal.transport,
+        )
     with get_conn() as conn:
         row = conn.execute(
             "SELECT id, username, role, is_active, created_at FROM users WHERE id = ?",
@@ -147,7 +204,10 @@ def me(principal: Principal = Depends(get_principal)) -> MeResponse:
     if row is None:
         raise HTTPException(status_code=404, detail="User not found")
     return MeResponse(
-        user=_user_out(row), auth=principal.auth, system_id=principal.system_id
+        user=_user_out(row),
+        auth=principal.auth,
+        system_id=principal.system_id,
+        transport=principal.transport,
     )
 
 

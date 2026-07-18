@@ -34,7 +34,7 @@ def admin_client(tmp_path, monkeypatch):
 def _login(client, username="root", password="s3cret"):
     r = client.post("/auth/login", json={"username": username, "password": password})
     assert r.status_code == 200, r.text
-    return r.json()["access_token"]
+    return r.cookies.get("probe_session")
 
 
 def _bearer(token):
@@ -1507,7 +1507,22 @@ class TestPurposeConfirmation:
                    VALUES (?, ?, ?, 'purpose', ?, ?, 0)""",
                 (system_id, snapshot_id, run_id, name, summary),
             )
-        return run_id
+            build_id = conn.execute(
+                """INSERT INTO system_understanding_builds
+                       (system_id, snapshot_id, status, completed_at, created_at)
+                   VALUES (?, ?, 'completed', ?, ?)""",
+                (system_id, snapshot_id, time.time(), time.time()),
+            ).lastrowid
+        return build_id
+
+    def _confirmation_payload(self, client, hdrs):
+        data = client.get(
+            "/repository/system-understanding", headers=hdrs
+        ).json()
+        return {
+            "snapshot_id": data["snapshot_id"],
+            "understanding_build_id": data["understanding_build_id"],
+        }
 
     def _create_ready_snapshot(self, client, hdrs, tmp_path):
         repo, sha = _init_git_repo(tmp_path)
@@ -1600,7 +1615,8 @@ class TestPurposeConfirmation:
         self._insert_ai_purpose(system_id, snapshot_id, name="AI System", summary="AI-derived purpose.")
 
         r = admin_client.post(
-            "/repository/system-understanding/purpose-confirmation", json={}, headers=hdrs
+            "/repository/system-understanding/purpose-confirmation",
+            json=self._confirmation_payload(admin_client, hdrs), headers=hdrs
         )
         assert r.status_code == 201, r.text
         body = r.json()
@@ -1610,6 +1626,8 @@ class TestPurposeConfirmation:
         assert body["ai_purpose_summary"] == "AI-derived purpose."
         assert body["ai_source"] == "capability_hierarchy"
         assert body["snapshot_id"] == snapshot_id
+        assert body["understanding_build_id"] is not None
+        assert body["decided_by_user_id"] is not None
         assert body["stale"] is False
         assert body["stale_reason"] is None
 
@@ -1623,6 +1641,64 @@ class TestPurposeConfirmation:
         state_r = admin_client.get("/system-state", headers=hdrs)
         state_ids = {i["state_id"] for i in state_r.json()["items"]}
         assert "understanding.purpose.manual_profile_unconfirmed" not in state_ids
+
+    def test_confirmation_rejects_rebuild_after_view_was_read(self, admin_client, tmp_path):
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "pc-build-race")
+        hdrs = _headers(token, sys["id"])
+        admin_client.put(
+            "/system-profile", json={"purpose": "Manual purpose."}, headers=hdrs
+        )
+        snapshot_id = self._create_ready_snapshot(admin_client, hdrs, tmp_path)
+        displayed_build_id = self._insert_ai_purpose(sys["id"], snapshot_id)
+        displayed = self._confirmation_payload(admin_client, hdrs)
+        assert displayed["understanding_build_id"] == displayed_build_id
+
+        from app.db import get_conn
+        with get_conn() as conn:
+            current_build_id = conn.execute(
+                """INSERT INTO system_understanding_builds
+                       (system_id, snapshot_id, status, completed_at, created_at)
+                   VALUES (?, ?, 'completed', ?, ?)""",
+                (sys["id"], snapshot_id, time.time(), time.time()),
+            ).lastrowid
+        assert current_build_id != displayed_build_id
+
+        response = admin_client.post(
+            "/repository/system-understanding/purpose-confirmation",
+            json=displayed,
+            headers=hdrs,
+        )
+        assert response.status_code == 409
+        with get_conn() as conn:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM system_purpose_confirmations WHERE system_id = ?",
+                (sys["id"],),
+            ).fetchone()[0] == 0
+
+    def test_sdk_api_token_cannot_record_manual_confirmation(self, admin_client, tmp_path):
+        session_token = _login(admin_client)
+        sys = _create_system(admin_client, session_token, "pc-sdk-denied")
+        hdrs = _headers(session_token, sys["id"])
+        admin_client.put(
+            "/system-profile", json={"purpose": "Manual purpose."}, headers=hdrs
+        )
+        snapshot_id = self._create_ready_snapshot(admin_client, hdrs, tmp_path)
+        self._insert_ai_purpose(sys["id"], snapshot_id)
+        payload = self._confirmation_payload(admin_client, hdrs)
+
+        issued = admin_client.post(
+            "/tokens/me",
+            json={"name": "sdk", "system_id": sys["id"]},
+            headers=_bearer(session_token),
+        )
+        assert issued.status_code == 201, issued.text
+        response = admin_client.post(
+            "/repository/system-understanding/purpose-confirmation",
+            json=payload,
+            headers={"X-Api-Key": issued.json()["token"]},
+        )
+        assert response.status_code == 403
 
     def test_confirmation_409_without_ready_snapshot(self, admin_client):
         token = _login(admin_client)
@@ -1647,7 +1723,10 @@ class TestPurposeConfirmation:
 
         r = admin_client.post(
             "/repository/system-understanding/purpose-confirmation",
-            json={"snapshot_id": snapshot_id + 999},
+            json={
+                **self._confirmation_payload(admin_client, hdrs),
+                "snapshot_id": snapshot_id + 999,
+            },
             headers=hdrs,
         )
         assert r.status_code == 409
@@ -1662,7 +1741,8 @@ class TestPurposeConfirmation:
         self._insert_ai_purpose(system_id, snapshot_id)
 
         r = admin_client.post(
-            "/repository/system-understanding/purpose-confirmation", json={}, headers=hdrs
+            "/repository/system-understanding/purpose-confirmation",
+            json=self._confirmation_payload(admin_client, hdrs), headers=hdrs
         )
         assert r.status_code == 422
 
@@ -1672,10 +1752,12 @@ class TestPurposeConfirmation:
         hdrs = _headers(token, sys["id"])
 
         admin_client.put("/system-profile", json={"purpose": "Manual purpose."}, headers=hdrs)
-        self._create_ready_snapshot(admin_client, hdrs, tmp_path)
+        snapshot_id = self._create_ready_snapshot(admin_client, hdrs, tmp_path)
 
         r = admin_client.post(
-            "/repository/system-understanding/purpose-confirmation", json={}, headers=hdrs
+            "/repository/system-understanding/purpose-confirmation",
+            json={"snapshot_id": snapshot_id, "understanding_build_id": 1},
+            headers=hdrs
         )
         assert r.status_code == 422
 
@@ -1690,13 +1772,15 @@ class TestPurposeConfirmation:
         self._insert_ai_purpose(system_id, snapshot_id)
 
         r1 = admin_client.post(
-            "/repository/system-understanding/purpose-confirmation", json={}, headers=hdrs
+            "/repository/system-understanding/purpose-confirmation",
+            json=self._confirmation_payload(admin_client, hdrs), headers=hdrs
         )
         assert r1.status_code == 201, r1.text
 
         r2 = admin_client.post(
             "/repository/system-understanding/purpose-confirmation",
-            json={"note": "second confirmation"},
+            json={**self._confirmation_payload(admin_client, hdrs),
+                  "note": "second confirmation"},
             headers=hdrs,
         )
         assert r2.status_code == 201, r2.text
@@ -1725,7 +1809,8 @@ class TestPurposeConfirmation:
         self._insert_ai_purpose(system_id, snapshot_id)
 
         confirm = admin_client.post(
-            "/repository/system-understanding/purpose-confirmation", json={}, headers=hdrs
+            "/repository/system-understanding/purpose-confirmation",
+            json=self._confirmation_payload(admin_client, hdrs), headers=hdrs
         )
         assert confirm.status_code == 201, confirm.text
 
@@ -1752,7 +1837,8 @@ class TestPurposeConfirmation:
         snapshot_id = self._create_ready_snapshot(admin_client, hdrs_a, tmp_path)
         self._insert_ai_purpose(sys_a["id"], snapshot_id)
         confirm = admin_client.post(
-            "/repository/system-understanding/purpose-confirmation", json={}, headers=hdrs_a
+            "/repository/system-understanding/purpose-confirmation",
+            json=self._confirmation_payload(admin_client, hdrs_a), headers=hdrs_a
         )
         assert confirm.status_code == 201, confirm.text
 

@@ -256,6 +256,9 @@ def _spawn(build_id: int, system_id: int) -> None:
 
 
 def _run_job_safely(build_id: int, system_id: int) -> None:
+    from .resource_limits import reset_current_system_id, set_current_system_id
+
+    quota_context = set_current_system_id(system_id)
     try:
         _execute_job(build_id, system_id)
     except Exception as exc:  # pragma: no cover - defensive
@@ -268,6 +271,8 @@ def _run_job_safely(build_id: int, system_id: int) -> None:
                 (str(exc), time.time(), build_id),
             )
             _close_open_runs(conn, build_id, "failed")
+    finally:
+        reset_current_system_id(quota_context)
 
 
 def _mark_step(
@@ -484,15 +489,37 @@ def _record_gap_history(
     Reuses the exact same gap computation the read path uses
     (`_load_gaps_from_reconciler` + `_compute_gap_summary`) so history never
     diverges from what the Hub displays for the same build/snapshot. Only
-    called for completed/partial jobs; a gap_type with zero gaps simply gets
-    no row (equivalent to a stored count of 0 when the trend is read back).
+    called for completed/partial jobs. A build with no open gaps stores one
+    reserved marker row so it remains the current side of an N -> 0 trend;
+    the read path filters that marker from user-visible gap types.
     """
     if snapshot_id is None:
         return
-    from .system_understanding_service import _compute_gap_summary, _load_gaps_from_reconciler
+    from .system_understanding_service import (
+        GAP_HISTORY_EMPTY_SENTINEL,
+        _compute_gap_summary,
+        _load_gaps_from_reconciler,
+        _open_gaps,
+    )
 
     gaps = _load_gaps_from_reconciler(conn, system_id, snapshot_id)
-    gap_summary = _compute_gap_summary(gaps)
+    from .gap_triage import materialize_automatic_reopens
+
+    # Build settlement is the explicit write point for automatic reopen. GET
+    # projections remain read-only, while the open event becomes durable and
+    # auditable before this build's open-only trend counts are stored.
+    materialize_automatic_reopens(conn, system_id, snapshot_id, gaps)
+    # Issue #276 policy: trend measures untriaged work, not every detected
+    # item. Acknowledged/dismissed/resolved gaps stay visible in the all-items
+    # worklist but do not make the trend look perpetually noisy.
+    gap_summary = _compute_gap_summary(_open_gaps(gaps))
+    if not gap_summary:
+        conn.execute(
+            """INSERT INTO system_understanding_gap_history
+                (system_id, snapshot_id, build_id, gap_type, count, created_at)
+            VALUES (?, ?, ?, ?, 0, ?)""",
+            (system_id, snapshot_id, build_id, GAP_HISTORY_EMPTY_SENTINEL, now),
+        )
     for gs in gap_summary:
         conn.execute(
             """INSERT INTO system_understanding_gap_history

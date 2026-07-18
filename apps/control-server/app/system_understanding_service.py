@@ -25,6 +25,8 @@ from .system_state import UnderstandingStatus, evaluate_understanding
 
 logger = logging.getLogger(__name__)
 
+GAP_HISTORY_EMPTY_SENTINEL = "__no_open_gaps__"
+
 
 # Pipeline step names (from docs/system-understanding-navigation.md)
 PIPELINE_STEPS = [
@@ -94,6 +96,7 @@ class MetadataCoverage:
 class SystemUnderstandingSummary:
     system_id: int
     snapshot_id: Optional[int] = None
+    understanding_build_id: Optional[int] = None
     commit_sha: Optional[str] = None
     pipeline: List[PipelineStep] = field(default_factory=list)
     purpose: Optional[Dict[str, Any]] = None
@@ -390,6 +393,8 @@ def _load_purpose_confirmation(
     return {
         "id": row["id"],
         "snapshot_id": row["snapshot_id"],
+        "understanding_build_id": row["understanding_build_id"],
+        "decided_by_user_id": row["decided_by_user_id"],
         "decision_method": row["decision_method"],
         "manual_purpose": row["manual_purpose"],
         "ai_purpose_name": row["ai_purpose_name"],
@@ -404,9 +409,16 @@ def _load_purpose_confirmation(
 
 
 def _load_capabilities(conn, system_id: int, snapshot_id: int) -> List[Dict[str, Any]]:
+    run = state_facts.get_latest_completed_capability_hierarchy_run(
+        conn, system_id, snapshot_id
+    )
+    if run is None:
+        return []
     rows = conn.execute(
-        "SELECT * FROM capability_hierarchy_nodes WHERE system_id = ? AND snapshot_id = ? AND node_type = 'capability' ORDER BY id",
-        (system_id, snapshot_id),
+        "SELECT * FROM capability_hierarchy_nodes "
+        "WHERE system_id = ? AND snapshot_id = ? AND intelligence_run_id = ? "
+        "AND node_type = 'capability' ORDER BY id",
+        (system_id, snapshot_id, run["id"]),
     ).fetchall()
     return [
         {"name": r["name"], "summary": r["summary"], "provenance_kind": r["provenance_kind"]}
@@ -774,6 +786,25 @@ def _attach_issue_drafts(conn, system_id: int, gaps: List[Dict[str, Any]]) -> No
         gap["issue_drafts"] = drafts_by_key.get(key, [])
 
 
+def _attach_gap_triage(
+    conn, system_id: int, snapshot_id: Optional[int], gaps: List[Dict[str, Any]]
+) -> None:
+    """Attach Issue #276's stable locator, fingerprint and effective state."""
+    from .gap_triage import annotate_gaps
+
+    annotate_gaps(conn, system_id, snapshot_id, gaps)
+
+
+def _open_gaps(gaps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return gaps still needing a human decision.
+
+    Summary, stage count, history/trend, and StateItem derivation consistently
+    use this definition. Acknowledged/dismissed/resolved gaps remain available
+    through the all-items worklist filter but no longer contribute noise.
+    """
+    return [g for g in gaps if g.get("triage_status", "open") == "open"]
+
+
 def _compute_gap_summary(gaps: List[Dict[str, Any]]) -> List[GapSummary]:
     counts: Dict[str, int] = {}
     for g in gaps:
@@ -963,7 +994,11 @@ def _load_gap_trend(conn, system_id: int) -> List[GapTrend]:
                WHERE system_id = ? AND build_id = ?""",
             (system_id, build_id),
         ).fetchall()
-        return {r["gap_type"]: r["count"] for r in rows}
+        return {
+            r["gap_type"]: r["count"]
+            for r in rows
+            if r["gap_type"] != GAP_HISTORY_EMPTY_SENTINEL
+        }
 
     current_counts = _counts_for(current_build_id)
     previous_counts = _counts_for(previous_build_id)
@@ -1044,6 +1079,12 @@ def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
             snapshot_id = snapshot_row["id"]
             summary.snapshot_id = snapshot_id
             summary.commit_sha = snapshot_row["commit_sha"]
+            completed_build = state_facts.get_latest_completed_understanding_build(
+                conn, system_id, snapshot_id
+            )
+            summary.understanding_build_id = (
+                completed_build["id"] if completed_build is not None else None
+            )
 
             summary.purpose = _load_purpose(conn, system_id, snapshot_id)
             summary.capabilities = _load_capabilities(conn, system_id, snapshot_id)
@@ -1051,8 +1092,9 @@ def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
             summary.major_symbols = _load_major_symbols(conn, system_id, snapshot_id)
             summary.metadata_coverage = _load_metadata_coverage(conn, system_id, snapshot_id)
             summary.gaps = _load_gaps_from_reconciler(conn, system_id, snapshot_id)
+            _attach_gap_triage(conn, system_id, snapshot_id, summary.gaps)
             _attach_issue_drafts(conn, system_id, summary.gaps)
-            summary.gap_summary = _compute_gap_summary(summary.gaps)
+            summary.gap_summary = _compute_gap_summary(_open_gaps(summary.gaps))
 
             purpose_defined = _purpose_defined_from_understanding_status(
                 evaluate_understanding(conn, system_id, snapshot_id, purpose=True)
@@ -1091,7 +1133,7 @@ def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
             pipeline,
             purpose_defined,
             summary.capabilities,
-            len(summary.gaps),
+            len(_open_gaps(summary.gaps)),
             summary.gap_summary,
             entrypoint_count,
             len(proposed_plan_ids),

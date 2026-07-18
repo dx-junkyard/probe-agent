@@ -28,6 +28,17 @@ def _clean_env(monkeypatch):
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
         "GEMINI_API_KEY",
+        "PROBE_EXECUTION_BACKEND",
+        "PROBE_EXECUTION_SPOOL_ROOT",
+        "PROBE_EXECUTION_WORKSPACE_ROOT",
+        "PROBE_WORKTREE_BASE",
+        "PROBE_REPLAY_WORKSPACE_BASE",
+        "PROBE_EXPERIMENT_WORKSPACE_BASE",
+        "CONTROL_TRACE_RATE_LIMIT_PER_SECOND",
+        "CONTROL_MANAGEMENT_RATE_LIMIT_PER_MINUTE",
+        "CONTROL_LLM_DAILY_EXECUTION_LIMIT",
+        "CONTROL_TRACE_MAX_ROWS_PER_SYSTEM",
+        "CONTROL_TRACE_MAX_BYTES_PER_SYSTEM",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -132,6 +143,23 @@ def test_production_environment_is_reported(tmp_path, monkeypatch):
     monkeypatch.setenv("CONTROL_ENV", "production")
     monkeypatch.setenv("CONTROL_ADMIN_USERNAME", "root")
     monkeypatch.setenv("CONTROL_ADMIN_PASSWORD", "a-strong-unique-passphrase")
+    spool = tmp_path / "execution-spool"
+    workspace = tmp_path / "execution-workspaces"
+    spool.mkdir()
+    workspace.mkdir()
+    monkeypatch.setenv("PROBE_EXECUTION_BACKEND", "worker")
+    monkeypatch.setenv("PROBE_EXECUTION_SPOOL_ROOT", str(spool))
+    monkeypatch.setenv("PROBE_EXECUTION_WORKSPACE_ROOT", str(workspace))
+    monkeypatch.setenv("PROBE_WORKTREE_BASE", str(workspace / "validation"))
+    monkeypatch.setenv("PROBE_REPLAY_WORKSPACE_BASE", str(workspace / "replay"))
+    monkeypatch.setenv(
+        "PROBE_EXPERIMENT_WORKSPACE_BASE", str(workspace / "experiments")
+    )
+    monkeypatch.setenv("CONTROL_TRACE_RATE_LIMIT_PER_SECOND", "1000")
+    monkeypatch.setenv("CONTROL_MANAGEMENT_RATE_LIMIT_PER_MINUTE", "600")
+    monkeypatch.setenv("CONTROL_LLM_DAILY_EXECUTION_LIMIT", "1000")
+    monkeypatch.setenv("CONTROL_TRACE_MAX_ROWS_PER_SYSTEM", "1000000")
+    monkeypatch.setenv("CONTROL_TRACE_MAX_BYTES_PER_SYSTEM", "1073741824")
     from app.main import app  # noqa: WPS433
 
     with TestClient(app) as c:
