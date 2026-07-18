@@ -2250,3 +2250,49 @@ LLM のみでの自動採用、任意コードの本番プロセスへの動的�
 
 **含まない:** UI からの管理者作成・signup フロー(env + restart のブート方式は
 そのまま)、LLM 設定を書き込む UI(表示・診断のみ)、新しい DB テーブル。
+
+## 手動 System Profile と AI 理解の突き合わせ(Issue #275、旧 #94)
+
+probe-agent の世界観は「人の認識と AI に任せたシステム構築を同期させる」こと
+だが、手動入力の `system_profile`(`PUT /system-profile`)は System
+Understanding の表示にも比較にも登場していなかった(`_load_purpose` は
+capability hierarchy の purpose ノード → `system_profile_drafts` の単一
+fallback チェーンのみ)。本 Issue は「人の認識」を第一級の provenance として
+並置し、人が突き合わせを確認した事実を `decision_method: manual` で記録する。
+
+- **`purpose_views`(並置ビュー)**: `GET /repository/system-understanding` に
+  追加。手動 profile 由来のビュー(`source: system_profile`,
+  `provenance_kind: manual`)は snapshot に依存せず、purpose が入力されて
+  いれば常に含まれる。AI/ソース由来のビューは ready snapshot がある場合のみ、
+  capability hierarchy の purpose ノード(行の `provenance_kind` をそのまま)
+  → `system_profile_drafts`(従来どおり `structural`)の順で 1 件。既存の
+  `purpose` フィールドの意味は変えない(後方互換)。
+- **確認記録**: 新テーブル `system_purpose_confirmations`(System-scoped、
+  append-only の監査行。UPDATE/DELETE しない)。`POST
+  /repository/system-understanding/purpose-confirmation` が最新 ready
+  snapshot に対して両ビューの内容を逐語でキャプチャして 1 行 INSERT する
+  (`decision_method` は常に `manual`)。どちらか一方が欠けていれば 422、
+  snapshot 不一致・snapshot 無しは 409(issue-drafts と同じ staleness
+  パターン)。
+- **staleness(決定的な構造等価のみ、Principle 6)**: 読み出し時に最新確認行を
+  現在状態と比較し、`snapshot_changed` → `profile_updated` → `ai_updated` の
+  順で判定した `stale_reason` を返す。一致/不一致の「解釈」はしない --
+  類似度・heuristic 判定は導入せず、差分の解釈は人に委ねる。
+- **StateItem**: 両ビューが存在し有効な確認が無いとき
+  `understanding.purpose.manual_profile_unconfirmed`(severity `info`、
+  `user_action_kind: confirm`、`display_routes: [/system-understanding]`、
+  anchor `purpose-views`)。確認後(非 stale)は消える。文言は
+  `state_messages.py` のカタログに追加。
+- **共有リーダー**: profile 行・AI purpose ビュー・最新確認行・staleness の
+  読み出しは `state_facts.py` の純関数に置き、
+  `system_understanding_service` と `system_state` が同一実装を共有する
+  (Issue #236 の方針)。
+- **Dashboard**: System Understanding ページの purpose セクションを
+  「人の認識(System Profile)」/「AI/ソース由来の理解」の並置カードに改修。
+  手動側が空ならその場入力(既存 `PUT /system-profile` へ purpose のみ
+  マージ更新)、両方あれば「一致を確認した」ボタン → 確認 POST。確認済みは
+  バッジ + 日時で表示し、stale 時は理由別の日本語注記を出す(#266 の言語規約)。
+
+**含まない:** LLM による purpose の自動マージ・書き換え(#59 の領分)、
+`probe-agent:` docstring への書き戻し(Principle 8 の interview 系 issue の
+領分)、`system_profile` スキーマ拡張、一致/不一致の自動判定。

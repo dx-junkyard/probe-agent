@@ -6414,6 +6414,231 @@ describe("Hub success summary and pipeline collapse (Issue #211)", () => {
   });
 });
 
+// ── System Purpose side-by-side views (Issue #94/#275) ──────────────
+
+describe("System Purpose side-by-side views (Issue #94/#275)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const completePipeline = [
+    { step: "repository_configured", status: "complete" },
+    { step: "snapshot_ready", status: "complete" },
+    { step: "documentation_indexed", status: "complete" },
+    { step: "documentation_claims_scanned", status: "complete" },
+    { step: "symbols_indexed", status: "complete" },
+    { step: "entrypoints_discovered", status: "complete" },
+    { step: "docs_code_reconciled", status: "complete" },
+    { step: "capability_hierarchy_ready", status: "complete" },
+  ];
+
+  function purposeResponse(overrides: Record<string, unknown> = {}) {
+    return {
+      system_id: 1,
+      snapshot_id: 5,
+      commit_sha: "abc12345def",
+      pipeline: completePipeline,
+      purpose: null,
+      capabilities: [],
+      entrypoints: [],
+      major_symbols: [],
+      gaps: [],
+      gap_summary: [],
+      metadata_coverage: null,
+      purpose_views: [],
+      purpose_confirmation: null,
+      ...overrides,
+    };
+  }
+
+  const emptyProfile = {
+    name: "", purpose: "", target_users: [], stakeholder_value: "",
+    constraints: [], success_criteria: [], created_at: null, updated_at: null,
+  };
+
+  function mockApis(response: Record<string, unknown>, profile: Record<string, unknown> = emptyProfile) {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(response);
+      if (path === "/system-profile") return Promise.resolve(profile);
+      if (path === "/system-diagnostics") return Promise.resolve(null);
+      if (path === "/system-state") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+  }
+
+  test("renders manual and AI purpose views side by side with provenance badges", async () => {
+    mockApis(purposeResponse({
+      purpose_views: [
+        { source: "system_profile", provenance_kind: "manual", name: "Manual purpose", summary: "human summary" },
+        { source: "capability_hierarchy", provenance_kind: "reasoning_llm", name: "AI purpose", summary: "ai summary" },
+      ],
+    }));
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const manualCard = await screen.findByTestId("purpose-manual-card");
+    expect(manualCard.textContent).toContain("Manual purpose");
+    expect(manualCard.textContent).toContain("human summary");
+    expect(manualCard.textContent).toContain("manual");
+
+    const aiCard = screen.getByTestId("purpose-ai-card");
+    expect(aiCard.textContent).toContain("AI purpose");
+    expect(aiCard.textContent).toContain("reasoning_llm");
+  });
+
+  test("manual side empty shows an inline entry form that saves via PUT /system-profile", async () => {
+    mockApis(
+      purposeResponse({
+        purpose_views: [
+          { source: "capability_hierarchy", provenance_kind: "reasoning_llm", name: "AI purpose", summary: "ai summary" },
+        ],
+      }),
+      {
+        name: "Existing name", purpose: "", target_users: ["dev"], stakeholder_value: "value",
+        constraints: [], success_criteria: [], created_at: 1, updated_at: 1,
+      },
+    );
+    mockApi.put.mockResolvedValue({});
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const textarea = await screen.findByTestId("purpose-manual-entry-textarea");
+    fireEvent.change(textarea, { target: { value: "新しい目的" } });
+    fireEvent.click(screen.getByTestId("purpose-manual-entry-save"));
+
+    await waitFor(() => expect(mockApi.put).toHaveBeenCalledWith("/system-profile", {
+      name: "Existing name",
+      purpose: "新しい目的",
+      target_users: ["dev"],
+      stakeholder_value: "value",
+      constraints: [],
+      success_criteria: [],
+    }));
+
+    const { toast } = await import("sonner");
+    await waitFor(() => expect(toast.success).toHaveBeenCalled());
+  });
+
+  test("AI side empty shows the Japanese empty state", async () => {
+    mockApis(purposeResponse({
+      purpose_views: [
+        { source: "system_profile", provenance_kind: "manual", name: "Manual purpose", summary: null },
+      ],
+    }));
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    expect(await screen.findByTestId("purpose-ai-empty")).toHaveTextContent(
+      "AI/ソース由来の purpose はまだありません。Snapshot 作成と Build 実行後に表示されます。",
+    );
+  });
+
+  test("both views present with no confirmation shows the confirm button and posts on click", async () => {
+    mockApis(purposeResponse({
+      purpose_views: [
+        { source: "system_profile", provenance_kind: "manual", name: "Manual purpose" },
+        { source: "capability_hierarchy", provenance_kind: "reasoning_llm", name: "AI purpose" },
+      ],
+    }));
+    mockApi.post.mockResolvedValue({
+      id: 1, snapshot_id: 5, decision_method: "manual", manual_purpose: "Manual purpose",
+      created_at: 1700000000, stale: false,
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByTestId("purpose-confirm-button"));
+
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/repository/system-understanding/purpose-confirmation",
+      { snapshot_id: 5 },
+    ));
+
+    const { toast } = await import("sonner");
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("一致を確認しました"));
+  });
+
+  test("confirmed and not stale shows the 確認済み badge without the confirm button", async () => {
+    mockApis(purposeResponse({
+      purpose_views: [
+        { source: "system_profile", provenance_kind: "manual", name: "Manual purpose" },
+        { source: "capability_hierarchy", provenance_kind: "reasoning_llm", name: "AI purpose" },
+      ],
+      purpose_confirmation: {
+        id: 1, snapshot_id: 5, decision_method: "manual", manual_purpose: "Manual purpose",
+        created_at: 1700000000, stale: false,
+      },
+    }));
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const confirmed = await screen.findByTestId("purpose-confirmed");
+    expect(confirmed.textContent).toContain("確認済み");
+    expect(screen.queryByTestId("purpose-confirm-button")).not.toBeInTheDocument();
+  });
+
+  test("stale confirmation shows the reason note and the confirm button again", async () => {
+    mockApis(purposeResponse({
+      purpose_views: [
+        { source: "system_profile", provenance_kind: "manual", name: "Manual purpose" },
+        { source: "capability_hierarchy", provenance_kind: "reasoning_llm", name: "AI purpose" },
+      ],
+      purpose_confirmation: {
+        id: 1, snapshot_id: 5, decision_method: "manual", manual_purpose: "Manual purpose",
+        created_at: 1700000000, stale: true, stale_reason: "profile_updated",
+      },
+    }));
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const note = await screen.findByTestId("purpose-confirmation-stale-note");
+    expect(note.textContent).toBe("確認後に System Profile が更新されています");
+    expect(screen.getByTestId("purpose-confirm-button")).toBeInTheDocument();
+  });
+
+  test("confirmation error is surfaced via toast", async () => {
+    mockApis(purposeResponse({
+      purpose_views: [
+        { source: "system_profile", provenance_kind: "manual", name: "Manual purpose" },
+        { source: "capability_hierarchy", provenance_kind: "reasoning_llm", name: "AI purpose" },
+      ],
+    }));
+    mockApi.post.mockRejectedValue(new ApiError(422, "Manual purpose is missing"));
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByTestId("purpose-confirm-button"));
+
+    const { toast } = await import("sonner");
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith(
+      "確認に失敗しました: Manual purpose is missing",
+    ));
+  });
+
+  test("purposeDefined falls back to purpose_views when the legacy purpose field is null", async () => {
+    mockApis(purposeResponse({
+      purpose: null,
+      purpose_views: [
+        { source: "system_profile", provenance_kind: "manual", name: "Manual purpose" },
+      ],
+    }));
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await screen.findByTestId("purpose-manual-card");
+    expect(screen.queryByTestId("entry-cards-prereq-note")).not.toBeInTheDocument();
+  });
+});
+
 // ── Notification surfaces consume one canonical StateItem (Issue #239) ──
 
 describe("Notification surface consistency (Issue #239)", () => {

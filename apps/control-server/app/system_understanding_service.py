@@ -121,6 +121,17 @@ class SystemUnderstandingSummary:
     # client-assembled `successSummary`). None while the pipeline is not
     # complete.
     success_summary: Optional[str] = None
+    # Issue #94/#275: manual system_profile purpose surfaced as a parallel
+    # provenance view next to `purpose` (the AI/source-derived view, whose
+    # existing semantics are unchanged). Manual view is snapshot-independent
+    # (included even without a ready snapshot); the AI view is included only
+    # when a ready snapshot exists. Each entry is a dict matching
+    # SystemUnderstandingPurposeViewOut's fields.
+    purpose_views: List[Dict[str, Any]] = field(default_factory=list)
+    # The latest human "confirmed" record reconciling the manual and AI
+    # purpose views (dict matching SystemUnderstandingPurposeConfirmationOut),
+    # or None if never confirmed.
+    purpose_confirmation: Optional[Dict[str, Any]] = None
 
 
 def _check_repository_configured(conn, system_id: int) -> PipelineStep:
@@ -310,28 +321,86 @@ def compute_pipeline_steps(conn, system_id: int, snapshot_row) -> List[PipelineS
 
 
 def _load_purpose(conn, system_id: int, snapshot_id: int) -> Optional[Dict[str, Any]]:
-    """Load system purpose from hierarchy or drafts."""
-    node = conn.execute(
-        "SELECT * FROM capability_hierarchy_nodes WHERE system_id = ? AND snapshot_id = ? AND node_type = 'purpose' LIMIT 1",
-        (system_id, snapshot_id),
-    ).fetchone()
-    if node:
-        return {
-            "name": node["name"],
-            "summary": node["summary"],
-            "provenance_kind": node["provenance_kind"],
-        }
-    draft = conn.execute(
-        "SELECT * FROM system_profile_drafts WHERE system_id = ? AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
-        (system_id, snapshot_id),
-    ).fetchone()
-    if draft:
-        return {
-            "name": draft["name"],
-            "summary": draft["purpose"],
-            "provenance_kind": "structural",
-        }
-    return None
+    """Load system purpose from hierarchy or drafts.
+
+    Delegates to ``state_facts.load_ai_purpose_view`` (Issue #94/#275) and
+    drops its extra ``source`` key, so this function's public return shape
+    (``name`` / ``summary`` / ``provenance_kind``) stays exactly what it was
+    before that extraction -- a behavior-preserving refactor.
+    """
+    view = state_facts.load_ai_purpose_view(conn, system_id, snapshot_id)
+    if view is None:
+        return None
+    return {
+        "name": view["name"],
+        "summary": view["summary"],
+        "provenance_kind": view["provenance_kind"],
+    }
+
+
+def _load_purpose_views(
+    conn, system_id: int, snapshot_id: Optional[int]
+) -> List[Dict[str, Any]]:
+    """Manual + AI purpose provenance views (Issue #94/#275).
+
+    Manual view first, snapshot-independent (included even when
+    ``snapshot_id`` is None): the human-entered ``system_profile.purpose``,
+    when non-empty. AI view second, only when ``snapshot_id`` is not None:
+    ``state_facts.load_ai_purpose_view``'s capability_hierarchy-node-or-draft
+    result for that snapshot, when present.
+    """
+    views: List[Dict[str, Any]] = []
+
+    profile = state_facts.get_system_profile_row(conn, system_id)
+    if profile is not None and (profile["purpose"] or "").strip():
+        name = (profile["name"] or "").strip() or "System Profile"
+        views.append({
+            "source": "system_profile",
+            "provenance_kind": "manual",
+            "name": name,
+            "summary": profile["purpose"],
+            "updated_at": profile["updated_at"],
+        })
+
+    if snapshot_id is not None:
+        ai_view = state_facts.load_ai_purpose_view(conn, system_id, snapshot_id)
+        if ai_view is not None:
+            views.append({
+                "source": ai_view["source"],
+                "provenance_kind": ai_view["provenance_kind"],
+                "name": ai_view["name"],
+                "summary": ai_view["summary"],
+                "updated_at": None,
+            })
+
+    return views
+
+
+def _load_purpose_confirmation(
+    conn, system_id: int, current_ready_snapshot_id: Optional[int]
+) -> Optional[Dict[str, Any]]:
+    """The latest human purpose confirmation, with staleness computed against
+    the current profile/snapshot/AI-view state (Issue #94/#275)."""
+    row = state_facts.get_latest_purpose_confirmation(conn, system_id)
+    if row is None:
+        return None
+    stale_reason = state_facts.purpose_confirmation_staleness(
+        conn, system_id, current_ready_snapshot_id
+    )
+    return {
+        "id": row["id"],
+        "snapshot_id": row["snapshot_id"],
+        "decision_method": row["decision_method"],
+        "manual_purpose": row["manual_purpose"],
+        "ai_purpose_name": row["ai_purpose_name"],
+        "ai_purpose_summary": row["ai_purpose_summary"],
+        "ai_source": row["ai_source"],
+        "ai_provenance_kind": row["ai_provenance_kind"],
+        "note": row["note"],
+        "created_at": row["created_at"],
+        "stale": stale_reason is not None,
+        "stale_reason": stale_reason,
+    }
 
 
 def _load_capabilities(conn, system_id: int, snapshot_id: int) -> List[Dict[str, Any]]:
@@ -988,6 +1057,15 @@ def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
             purpose_defined = _purpose_defined_from_understanding_status(
                 evaluate_understanding(conn, system_id, snapshot_id, purpose=True)
             )
+
+        # Issue #94/#275: manual + AI purpose provenance views and the latest
+        # human confirmation. purpose_views is snapshot-independent for its
+        # manual entry, so this is computed regardless of whether a ready
+        # snapshot exists (summary.snapshot_id is None when it doesn't).
+        summary.purpose_views = _load_purpose_views(conn, system_id, summary.snapshot_id)
+        summary.purpose_confirmation = _load_purpose_confirmation(
+            conn, system_id, summary.snapshot_id
+        )
 
         # Issue #238/#239: these id lists used to also feed the deprecated
         # `_build_next_actions` ("Review probe plan" / "Generate / validate

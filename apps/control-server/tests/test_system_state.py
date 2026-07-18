@@ -526,6 +526,80 @@ class TestUnderstandingState:
         assert caps["status"] == "impacted"
 
 
+class TestManualPurposeUnconfirmedItem:
+    """Issue #94/#275: understanding.purpose.manual_profile_unconfirmed --
+    a manual system_profile purpose awaiting confirmation against the
+    current AI/source-derived purpose view."""
+
+    def _create_ready_snapshot_with_ai_purpose(self, client, hdrs, sys, tmp_path, *, name="AI purpose"):
+        repo, sha = _init_git_repo(tmp_path)
+        client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+        snapshot_id = snap.json()["id"]
+        run_id = _insert_intelligence_run(sys["id"], snapshot_id, "capability_hierarchy", "completed")
+        _insert_capability_node(sys["id"], snapshot_id, run_id, node_type="purpose", name=name)
+        return snapshot_id
+
+    def test_appears_when_manual_and_ai_purpose_both_exist_unconfirmed(self, admin_client, tmp_path):
+        _, sys, hdrs = _setup(admin_client)
+        snapshot_id = self._create_ready_snapshot_with_ai_purpose(admin_client, hdrs, sys, tmp_path)
+        admin_client.put("/system-profile", json={"purpose": "Manual purpose."}, headers=hdrs)
+
+        _, items = _get_state(admin_client, hdrs)
+        item = items["understanding.purpose.manual_profile_unconfirmed"]
+        assert item["severity"] == "info"
+        assert item["status"] == "unconfirmed"
+        assert item["user_action_kind"] == "confirm"
+        assert item["intervention_timing"] == "optional"
+        assert item["evidence"]["snapshot_id"] == snapshot_id
+        assert item["evidence"]["ai_source"] == "capability_hierarchy"
+        assert item["target_ui"]["route"] == "/system-understanding"
+        assert item["target_ui"]["anchor"] == "purpose-views"
+        assert item["related_checks"] == ["system_purpose"]
+
+    def test_absent_when_only_manual_purpose_exists(self, admin_client, tmp_path):
+        _, sys, hdrs = _setup(admin_client)
+        repo, sha = _init_git_repo(tmp_path)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        admin_client.put("/system-profile", json={"purpose": "Manual purpose only."}, headers=hdrs)
+
+        _, items = _get_state(admin_client, hdrs)
+        assert "understanding.purpose.manual_profile_unconfirmed" not in items
+
+    def test_absent_when_only_ai_purpose_exists(self, admin_client, tmp_path):
+        _, sys, hdrs = _setup(admin_client)
+        self._create_ready_snapshot_with_ai_purpose(admin_client, hdrs, sys, tmp_path)
+
+        _, items = _get_state(admin_client, hdrs)
+        assert "understanding.purpose.manual_profile_unconfirmed" not in items
+
+    def test_disappears_after_confirmation(self, admin_client, tmp_path):
+        _, sys, hdrs = _setup(admin_client)
+        self._create_ready_snapshot_with_ai_purpose(admin_client, hdrs, sys, tmp_path)
+        admin_client.put("/system-profile", json={"purpose": "Manual purpose."}, headers=hdrs)
+
+        _, items_before = _get_state(admin_client, hdrs)
+        assert "understanding.purpose.manual_profile_unconfirmed" in items_before
+
+        confirm = admin_client.post(
+            "/repository/system-understanding/purpose-confirmation", json={}, headers=hdrs
+        )
+        assert confirm.status_code == 201, confirm.text
+
+        _, items_after = _get_state(admin_client, hdrs)
+        assert "understanding.purpose.manual_profile_unconfirmed" not in items_after
+
+
 class TestPipelineState:
     def test_head_ahead_of_snapshot_is_canonical_repository_state(self, admin_client, tmp_path):
         _, _, hdrs = _setup(admin_client)

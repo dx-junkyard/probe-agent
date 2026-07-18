@@ -242,6 +242,34 @@ fallback for intelligence work.
   `SystemUnderstandingOut.success_summary`, `user_phase` labels, gap
   actions) and keeps its local label maps only as a last-resort fallback.
 
+## Manual System Profile alignment (issue #275, formerly #94)
+
+- `GET /repository/system-understanding` returns `purpose_views` (parallel
+  provenance views) alongside the unchanged legacy `purpose` field: the
+  manual `system_profile` view (`source: system_profile`,
+  `provenance_kind: manual`) is snapshot-independent and present whenever
+  the profile's purpose is non-empty; the AI/source view follows
+  `_load_purpose`'s existing hierarchy-node → draft order and appears only
+  with a ready snapshot. Do not change the legacy `purpose` fallback chain.
+- `POST /repository/system-understanding/purpose-confirmation` records the
+  human's cross-check as an append-only `system_purpose_confirmations` row
+  (`decision_method: manual`, both sides captured verbatim, System-scoped).
+  409 on missing/mismatched snapshot, 422 when either side is absent.
+  Never UPDATE/DELETE confirmation rows.
+- Staleness of the latest confirmation is read-time structural equality
+  only (`snapshot_changed` → `profile_updated` → `ai_updated`); no
+  similarity scoring or heuristic match/mismatch judgement (Principle 6) —
+  interpreting the difference is the human's job.
+- The unconfirmed pairing surfaces as StateItem
+  `understanding.purpose.manual_profile_unconfirmed` (info,
+  `user_action_kind: confirm`, anchor `purpose-views`, display route
+  `/system-understanding`); it disappears once a valid confirmation
+  exists. Copy lives in `state_messages.py`.
+- Shared readers (profile row, AI purpose view, latest confirmation,
+  staleness) live in `state_facts.py` and are consumed by both
+  `system_understanding_service` and `system_state` — do not duplicate
+  the queries.
+
 ## System settings diagnostics (issue #101)
 
 - `GET /system-diagnostics` (`app/system_diagnostics.py`, `routes/diagnostics.py`)

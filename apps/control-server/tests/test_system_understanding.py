@@ -1469,3 +1469,302 @@ class TestIssue236FactsExtractionRegression:
         assert "understanding.capabilities.satisfied" in state_ids
         assert not any(s.startswith("pipeline.symbol_index.") for s in state_ids)
         assert not any(s.startswith("pipeline.capability_hierarchy.") for s in state_ids)
+
+
+class TestPurposeConfirmation:
+    """Issue #94/#275: the manual ``system_profile`` purpose surfaced as a
+    parallel provenance view next to the AI/source-derived purpose
+    (``purpose_views``), plus the human "confirmed" record reconciling them
+    (``purpose_confirmation`` / ``POST
+    /repository/system-understanding/purpose-confirmation``).
+    """
+
+    def _insert_capability_hierarchy_run(self, system_id, snapshot_id):
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO intelligence_runs
+                       (system_id, snapshot_id, run_type, provider, model,
+                        prompt_version, schema_version, decision_method,
+                        status, is_mock, started_at, completed_at)
+                   VALUES (?, ?, 'capability_hierarchy', 'deterministic', 'none',
+                           'v1', 'v1', 'deterministic', 'completed', 0, 0, 0)""",
+                (system_id, snapshot_id),
+            )
+            return cur.lastrowid
+
+    def _insert_ai_purpose(
+        self, system_id, snapshot_id, *, name="AI System", summary="AI-derived purpose."
+    ):
+        from app.db import get_conn
+
+        run_id = self._insert_capability_hierarchy_run(system_id, snapshot_id)
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO capability_hierarchy_nodes
+                       (system_id, snapshot_id, intelligence_run_id, node_type, name, summary, created_at)
+                   VALUES (?, ?, ?, 'purpose', ?, ?, 0)""",
+                (system_id, snapshot_id, run_id, name, summary),
+            )
+        return run_id
+
+    def _create_ready_snapshot(self, client, hdrs, tmp_path):
+        repo, sha = _init_git_repo(tmp_path)
+        client.put(
+            "/repository",
+            json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+            headers=hdrs,
+        )
+        snap = client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+        assert snap.status_code == 201, snap.text
+        return snap.json()["id"]
+
+    def test_manual_only_purpose_view_without_snapshot(self, admin_client):
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "pc-manual-only")
+        hdrs = _headers(token, sys["id"])
+
+        admin_client.put(
+            "/system-profile",
+            json={"name": "My System", "purpose": "Serve customers."},
+            headers=hdrs,
+        )
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["snapshot_id"] is None
+        # `purpose` keeps its exact pre-existing semantics: null without a
+        # ready snapshot, regardless of the manual view.
+        assert data["purpose"] is None
+        assert len(data["purpose_views"]) == 1
+        view = data["purpose_views"][0]
+        assert view["source"] == "system_profile"
+        assert view["provenance_kind"] == "manual"
+        assert view["name"] == "My System"
+        assert view["summary"] == "Serve customers."
+        assert view["updated_at"] is not None
+        assert data["purpose_confirmation"] is None
+
+    def test_ai_only_purpose_view(self, admin_client, tmp_path):
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "pc-ai-only")
+        hdrs = _headers(token, sys["id"])
+        system_id = sys["id"]
+
+        snapshot_id = self._create_ready_snapshot(admin_client, hdrs, tmp_path)
+        self._insert_ai_purpose(system_id, snapshot_id, name="AI System", summary="AI-derived purpose.")
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert len(data["purpose_views"]) == 1
+        view = data["purpose_views"][0]
+        assert view["source"] == "capability_hierarchy"
+        assert view["name"] == "AI System"
+        assert view["updated_at"] is None
+
+    def test_both_purpose_views_manual_first(self, admin_client, tmp_path):
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "pc-both")
+        hdrs = _headers(token, sys["id"])
+        system_id = sys["id"]
+
+        admin_client.put(
+            "/system-profile",
+            json={"name": "Manual Name", "purpose": "Manual purpose text."},
+            headers=hdrs,
+        )
+        snapshot_id = self._create_ready_snapshot(admin_client, hdrs, tmp_path)
+        self._insert_ai_purpose(system_id, snapshot_id)
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert [v["source"] for v in data["purpose_views"]] == [
+            "system_profile", "capability_hierarchy",
+        ]
+        assert data["purpose_confirmation"] is None
+
+    def test_confirmation_happy_path(self, admin_client, tmp_path):
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "pc-confirm")
+        hdrs = _headers(token, sys["id"])
+        system_id = sys["id"]
+
+        admin_client.put(
+            "/system-profile", json={"purpose": "Manual purpose text."}, headers=hdrs
+        )
+        snapshot_id = self._create_ready_snapshot(admin_client, hdrs, tmp_path)
+        self._insert_ai_purpose(system_id, snapshot_id, name="AI System", summary="AI-derived purpose.")
+
+        r = admin_client.post(
+            "/repository/system-understanding/purpose-confirmation", json={}, headers=hdrs
+        )
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["decision_method"] == "manual"
+        assert body["manual_purpose"] == "Manual purpose text."
+        assert body["ai_purpose_name"] == "AI System"
+        assert body["ai_purpose_summary"] == "AI-derived purpose."
+        assert body["ai_source"] == "capability_hierarchy"
+        assert body["snapshot_id"] == snapshot_id
+        assert body["stale"] is False
+        assert body["stale_reason"] is None
+
+        get_r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        conf = get_r.json()["purpose_confirmation"]
+        assert conf["id"] == body["id"]
+        assert conf["stale"] is False
+        assert conf["stale_reason"] is None
+
+        # The unconfirmed StateItem is gone now that a valid confirmation exists.
+        state_r = admin_client.get("/system-state", headers=hdrs)
+        state_ids = {i["state_id"] for i in state_r.json()["items"]}
+        assert "understanding.purpose.manual_profile_unconfirmed" not in state_ids
+
+    def test_confirmation_409_without_ready_snapshot(self, admin_client):
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "pc-409-no-snap")
+        hdrs = _headers(token, sys["id"])
+
+        admin_client.put("/system-profile", json={"purpose": "Manual purpose."}, headers=hdrs)
+        r = admin_client.post(
+            "/repository/system-understanding/purpose-confirmation", json={}, headers=hdrs
+        )
+        assert r.status_code == 409
+
+    def test_confirmation_409_stale_snapshot_id(self, admin_client, tmp_path):
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "pc-409-stale-snap")
+        hdrs = _headers(token, sys["id"])
+        system_id = sys["id"]
+
+        admin_client.put("/system-profile", json={"purpose": "Manual purpose."}, headers=hdrs)
+        snapshot_id = self._create_ready_snapshot(admin_client, hdrs, tmp_path)
+        self._insert_ai_purpose(system_id, snapshot_id)
+
+        r = admin_client.post(
+            "/repository/system-understanding/purpose-confirmation",
+            json={"snapshot_id": snapshot_id + 999},
+            headers=hdrs,
+        )
+        assert r.status_code == 409
+
+    def test_confirmation_422_missing_manual_side(self, admin_client, tmp_path):
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "pc-422-no-manual")
+        hdrs = _headers(token, sys["id"])
+        system_id = sys["id"]
+
+        snapshot_id = self._create_ready_snapshot(admin_client, hdrs, tmp_path)
+        self._insert_ai_purpose(system_id, snapshot_id)
+
+        r = admin_client.post(
+            "/repository/system-understanding/purpose-confirmation", json={}, headers=hdrs
+        )
+        assert r.status_code == 422
+
+    def test_confirmation_422_missing_ai_side(self, admin_client, tmp_path):
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "pc-422-no-ai")
+        hdrs = _headers(token, sys["id"])
+
+        admin_client.put("/system-profile", json={"purpose": "Manual purpose."}, headers=hdrs)
+        self._create_ready_snapshot(admin_client, hdrs, tmp_path)
+
+        r = admin_client.post(
+            "/repository/system-understanding/purpose-confirmation", json={}, headers=hdrs
+        )
+        assert r.status_code == 422
+
+    def test_confirmation_append_only_second_confirmation(self, admin_client, tmp_path):
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "pc-append-only")
+        hdrs = _headers(token, sys["id"])
+        system_id = sys["id"]
+
+        admin_client.put("/system-profile", json={"purpose": "Manual purpose v1."}, headers=hdrs)
+        snapshot_id = self._create_ready_snapshot(admin_client, hdrs, tmp_path)
+        self._insert_ai_purpose(system_id, snapshot_id)
+
+        r1 = admin_client.post(
+            "/repository/system-understanding/purpose-confirmation", json={}, headers=hdrs
+        )
+        assert r1.status_code == 201, r1.text
+
+        r2 = admin_client.post(
+            "/repository/system-understanding/purpose-confirmation",
+            json={"note": "second confirmation"},
+            headers=hdrs,
+        )
+        assert r2.status_code == 201, r2.text
+        assert r2.json()["id"] != r1.json()["id"]
+
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM system_purpose_confirmations WHERE system_id = ?",
+                (system_id,),
+            ).fetchone()[0]
+        assert count == 2
+
+        get_r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        assert get_r.json()["purpose_confirmation"]["id"] == r2.json()["id"]
+
+    def test_staleness_profile_updated_after_put(self, admin_client, tmp_path):
+        token = _login(admin_client)
+        sys = _create_system(admin_client, token, "pc-stale-profile")
+        hdrs = _headers(token, sys["id"])
+        system_id = sys["id"]
+
+        admin_client.put("/system-profile", json={"purpose": "Original purpose."}, headers=hdrs)
+        snapshot_id = self._create_ready_snapshot(admin_client, hdrs, tmp_path)
+        self._insert_ai_purpose(system_id, snapshot_id)
+
+        confirm = admin_client.post(
+            "/repository/system-understanding/purpose-confirmation", json={}, headers=hdrs
+        )
+        assert confirm.status_code == 201, confirm.text
+
+        admin_client.put("/system-profile", json={"purpose": "Changed purpose."}, headers=hdrs)
+
+        r = admin_client.get("/repository/system-understanding", headers=hdrs)
+        conf = r.json()["purpose_confirmation"]
+        assert conf["stale"] is True
+        assert conf["stale_reason"] == "profile_updated"
+
+        # The unconfirmed StateItem reappears now that the confirmation is stale.
+        state_r = admin_client.get("/system-state", headers=hdrs)
+        state_ids = {i["state_id"] for i in state_r.json()["items"]}
+        assert "understanding.purpose.manual_profile_unconfirmed" in state_ids
+
+    def test_system_isolation(self, admin_client, tmp_path):
+        token = _login(admin_client)
+        sys_a = _create_system(admin_client, token, "pc-iso-a")
+        sys_b = _create_system(admin_client, token, "pc-iso-b")
+        hdrs_a = _headers(token, sys_a["id"])
+        hdrs_b = _headers(token, sys_b["id"])
+
+        admin_client.put("/system-profile", json={"purpose": "System A purpose."}, headers=hdrs_a)
+        snapshot_id = self._create_ready_snapshot(admin_client, hdrs_a, tmp_path)
+        self._insert_ai_purpose(sys_a["id"], snapshot_id)
+        confirm = admin_client.post(
+            "/repository/system-understanding/purpose-confirmation", json={}, headers=hdrs_a
+        )
+        assert confirm.status_code == 201, confirm.text
+
+        r_b = admin_client.get("/repository/system-understanding", headers=hdrs_b)
+        assert r_b.status_code == 200, r_b.text
+        data_b = r_b.json()
+        assert data_b["purpose_views"] == []
+        assert data_b["purpose_confirmation"] is None
+
+        # System B has no ready snapshot of its own, so confirming there
+        # still 409s -- system A's snapshot/confirmation are invisible to it.
+        confirm_b = admin_client.post(
+            "/repository/system-understanding/purpose-confirmation", json={}, headers=hdrs_b
+        )
+        assert confirm_b.status_code == 409

@@ -2299,6 +2299,31 @@ CREATE INDEX IF NOT EXISTS idx_candidate_messages_session
     ON candidate_messages (session_id, id);
 CREATE INDEX IF NOT EXISTS idx_candidate_messages_system
     ON candidate_messages (system_id, session_id);
+
+-- Issue #94/#275: append-only audit of human "confirmed" decisions
+-- reconciling the manual system_profile purpose against the AI/source-
+-- derived purpose view. Never UPDATE/DELETE a row; the latest row per
+-- system is the current confirmation, and staleness is computed at read
+-- time by comparing the stored snapshot/manual/ai values against the
+-- current ones (see state_facts.purpose_confirmation_staleness).
+CREATE TABLE IF NOT EXISTS system_purpose_confirmations (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    snapshot_id         INTEGER NOT NULL,
+    manual_purpose      TEXT NOT NULL,
+    manual_profile_name TEXT,
+    ai_purpose_name     TEXT,
+    ai_purpose_summary  TEXT,
+    ai_source           TEXT,
+    ai_provenance_kind  TEXT,
+    note                TEXT,
+    decision_method     TEXT NOT NULL DEFAULT 'manual',
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_system_purpose_confirmations_system
+    ON system_purpose_confirmations (system_id, id DESC);
 """
 
 
