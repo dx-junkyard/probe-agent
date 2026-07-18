@@ -1877,15 +1877,20 @@ export interface EvaluationResult {
   created_at: string;
 }
 
+// Issue #94/#275: corrected to match the actual GET/PUT /system-profile
+// contract (`app/models.py`'s `SystemProfile`/`SystemProfileUpdate`), where
+// target_users/constraints/success_criteria are string arrays. This type was
+// previously out of sync (typed as plain strings); left unused elsewhere in
+// the dashboard prior to this issue.
 export interface SystemProfile {
   name: string;
   purpose: string;
-  target_users: string;
+  target_users: string[];
   stakeholder_value: string;
-  constraints: string;
-  success_criteria: string;
-  created_at: string;
-  updated_at: string;
+  constraints: string[];
+  success_criteria: string[];
+  created_at?: number | null;
+  updated_at?: number | null;
 }
 
 // --- Decision Workspace (Issues #35-#37) ------------------------------------
@@ -2064,6 +2069,49 @@ export interface SystemUnderstandingPurpose {
   provenance_kind?: string | null;
 }
 
+// Issue #94/#275: side-by-side human vs AI/source-derived System Purpose.
+// `system_profile` (provenance_kind "manual") is present whenever the human
+// profile has a purpose, even with no snapshot; the AI view
+// (capability_hierarchy or system_profile_draft) is present only when a
+// ready snapshot has one.
+export type SystemUnderstandingPurposeViewSource =
+  | "system_profile"
+  | "capability_hierarchy"
+  | "system_profile_draft";
+
+export interface SystemUnderstandingPurposeView {
+  source: SystemUnderstandingPurposeViewSource;
+  provenance_kind: string;
+  name: string;
+  summary?: string | null;
+  updated_at?: number | null;
+}
+
+export type PurposeConfirmationStaleReason =
+  | "profile_updated"
+  | "snapshot_changed"
+  | "ai_updated";
+
+export interface PurposeConfirmationOut {
+  id: number;
+  snapshot_id: number;
+  decision_method: string;
+  manual_purpose: string;
+  ai_purpose_name?: string | null;
+  ai_purpose_summary?: string | null;
+  ai_source?: string | null;
+  ai_provenance_kind?: string | null;
+  note?: string | null;
+  created_at: number;
+  stale: boolean;
+  stale_reason?: PurposeConfirmationStaleReason | null;
+}
+
+export interface PurposeConfirmationRequest {
+  snapshot_id?: number;
+  note?: string;
+}
+
 export interface SystemUnderstandingGapNextAction {
   action: string;
   link?: string | null;
@@ -2215,6 +2263,15 @@ export interface SystemUnderstandingOut {
   // pipeline is complete (null/absent otherwise). Optional for backward
   // compat with fixtures that predate it.
   success_summary?: string | null;
+  // Issue #94/#275: human (system_profile) and AI/source-derived
+  // (capability_hierarchy or system_profile_draft) purpose views shown side
+  // by side. Optional for backward compat with fixtures/mocks that predate
+  // this field.
+  purpose_views?: SystemUnderstandingPurposeView[];
+  // Issue #94/#275: the latest human confirmation that the manual and
+  // AI/source-derived purposes were checked against each other, or null if
+  // none has been recorded yet. Optional for backward compat.
+  purpose_confirmation?: PurposeConfirmationOut | null;
 }
 
 // Capability context: gaps / probe plans / experiments linked to one

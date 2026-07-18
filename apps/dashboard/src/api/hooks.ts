@@ -29,6 +29,8 @@ import type {
   UnderstandingRevisionListOut, UnderstandingDiffOut,
   SystemUnderstandingOut,
   SystemUnderstandingBuildOut,
+  PurposeConfirmationOut,
+  PurposeConfirmationRequest,
   IssueDraft,
   IssueDraftCreateRequest,
   GitHubIssueStatus,
@@ -278,6 +280,30 @@ export function useSystemProfile() {
     queryKey: sysKey("system-profile"),
     queryFn: () => api.get<SystemProfile>("/system-profile"),
     enabled: !!getSystemId(),
+  });
+}
+
+// Issue #94/#275: PUT replaces the whole profile, so callers must merge the
+// current profile (from useSystemProfile) with the one field they changed.
+// Invalidates system-profile, system-understanding (its purpose_views'
+// system_profile entry), and system-state (facts derived from the profile),
+// so the System Understanding page reflects the change without a reload.
+export function useUpdateSystemProfile() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: {
+      name: string;
+      purpose: string;
+      target_users: string[];
+      stakeholder_value: string;
+      constraints: string[];
+      success_criteria: string[];
+    }) => api.put<SystemProfile>("/system-profile", data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: sysKey("system-profile") });
+      qc.invalidateQueries({ queryKey: sysKey("system-understanding") });
+      qc.invalidateQueries({ queryKey: sysKey("system-state") });
+    },
   });
 }
 
@@ -1119,6 +1145,26 @@ export function useSystemUnderstanding() {
     queryKey: sysKey("system-understanding"),
     queryFn: () => api.get<SystemUnderstandingOut>("/repository/system-understanding"),
     enabled: !!getSystemId(),
+  });
+}
+
+// Issue #94/#275: records that a human checked the manual (System Profile)
+// and AI/source-derived purpose views against each other. Errors are 409
+// (no/stale snapshot) or 422 (either side missing) -- surfaced by the caller
+// via toast, not swallowed here. Invalidates system-understanding (so
+// purpose_confirmation reflects immediately) and system-state.
+export function useConfirmPurposeAlignment() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: PurposeConfirmationRequest) =>
+      api.post<PurposeConfirmationOut>(
+        "/repository/system-understanding/purpose-confirmation",
+        data,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: sysKey("system-understanding") });
+      qc.invalidateQueries({ queryKey: sysKey("system-state") });
+    },
   });
 }
 
