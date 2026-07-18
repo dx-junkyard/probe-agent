@@ -131,6 +131,8 @@ from ..models import (
     SystemProfileDraftOut,
     SystemUnderstandingBuildOut,
     SystemUnderstandingJobRetryIn,
+    SystemUnderstandingPurposeConfirmationCreate,
+    SystemUnderstandingPurposeConfirmationOut,
     ValidationCommandOut,
     ValidationRunOut,
 )
@@ -230,6 +232,107 @@ def get_system_understanding_endpoint(
     from ..system_understanding_service import get_system_understanding
     summary = get_system_understanding(system_id)
     return _system_understanding_to_out(summary)
+
+
+@router.post(
+    "/repository/system-understanding/purpose-confirmation",
+    response_model=SystemUnderstandingPurposeConfirmationOut,
+    status_code=201,
+)
+def create_purpose_confirmation_endpoint(
+    payload: SystemUnderstandingPurposeConfirmationCreate,
+    system_id: int = Depends(get_system_id),
+) -> SystemUnderstandingPurposeConfirmationOut:
+    """Record a human confirmation reconciling the manual system_profile
+    purpose against the current AI/source-derived purpose view (Issue
+    #94/#275).
+
+    probe-agent:
+      role: API boundary for confirming the manual vs AI System Purpose views
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: transformation
+      state_effects: [database-read, database-write]
+      probe_value: Verify a confirmation is refused (409) without a ready
+        snapshot or against a stale one, refused (422) without both a manual
+        and an AI purpose side, and otherwise persists an append-only,
+        decision_method=manual audit row capturing both sides verbatim.
+    """
+    from .. import state_facts
+    from ..system_understanding_service import _get_latest_ready_snapshot
+
+    with get_conn() as conn:
+        snapshot_row = _get_latest_ready_snapshot(conn, system_id)
+        if snapshot_row is None:
+            raise HTTPException(
+                status_code=409,
+                detail="No ready snapshot exists yet; create a snapshot before confirming System Purpose.",
+            )
+        snapshot_id = snapshot_row["id"]
+
+        if payload.snapshot_id is not None and payload.snapshot_id != snapshot_id:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Snapshot has changed since this purpose was displayed; "
+                    "refresh System Understanding and confirm again."
+                ),
+            )
+
+        profile_row = state_facts.get_system_profile_row(conn, system_id)
+        manual_purpose = profile_row["purpose"] if profile_row is not None else None
+        if not manual_purpose or not manual_purpose.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="Manual system_profile purpose is empty; set it via PUT /system-profile first.",
+            )
+
+        ai_view = state_facts.load_ai_purpose_view(conn, system_id, snapshot_id)
+        if ai_view is None:
+            raise HTTPException(
+                status_code=422,
+                detail="No AI/source-derived purpose view exists for this snapshot yet.",
+            )
+
+        now = time.time()
+        cur = conn.execute(
+            """
+            INSERT INTO system_purpose_confirmations
+                (system_id, snapshot_id, manual_purpose, manual_profile_name,
+                 ai_purpose_name, ai_purpose_summary, ai_source, ai_provenance_kind,
+                 note, decision_method, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?)
+            """,
+            (
+                system_id,
+                snapshot_id,
+                manual_purpose,
+                profile_row["name"],
+                ai_view["name"],
+                ai_view["summary"],
+                ai_view["source"],
+                ai_view["provenance_kind"],
+                payload.note,
+                now,
+            ),
+        )
+        confirmation_id = cur.lastrowid
+
+    return SystemUnderstandingPurposeConfirmationOut(
+        id=confirmation_id,
+        snapshot_id=snapshot_id,
+        decision_method="manual",
+        manual_purpose=manual_purpose,
+        ai_purpose_name=ai_view["name"],
+        ai_purpose_summary=ai_view["summary"],
+        ai_source=ai_view["source"],
+        ai_provenance_kind=ai_view["provenance_kind"],
+        note=payload.note,
+        created_at=now,
+        stale=False,
+        stale_reason=None,
+    )
 
 
 @router.post(
@@ -807,6 +910,8 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
         IssueDraftRefOut,
         SystemUnderstandingStageStatusOut,
         SystemUnderstandingGapTrendOut,
+        SystemUnderstandingPurposeViewOut,
+        SystemUnderstandingPurposeConfirmationOut,
     )
     pipeline = [
         SystemUnderstandingPipelineStepOut(
@@ -870,6 +975,14 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
         SystemUnderstandingGapTrendOut(gap_type=gt.gap_type, current=gt.current, previous=gt.previous)
         for gt in summary.gap_trend
     ]
+    purpose_views = [
+        SystemUnderstandingPurposeViewOut(**pv) for pv in summary.purpose_views
+    ]
+    purpose_confirmation = None
+    if summary.purpose_confirmation:
+        purpose_confirmation = SystemUnderstandingPurposeConfirmationOut(
+            **summary.purpose_confirmation
+        )
     return SystemUnderstandingOut(
         system_id=summary.system_id,
         snapshot_id=summary.snapshot_id,
@@ -885,6 +998,8 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
         stages=stages,
         gap_trend=gap_trend,
         success_summary=summary.success_summary,
+        purpose_views=purpose_views,
+        purpose_confirmation=purpose_confirmation,
     )
 
 

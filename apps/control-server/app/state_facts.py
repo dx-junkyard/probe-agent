@@ -76,6 +76,10 @@ __all__ = [
     "has_decided_experiment",
     "has_completed_replay_variant_run",
     "has_succeeded_publish_job",
+    "get_system_profile_row",
+    "load_ai_purpose_view",
+    "get_latest_purpose_confirmation",
+    "purpose_confirmation_staleness",
 ]
 
 
@@ -510,6 +514,106 @@ def has_completed_replay_variant_run(conn, system_id: int) -> bool:
         (system_id,),
     ).fetchone()
     return row is not None
+
+
+def get_system_profile_row(conn, system_id: int):
+    """Raw ``system_profile`` row for one system, or ``None`` if never set.
+
+    Backs the manual ``purpose_views`` entry on ``GET
+    /repository/system-understanding`` (Issue #94/#275) and the purpose-
+    confirmation create/staleness flow -- both read the same human-entered
+    ``PUT /system-profile`` record ``routes/evaluation.py`` writes.
+    """
+    return conn.execute(
+        "SELECT * FROM system_profile WHERE system_id = ?", (system_id,)
+    ).fetchone()
+
+
+def load_ai_purpose_view(conn, system_id: int, snapshot_id: int) -> Optional[Dict[str, Any]]:
+    """The AI/source-derived purpose view for one snapshot (Issue #94/#275).
+
+    Reproduces ``system_understanding_service._load_purpose``'s two-query
+    fallback chain byte-for-byte (capability_hierarchy purpose node, else the
+    latest system_profile_drafts row), with an added ``source`` key
+    (``"capability_hierarchy"`` | ``"system_profile_draft"``) so callers can
+    tell the two apart without re-deriving it from ``provenance_kind`` (which
+    can independently be ``"structural"`` on either source).
+    ``_load_purpose`` delegates to this and drops the ``source`` key to keep
+    its own public return shape unchanged.
+    """
+    node = conn.execute(
+        "SELECT * FROM capability_hierarchy_nodes "
+        "WHERE system_id = ? AND snapshot_id = ? AND node_type = 'purpose' LIMIT 1",
+        (system_id, snapshot_id),
+    ).fetchone()
+    if node:
+        return {
+            "source": "capability_hierarchy",
+            "name": node["name"],
+            "summary": node["summary"],
+            "provenance_kind": node["provenance_kind"],
+        }
+    draft = conn.execute(
+        "SELECT * FROM system_profile_drafts "
+        "WHERE system_id = ? AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
+        (system_id, snapshot_id),
+    ).fetchone()
+    if draft:
+        return {
+            "source": "system_profile_draft",
+            "name": draft["name"],
+            "summary": draft["purpose"],
+            "provenance_kind": "structural",
+        }
+    return None
+
+
+def get_latest_purpose_confirmation(conn, system_id: int):
+    """Most recent ``system_purpose_confirmations`` row for one system, or
+    ``None``. The table is append-only; the latest row is the current
+    confirmation (Issue #94/#275)."""
+    return conn.execute(
+        "SELECT * FROM system_purpose_confirmations WHERE system_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (system_id,),
+    ).fetchone()
+
+
+def purpose_confirmation_staleness(
+    conn, system_id: int, current_ready_snapshot_id: Optional[int]
+) -> Optional[str]:
+    """Staleness reason for the *latest* purpose confirmation, or ``None`` if
+    it is still valid (or there is no confirmation to evaluate).
+
+    Pure structural equality only (Principle 6), checked in this fixed order:
+
+    1. the confirmation's pinned ``snapshot_id`` no longer matches the
+       current latest ready snapshot id -> ``"snapshot_changed"``;
+    2. else the confirmation's stored ``manual_purpose`` no longer matches
+       the current ``system_profile.purpose`` text -> ``"profile_updated"``;
+    3. else the confirmation's stored AI name/summary no longer match the
+       current AI purpose view's name/summary -> ``"ai_updated"``;
+    4. else valid (``None``).
+    """
+    confirmation = get_latest_purpose_confirmation(conn, system_id)
+    if confirmation is None:
+        return None
+
+    if confirmation["snapshot_id"] != current_ready_snapshot_id:
+        return "snapshot_changed"
+
+    profile = get_system_profile_row(conn, system_id)
+    current_purpose = (profile["purpose"] or "") if profile is not None else ""
+    if (confirmation["manual_purpose"] or "") != current_purpose:
+        return "profile_updated"
+
+    ai_view = load_ai_purpose_view(conn, system_id, current_ready_snapshot_id)
+    ai_name = ai_view["name"] if ai_view else None
+    ai_summary = ai_view["summary"] if ai_view else None
+    if confirmation["ai_purpose_name"] != ai_name or confirmation["ai_purpose_summary"] != ai_summary:
+        return "ai_updated"
+
+    return None
 
 
 def has_succeeded_publish_job(conn, system_id: int) -> bool:

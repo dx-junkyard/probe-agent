@@ -154,6 +154,22 @@ UNDERSTANDING_MESSAGES: Dict[str, Dict[str, str]] = {
         "remediation": "Interview で Core Capabilities を定義・確認してください。",
         "action_label": "Interview でCore Capabilitiesを定義",
     },
+    # Issue #94/#275: the manually entered system_profile purpose (System
+    # Profile 画面で入力された purpose) awaits a human confirmation against
+    # the current AI/source-derived purpose view (capability_hierarchy or
+    # system_profile_drafts). {ai_source} is a finite raw source token
+    # ("capability_hierarchy" | "system_profile_draft"), never free text.
+    "understanding.purpose.manual_profile_unconfirmed": {
+        "summary": "System Profile の purpose が AI 由来の purpose とまだ確認されていません。",
+        "detail": (
+            "System Profile に入力された purpose と、{ai_source} から得られた"
+            "AI/ソース由来の purpose の両方が存在しますが、両者を突き合わせた"
+            "確認記録がまだありません。"
+        ),
+        "impact": "手動入力とAI/ソース由来の purpose のどちらを正とするか、開発者による判断がまだ記録されていません。",
+        "remediation": "System Understanding 画面で purpose を確認してください。",
+        "action_label": "purposeを確認",
+    },
 }
 
 

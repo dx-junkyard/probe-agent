@@ -3158,6 +3158,62 @@ class SystemUnderstandingPurposeOut(BaseModel):
     provenance_kind: Optional[str] = None
 
 
+# Issue #94/#275: the manual system_profile purpose surfaced as a parallel
+# provenance view next to the AI/source-derived purpose. `source` is a finite
+# set (Principle 6): "system_profile" is the human-entered PUT /system-profile
+# record; "capability_hierarchy" / "system_profile_draft" are the two
+# AI/structural sources `_load_purpose` already reads, kept distinguishable so
+# the Dashboard can label them separately.
+SystemUnderstandingPurposeViewSource = Literal[
+    "system_profile", "capability_hierarchy", "system_profile_draft"
+]
+
+
+class SystemUnderstandingPurposeViewOut(BaseModel):
+    source: SystemUnderstandingPurposeViewSource
+    provenance_kind: str
+    name: str
+    summary: Optional[str] = None
+    updated_at: Optional[float] = None
+
+
+# Finite stale reasons for a purpose confirmation, computed structurally at
+# read time (Principle 6): the manual/AI sides are compared against their
+# current persisted values, never inferred.
+SystemUnderstandingPurposeConfirmationStaleReason = Literal[
+    "profile_updated", "snapshot_changed", "ai_updated"
+]
+
+
+class SystemUnderstandingPurposeConfirmationOut(BaseModel):
+    id: int
+    snapshot_id: int
+    decision_method: str
+    manual_purpose: str
+    ai_purpose_name: Optional[str] = None
+    ai_purpose_summary: Optional[str] = None
+    ai_source: Optional[str] = None
+    ai_provenance_kind: Optional[str] = None
+    note: Optional[str] = None
+    created_at: float
+    stale: bool = False
+    stale_reason: Optional[SystemUnderstandingPurposeConfirmationStaleReason] = None
+
+
+class SystemUnderstandingPurposeConfirmationCreate(BaseModel):
+    """Record a human 'confirmed' decision between the manual system_profile
+    purpose and the current AI/source-derived purpose view.
+
+    `snapshot_id`, when provided, must match the latest ready snapshot (same
+    staleness pattern as `IssueDraftCreateRequest.snapshot_id`) so a
+    confirmation never embeds a snapshot that disagrees with the purpose
+    views the caller was looking at.
+    """
+
+    snapshot_id: Optional[int] = None
+    note: Optional[str] = Field(default=None, max_length=2000)
+
+
 class SystemUnderstandingGapNextActionOut(BaseModel):
     action: str
     link: Optional[str] = None
@@ -3265,6 +3321,15 @@ class SystemUnderstandingOut(BaseModel):
     # pipeline is complete (None otherwise); replaces the Dashboard's
     # client-assembled English success string.
     success_summary: Optional[str] = None
+    # Issue #94/#275: manual system_profile purpose surfaced as a parallel
+    # provenance view next to the AI/source-derived purpose (`purpose` above
+    # keeps its exact existing semantics unchanged). Manual view is
+    # snapshot-independent; the AI view is included only when a ready
+    # snapshot exists.
+    purpose_views: List[SystemUnderstandingPurposeViewOut] = Field(default_factory=list)
+    # The latest human "confirmed" record reconciling the manual and AI
+    # purpose views, or None if never confirmed.
+    purpose_confirmation: Optional[SystemUnderstandingPurposeConfirmationOut] = None
 
 
 class CapabilityContextProbePlanOut(BaseModel):

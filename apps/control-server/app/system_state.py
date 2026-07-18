@@ -170,6 +170,9 @@ ANCHOR_SNAPSHOT_CREATE = "snapshot-create"
 ANCHOR_BUILD = "build"
 ANCHOR_INTERVIEW_PURPOSE = "interview-purpose"
 ANCHOR_INTERVIEW_CAPABILITIES = "interview-capabilities"
+# Issue #94/#275: the parallel manual/AI System Purpose provenance views on
+# the System Understanding page.
+ANCHOR_PURPOSE_VIEWS = "purpose-views"
 
 DOC_PATH_SUFFIXES = (".md", ".mdx", ".rst", ".txt", ".adoc")
 DOC_PATH_MARKERS = ("readme", "architecture", "design", "spec", "docs/", "doc/")
@@ -706,6 +709,63 @@ def _understanding_state_item(status: UnderstandingStatus, *, purpose: bool) -> 
         ),
         display_routes=[PAGE_SYSTEM_UNDERSTANDING],
         related_checks=["system_purpose" if purpose else "system_capabilities"],
+    )
+
+
+def _purpose_manual_unconfirmed_item(
+    conn, system_id: int, snapshot_id: int
+) -> Optional[StateItem]:
+    """A human-entered ``system_profile`` purpose awaiting confirmation
+    against the current AI/source-derived purpose view (Issue #94/#275).
+
+    Emitted only when all of: a manual purpose is set, an AI purpose view
+    exists for the current snapshot, and there is no valid (non-stale)
+    confirmation reconciling the two. Once a confirmation is created and
+    stays valid (not stale), this item disappears -- it reappears if the
+    manual purpose, the snapshot, or the AI view later changes
+    (``state_facts.purpose_confirmation_staleness``).
+    """
+    profile = state_facts.get_system_profile_row(conn, system_id)
+    manual_purpose = (profile["purpose"] or "").strip() if profile is not None else ""
+    if not manual_purpose:
+        return None
+
+    ai_view = state_facts.load_ai_purpose_view(conn, system_id, snapshot_id)
+    if ai_view is None:
+        return None
+
+    confirmation = state_facts.get_latest_purpose_confirmation(conn, system_id)
+    if confirmation is not None:
+        stale_reason = state_facts.purpose_confirmation_staleness(conn, system_id, snapshot_id)
+        if stale_reason is None:
+            return None
+
+    state_id = "understanding.purpose.manual_profile_unconfirmed"
+    msg = state_messages.understanding_message(state_id)
+    return StateItem(
+        state_id=state_id,
+        state_group="understanding",
+        severity="info",
+        status="unconfirmed",
+        user_action_kind="confirm",
+        intervention_timing="optional",
+        subject="System Purpose",
+        summary=msg["summary"],
+        detail=msg["detail"].format(ai_source=ai_view["source"]),
+        impact=msg["impact"],
+        remediation=msg["remediation"],
+        evidence={
+            "snapshot_id": snapshot_id,
+            "ai_source": ai_view["source"],
+            "manual_updated_at": profile["updated_at"] if profile is not None else None,
+        },
+        target_ui=TargetUi(
+            route=PAGE_SYSTEM_UNDERSTANDING,
+            anchor=ANCHOR_PURPOSE_VIEWS,
+            action_label=msg["action_label"],
+        ),
+        display_routes=[PAGE_SYSTEM_UNDERSTANDING],
+        related_checks=["system_purpose"],
     )
 
 
@@ -1642,6 +1702,10 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
             items.append(_understanding_state_item(capabilities_status, purpose=False))
             purpose_satisfied = purpose_status.kind in ("satisfied_current", "baseline_reusable")
             capabilities_satisfied = capabilities_status.kind in ("satisfied_current", "baseline_reusable")
+
+            manual_purpose_item = _purpose_manual_unconfirmed_item(conn, system_id, snapshot_id)
+            if manual_purpose_item:
+                items.append(manual_purpose_item)
 
             symbol = _run_not_run_item(
                 conn, system_id, snapshot_id,
