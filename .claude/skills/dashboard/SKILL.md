@@ -293,6 +293,29 @@ The dashboard should support:
   human-wait state, matching the System Understanding build-job polling
   pattern.
 
+## System Purpose alignment view (issue #275, formerly #94)
+
+- The System Understanding page's purpose section renders
+  `purpose_views` from `GET /repository/system-understanding` as
+  side-by-side cards — 「人の認識(System Profile)」 (`provenance_kind:
+  manual`, snapshot-independent) and 「AI/ソース由来の理解」 — with the
+  provenance badge pattern reused as-is. Do not render the legacy single
+  `purpose` field in this section; it stays for other consumers.
+- When the manual side is empty, the section offers inline purpose entry
+  via the existing `PUT /system-profile` (merge the current profile from
+  `useSystemProfile()` and change only the purpose; never clobber other
+  fields). On success invalidate the system-understanding, system-profile,
+  and system-state queries so the view updates without a reload.
+- When both sides exist, the 「一致を確認した」 action posts
+  `POST /repository/system-understanding/purpose-confirmation`; a valid
+  confirmation renders as 確認済み + timestamp, and `stale_reason`
+  (`profile_updated` / `snapshot_changed` / `ai_updated`) maps to fixed
+  Japanese notes. The client never judges match/mismatch itself — it only
+  records the human's confirmation.
+- The section carries anchor id `purpose-views` so the
+  `understanding.purpose.manual_profile_unconfirmed` StateItem's
+  `target_ui` deep link resolves.
+
 ## UI Language Convention (Issue #266)
 
 Dashboard-side hardcoded UI copy follows the same Japanese-canonical
