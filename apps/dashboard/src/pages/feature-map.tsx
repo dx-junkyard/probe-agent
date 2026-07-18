@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { useLatestDrafts, useGenerateDrafts, useCodeLinks, useGenerateCodeLinks, useReviewCodeLink, useCapabilityHierarchy } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
@@ -21,15 +21,8 @@ export default function FeatureMapPage() {
   const reviewLink = useReviewCodeLink();
   const { data: hierarchy } = useCapabilityHierarchy();
   const [searchParams] = useSearchParams();
-  const [highlightedFeature, setHighlightedFeature] = useState<string | null>(null);
+  const highlightedFeature = searchParams.get("feature");
   const highlightRef = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => {
-    const featureParam = searchParams.get("feature");
-    if (featureParam) {
-      setHighlightedFeature(featureParam);
-    }
-  }, [searchParams]);
 
   useEffect(() => {
     if (highlightedFeature && highlightRef.current) {

@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import {
   useComponents, useSystemState, useConnectivityStatus,
@@ -79,7 +80,7 @@ export default function OverviewPage() {
   const { data: latestSnapshot } = useLatestSnapshot();
   const { data: latestDrafts } = useLatestDrafts();
   const { data: myTokens } = useMyTokens();
-  const now = Date.now();
+  const [now] = useState(() => Date.now());
   const hasActiveSdkToken = (myTokens ?? []).some((t) =>
     t.kind === "api" &&
     !t.revoked &&

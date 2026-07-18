@@ -108,6 +108,12 @@ PROBE_SERVER_URL=http://localhost:8000 python main.py
 開発サーバーは `http://localhost:5173` で起動する。Vite の proxy 設定により
 `/api` へのリクエストは自動的に Control Server (`http://localhost:8000`) へ転送される。
 
+テストは venv を activate した状態（venv の `bin` が PATH にある状態）で
+`python -m pytest apps/control-server/tests packages/python-probe/tests` を実行する。
+実験ワークスペースのコマンドはサーバープロセスの PATH から `python` を解決するため、
+venv 非アクティブだと test_experiments が失敗する。CI（`.github/workflows/ci.yml`）も
+同じ前提で実行している。
+
 Dashboard で `summarizer` / `classifier` の mode を `shadow` に切り替えてから
 サンプルを再実行すると、候補実装との比較結果が確認できる。
 

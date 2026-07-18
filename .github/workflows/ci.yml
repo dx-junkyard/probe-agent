@@ -1,0 +1,49 @@
+# Issue #98: PR ごとにバックエンドテスト・Dashboard build/lint/test・
+# dogfooding smoke(tests/test_dogfooding_smoke.py, mock LLM の決定的経路のみ)
+# を自動実行する。デプロイは行わない(mvp.md の非目標「CI/CD 連携」はデプロイの
+# 話であり、テスト実行の CI はこれに反しない)。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install packages (venv on PATH)
+        # 実験ワークスペースはサーバープロセスの PATH から `python` を解決する
+        # ため、venv の bin を PATH に載せた状態で pytest を起動する(README 参照)。
+        run: |
+          python -m venv .venv
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+          .venv/bin/pip install -e "apps/control-server[dev]" -e "packages/python-probe[dev]"
+      - name: Control Server tests (incl. dogfooding smoke)
+        run: python -m pytest apps/control-server/tests -q
+        env:
+          LLM_PROVIDER: mock
+      - name: Probe SDK tests
+        run: python -m pytest packages/python-probe/tests -q
+
+  dashboard:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/dashboard/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+      - run: npm run test
