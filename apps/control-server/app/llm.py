@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
+from .llm_secret_redaction import redact_messages
+
 
 Message = Dict[str, str]
 
@@ -125,6 +127,20 @@ class LLMClient(ABC):
 
 class LLMError(RuntimeError):
     pass
+
+
+class LLMResourceLimitError(RuntimeError):
+    code = "llm_resource_limit_error"
+
+
+class LLMQuotaExceeded(LLMResourceLimitError):
+    """The current System exhausted its durable daily LLM allowance."""
+
+    code = "llm_daily_limit_exceeded"
+
+
+class LLMSystemContextMissing(LLMResourceLimitError):
+    code = "llm_system_context_required"
 
 
 def is_reasoning_model(provider: str, model: str) -> bool:
@@ -377,6 +393,63 @@ class MockLLMClient(LLMClient):
         )
 
 
+class _QuotaLLMClient(LLMClient):
+    """Consume the current request/job System quota immediately before a call."""
+
+    def __init__(self, delegate: LLMClient):
+        self._delegate = delegate
+
+    def generate_text(
+        self,
+        messages: List[Message],
+        *,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        _consume_current_system_quota()
+        return self._delegate.generate_text(
+            redact_messages(messages),
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+
+class _QuotaMockLLMClient(MockLLMClient):
+    """Mock-preserving wrapper so existing isinstance audit logic stays valid."""
+
+    def generate_text(
+        self,
+        messages: List[Message],
+        *,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        _consume_current_system_quota()
+        return super().generate_text(
+            redact_messages(messages),
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+
+def _consume_current_system_quota() -> None:
+    from .resource_limits import (
+        ResourceLimitExceeded,
+        consume_llm_execution,
+        current_system_id,
+    )
+
+    system_id = current_system_id()
+    if system_id is None:
+        raise LLMSystemContextMissing(
+            "A System quota context is required before every LLM execution"
+        )
+    try:
+        consume_llm_execution(system_id)
+    except ResourceLimitExceeded as exc:
+        raise LLMQuotaExceeded(str(exc)) from exc
+
+
 @lru_cache(maxsize=1)
 def get_llm_client() -> LLMClient:
     config = LLMConfig.from_env()
@@ -385,9 +458,9 @@ def get_llm_client() -> LLMClient:
 
 def create_llm_client(config: LLMConfig) -> LLMClient:
     if config.provider == "mock":
-        return MockLLMClient()
+        return _QuotaMockLLMClient()
     if config.provider == "anthropic":
-        return AnthropicClient(config)
+        return _QuotaLLMClient(AnthropicClient(config))
     if config.provider == "gemini":
-        return GeminiClient(config)
-    return OpenAIChatClient(config)
+        return _QuotaLLMClient(GeminiClient(config))
+    return _QuotaLLMClient(OpenAIChatClient(config))

@@ -383,6 +383,13 @@ STATE_MESSAGES: Dict[str, Dict[str, str]] = {
         "remediation": "System Understanding で Build / Refresh を実行してください。",
         "action_label": "Build / Refresh を実行",
     },
+    "understanding.gaps.open": {
+        "summary": "未判断の Docs-code gap が {open_count} 件あります。",
+        "detail": "検出 {total_count} 件のうち {triaged_count} 件は判断済みとして worklist の既定表示と集計から除外されています。",
+        "impact": "未判断の差異だけを確認対象として扱えます。",
+        "remediation": "Gap worklist で内容を確認し、acknowledged から dismissed / resolved へ明示的に triage してください。",
+        "action_label": "Gap worklist を確認",
+    },
     "runtime.connectivity.no_signal": {
         "summary": "SDK からのトレースをまだ受信していません。",
         "detail_blocking": "このシステムでは probe SDK からのトレースを一度も受信していません。承認済みの probe plan もまだありません。",
@@ -437,6 +444,20 @@ STATE_MESSAGES: Dict[str, Dict[str, str]] = {
         "detail": "HEAD {current_head} は最新 ready snapshot #{snapshot_id} ({commit_sha}) と異なります。",
         "remediation": "Repository で新しい snapshot を作成してください。",
         "action_label": "Snapshot を作成",
+    },
+    "repository.resync.capabilities_stale": {
+        "summary": "{count} 件の Capability が古い snapshot を参照しています。",
+        "detail": "Repository refresh は snapshot #{snapshot_id} の symbol index まで完了しましたが、Capability Map は以前の snapshot を基準にしています。",
+        "impact": "Capability Map と System Understanding に最新コードの変更がまだ反映されていません。",
+        "remediation": "Capability Map を確認し、System Understanding の Build / Refresh を実行してください。",
+        "action_label": "Build / Refresh を実行",
+    },
+    "runtime.trace_storage.quota_exceeded": {
+        "summary": "Trace ストレージ上限に達したため取り込みを拒否しました。",
+        "detail": "この System は {rows} 行・概算 {bytes} bytes の Trace を保持しています。直近の拒否理由: {reason}",
+        "impact": "新しい Trace は保存されず、観測結果が欠落します。",
+        "remediation": "保存期間と容量計画を確認し、古い Trace を安全に削除した後で System 上限を見直してください。",
+        "action_label": "Trace を確認",
     },
     "repository.working_tree.dirty": {
         "summary": "未コミット差分があります。",

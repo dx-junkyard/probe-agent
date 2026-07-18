@@ -28,7 +28,7 @@ def admin_client(tmp_path, monkeypatch):
 def _login(client):
     r = client.post("/auth/login", json={"username": "root", "password": "s3cret"})
     assert r.status_code == 200, r.text
-    return r.json()["access_token"]
+    return r.cookies.get("probe_session")
 
 
 def _headers(token, system_id):
@@ -93,6 +93,8 @@ def test_status_unconfigured(admin_client):
     body = r.json()
     assert body["configured"] is False
     assert body["latest_snapshot"] is None
+    assert body["head_relation"] == "unknown"
+    assert body["commits_behind"] is None
 
 
 def test_status_head_and_snapshot_fresh(admin_client, git_repo):
@@ -109,6 +111,8 @@ def test_status_head_and_snapshot_fresh(admin_client, git_repo):
     assert body["current_head"] == snap["commit_sha"]
     assert body["working_tree_dirty"] is False
     assert body["snapshot_stale"] is False
+    assert body["head_relation"] == "same"
+    assert body["commits_behind"] == 0
     assert body["latest_snapshot"]["commit_sha"] == snap["commit_sha"]
     # No index yet -> symbols_stale until Index Symbols runs.
     assert body["symbols_stale"] is True
@@ -129,7 +133,56 @@ def test_status_stale_after_new_commit(admin_client, git_repo):
     body = r.json()
     assert body["current_head"] == new_head
     assert body["snapshot_stale"] is True
+    assert body["head_relation"] == "behind"
+    assert body["commits_behind"] == 1
     assert any("new snapshot" in a for a in body["next_actions"])
+
+
+def test_status_diverged_history_has_no_lag_count(admin_client, git_repo):
+    token = _login(admin_client)
+    sid = _create_system(admin_client, token)
+    _configure(admin_client, token, sid, git_repo)
+    base = _head(git_repo)
+
+    (git_repo / "main.py").write_text("def hello():\n    return 'snapshot branch'\n")
+    _git(git_repo, "commit", "-am", "snapshot branch")
+    _snapshot(admin_client, token, sid)
+
+    # Move HEAD to a sibling commit. The stored snapshot is not an ancestor,
+    # so a numeric lag would be misleading.
+    _git(git_repo, "checkout", "-b", "other", base)
+    (git_repo / "main.py").write_text("def hello():\n    return 'other branch'\n")
+    _git(git_repo, "commit", "-am", "other branch")
+
+    r = admin_client.get("/repository/status", headers=_headers(token, sid))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["snapshot_stale"] is True
+    assert body["head_relation"] == "diverged"
+    assert body["commits_behind"] is None
+
+
+def test_head_relation_git_failure_returns_unknown(admin_client, git_repo, monkeypatch):
+    from app import git_ops
+
+    snapshot_head = _head(git_repo)
+    (git_repo / "main.py").write_text("def hello():\n    return 2\n")
+    _git(git_repo, "commit", "-am", "advance")
+
+    original_run_git = git_ops._run_git
+
+    def fail_ancestor(repo_path, args, **kwargs):
+        if args[:2] == ["merge-base", "--is-ancestor"]:
+            return subprocess.CompletedProcess(args, 128, b"", b"git failure")
+        return original_run_git(repo_path, args, **kwargs)
+
+    monkeypatch.setattr(git_ops, "_run_git", fail_ancestor)
+    relation = git_ops.repository_head_relation(
+        str(git_repo), snapshot_head, _head(git_repo)
+    )
+
+    assert relation.head_relation == "unknown"
+    assert relation.commits_behind is None
 
 
 def test_status_reports_dirty_tree_without_mutation(admin_client, git_repo):

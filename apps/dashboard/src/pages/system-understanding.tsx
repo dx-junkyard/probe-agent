@@ -232,16 +232,22 @@ function ManualPurposeEntryForm() {
  */
 function PurposeConfirmationControl({
   snapshotId,
+  understandingBuildId,
   confirmation,
 }: {
   snapshotId: number | null;
+  understandingBuildId: number | null;
   confirmation: PurposeConfirmationOut | null;
 }) {
   const confirmAlignment = useConfirmPurposeAlignment();
 
   const handleConfirm = async () => {
     try {
-      await confirmAlignment.mutateAsync(snapshotId != null ? { snapshot_id: snapshotId } : {});
+      await confirmAlignment.mutateAsync(
+        snapshotId != null && understandingBuildId != null
+          ? { snapshot_id: snapshotId, understanding_build_id: understandingBuildId }
+          : {},
+      );
       toast.success("一致を確認しました");
     } catch (e) {
       toast.error(`確認に失敗しました: ${purposeErrorMessage(e)}`);
@@ -268,11 +274,18 @@ function PurposeConfirmationControl({
         size="sm"
         variant="outline"
         onClick={handleConfirm}
-        disabled={confirmAlignment.isPending}
+        disabled={
+          confirmAlignment.isPending || snapshotId == null || understandingBuildId == null
+        }
         data-testid="purpose-confirm-button"
       >
         一致を確認した
       </Button>
+      {(snapshotId == null || understandingBuildId == null) && (
+        <p className="text-xs text-muted-foreground" data-testid="purpose-confirm-build-required">
+          System Understanding の Build 完了後に確認できます。
+        </p>
+      )}
     </div>
   );
 }
@@ -346,6 +359,7 @@ function PurposeSection({ data }: { data: SystemUnderstandingOut }) {
         {manualView && aiView && (
           <PurposeConfirmationControl
             snapshotId={data.snapshot_id}
+            understandingBuildId={data.understanding_build_id ?? null}
             confirmation={data.purpose_confirmation ?? null}
           />
         )}

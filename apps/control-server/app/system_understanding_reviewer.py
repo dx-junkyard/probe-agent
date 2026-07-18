@@ -33,7 +33,14 @@ from .interview_language import (
     interview_message,
     language_directive,
 )
-from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient, is_reasoning_model
+from .llm import (
+    LLMClient,
+    LLMConfig,
+    LLMError,
+    LLMResourceLimitError,
+    MockLLMClient,
+    is_reasoning_model,
+)
 from .understanding_graph import UnderstandingGraph, GraphNode, EvidenceRef
 
 # v2: configurable output language for questions/summaries (Issue #127).
@@ -485,6 +492,8 @@ def generate_understanding_review(
                 max_tokens=max_output_tokens,
             )
             validated = _parse_review_response(raw)
+        except LLMResourceLimitError:
+            raise
         except (json.JSONDecodeError, ValidationError, LLMError):
             return ReviewResult(
                 provider=config.provider,

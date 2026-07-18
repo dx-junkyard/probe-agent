@@ -544,7 +544,7 @@ def admin_client(tmp_path, monkeypatch):
 def _login(client):
     r = client.post("/auth/login", json={"username": "root", "password": "s3cret"})
     assert r.status_code == 200, r.text
-    return r.json()["access_token"]
+    return r.cookies.get("probe_session")
 
 
 def _headers(token, system_id):

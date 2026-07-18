@@ -6,6 +6,7 @@ import {
   useIssueDraft,
   useGitHubIssueStatus,
   useCreateGitHubIssue,
+  useUpdateGapTriage,
 } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -28,6 +29,7 @@ import type {
   IssueDraft,
   IssueDraftRef,
   IssueDraftStatus,
+  GapTriageStatus,
 } from "@/api/types";
 
 function SeverityIcon({ severity }: { severity: string }) {
@@ -297,8 +299,30 @@ function GapCard({ gap, snapshotId, commitSha }: {
   commitSha: string | null;
 }) {
   const createDraft = useCreateIssueDraft();
+  const updateTriage = useUpdateGapTriage();
   const [openDraftId, setOpenDraftId] = useState<number | null>(null);
   const drafts = gap.issue_drafts ?? [];
+  const triageStatus = gap.triage_status ?? "open";
+
+  const transition = (status: GapTriageStatus) => {
+    if (!gap.gap_key || !gap.content_fingerprint) {
+      toast.error("Gap identity is missing. Refresh System Understanding.");
+      return;
+    }
+    updateTriage.mutate(
+      {
+        gap_key: gap.gap_key,
+        content_fingerprint: gap.content_fingerprint,
+        status,
+      },
+      {
+        onSuccess: () => toast.success(`Gap marked ${status}`),
+        onError: (e: unknown) => toast.error(
+          e instanceof Error ? e.message : "Could not update gap triage",
+        ),
+      },
+    );
+  };
 
   const handleCreateIssue = () => {
     if (drafts.length > 0) {
@@ -331,12 +355,21 @@ function GapCard({ gap, snapshotId, commitSha }: {
                 <Link to={`/capability-map?capability=${encodeURIComponent(gap.capability_key)}`} className="hover:underline">{gap.capability_key}</Link>
               </Badge>
             )}
+            <Badge variant="outline" className="text-xs" data-testid="gap-triage-status">
+              {triageStatus}
+            </Badge>
           </div>
         </div>
       </div>
 
       {gap.notes && (
         <p className="text-xs text-muted-foreground pl-6">{gap.notes}</p>
+      )}
+
+      {gap.triage_reopen_reason && (
+        <p className="text-xs text-amber-700 dark:text-amber-400 pl-6" data-testid="gap-triage-reopened">
+          Previous decision was reopened because this gap changed after it was triaged.
+        </p>
       )}
 
       {(gap.doc_refs.length > 0 || gap.symbol_refs.length > 0 || gap.entrypoint_refs.length > 0) && (
@@ -388,6 +421,67 @@ function GapCard({ gap, snapshotId, commitSha }: {
       )}
 
       <IssueDraftBadges drafts={drafts} onOpen={setOpenDraftId} />
+
+      <div className="pl-6 flex flex-wrap gap-2" data-testid="gap-triage-actions">
+        {triageStatus === "open" && (
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 text-xs"
+            onClick={() => transition("acknowledged")}
+            disabled={updateTriage.isPending || !gap.gap_key}
+            data-testid="gap-triage-acknowledge"
+          >
+            Acknowledge
+          </Button>
+        )}
+        {triageStatus === "acknowledged" && (
+          <>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 text-xs"
+              onClick={() => transition("dismissed")}
+              disabled={updateTriage.isPending}
+              data-testid="gap-triage-dismiss"
+            >
+              Dismiss
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 text-xs"
+              onClick={() => transition("resolved")}
+              disabled={updateTriage.isPending}
+              data-testid="gap-triage-resolve"
+            >
+              Resolve
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 text-xs"
+              onClick={() => transition("open")}
+              disabled={updateTriage.isPending}
+              data-testid="gap-triage-reopen"
+            >
+              Reopen
+            </Button>
+          </>
+        )}
+        {(triageStatus === "dismissed" || triageStatus === "resolved") && (
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 text-xs"
+            onClick={() => transition("open")}
+            disabled={updateTriage.isPending}
+            data-testid="gap-triage-reopen"
+          >
+            Reopen
+          </Button>
+        )}
+      </div>
 
       {gap.next_actions.length > 0 && (
         <div className="pl-6 flex flex-wrap gap-2">
@@ -476,10 +570,11 @@ export function GapWorklist({ gaps, gapSummary, gapTrend, snapshotId, commitSha 
 }) {
   const [typeFilter, setTypeFilter] = useState<string | null>(null);
   const [capabilityFilter, setCapabilityFilter] = useState<string | null>(null);
+  const [showAll, setShowAll] = useState(false);
 
   if (gaps.length === 0 && gapSummary.length === 0) {
     return (
-      <Card data-testid="gap-worklist">
+      <Card id="gap-worklist" data-testid="gap-worklist">
         <CardHeader>
           <CardTitle className="text-base">Docs-Code Gaps</CardTitle>
         </CardHeader>
@@ -493,23 +588,26 @@ export function GapWorklist({ gaps, gapSummary, gapTrend, snapshotId, commitSha 
     );
   }
 
-  const allTypes = Array.from(new Set(gaps.map((g) => g.gap_type ?? "unknown")));
-  const allCapabilities = Array.from(new Set(gaps.map((g) => g.capability_key).filter(Boolean))) as string[];
-  const filtered = gaps
+  const openGaps = gaps.filter((g) => (g.triage_status ?? "open") === "open");
+  const triagedCount = gaps.length - openGaps.length;
+  const triageFiltered = showAll ? gaps : openGaps;
+  const allTypes = Array.from(new Set(triageFiltered.map((g) => g.gap_type ?? "unknown")));
+  const allCapabilities = Array.from(new Set(triageFiltered.map((g) => g.capability_key).filter(Boolean))) as string[];
+  const filtered = triageFiltered
     .filter((g) => !typeFilter || (g.gap_type ?? "unknown") === typeFilter)
     .filter((g) => !capabilityFilter || g.capability_key === capabilityFilter);
 
-  const severityCounts = gaps.reduce((acc, g) => {
+  const severityCounts = openGaps.reduce((acc, g) => {
     acc[g.severity] = (acc[g.severity] || 0) + 1;
     return acc;
   }, {} as Record<string, number>);
 
   return (
-    <Card data-testid="gap-worklist">
+    <Card id="gap-worklist" data-testid="gap-worklist">
       <CardHeader>
         <CardTitle className="text-base">Docs-Code Gap Worklist</CardTitle>
         <CardDescription>
-          {gaps.length} gap{gaps.length !== 1 ? "s" : ""} found
+          {openGaps.length} untriaged / {triagedCount} triaged ({gaps.length} total)
           {Object.entries(severityCounts).map(([sev, cnt]) => (
             <span key={sev}> / {cnt} {sev}</span>
           ))}
@@ -517,6 +615,27 @@ export function GapWorklist({ gaps, gapSummary, gapTrend, snapshotId, commitSha 
         <GapTrendSummary gapTrend={gapTrend} />
       </CardHeader>
       <CardContent className="space-y-4">
+        <div className="flex flex-wrap gap-2" data-testid="gap-triage-filter">
+          <Button
+            variant={!showAll ? "default" : "outline"}
+            size="sm"
+            className="h-7 text-xs"
+            onClick={() => { setShowAll(false); setTypeFilter(null); setCapabilityFilter(null); }}
+            data-testid="gap-filter-open"
+          >
+            Untriaged ({openGaps.length})
+          </Button>
+          <Button
+            variant={showAll ? "default" : "outline"}
+            size="sm"
+            className="h-7 text-xs"
+            onClick={() => { setShowAll(true); setTypeFilter(null); setCapabilityFilter(null); }}
+            data-testid="gap-filter-all"
+          >
+            All ({gaps.length})
+          </Button>
+        </div>
+
         {/* Summary chips */}
         <div className="flex flex-wrap gap-2" data-testid="gap-summary">
           <Button
@@ -525,10 +644,10 @@ export function GapWorklist({ gaps, gapSummary, gapTrend, snapshotId, commitSha 
             className="h-7 text-xs"
             onClick={() => setTypeFilter(null)}
           >
-            All ({gaps.length})
+            All types ({triageFiltered.length})
           </Button>
           {allTypes.map((t) => {
-            const count = gaps.filter((g) => (g.gap_type ?? "unknown") === t).length;
+            const count = triageFiltered.filter((g) => (g.gap_type ?? "unknown") === t).length;
             return (
               <Button
                 key={t}
@@ -555,7 +674,7 @@ export function GapWorklist({ gaps, gapSummary, gapTrend, snapshotId, commitSha 
               All capabilities
             </Button>
             {allCapabilities.map((cap) => {
-              const count = gaps.filter((g) => g.capability_key === cap).length;
+              const count = triageFiltered.filter((g) => g.capability_key === cap).length;
               return (
                 <Button
                   key={cap}
@@ -574,8 +693,13 @@ export function GapWorklist({ gaps, gapSummary, gapTrend, snapshotId, commitSha 
         {/* Gap cards */}
         <div className="space-y-3" data-testid="gap-cards">
           {filtered.map((gap, i) => (
-            <GapCard key={i} gap={gap} snapshotId={snapshotId} commitSha={commitSha} />
+            <GapCard key={`${gap.gap_key ?? "gap"}:${i}`} gap={gap} snapshotId={snapshotId} commitSha={commitSha} />
           ))}
+          {filtered.length === 0 && (
+            <p className="text-sm text-muted-foreground" data-testid="gap-filter-empty">
+              No gaps match the current filter.
+            </p>
+          )}
         </div>
       </CardContent>
     </Card>

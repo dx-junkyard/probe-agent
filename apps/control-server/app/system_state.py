@@ -88,6 +88,9 @@ STATE_GROUP_PHASE: Dict[str, str] = {
 # would misclassify an item's role in the phase model. Kept as a small,
 # hand-enumerated map (Principle 6) -- never inferred from free text.
 STATE_ID_PHASE_OVERRIDES: Dict[str, str] = {
+    # Ingestion loss is operationally urgent in every phase, including a
+    # partially configured System that already receives SDK traffic.
+    "runtime.trace_storage.quota_exceeded": "setup",
     # SDK connectivity is one of the three OR'd instrumentation-completion
     # signals (an applied patch OR an approved probe plan OR non-"no_signal"
     # connectivity -- see derive_user_phase). Issue #256 moved this
@@ -163,6 +166,7 @@ STATUS_VALUES = (
 )
 
 PAGE_REPOSITORY = "/repository"
+PAGE_COMPONENTS = "/components"
 PAGE_SYSTEM_UNDERSTANDING = "/system-understanding"
 PAGE_INTERVIEW = "/interview"
 
@@ -173,6 +177,8 @@ ANCHOR_INTERVIEW_CAPABILITIES = "interview-capabilities"
 # Issue #94/#275: the parallel manual/AI System Purpose provenance views on
 # the System Understanding page.
 ANCHOR_PURPOSE_VIEWS = "purpose-views"
+# Issue #276: open-only docs-code gap worklist.
+ANCHOR_GAP_WORKLIST = "gap-worklist"
 
 DOC_PATH_SUFFIXES = (".md", ".mdx", ".rst", ".txt", ".adoc")
 DOC_PATH_MARKERS = ("readme", "architecture", "design", "spec", "docs/", "doc/")
@@ -1165,6 +1171,57 @@ def _docs_code_reconcile_state_item(conn, system_id: int, snapshot_id: int) -> O
     )
 
 
+def _open_gap_triage_item(conn, system_id: int, snapshot_id: int) -> Optional[StateItem]:
+    """Open-only gap work remains actionable; judged gaps are distinguished.
+
+    This uses the same identity/effective-state functions as the worklist and
+    build history, so StateItem counts cannot drift from those surfaces.
+    """
+    from .system_understanding_service import (
+        _attach_gap_triage,
+        _load_gaps_from_reconciler,
+        _open_gaps,
+    )
+
+    gaps = _load_gaps_from_reconciler(conn, system_id, snapshot_id)
+    _attach_gap_triage(conn, system_id, snapshot_id, gaps)
+    open_count = len(_open_gaps(gaps))
+    if open_count == 0:
+        return None
+    total_count = len(gaps)
+    triaged_count = total_count - open_count
+    msg = state_messages.state_message("understanding.gaps.open")
+    return StateItem(
+        state_id="understanding.gaps.open",
+        state_group="understanding",
+        severity="info",
+        status="unconfirmed",
+        user_action_kind="review",
+        intervention_timing="optional",
+        subject="Docs-code gap",
+        summary=msg["summary"].format(open_count=open_count),
+        detail=msg["detail"].format(
+            total_count=total_count, triaged_count=triaged_count
+        ),
+        impact=msg["impact"],
+        remediation=msg["remediation"],
+        evidence={
+            "snapshot_id": snapshot_id,
+            "open_gap_count": open_count,
+            "triaged_gap_count": triaged_count,
+            "total_gap_count": total_count,
+        },
+        target_ui=TargetUi(
+            route=PAGE_SYSTEM_UNDERSTANDING,
+            anchor=ANCHOR_GAP_WORKLIST,
+            action_label=msg["action_label"],
+        ),
+        display_routes=[PAGE_SYSTEM_UNDERSTANDING],
+        related_pipeline_steps=["docs_code_reconciled"],
+        dedupe_key="understanding.gaps.open",
+    )
+
+
 # --- runtime / proposal representative items (Issue #237) -----------------
 #
 # Phase 1 (Issue #193) intentionally left the runtime/proposal state_groups
@@ -1380,6 +1437,55 @@ def _repository_state_items(conn, system_id: int) -> List[StateItem]:
                       "dirty_sample": head_state.working_tree_dirty_sample},
             target_ui=TargetUi(route=PAGE_REPOSITORY, anchor=ANCHOR_SNAPSHOT_CREATE, action_label=msg["action_label"]),
             related_checks=["working_tree"], dedupe_key="repository.working_tree",
+        ))
+    latest_resync = conn.execute(
+        "SELECT * FROM repository_resync_jobs WHERE system_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (system_id,),
+    ).fetchone()
+    if (
+        latest_ready is not None
+        and latest_resync is not None
+        and latest_resync["status"] == "completed"
+        and latest_resync["snapshot_id"] == latest_ready["id"]
+    ):
+        from .repository_resync_jobs import _stale_capability_count_with_conn
+
+        count = _stale_capability_count_with_conn(
+            conn,
+            system_id,
+            latest_resync["snapshot_id"],
+            require_latest_ready=True,
+        )
+    else:
+        count = 0
+    if count > 0:
+        msg = state_messages.state_message("repository.resync.capabilities_stale")
+        items.append(StateItem(
+            state_id="repository.resync.capabilities_stale",
+            state_group="pipeline",
+            severity="warning",
+            status="stale",
+            user_action_kind="build",
+            intervention_timing="after_build",
+            subject="Capability Map",
+            summary=msg["summary"].format(count=count),
+            detail=msg["detail"].format(snapshot_id=latest_ready["id"]),
+            impact=msg["impact"],
+            remediation=msg["remediation"],
+            evidence={
+                "resync_job_id": latest_resync["id"],
+                "snapshot_id": latest_ready["id"],
+                "stale_capability_count": count,
+            },
+            target_ui=TargetUi(
+                route=PAGE_SYSTEM_UNDERSTANDING,
+                anchor=ANCHOR_BUILD,
+                action_label=msg["action_label"],
+            ),
+            display_routes=[PAGE_REPOSITORY, "/capability-map"],
+            related_pipeline_steps=["capability_hierarchy_ready"],
+            dedupe_key="repository.resync.capabilities_stale",
         ))
     return items
 
@@ -1747,6 +1853,10 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
             docs_code_reconcile = _docs_code_reconcile_state_item(conn, system_id, snapshot_id)
             if docs_code_reconcile:
                 items.append(docs_code_reconcile)
+            else:
+                gap_triage = _open_gap_triage_item(conn, system_id, snapshot_id)
+                if gap_triage:
+                    items.append(gap_triage)
 
             # Preparation "pipeline 全ステップ complete" is derived from the SAME
             # canonical 8-step Pipeline Checklist the System Understanding page and
@@ -1781,6 +1891,43 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
         undecided_item = _undecided_experiments_item(undecided_experiment_count)
         if undecided_item:
             items.append(undecided_item)
+
+        trace_quota = conn.execute(
+            "SELECT * FROM trace_quota_status WHERE system_id = ?",
+            (system_id,),
+        ).fetchone()
+        if trace_quota is not None and trace_quota["rejected_reason"]:
+            msg = state_messages.state_message("runtime.trace_storage.quota_exceeded")
+            items.append(StateItem(
+                state_id="runtime.trace_storage.quota_exceeded",
+                state_group="runtime",
+                severity="warning",
+                status="blocked",
+                user_action_kind="inspect",
+                intervention_timing="now",
+                subject="Trace storage",
+                summary=msg["summary"],
+                detail=msg["detail"].format(
+                    rows=trace_quota["trace_rows"],
+                    bytes=trace_quota["trace_bytes"],
+                    reason=trace_quota["rejected_reason"],
+                ),
+                impact=msg["impact"],
+                remediation=msg["remediation"],
+                evidence={
+                    "trace_rows": trace_quota["trace_rows"],
+                    "trace_bytes": trace_quota["trace_bytes"],
+                    "rejected_reason": trace_quota["rejected_reason"],
+                    "rejected_at": trace_quota["rejected_at"],
+                },
+                target_ui=TargetUi(
+                    route=PAGE_COMPONENTS,
+                    action_label=msg["action_label"],
+                ),
+                display_routes=[PAGE_COMPONENTS],
+                source="trace_quota_status",
+                dedupe_key="runtime.trace_storage.quota_exceeded",
+            ))
 
         proposed_probe_plan_count = state_facts.count_proposed_probe_plans(conn, system_id)
         approved_probe_plan_without_patch_count = (

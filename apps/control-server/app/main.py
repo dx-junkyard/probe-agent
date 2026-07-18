@@ -1,10 +1,11 @@
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from .auth import get_principal
 from .db import init_db
-from . import publish_recovery
+from . import publish_recovery, repository_resync_jobs
 from .routes import (
     assistant,
     auth,
@@ -37,6 +38,7 @@ _auth = [Depends(get_principal)]
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
+    repository_resync_jobs.recover_interrupted_repository_resync_jobs()
     # Fail over publish jobs interrupted by a previous crash/restart before
     # the periodic worker's first tick (Issue #226); the periodic worker
     # (started below) covers everything that goes stale afterwards.
@@ -50,6 +52,22 @@ async def lifespan(_app: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(title="probe-agent Control Server", version="0.1.0", lifespan=lifespan)
+
+    from .llm import LLMResourceLimitError
+
+    @app.exception_handler(LLMResourceLimitError)
+    async def llm_quota_exceeded_handler(
+        _request: Request, exc: LLMResourceLimitError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "detail": {
+                    "code": exc.code,
+                    "message": str(exc),
+                }
+            },
+        )
 
     @app.get("/health")
     def health() -> dict:

@@ -4,6 +4,7 @@ import type {
   SystemOut, ComponentSummary, TraceEvent, Policy,
   LineageOut, TraceAnalyzer, AnalysisRun, AnalyzerContext,
   RepositoryStatus,
+  RepositoryResyncJob,
   SystemStateAssessment,
   FlowOverlayOut, FlowOverlayRequest,
   ShadowResult, ComponentProfile, UserOut, TokenOut,
@@ -31,6 +32,8 @@ import type {
   SystemUnderstandingBuildOut,
   PurposeConfirmationOut,
   PurposeConfirmationRequest,
+  GapTriageDecision,
+  GapTriageUpdateRequest,
   IssueDraft,
   IssueDraftCreateRequest,
   GitHubIssueStatus,
@@ -392,6 +395,30 @@ export function useRepositoryStatus() {
     queryKey: sysKey("repositoryStatus"),
     queryFn: () => api.get<RepositoryStatus>("/repository/status"),
     enabled: !!getSystemId(),
+  });
+}
+
+export function useStartRepositoryResync() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post<RepositoryResyncJob>("/repository/resync"),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: sysKey("repositoryResync") });
+    },
+  });
+}
+
+export function useLatestRepositoryResync() {
+  return useQuery({
+    queryKey: sysKey("repositoryResync"),
+    queryFn: () => api.get<RepositoryResyncJob | null>("/repository/resync/latest"),
+    enabled: !!getSystemId(),
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+      return status === "queued" || status === "snapshotting" || status === "indexing"
+        ? 1000
+        : false;
+    },
   });
 }
 
@@ -1168,6 +1195,21 @@ export function useConfirmPurposeAlignment() {
   });
 }
 
+export function useUpdateGapTriage() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: GapTriageUpdateRequest) =>
+      api.post<GapTriageDecision>(
+        "/repository/system-understanding/gap-triage",
+        data,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: sysKey("system-understanding") });
+      qc.invalidateQueries({ queryKey: sysKey("system-state") });
+    },
+  });
+}
+
 export function useCapabilityContext(capabilityKey: string | null) {
   return useQuery({
     queryKey: sysKey("capability-context", capabilityKey),
@@ -1377,7 +1419,7 @@ export function useConnectivityStatus(refetchInterval?: number) {
 export function useLogin() {
   return useMutation({
     mutationFn: (data: { username: string; password: string }) =>
-      api.post<{ access_token: string; token_type: string; expires_at: string }>("/auth/login", data),
+      api.post<{ expires_at: number }>("/auth/login", data),
   });
 }
 

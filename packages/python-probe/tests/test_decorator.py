@@ -12,6 +12,10 @@ def sdk(monkeypatch):
     monkeypatch.setenv("PROBE_ENABLED", "true")
     monkeypatch.setenv("PROBE_DEFAULT_MODE", "trace")
     monkeypatch.setenv("PROBE_POLICY_TTL", "0.0")
+    # Most legacy assertions exercise the pre-#271 raw telemetry contract.
+    # Full is now an explicit opt-in; dedicated tests below cover the new
+    # redacted default and explicit metadata mode.
+    monkeypatch.setenv("PROBE_PAYLOAD_MODE", "full")
 
     # Reload modules so the patched env / fresh state apply.
     for mod in [
@@ -72,6 +76,201 @@ def test_trace_records_input_output(sdk):
     assert "5" in t["output"]
     assert t["input"]["args"] == ["2", "3"]
     assert t["duration_ms"] >= 0
+
+
+def test_payload_mode_defaults_to_redacted_with_mandatory_masks(sdk, monkeypatch):
+    monkeypatch.delenv("PROBE_PAYLOAD_MODE", raising=False)
+    probe = sdk["decorator_mod"].probe
+
+    @probe(component_id="safe-default")
+    def login(password, options):
+        return {"token": "returned-secret", "status": "ok"}
+
+    assert login("positional-secret", {"cookie": "nested-secret"})["status"] == "ok"
+    trace = sdk["traces"][0]
+    assert trace["input"] is not None
+    assert trace["output"] is not None
+    assert trace["input"]["args"][0] == "██redacted██"
+    assert "status" in trace["output"]
+    serialized = repr(trace)
+    assert "positional-secret" not in serialized
+    assert "nested-secret" not in serialized
+    assert "returned-secret" not in serialized
+
+
+def test_invalid_payload_mode_falls_back_to_redacted(sdk, monkeypatch):
+    monkeypatch.setenv("PROBE_PAYLOAD_MODE", "everything")
+    probe = sdk["decorator_mod"].probe
+
+    @probe(component_id="invalid-mode")
+    def f(secret, value):
+        return {"token": secret, "value": value}
+
+    assert f("hidden", "visible") == {"token": "hidden", "value": "visible"}
+    trace = sdk["traces"][0]
+    assert trace["input"]["args"] == ["██redacted██", "'visible'"]
+    assert "hidden" not in repr(trace)
+    assert "visible" in trace["output"]
+
+
+def test_open_transport_runs_only_function_before_trace_work(sdk, monkeypatch):
+    probe = sdk["decorator_mod"].probe
+    calls = []
+
+    sdk["decorator_mod"]._client.transport_is_open = lambda: True
+    sdk["decorator_mod"]._client.get_policy = lambda _cid: pytest.fail(
+        "policy lookup must be skipped while breaker is open"
+    )
+    monkeypatch.setattr(
+        sdk["decorator_mod"].uuid,
+        "uuid4",
+        lambda: pytest.fail("trace id must not be generated"),
+    )
+    monkeypatch.setattr(
+        sdk["decorator_mod"],
+        "_sampled_in",
+        lambda *_args: pytest.fail("sampling must not run"),
+    )
+
+    @probe(component_id="breaker-open")
+    def f(value):
+        calls.append(value)
+        return value + 1
+
+    assert f(4) == 5
+    assert calls == [4]
+    assert sdk["traces"] == []
+
+
+def test_slow_transport_never_blocks_return_or_exception(sdk):
+    import threading
+    import time
+
+    from probe_agent.client import ControlClient
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_sender(_path, _payload):
+        started.set()
+        release.wait(timeout=2)
+        return True
+
+    client = ControlClient(sender=slow_sender, queue_max=2)
+    sdk["decorator_mod"]._client = client
+    probe = sdk["decorator_mod"].probe
+
+    @probe(component_id="nonblocking-return")
+    def f(value):
+        return value + 1
+
+    before = time.perf_counter()
+    assert f(4) == 5
+    assert time.perf_counter() - before < 0.05
+    assert started.wait(timeout=1)
+
+    @probe(component_id="nonblocking-error")
+    def boom():
+        raise LookupError("original")
+
+    before = time.perf_counter()
+    with pytest.raises(LookupError, match="original"):
+        boom()
+    assert time.perf_counter() - before < 0.05
+
+    release.set()
+    sdk["decorator_mod"].flush(timeout=2)
+
+
+def test_public_transport_stats_has_fake_client_fallback(sdk):
+    assert sdk["decorator_mod"].transport_stats() == {
+        "dropped_count": 0,
+        "failure_count": 0,
+        "state": "closed",
+        "consecutive_failures": 0,
+        "queue_size": 0,
+    }
+
+
+def test_redacted_mode_masks_nested_and_named_positional_values(sdk, monkeypatch):
+    monkeypatch.setenv("PROBE_PAYLOAD_MODE", "redacted")
+    probe = sdk["decorator_mod"].probe
+
+    @probe(component_id="redacted")
+    def f(password, body=None):
+        return {"Authorization": "Bearer output", "status": "ok"}
+
+    assert f("positional-secret", body={"items": ({"TOKEN": "nested-secret"},)})
+    trace = sdk["traces"][0]
+    serialized = repr(trace)
+    assert "positional-secret" not in serialized
+    assert "nested-secret" not in serialized
+    assert "Bearer output" not in serialized
+    assert "status" in trace["output"]
+
+
+def test_full_mode_keeps_non_sensitive_raw_but_forces_denylist(sdk):
+    probe = sdk["decorator_mod"].probe
+
+    @probe(component_id="full")
+    def f(payload):
+        return {"result": "visible", "session": "hidden-output"}
+
+    assert f({"value": "visible-input", "api_key": "hidden-input"})["result"] == "visible"
+    trace = sdk["traces"][0]
+    serialized = repr(trace)
+    assert "visible-input" in serialized
+    assert "visible" in trace["output"]
+    assert "hidden-input" not in serialized
+    assert "hidden-output" not in serialized
+
+
+def test_non_full_error_keeps_type_but_suppresses_message_and_traceback(sdk, monkeypatch):
+    monkeypatch.setenv("PROBE_PAYLOAD_MODE", "redacted")
+    probe = sdk["decorator_mod"].probe
+
+    @probe(component_id="safe-error")
+    def f():
+        raise ValueError("secret exception message")
+
+    with pytest.raises(ValueError, match="secret exception message"):
+        f()
+    assert sdk["traces"][0]["error"] == "ValueError"
+    assert "secret exception message" not in repr(sdk["traces"][0])
+
+
+def test_marker_literal_and_mask_have_distinct_trace_repr(sdk, monkeypatch):
+    monkeypatch.setenv("PROBE_PAYLOAD_MODE", "redacted")
+    probe = sdk["decorator_mod"].probe
+
+    @probe(component_id="marker")
+    def f(payload):
+        return payload
+
+    f({"value": "██redacted██", "secret": "real-secret"})
+    input_repr = sdk["traces"][0]["input"]["args"][0]
+    assert "'██redacted██'" in input_repr  # user literal is quoted
+    assert "'secret': ██redacted██" in input_repr  # sentinel is not
+
+
+def test_redaction_failure_does_not_change_return_value(sdk, monkeypatch):
+    monkeypatch.setenv("PROBE_PAYLOAD_MODE", "redacted")
+    probe = sdk["decorator_mod"].probe
+
+    def fail_closed(_value):
+        raise RuntimeError("redactor failure")
+
+    monkeypatch.setattr(sdk["decorator_mod"]._redaction, "redact_sensitive", fail_closed)
+
+    @probe(component_id="redaction-failure")
+    def f(value):
+        return value
+
+    expected = {"value": 1}
+    assert f(expected) is expected
+    trace = sdk["traces"][0]
+    assert trace["input"]["args"] == ["<payload-redaction-failed>"]
+    assert trace["output"] == "<payload-redaction-failed>"
 
 
 def test_off_mode_skips_trace(sdk):
@@ -327,6 +526,9 @@ def test_shadow_in_subprocess_delivers_result(tmp_path):
             "PROBE_DEFAULT_MODE": "shadow",
             "PROBE_POLICY_TTL": "0",
             "PROBE_SHUTDOWN_TIMEOUT": "5",
+            # This legacy assertion intentionally opts into the pre-#271
+            # current/candidate raw output contract.
+            "PROBE_PAYLOAD_MODE": "full",
         }
         out = subprocess.run(
             [sys.executable, str(script)],
@@ -446,8 +648,24 @@ def test_replay_capture_redaction_never_leaks_raw_value(sdk):
     assert t["replayability"] == "partial"
     assert t["replay_reasons"] == ["redacted"]
     assert "hunter2" not in json.dumps(t["input_capture"], ensure_ascii=False)
-    # NOTE: the legacy repr `input` field is unaffected by replay redaction;
-    # this assertion is about the structured capture only.
+    # The SDK denylist also protects normal repr telemetry; the explicit
+    # replay path is independently enforced in the structured capture.
+    assert "hunter2" not in repr(t["input"])
+
+
+def test_replay_capture_masks_denylisted_positional_parameter(sdk):
+    probe = sdk["decorator_mod"].probe
+
+    @probe(component_id="capt-positional-secret", replay_capture=True)
+    def authenticate(password, user):
+        return user
+
+    assert authenticate("hunter-positional-42", "u1") == "u1"
+    trace = sdk["traces"][0]
+    assert trace["input_capture"]["args"] == ["██redacted██", "u1"]
+    assert trace["replayability"] == "partial"
+    assert trace["replay_reasons"] == ["redacted"]
+    assert "hunter-positional-42" not in repr(trace)
 
 
 def test_replay_capture_invalid_spec_raises_at_decoration(sdk):

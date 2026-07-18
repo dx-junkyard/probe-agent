@@ -20,6 +20,7 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from .execution_backend import ExecutionBackend
 from .patch_generator import cleanup_worktree, create_worktree
 from .validation_runner import (
     MAX_OUTPUT_BYTES,
@@ -184,6 +185,7 @@ def execute_variant(
     workspace_base: str,
     patch_text: str,
     execution_config: Dict[str, Any],
+    backend: Optional[ExecutionBackend] = None,
 ) -> ExperimentVariantExecution:
     workspace = None
     result = ExperimentVariantExecution(status="running")
@@ -215,7 +217,12 @@ def execute_variant(
         )
         for phase, command in phases:
             command_result = _run_command(
-                command, workspace, env, config.timeout_seconds, config.network
+                command,
+                workspace,
+                env,
+                config.timeout_seconds,
+                config.network,
+                backend=backend,
             )
             result.commands.append(
                 ExperimentCommandResult(

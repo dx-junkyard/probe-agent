@@ -258,6 +258,7 @@ export interface MeResponse {
   user: UserOut | null;
   auth: string;
   system_id: number | null;
+  transport: "authorization" | "x_api_key" | "cookie" | "legacy_api_key" | "anonymous";
 }
 
 // Issue #265: deterministic, credential-free, System-id-free "phase 0"
@@ -316,6 +317,8 @@ export interface SnapshotRef {
   created_at: number;
 }
 
+export type RepositoryHeadRelation = "same" | "behind" | "diverged" | "unknown";
+
 export interface RepositoryStatus {
   configured: boolean;
   repo_path: string | null;
@@ -329,8 +332,30 @@ export interface RepositoryStatus {
   understanding_snapshot_id: number | null;
   understanding_status: string | null;
   snapshot_stale: boolean;
+  head_relation: RepositoryHeadRelation;
+  commits_behind: number | null;
   symbols_stale: boolean;
   next_actions: string[];
+}
+
+export type RepositoryResyncStatus =
+  | "queued"
+  | "snapshotting"
+  | "indexing"
+  | "completed"
+  | "snapshot_failed"
+  | "index_failed";
+
+export interface RepositoryResyncJob {
+  id: number;
+  system_id: number;
+  snapshot_id: number | null;
+  status: RepositoryResyncStatus;
+  error: string | null;
+  stale_capability_count: number;
+  created_at: number;
+  started_at: number | null;
+  completed_at: number | null;
 }
 
 export interface SystemStateTargetUi {
@@ -2095,6 +2120,8 @@ export type PurposeConfirmationStaleReason =
 export interface PurposeConfirmationOut {
   id: number;
   snapshot_id: number;
+  understanding_build_id?: number | null;
+  decided_by_user_id?: number | null;
   decision_method: string;
   manual_purpose: string;
   ai_purpose_name?: string | null;
@@ -2109,6 +2136,7 @@ export interface PurposeConfirmationOut {
 
 export interface PurposeConfirmationRequest {
   snapshot_id?: number;
+  understanding_build_id?: number;
   note?: string;
 }
 
@@ -2140,6 +2168,30 @@ export interface IssueDraftRef {
   title: string;
 }
 
+export type GapTriageStatus = "open" | "acknowledged" | "dismissed" | "resolved";
+export type GapTriageDecisionMethod = "manual" | "deterministic";
+export type GapTriageReopenReason = "content_changed" | "resolved_gap_reappeared";
+
+export interface GapTriageDecision {
+  id: number;
+  system_id: number;
+  snapshot_id?: number | null;
+  gap_key: string;
+  content_fingerprint: string;
+  status: GapTriageStatus;
+  decided_by_user_id?: number | null;
+  decision_method: GapTriageDecisionMethod;
+  note?: string | null;
+  created_at: number;
+}
+
+export interface GapTriageUpdateRequest {
+  gap_key: string;
+  content_fingerprint: string;
+  status: GapTriageStatus;
+  note?: string | null;
+}
+
 export interface SystemUnderstandingGap {
   gap_type?: string | null;
   severity: string;
@@ -2156,6 +2208,13 @@ export interface SystemUnderstandingGap {
   source_id?: string | null;
   source_key?: string | null;
   issue_drafts?: IssueDraftRef[];
+  // Issue #276. Optional only for backward-compatible fixtures; current
+  // server responses always provide both identities and effective status.
+  gap_key?: string;
+  content_fingerprint?: string;
+  triage_status?: GapTriageStatus;
+  triage_decision?: GapTriageDecision | null;
+  triage_reopen_reason?: GapTriageReopenReason | null;
 }
 
 // Issue #107: issue drafts generated from System Understanding gaps.
@@ -2238,6 +2297,7 @@ export interface SystemUnderstandingGapTrend {
 export interface SystemUnderstandingOut {
   system_id: number;
   snapshot_id: number | null;
+  understanding_build_id?: number | null;
   commit_sha: string | null;
   pipeline: SystemUnderstandingPipelineStep[];
   purpose: SystemUnderstandingPurpose | null;

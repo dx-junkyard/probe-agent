@@ -40,12 +40,20 @@ export function ContextHeader() {
   const gapCount = understanding?.gaps.length ?? 0;
   if (gapCount > 0) statusParts.push(`${gapCount} gap${gapCount === 1 ? "" : "s"}`);
   const status = statusParts.length > 0 ? statusParts.join(", ") : null;
+  const freshness = repoStatus?.head_relation === "same"
+    ? "latest"
+    : repoStatus?.head_relation === "behind" && repoStatus.commits_behind != null
+      ? `${repoStatus.commits_behind} commit${repoStatus.commits_behind === 1 ? "" : "s"} behind`
+      : repoStatus?.head_relation === "diverged"
+        ? "history diverged"
+        : null;
 
   const items: { key: string; label: string; value: string }[] = [
     { key: "system", label: "System", value: systemName ?? "" },
     { key: "snapshot", label: "Snapshot", value: commitSha ? commitSha.slice(0, 8) : "" },
     { key: "capability", label: "Capability", value: capability ?? "" },
     { key: "entrypoint", label: "Entrypoint", value: entrypoint ?? "" },
+    { key: "freshness", label: "Repository", value: freshness ?? "" },
     { key: "status", label: "Status", value: status ?? "" },
   ].filter((item) => item.value !== "");
 

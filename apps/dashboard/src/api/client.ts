@@ -1,20 +1,9 @@
 const BASE = "/api";
 
-let sessionToken: string | null = localStorage.getItem("probe_session_token");
 let currentSystemId: number | null = (() => {
   const v = localStorage.getItem("probe_system_id");
   return v ? Number(v) : null;
 })();
-
-export function setSessionToken(token: string | null) {
-  sessionToken = token;
-  if (token) localStorage.setItem("probe_session_token", token);
-  else localStorage.removeItem("probe_session_token");
-}
-
-export function getSessionToken() {
-  return sessionToken;
-}
 
 export function setSystemId(id: number | null) {
   currentSystemId = id;
@@ -26,10 +15,25 @@ export function getSystemId() {
   return currentSystemId;
 }
 
-function headers(): Record<string, string> {
+function cookieValue(name: string): string | null {
+  if (typeof document === "undefined") return null;
+  const prefix = `${encodeURIComponent(name)}=`;
+  for (const part of document.cookie.split(";")) {
+    const candidate = part.trim();
+    if (candidate.startsWith(prefix)) {
+      return decodeURIComponent(candidate.slice(prefix.length));
+    }
+  }
+  return null;
+}
+
+function headers(method: string): Record<string, string> {
   const h: Record<string, string> = { "Content-Type": "application/json" };
-  if (sessionToken) h["Authorization"] = `Bearer ${sessionToken}`;
   if (currentSystemId !== null) h["X-Probe-System-Id"] = String(currentSystemId);
+  if (!["GET", "HEAD", "OPTIONS", "TRACE"].includes(method.toUpperCase())) {
+    const csrf = cookieValue("probe_csrf");
+    if (csrf) h["X-CSRF-Token"] = csrf;
+  }
   return h;
 }
 
@@ -60,7 +64,8 @@ export class ApiError extends Error {
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     method,
-    headers: headers(),
+    headers: headers(method),
+    credentials: "include",
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   if (res.status === 204) return undefined as T;

@@ -3,15 +3,22 @@ services:
     build:
       context: .
       dockerfile: apps/control-server/Dockerfile
+    # Local build output: no registry digest exists until this source is built.
     image: probe-agent/control-server:latest
     container_name: probe-control-server
     environment:
       PROBE_SERVER_URL: http://control-server:8000
       PROBE_API_KEY: ${PROBE_API_KEY:-}
       PROBE_DB_PATH: /data/probe.db
+      PROBE_EXECUTION_BACKEND: ${PROBE_EXECUTION_BACKEND:-inprocess}
       CONTROL_API_KEYS: ${CONTROL_API_KEYS:-}
       CONTROL_ADMIN_USERNAME: ${CONTROL_ADMIN_USERNAME:-}
       CONTROL_ADMIN_PASSWORD: ${CONTROL_ADMIN_PASSWORD:-}
+      CONTROL_TRACE_RATE_LIMIT_PER_SECOND: ${CONTROL_TRACE_RATE_LIMIT_PER_SECOND:-1000}
+      CONTROL_MANAGEMENT_RATE_LIMIT_PER_MINUTE: ${CONTROL_MANAGEMENT_RATE_LIMIT_PER_MINUTE:-600}
+      CONTROL_LLM_DAILY_EXECUTION_LIMIT: ${CONTROL_LLM_DAILY_EXECUTION_LIMIT:-1000}
+      CONTROL_TRACE_MAX_ROWS_PER_SYSTEM: ${CONTROL_TRACE_MAX_ROWS_PER_SYSTEM:-1000000}
+      CONTROL_TRACE_MAX_BYTES_PER_SYSTEM: ${CONTROL_TRACE_MAX_BYTES_PER_SYSTEM:-1073741824}
       LLM_PROVIDER: ${LLM_PROVIDER:-openai}
       LLM_MODEL: ${LLM_MODEL:-}
       LLM_API_KEY: ${LLM_API_KEY:-}
@@ -59,6 +66,7 @@ services:
   dashboard:
     build:
       context: ./apps/dashboard
+    # Local build output: no registry digest exists until this source is built.
     image: probe-agent/dashboard:latest
     container_name: probe-dashboard
     environment:

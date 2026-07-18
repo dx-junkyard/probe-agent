@@ -28,6 +28,9 @@ Redaction reuses the projection path grammar and semantics
 (``probe_agent/projection.py``): redact paths are applied structurally to the
 ``{"args": [...], "kwargs": {...}}`` root BEFORE encoding, and a structurally
 blocked redact path fails closed by dropping the entire capture.
+The SDK sensitive-key denylist is also applied recursively and cannot be
+disabled by opting into capture. A literal value equal to the public redaction
+marker uses an explicit ``literal`` encoding so it remains unambiguous.
 
 Capture is best-effort: :func:`capture_input` never raises — any internal
 failure degrades to ``unreplayable`` / ``capture_failed``. The decorator adds
@@ -40,6 +43,7 @@ import math
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from . import projection as _projection
+from . import redaction as _redaction
 from .config import ProbeConfig
 
 # Reserved marker key for explicit (non-JSON-native) encodings.
@@ -142,6 +146,8 @@ def encode_value(value: Any, flags: Optional[Set[str]] = None, depth: int = 0) -
     if depth > MAX_DEPTH:
         flags.add(REASON_DEPTH_LIMIT)
         return {MARKER: "unsupported", "type": "depth_limit"}
+    if value is _redaction.REDACTED:
+        return _redaction.REDACTION_MARKER
     if value is None or isinstance(value, bool):
         return value
     if isinstance(value, int):
@@ -153,6 +159,10 @@ def encode_value(value: Any, flags: Optional[Set[str]] = None, depth: int = 0) -
             return {MARKER: "float", "value": "nan"}
         return {MARKER: "float", "value": "inf" if value > 0 else "-inf"}
     if isinstance(value, str):
+        # Preserve a literal value equal to the public redaction marker as a
+        # literal, rather than making it indistinguishable from a mask.
+        if value == _redaction.REDACTION_MARKER:
+            return {MARKER: "literal", "value": value}
         return str(value)
     if isinstance(value, bytes):
         return {MARKER: "bytes", "b64": base64.b64encode(value).decode("ascii")}
@@ -217,9 +227,13 @@ def decode_value(encoded: Any) -> Any:
             }[encoded["value"]]
         if kind == "dict":
             return {decode_value(k): decode_value(v) for k, v in encoded["items"]}
+        if kind == "literal":
+            return encoded["value"]
         if kind == "unsupported":
             return UNDECODABLE
         raise ReplayCaptureError(f"unknown encoding marker {kind!r}")
+    if encoded == _redaction.REDACTION_MARKER:
+        return _redaction.REDACTED
     return encoded
 
 
@@ -231,6 +245,8 @@ def _roundtrip_equal(original: Any, decoded: Any) -> bool:
     (they are already flagged as degraded)."""
     if decoded is UNDECODABLE:
         return True
+    if original is _redaction.REDACTED or decoded is _redaction.REDACTED:
+        return original is _redaction.REDACTED and decoded is _redaction.REDACTED
     if isinstance(original, bool) or isinstance(decoded, bool):
         return (
             isinstance(original, bool)
@@ -295,7 +311,10 @@ def _roundtrip_equal(original: Any, decoded: Any) -> bool:
 # --- capture ------------------------------------------------------------------
 
 def capture_input(
-    args: tuple, kwargs: dict, spec: ReplayCaptureSpec
+    args: tuple,
+    kwargs: dict,
+    spec: ReplayCaptureSpec,
+    sensitive_arg_indexes: Optional[Set[int]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], str, List[str]]:
     """Capture ``(args, kwargs)`` as a structured, replayable payload.
 
@@ -313,6 +332,15 @@ def capture_input(
         root: Any = {"args": list(args), "kwargs": dict(kwargs)}
         flags: Set[str] = set()
 
+        # The finite SDK denylist is mandatory for every capture, including
+        # callers that explicitly opt into a full replay payload.
+        root = _redaction.redact_sensitive(root)
+        for index in sensitive_arg_indexes or ():
+            if 0 <= index < len(root["args"]):
+                root["args"][index] = _redaction.REDACTED
+        if _redaction.contains_redacted(root):
+            flags.add(REASON_REDACTED)
+
         if spec.redact:
             # Flag paths that resolve to at least one value: those values are
             # about to be masked. Resolution errors fail closed like blocked
@@ -323,7 +351,9 @@ def capture_input(
                         flags.add(REASON_REDACTED)
                 except Exception:  # noqa: BLE001 — fail closed
                     return None, UNREPLAYABLE, [REASON_REDACTION_BLOCKED]
-            root, blocked = _projection._apply_redaction(root, spec.redact)
+            root, blocked = _redaction.apply_path_redactions(
+                root, spec.redact, marker=_redaction.REDACTED
+            )
             if blocked:
                 # Same semantics as projection's blocked paths, but stricter:
                 # a capture is stored verbatim for replay, so a value that

@@ -9,6 +9,7 @@ def sdk(monkeypatch):
     monkeypatch.setenv("PROBE_ENABLED", "true")
     monkeypatch.setenv("PROBE_DEFAULT_MODE", "trace")
     monkeypatch.setenv("PROBE_POLICY_TTL", "0.0")
+    monkeypatch.setenv("PROBE_PAYLOAD_MODE", "full")
     for mod in [
         "probe_agent.decorator", "probe_agent.policy", "probe_agent.client",
         "probe_agent.config", "probe_agent.context", "probe_agent.projection",

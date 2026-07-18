@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11-slim@sha256:db3ff2e1800a8581e2c48a27c3995339d47bdf046da21c7627accd3d51053a93
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -11,22 +11,18 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends bubblewrap git \
     && rm -rf /var/lib/apt/lists/*
 
-#COPY pyproject.toml ./
-#COPY app ./app
+COPY apps/control-server/requirements.lock ./requirements.lock
+RUN pip install --require-hashes -r requirements.lock
 
-#-------
 COPY apps/control-server/pyproject.toml ./
 COPY apps/control-server/app ./app
 COPY packages/python-probe /opt/probe-agent/packages/python-probe
-RUN pip install --upgrade pip \
-    && pip install . \
-    && pip install /opt/probe-agent/packages/python-probe
-#-------
+RUN pip install --no-build-isolation --no-deps . \
+    && pip install --no-build-isolation --no-deps /opt/probe-agent/packages/python-probe
 
-
-RUN pip install --upgrade pip && pip install .
-
-RUN mkdir -p /data
+RUN mkdir -p /data /workspace /execution-spool /execution-workspaces \
+    && chown 65534:65534 /execution-spool /execution-workspaces \
+    && chmod -R a+rX /app/app
 VOLUME ["/data"]
 
 EXPOSE 8000

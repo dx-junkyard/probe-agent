@@ -23,6 +23,40 @@ def _clean_auth_env(monkeypatch):
     monkeypatch.delenv("CONTROL_API_KEYS", raising=False)
     monkeypatch.delenv("CONTROL_ADMIN_USERNAME", raising=False)
     monkeypatch.delenv("CONTROL_ADMIN_PASSWORD", raising=False)
+    for name in (
+        "PROBE_EXECUTION_BACKEND",
+        "PROBE_EXECUTION_SPOOL_ROOT",
+        "PROBE_EXECUTION_WORKSPACE_ROOT",
+        "PROBE_WORKTREE_BASE",
+        "PROBE_REPLAY_WORKSPACE_BASE",
+        "PROBE_EXPERIMENT_WORKSPACE_BASE",
+        "CONTROL_TRACE_RATE_LIMIT_PER_SECOND",
+        "CONTROL_MANAGEMENT_RATE_LIMIT_PER_MINUTE",
+        "CONTROL_LLM_DAILY_EXECUTION_LIMIT",
+        "CONTROL_TRACE_MAX_ROWS_PER_SYSTEM",
+        "CONTROL_TRACE_MAX_BYTES_PER_SYSTEM",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def _set_worker_env(tmp_path, monkeypatch):
+    spool = tmp_path / "execution-spool"
+    workspace = tmp_path / "execution-workspaces"
+    spool.mkdir(exist_ok=True)
+    workspace.mkdir(exist_ok=True)
+    monkeypatch.setenv("PROBE_EXECUTION_BACKEND", "worker")
+    monkeypatch.setenv("PROBE_EXECUTION_SPOOL_ROOT", str(spool))
+    monkeypatch.setenv("PROBE_EXECUTION_WORKSPACE_ROOT", str(workspace))
+    monkeypatch.setenv("PROBE_WORKTREE_BASE", str(workspace / "validation"))
+    monkeypatch.setenv("PROBE_REPLAY_WORKSPACE_BASE", str(workspace / "replay"))
+    monkeypatch.setenv(
+        "PROBE_EXPERIMENT_WORKSPACE_BASE", str(workspace / "experiments")
+    )
+    monkeypatch.setenv("CONTROL_TRACE_RATE_LIMIT_PER_SECOND", "1000")
+    monkeypatch.setenv("CONTROL_MANAGEMENT_RATE_LIMIT_PER_MINUTE", "600")
+    monkeypatch.setenv("CONTROL_LLM_DAILY_EXECUTION_LIMIT", "1000")
+    monkeypatch.setenv("CONTROL_TRACE_MAX_ROWS_PER_SYSTEM", "1000000")
+    monkeypatch.setenv("CONTROL_TRACE_MAX_BYTES_PER_SYSTEM", "1073741824")
 
 
 def _init_db(tmp_path, monkeypatch, name="probe-prod-auth.db"):
@@ -104,6 +138,7 @@ def test_production_valid_password_starts_and_audits_once(tmp_path, monkeypatch)
     monkeypatch.setenv("CONTROL_ADMIN_USERNAME", "root")
     monkeypatch.setenv("CONTROL_ADMIN_PASSWORD", "a-strong-unique-passphrase")
     monkeypatch.setenv("PROBE_DB_PATH", str(tmp_path / "p4.db"))
+    _set_worker_env(tmp_path, monkeypatch)
     from app import db  # noqa: WPS433
 
     db.init_db()
@@ -137,6 +172,18 @@ def test_production_valid_password_starts_and_audits_once(tmp_path, monkeypatch)
     assert count == 1
 
 
+def test_production_valid_auth_still_fails_without_worker_roots(tmp_path, monkeypatch):
+    _clean_auth_env(monkeypatch)
+    monkeypatch.setenv("CONTROL_ENV", "production")
+    monkeypatch.setenv("CONTROL_ADMIN_USERNAME", "root")
+    monkeypatch.setenv("CONTROL_ADMIN_PASSWORD", "a-strong-unique-passphrase")
+    monkeypatch.setenv("PROBE_DB_PATH", str(tmp_path / "p4-no-worker.db"))
+    from app import db  # noqa: WPS433
+
+    with pytest.raises(RuntimeError, match="PROBE_EXECUTION_SPOOL_ROOT"):
+        db.init_db()
+
+
 def test_production_require_auth_false_fails(tmp_path, monkeypatch):
     _clean_auth_env(monkeypatch)
     monkeypatch.setenv("CONTROL_ENV", "production")
@@ -156,6 +203,7 @@ def test_production_deactivated_admin_fails_on_restart(tmp_path, monkeypatch):
     monkeypatch.setenv("CONTROL_ADMIN_USERNAME", "root")
     monkeypatch.setenv("CONTROL_ADMIN_PASSWORD", "a-strong-unique-passphrase")
     monkeypatch.setenv("PROBE_DB_PATH", str(tmp_path / "p6.db"))
+    _set_worker_env(tmp_path, monkeypatch)
     from app import db  # noqa: WPS433
 
     db.init_db()
@@ -213,6 +261,7 @@ def prod_client(tmp_path, monkeypatch):
     monkeypatch.setenv("CONTROL_ENV", "production")
     monkeypatch.setenv("CONTROL_ADMIN_USERNAME", "root")
     monkeypatch.setenv("CONTROL_ADMIN_PASSWORD", "a-strong-unique-passphrase")
+    _set_worker_env(tmp_path, monkeypatch)
     from app.main import app  # noqa: WPS433
 
     with TestClient(app) as c:
@@ -222,7 +271,7 @@ def prod_client(tmp_path, monkeypatch):
 def _login(client, username="root", password="a-strong-unique-passphrase"):
     r = client.post("/auth/login", json={"username": username, "password": password})
     assert r.status_code == 200, r.text
-    return r.json()["access_token"]
+    return r.cookies.get("probe_session")
 
 
 def test_unauthenticated_request_is_401(prod_client):
