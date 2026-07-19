@@ -115,6 +115,34 @@ INTERVIEW_MESSAGES: dict = {
             "question, or choose \"hold for now\"."
         ),
     },
+    # Issue #286: deterministic Response Composer templates. Never LLM
+    # output -- these are the fixed frame around a Question Router /
+    # Investigation Agent result, never the model's own free-text wording.
+    "inquiry_human_only_answer": {
+        "ja": (
+            "この点はコードから判断できるものではなく、あなたご自身の判断が必要です。\n\n"
+            "ご質問: {question}\n\n"
+            "AI 判断根拠: {reason}"
+        ),
+        "en": (
+            "This is not something the code can determine -- it needs your "
+            "own decision.\n\n"
+            "Your question: {question}\n\n"
+            "AI classification reason: {reason}"
+        ),
+    },
+    "inquiry_hybrid_unresolved_note": {
+        "ja": "コードからの調査だけでは十分な根拠が見つかりませんでした。",
+        "en": "The code investigation alone did not find enough grounding.",
+    },
+    "inquiry_hybrid_decision_heading": {
+        "ja": "確認したいこと:",
+        "en": "What we'd like you to decide:",
+    },
+    "inquiry_hybrid_default_decision_question": {
+        "ja": "この点について、あなたの判断を教えてください:「{question}」",
+        "en": "Please share your own decision on this: \"{question}\"",
+    },
 }
 
 # Deterministic fallback language for the fixed-text messages above only,

@@ -140,6 +140,8 @@ def _message_out(row) -> InterviewInquiryMessageOut:
                 InterviewInquiryEvidenceOut(**e) for e in detail_json.get("evidence", [])
             ],
             uncertainty=detail_json.get("uncertainty", ""),
+            route_category=detail_json.get("route_category"),
+            decision_question=detail_json.get("decision_question"),
         )
     return InterviewInquiryMessageOut(
         id=row["id"],
@@ -177,6 +179,72 @@ class _AnswerOutcome:
     error: Optional[str]
 
 
+def _persist_route_run(conn, *, system_id: int, snapshot_id: int, route, now: float, completed_at: float) -> int:
+    """Persist the Question Router sub-run (Issue #286) as its own audit row."""
+    cur = conn.execute(
+        """
+        INSERT INTO intelligence_runs
+            (system_id, snapshot_id, run_type, provider, model,
+             prompt_version, schema_version, decision_method, status,
+             error_details, is_mock, started_at, completed_at)
+        VALUES (?, ?, 'question_route', ?, ?, ?, ?, 'reasoning_llm', ?, ?, ?, ?, ?)
+        """,
+        (
+            system_id, snapshot_id, route.provider, route.model,
+            route.prompt_version, route.schema_version,
+            "failed" if route.error else "completed", route.error,
+            1 if route.is_mock else 0, now, completed_at,
+        ),
+    )
+    return cur.lastrowid
+
+
+def _persist_investigation_run(
+    conn, *, system_id: int, snapshot_id: int, investigation, now: float, completed_at: float,
+) -> int:
+    """Persist the Investigation Agent sub-run + its evidence rows (Issue #286).
+
+    Every snippet actually read from the pinned snapshot is recorded here,
+    regardless of whether the final answer cited it -- mirroring the
+    interview dialogue's pass-1 evidence-audit pattern (Issue #137). Budget
+    usage (files/chars/llm-calls/elapsed) is recorded on the run row itself
+    for auditability.
+    """
+    cur = conn.execute(
+        """
+        INSERT INTO intelligence_runs
+            (system_id, snapshot_id, run_type, provider, model,
+             prompt_version, schema_version, decision_method, status,
+             error_details, is_mock, started_at, completed_at,
+             budget_files_read, budget_chars_read, budget_llm_calls,
+             budget_elapsed_seconds)
+        VALUES (?, ?, 'investigation', ?, ?, ?, ?, 'reasoning_llm', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            system_id, snapshot_id, investigation.provider, investigation.model,
+            investigation.prompt_version, investigation.schema_version,
+            "failed" if investigation.error else "completed", investigation.error,
+            1 if investigation.is_mock else 0, now, completed_at,
+            investigation.files_read, investigation.chars_read, investigation.llm_calls,
+            investigation.elapsed_seconds,
+        ),
+    )
+    run_id = cur.lastrowid
+    for snippet in investigation.read_snippets:
+        conn.execute(
+            """INSERT INTO intelligence_run_evidence
+                (system_id, intelligence_run_id, path, start_line,
+                 end_line, char_count, truncated, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                system_id, run_id, snippet.path, snippet.start_line,
+                snippet.end_line, snippet.char_count,
+                1 if snippet.truncated else 0, completed_at,
+            ),
+        )
+    return run_id
+
+
 def _generate_and_store_answer(
     conn,
     *,
@@ -190,14 +258,26 @@ def _generate_and_store_answer(
 ) -> _AnswerOutcome:
     """Run inquiry answer generation and persist the audit + message rows.
 
+    Issue #286 reworked ``generate_inquiry_answer`` into a Question Router +
+    Investigation Agent + Response Composer pipeline; each reasoning call
+    (``result.route``, ``result.investigation``) is persisted here as its
+    own ``intelligence_runs`` audit row before the overall 'inquiry_answer'
+    row that records the composed outcome (Principle 7 -- every reasoning
+    call is independently auditable).
+
     Fail-closed: on any error (mock/non-reasoning client, LLM call failure,
-    invalid structured output), the intelligence_runs row is recorded as
-    'failed' and NO assistant message is inserted -- the inquiry stays open
-    with only the user's question. ``answerable=false`` is not an error: a
-    fixed, non-LLM-fabricated message is stored instead of the model's own
+    invalid structured output, or a failed investigation), the
+    'inquiry_answer' intelligence_runs row is recorded as 'failed' and NO
+    assistant message is inserted -- the inquiry stays open with only the
+    user's question. ``answerable=false`` is not an error: a fixed,
+    non-LLM-fabricated message is stored instead of the model's own
     conclusion text (never fabricate, per Issue #285's brief).
     """
     context_pack = build_interview_context(conn, system_id, snapshot_id)
+    snapshot_row = conn.execute(
+        "SELECT repo_path, commit_sha FROM repository_snapshots WHERE id = ? AND system_id = ?",
+        (snapshot_id, system_id),
+    ).fetchone()
     config = LLMConfig.intelligence_from_env()
     try:
         client = create_llm_client(config)
@@ -208,6 +288,8 @@ def _generate_and_store_answer(
             question_text=question_text,
             conversation=conversation,
             origin_summary=origin_summary,
+            repo_path=snapshot_row["repo_path"] if snapshot_row else None,
+            commit_sha=snapshot_row["commit_sha"] if snapshot_row else None,
         )
     except LLMError as exc:
         result = InquiryAnswerResult(
@@ -218,6 +300,18 @@ def _generate_and_store_answer(
         )
 
     completed_at = time.time()
+
+    if result.route is not None:
+        _persist_route_run(
+            conn, system_id=system_id, snapshot_id=snapshot_id, route=result.route,
+            now=now, completed_at=completed_at,
+        )
+    if result.investigation is not None:
+        _persist_investigation_run(
+            conn, system_id=system_id, snapshot_id=snapshot_id,
+            investigation=result.investigation, now=now, completed_at=completed_at,
+        )
+
     run_status = "failed" if result.error else "completed"
     run_cur = conn.execute(
         """
@@ -258,12 +352,18 @@ def _generate_and_store_answer(
                 for e in result.evidence
             ],
             "uncertainty": result.uncertainty,
+            "route_category": result.route.category if result.route else None,
+            "decision_question": result.decision_question,
         }
     else:
         content = interview_message(
             "inquiry_insufficient_information", resolve_message_language(),
         )
-        detail = {"key_points": [], "evidence": [], "uncertainty": result.uncertainty}
+        detail = {
+            "key_points": [], "evidence": [], "uncertainty": result.uncertainty,
+            "route_category": result.route.category if result.route else None,
+            "decision_question": None,
+        }
 
     msg_cur = conn.execute(
         """INSERT INTO interview_inquiry_message

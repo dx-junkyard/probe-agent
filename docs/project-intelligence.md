@@ -2487,9 +2487,16 @@ held       -> open (resume)
 
 ### 回答生成(`app/inquiry_answering.py: generate_inquiry_answer`)
 
+（Issue #286 で内部実装を Question Router / Investigation Agent / Response
+Composer の3段構成に差し替え済み。`prompt_version`/`schema_version` は
+`inquiry-answer-v2` に更新した。以下は Issue #285 時点の単一パス設計の記
+述で、歴史的経緯として残す。詳細は次の「Question Router / Investigation
+Agent(Issue #286)」節を参照。）
+
 `interview_context.py` の `build_interview_context` が返すスナップショッ
 ト由来のコンテキストパックだけを根拠に、reasoning LLM を1回呼ぶ
-(`prompt_version`/`schema_version` = `inquiry-answer-v1`)。
+(`prompt_version`/`schema_version` = `inquiry-answer-v1`、#286 以降は
+`inquiry-answer-v2`)。
 `interview_agent.py` の2段階(エビデンス選定→読込)とは異なり、この呼び
 出しは単一パスで、コンテキストパックに既出の `(path, start_line,
 end_line)` だけを引用させ、範囲外の引用は Issue #142 と同じ「致命的では
@@ -2550,3 +2557,186 @@ Q&A パネル(`QaItemCard`)と Intent Brief パネル(`IntentItemRow`)の両
 **含まない:** `review_item` origin からの Inquiry 作成 UI(Issue #287
 の Review Queue が対応するまで導線がない)、質問ルーティング/調査エー
 ジェント(Issue #286)。
+
+## Question Router / Investigation Agent(Issue #286)
+
+Inquiry の質問応答を「分類 → 調査 → 組み立て」の3段に分割した:
+`app/question_router.py`(質問を有限カテゴリに分類する reasoning 呼び出
+し1回)→ `app/investigation_agent.py`(pin 済み snapshot だけを read-only
+で調べる reasoning 呼び出し、system_researchable/hybrid のみ)→
+`app/response_composer.py`(LLM を呼ばない決定的な組み立て)。
+`app/inquiry_answering.py` の `generate_inquiry_answer` はこの3段を束ね
+るオーケストレーションのみを行う純関数(DB に触れない)で、
+Issue #285 が確立した Inquiry ライフサイクル/遷移ロジック
+(`routes/interview_inquiry.py`)には手を入れていない — 呼び出し引数
+(`repo_path`/`commit_sha` の追加)とレスポンス組み立て(`route`/
+`investigation` サブ結果の追加)だけを差し替えた。
+
+### エージェント構成
+
+- **Question Router**(`route_question`、`prompt_version`/
+  `schema_version` = `question-router-v1`): 質問文 + 短い文脈(Inquiry
+  なら元項目の要約と直近の会話、`interview_qa` 単体ルーティングなら
+  question_category/hypothesis)を渡し、構造化出力
+  `{category, reason, research_focus}` を1回の reasoning 呼び出しで得る。
+  `category` は有限集合 `human_only | system_researchable | hybrid`
+  (Principle 6 — 自由文からの意味分類なので reasoning LLM 必須、キーワー
+  ドヒューリスティックでは代替しない)。`research_focus` は
+  `human_only` では常に `null` に強制する(調査対象がないため)。
+- **Investigation Agent**(`investigate`、`prompt_version`/
+  `schema_version` = `investigation-v1`): `system_researchable` /
+  `hybrid` のときだけ呼ぶ。候補ファイルの**取得**は `git ls-files`(pin
+  済み commit)に対する決定的キーワード一致(質問文 + `research_focus` を
+  トークン化してパス文字列に部分一致させ、一致数降順・パス昇順でソート)
+  — これはあくまで候補を絞る足切りで、実際に**何が関連するか**の選択と
+  結論は常に reasoning LLM が行う(Principle 6)。読み込みは
+  `git_ops.read_file_at_commit` / `list_tree_entries` のみで、pin 済み
+  commit 以外(作業ツリー・未追跡ファイル)には一切触れない。ファイル書
+  き込み・パッチ・任意のサブプロセス実行・LLM 呼び出し以外のネットワー
+  クはしない(Principle 5・8)。
+- **Response Composer**(`compose_human_only` /
+  `compose_system_researchable` / `compose_hybrid`): reasoning を一切呼
+  ばない決定的な組み立てのみ。文面は固定サーバーテンプレート
+  (`interview_language.py` の `inquiry_human_only_answer` /
+  `inquiry_hybrid_unresolved_note` / `inquiry_hybrid_decision_heading` /
+  `inquiry_hybrid_default_decision_question`)か、reasoning ステップが既
+  に検証済みの出力(Investigation の `conclusion`/`key_points`/
+  `evidence`/`uncertainty`、Router の `reason`)のいずれかであり、ここで
+  新しい文章を作らない。
+
+### Budget(`investigation_agent.InvestigationBudget`)
+
+明示的な有限上限をデータクラスで持ち、`__post_init__` で常にハード上限
+にクランプする(呼び出し側が上書きしても範囲外にはならない):
+
+| フィールド | デフォルト | ハード上限 |
+| --- | --- | --- |
+| `max_files` | 20 | 1–50 |
+| `max_snippet_chars` | 40,000 | 1,000–200,000 |
+| `max_llm_calls` | 3(現状の実装は常に高々1回だけ実際に呼ぶ) | 1–5 |
+| `max_evidence_items` | 10 | 1–20 |
+| `timeout_seconds` | 60 | 1–300 |
+
+- 候補選定は `max_files` 件までしか候補に残さないため、実際に読んだファ
+  イル数(`files_read`)は構造的に `max_files` を超えない。
+- 文字数は候補ファイルを順に読みながら `max_snippet_chars` の残り予算を
+  消費し、1行も収まらないファイルはスキップして次の(より小さい)候補
+  を試す。
+- 経過時間(`time.monotonic()`)がタイムアウトを超えた時点で以降の候補
+  読み込みを打ち切る。
+- 候補が1件も見つからない・タイムアウトで1件も読めなかった場合
+  (`files_read == 0`)は reasoning LLM 呼び出しを一切行わず(予算の節約
+  と「根拠なしからの捏造」防止)、`status="unresolved"` を返す。
+- 予算の使用量(`files_read` / `chars_read` / `llm_calls` /
+  `elapsed_seconds`)は `intelligence_runs` の追加カラム
+  `budget_files_read` / `budget_chars_read` / `budget_llm_calls` /
+  `budget_elapsed_seconds`(すべて additive ALTER、`run_type='investigation'`
+  行のみ設定、他の `run_type` は常に `NULL`)に監査記録する。
+
+### read-only 境界(Principle 5・8)
+
+Investigation Agent はファイル書き込み・パッチ適用・任意コード実行を一
+切行わない。すべての読み込みは pin 済み `commit_sha` に対する
+`git show` / `git ls-tree` 相当(`git_ops.read_file_at_commit` /
+`list_tree_entries`)のみで、作業ツリーの未コミット/未追跡の変更を読む
+経路は存在しない。テストは `git status --porcelain` が調査前後で空のま
+まであることを確認する(`tests/test_investigation_agent.py`)。
+
+### fail-closed のルール(Principle 6・7)
+
+- Question Router: mock クライアント・非 reasoning モデル・API 失敗・構
+  造化出力の検証失敗・`category` が有限集合外、のいずれも `error` を返
+  し、呼び出し元は `intelligence_runs`(`run_type='question_route'`)に
+  失敗行を記録するだけで質問のルーティング結果を確定させない。
+- Investigation Agent: 同様の失敗条件に加えて、`status` が
+  `completed | unresolved` の集合外、`intelligence_runs`
+  (`run_type='investigation'`)は常に記録し、成功時は
+  `intelligence_run_evidence` に実際に読んだ全スニペット(引用されたか
+  どうかに関わらず、Issue #137 のパス1監査パターンを踏襲)を記録する。
+- Evidence の検証: モデルが返した `evidence` は「実際に読んだ excerpt の
+  path・行範囲に収まっているか」を決定的にチェックする。範囲外の引用は
+  「有効な引用が1件以上残るなら破棄して警告付きで続行」
+  (`pruned_evidence` に記録、`uncertainty` にも件数を追記)、「全件が無
+  効なら `status="failed"` で fail-closed」の二択(Issue #142 のパター
+  ンを踏襲しつつ、全滅ケースは新規追加)。
+- Inquiry 統合(`generate_inquiry_answer`)は Router の失敗、
+  `system_researchable`/`hybrid` で pin 済み snapshot の
+  `repo_path`/`commit_sha` が無い場合、Investigation の
+  `status="failed"` のいずれでも `error` を伝播し、呼び出し元
+  (`routes/interview_inquiry.py`)は assistant メッセージを一切作成しな
+  い(Inquiry は `open` のまま)。
+
+### カテゴリ別の応答組み立て
+
+- **`human_only`**: Investigation を呼ばない。固定テンプレート
+  (`inquiry_human_only_answer`)で質問文をそのままエコーし、Router の
+  `reason` を「AI 判断根拠」として明示した上でユーザー自身の判断を促
+  す。常に `answerable=true`(「情報不足」ではなく正常な完了状態)。
+- **`system_researchable`**: Investigation の `status="completed"` ならそ
+  の `conclusion`/`key_points`/`evidence`/`uncertainty` をそのまま
+  `answerable=true` で使う。`status="unresolved"` なら `answerable=false`
+  にして、呼び出し元が既存の固定メッセージキー
+  `inquiry_insufficient_information`(Issue #285)に差し替える — Investigation
+  の生の文言を絶対に使わない。
+- **`hybrid`**: 常に `answerable=true`(片方が人間の判断である以上、
+  「情報不足」で全体を差し止めない)。Investigation が完了していればその
+  結論を、未解決なら固定ノート(`inquiry_hybrid_unresolved_note`)を土台
+  にし、末尾に「確認したいこと:」見出し + `decision_question`(モデルが
+  返した検証済みの値、無ければ固定テンプレート
+  `inquiry_hybrid_default_decision_question` で質問文をエコー)を付加す
+  る。`decision_question` は `interview_inquiry_message.detail` にも別
+  フィールドとして保存し、UI が強調表示できるようにする。
+
+### `interview_qa` への単体ルーティング
+
+`POST /interview/qa/{qa_id}/route`(`app/routes/question_router.py`、
+system-scoped)は `interview_qa` の1問を単独でルーティングし、
+`route_category` / `route_run_id`(additive ALTER)に結果を保存する。
+Inquiry 内の自動ルーティングとは完全に独立しており、
+`interview_agent.py` のダイアログターンには一切手を入れていない(スコー
+プを絞る、Issue #286 のブリーフどおり)。
+
+### テーブル/スキーマ変更(additive)
+
+- `interview_qa`: `route_category TEXT NULL` / `route_run_id INTEGER NULL
+  REFERENCES intelligence_runs(id) ON DELETE SET NULL`。
+- `intelligence_runs`: `budget_files_read` / `budget_chars_read` /
+  `budget_llm_calls INTEGER NULL` / `budget_elapsed_seconds REAL NULL`
+  (`run_type='investigation'` のみ設定)。`run_type` の有限集合に
+  `question_route` / `investigation` / `inquiry_answer`(#285 時点で未登
+  録だったものを今回追加)を追加。
+- `interview_inquiry_message.detail` に `route_category` /
+  `decision_question`(どちらも optional、旧行は `null`)を追加。
+
+### UI(`components/system-understanding/inquiry-panel.tsx`)
+
+assistant メッセージの先頭行に、`detail.route_category` を日本語ラベル
+に変換したバッジを表示する(Issue #266 規約: canonical enum は英語のま
+ま保持し、画面には出さない):
+`system_researchable` → 「AI が調査して回答」、`human_only` →
+「あなたの判断が必要」、`hybrid` → 「調査 + あなたの判断」。`hybrid` の
+`decision_question` は「確認したいこと: …」として、結論本文の直後(「根
+拠を見る」の展開を待たず)に強調表示する。コンポーネントテストは
+`tests/__tests__/inquiry-panel.test.tsx` の `route category badge` 節
+(バッジのラベルマッピングと raw な enum 文字列が画面に出ないことを確
+認)。
+
+### テスト
+
+- `tests/test_question_router.py`: 各カテゴリのパース、`human_only` で
+  `research_focus` が強制的に `null` になること、mock/非 reasoning モデ
+  ル/API 失敗/不正 JSON/カテゴリ外の値それぞれの fail-closed、
+  `POST /interview/qa/{qa_id}/route` の永続化・失敗時の未ルーティング維
+  持・System 分離。
+- `tests/test_investigation_agent.py`: pin 済み snapshot のみを読むこと
+  (未コミット/新規ファイルが結果に一切現れない)、budget 上限の遵守
+  (`files_read <= max_files`、文字数予算の枯渇、タイムアウトで
+  `status="unresolved"` かつ LLM 呼び出しゼロ)、read-only 境界
+  (`git status --porcelain` が空のまま)、evidence の破棄/全滅
+  fail-closed、hybrid の `decision_question` 伝播、監査メタデータ
+  (`prompt_version`/`schema_version`/`llm_calls`/`elapsed_seconds`)。
+- `tests/test_interview_inquiry.py`: Issue #286 のオーケストレーション単
+  体テスト(3カテゴリそれぞれの経路、investigation 失敗時の fail-closed、
+  pin 済み snapshot が無い場合の fail-closed)を追加しつつ、Issue #285
+  のライフサイクル/遷移テスト(30件、`generate_inquiry_answer` を丸ごと
+  スタブする方式)はそのまま維持した。

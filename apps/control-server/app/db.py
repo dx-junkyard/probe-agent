@@ -3041,6 +3041,28 @@ def init_db() -> None:
             # Issue #135: raw trace-aggregate + metadata-provenance JSON for
             # question_source = 'runtime' rows; existing rows stay NULL.
             conn.execute("ALTER TABLE interview_qa ADD COLUMN runtime_evidence TEXT")
+        if qa_cols and "route_category" not in qa_cols:
+            # Issue #286: Question Router classification, set only via
+            # POST /interview/qa/{qa_id}/route (never automatic for
+            # dialogue-turn questions); existing rows stay NULL (unrouted).
+            conn.execute("ALTER TABLE interview_qa ADD COLUMN route_category TEXT")
+        if qa_cols and "route_run_id" not in qa_cols:
+            conn.execute(
+                "ALTER TABLE interview_qa ADD COLUMN route_run_id INTEGER "
+                "REFERENCES intelligence_runs(id) ON DELETE SET NULL"
+            )
+        intelligence_run_cols = _columns(conn, "intelligence_runs")
+        if intelligence_run_cols and "budget_files_read" not in intelligence_run_cols:
+            # Issue #286: read-only Investigation Agent budget accounting,
+            # populated only for run_type='investigation' rows; every other
+            # run_type (and pre-migration rows) stays NULL.
+            conn.execute("ALTER TABLE intelligence_runs ADD COLUMN budget_files_read INTEGER")
+        if intelligence_run_cols and "budget_chars_read" not in intelligence_run_cols:
+            conn.execute("ALTER TABLE intelligence_runs ADD COLUMN budget_chars_read INTEGER")
+        if intelligence_run_cols and "budget_llm_calls" not in intelligence_run_cols:
+            conn.execute("ALTER TABLE intelligence_runs ADD COLUMN budget_llm_calls INTEGER")
+        if intelligence_run_cols and "budget_elapsed_seconds" not in intelligence_run_cols:
+            conn.execute("ALTER TABLE intelligence_runs ADD COLUMN budget_elapsed_seconds REAL")
         github_conn_cols = _columns(conn, "github_connections")
         if github_conn_cols and "last_synced_at" not in github_conn_cols:
             # Issue #216 sub-task 2: repo manager sync bookkeeping.

@@ -334,6 +334,7 @@ def _message_out(row) -> InterviewMessageOut:
 
 
 def _intelligence_run_out(row) -> IntelligenceRunOut:
+    keys = row.keys()
     return IntelligenceRunOut(
         id=row["id"],
         system_id=row["system_id"],
@@ -349,6 +350,15 @@ def _intelligence_run_out(row) -> IntelligenceRunOut:
         is_mock=bool(row["is_mock"]),
         started_at=row["started_at"],
         completed_at=row["completed_at"],
+        # Issue #286: only present on run_type="investigation" rows written
+        # after this migration; older rows/tables without the columns yet
+        # (defensive -- init_db always adds them) stay None.
+        budget_files_read=row["budget_files_read"] if "budget_files_read" in keys else None,
+        budget_chars_read=row["budget_chars_read"] if "budget_chars_read" in keys else None,
+        budget_llm_calls=row["budget_llm_calls"] if "budget_llm_calls" in keys else None,
+        budget_elapsed_seconds=(
+            row["budget_elapsed_seconds"] if "budget_elapsed_seconds" in keys else None
+        ),
     )
 
 
@@ -379,6 +389,12 @@ def _qa_out(row) -> InterviewQaOut:
         superseded_by_id=row["superseded_by_id"],
         created_at=row["created_at"],
         answered_at=row["answered_at"],
+        route_category=(
+            row["route_category"] if "route_category" in row.keys() else None
+        ),
+        route_run_id=(
+            row["route_run_id"] if "route_run_id" in row.keys() else None
+        ),
     )
 
 

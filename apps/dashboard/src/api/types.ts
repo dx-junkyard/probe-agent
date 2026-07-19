@@ -825,10 +825,18 @@ export interface InterviewInquiryEvidenceOut {
   summary: string;
 }
 
+export type InquiryRouteCategory = "human_only" | "system_researchable" | "hybrid";
+
 export interface InterviewInquiryMessageDetailOut {
   key_points: string[];
   evidence: InterviewInquiryEvidenceOut[];
   uncertainty: string;
+  // Issue #286: which Question Router category produced this assistant
+  // answer, and (for "hybrid") the decision question the developer still
+  // needs to answer themselves. Both null for messages predating Issue
+  // #286 or for the user's own messages.
+  route_category?: InquiryRouteCategory | null;
+  decision_question?: string | null;
 }
 
 export interface InterviewInquiryMessageOut {

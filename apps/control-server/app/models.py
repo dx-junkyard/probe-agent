@@ -509,6 +509,16 @@ IntelligenceRunType = Literal[
     # priority/constraints/non_goals items from the session conversation and
     # user_intent free text. Proposed items are never auto-confirmed.
     "intent_proposal",
+    # Issue #285: Inquiry side-conversation answer generation (the overall
+    # composed outcome; superseded internals split into "question_route" and
+    # "investigation" below by Issue #286, each audited separately).
+    "inquiry_answer",
+    # Issue #286: Question Router classifies a question into
+    # human_only | system_researchable | hybrid before any investigation.
+    "question_route",
+    # Issue #286: read-only Investigation Agent research over the pinned
+    # snapshot, budget-bounded, for system_researchable/hybrid questions.
+    "investigation",
 ]
 DecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
 # How a single hierarchy claim was produced. Kept distinct from the audit
@@ -642,6 +652,13 @@ class IntelligenceRunOut(BaseModel):
     is_mock: bool = False
     started_at: float
     completed_at: Optional[float] = None
+    # Issue #286: budget usage for run_type="investigation" rows only (the
+    # read-only Investigation Agent's deterministic budget accounting).
+    # None for every other run_type.
+    budget_files_read: Optional[int] = None
+    budget_chars_read: Optional[int] = None
+    budget_llm_calls: Optional[int] = None
+    budget_elapsed_seconds: Optional[float] = None
 
 
 class FeatureEvidence(BaseModel):
@@ -2875,6 +2892,11 @@ class InterviewQaOut(BaseModel):
     superseded_by_id: Optional[int] = None
     created_at: float
     answered_at: Optional[float] = None
+    # Issue #286: Question Router classification for this question, set only
+    # via POST /interview/qa/{qa_id}/route (never automatically for
+    # dialogue-turn questions). None until routed.
+    route_category: Optional[str] = None
+    route_run_id: Optional[int] = None
 
 
 class InterviewQaAnswerOut(BaseModel):
@@ -2993,6 +3015,11 @@ class InterviewInquiryMessageDetailOut(BaseModel):
     key_points: List[str] = Field(default_factory=list)
     evidence: List[InterviewInquiryEvidenceOut] = Field(default_factory=list)
     uncertainty: str = ""
+    # Issue #286: which Question Router category produced this answer, and
+    # (for "hybrid") the decision question the developer still needs to
+    # answer themselves. Both None for messages predating Issue #286.
+    route_category: Optional[str] = None
+    decision_question: Optional[str] = None
 
 
 class InterviewInquiryMessageOut(BaseModel):

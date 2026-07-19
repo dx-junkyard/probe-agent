@@ -1,21 +1,36 @@
 """Tests for Issue #285: Inquiry lifecycle (保留・疑問解消・復帰).
 
+Reworked for Issue #286 (Question Router / read-only Investigation Agent):
+``app/inquiry_answering.py``'s ``generate_inquiry_answer`` no longer makes a
+single reasoning call -- it routes the question first
+(``app/question_router.py``), then (for system_researchable/hybrid) runs
+the read-only Investigation Agent (``app/investigation_agent.py``) and
+composes the final answer deterministically (``app/response_composer.py``).
+The unit tests below were adapted accordingly (Issue #286 sub-issue brief:
+"if you change inquiry_answering internals, adapt its unit-test mocks but
+keep the lifecycle/contract tests intact").
+
 Covers:
 1. app/inquiry_answering.py's generate_inquiry_answer: fail-closed on
-   mock/non-reasoning clients and LLM/parse failures, answerable=false as a
-   non-error outcome, and unverifiable evidence citations dropped (not
-   fatal).
+   mock/non-reasoning clients and routing/investigation LLM failures, the
+   three route categories (human_only/system_researchable/hybrid), and
+   unverifiable evidence citations dropped (not fatal, via the
+   Investigation Agent's own pruning).
 2. Route lifecycle: create/list/detail/message/resolve/unresolved/hold/
    resume/cancel/reopen-doubt, invalid transitions -> 409, origin-untouched
    assertions (「解消を同意と誤認しない」), held_draft round-trip,
    unresolved/hold/cancel audit rows, LLM failure fail-closed (no assistant
    message, run recorded failed, inquiry stays open), answerable=false
-   path, and System isolation.
+   path, and System isolation. These route-level tests stub
+   ``generate_inquiry_answer`` wholesale (unaffected by the Issue #286
+   internal rework) so they stay exactly as Issue #285 wrote them.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import time
 from typing import Any, Dict, List, Optional
 
@@ -67,6 +82,9 @@ def _context_pack() -> InterviewContextPack:
 
 
 class FakeLLMClient(LLMClient):
+    """Single fixed response/error regardless of call -- only useful for the
+    Question Router call, since it always runs first."""
+
     def __init__(self, response: Any = None, error: Optional[str] = None):
         self._response = response
         self._error = error
@@ -77,6 +95,59 @@ class FakeLLMClient(LLMClient):
         if self._error:
             raise LLMError(self._error)
         return json.dumps(self._response)
+
+
+class RoutingFakeLLMClient(LLMClient):
+    """Dispatches by system-prompt marker: Question Router vs Investigation
+    Agent are two independent reasoning calls in the Issue #286 pipeline."""
+
+    def __init__(
+        self, *, route_response=None, route_error=None,
+        investigation_response=None, investigation_error=None,
+    ):
+        self.route_response = route_response
+        self.route_error = route_error
+        self.investigation_response = investigation_response
+        self.investigation_error = investigation_error
+        self.calls: List[str] = []
+
+    def generate_text(
+        self, messages: List[Dict[str, str]], *, temperature=None, max_tokens=None,
+    ) -> str:
+        system = next((m.get("content", "") for m in messages if m.get("role") == "system"), "")
+        # Investigation's own prompt mentions "the Question Router" in its
+        # instructions, so it must be checked first -- its own marker
+        # ("Investigation Agent") never appears in the router's prompt.
+        if "Investigation Agent" in system:
+            self.calls.append("investigation")
+            if self.investigation_error:
+                raise LLMError(self.investigation_error)
+            return json.dumps(self.investigation_response)
+        if "Question Router" in system:
+            self.calls.append("route")
+            if self.route_error:
+                raise LLMError(self.route_error)
+            return json.dumps(self.route_response)
+        raise AssertionError(f"Unexpected system prompt: {system[:80]!r}")
+
+
+def _init_repo(tmp_path, files: Dict[str, str]) -> "tuple[str, str]":
+    repo = str(tmp_path / "repo")
+    os.makedirs(repo)
+    subprocess.run(["git", "init", repo], check=True, capture_output=True)
+    subprocess.run(["git", "-C", repo, "config", "user.email", "test@test.com"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", repo, "config", "user.name", "Test"], check=True, capture_output=True)
+    for path, content in files.items():
+        full = os.path.join(repo, path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w") as f:
+            f.write(content)
+    subprocess.run(["git", "-C", repo, "add", "."], check=True, capture_output=True)
+    subprocess.run(["git", "-C", repo, "commit", "-m", "init"], check=True, capture_output=True)
+    sha = subprocess.run(
+        ["git", "-C", repo, "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    return repo, sha
 
 
 def test_generate_inquiry_answer_fails_closed_on_mock_client():
@@ -106,17 +177,48 @@ def test_generate_inquiry_answer_fails_closed_on_invalid_json():
     assert result.error is not None
 
 
-def test_generate_inquiry_answer_valid_response_with_verifiable_evidence():
-    client = FakeLLMClient(response={
-        "conclusion": "この関数はテキストを要約するために存在します。",
-        "key_points": ["入力は自由文", "出力は短い要約"],
-        "evidence": [{"path": "src/summarize.py", "start_line": 1, "end_line": 10, "summary": "定義箇所"}],
-        "uncertainty": "",
-        "answerable": True,
+def test_generate_inquiry_answer_human_only_needs_no_repo(tmp_path):
+    """human_only never triggers investigation -- no repo_path/commit_sha
+    needed, and result.investigation stays None."""
+    client = RoutingFakeLLMClient(route_response={
+        "category": "human_only",
+        "reason": "これは優先順位の判断であり、コードからは決められません。",
+        "research_focus": None,
     })
     result = generate_inquiry_answer(
         client, _make_config(),
+        context_pack=_context_pack(), question_text="この機能を今四半期に優先すべきですか?",
+    )
+    assert result.error is None
+    assert result.answerable is True
+    assert result.route is not None and result.route.category == "human_only"
+    assert result.investigation is None
+    assert "この機能を今四半期に優先すべきですか?" in result.conclusion
+    assert client.calls == ["route"]
+
+
+def test_generate_inquiry_answer_system_researchable_completed(tmp_path):
+    repo, sha = _init_repo(tmp_path, {"src/summarize.py": "\n".join(f"line{i}" for i in range(1, 21)) + "\n"})
+    client = RoutingFakeLLMClient(
+        route_response={
+            "category": "system_researchable",
+            "reason": "実装を読めば分かります。",
+            "research_focus": "summarize function",
+        },
+        investigation_response={
+            "status": "completed",
+            "conclusion": "この関数はテキストを要約するために存在します。",
+            "key_points": ["入力は自由文", "出力は短い要約"],
+            "evidence": [{"path": "src/summarize.py", "start_line": 1, "end_line": 10, "summary": "定義箇所"}],
+            "uncertainty": "",
+            "confidence": "confirmed",
+            "decision_question": None,
+        },
+    )
+    result = generate_inquiry_answer(
+        client, _make_config(),
         context_pack=_context_pack(), question_text="なぜこの実装なのですか?",
+        repo_path=repo, commit_sha=sha,
     )
     assert result.error is None
     assert result.answerable is True
@@ -124,24 +226,34 @@ def test_generate_inquiry_answer_valid_response_with_verifiable_evidence():
     assert len(result.evidence) == 1
     assert result.evidence[0].path == "src/summarize.py"
     assert result.evidence_dropped == 0
+    assert client.calls == ["route", "investigation"]
 
 
-def test_generate_inquiry_answer_drops_unverifiable_evidence():
-    """An evidence citation outside every known context-pack span is dropped,
-    not fatal -- the conclusion still comes back (Issue #142 pattern)."""
-    client = FakeLLMClient(response={
-        "conclusion": "結論です。",
-        "key_points": [],
-        "evidence": [
-            {"path": "src/summarize.py", "start_line": 1, "end_line": 10, "summary": "ok"},
-            {"path": "src/unknown.py", "start_line": 1, "end_line": 5, "summary": "invented"},
-        ],
-        "uncertainty": "",
-        "answerable": True,
-    })
+def test_generate_inquiry_answer_drops_unverifiable_evidence(tmp_path):
+    """An evidence citation outside every excerpt the Investigation Agent
+    actually read is dropped, not fatal -- the conclusion still comes back
+    (Issue #142 pattern, now enforced inside investigation_agent.py)."""
+    repo, sha = _init_repo(tmp_path, {"src/summarize.py": "\n".join(f"line{i}" for i in range(1, 21)) + "\n"})
+    client = RoutingFakeLLMClient(
+        route_response={
+            "category": "system_researchable", "reason": "r", "research_focus": "summarize",
+        },
+        investigation_response={
+            "status": "completed",
+            "conclusion": "結論です。",
+            "key_points": [],
+            "evidence": [
+                {"path": "src/summarize.py", "start_line": 1, "end_line": 10, "summary": "ok"},
+                {"path": "src/unknown.py", "start_line": 1, "end_line": 5, "summary": "invented"},
+            ],
+            "uncertainty": "",
+            "confidence": "likely",
+            "decision_question": None,
+        },
+    )
     result = generate_inquiry_answer(
         client, _make_config(),
-        context_pack=_context_pack(), question_text="q",
+        context_pack=_context_pack(), question_text="q", repo_path=repo, commit_sha=sha,
     )
     assert result.error is None
     assert len(result.evidence) == 1
@@ -149,21 +261,87 @@ def test_generate_inquiry_answer_drops_unverifiable_evidence():
     assert result.evidence_dropped == 1
 
 
-def test_generate_inquiry_answer_answerable_false_is_not_an_error():
-    client = FakeLLMClient(response={
-        "conclusion": "コンテキストからは判断できません。",
-        "key_points": [],
-        "evidence": [],
-        "uncertainty": "根拠となるコードが見つかりません",
-        "answerable": False,
+def test_generate_inquiry_answer_answerable_false_is_not_an_error(tmp_path):
+    """system_researchable + an unresolved investigation is not an error --
+    the caller substitutes the fixed template instead of fabricating."""
+    repo, sha = _init_repo(tmp_path, {"src/summarize.py": "line1\nline2\n"})
+    client = RoutingFakeLLMClient(
+        route_response={
+            "category": "system_researchable", "reason": "r", "research_focus": "summarize",
+        },
+        investigation_response={
+            "status": "unresolved",
+            "conclusion": "判断できません。",
+            "key_points": [],
+            "evidence": [],
+            "uncertainty": "根拠となるコードが見つかりません",
+            "confidence": "uncertain",
+            "decision_question": None,
+        },
+    )
+    result = generate_inquiry_answer(
+        client, _make_config(),
+        context_pack=_context_pack(), question_text="q", repo_path=repo, commit_sha=sha,
+    )
+    assert result.error is None
+    assert result.answerable is False
+    assert result.uncertainty == "根拠となるコードが見つかりません"
+
+
+def test_generate_inquiry_answer_hybrid_always_answerable_with_decision_question(tmp_path):
+    repo, sha = _init_repo(tmp_path, {"src/summarize.py": "line1\nline2\n"})
+    client = RoutingFakeLLMClient(
+        route_response={
+            "category": "hybrid", "reason": "r", "research_focus": "summarize",
+        },
+        investigation_response={
+            "status": "completed",
+            "conclusion": "現在は同期処理です。",
+            "key_points": [],
+            "evidence": [],
+            "uncertainty": "",
+            "confidence": "likely",
+            "decision_question": "非同期化を優先すべきですか?",
+        },
+    )
+    result = generate_inquiry_answer(
+        client, _make_config(),
+        context_pack=_context_pack(), question_text="q", repo_path=repo, commit_sha=sha,
+    )
+    assert result.error is None
+    assert result.answerable is True
+    assert result.decision_question == "非同期化を優先すべきですか?"
+    assert "非同期化を優先すべきですか?" in result.conclusion
+
+
+def test_generate_inquiry_answer_fails_closed_when_investigation_fails(tmp_path):
+    repo, sha = _init_repo(tmp_path, {"src/summarize.py": "line1\nline2\n"})
+    client = RoutingFakeLLMClient(
+        route_response={
+            "category": "system_researchable", "reason": "r", "research_focus": "summarize",
+        },
+        investigation_error="upstream timeout",
+    )
+    result = generate_inquiry_answer(
+        client, _make_config(),
+        context_pack=_context_pack(), question_text="q", repo_path=repo, commit_sha=sha,
+    )
+    assert result.error == "upstream timeout"
+    assert result.route is not None
+    assert result.investigation is not None and result.investigation.status == "failed"
+
+
+def test_generate_inquiry_answer_system_researchable_requires_pinned_snapshot():
+    """No repo_path/commit_sha -- investigation cannot run; fails closed."""
+    client = RoutingFakeLLMClient(route_response={
+        "category": "system_researchable", "reason": "r", "research_focus": "summarize",
     })
     result = generate_inquiry_answer(
         client, _make_config(),
         context_pack=_context_pack(), question_text="q",
     )
-    assert result.error is None
-    assert result.answerable is False
-    assert result.uncertainty == "根拠となるコードが見つかりません"
+    assert result.error is not None
+    assert result.investigation is None
 
 
 # --- Route-level lifecycle tests ----------------------------------------------

@@ -1,4 +1,4 @@
-"""Inquiry answer generation (Issue #285).
+"""Inquiry answer generation (Issue #285, reworked by Issue #286).
 
 When a developer has a doubt about a confirmation item (a Q&A question, an
 Intent Brief item, or — from Issue #287 onward — a review item), the
@@ -6,78 +6,65 @@ Inquiry conversation answers *that doubt*, strictly separate from answering
 or confirming the original item (see ``routes/interview_inquiry.py``). This
 module generates the assistant's answer inside that conversation.
 
-Grounded in the same snapshot context pack ``interview_context.py`` builds
-for the main interview dialogue (Issue #68): the model may cite
-``(path, start_line, end_line)`` spans that appear in the context pack, each
-with a short summary of what it shows (Principle 6 — deterministic
-containment check, not a heuristic reinterpretation of the model's
-citations). Unlike the two-pass evidence-selection-then-read flow in
-``interview_agent.py`` (Issue #130), this is a single reasoning call: the
-model answers directly from the context pack it is given, citing spans
-already surfaced there. This keeps the generation intentionally simple and
-isolated in one function so Issue #286 (Question Router / Investigation
-Agent) can replace the internals without touching the inquiry lifecycle
-routes.
+Issue #286 splits that single reasoning call into three composed steps:
 
-Fail-closed (Principle 6): a mock client, a non-reasoning model, an API
-failure, or a structured-output validation failure all return an error and
-no conclusion — callers must not persist an assistant message, only the
-failed intelligence_runs audit row (Principle 7). ``answerable=false`` is a
-distinct, non-error outcome: the model successfully determined it lacks
-grounding to answer, and the caller stores a fixed, server-authored
-message (never LLM-fabricated text) instead of the model's own wording.
+1. ``question_router.route_question`` classifies the Inquiry question into
+   ``human_only`` | ``system_researchable`` | ``hybrid``.
+2. For ``system_researchable``/``hybrid``, ``investigation_agent.investigate``
+   researches the PINNED repository snapshot only, within an explicit budget
+   (never the working tree, never unbounded reads).
+3. ``response_composer`` deterministically assembles the final conclusion-
+   first message from (1) and (2) -- no new wording is invented outside a
+   fixed server template or a reasoning step's own validated output.
+
+This module stays a pure orchestration function: it never touches the
+database. ``route`` and ``investigation`` are returned as sub-results so the
+caller (``routes/interview_inquiry.py``) can persist each reasoning call as
+its own ``intelligence_runs`` audit row (Principle 7), exactly as the two
+steps are two separate reasoning calls with their own prompt/schema
+versions. Keeping this module DB-free also means Issue #287+ can keep
+reusing it without threading write access through here.
+
+Fail-closed (Principle 6): if question routing itself fails (mock client,
+non-reasoning model, API failure, invalid structured output), the whole
+answer fails closed -- callers must not persist an assistant message, only
+the failed intelligence_runs audit row(s) (Principle 7). The same holds if
+an ``investigate()`` call reports ``status="failed"``. ``answerable=false``
+(the ``system_researchable``/unresolved-investigation case) is a distinct,
+non-error outcome: the caller substitutes a fixed, server-authored message
+(never LLM-fabricated text) instead of the model's own wording.
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
-
-from .interview_language import get_interview_language, language_directive
-from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient, is_reasoning_model
+from .interview_language import get_interview_language
+from .investigation_agent import (
+    InvestigationBudget,
+    InvestigationEvidenceItem,
+    InvestigationResult,
+    investigate,
+)
+from .llm import LLMClient, LLMConfig, MockLLMClient, is_reasoning_model
 from .models import InterviewContextPack
+from .question_router import RouteResult, route_question
+from .response_composer import compose_human_only, compose_hybrid, compose_system_researchable
 
-PROMPT_VERSION = "inquiry-answer-v1"
-SCHEMA_VERSION = "inquiry-answer-v1"
+PROMPT_VERSION = "inquiry-answer-v2"
+SCHEMA_VERSION = "inquiry-answer-v2"
 
 MAX_CONVERSATION_MESSAGES = 20
-MAX_EVIDENCE_ITEMS = 5
-
-
-# --- Raw response schema (what we require the model to return) --------------
-
-
-class _RawInquiryEvidence(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    path: str = Field(..., min_length=1, max_length=500)
-    start_line: int = Field(..., ge=1)
-    end_line: int = Field(..., ge=1)
-    summary: str = Field(default="", max_length=1_000)
-
-
-class _RawInquiryAnswer(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    conclusion: str = Field(..., min_length=1, max_length=1_000)
-    key_points: List[str] = Field(default_factory=list, max_length=10)
-    evidence: List[_RawInquiryEvidence] = Field(default_factory=list, max_length=MAX_EVIDENCE_ITEMS)
-    uncertainty: str = Field(default="", max_length=1_000)
-    answerable: bool = True
 
 
 # --- Public result types ------------------------------------------------------
 
 
-@dataclass
-class InquiryEvidenceItem:
-    path: str
-    start_line: int
-    end_line: int
-    summary: str = ""
+# Kept as an alias so existing imports (``from .investigation_agent import
+# InvestigationEvidenceItem``) and this module's own public evidence type
+# stay interchangeable for callers built against Issue #285's shape.
+InquiryEvidenceItem = InvestigationEvidenceItem
 
 
 @dataclass
@@ -93,108 +80,33 @@ class InquiryAnswerResult:
     uncertainty: str = ""
     answerable: bool = False
     evidence_dropped: int = 0
+    decision_question: Optional[str] = None
+    # Sub-run audit results, so the caller can persist each reasoning call
+    # as its own intelligence_runs row. None when that step never ran
+    # (route: only on an early failure before it could be called;
+    # investigation: always None for human_only).
+    route: Optional[RouteResult] = None
+    investigation: Optional[InvestigationResult] = None
     error: Optional[str] = None
 
 
-def _strip_fences(raw: str) -> str:
-    cleaned = raw.strip()
-    if not cleaned.startswith("```"):
-        return cleaned
-    lines = cleaned.split("\n")
-    lines = lines[1:] if lines[0].startswith("```") else lines
-    if lines and lines[-1].strip() == "```":
-        lines = lines[:-1]
-    return "\n".join(lines)
-
-
-_SYSTEM_PROMPT = """\
-You are answering a developer's follow-up doubt (Inquiry) raised while \
-confirming an item during a probe-agent system-understanding interview. The \
-Inquiry is a side conversation: resolving it never changes the original \
-item's own state; the developer confirms or corrects the original item \
-separately, afterward, through its own explicit action.
-
-Respond with a single JSON object and nothing else (no markdown fences, no \
-commentary), matching exactly this shape:
-
-{
-  "conclusion": "a short 1-3 sentence answer to the developer's question",
-  "key_points": ["..."],
-  "evidence": [
-    {"path": "src/module.py", "start_line": 1, "end_line": 20, "summary": "what this span shows"}
-  ],
-  "uncertainty": "what remains uncertain or unverified, or empty string if none",
-  "answerable": true
-}
-
-Rules:
-- Only cite "path"/"start_line"/"end_line" that appear in the supplied \
-context pack. Never invent a path or a line range.
-- "conclusion" must be short: 1-3 sentences, the direct answer first.
-- Set "answerable" to false, leave "conclusion" as your best short summary of \
-what is missing, and leave "evidence" empty when the context pack does not \
-contain enough grounding to answer the question. Do not guess or fabricate \
-an answer merely to appear helpful.
-- Never claim the original item has been answered, confirmed, or changed by \
-this conversation. This conversation only resolves the developer's doubt.
-"""
-
-
-def _system_prompt(language: str) -> str:
-    return _SYSTEM_PROMPT + language_directive(language) + "\n"
-
-
-def _allowed_spans(context_pack: InterviewContextPack) -> Dict[str, List[Tuple[int, int]]]:
-    """Snapshot-grounded (path -> line spans) the model may cite as evidence.
-
-    Mirrors ``interview_agent._allowed_evidence_spans`` for the context-pack
-    portion (Inquiry answers are not grounded in ``current_understanding`,
-    only in the context pack passed to this call) -- kept as an independent,
-    small copy rather than importing interview_agent internals so this
-    module stays a single self-contained swap point for Issue #286.
-    """
-    spans: Dict[str, List[Tuple[int, int]]] = {}
-    for sym in context_pack.symbols:
-        spans.setdefault(sym.path, []).append((sym.start_line, sym.end_line))
-    for ep in context_pack.entrypoints:
-        spans.setdefault(ep.handler_path, []).append((ep.line_start, ep.line_end))
-    return spans
-
-
-def _span_contains(start_line: int, end_line: int, span: Tuple[int, int]) -> bool:
-    start, end = span
-    if start < 1 or end < start:
-        return False
-    return start_line >= start and end_line <= end
-
-
-def _is_verifiable(item: _RawInquiryEvidence, spans: Dict[str, List[Tuple[int, int]]]) -> bool:
-    if item.path not in spans:
-        return False
-    if item.start_line < 1 or item.end_line < item.start_line:
-        return False
-    return any(_span_contains(item.start_line, item.end_line, span) for span in spans[item.path])
-
-
-def _build_user_prompt(
+def _build_router_context(
     context_pack: InterviewContextPack,
-    question_text: str,
     conversation: List[Dict[str, str]],
     origin_summary: Optional[str],
 ) -> str:
     parts: List[str] = []
     if origin_summary:
-        parts.append("## Original item under discussion (context only; not being answered here)")
-        parts.append(origin_summary)
-    parts.append("## Context Pack (the only allowed source of evidence paths/line ranges)")
-    parts.append(context_pack.model_dump_json())
+        parts.append(f"Original item under discussion (context only): {origin_summary}")
+    parts.append(
+        f"Snapshot has {context_pack.total_symbols} indexed symbol(s) and "
+        f"{context_pack.total_entrypoints} entrypoint(s) "
+        f"({context_pack.unclassified_count} unclassified)."
+    )
     recent = conversation[-MAX_CONVERSATION_MESSAGES:]
     if recent:
-        parts.append("## Inquiry conversation so far")
-        for msg in recent:
-            parts.append(f"{msg.get('role', '?')}: {msg.get('content', '')}")
-    parts.append("## Developer's question")
-    parts.append(question_text)
+        convo = "\n".join(f"{m.get('role', '?')}: {m.get('content', '')}" for m in recent)
+        parts.append(f"Inquiry conversation so far:\n{convo}")
     return "\n\n".join(parts)
 
 
@@ -206,19 +118,26 @@ def generate_inquiry_answer(
     question_text: str,
     conversation: Optional[List[Dict[str, str]]] = None,
     origin_summary: Optional[str] = None,
+    repo_path: Optional[str] = None,
+    commit_sha: Optional[str] = None,
+    investigation_budget: Optional[InvestigationBudget] = None,
 ) -> InquiryAnswerResult:
     """Generate one assistant answer for an Inquiry conversation turn.
 
+    Routes the question first; ``human_only`` never triggers investigation.
+    ``system_researchable``/``hybrid`` call ``investigate()`` against
+    ``repo_path``/``commit_sha`` (the pinned snapshot's Git location) and
+    compose the final message deterministically from its result.
+
     Fail-closed: a mock client, a non-reasoning model, invalid language
-    configuration, an API failure, or a structured-output validation failure
-    all return a result with ``error`` set and no conclusion -- callers must
-    not persist an assistant message for these. ``answerable=false`` is not
-    an error: the model determined (grounded in the context pack) that it
-    cannot answer, and the caller substitutes a fixed, non-fabricated
-    message instead of ``conclusion``. Unverifiable evidence citations are
-    dropped (not fatal), matching the interview dialogue's Issue #142
-    graceful-degradation pattern.
+    configuration, a routing failure, or an investigation failure
+    (``status="failed"``) all return a result with ``error`` set and no
+    conclusion -- callers must not persist an assistant message for these.
+    ``answerable=false`` is not an error: it is the
+    ``system_researchable``/unresolved-investigation outcome, and the caller
+    substitutes a fixed, non-fabricated message instead of ``conclusion``.
     """
+    conversation = conversation or []
     is_mock = isinstance(client, MockLLMClient)
     if is_mock or not is_reasoning_model(config.provider, config.model):
         return InquiryAnswerResult(
@@ -238,55 +157,57 @@ def generate_inquiry_answer(
             provider=config.provider, model=config.model, is_mock=False, error=str(exc),
         )
 
-    prompt = _build_user_prompt(
-        context_pack, question_text, conversation or [], origin_summary,
+    router_context = _build_router_context(context_pack, conversation, origin_summary)
+    route = route_question(client, config, question_text=question_text, context=router_context, language=language)
+
+    if route.error:
+        return InquiryAnswerResult(
+            provider=config.provider, model=config.model, is_mock=False,
+            route=route, error=route.error,
+        )
+
+    if route.category == "human_only":
+        composed = compose_human_only(question_text=question_text, route_reason=route.reason, language=language)
+        return InquiryAnswerResult(
+            provider=config.provider, model=config.model, is_mock=False,
+            conclusion=composed.conclusion, key_points=composed.key_points,
+            evidence=composed.evidence, uncertainty=composed.uncertainty,
+            answerable=composed.answerable, decision_question=composed.decision_question,
+            route=route, investigation=None,
+        )
+
+    # system_researchable | hybrid: both require a pinned snapshot location.
+    if not repo_path or not commit_sha:
+        return InquiryAnswerResult(
+            provider=config.provider, model=config.model, is_mock=False,
+            route=route,
+            error="Investigation requires a pinned snapshot repo_path/commit_sha",
+        )
+
+    investigation = investigate(
+        client, config,
+        repo_path=repo_path, commit_sha=commit_sha,
+        question=question_text, research_focus=route.research_focus,
+        hybrid_decision_question=(route.category == "hybrid"),
+        language=language, budget=investigation_budget,
     )
 
-    try:
-        raw = client.generate_text(
-            [
-                {"role": "system", "content": _system_prompt(language)},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-            max_tokens=2048,
-        )
-    except LLMError as exc:
+    if investigation.status == "failed":
         return InquiryAnswerResult(
-            provider=config.provider, model=config.model, is_mock=False, error=str(exc),
+            provider=config.provider, model=config.model, is_mock=False,
+            route=route, investigation=investigation, error=investigation.error,
         )
 
-    try:
-        parsed = json.loads(_strip_fences(raw))
-        validated = _RawInquiryAnswer.model_validate(parsed)
-    except (json.JSONDecodeError, ValidationError) as exc:
-        return InquiryAnswerResult(
-            provider=config.provider,
-            model=config.model,
-            is_mock=False,
-            error=f"Failed to parse structured response: {exc}",
-        )
-
-    spans = _allowed_spans(context_pack)
-    kept_evidence: List[InquiryEvidenceItem] = []
-    dropped = 0
-    for item in validated.evidence:
-        if _is_verifiable(item, spans):
-            kept_evidence.append(InquiryEvidenceItem(
-                path=item.path, start_line=item.start_line, end_line=item.end_line,
-                summary=item.summary,
-            ))
-        else:
-            dropped += 1
+    if route.category == "hybrid":
+        composed = compose_hybrid(investigation=investigation, question_text=question_text, language=language)
+    else:
+        composed = compose_system_researchable(investigation=investigation, language=language)
 
     return InquiryAnswerResult(
-        provider=config.provider,
-        model=config.model,
-        is_mock=False,
-        conclusion=validated.conclusion,
-        key_points=list(validated.key_points),
-        evidence=kept_evidence,
-        uncertainty=validated.uncertainty,
-        answerable=validated.answerable,
-        evidence_dropped=dropped,
+        provider=config.provider, model=config.model, is_mock=False,
+        conclusion=composed.conclusion, key_points=composed.key_points,
+        evidence=composed.evidence, uncertainty=composed.uncertainty,
+        answerable=composed.answerable, decision_question=composed.decision_question,
+        evidence_dropped=len(investigation.pruned_evidence),
+        route=route, investigation=investigation,
     )

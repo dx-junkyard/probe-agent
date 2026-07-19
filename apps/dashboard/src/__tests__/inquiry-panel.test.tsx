@@ -111,6 +111,38 @@ beforeEach(() => {
         ],
       });
     }
+    if (path === "/interview/inquiries/300") {
+      return Promise.resolve({
+        inquiry: {
+          id: 300, session_id: 1, system_id: 1, origin_kind: "intent", origin_id: 5,
+          held_draft: null, status: "open", status_reason: null,
+          created_at: 0, updated_at: 0, closed_at: null,
+        },
+        messages: [
+          { id: 1, inquiry_id: 300, system_id: 1, role: "user", content: "researchable な質問", detail: null, intelligence_run_id: null, is_mock: false, created_at: 0 },
+          {
+            id: 2, inquiry_id: 300, system_id: 1, role: "assistant", content: "コードから分かる回答です。",
+            detail: { key_points: [], evidence: [], uncertainty: "", route_category: "system_researchable", decision_question: null },
+            intelligence_run_id: 1, is_mock: false, created_at: 0,
+          },
+          { id: 3, inquiry_id: 300, system_id: 1, role: "user", content: "human_only な質問", detail: null, intelligence_run_id: null, is_mock: false, created_at: 0 },
+          {
+            id: 4, inquiry_id: 300, system_id: 1, role: "assistant", content: "あなたの判断が必要な内容です。",
+            detail: { key_points: [], evidence: [], uncertainty: "", route_category: "human_only", decision_question: null },
+            intelligence_run_id: 2, is_mock: false, created_at: 0,
+          },
+          { id: 5, inquiry_id: 300, system_id: 1, role: "user", content: "hybrid な質問", detail: null, intelligence_run_id: null, is_mock: false, created_at: 0 },
+          {
+            id: 6, inquiry_id: 300, system_id: 1, role: "assistant", content: "現在は同期処理です。",
+            detail: {
+              key_points: [], evidence: [], uncertainty: "",
+              route_category: "hybrid", decision_question: "非同期化を優先すべきですか?",
+            },
+            intelligence_run_id: 3, is_mock: false, created_at: 0,
+          },
+        ],
+      });
+    }
     throw new Error(`Unexpected GET ${path}`);
   });
 });
@@ -267,5 +299,53 @@ describe("InquiryPanel (Issue #285)", () => {
     });
     // Resuming reattaches to the same Inquiry and shows its conversation.
     expect(await within(row).findByText("以前の回答です。")).toBeInTheDocument();
+  });
+
+  // --- Question Router category badge (Issue #286) --------------------------
+
+  describe("route category badge", () => {
+    async function openInquiry300() {
+      inquiryListItems = [{
+        id: 300, session_id: 1, system_id: 1, origin_kind: "intent", origin_id: 5,
+        held_draft: null, status: "open", status_reason: null,
+        created_at: 0, updated_at: 0, closed_at: null,
+      }];
+      const row = await openIntentPanel();
+      fireEvent.click(await within(row).findByTestId("intent-item-inquiry-reopen-5"));
+      await within(row).findByText("コードから分かる回答です。");
+      return row;
+    }
+
+    test("system_researchable shows 「AI が調査して回答」and no raw enum text", async () => {
+      const row = await openInquiry300();
+      expect(within(row).getByTestId("inquiry-message-route-2")).toHaveTextContent(
+        "AI が調査して回答",
+      );
+      expect(within(row).queryByText("system_researchable")).not.toBeInTheDocument();
+    });
+
+    test("human_only shows 「あなたの判断が必要」and no raw enum text", async () => {
+      const row = await openInquiry300();
+      expect(within(row).getByTestId("inquiry-message-route-4")).toHaveTextContent(
+        "あなたの判断が必要",
+      );
+      expect(within(row).queryByText("human_only")).not.toBeInTheDocument();
+    });
+
+    test("hybrid shows 「調査 + あなたの判断」and the decision question emphasized", async () => {
+      const row = await openInquiry300();
+      expect(within(row).getByTestId("inquiry-message-route-6")).toHaveTextContent(
+        "調査 + あなたの判断",
+      );
+      expect(within(row).queryByText("hybrid")).not.toBeInTheDocument();
+      expect(within(row).getByTestId("inquiry-message-decision-question-6")).toHaveTextContent(
+        "確認したいこと: 非同期化を優先すべきですか?",
+      );
+    });
+
+    test("a message with no route_category shows no badge", async () => {
+      const row = await openInquiry();
+      expect(within(row).queryByTestId("inquiry-message-route-2")).not.toBeInTheDocument();
+    });
   });
 });

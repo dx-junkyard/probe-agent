@@ -18,7 +18,21 @@ import {
   useResolveInterviewInquiry,
   useSendInterviewInquiryMessage,
 } from "@/api/hooks";
-import type { InterviewInquiryMessageOut, InterviewInquiryOriginKind } from "@/api/types";
+import type {
+  InquiryRouteCategory,
+  InterviewInquiryMessageOut,
+  InterviewInquiryOriginKind,
+} from "@/api/types";
+
+// Issue #286: Question Router category -> 日本語ラベル。canonical enum
+// (human_only | system_researchable | hybrid) は英語のまま内部で保持し、
+// 表示ラベルだけ日本語に変換する(Issue #266 の規約どおり、raw な enum
+// 文字列を画面に出さない)。
+const ROUTE_CATEGORY_LABELS: Record<InquiryRouteCategory, string> = {
+  system_researchable: "AI が調査して回答",
+  human_only: "あなたの判断が必要",
+  hybrid: "調査 + あなたの判断",
+};
 
 function InquiryMessageBubble({ message }: { message: InterviewInquiryMessageOut }) {
   const [showEvidence, setShowEvidence] = useState(false);
@@ -38,16 +52,34 @@ function InquiryMessageBubble({ message }: { message: InterviewInquiryMessageOut
         <span className="font-semibold text-muted-foreground">
           {isAssistant ? "アシスタント" : "あなた"}
         </span>
-        {isAssistant && message.is_mock && (
-          <span
-            className="rounded bg-amber-500/20 px-1 text-[10px] text-amber-700"
-            data-testid={`inquiry-message-mock-${message.id}`}
-          >
-            mock
-          </span>
-        )}
+        <div className="flex items-center gap-1">
+          {isAssistant && message.detail?.route_category && (
+            <span
+              className="rounded bg-sky-500/20 px-1 text-[10px] text-sky-700"
+              data-testid={`inquiry-message-route-${message.id}`}
+            >
+              {ROUTE_CATEGORY_LABELS[message.detail.route_category]}
+            </span>
+          )}
+          {isAssistant && message.is_mock && (
+            <span
+              className="rounded bg-amber-500/20 px-1 text-[10px] text-amber-700"
+              data-testid={`inquiry-message-mock-${message.id}`}
+            >
+              mock
+            </span>
+          )}
+        </div>
       </div>
       <p className="whitespace-pre-wrap break-words">{message.content}</p>
+      {isAssistant && message.detail?.decision_question && (
+        <p
+          className="rounded border border-amber-500/60 bg-amber-500/10 px-2 py-1 font-medium text-amber-800"
+          data-testid={`inquiry-message-decision-question-${message.id}`}
+        >
+          確認したいこと: {message.detail.decision_question}
+        </p>
+      )}
       {isAssistant && hasDetail && (
         <div>
           <Button
