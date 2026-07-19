@@ -504,17 +504,16 @@ def test_create_inquiry_from_intent_does_not_touch_origin_row(admin_client, monk
     assert origin["value_text"] == intent["value_text"]
 
 
-def test_create_inquiry_review_item_origin_kind_accepted_without_table(admin_client, monkeypatch):
-    """review_item rows only appear from #287 onward, but the enum exists
-    now and creation must not fail just because no reviewing table exists."""
+def test_create_inquiry_review_item_origin_kind_rejects_unknown_id(admin_client, monkeypatch):
+    """Issue #287: unlike qa/intent's original placeholder behavior, a
+    review_item origin_id must now resolve to a real alignment_item row."""
     token, system_id, snapshot_id = _setup(admin_client)
     headers = _headers(token, system_id)
     session_id = _create_session(admin_client, headers, snapshot_id)
 
     _stub_answer(monkeypatch)
     r = _open_inquiry(admin_client, headers, session_id, "review_item", 999)
-    assert r.status_code == 201, r.text
-    assert r.json()["inquiry"]["origin_kind"] == "review_item"
+    assert r.status_code == 404, r.text
 
 
 def test_create_inquiry_rejects_unknown_qa_origin(admin_client):
@@ -545,6 +544,151 @@ def test_create_inquiry_is_mock_propagated(admin_client, monkeypatch):
     r = _open_inquiry(admin_client, headers, session_id, "qa", qa["id"])
     assert r.status_code == 201, r.text
     assert r.json()["messages"][1]["is_mock"] is True
+
+
+# --- Issue #287: review_item <-> alignment_item.status linkage ---------------
+
+
+def _insert_alignment_item(system_id, session_id, snapshot_id, *, status="open"):
+    """Insert a minimal alignment_item row directly (bypassing the #287
+    build endpoint, which is out of scope for this module's tests)."""
+    from app.db import get_conn
+
+    now = time.time()
+    with get_conn() as conn:
+        run_cur = conn.execute(
+            """
+            INSERT INTO intelligence_runs
+                (system_id, snapshot_id, run_type, provider, model,
+                 prompt_version, schema_version, decision_method, status,
+                 is_mock, started_at, completed_at)
+            VALUES (?, ?, 'alignment_build', 'anthropic', 'claude-sonnet-4-5',
+                    'alignment-v1', 'alignment-v1', 'reasoning_llm', 'completed',
+                    0, ?, ?)
+            """,
+            (system_id, snapshot_id, now, now),
+        )
+        run_id = run_cur.lastrowid
+        cur = conn.execute(
+            """
+            INSERT INTO alignment_item
+                (session_id, system_id, revision_id, snapshot_id, current_claim,
+                 current_evidence, alignment_state, risk_flags, confidence,
+                 review_category, reason_code, user_reason, status,
+                 intelligence_run_id, is_mock, created_at, updated_at)
+            VALUES (?, ?, NULL, ?, 'テストクレーム',
+                    '[{"path": "src/a.py", "start_line": 1, "end_line": 2, "summary": "s"}]',
+                    'gap', '[]', 'likely', 'batch_reviewable', 'routine_update',
+                    '軽微な差分です。まとめて確認してください', ?, ?, 0, ?, ?)
+            """,
+            (session_id, system_id, snapshot_id, status, run_id, now, now),
+        )
+        return cur.lastrowid
+
+
+def _get_alignment_item(system_id, item_id):
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        return dict(conn.execute(
+            "SELECT * FROM alignment_item WHERE id = ? AND system_id = ?", (item_id, system_id),
+        ).fetchone())
+
+
+def test_review_item_inquiry_open_sets_item_status_inquiry(admin_client, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    item_id = _insert_alignment_item(system_id, session_id, snapshot_id)
+
+    _stub_answer(monkeypatch)
+    r = _open_inquiry(admin_client, headers, session_id, "review_item", item_id)
+    assert r.status_code == 201, r.text
+
+    assert _get_alignment_item(system_id, item_id)["status"] == "inquiry"
+
+
+def test_review_item_inquiry_resolve_sets_item_back_to_open_not_answered(admin_client, monkeypatch):
+    """The regression this issue's brief calls for explicitly: resolving the
+    Inquiry must never itself count as answering the review item."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    item_id = _insert_alignment_item(system_id, session_id, snapshot_id)
+
+    _stub_answer(monkeypatch)
+    created = _open_inquiry(admin_client, headers, session_id, "review_item", item_id)
+    inquiry_id = created.json()["inquiry"]["id"]
+    assert _get_alignment_item(system_id, item_id)["status"] == "inquiry"
+
+    r = admin_client.post(f"/interview/inquiries/{inquiry_id}/resolve", headers=headers)
+    assert r.status_code == 200, r.text
+
+    after = _get_alignment_item(system_id, item_id)
+    assert after["status"] == "open"
+    assert after["user_decision"] is None
+
+    # The developer must still explicitly answer via the item's own endpoint.
+    answer = admin_client.post(
+        f"/interview/alignment/{item_id}/answer",
+        json={"decision": "accept_current"},
+        headers=headers,
+    )
+    assert answer.status_code == 200, answer.text
+    assert answer.json()["status"] == "answered"
+
+
+def test_review_item_inquiry_held_keeps_item_status_inquiry(admin_client, monkeypatch):
+    """held is a pause, not a close -- the item must stay blocked, not
+    silently revert to 'open' while the Inquiry itself is still pending."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    item_id = _insert_alignment_item(system_id, session_id, snapshot_id)
+
+    _stub_answer(monkeypatch)
+    created = _open_inquiry(admin_client, headers, session_id, "review_item", item_id)
+    inquiry_id = created.json()["inquiry"]["id"]
+
+    r = admin_client.post(f"/interview/inquiries/{inquiry_id}/hold", headers=headers)
+    assert r.status_code == 200, r.text
+    assert _get_alignment_item(system_id, item_id)["status"] == "inquiry"
+
+
+def test_review_item_inquiry_cancel_and_unresolved_also_release_item(admin_client, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+
+    item_a = _insert_alignment_item(system_id, session_id, snapshot_id)
+    item_b = _insert_alignment_item(system_id, session_id, snapshot_id)
+
+    _stub_answer(monkeypatch)
+    inquiry_a = _open_inquiry(admin_client, headers, session_id, "review_item", item_a).json()["inquiry"]["id"]
+    inquiry_b = _open_inquiry(admin_client, headers, session_id, "review_item", item_b).json()["inquiry"]["id"]
+
+    admin_client.post(f"/interview/inquiries/{inquiry_a}/cancel", headers=headers)
+    admin_client.post(f"/interview/inquiries/{inquiry_b}/unresolved", headers=headers)
+
+    assert _get_alignment_item(system_id, item_a)["status"] == "open"
+    assert _get_alignment_item(system_id, item_b)["status"] == "open"
+
+
+def test_review_item_inquiry_answer_locked_while_inquiry_open(admin_client, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    item_id = _insert_alignment_item(system_id, session_id, snapshot_id)
+
+    _stub_answer(monkeypatch)
+    _open_inquiry(admin_client, headers, session_id, "review_item", item_id)
+
+    r = admin_client.post(
+        f"/interview/alignment/{item_id}/answer",
+        json={"decision": "accept_current"},
+        headers=headers,
+    )
+    assert r.status_code == 409, r.text
 
 
 # --- LLM failure: fail-closed --------------------------------------------------

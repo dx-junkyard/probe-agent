@@ -876,6 +876,91 @@ export interface InterviewInquiryListOut {
   items: InterviewInquiryOut[];
 }
 
+// --- Alignment Review / Review Queue (Issue #287) -----------------------------
+//
+// Contrasts confirmed/proposed Intent Brief items against the evidence-backed
+// Current System understanding to produce alignment items with a
+// deterministic review classification. Only review_category IN (must_review,
+// batch_reviewable) ever surfaces as an action-required Review Queue card;
+// the rest are collapsed/informational.
+
+export type AlignmentState = "aligned" | "gap" | "unknown" | "conflict" | "not_applicable";
+export type AlignmentRiskFlag = "security" | "high_risk" | "core_intent";
+export type AlignmentConfidence = "confirmed" | "likely" | "uncertain" | "conflicting";
+export type AlignmentReviewCategory =
+  | "must_review" | "batch_reviewable" | "no_review_required" | "unchanged" | "informational";
+export type AlignmentReasonCode =
+  | "security_related" | "high_risk" | "core_intent" | "conflict_detected"
+  | "low_confidence" | "runtime_mismatch" | "routine_update" | "no_change"
+  | "informational_only";
+// 'inquiry' is set while an Inquiry (origin_kind='review_item') is open on
+// this item, and reset to 'open' (never 'answered') when it closes.
+export type AlignmentItemStatus = "open" | "answered" | "corrected" | "held" | "inquiry";
+export type AlignmentDecisionAction = "accept_current" | "needs_change" | "reject_interpretation";
+export type AlignmentUserDecisionAction = AlignmentDecisionAction | "corrected" | "held";
+
+export interface AlignmentEvidenceOut {
+  path: string;
+  start_line: number;
+  end_line: number;
+  summary: string;
+}
+
+export interface AlignmentUserDecisionOut {
+  action: AlignmentUserDecisionAction;
+  note: string | null;
+  decided_at: number;
+  decided_by: string | null;
+}
+
+export interface AlignmentItemOut {
+  id: number;
+  session_id: number;
+  system_id: number;
+  revision_id: number | null;
+  snapshot_id: number;
+  intent_item_id: number | null;
+  intent_summary: string | null;
+  current_claim: string;
+  current_evidence: AlignmentEvidenceOut[];
+  gap_summary: string | null;
+  proposed_interpretation: string | null;
+  alignment_state: AlignmentState;
+  risk_flags: AlignmentRiskFlag[];
+  confidence: AlignmentConfidence;
+  review_category: AlignmentReviewCategory;
+  reason_code: AlignmentReasonCode;
+  user_reason: string;
+  status: AlignmentItemStatus;
+  user_decision: AlignmentUserDecisionOut | null;
+  intelligence_run_id: number;
+  is_mock: boolean;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface AlignmentBuildOut {
+  session_id: number;
+  system_id: number;
+  revision_id: number | null;
+  intelligence_run_id: number;
+  is_mock: boolean;
+  items: AlignmentItemOut[];
+}
+
+export interface AlignmentListOut {
+  session_id: number;
+  system_id: number;
+  items_by_category: Record<string, AlignmentItemOut[]>;
+  counts: Record<string, number>;
+}
+
+export interface AlignmentReviewQueueOut {
+  session_id: number;
+  system_id: number;
+  items: AlignmentItemOut[];
+}
+
 export interface InterviewProposalDecisionOut {
   id: number;
   proposal_id: number;

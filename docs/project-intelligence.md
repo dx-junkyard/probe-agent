@@ -2740,3 +2740,218 @@ assistant メッセージの先頭行に、`detail.route_category` を日本語�
   pin 済み snapshot が無い場合の fail-closed)を追加しつつ、Issue #285
   のライフサイクル/遷移テスト(30件、`generate_inquiry_answer` を丸ごと
   スタブする方式)はそのまま維持した。
+
+## Alignment Review / Review Queue(Issue #287)
+
+Intent Brief(確定/提案済みの意図、Issue #284)と、証拠付きの「現在の理
+解」(最新の `understanding_revision`、Issue #136)を突き合わせ、
+**alignment item**(突き合わせ結果1件)を生成する。各 item は
+reasoning モデルが提案した内容(claim・evidence・alignment_state・
+risk_flags・confidence など)と、そこから **決定的に** 導出される
+review_category/reason_code を持つ。Review Queue には
+`must_review`/`batch_reviewable` の item だけが「要対応」として現れ、
+残りは折りたたみ表示にとどまる。
+
+### テーブル(additive): `alignment_item`
+
+| カラム | 型 | 説明 |
+| --- | --- | --- |
+| `id` | INTEGER PK | |
+| `session_id` / `system_id` | INTEGER NOT NULL | System-scoped、`interview_session` に紐づく |
+| `revision_id` | INTEGER NULL | この item を計算した基準の `understanding_revision` |
+| `snapshot_id` | INTEGER NOT NULL | `revision_id` が指すスナップショット |
+| `intent_item_id` | INTEGER NULL | 関連する `interview_intent_item`(構造的に解決。下記参照) |
+| `intent_summary` | TEXT NULL | reasoning モデルが付けた意図側の短い要約(表示専用) |
+| `current_claim` | TEXT NOT NULL | 「現在の理解」側のクレーム本文 |
+| `current_evidence` | TEXT NOT NULL (JSON) | `[{path,start_line,end_line,summary}]`。pin 済みスナップショットに対して検証済み |
+| `gap_summary` / `proposed_interpretation` | TEXT NULL | |
+| `alignment_state` | TEXT NOT NULL | `aligned\|gap\|unknown\|conflict\|not_applicable` |
+| `risk_flags` | TEXT NOT NULL (JSON) DEFAULT `[]` | 有限集合 `security\|high_risk\|core_intent` の部分集合 |
+| `confidence` | TEXT NOT NULL | `confirmed\|likely\|uncertain\|conflicting`(既存の水準を再利用) |
+| `review_category` | TEXT NOT NULL | `must_review\|batch_reviewable\|no_review_required\|unchanged\|informational` |
+| `reason_code` | TEXT NOT NULL | 下記ルール表参照 |
+| `user_reason` | TEXT NOT NULL | `reason_code` ごとの固定日本語テンプレート(LLM 自由文ではない) |
+| `status` | TEXT NOT NULL DEFAULT `'open'` | `open\|answered\|corrected\|held\|inquiry` |
+| `user_decision` | TEXT NULL (JSON) | `{action, note, decided_at, decided_by}`。サーバーは絶対に自動セットしない |
+| `intelligence_run_id` | INTEGER NOT NULL | この item を生成した `intelligence_runs` 行 |
+| `is_mock` | INTEGER DEFAULT 0 | |
+| `created_at` / `updated_at` | REAL NOT NULL | |
+
+`unchanged` は将来のビルド間差分検出(前回ビルドと同一内容)のために予
+約された値で、現時点のルール表からは到達しない(#287 の決定的ルール表
+は brief の記述どおり実装されており、`unchanged` を出力する分岐を持た
+ない)。Dashboard 側は未知/未到達の値でも折りたたみ扱いに倒すため、実
+装上の問題にはならない。
+
+### 生成(`app/alignment.py`)
+
+`build_alignment`(実体は `routes/interview_alignment.py` の
+`POST .../alignment/build` ハンドラ。DB オーケストレーションはルート層、
+reasoning 呼び出しと決定的検証は `app/alignment.py` という、Issue
+#284/#285 と同じ責務分割)は次の手順で動く:
+
+1. セッションの現在(`superseded_by_id IS NULL`)の Intent Brief item 全
+   件と、最新の `understanding_revision`(`current_understanding` /
+   `gap_analysis`)を読み込む。`understanding_revision` が1件も無い場合
+   は 409(reasoning 呼び出しは一切行わず、`intelligence_runs` 行も作ら
+   ない — 「先に System Understanding を構築してください」という前提条
+   件の欠落であり、reasoning の失敗ではないため)。
+2. reasoning モデル(`generate_alignment_proposal`、`prompt_version`/
+   `schema_version` = `alignment-v1`、run_type
+   `alignment_build`)が alignment item 候補を提案する:
+   `{items: [{intent_field, intent_ref_hint, current_claim, evidence[],
+   alignment_state, risk_flags, confidence, gap_summary,
+   proposed_interpretation}]}`。`alignment_state`/`confidence`/
+   `risk_flags`/`intent_field` はすべて有限集合に対してスキーマ検証さ
+   れ、外れた値が1つでもあればビルド全体を fail-closed する(Issue
+   #286 の Question Router と同じ扱い)。
+   - `intent_item_id` はモデルの自由文からは決めない。モデルが返すのは
+     `intent_field`(6値の enum、または関連する意図が無ければ `null`)
+     だけで、実際の `interview_intent_item.id` への解決はサーバー側で
+     「そのセッションの、その `field` の現在(非supersede)行」への完
+     全一致検索という決定的な構造チェックで行う(Principle 6 — 自由文
+     の fuzzy match は一切しない)。
+3. `evidence` は Issue #286 の Investigation Agent と同じ規律で pin 済
+   みスナップショットに対して検証する: path がそのコミットに存在し、
+   `1 <= start_line <= end_line <= (そのファイルの実際の行数)` を満た
+   すことを `git_ops.read_file_at_commit` で確認する(決定的、reasoning
+   ではない)。無効な evidence は item から取り除かれる(記録される)。
+   取り除いた結果その item の evidence が0件になった item はその item
+   ごと破棄する。**モデルが1件以上の item を提案したにもかかわらず、
+   有効な item が1件も残らなかった場合はビルド全体を fail-closed する**
+   (「有効な引用が0件なら失敗」の単位を、Issue #286 の1メッセージ単位
+   ではなく、このビルド1回の単位に広げたもの)。モデルが最初から
+   `items: []` を返した場合(比較する新事実が無い、という結論)は失敗
+   ではない。
+4. `review_category` + `reason_code` は前段の**決定的な**ルール表
+   (`app/alignment.py` の `_RULES`、先勝ちのデータ列で実装)から導出す
+   る。数値スコアの合算や LLM による並べ替えは一切行わない:
+
+   ```
+   'security' in risk_flags                                          -> must_review, security_related
+   'high_risk' in risk_flags                                         -> must_review, high_risk
+   'core_intent' in risk_flags OR (intent_field == 'goal' AND
+       alignment_state in (gap, conflict))                           -> must_review, core_intent
+   alignment_state == 'conflict'                                     -> must_review, conflict_detected
+   confidence in (uncertain, conflicting)                            -> must_review, low_confidence
+   alignment_state == 'unknown'                                      -> must_review, low_confidence
+   alignment_state == 'gap'                                          -> batch_reviewable, routine_update
+   alignment_state == 'aligned'                                      -> no_review_required, no_change
+   alignment_state == 'not_applicable'                               -> informational, informational_only
+   ```
+
+   有効な `alignment_state`(5値)は必ずこの表のどれか1行に一致する
+   (先勝ち)ため、スキーマ検証済みの入力に対してこの関数が例外を投げる
+   ことはない。`user_reason` は `reason_code` ごとの固定辞書
+   (`USER_REASON_TEMPLATES`)からそのまま引く(例:
+   `security_related` → 「セキュリティに関わるため個別確認が必要です」)。
+
+5. **キューの並び順**は `review_sort_key` によって決定的に決まる:
+   `(review_category のランク, reason_code のランク, id 昇順)`。ランク
+   は `REVIEW_CATEGORIES`/`REASON_CODES` タプルの並び順(must_review が
+   最優先、reason_code は `security_related < high_risk < core_intent <
+   conflict_detected < low_confidence < runtime_mismatch <
+   routine_update < no_change < informational_only`)そのもの。LLM によ
+   る並べ替えや数値スコアの掛け算は一切しない。
+
+### 再ビルド(rebuild-merge)のルール
+
+`POST .../alignment/build` を再度呼ぶと、そのセッションの
+`status = 'open' AND user_decision IS NULL` の行だけを **削除して作り直
+す**(未対応・ユーザー操作が一切入っていない提案のみが対象)。それ以外
+の行 —`answered`/`corrected`/`held`/`inquiry` のいずれか、または
+`user_decision` が記録済み — は、基準リビジョンがどれだけ新しくなって
+も再ビルドで削除・上書きされない(Principle 2: 再ビルドが人間の決定を
+失わせてはならない)。この非対称性はテーブルコメントと
+`tests/test_interview_alignment.py` の
+`test_rebuild_preserves_items_with_user_progress_and_refreshes_untouched_open`
+/ `test_held_item_is_also_preserved_across_rebuild` で固定化している。
+
+### ルート(`routes/interview_alignment.py`、`main.py` に登録)
+
+- `POST /interview/sessions/{id}/alignment/build` — 上記の生成 + 再ビル
+  ド。前提条件欠落は 409、reasoning/検証の失敗は 502(いずれも
+  `alignment_item` 行は一切変更されない)。
+- `GET /interview/sessions/{id}/alignment` — 全 item を `review_category`
+  ごとにグルーピングして返す(`items_by_category` + `counts`)。
+- `GET /interview/sessions/{id}/review-queue` — `must_review` /
+  `batch_reviewable` の item だけを `review_sort_key` の順で返す。
+- `POST /interview/alignment/{item_id}/answer` —
+  `{decision: accept_current|needs_change|reject_interpretation, note?}`。
+  `status='answered'` + `user_decision` を記録する(`decision_method` は
+  常に人間の明示操作、Principle 2)。
+- `POST /interview/alignment/{item_id}/correct` —
+  `{corrected_interpretation}`。`status='corrected'`。
+- `POST /interview/alignment/{item_id}/hold` — `status='held'`。
+- 上記3エンドポイントは、対象 item の `status == 'inquiry'`(下記)の
+  間は 409 で拒否する — 疑問を解消してから回答させるため。
+- サーバーが `user_decision` を自動でセットする経路は存在しない
+  (`test_build_never_auto_sets_user_decision` で固定化)。
+
+### Inquiry 統合(Issue #285 の `origin_kind='review_item'` 拡張)
+
+`routes/interview_inquiry.py` の `_validate_origin_exists` は
+`review_item` を受け取ると `alignment_item` の実在を確認するようになっ
+た(存在しなければ 404 — Issue #285/#286 時点の「テーブルが無いので存
+在チェックをスキップする」プレースホルダ挙動から変更)。
+
+`review_item` は qa/intent と異なり、Inquiry の開閉が origin の
+`alignment_item.status` に反映される唯一のケースとして明示的に許容され
+ている(Principle 2 の「origin テーブルを書き換えない」という原則の中
+での、ドキュメント化された例外— 変更するのは `status` だけで、
+`user_decision` には一切触れない):
+
+- Inquiry を作成した瞬間、対象 `alignment_item.status` を `'inquiry'`
+  にする。
+- Inquiry が **閉じる**(`resolved`/`unresolved`/`cancelled` —
+  `_CLOSED_STATUSES` をそのまま再利用)と `'open'` に戻す。**
+  `'answered'` には絶対にしない** — 開発者は改めて `/answer` 等を明示
+  的に呼ぶ必要がある(brief が明示するリグレッションテスト:
+  `test_review_item_inquiry_resolve_sets_item_back_to_open_not_answered`)。
+- `held`(一時停止であって終了ではない)は対象外: Inquiry が再開待ちの
+  間、item は `'inquiry'` のままブロックされ続ける
+  (`test_review_item_inquiry_held_keeps_item_status_inquiry`)。
+
+### Dashboard(`components/system-understanding/review-queue.tsx`)
+
+interview ページに新設した Review Queue パネル:
+
+- `must_review`/`batch_reviewable` の item だけをアクションカードとして
+  表示する(意図/現状/ギャップの短い対比 + `user_reason` バッジ +
+  「根拠を見る」でパス:行番号とスナップショット参照を展開)。
+- `no_review_required`/`unchanged`/`informational` は「対応不要の項目
+  (n)」という折りたたみセクションの中にだけ表示し、アクションボタンは
+  一切持たない。
+- `must_review` の item は破壊的トーンの枠線 + 「要確認」バッジ(色だ
+  けに依存せず `sr-only` テキストも付与)で視覚的に区別する。
+- 「疑問がある」は既存の `InquiryPanel`(Issue #285)を
+  `origin_kind="review_item"` でそのまま再利用する。`status='inquiry'`
+  の間、回答/修正/保留ボタンは非表示になり、代わりに「疑問を確認中で
+  す」という案内を出す。
+- canonical enum(`alignment_state`/`risk_flags`)は本ファイル内の単一
+  マッピングテーブルのみを通して日本語ラベルに変換する。
+
+### テスト
+
+- `tests/test_interview_alignment.py`: ルール表の全分岐を網羅する
+  table-driven テスト + 決定性の確認、must_review リグレッション集合
+  (security/high_risk/core_intent/conflict/unknown/uncertain)、
+  `review_sort_key` の固定フィクスチャによる並び順契約テスト、
+  `generate_alignment_proposal` の fail-closed(mock/非 reasoning モデ
+  ル/API 失敗/不正 JSON/有限集合外の値それぞれ)、
+  `validate_evidence_against_snapshot` の実 git フィクスチャ検証、ビル
+  ド API の 409(前提条件欠落)/502(reasoning 失敗・全 evidence 無効)、
+  再ビルドの保護/更新境界、review-queue のフィルタ+順序、
+  answer/correct/hold、`user_decision` 自動セット無し、review_item
+  Inquiry の実ビルド経由エンドツーエンド往復、System 分離。
+- `tests/test_interview_inquiry.py`: `review_item` の存在チェック(未知
+  の id は 404 に変更)、Inquiry 開始で `alignment_item.status` が
+  `'inquiry'` になること、resolve/cancel/unresolved で `'open'` に戻る
+  こと(`'answered'` にはならないこと)、hold では `'inquiry'` のまま
+  であること、`status='inquiry'` の間は `/answer` が 409 で拒否される
+  こと。
+- Dashboard: `src/__tests__/review-queue-panel.test.tsx`(アクションカ
+  ードが actionable なカテゴリだけに出ること、informational が折りた
+  たまれ操作を持たないこと、`status='inquiry'` でアクションが隠れるこ
+  と、raw enum が画面に出ないこと、answer/hold/build 各アクションが対
+  応する API を呼ぶこと)。

@@ -2548,6 +2548,74 @@ CREATE TABLE IF NOT EXISTS interview_inquiry_transition (
 
 CREATE INDEX IF NOT EXISTS idx_interview_inquiry_transition_inquiry
     ON interview_inquiry_transition (inquiry_id, id);
+
+-- Alignment Review / Review Queue (Issue #287). Contrasts confirmed/proposed
+-- Intent Brief items (interview_intent_item, Issue #284) against the
+-- evidence-backed Current System understanding (the latest
+-- understanding_revision, Issue #136) to produce alignment items. Each item
+-- carries its own claim + evidence (validated against the pinned snapshot,
+-- same discipline as Issue #286's investigation evidence check) and a
+-- DETERMINISTIC review classification (review_category/reason_code):
+-- computed by a data-driven rule table over the reasoning model's finite
+-- output fields (alignment_state/risk_flags/confidence/intent_field) --
+-- classification itself is never a reasoning decision (Principle 6).
+-- user_reason is a fixed Japanese template keyed by reason_code (never LLM
+-- free text). Only review_category IN (must_review, batch_reviewable) ever
+-- surfaces as an action-required card in the Review Queue; the rest are
+-- collapsed/informational.
+--
+-- Rebuild semantics (POST .../alignment/build): a build DELETEs and
+-- recreates only rows with status='open' AND user_decision IS NULL for the
+-- session -- untouched suggestions with no user progress. Any row with a
+-- different status (answered/corrected/held/inquiry) or a recorded
+-- user_decision is never deleted or overwritten by a rebuild, regardless of
+-- how the base revision changed (Principle 2 -- a rebuild must never lose a
+-- human decision).
+--
+-- status='inquiry' (Issue #287's extension to the Issue #285 Inquiry
+-- lifecycle) is set while an Inquiry with origin_kind='review_item' /
+-- origin_id=<this row's id> is open, and reset to 'open' (never 'answered')
+-- when that Inquiry resolves/holds/cancels -- the developer must still
+-- explicitly answer via the item's own endpoint (Principle 2).
+CREATE TABLE IF NOT EXISTS alignment_item (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id              INTEGER NOT NULL,
+    system_id               INTEGER NOT NULL,
+    revision_id             INTEGER,
+    snapshot_id             INTEGER NOT NULL,
+    intent_item_id          INTEGER,
+    intent_summary          TEXT,
+    current_claim           TEXT NOT NULL,
+    current_evidence        TEXT NOT NULL DEFAULT '[]',
+    gap_summary             TEXT,
+    proposed_interpretation TEXT,
+    alignment_state         TEXT NOT NULL,
+    risk_flags              TEXT NOT NULL DEFAULT '[]',
+    confidence              TEXT NOT NULL,
+    review_category         TEXT NOT NULL,
+    reason_code             TEXT NOT NULL,
+    user_reason             TEXT NOT NULL,
+    status                  TEXT NOT NULL DEFAULT 'open',
+    user_decision           TEXT,
+    intelligence_run_id     INTEGER NOT NULL,
+    is_mock                 INTEGER NOT NULL DEFAULT 0,
+    created_at              REAL NOT NULL,
+    updated_at              REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (revision_id) REFERENCES understanding_revision (id) ON DELETE SET NULL,
+    FOREIGN KEY (intent_item_id) REFERENCES interview_intent_item (id) ON DELETE SET NULL,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_alignment_item_session
+    ON alignment_item (session_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_alignment_item_system
+    ON alignment_item (system_id, session_id);
+
+CREATE INDEX IF NOT EXISTS idx_alignment_item_review_queue
+    ON alignment_item (session_id, review_category, status);
 """
 
 

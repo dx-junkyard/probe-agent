@@ -3087,6 +3087,115 @@ class InterviewInquiryTransitionRequest(BaseModel):
     actor: Optional[str] = Field(default=None, max_length=200)
 
 
+# --- Alignment Review / Review Queue (Issue #287) -----------------------------
+#
+# Contrasts confirmed/proposed Intent Brief items against the evidence-backed
+# Current System understanding to produce alignment items with a
+# deterministic review classification (review_category/reason_code -- see
+# app/alignment.py's rule table). Only review_category IN (must_review,
+# batch_reviewable) ever surfaces as an action-required Review Queue card.
+
+AlignmentState = Literal["aligned", "gap", "unknown", "conflict", "not_applicable"]
+AlignmentRiskFlag = Literal["security", "high_risk", "core_intent"]
+AlignmentConfidence = Literal["confirmed", "likely", "uncertain", "conflicting"]
+AlignmentReviewCategory = Literal[
+    "must_review", "batch_reviewable", "no_review_required", "unchanged", "informational",
+]
+AlignmentReasonCode = Literal[
+    "security_related", "high_risk", "core_intent", "conflict_detected",
+    "low_confidence", "runtime_mismatch", "routine_update", "no_change",
+    "informational_only",
+]
+# Item-level user progress. 'inquiry' is set while an Inquiry
+# (origin_kind='review_item') is open on this item, and reset to 'open'
+# (never 'answered') when that Inquiry closes -- the developer must still
+# explicitly answer via this item's own endpoint (Principle 2).
+AlignmentItemStatus = Literal["open", "answered", "corrected", "held", "inquiry"]
+# The three decisions POST /answer accepts as request input.
+AlignmentDecisionAction = Literal["accept_current", "needs_change", "reject_interpretation"]
+# The full set of actions that may appear in a persisted user_decision.action
+# -- a superset of AlignmentDecisionAction covering what /correct and /hold
+# each record (Principle 7: every manual write path leaves an audit action).
+AlignmentUserDecisionAction = Literal[
+    "accept_current", "needs_change", "reject_interpretation", "corrected", "held",
+]
+
+
+class AlignmentEvidenceOut(BaseModel):
+    path: str
+    start_line: int
+    end_line: int
+    summary: str = ""
+
+
+class AlignmentUserDecisionOut(BaseModel):
+    action: AlignmentUserDecisionAction
+    note: Optional[str] = None
+    decided_at: float
+    decided_by: Optional[str] = None
+
+
+class AlignmentItemOut(BaseModel):
+    id: int
+    session_id: int
+    system_id: int
+    revision_id: Optional[int] = None
+    snapshot_id: int
+    intent_item_id: Optional[int] = None
+    intent_summary: Optional[str] = None
+    current_claim: str
+    current_evidence: List[AlignmentEvidenceOut] = Field(default_factory=list)
+    gap_summary: Optional[str] = None
+    proposed_interpretation: Optional[str] = None
+    alignment_state: AlignmentState
+    risk_flags: List[AlignmentRiskFlag] = Field(default_factory=list)
+    confidence: AlignmentConfidence
+    review_category: AlignmentReviewCategory
+    reason_code: AlignmentReasonCode
+    user_reason: str
+    status: AlignmentItemStatus
+    user_decision: Optional[AlignmentUserDecisionOut] = None
+    intelligence_run_id: int
+    is_mock: bool = False
+    created_at: float
+    updated_at: float
+
+
+class AlignmentBuildOut(BaseModel):
+    session_id: int
+    system_id: int
+    revision_id: Optional[int] = None
+    intelligence_run_id: int
+    is_mock: bool = False
+    items: List[AlignmentItemOut] = Field(default_factory=list)
+
+
+class AlignmentListOut(BaseModel):
+    session_id: int
+    system_id: int
+    items_by_category: Dict[str, List[AlignmentItemOut]] = Field(default_factory=dict)
+    counts: Dict[str, int] = Field(default_factory=dict)
+
+
+class AlignmentReviewQueueOut(BaseModel):
+    session_id: int
+    system_id: int
+    items: List[AlignmentItemOut] = Field(default_factory=list)
+
+
+class AlignmentAnswerRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: AlignmentDecisionAction
+    note: Optional[str] = Field(default=None, max_length=2_000)
+
+
+class AlignmentCorrectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    corrected_interpretation: str = Field(..., min_length=1, max_length=2_000)
+
+
 # --- Runtime Reality Check (Issue #135) --------------------------------------
 #
 # Reconciles approved interview metadata/probe plans (role, probe_value,

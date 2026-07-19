@@ -2,14 +2,26 @@
 
 When a developer has a doubt about a confirmation item (an
 ``interview_qa`` question, an ``interview_intent_item``, or -- from Issue
-#287 onward -- a review item), the original item is held pending and a
-separate Inquiry conversation starts. Resolving the doubt ("疑問は解消し
-た") is strictly separate from answering/confirming the original item:
-creating, messaging, and closing (resolve/unresolved/hold/cancel) an
-Inquiry never writes to ``interview_qa`` or ``interview_intent_item``. The
-developer still has to submit the origin item's own answer/confirm
-endpoint afterward -- resolving an Inquiry is never mistaken for consent
-(the regression this module's tests guard against).
+#287 onward -- an ``alignment_item`` Review Queue item), the original item
+is held pending and a separate Inquiry conversation starts. Resolving the
+doubt ("疑問は解消した") is strictly separate from answering/confirming the
+original item: creating, messaging, and closing (resolve/unresolved/hold/
+cancel) an Inquiry never writes to ``interview_qa`` or
+``interview_intent_item``. The developer still has to submit the origin
+item's own answer/confirm endpoint afterward -- resolving an Inquiry is
+never mistaken for consent (the regression this module's tests guard
+against).
+
+``origin_kind='review_item'`` is the one documented exception to "never
+writes to the origin table": Issue #287's brief requires the
+``alignment_item`` row itself to reflect "an Inquiry is open on this item"
+(``status='inquiry'``) so the Review Queue UI can show it as blocked, and to
+revert to ``status='open'`` (never ``'answered'``) once the Inquiry closes --
+see ``_set_review_item_status`` below. This still preserves the same
+Principle-2 guarantee: only ``status`` is ever touched here, never
+``user_decision``, and the developer must still call the item's own
+``/answer``/``/correct``/``/hold`` endpoint (``routes/interview_alignment.py``)
+to actually decide it.
 
 Kept in its own module (like Issue #284's ``interview_intent.py``) rather
 than growing ``routes/interview.py`` further, per CLAUDE.md's guidance for
@@ -98,13 +110,7 @@ def _get_inquiry_or_404(conn, inquiry_id: int, system_id: int):
 def _validate_origin_exists(
     conn, origin_kind: str, origin_id: int, session_id: int, system_id: int
 ) -> Optional[str]:
-    """Validate the origin item exists and return a short prompt summary of it.
-
-    'review_item' is accepted without an existence check -- Issue #287 is
-    what starts writing rows to the (not yet created) reviewing table; the
-    enum value exists now so this table's origin_kind never needs a later
-    migration.
-    """
+    """Validate the origin item exists and return a short prompt summary of it."""
     if origin_kind == "qa":
         row = conn.execute(
             "SELECT question_text, answer_text FROM interview_qa "
@@ -126,8 +132,42 @@ def _validate_origin_exists(
         if row is None:
             raise HTTPException(status_code=404, detail="Origin Intent item not found")
         return f"Intent Brief field '{row['field']}' under discussion: {row['value_text']}"
-    # 'review_item' -- no table yet (Issue #287); enum accepted, nothing to summarize.
-    return None
+    # origin_kind == "review_item" (Issue #287): a Review Queue alignment
+    # item. Unlike qa/intent, opening/closing an Inquiry on a review_item
+    # DOES touch the origin row's own status (see
+    # _set_review_item_inquiry_status below) -- the item is "held pending"
+    # server-side, not just in the dashboard's local state.
+    row = conn.execute(
+        "SELECT current_claim, alignment_state, gap_summary FROM alignment_item "
+        "WHERE id = ? AND session_id = ? AND system_id = ?",
+        (origin_id, session_id, system_id),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Origin review item not found")
+    summary = f"Review item under discussion (alignment_state={row['alignment_state']}): {row['current_claim']}"
+    if row["gap_summary"]:
+        summary += f"\nGap summary: {row['gap_summary']}"
+    return summary
+
+
+def _set_review_item_status(
+    conn, *, origin_kind: str, origin_id: int, session_id: int, system_id: int, status: str, now: float,
+) -> None:
+    """Mirror an Inquiry's open/closed state onto its origin alignment_item.
+
+    Only origin_kind='review_item' is affected (Issue #287); qa/intent rows
+    are never written by the Inquiry lifecycle (module docstring). Called
+    with status='inquiry' when the Inquiry opens, and status='open' (never
+    'answered') when it closes -- the developer must still explicitly use
+    the item's own answer/correct/hold endpoint (Principle 2).
+    """
+    if origin_kind != "review_item":
+        return
+    conn.execute(
+        """UPDATE alignment_item SET status = ?, updated_at = ?
+           WHERE id = ? AND session_id = ? AND system_id = ?""",
+        (status, now, origin_id, session_id, system_id),
+    )
 
 
 def _message_out(row) -> InterviewInquiryMessageOut:
@@ -411,6 +451,21 @@ def _apply_transition(
             VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (inquiry_row["id"], inquiry_row["system_id"], current, target_status, actor, reason, now),
         )
+        # Issue #287: a closing transition (resolved/unresolved/cancelled)
+        # releases a review_item back to 'open' -- never 'answered'. 'held'
+        # is deliberately excluded (not in _CLOSED_STATUSES): the Inquiry is
+        # only paused, not closed, so the item stays 'inquiry' until it
+        # actually resolves/unresolves/cancels.
+        if target_status in _CLOSED_STATUSES:
+            _set_review_item_status(
+                conn,
+                origin_kind=inquiry_row["origin_kind"],
+                origin_id=inquiry_row["origin_id"],
+                session_id=inquiry_row["session_id"],
+                system_id=inquiry_row["system_id"],
+                status="open",
+                now=now,
+            )
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
@@ -435,10 +490,13 @@ def create_inquiry(
 ) -> InterviewInquiryDetailOut:
     """Open an Inquiry about a confirmation item.
 
-    The origin item (interview_qa / interview_intent_item row) is NOT
-    modified by this call -- it stays exactly as it was. The Inquiry starts
-    'open' with the developer's question as its first message; the initial
-    assistant answer is generated immediately (see
+    The origin ``interview_qa`` / ``interview_intent_item`` row is NOT
+    modified by this call -- it stays exactly as it was.
+    ``origin_kind='review_item'`` (Issue #287) is the one exception: its
+    ``alignment_item.status`` is set to 'inquiry' so the Review Queue shows
+    it as blocked pending this Inquiry (see module docstring). The Inquiry
+    itself starts 'open' with the developer's question as its first
+    message; the initial assistant answer is generated immediately (see
     ``app/inquiry_answering.py``). On LLM failure the Inquiry and the user's
     question are still persisted (so the developer can retry via
     ``/message``); only the assistant message is withheld, and the response
@@ -471,6 +529,15 @@ def create_inquiry(
                     (inquiry_id, system_id, role, content, created_at)
                 VALUES (?, ?, 'user', ?, ?)""",
                 (inquiry_id, system_id, payload.question_text, now),
+            )
+            _set_review_item_status(
+                conn,
+                origin_kind=payload.origin_kind,
+                origin_id=payload.origin_id,
+                session_id=session_id,
+                system_id=system_id,
+                status="inquiry",
+                now=now,
             )
             conn.execute("COMMIT")
         except Exception:

@@ -36,6 +36,7 @@ import { api } from "@/api/client";
 import { DiagnosticFixCallout, useDiagnosticHighlight } from "@/components/diagnostic-fix";
 import { UnderstandingOverview } from "@/components/system-understanding/understanding-overview";
 import { IntentBriefPanel } from "@/components/system-understanding/intent-brief-panel";
+import { ReviewQueuePanel } from "@/components/system-understanding/review-queue";
 import { InquiryPanel } from "@/components/system-understanding/inquiry-panel";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -1918,6 +1919,8 @@ git commit`}
               </Card>
 
               <IntentBriefPanel sessionId={session.id} />
+
+              <ReviewQueuePanel sessionId={session.id} />
 
               <UnderstandingDiffPanel
                 sessionId={session.id}

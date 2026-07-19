@@ -31,6 +31,8 @@ import type {
   InterviewIntentField, InterviewIntentUserStatus,
   InterviewInquiryListOut, InterviewInquiryDetailOut, InterviewInquiryOut,
   InterviewInquiryOriginKind,
+  AlignmentBuildOut, AlignmentListOut, AlignmentReviewQueueOut, AlignmentItemOut,
+  AlignmentDecisionAction,
   RuntimeRealityFactsOut, RuntimeRealityCheckRunOut,
   UnderstandingRevisionListOut, UnderstandingDiffOut,
   SystemUnderstandingOut,
@@ -925,6 +927,13 @@ export function useActiveInquiriesByOrigin(sessionId: number | null) {
 function _invalidateInquiry(qc: ReturnType<typeof useQueryClient>, sessionId: number | null, inquiryId: number) {
   qc.invalidateQueries({ queryKey: [...sysKey("interviewInquiries"), sessionId] });
   qc.invalidateQueries({ queryKey: [...sysKey("interviewInquiry"), inquiryId] });
+  // Issue #287: an Inquiry with origin_kind='review_item' mutates the
+  // origin alignment_item's status server-side (open <-> inquiry). The
+  // mutation payload/response here doesn't always carry origin_kind, so
+  // invalidate the alignment queries unconditionally -- harmless extra
+  // refetch when the origin was qa/intent instead.
+  qc.invalidateQueries({ queryKey: [...sysKey("alignment"), sessionId] });
+  qc.invalidateQueries({ queryKey: [...sysKey("reviewQueue"), sessionId] });
 }
 
 export function useCreateInterviewInquiry(sessionId: number | null) {
@@ -1000,6 +1009,64 @@ export function useReopenInterviewInquiryDoubt(sessionId: number | null) {
     mutationFn: ({ inquiryId }: { inquiryId: number }) =>
       api.post<InterviewInquiryOut>(`/interview/inquiries/${inquiryId}/reopen-doubt`),
     onSuccess: (_result, { inquiryId }) => _invalidateInquiry(qc, sessionId, inquiryId),
+  });
+}
+
+// --- Alignment Review / Review Queue (Issue #287) -----------------------------
+
+export function useAlignmentList(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("alignment"), sessionId],
+    queryFn: () => api.get<AlignmentListOut>(`/interview/sessions/${sessionId}/alignment`),
+    enabled: !!sessionId && !!getSystemId(),
+  });
+}
+
+export function useReviewQueue(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("reviewQueue"), sessionId],
+    queryFn: () => api.get<AlignmentReviewQueueOut>(`/interview/sessions/${sessionId}/review-queue`),
+    enabled: !!sessionId && !!getSystemId(),
+  });
+}
+
+function _invalidateAlignment(qc: ReturnType<typeof useQueryClient>, sessionId: number | null) {
+  qc.invalidateQueries({ queryKey: [...sysKey("alignment"), sessionId] });
+  qc.invalidateQueries({ queryKey: [...sysKey("reviewQueue"), sessionId] });
+}
+
+export function useBuildAlignment(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post<AlignmentBuildOut>(`/interview/sessions/${sessionId}/alignment/build`),
+    onSuccess: () => _invalidateAlignment(qc, sessionId),
+  });
+}
+
+export function useAnswerAlignmentItem(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ itemId, decision, note }: { itemId: number; decision: AlignmentDecisionAction; note?: string }) =>
+      api.post<AlignmentItemOut>(`/interview/alignment/${itemId}/answer`, { decision, note }),
+    onSuccess: () => _invalidateAlignment(qc, sessionId),
+  });
+}
+
+export function useCorrectAlignmentItem(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ itemId, corrected_interpretation }: { itemId: number; corrected_interpretation: string }) =>
+      api.post<AlignmentItemOut>(`/interview/alignment/${itemId}/correct`, { corrected_interpretation }),
+    onSuccess: () => _invalidateAlignment(qc, sessionId),
+  });
+}
+
+export function useHoldAlignmentItem(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ itemId }: { itemId: number }) =>
+      api.post<AlignmentItemOut>(`/interview/alignment/${itemId}/hold`),
+    onSuccess: () => _invalidateAlignment(qc, sessionId),
   });
 }
 
