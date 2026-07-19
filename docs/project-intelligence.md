@@ -2343,3 +2343,70 @@ fallback チェーンのみ)。本 Issue は「人の認識」を第一級の pr
 **含まない:** 理解生成ロジック・API・スキーマの変更、Intent Brief /
 Alignment Review / Investigation Agent(後続 Issue の領分)、長い調査ログ
 (Q&A の逐次編集など)を初期表示に持ち込むこと。
+
+## Intent Brief(Issue #284)
+
+「現在の理解」(実装事実の理解)とは別に、ユーザーの意図(本人だけが決めら
+れる)を構造化して保持する。両者を混在させない。
+
+- **テーブル `interview_intent_item`**(System-scoped、additive、
+  `interview_session` に `ON DELETE CASCADE`): `id` / `session_id` /
+  `system_id` / `field`(`goal | pain | success_criteria | priority |
+  constraints | non_goals`、API 側で有限集合を検証)/ `value_text` /
+  `status`(`proposed | confirmed | needs_review | undecided |
+  not_applicable`、既定 `proposed`)/ `origin`(`user | ai_proposed`)/
+  `source_statement`(AI 提案の根拠となったユーザー発言、nullable)/
+  `decision_method`(`manual` | `reasoning_llm`、確定操作は常に `manual`)/
+  `intelligence_run_id`(`ai_proposed` 行のみ、FK `intelligence_runs`)/
+  `is_mock` / `superseded_by_id`(自己 FK、訂正は新規行を追加し旧行を
+  supersede — `interview_qa` の回答訂正チェーンと同じ設計)/
+  `created_at` / `updated_at`。
+- **エンドポイント**(`app/routes/interview_intent.py`。`interview.py` を
+  これ以上肥大化させないため新規モジュールに分離し、`main.py` に登録):
+  - `GET /interview/sessions/{id}/intent` — 6フィールド固定キーで
+    グルーピングした現在値(非 superseded)の一覧。
+    `?include_superseded=true` で訂正履歴も返す。
+  - `POST /interview/sessions/{id}/intent` — ユーザーが直接作成。常に
+    `origin='user'` / `decision_method='manual'`。`status` は既定
+    `confirmed`、`undecided` / `not_applicable` も明示的に指定可能
+    (「現状把握だけが目的」「対象外」は正規の回答であり、エラーではな
+    い)。`field` / `status` は Pydantic の有限 `Literal` で検証し、
+    不正値は 422。
+  - `POST /interview/intent/{item_id}/confirm` — `ai_proposed` 項目を
+    ユーザーが確認 → `status='confirmed'` / `decision_method='manual'`。
+    `ai_proposed` 行がこの明示的な呼び出し以外で `confirmed` になる経路
+    はない(Principle 2)。
+  - `POST /interview/intent/{item_id}/correct`(body `{value_text}`)—
+    新規行を追加(`origin='user'` / `status='confirmed'` /
+    `decision_method='manual'`)し、旧行の `superseded_by_id` を設定。
+    旧行の `value_text` は上書きされない(監査用に保持)。
+  - `POST /interview/intent/{item_id}/decline` — `status='not_applicable'`
+    に変更する manual decision。行は削除せず保持。
+  - `POST /interview/sessions/{id}/intent/propose` — セッションの会話
+    履歴 + `user_intent` 自由記述から、まだ値が存在しないフィールドだけ
+    を対象に reasoning LLM(`app/interview_intent_agent.py`、
+    `prompt_version`/`schema_version` = `intent-brief-v1`)が候補を提案
+    する。fail-closed(mock/非推論モデル・API 失敗・構造化出力検証失敗は
+    すべて `intelligence_runs`(`run_type='intent_proposal'`)に失敗行を
+    記録した上で HTTP 502、行は一切作成しない — ヒューリスティック
+    フォールバックなし)。成功時に作成される行は常に `status='proposed'`
+    / `origin='ai_proposed'` / `decision_method='reasoning_llm'`。モック
+    出力は `is_mock=1` を必ず伝播する。
+  - すべて既存の `require_system`(`X-Probe-System-Id` + `get_system_id`)
+    パターンで System-scoped。
+- **UI**(`components/system-understanding/intent-brief-panel.tsx`、
+  `pages/interview.tsx` の「現在の理解」カードの隣に独立した Card として
+  配置、タイトル「Intent Brief(目標と成功条件)」): 6フィールドをそれ
+  ぞれ表示し、`proposed` 項目には「AI 提案(未確認)」バッジ +
+  「確認する」/「修正する」/「対象外」の3操作、`confirmed` 項目には
+  「確認済み」バッジのみを表示する。一度にすべての未入力フィールドを
+  尋ねない: 現在値が1件もない最初のフィールド(固定順 goal → pain →
+  success_criteria → priority → constraints → non_goals)だけを「次に
+  確認したい項目」として提示し、自由記述の入力に加えて「未定」
+  「対象外」のクイック選択肢を用意する。canonical enum の値は変更せず、
+  このコンポーネント内の単一マッピングテーブルのみを通して日本語ラベル
+  に変換する(生の enum 文字列は画面に出さない)。
+
+**含まない:** 対話ターン(`interview_agent.py`)からの自動抽出・Intent
+Brief の自動確定・Alignment Review / Investigation Agent との接続(後続
+Issue の領分)。

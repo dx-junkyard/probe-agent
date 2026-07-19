@@ -2421,6 +2421,47 @@ CREATE TABLE IF NOT EXISTS system_purpose_confirmations (
 
 CREATE INDEX IF NOT EXISTS idx_system_purpose_confirmations_system
     ON system_purpose_confirmations (system_id, id DESC);
+
+-- Intent Brief (Issue #284): user intent (goal/pain/success_criteria/
+-- priority/constraints/non_goals) kept structurally separate from
+-- implementation-fact understanding. field/status are finite sets validated
+-- by the API, not a DB CHECK constraint (kept consistent with the rest of
+-- this schema). origin='user' rows are authored/confirmed by a human
+-- directly (decision_method='manual'); origin='ai_proposed' rows come from
+-- the reasoning-model propose endpoint (decision_method='reasoning_llm',
+-- status='proposed') and NEVER become 'confirmed' except through the
+-- explicit confirm/correct user endpoints (Principle 2). Corrections never
+-- overwrite: a new row is inserted and the old row's superseded_by_id is set
+-- (revision history), mirroring interview_qa's answer/correction pattern.
+CREATE TABLE IF NOT EXISTS interview_intent_item (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id          INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    field               TEXT NOT NULL,
+    value_text          TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'proposed',
+    origin              TEXT NOT NULL,
+    source_statement    TEXT,
+    decision_method     TEXT NOT NULL DEFAULT 'manual',
+    intelligence_run_id INTEGER,
+    is_mock             INTEGER NOT NULL DEFAULT 0,
+    superseded_by_id    INTEGER,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE SET NULL,
+    FOREIGN KEY (superseded_by_id) REFERENCES interview_intent_item (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_interview_intent_item_session
+    ON interview_intent_item (session_id, superseded_by_id);
+
+CREATE INDEX IF NOT EXISTS idx_interview_intent_item_system
+    ON interview_intent_item (system_id, session_id);
+
+CREATE INDEX IF NOT EXISTS idx_interview_intent_item_field
+    ON interview_intent_item (session_id, field, superseded_by_id);
 """
 
 

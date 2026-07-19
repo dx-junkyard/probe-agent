@@ -26,6 +26,8 @@ import type {
   InterviewApprovedSetOut, InterviewMaterializeOut,
   InterviewSnapshotRebaseOut,
   InterviewQaListOut, InterviewQaOut, InterviewQaAnswerOut,
+  InterviewIntentListOut, InterviewIntentItemOut,
+  InterviewIntentField, InterviewIntentUserStatus,
   RuntimeRealityFactsOut, RuntimeRealityCheckRunOut,
   UnderstandingRevisionListOut, UnderstandingDiffOut,
   SystemUnderstandingOut,
@@ -804,6 +806,64 @@ export function useResumeInterviewQa(sessionId: number | null) {
     mutationFn: ({ qaId, actor }: { qaId: number; actor: string }) =>
       api.post<InterviewQaOut>(`/interview/sessions/${sessionId}/qa/${qaId}/resume`, { actor }),
     onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] }),
+  });
+}
+
+// --- Intent Brief (Issue #284) ------------------------------------------------
+
+export function useInterviewIntentList(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("interviewIntent"), sessionId],
+    queryFn: () => api.get<InterviewIntentListOut>(`/interview/sessions/${sessionId}/intent`),
+    enabled: !!sessionId && !!getSystemId(),
+  });
+}
+
+export function useCreateInterviewIntentItem(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: {
+      field: InterviewIntentField;
+      value_text: string;
+      status?: InterviewIntentUserStatus;
+    }) => api.post<InterviewIntentItemOut>(`/interview/sessions/${sessionId}/intent`, data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewIntent"), sessionId] }),
+  });
+}
+
+export function useConfirmInterviewIntentItem(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ itemId }: { itemId: number }) =>
+      api.post<InterviewIntentItemOut>(`/interview/intent/${itemId}/confirm`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewIntent"), sessionId] }),
+  });
+}
+
+export function useCorrectInterviewIntentItem(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ itemId, value_text }: { itemId: number; value_text: string }) =>
+      api.post<InterviewIntentItemOut>(`/interview/intent/${itemId}/correct`, { value_text }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewIntent"), sessionId] }),
+  });
+}
+
+export function useDeclineInterviewIntentItem(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ itemId }: { itemId: number }) =>
+      api.post<InterviewIntentItemOut>(`/interview/intent/${itemId}/decline`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewIntent"), sessionId] }),
+  });
+}
+
+export function useProposeInterviewIntentItems(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      api.post<InterviewIntentItemOut[]>(`/interview/sessions/${sessionId}/intent/propose`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewIntent"), sessionId] }),
   });
 }
 

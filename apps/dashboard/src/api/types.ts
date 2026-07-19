@@ -764,6 +764,48 @@ export interface InterviewQaListOut {
   answers_revised_at: number | null;
 }
 
+// --- Intent Brief (Issue #284) ------------------------------------------------
+//
+// User intent (only the user can decide), kept structurally separate from
+// the implementation-fact "current understanding" above. ai_proposed items
+// only become "confirmed" through an explicit confirm/correct call — never
+// automatically (Principle 2).
+
+export const INTERVIEW_INTENT_FIELDS = [
+  "goal", "pain", "success_criteria", "priority", "constraints", "non_goals",
+] as const;
+export type InterviewIntentField = typeof INTERVIEW_INTENT_FIELDS[number];
+
+export type InterviewIntentStatus =
+  | "proposed" | "confirmed" | "needs_review" | "undecided" | "not_applicable";
+// Statuses a user may set directly when creating an item. "proposed" /
+// "needs_review" are system/AI states, never user-chosen at creation time.
+export type InterviewIntentUserStatus = "confirmed" | "undecided" | "not_applicable";
+export type InterviewIntentOrigin = "user" | "ai_proposed";
+
+export interface InterviewIntentItemOut {
+  id: number;
+  session_id: number;
+  system_id: number;
+  field: InterviewIntentField;
+  value_text: string;
+  status: InterviewIntentStatus;
+  origin: InterviewIntentOrigin;
+  source_statement: string | null;
+  decision_method: "deterministic" | "reasoning_llm" | "manual";
+  intelligence_run_id: number | null;
+  is_mock: boolean;
+  superseded_by_id: number | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface InterviewIntentListOut {
+  session_id: number;
+  system_id: number;
+  items_by_field: Record<string, InterviewIntentItemOut[]>;
+}
+
 export interface InterviewProposalDecisionOut {
   id: number;
   proposal_id: number;

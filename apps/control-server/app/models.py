@@ -505,6 +505,10 @@ IntelligenceRunType = Literal[
     "pattern_reconcile",
     "pattern_investigate",
     "probe_plan_from_pattern",
+    # Issue #284: Intent Brief. Proposes missing goal/pain/success_criteria/
+    # priority/constraints/non_goals items from the session conversation and
+    # user_intent free text. Proposed items are never auto-confirmed.
+    "intent_proposal",
 ]
 DecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
 # How a single hierarchy claim was produced. Kept distinct from the audit
@@ -2889,6 +2893,74 @@ class InterviewQaListOut(BaseModel):
     open_count: int = 0
     high_priority_open_count: int = 0
     answers_revised_at: Optional[float] = None
+
+
+# --- Intent Brief (Issue #284) ------------------------------------------------
+#
+# Structured user intent, kept separate from implementation-fact
+# understanding: only the user can decide these values. ai_proposed items
+# are drafts the reasoning model grounds in the conversation; they never
+# become 'confirmed' except through the explicit confirm/correct endpoints
+# (decision_method stays 'manual' for every user-driven transition,
+# Principle 2). 'undecided' and 'not_applicable' are first-class answers
+# ("現状把握だけが目的" / "まだ解決策を決めていない" / 「対象外」), not errors.
+
+InterviewIntentField = Literal[
+    "goal", "pain", "success_criteria", "priority", "constraints", "non_goals"
+]
+InterviewIntentStatus = Literal[
+    "proposed", "confirmed", "needs_review", "undecided", "not_applicable"
+]
+# Statuses a user may set directly when creating an item. 'proposed' and
+# 'needs_review' are system/AI states, never user-chosen at creation time.
+InterviewIntentUserStatus = Literal["confirmed", "undecided", "not_applicable"]
+InterviewIntentOrigin = Literal["user", "ai_proposed"]
+
+
+class InterviewIntentItemOut(BaseModel):
+    id: int
+    session_id: int
+    system_id: int
+    field: InterviewIntentField
+    value_text: str
+    status: InterviewIntentStatus
+    origin: InterviewIntentOrigin
+    source_statement: Optional[str] = None
+    decision_method: DecisionMethod
+    intelligence_run_id: Optional[int] = None
+    is_mock: bool = False
+    superseded_by_id: Optional[int] = None
+    created_at: float
+    updated_at: float
+
+
+class InterviewIntentItemCreate(BaseModel):
+    """User-authored intent item. Always origin='user', decision_method='manual'."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    field: InterviewIntentField
+    value_text: str = Field(..., min_length=1, max_length=4_000)
+    status: InterviewIntentUserStatus = "confirmed"
+
+
+class InterviewIntentCorrectRequest(BaseModel):
+    """Correct an ai_proposed (or previously confirmed) item's value.
+
+    Never overwrites: the caller inserts a new 'confirmed'/'user' row and
+    marks the prior row's superseded_by_id, mirroring interview_qa's
+    answer/correction pattern.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    value_text: str = Field(..., min_length=1, max_length=4_000)
+
+
+class InterviewIntentListOut(BaseModel):
+    session_id: int
+    system_id: int
+    items_by_field: Dict[str, List[InterviewIntentItemOut]] = Field(default_factory=dict)
 
 
 # --- Runtime Reality Check (Issue #135) --------------------------------------

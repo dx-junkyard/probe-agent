@@ -33,6 +33,7 @@ import { useAuth } from "@/api/auth";
 import { api } from "@/api/client";
 import { DiagnosticFixCallout, useDiagnosticHighlight } from "@/components/diagnostic-fix";
 import { UnderstandingOverview } from "@/components/system-understanding/understanding-overview";
+import { IntentBriefPanel } from "@/components/system-understanding/intent-brief-panel";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -1812,6 +1813,8 @@ git commit`}
                   )}
                 </CardContent>
               </Card>
+
+              <IntentBriefPanel sessionId={session.id} />
 
               <UnderstandingDiffPanel
                 sessionId={session.id}
