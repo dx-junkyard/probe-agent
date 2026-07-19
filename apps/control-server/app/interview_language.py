@@ -105,6 +105,16 @@ INTERVIEW_MESSAGES: dict = {
         "ja": "「{name}」({section})の根拠がドキュメント・コードから見つかりませんでした。この項目は正しいですか?",
         "en": "No evidence for {section} item: {name}. Is this item correct?",
     },
+    # Issue #285: fixed, non-LLM-fabricated message stored on an Inquiry when
+    # the reasoning model determined it cannot answer (answerable=false).
+    # Never the model's own wording -- a lookup-table sentence only.
+    "inquiry_insufficient_information": {
+        "ja": "回答に必要な情報が不足しています。「解消していない」から追加の質問をするか、「今回は保留する」を選んでください。",
+        "en": (
+            "There is not enough information to answer this. Ask a follow-up "
+            "question, or choose \"hold for now\"."
+        ),
+    },
 }
 
 # Deterministic fallback language for the fixed-text messages above only,

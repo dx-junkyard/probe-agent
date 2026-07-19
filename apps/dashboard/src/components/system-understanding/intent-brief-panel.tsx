@@ -20,16 +20,20 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Textarea } from "@/components/ui/textarea";
+import { InquiryPanel } from "@/components/system-understanding/inquiry-panel";
 import {
+  useActiveInquiriesByOrigin,
   useConfirmInterviewIntentItem,
   useCorrectInterviewIntentItem,
   useCreateInterviewIntentItem,
   useDeclineInterviewIntentItem,
   useInterviewIntentList,
   useProposeInterviewIntentItems,
+  useResumeInterviewInquiry,
 } from "@/api/hooks";
 import {
   INTERVIEW_INTENT_FIELDS,
+  type InterviewInquiryOut,
   type InterviewIntentField,
   type InterviewIntentItemOut,
 } from "@/api/types";
@@ -70,16 +74,51 @@ function statusBadgeVariant(status: string): BadgeVariant {
 }
 
 function IntentItemRow({
-  item, sessionId,
-}: { item: InterviewIntentItemOut; sessionId: number }) {
+  item, sessionId, existingInquiry,
+}: {
+  item: InterviewIntentItemOut;
+  sessionId: number;
+  // Issue #285 refresh/resume: an already-active (open/held) Inquiry for
+  // this item, rediscovered via the list endpoint so a page reload never
+  // forgets an in-progress Inquiry.
+  existingInquiry?: InterviewInquiryOut;
+}) {
   const confirm = useConfirmInterviewIntentItem(sessionId);
   const correct = useCorrectInterviewIntentItem(sessionId);
   const decline = useDeclineInterviewIntentItem(sessionId);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(item.value_text);
+  const [inquiryMode, setInquiryMode] = useState(false);
+  const [hasHeldInquiry, setHasHeldInquiry] = useState(false);
+  const [attachedInquiryId, setAttachedInquiryId] = useState<number | null>(null);
+  const resumeInquiry = useResumeInterviewInquiry(sessionId);
 
   const isProposed = item.origin === "ai_proposed" && item.status === "proposed";
   const busy = confirm.isPending || correct.isPending || decline.isPending;
+
+  const heldInquiryId = hasHeldInquiry
+    ? attachedInquiryId
+    : (existingInquiry?.status === "held" ? existingInquiry.id : null);
+  const reopenableInquiryId = existingInquiry?.status === "open" ? existingInquiry.id : null;
+
+  const handleResumeInquiry = () => {
+    const id = heldInquiryId;
+    if (!id) return;
+    resumeInquiry.mutate({ inquiryId: id }, {
+      onSuccess: () => {
+        setAttachedInquiryId(id);
+        setHasHeldInquiry(false);
+        setInquiryMode(true);
+      },
+      onError: e => toast.error(String(e)),
+    });
+  };
+
+  const openExistingInquiry = () => {
+    if (!reopenableInquiryId) return;
+    setAttachedInquiryId(reopenableInquiryId);
+    setInquiryMode(true);
+  };
 
   const handleConfirm = () => {
     confirm.mutate({ itemId: item.id }, {
@@ -126,52 +165,117 @@ function IntentItemRow({
           根拠となる発言: 「{item.source_statement}」
         </p>
       )}
-      {editing ? (
-        <div className="space-y-2">
-          <Textarea
-            value={draft}
-            onChange={e => setDraft(e.target.value)}
-            rows={2}
-            data-testid={`intent-item-correct-input-${item.id}`}
-          />
-          <div className="flex gap-2">
-            <Button size="sm" onClick={handleCorrectSubmit} disabled={busy}>確定</Button>
-            <Button size="sm" variant="outline" onClick={() => setEditing(false)} disabled={busy}>
-              キャンセル
-            </Button>
-          </div>
-        </div>
+      {inquiryMode ? (
+        <InquiryPanel
+          key={attachedInquiryId ?? "new"}
+          sessionId={sessionId}
+          originKind="intent"
+          originId={item.id}
+          heldDraft={draft || null}
+          existingInquiryId={attachedInquiryId ?? undefined}
+          onResolved={heldDraft => {
+            setDraft(heldDraft ?? item.value_text);
+            setInquiryMode(false);
+            setHasHeldInquiry(false);
+            setAttachedInquiryId(null);
+            setEditing(true);
+          }}
+          onHeld={heldId => {
+            setInquiryMode(false);
+            setHasHeldInquiry(true);
+            setAttachedInquiryId(heldId);
+          }}
+          onCancel={() => { setInquiryMode(false); setAttachedInquiryId(null); }}
+        />
       ) : (
-        isProposed && (
-          <div className="flex gap-2">
-            <Button
-              size="sm"
-              onClick={handleConfirm}
-              disabled={busy}
-              data-testid={`intent-item-confirm-${item.id}`}
-            >
-              確認する
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => { setDraft(item.value_text); setEditing(true); }}
-              disabled={busy}
-              data-testid={`intent-item-edit-${item.id}`}
-            >
-              修正する
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={handleDecline}
-              disabled={busy}
-              data-testid={`intent-item-decline-${item.id}`}
-            >
-              対象外
-            </Button>
-          </div>
-        )
+        <>
+          {heldInquiryId && (
+            <div className="flex items-center gap-2" data-testid={`intent-item-held-inquiry-marker-${item.id}`}>
+              <p className="text-xs text-amber-700">保留中の疑問があります</p>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={handleResumeInquiry}
+                disabled={resumeInquiry.isPending}
+                data-testid={`intent-item-inquiry-resume-${item.id}`}
+              >
+                疑問を再開する
+              </Button>
+            </div>
+          )}
+          {editing ? (
+            <div className="space-y-2">
+              <Textarea
+                value={draft}
+                onChange={e => setDraft(e.target.value)}
+                rows={2}
+                data-testid={`intent-item-correct-input-${item.id}`}
+              />
+              <div className="flex gap-2">
+                <Button size="sm" onClick={handleCorrectSubmit} disabled={busy}>確定</Button>
+                <Button size="sm" variant="outline" onClick={() => setEditing(false)} disabled={busy}>
+                  キャンセル
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <div className="flex flex-wrap gap-2">
+              {isProposed && (
+                <>
+                  <Button
+                    size="sm"
+                    onClick={handleConfirm}
+                    disabled={busy}
+                    data-testid={`intent-item-confirm-${item.id}`}
+                  >
+                    確認する
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => { setDraft(item.value_text); setEditing(true); }}
+                    disabled={busy}
+                    data-testid={`intent-item-edit-${item.id}`}
+                  >
+                    修正する
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={handleDecline}
+                    disabled={busy}
+                    data-testid={`intent-item-decline-${item.id}`}
+                  >
+                    対象外
+                  </Button>
+                </>
+              )}
+              {reopenableInquiryId ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={openExistingInquiry}
+                  disabled={busy}
+                  data-testid={`intent-item-inquiry-reopen-${item.id}`}
+                >
+                  疑問を再開する
+                </Button>
+              ) : (
+                !heldInquiryId && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => { setAttachedInquiryId(null); setInquiryMode(true); }}
+                    disabled={busy}
+                    data-testid={`intent-item-inquiry-open-${item.id}`}
+                  >
+                    疑問がある
+                  </Button>
+                )
+              )}
+            </div>
+          )}
+        </>
       )}
     </div>
   );
@@ -247,6 +351,9 @@ function NextMissingFieldPrompt({
 export function IntentBriefPanel({ sessionId }: { sessionId: number }) {
   const { data: intentList } = useInterviewIntentList(sessionId);
   const propose = useProposeInterviewIntentItems(sessionId);
+  // Issue #285 refresh/resume: re-attach any still-active Inquiry to its
+  // origin item after a reload.
+  const activeInquiries = useActiveInquiriesByOrigin(sessionId);
 
   const handlePropose = () => {
     propose.mutate(undefined, {
@@ -302,7 +409,12 @@ export function IntentBriefPanel({ sessionId }: { sessionId: number }) {
               </h4>
               <div className="space-y-2">
                 {items.map(item => (
-                  <IntentItemRow key={item.id} item={item} sessionId={sessionId} />
+                  <IntentItemRow
+                    key={item.id}
+                    item={item}
+                    sessionId={sessionId}
+                    existingInquiry={activeInquiries.get(`intent:${item.id}`)}
+                  />
                 ))}
               </div>
             </div>

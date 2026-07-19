@@ -2410,3 +2410,143 @@ Alignment Review / Investigation Agent(後続 Issue の領分)、長い調査ロ
 **含まない:** 対話ターン(`interview_agent.py`)からの自動抽出・Intent
 Brief の自動確定・Alignment Review / Investigation Agent との接続(後続
 Issue の領分)。
+
+## Inquiry lifecycle(Issue #285)
+
+確認項目(Q&A の質問・Intent Brief の項目・将来の review item)に疑問が
+あるとき、元の項目はいったん保留し、別の Inquiry 会話で疑問だけを解消す
+る。「疑問は解消した」(resolve)は元の項目への回答・確認とは厳密に別物
+であり、Inquiry の作成・発言・resolve/unresolved/hold/cancel はいずれも
+`interview_qa` / `interview_intent_item` の状態を一切変更しない。解消後
+もユーザーは元の項目自身の回答/確認エンドポイントを明示的に呼ぶ必要があ
+る(「解消を同意と誤認しない」)。
+
+### 状態機械(有限集合、Principle 6)
+
+`status`: `open | resolved | unresolved | cancelled | held`。
+
+```
+open       -> resolved | unresolved | held | cancelled | open(no-op)
+held       -> open (resume)
+それ以外   -> 409 { code: "invalid_inquiry_transition", message }
+```
+
+`open -> open` は `/reopen-doubt`(「解消していない」)専用の no-op 遷移
+で、既に `open` のときだけ許可される(held からの再開は `/resume` を使
+う)。すべての遷移は `interview_inquiry_transition` に監査行として記録
+される(from_status / to_status / actor / reason)。`resolved` /
+`unresolved` / `cancelled` は `closed_at` を刻む終端状態、`held` は
+`closed_at` を刻まない再開可能な状態。
+
+### テーブル(System-scoped、additive、`interview_session` に
+`ON DELETE CASCADE`)
+
+- **`interview_inquiry`**: `id` / `session_id` / `system_id` /
+  `origin_kind`(`qa | intent | review_item`、`review_item` は Issue #287
+  以降にしか行が現れないが enum は今から存在する)/ `origin_id`(`qa` /
+  `intent` は作成時に存在確認、`review_item` は対応テーブルがまだ無いの
+  で検証しない)/ `held_draft`(ユーザーの未確定な回答下書き、サーバー
+  にとって不透明な文字列としてそのまま GET/resolve で往復させる)/
+  `status` / `status_reason` / `created_at` / `updated_at` / `closed_at`。
+- **`interview_inquiry_message`**: `id` / `inquiry_id` / `system_id` /
+  `role`(`user | assistant`)/ `content` / `detail`(JSON
+  `{key_points, evidence, uncertainty}`、assistant 行のみ、段階的開示用
+  — `content` が結論、`detail` が「根拠を見る」の展開)/
+  `intelligence_run_id` / `is_mock` / `created_at`。
+- **`interview_inquiry_transition`**: `id` / `inquiry_id` / `system_id` /
+  `from_status` / `to_status` / `actor` / `reason` / `created_at`(監査専
+  用、追記のみ)。
+
+### エンドポイント(`app/routes/interview_inquiry.py`、`main.py` に登録)
+
+- `POST /interview/sessions/{id}/inquiries` `{origin_kind, origin_id,
+  question_text, held_draft?}` — Inquiry を作成し(`status='open'`)、
+  ユーザーの質問を最初のメッセージとして保存、初回の assistant 回答を
+  即座に生成する。元の項目は一切更新しない。LLM 失敗時も Inquiry と
+  ユーザーメッセージ自体は保存され(再試行できるように)、レスポンスは
+  502(`detail.inquiry_id` に作成済み ID を含む)で assistant メッセー
+  ジだけが欠ける。
+- `GET /interview/sessions/{id}/inquiries?status=...` — 一覧。
+- `GET /interview/inquiries/{id}` — メッセージ全件を含む詳細
+  (`held_draft` / `origin_kind` / `origin_id` を含み、リフレッシュ後の
+  UI 復元に必要な情報をすべて返す)。
+- `POST /interview/inquiries/{id}/message` `{content}` — 追加の質問と
+  新しい assistant 回答。`status='open'` のときのみ許可(409)。
+- `POST /interview/inquiries/{id}/resolve` — `status='resolved'` /
+  `closed_at` 設定。レスポンスは `origin_kind` / `origin_id` /
+  `held_draft` を含む(`InterviewInquiryOut` の一部としてそのまま返る)
+  ので、UI はここから元の項目に戻って下書きを復元できる。
+- `POST /interview/inquiries/{id}/unresolved` `{status_reason?}` —
+  assistant が回答できなかった場合などに `status='unresolved'`。
+- `POST /interview/inquiries/{id}/hold` `{status_reason?}` — 「今回は
+  保留する」。`POST /interview/inquiries/{id}/resume` で `open` に戻せ
+  る。
+- `POST /interview/inquiries/{id}/cancel` `{status_reason?}`。
+- `POST /interview/inquiries/{id}/reopen-doubt` — 「解消していない」。
+  `open` のときだけ許可、監査行だけ追加して `open` のまま。
+
+### 回答生成(`app/inquiry_answering.py: generate_inquiry_answer`)
+
+`interview_context.py` の `build_interview_context` が返すスナップショッ
+ト由来のコンテキストパックだけを根拠に、reasoning LLM を1回呼ぶ
+(`prompt_version`/`schema_version` = `inquiry-answer-v1`)。
+`interview_agent.py` の2段階(エビデンス選定→読込)とは異なり、この呼び
+出しは単一パスで、コンテキストパックに既出の `(path, start_line,
+end_line)` だけを引用させ、範囲外の引用は Issue #142 と同じ「致命的では
+なく破棄」ルールで落とす。
+
+- fail-closed(Principle 6): mock/非推論モデル・API 失敗・構造化出力検
+  証失敗はすべて `intelligence_runs`(`run_type='inquiry_answer'`)に失
+  敗行を記録した上でエラーを返す。assistant メッセージは一切作成しない
+  (Inquiry は `open` のまま、ユーザーの質問だけが残る)。
+- `answerable=false` はエラーではない: モデルが「根拠不足で回答不能」
+  と判断した場合の正常系。この場合は LLM の文面を一切使わず、
+  `interview_language.py` の固定メッセージキー
+  `inquiry_insufficient_information`(ja/en 両方定義)だけを
+  `interview_inquiry_message.content` に保存する(絶対に LLM の文章を
+  捏造して使わない)。
+- `answerable=true` のときは `conclusion` を `content` に、
+  `{key_points, evidence, uncertainty}` を `detail` に保存する
+  (段階的開示: UI はまず結論だけを見せ、「根拠を見る」で `detail` を
+  展開する)。
+- モック出力は `is_mock=1` を伝播し、UI の `is_mock` バッジ規約(既存)
+  で可視化する。
+
+**#286 への差し替え口:** 回答生成は `generate_inquiry_answer` 一箇所に
+閉じてあるので、Issue #286(Question Router / Investigation Agent)は
+このライフサイクル/遷移ロジックに触れずに内部実装だけを差し替えられる。
+
+### UI(`components/system-understanding/inquiry-panel.tsx`)
+
+Q&A パネル(`QaItemCard`)と Intent Brief パネル(`IntentItemRow`)の両
+方に「疑問がある」ボタンを追加。押すと元のカードは「保留中(疑問を解消
+してから回答)」の表示に切り替わり、`InquiryPanel` が質問入力→会話
+(assistant の結論を先に表示し「根拠を見る」で `key_points` /
+`evidence` / `uncertainty` を展開)→「疑問は解消した」/「解消していな
+い(追加で質問)」/「今回は保留する」の3操作を提供する。「疑問は解消し
+た」を押すと元のカードに戻り、resolve レスポンスの `held_draft` を入力
+欄に復元するが、送信は自動では行わない(ユーザーが明示的に保存/確認す
+るまで元の項目は更新されない)。「今回は保留する」を押すと元のカードに
+「保留中の疑問があります」マーカーが残る。`api/client.ts` は無変更
+(`{code, message}` 形式の構造化エラーは既存の `ApiError` がそのまま解
+釈する)。`api/types.ts` / `api/hooks.ts` に型と対応するフックを追加。
+
+**リフレッシュ/再開(refresh/resume)の UI 復元:** サーバーは Inquiry の
+状態を常時永続化しているが、これをページリロード後も見失わないよう、
+`QaPanel` / `IntentBriefPanel` はセッション単位で
+`useActiveInquiriesByOrigin`(`api/hooks.ts`、既存の
+`GET /interview/sessions/{id}/inquiries` を素の一覧取得のまま使い、追加
+のサーバー変更なしでクライアント側だけで `status ∈ {open, held}` の行を
+`origin_kind:origin_id` キーの Map に組み直す)を呼び、各カードへ
+`existingInquiry` として渡す。カード側の描画は以下の3状態を区別する:
+`status='open'` の既存 Inquiry があれば「疑問がある」の代わりに「疑問を
+再開する」ボタンを表示し、押すと新規作成せずその Inquiry の会話をその
+まま再取得する(`InquiryPanel` に `existingInquiryId` を渡し、質問入力
+フォームを飛ばして会話ビューへ直行させる)。`status='held'` なら「保留
+中の疑問があります」マーカーの隣に「疑問を再開する」ボタンを出し、押す
+と `/resume` を呼んでから同じ Inquiry に再接続する。どちらのケースも
+新しい Inquiry 行は作られない。
+
+**含まない:** `review_item` origin からの Inquiry 作成 UI(Issue #287
+の Review Queue が対応するまで導線がない)、質問ルーティング/調査エー
+ジェント(Issue #286)。

@@ -2462,6 +2462,92 @@ CREATE INDEX IF NOT EXISTS idx_interview_intent_item_system
 
 CREATE INDEX IF NOT EXISTS idx_interview_intent_item_field
     ON interview_intent_item (session_id, field, superseded_by_id);
+
+-- Inquiry lifecycle (Issue #285): when a developer has a doubt about a
+-- confirmation item (a Q&A question, an Intent Brief item, or -- from Issue
+-- #287 onward -- a review item), the original item is held pending and a
+-- separate Inquiry conversation starts. Resolving the Inquiry ("疑問は解消
+-- した") is strictly separate from answering/confirming the origin item:
+-- creating, messaging, and resolving/holding/cancelling an Inquiry never
+-- writes to interview_qa / interview_intent_item. origin_kind/origin_id
+-- identify the item under discussion; 'review_item' is accepted now even
+-- though no reviewing table exists yet (#287 is what starts writing those
+-- rows) so the finite set does not need to change later. held_draft is the
+-- user's unconfirmed answer draft at the moment they opened the Inquiry,
+-- opaque JSON round-tripped back to the dashboard so it can restore the
+-- input when the developer returns to the original item -- the server never
+-- interprets it, and resolving never submits it as an answer (Principle 2:
+-- only an explicit user action on the origin item's own endpoint counts).
+CREATE TABLE IF NOT EXISTS interview_inquiry (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      INTEGER NOT NULL,
+    system_id       INTEGER NOT NULL,
+    origin_kind     TEXT NOT NULL,
+    origin_id       INTEGER NOT NULL,
+    held_draft      TEXT,
+    status          TEXT NOT NULL DEFAULT 'open',
+    status_reason   TEXT,
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL,
+    closed_at       REAL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_interview_inquiry_session
+    ON interview_inquiry (session_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_interview_inquiry_system
+    ON interview_inquiry (system_id, session_id);
+
+-- One row per turn in the Inquiry side-conversation. detail is populated on
+-- assistant messages only: {key_points, evidence, uncertainty} for
+-- progressive disclosure in the UI (the conclusion is the message content
+-- itself, shown first; "根拠を見る" expands detail). intelligence_run_id
+-- links to the intelligence_runs audit row that produced the message
+-- (Principle 7); NULL for user messages and for the fixed-template
+-- "insufficient information" assistant message (never LLM output).
+CREATE TABLE IF NOT EXISTS interview_inquiry_message (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    inquiry_id          INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    role                TEXT NOT NULL,
+    content             TEXT NOT NULL,
+    detail              TEXT,
+    intelligence_run_id INTEGER,
+    is_mock             INTEGER NOT NULL DEFAULT 0,
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (inquiry_id) REFERENCES interview_inquiry (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_interview_inquiry_message_inquiry
+    ON interview_inquiry_message (inquiry_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_interview_inquiry_message_system
+    ON interview_inquiry_message (system_id, inquiry_id);
+
+-- Audit trail for every Inquiry status change (Principle 7): which
+-- unresolved/hold/cancel/resolve/resume/reopen-doubt transition happened,
+-- who did it, and why. Kept as its own append-only table rather than
+-- overloading interview_inquiry.status_reason (which only ever reflects the
+-- *current* status) so a full history survives multiple hold/resume cycles.
+CREATE TABLE IF NOT EXISTS interview_inquiry_transition (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    inquiry_id  INTEGER NOT NULL,
+    system_id   INTEGER NOT NULL,
+    from_status TEXT NOT NULL,
+    to_status   TEXT NOT NULL,
+    actor       TEXT,
+    reason      TEXT,
+    created_at  REAL NOT NULL,
+    FOREIGN KEY (inquiry_id) REFERENCES interview_inquiry (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_interview_inquiry_transition_inquiry
+    ON interview_inquiry_transition (inquiry_id, id);
 """
 
 

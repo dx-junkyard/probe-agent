@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, getSystemId } from "./client";
 import type {
@@ -28,6 +29,8 @@ import type {
   InterviewQaListOut, InterviewQaOut, InterviewQaAnswerOut,
   InterviewIntentListOut, InterviewIntentItemOut,
   InterviewIntentField, InterviewIntentUserStatus,
+  InterviewInquiryListOut, InterviewInquiryDetailOut, InterviewInquiryOut,
+  InterviewInquiryOriginKind,
   RuntimeRealityFactsOut, RuntimeRealityCheckRunOut,
   UnderstandingRevisionListOut, UnderstandingDiffOut,
   SystemUnderstandingOut,
@@ -864,6 +867,139 @@ export function useProposeInterviewIntentItems(sessionId: number | null) {
     mutationFn: () =>
       api.post<InterviewIntentItemOut[]>(`/interview/sessions/${sessionId}/intent/propose`),
     onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewIntent"), sessionId] }),
+  });
+}
+
+// --- Inquiry lifecycle (Issue #285) --------------------------------------
+
+export function useInterviewInquiryList(sessionId: number | null, status?: string) {
+  return useQuery({
+    queryKey: [...sysKey("interviewInquiries"), sessionId, status ?? "all"],
+    queryFn: () => api.get<InterviewInquiryListOut>(
+      `/interview/sessions/${sessionId}/inquiries${status ? `?status=${status}` : ""}`,
+    ),
+    enabled: !!sessionId && !!getSystemId(),
+  });
+}
+
+export function useInterviewInquiryDetail(inquiryId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("interviewInquiry"), inquiryId],
+    queryFn: () => api.get<InterviewInquiryDetailOut>(`/interview/inquiries/${inquiryId}`),
+    enabled: !!inquiryId && !!getSystemId(),
+  });
+}
+
+// Refresh/resume (Issue #285): on page load / any list refetch, re-attach a
+// still-active (open or held) Inquiry to its origin card by
+// `${origin_kind}:${origin_id}` so a reload never "forgets" an in-progress
+// Inquiry — the server already persists everything needed
+// (GET /interview/inquiries/{id}); this just re-derives which origin each
+// active Inquiry belongs to from the existing list endpoint. 'open' is
+// preferred over 'held' for the same origin, then the most recently created
+// one, though in practice a single origin has at most one active Inquiry at
+// a time.
+export function activeInquiryByOrigin(
+  items: InterviewInquiryOut[],
+): Map<string, InterviewInquiryOut> {
+  const map = new Map<string, InterviewInquiryOut>();
+  for (const item of items) {
+    if (item.status !== "open" && item.status !== "held") continue;
+    const key = `${item.origin_kind}:${item.origin_id}`;
+    const current = map.get(key);
+    if (!current) {
+      map.set(key, item);
+      continue;
+    }
+    const itemBetter = (current.status !== "open" && item.status === "open") || item.id > current.id;
+    if (itemBetter) map.set(key, item);
+  }
+  return map;
+}
+
+export function useActiveInquiriesByOrigin(sessionId: number | null) {
+  const { data } = useInterviewInquiryList(sessionId);
+  return useMemo(() => activeInquiryByOrigin(data?.items ?? []), [data]);
+}
+
+function _invalidateInquiry(qc: ReturnType<typeof useQueryClient>, sessionId: number | null, inquiryId: number) {
+  qc.invalidateQueries({ queryKey: [...sysKey("interviewInquiries"), sessionId] });
+  qc.invalidateQueries({ queryKey: [...sysKey("interviewInquiry"), inquiryId] });
+}
+
+export function useCreateInterviewInquiry(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: {
+      origin_kind: InterviewInquiryOriginKind;
+      origin_id: number;
+      question_text: string;
+      held_draft?: string;
+    }) => api.post<InterviewInquiryDetailOut>(`/interview/sessions/${sessionId}/inquiries`, data),
+    onSuccess: result => _invalidateInquiry(qc, sessionId, result.inquiry.id),
+  });
+}
+
+export function useSendInterviewInquiryMessage(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ inquiryId, content }: { inquiryId: number; content: string }) =>
+      api.post<InterviewInquiryDetailOut>(`/interview/inquiries/${inquiryId}/message`, { content }),
+    onSuccess: (_result, { inquiryId }) => _invalidateInquiry(qc, sessionId, inquiryId),
+  });
+}
+
+export function useResolveInterviewInquiry(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ inquiryId }: { inquiryId: number }) =>
+      api.post<InterviewInquiryOut>(`/interview/inquiries/${inquiryId}/resolve`),
+    onSuccess: (_result, { inquiryId }) => _invalidateInquiry(qc, sessionId, inquiryId),
+  });
+}
+
+export function useMarkInterviewInquiryUnresolved(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ inquiryId, status_reason }: { inquiryId: number; status_reason?: string }) =>
+      api.post<InterviewInquiryOut>(`/interview/inquiries/${inquiryId}/unresolved`, { status_reason }),
+    onSuccess: (_result, { inquiryId }) => _invalidateInquiry(qc, sessionId, inquiryId),
+  });
+}
+
+export function useHoldInterviewInquiry(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ inquiryId }: { inquiryId: number }) =>
+      api.post<InterviewInquiryOut>(`/interview/inquiries/${inquiryId}/hold`),
+    onSuccess: (_result, { inquiryId }) => _invalidateInquiry(qc, sessionId, inquiryId),
+  });
+}
+
+export function useResumeInterviewInquiry(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ inquiryId }: { inquiryId: number }) =>
+      api.post<InterviewInquiryOut>(`/interview/inquiries/${inquiryId}/resume`),
+    onSuccess: (_result, { inquiryId }) => _invalidateInquiry(qc, sessionId, inquiryId),
+  });
+}
+
+export function useCancelInterviewInquiry(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ inquiryId }: { inquiryId: number }) =>
+      api.post<InterviewInquiryOut>(`/interview/inquiries/${inquiryId}/cancel`),
+    onSuccess: (_result, { inquiryId }) => _invalidateInquiry(qc, sessionId, inquiryId),
+  });
+}
+
+export function useReopenInterviewInquiryDoubt(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ inquiryId }: { inquiryId: number }) =>
+      api.post<InterviewInquiryOut>(`/interview/inquiries/${inquiryId}/reopen-doubt`),
+    onSuccess: (_result, { inquiryId }) => _invalidateInquiry(qc, sessionId, inquiryId),
   });
 }
 

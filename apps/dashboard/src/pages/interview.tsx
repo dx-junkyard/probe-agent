@@ -7,6 +7,7 @@ import {
   Sparkles, XCircle,
 } from "lucide-react";
 import {
+  useActiveInquiriesByOrigin,
   useAnswerInterviewQa,
   useApproveInterviewProposal,
   useConfirmInterviewUnderstanding,
@@ -23,6 +24,7 @@ import {
   useRebaseInterviewSnapshot,
   useRepositoryStatus,
   useRejectInterviewProposal,
+  useResumeInterviewInquiry,
   useResumeInterviewQa,
   useRunRuntimeRealityCheck,
   useSkipInterviewQa,
@@ -34,6 +36,7 @@ import { api } from "@/api/client";
 import { DiagnosticFixCallout, useDiagnosticHighlight } from "@/components/diagnostic-fix";
 import { UnderstandingOverview } from "@/components/system-understanding/understanding-overview";
 import { IntentBriefPanel } from "@/components/system-understanding/intent-brief-panel";
+import { InquiryPanel } from "@/components/system-understanding/inquiry-panel";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -52,6 +55,7 @@ import type {
   InterviewProposalMetadataBlock,
   InterviewProposalOut,
   InterviewProposalProbePlan,
+  InterviewInquiryOut,
   InterviewQaOut,
   InterviewQuestionEvidenceRef,
   InterviewSessionDetailOut,
@@ -417,9 +421,14 @@ function NextActionBanner({ uiState, nextAction }: {
 // 一覧・編集・スキップできる。回答の修正は新しいリビジョン行として保存され、
 // 旧回答も previous として残る(上書きしない)。
 function QaItemCard({
-  qa, onAnswer, onSkip, onResume, answering, skipping, resuming,
+  qa, sessionId, existingInquiry, onAnswer, onSkip, onResume, answering, skipping, resuming,
 }: {
   qa: InterviewQaOut;
+  sessionId: number;
+  // Issue #285 refresh/resume: an already-active (open/held) Inquiry for
+  // this question, rediscovered via the list endpoint so a page reload
+  // never forgets an in-progress Inquiry.
+  existingInquiry?: InterviewInquiryOut;
   onAnswer: (qaId: number, answerText: string, answerUnknown?: boolean) => Promise<void>;
   onSkip: (qaId: number) => void;
   onResume: (qaId: number) => void;
@@ -429,6 +438,34 @@ function QaItemCard({
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(qa.answer_text ?? "");
+  const [inquiryMode, setInquiryMode] = useState(false);
+  const [hasHeldInquiry, setHasHeldInquiry] = useState(false);
+  const [attachedInquiryId, setAttachedInquiryId] = useState<number | null>(null);
+  const resumeInquiry = useResumeInterviewInquiry(sessionId);
+
+  const heldInquiryId = hasHeldInquiry
+    ? attachedInquiryId
+    : (existingInquiry?.status === "held" ? existingInquiry.id : null);
+  const reopenableInquiryId = existingInquiry?.status === "open" ? existingInquiry.id : null;
+
+  const handleResumeInquiry = () => {
+    const id = heldInquiryId;
+    if (!id) return;
+    resumeInquiry.mutate({ inquiryId: id }, {
+      onSuccess: () => {
+        setAttachedInquiryId(id);
+        setHasHeldInquiry(false);
+        setInquiryMode(true);
+      },
+      onError: e => toast.error(String(e)),
+    });
+  };
+
+  const openExistingInquiry = () => {
+    if (!reopenableInquiryId) return;
+    setAttachedInquiryId(reopenableInquiryId);
+    setInquiryMode(true);
+  };
 
   const submit = async () => {
     if (!draft.trim()) return;
@@ -517,47 +554,108 @@ function QaItemCard({
         </p>
       )}
 
-      {editing ? (
-        <div className="space-y-2">
-          <Textarea
-            value={draft}
-            onChange={e => setDraft(e.target.value)}
-            rows={3}
-            placeholder="回答を入力"
-          />
-          <div className="flex gap-2">
-            <Button size="sm" onClick={submit} disabled={answering || !draft.trim()}>
-              {answering ? "送信中..." : "保存"}
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={submitUnknown}
-              disabled={answering}
-              data-testid={`qa-answer-unknown-${qa.id}`}
-            >
-              わからない
-            </Button>
-            <Button size="sm" variant="outline" onClick={() => setEditing(false)}>キャンセル</Button>
-          </div>
-        </div>
+      {inquiryMode ? (
+        <InquiryPanel
+          key={attachedInquiryId ?? "new"}
+          sessionId={sessionId}
+          originKind="qa"
+          originId={qa.id}
+          heldDraft={draft || null}
+          existingInquiryId={attachedInquiryId ?? undefined}
+          onResolved={heldDraft => {
+            setDraft(heldDraft ?? "");
+            setInquiryMode(false);
+            setHasHeldInquiry(false);
+            setAttachedInquiryId(null);
+            setEditing(true);
+          }}
+          onHeld={heldId => {
+            setInquiryMode(false);
+            setHasHeldInquiry(true);
+            setAttachedInquiryId(heldId);
+          }}
+          onCancel={() => { setInquiryMode(false); setAttachedInquiryId(null); }}
+        />
       ) : (
-        <div className="flex gap-2">
-          <Button size="sm" variant="outline" onClick={() => setEditing(true)}>
-            <Pencil className="h-3 w-3 mr-1" />
-            {qa.status === "answered" || qa.status === "unconfirmed" ? "回答を修正" : "回答する"}
-          </Button>
-          {qa.status === "open" && (
-            <Button size="sm" variant="outline" onClick={() => onSkip(qa.id)} disabled={skipping}>
-              後で回答
-            </Button>
+        <>
+          {heldInquiryId && (
+            <div className="flex items-center gap-2" data-testid={`qa-held-inquiry-marker-${qa.id}`}>
+              <p className="text-xs text-amber-700">保留中の疑問があります</p>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={handleResumeInquiry}
+                disabled={resumeInquiry.isPending}
+                data-testid={`qa-inquiry-resume-${qa.id}`}
+              >
+                疑問を再開する
+              </Button>
+            </div>
           )}
-          {qa.status === "skipped" && (
-            <Button size="sm" variant="outline" onClick={() => onResume(qa.id)} disabled={resuming}>
-              再開
-            </Button>
+          {editing ? (
+            <div className="space-y-2">
+              <Textarea
+                value={draft}
+                onChange={e => setDraft(e.target.value)}
+                rows={3}
+                placeholder="回答を入力"
+              />
+              <div className="flex gap-2">
+                <Button size="sm" onClick={submit} disabled={answering || !draft.trim()}>
+                  {answering ? "送信中..." : "保存"}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={submitUnknown}
+                  disabled={answering}
+                  data-testid={`qa-answer-unknown-${qa.id}`}
+                >
+                  わからない
+                </Button>
+                <Button size="sm" variant="outline" onClick={() => setEditing(false)}>キャンセル</Button>
+              </div>
+            </div>
+          ) : (
+            <div className="flex flex-wrap gap-2">
+              <Button size="sm" variant="outline" onClick={() => setEditing(true)}>
+                <Pencil className="h-3 w-3 mr-1" />
+                {qa.status === "answered" || qa.status === "unconfirmed" ? "回答を修正" : "回答する"}
+              </Button>
+              {qa.status === "open" && (
+                <Button size="sm" variant="outline" onClick={() => onSkip(qa.id)} disabled={skipping}>
+                  後で回答
+                </Button>
+              )}
+              {qa.status === "skipped" && (
+                <Button size="sm" variant="outline" onClick={() => onResume(qa.id)} disabled={resuming}>
+                  再開
+                </Button>
+              )}
+              {reopenableInquiryId ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={openExistingInquiry}
+                  data-testid={`qa-inquiry-reopen-${qa.id}`}
+                >
+                  疑問を再開する
+                </Button>
+              ) : (
+                !heldInquiryId && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => { setAttachedInquiryId(null); setInquiryMode(true); }}
+                    data-testid={`qa-inquiry-open-${qa.id}`}
+                  >
+                    疑問がある
+                  </Button>
+                )
+              )}
+            </div>
           )}
-        </div>
+        </>
       )}
     </div>
   );
@@ -571,6 +669,9 @@ function QaPanel({
   const skip = useSkipInterviewQa(sessionId);
   const resume = useResumeInterviewQa(sessionId);
   const runRealityCheck = useRunRuntimeRealityCheck(sessionId);
+  // Issue #285 refresh/resume: re-attach any still-active Inquiry to its
+  // origin card after a reload.
+  const activeInquiries = useActiveInquiriesByOrigin(sessionId);
 
   const handleAnswer = async (qaId: number, answerText: string, answerUnknown?: boolean) => {
     try {
@@ -658,6 +759,8 @@ function QaPanel({
             <QaItemCard
               key={qa.id}
               qa={qa}
+              sessionId={sessionId}
+              existingInquiry={activeInquiries.get(`qa:${qa.id}`)}
               onAnswer={handleAnswer}
               onSkip={qaId => skip.mutate({ qaId, actor }, {
                 onError: e => toast.error(String(e)),

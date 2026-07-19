@@ -806,6 +806,68 @@ export interface InterviewIntentListOut {
   items_by_field: Record<string, InterviewIntentItemOut[]>;
 }
 
+// --- Inquiry lifecycle (Issue #285) --------------------------------------
+//
+// A doubt about a confirmation item (Q&A question, Intent Brief item, or —
+// from Issue #287 — a review item) holds the original item pending and
+// starts a separate Inquiry conversation. Resolving the Inquiry never
+// changes the origin item's own state; the developer still submits that
+// item's own answer/confirm action afterward.
+
+export type InterviewInquiryOriginKind = "qa" | "intent" | "review_item";
+export type InterviewInquiryStatus = "open" | "resolved" | "unresolved" | "cancelled" | "held";
+export type InterviewInquiryMessageRole = "user" | "assistant";
+
+export interface InterviewInquiryEvidenceOut {
+  path: string;
+  start_line: number;
+  end_line: number;
+  summary: string;
+}
+
+export interface InterviewInquiryMessageDetailOut {
+  key_points: string[];
+  evidence: InterviewInquiryEvidenceOut[];
+  uncertainty: string;
+}
+
+export interface InterviewInquiryMessageOut {
+  id: number;
+  inquiry_id: number;
+  system_id: number;
+  role: InterviewInquiryMessageRole;
+  content: string;
+  detail: InterviewInquiryMessageDetailOut | null;
+  intelligence_run_id: number | null;
+  is_mock: boolean;
+  created_at: number;
+}
+
+export interface InterviewInquiryOut {
+  id: number;
+  session_id: number;
+  system_id: number;
+  origin_kind: InterviewInquiryOriginKind;
+  origin_id: number;
+  held_draft: string | null;
+  status: InterviewInquiryStatus;
+  status_reason: string | null;
+  created_at: number;
+  updated_at: number;
+  closed_at: number | null;
+}
+
+export interface InterviewInquiryDetailOut {
+  inquiry: InterviewInquiryOut;
+  messages: InterviewInquiryMessageOut[];
+}
+
+export interface InterviewInquiryListOut {
+  session_id: number;
+  system_id: number;
+  items: InterviewInquiryOut[];
+}
+
 export interface InterviewProposalDecisionOut {
   id: number;
   proposal_id: number;

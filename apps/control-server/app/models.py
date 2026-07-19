@@ -2963,6 +2963,103 @@ class InterviewIntentListOut(BaseModel):
     items_by_field: Dict[str, List[InterviewIntentItemOut]] = Field(default_factory=dict)
 
 
+# --- Inquiry lifecycle (Issue #285) -------------------------------------------
+#
+# A doubt about a confirmation item (Q&A question, Intent Brief item, or --
+# from Issue #287 -- a review item) is held pending while a separate Inquiry
+# conversation resolves it. Resolving an Inquiry never changes the origin
+# item's own state (Principle 2's "explicit user action" boundary applies to
+# the origin item's own endpoint, not to closing the Inquiry).
+
+InterviewInquiryOriginKind = Literal["qa", "intent", "review_item"]
+InterviewInquiryStatus = Literal["open", "resolved", "unresolved", "cancelled", "held"]
+InterviewInquiryMessageRole = Literal["user", "assistant"]
+
+
+class InterviewInquiryEvidenceOut(BaseModel):
+    path: str
+    start_line: int
+    end_line: int
+    summary: str = ""
+
+
+class InterviewInquiryMessageDetailOut(BaseModel):
+    """Progressive-disclosure detail for an assistant Inquiry message.
+
+    The message's own ``content`` is always the short conclusion, shown
+    first; ``detail`` is the "根拠を見る" (show evidence) expansion.
+    """
+
+    key_points: List[str] = Field(default_factory=list)
+    evidence: List[InterviewInquiryEvidenceOut] = Field(default_factory=list)
+    uncertainty: str = ""
+
+
+class InterviewInquiryMessageOut(BaseModel):
+    id: int
+    inquiry_id: int
+    system_id: int
+    role: InterviewInquiryMessageRole
+    content: str
+    detail: Optional[InterviewInquiryMessageDetailOut] = None
+    intelligence_run_id: Optional[int] = None
+    is_mock: bool = False
+    created_at: float
+
+
+class InterviewInquiryOut(BaseModel):
+    id: int
+    session_id: int
+    system_id: int
+    origin_kind: InterviewInquiryOriginKind
+    origin_id: int
+    held_draft: Optional[str] = None
+    status: InterviewInquiryStatus
+    status_reason: Optional[str] = None
+    created_at: float
+    updated_at: float
+    closed_at: Optional[float] = None
+
+
+class InterviewInquiryDetailOut(BaseModel):
+    inquiry: InterviewInquiryOut
+    messages: List[InterviewInquiryMessageOut] = Field(default_factory=list)
+
+
+class InterviewInquiryListOut(BaseModel):
+    session_id: int
+    system_id: int
+    items: List[InterviewInquiryOut] = Field(default_factory=list)
+
+
+class InterviewInquiryCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    origin_kind: InterviewInquiryOriginKind
+    origin_id: int
+    question_text: str = Field(..., min_length=1, max_length=2_000)
+    # Opaque to the server: the user's unconfirmed answer draft on the origin
+    # item at the moment they opened the Inquiry, round-tripped back verbatim
+    # via GET/resolve so the dashboard can restore it into the input without
+    # the server ever interpreting or submitting it as an answer.
+    held_draft: Optional[str] = Field(default=None, max_length=20_000)
+
+
+class InterviewInquiryMessageCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    content: str = Field(..., min_length=1, max_length=2_000)
+
+
+class InterviewInquiryTransitionRequest(BaseModel):
+    """Optional audit fields for a hold/cancel/unresolved status change."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status_reason: Optional[str] = Field(default=None, max_length=500)
+    actor: Optional[str] = Field(default=None, max_length=200)
+
+
 # --- Runtime Reality Check (Issue #135) --------------------------------------
 #
 # Reconciles approved interview metadata/probe plans (role, probe_value,
