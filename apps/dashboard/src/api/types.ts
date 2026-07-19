@@ -961,6 +961,33 @@ export interface AlignmentReviewQueueOut {
   items: AlignmentItemOut[];
 }
 
+// --- Automatic refresh after an answer batch (Issue #288) --------------------
+
+export type RefreshTriggerKind =
+  | "qa_answer" | "intent_update" | "alignment_answer" | "nl_change_set";
+export type RefreshJobStatus = "pending" | "updating" | "updated" | "failed" | "stale";
+
+export interface RefreshJobOut {
+  id: number;
+  session_id: number;
+  system_id: number;
+  trigger_kind: RefreshTriggerKind;
+  status: RefreshJobStatus;
+  error: string | null;
+  intelligence_run_id: number | null;
+  result_revision_id: number | null;
+  created_at: number;
+  started_at: number | null;
+  finished_at: number | null;
+}
+
+export interface RefreshStatusOut {
+  session_id: number;
+  system_id: number;
+  latest_job: RefreshJobOut | null;
+  pending_count: number;
+}
+
 export interface InterviewProposalDecisionOut {
   id: number;
   proposal_id: number;

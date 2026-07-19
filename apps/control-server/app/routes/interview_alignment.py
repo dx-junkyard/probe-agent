@@ -139,15 +139,13 @@ def _sorted_items(rows) -> List[AlignmentItemOut]:
 # --- Build ---------------------------------------------------------------------
 
 
-@router.post(
-    "/interview/sessions/{session_id}/alignment/build",
-    response_model=AlignmentBuildOut,
-)
-def build_alignment_items(
-    session_id: int,
-    system_id: int = Depends(get_system_id),
-) -> AlignmentBuildOut:
+def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuildOut:
     """Build alignment items contrasting Intent Brief vs Current System.
+
+    Core of ``POST .../alignment/build`` (below), extracted so the automatic
+    refresh job (``app/interview_refresh.py``, Issue #288) can rebuild
+    Alignment on the exact same code path right after Understanding is
+    rebuilt, instead of duplicating this orchestration.
 
     Requires at least one ``understanding_revision`` for this session (409
     otherwise -- build/refresh System Understanding first; no reasoning call
@@ -158,198 +156,212 @@ def build_alignment_items(
     row (``run_type='alignment_build'``).
 
     Fail-closed (Principle 6): LLM/schema failures, or every proposed item's
-    evidence failing snapshot validation, both raise 502 with no
-    ``alignment_item`` rows written or replaced. See module docstring for
-    the rebuild-merge rule.
+    evidence failing snapshot validation, both raise ``HTTPException`` (502)
+    with no ``alignment_item`` rows written or replaced. See module
+    docstring for the rebuild-merge rule. Callers that want to treat a
+    failure as non-fatal (the refresh job does, for the Alignment step
+    specifically) must catch ``HTTPException`` themselves.
     """
     now = time.time()
-    with get_conn() as conn:
-        _get_session_or_404(conn, session_id, system_id)
+    _get_session_or_404(conn, session_id, system_id)
 
-        revision = conn.execute(
-            """SELECT * FROM understanding_revision
-               WHERE session_id = ? AND system_id = ?
-               ORDER BY id DESC LIMIT 1""",
-            (session_id, system_id),
-        ).fetchone()
-        if revision is None:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "No understanding revision found for this session; "
-                    "build/refresh System Understanding first."
-                ),
-            )
-
-        snapshot_row = conn.execute(
-            "SELECT repo_path, commit_sha FROM repository_snapshots WHERE id = ? AND system_id = ?",
-            (revision["snapshot_id"], system_id),
-        ).fetchone()
-        if snapshot_row is None:
-            raise HTTPException(
-                status_code=409,
-                detail="The pinned snapshot for this session's latest understanding revision no longer exists.",
-            )
-
-        intent_rows = conn.execute(
-            """SELECT * FROM interview_intent_item
-               WHERE session_id = ? AND system_id = ? AND superseded_by_id IS NULL
-               ORDER BY field, id""",
-            (session_id, system_id),
-        ).fetchall()
-        intent_payload = [
-            {
-                "id": r["id"], "field": r["field"], "value_text": r["value_text"],
-                "status": r["status"],
-            }
-            for r in intent_rows
-        ]
-        # Deterministic FK resolution (Principle 6): the reasoning model only
-        # proposes a *field name*; the concrete interview_intent_item id is
-        # resolved here by an exact structural match against the current
-        # (non-superseded) row for that field -- never a fuzzy/text match.
-        intent_item_id_by_field: Dict[str, int] = {}
-        for r in intent_rows:
-            intent_item_id_by_field.setdefault(r["field"], r["id"])
-
-        current_understanding = (
-            json.loads(revision["current_understanding"]) if revision["current_understanding"] else None
-        )
-        gap_analysis = json.loads(revision["gap_analysis"]) if revision["gap_analysis"] else None
-
-        config = LLMConfig.intelligence_from_env()
-        client_error: Optional[str] = None
-        try:
-            client = create_llm_client(config)
-        except LLMError as exc:
-            client = None
-            client_error = str(exc)
-
-        if client_error is not None:
-            proposal = AlignmentProposalResult(
-                provider=config.provider,
-                model=config.model,
-                is_mock=config.provider == "mock",
-                error=client_error,
-            )
-        else:
-            proposal = generate_alignment_proposal(
-                client, config,
-                intent_items=intent_payload,
-                current_understanding=current_understanding,
-                gap_analysis=gap_analysis,
-            )
-
-        completed_at = time.time()
-        final_items: List[dict] = []
-        if proposal.error is None:
-            line_count_cache: Dict[str, Optional[int]] = {}
-            had_raw_items = len(proposal.items) > 0
-            for item in proposal.items:
-                valid_evidence, _pruned = validate_evidence_against_snapshot(
-                    snapshot_row["repo_path"], snapshot_row["commit_sha"],
-                    item.evidence, line_count_cache,
-                )
-                if not valid_evidence:
-                    # Dropped, not fatal on its own -- see the "fail only if
-                    # none valid" rule below.
-                    continue
-                review_category, reason_code = classify_alignment_item(
-                    alignment_state=item.alignment_state,
-                    risk_flags=item.risk_flags,
-                    confidence=item.confidence,
-                    intent_field=item.intent_field,
-                )
-                final_items.append({
-                    "intent_item_id": intent_item_id_by_field.get(item.intent_field)
-                        if item.intent_field else None,
-                    "intent_summary": item.intent_ref_hint,
-                    "current_claim": item.current_claim,
-                    "current_evidence": [
-                        {"path": e.path, "start_line": e.start_line, "end_line": e.end_line, "summary": e.summary}
-                        for e in valid_evidence
-                    ],
-                    "gap_summary": item.gap_summary,
-                    "proposed_interpretation": item.proposed_interpretation,
-                    "alignment_state": item.alignment_state,
-                    "risk_flags": item.risk_flags,
-                    "confidence": item.confidence,
-                    "review_category": review_category,
-                    "reason_code": reason_code,
-                })
-            if had_raw_items and not final_items:
-                proposal = AlignmentProposalResult(
-                    provider=proposal.provider, model=proposal.model, is_mock=proposal.is_mock,
-                    error="Every proposed alignment item's evidence failed snapshot validation",
-                )
-
-        run_status = "failed" if proposal.error else "completed"
-        run_cur = conn.execute(
-            """
-            INSERT INTO intelligence_runs
-                (system_id, snapshot_id, run_type, provider, model,
-                 prompt_version, schema_version, decision_method, status,
-                 error_details, is_mock, started_at, completed_at)
-            VALUES (?, ?, 'alignment_build', ?, ?, ?, ?, 'reasoning_llm', ?, ?, ?, ?, ?)
-            """,
-            (
-                system_id, revision["snapshot_id"], proposal.provider, proposal.model,
-                proposal.prompt_version, proposal.schema_version, run_status, proposal.error,
-                1 if proposal.is_mock else 0, now, completed_at,
+    revision = conn.execute(
+        """SELECT * FROM understanding_revision
+           WHERE session_id = ? AND system_id = ?
+           ORDER BY id DESC LIMIT 1""",
+        (session_id, system_id),
+    ).fetchone()
+    if revision is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "No understanding revision found for this session; "
+                "build/refresh System Understanding first."
             ),
         )
-        run_id = run_cur.lastrowid
 
-        if proposal.error:
-            raise HTTPException(status_code=502, detail=proposal.error)
-
-        conn.execute("BEGIN")
-        try:
-            # Rebuild-merge (Principle 2): only rows with no user progress
-            # are ever replaced.
-            conn.execute(
-                """DELETE FROM alignment_item
-                   WHERE session_id = ? AND system_id = ?
-                     AND status = 'open' AND user_decision IS NULL""",
-                (session_id, system_id),
-            )
-            for it in final_items:
-                reason_code = it["reason_code"]
-                conn.execute(
-                    """INSERT INTO alignment_item
-                        (session_id, system_id, revision_id, snapshot_id, intent_item_id,
-                         intent_summary, current_claim, current_evidence, gap_summary,
-                         proposed_interpretation, alignment_state, risk_flags, confidence,
-                         review_category, reason_code, user_reason, status, user_decision,
-                         intelligence_run_id, is_mock, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?, ?, ?)""",
-                    (
-                        session_id, system_id, revision["id"], revision["snapshot_id"],
-                        it["intent_item_id"], it["intent_summary"], it["current_claim"],
-                        json.dumps(it["current_evidence"], ensure_ascii=False),
-                        it["gap_summary"], it["proposed_interpretation"], it["alignment_state"],
-                        json.dumps(it["risk_flags"]), it["confidence"], it["review_category"],
-                        reason_code, user_reason_for(reason_code), run_id,
-                        1 if proposal.is_mock else 0, completed_at, completed_at,
-                    ),
-                )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
-
-        rows = conn.execute(
-            "SELECT * FROM alignment_item WHERE session_id = ? AND system_id = ?",
-            (session_id, system_id),
-        ).fetchall()
-        return AlignmentBuildOut(
-            session_id=session_id,
-            system_id=system_id,
-            revision_id=revision["id"],
-            intelligence_run_id=run_id,
-            is_mock=proposal.is_mock,
-            items=_sorted_items(rows),
+    snapshot_row = conn.execute(
+        "SELECT repo_path, commit_sha FROM repository_snapshots WHERE id = ? AND system_id = ?",
+        (revision["snapshot_id"], system_id),
+    ).fetchone()
+    if snapshot_row is None:
+        raise HTTPException(
+            status_code=409,
+            detail="The pinned snapshot for this session's latest understanding revision no longer exists.",
         )
+
+    intent_rows = conn.execute(
+        """SELECT * FROM interview_intent_item
+           WHERE session_id = ? AND system_id = ? AND superseded_by_id IS NULL
+           ORDER BY field, id""",
+        (session_id, system_id),
+    ).fetchall()
+    intent_payload = [
+        {
+            "id": r["id"], "field": r["field"], "value_text": r["value_text"],
+            "status": r["status"],
+        }
+        for r in intent_rows
+    ]
+    # Deterministic FK resolution (Principle 6): the reasoning model only
+    # proposes a *field name*; the concrete interview_intent_item id is
+    # resolved here by an exact structural match against the current
+    # (non-superseded) row for that field -- never a fuzzy/text match.
+    intent_item_id_by_field: Dict[str, int] = {}
+    for r in intent_rows:
+        intent_item_id_by_field.setdefault(r["field"], r["id"])
+
+    current_understanding = (
+        json.loads(revision["current_understanding"]) if revision["current_understanding"] else None
+    )
+    gap_analysis = json.loads(revision["gap_analysis"]) if revision["gap_analysis"] else None
+
+    config = LLMConfig.intelligence_from_env()
+    client_error: Optional[str] = None
+    try:
+        client = create_llm_client(config)
+    except LLMError as exc:
+        client = None
+        client_error = str(exc)
+
+    if client_error is not None:
+        proposal = AlignmentProposalResult(
+            provider=config.provider,
+            model=config.model,
+            is_mock=config.provider == "mock",
+            error=client_error,
+        )
+    else:
+        proposal = generate_alignment_proposal(
+            client, config,
+            intent_items=intent_payload,
+            current_understanding=current_understanding,
+            gap_analysis=gap_analysis,
+        )
+
+    completed_at = time.time()
+    final_items: List[dict] = []
+    if proposal.error is None:
+        line_count_cache: Dict[str, Optional[int]] = {}
+        had_raw_items = len(proposal.items) > 0
+        for item in proposal.items:
+            valid_evidence, _pruned = validate_evidence_against_snapshot(
+                snapshot_row["repo_path"], snapshot_row["commit_sha"],
+                item.evidence, line_count_cache,
+            )
+            if not valid_evidence:
+                # Dropped, not fatal on its own -- see the "fail only if
+                # none valid" rule below.
+                continue
+            review_category, reason_code = classify_alignment_item(
+                alignment_state=item.alignment_state,
+                risk_flags=item.risk_flags,
+                confidence=item.confidence,
+                intent_field=item.intent_field,
+            )
+            final_items.append({
+                "intent_item_id": intent_item_id_by_field.get(item.intent_field)
+                    if item.intent_field else None,
+                "intent_summary": item.intent_ref_hint,
+                "current_claim": item.current_claim,
+                "current_evidence": [
+                    {"path": e.path, "start_line": e.start_line, "end_line": e.end_line, "summary": e.summary}
+                    for e in valid_evidence
+                ],
+                "gap_summary": item.gap_summary,
+                "proposed_interpretation": item.proposed_interpretation,
+                "alignment_state": item.alignment_state,
+                "risk_flags": item.risk_flags,
+                "confidence": item.confidence,
+                "review_category": review_category,
+                "reason_code": reason_code,
+            })
+        if had_raw_items and not final_items:
+            proposal = AlignmentProposalResult(
+                provider=proposal.provider, model=proposal.model, is_mock=proposal.is_mock,
+                error="Every proposed alignment item's evidence failed snapshot validation",
+            )
+
+    run_status = "failed" if proposal.error else "completed"
+    run_cur = conn.execute(
+        """
+        INSERT INTO intelligence_runs
+            (system_id, snapshot_id, run_type, provider, model,
+             prompt_version, schema_version, decision_method, status,
+             error_details, is_mock, started_at, completed_at)
+        VALUES (?, ?, 'alignment_build', ?, ?, ?, ?, 'reasoning_llm', ?, ?, ?, ?, ?)
+        """,
+        (
+            system_id, revision["snapshot_id"], proposal.provider, proposal.model,
+            proposal.prompt_version, proposal.schema_version, run_status, proposal.error,
+            1 if proposal.is_mock else 0, now, completed_at,
+        ),
+    )
+    run_id = run_cur.lastrowid
+
+    if proposal.error:
+        raise HTTPException(status_code=502, detail=proposal.error)
+
+    conn.execute("BEGIN")
+    try:
+        # Rebuild-merge (Principle 2): only rows with no user progress
+        # are ever replaced.
+        conn.execute(
+            """DELETE FROM alignment_item
+               WHERE session_id = ? AND system_id = ?
+                 AND status = 'open' AND user_decision IS NULL""",
+            (session_id, system_id),
+        )
+        for it in final_items:
+            reason_code = it["reason_code"]
+            conn.execute(
+                """INSERT INTO alignment_item
+                    (session_id, system_id, revision_id, snapshot_id, intent_item_id,
+                     intent_summary, current_claim, current_evidence, gap_summary,
+                     proposed_interpretation, alignment_state, risk_flags, confidence,
+                     review_category, reason_code, user_reason, status, user_decision,
+                     intelligence_run_id, is_mock, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?, ?, ?)""",
+                (
+                    session_id, system_id, revision["id"], revision["snapshot_id"],
+                    it["intent_item_id"], it["intent_summary"], it["current_claim"],
+                    json.dumps(it["current_evidence"], ensure_ascii=False),
+                    it["gap_summary"], it["proposed_interpretation"], it["alignment_state"],
+                    json.dumps(it["risk_flags"]), it["confidence"], it["review_category"],
+                    reason_code, user_reason_for(reason_code), run_id,
+                    1 if proposal.is_mock else 0, completed_at, completed_at,
+                ),
+            )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    rows = conn.execute(
+        "SELECT * FROM alignment_item WHERE session_id = ? AND system_id = ?",
+        (session_id, system_id),
+    ).fetchall()
+    return AlignmentBuildOut(
+        session_id=session_id,
+        system_id=system_id,
+        revision_id=revision["id"],
+        intelligence_run_id=run_id,
+        is_mock=proposal.is_mock,
+        items=_sorted_items(rows),
+    )
+
+
+@router.post(
+    "/interview/sessions/{session_id}/alignment/build",
+    response_model=AlignmentBuildOut,
+)
+def build_alignment_items(
+    session_id: int,
+    system_id: int = Depends(get_system_id),
+) -> AlignmentBuildOut:
+    """API boundary for ``run_alignment_build`` -- see its docstring."""
+    with get_conn() as conn:
+        return run_alignment_build(conn, session_id, system_id)
 
 
 # --- Read ------------------------------------------------------------------
@@ -449,7 +461,15 @@ def answer_alignment_item(
             (json.dumps(decision, ensure_ascii=False), now, item_id),
         )
         row = conn.execute("SELECT * FROM alignment_item WHERE id = ?", (item_id,)).fetchone()
-        return _item_out(row)
+        result = _item_out(row)
+
+    # Issue #288: refresh Understanding/Alignment/Review Queue now that the
+    # decision is durably committed (see interview.answer_interview_qa's
+    # comment for why this call sits outside the `with get_conn()` block).
+    from ..interview_refresh import request_refresh
+
+    request_refresh(result.session_id, system_id, "alignment_answer")
+    return result
 
 
 @router.post(
@@ -484,7 +504,13 @@ def correct_alignment_item(
             (json.dumps(decision, ensure_ascii=False), now, item_id),
         )
         row = conn.execute("SELECT * FROM alignment_item WHERE id = ?", (item_id,)).fetchone()
-        return _item_out(row)
+        result = _item_out(row)
+
+    # Issue #288: see answer_alignment_item's comment above.
+    from ..interview_refresh import request_refresh
+
+    request_refresh(result.session_id, system_id, "alignment_answer")
+    return result
 
 
 @router.post(

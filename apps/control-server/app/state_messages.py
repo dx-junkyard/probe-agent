@@ -1160,3 +1160,27 @@ def gap_note(key: str, **kwargs: Any) -> str:
 
 def success_summary(*, done: int, total: int, symbol_count: int, entrypoint_count: int) -> str:
     return f"分析完了 — {done}/{total} ステップ ・ {symbol_count} シンボル ・ {entrypoint_count} エントリポイント"
+
+
+# ---------------------------------------------------------------------------
+# interview_refresh.py: automatic-refresh job notes (Issue #288). These are
+# fixed informational notes stored in interview_refresh_job.error for
+# non-failure terminal states (status='updated' with nothing new to rebuild,
+# or status='stale' when a newer job already completed) -- never LLM free
+# text (Principle 6/7).
+# ---------------------------------------------------------------------------
+
+REFRESH_JOB_MESSAGES: Dict[str, str] = {
+    "skipped_no_new_answers": "新しい回答がないため、理解の更新をスキップしました。",
+    "superseded": "より新しい更新結果が既に存在するため、この結果は破棄されました。",
+}
+
+
+def refresh_job_message(key: str) -> str:
+    try:
+        return REFRESH_JOB_MESSAGES[key]
+    except KeyError as exc:
+        raise KeyError(
+            f"state_messages.REFRESH_JOB_MESSAGES: no entry for key={key!r}. "
+            "Add one instead of falling back to hardcoded/English text (Issue #240)."
+        ) from exc

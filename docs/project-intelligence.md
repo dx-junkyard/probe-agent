@@ -2955,3 +2955,151 @@ interview ページに新設した Review Queue パネル:
   たまれ操作を持たないこと、`status='inquiry'` でアクションが隠れるこ
   と、raw enum が画面に出ないこと、answer/hold/build 各アクションが対
   応する API を呼ぶこと)。
+
+## 回答バッチ後の自動更新(Issue #288)
+
+Q&A 回答 / Intent の confirm・correct・decline / Alignment の
+answer・correct のいずれかが保存された直後、手動の「理解を更新」を押さ
+なくても Understanding / Alignment / Review Queue を自動で最新化する。
+保存済みの回答を失わないこと(Principle 1)、冪等であること、古い(=
+実行順序が入れ替わって後から書き込もうとした)結果が新しい結果を上書き
+しないことを満たす。
+
+### テーブル(additive): `interview_refresh_job`
+
+| カラム | 型 | 説明 |
+| --- | --- | --- |
+| `id` | INTEGER PK | |
+| `session_id` / `system_id` | INTEGER NOT NULL | System-scoped、`interview_session` に紐づく |
+| `trigger_kind` | TEXT NOT NULL | `qa_answer\|intent_update\|alignment_answer\|nl_change_set`(`nl_change_set` は #289 が使う予約値。本 issue では発行しない) |
+| `base_revision_id` | INTEGER NULL | enqueue 時点の最新 `understanding_revision.id`(まだ無ければ NULL) |
+| `base_answer_marker` | REAL NOT NULL | enqueue 時刻(このトリガー入力のデデュープキー) |
+| `status` | TEXT NOT NULL DEFAULT `'pending'` | `pending\|updating\|updated\|failed\|stale` |
+| `error` | TEXT NULL | `failed` 時は失敗理由、`updated`/`stale` 時は固定の日本語注記(何もすることがなかった/より新しい結果に破棄された)。LLM 自由文ではない |
+| `intelligence_run_id` | INTEGER NULL | この job が生成した `understanding_review` の `intelligence_runs` 行 |
+| `result_revision_id` | INTEGER NULL | この job が生成した `understanding_revision.id` |
+| `created_at` / `started_at` / `finished_at` | REAL | |
+
+インデックス: `(session_id, id DESC)` / `(system_id, session_id)`。
+
+### オーケストレーション(`app/interview_refresh.py`)
+
+- `request_refresh(session_id, system_id, trigger_kind)`: 回答/決定の
+  コミットが**完了した後**に呼ぶ(回答の永続化成功と自動更新の成否を結
+  合しない、Principle 1)。デデュープ規則:
+  - そのセッションに `pending` job が既にあれば、新しい行は作らない
+    (既存の `pending` job が実行される時点で、その時点までに保存され
+    ているすべての回答を拾う — 束ねられたバッチ)。
+  - `updating` job があり `pending` が無ければ、`pending` job を1件だ
+    け作る(実行中の job には今回のトリガーが間に合わないため)。
+  - どちらも無ければ `pending` job を作って即座にディスパッチする。
+  - 結果として、1セッションにつき常に「`pending` 高々1件 + `updating`
+    高々1件」までしか積み上がらない(連続した回答が revision の乱発を
+    生まない)。
+- `run_refresh_job(job_id)`:
+  1. セッションと同じ `session_id` に紐づく in-process lock
+     (`_lock_for_session`)を取得し、このセッションの job 実行を直列化
+     する。
+  2. job が `pending` でなければ即座に no-op で返る(同じ job を2回実
+     行しても2回目は何もしない — 冪等性)。
+  3. 「このセッションで、より新しい(`id` が大きい)job が既に
+     `updated` で完了している」場合は、この job を `status='stale'` に
+     し、何も書き込まずに返る(実行順序が入れ替わって古い job が後から
+     動いても、新しい結果を上書きしない)。
+  4. `_understanding_update_blocked` が真(手動「理解を更新」の 409 条
+     件と完全に同じ判定 — 確定済みで新しい回答が無い)なら、Understanding
+     の再構築を**スキップ**し、`status='updated'` + 固定の注記だけを記
+     録する(rebuild は何もしなかった、という事実そのものが結果)。
+  5. そうでなければ `routes/interview._rebuild_understanding` を呼ぶ
+     (`update_interview_understanding` エンドポイントと **全く同じ**
+     reasoning 呼び出し・永続化コードパス — 重複実装しない)。失敗すれ
+     ば `status='failed'` + エラー内容 + その reasoning run の
+     `intelligence_run_id` を記録して終了。保存済みの回答行は一切変更
+     しない。
+  6. 成功したら続けて `routes/interview_alignment.run_alignment_build`
+     を呼ぶ(`POST .../alignment/build` と同じコードパス)。Alignment
+     側の失敗は Understanding の成功を無効化しない — job は `updated`
+     のまま、`error` に Alignment 失敗のメモを残す(Understanding は既
+     に永続化済みであり、それを握りつぶして `failed` にする方が
+     Principle 1 に反するため)。
+  7. job の `intelligence_run_id`/`result_revision_id` を記録して
+     `status='updated'` で終える。この2列と `understanding_revision`
+     の `intelligence_run_id` を辿ることで job → intelligence_run →
+     revision の監査系列が常に問い合わせ可能(Principle 7)。
+  8. `run_refresh_job` はこの job を終えた後、同じセッションに
+     `pending` job が残っていればそれを続けて実行する(ドレイン)。バ
+     ックグラウンドスレッド1本の中で完結するため、追加のディスパッチ
+     やポーリングを別途必要としない。
+
+現在の実装は「セッション単位の直列実行」を in-process lock で保証して
+いる前提で、`stale` 判定を job 開始前の1回のチェックに単純化している
+(ブリーフが示す「reasoning 呼び出し後・書き込み前」の再チェックまでは
+実装していない)。`db.get_conn()` がプロセス全体で単一のグローバルロッ
+クを介して DB アクセスを直列化する既存設計のもとでは、同一セッション
+の2 job が本当に同時に書き込むことは構造的に起こり得ないため、この単
+純化は安全側に倒れている。
+
+### 実行モデル・eager モード
+
+`system_understanding_jobs.py` の「バックグラウンドスレッドで実行し、
+状態は DB 行に永続化する」という既存パターンに倣う。ただし #288 の
+job は単一ステップなので、専用のステップ/ハートビート/キャンセルの仕
+組みは持たない(必要になれば #109 のパターンへ寄せる余地を残す)。
+
+環境変数 `PROBE_REFRESH_EAGER`(デフォルト `0`/`false`)を `1` にする
+と、`request_refresh` がディスパッチする最初の job をバックグラウンド
+スレッドではなく呼び出し元のスレッドで同期的に実行する。テストで決定
+的にアサーションするための切り替えで、`tests/test_interview_refresh.py`
+がテストごとに `monkeypatch.setenv("PROBE_REFRESH_EAGER", "1")` してい
+る。
+
+### ルート(`routes/interview_refresh.py`、`main.py` に登録)
+
+- `GET /interview/sessions/{id}/refresh-status` — `{latest_job: {status,
+  trigger_kind, error, created_at, finished_at, result_revision_id, ...},
+  pending_count}`。Dashboard のステータスチップが参照する。
+- `POST /interview/sessions/{id}/refresh-jobs/{job_id}/retry` —
+  `failed` の job だけを再試行できる(それ以外は 409)。既存の手動
+  「理解を更新」エンドポイントと同様、障害復旧・診断用の明示操作。
+  内部的には `request_refresh` と同じデデュープ経路を通る新しい
+  `pending` job を発行する(失敗した行自体は書き換えない — 監査履歴と
+  して残す)。
+
+既存の手動「理解を更新」(`POST .../update-understanding`)はそのまま
+残る(障害復旧・診断用)。その内部実装は本 issue で
+`routes/interview._rebuild_understanding` として抽出し、409 ゲート
+(`_understanding_update_blocked`)を持つのはこのエンドポイントだけ、
+という既存の契約はそのまま維持している。
+
+### Dashboard
+
+- `RefreshStatusChip`(`components/system-understanding/refresh-status-chip.tsx`)
+  を「現在の理解」カードと「レビューキュー」カードの両方のヘッダーに表
+  示する。`pending|updating|updated|failed|stale` を
+  「更新待ち…/更新中…/更新済み/更新に失敗しました/古い結果を破棄しま
+  した」に日本語マップし(Issue #266 の規約どおりクライアント側の固定
+  マッピング)、`failed` のときだけ「再試行」ボタンを表示する。
+  `useRefreshStatus` は job が `pending`/`updating` の間だけ2秒間隔で
+  ポーリングし、回答/決定の各 mutation フックは成功時にこのクエリを直
+  接無効化する(ポーリングの次の tick を待たずに反映するため)。
+- 「理解を更新」ボタンは残すが、二次的な操作(`variant="ghost"`)に位
+  置づけ、カード説明文に「通常は回答後に自動で更新されます」という補
+  足を添える。回答後に押す必要がある、という UI 上の要求は取り除いた。
+
+### テスト
+
+- `tests/test_interview_refresh.py`: 回答 → job 実行 → 新 revision +
+  Alignment 再構築 + `refresh-status` 反映のエンドツーエンド(eager
+  モード)、reasoning 失敗時も回答自体は残ること + 失敗 job の retry が
+  回復すること、`updating` 中の複数回トリガーが `pending` 1件までしか
+  積まないこと、古い job が新しい job の後に実行されると `stale` にな
+  り revision を上書きしないこと、同じ job の2回実行が冪等であること
+  (revision/alignment_item が重複しないこと)、Alignment が生成した
+  `must_review` item が Review Queue に現れること、job →
+  intelligence_run → revision の監査系列が辿れること(prompt/schema
+  version の契約チェック込み)、2スレッドが同じ job を同時に実行して
+  も再構築が1回しか起きないこと、確定済みで新しい回答が無いときは
+  rebuild をスキップして `updated` + 注記になること。
+- Dashboard: `src/__tests__/refresh-status-chip.test.tsx`(job が無け
+  れば何も出さないこと、各 status の日本語ラベル、`failed` のときだけ
+  再試行ボタンが出て retry API を呼ぶこと)。

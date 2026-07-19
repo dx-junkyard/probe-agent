@@ -3196,6 +3196,41 @@ class AlignmentCorrectRequest(BaseModel):
     corrected_interpretation: str = Field(..., min_length=1, max_length=2_000)
 
 
+# --- Automatic refresh after an answer batch (Issue #288) --------------------
+#
+# app/interview_refresh.py's request_refresh()/run_refresh_job() keep
+# Understanding / Alignment / Review Queue current after a Q&A answer, Intent
+# confirm/correct, or Alignment answer/correct, without the manual
+# 「理解を更新」 action. trigger_kind/status are explicit finite sets
+# (Principle 6).
+
+RefreshTriggerKind = Literal[
+    "qa_answer", "intent_update", "alignment_answer", "nl_change_set",
+]
+RefreshJobStatus = Literal["pending", "updating", "updated", "failed", "stale"]
+
+
+class RefreshJobOut(BaseModel):
+    id: int
+    session_id: int
+    system_id: int
+    trigger_kind: RefreshTriggerKind
+    status: RefreshJobStatus
+    error: Optional[str] = None
+    intelligence_run_id: Optional[int] = None
+    result_revision_id: Optional[int] = None
+    created_at: float
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+
+
+class RefreshStatusOut(BaseModel):
+    session_id: int
+    system_id: int
+    latest_job: Optional[RefreshJobOut] = None
+    pending_count: int = 0
+
+
 # --- Runtime Reality Check (Issue #135) --------------------------------------
 #
 # Reconciles approved interview metadata/probe plans (role, probe_value,

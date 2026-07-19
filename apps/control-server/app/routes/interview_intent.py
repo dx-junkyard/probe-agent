@@ -239,7 +239,15 @@ def confirm_intent_item(
         row = conn.execute(
             "SELECT * FROM interview_intent_item WHERE id = ?", (item_id,)
         ).fetchone()
-        return _item_out(row)
+        result = _item_out(row)
+
+    # Issue #288: refresh Understanding/Alignment/Review Queue now that the
+    # decision is durably committed (see answer_interview_qa's comment for
+    # why this call sits outside the `with get_conn()` block).
+    from ..interview_refresh import request_refresh
+
+    request_refresh(result.session_id, system_id, "intent_update")
+    return result
 
 
 @router.post(
@@ -287,7 +295,13 @@ def correct_intent_item(
         row = conn.execute(
             "SELECT * FROM interview_intent_item WHERE id = ?", (new_id,)
         ).fetchone()
-        return _item_out(row)
+        result = _item_out(row)
+
+    # Issue #288: see confirm_intent_item's comment above.
+    from ..interview_refresh import request_refresh
+
+    request_refresh(result.session_id, system_id, "intent_update")
+    return result
 
 
 @router.post(
@@ -320,7 +334,13 @@ def decline_intent_item(
         row = conn.execute(
             "SELECT * FROM interview_intent_item WHERE id = ?", (item_id,)
         ).fetchone()
-        return _item_out(row)
+        result = _item_out(row)
+
+    # Issue #288: see confirm_intent_item's comment above.
+    from ..interview_refresh import request_refresh
+
+    request_refresh(result.session_id, system_id, "intent_update")
+    return result
 
 
 @router.post(

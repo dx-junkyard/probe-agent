@@ -33,6 +33,7 @@ import type {
   InterviewInquiryOriginKind,
   AlignmentBuildOut, AlignmentListOut, AlignmentReviewQueueOut, AlignmentItemOut,
   AlignmentDecisionAction,
+  RefreshStatusOut, RefreshJobOut,
   RuntimeRealityFactsOut, RuntimeRealityCheckRunOut,
   UnderstandingRevisionListOut, UnderstandingDiffOut,
   SystemUnderstandingOut,
@@ -792,6 +793,10 @@ export function useAnswerInterviewQa(sessionId: number | null) {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] });
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+      // Issue #288: the server enqueues an automatic refresh right after
+      // this answer commits; refetch its status so the chip updates
+      // promptly instead of waiting for the next poll tick.
+      _invalidateAfterAnswerBatch(qc, sessionId);
     },
   });
 }
@@ -841,7 +846,11 @@ export function useConfirmInterviewIntentItem(sessionId: number | null) {
   return useMutation({
     mutationFn: ({ itemId }: { itemId: number }) =>
       api.post<InterviewIntentItemOut>(`/interview/intent/${itemId}/confirm`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewIntent"), sessionId] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewIntent"), sessionId] });
+      // Issue #288: see useAnswerInterviewQa's comment above.
+      _invalidateAfterAnswerBatch(qc, sessionId);
+    },
   });
 }
 
@@ -850,7 +859,10 @@ export function useCorrectInterviewIntentItem(sessionId: number | null) {
   return useMutation({
     mutationFn: ({ itemId, value_text }: { itemId: number; value_text: string }) =>
       api.post<InterviewIntentItemOut>(`/interview/intent/${itemId}/correct`, { value_text }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewIntent"), sessionId] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewIntent"), sessionId] });
+      _invalidateAfterAnswerBatch(qc, sessionId);
+    },
   });
 }
 
@@ -859,7 +871,10 @@ export function useDeclineInterviewIntentItem(sessionId: number | null) {
   return useMutation({
     mutationFn: ({ itemId }: { itemId: number }) =>
       api.post<InterviewIntentItemOut>(`/interview/intent/${itemId}/decline`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewIntent"), sessionId] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewIntent"), sessionId] });
+      _invalidateAfterAnswerBatch(qc, sessionId);
+    },
   });
 }
 
@@ -1048,7 +1063,11 @@ export function useAnswerAlignmentItem(sessionId: number | null) {
   return useMutation({
     mutationFn: ({ itemId, decision, note }: { itemId: number; decision: AlignmentDecisionAction; note?: string }) =>
       api.post<AlignmentItemOut>(`/interview/alignment/${itemId}/answer`, { decision, note }),
-    onSuccess: () => _invalidateAlignment(qc, sessionId),
+    onSuccess: () => {
+      _invalidateAlignment(qc, sessionId);
+      // Issue #288: see useAnswerInterviewQa's comment above.
+      _invalidateAfterAnswerBatch(qc, sessionId);
+    },
   });
 }
 
@@ -1057,7 +1076,10 @@ export function useCorrectAlignmentItem(sessionId: number | null) {
   return useMutation({
     mutationFn: ({ itemId, corrected_interpretation }: { itemId: number; corrected_interpretation: string }) =>
       api.post<AlignmentItemOut>(`/interview/alignment/${itemId}/correct`, { corrected_interpretation }),
-    onSuccess: () => _invalidateAlignment(qc, sessionId),
+    onSuccess: () => {
+      _invalidateAlignment(qc, sessionId);
+      _invalidateAfterAnswerBatch(qc, sessionId);
+    },
   });
 }
 
@@ -1067,6 +1089,43 @@ export function useHoldAlignmentItem(sessionId: number | null) {
     mutationFn: ({ itemId }: { itemId: number }) =>
       api.post<AlignmentItemOut>(`/interview/alignment/${itemId}/hold`),
     onSuccess: () => _invalidateAlignment(qc, sessionId),
+  });
+}
+
+// --- Automatic refresh after an answer batch (Issue #288) --------------------
+//
+// Polls while a job is pending/updating so the status chip near 現在の理解 /
+// レビューキュー reflects progress without the user reloading; every answer/
+// decision mutation also invalidates this query directly (see
+// `_invalidateAfterAnswerBatch` below) so the chip updates promptly instead
+// of waiting for the next poll tick.
+
+export function useRefreshStatus(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("refreshStatus"), sessionId],
+    queryFn: () => api.get<RefreshStatusOut>(`/interview/sessions/${sessionId}/refresh-status`),
+    enabled: !!sessionId && !!getSystemId(),
+    refetchInterval: (query) => {
+      const status = query.state.data?.latest_job?.status;
+      return status === "pending" || status === "updating" ? 2000 : false;
+    },
+  });
+}
+
+function _invalidateAfterAnswerBatch(qc: ReturnType<typeof useQueryClient>, sessionId: number | null) {
+  qc.invalidateQueries({ queryKey: [...sysKey("refreshStatus"), sessionId] });
+  qc.invalidateQueries({ queryKey: [...sysKey("understandingRevisions"), sessionId] });
+  qc.invalidateQueries({ queryKey: [...sysKey("understandingDiff"), sessionId] });
+  qc.invalidateQueries({ queryKey: [...sysKey("alignment"), sessionId] });
+  qc.invalidateQueries({ queryKey: [...sysKey("reviewQueue"), sessionId] });
+}
+
+export function useRetryRefreshJob(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ jobId }: { jobId: number }) =>
+      api.post<RefreshJobOut>(`/interview/sessions/${sessionId}/refresh-jobs/${jobId}/retry`),
+    onSuccess: () => _invalidateAfterAnswerBatch(qc, sessionId),
   });
 }
 

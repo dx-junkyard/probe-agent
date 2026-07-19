@@ -2616,6 +2616,48 @@ CREATE INDEX IF NOT EXISTS idx_alignment_item_system
 
 CREATE INDEX IF NOT EXISTS idx_alignment_item_review_queue
     ON alignment_item (session_id, review_category, status);
+
+-- Automatic refresh job after an answer batch (Issue #288). One row per
+-- refresh attempt; app/interview_refresh.py's request_refresh() dedupes so
+-- at most one 'pending' and one 'updating' row exist per session at a time.
+-- trigger_kind/status are explicit finite sets (Principle 6):
+--   trigger_kind: qa_answer | intent_update | alignment_answer | nl_change_set
+--   status:       pending | updating | updated | failed | stale
+-- base_revision_id is the understanding_revision id at enqueue time (NULL
+-- when the session has none yet); base_answer_marker is the enqueue
+-- timestamp, the dedupe key input. result_revision_id/intelligence_run_id
+-- link the job to the understanding rebuild it produced (Principle 7 audit
+-- lineage: job -> intelligence_run -> understanding_revision is queryable
+-- from these two columns). error carries either a failure message
+-- (status='failed') or a fixed informational note (status='updated' with
+-- nothing new to apply, or status='stale' when superseded by a newer
+-- completed job) -- never LLM free text (Principle 6/7).
+CREATE TABLE IF NOT EXISTS interview_refresh_job (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id          INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    trigger_kind        TEXT NOT NULL,
+    base_revision_id    INTEGER,
+    base_answer_marker  REAL NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'pending',
+    error               TEXT,
+    intelligence_run_id INTEGER,
+    result_revision_id  INTEGER,
+    created_at          REAL NOT NULL,
+    started_at          REAL,
+    finished_at         REAL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (base_revision_id) REFERENCES understanding_revision (id) ON DELETE SET NULL,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE SET NULL,
+    FOREIGN KEY (result_revision_id) REFERENCES understanding_revision (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_interview_refresh_job_session
+    ON interview_refresh_job (session_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_interview_refresh_job_system
+    ON interview_refresh_job (system_id, session_id);
 """
 
 

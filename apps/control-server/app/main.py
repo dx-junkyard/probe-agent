@@ -21,6 +21,7 @@ from .routes import (
     interview_alignment,
     interview_inquiry,
     interview_intent,
+    interview_refresh,
     probe_patterns,
     project_intelligence,
     publish_jobs,
@@ -103,6 +104,7 @@ def create_app() -> FastAPI:
     app.include_router(interview_intent.router, dependencies=_auth)
     app.include_router(interview_inquiry.router, dependencies=_auth)
     app.include_router(interview_alignment.router, dependencies=_auth)
+    app.include_router(interview_refresh.router, dependencies=_auth)
     app.include_router(question_router.router, dependencies=_auth)
     app.include_router(github_connections.router, dependencies=_auth)
     app.include_router(publish_jobs.router, dependencies=_auth)

@@ -24,6 +24,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Textarea } from "@/components/ui/textarea";
 import { InquiryPanel } from "@/components/system-understanding/inquiry-panel";
+import { RefreshStatusChip } from "@/components/system-understanding/refresh-status-chip";
 import {
   useActiveInquiriesByOrigin,
   useAlignmentList,
@@ -401,9 +402,12 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
       <CardHeader>
         <div className="flex items-center justify-between gap-2">
           <div>
-            <CardTitle className="text-sm">レビューキュー(意図と現状の突き合わせ)</CardTitle>
+            <CardTitle className="text-sm flex items-center gap-2">
+              レビューキュー(意図と現状の突き合わせ)
+              <RefreshStatusChip sessionId={sessionId} />
+            </CardTitle>
             <CardDescription>
-              Intent Brief と現在の理解を突き合わせ、確認が必要な項目だけを表示します。
+              Intent Brief と現在の理解を突き合わせ、確認が必要な項目だけを表示します。回答後は自動で更新されます。
             </CardDescription>
           </div>
           <Button

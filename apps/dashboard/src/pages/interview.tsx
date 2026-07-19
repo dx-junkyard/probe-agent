@@ -38,6 +38,7 @@ import { UnderstandingOverview } from "@/components/system-understanding/underst
 import { IntentBriefPanel } from "@/components/system-understanding/intent-brief-panel";
 import { ReviewQueuePanel } from "@/components/system-understanding/review-queue";
 import { InquiryPanel } from "@/components/system-understanding/inquiry-panel";
+import { RefreshStatusChip } from "@/components/system-understanding/refresh-status-chip";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -1870,19 +1871,20 @@ git commit`}
                     <div>
                       <CardTitle className="text-sm flex items-center gap-2">
                         <Layers className="h-4 w-4" /> 現在の理解
+                        <RefreshStatusChip sessionId={selectedSessionId} />
                       </CardTitle>
                       <CardDescription>
-                        ドキュメントとコード分析から構築したシステム理解。
+                        ドキュメントとコード分析から構築したシステム理解。通常は回答後に自動で更新されます。
                       </CardDescription>
                     </div>
                     <Button
                       size="sm"
-                      variant="outline"
+                      variant="ghost"
                       onClick={refreshUnderstanding}
                       disabled={building || !canRefreshUnderstanding}
                       title={refreshBlockedUntilAnswerRevision
                         ? "新しい回答(修正・追加回答)がある場合にのみ、理解を再構築できます"
-                        : undefined}
+                        : "通常は回答後に自動で更新されます。障害復旧・診断用の手動更新です"}
                     >
                       <Sparkles className="h-4 w-4 mr-1" />
                       {updateUnderstanding.isPending ? "分析中..." : "理解を更新"}

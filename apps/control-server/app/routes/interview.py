@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import dataclass
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -1773,6 +1774,7 @@ def answer_interview_qa(
       probe_value: Verify corrections create a new revision row, link the old row, and never overwrite a prior answer
     """
     now = time.time()
+    result: InterviewQaAnswerOut
     with get_conn() as conn:
         _get_session_or_404(conn, session_id, system_id)
         qa = _get_qa_or_404(conn, qa_id, session_id, system_id)
@@ -1807,60 +1809,69 @@ def answer_interview_qa(
                 updated = conn.execute(
                     "SELECT * FROM interview_qa WHERE id = ?", (qa_id,)
                 ).fetchone()
-                return InterviewQaAnswerOut(
+                result = InterviewQaAnswerOut(
                     qa=_qa_out(updated),
                     previous=None,
                     regeneration_recommended=False,
                 )
-
-            # status is 'answered' or 'unconfirmed': this is a correction.
-            # Insert a new
-            # revision row, then link the old row forward. runtime_evidence
-            # (Issue #135) is carried onto the new current row just like
-            # evidence_refs, so correcting a runtime question's answer never
-            # drops the trace-fact provenance that justified the question.
-            new_id = _insert_qa_row(
-                conn, session_id, system_id,
-                question_text=qa["question_text"],
-                question_category=qa["question_category"],
-                question_source=qa["question_source"],
-                hypothesis=qa["hypothesis"],
-                evidence_refs=(
-                    [InterviewQaEvidenceRefOut(**e) for e in json.loads(qa["evidence_refs"])]
-                    if qa["evidence_refs"] else []
-                ),
-                now=now,
-                answer_text=payload.answer_text,
-                status=new_status,
-                answered_by=payload.actor,
-                answered_at=now,
-                runtime_evidence=(
-                    json.loads(qa["runtime_evidence"])
-                    if ("runtime_evidence" in qa.keys() and qa["runtime_evidence"])
-                    else None
-                ),
-            )
-            conn.execute(
-                "UPDATE interview_qa SET status = 'revised', superseded_by_id = ? WHERE id = ?",
-                (new_id, qa_id),
-            )
-            conn.execute(
-                """UPDATE interview_session SET answers_revised_at = ?, updated_at = ?
-                   WHERE id = ? AND system_id = ?""",
-                (now, now, session_id, system_id),
-            )
-            conn.execute("COMMIT")
+            else:
+                # status is 'answered' or 'unconfirmed': this is a
+                # correction. Insert a new revision row, then link the old
+                # row forward. runtime_evidence (Issue #135) is carried onto
+                # the new current row just like evidence_refs, so correcting
+                # a runtime question's answer never drops the trace-fact
+                # provenance that justified the question.
+                new_id = _insert_qa_row(
+                    conn, session_id, system_id,
+                    question_text=qa["question_text"],
+                    question_category=qa["question_category"],
+                    question_source=qa["question_source"],
+                    hypothesis=qa["hypothesis"],
+                    evidence_refs=(
+                        [InterviewQaEvidenceRefOut(**e) for e in json.loads(qa["evidence_refs"])]
+                        if qa["evidence_refs"] else []
+                    ),
+                    now=now,
+                    answer_text=payload.answer_text,
+                    status=new_status,
+                    answered_by=payload.actor,
+                    answered_at=now,
+                    runtime_evidence=(
+                        json.loads(qa["runtime_evidence"])
+                        if ("runtime_evidence" in qa.keys() and qa["runtime_evidence"])
+                        else None
+                    ),
+                )
+                conn.execute(
+                    "UPDATE interview_qa SET status = 'revised', superseded_by_id = ? WHERE id = ?",
+                    (new_id, qa_id),
+                )
+                conn.execute(
+                    """UPDATE interview_session SET answers_revised_at = ?, updated_at = ?
+                       WHERE id = ? AND system_id = ?""",
+                    (now, now, session_id, system_id),
+                )
+                conn.execute("COMMIT")
+                new_row = conn.execute("SELECT * FROM interview_qa WHERE id = ?", (new_id,)).fetchone()
+                old_row = conn.execute("SELECT * FROM interview_qa WHERE id = ?", (qa_id,)).fetchone()
+                result = InterviewQaAnswerOut(
+                    qa=_qa_out(new_row),
+                    previous=_qa_out(old_row),
+                    regeneration_recommended=has_proposals,
+                )
         except Exception:
             conn.execute("ROLLBACK")
             raise
 
-        new_row = conn.execute("SELECT * FROM interview_qa WHERE id = ?", (new_id,)).fetchone()
-        old_row = conn.execute("SELECT * FROM interview_qa WHERE id = ?", (qa_id,)).fetchone()
-        return InterviewQaAnswerOut(
-            qa=_qa_out(new_row),
-            previous=_qa_out(old_row),
-            regeneration_recommended=has_proposals,
-        )
+    # Issue #288: kick off the automatic Understanding/Alignment/Review
+    # Queue refresh now that the answer is durably committed (this call is
+    # outside the `with get_conn()` block above -- request_refresh() opens
+    # its own connection, and eager-mode execution must not run while this
+    # request still holds db.py's single global connection lock).
+    from ..interview_refresh import request_refresh
+
+    request_refresh(session_id, system_id, "qa_answer")
+    return result
 
 
 @router.post(
@@ -2511,6 +2522,329 @@ def advance_interview_stage(
         return _session_out(conn, row)
 
 
+@dataclass
+class UnderstandingRebuildResult:
+    """Outcome of one core-rebuild pass.
+
+    Shared by `update_interview_understanding` (below) and the automatic
+    refresh job (`app/interview_refresh.py`, Issue #288) so both paths run
+    the exact same reasoning call, persistence, and message/revision
+    bookkeeping -- only the caller differs in how it reacts to the result.
+    """
+
+    ok: bool
+    error: Optional[str] = None
+    intelligence_run_id: Optional[int] = None
+    revision_id: Optional[int] = None
+
+
+def _rebuild_understanding(conn, session, system_id: int) -> UnderstandingRebuildResult:
+    """Core of `update_interview_understanding`: always attempts a rebuild.
+
+    The caller is responsible for the `_understanding_update_blocked` gate
+    (the manual endpoint turns it into a 409; the refresh job treats it as a
+    no-op "nothing new" skip) -- this function never checks it itself, so it
+    cannot silently disagree with either caller about when a rebuild should
+    run.
+    """
+    now = time.time()
+    # Issue #138: fixed-text messages this route composes itself follow
+    # INTERVIEW_LANGUAGE. Falls back to ja only for these messages if the
+    # setting is invalid, so a misconfiguration doesn't prevent the failure
+    # message itself from being composed; reasoning calls below still fail
+    # closed through get_interview_language() unchanged.
+    msg_lang = resolve_message_language()
+    session_id = session["id"]
+    snapshot_id = session["snapshot_id"]
+
+    from ..docs_code_reconciler import reconcile
+    from ..system_understanding_service import _load_graph_for_snapshot
+    from ..system_understanding_reviewer import (
+        PROMPT_VERSION as REVIEW_PROMPT_VERSION,
+        SCHEMA_VERSION as REVIEW_SCHEMA_VERSION,
+        generate_understanding_review,
+    )
+
+    # Principle 7: the understanding review is a reasoning run; record it
+    # in intelligence_runs for success and failure alike so the reviewer's
+    # prompt_version stays auditable (Issue #127).
+    def _record_review_run(
+        status: str,
+        error_details: Optional[str],
+        provider: str,
+        model: str,
+        is_mock: bool,
+    ) -> int:
+        cur = conn.execute(
+            """INSERT INTO intelligence_runs
+                (system_id, snapshot_id, run_type, provider, model,
+                 prompt_version, schema_version, decision_method, status,
+                 error_details, is_mock, started_at, completed_at)
+            VALUES (?, ?, 'understanding_review', ?, ?, ?, ?,
+                    'reasoning_llm', ?, ?, ?, ?, ?)""",
+            (
+                system_id,
+                snapshot_id,
+                provider,
+                model,
+                REVIEW_PROMPT_VERSION,
+                REVIEW_SCHEMA_VERSION,
+                status,
+                error_details,
+                1 if is_mock else 0,
+                now,
+                now,
+            ),
+        )
+        return cur.lastrowid
+
+    config = LLMConfig.intelligence_from_env()
+    try:
+        client = create_llm_client(config)
+    except LLMError as exc:
+        error = str(exc)
+        run_id = _record_review_run(
+            "failed", error, config.provider, config.model,
+            config.provider == "mock",
+        )
+        conn.execute(
+            """UPDATE interview_session
+               SET last_error = ?, updated_at = ?
+               WHERE id = ? AND system_id = ?""",
+            (error, now, session_id, system_id),
+        )
+        conn.execute(
+            """INSERT INTO interview_message
+                (session_id, system_id, role, content, intelligence_run_id, created_at)
+            VALUES (?, ?, 'assistant', ?, ?, ?)""",
+            (
+                session_id, system_id,
+                interview_message("understanding_update_failed", msg_lang, error=error),
+                run_id, now,
+            ),
+        )
+        return UnderstandingRebuildResult(ok=False, error=error, intelligence_run_id=run_id)
+
+    graph = _load_graph_for_snapshot(conn, system_id, snapshot_id)
+    if graph is None:
+        error = interview_message("graph_not_built", msg_lang)
+        conn.execute(
+            """UPDATE interview_session
+               SET last_error = ?, updated_at = ?
+               WHERE id = ? AND system_id = ?""",
+            (error, now, session_id, system_id),
+        )
+        conn.execute(
+            """INSERT INTO interview_message
+                (session_id, system_id, role, content, created_at)
+            VALUES (?, ?, 'assistant', ?, ?)""",
+            (
+                session_id, system_id,
+                interview_message("understanding_update_failed", msg_lang, error=error),
+                now,
+            ),
+        )
+        return UnderstandingRebuildResult(ok=False, error=error)
+
+    reconciliation = reconcile(conn, system_id, snapshot_id, graph)
+
+    # Issue #128: feed the interview answers back into the review so
+    # the rebuilt understanding reflects what the developer already said.
+    history_rows = conn.execute(
+        "SELECT role, content FROM interview_message WHERE session_id = ? ORDER BY id",
+        (session_id,),
+    ).fetchall()
+    history = _review_history(history_rows)
+
+    # Issue #263: also feed the Q&A-panel answers into the review, same
+    # as the conversational interview turn already does — an answer
+    # given only via the Q&A panel never becomes an interview_message.
+    answered_qa_pairs, unconfirmed_qa_pairs = _load_qa_pairs(
+        conn, session_id, system_id
+    )
+
+    review = generate_understanding_review(
+        client, config,
+        graph=graph,
+        reconciliation=reconciliation,
+        history=history or None,
+        answered_qa=answered_qa_pairs,
+        unconfirmed_qa=unconfirmed_qa_pairs or None,
+    )
+
+    if review.error:
+        run_id = _record_review_run(
+            "failed", review.error, review.provider, review.model,
+            review.is_mock,
+        )
+        conn.execute(
+            """UPDATE interview_session
+               SET last_error = ?, updated_at = ?
+               WHERE id = ? AND system_id = ?""",
+            (review.error, now, session_id, system_id),
+        )
+        conn.execute(
+            """INSERT INTO interview_message
+                (session_id, system_id, role, content, intelligence_run_id, created_at)
+            VALUES (?, ?, 'assistant', ?, ?, ?)""",
+            (
+                session_id, system_id,
+                interview_message("review_failed", msg_lang, error=review.error),
+                run_id, now,
+            ),
+        )
+        return UnderstandingRebuildResult(ok=False, error=review.error, intelligence_run_id=run_id)
+
+    run_id = _record_review_run(
+        "completed", None, review.provider, review.model, review.is_mock,
+    )
+
+    # Issue #129: register the reviewer's open questions as
+    # ID-addressable interview_qa rows (question_source "reviewer") and
+    # carry each row's qa_id in the open_questions JSON so the dashboard
+    # answers by ID. Questions whose exact text already exists as a
+    # current row are not re-inserted (structural exact-text dedupe,
+    # e.g. across repeated rebuilds).
+    existing_qa_by_text = {
+        r["question_text"]: r["id"]
+        for r in conn.execute(
+            """SELECT id, question_text FROM interview_qa
+               WHERE session_id = ? AND system_id = ?
+                 AND superseded_by_id IS NULL
+               ORDER BY id""",
+            (session_id, system_id),
+        ).fetchall()
+    }
+    open_question_entries: List[dict] = []
+    for q in review.open_questions or []:
+        entry = dict(q)
+        text = entry.get("question") or ""
+        if not text:
+            continue
+        if text in existing_qa_by_text:
+            qa_id = existing_qa_by_text[text]
+        else:
+            category = entry.get("category")
+            if category not in ("purpose", "capability", "api", "probe_flow", "general"):
+                category = "general"
+            qa_id = _insert_qa_row(
+                conn, session_id, system_id,
+                question_text=text,
+                question_category=category,
+                question_source="reviewer",
+                hypothesis=None,
+                evidence_refs=[],
+                now=now,
+            )
+            existing_qa_by_text[text] = qa_id
+        entry["qa_id"] = qa_id
+        open_question_entries.append(entry)
+
+    understanding_json = json.dumps(review.current_understanding) if review.current_understanding else None
+    gap_json = json.dumps(review.gap_analysis) if review.gap_analysis else None
+    questions_json = (
+        json.dumps(open_question_entries, ensure_ascii=False)
+        if open_question_entries else None
+    )
+
+    new_stage = _advance_stage(
+        session["stage"] or "understanding_initialized",
+        "purpose_confirmation",
+    )
+
+    conn.execute(
+        """UPDATE interview_session
+           SET current_understanding = ?, gap_analysis = ?, open_questions = ?,
+               stage = ?, last_error = NULL, answers_revised_at = NULL,
+               understanding_rebuilt_at = ?, updated_at = ?
+           WHERE id = ? AND system_id = ?""",
+        (understanding_json, gap_json, questions_json, new_stage, now, now, session_id, system_id),
+    )
+
+    # Issue #136: an existing session whose understanding was built before
+    # this feature has a current_understanding but no revision rows. Seed
+    # that prior state as the initial revision (no run produced it in the
+    # revision history, so intelligence_run_id is NULL) *before* appending
+    # the new one, so this update's diff has a real "previous" to compare
+    # against instead of collapsing to has_previous:false and losing the
+    # pre-existing understanding. No blanket backfill of other sessions.
+    has_revision = conn.execute(
+        """SELECT 1 FROM understanding_revision
+           WHERE session_id = ? AND system_id = ? LIMIT 1""",
+        (session_id, system_id),
+    ).fetchone()
+    if has_revision is None and session["current_understanding"]:
+        conn.execute(
+            """INSERT INTO understanding_revision
+                (session_id, system_id, snapshot_id, intelligence_run_id,
+                 current_understanding, gap_analysis, created_at)
+            VALUES (?, ?, ?, NULL, ?, ?, ?)""",
+            (
+                session_id, system_id, snapshot_id,
+                session["current_understanding"], session["gap_analysis"], now,
+            ),
+        )
+
+    # Issue #136: append (never overwrite) an understanding revision,
+    # linked to the understanding_review run that produced it, so the
+    # Dashboard can show a deterministic diff against the previous one.
+    revision_cur = conn.execute(
+        """INSERT INTO understanding_revision
+            (session_id, system_id, snapshot_id, intelligence_run_id,
+             current_understanding, gap_analysis, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (session_id, system_id, snapshot_id, run_id, understanding_json, gap_json, now),
+    )
+    revision_id = revision_cur.lastrowid
+    try:
+        limit = revision_limit()
+    except ValueError:
+        limit = DEFAULT_REVISION_LIMIT
+    conn.execute(
+        """DELETE FROM understanding_revision
+           WHERE session_id = ? AND system_id = ? AND id NOT IN (
+               SELECT id FROM understanding_revision
+               WHERE session_id = ? AND system_id = ?
+               ORDER BY id DESC LIMIT ?
+           )""",
+        (session_id, system_id, session_id, system_id, limit),
+    )
+
+    if review.current_understanding:
+        unknown_name = interview_message("unknown_name", msg_lang)
+        purpose_label = interview_message("system_purpose_label", msg_lang)
+        capability_label = interview_message("core_capability_label", msg_lang)
+        summary_parts = []
+        for purpose in review.current_understanding.get("system_purpose", []):
+            summary_parts.append(f"{purpose_label}: {purpose.get('name') or unknown_name}")
+        for cap in review.current_understanding.get("core_capabilities", []):
+            summary_parts.append(f"{capability_label}: {cap.get('name') or unknown_name}")
+        if summary_parts:
+            asst_content = (
+                interview_message("understanding_built_intro", msg_lang) + "\n\n"
+                + "\n".join(f"- {p}" for p in summary_parts)
+            )
+            if review.open_questions:
+                asst_content += (
+                    "\n\n" + interview_message("key_questions_heading", msg_lang) + "\n"
+                )
+                for q in review.open_questions[:5]:
+                    asst_content += f"- {q.get('question', '')}\n"
+            asst_content += (
+                f"\n{interview_message('suggested_next_action_label', msg_lang)}: "
+                f"{review.suggested_next_action}"
+            )
+
+            conn.execute(
+                """INSERT INTO interview_message
+                    (session_id, system_id, role, content, intelligence_run_id, created_at)
+                VALUES (?, ?, 'assistant', ?, ?, ?)""",
+                (session_id, system_id, asst_content, run_id, now),
+            )
+
+    return UnderstandingRebuildResult(ok=True, intelligence_run_id=run_id, revision_id=revision_id)
+
+
 @router.post(
     "/interview/sessions/{session_id}/update-understanding",
     response_model=InterviewSessionOut,
@@ -2522,7 +2856,10 @@ def update_interview_understanding(
     """Update the session's current understanding from its graph/reconciliation data.
 
     This endpoint is the entry point for generating an initial understanding
-    when Start Interview is clicked, or for refreshing after new turns.
+    when Start Interview is clicked, or for refreshing after new turns. The
+    actual rebuild (reasoning call + persistence) is `_rebuild_understanding`,
+    shared with the automatic refresh job (Issue #288); this endpoint only
+    owns the blocked-gate 409 and the session response shape.
 
     probe-agent:
       role: API boundary for updating session understanding from graph data
@@ -2533,16 +2870,8 @@ def update_interview_understanding(
       state_effects: [database-write]
       probe_value: Verify understanding update rebuilds graph and reconciliation correctly
     """
-    now = time.time()
-    # Issue #138: fixed-text messages this route composes itself follow
-    # INTERVIEW_LANGUAGE. Falls back to ja only for these messages if the
-    # setting is invalid, so a misconfiguration doesn't prevent the failure
-    # message itself from being composed; reasoning calls below still fail
-    # closed through get_interview_language() unchanged.
-    msg_lang = resolve_message_language()
     with get_conn() as conn:
         session = _get_session_or_404(conn, session_id, system_id)
-        snapshot_id = session["snapshot_id"]
 
         # After manual confirmation, rebuilding is meaningful only when new
         # developer input is waiting to be reflected. Keep this guard at the
@@ -2564,292 +2893,7 @@ def update_interview_understanding(
                 },
             )
 
-        from ..docs_code_reconciler import reconcile
-        from ..system_understanding_service import _load_graph_for_snapshot
-        from ..system_understanding_reviewer import (
-            PROMPT_VERSION as REVIEW_PROMPT_VERSION,
-            SCHEMA_VERSION as REVIEW_SCHEMA_VERSION,
-            generate_understanding_review,
-        )
-
-        # Principle 7: the understanding review is a reasoning run; record it
-        # in intelligence_runs for success and failure alike so the reviewer's
-        # prompt_version stays auditable (Issue #127).
-        def _record_review_run(
-            status: str,
-            error_details: Optional[str],
-            provider: str,
-            model: str,
-            is_mock: bool,
-        ) -> int:
-            cur = conn.execute(
-                """INSERT INTO intelligence_runs
-                    (system_id, snapshot_id, run_type, provider, model,
-                     prompt_version, schema_version, decision_method, status,
-                     error_details, is_mock, started_at, completed_at)
-                VALUES (?, ?, 'understanding_review', ?, ?, ?, ?,
-                        'reasoning_llm', ?, ?, ?, ?, ?)""",
-                (
-                    system_id,
-                    snapshot_id,
-                    provider,
-                    model,
-                    REVIEW_PROMPT_VERSION,
-                    REVIEW_SCHEMA_VERSION,
-                    status,
-                    error_details,
-                    1 if is_mock else 0,
-                    now,
-                    now,
-                ),
-            )
-            return cur.lastrowid
-
-        config = LLMConfig.intelligence_from_env()
-        try:
-            client = create_llm_client(config)
-        except LLMError as exc:
-            error = str(exc)
-            run_id = _record_review_run(
-                "failed", error, config.provider, config.model,
-                config.provider == "mock",
-            )
-            conn.execute(
-                """UPDATE interview_session
-                   SET last_error = ?, updated_at = ?
-                   WHERE id = ? AND system_id = ?""",
-                (error, now, session_id, system_id),
-            )
-            conn.execute(
-                """INSERT INTO interview_message
-                    (session_id, system_id, role, content, intelligence_run_id, created_at)
-                VALUES (?, ?, 'assistant', ?, ?, ?)""",
-                (
-                    session_id, system_id,
-                    interview_message("understanding_update_failed", msg_lang, error=error),
-                    run_id, now,
-                ),
-            )
-            row = _get_session_or_404(conn, session_id, system_id)
-            return _session_out(conn, row)
-
-        graph = _load_graph_for_snapshot(conn, system_id, snapshot_id)
-        if graph is None:
-            error = interview_message("graph_not_built", msg_lang)
-            conn.execute(
-                """UPDATE interview_session
-                   SET last_error = ?, updated_at = ?
-                   WHERE id = ? AND system_id = ?""",
-                (error, now, session_id, system_id),
-            )
-            conn.execute(
-                """INSERT INTO interview_message
-                    (session_id, system_id, role, content, created_at)
-                VALUES (?, ?, 'assistant', ?, ?)""",
-                (
-                    session_id, system_id,
-                    interview_message("understanding_update_failed", msg_lang, error=error),
-                    now,
-                ),
-            )
-            row = _get_session_or_404(conn, session_id, system_id)
-            return _session_out(conn, row)
-
-        reconciliation = reconcile(conn, system_id, snapshot_id, graph)
-
-        # Issue #128: feed the interview answers back into the review so
-        # the rebuilt understanding reflects what the developer already said.
-        history_rows = conn.execute(
-            "SELECT role, content FROM interview_message WHERE session_id = ? ORDER BY id",
-            (session_id,),
-        ).fetchall()
-        history = _review_history(history_rows)
-
-        # Issue #263: also feed the Q&A-panel answers into the review, same
-        # as the conversational interview turn already does — an answer
-        # given only via the Q&A panel never becomes an interview_message.
-        answered_qa_pairs, unconfirmed_qa_pairs = _load_qa_pairs(
-            conn, session_id, system_id
-        )
-
-        review = generate_understanding_review(
-            client, config,
-            graph=graph,
-            reconciliation=reconciliation,
-            history=history or None,
-            answered_qa=answered_qa_pairs,
-            unconfirmed_qa=unconfirmed_qa_pairs or None,
-        )
-
-        if review.error:
-            run_id = _record_review_run(
-                "failed", review.error, review.provider, review.model,
-                review.is_mock,
-            )
-            conn.execute(
-                """UPDATE interview_session
-                   SET last_error = ?, updated_at = ?
-                   WHERE id = ? AND system_id = ?""",
-                (review.error, now, session_id, system_id),
-            )
-            conn.execute(
-                """INSERT INTO interview_message
-                    (session_id, system_id, role, content, intelligence_run_id, created_at)
-                VALUES (?, ?, 'assistant', ?, ?, ?)""",
-                (
-                    session_id, system_id,
-                    interview_message("review_failed", msg_lang, error=review.error),
-                    run_id, now,
-                ),
-            )
-            row = _get_session_or_404(conn, session_id, system_id)
-            return _session_out(conn, row)
-
-        run_id = _record_review_run(
-            "completed", None, review.provider, review.model, review.is_mock,
-        )
-
-        # Issue #129: register the reviewer's open questions as
-        # ID-addressable interview_qa rows (question_source "reviewer") and
-        # carry each row's qa_id in the open_questions JSON so the dashboard
-        # answers by ID. Questions whose exact text already exists as a
-        # current row are not re-inserted (structural exact-text dedupe,
-        # e.g. across repeated rebuilds).
-        existing_qa_by_text = {
-            r["question_text"]: r["id"]
-            for r in conn.execute(
-                """SELECT id, question_text FROM interview_qa
-                   WHERE session_id = ? AND system_id = ?
-                     AND superseded_by_id IS NULL
-                   ORDER BY id""",
-                (session_id, system_id),
-            ).fetchall()
-        }
-        open_question_entries: List[dict] = []
-        for q in review.open_questions or []:
-            entry = dict(q)
-            text = entry.get("question") or ""
-            if not text:
-                continue
-            if text in existing_qa_by_text:
-                qa_id = existing_qa_by_text[text]
-            else:
-                category = entry.get("category")
-                if category not in ("purpose", "capability", "api", "probe_flow", "general"):
-                    category = "general"
-                qa_id = _insert_qa_row(
-                    conn, session_id, system_id,
-                    question_text=text,
-                    question_category=category,
-                    question_source="reviewer",
-                    hypothesis=None,
-                    evidence_refs=[],
-                    now=now,
-                )
-                existing_qa_by_text[text] = qa_id
-            entry["qa_id"] = qa_id
-            open_question_entries.append(entry)
-
-        understanding_json = json.dumps(review.current_understanding) if review.current_understanding else None
-        gap_json = json.dumps(review.gap_analysis) if review.gap_analysis else None
-        questions_json = (
-            json.dumps(open_question_entries, ensure_ascii=False)
-            if open_question_entries else None
-        )
-
-        new_stage = _advance_stage(
-            session["stage"] or "understanding_initialized",
-            "purpose_confirmation",
-        )
-
-        conn.execute(
-            """UPDATE interview_session
-               SET current_understanding = ?, gap_analysis = ?, open_questions = ?,
-                   stage = ?, last_error = NULL, answers_revised_at = NULL,
-                   understanding_rebuilt_at = ?, updated_at = ?
-               WHERE id = ? AND system_id = ?""",
-            (understanding_json, gap_json, questions_json, new_stage, now, now, session_id, system_id),
-        )
-
-        # Issue #136: an existing session whose understanding was built before
-        # this feature has a current_understanding but no revision rows. Seed
-        # that prior state as the initial revision (no run produced it in the
-        # revision history, so intelligence_run_id is NULL) *before* appending
-        # the new one, so this update's diff has a real "previous" to compare
-        # against instead of collapsing to has_previous:false and losing the
-        # pre-existing understanding. No blanket backfill of other sessions.
-        has_revision = conn.execute(
-            """SELECT 1 FROM understanding_revision
-               WHERE session_id = ? AND system_id = ? LIMIT 1""",
-            (session_id, system_id),
-        ).fetchone()
-        if has_revision is None and session["current_understanding"]:
-            conn.execute(
-                """INSERT INTO understanding_revision
-                    (session_id, system_id, snapshot_id, intelligence_run_id,
-                     current_understanding, gap_analysis, created_at)
-                VALUES (?, ?, ?, NULL, ?, ?, ?)""",
-                (
-                    session_id, system_id, snapshot_id,
-                    session["current_understanding"], session["gap_analysis"], now,
-                ),
-            )
-
-        # Issue #136: append (never overwrite) an understanding revision,
-        # linked to the understanding_review run that produced it, so the
-        # Dashboard can show a deterministic diff against the previous one.
-        conn.execute(
-            """INSERT INTO understanding_revision
-                (session_id, system_id, snapshot_id, intelligence_run_id,
-                 current_understanding, gap_analysis, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (session_id, system_id, snapshot_id, run_id, understanding_json, gap_json, now),
-        )
-        try:
-            limit = revision_limit()
-        except ValueError:
-            limit = DEFAULT_REVISION_LIMIT
-        conn.execute(
-            """DELETE FROM understanding_revision
-               WHERE session_id = ? AND system_id = ? AND id NOT IN (
-                   SELECT id FROM understanding_revision
-                   WHERE session_id = ? AND system_id = ?
-                   ORDER BY id DESC LIMIT ?
-               )""",
-            (session_id, system_id, session_id, system_id, limit),
-        )
-
-        if review.current_understanding:
-            unknown_name = interview_message("unknown_name", msg_lang)
-            purpose_label = interview_message("system_purpose_label", msg_lang)
-            capability_label = interview_message("core_capability_label", msg_lang)
-            summary_parts = []
-            for purpose in review.current_understanding.get("system_purpose", []):
-                summary_parts.append(f"{purpose_label}: {purpose.get('name') or unknown_name}")
-            for cap in review.current_understanding.get("core_capabilities", []):
-                summary_parts.append(f"{capability_label}: {cap.get('name') or unknown_name}")
-            if summary_parts:
-                asst_content = (
-                    interview_message("understanding_built_intro", msg_lang) + "\n\n"
-                    + "\n".join(f"- {p}" for p in summary_parts)
-                )
-                if review.open_questions:
-                    asst_content += (
-                        "\n\n" + interview_message("key_questions_heading", msg_lang) + "\n"
-                    )
-                    for q in review.open_questions[:5]:
-                        asst_content += f"- {q.get('question', '')}\n"
-                asst_content += (
-                    f"\n{interview_message('suggested_next_action_label', msg_lang)}: "
-                    f"{review.suggested_next_action}"
-                )
-
-                conn.execute(
-                    """INSERT INTO interview_message
-                        (session_id, system_id, role, content, intelligence_run_id, created_at)
-                    VALUES (?, ?, 'assistant', ?, ?, ?)""",
-                    (session_id, system_id, asst_content, run_id, now),
-                )
+        _rebuild_understanding(conn, session, system_id)
 
         row = _get_session_or_404(conn, session_id, system_id)
         return _session_out(conn, row)
