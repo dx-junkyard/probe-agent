@@ -32,6 +32,7 @@ import {
 import { useAuth } from "@/api/auth";
 import { api } from "@/api/client";
 import { DiagnosticFixCallout, useDiagnosticHighlight } from "@/components/diagnostic-fix";
+import { UnderstandingOverview } from "@/components/system-understanding/understanding-overview";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -45,7 +46,6 @@ import { formatTimestamp } from "@/lib/utils";
 import { buildPatchFilename, downloadTextFile } from "@/lib/patch";
 import type {
   CurrentUnderstanding,
-  GapItem,
   IntelligenceRunEvidenceOut,
   InterviewMaterializeOut,
   InterviewProposalMetadataBlock,
@@ -63,7 +63,6 @@ import type {
   SourceMetadataOperationKind,
   SourceMetadataStateEffect,
   UnderstandingDiffOut,
-  UnderstandingItem,
 } from "@/api/types";
 
 const ELEMENT_TYPES: Array<"" | SourceMetadataElementType> = [
@@ -248,19 +247,6 @@ function proposalReviewable(value: string) {
   return value === "proposed" || value === "needs_review";
 }
 
-function confidenceVariant(level: string) {
-  if (level === "confirmed") return "success" as const;
-  if (level === "likely") return "secondary" as const;
-  if (level === "conflicting") return "destructive" as const;
-  return "outline" as const;
-}
-
-function severityVariant(severity: string) {
-  if (severity === "high") return "destructive" as const;
-  if (severity === "medium") return "warning" as const;
-  return "outline" as const;
-}
-
 function csv(items: string[]) {
   return items.join(", ");
 }
@@ -422,77 +408,6 @@ function NextActionBanner({ uiState, nextAction }: {
         </div>
         <p className="text-sm mt-1">{nextAction}</p>
       </div>
-    </div>
-  );
-}
-
-function UnderstandingItemCard({ item, category }: { item: UnderstandingItem; category: string }) {
-  return (
-    <div className="rounded-md border p-3 space-y-2">
-      <div className="flex items-start justify-between gap-2">
-        <div className="min-w-0">
-          <div className="font-medium text-sm">{item.name}</div>
-          <div className="text-xs text-muted-foreground">{category}</div>
-        </div>
-        <Badge variant={confidenceVariant(item.confidence.level)}>
-          {item.confidence.level}
-        </Badge>
-      </div>
-      {item.summary && <p className="text-xs">{item.summary}</p>}
-      {item.why_core && <p className="text-xs text-muted-foreground italic">{item.why_core}</p>}
-      {item.evidence.length > 0 && (
-        <div className="space-y-1">
-          {item.evidence.map((e, i) => (
-            <div key={i} className="text-[10px] text-muted-foreground font-mono">
-              {e.path}:{e.start_line}-{e.end_line} — {e.summary}
-            </div>
-          ))}
-        </div>
-      )}
-      {item.related_apis.length > 0 && (
-        <div className="text-[10px] text-muted-foreground">APIs: {item.related_apis.join(", ")}</div>
-      )}
-      {item.children.length > 0 && (
-        <div className="text-[10px] text-muted-foreground">子要素: {item.children.join(", ")}</div>
-      )}
-    </div>
-  );
-}
-
-function UnderstandingPanel({ understanding }: { understanding: CurrentUnderstanding }) {
-  const sections: [string, UnderstandingItem[]][] = [
-    ["システムの目的", understanding.system_purpose],
-    ["主要機能", understanding.core_capabilities],
-    ["機能要素", understanding.capability_elements],
-    ["支援要素", understanding.supporting_elements],
-    ["API境界", understanding.api_boundaries],
-    ["プローブ対象フロー候補", understanding.probe_flow_candidates],
-  ];
-
-  const hasContent = sections.some(([, items]) => items.length > 0);
-
-  if (!hasContent) {
-    return (
-      <div className="text-sm text-muted-foreground text-center py-4">
-        理解項目が見つかりませんでした。ドキュメントの内容が不足している可能性があります。
-      </div>
-    );
-  }
-
-  return (
-    <div className="space-y-4" data-testid="understanding-panel">
-      {sections.map(([label, items]) =>
-        items.length > 0 ? (
-          <div key={label}>
-            <h4 className="text-xs font-semibold uppercase text-muted-foreground mb-2">{label}</h4>
-            <div className="space-y-2">
-              {items.map((item, idx) => (
-                <UnderstandingItemCard key={idx} item={item} category={label} />
-              ))}
-            </div>
-          </div>
-        ) : null,
-      )}
     </div>
   );
 }
@@ -868,27 +783,6 @@ function UnderstandingDiffPanel({
         )}
       </CardContent>
     </Card>
-  );
-}
-
-function GapAnalysisPanel({ gaps }: { gaps: GapItem[] }) {
-  if (gaps.length === 0) return null;
-  return (
-    <div className="space-y-2" data-testid="gap-analysis-panel">
-      {gaps.map((gap, idx) => (
-        <div key={idx} className="rounded-md border p-3 flex items-start gap-3">
-          <AlertCircle className="h-4 w-4 mt-0.5 shrink-0 text-amber-500" />
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <span className="text-sm font-medium">{gap.name}</span>
-              <Badge variant={severityVariant(gap.severity)}>{gap.severity}</Badge>
-              <Badge variant="outline">{gap.gap_type}</Badge>
-            </div>
-            {gap.summary && <p className="text-xs text-muted-foreground mt-1">{gap.summary}</p>}
-          </div>
-        </div>
-      ))}
-    </div>
   );
 }
 
@@ -1908,44 +1802,16 @@ git commit`}
                       </div>
                     </div>
                   )}
-                  {session.current_understanding ? (
-                    <UnderstandingPanel understanding={session.current_understanding} />
-                  ) : !session.last_error ? (
-                    <div className="text-sm text-muted-foreground text-center py-6" data-testid="no-understanding">
-                      まだ理解は構築されていません。
-                    </div>
-                  ) : null}
+                  {(session.current_understanding || !session.last_error) && (
+                    <UnderstandingOverview
+                      understanding={session.current_understanding}
+                      gaps={session.gap_analysis}
+                      openQuestions={session.open_questions}
+                      nextAction={nextActionText}
+                    />
+                  )}
                 </CardContent>
               </Card>
-
-              {session.open_questions && session.open_questions.length > 1 && (
-                <Card>
-                  <CardHeader>
-                    <CardTitle className="text-sm flex items-center gap-2">
-                      <HelpCircle className="h-4 w-4" /> 残りの質問
-                    </CardTitle>
-                    <CardDescription>この後の確認で1つずつ質問されます。</CardDescription>
-                  </CardHeader>
-                  <CardContent>
-                    <div className="space-y-2" data-testid="open-questions-panel">
-                      {sortQuestions(session.open_questions).slice(1).map((q, idx) => (
-                        <div key={idx} className="rounded-md border p-3 flex items-start gap-3">
-                          <HelpCircle className="h-4 w-4 mt-0.5 shrink-0 text-blue-500" />
-                          <div className="min-w-0">
-                            <span className="text-sm">{q.question}</span>
-                            <div className="flex gap-1 mt-1">
-                              <Badge variant="outline">{q.category}</Badge>
-                              <Badge variant={q.priority === "high" ? "destructive" : q.priority === "medium" ? "warning" : "outline"}>
-                                {q.priority}
-                              </Badge>
-                            </div>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </CardContent>
-                </Card>
-              )}
 
               <UnderstandingDiffPanel
                 sessionId={session.id}
@@ -1953,20 +1819,6 @@ git commit`}
               />
 
               <QaPanel sessionId={session.id} actor={actor} approvedCount={approvedCount} />
-
-              {session.gap_analysis && session.gap_analysis.length > 0 && (
-                <Card>
-                  <CardHeader>
-                    <CardTitle className="text-sm flex items-center gap-2">
-                      <AlertCircle className="h-4 w-4" /> ギャップ分析
-                    </CardTitle>
-                    <CardDescription>ドキュメントとコードの差分。</CardDescription>
-                  </CardHeader>
-                  <CardContent>
-                    <GapAnalysisPanel gaps={session.gap_analysis} />
-                  </CardContent>
-                </Card>
-              )}
             </div>
           </div>
 

@@ -2296,3 +2296,50 @@ fallback チェーンのみ)。本 Issue は「人の認識」を第一級の pr
 **含まない:** LLM による purpose の自動マージ・書き換え(#59 の領分)、
 `probe-agent:` docstring への書き戻し(Principle 8 の interview 系 issue の
 領分)、`system_profile` スキーマ拡張、一致/不一致の自動判定。
+
+## Interview 現在の理解の段階表示(Issue #283)
+
+`pages/interview.tsx` の「現在の理解」パネル(旧 `UnderstandingPanel`)は、
+`confidence.level` などの内部状態・確信度の理由・根拠コードを一度にフラット
+表示しており、何が分かっていて何をユーザーに確認してほしいかが読み取り
+にくかった。本 Issue は Dashboard 表示のみを再設計する(API・スキーマ・
+理解生成ロジックは変更しない)。
+
+- **`components/system-understanding/understanding-overview.tsx`
+  (`UnderstandingOverview`)**: `current_understanding` /
+  `gap_analysis` / `open_questions` と、呼び出し側が既に算出している
+  next-action の文言(`nextActionText`、ロジックは再実装せず prop で
+  受け取るだけ)から、初期表示を3グループのサマリーに絞る。
+  - 「分かったこと」: `confidence.level` が `confirmed`/`likely` の
+    `UnderstandingItem`。
+  - 「確認したいこと」: `confidence.level` が `uncertain`/`conflicting`
+    (未知の値もこちら側にフォールバック)の `UnderstandingItem` +
+    `gap_analysis` の各項目 + `open_questions` の各項目。
+  - 「次にすること」: `nextAction` prop をそのまま表示。
+- **claim とその根拠の分離**: 各アイテムはまず見出し(`name`/`question`)・
+  1–3文の要約・要対応バッジのみを表示する。`confidence.reason` ・
+  `evidence`(path:line)・`related_docs`/`related_apis`/`children`・
+  `hypothesis`/`evidence_refs`/`answer_options` は「根拠を見る」トグルで
+  折りたたみ、初期表示では連結表示しない。
+- **表示ラベルの単一マッピングテーブル**: `confidence.level` /
+  `severity` / `gap_type` / `priority` の canonical enum 値はデータ上
+  変更せず、`understanding-overview.tsx` 内の1つのテーブル
+  (`CONFIDENCE_LABELS` 等)だけを通して日本語ラベルへ変換する。未知の値は
+  常に安全側(要確認寄り)のラベルへフォールバックし、生の enum 文字列を
+  画面に出さない。
+- **要対応/参考情報の区別**: 色だけに依存せず、バッジ内の視覚的に隠した
+  テキスト(`sr-only` の「要確認: 」/「参考情報: 」)と
+  `data-action-required` 属性の両方で伝える。「分かったこと」側の項目は
+  「要確認」カードとして提示しない(要件4)。
+- **「詳細をすべて見る」**: 旧 `UnderstandingPanel` のカテゴリ別グルーピング
+  表示は、既定で折りたたまれた詳細レイヤー(`UnderstandingCategoryDetail`)
+  として残し、確信度バッジは翻訳済みラベルのみを表示する(生の enum 値は
+  出さない)。
+- 冗長になっていた旧「残りの質問」カード・「ギャップ分析」カードは、同じ
+  情報が「確認したいこと」グループに翻訳付きで統合されたため削除した。
+  Q&A の個別編集・スキップ・実態チェックなど既存の操作は `QaPanel` に残る
+  (本 Issue はそれらの操作系・ライフサイクルを変更しない)。
+
+**含まない:** 理解生成ロジック・API・スキーマの変更、Intent Brief /
+Alignment Review / Investigation Agent(後続 Issue の領分)、長い調査ログ
+(Q&A の逐次編集など)を初期表示に持ち込むこと。
