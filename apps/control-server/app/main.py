@@ -18,9 +18,17 @@ from .routes import (
     generation,
     github_connections,
     interview,
+    interview_alignment,
+    interview_change_sets,
+    interview_handoff,
+    interview_inquiry,
+    interview_intent,
+    interview_observation,
+    interview_refresh,
     probe_patterns,
     project_intelligence,
     publish_jobs,
+    question_router,
     replay,
     retention,
     shadow,
@@ -96,6 +104,14 @@ def create_app() -> FastAPI:
     app.include_router(assistant.router, dependencies=_auth)
     app.include_router(workspaces.router, dependencies=_auth)
     app.include_router(interview.router, dependencies=_auth)
+    app.include_router(interview_intent.router, dependencies=_auth)
+    app.include_router(interview_inquiry.router, dependencies=_auth)
+    app.include_router(interview_alignment.router, dependencies=_auth)
+    app.include_router(interview_handoff.router, dependencies=_auth)
+    app.include_router(interview_observation.router, dependencies=_auth)
+    app.include_router(interview_refresh.router, dependencies=_auth)
+    app.include_router(interview_change_sets.router, dependencies=_auth)
+    app.include_router(question_router.router, dependencies=_auth)
     app.include_router(github_connections.router, dependencies=_auth)
     app.include_router(publish_jobs.router, dependencies=_auth)
     return app

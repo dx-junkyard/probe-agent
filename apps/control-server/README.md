@@ -142,6 +142,20 @@ cancelled の step が残る場合は `partial`(1 つも完了していなけれ
 | `SYSTEM_UNDERSTANDING_LLM_MAX_ATTEMPTS` | claim scan chunk task の最大試行回数（既定値: `3`） |
 | `SYSTEM_UNDERSTANDING_LLM_BACKOFF_SECONDS` | chunk task retry の指数 backoff 基準秒（既定値: `2`） |
 
+## Interview 回答バッチ後の自動更新 (Issue #288)
+
+Q&A 回答 / Intent の confirm・correct・decline / Alignment の
+answer・correct を保存すると、`app/interview_refresh.py` が
+Understanding / Alignment / Review Queue の自動更新ジョブ
+(`interview_refresh_job`)を enqueue する。手動の
+`POST /interview/sessions/{id}/update-understanding` は障害復旧・診断用
+として残る。詳細は `docs/project-intelligence.md` の
+「回答バッチ後の自動更新(Issue #288)」を参照。
+
+| 変数 | 用途 |
+| --- | --- |
+| `PROBE_REFRESH_EAGER` | `1`/`true` で、enqueue された自動更新ジョブを呼び出し元スレッドで同期実行する（既定値は非同期のバックグラウンドスレッド実行）。テストでの決定的なアサーション用（既定値: `0`） |
+
 ## 設定診断 (System Diagnostics)
 
 `GET /system-diagnostics` は必須設定の静的・決定的ヘルスチェックを返す (Issue #101)。

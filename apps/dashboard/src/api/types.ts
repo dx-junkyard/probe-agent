@@ -424,6 +424,13 @@ export interface SystemStateAssessment {
 
 export type InterviewSessionStatus = "open" | "proposals_ready" | "materialized" | "closed";
 export type InterviewMessageRole = "user" | "assistant" | "system";
+
+// Issue #291: answerable knowledge areas / handoff finite sets.
+export type KnowledgeArea =
+  | "product_intent" | "domain_rule" | "operations" | "implementation" | "security";
+export type HandoffOriginKind = "qa" | "review_item";
+export type HandoffPriority = "low" | "normal" | "high";
+export type HandoffStatus = "pending" | "answered" | "returned" | "cancelled";
 export type InterviewStage =
   | "understanding_initialized"
   | "purpose_confirmation"
@@ -525,6 +532,9 @@ export interface InterviewSessionOut {
   materialization_diff: string | null;
   materialization_ref: string | null;
   materialized_at: number | null;
+  // Issue #291: which knowledge areas the developer can answer RIGHT NOW
+  // (no role inference). Empty means no filtering, never "every area".
+  answerable_areas: KnowledgeArea[];
   created_at: number;
   updated_at: number;
 }
@@ -747,6 +757,16 @@ export interface InterviewQaOut {
   superseded_by_id: number | null;
   created_at: number;
   answered_at: number | null;
+  // Issue #286: Question Router classification, set only via the on-demand
+  // route endpoint. Null until routed.
+  route_category?: string | null;
+  route_run_id?: number | null;
+  // Issue #291: knowledge area assigned by the same router call
+  // (question-router-v2); null until routed or when no area clearly fits.
+  // Never hides the question -- used only for out-of-area grouping.
+  knowledge_area?: KnowledgeArea | null;
+  // Issue #291: set once this question has been handed off to an assignee.
+  handoff_id?: number | null;
 }
 
 export interface InterviewQaAnswerOut {
@@ -762,6 +782,422 @@ export interface InterviewQaListOut {
   open_count: number;
   high_priority_open_count: number;
   answers_revised_at: number | null;
+}
+
+// --- Intent Brief (Issue #284) ------------------------------------------------
+//
+// User intent (only the user can decide), kept structurally separate from
+// the implementation-fact "current understanding" above. ai_proposed items
+// only become "confirmed" through an explicit confirm/correct call — never
+// automatically (Principle 2).
+
+export const INTERVIEW_INTENT_FIELDS = [
+  "goal", "pain", "success_criteria", "priority", "constraints", "non_goals",
+] as const;
+export type InterviewIntentField = typeof INTERVIEW_INTENT_FIELDS[number];
+
+export type InterviewIntentStatus =
+  | "proposed" | "confirmed" | "needs_review" | "undecided" | "not_applicable";
+// Statuses a user may set directly when creating an item. "proposed" /
+// "needs_review" are system/AI states, never user-chosen at creation time.
+export type InterviewIntentUserStatus = "confirmed" | "undecided" | "not_applicable";
+export type InterviewIntentOrigin = "user" | "ai_proposed";
+
+export interface InterviewIntentItemOut {
+  id: number;
+  session_id: number;
+  system_id: number;
+  field: InterviewIntentField;
+  value_text: string;
+  status: InterviewIntentStatus;
+  origin: InterviewIntentOrigin;
+  source_statement: string | null;
+  decision_method: "deterministic" | "reasoning_llm" | "manual";
+  intelligence_run_id: number | null;
+  is_mock: boolean;
+  superseded_by_id: number | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface InterviewIntentListOut {
+  session_id: number;
+  system_id: number;
+  items_by_field: Record<string, InterviewIntentItemOut[]>;
+}
+
+// --- Inquiry lifecycle (Issue #285) --------------------------------------
+//
+// A doubt about a confirmation item (Q&A question, Intent Brief item, or —
+// from Issue #287 — a review item) holds the original item pending and
+// starts a separate Inquiry conversation. Resolving the Inquiry never
+// changes the origin item's own state; the developer still submits that
+// item's own answer/confirm action afterward.
+
+export type InterviewInquiryOriginKind = "qa" | "intent" | "review_item";
+export type InterviewInquiryStatus = "open" | "resolved" | "unresolved" | "cancelled" | "held";
+export type InterviewInquiryMessageRole = "user" | "assistant";
+
+export interface InterviewInquiryEvidenceOut {
+  path: string;
+  start_line: number;
+  end_line: number;
+  summary: string;
+}
+
+export type InquiryRouteCategory = "human_only" | "system_researchable" | "hybrid";
+
+// Issue #290: runtime_fact evidence provenance envelope + finite match
+// state. `environment` is always null today (traces carry no environment
+// metadata) but the field exists for a future capability.
+export type RuntimeFactFreshness = "fresh" | "stale" | "unobserved";
+
+export interface RuntimeFactSnapshotRefOut {
+  snapshot_id: number;
+  git_sha: string | null;
+}
+
+export interface RuntimeFactProvenanceOut {
+  environment: string | null;
+  first_observed_at: number | null;
+  last_observed_at: number | null;
+  snapshot_ref: RuntimeFactSnapshotRefOut | null;
+  source: "trace_aggregation";
+  freshness: RuntimeFactFreshness;
+}
+
+export interface InterviewInquiryRuntimeEvidenceOut {
+  kind: "runtime_fact";
+  component_id: string;
+  provenance: RuntimeFactProvenanceOut;
+  runtime_check: RuntimeCheckState;
+  summary: string;
+}
+
+export interface SuggestedObservationProposalOut {
+  target_component: string;
+  reason: "unobserved" | "stale";
+}
+
+export interface InterviewInquiryMessageDetailOut {
+  key_points: string[];
+  evidence: InterviewInquiryEvidenceOut[];
+  uncertainty: string;
+  // Issue #286: which Question Router category produced this assistant
+  // answer, and (for "hybrid") the decision question the developer still
+  // needs to answer themselves. Both null for messages predating Issue
+  // #286 or for the user's own messages.
+  route_category?: InquiryRouteCategory | null;
+  decision_question?: string | null;
+  // Issue #290: runtime_fact evidence + a deterministic observation-
+  // proposal hint, both progressive-disclosure only (never in `content`).
+  runtime_evidence?: InterviewInquiryRuntimeEvidenceOut[];
+  suggested_observation_proposal?: SuggestedObservationProposalOut | null;
+}
+
+export interface InterviewInquiryMessageOut {
+  id: number;
+  inquiry_id: number;
+  system_id: number;
+  role: InterviewInquiryMessageRole;
+  content: string;
+  detail: InterviewInquiryMessageDetailOut | null;
+  intelligence_run_id: number | null;
+  is_mock: boolean;
+  created_at: number;
+}
+
+export interface InterviewInquiryOut {
+  id: number;
+  session_id: number;
+  system_id: number;
+  origin_kind: InterviewInquiryOriginKind;
+  origin_id: number;
+  held_draft: string | null;
+  status: InterviewInquiryStatus;
+  status_reason: string | null;
+  created_at: number;
+  updated_at: number;
+  closed_at: number | null;
+}
+
+export interface InterviewInquiryDetailOut {
+  inquiry: InterviewInquiryOut;
+  messages: InterviewInquiryMessageOut[];
+}
+
+export interface InterviewInquiryListOut {
+  session_id: number;
+  system_id: number;
+  items: InterviewInquiryOut[];
+}
+
+// --- Alignment Review / Review Queue (Issue #287) -----------------------------
+//
+// Contrasts confirmed/proposed Intent Brief items against the evidence-backed
+// Current System understanding to produce alignment items with a
+// deterministic review classification. Only review_category IN (must_review,
+// batch_reviewable) ever surfaces as an action-required Review Queue card;
+// the rest are collapsed/informational.
+
+export type AlignmentState = "aligned" | "gap" | "unknown" | "conflict" | "not_applicable";
+export type AlignmentRiskFlag = "security" | "high_risk" | "core_intent";
+export type AlignmentConfidence = "confirmed" | "likely" | "uncertain" | "conflicting";
+export type AlignmentReviewCategory =
+  | "must_review" | "batch_reviewable" | "no_review_required" | "unchanged" | "informational";
+export type AlignmentReasonCode =
+  | "security_related" | "high_risk" | "core_intent" | "conflict_detected"
+  | "low_confidence" | "runtime_mismatch" | "routine_update" | "no_change"
+  | "informational_only";
+// Issue #290: deterministic Runtime Reality Check match state, set only
+// when this item's evidence deterministically maps to a component_id with
+// runtime trace facts; null when no deterministic mapping exists.
+export type RuntimeCheckState = "match" | "mismatch" | "unobserved" | "stale";
+// 'inquiry' is set while an Inquiry (origin_kind='review_item') is open on
+// this item, and reset to 'open' (never 'answered') when it closes.
+export type AlignmentItemStatus = "open" | "answered" | "corrected" | "held" | "inquiry";
+export type AlignmentDecisionAction = "accept_current" | "needs_change" | "reject_interpretation";
+export type AlignmentUserDecisionAction = AlignmentDecisionAction | "corrected" | "held";
+
+export interface AlignmentEvidenceOut {
+  path: string;
+  start_line: number;
+  end_line: number;
+  summary: string;
+}
+
+export interface AlignmentUserDecisionOut {
+  action: AlignmentUserDecisionAction;
+  note: string | null;
+  decided_at: number;
+  decided_by: string | null;
+}
+
+export interface AlignmentItemOut {
+  id: number;
+  session_id: number;
+  system_id: number;
+  revision_id: number | null;
+  snapshot_id: number;
+  intent_item_id: number | null;
+  intent_summary: string | null;
+  current_claim: string;
+  current_evidence: AlignmentEvidenceOut[];
+  gap_summary: string | null;
+  proposed_interpretation: string | null;
+  alignment_state: AlignmentState;
+  risk_flags: AlignmentRiskFlag[];
+  confidence: AlignmentConfidence;
+  review_category: AlignmentReviewCategory;
+  reason_code: AlignmentReasonCode;
+  user_reason: string;
+  runtime_check?: RuntimeCheckState | null;
+  status: AlignmentItemStatus;
+  user_decision: AlignmentUserDecisionOut | null;
+  // Issue #291: set once this review item has been handed off to an
+  // assignee (creating the handoff also sets status='held').
+  handoff_id?: number | null;
+  intelligence_run_id: number;
+  is_mock: boolean;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface AlignmentBuildOut {
+  session_id: number;
+  system_id: number;
+  revision_id: number | null;
+  intelligence_run_id: number;
+  is_mock: boolean;
+  items: AlignmentItemOut[];
+}
+
+export interface AlignmentListOut {
+  session_id: number;
+  system_id: number;
+  items_by_category: Record<string, AlignmentItemOut[]>;
+  counts: Record<string, number>;
+}
+
+export interface AlignmentReviewQueueOut {
+  session_id: number;
+  system_id: number;
+  items: AlignmentItemOut[];
+}
+
+// --- Answerable knowledge areas / handoff (Issue #291) ------------------------
+//
+// A developer picks which knowledge areas they can answer NOW; out-of-area
+// items (interview_qa) or Review Queue items (alignment_item) can be handed
+// off to an assignee. The assignee's own answer is never written into the
+// origin row -- the original developer must explicitly confirm it via
+// /return + the origin item's own existing answer endpoint.
+
+export interface QuestionHandoffEvidenceRef {
+  path: string;
+  start_line: number;
+  end_line: number;
+  summary: string;
+}
+
+export interface QuestionHandoffOut {
+  id: number;
+  session_id: number;
+  system_id: number;
+  origin_kind: HandoffOriginKind;
+  origin_id: number;
+  assignee: string;
+  background: string;
+  needed_decision: string;
+  evidence: QuestionHandoffEvidenceRef[] | null;
+  due_note: string | null;
+  priority: HandoffPriority;
+  status: HandoffStatus;
+  answer_text: string | null;
+  answered_by: string | null;
+  answered_at: number | null;
+  created_by: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface QuestionHandoffListOut {
+  session_id: number;
+  system_id: number;
+  items: QuestionHandoffOut[];
+}
+
+// --- Observation proposal (Issue #290) ----------------------------------------
+//
+// Approval-gated request to start NEW runtime observation. Approving never
+// starts observation itself -- `policy_pointer` is a fixed, server-authored
+// string pointing at the existing PUT /components/{id}/policy endpoint.
+
+export type RuntimeObservationProposalStatus = "proposed" | "approved" | "rejected" | "expired";
+
+export interface RuntimeObservationProposalOut {
+  id: number;
+  session_id: number;
+  system_id: number;
+  origin_inquiry_id: number | null;
+  origin_alignment_item_id: number | null;
+  target_component: string;
+  purpose: string;
+  expected_cost: string | null;
+  risk_note: string | null;
+  retention_note: string | null;
+  status: RuntimeObservationProposalStatus;
+  decision_by: string | null;
+  decision_at: number | null;
+  created_at: number;
+  policy_pointer: string | null;
+}
+
+export interface RuntimeObservationProposalCreate {
+  target_component: string;
+  purpose: string;
+  expected_cost?: string | null;
+  risk_note?: string | null;
+  retention_note?: string | null;
+  origin_inquiry_id?: number | null;
+  origin_alignment_item_id?: number | null;
+}
+
+// --- Automatic refresh after an answer batch (Issue #288) --------------------
+
+export type RefreshTriggerKind =
+  | "qa_answer" | "intent_update" | "alignment_answer" | "nl_change_set";
+export type RefreshJobStatus = "pending" | "updating" | "updated" | "failed" | "stale";
+
+export interface RefreshJobOut {
+  id: number;
+  session_id: number;
+  system_id: number;
+  trigger_kind: RefreshTriggerKind;
+  status: RefreshJobStatus;
+  error: string | null;
+  intelligence_run_id: number | null;
+  result_revision_id: number | null;
+  created_at: number;
+  started_at: number | null;
+  finished_at: number | null;
+}
+
+export interface RefreshStatusOut {
+  session_id: number;
+  system_id: number;
+  latest_job: RefreshJobOut | null;
+  pending_count: number;
+}
+
+// --- Natural-language bulk correction -> structured change set (Issue #289) -
+//
+// A free-text correction covering multiple Understanding items is never
+// applied directly — a reasoning LLM turns it into a structured, itemized
+// change set; the developer previews field-level diffs + a deterministic
+// impact preview and selectively applies only resolved items.
+// 'forbidden' means the (target_kind, field) pair is outside the server's
+// whitelist (e.g. an attempt to touch alignment user_decision), not merely
+// unresolved.
+
+export type ChangeSetStatus =
+  | "proposed" | "previewed" | "partially_applied" | "applied" | "discarded" | "failed";
+export type ChangeTargetKind = "intent_item" | "understanding_claim";
+export type ChangeResolutionState = "resolved" | "ambiguous" | "conflict" | "stale" | "forbidden";
+
+export interface ChangeSetOut {
+  id: number;
+  session_id: number;
+  system_id: number;
+  base_revision_id: number | null;
+  source_text: string;
+  status: ChangeSetStatus;
+  intelligence_run_id: number;
+  is_mock: boolean;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ChangeSetAffectedItemOut {
+  alignment_item_id: number;
+  current_claim: string;
+  review_category: string;
+}
+
+export interface ChangeSetItemOut {
+  id: number;
+  change_set_id: number;
+  system_id: number;
+  target_kind: ChangeTargetKind;
+  target_ref: Record<string, unknown>;
+  field: string;
+  before_value: string | null;
+  after_value: string;
+  reason: string;
+  resolution_state: ChangeResolutionState;
+  applied: boolean;
+  applied_at: number | null;
+  created_at: number;
+  affected_items: ChangeSetAffectedItemOut[];
+}
+
+export interface ChangeSetDetailOut {
+  change_set: ChangeSetOut;
+  items: ChangeSetItemOut[];
+  rebuild_note: string;
+}
+
+export interface ChangeSetSkippedItemOut {
+  item_id: number;
+  resolution_state: ChangeResolutionState;
+  message: string;
+}
+
+export interface ChangeSetApplyResultOut {
+  change_set: ChangeSetOut;
+  applied_item_ids: number[];
+  skipped: ChangeSetSkippedItemOut[];
+  result_revision_id: number | null;
 }
 
 export interface InterviewProposalDecisionOut {

@@ -505,6 +505,20 @@ IntelligenceRunType = Literal[
     "pattern_reconcile",
     "pattern_investigate",
     "probe_plan_from_pattern",
+    # Issue #284: Intent Brief. Proposes missing goal/pain/success_criteria/
+    # priority/constraints/non_goals items from the session conversation and
+    # user_intent free text. Proposed items are never auto-confirmed.
+    "intent_proposal",
+    # Issue #285: Inquiry side-conversation answer generation (the overall
+    # composed outcome; superseded internals split into "question_route" and
+    # "investigation" below by Issue #286, each audited separately).
+    "inquiry_answer",
+    # Issue #286: Question Router classifies a question into
+    # human_only | system_researchable | hybrid before any investigation.
+    "question_route",
+    # Issue #286: read-only Investigation Agent research over the pinned
+    # snapshot, budget-bounded, for system_researchable/hybrid questions.
+    "investigation",
 ]
 DecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
 # How a single hierarchy claim was produced. Kept distinct from the audit
@@ -638,6 +652,13 @@ class IntelligenceRunOut(BaseModel):
     is_mock: bool = False
     started_at: float
     completed_at: Optional[float] = None
+    # Issue #286: budget usage for run_type="investigation" rows only (the
+    # read-only Investigation Agent's deterministic budget accounting).
+    # None for every other run_type.
+    budget_files_read: Optional[int] = None
+    budget_chars_read: Optional[int] = None
+    budget_llm_calls: Optional[int] = None
+    budget_elapsed_seconds: Optional[float] = None
 
 
 class FeatureEvidence(BaseModel):
@@ -2328,6 +2349,16 @@ class WorkspaceProposalDraftOut(BaseModel):
 InterviewSessionStatus = Literal["open", "proposals_ready", "materialized", "closed"]
 InterviewMessageRole = Literal["user", "assistant", "system"]
 
+# Issue #291: answerable knowledge areas / handoff finite sets. Defined here
+# (ahead of InterviewSessionOut/InterviewQaOut which reference KnowledgeArea)
+# rather than down by the rest of the Issue #291 models further below.
+KnowledgeArea = Literal[
+    "product_intent", "domain_rule", "operations", "implementation", "security",
+]
+HandoffOriginKind = Literal["qa", "review_item"]
+HandoffPriority = Literal["low", "normal", "high"]
+HandoffStatus = Literal["pending", "answered", "returned", "cancelled"]
+
 InterviewStage = Literal[
     "understanding_initialized",
     "purpose_confirmation",
@@ -2393,6 +2424,10 @@ class InterviewSessionOut(BaseModel):
     materialization_diff: Optional[str] = None
     materialization_ref: Optional[str] = None
     materialized_at: Optional[float] = None
+    # Issue #291: which knowledge areas the developer can answer RIGHT NOW
+    # (no role inference). Empty means no filtering -- the pre-#291 default
+    # of showing every question, never "every area selected".
+    answerable_areas: List[KnowledgeArea] = Field(default_factory=list)
     created_at: float
     updated_at: float
 
@@ -2843,6 +2878,14 @@ class InterviewQaAnswerRequest(BaseModel):
     answer_text: str = Field(default="", max_length=20_000)
     actor: str = Field(..., min_length=1, max_length=200)
     answer_unknown: bool = False
+    # Issue #291: set when this answer is the original user's EXPLICIT
+    # confirmation of a returned handoff's assignee answer (optionally
+    # prefilled client-side from QuestionHandoffOut.answer_text). The
+    # handoff's own answer_text/answered_by are never written here directly
+    # -- the developer still submits their own answer_text/actor; this only
+    # links the provenance (routes/interview.py validates the handoff
+    # exists, belongs to this question, and is status='returned').
+    handoff_id: Optional[int] = None
 
     @model_validator(mode="after")
     def _require_answer_or_unknown(self) -> "InterviewQaAnswerRequest":
@@ -2871,6 +2914,20 @@ class InterviewQaOut(BaseModel):
     superseded_by_id: Optional[int] = None
     created_at: float
     answered_at: Optional[float] = None
+    # Issue #286: Question Router classification for this question, set only
+    # via POST /interview/qa/{qa_id}/route (never automatically for
+    # dialogue-turn questions). None until routed.
+    route_category: Optional[str] = None
+    route_run_id: Optional[int] = None
+    # Issue #291: knowledge area assigned by the same Question Router call
+    # (question-router-v2); null until routed or when no area clearly fits.
+    # Never inferred deterministically. Used only to group out-of-area
+    # questions -- it never hides a question from the full list.
+    knowledge_area: Optional[KnowledgeArea] = None
+    # Issue #291: set when this question has been handed off to an assignee
+    # (question_handoff.id). The origin row's own `status` is left
+    # untouched by a handoff (Principle 2/6 -- see db.py's table docstring).
+    handoff_id: Optional[int] = None
 
 
 class InterviewQaAnswerOut(BaseModel):
@@ -2889,6 +2946,524 @@ class InterviewQaListOut(BaseModel):
     open_count: int = 0
     high_priority_open_count: int = 0
     answers_revised_at: Optional[float] = None
+
+
+# --- Intent Brief (Issue #284) ------------------------------------------------
+#
+# Structured user intent, kept separate from implementation-fact
+# understanding: only the user can decide these values. ai_proposed items
+# are drafts the reasoning model grounds in the conversation; they never
+# become 'confirmed' except through the explicit confirm/correct endpoints
+# (decision_method stays 'manual' for every user-driven transition,
+# Principle 2). 'undecided' and 'not_applicable' are first-class answers
+# ("現状把握だけが目的" / "まだ解決策を決めていない" / 「対象外」), not errors.
+
+InterviewIntentField = Literal[
+    "goal", "pain", "success_criteria", "priority", "constraints", "non_goals"
+]
+InterviewIntentStatus = Literal[
+    "proposed", "confirmed", "needs_review", "undecided", "not_applicable"
+]
+# Statuses a user may set directly when creating an item. 'proposed' and
+# 'needs_review' are system/AI states, never user-chosen at creation time.
+InterviewIntentUserStatus = Literal["confirmed", "undecided", "not_applicable"]
+InterviewIntentOrigin = Literal["user", "ai_proposed"]
+
+
+class InterviewIntentItemOut(BaseModel):
+    id: int
+    session_id: int
+    system_id: int
+    field: InterviewIntentField
+    value_text: str
+    status: InterviewIntentStatus
+    origin: InterviewIntentOrigin
+    source_statement: Optional[str] = None
+    decision_method: DecisionMethod
+    intelligence_run_id: Optional[int] = None
+    is_mock: bool = False
+    superseded_by_id: Optional[int] = None
+    created_at: float
+    updated_at: float
+
+
+class InterviewIntentItemCreate(BaseModel):
+    """User-authored intent item. Always origin='user', decision_method='manual'."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    field: InterviewIntentField
+    value_text: str = Field(..., min_length=1, max_length=4_000)
+    status: InterviewIntentUserStatus = "confirmed"
+
+
+class InterviewIntentCorrectRequest(BaseModel):
+    """Correct an ai_proposed (or previously confirmed) item's value.
+
+    Never overwrites: the caller inserts a new 'confirmed'/'user' row and
+    marks the prior row's superseded_by_id, mirroring interview_qa's
+    answer/correction pattern.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    value_text: str = Field(..., min_length=1, max_length=4_000)
+
+
+class InterviewIntentListOut(BaseModel):
+    session_id: int
+    system_id: int
+    items_by_field: Dict[str, List[InterviewIntentItemOut]] = Field(default_factory=dict)
+
+
+# --- Inquiry lifecycle (Issue #285) -------------------------------------------
+#
+# A doubt about a confirmation item (Q&A question, Intent Brief item, or --
+# from Issue #287 -- a review item) is held pending while a separate Inquiry
+# conversation resolves it. Resolving an Inquiry never changes the origin
+# item's own state (Principle 2's "explicit user action" boundary applies to
+# the origin item's own endpoint, not to closing the Inquiry).
+
+InterviewInquiryOriginKind = Literal["qa", "intent", "review_item"]
+InterviewInquiryStatus = Literal["open", "resolved", "unresolved", "cancelled", "held"]
+InterviewInquiryMessageRole = Literal["user", "assistant"]
+
+
+class InterviewInquiryEvidenceOut(BaseModel):
+    path: str
+    start_line: int
+    end_line: int
+    summary: str = ""
+
+
+class InterviewInquiryMessageDetailOut(BaseModel):
+    """Progressive-disclosure detail for an assistant Inquiry message.
+
+    The message's own ``content`` is always the short conclusion, shown
+    first; ``detail`` is the "根拠を見る" (show evidence) expansion.
+    """
+
+    key_points: List[str] = Field(default_factory=list)
+    evidence: List[InterviewInquiryEvidenceOut] = Field(default_factory=list)
+    uncertainty: str = ""
+    # Issue #286: which Question Router category produced this answer, and
+    # (for "hybrid") the decision question the developer still needs to
+    # answer themselves. Both None for messages predating Issue #286.
+    route_category: Optional[str] = None
+    decision_question: Optional[str] = None
+    # Issue #290: runtime_fact evidence entries (provenance + finite
+    # runtime_check), always in this detail layer -- never in the message's
+    # short ``content`` -- so the initial answer stays conclusion-first and
+    # raw trace/provenance data only appears in the collapsible detail
+    # expansion (progressive disclosure).
+    runtime_evidence: List["InterviewInquiryRuntimeEvidenceOut"] = Field(default_factory=list)
+    # A deterministic hint (never LLM free text) that a runtime_fact came
+    # back unobserved/stale -- the developer can turn this into an actual
+    # POST .../observation-proposals call if they want new observation;
+    # this hint alone never creates a proposal row (Principle 5/8).
+    suggested_observation_proposal: Optional["SuggestedObservationProposalOut"] = None
+
+
+class InterviewInquiryMessageOut(BaseModel):
+    id: int
+    inquiry_id: int
+    system_id: int
+    role: InterviewInquiryMessageRole
+    content: str
+    detail: Optional[InterviewInquiryMessageDetailOut] = None
+    intelligence_run_id: Optional[int] = None
+    is_mock: bool = False
+    created_at: float
+
+
+class InterviewInquiryOut(BaseModel):
+    id: int
+    session_id: int
+    system_id: int
+    origin_kind: InterviewInquiryOriginKind
+    origin_id: int
+    held_draft: Optional[str] = None
+    status: InterviewInquiryStatus
+    status_reason: Optional[str] = None
+    created_at: float
+    updated_at: float
+    closed_at: Optional[float] = None
+
+
+class InterviewInquiryDetailOut(BaseModel):
+    inquiry: InterviewInquiryOut
+    messages: List[InterviewInquiryMessageOut] = Field(default_factory=list)
+
+
+class InterviewInquiryListOut(BaseModel):
+    session_id: int
+    system_id: int
+    items: List[InterviewInquiryOut] = Field(default_factory=list)
+
+
+class InterviewInquiryCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    origin_kind: InterviewInquiryOriginKind
+    origin_id: int
+    question_text: str = Field(..., min_length=1, max_length=2_000)
+    # Opaque to the server: the user's unconfirmed answer draft on the origin
+    # item at the moment they opened the Inquiry, round-tripped back verbatim
+    # via GET/resolve so the dashboard can restore it into the input without
+    # the server ever interpreting or submitting it as an answer.
+    held_draft: Optional[str] = Field(default=None, max_length=20_000)
+
+
+class InterviewInquiryMessageCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    content: str = Field(..., min_length=1, max_length=2_000)
+
+
+class InterviewInquiryTransitionRequest(BaseModel):
+    """Optional audit fields for a hold/cancel/unresolved status change."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status_reason: Optional[str] = Field(default=None, max_length=500)
+    actor: Optional[str] = Field(default=None, max_length=200)
+
+
+# --- Alignment Review / Review Queue (Issue #287) -----------------------------
+#
+# Contrasts confirmed/proposed Intent Brief items against the evidence-backed
+# Current System understanding to produce alignment items with a
+# deterministic review classification (review_category/reason_code -- see
+# app/alignment.py's rule table). Only review_category IN (must_review,
+# batch_reviewable) ever surfaces as an action-required Review Queue card.
+
+# Issue #290: defined here (ahead of the Runtime Reality Check section
+# further down) because AlignmentItemOut.runtime_check needs
+# RuntimeCheckState. See that section for the full provenance envelope
+# model these finite sets belong to.
+RuntimeFactFreshness = Literal["fresh", "stale", "unobserved"]
+RuntimeCheckState = Literal["match", "mismatch", "unobserved", "stale"]
+
+AlignmentState = Literal["aligned", "gap", "unknown", "conflict", "not_applicable"]
+AlignmentRiskFlag = Literal["security", "high_risk", "core_intent"]
+AlignmentConfidence = Literal["confirmed", "likely", "uncertain", "conflicting"]
+AlignmentReviewCategory = Literal[
+    "must_review", "batch_reviewable", "no_review_required", "unchanged", "informational",
+]
+AlignmentReasonCode = Literal[
+    "security_related", "high_risk", "core_intent", "conflict_detected",
+    "low_confidence", "runtime_mismatch", "routine_update", "no_change",
+    "informational_only",
+]
+# Item-level user progress. 'inquiry' is set while an Inquiry
+# (origin_kind='review_item') is open on this item, and reset to 'open'
+# (never 'answered') when that Inquiry closes -- the developer must still
+# explicitly answer via this item's own endpoint (Principle 2).
+AlignmentItemStatus = Literal["open", "answered", "corrected", "held", "inquiry"]
+# The three decisions POST /answer accepts as request input.
+AlignmentDecisionAction = Literal["accept_current", "needs_change", "reject_interpretation"]
+# The full set of actions that may appear in a persisted user_decision.action
+# -- a superset of AlignmentDecisionAction covering what /correct and /hold
+# each record (Principle 7: every manual write path leaves an audit action).
+AlignmentUserDecisionAction = Literal[
+    "accept_current", "needs_change", "reject_interpretation", "corrected", "held",
+]
+
+
+class AlignmentEvidenceOut(BaseModel):
+    path: str
+    start_line: int
+    end_line: int
+    summary: str = ""
+
+
+class AlignmentUserDecisionOut(BaseModel):
+    action: AlignmentUserDecisionAction
+    note: Optional[str] = None
+    decided_at: float
+    decided_by: Optional[str] = None
+
+
+class AlignmentItemOut(BaseModel):
+    id: int
+    session_id: int
+    system_id: int
+    revision_id: Optional[int] = None
+    snapshot_id: int
+    intent_item_id: Optional[int] = None
+    intent_summary: Optional[str] = None
+    current_claim: str
+    current_evidence: List[AlignmentEvidenceOut] = Field(default_factory=list)
+    gap_summary: Optional[str] = None
+    proposed_interpretation: Optional[str] = None
+    alignment_state: AlignmentState
+    risk_flags: List[AlignmentRiskFlag] = Field(default_factory=list)
+    confidence: AlignmentConfidence
+    review_category: AlignmentReviewCategory
+    reason_code: AlignmentReasonCode
+    user_reason: str
+    # Issue #290: deterministic Runtime Reality Check match state, set only
+    # when this item's evidence deterministically maps to a component_id
+    # with runtime trace facts; null when no deterministic mapping exists
+    # (never guessed from free text -- app/runtime_alignment.py).
+    runtime_check: Optional[RuntimeCheckState] = None
+    status: AlignmentItemStatus
+    user_decision: Optional[AlignmentUserDecisionOut] = None
+    # Issue #291: set when this review item has been handed off to an
+    # assignee (question_handoff.id, origin_kind='review_item'). Creating
+    # the handoff sets status='held' (the same value /hold already uses)
+    # alongside this column.
+    handoff_id: Optional[int] = None
+    intelligence_run_id: int
+    is_mock: bool = False
+    created_at: float
+    updated_at: float
+
+
+class AlignmentBuildOut(BaseModel):
+    session_id: int
+    system_id: int
+    revision_id: Optional[int] = None
+    intelligence_run_id: int
+    is_mock: bool = False
+    items: List[AlignmentItemOut] = Field(default_factory=list)
+
+
+class AlignmentListOut(BaseModel):
+    session_id: int
+    system_id: int
+    items_by_category: Dict[str, List[AlignmentItemOut]] = Field(default_factory=dict)
+    counts: Dict[str, int] = Field(default_factory=dict)
+
+
+class AlignmentReviewQueueOut(BaseModel):
+    session_id: int
+    system_id: int
+    items: List[AlignmentItemOut] = Field(default_factory=list)
+
+
+class AlignmentAnswerRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: AlignmentDecisionAction
+    note: Optional[str] = Field(default=None, max_length=2_000)
+
+
+class AlignmentCorrectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    corrected_interpretation: str = Field(..., min_length=1, max_length=2_000)
+
+
+# --- Answerable knowledge areas / handoff (Issue #291) ------------------------
+#
+# A developer picks which knowledge areas they can answer NOW (no role
+# inference, Principle 6). KnowledgeArea (defined earlier, alongside
+# InterviewSessionStatus) is the same finite set the Question Router
+# (app/question_router.py question-router-v2) tags a question with; empty
+# session.answerable_areas means "no filtering" (unchanged default
+# behavior), never "all areas explicitly selected".
+
+
+class AnswerableAreasUpdateRequest(BaseModel):
+    """Replace the session's answerable-areas selection. Changeable anytime."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    areas: List[KnowledgeArea] = Field(default_factory=list, max_length=5)
+
+
+class QuestionHandoffEvidenceRef(BaseModel):
+    path: str = Field(..., min_length=1, max_length=500)
+    start_line: int = 0
+    end_line: int = 0
+    summary: str = Field(default="", max_length=2_000)
+
+
+class QuestionHandoffCreate(BaseModel):
+    """Hand an out-of-area (or otherwise deferred) item off to an assignee.
+
+    ``assignee`` is a free-text name/address -- no org auth system exists
+    yet (same convention as ``understanding_confirmed_by`` /
+    ``interview_qa.answered_by``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    origin_kind: HandoffOriginKind
+    origin_id: int
+    assignee: str = Field(..., min_length=1, max_length=200)
+    background: str = Field(..., min_length=1, max_length=4_000)
+    needed_decision: str = Field(..., min_length=1, max_length=2_000)
+    evidence: Optional[List[QuestionHandoffEvidenceRef]] = Field(default=None, max_length=10)
+    due_note: Optional[str] = Field(default=None, max_length=500)
+    priority: HandoffPriority = "normal"
+    created_by: Optional[str] = Field(default=None, max_length=200)
+
+
+class QuestionHandoffOut(BaseModel):
+    id: int
+    session_id: int
+    system_id: int
+    origin_kind: HandoffOriginKind
+    origin_id: int
+    assignee: str
+    background: str
+    needed_decision: str
+    evidence: Optional[List[QuestionHandoffEvidenceRef]] = None
+    due_note: Optional[str] = None
+    priority: HandoffPriority
+    status: HandoffStatus
+    answer_text: Optional[str] = None
+    answered_by: Optional[str] = None
+    answered_at: Optional[float] = None
+    created_by: Optional[str] = None
+    created_at: float
+    updated_at: float
+
+
+class QuestionHandoffListOut(BaseModel):
+    session_id: int
+    system_id: int
+    items: List[QuestionHandoffOut] = Field(default_factory=list)
+
+
+class QuestionHandoffAnswerRequest(BaseModel):
+    """The assignee's own answer.
+
+    Never written into the origin qa/alignment row -- see the
+    ``question_handoff`` table docstring in ``db.py``. The original user
+    must still explicitly confirm it via ``/return`` and the origin item's
+    own answer endpoint (Principle 2).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    answer_text: str = Field(..., min_length=1, max_length=20_000)
+    answered_by: str = Field(..., min_length=1, max_length=200)
+
+
+# --- Automatic refresh after an answer batch (Issue #288) --------------------
+#
+# app/interview_refresh.py's request_refresh()/run_refresh_job() keep
+# Understanding / Alignment / Review Queue current after a Q&A answer, Intent
+# confirm/correct, or Alignment answer/correct, without the manual
+# 「理解を更新」 action. trigger_kind/status are explicit finite sets
+# (Principle 6).
+
+RefreshTriggerKind = Literal[
+    "qa_answer", "intent_update", "alignment_answer", "nl_change_set",
+]
+RefreshJobStatus = Literal["pending", "updating", "updated", "failed", "stale"]
+
+
+class RefreshJobOut(BaseModel):
+    id: int
+    session_id: int
+    system_id: int
+    trigger_kind: RefreshTriggerKind
+    status: RefreshJobStatus
+    error: Optional[str] = None
+    intelligence_run_id: Optional[int] = None
+    result_revision_id: Optional[int] = None
+    created_at: float
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+
+
+class RefreshStatusOut(BaseModel):
+    session_id: int
+    system_id: int
+    latest_job: Optional[RefreshJobOut] = None
+    pending_count: int = 0
+
+
+# --- Natural-language bulk correction -> structured change set (Issue #289) --
+#
+# app/change_sets.py turns a developer's free-text correction into a
+# structured, previewed, selectively-applied change set -- NL is never
+# applied to state directly (Principle 2/6). target_kind/resolution_state
+# are explicit finite sets; 'forbidden' means the (target_kind, field) pair
+# is outside the whitelist (app/change_sets.py's ALLOWED_TARGET_FIELDS),
+# not merely unresolved.
+
+ChangeSetStatus = Literal[
+    "proposed", "previewed", "partially_applied", "applied", "discarded", "failed",
+]
+ChangeTargetKind = Literal["intent_item", "understanding_claim"]
+ChangeResolutionState = Literal["resolved", "ambiguous", "conflict", "stale", "forbidden"]
+
+
+class ChangeSetCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(..., min_length=1, max_length=8_000)
+
+
+class ChangeSetOut(BaseModel):
+    id: int
+    session_id: int
+    system_id: int
+    base_revision_id: Optional[int] = None
+    source_text: str
+    status: ChangeSetStatus
+    intelligence_run_id: int
+    is_mock: bool = False
+    created_at: float
+    updated_at: float
+
+
+class ChangeSetAffectedItemOut(BaseModel):
+    """One alignment/review item a change item's edit would touch,
+    determined by a deterministic structural match (Principle 6) -- never a
+    reasoning decision. See ``routes/interview_change_sets.py``'s
+    ``_affected_alignment_items``."""
+
+    alignment_item_id: int
+    current_claim: str
+    review_category: str
+
+
+class ChangeSetItemOut(BaseModel):
+    id: int
+    change_set_id: int
+    system_id: int
+    target_kind: ChangeTargetKind
+    target_ref: Dict[str, Any] = Field(default_factory=dict)
+    field: str
+    before_value: Optional[str] = None
+    after_value: str
+    reason: str
+    resolution_state: ChangeResolutionState
+    applied: bool = False
+    applied_at: Optional[float] = None
+    created_at: float
+    affected_items: List[ChangeSetAffectedItemOut] = Field(default_factory=list)
+
+
+class ChangeSetDetailOut(BaseModel):
+    change_set: ChangeSetOut
+    items: List[ChangeSetItemOut] = Field(default_factory=list)
+    rebuild_note: str
+
+
+class ChangeSetApplyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_ids: List[int] = Field(..., min_length=1, max_length=100)
+
+
+class ChangeSetSkippedItemOut(BaseModel):
+    item_id: int
+    resolution_state: ChangeResolutionState
+    message: str
+
+
+class ChangeSetApplyResultOut(BaseModel):
+    change_set: ChangeSetOut
+    applied_item_ids: List[int] = Field(default_factory=list)
+    skipped: List[ChangeSetSkippedItemOut] = Field(default_factory=list)
+    result_revision_id: Optional[int] = None
 
 
 # --- Runtime Reality Check (Issue #135) --------------------------------------
@@ -2919,8 +3494,43 @@ class RuntimeTraceFactsOut(BaseModel):
     duration_p50_ms: Optional[float] = None
     duration_p90_ms: Optional[float] = None
     duration_p99_ms: Optional[float] = None
+    # Issue #290: earliest trace timestamp inside the aggregation window
+    # (None when has_traces is False), used by the provenance envelope's
+    # observed_at.first alongside last_observed_at's observed_at.last.
+    first_observed_at: Optional[float] = None
     last_observed_at: Optional[float] = None
     has_traces: bool = False
+
+
+# --- Runtime fact provenance / match state (Issue #290) ----------------------
+#
+# Wraps RuntimeTraceFactsOut with WHERE the facts came from and HOW current
+# they are, so a fact is never silently presented as current/authoritative
+# once it has gone stale (Principle 5 stale guard). ``environment`` is only
+# ever populated from actual trace metadata (never invented) -- the current
+# ``traces`` schema has no environment column, so it is always null today;
+# the field exists so a future trace-tagging capability does not need a
+# schema-incompatible follow-up. ``freshness`` and ``runtime_check`` are both
+# finite sets (Principle 6): freshness is a pure function of
+# RUNTIME_FACT_FRESH_SECONDS vs last_observed_at (app/runtime_reality.py);
+# runtime_check is app/runtime_alignment.py's compare_claim_to_runtime result.
+# NOTE: RuntimeFactFreshness/RuntimeCheckState themselves are defined earlier
+# in this module (just above the Alignment Review section) because
+# AlignmentItemOut needs RuntimeCheckState.
+
+
+class RuntimeFactSnapshotRefOut(BaseModel):
+    snapshot_id: int
+    git_sha: Optional[str] = None
+
+
+class RuntimeFactProvenanceOut(BaseModel):
+    environment: Optional[str] = None
+    first_observed_at: Optional[float] = None
+    last_observed_at: Optional[float] = None
+    snapshot_ref: Optional[RuntimeFactSnapshotRefOut] = None
+    source: Literal["trace_aggregation"] = "trace_aggregation"
+    freshness: RuntimeFactFreshness
 
 
 class RuntimeRealityCheckItemOut(BaseModel):
@@ -2965,6 +3575,89 @@ class RuntimeRealityCheckRunOut(BaseModel):
     skipped: bool = False
     skipped_reason: Optional[str] = None
     error: Optional[str] = None
+
+
+# --- Investigation Agent runtime_fact evidence (Issue #290) ------------------
+#
+# Extends Issue #286's Investigation Agent with a second evidence kind
+# alongside code citations: a runtime_fact entry cites a component_id (never
+# invented -- must be one of the components deterministically offered to the
+# model, mirroring how code evidence must cite an actually-read path) plus
+# its provenance envelope and the finite runtime_check state. When the
+# deterministic freshness is 'unobserved'/'stale' the persisted
+# ``runtime_check`` always matches that deterministic value regardless of
+# what the model said (Principle 5 stale guard); only when facts are fresh
+# does the model's own match/mismatch judgement (a semantic call, Principle
+# 6) get recorded as-is.
+
+
+class InvestigationRuntimeEvidenceOut(BaseModel):
+    kind: Literal["runtime_fact"] = "runtime_fact"
+    component_id: str
+    provenance: RuntimeFactProvenanceOut
+    runtime_check: RuntimeCheckState
+    summary: str = ""
+
+
+class InterviewInquiryRuntimeEvidenceOut(InvestigationRuntimeEvidenceOut):
+    pass
+
+
+class SuggestedObservationProposalOut(BaseModel):
+    target_component: str
+    reason: Literal["unobserved", "stale"]
+
+
+# --- Observation proposal (Issue #290) ---------------------------------------
+#
+# A developer's request to start capturing NEW runtime observation (as
+# opposed to reading facts that already exist) is never auto-started
+# (Principle 5/8): POST .../observation-proposals only ever records a
+# proposal row; approving it (decision_method='manual') does NOT itself
+# start anything -- the response only points back at the existing
+# PUT /components/{component_id}/policy endpoint that already sets a
+# component's trace/shadow mode.
+
+RuntimeObservationProposalStatus = Literal["proposed", "approved", "rejected", "expired"]
+
+
+class RuntimeObservationProposalCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_component: str = Field(..., min_length=1, max_length=500)
+    purpose: str = Field(..., min_length=1, max_length=2_000)
+    expected_cost: Optional[str] = Field(default=None, max_length=500)
+    risk_note: Optional[str] = Field(default=None, max_length=2_000)
+    retention_note: Optional[str] = Field(default=None, max_length=2_000)
+    origin_inquiry_id: Optional[int] = None
+    origin_alignment_item_id: Optional[int] = None
+
+
+class RuntimeObservationProposalOut(BaseModel):
+    id: int
+    session_id: int
+    system_id: int
+    origin_inquiry_id: Optional[int] = None
+    origin_alignment_item_id: Optional[int] = None
+    target_component: str
+    purpose: str
+    expected_cost: Optional[str] = None
+    risk_note: Optional[str] = None
+    retention_note: Optional[str] = None
+    status: RuntimeObservationProposalStatus
+    decision_by: Optional[str] = None
+    decision_at: Optional[float] = None
+    created_at: float
+    # Deterministic, fixed (never LLM free text): only present once
+    # status='approved', pointing at the existing policy endpoint that
+    # actually starts trace/shadow capture (this proposal never does).
+    policy_pointer: Optional[str] = None
+
+
+class RuntimeObservationProposalDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision_by: Optional[str] = Field(default=None, max_length=200)
 
 
 # --- Understanding Revisions (Issue #136) ------------------------------------

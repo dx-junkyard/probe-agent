@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, getSystemId } from "./client";
 import type {
@@ -26,6 +27,15 @@ import type {
   InterviewApprovedSetOut, InterviewMaterializeOut,
   InterviewSnapshotRebaseOut,
   InterviewQaListOut, InterviewQaOut, InterviewQaAnswerOut,
+  InterviewIntentListOut, InterviewIntentItemOut,
+  InterviewIntentField, InterviewIntentUserStatus,
+  InterviewInquiryListOut, InterviewInquiryDetailOut, InterviewInquiryOut,
+  InterviewInquiryOriginKind,
+  AlignmentBuildOut, AlignmentListOut, AlignmentReviewQueueOut, AlignmentItemOut,
+  AlignmentDecisionAction,
+  RuntimeObservationProposalOut, RuntimeObservationProposalCreate,
+  RefreshStatusOut, RefreshJobOut,
+  ChangeSetDetailOut, ChangeSetApplyResultOut, ChangeSetOut,
   RuntimeRealityFactsOut, RuntimeRealityCheckRunOut,
   UnderstandingRevisionListOut, UnderstandingDiffOut,
   SystemUnderstandingOut,
@@ -56,6 +66,8 @@ import type {
   CandidateSessionOut, CandidateSessionCreateRequest, CandidateVersionOut,
   CandidatePromotionOut,
   BootstrapStatusOut,
+  KnowledgeArea, HandoffOriginKind, HandoffPriority, HandoffStatus,
+  QuestionHandoffListOut, QuestionHandoffOut, QuestionHandoffEvidenceRef,
 } from "./types";
 
 export function sysKey(base: string, ...extra: unknown[]) {
@@ -777,15 +789,108 @@ export function useCreateInterviewQa(sessionId: number | null) {
 export function useAnswerInterviewQa(sessionId: number | null) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ qaId, answer_text, actor, answer_unknown }: { qaId: number; answer_text: string; actor: string; answer_unknown?: boolean }) =>
+    mutationFn: ({
+      qaId, answer_text, actor, answer_unknown, handoff_id,
+    }: {
+      qaId: number; answer_text: string; actor: string; answer_unknown?: boolean;
+      // Issue #291: set only when this answer is the original developer's
+      // explicit confirmation of a returned handoff's assignee answer.
+      handoff_id?: number;
+    }) =>
       api.post<InterviewQaAnswerOut>(
         `/interview/sessions/${sessionId}/qa/${qaId}/answer`,
-        { answer_text, actor, answer_unknown: answer_unknown ?? false },
+        { answer_text, actor, answer_unknown: answer_unknown ?? false, handoff_id },
       ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] });
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+      // Issue #291: confirming a handoff's answer changes handoff state too.
+      qc.invalidateQueries({ queryKey: [...sysKey("questionHandoffs"), sessionId] });
+      // Issue #288: the server enqueues an automatic refresh right after
+      // this answer commits; refetch its status so the chip updates
+      // promptly instead of waiting for the next poll tick.
+      _invalidateAfterAnswerBatch(qc, sessionId);
     },
+  });
+}
+
+// --- Answerable knowledge areas / handoff (Issue #291) ------------------------
+
+export function useUpdateAnswerableAreas(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (areas: KnowledgeArea[]) =>
+      api.put<InterviewSessionOut>(`/interview/sessions/${sessionId}/answerable-areas`, { areas }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+      qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
+      // Area filtering changes which questions are askable.
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] });
+    },
+  });
+}
+
+export function useQuestionHandoffs(sessionId: number | null, status?: HandoffStatus) {
+  return useQuery({
+    queryKey: [...sysKey("questionHandoffs"), sessionId, status ?? "all"],
+    queryFn: () => api.get<QuestionHandoffListOut>(
+      `/interview/sessions/${sessionId}/handoffs${status ? `?status=${status}` : ""}`,
+    ),
+    enabled: !!sessionId && !!getSystemId(),
+  });
+}
+
+function _invalidateHandoffs(qc: ReturnType<typeof useQueryClient>, sessionId: number | null) {
+  qc.invalidateQueries({ queryKey: [...sysKey("questionHandoffs"), sessionId] });
+  // A handoff creation/transition can also touch the origin qa/alignment row
+  // (handoff_id link, or alignment_item.status='held').
+  qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] });
+  qc.invalidateQueries({ queryKey: [...sysKey("alignment"), sessionId] });
+  qc.invalidateQueries({ queryKey: [...sysKey("reviewQueue"), sessionId] });
+}
+
+export function useCreateQuestionHandoff(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: {
+      origin_kind: HandoffOriginKind;
+      origin_id: number;
+      assignee: string;
+      background: string;
+      needed_decision: string;
+      evidence?: QuestionHandoffEvidenceRef[];
+      due_note?: string;
+      priority?: HandoffPriority;
+      created_by?: string;
+    }) => api.post<QuestionHandoffOut>(`/interview/sessions/${sessionId}/handoffs`, data),
+    onSuccess: () => _invalidateHandoffs(qc, sessionId),
+  });
+}
+
+export function useAnswerQuestionHandoff(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ handoffId, answer_text, answered_by }: { handoffId: number; answer_text: string; answered_by: string }) =>
+      api.post<QuestionHandoffOut>(`/interview/handoffs/${handoffId}/answer`, { answer_text, answered_by }),
+    onSuccess: () => _invalidateHandoffs(qc, sessionId),
+  });
+}
+
+export function useReturnQuestionHandoff(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ handoffId }: { handoffId: number }) =>
+      api.post<QuestionHandoffOut>(`/interview/handoffs/${handoffId}/return`),
+    onSuccess: () => _invalidateHandoffs(qc, sessionId),
+  });
+}
+
+export function useCancelQuestionHandoff(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ handoffId }: { handoffId: number }) =>
+      api.post<QuestionHandoffOut>(`/interview/handoffs/${handoffId}/cancel`),
+    onSuccess: () => _invalidateHandoffs(qc, sessionId),
   });
 }
 
@@ -804,6 +909,414 @@ export function useResumeInterviewQa(sessionId: number | null) {
     mutationFn: ({ qaId, actor }: { qaId: number; actor: string }) =>
       api.post<InterviewQaOut>(`/interview/sessions/${sessionId}/qa/${qaId}/resume`, { actor }),
     onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] }),
+  });
+}
+
+// --- Intent Brief (Issue #284) ------------------------------------------------
+
+export function useInterviewIntentList(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("interviewIntent"), sessionId],
+    queryFn: () => api.get<InterviewIntentListOut>(`/interview/sessions/${sessionId}/intent`),
+    enabled: !!sessionId && !!getSystemId(),
+  });
+}
+
+export function useCreateInterviewIntentItem(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: {
+      field: InterviewIntentField;
+      value_text: string;
+      status?: InterviewIntentUserStatus;
+    }) => api.post<InterviewIntentItemOut>(`/interview/sessions/${sessionId}/intent`, data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewIntent"), sessionId] }),
+  });
+}
+
+export function useConfirmInterviewIntentItem(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ itemId }: { itemId: number }) =>
+      api.post<InterviewIntentItemOut>(`/interview/intent/${itemId}/confirm`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewIntent"), sessionId] });
+      // Issue #288: see useAnswerInterviewQa's comment above.
+      _invalidateAfterAnswerBatch(qc, sessionId);
+    },
+  });
+}
+
+export function useCorrectInterviewIntentItem(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ itemId, value_text }: { itemId: number; value_text: string }) =>
+      api.post<InterviewIntentItemOut>(`/interview/intent/${itemId}/correct`, { value_text }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewIntent"), sessionId] });
+      _invalidateAfterAnswerBatch(qc, sessionId);
+    },
+  });
+}
+
+export function useDeclineInterviewIntentItem(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ itemId }: { itemId: number }) =>
+      api.post<InterviewIntentItemOut>(`/interview/intent/${itemId}/decline`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewIntent"), sessionId] });
+      _invalidateAfterAnswerBatch(qc, sessionId);
+    },
+  });
+}
+
+export function useProposeInterviewIntentItems(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      api.post<InterviewIntentItemOut[]>(`/interview/sessions/${sessionId}/intent/propose`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewIntent"), sessionId] }),
+  });
+}
+
+// --- Inquiry lifecycle (Issue #285) --------------------------------------
+
+export function useInterviewInquiryList(sessionId: number | null, status?: string) {
+  return useQuery({
+    queryKey: [...sysKey("interviewInquiries"), sessionId, status ?? "all"],
+    queryFn: () => api.get<InterviewInquiryListOut>(
+      `/interview/sessions/${sessionId}/inquiries${status ? `?status=${status}` : ""}`,
+    ),
+    enabled: !!sessionId && !!getSystemId(),
+  });
+}
+
+export function useInterviewInquiryDetail(inquiryId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("interviewInquiry"), inquiryId],
+    queryFn: () => api.get<InterviewInquiryDetailOut>(`/interview/inquiries/${inquiryId}`),
+    enabled: !!inquiryId && !!getSystemId(),
+  });
+}
+
+// Refresh/resume (Issue #285): on page load / any list refetch, re-attach a
+// still-active (open or held) Inquiry to its origin card by
+// `${origin_kind}:${origin_id}` so a reload never "forgets" an in-progress
+// Inquiry — the server already persists everything needed
+// (GET /interview/inquiries/{id}); this just re-derives which origin each
+// active Inquiry belongs to from the existing list endpoint. 'open' is
+// preferred over 'held' for the same origin, then the most recently created
+// one, though in practice a single origin has at most one active Inquiry at
+// a time.
+export function activeInquiryByOrigin(
+  items: InterviewInquiryOut[],
+): Map<string, InterviewInquiryOut> {
+  const map = new Map<string, InterviewInquiryOut>();
+  for (const item of items) {
+    if (item.status !== "open" && item.status !== "held") continue;
+    const key = `${item.origin_kind}:${item.origin_id}`;
+    const current = map.get(key);
+    if (!current) {
+      map.set(key, item);
+      continue;
+    }
+    const itemBetter = (current.status !== "open" && item.status === "open") || item.id > current.id;
+    if (itemBetter) map.set(key, item);
+  }
+  return map;
+}
+
+export function useActiveInquiriesByOrigin(sessionId: number | null) {
+  const { data } = useInterviewInquiryList(sessionId);
+  return useMemo(() => activeInquiryByOrigin(data?.items ?? []), [data]);
+}
+
+function _invalidateInquiry(qc: ReturnType<typeof useQueryClient>, sessionId: number | null, inquiryId: number) {
+  qc.invalidateQueries({ queryKey: [...sysKey("interviewInquiries"), sessionId] });
+  qc.invalidateQueries({ queryKey: [...sysKey("interviewInquiry"), inquiryId] });
+  // Issue #287: an Inquiry with origin_kind='review_item' mutates the
+  // origin alignment_item's status server-side (open <-> inquiry). The
+  // mutation payload/response here doesn't always carry origin_kind, so
+  // invalidate the alignment queries unconditionally -- harmless extra
+  // refetch when the origin was qa/intent instead.
+  qc.invalidateQueries({ queryKey: [...sysKey("alignment"), sessionId] });
+  qc.invalidateQueries({ queryKey: [...sysKey("reviewQueue"), sessionId] });
+}
+
+export function useCreateInterviewInquiry(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: {
+      origin_kind: InterviewInquiryOriginKind;
+      origin_id: number;
+      question_text: string;
+      held_draft?: string;
+    }) => api.post<InterviewInquiryDetailOut>(`/interview/sessions/${sessionId}/inquiries`, data),
+    onSuccess: result => _invalidateInquiry(qc, sessionId, result.inquiry.id),
+  });
+}
+
+export function useSendInterviewInquiryMessage(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ inquiryId, content }: { inquiryId: number; content: string }) =>
+      api.post<InterviewInquiryDetailOut>(`/interview/inquiries/${inquiryId}/message`, { content }),
+    onSuccess: (_result, { inquiryId }) => _invalidateInquiry(qc, sessionId, inquiryId),
+  });
+}
+
+export function useResolveInterviewInquiry(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ inquiryId }: { inquiryId: number }) =>
+      api.post<InterviewInquiryOut>(`/interview/inquiries/${inquiryId}/resolve`),
+    onSuccess: (_result, { inquiryId }) => _invalidateInquiry(qc, sessionId, inquiryId),
+  });
+}
+
+export function useMarkInterviewInquiryUnresolved(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ inquiryId, status_reason }: { inquiryId: number; status_reason?: string }) =>
+      api.post<InterviewInquiryOut>(`/interview/inquiries/${inquiryId}/unresolved`, { status_reason }),
+    onSuccess: (_result, { inquiryId }) => _invalidateInquiry(qc, sessionId, inquiryId),
+  });
+}
+
+export function useHoldInterviewInquiry(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ inquiryId }: { inquiryId: number }) =>
+      api.post<InterviewInquiryOut>(`/interview/inquiries/${inquiryId}/hold`),
+    onSuccess: (_result, { inquiryId }) => _invalidateInquiry(qc, sessionId, inquiryId),
+  });
+}
+
+export function useResumeInterviewInquiry(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ inquiryId }: { inquiryId: number }) =>
+      api.post<InterviewInquiryOut>(`/interview/inquiries/${inquiryId}/resume`),
+    onSuccess: (_result, { inquiryId }) => _invalidateInquiry(qc, sessionId, inquiryId),
+  });
+}
+
+export function useCancelInterviewInquiry(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ inquiryId }: { inquiryId: number }) =>
+      api.post<InterviewInquiryOut>(`/interview/inquiries/${inquiryId}/cancel`),
+    onSuccess: (_result, { inquiryId }) => _invalidateInquiry(qc, sessionId, inquiryId),
+  });
+}
+
+export function useReopenInterviewInquiryDoubt(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ inquiryId }: { inquiryId: number }) =>
+      api.post<InterviewInquiryOut>(`/interview/inquiries/${inquiryId}/reopen-doubt`),
+    onSuccess: (_result, { inquiryId }) => _invalidateInquiry(qc, sessionId, inquiryId),
+  });
+}
+
+// --- Alignment Review / Review Queue (Issue #287) -----------------------------
+
+export function useAlignmentList(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("alignment"), sessionId],
+    queryFn: () => api.get<AlignmentListOut>(`/interview/sessions/${sessionId}/alignment`),
+    enabled: !!sessionId && !!getSystemId(),
+  });
+}
+
+export function useReviewQueue(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("reviewQueue"), sessionId],
+    queryFn: () => api.get<AlignmentReviewQueueOut>(`/interview/sessions/${sessionId}/review-queue`),
+    enabled: !!sessionId && !!getSystemId(),
+  });
+}
+
+function _invalidateAlignment(qc: ReturnType<typeof useQueryClient>, sessionId: number | null) {
+  qc.invalidateQueries({ queryKey: [...sysKey("alignment"), sessionId] });
+  qc.invalidateQueries({ queryKey: [...sysKey("reviewQueue"), sessionId] });
+}
+
+export function useBuildAlignment(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post<AlignmentBuildOut>(`/interview/sessions/${sessionId}/alignment/build`),
+    onSuccess: () => _invalidateAlignment(qc, sessionId),
+  });
+}
+
+export function useAnswerAlignmentItem(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ itemId, decision, note }: { itemId: number; decision: AlignmentDecisionAction; note?: string }) =>
+      api.post<AlignmentItemOut>(`/interview/alignment/${itemId}/answer`, { decision, note }),
+    onSuccess: () => {
+      _invalidateAlignment(qc, sessionId);
+      // Issue #288: see useAnswerInterviewQa's comment above.
+      _invalidateAfterAnswerBatch(qc, sessionId);
+    },
+  });
+}
+
+export function useCorrectAlignmentItem(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ itemId, corrected_interpretation }: { itemId: number; corrected_interpretation: string }) =>
+      api.post<AlignmentItemOut>(`/interview/alignment/${itemId}/correct`, { corrected_interpretation }),
+    onSuccess: () => {
+      _invalidateAlignment(qc, sessionId);
+      _invalidateAfterAnswerBatch(qc, sessionId);
+    },
+  });
+}
+
+export function useHoldAlignmentItem(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ itemId }: { itemId: number }) =>
+      api.post<AlignmentItemOut>(`/interview/alignment/${itemId}/hold`),
+    onSuccess: () => _invalidateAlignment(qc, sessionId),
+  });
+}
+
+// --- Observation proposal (Issue #290) ----------------------------------------
+//
+// Approval-gated: creating/approving/rejecting a proposal never starts
+// observation itself (see `policy_pointer` on the approved response).
+
+export function useObservationProposals(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("observationProposals"), sessionId],
+    queryFn: () =>
+      api.get<RuntimeObservationProposalOut[]>(`/interview/sessions/${sessionId}/observation-proposals`),
+    enabled: !!sessionId && !!getSystemId(),
+  });
+}
+
+function _invalidateObservationProposals(qc: ReturnType<typeof useQueryClient>, sessionId: number | null) {
+  qc.invalidateQueries({ queryKey: [...sysKey("observationProposals"), sessionId] });
+}
+
+export function useCreateObservationProposal(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: RuntimeObservationProposalCreate) =>
+      api.post<RuntimeObservationProposalOut>(
+        `/interview/sessions/${sessionId}/observation-proposals`, payload,
+      ),
+    onSuccess: () => _invalidateObservationProposals(qc, sessionId),
+  });
+}
+
+export function useApproveObservationProposal(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ proposalId, decision_by }: { proposalId: number; decision_by?: string }) =>
+      api.post<RuntimeObservationProposalOut>(
+        `/interview/observation-proposals/${proposalId}/approve`, { decision_by },
+      ),
+    onSuccess: () => _invalidateObservationProposals(qc, sessionId),
+  });
+}
+
+export function useRejectObservationProposal(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ proposalId, decision_by }: { proposalId: number; decision_by?: string }) =>
+      api.post<RuntimeObservationProposalOut>(
+        `/interview/observation-proposals/${proposalId}/reject`, { decision_by },
+      ),
+    onSuccess: () => _invalidateObservationProposals(qc, sessionId),
+  });
+}
+
+// --- Automatic refresh after an answer batch (Issue #288) --------------------
+//
+// Polls while a job is pending/updating so the status chip near 現在の理解 /
+// レビューキュー reflects progress without the user reloading; every answer/
+// decision mutation also invalidates this query directly (see
+// `_invalidateAfterAnswerBatch` below) so the chip updates promptly instead
+// of waiting for the next poll tick.
+
+export function useRefreshStatus(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("refreshStatus"), sessionId],
+    queryFn: () => api.get<RefreshStatusOut>(`/interview/sessions/${sessionId}/refresh-status`),
+    enabled: !!sessionId && !!getSystemId(),
+    refetchInterval: (query) => {
+      const status = query.state.data?.latest_job?.status;
+      return status === "pending" || status === "updating" ? 2000 : false;
+    },
+  });
+}
+
+function _invalidateAfterAnswerBatch(qc: ReturnType<typeof useQueryClient>, sessionId: number | null) {
+  qc.invalidateQueries({ queryKey: [...sysKey("refreshStatus"), sessionId] });
+  qc.invalidateQueries({ queryKey: [...sysKey("understandingRevisions"), sessionId] });
+  qc.invalidateQueries({ queryKey: [...sysKey("understandingDiff"), sessionId] });
+  qc.invalidateQueries({ queryKey: [...sysKey("alignment"), sessionId] });
+  qc.invalidateQueries({ queryKey: [...sysKey("reviewQueue"), sessionId] });
+}
+
+export function useRetryRefreshJob(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ jobId }: { jobId: number }) =>
+      api.post<RefreshJobOut>(`/interview/sessions/${sessionId}/refresh-jobs/${jobId}/retry`),
+    onSuccess: () => _invalidateAfterAnswerBatch(qc, sessionId),
+  });
+}
+
+// --- Natural-language bulk correction -> structured change set (Issue #289) --
+
+export function useCreateChangeSet(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (text: string) =>
+      api.post<ChangeSetDetailOut>(`/interview/sessions/${sessionId}/change-sets`, { text }),
+    onSuccess: result => {
+      qc.setQueryData([...sysKey("changeSet"), result.change_set.id], result);
+    },
+  });
+}
+
+export function useChangeSet(changeSetId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("changeSet"), changeSetId],
+    queryFn: () => api.get<ChangeSetDetailOut>(`/interview/change-sets/${changeSetId}`),
+    enabled: !!changeSetId && !!getSystemId(),
+  });
+}
+
+export function useApplyChangeSet(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ changeSetId, itemIds }: { changeSetId: number; itemIds: number[] }) =>
+      api.post<ChangeSetApplyResultOut>(`/interview/change-sets/${changeSetId}/apply`, { item_ids: itemIds }),
+    onSuccess: (result, { changeSetId }) => {
+      qc.invalidateQueries({ queryKey: [...sysKey("changeSet"), changeSetId] });
+      if (result.applied_item_ids.length > 0) {
+        // Issue #288: see useAnswerInterviewQa's comment above.
+        _invalidateAfterAnswerBatch(qc, sessionId);
+      }
+    },
+  });
+}
+
+export function useDiscardChangeSet() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (changeSetId: number) =>
+      api.post<ChangeSetOut>(`/interview/change-sets/${changeSetId}/discard`),
+    onSuccess: (_result, changeSetId) => {
+      qc.invalidateQueries({ queryKey: [...sysKey("changeSet"), changeSetId] });
+    },
   });
 }
 

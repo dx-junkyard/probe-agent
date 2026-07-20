@@ -2038,6 +2038,7 @@ function interviewSession(overrides: Record<string, unknown> = {}) {
     materialization_diff: null,
     materialization_ref: null,
     materialized_at: null,
+    answerable_areas: [],
     created_at: 1,
     updated_at: 2,
     ...overrides,

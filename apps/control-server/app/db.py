@@ -2421,6 +2421,418 @@ CREATE TABLE IF NOT EXISTS system_purpose_confirmations (
 
 CREATE INDEX IF NOT EXISTS idx_system_purpose_confirmations_system
     ON system_purpose_confirmations (system_id, id DESC);
+
+-- Intent Brief (Issue #284): user intent (goal/pain/success_criteria/
+-- priority/constraints/non_goals) kept structurally separate from
+-- implementation-fact understanding. field/status are finite sets validated
+-- by the API, not a DB CHECK constraint (kept consistent with the rest of
+-- this schema). origin='user' rows are authored/confirmed by a human
+-- directly (decision_method='manual'); origin='ai_proposed' rows come from
+-- the reasoning-model propose endpoint (decision_method='reasoning_llm',
+-- status='proposed') and NEVER become 'confirmed' except through the
+-- explicit confirm/correct user endpoints (Principle 2). Corrections never
+-- overwrite: a new row is inserted and the old row's superseded_by_id is set
+-- (revision history), mirroring interview_qa's answer/correction pattern.
+CREATE TABLE IF NOT EXISTS interview_intent_item (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id          INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    field               TEXT NOT NULL,
+    value_text          TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'proposed',
+    origin              TEXT NOT NULL,
+    source_statement    TEXT,
+    decision_method     TEXT NOT NULL DEFAULT 'manual',
+    intelligence_run_id INTEGER,
+    is_mock             INTEGER NOT NULL DEFAULT 0,
+    superseded_by_id    INTEGER,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE SET NULL,
+    FOREIGN KEY (superseded_by_id) REFERENCES interview_intent_item (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_interview_intent_item_session
+    ON interview_intent_item (session_id, superseded_by_id);
+
+CREATE INDEX IF NOT EXISTS idx_interview_intent_item_system
+    ON interview_intent_item (system_id, session_id);
+
+CREATE INDEX IF NOT EXISTS idx_interview_intent_item_field
+    ON interview_intent_item (session_id, field, superseded_by_id);
+
+-- Inquiry lifecycle (Issue #285): when a developer has a doubt about a
+-- confirmation item (a Q&A question, an Intent Brief item, or -- from Issue
+-- #287 onward -- a review item), the original item is held pending and a
+-- separate Inquiry conversation starts. Resolving the Inquiry ("疑問は解消
+-- した") is strictly separate from answering/confirming the origin item:
+-- creating, messaging, and resolving/holding/cancelling an Inquiry never
+-- writes to interview_qa / interview_intent_item. origin_kind/origin_id
+-- identify the item under discussion; 'review_item' is accepted now even
+-- though no reviewing table exists yet (#287 is what starts writing those
+-- rows) so the finite set does not need to change later. held_draft is the
+-- user's unconfirmed answer draft at the moment they opened the Inquiry,
+-- opaque JSON round-tripped back to the dashboard so it can restore the
+-- input when the developer returns to the original item -- the server never
+-- interprets it, and resolving never submits it as an answer (Principle 2:
+-- only an explicit user action on the origin item's own endpoint counts).
+CREATE TABLE IF NOT EXISTS interview_inquiry (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      INTEGER NOT NULL,
+    system_id       INTEGER NOT NULL,
+    origin_kind     TEXT NOT NULL,
+    origin_id       INTEGER NOT NULL,
+    held_draft      TEXT,
+    status          TEXT NOT NULL DEFAULT 'open',
+    status_reason   TEXT,
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL,
+    closed_at       REAL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_interview_inquiry_session
+    ON interview_inquiry (session_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_interview_inquiry_system
+    ON interview_inquiry (system_id, session_id);
+
+-- One row per turn in the Inquiry side-conversation. detail is populated on
+-- assistant messages only: {key_points, evidence, uncertainty} for
+-- progressive disclosure in the UI (the conclusion is the message content
+-- itself, shown first; "根拠を見る" expands detail). intelligence_run_id
+-- links to the intelligence_runs audit row that produced the message
+-- (Principle 7); NULL for user messages and for the fixed-template
+-- "insufficient information" assistant message (never LLM output).
+CREATE TABLE IF NOT EXISTS interview_inquiry_message (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    inquiry_id          INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    role                TEXT NOT NULL,
+    content             TEXT NOT NULL,
+    detail              TEXT,
+    intelligence_run_id INTEGER,
+    is_mock             INTEGER NOT NULL DEFAULT 0,
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (inquiry_id) REFERENCES interview_inquiry (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_interview_inquiry_message_inquiry
+    ON interview_inquiry_message (inquiry_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_interview_inquiry_message_system
+    ON interview_inquiry_message (system_id, inquiry_id);
+
+-- Audit trail for every Inquiry status change (Principle 7): which
+-- unresolved/hold/cancel/resolve/resume/reopen-doubt transition happened,
+-- who did it, and why. Kept as its own append-only table rather than
+-- overloading interview_inquiry.status_reason (which only ever reflects the
+-- *current* status) so a full history survives multiple hold/resume cycles.
+CREATE TABLE IF NOT EXISTS interview_inquiry_transition (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    inquiry_id  INTEGER NOT NULL,
+    system_id   INTEGER NOT NULL,
+    from_status TEXT NOT NULL,
+    to_status   TEXT NOT NULL,
+    actor       TEXT,
+    reason      TEXT,
+    created_at  REAL NOT NULL,
+    FOREIGN KEY (inquiry_id) REFERENCES interview_inquiry (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_interview_inquiry_transition_inquiry
+    ON interview_inquiry_transition (inquiry_id, id);
+
+-- Alignment Review / Review Queue (Issue #287). Contrasts confirmed/proposed
+-- Intent Brief items (interview_intent_item, Issue #284) against the
+-- evidence-backed Current System understanding (the latest
+-- understanding_revision, Issue #136) to produce alignment items. Each item
+-- carries its own claim + evidence (validated against the pinned snapshot,
+-- same discipline as Issue #286's investigation evidence check) and a
+-- DETERMINISTIC review classification (review_category/reason_code):
+-- computed by a data-driven rule table over the reasoning model's finite
+-- output fields (alignment_state/risk_flags/confidence/intent_field) --
+-- classification itself is never a reasoning decision (Principle 6).
+-- user_reason is a fixed Japanese template keyed by reason_code (never LLM
+-- free text). Only review_category IN (must_review, batch_reviewable) ever
+-- surfaces as an action-required card in the Review Queue; the rest are
+-- collapsed/informational.
+--
+-- Rebuild semantics (POST .../alignment/build): a build DELETEs and
+-- recreates only rows with status='open' AND user_decision IS NULL for the
+-- session -- untouched suggestions with no user progress. Any row with a
+-- different status (answered/corrected/held/inquiry) or a recorded
+-- user_decision is never deleted or overwritten by a rebuild, regardless of
+-- how the base revision changed (Principle 2 -- a rebuild must never lose a
+-- human decision).
+--
+-- status='inquiry' (Issue #287's extension to the Issue #285 Inquiry
+-- lifecycle) is set while an Inquiry with origin_kind='review_item' /
+-- origin_id=<this row's id> is open, and reset to 'open' (never 'answered')
+-- when that Inquiry resolves/holds/cancels -- the developer must still
+-- explicitly answer via the item's own endpoint (Principle 2).
+CREATE TABLE IF NOT EXISTS alignment_item (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id              INTEGER NOT NULL,
+    system_id               INTEGER NOT NULL,
+    revision_id             INTEGER,
+    snapshot_id             INTEGER NOT NULL,
+    intent_item_id          INTEGER,
+    intent_summary          TEXT,
+    current_claim           TEXT NOT NULL,
+    current_evidence        TEXT NOT NULL DEFAULT '[]',
+    gap_summary             TEXT,
+    proposed_interpretation TEXT,
+    alignment_state         TEXT NOT NULL,
+    risk_flags              TEXT NOT NULL DEFAULT '[]',
+    confidence              TEXT NOT NULL,
+    review_category         TEXT NOT NULL,
+    reason_code             TEXT NOT NULL,
+    user_reason             TEXT NOT NULL,
+    status                  TEXT NOT NULL DEFAULT 'open',
+    user_decision           TEXT,
+    intelligence_run_id     INTEGER NOT NULL,
+    is_mock                 INTEGER NOT NULL DEFAULT 0,
+    created_at              REAL NOT NULL,
+    updated_at              REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (revision_id) REFERENCES understanding_revision (id) ON DELETE SET NULL,
+    FOREIGN KEY (intent_item_id) REFERENCES interview_intent_item (id) ON DELETE SET NULL,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_alignment_item_session
+    ON alignment_item (session_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_alignment_item_system
+    ON alignment_item (system_id, session_id);
+
+CREATE INDEX IF NOT EXISTS idx_alignment_item_review_queue
+    ON alignment_item (session_id, review_category, status);
+
+-- Automatic refresh job after an answer batch (Issue #288). One row per
+-- refresh attempt; app/interview_refresh.py's request_refresh() dedupes so
+-- at most one 'pending' and one 'updating' row exist per session at a time.
+-- trigger_kind/status are explicit finite sets (Principle 6):
+--   trigger_kind: qa_answer | intent_update | alignment_answer | nl_change_set
+--   status:       pending | updating | updated | failed | stale
+-- base_revision_id is the understanding_revision id at enqueue time (NULL
+-- when the session has none yet); base_answer_marker is the enqueue
+-- timestamp, the dedupe key input. result_revision_id/intelligence_run_id
+-- link the job to the understanding rebuild it produced (Principle 7 audit
+-- lineage: job -> intelligence_run -> understanding_revision is queryable
+-- from these two columns). error carries either a failure message
+-- (status='failed') or a fixed informational note (status='updated' with
+-- nothing new to apply, or status='stale' when superseded by a newer
+-- completed job) -- never LLM free text (Principle 6/7).
+CREATE TABLE IF NOT EXISTS interview_refresh_job (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id          INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    trigger_kind        TEXT NOT NULL,
+    base_revision_id    INTEGER,
+    base_answer_marker  REAL NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'pending',
+    error               TEXT,
+    intelligence_run_id INTEGER,
+    result_revision_id  INTEGER,
+    created_at          REAL NOT NULL,
+    started_at          REAL,
+    finished_at         REAL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (base_revision_id) REFERENCES understanding_revision (id) ON DELETE SET NULL,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE SET NULL,
+    FOREIGN KEY (result_revision_id) REFERENCES understanding_revision (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_interview_refresh_job_session
+    ON interview_refresh_job (session_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_interview_refresh_job_system
+    ON interview_refresh_job (system_id, session_id);
+
+-- Natural-language bulk correction -> structured change set (Issue #289).
+-- A developer's free-text correction covering multiple understanding items
+-- is never applied directly to state (Principle 2/6): it is first turned
+-- into a validated, structured, itemized change set by a reasoning LLM
+-- (app/change_sets.py, prompt_version 'nl-change-set-v1'), previewed with
+-- field-level diffs + deterministic impact, and only the items the
+-- developer explicitly selects are ever applied. One row per submitted
+-- correction text. base_revision_id pins the understanding_revision that
+-- was current when this change set was proposed, so a later staleness
+-- check (has the understanding moved on since?) has something concrete to
+-- compare against for understanding_claim targets.
+CREATE TABLE IF NOT EXISTS understanding_change_set (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id          INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    base_revision_id    INTEGER,
+    source_text         TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'proposed',
+    intelligence_run_id INTEGER NOT NULL,
+    is_mock             INTEGER NOT NULL DEFAULT 0,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (base_revision_id) REFERENCES understanding_revision (id) ON DELETE SET NULL,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_change_set_session
+    ON understanding_change_set (session_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_change_set_system
+    ON understanding_change_set (system_id, session_id);
+
+-- One row per proposed field-level edit within a change set (Issue #289).
+-- target_kind is a finite set (intent_item | understanding_claim) enforced
+-- by construction: only the whitelisted (target_kind, field) pair for each
+-- kind ever resolves (intent_item -> value_text, understanding_claim ->
+-- summary); anything else -- including any attempt to address alignment
+-- user_decision, evidence refs, confirmed-at audit fields, or alignment
+-- classification, none of which are addressable target_kind values at all
+-- -- is rejected with resolution_state='forbidden'. target_ref is JSON
+-- ({"intent_item_id": ...} for intent_item, {"section": ..., "name": ...}
+-- for understanding_claim) resolved deterministically against a finite
+-- candidate list at proposal time (app/change_sets.py), never a reasoning
+-- decision. resolution_state is re-validated (never re-interpreted) every
+-- time it is read or applied: 'resolved' items are re-checked against the
+-- CURRENT target for staleness (understanding moved on since
+-- base_revision_id) and conflict (current value no longer matches the
+-- recorded before_value); 'ambiguous'/'forbidden' are structural facts
+-- fixed at creation and never change. applied/applied_at guard against
+-- double-application when the same item_id is submitted to apply twice.
+CREATE TABLE IF NOT EXISTS understanding_change_item (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    change_set_id       INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    target_kind         TEXT NOT NULL,
+    target_ref          TEXT NOT NULL,
+    field               TEXT NOT NULL,
+    before_value        TEXT,
+    after_value         TEXT NOT NULL,
+    reason              TEXT NOT NULL,
+    resolution_state    TEXT NOT NULL,
+    applied             INTEGER NOT NULL DEFAULT 0,
+    applied_at          REAL,
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (change_set_id) REFERENCES understanding_change_set (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_change_item_set
+    ON understanding_change_item (change_set_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_change_item_system
+    ON understanding_change_item (system_id, change_set_id);
+
+-- Runtime Reality Check <-> Inquiry/Review Queue integration (Issue #290).
+-- A developer's request to START capturing NEW runtime observation for a
+-- component (as opposed to reading facts that already exist) is never
+-- auto-started (Principle 5/8): it is only ever recorded here as a proposal,
+-- and approving it (status='approved') does NOT itself flip any
+-- components.mode policy row -- the response only points back at the
+-- existing PUT /components/{component_id}/policy endpoint. status is a
+-- finite set: proposed | approved | rejected | expired. decision_by/
+-- decision_at are set only by the manual approve/reject endpoints
+-- (decision_method='manual', Principle 2) -- never by investigation or any
+-- other automatic code path.
+CREATE TABLE IF NOT EXISTS runtime_observation_proposal (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id              INTEGER NOT NULL,
+    system_id               INTEGER NOT NULL,
+    origin_inquiry_id       INTEGER,
+    origin_alignment_item_id INTEGER,
+    target_component        TEXT NOT NULL,
+    purpose                 TEXT NOT NULL,
+    expected_cost           TEXT,
+    risk_note               TEXT,
+    retention_note          TEXT,
+    status                  TEXT NOT NULL DEFAULT 'proposed',
+    decision_by             TEXT,
+    decision_at             REAL,
+    created_at              REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (origin_inquiry_id) REFERENCES interview_inquiry (id) ON DELETE SET NULL,
+    FOREIGN KEY (origin_alignment_item_id) REFERENCES alignment_item (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_runtime_observation_proposal_session
+    ON runtime_observation_proposal (session_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_runtime_observation_proposal_system
+    ON runtime_observation_proposal (system_id, session_id);
+
+-- Answerable knowledge areas / handoff (Issue #291). A developer picks which
+-- knowledge areas they can answer NOW (no role inference, Principle 6); the
+-- finite set is product_intent | domain_rule | operations | implementation |
+-- security. Out-of-area questions are never hidden -- they are grouped
+-- separately and can be deferred/held/handed off to another assignee.
+--
+-- origin_kind is 'qa' (interview_qa) or 'review_item' (alignment_item), a
+-- finite set like Issue #285/#287's origin_kind. assignee/created_by/
+-- answered_by are free-text actor names (no org auth system exists yet --
+-- same convention as understanding_confirmed_by/answered_by elsewhere).
+--
+-- Creating a handoff never writes the assignee's eventual answer into the
+-- origin row (interview_qa.answer_text / alignment_item.user_decision):
+-- answer_text/answered_by/answered_at here are the ASSIGNEE's own answer,
+-- held pending the ORIGINAL user's explicit confirmation via /return ->
+-- the origin item's own existing answer endpoint (Principle 2 -- an
+-- assignee's answer is never silently treated as the developer's own).
+--
+-- For origin_kind='qa': the origin interview_qa row's own `status` is left
+-- untouched (do not overload its finite set); instead
+-- interview_qa.handoff_id (additive column below) links to this row, and
+-- the askable-view filter (routes/interview.py) treats a qa row with an
+-- open handoff (status IN pending/answered) as "held via handoff" -- not
+-- re-asked. For origin_kind='review_item': alignment_item.status is set to
+-- 'held' (the same finite value /hold already uses) plus
+-- alignment_item.handoff_id (additive column below) links to this row.
+--
+-- status is a finite set: pending | answered | returned | cancelled.
+-- Transition table (enforced in routes/interview_handoff.py):
+--   pending -> answered | cancelled
+--   answered -> returned
+--   anything else -> 409.
+CREATE TABLE IF NOT EXISTS question_handoff (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id       INTEGER NOT NULL,
+    system_id        INTEGER NOT NULL,
+    origin_kind      TEXT NOT NULL,
+    origin_id        INTEGER NOT NULL,
+    assignee         TEXT NOT NULL,
+    background       TEXT NOT NULL,
+    needed_decision  TEXT NOT NULL,
+    evidence         TEXT,
+    due_note         TEXT,
+    priority         TEXT NOT NULL DEFAULT 'normal',
+    status           TEXT NOT NULL DEFAULT 'pending',
+    answer_text      TEXT,
+    answered_by      TEXT,
+    answered_at      REAL,
+    created_by       TEXT,
+    created_at       REAL NOT NULL,
+    updated_at       REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_question_handoff_session
+    ON question_handoff (session_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_question_handoff_system
+    ON question_handoff (system_id, session_id);
 """
 
 
@@ -2914,6 +3326,28 @@ def init_db() -> None:
             # Issue #135: raw trace-aggregate + metadata-provenance JSON for
             # question_source = 'runtime' rows; existing rows stay NULL.
             conn.execute("ALTER TABLE interview_qa ADD COLUMN runtime_evidence TEXT")
+        if qa_cols and "route_category" not in qa_cols:
+            # Issue #286: Question Router classification, set only via
+            # POST /interview/qa/{qa_id}/route (never automatic for
+            # dialogue-turn questions); existing rows stay NULL (unrouted).
+            conn.execute("ALTER TABLE interview_qa ADD COLUMN route_category TEXT")
+        if qa_cols and "route_run_id" not in qa_cols:
+            conn.execute(
+                "ALTER TABLE interview_qa ADD COLUMN route_run_id INTEGER "
+                "REFERENCES intelligence_runs(id) ON DELETE SET NULL"
+            )
+        intelligence_run_cols = _columns(conn, "intelligence_runs")
+        if intelligence_run_cols and "budget_files_read" not in intelligence_run_cols:
+            # Issue #286: read-only Investigation Agent budget accounting,
+            # populated only for run_type='investigation' rows; every other
+            # run_type (and pre-migration rows) stays NULL.
+            conn.execute("ALTER TABLE intelligence_runs ADD COLUMN budget_files_read INTEGER")
+        if intelligence_run_cols and "budget_chars_read" not in intelligence_run_cols:
+            conn.execute("ALTER TABLE intelligence_runs ADD COLUMN budget_chars_read INTEGER")
+        if intelligence_run_cols and "budget_llm_calls" not in intelligence_run_cols:
+            conn.execute("ALTER TABLE intelligence_runs ADD COLUMN budget_llm_calls INTEGER")
+        if intelligence_run_cols and "budget_elapsed_seconds" not in intelligence_run_cols:
+            conn.execute("ALTER TABLE intelligence_runs ADD COLUMN budget_elapsed_seconds REAL")
         github_conn_cols = _columns(conn, "github_connections")
         if github_conn_cols and "last_synced_at" not in github_conn_cols:
             # Issue #216 sub-task 2: repo manager sync bookkeeping.
@@ -2959,6 +3393,40 @@ def init_db() -> None:
                 "ALTER TABLE system_purpose_confirmations "
                 "ADD COLUMN decided_by_user_id INTEGER "
                 "REFERENCES users(id) ON DELETE SET NULL"
+            )
+        # Issue #290: deterministic Runtime Reality Check match state
+        # (match | mismatch | unobserved | stale), set only when an
+        # alignment item's evidence deterministically maps to a component_id
+        # with runtime trace facts (app/runtime_alignment.py). Existing rows
+        # and items with no deterministic mapping stay NULL -- never guessed.
+        alignment_item_cols = _columns(conn, "alignment_item")
+        if alignment_item_cols and "runtime_check" not in alignment_item_cols:
+            conn.execute("ALTER TABLE alignment_item ADD COLUMN runtime_check TEXT")
+        # Issue #291: answerable knowledge areas + handoff. Existing sessions
+        # default to '[]' (empty = no filtering, matches the pre-#291
+        # behavior of showing every question); existing qa/alignment rows
+        # stay NULL (unrouted / not handed off).
+        session_cols = _columns(conn, "interview_session")
+        if session_cols and "answerable_areas" not in session_cols:
+            conn.execute(
+                "ALTER TABLE interview_session "
+                "ADD COLUMN answerable_areas TEXT NOT NULL DEFAULT '[]'"
+            )
+        qa_cols = _columns(conn, "interview_qa")
+        if qa_cols and "knowledge_area" not in qa_cols:
+            # Issue #291: assigned only by the question router LLM
+            # (app/question_router.py question-router-v2), never inferred
+            # deterministically from title/repository info.
+            conn.execute("ALTER TABLE interview_qa ADD COLUMN knowledge_area TEXT")
+        if qa_cols and "handoff_id" not in qa_cols:
+            conn.execute(
+                "ALTER TABLE interview_qa ADD COLUMN handoff_id INTEGER "
+                "REFERENCES question_handoff(id) ON DELETE SET NULL"
+            )
+        if alignment_item_cols and "handoff_id" not in alignment_item_cols:
+            conn.execute(
+                "ALTER TABLE alignment_item ADD COLUMN handoff_id INTEGER "
+                "REFERENCES question_handoff(id) ON DELETE SET NULL"
             )
         _ensure_legacy_system(conn)
     _validate_startup_environment()

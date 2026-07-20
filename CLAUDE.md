@@ -132,6 +132,32 @@ creating incomplete persistence or execution paths for later phases.
    messages never do. See the Issue #252 section in
    `docs/project-intelligence.md`.
 
+10. Issue #282 — Interview Alignment UX (sub-issues #283-#292): the AI
+    investigates implementation facts first and asks the user only what
+    only the user can decide. Implemented in dependency order:
+    #283 段階表示 (progressive disclosure of 現在の理解), #284 Intent Brief
+    (user intent separated from implementation facts; AI proposals never
+    auto-confirm), #285 Inquiry lifecycle (doubt resolution is strictly
+    separate from answer confirmation; 「疑問は解消した」 never confirms the
+    original item), #286 Question Router (human_only / system_researchable /
+    hybrid) + read-only Investigation Agent on the pinned snapshot with
+    explicit budgets, #287 Alignment Review / Review Queue (deterministic
+    first-match rule table for must_review / batch_reviewable / …; queue
+    ordering is finite-gate based, never scored or LLM-ordered), #288
+    auto-refresh after answer batches (interview_refresh_job; idempotent,
+    stale-safe, answers survive refresh failure), #289 NL batch correction
+    via structured change sets (resolved/ambiguous/conflict/stale/forbidden;
+    preview + selective apply only), #290 Runtime Reality Check integration
+    (finite match/mismatch/unobserved/stale states; new observations only
+    via manual-approval proposals that never touch policies), #291 knowledge
+    areas + handoff (answerable areas chosen by the user, handoff answers
+    never recorded as the original user's answer). Per-issue design notes
+    live in `docs/project-intelligence.md`.
+    **#292 (低リスク提案の一括承認) is intentionally NOT implemented**: its
+    start condition — observed usage data and misclassification/undo cases
+    from individual review — is not yet met. Do not implement it until that
+    data exists.
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,
