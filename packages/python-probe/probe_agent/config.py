@@ -29,6 +29,12 @@ class ProbeConfig:
     ENV_SEND_QUEUE_MAX = "PROBE_SEND_QUEUE_MAX"
     ENV_BREAKER_FAILURE_THRESHOLD = "PROBE_BREAKER_FAILURE_THRESHOLD"
     ENV_BREAKER_RESET_SECONDS = "PROBE_BREAKER_RESET_SECONDS"
+    # Issue #290 Finding 5: optional deployment provenance tags. Unset/blank
+    # means "unknown" (None) -- never fabricated or defaulted, so the
+    # Control Server's Runtime Reality Check provenance stays honest about
+    # what it actually observed.
+    ENV_ENVIRONMENT = "PROBE_ENVIRONMENT"
+    ENV_GIT_SHA = "PROBE_GIT_SHA"
 
     PAYLOAD_MODES = ("metadata", "redacted", "full")
 
@@ -115,3 +121,21 @@ class ProbeConfig:
             return max(0.1, value)
         except ValueError:
             return 30.0
+
+    @classmethod
+    def environment(cls) -> Optional[str]:
+        """Deployment environment tag (e.g. 'production'), or None when unset/blank."""
+        value = os.getenv(cls.ENV_ENVIRONMENT)
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+    @classmethod
+    def git_sha(cls) -> Optional[str]:
+        """Deployed commit sha, or None when unset/blank."""
+        value = os.getenv(cls.ENV_GIT_SHA)
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None

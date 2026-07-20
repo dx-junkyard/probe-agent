@@ -38,6 +38,39 @@ def test_post_trace_and_list(client):
     assert rows[0]["input"] == {"args": ["'hi'"], "kwargs": {}}
 
 
+def test_post_trace_persists_environment_and_git_sha(client):
+    """Issue #290 Finding 5: optional deployment provenance is persisted on
+    ingestion (never fabricated, never required)."""
+    event = _trace(trace_id="t-env")
+    event["environment"] = "production"
+    event["git_sha"] = "abc123"
+    r = client.post("/traces", json=event)
+    assert r.status_code == 201, r.text
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT environment, git_sha FROM traces WHERE trace_id = ?", ("t-env",),
+        ).fetchone()
+    assert row["environment"] == "production"
+    assert row["git_sha"] == "abc123"
+
+
+def test_post_trace_without_environment_or_git_sha_persists_null(client):
+    r = client.post("/traces", json=_trace(trace_id="t-no-env"))
+    assert r.status_code == 201, r.text
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT environment, git_sha FROM traces WHERE trace_id = ?", ("t-no-env",),
+        ).fetchone()
+    assert row["environment"] is None
+    assert row["git_sha"] is None
+
+
 def test_components_lists_aggregates(client):
     client.post("/traces", json=_trace(trace_id="a"))
     client.post("/traces", json=_trace(trace_id="b"))

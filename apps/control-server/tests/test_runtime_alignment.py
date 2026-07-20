@@ -85,30 +85,83 @@ def test_freshness_for_defaults_now_to_current_time():
     assert freshness_for(fact) == "fresh"
 
 
-# --- build_provenance ---------------------------------------------------------
+# --- build_provenance (Issue #290 Finding 5) -----------------------------------
+#
+# environment/snapshot_ref now come ONLY from what was actually observed on
+# traces (RuntimeTraceFactsOut.observed_environment/observed_git_sha) --
+# never invented, and never the caller's pinned snapshot (that was the
+# fabrication bug: Finding 5(b)).
 
 
-def test_build_provenance_environment_always_none():
-    """traces has no environment column -- never invented (Principle 5)."""
-    fact = _fact()
-    prov = build_provenance(fact, snapshot_id=7, git_sha="abc123", now=1_000.0)
+def test_build_provenance_environment_none_when_never_observed():
+    fact = _fact()  # observed_environment defaults to None
+    prov = build_provenance(fact, now=1_000.0)
     assert prov.environment is None
 
 
+def test_build_provenance_environment_from_observed_fact():
+    fact = _fact(observed_environment="production")
+    prov = build_provenance(fact, now=1_000.0)
+    assert prov.environment == "production"
+
+
 def test_build_provenance_shape():
-    fact = _fact(first_observed_at=500.0, last_observed_at=1_000.0)
-    prov = build_provenance(fact, snapshot_id=7, git_sha="abc123", now=1_000.0)
+    fact = _fact(
+        first_observed_at=500.0, last_observed_at=1_000.0,
+        observed_environment="production", observed_git_sha="abc123",
+    )
+    prov = build_provenance(fact, now=1_000.0)
     assert prov.first_observed_at == 500.0
     assert prov.last_observed_at == 1_000.0
-    assert prov.snapshot_ref == RuntimeFactSnapshotRefOut(snapshot_id=7, git_sha="abc123")
+    assert prov.environment == "production"
+    assert prov.snapshot_ref == RuntimeFactSnapshotRefOut(snapshot_id=None, git_sha="abc123")
     assert prov.source == "trace_aggregation"
     assert prov.freshness == "fresh"
 
 
-def test_build_provenance_no_snapshot_ref_when_snapshot_id_omitted():
-    fact = _fact()
+def test_build_provenance_no_snapshot_ref_when_no_sha_observed():
+    fact = _fact(observed_git_sha=None)
     prov = build_provenance(fact, now=1_000.0)
     assert prov.snapshot_ref is None
+
+
+def test_build_provenance_no_snapshot_ref_when_no_sha_observed_even_with_pinned_snapshot(
+    system_and_snapshot,
+):
+    """Fabrication regression (Issue #290 Finding 5(b)): a session may have a
+    pinned snapshot, but if no trace ever reported a git_sha, snapshot_ref
+    must stay None -- it must NEVER silently become the pinned snapshot."""
+    conn, system_id, _snapshot_id = system_and_snapshot
+    fact = _fact(observed_git_sha=None)
+    prov = build_provenance(fact, conn=conn, system_id=system_id, now=1_000.0)
+    assert prov.snapshot_ref is None
+
+
+def test_build_provenance_snapshot_ref_carries_raw_sha_without_conn():
+    """Without conn/system_id, the observed sha is still carried verbatim
+    (never resolved, never dropped)."""
+    fact = _fact(observed_git_sha="abc123")
+    prov = build_provenance(fact, now=1_000.0)
+    assert prov.snapshot_ref == RuntimeFactSnapshotRefOut(snapshot_id=None, git_sha="abc123")
+
+
+def test_build_provenance_snapshot_ref_resolves_on_exact_sha_match(system_and_snapshot):
+    """system_and_snapshot's fixture snapshot has commit_sha='abc123'."""
+    conn, system_id, snapshot_id = system_and_snapshot
+    fact = _fact(observed_git_sha="abc123")
+    prov = build_provenance(fact, conn=conn, system_id=system_id, now=1_000.0)
+    assert prov.snapshot_ref == RuntimeFactSnapshotRefOut(snapshot_id=snapshot_id, git_sha="abc123")
+
+
+def test_build_provenance_snapshot_ref_keeps_raw_sha_when_unresolved(system_and_snapshot):
+    """An observed sha with no matching repository_snapshots row still keeps
+    the raw sha; snapshot_id stays None (never guessed)."""
+    conn, system_id, _snapshot_id = system_and_snapshot
+    fact = _fact(observed_git_sha="does-not-match-anything")
+    prov = build_provenance(fact, conn=conn, system_id=system_id, now=1_000.0)
+    assert prov.snapshot_ref == RuntimeFactSnapshotRefOut(
+        snapshot_id=None, git_sha="does-not-match-anything",
+    )
 
 
 def test_build_provenance_unobserved_when_no_traces():

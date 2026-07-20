@@ -80,6 +80,12 @@ class TraceEvent(BaseModel):
     replayability: Optional[Replayability] = None
     replay_reasons: Optional[List[ReplayReason]] = None
     sdk_transport: Optional[SDKTransportSummary] = None
+    # Issue #290 Finding 5: optional deployment provenance reported by the
+    # SDK (PROBE_ENVIRONMENT / PROBE_GIT_SHA). Both additive/backward
+    # compatible; None on every trace predating this capability. Feeds
+    # app/runtime_reality.py's provenance envelope -- never fabricated here.
+    environment: Optional[str] = None
+    git_sha: Optional[str] = None
 
 
 class ProjectionOut(BaseModel):
@@ -519,6 +525,11 @@ IntelligenceRunType = Literal[
     # Issue #286: read-only Investigation Agent research over the pinned
     # snapshot, budget-bounded, for system_researchable/hybrid questions.
     "investigation",
+    # Issue #290 Finding 5 (Part 2): semantic match/mismatch judge over
+    # alignment items whose deterministic runtime baseline is 'match'
+    # (app/runtime_match_judge.py). Never runs for stale/unobserved/
+    # environment-mismatch items -- those keep their deterministic value.
+    "runtime_match",
 ]
 DecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
 # How a single hierarchy claim was produced. Kept distinct from the audit
@@ -2894,6 +2905,35 @@ class InterviewQaAnswerRequest(BaseModel):
         return self
 
 
+class InterviewQaInvestigationEvidenceOut(BaseModel):
+    path: str
+    start_line: int
+    end_line: int
+    summary: str = ""
+
+
+class InterviewQaInvestigationOut(BaseModel):
+    """A persisted Investigation Agent result for a normal-flow question.
+
+    Issue #286 review fix (Finding 1): populated by
+    ``POST /interview/sessions/{session_id}/qa/route-and-investigate`` from
+    the same ``InvestigationResult`` shape the Inquiry flow already composes
+    (``app/investigation_agent.py``). Never written by anything else --
+    answering/correcting a question never fabricates or edits this field,
+    and this field itself never confirms an answer (#286/#284: an AI
+    proposal/finding never auto-confirms).
+    """
+
+    run_id: int
+    status: str  # completed | unresolved
+    conclusion: str = ""
+    key_points: List[str] = Field(default_factory=list)
+    evidence: List[InterviewQaInvestigationEvidenceOut] = Field(default_factory=list)
+    uncertainty: str = ""
+    confidence: str = "uncertain"
+    decision_question: Optional[str] = None
+
+
 class InterviewQaOut(BaseModel):
     id: int
     session_id: int
@@ -2928,6 +2968,11 @@ class InterviewQaOut(BaseModel):
     # (question_handoff.id). The origin row's own `status` is left
     # untouched by a handoff (Principle 2/6 -- see db.py's table docstring).
     handoff_id: Optional[int] = None
+    # Issue #286 review fix (Finding 1): the Investigation Agent result for
+    # this question, populated only via the batch route-and-investigate
+    # endpoint. None until investigated (or for human_only/failed runs,
+    # which never populate it -- see the endpoint docstring).
+    investigation: Optional[InterviewQaInvestigationOut] = None
 
 
 class InterviewQaAnswerOut(BaseModel):
@@ -2946,6 +2991,41 @@ class InterviewQaListOut(BaseModel):
     open_count: int = 0
     high_priority_open_count: int = 0
     answers_revised_at: Optional[float] = None
+
+
+# --- Batch route-and-investigate (Issue #286 review fix, Finding 1) ----------
+#
+# Wires Question Router / Investigation Agent into the NORMAL Q&A flow (they
+# were previously reachable only inside the Inquiry side-conversation and via
+# the single-question POST .../qa/{qa_id}/route, which never investigates).
+# This never writes answer_text/status/answered_by -- investigation is a
+# finding to review, never an auto-confirmation (Principle 2/7; #286 AC).
+
+
+class InterviewQaRouteInvestigateItemOut(BaseModel):
+    qa_id: int
+    route_category: Optional[str] = None
+    knowledge_area: Optional[KnowledgeArea] = None
+    # completed | unresolved | failed | None (not attempted this call, e.g.
+    # human_only or a route failure that left the question unrouted).
+    investigation_status: Optional[str] = None
+    error: Optional[str] = None
+
+
+class InterviewQaRouteInvestigateCountsOut(BaseModel):
+    routed: int = 0
+    investigated: int = 0
+    failed: int = 0
+    skipped_cap: int = 0
+
+
+class InterviewQaRouteInvestigateBatchOut(BaseModel):
+    session_id: int
+    system_id: int
+    results: List[InterviewQaRouteInvestigateItemOut] = Field(default_factory=list)
+    counts: InterviewQaRouteInvestigateCountsOut = Field(
+        default_factory=InterviewQaRouteInvestigateCountsOut
+    )
 
 
 # --- Intent Brief (Issue #284) ------------------------------------------------
@@ -3507,6 +3587,14 @@ class RuntimeTraceFactsOut(BaseModel):
     first_observed_at: Optional[float] = None
     last_observed_at: Optional[float] = None
     has_traces: bool = False
+    # Issue #290 Finding 5: the most recent non-empty traces.environment /
+    # traces.git_sha value observed for this component in the aggregation
+    # window (deterministic "latest by timestamp" pick — never a semantic
+    # choice). None when no trace in the window carried the field, which is
+    # the honest "unknown" signal build_provenance() relies on instead of
+    # inventing a value from the caller's pinned snapshot.
+    observed_environment: Optional[str] = None
+    observed_git_sha: Optional[str] = None
 
 
 # --- Runtime fact provenance / match state (Issue #290) ----------------------
@@ -3514,20 +3602,28 @@ class RuntimeTraceFactsOut(BaseModel):
 # Wraps RuntimeTraceFactsOut with WHERE the facts came from and HOW current
 # they are, so a fact is never silently presented as current/authoritative
 # once it has gone stale (Principle 5 stale guard). ``environment`` is only
-# ever populated from actual trace metadata (never invented) -- the current
-# ``traces`` schema has no environment column, so it is always null today;
-# the field exists so a future trace-tagging capability does not need a
-# schema-incompatible follow-up. ``freshness`` and ``runtime_check`` are both
-# finite sets (Principle 6): freshness is a pure function of
-# RUNTIME_FACT_FRESH_SECONDS vs last_observed_at (app/runtime_reality.py);
-# runtime_check is app/runtime_alignment.py's compare_claim_to_runtime result.
-# NOTE: RuntimeFactFreshness/RuntimeCheckState themselves are defined earlier
-# in this module (just above the Alignment Review section) because
+# ever populated from actual trace metadata (``RuntimeTraceFactsOut.
+# observed_environment``, Issue #290 Finding 5's SDK-reported
+# PROBE_ENVIRONMENT) -- never invented, and never the caller's pinned
+# snapshot or expected environment. ``snapshot_ref`` follows the same rule:
+# it is derived only from ``observed_git_sha`` (an actually-observed trace
+# tag, resolved against ``repository_snapshots`` by exact commit-sha match
+# when possible), never from the analysis session's pinned snapshot --
+# fabricating it from the pinned snapshot was Finding 5(b) of the Issue
+# #290 review. ``freshness`` and ``runtime_check`` are both finite sets
+# (Principle 6): freshness is a pure function of RUNTIME_FACT_FRESH_SECONDS
+# vs last_observed_at (app/runtime_reality.py); runtime_check is
+# app/runtime_alignment.py's compare_claim_to_runtime result. NOTE:
+# RuntimeFactFreshness/RuntimeCheckState themselves are defined earlier in
+# this module (just above the Alignment Review section) because
 # AlignmentItemOut needs RuntimeCheckState.
 
 
 class RuntimeFactSnapshotRefOut(BaseModel):
-    snapshot_id: int
+    # None when the observed git_sha does not match any known
+    # repository_snapshots row for the System (Issue #290 Finding 5) -- the
+    # raw sha is still carried in git_sha even when it cannot be resolved.
+    snapshot_id: Optional[int] = None
     git_sha: Optional[str] = None
 
 

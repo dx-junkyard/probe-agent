@@ -62,6 +62,7 @@ from ..db import get_conn
 from ..interview_context import build_interview_context
 from ..interview_language import interview_message, resolve_message_language
 from ..inquiry_answering import InquiryAnswerResult, generate_inquiry_answer
+from ..investigation_persistence import persist_investigation_run, persist_route_run
 from ..llm import LLMConfig, LLMError, create_llm_client
 from ..models import (
     InterviewInquiryCreate,
@@ -248,72 +249,6 @@ class _AnswerOutcome:
     error: Optional[str]
 
 
-def _persist_route_run(conn, *, system_id: int, snapshot_id: int, route, now: float, completed_at: float) -> int:
-    """Persist the Question Router sub-run (Issue #286) as its own audit row."""
-    cur = conn.execute(
-        """
-        INSERT INTO intelligence_runs
-            (system_id, snapshot_id, run_type, provider, model,
-             prompt_version, schema_version, decision_method, status,
-             error_details, is_mock, started_at, completed_at)
-        VALUES (?, ?, 'question_route', ?, ?, ?, ?, 'reasoning_llm', ?, ?, ?, ?, ?)
-        """,
-        (
-            system_id, snapshot_id, route.provider, route.model,
-            route.prompt_version, route.schema_version,
-            "failed" if route.error else "completed", route.error,
-            1 if route.is_mock else 0, now, completed_at,
-        ),
-    )
-    return cur.lastrowid
-
-
-def _persist_investigation_run(
-    conn, *, system_id: int, snapshot_id: int, investigation, now: float, completed_at: float,
-) -> int:
-    """Persist the Investigation Agent sub-run + its evidence rows (Issue #286).
-
-    Every snippet actually read from the pinned snapshot is recorded here,
-    regardless of whether the final answer cited it -- mirroring the
-    interview dialogue's pass-1 evidence-audit pattern (Issue #137). Budget
-    usage (files/chars/llm-calls/elapsed) is recorded on the run row itself
-    for auditability.
-    """
-    cur = conn.execute(
-        """
-        INSERT INTO intelligence_runs
-            (system_id, snapshot_id, run_type, provider, model,
-             prompt_version, schema_version, decision_method, status,
-             error_details, is_mock, started_at, completed_at,
-             budget_files_read, budget_chars_read, budget_llm_calls,
-             budget_elapsed_seconds)
-        VALUES (?, ?, 'investigation', ?, ?, ?, ?, 'reasoning_llm', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            system_id, snapshot_id, investigation.provider, investigation.model,
-            investigation.prompt_version, investigation.schema_version,
-            "failed" if investigation.error else "completed", investigation.error,
-            1 if investigation.is_mock else 0, now, completed_at,
-            investigation.files_read, investigation.chars_read, investigation.llm_calls,
-            investigation.elapsed_seconds,
-        ),
-    )
-    run_id = cur.lastrowid
-    for snippet in investigation.read_snippets:
-        conn.execute(
-            """INSERT INTO intelligence_run_evidence
-                (system_id, intelligence_run_id, path, start_line,
-                 end_line, char_count, truncated, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                system_id, run_id, snippet.path, snippet.start_line,
-                snippet.end_line, snippet.char_count,
-                1 if snippet.truncated else 0, completed_at,
-            ),
-        )
-    return run_id
-
-
 def _generate_and_store_answer(
     conn,
     *,
@@ -374,12 +309,12 @@ def _generate_and_store_answer(
     completed_at = time.time()
 
     if result.route is not None:
-        _persist_route_run(
+        persist_route_run(
             conn, system_id=system_id, snapshot_id=snapshot_id, route=result.route,
             now=now, completed_at=completed_at,
         )
     if result.investigation is not None:
-        _persist_investigation_run(
+        persist_investigation_run(
             conn, system_id=system_id, snapshot_id=snapshot_id,
             investigation=result.investigation, now=now, completed_at=completed_at,
         )

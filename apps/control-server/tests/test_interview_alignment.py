@@ -890,7 +890,7 @@ def _insert_code_symbol(system_id, snapshot_id, *, path, start_line, end_line, c
         )
 
 
-def _insert_trace(system_id, component_id, *, timestamp, error=None):
+def _insert_trace(system_id, component_id, *, timestamp, error=None, environment=None, git_sha=None):
     from app.db import get_conn
     import uuid
 
@@ -898,13 +898,46 @@ def _insert_trace(system_id, component_id, *, timestamp, error=None):
         conn.execute(
             """INSERT INTO traces
                 (system_id, trace_id, component_id, mode, input_json, output_text, error,
-                 duration_ms, timestamp)
-            VALUES (?, ?, ?, 'trace', '{}', 'ok', ?, 5.0, ?)""",
-            (system_id, str(uuid.uuid4()), component_id, error, timestamp),
+                 duration_ms, timestamp, environment, git_sha)
+            VALUES (?, ?, ?, 'trace', '{}', 'ok', ?, 5.0, ?, ?, ?)""",
+            (system_id, str(uuid.uuid4()), component_id, error, timestamp, environment, git_sha),
         )
 
 
+def _stub_runtime_match_judge(monkeypatch, *, verdicts=None, error=None, is_mock=False):
+    """Stub app/runtime_match_judge.judge_runtime_match as imported into
+    routes/interview_alignment.py, mirroring _stub_build's pattern.
+
+    ``verdicts`` maps the caller-assigned item ``index`` (position among the
+    items actually offered to the judge, i.e. only baseline-'match' items)
+    to a runtime_check ("match"/"mismatch"); items not present default to
+    "match". Pass ``error=`` to simulate a judge failure instead.
+    """
+    from app.routes import interview_alignment as alignment_routes
+    from app.runtime_match_judge import RuntimeMatchJudgeItemResult, RuntimeMatchJudgeResult
+
+    def fake_judge_runtime_match(client, config, items, *, language):
+        if error is not None:
+            return RuntimeMatchJudgeResult(
+                provider="anthropic", model="claude-sonnet-4-5", is_mock=False, error=error,
+            )
+        results = [
+            RuntimeMatchJudgeItemResult(
+                index=it.index, runtime_check=(verdicts or {}).get(it.index, "match"),
+            )
+            for it in items
+        ]
+        return RuntimeMatchJudgeResult(
+            provider="anthropic", model="claude-sonnet-4-5", is_mock=is_mock, items=results,
+        )
+
+    monkeypatch.setattr(alignment_routes, "judge_runtime_match", fake_judge_runtime_match)
+
+
 def test_build_sets_runtime_check_match_when_fresh_traces_exist(admin_client, tmp_path, monkeypatch):
+    """Deterministic baseline is 'match' (fresh, no environment conflict);
+    the Runtime Match Judge (Issue #290 Finding 5 Part 2) agrees, so the
+    persisted runtime_check stays 'match'."""
     token, system_id, snapshot_id = _setup(admin_client, tmp_path)
     headers = _headers(token, system_id)
     session_id = _create_session(admin_client, headers, snapshot_id)
@@ -915,6 +948,7 @@ def test_build_sets_runtime_check_match_when_fresh_traces_exist(admin_client, tm
     )
     _insert_trace(system_id, "src_a_fn", timestamp=time.time())
 
+    _stub_runtime_match_judge(monkeypatch)
     _stub_build(monkeypatch, items=[_proposal_item()])
     r = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers)
     assert r.status_code == 200, r.text
@@ -973,13 +1007,27 @@ def test_build_leaves_runtime_check_none_when_no_deterministic_component_mapping
 
 
 def test_build_static_vs_runtime_mismatch_forces_must_review(admin_client, tmp_path, monkeypatch):
-    """End-to-end through the real build pipeline: evidence maps to a
-    component deterministically, the fact/provenance's environment differs
-    from the System's declared environment (the one deterministic mismatch
-    signal, see app/runtime_alignment.py), and the resulting item lands in
-    must_review with reason_code=runtime_mismatch -- an aligned/confirmed
-    state that would otherwise be no_review_required."""
-    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    """End-to-end through the real build pipeline with REAL trace data
+    (Issue #290 Finding 5(a) regression -- previously only reachable by
+    monkeypatching build_provenance's output, since traces carried no
+    environment column): evidence maps to a component deterministically, a
+    real trace reports environment='staging' while the System declares
+    environment='production' (the one deterministic mismatch signal, see
+    app/runtime_alignment.py), and the resulting item lands in must_review
+    with reason_code=runtime_mismatch -- an aligned/confirmed state that
+    would otherwise be no_review_required. A deterministic env-mismatch
+    baseline is never sent to the Runtime Match Judge (Part 2), so no judge
+    stub is needed here."""
+    token = _login(admin_client)
+    r = admin_client.post(
+        "/systems",
+        json={"name": "System Prod", "environment": "production", "description": "d"},
+        headers=_bearer(token),
+    )
+    assert r.status_code == 201, r.text
+    system_id = r.json()["id"]
+    repo, sha = _init_repo(tmp_path, {"src/a.py": "\n".join(f"line{i}" for i in range(1, 21)) + "\n"})
+    snapshot_id = _insert_snapshot(system_id, repo, sha)
     headers = _headers(token, system_id)
     session_id = _create_session(admin_client, headers, snapshot_id)
     _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
@@ -987,28 +1035,7 @@ def test_build_static_vs_runtime_mismatch_forces_must_review(admin_client, tmp_p
     _insert_code_symbol(
         system_id, snapshot_id, path="src/a.py", start_line=1, end_line=20, component_id="src_a_fn",
     )
-    _insert_trace(system_id, "src_a_fn", timestamp=time.time())
-
-    # The System itself declares environment='test' (see _create_system);
-    # fabricate a differing fact-provenance environment to exercise the
-    # deterministic environment-mismatch branch through the real build path
-    # (today's traces table carries no environment column, so this is the
-    # only way to exercise it end-to-end -- see docs/project-intelligence.md
-    # Issue #290 section).
-    from app.models import RuntimeFactProvenanceOut
-    from app.routes import interview_alignment as alignment_routes
-
-    real_build_provenance = alignment_routes.build_provenance
-
-    def fake_build_provenance(fact, **kwargs):
-        prov = real_build_provenance(fact, **kwargs)
-        return RuntimeFactProvenanceOut(
-            environment="staging", first_observed_at=prov.first_observed_at,
-            last_observed_at=prov.last_observed_at, snapshot_ref=prov.snapshot_ref,
-            source=prov.source, freshness=prov.freshness,
-        )
-
-    monkeypatch.setattr(alignment_routes, "build_provenance", fake_build_provenance)
+    _insert_trace(system_id, "src_a_fn", timestamp=time.time(), environment="staging")
 
     _stub_build(monkeypatch, items=[
         _proposal_item(alignment_state="aligned", confidence="confirmed", risk_flags=[]),
@@ -1046,6 +1073,7 @@ def test_new_traces_update_runtime_check_on_rebuild(admin_client, tmp_path, monk
     # "Observation import": a new trace arrives for the mapped component.
     _insert_trace(system_id, "src_a_fn", timestamp=time.time())
 
+    _stub_runtime_match_judge(monkeypatch)
     _stub_build(monkeypatch, items=[_proposal_item(current_claim="対象クレーム")])
     second = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
     second_item = next(it for it in second["items"] if it["current_claim"] == "対象クレーム")
@@ -1053,6 +1081,116 @@ def test_new_traces_update_runtime_check_on_rebuild(admin_client, tmp_path, monk
     # Revision lineage: the rebuild is a new, independently-audited
     # intelligence_runs row -- never overwriting the first build's record.
     assert second_item["intelligence_run_id"] != first_run_id
+
+
+# --- Runtime Match Judge integration (Issue #290 Finding 5, Part 2) ------------
+
+
+def _latest_run(system_id, run_type):
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM intelligence_runs WHERE system_id = ? AND run_type = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (system_id, run_type),
+        ).fetchone()
+
+
+def test_judge_mismatch_verdict_forces_must_review(admin_client, tmp_path, monkeypatch):
+    """A deterministic 'match' baseline (fresh trace, no environment
+    conflict) is overridden by the judge's semantic 'mismatch' verdict --
+    the item lands in must_review/runtime_mismatch even though nothing
+    structural conflicts."""
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _insert_code_symbol(
+        system_id, snapshot_id, path="src/a.py", start_line=1, end_line=20, component_id="src_a_fn",
+    )
+    _insert_trace(system_id, "src_a_fn", timestamp=time.time())
+
+    _stub_runtime_match_judge(monkeypatch, verdicts={0: "mismatch"})
+    _stub_build(monkeypatch, items=[
+        _proposal_item(alignment_state="aligned", confidence="confirmed", risk_flags=[]),
+    ])
+    r = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers)
+    assert r.status_code == 200, r.text
+    item = r.json()["items"][0]
+    assert item["runtime_check"] == "mismatch"
+    assert item["review_category"] == "must_review"
+    assert item["reason_code"] == "runtime_mismatch"
+
+    run = _latest_run(system_id, "runtime_match")
+    assert run is not None
+    assert run["status"] == "completed"
+    assert run["decision_method"] == "reasoning_llm"
+    assert run["prompt_version"] == "runtime-match-v1"
+    assert run["schema_version"] == "runtime-match-v1"
+
+
+def test_judge_failure_persists_null_runtime_check_but_build_still_succeeds(
+    admin_client, tmp_path, monkeypatch,
+):
+    """A judge failure (LLM error / invalid structured output) must never
+    fall back to the deterministic 'match' baseline -- the item's
+    runtime_check is persisted NULL, a failed 'runtime_match' run is
+    recorded, and the overall build still succeeds (200, not 502) since the
+    Alignment proposal itself succeeded."""
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _insert_code_symbol(
+        system_id, snapshot_id, path="src/a.py", start_line=1, end_line=20, component_id="src_a_fn",
+    )
+    _insert_trace(system_id, "src_a_fn", timestamp=time.time())
+
+    _stub_runtime_match_judge(monkeypatch, error="Failed to parse structured response")
+    _stub_build(monkeypatch, items=[_proposal_item()])
+    r = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers)
+    assert r.status_code == 200, r.text
+    item = r.json()["items"][0]
+    assert item["runtime_check"] is None
+    # A None runtime_check does not itself force must_review -- the
+    # deterministic rule table only reacts to 'mismatch'.
+    assert item["reason_code"] != "runtime_mismatch"
+
+    run = _latest_run(system_id, "runtime_match")
+    assert run is not None
+    assert run["status"] == "failed"
+    assert run["error_details"] == "Failed to parse structured response"
+    assert run["decision_method"] == "reasoning_llm"
+
+
+def test_judge_never_called_for_stale_or_unobserved_items(admin_client, tmp_path, monkeypatch):
+    """Deterministic stale/unobserved baselines are never sent to the judge
+    (no eligible items -> no judge run row at all) and keep their
+    deterministic value verbatim."""
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _insert_code_symbol(
+        system_id, snapshot_id, path="src/a.py", start_line=1, end_line=20, component_id="src_a_fn",
+    )
+    # No traces inserted at all -- baseline is 'unobserved'.
+
+    def _fail_if_called(client, config, items, *, language):
+        raise AssertionError("judge_runtime_match must not be called for an unobserved baseline")
+
+    from app.routes import interview_alignment as alignment_routes
+
+    monkeypatch.setattr(alignment_routes, "judge_runtime_match", _fail_if_called)
+    _stub_build(monkeypatch, items=[_proposal_item()])
+    r = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["items"][0]["runtime_check"] == "unobserved"
+    assert _latest_run(system_id, "runtime_match") is None
 
 
 def test_system_isolation(admin_client, tmp_path, monkeypatch):

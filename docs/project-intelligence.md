@@ -2728,9 +2728,82 @@ Investigation Agent はファイル書き込み・パッチ適用・任意コー
 `POST /interview/qa/{qa_id}/route`(`app/routes/question_router.py`、
 system-scoped)は `interview_qa` の1問を単独でルーティングし、
 `route_category` / `route_run_id`(additive ALTER)に結果を保存する。
-Inquiry 内の自動ルーティングとは完全に独立しており、
 `interview_agent.py` のダイアログターンには一切手を入れていない(スコー
-プを絞る、Issue #286 のブリーフどおり)。
+プを絞る、Issue #286 のブリーフどおり)。当初は Inquiry 内の自動ルーティ
+ングとは完全に独立していたが、後続のレビュー指摘修正(下記「通常の Q&A
+フローへの接続」)で同じ通常フローの一部として、バッチ版のエンドポイン
+トからも(未ルーティングの質問に対して)呼び出されるようになった —
+歴史的経緯として残す。単体エンドポイント自体の挙動(1問だけをルーティ
+ングし、調査は一切行わない)は変わっていない。
+
+### 通常の Q&A フローへの接続(レビュー指摘修正、Finding 1)
+
+Issue #286 実装時点では、Question Router / Investigation Agent は Inquiry
+の会話(上記)からしか自動では呼ばれず、`interview_qa` の通常フローでは
+単体ルーティングエンドポイントが「分類だけして調査しない」ため、実装で
+回答可能な質問がそのままユーザーに丸投げされ、`interview_qa.knowledge_area`
+も通常フローでは常に null のままだった(#291 の対象外グルーピングが弱
+まる)。これを埋めるのが `POST
+/interview/sessions/{session_id}/qa/route-and-investigate`
+(`app/routes/question_router.py`)で、Question Router と Investigation
+Agent を1回のバッチ呼び出しで通常フローに接続する。
+
+- **対象の選定**: 現在行(`superseded_by_id IS NULL AND status = 'open'`)
+  のうち、未ルーティング、または `route_category IN
+  ('system_researchable', 'hybrid')` かつ未調査
+  (`investigation_run_id IS NULL`)の質問を `id` 昇順に最大10件
+  (`MAX_BATCH_QUESTIONS`、決定的な定数)まで処理する。超過分は
+  `counts.skipped_cap` に計上され、次回呼び出しで続きから処理される。
+- **fail-closed はリクエスト全体ではなく質問単位(Principle 6/7)**:
+  設定ゲート(mock クライアント・非 reasoning モデル)だけはバッチ全体
+  の前提なので、呼び出しの最初に1回だけチェックし、失敗時は
+  1行も書き換えずに 502(単体エンドポイントと同じ
+  `question_route_failed` 形状)を返す。個別の質問のルーティング失敗・
+  調査失敗はそれぞれ失敗した `intelligence_runs` 監査行だけを残してその
+  質問を未処理のまま次の質問へ進む — 1問の失敗がバッチ全体を中断しない。
+- **永続化ヘルパーの共有**: `app/investigation_persistence.py`
+  (`persist_route_run` / `persist_investigation_run`)に
+  `routes/interview_inquiry.py` の元実装を抽出し、単体ルーティングエン
+  ドポイント・バッチエンドポイント・Inquiry フローの3箇所が同じ
+  `intelligence_runs` / `intelligence_run_evidence` 書き込みコードを共有
+  する(重複実装しない)。
+- **`interview_qa` への調査結果の永続化(additive)**:
+  `investigation_run_id`(`intelligence_runs` 参照)/
+  `investigation_json`(`{status, conclusion, key_points, evidence,
+  uncertainty, confidence, decision_question}` の JSON、Inquiry の
+  `InvestigationResult` と同じ形)。調査が `status="failed"` の場合は両方
+  とも `NULL` のまま(監査行だけ残る)。回答の訂正(`answer_interview_qa`
+  の correction 経路)は `runtime_evidence` と同様、この2列も新しいリビ
+  ジョン行へ引き継ぐ。
+- **調査は絶対に回答を確定しない**: このエンドポイントは
+  `answer_text`/`status`/`answered_by` を一切書き込まない。調査結果は
+  「レビューする材料」であって「回答」ではない(#286 受け入れ基準
+  「調査完了だけで元のユーザー回答が確定しない」、#284 の「AI 提案は自
+  動確定しない」と同じ原則)。ユーザーは Dashboard の「調査結果を回答欄
+  に転記」ボタンで結論をテキストエリアへコピーできるが、これは送信しな
+  い — 既存の回答エンドポイントを明示的に呼ぶまで何も確定しない。
+- **`models.py`**: `InterviewQaOut.investigation:
+  Optional[InterviewQaInvestigationOut]`(永続化済みの調査結果を
+  `_qa_out` が組み立てる)、`InterviewQaRouteInvestigateBatchOut`
+  (`results: [{qa_id, route_category, knowledge_area,
+  investigation_status, error}]` + `counts: {routed, investigated, failed,
+  skipped_cap}`)を additive に追加。
+
+### Dashboard(バッチ接続)
+
+`pages/interview.tsx` の Q&A パネルヘッダーに「AIに先に調査させる」ボタ
+ン(未回答の質問が1件以上あるときだけ表示、成功時に「分類 n 件・調査 n
+件が完了しました」という日本語トーストを表示)を追加した。各質問カード
+は `route_category` を(`inquiry-panel.tsx` の
+`ROUTE_CATEGORY_LABELS` を再エクスポートして再利用した)同じ日本語ラベ
+ルのバッジで表示し、`investigation` があれば結論を「AIの調査結果: …」
+として強調表示し、`key_points` を箇条書き、`hybrid` なら
+「確認したいこと: …」を強調表示し、「根拠を見る」で evidence/uncertainty
+を折りたたみ表示する(いずれも Inquiry パネルの表示パターンを踏襲)。
+`status === "unresolved"` のときは結論ブロックの代わりに「AIの調査では
+特定できませんでした」という控えめな注記だけを出す。「調査結果を回答欄
+に転記」ボタンは回答用テキストエリアに結論を書き込むだけで、送信は一切
+行わない。raw な enum はどこにも出さない(Issue #266)。
 
 ### テーブル/スキーマ変更(additive)
 
@@ -2743,6 +2816,11 @@ Inquiry 内の自動ルーティングとは完全に独立しており、
   録だったものを今回追加)を追加。
 - `interview_inquiry_message.detail` に `route_category` /
   `decision_question`(どちらも optional、旧行は `null`)を追加。
+- (レビュー指摘修正、Finding 1)`interview_qa`: `investigation_run_id
+  INTEGER NULL REFERENCES intelligence_runs(id) ON DELETE SET NULL` /
+  `investigation_json TEXT NULL`(`runtime_evidence` と同じ JSON カラム
+  の慣習)。バッチ route-and-investigate エンドポイントだけが書き込み、
+  調査失敗時は両方とも `NULL` のまま。
 
 ### UI(`components/system-understanding/inquiry-panel.tsx`)
 
@@ -2766,6 +2844,17 @@ assistant メッセージの先頭行に、`detail.route_category` を日本語�
   持・System 分離。加えて(レビュー指摘修正)`question-router-v3` への
   バンプ、`search_keywords` のパース、`human_only` で強制的に `[]` に
   なること、フィールド省略時に `[]` にデフォルトすること(後方互換)。
+  さらに(Finding 1)バッチエンドポイント
+  `POST /interview/sessions/{id}/qa/route-and-investigate` を追加テスト:
+  未ルーティングの質問をルーティングし `knowledge_area` を永続化するこ
+  と、fake reasoning クライアントで `system_researchable`/`hybrid` を調
+  査し `investigation_json` + budget カラム付きの完了 `investigation`
+  行 + evidence 行を永続化すること、1問のルーティング失敗がバッチを中
+  断しないこと、調査失敗は `investigation_json`/`investigation_run_id`
+  を `NULL` のまま失敗行だけ残すこと、`human_only` は調査されないこと、
+  `answer_text`/`status`/`answered_by` を一切書き換えないこと、10件の
+  上限、System 分離(他 System のセッションは 404・行は無変更)、
+  mock 設定時は 502 かつ1行も変更されないこと。
 - `tests/test_investigation_agent.py`: pin 済み snapshot のみを読むこと
   (未コミット/新規ファイルが結果に一切現れない)、budget 上限の遵守
   (`files_read <= max_files`、文字数予算の枯渇、タイムアウトで
@@ -3366,22 +3455,58 @@ Review(#287)の Review Queue 判定・新規の観測提案フローへ接続す
 だが、「その事実が今なお現在のものと呼べるか(鮮度・有無・環境)」は
 決定的ルールだけで判定する(Principle 6)。
 
+**Finding 5 の修正(レビュー指摘)**: 初期実装は (a) `traces` に
+environment/version 情報が無く `compare_claim_to_runtime` の environment
+mismatch 分岐が実データで到達不能、(b) `build_provenance` がセッション
+の pinned snapshot を `snapshot_ref` として渡していた(トレースを送った
+デプロイが実際にどの snapshot かは分からないのに)、(c) claim テキスト
+が意味的に一切判定されず新鮮なトレースは常に `match` になり
+`runtime_mismatch → must_review` ルールが実データで到達不能、という 3
+つの欠陥を持っていた。以下はその修正後の仕様。
+
+### SDK からの provenance 取得(`PROBE_ENVIRONMENT` / `PROBE_GIT_SHA`)
+
+`packages/python-probe/probe_agent/config.py` に `ENV_ENVIRONMENT`
+(`PROBE_ENVIRONMENT`)/`ENV_GIT_SHA`(`PROBE_GIT_SHA`)を追加。両方とも
+未設定/空文字なら `None`(捏造しない)。設定されている場合のみ
+`decorator.py` が trace ペイロードに `environment`/`git_sha` を追加する
+(read が失敗しても対象関数・trace 送信は壊れない、既存の replay
+capture と同じ best-effort パターン)。`shared/schemas/trace_event.schema.json`
+・`TraceEvent`(server)・`traces` テーブル(`environment TEXT`,
+`git_sha TEXT`、additive `ALTER TABLE`)がこれを additive に受け取る。
+
 ### 出所エンベロープ(`RuntimeFactProvenanceOut`)
 
-`aggregate_component_facts` が返す `RuntimeTraceFactsOut`(既存、
-`first_observed_at` を additive に追加)を、`app/runtime_reality.py` の
-`build_provenance()` が次の形にラップする:
+`aggregate_component_facts` が返す `RuntimeTraceFactsOut` に
+`observed_environment` / `observed_git_sha` を additive に追加: 集計ウィ
+ンドウ内で `environment`/`git_sha` が非 NULL・非空文字列の行のうち
+`timestamp` が最大のものを1件ずつ選ぶ(決定的な「最新観測値」ピック。
+列ごとに1クエリ)。1件も無ければ `None`。
+
+`app/runtime_reality.py` の `build_provenance(fact, *, conn=None,
+system_id=None, now=None)` がこれを次の形にラップする:
 
 ```
 {
-  environment: str | null,       # traces テーブルに environment 列が無いため常に null(捏造しない)
+  environment: str | null,       # fact.observed_environment そのまま(捏造しない)
   first_observed_at: float | null,
   last_observed_at: float | null,
-  snapshot_ref: {snapshot_id, git_sha} | null,
+  snapshot_ref: {snapshot_id: int | null, git_sha} | null,
   source: "trace_aggregation",   # 固定値
   freshness: "fresh" | "stale" | "unobserved",
 }
 ```
+
+`snapshot_ref` は `fact.observed_git_sha` が無ければ常に `null`
+(Finding 5(b) の再発防止 — **セッションの pinned snapshot を絶対に代入
+しない**)。sha が観測されていれば、`conn`/`system_id` が両方渡された時
+だけ `repository_snapshots`(その System)を commit_sha 完全一致で検索
+し、見つかった `id` を `snapshot_id` に入れる。見つからなくても
+`git_sha` は生の観測値のまま保持し(`snapshot_id` は `null`)、`conn`/
+`system_id` を渡さなかった呼び出し元でも同様に `git_sha` だけは保持され
+る。呼び出し元(`routes/interview_alignment.py::run_alignment_build`、
+`investigation_agent.py::_gather_runtime_candidates`)はどちらも
+pinned snapshot_id/commit_sha を渡さなくなった。
 
 `freshness` は `freshness_for()` が決定的に計算する: トレースが1件も
 無ければ `unobserved`、`last_observed_at` が `RUNTIME_FACT_FRESH_SECONDS`
@@ -3400,13 +3525,15 @@ guard)。
   expected_environment=None)` — `match | mismatch | unobserved | stale`
   を返す。`claim`(自由文)は監査上の引数として受け取るだけで一切解析
   しない。判定は `provenance.freshness` のみ(`unobserved`/`stale` は
-  そのまま返す)と、`expected_environment` と `provenance.environment`
-  が両方既知かつ不一致のときの `mismatch`(現行スキーマでは
-  `provenance.environment` が常に null のため到達しないが、将来
-  environment 情報が載る場合のために用意してある。テストは構築した
-  `RuntimeFactProvenanceOut` で直接検証する)だけ。それ以外は `match`。
-  「振る舞いが意味的に一致しているか」の判断は reasoning モデル
-  (Investigation Agent)の仕事で、この関数の仕事ではない。
+  そのまま返す)と、`expected_environment`(呼び出し元が渡す Systemの
+  `environment` 列。空文字は未知として扱い None 同等)と
+  `provenance.environment`(実際にトレースで観測された値)が両方既知
+  かつ不一致のときの `mismatch` だけ。SDK が `PROBE_ENVIRONMENT` を送る
+  ようになったことで、この分岐は今や実データ(構築した
+  `RuntimeFactProvenanceOut` に頼らないエンドツーエンドの trace 挿入)
+  で到達できる。それ以外は `match`。「振る舞いが意味的に一致している
+  か」の判断は下記の Runtime Match Judge(Alignment Review 側)や
+  Investigation Agent の仕事で、この関数の仕事ではない。
 
 ### Investigation Agent への統合(#286 拡張)
 
@@ -3424,7 +3551,11 @@ runtime fact 候補をプロンプトに追加提示する。モデルは
 何と言おうと必ずその値で上書きして永続化する — モデルが古い/未観測の
 事実を `match` と主張することは構造的にできない。ベースラインが
 `match`(=新鮮なデータがある)のときだけ、モデル自身の
-`match`/`mismatch` という意味的判断を採用する。
+`match`/`mismatch` という意味的判断を採用する。この意味的判断は
+Investigation Agent 自身の会話フロー内に限定される(引用として提示され
+るだけで `alignment_item.runtime_check` には反映されない)。Alignment
+Review 側の同種の判断は下記の Runtime Match Judge という別のコード経路
+が担当する。
 
 ### 段階的開示(Progressive disclosure)
 
@@ -3443,8 +3574,9 @@ runtime の生データ・出所情報は一切含めない。`runtime_evidence`
 各 item の検証済み evidence から `resolve_component_for_evidence` で
 `component_id` を解決できたときだけ `aggregate_component_facts` +
 `build_provenance` + `compare_claim_to_runtime`(`expected_environment`
-は Systemの `environment` 列)を呼び、`runtime_check` を決定する。決定
-的マッピングが無ければ `null`(推測しない)。
+は Systemの `environment` 列)を呼び、決定的ベースラインの
+`runtime_check` を決定する。決定的マッピングが無ければ `null`(推測し
+ない)。
 
 `app/alignment.py` の `_RULES`(先勝ちルール表)に、`conflict_detected`
 の直後・`low_confidence` の直前として次を追加:
@@ -3456,6 +3588,41 @@ runtime_check == 'mismatch' -> must_review, runtime_mismatch
 `stale`/`unobserved` はそれ単独では must_review を強制しない。
 `user_reason_for('runtime_mismatch')` の固定文言は
 「コード上の理解と実行時の観測が一致していません」。
+
+### Runtime Match Judge(Finding 5 Part 2、reasoning モデルによる意味判定)
+
+決定的ベースラインは鮮度と環境一致しか見ないため、claim の *内容* が新
+鮮なトレースと意味的に矛盾していても検出できなかった(`runtime_mismatch
+→ must_review` ルールが実データで到達不能という Finding 5(c))。
+`app/runtime_match_judge.py` の `judge_runtime_match(client, config,
+items, *, language)` がこの意味的判定を追加する:
+
+- 対象は決定的ベースラインが **`match`(新鮮・構造的な矛盾なし)の item
+  だけ**。`stale`/`unobserved`/`mismatch`(environment)は絶対に judge
+  に渡さない — stale guard と同じ思想で、モデルはこれらの決定を一切上
+  書きできない(Principle 6)。
+- 1バッチで全 eligible item をまとめて1回だけ呼ぶ。
+  `PROMPT_VERSION`/`SCHEMA_VERSION` は `"runtime-match-v1"`。
+- 構造化出力 `{items: [{index, runtime_check: "match"|"mismatch",
+  note}]}` を厳密検証: 集合外の `runtime_check`、未知/重複/欠落した
+  `index` はどれか1つでもあれば **レスポンス全体を無効**とする
+  (fail-closed、部分採用しない)。
+- mock/非 reasoning モデル・LLM エラー・不正な構造化出力はいずれも
+  `error` を返す。`run_alignment_build` はこのとき対象 item の
+  `runtime_check` を `NULL` として永続化する(**推測せず、決定的な
+  `match` ベースラインへフォールバックもしない**)。
+- `intelligence_runs` に必ず1行記録する(`run_type='runtime_match'`、
+  `decision_method='reasoning_llm'`、成功/失敗どちらも
+  `status`/`error_details`/prompt・schema version/`is_mock` を保存)。
+  eligible item が 0 件のときは LLM 呼び出し自体をスキップし、この行も
+  作らない。
+- judge の `note` は監査目的の一時情報であり、`alignment_item` には永続
+  化しない(決定的事実と reasoning 出力を分離して保存する原則どおり、
+  永続化されるのは finite enum の `runtime_check` だけ)。
+- `run_alignment_build` は各 item の `classify_alignment_item` 呼び出し
+  を judge 実行後まで遅延させる: 決定的ベースラインと judge 判定のどち
+  らが最終的な `runtime_check` になっても、`_RULES` の
+  `runtime_mismatch` ルールが正しく評価される。
 
 ### 観測提案(承認ゲート、新規テーブル `runtime_observation_proposal`)
 
@@ -3500,20 +3667,41 @@ runtime_check == 'mismatch' -> must_review, runtime_mismatch
 - `RUNTIME_FACT_FRESH_SECONDS`(デフォルト `604800` = 7日)— runtime
   fact が `fresh` とみなされる上限秒数。`RUNTIME_REALITY_CHECK_*` と同
   じ正の整数パーサーを使い、不正な値は 422 で fail-closed する。
+- `PROBE_ENVIRONMENT` / `PROBE_GIT_SHA`(SDK、`packages/python-probe`)—
+  デプロイの provenance タグ。両方とも既定は未設定(`None`)で、trace
+  ペイロードに新フィールドは付かない。設定した場合のみ
+  `traces.environment`/`traces.git_sha` として永続化され、
+  `aggregate_component_facts`/`build_provenance` の唯一の入力になる。
 
 ### テスト
 
+- `tests/test_runtime_reality.py` 拡張: `aggregate_component_facts` の
+  `observed_environment`/`observed_git_sha`(最新観測値ピック、空文字/
+  NULL の除外、後続の値なしトレースが以前の観測値を上書きしないこと、
+  System 分離)。
 - `tests/test_runtime_alignment.py`: `freshness_for`/`build_provenance`
   の時刻固定フィクスチャ(fresh/stale/unobserved の境界、環境変数上書
   き)、`compare_claim_to_runtime` の全分岐(unobserved 優先 > stale
   優先 > environment mismatch > match、stale な事実が絶対に `match` に
   ならないこと)、`resolve_component_for_evidence` の一意/曖昧/無マッ
-  チ。
+  チ、`build_provenance` の新シグネチャ(`conn`/`system_id` 省略時は生
+  の sha のみ保持、sha 未観測なら pinned snapshot があっても
+  `snapshot_ref` が絶対に `null` になる捏造防止回帰テスト、commit_sha
+  完全一致での解決/非解決)。
+- `tests/test_runtime_match_judge.py`(新規): `judge_runtime_match` の
+  mock/非 reasoning モデル拒否、LLM エラー、不正 JSON、集合外
+  `runtime_check`、未知/重複/欠落 index のいずれもレスポンス全体を無効
+  にすること、成功バッチの検証済み結果。
 - `tests/test_interview_alignment.py` 拡張: `classify_alignment_item`
   への `runtime_check='mismatch'` が `must_review`/`runtime_mismatch`
   になること(conflict_detected より後・low_confidence より前の優先順
   位を含む)、`run_alignment_build` 経由の統合テスト(evidence を
-  `code_symbols` にマッピングして runtime_check を決定的に付与)。
+  `code_symbols` にマッピングして runtime_check を決定的に付与、
+  environment mismatch は実際に `environment` 付きトレースを INSERT し
+  て到達させる)、Runtime Match Judge の統合(成功バッチの mismatch 判
+  定が must_review に反映される、judge 失敗時は `runtime_check=NULL` +
+  失敗した `runtime_match` 監査行を残しつつ build 自体は成功する、
+  stale/unobserved item は judge に一切送られず監査行も作られないこと)。
 - `tests/test_investigation_agent.py` 拡張: runtime_evidence の
   budget/schema 検証、stale/unobserved の上書きガード、未提示
   `component_id` の引用が破棄されること、`conn` 省略時は従来どおり
@@ -3525,6 +3713,16 @@ runtime_check == 'mismatch' -> must_review, runtime_mismatch
 - 進行的開示: assistant メッセージの `content` に生トレース/出所デー
   タが含まれないこと(`detail.runtime_evidence` にだけ入ること)を
   コンポーネント/ユニットテストで固定。
+- `tests/test_schemas.py` 拡張: `trace_event.schema.json` が
+  `environment`/`git_sha` を受理すること、SDK が実際に組み立てた
+  `PROBE_ENVIRONMENT`/`PROBE_GIT_SHA` 付き payload がスキーマとサーバ
+  モデルの両方を通ること。
+- `tests/test_api.py` 拡張: `POST /traces` が `environment`/`git_sha` を
+  永続化すること(設定時/未設定時の両方)。
+- `packages/python-probe/tests/test_decorator.py` 拡張: 設定時に trace
+  payload へ `environment`/`git_sha` が追加されること、未設定/空文字な
+  ら追加されないこと、読み取り失敗時も対象関数の返り値・trace 送信が
+  壊れないこと。
 
 ## 回答可能領域と担当者引き継ぎ(Issue #291)
 
@@ -3557,6 +3755,15 @@ runtime_check == 'mismatch' -> must_review, runtime_mismatch
   ラー、`null` は正当な「どの領域にも当てはまらない」判定として受理す
   る。タイトルやリポジトリ情報からの決定的推論は行わない(Principle
   6)。未ルーティング(`null`)の質問は絶対に非表示にしない。
+- (レビュー指摘修正、Finding 1)本 issue 実装時点では `knowledge_area`
+  は Inquiry の自動ルーティングと単体ルーティングエンドポイントからしか
+  設定されず、通常の Q&A フローで質問を作成しただけでは null のまま
+  だった。バッチ版の `POST
+  /interview/sessions/{session_id}/qa/route-and-investigate`(「Question
+  Router / Investigation Agent(Issue #286)」節参照)が通常フローにも
+  ルーティングを接続したことで、開発者が明示的にバッチ実行すれば
+  `knowledge_area` が通常フローでも埋まるようになった。それでも自動実
+  行ではなく開発者の明示操作(ボタン押下)が起点である点は変わらない。
 
 ### 決定的な対象外判定
 

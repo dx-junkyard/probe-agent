@@ -97,6 +97,11 @@ CREATE TABLE IF NOT EXISTS traces (
     input_capture_json  TEXT,
     replayability       TEXT,
     replay_reasons_json TEXT,
+    -- Issue #290 Finding 5: optional deployment provenance reported by the
+    -- SDK (PROBE_ENVIRONMENT / PROBE_GIT_SHA). NULL when the caller never
+    -- set the env var; never backfilled or inferred.
+    environment  TEXT,
+    git_sha      TEXT,
     PRIMARY KEY (system_id, trace_id),
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
 );
@@ -3381,6 +3386,16 @@ def init_db() -> None:
             conn.execute("ALTER TABLE traces ADD COLUMN replayability TEXT")
         if "replay_reasons_json" not in trace_cols:
             conn.execute("ALTER TABLE traces ADD COLUMN replay_reasons_json TEXT")
+        # Issue #290 Finding 5: environment/git_sha reported by the SDK
+        # (PROBE_ENVIRONMENT / PROBE_GIT_SHA), so runtime provenance
+        # reflects real deployment metadata instead of always-null /
+        # fabricated-from-the-pinned-snapshot values. Existing rows stay
+        # NULL (no SDK-side signal at the time they were ingested) -- never
+        # backfilled.
+        if "environment" not in trace_cols:
+            conn.execute("ALTER TABLE traces ADD COLUMN environment TEXT")
+        if "git_sha" not in trace_cols:
+            conn.execute("ALTER TABLE traces ADD COLUMN git_sha TEXT")
         purpose_confirmation_cols = _columns(conn, "system_purpose_confirmations")
         if (
             purpose_confirmation_cols
@@ -3446,6 +3461,25 @@ def init_db() -> None:
                 "ALTER TABLE alignment_item "
                 "ADD COLUMN superseded INTEGER NOT NULL DEFAULT 0"
             )
+        # Issue #286 review fix (Finding 1): wires Question Router /
+        # Investigation Agent into the normal Q&A flow (previously only used
+        # inside the Inquiry side-conversation). investigation_json holds the
+        # same {status, conclusion, key_points, evidence, uncertainty,
+        # confidence, decision_question} shape the Inquiry flow already
+        # composes from InvestigationResult; investigation_run_id points at
+        # the 'investigation' intelligence_runs row that produced it. Both
+        # stay NULL until POST .../qa/route-and-investigate successfully
+        # investigates a system_researchable/hybrid question -- a failed
+        # investigation leaves them NULL (audit-only failed run), and
+        # human_only questions never get one at all.
+        qa_cols = _columns(conn, "interview_qa")
+        if qa_cols and "investigation_run_id" not in qa_cols:
+            conn.execute(
+                "ALTER TABLE interview_qa ADD COLUMN investigation_run_id INTEGER "
+                "REFERENCES intelligence_runs(id) ON DELETE SET NULL"
+            )
+        if qa_cols and "investigation_json" not in qa_cols:
+            conn.execute("ALTER TABLE interview_qa ADD COLUMN investigation_json TEXT")
         _ensure_legacy_system(conn)
     _validate_startup_environment()
     _validate_publish_startup_config()

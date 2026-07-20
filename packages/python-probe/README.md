@@ -236,6 +236,8 @@ def check(user, password=None):
 | `PROBE_PROJECTION_MAX_FIELDS` | `64` | projection の最大フィールド数 |
 | `PROBE_PROJECTION_MAX_SAMPLES` | `20` | sample の最大要素数 |
 | `PROBE_REPLAY_CAPTURE_MAX_BYTES` | `65536` | replay capture（canonical JSON）の最大バイト数。超過でキャプチャ全体を破棄し `unreplayable` / `size_limit_exceeded`（部分保存はしない） |
+| `PROBE_ENVIRONMENT` | 未設定 | デプロイ環境タグ（例 `production`）。未設定/空文字なら trace payload に `environment` は付かない（捏造しない）。Runtime Reality Check（Issue #290）の provenance に使われる |
+| `PROBE_GIT_SHA` | 未設定 | デプロイ済みコミットの sha。未設定/空文字なら trace payload に `git_sha` は付かない。Runtime Reality Check の `snapshot_ref` 解決に使われる |
 
 ## 設計メモ
 

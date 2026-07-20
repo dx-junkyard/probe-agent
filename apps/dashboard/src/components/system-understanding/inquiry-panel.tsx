@@ -30,8 +30,10 @@ import type {
 // Issue #286: Question Router category -> 日本語ラベル。canonical enum
 // (human_only | system_researchable | hybrid) は英語のまま内部で保持し、
 // 表示ラベルだけ日本語に変換する(Issue #266 の規約どおり、raw な enum
-// 文字列を画面に出さない)。
-const ROUTE_CATEGORY_LABELS: Record<InquiryRouteCategory, string> = {
+// 文字列を画面に出さない)。Exported so the normal Q&A flow's route badge
+// (Issue #286 review fix, Finding 1; components/qa-panel usage in
+// pages/interview.tsx) reuses the same labels instead of a second copy.
+export const ROUTE_CATEGORY_LABELS: Record<InquiryRouteCategory, string> = {
   system_researchable: "AI が調査して回答",
   human_only: "あなたの判断が必要",
   hybrid: "調査 + あなたの判断",

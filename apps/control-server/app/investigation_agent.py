@@ -405,7 +405,10 @@ def _gather_runtime_candidates(
     for row in rows:
         component_id = row["component_id"]
         fact = aggregate_component_facts(conn, system_id, component_id)
-        provenance = build_provenance(fact, snapshot_id=snapshot_id)
+        # Issue #290 Finding 5: provenance now comes only from what was
+        # actually observed on traces (build_provenance resolves snapshot_ref
+        # from fact.observed_git_sha itself); never pass the pinned snapshot_id.
+        provenance = build_provenance(fact, conn=conn, system_id=system_id)
         baseline = compare_claim_to_runtime("", fact, provenance)
         candidates.append(
             RuntimeFactCandidate(

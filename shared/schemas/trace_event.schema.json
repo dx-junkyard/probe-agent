@@ -98,7 +98,9 @@
         "state": { "type": "string", "enum": ["closed", "open", "half_open"] }
       },
       "additionalProperties": false
-    }
+    },
+    "environment": { "type": ["string", "null"], "description": "Optional deployment environment tag reported by the SDK (PROBE_ENVIRONMENT), e.g. 'production'. Null when unset (Issue #290 Finding 5) — never inferred." },
+    "git_sha": { "type": ["string", "null"], "description": "Optional deployed commit sha reported by the SDK (PROBE_GIT_SHA). Null when unset (Issue #290 Finding 5) — never inferred from the pinned analysis snapshot." }
   },
   "additionalProperties": false
 }

@@ -418,6 +418,22 @@ def probe(
                 trace["input_capture"] = capture_payload
                 trace["replayability"] = capture_replayability
                 trace["replay_reasons"] = capture_reasons
+            # Issue #290 Finding 5: optional deployment provenance
+            # (PROBE_ENVIRONMENT / PROBE_GIT_SHA). Omitted entirely when
+            # unset so pre-existing traces/payloads are unaffected; best-
+            # effort like replay capture above -- reading these env vars
+            # must never break the wrapped function or trace sending.
+            try:
+                env_value = ProbeConfig.environment()
+                git_sha_value = ProbeConfig.git_sha()
+            except Exception:  # noqa: BLE001 — must never break fn or trace sending
+                logger.debug("environment/git_sha env read failed", exc_info=True)
+                env_value = None
+                git_sha_value = None
+            if env_value is not None:
+                trace["environment"] = env_value
+            if git_sha_value is not None:
+                trace["git_sha"] = git_sha_value
 
             if spec is not None and raised is None:
                 # Output projection (the input phase was extracted pre-call).

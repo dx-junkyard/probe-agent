@@ -26,6 +26,7 @@ import {
   useRejectInterviewProposal,
   useResumeInterviewInquiry,
   useResumeInterviewQa,
+  useRouteAndInvestigateQa,
   useRunRuntimeRealityCheck,
   useSkipInterviewQa,
   useUnderstandingDiff,
@@ -41,7 +42,7 @@ import { AnswerableAreasControl, isOutOfArea, knowledgeAreaLabel } from "@/compo
 import { HandoffListPanel, HandoffModal } from "@/components/system-understanding/handoff-panel";
 import { ObservationProposalPanel } from "@/components/system-understanding/observation-proposal-panel";
 import { ChangeSetPanel } from "@/components/system-understanding/change-set-panel";
-import { InquiryPanel } from "@/components/system-understanding/inquiry-panel";
+import { InquiryPanel, ROUTE_CATEGORY_LABELS } from "@/components/system-understanding/inquiry-panel";
 import { RefreshStatusChip } from "@/components/system-understanding/refresh-status-chip";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -61,6 +62,7 @@ import type {
   InterviewProposalMetadataBlock,
   InterviewProposalOut,
   InterviewProposalProbePlan,
+  InquiryRouteCategory,
   InterviewInquiryOut,
   InterviewQaOut,
   InterviewQuestionEvidenceRef,
@@ -453,7 +455,23 @@ function QaItemCard({
   const [hasHeldInquiry, setHasHeldInquiry] = useState(false);
   const [attachedInquiryId, setAttachedInquiryId] = useState<number | null>(null);
   const [handoffOpen, setHandoffOpen] = useState(false);
+  // Issue #286 review fix (Finding 1): collapsible "根拠を見る" for this
+  // question's persisted Investigation Agent result, mirroring
+  // InquiryMessageBubble's showEvidence pattern.
+  const [showInvestigationEvidence, setShowInvestigationEvidence] = useState(false);
   const resumeInquiry = useResumeInterviewInquiry(sessionId);
+
+  // Raw enum values are never rendered (Issue #266) -- only a known,
+  // mapped label is shown; an unrecognized value renders no badge at all.
+  const routeCategoryLabel = qa.route_category
+    ? ROUTE_CATEGORY_LABELS[qa.route_category as InquiryRouteCategory]
+    : undefined;
+
+  const transcribeInvestigationConclusion = () => {
+    if (!qa.investigation) return;
+    setDraft(qa.investigation.conclusion);
+    setEditing(true);
+  };
 
   const heldInquiryId = hasHeldInquiry
     ? attachedInquiryId
@@ -510,6 +528,11 @@ function QaItemCard({
               担当外({knowledgeAreaLabel(qa.knowledge_area)})
             </Badge>
           )}
+          {routeCategoryLabel && (
+            <Badge variant="secondary" data-testid={`qa-route-category-${qa.id}`}>
+              {routeCategoryLabel}
+            </Badge>
+          )}
           <Badge variant="outline">{qa.question_category}</Badge>
           <Badge variant={
             qa.status === "answered" ? "success"
@@ -557,6 +580,69 @@ function QaItemCard({
             state_effects=[{qa.runtime_evidence.declared.state_effects.join(", ")}] /
             recommended_mode={qa.runtime_evidence.declared.recommended_mode}
           </p>
+        </div>
+      )}
+
+      {qa.investigation && (
+        <div
+          className="rounded-md border p-2 text-xs space-y-1 bg-sky-500/5"
+          data-testid={`qa-investigation-${qa.id}`}
+        >
+          {qa.investigation.status === "completed" ? (
+            <>
+              <p className="font-medium">AIの調査結果: {qa.investigation.conclusion}</p>
+              {qa.investigation.key_points.length > 0 && (
+                <ul className="list-disc pl-4">
+                  {qa.investigation.key_points.map((k, i) => <li key={i}>{k}</li>)}
+                </ul>
+              )}
+              {qa.route_category === "hybrid" && qa.investigation.decision_question && (
+                <p
+                  className="rounded border border-amber-500/60 bg-amber-500/10 px-2 py-1 font-medium text-amber-800"
+                  data-testid={`qa-investigation-decision-question-${qa.id}`}
+                >
+                  確認したいこと: {qa.investigation.decision_question}
+                </p>
+              )}
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setShowInvestigationEvidence(s => !s)}
+                  data-testid={`qa-investigation-show-evidence-${qa.id}`}
+                >
+                  {showInvestigationEvidence ? "根拠を隠す" : "根拠を見る"}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={transcribeInvestigationConclusion}
+                  data-testid={`qa-investigation-transcribe-${qa.id}`}
+                >
+                  調査結果を回答欄に転記
+                </Button>
+              </div>
+              {showInvestigationEvidence && (
+                <div
+                  className="mt-1 space-y-1 rounded bg-background/60 p-2"
+                  data-testid={`qa-investigation-evidence-${qa.id}`}
+                >
+                  {qa.investigation.evidence.map((e, i) => (
+                    <p key={i} className="font-mono text-[10px] text-muted-foreground">
+                      {e.path}:{e.start_line}-{e.end_line}{e.summary ? ` — ${e.summary}` : ""}
+                    </p>
+                  ))}
+                  {qa.investigation.uncertainty && (
+                    <p className="text-muted-foreground">不確実な点: {qa.investigation.uncertainty}</p>
+                  )}
+                </div>
+              )}
+            </>
+          ) : (
+            <p className="text-muted-foreground italic" data-testid={`qa-investigation-unresolved-${qa.id}`}>
+              AIの調査では特定できませんでした
+            </p>
+          )}
         </div>
       )}
 
@@ -719,9 +805,24 @@ export function QaPanel({
   const skip = useSkipInterviewQa(sessionId);
   const resume = useResumeInterviewQa(sessionId);
   const runRealityCheck = useRunRuntimeRealityCheck(sessionId);
+  // Issue #286 review fix (Finding 1): batch-routes + investigates open
+  // questions in the normal Q&A flow instead of leaving Question Router /
+  // Investigation Agent reachable only from the Inquiry side-conversation.
+  const routeAndInvestigate = useRouteAndInvestigateQa(sessionId);
   // Issue #285 refresh/resume: re-attach any still-active Inquiry to its
   // origin card after a reload.
   const activeInquiries = useActiveInquiriesByOrigin(sessionId);
+
+  const handleRouteAndInvestigate = async () => {
+    try {
+      const result = await routeAndInvestigate.mutateAsync();
+      toast.success(
+        `分類 ${result.counts.routed} 件・調査 ${result.counts.investigated} 件が完了しました`,
+      );
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
 
   const handleAnswer = async (qaId: number, answerText: string, answerUnknown?: boolean) => {
     try {
@@ -779,16 +880,29 @@ export function QaPanel({
           <span>
             残質問 {qaList.open_count} 件(うち高優先度 {qaList.high_priority_open_count} 件)
           </span>
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={handleRuntimeRealityCheck}
-            disabled={runRealityCheck.isPending || approvedCount === 0}
-            data-testid="run-runtime-reality-check"
-            title={approvedCount === 0 ? "先に提案を1件以上承認してください" : undefined}
-          >
-            {runRealityCheck.isPending ? "実行中..." : "実態チェックを実行"}
-          </Button>
+          <div className="flex items-center gap-2">
+            {qaList.open_count > 0 && (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={handleRouteAndInvestigate}
+                disabled={routeAndInvestigate.isPending}
+                data-testid="route-and-investigate-qa"
+              >
+                {routeAndInvestigate.isPending ? "調査中..." : "AIに先に調査させる"}
+              </Button>
+            )}
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleRuntimeRealityCheck}
+              disabled={runRealityCheck.isPending || approvedCount === 0}
+              data-testid="run-runtime-reality-check"
+              title={approvedCount === 0 ? "先に提案を1件以上承認してください" : undefined}
+            >
+              {runRealityCheck.isPending ? "実行中..." : "実態チェックを実行"}
+            </Button>
+          </div>
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
@@ -804,8 +918,8 @@ export function QaPanel({
           >
             <AlertCircle className="h-4 w-4 mt-0.5 shrink-0 text-amber-600" />
             <div>
-              回答が修正されました。内容を反映するには「理解を更新」を実行してください
-              (自動では再構築されません)。
+              回答が修正されました。理解は自動で更新されます。更新状況は「現在の理解」/
+              「レビューキュー」のステータスをご確認ください(失敗時は再試行できます)。
             </div>
           </div>
         )}

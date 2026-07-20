@@ -36,6 +36,10 @@ def _trace_values(event: TraceEvent) -> dict:
         "replayability": event.replayability,
         "replay_reasons_json": json.dumps(event.replay_reasons, ensure_ascii=False)
         if event.replay_reasons is not None else None,
+        # Issue #290 Finding 5: optional deployment provenance reported by
+        # the SDK (PROBE_ENVIRONMENT / PROBE_GIT_SHA); None when unset.
+        "environment": event.environment,
+        "git_sha": event.git_sha,
     }
 
 
@@ -51,6 +55,7 @@ def _stored_trace_bytes(row) -> int:
     return 16 + sum(_utf8_size(row[key]) for key in (
         "trace_id", "component_id", "mode", "input_json", "output_text",
         "error", "input_capture_json", "replayability", "replay_reasons_json",
+        "environment", "git_sha",
     ))
 
 
@@ -68,6 +73,8 @@ def _current_trace_usage(conn, system_id: int) -> tuple[int, int]:
                     + length(CAST(COALESCE(input_capture_json, '') AS BLOB))
                     + length(CAST(COALESCE(replayability, '') AS BLOB))
                     + length(CAST(COALESCE(replay_reasons_json, '') AS BLOB))
+                    + length(CAST(COALESCE(environment, '') AS BLOB))
+                    + length(CAST(COALESCE(git_sha, '') AS BLOB))
                   ), 0) AS trace_bytes
            FROM traces WHERE system_id = ?""",
         (system_id,),
@@ -237,7 +244,8 @@ def post_trace(
             current_rows, current_bytes = _current_trace_usage(conn, system_id)
             previous = conn.execute(
             """SELECT trace_id, component_id, mode, input_json, output_text, error,
-                      input_capture_json, replayability, replay_reasons_json
+                      input_capture_json, replayability, replay_reasons_json,
+                      environment, git_sha
                FROM traces WHERE system_id = ? AND trace_id = ?""",
             (system_id, event.trace_id),
             ).fetchone()
@@ -274,8 +282,9 @@ def post_trace(
                 INSERT OR REPLACE INTO traces
                     (system_id, trace_id, component_id, mode, input_json, output_text,
                      error, duration_ms, timestamp,
-                     input_capture_json, replayability, replay_reasons_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     input_capture_json, replayability, replay_reasons_json,
+                     environment, git_sha)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     system_id,
@@ -290,6 +299,8 @@ def post_trace(
                     values["input_capture_json"],
                     values["replayability"],
                     values["replay_reasons_json"],
+                    values["environment"],
+                    values["git_sha"],
                 ),
             )
             _write_lineage(conn, system_id, event)

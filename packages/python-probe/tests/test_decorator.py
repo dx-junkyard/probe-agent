@@ -78,6 +78,76 @@ def test_trace_records_input_output(sdk):
     assert t["duration_ms"] >= 0
 
 
+# --- Issue #290 Finding 5: PROBE_ENVIRONMENT / PROBE_GIT_SHA provenance -------
+
+
+def test_trace_includes_environment_and_git_sha_when_set(sdk, monkeypatch):
+    monkeypatch.setenv("PROBE_ENVIRONMENT", "production")
+    monkeypatch.setenv("PROBE_GIT_SHA", "abc123")
+    probe = sdk["decorator_mod"].probe
+
+    @probe(component_id="adder")
+    def add(a, b):
+        return a + b
+
+    assert add(2, 3) == 5
+    t = sdk["traces"][0]
+    assert t["environment"] == "production"
+    assert t["git_sha"] == "abc123"
+
+
+def test_trace_omits_environment_and_git_sha_when_unset(sdk, monkeypatch):
+    monkeypatch.delenv("PROBE_ENVIRONMENT", raising=False)
+    monkeypatch.delenv("PROBE_GIT_SHA", raising=False)
+    probe = sdk["decorator_mod"].probe
+
+    @probe(component_id="adder")
+    def add(a, b):
+        return a + b
+
+    assert add(2, 3) == 5
+    t = sdk["traces"][0]
+    assert "environment" not in t
+    assert "git_sha" not in t
+
+
+def test_trace_environment_and_git_sha_blank_treated_as_unset(sdk, monkeypatch):
+    monkeypatch.setenv("PROBE_ENVIRONMENT", "   ")
+    monkeypatch.setenv("PROBE_GIT_SHA", "")
+    probe = sdk["decorator_mod"].probe
+
+    @probe(component_id="adder")
+    def add(a, b):
+        return a + b
+
+    assert add(2, 3) == 5
+    t = sdk["traces"][0]
+    assert "environment" not in t
+    assert "git_sha" not in t
+
+
+def test_environment_git_sha_read_failure_never_breaks_wrapped_function(sdk, monkeypatch):
+    """Best-effort like replay capture: a failure reading the env vars must
+    never change the wrapped function's return value or block trace sending."""
+    decorator_mod = sdk["decorator_mod"]
+
+    def boom():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(decorator_mod.ProbeConfig, "environment", staticmethod(boom))
+    probe = decorator_mod.probe
+
+    @probe(component_id="adder")
+    def add(a, b):
+        return a + b
+
+    assert add(2, 3) == 5
+    assert len(sdk["traces"]) == 1
+    t = sdk["traces"][0]
+    assert "environment" not in t
+    assert "git_sha" not in t
+
+
 def test_payload_mode_defaults_to_redacted_with_mandatory_masks(sdk, monkeypatch):
     monkeypatch.delenv("PROBE_PAYLOAD_MODE", raising=False)
     probe = sdk["decorator_mod"].probe
