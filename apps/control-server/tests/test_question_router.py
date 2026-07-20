@@ -7,9 +7,13 @@ Covers:
 2. POST /interview/qa/{qa_id}/route: persists route_category/route_run_id
    on success, records a failed intelligence_runs row and leaves the
    question unrouted on failure, and System isolation.
-3. Issue #291: additive knowledge_area field bumped to prompt/schema
-   version 'question-router-v2' -- null and each valid enum value parse,
-   an invalid value fails closed, and the route endpoint persists it.
+3. Issue #291: additive knowledge_area field (schema/prompt version bumped
+   to 'question-router-v2' at the time) -- null and each valid enum value
+   parse, an invalid value fails closed, and the route endpoint persists it.
+4. Review fix: additive search_keywords field bumped prompt/schema version
+   again to 'question-router-v3' -- parsed for system_researchable/hybrid,
+   forced to [] for human_only, and defaults to [] when the model omits the
+   field (backward compatible).
 """
 
 from __future__ import annotations
@@ -99,12 +103,12 @@ def test_route_question_parses_each_category(category):
     assert result.schema_version == SCHEMA_VERSION
 
 
-def test_route_question_prompt_and_schema_version_bumped_for_291():
-    """Issue #291 added knowledge_area additively -- both versions bumped
-    to 'question-router-v2' (Principle 7: any prompt/schema change is a new
-    version)."""
-    assert PROMPT_VERSION == "question-router-v2"
-    assert SCHEMA_VERSION == "question-router-v2"
+def test_route_question_prompt_and_schema_version_bumped_for_search_keywords():
+    """A later review fix added search_keywords additively -- both versions
+    bumped again to 'question-router-v3' (Principle 7: any prompt/schema
+    change is a new version)."""
+    assert PROMPT_VERSION == "question-router-v3"
+    assert SCHEMA_VERSION == "question-router-v3"
 
 
 def test_route_question_accepts_null_knowledge_area():
@@ -157,6 +161,44 @@ def test_route_question_forces_research_focus_null_for_human_only():
     result = route_question(client, _make_config(), question_text="q")
     assert result.error is None
     assert result.research_focus is None
+
+
+# --- search_keywords (review fix) ----------------------------------------------
+
+
+@pytest.mark.parametrize("category", ["system_researchable", "hybrid"])
+def test_route_question_parses_search_keywords(category):
+    client = FakeLLMClient(response={
+        "category": category, "reason": "r", "research_focus": "focus",
+        "search_keywords": ["auth", "login", "token", "session"],
+    })
+    result = route_question(client, _make_config(), question_text="認証はどのように実装されていますか")
+    assert result.error is None
+    assert result.search_keywords == ["auth", "login", "token", "session"]
+
+
+def test_route_question_forces_search_keywords_empty_for_human_only():
+    """Even if the model returns search_keywords for human_only, they are
+    discarded -- same rule as research_focus -> None (nothing to search
+    for when investigation never runs)."""
+    client = FakeLLMClient(response={
+        "category": "human_only", "reason": "r", "research_focus": None,
+        "search_keywords": ["should", "be", "discarded"],
+    })
+    result = route_question(client, _make_config(), question_text="q")
+    assert result.error is None
+    assert result.search_keywords == []
+
+
+def test_route_question_missing_search_keywords_defaults_to_empty_list():
+    """Backward compatible: an older prompt reply that omits the field
+    entirely is still valid, not a parse failure."""
+    client = FakeLLMClient(response={
+        "category": "system_researchable", "reason": "r", "research_focus": "focus",
+    })
+    result = route_question(client, _make_config(), question_text="q")
+    assert result.error is None
+    assert result.search_keywords == []
 
 
 # --- Route-level: POST /interview/qa/{qa_id}/route -----------------------------

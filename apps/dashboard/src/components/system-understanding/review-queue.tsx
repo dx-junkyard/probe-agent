@@ -394,6 +394,9 @@ function InformationalItemRow({ item }: { item: AlignmentItemOut }) {
       <div className="flex flex-wrap items-center gap-1 text-[11px]">
         <Badge variant="outline">{alignmentStateLabel(item.alignment_state)}</Badge>
         <Badge variant="secondary">{item.user_reason}</Badge>
+        {item.superseded && (
+          <Badge variant="outline" data-testid={`review-item-superseded-${item.id}`}>履歴</Badge>
+        )}
       </div>
     </div>
   );

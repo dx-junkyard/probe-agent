@@ -35,21 +35,37 @@ question, and it is always the LLM's classification, never a deterministic
 guess from title/repository text (Principle 6). Adding this field bumped
 both ``PROMPT_VERSION`` and ``SCHEMA_VERSION`` to 'question-router-v2'
 (Principle 7: any prompt/schema change is a new version).
+
+A later review fix on top of Issue #286 adds ``search_keywords``: a small
+list of ASCII code identifiers / symbol names / file-path fragments the
+model expects to help
+retrieve relevant files, returned only for ``system_researchable`` /
+``hybrid`` (forced to ``[]`` for ``human_only``, same rule as
+``research_focus`` -> ``None``). This exists because
+``investigation_agent._select_candidates`` matches keywords against repo
+FILE PATHS, which are almost always ASCII identifiers -- a Japanese-only
+question tokenizes to no ASCII keywords at all (Unicode/CJK tokens from the
+question text can match Japanese-named paths/docs, but not ASCII source
+paths), so without an explicit ASCII hint from the router a
+non-English question can select zero candidate files and end the
+investigation ``unresolved`` before any reasoning-model call happens. This
+bumped both ``PROMPT_VERSION`` and ``SCHEMA_VERSION`` again, to
+'question-router-v3' (Principle 7).
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
-from typing import Literal, Optional
+from dataclasses import dataclass, field
+from typing import Annotated, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .interview_language import language_directive
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient, is_reasoning_model
 
-PROMPT_VERSION = "question-router-v2"
-SCHEMA_VERSION = "question-router-v2"
+PROMPT_VERSION = "question-router-v3"
+SCHEMA_VERSION = "question-router-v3"
 
 RouteCategory = Literal["human_only", "system_researchable", "hybrid"]
 ROUTE_CATEGORIES = ("human_only", "system_researchable", "hybrid")
@@ -77,6 +93,17 @@ class _RawRouteResponse(BaseModel):
     # UNKNOWN field were sent; a missing optional field is fine (defaults to
     # None), so this is a backward-compatible addition to the schema.
     knowledge_area: Optional[str] = Field(default=None, max_length=50)
+    # search_keywords fix (question-router-v3): additive, defaults to [] so
+    # an older/partial model reply that omits it entirely still validates
+    # (same backward-compatible pattern as knowledge_area above). At most 10
+    # keywords, each 1-50 chars; non-ASCII strings are accepted (harmless --
+    # investigation_agent tokenizes with its own regex, which simply yields
+    # nothing useful for a non-ASCII hint rather than erroring).
+    search_keywords: List[Annotated[str, Field(min_length=1, max_length=50)]] = Field(
+        default_factory=list,
+        max_length=10,
+        description="ASCII code identifiers/paths a code search should try",
+    )
 
 
 # --- Public result type -------------------------------------------------------
@@ -95,6 +122,11 @@ class RouteResult:
     # Issue #291: null when the model found no clearly-matching area -- never
     # hidden from the list, only used for out-of-area grouping.
     knowledge_area: Optional[str] = None
+    # search_keywords fix (question-router-v3): [] for human_only (forced
+    # server-side, same rule as research_focus -> None) and whenever the
+    # model omitted the field. investigation_agent.investigate() tokenizes
+    # and prepends these ahead of its own question/research_focus keywords.
+    search_keywords: List[str] = field(default_factory=list)
     error: Optional[str] = None
 
 
@@ -130,7 +162,8 @@ commentary), matching exactly this shape:
   "category": "human_only | system_researchable | hybrid",
   "reason": "a short reason for this classification",
   "research_focus": "what a read-only code investigation should look for, or null for human_only",
-  "knowledge_area": "product_intent | domain_rule | operations | implementation | security | null"
+  "knowledge_area": "product_intent | domain_rule | operations | implementation | security | null",
+  "search_keywords": ["a few ASCII code identifiers/paths, or [] for human_only"]
 }
 
 Rules:
@@ -147,6 +180,16 @@ belongs to, used only to group who should answer it -- never to hide it:
   - "implementation": how the code itself is built/structured
   - "security": security, auth, or access-control specific questions
   Return null when no single area clearly fits -- never guess.
+- "search_keywords" must be [] for "human_only" (there is nothing to search \
+for). For "system_researchable" and "hybrid", return up to 10 short, \
+LIKELY-ASCII code search hints: identifiers, function/class/symbol names, or \
+file/path fragments a keyword search over the repository's file paths could \
+plausibly match -- never a restatement of the question. The developer's \
+question may be written in a language other than English (e.g. Japanese) \
+while the codebase's paths and identifiers are English, so translate the \
+concept into what the code would actually be named. Example: a Japanese \
+question about 認証 ("authentication") should suggest something like \
+["auth", "login", "token", "session"], not Japanese words.
 - You never decide, adopt, apply, or answer anything yourself here. This \
 step only classifies the question.
 """
@@ -232,6 +275,9 @@ def route_question(
         )
 
     research_focus = validated.research_focus if validated.category != "human_only" else None
+    # search_keywords fix (question-router-v3): forced to [] for human_only,
+    # the same rule as research_focus -> None above (nothing to search for).
+    search_keywords = list(validated.search_keywords) if validated.category != "human_only" else []
 
     return RouteResult(
         provider=config.provider,
@@ -241,4 +287,5 @@ def route_question(
         reason=validated.reason,
         research_focus=research_focus,
         knowledge_area=validated.knowledge_area,
+        search_keywords=search_keywords,
     )

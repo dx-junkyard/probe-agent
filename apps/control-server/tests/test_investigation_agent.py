@@ -11,6 +11,12 @@ Covers:
    invalid status/category all -> status="failed".
 5. Read-only boundary: the repo fixture is untouched (`git status
    --porcelain` empty) after an investigation run.
+6. Review fix: `_keywords()` extracts CJK tokens from a Japanese-only
+   question; a Japanese question plus a router `search_keywords` hint
+   selects/reads a candidate file instead of returning unresolved-with-
+   zero-files; a `status="completed"` response with no valid evidence at
+   all (code or runtime) is demoted to `"unresolved"`; a `"completed"`
+   backed only by valid `runtime_evidence` stays `"completed"`.
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ from app.investigation_agent import (
     PROMPT_VERSION,
     SCHEMA_VERSION,
     InvestigationBudget,
+    _keywords,
     investigate,
 )
 from app.llm import LLMClient, LLMConfig, LLMError, MockLLMClient
@@ -526,3 +533,103 @@ def test_investigation_budget_clamps_max_runtime_facts():
     assert budget.max_runtime_facts <= 20
     budget = InvestigationBudget(max_runtime_facts=-5)
     assert budget.max_runtime_facts == 0
+
+
+# --- Review fix: Unicode `_keywords`, `search_keywords` hint, evidence-gated
+# --- "completed" ------------------------------------------------------------
+
+
+def test_keywords_extracts_cjk_tokens_from_japanese_question():
+    """Before this fix, a Japanese-only question tokenized to [] entirely
+    (the old regex was `[A-Za-z0-9_]+` only). CJK sequences (min length 2)
+    are now also extracted -- they can match Japanese-named paths/docs, and
+    are harmless (just unused) against ASCII-only repo paths."""
+    keywords = _keywords(None, "認証はどのように実装されていますか")
+    assert keywords != []
+    assert any("認証" in kw for kw in keywords)
+
+
+def test_keywords_still_extracts_ascii_tokens_unchanged():
+    keywords = _keywords("the summarize function", None)
+    assert "summarize" in keywords
+    assert "function" in keywords
+    assert "the" not in keywords  # stopword, unchanged behavior
+
+
+def test_investigate_japanese_question_without_search_keywords_is_unresolved(tmp_path):
+    """Finding 2 regression guard: WITHOUT a search_keywords hint, a
+    Japanese-only question still cannot select any candidate against
+    ASCII-only file paths (CJK tokens don't substring-match ASCII paths) --
+    proves the next test's success comes from the hint, not from CJK
+    tokenization alone."""
+    repo, sha = _init_repo(tmp_path, {"src/auth.py": "def authenticate(user, password):\n    return True\n"})
+    client = FakeLLMClient(response=_valid_investigation_response())
+    result = investigate(
+        client, _make_config(), repo_path=repo, commit_sha=sha,
+        question="認証はどのように実装されていますか",
+    )
+    assert result.status == "unresolved"
+    assert result.files_read == 0
+    assert client.calls == 0
+
+
+def test_investigate_japanese_question_with_search_keywords_selects_candidate(tmp_path):
+    """Finding 2 fix: the Question Router's ASCII search_keywords hint lets
+    a Japanese-only question select and read a candidate file, instead of
+    ending unresolved-with-zero-files before any LLM call."""
+    repo, sha = _init_repo(tmp_path, {
+        "src/auth.py": "def authenticate(user, password):\n    return True\n",
+        "src/unrelated.py": "def unrelated():\n    pass\n",
+    })
+    client = FakeLLMClient(response=_valid_investigation_response(evidence=[
+        {"path": "src/auth.py", "start_line": 1, "end_line": 2, "summary": "認証の定義"},
+    ]))
+    result = investigate(
+        client, _make_config(), repo_path=repo, commit_sha=sha,
+        question="認証はどのように実装されていますか",
+        search_keywords=["auth", "login", "token", "session"],
+    )
+    assert result.status == "completed"
+    assert result.files_read >= 1
+    assert any(s.path == "src/auth.py" for s in result.read_snippets)
+    assert client.calls == 1
+
+
+def test_investigate_completed_with_empty_evidence_demotes_to_unresolved(tmp_path):
+    """Finding 3 fix: status="completed" with zero valid evidence of either
+    kind is an ungrounded conclusion -- deterministically demoted, never
+    reported as completed."""
+    repo, sha = _init_repo(tmp_path, {"src/summarize.py": "def summarize():\n    pass\n"})
+    client = FakeLLMClient(response=_valid_investigation_response(evidence=[]))
+    result = investigate(
+        client, _make_config(), repo_path=repo, commit_sha=sha,
+        question="summarize とは何ですか?", research_focus="summarize",
+    )
+    assert result.status == "unresolved"
+    assert result.status != "completed"
+    assert result.evidence == []
+    assert "demoted to unresolved" in result.uncertainty
+
+
+def test_investigate_completed_with_only_runtime_evidence_stays_completed(tmp_path, system_and_snapshot):
+    """A "completed" conclusion backed only by valid runtime_evidence (no
+    code evidence) is grounded and must NOT be demoted."""
+    conn, system_id, snapshot_id = system_and_snapshot
+    repo, sha = _init_repo(tmp_path, {"src/summarize.py": "def summarize():\n    pass\n"})
+    _insert_symbol(conn, snapshot_id=snapshot_id, system_id=system_id,
+                    path="src/summarize.py", component_id="summarize_fn")
+    _insert_trace(conn, system_id, "summarize_fn", timestamp=time.time())
+
+    client = FakeLLMClient(response=_valid_investigation_response(
+        evidence=[],
+        runtime_evidence=[{"component_id": "summarize_fn", "runtime_check": "match", "summary": "観測あり"}],
+    ))
+    result = investigate(
+        client, _make_config(), repo_path=repo, commit_sha=sha,
+        question="summarize とは何ですか?", research_focus="summarize",
+        conn=conn, system_id=system_id, snapshot_id=snapshot_id,
+    )
+    assert result.status == "completed"
+    assert result.evidence == []
+    assert len(result.runtime_evidence) == 1
+    assert result.runtime_evidence[0].runtime_check == "match"

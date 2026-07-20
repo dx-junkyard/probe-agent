@@ -7,9 +7,11 @@ produces "alignment items": one row per contrast point, each with a
 DETERMINISTIC review classification (``review_category`` / ``reason_code``,
 see ``app/alignment.py``'s rule table -- classification itself is never a
 reasoning decision, Principle 6). Only ``review_category IN (must_review,
-batch_reviewable)`` ever surfaces as an action-required Review Queue card;
-the rest (``no_review_required`` / ``unchanged`` / ``informational``) are
-collapsed/informational.
+batch_reviewable)``, further restricted to non-terminal, non-superseded rows
+(``status NOT IN (answered, corrected)`` and ``superseded = 0``), ever
+surfaces as an action-required Review Queue card; the rest
+(``no_review_required`` / ``unchanged`` / ``informational``, plus any
+answered/corrected/superseded row) are collapsed/informational/history.
 
 Kept in its own module (like Issues #284/#285) rather than growing
 ``routes/interview.py`` further, per CLAUDE.md's guidance for this
@@ -20,7 +22,11 @@ rows with ``status='open' AND user_decision IS NULL`` for the session --
 untouched suggestions with no user progress. Any row with a different status
 (``answered``/``corrected``/``held``/``inquiry``) or a recorded
 ``user_decision`` is always kept, regardless of how the base revision
-changed (Principle 2 -- a rebuild must never lose a human decision).
+changed (Principle 2 -- a rebuild must never lose a human decision). Of the
+kept rows, a rebuild also marks surviving TERMINAL rows
+(``answered``/``corrected``) ``superseded=1`` so the fresh replacement row
+for the same contrast point is distinguishable from stale history;
+``held``/``inquiry`` rows are never marked superseded (still in-flight).
 
 Inquiry integration (Issue #285's ``origin_kind='review_item'``) lives in
 ``routes/interview_inquiry.py``: opening an Inquiry on an alignment item sets
@@ -125,6 +131,7 @@ def _item_out(row) -> AlignmentItemOut:
         status=row["status"],
         user_decision=AlignmentUserDecisionOut(**user_decision) if user_decision else None,
         handoff_id=row["handoff_id"] if "handoff_id" in row.keys() else None,
+        superseded=bool(row["superseded"]) if "superseded" in row.keys() else False,
         intelligence_run_id=row["intelligence_run_id"],
         is_mock=bool(row["is_mock"]),
         created_at=row["created_at"],
@@ -347,6 +354,24 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
                  AND status = 'open' AND user_decision IS NULL""",
             (session_id, system_id),
         )
+        # Finding 4 fix: surviving TERMINAL rows (answered/corrected) become
+        # history the moment a fresh row for the same contrast point is
+        # about to be inserted. GET .../review-queue also filters on
+        # status/superseded directly (belt and braces), but marking these
+        # rows here is what lets a full-listing view (GET .../alignment)
+        # tell a stale answered/corrected row apart from a current one.
+        # held/inquiry rows are intentionally NOT marked superseded -- they
+        # are still in-flight and stay the current row (Principle 2's
+        # rebuild-must-never-lose-progress rule already preserves them
+        # untouched; this only adds the superseded label to the terminal
+        # ones).
+        conn.execute(
+            """UPDATE alignment_item
+               SET superseded = 1
+               WHERE session_id = ? AND system_id = ?
+                 AND status IN ('answered', 'corrected') AND superseded = 0""",
+            (session_id, system_id),
+        )
         for it in final_items:
             reason_code = it["reason_code"]
             conn.execute(
@@ -439,13 +464,23 @@ def get_review_queue(
     system_id: int = Depends(get_system_id),
 ) -> AlignmentReviewQueueOut:
     """Only action-required items (must_review + batch_reviewable), ordered
-    deterministically by category rank, then reason-code rank, then id."""
+    deterministically by category rank, then reason-code rank, then id.
+
+    Finding 4 fix: a terminal-status row (answered/corrected) is history,
+    not an action card, even though its review_category was must_review/
+    batch_reviewable at creation time -- so it is excluded explicitly here,
+    not just left to whatever status the dashboard happens to filter on.
+    ``superseded = 0`` is belt-and-braces on top of that: today's flows
+    already ensure a superseded row is always terminal-status too, but a
+    superseded row must never surface as an action card regardless.
+    """
     with get_conn() as conn:
         _get_session_or_404(conn, session_id, system_id)
         placeholders = ",".join("?" for _ in _ACTIONABLE_CATEGORIES)
         rows = conn.execute(
             f"""SELECT * FROM alignment_item
-                WHERE session_id = ? AND system_id = ? AND review_category IN ({placeholders})""",
+                WHERE session_id = ? AND system_id = ? AND review_category IN ({placeholders})
+                  AND status NOT IN ('answered', 'corrected') AND superseded = 0""",
             (session_id, system_id, *_ACTIONABLE_CATEGORIES),
         ).fetchall()
         return AlignmentReviewQueueOut(

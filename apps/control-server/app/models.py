@@ -3214,6 +3214,13 @@ class AlignmentItemOut(BaseModel):
     # the handoff sets status='held' (the same value /hold already uses)
     # alongside this column.
     handoff_id: Optional[int] = None
+    # Review-finding fix (Finding 4): true when a later rebuild produced a
+    # fresh replacement row for the same contrast point while this row was
+    # already answered/corrected. Superseded rows are history only -- never
+    # an action card -- and are additionally excluded from
+    # GET .../review-queue. Additive column; defaults False so pre-migration
+    # rows and any DB row missing the column still validate.
+    superseded: bool = False
     intelligence_run_id: int
     is_mock: bool = False
     created_at: float

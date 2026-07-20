@@ -997,6 +997,13 @@ export interface AlignmentItemOut {
   // Issue #291: set once this review item has been handed off to an
   // assignee (creating the handoff also sets status='held').
   handoff_id?: number | null;
+  // Review-finding fix (Finding 4): true when a later rebuild produced a
+  // fresh replacement row for this contrast point while this row was
+  // already answered/corrected. GET .../review-queue always excludes
+  // superseded=1 rows; the full GET .../alignment listing (grouped by
+  // review_category) can still surface one, so any rendering of that full
+  // listing should treat superseded=true as history, not a current item.
+  superseded?: boolean;
   intelligence_run_id: number;
   is_mock: boolean;
   created_at: number;

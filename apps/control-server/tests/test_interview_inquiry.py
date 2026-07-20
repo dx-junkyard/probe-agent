@@ -692,6 +692,143 @@ def test_review_item_inquiry_answer_locked_while_inquiry_open(admin_client, monk
     assert r.status_code == 409, r.text
 
 
+# --- Finding 7: at most one active Inquiry per origin ------------------------
+
+
+def _insert_inquiry_row(system_id, session_id, origin_kind, origin_id, *, status="open"):
+    """Insert a minimal interview_inquiry row directly via SQL, bypassing
+    create_inquiry's uniqueness check -- simulates pre-fix duplicate data so
+    _apply_transition's defense-in-depth guard (item 2 of the Finding 7 fix)
+    can be exercised on its own."""
+    from app.db import get_conn
+
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO interview_inquiry
+                (session_id, system_id, origin_kind, origin_id, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (session_id, system_id, origin_kind, origin_id, status, now, now),
+        )
+        return cur.lastrowid
+
+
+def test_create_inquiry_rejects_second_open_inquiry_for_same_origin(admin_client, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    qa = _create_qa(admin_client, headers, session_id)
+
+    _stub_answer(monkeypatch)
+    first = _open_inquiry(admin_client, headers, session_id, "qa", qa["id"])
+    assert first.status_code == 201, first.text
+    first_id = first.json()["inquiry"]["id"]
+
+    second = _open_inquiry(admin_client, headers, session_id, "qa", qa["id"])
+    assert second.status_code == 409, second.text
+    detail = second.json()["detail"]
+    assert detail["code"] == "inquiry_already_active"
+    assert detail["inquiry_id"] == first_id
+
+    # The rejected attempt must not have created a second row.
+    listing = admin_client.get(
+        f"/interview/sessions/{session_id}/inquiries", headers=headers,
+    ).json()
+    assert len(listing["items"]) == 1
+
+
+def test_create_inquiry_rejects_second_inquiry_while_first_is_held(admin_client, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    qa = _create_qa(admin_client, headers, session_id)
+
+    _stub_answer(monkeypatch)
+    first = _open_inquiry(admin_client, headers, session_id, "qa", qa["id"])
+    first_id = first.json()["inquiry"]["id"]
+    held = admin_client.post(f"/interview/inquiries/{first_id}/hold", headers=headers)
+    assert held.status_code == 200, held.text
+
+    second = _open_inquiry(admin_client, headers, session_id, "qa", qa["id"])
+    assert second.status_code == 409, second.text
+    assert second.json()["detail"]["code"] == "inquiry_already_active"
+
+
+def test_create_inquiry_review_item_origin_rejects_duplicate_too(admin_client, monkeypatch):
+    """The uniqueness rule is origin-generic, not qa-specific -- it also
+    covers origin_kind='review_item' (Issue #287's alignment_item origin)."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    item_id = _insert_alignment_item(system_id, session_id, snapshot_id)
+
+    _stub_answer(monkeypatch)
+    first = _open_inquiry(admin_client, headers, session_id, "review_item", item_id)
+    assert first.status_code == 201, first.text
+
+    second = _open_inquiry(admin_client, headers, session_id, "review_item", item_id)
+    assert second.status_code == 409, second.text
+    assert second.json()["detail"]["code"] == "inquiry_already_active"
+
+
+def test_create_inquiry_allowed_again_after_first_resolves(admin_client, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    qa = _create_qa(admin_client, headers, session_id)
+
+    _stub_answer(monkeypatch)
+    first = _open_inquiry(admin_client, headers, session_id, "qa", qa["id"])
+    first_id = first.json()["inquiry"]["id"]
+    resolved = admin_client.post(f"/interview/inquiries/{first_id}/resolve", headers=headers)
+    assert resolved.status_code == 200, resolved.text
+
+    second = _open_inquiry(admin_client, headers, session_id, "qa", qa["id"])
+    assert second.status_code == 201, second.text
+
+
+def test_create_inquiry_duplicate_check_is_scoped_per_origin(admin_client, monkeypatch):
+    """A second Inquiry on a DIFFERENT origin is unaffected by an open one on
+    another origin."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    item_a = _insert_alignment_item(system_id, session_id, snapshot_id)
+    item_b = _insert_alignment_item(system_id, session_id, snapshot_id)
+
+    _stub_answer(monkeypatch)
+    a = _open_inquiry(admin_client, headers, session_id, "review_item", item_a)
+    assert a.status_code == 201, a.text
+    b = _open_inquiry(admin_client, headers, session_id, "review_item", item_b)
+    assert b.status_code == 201, b.text
+
+
+def test_closing_one_of_two_duplicate_inquiries_keeps_item_locked_until_last_closes(
+    admin_client, monkeypatch,
+):
+    """Defense in depth (item 2 of the Finding 7 fix) for pre-existing
+    duplicate rows, seeded directly via SQL to simulate data that predates
+    this fix (create_inquiry's own uniqueness check would now prevent this
+    from happening through the API): closing one of two active Inquiries on
+    the same origin must NOT release the origin item while the other active
+    Inquiry remains open; only closing the last active one does."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    item_id = _insert_alignment_item(system_id, session_id, snapshot_id, status="inquiry")
+
+    inquiry_1 = _insert_inquiry_row(system_id, session_id, "review_item", item_id)
+    inquiry_2 = _insert_inquiry_row(system_id, session_id, "review_item", item_id)
+
+    r1 = admin_client.post(f"/interview/inquiries/{inquiry_1}/resolve", headers=headers)
+    assert r1.status_code == 200, r1.text
+    assert _get_alignment_item(system_id, item_id)["status"] == "inquiry"
+
+    r2 = admin_client.post(f"/interview/inquiries/{inquiry_2}/resolve", headers=headers)
+    assert r2.status_code == 200, r2.text
+    assert _get_alignment_item(system_id, item_id)["status"] == "open"
+
+
 # --- LLM failure: fail-closed --------------------------------------------------
 
 

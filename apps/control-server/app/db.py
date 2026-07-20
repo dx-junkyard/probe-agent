@@ -2577,6 +2577,13 @@ CREATE INDEX IF NOT EXISTS idx_interview_inquiry_transition_inquiry
 -- origin_id=<this row's id> is open, and reset to 'open' (never 'answered')
 -- when that Inquiry resolves/holds/cancels -- the developer must still
 -- explicitly answer via the item's own endpoint (Principle 2).
+--
+-- superseded (additive column, review-finding fix): set to 1 on a rebuild
+-- for rows that were already in a TERMINAL status (answered/corrected) at
+-- that time, so the fresh replacement row for the same contrast point is
+-- distinguishable from stale history. held/inquiry rows are never marked
+-- superseded (still in-flight). GET .../review-queue always excludes
+-- superseded=1 rows in addition to filtering by review_category.
 CREATE TABLE IF NOT EXISTS alignment_item (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id              INTEGER NOT NULL,
@@ -3427,6 +3434,17 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE alignment_item ADD COLUMN handoff_id INTEGER "
                 "REFERENCES question_handoff(id) ON DELETE SET NULL"
+            )
+        # Finding 4 (review of Issue #287): distinguishes a terminal
+        # (answered/corrected) row that has been superseded by a fresh
+        # rebuilt row for the same contrast point from the current row a
+        # human should still be able to see as history. Existing rows
+        # backfill to 0 (not superseded) -- a rebuild only ever marks a row
+        # superseded going forward, never retroactively.
+        if alignment_item_cols and "superseded" not in alignment_item_cols:
+            conn.execute(
+                "ALTER TABLE alignment_item "
+                "ADD COLUMN superseded INTEGER NOT NULL DEFAULT 0"
             )
         _ensure_legacy_system(conn)
     _validate_startup_environment()

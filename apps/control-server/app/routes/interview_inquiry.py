@@ -31,6 +31,12 @@ Answer generation is isolated in ``app/inquiry_answering.py`` so Issue #286
 (Question Router / Investigation Agent) can replace the reasoning-model call
 without touching this lifecycle/transition logic.
 
+At most one Inquiry may be active (``status IN ('open', 'held')``) per
+origin at a time: ``create_inquiry`` 409s (``inquiry_already_active``) when
+one already exists, and a closing transition only releases the origin item
+back to ``'open'`` when no OTHER active Inquiry remains for that same
+origin (defense in depth for any pre-existing duplicate rows).
+
 probe-agent:
   role: API boundary for the Inquiry side-conversation lifecycle (held
     pending -> resolved/unresolved/held/cancelled)
@@ -498,16 +504,33 @@ def _apply_transition(
         # is deliberately excluded (not in _CLOSED_STATUSES): the Inquiry is
         # only paused, not closed, so the item stays 'inquiry' until it
         # actually resolves/unresolves/cancels.
+        #
+        # Finding 7 fix (defense in depth): create_inquiry now refuses to
+        # open a second active Inquiry for the same origin, but this guard
+        # stays regardless -- pre-existing duplicate rows (from before this
+        # fix) must not have the origin released while ANOTHER Inquiry on
+        # the same origin is still open/held.
         if target_status in _CLOSED_STATUSES:
-            _set_review_item_status(
-                conn,
-                origin_kind=inquiry_row["origin_kind"],
-                origin_id=inquiry_row["origin_id"],
-                session_id=inquiry_row["session_id"],
-                system_id=inquiry_row["system_id"],
-                status="open",
-                now=now,
-            )
+            other_active = conn.execute(
+                """SELECT id FROM interview_inquiry
+                   WHERE session_id = ? AND system_id = ? AND origin_kind = ?
+                     AND origin_id = ? AND id != ? AND status IN ('open', 'held')""",
+                (
+                    inquiry_row["session_id"], inquiry_row["system_id"],
+                    inquiry_row["origin_kind"], inquiry_row["origin_id"],
+                    inquiry_row["id"],
+                ),
+            ).fetchone()
+            if other_active is None:
+                _set_review_item_status(
+                    conn,
+                    origin_kind=inquiry_row["origin_kind"],
+                    origin_id=inquiry_row["origin_id"],
+                    session_id=inquiry_row["session_id"],
+                    system_id=inquiry_row["system_id"],
+                    status="open",
+                    now=now,
+                )
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
@@ -543,6 +566,16 @@ def create_inquiry(
     question are still persisted (so the developer can retry via
     ``/message``); only the assistant message is withheld, and the response
     is a 502 whose detail carries the created ``inquiry_id``.
+
+    Finding 7 fix: at most one Inquiry may be active (``status IN ('open',
+    'held')``) per origin (session_id/system_id/origin_kind/origin_id) at a
+    time -- a second attempt is rejected with 409
+    ``inquiry_already_active`` carrying the existing ``inquiry_id``. The
+    check runs inside the same transaction as the INSERT below; ``db.py``'s
+    single global connection lock (``get_conn``) serializes all writers, so
+    this in-transaction check-then-insert is race-free without needing a
+    partial unique index (which pre-existing duplicate rows could fail to
+    migrate under).
     """
     if payload.origin_kind not in ORIGIN_KINDS:
         raise HTTPException(status_code=422, detail="Invalid origin_kind")
@@ -554,6 +587,22 @@ def create_inquiry(
         )
 
         conn.execute("BEGIN")
+        existing_active = conn.execute(
+            """SELECT id FROM interview_inquiry
+               WHERE session_id = ? AND system_id = ? AND origin_kind = ?
+                 AND origin_id = ? AND status IN ('open', 'held')""",
+            (session_id, system_id, payload.origin_kind, payload.origin_id),
+        ).fetchone()
+        if existing_active is not None:
+            conn.execute("ROLLBACK")
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "inquiry_already_active",
+                    "message": "An Inquiry is already open or held for this item.",
+                    "inquiry_id": existing_active["id"],
+                },
+            )
         try:
             cur = conn.execute(
                 """INSERT INTO interview_inquiry
