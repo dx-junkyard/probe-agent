@@ -25,6 +25,16 @@ failure, or a structured-output validation failure (including a category
 outside the finite set) all return an error result -- callers must not
 persist a route decision or treat the question as routed. Never a heuristic
 substitute (e.g. never fall back to a keyword-based guess).
+
+Issue #291 extends the schema additively with ``knowledge_area``: which of a
+fixed set of knowledge areas (product_intent | domain_rule | operations |
+implementation | security, or null when none clearly fits) the question
+belongs to. This is used only to group out-of-area questions in the
+Dashboard (routes/interview.py's askable-view filter) -- it never hides a
+question, and it is always the LLM's classification, never a deterministic
+guess from title/repository text (Principle 6). Adding this field bumped
+both ``PROMPT_VERSION`` and ``SCHEMA_VERSION`` to 'question-router-v2'
+(Principle 7: any prompt/schema change is a new version).
 """
 
 from __future__ import annotations
@@ -38,11 +48,19 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from .interview_language import language_directive
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient, is_reasoning_model
 
-PROMPT_VERSION = "question-router-v1"
-SCHEMA_VERSION = "question-router-v1"
+PROMPT_VERSION = "question-router-v2"
+SCHEMA_VERSION = "question-router-v2"
 
 RouteCategory = Literal["human_only", "system_researchable", "hybrid"]
 ROUTE_CATEGORIES = ("human_only", "system_researchable", "hybrid")
+
+# Issue #291: finite knowledge-area set (Principle 6). Kept here (rather than
+# only in models.py) since the router's own schema validation must reject an
+# out-of-set value fail-closed, the same discipline as ROUTE_CATEGORIES.
+KnowledgeArea = Literal[
+    "product_intent", "domain_rule", "operations", "implementation", "security",
+]
+KNOWLEDGE_AREAS = ("product_intent", "domain_rule", "operations", "implementation", "security")
 
 
 # --- Raw response schema (what we require the model to return) --------------
@@ -54,6 +72,11 @@ class _RawRouteResponse(BaseModel):
     category: str = Field(..., min_length=1, max_length=50)
     reason: str = Field(..., min_length=1, max_length=1_000)
     research_focus: Optional[str] = Field(default=None, max_length=1_000)
+    # Issue #291: additive, nullable. Absent/omitted by older prompt
+    # callers would fail model_validate under extra="forbid" only if an
+    # UNKNOWN field were sent; a missing optional field is fine (defaults to
+    # None), so this is a backward-compatible addition to the schema.
+    knowledge_area: Optional[str] = Field(default=None, max_length=50)
 
 
 # --- Public result type -------------------------------------------------------
@@ -69,6 +92,9 @@ class RouteResult:
     category: Optional[str] = None
     reason: str = ""
     research_focus: Optional[str] = None
+    # Issue #291: null when the model found no clearly-matching area -- never
+    # hidden from the list, only used for out-of-area grouping.
+    knowledge_area: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -103,7 +129,8 @@ commentary), matching exactly this shape:
 {
   "category": "human_only | system_researchable | hybrid",
   "reason": "a short reason for this classification",
-  "research_focus": "what a read-only code investigation should look for, or null for human_only"
+  "research_focus": "what a read-only code investigation should look for, or null for human_only",
+  "knowledge_area": "product_intent | domain_rule | operations | implementation | security | null"
 }
 
 Rules:
@@ -112,6 +139,14 @@ Rules:
 investigate). For "system_researchable" and "hybrid" it should name the \
 concrete thing to look for in the code (e.g. a symbol, a file area, a \
 behavior) -- never a restatement of "look for the answer".
+- "knowledge_area" classifies which single knowledge area the question \
+belongs to, used only to group who should answer it -- never to hide it:
+  - "product_intent": product goals, priorities, business tradeoffs
+  - "domain_rule": business/domain rules the system must follow
+  - "operations": how the system is run, deployed, monitored day to day
+  - "implementation": how the code itself is built/structured
+  - "security": security, auth, or access-control specific questions
+  Return null when no single area clearly fits -- never guess.
 - You never decide, adopt, apply, or answer anything yourself here. This \
 step only classifies the question.
 """
@@ -186,6 +221,16 @@ def route_question(
             error=f"Model returned an invalid category: {validated.category!r}",
         )
 
+    # Issue #291: fail-closed on an out-of-set knowledge_area too (Principle
+    # 6) -- null is valid (no area fits), an unknown string is not.
+    if validated.knowledge_area is not None and validated.knowledge_area not in KNOWLEDGE_AREAS:
+        return RouteResult(
+            provider=config.provider,
+            model=config.model,
+            is_mock=False,
+            error=f"Model returned an invalid knowledge_area: {validated.knowledge_area!r}",
+        )
+
     research_focus = validated.research_focus if validated.category != "human_only" else None
 
     return RouteResult(
@@ -195,4 +240,5 @@ def route_question(
         category=validated.category,
         reason=validated.reason,
         research_focus=research_focus,
+        knowledge_area=validated.knowledge_area,
     )

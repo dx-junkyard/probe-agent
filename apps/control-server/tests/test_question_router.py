@@ -7,6 +7,9 @@ Covers:
 2. POST /interview/qa/{qa_id}/route: persists route_category/route_run_id
    on success, records a failed intelligence_runs row and leaves the
    question unrouted on failure, and System isolation.
+3. Issue #291: additive knowledge_area field bumped to prompt/schema
+   version 'question-router-v2' -- null and each valid enum value parse,
+   an invalid value fails closed, and the route endpoint persists it.
 """
 
 from __future__ import annotations
@@ -19,7 +22,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.llm import LLMClient, LLMConfig, LLMError, MockLLMClient
-from app.question_router import ROUTE_CATEGORIES, PROMPT_VERSION, SCHEMA_VERSION, route_question
+from app.question_router import (
+    KNOWLEDGE_AREAS,
+    PROMPT_VERSION,
+    ROUTE_CATEGORIES,
+    SCHEMA_VERSION,
+    route_question,
+)
 
 
 def _make_config(provider="anthropic", model="claude-sonnet-4-5"):
@@ -88,6 +97,55 @@ def test_route_question_parses_each_category(category):
     assert result.reason == "根拠"
     assert result.prompt_version == PROMPT_VERSION
     assert result.schema_version == SCHEMA_VERSION
+
+
+def test_route_question_prompt_and_schema_version_bumped_for_291():
+    """Issue #291 added knowledge_area additively -- both versions bumped
+    to 'question-router-v2' (Principle 7: any prompt/schema change is a new
+    version)."""
+    assert PROMPT_VERSION == "question-router-v2"
+    assert SCHEMA_VERSION == "question-router-v2"
+
+
+def test_route_question_accepts_null_knowledge_area():
+    client = FakeLLMClient(response={
+        "category": "human_only", "reason": "r", "research_focus": None, "knowledge_area": None,
+    })
+    result = route_question(client, _make_config(), question_text="q")
+    assert result.error is None
+    assert result.knowledge_area is None
+
+
+@pytest.mark.parametrize("area", KNOWLEDGE_AREAS)
+def test_route_question_parses_each_knowledge_area(area):
+    client = FakeLLMClient(response={
+        "category": "system_researchable", "reason": "r",
+        "research_focus": "focus", "knowledge_area": area,
+    })
+    result = route_question(client, _make_config(), question_text="q")
+    assert result.error is None
+    assert result.knowledge_area == area
+
+
+def test_route_question_fails_closed_on_unknown_knowledge_area():
+    client = FakeLLMClient(response={
+        "category": "system_researchable", "reason": "r",
+        "research_focus": "focus", "knowledge_area": "not_a_real_area",
+    })
+    result = route_question(client, _make_config(), question_text="q")
+    assert result.error is not None
+    assert "invalid knowledge_area" in result.error
+
+
+def test_route_question_missing_knowledge_area_defaults_to_none():
+    """Backward compatible: an older prompt reply that omits the field
+    entirely is still valid, not a parse failure."""
+    client = FakeLLMClient(response={
+        "category": "human_only", "reason": "r", "research_focus": None,
+    })
+    result = route_question(client, _make_config(), question_text="q")
+    assert result.error is None
+    assert result.knowledge_area is None
 
 
 def test_route_question_forces_research_focus_null_for_human_only():
@@ -178,7 +236,10 @@ def _create_qa(client, headers, session_id, question_text="この関数の目的
     return r.json()
 
 
-def _stub_route(monkeypatch, *, category="system_researchable", reason="r", research_focus="focus", error=None):
+def _stub_route(
+    monkeypatch, *, category="system_researchable", reason="r", research_focus="focus",
+    knowledge_area=None, error=None,
+):
     from app.routes import question_router as router_routes
     from app.question_router import RouteResult
 
@@ -189,7 +250,7 @@ def _stub_route(monkeypatch, *, category="system_researchable", reason="r", rese
         return RouteResult(
             provider="anthropic", model="claude-sonnet-4-5", is_mock=False,
             category=None if error else category, reason=reason,
-            research_focus=research_focus, error=error,
+            research_focus=research_focus, knowledge_area=knowledge_area, error=error,
         )
 
     monkeypatch.setattr(router_routes, "create_llm_client", fake_create_llm_client)
@@ -217,7 +278,45 @@ def test_route_qa_persists_category_and_run_id(admin_client, monkeypatch):
         ).fetchone()
     assert run["run_type"] == "question_route"
     assert run["status"] == "completed"
-    assert run["prompt_version"] == PROMPT_VERSION
+
+
+def test_route_qa_persists_knowledge_area(admin_client, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    qa = _create_qa(admin_client, headers, session_id)
+
+    _stub_route(monkeypatch, category="hybrid", knowledge_area="implementation")
+    r = admin_client.post(f"/interview/qa/{qa['id']}/route", headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["knowledge_area"] == "implementation"
+
+    listed = admin_client.get(f"/interview/sessions/{session_id}/qa", headers=headers).json()
+    item = next(i for i in listed["items"] if i["id"] == qa["id"])
+    assert item["knowledge_area"] == "implementation"
+
+
+def test_route_qa_null_knowledge_area_stays_askable(admin_client, monkeypatch):
+    """An unrouted (or routed-but-no-area) question is never hidden."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    qa = _create_qa(admin_client, headers, session_id)
+
+    _stub_route(monkeypatch, category="human_only", knowledge_area=None)
+    r = admin_client.post(f"/interview/qa/{qa['id']}/route", headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["knowledge_area"] is None
+
+    admin_client.put(
+        f"/interview/sessions/{session_id}/answerable-areas",
+        json={"areas": ["security"]},
+        headers=headers,
+    )
+    askable = admin_client.get(
+        f"/interview/sessions/{session_id}/qa?view=askable", headers=headers,
+    ).json()
+    assert any(i["id"] == qa["id"] for i in askable["items"])
 
 
 def test_route_qa_fails_closed_leaves_question_unrouted(admin_client, monkeypatch):

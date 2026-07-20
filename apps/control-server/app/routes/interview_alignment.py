@@ -124,6 +124,7 @@ def _item_out(row) -> AlignmentItemOut:
         runtime_check=row["runtime_check"] if "runtime_check" in row.keys() else None,
         status=row["status"],
         user_decision=AlignmentUserDecisionOut(**user_decision) if user_decision else None,
+        handoff_id=row["handoff_id"] if "handoff_id" in row.keys() else None,
         intelligence_run_id=row["intelligence_run_id"],
         is_mock=bool(row["is_mock"]),
         created_at=row["created_at"],

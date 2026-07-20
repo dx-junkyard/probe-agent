@@ -67,6 +67,7 @@ from ..understanding_diff import (
     revision_limit,
 )
 from ..models import (
+    AnswerableAreasUpdateRequest,
     InterviewApprovedItemOut,
     InterviewApprovedSetOut,
     InterviewConfirmUnderstandingRequest,
@@ -318,6 +319,11 @@ def _session_out(conn, row) -> InterviewSessionOut:
         materialization_diff=row["materialization_diff"],
         materialization_ref=row["materialization_ref"],
         materialized_at=row["materialized_at"],
+        answerable_areas=(
+            _json.loads(row["answerable_areas"])
+            if ("answerable_areas" in row.keys() and row["answerable_areas"])
+            else []
+        ),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -395,6 +401,12 @@ def _qa_out(row) -> InterviewQaOut:
         ),
         route_run_id=(
             row["route_run_id"] if "route_run_id" in row.keys() else None
+        ),
+        knowledge_area=(
+            row["knowledge_area"] if "knowledge_area" in row.keys() else None
+        ),
+        handoff_id=(
+            row["handoff_id"] if "handoff_id" in row.keys() else None
         ),
     )
 
@@ -600,6 +612,45 @@ def get_interview_session(
             messages=[_message_out(m) for m in message_rows],
             proposals=[_proposal_out(conn, p) for p in proposal_rows],
         )
+
+
+@router.put(
+    "/interview/sessions/{session_id}/answerable-areas",
+    response_model=InterviewSessionOut,
+)
+def update_answerable_areas(
+    session_id: int,
+    payload: AnswerableAreasUpdateRequest,
+    system_id: int = Depends(get_system_id),
+) -> InterviewSessionOut:
+    """Set which knowledge areas the developer can answer RIGHT NOW.
+
+    No role inference (Principle 6/8's actor convention): the developer
+    picks their own answerable areas, changeable at any time during the
+    session. An empty list means NO FILTERING -- every question stays
+    askable regardless of its knowledge_area, exactly like the pre-#291
+    default -- never "every area is answerable".
+
+    probe-agent:
+      role: API boundary for setting the session's answerable knowledge
+        areas
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: write
+      state_effects: [database-write]
+      probe_value: Verify the selection persists, is changeable at any session stage, and that an empty list disables (not enables-all) area filtering.
+    """
+    now = time.time()
+    with get_conn() as conn:
+        _get_session_or_404(conn, session_id, system_id)
+        conn.execute(
+            "UPDATE interview_session SET answerable_areas = ?, updated_at = ? "
+            "WHERE id = ? AND system_id = ?",
+            (json.dumps(payload.areas), now, session_id, system_id),
+        )
+        row = _get_session_or_404(conn, session_id, system_id)
+        return _session_out(conn, row)
 
 
 def _latest_ready_snapshot_id(conn, system_id: int) -> Optional[int]:
@@ -1653,12 +1704,45 @@ def interview_dialogue_turn(
 # --- Structured Interview Q&A (Issue #129) -----------------------------------
 
 
+def _is_out_of_area(knowledge_area: Optional[str], answerable_areas: List[str]) -> bool:
+    """Deterministic out-of-area rule (Issue #291, Principle 6).
+
+    A question is out-of-area for the current user iff the session has a
+    non-empty answerable-areas selection AND the question has a (non-null)
+    knowledge_area AND that area is not in the selection. An empty
+    selection means no filtering; an unrouted (null-area) question is
+    always in-area -- it is never hidden for lack of a classification.
+    """
+    if not answerable_areas:
+        return False
+    if not knowledge_area:
+        return False
+    return knowledge_area not in answerable_areas
+
+
+def _held_via_pending_handoff(conn, handoff_id: Optional[int], system_id: int) -> bool:
+    """True while a qa row's linked handoff is still pending/answered.
+
+    Once the handoff is 'returned' (surfaced back for explicit confirmation)
+    or 'cancelled', the question is askable again -- only an in-flight
+    handoff suppresses re-asking (Issue #291's duplicate-suppression rule).
+    """
+    if handoff_id is None:
+        return False
+    row = conn.execute(
+        "SELECT status FROM question_handoff WHERE id = ? AND system_id = ?",
+        (handoff_id, system_id),
+    ).fetchone()
+    return row is not None and row["status"] in ("pending", "answered")
+
+
 @router.get(
     "/interview/sessions/{session_id}/qa",
     response_model=InterviewQaListOut,
 )
 def list_interview_qa(
     session_id: int,
+    view: Optional[str] = Query(default=None),
     system_id: int = Depends(get_system_id),
 ) -> InterviewQaListOut:
     """List the current Q&A rows for a session.
@@ -1668,6 +1752,15 @@ def list_interview_qa(
     are reachable only via the ``previous`` field of the answer endpoint's
     response, not this list — this keeps the list one row per question.
 
+    Issue #291: ``?view=askable`` returns the same rows further filtered to
+    the primary "次に回答する質問" flow -- excluding rows that are already
+    answered, held via a still-pending/answered handoff, or out-of-area for
+    the session's current ``answerable_areas`` selection (see
+    ``_is_out_of_area`` / ``_held_via_pending_handoff``). This is the single
+    server-side source of truth for duplicate suppression so the dashboard
+    and any future agent never re-derive it independently. Omitting ``view``
+    (or any other value) keeps the existing full-list behavior unchanged.
+
     probe-agent:
       role: API boundary for the structured interview Q&A list
       capability: interactive-system-understanding
@@ -1675,7 +1768,7 @@ def list_interview_qa(
       consumers: [dashboard]
       operation_kind: read
       state_effects: [database-read]
-      probe_value: Verify the list excludes superseded rows and reports open/high-priority counts correctly
+      probe_value: Verify the list excludes superseded rows and reports open/high-priority counts correctly, and that view=askable excludes answered/handoff-pending/out-of-area rows while keeping unrouted null-area rows askable
     """
     with get_conn() as conn:
         session = _get_session_or_404(conn, session_id, system_id)
@@ -1686,6 +1779,18 @@ def list_interview_qa(
             (session_id, system_id),
         ).fetchall()
         items = [_qa_out(r) for r in rows]
+        if view == "askable":
+            answerable_areas = (
+                json.loads(session["answerable_areas"])
+                if ("answerable_areas" in session.keys() and session["answerable_areas"])
+                else []
+            )
+            items = [
+                i for i in items
+                if i.status != "answered"
+                and not _held_via_pending_handoff(conn, i.handoff_id, system_id)
+                and not _is_out_of_area(i.knowledge_area, answerable_areas)
+            ]
         open_items = [i for i in items if i.status == "open"]
         return InterviewQaListOut(
             session_id=session_id,
@@ -1784,6 +1889,34 @@ def answer_interview_qa(
                 status_code=409,
                 detail="This question has already been superseded by a newer revision",
             )
+
+        # Issue #291: explicit-confirm provenance for a returned handoff.
+        # This never writes the handoff's own answer_text/answered_by into
+        # interview_qa -- the developer's own answer_text/actor above are
+        # what gets recorded; this only validates that the referenced
+        # handoff really belongs to this question and has actually been
+        # returned for confirmation (Principle 2 -- an assignee's answer is
+        # never silently treated as the developer's own).
+        if payload.handoff_id is not None:
+            handoff = conn.execute(
+                "SELECT * FROM question_handoff WHERE id = ? AND system_id = ?",
+                (payload.handoff_id, system_id),
+            ).fetchone()
+            if handoff is None:
+                raise HTTPException(status_code=404, detail="Handoff not found")
+            if handoff["origin_kind"] != "qa" or handoff["origin_id"] != qa_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This handoff does not belong to this question",
+                )
+            if handoff["status"] != "returned":
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "This handoff has not been returned for confirmation "
+                        f"(current status: {handoff['status']})"
+                    ),
+                )
 
         proposal_row = conn.execute(
             "SELECT id FROM interview_proposal WHERE session_id = ? LIMIT 1",

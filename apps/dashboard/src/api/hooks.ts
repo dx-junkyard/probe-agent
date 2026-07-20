@@ -66,6 +66,8 @@ import type {
   CandidateSessionOut, CandidateSessionCreateRequest, CandidateVersionOut,
   CandidatePromotionOut,
   BootstrapStatusOut,
+  KnowledgeArea, HandoffOriginKind, HandoffPriority, HandoffStatus,
+  QuestionHandoffListOut, QuestionHandoffOut, QuestionHandoffEvidenceRef,
 } from "./types";
 
 export function sysKey(base: string, ...extra: unknown[]) {
@@ -787,19 +789,108 @@ export function useCreateInterviewQa(sessionId: number | null) {
 export function useAnswerInterviewQa(sessionId: number | null) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ qaId, answer_text, actor, answer_unknown }: { qaId: number; answer_text: string; actor: string; answer_unknown?: boolean }) =>
+    mutationFn: ({
+      qaId, answer_text, actor, answer_unknown, handoff_id,
+    }: {
+      qaId: number; answer_text: string; actor: string; answer_unknown?: boolean;
+      // Issue #291: set only when this answer is the original developer's
+      // explicit confirmation of a returned handoff's assignee answer.
+      handoff_id?: number;
+    }) =>
       api.post<InterviewQaAnswerOut>(
         `/interview/sessions/${sessionId}/qa/${qaId}/answer`,
-        { answer_text, actor, answer_unknown: answer_unknown ?? false },
+        { answer_text, actor, answer_unknown: answer_unknown ?? false, handoff_id },
       ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] });
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+      // Issue #291: confirming a handoff's answer changes handoff state too.
+      qc.invalidateQueries({ queryKey: [...sysKey("questionHandoffs"), sessionId] });
       // Issue #288: the server enqueues an automatic refresh right after
       // this answer commits; refetch its status so the chip updates
       // promptly instead of waiting for the next poll tick.
       _invalidateAfterAnswerBatch(qc, sessionId);
     },
+  });
+}
+
+// --- Answerable knowledge areas / handoff (Issue #291) ------------------------
+
+export function useUpdateAnswerableAreas(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (areas: KnowledgeArea[]) =>
+      api.put<InterviewSessionOut>(`/interview/sessions/${sessionId}/answerable-areas`, { areas }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+      qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
+      // Area filtering changes which questions are askable.
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] });
+    },
+  });
+}
+
+export function useQuestionHandoffs(sessionId: number | null, status?: HandoffStatus) {
+  return useQuery({
+    queryKey: [...sysKey("questionHandoffs"), sessionId, status ?? "all"],
+    queryFn: () => api.get<QuestionHandoffListOut>(
+      `/interview/sessions/${sessionId}/handoffs${status ? `?status=${status}` : ""}`,
+    ),
+    enabled: !!sessionId && !!getSystemId(),
+  });
+}
+
+function _invalidateHandoffs(qc: ReturnType<typeof useQueryClient>, sessionId: number | null) {
+  qc.invalidateQueries({ queryKey: [...sysKey("questionHandoffs"), sessionId] });
+  // A handoff creation/transition can also touch the origin qa/alignment row
+  // (handoff_id link, or alignment_item.status='held').
+  qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] });
+  qc.invalidateQueries({ queryKey: [...sysKey("alignment"), sessionId] });
+  qc.invalidateQueries({ queryKey: [...sysKey("reviewQueue"), sessionId] });
+}
+
+export function useCreateQuestionHandoff(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: {
+      origin_kind: HandoffOriginKind;
+      origin_id: number;
+      assignee: string;
+      background: string;
+      needed_decision: string;
+      evidence?: QuestionHandoffEvidenceRef[];
+      due_note?: string;
+      priority?: HandoffPriority;
+      created_by?: string;
+    }) => api.post<QuestionHandoffOut>(`/interview/sessions/${sessionId}/handoffs`, data),
+    onSuccess: () => _invalidateHandoffs(qc, sessionId),
+  });
+}
+
+export function useAnswerQuestionHandoff(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ handoffId, answer_text, answered_by }: { handoffId: number; answer_text: string; answered_by: string }) =>
+      api.post<QuestionHandoffOut>(`/interview/handoffs/${handoffId}/answer`, { answer_text, answered_by }),
+    onSuccess: () => _invalidateHandoffs(qc, sessionId),
+  });
+}
+
+export function useReturnQuestionHandoff(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ handoffId }: { handoffId: number }) =>
+      api.post<QuestionHandoffOut>(`/interview/handoffs/${handoffId}/return`),
+    onSuccess: () => _invalidateHandoffs(qc, sessionId),
+  });
+}
+
+export function useCancelQuestionHandoff(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ handoffId }: { handoffId: number }) =>
+      api.post<QuestionHandoffOut>(`/interview/handoffs/${handoffId}/cancel`),
+    onSuccess: () => _invalidateHandoffs(qc, sessionId),
   });
 }
 

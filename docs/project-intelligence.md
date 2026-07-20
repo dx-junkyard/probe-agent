@@ -3419,3 +3419,134 @@ runtime_check == 'mismatch' -> must_review, runtime_mismatch
 - 進行的開示: assistant メッセージの `content` に生トレース/出所デー
   タが含まれないこと(`detail.runtime_evidence` にだけ入ること)を
   コンポーネント/ユニットテストで固定。
+
+## 回答可能領域と担当者引き継ぎ(Issue #291)
+
+開発者が「今回自分が答えられる領域」を明示的に選び(ロールからの推論は
+しない、Principle 6)、担当外の質問・Review Queue 項目は非表示にせず別
+グループへ回す。引き継いだ回答は必ず元のユーザーの明示確認を経てから
+本来の回答として確定する(Principle 2)。
+
+### 回答可能領域(`interview_session.answerable_areas`)
+
+- 有限集合 `KnowledgeArea`: `product_intent | domain_rule | operations |
+  implementation | security`。`app/models.py`(`InterviewSessionOut`
+  より前)と `app/question_router.py`(`KNOWLEDGE_AREAS`)の双方に定義
+  し、値を一致させる。
+- `interview_session.answerable_areas`(additive、`TEXT NOT NULL DEFAULT
+  '[]'`、JSON 配列)。`PUT /interview/sessions/{id}/answerable-areas
+  {areas: [...]}` でいつでも変更できる。**空配列は「フィルタなし」**
+  (#291 以前と同じ全件表示)であって「全領域を選択した」ではない —
+  この違いは UI・API どちらでも明示する。
+
+### 質問への領域タグ付け(`interview_qa.knowledge_area`)
+
+- `interview_qa.knowledge_area`(additive、`TEXT NULL`)。Question
+  Router(#286、`app/question_router.py`)の reasoning モデル呼び出しで
+  のみ設定される。プロンプト/スキーマへ `knowledge_area`
+  (finite enum または null)を additive に追加し、`PROMPT_VERSION` /
+  `SCHEMA_VERSION` を `question-router-v2` へバンプ(Principle 7)。
+  fail-closed: 集合外の値はエラー、`null` は正当な「どの領域にも当ては
+  まらない」判定として受理する。タイトルやリポジトリ情報からの決定的
+  推論は行わない(Principle 6)。未ルーティング(`null`)の質問は絶対
+  に非表示にしない。
+
+### 決定的な対象外判定
+
+`routes/interview.py::_is_out_of_area` — 質問が現在のユーザーにとって
+「対象外」なのは、`session.answerable_areas` が空でなく **かつ**
+`question.knowledge_area` が非 null **かつ** その領域が
+`answerable_areas` に含まれない場合のみ。対象外の質問は非表示にせず、
+別グループへ分類し 後で回答 / 保留 / 引き継ぐ の操作を提供する。
+「わからない」を低確信度の Yes/No などへ変換することは決してしない。
+
+### 引き継ぎ(`question_handoff` テーブル、`routes/interview_handoff.py`)
+
+System スコープの additive テーブル。`origin_kind` は有限集合 `qa |
+review_item`(#285/#287 と同じ finite origin_kind パターン)。
+`assignee` / `created_by` / `answered_by` は自由文の担当者名/連絡先
+(組織的な認証システムは無いため、既存の `understanding_confirmed_by` /
+`interview_qa.answered_by` と同じ慣習を踏襲)。
+
+引き継ぎの作成は元の項目の回答・判断フィールドへは一切書き込まない:
+
+- `origin_kind='qa'`: `interview_qa.status` はそのまま変更しない
+  (既存の finite set を上書きしない、#285/#287 の方針を踏襲)。
+  additive な `interview_qa.handoff_id` だけを設定する。
+- `origin_kind='review_item'`: `alignment_item.status` を
+  `'held'`(既存の `/hold` エンドポイントと同じ値)にし、additive な
+  `alignment_item.handoff_id` を設定する(`user_decision` は書き込ま
+  ない — 引き継ぎは判断ではない)。
+
+ライフサイクル(有限遷移表、Principle 6):
+
+```
+pending -> answered | cancelled
+answered -> returned
+それ以外 -> 409
+```
+
+- `POST /interview/sessions/{id}/handoffs` — 作成、`pending` で開始。
+  対象項目に既に in-flight(`pending`/`answered`)な引き継ぎがある場合
+  は `409 handoff_already_in_flight`。
+- `GET /interview/sessions/{id}/handoffs?status=` — 一覧・状態フィルタ。
+- `POST /interview/handoffs/{id}/answer {answer_text, answered_by}` —
+  担当者自身の回答を **引き継ぎ行にだけ** 記録する(`answered` へ遷
+  移)。元の `interview_qa`/`alignment_item` 行は一切変更しない。
+- `POST /interview/handoffs/{id}/return` — `returned` へ遷移。UI は
+  担当者の回答を元の項目に「引き継ぎ先の回答(未確定)」として表示す
+  る。ここでも元の行への書き込みは無い。
+- `POST /interview/handoffs/{id}/cancel` — `pending` からのみ
+  `cancelled` へ。
+
+### 明示確認による確定
+
+`return` された引き継ぎは、元のユーザーが **既存の回答エンドポイント**
+経由で明示的に確定する。`interview_qa` の
+`POST .../qa/{id}/answer` を additive に拡張し、任意の `handoff_id` を
+受け付ける:サーバーは当該 handoff が存在し、この質問に属し、
+`status='returned'` であることを検証したうえで、通常どおり
+`answer_text`/`actor` を記録する(担当者の回答をそのまま「元ユーザーの
+回答」として書き込むことは絶対にしない — 開発者自身が
+`answer_text`/`actor` を送信する)。検証失敗(未 return / 対象質問不一
+致 / 存在しない)は 409/404。Alignment 側の `/answer`・`/correct` は本
+issue では拡張しない(brief が明示的に要求していないため) — 引き継ぎ
+の来歴は `alignment_item.handoff_id` と `status='held'` だけで追跡でき
+る。
+
+### 重複抑止(決定的)
+
+`GET /interview/sessions/{id}/qa?view=askable` — 「次に回答する質問」
+の一次フローが共有する単一のサーバー側フィルタ。除外条件:
+回答済み(`status == 'answered'`)、in-flight な引き継ぎあり
+(`handoff_id` が `pending`/`answered` の引き継ぎを指す)、対象外
+(`_is_out_of_area`)。`view` を指定しない既存の一覧は挙動不変。
+
+### Dashboard
+
+- セッションヘッダーの「今回回答できる領域」チップ(5 領域、日本語ラ
+  ベル: 事業・目的 / 業務ルール / 運用 / 実装 / セキュリティ)、
+  `PUT` で即時反映、セッション中いつでも変更可能。
+- Q&A パネル: 対象外の質問を「担当外の質問」として別グループ表示し、
+  後で回答(既存 skip 再利用) / 担当者へ引き継ぐ(モーダル: 担当者・
+  背景・決めてほしいこと・優先度・期限メモ)を提供する。
+- Review Queue: 各項目に「担当者へ引き継ぐ」操作を追加(alignment_item
+  は領域タグを持たないため対象外グルーピングは行わない — 引き継ぎ機能
+  のみ)。
+- 引き継ぎ一覧パネル: pending/answered/returned を日本語で表示。
+  `returned` の項目は担当者の回答を「引き継ぎ先の回答(未確定)」と
+  マークし、「この内容で回答を確定する」ボタンから通常の回答エンドポ
+  イントを呼び出す(明示確定)。
+- 生の enum 値をそのまま表示しない(Issue #266 規約)。
+
+### テスト
+
+- `tests/test_interview_handoff.py`(新規): 領域選択の検証・随時変更・
+  空配列でのフィルタなし、askable ビューの回答済み/引き継ぎ中/対象外
+  除外と null 領域の非表示なし、引き継ぎのライフサイクル・不正遷移
+  409、`/answer` が元行に一切書き込まないこと(回帰)、
+  `return` 後の明示確認で確定ユーザーと `handoff_id` 来歴が記録される
+  こと、キャンセル経路、System 分離。
+- `tests/test_question_router.py` 拡張: `question-router-v2` への
+  バンプ、`knowledge_area` の null/各 enum 値の受理、集合外値の
+  fail-closed、ルーティング結果の永続化。

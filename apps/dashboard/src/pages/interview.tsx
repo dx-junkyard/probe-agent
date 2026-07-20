@@ -37,6 +37,8 @@ import { DiagnosticFixCallout, useDiagnosticHighlight } from "@/components/diagn
 import { UnderstandingOverview } from "@/components/system-understanding/understanding-overview";
 import { IntentBriefPanel } from "@/components/system-understanding/intent-brief-panel";
 import { ReviewQueuePanel } from "@/components/system-understanding/review-queue";
+import { AnswerableAreasControl, isOutOfArea, knowledgeAreaLabel } from "@/components/system-understanding/answerable-areas";
+import { HandoffListPanel, HandoffModal } from "@/components/system-understanding/handoff-panel";
 import { ObservationProposalPanel } from "@/components/system-understanding/observation-proposal-panel";
 import { ChangeSetPanel } from "@/components/system-understanding/change-set-panel";
 import { InquiryPanel } from "@/components/system-understanding/inquiry-panel";
@@ -64,6 +66,7 @@ import type {
   InterviewQuestionEvidenceRef,
   InterviewSessionDetailOut,
   InterviewStage,
+  KnowledgeArea,
   OpenQuestion,
   ProbeRecommendedMode,
   ProbeReplayability,
@@ -426,6 +429,7 @@ function NextActionBanner({ uiState, nextAction }: {
 // 旧回答も previous として残る(上書きしない)。
 function QaItemCard({
   qa, sessionId, existingInquiry, onAnswer, onSkip, onResume, answering, skipping, resuming,
+  outOfArea,
 }: {
   qa: InterviewQaOut;
   sessionId: number;
@@ -439,12 +443,16 @@ function QaItemCard({
   answering: boolean;
   skipping: boolean;
   resuming: boolean;
+  // Issue #291: rendered in the 「担当外の質問」 group -- offers a handoff
+  // action in addition to the normal answer/skip actions.
+  outOfArea?: boolean;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(qa.answer_text ?? "");
   const [inquiryMode, setInquiryMode] = useState(false);
   const [hasHeldInquiry, setHasHeldInquiry] = useState(false);
   const [attachedInquiryId, setAttachedInquiryId] = useState<number | null>(null);
+  const [handoffOpen, setHandoffOpen] = useState(false);
   const resumeInquiry = useResumeInterviewInquiry(sessionId);
 
   const heldInquiryId = hasHeldInquiry
@@ -496,6 +504,11 @@ function QaItemCard({
         <div className="flex gap-1 shrink-0">
           {qa.question_source === "runtime" && (
             <Badge variant="secondary" data-testid={`qa-source-runtime-${qa.id}`}>実態チェック</Badge>
+          )}
+          {outOfArea && (
+            <Badge variant="warning" data-testid={`qa-out-of-area-${qa.id}`}>
+              担当外({knowledgeAreaLabel(qa.knowledge_area)})
+            </Badge>
           )}
           <Badge variant="outline">{qa.question_category}</Badge>
           <Badge variant={
@@ -636,6 +649,16 @@ function QaItemCard({
                   再開
                 </Button>
               )}
+              {outOfArea && qa.status === "open" && !qa.handoff_id && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setHandoffOpen(true)}
+                  data-testid={`qa-handoff-open-${qa.id}`}
+                >
+                  担当者へ引き継ぐ
+                </Button>
+              )}
               {reopenableInquiryId ? (
                 <Button
                   size="sm"
@@ -661,13 +684,36 @@ function QaItemCard({
           )}
         </>
       )}
+      {outOfArea && (
+        <HandoffModal
+          sessionId={sessionId}
+          originKind="qa"
+          originId={qa.id}
+          defaultBackground={qa.question_text}
+          defaultEvidence={qa.evidence_refs.map(e => ({
+            path: e.path, start_line: e.start_line, end_line: e.end_line, summary: "",
+          }))}
+          open={handoffOpen}
+          onOpenChange={setHandoffOpen}
+        />
+      )}
     </div>
   );
 }
 
-function QaPanel({
-  sessionId, actor, approvedCount,
-}: { sessionId: number; actor: string; approvedCount: number }) {
+// Exported for focused component testing (Issue #291's out-of-area
+// grouping) without rendering the entire InterviewPage.
+export function QaPanel({
+  sessionId, actor, approvedCount, answerableAreas,
+}: {
+  sessionId: number;
+  actor: string;
+  approvedCount: number;
+  // Issue #291: the session's current answerable-areas selection, used only
+  // to group out-of-area questions separately -- never to hide them.
+  // Defensively accepts undefined (a stale cached/mocked session shape).
+  answerableAreas: KnowledgeArea[] | null | undefined;
+}) {
   const { data: qaList } = useInterviewQaList(sessionId);
   const answer = useAnswerInterviewQa(sessionId);
   const skip = useSkipInterviewQa(sessionId);
@@ -718,6 +764,11 @@ function QaPanel({
   // that could be run.
   if (!qaList || (qaList.items.length === 0 && approvedCount === 0)) return null;
 
+  // Issue #291: out-of-area questions are never hidden -- only grouped
+  // separately under 「担当外の質問」, excluded from the primary list.
+  const inAreaItems = qaList.items.filter(qa => !isOutOfArea(qa.knowledge_area, answerableAreas));
+  const outOfAreaItems = qaList.items.filter(qa => isOutOfArea(qa.knowledge_area, answerableAreas));
+
   return (
     <Card data-testid="qa-panel">
       <CardHeader>
@@ -759,7 +810,7 @@ function QaPanel({
           </div>
         )}
         <div className="space-y-2 max-h-[26rem] overflow-y-auto pr-1">
-          {qaList.items.map(qa => (
+          {inAreaItems.map(qa => (
             <QaItemCard
               key={qa.id}
               qa={qa}
@@ -778,6 +829,35 @@ function QaPanel({
             />
           ))}
         </div>
+
+        {outOfAreaItems.length > 0 && (
+          <div className="pt-2 border-t space-y-2" data-testid="qa-out-of-area-group">
+            <p className="text-xs font-semibold text-muted-foreground">
+              担当外の質問({outOfAreaItems.length} 件)
+            </p>
+            <div className="space-y-2 max-h-[20rem] overflow-y-auto pr-1">
+              {outOfAreaItems.map(qa => (
+                <QaItemCard
+                  key={qa.id}
+                  qa={qa}
+                  sessionId={sessionId}
+                  existingInquiry={activeInquiries.get(`qa:${qa.id}`)}
+                  onAnswer={handleAnswer}
+                  onSkip={qaId => skip.mutate({ qaId, actor }, {
+                    onError: e => toast.error(String(e)),
+                  })}
+                  onResume={qaId => resume.mutate({ qaId, actor }, {
+                    onError: e => toast.error(String(e)),
+                  })}
+                  answering={answer.isPending}
+                  skipping={skip.isPending}
+                  resuming={resume.isPending}
+                  outOfArea
+                />
+              ))}
+            </div>
+          </div>
+        )}
       </CardContent>
     </Card>
   );
@@ -1864,6 +1944,7 @@ git commit`}
                       </div>
                     </div>
                   )}
+                  <AnswerableAreasControl sessionId={session.id} answerableAreas={session.answerable_areas} />
                 </CardContent>
               </Card>
 
@@ -1926,6 +2007,8 @@ git commit`}
 
               <ReviewQueuePanel sessionId={session.id} />
 
+              <HandoffListPanel sessionId={session.id} actor={actor} />
+
               <ObservationProposalPanel sessionId={session.id} />
 
               <ChangeSetPanel sessionId={session.id} />
@@ -1935,7 +2018,12 @@ git commit`}
                 answerRevisionReflected={answerRevisionReflected}
               />
 
-              <QaPanel sessionId={session.id} actor={actor} approvedCount={approvedCount} />
+              <QaPanel
+                sessionId={session.id}
+                actor={actor}
+                approvedCount={approvedCount}
+                answerableAreas={session.answerable_areas}
+              />
             </div>
           </div>
 

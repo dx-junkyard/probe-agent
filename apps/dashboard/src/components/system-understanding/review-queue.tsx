@@ -25,6 +25,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Textarea } from "@/components/ui/textarea";
 import { InquiryPanel } from "@/components/system-understanding/inquiry-panel";
 import { RefreshStatusChip } from "@/components/system-understanding/refresh-status-chip";
+import { HandoffModal } from "@/components/system-understanding/handoff-panel";
 import {
   useActiveInquiriesByOrigin,
   useAlignmentList,
@@ -138,6 +139,7 @@ function ReviewQueueItemCard({
   const [inquiryMode, setInquiryMode] = useState(false);
   const [hasHeldInquiry, setHasHeldInquiry] = useState(false);
   const [attachedInquiryId, setAttachedInquiryId] = useState<number | null>(null);
+  const [handoffOpen, setHandoffOpen] = useState(false);
 
   const isMustReview = item.review_category === "must_review";
   const locked = item.status === "inquiry";
@@ -359,8 +361,28 @@ function ReviewQueueItemCard({
           >
             保留
           </Button>
+          {!item.handoff_id && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setHandoffOpen(true)}
+              disabled={busy}
+              data-testid={`review-item-handoff-open-${item.id}`}
+            >
+              担当者へ引き継ぐ
+            </Button>
+          )}
         </div>
       )}
+      <HandoffModal
+        sessionId={sessionId}
+        originKind="review_item"
+        originId={item.id}
+        defaultBackground={item.current_claim}
+        defaultEvidence={item.current_evidence}
+        open={handoffOpen}
+        onOpenChange={setHandoffOpen}
+      />
     </div>
   );
 }

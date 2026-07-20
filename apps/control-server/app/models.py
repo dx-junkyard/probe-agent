@@ -2349,6 +2349,16 @@ class WorkspaceProposalDraftOut(BaseModel):
 InterviewSessionStatus = Literal["open", "proposals_ready", "materialized", "closed"]
 InterviewMessageRole = Literal["user", "assistant", "system"]
 
+# Issue #291: answerable knowledge areas / handoff finite sets. Defined here
+# (ahead of InterviewSessionOut/InterviewQaOut which reference KnowledgeArea)
+# rather than down by the rest of the Issue #291 models further below.
+KnowledgeArea = Literal[
+    "product_intent", "domain_rule", "operations", "implementation", "security",
+]
+HandoffOriginKind = Literal["qa", "review_item"]
+HandoffPriority = Literal["low", "normal", "high"]
+HandoffStatus = Literal["pending", "answered", "returned", "cancelled"]
+
 InterviewStage = Literal[
     "understanding_initialized",
     "purpose_confirmation",
@@ -2414,6 +2424,10 @@ class InterviewSessionOut(BaseModel):
     materialization_diff: Optional[str] = None
     materialization_ref: Optional[str] = None
     materialized_at: Optional[float] = None
+    # Issue #291: which knowledge areas the developer can answer RIGHT NOW
+    # (no role inference). Empty means no filtering -- the pre-#291 default
+    # of showing every question, never "every area selected".
+    answerable_areas: List[KnowledgeArea] = Field(default_factory=list)
     created_at: float
     updated_at: float
 
@@ -2864,6 +2878,14 @@ class InterviewQaAnswerRequest(BaseModel):
     answer_text: str = Field(default="", max_length=20_000)
     actor: str = Field(..., min_length=1, max_length=200)
     answer_unknown: bool = False
+    # Issue #291: set when this answer is the original user's EXPLICIT
+    # confirmation of a returned handoff's assignee answer (optionally
+    # prefilled client-side from QuestionHandoffOut.answer_text). The
+    # handoff's own answer_text/answered_by are never written here directly
+    # -- the developer still submits their own answer_text/actor; this only
+    # links the provenance (routes/interview.py validates the handoff
+    # exists, belongs to this question, and is status='returned').
+    handoff_id: Optional[int] = None
 
     @model_validator(mode="after")
     def _require_answer_or_unknown(self) -> "InterviewQaAnswerRequest":
@@ -2897,6 +2919,15 @@ class InterviewQaOut(BaseModel):
     # dialogue-turn questions). None until routed.
     route_category: Optional[str] = None
     route_run_id: Optional[int] = None
+    # Issue #291: knowledge area assigned by the same Question Router call
+    # (question-router-v2); null until routed or when no area clearly fits.
+    # Never inferred deterministically. Used only to group out-of-area
+    # questions -- it never hides a question from the full list.
+    knowledge_area: Optional[KnowledgeArea] = None
+    # Issue #291: set when this question has been handed off to an assignee
+    # (question_handoff.id). The origin row's own `status` is left
+    # untouched by a handoff (Principle 2/6 -- see db.py's table docstring).
+    handoff_id: Optional[int] = None
 
 
 class InterviewQaAnswerOut(BaseModel):
@@ -3178,6 +3209,11 @@ class AlignmentItemOut(BaseModel):
     runtime_check: Optional[RuntimeCheckState] = None
     status: AlignmentItemStatus
     user_decision: Optional[AlignmentUserDecisionOut] = None
+    # Issue #291: set when this review item has been handed off to an
+    # assignee (question_handoff.id, origin_kind='review_item'). Creating
+    # the handoff sets status='held' (the same value /hold already uses)
+    # alongside this column.
+    handoff_id: Optional[int] = None
     intelligence_run_id: int
     is_mock: bool = False
     created_at: float
@@ -3217,6 +3253,94 @@ class AlignmentCorrectRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     corrected_interpretation: str = Field(..., min_length=1, max_length=2_000)
+
+
+# --- Answerable knowledge areas / handoff (Issue #291) ------------------------
+#
+# A developer picks which knowledge areas they can answer NOW (no role
+# inference, Principle 6). KnowledgeArea (defined earlier, alongside
+# InterviewSessionStatus) is the same finite set the Question Router
+# (app/question_router.py question-router-v2) tags a question with; empty
+# session.answerable_areas means "no filtering" (unchanged default
+# behavior), never "all areas explicitly selected".
+
+
+class AnswerableAreasUpdateRequest(BaseModel):
+    """Replace the session's answerable-areas selection. Changeable anytime."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    areas: List[KnowledgeArea] = Field(default_factory=list, max_length=5)
+
+
+class QuestionHandoffEvidenceRef(BaseModel):
+    path: str = Field(..., min_length=1, max_length=500)
+    start_line: int = 0
+    end_line: int = 0
+    summary: str = Field(default="", max_length=2_000)
+
+
+class QuestionHandoffCreate(BaseModel):
+    """Hand an out-of-area (or otherwise deferred) item off to an assignee.
+
+    ``assignee`` is a free-text name/address -- no org auth system exists
+    yet (same convention as ``understanding_confirmed_by`` /
+    ``interview_qa.answered_by``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    origin_kind: HandoffOriginKind
+    origin_id: int
+    assignee: str = Field(..., min_length=1, max_length=200)
+    background: str = Field(..., min_length=1, max_length=4_000)
+    needed_decision: str = Field(..., min_length=1, max_length=2_000)
+    evidence: Optional[List[QuestionHandoffEvidenceRef]] = Field(default=None, max_length=10)
+    due_note: Optional[str] = Field(default=None, max_length=500)
+    priority: HandoffPriority = "normal"
+    created_by: Optional[str] = Field(default=None, max_length=200)
+
+
+class QuestionHandoffOut(BaseModel):
+    id: int
+    session_id: int
+    system_id: int
+    origin_kind: HandoffOriginKind
+    origin_id: int
+    assignee: str
+    background: str
+    needed_decision: str
+    evidence: Optional[List[QuestionHandoffEvidenceRef]] = None
+    due_note: Optional[str] = None
+    priority: HandoffPriority
+    status: HandoffStatus
+    answer_text: Optional[str] = None
+    answered_by: Optional[str] = None
+    answered_at: Optional[float] = None
+    created_by: Optional[str] = None
+    created_at: float
+    updated_at: float
+
+
+class QuestionHandoffListOut(BaseModel):
+    session_id: int
+    system_id: int
+    items: List[QuestionHandoffOut] = Field(default_factory=list)
+
+
+class QuestionHandoffAnswerRequest(BaseModel):
+    """The assignee's own answer.
+
+    Never written into the origin qa/alignment row -- see the
+    ``question_handoff`` table docstring in ``db.py``. The original user
+    must still explicitly confirm it via ``/return`` and the origin item's
+    own answer endpoint (Principle 2).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    answer_text: str = Field(..., min_length=1, max_length=20_000)
+    answered_by: str = Field(..., min_length=1, max_length=200)
 
 
 # --- Automatic refresh after an answer batch (Issue #288) --------------------

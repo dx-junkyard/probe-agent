@@ -59,7 +59,7 @@ def route_interview_qa(
       consumers: [dashboard]
       operation_kind: io
       state_effects: [database-read, database-write, external-api]
-      probe_value: Verify a routed question persists route_category/route_run_id and that LLM failure leaves the question unrouted with a failed audit row.
+      probe_value: Verify a routed question persists route_category/route_run_id/knowledge_area and that LLM failure leaves the question unrouted with a failed audit row.
     """
     now = time.time()
     with get_conn() as conn:
@@ -124,8 +124,9 @@ def route_interview_qa(
             )
 
         conn.execute(
-            "UPDATE interview_qa SET route_category = ?, route_run_id = ? WHERE id = ?",
-            (result.category, run_id, qa_id),
+            "UPDATE interview_qa "
+            "SET route_category = ?, route_run_id = ?, knowledge_area = ? WHERE id = ?",
+            (result.category, run_id, result.knowledge_area, qa_id),
         )
         row = conn.execute("SELECT * FROM interview_qa WHERE id = ?", (qa_id,)).fetchone()
         return _qa_out(row)

@@ -2772,6 +2772,67 @@ CREATE INDEX IF NOT EXISTS idx_runtime_observation_proposal_session
 
 CREATE INDEX IF NOT EXISTS idx_runtime_observation_proposal_system
     ON runtime_observation_proposal (system_id, session_id);
+
+-- Answerable knowledge areas / handoff (Issue #291). A developer picks which
+-- knowledge areas they can answer NOW (no role inference, Principle 6); the
+-- finite set is product_intent | domain_rule | operations | implementation |
+-- security. Out-of-area questions are never hidden -- they are grouped
+-- separately and can be deferred/held/handed off to another assignee.
+--
+-- origin_kind is 'qa' (interview_qa) or 'review_item' (alignment_item), a
+-- finite set like Issue #285/#287's origin_kind. assignee/created_by/
+-- answered_by are free-text actor names (no org auth system exists yet --
+-- same convention as understanding_confirmed_by/answered_by elsewhere).
+--
+-- Creating a handoff never writes the assignee's eventual answer into the
+-- origin row (interview_qa.answer_text / alignment_item.user_decision):
+-- answer_text/answered_by/answered_at here are the ASSIGNEE's own answer,
+-- held pending the ORIGINAL user's explicit confirmation via /return ->
+-- the origin item's own existing answer endpoint (Principle 2 -- an
+-- assignee's answer is never silently treated as the developer's own).
+--
+-- For origin_kind='qa': the origin interview_qa row's own `status` is left
+-- untouched (do not overload its finite set); instead
+-- interview_qa.handoff_id (additive column below) links to this row, and
+-- the askable-view filter (routes/interview.py) treats a qa row with an
+-- open handoff (status IN pending/answered) as "held via handoff" -- not
+-- re-asked. For origin_kind='review_item': alignment_item.status is set to
+-- 'held' (the same finite value /hold already uses) plus
+-- alignment_item.handoff_id (additive column below) links to this row.
+--
+-- status is a finite set: pending | answered | returned | cancelled.
+-- Transition table (enforced in routes/interview_handoff.py):
+--   pending -> answered | cancelled
+--   answered -> returned
+--   anything else -> 409.
+CREATE TABLE IF NOT EXISTS question_handoff (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id       INTEGER NOT NULL,
+    system_id        INTEGER NOT NULL,
+    origin_kind      TEXT NOT NULL,
+    origin_id        INTEGER NOT NULL,
+    assignee         TEXT NOT NULL,
+    background       TEXT NOT NULL,
+    needed_decision  TEXT NOT NULL,
+    evidence         TEXT,
+    due_note         TEXT,
+    priority         TEXT NOT NULL DEFAULT 'normal',
+    status           TEXT NOT NULL DEFAULT 'pending',
+    answer_text      TEXT,
+    answered_by      TEXT,
+    answered_at      REAL,
+    created_by       TEXT,
+    created_at       REAL NOT NULL,
+    updated_at       REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_question_handoff_session
+    ON question_handoff (session_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_question_handoff_system
+    ON question_handoff (system_id, session_id);
 """
 
 
@@ -3341,6 +3402,32 @@ def init_db() -> None:
         alignment_item_cols = _columns(conn, "alignment_item")
         if alignment_item_cols and "runtime_check" not in alignment_item_cols:
             conn.execute("ALTER TABLE alignment_item ADD COLUMN runtime_check TEXT")
+        # Issue #291: answerable knowledge areas + handoff. Existing sessions
+        # default to '[]' (empty = no filtering, matches the pre-#291
+        # behavior of showing every question); existing qa/alignment rows
+        # stay NULL (unrouted / not handed off).
+        session_cols = _columns(conn, "interview_session")
+        if session_cols and "answerable_areas" not in session_cols:
+            conn.execute(
+                "ALTER TABLE interview_session "
+                "ADD COLUMN answerable_areas TEXT NOT NULL DEFAULT '[]'"
+            )
+        qa_cols = _columns(conn, "interview_qa")
+        if qa_cols and "knowledge_area" not in qa_cols:
+            # Issue #291: assigned only by the question router LLM
+            # (app/question_router.py question-router-v2), never inferred
+            # deterministically from title/repository info.
+            conn.execute("ALTER TABLE interview_qa ADD COLUMN knowledge_area TEXT")
+        if qa_cols and "handoff_id" not in qa_cols:
+            conn.execute(
+                "ALTER TABLE interview_qa ADD COLUMN handoff_id INTEGER "
+                "REFERENCES question_handoff(id) ON DELETE SET NULL"
+            )
+        if alignment_item_cols and "handoff_id" not in alignment_item_cols:
+            conn.execute(
+                "ALTER TABLE alignment_item ADD COLUMN handoff_id INTEGER "
+                "REFERENCES question_handoff(id) ON DELETE SET NULL"
+            )
         _ensure_legacy_system(conn)
     _validate_startup_environment()
     _validate_publish_startup_config()

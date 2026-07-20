@@ -424,6 +424,13 @@ export interface SystemStateAssessment {
 
 export type InterviewSessionStatus = "open" | "proposals_ready" | "materialized" | "closed";
 export type InterviewMessageRole = "user" | "assistant" | "system";
+
+// Issue #291: answerable knowledge areas / handoff finite sets.
+export type KnowledgeArea =
+  | "product_intent" | "domain_rule" | "operations" | "implementation" | "security";
+export type HandoffOriginKind = "qa" | "review_item";
+export type HandoffPriority = "low" | "normal" | "high";
+export type HandoffStatus = "pending" | "answered" | "returned" | "cancelled";
 export type InterviewStage =
   | "understanding_initialized"
   | "purpose_confirmation"
@@ -525,6 +532,9 @@ export interface InterviewSessionOut {
   materialization_diff: string | null;
   materialization_ref: string | null;
   materialized_at: number | null;
+  // Issue #291: which knowledge areas the developer can answer RIGHT NOW
+  // (no role inference). Empty means no filtering, never "every area".
+  answerable_areas: KnowledgeArea[];
   created_at: number;
   updated_at: number;
 }
@@ -747,6 +757,16 @@ export interface InterviewQaOut {
   superseded_by_id: number | null;
   created_at: number;
   answered_at: number | null;
+  // Issue #286: Question Router classification, set only via the on-demand
+  // route endpoint. Null until routed.
+  route_category?: string | null;
+  route_run_id?: number | null;
+  // Issue #291: knowledge area assigned by the same router call
+  // (question-router-v2); null until routed or when no area clearly fits.
+  // Never hides the question -- used only for out-of-area grouping.
+  knowledge_area?: KnowledgeArea | null;
+  // Issue #291: set once this question has been handed off to an assignee.
+  handoff_id?: number | null;
 }
 
 export interface InterviewQaAnswerOut {
@@ -974,6 +994,9 @@ export interface AlignmentItemOut {
   runtime_check?: RuntimeCheckState | null;
   status: AlignmentItemStatus;
   user_decision: AlignmentUserDecisionOut | null;
+  // Issue #291: set once this review item has been handed off to an
+  // assignee (creating the handoff also sets status='held').
+  handoff_id?: number | null;
   intelligence_run_id: number;
   is_mock: boolean;
   created_at: number;
@@ -1000,6 +1023,48 @@ export interface AlignmentReviewQueueOut {
   session_id: number;
   system_id: number;
   items: AlignmentItemOut[];
+}
+
+// --- Answerable knowledge areas / handoff (Issue #291) ------------------------
+//
+// A developer picks which knowledge areas they can answer NOW; out-of-area
+// items (interview_qa) or Review Queue items (alignment_item) can be handed
+// off to an assignee. The assignee's own answer is never written into the
+// origin row -- the original developer must explicitly confirm it via
+// /return + the origin item's own existing answer endpoint.
+
+export interface QuestionHandoffEvidenceRef {
+  path: string;
+  start_line: number;
+  end_line: number;
+  summary: string;
+}
+
+export interface QuestionHandoffOut {
+  id: number;
+  session_id: number;
+  system_id: number;
+  origin_kind: HandoffOriginKind;
+  origin_id: number;
+  assignee: string;
+  background: string;
+  needed_decision: string;
+  evidence: QuestionHandoffEvidenceRef[] | null;
+  due_note: string | null;
+  priority: HandoffPriority;
+  status: HandoffStatus;
+  answer_text: string | null;
+  answered_by: string | null;
+  answered_at: number | null;
+  created_by: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface QuestionHandoffListOut {
+  session_id: number;
+  system_id: number;
+  items: QuestionHandoffOut[];
 }
 
 // --- Observation proposal (Issue #290) ----------------------------------------

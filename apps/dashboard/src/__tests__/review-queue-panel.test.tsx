@@ -311,4 +311,77 @@ describe("ReviewQueuePanel", () => {
     const card = await screen.findByTestId("review-item-21");
     expect(within(card).queryByTestId("review-item-runtime-mismatch-21")).not.toBeInTheDocument();
   });
+
+  // Issue #291: handoff.
+  test("担当者へ引き継ぐ opens the handoff modal and submits via the handoff API", async () => {
+    const item = makeItem({ id: 30, review_category: "must_review", reason_code: "conflict_detected" });
+    const queue: AlignmentReviewQueueOut = { session_id: 1, system_id: 1, items: [item] };
+    const full: AlignmentListOut = {
+      session_id: 1, system_id: 1,
+      items_by_category: { must_review: [item], batch_reviewable: [], no_review_required: [], unchanged: [], informational: [] },
+      counts: { must_review: 1, batch_reviewable: 0, no_review_required: 0, unchanged: 0, informational: 0 },
+    };
+    getImpl = (path: string) => {
+      if (path === "/interview/sessions/1/review-queue") return Promise.resolve(queue);
+      if (path === "/interview/sessions/1/alignment") return Promise.resolve(full);
+      if (path === "/interview/sessions/1/inquiries") return Promise.resolve({ session_id: 1, system_id: 1, items: [] });
+      if (path === "/interview/sessions/1/handoffs") return Promise.resolve({ session_id: 1, system_id: 1, items: [] });
+      return Promise.resolve(undefined);
+    };
+    mockApi.post.mockResolvedValue({
+      id: 99, session_id: 1, system_id: 1, origin_kind: "review_item", origin_id: 30,
+      assignee: "山田", background: item.current_claim, needed_decision: "方針を決めてほしい",
+      evidence: null, due_note: null, priority: "normal", status: "pending",
+      answer_text: null, answered_by: null, answered_at: null, created_by: null,
+      created_at: 0, updated_at: 0,
+    });
+
+    const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
+    render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+
+    const openButton = await screen.findByTestId("review-item-handoff-open-30");
+    fireEvent.click(openButton);
+
+    const form = await screen.findByTestId("handoff-modal-form");
+    fireEvent.change(within(form).getByTestId("handoff-assignee-input"), { target: { value: "山田" } });
+    fireEvent.change(within(form).getByTestId("handoff-needed-decision-input"), { target: { value: "方針を決めてほしい" } });
+    fireEvent.click(within(form).getByTestId("handoff-submit-button"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/1/handoffs",
+        expect.objectContaining({
+          origin_kind: "review_item",
+          origin_id: 30,
+          assignee: "山田",
+          needed_decision: "方針を決めてほしい",
+          background: item.current_claim,
+        }),
+      );
+    });
+  });
+
+  test("既に引き継ぎ済みの項目には引き継ぐボタンを出さない", async () => {
+    const item = makeItem({
+      id: 31, review_category: "batch_reviewable", status: "held", handoff_id: 5,
+    });
+    const queue: AlignmentReviewQueueOut = { session_id: 1, system_id: 1, items: [item] };
+    const full: AlignmentListOut = {
+      session_id: 1, system_id: 1,
+      items_by_category: { must_review: [], batch_reviewable: [item], no_review_required: [], unchanged: [], informational: [] },
+      counts: { must_review: 0, batch_reviewable: 1, no_review_required: 0, unchanged: 0, informational: 0 },
+    };
+    getImpl = (path: string) => {
+      if (path === "/interview/sessions/1/review-queue") return Promise.resolve(queue);
+      if (path === "/interview/sessions/1/alignment") return Promise.resolve(full);
+      if (path === "/interview/sessions/1/inquiries") return Promise.resolve({ session_id: 1, system_id: 1, items: [] });
+      return Promise.resolve(undefined);
+    };
+
+    const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
+    render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+
+    const card = await screen.findByTestId("review-item-31");
+    expect(within(card).queryByTestId("review-item-handoff-open-31")).not.toBeInTheDocument();
+  });
 });
