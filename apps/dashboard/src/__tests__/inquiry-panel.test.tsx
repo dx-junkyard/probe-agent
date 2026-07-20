@@ -143,6 +143,67 @@ beforeEach(() => {
         ],
       });
     }
+    if (path === "/interview/inquiries/400") {
+      return Promise.resolve({
+        inquiry: {
+          id: 400, session_id: 1, system_id: 1, origin_kind: "intent", origin_id: 5,
+          held_draft: null, status: "open", status_reason: null,
+          created_at: 0, updated_at: 0, closed_at: null,
+        },
+        messages: [
+          { id: 1, inquiry_id: 400, system_id: 1, role: "user", content: "この関数は実行されていますか?", detail: null, intelligence_run_id: null, is_mock: false, created_at: 0 },
+          {
+            id: 2, inquiry_id: 400, system_id: 1, role: "assistant",
+            content: "この関数は summarize を実行します。",
+            detail: {
+              key_points: [], evidence: [], uncertainty: "",
+              route_category: "system_researchable", decision_question: null,
+              runtime_evidence: [{
+                kind: "runtime_fact", component_id: "summarize_fn", runtime_check: "match",
+                summary: "call_count=42 を観測",
+                provenance: {
+                  environment: null, first_observed_at: 1_700_000_000, last_observed_at: 1_700_000_000,
+                  snapshot_ref: { snapshot_id: 9, git_sha: "abc123" }, source: "trace_aggregation",
+                  freshness: "fresh",
+                },
+              }],
+              suggested_observation_proposal: null,
+            },
+            intelligence_run_id: 1, is_mock: false, created_at: 0,
+          },
+        ],
+      });
+    }
+    if (path === "/interview/inquiries/401") {
+      return Promise.resolve({
+        inquiry: {
+          id: 401, session_id: 1, system_id: 1, origin_kind: "intent", origin_id: 5,
+          held_draft: null, status: "open", status_reason: null,
+          created_at: 0, updated_at: 0, closed_at: null,
+        },
+        messages: [
+          { id: 1, inquiry_id: 401, system_id: 1, role: "user", content: "この関数は実行されていますか?", detail: null, intelligence_run_id: null, is_mock: false, created_at: 0 },
+          {
+            id: 2, inquiry_id: 401, system_id: 1, role: "assistant",
+            content: "この関数についての観測データが古くなっています。",
+            detail: {
+              key_points: [], evidence: [], uncertainty: "",
+              route_category: "system_researchable", decision_question: null,
+              runtime_evidence: [{
+                kind: "runtime_fact", component_id: "stale_fn", runtime_check: "stale",
+                summary: "10日前の観測",
+                provenance: {
+                  environment: null, first_observed_at: 1_600_000_000, last_observed_at: 1_600_000_000,
+                  snapshot_ref: null, source: "trace_aggregation", freshness: "stale",
+                },
+              }],
+              suggested_observation_proposal: { target_component: "stale_fn", reason: "stale" },
+            },
+            intelligence_run_id: 1, is_mock: false, created_at: 0,
+          },
+        ],
+      });
+    }
     throw new Error(`Unexpected GET ${path}`);
   });
 });
@@ -346,6 +407,66 @@ describe("InquiryPanel (Issue #285)", () => {
     test("a message with no route_category shows no badge", async () => {
       const row = await openInquiry();
       expect(within(row).queryByTestId("inquiry-message-route-2")).not.toBeInTheDocument();
+    });
+  });
+
+  // --- Runtime fact evidence / observation proposal hint (Issue #290) -------
+
+  describe("runtime evidence / observation proposal hint", () => {
+    async function openInquiryWithId(id: number, expectedContent: string) {
+      inquiryListItems = [{
+        id, session_id: 1, system_id: 1, origin_kind: "intent", origin_id: 5,
+        held_draft: null, status: "open", status_reason: null,
+        created_at: 0, updated_at: 0, closed_at: null,
+      }];
+      const row = await openIntentPanel();
+      fireEvent.click(await within(row).findByTestId("intent-item-inquiry-reopen-5"));
+      await within(row).findByText(expectedContent);
+      return row;
+    }
+
+    test("fresh runtime evidence renders provenance chips and no stale warning", async () => {
+      const row = await openInquiryWithId(400, "この関数は summarize を実行します。");
+      fireEvent.click(within(row).getByTestId("inquiry-show-evidence-2"));
+
+      const chips = within(row).getByTestId("inquiry-runtime-evidence-summarize_fn");
+      expect(within(chips).getByTestId("runtime-chip-environment")).toHaveTextContent("環境: 不明");
+      expect(within(chips).getByTestId("runtime-chip-snapshot")).toHaveTextContent("snapshot: 9");
+      expect(within(chips).getByTestId("runtime-chip-freshness")).toHaveTextContent("鮮度: 最新");
+      expect(within(chips).queryByTestId("runtime-evidence-stale-warning")).not.toBeInTheDocument();
+      // The short content bubble itself never carries raw provenance/numbers.
+      const bubble = within(row).getByTestId("inquiry-message-2");
+      expect(bubble.textContent).not.toMatch(/trace_aggregation/);
+    });
+
+    test("stale runtime evidence is flagged 古い観測です and offers a proposal draft", async () => {
+      const row = await openInquiryWithId(401, "この関数についての観測データが古くなっています。");
+      fireEvent.click(within(row).getByTestId("inquiry-show-evidence-2"));
+
+      const chips = within(row).getByTestId("inquiry-runtime-evidence-stale_fn");
+      expect(within(chips).getByTestId("runtime-chip-freshness")).toHaveTextContent("鮮度: 古い");
+      expect(within(chips).getByTestId("runtime-evidence-stale-warning")).toHaveTextContent("古い観測です");
+
+      const suggested = within(row).getByTestId("observation-proposal-suggested");
+      expect(suggested).toHaveTextContent("stale_fn");
+      fireEvent.click(within(suggested).getByTestId("observation-proposal-suggested-open"));
+      fireEvent.change(within(suggested).getByTestId("observation-proposal-suggested-purpose"), {
+        target: { value: "エラー原因を切り分けたい" },
+      });
+      mockApi.post.mockResolvedValueOnce({
+        id: 1, session_id: 1, system_id: 1, origin_inquiry_id: null, origin_alignment_item_id: null,
+        target_component: "stale_fn", purpose: "エラー原因を切り分けたい", expected_cost: null,
+        risk_note: null, retention_note: null, status: "proposed", decision_by: null, decision_at: null,
+        created_at: 0, policy_pointer: null,
+      });
+      fireEvent.click(within(suggested).getByTestId("observation-proposal-suggested-submit"));
+
+      await waitFor(() => {
+        expect(mockApi.post).toHaveBeenCalledWith(
+          "/interview/sessions/1/observation-proposals",
+          { target_component: "stale_fn", purpose: "エラー原因を切り分けたい" },
+        );
+      });
     });
   });
 });

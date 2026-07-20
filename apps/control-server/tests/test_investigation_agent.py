@@ -342,3 +342,187 @@ def test_investigate_success_records_prompt_and_schema_version(tmp_path):
     assert result.schema_version == SCHEMA_VERSION
     assert result.llm_calls == 1
     assert result.elapsed_seconds >= 0
+
+
+# --- Issue #290: runtime_fact evidence ------------------------------------------
+
+
+@pytest.fixture
+def system_and_snapshot(tmp_path, monkeypatch):
+    """A real System + repository_snapshots row (FK-satisfying) for code_symbols."""
+    monkeypatch.setenv("PROBE_DB_PATH", str(tmp_path / "probe-investigation-runtime.db"))
+    monkeypatch.setenv("CONTROL_ADMIN_USERNAME", "root")
+    monkeypatch.setenv("CONTROL_ADMIN_PASSWORD", "s3cret")
+    monkeypatch.delenv("CONTROL_API_KEYS", raising=False)
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    with TestClient(app) as client:
+        r = client.post("/auth/login", json={"username": "root", "password": "s3cret"})
+        assert r.status_code == 200, r.text
+        token = r.cookies.get("probe_session")
+        r = client.post(
+            "/systems", json={"name": "Sys", "environment": "test", "description": "d"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 201, r.text
+        system_id = r.json()["id"]
+
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO repository_snapshots
+                    (system_id, repo_path, commit_sha, status, created_at, completed_at)
+                VALUES (?, '/tmp/repo', 'abc123', 'ready', ?, ?)""",
+                (system_id, time.time(), time.time()),
+            )
+            snapshot_id = cur.lastrowid
+            yield conn, system_id, snapshot_id
+
+
+def _insert_symbol(conn, *, snapshot_id, system_id, path, component_id, start_line=1, end_line=5):
+    conn.execute(
+        """INSERT INTO code_symbols
+            (snapshot_id, system_id, path, qualified_name, kind, start_line, end_line, component_id)
+        VALUES (?, ?, ?, 'fn', 'function', ?, ?, ?)""",
+        (snapshot_id, system_id, path, start_line, end_line, component_id),
+    )
+
+
+def _insert_trace(conn, system_id, component_id, *, timestamp):
+    import uuid
+
+    conn.execute(
+        """INSERT INTO traces
+            (system_id, trace_id, component_id, mode, input_json, output_text, error,
+             duration_ms, timestamp)
+        VALUES (?, ?, ?, 'trace', '{}', 'ok', NULL, 5.0, ?)""",
+        (system_id, str(uuid.uuid4()), component_id, timestamp),
+    )
+
+
+def test_investigate_without_conn_never_offers_runtime_evidence(tmp_path):
+    """Omitting conn/system_id/snapshot_id keeps investigate() exactly as
+    read-only/git-only as before Issue #290 -- no runtime facts gathered."""
+    repo, sha = _init_repo(tmp_path, {"src/summarize.py": "def summarize():\n    pass\n"})
+    client = FakeLLMClient(response=_valid_investigation_response())
+    result = investigate(
+        client, _make_config(), repo_path=repo, commit_sha=sha,
+        question="summarize とは何ですか?", research_focus="summarize",
+    )
+    assert result.status == "completed"
+    assert result.runtime_evidence == []
+    assert result.runtime_candidates_offered == 0
+
+
+def test_investigate_offers_runtime_facts_for_candidate_components(tmp_path, system_and_snapshot):
+    conn, system_id, snapshot_id = system_and_snapshot
+    repo, sha = _init_repo(tmp_path, {"src/summarize.py": "def summarize():\n    pass\n"})
+    _insert_symbol(conn, snapshot_id=snapshot_id, system_id=system_id,
+                    path="src/summarize.py", component_id="summarize_fn")
+    _insert_trace(conn, system_id, "summarize_fn", timestamp=time.time())
+
+    client = FakeLLMClient(response=_valid_investigation_response(
+        runtime_evidence=[{"component_id": "summarize_fn", "runtime_check": "match", "summary": "観測あり"}],
+    ))
+    result = investigate(
+        client, _make_config(), repo_path=repo, commit_sha=sha,
+        question="summarize とは何ですか?", research_focus="summarize",
+        conn=conn, system_id=system_id, snapshot_id=snapshot_id,
+    )
+    assert result.status == "completed"
+    assert result.runtime_candidates_offered == 1
+    assert len(result.runtime_evidence) == 1
+    entry = result.runtime_evidence[0]
+    assert entry.component_id == "summarize_fn"
+    assert entry.runtime_check == "match"
+    assert entry.provenance.freshness == "fresh"
+
+
+def test_investigate_prunes_runtime_evidence_citing_unoffered_component(tmp_path, system_and_snapshot):
+    conn, system_id, snapshot_id = system_and_snapshot
+    repo, sha = _init_repo(tmp_path, {"src/summarize.py": "def summarize():\n    pass\n"})
+    _insert_symbol(conn, snapshot_id=snapshot_id, system_id=system_id,
+                    path="src/summarize.py", component_id="summarize_fn")
+    _insert_trace(conn, system_id, "summarize_fn", timestamp=time.time())
+
+    client = FakeLLMClient(response=_valid_investigation_response(
+        runtime_evidence=[{"component_id": "invented_component", "runtime_check": "match", "summary": "x"}],
+    ))
+    result = investigate(
+        client, _make_config(), repo_path=repo, commit_sha=sha,
+        question="summarize とは何ですか?", research_focus="summarize",
+        conn=conn, system_id=system_id, snapshot_id=snapshot_id,
+    )
+    # Unlike code evidence, an invalid runtime_evidence citation is dropped
+    # but never fails the whole run closed (it is always supplementary).
+    assert result.status == "completed"
+    assert result.runtime_evidence == []
+    assert len(result.pruned_runtime_evidence) == 1
+
+
+def test_investigate_stale_guard_overrides_model_claimed_match(tmp_path, system_and_snapshot):
+    """A stale/unobserved component_id must never be persisted as 'match'
+    even when the model's own output claims it."""
+    conn, system_id, snapshot_id = system_and_snapshot
+    repo, sha = _init_repo(tmp_path, {"src/summarize.py": "def summarize():\n    pass\n"})
+    _insert_symbol(conn, snapshot_id=snapshot_id, system_id=system_id,
+                    path="src/summarize.py", component_id="summarize_fn")
+    # No trace inserted -> deterministic baseline is 'unobserved'.
+
+    client = FakeLLMClient(response=_valid_investigation_response(
+        runtime_evidence=[{"component_id": "summarize_fn", "runtime_check": "match", "summary": "x"}],
+    ))
+    result = investigate(
+        client, _make_config(), repo_path=repo, commit_sha=sha,
+        question="summarize とは何ですか?", research_focus="summarize",
+        conn=conn, system_id=system_id, snapshot_id=snapshot_id,
+    )
+    assert result.status == "completed"
+    assert len(result.runtime_evidence) == 1
+    assert result.runtime_evidence[0].runtime_check == "unobserved"
+
+
+def test_investigate_respects_max_runtime_facts_budget(tmp_path, system_and_snapshot):
+    conn, system_id, snapshot_id = system_and_snapshot
+    files = {f"src/mod_{i}.py": f"def fn_{i}():\n    pass\n" for i in range(5)}
+    repo, sha = _init_repo(tmp_path, files)
+    for i in range(5):
+        _insert_symbol(conn, snapshot_id=snapshot_id, system_id=system_id,
+                        path=f"src/mod_{i}.py", component_id=f"mod_{i}_fn")
+        _insert_trace(conn, system_id, f"mod_{i}_fn", timestamp=time.time())
+
+    client = FakeLLMClient(response=_valid_investigation_response(evidence=[], runtime_evidence=[]))
+    budget = InvestigationBudget(max_runtime_facts=2, max_files=20)
+    result = investigate(
+        client, _make_config(), repo_path=repo, commit_sha=sha,
+        question="mod functions", research_focus="mod",
+        conn=conn, system_id=system_id, snapshot_id=snapshot_id, budget=budget,
+    )
+    assert result.runtime_candidates_offered <= 2
+
+
+def test_investigate_zero_runtime_budget_disables_runtime_facts(tmp_path, system_and_snapshot):
+    conn, system_id, snapshot_id = system_and_snapshot
+    repo, sha = _init_repo(tmp_path, {"src/summarize.py": "def summarize():\n    pass\n"})
+    _insert_symbol(conn, snapshot_id=snapshot_id, system_id=system_id,
+                    path="src/summarize.py", component_id="summarize_fn")
+    _insert_trace(conn, system_id, "summarize_fn", timestamp=time.time())
+
+    client = FakeLLMClient(response=_valid_investigation_response(evidence=[], runtime_evidence=[]))
+    budget = InvestigationBudget(max_runtime_facts=0)
+    result = investigate(
+        client, _make_config(), repo_path=repo, commit_sha=sha,
+        question="summarize とは何ですか?", research_focus="summarize",
+        conn=conn, system_id=system_id, snapshot_id=snapshot_id, budget=budget,
+    )
+    assert result.runtime_candidates_offered == 0
+
+
+def test_investigation_budget_clamps_max_runtime_facts():
+    budget = InvestigationBudget(max_runtime_facts=1_000)
+    assert budget.max_runtime_facts <= 20
+    budget = InvestigationBudget(max_runtime_facts=-5)
+    assert budget.max_runtime_facts == 0

@@ -228,6 +228,11 @@ function ReviewQueueItemCard({
         <Badge variant="secondary" data-testid={`review-item-reason-${item.id}`}>
           {item.user_reason}
         </Badge>
+        {item.reason_code === "runtime_mismatch" && (
+          <Badge variant="destructive" data-testid={`review-item-runtime-mismatch-${item.id}`}>
+            実行時不一致
+          </Badge>
+        )}
       </div>
 
       <EvidenceList item={item} />

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -44,6 +45,9 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from .git_ops import GitError, list_tree_entries, read_file_at_commit
 from .interview_language import language_directive
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient, is_reasoning_model
+from .models import RuntimeFactProvenanceOut
+from .runtime_alignment import RUNTIME_CHECK_STATES, compare_claim_to_runtime
+from .runtime_reality import aggregate_component_facts, build_provenance
 
 PROMPT_VERSION = "investigation-v1"
 SCHEMA_VERSION = "investigation-v1"
@@ -52,6 +56,9 @@ DEFAULT_MAX_FILES = 20
 DEFAULT_MAX_SNIPPET_CHARS = 40_000
 DEFAULT_MAX_LLM_CALLS = 3
 DEFAULT_MAX_EVIDENCE_ITEMS = 10
+# Issue #290: default cap on runtime_fact evidence entries offered to (and
+# citable by) one investigation run.
+DEFAULT_MAX_RUNTIME_FACTS = 10
 DEFAULT_TIMEOUT_SECONDS = 60
 
 # Hard clamps: whatever a caller passes, the effective budget never exceeds
@@ -61,6 +68,9 @@ _FILES_BOUNDS = (1, 50)
 _CHARS_BOUNDS = (1_000, 200_000)
 _LLM_CALLS_BOUNDS = (1, 5)
 _EVIDENCE_BOUNDS = (1, 20)
+# 0 is a valid lower bound here (unlike the others): a caller may disable
+# runtime-fact evidence entirely without disabling investigation itself.
+_RUNTIME_FACTS_BOUNDS = (0, 20)
 _TIMEOUT_BOUNDS = (1, 300)
 
 InvestigationStatus = ("completed", "unresolved", "failed")
@@ -89,6 +99,7 @@ class InvestigationBudget:
     max_snippet_chars: int = DEFAULT_MAX_SNIPPET_CHARS
     max_llm_calls: int = DEFAULT_MAX_LLM_CALLS
     max_evidence_items: int = DEFAULT_MAX_EVIDENCE_ITEMS
+    max_runtime_facts: int = DEFAULT_MAX_RUNTIME_FACTS
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:
@@ -96,6 +107,7 @@ class InvestigationBudget:
         self.max_snippet_chars = _clamp(int(self.max_snippet_chars), _CHARS_BOUNDS)
         self.max_llm_calls = _clamp(int(self.max_llm_calls), _LLM_CALLS_BOUNDS)
         self.max_evidence_items = _clamp(int(self.max_evidence_items), _EVIDENCE_BOUNDS)
+        self.max_runtime_facts = _clamp(int(self.max_runtime_facts), _RUNTIME_FACTS_BOUNDS)
         self.timeout_seconds = _clamp(int(self.timeout_seconds), _TIMEOUT_BOUNDS)
 
 
@@ -104,6 +116,34 @@ class InvestigationEvidenceItem:
     path: str
     start_line: int
     end_line: int
+    summary: str = ""
+
+
+@dataclass
+class RuntimeFactCandidate:
+    """One deterministically-offered runtime fact the model MAY cite.
+
+    Built (Issue #290) from components whose ``code_symbols`` path matches a
+    candidate file already selected for this investigation -- never a
+    separate free-standing keyword search over all components. ``baseline``
+    is the deterministic ``compare_claim_to_runtime`` result computed with
+    no claim text (Principle 6): 'unobserved'/'stale' here always overrides
+    whatever the model later says (the stale guard); 'match' leaves room for
+    the model's own match/mismatch semantic judgement.
+    """
+
+    component_id: str
+    provenance: RuntimeFactProvenanceOut
+    baseline: str
+    call_count: int = 0
+    error_rate: Optional[float] = None
+
+
+@dataclass
+class InvestigationRuntimeEvidenceItem:
+    component_id: str
+    provenance: RuntimeFactProvenanceOut
+    runtime_check: str  # match | mismatch | unobserved | stale
     summary: str = ""
 
 
@@ -140,6 +180,12 @@ class InvestigationResult:
     decision_question: Optional[str] = None
     read_snippets: List[ReadSnippet] = field(default_factory=list)
     pruned_evidence: List[Dict[str, object]] = field(default_factory=list)
+    # Issue #290: runtime_fact evidence the model actually cited (validated
+    # against the offered candidate set; stale/unobserved always reflect the
+    # deterministic baseline, never the model's own claim of 'match').
+    runtime_evidence: List[InvestigationRuntimeEvidenceItem] = field(default_factory=list)
+    pruned_runtime_evidence: List[Dict[str, object]] = field(default_factory=list)
+    runtime_candidates_offered: int = 0
     files_read: int = 0
     chars_read: int = 0
     llm_calls: int = 0
@@ -159,6 +205,14 @@ class _RawInvestigationEvidence(BaseModel):
     summary: str = Field(default="", max_length=1_000)
 
 
+class _RawRuntimeEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    component_id: str = Field(..., min_length=1, max_length=500)
+    runtime_check: str = Field(..., min_length=1, max_length=20)
+    summary: str = Field(default="", max_length=1_000)
+
+
 class _RawInvestigationResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -166,6 +220,7 @@ class _RawInvestigationResponse(BaseModel):
     conclusion: str = Field(..., min_length=1, max_length=2_000)
     key_points: List[str] = Field(default_factory=list, max_length=10)
     evidence: List[_RawInvestigationEvidence] = Field(default_factory=list, max_length=20)
+    runtime_evidence: List[_RawRuntimeEvidence] = Field(default_factory=list, max_length=20)
     uncertainty: str = Field(default="", max_length=1_000)
     confidence: str = Field(default="uncertain", max_length=20)
     decision_question: Optional[str] = Field(default=None, max_length=1_000)
@@ -273,6 +328,47 @@ def _allowed_ranges(snippets: List[ReadSnippet]) -> Dict[str, int]:
     return {s.path: s.end_line for s in snippets}
 
 
+def _gather_runtime_candidates(
+    conn: "sqlite3.Connection",
+    system_id: int,
+    snapshot_id: int,
+    candidate_paths: List[str],
+    max_runtime_facts: int,
+) -> List[RuntimeFactCandidate]:
+    """Deterministic runtime facts for components found in candidate files.
+
+    Restricted to the SAME candidate file set already selected for code
+    excerpts (never a separate all-components search) -- component_id comes
+    from ``code_symbols`` (Issue #24's Feature-to-Code index), ordered for
+    determinism and capped at ``max_runtime_facts``. Returns ``[]`` when the
+    budget is 0 or no candidate path maps to a component.
+    """
+    if max_runtime_facts <= 0 or not candidate_paths:
+        return []
+    placeholders = ",".join("?" for _ in candidate_paths)
+    rows = conn.execute(
+        f"""SELECT DISTINCT component_id FROM code_symbols
+            WHERE snapshot_id = ? AND path IN ({placeholders})
+              AND component_id IS NOT NULL
+            ORDER BY component_id
+            LIMIT ?""",
+        (snapshot_id, *candidate_paths, max_runtime_facts),
+    ).fetchall()
+    candidates: List[RuntimeFactCandidate] = []
+    for row in rows:
+        component_id = row["component_id"]
+        fact = aggregate_component_facts(conn, system_id, component_id)
+        provenance = build_provenance(fact, snapshot_id=snapshot_id)
+        baseline = compare_claim_to_runtime("", fact, provenance)
+        candidates.append(
+            RuntimeFactCandidate(
+                component_id=component_id, provenance=provenance, baseline=baseline,
+                call_count=fact.call_count, error_rate=fact.error_rate,
+            )
+        )
+    return candidates
+
+
 def _is_verifiable(item: _RawInvestigationEvidence, allowed: Dict[str, int]) -> bool:
     end = allowed.get(item.path)
     if end is None:
@@ -285,10 +381,11 @@ def _is_verifiable(item: _RawInvestigationEvidence, allowed: Dict[str, int]) -> 
 _SYSTEM_PROMPT = """\
 You are the read-only Investigation Agent of probe-agent's system-understanding \
 Inquiry flow. You are given a developer's question, an optional research \
-focus from the Question Router, and a bounded set of source file excerpts \
-read from a PINNED git snapshot (never the mutable working tree). You have \
-no write access, cannot run code, and cannot look beyond the supplied \
-excerpts.
+focus from the Question Router, a bounded set of source file excerpts \
+read from a PINNED git snapshot (never the mutable working tree), and \
+(when supplied) a bounded set of DETERMINISTIC runtime trace facts for \
+components found in those excerpts. You have no write access, cannot run \
+code, and cannot look beyond the supplied excerpts/facts.
 
 Respond with a single JSON object and nothing else (no markdown fences, no \
 commentary), matching exactly this shape:
@@ -300,6 +397,9 @@ commentary), matching exactly this shape:
   "evidence": [
     {"path": "src/module.py", "start_line": 1, "end_line": 20, "summary": "what this span shows"}
   ],
+  "runtime_evidence": [
+    {"component_id": "module_function", "runtime_check": "match | mismatch", "summary": "why the runtime facts support or contradict the conclusion"}
+  ],
   "uncertainty": "what remains uncertain or unverified, or empty string if none",
   "confidence": "confirmed | likely | uncertain",
   "decision_question": "a short question only the developer can decide, or null"
@@ -309,10 +409,18 @@ Rules:
 - Only cite "path"/"start_line"/"end_line" that appear in the supplied \
 excerpts, within the line range actually shown for that path. Never invent \
 a path, a line range, or cite a file that was not supplied.
+- "runtime_evidence" may only cite a "component_id" that appears in the \
+supplied runtime facts section; leave it empty if no runtime fact was \
+supplied or none is relevant. Only include an entry when the runtime facts \
+were actually FRESH (never claim "match" for facts the supplied data marked \
+stale or unobserved -- omit those instead). "runtime_check" is your own \
+judgement of whether the observed call volume/behavior is consistent with \
+your conclusion ("match") or contradicts it ("mismatch") -- never anything \
+else in this field.
 - Set "status" to "unresolved" when the supplied excerpts do not contain \
 enough grounding to answer -- do not guess or fabricate an answer merely to \
-appear helpful. Keep "evidence" empty in that case unless a partial finding \
-is genuinely grounded.
+appear helpful. Keep "evidence" and "runtime_evidence" empty in that case \
+unless a partial finding is genuinely grounded.
 - "confidence" reflects how directly the cited evidence supports the \
 conclusion: "confirmed" only when the code plainly shows the answer, \
 "likely" for a well-grounded inference, "uncertain" otherwise.
@@ -337,7 +445,10 @@ def _system_prompt(language: str, hybrid_decision_question: bool) -> str:
 
 
 def _build_user_prompt(
-    question: str, research_focus: Optional[str], snippets: List[ReadSnippet],
+    question: str,
+    research_focus: Optional[str],
+    snippets: List[ReadSnippet],
+    runtime_candidates: Optional[List[RuntimeFactCandidate]] = None,
 ) -> str:
     parts = [f"Developer question: {question}"]
     if research_focus:
@@ -346,6 +457,19 @@ def _build_user_prompt(
     for s in snippets:
         note = " (truncated)" if s.truncated else ""
         parts.append(f"### {s.path} (lines {s.start_line}-{s.end_line}{note})\n{s.content}")
+    if runtime_candidates:
+        parts.append(
+            "## Runtime facts (deterministic aggregates; the ONLY component_id "
+            "values you may cite in runtime_evidence)"
+        )
+        for c in runtime_candidates:
+            parts.append(
+                f"### {c.component_id}\n"
+                f"freshness={c.provenance.freshness}, call_count={c.call_count}, "
+                f"error_rate={c.error_rate}, "
+                f"first_observed_at={c.provenance.first_observed_at}, "
+                f"last_observed_at={c.provenance.last_observed_at}"
+            )
     return "\n\n".join(parts)
 
 
@@ -360,6 +484,9 @@ def investigate(
     hybrid_decision_question: bool = False,
     language: str = "ja",
     budget: Optional[InvestigationBudget] = None,
+    conn: "Optional[sqlite3.Connection]" = None,
+    system_id: Optional[int] = None,
+    snapshot_id: Optional[int] = None,
 ) -> InvestigationResult:
     """Investigate ``question`` against the pinned snapshot only, within budget.
 
@@ -370,6 +497,14 @@ def investigate(
     read are pruned (recorded, not fatal) as long as at least one citation
     remains valid when citations were given at all; if every citation is
     invalid, the run fails closed.
+
+    ``conn``/``system_id``/``snapshot_id`` (Issue #290, all optional and
+    default ``None``) additionally offer the model deterministic runtime
+    facts (from ``code_symbols``-mapped components found in the SAME
+    candidate file set already selected for code excerpts) as a second,
+    citable evidence kind (``runtime_evidence``); omitting them keeps this
+    call exactly as read-only/git-only as before -- no runtime facts are
+    gathered or offered.
     """
     start_time = time.monotonic()
     budget = budget or InvestigationBudget()
@@ -418,7 +553,13 @@ def investigate(
             elapsed_seconds=time.monotonic() - start_time,
         )
 
-    prompt = _build_user_prompt(question, research_focus, snippets)
+    runtime_candidates: List[RuntimeFactCandidate] = []
+    if conn is not None and system_id is not None and snapshot_id is not None:
+        runtime_candidates = _gather_runtime_candidates(
+            conn, system_id, snapshot_id, [s.path for s in snippets], budget.max_runtime_facts,
+        )
+
+    prompt = _build_user_prompt(question, research_focus, snippets, runtime_candidates)
 
     try:
         raw = client.generate_text(
@@ -433,7 +574,8 @@ def investigate(
         return InvestigationResult(
             provider=config.provider, model=config.model, is_mock=False, status="failed",
             error=str(exc), read_snippets=snippets, files_read=files_read, chars_read=chars_read,
-            llm_calls=1, elapsed_seconds=time.monotonic() - start_time,
+            llm_calls=1, runtime_candidates_offered=len(runtime_candidates),
+            elapsed_seconds=time.monotonic() - start_time,
         )
 
     try:
@@ -444,6 +586,7 @@ def investigate(
             provider=config.provider, model=config.model, is_mock=False, status="failed",
             error=f"Failed to parse structured response: {exc}", read_snippets=snippets,
             files_read=files_read, chars_read=chars_read, llm_calls=1,
+            runtime_candidates_offered=len(runtime_candidates),
             elapsed_seconds=time.monotonic() - start_time,
         )
 
@@ -452,6 +595,7 @@ def investigate(
             provider=config.provider, model=config.model, is_mock=False, status="failed",
             error=f"Model returned an invalid status: {validated.status!r}", read_snippets=snippets,
             files_read=files_read, chars_read=chars_read, llm_calls=1,
+            runtime_candidates_offered=len(runtime_candidates),
             elapsed_seconds=time.monotonic() - start_time,
         )
     confidence = validated.confidence if validated.confidence in _RAW_CONFIDENCES else "uncertain"
@@ -473,6 +617,7 @@ def investigate(
             provider=config.provider, model=config.model, is_mock=False, status="failed",
             error="Every evidence citation failed snapshot validation", read_snippets=snippets,
             pruned_evidence=pruned, files_read=files_read, chars_read=chars_read, llm_calls=1,
+            runtime_candidates_offered=len(runtime_candidates),
             elapsed_seconds=time.monotonic() - start_time,
         )
 
@@ -482,6 +627,39 @@ def investigate(
         uncertainty = (
             f"{uncertainty} " if uncertainty else ""
         ) + f"({len(pruned)} evidence citation(s) could not be verified against the snapshot and were dropped.)"
+
+    # Issue #290: runtime_evidence citations are validated against the
+    # offered candidate set (never an invented component_id, mirroring code
+    # evidence path validation) and the stale/unobserved guard: whatever the
+    # model said, a candidate whose deterministic baseline is
+    # 'unobserved'/'stale' is always persisted with THAT value, never a
+    # model-claimed 'match'. Unlike code evidence, an invalid/stale-abused
+    # citation is dropped (recorded) but never fails the whole run closed --
+    # runtime_evidence is always optional, supplementary evidence.
+    runtime_by_id = {c.component_id: c for c in runtime_candidates}
+    valid_runtime_evidence: List[InvestigationRuntimeEvidenceItem] = []
+    pruned_runtime: List[Dict[str, object]] = []
+    for item in validated.runtime_evidence:
+        candidate = runtime_by_id.get(item.component_id)
+        if candidate is None or item.runtime_check not in RUNTIME_CHECK_STATES:
+            pruned_runtime.append({
+                "component_id": item.component_id, "runtime_check": item.runtime_check,
+            })
+            continue
+        final_check = (
+            candidate.baseline
+            if candidate.baseline in ("unobserved", "stale")
+            else item.runtime_check
+        )
+        valid_runtime_evidence.append(
+            InvestigationRuntimeEvidenceItem(
+                component_id=item.component_id,
+                provenance=candidate.provenance,
+                runtime_check=final_check,
+                summary=item.summary,
+            )
+        )
+    valid_runtime_evidence = valid_runtime_evidence[: budget.max_runtime_facts]
 
     decision_question = validated.decision_question if hybrid_decision_question else None
 
@@ -498,6 +676,9 @@ def investigate(
         decision_question=decision_question,
         read_snippets=snippets,
         pruned_evidence=pruned,
+        runtime_evidence=valid_runtime_evidence,
+        pruned_runtime_evidence=pruned_runtime,
+        runtime_candidates_offered=len(runtime_candidates),
         files_read=files_read,
         chars_read=chars_read,
         llm_calls=1,

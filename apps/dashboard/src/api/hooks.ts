@@ -33,6 +33,7 @@ import type {
   InterviewInquiryOriginKind,
   AlignmentBuildOut, AlignmentListOut, AlignmentReviewQueueOut, AlignmentItemOut,
   AlignmentDecisionAction,
+  RuntimeObservationProposalOut, RuntimeObservationProposalCreate,
   RefreshStatusOut, RefreshJobOut,
   ChangeSetDetailOut, ChangeSetApplyResultOut, ChangeSetOut,
   RuntimeRealityFactsOut, RuntimeRealityCheckRunOut,
@@ -1090,6 +1091,57 @@ export function useHoldAlignmentItem(sessionId: number | null) {
     mutationFn: ({ itemId }: { itemId: number }) =>
       api.post<AlignmentItemOut>(`/interview/alignment/${itemId}/hold`),
     onSuccess: () => _invalidateAlignment(qc, sessionId),
+  });
+}
+
+// --- Observation proposal (Issue #290) ----------------------------------------
+//
+// Approval-gated: creating/approving/rejecting a proposal never starts
+// observation itself (see `policy_pointer` on the approved response).
+
+export function useObservationProposals(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("observationProposals"), sessionId],
+    queryFn: () =>
+      api.get<RuntimeObservationProposalOut[]>(`/interview/sessions/${sessionId}/observation-proposals`),
+    enabled: !!sessionId && !!getSystemId(),
+  });
+}
+
+function _invalidateObservationProposals(qc: ReturnType<typeof useQueryClient>, sessionId: number | null) {
+  qc.invalidateQueries({ queryKey: [...sysKey("observationProposals"), sessionId] });
+}
+
+export function useCreateObservationProposal(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: RuntimeObservationProposalCreate) =>
+      api.post<RuntimeObservationProposalOut>(
+        `/interview/sessions/${sessionId}/observation-proposals`, payload,
+      ),
+    onSuccess: () => _invalidateObservationProposals(qc, sessionId),
+  });
+}
+
+export function useApproveObservationProposal(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ proposalId, decision_by }: { proposalId: number; decision_by?: string }) =>
+      api.post<RuntimeObservationProposalOut>(
+        `/interview/observation-proposals/${proposalId}/approve`, { decision_by },
+      ),
+    onSuccess: () => _invalidateObservationProposals(qc, sessionId),
+  });
+}
+
+export function useRejectObservationProposal(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ proposalId, decision_by }: { proposalId: number; decision_by?: string }) =>
+      api.post<RuntimeObservationProposalOut>(
+        `/interview/observation-proposals/${proposalId}/reject`, { decision_by },
+      ),
+    onSuccess: () => _invalidateObservationProposals(qc, sessionId),
   });
 }
 

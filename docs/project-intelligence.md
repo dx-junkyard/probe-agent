@@ -3250,3 +3250,172 @@ pass が各項目の対象を有限候補リストに対して解決し、開発
   表示、非 resolved 項目のチェックボックスが既定で外れ無効化されるこ
   と、apply が選択済み id だけを送ること、discard が discard API を呼
   ぶこと)。
+
+## Runtime Reality Check 統合(Issue #290)
+
+既存の Runtime Reality Check(Issue #135、`app/runtime_reality.py`)の
+決定的トレース集計を、Investigation Agent(#286)の証拠種別・Alignment
+Review(#287)の Review Queue 判定・新規の観測提案フローへ接続する。
+「新しい runtime 事実をどう解釈するか」は reasoning モデルの仕事のまま
+だが、「その事実が今なお現在のものと呼べるか(鮮度・有無・環境)」は
+決定的ルールだけで判定する(Principle 6)。
+
+### 出所エンベロープ(`RuntimeFactProvenanceOut`)
+
+`aggregate_component_facts` が返す `RuntimeTraceFactsOut`(既存、
+`first_observed_at` を additive に追加)を、`app/runtime_reality.py` の
+`build_provenance()` が次の形にラップする:
+
+```
+{
+  environment: str | null,       # traces テーブルに environment 列が無いため常に null(捏造しない)
+  first_observed_at: float | null,
+  last_observed_at: float | null,
+  snapshot_ref: {snapshot_id, git_sha} | null,
+  source: "trace_aggregation",   # 固定値
+  freshness: "fresh" | "stale" | "unobserved",
+}
+```
+
+`freshness` は `freshness_for()` が決定的に計算する: トレースが1件も
+無ければ `unobserved`、`last_observed_at` が `RUNTIME_FACT_FRESH_SECONDS`
+(環境変数、デフォルト 7 日 = 604800 秒)以内なら `fresh`、それ以外は
+`stale`。鮮度が古い事実が「最新」として提示されることは無い(stale
+guard)。
+
+### 有限マッチ状態(`app/runtime_alignment.py`)
+
+- `resolve_component_for_evidence(conn, snapshot_id, evidence)` —
+  evidence の `{path, start_line, end_line}` を `code_symbols`(Issue
+  #24 の Feature-to-Code index)に対して構造的に突き合わせ、
+  `component_id` を決定的に1つだけ解決する。0件または複数件の異なる
+  `component_id` にマッチした場合は `None`(推測しない)。
+- `compare_claim_to_runtime(claim, fact, provenance, *,
+  expected_environment=None)` — `match | mismatch | unobserved | stale`
+  を返す。`claim`(自由文)は監査上の引数として受け取るだけで一切解析
+  しない。判定は `provenance.freshness` のみ(`unobserved`/`stale` は
+  そのまま返す)と、`expected_environment` と `provenance.environment`
+  が両方既知かつ不一致のときの `mismatch`(現行スキーマでは
+  `provenance.environment` が常に null のため到達しないが、将来
+  environment 情報が載る場合のために用意してある。テストは構築した
+  `RuntimeFactProvenanceOut` で直接検証する)だけ。それ以外は `match`。
+  「振る舞いが意味的に一致しているか」の判断は reasoning モデル
+  (Investigation Agent)の仕事で、この関数の仕事ではない。
+
+### Investigation Agent への統合(#286 拡張)
+
+`investigate()` に `conn`/`system_id`/`snapshot_id`(すべて省略可、既定
+`None` — 省略時は #286 と完全に同じ read-only/git-only 挙動)を追加。
+指定された場合、コード証拠として既に選ばれた候補ファイル(`candidates`)
+と同じパス集合から `code_symbols.component_id` を引き、
+`InvestigationBudget.max_runtime_facts`(既定 10、範囲 0〜20)件までの
+runtime fact 候補をプロンプトに追加提示する。モデルは
+`runtime_evidence: [{component_id, runtime_check, summary}]` として引用
+できる(コード証拠と同じく、提示された `component_id` 以外は引用できな
+い — 未知の引用は破棄されるだけで、コード証拠と違いこの拡張だけでは
+実行全体を fail-closed にしない)。**stale guard**: 決定的ベースライン
+(鮮度のみで計算、claim 抜き)が `unobserved`/`stale` の場合、モデルが
+何と言おうと必ずその値で上書きして永続化する — モデルが古い/未観測の
+事実を `match` と主張することは構造的にできない。ベースラインが
+`match`(=新鮮なデータがある)のときだけ、モデル自身の
+`match`/`mismatch` という意味的判断を採用する。
+
+### 段階的開示(Progressive disclosure)
+
+Inquiry の assistant メッセージの `content`(最初に見える結論)には
+runtime の生データ・出所情報は一切含めない。`runtime_evidence` は既存
+の `detail` JSON 展開レイヤー(`InterviewInquiryMessageDetailOut`)に
+だけ入る。同じ detail に `suggested_observation_proposal`
+(`{target_component, reason: "unobserved"|"stale"}` または `null`)も
+入る — これは固定テンプレートによるヒントであり、これ自体は提案レコー
+ドを一切作らない。
+
+### Alignment Review / Review Queue への統合(#287 拡張)
+
+`alignment_item` に additive カラム `runtime_check TEXT NULL`
+(`match|mismatch|unobserved|stale`)を追加。`run_alignment_build` は
+各 item の検証済み evidence から `resolve_component_for_evidence` で
+`component_id` を解決できたときだけ `aggregate_component_facts` +
+`build_provenance` + `compare_claim_to_runtime`(`expected_environment`
+は Systemの `environment` 列)を呼び、`runtime_check` を決定する。決定
+的マッピングが無ければ `null`(推測しない)。
+
+`app/alignment.py` の `_RULES`(先勝ちルール表)に、`conflict_detected`
+の直後・`low_confidence` の直前として次を追加:
+
+```
+runtime_check == 'mismatch' -> must_review, runtime_mismatch
+```
+
+`stale`/`unobserved` はそれ単独では must_review を強制しない。
+`user_reason_for('runtime_mismatch')` の固定文言は
+「コード上の理解と実行時の観測が一致していません」。
+
+### 観測提案(承認ゲート、新規テーブル `runtime_observation_proposal`)
+
+新しい runtime 観測を「開始する」ことは、この Issue のどのコード経路
+からも自動実行されない(Principle 5/8)。開発者の依頼は additive な
+`runtime_observation_proposal` テーブルに `status='proposed'` として記
+録されるだけ:
+
+| カラム | 型 | 説明 |
+| --- | --- | --- |
+| `id` | INTEGER PK | |
+| `session_id` / `system_id` | INTEGER NOT NULL | System-scoped |
+| `origin_inquiry_id` / `origin_alignment_item_id` | INTEGER NULL | 任意の監査リンク |
+| `target_component` | TEXT NOT NULL | |
+| `purpose` / `expected_cost` / `risk_note` / `retention_note` | TEXT | 開発者が入力 |
+| `status` | TEXT NOT NULL DEFAULT `'proposed'` | `proposed\|approved\|rejected\|expired` |
+| `decision_by` / `decision_at` | TEXT / REAL NULL | 手動承認のみ(`decision_method: manual`) |
+| `created_at` | REAL NOT NULL | |
+
+ルート(`routes/interview_observation.py`):
+
+- `POST /interview/sessions/{id}/observation-proposals` — 提案を作成
+  するだけ。
+- `GET /interview/sessions/{id}/observation-proposals` — 一覧
+  (`status` で絞り込み可)。
+- `POST /interview/observation-proposals/{id}/approve` /
+  `.../reject` — `status='proposed'` の行だけを遷移できる(409 それ以
+  外)。**承認しても観測は開始されない** — レスポンスの `policy_pointer`
+  は固定テンプレート文言(`interview_language.py` の
+  `observation_proposal_policy_hint`)で、既存の
+  `PUT /components/{component_id}/policy` を指し示すだけ。interview/
+  investigation 系のどのコードパスも `components` テーブル(ポリシー)
+  へは一切書き込まない — これは回帰テストで固定する。
+
+新しい runtime 事実が届いた後(テストではトレースを直接 INSERT して模
+擬する)、Issue #288 の自動 refresh を再実行すると `run_alignment_build`
+が再度呼ばれ、`runtime_check` が更新される(revision の系列は既存の
+リビジョン/監査の仕組みでそのまま追跡できる)。
+
+### 環境変数
+
+- `RUNTIME_FACT_FRESH_SECONDS`(デフォルト `604800` = 7日)— runtime
+  fact が `fresh` とみなされる上限秒数。`RUNTIME_REALITY_CHECK_*` と同
+  じ正の整数パーサーを使い、不正な値は 422 で fail-closed する。
+
+### テスト
+
+- `tests/test_runtime_alignment.py`: `freshness_for`/`build_provenance`
+  の時刻固定フィクスチャ(fresh/stale/unobserved の境界、環境変数上書
+  き)、`compare_claim_to_runtime` の全分岐(unobserved 優先 > stale
+  優先 > environment mismatch > match、stale な事実が絶対に `match` に
+  ならないこと)、`resolve_component_for_evidence` の一意/曖昧/無マッ
+  チ。
+- `tests/test_interview_alignment.py` 拡張: `classify_alignment_item`
+  への `runtime_check='mismatch'` が `must_review`/`runtime_mismatch`
+  になること(conflict_detected より後・low_confidence より前の優先順
+  位を含む)、`run_alignment_build` 経由の統合テスト(evidence を
+  `code_symbols` にマッピングして runtime_check を決定的に付与)。
+- `tests/test_investigation_agent.py` 拡張: runtime_evidence の
+  budget/schema 検証、stale/unobserved の上書きガード、未提示
+  `component_id` の引用が破棄されること、`conn` 省略時は従来どおり
+  runtime_evidence が空であること。
+- `tests/test_interview_observation.py`(新規): 提案の作成/一覧/承認/
+  却下のライフサイクル、`proposed` 以外からの承認・却下が 409 になる
+  こと、承認後も `components` テーブルが一切変化しないこと(否定テス
+  ト)。
+- 進行的開示: assistant メッセージの `content` に生トレース/出所デー
+  タが含まれないこと(`detail.runtime_evidence` にだけ入ること)を
+  コンポーネント/ユニットテストで固定。

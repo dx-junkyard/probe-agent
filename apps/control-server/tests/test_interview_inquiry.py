@@ -432,7 +432,7 @@ def _create_intent(client, headers, session_id):
 
 
 def _stub_answer(monkeypatch, *, answerable=True, conclusion="結論です", error=None, is_mock=False,
-                  key_points=None, evidence=None, uncertainty=""):
+                  key_points=None, evidence=None, uncertainty="", runtime_evidence=None):
     from app.routes import interview_inquiry as inquiry_routes
 
     def fake_create_llm_client(config):
@@ -442,6 +442,7 @@ def _stub_answer(monkeypatch, *, answerable=True, conclusion="結論です", err
         return InquiryAnswerResult(
             provider="anthropic", model="claude-sonnet-4-5", is_mock=is_mock,
             conclusion=conclusion, key_points=key_points or [], evidence=[],
+            runtime_evidence=runtime_evidence or [],
             uncertainty=uncertainty, answerable=answerable, error=error,
         )
 
@@ -1104,3 +1105,85 @@ def test_migration_creates_inquiry_tables(admin_client):
     assert "interview_inquiry" in tables
     assert "interview_inquiry_message" in tables
     assert "interview_inquiry_transition" in tables
+
+
+# --- Issue #290: runtime_fact evidence / progressive disclosure --------------
+
+
+def _runtime_evidence_item(runtime_check="match", component_id="mod_fn"):
+    from app.investigation_agent import InvestigationRuntimeEvidenceItem
+    from app.models import RuntimeFactProvenanceOut
+
+    return InvestigationRuntimeEvidenceItem(
+        component_id=component_id,
+        provenance=RuntimeFactProvenanceOut(
+            environment=None, first_observed_at=1_000.0, last_observed_at=1_000.0,
+            snapshot_ref=None, source="trace_aggregation", freshness="fresh",
+        ),
+        runtime_check=runtime_check,
+        summary="call_count=42 の呼び出しを観測",
+    )
+
+
+def test_runtime_evidence_never_appears_in_message_content(admin_client, monkeypatch):
+    """Progressive disclosure: content stays conclusion-first; raw
+    provenance/runtime data lives only in detail.runtime_evidence."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    qa = _create_qa(admin_client, headers, session_id)
+
+    _stub_answer(
+        monkeypatch, conclusion="この関数は summarize を実行します。",
+        runtime_evidence=[_runtime_evidence_item()],
+    )
+    created = _open_inquiry(admin_client, headers, session_id, "qa", qa["id"])
+    assert created.status_code == 201, created.text
+
+    assistant = created.json()["messages"][1]
+    assert "trace_aggregation" not in assistant["content"]
+    assert "42" not in assistant["content"]
+    assert "call_count" not in assistant["content"]
+    assert assistant["content"] == "この関数は summarize を実行します。"
+
+    detail = assistant["detail"]
+    assert len(detail["runtime_evidence"]) == 1
+    entry = detail["runtime_evidence"][0]
+    assert entry["component_id"] == "mod_fn"
+    assert entry["runtime_check"] == "match"
+    assert entry["provenance"]["source"] == "trace_aggregation"
+    assert entry["provenance"]["freshness"] == "fresh"
+    assert entry["provenance"]["environment"] is None
+
+
+def test_suggested_observation_proposal_present_when_unobserved(admin_client, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    qa = _create_qa(admin_client, headers, session_id)
+
+    _stub_answer(
+        monkeypatch, conclusion="この関数についての観測データがありません。",
+        runtime_evidence=[_runtime_evidence_item(runtime_check="unobserved")],
+    )
+    created = _open_inquiry(admin_client, headers, session_id, "qa", qa["id"])
+    assert created.status_code == 201, created.text
+
+    detail = created.json()["messages"][1]["detail"]
+    assert detail["suggested_observation_proposal"] == {
+        "target_component": "mod_fn", "reason": "unobserved",
+    }
+
+
+def test_suggested_observation_proposal_absent_when_all_match(admin_client, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    qa = _create_qa(admin_client, headers, session_id)
+
+    _stub_answer(monkeypatch, runtime_evidence=[_runtime_evidence_item(runtime_check="match")])
+    created = _open_inquiry(admin_client, headers, session_id, "qa", qa["id"])
+    assert created.status_code == 201, created.text
+
+    detail = created.json()["messages"][1]["detail"]
+    assert detail["suggested_observation_proposal"] is None

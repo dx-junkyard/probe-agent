@@ -827,6 +827,38 @@ export interface InterviewInquiryEvidenceOut {
 
 export type InquiryRouteCategory = "human_only" | "system_researchable" | "hybrid";
 
+// Issue #290: runtime_fact evidence provenance envelope + finite match
+// state. `environment` is always null today (traces carry no environment
+// metadata) but the field exists for a future capability.
+export type RuntimeFactFreshness = "fresh" | "stale" | "unobserved";
+
+export interface RuntimeFactSnapshotRefOut {
+  snapshot_id: number;
+  git_sha: string | null;
+}
+
+export interface RuntimeFactProvenanceOut {
+  environment: string | null;
+  first_observed_at: number | null;
+  last_observed_at: number | null;
+  snapshot_ref: RuntimeFactSnapshotRefOut | null;
+  source: "trace_aggregation";
+  freshness: RuntimeFactFreshness;
+}
+
+export interface InterviewInquiryRuntimeEvidenceOut {
+  kind: "runtime_fact";
+  component_id: string;
+  provenance: RuntimeFactProvenanceOut;
+  runtime_check: RuntimeCheckState;
+  summary: string;
+}
+
+export interface SuggestedObservationProposalOut {
+  target_component: string;
+  reason: "unobserved" | "stale";
+}
+
 export interface InterviewInquiryMessageDetailOut {
   key_points: string[];
   evidence: InterviewInquiryEvidenceOut[];
@@ -837,6 +869,10 @@ export interface InterviewInquiryMessageDetailOut {
   // #286 or for the user's own messages.
   route_category?: InquiryRouteCategory | null;
   decision_question?: string | null;
+  // Issue #290: runtime_fact evidence + a deterministic observation-
+  // proposal hint, both progressive-disclosure only (never in `content`).
+  runtime_evidence?: InterviewInquiryRuntimeEvidenceOut[];
+  suggested_observation_proposal?: SuggestedObservationProposalOut | null;
 }
 
 export interface InterviewInquiryMessageOut {
@@ -893,6 +929,10 @@ export type AlignmentReasonCode =
   | "security_related" | "high_risk" | "core_intent" | "conflict_detected"
   | "low_confidence" | "runtime_mismatch" | "routine_update" | "no_change"
   | "informational_only";
+// Issue #290: deterministic Runtime Reality Check match state, set only
+// when this item's evidence deterministically maps to a component_id with
+// runtime trace facts; null when no deterministic mapping exists.
+export type RuntimeCheckState = "match" | "mismatch" | "unobserved" | "stale";
 // 'inquiry' is set while an Inquiry (origin_kind='review_item') is open on
 // this item, and reset to 'open' (never 'answered') when it closes.
 export type AlignmentItemStatus = "open" | "answered" | "corrected" | "held" | "inquiry";
@@ -931,6 +971,7 @@ export interface AlignmentItemOut {
   review_category: AlignmentReviewCategory;
   reason_code: AlignmentReasonCode;
   user_reason: string;
+  runtime_check?: RuntimeCheckState | null;
   status: AlignmentItemStatus;
   user_decision: AlignmentUserDecisionOut | null;
   intelligence_run_id: number;
@@ -959,6 +1000,42 @@ export interface AlignmentReviewQueueOut {
   session_id: number;
   system_id: number;
   items: AlignmentItemOut[];
+}
+
+// --- Observation proposal (Issue #290) ----------------------------------------
+//
+// Approval-gated request to start NEW runtime observation. Approving never
+// starts observation itself -- `policy_pointer` is a fixed, server-authored
+// string pointing at the existing PUT /components/{id}/policy endpoint.
+
+export type RuntimeObservationProposalStatus = "proposed" | "approved" | "rejected" | "expired";
+
+export interface RuntimeObservationProposalOut {
+  id: number;
+  session_id: number;
+  system_id: number;
+  origin_inquiry_id: number | null;
+  origin_alignment_item_id: number | null;
+  target_component: string;
+  purpose: string;
+  expected_cost: string | null;
+  risk_note: string | null;
+  retention_note: string | null;
+  status: RuntimeObservationProposalStatus;
+  decision_by: string | null;
+  decision_at: number | null;
+  created_at: number;
+  policy_pointer: string | null;
+}
+
+export interface RuntimeObservationProposalCreate {
+  target_component: string;
+  purpose: string;
+  expected_cost?: string | null;
+  risk_note?: string | null;
+  retention_note?: string | null;
+  origin_inquiry_id?: number | null;
+  origin_alignment_item_id?: number | null;
 }
 
 // --- Automatic refresh after an answer batch (Issue #288) --------------------

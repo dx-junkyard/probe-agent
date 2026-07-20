@@ -45,6 +45,7 @@ from .investigation_agent import (
     InvestigationBudget,
     InvestigationEvidenceItem,
     InvestigationResult,
+    InvestigationRuntimeEvidenceItem,
     investigate,
 )
 from .llm import LLMClient, LLMConfig, MockLLMClient, is_reasoning_model
@@ -77,6 +78,7 @@ class InquiryAnswerResult:
     conclusion: str = ""
     key_points: List[str] = field(default_factory=list)
     evidence: List[InquiryEvidenceItem] = field(default_factory=list)
+    runtime_evidence: List[InvestigationRuntimeEvidenceItem] = field(default_factory=list)
     uncertainty: str = ""
     answerable: bool = False
     evidence_dropped: int = 0
@@ -121,6 +123,9 @@ def generate_inquiry_answer(
     repo_path: Optional[str] = None,
     commit_sha: Optional[str] = None,
     investigation_budget: Optional[InvestigationBudget] = None,
+    conn=None,
+    system_id: Optional[int] = None,
+    snapshot_id: Optional[int] = None,
 ) -> InquiryAnswerResult:
     """Generate one assistant answer for an Inquiry conversation turn.
 
@@ -190,6 +195,7 @@ def generate_inquiry_answer(
         question=question_text, research_focus=route.research_focus,
         hybrid_decision_question=(route.category == "hybrid"),
         language=language, budget=investigation_budget,
+        conn=conn, system_id=system_id, snapshot_id=snapshot_id,
     )
 
     if investigation.status == "failed":
@@ -206,7 +212,8 @@ def generate_inquiry_answer(
     return InquiryAnswerResult(
         provider=config.provider, model=config.model, is_mock=False,
         conclusion=composed.conclusion, key_points=composed.key_points,
-        evidence=composed.evidence, uncertainty=composed.uncertainty,
+        evidence=composed.evidence, runtime_evidence=composed.runtime_evidence,
+        uncertainty=composed.uncertainty,
         answerable=composed.answerable, decision_question=composed.decision_question,
         evidence_dropped=len(investigation.pruned_evidence),
         route=route, investigation=investigation,

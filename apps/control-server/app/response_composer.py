@@ -20,7 +20,11 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from .interview_language import interview_message
-from .investigation_agent import InvestigationEvidenceItem, InvestigationResult
+from .investigation_agent import (
+    InvestigationEvidenceItem,
+    InvestigationResult,
+    InvestigationRuntimeEvidenceItem,
+)
 
 
 @dataclass
@@ -29,6 +33,10 @@ class ComposedAnswer:
     conclusion: str
     key_points: List[str] = field(default_factory=list)
     evidence: List[InvestigationEvidenceItem] = field(default_factory=list)
+    # Issue #290: runtime_fact evidence, kept separate from ``evidence``
+    # (code citations) -- both stay in the detail/expansion layer, never in
+    # ``conclusion`` (progressive disclosure).
+    runtime_evidence: List[InvestigationRuntimeEvidenceItem] = field(default_factory=list)
     uncertainty: str = ""
     decision_question: Optional[str] = None
     route_category: Optional[str] = None
@@ -65,6 +73,7 @@ def compose_system_researchable(*, investigation: InvestigationResult, language:
             conclusion=investigation.conclusion,
             key_points=list(investigation.key_points),
             evidence=list(investigation.evidence),
+            runtime_evidence=list(investigation.runtime_evidence),
             uncertainty=investigation.uncertainty,
             decision_question=None,
             route_category="system_researchable",
@@ -93,11 +102,13 @@ def compose_hybrid(
         base = investigation.conclusion
         key_points = list(investigation.key_points)
         evidence = list(investigation.evidence)
+        runtime_evidence = list(investigation.runtime_evidence)
         uncertainty = investigation.uncertainty
     else:
         base = interview_message("inquiry_hybrid_unresolved_note", language)
         key_points = []
         evidence = []
+        runtime_evidence = []
         uncertainty = investigation.uncertainty
 
     decision_question = investigation.decision_question or interview_message(
@@ -111,6 +122,7 @@ def compose_hybrid(
         conclusion=conclusion,
         key_points=key_points,
         evidence=evidence,
+        runtime_evidence=runtime_evidence,
         uncertainty=uncertainty,
         decision_question=decision_question,
         route_category="hybrid",

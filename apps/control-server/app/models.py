@@ -3020,6 +3020,17 @@ class InterviewInquiryMessageDetailOut(BaseModel):
     # answer themselves. Both None for messages predating Issue #286.
     route_category: Optional[str] = None
     decision_question: Optional[str] = None
+    # Issue #290: runtime_fact evidence entries (provenance + finite
+    # runtime_check), always in this detail layer -- never in the message's
+    # short ``content`` -- so the initial answer stays conclusion-first and
+    # raw trace/provenance data only appears in the collapsible detail
+    # expansion (progressive disclosure).
+    runtime_evidence: List["InterviewInquiryRuntimeEvidenceOut"] = Field(default_factory=list)
+    # A deterministic hint (never LLM free text) that a runtime_fact came
+    # back unobserved/stale -- the developer can turn this into an actual
+    # POST .../observation-proposals call if they want new observation;
+    # this hint alone never creates a proposal row (Principle 5/8).
+    suggested_observation_proposal: Optional["SuggestedObservationProposalOut"] = None
 
 
 class InterviewInquiryMessageOut(BaseModel):
@@ -3095,6 +3106,13 @@ class InterviewInquiryTransitionRequest(BaseModel):
 # app/alignment.py's rule table). Only review_category IN (must_review,
 # batch_reviewable) ever surfaces as an action-required Review Queue card.
 
+# Issue #290: defined here (ahead of the Runtime Reality Check section
+# further down) because AlignmentItemOut.runtime_check needs
+# RuntimeCheckState. See that section for the full provenance envelope
+# model these finite sets belong to.
+RuntimeFactFreshness = Literal["fresh", "stale", "unobserved"]
+RuntimeCheckState = Literal["match", "mismatch", "unobserved", "stale"]
+
 AlignmentState = Literal["aligned", "gap", "unknown", "conflict", "not_applicable"]
 AlignmentRiskFlag = Literal["security", "high_risk", "core_intent"]
 AlignmentConfidence = Literal["confirmed", "likely", "uncertain", "conflicting"]
@@ -3153,6 +3171,11 @@ class AlignmentItemOut(BaseModel):
     review_category: AlignmentReviewCategory
     reason_code: AlignmentReasonCode
     user_reason: str
+    # Issue #290: deterministic Runtime Reality Check match state, set only
+    # when this item's evidence deterministically maps to a component_id
+    # with runtime trace facts; null when no deterministic mapping exists
+    # (never guessed from free text -- app/runtime_alignment.py).
+    runtime_check: Optional[RuntimeCheckState] = None
     status: AlignmentItemStatus
     user_decision: Optional[AlignmentUserDecisionOut] = None
     intelligence_run_id: int
@@ -3347,8 +3370,43 @@ class RuntimeTraceFactsOut(BaseModel):
     duration_p50_ms: Optional[float] = None
     duration_p90_ms: Optional[float] = None
     duration_p99_ms: Optional[float] = None
+    # Issue #290: earliest trace timestamp inside the aggregation window
+    # (None when has_traces is False), used by the provenance envelope's
+    # observed_at.first alongside last_observed_at's observed_at.last.
+    first_observed_at: Optional[float] = None
     last_observed_at: Optional[float] = None
     has_traces: bool = False
+
+
+# --- Runtime fact provenance / match state (Issue #290) ----------------------
+#
+# Wraps RuntimeTraceFactsOut with WHERE the facts came from and HOW current
+# they are, so a fact is never silently presented as current/authoritative
+# once it has gone stale (Principle 5 stale guard). ``environment`` is only
+# ever populated from actual trace metadata (never invented) -- the current
+# ``traces`` schema has no environment column, so it is always null today;
+# the field exists so a future trace-tagging capability does not need a
+# schema-incompatible follow-up. ``freshness`` and ``runtime_check`` are both
+# finite sets (Principle 6): freshness is a pure function of
+# RUNTIME_FACT_FRESH_SECONDS vs last_observed_at (app/runtime_reality.py);
+# runtime_check is app/runtime_alignment.py's compare_claim_to_runtime result.
+# NOTE: RuntimeFactFreshness/RuntimeCheckState themselves are defined earlier
+# in this module (just above the Alignment Review section) because
+# AlignmentItemOut needs RuntimeCheckState.
+
+
+class RuntimeFactSnapshotRefOut(BaseModel):
+    snapshot_id: int
+    git_sha: Optional[str] = None
+
+
+class RuntimeFactProvenanceOut(BaseModel):
+    environment: Optional[str] = None
+    first_observed_at: Optional[float] = None
+    last_observed_at: Optional[float] = None
+    snapshot_ref: Optional[RuntimeFactSnapshotRefOut] = None
+    source: Literal["trace_aggregation"] = "trace_aggregation"
+    freshness: RuntimeFactFreshness
 
 
 class RuntimeRealityCheckItemOut(BaseModel):
@@ -3393,6 +3451,89 @@ class RuntimeRealityCheckRunOut(BaseModel):
     skipped: bool = False
     skipped_reason: Optional[str] = None
     error: Optional[str] = None
+
+
+# --- Investigation Agent runtime_fact evidence (Issue #290) ------------------
+#
+# Extends Issue #286's Investigation Agent with a second evidence kind
+# alongside code citations: a runtime_fact entry cites a component_id (never
+# invented -- must be one of the components deterministically offered to the
+# model, mirroring how code evidence must cite an actually-read path) plus
+# its provenance envelope and the finite runtime_check state. When the
+# deterministic freshness is 'unobserved'/'stale' the persisted
+# ``runtime_check`` always matches that deterministic value regardless of
+# what the model said (Principle 5 stale guard); only when facts are fresh
+# does the model's own match/mismatch judgement (a semantic call, Principle
+# 6) get recorded as-is.
+
+
+class InvestigationRuntimeEvidenceOut(BaseModel):
+    kind: Literal["runtime_fact"] = "runtime_fact"
+    component_id: str
+    provenance: RuntimeFactProvenanceOut
+    runtime_check: RuntimeCheckState
+    summary: str = ""
+
+
+class InterviewInquiryRuntimeEvidenceOut(InvestigationRuntimeEvidenceOut):
+    pass
+
+
+class SuggestedObservationProposalOut(BaseModel):
+    target_component: str
+    reason: Literal["unobserved", "stale"]
+
+
+# --- Observation proposal (Issue #290) ---------------------------------------
+#
+# A developer's request to start capturing NEW runtime observation (as
+# opposed to reading facts that already exist) is never auto-started
+# (Principle 5/8): POST .../observation-proposals only ever records a
+# proposal row; approving it (decision_method='manual') does NOT itself
+# start anything -- the response only points back at the existing
+# PUT /components/{component_id}/policy endpoint that already sets a
+# component's trace/shadow mode.
+
+RuntimeObservationProposalStatus = Literal["proposed", "approved", "rejected", "expired"]
+
+
+class RuntimeObservationProposalCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_component: str = Field(..., min_length=1, max_length=500)
+    purpose: str = Field(..., min_length=1, max_length=2_000)
+    expected_cost: Optional[str] = Field(default=None, max_length=500)
+    risk_note: Optional[str] = Field(default=None, max_length=2_000)
+    retention_note: Optional[str] = Field(default=None, max_length=2_000)
+    origin_inquiry_id: Optional[int] = None
+    origin_alignment_item_id: Optional[int] = None
+
+
+class RuntimeObservationProposalOut(BaseModel):
+    id: int
+    session_id: int
+    system_id: int
+    origin_inquiry_id: Optional[int] = None
+    origin_alignment_item_id: Optional[int] = None
+    target_component: str
+    purpose: str
+    expected_cost: Optional[str] = None
+    risk_note: Optional[str] = None
+    retention_note: Optional[str] = None
+    status: RuntimeObservationProposalStatus
+    decision_by: Optional[str] = None
+    decision_at: Optional[float] = None
+    created_at: float
+    # Deterministic, fixed (never LLM free text): only present once
+    # status='approved', pointing at the existing policy endpoint that
+    # actually starts trace/shadow capture (this proposal never does).
+    policy_pointer: Optional[str] = None
+
+
+class RuntimeObservationProposalDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision_by: Optional[str] = Field(default=None, max_length=200)
 
 
 # --- Understanding Revisions (Issue #136) ------------------------------------

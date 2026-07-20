@@ -829,6 +829,232 @@ def test_review_item_inquiry_round_trip_through_real_build(admin_client, tmp_pat
     assert answer.json()["status"] == "answered"
 
 
+# --- Issue #290: runtime_check rule table + build integration ---------------
+
+
+@pytest.mark.parametrize("runtime_check", ["mismatch"])
+def test_classify_alignment_item_runtime_mismatch_is_must_review(runtime_check):
+    category, reason = classify_alignment_item(
+        alignment_state="aligned", risk_flags=[], confidence="confirmed",
+        intent_field=None, runtime_check=runtime_check,
+    )
+    assert (category, reason) == ("must_review", "runtime_mismatch")
+
+
+@pytest.mark.parametrize("runtime_check", ["stale", "unobserved", None])
+def test_classify_alignment_item_stale_unobserved_do_not_force_must_review(runtime_check):
+    """stale/unobserved alone must not trigger must_review -- an aligned,
+    confirmed item with no risk flags stays no_review_required regardless."""
+    category, reason = classify_alignment_item(
+        alignment_state="aligned", risk_flags=[], confidence="confirmed",
+        intent_field=None, runtime_check=runtime_check,
+    )
+    assert (category, reason) == ("no_review_required", "no_change")
+
+
+def test_classify_alignment_item_runtime_mismatch_priority_after_conflict_before_low_confidence():
+    """runtime_check='mismatch' must not override conflict_detected (checked
+    first) but must win over low_confidence (checked after)."""
+    # conflict state wins regardless of runtime_check.
+    category, reason = classify_alignment_item(
+        alignment_state="conflict", risk_flags=[], confidence="confirmed",
+        intent_field=None, runtime_check="mismatch",
+    )
+    assert (category, reason) == ("must_review", "conflict_detected")
+
+    # runtime_check='mismatch' wins over a merely-uncertain confidence.
+    category, reason = classify_alignment_item(
+        alignment_state="gap", risk_flags=[], confidence="uncertain",
+        intent_field=None, runtime_check="mismatch",
+    )
+    assert (category, reason) == ("must_review", "runtime_mismatch")
+
+
+def test_classify_alignment_item_runtime_check_default_is_none_backward_compatible():
+    """Every pre-#290 call site (no runtime_check kwarg) keeps working."""
+    category, reason = classify_alignment_item(
+        alignment_state="gap", risk_flags=[], confidence="likely", intent_field="pain",
+    )
+    assert (category, reason) == ("batch_reviewable", "routine_update")
+
+
+def _insert_code_symbol(system_id, snapshot_id, *, path, start_line, end_line, component_id, name="fn"):
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO code_symbols
+                (snapshot_id, system_id, path, qualified_name, kind, start_line, end_line, component_id)
+            VALUES (?, ?, ?, ?, 'function', ?, ?, ?)""",
+            (snapshot_id, system_id, path, name, start_line, end_line, component_id),
+        )
+
+
+def _insert_trace(system_id, component_id, *, timestamp, error=None):
+    from app.db import get_conn
+    import uuid
+
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO traces
+                (system_id, trace_id, component_id, mode, input_json, output_text, error,
+                 duration_ms, timestamp)
+            VALUES (?, ?, ?, 'trace', '{}', 'ok', ?, 5.0, ?)""",
+            (system_id, str(uuid.uuid4()), component_id, error, timestamp),
+        )
+
+
+def test_build_sets_runtime_check_match_when_fresh_traces_exist(admin_client, tmp_path, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _insert_code_symbol(
+        system_id, snapshot_id, path="src/a.py", start_line=1, end_line=20, component_id="src_a_fn",
+    )
+    _insert_trace(system_id, "src_a_fn", timestamp=time.time())
+
+    _stub_build(monkeypatch, items=[_proposal_item()])
+    r = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["items"][0]["runtime_check"] == "match"
+
+
+def test_build_sets_runtime_check_unobserved_when_no_traces(admin_client, tmp_path, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _insert_code_symbol(
+        system_id, snapshot_id, path="src/a.py", start_line=1, end_line=20, component_id="src_a_fn",
+    )
+    # No traces inserted for src_a_fn.
+
+    _stub_build(monkeypatch, items=[_proposal_item()])
+    r = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["items"][0]["runtime_check"] == "unobserved"
+
+
+def test_build_sets_runtime_check_stale_when_traces_are_old(admin_client, tmp_path, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _insert_code_symbol(
+        system_id, snapshot_id, path="src/a.py", start_line=1, end_line=20, component_id="src_a_fn",
+    )
+    # Old timestamp, but still inside the default RUNTIME_REALITY_CHECK_WINDOW_DAYS
+    # aggregation window so aggregate_component_facts still finds it.
+    monkeypatch.setenv("RUNTIME_REALITY_CHECK_WINDOW_DAYS", "365")
+    monkeypatch.setenv("RUNTIME_FACT_FRESH_SECONDS", "3600")
+    _insert_trace(system_id, "src_a_fn", timestamp=time.time() - 10 * 86_400)
+
+    _stub_build(monkeypatch, items=[_proposal_item()])
+    r = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["items"][0]["runtime_check"] == "stale"
+
+
+def test_build_leaves_runtime_check_none_when_no_deterministic_component_mapping(admin_client, tmp_path, monkeypatch):
+    """No code_symbols component_id maps to the evidence path -- never guessed."""
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _stub_build(monkeypatch, items=[_proposal_item()])
+    r = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["items"][0]["runtime_check"] is None
+
+
+def test_build_static_vs_runtime_mismatch_forces_must_review(admin_client, tmp_path, monkeypatch):
+    """End-to-end through the real build pipeline: evidence maps to a
+    component deterministically, the fact/provenance's environment differs
+    from the System's declared environment (the one deterministic mismatch
+    signal, see app/runtime_alignment.py), and the resulting item lands in
+    must_review with reason_code=runtime_mismatch -- an aligned/confirmed
+    state that would otherwise be no_review_required."""
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _insert_code_symbol(
+        system_id, snapshot_id, path="src/a.py", start_line=1, end_line=20, component_id="src_a_fn",
+    )
+    _insert_trace(system_id, "src_a_fn", timestamp=time.time())
+
+    # The System itself declares environment='test' (see _create_system);
+    # fabricate a differing fact-provenance environment to exercise the
+    # deterministic environment-mismatch branch through the real build path
+    # (today's traces table carries no environment column, so this is the
+    # only way to exercise it end-to-end -- see docs/project-intelligence.md
+    # Issue #290 section).
+    from app.models import RuntimeFactProvenanceOut
+    from app.routes import interview_alignment as alignment_routes
+
+    real_build_provenance = alignment_routes.build_provenance
+
+    def fake_build_provenance(fact, **kwargs):
+        prov = real_build_provenance(fact, **kwargs)
+        return RuntimeFactProvenanceOut(
+            environment="staging", first_observed_at=prov.first_observed_at,
+            last_observed_at=prov.last_observed_at, snapshot_ref=prov.snapshot_ref,
+            source=prov.source, freshness=prov.freshness,
+        )
+
+    monkeypatch.setattr(alignment_routes, "build_provenance", fake_build_provenance)
+
+    _stub_build(monkeypatch, items=[
+        _proposal_item(alignment_state="aligned", confidence="confirmed", risk_flags=[]),
+    ])
+    r = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers)
+    assert r.status_code == 200, r.text
+    item = r.json()["items"][0]
+    assert item["runtime_check"] == "mismatch"
+    assert item["review_category"] == "must_review"
+    assert item["reason_code"] == "runtime_mismatch"
+    assert item["user_reason"] == USER_REASON_TEMPLATES["runtime_mismatch"]
+    assert item["user_reason"] == "コード上の理解と実行時の観測が一致していません"
+
+
+def test_new_traces_update_runtime_check_on_rebuild(admin_client, tmp_path, monkeypatch):
+    """Simulates 'observation import': runtime_check is unobserved on the
+    first build (no traces yet), then updates to match once traces arrive
+    and the item is rebuilt -- lineage (intelligence_run_id) advances to a
+    new audit row for the new build, per Issue #288's refresh reusing this
+    exact build path."""
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+    _insert_code_symbol(
+        system_id, snapshot_id, path="src/a.py", start_line=1, end_line=20, component_id="src_a_fn",
+    )
+
+    _stub_build(monkeypatch, items=[_proposal_item(current_claim="対象クレーム")])
+    first = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+    first_item = next(it for it in first["items"] if it["current_claim"] == "対象クレーム")
+    assert first_item["runtime_check"] == "unobserved"
+    first_run_id = first_item["intelligence_run_id"]
+
+    # "Observation import": a new trace arrives for the mapped component.
+    _insert_trace(system_id, "src_a_fn", timestamp=time.time())
+
+    _stub_build(monkeypatch, items=[_proposal_item(current_claim="対象クレーム")])
+    second = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+    second_item = next(it for it in second["items"] if it["current_claim"] == "対象クレーム")
+    assert second_item["runtime_check"] == "match"
+    # Revision lineage: the rebuild is a new, independently-audited
+    # intelligence_runs row -- never overwriting the first build's record.
+    assert second_item["intelligence_run_id"] != first_run_id
+
+
 def test_system_isolation(admin_client, tmp_path, monkeypatch):
     token_a, system_a, snapshot_a = _setup(admin_client, tmp_path, name="System A")
     headers_a = _headers(token_a, system_a)

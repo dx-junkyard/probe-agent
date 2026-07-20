@@ -143,6 +143,23 @@ INTERVIEW_MESSAGES: dict = {
         "ja": "この点について、あなたの判断を教えてください:「{question}」",
         "en": "Please share your own decision on this: \"{question}\"",
     },
+    # Issue #290: fixed, non-LLM-fabricated pointer shown once an
+    # observation proposal is approved. Approving never starts observation
+    # itself -- this only points back at the existing policy endpoint.
+    "observation_proposal_policy_hint": {
+        "ja": (
+            "この提案は承認されましたが、観測はまだ開始されていません。"
+            "「{component_id}」の実行時観測を開始するには、"
+            "既存のポリシー設定画面からこのコンポーネントの mode を "
+            "trace または shadow に変更してください。"
+        ),
+        "en": (
+            "This proposal has been approved, but observation has not started "
+            "yet. To start runtime observation for \"{component_id}\", change "
+            "this component's mode to trace or shadow from the existing "
+            "policy settings."
+        ),
+    },
 }
 
 # Deterministic fallback language for the fixed-text messages above only,

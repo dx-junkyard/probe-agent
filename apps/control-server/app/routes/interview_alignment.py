@@ -69,6 +69,8 @@ from ..models import (
     AlignmentReviewQueueOut,
     AlignmentUserDecisionOut,
 )
+from ..runtime_alignment import compare_claim_to_runtime, resolve_component_for_evidence
+from ..runtime_reality import aggregate_component_facts, build_provenance
 
 router = APIRouter()
 
@@ -119,6 +121,7 @@ def _item_out(row) -> AlignmentItemOut:
         review_category=row["review_category"],
         reason_code=row["reason_code"],
         user_reason=row["user_reason"],
+        runtime_check=row["runtime_check"] if "runtime_check" in row.keys() else None,
         status=row["status"],
         user_decision=AlignmentUserDecisionOut(**user_decision) if user_decision else None,
         intelligence_run_id=row["intelligence_run_id"],
@@ -190,6 +193,16 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
             detail="The pinned snapshot for this session's latest understanding revision no longer exists.",
         )
 
+    # Issue #290: the System's own declared environment (may be '') is the
+    # only "expected environment" compare_claim_to_runtime is ever given --
+    # never inferred from claim text.
+    system_row = conn.execute(
+        "SELECT environment FROM systems WHERE id = ?", (system_id,),
+    ).fetchone()
+    expected_environment = (
+        system_row["environment"] if system_row and system_row["environment"] else None
+    )
+
     intent_rows = conn.execute(
         """SELECT * FROM interview_intent_item
            WHERE session_id = ? AND system_id = ? AND superseded_by_id IS NULL
@@ -253,11 +266,31 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
                 # Dropped, not fatal on its own -- see the "fail only if
                 # none valid" rule below.
                 continue
+
+            # Issue #290: deterministic evidence -> component_id -> runtime
+            # facts -> finite match state. None whenever no deterministic
+            # mapping exists (ambiguous or no code_symbols component_id
+            # match) -- never guessed.
+            runtime_check: Optional[str] = None
+            component_id = resolve_component_for_evidence(
+                conn, revision["snapshot_id"], valid_evidence,
+            )
+            if component_id is not None:
+                fact = aggregate_component_facts(conn, system_id, component_id)
+                provenance = build_provenance(
+                    fact, snapshot_id=revision["snapshot_id"], git_sha=snapshot_row["commit_sha"],
+                )
+                runtime_check = compare_claim_to_runtime(
+                    item.current_claim, fact, provenance,
+                    expected_environment=expected_environment,
+                )
+
             review_category, reason_code = classify_alignment_item(
                 alignment_state=item.alignment_state,
                 risk_flags=item.risk_flags,
                 confidence=item.confidence,
                 intent_field=item.intent_field,
+                runtime_check=runtime_check,
             )
             final_items.append({
                 "intent_item_id": intent_item_id_by_field.get(item.intent_field)
@@ -275,6 +308,7 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
                 "confidence": item.confidence,
                 "review_category": review_category,
                 "reason_code": reason_code,
+                "runtime_check": runtime_check,
             })
         if had_raw_items and not final_items:
             proposal = AlignmentProposalResult(
@@ -319,16 +353,16 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
                     (session_id, system_id, revision_id, snapshot_id, intent_item_id,
                      intent_summary, current_claim, current_evidence, gap_summary,
                      proposed_interpretation, alignment_state, risk_flags, confidence,
-                     review_category, reason_code, user_reason, status, user_decision,
-                     intelligence_run_id, is_mock, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?, ?, ?)""",
+                     review_category, reason_code, user_reason, runtime_check, status,
+                     user_decision, intelligence_run_id, is_mock, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?, ?, ?)""",
                 (
                     session_id, system_id, revision["id"], revision["snapshot_id"],
                     it["intent_item_id"], it["intent_summary"], it["current_claim"],
                     json.dumps(it["current_evidence"], ensure_ascii=False),
                     it["gap_summary"], it["proposed_interpretation"], it["alignment_state"],
                     json.dumps(it["risk_flags"]), it["confidence"], it["review_category"],
-                    reason_code, user_reason_for(reason_code), run_id,
+                    reason_code, user_reason_for(reason_code), it["runtime_check"], run_id,
                     1 if proposal.is_mock else 0, completed_at, completed_at,
                 ),
             )

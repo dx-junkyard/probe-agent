@@ -94,7 +94,7 @@ USER_REASON_TEMPLATES: Dict[str, str] = {
     "core_intent": "目標(goal)に関わる内容のため個別確認が必要です",
     "conflict_detected": "意図と現状の理解が矛盾しているため確認が必要です",
     "low_confidence": "AIの確信度が低いため個別確認が必要です",
-    "runtime_mismatch": "実行時の実態と食い違う可能性があるため確認が必要です",
+    "runtime_mismatch": "コード上の理解と実行時の観測が一致していません",
     "routine_update": "軽微な差分です。まとめて確認してください",
     "no_change": "意図と現状の理解は一致しています。対応は不要です",
     "informational_only": "参考情報です。対応は不要です",
@@ -109,31 +109,42 @@ def user_reason_for(reason_code: str) -> str:
 #
 # First match wins. Every branch's predicate reads only finite-set fields
 # already validated by generate_alignment_proposal (alignment_state,
-# risk_flags, confidence, intent_field) -- never free text. Kept as plain
-# data (not nested if/elif) so tests can enumerate every rule and assert on
-# it directly, and so the priority order is visible at a glance.
+# risk_flags, confidence, intent_field) plus, from Issue #290,
+# runtime_check -- itself a finite state already validated deterministically
+# by app/runtime_alignment.py's compare_claim_to_runtime, never free text.
+# Kept as plain data (not nested if/elif) so tests can enumerate every rule
+# and assert on it directly, and so the priority order is visible at a
+# glance.
 
-_RulePredicate = Callable[[str, List[str], str, Optional[str]], bool]
+_RulePredicate = Callable[[str, List[str], str, Optional[str], Optional[str]], bool]
 
 _RULES: List[Tuple[_RulePredicate, str, str]] = [
-    (lambda state, risk, conf, ifield: "security" in risk,
+    (lambda state, risk, conf, ifield, runtime_check: "security" in risk,
      "must_review", "security_related"),
-    (lambda state, risk, conf, ifield: "high_risk" in risk,
+    (lambda state, risk, conf, ifield, runtime_check: "high_risk" in risk,
      "must_review", "high_risk"),
-    (lambda state, risk, conf, ifield: (
+    (lambda state, risk, conf, ifield, runtime_check: (
         "core_intent" in risk or (ifield == "goal" and state in ("gap", "conflict"))
      ), "must_review", "core_intent"),
-    (lambda state, risk, conf, ifield: state == "conflict",
+    (lambda state, risk, conf, ifield, runtime_check: state == "conflict",
      "must_review", "conflict_detected"),
-    (lambda state, risk, conf, ifield: conf in ("uncertain", "conflicting"),
+    # Issue #290: a deterministic runtime/current-system mismatch is its own
+    # must_review reason, inserted after conflict_detected (an intent-vs-code
+    # conflict is a stronger, more specific signal) and before low_confidence
+    # (a runtime mismatch is a structural fact, not a confidence problem).
+    # stale/unobserved deliberately do NOT match here -- they never force
+    # must_review by themselves (brief).
+    (lambda state, risk, conf, ifield, runtime_check: runtime_check == "mismatch",
+     "must_review", "runtime_mismatch"),
+    (lambda state, risk, conf, ifield, runtime_check: conf in ("uncertain", "conflicting"),
      "must_review", "low_confidence"),
-    (lambda state, risk, conf, ifield: state == "unknown",
+    (lambda state, risk, conf, ifield, runtime_check: state == "unknown",
      "must_review", "low_confidence"),
-    (lambda state, risk, conf, ifield: state == "gap",
+    (lambda state, risk, conf, ifield, runtime_check: state == "gap",
      "batch_reviewable", "routine_update"),
-    (lambda state, risk, conf, ifield: state == "aligned",
+    (lambda state, risk, conf, ifield, runtime_check: state == "aligned",
      "no_review_required", "no_change"),
-    (lambda state, risk, conf, ifield: state == "not_applicable",
+    (lambda state, risk, conf, ifield, runtime_check: state == "not_applicable",
      "informational", "informational_only"),
 ]
 
@@ -144,19 +155,24 @@ def classify_alignment_item(
     risk_flags: List[str],
     confidence: str,
     intent_field: Optional[str],
+    runtime_check: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Deterministic (review_category, reason_code) for one alignment item.
 
     Requires ``alignment_state`` in ``ALIGNMENT_STATES`` and ``confidence``
     in ``CONFIDENCE_LEVELS`` (callers validate this before classifying, see
-    ``generate_alignment_proposal``). Every valid ``alignment_state`` is
-    covered by exactly one terminal rule below (conflict / unknown / gap /
-    aligned / not_applicable), so the rule table is exhaustive for any
+    ``generate_alignment_proposal``). ``runtime_check`` (Issue #290), when
+    given, must be one of ``runtime_alignment.RUNTIME_CHECK_STATES``; it is
+    ``None`` whenever the item has no deterministic component mapping (the
+    default, and the case for every pre-#290 caller/test). Every valid
+    ``alignment_state`` is covered by exactly one terminal rule below
+    (conflict / unknown / gap / aligned / not_applicable) even when
+    ``runtime_check`` is ``None``, so the rule table is exhaustive for any
     already-validated input; the ``ValueError`` below only guards against a
     future rule-table edit accidentally leaving a state uncovered.
     """
     for predicate, category, reason_code in _RULES:
-        if predicate(alignment_state, risk_flags, confidence, intent_field):
+        if predicate(alignment_state, risk_flags, confidence, intent_field, runtime_check):
             return category, reason_code
     raise ValueError(f"No review rule matched alignment_state={alignment_state!r}")
 

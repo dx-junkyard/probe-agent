@@ -66,7 +66,9 @@ from ..models import (
     InterviewInquiryMessageDetailOut,
     InterviewInquiryMessageOut,
     InterviewInquiryOut,
+    InterviewInquiryRuntimeEvidenceOut,
     InterviewInquiryTransitionRequest,
+    SuggestedObservationProposalOut,
 )
 
 router = APIRouter()
@@ -170,10 +172,24 @@ def _set_review_item_status(
     )
 
 
+def _suggested_observation_proposal(runtime_evidence) -> Optional[Dict[str, str]]:
+    """First unobserved/stale runtime_fact -> a deterministic proposal hint.
+
+    Never LLM free text: only ``target_component``/``reason`` (both finite),
+    used by the dashboard to prefill (never auto-submit) a
+    POST .../observation-proposals call.
+    """
+    for e in runtime_evidence:
+        if e.runtime_check in ("unobserved", "stale"):
+            return {"target_component": e.component_id, "reason": e.runtime_check}
+    return None
+
+
 def _message_out(row) -> InterviewInquiryMessageOut:
     detail_out = None
     if row["detail"]:
         detail_json = json.loads(row["detail"])
+        suggested = detail_json.get("suggested_observation_proposal")
         detail_out = InterviewInquiryMessageDetailOut(
             key_points=detail_json.get("key_points", []),
             evidence=[
@@ -182,6 +198,13 @@ def _message_out(row) -> InterviewInquiryMessageOut:
             uncertainty=detail_json.get("uncertainty", ""),
             route_category=detail_json.get("route_category"),
             decision_question=detail_json.get("decision_question"),
+            runtime_evidence=[
+                InterviewInquiryRuntimeEvidenceOut(**e)
+                for e in detail_json.get("runtime_evidence", [])
+            ],
+            suggested_observation_proposal=(
+                SuggestedObservationProposalOut(**suggested) if suggested else None
+            ),
         )
     return InterviewInquiryMessageOut(
         id=row["id"],
@@ -330,6 +353,9 @@ def _generate_and_store_answer(
             origin_summary=origin_summary,
             repo_path=snapshot_row["repo_path"] if snapshot_row else None,
             commit_sha=snapshot_row["commit_sha"] if snapshot_row else None,
+            conn=conn,
+            system_id=system_id,
+            snapshot_id=snapshot_id,
         )
     except LLMError as exc:
         result = InquiryAnswerResult(
@@ -391,18 +417,34 @@ def _generate_and_store_answer(
                 }
                 for e in result.evidence
             ],
+            # Issue #290: runtime_fact evidence lives only in this detail
+            # layer -- ``content`` above never carries provenance/raw
+            # numbers (progressive disclosure).
+            "runtime_evidence": [
+                {
+                    "kind": "runtime_fact",
+                    "component_id": e.component_id,
+                    "provenance": e.provenance.model_dump(),
+                    "runtime_check": e.runtime_check,
+                    "summary": e.summary,
+                }
+                for e in result.runtime_evidence
+            ],
             "uncertainty": result.uncertainty,
             "route_category": result.route.category if result.route else None,
             "decision_question": result.decision_question,
+            "suggested_observation_proposal": _suggested_observation_proposal(result.runtime_evidence),
         }
     else:
         content = interview_message(
             "inquiry_insufficient_information", resolve_message_language(),
         )
         detail = {
-            "key_points": [], "evidence": [], "uncertainty": result.uncertainty,
+            "key_points": [], "evidence": [], "runtime_evidence": [],
+            "uncertainty": result.uncertainty,
             "route_category": result.route.category if result.route else None,
             "decision_question": None,
+            "suggested_observation_proposal": None,
         }
 
     msg_cur = conn.execute(

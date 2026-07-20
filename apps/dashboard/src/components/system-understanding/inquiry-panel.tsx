@@ -12,6 +12,7 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import {
   useCreateInterviewInquiry,
+  useCreateObservationProposal,
   useHoldInterviewInquiry,
   useInterviewInquiryDetail,
   useReopenInterviewInquiryDoubt,
@@ -22,6 +23,8 @@ import type {
   InquiryRouteCategory,
   InterviewInquiryMessageOut,
   InterviewInquiryOriginKind,
+  InterviewInquiryRuntimeEvidenceOut,
+  RuntimeFactFreshness,
 } from "@/api/types";
 
 // Issue #286: Question Router category -> 日本語ラベル。canonical enum
@@ -34,13 +37,124 @@ const ROUTE_CATEGORY_LABELS: Record<InquiryRouteCategory, string> = {
   hybrid: "調査 + あなたの判断",
 };
 
-function InquiryMessageBubble({ message }: { message: InterviewInquiryMessageOut }) {
+// Issue #290: runtime_fact provenance の鮮度 -> 日本語ラベル。
+const FRESHNESS_LABELS: Record<RuntimeFactFreshness, string> = {
+  fresh: "最新",
+  stale: "古い",
+  unobserved: "未観測",
+};
+
+function formatObservedAt(ts: number | null): string {
+  if (ts === null) return "—";
+  return new Date(ts * 1000).toLocaleString("ja-JP");
+}
+
+function RuntimeEvidenceChips({ entry }: { entry: InterviewInquiryRuntimeEvidenceOut }) {
+  const { provenance } = entry;
+  const isStale = provenance.freshness === "stale";
+  return (
+    <div
+      className="rounded border border-muted-foreground/20 bg-background/60 p-2 space-y-1"
+      data-testid={`inquiry-runtime-evidence-${entry.component_id}`}
+    >
+      <p className="font-mono text-[10px]">{entry.component_id}</p>
+      <div className="flex flex-wrap gap-1 text-[10px]">
+        <span className="rounded bg-muted px-1" data-testid="runtime-chip-environment">
+          環境: {provenance.environment ?? "不明"}
+        </span>
+        <span className="rounded bg-muted px-1" data-testid="runtime-chip-observed-at">
+          観測日時: {formatObservedAt(provenance.last_observed_at)}
+        </span>
+        <span className="rounded bg-muted px-1" data-testid="runtime-chip-snapshot">
+          snapshot: {provenance.snapshot_ref?.snapshot_id ?? "—"}
+        </span>
+        <span
+          className={`rounded px-1 ${isStale ? "bg-amber-500/20 text-amber-800" : "bg-muted"}`}
+          data-testid="runtime-chip-freshness"
+        >
+          鮮度: {FRESHNESS_LABELS[provenance.freshness]}
+        </span>
+      </div>
+      {entry.summary && <p className="text-muted-foreground">{entry.summary}</p>}
+      {isStale && (
+        <p className="font-medium text-amber-700" data-testid="runtime-evidence-stale-warning">
+          古い観測です
+        </p>
+      )}
+    </div>
+  );
+}
+
+function SuggestedObservationProposalCard({
+  sessionId, targetComponent, reason,
+}: {
+  sessionId: number;
+  targetComponent: string;
+  reason: "unobserved" | "stale";
+}) {
+  const [open, setOpen] = useState(false);
+  const [purpose, setPurpose] = useState("");
+  const create = useCreateObservationProposal(sessionId);
+  const [submitted, setSubmitted] = useState(false);
+
+  if (submitted) {
+    return (
+      <p className="text-[11px] text-muted-foreground" data-testid="observation-proposal-suggested-submitted">
+        新規観測の提案を送信しました。承認されるまで観測は開始されません。
+      </p>
+    );
+  }
+
+  return (
+    <div className="rounded border border-sky-500/40 bg-sky-500/5 p-2 space-y-1" data-testid="observation-proposal-suggested">
+      <p className="text-[11px] text-sky-800">
+        「{targetComponent}」は{reason === "unobserved" ? "実行時の観測データがありません" : "観測データが古くなっています"}。
+        新しい観測を開始したい場合は、承認が必要な提案として送信できます(送信しただけでは観測は開始されません)。
+      </p>
+      {open ? (
+        <div className="space-y-1">
+          <Textarea
+            value={purpose}
+            onChange={e => setPurpose(e.target.value)}
+            placeholder="観測の目的を入力してください"
+            rows={2}
+            data-testid="observation-proposal-suggested-purpose"
+          />
+          <div className="flex gap-2">
+            <Button
+              size="sm"
+              disabled={create.isPending || !purpose.trim()}
+              onClick={() => create.mutate(
+                { target_component: targetComponent, purpose },
+                {
+                  onSuccess: () => { setSubmitted(true); toast.success("観測の提案を送信しました"); },
+                  onError: e => toast.error(String(e)),
+                },
+              )}
+              data-testid="observation-proposal-suggested-submit"
+            >
+              提案を送信
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => setOpen(false)}>キャンセル</Button>
+          </div>
+        </div>
+      ) : (
+        <Button size="sm" variant="outline" onClick={() => setOpen(true)} data-testid="observation-proposal-suggested-open">
+          新規観測を提案する
+        </Button>
+      )}
+    </div>
+  );
+}
+
+function InquiryMessageBubble({ message, sessionId }: { message: InterviewInquiryMessageOut; sessionId: number }) {
   const [showEvidence, setShowEvidence] = useState(false);
   const isAssistant = message.role === "assistant";
   const hasDetail = !!message.detail && (
     message.detail.key_points.length > 0
     || message.detail.evidence.length > 0
     || !!message.detail.uncertainty
+    || (message.detail.runtime_evidence?.length ?? 0) > 0
   );
 
   return (
@@ -104,6 +218,16 @@ function InquiryMessageBubble({ message }: { message: InterviewInquiryMessageOut
               ))}
               {message.detail!.uncertainty && (
                 <p className="text-muted-foreground">不確実な点: {message.detail!.uncertainty}</p>
+              )}
+              {(message.detail!.runtime_evidence ?? []).map(entry => (
+                <RuntimeEvidenceChips key={entry.component_id} entry={entry} />
+              ))}
+              {message.detail!.suggested_observation_proposal && (
+                <SuggestedObservationProposalCard
+                  sessionId={sessionId}
+                  targetComponent={message.detail!.suggested_observation_proposal.target_component}
+                  reason={message.detail!.suggested_observation_proposal.reason}
+                />
               )}
             </div>
           )}
@@ -219,7 +343,7 @@ export function InquiryPanel({
 
       {detail && (
         <div className="space-y-2 max-h-64 overflow-y-auto pr-1" data-testid="inquiry-conversation">
-          {detail.messages.map(m => <InquiryMessageBubble key={m.id} message={m} />)}
+          {detail.messages.map(m => <InquiryMessageBubble key={m.id} message={m} sessionId={sessionId} />)}
         </div>
       )}
 

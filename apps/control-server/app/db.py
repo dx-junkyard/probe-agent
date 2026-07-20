@@ -2734,6 +2734,44 @@ CREATE INDEX IF NOT EXISTS idx_understanding_change_item_set
 
 CREATE INDEX IF NOT EXISTS idx_understanding_change_item_system
     ON understanding_change_item (system_id, change_set_id);
+
+-- Runtime Reality Check <-> Inquiry/Review Queue integration (Issue #290).
+-- A developer's request to START capturing NEW runtime observation for a
+-- component (as opposed to reading facts that already exist) is never
+-- auto-started (Principle 5/8): it is only ever recorded here as a proposal,
+-- and approving it (status='approved') does NOT itself flip any
+-- components.mode policy row -- the response only points back at the
+-- existing PUT /components/{component_id}/policy endpoint. status is a
+-- finite set: proposed | approved | rejected | expired. decision_by/
+-- decision_at are set only by the manual approve/reject endpoints
+-- (decision_method='manual', Principle 2) -- never by investigation or any
+-- other automatic code path.
+CREATE TABLE IF NOT EXISTS runtime_observation_proposal (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id              INTEGER NOT NULL,
+    system_id               INTEGER NOT NULL,
+    origin_inquiry_id       INTEGER,
+    origin_alignment_item_id INTEGER,
+    target_component        TEXT NOT NULL,
+    purpose                 TEXT NOT NULL,
+    expected_cost           TEXT,
+    risk_note               TEXT,
+    retention_note          TEXT,
+    status                  TEXT NOT NULL DEFAULT 'proposed',
+    decision_by             TEXT,
+    decision_at             REAL,
+    created_at              REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (origin_inquiry_id) REFERENCES interview_inquiry (id) ON DELETE SET NULL,
+    FOREIGN KEY (origin_alignment_item_id) REFERENCES alignment_item (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_runtime_observation_proposal_session
+    ON runtime_observation_proposal (session_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_runtime_observation_proposal_system
+    ON runtime_observation_proposal (system_id, session_id);
 """
 
 
@@ -3295,6 +3333,14 @@ def init_db() -> None:
                 "ADD COLUMN decided_by_user_id INTEGER "
                 "REFERENCES users(id) ON DELETE SET NULL"
             )
+        # Issue #290: deterministic Runtime Reality Check match state
+        # (match | mismatch | unobserved | stale), set only when an
+        # alignment item's evidence deterministically maps to a component_id
+        # with runtime trace facts (app/runtime_alignment.py). Existing rows
+        # and items with no deterministic mapping stay NULL -- never guessed.
+        alignment_item_cols = _columns(conn, "alignment_item")
+        if alignment_item_cols and "runtime_check" not in alignment_item_cols:
+            conn.execute("ALTER TABLE alignment_item ADD COLUMN runtime_check TEXT")
         _ensure_legacy_system(conn)
     _validate_startup_environment()
     _validate_publish_startup_config()

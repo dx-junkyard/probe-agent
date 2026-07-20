@@ -262,4 +262,53 @@ describe("ReviewQueuePanel", () => {
       expect(mockApi.post).toHaveBeenCalledWith("/interview/sessions/1/alignment/build");
     });
   });
+
+  // Issue #290
+  test("runtime_mismatch reason_code shows the 実行時不一致 badge", async () => {
+    const item = makeItem({
+      id: 20, review_category: "must_review", reason_code: "runtime_mismatch",
+      user_reason: "コード上の理解と実行時の観測が一致していません",
+      runtime_check: "mismatch",
+    });
+    const queue: AlignmentReviewQueueOut = { session_id: 1, system_id: 1, items: [item] };
+    const full: AlignmentListOut = {
+      session_id: 1, system_id: 1,
+      items_by_category: { must_review: [item], batch_reviewable: [], no_review_required: [], unchanged: [], informational: [] },
+      counts: { must_review: 1, batch_reviewable: 0, no_review_required: 0, unchanged: 0, informational: 0 },
+    };
+    getImpl = (path: string) => {
+      if (path === "/interview/sessions/1/review-queue") return Promise.resolve(queue);
+      if (path === "/interview/sessions/1/alignment") return Promise.resolve(full);
+      if (path === "/interview/sessions/1/inquiries") return Promise.resolve({ session_id: 1, system_id: 1, items: [] });
+      return Promise.resolve(undefined);
+    };
+
+    const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
+    render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+
+    const card = await screen.findByTestId("review-item-20");
+    expect(within(card).getByTestId("review-item-runtime-mismatch-20")).toHaveTextContent("実行時不一致");
+  });
+
+  test("non-runtime_mismatch items never show the 実行時不一致 badge", async () => {
+    const item = makeItem({ id: 21, review_category: "batch_reviewable", reason_code: "routine_update" });
+    const queue: AlignmentReviewQueueOut = { session_id: 1, system_id: 1, items: [item] };
+    const full: AlignmentListOut = {
+      session_id: 1, system_id: 1,
+      items_by_category: { must_review: [], batch_reviewable: [item], no_review_required: [], unchanged: [], informational: [] },
+      counts: { must_review: 0, batch_reviewable: 1, no_review_required: 0, unchanged: 0, informational: 0 },
+    };
+    getImpl = (path: string) => {
+      if (path === "/interview/sessions/1/review-queue") return Promise.resolve(queue);
+      if (path === "/interview/sessions/1/alignment") return Promise.resolve(full);
+      if (path === "/interview/sessions/1/inquiries") return Promise.resolve({ session_id: 1, system_id: 1, items: [] });
+      return Promise.resolve(undefined);
+    };
+
+    const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
+    render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+
+    const card = await screen.findByTestId("review-item-21");
+    expect(within(card).queryByTestId("review-item-runtime-mismatch-21")).not.toBeInTheDocument();
+  });
 });
