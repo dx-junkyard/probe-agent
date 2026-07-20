@@ -2658,6 +2658,82 @@ CREATE INDEX IF NOT EXISTS idx_interview_refresh_job_session
 
 CREATE INDEX IF NOT EXISTS idx_interview_refresh_job_system
     ON interview_refresh_job (system_id, session_id);
+
+-- Natural-language bulk correction -> structured change set (Issue #289).
+-- A developer's free-text correction covering multiple understanding items
+-- is never applied directly to state (Principle 2/6): it is first turned
+-- into a validated, structured, itemized change set by a reasoning LLM
+-- (app/change_sets.py, prompt_version 'nl-change-set-v1'), previewed with
+-- field-level diffs + deterministic impact, and only the items the
+-- developer explicitly selects are ever applied. One row per submitted
+-- correction text. base_revision_id pins the understanding_revision that
+-- was current when this change set was proposed, so a later staleness
+-- check (has the understanding moved on since?) has something concrete to
+-- compare against for understanding_claim targets.
+CREATE TABLE IF NOT EXISTS understanding_change_set (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id          INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    base_revision_id    INTEGER,
+    source_text         TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'proposed',
+    intelligence_run_id INTEGER NOT NULL,
+    is_mock             INTEGER NOT NULL DEFAULT 0,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (base_revision_id) REFERENCES understanding_revision (id) ON DELETE SET NULL,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_change_set_session
+    ON understanding_change_set (session_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_change_set_system
+    ON understanding_change_set (system_id, session_id);
+
+-- One row per proposed field-level edit within a change set (Issue #289).
+-- target_kind is a finite set (intent_item | understanding_claim) enforced
+-- by construction: only the whitelisted (target_kind, field) pair for each
+-- kind ever resolves (intent_item -> value_text, understanding_claim ->
+-- summary); anything else -- including any attempt to address alignment
+-- user_decision, evidence refs, confirmed-at audit fields, or alignment
+-- classification, none of which are addressable target_kind values at all
+-- -- is rejected with resolution_state='forbidden'. target_ref is JSON
+-- ({"intent_item_id": ...} for intent_item, {"section": ..., "name": ...}
+-- for understanding_claim) resolved deterministically against a finite
+-- candidate list at proposal time (app/change_sets.py), never a reasoning
+-- decision. resolution_state is re-validated (never re-interpreted) every
+-- time it is read or applied: 'resolved' items are re-checked against the
+-- CURRENT target for staleness (understanding moved on since
+-- base_revision_id) and conflict (current value no longer matches the
+-- recorded before_value); 'ambiguous'/'forbidden' are structural facts
+-- fixed at creation and never change. applied/applied_at guard against
+-- double-application when the same item_id is submitted to apply twice.
+CREATE TABLE IF NOT EXISTS understanding_change_item (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    change_set_id       INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    target_kind         TEXT NOT NULL,
+    target_ref          TEXT NOT NULL,
+    field               TEXT NOT NULL,
+    before_value        TEXT,
+    after_value         TEXT NOT NULL,
+    reason              TEXT NOT NULL,
+    resolution_state    TEXT NOT NULL,
+    applied             INTEGER NOT NULL DEFAULT 0,
+    applied_at          REAL,
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (change_set_id) REFERENCES understanding_change_set (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_change_item_set
+    ON understanding_change_item (change_set_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_change_item_system
+    ON understanding_change_item (system_id, change_set_id);
 """
 
 

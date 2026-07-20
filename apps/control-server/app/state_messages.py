@@ -1184,3 +1184,31 @@ def refresh_job_message(key: str) -> str:
             f"state_messages.REFRESH_JOB_MESSAGES: no entry for key={key!r}. "
             "Add one instead of falling back to hardcoded/English text (Issue #240)."
         ) from exc
+
+
+# --- Natural-language bulk correction / structured change set (Issue #289) -
+#
+# Fixed Japanese copy for the change-set preview/apply flow: the rebuild
+# note shown alongside every preview, and one message per per-item apply
+# skip reason (resolution_state at the moment apply revalidated it).
+# Never LLM free text (Principle 6/7).
+
+CHANGE_SET_MESSAGES: Dict[str, str] = {
+    "rebuild_note": "適用すると、レビューキューと現在の理解が自動的に更新されます。",
+    "skip_ambiguous": "対象を一意に特定できなかったため、適用できません。",
+    "skip_forbidden": "この項目は自然文一括修正では変更できない対象です。",
+    "skip_stale": "前提となる理解がその後更新されているため、適用できません。最新の状態を確認してください。",
+    "skip_conflict": "対象が別の変更で既に更新されているため、適用できません。",
+    "skip_already_applied": "この項目は既に適用済みです。",
+    "skip_not_found": "対象の項目が見つかりませんでした。",
+}
+
+
+def change_set_message(key: str) -> str:
+    try:
+        return CHANGE_SET_MESSAGES[key]
+    except KeyError as exc:
+        raise KeyError(
+            f"state_messages.CHANGE_SET_MESSAGES: no entry for key={key!r}. "
+            "Add one instead of falling back to hardcoded/English text (Issue #240)."
+        ) from exc

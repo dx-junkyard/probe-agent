@@ -34,6 +34,7 @@ import type {
   AlignmentBuildOut, AlignmentListOut, AlignmentReviewQueueOut, AlignmentItemOut,
   AlignmentDecisionAction,
   RefreshStatusOut, RefreshJobOut,
+  ChangeSetDetailOut, ChangeSetApplyResultOut, ChangeSetOut,
   RuntimeRealityFactsOut, RuntimeRealityCheckRunOut,
   UnderstandingRevisionListOut, UnderstandingDiffOut,
   SystemUnderstandingOut,
@@ -1126,6 +1127,53 @@ export function useRetryRefreshJob(sessionId: number | null) {
     mutationFn: ({ jobId }: { jobId: number }) =>
       api.post<RefreshJobOut>(`/interview/sessions/${sessionId}/refresh-jobs/${jobId}/retry`),
     onSuccess: () => _invalidateAfterAnswerBatch(qc, sessionId),
+  });
+}
+
+// --- Natural-language bulk correction -> structured change set (Issue #289) --
+
+export function useCreateChangeSet(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (text: string) =>
+      api.post<ChangeSetDetailOut>(`/interview/sessions/${sessionId}/change-sets`, { text }),
+    onSuccess: result => {
+      qc.setQueryData([...sysKey("changeSet"), result.change_set.id], result);
+    },
+  });
+}
+
+export function useChangeSet(changeSetId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("changeSet"), changeSetId],
+    queryFn: () => api.get<ChangeSetDetailOut>(`/interview/change-sets/${changeSetId}`),
+    enabled: !!changeSetId && !!getSystemId(),
+  });
+}
+
+export function useApplyChangeSet(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ changeSetId, itemIds }: { changeSetId: number; itemIds: number[] }) =>
+      api.post<ChangeSetApplyResultOut>(`/interview/change-sets/${changeSetId}/apply`, { item_ids: itemIds }),
+    onSuccess: (result, { changeSetId }) => {
+      qc.invalidateQueries({ queryKey: [...sysKey("changeSet"), changeSetId] });
+      if (result.applied_item_ids.length > 0) {
+        // Issue #288: see useAnswerInterviewQa's comment above.
+        _invalidateAfterAnswerBatch(qc, sessionId);
+      }
+    },
+  });
+}
+
+export function useDiscardChangeSet() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (changeSetId: number) =>
+      api.post<ChangeSetOut>(`/interview/change-sets/${changeSetId}/discard`),
+    onSuccess: (_result, changeSetId) => {
+      qc.invalidateQueries({ queryKey: [...sysKey("changeSet"), changeSetId] });
+    },
   });
 }
 

@@ -3231,6 +3231,94 @@ class RefreshStatusOut(BaseModel):
     pending_count: int = 0
 
 
+# --- Natural-language bulk correction -> structured change set (Issue #289) --
+#
+# app/change_sets.py turns a developer's free-text correction into a
+# structured, previewed, selectively-applied change set -- NL is never
+# applied to state directly (Principle 2/6). target_kind/resolution_state
+# are explicit finite sets; 'forbidden' means the (target_kind, field) pair
+# is outside the whitelist (app/change_sets.py's ALLOWED_TARGET_FIELDS),
+# not merely unresolved.
+
+ChangeSetStatus = Literal[
+    "proposed", "previewed", "partially_applied", "applied", "discarded", "failed",
+]
+ChangeTargetKind = Literal["intent_item", "understanding_claim"]
+ChangeResolutionState = Literal["resolved", "ambiguous", "conflict", "stale", "forbidden"]
+
+
+class ChangeSetCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(..., min_length=1, max_length=8_000)
+
+
+class ChangeSetOut(BaseModel):
+    id: int
+    session_id: int
+    system_id: int
+    base_revision_id: Optional[int] = None
+    source_text: str
+    status: ChangeSetStatus
+    intelligence_run_id: int
+    is_mock: bool = False
+    created_at: float
+    updated_at: float
+
+
+class ChangeSetAffectedItemOut(BaseModel):
+    """One alignment/review item a change item's edit would touch,
+    determined by a deterministic structural match (Principle 6) -- never a
+    reasoning decision. See ``routes/interview_change_sets.py``'s
+    ``_affected_alignment_items``."""
+
+    alignment_item_id: int
+    current_claim: str
+    review_category: str
+
+
+class ChangeSetItemOut(BaseModel):
+    id: int
+    change_set_id: int
+    system_id: int
+    target_kind: ChangeTargetKind
+    target_ref: Dict[str, Any] = Field(default_factory=dict)
+    field: str
+    before_value: Optional[str] = None
+    after_value: str
+    reason: str
+    resolution_state: ChangeResolutionState
+    applied: bool = False
+    applied_at: Optional[float] = None
+    created_at: float
+    affected_items: List[ChangeSetAffectedItemOut] = Field(default_factory=list)
+
+
+class ChangeSetDetailOut(BaseModel):
+    change_set: ChangeSetOut
+    items: List[ChangeSetItemOut] = Field(default_factory=list)
+    rebuild_note: str
+
+
+class ChangeSetApplyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_ids: List[int] = Field(..., min_length=1, max_length=100)
+
+
+class ChangeSetSkippedItemOut(BaseModel):
+    item_id: int
+    resolution_state: ChangeResolutionState
+    message: str
+
+
+class ChangeSetApplyResultOut(BaseModel):
+    change_set: ChangeSetOut
+    applied_item_ids: List[int] = Field(default_factory=list)
+    skipped: List[ChangeSetSkippedItemOut] = Field(default_factory=list)
+    result_revision_id: Optional[int] = None
+
+
 # --- Runtime Reality Check (Issue #135) --------------------------------------
 #
 # Reconciles approved interview metadata/probe plans (role, probe_value,

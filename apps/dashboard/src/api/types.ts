@@ -988,6 +988,76 @@ export interface RefreshStatusOut {
   pending_count: number;
 }
 
+// --- Natural-language bulk correction -> structured change set (Issue #289) -
+//
+// A free-text correction covering multiple Understanding items is never
+// applied directly — a reasoning LLM turns it into a structured, itemized
+// change set; the developer previews field-level diffs + a deterministic
+// impact preview and selectively applies only resolved items.
+// 'forbidden' means the (target_kind, field) pair is outside the server's
+// whitelist (e.g. an attempt to touch alignment user_decision), not merely
+// unresolved.
+
+export type ChangeSetStatus =
+  | "proposed" | "previewed" | "partially_applied" | "applied" | "discarded" | "failed";
+export type ChangeTargetKind = "intent_item" | "understanding_claim";
+export type ChangeResolutionState = "resolved" | "ambiguous" | "conflict" | "stale" | "forbidden";
+
+export interface ChangeSetOut {
+  id: number;
+  session_id: number;
+  system_id: number;
+  base_revision_id: number | null;
+  source_text: string;
+  status: ChangeSetStatus;
+  intelligence_run_id: number;
+  is_mock: boolean;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ChangeSetAffectedItemOut {
+  alignment_item_id: number;
+  current_claim: string;
+  review_category: string;
+}
+
+export interface ChangeSetItemOut {
+  id: number;
+  change_set_id: number;
+  system_id: number;
+  target_kind: ChangeTargetKind;
+  target_ref: Record<string, unknown>;
+  field: string;
+  before_value: string | null;
+  after_value: string;
+  reason: string;
+  resolution_state: ChangeResolutionState;
+  applied: boolean;
+  applied_at: number | null;
+  created_at: number;
+  affected_items: ChangeSetAffectedItemOut[];
+}
+
+export interface ChangeSetDetailOut {
+  change_set: ChangeSetOut;
+  items: ChangeSetItemOut[];
+  rebuild_note: string;
+}
+
+export interface ChangeSetSkippedItemOut {
+  item_id: number;
+  resolution_state: ChangeResolutionState;
+  message: string;
+}
+
+export interface ChangeSetApplyResultOut {
+  change_set: ChangeSetOut;
+  applied_item_ids: number[];
+  skipped: ChangeSetSkippedItemOut[];
+  result_revision_id: number | null;
+}
+
 export interface InterviewProposalDecisionOut {
   id: number;
   proposal_id: number;

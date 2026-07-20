@@ -37,6 +37,7 @@ import { DiagnosticFixCallout, useDiagnosticHighlight } from "@/components/diagn
 import { UnderstandingOverview } from "@/components/system-understanding/understanding-overview";
 import { IntentBriefPanel } from "@/components/system-understanding/intent-brief-panel";
 import { ReviewQueuePanel } from "@/components/system-understanding/review-queue";
+import { ChangeSetPanel } from "@/components/system-understanding/change-set-panel";
 import { InquiryPanel } from "@/components/system-understanding/inquiry-panel";
 import { RefreshStatusChip } from "@/components/system-understanding/refresh-status-chip";
 import { Button } from "@/components/ui/button";
@@ -1923,6 +1924,8 @@ git commit`}
               <IntentBriefPanel sessionId={session.id} />
 
               <ReviewQueuePanel sessionId={session.id} />
+
+              <ChangeSetPanel sessionId={session.id} />
 
               <UnderstandingDiffPanel
                 sessionId={session.id}

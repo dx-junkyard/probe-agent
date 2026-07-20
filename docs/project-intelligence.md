@@ -3103,3 +3103,150 @@ job は単一ステップなので、専用のステップ/ハートビート/�
 - Dashboard: `src/__tests__/refresh-status-chip.test.tsx`(job が無け
   れば何も出さないこと、各 status の日本語ラベル、`failed` のときだけ
   再試行ボタンが出て retry API を呼ぶこと)。
+
+## 自然文一括修正(Issue #289)
+
+開発者が複数の理解項目にまたがる修正をまとめて自由文で書いても、その自
+由文が直接状態に反映されることは一切ない(Principle 2/6)。reasoning
+LLM(fail-closed)が構造化された change item に変換し、決定的な post-
+pass が各項目の対象を有限候補リストに対して解決し、開発者がフィールド
+単位の diff + 決定的な影響プレビューを確認したうえで選択した項目だけを
+適用する。
+
+### テーブル(additive)
+
+`understanding_change_set`(1回の投稿につき1行):
+
+| カラム | 型 | 説明 |
+| --- | --- | --- |
+| `id` | INTEGER PK | |
+| `session_id` / `system_id` | INTEGER NOT NULL | |
+| `base_revision_id` | INTEGER NULL | 提案時点の最新 `understanding_revision.id`(understanding_claim 系項目の古さ判定の基準) |
+| `source_text` | TEXT NOT NULL | 開発者が入力した自由文そのもの(監査用。状態には決して直接反映しない) |
+| `status` | TEXT NOT NULL DEFAULT `'proposed'` | `proposed\|previewed\|partially_applied\|applied\|discarded\|failed` |
+| `intelligence_run_id` | INTEGER NOT NULL | この提案を生成した `intelligence_runs` 行(`run_type='nl_change_set'`) |
+| `is_mock` | INTEGER | |
+| `created_at` / `updated_at` | REAL | |
+
+`understanding_change_item`(1提案項目につき1行):
+
+| カラム | 型 | 説明 |
+| --- | --- | --- |
+| `id` / `change_set_id` / `system_id` | INTEGER | |
+| `target_kind` | TEXT NOT NULL | `intent_item\|understanding_claim`(有限集合。構造上これ以外は存在し得ない — LLM の生スキーマ自体がこの2値の Literal で検証される) |
+| `target_ref` | TEXT NOT NULL(JSON) | `{"intent_item_id": ...}` または `{"section": ..., "name": ...}`(未解決時は `{"hint": ...}` を保持し、何を狙っていたかの監査だけ残す) |
+| `field` | TEXT NOT NULL | `value_text`(intent_item 用)または `summary`(understanding_claim 用)。この2ペア以外は構造的に `forbidden` になる |
+| `before_value` / `after_value` | TEXT | 解決できた場合のみ `before_value` が入る |
+| `reason` | TEXT NOT NULL | LLM が付けた短い理由(自由文だが、状態そのものではなく提案の説明に過ぎない) |
+| `resolution_state` | TEXT NOT NULL | `resolved\|ambiguous\|conflict\|stale\|forbidden` |
+| `applied` / `applied_at` | INTEGER / REAL | 二重適用防止フラグ |
+| `created_at` | REAL | |
+
+### 決定的な対象解決(`app/change_sets.py`)
+
+- `generate_change_set_proposal`: Intent Brief / Alignment と同じ
+  fail-closed パターン(mock・非 reasoning モデル・API 失敗・スキーマ
+  検証失敗はすべて `error` 付きの結果を返し、何も永続化しない)。プロ
+  ンプトには「候補リスト」(`{kind, hint, current_value}` の有限配列)
+  を渡し、モデルは `target_hint` にその `hint` を**一字一句そのまま**
+  返すことしか許されない — 曖昧な言い換えやファジーマッチは一切な
+  い。生レスポンスの `target_kind` は `Literal["intent_item",
+  "understanding_claim"]` でスキーマ検証される(Alignment の
+  `alignment_state`/`confidence` などと同じく、範囲外の値はバッチ全体
+  を失敗させる)。`field` はここでは検証しない自由文字列のまま
+  — 「有効な `target_kind` に対して許されていない `field` を狙う」と
+  いう、まさに `forbidden` が拾うべき現実的なケースを個別項目の判定に
+  残すため。
+- `resolve_change_set_items`(純粋関数、DB 非依存): `(target_kind,
+  field)` が `ALLOWED_TARGET_FIELDS` のホワイトリスト(`intent_item` →
+  `value_text`、`understanding_claim` → `summary` の2エントリのみ)と
+  完全一致しなければ `forbidden`。一致すれば `(target_kind,
+  target_hint)` を候補リストに対して**完全一致**で引き、一致がちょう
+  ど1件なら `resolved`(`before_value`/`target_ref` を確定)、0件また
+  は複数件なら `ambiguous`(タイポで一致しない場合も、本当に複数候補
+  がある場合も、人が入力し直すべき点は同じなので同じ状態にまとめる)。
+  同じ入力からは常に同じ出力(決定性のテスト契約)。
+- `effective_resolution_state`: `resolved` 項目だけを対象に、呼ばれる
+  たびに現在の状態へ再検証する。`ambiguous`/`forbidden` は作成時点で
+  確定した構造的事実で変化しない。再検証が拾う2つの退行:
+  - `stale`(`understanding_claim` のみ): この change set の
+    `base_revision_id` が、その時点の最新 `understanding_revision.id`
+    と一致しない(理解がその後リビルドされた)。`intent_item` はこの
+    方式でリビジョン管理されないため対象外。
+  - `conflict`: 対象の現在値が記録済み `before_value` と一致しない、
+    または(`intent_item`)対象行が既に superseded/削除された。
+  このロジックはプレビュー(`GET`、表示のみで永続化しない)と適用
+  (`POST .../apply`、実際にスキップした項目だけ永続化する遷移)の両方
+  から同じ関数で呼ばれるため、プレビューと適用が食い違うことはない。
+
+### ルート(`routes/interview_change_sets.py`、`main.py` に登録)
+
+1. `POST /interview/sessions/{id}/change-sets` `{text}` — 候補リストを
+   構築(現在の非 superseded `interview_intent_item` + 最新
+   `understanding_revision.current_understanding` の5セクション)し、
+   reasoning LLM を呼び、`understanding_change_set` + 解決済み
+   `understanding_change_item` 群を作成する。失敗時も
+   `status='failed'` の change set 行だけは監査のために残し(項目は
+   0件)、502 を返す — NL は絶対に直接適用されない。
+2. `GET /interview/change-sets/{id}` — フィールド単位の diff
+   (`before_value → after_value`)、`effective_resolution_state` で再検
+   証した `resolution_state`、決定的な影響プレビュー
+   (`_affected_alignment_items`: `intent_item` 対象は
+   `alignment_item.intent_item_id` 一致、`understanding_claim` 対象は
+   `current_claim`/`intent_summary` への構造的な部分一致で拾う)、固定
+   の日本語注記(`rebuild_note`、`state_messages.change_set_message`)
+   を返す。初回参照時に change set の `status` を `proposed` →
+   `previewed` に進める(項目の解決状態自体は書き換えない読み取り専用
+   の遷移)。
+3. `POST /interview/change-sets/{id}/apply` `{item_ids}` — 指定された
+   項目だけを、この瞬間に再検証してから適用する(バッチ全体ではなく項
+   目単位の fail-closed)。`intent_item` 対象は Issue #284 の
+   `correct_intent_item` と同じ supersede 行パターン
+   (`origin='user'`, `decision_method='manual'`,
+   `source_statement=<投稿した自由文>`)。`understanding_claim` 対象は
+   同じ apply 呼び出し内のすべての claim 編集をまとめて1つの新しい
+   `understanding_revision`(最新リビジョンをディープコピーして編集、
+   既存行は絶対に書き換えない)にする — 個別にリビジョンを作ると、先
+   に適用した編集が後続の編集を誤って `stale` にしてしまうため。適用
+   後は `interview_refresh.request_refresh(trigger_kind='nl_change_set')`
+   を呼ぶ(Issue #288 の自動更新に接続)。`change_set.status` は「選択
+   した項目が全部適用できた」なら `applied`、一部だけなら
+   `partially_applied`。既に `applied=1` の項目を再度指定してもスキッ
+   プされるだけで再適用はしない(冪等)。
+4. `POST /interview/change-sets/{id}/discard` — `status='discarded'`。
+   以降の apply は 409。
+
+### Dashboard
+
+- `ChangeSetPanel`(`components/system-understanding/change-set-panel.tsx`)
+  を Interview ページのレビューキュー直下に配置。「まとめて修正」の
+  テキストエリア + 送信ボタンで変更案を作成し、フィールド単位の diff
+  一覧をプレビュー表示する。`resolution_state` を「適用可能/あいまい/
+  競合/古い前提/変更不可」に日本語マップ(Issue #266 の規約どおりクラ
+  イアント側の固定マッピング、canonical enum はログ/ペイロードのみ)。
+  `resolved` かつ未適用の項目だけ既定でチェック済み、それ以外は既定で
+  未選択かつ操作不能(誤って選択できない)。「選択した変更を適用」は
+  チェック済みの `resolved` 項目 id だけを送る。適用後は
+  `RefreshStatusChip`(Issue #288)が自動更新の反映を示す。
+
+### テスト
+
+- `tests/test_change_sets.py`: `resolve_change_set_items` /
+  `effective_resolution_state` の決定性(resolved/ambiguous/conflict/
+  stale/forbidden の各状態を fixture から再現)、
+  `generate_change_set_proposal` の fail-closed(mock・非 reasoning モ
+  デル・API 失敗・不正 JSON・範囲外 `target_kind` の各ケース)、作成→
+  プレビュー(影響プレビュー込み)→部分選択→適用のエンドツーエンド
+  (選択+resolved のみ適用、未選択/未解決項目は無変更、intent 対象は
+  supersede 行トレイルを作る、understanding_claim 対象は新しい
+  revision を作り旧 revision は変更されずに残る、apply が Issue #288
+  の refresh job を発行すること)、LLM 失敗時は `failed` になり何も適
+  用されないこと、apply 時点で base revision が古くなっていれば
+  `stale` としてスキップされること、ホワイトリスト外の `field` は
+  `forbidden` として拒否されること、同じ項目への2回目の apply が
+  no-op になること、change_set → intelligence_run → revision の監査系
+  列。
+- Dashboard: `src/__tests__/change-set-panel.test.tsx`(diff プレビュー
+  表示、非 resolved 項目のチェックボックスが既定で外れ無効化されるこ
+  と、apply が選択済み id だけを送ること、discard が discard API を呼
+  ぶこと)。
