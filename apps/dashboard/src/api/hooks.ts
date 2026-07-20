@@ -27,6 +27,7 @@ import type {
   InterviewApprovedSetOut, InterviewMaterializeOut,
   InterviewSnapshotRebaseOut,
   InterviewQaListOut, InterviewQaOut, InterviewQaAnswerOut,
+  InterviewQaRouteInvestigateBatchOut,
   InterviewIntentListOut, InterviewIntentItemOut,
   InterviewIntentField, InterviewIntentUserStatus,
   InterviewInquiryListOut, InterviewInquiryDetailOut, InterviewInquiryOut,
@@ -811,6 +812,22 @@ export function useAnswerInterviewQa(sessionId: number | null) {
       // promptly instead of waiting for the next poll tick.
       _invalidateAfterAnswerBatch(qc, sessionId);
     },
+  });
+}
+
+// Issue #286 review fix (Finding 1): wires Question Router / Investigation
+// Agent into the normal Q&A flow. Never writes answer_text/status, so (unlike
+// useAnswerInterviewQa) this does not trigger the #288 auto-refresh -- only
+// route_category/knowledge_area/investigation are affected, and only the QA
+// list needs to be refetched.
+export function useRouteAndInvestigateQa(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      api.post<InterviewQaRouteInvestigateBatchOut>(
+        `/interview/sessions/${sessionId}/qa/route-and-investigate`,
+      ),
+    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] }),
   });
 }
 

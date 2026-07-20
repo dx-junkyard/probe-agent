@@ -94,6 +94,8 @@ from ..models import (
     InterviewQaAnswerRequest,
     InterviewQaCreate,
     InterviewQaEvidenceRefOut,
+    InterviewQaInvestigationEvidenceOut,
+    InterviewQaInvestigationOut,
     InterviewQaListOut,
     InterviewQaOut,
     InterviewSessionCreate,
@@ -372,6 +374,30 @@ def _intelligence_run_out(row) -> IntelligenceRunOut:
 # --- Structured Interview Q&A (Issue #129) ----------------------------------
 
 
+def _qa_investigation_out(row) -> Optional[InterviewQaInvestigationOut]:
+    """Parse the persisted Investigation Agent result (Issue #286 review fix).
+
+    Tolerates a pre-migration row (missing columns) and a row that has
+    never been investigated (NULL json) the same way runtime_evidence does.
+    """
+    if "investigation_json" not in row.keys() or not row["investigation_json"]:
+        return None
+    run_id = row["investigation_run_id"] if "investigation_run_id" in row.keys() else None
+    if run_id is None:
+        return None
+    data = json.loads(row["investigation_json"])
+    return InterviewQaInvestigationOut(
+        run_id=run_id,
+        status=data.get("status", "unresolved"),
+        conclusion=data.get("conclusion", ""),
+        key_points=data.get("key_points", []),
+        evidence=[InterviewQaInvestigationEvidenceOut(**e) for e in data.get("evidence", [])],
+        uncertainty=data.get("uncertainty", ""),
+        confidence=data.get("confidence", "uncertain"),
+        decision_question=data.get("decision_question"),
+    )
+
+
 def _qa_out(row) -> InterviewQaOut:
     return InterviewQaOut(
         id=row["id"],
@@ -408,6 +434,7 @@ def _qa_out(row) -> InterviewQaOut:
         handoff_id=(
             row["handoff_id"] if "handoff_id" in row.keys() else None
         ),
+        investigation=_qa_investigation_out(row),
     )
 
 
@@ -443,13 +470,16 @@ def _insert_qa_row(
     answered_by: Optional[str] = None,
     answered_at: Optional[float] = None,
     runtime_evidence: Optional[dict] = None,
+    investigation_json: Optional[dict] = None,
+    investigation_run_id: Optional[int] = None,
 ) -> int:
     cur = conn.execute(
         """INSERT INTO interview_qa
             (session_id, system_id, question_text, question_category,
              question_source, hypothesis, evidence_refs, runtime_evidence,
-             answer_text, status, answered_by, created_at, answered_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             answer_text, status, answered_by, created_at, answered_at,
+             investigation_json, investigation_run_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             session_id,
             system_id,
@@ -465,6 +495,8 @@ def _insert_qa_row(
             answered_by,
             now,
             answered_at,
+            json.dumps(investigation_json, ensure_ascii=False) if investigation_json else None,
+            investigation_run_id,
         ),
     )
     return cur.lastrowid
@@ -1950,10 +1982,12 @@ def answer_interview_qa(
             else:
                 # status is 'answered' or 'unconfirmed': this is a
                 # correction. Insert a new revision row, then link the old
-                # row forward. runtime_evidence (Issue #135) is carried onto
-                # the new current row just like evidence_refs, so correcting
-                # a runtime question's answer never drops the trace-fact
-                # provenance that justified the question.
+                # row forward. runtime_evidence (Issue #135) and, likewise,
+                # investigation_json/investigation_run_id (Issue #286 review
+                # fix, Finding 1) are carried onto the new current row just
+                # like evidence_refs, so correcting an answer never drops the
+                # trace-fact provenance or the Investigation Agent finding
+                # that justified/informed the question.
                 new_id = _insert_qa_row(
                     conn, session_id, system_id,
                     question_text=qa["question_text"],
@@ -1973,6 +2007,14 @@ def answer_interview_qa(
                         json.loads(qa["runtime_evidence"])
                         if ("runtime_evidence" in qa.keys() and qa["runtime_evidence"])
                         else None
+                    ),
+                    investigation_json=(
+                        json.loads(qa["investigation_json"])
+                        if ("investigation_json" in qa.keys() and qa["investigation_json"])
+                        else None
+                    ),
+                    investigation_run_id=(
+                        qa["investigation_run_id"] if "investigation_run_id" in qa.keys() else None
                     ),
                 )
                 conn.execute(

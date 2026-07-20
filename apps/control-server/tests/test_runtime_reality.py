@@ -52,15 +52,15 @@ def _insert_system(db_module, name="System A") -> int:
 
 def _insert_trace(
     db_module, system_id, component_id, *, error=None, duration_ms=10.0, timestamp=None,
-    trace_id=None,
+    trace_id=None, environment=None, git_sha=None,
 ):
     now = timestamp if timestamp is not None else time.time()
     with db_module.get_conn() as conn:
         conn.execute(
             """INSERT INTO traces
                 (system_id, trace_id, component_id, mode, input_json, output_text,
-                 error, duration_ms, timestamp)
-            VALUES (?, ?, ?, 'trace', '{}', 'out', ?, ?, ?)""",
+                 error, duration_ms, timestamp, environment, git_sha)
+            VALUES (?, ?, ?, 'trace', '{}', 'out', ?, ?, ?, ?, ?)""",
             (
                 system_id,
                 trace_id or f"trace-{time.time_ns()}",
@@ -68,6 +68,8 @@ def _insert_trace(
                 error,
                 duration_ms,
                 now,
+                environment,
+                git_sha,
             ),
         )
 
@@ -134,6 +136,85 @@ def test_aggregation_respects_window(db):
         )
     assert facts.has_traces is False
     assert facts.call_count == 0
+
+
+# --- Observed environment/git_sha (Issue #290 Finding 5) ----------------------
+
+
+def test_aggregation_observed_environment_and_git_sha_none_when_no_traces(db):
+    system_id = _insert_system(db)
+    with db.get_conn() as conn:
+        facts = aggregate_component_facts(conn, system_id, "comp")
+    assert facts.observed_environment is None
+    assert facts.observed_git_sha is None
+
+
+def test_aggregation_observed_environment_and_git_sha_none_when_never_reported(db):
+    system_id = _insert_system(db)
+    _insert_trace(db, system_id, "comp", timestamp=time.time())
+    with db.get_conn() as conn:
+        facts = aggregate_component_facts(conn, system_id, "comp")
+    assert facts.observed_environment is None
+    assert facts.observed_git_sha is None
+
+
+def test_aggregation_returns_latest_observed_environment_and_git_sha(db):
+    """Deterministic 'greatest timestamp with a non-null, non-empty value'
+    pick -- an older trace's values are superseded by a newer trace's."""
+    system_id = _insert_system(db)
+    now = time.time()
+    _insert_trace(
+        db, system_id, "comp", timestamp=now - 20, environment="staging", git_sha="old111",
+    )
+    _insert_trace(
+        db, system_id, "comp", timestamp=now - 10, environment="production", git_sha="new222",
+    )
+
+    with db.get_conn() as conn:
+        facts = aggregate_component_facts(conn, system_id, "comp")
+    assert facts.observed_environment == "production"
+    assert facts.observed_git_sha == "new222"
+
+
+def test_aggregation_latest_trace_with_blank_fields_does_not_blank_out_earlier_values(db):
+    """A later trace that never set environment/git_sha (NULL) must not hide
+    an earlier trace's actually-observed values -- the pick is over non-null
+    rows only, not simply 'the most recent trace's own columns'."""
+    system_id = _insert_system(db)
+    now = time.time()
+    _insert_trace(
+        db, system_id, "comp", timestamp=now - 10, environment="production", git_sha="abc123",
+    )
+    _insert_trace(db, system_id, "comp", timestamp=now)  # latest trace, no environment/git_sha
+
+    with db.get_conn() as conn:
+        facts = aggregate_component_facts(conn, system_id, "comp")
+    assert facts.observed_environment == "production"
+    assert facts.observed_git_sha == "abc123"
+
+
+def test_aggregation_treats_blank_environment_and_git_sha_as_unset(db):
+    system_id = _insert_system(db)
+    _insert_trace(db, system_id, "comp", timestamp=time.time(), environment="", git_sha="")
+    with db.get_conn() as conn:
+        facts = aggregate_component_facts(conn, system_id, "comp")
+    assert facts.observed_environment is None
+    assert facts.observed_git_sha is None
+
+
+def test_aggregation_observed_environment_and_git_sha_are_system_isolated(db):
+    system_a = _insert_system(db, "System A")
+    system_b = _insert_system(db, "System B")
+    _insert_trace(db, system_a, "shared_component_id", environment="staging", git_sha="a1")
+    _insert_trace(db, system_b, "shared_component_id", environment="production", git_sha="b2")
+
+    with db.get_conn() as conn:
+        facts_a = aggregate_component_facts(conn, system_a, "shared_component_id")
+        facts_b = aggregate_component_facts(conn, system_b, "shared_component_id")
+    assert facts_a.observed_environment == "staging"
+    assert facts_a.observed_git_sha == "a1"
+    assert facts_b.observed_environment == "production"
+    assert facts_b.observed_git_sha == "b2"
 
 
 # --- Reasoning reconciliation (fail-closed) -----------------------------------

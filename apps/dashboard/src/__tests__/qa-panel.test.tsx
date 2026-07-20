@@ -6,12 +6,20 @@
 //    「担当外の質問」グループへ分離され、非表示にはならないこと。
 // 3. knowledge_area が null(未分類)の質問は常に通常グループに残ること。
 // 4. 担当外グループの質問には「担当者へ引き継ぐ」ボタンが出ること。
+//
+// Issue #286 review fix (Finding 1) / Finding 6:
+// 5. 「AIに先に調査させる」ボタンがバッチ API を呼び、結果をトーストで表示する。
+// 6. route_category バッジは日本語ラベルで表示され、raw な enum 文字列は出ない。
+// 7. investigation の結論表示と「調査結果を回答欄に転記」ボタンが送信せず
+//    テキストエリアだけを埋めること。
+// 8. investigation.status === "unresolved" のときは注記だけ表示すること。
+// 9. #288 の自動更新と整合するバナー文言であること。
 
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { vi } from "vitest";
 import type { ReactNode } from "react";
-import type { InterviewQaListOut, InterviewQaOut } from "@/api/types";
+import type { InterviewQaListOut, InterviewQaOut, InterviewQaRouteInvestigateBatchOut } from "@/api/types";
 
 const mockApi = {
   get: vi.fn(),
@@ -61,6 +69,7 @@ function makeQa(overrides: Partial<InterviewQaOut> & { id: number }): InterviewQ
     route_run_id: null,
     knowledge_area: null,
     handoff_id: null,
+    investigation: null,
     ...overrides,
   } as InterviewQaOut;
 }
@@ -145,5 +154,149 @@ describe("QaPanel out-of-area grouping (Issue #291)", () => {
 
     const outOfAreaGroup = await screen.findByTestId("qa-out-of-area-group");
     expect(within(outOfAreaGroup).getByTestId("qa-handoff-open-4")).toBeInTheDocument();
+  });
+});
+
+describe("QaPanel route-and-investigate wiring (Issue #286 review fix, Finding 1/6)", () => {
+  test("AIに先に調査させる button calls the batch endpoint and toasts a Japanese summary", async () => {
+    mockQaList([makeQa({ id: 1 })]);
+    const batchResult: InterviewQaRouteInvestigateBatchOut = {
+      session_id: 1,
+      system_id: 1,
+      results: [
+        { qa_id: 1, route_category: "human_only", knowledge_area: null, investigation_status: null, error: null },
+      ],
+      counts: { routed: 1, investigated: 0, failed: 0, skipped_cap: 0 },
+    };
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/1/qa/route-and-investigate") return Promise.resolve(batchResult);
+      return Promise.resolve(undefined);
+    });
+
+    const { QaPanel } = await import("@/pages/interview");
+    const { toast } = await import("sonner");
+    render(
+      <QaPanel sessionId={1} actor="dev" approvedCount={1} answerableAreas={[]} />,
+      { wrapper: createWrapper() },
+    );
+
+    const button = await screen.findByTestId("route-and-investigate-qa");
+    fireEvent.click(button);
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/interview/sessions/1/qa/route-and-investigate");
+    });
+    await waitFor(() => {
+      expect(toast.success).toHaveBeenCalledWith("分類 1 件・調査 0 件が完了しました");
+    });
+  });
+
+  test("route_category badge renders the Japanese label, never the raw enum", async () => {
+    mockQaList([
+      makeQa({ id: 1, route_category: "system_researchable", knowledge_area: "implementation" }),
+    ]);
+
+    const { QaPanel } = await import("@/pages/interview");
+    render(
+      <QaPanel sessionId={1} actor="dev" approvedCount={1} answerableAreas={[]} />,
+      { wrapper: createWrapper() },
+    );
+
+    const badge = await screen.findByTestId("qa-route-category-1");
+    expect(badge).toHaveTextContent("AI が調査して回答");
+    expect(badge).not.toHaveTextContent("system_researchable");
+  });
+
+  test("investigation conclusion renders with a 転記 button that fills the textarea without submitting", async () => {
+    mockQaList([
+      makeQa({
+        id: 1,
+        route_category: "hybrid",
+        investigation: {
+          run_id: 42,
+          status: "completed",
+          conclusion: "認証はJWTで行われます",
+          key_points: ["JWTトークンを検証"],
+          evidence: [{ path: "auth.py", start_line: 1, end_line: 5, summary: "検証処理" }],
+          uncertainty: "",
+          confidence: "likely",
+          decision_question: "本番でもこの方式のままでよいですか",
+        },
+      }),
+    ]);
+
+    const { QaPanel } = await import("@/pages/interview");
+    render(
+      <QaPanel sessionId={1} actor="dev" approvedCount={1} answerableAreas={[]} />,
+      { wrapper: createWrapper() },
+    );
+
+    const investigationBlock = await screen.findByTestId("qa-investigation-1");
+    expect(investigationBlock).toHaveTextContent("AIの調査結果: 認証はJWTで行われます");
+    expect(investigationBlock).toHaveTextContent("確認したいこと: 本番でもこの方式のままでよいですか");
+
+    fireEvent.click(screen.getByTestId("qa-investigation-show-evidence-1"));
+    const evidenceDetail = await screen.findByTestId("qa-investigation-evidence-1");
+    expect(evidenceDetail).toHaveTextContent("auth.py:1-5");
+
+    fireEvent.click(screen.getByTestId("qa-investigation-transcribe-1"));
+
+    const textarea = await screen.findByPlaceholderText("回答を入力");
+    expect((textarea as HTMLTextAreaElement).value).toBe("認証はJWTで行われます");
+    // Transcribing only fills the draft -- it never itself submits an answer.
+    expect(mockApi.post).not.toHaveBeenCalled();
+  });
+
+  test("unresolved investigation shows a muted note instead of a conclusion", async () => {
+    mockQaList([
+      makeQa({
+        id: 1,
+        route_category: "system_researchable",
+        investigation: {
+          run_id: 42,
+          status: "unresolved",
+          conclusion: "",
+          key_points: [],
+          evidence: [],
+          uncertainty: "",
+          confidence: "uncertain",
+          decision_question: null,
+        },
+      }),
+    ]);
+
+    const { QaPanel } = await import("@/pages/interview");
+    render(
+      <QaPanel sessionId={1} actor="dev" answerableAreas={[]} approvedCount={1} />,
+      { wrapper: createWrapper() },
+    );
+
+    const note = await screen.findByTestId("qa-investigation-unresolved-1");
+    expect(note).toHaveTextContent("AIの調査では特定できませんでした");
+    expect(screen.queryByTestId("qa-investigation-transcribe-1")).not.toBeInTheDocument();
+  });
+
+  test("answers-revised banner text matches #288 auto-refresh copy (Finding 6)", async () => {
+    const items = [makeQa({ id: 1 })];
+    const list: InterviewQaListOut = {
+      session_id: 1, system_id: 1, items,
+      open_count: 1, high_priority_open_count: 0, answers_revised_at: 123,
+    };
+    getImpl = (path: string) => {
+      if (path === "/interview/sessions/1/qa") return Promise.resolve(list);
+      if (path === "/interview/sessions/1/inquiries") return Promise.resolve({ session_id: 1, system_id: 1, items: [] });
+      if (path === "/interview/sessions/1/handoffs") return Promise.resolve({ session_id: 1, system_id: 1, items: [] });
+      return Promise.resolve(undefined);
+    };
+
+    const { QaPanel } = await import("@/pages/interview");
+    render(
+      <QaPanel sessionId={1} actor="dev" approvedCount={1} answerableAreas={[]} />,
+      { wrapper: createWrapper() },
+    );
+
+    const banner = await screen.findByTestId("answers-revised-banner");
+    expect(banner).toHaveTextContent("理解は自動で更新されます");
+    expect(banner).not.toHaveTextContent("自動では再構築されません");
   });
 });

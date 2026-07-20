@@ -135,6 +135,8 @@ def aggregate_component_facts(
             first_observed_at=None,
             last_observed_at=None,
             has_traces=False,
+            observed_environment=None,
+            observed_git_sha=None,
         )
 
     error_count = summary["error_count"] or 0
@@ -149,6 +151,26 @@ def aggregate_component_facts(
         )
     ]
 
+    # Issue #290 Finding 5: latest non-empty observed environment/git_sha in
+    # the same window -- deterministic "greatest timestamp with a non-null,
+    # non-empty value" pick, one bounded query per column. None when no
+    # trace in the window carried the field (most traces predate SDK
+    # PROBE_ENVIRONMENT/PROBE_GIT_SHA support, or never set them).
+    env_row = conn.execute(
+        """SELECT environment FROM traces
+           WHERE system_id = ? AND component_id = ? AND timestamp >= ?
+             AND environment IS NOT NULL AND environment != ''
+           ORDER BY timestamp DESC LIMIT 1""",
+        (system_id, component_id, since),
+    ).fetchone()
+    sha_row = conn.execute(
+        """SELECT git_sha FROM traces
+           WHERE system_id = ? AND component_id = ? AND timestamp >= ?
+             AND git_sha IS NOT NULL AND git_sha != ''
+           ORDER BY timestamp DESC LIMIT 1""",
+        (system_id, component_id, since),
+    ).fetchone()
+
     return RuntimeTraceFactsOut(
         component_id=component_id,
         window_days=days,
@@ -161,6 +183,8 @@ def aggregate_component_facts(
         first_observed_at=summary["first_observed_at"],
         last_observed_at=summary["last_observed_at"],
         has_traces=True,
+        observed_environment=env_row["environment"] if env_row is not None else None,
+        observed_git_sha=sha_row["git_sha"] if sha_row is not None else None,
     )
 
 
@@ -185,26 +209,52 @@ def freshness_for(fact: RuntimeTraceFactsOut, *, now: Optional[float] = None) ->
 def build_provenance(
     fact: RuntimeTraceFactsOut,
     *,
-    snapshot_id: Optional[int] = None,
-    git_sha: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
+    system_id: Optional[int] = None,
     now: Optional[float] = None,
 ) -> RuntimeFactProvenanceOut:
     """Wrap a deterministic fact in its provenance envelope.
 
-    ``environment`` is always None: the ``traces`` table has no environment
-    column today, so this never invents one from trace content (Principle
-    5). ``source`` is always the fixed literal 'trace_aggregation' -- every
+    ``environment`` comes only from ``fact.observed_environment`` -- the
+    latest non-empty ``traces.environment`` value actually observed for
+    this component (Issue #290 Finding 5's SDK-reported PROBE_ENVIRONMENT).
+    Never invented, and never the caller's pinned/expected environment.
+
+    ``snapshot_ref`` is derived the same way from ``fact.observed_git_sha``:
+    when no sha was ever observed on a trace, ``snapshot_ref`` is ``None``
+    -- it is NEVER the analysis session's pinned snapshot, because the
+    trace-producing deployment may be running different code than what is
+    currently pinned for analysis (this was Finding 5(b) of the Issue #290
+    review: fabricated provenance). When a sha *was* observed, this
+    resolves it against ``repository_snapshots`` for ``system_id`` by exact
+    commit-sha match -- but only when both ``conn`` and ``system_id`` are
+    given; the raw observed sha is always kept in ``snapshot_ref.git_sha``
+    even when it cannot be resolved to a known snapshot (``snapshot_id``
+    stays ``None`` in that case; this is a structural lookup, never a
+    guess).
+
+    ``source`` is always the fixed literal 'trace_aggregation' -- every
     runtime fact in this system comes from the same deterministic
     aggregation path, so this is a structural constant, not a per-call
     choice.
     """
-    snapshot_ref = (
-        RuntimeFactSnapshotRefOut(snapshot_id=snapshot_id, git_sha=git_sha)
-        if snapshot_id is not None
-        else None
-    )
+    snapshot_ref: Optional[RuntimeFactSnapshotRefOut] = None
+    if fact.observed_git_sha:
+        resolved_snapshot_id: Optional[int] = None
+        if conn is not None and system_id is not None:
+            row = conn.execute(
+                """SELECT id FROM repository_snapshots
+                   WHERE system_id = ? AND commit_sha = ?
+                   ORDER BY id DESC LIMIT 1""",
+                (system_id, fact.observed_git_sha),
+            ).fetchone()
+            if row is not None:
+                resolved_snapshot_id = row["id"]
+        snapshot_ref = RuntimeFactSnapshotRefOut(
+            snapshot_id=resolved_snapshot_id, git_sha=fact.observed_git_sha,
+        )
     return RuntimeFactProvenanceOut(
-        environment=None,
+        environment=fact.observed_environment,
         first_observed_at=fact.first_observed_at,
         last_observed_at=fact.last_observed_at,
         snapshot_ref=snapshot_ref,

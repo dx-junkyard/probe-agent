@@ -384,4 +384,50 @@ describe("ReviewQueuePanel", () => {
     const card = await screen.findByTestId("review-item-31");
     expect(within(card).queryByTestId("review-item-handoff-open-31")).not.toBeInTheDocument();
   });
+
+  // Review finding 4: GET .../review-queue already excludes
+  // answered/corrected/superseded rows server-side, so this panel never
+  // renders them as action cards. The one client-side rendering change is
+  // labeling a superseded row with a 履歴 badge wherever the full
+  // GET .../alignment listing surfaces one (e.g. the collapsed
+  // 対応不要の項目 section), so it's never confused for a current item.
+  test("履歴 badge shows on a superseded informational item, not on a current one", async () => {
+    const current = makeItem({
+      id: 40, review_category: "no_review_required", reason_code: "no_change",
+      alignment_state: "aligned", user_reason: "意図と現状の理解は一致しています。対応は不要です",
+    });
+    const historical = makeItem({
+      id: 41, review_category: "no_review_required", reason_code: "no_change",
+      alignment_state: "aligned", user_reason: "意図と現状の理解は一致しています。対応は不要です",
+      status: "answered", superseded: true,
+    });
+    const queue: AlignmentReviewQueueOut = { session_id: 1, system_id: 1, items: [] };
+    const full: AlignmentListOut = {
+      session_id: 1, system_id: 1,
+      items_by_category: {
+        must_review: [], batch_reviewable: [],
+        no_review_required: [current, historical], unchanged: [], informational: [],
+      },
+      counts: { must_review: 0, batch_reviewable: 0, no_review_required: 2, unchanged: 0, informational: 0 },
+    };
+    getImpl = (path: string) => {
+      if (path === "/interview/sessions/1/review-queue") return Promise.resolve(queue);
+      if (path === "/interview/sessions/1/alignment") return Promise.resolve(full);
+      if (path === "/interview/sessions/1/inquiries") return Promise.resolve({ session_id: 1, system_id: 1, items: [] });
+      return Promise.resolve(undefined);
+    };
+
+    const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
+    render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+
+    const toggle = await screen.findByTestId("review-queue-informational-toggle");
+    expect(toggle).toHaveTextContent("対応不要の項目 (2)");
+    fireEvent.click(toggle);
+
+    const currentRow = await screen.findByTestId("review-item-informational-40");
+    expect(within(currentRow).queryByTestId("review-item-superseded-40")).not.toBeInTheDocument();
+
+    const historicalRow = await screen.findByTestId("review-item-informational-41");
+    expect(within(historicalRow).getByTestId("review-item-superseded-41")).toHaveTextContent("履歴");
+  });
 });

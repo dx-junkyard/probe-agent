@@ -193,6 +193,7 @@ def generate_inquiry_answer(
         client, config,
         repo_path=repo_path, commit_sha=commit_sha,
         question=question_text, research_focus=route.research_focus,
+        search_keywords=route.search_keywords,
         hybrid_decision_question=(route.category == "hybrid"),
         language=language, budget=investigation_budget,
         conn=conn, system_id=system_id, snapshot_id=snapshot_id,

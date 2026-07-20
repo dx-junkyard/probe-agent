@@ -17,6 +17,14 @@ Split per Principle 6: candidate file *retrieval* is deterministic keyword
 matching over tracked paths (a heuristic that only narrows the candidate
 set); the actual *selection* of what is relevant and the conclusion are
 always a reasoning-model decision, never a heuristic final answer.
+``_keywords()`` tokenizes both ASCII (``[A-Za-z0-9_]+``, unchanged) and CJK
+(e.g. Japanese) sequences, but repo paths/identifiers are almost always
+ASCII, so a Japanese-only question alone still cannot match most files.
+``investigate()`` therefore also accepts an optional ``search_keywords``
+hint (the Question Router's own ASCII code-search guess, Issue #286 review
+fix) and tokenizes+prepends it ahead of the question/research_focus
+keywords -- these are explicit hints, so they skip the stopword filter and
+the length-3 minimum that ordinary free-text tokens use.
 
 Budgets are explicit and enforced deterministically (never inferred): a
 budget too small to gather any evidence yields ``status="unresolved"`` with
@@ -28,7 +36,14 @@ structured-output validation failure yields ``status="failed"``. Evidence
 citations that do not resolve inside the excerpts actually read are pruned
 (with a recorded note) as long as at least one citation remains valid; if
 every citation is invalid, the run fails closed rather than silently
-returning an unfounded conclusion.
+returning an unfounded conclusion. A further gate (Issue #286 review fix)
+guards the opposite failure mode: if the model reports ``status="completed"``
+but, after validation/pruning, BOTH ``evidence`` and ``runtime_evidence`` are
+empty, the conclusion has no verifiable grounding at all -- ``status`` is
+deterministically demoted to ``"unresolved"`` and a fixed note is appended to
+``uncertainty`` rather than adopting an ungrounded "completed" conclusion. A
+``completed`` status backed only by valid ``runtime_evidence`` (no code
+evidence) is unaffected and stays ``completed``.
 """
 
 from __future__ import annotations
@@ -243,11 +258,43 @@ def _strip_fences(raw: str) -> str:
 
 # --- Deterministic candidate retrieval (Principle 6: candidates only) -------
 
+# CJK code-point ranges (repetition mark, Hiragana/Katakana, CJK Extension A,
+# common CJK Unified Ideographs) -- a question written in Japanese still
+# tokenizes to something, even though it rarely matches ASCII repo paths
+# directly (Japanese-named paths/docs are the case it does help).
+_CJK_TOKEN_RE = re.compile(r"[々぀-ヿ㐀-䶿一-鿿]+")
+
 
 def _keywords(*texts: Optional[str]) -> List[str]:
     combined = " ".join(t for t in texts if t)
-    tokens = re.findall(r"[A-Za-z0-9_]+", combined.lower())
-    return list(dict.fromkeys(t for t in tokens if len(t) >= 3 and t not in _STOPWORDS))
+    lower = combined.lower()
+    ascii_tokens = re.findall(r"[A-Za-z0-9_]+", lower)
+    cjk_tokens = _CJK_TOKEN_RE.findall(lower)
+    tokens = [t for t in ascii_tokens if len(t) >= 3 and t not in _STOPWORDS]
+    tokens += [t for t in cjk_tokens if len(t) >= 2]
+    return list(dict.fromkeys(tokens))
+
+
+def _hint_keywords(hints: Optional[List[str]]) -> List[str]:
+    """Tokenize explicit search-keyword hints (Question Router's own ASCII
+    code-search guess, Issue #286 review fix).
+
+    Unlike ``_keywords()`` these are already a short, explicit list the
+    caller wants tried -- so there is no stopword filter (a hint like "not"
+    or "for" would be an unusual identifier but is still the caller's
+    explicit choice) and the minimum token length is 2 instead of 3. Applies
+    the same ASCII+CJK tokenization as ``_keywords()`` since a hint could in
+    principle contain either.
+    """
+    if not hints:
+        return []
+    combined = " ".join(hints)
+    lower = combined.lower()
+    ascii_tokens = re.findall(r"[A-Za-z0-9_]+", lower)
+    cjk_tokens = _CJK_TOKEN_RE.findall(lower)
+    tokens = [t for t in ascii_tokens if len(t) >= 2]
+    tokens += [t for t in cjk_tokens if len(t) >= 2]
+    return list(dict.fromkeys(tokens))
 
 
 def _score_path(path: str, keywords: List[str]) -> int:
@@ -358,7 +405,10 @@ def _gather_runtime_candidates(
     for row in rows:
         component_id = row["component_id"]
         fact = aggregate_component_facts(conn, system_id, component_id)
-        provenance = build_provenance(fact, snapshot_id=snapshot_id)
+        # Issue #290 Finding 5: provenance now comes only from what was
+        # actually observed on traces (build_provenance resolves snapshot_ref
+        # from fact.observed_git_sha itself); never pass the pinned snapshot_id.
+        provenance = build_provenance(fact, conn=conn, system_id=system_id)
         baseline = compare_claim_to_runtime("", fact, provenance)
         candidates.append(
             RuntimeFactCandidate(
@@ -481,6 +531,7 @@ def investigate(
     commit_sha: str,
     question: str,
     research_focus: Optional[str] = None,
+    search_keywords: Optional[List[str]] = None,
     hybrid_decision_question: bool = False,
     language: str = "ja",
     budget: Optional[InvestigationBudget] = None,
@@ -496,7 +547,18 @@ def investigate(
     spending an LLM call. Evidence citations outside the excerpts actually
     read are pruned (recorded, not fatal) as long as at least one citation
     remains valid when citations were given at all; if every citation is
-    invalid, the run fails closed.
+    invalid, the run fails closed. A ``status="completed"`` response with no
+    valid evidence at all (neither code nor runtime) is demoted to
+    ``"unresolved"`` -- see the module docstring.
+
+    ``search_keywords`` (optional, Issue #286 review fix) is the Question
+    Router's own ASCII code-search hint (``RouteResult.search_keywords``):
+    tokenized and placed FIRST in the candidate-retrieval keyword list, ahead
+    of the tokens derived from ``question``/``research_focus``. This matters
+    because candidate retrieval matches keywords against repo FILE PATHS
+    (almost always ASCII identifiers) while the question itself may be
+    written in a non-English language (e.g. Japanese) that tokenizes to
+    nothing useful for path matching.
 
     ``conn``/``system_id``/``snapshot_id`` (Issue #290, all optional and
     default ``None``) additionally offer the model deterministic runtime
@@ -533,7 +595,12 @@ def investigate(
         )
     paths = [e.path for e in entries if e.object_type == "blob" and e.mode != "120000"]
 
-    keywords = _keywords(research_focus, question)
+    # search_keywords hints go first: they are the Question Router's own
+    # ASCII code-search guess, offered because repo paths are ASCII while
+    # the question/research_focus may not tokenize to anything path-like
+    # (e.g. a Japanese-only question). Deduped against the trailing tokens
+    # so a hint is never counted twice in _score_path.
+    keywords = list(dict.fromkeys(_hint_keywords(search_keywords) + _keywords(research_focus, question)))
     candidates = _select_candidates(paths, keywords, budget.max_files)
     snippets, timed_out = _read_candidates(repo_path, commit_sha, candidates, budget, start_time)
 
@@ -661,13 +728,27 @@ def investigate(
         )
     valid_runtime_evidence = valid_runtime_evidence[: budget.max_runtime_facts]
 
+    # Review fix: a "completed" status with zero valid evidence of EITHER
+    # kind (code or runtime) is an ungrounded conclusion -- demote it
+    # deterministically rather than adopting it. A "completed" backed only
+    # by valid runtime_evidence (no code evidence) is left alone; only the
+    # both-empty case is demoted. Uses a fixed English note, consistent with
+    # this module's other fixed (non-LLM-authored) uncertainty notes.
+    final_status = validated.status
+    if final_status == "completed" and not valid_evidence and not valid_runtime_evidence:
+        final_status = "unresolved"
+        uncertainty = (f"{uncertainty} " if uncertainty else "") + (
+            "Model reported completion without any verifiable evidence "
+            "citation; demoted to unresolved."
+        )
+
     decision_question = validated.decision_question if hybrid_decision_question else None
 
     return InvestigationResult(
         provider=config.provider,
         model=config.model,
         is_mock=False,
-        status=validated.status,
+        status=final_status,
         conclusion=validated.conclusion,
         key_points=list(validated.key_points),
         evidence=valid_evidence,

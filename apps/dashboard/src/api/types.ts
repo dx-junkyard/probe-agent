@@ -739,6 +739,29 @@ export interface InterviewQaEvidenceRef {
   char_count: number | null;
 }
 
+// Issue #286 review fix (Finding 1): the Investigation Agent result for a
+// normal-flow question, populated only via the batch route-and-investigate
+// endpoint below. Mirrors InterviewInquiryMessageDetailOut's evidence shape.
+export interface InterviewQaInvestigationEvidenceOut {
+  path: string;
+  start_line: number;
+  end_line: number;
+  summary: string;
+}
+
+export type InterviewQaInvestigationStatus = "completed" | "unresolved";
+
+export interface InterviewQaInvestigationOut {
+  run_id: number;
+  status: InterviewQaInvestigationStatus;
+  conclusion: string;
+  key_points: string[];
+  evidence: InterviewQaInvestigationEvidenceOut[];
+  uncertainty: string;
+  confidence: "confirmed" | "likely" | "uncertain";
+  decision_question: string | null;
+}
+
 export interface InterviewQaOut {
   id: number;
   session_id: number;
@@ -767,6 +790,10 @@ export interface InterviewQaOut {
   knowledge_area?: KnowledgeArea | null;
   // Issue #291: set once this question has been handed off to an assignee.
   handoff_id?: number | null;
+  // Issue #286 review fix (Finding 1): populated only by the batch
+  // route-and-investigate endpoint. Never written by answering/correcting a
+  // question, and never itself confirms an answer.
+  investigation?: InterviewQaInvestigationOut | null;
 }
 
 export interface InterviewQaAnswerOut {
@@ -782,6 +809,30 @@ export interface InterviewQaListOut {
   open_count: number;
   high_priority_open_count: number;
   answers_revised_at: number | null;
+}
+
+// --- Batch route-and-investigate (Issue #286 review fix, Finding 1) ----------
+
+export interface InterviewQaRouteInvestigateItemOut {
+  qa_id: number;
+  route_category?: InquiryRouteCategory | null;
+  knowledge_area?: KnowledgeArea | null;
+  investigation_status?: InterviewQaInvestigationStatus | "failed" | null;
+  error?: string | null;
+}
+
+export interface InterviewQaRouteInvestigateCountsOut {
+  routed: number;
+  investigated: number;
+  failed: number;
+  skipped_cap: number;
+}
+
+export interface InterviewQaRouteInvestigateBatchOut {
+  session_id: number;
+  system_id: number;
+  results: InterviewQaRouteInvestigateItemOut[];
+  counts: InterviewQaRouteInvestigateCountsOut;
 }
 
 // --- Intent Brief (Issue #284) ------------------------------------------------
@@ -848,12 +899,16 @@ export interface InterviewInquiryEvidenceOut {
 export type InquiryRouteCategory = "human_only" | "system_researchable" | "hybrid";
 
 // Issue #290: runtime_fact evidence provenance envelope + finite match
-// state. `environment` is always null today (traces carry no environment
-// metadata) but the field exists for a future capability.
+// state. `environment` / `snapshot_ref` are populated only from what was
+// actually observed on traces (SDK PROBE_ENVIRONMENT / PROBE_GIT_SHA) --
+// never the pinned analysis snapshot (Finding 5). Both are `null` for
+// traces that never reported the field.
 export type RuntimeFactFreshness = "fresh" | "stale" | "unobserved";
 
 export interface RuntimeFactSnapshotRefOut {
-  snapshot_id: number;
+  // null when the observed git_sha does not match any known snapshot for
+  // the System; git_sha is still carried verbatim in that case.
+  snapshot_id: number | null;
   git_sha: string | null;
 }
 
@@ -997,6 +1052,13 @@ export interface AlignmentItemOut {
   // Issue #291: set once this review item has been handed off to an
   // assignee (creating the handoff also sets status='held').
   handoff_id?: number | null;
+  // Review-finding fix (Finding 4): true when a later rebuild produced a
+  // fresh replacement row for this contrast point while this row was
+  // already answered/corrected. GET .../review-queue always excludes
+  // superseded=1 rows; the full GET .../alignment listing (grouped by
+  // review_category) can still surface one, so any rendering of that full
+  // listing should treat superseded=true as history, not a current item.
+  superseded?: boolean;
   intelligence_run_id: number;
   is_mock: boolean;
   created_at: number;

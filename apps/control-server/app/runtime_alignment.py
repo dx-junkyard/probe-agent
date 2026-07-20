@@ -16,10 +16,13 @@ checks, never a semantic judgement of whether *behavior* matches):
   fact and an expected environment are known) environment equality. The
   ``claim`` text itself is accepted for interface/audit completeness but is
   never parsed or inspected here: judging whether a claim's free-text
-  *meaning* matches observed behavior is a semantic call that belongs to the
-  reasoning-model Investigation Agent (Issue #286), which must express that
-  judgement through this same finite vocabulary (schema-validated), not to
-  this deterministic function.
+  *meaning* matches observed behavior is a semantic call that belongs to
+  reasoning models -- the Investigation Agent (Issue #286) and, for
+  Alignment Review items whose baseline here is 'match', the Runtime Match
+  Judge (Issue #290 Finding 5 Part 2, ``app/runtime_match_judge.py``) --
+  both of which must express that judgement through this same finite
+  vocabulary (schema-validated), never by second-guessing this
+  deterministic function's stale/unobserved/environment-mismatch results.
 
 probe-agent:
   role: Deterministic component-evidence mapping + finite claim/runtime match
@@ -93,8 +96,13 @@ def compare_claim_to_runtime(
     """Deterministic finite match state for one (claim, fact) pair.
 
     ``claim`` is accepted for call-site/audit clarity only and is never
-    inspected: every branch below reads only ``fact``/``provenance`` finite
-    fields (Principle 6). First-match order:
+    inspected here: every branch below reads only ``fact``/``provenance``
+    finite fields (Principle 6). Whether the claim's free-text *meaning*
+    still matches runtime behavior is judged separately, by the reasoning
+    model in ``app/runtime_match_judge.py``'s ``judge_runtime_match`` --
+    but only ever for items this function already classified 'match'; the
+    stale/unobserved/environment-mismatch results below are absolute and
+    are never re-decided by the model. First-match order:
 
     1. ``provenance.freshness == 'unobserved'`` -> 'unobserved' (no trace
        data at all for the mapped component).
@@ -103,12 +111,15 @@ def compare_claim_to_runtime(
        current, per the Issue #290 stale guard).
     3. Both ``expected_environment`` and ``provenance.environment`` are
        known and differ -> 'mismatch' (the one deterministic negative
-       signal the brief enumerates; today ``provenance.environment`` is
-       always None since the ``traces`` table carries no environment
-       column, so this branch is unreachable with real data until that
-       capability exists -- exercised in tests via a constructed
-       provenance).
-    4. Otherwise -> 'match' (fresh data, no structural conflict detected).
+       signal the brief enumerates). ``expected_environment`` is always the
+       calling System's own declared ``environment`` column (empty string
+       treated as unknown/None, never inferred from claim text);
+       ``provenance.environment`` is the latest value actually observed on
+       a trace (Issue #290 Finding 5's SDK-reported PROBE_ENVIRONMENT) --
+       reachable with real data now that traces can carry it, not just via
+       a constructed provenance in tests.
+    4. Otherwise -> 'match' (fresh data, no structural conflict detected;
+       eligible for the semantic judge above).
     """
     del claim  # intentionally unused -- see docstring
     if provenance.freshness == "unobserved":

@@ -31,6 +31,12 @@ Answer generation is isolated in ``app/inquiry_answering.py`` so Issue #286
 (Question Router / Investigation Agent) can replace the reasoning-model call
 without touching this lifecycle/transition logic.
 
+At most one Inquiry may be active (``status IN ('open', 'held')``) per
+origin at a time: ``create_inquiry`` 409s (``inquiry_already_active``) when
+one already exists, and a closing transition only releases the origin item
+back to ``'open'`` when no OTHER active Inquiry remains for that same
+origin (defense in depth for any pre-existing duplicate rows).
+
 probe-agent:
   role: API boundary for the Inquiry side-conversation lifecycle (held
     pending -> resolved/unresolved/held/cancelled)
@@ -56,6 +62,7 @@ from ..db import get_conn
 from ..interview_context import build_interview_context
 from ..interview_language import interview_message, resolve_message_language
 from ..inquiry_answering import InquiryAnswerResult, generate_inquiry_answer
+from ..investigation_persistence import persist_investigation_run, persist_route_run
 from ..llm import LLMConfig, LLMError, create_llm_client
 from ..models import (
     InterviewInquiryCreate,
@@ -242,72 +249,6 @@ class _AnswerOutcome:
     error: Optional[str]
 
 
-def _persist_route_run(conn, *, system_id: int, snapshot_id: int, route, now: float, completed_at: float) -> int:
-    """Persist the Question Router sub-run (Issue #286) as its own audit row."""
-    cur = conn.execute(
-        """
-        INSERT INTO intelligence_runs
-            (system_id, snapshot_id, run_type, provider, model,
-             prompt_version, schema_version, decision_method, status,
-             error_details, is_mock, started_at, completed_at)
-        VALUES (?, ?, 'question_route', ?, ?, ?, ?, 'reasoning_llm', ?, ?, ?, ?, ?)
-        """,
-        (
-            system_id, snapshot_id, route.provider, route.model,
-            route.prompt_version, route.schema_version,
-            "failed" if route.error else "completed", route.error,
-            1 if route.is_mock else 0, now, completed_at,
-        ),
-    )
-    return cur.lastrowid
-
-
-def _persist_investigation_run(
-    conn, *, system_id: int, snapshot_id: int, investigation, now: float, completed_at: float,
-) -> int:
-    """Persist the Investigation Agent sub-run + its evidence rows (Issue #286).
-
-    Every snippet actually read from the pinned snapshot is recorded here,
-    regardless of whether the final answer cited it -- mirroring the
-    interview dialogue's pass-1 evidence-audit pattern (Issue #137). Budget
-    usage (files/chars/llm-calls/elapsed) is recorded on the run row itself
-    for auditability.
-    """
-    cur = conn.execute(
-        """
-        INSERT INTO intelligence_runs
-            (system_id, snapshot_id, run_type, provider, model,
-             prompt_version, schema_version, decision_method, status,
-             error_details, is_mock, started_at, completed_at,
-             budget_files_read, budget_chars_read, budget_llm_calls,
-             budget_elapsed_seconds)
-        VALUES (?, ?, 'investigation', ?, ?, ?, ?, 'reasoning_llm', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            system_id, snapshot_id, investigation.provider, investigation.model,
-            investigation.prompt_version, investigation.schema_version,
-            "failed" if investigation.error else "completed", investigation.error,
-            1 if investigation.is_mock else 0, now, completed_at,
-            investigation.files_read, investigation.chars_read, investigation.llm_calls,
-            investigation.elapsed_seconds,
-        ),
-    )
-    run_id = cur.lastrowid
-    for snippet in investigation.read_snippets:
-        conn.execute(
-            """INSERT INTO intelligence_run_evidence
-                (system_id, intelligence_run_id, path, start_line,
-                 end_line, char_count, truncated, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                system_id, run_id, snippet.path, snippet.start_line,
-                snippet.end_line, snippet.char_count,
-                1 if snippet.truncated else 0, completed_at,
-            ),
-        )
-    return run_id
-
-
 def _generate_and_store_answer(
     conn,
     *,
@@ -368,12 +309,12 @@ def _generate_and_store_answer(
     completed_at = time.time()
 
     if result.route is not None:
-        _persist_route_run(
+        persist_route_run(
             conn, system_id=system_id, snapshot_id=snapshot_id, route=result.route,
             now=now, completed_at=completed_at,
         )
     if result.investigation is not None:
-        _persist_investigation_run(
+        persist_investigation_run(
             conn, system_id=system_id, snapshot_id=snapshot_id,
             investigation=result.investigation, now=now, completed_at=completed_at,
         )
@@ -498,16 +439,33 @@ def _apply_transition(
         # is deliberately excluded (not in _CLOSED_STATUSES): the Inquiry is
         # only paused, not closed, so the item stays 'inquiry' until it
         # actually resolves/unresolves/cancels.
+        #
+        # Finding 7 fix (defense in depth): create_inquiry now refuses to
+        # open a second active Inquiry for the same origin, but this guard
+        # stays regardless -- pre-existing duplicate rows (from before this
+        # fix) must not have the origin released while ANOTHER Inquiry on
+        # the same origin is still open/held.
         if target_status in _CLOSED_STATUSES:
-            _set_review_item_status(
-                conn,
-                origin_kind=inquiry_row["origin_kind"],
-                origin_id=inquiry_row["origin_id"],
-                session_id=inquiry_row["session_id"],
-                system_id=inquiry_row["system_id"],
-                status="open",
-                now=now,
-            )
+            other_active = conn.execute(
+                """SELECT id FROM interview_inquiry
+                   WHERE session_id = ? AND system_id = ? AND origin_kind = ?
+                     AND origin_id = ? AND id != ? AND status IN ('open', 'held')""",
+                (
+                    inquiry_row["session_id"], inquiry_row["system_id"],
+                    inquiry_row["origin_kind"], inquiry_row["origin_id"],
+                    inquiry_row["id"],
+                ),
+            ).fetchone()
+            if other_active is None:
+                _set_review_item_status(
+                    conn,
+                    origin_kind=inquiry_row["origin_kind"],
+                    origin_id=inquiry_row["origin_id"],
+                    session_id=inquiry_row["session_id"],
+                    system_id=inquiry_row["system_id"],
+                    status="open",
+                    now=now,
+                )
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
@@ -543,6 +501,16 @@ def create_inquiry(
     question are still persisted (so the developer can retry via
     ``/message``); only the assistant message is withheld, and the response
     is a 502 whose detail carries the created ``inquiry_id``.
+
+    Finding 7 fix: at most one Inquiry may be active (``status IN ('open',
+    'held')``) per origin (session_id/system_id/origin_kind/origin_id) at a
+    time -- a second attempt is rejected with 409
+    ``inquiry_already_active`` carrying the existing ``inquiry_id``. The
+    check runs inside the same transaction as the INSERT below; ``db.py``'s
+    single global connection lock (``get_conn``) serializes all writers, so
+    this in-transaction check-then-insert is race-free without needing a
+    partial unique index (which pre-existing duplicate rows could fail to
+    migrate under).
     """
     if payload.origin_kind not in ORIGIN_KINDS:
         raise HTTPException(status_code=422, detail="Invalid origin_kind")
@@ -554,6 +522,22 @@ def create_inquiry(
         )
 
         conn.execute("BEGIN")
+        existing_active = conn.execute(
+            """SELECT id FROM interview_inquiry
+               WHERE session_id = ? AND system_id = ? AND origin_kind = ?
+                 AND origin_id = ? AND status IN ('open', 'held')""",
+            (session_id, system_id, payload.origin_kind, payload.origin_id),
+        ).fetchone()
+        if existing_active is not None:
+            conn.execute("ROLLBACK")
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "inquiry_already_active",
+                    "message": "An Inquiry is already open or held for this item.",
+                    "inquiry_id": existing_active["id"],
+                },
+            )
         try:
             cur = conn.execute(
                 """INSERT INTO interview_inquiry

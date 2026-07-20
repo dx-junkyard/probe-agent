@@ -98,12 +98,17 @@ def test_full_featured_trace_event_with_capture_validates(trace_event_schema):
         },
         "replayability": "partial",
         "replay_reasons": ["unsupported_type"],
+        # Issue #290 Finding 5: optional deployment provenance.
+        "environment": "production",
+        "git_sha": "abc123",
     }
     jsonschema.validate(event, trace_event_schema)
     from app.models import TraceEvent
     parsed = TraceEvent(**event)
     assert parsed.replayability == "partial"
     assert parsed.replay_reasons == ["unsupported_type"]
+    assert parsed.environment == "production"
+    assert parsed.git_sha == "abc123"
 
 
 def test_unknown_replay_enum_values_fail_schema(trace_event_schema):
@@ -233,6 +238,31 @@ def test_actual_sdk_trace_dict_validates(sdk, trace_event_schema):
     # And the server model accepts the exact same payload.
     from app.models import TraceEvent
     TraceEvent(**trace)
+
+
+def test_actual_sdk_trace_dict_with_environment_and_git_sha_validates(
+    sdk, trace_event_schema, monkeypatch,
+):
+    """Issue #290 Finding 5: PROBE_ENVIRONMENT / PROBE_GIT_SHA-tagged trace
+    payloads validate against the shared schema and the server model."""
+    monkeypatch.setenv("PROBE_ENVIRONMENT", "production")
+    monkeypatch.setenv("PROBE_GIT_SHA", "deadbeef")
+    probe = sdk["decorator_mod"].probe
+
+    @probe(component_id="schema-check-env")
+    def handle(x):
+        return x + 1
+
+    handle(1)
+    assert len(sdk["traces"]) == 1
+    trace = json.loads(json.dumps(sdk["traces"][0], ensure_ascii=False))
+    jsonschema.validate(trace, trace_event_schema)
+    assert trace["environment"] == "production"
+    assert trace["git_sha"] == "deadbeef"
+    from app.models import TraceEvent
+    parsed = TraceEvent(**trace)
+    assert parsed.environment == "production"
+    assert parsed.git_sha == "deadbeef"
 
 
 def test_actual_sdk_shadow_payload_validates(sdk, shadow_result_schema):

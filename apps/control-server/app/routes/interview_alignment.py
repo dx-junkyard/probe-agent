@@ -7,9 +7,11 @@ produces "alignment items": one row per contrast point, each with a
 DETERMINISTIC review classification (``review_category`` / ``reason_code``,
 see ``app/alignment.py``'s rule table -- classification itself is never a
 reasoning decision, Principle 6). Only ``review_category IN (must_review,
-batch_reviewable)`` ever surfaces as an action-required Review Queue card;
-the rest (``no_review_required`` / ``unchanged`` / ``informational``) are
-collapsed/informational.
+batch_reviewable)``, further restricted to non-terminal, non-superseded rows
+(``status NOT IN (answered, corrected)`` and ``superseded = 0``), ever
+surfaces as an action-required Review Queue card; the rest
+(``no_review_required`` / ``unchanged`` / ``informational``, plus any
+answered/corrected/superseded row) are collapsed/informational/history.
 
 Kept in its own module (like Issues #284/#285) rather than growing
 ``routes/interview.py`` further, per CLAUDE.md's guidance for this
@@ -20,7 +22,11 @@ rows with ``status='open' AND user_decision IS NULL`` for the session --
 untouched suggestions with no user progress. Any row with a different status
 (``answered``/``corrected``/``held``/``inquiry``) or a recorded
 ``user_decision`` is always kept, regardless of how the base revision
-changed (Principle 2 -- a rebuild must never lose a human decision).
+changed (Principle 2 -- a rebuild must never lose a human decision). Of the
+kept rows, a rebuild also marks surviving TERMINAL rows
+(``answered``/``corrected``) ``superseded=1`` so the fresh replacement row
+for the same contrast point is distinguishable from stale history;
+``held``/``inquiry`` rows are never marked superseded (still in-flight).
 
 Inquiry integration (Issue #285's ``origin_kind='review_item'``) lives in
 ``routes/interview_inquiry.py``: opening an Inquiry on an alignment item sets
@@ -58,6 +64,7 @@ from ..alignment import (
 )
 from ..auth import get_system_id
 from ..db import get_conn
+from ..interview_language import get_interview_language
 from ..llm import LLMConfig, LLMError, create_llm_client
 from ..models import (
     AlignmentAnswerRequest,
@@ -70,6 +77,12 @@ from ..models import (
     AlignmentUserDecisionOut,
 )
 from ..runtime_alignment import compare_claim_to_runtime, resolve_component_for_evidence
+from ..runtime_match_judge import (
+    PROMPT_VERSION as RUNTIME_MATCH_PROMPT_VERSION,
+    SCHEMA_VERSION as RUNTIME_MATCH_SCHEMA_VERSION,
+    RuntimeMatchJudgeInputItem,
+    judge_runtime_match,
+)
 from ..runtime_reality import aggregate_component_facts, build_provenance
 
 router = APIRouter()
@@ -125,6 +138,7 @@ def _item_out(row) -> AlignmentItemOut:
         status=row["status"],
         user_decision=AlignmentUserDecisionOut(**user_decision) if user_decision else None,
         handoff_id=row["handoff_id"] if "handoff_id" in row.keys() else None,
+        superseded=bool(row["superseded"]) if "superseded" in row.keys() else False,
         intelligence_run_id=row["intelligence_run_id"],
         is_mock=bool(row["is_mock"]),
         created_at=row["created_at"],
@@ -138,6 +152,85 @@ def _sorted_items(rows) -> List[AlignmentItemOut]:
         review_category=it.review_category, reason_code=it.reason_code, item_id=it.id,
     ))
     return items
+
+
+# --- Runtime Match Judge (Issue #290 Finding 5, Part 2) ------------------------
+
+
+def _run_runtime_match_judge(
+    conn, system_id: int, snapshot_id: int, config: LLMConfig, client, final_items: List[dict],
+) -> None:
+    """Semantic match/mismatch judge over items whose baseline is 'match'.
+
+    Mutates ``final_items`` in place, replacing each eligible item's
+    ``runtime_check`` with the judge's verdict (or ``None`` on judge
+    failure -- never falling back to the deterministic 'match' baseline it
+    was pre-filtered on). Stale/unobserved/environment-mismatch/no-mapping
+    items are untouched (never eligible in the first place).
+
+    Records exactly one ``intelligence_runs`` row
+    (``run_type='runtime_match'``) when there is at least one eligible item;
+    skips the LLM call and writes no row when there are none. ``client`` is
+    the SAME client already created for the alignment proposal above -- by
+    the time this runs, ``proposal.error is None`` already proved it is a
+    configured reasoning model (a mock/non-reasoning provider would have
+    failed the proposal step closed before any item reached this point).
+    """
+    eligible = [(i, it) for i, it in enumerate(final_items) if it.get("_judge_ctx") is not None]
+    if not eligible:
+        return
+
+    started_at = time.time()
+    try:
+        language = get_interview_language()
+    except ValueError as exc:
+        judge_error: Optional[str] = str(exc)
+        judge_items: Optional[list] = None
+    else:
+        judge_input_items = [
+            RuntimeMatchJudgeInputItem(
+                index=i,
+                claim=it["current_claim"],
+                component_id=it["_judge_ctx"]["component_id"],
+                call_count=it["_judge_ctx"]["call_count"],
+                error_rate=it["_judge_ctx"]["error_rate"],
+                duration_p50_ms=it["_judge_ctx"]["duration_p50_ms"],
+                duration_p90_ms=it["_judge_ctx"]["duration_p90_ms"],
+                duration_p99_ms=it["_judge_ctx"]["duration_p99_ms"],
+                freshness=it["_judge_ctx"]["freshness"],
+                environment=it["_judge_ctx"]["environment"],
+            )
+            for i, it in eligible
+        ]
+        judge_result = judge_runtime_match(client, config, judge_input_items, language=language)
+        judge_error = judge_result.error
+        judge_items = judge_result.items if judge_result.error is None else None
+
+    judge_status = "failed" if judge_error else "completed"
+    conn.execute(
+        """
+        INSERT INTO intelligence_runs
+            (system_id, snapshot_id, run_type, provider, model,
+             prompt_version, schema_version, decision_method, status,
+             error_details, is_mock, started_at, completed_at)
+        VALUES (?, ?, 'runtime_match', ?, ?, ?, ?, 'reasoning_llm', ?, ?, 0, ?, ?)
+        """,
+        (
+            system_id, snapshot_id, config.provider, config.model,
+            RUNTIME_MATCH_PROMPT_VERSION, RUNTIME_MATCH_SCHEMA_VERSION, judge_status,
+            judge_error, started_at, time.time(),
+        ),
+    )
+
+    if judge_items is not None:
+        by_index = {r.index: r.runtime_check for r in judge_items}
+        for i, it in eligible:
+            it["runtime_check"] = by_index.get(i)
+    else:
+        # Fail-closed: no semantic determination -- never guess, never fall
+        # back to the deterministic 'match' baseline.
+        for _i, it in eligible:
+            it["runtime_check"] = None
 
 
 # --- Build ---------------------------------------------------------------------
@@ -165,6 +258,14 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
     docstring for the rebuild-merge rule. Callers that want to treat a
     failure as non-fatal (the refresh job does, for the Alignment step
     specifically) must catch ``HTTPException`` themselves.
+
+    Once the proposal succeeds, ``_run_runtime_match_judge`` (Issue #290
+    Finding 5, Part 2) runs as a SEPARATE reasoning step over just the items
+    whose deterministic runtime baseline is 'match', recorded in its own
+    ``intelligence_runs`` row (``run_type='runtime_match'``); a judge
+    failure never fails this whole build (those items just persist
+    ``runtime_check=NULL``) since the Alignment proposal itself already
+    succeeded.
     """
     now = time.time()
     _get_session_or_404(conn, session_id, system_id)
@@ -271,28 +372,37 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
             # Issue #290: deterministic evidence -> component_id -> runtime
             # facts -> finite match state. None whenever no deterministic
             # mapping exists (ambiguous or no code_symbols component_id
-            # match) -- never guessed.
+            # match) -- never guessed. Finding 5: provenance now comes only
+            # from what was actually observed on traces (never the pinned
+            # snapshot/commit).
             runtime_check: Optional[str] = None
+            judge_ctx: Optional[Dict[str, object]] = None
             component_id = resolve_component_for_evidence(
                 conn, revision["snapshot_id"], valid_evidence,
             )
             if component_id is not None:
                 fact = aggregate_component_facts(conn, system_id, component_id)
-                provenance = build_provenance(
-                    fact, snapshot_id=revision["snapshot_id"], git_sha=snapshot_row["commit_sha"],
-                )
+                provenance = build_provenance(fact, conn=conn, system_id=system_id)
                 runtime_check = compare_claim_to_runtime(
                     item.current_claim, fact, provenance,
                     expected_environment=expected_environment,
                 )
+                if runtime_check == "match":
+                    # Finding 5 Part 2: only a fresh, structurally-clean
+                    # baseline is eligible for the semantic judge below --
+                    # stale/unobserved/environment-mismatch guards are never
+                    # second-guessed by the model (Principle 6).
+                    judge_ctx = {
+                        "component_id": component_id,
+                        "call_count": fact.call_count,
+                        "error_rate": fact.error_rate,
+                        "duration_p50_ms": fact.duration_p50_ms,
+                        "duration_p90_ms": fact.duration_p90_ms,
+                        "duration_p99_ms": fact.duration_p99_ms,
+                        "freshness": provenance.freshness,
+                        "environment": provenance.environment,
+                    }
 
-            review_category, reason_code = classify_alignment_item(
-                alignment_state=item.alignment_state,
-                risk_flags=item.risk_flags,
-                confidence=item.confidence,
-                intent_field=item.intent_field,
-                runtime_check=runtime_check,
-            )
             final_items.append({
                 "intent_item_id": intent_item_id_by_field.get(item.intent_field)
                     if item.intent_field else None,
@@ -307,15 +417,28 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
                 "alignment_state": item.alignment_state,
                 "risk_flags": item.risk_flags,
                 "confidence": item.confidence,
-                "review_category": review_category,
-                "reason_code": reason_code,
+                "intent_field": item.intent_field,
                 "runtime_check": runtime_check,
+                "_judge_ctx": judge_ctx,
             })
         if had_raw_items and not final_items:
             proposal = AlignmentProposalResult(
                 provider=proposal.provider, model=proposal.model, is_mock=proposal.is_mock,
                 error="Every proposed alignment item's evidence failed snapshot validation",
             )
+
+        if proposal.error is None:
+            _run_runtime_match_judge(conn, system_id, revision["snapshot_id"], config, client, final_items)
+            for it in final_items:
+                review_category, reason_code = classify_alignment_item(
+                    alignment_state=it["alignment_state"],
+                    risk_flags=it["risk_flags"],
+                    confidence=it["confidence"],
+                    intent_field=it["intent_field"],
+                    runtime_check=it["runtime_check"],
+                )
+                it["review_category"] = review_category
+                it["reason_code"] = reason_code
 
     run_status = "failed" if proposal.error else "completed"
     run_cur = conn.execute(
@@ -345,6 +468,24 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
             """DELETE FROM alignment_item
                WHERE session_id = ? AND system_id = ?
                  AND status = 'open' AND user_decision IS NULL""",
+            (session_id, system_id),
+        )
+        # Finding 4 fix: surviving TERMINAL rows (answered/corrected) become
+        # history the moment a fresh row for the same contrast point is
+        # about to be inserted. GET .../review-queue also filters on
+        # status/superseded directly (belt and braces), but marking these
+        # rows here is what lets a full-listing view (GET .../alignment)
+        # tell a stale answered/corrected row apart from a current one.
+        # held/inquiry rows are intentionally NOT marked superseded -- they
+        # are still in-flight and stay the current row (Principle 2's
+        # rebuild-must-never-lose-progress rule already preserves them
+        # untouched; this only adds the superseded label to the terminal
+        # ones).
+        conn.execute(
+            """UPDATE alignment_item
+               SET superseded = 1
+               WHERE session_id = ? AND system_id = ?
+                 AND status IN ('answered', 'corrected') AND superseded = 0""",
             (session_id, system_id),
         )
         for it in final_items:
@@ -439,13 +580,23 @@ def get_review_queue(
     system_id: int = Depends(get_system_id),
 ) -> AlignmentReviewQueueOut:
     """Only action-required items (must_review + batch_reviewable), ordered
-    deterministically by category rank, then reason-code rank, then id."""
+    deterministically by category rank, then reason-code rank, then id.
+
+    Finding 4 fix: a terminal-status row (answered/corrected) is history,
+    not an action card, even though its review_category was must_review/
+    batch_reviewable at creation time -- so it is excluded explicitly here,
+    not just left to whatever status the dashboard happens to filter on.
+    ``superseded = 0`` is belt-and-braces on top of that: today's flows
+    already ensure a superseded row is always terminal-status too, but a
+    superseded row must never surface as an action card regardless.
+    """
     with get_conn() as conn:
         _get_session_or_404(conn, session_id, system_id)
         placeholders = ",".join("?" for _ in _ACTIONABLE_CATEGORIES)
         rows = conn.execute(
             f"""SELECT * FROM alignment_item
-                WHERE session_id = ? AND system_id = ? AND review_category IN ({placeholders})""",
+                WHERE session_id = ? AND system_id = ? AND review_category IN ({placeholders})
+                  AND status NOT IN ('answered', 'corrected') AND superseded = 0""",
             (session_id, system_id, *_ACTIONABLE_CATEGORIES),
         ).fetchall()
         return AlignmentReviewQueueOut(

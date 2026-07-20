@@ -890,7 +890,7 @@ def _insert_code_symbol(system_id, snapshot_id, *, path, start_line, end_line, c
         )
 
 
-def _insert_trace(system_id, component_id, *, timestamp, error=None):
+def _insert_trace(system_id, component_id, *, timestamp, error=None, environment=None, git_sha=None):
     from app.db import get_conn
     import uuid
 
@@ -898,13 +898,46 @@ def _insert_trace(system_id, component_id, *, timestamp, error=None):
         conn.execute(
             """INSERT INTO traces
                 (system_id, trace_id, component_id, mode, input_json, output_text, error,
-                 duration_ms, timestamp)
-            VALUES (?, ?, ?, 'trace', '{}', 'ok', ?, 5.0, ?)""",
-            (system_id, str(uuid.uuid4()), component_id, error, timestamp),
+                 duration_ms, timestamp, environment, git_sha)
+            VALUES (?, ?, ?, 'trace', '{}', 'ok', ?, 5.0, ?, ?, ?)""",
+            (system_id, str(uuid.uuid4()), component_id, error, timestamp, environment, git_sha),
         )
 
 
+def _stub_runtime_match_judge(monkeypatch, *, verdicts=None, error=None, is_mock=False):
+    """Stub app/runtime_match_judge.judge_runtime_match as imported into
+    routes/interview_alignment.py, mirroring _stub_build's pattern.
+
+    ``verdicts`` maps the caller-assigned item ``index`` (position among the
+    items actually offered to the judge, i.e. only baseline-'match' items)
+    to a runtime_check ("match"/"mismatch"); items not present default to
+    "match". Pass ``error=`` to simulate a judge failure instead.
+    """
+    from app.routes import interview_alignment as alignment_routes
+    from app.runtime_match_judge import RuntimeMatchJudgeItemResult, RuntimeMatchJudgeResult
+
+    def fake_judge_runtime_match(client, config, items, *, language):
+        if error is not None:
+            return RuntimeMatchJudgeResult(
+                provider="anthropic", model="claude-sonnet-4-5", is_mock=False, error=error,
+            )
+        results = [
+            RuntimeMatchJudgeItemResult(
+                index=it.index, runtime_check=(verdicts or {}).get(it.index, "match"),
+            )
+            for it in items
+        ]
+        return RuntimeMatchJudgeResult(
+            provider="anthropic", model="claude-sonnet-4-5", is_mock=is_mock, items=results,
+        )
+
+    monkeypatch.setattr(alignment_routes, "judge_runtime_match", fake_judge_runtime_match)
+
+
 def test_build_sets_runtime_check_match_when_fresh_traces_exist(admin_client, tmp_path, monkeypatch):
+    """Deterministic baseline is 'match' (fresh, no environment conflict);
+    the Runtime Match Judge (Issue #290 Finding 5 Part 2) agrees, so the
+    persisted runtime_check stays 'match'."""
     token, system_id, snapshot_id = _setup(admin_client, tmp_path)
     headers = _headers(token, system_id)
     session_id = _create_session(admin_client, headers, snapshot_id)
@@ -915,6 +948,7 @@ def test_build_sets_runtime_check_match_when_fresh_traces_exist(admin_client, tm
     )
     _insert_trace(system_id, "src_a_fn", timestamp=time.time())
 
+    _stub_runtime_match_judge(monkeypatch)
     _stub_build(monkeypatch, items=[_proposal_item()])
     r = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers)
     assert r.status_code == 200, r.text
@@ -973,13 +1007,27 @@ def test_build_leaves_runtime_check_none_when_no_deterministic_component_mapping
 
 
 def test_build_static_vs_runtime_mismatch_forces_must_review(admin_client, tmp_path, monkeypatch):
-    """End-to-end through the real build pipeline: evidence maps to a
-    component deterministically, the fact/provenance's environment differs
-    from the System's declared environment (the one deterministic mismatch
-    signal, see app/runtime_alignment.py), and the resulting item lands in
-    must_review with reason_code=runtime_mismatch -- an aligned/confirmed
-    state that would otherwise be no_review_required."""
-    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    """End-to-end through the real build pipeline with REAL trace data
+    (Issue #290 Finding 5(a) regression -- previously only reachable by
+    monkeypatching build_provenance's output, since traces carried no
+    environment column): evidence maps to a component deterministically, a
+    real trace reports environment='staging' while the System declares
+    environment='production' (the one deterministic mismatch signal, see
+    app/runtime_alignment.py), and the resulting item lands in must_review
+    with reason_code=runtime_mismatch -- an aligned/confirmed state that
+    would otherwise be no_review_required. A deterministic env-mismatch
+    baseline is never sent to the Runtime Match Judge (Part 2), so no judge
+    stub is needed here."""
+    token = _login(admin_client)
+    r = admin_client.post(
+        "/systems",
+        json={"name": "System Prod", "environment": "production", "description": "d"},
+        headers=_bearer(token),
+    )
+    assert r.status_code == 201, r.text
+    system_id = r.json()["id"]
+    repo, sha = _init_repo(tmp_path, {"src/a.py": "\n".join(f"line{i}" for i in range(1, 21)) + "\n"})
+    snapshot_id = _insert_snapshot(system_id, repo, sha)
     headers = _headers(token, system_id)
     session_id = _create_session(admin_client, headers, snapshot_id)
     _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
@@ -987,28 +1035,7 @@ def test_build_static_vs_runtime_mismatch_forces_must_review(admin_client, tmp_p
     _insert_code_symbol(
         system_id, snapshot_id, path="src/a.py", start_line=1, end_line=20, component_id="src_a_fn",
     )
-    _insert_trace(system_id, "src_a_fn", timestamp=time.time())
-
-    # The System itself declares environment='test' (see _create_system);
-    # fabricate a differing fact-provenance environment to exercise the
-    # deterministic environment-mismatch branch through the real build path
-    # (today's traces table carries no environment column, so this is the
-    # only way to exercise it end-to-end -- see docs/project-intelligence.md
-    # Issue #290 section).
-    from app.models import RuntimeFactProvenanceOut
-    from app.routes import interview_alignment as alignment_routes
-
-    real_build_provenance = alignment_routes.build_provenance
-
-    def fake_build_provenance(fact, **kwargs):
-        prov = real_build_provenance(fact, **kwargs)
-        return RuntimeFactProvenanceOut(
-            environment="staging", first_observed_at=prov.first_observed_at,
-            last_observed_at=prov.last_observed_at, snapshot_ref=prov.snapshot_ref,
-            source=prov.source, freshness=prov.freshness,
-        )
-
-    monkeypatch.setattr(alignment_routes, "build_provenance", fake_build_provenance)
+    _insert_trace(system_id, "src_a_fn", timestamp=time.time(), environment="staging")
 
     _stub_build(monkeypatch, items=[
         _proposal_item(alignment_state="aligned", confidence="confirmed", risk_flags=[]),
@@ -1046,6 +1073,7 @@ def test_new_traces_update_runtime_check_on_rebuild(admin_client, tmp_path, monk
     # "Observation import": a new trace arrives for the mapped component.
     _insert_trace(system_id, "src_a_fn", timestamp=time.time())
 
+    _stub_runtime_match_judge(monkeypatch)
     _stub_build(monkeypatch, items=[_proposal_item(current_claim="対象クレーム")])
     second = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
     second_item = next(it for it in second["items"] if it["current_claim"] == "対象クレーム")
@@ -1053,6 +1081,116 @@ def test_new_traces_update_runtime_check_on_rebuild(admin_client, tmp_path, monk
     # Revision lineage: the rebuild is a new, independently-audited
     # intelligence_runs row -- never overwriting the first build's record.
     assert second_item["intelligence_run_id"] != first_run_id
+
+
+# --- Runtime Match Judge integration (Issue #290 Finding 5, Part 2) ------------
+
+
+def _latest_run(system_id, run_type):
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM intelligence_runs WHERE system_id = ? AND run_type = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (system_id, run_type),
+        ).fetchone()
+
+
+def test_judge_mismatch_verdict_forces_must_review(admin_client, tmp_path, monkeypatch):
+    """A deterministic 'match' baseline (fresh trace, no environment
+    conflict) is overridden by the judge's semantic 'mismatch' verdict --
+    the item lands in must_review/runtime_mismatch even though nothing
+    structural conflicts."""
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _insert_code_symbol(
+        system_id, snapshot_id, path="src/a.py", start_line=1, end_line=20, component_id="src_a_fn",
+    )
+    _insert_trace(system_id, "src_a_fn", timestamp=time.time())
+
+    _stub_runtime_match_judge(monkeypatch, verdicts={0: "mismatch"})
+    _stub_build(monkeypatch, items=[
+        _proposal_item(alignment_state="aligned", confidence="confirmed", risk_flags=[]),
+    ])
+    r = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers)
+    assert r.status_code == 200, r.text
+    item = r.json()["items"][0]
+    assert item["runtime_check"] == "mismatch"
+    assert item["review_category"] == "must_review"
+    assert item["reason_code"] == "runtime_mismatch"
+
+    run = _latest_run(system_id, "runtime_match")
+    assert run is not None
+    assert run["status"] == "completed"
+    assert run["decision_method"] == "reasoning_llm"
+    assert run["prompt_version"] == "runtime-match-v1"
+    assert run["schema_version"] == "runtime-match-v1"
+
+
+def test_judge_failure_persists_null_runtime_check_but_build_still_succeeds(
+    admin_client, tmp_path, monkeypatch,
+):
+    """A judge failure (LLM error / invalid structured output) must never
+    fall back to the deterministic 'match' baseline -- the item's
+    runtime_check is persisted NULL, a failed 'runtime_match' run is
+    recorded, and the overall build still succeeds (200, not 502) since the
+    Alignment proposal itself succeeded."""
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _insert_code_symbol(
+        system_id, snapshot_id, path="src/a.py", start_line=1, end_line=20, component_id="src_a_fn",
+    )
+    _insert_trace(system_id, "src_a_fn", timestamp=time.time())
+
+    _stub_runtime_match_judge(monkeypatch, error="Failed to parse structured response")
+    _stub_build(monkeypatch, items=[_proposal_item()])
+    r = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers)
+    assert r.status_code == 200, r.text
+    item = r.json()["items"][0]
+    assert item["runtime_check"] is None
+    # A None runtime_check does not itself force must_review -- the
+    # deterministic rule table only reacts to 'mismatch'.
+    assert item["reason_code"] != "runtime_mismatch"
+
+    run = _latest_run(system_id, "runtime_match")
+    assert run is not None
+    assert run["status"] == "failed"
+    assert run["error_details"] == "Failed to parse structured response"
+    assert run["decision_method"] == "reasoning_llm"
+
+
+def test_judge_never_called_for_stale_or_unobserved_items(admin_client, tmp_path, monkeypatch):
+    """Deterministic stale/unobserved baselines are never sent to the judge
+    (no eligible items -> no judge run row at all) and keep their
+    deterministic value verbatim."""
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _insert_code_symbol(
+        system_id, snapshot_id, path="src/a.py", start_line=1, end_line=20, component_id="src_a_fn",
+    )
+    # No traces inserted at all -- baseline is 'unobserved'.
+
+    def _fail_if_called(client, config, items, *, language):
+        raise AssertionError("judge_runtime_match must not be called for an unobserved baseline")
+
+    from app.routes import interview_alignment as alignment_routes
+
+    monkeypatch.setattr(alignment_routes, "judge_runtime_match", _fail_if_called)
+    _stub_build(monkeypatch, items=[_proposal_item()])
+    r = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["items"][0]["runtime_check"] == "unobserved"
+    assert _latest_run(system_id, "runtime_match") is None
 
 
 def test_system_isolation(admin_client, tmp_path, monkeypatch):
@@ -1069,3 +1207,282 @@ def test_system_isolation(admin_client, tmp_path, monkeypatch):
 
     r = admin_client.get(f"/interview/sessions/{session_a}/alignment", headers=headers_b)
     assert r.status_code == 404, r.text
+
+
+# --- Review finding 4: review-queue excludes terminal/superseded items -------
+#
+# Covers: answered/corrected items disappear from the Review Queue but stay
+# visible (as history) via the full GET .../alignment listing; held/inquiry
+# items remain actionable in the queue; a rebuild marks surviving terminal
+# rows superseded=1 while the fresh replacement row is superseded=0 and
+# appears exactly once; held/inquiry rows survive a rebuild with
+# superseded=0; System isolation and the additive-column migration/backfill.
+
+
+def _open_review_item_inquiry(admin_client, monkeypatch, session_id, item_id, headers):
+    """Open a real review_item Inquiry (mirrors
+    test_review_item_inquiry_round_trip_through_real_build's stubbing) so the
+    target alignment_item's status becomes 'inquiry'."""
+    from app.routes import interview_inquiry as inquiry_routes
+    from app.inquiry_answering import InquiryAnswerResult
+
+    def fake_create_llm_client(config):
+        return object()
+
+    def fake_generate_inquiry_answer(client, config, **kwargs):
+        return InquiryAnswerResult(
+            provider="anthropic", model="claude-sonnet-4-5", is_mock=False,
+            conclusion="確認します。", answerable=True,
+        )
+
+    monkeypatch.setattr(inquiry_routes, "create_llm_client", fake_create_llm_client)
+    monkeypatch.setattr(inquiry_routes, "generate_inquiry_answer", fake_generate_inquiry_answer)
+
+    r = admin_client.post(
+        f"/interview/sessions/{session_id}/inquiries",
+        json={"origin_kind": "review_item", "origin_id": item_id, "question_text": "根拠を確認したい"},
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["inquiry"]["id"]
+
+
+def test_answered_and_corrected_items_are_excluded_from_review_queue(admin_client, tmp_path, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _stub_build(monkeypatch, items=[
+        _proposal_item(current_claim="A: 回答される", risk_flags=["security"]),
+        _proposal_item(current_claim="B: 修正される", risk_flags=["security"]),
+    ])
+    built = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+    a_id = next(it["id"] for it in built["items"] if it["current_claim"] == "A: 回答される")
+    b_id = next(it["id"] for it in built["items"] if it["current_claim"] == "B: 修正される")
+
+    queue_before = admin_client.get(f"/interview/sessions/{session_id}/review-queue", headers=headers).json()
+    assert {it["id"] for it in queue_before["items"]} == {a_id, b_id}
+
+    admin_client.post(
+        f"/interview/alignment/{a_id}/answer", json={"decision": "accept_current"}, headers=headers,
+    )
+    admin_client.post(
+        f"/interview/alignment/{b_id}/correct",
+        json={"corrected_interpretation": "正しい解釈"}, headers=headers,
+    )
+
+    queue_after = admin_client.get(f"/interview/sessions/{session_id}/review-queue", headers=headers).json()
+    assert queue_after["items"] == []
+
+    # Still visible as history via the full listing, just not action cards.
+    listing = admin_client.get(f"/interview/sessions/{session_id}/alignment", headers=headers).json()
+    ids_in_listing = {it["id"] for cat in listing["items_by_category"].values() for it in cat}
+    assert {a_id, b_id} <= ids_in_listing
+
+
+def test_held_and_inquiry_items_remain_in_review_queue(admin_client, tmp_path, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _stub_build(monkeypatch, items=[
+        _proposal_item(current_claim="A: 保留される", risk_flags=["security"]),
+        _proposal_item(current_claim="B: 疑問がある", risk_flags=["security"]),
+    ])
+    built = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+    held_id = next(it["id"] for it in built["items"] if it["current_claim"] == "A: 保留される")
+    inquiry_item_id = next(it["id"] for it in built["items"] if it["current_claim"] == "B: 疑問がある")
+
+    admin_client.post(f"/interview/alignment/{held_id}/hold", headers=headers)
+    _open_review_item_inquiry(admin_client, monkeypatch, session_id, inquiry_item_id, headers)
+
+    queue = admin_client.get(f"/interview/sessions/{session_id}/review-queue", headers=headers).json()
+    by_id = {it["id"]: it for it in queue["items"]}
+    assert set(by_id) == {held_id, inquiry_item_id}
+    assert by_id[held_id]["status"] == "held"
+    assert by_id[held_id]["superseded"] is False
+    assert by_id[inquiry_item_id]["status"] == "inquiry"
+    assert by_id[inquiry_item_id]["superseded"] is False
+
+
+def test_rebuild_marks_terminal_rows_superseded_and_queue_shows_only_fresh_row(
+    admin_client, tmp_path, monkeypatch,
+):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _stub_build(monkeypatch, items=[
+        _proposal_item(current_claim="回答される項目", risk_flags=["security"]),
+        _proposal_item(current_claim="修正される項目", risk_flags=["security"]),
+    ])
+    first = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+    answered_id = next(it["id"] for it in first["items"] if it["current_claim"] == "回答される項目")
+    corrected_id = next(it["id"] for it in first["items"] if it["current_claim"] == "修正される項目")
+    assert all(it["superseded"] is False for it in first["items"])
+
+    admin_client.post(
+        f"/interview/alignment/{answered_id}/answer", json={"decision": "accept_current"}, headers=headers,
+    )
+    admin_client.post(
+        f"/interview/alignment/{corrected_id}/correct",
+        json={"corrected_interpretation": "修正しました"}, headers=headers,
+    )
+
+    _stub_build(monkeypatch, items=[_proposal_item(current_claim="新しい項目", risk_flags=["security"])])
+    second = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+
+    by_id = {it["id"]: it for it in second["items"]}
+    assert by_id[answered_id]["status"] == "answered"
+    assert by_id[answered_id]["superseded"] is True
+    assert by_id[corrected_id]["status"] == "corrected"
+    assert by_id[corrected_id]["superseded"] is True
+
+    new_items = [it for it in second["items"] if it["current_claim"] == "新しい項目"]
+    assert len(new_items) == 1
+    assert new_items[0]["status"] == "open"
+    assert new_items[0]["superseded"] is False
+
+    queue = admin_client.get(f"/interview/sessions/{session_id}/review-queue", headers=headers).json()
+    queue_ids = {it["id"] for it in queue["items"]}
+    assert answered_id not in queue_ids
+    assert corrected_id not in queue_ids
+    assert new_items[0]["id"] in queue_ids
+    assert len([i for i in queue_ids if i == new_items[0]["id"]]) == 1
+
+
+def test_rebuild_keeps_held_and_inquiry_rows_not_superseded(admin_client, tmp_path, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _stub_build(monkeypatch, items=[
+        _proposal_item(current_claim="保留される項目", risk_flags=["security"]),
+        _proposal_item(current_claim="疑問がある項目", risk_flags=["security"]),
+    ])
+    first = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+    held_id = next(it["id"] for it in first["items"] if it["current_claim"] == "保留される項目")
+    inquiry_item_id = next(it["id"] for it in first["items"] if it["current_claim"] == "疑問がある項目")
+
+    admin_client.post(f"/interview/alignment/{held_id}/hold", headers=headers)
+    _open_review_item_inquiry(admin_client, monkeypatch, session_id, inquiry_item_id, headers)
+
+    _stub_build(monkeypatch, items=[])
+    second = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+    by_id = {it["id"]: it for it in second["items"]}
+    assert by_id[held_id]["status"] == "held"
+    assert by_id[held_id]["superseded"] is False
+    assert by_id[inquiry_item_id]["status"] == "inquiry"
+    assert by_id[inquiry_item_id]["superseded"] is False
+
+
+def test_system_isolation_for_superseded_column(admin_client, tmp_path, monkeypatch):
+    """A rebuild's superseded marking must never cross a System boundary."""
+    from app.db import get_conn
+
+    token, system_a, snapshot_a = _setup(admin_client, tmp_path, name="System A3")
+    headers_a = _headers(token, system_a)
+    session_a = _create_session(admin_client, headers_a, snapshot_a)
+    _insert_revision(session_a, system_a, snapshot_a, current_understanding={})
+
+    system_b = _create_system(admin_client, token, "System B3")["id"]
+    headers_b = _headers(token, system_b)
+    with get_conn() as conn:
+        snap_row = conn.execute(
+            "SELECT repo_path, commit_sha FROM repository_snapshots WHERE id = ?", (snapshot_a,),
+        ).fetchone()
+    snapshot_b = _insert_snapshot(system_b, snap_row["repo_path"], snap_row["commit_sha"])
+    session_b = _create_session(admin_client, headers_b, snapshot_b)
+    _insert_revision(session_b, system_b, snapshot_b, current_understanding={})
+
+    _stub_build(monkeypatch, items=[_proposal_item(current_claim="共通クレーム", risk_flags=["security"])])
+    built_a = admin_client.post(f"/interview/sessions/{session_a}/alignment/build", headers=headers_a).json()
+    built_b = admin_client.post(f"/interview/sessions/{session_b}/alignment/build", headers=headers_b).json()
+    a_item_id = built_a["items"][0]["id"]
+    b_item_id = built_b["items"][0]["id"]
+
+    admin_client.post(
+        f"/interview/alignment/{a_item_id}/answer", json={"decision": "accept_current"}, headers=headers_a,
+    )
+
+    # Rebuild only System A -- System B's answered-equivalent row must be
+    # untouched (it wasn't even answered, so this also indirectly proves the
+    # UPDATE ... WHERE system_id=? scoping in run_alignment_build).
+    _stub_build(monkeypatch, items=[_proposal_item(current_claim="新しいクレームA", risk_flags=["security"])])
+    admin_client.post(f"/interview/sessions/{session_a}/alignment/build", headers=headers_a)
+
+    listing_a = admin_client.get(f"/interview/sessions/{session_a}/alignment", headers=headers_a).json()
+    a_item = next(it for cat in listing_a["items_by_category"].values() for it in cat if it["id"] == a_item_id)
+    assert a_item["superseded"] is True
+
+    listing_b = admin_client.get(f"/interview/sessions/{session_b}/alignment", headers=headers_b).json()
+    b_item = next(it for cat in listing_b["items_by_category"].values() for it in cat if it["id"] == b_item_id)
+    assert b_item["status"] == "open"
+    assert b_item["superseded"] is False
+
+
+def test_superseded_column_migration_backfills_existing_rows_to_zero(tmp_path, monkeypatch):
+    """A pre-Finding-4 database (no ``superseded`` column) gains it via
+    ALTER TABLE and existing rows backfill to 0 -- mirroring this repo's
+    established additive-column migration pattern (see e.g.
+    test_replay_capture_api.py's Phase A migration test)."""
+    import sqlite3
+
+    db_path = tmp_path / "pre-finding4.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE alignment_item (
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id              INTEGER NOT NULL,
+            system_id               INTEGER NOT NULL,
+            revision_id             INTEGER,
+            snapshot_id             INTEGER NOT NULL,
+            intent_item_id          INTEGER,
+            intent_summary          TEXT,
+            current_claim           TEXT NOT NULL,
+            current_evidence        TEXT NOT NULL DEFAULT '[]',
+            gap_summary             TEXT,
+            proposed_interpretation TEXT,
+            alignment_state         TEXT NOT NULL,
+            risk_flags              TEXT NOT NULL DEFAULT '[]',
+            confidence              TEXT NOT NULL,
+            review_category         TEXT NOT NULL,
+            reason_code             TEXT NOT NULL,
+            user_reason             TEXT NOT NULL,
+            status                  TEXT NOT NULL DEFAULT 'open',
+            user_decision           TEXT,
+            intelligence_run_id     INTEGER NOT NULL,
+            is_mock                 INTEGER NOT NULL DEFAULT 0,
+            created_at              REAL NOT NULL,
+            updated_at              REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """INSERT INTO alignment_item
+            (id, session_id, system_id, snapshot_id, current_claim,
+             alignment_state, confidence, review_category, reason_code,
+             user_reason, intelligence_run_id, created_at, updated_at)
+        VALUES (1, 1, 1, 1, '既存の項目', 'gap', 'likely',
+                'batch_reviewable', 'routine_update', '既存の理由', 1, ?, ?)""",
+        (time.time(), time.time()),
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("PROBE_DB_PATH", str(db_path))
+    from app.main import app
+
+    with TestClient(app):
+        check = sqlite3.connect(db_path)
+        check.row_factory = sqlite3.Row
+        cols = {r["name"] for r in check.execute("PRAGMA table_info(alignment_item)")}
+        assert "superseded" in cols
+        row = check.execute("SELECT * FROM alignment_item WHERE id = 1").fetchone()
+        assert row["superseded"] == 0
+        check.close()
