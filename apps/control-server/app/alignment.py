@@ -54,6 +54,7 @@ probe-agent:
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
@@ -79,7 +80,7 @@ REVIEW_CATEGORIES = (
 REASON_CODES = (
     "security_related", "high_risk", "core_intent", "conflict_detected",
     "low_confidence", "runtime_mismatch", "routine_update", "no_change",
-    "informational_only",
+    "informational_only", "unchanged_since_confirmation",
 )
 
 _CATEGORY_RANK: Dict[str, int] = {name: i for i, name in enumerate(REVIEW_CATEGORIES)}
@@ -98,6 +99,7 @@ USER_REASON_TEMPLATES: Dict[str, str] = {
     "routine_update": "軽微な差分です。まとめて確認してください",
     "no_change": "意図と現状の理解は一致しています。対応は不要です",
     "informational_only": "参考情報です。対応は不要です",
+    "unchanged_since_confirmation": "前回の確認から内容に変更はありません。対応は不要です",
 }
 
 
@@ -183,6 +185,61 @@ def review_sort_key(*, review_category: str, reason_code: str, item_id: int) -> 
     No numeric score multiplication, no LLM-provided ordering (Principle 6).
     """
     return (_CATEGORY_RANK[review_category], _REASON_RANK[reason_code], item_id)
+
+
+# --- Deterministic content hash for unchanged-item carry-over (Issue #295) --
+#
+# ``unchanged`` (Issue #287's reserved-but-unreachable review_category) is
+# realized here: a rebuild that produces an item whose content_hash exactly
+# matches a terminal (answered/corrected, non-superseded) row from the
+# immediately preceding build carries that row's identity forward instead of
+# re-running it through ``classify_alignment_item``'s rule table. This is an
+# EXACT structural match, never a similarity/heuristic comparison (Principle
+# 6) -- a single differing character anywhere in the hashed payload produces
+# a completely different hash and the item is reclassified normally.
+#
+# The hashed payload is current_claim + normalized evidence (the item's
+# "content", per the Issue #295 brief) plus every field that feeds
+# classify_alignment_item's rule table (alignment_state / risk_flags /
+# confidence / intent_field / runtime_check), so a change in
+# classification-relevant state can never be masked as "unchanged" even when
+# the claim text itself happens to repeat verbatim.
+
+
+def compute_content_hash(
+    *,
+    current_claim: str,
+    current_evidence: List[Dict[str, object]],
+    alignment_state: str,
+    risk_flags: List[str],
+    confidence: str,
+    intent_field: Optional[str],
+    runtime_check: Optional[str],
+) -> str:
+    """Deterministic sha256 over one alignment item's identity-bearing fields."""
+    normalized_evidence = sorted(
+        (
+            {
+                "path": e.get("path"),
+                "start_line": e.get("start_line"),
+                "end_line": e.get("end_line"),
+                "summary": e.get("summary", ""),
+            }
+            for e in current_evidence
+        ),
+        key=lambda e: (e["path"], e["start_line"], e["end_line"], e["summary"]),
+    )
+    payload = {
+        "current_claim": current_claim,
+        "current_evidence": normalized_evidence,
+        "alignment_state": alignment_state,
+        "risk_flags": sorted(risk_flags),
+        "confidence": confidence,
+        "intent_field": intent_field,
+        "runtime_check": runtime_check,
+    }
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 # --- Raw LLM response schema (what we require the model to return) ----------

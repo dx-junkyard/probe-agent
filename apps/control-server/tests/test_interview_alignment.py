@@ -43,6 +43,7 @@ from app.alignment import (
     AlignmentProposalItem,
     AlignmentProposalResult,
     classify_alignment_item,
+    compute_content_hash,
     generate_alignment_proposal,
     review_sort_key,
     user_reason_for,
@@ -163,6 +164,66 @@ def test_user_reason_templates_cover_every_reason_code():
         assert isinstance(user_reason_for(reason_code), str)
         assert user_reason_for(reason_code)
     assert set(USER_REASON_TEMPLATES) == set(REASON_CODES)
+
+
+# --- Unit tests: compute_content_hash (Issue #295 unchanged carry-over) -----
+
+
+def _hash_kwargs(**overrides):
+    base = dict(
+        current_claim="クレーム",
+        current_evidence=[{"path": "src/a.py", "start_line": 1, "end_line": 3, "summary": "s"}],
+        alignment_state="gap",
+        risk_flags=["security"],
+        confidence="likely",
+        intent_field="pain",
+        runtime_check=None,
+    )
+    base.update(overrides)
+    return base
+
+
+def test_compute_content_hash_is_deterministic():
+    kwargs = _hash_kwargs()
+    assert compute_content_hash(**kwargs) == compute_content_hash(**kwargs)
+
+
+def test_compute_content_hash_ignores_evidence_order():
+    e1 = {"path": "src/a.py", "start_line": 1, "end_line": 3, "summary": "s"}
+    e2 = {"path": "src/b.py", "start_line": 4, "end_line": 5, "summary": "t"}
+    h1 = compute_content_hash(**_hash_kwargs(current_evidence=[e1, e2]))
+    h2 = compute_content_hash(**_hash_kwargs(current_evidence=[e2, e1]))
+    assert h1 == h2
+
+
+def test_compute_content_hash_ignores_risk_flag_order():
+    h1 = compute_content_hash(**_hash_kwargs(risk_flags=["security", "high_risk"]))
+    h2 = compute_content_hash(**_hash_kwargs(risk_flags=["high_risk", "security"]))
+    assert h1 == h2
+
+
+@pytest.mark.parametrize("field,value", [
+    ("current_claim", "別のクレーム"),
+    ("alignment_state", "aligned"),
+    ("confidence", "confirmed"),
+    ("intent_field", "goal"),
+    ("runtime_check", "mismatch"),
+    ("risk_flags", ["high_risk"]),
+])
+def test_compute_content_hash_changes_when_any_classification_input_changes(field, value):
+    """Every field that feeds classify_alignment_item's rule table, plus the
+    claim text itself, must be part of the hash -- a change in any of them
+    must never be silently masked as 'unchanged' (Issue #295 brief)."""
+    base = compute_content_hash(**_hash_kwargs())
+    changed = compute_content_hash(**_hash_kwargs(**{field: value}))
+    assert base != changed
+
+
+def test_compute_content_hash_changes_on_evidence_diff():
+    base = compute_content_hash(**_hash_kwargs())
+    changed_evidence = [{"path": "src/a.py", "start_line": 1, "end_line": 4, "summary": "s"}]
+    changed = compute_content_hash(**_hash_kwargs(current_evidence=changed_evidence))
+    assert base != changed
 
 
 # --- Unit tests: review_sort_key (fixed fixture ordering contract) ----------
@@ -454,6 +515,24 @@ def _insert_revision(session_id, system_id, snapshot_id, *, current_understandin
                 json.dumps(gap_analysis) if gap_analysis is not None else None,
                 now,
             ),
+        )
+        return cur.lastrowid
+
+
+def _insert_intent_item(session_id, system_id, *, field, value_text="value", status="confirmed", created_at=None):
+    """Insert an Intent Brief row directly with explicit timestamp control,
+    so tests can place a 'goal' decision precisely before/after a given
+    alignment build (Issue #295's goal-change-blocks-carryover rule)."""
+    from app.db import get_conn
+
+    now = created_at if created_at is not None else time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO interview_intent_item
+                (session_id, system_id, field, value_text, status, origin,
+                 decision_method, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 'user', 'manual', ?, ?)""",
+            (session_id, system_id, field, value_text, status, now, now),
         )
         return cur.lastrowid
 
@@ -1378,6 +1457,209 @@ def test_rebuild_keeps_held_and_inquiry_rows_not_superseded(admin_client, tmp_pa
     assert by_id[held_id]["superseded"] is False
     assert by_id[inquiry_item_id]["status"] == "inquiry"
     assert by_id[inquiry_item_id]["superseded"] is False
+
+
+# --- Unchanged-item carry-over (Issue #295) ----------------------------------
+
+
+def test_unchanged_item_carried_over_and_excluded_from_review_queue(admin_client, tmp_path, monkeypatch):
+    """A rebuild that reproposes byte-identical content for an already
+    answered item marks the fresh replacement row 'unchanged' and records
+    which prior row it was carried over from, and that fresh row never
+    appears in the actionable Review Queue (must_review/batch_reviewable)."""
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _stub_build(monkeypatch, items=[_proposal_item(current_claim="変わらない項目", risk_flags=["security"])])
+    first = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+    item_id = first["items"][0]["id"]
+    assert first["items"][0]["content_hash"]
+    assert first["items"][0]["carried_over_from"] is None
+
+    answer = admin_client.post(
+        f"/interview/alignment/{item_id}/answer", json={"decision": "accept_current"}, headers=headers,
+    )
+    assert answer.status_code == 200, answer.text
+
+    # Second build reproposes the exact same content (claim + evidence +
+    # every classification-relevant field unchanged).
+    _stub_build(monkeypatch, items=[_proposal_item(current_claim="変わらない項目", risk_flags=["security"])])
+    second = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+
+    unchanged = [it for it in second["items"] if it["review_category"] == "unchanged"]
+    assert len(unchanged) == 1
+    assert unchanged[0]["reason_code"] == "unchanged_since_confirmation"
+    assert unchanged[0]["carried_over_from"] == item_id
+    assert unchanged[0]["current_claim"] == "変わらない項目"
+    assert unchanged[0]["status"] == "open"
+    assert unchanged[0]["id"] != item_id
+
+    listing = admin_client.get(f"/interview/sessions/{session_id}/alignment", headers=headers).json()
+    assert listing["counts"]["unchanged"] == 1
+    assert len(listing["items_by_category"]["unchanged"]) == 1
+
+    queue = admin_client.get(f"/interview/sessions/{session_id}/review-queue", headers=headers).json()
+    queue_ids = {it["id"] for it in queue["items"]}
+    assert unchanged[0]["id"] not in queue_ids
+
+
+def test_changed_item_content_is_not_carried_over(admin_client, tmp_path, monkeypatch):
+    """A changed classification-relevant field (alignment_state here) must
+    produce a different content_hash, so the item goes through normal
+    classification instead of being marked 'unchanged'."""
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _stub_build(monkeypatch, items=[
+        _proposal_item(current_claim="最初の内容", alignment_state="gap", confidence="likely"),
+    ])
+    first = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+    item_id = first["items"][0]["id"]
+    admin_client.post(
+        f"/interview/alignment/{item_id}/answer", json={"decision": "accept_current"}, headers=headers,
+    )
+
+    # Same claim text, but the current-system understanding of it has
+    # genuinely changed (now aligned instead of a gap) -- must not carry over.
+    _stub_build(monkeypatch, items=[
+        _proposal_item(current_claim="最初の内容", alignment_state="aligned", confidence="confirmed"),
+    ])
+    second = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+
+    fresh = next(it for it in second["items"] if it["id"] != item_id)
+    assert fresh["review_category"] == "no_review_required"
+    assert fresh["reason_code"] == "no_change"
+    assert fresh["carried_over_from"] is None
+
+
+def test_goal_change_in_batch_blocks_unchanged_carryover(admin_client, tmp_path, monkeypatch):
+    """When the batch that triggers a rebuild includes a decision on the
+    'goal' Intent Brief field, this rebuild must reclassify every item
+    through the normal rule table -- never carry anything over, even if an
+    item's content is otherwise byte-identical to a prior answered row."""
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _stub_build(monkeypatch, items=[_proposal_item(current_claim="変わらない項目", risk_flags=["security"])])
+    first = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+    item_id = first["items"][0]["id"]
+    admin_client.post(
+        f"/interview/alignment/{item_id}/answer", json={"decision": "accept_current"}, headers=headers,
+    )
+
+    # A goal decision lands strictly after the first build's timestamp,
+    # simulating "this rebuild's triggering batch included a goal answer".
+    _insert_intent_item(
+        session_id, system_id, field="goal", value_text="新しい目標", created_at=time.time() + 1,
+    )
+
+    _stub_build(monkeypatch, items=[_proposal_item(current_claim="変わらない項目", risk_flags=["security"])])
+    second = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+
+    fresh = next(it for it in second["items"] if it["id"] != item_id)
+    assert fresh["review_category"] != "unchanged"
+    assert fresh["review_category"] == "must_review"
+    assert fresh["reason_code"] == "security_related"
+    assert fresh["carried_over_from"] is None
+
+
+def test_goal_unchanged_since_last_build_still_allows_carryover(admin_client, tmp_path, monkeypatch):
+    """A confirmed 'goal' item that predates the prior build (i.e. the
+    triggering batch did NOT touch goal) must not block carry-over -- the
+    guard is specific to goal changing IN this batch, not to goal simply
+    existing."""
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    # Goal confirmed well before the first alignment build.
+    _insert_intent_item(
+        session_id, system_id, field="goal", value_text="既存の目標", created_at=time.time() - 100,
+    )
+
+    _stub_build(monkeypatch, items=[_proposal_item(current_claim="変わらない項目", risk_flags=["security"])])
+    first = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+    item_id = first["items"][0]["id"]
+    admin_client.post(
+        f"/interview/alignment/{item_id}/answer", json={"decision": "accept_current"}, headers=headers,
+    )
+
+    _stub_build(monkeypatch, items=[_proposal_item(current_claim="変わらない項目", risk_flags=["security"])])
+    second = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+
+    fresh = next(it for it in second["items"] if it["id"] != item_id)
+    assert fresh["review_category"] == "unchanged"
+    assert fresh["carried_over_from"] == item_id
+
+
+def test_content_hash_columns_migration_backfills_existing_rows_to_null(tmp_path, monkeypatch):
+    """A pre-Issue-#295 database (no content_hash/carried_over_from columns)
+    gains them via ALTER TABLE and existing rows backfill to NULL -- same
+    additive-column migration pattern as the 'superseded' column above."""
+    import sqlite3
+
+    db_path = tmp_path / "pre-295.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE alignment_item (
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id              INTEGER NOT NULL,
+            system_id               INTEGER NOT NULL,
+            revision_id             INTEGER,
+            snapshot_id             INTEGER NOT NULL,
+            intent_item_id          INTEGER,
+            intent_summary          TEXT,
+            current_claim           TEXT NOT NULL,
+            current_evidence        TEXT NOT NULL DEFAULT '[]',
+            gap_summary             TEXT,
+            proposed_interpretation TEXT,
+            alignment_state         TEXT NOT NULL,
+            risk_flags              TEXT NOT NULL DEFAULT '[]',
+            confidence              TEXT NOT NULL,
+            review_category         TEXT NOT NULL,
+            reason_code             TEXT NOT NULL,
+            user_reason             TEXT NOT NULL,
+            status                  TEXT NOT NULL DEFAULT 'open',
+            user_decision           TEXT,
+            intelligence_run_id     INTEGER NOT NULL,
+            is_mock                 INTEGER NOT NULL DEFAULT 0,
+            created_at              REAL NOT NULL,
+            updated_at              REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """INSERT INTO alignment_item
+            (id, session_id, system_id, snapshot_id, current_claim,
+             alignment_state, confidence, review_category, reason_code,
+             user_reason, intelligence_run_id, created_at, updated_at)
+        VALUES (1, 1, 1, 1, '既存の項目', 'gap', 'likely',
+                'batch_reviewable', 'routine_update', '既存の理由', 1, ?, ?)""",
+        (time.time(), time.time()),
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("PROBE_DB_PATH", str(db_path))
+    from app.main import app
+
+    with TestClient(app):
+        check = sqlite3.connect(db_path)
+        check.row_factory = sqlite3.Row
+        cols = {r["name"] for r in check.execute("PRAGMA table_info(alignment_item)")}
+        assert "content_hash" in cols
+        assert "carried_over_from" in cols
+        row = check.execute("SELECT * FROM alignment_item WHERE id = 1").fetchone()
+        assert row["content_hash"] is None
+        assert row["carried_over_from"] is None
 
 
 def test_system_isolation_for_superseded_column(admin_client, tmp_path, monkeypatch):

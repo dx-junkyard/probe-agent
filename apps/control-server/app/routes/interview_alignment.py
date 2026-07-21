@@ -57,6 +57,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from ..alignment import (
     AlignmentProposalResult,
     classify_alignment_item,
+    compute_content_hash,
     generate_alignment_proposal,
     review_sort_key,
     user_reason_for,
@@ -139,6 +140,8 @@ def _item_out(row) -> AlignmentItemOut:
         user_decision=AlignmentUserDecisionOut(**user_decision) if user_decision else None,
         handoff_id=row["handoff_id"] if "handoff_id" in row.keys() else None,
         superseded=bool(row["superseded"]) if "superseded" in row.keys() else False,
+        content_hash=row["content_hash"] if "content_hash" in row.keys() else None,
+        carried_over_from=row["carried_over_from"] if "carried_over_from" in row.keys() else None,
         intelligence_run_id=row["intelligence_run_id"],
         is_mock=bool(row["is_mock"]),
         created_at=row["created_at"],
@@ -429,16 +432,88 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
 
         if proposal.error is None:
             _run_runtime_match_judge(conn, system_id, revision["snapshot_id"], config, client, final_items)
+
+            # Issue #295: unchanged-item carry-over. carry_candidates maps a
+            # terminal (answered/corrected, non-superseded) row's
+            # content_hash from the immediately preceding build to that
+            # row's id -- the only rows a fresh item may ever carry over
+            # from. Read before this build's own DELETE/UPDATE/INSERT touch
+            # the table (the write transaction is still below).
+            carry_rows = conn.execute(
+                """SELECT id, content_hash FROM alignment_item
+                   WHERE session_id = ? AND system_id = ?
+                     AND status IN ('answered', 'corrected') AND superseded = 0
+                     AND content_hash IS NOT NULL
+                   ORDER BY id""",
+                (session_id, system_id),
+            ).fetchall()
+            carry_candidates: Dict[str, int] = {}
+            for r in carry_rows:
+                carry_candidates.setdefault(r["content_hash"], r["id"])
+
+            # A rebuild triggered by a batch that confirmed/corrected/
+            # declined the 'goal' Intent Brief field never carries anything
+            # over -- goal is the System's core intent (the rule table
+            # itself already special-cases it via core_intent), so a goal
+            # change means every item must be reclassified fresh.
+            # interview_refresh.py's trigger_kind alone cannot tell us this:
+            # a batch's later triggers can be swallowed into an
+            # already-'pending' job created by an earlier, different
+            # trigger_kind (see interview_refresh._enqueue's dedupe), so the
+            # job that actually runs may carry a trigger_kind of
+            # 'qa_answer' even though the same batch also confirmed goal.
+            # Instead, compare the current (non-superseded, decided) 'goal'
+            # item's updated_at against the immediately preceding build's
+            # timestamp -- every row from one build shares exactly one
+            # created_at (the build's completed_at, see the INSERT below),
+            # so MAX(created_at) over existing rows is exactly that moment.
+            previous_build_row = conn.execute(
+                "SELECT MAX(created_at) AS ts FROM alignment_item WHERE session_id = ? AND system_id = ?",
+                (session_id, system_id),
+            ).fetchone()
+            previous_build_at = previous_build_row["ts"] if previous_build_row else None
+            goal_row = conn.execute(
+                """SELECT updated_at FROM interview_intent_item
+                   WHERE session_id = ? AND system_id = ? AND field = 'goal'
+                     AND superseded_by_id IS NULL AND status IN ('confirmed', 'not_applicable')
+                   ORDER BY id DESC LIMIT 1""",
+                (session_id, system_id),
+            ).fetchone()
+            goal_changed_since_last_build = bool(
+                previous_build_at is not None
+                and goal_row is not None
+                and goal_row["updated_at"] > previous_build_at
+            )
+
             for it in final_items:
-                review_category, reason_code = classify_alignment_item(
+                it["content_hash"] = compute_content_hash(
+                    current_claim=it["current_claim"],
+                    current_evidence=it["current_evidence"],
                     alignment_state=it["alignment_state"],
                     risk_flags=it["risk_flags"],
                     confidence=it["confidence"],
                     intent_field=it["intent_field"],
                     runtime_check=it["runtime_check"],
                 )
-                it["review_category"] = review_category
-                it["reason_code"] = reason_code
+                carried_from = (
+                    None if goal_changed_since_last_build
+                    else carry_candidates.get(it["content_hash"])
+                )
+                if carried_from is not None:
+                    it["review_category"] = "unchanged"
+                    it["reason_code"] = "unchanged_since_confirmation"
+                    it["carried_over_from"] = carried_from
+                else:
+                    review_category, reason_code = classify_alignment_item(
+                        alignment_state=it["alignment_state"],
+                        risk_flags=it["risk_flags"],
+                        confidence=it["confidence"],
+                        intent_field=it["intent_field"],
+                        runtime_check=it["runtime_check"],
+                    )
+                    it["review_category"] = review_category
+                    it["reason_code"] = reason_code
+                    it["carried_over_from"] = None
 
     run_status = "failed" if proposal.error else "completed"
     run_cur = conn.execute(
@@ -496,16 +571,18 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
                      intent_summary, current_claim, current_evidence, gap_summary,
                      proposed_interpretation, alignment_state, risk_flags, confidence,
                      review_category, reason_code, user_reason, runtime_check, status,
-                     user_decision, intelligence_run_id, is_mock, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?, ?, ?)""",
+                     user_decision, content_hash, carried_over_from,
+                     intelligence_run_id, is_mock, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id, system_id, revision["id"], revision["snapshot_id"],
                     it["intent_item_id"], it["intent_summary"], it["current_claim"],
                     json.dumps(it["current_evidence"], ensure_ascii=False),
                     it["gap_summary"], it["proposed_interpretation"], it["alignment_state"],
                     json.dumps(it["risk_flags"]), it["confidence"], it["review_category"],
-                    reason_code, user_reason_for(reason_code), it["runtime_check"], run_id,
-                    1 if proposal.is_mock else 0, completed_at, completed_at,
+                    reason_code, user_reason_for(reason_code), it["runtime_check"],
+                    it["content_hash"], it["carried_over_from"],
+                    run_id, 1 if proposal.is_mock else 0, completed_at, completed_at,
                 ),
             )
         conn.execute("COMMIT")

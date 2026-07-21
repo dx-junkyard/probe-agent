@@ -3233,7 +3233,7 @@ AlignmentReviewCategory = Literal[
 AlignmentReasonCode = Literal[
     "security_related", "high_risk", "core_intent", "conflict_detected",
     "low_confidence", "runtime_mismatch", "routine_update", "no_change",
-    "informational_only",
+    "informational_only", "unchanged_since_confirmation",
 ]
 # Item-level user progress. 'inquiry' is set while an Inquiry
 # (origin_kind='review_item') is open on this item, and reset to 'open'
@@ -3301,6 +3301,16 @@ class AlignmentItemOut(BaseModel):
     # GET .../review-queue. Additive column; defaults False so pre-migration
     # rows and any DB row missing the column still validate.
     superseded: bool = False
+    # Issue #295: realizes Issue #287's reserved 'unchanged' review_category.
+    # content_hash is the deterministic sha256 (app/alignment.py's
+    # compute_content_hash) over this item's identity-bearing fields, set on
+    # every build; NULL only for rows written before this migration.
+    # carried_over_from is the id of the immediately-preceding build's
+    # terminal (answered/corrected) row this item's content exactly matched,
+    # set only when review_category == 'unchanged'; NULL otherwise
+    # (audit-only -- never a live FK join for decision-making).
+    content_hash: Optional[str] = None
+    carried_over_from: Optional[int] = None
     intelligence_run_id: int
     is_mock: bool = False
     created_at: float
