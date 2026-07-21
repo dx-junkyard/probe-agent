@@ -15,6 +15,28 @@
 // 「疑問がある」は既存の InquiryPanel を origin_kind='review_item' で再利
 // 用する(#285)。Inquiry が開いている間はサーバー側で該当 alignment_item
 // の status が 'inquiry' になり、回答/修正/保留アクションは無効化される。
+//
+// Issue #295 (ST-2, Review Queue UI) の追加:
+// - パネル上部にカテゴリ別件数サマリを表示する(§4.1)。5カテゴリを固定
+//   の表示順で扱い、応答に無いカテゴリ(例: unchanged がまだ実体化して
+//   いない場合)は 0件として表示する — 応答のカテゴリ有無に依存しない
+//   汎用実装。
+// - must_review/batch_reviewable カードの「回答する」に、ローカルに選択
+//   を保留してから「まとめて送信」で一括送信する任意モードを追加した
+//   (§4.1)。既定はオフで、従来どおり選択即送信の個別モードのまま動く。
+//   一括送信は既存の /answer エンドポイントを項目ごとに順次呼ぶだけで、
+//   新しい一括APIは追加しない(#288 の refresh dedup がまとめて1回の再
+//   ビルドに集約する)。
+// - no_review_required/unchanged/informational の行に監査詳細の展開ト
+//   グルを追加した(§5.3)。応答に存在するフィールドだけを表示し、まだ
+//   存在しない carried_over_from 等は防御的に optional として扱う。
+// - no_review_required/informational のうち id 昇順で先頭3件を超える場
+//   合に、決定的に選んだ3件を「サンプル確認」として展開済み+疑問導線つ
+//   きで提示する(§5.4)。乱数は使わない。
+// - EvidenceList は、alignment_state が conflict / risk_flags に高リス
+//   ク相当(security・high_risk)が含まれる / runtime_check が
+//   mismatch・stale / evidence が1件のみ、のいずれかに該当する場合は初
+//   期表示で展開する(§4.4)。
 
 import { useState } from "react";
 import { toast } from "sonner";
@@ -36,8 +58,10 @@ import {
   useReviewQueue,
 } from "@/api/hooks";
 import type {
+  AlignmentConfidence,
   AlignmentDecisionAction,
   AlignmentItemOut,
+  AlignmentReviewCategory,
   AlignmentRiskFlag,
   AlignmentState,
   InterviewInquiryOut,
@@ -67,6 +91,17 @@ function riskFlagLabel(flag: string): string {
   return RISK_FLAG_LABELS[flag as AlignmentRiskFlag] ?? flag;
 }
 
+const CONFIDENCE_LABELS: Record<AlignmentConfidence, string> = {
+  confirmed: "確定",
+  likely: "ほぼ確実",
+  uncertain: "不確か",
+  conflicting: "食い違いあり",
+};
+
+function confidenceLabel(confidence: string): string {
+  return CONFIDENCE_LABELS[confidence as AlignmentConfidence] ?? "不明";
+}
+
 const DECISION_LABELS: Record<AlignmentDecisionAction, string> = {
   accept_current: "現状でよい",
   needs_change: "変更が必要",
@@ -91,8 +126,37 @@ function statusBadgeVariant(status: string): BadgeVariant {
   return "outline";
 }
 
+// §4.1: fixed display order for the category summary. Counts default to 0
+// for any category absent from the server's `counts` map (e.g. `unchanged`
+// before it is fully wired server-side) so this stays generic regardless of
+// which categories the backend currently emits.
+const CATEGORY_SUMMARY: { key: AlignmentReviewCategory; label: string }[] = [
+  { key: "must_review", label: "要確認" },
+  { key: "batch_reviewable", label: "一括レビュー可" },
+  { key: "no_review_required", label: "確認不要" },
+  { key: "unchanged", label: "前回から変更なし" },
+  { key: "informational", label: "参考情報" },
+];
+
+function formatTimestamp(ts: number | null | undefined): string {
+  if (!ts) return "—";
+  return new Date(ts * 1000).toLocaleString("ja-JP");
+}
+
+// §4.4: evidence starts pre-expanded (instead of collapsed) for items where
+// hiding the evidence behind a click would hide something the reviewer
+// needs immediately. All checks are on existing, already-validated
+// deterministic fields — no new judgement.
+function shouldExpandEvidenceByDefault(item: AlignmentItemOut): boolean {
+  if (item.alignment_state === "conflict") return true;
+  if (item.risk_flags.includes("security") || item.risk_flags.includes("high_risk")) return true;
+  if (item.runtime_check === "mismatch" || item.runtime_check === "stale") return true;
+  if (item.current_evidence.length === 1) return true;
+  return false;
+}
+
 function EvidenceList({ item }: { item: AlignmentItemOut }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(() => shouldExpandEvidenceByDefault(item));
   if (item.current_evidence.length === 0) return null;
   return (
     <div>
@@ -122,12 +186,65 @@ function EvidenceList({ item }: { item: AlignmentItemOut }) {
   );
 }
 
+// §5.3: shared audit-detail block for the collapsed/no-action rows. Only
+// renders fields that actually exist on the response; optional fields not
+// yet returned by the server (e.g. carried_over_from before ST-1 lands)
+// are simply omitted rather than shown as blank/placeholder text.
+function AuditDetail({ item }: { item: AlignmentItemOut }) {
+  return (
+    <div
+      className="mt-1 space-y-1 text-[11px] text-muted-foreground"
+      data-testid={`review-item-audit-detail-${item.id}`}
+    >
+      <p><span className="font-semibold">状態:</span> {alignmentStateLabel(item.alignment_state)}</p>
+      <p><span className="font-semibold">確信度:</span> {confidenceLabel(item.confidence)}</p>
+      <p><span className="font-semibold">理由:</span> {item.user_reason}</p>
+      {item.current_evidence.length > 0 && (
+        <div>
+          <p className="font-semibold">根拠:</p>
+          {item.current_evidence.map((e, i) => (
+            <p key={i} className="font-mono">
+              {e.path}:{e.start_line}-{e.end_line}{e.summary ? ` — ${e.summary}` : ""}
+            </p>
+          ))}
+        </div>
+      )}
+      <p>
+        <span className="font-semibold">スナップショット:</span> #{item.snapshot_id}
+        {item.revision_id !== null ? `(リビジョン #${item.revision_id})` : ""}
+      </p>
+      <p><span className="font-semibold">更新日時:</span> {formatTimestamp(item.updated_at)}</p>
+      <p><span className="font-semibold">分析実行:</span> #{item.intelligence_run_id}</p>
+      {item.carried_over_from != null && (
+        <p data-testid={`review-item-carried-over-${item.id}`}>
+          <span className="font-semibold">引き継ぎ元:</span> #{item.carried_over_from}
+        </p>
+      )}
+      {item.content_hash && (
+        <p className="font-mono" data-testid={`review-item-content-hash-${item.id}`}>
+          content_hash: {item.content_hash}
+        </p>
+      )}
+    </div>
+  );
+}
+
+interface StagedAnswer {
+  decision: AlignmentDecisionAction;
+  note?: string;
+}
+
 function ReviewQueueItemCard({
-  item, sessionId, existingInquiry,
+  item, sessionId, existingInquiry, bulkMode, bulkSending, stagedAnswer, onStageAnswer, onUnstageAnswer,
 }: {
   item: AlignmentItemOut;
   sessionId: number;
   existingInquiry?: InterviewInquiryOut;
+  bulkMode: boolean;
+  bulkSending: boolean;
+  stagedAnswer?: StagedAnswer;
+  onStageAnswer: (decision: AlignmentDecisionAction, note?: string) => void;
+  onUnstageAnswer: () => void;
 }) {
   const answer = useAnswerAlignmentItem(sessionId);
   const correct = useCorrectAlignmentItem(sessionId);
@@ -151,6 +268,12 @@ function ReviewQueueItemCard({
   const reopenableInquiryId = existingInquiry?.status === "open" ? existingInquiry.id : null;
 
   const submitAnswer = (decision: AlignmentDecisionAction) => {
+    if (bulkMode) {
+      onStageAnswer(decision, note || undefined);
+      setAnswering(false);
+      setNote("");
+      return;
+    }
     answer.mutate({ itemId: item.id, decision, note: note || undefined }, {
       onSuccess: () => {
         setAnswering(false);
@@ -310,14 +433,40 @@ function ReviewQueueItemCard({
         </div>
       ) : (
         <div className="flex flex-wrap gap-2">
-          <Button
-            size="sm"
-            onClick={() => setAnswering(true)}
-            disabled={busy}
-            data-testid={`review-item-answer-open-${item.id}`}
-          >
-            回答する
-          </Button>
+          {stagedAnswer ? (
+            <>
+              <Badge variant="secondary" data-testid={`review-item-staged-${item.id}`}>
+                回答予定: {DECISION_LABELS[stagedAnswer.decision]}
+              </Badge>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => setAnswering(true)}
+                disabled={bulkSending}
+                data-testid={`review-item-restage-${item.id}`}
+              >
+                回答を変更
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={onUnstageAnswer}
+                disabled={bulkSending}
+                data-testid={`review-item-unstage-${item.id}`}
+              >
+                選択を解除
+              </Button>
+            </>
+          ) : (
+            <Button
+              size="sm"
+              onClick={() => setAnswering(true)}
+              disabled={busy || bulkSending}
+              data-testid={`review-item-answer-open-${item.id}`}
+            >
+              回答する
+            </Button>
+          )}
           <Button
             size="sm"
             variant="outline"
@@ -387,9 +536,37 @@ function ReviewQueueItemCard({
   );
 }
 
-function InformationalItemRow({ item }: { item: AlignmentItemOut }) {
+// §5.3 / §5.4: shared row for no_review_required / unchanged / informational
+// items. `sample` renders it pre-expanded with an inquiry entry point, used
+// for the deterministic §5.4 spot-check; non-sample rows only get the
+// collapsed audit-detail toggle.
+function InformationalItemRow({
+  item, sessionId, existingInquiry, sample,
+}: {
+  item: AlignmentItemOut;
+  sessionId: number;
+  existingInquiry?: InterviewInquiryOut;
+  sample?: boolean;
+}) {
+  const [open, setOpen] = useState(!!sample);
+  const [inquiryMode, setInquiryMode] = useState(false);
+  const [hasHeldInquiry, setHasHeldInquiry] = useState(false);
+  const [attachedInquiryId, setAttachedInquiryId] = useState<number | null>(null);
+
+  const heldInquiryId = hasHeldInquiry
+    ? attachedInquiryId
+    : (existingInquiry?.status === "held" ? existingInquiry.id : null);
+  const reopenableInquiryId = existingInquiry?.status === "open" ? existingInquiry.id : null;
+
   return (
     <div className="rounded-md border p-2 text-xs space-y-1" data-testid={`review-item-informational-${item.id}`}>
+      <div className="flex flex-wrap items-center gap-1">
+        {sample && (
+          <Badge variant="outline" data-testid={`review-item-sample-${item.id}`}>
+            サンプル確認
+          </Badge>
+        )}
+      </div>
       <p className="break-words"><span className="font-semibold">現状:</span> {item.current_claim}</p>
       <div className="flex flex-wrap items-center gap-1 text-[11px]">
         <Badge variant="outline">{alignmentStateLabel(item.alignment_state)}</Badge>
@@ -398,6 +575,44 @@ function InformationalItemRow({ item }: { item: AlignmentItemOut }) {
           <Badge variant="outline" data-testid={`review-item-superseded-${item.id}`}>履歴</Badge>
         )}
       </div>
+      <button
+        type="button"
+        className="text-xs text-primary underline underline-offset-2"
+        onClick={() => setOpen(o => !o)}
+        aria-expanded={open}
+        data-testid={`review-item-informational-detail-toggle-${item.id}`}
+      >
+        {open ? "詳細を隠す" : "詳細を見る"}
+      </button>
+      {open && <AuditDetail item={item} />}
+      {sample && (
+        inquiryMode ? (
+          <InquiryPanel
+            key={attachedInquiryId ?? "new"}
+            sessionId={sessionId}
+            originKind="review_item"
+            originId={item.id}
+            heldDraft={null}
+            existingInquiryId={attachedInquiryId ?? undefined}
+            onResolved={() => { setInquiryMode(false); setHasHeldInquiry(false); setAttachedInquiryId(null); }}
+            onHeld={heldId => { setInquiryMode(false); setHasHeldInquiry(true); setAttachedInquiryId(heldId); }}
+            onCancel={() => { setInquiryMode(false); setAttachedInquiryId(null); }}
+          />
+        ) : heldInquiryId ? (
+          <p className="text-xs text-amber-700" data-testid={`review-item-held-inquiry-marker-${item.id}`}>
+            保留中の疑問があります
+          </p>
+        ) : (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => { setAttachedInquiryId(reopenableInquiryId); setInquiryMode(true); }}
+            data-testid={`review-item-inquiry-open-${item.id}`}
+          >
+            {reopenableInquiryId ? "疑問を再開する" : "疑問がある"}
+          </Button>
+        )
+      )}
     </div>
   );
 }
@@ -406,8 +621,13 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
   const { data: queue } = useReviewQueue(sessionId);
   const { data: full } = useAlignmentList(sessionId);
   const build = useBuildAlignment(sessionId);
+  const bulkAnswer = useAnswerAlignmentItem(sessionId);
   const activeInquiries = useActiveInquiriesByOrigin(sessionId);
   const [showInformational, setShowInformational] = useState(false);
+  const [bulkMode, setBulkMode] = useState(false);
+  const [bulkSending, setBulkSending] = useState(false);
+  const [pendingAnswers, setPendingAnswers] = useState<Record<number, StagedAnswer>>({});
+  const [bulkResult, setBulkResult] = useState<{ success: number; failed: number } | null>(null);
 
   const handleBuild = () => {
     build.mutate(undefined, {
@@ -418,14 +638,67 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
     });
   };
 
-  const informationalItems = full
-    ? [
-        ...(full.items_by_category["no_review_required"] ?? []),
-        ...(full.items_by_category["unchanged"] ?? []),
-        ...(full.items_by_category["informational"] ?? []),
-      ]
-    : [];
+  const toggleBulkMode = () => {
+    setBulkMode(m => !m);
+    setPendingAnswers({});
+    setBulkResult(null);
+  };
+
+  const stageAnswer = (itemId: number, decision: AlignmentDecisionAction, note?: string) => {
+    setPendingAnswers(prev => ({ ...prev, [itemId]: { decision, note } }));
+  };
+
+  const unstageAnswer = (itemId: number) => {
+    setPendingAnswers(prev => {
+      const next = { ...prev };
+      delete next[itemId];
+      return next;
+    });
+  };
+
+  const pendingCount = Object.keys(pendingAnswers).length;
+
+  const handleBulkSubmit = async () => {
+    const entries = Object.entries(pendingAnswers);
+    if (entries.length === 0) return;
+    setBulkSending(true);
+    setBulkResult(null);
+    let success = 0;
+    const stillFailed: Record<number, StagedAnswer> = {};
+    for (const [key, staged] of entries) {
+      const itemId = Number(key);
+      try {
+        await bulkAnswer.mutateAsync({ itemId, decision: staged.decision, note: staged.note });
+        success += 1;
+      } catch {
+        stillFailed[itemId] = staged;
+      }
+    }
+    setBulkSending(false);
+    setPendingAnswers(stillFailed);
+    const failedCount = Object.keys(stillFailed).length;
+    setBulkResult({ success, failed: failedCount });
+    if (failedCount === 0) {
+      toast.success(`${success}件を送信しました`);
+    } else {
+      toast.error(`${success}件送信、${failedCount}件失敗しました`);
+    }
+  };
+
+  const noReviewItems = full?.items_by_category["no_review_required"] ?? [];
+  const unchangedItems = full?.items_by_category["unchanged"] ?? [];
+  const informationalOnlyItems = full?.items_by_category["informational"] ?? [];
+  const informationalItems = [...noReviewItems, ...unchangedItems, ...informationalOnlyItems];
   const informationalCount = informationalItems.length;
+
+  // §5.4: deterministic spot-check — sorted by id ascending, capped at 3.
+  // `unchanged` is excluded: it is a "nothing changed since last time"
+  // finding, not a fresh no-review/informational judgement that needs the
+  // same sampling scrutiny.
+  const sampleEligible = [...noReviewItems, ...informationalOnlyItems].slice().sort((a, b) => a.id - b.id);
+  const sampleItems = sampleEligible.length > 3 ? sampleEligible.slice(0, 3) : [];
+  const sampleIds = new Set(sampleItems.map(i => i.id));
+  const remainingInformationalItems = informationalItems.filter(i => !sampleIds.has(i.id));
 
   return (
     <Card data-testid="review-queue-panel">
@@ -453,6 +726,46 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
         </div>
       </CardHeader>
       <CardContent className="space-y-3">
+        <div className="flex flex-wrap gap-1.5" data-testid="review-queue-category-summary">
+          {CATEGORY_SUMMARY.map(({ key, label }) => (
+            <Badge key={key} variant="outline" data-testid={`review-queue-summary-${key}`}>
+              {label} {full?.counts[key] ?? 0}件
+            </Badge>
+          ))}
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={toggleBulkMode}
+            disabled={bulkSending}
+            data-testid="review-queue-bulk-mode-toggle"
+          >
+            {bulkMode ? "個別に回答するモードに戻す" : "まとめて回答するモードにする"}
+          </Button>
+          {bulkMode && (
+            <div className="flex items-center gap-2 text-xs" data-testid="review-queue-bulk-bar">
+              <span data-testid="review-queue-bulk-pending-count">{pendingCount}件選択中</span>
+              <Button
+                size="sm"
+                onClick={handleBulkSubmit}
+                disabled={pendingCount === 0 || bulkSending}
+                data-testid="review-queue-bulk-submit"
+              >
+                {bulkSending ? "送信中..." : "まとめて送信"}
+              </Button>
+              {bulkResult && (
+                <span data-testid="review-queue-bulk-result">
+                  {bulkResult.failed === 0
+                    ? `${bulkResult.success}件送信しました`
+                    : `${bulkResult.success}件送信、${bulkResult.failed}件失敗しました`}
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+
         {queue && queue.items.length === 0 && (
           <p className="text-xs text-muted-foreground" data-testid="review-queue-empty">
             確認が必要な項目はありません。
@@ -464,8 +777,30 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
             item={item}
             sessionId={sessionId}
             existingInquiry={activeInquiries.get(`review_item:${item.id}`)}
+            bulkMode={bulkMode}
+            bulkSending={bulkSending}
+            stagedAnswer={pendingAnswers[item.id]}
+            onStageAnswer={(decision, note) => stageAnswer(item.id, decision, note)}
+            onUnstageAnswer={() => unstageAnswer(item.id)}
           />
         ))}
+
+        {sampleItems.length > 0 && (
+          <div className="space-y-2 pt-2 border-t" data-testid="review-queue-sample-section">
+            <p className="text-xs font-semibold text-muted-foreground">
+              確認不要と判断した項目のサンプル確認
+            </p>
+            {sampleItems.map(item => (
+              <InformationalItemRow
+                key={item.id}
+                item={item}
+                sessionId={sessionId}
+                existingInquiry={activeInquiries.get(`review_item:${item.id}`)}
+                sample
+              />
+            ))}
+          </div>
+        )}
 
         {informationalCount > 0 && (
           <div className="pt-2 border-t">
@@ -480,7 +815,14 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
             </button>
             {showInformational && (
               <div className="mt-2 space-y-2" data-testid="review-queue-informational-list">
-                {informationalItems.map(item => <InformationalItemRow key={item.id} item={item} />)}
+                {remainingInformationalItems.map(item => (
+                  <InformationalItemRow
+                    key={item.id}
+                    item={item}
+                    sessionId={sessionId}
+                    existingInquiry={activeInquiries.get(`review_item:${item.id}`)}
+                  />
+                ))}
               </div>
             )}
           </div>

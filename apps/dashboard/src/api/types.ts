@@ -1059,6 +1059,13 @@ export interface AlignmentItemOut {
   // review_category) can still surface one, so any rendering of that full
   // listing should treat superseded=true as history, not a current item.
   superseded?: boolean;
+  // Issue #295 (ST-2) defensive additions: not yet returned by the server
+  // as of this UI change (tracked separately under ST-1's `unchanged`
+  // materialization work). Optional so the UI degrades gracefully to "not
+  // shown" until the backend adds them, rather than assuming a shape the
+  // API doesn't send yet.
+  carried_over_from?: number | null;
+  content_hash?: string | null;
   intelligence_run_id: number;
   is_mock: boolean;
   created_at: number;
