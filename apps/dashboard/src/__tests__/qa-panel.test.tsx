@@ -191,6 +191,129 @@ describe("QaPanel route-and-investigate wiring (Issue #286 review fix, Finding 1
     });
   });
 
+  // --- Issue #295 §4.8: 「わからない」→ 自動調査接続 --------------------
+
+  test("「わからない」triggers the batch route-and-investigate endpoint for this question, showing a short status only", async () => {
+    mockQaList([makeQa({ id: 1 })]);
+    let resolveInvestigate: (v: InterviewQaRouteInvestigateBatchOut) => void;
+    const investigatePromise = new Promise<InterviewQaRouteInvestigateBatchOut>(resolve => {
+      resolveInvestigate = resolve;
+    });
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/1/qa/route-and-investigate") return investigatePromise;
+      return Promise.resolve(undefined);
+    });
+
+    const { QaPanel } = await import("@/pages/interview");
+    render(
+      <QaPanel sessionId={1} actor="dev" approvedCount={1} answerableAreas={[]} />,
+      { wrapper: createWrapper() },
+    );
+
+    const item = await screen.findByTestId("qa-item-1");
+    fireEvent.click(within(item).getByText("回答する"));
+    fireEvent.click(within(item).getByTestId("qa-answer-unknown-1"));
+
+    // Only a short status line while investigating -- no answer call yet,
+    // and the わからない button itself is replaced (no duplicate firing).
+    expect(within(item).getByTestId("qa-answer-unknown-investigating-1")).toHaveTextContent(
+      "関連コードとテストを確認しています",
+    );
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/interview/sessions/1/qa/route-and-investigate");
+    });
+    expect(within(item).queryByTestId("qa-answer-unknown-1")).not.toBeInTheDocument();
+    expect(mockApi.post).not.toHaveBeenCalledWith(
+      "/interview/sessions/1/qa/1/answer", expect.anything(),
+    );
+
+    resolveInvestigate!({
+      session_id: 1, system_id: 1,
+      results: [{ qa_id: 1, route_category: "system_researchable", knowledge_area: null, investigation_status: "completed", error: null }],
+      counts: { routed: 1, investigated: 1, failed: 0, skipped_cap: 0 },
+    });
+
+    // Investigation succeeded for this question: never falls back to
+    // recording an unknown answer, and returns to the normal confirm view.
+    await waitFor(() => {
+      expect(within(item).queryByTestId("qa-answer-unknown-investigating-1")).not.toBeInTheDocument();
+    });
+    expect(mockApi.post).not.toHaveBeenCalledWith(
+      "/interview/sessions/1/qa/1/answer", expect.anything(),
+    );
+    expect(within(item).getByText("回答する")).toBeInTheDocument();
+  });
+
+  test("investigation API failure falls back to the original #142 わからない flow (never loses the answer opportunity)", async () => {
+    mockQaList([makeQa({ id: 1 })]);
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/1/qa/route-and-investigate") {
+        return Promise.reject(new Error("boom"));
+      }
+      if (path === "/interview/sessions/1/qa/1/answer") {
+        return Promise.resolve({ qa: makeQa({ id: 1, status: "unconfirmed" }), previous: null, regeneration_recommended: false });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const { QaPanel } = await import("@/pages/interview");
+    const { toast } = await import("sonner");
+    render(
+      <QaPanel sessionId={1} actor="dev" approvedCount={1} answerableAreas={[]} />,
+      { wrapper: createWrapper() },
+    );
+
+    const item = await screen.findByTestId("qa-item-1");
+    fireEvent.click(within(item).getByText("回答する"));
+    fireEvent.click(within(item).getByTestId("qa-answer-unknown-1"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/1/qa/1/answer",
+        expect.objectContaining({ answer_unknown: true }),
+      );
+    });
+    await waitFor(() => {
+      expect(toast.info).toHaveBeenCalledWith(
+        "「わからない」として記録しました。仮説を立てて確認質問を続けます。",
+      );
+    });
+  });
+
+  test("a question not covered by the batch result (e.g. cap/skip) also falls back to the #142 flow", async () => {
+    mockQaList([makeQa({ id: 1 })]);
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/1/qa/route-and-investigate") {
+        const batch: InterviewQaRouteInvestigateBatchOut = {
+          session_id: 1, system_id: 1, results: [],
+          counts: { routed: 0, investigated: 0, failed: 0, skipped_cap: 1 },
+        };
+        return Promise.resolve(batch);
+      }
+      if (path === "/interview/sessions/1/qa/1/answer") {
+        return Promise.resolve({ qa: makeQa({ id: 1, status: "unconfirmed" }), previous: null, regeneration_recommended: false });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const { QaPanel } = await import("@/pages/interview");
+    render(
+      <QaPanel sessionId={1} actor="dev" approvedCount={1} answerableAreas={[]} />,
+      { wrapper: createWrapper() },
+    );
+
+    const item = await screen.findByTestId("qa-item-1");
+    fireEvent.click(within(item).getByText("回答する"));
+    fireEvent.click(within(item).getByTestId("qa-answer-unknown-1"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/1/qa/1/answer",
+        expect.objectContaining({ answer_unknown: true }),
+      );
+    });
+  });
+
   test("route_category badge renders the Japanese label, never the raw enum", async () => {
     mockQaList([
       makeQa({ id: 1, route_category: "system_researchable", knowledge_area: "implementation" }),

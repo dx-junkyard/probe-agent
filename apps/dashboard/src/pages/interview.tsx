@@ -65,6 +65,7 @@ import type {
   InquiryRouteCategory,
   InterviewInquiryOut,
   InterviewQaOut,
+  InterviewQaRouteInvestigateBatchOut,
   InterviewQuestionEvidenceRef,
   InterviewSessionDetailOut,
   InterviewStage,
@@ -431,7 +432,7 @@ function NextActionBanner({ uiState, nextAction }: {
 // 旧回答も previous として残る(上書きしない)。
 function QaItemCard({
   qa, sessionId, existingInquiry, onAnswer, onSkip, onResume, answering, skipping, resuming,
-  outOfArea,
+  outOfArea, onInvestigateForUnknown, investigatePending,
 }: {
   qa: InterviewQaOut;
   sessionId: number;
@@ -448,6 +449,12 @@ function QaItemCard({
   // Issue #291: rendered in the 「担当外の質問」 group -- offers a handoff
   // action in addition to the normal answer/skip actions.
   outOfArea?: boolean;
+  // Issue #295 §4.8: same batch route-and-investigate call the 「AIに先に
+  // 調査させる」button uses (shared mutation instance from QaPanel), invoked
+  // automatically for this one question when 「わからない」is chosen.
+  // Resolves to null on API failure so the caller can fall back safely.
+  onInvestigateForUnknown: () => Promise<InterviewQaRouteInvestigateBatchOut | null>;
+  investigatePending: boolean;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(qa.answer_text ?? "");
@@ -459,6 +466,11 @@ function QaItemCard({
   // question's persisted Investigation Agent result, mirroring
   // InquiryMessageBubble's showEvidence pattern.
   const [showInvestigationEvidence, setShowInvestigationEvidence] = useState(false);
+  // Issue #295 §4.8: true only while THIS card's 「わからない」 auto-
+  // investigation is in flight -- drives the short status line and guards
+  // against firing a second request for the same question while one is
+  // already running.
+  const [investigatingUnknown, setInvestigatingUnknown] = useState(false);
   const resumeInquiry = useResumeInterviewInquiry(sessionId);
 
   // Raw enum values are never rendered (Issue #266) -- only a known,
@@ -505,9 +517,37 @@ function QaItemCard({
 
   // Issue #142: 「わからない」を有効な入力として記録する。エラーにはせず、
   // status=unconfirmed として保存し、以後の推論で仮説→再確認に回す。
-  const submitUnknown = async () => {
+  const fallBackToUnknownFlow = async () => {
     await onAnswer(qa.id, draft.trim(), true);
     setEditing(false);
+  };
+
+  // Issue #295 §4.8: 「わからない」を選んだら、まず既存の
+  // route-and-investigate バッチ API(「AIに先に調査させる」ボタンと同じ
+  // もの)をこの質問について自動で呼び出す。投稿された結果が
+  // qa.investigation に反映されれば(下の qa.investigation ブロックが
+  // 自動で結論を表示する)、#142 の仮説生成フローには入らず既存の確認導線
+  // (回答する/わからない/疑問がある)に戻すだけにする。調査が使えない
+  // (失敗・対象外・バッチの上限で処理されなかった)場合は、ユーザーが回答
+  // する機会を失わないよう、必ず従来の #142 フローにフォールバックする。
+  const submitUnknown = async () => {
+    if (investigatingUnknown || investigatePending) return;
+    setInvestigatingUnknown(true);
+    try {
+      const batch = await onInvestigateForUnknown();
+      const item = batch?.results.find(r => r.qa_id === qa.id);
+      const investigated = !!item && !item.error
+        && (item.investigation_status === "completed" || item.investigation_status === "unresolved");
+      if (investigated) {
+        // AIの調査結果 (qa.investigation) は qa 一覧の再取得で表示される。
+        // 元の回答は一切送信せず、既存の確認導線に戻すだけ。
+        setEditing(false);
+        return;
+      }
+      await fallBackToUnknownFlow();
+    } finally {
+      setInvestigatingUnknown(false);
+    }
   };
 
   return (
@@ -703,20 +743,38 @@ function QaItemCard({
                 rows={3}
                 placeholder="回答を入力"
               />
-              <div className="flex gap-2">
-                <Button size="sm" onClick={submit} disabled={answering || !draft.trim()}>
+              <div className="flex items-center gap-2">
+                <Button size="sm" onClick={submit} disabled={answering || !draft.trim() || investigatingUnknown}>
                   {answering ? "送信中..." : "保存"}
                 </Button>
+                {investigatingUnknown ? (
+                  // Issue #295 §4.11: a single short Japanese status line only
+                  // -- no log stream -- while the auto-investigation runs.
+                  <p
+                    className="text-xs text-muted-foreground"
+                    data-testid={`qa-answer-unknown-investigating-${qa.id}`}
+                  >
+                    関連コードとテストを確認しています
+                  </p>
+                ) : (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={submitUnknown}
+                    disabled={answering || investigatePending}
+                    data-testid={`qa-answer-unknown-${qa.id}`}
+                  >
+                    わからない
+                  </Button>
+                )}
                 <Button
                   size="sm"
                   variant="outline"
-                  onClick={submitUnknown}
-                  disabled={answering}
-                  data-testid={`qa-answer-unknown-${qa.id}`}
+                  onClick={() => setEditing(false)}
+                  disabled={investigatingUnknown}
                 >
-                  わからない
+                  キャンセル
                 </Button>
-                <Button size="sm" variant="outline" onClick={() => setEditing(false)}>キャンセル</Button>
               </div>
             </div>
           ) : (
@@ -821,6 +879,19 @@ export function QaPanel({
       );
     } catch (e) {
       toast.error(String(e));
+    }
+  };
+
+  // Issue #295 §4.8: same batch mutation as the 「AIに先に調査させる」
+  // button above, reused (not duplicated) so a 「わからない」 click and the
+  // manual batch button can never race each other -- they share the same
+  // mutation's pending state. Resolves to null on failure so QaItemCard can
+  // fall back to the original #142 flow without losing the user's turn.
+  const handleInvestigateForUnknown = async () => {
+    try {
+      return await routeAndInvestigate.mutateAsync();
+    } catch {
+      return null;
     }
   };
 
@@ -940,6 +1011,8 @@ export function QaPanel({
               answering={answer.isPending}
               skipping={skip.isPending}
               resuming={resume.isPending}
+              onInvestigateForUnknown={handleInvestigateForUnknown}
+              investigatePending={routeAndInvestigate.isPending}
             />
           ))}
         </div>
@@ -966,6 +1039,8 @@ export function QaPanel({
                   answering={answer.isPending}
                   skipping={skip.isPending}
                   resuming={resume.isPending}
+                  onInvestigateForUnknown={handleInvestigateForUnknown}
+                  investigatePending={routeAndInvestigate.isPending}
                   outOfArea
                 />
               ))}
