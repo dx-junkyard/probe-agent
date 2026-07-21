@@ -3866,3 +3866,102 @@ issue では拡張しない(brief が明示的に要求していないため) �
   fail-closed、ルーティング結果の永続化(その後 `search_keywords` 追加
   で `question-router-v3` までバンプ済み。「Question Router /
   Investigation Agent(Issue #286)」節参照)。
+
+## Interview Alignment UX 差分改善(Issue #295)
+
+Issue #295 は Interview Alignment UX の元提案であり、その大部分は Issue
+#282(サブイシュー #283-#291)で実装済み。本節は #295 のうち #283-#291
+でカバーされていなかった差分として実装した内容と、意図的に見送った残課
+題を記録する。
+
+### unchanged 分類の実体化(#295 §4.3 / §7.1、control-server)
+
+#287 で予約値だった `review_category='unchanged'` を決定的ロジックで到
+達可能にした。
+
+- `app/alignment.py` の `compute_content_hash()`: `current_claim` +
+  正規化した `current_evidence`(path/start_line/end_line/summary をソー
+  ト)+ ルール表 `classify_alignment_item` の入力になる全フィールド
+  (`alignment_state` / `risk_flags`(ソート)/ `confidence` /
+  `intent_field` / `runtime_check`)の canonical JSON を sha256 する。
+  分類に影響する変化(Runtime Reality Check の反転を含む)が
+  「変更なし」と誤判定されることはない。完全一致のみで、類似度・
+  LLM 判断は使わない(Principle 6)。
+- 再ビルド(`run_alignment_build`)時、直前ビルドの終端行
+  (`status IN ('answered','corrected') AND superseded=0`)と
+  `content_hash` が一致する新項目は `unchanged` /
+  `reason_code='unchanged_since_confirmation'` に分類し、
+  `carried_over_from` に引き継ぎ元 id を記録する(監査専用の参照。
+  ON DELETE SET NULL)。unchanged 項目は `GET .../review-queue` の
+  主導線(must_review/batch_reviewable フィルタ)に現れない。
+- §5.5 の狭い決定的版: goal intent(System Purpose 相当)が直前ビルド
+  以降に確定・変更された場合、そのビルドでは引き継ぎを行わず全項目を
+  ルール表で再分類する。`trigger_kind` は `interview_refresh` の
+  dedupe(pending ジョブへの合流)によりバッチ全体を代表しないため、
+  goal 行の `updated_at` と直前ビルドの `alignment_item.created_at`
+  最大値の比較で判定する。
+- additive migration: `alignment_item.content_hash TEXT` /
+  `carried_over_from INTEGER`(既存行は NULL のまま)。
+- テスト: `tests/test_interview_alignment.py` に hash の決定性・順序
+  非依存性、引き継ぎ、内容変化時の非引き継ぎ、goal 変更によるブロック
+  と過剰ブロックの回帰、旧 DB からの migration を追加(98件)。
+
+### Review Queue の表示・操作(#295 §4.1 / §5.3 / §5.4 / §4.4、dashboard)
+
+`review-queue.tsx` のみの変更。分類・優先度はバックエンド値をそのまま
+使い、フロントで再分類しない。
+
+- カテゴリ別件数サマリ: 要確認 / 一括レビュー可 / 確認不要 / 前回から
+  変更なし / 参考情報 の5固定区分を `counts` から表示(欠損は0扱い)。
+- まとめて回答モード(既定OFF): 回答をローカルに保留し「まとめて送信」
+  で既存 `/answer` を項目ごとに順次呼ぶ。#288 の refresh dedupe が
+  バッチを1回の再ビルドにまとめるため一括 API は追加しない。失敗項目
+  は保留のまま残し「N件送信、M件失敗しました」を表示。1件即時送信の
+  従来 UX は不変。
+- 確認不要/参考情報/unchanged 行の監査詳細展開(§5.3): 応答に存在する
+  フィールドのみ(state・confidence・evidence・snapshot/revision・
+  updated_at・intelligence run・carried_over_from/content_hash)を表示。
+- サンプル確認(§5.4 最小版): no_review_required + informational から
+  id 昇順で最大3件を決定的に選び、展開済み+「疑問がある」導線付きで
+  提示(全件3件以下ならサンプル節なし)。誤り発見時の分類ルール自動
+  再評価は未実装(残課題)。
+- 根拠の先出し例外(§4.4): conflict / security・high_risk フラグ /
+  runtime_check mismatch・stale / 根拠1件のみ、のとき EvidenceList を
+  初期展開する(応答の有限フィールドからの決定的判定のみ)。
+
+### Inquiry 段階開示の4段階化と「わからない」自動調査(#295 §4.4 / §4.8 / §4.10、dashboard)
+
+- `inquiry-panel.tsx`: 従来の「結論 → detail 一括トグル」2段階を、
+  結論(常時)/「理由を見る」(`key_points`)/「根拠を見る」
+  (evidence の docs/code/test/Runtime 種別+要約+uncertainty)/
+  「調査詳細を見る」(path:行番号・runtime provenance・調査 run 参照)
+  の4段階に分割。種別はパス文字列からの構造的分類(file kind、
+  Principle 6 の許容例)。バックエンド・スキーマ変更なし(既存
+  detail payload の表示分割のみ)。
+- 例外の先出し: `runtime_evidence[].runtime_check=='mismatch'` または
+  `detail.uncertainty` 非空のとき第2〜3層を初期展開(第4層は自動展開
+  しない)。
+- `interview.tsx`: Q&A の「わからない」選択時、既存の
+  route-and-investigate バッチ調査(#286/#291 で整備済みのエンドポイ
+  ント)を自動起動する。調査中は「関連コードとテストを確認しています」
+  の短い状態表示のみ。API 失敗・バッチ対象外時は従来の #142 フロー
+  (`answer_unknown: true`)へ無条件フォールバックし、回答機会を失わ
+  せない。実行中の重複発火は防止。`investigation_status='unresolved'`
+  は調査成功(特定できず)として扱い、既存の表示に委ねる。
+
+### 実装しない・見送った残課題
+
+- **#292(低リスク提案の一括承認)**: 引き続き実装しない(CLAUDE.md
+  参照。開始条件の観測データが未取得)。本節の「まとめて回答」は
+  ユーザーが1件ずつ選んだ回答の送信バッチ化であり、AI 分類による
+  自動承認ではない — `decision_method: manual` は項目単位で維持。
+- **Inquiry の前提追跡(#295 §5.6 拡張)**: Inquiry 行への
+  snapshot/revision 参照列・`superseded` 状態・前提変化時の再確認復帰
+  は未実装。DB migration を含む独立した issue として設計すべき規模。
+- **評価指標(#295 §9)**: 疑問解消率・誤った回答確定率などの計測基盤
+  は未実装。指標定義が UI 実装の安定後に確定するため見送り。
+- **サンプル誤り発見時の分類ルール再評価(§5.4 後半)**: 疑問導線まで。
+- **提案 §7 のフィールド名との差異**: 既存実装のフィールド名
+  (`non_goals`、`status` 等)を維持し、#295 記載の名称
+  (`out_of_scope`、`confirmation_state` 等)への改名は行わない
+  (スキーマ契約の互換性優先)。
