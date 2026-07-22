@@ -3346,6 +3346,17 @@ class AlignmentListOut(BaseModel):
     system_id: int
     items_by_category: Dict[str, List[AlignmentItemOut]] = Field(default_factory=dict)
     counts: Dict[str, int] = Field(default_factory=dict)
+    # 2nd review round (PR #296, Finding 3): `counts` still includes current
+    # rows in a terminal status (answered/corrected, superseded=0) -- e.g.
+    # right after answering a must_review item and before the next rebuild
+    # marks it superseded=1, counts.must_review still counts it even though
+    # GET .../review-queue no longer does. `outstanding_counts` applies the
+    # EXACT SAME predicate get_review_queue uses (superseded=0 AND status NOT
+    # IN ('answered','corrected')) to every category consistently, so a
+    # client that wants "how many of these still need action" always agrees
+    # with the Review Queue's own count. Additive; `counts` keeps its
+    # original meaning ("current rows of this category") for compatibility.
+    outstanding_counts: Dict[str, int] = Field(default_factory=dict)
     # Review fix (PR #296, Finding 3): superseded=1 rows (history -- a later
     # rebuild already produced a fresh replacement row for the same contrast
     # point) are additive-only here, kept fully visible for audit but split
@@ -3398,6 +3409,13 @@ class AlignmentBatchAnswerItemRequest(BaseModel):
     item_id: int
     decision: AlignmentDecisionAction
     note: Optional[str] = Field(default=None, max_length=2_000)
+    # 2nd review round (PR #296, Finding 2): optional staleness guard. When
+    # given, it must match the item's CURRENT alignment_item.content_hash or
+    # the entry is rejected as a per-item error (the item changed -- e.g. a
+    # rebuild carried it over to a new row, or another reviewer/tab already
+    # answered it -- since the client staged this answer). Omitting it keeps
+    # pre-fix behavior (no staleness check) for backward compatibility.
+    content_hash: Optional[str] = Field(default=None, max_length=64)
 
 
 class AlignmentBatchAnswerRequest(BaseModel):

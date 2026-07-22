@@ -235,6 +235,31 @@ def review_sort_key(*, review_category: str, reason_code: str, item_id: int) -> 
 # candidate lookup (the caller's ``content_hash IS NOT NULL`` filter already
 # excludes it) -- it is simply reclassified fresh through the normal rule
 # table instead.
+#
+# Second review round (PR #296, 2nd pass, Finding 1): the hash still missed
+# the Intent Brief entity an item is *linked to* -- only ``intent_field``
+# (the field NAME, e.g. "pain") was hashed, never the linked
+# ``interview_intent_item`` row's own content. A developer editing an Intent
+# Brief field (correcting its value_text, or confirming/declining it) while
+# the reasoning model happens to re-propose byte-identical claim/summary text
+# for a dependent alignment item would previously carry that item over as
+# "unchanged" even though the intent it is contrasted against had genuinely
+# changed. Two new (optional, additive-in-signature) inputs close this:
+#
+# - ``intent_item_id``: the raw FK id of the linked ``interview_intent_item``
+#   row (``None`` when an item has no linked intent). Issue #284's /correct
+#   flow always mints a NEW id when value_text changes (the old row is
+#   superseded, never edited in place), so an id change alone already
+#   invalidates the hash for that case.
+# - ``linked_intent_digest``: a sha256 (``compute_intent_item_digest`` below)
+#   over the linked intent row's CURRENT ``field``/``value_text``/``status``,
+#   computed by the caller (``run_alignment_build``) from a fresh DB read --
+#   never computed in here, since this module has no DB access. This catches
+#   the case /correct does not: /confirm and /decline update status IN PLACE
+#   (same id, same value_text), so the id alone would not change.
+#
+# Callers that do not resolve a linked intent item pass ``None`` for both
+# (unchanged behavior, same as before this fields existed).
 
 
 def _read_lines(
@@ -279,6 +304,19 @@ def _evidence_source_digest(
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def compute_intent_item_digest(*, field: str, value_text: str, status: str) -> str:
+    """sha256 over a linked ``interview_intent_item`` row's current content.
+
+    Callers (``run_alignment_build``) compute this from a fresh DB read of
+    the linked intent row and pass the result into ``compute_content_hash``
+    as ``linked_intent_digest`` -- this function itself never touches the
+    database (Principle 6: a pure structural digest, not a decision).
+    """
+    payload = {"field": field, "value_text": value_text, "status": status}
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def compute_content_hash(
     *,
     current_claim: str,
@@ -293,6 +331,8 @@ def compute_content_hash(
     intent_summary: Optional[str] = None,
     gap_summary: Optional[str] = None,
     proposed_interpretation: Optional[str] = None,
+    intent_item_id: Optional[int] = None,
+    linked_intent_digest: Optional[str] = None,
     source_digest_cache: Optional[Dict[str, Optional[List[str]]]] = None,
 ) -> Optional[str]:
     """Deterministic sha256 over one alignment item's identity-bearing fields.
@@ -300,6 +340,11 @@ def compute_content_hash(
     Returns ``None`` (never a partial/best-effort hash) when any evidence
     item's source text cannot be read/validated at ``(repo_path, commit_sha)``
     -- see the module-level comment above for why that is the safe direction.
+
+    ``intent_item_id``/``linked_intent_digest`` (2nd review round, Finding 1)
+    make the hash sensitive to the linked Intent Brief entity's own identity
+    and current content, not just the field name it belongs to -- see the
+    module-level comment above.
     """
     cache: Dict[str, Optional[List[str]]] = (
         source_digest_cache if source_digest_cache is not None else {}
@@ -333,6 +378,8 @@ def compute_content_hash(
         "intent_summary": intent_summary,
         "gap_summary": gap_summary,
         "proposed_interpretation": proposed_interpretation,
+        "intent_item_id": intent_item_id,
+        "linked_intent_digest": linked_intent_digest,
     }
     canonical = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

@@ -577,8 +577,11 @@ describe("ReviewQueuePanel", () => {
     });
     // The failed item stays staged so the user can retry.
     expect(screen.getByTestId("review-item-staged-61")).toBeInTheDocument();
+    // The server's own per-item error text is shown verbatim.
+    expect(screen.getByTestId("review-item-staged-error-61")).toHaveTextContent("internal error");
     // The succeeded item is no longer staged.
     expect(screen.queryByTestId("review-item-staged-60")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("review-item-staged-error-60")).not.toBeInTheDocument();
   });
 
   // PR #296 review fix (Finding 3): superseded history section.
@@ -715,10 +718,16 @@ describe("ReviewQueuePanel", () => {
     expect(within(sampleSection).getByTestId("review-item-informational-3")).toBeInTheDocument();
     expect(within(sampleSection).queryByTestId("review-item-informational-4")).not.toBeInTheDocument();
     expect(within(sampleSection).queryByTestId("review-item-informational-5")).not.toBeInTheDocument();
-    // Sample rows come pre-expanded (no click needed) and offer the
-    // existing Inquiry entry point.
-    expect(within(sampleSection).getByTestId("review-item-audit-detail-1")).toBeInTheDocument();
+    // PR #296 review fix (2nd pass, Finding 5b): sample rows still show the
+    // current_claim unconditionally, but the audit detail (evidence,
+    // content_hash, etc.) stays collapsed by default like a non-sample row
+    // -- three items' worth of audit detail expanded on first render was
+    // information overload. The Inquiry entry point remains reachable
+    // without expanding anything.
+    expect(within(sampleSection).queryByTestId("review-item-audit-detail-1")).not.toBeInTheDocument();
     expect(within(sampleSection).getByTestId("review-item-inquiry-open-1")).toBeInTheDocument();
+    fireEvent.click(within(sampleSection).getByTestId("review-item-informational-detail-toggle-1"));
+    expect(within(sampleSection).getByTestId("review-item-audit-detail-1")).toBeInTheDocument();
 
     // Items 4 and 5 remain reachable only through the collapsed section.
     const toggle = await screen.findByTestId("review-queue-informational-toggle");
@@ -840,5 +849,156 @@ describe("ReviewQueuePanel", () => {
 
     const card = await screen.findByTestId("review-item-82");
     expect(within(card).getByTestId("review-item-evidence-82")).toBeInTheDocument();
+  });
+
+  // PR #296 review fix (2nd pass, Finding 3/5b): actionable categories
+  // (must_review/batch_reviewable) prefer outstanding_counts (未対応件数)
+  // over counts (a total that can still include already-answered rows),
+  // so this panel's own summary never disagrees with its action cards.
+  test("要確認/一括レビュー可の件数サマリは outstanding_counts を優先し、counts と食い違っていても後者にフォールバックしない", async () => {
+    const openItem = makeItem({ id: 100, review_category: "must_review" });
+    const queue: AlignmentReviewQueueOut = { session_id: 1, system_id: 1, items: [openItem] };
+    const full: AlignmentListOut = {
+      session_id: 1, system_id: 1,
+      items_by_category: {
+        must_review: [openItem], batch_reviewable: [], no_review_required: [], unchanged: [], informational: [],
+      },
+      // counts still counts a since-answered row that hasn't been
+      // superseded yet; outstanding_counts already excludes it.
+      counts: { must_review: 2, batch_reviewable: 3, no_review_required: 0, unchanged: 0, informational: 0 },
+      outstanding_counts: { must_review: 1, batch_reviewable: 0, no_review_required: 0, unchanged: 0, informational: 0 },
+    };
+    getImpl = (path: string) => {
+      if (path === "/interview/sessions/1/review-queue") return Promise.resolve(queue);
+      if (path === "/interview/sessions/1/alignment") return Promise.resolve(full);
+      if (path === "/interview/sessions/1/inquiries") return Promise.resolve({ session_id: 1, system_id: 1, items: [] });
+      return Promise.resolve(undefined);
+    };
+
+    const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
+    render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+
+    const summary = await screen.findByTestId("review-queue-category-summary");
+    await waitFor(() => {
+      expect(within(summary).getByTestId("review-queue-summary-must_review")).toHaveTextContent("要確認 1件");
+    });
+    expect(within(summary).getByTestId("review-queue-summary-batch_reviewable")).toHaveTextContent("一括レビュー可 0件");
+    // Matches the one action card actually rendered.
+    expect(await screen.findByTestId("review-item-100")).toBeInTheDocument();
+  });
+
+  test("要確認/一括レビュー可の件数サマリは outstanding_counts が無いとき counts にフォールバックする", async () => {
+    const queue: AlignmentReviewQueueOut = { session_id: 1, system_id: 1, items: [] };
+    const full: AlignmentListOut = {
+      session_id: 1, system_id: 1,
+      items_by_category: { must_review: [], batch_reviewable: [], no_review_required: [], unchanged: [], informational: [] },
+      counts: { must_review: 2, batch_reviewable: 1, no_review_required: 0, unchanged: 0, informational: 0 },
+    };
+    getImpl = (path: string) => {
+      if (path === "/interview/sessions/1/review-queue") return Promise.resolve(queue);
+      if (path === "/interview/sessions/1/alignment") return Promise.resolve(full);
+      if (path === "/interview/sessions/1/inquiries") return Promise.resolve({ session_id: 1, system_id: 1, items: [] });
+      return Promise.resolve(undefined);
+    };
+
+    const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
+    render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+
+    const summary = await screen.findByTestId("review-queue-category-summary");
+    await waitFor(() => {
+      expect(within(summary).getByTestId("review-queue-summary-must_review")).toHaveTextContent("要確認 2件");
+    });
+    expect(within(summary).getByTestId("review-queue-summary-batch_reviewable")).toHaveTextContent("一括レビュー可 1件");
+  });
+
+  // PR #296 review fix (2nd pass, Finding 2): まとめて送信 includes each
+  // item's content_hash (as read from the last GET .../alignment response)
+  // so the server can validate the item hasn't changed since it was staged.
+  test("まとめて送信は各項目の content_hash をリクエストに含める", async () => {
+    const item = makeItem({ id: 110, review_category: "batch_reviewable", content_hash: "hash-110" });
+    const queue: AlignmentReviewQueueOut = { session_id: 1, system_id: 1, items: [item] };
+    const full: AlignmentListOut = {
+      session_id: 1, system_id: 1,
+      items_by_category: { must_review: [], batch_reviewable: [item], no_review_required: [], unchanged: [], informational: [] },
+      counts: { must_review: 0, batch_reviewable: 1, no_review_required: 0, unchanged: 0, informational: 0 },
+    };
+    getImpl = (path: string) => {
+      if (path === "/interview/sessions/1/review-queue") return Promise.resolve(queue);
+      if (path === "/interview/sessions/1/alignment") return Promise.resolve(full);
+      if (path === "/interview/sessions/1/inquiries") return Promise.resolve({ session_id: 1, system_id: 1, items: [] });
+      return Promise.resolve(undefined);
+    };
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/1/alignment/answers-batch") {
+        return Promise.resolve({
+          session_id: 1, system_id: 1, refreshed: true,
+          results: [{ item_id: 110, success: true, item: { ...item, status: "answered" }, error: null }],
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
+    render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByTestId("review-queue-bulk-mode-toggle"));
+    fireEvent.click(await screen.findByTestId("review-item-answer-open-110"));
+    fireEvent.click(await screen.findByTestId("review-item-answer-accept_current-110"));
+    fireEvent.click(await screen.findByTestId("review-queue-bulk-submit"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/1/alignment/answers-batch",
+        { answers: [{ item_id: 110, decision: "accept_current", note: undefined, content_hash: "hash-110" }] },
+      );
+    });
+  });
+
+  // PR #296 review fix (2nd pass, Finding 2): a batch failure on an entry
+  // that carried a content_hash is shown verbatim -- the Control Server's
+  // stale-content_hash error is already Japanese (confirmed against
+  // apps/control-server/app/routes/interview_alignment.py's
+  // `_BATCH_ERROR_STALE_CONTENT`) -- and the item stays staged for retry
+  // (same as any other partial-failure case).
+  test("content_hash 付きの項目がまとめて送信で失敗すると、日本語で更新済みである旨を表示し、保留に残す", async () => {
+    const item = makeItem({ id: 120, review_category: "batch_reviewable", content_hash: "hash-120" });
+    const queue: AlignmentReviewQueueOut = { session_id: 1, system_id: 1, items: [item] };
+    const full: AlignmentListOut = {
+      session_id: 1, system_id: 1,
+      items_by_category: { must_review: [], batch_reviewable: [item], no_review_required: [], unchanged: [], informational: [] },
+      counts: { must_review: 0, batch_reviewable: 1, no_review_required: 0, unchanged: 0, informational: 0 },
+    };
+    getImpl = (path: string) => {
+      if (path === "/interview/sessions/1/review-queue") return Promise.resolve(queue);
+      if (path === "/interview/sessions/1/alignment") return Promise.resolve(full);
+      if (path === "/interview/sessions/1/inquiries") return Promise.resolve({ session_id: 1, system_id: 1, items: [] });
+      return Promise.resolve(undefined);
+    };
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/1/alignment/answers-batch") {
+        return Promise.resolve({
+          session_id: 1, system_id: 1, refreshed: true,
+          results: [{
+            item_id: 120, success: false, item: null,
+            error: "項目が更新されています。最新の内容を確認してください。",
+          }],
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
+    render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByTestId("review-queue-bulk-mode-toggle"));
+    fireEvent.click(await screen.findByTestId("review-item-answer-open-120"));
+    fireEvent.click(await screen.findByTestId("review-item-answer-accept_current-120"));
+    fireEvent.click(await screen.findByTestId("review-queue-bulk-submit"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("review-item-staged-error-120")).toHaveTextContent("項目が更新されています");
+    });
+    // Stays staged so the user can retry after refreshing the content.
+    expect(screen.getByTestId("review-item-staged-120")).toBeInTheDocument();
   });
 });

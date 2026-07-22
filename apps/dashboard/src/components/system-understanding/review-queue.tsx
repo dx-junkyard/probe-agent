@@ -31,8 +31,11 @@
 //   グルを追加した(§5.3)。応答に存在するフィールドだけを表示し、まだ
 //   存在しない carried_over_from 等は防御的に optional として扱う。
 // - no_review_required/informational のうち id 昇順で先頭3件を超える場
-//   合に、決定的に選んだ3件を「サンプル確認」として展開済み+疑問導線つ
-//   きで提示する(§5.4)。乱数は使わない。
+//   合に、決定的に選んだ3件を「サンプル確認」として疑問導線つきで提示す
+//   る(§5.4)。乱数は使わない。監査詳細(AuditDetail: 根拠・content_hash
+//   等)は PR #296 2回目レビュー指摘5b により既定で折りたたみ(非サンプル
+//   行と同じ)に変更した — current_claim は常に見えるが、3件分の監査詳細
+//   まで初回表示で展開されると確認疲れを招くため。
 // - EvidenceList は、alignment_state が conflict / risk_flags に高リス
 //   ク相当(security・high_risk)が含まれる / runtime_check が
 //   mismatch・stale / evidence が1件のみ、のいずれかに該当する場合は初
@@ -49,6 +52,22 @@
 //   の /answer 順次呼び出しをやめた)。部分失敗した項目は response.results
 //   から判定して保留に残す。単体(非一括モード)の即時送信は従来どおり
 //   /answer のまま変更していない。
+//
+// PR #296 2回目レビュー指摘対応の追加:
+// - 指摘2: まとめて送信の各エントリに、その項目をステージした時点の
+//   content_hash(直近の GET .../alignment 応答由来)を含めて送る。
+//   バックエンド(apps/control-server/app/routes/interview_alignment.py の
+//   `_validate_answer_target_for_batch` / `AlignmentBatchAnswerItemRequest.
+//   content_hash`、確認済み)がこれを検証し、stale を検出した項目だけを
+//   失敗として返す。失敗時の `error` はバックエンドが既に日本語で用意した
+//   文字列(stale の場合は文字どおり「項目が更新されています。最新の内容
+//   を確認してください。」)なので、このコンポーネントは言い換えずそのまま
+//   表示するだけ -- 保留には残る(他の失敗理由と同じくリトライ可能)。
+// - 指摘3/5b: 要確認/一括レビュー可の件数は outstanding_counts(未対応件
+//   数、apps/control-server/app/models.py の `AlignmentListOut.
+//   outstanding_counts`、確認済み)があればそれを使い、この画面が実際に出
+//   す action card の数と一致させる。古い Control Server(未対応)では従
+//   来どおり counts にフォールバックする。
 
 import { useState } from "react";
 import { toast } from "sonner";
@@ -245,10 +264,18 @@ function AuditDetail({ item }: { item: AlignmentItemOut }) {
 interface StagedAnswer {
   decision: AlignmentDecisionAction;
   note?: string;
+  // PR #296 review fix (2nd pass, Finding 2): the item's content_hash at the
+  // moment it was staged (from AlignmentItemOut.content_hash, read from the
+  // last GET .../alignment response). Sent back on submit so the server can
+  // detect the item changed underneath the staged answer; null/undefined
+  // when the response didn't provide one (older Control Server), in which
+  // case no staleness check is requested for this entry.
+  content_hash?: string | null;
 }
 
 function ReviewQueueItemCard({
-  item, sessionId, existingInquiry, bulkMode, bulkSending, stagedAnswer, onStageAnswer, onUnstageAnswer,
+  item, sessionId, existingInquiry, bulkMode, bulkSending, stagedAnswer, stagedError,
+  onStageAnswer, onUnstageAnswer,
 }: {
   item: AlignmentItemOut;
   sessionId: number;
@@ -256,6 +283,10 @@ function ReviewQueueItemCard({
   bulkMode: boolean;
   bulkSending: boolean;
   stagedAnswer?: StagedAnswer;
+  // PR #296 review fix (2nd pass, Finding 2): Japanese failure text from the
+  // most recent まとめて送信 attempt for this item, when it failed and
+  // stayed staged for retry.
+  stagedError?: string;
   onStageAnswer: (decision: AlignmentDecisionAction, note?: string) => void;
   onUnstageAnswer: () => void;
 }) {
@@ -451,6 +482,11 @@ function ReviewQueueItemCard({
               <Badge variant="secondary" data-testid={`review-item-staged-${item.id}`}>
                 回答予定: {DECISION_LABELS[stagedAnswer.decision]}
               </Badge>
+              {stagedError && (
+                <Badge variant="destructive" data-testid={`review-item-staged-error-${item.id}`}>
+                  {stagedError}
+                </Badge>
+              )}
               <Button
                 size="sm"
                 variant="outline"
@@ -561,7 +597,11 @@ function InformationalItemRow({
   existingInquiry?: InterviewInquiryOut;
   sample?: boolean;
 }) {
-  const [open, setOpen] = useState(!!sample);
+  // 指摘5b: サンプル確認は「現状(主張)」は常に表示しつつ、監査詳細
+  // (根拠・content_hash 等)は既定で折りたたむ -- 3件とはいえ初回表示から
+  // 監査情報まで展開されると確認疲れを招くため、非サンプル行と同じ既定閉
+  // にする。展開はトグルで常に可能。
+  const [open, setOpen] = useState(false);
   const [inquiryMode, setInquiryMode] = useState(false);
   const [hasHeldInquiry, setHasHeldInquiry] = useState(false);
   const [attachedInquiryId, setAttachedInquiryId] = useState<number | null>(null);
@@ -642,6 +682,11 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
   const [bulkSending, setBulkSending] = useState(false);
   const [pendingAnswers, setPendingAnswers] = useState<Record<number, StagedAnswer>>({});
   const [bulkResult, setBulkResult] = useState<{ success: number; failed: number } | null>(null);
+  // PR #296 review fix (2nd pass, Finding 2): per-item Japanese failure text
+  // from the most recent まとめて送信 attempt, keyed by item_id. Cleared
+  // whenever that item is re-staged/unstaged/succeeds, so a stale failure
+  // message never lingers past the situation that produced it.
+  const [itemErrors, setItemErrors] = useState<Record<number, string>>({});
 
   const handleBuild = () => {
     build.mutate(undefined, {
@@ -656,10 +701,24 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
     setBulkMode(m => !m);
     setPendingAnswers({});
     setBulkResult(null);
+    setItemErrors({});
   };
 
-  const stageAnswer = (itemId: number, decision: AlignmentDecisionAction, note?: string) => {
-    setPendingAnswers(prev => ({ ...prev, [itemId]: { decision, note } }));
+  // PR #296 review fix (2nd pass, Finding 2): captures the item's
+  // content_hash (as of the last GET .../alignment response) at staging
+  // time, so まとめて送信 can ask the server to validate the item hasn't
+  // changed since. Re-staging (回答を変更) refreshes it from the current
+  // `item`, so a stale hash never carries over past a retry.
+  const stageAnswer = (
+    itemId: number, decision: AlignmentDecisionAction, note?: string, contentHash?: string | null,
+  ) => {
+    setPendingAnswers(prev => ({ ...prev, [itemId]: { decision, note, content_hash: contentHash } }));
+    setItemErrors(prev => {
+      if (!(itemId in prev)) return prev;
+      const next = { ...prev };
+      delete next[itemId];
+      return next;
+    });
   };
 
   const unstageAnswer = (itemId: number) => {
@@ -668,9 +727,30 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
       delete next[itemId];
       return next;
     });
+    setItemErrors(prev => {
+      if (!(itemId in prev)) return prev;
+      const next = { ...prev };
+      delete next[itemId];
+      return next;
+    });
   };
 
   const pendingCount = Object.keys(pendingAnswers).length;
+
+  // PR #296 review fix (2nd pass, Finding 2): the Control Server's batch
+  // validation (verified in apps/control-server/app/routes/
+  // interview_alignment.py, `_validate_answer_target_for_batch` /
+  // `_BATCH_ERROR_*`) already authors its 2nd-round error strings in
+  // Japanese -- including the exact stale-content_hash case, whose message
+  // is literally "項目が更新されています。最新の内容を確認してください。"
+  // -- so this only needs to render `result.error` verbatim (never
+  // reworded/guessed client-side) with a Japanese fallback for the
+  // (currently impossible, but type-optional) case where the server omits
+  // it. Two pre-existing validation paths on the same endpoint (bad
+  // item_id / already-open-Inquiry) still return English text; that is a
+  // Control Server matter outside this dashboard-only change, not
+  // something to paper over with a client-side translation guess.
+  const failureMessage = (error: string | null | undefined) => error || "送信に失敗しました。もう一度お試しください。";
 
   // PR #296 review fix (Finding 5): one POST .../answers-batch call for the
   // whole staged set, instead of sequential per-item /answer calls (the
@@ -688,18 +768,22 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
       const response = await batchAnswer.mutateAsync(
         entries.map(([key, staged]) => ({
           item_id: Number(key), decision: staged.decision, note: staged.note,
+          content_hash: staged.content_hash,
         })),
       );
       const stillFailed: Record<number, StagedAnswer> = {};
+      const nextItemErrors: Record<number, string> = {};
       let success = 0;
       for (const result of response.results) {
         if (result.success) {
           success += 1;
         } else if (pendingAnswers[result.item_id]) {
           stillFailed[result.item_id] = pendingAnswers[result.item_id];
+          nextItemErrors[result.item_id] = failureMessage(result.error);
         }
       }
       setPendingAnswers(stillFailed);
+      setItemErrors(nextItemErrors);
       const failedCount = Object.keys(stillFailed).length;
       setBulkResult({ success, failed: failedCount });
       if (failedCount === 0) {
@@ -761,11 +845,25 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
       </CardHeader>
       <CardContent className="space-y-3">
         <div className="flex flex-wrap gap-1.5" data-testid="review-queue-category-summary">
-          {CATEGORY_SUMMARY.map(({ key, label }) => (
-            <Badge key={key} variant="outline" data-testid={`review-queue-summary-${key}`}>
-              {label} {full?.counts[key] ?? 0}件
-            </Badge>
-          ))}
+          {CATEGORY_SUMMARY.map(({ key, label }) => {
+            // PR #296 review fix (2nd pass, Finding 3/5b): the actionable
+            // categories (must_review/batch_reviewable) prefer
+            // outstanding_counts (未対応件数, matching this panel's own
+            // action-card count) over `counts` (a total that historically
+            // stays inclusive of already-answered items server-side).
+            // Non-actionable categories are unaffected and keep reading
+            // `counts`. Falls back to `counts` when an older Control Server
+            // doesn't send outstanding_counts yet.
+            const isActionable = key === "must_review" || key === "batch_reviewable";
+            const count = isActionable
+              ? (full?.outstanding_counts?.[key] ?? full?.counts[key] ?? 0)
+              : (full?.counts[key] ?? 0);
+            return (
+              <Badge key={key} variant="outline" data-testid={`review-queue-summary-${key}`}>
+                {label} {count}件
+              </Badge>
+            );
+          })}
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -814,7 +912,8 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
             bulkMode={bulkMode}
             bulkSending={bulkSending}
             stagedAnswer={pendingAnswers[item.id]}
-            onStageAnswer={(decision, note) => stageAnswer(item.id, decision, note)}
+            stagedError={itemErrors[item.id]}
+            onStageAnswer={(decision, note) => stageAnswer(item.id, decision, note, item.content_hash)}
             onUnstageAnswer={() => unstageAnswer(item.id)}
           />
         ))}

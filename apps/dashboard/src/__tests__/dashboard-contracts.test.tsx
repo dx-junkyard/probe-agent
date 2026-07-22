@@ -3316,6 +3316,146 @@ describe("Interview page", () => {
     expect(screen.getByTestId("review-queue-build-button")).toBeInTheDocument();
   });
 
+  // PR #296 review fix (2nd pass, Finding 4): "build 済みだから Alignment
+  // Review が既定" は、会話タブ側にまだ必須操作(ここでは fill_gaps の
+  // 「この理解を確認済みにする」)が残っているケースでは適用されない --
+  // 既定は会話タブのままで、必須操作を見失わせない。
+  test("会話タブに必須アクションが残っている build 済みセッションでは既定が会話タブになり、バナーから会話タブへ移動できる", async () => {
+    mockInterviewApi({
+      session: {
+        stage: "capability_confirmation",
+        understanding_confirmed_at: null,
+        understanding_confirmed_by: null,
+        current_understanding: {
+          system_purpose: [understandingItem("Summarize documents")],
+          core_capabilities: [],
+          capability_elements: [],
+          supporting_elements: [],
+          api_boundaries: [],
+          probe_flow_candidates: [],
+        },
+      },
+    });
+    const item = alignmentItem({ id: 5, review_category: "batch_reviewable" });
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7/alignment") {
+        return Promise.resolve({
+          session_id: 7,
+          system_id: 1,
+          items_by_category: {
+            must_review: [], batch_reviewable: [item], no_review_required: [], unchanged: [], informational: [],
+          },
+          counts: { must_review: 0, batch_reviewable: 1, no_review_required: 0, unchanged: 0, informational: 0 },
+        });
+      }
+      if (path === "/interview/sessions/7/review-queue") {
+        return Promise.resolve({ session_id: 7, system_id: 1, items: [item] });
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // Alignment has been built (a batch_reviewable item exists), but the
+    // session still needs a conversation-tab action (fill_gaps stage +
+    // canConfirmStructuredUnderstanding) -- the default must stay on the
+    // conversation tab, not Alignment Review.
+    expect(await screen.findByTestId("main-tab-content-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("main-tab-content-alignment")).not.toBeInTheDocument();
+    expect(screen.getByTestId("confirm-understanding")).toBeInTheDocument();
+
+    // Switching to the Alignment Review tab manually still works...
+    fireEvent.click(screen.getByTestId("main-tab-alignment"));
+    expect(await screen.findByTestId("main-tab-content-alignment")).toBeInTheDocument();
+
+    // ...but since a required action still lives in the conversation tab,
+    // the next-action banner (which sits above the tabs, reachable from
+    // either) offers a direct way back instead of pointing at a control
+    // hidden behind the currently-shown tab.
+    const goToConversation = await screen.findByTestId("next-action-go-to-conversation");
+    fireEvent.click(goToConversation);
+    expect(await screen.findByTestId("main-tab-content-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("main-tab-content-alignment")).not.toBeInTheDocument();
+  });
+
+  // PR #296 review fix (2nd pass, Finding 5a/5b/3): outstanding_counts feeds
+  // both the tab label and AlignmentSummaryHeader's counts (matching the
+  // Review Queue's own card count), and the gap summary shows the top
+  // outstanding gap's text instead of only a count.
+  test("outstanding_counts がタブ件数とギャップサマリの件数に使われ、Review Queue のカード数と一致する", async () => {
+    mockInterviewApi();
+    const answeredItem = alignmentItem({
+      id: 1, review_category: "must_review", status: "answered",
+      gap_summary: "解消済みの古いギャップ文言",
+    });
+    const openItem = alignmentItem({
+      id: 2, review_category: "must_review",
+      gap_summary: "承認フローが自動化されていません",
+      current_claim: "現在は手動で承認している",
+    });
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7/alignment") {
+        return Promise.resolve({
+          session_id: 7,
+          system_id: 1,
+          items_by_category: {
+            must_review: [answeredItem, openItem], batch_reviewable: [], no_review_required: [], unchanged: [], informational: [],
+          },
+          // `counts` stays a total (2, including the already-answered
+          // item); `outstanding_counts` (未対応件数) is 1, matching the
+          // review-queue response below exactly.
+          counts: { must_review: 2, batch_reviewable: 0, no_review_required: 0, unchanged: 0, informational: 0 },
+          outstanding_counts: { must_review: 1, batch_reviewable: 0, no_review_required: 0, unchanged: 0, informational: 0 },
+        });
+      }
+      if (path === "/interview/sessions/7/review-queue") {
+        return Promise.resolve({ session_id: 7, system_id: 1, items: [openItem] });
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // Tab label count uses outstanding_counts (1), not counts (2).
+    expect(await screen.findByTestId("main-tab-alignment")).toHaveTextContent("Alignment Review (1)");
+
+    // AlignmentSummaryHeader shows the top outstanding gap's own text (not
+    // the resolved item's stale gap text) plus the matching outstanding
+    // count.
+    const gapItem0 = await screen.findByTestId("alignment-summary-gap-item-0");
+    expect(gapItem0).toHaveTextContent("承認フローが自動化されていません");
+    expect(screen.queryByText("解消済みの古いギャップ文言")).not.toBeInTheDocument();
+    expect(screen.getByTestId("alignment-summary-gap-count")).toHaveTextContent("要確認 1件");
+
+    // The Review Queue panel's own category summary agrees, and renders
+    // exactly the one outstanding item as an action card.
+    expect(await screen.findByTestId("review-queue-summary-must_review")).toHaveTextContent("要確認 1件");
+    expect(screen.getByTestId("review-item-2")).toBeInTheDocument();
+    expect(screen.queryByTestId("review-item-1")).not.toBeInTheDocument();
+  });
+
   // PR #296 review restructure / previous reviewer's note (Finding 4): a
   // just-investigated question's qa.investigation conclusion must be visible
   // in the same view as the focused question, not only inside the Q&A list.

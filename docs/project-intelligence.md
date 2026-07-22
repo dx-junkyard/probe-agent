@@ -4002,3 +4002,41 @@ Issue #295 は Interview Alignment UX の元提案であり、その大部分は
    ReviewQueuePanel)を既定表示。サイドバーの Review Queue 二重表示を
    撤去し、`qa.investigation` の結論表示を focused question と同じ
    ビューでも表示する(`QaInvestigationBlock` 共有)。
+
+### PR #296 2回目レビュー対応
+
+初回レビュー対応後の再レビューで残った P1×2・P2×3 への修正。
+
+1. **carry-over が Intent/上位概念変更を検知(指摘1, P1)**:
+   `compute_content_hash` に `intent_item_id`(リンク先 Intent の生 FK)と
+   `linked_intent_digest`(リンク先 `interview_intent_item` の
+   field/value_text/status の sha256)を追加。`/correct` は新 id を発行、
+   `/confirm`・`/decline` は同 id で status が変わるため、どちらも
+   ハッシュが変化し「LLM が同じ要約を返しても依存 Intent が変わった」
+   ケースを項目単位で検知する。加えて goal 専用だった再ビルドガードを
+   **確定済み(confirmed/not_applicable)Intent フィールドのいずれかが
+   直前ビルド以降に更新された場合**へ一般化(全項目を再分類)。
+   Core Capability は per-capability の確定タイムスタンプ列が存在せず
+   決定的判定源が無いため今回は対象外(ヒューリスティック差分は
+   Principle 6 で禁止のため実装しない)。
+2. **回答対象の検証強化(指摘2, P1)**: batch の項目検証に
+   `superseded=1` 拒否・回答可能 status(open/held)以外の拒否・
+   actionable category(must_review/batch_reviewable)以外の拒否・
+   optional な `content_hash` 不一致拒否を追加。単体 answer/correct/hold
+   にも `_reject_if_superseded`(409, `alignment_item_superseded`)を追加。
+   別タブや自動更新で履歴化した項目を古い判断で上書きできない。
+3. **未対応件数の分離(指摘3, P2)**: `AlignmentListOut` に
+   `outstanding_counts` を追加(get_review_queue と同一述語 = superseded=0
+   かつ status NOT IN answered/corrected)。`counts`(現行行総数)は互換
+   維持。UI の要確認・一括レビュー可の件数は outstanding_counts を優先
+   使用し Review Queue のカード数と一致させる。
+4. **既定タブの必須操作優先(指摘4, P2)**: 既定タブを
+   「会話タブに必須アクションが残る間は会話」優先に変更(alignmentBuilt
+   だけで alignment を既定にしない)。会話タブの必須アクションがある間は
+   NextActionBanner に「会話タブへ移動」導線を出し、どのタブからも必須
+   操作へ到達できるようにした。
+5. **gap サマリの内容表示とサンプルの情報量抑制(指摘5, P2)**:
+   AlignmentSummaryHeader のギャップ欄に最重要 gap の要約
+   (gap_summary || current_claim、未対応のみ、Review Queue と同じ決定的
+   順序)を主表示し件数を補助に。確認不要サンプルの根拠・content_hash は
+   初期折りたたみ(主張のみ表示)にして確認疲れを抑制。

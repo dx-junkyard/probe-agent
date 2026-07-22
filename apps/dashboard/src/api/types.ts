@@ -1093,6 +1093,15 @@ export interface AlignmentListOut {
   // older Control Server) degrades to "no history shown" instead of
   // breaking the page.
   superseded_items?: AlignmentItemOut[];
+  // Review fix (PR #296, 2nd pass, Finding 3/5b): per-category count of
+  // items NOT YET resolved (superseded=0 AND status NOT IN
+  // (answered, corrected)) -- matches the Review Queue's card count
+  // exactly, unlike `counts` which stays a total. Field name confirmed
+  // against apps/control-server/app/models.py's
+  // `AlignmentListOut.outstanding_counts`. Optional so a response predating
+  // this field (or an older Control Server) falls back to `counts` instead
+  // of breaking.
+  outstanding_counts?: Record<string, number>;
 }
 
 // --- Batch answer (PR #296 review fix, Finding 5) ----------------------------
@@ -1101,6 +1110,15 @@ export interface AlignmentBatchAnswerItemRequest {
   item_id: number;
   decision: AlignmentDecisionAction;
   note?: string;
+  // Review fix (PR #296, 2nd pass, Finding 2): when provided (read from this
+  // item's AlignmentItemOut.content_hash at the time it was staged), the
+  // server validates the item has not changed since, failing only this
+  // entry (never the whole batch) on a mismatch, with an already-Japanese
+  // `error` message. Field name confirmed against
+  // apps/control-server/app/models.py's
+  // `AlignmentBatchAnswerItemRequest.content_hash`. Optional/omit-safe so
+  // older Control Servers that don't validate it simply ignore the field.
+  content_hash?: string | null;
 }
 
 export interface AlignmentBatchAnswerItemResult {

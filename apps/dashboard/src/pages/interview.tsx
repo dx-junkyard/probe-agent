@@ -60,6 +60,8 @@ import { Textarea } from "@/components/ui/textarea";
 import { formatTimestamp } from "@/lib/utils";
 import { buildPatchFilename, downloadTextFile } from "@/lib/patch";
 import type {
+  AlignmentItemOut,
+  AlignmentListOut,
   CurrentUnderstanding,
   IntelligenceRunEvidenceOut,
   InterviewMaterializeOut,
@@ -414,13 +416,22 @@ function ProgressSteps({ current }: { current: InterviewStage }) {
   );
 }
 
-function NextActionBanner({ uiState, nextAction }: {
+// PR #296 review fix (Finding 4): the banner sits above the main tabs, so a
+// required conversation-tab action (see `conversationHasRequiredAction`
+// below) must stay reachable regardless of which tab is currently shown --
+// otherwise this banner can point at a CTA that lives in the other tab.
+// `onGoToConversation` renders that escape hatch; callers only pass it (and
+// `showGoToConversation`) when the currently displayed tab is NOT the
+// conversation tab and a required action lives there.
+function NextActionBanner({ uiState, nextAction, showGoToConversation, onGoToConversation }: {
   uiState: InterviewUiState;
   nextAction: string;
+  showGoToConversation?: boolean;
+  onGoToConversation?: () => void;
 }) {
   return (
     <div
-      className="rounded-md border bg-muted/40 p-3 flex items-start gap-3"
+      className="rounded-md border bg-muted/40 p-3 flex items-start gap-3 flex-wrap sm:flex-nowrap"
       data-testid="next-action"
     >
       {uiState === "preparing" ? (
@@ -428,13 +439,25 @@ function NextActionBanner({ uiState, nextAction }: {
       ) : (
         <Sparkles className="h-4 w-4 mt-0.5 shrink-0 text-primary" />
       )}
-      <div className="min-w-0">
+      <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
           <Badge variant="secondary">{UI_STATE_LABELS[uiState]}</Badge>
           <span className="text-xs font-medium text-muted-foreground">次にやること</span>
         </div>
         <p className="text-sm mt-1">{nextAction}</p>
       </div>
+      {showGoToConversation && onGoToConversation && (
+        <Button
+          size="sm"
+          variant="outline"
+          className="shrink-0"
+          onClick={onGoToConversation}
+          data-testid="next-action-go-to-conversation"
+        >
+          <MessageSquareText className="h-4 w-4 mr-1" />
+          会話タブへ移動
+        </Button>
+      )}
     </div>
   );
 }
@@ -1182,19 +1205,32 @@ function UnderstandingDiffPanel({
   );
 }
 
-// PR #296 レビュー指摘対応(画面構造の再構成): Alignment Review の主領域
-// 上部に置く「あなたが実現したいこと / システムの現状 / ギャップ」サマリ。
-// Intent Brief 編集・現在の理解の詳細はサイドバーの既存パネルに任せ、ここ
-// では全体量を一目で把握できる短い読み取り専用サマリだけを表示する
-// (Issue #295 §6 の推奨構成)。新しい判断ロジックは持たず、既存の
-// intent list / current understanding / alignment counts をそのまま要約
+// PR #296 レビュー指摘対応(画面構造の再構成 / 指摘5a): Alignment Review の
+// 主領域上部に置く「あなたが実現したいこと / システムの現状 / ギャップ」
+// サマリ。Intent Brief 編集・現在の理解の詳細はサイドバーの既存パネルに
+// 任せ、ここでは全体量を一目で把握できる短い読み取り専用サマリだけを表示
+// する(Issue #295 §6 の推奨構成)。新しい判断ロジックは持たず、既存の
+// intent list / current understanding / alignment items をそのまま要約
 // するだけ。
+//
+// 指摘5a: 「ギャップ」を件数だけでなく、最重要 gap の名称・要約を主に表示
+// する。候補は alignment_state==='gap' の項目、または must_review 項目
+// (gap_summary があればそれを、無ければ current_claim を使う)。並び順は
+// Review Queue と同じカテゴリ優先度(must_review → batch_reviewable、
+// CATEGORY_SUMMARY と同じ固定順)+ id昇順というこのコードベース既存の
+// 決定的タイブレーク(review-queue.tsx §5.4 のサンプル抽出と同じ規則)を
+// 再利用するだけで、新しい並び替えロジックは追加しない。
+//
+// 件数には、バックエンドが返す outstanding_counts(未対応件数 = superseded
+// でなく answered/corrected でもない件数、Review Queue のカード数と一致)
+// があればそれを優先し、無ければ従来の counts(総数)にフォールバックする
+// (指摘3のフロント側整合)。
 function AlignmentSummaryHeader({
-  intentList, understanding, counts,
+  intentList, understanding, alignment,
 }: {
   intentList: InterviewIntentListOut | null | undefined;
   understanding: CurrentUnderstanding | null | undefined;
-  counts: Record<string, number> | undefined;
+  alignment: AlignmentListOut | null | undefined;
 }) {
   const goalItems = intentList?.items_by_field["goal"] ?? [];
   const confirmedGoal = goalItems.find(i => i.status === "confirmed") ?? goalItems[0];
@@ -1202,8 +1238,28 @@ function AlignmentSummaryHeader({
     .map(i => i.name)
     .filter(Boolean)
     .slice(0, 3);
-  const mustReview = counts?.must_review ?? 0;
-  const batchReviewable = counts?.batch_reviewable ?? 0;
+  const counts = alignment?.counts;
+  const outstanding = alignment?.outstanding_counts;
+  const mustReview = outstanding?.must_review ?? counts?.must_review ?? 0;
+  const batchReviewable = outstanding?.batch_reviewable ?? counts?.batch_reviewable ?? 0;
+
+  // アウトスタンディング(未対応)のギャップだけを候補にする -- 既に
+  // answered/corrected な行や superseded な行の古いギャップ文言を「最重要
+  // ギャップ」として出さないため、Review Queue が実際に action card として
+  // 出す条件(status not answered/corrected, not superseded)と同じ絞り込み
+  // を先にかける。
+  const byIdAscending = (a: AlignmentItemOut, b: AlignmentItemOut) => a.id - b.id;
+  const isOutstanding = (item: AlignmentItemOut) =>
+    item.status !== "answered" && item.status !== "corrected" && !item.superseded;
+  const mustReviewItems = [...(alignment?.items_by_category["must_review"] ?? [])]
+    .filter(isOutstanding).sort(byIdAscending);
+  const batchReviewableItems = [...(alignment?.items_by_category["batch_reviewable"] ?? [])]
+    .filter(isOutstanding).sort(byIdAscending);
+  const gapItems = [...mustReviewItems, ...batchReviewableItems]
+    .filter(item => item.alignment_state === "gap" || item.review_category === "must_review");
+  const gapTexts = gapItems.map(item => item.gap_summary || item.current_claim);
+  const topGapTexts = gapTexts.slice(0, 2);
+  const remainingGapCount = Math.max(gapTexts.length - topGapTexts.length, 0);
 
   return (
     <div className="grid grid-cols-1 md:grid-cols-3 gap-3" data-testid="alignment-summary-header">
@@ -1221,7 +1277,21 @@ function AlignmentSummaryHeader({
       </div>
       <div className="rounded-md border p-3 space-y-1" data-testid="alignment-summary-gap">
         <p className="text-[10px] font-semibold uppercase text-muted-foreground">ギャップ</p>
-        <p className="text-sm">
+        {topGapTexts.length > 0 ? (
+          <div className="space-y-0.5" data-testid="alignment-summary-gap-list">
+            {topGapTexts.map((text, i) => (
+              <p key={i} className="text-sm break-words" data-testid={`alignment-summary-gap-item-${i}`}>
+                {text}
+              </p>
+            ))}
+            {remainingGapCount > 0 && (
+              <p className="text-xs text-muted-foreground">ほか {remainingGapCount}件</p>
+            )}
+          </div>
+        ) : (
+          <p className="text-sm text-muted-foreground">未確認のギャップはありません</p>
+        )}
+        <p className="text-xs text-muted-foreground" data-testid="alignment-summary-gap-count">
           要確認 {mustReview}件 · 一括レビュー可 {batchReviewable}件
         </p>
       </div>
@@ -1328,27 +1398,61 @@ export default function InterviewPage() {
   // 情報不足だった場合、モデルの確認質問が open_questions に残る。
   const proposalNarrowing =
     uiState === "ready_for_proposals" && (session?.open_questions ?? []).length > 0;
+  // 「この理解を確認済みにする」ボタン(会話タブ内)がまだ有効な状態かどうか。
+  // uiState の判定より先に定義し、下の会話タブ必須アクション判定から参照する。
+  const canConfirmStructuredUnderstanding = !!(
+    session?.current_understanding && session.understanding_confirmed_at == null
+  );
 
   // PR #296 review restructure: 「build 済み(=突き合わせ項目が1件以上あ
   // る)」を、現在の GET .../alignment レスポンスの実項目数から決定的に
   // 判定する(サーバーに専用フラグは無い)。superseded_items は履歴だが
   // 「一度は build された」事実には変わらないため合算する。
   const alignmentItemCounts = alignmentFull?.counts;
+  const alignmentOutstandingCounts = alignmentFull?.outstanding_counts;
   const totalAlignmentItems = alignmentFull
     ? Object.values(alignmentFull.items_by_category).reduce((n, arr) => n + (arr?.length ?? 0), 0)
       + (alignmentFull.superseded_items?.length ?? 0)
     : 0;
   const alignmentBuilt = totalAlignmentItems > 0;
+  // 指摘3/5b のフロント側整合: 実行可能(actionable)カテゴリの件数は
+  // outstanding_counts(未対応件数)を優先し、Review Queue のカード数と一致
+  // させる。古い Control Server(outstanding_counts 未対応)では従来どおり
+  // counts(総数)にフォールバックする。
   const alignmentActionableCount =
-    (alignmentItemCounts?.must_review ?? 0) + (alignmentItemCounts?.batch_reviewable ?? 0);
-  // 既定表示: build 済みなら Alignment Review、未 build なら従来どおり
-  // 会話を既定にする。ユーザーが明示的にタブを切り替えた場合はそちらを
-  // 優先するが、その選択は選択中のセッションに限って有効にする(別セッ
-  // ションへ切り替えたときに古い選択を持ち越さない)。
+    (alignmentOutstandingCounts?.must_review ?? alignmentItemCounts?.must_review ?? 0)
+    + (alignmentOutstandingCounts?.batch_reviewable ?? alignmentItemCounts?.batch_reviewable ?? 0);
+
+  // PR #296 review fix (Finding 4): 「build 済みだから既定は Alignment
+  // Review」という以前の判定は、会話タブ側にまだ必須操作が残っている状態
+  // (例: 初回の理解確認・不足情報への回答・ゼロベース質問・提案生成待ち)
+  // でも Alignment Review を既定にしてしまい、次にやること(NextActionBanner)
+  // が指す操作が別タブに隠れる問題があった。会話タブで行うべき必須操作が
+  // 「無い」と言えるのは、uiState が proposal_review(提案のレビュー・承認
+  // は Alignment タブ側で完結する)であり、かつ canConfirmStructuredUnderstanding
+  // も false のときだけ -- それ以外の全 uiState(preparing/needs_build/
+  // confirm_understanding/fill_gaps/zero_base/ready_for_proposals。
+  // proposalNarrowing は ready_for_proposals の部分集合なので個別チェック
+  // は不要)は会話タブでの対応が必須なので、alignmentBuilt であっても既定
+  // は会話タブのままにする。新しいサーバーフラグは使わず、既存の
+  // uiState/canConfirmStructuredUnderstanding から決定的に導出するだけ。
+  const conversationHasRequiredAction = !!(
+    canConfirmStructuredUnderstanding || (uiState && uiState !== "proposal_review")
+  );
+  // ユーザーが明示的にタブを切り替えた場合はそちらを優先するが、その選択は
+  // 選択中のセッションに限って有効にする(別セッションへ切り替えたときに
+  // 古い選択を持ち越さない)。
   const manualMainTab =
     manualMainTabState?.sessionId === selectedSessionId ? manualMainTabState.value : null;
   const mainTab: "alignment" | "conversation" =
-    manualMainTab ?? (alignmentBuilt ? "alignment" : "conversation");
+    manualMainTab ?? (alignmentBuilt && !conversationHasRequiredAction ? "alignment" : "conversation");
+  // 指摘4: どのタブを見ていても必須操作(会話タブ)へ到達できるよう、必須
+  // アクションが会話タブ側にあり、かつ今表示中のタブが会話タブでない場合に
+  // NextActionBanner から会話タブへ切り替える導線を出す。
+  const showGoToConversationInBanner = conversationHasRequiredAction && mainTab !== "conversation";
+  const goToConversationTab = () => {
+    setManualMainTabState({ sessionId: selectedSessionId, value: "conversation" });
+  };
 
   useEffect(() => {
     if (!selectedSessionId && sortedSessions.length > 0) {
@@ -1377,9 +1481,6 @@ export default function InterviewPage() {
   const zeroBaseComplete =
     uiState === "zero_base" &&
     (userMessageCount >= ZERO_BASE_QUESTIONS.length || isProposalStage);
-  const canConfirmStructuredUnderstanding = !!(
-    session?.current_understanding && session.understanding_confirmed_at == null
-  );
 
   // 現在ユーザーに求める「1つの質問/確認」を導出する。
   const focusedQuestion = useMemo<FocusedQuestion | null>(() => {
@@ -1821,7 +1922,14 @@ export default function InterviewPage() {
             </div>
           )}
 
-          {uiState && <NextActionBanner uiState={uiState} nextAction={nextActionText} />}
+          {uiState && (
+            <NextActionBanner
+              uiState={uiState}
+              nextAction={nextActionText}
+              showGoToConversation={showGoToConversationInBanner}
+              onGoToConversation={goToConversationTab}
+            />
+          )}
 
           <Card>
             <CardContent className="py-3">
@@ -1832,11 +1940,20 @@ export default function InterviewPage() {
           <div className="grid grid-cols-1 xl:grid-cols-[1fr_380px] gap-4">
             {/* メイン: PR #296 レビュー指摘対応 -- Alignment Review(意図と
                 現状の突き合わせをまとめて判断する)と会話(focused question /
-                自由入力)をタブで切り替える主操作領域。build 済み(突き合わ
-                せ項目が1件以上ある)セッションでは Alignment Review を既定
-                にし、それ以外は従来どおり会話を既定にする(Issue #295 §6)。
-                どちらのタブも常に到達できるので、build 済みでも未回答の
-                focused question や自由入力を見失わない。 */}
+                自由入力)をタブで切り替える主操作領域。
+                指摘4: 「build 済みなら Alignment Review を既定にする」だけ
+                では、会話タブ側にまだ必須操作(初回の理解確認・不足情報へ
+                の回答・ゼロベース質問・提案生成待ちなど)が残っている間も
+                Alignment Review が既定になり、NextActionBanner の CTA が
+                別タブに隠れてしまっていた。既定タブは
+                `conversationHasRequiredAction`(既存の uiState /
+                canConfirmStructuredUnderstanding から決定的に導出、新しい
+                サーバーフラグは追加しない)が false -- つまり会話タブでの
+                必須操作が残っていない(例: proposal_review)-- かつ
+                build 済みのときに限り Alignment Review にする(Issue #295
+                §6)。どちらのタブも常に到達できる上、会話タブに必須操作が
+                残っている間は NextActionBanner に「会話タブへ移動」ボタン
+                が出る。 */}
             <div className="space-y-4">
               <Tabs
                 value={mainTab}
@@ -1864,7 +1981,7 @@ export default function InterviewPage() {
                       <AlignmentSummaryHeader
                         intentList={intentList}
                         understanding={session.current_understanding}
-                        counts={alignmentItemCounts}
+                        alignment={alignmentFull}
                       />
                     </CardContent>
                   </Card>
