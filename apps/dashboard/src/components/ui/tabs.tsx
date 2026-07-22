@@ -23,15 +23,27 @@ function Tabs({ defaultValue, value, onValueChange, children, className }: {
   );
 }
 
-function TabsList({ children, className }: { children: ReactNode; className?: string }) {
+function TabsList({ children, className, ...rest }: {
+  children: ReactNode;
+  className?: string;
+  "data-testid"?: string;
+}) {
   return (
-    <div className={cn("inline-flex h-9 items-center justify-center rounded-lg bg-muted p-1 text-muted-foreground", className)}>
+    <div
+      className={cn("inline-flex h-9 items-center justify-center rounded-lg bg-muted p-1 text-muted-foreground", className)}
+      {...rest}
+    >
       {children}
     </div>
   );
 }
 
-function TabsTrigger({ value, children, className }: { value: string; children: ReactNode; className?: string }) {
+function TabsTrigger({ value, children, className, ...rest }: {
+  value: string;
+  children: ReactNode;
+  className?: string;
+  "data-testid"?: string;
+}) {
   const ctx = useContext(TabsContext);
   const active = ctx.value === value;
   return (
@@ -43,16 +55,22 @@ function TabsTrigger({ value, children, className }: { value: string; children: 
         className,
       )}
       onClick={() => ctx.onChange(value)}
+      {...rest}
     >
       {children}
     </button>
   );
 }
 
-function TabsContent({ value, children, className }: { value: string; children: ReactNode; className?: string }) {
+function TabsContent({ value, children, className, ...rest }: {
+  value: string;
+  children: ReactNode;
+  className?: string;
+  "data-testid"?: string;
+}) {
   const ctx = useContext(TabsContext);
   if (ctx.value !== value) return null;
-  return <div className={cn("mt-2", className)}>{children}</div>;
+  return <div className={cn("mt-2", className)} {...rest}>{children}</div>;
 }
 
 export { Tabs, TabsList, TabsTrigger, TabsContent };

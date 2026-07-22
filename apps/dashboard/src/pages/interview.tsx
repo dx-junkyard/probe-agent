@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import {
   useActiveInquiriesByOrigin,
+  useAlignmentList,
   useAnswerInterviewQa,
   useApproveInterviewProposal,
   useConfirmInterviewUnderstanding,
@@ -16,6 +17,7 @@ import {
   useInterviewApprovedSet,
   useInterviewContextPack,
   useInterviewDialogueTurn,
+  useInterviewIntentList,
   useInterviewQaList,
   useInterviewSession,
   useInterviewSessions,
@@ -53,6 +55,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { formatTimestamp } from "@/lib/utils";
 import { buildPatchFilename, downloadTextFile } from "@/lib/patch";
@@ -65,6 +68,7 @@ import type {
   InterviewProposalProbePlan,
   InquiryRouteCategory,
   InterviewInquiryOut,
+  InterviewIntentListOut,
   InterviewQaOut,
   InterviewQuestionEvidenceRef,
   InterviewSessionDetailOut,
@@ -435,6 +439,87 @@ function NextActionBanner({ uiState, nextAction }: {
   );
 }
 
+// Issue #295 PR #296 review restructure (Finding: Alignment Review layout):
+// 調査結果(qa.investigation)の表示を Q&A一覧カード専用から切り出した
+// 共有コンポーネント。focused question カード(画面中央)と Q&A一覧カード
+// (サイドバー)の両方から同じ内容・同じ testid で表示できるようにする。
+// `onTranscribe` を渡した場合だけ「回答欄に転記」ボタンを出す(focused
+// question 側は会話の message 欄に、Q&A一覧側は回答ドラフトに転記する)。
+function QaInvestigationBlock({
+  qaId, investigation, routeCategory, onTranscribe,
+}: {
+  qaId: number;
+  investigation: NonNullable<InterviewQaOut["investigation"]>;
+  routeCategory?: InquiryRouteCategory | null;
+  onTranscribe?: () => void;
+}) {
+  const [showEvidence, setShowEvidence] = useState(false);
+  return (
+    <div
+      className="rounded-md border p-2 text-xs space-y-1 bg-sky-500/5"
+      data-testid={`qa-investigation-${qaId}`}
+    >
+      {investigation.status === "completed" ? (
+        <>
+          <p className="font-medium">AIの調査結果: {investigation.conclusion}</p>
+          {investigation.key_points.length > 0 && (
+            <ul className="list-disc pl-4">
+              {investigation.key_points.map((k, i) => <li key={i}>{k}</li>)}
+            </ul>
+          )}
+          {routeCategory === "hybrid" && investigation.decision_question && (
+            <p
+              className="rounded border border-amber-500/60 bg-amber-500/10 px-2 py-1 font-medium text-amber-800"
+              data-testid={`qa-investigation-decision-question-${qaId}`}
+            >
+              確認したいこと: {investigation.decision_question}
+            </p>
+          )}
+          <div className="flex flex-wrap gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setShowEvidence(s => !s)}
+              data-testid={`qa-investigation-show-evidence-${qaId}`}
+            >
+              {showEvidence ? "根拠を隠す" : "根拠を見る"}
+            </Button>
+            {onTranscribe && (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={onTranscribe}
+                data-testid={`qa-investigation-transcribe-${qaId}`}
+              >
+                調査結果を回答欄に転記
+              </Button>
+            )}
+          </div>
+          {showEvidence && (
+            <div
+              className="mt-1 space-y-1 rounded bg-background/60 p-2"
+              data-testid={`qa-investigation-evidence-${qaId}`}
+            >
+              {investigation.evidence.map((e, i) => (
+                <p key={i} className="font-mono text-[10px] text-muted-foreground">
+                  {e.path}:{e.start_line}-{e.end_line}{e.summary ? ` — ${e.summary}` : ""}
+                </p>
+              ))}
+              {investigation.uncertainty && (
+                <p className="text-muted-foreground">不確実な点: {investigation.uncertainty}</p>
+              )}
+            </div>
+          )}
+        </>
+      ) : (
+        <p className="text-muted-foreground italic" data-testid={`qa-investigation-unresolved-${qaId}`}>
+          AIの調査では特定できませんでした
+        </p>
+      )}
+    </div>
+  );
+}
+
 // Q&A一覧パネル(Issue #129)。会話ログとは別に、質問・回答をIDベースで
 // 一覧・編集・スキップできる。回答の修正は新しいリビジョン行として保存され、
 // 旧回答も previous として残る(上書きしない)。
@@ -470,10 +555,6 @@ function QaItemCard({
   const [hasHeldInquiry, setHasHeldInquiry] = useState(false);
   const [attachedInquiryId, setAttachedInquiryId] = useState<number | null>(null);
   const [handoffOpen, setHandoffOpen] = useState(false);
-  // Issue #286 review fix (Finding 1): collapsible "根拠を見る" for this
-  // question's persisted Investigation Agent result, mirroring
-  // InquiryMessageBubble's showEvidence pattern.
-  const [showInvestigationEvidence, setShowInvestigationEvidence] = useState(false);
   // Issue #295 §4.8: true only while THIS card's 「わからない」 auto-
   // investigation is in flight (derived from the shared controller, not
   // local state) -- drives the short status line.
@@ -624,66 +705,12 @@ function QaItemCard({
       )}
 
       {qa.investigation && (
-        <div
-          className="rounded-md border p-2 text-xs space-y-1 bg-sky-500/5"
-          data-testid={`qa-investigation-${qa.id}`}
-        >
-          {qa.investigation.status === "completed" ? (
-            <>
-              <p className="font-medium">AIの調査結果: {qa.investigation.conclusion}</p>
-              {qa.investigation.key_points.length > 0 && (
-                <ul className="list-disc pl-4">
-                  {qa.investigation.key_points.map((k, i) => <li key={i}>{k}</li>)}
-                </ul>
-              )}
-              {qa.route_category === "hybrid" && qa.investigation.decision_question && (
-                <p
-                  className="rounded border border-amber-500/60 bg-amber-500/10 px-2 py-1 font-medium text-amber-800"
-                  data-testid={`qa-investigation-decision-question-${qa.id}`}
-                >
-                  確認したいこと: {qa.investigation.decision_question}
-                </p>
-              )}
-              <div className="flex flex-wrap gap-2">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => setShowInvestigationEvidence(s => !s)}
-                  data-testid={`qa-investigation-show-evidence-${qa.id}`}
-                >
-                  {showInvestigationEvidence ? "根拠を隠す" : "根拠を見る"}
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={transcribeInvestigationConclusion}
-                  data-testid={`qa-investigation-transcribe-${qa.id}`}
-                >
-                  調査結果を回答欄に転記
-                </Button>
-              </div>
-              {showInvestigationEvidence && (
-                <div
-                  className="mt-1 space-y-1 rounded bg-background/60 p-2"
-                  data-testid={`qa-investigation-evidence-${qa.id}`}
-                >
-                  {qa.investigation.evidence.map((e, i) => (
-                    <p key={i} className="font-mono text-[10px] text-muted-foreground">
-                      {e.path}:{e.start_line}-{e.end_line}{e.summary ? ` — ${e.summary}` : ""}
-                    </p>
-                  ))}
-                  {qa.investigation.uncertainty && (
-                    <p className="text-muted-foreground">不確実な点: {qa.investigation.uncertainty}</p>
-                  )}
-                </div>
-              )}
-            </>
-          ) : (
-            <p className="text-muted-foreground italic" data-testid={`qa-investigation-unresolved-${qa.id}`}>
-              AIの調査では特定できませんでした
-            </p>
-          )}
-        </div>
+        <QaInvestigationBlock
+          qaId={qa.id}
+          investigation={qa.investigation}
+          routeCategory={qa.route_category as InquiryRouteCategory}
+          onTranscribe={transcribeInvestigationConclusion}
+        />
       )}
 
       {qa.answer_text && !editing && (
@@ -1155,6 +1182,53 @@ function UnderstandingDiffPanel({
   );
 }
 
+// PR #296 レビュー指摘対応(画面構造の再構成): Alignment Review の主領域
+// 上部に置く「あなたが実現したいこと / システムの現状 / ギャップ」サマリ。
+// Intent Brief 編集・現在の理解の詳細はサイドバーの既存パネルに任せ、ここ
+// では全体量を一目で把握できる短い読み取り専用サマリだけを表示する
+// (Issue #295 §6 の推奨構成)。新しい判断ロジックは持たず、既存の
+// intent list / current understanding / alignment counts をそのまま要約
+// するだけ。
+function AlignmentSummaryHeader({
+  intentList, understanding, counts,
+}: {
+  intentList: InterviewIntentListOut | null | undefined;
+  understanding: CurrentUnderstanding | null | undefined;
+  counts: Record<string, number> | undefined;
+}) {
+  const goalItems = intentList?.items_by_field["goal"] ?? [];
+  const confirmedGoal = goalItems.find(i => i.status === "confirmed") ?? goalItems[0];
+  const purposeNames = (understanding?.system_purpose ?? [])
+    .map(i => i.name)
+    .filter(Boolean)
+    .slice(0, 3);
+  const mustReview = counts?.must_review ?? 0;
+  const batchReviewable = counts?.batch_reviewable ?? 0;
+
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-3 gap-3" data-testid="alignment-summary-header">
+      <div className="rounded-md border p-3 space-y-1" data-testid="alignment-summary-goal">
+        <p className="text-[10px] font-semibold uppercase text-muted-foreground">あなたが実現したいこと</p>
+        <p className="text-sm break-words">
+          {confirmedGoal?.value_text ?? "未入力です(Intent Briefで入力してください)"}
+        </p>
+      </div>
+      <div className="rounded-md border p-3 space-y-1" data-testid="alignment-summary-current-state">
+        <p className="text-[10px] font-semibold uppercase text-muted-foreground">システムの現状</p>
+        <p className="text-sm break-words">
+          {purposeNames.length > 0 ? purposeNames.join("、") : "現在の理解はまだ構築されていません"}
+        </p>
+      </div>
+      <div className="rounded-md border p-3 space-y-1" data-testid="alignment-summary-gap">
+        <p className="text-[10px] font-semibold uppercase text-muted-foreground">ギャップ</p>
+        <p className="text-sm">
+          要確認 {mustReview}件 · 一括レビュー可 {batchReviewable}件
+        </p>
+      </div>
+    </div>
+  );
+}
+
 export default function InterviewPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const sessionParam = Number(searchParams.get("session"));
@@ -1182,6 +1256,18 @@ export default function InterviewPage() {
   // focused-question card below and by QaPanel/QaItemCard (passed down as a
   // prop) -- see QaAutoInvestigateController's doc comment in api/hooks.ts.
   const qaAutoInvestigate = useQaAutoInvestigate(selectedSessionId);
+  // PR #296 review restructure: the same interview_qa list QaPanel already
+  // fetches, read here too (react-query dedups the identical queryKey) so
+  // the focused-question card can show a just-investigated question's
+  // qa.investigation in the same view instead of only inside the Q&A list.
+  const { data: qaListForFocus } = useInterviewQaList(selectedSessionId);
+  // PR #296 review restructure: Alignment Review (Intent Brief summary +
+  // Review Queue) moves into the main, tabbed content area. `alignmentFull`
+  // (same GET .../alignment ReviewQueuePanel already reads) decides whether
+  // this session has anything to review yet; `intentList` feeds the
+  // read-only "あなたが実現したいこと" summary line.
+  const { data: alignmentFull } = useAlignmentList(selectedSessionId);
+  const { data: intentList } = useInterviewIntentList(selectedSessionId);
 
   const [message, setMessage] = useState("");
   const messageInputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -1196,6 +1282,14 @@ export default function InterviewPage() {
     sessionId: number | null;
     items: IntelligenceRunEvidenceOut[];
   }>({ sessionId: null, items: [] });
+  // PR #296 review restructure: which main-area tab the user explicitly
+  // picked. Scoped by sessionId (same pattern as answerRevisionReflectedState
+  // above) rather than reset via an effect, so switching sessions never
+  // carries over a stale manual pick from a different session.
+  const [manualMainTabState, setManualMainTabState] = useState<{
+    sessionId: number | null;
+    value: "alignment" | "conversation";
+  } | null>(null);
 
   const sortedSessions = useMemo(() => sessions ?? [], [sessions]);
   const proposals = session?.proposals ?? [];
@@ -1234,6 +1328,27 @@ export default function InterviewPage() {
   // 情報不足だった場合、モデルの確認質問が open_questions に残る。
   const proposalNarrowing =
     uiState === "ready_for_proposals" && (session?.open_questions ?? []).length > 0;
+
+  // PR #296 review restructure: 「build 済み(=突き合わせ項目が1件以上あ
+  // る)」を、現在の GET .../alignment レスポンスの実項目数から決定的に
+  // 判定する(サーバーに専用フラグは無い)。superseded_items は履歴だが
+  // 「一度は build された」事実には変わらないため合算する。
+  const alignmentItemCounts = alignmentFull?.counts;
+  const totalAlignmentItems = alignmentFull
+    ? Object.values(alignmentFull.items_by_category).reduce((n, arr) => n + (arr?.length ?? 0), 0)
+      + (alignmentFull.superseded_items?.length ?? 0)
+    : 0;
+  const alignmentBuilt = totalAlignmentItems > 0;
+  const alignmentActionableCount =
+    (alignmentItemCounts?.must_review ?? 0) + (alignmentItemCounts?.batch_reviewable ?? 0);
+  // 既定表示: build 済みなら Alignment Review、未 build なら従来どおり
+  // 会話を既定にする。ユーザーが明示的にタブを切り替えた場合はそちらを
+  // 優先するが、その選択は選択中のセッションに限って有効にする(別セッ
+  // ションへ切り替えたときに古い選択を持ち越さない)。
+  const manualMainTab =
+    manualMainTabState?.sessionId === selectedSessionId ? manualMainTabState.value : null;
+  const mainTab: "alignment" | "conversation" =
+    manualMainTab ?? (alignmentBuilt ? "alignment" : "conversation");
 
   useEffect(() => {
     if (!selectedSessionId && sortedSessions.length > 0) {
@@ -1469,14 +1584,20 @@ export default function InterviewPage() {
   // Issue #295 §4.8 review fix (Finding 4): 画面中央の focused question の
   // 「わからない」にも、QaItemCard 側と同じ共有コントローラ(qaAutoInvestigate)
   // を接続する。この質問を裏付ける interview_qa 行の qa_id が分かる場合のみ
-  // qa_ids=[qaId] で自動調査を依頼し、投稿された調査結果は Q&A一覧側の
-  // QaItemCard が自動で表示する(このカード自身は投稿結果を保持していない
-  // ため転記はできない -- そちらを確認するよう案内するだけ)。qa_id が無い
-  // (ゼロベースの固定質問など)場合や調査が使えなかった場合は、必ず従来の
-  // #142 フロー(sendUnknown)にフォールバックする。
+  // qa_ids=[qaId] で自動調査を依頼する。
+  // PR #296 review restructure: 投稿された調査結果(qa.investigation)は
+  // qaListForFocus(QaPanel と同じ interview_qa 一覧、react-query がキャッ
+  // シュを共有)から同じ qa_id の行を探して、この focused question のすぐ
+  // 下に同じ QaInvestigationBlock で表示する -- もう「Q&A一覧を見に行っ
+  // て」というトースト誘導だけには頼らない。qa_id が無い(ゼロベースの固
+  // 定質問など)場合や調査が使えなかった場合は、必ず従来の #142 フロー
+  // (sendUnknown)にフォールバックする。
   const focusedQuestionInvestigating = !!(
     focusedQuestion?.qaId != null && qaAutoInvestigate.investigatingQaId === focusedQuestion.qaId
   );
+  const focusedQa = focusedQuestion?.qaId != null
+    ? qaListForFocus?.items.find(qa => qa.id === focusedQuestion.qaId)
+    : undefined;
   const handleFocusedUnknown = async () => {
     const qaId = focusedQuestion?.qaId;
     if (qaId == null) {
@@ -1490,9 +1611,7 @@ export default function InterviewPage() {
     if (qaAutoInvestigate.isPending) return;
     const investigated = await qaAutoInvestigate.runForQuestion(qaId);
     if (investigated) {
-      toast.info(
-        "AIが調査しました。調査結果は右側の「Q&A一覧」でご確認のうえ、必要であれば回答欄に転記してください。",
-      );
+      toast.info("AIが調査しました。調査結果をこの画面で確認してください。");
       return;
     }
     sendUnknown();
@@ -1711,8 +1830,48 @@ export default function InterviewPage() {
           </Card>
 
           <div className="grid grid-cols-1 xl:grid-cols-[1fr_380px] gap-4">
-            {/* メイン: 会話がインタビューの主要な操作領域 */}
+            {/* メイン: PR #296 レビュー指摘対応 -- Alignment Review(意図と
+                現状の突き合わせをまとめて判断する)と会話(focused question /
+                自由入力)をタブで切り替える主操作領域。build 済み(突き合わ
+                せ項目が1件以上ある)セッションでは Alignment Review を既定
+                にし、それ以外は従来どおり会話を既定にする(Issue #295 §6)。
+                どちらのタブも常に到達できるので、build 済みでも未回答の
+                focused question や自由入力を見失わない。 */}
             <div className="space-y-4">
+              <Tabs
+                value={mainTab}
+                onValueChange={v => setManualMainTabState({
+                  sessionId: selectedSessionId, value: v as "alignment" | "conversation",
+                })}
+              >
+                <TabsList>
+                  <TabsTrigger value="alignment" data-testid="main-tab-alignment">
+                    Alignment Review
+                    {alignmentActionableCount > 0 && ` (${alignmentActionableCount})`}
+                  </TabsTrigger>
+                  <TabsTrigger value="conversation" data-testid="main-tab-conversation">会話</TabsTrigger>
+                </TabsList>
+
+                <TabsContent value="alignment" className="space-y-4" data-testid="main-tab-content-alignment">
+                  <Card data-testid="alignment-review-panel">
+                    <CardHeader>
+                      <CardTitle className="text-sm">Alignment Review</CardTitle>
+                      <CardDescription>
+                        あなたが実現したいこと(Intent Brief)と現在の理解を突き合わせ、確認が必要な項目をまとめて判断します。
+                      </CardDescription>
+                    </CardHeader>
+                    <CardContent>
+                      <AlignmentSummaryHeader
+                        intentList={intentList}
+                        understanding={session.current_understanding}
+                        counts={alignmentItemCounts}
+                      />
+                    </CardContent>
+                  </Card>
+                  <ReviewQueuePanel sessionId={session.id} />
+                </TabsContent>
+
+                <TabsContent value="conversation" className="space-y-4" data-testid="main-tab-content-conversation">
               <Card>
                 <CardHeader>
                   <CardTitle className="text-sm">会話</CardTitle>
@@ -1852,6 +2011,18 @@ export default function InterviewPage() {
                                 )
                               )}
                             </div>
+                          )}
+                          {/* PR #296 review restructure: qa.investigation を Q&A一覧
+                              だけでなく focused question と同じビューにも表示する
+                              (前任者の申し送り対応)。QaItemCard と同じ表示コンポー
+                              ネントを再利用し、判断ロジックは一切増やさない。 */}
+                          {focusedQa?.investigation && (
+                            <QaInvestigationBlock
+                              qaId={focusedQa.id}
+                              investigation={focusedQa.investigation}
+                              routeCategory={focusedQa.route_category as InquiryRouteCategory}
+                              onTranscribe={() => setMessage(focusedQa.investigation!.conclusion)}
+                            />
                           )}
                         </div>
                       )}
@@ -2134,6 +2305,8 @@ git commit`}
                   </Card>
                 </>
               )}
+                </TabsContent>
+              </Tabs>
             </div>
 
             {/* サイド: 理解の内容・セッション情報(補助的な表示) */}
@@ -2233,9 +2406,11 @@ git commit`}
                 </CardContent>
               </Card>
 
+              {/* PR #296 review restructure: Review Queue now lives only in
+                  the main "Alignment Review" tab above (never duplicated
+                  here) -- the sidebar keeps Intent Brief editing and the
+                  other supporting panels. */}
               <IntentBriefPanel sessionId={session.id} />
-
-              <ReviewQueuePanel sessionId={session.id} />
 
               <HandoffListPanel sessionId={session.id} actor={actor} />
 

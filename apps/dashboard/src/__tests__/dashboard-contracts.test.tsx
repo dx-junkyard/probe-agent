@@ -3201,6 +3201,200 @@ describe("Interview page", () => {
       );
     });
   });
+
+  // PR #296 review restructure: Alignment Review moves into the main,
+  // tabbed content area instead of a 380px sidebar slot, and defaults to
+  // whichever tab matches whether the session's alignment has been built.
+  function alignmentItem(overrides: Record<string, unknown> & { id: number }) {
+    return {
+      session_id: 7,
+      system_id: 1,
+      revision_id: 1,
+      snapshot_id: 42,
+      intent_item_id: null,
+      intent_summary: "トレース収集を効率化したい",
+      current_claim: "現在は手動でトレースを確認している",
+      current_evidence: [{ path: "src/a.py", start_line: 1, end_line: 3, summary: "手動確認箇所" }],
+      gap_summary: "自動化されていない",
+      proposed_interpretation: "自動収集の追加を検討",
+      alignment_state: "gap",
+      risk_flags: [],
+      confidence: "likely",
+      review_category: "must_review",
+      reason_code: "core_intent",
+      user_reason: "目標に関わるため個別確認が必要です",
+      status: "open",
+      user_decision: null,
+      intelligence_run_id: 1,
+      is_mock: false,
+      created_at: 0,
+      updated_at: 0,
+      ...overrides,
+    };
+  }
+
+  test("build 済みセッションでは Alignment Review が主領域に既定表示され、会話タブへ切り替えられる", async () => {
+    mockInterviewApi();
+    const item = alignmentItem({ id: 1 });
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7/alignment") {
+        return Promise.resolve({
+          session_id: 7,
+          system_id: 1,
+          items_by_category: {
+            must_review: [item], batch_reviewable: [], no_review_required: [], unchanged: [], informational: [],
+          },
+          counts: { must_review: 1, batch_reviewable: 0, no_review_required: 0, unchanged: 0, informational: 0 },
+        });
+      }
+      if (path === "/interview/sessions/7/review-queue") {
+        return Promise.resolve({ session_id: 7, system_id: 1, items: [item] });
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // Alignment Review is the default main-area view for a built session.
+    await screen.findByTestId("alignment-review-panel");
+    expect(await screen.findByTestId("review-queue-panel")).toBeInTheDocument();
+    expect(screen.getByTestId("main-tab-content-alignment")).toBeInTheDocument();
+    expect(screen.queryByTestId("main-tab-content-conversation")).not.toBeInTheDocument();
+    // The tab label surfaces the actionable count so the developer can see
+    // the overall volume before opening the tab.
+    expect(screen.getByTestId("main-tab-alignment")).toHaveTextContent("Alignment Review (1)");
+
+    // The conversation (focused question / free-form input) stays reachable
+    // via the other tab -- it is never removed, only demoted.
+    fireEvent.click(screen.getByTestId("main-tab-conversation"));
+    expect(await screen.findByTestId("main-tab-content-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("main-tab-content-alignment")).not.toBeInTheDocument();
+    expect(screen.getByPlaceholderText(
+      /上の質問への回答や修正点を入力してください。|提案の対象範囲や重視したい観点があれば入力してください。/,
+    )).toBeInTheDocument();
+  });
+
+  test("未 build のセッションでは会話が既定表示され、Alignment Review タブへ切り替えられる", async () => {
+    // mockInterviewApi's default catch-all resolves /alignment and
+    // /review-queue to null, i.e. "not built yet".
+    mockInterviewApi();
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByTestId("main-tab-content-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("main-tab-content-alignment")).not.toBeInTheDocument();
+    // No actionable count badge when nothing has been built yet.
+    expect(screen.getByTestId("main-tab-alignment")).toHaveTextContent("Alignment Review");
+    expect(screen.getByTestId("main-tab-alignment")).not.toHaveTextContent("Alignment Review (");
+
+    fireEvent.click(screen.getByTestId("main-tab-alignment"));
+    expect(await screen.findByTestId("main-tab-content-alignment")).toBeInTheDocument();
+    expect(screen.queryByTestId("main-tab-content-conversation")).not.toBeInTheDocument();
+    // Review Queue's own empty/not-yet-built state (build trigger) is reused
+    // as-is -- no separate empty state is invented for this tab.
+    expect(screen.getByTestId("review-queue-build-button")).toBeInTheDocument();
+  });
+
+  // PR #296 review restructure / previous reviewer's note (Finding 4): a
+  // just-investigated question's qa.investigation conclusion must be visible
+  // in the same view as the focused question, not only inside the Q&A list.
+  test("調査済みの focused question は、その qa.investigation を同じ画面領域に表示する", async () => {
+    mockInterviewApi({
+      proposals: [],
+      session: {
+        open_questions: [{
+          question: "対象のプローブ範囲はどこですか?",
+          category: "followup",
+          priority: "medium",
+          hypothesis: null,
+          qa_id: 77,
+        }],
+      },
+      qaList: {
+        session_id: 7,
+        system_id: 1,
+        items: [{
+          id: 77,
+          session_id: 7,
+          system_id: 1,
+          question_text: "対象のプローブ範囲はどこですか?",
+          question_category: "followup",
+          question_source: "dialogue",
+          hypothesis: null,
+          evidence_refs: [],
+          runtime_evidence: null,
+          answer_text: null,
+          status: "unconfirmed",
+          answered_by: null,
+          superseded_by_id: null,
+          created_at: 0,
+          answered_at: null,
+          route_category: "system_researchable",
+          route_run_id: 1,
+          knowledge_area: "implementation",
+          handoff_id: null,
+          investigation: {
+            run_id: 1,
+            status: "completed",
+            conclusion: "対象はsummarize.summarize_textです",
+            key_points: ["要約フローが主対象"],
+            evidence: [{ path: "src/summarize.py", start_line: 1, end_line: 5, summary: "要約処理" }],
+            uncertainty: "",
+            confidence: "likely",
+            decision_question: null,
+          },
+        }],
+        open_count: 1,
+        high_priority_open_count: 0,
+        answers_revised_at: null,
+      },
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const card = await screen.findByTestId("focused-question");
+    const investigation = await within(card).findByTestId("qa-investigation-77");
+    expect(investigation).toHaveTextContent("AIの調査結果: 対象はsummarize.summarize_textです");
+
+    // Transcribing fills the conversation's message box (not the Q&A
+    // panel's own draft), matching this view's own input control.
+    fireEvent.click(within(investigation).getByTestId("qa-investigation-transcribe-77"));
+    const textarea = await screen.findByPlaceholderText(
+      /上の質問への回答や修正点を入力してください。|提案の対象範囲や重視したい観点があれば入力してください。/,
+    );
+    expect((textarea as HTMLTextAreaElement).value).toBe("対象はsummarize.summarize_textです");
+  });
 });
 
 describe("Flow Explorer auto-select from URL (Issue #62)", () => {
