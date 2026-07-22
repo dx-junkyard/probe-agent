@@ -187,6 +187,19 @@ The dashboard should support:
   Zero-base questions are a fixed UI questionnaire (goal / affected area /
   desired change / constraints / success criteria); answers still flow
   through the reasoning-model dialogue turn — never heuristic inference.
+- Interview page layout (Issue #295): the main column is a two-tab area —
+  「Alignment Review」 and 「会話」. Sessions with built alignment data
+  default to Alignment Review (derived deterministically from the
+  `/alignment` response counts, no server flag); unbuilt sessions default
+  to 会話. The Alignment Review tab composes an Intent/現状/gap summary
+  header on top of the unmodified `ReviewQueuePanel`; the sidebar holds
+  auxiliary panels only (Intent Brief editing, understanding overview,
+  Inquiry, handoff, Q&A list) and never duplicates the Review Queue.
+  All 「わからない」/「AIに先に調査させる」 investigation calls go through
+  the single `useQaAutoInvestigate` controller (`api/hooks.ts`) — do not
+  add another route-and-investigate call site; per-question calls must
+  pass `qa_ids: [id]` so one user action never fans out to a multi-question
+  LLM investigation.
   Each dialogue turn sends `answered_qa_id` (the focused open question's
   `qa_id`, Issue #129) plus `answered_question` (exact text, kept for
   sessions predating the Q&A layer) so the server consumes the question

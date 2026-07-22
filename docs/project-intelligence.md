@@ -3965,3 +3965,40 @@ Issue #295 は Interview Alignment UX の元提案であり、その大部分は
   (`non_goals`、`status` 等)を維持し、#295 記載の名称
   (`out_of_scope`、`confirmation_state` 等)への改名は行わない
   (スキーマ契約の互換性優先)。
+
+### PR #296 レビュー対応(#295 実装の修正)
+
+初回実装へのレビュー指摘5件とUX評価に対する修正。
+
+1. **content hash の対象拡張**: `compute_content_hash` に
+   `intent_summary` / `gap_summary` / `proposed_interpretation` と、
+   evidence 参照範囲の実テキスト digest(`source_digest`: pin 済み
+   commit から `read_file_at_commit` で読んだ start〜end 行の sha256、
+   ビルド単位キャッシュ)を追加。同じ行範囲のコード変更や制約・scope
+   の変化が unchanged と誤判定される穴を塞いだ。evidence が読めない
+   項目は hash を None とし carry-over 対象外(安全側)。旧形式 hash
+   とは一致しなくなるが再確認へ戻る方向なので移行処理は不要。
+2. **carry-over の多世代持続**: carry 候補に
+   `review_category='unchanged'` の行を追加し、`carried_over_from` は
+   チェーンを辿った元の人間回答行(answered/corrected)の id を伝播。
+   3世代目以降も引き継ぎが持続し、監査参照は常に実際の人間回答を指す。
+3. **superseded 履歴の分離**: `GET /alignment` の `items_by_category` /
+   `counts` は superseded=0 の現行行のみを対象にし、履歴行は additive な
+   `superseded_items` で返す。UI は「履歴 N件」の折りたたみで監査閲覧
+   可能にし、件数サマリ・サンプル確認への履歴混入を解消。
+4. **調査の単件スコープ化と主導線接続**: `route-and-investigate` に
+   optional な `qa_ids` body を追加(省略時は従来の全対象バッチ)。
+   フロントは `useQaAutoInvestigate` 共通コントローラに調査呼び出しを
+   一本化し、focused question の「わからない」も自動調査へ接続。
+   1操作で複数件の LLM 調査が走らない。
+5. **回答バッチ API**: `POST .../alignment/answers-batch` を追加。
+   単体 `/answer` と同じ書き込みロジックを項目単位で再利用
+   (`decision_method: manual` は項目単位のまま)、`request_refresh` は
+   バッチ全体で一度だけ。部分失敗は項目ごとの成否で応答し、UI は失敗
+   項目を保留に残す。
+6. **画面再構成(UX評価対応)**: Interview 画面の中央主領域を
+   「Alignment Review / 会話」の2タブにし、Alignment build 済み
+   セッションは Alignment Review(Intent/現状/gap サマリ +
+   ReviewQueuePanel)を既定表示。サイドバーの Review Queue 二重表示を
+   撤去し、`qa.investigation` の結論表示を focused question と同じ
+   ビューでも表示する(`QaInvestigationBlock` 共有)。
