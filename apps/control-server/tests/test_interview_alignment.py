@@ -1670,6 +1670,71 @@ def test_changed_item_content_is_not_carried_over(admin_client, tmp_path, monkey
     assert fresh["carried_over_from"] is None
 
 
+@pytest.mark.parametrize("decision", ["needs_change", "reject_interpretation"])
+def test_non_accept_answer_is_not_carried_over_as_unchanged(
+    admin_client, tmp_path, monkeypatch, decision,
+):
+    """3rd review round (Finding 1): only an 'accept_current' answer is a
+    carry-over origin. A 'needs_change' / 'reject_interpretation' answer is an
+    unresolved objection the rebuild has not folded back into the
+    Understanding, so an identical regeneration must NOT be marked
+    'unchanged' -- it stays actionable in the Review Queue instead of hiding
+    the human's objection."""
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _stub_build(monkeypatch, items=[_proposal_item(current_claim="変わらない項目", risk_flags=["security"])])
+    first = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+    item_id = first["items"][0]["id"]
+    admin_client.post(
+        f"/interview/alignment/{item_id}/answer",
+        json={"decision": decision, "note": "異議"}, headers=headers,
+    )
+
+    # Identical content re-proposed (same claim + every classification field).
+    _stub_build(monkeypatch, items=[_proposal_item(current_claim="変わらない項目", risk_flags=["security"])])
+    second = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+
+    fresh = next(it for it in second["items"] if it["id"] != item_id)
+    assert fresh["review_category"] != "unchanged"
+    assert fresh["review_category"] == "must_review"
+    assert fresh["carried_over_from"] is None
+
+    queue = admin_client.get(f"/interview/sessions/{session_id}/review-queue", headers=headers).json()
+    assert fresh["id"] in {it["id"] for it in queue["items"]}
+
+
+def test_corrected_item_is_not_carried_over_as_unchanged(admin_client, tmp_path, monkeypatch):
+    """3rd review round (Finding 1): a 'corrected' row is the human's own
+    edit, not an approval of the current understanding, so an identical
+    regeneration must not be marked 'unchanged' -- it returns to the
+    actionable queue rather than being silently dropped as 'no action'."""
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _stub_build(monkeypatch, items=[_proposal_item(current_claim="変わらない項目", risk_flags=["security"])])
+    first = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+    item_id = first["items"][0]["id"]
+    admin_client.post(
+        f"/interview/alignment/{item_id}/correct",
+        json={"corrected_interpretation": "私の解釈"}, headers=headers,
+    )
+
+    _stub_build(monkeypatch, items=[_proposal_item(current_claim="変わらない項目", risk_flags=["security"])])
+    second = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+
+    fresh = next(it for it in second["items"] if it["id"] != item_id)
+    assert fresh["review_category"] != "unchanged"
+    assert fresh["carried_over_from"] is None
+
+    queue = admin_client.get(f"/interview/sessions/{session_id}/review-queue", headers=headers).json()
+    assert fresh["id"] in {it["id"] for it in queue["items"]}
+
+
 def test_goal_change_in_batch_blocks_unchanged_carryover(admin_client, tmp_path, monkeypatch):
     """When the batch that triggers a rebuild includes a decision on the
     'goal' Intent Brief field, this rebuild must reclassify every item

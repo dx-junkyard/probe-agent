@@ -3887,12 +3887,16 @@ Issue #295 は Interview Alignment UX の元提案であり、その大部分は
   分類に影響する変化(Runtime Reality Check の反転を含む)が
   「変更なし」と誤判定されることはない。完全一致のみで、類似度・
   LLM 判断は使わない(Principle 6)。
-- 再ビルド(`run_alignment_build`)時、直前ビルドの終端行
-  (`status IN ('answered','corrected') AND superseded=0`)と
+- 再ビルド(`run_alignment_build`)時、直前ビルドの **`accept_current`
+  回答済み行**(`status='answered'` かつ `user_decision.action=
+  'accept_current'`、`superseded=0`。加えて多世代 `unchanged` チェーン)と
   `content_hash` が一致する新項目は `unchanged` /
   `reason_code='unchanged_since_confirmation'` に分類し、
   `carried_over_from` に引き継ぎ元 id を記録する(監査専用の参照。
-  ON DELETE SET NULL)。unchanged 項目は `GET .../review-queue` の
+  ON DELETE SET NULL)。`needs_change` / `reject_interpretation` /
+  `corrected` は人間の異議・修正であり Understanding へ未反映のため
+  carry-over 対象外とし(3回目レビュー指摘1)、ルール表で再分類して
+  actionable のまま残す。unchanged 項目は `GET .../review-queue` の
   主導線(must_review/batch_reviewable フィルタ)に現れない。
 - §5.5 の狭い決定的版: goal intent(System Purpose 相当)が直前ビルド
   以降に確定・変更された場合、そのビルドでは引き継ぎを行わず全項目を
@@ -4040,3 +4044,39 @@ Issue #295 は Interview Alignment UX の元提案であり、その大部分は
    (gap_summary || current_claim、未対応のみ、Review Queue と同じ決定的
    順序)を主表示し件数を補助に。確認不要サンプルの根拠・content_hash は
    初期折りたたみ(主張のみ表示)にして確認疲れを抑制。
+
+### PR #296 3回目レビュー対応
+
+2回目レビュー対応をマージ後の再レビューで残った P1×2・P2×2 への修正。
+
+1. **carry-over の起点を accept_current に限定(指摘1, P1)**:
+   これまで carry-over 候補は `status IN ('answered','corrected')` の終端行
+   全てだったため、`needs_change` / `reject_interpretation` の回答や
+   `corrected` 行も、再生成内容が同一なら `unchanged`(対応不要)になり、
+   人間が明示した異議・修正が Review Queue から消えていた。これらは
+   Understanding へ反映する処理も無いため、実質的に異議が隠れる。carry
+   候補を **`accept_current` の `answered` 行のみ**(＋その id を辿る
+   多世代 `unchanged` チェーン)に限定し、否定・修正判断はルール表での
+   再分類に落として actionable のまま残す。FK 安全性(carried_over_from
+   の参照先は DELETE 対象の status='open' 行に決してならない)も維持。
+2. **未確認 goal を確定 Intent として表示しない(指摘2, P1)**:
+   `AlignmentSummaryHeader` は確認済み goal が無いとき `goalItems[0]` を
+   「あなたが実現したいこと」として表示していたため、`status='proposed'`
+   の AI 提案が人間の確定 Intent に見えていた。確認済み goal のみを確定
+   表示し、未確認の AI 提案しか無い場合は「AI提案・未確認」ラベル付きの
+   未確認候補として明示、どちらも無ければ未入力表示にする(#295 の
+   「AI推定と人間確認済み情報の区別」)。
+3. **proposal_review を会話タブの必須操作として扱う(指摘3, P2)**:
+   提案の承認・却下・差分生成の UI は会話タブ内にあるのに、
+   `conversationHasRequiredAction` が `proposal_review` を「必須操作なし」
+   と判定していたため、build 済みだと Alignment タブが既定表示され、
+   NextActionBanner の指示先と表示タブが食い違い「会話タブへ移動」導線も
+   出なかった。`proposal_review` も会話タブの必須操作として扱い、既定を
+   会話タブにする(Alignment はタブ切替で常時到達可能、切替時はバナー
+   導線を表示)。
+4. **監査詳細に人間の判断を表示(指摘4, P2)**:
+   `AuditDetail` が `user_decision` の action・note・日時を表示せず、
+   承認・変更要求・却下・修正・保留のどれだったか判別不能だった。
+   `USER_DECISION_LABELS`(5 action の日本語ラベル)を追加し、判断内容と
+   メモを監査詳細に表示。carried_over_from / superseded 履歴と合わせて
+   #295 の監査可能性を満たす。

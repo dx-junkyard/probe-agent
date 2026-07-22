@@ -1233,7 +1233,14 @@ function AlignmentSummaryHeader({
   alignment: AlignmentListOut | null | undefined;
 }) {
   const goalItems = intentList?.items_by_field["goal"] ?? [];
-  const confirmedGoal = goalItems.find(i => i.status === "confirmed") ?? goalItems[0];
+  // Issue #295 が維持を求める「AI推定と人間確認済み情報の区別」: 確認済みの
+  // goal だけを「あなたが実現したいこと」として提示する。確認済みが無く AI
+  // 提案(未確認)しか無い場合は、それを人間のIntentとして出さず、未確認候補
+  // として明示ラベル付きで表示する(承認前の提案を確定情報に見せない)。
+  const confirmedGoal = goalItems.find(i => i.status === "confirmed");
+  const proposedGoal = confirmedGoal
+    ? undefined
+    : goalItems.find(i => i.status === "proposed" || i.origin === "ai_proposed");
   const purposeNames = (understanding?.system_purpose ?? [])
     .map(i => i.name)
     .filter(Boolean)
@@ -1265,9 +1272,25 @@ function AlignmentSummaryHeader({
     <div className="grid grid-cols-1 md:grid-cols-3 gap-3" data-testid="alignment-summary-header">
       <div className="rounded-md border p-3 space-y-1" data-testid="alignment-summary-goal">
         <p className="text-[10px] font-semibold uppercase text-muted-foreground">あなたが実現したいこと</p>
-        <p className="text-sm break-words">
-          {confirmedGoal?.value_text ?? "未入力です(Intent Briefで入力してください)"}
-        </p>
+        {confirmedGoal ? (
+          <p className="text-sm break-words" data-testid="alignment-summary-goal-confirmed">
+            {confirmedGoal.value_text}
+          </p>
+        ) : proposedGoal ? (
+          <div className="space-y-1" data-testid="alignment-summary-goal-proposed">
+            <span className="inline-block rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-800">
+              AI提案 · 未確認
+            </span>
+            <p className="text-sm break-words text-muted-foreground">{proposedGoal.value_text}</p>
+            <p className="text-[11px] text-muted-foreground">
+              まだ確認されていません。Intent Briefで確認・修正してください。
+            </p>
+          </div>
+        ) : (
+          <p className="text-sm break-words text-muted-foreground">
+            未入力です(Intent Briefで入力してください)
+          </p>
+        )}
       </div>
       <div className="rounded-md border p-3 space-y-1" data-testid="alignment-summary-current-state">
         <p className="text-[10px] font-semibold uppercase text-muted-foreground">システムの現状</p>
@@ -1427,17 +1450,21 @@ export default function InterviewPage() {
   // Review」という以前の判定は、会話タブ側にまだ必須操作が残っている状態
   // (例: 初回の理解確認・不足情報への回答・ゼロベース質問・提案生成待ち)
   // でも Alignment Review を既定にしてしまい、次にやること(NextActionBanner)
-  // が指す操作が別タブに隠れる問題があった。会話タブで行うべき必須操作が
-  // 「無い」と言えるのは、uiState が proposal_review(提案のレビュー・承認
-  // は Alignment タブ側で完結する)であり、かつ canConfirmStructuredUnderstanding
-  // も false のときだけ -- それ以外の全 uiState(preparing/needs_build/
-  // confirm_understanding/fill_gaps/zero_base/ready_for_proposals。
-  // proposalNarrowing は ready_for_proposals の部分集合なので個別チェック
-  // は不要)は会話タブでの対応が必須なので、alignmentBuilt であっても既定
-  // は会話タブのままにする。新しいサーバーフラグは使わず、既存の
+  // が指す操作が別タブに隠れる問題があった。
+  //
+  // 3rd review round (Finding 3): 以前はここで proposal_review を「会話タブ
+  // に必須操作なし(=提案レビューは Alignment タブ側で完結する)」と判定して
+  // いたが、これは誤りだった -- 提案の承認・却下・差分生成のUIは会話タブ内
+  // (下の TabsContent value="conversation")にある。そのため
+  // proposal_review でも会話タブが既定になり、NextActionBanner の「各提案を
+  // 承認・却下してください」という指示先と表示タブが食い違い、別タブに切り替え
+  // ても会話タブへ戻る導線が出なかった。提案レビューも会話タブ側の必須操作
+  // として扱う。結果として、会話タブに必須操作が「無い」のは uiState が
+  // 未確定(セッション未ロード等)で、かつ canConfirmStructuredUnderstanding
+  // も false のときだけになる。新しいサーバーフラグは使わず、既存の
   // uiState/canConfirmStructuredUnderstanding から決定的に導出するだけ。
   const conversationHasRequiredAction = !!(
-    canConfirmStructuredUnderstanding || (uiState && uiState !== "proposal_review")
+    canConfirmStructuredUnderstanding || uiState
   );
   // ユーザーが明示的にタブを切り替えた場合はそちらを優先するが、その選択は
   // 選択中のセッションに限って有効にする(別セッションへ切り替えたときに
@@ -1949,11 +1976,12 @@ export default function InterviewPage() {
                 `conversationHasRequiredAction`(既存の uiState /
                 canConfirmStructuredUnderstanding から決定的に導出、新しい
                 サーバーフラグは追加しない)が false -- つまり会話タブでの
-                必須操作が残っていない(例: proposal_review)-- かつ
-                build 済みのときに限り Alignment Review にする(Issue #295
-                §6)。どちらのタブも常に到達できる上、会話タブに必須操作が
-                残っている間は NextActionBanner に「会話タブへ移動」ボタン
-                が出る。 */}
+                必須操作が残っていない -- かつ build 済みのときに限り
+                Alignment Review にする(Issue #295 §6)。3rd review round
+                (Finding 3): 提案の承認・却下・差分生成は会話タブ内にある
+                ため proposal_review も会話タブの必須操作として扱う。どちら
+                のタブも常に到達できる上、会話タブに必須操作が残っている間は
+                NextActionBanner に「会話タブへ移動」ボタンが出る。 */}
             <div className="space-y-4">
               <Tabs
                 value={mainTab}

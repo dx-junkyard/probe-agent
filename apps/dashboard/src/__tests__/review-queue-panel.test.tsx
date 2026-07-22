@@ -690,6 +690,42 @@ describe("ReviewQueuePanel", () => {
     expect(within(row).queryByTestId("review-item-content-hash-70")).not.toBeInTheDocument();
   });
 
+  // Finding 4: the audit detail must surface the human decision (action +
+  // note + timestamp), so an approve / needs_change / reject / corrected /
+  // held item is distinguishable in history, not just its carried_over_from.
+  test("監査詳細に人間の判断(action・メモ・日時)が表示される", async () => {
+    const item = makeItem({
+      id: 88, review_category: "no_review_required", reason_code: "no_change",
+      alignment_state: "aligned", user_reason: "対応は不要です", confidence: "confirmed",
+      updated_at: 1700000000, intelligence_run_id: 42, revision_id: 7, snapshot_id: 9,
+      status: "answered",
+      user_decision: { action: "needs_change", note: "この解釈は変更が必要", decided_at: 1700000500, decided_by: null },
+    });
+    const queue: AlignmentReviewQueueOut = { session_id: 1, system_id: 1, items: [] };
+    const full: AlignmentListOut = {
+      session_id: 1, system_id: 1,
+      items_by_category: { must_review: [], batch_reviewable: [], no_review_required: [item], unchanged: [], informational: [] },
+      counts: { must_review: 0, batch_reviewable: 0, no_review_required: 1, unchanged: 0, informational: 0 },
+    };
+    getImpl = (path: string) => {
+      if (path === "/interview/sessions/1/review-queue") return Promise.resolve(queue);
+      if (path === "/interview/sessions/1/alignment") return Promise.resolve(full);
+      if (path === "/interview/sessions/1/inquiries") return Promise.resolve({ session_id: 1, system_id: 1, items: [] });
+      return Promise.resolve(undefined);
+    };
+
+    const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
+    render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByTestId("review-queue-informational-toggle"));
+    const row = await screen.findByTestId("review-item-informational-88");
+    fireEvent.click(within(row).getByTestId("review-item-informational-detail-toggle-88"));
+
+    const decision = within(row).getByTestId("review-item-user-decision-88");
+    expect(decision).toHaveTextContent("変更が必要");
+    expect(decision).toHaveTextContent("この解釈は変更が必要");
+  });
+
   // Issue #295 (ST-2): §5.4 deterministic sample check.
   test("確認不要/参考情報が3件を超えるとき、id昇順で先頭3件だけをサンプル確認として展開表示する", async () => {
     const items = [5, 3, 1, 4, 2].map(id => makeItem({

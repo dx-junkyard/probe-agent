@@ -96,6 +96,7 @@ import type {
   AlignmentReviewCategory,
   AlignmentRiskFlag,
   AlignmentState,
+  AlignmentUserDecisionAction,
   InterviewInquiryOut,
 } from "@/api/types";
 
@@ -139,6 +140,21 @@ const DECISION_LABELS: Record<AlignmentDecisionAction, string> = {
   needs_change: "変更が必要",
   reject_interpretation: "AIの解釈を採用しない",
 };
+
+// Finding 4: full label set for a persisted user_decision.action (the answer
+// actions above plus /correct と /hold が記録する corrected / held)。監査詳細
+// で「承認・変更要求・却下・修正・保留」のどれだったかを判別可能にする。
+const USER_DECISION_LABELS: Record<AlignmentUserDecisionAction, string> = {
+  accept_current: "現状でよい(承認)",
+  needs_change: "変更が必要",
+  reject_interpretation: "AIの解釈を採用しない",
+  corrected: "修正済み",
+  held: "保留中",
+};
+
+function userDecisionLabel(action: string): string {
+  return USER_DECISION_LABELS[action as AlignmentUserDecisionAction] ?? action;
+}
 
 const STATUS_LABELS: Record<string, string> = {
   open: "未対応",
@@ -231,6 +247,21 @@ function AuditDetail({ item }: { item: AlignmentItemOut }) {
       <p><span className="font-semibold">状態:</span> {alignmentStateLabel(item.alignment_state)}</p>
       <p><span className="font-semibold">確信度:</span> {confidenceLabel(item.confidence)}</p>
       <p><span className="font-semibold">理由:</span> {item.user_reason}</p>
+      {item.user_decision && (
+        <div data-testid={`review-item-user-decision-${item.id}`}>
+          <p>
+            <span className="font-semibold">人間の判断:</span>{" "}
+            {userDecisionLabel(item.user_decision.action)}
+            {" · "}
+            {formatTimestamp(item.user_decision.decided_at)}
+          </p>
+          {item.user_decision.note && (
+            <p className="break-words">
+              <span className="font-semibold">メモ:</span> {item.user_decision.note}
+            </p>
+          )}
+        </div>
+      )}
       {item.current_evidence.length > 0 && (
         <div>
           <p className="font-semibold">根拠:</p>

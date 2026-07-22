@@ -448,38 +448,52 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
 
             # Issue #295: unchanged-item carry-over. carry_candidates maps a
             # content_hash from the immediately preceding build to the id of
-            # the ORIGINAL human-decided (answered/corrected) row for that
-            # contrast point -- the only kind of row a fresh item's audit
-            # trail may ever point back to.
+            # the ORIGINAL human-decided row for that contrast point -- the
+            # only kind of row a fresh item's audit trail may ever point
+            # back to.
+            #
+            # 3rd review round (Finding 1): ONLY an 'accept_current' answer
+            # is an eligible carry-over origin. That decision is the human
+            # saying "the current understanding of this point is right", so
+            # a byte-identical regeneration genuinely needs no re-review and
+            # can be marked 'unchanged' (excluded from the Review Queue).
+            # 'needs_change' / 'reject_interpretation' answers and 'corrected'
+            # rows are the OPPOSITE: an explicit objection or edit that the
+            # rebuild has NOT yet resolved (there is no code path that folds
+            # such a decision back into the Understanding). Carrying those
+            # over as 'unchanged' would silently drop the human's objection
+            # out of the actionable queue, so they are skipped here and fall
+            # through to fresh classification below, staying actionable.
             #
             # Review fix (PR #296, Finding 2): a prior build's 'unchanged'
-            # row (status='open', since it was never itself answered) is now
-            # ALSO an eligible candidate, not just terminal answered/
-            # corrected rows -- otherwise a 3rd build's carry-over candidate
-            # set loses the 2nd build's unchanged row (an 'open' row this
-            # rebuild's DELETE ... WHERE status='open' AND user_decision IS
-            # NULL is about to remove) and the item incorrectly falls back
-            # to fresh reclassification. When the candidate is itself an
-            # 'unchanged' row, its OWN carried_over_from (never its own id)
-            # is propagated as the origin -- so the audit trail always
-            # terminates at the real human decision, no matter how many
-            # unchanged generations sit in between. This is exactly why the
-            # DELETE above is safe against `carried_over_from ... ON DELETE
-            # SET NULL`: the referenced origin id is always an
-            # answered/corrected row, which the DELETE's WHERE clause never
-            # touches (it only ever deletes status='open' rows), so the FK
-            # target never disappears out from under a surviving reference.
+            # row (status='open', since it was never itself answered) is
+            # ALSO an eligible candidate, not just terminal answered rows --
+            # otherwise a 3rd build's carry-over candidate set loses the 2nd
+            # build's unchanged row (an 'open' row this rebuild's DELETE ...
+            # WHERE status='open' AND user_decision IS NULL is about to
+            # remove) and the item incorrectly falls back to fresh
+            # reclassification. When the candidate is itself an 'unchanged'
+            # row, its OWN carried_over_from (never its own id) is propagated
+            # as the origin -- so the audit trail always terminates at the
+            # real 'accept_current' decision, no matter how many unchanged
+            # generations sit in between. This is exactly why the DELETE
+            # above is safe against `carried_over_from ... ON DELETE SET
+            # NULL`: the referenced origin id is always an accept_current
+            # 'answered' row, which the DELETE's WHERE clause never touches
+            # (it only ever deletes status='open' rows), so the FK target
+            # never disappears out from under a surviving reference.
             #
             # Read before this build's own DELETE/UPDATE/INSERT touch the
             # table (the write transaction is still below).
             carry_rows = conn.execute(
-                """SELECT id, content_hash, carried_over_from, review_category
+                """SELECT id, content_hash, carried_over_from, review_category,
+                          status, user_decision
                    FROM alignment_item
                    WHERE session_id = ? AND system_id = ?
                      AND superseded = 0
                      AND content_hash IS NOT NULL
                      AND (
-                       status IN ('answered', 'corrected')
+                       status = 'answered'
                        OR (review_category = 'unchanged' AND carried_over_from IS NOT NULL)
                      )
                    ORDER BY id""",
@@ -487,9 +501,18 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
             ).fetchall()
             carry_candidates: Dict[str, int] = {}
             for r in carry_rows:
-                origin_id = (
-                    r["carried_over_from"] if r["review_category"] == "unchanged" else r["id"]
-                )
+                if r["review_category"] == "unchanged":
+                    # A prior carried-over row: its own carried_over_from
+                    # already terminates at an accept_current answer (that
+                    # same guarantee was enforced when this row was created),
+                    # so propagate it rather than this intermediate row's id.
+                    origin_id = r["carried_over_from"]
+                else:
+                    # Terminal 'answered' row: only accept_current qualifies.
+                    decision = json.loads(r["user_decision"]) if r["user_decision"] else None
+                    if not decision or decision.get("action") != "accept_current":
+                        continue
+                    origin_id = r["id"]
                 carry_candidates.setdefault(r["content_hash"], origin_id)
 
             # A rebuild triggered by a batch that confirmed/corrected/
