@@ -134,6 +134,8 @@ vi.mock("sonner", () => ({
   toast: {
     success: vi.fn(),
     error: vi.fn(),
+    info: vi.fn(),
+    warning: vi.fn(),
   },
   Toaster: () => null,
 }));
@@ -2638,6 +2640,137 @@ describe("Interview page", () => {
           answered_qa_id: 21,
           answered_question: "計測対象は要約フローで正しいですか?",
         }),
+      );
+    });
+  });
+
+  // Issue #295 §4.8 review fix (Finding 4): 画面中央の focused question の
+  // 「わからない」を、QaItemCard 側と同じ共有オートインベスティゲート
+  // コントローラに接続した。
+  test("focused question の「わからない」は qa_ids=[その id] だけを対象に自動調査し、成功時は dialogue-turn へ進まない", async () => {
+    mockInterviewApi({
+      proposals: [],
+      session: {
+        open_questions: [{
+          question: "対象のプローブ範囲はどこですか?",
+          category: "followup",
+          priority: "medium",
+          hypothesis: null,
+          qa_id: 55,
+        }],
+      },
+    });
+    let resolveInvestigate: (v: unknown) => void = () => {};
+    const investigatePromise = new Promise(resolve => { resolveInvestigate = resolve; });
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7/qa/route-and-investigate") return investigatePromise;
+      return Promise.resolve(undefined);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const card = await screen.findByTestId("focused-question");
+    fireEvent.click(within(card).getByTestId("quick-answer-unknown"));
+
+    // Only a short status line while investigating -- the button itself is
+    // replaced (no duplicate firing), matching QaItemCard's pattern.
+    expect(within(card).getByTestId("focused-question-unknown-investigating")).toHaveTextContent(
+      "関連コードとテストを確認しています",
+    );
+    await waitFor(() => {
+      // Scoped to qa_ids=[55] -- never the unrestricted whole-session batch.
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/7/qa/route-and-investigate", { qa_ids: [55] },
+      );
+    });
+    expect(mockApi.post).not.toHaveBeenCalledWith(
+      "/interview/sessions/7/dialogue-turn", expect.anything(),
+    );
+
+    resolveInvestigate({
+      session_id: 7, system_id: 1,
+      results: [{ qa_id: 55, route_category: "system_researchable", knowledge_area: null, investigation_status: "completed", error: null }],
+      counts: { routed: 1, investigated: 1, failed: 0, skipped_cap: 0 },
+    });
+
+    await waitFor(() => {
+      expect(within(card).queryByTestId("focused-question-unknown-investigating")).not.toBeInTheDocument();
+    });
+    // Investigation succeeded for this question: never falls back to
+    // recording an unknown answer via the dialogue-turn endpoint.
+    expect(mockApi.post).not.toHaveBeenCalledWith(
+      "/interview/sessions/7/dialogue-turn", expect.anything(),
+    );
+  });
+
+  test("focused question の「わからない」は自動調査が使えないとき従来の #142 フロー(dialogue-turn, answer_unknown)にフォールバックする", async () => {
+    mockInterviewApi({
+      proposals: [],
+      session: {
+        open_questions: [{
+          question: "対象のプローブ範囲はどこですか?",
+          category: "followup",
+          priority: "medium",
+          hypothesis: null,
+          qa_id: 56,
+        }],
+      },
+    });
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7/qa/route-and-investigate") {
+        return Promise.reject(new Error("boom"));
+      }
+      if (path === "/interview/sessions/7/dialogue-turn") {
+        return Promise.resolve({
+          assistant_message: "了解しました。",
+          proposals: [],
+          proposals_requested: true,
+          next_questions: [],
+          intelligence_run: null,
+          error: null,
+          stage: "proposal_generation",
+          current_understanding: null,
+          gap_analysis: null,
+          open_questions_structured: [],
+          created_qa_ids: [],
+          evidence_run: null,
+          evidence_used: [],
+          evidence_reads: [],
+          evidence_refs_dropped: 0,
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const card = await screen.findByTestId("focused-question");
+    fireEvent.click(within(card).getByTestId("quick-answer-unknown"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/7/dialogue-turn",
+        expect.objectContaining({ answer_unknown: true, answered_qa_id: 56 }),
       );
     });
   });

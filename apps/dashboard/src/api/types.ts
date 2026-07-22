@@ -1086,6 +1086,39 @@ export interface AlignmentListOut {
   system_id: number;
   items_by_category: Record<string, AlignmentItemOut[]>;
   counts: Record<string, number>;
+  // Review fix (PR #296, Finding 3): superseded=1 rows (history -- a later
+  // rebuild already produced a fresh replacement row for the same contrast
+  // point), split out of items_by_category/counts so those two only ever
+  // reflect CURRENT rows. Optional so a response predating this fix (or an
+  // older Control Server) degrades to "no history shown" instead of
+  // breaking the page.
+  superseded_items?: AlignmentItemOut[];
+}
+
+// --- Batch answer (PR #296 review fix, Finding 5) ----------------------------
+
+export interface AlignmentBatchAnswerItemRequest {
+  item_id: number;
+  decision: AlignmentDecisionAction;
+  note?: string;
+}
+
+export interface AlignmentBatchAnswerItemResult {
+  item_id: number;
+  success: boolean;
+  // Populated only when success is true.
+  item?: AlignmentItemOut | null;
+  // Populated only when success is false -- a concise structural reason
+  // (not found / wrong session / Inquiry-locked / duplicate item_id),
+  // never LLM free text.
+  error?: string | null;
+}
+
+export interface AlignmentBatchAnswerOut {
+  session_id: number;
+  system_id: number;
+  results: AlignmentBatchAnswerItemResult[];
+  refreshed: boolean;
 }
 
 export interface AlignmentReviewQueueOut {

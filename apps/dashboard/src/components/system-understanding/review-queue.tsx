@@ -37,6 +37,18 @@
 //   ク相当(security・high_risk)が含まれる / runtime_check が
 //   mismatch・stale / evidence が1件のみ、のいずれかに該当する場合は初
 //   期表示で展開する(§4.4)。
+//
+// PR #296 レビュー指摘対応の追加:
+// - 指摘3: GET .../alignment はもう superseded=1 行を items_by_category/
+//   counts に含めない(サーバー側で分離済み)。かわりに追加された
+//   superseded_items を「履歴 N件」の折りたたみ(初期閉)として表示し、
+//   既存の InformationalItemRow(監査詳細 AuditDetail の展開込み)をその
+//   まま再利用する。まだ superseded_items を返さない古い Control Server
+//   との互換のため、フィールド自体は optional として扱う。
+// - 指摘5: まとめて送信は POST .../answers-batch を1回だけ呼ぶ(項目ごと
+//   の /answer 順次呼び出しをやめた)。部分失敗した項目は response.results
+//   から判定して保留に残す。単体(非一括モード)の即時送信は従来どおり
+//   /answer のまま変更していない。
 
 import { useState } from "react";
 import { toast } from "sonner";
@@ -52,6 +64,7 @@ import {
   useActiveInquiriesByOrigin,
   useAlignmentList,
   useAnswerAlignmentItem,
+  useAnswerAlignmentItemsBatch,
   useBuildAlignment,
   useCorrectAlignmentItem,
   useHoldAlignmentItem,
@@ -621,9 +634,10 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
   const { data: queue } = useReviewQueue(sessionId);
   const { data: full } = useAlignmentList(sessionId);
   const build = useBuildAlignment(sessionId);
-  const bulkAnswer = useAnswerAlignmentItem(sessionId);
+  const batchAnswer = useAnswerAlignmentItemsBatch(sessionId);
   const activeInquiries = useActiveInquiriesByOrigin(sessionId);
   const [showInformational, setShowInformational] = useState(false);
+  const [showSuperseded, setShowSuperseded] = useState(false);
   const [bulkMode, setBulkMode] = useState(false);
   const [bulkSending, setBulkSending] = useState(false);
   const [pendingAnswers, setPendingAnswers] = useState<Record<number, StagedAnswer>>({});
@@ -658,30 +672,45 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
 
   const pendingCount = Object.keys(pendingAnswers).length;
 
+  // PR #296 review fix (Finding 5): one POST .../answers-batch call for the
+  // whole staged set, instead of sequential per-item /answer calls (the
+  // server now runs the #288 refresh exactly once for the batch). A failed
+  // item is identified from `results` (never re-derived/guessed client-side)
+  // and stays staged so the user can retry it; a hard request failure (the
+  // whole call rejecting, e.g. a network error) leaves every staged item in
+  // place untouched, same as "everything failed".
   const handleBulkSubmit = async () => {
     const entries = Object.entries(pendingAnswers);
     if (entries.length === 0) return;
     setBulkSending(true);
     setBulkResult(null);
-    let success = 0;
-    const stillFailed: Record<number, StagedAnswer> = {};
-    for (const [key, staged] of entries) {
-      const itemId = Number(key);
-      try {
-        await bulkAnswer.mutateAsync({ itemId, decision: staged.decision, note: staged.note });
-        success += 1;
-      } catch {
-        stillFailed[itemId] = staged;
+    try {
+      const response = await batchAnswer.mutateAsync(
+        entries.map(([key, staged]) => ({
+          item_id: Number(key), decision: staged.decision, note: staged.note,
+        })),
+      );
+      const stillFailed: Record<number, StagedAnswer> = {};
+      let success = 0;
+      for (const result of response.results) {
+        if (result.success) {
+          success += 1;
+        } else if (pendingAnswers[result.item_id]) {
+          stillFailed[result.item_id] = pendingAnswers[result.item_id];
+        }
       }
-    }
-    setBulkSending(false);
-    setPendingAnswers(stillFailed);
-    const failedCount = Object.keys(stillFailed).length;
-    setBulkResult({ success, failed: failedCount });
-    if (failedCount === 0) {
-      toast.success(`${success}件を送信しました`);
-    } else {
-      toast.error(`${success}件送信、${failedCount}件失敗しました`);
+      setPendingAnswers(stillFailed);
+      const failedCount = Object.keys(stillFailed).length;
+      setBulkResult({ success, failed: failedCount });
+      if (failedCount === 0) {
+        toast.success(`${success}件を送信しました`);
+      } else {
+        toast.error(`${success}件送信、${failedCount}件失敗しました`);
+      }
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setBulkSending(false);
     }
   };
 
@@ -699,6 +728,11 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
   const sampleItems = sampleEligible.length > 3 ? sampleEligible.slice(0, 3) : [];
   const sampleIds = new Set(sampleItems.map(i => i.id));
   const remainingInformationalItems = informationalItems.filter(i => !sampleIds.has(i.id));
+
+  // PR #296 review fix (Finding 3): superseded rows are audit history, kept
+  // fully visible but out of the counts/category groups above. `?? []`
+  // degrades gracefully for a Control Server predating this field.
+  const supersededItems = full?.superseded_items ?? [];
 
   return (
     <Card data-testid="review-queue-panel">
@@ -816,6 +850,32 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
             {showInformational && (
               <div className="mt-2 space-y-2" data-testid="review-queue-informational-list">
                 {remainingInformationalItems.map(item => (
+                  <InformationalItemRow
+                    key={item.id}
+                    item={item}
+                    sessionId={sessionId}
+                    existingInquiry={activeInquiries.get(`review_item:${item.id}`)}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {supersededItems.length > 0 && (
+          <div className="pt-2 border-t">
+            <button
+              type="button"
+              className="text-xs text-muted-foreground underline underline-offset-2"
+              onClick={() => setShowSuperseded(s => !s)}
+              aria-expanded={showSuperseded}
+              data-testid="review-queue-superseded-toggle"
+            >
+              {showSuperseded ? "履歴を隠す" : `履歴 ${supersededItems.length}件`}
+            </button>
+            {showSuperseded && (
+              <div className="mt-2 space-y-2" data-testid="review-queue-superseded-list">
+                {supersededItems.map(item => (
                   <InformationalItemRow
                     key={item.id}
                     item={item}

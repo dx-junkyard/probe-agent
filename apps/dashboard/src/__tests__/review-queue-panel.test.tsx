@@ -461,8 +461,9 @@ describe("ReviewQueuePanel", () => {
     expect(within(summary).getByTestId("review-queue-summary-informational")).toHaveTextContent("参考情報 1件");
   });
 
-  // Issue #295 (ST-2): bulk answer mode.
-  test("一括回答モードでは選択が保留され、まとめて送信で順次APIを呼ぶ", async () => {
+  // Issue #295 (ST-2) / PR #296 review fix (Finding 5): bulk answer mode now
+  // sends one POST .../answers-batch call instead of per-item /answer calls.
+  test("一括回答モードでは選択が保留され、まとめて送信で answers-batch を1回だけ呼ぶ", async () => {
     const item1 = makeItem({ id: 50, review_category: "must_review", reason_code: "conflict_detected" });
     const item2 = makeItem({ id: 51, review_category: "batch_reviewable" });
     const queue: AlignmentReviewQueueOut = { session_id: 1, system_id: 1, items: [item1, item2] };
@@ -478,8 +479,15 @@ describe("ReviewQueuePanel", () => {
       return Promise.resolve(undefined);
     };
     mockApi.post.mockImplementation((path: string) => {
-      if (path === "/interview/alignment/50/answer") return Promise.resolve({ ...item1, status: "answered" });
-      if (path === "/interview/alignment/51/answer") return Promise.resolve({ ...item2, status: "answered" });
+      if (path === "/interview/sessions/1/alignment/answers-batch") {
+        return Promise.resolve({
+          session_id: 1, system_id: 1, refreshed: true,
+          results: [
+            { item_id: 50, success: true, item: { ...item1, status: "answered" }, error: null },
+            { item_id: 51, success: true, item: { ...item2, status: "answered" }, error: null },
+          ],
+        });
+      }
       return Promise.resolve(undefined);
     });
 
@@ -506,20 +514,23 @@ describe("ReviewQueuePanel", () => {
 
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith(
-        "/interview/alignment/50/answer",
-        { decision: "accept_current", note: undefined },
-      );
-      expect(mockApi.post).toHaveBeenCalledWith(
-        "/interview/alignment/51/answer",
-        { decision: "needs_change", note: undefined },
+        "/interview/sessions/1/alignment/answers-batch",
+        {
+          answers: [
+            { item_id: 50, decision: "accept_current", note: undefined },
+            { item_id: 51, decision: "needs_change", note: undefined },
+          ],
+        },
       );
     });
+    // Exactly one call to the batch endpoint -- never per-item /answer calls.
+    expect(mockApi.post).toHaveBeenCalledTimes(1);
     await waitFor(() => {
       expect(screen.getByTestId("review-queue-bulk-result")).toHaveTextContent("2件送信しました");
     });
   });
 
-  test("一括送信で一部失敗した場合、日本語で部分失敗を明示する", async () => {
+  test("一括送信で一部失敗した場合、日本語で部分失敗を明示し、失敗項目だけ保留に残す", async () => {
     const item1 = makeItem({ id: 60, review_category: "batch_reviewable" });
     const item2 = makeItem({ id: 61, review_category: "batch_reviewable" });
     const queue: AlignmentReviewQueueOut = { session_id: 1, system_id: 1, items: [item1, item2] };
@@ -535,8 +546,15 @@ describe("ReviewQueuePanel", () => {
       return Promise.resolve(undefined);
     };
     mockApi.post.mockImplementation((path: string) => {
-      if (path === "/interview/alignment/60/answer") return Promise.resolve({ ...item1, status: "answered" });
-      if (path === "/interview/alignment/61/answer") return Promise.reject(new ApiError(500, "internal error"));
+      if (path === "/interview/sessions/1/alignment/answers-batch") {
+        return Promise.resolve({
+          session_id: 1, system_id: 1, refreshed: true,
+          results: [
+            { item_id: 60, success: true, item: { ...item1, status: "answered" }, error: null },
+            { item_id: 61, success: false, item: null, error: "internal error" },
+          ],
+        });
+      }
       return Promise.resolve(undefined);
     });
 
@@ -552,10 +570,83 @@ describe("ReviewQueuePanel", () => {
     fireEvent.click(await screen.findByTestId("review-queue-bulk-submit"));
 
     await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledTimes(1);
+    });
+    await waitFor(() => {
       expect(screen.getByTestId("review-queue-bulk-result")).toHaveTextContent("1件送信、1件失敗しました");
     });
     // The failed item stays staged so the user can retry.
     expect(screen.getByTestId("review-item-staged-61")).toBeInTheDocument();
+    // The succeeded item is no longer staged.
+    expect(screen.queryByTestId("review-item-staged-60")).not.toBeInTheDocument();
+  });
+
+  // PR #296 review fix (Finding 3): superseded history section.
+  test("superseded_items は「履歴 N件」として初期折りたたみで表示され、監査詳細を展開できる", async () => {
+    const current = makeItem({
+      id: 90, review_category: "no_review_required", reason_code: "no_change",
+      alignment_state: "aligned",
+    });
+    const historical = makeItem({
+      id: 91, review_category: "must_review", reason_code: "conflict_detected",
+      status: "answered", superseded: true, confidence: "confirmed",
+      intelligence_run_id: 5,
+    });
+    const queue: AlignmentReviewQueueOut = { session_id: 1, system_id: 1, items: [] };
+    const full: AlignmentListOut = {
+      session_id: 1, system_id: 1,
+      items_by_category: { must_review: [], batch_reviewable: [], no_review_required: [current], unchanged: [], informational: [] },
+      counts: { must_review: 0, batch_reviewable: 0, no_review_required: 1, unchanged: 0, informational: 0 },
+      superseded_items: [historical],
+    };
+    getImpl = (path: string) => {
+      if (path === "/interview/sessions/1/review-queue") return Promise.resolve(queue);
+      if (path === "/interview/sessions/1/alignment") return Promise.resolve(full);
+      if (path === "/interview/sessions/1/inquiries") return Promise.resolve({ session_id: 1, system_id: 1, items: [] });
+      return Promise.resolve(undefined);
+    };
+
+    const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
+    render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+
+    const toggle = await screen.findByTestId("review-queue-superseded-toggle");
+    expect(toggle).toHaveTextContent("履歴 1件");
+    // Collapsed by default -- no action cards, and no history row yet.
+    expect(screen.queryByTestId("review-item-informational-91")).not.toBeInTheDocument();
+    // A superseded item, however 'must_review' its review_category was at
+    // creation time, is never rendered as an action card.
+    expect(screen.queryByTestId("review-item-91")).not.toBeInTheDocument();
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveTextContent("履歴を隠す");
+    const historyList = await screen.findByTestId("review-queue-superseded-list");
+    const historyRow = within(historyList).getByTestId("review-item-informational-91");
+    expect(within(historyRow).getByTestId("review-item-superseded-91")).toHaveTextContent("履歴");
+
+    // Reuses the existing AuditDetail expansion.
+    fireEvent.click(within(historyRow).getByTestId("review-item-informational-detail-toggle-91"));
+    expect(within(historyRow).getByTestId("review-item-audit-detail-91")).toHaveTextContent("#5");
+  });
+
+  test("superseded_items が空/未提供のときは履歴セクションを出さない", async () => {
+    const queue: AlignmentReviewQueueOut = { session_id: 1, system_id: 1, items: [] };
+    const full: AlignmentListOut = {
+      session_id: 1, system_id: 1,
+      items_by_category: { must_review: [], batch_reviewable: [], no_review_required: [], unchanged: [], informational: [] },
+      counts: { must_review: 0, batch_reviewable: 0, no_review_required: 0, unchanged: 0, informational: 0 },
+    };
+    getImpl = (path: string) => {
+      if (path === "/interview/sessions/1/review-queue") return Promise.resolve(queue);
+      if (path === "/interview/sessions/1/alignment") return Promise.resolve(full);
+      if (path === "/interview/sessions/1/inquiries") return Promise.resolve({ session_id: 1, system_id: 1, items: [] });
+      return Promise.resolve(undefined);
+    };
+
+    const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
+    render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+
+    await screen.findByTestId("review-queue-panel");
+    expect(screen.queryByTestId("review-queue-superseded-toggle")).not.toBeInTheDocument();
   });
 
   // Issue #295 (ST-2): audit detail expansion for no-action rows.

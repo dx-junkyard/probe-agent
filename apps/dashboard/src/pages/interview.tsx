@@ -26,8 +26,9 @@ import {
   useRejectInterviewProposal,
   useResumeInterviewInquiry,
   useResumeInterviewQa,
-  useRouteAndInvestigateQa,
+  useQaAutoInvestigate,
   useRunRuntimeRealityCheck,
+  type QaAutoInvestigateController,
   useSkipInterviewQa,
   useUnderstandingDiff,
   useUpdateInterviewUnderstanding,
@@ -65,7 +66,6 @@ import type {
   InquiryRouteCategory,
   InterviewInquiryOut,
   InterviewQaOut,
-  InterviewQaRouteInvestigateBatchOut,
   InterviewQuestionEvidenceRef,
   InterviewSessionDetailOut,
   InterviewStage,
@@ -228,6 +228,13 @@ type FocusedQuestion = {
   evidenceRefs?: InterviewQuestionEvidenceRef[];
   answerOptions?: string[];
   confirmable: boolean;
+  // Issue #295 §4.8 review fix (Finding 4): the backing interview_qa row's
+  // id, when this focused question came from an OpenQuestion carrying one
+  // (Issue #129). Used to scope route-and-investigate to qa_ids=[qaId] for
+  // this question's 「わからない」 auto-investigation. Absent for questions
+  // with no backing row (e.g. the zero-base fixed questionnaire) -- those
+  // fall back to the original #142 flow directly, never auto-investigated.
+  qaId?: number | null;
 };
 
 const QUICK_ANSWER_YES = "はい、その理解で正しいです。";
@@ -242,6 +249,7 @@ function focusedFromOpenQuestion(q: OpenQuestion): FocusedQuestion {
     answerOptions: q.answer_options ?? [],
     // 仮説付きの質問は「はい/いいえ+修正」で答えられる確認型。
     confirmable: !!q.hypothesis,
+    qaId: q.qa_id ?? null,
   };
 }
 
@@ -432,7 +440,7 @@ function NextActionBanner({ uiState, nextAction }: {
 // 旧回答も previous として残る(上書きしない)。
 function QaItemCard({
   qa, sessionId, existingInquiry, onAnswer, onSkip, onResume, answering, skipping, resuming,
-  outOfArea, onInvestigateForUnknown, investigatePending,
+  outOfArea, investigate,
 }: {
   qa: InterviewQaOut;
   sessionId: number;
@@ -449,12 +457,12 @@ function QaItemCard({
   // Issue #291: rendered in the 「担当外の質問」 group -- offers a handoff
   // action in addition to the normal answer/skip actions.
   outOfArea?: boolean;
-  // Issue #295 §4.8: same batch route-and-investigate call the 「AIに先に
-  // 調査させる」button uses (shared mutation instance from QaPanel), invoked
-  // automatically for this one question when 「わからない」is chosen.
-  // Resolves to null on API failure so the caller can fall back safely.
-  onInvestigateForUnknown: () => Promise<InterviewQaRouteInvestigateBatchOut | null>;
-  investigatePending: boolean;
+  // Issue #295 §4.8 / PR #296 review fix (Finding 4): the single shared
+  // auto-investigation controller (one instance per session, created in
+  // InterviewPage and passed down through QaPanel) -- never a per-card
+  // instance, so an in-flight call from this card, another card, or the
+  // focused-question card all share the same isPending flag.
+  investigate: QaAutoInvestigateController;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(qa.answer_text ?? "");
@@ -467,10 +475,9 @@ function QaItemCard({
   // InquiryMessageBubble's showEvidence pattern.
   const [showInvestigationEvidence, setShowInvestigationEvidence] = useState(false);
   // Issue #295 §4.8: true only while THIS card's 「わからない」 auto-
-  // investigation is in flight -- drives the short status line and guards
-  // against firing a second request for the same question while one is
-  // already running.
-  const [investigatingUnknown, setInvestigatingUnknown] = useState(false);
+  // investigation is in flight (derived from the shared controller, not
+  // local state) -- drives the short status line.
+  const investigatingUnknown = investigate.investigatingQaId === qa.id;
   const resumeInquiry = useResumeInterviewInquiry(sessionId);
 
   // Raw enum values are never rendered (Issue #266) -- only a known,
@@ -522,32 +529,25 @@ function QaItemCard({
     setEditing(false);
   };
 
-  // Issue #295 §4.8: 「わからない」を選んだら、まず既存の
-  // route-and-investigate バッチ API(「AIに先に調査させる」ボタンと同じ
-  // もの)をこの質問について自動で呼び出す。投稿された結果が
-  // qa.investigation に反映されれば(下の qa.investigation ブロックが
-  // 自動で結論を表示する)、#142 の仮説生成フローには入らず既存の確認導線
-  // (回答する/わからない/疑問がある)に戻すだけにする。調査が使えない
-  // (失敗・対象外・バッチの上限で処理されなかった)場合は、ユーザーが回答
-  // する機会を失わないよう、必ず従来の #142 フローにフォールバックする。
+  // Issue #295 §4.8 / PR #296 review fix (Finding 4): 「わからない」を選ん
+  // だら、まず共有の自動調査コントローラ(useQaAutoInvestigate、「AIに先に
+  // 調査させる」ボタンと同じ基盤)に、この質問だけ(qa_ids=[qa.id])を対象
+  // にした調査を依頼する。投稿された結果が qa.investigation に反映されれば
+  // (下の qa.investigation ブロックが自動で結論を表示する)、#142 の仮説生
+  // 成フローには入らず既存の確認導線(回答する/わからない/疑問がある)に戻
+  // すだけにする。調査が使えない(失敗・対象外・バッチの上限で処理されな
+  // かった)場合は、ユーザーが回答する機会を失わないよう、必ず従来の #142
+  // フローにフォールバックする。
   const submitUnknown = async () => {
-    if (investigatingUnknown || investigatePending) return;
-    setInvestigatingUnknown(true);
-    try {
-      const batch = await onInvestigateForUnknown();
-      const item = batch?.results.find(r => r.qa_id === qa.id);
-      const investigated = !!item && !item.error
-        && (item.investigation_status === "completed" || item.investigation_status === "unresolved");
-      if (investigated) {
-        // AIの調査結果 (qa.investigation) は qa 一覧の再取得で表示される。
-        // 元の回答は一切送信せず、既存の確認導線に戻すだけ。
-        setEditing(false);
-        return;
-      }
-      await fallBackToUnknownFlow();
-    } finally {
-      setInvestigatingUnknown(false);
+    if (investigate.isPending) return;
+    const investigated = await investigate.runForQuestion(qa.id);
+    if (investigated) {
+      // AIの調査結果 (qa.investigation) は qa 一覧の再取得で表示される。
+      // 元の回答は一切送信せず、既存の確認導線に戻すだけ。
+      setEditing(false);
+      return;
     }
+    await fallBackToUnknownFlow();
   };
 
   return (
@@ -761,7 +761,7 @@ function QaItemCard({
                     size="sm"
                     variant="outline"
                     onClick={submitUnknown}
-                    disabled={answering || investigatePending}
+                    disabled={answering || investigate.isPending}
                     data-testid={`qa-answer-unknown-${qa.id}`}
                   >
                     わからない
@@ -848,7 +848,7 @@ function QaItemCard({
 // Exported for focused component testing (Issue #291's out-of-area
 // grouping) without rendering the entire InterviewPage.
 export function QaPanel({
-  sessionId, actor, approvedCount, answerableAreas,
+  sessionId, actor, approvedCount, answerableAreas, investigate,
 }: {
   sessionId: number;
   actor: string;
@@ -857,41 +857,35 @@ export function QaPanel({
   // to group out-of-area questions separately -- never to hide them.
   // Defensively accepts undefined (a stale cached/mocked session shape).
   answerableAreas: KnowledgeArea[] | null | undefined;
+  // Issue #295 §4.8 / PR #296 review fix (Finding 4): the single shared
+  // auto-investigation controller, created once per session by the caller
+  // (InterviewPage) and also used by the focused-question card there --
+  // never instantiated locally here, so the two UI surfaces share one
+  // in-flight state (see QaAutoInvestigateController's doc comment).
+  investigate: QaAutoInvestigateController;
 }) {
   const { data: qaList } = useInterviewQaList(sessionId);
   const answer = useAnswerInterviewQa(sessionId);
   const skip = useSkipInterviewQa(sessionId);
   const resume = useResumeInterviewQa(sessionId);
   const runRealityCheck = useRunRuntimeRealityCheck(sessionId);
-  // Issue #286 review fix (Finding 1): batch-routes + investigates open
-  // questions in the normal Q&A flow instead of leaving Question Router /
-  // Investigation Agent reachable only from the Inquiry side-conversation.
-  const routeAndInvestigate = useRouteAndInvestigateQa(sessionId);
   // Issue #285 refresh/resume: re-attach any still-active Inquiry to its
   // origin card after a reload.
   const activeInquiries = useActiveInquiriesByOrigin(sessionId);
 
+  // Issue #286 review fix (Finding 1): batch-routes + investigates open
+  // questions in the normal Q&A flow instead of leaving Question Router /
+  // Investigation Agent reachable only from the Inquiry side-conversation.
+  // Unrestricted (no qa_ids) -- the whole-session batch, distinct from each
+  // card's single-question auto-investigate below.
   const handleRouteAndInvestigate = async () => {
     try {
-      const result = await routeAndInvestigate.mutateAsync();
+      const result = await investigate.runBulk();
       toast.success(
         `分類 ${result.counts.routed} 件・調査 ${result.counts.investigated} 件が完了しました`,
       );
     } catch (e) {
       toast.error(String(e));
-    }
-  };
-
-  // Issue #295 §4.8: same batch mutation as the 「AIに先に調査させる」
-  // button above, reused (not duplicated) so a 「わからない」 click and the
-  // manual batch button can never race each other -- they share the same
-  // mutation's pending state. Resolves to null on failure so QaItemCard can
-  // fall back to the original #142 flow without losing the user's turn.
-  const handleInvestigateForUnknown = async () => {
-    try {
-      return await routeAndInvestigate.mutateAsync();
-    } catch {
-      return null;
     }
   };
 
@@ -957,10 +951,10 @@ export function QaPanel({
                 size="sm"
                 variant="outline"
                 onClick={handleRouteAndInvestigate}
-                disabled={routeAndInvestigate.isPending}
+                disabled={investigate.isPending}
                 data-testid="route-and-investigate-qa"
               >
-                {routeAndInvestigate.isPending ? "調査中..." : "AIに先に調査させる"}
+                {investigate.isPending ? "調査中..." : "AIに先に調査させる"}
               </Button>
             )}
             <Button
@@ -1011,8 +1005,7 @@ export function QaPanel({
               answering={answer.isPending}
               skipping={skip.isPending}
               resuming={resume.isPending}
-              onInvestigateForUnknown={handleInvestigateForUnknown}
-              investigatePending={routeAndInvestigate.isPending}
+              investigate={investigate}
             />
           ))}
         </div>
@@ -1039,8 +1032,7 @@ export function QaPanel({
                   answering={answer.isPending}
                   skipping={skip.isPending}
                   resuming={resume.isPending}
-                  onInvestigateForUnknown={handleInvestigateForUnknown}
-                  investigatePending={routeAndInvestigate.isPending}
+                  investigate={investigate}
                   outOfArea
                 />
               ))}
@@ -1185,6 +1177,11 @@ export default function InterviewPage() {
   const rebaseSnapshot = useRebaseInterviewSnapshot(selectedSessionId);
   const updateUnderstanding = useUpdateInterviewUnderstanding();
   const confirmUnderstanding = useConfirmInterviewUnderstanding(selectedSessionId);
+  // Issue #295 §4.8 / PR #296 review fix (Finding 4): one shared
+  // auto-investigation controller per session, used both by the
+  // focused-question card below and by QaPanel/QaItemCard (passed down as a
+  // prop) -- see QaAutoInvestigateController's doc comment in api/hooks.ts.
+  const qaAutoInvestigate = useQaAutoInvestigate(selectedSessionId);
 
   const [message, setMessage] = useState("");
   const messageInputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -1468,6 +1465,38 @@ export default function InterviewPage() {
   // 自由文ではなく answer_unknown フラグで送り、確定回答なしとして記録させる。
   const sendUnknown = () =>
     sendText(message.trim() || "わかりません", { answerUnknown: true });
+
+  // Issue #295 §4.8 review fix (Finding 4): 画面中央の focused question の
+  // 「わからない」にも、QaItemCard 側と同じ共有コントローラ(qaAutoInvestigate)
+  // を接続する。この質問を裏付ける interview_qa 行の qa_id が分かる場合のみ
+  // qa_ids=[qaId] で自動調査を依頼し、投稿された調査結果は Q&A一覧側の
+  // QaItemCard が自動で表示する(このカード自身は投稿結果を保持していない
+  // ため転記はできない -- そちらを確認するよう案内するだけ)。qa_id が無い
+  // (ゼロベースの固定質問など)場合や調査が使えなかった場合は、必ず従来の
+  // #142 フロー(sendUnknown)にフォールバックする。
+  const focusedQuestionInvestigating = !!(
+    focusedQuestion?.qaId != null && qaAutoInvestigate.investigatingQaId === focusedQuestion.qaId
+  );
+  const handleFocusedUnknown = async () => {
+    const qaId = focusedQuestion?.qaId;
+    if (qaId == null) {
+      // 対象外(裏付けとなる質問行が無い): 従来の #142 フローへ直接進む。
+      sendUnknown();
+      return;
+    }
+    // 既に他のカードからの自動調査が進行中: 二重発火させず、ボタンが
+    // disabled になっている間はここで何もしない(#142へは進めない -- ユー
+    // ザーの操作機会は失わない。再クリックすれば良いだけ)。
+    if (qaAutoInvestigate.isPending) return;
+    const investigated = await qaAutoInvestigate.runForQuestion(qaId);
+    if (investigated) {
+      toast.info(
+        "AIが調査しました。調査結果は右側の「Q&A一覧」でご確認のうえ、必要であれば回答欄に転記してください。",
+      );
+      return;
+    }
+    sendUnknown();
+  };
 
   // 「いいえ」は修正内容の入力を促す: 定型の書き出しを入力欄に入れてフォーカスする。
   const startCorrection = () => {
@@ -1797,18 +1826,30 @@ export default function InterviewPage() {
                               ))}
                               {/* Issue #142: 明示的な「わからない」入力。自由文ではなく
                                   answer_unknown フラグで送り、確定回答なしとして記録する。
-                                  提案ステージの絞り込み質問でも同様に使える。 */}
+                                  提案ステージの絞り込み質問でも同様に使える。
+                                  Issue #295 §4.8 review fix (Finding 4): まず共有の自動調査
+                                  コントローラでこの質問(qa_ids=[qaId])を調査し、投稿された
+                                  結果がなければ従来の #142 フローにフォールバックする。 */}
                               {(uiState === "fill_gaps" || proposalNarrowing) && (
-                                <Button
-                                  size="sm"
-                                  variant="outline"
-                                  onClick={sendUnknown}
-                                  disabled={dialogueTurn.isPending}
-                                  data-testid="quick-answer-unknown"
-                                >
-                                  <HelpCircle className="h-4 w-4 mr-1" />
-                                  わからない
-                                </Button>
+                                focusedQuestionInvestigating ? (
+                                  <p
+                                    className="text-xs text-muted-foreground self-center"
+                                    data-testid="focused-question-unknown-investigating"
+                                  >
+                                    関連コードとテストを確認しています
+                                  </p>
+                                ) : (
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    onClick={handleFocusedUnknown}
+                                    disabled={dialogueTurn.isPending || qaAutoInvestigate.isPending}
+                                    data-testid="quick-answer-unknown"
+                                  >
+                                    <HelpCircle className="h-4 w-4 mr-1" />
+                                    わからない
+                                  </Button>
+                                )
                               )}
                             </div>
                           )}
@@ -2212,6 +2253,7 @@ git commit`}
                 actor={actor}
                 approvedCount={approvedCount}
                 answerableAreas={session.answerable_areas}
+                investigate={qaAutoInvestigate}
               />
             </div>
           </div>
