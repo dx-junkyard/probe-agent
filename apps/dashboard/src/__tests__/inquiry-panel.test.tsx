@@ -204,6 +204,88 @@ beforeEach(() => {
         ],
       });
     }
+    // --- Issue #295 ST-3: 4-layer progressive disclosure fixtures ----------
+    if (path === "/interview/inquiries/500") {
+      return Promise.resolve({
+        inquiry: {
+          id: 500, session_id: 1, system_id: 1, origin_kind: "intent", origin_id: 5,
+          held_draft: null, status: "open", status_reason: null,
+          created_at: 0, updated_at: 0, closed_at: null,
+        },
+        messages: [
+          { id: 1, inquiry_id: 500, system_id: 1, role: "user", content: "この設定はどこで検証していますか?", detail: null, intelligence_run_id: null, is_mock: false, created_at: 0 },
+          {
+            id: 2, inquiry_id: 500, system_id: 1, role: "assistant",
+            content: "設定は起動時に検証されます。",
+            detail: {
+              key_points: ["起動処理内で読み込む", "不正な値は起動を止める"],
+              evidence: [
+                { path: "apps/control-server/app/config.py", start_line: 10, end_line: 20, summary: "設定を検証" },
+                { path: "apps/control-server/tests/test_config.py", start_line: 1, end_line: 5, summary: "検証テスト" },
+              ],
+              uncertainty: "",
+              route_category: "system_researchable", decision_question: null,
+            },
+            intelligence_run_id: 7, is_mock: false, created_at: 0,
+          },
+        ],
+      });
+    }
+    if (path === "/interview/inquiries/501") {
+      return Promise.resolve({
+        inquiry: {
+          id: 501, session_id: 1, system_id: 1, origin_kind: "intent", origin_id: 5,
+          held_draft: null, status: "open", status_reason: null,
+          created_at: 0, updated_at: 0, closed_at: null,
+        },
+        messages: [
+          { id: 1, inquiry_id: 501, system_id: 1, role: "user", content: "この処理は同期的ですか?", detail: null, intelligence_run_id: null, is_mock: false, created_at: 0 },
+          {
+            id: 2, inquiry_id: 501, system_id: 1, role: "assistant",
+            content: "同期処理と推測されますが確証はありません。",
+            detail: {
+              key_points: ["呼び出し元がawaitしていない"],
+              evidence: [{ path: "apps/control-server/app/worker.py", start_line: 3, end_line: 8, summary: "呼び出し箇所" }],
+              uncertainty: "関連する設定ファイルを読めていません",
+              route_category: "system_researchable", decision_question: null,
+            },
+            intelligence_run_id: 8, is_mock: false, created_at: 0,
+          },
+        ],
+      });
+    }
+    if (path === "/interview/inquiries/502") {
+      return Promise.resolve({
+        inquiry: {
+          id: 502, session_id: 1, system_id: 1, origin_kind: "intent", origin_id: 5,
+          held_draft: null, status: "open", status_reason: null,
+          created_at: 0, updated_at: 0, closed_at: null,
+        },
+        messages: [
+          { id: 1, inquiry_id: 502, system_id: 1, role: "user", content: "この関数は実行されていますか?", detail: null, intelligence_run_id: null, is_mock: false, created_at: 0 },
+          {
+            id: 2, inquiry_id: 502, system_id: 1, role: "assistant",
+            content: "実装上は未使用と見えますが、実行時には呼ばれています。",
+            detail: {
+              key_points: ["静的解析では呼び出し元が見つからない"],
+              evidence: [],
+              uncertainty: "",
+              route_category: "system_researchable", decision_question: null,
+              runtime_evidence: [{
+                kind: "runtime_fact", component_id: "hidden_fn", runtime_check: "mismatch",
+                summary: "call_count=12 を観測(想定と不一致)",
+                provenance: {
+                  environment: null, first_observed_at: 1_700_000_000, last_observed_at: 1_700_000_000,
+                  snapshot_ref: null, source: "trace_aggregation", freshness: "fresh",
+                },
+              }],
+              suggested_observation_proposal: null,
+            },
+            intelligence_run_id: 9, is_mock: false, created_at: 0,
+          },
+        ],
+      });
+    }
     throw new Error(`Unexpected GET ${path}`);
   });
 });
@@ -427,7 +509,9 @@ describe("InquiryPanel (Issue #285)", () => {
 
     test("fresh runtime evidence renders provenance chips and no stale warning", async () => {
       const row = await openInquiryWithId(400, "この関数は summarize を実行します。");
-      fireEvent.click(within(row).getByTestId("inquiry-show-evidence-2"));
+      // Full provenance chips (environment/snapshot/freshness) live in the
+      // layer-4 audit detail (Issue #295), not the layer-3 evidence summary.
+      fireEvent.click(within(row).getByTestId("inquiry-show-audit-2"));
 
       const chips = within(row).getByTestId("inquiry-runtime-evidence-summarize_fn");
       expect(within(chips).getByTestId("runtime-chip-environment")).toHaveTextContent("環境: 不明");
@@ -441,7 +525,7 @@ describe("InquiryPanel (Issue #285)", () => {
 
     test("stale runtime evidence is flagged 古い観測です and offers a proposal draft", async () => {
       const row = await openInquiryWithId(401, "この関数についての観測データが古くなっています。");
-      fireEvent.click(within(row).getByTestId("inquiry-show-evidence-2"));
+      fireEvent.click(within(row).getByTestId("inquiry-show-audit-2"));
 
       const chips = within(row).getByTestId("inquiry-runtime-evidence-stale_fn");
       expect(within(chips).getByTestId("runtime-chip-freshness")).toHaveTextContent("鮮度: 古い");
@@ -467,6 +551,94 @@ describe("InquiryPanel (Issue #285)", () => {
           { target_component: "stale_fn", purpose: "エラー原因を切り分けたい" },
         );
       });
+    });
+  });
+
+  // --- 4-layer progressive disclosure (Issue #295 ST-3, §4.4/§4.10) ---------
+
+  describe("4-layer progressive disclosure", () => {
+    async function openInquiryWithId(id: number, expectedContent: string) {
+      inquiryListItems = [{
+        id, session_id: 1, system_id: 1, origin_kind: "intent", origin_id: 5,
+        held_draft: null, status: "open", status_reason: null,
+        created_at: 0, updated_at: 0, closed_at: null,
+      }];
+      const row = await openIntentPanel();
+      fireEvent.click(await within(row).findByTestId("intent-item-inquiry-reopen-5"));
+      await within(row).findByText(expectedContent);
+      return row;
+    }
+
+    test("all 4 layers are available and collapsed by default when key_points/evidence exist with no exception signal", async () => {
+      const row = await openInquiryWithId(500, "設定は起動時に検証されます。");
+
+      // Layer 1 (content) is always visible.
+      expect(within(row).getByText("設定は起動時に検証されます。")).toBeInTheDocument();
+
+      // Layers 2-4 exist (key_points + evidence are both non-empty) but stay
+      // collapsed until clicked -- no exception signal on this message.
+      expect(within(row).queryByTestId("inquiry-reasons-detail-2")).not.toBeInTheDocument();
+      expect(within(row).queryByTestId("inquiry-evidence-detail-2")).not.toBeInTheDocument();
+      expect(within(row).queryByTestId("inquiry-audit-detail-2")).not.toBeInTheDocument();
+
+      fireEvent.click(within(row).getByTestId("inquiry-show-reasons-2"));
+      expect(within(row).getByTestId("inquiry-reasons-detail-2")).toHaveTextContent("起動処理内で読み込む");
+      // Layer 2 never shows file paths/line numbers -- those are layer 4 only.
+      expect(within(row).getByTestId("inquiry-reasons-detail-2").textContent).not.toMatch(/config\.py/);
+
+      fireEvent.click(within(row).getByTestId("inquiry-show-evidence-2"));
+      const evidenceDetail = within(row).getByTestId("inquiry-evidence-detail-2");
+      // Layer 3 shows a docs/code/test kind label + summary, never the exact
+      // path:line (that is layer 4's job).
+      expect(evidenceDetail).toHaveTextContent("コード");
+      expect(evidenceDetail).toHaveTextContent("テスト");
+      expect(evidenceDetail).toHaveTextContent("設定を検証");
+      expect(evidenceDetail.textContent).not.toMatch(/config\.py:10-20/);
+
+      fireEvent.click(within(row).getByTestId("inquiry-show-audit-2"));
+      const auditDetail = within(row).getByTestId("inquiry-audit-detail-2");
+      expect(auditDetail).toHaveTextContent("apps/control-server/app/config.py:10-20");
+      expect(auditDetail).toHaveTextContent("apps/control-server/tests/test_config.py:1-5");
+      expect(auditDetail).toHaveTextContent("調査 run: 7");
+    });
+
+    test("a layer with no backing fields renders no toggle at all", async () => {
+      // Inquiry 100 (used by openInquiry()) has key_points only -- no
+      // evidence, no runtime_evidence, no uncertainty.
+      const row = await openInquiry();
+      expect(within(row).getByTestId("inquiry-show-reasons-2")).toBeInTheDocument();
+      expect(within(row).queryByTestId("inquiry-show-evidence-2")).not.toBeInTheDocument();
+      expect(within(row).queryByTestId("inquiry-show-audit-2")).not.toBeInTheDocument();
+    });
+
+    test("non-empty uncertainty pre-expands layers 2-3 (exception), layer 4 stays collapsed", async () => {
+      const row = await openInquiryWithId(501, "同期処理と推測されますが確証はありません。");
+
+      // No click needed -- already expanded because of the uncertainty signal.
+      expect(within(row).getByTestId("inquiry-reasons-detail-2")).toHaveTextContent(
+        "呼び出し元がawaitしていない",
+      );
+      const evidenceDetail = within(row).getByTestId("inquiry-evidence-detail-2");
+      expect(evidenceDetail).toHaveTextContent("関連する設定ファイルを読めていません");
+      // Layer 4 (audit) is never auto-expanded even under the exception.
+      expect(within(row).queryByTestId("inquiry-audit-detail-2")).not.toBeInTheDocument();
+
+      // Buttons reflect the already-open state.
+      expect(within(row).getByTestId("inquiry-show-reasons-2")).toHaveTextContent("理由を隠す");
+      expect(within(row).getByTestId("inquiry-show-evidence-2")).toHaveTextContent("根拠を隠す");
+    });
+
+    test("a runtime_evidence mismatch (conflict) pre-expands layers 2-3", async () => {
+      const row = await openInquiryWithId(
+        502, "実装上は未使用と見えますが、実行時には呼ばれています。",
+      );
+
+      expect(within(row).getByTestId("inquiry-reasons-detail-2")).toHaveTextContent(
+        "静的解析では呼び出し元が見つからない",
+      );
+      const evidenceDetail = within(row).getByTestId("inquiry-evidence-detail-2");
+      expect(evidenceDetail).toHaveTextContent("Runtime");
+      expect(evidenceDetail).toHaveTextContent("想定と不一致");
     });
   });
 });

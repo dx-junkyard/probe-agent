@@ -3866,3 +3866,177 @@ issue では拡張しない(brief が明示的に要求していないため) �
   fail-closed、ルーティング結果の永続化(その後 `search_keywords` 追加
   で `question-router-v3` までバンプ済み。「Question Router /
   Investigation Agent(Issue #286)」節参照)。
+
+## Interview Alignment UX 差分改善(Issue #295)
+
+Issue #295 は Interview Alignment UX の元提案であり、その大部分は Issue
+#282(サブイシュー #283-#291)で実装済み。本節は #295 のうち #283-#291
+でカバーされていなかった差分として実装した内容と、意図的に見送った残課
+題を記録する。
+
+### unchanged 分類の実体化(#295 §4.3 / §7.1、control-server)
+
+#287 で予約値だった `review_category='unchanged'` を決定的ロジックで到
+達可能にした。
+
+- `app/alignment.py` の `compute_content_hash()`: `current_claim` +
+  正規化した `current_evidence`(path/start_line/end_line/summary をソー
+  ト)+ ルール表 `classify_alignment_item` の入力になる全フィールド
+  (`alignment_state` / `risk_flags`(ソート)/ `confidence` /
+  `intent_field` / `runtime_check`)の canonical JSON を sha256 する。
+  分類に影響する変化(Runtime Reality Check の反転を含む)が
+  「変更なし」と誤判定されることはない。完全一致のみで、類似度・
+  LLM 判断は使わない(Principle 6)。
+- 再ビルド(`run_alignment_build`)時、直前ビルドの終端行
+  (`status IN ('answered','corrected') AND superseded=0`)と
+  `content_hash` が一致する新項目は `unchanged` /
+  `reason_code='unchanged_since_confirmation'` に分類し、
+  `carried_over_from` に引き継ぎ元 id を記録する(監査専用の参照。
+  ON DELETE SET NULL)。unchanged 項目は `GET .../review-queue` の
+  主導線(must_review/batch_reviewable フィルタ)に現れない。
+- §5.5 の狭い決定的版: goal intent(System Purpose 相当)が直前ビルド
+  以降に確定・変更された場合、そのビルドでは引き継ぎを行わず全項目を
+  ルール表で再分類する。`trigger_kind` は `interview_refresh` の
+  dedupe(pending ジョブへの合流)によりバッチ全体を代表しないため、
+  goal 行の `updated_at` と直前ビルドの `alignment_item.created_at`
+  最大値の比較で判定する。
+- additive migration: `alignment_item.content_hash TEXT` /
+  `carried_over_from INTEGER`(既存行は NULL のまま)。
+- テスト: `tests/test_interview_alignment.py` に hash の決定性・順序
+  非依存性、引き継ぎ、内容変化時の非引き継ぎ、goal 変更によるブロック
+  と過剰ブロックの回帰、旧 DB からの migration を追加(98件)。
+
+### Review Queue の表示・操作(#295 §4.1 / §5.3 / §5.4 / §4.4、dashboard)
+
+`review-queue.tsx` のみの変更。分類・優先度はバックエンド値をそのまま
+使い、フロントで再分類しない。
+
+- カテゴリ別件数サマリ: 要確認 / 一括レビュー可 / 確認不要 / 前回から
+  変更なし / 参考情報 の5固定区分を `counts` から表示(欠損は0扱い)。
+- まとめて回答モード(既定OFF): 回答をローカルに保留し「まとめて送信」
+  で既存 `/answer` を項目ごとに順次呼ぶ。#288 の refresh dedupe が
+  バッチを1回の再ビルドにまとめるため一括 API は追加しない。失敗項目
+  は保留のまま残し「N件送信、M件失敗しました」を表示。1件即時送信の
+  従来 UX は不変。
+- 確認不要/参考情報/unchanged 行の監査詳細展開(§5.3): 応答に存在する
+  フィールドのみ(state・confidence・evidence・snapshot/revision・
+  updated_at・intelligence run・carried_over_from/content_hash)を表示。
+- サンプル確認(§5.4 最小版): no_review_required + informational から
+  id 昇順で最大3件を決定的に選び、展開済み+「疑問がある」導線付きで
+  提示(全件3件以下ならサンプル節なし)。誤り発見時の分類ルール自動
+  再評価は未実装(残課題)。
+- 根拠の先出し例外(§4.4): conflict / security・high_risk フラグ /
+  runtime_check mismatch・stale / 根拠1件のみ、のとき EvidenceList を
+  初期展開する(応答の有限フィールドからの決定的判定のみ)。
+
+### Inquiry 段階開示の4段階化と「わからない」自動調査(#295 §4.4 / §4.8 / §4.10、dashboard)
+
+- `inquiry-panel.tsx`: 従来の「結論 → detail 一括トグル」2段階を、
+  結論(常時)/「理由を見る」(`key_points`)/「根拠を見る」
+  (evidence の docs/code/test/Runtime 種別+要約+uncertainty)/
+  「調査詳細を見る」(path:行番号・runtime provenance・調査 run 参照)
+  の4段階に分割。種別はパス文字列からの構造的分類(file kind、
+  Principle 6 の許容例)。バックエンド・スキーマ変更なし(既存
+  detail payload の表示分割のみ)。
+- 例外の先出し: `runtime_evidence[].runtime_check=='mismatch'` または
+  `detail.uncertainty` 非空のとき第2〜3層を初期展開(第4層は自動展開
+  しない)。
+- `interview.tsx`: Q&A の「わからない」選択時、既存の
+  route-and-investigate バッチ調査(#286/#291 で整備済みのエンドポイ
+  ント)を自動起動する。調査中は「関連コードとテストを確認しています」
+  の短い状態表示のみ。API 失敗・バッチ対象外時は従来の #142 フロー
+  (`answer_unknown: true`)へ無条件フォールバックし、回答機会を失わ
+  せない。実行中の重複発火は防止。`investigation_status='unresolved'`
+  は調査成功(特定できず)として扱い、既存の表示に委ねる。
+
+### 実装しない・見送った残課題
+
+- **#292(低リスク提案の一括承認)**: 引き続き実装しない(CLAUDE.md
+  参照。開始条件の観測データが未取得)。本節の「まとめて回答」は
+  ユーザーが1件ずつ選んだ回答の送信バッチ化であり、AI 分類による
+  自動承認ではない — `decision_method: manual` は項目単位で維持。
+- **Inquiry の前提追跡(#295 §5.6 拡張)**: Inquiry 行への
+  snapshot/revision 参照列・`superseded` 状態・前提変化時の再確認復帰
+  は未実装。DB migration を含む独立した issue として設計すべき規模。
+- **評価指標(#295 §9)**: 疑問解消率・誤った回答確定率などの計測基盤
+  は未実装。指標定義が UI 実装の安定後に確定するため見送り。
+- **サンプル誤り発見時の分類ルール再評価(§5.4 後半)**: 疑問導線まで。
+- **提案 §7 のフィールド名との差異**: 既存実装のフィールド名
+  (`non_goals`、`status` 等)を維持し、#295 記載の名称
+  (`out_of_scope`、`confirmation_state` 等)への改名は行わない
+  (スキーマ契約の互換性優先)。
+
+### PR #296 レビュー対応(#295 実装の修正)
+
+初回実装へのレビュー指摘5件とUX評価に対する修正。
+
+1. **content hash の対象拡張**: `compute_content_hash` に
+   `intent_summary` / `gap_summary` / `proposed_interpretation` と、
+   evidence 参照範囲の実テキスト digest(`source_digest`: pin 済み
+   commit から `read_file_at_commit` で読んだ start〜end 行の sha256、
+   ビルド単位キャッシュ)を追加。同じ行範囲のコード変更や制約・scope
+   の変化が unchanged と誤判定される穴を塞いだ。evidence が読めない
+   項目は hash を None とし carry-over 対象外(安全側)。旧形式 hash
+   とは一致しなくなるが再確認へ戻る方向なので移行処理は不要。
+2. **carry-over の多世代持続**: carry 候補に
+   `review_category='unchanged'` の行を追加し、`carried_over_from` は
+   チェーンを辿った元の人間回答行(answered/corrected)の id を伝播。
+   3世代目以降も引き継ぎが持続し、監査参照は常に実際の人間回答を指す。
+3. **superseded 履歴の分離**: `GET /alignment` の `items_by_category` /
+   `counts` は superseded=0 の現行行のみを対象にし、履歴行は additive な
+   `superseded_items` で返す。UI は「履歴 N件」の折りたたみで監査閲覧
+   可能にし、件数サマリ・サンプル確認への履歴混入を解消。
+4. **調査の単件スコープ化と主導線接続**: `route-and-investigate` に
+   optional な `qa_ids` body を追加(省略時は従来の全対象バッチ)。
+   フロントは `useQaAutoInvestigate` 共通コントローラに調査呼び出しを
+   一本化し、focused question の「わからない」も自動調査へ接続。
+   1操作で複数件の LLM 調査が走らない。
+5. **回答バッチ API**: `POST .../alignment/answers-batch` を追加。
+   単体 `/answer` と同じ書き込みロジックを項目単位で再利用
+   (`decision_method: manual` は項目単位のまま)、`request_refresh` は
+   バッチ全体で一度だけ。部分失敗は項目ごとの成否で応答し、UI は失敗
+   項目を保留に残す。
+6. **画面再構成(UX評価対応)**: Interview 画面の中央主領域を
+   「Alignment Review / 会話」の2タブにし、Alignment build 済み
+   セッションは Alignment Review(Intent/現状/gap サマリ +
+   ReviewQueuePanel)を既定表示。サイドバーの Review Queue 二重表示を
+   撤去し、`qa.investigation` の結論表示を focused question と同じ
+   ビューでも表示する(`QaInvestigationBlock` 共有)。
+
+### PR #296 2回目レビュー対応
+
+初回レビュー対応後の再レビューで残った P1×2・P2×3 への修正。
+
+1. **carry-over が Intent/上位概念変更を検知(指摘1, P1)**:
+   `compute_content_hash` に `intent_item_id`(リンク先 Intent の生 FK)と
+   `linked_intent_digest`(リンク先 `interview_intent_item` の
+   field/value_text/status の sha256)を追加。`/correct` は新 id を発行、
+   `/confirm`・`/decline` は同 id で status が変わるため、どちらも
+   ハッシュが変化し「LLM が同じ要約を返しても依存 Intent が変わった」
+   ケースを項目単位で検知する。加えて goal 専用だった再ビルドガードを
+   **確定済み(confirmed/not_applicable)Intent フィールドのいずれかが
+   直前ビルド以降に更新された場合**へ一般化(全項目を再分類)。
+   Core Capability は per-capability の確定タイムスタンプ列が存在せず
+   決定的判定源が無いため今回は対象外(ヒューリスティック差分は
+   Principle 6 で禁止のため実装しない)。
+2. **回答対象の検証強化(指摘2, P1)**: batch の項目検証に
+   `superseded=1` 拒否・回答可能 status(open/held)以外の拒否・
+   actionable category(must_review/batch_reviewable)以外の拒否・
+   optional な `content_hash` 不一致拒否を追加。単体 answer/correct/hold
+   にも `_reject_if_superseded`(409, `alignment_item_superseded`)を追加。
+   別タブや自動更新で履歴化した項目を古い判断で上書きできない。
+3. **未対応件数の分離(指摘3, P2)**: `AlignmentListOut` に
+   `outstanding_counts` を追加(get_review_queue と同一述語 = superseded=0
+   かつ status NOT IN answered/corrected)。`counts`(現行行総数)は互換
+   維持。UI の要確認・一括レビュー可の件数は outstanding_counts を優先
+   使用し Review Queue のカード数と一致させる。
+4. **既定タブの必須操作優先(指摘4, P2)**: 既定タブを
+   「会話タブに必須アクションが残る間は会話」優先に変更(alignmentBuilt
+   だけで alignment を既定にしない)。会話タブの必須アクションがある間は
+   NextActionBanner に「会話タブへ移動」導線を出し、どのタブからも必須
+   操作へ到達できるようにした。
+5. **gap サマリの内容表示とサンプルの情報量抑制(指摘5, P2)**:
+   AlignmentSummaryHeader のギャップ欄に最重要 gap の要約
+   (gap_summary || current_claim、未対応のみ、Review Queue と同じ決定的
+   順序)を主表示し件数を補助に。確認不要サンプルの根拠・content_hash は
+   初期折りたたみ(主張のみ表示)にして確認疲れを抑制。

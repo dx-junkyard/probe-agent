@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, getSystemId } from "./client";
 import type {
@@ -34,6 +34,7 @@ import type {
   InterviewInquiryOriginKind,
   AlignmentBuildOut, AlignmentListOut, AlignmentReviewQueueOut, AlignmentItemOut,
   AlignmentDecisionAction,
+  AlignmentBatchAnswerItemRequest, AlignmentBatchAnswerOut,
   RuntimeObservationProposalOut, RuntimeObservationProposalCreate,
   RefreshStatusOut, RefreshJobOut,
   ChangeSetDetailOut, ChangeSetApplyResultOut, ChangeSetOut,
@@ -820,15 +821,77 @@ export function useAnswerInterviewQa(sessionId: number | null) {
 // useAnswerInterviewQa) this does not trigger the #288 auto-refresh -- only
 // route_category/knowledge_area/investigation are affected, and only the QA
 // list needs to be refetched.
+//
+// PR #296 review fix (Finding 4): accepts an optional explicit qa_ids subset
+// so a single question's 「わからない」 can scope the batch to just itself
+// instead of always investigating every eligible open question in the
+// session. Omitting qa_ids (undefined, or an empty array) keeps the prior
+// whole-session batch behavior used by the 「AIに先に調査させる」 button.
 export function useRouteAndInvestigateQa(sessionId: number | null) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: () =>
-      api.post<InterviewQaRouteInvestigateBatchOut>(
-        `/interview/sessions/${sessionId}/qa/route-and-investigate`,
-      ),
+    // The unrestricted call keeps posting with no body at all (matching the
+    // endpoint's documented `payload=None` default) rather than an explicit
+    // `{ qa_ids: undefined }` -- a scoped call is the only case that ever
+    // sends a body.
+    mutationFn: (qaIds?: number[]) =>
+      qaIds && qaIds.length > 0
+        ? api.post<InterviewQaRouteInvestigateBatchOut>(
+            `/interview/sessions/${sessionId}/qa/route-and-investigate`, { qa_ids: qaIds },
+          )
+        : api.post<InterviewQaRouteInvestigateBatchOut>(
+            `/interview/sessions/${sessionId}/qa/route-and-investigate`,
+          ),
     onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] }),
   });
+}
+
+// Issue #295 §4.8 / PR #296 review fix (Finding 4): a single shared
+// auto-investigation controller so the 「わからない」 auto-investigate
+// wiring is implemented once and reused verbatim by both the normal Q&A list
+// (QaItemCard, via QaPanel) and the focused-question card in
+// pages/interview.tsx -- never duplicated per call site. Callers are
+// expected to create ONE instance per session (in InterviewPage) and pass it
+// down, so the two call sites share a single isPending flag: an in-flight
+// investigate call from either place blocks the other from firing a second,
+// overlapping request for the same underlying batch endpoint.
+// `runForQuestion` always scopes the call to a single question
+// (qa_ids=[qaId]); `runBulk` is the unrestricted whole-session batch used by
+// the existing 「AIに先に調査させる」 button, unchanged.
+export interface QaAutoInvestigateController {
+  isPending: boolean;
+  // The qa_id currently being auto-investigated via runForQuestion, or null.
+  // Never set for runBulk (the whole-session batch has no single target).
+  investigatingQaId: number | null;
+  // Resolves true iff THIS question was investigated (completed/unresolved,
+  // no error) by the batch call; false on any other outcome (API failure,
+  // human_only routing, cap/skip) so the caller can fall back safely.
+  runForQuestion: (qaId: number) => Promise<boolean>;
+  runBulk: () => Promise<InterviewQaRouteInvestigateBatchOut>;
+}
+
+export function useQaAutoInvestigate(sessionId: number | null): QaAutoInvestigateController {
+  const routeAndInvestigate = useRouteAndInvestigateQa(sessionId);
+  const [investigatingQaId, setInvestigatingQaId] = useState<number | null>(null);
+
+  const runForQuestion = async (qaId: number): Promise<boolean> => {
+    if (routeAndInvestigate.isPending) return false;
+    setInvestigatingQaId(qaId);
+    try {
+      const batch = await routeAndInvestigate.mutateAsync([qaId]);
+      const item = batch.results.find(r => r.qa_id === qaId);
+      return !!item && !item.error
+        && (item.investigation_status === "completed" || item.investigation_status === "unresolved");
+    } catch {
+      return false;
+    } finally {
+      setInvestigatingQaId(null);
+    }
+  };
+
+  const runBulk = () => routeAndInvestigate.mutateAsync(undefined);
+
+  return { isPending: routeAndInvestigate.isPending, investigatingQaId, runForQuestion, runBulk };
 }
 
 // --- Answerable knowledge areas / handoff (Issue #291) ------------------------
@@ -1173,6 +1236,28 @@ export function useAnswerAlignmentItem(sessionId: number | null) {
   return useMutation({
     mutationFn: ({ itemId, decision, note }: { itemId: number; decision: AlignmentDecisionAction; note?: string }) =>
       api.post<AlignmentItemOut>(`/interview/alignment/${itemId}/answer`, { decision, note }),
+    onSuccess: () => {
+      _invalidateAlignment(qc, sessionId);
+      // Issue #288: see useAnswerInterviewQa's comment above.
+      _invalidateAfterAnswerBatch(qc, sessionId);
+    },
+  });
+}
+
+// PR #296 review fix (Finding 5): answers several alignment_item rows in one
+// call instead of the dashboard sequentially calling POST .../answer once
+// per staged item -- the server now triggers the #288 refresh exactly once
+// for the whole batch. Reuses the exact same invalidation as the single-item
+// answer above; a partial failure still leaves `refreshed: true` when at
+// least one item saved, so invalidating unconditionally on success here is
+// safe (the caller only reads `response.results` to decide what to re-stage).
+export function useAnswerAlignmentItemsBatch(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (answers: AlignmentBatchAnswerItemRequest[]) =>
+      api.post<AlignmentBatchAnswerOut>(
+        `/interview/sessions/${sessionId}/alignment/answers-batch`, { answers },
+      ),
     onSuccess: () => {
       _invalidateAlignment(qc, sessionId);
       // Issue #288: see useAnswerInterviewQa's comment above.

@@ -19,7 +19,9 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { vi } from "vitest";
 import type { ReactNode } from "react";
-import type { InterviewQaListOut, InterviewQaOut, InterviewQaRouteInvestigateBatchOut } from "@/api/types";
+import type {
+  InterviewQaListOut, InterviewQaOut, InterviewQaRouteInvestigateBatchOut, KnowledgeArea,
+} from "@/api/types";
 
 const mockApi = {
   get: vi.fn(),
@@ -82,6 +84,27 @@ beforeEach(() => {
   mockApi.get.mockImplementation((path: string) => getImpl(path));
 });
 
+// Issue #295 §4.8 / PR #296 review fix (Finding 4): QaPanel now takes the
+// shared auto-investigation controller (useQaAutoInvestigate) as a prop
+// instead of creating its own instance -- this harness mirrors how
+// InterviewPage creates ONE controller per session and passes it down.
+interface QaPanelOwnProps {
+  sessionId: number;
+  actor: string;
+  approvedCount: number;
+  answerableAreas: KnowledgeArea[] | null | undefined;
+}
+
+async function renderQaPanel(props: QaPanelOwnProps) {
+  const { QaPanel } = await import("@/pages/interview");
+  const { useQaAutoInvestigate } = await import("@/api/hooks");
+  function Harness() {
+    const investigate = useQaAutoInvestigate(props.sessionId);
+    return <QaPanel {...props} investigate={investigate} />;
+  }
+  return render(<Harness />, { wrapper: createWrapper() });
+}
+
 function mockQaList(items: InterviewQaOut[]) {
   const list: InterviewQaListOut = {
     session_id: 1, system_id: 1, items,
@@ -104,11 +127,7 @@ describe("QaPanel out-of-area grouping (Issue #291)", () => {
       makeQa({ id: 2, knowledge_area: "implementation" }),
     ]);
 
-    const { QaPanel } = await import("@/pages/interview");
-    render(
-      <QaPanel sessionId={1} actor="dev" approvedCount={1} answerableAreas={[]} />,
-      { wrapper: createWrapper() },
-    );
+    await renderQaPanel({ sessionId: 1, actor: "dev", approvedCount: 1, answerableAreas: [] });
 
     await screen.findByTestId("qa-item-1");
     expect(screen.getByTestId("qa-item-2")).toBeInTheDocument();
@@ -122,11 +141,9 @@ describe("QaPanel out-of-area grouping (Issue #291)", () => {
       makeQa({ id: 3, knowledge_area: null }), // unrouted -- always in the normal group
     ]);
 
-    const { QaPanel } = await import("@/pages/interview");
-    render(
-      <QaPanel sessionId={1} actor="dev" approvedCount={1} answerableAreas={["implementation"]} />,
-      { wrapper: createWrapper() },
-    );
+    await renderQaPanel({
+      sessionId: 1, actor: "dev", approvedCount: 1, answerableAreas: ["implementation"],
+    });
 
     await screen.findByTestId("qa-panel");
     const outOfAreaGroup = await screen.findByTestId("qa-out-of-area-group");
@@ -146,11 +163,9 @@ describe("QaPanel out-of-area grouping (Issue #291)", () => {
   test("out-of-area items offer a 担当者へ引き継ぐ action", async () => {
     mockQaList([makeQa({ id: 4, knowledge_area: "security" })]);
 
-    const { QaPanel } = await import("@/pages/interview");
-    render(
-      <QaPanel sessionId={1} actor="dev" approvedCount={1} answerableAreas={["implementation"]} />,
-      { wrapper: createWrapper() },
-    );
+    await renderQaPanel({
+      sessionId: 1, actor: "dev", approvedCount: 1, answerableAreas: ["implementation"],
+    });
 
     const outOfAreaGroup = await screen.findByTestId("qa-out-of-area-group");
     expect(within(outOfAreaGroup).getByTestId("qa-handoff-open-4")).toBeInTheDocument();
@@ -173,21 +188,134 @@ describe("QaPanel route-and-investigate wiring (Issue #286 review fix, Finding 1
       return Promise.resolve(undefined);
     });
 
-    const { QaPanel } = await import("@/pages/interview");
     const { toast } = await import("sonner");
-    render(
-      <QaPanel sessionId={1} actor="dev" approvedCount={1} answerableAreas={[]} />,
-      { wrapper: createWrapper() },
-    );
+    await renderQaPanel({ sessionId: 1, actor: "dev", approvedCount: 1, answerableAreas: [] });
 
     const button = await screen.findByTestId("route-and-investigate-qa");
     fireEvent.click(button);
 
     await waitFor(() => {
+      // Unrestricted call -- no qa_ids body, matching the endpoint's
+      // documented payload=None default.
       expect(mockApi.post).toHaveBeenCalledWith("/interview/sessions/1/qa/route-and-investigate");
     });
     await waitFor(() => {
       expect(toast.success).toHaveBeenCalledWith("分類 1 件・調査 0 件が完了しました");
+    });
+  });
+
+  // --- Issue #295 §4.8: 「わからない」→ 自動調査接続 --------------------
+
+  test("「わからない」triggers the batch route-and-investigate endpoint for this question, showing a short status only", async () => {
+    mockQaList([makeQa({ id: 1 })]);
+    let resolveInvestigate: (v: InterviewQaRouteInvestigateBatchOut) => void;
+    const investigatePromise = new Promise<InterviewQaRouteInvestigateBatchOut>(resolve => {
+      resolveInvestigate = resolve;
+    });
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/1/qa/route-and-investigate") return investigatePromise;
+      return Promise.resolve(undefined);
+    });
+
+    await renderQaPanel({ sessionId: 1, actor: "dev", approvedCount: 1, answerableAreas: [] });
+
+    const item = await screen.findByTestId("qa-item-1");
+    fireEvent.click(within(item).getByText("回答する"));
+    fireEvent.click(within(item).getByTestId("qa-answer-unknown-1"));
+
+    // Only a short status line while investigating -- no answer call yet,
+    // and the わからない button itself is replaced (no duplicate firing).
+    expect(within(item).getByTestId("qa-answer-unknown-investigating-1")).toHaveTextContent(
+      "関連コードとテストを確認しています",
+    );
+    await waitFor(() => {
+      // PR #296 review fix (Finding 4): scoped to qa_ids=[1] -- never the
+      // whole-session batch -- for this single question's 「わからない」.
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/1/qa/route-and-investigate", { qa_ids: [1] },
+      );
+    });
+    expect(within(item).queryByTestId("qa-answer-unknown-1")).not.toBeInTheDocument();
+    expect(mockApi.post).not.toHaveBeenCalledWith(
+      "/interview/sessions/1/qa/1/answer", expect.anything(),
+    );
+
+    resolveInvestigate!({
+      session_id: 1, system_id: 1,
+      results: [{ qa_id: 1, route_category: "system_researchable", knowledge_area: null, investigation_status: "completed", error: null }],
+      counts: { routed: 1, investigated: 1, failed: 0, skipped_cap: 0 },
+    });
+
+    // Investigation succeeded for this question: never falls back to
+    // recording an unknown answer, and returns to the normal confirm view.
+    await waitFor(() => {
+      expect(within(item).queryByTestId("qa-answer-unknown-investigating-1")).not.toBeInTheDocument();
+    });
+    expect(mockApi.post).not.toHaveBeenCalledWith(
+      "/interview/sessions/1/qa/1/answer", expect.anything(),
+    );
+    expect(within(item).getByText("回答する")).toBeInTheDocument();
+  });
+
+  test("investigation API failure falls back to the original #142 わからない flow (never loses the answer opportunity)", async () => {
+    mockQaList([makeQa({ id: 1 })]);
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/1/qa/route-and-investigate") {
+        return Promise.reject(new Error("boom"));
+      }
+      if (path === "/interview/sessions/1/qa/1/answer") {
+        return Promise.resolve({ qa: makeQa({ id: 1, status: "unconfirmed" }), previous: null, regeneration_recommended: false });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const { toast } = await import("sonner");
+    await renderQaPanel({ sessionId: 1, actor: "dev", approvedCount: 1, answerableAreas: [] });
+
+    const item = await screen.findByTestId("qa-item-1");
+    fireEvent.click(within(item).getByText("回答する"));
+    fireEvent.click(within(item).getByTestId("qa-answer-unknown-1"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/1/qa/1/answer",
+        expect.objectContaining({ answer_unknown: true }),
+      );
+    });
+    await waitFor(() => {
+      expect(toast.info).toHaveBeenCalledWith(
+        "「わからない」として記録しました。仮説を立てて確認質問を続けます。",
+      );
+    });
+  });
+
+  test("a question not covered by the batch result (e.g. cap/skip) also falls back to the #142 flow", async () => {
+    mockQaList([makeQa({ id: 1 })]);
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/1/qa/route-and-investigate") {
+        const batch: InterviewQaRouteInvestigateBatchOut = {
+          session_id: 1, system_id: 1, results: [],
+          counts: { routed: 0, investigated: 0, failed: 0, skipped_cap: 1 },
+        };
+        return Promise.resolve(batch);
+      }
+      if (path === "/interview/sessions/1/qa/1/answer") {
+        return Promise.resolve({ qa: makeQa({ id: 1, status: "unconfirmed" }), previous: null, regeneration_recommended: false });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    await renderQaPanel({ sessionId: 1, actor: "dev", approvedCount: 1, answerableAreas: [] });
+
+    const item = await screen.findByTestId("qa-item-1");
+    fireEvent.click(within(item).getByText("回答する"));
+    fireEvent.click(within(item).getByTestId("qa-answer-unknown-1"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/1/qa/1/answer",
+        expect.objectContaining({ answer_unknown: true }),
+      );
     });
   });
 
@@ -196,11 +324,7 @@ describe("QaPanel route-and-investigate wiring (Issue #286 review fix, Finding 1
       makeQa({ id: 1, route_category: "system_researchable", knowledge_area: "implementation" }),
     ]);
 
-    const { QaPanel } = await import("@/pages/interview");
-    render(
-      <QaPanel sessionId={1} actor="dev" approvedCount={1} answerableAreas={[]} />,
-      { wrapper: createWrapper() },
-    );
+    await renderQaPanel({ sessionId: 1, actor: "dev", approvedCount: 1, answerableAreas: [] });
 
     const badge = await screen.findByTestId("qa-route-category-1");
     expect(badge).toHaveTextContent("AI が調査して回答");
@@ -225,11 +349,7 @@ describe("QaPanel route-and-investigate wiring (Issue #286 review fix, Finding 1
       }),
     ]);
 
-    const { QaPanel } = await import("@/pages/interview");
-    render(
-      <QaPanel sessionId={1} actor="dev" approvedCount={1} answerableAreas={[]} />,
-      { wrapper: createWrapper() },
-    );
+    await renderQaPanel({ sessionId: 1, actor: "dev", approvedCount: 1, answerableAreas: [] });
 
     const investigationBlock = await screen.findByTestId("qa-investigation-1");
     expect(investigationBlock).toHaveTextContent("AIの調査結果: 認証はJWTで行われます");
@@ -265,11 +385,7 @@ describe("QaPanel route-and-investigate wiring (Issue #286 review fix, Finding 1
       }),
     ]);
 
-    const { QaPanel } = await import("@/pages/interview");
-    render(
-      <QaPanel sessionId={1} actor="dev" answerableAreas={[]} approvedCount={1} />,
-      { wrapper: createWrapper() },
-    );
+    await renderQaPanel({ sessionId: 1, actor: "dev", answerableAreas: [], approvedCount: 1 });
 
     const note = await screen.findByTestId("qa-investigation-unresolved-1");
     expect(note).toHaveTextContent("AIの調査では特定できませんでした");
@@ -289,11 +405,7 @@ describe("QaPanel route-and-investigate wiring (Issue #286 review fix, Finding 1
       return Promise.resolve(undefined);
     };
 
-    const { QaPanel } = await import("@/pages/interview");
-    render(
-      <QaPanel sessionId={1} actor="dev" approvedCount={1} answerableAreas={[]} />,
-      { wrapper: createWrapper() },
-    );
+    await renderQaPanel({ sessionId: 1, actor: "dev", approvedCount: 1, answerableAreas: [] });
 
     const banner = await screen.findByTestId("answers-revised-banner");
     expect(banner).toHaveTextContent("理解は自動で更新されます");

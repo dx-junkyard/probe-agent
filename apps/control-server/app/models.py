@@ -3028,6 +3028,21 @@ class InterviewQaRouteInvestigateBatchOut(BaseModel):
     )
 
 
+# Review fix (PR #296, Finding 4): an optional, explicit subset of question
+# ids to route+investigate, so a single card's 「わからない」 action can
+# target just that one question instead of always triggering the whole
+# session's batch selection (up to MAX_BATCH_QUESTIONS LLM investigations
+# per call). Omitting qa_ids (or sending null) keeps the prior all-eligible
+# behavior (backward compatible). A qa_id that does not exist, or belongs to
+# a different session, is a per-question error in the response -- never a
+# reason to fail or silently drop the rest of the batch (same fail-closed-
+# per-question policy the existing batch endpoint already uses).
+class InterviewQaRouteInvestigateBatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    qa_ids: Optional[List[int]] = None
+
+
 # --- Intent Brief (Issue #284) ------------------------------------------------
 #
 # Structured user intent, kept separate from implementation-fact
@@ -3233,7 +3248,7 @@ AlignmentReviewCategory = Literal[
 AlignmentReasonCode = Literal[
     "security_related", "high_risk", "core_intent", "conflict_detected",
     "low_confidence", "runtime_mismatch", "routine_update", "no_change",
-    "informational_only",
+    "informational_only", "unchanged_since_confirmation",
 ]
 # Item-level user progress. 'inquiry' is set while an Inquiry
 # (origin_kind='review_item') is open on this item, and reset to 'open'
@@ -3301,6 +3316,16 @@ class AlignmentItemOut(BaseModel):
     # GET .../review-queue. Additive column; defaults False so pre-migration
     # rows and any DB row missing the column still validate.
     superseded: bool = False
+    # Issue #295: realizes Issue #287's reserved 'unchanged' review_category.
+    # content_hash is the deterministic sha256 (app/alignment.py's
+    # compute_content_hash) over this item's identity-bearing fields, set on
+    # every build; NULL only for rows written before this migration.
+    # carried_over_from is the id of the immediately-preceding build's
+    # terminal (answered/corrected) row this item's content exactly matched,
+    # set only when review_category == 'unchanged'; NULL otherwise
+    # (audit-only -- never a live FK join for decision-making).
+    content_hash: Optional[str] = None
+    carried_over_from: Optional[int] = None
     intelligence_run_id: int
     is_mock: bool = False
     created_at: float
@@ -3321,6 +3346,23 @@ class AlignmentListOut(BaseModel):
     system_id: int
     items_by_category: Dict[str, List[AlignmentItemOut]] = Field(default_factory=dict)
     counts: Dict[str, int] = Field(default_factory=dict)
+    # 2nd review round (PR #296, Finding 3): `counts` still includes current
+    # rows in a terminal status (answered/corrected, superseded=0) -- e.g.
+    # right after answering a must_review item and before the next rebuild
+    # marks it superseded=1, counts.must_review still counts it even though
+    # GET .../review-queue no longer does. `outstanding_counts` applies the
+    # EXACT SAME predicate get_review_queue uses (superseded=0 AND status NOT
+    # IN ('answered','corrected')) to every category consistently, so a
+    # client that wants "how many of these still need action" always agrees
+    # with the Review Queue's own count. Additive; `counts` keeps its
+    # original meaning ("current rows of this category") for compatibility.
+    outstanding_counts: Dict[str, int] = Field(default_factory=dict)
+    # Review fix (PR #296, Finding 3): superseded=1 rows (history -- a later
+    # rebuild already produced a fresh replacement row for the same contrast
+    # point) are additive-only here, kept fully visible for audit but split
+    # out of items_by_category/counts so those two fields only ever reflect
+    # CURRENT rows (superseded=0). Never used to drive Review Queue counts.
+    superseded_items: List[AlignmentItemOut] = Field(default_factory=list)
 
 
 class AlignmentReviewQueueOut(BaseModel):
@@ -3340,6 +3382,71 @@ class AlignmentCorrectRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     corrected_interpretation: str = Field(..., min_length=1, max_length=2_000)
+
+
+# --- Batch answer (PR #296 review fix, Finding 5) ----------------------------
+#
+# One review batch (the developer clears several Review Queue cards at once)
+# previously fired one Issue #288 request_refresh call PER item answered --
+# de-duplicated down to at most "1 running + 1 queued" by
+# interview_refresh._enqueue, but still up to 2 rebuilds for what is
+# conceptually a single batch, or as many as the item count under an eager
+# refresh policy. This endpoint answers every item in one request and calls
+# request_refresh exactly once, only after at least one item's answer is
+# durably committed.
+#
+# Same fields as AlignmentAnswerRequest, plus item_id so one entry can target
+# any alignment_item in the session. MAX_BATCH_ANSWERS mirrors the existing
+# deterministic per-call cap pattern (Issue #286's MAX_BATCH_QUESTIONS,
+# app/routes/question_router.py) -- a finite, explicit bound (Principle 6),
+# not a heuristic one.
+MAX_BATCH_ANSWERS = 50
+
+
+class AlignmentBatchAnswerItemRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: int
+    decision: AlignmentDecisionAction
+    note: Optional[str] = Field(default=None, max_length=2_000)
+    # 2nd review round (PR #296, Finding 2): optional staleness guard. When
+    # given, it must match the item's CURRENT alignment_item.content_hash or
+    # the entry is rejected as a per-item error (the item changed -- e.g. a
+    # rebuild carried it over to a new row, or another reviewer/tab already
+    # answered it -- since the client staged this answer). Omitting it keeps
+    # pre-fix behavior (no staleness check) for backward compatibility.
+    content_hash: Optional[str] = Field(default=None, max_length=64)
+
+
+class AlignmentBatchAnswerRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    answers: List[AlignmentBatchAnswerItemRequest] = Field(
+        default_factory=list, max_length=MAX_BATCH_ANSWERS,
+    )
+
+
+class AlignmentBatchAnswerItemResult(BaseModel):
+    item_id: int
+    success: bool
+    # Populated only when success is True; the full updated item, exactly
+    # like the single-item POST .../answer response, so the caller never
+    # needs a follow-up GET for the items that saved cleanly.
+    item: Optional[AlignmentItemOut] = None
+    # Populated only when success is False -- a concise, structural reason
+    # (not found / wrong session / Inquiry-locked / duplicate item_id in this
+    # batch), never LLM free text.
+    error: Optional[str] = None
+
+
+class AlignmentBatchAnswerOut(BaseModel):
+    session_id: int
+    system_id: int
+    results: List[AlignmentBatchAnswerItemResult] = Field(default_factory=list)
+    # True iff at least one item in this batch was durably saved and
+    # request_refresh was therefore called exactly once for the whole batch;
+    # False when every item failed (refresh is never called on a total miss).
+    refreshed: bool = False
 
 
 # --- Answerable knowledge areas / handoff (Issue #291) ------------------------

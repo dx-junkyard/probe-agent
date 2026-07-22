@@ -1059,6 +1059,13 @@ export interface AlignmentItemOut {
   // review_category) can still surface one, so any rendering of that full
   // listing should treat superseded=true as history, not a current item.
   superseded?: boolean;
+  // Issue #295 (ST-2) defensive additions: not yet returned by the server
+  // as of this UI change (tracked separately under ST-1's `unchanged`
+  // materialization work). Optional so the UI degrades gracefully to "not
+  // shown" until the backend adds them, rather than assuming a shape the
+  // API doesn't send yet.
+  carried_over_from?: number | null;
+  content_hash?: string | null;
   intelligence_run_id: number;
   is_mock: boolean;
   created_at: number;
@@ -1079,6 +1086,57 @@ export interface AlignmentListOut {
   system_id: number;
   items_by_category: Record<string, AlignmentItemOut[]>;
   counts: Record<string, number>;
+  // Review fix (PR #296, Finding 3): superseded=1 rows (history -- a later
+  // rebuild already produced a fresh replacement row for the same contrast
+  // point), split out of items_by_category/counts so those two only ever
+  // reflect CURRENT rows. Optional so a response predating this fix (or an
+  // older Control Server) degrades to "no history shown" instead of
+  // breaking the page.
+  superseded_items?: AlignmentItemOut[];
+  // Review fix (PR #296, 2nd pass, Finding 3/5b): per-category count of
+  // items NOT YET resolved (superseded=0 AND status NOT IN
+  // (answered, corrected)) -- matches the Review Queue's card count
+  // exactly, unlike `counts` which stays a total. Field name confirmed
+  // against apps/control-server/app/models.py's
+  // `AlignmentListOut.outstanding_counts`. Optional so a response predating
+  // this field (or an older Control Server) falls back to `counts` instead
+  // of breaking.
+  outstanding_counts?: Record<string, number>;
+}
+
+// --- Batch answer (PR #296 review fix, Finding 5) ----------------------------
+
+export interface AlignmentBatchAnswerItemRequest {
+  item_id: number;
+  decision: AlignmentDecisionAction;
+  note?: string;
+  // Review fix (PR #296, 2nd pass, Finding 2): when provided (read from this
+  // item's AlignmentItemOut.content_hash at the time it was staged), the
+  // server validates the item has not changed since, failing only this
+  // entry (never the whole batch) on a mismatch, with an already-Japanese
+  // `error` message. Field name confirmed against
+  // apps/control-server/app/models.py's
+  // `AlignmentBatchAnswerItemRequest.content_hash`. Optional/omit-safe so
+  // older Control Servers that don't validate it simply ignore the field.
+  content_hash?: string | null;
+}
+
+export interface AlignmentBatchAnswerItemResult {
+  item_id: number;
+  success: boolean;
+  // Populated only when success is true.
+  item?: AlignmentItemOut | null;
+  // Populated only when success is false -- a concise structural reason
+  // (not found / wrong session / Inquiry-locked / duplicate item_id),
+  // never LLM free text.
+  error?: string | null;
+}
+
+export interface AlignmentBatchAnswerOut {
+  session_id: number;
+  system_id: number;
+  results: AlignmentBatchAnswerItemResult[];
+  refreshed: boolean;
 }
 
 export interface AlignmentReviewQueueOut {

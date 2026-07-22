@@ -3480,6 +3480,26 @@ def init_db() -> None:
             )
         if qa_cols and "investigation_json" not in qa_cols:
             conn.execute("ALTER TABLE interview_qa ADD COLUMN investigation_json TEXT")
+        # Issue #295: realizes the 'unchanged' review_category reserved by
+        # Issue #287. content_hash is a deterministic sha256 over an item's
+        # identity-bearing fields (app/alignment.py's compute_content_hash),
+        # computed for every item on every build (including pre-existing
+        # rows the next build leaves untouched -- those simply keep whatever
+        # hash they were built with). carried_over_from records which
+        # terminal (answered/corrected) row from the immediately preceding
+        # build a fresh 'unchanged' row's content exactly matched, purely for
+        # audit -- it is never used to resolve a FK-style join back into
+        # decision-making. Existing rows backfill to NULL (their content_hash
+        # was never computed and they are never retroactively matched
+        # against).
+        alignment_item_cols = _columns(conn, "alignment_item")
+        if alignment_item_cols and "content_hash" not in alignment_item_cols:
+            conn.execute("ALTER TABLE alignment_item ADD COLUMN content_hash TEXT")
+        if alignment_item_cols and "carried_over_from" not in alignment_item_cols:
+            conn.execute(
+                "ALTER TABLE alignment_item ADD COLUMN carried_over_from INTEGER "
+                "REFERENCES alignment_item(id) ON DELETE SET NULL"
+            )
         _ensure_legacy_system(conn)
     _validate_startup_environment()
     _validate_publish_startup_config()

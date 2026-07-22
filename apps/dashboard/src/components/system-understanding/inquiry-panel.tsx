@@ -21,6 +21,7 @@ import {
 } from "@/api/hooks";
 import type {
   InquiryRouteCategory,
+  InterviewInquiryMessageDetailOut,
   InterviewInquiryMessageOut,
   InterviewInquiryOriginKind,
   InterviewInquiryRuntimeEvidenceOut,
@@ -149,15 +150,66 @@ function SuggestedObservationProposalCard({
   );
 }
 
+// Issue #295 ST-3 (§4.4/§4.10): 4-layer progressive disclosure for an
+// assistant Inquiry answer. Layer 1 (content, always visible) already comes
+// from `message.content`. The remaining three layers are built ONLY from
+// fields the existing `detail` payload already carries -- no new backend
+// data, no restructuring of `detail` itself, just splitting how much of it
+// is shown at once:
+//   layer 2 「理由を見る」        -- detail.key_points (short reasons)
+//   layer 3 「根拠を見る」        -- evidence + runtime_evidence summaries
+//                                     (kind + short overview) + uncertainty
+//   layer 4 「調査詳細を見る」    -- exact file:line evidence, full runtime
+//                                     provenance chips, the observation-
+//                                     proposal action, and the audit run
+//                                     reference (intelligence_run_id)
+// A layer whose backing fields are all empty renders no toggle at all.
+type EvidenceKind = "docs" | "test" | "code";
+
+const EVIDENCE_KIND_LABELS: Record<EvidenceKind, string> = {
+  docs: "ドキュメント",
+  test: "テスト",
+  code: "コード",
+};
+
+// Deterministic structural classification of an evidence citation's source
+// kind, from the path shape alone (Principle 6 allows "file kind" as a
+// direct structural check) -- never a semantic/LLM judgment.
+function classifyEvidenceKind(path: string): EvidenceKind {
+  const lower = path.toLowerCase();
+  if (lower.includes("test")) return "test";
+  if (lower.startsWith("docs/") || lower.endsWith(".md")) return "docs";
+  return "code";
+}
+
+// Issue #295 §4.4 exception: pre-expand layers 2-3 up front when the
+// response's OWN existing fields already signal a conflict or unresolved
+// doubt -- judged only from finite/structural fields already in `detail`
+// (a runtime_fact `mismatch` check, or a non-empty `uncertainty` note),
+// never by pattern-matching free-text content.
+function needsUpfrontDisclosure(detail: InterviewInquiryMessageDetailOut | null): boolean {
+  if (!detail) return false;
+  const hasRuntimeMismatch = (detail.runtime_evidence ?? []).some(e => e.runtime_check === "mismatch");
+  return hasRuntimeMismatch || detail.uncertainty.trim() !== "";
+}
+
 function InquiryMessageBubble({ message, sessionId }: { message: InterviewInquiryMessageOut; sessionId: number }) {
-  const [showEvidence, setShowEvidence] = useState(false);
   const isAssistant = message.role === "assistant";
-  const hasDetail = !!message.detail && (
-    message.detail.key_points.length > 0
-    || message.detail.evidence.length > 0
-    || !!message.detail.uncertainty
-    || (message.detail.runtime_evidence?.length ?? 0) > 0
-  );
+  const detail = message.detail;
+
+  const keyPoints = detail?.key_points ?? [];
+  const evidence = detail?.evidence ?? [];
+  const runtimeEvidence = detail?.runtime_evidence ?? [];
+  const uncertainty = detail?.uncertainty ?? "";
+
+  const hasReasons = keyPoints.length > 0;
+  const hasEvidenceSummary = evidence.length > 0 || runtimeEvidence.length > 0 || uncertainty !== "";
+  const hasAuditDetail = evidence.length > 0 || runtimeEvidence.length > 0;
+
+  const preExpand = needsUpfrontDisclosure(detail);
+  const [showReasons, setShowReasons] = useState(preExpand && hasReasons);
+  const [showEvidence, setShowEvidence] = useState(preExpand && hasEvidenceSummary);
+  const [showAudit, setShowAudit] = useState(false);
 
   return (
     <div
@@ -196,7 +248,29 @@ function InquiryMessageBubble({ message, sessionId }: { message: InterviewInquir
           確認したいこと: {message.detail.decision_question}
         </p>
       )}
-      {isAssistant && hasDetail && (
+
+      {isAssistant && hasReasons && (
+        <div>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => setShowReasons(s => !s)}
+            data-testid={`inquiry-show-reasons-${message.id}`}
+          >
+            {showReasons ? "理由を隠す" : "理由を見る"}
+          </Button>
+          {showReasons && (
+            <ul
+              className="mt-1 list-disc rounded bg-background/60 p-2 pl-6 space-y-0.5"
+              data-testid={`inquiry-reasons-detail-${message.id}`}
+            >
+              {keyPoints.map((k, i) => <li key={i}>{k}</li>)}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {isAssistant && hasEvidenceSummary && (
         <div>
           <Button
             size="sm"
@@ -208,28 +282,55 @@ function InquiryMessageBubble({ message, sessionId }: { message: InterviewInquir
           </Button>
           {showEvidence && (
             <div className="mt-1 space-y-1 rounded bg-background/60 p-2" data-testid={`inquiry-evidence-detail-${message.id}`}>
-              {message.detail!.key_points.length > 0 && (
-                <ul className="list-disc pl-4">
-                  {message.detail!.key_points.map((k, i) => <li key={i}>{k}</li>)}
-                </ul>
+              {evidence.map((e, i) => (
+                <p key={i}>
+                  <span className="rounded bg-muted px-1 mr-1">{EVIDENCE_KIND_LABELS[classifyEvidenceKind(e.path)]}</span>
+                  {e.summary || "(概要なし)"}
+                </p>
+              ))}
+              {runtimeEvidence.map(entry => (
+                <p key={entry.component_id}>
+                  <span className="rounded bg-muted px-1 mr-1">Runtime</span>
+                  {entry.summary}
+                </p>
+              ))}
+              {uncertainty && (
+                <p className="text-muted-foreground">不確実な点: {uncertainty}</p>
               )}
-              {message.detail!.evidence.map((e, i) => (
+            </div>
+          )}
+        </div>
+      )}
+
+      {isAssistant && hasAuditDetail && (
+        <div>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => setShowAudit(s => !s)}
+            data-testid={`inquiry-show-audit-${message.id}`}
+          >
+            {showAudit ? "調査詳細を隠す" : "調査詳細を見る"}
+          </Button>
+          {showAudit && (
+            <div className="mt-1 space-y-1 rounded bg-background/60 p-2" data-testid={`inquiry-audit-detail-${message.id}`}>
+              {evidence.map((e, i) => (
                 <p key={i} className="font-mono text-[10px] text-muted-foreground">
                   {e.path}:{e.start_line}-{e.end_line}{e.summary ? ` — ${e.summary}` : ""}
                 </p>
               ))}
-              {message.detail!.uncertainty && (
-                <p className="text-muted-foreground">不確実な点: {message.detail!.uncertainty}</p>
-              )}
-              {(message.detail!.runtime_evidence ?? []).map(entry => (
+              {runtimeEvidence.map(entry => (
                 <RuntimeEvidenceChips key={entry.component_id} entry={entry} />
               ))}
-              {message.detail!.suggested_observation_proposal && (
+              {detail?.suggested_observation_proposal && (
                 <SuggestedObservationProposalCard
                   sessionId={sessionId}
-                  targetComponent={message.detail!.suggested_observation_proposal.target_component}
-                  reason={message.detail!.suggested_observation_proposal.reason}
+                  targetComponent={detail.suggested_observation_proposal.target_component}
+                  reason={detail.suggested_observation_proposal.reason}
                 />
+              )}
+              {message.intelligence_run_id != null && (
+                <p className="text-[10px] text-muted-foreground">調査 run: {message.intelligence_run_id}</p>
               )}
             </div>
           )}

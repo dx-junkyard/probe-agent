@@ -158,6 +158,23 @@ creating incomplete persistence or execution paths for later phases.
     from individual review — is not yet met. Do not implement it until that
     data exists.
 
+11. Issue #295 — Interview Alignment UX 差分改善: the original UX proposal
+    behind #282. Most of it is already covered by #283-#291; the implemented
+    delta is: `review_category='unchanged'` made reachable via deterministic
+    content-hash carry-over of previously answered items (with a
+    goal-change guard that disables carry-over for that rebuild), Review
+    Queue category count summary + local batch answering (staged answers
+    sent through the existing per-item `/answer`; NOT AI batch approval —
+    `decision_method: manual` stays per item), audit-detail expansion and
+    deterministic sampling of no-review-required items, evidence shown
+    up-front for conflict/high-risk/runtime-mismatch/single-evidence items,
+    4-stage progressive disclosure in Inquiry answers, and 「わからない」
+    auto-routing into the existing route-and-investigate flow. Deferred
+    (need their own issues): Inquiry snapshot/revision premise tracking +
+    `superseded`, the §9 evaluation-metrics pipeline, and sample-error
+    driven rule re-evaluation. #292 remains NOT implemented. See the
+    Issue #295 section in `docs/project-intelligence.md`.
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,

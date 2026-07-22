@@ -54,6 +54,7 @@ probe-agent:
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
@@ -79,7 +80,7 @@ REVIEW_CATEGORIES = (
 REASON_CODES = (
     "security_related", "high_risk", "core_intent", "conflict_detected",
     "low_confidence", "runtime_mismatch", "routine_update", "no_change",
-    "informational_only",
+    "informational_only", "unchanged_since_confirmation",
 )
 
 _CATEGORY_RANK: Dict[str, int] = {name: i for i, name in enumerate(REVIEW_CATEGORIES)}
@@ -98,6 +99,7 @@ USER_REASON_TEMPLATES: Dict[str, str] = {
     "routine_update": "軽微な差分です。まとめて確認してください",
     "no_change": "意図と現状の理解は一致しています。対応は不要です",
     "informational_only": "参考情報です。対応は不要です",
+    "unchanged_since_confirmation": "前回の確認から内容に変更はありません。対応は不要です",
 }
 
 
@@ -183,6 +185,204 @@ def review_sort_key(*, review_category: str, reason_code: str, item_id: int) -> 
     No numeric score multiplication, no LLM-provided ordering (Principle 6).
     """
     return (_CATEGORY_RANK[review_category], _REASON_RANK[reason_code], item_id)
+
+
+# --- Deterministic content hash for unchanged-item carry-over (Issue #295) --
+#
+# ``unchanged`` (Issue #287's reserved-but-unreachable review_category) is
+# realized here: a rebuild that produces an item whose content_hash exactly
+# matches a terminal (answered/corrected, non-superseded) row from the
+# immediately preceding build carries that row's identity forward instead of
+# re-running it through ``classify_alignment_item``'s rule table. This is an
+# EXACT structural match, never a similarity/heuristic comparison (Principle
+# 6) -- a single differing character anywhere in the hashed payload produces
+# a completely different hash and the item is reclassified normally.
+#
+# The hashed payload is current_claim + normalized evidence (the item's
+# "content", per the Issue #295 brief) plus every field that feeds
+# classify_alignment_item's rule table (alignment_state / risk_flags /
+# confidence / intent_field / runtime_check), so a change in
+# classification-relevant state can never be masked as "unchanged" even when
+# the claim text itself happens to repeat verbatim.
+#
+# Review fix (PR #296, Finding 1): the hash previously missed three
+# meaning-bearing text fields (intent_summary / gap_summary /
+# proposed_interpretation -- an LLM-authored interpretation can change while
+# every other field stays byte-identical) and never checked whether the
+# evidence *citations themselves* still point at the same source text -- a
+# reference-only hash ("path"/"start_line"/"end_line"/"summary") would
+# silently call a build "unchanged" even if the underlying lines had since
+# been edited. Both gaps are closed here:
+#
+# - intent_summary/gap_summary/proposed_interpretation are now hashed inputs.
+# - each evidence item's normalized dict now carries a ``source_digest``: the
+#   sha256 of the EXACT lines ``start_line``..``end_line`` of ``path`` read
+#   from the pinned snapshot commit (Principle 5 -- never the working tree).
+#   Reading reuses the same deterministic, pinned-commit read path this
+#   module already uses for evidence validation (``git_ops.read_file_at_commit``,
+#   mirrored by the ``_read_lines`` helper below -- see
+#   ``validate_evidence_against_snapshot``/``_line_count`` just above for the
+#   sibling read used for line-count validation).
+#
+# Both changes are intentionally NOT migrated: existing content_hash values
+# stop matching the new formula, which only ever causes an item to fall back
+# to normal (re-)classification instead of carrying over -- the safe
+# direction (Issue #295 brief). ``repo_path``/``commit_sha`` are required
+# (not optional) so every call site is forced to compute a real
+# source_digest; when any evidence item's source text cannot be read from
+# the pinned commit, the WHOLE hash is ``None`` so the item can never be
+# treated as a carry-over candidate now, nor match a future rebuild's
+# candidate lookup (the caller's ``content_hash IS NOT NULL`` filter already
+# excludes it) -- it is simply reclassified fresh through the normal rule
+# table instead.
+#
+# Second review round (PR #296, 2nd pass, Finding 1): the hash still missed
+# the Intent Brief entity an item is *linked to* -- only ``intent_field``
+# (the field NAME, e.g. "pain") was hashed, never the linked
+# ``interview_intent_item`` row's own content. A developer editing an Intent
+# Brief field (correcting its value_text, or confirming/declining it) while
+# the reasoning model happens to re-propose byte-identical claim/summary text
+# for a dependent alignment item would previously carry that item over as
+# "unchanged" even though the intent it is contrasted against had genuinely
+# changed. Two new (optional, additive-in-signature) inputs close this:
+#
+# - ``intent_item_id``: the raw FK id of the linked ``interview_intent_item``
+#   row (``None`` when an item has no linked intent). Issue #284's /correct
+#   flow always mints a NEW id when value_text changes (the old row is
+#   superseded, never edited in place), so an id change alone already
+#   invalidates the hash for that case.
+# - ``linked_intent_digest``: a sha256 (``compute_intent_item_digest`` below)
+#   over the linked intent row's CURRENT ``field``/``value_text``/``status``,
+#   computed by the caller (``run_alignment_build``) from a fresh DB read --
+#   never computed in here, since this module has no DB access. This catches
+#   the case /correct does not: /confirm and /decline update status IN PLACE
+#   (same id, same value_text), so the id alone would not change.
+#
+# Callers that do not resolve a linked intent item pass ``None`` for both
+# (unchanged behavior, same as before this fields existed).
+
+
+def _read_lines(
+    repo_path: str, commit_sha: str, path: str, cache: Dict[str, Optional[List[str]]],
+) -> Optional[List[str]]:
+    """Read ``path`` at the pinned commit, split into lines. ``None`` on any
+    read failure (missing path, binary content) -- never partial/guessed."""
+    if path in cache:
+        return cache[path]
+    try:
+        raw = read_file_at_commit(repo_path, commit_sha, path)
+    except GitError:
+        cache[path] = None
+        return None
+    text = raw.decode("utf-8", errors="replace")
+    if "\x00" in text:
+        cache[path] = None
+        return None
+    lines = text.splitlines()
+    cache[path] = lines
+    return lines
+
+
+def _evidence_source_digest(
+    repo_path: str,
+    commit_sha: str,
+    path: object,
+    start_line: object,
+    end_line: object,
+    cache: Dict[str, Optional[List[str]]],
+) -> Optional[str]:
+    """sha256 of the exact ``start_line``..``end_line`` source text of ``path``
+    at the pinned commit, or ``None`` if it cannot be read/validated."""
+    if not isinstance(path, str) or not isinstance(start_line, int) or not isinstance(end_line, int):
+        return None
+    lines = _read_lines(repo_path, commit_sha, path, cache)
+    if lines is None:
+        return None
+    if start_line < 1 or end_line < start_line or end_line > len(lines):
+        return None
+    text = "\n".join(lines[start_line - 1:end_line])
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def compute_intent_item_digest(*, field: str, value_text: str, status: str) -> str:
+    """sha256 over a linked ``interview_intent_item`` row's current content.
+
+    Callers (``run_alignment_build``) compute this from a fresh DB read of
+    the linked intent row and pass the result into ``compute_content_hash``
+    as ``linked_intent_digest`` -- this function itself never touches the
+    database (Principle 6: a pure structural digest, not a decision).
+    """
+    payload = {"field": field, "value_text": value_text, "status": status}
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def compute_content_hash(
+    *,
+    current_claim: str,
+    current_evidence: List[Dict[str, object]],
+    alignment_state: str,
+    risk_flags: List[str],
+    confidence: str,
+    intent_field: Optional[str],
+    runtime_check: Optional[str],
+    repo_path: str,
+    commit_sha: str,
+    intent_summary: Optional[str] = None,
+    gap_summary: Optional[str] = None,
+    proposed_interpretation: Optional[str] = None,
+    intent_item_id: Optional[int] = None,
+    linked_intent_digest: Optional[str] = None,
+    source_digest_cache: Optional[Dict[str, Optional[List[str]]]] = None,
+) -> Optional[str]:
+    """Deterministic sha256 over one alignment item's identity-bearing fields.
+
+    Returns ``None`` (never a partial/best-effort hash) when any evidence
+    item's source text cannot be read/validated at ``(repo_path, commit_sha)``
+    -- see the module-level comment above for why that is the safe direction.
+
+    ``intent_item_id``/``linked_intent_digest`` (2nd review round, Finding 1)
+    make the hash sensitive to the linked Intent Brief entity's own identity
+    and current content, not just the field name it belongs to -- see the
+    module-level comment above.
+    """
+    cache: Dict[str, Optional[List[str]]] = (
+        source_digest_cache if source_digest_cache is not None else {}
+    )
+    normalized_evidence = []
+    for e in current_evidence:
+        path = e.get("path")
+        start_line = e.get("start_line")
+        end_line = e.get("end_line")
+        source_digest = _evidence_source_digest(repo_path, commit_sha, path, start_line, end_line, cache)
+        if source_digest is None:
+            return None
+        normalized_evidence.append({
+            "path": path,
+            "start_line": start_line,
+            "end_line": end_line,
+            "summary": e.get("summary", ""),
+            "source_digest": source_digest,
+        })
+    normalized_evidence.sort(
+        key=lambda e: (e["path"], e["start_line"], e["end_line"], e["summary"], e["source_digest"]),
+    )
+    payload = {
+        "current_claim": current_claim,
+        "current_evidence": normalized_evidence,
+        "alignment_state": alignment_state,
+        "risk_flags": sorted(risk_flags),
+        "confidence": confidence,
+        "intent_field": intent_field,
+        "runtime_check": runtime_check,
+        "intent_summary": intent_summary,
+        "gap_summary": gap_summary,
+        "proposed_interpretation": proposed_interpretation,
+        "intent_item_id": intent_item_id,
+        "linked_intent_digest": linked_intent_digest,
+    }
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 # --- Raw LLM response schema (what we require the model to return) ----------

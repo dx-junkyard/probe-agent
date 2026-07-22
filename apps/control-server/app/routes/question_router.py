@@ -34,6 +34,7 @@ from ..llm import LLMConfig, LLMError, MockLLMClient, create_llm_client, is_reas
 from ..models import (
     InterviewQaOut,
     InterviewQaRouteInvestigateBatchOut,
+    InterviewQaRouteInvestigateBatchRequest,
     InterviewQaRouteInvestigateCountsOut,
     InterviewQaRouteInvestigateItemOut,
 )
@@ -175,6 +176,7 @@ def _investigation_json(investigation) -> dict:
 )
 def route_and_investigate_qa(
     session_id: int,
+    payload: Optional[InterviewQaRouteInvestigateBatchRequest] = None,
     system_id: int = Depends(get_system_id),
 ) -> InterviewQaRouteInvestigateBatchOut:
     """Batch-route and investigate open questions in the NORMAL Q&A flow.
@@ -197,6 +199,17 @@ def route_and_investigate_qa(
     against the session's pinned snapshot (persisting an ``investigation``
     row + its evidence, exactly like the Inquiry flow's
     ``_generate_and_store_answer``).
+
+    Finding 4 fix: an optional ``{"qa_ids": [...]}`` body restricts the batch
+    to just those question ids (still subject to the same eligibility
+    filter as the unrestricted case) -- so a single Review Queue card's
+    「わからない」 action investigates only that one question instead of
+    always kicking off a whole-session batch. Omitting the body (or sending
+    ``qa_ids: null``) keeps the prior all-eligible-questions behavior
+    (backward compatible). A requested id that does not exist, or belongs to
+    a different session/system, is reported as a per-question error in
+    ``results`` -- it never fails or silently drops the rest of the request
+    (same fail-closed-per-question policy as the rest of this endpoint).
 
     Fail-closed per question, never per batch: a routing failure persists the
     failed audit row and leaves that question unrouted; an investigation
@@ -226,6 +239,7 @@ def route_and_investigate_qa(
       probe_value: Verify a batch call routes+investigates eligible questions, fails closed per question without aborting the batch, never writes answer_text/status, and 502s with zero row changes on a mock/non-reasoning configuration.
     """
     now = time.time()
+    requested_qa_ids = payload.qa_ids if payload is not None else None
     with get_conn() as conn:
         session = _get_session_or_404(conn, session_id, system_id)
         snapshot_id = session["snapshot_id"]
@@ -252,8 +266,48 @@ def route_and_investigate_qa(
         repo_path = snapshot_row["repo_path"] if snapshot_row else None
         commit_sha = snapshot_row["commit_sha"] if snapshot_row else None
 
+        # Finding 4: when qa_ids is given, restrict eligibility to that
+        # explicit id set (deduped, order preserved) on top of the same
+        # eligibility filter used for the unrestricted case -- never a
+        # looser or different rule for the scoped call. An id that does not
+        # resolve to a row in THIS session/system is reported as a
+        # per-question error below rather than silently ignored or allowed
+        # to fail the whole request.
+        missing_qa_id_errors: List[InterviewQaRouteInvestigateItemOut] = []
+        id_filter_sql = ""
+        id_filter_params: tuple = ()
+        if requested_qa_ids is not None:
+            seen_requested: set = set()
+            ordered_requested: List[int] = []
+            for qid in requested_qa_ids:
+                if qid not in seen_requested:
+                    seen_requested.add(qid)
+                    ordered_requested.append(qid)
+            found_rows = conn.execute(
+                f"""SELECT id FROM interview_qa
+                    WHERE system_id = ? AND session_id = ?
+                      AND id IN ({",".join("?" for _ in ordered_requested)})""",
+                (system_id, session_id, *ordered_requested),
+            ).fetchall() if ordered_requested else []
+            found_ids = {r["id"] for r in found_rows}
+            for qid in ordered_requested:
+                if qid not in found_ids:
+                    missing_qa_id_errors.append(InterviewQaRouteInvestigateItemOut(
+                        qa_id=qid, route_category=None, knowledge_area=None,
+                        investigation_status=None,
+                        error="Question not found in this session",
+                    ))
+            if found_ids:
+                id_filter_sql = f" AND id IN ({','.join('?' for _ in found_ids)})"
+                id_filter_params = tuple(found_ids)
+            else:
+                # Nothing to select at all (every requested id was missing);
+                # use an always-false clause so the query below returns [].
+                id_filter_sql = " AND 1 = 0"
+                id_filter_params = ()
+
         eligible = conn.execute(
-            """
+            f"""
             SELECT * FROM interview_qa
             WHERE session_id = ? AND system_id = ?
               AND superseded_by_id IS NULL AND status = 'open'
@@ -262,9 +316,10 @@ def route_and_investigate_qa(
                 OR (route_category IN ('system_researchable', 'hybrid')
                     AND investigation_run_id IS NULL)
               )
+              {id_filter_sql}
             ORDER BY id
             """,
-            (session_id, system_id),
+            (session_id, system_id, *id_filter_params),
         ).fetchall()
         selected = eligible[:MAX_BATCH_QUESTIONS]
         skipped_cap = max(0, len(eligible) - len(selected))
@@ -274,8 +329,10 @@ def route_and_investigate_qa(
         # questions and Inquiry answers never diverge on INTERVIEW_LANGUAGE.
         language = get_interview_language()
 
-        results: List[InterviewQaRouteInvestigateItemOut] = []
-        counts = InterviewQaRouteInvestigateCountsOut(skipped_cap=skipped_cap)
+        results: List[InterviewQaRouteInvestigateItemOut] = list(missing_qa_id_errors)
+        counts = InterviewQaRouteInvestigateCountsOut(
+            skipped_cap=skipped_cap, failed=len(missing_qa_id_errors),
+        )
 
         for qa in selected:
             qa_id = qa["id"]

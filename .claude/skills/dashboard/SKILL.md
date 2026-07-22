@@ -187,6 +187,50 @@ The dashboard should support:
   Zero-base questions are a fixed UI questionnaire (goal / affected area /
   desired change / constraints / success criteria); answers still flow
   through the reasoning-model dialogue turn — never heuristic inference.
+- Interview page layout (Issue #295): the main column is a two-tab area —
+  「Alignment Review」 and 「会話」. The default tab is derived
+  deterministically from existing client state (`uiState`,
+  `canConfirmStructuredUnderstanding`, `alignmentBuilt` from the
+  `/alignment` response item count) — no server flag either way. Alignment
+  Review is the default ONLY when alignment has been built AND the
+  conversation tab currently has no required action (i.e. `uiState ===
+  "proposal_review"` and `canConfirmStructuredUnderstanding` is false);
+  every other `uiState` (`preparing`/`needs_build`/`confirm_understanding`/
+  `fill_gaps`/`zero_base`/`ready_for_proposals`, including the
+  `proposalNarrowing` sub-case) means a required action still lives in the
+  conversation tab, so that tab stays the default even when alignment is
+  already built (PR #296 2nd-pass review fix, Finding 4 — a "build済みなら
+  Alignment Review" rule with no such check previously hid the required CTA
+  behind the other tab). The explicit tab picker (`manualMainTab`) always
+  wins once the user has switched tabs for that session. Because the
+  `NextActionBanner` sits above both tabs, whenever a required action lives
+  in the conversation tab and the currently-shown tab is not it, the banner
+  renders an explicit 会話タブへ移動 button (`next-action-go-to-conversation`)
+  rather than ever pointing at a control hidden in the other tab.
+  The Alignment Review tab composes an Intent/現状/gap summary
+  header (`AlignmentSummaryHeader`) on top of the unmodified
+  `ReviewQueuePanel`; the sidebar holds auxiliary panels only (Intent Brief
+  editing, understanding overview, Inquiry, handoff, Q&A list) and never
+  duplicates the Review Queue. The gap summary shows the top 1-2 outstanding
+  gaps' own text (must_review items, or any item with `alignment_state ===
+  'gap'`, excluding answered/corrected/superseded rows — same "outstanding"
+  definition as `outstanding_counts` below) plus a "ほか N件" count, not just
+  a bare count; it falls back to a "no gaps" message when there are none.
+  Actionable category counts (要確認/一括レビュー可, both in this header and
+  in `ReviewQueuePanel`'s own category summary) prefer the `/alignment`
+  response's `outstanding_counts` (未対応件数: `superseded=0` AND status not
+  in answered/corrected) over the total `counts`, so the displayed number
+  always matches the Review Queue's actual action-card count; an older
+  Control Server without `outstanding_counts` falls back to `counts`.
+  まとめて送信 (`answers-batch`) sends each staged item's `content_hash` (as
+  read from the last `/alignment` response); a per-item failure on an entry
+  that carried a `content_hash` is shown as "項目が更新されています" and the
+  item stays staged for retry, same as any other partial batch failure.
+  All 「わからない」/「AIに先に調査させる」 investigation calls go through
+  the single `useQaAutoInvestigate` controller (`api/hooks.ts`) — do not
+  add another route-and-investigate call site; per-question calls must
+  pass `qa_ids: [id]` so one user action never fans out to a multi-question
+  LLM investigation.
   Each dialogue turn sends `answered_qa_id` (the focused open question's
   `qa_id`, Issue #129) plus `answered_question` (exact text, kept for
   sessions predating the Q&A layer) so the server consumes the question
