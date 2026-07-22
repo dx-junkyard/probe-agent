@@ -481,8 +481,11 @@ def _investigation_result(status="completed", *, conclusion="結論", error=None
     )
 
 
-def _route_investigate(client, headers, session_id):
-    return client.post(f"/interview/sessions/{session_id}/qa/route-and-investigate", headers=headers)
+def _route_investigate(client, headers, session_id, qa_ids=None):
+    kwargs = {"headers": headers}
+    if qa_ids is not None:
+        kwargs["json"] = {"qa_ids": qa_ids}
+    return client.post(f"/interview/sessions/{session_id}/qa/route-and-investigate", **kwargs)
 
 
 def test_route_and_investigate_routes_unrouted_and_persists_knowledge_area(admin_client, monkeypatch):
@@ -781,3 +784,137 @@ def test_route_and_investigate_mock_config_returns_502_with_zero_row_changes(adm
             "SELECT * FROM intelligence_runs WHERE run_type IN ('question_route', 'investigation')"
         ).fetchone()
         assert run is None
+
+
+# --- qa_ids scoping (PR #296 review fix, Finding 4) --------------------------
+#
+# An optional {"qa_ids": [...]} body restricts the batch to just those
+# question ids, so a single Review Queue card's 「わからない」 action need
+# not trigger a whole-session batch of LLM investigations.
+
+
+def test_route_and_investigate_qa_ids_restricts_to_requested_questions(admin_client, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    qa1 = _create_qa(admin_client, headers, session_id, "この関数は何をしますか")
+    qa2 = _create_qa(admin_client, headers, session_id, "この機能の優先度はどれくらいですか")
+
+    _allow_reasoning_config(monkeypatch)
+    _stub_batch_route(
+        monkeypatch,
+        lambda client, config, **kwargs: _route_result("human_only", knowledge_area="implementation"),
+    )
+
+    r = _route_investigate(admin_client, headers, session_id, qa_ids=[qa1["id"]])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["results"]) == 1
+    assert body["results"][0]["qa_id"] == qa1["id"]
+    assert body["counts"]["routed"] == 1
+
+    listed = admin_client.get(f"/interview/sessions/{session_id}/qa", headers=headers).json()
+    qa1_row = next(i for i in listed["items"] if i["id"] == qa1["id"])
+    qa2_row = next(i for i in listed["items"] if i["id"] == qa2["id"])
+    assert qa1_row["route_category"] == "human_only"
+    # qa2 was never in qa_ids -- left completely untouched.
+    assert qa2_row["route_category"] is None
+
+
+def test_route_and_investigate_qa_ids_null_keeps_full_batch_backward_compatible(admin_client, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    qa1 = _create_qa(admin_client, headers, session_id, "質問1")
+    qa2 = _create_qa(admin_client, headers, session_id, "質問2")
+
+    _allow_reasoning_config(monkeypatch)
+    _stub_batch_route(
+        monkeypatch,
+        lambda client, config, **kwargs: _route_result("human_only", knowledge_area="implementation"),
+    )
+
+    # No body at all (existing clients) -- same as omitting qa_ids.
+    r = _route_investigate(admin_client, headers, session_id)
+    assert r.status_code == 200, r.text
+    assert {res["qa_id"] for res in r.json()["results"]} == {qa1["id"], qa2["id"]}
+
+
+def test_route_and_investigate_qa_ids_rejects_other_session_id(admin_client, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_a = _create_session(admin_client, headers, snapshot_id)
+    session_b = _create_session(admin_client, headers, snapshot_id)
+    qa_b = _create_qa(admin_client, headers, session_b, "セッションBの質問")
+
+    _allow_reasoning_config(monkeypatch)
+    _stub_batch_route(
+        monkeypatch,
+        lambda client, config, **kwargs: _route_result("human_only", knowledge_area="implementation"),
+    )
+
+    r = _route_investigate(admin_client, headers, session_a, qa_ids=[qa_b["id"]])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["counts"]["routed"] == 0
+    assert body["counts"]["failed"] == 1
+    assert len(body["results"]) == 1
+    assert body["results"][0]["qa_id"] == qa_b["id"]
+    assert body["results"][0]["route_category"] is None
+    assert body["results"][0]["error"]
+
+    # qa_b, belonging to session_b, was never touched by session_a's call.
+    listed_b = admin_client.get(f"/interview/sessions/{session_b}/qa", headers=headers).json()
+    qa_b_row = next(i for i in listed_b["items"] if i["id"] == qa_b["id"])
+    assert qa_b_row["route_category"] is None
+
+
+def test_route_and_investigate_qa_ids_rejects_nonexistent_id(admin_client, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    qa = _create_qa(admin_client, headers, session_id, "存在する質問")
+
+    _allow_reasoning_config(monkeypatch)
+    _stub_batch_route(
+        monkeypatch,
+        lambda client, config, **kwargs: _route_result("human_only", knowledge_area="implementation"),
+    )
+
+    r = _route_investigate(admin_client, headers, session_id, qa_ids=[qa["id"], 999_999])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    by_id = {res["qa_id"]: res for res in body["results"]}
+    assert by_id[qa["id"]]["route_category"] == "human_only"
+    assert by_id[999_999]["route_category"] is None
+    assert by_id[999_999]["error"]
+    assert body["counts"]["routed"] == 1
+    assert body["counts"]["failed"] == 1
+
+
+def test_route_and_investigate_qa_ids_still_respects_eligibility_filter(admin_client, monkeypatch):
+    """A requested id that is already routed+investigated (not eligible for
+    re-processing) is simply not re-processed -- same as the unrestricted
+    batch's existing behavior, not an error."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    qa = _create_qa(admin_client, headers, session_id, "質問")
+
+    _allow_reasoning_config(monkeypatch)
+    _stub_batch_route(
+        monkeypatch,
+        lambda client, config, **kwargs: _route_result("human_only", knowledge_area="implementation"),
+    )
+    first = _route_investigate(admin_client, headers, session_id, qa_ids=[qa["id"]])
+    assert first.status_code == 200, first.text
+    assert first.json()["counts"]["routed"] == 1
+
+    # Second call with the same qa_ids: already routed (human_only, never
+    # investigated) -- not eligible anymore, so it is simply excluded, not
+    # an error.
+    second = _route_investigate(admin_client, headers, session_id, qa_ids=[qa["id"]])
+    assert second.status_code == 200, second.text
+    assert second.json()["results"] == []
+    assert second.json()["counts"]["routed"] == 0
+    assert second.json()["counts"]["failed"] == 0

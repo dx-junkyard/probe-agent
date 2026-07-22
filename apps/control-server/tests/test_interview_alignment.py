@@ -167,9 +167,22 @@ def test_user_reason_templates_cover_every_reason_code():
 
 
 # --- Unit tests: compute_content_hash (Issue #295 unchanged carry-over) -----
+#
+# Review fix (PR #296, Finding 1): compute_content_hash now requires
+# repo_path/commit_sha (it reads each evidence citation's exact source text
+# from the pinned commit to compute a per-citation source_digest) and also
+# hashes intent_summary/gap_summary/proposed_interpretation. _hash_repo below
+# gives every test below a real two-file git fixture to read from.
 
 
-def _hash_kwargs(**overrides):
+def _hash_repo(tmp_path):
+    return _init_repo(tmp_path, {
+        "src/a.py": "\n".join(f"line{i}" for i in range(1, 11)) + "\n",
+        "src/b.py": "\n".join(f"line{i}" for i in range(1, 11)) + "\n",
+    })
+
+
+def _hash_kwargs(repo_path, commit_sha, **overrides):
     base = dict(
         current_claim="クレーム",
         current_evidence=[{"path": "src/a.py", "start_line": 1, "end_line": 3, "summary": "s"}],
@@ -178,27 +191,35 @@ def _hash_kwargs(**overrides):
         confidence="likely",
         intent_field="pain",
         runtime_check=None,
+        intent_summary="意図の要約",
+        gap_summary="ギャップの要約",
+        proposed_interpretation="提案された解釈",
+        repo_path=repo_path,
+        commit_sha=commit_sha,
     )
     base.update(overrides)
     return base
 
 
-def test_compute_content_hash_is_deterministic():
-    kwargs = _hash_kwargs()
+def test_compute_content_hash_is_deterministic(tmp_path):
+    repo, sha = _hash_repo(tmp_path)
+    kwargs = _hash_kwargs(repo, sha)
     assert compute_content_hash(**kwargs) == compute_content_hash(**kwargs)
 
 
-def test_compute_content_hash_ignores_evidence_order():
+def test_compute_content_hash_ignores_evidence_order(tmp_path):
+    repo, sha = _hash_repo(tmp_path)
     e1 = {"path": "src/a.py", "start_line": 1, "end_line": 3, "summary": "s"}
     e2 = {"path": "src/b.py", "start_line": 4, "end_line": 5, "summary": "t"}
-    h1 = compute_content_hash(**_hash_kwargs(current_evidence=[e1, e2]))
-    h2 = compute_content_hash(**_hash_kwargs(current_evidence=[e2, e1]))
+    h1 = compute_content_hash(**_hash_kwargs(repo, sha, current_evidence=[e1, e2]))
+    h2 = compute_content_hash(**_hash_kwargs(repo, sha, current_evidence=[e2, e1]))
     assert h1 == h2
 
 
-def test_compute_content_hash_ignores_risk_flag_order():
-    h1 = compute_content_hash(**_hash_kwargs(risk_flags=["security", "high_risk"]))
-    h2 = compute_content_hash(**_hash_kwargs(risk_flags=["high_risk", "security"]))
+def test_compute_content_hash_ignores_risk_flag_order(tmp_path):
+    repo, sha = _hash_repo(tmp_path)
+    h1 = compute_content_hash(**_hash_kwargs(repo, sha, risk_flags=["security", "high_risk"]))
+    h2 = compute_content_hash(**_hash_kwargs(repo, sha, risk_flags=["high_risk", "security"]))
     assert h1 == h2
 
 
@@ -209,21 +230,71 @@ def test_compute_content_hash_ignores_risk_flag_order():
     ("intent_field", "goal"),
     ("runtime_check", "mismatch"),
     ("risk_flags", ["high_risk"]),
+    ("intent_summary", "別の要約"),
+    ("gap_summary", "別のギャップ要約"),
+    ("proposed_interpretation", "別の提案解釈"),
 ])
-def test_compute_content_hash_changes_when_any_classification_input_changes(field, value):
-    """Every field that feeds classify_alignment_item's rule table, plus the
-    claim text itself, must be part of the hash -- a change in any of them
-    must never be silently masked as 'unchanged' (Issue #295 brief)."""
-    base = compute_content_hash(**_hash_kwargs())
-    changed = compute_content_hash(**_hash_kwargs(**{field: value}))
+def test_compute_content_hash_changes_when_any_classification_input_changes(tmp_path, field, value):
+    """Every field that feeds classify_alignment_item's rule table, the claim
+    text itself, and (review fix, Finding 1) every meaning-bearing summary
+    field must be part of the hash -- a change in any of them must never be
+    silently masked as 'unchanged' (Issue #295 brief)."""
+    repo, sha = _hash_repo(tmp_path)
+    base = compute_content_hash(**_hash_kwargs(repo, sha))
+    changed = compute_content_hash(**_hash_kwargs(repo, sha, **{field: value}))
     assert base != changed
 
 
-def test_compute_content_hash_changes_on_evidence_diff():
-    base = compute_content_hash(**_hash_kwargs())
+def test_compute_content_hash_changes_on_evidence_diff(tmp_path):
+    repo, sha = _hash_repo(tmp_path)
+    base = compute_content_hash(**_hash_kwargs(repo, sha))
     changed_evidence = [{"path": "src/a.py", "start_line": 1, "end_line": 4, "summary": "s"}]
-    changed = compute_content_hash(**_hash_kwargs(current_evidence=changed_evidence))
+    changed = compute_content_hash(**_hash_kwargs(repo, sha, current_evidence=changed_evidence))
     assert base != changed
+
+
+def test_compute_content_hash_changes_when_source_text_changes_at_same_citation(tmp_path):
+    """Review fix (PR #296, Finding 1): the same claim, the same evidence
+    citation (identical path/start_line/end_line/summary), but the actual
+    source text at that pinned commit differs between two builds -- the
+    source_digest must catch this even though every other hashed field is
+    byte-identical, closing the pre-fix gap where a reference-only evidence
+    hash could not detect an edited source line."""
+    repo1, sha1 = _init_repo(
+        tmp_path / "r1", {"src/a.py": "\n".join(f"line{i}" for i in range(1, 11)) + "\n"},
+    )
+    repo2, sha2 = _init_repo(
+        tmp_path / "r2", {"src/a.py": "\n".join(f"CHANGED{i}" for i in range(1, 11)) + "\n"},
+    )
+    evidence = [{"path": "src/a.py", "start_line": 1, "end_line": 3, "summary": "s"}]
+    h1 = compute_content_hash(**_hash_kwargs(repo1, sha1, current_evidence=evidence))
+    h2 = compute_content_hash(**_hash_kwargs(repo2, sha2, current_evidence=evidence))
+    assert h1 is not None
+    assert h2 is not None
+    assert h1 != h2
+
+
+def test_compute_content_hash_returns_none_when_evidence_source_unreadable(tmp_path):
+    """Fail-closed (PR #296 review fix, Finding 1): when an evidence
+    citation's source text cannot be read/validated at the pinned commit,
+    the WHOLE hash is None so the item can never be treated as an
+    unchanged-carry-over candidate now, nor become a valid future carry
+    candidate (callers filter on content_hash IS NOT NULL)."""
+    repo, sha = _hash_repo(tmp_path)
+    bad_evidence = [{"path": "src/does_not_exist.py", "start_line": 1, "end_line": 1, "summary": "s"}]
+    result = compute_content_hash(**_hash_kwargs(repo, sha, current_evidence=bad_evidence))
+    assert result is None
+
+
+def test_compute_content_hash_source_digest_cache_is_reused(tmp_path):
+    repo, sha = _hash_repo(tmp_path)
+    cache: Dict[str, Optional[List[str]]] = {}
+    first = compute_content_hash(**_hash_kwargs(repo, sha, source_digest_cache=cache))
+    assert first is not None
+    assert "src/a.py" in cache
+    # Second call reuses the cache for the same path; still resolves fine.
+    second = compute_content_hash(**_hash_kwargs(repo, sha, source_digest_cache=cache))
+    assert second == first
 
 
 # --- Unit tests: review_sort_key (fixed fixture ordering contract) ----------
@@ -1599,6 +1670,57 @@ def test_goal_unchanged_since_last_build_still_allows_carryover(admin_client, tm
     assert fresh["carried_over_from"] == item_id
 
 
+def test_unchanged_carryover_survives_three_consecutive_builds(admin_client, tmp_path, monkeypatch):
+    """Review fix (PR #296, Finding 2): before the fix, a prior build's
+    'unchanged' row (status='open') was NOT itself an eligible carry
+    candidate -- only 'answered'/'corrected' rows were -- so a THIRD build
+    of byte-identical content lost the carry-over chain and fell back to
+    fresh (re-)classification. This must not happen: the 3rd build's fresh
+    row must still be 'unchanged' and its carried_over_from must still point
+    at the ORIGINAL answered row (never the 2nd build's now-superseded
+    'unchanged' row), so the audit trail always terminates at the real human
+    decision."""
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _stub_build(monkeypatch, items=[_proposal_item(current_claim="不変の項目", risk_flags=["security"])])
+    first = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+    original_id = first["items"][0]["id"]
+    admin_client.post(
+        f"/interview/alignment/{original_id}/answer", json={"decision": "accept_current"}, headers=headers,
+    )
+
+    # 2nd build: byte-identical content -> carried over from the original
+    # answered row.
+    _stub_build(monkeypatch, items=[_proposal_item(current_claim="不変の項目", risk_flags=["security"])])
+    second = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+    second_unchanged = next(it for it in second["items"] if it["id"] != original_id)
+    assert second_unchanged["review_category"] == "unchanged"
+    assert second_unchanged["carried_over_from"] == original_id
+
+    # 3rd build: still byte-identical content -> must STILL carry over, and
+    # must still point at the original answered row, not the 2nd build's
+    # (now superseded-on-delete) unchanged row.
+    _stub_build(monkeypatch, items=[_proposal_item(current_claim="不変の項目", risk_flags=["security"])])
+    third = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+    third_unchanged = next(
+        it for it in third["items"] if it["id"] not in (original_id, second_unchanged["id"])
+    )
+    assert third_unchanged["review_category"] == "unchanged"
+    assert third_unchanged["carried_over_from"] == original_id
+    assert third_unchanged["reason_code"] == "unchanged_since_confirmation"
+
+    # The original answered row is still present (superseded=1 history) --
+    # the FK it is referenced by was never NULLed out by an ON DELETE SET
+    # NULL cascade, because the DELETE only ever removes status='open' rows
+    # and the original row's status is 'answered'.
+    listing = admin_client.get(f"/interview/sessions/{session_id}/alignment", headers=headers).json()
+    original_in_history = next(it for it in listing["superseded_items"] if it["id"] == original_id)
+    assert original_in_history["status"] == "answered"
+
+
 def test_content_hash_columns_migration_backfills_existing_rows_to_null(tmp_path, monkeypatch):
     """A pre-Issue-#295 database (no content_hash/carried_over_from columns)
     gains them via ALTER TABLE and existing rows backfill to NULL -- same
@@ -1697,11 +1819,18 @@ def test_system_isolation_for_superseded_column(admin_client, tmp_path, monkeypa
     _stub_build(monkeypatch, items=[_proposal_item(current_claim="新しいクレームA", risk_flags=["security"])])
     admin_client.post(f"/interview/sessions/{session_a}/alignment/build", headers=headers_a)
 
+    # Review fix (PR #296, Finding 3): a superseded row is history, not a
+    # current row -- it now surfaces only via the additive
+    # superseded_items field, never items_by_category/counts.
     listing_a = admin_client.get(f"/interview/sessions/{session_a}/alignment", headers=headers_a).json()
-    a_item = next(it for cat in listing_a["items_by_category"].values() for it in cat if it["id"] == a_item_id)
+    assert not any(
+        it["id"] == a_item_id for cat in listing_a["items_by_category"].values() for it in cat
+    )
+    a_item = next(it for it in listing_a["superseded_items"] if it["id"] == a_item_id)
     assert a_item["superseded"] is True
 
     listing_b = admin_client.get(f"/interview/sessions/{session_b}/alignment", headers=headers_b).json()
+    assert listing_b["superseded_items"] == []
     b_item = next(it for cat in listing_b["items_by_category"].values() for it in cat if it["id"] == b_item_id)
     assert b_item["status"] == "open"
     assert b_item["superseded"] is False
@@ -1768,3 +1897,243 @@ def test_superseded_column_migration_backfills_existing_rows_to_zero(tmp_path, m
         row = check.execute("SELECT * FROM alignment_item WHERE id = 1").fetchone()
         assert row["superseded"] == 0
         check.close()
+
+
+# --- Batch answer endpoint (PR #296 review fix, Finding 5) -------------------
+#
+# POST /interview/sessions/{session_id}/alignment/answers-batch: answers
+# several alignment_item rows in one call and triggers Issue #288's
+# request_refresh exactly once (not once per item), with per-item fail-closed
+# error reporting on partial failure.
+
+
+def _spy_request_refresh(monkeypatch):
+    """Replace app.interview_refresh.request_refresh with a call-recording
+    stub. The batch/single endpoints do `from ..interview_refresh import
+    request_refresh` INSIDE the function body, so patching the attribute on
+    the home module (not the routes module) is picked up correctly -- the
+    import statement re-resolves the name from the module namespace on every
+    call, it is not cached at route-module import time."""
+    import app.interview_refresh as refresh_module
+
+    calls = []
+
+    def fake_request_refresh(session_id, system_id, trigger_kind):
+        calls.append((session_id, system_id, trigger_kind))
+        return None
+
+    monkeypatch.setattr(refresh_module, "request_refresh", fake_request_refresh)
+    return calls
+
+
+def _batch_answer(client, headers, session_id, answers):
+    return client.post(
+        f"/interview/sessions/{session_id}/alignment/answers-batch",
+        json={"answers": answers},
+        headers=headers,
+    )
+
+
+def test_answers_batch_all_success_saves_every_item_and_refreshes_once(admin_client, tmp_path, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _stub_build(monkeypatch, items=[
+        _proposal_item(current_claim="A"), _proposal_item(current_claim="B"), _proposal_item(current_claim="C"),
+    ])
+    built = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+    a_id, b_id, c_id = (it["id"] for it in built["items"])
+
+    refresh_calls = _spy_request_refresh(monkeypatch)
+
+    r = _batch_answer(admin_client, headers, session_id, [
+        {"item_id": a_id, "decision": "accept_current", "note": "確認済み"},
+        {"item_id": b_id, "decision": "needs_change"},
+        {"item_id": c_id, "decision": "reject_interpretation"},
+    ])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["session_id"] == session_id
+    assert body["system_id"] == system_id
+    assert body["refreshed"] is True
+    assert len(body["results"]) == 3
+    by_id = {res["item_id"]: res for res in body["results"]}
+    assert by_id[a_id]["success"] is True
+    assert by_id[a_id]["item"]["status"] == "answered"
+    assert by_id[a_id]["item"]["user_decision"]["action"] == "accept_current"
+    assert by_id[a_id]["item"]["user_decision"]["note"] == "確認済み"
+    assert by_id[b_id]["success"] is True
+    assert by_id[b_id]["item"]["user_decision"]["action"] == "needs_change"
+    assert by_id[c_id]["success"] is True
+    assert by_id[c_id]["item"]["user_decision"]["action"] == "reject_interpretation"
+
+    # Exactly one refresh for the whole batch, not one per item.
+    assert len(refresh_calls) == 1
+    assert refresh_calls[0] == (session_id, system_id, "alignment_answer")
+
+    listing = admin_client.get(f"/interview/sessions/{session_id}/alignment", headers=headers).json()
+    all_items = [it for cat in listing["items_by_category"].values() for it in cat]
+    for item_id in (a_id, b_id, c_id):
+        item = next(it for it in all_items if it["id"] == item_id)
+        assert item["status"] == "answered"
+
+
+def test_answers_batch_partial_failure_saves_valid_items_and_reports_errors(admin_client, tmp_path, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _stub_build(monkeypatch, items=[_proposal_item(current_claim="A")])
+    built = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+    a_id = built["items"][0]["id"]
+    missing_id = a_id + 999_999
+
+    refresh_calls = _spy_request_refresh(monkeypatch)
+
+    r = _batch_answer(admin_client, headers, session_id, [
+        {"item_id": a_id, "decision": "accept_current"},
+        {"item_id": missing_id, "decision": "accept_current"},
+    ])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["refreshed"] is True
+    by_id = {res["item_id"]: res for res in body["results"]}
+    assert by_id[a_id]["success"] is True
+    assert by_id[missing_id]["success"] is False
+    assert by_id[missing_id]["error"]
+    assert by_id[missing_id]["item"] is None
+
+    # A single valid item still triggers exactly one refresh.
+    assert len(refresh_calls) == 1
+
+    listing = admin_client.get(f"/interview/sessions/{session_id}/alignment", headers=headers).json()
+    all_items = [it for cat in listing["items_by_category"].values() for it in cat]
+    assert next(it for it in all_items if it["id"] == a_id)["status"] == "answered"
+
+
+def test_answers_batch_all_failure_never_refreshes(admin_client, tmp_path, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    refresh_calls = _spy_request_refresh(monkeypatch)
+
+    r = _batch_answer(admin_client, headers, session_id, [
+        {"item_id": 999_999, "decision": "accept_current"},
+        {"item_id": 999_998, "decision": "accept_current"},
+    ])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["refreshed"] is False
+    assert all(res["success"] is False for res in body["results"])
+    assert refresh_calls == []
+
+
+def test_answers_batch_rejects_duplicate_item_id_within_batch(admin_client, tmp_path, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _stub_build(monkeypatch, items=[_proposal_item(current_claim="A")])
+    built = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+    a_id = built["items"][0]["id"]
+
+    _spy_request_refresh(monkeypatch)
+    r = _batch_answer(admin_client, headers, session_id, [
+        {"item_id": a_id, "decision": "accept_current"},
+        {"item_id": a_id, "decision": "needs_change"},
+    ])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["results"][0]["success"] is True
+    assert body["results"][1]["success"] is False
+    assert "duplicate" in body["results"][1]["error"].lower()
+
+
+def test_answers_batch_item_from_another_session_is_a_per_item_error(admin_client, tmp_path, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_1 = _create_session(admin_client, headers, snapshot_id)
+    session_2 = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_1, system_id, snapshot_id, current_understanding={})
+
+    _stub_build(monkeypatch, items=[_proposal_item(current_claim="A")])
+    built = admin_client.post(f"/interview/sessions/{session_1}/alignment/build", headers=headers).json()
+    item_id = built["items"][0]["id"]
+
+    refresh_calls = _spy_request_refresh(monkeypatch)
+    r = _batch_answer(admin_client, headers, session_2, [
+        {"item_id": item_id, "decision": "accept_current"},
+    ])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["results"][0]["success"] is False
+    assert body["refreshed"] is False
+    assert refresh_calls == []
+
+
+def test_answers_batch_inquiry_locked_item_is_a_per_item_error(admin_client, tmp_path, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _stub_build(monkeypatch, items=[
+        _proposal_item(current_claim="A: 疑問あり"), _proposal_item(current_claim="B: 通常"),
+    ])
+    built = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+    inquiry_id = next(it["id"] for it in built["items"] if it["current_claim"] == "A: 疑問あり")
+    normal_id = next(it["id"] for it in built["items"] if it["current_claim"] == "B: 通常")
+
+    _open_review_item_inquiry(admin_client, monkeypatch, session_id, inquiry_id, headers)
+
+    refresh_calls = _spy_request_refresh(monkeypatch)
+    r = _batch_answer(admin_client, headers, session_id, [
+        {"item_id": inquiry_id, "decision": "accept_current"},
+        {"item_id": normal_id, "decision": "accept_current"},
+    ])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    by_id = {res["item_id"]: res for res in body["results"]}
+    assert by_id[inquiry_id]["success"] is False
+    assert by_id[normal_id]["success"] is True
+    assert body["refreshed"] is True
+    assert len(refresh_calls) == 1
+
+
+def test_answers_batch_system_isolation(admin_client, tmp_path, monkeypatch):
+    token_a, system_a, snapshot_a = _setup(admin_client, tmp_path, name="System Batch A")
+    headers_a = _headers(token_a, system_a)
+    session_a = _create_session(admin_client, headers_a, snapshot_a)
+    _insert_revision(session_a, system_a, snapshot_a, current_understanding={})
+
+    _stub_build(monkeypatch, items=[_proposal_item(current_claim="System Aの項目")])
+    built_a = admin_client.post(f"/interview/sessions/{session_a}/alignment/build", headers=headers_a).json()
+    a_item_id = built_a["items"][0]["id"]
+
+    system_b = _create_system(admin_client, token_a, "System Batch B")
+    headers_b = _headers(token_a, system_b["id"])
+
+    _spy_request_refresh(monkeypatch)
+    r = _batch_answer(admin_client, headers_b, session_a, [
+        {"item_id": a_item_id, "decision": "accept_current"},
+    ])
+    assert r.status_code == 404, r.text
+
+
+def test_answers_batch_rejects_unknown_fields(admin_client, tmp_path, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+
+    r = admin_client.post(
+        f"/interview/sessions/{session_id}/alignment/answers-batch",
+        json={"answers": [{"item_id": 1, "decision": "accept_current", "unexpected": "x"}]},
+        headers=headers,
+    )
+    assert r.status_code == 422, r.text

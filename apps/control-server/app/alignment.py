@@ -204,6 +204,79 @@ def review_sort_key(*, review_category: str, reason_code: str, item_id: int) -> 
 # confidence / intent_field / runtime_check), so a change in
 # classification-relevant state can never be masked as "unchanged" even when
 # the claim text itself happens to repeat verbatim.
+#
+# Review fix (PR #296, Finding 1): the hash previously missed three
+# meaning-bearing text fields (intent_summary / gap_summary /
+# proposed_interpretation -- an LLM-authored interpretation can change while
+# every other field stays byte-identical) and never checked whether the
+# evidence *citations themselves* still point at the same source text -- a
+# reference-only hash ("path"/"start_line"/"end_line"/"summary") would
+# silently call a build "unchanged" even if the underlying lines had since
+# been edited. Both gaps are closed here:
+#
+# - intent_summary/gap_summary/proposed_interpretation are now hashed inputs.
+# - each evidence item's normalized dict now carries a ``source_digest``: the
+#   sha256 of the EXACT lines ``start_line``..``end_line`` of ``path`` read
+#   from the pinned snapshot commit (Principle 5 -- never the working tree).
+#   Reading reuses the same deterministic, pinned-commit read path this
+#   module already uses for evidence validation (``git_ops.read_file_at_commit``,
+#   mirrored by the ``_read_lines`` helper below -- see
+#   ``validate_evidence_against_snapshot``/``_line_count`` just above for the
+#   sibling read used for line-count validation).
+#
+# Both changes are intentionally NOT migrated: existing content_hash values
+# stop matching the new formula, which only ever causes an item to fall back
+# to normal (re-)classification instead of carrying over -- the safe
+# direction (Issue #295 brief). ``repo_path``/``commit_sha`` are required
+# (not optional) so every call site is forced to compute a real
+# source_digest; when any evidence item's source text cannot be read from
+# the pinned commit, the WHOLE hash is ``None`` so the item can never be
+# treated as a carry-over candidate now, nor match a future rebuild's
+# candidate lookup (the caller's ``content_hash IS NOT NULL`` filter already
+# excludes it) -- it is simply reclassified fresh through the normal rule
+# table instead.
+
+
+def _read_lines(
+    repo_path: str, commit_sha: str, path: str, cache: Dict[str, Optional[List[str]]],
+) -> Optional[List[str]]:
+    """Read ``path`` at the pinned commit, split into lines. ``None`` on any
+    read failure (missing path, binary content) -- never partial/guessed."""
+    if path in cache:
+        return cache[path]
+    try:
+        raw = read_file_at_commit(repo_path, commit_sha, path)
+    except GitError:
+        cache[path] = None
+        return None
+    text = raw.decode("utf-8", errors="replace")
+    if "\x00" in text:
+        cache[path] = None
+        return None
+    lines = text.splitlines()
+    cache[path] = lines
+    return lines
+
+
+def _evidence_source_digest(
+    repo_path: str,
+    commit_sha: str,
+    path: object,
+    start_line: object,
+    end_line: object,
+    cache: Dict[str, Optional[List[str]]],
+) -> Optional[str]:
+    """sha256 of the exact ``start_line``..``end_line`` source text of ``path``
+    at the pinned commit, or ``None`` if it cannot be read/validated."""
+    if not isinstance(path, str) or not isinstance(start_line, int) or not isinstance(end_line, int):
+        return None
+    lines = _read_lines(repo_path, commit_sha, path, cache)
+    if lines is None:
+        return None
+    if start_line < 1 or end_line < start_line or end_line > len(lines):
+        return None
+    text = "\n".join(lines[start_line - 1:end_line])
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def compute_content_hash(
@@ -215,19 +288,39 @@ def compute_content_hash(
     confidence: str,
     intent_field: Optional[str],
     runtime_check: Optional[str],
-) -> str:
-    """Deterministic sha256 over one alignment item's identity-bearing fields."""
-    normalized_evidence = sorted(
-        (
-            {
-                "path": e.get("path"),
-                "start_line": e.get("start_line"),
-                "end_line": e.get("end_line"),
-                "summary": e.get("summary", ""),
-            }
-            for e in current_evidence
-        ),
-        key=lambda e: (e["path"], e["start_line"], e["end_line"], e["summary"]),
+    repo_path: str,
+    commit_sha: str,
+    intent_summary: Optional[str] = None,
+    gap_summary: Optional[str] = None,
+    proposed_interpretation: Optional[str] = None,
+    source_digest_cache: Optional[Dict[str, Optional[List[str]]]] = None,
+) -> Optional[str]:
+    """Deterministic sha256 over one alignment item's identity-bearing fields.
+
+    Returns ``None`` (never a partial/best-effort hash) when any evidence
+    item's source text cannot be read/validated at ``(repo_path, commit_sha)``
+    -- see the module-level comment above for why that is the safe direction.
+    """
+    cache: Dict[str, Optional[List[str]]] = (
+        source_digest_cache if source_digest_cache is not None else {}
+    )
+    normalized_evidence = []
+    for e in current_evidence:
+        path = e.get("path")
+        start_line = e.get("start_line")
+        end_line = e.get("end_line")
+        source_digest = _evidence_source_digest(repo_path, commit_sha, path, start_line, end_line, cache)
+        if source_digest is None:
+            return None
+        normalized_evidence.append({
+            "path": path,
+            "start_line": start_line,
+            "end_line": end_line,
+            "summary": e.get("summary", ""),
+            "source_digest": source_digest,
+        })
+    normalized_evidence.sort(
+        key=lambda e: (e["path"], e["start_line"], e["end_line"], e["summary"], e["source_digest"]),
     )
     payload = {
         "current_claim": current_claim,
@@ -237,6 +330,9 @@ def compute_content_hash(
         "confidence": confidence,
         "intent_field": intent_field,
         "runtime_check": runtime_check,
+        "intent_summary": intent_summary,
+        "gap_summary": gap_summary,
+        "proposed_interpretation": proposed_interpretation,
     }
     canonical = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

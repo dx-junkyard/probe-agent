@@ -69,6 +69,9 @@ from ..interview_language import get_interview_language
 from ..llm import LLMConfig, LLMError, create_llm_client
 from ..models import (
     AlignmentAnswerRequest,
+    AlignmentBatchAnswerItemResult,
+    AlignmentBatchAnswerOut,
+    AlignmentBatchAnswerRequest,
     AlignmentBuildOut,
     AlignmentCorrectRequest,
     AlignmentEvidenceOut,
@@ -434,22 +437,50 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
             _run_runtime_match_judge(conn, system_id, revision["snapshot_id"], config, client, final_items)
 
             # Issue #295: unchanged-item carry-over. carry_candidates maps a
-            # terminal (answered/corrected, non-superseded) row's
-            # content_hash from the immediately preceding build to that
-            # row's id -- the only rows a fresh item may ever carry over
-            # from. Read before this build's own DELETE/UPDATE/INSERT touch
-            # the table (the write transaction is still below).
+            # content_hash from the immediately preceding build to the id of
+            # the ORIGINAL human-decided (answered/corrected) row for that
+            # contrast point -- the only kind of row a fresh item's audit
+            # trail may ever point back to.
+            #
+            # Review fix (PR #296, Finding 2): a prior build's 'unchanged'
+            # row (status='open', since it was never itself answered) is now
+            # ALSO an eligible candidate, not just terminal answered/
+            # corrected rows -- otherwise a 3rd build's carry-over candidate
+            # set loses the 2nd build's unchanged row (an 'open' row this
+            # rebuild's DELETE ... WHERE status='open' AND user_decision IS
+            # NULL is about to remove) and the item incorrectly falls back
+            # to fresh reclassification. When the candidate is itself an
+            # 'unchanged' row, its OWN carried_over_from (never its own id)
+            # is propagated as the origin -- so the audit trail always
+            # terminates at the real human decision, no matter how many
+            # unchanged generations sit in between. This is exactly why the
+            # DELETE above is safe against `carried_over_from ... ON DELETE
+            # SET NULL`: the referenced origin id is always an
+            # answered/corrected row, which the DELETE's WHERE clause never
+            # touches (it only ever deletes status='open' rows), so the FK
+            # target never disappears out from under a surviving reference.
+            #
+            # Read before this build's own DELETE/UPDATE/INSERT touch the
+            # table (the write transaction is still below).
             carry_rows = conn.execute(
-                """SELECT id, content_hash FROM alignment_item
+                """SELECT id, content_hash, carried_over_from, review_category
+                   FROM alignment_item
                    WHERE session_id = ? AND system_id = ?
-                     AND status IN ('answered', 'corrected') AND superseded = 0
+                     AND superseded = 0
                      AND content_hash IS NOT NULL
+                     AND (
+                       status IN ('answered', 'corrected')
+                       OR (review_category = 'unchanged' AND carried_over_from IS NOT NULL)
+                     )
                    ORDER BY id""",
                 (session_id, system_id),
             ).fetchall()
             carry_candidates: Dict[str, int] = {}
             for r in carry_rows:
-                carry_candidates.setdefault(r["content_hash"], r["id"])
+                origin_id = (
+                    r["carried_over_from"] if r["review_category"] == "unchanged" else r["id"]
+                )
+                carry_candidates.setdefault(r["content_hash"], origin_id)
 
             # A rebuild triggered by a batch that confirmed/corrected/
             # declined the 'goal' Intent Brief field never carries anything
@@ -485,6 +516,11 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
                 and goal_row["updated_at"] > previous_build_at
             )
 
+            # Review fix (PR #296, Finding 1): source_digest_cache amortizes
+            # the per-evidence-item pinned-commit reads compute_content_hash
+            # now performs (one full-file read per distinct path across every
+            # item in this build, not per evidence citation).
+            source_digest_cache: Dict[str, Optional[List[str]]] = {}
             for it in final_items:
                 it["content_hash"] = compute_content_hash(
                     current_claim=it["current_claim"],
@@ -494,6 +530,12 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
                     confidence=it["confidence"],
                     intent_field=it["intent_field"],
                     runtime_check=it["runtime_check"],
+                    intent_summary=it["intent_summary"],
+                    gap_summary=it["gap_summary"],
+                    proposed_interpretation=it["proposed_interpretation"],
+                    repo_path=snapshot_row["repo_path"],
+                    commit_sha=snapshot_row["commit_sha"],
+                    source_digest_cache=source_digest_cache,
                 )
                 carried_from = (
                     None if goal_changed_since_last_build
@@ -628,13 +670,28 @@ def list_alignment_items(
     session_id: int,
     system_id: int = Depends(get_system_id),
 ) -> AlignmentListOut:
+    """Full listing, split into current rows (``items_by_category``/``counts``)
+    and history (``superseded_items``).
+
+    Review fix (PR #296, Finding 3): a ``superseded=1`` row is audit history,
+    not a live Review Queue signal -- before this fix it was folded into
+    ``items_by_category``/``counts`` alongside current rows, so e.g. an
+    already-answered-then-superseded ``must_review`` item could inflate
+    "要確認 N件" even though the Review Queue itself (which already filters
+    ``superseded = 0``, see ``get_review_queue`` above) was empty. History
+    stays fully visible via the new additive ``superseded_items`` field --
+    nothing is dropped from the response, just moved out of the counts that
+    drive the "do I need to act" signal.
+    """
     with get_conn() as conn:
         _get_session_or_404(conn, session_id, system_id)
         rows = conn.execute(
             "SELECT * FROM alignment_item WHERE session_id = ? AND system_id = ?",
             (session_id, system_id),
         ).fetchall()
-        items = _sorted_items(rows)
+        current_rows = [r for r in rows if not (("superseded" in r.keys()) and r["superseded"])]
+        superseded_rows = [r for r in rows if ("superseded" in r.keys()) and r["superseded"]]
+        items = _sorted_items(current_rows)
         items_by_category: Dict[str, List[AlignmentItemOut]] = {c: [] for c in (
             "must_review", "batch_reviewable", "no_review_required", "unchanged", "informational",
         )}
@@ -645,6 +702,7 @@ def list_alignment_items(
         return AlignmentListOut(
             session_id=session_id, system_id=system_id,
             items_by_category=items_by_category, counts=counts,
+            superseded_items=_sorted_items(superseded_rows),
         )
 
 
@@ -695,6 +753,31 @@ def _reject_if_inquiry_locked(item) -> None:
         )
 
 
+def _write_answer_decision(
+    conn, item_id: int, *, decision: str, note: Optional[str], now: float,
+) -> AlignmentItemOut:
+    """Shared write path for a single alignment_item 'answer' decision.
+
+    Used by both the single-item endpoint below and the batch endpoint
+    (PR #296 review fix, Finding 5) so the two never drift -- validation
+    (item exists / session ownership / not Inquiry-locked) is the caller's
+    job, since the single endpoint fails the whole request on a bad item
+    (404/409) while the batch endpoint must record a per-item error and
+    keep going instead.
+    """
+    decision_payload = {
+        "action": decision, "note": note, "decided_at": now, "decided_by": None,
+    }
+    conn.execute(
+        """UPDATE alignment_item
+           SET status = 'answered', user_decision = ?, updated_at = ?
+           WHERE id = ?""",
+        (json.dumps(decision_payload, ensure_ascii=False), now, item_id),
+    )
+    row = conn.execute("SELECT * FROM alignment_item WHERE id = ?", (item_id,)).fetchone()
+    return _item_out(row)
+
+
 @router.post(
     "/interview/alignment/{item_id}/answer",
     response_model=AlignmentItemOut,
@@ -707,24 +790,16 @@ def answer_alignment_item(
     """Manual decision on an alignment item (Principle 2 -- never automatic).
 
     Server never auto-sets ``user_decision`` -- this endpoint (plus
-    ``/correct`` and ``/hold`` below) is the only write path for it.
+    ``/correct`` and ``/hold`` below, and the batch endpoint further down)
+    is the only write path for it.
     """
     now = time.time()
     with get_conn() as conn:
         item = _get_item_or_404(conn, item_id, system_id)
         _reject_if_inquiry_locked(item)
-        decision = {
-            "action": payload.decision, "note": payload.note,
-            "decided_at": now, "decided_by": None,
-        }
-        conn.execute(
-            """UPDATE alignment_item
-               SET status = 'answered', user_decision = ?, updated_at = ?
-               WHERE id = ?""",
-            (json.dumps(decision, ensure_ascii=False), now, item_id),
+        result = _write_answer_decision(
+            conn, item_id, decision=payload.decision, note=payload.note, now=now,
         )
-        row = conn.execute("SELECT * FROM alignment_item WHERE id = ?", (item_id,)).fetchone()
-        result = _item_out(row)
 
     # Issue #288: refresh Understanding/Alignment/Review Queue now that the
     # decision is durably committed (see interview.answer_interview_qa's
@@ -797,3 +872,94 @@ def hold_alignment_item(
         )
         row = conn.execute("SELECT * FROM alignment_item WHERE id = ?", (item_id,)).fetchone()
         return _item_out(row)
+
+
+# --- Batch answer (PR #296 review fix, Finding 5) ----------------------------
+
+
+def _validate_answer_target_for_batch(conn, item_id: int, session_id: int, system_id: int):
+    """Non-raising equivalent of ``_get_item_or_404`` + ``_reject_if_inquiry_locked``
+    for the batch endpoint: a bad item must produce a per-item error, never
+    abort the whole batch. Returns ``(row, error)`` -- exactly one is ``None``.
+    """
+    row = conn.execute(
+        "SELECT * FROM alignment_item WHERE id = ? AND system_id = ?",
+        (item_id, system_id),
+    ).fetchone()
+    if row is None:
+        return None, "Alignment item not found"
+    if row["session_id"] != session_id:
+        return None, "Alignment item does not belong to this session"
+    if row["status"] == "inquiry":
+        return None, "This item has an open Inquiry; resolve it before answering."
+    return row, None
+
+
+@router.post(
+    "/interview/sessions/{session_id}/alignment/answers-batch",
+    response_model=AlignmentBatchAnswerOut,
+)
+def answer_alignment_items_batch(
+    session_id: int,
+    payload: AlignmentBatchAnswerRequest,
+    system_id: int = Depends(get_system_id),
+) -> AlignmentBatchAnswerOut:
+    """Answer several alignment_item rows in one call, one refresh total.
+
+    Fixes Finding 5: the developer clearing N Review Queue cards at once
+    previously triggered up to N (or, with de-duplication, up to 2) separate
+    Issue #288 ``request_refresh`` calls -- one full Understanding/Alignment/
+    Review Queue rebuild is conceptually enough for one batch of decisions.
+    This endpoint reuses ``_write_answer_decision`` (the exact single-item
+    write path, so ``decision_method: manual`` provenance is identical per
+    item) and calls ``request_refresh`` exactly once, only after this
+    ``with get_conn()`` block has committed at least one item (autocommit
+    connection -- see ``app/db.py``'s ``isolation_level=None``), never inside
+    it (same ordering rule as ``answer_alignment_item`` above).
+
+    Partial failure is fail-closed PER ITEM, never per batch: a bad item_id
+    (not found / belongs to another session / Inquiry-locked) or a duplicate
+    item_id within the same batch records a per-item error and the rest of
+    the batch still proceeds. If every item fails, no row changes and no
+    refresh is triggered.
+    """
+    now = time.time()
+    results: List[AlignmentBatchAnswerItemResult] = []
+    any_saved = False
+    with get_conn() as conn:
+        _get_session_or_404(conn, session_id, system_id)
+        seen_item_ids: set = set()
+        for entry in payload.answers:
+            if entry.item_id in seen_item_ids:
+                results.append(AlignmentBatchAnswerItemResult(
+                    item_id=entry.item_id, success=False,
+                    error="Duplicate item_id in this batch",
+                ))
+                continue
+            seen_item_ids.add(entry.item_id)
+
+            _row, error = _validate_answer_target_for_batch(conn, entry.item_id, session_id, system_id)
+            if error is not None:
+                results.append(AlignmentBatchAnswerItemResult(
+                    item_id=entry.item_id, success=False, error=error,
+                ))
+                continue
+
+            item_out = _write_answer_decision(
+                conn, entry.item_id, decision=entry.decision, note=entry.note, now=now,
+            )
+            results.append(AlignmentBatchAnswerItemResult(
+                item_id=entry.item_id, success=True, item=item_out,
+            ))
+            any_saved = True
+
+    if any_saved:
+        # Issue #288: see answer_alignment_item's comment above -- called
+        # exactly once for the whole batch, outside the connection block.
+        from ..interview_refresh import request_refresh
+
+        request_refresh(session_id, system_id, "alignment_answer")
+
+    return AlignmentBatchAnswerOut(
+        session_id=session_id, system_id=system_id, results=results, refreshed=any_saved,
+    )
