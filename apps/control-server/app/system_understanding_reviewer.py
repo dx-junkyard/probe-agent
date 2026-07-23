@@ -46,7 +46,10 @@ from .understanding_graph import UnderstandingGraph, GraphNode, EvidenceRef
 # v2: configurable output language for questions/summaries (Issue #127).
 # v4: injects answered_qa / unconfirmed_qa from the Q&A panel, same as the
 # interview-turn prompt (Issue #263).
-PROMPT_VERSION = "understanding-review-v4"
+# v5: injects terminal Alignment Review decisions so a developer's rejection
+# or correction becomes input to the next Understanding rebuild instead of
+# merely preventing carry-over in the Review Queue.
+PROMPT_VERSION = "understanding-review-v5"
 SCHEMA_VERSION = "understanding-review-v1"
 DEFAULT_REVIEW_MAX_OUTPUT_TOKENS = 32_768
 DEFAULT_REVIEW_MAX_NODES_PER_TYPE = 5
@@ -54,6 +57,7 @@ DEFAULT_REVIEW_MAX_PROMPT_CHARS = 30_000
 DEFAULT_REVIEW_MAX_EVIDENCE_PER_NODE = 2
 # Same budget interview_agent.py uses for Q&A JSON-trim (GAP_AND_QUESTION_MAX_CHARS).
 QA_PROMPT_MAX_CHARS = 4_000
+ALIGNMENT_FEEDBACK_PROMPT_MAX_CHARS = 6_000
 
 
 CONFIDENCE_LEVELS = {"confirmed", "likely", "uncertain", "conflicting"}
@@ -186,6 +190,9 @@ matching exactly this shape:
 
 Rules:
 - Keep confirmed, likely, uncertain, and conflicting claims separate using the confidence level.
+- Explicit Human Alignment Review Feedback is authoritative. When it
+  conflicts with generated graph hypotheses, the newest listed human
+  decision wins; never restore a rejected interpretation as confirmed.
 - Preserve evidence and provenance for all major understanding items.
 - Order open questions from top-level purpose toward API/probe flow details.
 - Do NOT generate metadata or probe proposals — this is understanding only.
@@ -296,9 +303,27 @@ def _build_review_prompt(
     history: Optional[List[Dict[str, str]]] = None,
     answered_qa: Optional[List[Dict[str, Any]]] = None,
     unconfirmed_qa: Optional[List[Dict[str, Any]]] = None,
+    alignment_feedback: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Build the review prompt from graph + code facts."""
     parts: List[str] = []
+
+    # Human Alignment decisions have higher authority than generated graph
+    # hypotheses, so put them first.  The final prompt budget truncates from
+    # the tail; this ordering keeps an explicit rejection/correction from
+    # being dropped merely because the graph is large.
+    if alignment_feedback:
+        parts.append(
+            "## Human Alignment Review Feedback\n"
+            "These are explicit developer decisions from earlier Alignment "
+            "Review items. Treat corrected text and change requests as "
+            "authoritative requirements for this rebuild. Do not repeat a "
+            "rejected interpretation as an established fact. An "
+            "accept_current decision confirms the cited current claim."
+        )
+        parts.append(
+            _trim_json(alignment_feedback, ALIGNMENT_FEEDBACK_PROMPT_MAX_CHARS)
+        )
 
     selected_nodes = _selected_review_nodes(graph)
     parts.append(
@@ -420,6 +445,7 @@ def generate_understanding_review(
     history: Optional[List[Dict[str, str]]] = None,
     answered_qa: Optional[List[Dict[str, Any]]] = None,
     unconfirmed_qa: Optional[List[Dict[str, Any]]] = None,
+    alignment_feedback: Optional[List[Dict[str, Any]]] = None,
 ) -> ReviewResult:
     """Generate a system understanding review from graph + code facts.
 
@@ -428,6 +454,12 @@ def generate_understanding_review(
     the conversational interview turn, so an answer given only via the Q&A
     panel (never posted as an ``interview_message``) still reaches
     ``current_understanding`` regeneration.
+
+    ``alignment_feedback`` carries explicit terminal decisions from
+    Alignment Review. In particular, ``needs_change``,
+    ``reject_interpretation``, and ``corrected`` must influence the newly
+    generated Understanding; keeping their old rows actionable is not by
+    itself sufficient.
 
     Fail-closed: mock clients and non-reasoning models return an error.
     No proposals are generated.
@@ -444,6 +476,7 @@ def generate_understanding_review(
     prompt = _build_review_prompt(
         graph, reconciliation, history,
         answered_qa=answered_qa, unconfirmed_qa=unconfirmed_qa,
+        alignment_feedback=alignment_feedback,
     )
     try:
         max_output_tokens = _review_max_output_tokens()

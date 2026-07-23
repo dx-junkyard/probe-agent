@@ -3293,6 +3293,64 @@ describe("Interview page", () => {
     expect(screen.queryByTestId("main-tab-content-alignment")).not.toBeInTheDocument();
   });
 
+  test("提案の必須操作が完了した build 済みセッションでは Alignment Review が自動既定になる", async () => {
+    const rejectedProposal = {
+      ...interviewProposal(),
+      approval_state: "rejected",
+    };
+    mockInterviewApi({ proposals: [rejectedProposal] });
+    const item = alignmentItem({ id: 2 });
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7/approved-set") {
+        return Promise.resolve({
+          session_id: 7,
+          system_id: 1,
+          snapshot_id: 42,
+          items: [],
+          total_proposals: 1,
+          approved_count: 0,
+          rejected_count: 1,
+          pending_count: 0,
+        });
+      }
+      if (path === "/interview/sessions/7/alignment") {
+        return Promise.resolve({
+          session_id: 7,
+          system_id: 1,
+          items_by_category: {
+            must_review: [item], batch_reviewable: [], no_review_required: [], unchanged: [], informational: [],
+          },
+          counts: { must_review: 1, batch_reviewable: 0, no_review_required: 0, unchanged: 0, informational: 0 },
+          outstanding_counts: { must_review: 1, batch_reviewable: 0, no_review_required: 0, unchanged: 0, informational: 0 },
+        });
+      }
+      if (path === "/interview/sessions/7/review-queue") {
+        return Promise.resolve({ session_id: 7, system_id: 1, items: [item] });
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByTestId("main-tab-content-alignment")).toBeInTheDocument();
+    expect(screen.queryByTestId("main-tab-content-conversation")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("next-action-go-to-conversation")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("main-tab-conversation"));
+    expect(await screen.findByTestId("main-tab-content-conversation")).toBeInTheDocument();
+  });
+
   test("未 build のセッションでは会話が既定表示され、Alignment Review タブへ切り替えられる", async () => {
     // mockInterviewApi's default catch-all resolves /alignment and
     // /review-queue to null, i.e. "not built yet".
@@ -3517,6 +3575,40 @@ describe("Interview page", () => {
     expect(proposed).toHaveTextContent("未確認");
     // It is never rendered as the confirmed human intent.
     expect(screen.queryByTestId("alignment-summary-goal-confirmed")).not.toBeInTheDocument();
+  });
+
+  test("却下済みのAI提案 goal は未確認候補として再表示しない", async () => {
+    mockInterviewApi();
+    const declinedGoal = intentItem({
+      field: "goal", value_text: "却下したAI目標", status: "not_applicable",
+      origin: "ai_proposed", decision_method: "manual", intelligence_run_id: 3,
+    });
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7/intent") {
+        return Promise.resolve({ session_id: 7, system_id: 1, items_by_field: { goal: [declinedGoal] } });
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(await screen.findByTestId("main-tab-alignment"));
+
+    const summary = await screen.findByTestId("alignment-summary-goal");
+    expect(summary).toHaveTextContent("未入力です");
+    expect(summary).not.toHaveTextContent("却下したAI目標");
+    expect(screen.queryByTestId("alignment-summary-goal-proposed")).not.toBeInTheDocument();
   });
 
   test("確認済みの goal は『あなたが実現したいこと』として確定表示する", async () => {

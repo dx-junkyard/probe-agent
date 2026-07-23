@@ -162,8 +162,9 @@ creating incomplete persistence or execution paths for later phases.
     behind #282. Most of it is already covered by #283-#291; the implemented
     delta is: `review_category='unchanged'` made reachable via deterministic
     content-hash carry-over of previously `accept_current`-answered items
-    only (needs_change/reject/corrected stay actionable; with a
-    goal-change guard that disables carry-over for that rebuild), Review
+    only (needs_change/reject/corrected stay actionable and are fed into the
+    next Understanding review; with a goal-change guard that disables
+    carry-over for that rebuild), Review
     Queue category count summary + local batch answering (staged answers
     sent through the existing per-item `/answer`; NOT AI batch approval —
     `decision_method: manual` stays per item), audit-detail expansion and

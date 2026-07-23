@@ -3540,10 +3540,10 @@ class QuestionHandoffAnswerRequest(BaseModel):
 # --- Automatic refresh after an answer batch (Issue #288) --------------------
 #
 # app/interview_refresh.py's request_refresh()/run_refresh_job() keep
-# Understanding / Alignment / Review Queue current after a Q&A answer, Intent
-# confirm/correct, or Alignment answer/correct, without the manual
-# 「理解を更新」 action. trigger_kind/status are explicit finite sets
-# (Principle 6).
+# affected Understanding / Alignment / Review Queue state current after a Q&A
+# answer, Intent confirm/correct, Alignment answer/correct, or applied change
+# set, without the manual 「理解を更新」 action. trigger_kind/status are
+# explicit finite sets (Principle 6).
 
 RefreshTriggerKind = Literal[
     "qa_answer", "intent_update", "alignment_answer", "nl_change_set",

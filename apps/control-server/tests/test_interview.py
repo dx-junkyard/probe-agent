@@ -735,7 +735,7 @@ def test_update_understanding_records_llm_config_failure(admin_client, monkeypat
     assert run is not None
     assert run["status"] == "failed"
     assert "ANTHROPIC_API_KEY" in run["error_details"]
-    assert run["prompt_version"] == "understanding-review-v4"
+    assert run["prompt_version"] == "understanding-review-v5"
     assert detail["messages"][-1]["intelligence_run_id"] == run["id"]
 
 
@@ -879,7 +879,7 @@ def test_update_understanding_records_run_and_reviewer_qa_rows(admin_client, mon
         ).fetchone()
     assert run is not None
     assert run["status"] == "completed"
-    assert run["prompt_version"] == "understanding-review-v4"
+    assert run["prompt_version"] == "understanding-review-v5"
     assert run["decision_method"] == "reasoning_llm"
 
     qa_listing = admin_client.get(

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, getSystemId } from "./client";
 import type {
@@ -1346,8 +1346,34 @@ export function useRejectObservationProposal(sessionId: number | null) {
 // `_invalidateAfterAnswerBatch` below) so the chip updates promptly instead
 // of waiting for the next poll tick.
 
+const _handledTerminalRefreshJobs = new WeakMap<
+  ReturnType<typeof useQueryClient>,
+  Set<string>
+>();
+
+function _claimTerminalRefreshJob(
+  qc: ReturnType<typeof useQueryClient>,
+  terminalKey: string,
+): boolean {
+  let handled = _handledTerminalRefreshJobs.get(qc);
+  if (!handled) {
+    handled = new Set();
+    _handledTerminalRefreshJobs.set(qc, handled);
+  }
+  if (handled.has(terminalKey)) return false;
+  handled.add(terminalKey);
+  // A QueryClient normally lives for the whole app session; keep this
+  // observer-only dedupe bounded without affecting server-side job history.
+  if (handled.size > 100) {
+    const oldest = handled.values().next().value;
+    if (oldest) handled.delete(oldest);
+  }
+  return true;
+}
+
 export function useRefreshStatus(sessionId: number | null) {
-  return useQuery({
+  const qc = useQueryClient();
+  const query = useQuery({
     queryKey: [...sysKey("refreshStatus"), sessionId],
     queryFn: () => api.get<RefreshStatusOut>(`/interview/sessions/${sessionId}/refresh-status`),
     enabled: !!sessionId && !!getSystemId(),
@@ -1356,6 +1382,40 @@ export function useRefreshStatus(sessionId: number | null) {
       return status === "pending" || status === "updating" ? 2000 : false;
     },
   });
+
+  const terminalJobId = query.data?.latest_job?.id ?? null;
+  const terminalJobStatus = query.data?.latest_job?.status ?? null;
+  useEffect(() => {
+    if (
+      terminalJobId == null
+      || terminalJobStatus == null
+      || terminalJobStatus === "pending"
+      || terminalJobStatus === "updating"
+    ) return;
+    const terminalKey = `${sessionId}:${terminalJobId}:${terminalJobStatus}`;
+    if (!_claimTerminalRefreshJob(qc, terminalKey)) return;
+
+    // The mutation's immediate invalidation can race ahead of the
+    // background refresh and fetch the old revision/alignment. Re-fetch the
+    // complete derived view once the polled job actually reaches a terminal
+    // state. This also covers jobs that complete before the first poll.
+    _invalidateAfterRefreshCompletion(qc, sessionId);
+  }, [terminalJobId, terminalJobStatus, qc, sessionId]);
+
+  return query;
+}
+
+function _invalidateAfterRefreshCompletion(
+  qc: ReturnType<typeof useQueryClient>,
+  sessionId: number | null,
+) {
+  qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+  qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
+  qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] });
+  qc.invalidateQueries({ queryKey: [...sysKey("understandingRevisions"), sessionId] });
+  qc.invalidateQueries({ queryKey: [...sysKey("understandingDiff"), sessionId] });
+  qc.invalidateQueries({ queryKey: [...sysKey("alignment"), sessionId] });
+  qc.invalidateQueries({ queryKey: [...sysKey("reviewQueue"), sessionId] });
 }
 
 function _invalidateAfterAnswerBatch(qc: ReturnType<typeof useQueryClient>, sessionId: number | null) {

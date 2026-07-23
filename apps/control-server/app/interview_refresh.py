@@ -1,10 +1,12 @@
 """Automatic refresh after an answer batch (Issue #288).
 
-After a Q&A answer, an Intent confirm/correct, or an Alignment answer/correct
-is durably committed, this module refreshes Understanding, Alignment, and the
-Review Queue without requiring the manual 「理解を更新」 action -- without
-ever losing a saved answer, idempotently, and without a stale/superseded
-result overwriting newer state.
+After a Q&A answer, an Intent confirm/correct, an Alignment answer/correct,
+or an applied NL change set is durably committed, this module refreshes the
+affected derived state without requiring the manual 「理解を更新」 action.
+Q&A/Alignment feedback regenerates Understanding; Intent/change-set updates
+reuse the latest persisted revision and rebuild Alignment/Review Queue.
+Saved answers are never coupled to refresh success, execution is idempotent,
+and stale/superseded results never overwrite newer state.
 
 Design (see the Issue #288 section of ``docs/project-intelligence.md`` for
 the full write-up):
@@ -30,11 +32,6 @@ the full write-up):
   caller's thread instead of a background thread -- used by the test suite
   (see ``tests/conftest.py``) for deterministic assertions without racing a
   background thread.
-
-Deliberately NOT implemented here (out of #288's scope): ``nl_change_set`` is
-listed as a valid ``trigger_kind`` because Issue #289 will call
-``request_refresh(..., "nl_change_set")`` once it lands; nothing in this
-module produces that trigger yet.
 
 probe-agent:
   role: Automatic Understanding/Alignment/Review-Queue refresh orchestration
@@ -67,6 +64,20 @@ logger = logging.getLogger(__name__)
 TRIGGER_KINDS = ("qa_answer", "intent_update", "alignment_answer", "nl_change_set")
 JOB_STATUSES = ("pending", "updating", "updated", "failed", "stale")
 
+# A pending job represents a bounded batch, so a later trigger can be merged
+# into its existing row.  Preserve the strongest processing requirement:
+# Alignment feedback must rebuild Understanding even when the ordinary
+# post-confirmation Q&A gate is closed; a Q&A answer also rebuilds
+# Understanding; Intent/change-set updates only need Alignment rebuilt from
+# the latest already-persisted revision.
+_TRIGGER_PRIORITY = {
+    "intent_update": 0,
+    "nl_change_set": 0,
+    "qa_answer": 1,
+    "alignment_answer": 2,
+}
+_UNDERSTANDING_REBUILD_TRIGGERS = {"qa_answer", "alignment_answer"}
+
 # One lock per session_id so refresh jobs for different sessions can run
 # concurrently, while jobs for the *same* session are always serialized
 # (Principle 8-adjacent isolation: this job never runs two rebuilds for one
@@ -92,19 +103,31 @@ def _enqueue(conn, session_id: int, system_id: int, trigger_kind: str):
     """Insert a job row per the dedupe rule; returns (job_id, should_dispatch).
 
     - a 'pending' job already exists -> no new row; the existing job will
-      pick up this trigger's answers when it runs (bounded batch).
+      pick up this trigger's answers when it runs (bounded batch), and its
+      trigger_kind is promoted when the new input needs stronger processing.
     - an 'updating' job exists (no pending yet) -> insert exactly one
       'pending' follow-up job; do not dispatch now (the in-flight job's
       completion drains it, see ``run_refresh_job``).
     - neither exists -> insert a 'pending' job and dispatch immediately.
     """
     pending = conn.execute(
-        """SELECT id FROM interview_refresh_job
+        """SELECT id, trigger_kind FROM interview_refresh_job
            WHERE session_id = ? AND status = 'pending'
            ORDER BY id DESC LIMIT 1""",
         (session_id,),
     ).fetchone()
     if pending is not None:
+        merged_trigger = max(
+            (pending["trigger_kind"], trigger_kind),
+            key=lambda value: _TRIGGER_PRIORITY[value],
+        )
+        if merged_trigger != pending["trigger_kind"]:
+            conn.execute(
+                """UPDATE interview_refresh_job
+                   SET trigger_kind = ?
+                   WHERE id = ? AND status = 'pending'""",
+                (merged_trigger, pending["id"]),
+            )
         return pending["id"], False
 
     updating = conn.execute(
@@ -271,7 +294,19 @@ def _run_one_locked(job_id: int) -> None:
         # here would be circular.
         from .routes.interview import _rebuild_understanding, _understanding_update_blocked
 
-        if _understanding_update_blocked(conn, session, system_id):
+        trigger_kind = job["trigger_kind"]
+        rebuild_understanding = trigger_kind in _UNDERSTANDING_REBUILD_TRIGGERS
+
+        # The Q&A trigger shares the manual endpoint's "nothing new" gate.
+        # Other trigger kinds must never return here: Alignment decisions
+        # are separate human evidence and intentionally bypass the Q&A-only
+        # watermark, while Intent/change-set updates still need the
+        # Alignment build below even though they do not regenerate System
+        # Understanding.
+        if (
+            trigger_kind == "qa_answer"
+            and _understanding_update_blocked(conn, session, system_id)
+        ):
             latest_rev = conn.execute(
                 """SELECT id FROM understanding_revision
                    WHERE session_id = ? AND system_id = ?
@@ -291,15 +326,33 @@ def _run_one_locked(job_id: int) -> None:
             )
             return
 
-        result = _rebuild_understanding(conn, session, system_id)
-        if not result.ok:
-            conn.execute(
-                """UPDATE interview_refresh_job
-                   SET status = 'failed', error = ?, intelligence_run_id = ?, finished_at = ?
-                   WHERE id = ?""",
-                (result.error, result.intelligence_run_id, time.time(), job_id),
-            )
-            return
+        intelligence_run_id: Optional[int] = None
+        result_revision_id: Optional[int] = None
+        if rebuild_understanding:
+            result = _rebuild_understanding(conn, session, system_id)
+            if not result.ok:
+                conn.execute(
+                    """UPDATE interview_refresh_job
+                       SET status = 'failed', error = ?, intelligence_run_id = ?, finished_at = ?
+                       WHERE id = ?""",
+                    (result.error, result.intelligence_run_id, time.time(), job_id),
+                )
+                return
+            intelligence_run_id = result.intelligence_run_id
+            result_revision_id = result.revision_id
+        else:
+            # Intent updates affect the desired state, not facts about the
+            # current system. NL change sets have already persisted their
+            # selected claim edits as a new understanding_revision. Reusing
+            # that latest revision avoids needlessly regenerating (and for a
+            # change set, potentially overwriting) explicit human edits.
+            latest_rev = conn.execute(
+                """SELECT id FROM understanding_revision
+                   WHERE session_id = ? AND system_id = ?
+                   ORDER BY id DESC LIMIT 1""",
+                (session_id, system_id),
+            ).fetchone()
+            result_revision_id = latest_rev["id"] if latest_rev else None
 
         # Issue #287's Alignment build is best-effort here: Understanding
         # already rebuilt successfully (the primary deliverable), so a
@@ -321,7 +374,7 @@ def _run_one_locked(job_id: int) -> None:
                    finished_at = ?, error = ?
                WHERE id = ?""",
             (
-                result.intelligence_run_id, result.revision_id,
+                intelligence_run_id, result_revision_id,
                 time.time(), alignment_note, job_id,
             ),
         )

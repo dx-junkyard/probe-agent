@@ -864,6 +864,37 @@ def _reject_if_superseded(item) -> None:
         )
 
 
+def _reject_if_not_actionable(item) -> None:
+    """Reject direct decisions on collapsed/informational Alignment rows."""
+    if item["review_category"] not in _ACTIONABLE_CATEGORIES:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "alignment_item_not_actionable",
+                "message": "この項目は回答対象ではありません。最新のレビューキューを確認してください。",
+            },
+        )
+
+
+def _reject_if_not_decidable(item, *, allow_held: bool) -> None:
+    """Prevent a stale single-item request from overwriting a decision.
+
+    ``answered`` and ``corrected`` are terminal. ``held`` may transition to
+    an actual answer/correction, but a repeated /hold is handled
+    idempotently by that endpoint without rewriting ``user_decision`` or its
+    timestamp.
+    """
+    allowed = ("open", "held") if allow_held else ("open",)
+    if item["status"] not in allowed:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "alignment_item_already_decided",
+                "message": "この項目にはすでに判断が記録されています。最新のレビューキューを確認してください。",
+            },
+        )
+
+
 def _write_answer_decision(
     conn, item_id: int, *, decision: str, note: Optional[str], now: float,
 ) -> AlignmentItemOut:
@@ -909,6 +940,8 @@ def answer_alignment_item(
         item = _get_item_or_404(conn, item_id, system_id)
         _reject_if_inquiry_locked(item)
         _reject_if_superseded(item)
+        _reject_if_not_actionable(item)
+        _reject_if_not_decidable(item, allow_held=True)
         result = _write_answer_decision(
             conn, item_id, decision=payload.decision, note=payload.note, now=now,
         )
@@ -944,6 +977,8 @@ def correct_alignment_item(
         item = _get_item_or_404(conn, item_id, system_id)
         _reject_if_inquiry_locked(item)
         _reject_if_superseded(item)
+        _reject_if_not_actionable(item)
+        _reject_if_not_decidable(item, allow_held=True)
         decision = {
             "action": "corrected", "note": payload.corrected_interpretation,
             "decided_at": now, "decided_by": None,
@@ -977,6 +1012,11 @@ def hold_alignment_item(
         item = _get_item_or_404(conn, item_id, system_id)
         _reject_if_inquiry_locked(item)
         _reject_if_superseded(item)
+        _reject_if_not_actionable(item)
+        if item["status"] == "held":
+            # Safe retry: preserve the original audit timestamp/payload.
+            return _item_out(item)
+        _reject_if_not_decidable(item, allow_held=False)
         decision = {"action": "held", "note": None, "decided_at": now, "decided_by": None}
         conn.execute(
             """UPDATE alignment_item

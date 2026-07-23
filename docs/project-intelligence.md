@@ -3155,7 +3155,8 @@ interview ページに新設した Review Queue パネル:
 
 Q&A 回答 / Intent の confirm・correct・decline / Alignment の
 answer・correct のいずれかが保存された直後、手動の「理解を更新」を押さ
-なくても Understanding / Alignment / Review Queue を自動で最新化する。
+なくても、入力種別に応じて Understanding を再構築し、Alignment /
+Review Queue を自動で最新化する。
 保存済みの回答を失わないこと(Principle 1)、冪等であること、古い(=
 実行順序が入れ替わって後から書き込もうとした)結果が新しい結果を上書き
 しないことを満たす。
@@ -3184,7 +3185,9 @@ answer・correct のいずれかが保存された直後、手動の「理解を
   合しない、Principle 1)。デデュープ規則:
   - そのセッションに `pending` job が既にあれば、新しい行は作らない
     (既存の `pending` job が実行される時点で、その時点までに保存され
-    ているすべての回答を拾う — 束ねられたバッチ)。
+    ているすべての回答を拾う — 束ねられたバッチ)。必要処理を失わない
+    よう trigger は `alignment_answer > qa_answer >
+    intent_update/nl_change_set` の順に昇格する。
   - `updating` job があり `pending` が無ければ、`pending` job を1件だ
     け作る(実行中の job には今回のトリガーが間に合わないため)。
   - どちらも無ければ `pending` job を作って即座にディスパッチする。
@@ -3201,16 +3204,18 @@ answer・correct のいずれかが保存された直後、手動の「理解を
      `updated` で完了している」場合は、この job を `status='stale'` に
      し、何も書き込まずに返る(実行順序が入れ替わって古い job が後から
      動いても、新しい結果を上書きしない)。
-  4. `_understanding_update_blocked` が真(手動「理解を更新」の 409 条
-     件と完全に同じ判定 — 確定済みで新しい回答が無い)なら、Understanding
-     の再構築を**スキップ**し、`status='updated'` + 固定の注記だけを記
-     録する(rebuild は何もしなかった、という事実そのものが結果)。
-  5. そうでなければ `routes/interview._rebuild_understanding` を呼ぶ
-     (`update_interview_understanding` エンドポイントと **全く同じ**
-     reasoning 呼び出し・永続化コードパス — 重複実装しない)。失敗すれ
-     ば `status='failed'` + エラー内容 + その reasoning run の
-     `intelligence_run_id` を記録して終了。保存済みの回答行は一切変更
-     しない。
+  4. `qa_answer` だけは `_understanding_update_blocked` が真(確定済み
+     で新しい Q&A が無い)なら再構築をスキップし、
+     `status='updated'` + 固定注記で終える。`alignment_answer` は Q&A
+     watermark と別の人間入力なので gate を迂回する。
+  5. `qa_answer` / `alignment_answer` は
+     `routes/interview._rebuild_understanding` を呼ぶ
+     (`update_interview_understanding` と同じ reasoning・永続化コード)。
+     `intent_update` は desired state のみ、`nl_change_set` は選択された
+     revision edit を永続化済みなので Understanding を再生成せず、
+     最新 revision をそのまま次の Alignment build に渡す。rebuild が
+     失敗すれば `status='failed'` + エラー内容 + reasoning run id を
+     記録して終了し、保存済み回答は変更しない。
   6. 成功したら続けて `routes/interview_alignment.run_alignment_build`
      を呼ぶ(`POST .../alignment/build` と同じコードパス)。Alignment
      側の失敗は Understanding の成功を無効化しない — job は `updated`
@@ -3894,9 +3899,10 @@ Issue #295 は Interview Alignment UX の元提案であり、その大部分は
   `reason_code='unchanged_since_confirmation'` に分類し、
   `carried_over_from` に引き継ぎ元 id を記録する(監査専用の参照。
   ON DELETE SET NULL)。`needs_change` / `reject_interpretation` /
-  `corrected` は人間の異議・修正であり Understanding へ未反映のため
-  carry-over 対象外とし(3回目レビュー指摘1)、ルール表で再分類して
-  actionable のまま残す。unchanged 項目は `GET .../review-queue` の
+  `corrected` は人間の異議・修正なので carry-over 対象外とし(3回目
+  レビュー指摘1)、次の Understanding rebuild の reviewer prompt に
+  還流する。新しい理解でもなお差分が残る場合はルール表で再分類され
+  actionable のまま残る。unchanged 項目は `GET .../review-queue` の
   主導線(must_review/batch_reviewable フィルタ)に現れない。
 - §5.5 の狭い決定的版: goal intent(System Purpose 相当)が直前ビルド
   以降に確定・変更された場合、そのビルドでは引き継ぎを行わず全項目を
@@ -4080,3 +4086,47 @@ Issue #295 は Interview Alignment UX の元提案であり、その大部分は
    `USER_DECISION_LABELS`(5 action の日本語ラベル)を追加し、判断内容と
    メモを監査詳細に表示。carried_over_from / superseded 履歴と合わせて
    #295 の監査可能性を満たす。
+
+### PR #296 4回目レビュー対応
+
+3回目レビュー対応後に残った動作上の指摘6件への修正。
+
+1. **Alignment 判断を Understanding に還流(P1)**:
+   `answered` / `corrected` の終端 `alignment_item.user_decision` を
+   `routes/interview.py::_load_alignment_feedback` で新旧履歴から読み、
+   `generate_understanding_review(..., alignment_feedback=...)` に渡す。
+   reviewer prompt では人間の判断を graph 仮説より優先し、最新判断を
+   先頭に配置する。`needs_change` / `reject_interpretation` /
+   `corrected` が同じ提案の再表示抑止だけでなく、次の Understanding
+   自体へ反映される。prompt 変更の監査用に
+   `PROMPT_VERSION='understanding-review-v5'` とした。`held` は作業状態で
+   内容判断ではないため注入しない。
+2. **refresh job をトリガー別に実行(P1)**:
+   確定後の `_understanding_update_blocked` は Q&A watermark の gate
+   なので `qa_answer` の「新規回答なし」判定にだけ使う。
+   `alignment_answer` は gate を迂回して Alignment 判断込みで
+   Understanding を再構築する。`intent_update` は desired state の変更、
+   `nl_change_set` は選択済み claim edit を revision に永続化済みなので、
+   最新 revision を再生成せずそのまま Alignment build へ進む。
+   pending job へ別 trigger が合流した場合は
+   `alignment_answer > qa_answer > intent/change-set` の必要処理順に
+   `trigger_kind` を昇格し、強い入力を dedupe で失わない。
+3. **単体判断 API の上書き防止(P1)**:
+   `/answer` / `/correct` / `/hold` も batch と同じく actionable category
+   だけを受け付け、`answered` / `corrected` への再判断を 409 にする。
+   `/hold` の再送は既存行をそのまま返す冪等処理とし、判断時刻を
+   書き換えない。`held` から明示的な answer/correct への遷移は維持する。
+4. **非同期 refresh 完了後の再取得(P1)**:
+   Dashboard の `useRefreshStatus` は pending/updating の polling に加え、
+   job が terminal になった時点で session/Q&A/understanding revision・
+   diff/alignment/review queue を再取得する。mutation 直後の早すぎる
+   invalidation が旧状態を取得しても、完了後に新 revision が必ず反映される。
+5. **Alignment 自動既定の到達可能化(P2)**:
+   `conversationHasRequiredAction` を `uiState` の truthiness ではなく
+   実際の CTA から導出する。proposal review 中は proposed/needs_review
+   または approved/edited が残る間だけ会話タブを優先し、全提案却下済み
+   かつ Alignment build 済みなら Alignment Review が自動既定になる。
+6. **却下済み AI goal の除外(P2)**:
+   未確認候補は `status='proposed' AND origin='ai_proposed'` の行だけ。
+   `not_applicable` へ却下済みの AI goal は「AI提案・未確認」として
+   再表示しない。

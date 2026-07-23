@@ -418,6 +418,30 @@ class TestQaInjection:
         assert "Confirmed Q&A" not in prompt
         assert "Unconfirmed Q&A" not in prompt
 
+    def test_prompt_includes_human_alignment_feedback_before_graph(self):
+        graph = _build_graph([_claim()])
+        recon = _empty_reconciliation()
+        feedback = [{
+            "alignment_item_id": 12,
+            "current_claim": "The API owns authorization",
+            "proposed_interpretation": "Authorization is automatic",
+            "decision": {
+                "action": "corrected",
+                "note": "Authorization requires an explicit operator approval.",
+            },
+        }]
+
+        prompt = _build_review_prompt(
+            graph, recon, alignment_feedback=feedback,
+        )
+
+        assert "Human Alignment Review Feedback" in prompt
+        assert "corrected" in prompt
+        assert "explicit operator approval" in prompt
+        assert prompt.index("Human Alignment Review Feedback") < prompt.index(
+            "Understanding Graph Nodes"
+        )
+
     def test_generate_understanding_review_forwards_qa_to_prompt(self):
         graph = _build_graph([_claim()])
         recon = _empty_reconciliation()
@@ -438,8 +462,32 @@ class TestQaInjection:
         assert "Panel Q2" in user_prompt
         assert "不明" in user_prompt
 
-    def test_prompt_version_bumped_for_qa_injection(self):
-        assert PROMPT_VERSION == "understanding-review-v4"
+    def test_generate_understanding_review_forwards_alignment_feedback_to_prompt(self):
+        graph = _build_graph([_claim()])
+        recon = _empty_reconciliation()
+        client = CapturingReasoningClient([VALID_REVIEW_RESPONSE])
+        feedback = [{
+            "alignment_item_id": 8,
+            "current_claim": "Wrong claim",
+            "decision": {
+                "action": "reject_interpretation",
+                "note": "Do not retain this interpretation.",
+            },
+        }]
+
+        result = generate_understanding_review(
+            client, _reasoning_config(),
+            graph=graph, reconciliation=recon,
+            alignment_feedback=feedback,
+        )
+
+        assert result.error is None
+        user_prompt = client.calls[0]["messages"][1]["content"]
+        assert "reject_interpretation" in user_prompt
+        assert "Do not retain this interpretation." in user_prompt
+
+    def test_prompt_version_bumped_for_alignment_feedback_injection(self):
+        assert PROMPT_VERSION == "understanding-review-v5"
 
 
 class TestEnumValidation:
@@ -589,7 +637,7 @@ class TestOutputLanguage:
         system_msg = client.calls[0]["messages"][0]["content"]
         assert "in Japanese" in system_msg
         assert "enum values" in system_msg
-        assert result.prompt_version == "understanding-review-v4"
+        assert result.prompt_version == "understanding-review-v5"
         assert "review_capabilities" in system_msg
 
     def test_english_directive(self, monkeypatch):

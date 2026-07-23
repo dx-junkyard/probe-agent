@@ -1240,7 +1240,7 @@ function AlignmentSummaryHeader({
   const confirmedGoal = goalItems.find(i => i.status === "confirmed");
   const proposedGoal = confirmedGoal
     ? undefined
-    : goalItems.find(i => i.status === "proposed" || i.origin === "ai_proposed");
+    : goalItems.find(i => i.status === "proposed" && i.origin === "ai_proposed");
   const purposeNames = (understanding?.system_purpose ?? [])
     .map(i => i.name)
     .filter(Boolean)
@@ -1452,19 +1452,29 @@ export default function InterviewPage() {
   // でも Alignment Review を既定にしてしまい、次にやること(NextActionBanner)
   // が指す操作が別タブに隠れる問題があった。
   //
-  // 3rd review round (Finding 3): 以前はここで proposal_review を「会話タブ
-  // に必須操作なし(=提案レビューは Alignment タブ側で完結する)」と判定して
-  // いたが、これは誤りだった -- 提案の承認・却下・差分生成のUIは会話タブ内
-  // (下の TabsContent value="conversation")にある。そのため
-  // proposal_review でも会話タブが既定になり、NextActionBanner の「各提案を
-  // 承認・却下してください」という指示先と表示タブが食い違い、別タブに切り替え
-  // ても会話タブへ戻る導線が出なかった。提案レビューも会話タブ側の必須操作
-  // として扱う。結果として、会話タブに必須操作が「無い」のは uiState が
-  // 未確定(セッション未ロード等)で、かつ canConfirmStructuredUnderstanding
-  // も false のときだけになる。新しいサーバーフラグは使わず、既存の
-  // uiState/canConfirmStructuredUnderstanding から決定的に導出するだけ。
+  // proposal_review は状態名だけでは「必須操作あり」とは限らない。未レビュー
+  // (proposed/needs_review)が残る、または承認済み提案から差分を生成できる間は
+  // 会話タブに操作がある。一方、全提案を却下済みで approved set も空なら
+  // 会話側の操作は完了しており、build 済み Alignment Review を既定表示できる。
+  // uiState の truthiness をそのまま使わず、各状態が実際に持つ CTA から有限に
+  // 導出することで Alignment 自動既定が到達不能になるのを防ぐ。
+  const proposalReviewHasRequiredAction = (
+    uiState === "proposal_review"
+    && (
+      proposals.some(p => proposalReviewable(p.approval_state))
+      || proposals.some(p => p.approval_state === "approved" || p.approval_state === "edited")
+      || approvedCount > 0
+    )
+  );
   const conversationHasRequiredAction = !!(
-    canConfirmStructuredUnderstanding || uiState
+    canConfirmStructuredUnderstanding
+    || uiState === "preparing"
+    || uiState === "needs_build"
+    || uiState === "confirm_understanding"
+    || uiState === "fill_gaps"
+    || uiState === "zero_base"
+    || uiState === "ready_for_proposals"
+    || proposalReviewHasRequiredAction
   );
   // ユーザーが明示的にタブを切り替えた場合はそちらを優先するが、その選択は
   // 選択中のセッションに限って有効にする(別セッションへ切り替えたときに
@@ -1973,15 +1983,15 @@ export default function InterviewPage() {
                 の回答・ゼロベース質問・提案生成待ちなど)が残っている間も
                 Alignment Review が既定になり、NextActionBanner の CTA が
                 別タブに隠れてしまっていた。既定タブは
-                `conversationHasRequiredAction`(既存の uiState /
+                `conversationHasRequiredAction`(各 uiState の実 CTA と
                 canConfirmStructuredUnderstanding から決定的に導出、新しい
                 サーバーフラグは追加しない)が false -- つまり会話タブでの
                 必須操作が残っていない -- かつ build 済みのときに限り
-                Alignment Review にする(Issue #295 §6)。3rd review round
-                (Finding 3): 提案の承認・却下・差分生成は会話タブ内にある
-                ため proposal_review も会話タブの必須操作として扱う。どちら
-                のタブも常に到達できる上、会話タブに必須操作が残っている間は
-                NextActionBanner に「会話タブへ移動」ボタンが出る。 */}
+                Alignment Review にする(Issue #295 §6)。proposal_review
+                でも proposed/needs_review、または承認済み差分生成が残る間は
+                会話タブを既定にするが、全却下済みなら Alignment 自動既定へ
+                到達する。どちらのタブも常に到達でき、会話タブに必須操作が
+                残る間は NextActionBanner に「会話タブへ移動」ボタンが出る。 */}
             <div className="space-y-4">
               <Tabs
                 value={mainTab}
