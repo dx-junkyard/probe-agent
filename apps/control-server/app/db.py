@@ -2984,6 +2984,150 @@ CREATE TABLE IF NOT EXISTS cell_activations (
 
 CREATE INDEX IF NOT EXISTS idx_cell_activations_cell
     ON cell_activations (system_id, cell_definition_id, id DESC);
+-- Issue #300 (Sub 3 of the Probe Cell Fabric epic, Issue #297): Goal/Task
+-- ledger + delegate/report/escalate protocol. Purely deterministic -- no
+-- reasoning-model call anywhere in this table group or in app/cell_tasks.py.
+-- parent_goal_id NULL means a root goal; cycle rejection is enforced in
+-- app/cell_tasks.py (walking the parent chain), not by SQLite.
+CREATE TABLE IF NOT EXISTS cell_goals (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id       INTEGER NOT NULL,
+    parent_goal_id  INTEGER,
+    title           TEXT NOT NULL,
+    description     TEXT NOT NULL DEFAULT '',
+    owner_cell_id   INTEGER,
+    status          TEXT NOT NULL DEFAULT 'open'
+                        CHECK (status IN ('open', 'achieved', 'abandoned')),
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_goal_id) REFERENCES cell_goals (id) ON DELETE CASCADE,
+    FOREIGN KEY (owner_cell_id) REFERENCES cell_definitions (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_goals_system
+    ON cell_goals (system_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_cell_goals_parent
+    ON cell_goals (system_id, parent_goal_id);
+
+-- cell_tasks: exactly one owner Cell and one parent goal per task by
+-- construction (no many-to-many membership table exists at Sub 3).
+-- acceptance_json must be a non-empty JSON array; this is enforced at the
+-- API/core layer via cell_fabric.TaskDelegation-style validation, not by a
+-- SQLite CHECK (JSON array emptiness is not expressible there). UNIQUE
+-- (system_id, idempotency_key) relies on SQLite treating distinct NULLs as
+-- non-conflicting, so tasks created without an idempotency key never
+-- collide with each other.
+CREATE TABLE IF NOT EXISTS cell_tasks (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    goal_id               INTEGER NOT NULL,
+    owner_cell_id         INTEGER NOT NULL,
+    delegated_by_cell_id  INTEGER,
+    title                 TEXT NOT NULL,
+    acceptance_json       TEXT NOT NULL,
+    context_refs_json     TEXT NOT NULL DEFAULT '[]',
+    budget_json           TEXT,
+    deadline              TEXT,
+    priority              TEXT NOT NULL DEFAULT 'normal'
+                              CHECK (priority IN ('low', 'normal', 'high')),
+    status                TEXT NOT NULL DEFAULT 'todo'
+                              CHECK (status IN ('todo', 'doing', 'review', 'done', 'failed', 'blocked')),
+    retry_count           INTEGER NOT NULL DEFAULT 0,
+    retry_limit           INTEGER NOT NULL DEFAULT 3,
+    blocked_by_json       TEXT NOT NULL DEFAULT '[]',
+    acceptance_met        INTEGER NOT NULL DEFAULT 0,
+    evidence_json         TEXT NOT NULL DEFAULT '[]',
+    returned_to_parent    INTEGER NOT NULL DEFAULT 0,
+    idempotency_key       TEXT,
+    created_at            REAL NOT NULL,
+    updated_at            REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (goal_id) REFERENCES cell_goals (id) ON DELETE CASCADE,
+    FOREIGN KEY (owner_cell_id) REFERENCES cell_definitions (id) ON DELETE RESTRICT,
+    FOREIGN KEY (delegated_by_cell_id) REFERENCES cell_definitions (id) ON DELETE SET NULL,
+    UNIQUE (system_id, idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_tasks_system
+    ON cell_tasks (system_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_cell_tasks_goal
+    ON cell_tasks (system_id, goal_id);
+CREATE INDEX IF NOT EXISTS idx_cell_tasks_owner
+    ON cell_tasks (system_id, owner_cell_id);
+CREATE INDEX IF NOT EXISTS idx_cell_tasks_status
+    ON cell_tasks (system_id, status);
+
+-- Append-only audit of every task state transition -- retry / blocked /
+-- unblocked / returned_to_parent are ordinary rows here, written in the same
+-- transaction as the state change, never reconstructed after the fact.
+CREATE TABLE IF NOT EXISTS cell_task_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id    INTEGER NOT NULL,
+    task_id      INTEGER NOT NULL,
+    event_type   TEXT NOT NULL,
+    from_status  TEXT,
+    to_status    TEXT,
+    detail       TEXT NOT NULL DEFAULT '',
+    created_at   REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (task_id) REFERENCES cell_tasks (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_task_events_task
+    ON cell_task_events (system_id, task_id, id DESC);
+
+-- cell_reports: kind is schema-validated to digest|escalation only -- any
+-- other free-form payload is rejected fail-closed at the API layer
+-- (Pydantic extra="forbid"). fact_json / interpretation_json / ask_json stay
+-- separate fields: raw evidence-backed facts are never mixed with
+-- interpretation/ask text (Principle 7), even though this module calls no
+-- reasoning model.
+CREATE TABLE IF NOT EXISTS cell_reports (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id            INTEGER NOT NULL,
+    cell_definition_id   INTEGER NOT NULL,
+    task_id              INTEGER,
+    kind                 TEXT NOT NULL CHECK (kind IN ('digest', 'escalation')),
+    severity             TEXT CHECK (severity IS NULL OR severity IN ('sev1', 'sev2', 'sev3')),
+    fact_json            TEXT NOT NULL DEFAULT '[]',
+    interpretation_json  TEXT NOT NULL DEFAULT '[]',
+    ask_json             TEXT NOT NULL DEFAULT '[]',
+    idempotency_key      TEXT,
+    created_at           REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (cell_definition_id) REFERENCES cell_definitions (id) ON DELETE CASCADE,
+    FOREIGN KEY (task_id) REFERENCES cell_tasks (id) ON DELETE SET NULL,
+    UNIQUE (system_id, idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_reports_system
+    ON cell_reports (system_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_cell_reports_cell
+    ON cell_reports (system_id, cell_definition_id, id DESC);
+
+-- cell_escalations: created automatically from an escalation-kind report in
+-- the same transaction; never created independently of a report.
+CREATE TABLE IF NOT EXISTS cell_escalations (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id            INTEGER NOT NULL,
+    report_id            INTEGER NOT NULL,
+    cell_definition_id   INTEGER NOT NULL,
+    severity             TEXT NOT NULL CHECK (severity IN ('sev1', 'sev2', 'sev3')),
+    status               TEXT NOT NULL DEFAULT 'open'
+                             CHECK (status IN ('open', 'acknowledged', 'resolved')),
+    summary              TEXT NOT NULL,
+    created_at           REAL NOT NULL,
+    updated_at           REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (report_id) REFERENCES cell_reports (id) ON DELETE CASCADE,
+    FOREIGN KEY (cell_definition_id) REFERENCES cell_definitions (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_escalations_system
+    ON cell_escalations (system_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_cell_escalations_status
+    ON cell_escalations (system_id, status, id DESC);
 """
 
 

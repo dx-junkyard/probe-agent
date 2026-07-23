@@ -5535,3 +5535,183 @@ class CellStateOut(BaseModel):
     state: Dict[str, Any]
     binding: Optional[CellBindingOut] = None
     recent_activations: List[CellActivationOut] = Field(default_factory=list)
+# Goal/Task ledger + delegate/report/escalate protocol (Issue #300, Sub 3 of
+# the Probe Cell Fabric epic, Issue #297). Core logic lives in
+# app/cell_tasks.py; these are the request/response shapes for
+# routes/cell_tasks.py.
+# ---------------------------------------------------------------------------
+
+
+class CellGoalCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(..., min_length=1)
+    description: str = ""
+    parent_goal_id: Optional[int] = None
+    owner_cell_id: Optional[str] = None
+
+
+class CellGoalStatusUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: str
+
+
+class CellGoalOut(BaseModel):
+    id: int
+    system_id: int
+    parent_goal_id: Optional[int] = None
+    title: str
+    description: str = ""
+    owner_cell_id: Optional[str] = None
+    status: str
+    created_at: float
+    updated_at: float
+
+
+class CellGoalsListOut(BaseModel):
+    system_id: int
+    goals: List[CellGoalOut] = Field(default_factory=list)
+
+
+class CellTaskDelegateCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    goal_id: int
+    owner_cell_id: str = Field(..., min_length=1)
+    delegated_by_cell_id: Optional[str] = None
+    title: str = Field(..., min_length=1)
+    acceptance: List[str] = Field(..., min_length=1)
+    context_refs: List[str] = Field(default_factory=list)
+    budget: Optional[Dict[str, Any]] = None
+    deadline: Optional[str] = None
+    priority: Optional[str] = None
+    idempotency_key: Optional[str] = None
+
+
+class CellTaskOut(BaseModel):
+    id: int
+    system_id: int
+    goal_id: int
+    owner_cell_id: str
+    delegated_by_cell_id: Optional[str] = None
+    title: str
+    acceptance: List[str] = Field(default_factory=list)
+    context_refs: List[str] = Field(default_factory=list)
+    budget: Optional[Dict[str, Any]] = None
+    deadline: Optional[str] = None
+    priority: str
+    status: str
+    retry_count: int
+    retry_limit: int
+    blocked_by: List[int] = Field(default_factory=list)
+    acceptance_met: bool
+    evidence: List[str] = Field(default_factory=list)
+    returned_to_parent: bool
+    idempotency_key: Optional[str] = None
+    created_at: float
+    updated_at: float
+
+
+class CellTasksListOut(BaseModel):
+    system_id: int
+    tasks: List[CellTaskOut] = Field(default_factory=list)
+
+
+class CellGoalDetailOut(BaseModel):
+    goal: CellGoalOut
+    tasks: List[CellTaskOut] = Field(default_factory=list)
+
+
+class CellTaskEventOut(BaseModel):
+    id: int
+    task_id: int
+    event_type: str
+    from_status: Optional[str] = None
+    to_status: Optional[str] = None
+    detail: str = ""
+    created_at: float
+
+
+class CellTaskDetailOut(BaseModel):
+    task: CellTaskOut
+    events: List[CellTaskEventOut] = Field(default_factory=list)
+
+
+class CellTaskTransitionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    new_status: str
+    acceptance_met: Optional[bool] = None
+    evidence_refs: Optional[List[str]] = None
+    blocked_by: Optional[List[int]] = None
+    detail: str = ""
+
+
+class CellTaskReturnToParentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    detail: str = ""
+
+
+class CellReportFactItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(..., min_length=1)
+    evidence_refs: List[str] = Field(default_factory=list)
+
+
+class CellReportTextItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(..., min_length=1)
+
+
+class CellReportCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cell_definition_id: str = Field(..., min_length=1)
+    task_id: Optional[int] = None
+    kind: str
+    severity: Optional[str] = None
+    fact: List[CellReportFactItem] = Field(default_factory=list)
+    interpretation: List[CellReportTextItem] = Field(default_factory=list)
+    ask: List[CellReportTextItem] = Field(default_factory=list)
+    idempotency_key: Optional[str] = None
+
+
+class CellReportOut(BaseModel):
+    id: int
+    system_id: int
+    cell_definition_id: str
+    task_id: Optional[int] = None
+    kind: str
+    severity: Optional[str] = None
+    fact: List[Dict[str, Any]] = Field(default_factory=list)
+    interpretation: List[Dict[str, Any]] = Field(default_factory=list)
+    ask: List[Dict[str, Any]] = Field(default_factory=list)
+    idempotency_key: Optional[str] = None
+    created_at: float
+    escalation_id: Optional[int] = None
+
+
+class CellReportsListOut(BaseModel):
+    system_id: int
+    reports: List[CellReportOut] = Field(default_factory=list)
+
+
+class CellEscalationOut(BaseModel):
+    id: int
+    system_id: int
+    report_id: int
+    cell_definition_id: str
+    severity: str
+    status: str
+    summary: str
+    created_at: float
+    updated_at: float
+
+
+class CellEscalationsListOut(BaseModel):
+    system_id: int
+    escalations: List[CellEscalationOut] = Field(default_factory=list)

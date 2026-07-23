@@ -788,3 +788,68 @@ Add or update tests for:
   Issue #25 validation gate at job creation, the pre-push staleness
   re-check, approve/cancel idempotency, worktree cleanup on every terminal
   state, and system isolation
+
+## Probe Cell Fabric -- Goal/Task ledger (issue #300)
+
+Sub 3 of the Probe Cell Fabric epic (Issue #297; Sub 1's contract layer is
+`app/cell_fabric.py`, Issue #298). See the "Probe Cell Fabric(Issue #297)"
+section of `docs/project-intelligence.md` for the full epic design.
+
+- Core logic in `app/cell_tasks.py`; routes are thin
+  (`routes/cell_tasks.py`) and only translate `app.cell_tasks` errors to
+  HTTP status codes: `NotFoundError` -> 404, `ConflictError` -> 409,
+  `ValidationFailedError` -> 422.
+- Tables (System-scoped, additive `CREATE TABLE IF NOT EXISTS`, cascade
+  FKs): `cell_goals` (parent_goal_id nullable = root goal), `cell_tasks`
+  (exactly one `owner_cell_id` + one `goal_id` per row -- no many-to-many
+  membership table at this Sub), `cell_task_events` (append-only transition
+  audit), `cell_reports` (`kind` = `digest` | `escalation` only),
+  `cell_escalations` (created automatically from an escalation-kind report
+  in the same transaction).
+- Task transitions delegate legality to `cell_fabric.TASK_TRANSITIONS` /
+  `validate_task_transition` (Issue #298) -- this module never re-implements
+  the transition table. It only adds ledger-specific rules on top: a retry
+  (`failed -> todo`) increments `retry_count` and is refused (409) once
+  `retry_count >= retry_limit`; entering `blocked` requires `blocked_by`
+  task ids or an explicit `detail`; every transition writes exactly one
+  `cell_task_events` row (event_type is `created` / `transition` / `retry`
+  / `blocked` / `unblocked` / `returned_to_parent`, chosen structurally from
+  the from/to status pair, never inferred after the fact).
+  `return_to_parent` is only legal from `failed` or `blocked`.
+- Delegation (P1, `delegate_task`) reuses `cell_fabric.TaskDelegation` for
+  the acceptance/context_refs/budget/deadline/priority contract instead of
+  re-validating it -- a missing/empty `acceptance` list is the same
+  fail-closed error as #298's contract layer.
+- Evidence/context ref resolution (`resolve_evidence_ref`, Principle 6:
+  deterministic, finite ref grammar only) accepts exactly `trace:<id>` /
+  `evaluation:<id>` / `shadow_result:<id>` / `replay_run:<id>` /
+  `experiment:<id>` / `snapshot_file:<snapshot_id>:<path>`, and verifies the
+  referenced row exists AND belongs to the calling System (snapshot_file
+  additionally checks the path exists in `snapshot_files` for that
+  snapshot). Applied at the `done` transition's `evidence_refs`, a task's
+  `context_refs`, and a report's per-fact `evidence_refs`. `quality_sample:<id>`
+  and `improvement:<id>` are RESERVED P3/P4 ref formats (Sub 6 / #302 and
+  Sub 7 / #304 respectively) -- they parse but always fail closed with a
+  "not yet implemented" message; do not make them resolvable here.
+- Reports (P2, `submit_report`): `kind` outside `digest`/`escalation` is
+  rejected fail-closed, and any unknown request field is rejected by the
+  Pydantic `extra="forbid"` request model. `escalation` requires
+  `severity`; `digest` must not set one. `fact` / `interpretation` / `ask`
+  are stored as separate JSON columns -- raw evidence-backed facts are
+  never mixed with interpretation/ask text (Principle 7 discipline, even
+  though this module calls no reasoning model).
+- Idempotency: `delegate_task` and `submit_report` both accept an optional
+  `idempotency_key`; a resend with the same `(system_id, idempotency_key)`
+  returns the EXISTING row unchanged (`UNIQUE (system_id, idempotency_key)`
+  -- SQLite treats distinct NULLs as non-conflicting, so tasks/reports
+  without a key never collide with each other).
+- Goal cycle rejection (`would_create_cycle`) walks the parent chain
+  deterministically. There is no reparent endpoint at Sub 3 (only goal
+  creation and a status-only update), so the checker is exercised directly
+  in tests the same way #298 tests `validate_task_transition` directly --
+  it exists so a future reparent path can reuse it without adding a new
+  cycle-detection implementation.
+- This module has NO reasoning-model call anywhere (non-goal for #300):
+  orchestrator aggregation/triage is #301, quality sampling is #302,
+  improvement proposals are #304.
+- Tests: `tests/test_cell_tasks.py`.
