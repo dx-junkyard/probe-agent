@@ -5715,3 +5715,76 @@ class CellEscalationOut(BaseModel):
 class CellEscalationsListOut(BaseModel):
     system_id: int
     escalations: List[CellEscalationOut] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# 領域オーケストレーター / domain orchestrators (Issue #301, Sub 4 of the
+# Probe Cell Fabric epic, Issue #297). Core logic lives in
+# app/cell_orchestrator.py; these are the request/response shapes for
+# routes/cell_orchestrators.py.
+# ---------------------------------------------------------------------------
+
+
+class CellOrchestratorDigestOut(BaseModel):
+    """The deterministic digest -- ``digest`` is returned as a plain dict
+    (matching the existing ``CellStateOut.state`` / ``CellDetailOut.state``
+    pattern) rather than a rigid nested model, since its shape mirrors
+    ``app.cell_orchestrator.build_orchestrator_digest``'s return value."""
+
+    system_id: int
+    cell_id: str
+    digest: Dict[str, Any]
+
+
+class CellTriageResultOut(BaseModel):
+    id: int
+    system_id: int
+    intelligence_run_id: int
+    classification: str
+    reasoning_summary: str
+    affected_cell_ids: List[str] = Field(default_factory=list)
+    proposed_ask: str = ""
+    is_mock: bool = False
+    created_at: float
+
+
+class CellTriageResultsListOut(BaseModel):
+    system_id: int
+    cell_id: str
+    results: List[CellTriageResultOut] = Field(default_factory=list)
+
+
+class CellTriageRunOut(BaseModel):
+    """Response of ``POST /cell-fabric/orchestrators/{cell_id}/triage``. The
+    digest is always present (facts survive triage failure); ``triage`` is
+    ``None`` and ``triage_error`` is set on ANY triage failure -- there is no
+    heuristic classification fallback."""
+
+    system_id: int
+    cell_id: str
+    digest: Dict[str, Any]
+    triage: Optional[CellTriageResultOut] = None
+    triage_error: Optional[str] = None
+    is_mock: bool = False
+    intelligence_run_id: int
+
+
+class CellRosterUpdateIn(BaseModel):
+    """``roster`` is always a list here (possibly empty): this endpoint only
+    ever sets/changes an orchestrator's roster, it never converts a Cell
+    back into a roster-less worker."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    roster: List[str] = Field(default_factory=list)
+    changed_by: Optional[str] = None
+
+
+class CellRosterEventOut(BaseModel):
+    id: int
+    system_id: int
+    cell_definition_id: int
+    old_roster: Optional[List[str]] = None
+    new_roster: List[str] = Field(default_factory=list)
+    changed_by: Optional[str] = None
+    created_at: float

@@ -3128,6 +3128,58 @@ CREATE INDEX IF NOT EXISTS idx_cell_escalations_system
     ON cell_escalations (system_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_cell_escalations_status
     ON cell_escalations (system_id, status, id DESC);
+
+-- Probe Cell Fabric (Issue #297), Sub 4: 領域オーケストレーター (Issue #301).
+-- See app/cell_orchestrator.py for guardrail validation, the deterministic
+-- digest builder, and the reasoning triage; the "Probe Cell Fabric(Issue
+-- #297)" section of docs/project-intelligence.md for the full epic design.
+--
+-- cell_roster_events: append-only audit of every roster change made through
+-- the explicit PUT /cell-fabric/cells/{cell_id}/roster endpoint (creation is
+-- NOT audited here). old_roster_json is NULL when the cell had no roster
+-- before (a worker Cell becoming an orchestrator for the first time).
+CREATE TABLE IF NOT EXISTS cell_roster_events (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    cell_definition_id    INTEGER NOT NULL,
+    old_roster_json       TEXT,
+    new_roster_json       TEXT NOT NULL,
+    changed_by            TEXT,
+    created_at            REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (cell_definition_id) REFERENCES cell_definitions (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_roster_events_cell
+    ON cell_roster_events (system_id, cell_definition_id, id DESC);
+
+-- cell_triage_results: persisted reasoning triage output (individual vs
+-- systemic vs upstream vs inconclusive), kept separate from the
+-- deterministic digest_json snapshot it was computed from (Principle 7 --
+-- raw facts and interpretation stay separate fields even within one row).
+-- intelligence_run_id is NOT NULL: a row here is only ever written alongside
+-- a completed intelligence_runs row in the same transaction -- on ANY
+-- failure app/cell_orchestrator.py persists the failed run and writes no row
+-- here at all (fail-closed, no heuristic classification).
+CREATE TABLE IF NOT EXISTS cell_triage_results (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id               INTEGER NOT NULL,
+    cell_definition_id      INTEGER NOT NULL,
+    intelligence_run_id     INTEGER NOT NULL,
+    digest_json             TEXT NOT NULL,
+    classification          TEXT NOT NULL
+                                CHECK (classification IN ('individual', 'systemic', 'upstream', 'inconclusive')),
+    reasoning_summary       TEXT NOT NULL DEFAULT '',
+    affected_cell_ids_json  TEXT NOT NULL DEFAULT '[]',
+    proposed_ask            TEXT NOT NULL DEFAULT '',
+    created_at              REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (cell_definition_id) REFERENCES cell_definitions (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_triage_results_cell
+    ON cell_triage_results (system_id, cell_definition_id, id DESC);
 """
 
 

@@ -362,6 +362,21 @@ class MockLLMClient(LLMClient):
                     ],
                 }
             )
+        if "CELL_TRIAGE_RESPONSE_JSON" in joined:
+            return json.dumps(
+                {
+                    "classification": "individual",
+                    "reasoning_summary": (
+                        "Mock triage: no external LLM was called; this is "
+                        "deterministic mock output."
+                    ),
+                    "affected_cell_ids": [],
+                    "proposed_ask": (
+                        "Mock proposed ask -- review the digest facts manually "
+                        "before acting."
+                    ),
+                }
+            )
         if "REGRESSION_SCAFFOLD_RESPONSE_JSON" in joined:
             return json.dumps(
                 {

@@ -619,6 +619,16 @@ class TestCellApi:
         headers = _headers(token, system["id"])
         _create_card(admin_client, headers)
 
+        # Issue #301's guardrails require every roster member to already
+        # exist as a cell_definitions row in the same System.
+        for child in ("child-a", "child-b"):
+            r = admin_client.post(
+                "/cell-fabric/cells",
+                json=_cell_payload(cell_id=child),
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
         r = admin_client.post(
             "/cell-fabric/cells",
             json=_cell_payload(cell_id="orch-1", roster=["child-a", "child-b"]),

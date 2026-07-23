@@ -33,7 +33,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from .. import cell_binding
+from .. import cell_binding, cell_orchestrator
 from ..auth import Principal, get_system_id, require_user
 from ..cell_fabric import (
     AgentRoleCard,
@@ -335,6 +335,16 @@ def create_cell(
                 status_code=400,
                 detail="role_card_ref must resolve to an ACTIVE role card",
             )
+        # Orchestrator guardrails (Issue #301, Sub 4): roster size <= 7,
+        # every member must already exist in this System, no self-roster, no
+        # roster cycle, and nesting depth <= 3. A no-op (roster=None) for a
+        # worker Cell.
+        try:
+            cell_orchestrator.validate_roster(
+                conn, system_id=system_id, cell_id=payload.cell_id, roster=payload.roster,
+            )
+        except cell_orchestrator.ValidationFailedError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         conn.execute("BEGIN")
         try:
             cur = conn.execute(
