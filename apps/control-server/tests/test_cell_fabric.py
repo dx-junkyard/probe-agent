@@ -604,7 +604,13 @@ class TestCellApi:
         assert body["state"]["role_card"]["role_key"] == "worker-summarizer"
         assert body["state"]["role_card"]["model_alias"] == "worker-default"
         assert body["state"]["tasks"]["counts"]["todo"] == 0
-        assert body["state"]["health"] is None
+        # Issue #299 (Sub 2) fills the health block from real Trace/
+        # Cell-Activation facts on this same endpoint; with no traces or
+        # activations recorded yet every stat is None except queue_length
+        # (a real 0-count, not an absent fact).
+        assert body["state"]["health"]["heartbeat_at"] is None
+        assert body["state"]["health"]["queue_length"] == 0
+        assert body["state"]["health"]["error_rate"] is None
         assert body["state"]["orchestration"] is None
 
     def test_create_orchestrator_with_roster(self, admin_client):

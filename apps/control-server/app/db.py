@@ -2909,6 +2909,81 @@ CREATE TABLE IF NOT EXISTS cell_definitions (
 
 CREATE INDEX IF NOT EXISTS idx_cell_definitions_system
     ON cell_definitions (system_id, id DESC);
+
+-- Probe Cell Fabric (Issue #297), Sub 2: versioned Cell Binding and a
+-- read-only Probe Cell pilot (Issue #299). See app/cell_binding.py for the
+-- provenance/versioning/drift logic and the "Probe Cell Fabric(Issue #297)"
+-- section of docs/project-intelligence.md for the full design.
+--
+-- cell_bindings rows are append-only VERSIONS: creating a new binding for a
+-- Cell never UPDATEs the content of a prior version's row -- it inserts a
+-- new row with version = max(version)+1 and marks the previous
+-- active/stale/review_required row 'superseded' in the same transaction.
+-- provenance is exactly one of probe_point_id (an approved Probe Point) or
+-- probe_pattern_id (a Probe Pattern's saved point); both are nullable so
+-- either source can be recorded, but application logic (app/cell_binding.py)
+-- requires exactly one to be set.
+CREATE TABLE IF NOT EXISTS cell_bindings (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    cell_definition_id    INTEGER NOT NULL,
+    version               INTEGER NOT NULL,
+    snapshot_id           INTEGER NOT NULL,
+    commit_sha            TEXT NOT NULL,
+    path                  TEXT NOT NULL,
+    qualified_symbol      TEXT NOT NULL,
+    component_id          TEXT NOT NULL,
+    probe_point_id        INTEGER,
+    probe_pattern_id      INTEGER,
+    feature_refs_json     TEXT NOT NULL DEFAULT '[]',
+    capability_refs_json  TEXT NOT NULL DEFAULT '[]',
+    entrypoint_refs_json  TEXT NOT NULL DEFAULT '[]',
+    status                TEXT NOT NULL DEFAULT 'active'
+                              CHECK (status IN ('active', 'stale', 'review_required', 'superseded')),
+    status_reason         TEXT NOT NULL DEFAULT '',
+    created_at            REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (cell_definition_id) REFERENCES cell_definitions (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE RESTRICT,
+    FOREIGN KEY (probe_point_id) REFERENCES probe_points (id) ON DELETE SET NULL,
+    FOREIGN KEY (probe_pattern_id) REFERENCES probe_patterns (id) ON DELETE SET NULL,
+    UNIQUE (system_id, cell_definition_id, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_bindings_cell
+    ON cell_bindings (system_id, cell_definition_id, version DESC);
+
+CREATE INDEX IF NOT EXISTS idx_cell_bindings_status
+    ON cell_bindings (system_id, cell_definition_id, status);
+
+-- cell_activations: an audit record of when a Cell was invoked (explicit
+-- request or an aggregation-window trigger). This is NOT a per-trace LLM
+-- call log -- Sub 2 never invokes an LLM; used_llm defaults to 0 and there
+-- is no LLM execution path in this sub-issue at all (later subs may record
+-- used_llm=1 once an orchestrator/worker execution path exists).
+CREATE TABLE IF NOT EXISTS cell_activations (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    cell_definition_id    INTEGER NOT NULL,
+    trigger_kind          TEXT NOT NULL
+                              CHECK (trigger_kind IN ('explicit', 'aggregation_window')),
+    window_start          REAL,
+    window_end            REAL,
+    requested_by          TEXT,
+    used_llm              INTEGER NOT NULL DEFAULT 0,
+    intelligence_run_id   INTEGER,
+    status                TEXT NOT NULL DEFAULT 'recorded'
+                              CHECK (status IN ('recorded', 'completed', 'failed')),
+    detail                TEXT NOT NULL DEFAULT '',
+    created_at            REAL NOT NULL,
+    completed_at          REAL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (cell_definition_id) REFERENCES cell_definitions (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_activations_cell
+    ON cell_activations (system_id, cell_definition_id, id DESC);
 """
 
 

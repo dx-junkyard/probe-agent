@@ -1,21 +1,28 @@
 """Probe Cell Fabric API routes: Cell contract / Role Card / common state
-schema (Issue #298, Sub 1 of the Probe Cell Fabric epic, Issue #297).
+schema (Issue #298, Sub 1) plus versioned Cell Binding and the read-only
+Probe Cell pilot (Issue #299, Sub 2) of the Probe Cell Fabric epic
+(Issue #297).
 
-Only the contract-layer surface is implemented here: versioned Agent Role
-Cards, Cell Definitions (worker and orchestrator share one contract, roster
-presence is the only distinguisher), and a minimal ``cell_state`` document
-built from a Cell Definition alone. Goal/Task ledger persistence, Cell
-worker activation, and LLM-generated Role Cards are Issue #300 and later
-subs' scope -- not implemented here.
+Sub 1 (unchanged): versioned Agent Role Cards, Cell Definitions (worker and
+orchestrator share one contract, roster presence is the only distinguisher),
+and a minimal ``cell_state`` document built from a Cell Definition alone.
+
+Sub 2 adds: creating/listing versioned Cell Bindings from an approved Probe
+Point or a Probe Pattern point, deterministic drift re-evaluation against
+the latest ready snapshot, explicit/aggregation-window activation records,
+and a read-only Cell state endpoint (health + current binding + recent
+activations -- no LLM call anywhere on this path). Goal/Task ledger
+persistence, Cell worker execution, and LLM-generated Role Cards remain
+Issue #300 and later subs' scope -- not implemented here.
 
 probe-agent:
-  role: API boundary for Agent Role Card and Cell Definition lifecycle
+  role: API boundary for Agent Role Card / Cell Definition / Cell Binding / Cell Activation lifecycle
   capability: probe-cell-fabric
   element_type: boundary
   consumers: [dashboard]
   operation_kind: io
   state_effects: [database-read, database-write]
-  probe_value: Verify Role Card versions are append-only per (system_id, role_key, version), a Cell can only bind to an ACTIVE Role Card in its own System, and every table stays System-scoped.
+  probe_value: Verify Role Card versions are append-only per (system_id, role_key, version), a Cell can only bind to an ACTIVE Role Card in its own System, a Cell Binding can only be created from an approved Probe Point or a Probe Pattern point, binding versions are append-only with the prior version superseded, drift evaluation is purely structural, and every table stays System-scoped.
 """
 
 from __future__ import annotations
@@ -26,22 +33,43 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from .. import cell_binding
 from ..auth import Principal, get_system_id, require_user
 from ..cell_fabric import (
     AgentRoleCard,
     CellDefinitionContract,
-    build_minimal_cell_state,
 )
 from ..db import get_conn
+from ..state_facts import get_latest_ready_snapshot_id
 from ..models import (
     AgentRoleCardOut,
     AgentRoleCardsListOut,
+    CellActivationCreateIn,
+    CellActivationOut,
+    CellActivationsListOut,
+    CellBindingCreateIn,
+    CellBindingOut,
+    CellBindingsListOut,
     CellDefinitionOut,
     CellDetailOut,
     CellsListOut,
+    CellStateOut,
 )
 
 router = APIRouter()
+
+_BINDING_ERROR_STATUS = {
+    cell_binding.CellBindingNotFoundError: 404,
+    cell_binding.CellBindingConflictError: 409,
+    cell_binding.CellBindingValidationError: 422,
+}
+
+
+def _raise_binding_error(exc: cell_binding.CellBindingError) -> None:
+    for exc_type, status_code in _BINDING_ERROR_STATUS.items():
+        if isinstance(exc, exc_type):
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -353,23 +381,270 @@ def get_cell(
     cell_id: str,
     system_id: int = Depends(get_system_id),
 ) -> CellDetailOut:
-    """Return the Cell Definition plus a minimal ``cell_state`` document
-    built from the definition alone -- tasks/health/quality/improvement stay
-    empty/null at this phase (Issue #299 fills ``health`` from real
-    Trace/Evaluation/Shadow/Replay/Experiment facts)."""
+    """Return the Cell Definition plus its ``cell_state`` document, health
+    filled in from real Trace/Cell-Activation facts (Issue #299). No LLM
+    call is made anywhere on this path."""
     with get_conn() as conn:
         row = _get_cell_row(conn, cell_id, system_id)
         card_row = conn.execute(
             "SELECT * FROM agent_role_cards WHERE id = ?", (row["role_card_id"],),
         ).fetchone()
         definition = _cell_definition_out(conn, row)
-    roster = json.loads(row["roster_json"]) if row["roster_json"] is not None else None
-    state = build_minimal_cell_state(
-        cell_id=row["cell_id"],
-        role_key=card_row["role_key"],
-        role_version=card_row["version"],
-        model_alias=card_row["model_alias"],
-        mission=row["mission"] or card_row["mission"],
-        roster=roster,
-    )
+        state = cell_binding.build_cell_state(conn, system_id=system_id, cell_row=row, card_row=card_row)
     return CellDetailOut(definition=definition, state=state.model_dump())
+
+
+# ---------------------------------------------------------------------------
+# Cell Bindings (Issue #299, Sub 2)
+# ---------------------------------------------------------------------------
+
+
+def _binding_out(row) -> CellBindingOut:
+    return CellBindingOut(
+        id=row["id"],
+        system_id=row["system_id"],
+        cell_definition_id=row["cell_definition_id"],
+        cell_id=row["component_id"],
+        version=row["version"],
+        snapshot_id=row["snapshot_id"],
+        commit_sha=row["commit_sha"],
+        path=row["path"],
+        qualified_symbol=row["qualified_symbol"],
+        component_id=row["component_id"],
+        probe_point_id=row["probe_point_id"],
+        probe_pattern_id=row["probe_pattern_id"],
+        feature_refs=json.loads(row["feature_refs_json"] or "[]"),
+        capability_refs=json.loads(row["capability_refs_json"] or "[]"),
+        entrypoint_refs=json.loads(row["entrypoint_refs_json"] or "[]"),
+        status=row["status"],
+        status_reason=row["status_reason"],
+        created_at=row["created_at"],
+    )
+
+
+def _activation_out(row, cell_id: str) -> CellActivationOut:
+    return CellActivationOut(
+        id=row["id"],
+        system_id=row["system_id"],
+        cell_definition_id=row["cell_definition_id"],
+        cell_id=cell_id,
+        trigger_kind=row["trigger_kind"],
+        window_start=row["window_start"],
+        window_end=row["window_end"],
+        requested_by=row["requested_by"],
+        used_llm=bool(row["used_llm"]),
+        intelligence_run_id=row["intelligence_run_id"],
+        status=row["status"],
+        detail=row["detail"],
+        created_at=row["created_at"],
+        completed_at=row["completed_at"],
+    )
+
+
+def _latest_binding_row(conn, *, system_id: int, cell_definition_id: int):
+    return conn.execute(
+        """SELECT * FROM cell_bindings
+           WHERE system_id = ? AND cell_definition_id = ?
+           ORDER BY version DESC LIMIT 1""",
+        (system_id, cell_definition_id),
+    ).fetchone()
+
+
+def _current_binding_row(conn, *, system_id: int, cell_definition_id: int):
+    """The binding row currently considered "the" binding: the latest
+    non-superseded row if one exists, else the latest version of any
+    status (e.g. all versions superseded)."""
+    row = conn.execute(
+        """SELECT * FROM cell_bindings
+           WHERE system_id = ? AND cell_definition_id = ? AND status != 'superseded'
+           ORDER BY version DESC LIMIT 1""",
+        (system_id, cell_definition_id),
+    ).fetchone()
+    if row is not None:
+        return row
+    return _latest_binding_row(conn, system_id=system_id, cell_definition_id=cell_definition_id)
+
+
+@router.post(
+    "/cell-fabric/cells/{cell_id}/bindings",
+    response_model=CellBindingOut,
+    status_code=201,
+)
+def create_cell_binding(
+    cell_id: str,
+    payload: CellBindingCreateIn,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
+) -> CellBindingOut:
+    with get_conn() as conn:
+        cell_row = _get_cell_row(conn, cell_id, system_id)
+        try:
+            row = cell_binding.create_binding(
+                conn,
+                system_id=system_id,
+                cell_definition_id=cell_row["id"],
+                probe_point_id=payload.probe_point_id,
+                probe_pattern_point_id=payload.probe_pattern_point_id,
+                feature_refs=payload.feature_refs,
+                capability_refs=payload.capability_refs,
+                entrypoint_refs=payload.entrypoint_refs,
+            )
+        except cell_binding.CellBindingError as exc:
+            _raise_binding_error(exc)
+    return _binding_out(row)
+
+
+@router.get(
+    "/cell-fabric/cells/{cell_id}/bindings",
+    response_model=CellBindingsListOut,
+)
+def list_cell_bindings(
+    cell_id: str,
+    system_id: int = Depends(get_system_id),
+) -> CellBindingsListOut:
+    with get_conn() as conn:
+        cell_row = _get_cell_row(conn, cell_id, system_id)
+        rows = conn.execute(
+            """SELECT * FROM cell_bindings
+               WHERE system_id = ? AND cell_definition_id = ?
+               ORDER BY version DESC""",
+            (system_id, cell_row["id"]),
+        ).fetchall()
+    return CellBindingsListOut(
+        system_id=system_id, cell_id=cell_id,
+        bindings=[_binding_out(r) for r in rows],
+    )
+
+
+@router.post(
+    "/cell-fabric/cells/{cell_id}/bindings/refresh-drift",
+    response_model=CellBindingOut,
+)
+def refresh_cell_binding_drift(
+    cell_id: str,
+    system_id: int = Depends(get_system_id),
+) -> CellBindingOut:
+    """Re-evaluate the Cell's current binding against the latest ready
+    snapshot's ``code_symbols`` (purely structural, Principle 6). Never
+    creates a new binding version and never changes ``path`` /
+    ``qualified_symbol`` -- only ``status``/``status_reason`` may change."""
+    with get_conn() as conn:
+        cell_row = _get_cell_row(conn, cell_id, system_id)
+        binding_row = _current_binding_row(conn, system_id=system_id, cell_definition_id=cell_row["id"])
+        if binding_row is None:
+            raise HTTPException(status_code=404, detail="Cell has no binding yet")
+        if binding_row["status"] == "superseded":
+            raise HTTPException(
+                status_code=409,
+                detail="Cell's latest binding version has already been superseded",
+            )
+        latest_ready_snapshot_id = get_latest_ready_snapshot_id(conn, system_id)
+        new_status, reason = cell_binding.evaluate_binding_drift(
+            conn, system_id=system_id, binding_row=binding_row,
+            latest_ready_snapshot_id=latest_ready_snapshot_id,
+        )
+        conn.execute("BEGIN")
+        try:
+            conn.execute(
+                "UPDATE cell_bindings SET status = ?, status_reason = ? WHERE id = ?",
+                (new_status, reason, binding_row["id"]),
+            )
+            row = conn.execute(
+                "SELECT * FROM cell_bindings WHERE id = ?", (binding_row["id"],),
+            ).fetchone()
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return _binding_out(row)
+
+
+# ---------------------------------------------------------------------------
+# Cell Activations (Issue #299, Sub 2)
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/cell-fabric/cells/{cell_id}/activations",
+    response_model=CellActivationOut,
+    status_code=201,
+)
+def create_cell_activation(
+    cell_id: str,
+    payload: CellActivationCreateIn,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
+) -> CellActivationOut:
+    with get_conn() as conn:
+        cell_row = _get_cell_row(conn, cell_id, system_id)
+        try:
+            row = cell_binding.create_activation(
+                conn,
+                system_id=system_id,
+                cell_definition_id=cell_row["id"],
+                window_start=payload.window_start,
+                window_end=payload.window_end,
+                requested_by=payload.requested_by or _principal_label(principal),
+            )
+        except cell_binding.CellBindingError as exc:
+            _raise_binding_error(exc)
+    return _activation_out(row, cell_id)
+
+
+@router.get(
+    "/cell-fabric/cells/{cell_id}/activations",
+    response_model=CellActivationsListOut,
+)
+def list_cell_activations(
+    cell_id: str,
+    system_id: int = Depends(get_system_id),
+) -> CellActivationsListOut:
+    with get_conn() as conn:
+        cell_row = _get_cell_row(conn, cell_id, system_id)
+        rows = conn.execute(
+            """SELECT * FROM cell_activations
+               WHERE system_id = ? AND cell_definition_id = ?
+               ORDER BY id DESC""",
+            (system_id, cell_row["id"]),
+        ).fetchall()
+    return CellActivationsListOut(
+        system_id=system_id, cell_id=cell_id,
+        activations=[_activation_out(r, cell_id) for r in rows],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cell state (read-only pilot; Issue #299, Sub 2)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/cell-fabric/cells/{cell_id}/state",
+    response_model=CellStateOut,
+)
+def get_cell_state(
+    cell_id: str,
+    system_id: int = Depends(get_system_id),
+) -> CellStateOut:
+    """Read-only Probe Cell pilot state: ``cell_state`` (health filled in)
+    plus the current binding and recent activations. Deterministic only --
+    no LLM call is made anywhere on this path."""
+    with get_conn() as conn:
+        cell_row = _get_cell_row(conn, cell_id, system_id)
+        card_row = conn.execute(
+            "SELECT * FROM agent_role_cards WHERE id = ?", (cell_row["role_card_id"],),
+        ).fetchone()
+        state = cell_binding.build_cell_state(conn, system_id=system_id, cell_row=cell_row, card_row=card_row)
+        binding_row = _current_binding_row(conn, system_id=system_id, cell_definition_id=cell_row["id"])
+        activation_rows = conn.execute(
+            """SELECT * FROM cell_activations
+               WHERE system_id = ? AND cell_definition_id = ?
+               ORDER BY id DESC LIMIT 20""",
+            (system_id, cell_row["id"]),
+        ).fetchall()
+    return CellStateOut(
+        cell_id=cell_id,
+        state=state.model_dump(),
+        binding=_binding_out(binding_row) if binding_row is not None else None,
+        recent_activations=[_activation_out(r, cell_id) for r in activation_rows],
+    )

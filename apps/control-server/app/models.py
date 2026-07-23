@@ -5451,3 +5451,87 @@ class CellsListOut(BaseModel):
 class CellDetailOut(BaseModel):
     definition: CellDefinitionOut
     state: Dict[str, Any]
+
+
+# ---------------------------------------------------------------------------
+# Cell Binding / Activation (Issue #299, Sub 2 of the Probe Cell Fabric epic)
+# ---------------------------------------------------------------------------
+
+
+class CellBindingCreateIn(BaseModel):
+    """Exactly one of ``probe_point_id`` / ``probe_pattern_point_id`` must be
+    given; provenance is read from that row server-side, never accepted from
+    the caller."""
+
+    probe_point_id: Optional[int] = None
+    probe_pattern_point_id: Optional[int] = None
+    feature_refs: List[str] = Field(default_factory=list)
+    capability_refs: List[str] = Field(default_factory=list)
+    entrypoint_refs: List[str] = Field(default_factory=list)
+
+
+class CellBindingOut(BaseModel):
+    id: int
+    system_id: int
+    cell_definition_id: int
+    cell_id: str
+    version: int
+    snapshot_id: int
+    commit_sha: str
+    path: str
+    qualified_symbol: str
+    component_id: str
+    probe_point_id: Optional[int] = None
+    probe_pattern_id: Optional[int] = None
+    feature_refs: List[str] = Field(default_factory=list)
+    capability_refs: List[str] = Field(default_factory=list)
+    entrypoint_refs: List[str] = Field(default_factory=list)
+    status: str
+    status_reason: str
+    created_at: float
+
+
+class CellBindingsListOut(BaseModel):
+    system_id: int
+    cell_id: str
+    bindings: List[CellBindingOut] = Field(default_factory=list)
+
+
+class CellActivationCreateIn(BaseModel):
+    window_start: Optional[float] = None
+    window_end: Optional[float] = None
+    requested_by: Optional[str] = None
+
+
+class CellActivationOut(BaseModel):
+    id: int
+    system_id: int
+    cell_definition_id: int
+    cell_id: str
+    trigger_kind: str
+    window_start: Optional[float] = None
+    window_end: Optional[float] = None
+    requested_by: Optional[str] = None
+    used_llm: bool
+    intelligence_run_id: Optional[int] = None
+    status: str
+    detail: str
+    created_at: float
+    completed_at: Optional[float] = None
+
+
+class CellActivationsListOut(BaseModel):
+    system_id: int
+    cell_id: str
+    activations: List[CellActivationOut] = Field(default_factory=list)
+
+
+class CellStateOut(BaseModel):
+    """The read-only pilot state document: Sub 1's ``cell_state`` (with the
+    health block filled in) plus the current binding and recent activations
+    as sibling fields -- the ``cell_state`` schema itself is unchanged."""
+
+    cell_id: str
+    state: Dict[str, Any]
+    binding: Optional[CellBindingOut] = None
+    recent_activations: List[CellActivationOut] = Field(default_factory=list)
