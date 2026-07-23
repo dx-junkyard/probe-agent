@@ -2637,10 +2637,11 @@ CREATE INDEX IF NOT EXISTS idx_alignment_item_review_queue
 --   status:       pending | updating | updated | failed | stale
 -- base_revision_id is the understanding_revision id at enqueue time (NULL
 -- when the session has none yet); base_answer_marker is the enqueue
--- timestamp, the dedupe key input. result_revision_id/intelligence_run_id
--- link the job to the understanding rebuild it produced (Principle 7 audit
--- lineage: job -> intelligence_run -> understanding_revision is queryable
--- from these two columns). error carries either a failure message
+-- timestamp, the dedupe key input. result_revision_id identifies the
+-- revision used by the resulting Alignment build (newly generated for
+-- qa/alignment feedback, already persisted for intent/change-set updates);
+-- intelligence_run_id is set only when this job generated an Understanding
+-- review (Principle 7 audit lineage). error carries either a failure message
 -- (status='failed') or a fixed informational note (status='updated' with
 -- nothing new to apply, or status='stale' when superseded by a newer
 -- completed job) -- never LLM free text (Principle 6/7).

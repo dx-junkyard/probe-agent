@@ -262,6 +262,58 @@ def _load_qa_pairs(
     return answered_qa_pairs, unconfirmed_qa_pairs
 
 
+def _load_alignment_feedback(
+    conn, session_id: int, system_id: int
+) -> Optional[List[dict]]:
+    """Return explicit terminal Alignment decisions for a rebuild prompt.
+
+    Alignment rows are append-only history once terminal.  Read both current
+    and superseded rows so a later Q&A-triggered rebuild cannot regress a
+    correction that an earlier rebuild already incorporated.  ``held`` is a
+    workflow state, not substantive feedback, and therefore is excluded.
+    Newest decisions come first so the bounded prompt retains the most recent
+    human guidance if the serialized list must be trimmed.
+    """
+    rows = conn.execute(
+        """SELECT id, intent_summary, current_claim, gap_summary,
+                  proposed_interpretation, user_decision
+           FROM alignment_item
+           WHERE session_id = ? AND system_id = ?
+             AND status IN ('answered', 'corrected')
+             AND user_decision IS NOT NULL
+           ORDER BY updated_at DESC, id DESC
+           LIMIT 100""",
+        (session_id, system_id),
+    ).fetchall()
+
+    feedback: List[dict] = []
+    for row in rows:
+        try:
+            decision = json.loads(row["user_decision"])
+        except (TypeError, json.JSONDecodeError):
+            # Pre-migration/corrupt audit payloads are not reliable human
+            # evidence. Fail closed by omitting them rather than guessing.
+            continue
+        action = decision.get("action")
+        if action not in {
+            "accept_current", "needs_change", "reject_interpretation", "corrected",
+        }:
+            continue
+        feedback.append({
+            "alignment_item_id": row["id"],
+            "intent_summary": row["intent_summary"],
+            "current_claim": row["current_claim"],
+            "gap_summary": row["gap_summary"],
+            "proposed_interpretation": row["proposed_interpretation"],
+            "decision": {
+                "action": action,
+                "note": decision.get("note"),
+                "decided_at": decision.get("decided_at"),
+            },
+        })
+    return feedback or None
+
+
 def _question_entry(question) -> dict:
     """Normalize a turn question (structured object or legacy string) into
     the open_questions JSON entry shape."""
@@ -2837,6 +2889,9 @@ def _rebuild_understanding(conn, session, system_id: int) -> UnderstandingRebuil
     answered_qa_pairs, unconfirmed_qa_pairs = _load_qa_pairs(
         conn, session_id, system_id
     )
+    alignment_feedback = _load_alignment_feedback(
+        conn, session_id, system_id
+    )
 
     review = generate_understanding_review(
         client, config,
@@ -2845,6 +2900,7 @@ def _rebuild_understanding(conn, session, system_id: int) -> UnderstandingRebuil
         history=history or None,
         answered_qa=answered_qa_pairs,
         unconfirmed_qa=unconfirmed_qa_pairs or None,
+        alignment_feedback=alignment_feedback,
     )
 
     if review.error:

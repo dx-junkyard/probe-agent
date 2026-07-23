@@ -971,6 +971,130 @@ def test_answer_correct_hold_endpoints(admin_client, tmp_path, monkeypatch):
     assert r.json()["status"] == "held"
 
 
+def test_single_decision_endpoints_do_not_overwrite_terminal_decisions(
+    admin_client, tmp_path, monkeypatch,
+):
+    """A retry/stale tab may not replace an already terminal human call."""
+    import app.interview_refresh as refresh
+
+    monkeypatch.setattr(refresh, "request_refresh", lambda *args: None)
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _stub_build(monkeypatch, items=[
+        _proposal_item(current_claim="回答済み", risk_flags=["security"]),
+        _proposal_item(current_claim="修正済み", risk_flags=["security"]),
+    ])
+    items = admin_client.post(
+        f"/interview/sessions/{session_id}/alignment/build", headers=headers,
+    ).json()["items"]
+    answered_id, corrected_id = (item["id"] for item in items)
+
+    first_answer = admin_client.post(
+        f"/interview/alignment/{answered_id}/answer",
+        json={"decision": "needs_change", "note": "最初の判断"},
+        headers=headers,
+    )
+    assert first_answer.status_code == 200, first_answer.text
+    first_decision = first_answer.json()["user_decision"]
+
+    retry_answer = admin_client.post(
+        f"/interview/alignment/{answered_id}/answer",
+        json={"decision": "accept_current", "note": "上書き"},
+        headers=headers,
+    )
+    assert retry_answer.status_code == 409, retry_answer.text
+    assert retry_answer.json()["detail"]["code"] == "alignment_item_already_decided"
+
+    first_correct = admin_client.post(
+        f"/interview/alignment/{corrected_id}/correct",
+        json={"corrected_interpretation": "正しい解釈"},
+        headers=headers,
+    )
+    assert first_correct.status_code == 200, first_correct.text
+    retry_correct = admin_client.post(
+        f"/interview/alignment/{corrected_id}/correct",
+        json={"corrected_interpretation": "別の上書き"},
+        headers=headers,
+    )
+    assert retry_correct.status_code == 409, retry_correct.text
+    assert retry_correct.json()["detail"]["code"] == "alignment_item_already_decided"
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        answer_row = conn.execute(
+            "SELECT user_decision FROM alignment_item WHERE id = ?", (answered_id,),
+        ).fetchone()
+        correct_row = conn.execute(
+            "SELECT user_decision FROM alignment_item WHERE id = ?", (corrected_id,),
+        ).fetchone()
+    assert json.loads(answer_row["user_decision"]) == first_decision
+    assert json.loads(correct_row["user_decision"])["note"] == "正しい解釈"
+
+
+def test_single_decision_endpoints_reject_non_actionable_items(
+    admin_client, tmp_path, monkeypatch,
+):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _stub_build(monkeypatch, items=[
+        _proposal_item(
+            current_claim="確認不要",
+            alignment_state="aligned",
+            confidence="confirmed",
+        ),
+    ])
+    item_id = admin_client.post(
+        f"/interview/sessions/{session_id}/alignment/build", headers=headers,
+    ).json()["items"][0]["id"]
+
+    calls = [
+        ("answer", {"decision": "accept_current"}),
+        ("correct", {"corrected_interpretation": "修正"}),
+        ("hold", None),
+    ]
+    for suffix, payload in calls:
+        response = admin_client.post(
+            f"/interview/alignment/{item_id}/{suffix}",
+            json=payload,
+            headers=headers,
+        )
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == "alignment_item_not_actionable"
+
+
+def test_repeated_hold_is_idempotent_without_rewriting_audit_timestamp(
+    admin_client, tmp_path, monkeypatch,
+):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+    _stub_build(monkeypatch, items=[
+        _proposal_item(current_claim="保留対象", risk_flags=["security"]),
+    ])
+    item_id = admin_client.post(
+        f"/interview/sessions/{session_id}/alignment/build", headers=headers,
+    ).json()["items"][0]["id"]
+
+    first = admin_client.post(
+        f"/interview/alignment/{item_id}/hold", headers=headers,
+    )
+    second = admin_client.post(
+        f"/interview/alignment/{item_id}/hold", headers=headers,
+    )
+
+    assert first.status_code == second.status_code == 200
+    assert second.json()["user_decision"] == first.json()["user_decision"]
+    assert second.json()["updated_at"] == first.json()["updated_at"]
+
+
 def test_answer_rejects_invalid_decision_value(admin_client, tmp_path, monkeypatch):
     token, system_id, snapshot_id = _setup(admin_client, tmp_path)
     headers = _headers(token, system_id)
@@ -1668,6 +1792,71 @@ def test_changed_item_content_is_not_carried_over(admin_client, tmp_path, monkey
     assert fresh["review_category"] == "no_review_required"
     assert fresh["reason_code"] == "no_change"
     assert fresh["carried_over_from"] is None
+
+
+@pytest.mark.parametrize("decision", ["needs_change", "reject_interpretation"])
+def test_non_accept_answer_is_not_carried_over_as_unchanged(
+    admin_client, tmp_path, monkeypatch, decision,
+):
+    """3rd review round (Finding 1): only an 'accept_current' answer is a
+    carry-over origin. A 'needs_change' / 'reject_interpretation' answer is an
+    unresolved objection the rebuild has not folded back into the
+    Understanding, so an identical regeneration must NOT be marked
+    'unchanged' -- it stays actionable in the Review Queue instead of hiding
+    the human's objection."""
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _stub_build(monkeypatch, items=[_proposal_item(current_claim="変わらない項目", risk_flags=["security"])])
+    first = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+    item_id = first["items"][0]["id"]
+    admin_client.post(
+        f"/interview/alignment/{item_id}/answer",
+        json={"decision": decision, "note": "異議"}, headers=headers,
+    )
+
+    # Identical content re-proposed (same claim + every classification field).
+    _stub_build(monkeypatch, items=[_proposal_item(current_claim="変わらない項目", risk_flags=["security"])])
+    second = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+
+    fresh = next(it for it in second["items"] if it["id"] != item_id)
+    assert fresh["review_category"] != "unchanged"
+    assert fresh["review_category"] == "must_review"
+    assert fresh["carried_over_from"] is None
+
+    queue = admin_client.get(f"/interview/sessions/{session_id}/review-queue", headers=headers).json()
+    assert fresh["id"] in {it["id"] for it in queue["items"]}
+
+
+def test_corrected_item_is_not_carried_over_as_unchanged(admin_client, tmp_path, monkeypatch):
+    """3rd review round (Finding 1): a 'corrected' row is the human's own
+    edit, not an approval of the current understanding, so an identical
+    regeneration must not be marked 'unchanged' -- it returns to the
+    actionable queue rather than being silently dropped as 'no action'."""
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+
+    _stub_build(monkeypatch, items=[_proposal_item(current_claim="変わらない項目", risk_flags=["security"])])
+    first = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+    item_id = first["items"][0]["id"]
+    admin_client.post(
+        f"/interview/alignment/{item_id}/correct",
+        json={"corrected_interpretation": "私の解釈"}, headers=headers,
+    )
+
+    _stub_build(monkeypatch, items=[_proposal_item(current_claim="変わらない項目", risk_flags=["security"])])
+    second = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+
+    fresh = next(it for it in second["items"] if it["id"] != item_id)
+    assert fresh["review_category"] != "unchanged"
+    assert fresh["carried_over_from"] is None
+
+    queue = admin_client.get(f"/interview/sessions/{session_id}/review-queue", headers=headers).json()
+    assert fresh["id"] in {it["id"] for it in queue["items"]}
 
 
 def test_goal_change_in_batch_blocks_unchanged_carryover(admin_client, tmp_path, monkeypatch):

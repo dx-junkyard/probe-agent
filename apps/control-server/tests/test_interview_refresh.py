@@ -180,8 +180,10 @@ class _FakeReviewClient:
     def __init__(self, open_questions=None, fail=False):
         self._open_questions = open_questions or []
         self._fail = fail
+        self.calls = []
 
     def generate_text(self, messages, *, temperature=None, max_tokens=None):
+        self.calls.append(messages)
         if self._fail:
             return "not valid json"
         return json.dumps({
@@ -215,10 +217,9 @@ def _stub_understanding_review(monkeypatch, *, open_questions=None):
     monkeypatch.setenv("LLM_PROVIDER", "openai")
     monkeypatch.setenv("LLM_MODEL", "o3-mini")
     monkeypatch.setenv("OPENAI_API_KEY", "test")
-    monkeypatch.setattr(
-        interview_route, "create_llm_client",
-        lambda config: _FakeReviewClient(open_questions=open_questions),
-    )
+    client = _FakeReviewClient(open_questions=open_questions)
+    monkeypatch.setattr(interview_route, "create_llm_client", lambda config: client)
+    return client
 
 
 def _stub_understanding_review_failure(monkeypatch):
@@ -266,6 +267,25 @@ def _alignment_item(**overrides):
     )
     base.update(overrides)
     return base
+
+
+def _advance_to_confirmed_proposal_stage(client, headers, session_id):
+    for stage in [
+        "purpose_confirmation", "capability_confirmation", "element_classification",
+        "api_boundary_mapping", "probe_flow_selection", "proposal_generation",
+    ]:
+        response = client.post(
+            f"/interview/sessions/{session_id}/advance-stage",
+            json={"stage": stage},
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+    response = client.post(
+        f"/interview/sessions/{session_id}/confirm-understanding",
+        json={"actor": "root"},
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
 
 
 # --- 1. end-to-end: answer -> refresh job -> revision + alignment + status --
@@ -415,6 +435,30 @@ def test_dedupe_bounds_pending_jobs_during_updating(admin_client, tmp_path):
         ).fetchall()
     statuses = [r["status"] for r in rows]
     assert statuses == ["updating", "pending"]
+
+
+def test_pending_job_promotes_trigger_when_alignment_feedback_joins_batch(
+    admin_client, tmp_path, monkeypatch,
+):
+    """A deduped pending intent job must not hide later Alignment feedback."""
+    from app.db import get_conn
+    import app.interview_refresh as refresh
+
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    monkeypatch.setattr(refresh, "_dispatch", lambda job_id: None)
+
+    first_id = refresh.request_refresh(session_id, system_id, "intent_update")
+    second_id = refresh.request_refresh(session_id, system_id, "alignment_answer")
+
+    assert second_id == first_id
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT trigger_kind FROM interview_refresh_job WHERE id = ?",
+            (first_id,),
+        ).fetchone()
+    assert row["trigger_kind"] == "alignment_answer"
 
 
 # --- 4. stale: an older job finishing after a newer one is discarded ----
@@ -604,7 +648,150 @@ def test_concurrent_run_refresh_job_only_rebuilds_once(admin_client, tmp_path, m
     assert job_row["status"] == "updated"
 
 
-# --- 9. nothing new -> skip with a note, no rebuild ----------------------
+# --- 9. trigger-specific work after confirmation --------------------------
+
+
+def test_intent_update_rebuilds_alignment_without_regenerating_understanding(
+    admin_client, tmp_path, monkeypatch,
+):
+    """Intent is desired state: reuse the latest facts revision and rebuild
+    Alignment even when the Q&A-only Understanding gate is closed."""
+    import app.routes.interview as interview_route
+    from app.db import get_conn
+
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+
+    _stub_understanding_review(monkeypatch)
+    initial = admin_client.post(
+        f"/interview/sessions/{session_id}/update-understanding",
+        headers=headers,
+    )
+    assert initial.status_code == 200, initial.text
+    _advance_to_confirmed_proposal_stage(admin_client, headers, session_id)
+
+    created = admin_client.post(
+        f"/interview/sessions/{session_id}/intent",
+        json={"field": "goal", "value_text": "最初の目標"},
+        headers=headers,
+    )
+    assert created.status_code == 201, created.text
+
+    with get_conn() as conn:
+        revision_before = conn.execute(
+            """SELECT id FROM understanding_revision
+               WHERE session_id = ? ORDER BY id DESC LIMIT 1""",
+            (session_id,),
+        ).fetchone()["id"]
+
+    def fail_if_understanding_regenerates(_config):
+        raise AssertionError("intent_update must not regenerate Understanding")
+
+    monkeypatch.setattr(
+        interview_route, "create_llm_client", fail_if_understanding_regenerates,
+    )
+    _stub_alignment_build(monkeypatch, items=[_alignment_item(current_claim="目標更新後")])
+
+    corrected = admin_client.post(
+        f"/interview/intent/{created.json()['id']}/correct",
+        json={"value_text": "更新した目標"},
+        headers=headers,
+    )
+    assert corrected.status_code == 200, corrected.text
+
+    status = admin_client.get(
+        f"/interview/sessions/{session_id}/refresh-status", headers=headers,
+    ).json()["latest_job"]
+    assert status["trigger_kind"] == "intent_update"
+    assert status["status"] == "updated"
+    assert status["error"] is None
+    assert status["intelligence_run_id"] is None
+    assert status["result_revision_id"] == revision_before
+
+    alignment = admin_client.get(
+        f"/interview/sessions/{session_id}/alignment", headers=headers,
+    ).json()
+    claims = [
+        item["current_claim"]
+        for items in alignment["items_by_category"].values()
+        for item in items
+    ]
+    assert "目標更新後" in claims
+
+    with get_conn() as conn:
+        revision_after = conn.execute(
+            """SELECT id FROM understanding_revision
+               WHERE session_id = ? ORDER BY id DESC LIMIT 1""",
+            (session_id,),
+        ).fetchone()["id"]
+    assert revision_after == revision_before
+
+
+def test_alignment_correction_bypasses_qa_gate_and_reaches_reviewer_prompt(
+    admin_client, tmp_path, monkeypatch,
+):
+    """An explicit correction is human evidence even with no post-confirm
+    Q&A, so it must produce a new Understanding revision."""
+    from app.db import get_conn
+
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+
+    _stub_understanding_review(monkeypatch)
+    initial = admin_client.post(
+        f"/interview/sessions/{session_id}/update-understanding",
+        headers=headers,
+    )
+    assert initial.status_code == 200, initial.text
+    _advance_to_confirmed_proposal_stage(admin_client, headers, session_id)
+
+    _stub_alignment_build(monkeypatch, items=[
+        _alignment_item(
+            current_claim="認可は自動で行われる",
+            proposed_interpretation="追加の承認は不要",
+            risk_flags=["security"],
+        ),
+    ])
+    built = admin_client.post(
+        f"/interview/sessions/{session_id}/alignment/build", headers=headers,
+    )
+    assert built.status_code == 200, built.text
+    item_id = built.json()["items"][0]["id"]
+
+    with get_conn() as conn:
+        revision_before = conn.execute(
+            """SELECT id FROM understanding_revision
+               WHERE session_id = ? ORDER BY id DESC LIMIT 1""",
+            (session_id,),
+        ).fetchone()["id"]
+
+    review_client = _stub_understanding_review(monkeypatch)
+    corrected = admin_client.post(
+        f"/interview/alignment/{item_id}/correct",
+        json={"corrected_interpretation": "認可には運用者の明示承認が必要"},
+        headers=headers,
+    )
+    assert corrected.status_code == 200, corrected.text
+
+    assert review_client.calls
+    prompt = review_client.calls[0][1]["content"]
+    assert "Human Alignment Review Feedback" in prompt
+    assert "corrected" in prompt
+    assert "認可には運用者の明示承認が必要" in prompt
+    assert "追加の承認は不要" in prompt
+
+    status = admin_client.get(
+        f"/interview/sessions/{session_id}/refresh-status", headers=headers,
+    ).json()["latest_job"]
+    assert status["trigger_kind"] == "alignment_answer"
+    assert status["status"] == "updated"
+    assert status["intelligence_run_id"] is not None
+    assert status["result_revision_id"] > revision_before
+
+
+# --- 10. nothing new -> skip with a note, no rebuild ---------------------
 
 
 def test_refresh_skips_rebuild_when_nothing_new(admin_client, tmp_path, monkeypatch):

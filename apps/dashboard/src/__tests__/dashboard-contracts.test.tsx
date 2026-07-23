@@ -3233,7 +3233,14 @@ describe("Interview page", () => {
     };
   }
 
-  test("build 済みセッションでは Alignment Review が主領域に既定表示され、会話タブへ切り替えられる", async () => {
+  // 3rd review round (Finding 3): a proposal_review session (the default
+  // mockInterviewApi shape -- proposal_generation stage + a pending proposal)
+  // keeps its required next action (承認・却下・差分生成) in the conversation
+  // tab, so even when Alignment has been built the default main-area tab must
+  // stay on conversation, not Alignment Review -- otherwise the tab shown and
+  // the NextActionBanner's instruction point at different places. Alignment
+  // Review stays one click away, with the count surfaced on its tab label.
+  test("提案レビュー中の build 済みセッションでは既定が会話タブになり、Alignment Review タブへ切り替えられる", async () => {
     mockInterviewApi();
     const item = alignmentItem({ id: 1 });
     const baseGet = mockApi.get.getMockImplementation();
@@ -3266,23 +3273,82 @@ describe("Interview page", () => {
       </QueryClientProvider>,
     );
 
-    // Alignment Review is the default main-area view for a built session.
-    await screen.findByTestId("alignment-review-panel");
-    expect(await screen.findByTestId("review-queue-panel")).toBeInTheDocument();
-    expect(screen.getByTestId("main-tab-content-alignment")).toBeInTheDocument();
-    expect(screen.queryByTestId("main-tab-content-conversation")).not.toBeInTheDocument();
-    // The tab label surfaces the actionable count so the developer can see
-    // the overall volume before opening the tab.
-    expect(screen.getByTestId("main-tab-alignment")).toHaveTextContent("Alignment Review (1)");
-
-    // The conversation (focused question / free-form input) stays reachable
-    // via the other tab -- it is never removed, only demoted.
-    fireEvent.click(screen.getByTestId("main-tab-conversation"));
+    // The proposal review (a conversation-tab action) is the default view.
     expect(await screen.findByTestId("main-tab-content-conversation")).toBeInTheDocument();
     expect(screen.queryByTestId("main-tab-content-alignment")).not.toBeInTheDocument();
-    expect(screen.getByPlaceholderText(
-      /上の質問への回答や修正点を入力してください。|提案の対象範囲や重視したい観点があれば入力してください。/,
-    )).toBeInTheDocument();
+    // The tab label still surfaces the actionable Alignment count.
+    expect(screen.getByTestId("main-tab-alignment")).toHaveTextContent("Alignment Review (1)");
+
+    // Alignment Review stays reachable via its tab...
+    fireEvent.click(screen.getByTestId("main-tab-alignment"));
+    await screen.findByTestId("alignment-review-panel");
+    expect(await screen.findByTestId("main-tab-content-alignment")).toBeInTheDocument();
+    expect(screen.queryByTestId("main-tab-content-conversation")).not.toBeInTheDocument();
+
+    // ...but because the required proposal action still lives in the
+    // conversation tab, the banner offers a direct way back to it.
+    const goToConversation = await screen.findByTestId("next-action-go-to-conversation");
+    fireEvent.click(goToConversation);
+    expect(await screen.findByTestId("main-tab-content-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("main-tab-content-alignment")).not.toBeInTheDocument();
+  });
+
+  test("提案の必須操作が完了した build 済みセッションでは Alignment Review が自動既定になる", async () => {
+    const rejectedProposal = {
+      ...interviewProposal(),
+      approval_state: "rejected",
+    };
+    mockInterviewApi({ proposals: [rejectedProposal] });
+    const item = alignmentItem({ id: 2 });
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7/approved-set") {
+        return Promise.resolve({
+          session_id: 7,
+          system_id: 1,
+          snapshot_id: 42,
+          items: [],
+          total_proposals: 1,
+          approved_count: 0,
+          rejected_count: 1,
+          pending_count: 0,
+        });
+      }
+      if (path === "/interview/sessions/7/alignment") {
+        return Promise.resolve({
+          session_id: 7,
+          system_id: 1,
+          items_by_category: {
+            must_review: [item], batch_reviewable: [], no_review_required: [], unchanged: [], informational: [],
+          },
+          counts: { must_review: 1, batch_reviewable: 0, no_review_required: 0, unchanged: 0, informational: 0 },
+          outstanding_counts: { must_review: 1, batch_reviewable: 0, no_review_required: 0, unchanged: 0, informational: 0 },
+        });
+      }
+      if (path === "/interview/sessions/7/review-queue") {
+        return Promise.resolve({ session_id: 7, system_id: 1, items: [item] });
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByTestId("main-tab-content-alignment")).toBeInTheDocument();
+    expect(screen.queryByTestId("main-tab-content-conversation")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("next-action-go-to-conversation")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("main-tab-conversation"));
+    expect(await screen.findByTestId("main-tab-content-conversation")).toBeInTheDocument();
   });
 
   test("未 build のセッションでは会話が既定表示され、Alignment Review タブへ切り替えられる", async () => {
@@ -3438,8 +3504,13 @@ describe("Interview page", () => {
       </QueryClientProvider>,
     );
 
-    // Tab label count uses outstanding_counts (1), not counts (2).
+    // Tab label count uses outstanding_counts (1), not counts (2). The tab
+    // label is visible regardless of the active tab.
     expect(await screen.findByTestId("main-tab-alignment")).toHaveTextContent("Alignment Review (1)");
+
+    // This default session is in proposal_review, so the conversation tab is
+    // the default (Finding 3); open Alignment Review to inspect its summary.
+    fireEvent.click(screen.getByTestId("main-tab-alignment"));
 
     // AlignmentSummaryHeader shows the top outstanding gap's own text (not
     // the resolved item's stale gap text) plus the matching outstanding
@@ -3454,6 +3525,120 @@ describe("Interview page", () => {
     expect(await screen.findByTestId("review-queue-summary-must_review")).toHaveTextContent("要確認 1件");
     expect(screen.getByTestId("review-item-2")).toBeInTheDocument();
     expect(screen.queryByTestId("review-item-1")).not.toBeInTheDocument();
+  });
+
+  function intentItem(overrides: Record<string, unknown> & { field: string; value_text: string }) {
+    return {
+      id: 1, session_id: 7, system_id: 1,
+      status: "confirmed", origin: "user", source_statement: null,
+      decision_method: "manual", intelligence_run_id: null, is_mock: false,
+      superseded_by_id: null, created_at: 1, updated_at: 1,
+      ...overrides,
+    };
+  }
+
+  // 3rd review round (Finding 2): an unconfirmed AI-proposed goal must NOT be
+  // shown as "あなたが実現したいこと" (confirmed human intent). Issue #295's
+  // "AI推定と人間確認済み情報の区別" -- it is surfaced as an explicit
+  // unconfirmed candidate instead.
+  test("未確認のAI提案 goal は確定した『あなたが実現したいこと』として表示せず、未確認候補として明示する", async () => {
+    mockInterviewApi();
+    const proposedGoal = intentItem({
+      field: "goal", value_text: "AIが推定した目標", status: "proposed",
+      origin: "ai_proposed", decision_method: "reasoning_llm", intelligence_run_id: 3,
+    });
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7/intent") {
+        return Promise.resolve({ session_id: 7, system_id: 1, items_by_field: { goal: [proposedGoal] } });
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(await screen.findByTestId("main-tab-alignment"));
+
+    const proposed = await screen.findByTestId("alignment-summary-goal-proposed");
+    expect(proposed).toHaveTextContent("AIが推定した目標");
+    expect(proposed).toHaveTextContent("AI提案");
+    expect(proposed).toHaveTextContent("未確認");
+    // It is never rendered as the confirmed human intent.
+    expect(screen.queryByTestId("alignment-summary-goal-confirmed")).not.toBeInTheDocument();
+  });
+
+  test("却下済みのAI提案 goal は未確認候補として再表示しない", async () => {
+    mockInterviewApi();
+    const declinedGoal = intentItem({
+      field: "goal", value_text: "却下したAI目標", status: "not_applicable",
+      origin: "ai_proposed", decision_method: "manual", intelligence_run_id: 3,
+    });
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7/intent") {
+        return Promise.resolve({ session_id: 7, system_id: 1, items_by_field: { goal: [declinedGoal] } });
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(await screen.findByTestId("main-tab-alignment"));
+
+    const summary = await screen.findByTestId("alignment-summary-goal");
+    expect(summary).toHaveTextContent("未入力です");
+    expect(summary).not.toHaveTextContent("却下したAI目標");
+    expect(screen.queryByTestId("alignment-summary-goal-proposed")).not.toBeInTheDocument();
+  });
+
+  test("確認済みの goal は『あなたが実現したいこと』として確定表示する", async () => {
+    mockInterviewApi();
+    const confirmedGoal = intentItem({ field: "goal", value_text: "確定した目標" });
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7/intent") {
+        return Promise.resolve({ session_id: 7, system_id: 1, items_by_field: { goal: [confirmedGoal] } });
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(await screen.findByTestId("main-tab-alignment"));
+
+    const confirmed = await screen.findByTestId("alignment-summary-goal-confirmed");
+    expect(confirmed).toHaveTextContent("確定した目標");
+    expect(screen.queryByTestId("alignment-summary-goal-proposed")).not.toBeInTheDocument();
   });
 
   // PR #296 review restructure / previous reviewer's note (Finding 4): a

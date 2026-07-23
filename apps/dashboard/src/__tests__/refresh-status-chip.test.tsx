@@ -6,7 +6,7 @@
 //    マップして表示する。
 // 3. failed のときだけ「再試行」ボタンが表示され、押すと retry API を呼ぶ。
 
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { vi } from "vitest";
 import type { ReactNode } from "react";
@@ -141,6 +141,49 @@ describe("RefreshStatusChip", () => {
     fireEvent.click(retryButton);
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith("/interview/sessions/1/refresh-jobs/9/retry");
+    });
+  });
+
+  test("refreshes derived interview queries after the background job becomes terminal", async () => {
+    mockApi.get
+      .mockResolvedValueOnce(makeStatus("updating"))
+      .mockResolvedValueOnce(makeStatus("updated"));
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity }, mutations: { retry: false } },
+    });
+    const dependentKeys = [
+      ["interviewSession", 1, 1],
+      ["interviewSessions", 1],
+      ["interviewQa", 1, 1],
+      ["understandingRevisions", 1, 1],
+      ["understandingDiff", 1, 1],
+      ["alignment", 1, 1],
+      ["reviewQueue", 1, 1],
+    ];
+    for (const key of dependentKeys) qc.setQueryData(key, { old: true });
+
+    const { RefreshStatusChip } = await import("@/components/system-understanding/refresh-status-chip");
+    render(
+      <QueryClientProvider client={qc}>
+        <RefreshStatusChip sessionId={1} />
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByTestId("refresh-status-chip")).toHaveTextContent("更新中");
+    expect(
+      qc.getQueryState(["alignment", 1, 1])?.isInvalidated,
+    ).toBe(false);
+
+    await act(async () => {
+      await qc.invalidateQueries({ queryKey: ["refreshStatus", 1, 1] });
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("refresh-status-chip")).toHaveTextContent("更新済み");
+    });
+    await waitFor(() => {
+      for (const key of dependentKeys) {
+        expect(qc.getQueryState(key)?.isInvalidated).toBe(true);
+      }
     });
   });
 });
