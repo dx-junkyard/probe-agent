@@ -2846,6 +2846,69 @@ CREATE INDEX IF NOT EXISTS idx_question_handoff_session
 
 CREATE INDEX IF NOT EXISTS idx_question_handoff_system
     ON question_handoff (system_id, session_id);
+
+-- Probe Cell Fabric (Issue #297), Sub 1: Cell contract / Role Card / common
+-- state schema (Issue #298). See app/cell_fabric.py for the Pydantic
+-- contract layer and the "Probe Cell Fabric(Issue #297)" section of
+-- docs/project-intelligence.md for the full epic design.
+--
+-- agent_role_cards is versioned and append-only per (system_id, role_key,
+-- version): a new revision is always a new row (UNIQUE constraint below
+-- enforces no duplicate version), never an UPDATE of an existing version's
+-- content. Only `status` may be updated on an existing row (e.g. deprecate).
+-- This is a distinct table from the existing API Role Card display model
+-- (Issue #58) -- Agent Role Card declares a Cell's mission/scope/model
+-- alias/tool policy/acceptance template/rubric ref, never mixed with it.
+CREATE TABLE IF NOT EXISTS agent_role_cards (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                   INTEGER NOT NULL,
+    role_key                    TEXT NOT NULL,
+    version                     TEXT NOT NULL,
+    status                      TEXT NOT NULL DEFAULT 'draft'
+                                     CHECK (status IN ('draft', 'active', 'deprecated')),
+    mission                     TEXT NOT NULL,
+    scope_json                  TEXT NOT NULL DEFAULT '[]',
+    out_of_scope_json           TEXT NOT NULL DEFAULT '[]',
+    model_alias                 TEXT NOT NULL,
+    tool_policy_json            TEXT NOT NULL DEFAULT '{}',
+    acceptance_template_json    TEXT NOT NULL DEFAULT '[]',
+    rubric_ref                  TEXT,
+    changelog                   TEXT NOT NULL,
+    schema_version              TEXT NOT NULL,
+    decision_method             TEXT NOT NULL DEFAULT 'manual',
+    created_by                  TEXT,
+    created_at                  REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    UNIQUE (system_id, role_key, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_role_cards_system_role
+    ON agent_role_cards (system_id, role_key, id DESC);
+
+-- cell_definitions: one logical Probe Cell per row. roster_json NULL means a
+-- worker Cell; a non-null JSON array (possibly empty) means an orchestrator
+-- Cell -- there is no separate "kind" column, matching the shared
+-- cell_definition schema. role_card_id pins the Cell to one specific Role
+-- Card VERSION row (not just a role_key), so a Role Card revision never
+-- silently changes an already-bound Cell's behavior.
+CREATE TABLE IF NOT EXISTS cell_definitions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id       INTEGER NOT NULL,
+    cell_id         TEXT NOT NULL,
+    roster_json     TEXT,
+    role_card_id    INTEGER NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'dormant'
+                        CHECK (status IN ('active', 'dormant', 'retired')),
+    mission         TEXT NOT NULL DEFAULT '',
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (role_card_id) REFERENCES agent_role_cards (id) ON DELETE RESTRICT,
+    UNIQUE (system_id, cell_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_definitions_system
+    ON cell_definitions (system_id, id DESC);
 """
 
 

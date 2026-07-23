@@ -10,6 +10,7 @@ from .routes import (
     assistant,
     auth,
     candidate_studio,
+    cell_fabric,
     components,
     connectivity,
     diagnostics,
@@ -114,6 +115,7 @@ def create_app() -> FastAPI:
     app.include_router(question_router.router, dependencies=_auth)
     app.include_router(github_connections.router, dependencies=_auth)
     app.include_router(publish_jobs.router, dependencies=_auth)
+    app.include_router(cell_fabric.router, dependencies=_auth)
     return app
 
 

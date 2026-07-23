@@ -5394,3 +5394,60 @@ class CandidateEventOut(BaseModel):
 class CandidateEventsOut(BaseModel):
     session_id: int
     events: List[CandidateEventOut] = Field(default_factory=list)
+
+
+# --- Probe Cell Fabric (Issue #297), Sub 1: Cell contract / Role Card /
+# common state schema (Issue #298). Request bodies reuse the shared-schema
+# mirror models in app/cell_fabric.py directly (AgentRoleCard,
+# CellDefinitionContract) so FastAPI's own request validation enforces the
+# fail-closed unknown-field / enum / schema_version rules; these are only the
+# server-assigned "Out" projections (id, system_id, timestamps, audit
+# fields). See docs/project-intelligence.md's "Probe Cell Fabric(Issue
+# #297)" section.
+
+
+class AgentRoleCardOut(BaseModel):
+    id: int
+    system_id: int
+    role_key: str
+    version: str
+    status: str
+    mission: str
+    scope: List[str] = Field(default_factory=list)
+    out_of_scope: List[str] = Field(default_factory=list)
+    model_alias: str
+    tool_policy: Dict[str, Any] = Field(default_factory=dict)
+    acceptance_template: List[str] = Field(default_factory=list)
+    rubric_ref: Optional[str] = None
+    changelog: str
+    schema_version: str
+    decision_method: str
+    created_by: Optional[str] = None
+    created_at: float
+
+
+class AgentRoleCardsListOut(BaseModel):
+    system_id: int
+    role_cards: List[AgentRoleCardOut] = Field(default_factory=list)
+
+
+class CellDefinitionOut(BaseModel):
+    id: int
+    system_id: int
+    cell_id: str
+    roster: Optional[List[str]] = None
+    role_card_ref: Dict[str, str]
+    status: str
+    mission: str
+    created_at: float
+    updated_at: float
+
+
+class CellsListOut(BaseModel):
+    system_id: int
+    cells: List[CellDefinitionOut] = Field(default_factory=list)
+
+
+class CellDetailOut(BaseModel):
+    definition: CellDefinitionOut
+    state: Dict[str, Any]
