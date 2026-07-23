@@ -34,3 +34,6 @@ uv.lock
 *.db-journal
 *.db-wal
 *.db-shm
+
+# Claude Code agent worktrees (session artifacts, never committed)
+.claude/worktrees/
