@@ -853,3 +853,79 @@ section of `docs/project-intelligence.md` for the full epic design.
   orchestrator aggregation/triage is #301, quality sampling is #302,
   improvement proposals are #304.
 - Tests: `tests/test_cell_tasks.py`.
+
+## Probe Cell Fabric -- epic-wide map (issue #297, subs #298-#304)
+
+See the "Probe Cell Fabric(Issue #297)" section of
+`docs/project-intelligence.md` for the binding design. Module map:
+
+- `app/cell_fabric.py` (#298): shared-schema mirror models
+  (`extra="forbid"` fail-closed), `TASK_TRANSITIONS` /
+  `validate_task_transition` (done requires acceptance + evidence),
+  Role Card semver compat (same-major AND >= pinned), and
+  `resolve_model_alias` (`CELL_MODEL_ALIAS_<UPPER_ALIAS>` env,
+  `provider:model`; unset falls back to `intelligence_from_env`). Role
+  Cards never store literal provider/model names; changing the env value
+  never requires a card revision. Tables `agent_role_cards` (append-only
+  versions) / `cell_definitions` (roster_json NULL = worker, non-null =
+  orchestrator; no separate kind column).
+- `app/cell_binding.py` (#299): `cell_bindings` append-only versions from
+  APPROVED probe points / pattern points only; drift is purely structural
+  (`active`/`stale`/`review_required`, never re-binds); `build_cell_health`
+  aggregates traces/activations deterministically (unobserved = None).
+  `cell_activations` audits explicit/aggregation-window triggers; there is
+  no per-trace LLM path anywhere in the fabric.
+- `app/cell_tasks.py` (#300): see the dedicated section above.
+- `app/cell_orchestrator.py` (#301): roster guardrails (span <= 7,
+  depth <= 3, no self/cycle, members must exist; static rosters changed
+  only via `PUT .../roster` + `cell_roster_events` audit); deterministic
+  digest with finite bottleneck rules (queue_depth / stuck_task /
+  blocked_chain / retry_churn, facts attached); `run_triage` is the ONE
+  reasoning boundary (run_type `cell_triage`, fail-closed, facts survive
+  failure, roster-external affected ids rejected).
+- `app/cell_quality.py` (#302): quality sampling is a SEPARATE contract
+  from the SDK's lineage `sample_rate`. Deterministic stable-hash
+  stratified selection (rare strata guaranteed >= 1); audit VERDICT is
+  deterministic via `evaluator.py` (`pass`/`fail`/`no_criteria`), only the
+  failure explanation is reasoning_llm (fail-closed; verdict row survives
+  LLM failure); blind re-audits never read prior audit rows; quality-floor
+  breach suspends ONLY that cell's intake + sev1 escalation via
+  `cell_tasks.submit_report`; `cell_quality_usage` enforces the
+  System-scoped daily audit budget.
+- `app/cell_root.py` (#303): `GET /cell-fabric/root-digest` reuses
+  `system_state.build_system_state` as the canonical fact source (call it
+  BEFORE opening your own `get_conn` -- it manages its own connection);
+  4-level progressive disclosure (conclusion / key_points / evidence /
+  audit), sev1 -> conclusion, sev2 -> key_points, sev3 -> evidence,
+  sha256 dedupe with merged `sources`. `cell_asks` decisions are
+  `decision_method: manual`; `execution_approved` is ALWAYS 0 here --
+  proposal accept never executes anything. Dashboard page:
+  `apps/dashboard/src/pages/cell-fabric.tsx` (Japanese UI).
+- `app/cell_improvement.py` (#304): finite lifecycle `observed ->
+  proposed -> canary_ready -> canary_running -> adopted|rejected|blocked`
+  with append-only `cell_improvement_events` (rejected history never
+  deleted); canary evidence refs restricted to existing Replay /
+  Experiment / Evaluation rows (no new execution path); `adopted`
+  requires BOTH parent and human approval; role_card adoption re-pins
+  `cell_definitions.role_card_id` (rollback re-pins back);
+  candidate_patch adoption is a handoff marker only -- the real
+  adoption/publish flows through the existing #25/#216/#242/#252 gates.
+  `cell_shadow_decisions` keeps `shadow_proposal` and
+  `live_shadow_execution_approval` as separate manual records; approving
+  execution writes NO policy/candidate rows. Rubric changes are
+  parent-owned; >= 3 consecutive rejections auto-suspend the cell's
+  improvement rights.
+
+Cross-cutting rules for every fabric module:
+
+- `db.get_conn()`'s lock is NON-REENTRANT: pass `conn` into helpers, and
+  NEVER hold a connection across `generate_text` (the quota wrapper opens
+  its own connection) -- use the 3-phase read / LLM / write structure of
+  `cell_orchestrator.run_triage`.
+- All tables are System-scoped with isolation tests; all reasoning goes
+  through `intelligence_runs` fail-closed with `is_mock` surfaced; the
+  Probe SDK is never touched by fabric work.
+- Tests: `tests/test_cell_fabric.py`, `test_cell_binding.py`,
+  `test_cell_tasks.py`, `test_cell_orchestrator.py`,
+  `test_cell_quality.py`, `test_cell_root.py`,
+  `test_cell_improvement.py`.
