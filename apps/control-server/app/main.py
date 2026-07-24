@@ -13,6 +13,7 @@ from .routes import (
     cell_fabric,
     cell_orchestrators,
     cell_quality,
+    cell_root,
     cell_tasks,
     components,
     connectivity,
@@ -122,6 +123,7 @@ def create_app() -> FastAPI:
     app.include_router(cell_tasks.router, dependencies=_auth)
     app.include_router(cell_orchestrators.router, dependencies=_auth)
     app.include_router(cell_quality.router, dependencies=_auth)
+    app.include_router(cell_root.router, dependencies=_auth)
     return app
 
 

@@ -5910,3 +5910,56 @@ class CellIntakeStateOut(BaseModel):
     reason: str = ""
     escalation_id: Optional[int] = None
     changed_at: Optional[float] = None
+# Root Orchestrator と統合ダイジェスト (Issue #303, Sub 5 of the Probe Cell
+# Fabric epic, Issue #297). Core logic lives in app/cell_root.py; these are
+# the request/response shapes for routes/cell_root.py.
+# ---------------------------------------------------------------------------
+
+
+class CellRootDigestOut(BaseModel):
+    """The 4-level progressive-disclosure digest -- ``digest`` is returned as
+    a plain dict (same pattern as ``CellOrchestratorDigestOut.digest``) since
+    its shape mirrors ``app.cell_root.build_root_digest``'s return value
+    verbatim."""
+
+    system_id: int
+    digest: Dict[str, Any]
+    generated_at: float
+
+
+class CellAskSyncOut(BaseModel):
+    system_id: int
+    created: int
+    deduped: int
+
+
+class CellAskOut(BaseModel):
+    id: int
+    system_id: int
+    source_kind: str
+    source_id: int
+    cell_definition_id: Optional[str] = None
+    goal_id: Optional[int] = None
+    task_id: Optional[int] = None
+    ask_text: str
+    severity: str
+    status: str
+    decision: str = ""
+    decision_method: str = ""
+    decided_by: Optional[str] = None
+    decided_at: Optional[float] = None
+    execution_approved: bool = False
+    dedupe_key: str
+    created_at: float
+
+
+class CellAsksListOut(BaseModel):
+    system_id: int
+    asks: List[CellAskOut] = Field(default_factory=list)
+
+
+class CellAskDecideRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: str
+    note: str = ""

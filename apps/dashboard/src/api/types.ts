@@ -3573,3 +3573,113 @@ export interface CandidateEventsOut {
   session_id: number;
   events: CandidateEventOut[];
 }
+
+// ── Probe Cell Fabric: Root Orchestrator digest / Ask lifecycle (Issue #303) ──
+// The digest shape mirrors app.cell_root.build_root_digest's return value
+// verbatim (same pattern as the Sub 4 orchestrator digest); it is
+// deliberately loosely typed here since it is display-only and the Control
+// Server is the single source of truth for its exact contents.
+
+export interface CellAskDigestEntry {
+  kind: "escalation";
+  dedupe_key: string;
+  cell_id: string;
+  severity: "sev1" | "sev2" | "sev3";
+  summary: string;
+  evidence_refs: string[];
+  sources: number[];
+  created_at: number;
+}
+
+export interface CellOrchestratorKeyPoint {
+  type: "orchestrator";
+  cell_id: string;
+  progress: { by_cell: Record<string, Record<string, number>>; total: Record<string, number> };
+  escalations_open_by_severity: Record<string, number>;
+  bottleneck_candidates: Array<Record<string, unknown>>;
+  binding_stale: boolean;
+}
+
+export interface CellEscalationPendingKeyPoint extends CellAskDigestEntry {
+  type: "escalation_pending_decision";
+}
+
+export type CellRootKeyPoint = CellOrchestratorKeyPoint | CellEscalationPendingKeyPoint;
+
+export interface CellRootConclusion {
+  overall_severity: "ok" | "info" | "warning" | "blocked" | "error";
+  counts: {
+    orchestrators: number;
+    tasks: Record<string, number>;
+    escalations_open_by_severity: Record<string, number>;
+    asks_open: number;
+  };
+  top_risks: CellAskDigestEntry[];
+}
+
+export interface CellRootEvidence {
+  sev3_escalations: CellAskDigestEntry[];
+  tasks: Array<{ task_id: number; cell_id: string; evidence_refs: string[] }>;
+}
+
+export interface CellRootAudit {
+  generated_at: number;
+  system_state: {
+    generated_at: number;
+    overall_severity: string;
+    user_phase?: UserPhase;
+    primary_item: SystemStateItem | null;
+    items: SystemStateItem[];
+  };
+  is_stale: boolean;
+  stale_orchestrator_cell_ids: string[];
+  decision_method_notes: string;
+}
+
+export interface CellRootDigest {
+  generated_at: number;
+  conclusion: CellRootConclusion;
+  key_points: CellRootKeyPoint[];
+  evidence: CellRootEvidence;
+  audit: CellRootAudit;
+}
+
+export interface CellRootDigestOut {
+  system_id: number;
+  digest: CellRootDigest;
+  generated_at: number;
+}
+
+export type CellAskStatus = "open" | "accepted" | "held" | "rejected";
+export type CellAskDecision = "accepted" | "held" | "rejected";
+
+export interface CellAskOut {
+  id: number;
+  system_id: number;
+  source_kind: "escalation" | "triage" | "report";
+  source_id: number;
+  cell_definition_id: string | null;
+  goal_id: number | null;
+  task_id: number | null;
+  ask_text: string;
+  severity: "sev1" | "sev2" | "sev3";
+  status: CellAskStatus;
+  decision: string;
+  decision_method: string;
+  decided_by: string | null;
+  decided_at: number | null;
+  execution_approved: boolean;
+  dedupe_key: string;
+  created_at: number;
+}
+
+export interface CellAsksListOut {
+  system_id: number;
+  asks: CellAskOut[];
+}
+
+export interface CellAskSyncOut {
+  system_id: number;
+  created: number;
+  deduped: number;
+}

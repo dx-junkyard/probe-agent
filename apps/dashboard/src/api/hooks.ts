@@ -70,6 +70,7 @@ import type {
   BootstrapStatusOut,
   KnowledgeArea, HandoffOriginKind, HandoffPriority, HandoffStatus,
   QuestionHandoffListOut, QuestionHandoffOut, QuestionHandoffEvidenceRef,
+  CellRootDigestOut, CellAsksListOut, CellAskOut, CellAskSyncOut, CellAskDecision,
 } from "./types";
 
 export function sysKey(base: string, ...extra: unknown[]) {
@@ -2727,5 +2728,51 @@ export function usePromoteCandidateVersion() {
       api.post<CandidatePromotionOut>(`/candidate-versions/${versionId}/promote`),
     onSuccess: (_d, vars) =>
       qc.invalidateQueries({ queryKey: sysKey("candidateSession", vars.sessionId) }),
+  });
+}
+
+// ── Probe Cell Fabric: Root Orchestrator digest / Ask lifecycle (Issue #303) ──
+
+export function useCellRootDigest() {
+  return useQuery({
+    queryKey: sysKey("cellRootDigest"),
+    queryFn: () => api.get<CellRootDigestOut>("/cell-fabric/root-digest"),
+    enabled: !!getSystemId(),
+    staleTime: 10_000,
+  });
+}
+
+export function useCellAsks(status?: string) {
+  return useQuery({
+    queryKey: sysKey("cellAsks", status ?? "all"),
+    queryFn: () => api.get<CellAsksListOut>(
+      status ? `/cell-fabric/asks?status=${encodeURIComponent(status)}` : "/cell-fabric/asks",
+    ),
+    enabled: !!getSystemId(),
+  });
+}
+
+function invalidateCellFabric(qc: ReturnType<typeof useQueryClient>) {
+  qc.invalidateQueries({ queryKey: sysKey("cellRootDigest") });
+  qc.invalidateQueries({ queryKey: ["cellAsks"], exact: false });
+}
+
+export function useSyncCellAsks() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post<CellAskSyncOut>("/cell-fabric/asks/sync"),
+    onSuccess: () => invalidateCellFabric(qc),
+  });
+}
+
+export function useDecideCellAsk() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ askId, decision, note }: {
+      askId: number;
+      decision: CellAskDecision;
+      note?: string;
+    }) => api.post<CellAskOut>(`/cell-fabric/asks/${askId}/decide`, { decision, note: note ?? "" }),
+    onSuccess: () => invalidateCellFabric(qc),
   });
 }

@@ -3302,6 +3302,57 @@ CREATE TABLE IF NOT EXISTS cell_quality_usage (
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
     UNIQUE (system_id, day)
 );
+-- Probe Cell Fabric (Issue #297), Sub 5: Root Orchestrator と統合ダイジェスト
+-- (Issue #303). See app/cell_root.py for the deterministic digest builder and
+-- ask lifecycle, and the "Probe Cell Fabric(Issue #297)" section of
+-- docs/project-intelligence.md for the full epic design.
+--
+-- cell_asks: a human-decidable Ask surfaced by the root digest, created from
+-- (a) an open sev1/sev2 cell_escalations row or (b) a cell_triage_results row
+-- with a non-empty proposed_ask. source_kind + source_id together identify
+-- the originating row (report is reserved for a future source kind; this Sub
+-- only ever writes 'escalation' or 'triage'). dedupe_key makes re-sync
+-- idempotent (UNIQUE with system_id) -- re-running sync_asks_from_sources
+-- never creates a duplicate row for the same source.
+--
+-- execution_approved ALWAYS stays 0 in this Sub: deciding an Ask ('accepted'
+-- | 'held' | 'rejected') records decision_method='manual' and flows back into
+-- the Goal/Task ledger (unblocking a blocked task, acknowledging the source
+-- escalation), but it is a PROPOSAL-ACCEPT record, never an EXECUTION-APPROVE
+-- record -- no policy change, candidate deploy, or patch apply is triggered
+-- here. Execution approval is #304's and the existing #25/#216/#242/#252
+-- gates' domain; this column exists so a later Sub can distinguish the two
+-- without a schema change, but nothing in this Sub ever sets it to 1.
+CREATE TABLE IF NOT EXISTS cell_asks (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    source_kind           TEXT NOT NULL CHECK (source_kind IN ('escalation', 'triage', 'report')),
+    source_id             INTEGER NOT NULL,
+    cell_definition_id    INTEGER,
+    goal_id               INTEGER,
+    task_id               INTEGER,
+    ask_text              TEXT NOT NULL,
+    severity              TEXT NOT NULL DEFAULT 'sev2' CHECK (severity IN ('sev1', 'sev2', 'sev3')),
+    status                TEXT NOT NULL DEFAULT 'open'
+                              CHECK (status IN ('open', 'accepted', 'held', 'rejected')),
+    decision              TEXT NOT NULL DEFAULT '',
+    decision_method       TEXT NOT NULL DEFAULT '',
+    decided_by            TEXT,
+    decided_at            REAL,
+    execution_approved    INTEGER NOT NULL DEFAULT 0,
+    dedupe_key            TEXT NOT NULL,
+    created_at            REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (cell_definition_id) REFERENCES cell_definitions (id) ON DELETE SET NULL,
+    FOREIGN KEY (goal_id) REFERENCES cell_goals (id) ON DELETE SET NULL,
+    FOREIGN KEY (task_id) REFERENCES cell_tasks (id) ON DELETE SET NULL,
+    UNIQUE (system_id, dedupe_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_asks_system
+    ON cell_asks (system_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_cell_asks_status
+    ON cell_asks (system_id, status, id DESC);
 """
 
 

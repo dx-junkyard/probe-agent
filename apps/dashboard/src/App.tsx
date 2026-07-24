@@ -23,6 +23,7 @@ import AdminPage from "./pages/admin";
 import WorkspacesPage from "./pages/workspaces";
 import SystemUnderstandingPage from "./pages/system-understanding";
 import GithubPage from "./pages/github";
+import CellFabricPage from "./pages/cell-fabric";
 
 export default function App() {
   return (
@@ -49,6 +50,7 @@ export default function App() {
         <Route path="candidate-studio" element={<CandidateStudioPage />} />
         <Route path="workspaces" element={<WorkspacesPage />} />
         <Route path="github" element={<GithubPage />} />
+        <Route path="cell-fabric" element={<CellFabricPage />} />
         <Route path="settings" element={<SettingsPage />} />
         <Route path="admin" element={<AdminPage />} />
       </Route>
