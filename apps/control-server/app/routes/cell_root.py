@@ -104,7 +104,13 @@ def get_root_digest(system_id: int = Depends(get_system_id)) -> CellRootDigestOu
 
 
 @router.post("/cell-fabric/asks/sync", response_model=CellAskSyncOut)
-def sync_asks(system_id: int = Depends(get_system_id)) -> CellAskSyncOut:
+def sync_asks(
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
+) -> CellAskSyncOut:
+    # A state-changing management operation: it materializes cell_asks rows.
+    # Require a user session, same as decide_ask -- SDK API tokens and the
+    # anonymous compat mode are data-plane only and must not mutate this.
     with get_conn() as conn:
         result = cell_root.sync_asks_from_sources(conn, system_id=system_id)
     return CellAskSyncOut(system_id=system_id, created=result["created"], deduped=result["deduped"])

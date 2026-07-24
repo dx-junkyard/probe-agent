@@ -6075,6 +6075,7 @@ class CellImprovementTransitionIn(BaseModel):
     new_status: str
     canary_evidence_refs: Optional[List[str]] = None
     proposed_role_card_version: Optional[str] = None
+    allow_major_bump: bool = False
     detail: str = ""
     actor: Optional[str] = None
 

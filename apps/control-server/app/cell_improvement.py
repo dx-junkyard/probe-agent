@@ -105,7 +105,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from . import cell_fabric, cell_tasks
 from .db import get_conn
-from .llm import LLMConfig, LLMError, create_llm_client, is_reasoning_model
+from .llm import (
+    LLMConfig,
+    LLMError,
+    LLMResourceLimitError,
+    create_llm_client,
+    is_reasoning_model,
+)
 
 CELL_IMPROVEMENT_DRAFT_PROMPT_VERSION = "v1"
 CELL_IMPROVEMENT_DRAFT_SCHEMA_VERSION = "v1"
@@ -540,7 +546,7 @@ def draft_improvement(
             max_tokens=1024,
         )
         drafted = _parse_improvement_draft_response(raw)
-    except (LLMError, ValidationFailedError, json.JSONDecodeError) as exc:
+    except (LLMError, LLMResourceLimitError, ValidationFailedError, json.JSONDecodeError) as exc:
         error = str(exc)
     completed_at = time.time()
 
@@ -639,12 +645,41 @@ def list_shadow_decisions(conn, system_id: int, improvement_id: int):
 
 
 def _validate_canary_ref(conn, system_id: int, ref: str) -> None:
-    if not isinstance(ref, str) or not _CANARY_REF_RE.match(ref):
+    match = _CANARY_REF_RE.match(ref) if isinstance(ref, str) else None
+    if match is None:
         raise ValidationFailedError(
             "canary evidence ref must be replay_run:<id> / experiment:<id> / "
             f"evaluation:<id>: {ref!r}"
         )
+    # Existence + System ownership (shared resolver, no new execution path).
     _resolve_evidence_ref(conn, system_id, ref)
+    # Beyond existence, canary evidence must come from a run that ACTUALLY
+    # completed successfully -- an un-run/failed replay or experiment is not
+    # evidence (Principle 6, a deterministic structural gate). An
+    # ``evaluation:<id>`` is an already-terminal ``evaluation_results`` row
+    # (produced only after an evaluation runs), so its existence is the
+    # completion signal.
+    kind, raw_id = match.group(1), match.group(2)
+    if kind == "replay_run":
+        status = conn.execute(
+            "SELECT status FROM replay_runs WHERE id = ? AND system_id = ?",
+            (raw_id, system_id),
+        ).fetchone()
+        if status is None or status["status"] != "completed":
+            raise ValidationFailedError(
+                f"canary evidence {ref!r} is not a completed replay run "
+                f"(status={status['status'] if status else 'missing'!r})"
+            )
+    elif kind == "experiment":
+        status = conn.execute(
+            "SELECT status FROM experiments WHERE id = ? AND system_id = ?",
+            (raw_id, system_id),
+        ).fetchone()
+        if status is None or status["status"] != "completed":
+            raise ValidationFailedError(
+                f"canary evidence {ref!r} is not a completed experiment "
+                f"(status={status['status'] if status else 'missing'!r})"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -690,6 +725,7 @@ def transition_improvement(
     new_status: str,
     canary_evidence_refs: Optional[List[str]] = None,
     proposed_role_card_version: Optional[str] = None,
+    allow_major_bump: bool = False,
     detail: str = "",
     actor: Optional[str] = None,
 ):
@@ -721,6 +757,47 @@ def transition_improvement(
             _check_rubric_ownership(conn, system_id, row, proposed_role_card_version)
         updated_role_card_version = proposed_role_card_version
 
+    # An approval is granted against a SPECIFIC proposed version + canary
+    # evidence set. If either changes after an approval was recorded, the
+    # approval no longer covers what would be adopted, so it is invalidated
+    # (must be re-granted). This closes the "swap the content after approval,
+    # then adopt" gap (Principle 7: the approval is the manual decision on a
+    # concrete proposal, not a blank cheque).
+    content_changed = (
+        updated_role_card_version != row["proposed_role_card_version"]
+        or updated_evidence != existing_evidence
+    )
+    had_approval = bool(
+        row["parent_approved_by"] or row["human_approved_by"]
+    )
+    invalidate_approvals = content_changed and had_approval
+
+    # Eagerly void the approvals the moment the proposed content changes, in
+    # its own committed transaction -- so even if the current transition is
+    # then refused (e.g. an adopt that changed the version), the stale
+    # approval is gone and must be re-granted against the new proposal.
+    if invalidate_approvals:
+        conn.execute("BEGIN")
+        try:
+            conn.execute(
+                """UPDATE cell_improvements
+                       SET parent_approved_by = NULL, parent_approved_at = NULL,
+                           human_approved_by = NULL, human_approved_at = NULL
+                   WHERE id = ?""",
+                (improvement_id,),
+            )
+            _write_event(
+                conn, system_id=system_id, improvement_id=improvement_id,
+                event_type="approvals_invalidated", from_status=current, to_status=current,
+                actor=actor,
+                detail="proposed role card version or canary evidence changed "
+                       "after approval; parent/human approvals invalidated",
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
     if new_status == "proposed":
         _require_hypothesis_fields(row)
 
@@ -735,15 +812,19 @@ def transition_improvement(
     event_detail_payload: Optional[Dict[str, Any]] = None
 
     if new_status == "adopted":
-        if not (row["parent_approved_by"] and row["parent_approved_at"]):
+        # An approval about to be invalidated by this same call's content
+        # change cannot satisfy the adoption gate.
+        parent_ok = bool(row["parent_approved_by"] and row["parent_approved_at"]) and not invalidate_approvals
+        human_ok = bool(row["human_approved_by"] and row["human_approved_at"]) and not invalidate_approvals
+        if not parent_ok:
             raise ConflictError(
                 f"Improvement {improvement_id} cannot be adopted without a "
-                "recorded parent approval"
+                "recorded parent approval covering the current proposal"
             )
-        if not (row["human_approved_by"] and row["human_approved_at"]):
+        if not human_ok:
             raise ConflictError(
                 f"Improvement {improvement_id} cannot be adopted without a "
-                "recorded human approval"
+                "recorded human approval covering the current proposal"
             )
         if row["target_kind"] == "role_card":
             if not updated_role_card_version:
@@ -758,12 +839,29 @@ def transition_improvement(
             candidate_card = _resolve_candidate_card(
                 conn, system_id, pinned_card["role_key"], updated_role_card_version,
             )
+            # A draft/deprecated card must never be adopted onto a live Cell
+            # (deterministic structural gate).
+            if candidate_card["status"] != "active":
+                raise ConflictError(
+                    "cannot adopt a role card whose status is "
+                    f"{candidate_card['status']!r}; only an 'active' card may "
+                    "be adopted"
+                )
             try:
                 compatible = cell_fabric.role_card_versions_compatible(
                     pinned_card["version"], candidate_card["version"],
                 )
             except cell_fabric.CellContractError as exc:
                 raise ValidationFailedError(str(exc))
+            # An incompatible (major) bump is only adopted when the caller
+            # explicitly intends it -- otherwise fail closed instead of
+            # silently recording 'major_bump' and proceeding.
+            if not compatible and not allow_major_bump:
+                raise ConflictError(
+                    f"proposed role card {candidate_card['version']!r} is not "
+                    f"semver-compatible with the pinned {pinned_card['version']!r}; "
+                    "pass allow_major_bump=true to adopt an intentional major bump"
+                )
             compat_label = "compatible" if compatible else "major_bump"
             new_cell_role_card_id = candidate_card["id"]
             event_detail_payload = {
@@ -930,6 +1028,21 @@ def rollback_role_card(conn, *, system_id: int, improvement_id: int, actor: Opti
             "role card recorded"
         )
     previous_role_card_id = adoption["previous_role_card_id"]
+    # Only roll back if this improvement's adopted card is STILL the Cell's
+    # pinned card. If a later improvement was adopted after this one, its
+    # newer card is live -- blindly restoring this improvement's predecessor
+    # would clobber that newer adoption.
+    cell_row = conn.execute(
+        "SELECT role_card_id FROM cell_definitions WHERE id = ? AND system_id = ?",
+        (row["cell_definition_id"], system_id),
+    ).fetchone()
+    adopted_card_id = adoption.get("new_role_card_id")
+    if cell_row is None or cell_row["role_card_id"] != adopted_card_id:
+        raise ConflictError(
+            f"Improvement {improvement_id} cannot be rolled back: a newer role "
+            "card adoption has superseded it (the Cell no longer pins this "
+            "improvement's adopted card)"
+        )
     now = time.time()
     conn.execute("BEGIN")
     try:
@@ -1010,6 +1123,31 @@ def request_live_shadow_approval(
         raise ConflictError(
             "live shadow execution approval requires an already-approved "
             "shadow_proposal"
+        )
+    # Replay-first (Principle 5/8, #242): the current SDK in-process live
+    # shadow does not isolate candidate side effects, so a live shadow may
+    # only be REQUESTED after an isolated Replay / offline shadow has actually
+    # run. Deterministic structural gate: the improvement must carry at least
+    # one completed replay_run canary ref.
+    replay_refs = [
+        ref for ref in json.loads(row["canary_evidence_json"] or "[]")
+        if isinstance(ref, str) and ref.startswith("replay_run:")
+    ]
+    has_completed_replay = False
+    for ref in replay_refs:
+        raw_id = ref.split(":", 1)[1]
+        status = conn.execute(
+            "SELECT status FROM replay_runs WHERE id = ? AND system_id = ?",
+            (raw_id, system_id),
+        ).fetchone()
+        if status is not None and status["status"] == "completed":
+            has_completed_replay = True
+            break
+    if not has_completed_replay:
+        raise ConflictError(
+            "live shadow execution approval requires replay-first evidence: "
+            "at least one completed isolated Replay run (replay_run:<id>) must "
+            "be recorded as canary evidence before live shadow is requested"
         )
     now = time.time()
     conn.execute("BEGIN")

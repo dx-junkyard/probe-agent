@@ -294,6 +294,7 @@ def transition_improvement(
                 new_status=payload.new_status,
                 canary_evidence_refs=payload.canary_evidence_refs,
                 proposed_role_card_version=payload.proposed_role_card_version,
+                allow_major_bump=payload.allow_major_bump,
                 detail=payload.detail, actor=payload.actor,
             )
         except cell_improvement.CellImprovementError as exc:

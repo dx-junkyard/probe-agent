@@ -207,7 +207,7 @@ def _insert_replay_run(system_id, snapshot_id, component_id="comp-1"):
     )
 
 
-def _insert_experiment(system_id, snapshot_id, feature_id="feat-1"):
+def _insert_experiment(system_id, snapshot_id, feature_id="feat-1", status="completed"):
     now = time.time()
     return _insert_row(
         system_id,
@@ -220,7 +220,7 @@ def _insert_experiment(system_id, snapshot_id, feature_id="feat-1"):
             "baseline_commit": "deadbeef",
             "config_revision": "1",
             "execution_config": "{}",
-            "status": "draft",
+            "status": status,
             "created_at": now,
         },
     )
@@ -372,16 +372,28 @@ def _resume(client, headers, cell_id):
     return client.post(f"/cell-fabric/cells/{cell_id}/improvements/resume", headers=headers)
 
 
-def _advance_to_canary_running(client, headers, cell_id, evidence_refs, target_kind="role_card"):
+def _advance_to_canary_running(
+    client, headers, cell_id, evidence_refs, target_kind="role_card",
+    proposed_role_card_version=None,
+):
     """Create a fully-specified manual improvement and advance it through
     observed -> proposed -> canary_ready -> canary_running. Returns the
-    improvement id."""
+    improvement id.
+
+    ``proposed_role_card_version`` is pinned at the ``canary_ready`` step --
+    i.e. BEFORE approval -- so that a later parent/human approval covers the
+    exact proposed version (Issue #304 P1-2: changing the proposed version
+    after approval invalidates the approval)."""
     r = _full_hypothesis_manual(client, headers, cell_id, target_kind=target_kind)
     assert r.status_code == 201, r.text
     improvement_id = r.json()["id"]
     r = _transition(client, headers, improvement_id, "proposed")
     assert r.status_code == 200, r.text
-    r = _transition(client, headers, improvement_id, "canary_ready", canary_evidence_refs=evidence_refs)
+    r = _transition(
+        client, headers, improvement_id, "canary_ready",
+        canary_evidence_refs=evidence_refs,
+        proposed_role_card_version=proposed_role_card_version,
+    )
     assert r.status_code == 200, r.text
     r = _transition(client, headers, improvement_id, "canary_running")
     assert r.status_code == 200, r.text
@@ -647,16 +659,17 @@ class TestApprovalsAndAdoption:
 
         snapshot_id = _insert_snapshot(system["id"])
         experiment_id = _insert_experiment(system["id"], snapshot_id)
+        # Pin the proposed version BEFORE approval so the approval covers it
+        # (P1-2). Adoption then does not change the proposed content.
         improvement_id = _advance_to_canary_running(
             admin_client, headers, cell_id, [f"experiment:{experiment_id}"],
-            target_kind="role_card",
+            target_kind="role_card", proposed_role_card_version="1.1.0",
         )
         _parent_approve(admin_client, headers, improvement_id)
         _human_approve(admin_client, headers, improvement_id)
 
         r = _transition(
             admin_client, headers, improvement_id, "adopted",
-            proposed_role_card_version="1.1.0",
         )
         assert r.status_code == 200, r.text
         body = r.json()
@@ -771,6 +784,16 @@ class TestShadowGates:
         improvement_id = r.json()["id"]
         _transition(admin_client, headers, improvement_id, "proposed")
 
+        # Replay-first (P1-5): a completed isolated Replay run must back the
+        # improvement before a live shadow may be requested.
+        snapshot_id = _insert_snapshot(system["id"])
+        replay_run_id = _insert_replay_run(system["id"], snapshot_id, component_id=cell_id)
+        r = _transition(
+            admin_client, headers, improvement_id, "canary_ready",
+            canary_evidence_refs=[f"replay_run:{replay_run_id}"],
+        )
+        assert r.status_code == 200, r.text
+
         r = _propose_shadow(admin_client, headers, improvement_id, note="proposal note")
         assert r.status_code == 201, r.text
         proposal = r.json()
@@ -822,6 +845,14 @@ class TestShadowGates:
         r = _full_hypothesis_manual(admin_client, headers, cell_id)
         improvement_id = r.json()["id"]
         _transition(admin_client, headers, improvement_id, "proposed")
+
+        # Replay-first evidence (P1-5) so the live shadow request is admissible.
+        snapshot_id = _insert_snapshot(system["id"])
+        replay_run_id = _insert_replay_run(system["id"], snapshot_id, component_id=cell_id)
+        _transition(
+            admin_client, headers, improvement_id, "canary_ready",
+            canary_evidence_refs=[f"replay_run:{replay_run_id}"],
+        )
 
         # Set an explicit policy row for this component so we can prove it
         # never gets touched by shadow-execution approval.
@@ -1049,13 +1080,13 @@ class TestRollback:
         snapshot_id = _insert_snapshot(system["id"])
         experiment_id = _insert_experiment(system["id"], snapshot_id)
         improvement_id = _advance_to_canary_running(
-            admin_client, headers, cell_id, [f"experiment:{experiment_id}"], target_kind="role_card",
+            admin_client, headers, cell_id, [f"experiment:{experiment_id}"],
+            target_kind="role_card", proposed_role_card_version="1.1.0",
         )
         _parent_approve(admin_client, headers, improvement_id)
         _human_approve(admin_client, headers, improvement_id)
         r = _transition(
             admin_client, headers, improvement_id, "adopted",
-            proposed_role_card_version="1.1.0",
         )
         assert r.status_code == 200, r.text
 

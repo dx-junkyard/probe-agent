@@ -3421,6 +3421,7 @@ CREATE TABLE IF NOT EXISTS cell_improvement_events (
     improvement_id    INTEGER NOT NULL,
     event_type        TEXT NOT NULL CHECK (event_type IN (
                           'created', 'status_transition', 'parent_approval', 'human_approval',
+                          'approvals_invalidated',
                           'shadow_proposed', 'live_shadow_approval_requested',
                           'live_shadow_approved', 'suspended', 'resumed', 'rolled_back'
                       )),

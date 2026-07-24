@@ -231,10 +231,15 @@ class CellQuality(BaseModel):
 
 
 class CellImprovement(BaseModel):
-    """Reserved for Sub 7 (#304) improvement hypothesis / canary / adoption
-    state. Intentionally empty at Sub 1."""
+    """Improvement-lifecycle summary (Sub 7, #304). All fields optional/
+    additive; ``None`` means no improvement data for this Cell yet."""
 
     model_config = ConfigDict(extra="forbid")
+
+    total: Optional[int] = None
+    open_count: Optional[int] = None
+    adopted_count: Optional[int] = None
+    latest_status: Optional[str] = None
 
 
 class CellOrchestration(BaseModel):

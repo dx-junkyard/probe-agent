@@ -270,12 +270,23 @@ def build_root_digest(
         for row in orchestrator_rows
     ]
 
+    # Count each task exactly once by its single owner across the whole
+    # System, NOT by summing per-orchestrator digests: a worker that appears
+    # in two orchestrators' rosters (multiple context lenses) -- or a nested
+    # orchestrator counted by both itself and its parent -- would otherwise be
+    # double-counted. Task ownership is single (owner_cell_id), so a direct
+    # ledger group-by is the authoritative, dedup-free total (Principle 6).
     total_task_counts = {status: 0 for status in TASK_STATUSES}
+    for r in conn.execute(
+        "SELECT status, COUNT(*) AS n FROM cell_tasks WHERE system_id = ? GROUP BY status",
+        (system_id,),
+    ).fetchall():
+        if r["status"] in total_task_counts:
+            total_task_counts[r["status"]] = r["n"]
+
     stale_orchestrator_cell_ids: List[str] = []
     orchestrator_key_points: List[Dict[str, Any]] = []
     for digest in orchestrator_digests:
-        for status_name, n in digest["tasks"]["total"].items():
-            total_task_counts[status_name] += n
         key_point = _orchestrator_key_point(digest)
         if key_point["binding_stale"]:
             stale_orchestrator_cell_ids.append(digest["cell_id"])

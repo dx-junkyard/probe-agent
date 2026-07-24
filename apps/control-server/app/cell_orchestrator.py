@@ -56,7 +56,13 @@ from typing import Any, Dict, List, Optional, Tuple
 from . import cell_binding
 from .cell_fabric import TASK_STATUSES
 from .db import get_conn
-from .llm import LLMConfig, LLMError, create_llm_client, is_reasoning_model
+from .llm import (
+    LLMConfig,
+    LLMError,
+    LLMResourceLimitError,
+    create_llm_client,
+    is_reasoning_model,
+)
 
 MAX_ROSTER_SIZE = 7
 MAX_ORCHESTRATOR_DEPTH = 3
@@ -600,7 +606,11 @@ def run_triage(
         classification, reasoning_summary, affected_ids, proposed_ask = _parse_triage_response(
             cleaned, roster_cell_ids,
         )
-    except (LLMError, ValidationFailedError, json.JSONDecodeError) as exc:
+    except (LLMError, LLMResourceLimitError, ValidationFailedError, json.JSONDecodeError) as exc:
+        # LLM quota / resource-limit / system-context errors are NOT
+        # subclasses of LLMError, so without catching them here a quota breach
+        # would escape the fail-closed path -- surfacing a 429 with no failed
+        # intelligence_run recorded and no deterministic digest returned.
         error = str(exc)
     completed_at = time.time()
 

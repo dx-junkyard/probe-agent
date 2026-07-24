@@ -258,6 +258,14 @@ def _resolve_from_pattern_point(conn, *, system_id: int, probe_pattern_point_id:
     ).fetchone()
     if pattern_row is None:
         raise CellBindingNotFoundError("Probe pattern not found for this pattern point")
+    # Only an 'active' pattern is an approved, current instrumentation source.
+    # A 'stale' / 'archived' / 'superseded' pattern (Issue #168 lifecycle) must
+    # not back a formal Cell Binding.
+    if pattern_row["status"] != "active":
+        raise CellBindingConflictError(
+            f"Probe pattern status is {pattern_row['status']!r}; only an "
+            "'active' pattern may back a Cell Binding"
+        )
     if not pattern_row["source_snapshot_id"] or not pattern_row["source_commit_sha"]:
         raise CellBindingConflictError(
             "Probe pattern has no pinned source snapshot/commit"
@@ -490,4 +498,79 @@ def build_cell_state(
     quality = cell_quality.build_cell_quality_state(
         conn, system_id=system_id, cell_definition_id=cell_row["id"],
     )
-    return state.model_copy(update={"health": health, "quality": quality})
+    tasks = _build_task_summary(conn, system_id=system_id, cell_definition_id=cell_row["id"])
+    improvement = _build_improvement_summary(
+        conn, system_id=system_id, cell_definition_id=cell_row["id"],
+    )
+    orchestration = _build_orchestration_summary(
+        conn, system_id=system_id, roster=roster,
+    )
+    return state.model_copy(update={
+        "tasks": tasks,
+        "health": health,
+        "quality": quality,
+        "improvement": improvement,
+        "orchestration": orchestration,
+    })
+
+
+def _build_task_summary(conn, *, system_id: int, cell_definition_id: int) -> cell_fabric.TaskSummary:
+    """Real task counts from the Goal/Task ledger for this Cell as owner
+    (deterministic; never the hardcoded zeros of the minimal state)."""
+    counts = cell_fabric.TaskCounts()
+    rows = conn.execute(
+        """SELECT status, COUNT(*) AS n FROM cell_tasks
+           WHERE system_id = ? AND owner_cell_id = ? GROUP BY status""",
+        (system_id, cell_definition_id),
+    ).fetchall()
+    valid = set(cell_fabric.TASK_STATUSES)
+    for r in rows:
+        if r["status"] in valid:
+            setattr(counts, r["status"], r["n"])
+    return cell_fabric.TaskSummary(counts=counts)
+
+
+def _build_improvement_summary(
+    conn, *, system_id: int, cell_definition_id: int,
+) -> Optional["cell_fabric.CellImprovement"]:
+    rows = conn.execute(
+        """SELECT status FROM cell_improvements
+           WHERE system_id = ? AND cell_definition_id = ? ORDER BY id DESC""",
+        (system_id, cell_definition_id),
+    ).fetchall()
+    if not rows:
+        return None
+    statuses = [r["status"] for r in rows]
+    open_count = sum(1 for s in statuses if s not in ("adopted", "rejected"))
+    adopted_count = sum(1 for s in statuses if s == "adopted")
+    return cell_fabric.CellImprovement(
+        total=len(statuses),
+        open_count=open_count,
+        adopted_count=adopted_count,
+        latest_status=statuses[0],
+    )
+
+
+def _build_orchestration_summary(
+    conn, *, system_id: int, roster: Optional[List[str]],
+) -> Optional["cell_fabric.CellOrchestration"]:
+    if roster is None:
+        return None
+    active = dormant = retired = 0
+    for child_id in roster:
+        child = conn.execute(
+            "SELECT status FROM cell_definitions WHERE system_id = ? AND cell_id = ?",
+            (system_id, child_id),
+        ).fetchone()
+        if child is None:
+            continue
+        if child["status"] == "active":
+            active += 1
+        elif child["status"] == "dormant":
+            dormant += 1
+        elif child["status"] == "retired":
+            retired += 1
+    return cell_fabric.CellOrchestration(
+        roster=list(roster), active_count=active, dormant_count=dormant,
+        retired_count=retired,
+    )

@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import time
 from typing import Any, Dict, List, Optional
 
@@ -417,6 +418,20 @@ def delegate_task(
     if delegated_by_cell_id is not None:
         delegated_by_row_id = _resolve_cell_row_id(conn, system_id, delegated_by_cell_id)
 
+    # Quality-floor intake suspension (#302): a Cell whose intake is
+    # 'suspended' must not receive NEW task delegations -- "受付停止" means
+    # stop accepting work, not just stop auditing.
+    intake_row = conn.execute(
+        "SELECT intake_status FROM cell_intake_states "
+        "WHERE system_id = ? AND cell_definition_id = ?",
+        (system_id, owner_row_id),
+    ).fetchone()
+    if intake_row is not None and intake_row["intake_status"] == "suspended":
+        raise ConflictError(
+            f"Cell {owner_cell_id!r} intake is suspended (quality floor); it "
+            "cannot receive new task delegations until intake is resumed"
+        )
+
     for ref in context_refs:
         resolve_evidence_ref(conn, system_id, ref)
 
@@ -451,6 +466,18 @@ def delegate_task(
             "SELECT * FROM cell_tasks WHERE id = ?", (task_id,),
         ).fetchone()
         conn.execute("COMMIT")
+    except sqlite3.IntegrityError:
+        # A concurrent resend with the same (system_id, idempotency_key) won
+        # the UNIQUE race; return the row it created instead of a 500.
+        conn.execute("ROLLBACK")
+        if idempotency_key:
+            existing = conn.execute(
+                "SELECT * FROM cell_tasks WHERE system_id = ? AND idempotency_key = ?",
+                (system_id, idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                return existing
+        raise
     except Exception:
         conn.execute("ROLLBACK")
         raise
@@ -536,10 +563,22 @@ def transition_task(
             set_clauses.append("evidence_json = ?")
             params.append(json.dumps(resolved_evidence))
         params.append(task_id)
-        conn.execute(
-            f"UPDATE cell_tasks SET {', '.join(set_clauses)} WHERE id = ?",
+        params.append(current_status)
+        # Compare-and-set on the observed status: a concurrent transition that
+        # already moved the task off ``current_status`` updates 0 rows, so two
+        # requests can never both write a transition event from the same
+        # ``from_status`` (audit-integrity guard, Principle 6).
+        cur = conn.execute(
+            f"UPDATE cell_tasks SET {', '.join(set_clauses)} "
+            f"WHERE id = ? AND status = ?",
             params,
         )
+        if cur.rowcount == 0:
+            conn.execute("ROLLBACK")
+            raise ConflictError(
+                f"Task {task_id} status changed concurrently "
+                f"(expected {current_status!r}); retry the transition"
+            )
         conn.execute(
             """INSERT INTO cell_task_events
                    (system_id, task_id, event_type, from_status, to_status,
@@ -690,6 +729,18 @@ def submit_report(
             "SELECT * FROM cell_reports WHERE id = ?", (report_id,),
         ).fetchone()
         conn.execute("COMMIT")
+    except sqlite3.IntegrityError:
+        # A concurrent resend with the same (system_id, idempotency_key) won
+        # the UNIQUE race; return its row instead of surfacing a 500.
+        conn.execute("ROLLBACK")
+        if idempotency_key:
+            existing = conn.execute(
+                "SELECT * FROM cell_reports WHERE system_id = ? AND idempotency_key = ?",
+                (system_id, idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                return existing
+        raise
     except Exception:
         conn.execute("ROLLBACK")
         raise

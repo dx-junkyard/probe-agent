@@ -75,7 +75,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from . import cell_fabric, cell_tasks, evaluator
 from .db import get_conn
-from .llm import LLMError, create_llm_client, is_reasoning_model
+from .llm import (
+    LLMError,
+    LLMResourceLimitError,
+    create_llm_client,
+    is_reasoning_model,
+)
 
 CELL_QUALITY_AUDIT_PROMPT_VERSION = "v1"
 CELL_QUALITY_AUDIT_SCHEMA_VERSION = "v1"
@@ -126,6 +131,22 @@ def _get_cell_row_by_id(conn, system_id: int, cell_definition_id: int):
     if row is None:
         raise NotFoundError(f"Cell {cell_definition_id} not found in this System")
     return row
+
+
+def _worker_model_alias(conn, cell_row) -> Optional[str]:
+    """The audited Cell's own worker model alias (from its pinned Role Card),
+    used to reject a self-audit. ``None`` when the Cell has no resolvable
+    role card."""
+    role_card_id = cell_row["role_card_id"]
+    if role_card_id is None:
+        return None
+    card = conn.execute(
+        "SELECT model_alias FROM agent_role_cards WHERE id = ?",
+        (role_card_id,),
+    ).fetchone()
+    if card is None:
+        return None
+    return (card["model_alias"] or "").strip() or None
 
 
 def _get_config_row(conn, system_id: int, cell_definition_id: int):
@@ -571,6 +592,16 @@ def run_audit(
         cell_row = _get_cell_row_by_id(conn, system_id, cell_definition_id)
         config_row = _ensure_config_row(conn, system_id, cell_definition_id)
 
+        # Auditor independence (#302): the auditor model must be SEPARATE from
+        # the worker's own execution model, so a client can never turn an
+        # independent audit into a self-audit by passing the worker's alias.
+        worker_alias = _worker_model_alias(conn, cell_row)
+        if worker_alias is not None and auditor_alias == worker_alias:
+            raise ValidationFailedError(
+                f"auditor_alias {auditor_alias!r} is the audited Cell's own "
+                "worker model alias; an audit must use a separate auditor model"
+            )
+
         _consume_quality_audit_budget(conn, system_id, config_row["daily_audit_budget"])
 
         trace_row = conn.execute(
@@ -616,7 +647,7 @@ def run_audit(
                 max_tokens=1024,
             )
             explanation = _parse_explanation_response(raw)
-        except (LLMError, ValidationFailedError, json.JSONDecodeError) as exc:
+        except (LLMError, LLMResourceLimitError, ValidationFailedError, json.JSONDecodeError) as exc:
             error = str(exc)
         completed_at = time.time()
 
@@ -719,14 +750,28 @@ def list_quality_audits(conn, system_id: int, cell_definition_id: int):
 def _rolling_pass_rate(
     conn, system_id: int, cell_definition_id: int, floor_window: int,
 ) -> Tuple[Optional[float], int]:
+    """Rolling pass rate over the last ``floor_window`` DISTINCT samples,
+    counting each sample once by its most recent audit. Deduping by sample
+    closes the "re-audit a passing sample repeatedly to inflate the rolling
+    window and resume intake" gap: repeating an audit of the same sample can
+    never add more than that one sample's latest verdict to the window."""
     rows = conn.execute(
-        """SELECT a.verdict FROM cell_quality_audits a
+        """SELECT s.id AS sample_id, a.verdict, a.id AS audit_id
+           FROM cell_quality_audits a
            JOIN cell_quality_samples s ON a.sample_id = s.id
            WHERE a.system_id = ? AND s.cell_definition_id = ?
-           ORDER BY a.id DESC LIMIT ?""",
-        (system_id, cell_definition_id, floor_window),
+           ORDER BY a.id DESC""",
+        (system_id, cell_definition_id),
     ).fetchall()
-    considered = [r["verdict"] for r in rows if r["verdict"] != "no_criteria"]
+    # Keep the latest audit per sample (rows are newest-first, so the first
+    # occurrence of each sample_id is its most recent audit).
+    latest_by_sample: Dict[int, str] = {}
+    for r in rows:
+        if r["sample_id"] not in latest_by_sample:
+            latest_by_sample[r["sample_id"]] = r["verdict"]
+        if len(latest_by_sample) >= floor_window:
+            break
+    considered = [v for v in latest_by_sample.values() if v != "no_criteria"]
     denominator = len(considered)
     if denominator == 0:
         return None, 0
