@@ -15,8 +15,10 @@ Covers:
    `return_to_parent` only from `failed`/`blocked`, and every transition
    producing a `cell_task_events` row.
 4. Owner/report-target shape: a task has exactly one `owner_cell_id`.
-5. Evidence ref resolution: all 6 accepted formats, cross-system/missing
-   rejection, malformed refs, and the reserved P3/P4 ref kinds.
+5. Evidence ref resolution: all 7 accepted formats (including
+   ``improvement:<id>``, resolvable since Issue #304 added
+   ``cell_improvements``), cross-system/missing rejection, malformed refs,
+   and the still-reserved ``quality_sample`` ref kind.
 6. Reports (P2): digest vs escalation severity rules, fail-closed unknown
    fields, fact/interpretation/ask kept separate, idempotent resend.
 7. Escalations: auto-created from an escalation report, acknowledge/resolve.
@@ -284,6 +286,41 @@ def _insert_replay_run(system_id, snapshot_id, component_id="comp-1"):
             "trace_set_hash": "hash",
             "sandbox_config_json": "{}",
             "created_at": now,
+        },
+    )
+
+
+def _get_cell_row_id(system_id, cell_id):
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM cell_definitions WHERE system_id = ? AND cell_id = ?",
+            (system_id, cell_id),
+        ).fetchone()
+        return row["id"]
+
+
+def _insert_cell_improvement(system_id, cell_definition_row_id, target_kind="candidate_patch"):
+    now = time.time()
+    return _insert_row(
+        system_id,
+        "cell_improvements",
+        {
+            "system_id": system_id,
+            "cell_definition_id": cell_definition_row_id,
+            "status": "observed",
+            "target_kind": target_kind,
+            "hypothesis": "",
+            "expected_effect": "",
+            "risk": "",
+            "rollback_plan": "",
+            "observed_facts_json": "[]",
+            "canary_evidence_json": "[]",
+            "suspended": 0,
+            "suspension_reason": "",
+            "created_at": now,
+            "updated_at": now,
         },
     )
 
@@ -903,15 +940,41 @@ class TestEvidenceResolution:
             with pytest.raises(ValidationFailedError, match="not yet implemented"):
                 resolve_evidence_ref(conn, system["id"], "quality_sample:1")
 
-    def test_reserved_improvement_ref_422(self, admin_client):
+    def test_improvement_ref_now_resolves(self, admin_client):
+        """Issue #304 added cell_improvements -- improvement:<id> is no
+        longer reserved and resolves like any other System-scoped ref."""
         token = _login(admin_client)
-        system = _create_system(admin_client, token, "EvidenceReservedImprovement")
+        system = _create_system(admin_client, token, "EvidenceImprovementResolves")
+        headers = _headers(token, system["id"])
+        cell_id = _create_cell(admin_client, headers, cell_id="cell-imp")
+        cell_row_id = _get_cell_row_id(system["id"], cell_id)
+        improvement_id = _insert_cell_improvement(system["id"], cell_row_id)
+
         from app.cell_tasks import ValidationFailedError, resolve_evidence_ref
         from app.db import get_conn
 
         with get_conn() as conn:
-            with pytest.raises(ValidationFailedError, match="not yet implemented"):
-                resolve_evidence_ref(conn, system["id"], "improvement:1")
+            assert resolve_evidence_ref(
+                conn, system["id"], f"improvement:{improvement_id}"
+            ) is True
+            with pytest.raises(ValidationFailedError):
+                resolve_evidence_ref(conn, system["id"], "improvement:999999")
+
+    def test_improvement_ref_cross_system_fails(self, admin_client):
+        token = _login(admin_client)
+        sys_a = _create_system(admin_client, token, "EvidenceImprovementXSysA")
+        sys_b = _create_system(admin_client, token, "EvidenceImprovementXSysB")
+        headers_a = _headers(token, sys_a["id"])
+        cell_id = _create_cell(admin_client, headers_a, cell_id="cell-imp-a")
+        cell_row_id = _get_cell_row_id(sys_a["id"], cell_id)
+        improvement_id = _insert_cell_improvement(sys_a["id"], cell_row_id)
+
+        from app.cell_tasks import ValidationFailedError, resolve_evidence_ref
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            with pytest.raises(ValidationFailedError):
+                resolve_evidence_ref(conn, sys_b["id"], f"improvement:{improvement_id}")
 
 
 # ---------------------------------------------------------------------------

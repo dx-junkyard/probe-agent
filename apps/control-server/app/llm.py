@@ -377,6 +377,25 @@ class MockLLMClient(LLMClient):
                     ),
                 }
             )
+        if "CELL_IMPROVEMENT_RESPONSE_JSON" in joined:
+            return json.dumps(
+                {
+                    "hypothesis": (
+                        "Mock hypothesis: no external LLM was called; this is "
+                        "deterministic mock output grounded only in the "
+                        "observed facts refs supplied."
+                    ),
+                    "expected_effect": (
+                        "Mock expected effect: improved outcome on the "
+                        "sampled failure pattern."
+                    ),
+                    "risk": "Mock risk: review canary evidence before adoption.",
+                    "rollback_plan": (
+                        "Mock rollback plan: revert to the previously pinned "
+                        "Role Card version / patch."
+                    ),
+                }
+            )
         if "CELL_QUALITY_AUDIT_RESPONSE_JSON" in joined:
             return json.dumps(
                 {

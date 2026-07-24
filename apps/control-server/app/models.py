@@ -5963,3 +5963,157 @@ class CellAskDecideRequest(BaseModel):
 
     decision: str
     note: str = ""
+
+
+# ---------------------------------------------------------------------------
+# 改善仮説・カナリア・shadow実行承認ゲート (Issue #304, Sub 7 of the Probe
+# Cell Fabric epic, Issue #297). Core logic lives in app/cell_improvement.py;
+# these are the request/response shapes for routes/cell_improvement.py.
+# ---------------------------------------------------------------------------
+
+
+class CellImprovementDraftIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    observed_facts_refs: List[str] = Field(default_factory=list)
+    target_kind: str = "role_card"
+    parent_cell_id: Optional[str] = None
+
+
+class CellImprovementCreateIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_kind: str
+    hypothesis: str = ""
+    expected_effect: str = ""
+    risk: str = ""
+    rollback_plan: str = ""
+    observed_facts_refs: List[str] = Field(default_factory=list)
+    parent_cell_id: Optional[str] = None
+
+
+class CellImprovementOut(BaseModel):
+    id: int
+    system_id: int
+    cell_id: str
+    status: str
+    target_kind: str
+    hypothesis: str = ""
+    expected_effect: str = ""
+    risk: str = ""
+    rollback_plan: str = ""
+    observed_facts_refs: List[str] = Field(default_factory=list)
+    proposal_run_id: Optional[int] = None
+    is_mock: bool = False
+    role_card_id: Optional[int] = None
+    proposed_role_card_version: Optional[str] = None
+    canary_evidence_refs: List[str] = Field(default_factory=list)
+    parent_cell_id: Optional[str] = None
+    parent_approved_by: Optional[str] = None
+    parent_approved_at: Optional[float] = None
+    human_approved_by: Optional[str] = None
+    human_approved_at: Optional[float] = None
+    suspended: bool = False
+    suspension_reason: str = ""
+    created_at: float
+    updated_at: float
+
+
+class CellImprovementsListOut(BaseModel):
+    system_id: int
+    cell_id: str
+    improvements: List[CellImprovementOut] = Field(default_factory=list)
+
+
+class CellImprovementEventOut(BaseModel):
+    id: int
+    system_id: int
+    improvement_id: int
+    event_type: str
+    from_status: Optional[str] = None
+    to_status: Optional[str] = None
+    actor: Optional[str] = None
+    detail: str = ""
+    created_at: float
+
+
+class CellShadowDecisionOut(BaseModel):
+    id: int
+    system_id: int
+    improvement_id: int
+    kind: str
+    status: str
+    decided_by: Optional[str] = None
+    decided_at: Optional[float] = None
+    decision_method: str = ""
+    note: str = ""
+    created_at: float
+
+
+class CellImprovementDetailOut(BaseModel):
+    improvement: CellImprovementOut
+    events: List[CellImprovementEventOut] = Field(default_factory=list)
+    shadow_decisions: List[CellShadowDecisionOut] = Field(default_factory=list)
+
+
+class CellImprovementDraftOut(BaseModel):
+    """Response of ``POST /cell-fabric/cells/{cell_id}/improvements/draft``.
+    ``improvement`` is ``None`` and ``draft_error`` is set on ANY LLM/JSON
+    failure -- there is no heuristic hypothesis fallback."""
+
+    system_id: int
+    cell_id: str
+    improvement: Optional[CellImprovementOut] = None
+    draft_error: Optional[str] = None
+    is_mock: bool = False
+    intelligence_run_id: int
+
+
+class CellImprovementTransitionIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    new_status: str
+    canary_evidence_refs: Optional[List[str]] = None
+    proposed_role_card_version: Optional[str] = None
+    detail: str = ""
+    actor: Optional[str] = None
+
+
+class CellApprovalIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str
+
+
+class CellImprovementSuspendIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = ""
+
+
+class CellImprovementRollbackIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    actor: Optional[str] = None
+
+
+class CellShadowProposalIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    note: str = ""
+    actor: Optional[str] = None
+
+
+class CellShadowRequestIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    note: str = ""
+    actor: Optional[str] = None
+
+
+class CellShadowDecideIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: str
+    decided_by: str
+    note: str = ""

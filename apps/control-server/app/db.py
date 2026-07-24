@@ -3353,6 +3353,113 @@ CREATE INDEX IF NOT EXISTS idx_cell_asks_system
     ON cell_asks (system_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_cell_asks_status
     ON cell_asks (system_id, status, id DESC);
+
+-- Probe Cell Fabric (Issue #297), Sub 7: 改善仮説・カナリア・shadow実行承認
+-- ゲート (Issue #304). See app/cell_improvement.py for the lifecycle state
+-- machine, the canary evidence gate, parent/human approval gates, rubric
+-- ownership, the consecutive-rejection auto-suspend circuit breaker, and the
+-- fail-closed reasoning hypothesis draft; the "Probe Cell Fabric(Issue #297)"
+-- section of docs/project-intelligence.md for the full epic design.
+--
+-- cell_improvements: one row per improvement hypothesis. There is NO DELETE
+-- endpoint anywhere in this module -- a rejected row is permanent history,
+-- both for audit and because it is the deterministic input to the
+-- consecutive-rejection circuit breaker. role_card_id is the card that was
+-- PINNED to the Cell at the time this improvement was created (immutable
+-- baseline for comparison, distinct from cell_definitions.role_card_id which
+-- changes on adoption); NULL for target_kind='candidate_patch'.
+-- canary_evidence_json holds ONLY refs into EXISTING Replay/Experiment/
+-- Evaluation-Criteria infrastructure (replay_run:<id> / experiment:<id> /
+-- evaluation:<id>) -- never a new execution record.
+CREATE TABLE IF NOT EXISTS cell_improvements (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                   INTEGER NOT NULL,
+    cell_definition_id          INTEGER NOT NULL,
+    status                      TEXT NOT NULL DEFAULT 'observed'
+                                    CHECK (status IN ('observed', 'proposed', 'canary_ready',
+                                                       'canary_running', 'adopted', 'rejected',
+                                                       'blocked')),
+    target_kind                 TEXT NOT NULL CHECK (target_kind IN ('role_card', 'candidate_patch')),
+    hypothesis                  TEXT NOT NULL DEFAULT '',
+    expected_effect             TEXT NOT NULL DEFAULT '',
+    risk                        TEXT NOT NULL DEFAULT '',
+    rollback_plan               TEXT NOT NULL DEFAULT '',
+    observed_facts_json         TEXT NOT NULL DEFAULT '[]',
+    proposal_run_id             INTEGER,
+    role_card_id                INTEGER,
+    proposed_role_card_version  TEXT,
+    canary_evidence_json        TEXT NOT NULL DEFAULT '[]',
+    parent_cell_id              INTEGER,
+    parent_approved_by          TEXT,
+    parent_approved_at          REAL,
+    human_approved_by           TEXT,
+    human_approved_at           REAL,
+    suspended                   INTEGER NOT NULL DEFAULT 0,
+    suspension_reason           TEXT NOT NULL DEFAULT '',
+    created_at                  REAL NOT NULL,
+    updated_at                  REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (cell_definition_id) REFERENCES cell_definitions (id) ON DELETE CASCADE,
+    FOREIGN KEY (proposal_run_id) REFERENCES intelligence_runs (id) ON DELETE SET NULL,
+    FOREIGN KEY (role_card_id) REFERENCES agent_role_cards (id) ON DELETE SET NULL,
+    FOREIGN KEY (parent_cell_id) REFERENCES cell_definitions (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_improvements_cell
+    ON cell_improvements (system_id, cell_definition_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_cell_improvements_status
+    ON cell_improvements (system_id, cell_definition_id, status);
+
+-- cell_improvement_events: append-only audit trail -- rejected hypotheses
+-- are never deleted, and there is no DELETE endpoint anywhere in this
+-- module. This is also the deterministic input the consecutive-rejection
+-- circuit breaker (app/cell_improvement.py::_consecutive_rejection_count)
+-- reads to decide whether new-improvement creation is currently refused.
+CREATE TABLE IF NOT EXISTS cell_improvement_events (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    improvement_id    INTEGER NOT NULL,
+    event_type        TEXT NOT NULL CHECK (event_type IN (
+                          'created', 'status_transition', 'parent_approval', 'human_approval',
+                          'shadow_proposed', 'live_shadow_approval_requested',
+                          'live_shadow_approved', 'suspended', 'resumed', 'rolled_back'
+                      )),
+    from_status       TEXT,
+    to_status         TEXT,
+    actor             TEXT,
+    detail            TEXT NOT NULL DEFAULT '',
+    created_at        REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (improvement_id) REFERENCES cell_improvements (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_improvement_events_improvement
+    ON cell_improvement_events (system_id, improvement_id, id ASC);
+
+-- cell_shadow_decisions: a 'shadow_proposal' row and a
+-- 'live_shadow_execution_approval' row are ALWAYS separate records with
+-- separate statuses -- approving one never approves or performs the other.
+-- Approving a 'live_shadow_execution_approval' writes NOTHING but this row
+-- plus one cell_improvement_events row: no policy write, no candidate
+-- deploy, anywhere in app/cell_improvement.py.
+CREATE TABLE IF NOT EXISTS cell_shadow_decisions (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    improvement_id    INTEGER NOT NULL,
+    kind              TEXT NOT NULL CHECK (kind IN ('shadow_proposal', 'live_shadow_execution_approval')),
+    status            TEXT NOT NULL DEFAULT 'proposed'
+                          CHECK (status IN ('proposed', 'approved', 'rejected')),
+    decided_by        TEXT,
+    decided_at        REAL,
+    decision_method   TEXT NOT NULL DEFAULT '',
+    note              TEXT NOT NULL DEFAULT '',
+    created_at        REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (improvement_id) REFERENCES cell_improvements (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_shadow_decisions_improvement
+    ON cell_shadow_decisions (system_id, improvement_id, id DESC);
 """
 
 

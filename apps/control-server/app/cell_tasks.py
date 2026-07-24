@@ -23,13 +23,15 @@ transition table, it only adds ledger-specific rules on top: a retry
 ``cell_task_events`` row.
 
 Evidence resolution (Principle 6, deterministic only): ``resolve_evidence_ref``
-accepts only ``trace:<id>`` / ``evaluation:<id>`` / ``shadow_result:<id>`` /
+accepts ``trace:<id>`` / ``evaluation:<id>`` / ``shadow_result:<id>`` /
 ``replay_run:<id>`` / ``experiment:<id>`` / ``snapshot_file:<snapshot_id>:<path>``
-and verifies the referenced row exists AND belongs to the calling System.
-``quality_sample:<id>`` and ``improvement:<id>`` are RESERVED reference
-formats for Sub 6 (#302) and Sub 7 (#304) respectively -- they parse but
-always fail closed with a "not yet implemented" message; no other logic in
-this module or its callers may treat them as resolvable.
+/ ``improvement:<id>`` and verifies the referenced row exists AND belongs to
+the calling System. ``improvement:<id>`` (Sub 7, #304) resolves against
+``cell_improvements`` now that that table exists -- an improvement hypothesis
+is valid observation/context evidence like any other System-scoped record.
+``quality_sample:<id>`` remains a RESERVED reference format for Sub 6 (#302):
+it parses but always fails closed with a "not yet implemented" message; no
+other logic in this module or its callers may treat it as resolvable.
 
 This is a pure deterministic ledger: no reasoning-model call anywhere in this
 module (non-goal per the Issue #300 scope -- orchestrator aggregation is #301,
@@ -42,7 +44,7 @@ probe-agent:
   consumers: [control-server-routes]
   operation_kind: io
   state_effects: [database-read, database-write]
-  probe_value: Verify every task transition is legal per cell_fabric's finite table, retry/blocked/returned_to_parent ledger rules are enforced and audited, evidence refs resolve only within the calling System, idempotent delegate/report resend never duplicates a row, and reserved P3/P4 ref kinds fail closed rather than silently resolving.
+  probe_value: Verify every task transition is legal per cell_fabric's finite table, retry/blocked/returned_to_parent ledger rules are enforced and audited, evidence refs (including improvement:<id> now that #304 exists) resolve only within the calling System, idempotent delegate/report resend never duplicates a row, and the still-reserved quality_sample ref kind fails closed rather than silently resolving.
 """
 
 from __future__ import annotations
@@ -102,11 +104,12 @@ _REF_RE = re.compile(
     r"|quality_sample|improvement):(.+)$"
 )
 
-# P3/P4 reference contracts (Issue #300 scope: define the ref format only;
-# implementation is #302 quality sampling and #304 improvement proposals).
+# P3 reference contract (Issue #300 scope: define the ref format only;
+# implementation is #302 quality sampling). improvement:<id> (P4) is no
+# longer reserved -- Issue #304 added the cell_improvements table, so it now
+# resolves via _INT_ID_TABLES below like any other System-scoped row ref.
 _RESERVED_REF_MESSAGES = {
     "quality_sample": "quality_sample refs are not yet implemented (Issue #302)",
-    "improvement": "improvement refs are not yet implemented (Issue #304)",
 }
 
 _INT_ID_TABLES = {
@@ -114,6 +117,7 @@ _INT_ID_TABLES = {
     "shadow_result": "shadow_results",
     "replay_run": "replay_runs",
     "experiment": "experiments",
+    "improvement": "cell_improvements",
 }
 
 

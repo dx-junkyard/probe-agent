@@ -11,6 +11,7 @@ from .routes import (
     auth,
     candidate_studio,
     cell_fabric,
+    cell_improvement,
     cell_orchestrators,
     cell_quality,
     cell_root,
@@ -124,6 +125,7 @@ def create_app() -> FastAPI:
     app.include_router(cell_orchestrators.router, dependencies=_auth)
     app.include_router(cell_quality.router, dependencies=_auth)
     app.include_router(cell_root.router, dependencies=_auth)
+    app.include_router(cell_improvement.router, dependencies=_auth)
     return app
 
 
