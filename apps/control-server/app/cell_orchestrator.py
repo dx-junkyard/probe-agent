@@ -179,6 +179,31 @@ def _proposed_depth(conn, system_id: int, roster: List[str]) -> int:
     return 1 + (max(child_depths) if child_depths else 0)
 
 
+def _max_ancestor_height(conn, system_id: int, cell_id: str, _visited=None) -> int:
+    """Longest chain of orchestrators ABOVE ``cell_id`` (0 if no cell rosters
+    it). Used so a roster UPDATE on a nested child cannot push an ancestor
+    past MAX_ORCHESTRATOR_DEPTH -- the pre-existing downward-only check missed
+    that (a grandchild roster edit could otherwise create an A->B->C->D chain
+    of depth 4)."""
+    visited = set(_visited or ())
+    if cell_id in visited:
+        return MAX_ORCHESTRATOR_DEPTH + 1  # defensive: a persisted cycle
+    visited.add(cell_id)
+    parents = conn.execute(
+        "SELECT cell_id, roster_json FROM cell_definitions "
+        "WHERE system_id = ? AND roster_json IS NOT NULL",
+        (system_id,),
+    ).fetchall()
+    best = 0
+    for parent in parents:
+        roster = json.loads(parent["roster_json"] or "[]")
+        if cell_id in roster:
+            best = max(best, 1 + _max_ancestor_height(
+                conn, system_id, parent["cell_id"], visited,
+            ))
+    return best
+
+
 def validate_roster(
     conn, *, system_id: int, cell_id: str, roster: Optional[List[str]],
 ) -> None:
@@ -210,7 +235,12 @@ def validate_roster(
             f"roster would create a cycle involving {cell_id!r}"
         )
 
-    depth = _proposed_depth(conn, system_id, roster)
+    # Total chain length = ancestors above this cell + this cell and its
+    # proposed descendants. The ancestor term is what makes a roster UPDATE on
+    # an already-nested child safe (a create has no ancestors yet, so this
+    # reduces to the old downward-only check).
+    ancestor_height = _max_ancestor_height(conn, system_id, cell_id)
+    depth = ancestor_height + _proposed_depth(conn, system_id, roster)
     if depth > MAX_ORCHESTRATOR_DEPTH:
         raise ValidationFailedError(
             f"orchestrator nesting depth {depth} exceeds the limit of "

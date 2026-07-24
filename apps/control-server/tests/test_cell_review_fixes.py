@@ -488,3 +488,47 @@ def test_changing_version_after_approval_invalidates_it(client):
         ).fetchone()
     assert row["parent_approved_by"] is None
     assert row["human_approved_by"] is None
+
+
+# --- P1-12(a): a child roster update cannot push an ancestor past depth 3 ---
+
+
+def _make_orchestrator(client, headers, cell_id, roster):
+    r = client.post(
+        "/cell-fabric/role-cards",
+        json=_card_payload(role_key=f"rk-{cell_id}", version="1.0.0"),
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    r = client.post(
+        "/cell-fabric/cells",
+        json={
+            "cell_id": cell_id, "roster": roster,
+            "role_card_ref": {"role_key": f"rk-{cell_id}", "version": "1.0.0"},
+            "status": "active", "mission": None, "schema_version": "1.0",
+        },
+        headers=headers,
+    )
+    return r
+
+
+def test_child_roster_update_cannot_exceed_depth_via_ancestor(client):
+    token = _login(client)
+    system = _system(client, token, "DepthAncestor")
+    headers = _headers(token, system["id"])
+    # Chain A -> B -> C with C a worker leaf: A has depth 2 (valid, <= 3).
+    _create_cell(client, headers, cell_id="C", role_key="rk-C")
+    assert _make_orchestrator(client, headers, "B", ["C"]).status_code == 201
+    assert _make_orchestrator(client, headers, "A", ["B"]).status_code == 201
+    # A separate orchestrator D -> E (D has downward depth 1).
+    _create_cell(client, headers, cell_id="E", role_key="rk-E")
+    assert _make_orchestrator(client, headers, "D", ["E"]).status_code == 201
+
+    # Adding D under C makes A -> B -> C -> D -> E (depth 4). The old
+    # downward-only check (proposed_depth([D]) = 2) alone would not see the
+    # two ancestors above C; the ancestor-aware guard rejects it.
+    r = client.put(
+        "/cell-fabric/cells/C/roster", json={"roster": ["D"]}, headers=headers,
+    )
+    assert r.status_code == 422, r.text
+    assert "depth" in r.json()["detail"].lower()
