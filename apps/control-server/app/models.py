@@ -5788,3 +5788,125 @@ class CellRosterEventOut(BaseModel):
     new_roster: List[str] = Field(default_factory=list)
     changed_by: Optional[str] = None
     created_at: float
+
+
+# ---------------------------------------------------------------------------
+# 品質サンプリング・独立監査・quality floor (Issue #302, Sub 6 of the Probe
+# Cell Fabric epic, Issue #297). Core logic lives in app/cell_quality.py;
+# these are the request/response shapes for routes/cell_quality.py.
+# ---------------------------------------------------------------------------
+
+
+class CellQualityStratumIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1)
+    task_type: Optional[str] = None
+    risk: Optional[str] = None
+    rare: bool = False
+
+
+class CellQualityConfigIn(BaseModel):
+    """Every field optional: an omitted field keeps its existing persisted
+    value (or the module default on first create)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sample_rate: Optional[float] = None
+    strata: Optional[List[CellQualityStratumIn]] = None
+    audit_rate: Optional[float] = None
+    quality_floor: Optional[float] = None
+    floor_window: Optional[int] = None
+    daily_audit_budget: Optional[int] = None
+
+
+class CellQualityConfigOut(BaseModel):
+    system_id: int
+    cell_definition_id: int
+    sample_rate: float
+    strata: List[Dict[str, Any]] = Field(default_factory=list)
+    audit_rate: float
+    quality_floor: float
+    floor_window: int
+    daily_audit_budget: int
+    created_at: Optional[float] = None
+    updated_at: Optional[float] = None
+
+
+class CellQualitySampleSelectIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    window_seconds: Optional[float] = None
+
+
+class CellQualitySampleOut(BaseModel):
+    id: int
+    system_id: int
+    cell_definition_id: int
+    config_id: int
+    stratum: str = ""
+    target_kind: str
+    target_id: str
+    selection_seed: str
+    selected_at: float
+
+
+class CellQualitySamplesListOut(BaseModel):
+    system_id: int
+    cell_id: str
+    samples: List[CellQualitySampleOut] = Field(default_factory=list)
+
+
+class CellQualityAuditRequestIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    blind: bool = False
+    auditor_alias: Optional[str] = None
+
+
+class CellQualityAuditOut(BaseModel):
+    id: int
+    system_id: int
+    sample_id: int
+    auditor_model_alias: str
+    verdict: str
+    verdict_decision_method: str
+    is_blind: bool
+    failed_criteria: List[int] = Field(default_factory=list)
+    verbatim_example: str = ""
+    explanation: str = ""
+    explanation_run_id: Optional[int] = None
+    is_mock: bool = False
+    created_at: float
+
+
+class CellQualityAuditsListOut(BaseModel):
+    system_id: int
+    cell_id: str
+    counts: Dict[str, int] = Field(default_factory=dict)
+    audits: List[CellQualityAuditOut] = Field(default_factory=list)
+
+
+class CellQualityFloorEvaluateOut(BaseModel):
+    system_id: int
+    cell_id: str
+    pass_rate: Optional[float] = None
+    floor: float
+    denominator: int
+    suspended: bool
+    escalation_id: Optional[int] = None
+
+
+class CellIntakeResumeIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = ""
+
+
+class CellIntakeStateOut(BaseModel):
+    system_id: int
+    cell_id: str
+    intake_status: str
+    reason: str = ""
+    escalation_id: Optional[int] = None
+    changed_at: Optional[float] = None

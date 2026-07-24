@@ -62,8 +62,13 @@
     },
     "quality": {
       "type": "object",
-      "description": "Reserved for Sub 6 (#302) quality sampling / independent audit / quality floor state. Empty at Sub 1.",
-      "properties": {},
+      "description": "Filled by Sub 6 (#302) from cell_quality_configs / cell_quality_audits / cell_intake_states. All fields nullable/optional; absent or null means no quality-sampling data exists yet for this Cell, never a guessed value.",
+      "properties": {
+        "pass_rate":     { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "audited_count": { "type": ["integer", "null"], "minimum": 0 },
+        "intake_status": { "type": ["string", "null"], "enum": ["accepting", "suspended", null] },
+        "sample_rate":   { "type": ["number", "null"], "minimum": 0, "maximum": 1 }
+      },
       "additionalProperties": false
     },
     "improvement": {

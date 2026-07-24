@@ -216,10 +216,18 @@ class CellHealth(BaseModel):
 
 
 class CellQuality(BaseModel):
-    """Reserved for Sub 6 (#302) quality sampling / audit / quality floor
-    state. Intentionally empty at Sub 1."""
+    """Filled by Sub 6 (#302) from ``cell_quality_configs`` /
+    ``cell_quality_audits`` / ``cell_intake_states``. All fields are
+    optional/nullable -- ``None`` means no quality-sampling data exists yet
+    for this Cell, never a guessed value. See ``app/cell_quality.py``'s
+    ``build_cell_quality_state``."""
 
     model_config = ConfigDict(extra="forbid")
+
+    pass_rate: Optional[float] = None
+    audited_count: Optional[int] = None
+    intake_status: Optional[str] = None
+    sample_rate: Optional[float] = None
 
 
 class CellImprovement(BaseModel):

@@ -377,6 +377,16 @@ class MockLLMClient(LLMClient):
                     ),
                 }
             )
+        if "CELL_QUALITY_AUDIT_RESPONSE_JSON" in joined:
+            return json.dumps(
+                {
+                    "explanation": (
+                        "Mock quality-audit explanation: no external LLM was "
+                        "called; this is deterministic mock output describing "
+                        "the failed criteria pattern."
+                    )
+                }
+            )
         if "REGRESSION_SCAFFOLD_RESPONSE_JSON" in joined:
             return json.dumps(
                 {

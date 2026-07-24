@@ -3180,6 +3180,128 @@ CREATE TABLE IF NOT EXISTS cell_triage_results (
 
 CREATE INDEX IF NOT EXISTS idx_cell_triage_results_cell
     ON cell_triage_results (system_id, cell_definition_id, id DESC);
+
+-- Probe Cell Fabric (Issue #297), Sub 6: 品質サンプリング・独立監査・quality
+-- floor (Issue #302). See app/cell_quality.py for the deterministic
+-- stratified sampling, the deterministic verdict + fail-closed reasoning
+-- explanation, the daily audit budget gate, and the quality-floor
+-- suspend/resume logic; the "Probe Cell Fabric(Issue #297)" section of
+-- docs/project-intelligence.md for the full epic design.
+--
+-- cell_quality_configs: one row per (system, Cell). sample_rate/audit_rate/
+-- quality_floor are fractions in [0.0, 1.0]; strata_json is a JSON array of
+-- {name, task_type?, risk?, rare} objects used for finite-field stratum
+-- matching only (Principle 6) -- never similarity/keyword scoring.
+CREATE TABLE IF NOT EXISTS cell_quality_configs (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    cell_definition_id    INTEGER NOT NULL,
+    sample_rate           REAL NOT NULL DEFAULT 0.05
+                              CHECK (sample_rate >= 0.0 AND sample_rate <= 1.0),
+    strata_json           TEXT NOT NULL DEFAULT '[]',
+    audit_rate            REAL NOT NULL DEFAULT 0.1
+                              CHECK (audit_rate >= 0.0 AND audit_rate <= 1.0),
+    quality_floor         REAL NOT NULL DEFAULT 0.7
+                              CHECK (quality_floor >= 0.0 AND quality_floor <= 1.0),
+    floor_window          INTEGER NOT NULL DEFAULT 20 CHECK (floor_window >= 1),
+    daily_audit_budget    INTEGER NOT NULL DEFAULT 50 CHECK (daily_audit_budget >= 0),
+    created_at            REAL NOT NULL,
+    updated_at            REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (cell_definition_id) REFERENCES cell_definitions (id) ON DELETE CASCADE,
+    UNIQUE (system_id, cell_definition_id)
+);
+
+-- cell_quality_samples: deterministic stratified selection output. Every row
+-- is idempotent (UNIQUE + INSERT OR IGNORE at the app layer): re-running
+-- selection over the same window never duplicates a (system, Cell, target)
+-- row. selection_seed is the exact stable-hash input string used to derive
+-- the selection fraction, so a selection decision is always reproducible
+-- and auditable from the row alone.
+CREATE TABLE IF NOT EXISTS cell_quality_samples (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    cell_definition_id    INTEGER NOT NULL,
+    config_id             INTEGER NOT NULL,
+    stratum               TEXT NOT NULL DEFAULT '',
+    target_kind           TEXT NOT NULL DEFAULT 'trace' CHECK (target_kind = 'trace'),
+    -- traces.trace_id is TEXT (system_id + trace_id composite PK).
+    target_id             TEXT NOT NULL,
+    selection_seed        TEXT NOT NULL,
+    selected_at           REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (cell_definition_id) REFERENCES cell_definitions (id) ON DELETE CASCADE,
+    FOREIGN KEY (config_id) REFERENCES cell_quality_configs (id) ON DELETE RESTRICT,
+    UNIQUE (system_id, cell_definition_id, target_kind, target_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_quality_samples_cell
+    ON cell_quality_samples (system_id, cell_definition_id, id DESC);
+
+-- cell_quality_audits: the DETERMINISTIC verdict (Principle 6, evaluated
+-- against the component's evaluation_criteria via app/evaluator.py) plus an
+-- OPTIONAL fail-closed reasoning explanation (only attempted for 'fail'
+-- verdicts; a failed/skipped explanation never blocks the deterministic
+-- verdict from being persisted). auditor_model_alias is recorded verbatim
+-- so a worker-alias vs auditor-alias mismatch is always visible in the row.
+-- verbatim_example and explanation are separate fields from fact/verdict --
+-- raw evidence-backed facts are never mixed with interpretation text
+-- (Principle 7), even though the verdict itself is deterministic.
+CREATE TABLE IF NOT EXISTS cell_quality_audits (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                 INTEGER NOT NULL,
+    sample_id                 INTEGER NOT NULL,
+    auditor_model_alias       TEXT NOT NULL,
+    verdict                   TEXT NOT NULL
+                                  CHECK (verdict IN ('pass', 'fail', 'no_criteria')),
+    verdict_decision_method   TEXT NOT NULL DEFAULT 'deterministic',
+    is_blind                  INTEGER NOT NULL DEFAULT 0,
+    failed_criteria_json      TEXT NOT NULL DEFAULT '[]',
+    verbatim_example          TEXT NOT NULL DEFAULT '',
+    explanation               TEXT NOT NULL DEFAULT '',
+    explanation_run_id        INTEGER,
+    created_at                 REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (sample_id) REFERENCES cell_quality_samples (id) ON DELETE CASCADE,
+    FOREIGN KEY (explanation_run_id) REFERENCES intelligence_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_quality_audits_sample
+    ON cell_quality_audits (system_id, sample_id, id DESC);
+
+-- cell_intake_states: only the ONE Cell whose rolling pass rate breaches its
+-- quality_floor is ever suspended -- every other Cell (in this System or any
+-- other) is untouched. escalation_id points at the sev1 escalation created
+-- (via app/cell_tasks.py's existing submit_report path) in the same logical
+-- suspend operation; resume clears it back to NULL.
+CREATE TABLE IF NOT EXISTS cell_intake_states (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    cell_definition_id    INTEGER NOT NULL,
+    intake_status         TEXT NOT NULL DEFAULT 'accepting'
+                              CHECK (intake_status IN ('accepting', 'suspended')),
+    reason                TEXT NOT NULL DEFAULT '',
+    escalation_id         INTEGER,
+    changed_at            REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (cell_definition_id) REFERENCES cell_definitions (id) ON DELETE CASCADE,
+    FOREIGN KEY (escalation_id) REFERENCES cell_escalations (id) ON DELETE SET NULL,
+    UNIQUE (system_id, cell_definition_id)
+);
+
+-- cell_quality_usage: System-scoped daily audit-budget counter, mirroring
+-- llm_daily_usage's (Issue #273) exact pattern -- one row per (system, UTC
+-- day), incremented atomically before an audit runs. Each Cell's own
+-- cell_quality_configs.daily_audit_budget is the ceiling compared against
+-- this SHARED per-System counter (never a per-Cell counter row).
+CREATE TABLE IF NOT EXISTS cell_quality_usage (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id     INTEGER NOT NULL,
+    day           TEXT NOT NULL,
+    audits_used   INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    UNIQUE (system_id, day)
+);
 """
 
 

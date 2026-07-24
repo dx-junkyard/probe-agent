@@ -46,7 +46,7 @@ import math
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from . import cell_fabric
+from . import cell_fabric, cell_quality
 
 BINDING_STATUSES: Tuple[str, ...] = (
     "active", "stale", "review_required", "superseded",
@@ -487,4 +487,7 @@ def build_cell_state(
         conn, system_id=system_id, component_id=cell_row["cell_id"],
         window_seconds=window_seconds,
     )
-    return state.model_copy(update={"health": health})
+    quality = cell_quality.build_cell_quality_state(
+        conn, system_id=system_id, cell_definition_id=cell_row["id"],
+    )
+    return state.model_copy(update={"health": health, "quality": quality})
