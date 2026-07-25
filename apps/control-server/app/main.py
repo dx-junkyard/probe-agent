@@ -10,6 +10,12 @@ from .routes import (
     assistant,
     auth,
     candidate_studio,
+    cell_fabric,
+    cell_improvement,
+    cell_orchestrators,
+    cell_quality,
+    cell_root,
+    cell_tasks,
     components,
     connectivity,
     diagnostics,
@@ -114,6 +120,12 @@ def create_app() -> FastAPI:
     app.include_router(question_router.router, dependencies=_auth)
     app.include_router(github_connections.router, dependencies=_auth)
     app.include_router(publish_jobs.router, dependencies=_auth)
+    app.include_router(cell_fabric.router, dependencies=_auth)
+    app.include_router(cell_tasks.router, dependencies=_auth)
+    app.include_router(cell_orchestrators.router, dependencies=_auth)
+    app.include_router(cell_quality.router, dependencies=_auth)
+    app.include_router(cell_root.router, dependencies=_auth)
+    app.include_router(cell_improvement.router, dependencies=_auth)
     return app
 
 

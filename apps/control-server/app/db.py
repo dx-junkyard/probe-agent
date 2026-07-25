@@ -2846,6 +2846,621 @@ CREATE INDEX IF NOT EXISTS idx_question_handoff_session
 
 CREATE INDEX IF NOT EXISTS idx_question_handoff_system
     ON question_handoff (system_id, session_id);
+
+-- Probe Cell Fabric (Issue #297), Sub 1: Cell contract / Role Card / common
+-- state schema (Issue #298). See app/cell_fabric.py for the Pydantic
+-- contract layer and the "Probe Cell Fabric(Issue #297)" section of
+-- docs/project-intelligence.md for the full epic design.
+--
+-- agent_role_cards is versioned and append-only per (system_id, role_key,
+-- version): a new revision is always a new row (UNIQUE constraint below
+-- enforces no duplicate version), never an UPDATE of an existing version's
+-- content. Only `status` may be updated on an existing row (e.g. deprecate).
+-- This is a distinct table from the existing API Role Card display model
+-- (Issue #58) -- Agent Role Card declares a Cell's mission/scope/model
+-- alias/tool policy/acceptance template/rubric ref, never mixed with it.
+CREATE TABLE IF NOT EXISTS agent_role_cards (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                   INTEGER NOT NULL,
+    role_key                    TEXT NOT NULL,
+    version                     TEXT NOT NULL,
+    status                      TEXT NOT NULL DEFAULT 'draft'
+                                     CHECK (status IN ('draft', 'active', 'deprecated')),
+    mission                     TEXT NOT NULL,
+    scope_json                  TEXT NOT NULL DEFAULT '[]',
+    out_of_scope_json           TEXT NOT NULL DEFAULT '[]',
+    model_alias                 TEXT NOT NULL,
+    tool_policy_json            TEXT NOT NULL DEFAULT '{}',
+    acceptance_template_json    TEXT NOT NULL DEFAULT '[]',
+    rubric_ref                  TEXT,
+    changelog                   TEXT NOT NULL,
+    schema_version              TEXT NOT NULL,
+    decision_method             TEXT NOT NULL DEFAULT 'manual',
+    created_by                  TEXT,
+    created_at                  REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    UNIQUE (system_id, role_key, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_role_cards_system_role
+    ON agent_role_cards (system_id, role_key, id DESC);
+
+-- cell_definitions: one logical Probe Cell per row. roster_json NULL means a
+-- worker Cell; a non-null JSON array (possibly empty) means an orchestrator
+-- Cell -- there is no separate "kind" column, matching the shared
+-- cell_definition schema. role_card_id pins the Cell to one specific Role
+-- Card VERSION row (not just a role_key), so a Role Card revision never
+-- silently changes an already-bound Cell's behavior.
+CREATE TABLE IF NOT EXISTS cell_definitions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id       INTEGER NOT NULL,
+    cell_id         TEXT NOT NULL,
+    roster_json     TEXT,
+    role_card_id    INTEGER NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'dormant'
+                        CHECK (status IN ('active', 'dormant', 'retired')),
+    mission         TEXT NOT NULL DEFAULT '',
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (role_card_id) REFERENCES agent_role_cards (id) ON DELETE RESTRICT,
+    UNIQUE (system_id, cell_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_definitions_system
+    ON cell_definitions (system_id, id DESC);
+
+-- Probe Cell Fabric (Issue #297), Sub 2: versioned Cell Binding and a
+-- read-only Probe Cell pilot (Issue #299). See app/cell_binding.py for the
+-- provenance/versioning/drift logic and the "Probe Cell Fabric(Issue #297)"
+-- section of docs/project-intelligence.md for the full design.
+--
+-- cell_bindings rows are append-only VERSIONS: creating a new binding for a
+-- Cell never UPDATEs the content of a prior version's row -- it inserts a
+-- new row with version = max(version)+1 and marks the previous
+-- active/stale/review_required row 'superseded' in the same transaction.
+-- provenance is exactly one of probe_point_id (an approved Probe Point) or
+-- probe_pattern_id (a Probe Pattern's saved point); both are nullable so
+-- either source can be recorded, but application logic (app/cell_binding.py)
+-- requires exactly one to be set.
+CREATE TABLE IF NOT EXISTS cell_bindings (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    cell_definition_id    INTEGER NOT NULL,
+    version               INTEGER NOT NULL,
+    snapshot_id           INTEGER NOT NULL,
+    commit_sha            TEXT NOT NULL,
+    path                  TEXT NOT NULL,
+    qualified_symbol      TEXT NOT NULL,
+    component_id          TEXT NOT NULL,
+    probe_point_id        INTEGER,
+    probe_pattern_id      INTEGER,
+    feature_refs_json     TEXT NOT NULL DEFAULT '[]',
+    capability_refs_json  TEXT NOT NULL DEFAULT '[]',
+    entrypoint_refs_json  TEXT NOT NULL DEFAULT '[]',
+    status                TEXT NOT NULL DEFAULT 'active'
+                              CHECK (status IN ('active', 'stale', 'review_required', 'superseded')),
+    status_reason         TEXT NOT NULL DEFAULT '',
+    created_at            REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (cell_definition_id) REFERENCES cell_definitions (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE RESTRICT,
+    FOREIGN KEY (probe_point_id) REFERENCES probe_points (id) ON DELETE SET NULL,
+    FOREIGN KEY (probe_pattern_id) REFERENCES probe_patterns (id) ON DELETE SET NULL,
+    UNIQUE (system_id, cell_definition_id, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_bindings_cell
+    ON cell_bindings (system_id, cell_definition_id, version DESC);
+
+CREATE INDEX IF NOT EXISTS idx_cell_bindings_status
+    ON cell_bindings (system_id, cell_definition_id, status);
+
+-- cell_activations: an audit record of when a Cell was invoked (explicit
+-- request or an aggregation-window trigger). This is NOT a per-trace LLM
+-- call log -- Sub 2 never invokes an LLM; used_llm defaults to 0 and there
+-- is no LLM execution path in this sub-issue at all (later subs may record
+-- used_llm=1 once an orchestrator/worker execution path exists).
+CREATE TABLE IF NOT EXISTS cell_activations (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    cell_definition_id    INTEGER NOT NULL,
+    trigger_kind          TEXT NOT NULL
+                              CHECK (trigger_kind IN ('explicit', 'aggregation_window')),
+    window_start          REAL,
+    window_end            REAL,
+    requested_by          TEXT,
+    used_llm              INTEGER NOT NULL DEFAULT 0,
+    intelligence_run_id   INTEGER,
+    status                TEXT NOT NULL DEFAULT 'recorded'
+                              CHECK (status IN ('recorded', 'completed', 'failed')),
+    detail                TEXT NOT NULL DEFAULT '',
+    created_at            REAL NOT NULL,
+    completed_at          REAL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (cell_definition_id) REFERENCES cell_definitions (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_activations_cell
+    ON cell_activations (system_id, cell_definition_id, id DESC);
+-- Issue #300 (Sub 3 of the Probe Cell Fabric epic, Issue #297): Goal/Task
+-- ledger + delegate/report/escalate protocol. Purely deterministic -- no
+-- reasoning-model call anywhere in this table group or in app/cell_tasks.py.
+-- parent_goal_id NULL means a root goal; cycle rejection is enforced in
+-- app/cell_tasks.py (walking the parent chain), not by SQLite.
+CREATE TABLE IF NOT EXISTS cell_goals (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id       INTEGER NOT NULL,
+    parent_goal_id  INTEGER,
+    title           TEXT NOT NULL,
+    description     TEXT NOT NULL DEFAULT '',
+    owner_cell_id   INTEGER,
+    status          TEXT NOT NULL DEFAULT 'open'
+                        CHECK (status IN ('open', 'achieved', 'abandoned')),
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_goal_id) REFERENCES cell_goals (id) ON DELETE CASCADE,
+    FOREIGN KEY (owner_cell_id) REFERENCES cell_definitions (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_goals_system
+    ON cell_goals (system_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_cell_goals_parent
+    ON cell_goals (system_id, parent_goal_id);
+
+-- cell_tasks: exactly one owner Cell and one parent goal per task by
+-- construction (no many-to-many membership table exists at Sub 3).
+-- acceptance_json must be a non-empty JSON array; this is enforced at the
+-- API/core layer via cell_fabric.TaskDelegation-style validation, not by a
+-- SQLite CHECK (JSON array emptiness is not expressible there). UNIQUE
+-- (system_id, idempotency_key) relies on SQLite treating distinct NULLs as
+-- non-conflicting, so tasks created without an idempotency key never
+-- collide with each other.
+CREATE TABLE IF NOT EXISTS cell_tasks (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    goal_id               INTEGER NOT NULL,
+    owner_cell_id         INTEGER NOT NULL,
+    delegated_by_cell_id  INTEGER,
+    title                 TEXT NOT NULL,
+    acceptance_json       TEXT NOT NULL,
+    context_refs_json     TEXT NOT NULL DEFAULT '[]',
+    budget_json           TEXT,
+    deadline              TEXT,
+    priority              TEXT NOT NULL DEFAULT 'normal'
+                              CHECK (priority IN ('low', 'normal', 'high')),
+    status                TEXT NOT NULL DEFAULT 'todo'
+                              CHECK (status IN ('todo', 'doing', 'review', 'done', 'failed', 'blocked')),
+    retry_count           INTEGER NOT NULL DEFAULT 0,
+    retry_limit           INTEGER NOT NULL DEFAULT 3,
+    blocked_by_json       TEXT NOT NULL DEFAULT '[]',
+    acceptance_met        INTEGER NOT NULL DEFAULT 0,
+    evidence_json         TEXT NOT NULL DEFAULT '[]',
+    returned_to_parent    INTEGER NOT NULL DEFAULT 0,
+    idempotency_key       TEXT,
+    created_at            REAL NOT NULL,
+    updated_at            REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (goal_id) REFERENCES cell_goals (id) ON DELETE CASCADE,
+    FOREIGN KEY (owner_cell_id) REFERENCES cell_definitions (id) ON DELETE RESTRICT,
+    FOREIGN KEY (delegated_by_cell_id) REFERENCES cell_definitions (id) ON DELETE SET NULL,
+    UNIQUE (system_id, idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_tasks_system
+    ON cell_tasks (system_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_cell_tasks_goal
+    ON cell_tasks (system_id, goal_id);
+CREATE INDEX IF NOT EXISTS idx_cell_tasks_owner
+    ON cell_tasks (system_id, owner_cell_id);
+CREATE INDEX IF NOT EXISTS idx_cell_tasks_status
+    ON cell_tasks (system_id, status);
+
+-- Append-only audit of every task state transition -- retry / blocked /
+-- unblocked / returned_to_parent are ordinary rows here, written in the same
+-- transaction as the state change, never reconstructed after the fact.
+CREATE TABLE IF NOT EXISTS cell_task_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id    INTEGER NOT NULL,
+    task_id      INTEGER NOT NULL,
+    event_type   TEXT NOT NULL,
+    from_status  TEXT,
+    to_status    TEXT,
+    detail       TEXT NOT NULL DEFAULT '',
+    created_at   REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (task_id) REFERENCES cell_tasks (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_task_events_task
+    ON cell_task_events (system_id, task_id, id DESC);
+
+-- cell_reports: kind is schema-validated to digest|escalation only -- any
+-- other free-form payload is rejected fail-closed at the API layer
+-- (Pydantic extra="forbid"). fact_json / interpretation_json / ask_json stay
+-- separate fields: raw evidence-backed facts are never mixed with
+-- interpretation/ask text (Principle 7), even though this module calls no
+-- reasoning model.
+CREATE TABLE IF NOT EXISTS cell_reports (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id            INTEGER NOT NULL,
+    cell_definition_id   INTEGER NOT NULL,
+    task_id              INTEGER,
+    kind                 TEXT NOT NULL CHECK (kind IN ('digest', 'escalation')),
+    severity             TEXT CHECK (severity IS NULL OR severity IN ('sev1', 'sev2', 'sev3')),
+    fact_json            TEXT NOT NULL DEFAULT '[]',
+    interpretation_json  TEXT NOT NULL DEFAULT '[]',
+    ask_json             TEXT NOT NULL DEFAULT '[]',
+    idempotency_key      TEXT,
+    created_at           REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (cell_definition_id) REFERENCES cell_definitions (id) ON DELETE CASCADE,
+    FOREIGN KEY (task_id) REFERENCES cell_tasks (id) ON DELETE SET NULL,
+    UNIQUE (system_id, idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_reports_system
+    ON cell_reports (system_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_cell_reports_cell
+    ON cell_reports (system_id, cell_definition_id, id DESC);
+
+-- cell_escalations: created automatically from an escalation-kind report in
+-- the same transaction; never created independently of a report.
+CREATE TABLE IF NOT EXISTS cell_escalations (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id            INTEGER NOT NULL,
+    report_id            INTEGER NOT NULL,
+    cell_definition_id   INTEGER NOT NULL,
+    severity             TEXT NOT NULL CHECK (severity IN ('sev1', 'sev2', 'sev3')),
+    status               TEXT NOT NULL DEFAULT 'open'
+                             CHECK (status IN ('open', 'acknowledged', 'resolved')),
+    summary              TEXT NOT NULL,
+    created_at           REAL NOT NULL,
+    updated_at           REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (report_id) REFERENCES cell_reports (id) ON DELETE CASCADE,
+    FOREIGN KEY (cell_definition_id) REFERENCES cell_definitions (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_escalations_system
+    ON cell_escalations (system_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_cell_escalations_status
+    ON cell_escalations (system_id, status, id DESC);
+
+-- Probe Cell Fabric (Issue #297), Sub 4: 領域オーケストレーター (Issue #301).
+-- See app/cell_orchestrator.py for guardrail validation, the deterministic
+-- digest builder, and the reasoning triage; the "Probe Cell Fabric(Issue
+-- #297)" section of docs/project-intelligence.md for the full epic design.
+--
+-- cell_roster_events: append-only audit of every roster change made through
+-- the explicit PUT /cell-fabric/cells/{cell_id}/roster endpoint (creation is
+-- NOT audited here). old_roster_json is NULL when the cell had no roster
+-- before (a worker Cell becoming an orchestrator for the first time).
+CREATE TABLE IF NOT EXISTS cell_roster_events (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    cell_definition_id    INTEGER NOT NULL,
+    old_roster_json       TEXT,
+    new_roster_json       TEXT NOT NULL,
+    changed_by            TEXT,
+    created_at            REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (cell_definition_id) REFERENCES cell_definitions (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_roster_events_cell
+    ON cell_roster_events (system_id, cell_definition_id, id DESC);
+
+-- cell_triage_results: persisted reasoning triage output (individual vs
+-- systemic vs upstream vs inconclusive), kept separate from the
+-- deterministic digest_json snapshot it was computed from (Principle 7 --
+-- raw facts and interpretation stay separate fields even within one row).
+-- intelligence_run_id is NOT NULL: a row here is only ever written alongside
+-- a completed intelligence_runs row in the same transaction -- on ANY
+-- failure app/cell_orchestrator.py persists the failed run and writes no row
+-- here at all (fail-closed, no heuristic classification).
+CREATE TABLE IF NOT EXISTS cell_triage_results (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id               INTEGER NOT NULL,
+    cell_definition_id      INTEGER NOT NULL,
+    intelligence_run_id     INTEGER NOT NULL,
+    digest_json             TEXT NOT NULL,
+    classification          TEXT NOT NULL
+                                CHECK (classification IN ('individual', 'systemic', 'upstream', 'inconclusive')),
+    reasoning_summary       TEXT NOT NULL DEFAULT '',
+    affected_cell_ids_json  TEXT NOT NULL DEFAULT '[]',
+    proposed_ask            TEXT NOT NULL DEFAULT '',
+    created_at              REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (cell_definition_id) REFERENCES cell_definitions (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_triage_results_cell
+    ON cell_triage_results (system_id, cell_definition_id, id DESC);
+
+-- Probe Cell Fabric (Issue #297), Sub 6: 品質サンプリング・独立監査・quality
+-- floor (Issue #302). See app/cell_quality.py for the deterministic
+-- stratified sampling, the deterministic verdict + fail-closed reasoning
+-- explanation, the daily audit budget gate, and the quality-floor
+-- suspend/resume logic; the "Probe Cell Fabric(Issue #297)" section of
+-- docs/project-intelligence.md for the full epic design.
+--
+-- cell_quality_configs: one row per (system, Cell). sample_rate/audit_rate/
+-- quality_floor are fractions in [0.0, 1.0]; strata_json is a JSON array of
+-- {name, task_type?, risk?, rare} objects used for finite-field stratum
+-- matching only (Principle 6) -- never similarity/keyword scoring.
+CREATE TABLE IF NOT EXISTS cell_quality_configs (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    cell_definition_id    INTEGER NOT NULL,
+    sample_rate           REAL NOT NULL DEFAULT 0.05
+                              CHECK (sample_rate >= 0.0 AND sample_rate <= 1.0),
+    strata_json           TEXT NOT NULL DEFAULT '[]',
+    audit_rate            REAL NOT NULL DEFAULT 0.1
+                              CHECK (audit_rate >= 0.0 AND audit_rate <= 1.0),
+    quality_floor         REAL NOT NULL DEFAULT 0.7
+                              CHECK (quality_floor >= 0.0 AND quality_floor <= 1.0),
+    floor_window          INTEGER NOT NULL DEFAULT 20 CHECK (floor_window >= 1),
+    daily_audit_budget    INTEGER NOT NULL DEFAULT 50 CHECK (daily_audit_budget >= 0),
+    created_at            REAL NOT NULL,
+    updated_at            REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (cell_definition_id) REFERENCES cell_definitions (id) ON DELETE CASCADE,
+    UNIQUE (system_id, cell_definition_id)
+);
+
+-- cell_quality_samples: deterministic stratified selection output. Every row
+-- is idempotent (UNIQUE + INSERT OR IGNORE at the app layer): re-running
+-- selection over the same window never duplicates a (system, Cell, target)
+-- row. selection_seed is the exact stable-hash input string used to derive
+-- the selection fraction, so a selection decision is always reproducible
+-- and auditable from the row alone.
+CREATE TABLE IF NOT EXISTS cell_quality_samples (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    cell_definition_id    INTEGER NOT NULL,
+    config_id             INTEGER NOT NULL,
+    stratum               TEXT NOT NULL DEFAULT '',
+    target_kind           TEXT NOT NULL DEFAULT 'trace' CHECK (target_kind = 'trace'),
+    -- traces.trace_id is TEXT (system_id + trace_id composite PK).
+    target_id             TEXT NOT NULL,
+    selection_seed        TEXT NOT NULL,
+    selected_at           REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (cell_definition_id) REFERENCES cell_definitions (id) ON DELETE CASCADE,
+    FOREIGN KEY (config_id) REFERENCES cell_quality_configs (id) ON DELETE RESTRICT,
+    UNIQUE (system_id, cell_definition_id, target_kind, target_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_quality_samples_cell
+    ON cell_quality_samples (system_id, cell_definition_id, id DESC);
+
+-- cell_quality_audits: the DETERMINISTIC verdict (Principle 6, evaluated
+-- against the component's evaluation_criteria via app/evaluator.py) plus an
+-- OPTIONAL fail-closed reasoning explanation (only attempted for 'fail'
+-- verdicts; a failed/skipped explanation never blocks the deterministic
+-- verdict from being persisted). auditor_model_alias is recorded verbatim
+-- so a worker-alias vs auditor-alias mismatch is always visible in the row.
+-- verbatim_example and explanation are separate fields from fact/verdict --
+-- raw evidence-backed facts are never mixed with interpretation text
+-- (Principle 7), even though the verdict itself is deterministic.
+CREATE TABLE IF NOT EXISTS cell_quality_audits (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                 INTEGER NOT NULL,
+    sample_id                 INTEGER NOT NULL,
+    auditor_model_alias       TEXT NOT NULL,
+    verdict                   TEXT NOT NULL
+                                  CHECK (verdict IN ('pass', 'fail', 'no_criteria')),
+    verdict_decision_method   TEXT NOT NULL DEFAULT 'deterministic',
+    is_blind                  INTEGER NOT NULL DEFAULT 0,
+    failed_criteria_json      TEXT NOT NULL DEFAULT '[]',
+    verbatim_example          TEXT NOT NULL DEFAULT '',
+    explanation               TEXT NOT NULL DEFAULT '',
+    explanation_run_id        INTEGER,
+    created_at                 REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (sample_id) REFERENCES cell_quality_samples (id) ON DELETE CASCADE,
+    FOREIGN KEY (explanation_run_id) REFERENCES intelligence_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_quality_audits_sample
+    ON cell_quality_audits (system_id, sample_id, id DESC);
+
+-- cell_intake_states: only the ONE Cell whose rolling pass rate breaches its
+-- quality_floor is ever suspended -- every other Cell (in this System or any
+-- other) is untouched. escalation_id points at the sev1 escalation created
+-- (via app/cell_tasks.py's existing submit_report path) in the same logical
+-- suspend operation; resume clears it back to NULL.
+CREATE TABLE IF NOT EXISTS cell_intake_states (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    cell_definition_id    INTEGER NOT NULL,
+    intake_status         TEXT NOT NULL DEFAULT 'accepting'
+                              CHECK (intake_status IN ('accepting', 'suspended')),
+    reason                TEXT NOT NULL DEFAULT '',
+    escalation_id         INTEGER,
+    changed_at            REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (cell_definition_id) REFERENCES cell_definitions (id) ON DELETE CASCADE,
+    FOREIGN KEY (escalation_id) REFERENCES cell_escalations (id) ON DELETE SET NULL,
+    UNIQUE (system_id, cell_definition_id)
+);
+
+-- cell_quality_usage: System-scoped daily audit-budget counter, mirroring
+-- llm_daily_usage's (Issue #273) exact pattern -- one row per (system, UTC
+-- day), incremented atomically before an audit runs. Each Cell's own
+-- cell_quality_configs.daily_audit_budget is the ceiling compared against
+-- this SHARED per-System counter (never a per-Cell counter row).
+CREATE TABLE IF NOT EXISTS cell_quality_usage (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id     INTEGER NOT NULL,
+    day           TEXT NOT NULL,
+    audits_used   INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    UNIQUE (system_id, day)
+);
+-- Probe Cell Fabric (Issue #297), Sub 5: Root Orchestrator と統合ダイジェスト
+-- (Issue #303). See app/cell_root.py for the deterministic digest builder and
+-- ask lifecycle, and the "Probe Cell Fabric(Issue #297)" section of
+-- docs/project-intelligence.md for the full epic design.
+--
+-- cell_asks: a human-decidable Ask surfaced by the root digest, created from
+-- (a) an open sev1/sev2 cell_escalations row or (b) a cell_triage_results row
+-- with a non-empty proposed_ask. source_kind + source_id together identify
+-- the originating row (report is reserved for a future source kind; this Sub
+-- only ever writes 'escalation' or 'triage'). dedupe_key makes re-sync
+-- idempotent (UNIQUE with system_id) -- re-running sync_asks_from_sources
+-- never creates a duplicate row for the same source.
+--
+-- execution_approved ALWAYS stays 0 in this Sub: deciding an Ask ('accepted'
+-- | 'held' | 'rejected') records decision_method='manual' and flows back into
+-- the Goal/Task ledger (unblocking a blocked task, acknowledging the source
+-- escalation), but it is a PROPOSAL-ACCEPT record, never an EXECUTION-APPROVE
+-- record -- no policy change, candidate deploy, or patch apply is triggered
+-- here. Execution approval is #304's and the existing #25/#216/#242/#252
+-- gates' domain; this column exists so a later Sub can distinguish the two
+-- without a schema change, but nothing in this Sub ever sets it to 1.
+CREATE TABLE IF NOT EXISTS cell_asks (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    source_kind           TEXT NOT NULL CHECK (source_kind IN ('escalation', 'triage', 'report')),
+    source_id             INTEGER NOT NULL,
+    cell_definition_id    INTEGER,
+    goal_id               INTEGER,
+    task_id               INTEGER,
+    ask_text              TEXT NOT NULL,
+    severity              TEXT NOT NULL DEFAULT 'sev2' CHECK (severity IN ('sev1', 'sev2', 'sev3')),
+    status                TEXT NOT NULL DEFAULT 'open'
+                              CHECK (status IN ('open', 'accepted', 'held', 'rejected')),
+    decision              TEXT NOT NULL DEFAULT '',
+    decision_method       TEXT NOT NULL DEFAULT '',
+    decided_by            TEXT,
+    decided_at            REAL,
+    execution_approved    INTEGER NOT NULL DEFAULT 0,
+    dedupe_key            TEXT NOT NULL,
+    created_at            REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (cell_definition_id) REFERENCES cell_definitions (id) ON DELETE SET NULL,
+    FOREIGN KEY (goal_id) REFERENCES cell_goals (id) ON DELETE SET NULL,
+    FOREIGN KEY (task_id) REFERENCES cell_tasks (id) ON DELETE SET NULL,
+    UNIQUE (system_id, dedupe_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_asks_system
+    ON cell_asks (system_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_cell_asks_status
+    ON cell_asks (system_id, status, id DESC);
+
+-- Probe Cell Fabric (Issue #297), Sub 7: 改善仮説・カナリア・shadow実行承認
+-- ゲート (Issue #304). See app/cell_improvement.py for the lifecycle state
+-- machine, the canary evidence gate, parent/human approval gates, rubric
+-- ownership, the consecutive-rejection auto-suspend circuit breaker, and the
+-- fail-closed reasoning hypothesis draft; the "Probe Cell Fabric(Issue #297)"
+-- section of docs/project-intelligence.md for the full epic design.
+--
+-- cell_improvements: one row per improvement hypothesis. There is NO DELETE
+-- endpoint anywhere in this module -- a rejected row is permanent history,
+-- both for audit and because it is the deterministic input to the
+-- consecutive-rejection circuit breaker. role_card_id is the card that was
+-- PINNED to the Cell at the time this improvement was created (immutable
+-- baseline for comparison, distinct from cell_definitions.role_card_id which
+-- changes on adoption); NULL for target_kind='candidate_patch'.
+-- canary_evidence_json holds ONLY refs into EXISTING Replay/Experiment/
+-- Evaluation-Criteria infrastructure (replay_run:<id> / experiment:<id> /
+-- evaluation:<id>) -- never a new execution record.
+CREATE TABLE IF NOT EXISTS cell_improvements (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                   INTEGER NOT NULL,
+    cell_definition_id          INTEGER NOT NULL,
+    status                      TEXT NOT NULL DEFAULT 'observed'
+                                    CHECK (status IN ('observed', 'proposed', 'canary_ready',
+                                                       'canary_running', 'adopted', 'rejected',
+                                                       'blocked')),
+    target_kind                 TEXT NOT NULL CHECK (target_kind IN ('role_card', 'candidate_patch')),
+    hypothesis                  TEXT NOT NULL DEFAULT '',
+    expected_effect             TEXT NOT NULL DEFAULT '',
+    risk                        TEXT NOT NULL DEFAULT '',
+    rollback_plan               TEXT NOT NULL DEFAULT '',
+    observed_facts_json         TEXT NOT NULL DEFAULT '[]',
+    proposal_run_id             INTEGER,
+    role_card_id                INTEGER,
+    proposed_role_card_version  TEXT,
+    canary_evidence_json        TEXT NOT NULL DEFAULT '[]',
+    parent_cell_id              INTEGER,
+    parent_approved_by          TEXT,
+    parent_approved_at          REAL,
+    human_approved_by           TEXT,
+    human_approved_at           REAL,
+    suspended                   INTEGER NOT NULL DEFAULT 0,
+    suspension_reason           TEXT NOT NULL DEFAULT '',
+    created_at                  REAL NOT NULL,
+    updated_at                  REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (cell_definition_id) REFERENCES cell_definitions (id) ON DELETE CASCADE,
+    FOREIGN KEY (proposal_run_id) REFERENCES intelligence_runs (id) ON DELETE SET NULL,
+    FOREIGN KEY (role_card_id) REFERENCES agent_role_cards (id) ON DELETE SET NULL,
+    FOREIGN KEY (parent_cell_id) REFERENCES cell_definitions (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_improvements_cell
+    ON cell_improvements (system_id, cell_definition_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_cell_improvements_status
+    ON cell_improvements (system_id, cell_definition_id, status);
+
+-- cell_improvement_events: append-only audit trail -- rejected hypotheses
+-- are never deleted, and there is no DELETE endpoint anywhere in this
+-- module. This is also the deterministic input the consecutive-rejection
+-- circuit breaker (app/cell_improvement.py::_consecutive_rejection_count)
+-- reads to decide whether new-improvement creation is currently refused.
+CREATE TABLE IF NOT EXISTS cell_improvement_events (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    improvement_id    INTEGER NOT NULL,
+    event_type        TEXT NOT NULL CHECK (event_type IN (
+                          'created', 'status_transition', 'parent_approval', 'human_approval',
+                          'approvals_invalidated',
+                          'shadow_proposed', 'live_shadow_approval_requested',
+                          'live_shadow_approved', 'suspended', 'resumed', 'rolled_back'
+                      )),
+    from_status       TEXT,
+    to_status         TEXT,
+    actor             TEXT,
+    detail            TEXT NOT NULL DEFAULT '',
+    created_at        REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (improvement_id) REFERENCES cell_improvements (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_improvement_events_improvement
+    ON cell_improvement_events (system_id, improvement_id, id ASC);
+
+-- cell_shadow_decisions: a 'shadow_proposal' row and a
+-- 'live_shadow_execution_approval' row are ALWAYS separate records with
+-- separate statuses -- approving one never approves or performs the other.
+-- Approving a 'live_shadow_execution_approval' writes NOTHING but this row
+-- plus one cell_improvement_events row: no policy write, no candidate
+-- deploy, anywhere in app/cell_improvement.py.
+CREATE TABLE IF NOT EXISTS cell_shadow_decisions (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    improvement_id    INTEGER NOT NULL,
+    kind              TEXT NOT NULL CHECK (kind IN ('shadow_proposal', 'live_shadow_execution_approval')),
+    status            TEXT NOT NULL DEFAULT 'proposed'
+                          CHECK (status IN ('proposed', 'approved', 'rejected')),
+    decided_by        TEXT,
+    decided_at        REAL,
+    decision_method   TEXT NOT NULL DEFAULT '',
+    note              TEXT NOT NULL DEFAULT '',
+    created_at        REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (improvement_id) REFERENCES cell_improvements (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_cell_shadow_decisions_improvement
+    ON cell_shadow_decisions (system_id, improvement_id, id DESC);
 """
 
 

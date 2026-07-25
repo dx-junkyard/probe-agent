@@ -788,3 +788,144 @@ Add or update tests for:
   Issue #25 validation gate at job creation, the pre-push staleness
   re-check, approve/cancel idempotency, worktree cleanup on every terminal
   state, and system isolation
+
+## Probe Cell Fabric -- Goal/Task ledger (issue #300)
+
+Sub 3 of the Probe Cell Fabric epic (Issue #297; Sub 1's contract layer is
+`app/cell_fabric.py`, Issue #298). See the "Probe Cell Fabric(Issue #297)"
+section of `docs/project-intelligence.md` for the full epic design.
+
+- Core logic in `app/cell_tasks.py`; routes are thin
+  (`routes/cell_tasks.py`) and only translate `app.cell_tasks` errors to
+  HTTP status codes: `NotFoundError` -> 404, `ConflictError` -> 409,
+  `ValidationFailedError` -> 422.
+- Tables (System-scoped, additive `CREATE TABLE IF NOT EXISTS`, cascade
+  FKs): `cell_goals` (parent_goal_id nullable = root goal), `cell_tasks`
+  (exactly one `owner_cell_id` + one `goal_id` per row -- no many-to-many
+  membership table at this Sub), `cell_task_events` (append-only transition
+  audit), `cell_reports` (`kind` = `digest` | `escalation` only),
+  `cell_escalations` (created automatically from an escalation-kind report
+  in the same transaction).
+- Task transitions delegate legality to `cell_fabric.TASK_TRANSITIONS` /
+  `validate_task_transition` (Issue #298) -- this module never re-implements
+  the transition table. It only adds ledger-specific rules on top: a retry
+  (`failed -> todo`) increments `retry_count` and is refused (409) once
+  `retry_count >= retry_limit`; entering `blocked` requires `blocked_by`
+  task ids or an explicit `detail`; every transition writes exactly one
+  `cell_task_events` row (event_type is `created` / `transition` / `retry`
+  / `blocked` / `unblocked` / `returned_to_parent`, chosen structurally from
+  the from/to status pair, never inferred after the fact).
+  `return_to_parent` is only legal from `failed` or `blocked`.
+- Delegation (P1, `delegate_task`) reuses `cell_fabric.TaskDelegation` for
+  the acceptance/context_refs/budget/deadline/priority contract instead of
+  re-validating it -- a missing/empty `acceptance` list is the same
+  fail-closed error as #298's contract layer.
+- Evidence/context ref resolution (`resolve_evidence_ref`, Principle 6:
+  deterministic, finite ref grammar only) accepts exactly `trace:<id>` /
+  `evaluation:<id>` / `shadow_result:<id>` / `replay_run:<id>` /
+  `experiment:<id>` / `snapshot_file:<snapshot_id>:<path>`, and verifies the
+  referenced row exists AND belongs to the calling System (snapshot_file
+  additionally checks the path exists in `snapshot_files` for that
+  snapshot). Applied at the `done` transition's `evidence_refs`, a task's
+  `context_refs`, and a report's per-fact `evidence_refs`. `quality_sample:<id>`
+  and `improvement:<id>` are RESERVED P3/P4 ref formats (Sub 6 / #302 and
+  Sub 7 / #304 respectively) -- they parse but always fail closed with a
+  "not yet implemented" message; do not make them resolvable here.
+- Reports (P2, `submit_report`): `kind` outside `digest`/`escalation` is
+  rejected fail-closed, and any unknown request field is rejected by the
+  Pydantic `extra="forbid"` request model. `escalation` requires
+  `severity`; `digest` must not set one. `fact` / `interpretation` / `ask`
+  are stored as separate JSON columns -- raw evidence-backed facts are
+  never mixed with interpretation/ask text (Principle 7 discipline, even
+  though this module calls no reasoning model).
+- Idempotency: `delegate_task` and `submit_report` both accept an optional
+  `idempotency_key`; a resend with the same `(system_id, idempotency_key)`
+  returns the EXISTING row unchanged (`UNIQUE (system_id, idempotency_key)`
+  -- SQLite treats distinct NULLs as non-conflicting, so tasks/reports
+  without a key never collide with each other).
+- Goal cycle rejection (`would_create_cycle`) walks the parent chain
+  deterministically. There is no reparent endpoint at Sub 3 (only goal
+  creation and a status-only update), so the checker is exercised directly
+  in tests the same way #298 tests `validate_task_transition` directly --
+  it exists so a future reparent path can reuse it without adding a new
+  cycle-detection implementation.
+- This module has NO reasoning-model call anywhere (non-goal for #300):
+  orchestrator aggregation/triage is #301, quality sampling is #302,
+  improvement proposals are #304.
+- Tests: `tests/test_cell_tasks.py`.
+
+## Probe Cell Fabric -- epic-wide map (issue #297, subs #298-#304)
+
+See the "Probe Cell Fabric(Issue #297)" section of
+`docs/project-intelligence.md` for the binding design. Module map:
+
+- `app/cell_fabric.py` (#298): shared-schema mirror models
+  (`extra="forbid"` fail-closed), `TASK_TRANSITIONS` /
+  `validate_task_transition` (done requires acceptance + evidence),
+  Role Card semver compat (same-major AND >= pinned), and
+  `resolve_model_alias` (`CELL_MODEL_ALIAS_<UPPER_ALIAS>` env,
+  `provider:model`; unset falls back to `intelligence_from_env`). Role
+  Cards never store literal provider/model names; changing the env value
+  never requires a card revision. Tables `agent_role_cards` (append-only
+  versions) / `cell_definitions` (roster_json NULL = worker, non-null =
+  orchestrator; no separate kind column).
+- `app/cell_binding.py` (#299): `cell_bindings` append-only versions from
+  APPROVED probe points / pattern points only; drift is purely structural
+  (`active`/`stale`/`review_required`, never re-binds); `build_cell_health`
+  aggregates traces/activations deterministically (unobserved = None).
+  `cell_activations` audits explicit/aggregation-window triggers; there is
+  no per-trace LLM path anywhere in the fabric.
+- `app/cell_tasks.py` (#300): see the dedicated section above.
+- `app/cell_orchestrator.py` (#301): roster guardrails (span <= 7,
+  depth <= 3, no self/cycle, members must exist; static rosters changed
+  only via `PUT .../roster` + `cell_roster_events` audit); deterministic
+  digest with finite bottleneck rules (queue_depth / stuck_task /
+  blocked_chain / retry_churn, facts attached); `run_triage` is the ONE
+  reasoning boundary (run_type `cell_triage`, fail-closed, facts survive
+  failure, roster-external affected ids rejected).
+- `app/cell_quality.py` (#302): quality sampling is a SEPARATE contract
+  from the SDK's lineage `sample_rate`. Deterministic stable-hash
+  stratified selection (rare strata guaranteed >= 1); audit VERDICT is
+  deterministic via `evaluator.py` (`pass`/`fail`/`no_criteria`), only the
+  failure explanation is reasoning_llm (fail-closed; verdict row survives
+  LLM failure); blind re-audits never read prior audit rows; quality-floor
+  breach suspends ONLY that cell's intake + sev1 escalation via
+  `cell_tasks.submit_report`; `cell_quality_usage` enforces the
+  System-scoped daily audit budget.
+- `app/cell_root.py` (#303): `GET /cell-fabric/root-digest` reuses
+  `system_state.build_system_state` as the canonical fact source (call it
+  BEFORE opening your own `get_conn` -- it manages its own connection);
+  4-level progressive disclosure (conclusion / key_points / evidence /
+  audit), sev1 -> conclusion, sev2 -> key_points, sev3 -> evidence,
+  sha256 dedupe with merged `sources`. `cell_asks` decisions are
+  `decision_method: manual`; `execution_approved` is ALWAYS 0 here --
+  proposal accept never executes anything. Dashboard page:
+  `apps/dashboard/src/pages/cell-fabric.tsx` (Japanese UI).
+- `app/cell_improvement.py` (#304): finite lifecycle `observed ->
+  proposed -> canary_ready -> canary_running -> adopted|rejected|blocked`
+  with append-only `cell_improvement_events` (rejected history never
+  deleted); canary evidence refs restricted to existing Replay /
+  Experiment / Evaluation rows (no new execution path); `adopted`
+  requires BOTH parent and human approval; role_card adoption re-pins
+  `cell_definitions.role_card_id` (rollback re-pins back);
+  candidate_patch adoption is a handoff marker only -- the real
+  adoption/publish flows through the existing #25/#216/#242/#252 gates.
+  `cell_shadow_decisions` keeps `shadow_proposal` and
+  `live_shadow_execution_approval` as separate manual records; approving
+  execution writes NO policy/candidate rows. Rubric changes are
+  parent-owned; >= 3 consecutive rejections auto-suspend the cell's
+  improvement rights.
+
+Cross-cutting rules for every fabric module:
+
+- `db.get_conn()`'s lock is NON-REENTRANT: pass `conn` into helpers, and
+  NEVER hold a connection across `generate_text` (the quota wrapper opens
+  its own connection) -- use the 3-phase read / LLM / write structure of
+  `cell_orchestrator.run_triage`.
+- All tables are System-scoped with isolation tests; all reasoning goes
+  through `intelligence_runs` fail-closed with `is_mock` surfaced; the
+  Probe SDK is never touched by fabric work.
+- Tests: `tests/test_cell_fabric.py`, `test_cell_binding.py`,
+  `test_cell_tasks.py`, `test_cell_orchestrator.py`,
+  `test_cell_quality.py`, `test_cell_root.py`,
+  `test_cell_improvement.py`.

@@ -177,6 +177,37 @@ creating incomplete persistence or execution paths for later phases.
     driven rule re-evaluation. #292 remains NOT implemented. See the
     Issue #295 section in `docs/project-intelligence.md`.
 
+12. Issue #297 — Probe Cell Fabric (sub-issues #298-#304): assign a logical
+    Probe Cell to each approved Probe Point / Component (1 probe = 1 logical
+    Cell, `system_id + component_id`; never a resident LLM process, never a
+    per-trace LLM call), aggregate state through Feature/UX/API/Flow domain
+    orchestrators, and unify user interaction in a Root Orchestrator.
+    Implement sub-issues in dependency order:
+    #298 Cell contract / versioned Agent Role Card (distinct from the #58
+    API Role Card; model aliases only, never literal provider/model names) /
+    common `cell_state` schema; #299 versioned Cell Binding from approved
+    Probe Points/Patterns only + a read-only Probe Cell pilot (structural
+    drift detection, never heuristic re-binding); #300 Goal/Task ledger with
+    single owner + single `parent_goal` per task, acceptance+evidence
+    required for `done`, digest/escalation-only report contract
+    (fail-closed), idempotent resends; #301 domain orchestrators
+    (deterministic bottleneck candidates; systemic-vs-individual triage is
+    reasoning_llm fail-closed; span-of-control ≤7, depth ≤3, static
+    rosters); #303 Root Orchestrator digest reusing `GET /system-state` as
+    the canonical fact source (severity routing, deterministic dedupe,
+    progressive disclosure, Ask decisions flow back to Goal/Task, proposal
+    accept ≠ execution approval); #302 quality sampling (separate from SDK
+    lineage sampling), auditor-model separation, blind re-audit, quality
+    floor circuit breaker per Cell, System-scoped cost caps; #304
+    improvement lifecycle (`observed → … → adopted|rejected|blocked`) with
+    canary evidence from existing Replay/offline-shadow/Experiment infra,
+    parent + human approval gates, shadow proposal vs live-shadow execution
+    approval as separate records, and no bypass of the existing #25/#216/
+    #242/#252 human gates. Keep the three structures separate: System
+    Topology Graph (existing, referenced read-only), Goal/Accountability
+    Tree, and Cell Runtime State. See the Issue #297 section in
+    `docs/project-intelligence.md`.
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,

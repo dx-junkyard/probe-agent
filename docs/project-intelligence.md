@@ -4130,3 +4130,203 @@ Issue #295 は Interview Alignment UX の元提案であり、その大部分は
    未確認候補は `status='proposed' AND origin='ai_proposed'` の行だけ。
    `not_applicable` へ却下済みの AI goal は「AI提案・未確認」として
    再表示しない。
+
+## Probe Cell Fabric(Issue #297)
+
+自律改善エージェント組織(Cell Fabric)の思想を取り込み、承認済みの各
+Probe Point / Component に論理的な Probe Cell を割り当て、Feature・UX・
+API/Flow 単位のオーケストレーターが状態を集約し、Root Orchestrator が
+ユーザーとのやり取りを一本化する。sub-issue は依存順に
+#298 → (#299 ∥ #300) → #301 → (#303 ∥ #302) → #304。
+
+### 全体アーキテクチャ決定
+
+1. **三つの構造の分離**。
+   - System Topology Graph: Feature / Capability / API / UX / Symbol /
+     Component の多対多関係。既存の understanding graph / feature_code_links
+     / capability_hierarchy を正本とし、Cell Fabric は参照のみ行う。
+   - Goal / Accountability Tree: `cell_goals` / `cell_tasks`(#300)。各 task
+     は単一の owner Cell と単一の `parent_goal` を持つ。Topology を Goal
+     Tree として流用しない。
+   - Cell Runtime State: mission / tasks / quality / health / improvement /
+     role card version。`cell_state` は読み取り時に既存の Trace /
+     Evaluation / Shadow Result / Replay / Experiment 参照から決定的に構築
+     し、キャッシュ用の別テーブルを持たない。
+2. **1 probe = 1 論理 Probe Cell**。Cell ID は原則
+   `system_id + component_id`。常駐 LLM プロセスや trace ごとの LLM 呼び出し
+   にはしない。モデル起動は明示要求または集約窓/イベント単位のみで、起動は
+   `cell_activations` に監査記録される。dormant Cell は LLM を消費しない。
+3. **Agent Role Card は既存の API Role Card(#58)と別物**。API Role Card は
+   API のシステム内役割の表示モデル。Agent Role Card(#298)は Cell の
+   mission / scope / model alias / tool policy / acceptance template /
+   rubric ref を宣言する versioned 契約で、同一 schema へ混在させない。
+4. **provider/model の実体名は Role Card に直書きしない**。Role Card は
+   `model_alias`(例 `worker-default` / `auditor-default`)のみを持ち、
+   alias → provider/model の解決は環境変数
+   `CELL_MODEL_ALIAS_<UPPER_ALIAS>`(値は `provider:model` 形式、未設定時は
+   既存 `LLMConfig.intelligence_from_env()` に委譲)で行う。実モデル名変更が
+   card 改版を要求しない。
+5. **shadow の「提案」と「実行」の分離**。Cell は `recommended_mode: shadow`
+   や候補・Replay Set・Experiment plan を提案できるが、policy 切替・
+   candidate 登録/配備・live shadow・patch 適用・採用・publish は既存の
+   人間ゲート(#25 / #216 / #242 / #252)を通る。#304 は提案 status と実行
+   承認 decision record を別レコードとして持つ。
+6. **判断境界(Principle 6)**。状態集約・優先度・ゲート・bottleneck 候補
+   抽出・sampling 選択・quality floor はすべて決定的。系統的問題の切り分け
+   (#301)、監査 verdict の根拠説明(#302)、改善仮説の生成(#304)は
+   reasoning_llm で fail-closed。承認・採用は常に `decision_method: manual`。
+
+### Sub 1: Cell 契約・Role Card・共通状態 schema(Issue #298)
+
+- shared schemas: `shared/schemas/cell_definition.schema.json` /
+  `cell_state.schema.json` / `agent_role_card.schema.json`。すべて
+  `additionalProperties: false` で unknown field を fail-closed 拒否。
+- サーバ契約層は `app/cell_fabric.py`。Pydantic モデルは
+  `model_config = ConfigDict(extra="forbid")`。
+- worker と orchestrator は別種類にせず、`roster`(子 Cell ID 配列、
+  nullable)の有無で表現する共通 Cell contract。
+- task 状態は有限集合 `todo | doing | review | done | failed | blocked`。
+  遷移規則は明示的な遷移表(`TASK_TRANSITIONS`)で検証し、`done` への遷移は
+  acceptance 充足フラグと evidence ref(1件以上)を必須とする。違反は
+  validation error。
+- Role Card は semver。`role_key` ごとに versioned 行を追加し(上書き禁止)、
+  changelog 必須。互換性検証は決定的: major 一致かつ以上のバージョンのみ
+  互換、schema_version 不一致・未知 enum・非互換 version は fail-closed。
+- テーブル(System-scoped、additive CREATE のみ):
+  `agent_role_cards`(role_key, version, status `draft|active|deprecated`,
+  mission, scope_json, out_of_scope_json, model_alias, tool_policy_json,
+  acceptance_template_json, rubric_ref, changelog, created_at, created_by,
+  decision_method)と `cell_definitions`(cell_id, roster_json nullable,
+  role_card_id + pinned card version, status `active|dormant|retired`,
+  mission override)。
+- API: `POST/GET /cell-fabric/role-cards`(+`/{id}`)、
+  `POST/GET /cell-fabric/cells`(+`/{cell_id}`)。routes は
+  `routes/cell_fabric.py`。
+- Goal/Task の永続化・Cell worker の起動・LLM による Role Card 自動生成は
+  非スコープ。
+
+### Sub 2: versioned Cell Binding と read-only pilot(Issue #299)
+
+- `cell_bindings`(cell FK, version 連番, snapshot_id, commit_sha, path,
+  qualified_symbol, probe_point_id / probe_pattern_id provenance,
+  feature/capability/entrypoint refs json, status
+  `active|stale|review_required|superseded`)。同一 Cell の source 移動・
+  snapshot 更新は新 version 行として保持し、上書きしない。
+- binding は承認済み Probe Point(status `approved`)または Probe Pattern
+  由来のみ作成可能。未承認は 409/422 で拒否。
+- read-only cell state: traces / evaluation_results / shadow_results /
+  replay_runs / experiments から heartbeat(最終 trace 時刻)、error rate、
+  duration 統計、直近 window 件数を決定的に集約(`GET
+  /cell-fabric/cells/{cell_id}/state`)。
+- drift 検出は構造的判定のみ: 最新 ready snapshot の `code_symbols` に同一
+  path + qualified symbol が存在しなければ `review_required`、存在するが
+  binding の snapshot が古ければ `stale`。推測で別 symbol へ再接続しない
+  (再接続は #168 の reconcile フローの領分)。
+- activation: `POST /cell-fabric/cells/{cell_id}/activations`(明示)または
+  集約窓条件。`cell_activations` に trigger 種別・窓・LLM 使用有無・
+  intelligence_run 参照を監査記録。trace ごとの LLM 呼び出し経路は存在
+  しない。
+- Probe SDK は変更しない。host isolation / non-blocking の回帰テストを維持。
+
+### Sub 3: Goal/Task 台帳と protocol(Issue #300)
+
+- テーブル: `cell_goals`(parent_goal_id nullable=root、循環拒否)、
+  `cell_tasks`(goal_id 必須、owner_cell_id 必須、acceptance_json 必須、
+  context_refs_json、budget_json、deadline/priority、retry_count/limit、
+  blocked_by_json、idempotency_key、evidence_json、returned_to_parent)、
+  `cell_reports`(kind `digest|escalation` は schema 検証、fact_json /
+  interpretation_json / ask_json を別 field、idempotency_key)、
+  `cell_escalations`(severity `sev1|sev2|sev3`、status
+  `open|acknowledged|resolved`)。
+- P1 delegate = task 作成(goal / acceptance / context_refs / budget /
+  deadline)。P2 report = digest / escalation の二形式のみで、契約外の
+  自由形式 payload は fail-closed 拒否。P3(quality sample event)と
+  P4(improvement proposal)は参照契約(ref 形式)のみ定義し、実装は
+  #302 / #304。
+- evidence は決定的に解決検証する: `trace:<id>` / `evaluation:<id>` /
+  `shadow_result:<id>` / `replay_run:<id>` / `experiment:<id>` /
+  `snapshot_file:<snapshot_id>:<path>` 形式のみ受け付け、実在しない参照は
+  422。
+- 同一 idempotency_key の再送は既存行を返し重複しない。
+
+### Sub 4: 領域オーケストレーター(Issue #301)
+
+- orchestrator は roster 付き `cell_definitions` 行。context lens
+  (feature/ux/api/flow)ごとの参照は多対多だが task owner は常に一意。
+- guardrail: roster は span of control 上限 7(5±2 の上限)、Goal Tree
+  深さ上限 3、構成は静的(API 経由の明示更新のみ)。違反は validation
+  error。
+- digest(`GET /cell-fabric/orchestrators/{cell_id}/digest`)は決定的
+  集約: 子 Cell の task 進捗、health、queue length、cycle time、WIP age、
+  blocked_by graph、critical path から bottleneck 候補を有限規則で列挙し、
+  各候補に根拠 fact と対処 task 参照を付ける。
+- 個別 Cell 問題か系統的/上流問題かの切り分けは reasoning_llm
+  (`run_type: cell_triage`、fail-closed)。失敗時も fact digest は返り、
+  推測で ask を確定しない。結果は fact と分離して
+  `cell_triage_results` に永続化。
+
+### Sub 5: Root Orchestrator と統合ダイジェスト(Issue #303)
+
+- `GET /cell-fabric/root-digest`: canonical deterministic facts は
+  `GET /system-state`(#235)の実装(`build_system_state`)を正本として
+  再利用し、Cell Fabric 由来の進捗・品質・escalation・Ask を統合。
+- severity routing: sev1 は即時 surface、sev2 は判断要求として集約、
+  sev3 は詳細格納。同一 root cause(決定的 dedupe key = 対象 Cell +
+  escalation 種別 + 根拠 evidence 集合のハッシュ)は一つに集約。
+- progressive disclosure: conclusion → key_points → evidence/uncertainty →
+  audit detail の 4 段を応答構造として持ち、UI はユーザー操作で展開。
+- Ask(`cell_asks`): 回答 `accept | hold | reject` は
+  `decision_method: manual` で記録し、元 Goal/Task へ還流(task の
+  blocked 解除/failed 化)。提案 accept と実行承認は別レコード・別状態
+  (実行承認は #304 のゲートおよび既存 #25/#216 ゲートの領分)。
+- Dashboard: `/cell-fabric` ページ(日本語 UI)。digest 表示・drill-down
+  (Feature → Cell → Trace/evidence)・Ask 回答。stale snapshot /
+  provenance / decision_method を明示。
+
+### Sub 6: 品質サンプリング・独立監査・quality floor(Issue #302)
+
+- SDK の lineage/projection `sample_rate` とは独立した quality sampling
+  契約。`cell_quality_configs`(sample_rate 既定 0.05〜0.10、strata_json
+  = task type / risk / rare case、audit_rate、quality_floor、budget)。
+- サンプル選択は決定的(安定ハッシュによる層化選択)。希少 stratum は
+  最低 1 件保証。選択結果は `cell_quality_samples`。
+- worker 実行モデルと auditor モデルは model alias で分離
+  (`auditor-default`)。監査は `cell_quality_audits`(verdict
+  `pass|fail` は golden set / Evaluation Criteria の決定的判定を優先し、
+  根拠説明のみ reasoning_llm・fail-closed。blind re-audit フラグ)。
+- pass/fail 集計・逐語例・fact・hypothesis は別 field で混在させない。
+- quality floor 割れ: 対象 Cell のみ `cell_intake_states` を
+  `suspended` にし sev1 escalation を発行。host app や無関係 Cell は
+  止めない。回復は floor 回復の決定的判定+明示操作。
+- sampling / audit / model cost に System-scoped 上限
+  (`resource_limits` の既存機構と同型の日次上限)。
+
+### Sub 7: 改善仮説・カナリア・承認ゲート(Issue #304)
+
+- `cell_improvements`: lifecycle
+  `observed → proposed → canary_ready → canary_running → adopted |
+  rejected | blocked`(有限遷移表)。hypothesis / 対象(role_card |
+  candidate_patch)/ 期待効果 / risk / rollback_plan / canary evidence
+  refs(golden set・Replay run・offline shadow・Experiment の参照のみ)/
+  parent 承認 / 人間承認 / suspension。`cell_improvement_events` は
+  append-only 履歴で rejected も削除しない。
+- 仮説文面の生成は reasoning_llm(fail-closed、intelligence_runs 監査)。
+  遷移はすべて決定的ゲート+manual 承認。
+- Role Card 変更はカナリア evidence + 直属親承認なしに `adopted` に
+  ならない。shared protocol/schema 変更は Root 承認 + 互換性テスト、
+  harness 変更は人間レビュー必須。rubric は親所有で自己変更不可。
+- shadow 提案(proposal record)と live shadow 実行承認(decision
+  record)は別テーブル列・別 status。live shadow 承認だけでは candidate
+  配備や policy 変更を実行しない。candidate 採用・patch 適用・publish は
+  既存人間ゲート(#25 / #216 / #242 / #252)へ handoff し、迂回経路を
+  作らない。
+- 連続失敗(閾値)・quality 悪化・契約違反で改善権を `suspended` にし、
+  rollback(Role Card は前 version へ pin)できる。
+
+### 非スコープ(Epic 全体)
+
+- `@probe` 内または trace 受信ごとの LLM 呼び出し
+- 既存 Component の一括 Cell 化、動的な無制限 Cell 生成・無限の入れ子
+- reasoning model だけによる承認・採用・publish
+- live shadow・source 変更・外部副作用の無承認実行
+- #282 Interview / #242 Replay 基盤の別系統再実装

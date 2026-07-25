@@ -436,3 +436,16 @@ Operational notes when touching a screen:
 For UI-only changes, provide manual verification steps if automated tests are not available.
 Verify system switching does not leak repository, Feature, plan, or experiment
 data across Systems.
+
+## Cell Fabric page (issue #303)
+
+- `src/pages/cell-fabric.tsx` (route `cell-fabric`, sidebar "Cell Fabric")
+  renders `GET /cell-fabric/root-digest` as 4-level progressive disclosure:
+  結論 (always visible) → 詳細 → エビデンス → 監査情報, collapsed by
+  default. UI copy is Japanese (Issue #266); Cell / Trace / severity codes
+  stay canonical.
+- The Ask list posts to `POST /cell-fabric/asks/{id}/decide`
+  (承認/保留/却下). Keep the fixed helper text 「承認は提案の受け入れのみを
+  意味し、実行には別途承認が必要です」 — proposal accept never means
+  execution approval (`execution_approved` stays 0 server-side).
+- Tests: `src/__tests__/cell-fabric.test.tsx`.

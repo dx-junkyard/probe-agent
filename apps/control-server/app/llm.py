@@ -362,6 +362,50 @@ class MockLLMClient(LLMClient):
                     ],
                 }
             )
+        if "CELL_TRIAGE_RESPONSE_JSON" in joined:
+            return json.dumps(
+                {
+                    "classification": "individual",
+                    "reasoning_summary": (
+                        "Mock triage: no external LLM was called; this is "
+                        "deterministic mock output."
+                    ),
+                    "affected_cell_ids": [],
+                    "proposed_ask": (
+                        "Mock proposed ask -- review the digest facts manually "
+                        "before acting."
+                    ),
+                }
+            )
+        if "CELL_IMPROVEMENT_RESPONSE_JSON" in joined:
+            return json.dumps(
+                {
+                    "hypothesis": (
+                        "Mock hypothesis: no external LLM was called; this is "
+                        "deterministic mock output grounded only in the "
+                        "observed facts refs supplied."
+                    ),
+                    "expected_effect": (
+                        "Mock expected effect: improved outcome on the "
+                        "sampled failure pattern."
+                    ),
+                    "risk": "Mock risk: review canary evidence before adoption.",
+                    "rollback_plan": (
+                        "Mock rollback plan: revert to the previously pinned "
+                        "Role Card version / patch."
+                    ),
+                }
+            )
+        if "CELL_QUALITY_AUDIT_RESPONSE_JSON" in joined:
+            return json.dumps(
+                {
+                    "explanation": (
+                        "Mock quality-audit explanation: no external LLM was "
+                        "called; this is deterministic mock output describing "
+                        "the failed criteria pattern."
+                    )
+                }
+            )
         if "REGRESSION_SCAFFOLD_RESPONSE_JSON" in joined:
             return json.dumps(
                 {

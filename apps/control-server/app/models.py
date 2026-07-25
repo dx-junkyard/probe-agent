@@ -5394,3 +5394,727 @@ class CandidateEventOut(BaseModel):
 class CandidateEventsOut(BaseModel):
     session_id: int
     events: List[CandidateEventOut] = Field(default_factory=list)
+
+
+# --- Probe Cell Fabric (Issue #297), Sub 1: Cell contract / Role Card /
+# common state schema (Issue #298). Request bodies reuse the shared-schema
+# mirror models in app/cell_fabric.py directly (AgentRoleCard,
+# CellDefinitionContract) so FastAPI's own request validation enforces the
+# fail-closed unknown-field / enum / schema_version rules; these are only the
+# server-assigned "Out" projections (id, system_id, timestamps, audit
+# fields). See docs/project-intelligence.md's "Probe Cell Fabric(Issue
+# #297)" section.
+
+
+class AgentRoleCardOut(BaseModel):
+    id: int
+    system_id: int
+    role_key: str
+    version: str
+    status: str
+    mission: str
+    scope: List[str] = Field(default_factory=list)
+    out_of_scope: List[str] = Field(default_factory=list)
+    model_alias: str
+    tool_policy: Dict[str, Any] = Field(default_factory=dict)
+    acceptance_template: List[str] = Field(default_factory=list)
+    rubric_ref: Optional[str] = None
+    changelog: str
+    schema_version: str
+    decision_method: str
+    created_by: Optional[str] = None
+    created_at: float
+
+
+class AgentRoleCardsListOut(BaseModel):
+    system_id: int
+    role_cards: List[AgentRoleCardOut] = Field(default_factory=list)
+
+
+class CellDefinitionOut(BaseModel):
+    id: int
+    system_id: int
+    cell_id: str
+    roster: Optional[List[str]] = None
+    role_card_ref: Dict[str, str]
+    status: str
+    mission: str
+    created_at: float
+    updated_at: float
+
+
+class CellsListOut(BaseModel):
+    system_id: int
+    cells: List[CellDefinitionOut] = Field(default_factory=list)
+
+
+class CellDetailOut(BaseModel):
+    definition: CellDefinitionOut
+    state: Dict[str, Any]
+
+
+# ---------------------------------------------------------------------------
+# Cell Binding / Activation (Issue #299, Sub 2 of the Probe Cell Fabric epic)
+# ---------------------------------------------------------------------------
+
+
+class CellBindingCreateIn(BaseModel):
+    """Exactly one of ``probe_point_id`` / ``probe_pattern_point_id`` must be
+    given; provenance is read from that row server-side, never accepted from
+    the caller."""
+
+    probe_point_id: Optional[int] = None
+    probe_pattern_point_id: Optional[int] = None
+    feature_refs: List[str] = Field(default_factory=list)
+    capability_refs: List[str] = Field(default_factory=list)
+    entrypoint_refs: List[str] = Field(default_factory=list)
+
+
+class CellBindingOut(BaseModel):
+    id: int
+    system_id: int
+    cell_definition_id: int
+    cell_id: str
+    version: int
+    snapshot_id: int
+    commit_sha: str
+    path: str
+    qualified_symbol: str
+    component_id: str
+    probe_point_id: Optional[int] = None
+    probe_pattern_id: Optional[int] = None
+    feature_refs: List[str] = Field(default_factory=list)
+    capability_refs: List[str] = Field(default_factory=list)
+    entrypoint_refs: List[str] = Field(default_factory=list)
+    status: str
+    status_reason: str
+    created_at: float
+
+
+class CellBindingsListOut(BaseModel):
+    system_id: int
+    cell_id: str
+    bindings: List[CellBindingOut] = Field(default_factory=list)
+
+
+class CellActivationCreateIn(BaseModel):
+    window_start: Optional[float] = None
+    window_end: Optional[float] = None
+    requested_by: Optional[str] = None
+
+
+class CellActivationOut(BaseModel):
+    id: int
+    system_id: int
+    cell_definition_id: int
+    cell_id: str
+    trigger_kind: str
+    window_start: Optional[float] = None
+    window_end: Optional[float] = None
+    requested_by: Optional[str] = None
+    used_llm: bool
+    intelligence_run_id: Optional[int] = None
+    status: str
+    detail: str
+    created_at: float
+    completed_at: Optional[float] = None
+
+
+class CellActivationsListOut(BaseModel):
+    system_id: int
+    cell_id: str
+    activations: List[CellActivationOut] = Field(default_factory=list)
+
+
+class CellStateOut(BaseModel):
+    """The read-only pilot state document: Sub 1's ``cell_state`` (with the
+    health block filled in) plus the current binding and recent activations
+    as sibling fields -- the ``cell_state`` schema itself is unchanged."""
+
+    cell_id: str
+    state: Dict[str, Any]
+    binding: Optional[CellBindingOut] = None
+    recent_activations: List[CellActivationOut] = Field(default_factory=list)
+# Goal/Task ledger + delegate/report/escalate protocol (Issue #300, Sub 3 of
+# the Probe Cell Fabric epic, Issue #297). Core logic lives in
+# app/cell_tasks.py; these are the request/response shapes for
+# routes/cell_tasks.py.
+# ---------------------------------------------------------------------------
+
+
+class CellGoalCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(..., min_length=1)
+    description: str = ""
+    parent_goal_id: Optional[int] = None
+    owner_cell_id: Optional[str] = None
+
+
+class CellGoalStatusUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: str
+
+
+class CellGoalOut(BaseModel):
+    id: int
+    system_id: int
+    parent_goal_id: Optional[int] = None
+    title: str
+    description: str = ""
+    owner_cell_id: Optional[str] = None
+    status: str
+    created_at: float
+    updated_at: float
+
+
+class CellGoalsListOut(BaseModel):
+    system_id: int
+    goals: List[CellGoalOut] = Field(default_factory=list)
+
+
+class CellTaskDelegateCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    goal_id: int
+    owner_cell_id: str = Field(..., min_length=1)
+    delegated_by_cell_id: Optional[str] = None
+    title: str = Field(..., min_length=1)
+    acceptance: List[str] = Field(..., min_length=1)
+    context_refs: List[str] = Field(default_factory=list)
+    budget: Optional[Dict[str, Any]] = None
+    deadline: Optional[str] = None
+    priority: Optional[str] = None
+    idempotency_key: Optional[str] = None
+
+
+class CellTaskOut(BaseModel):
+    id: int
+    system_id: int
+    goal_id: int
+    owner_cell_id: str
+    delegated_by_cell_id: Optional[str] = None
+    title: str
+    acceptance: List[str] = Field(default_factory=list)
+    context_refs: List[str] = Field(default_factory=list)
+    budget: Optional[Dict[str, Any]] = None
+    deadline: Optional[str] = None
+    priority: str
+    status: str
+    retry_count: int
+    retry_limit: int
+    blocked_by: List[int] = Field(default_factory=list)
+    acceptance_met: bool
+    evidence: List[str] = Field(default_factory=list)
+    returned_to_parent: bool
+    idempotency_key: Optional[str] = None
+    created_at: float
+    updated_at: float
+
+
+class CellTasksListOut(BaseModel):
+    system_id: int
+    tasks: List[CellTaskOut] = Field(default_factory=list)
+
+
+class CellGoalDetailOut(BaseModel):
+    goal: CellGoalOut
+    tasks: List[CellTaskOut] = Field(default_factory=list)
+
+
+class CellTaskEventOut(BaseModel):
+    id: int
+    task_id: int
+    event_type: str
+    from_status: Optional[str] = None
+    to_status: Optional[str] = None
+    detail: str = ""
+    created_at: float
+
+
+class CellTaskDetailOut(BaseModel):
+    task: CellTaskOut
+    events: List[CellTaskEventOut] = Field(default_factory=list)
+
+
+class CellTaskTransitionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    new_status: str
+    acceptance_met: Optional[bool] = None
+    evidence_refs: Optional[List[str]] = None
+    blocked_by: Optional[List[int]] = None
+    detail: str = ""
+
+
+class CellTaskReturnToParentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    detail: str = ""
+
+
+class CellReportFactItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(..., min_length=1)
+    evidence_refs: List[str] = Field(default_factory=list)
+
+
+class CellReportTextItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(..., min_length=1)
+
+
+class CellReportCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cell_definition_id: str = Field(..., min_length=1)
+    task_id: Optional[int] = None
+    kind: str
+    severity: Optional[str] = None
+    fact: List[CellReportFactItem] = Field(default_factory=list)
+    interpretation: List[CellReportTextItem] = Field(default_factory=list)
+    ask: List[CellReportTextItem] = Field(default_factory=list)
+    idempotency_key: Optional[str] = None
+
+
+class CellReportOut(BaseModel):
+    id: int
+    system_id: int
+    cell_definition_id: str
+    task_id: Optional[int] = None
+    kind: str
+    severity: Optional[str] = None
+    fact: List[Dict[str, Any]] = Field(default_factory=list)
+    interpretation: List[Dict[str, Any]] = Field(default_factory=list)
+    ask: List[Dict[str, Any]] = Field(default_factory=list)
+    idempotency_key: Optional[str] = None
+    created_at: float
+    escalation_id: Optional[int] = None
+
+
+class CellReportsListOut(BaseModel):
+    system_id: int
+    reports: List[CellReportOut] = Field(default_factory=list)
+
+
+class CellEscalationOut(BaseModel):
+    id: int
+    system_id: int
+    report_id: int
+    cell_definition_id: str
+    severity: str
+    status: str
+    summary: str
+    created_at: float
+    updated_at: float
+
+
+class CellEscalationsListOut(BaseModel):
+    system_id: int
+    escalations: List[CellEscalationOut] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# 領域オーケストレーター / domain orchestrators (Issue #301, Sub 4 of the
+# Probe Cell Fabric epic, Issue #297). Core logic lives in
+# app/cell_orchestrator.py; these are the request/response shapes for
+# routes/cell_orchestrators.py.
+# ---------------------------------------------------------------------------
+
+
+class CellOrchestratorDigestOut(BaseModel):
+    """The deterministic digest -- ``digest`` is returned as a plain dict
+    (matching the existing ``CellStateOut.state`` / ``CellDetailOut.state``
+    pattern) rather than a rigid nested model, since its shape mirrors
+    ``app.cell_orchestrator.build_orchestrator_digest``'s return value."""
+
+    system_id: int
+    cell_id: str
+    digest: Dict[str, Any]
+
+
+class CellTriageResultOut(BaseModel):
+    id: int
+    system_id: int
+    intelligence_run_id: int
+    classification: str
+    reasoning_summary: str
+    affected_cell_ids: List[str] = Field(default_factory=list)
+    proposed_ask: str = ""
+    is_mock: bool = False
+    created_at: float
+
+
+class CellTriageResultsListOut(BaseModel):
+    system_id: int
+    cell_id: str
+    results: List[CellTriageResultOut] = Field(default_factory=list)
+
+
+class CellTriageRunOut(BaseModel):
+    """Response of ``POST /cell-fabric/orchestrators/{cell_id}/triage``. The
+    digest is always present (facts survive triage failure); ``triage`` is
+    ``None`` and ``triage_error`` is set on ANY triage failure -- there is no
+    heuristic classification fallback."""
+
+    system_id: int
+    cell_id: str
+    digest: Dict[str, Any]
+    triage: Optional[CellTriageResultOut] = None
+    triage_error: Optional[str] = None
+    is_mock: bool = False
+    intelligence_run_id: int
+
+
+class CellRosterUpdateIn(BaseModel):
+    """``roster`` is always a list here (possibly empty): this endpoint only
+    ever sets/changes an orchestrator's roster, it never converts a Cell
+    back into a roster-less worker."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    roster: List[str] = Field(default_factory=list)
+    changed_by: Optional[str] = None
+
+
+class CellRosterEventOut(BaseModel):
+    id: int
+    system_id: int
+    cell_definition_id: int
+    old_roster: Optional[List[str]] = None
+    new_roster: List[str] = Field(default_factory=list)
+    changed_by: Optional[str] = None
+    created_at: float
+
+
+# ---------------------------------------------------------------------------
+# 品質サンプリング・独立監査・quality floor (Issue #302, Sub 6 of the Probe
+# Cell Fabric epic, Issue #297). Core logic lives in app/cell_quality.py;
+# these are the request/response shapes for routes/cell_quality.py.
+# ---------------------------------------------------------------------------
+
+
+class CellQualityStratumIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1)
+    task_type: Optional[str] = None
+    risk: Optional[str] = None
+    rare: bool = False
+
+
+class CellQualityConfigIn(BaseModel):
+    """Every field optional: an omitted field keeps its existing persisted
+    value (or the module default on first create)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sample_rate: Optional[float] = None
+    strata: Optional[List[CellQualityStratumIn]] = None
+    audit_rate: Optional[float] = None
+    quality_floor: Optional[float] = None
+    floor_window: Optional[int] = None
+    daily_audit_budget: Optional[int] = None
+
+
+class CellQualityConfigOut(BaseModel):
+    system_id: int
+    cell_definition_id: int
+    sample_rate: float
+    strata: List[Dict[str, Any]] = Field(default_factory=list)
+    audit_rate: float
+    quality_floor: float
+    floor_window: int
+    daily_audit_budget: int
+    created_at: Optional[float] = None
+    updated_at: Optional[float] = None
+
+
+class CellQualitySampleSelectIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    window_seconds: Optional[float] = None
+
+
+class CellQualitySampleOut(BaseModel):
+    id: int
+    system_id: int
+    cell_definition_id: int
+    config_id: int
+    stratum: str = ""
+    target_kind: str
+    target_id: str
+    selection_seed: str
+    selected_at: float
+
+
+class CellQualitySamplesListOut(BaseModel):
+    system_id: int
+    cell_id: str
+    samples: List[CellQualitySampleOut] = Field(default_factory=list)
+
+
+class CellQualityAuditRequestIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    blind: bool = False
+    auditor_alias: Optional[str] = None
+
+
+class CellQualityAuditOut(BaseModel):
+    id: int
+    system_id: int
+    sample_id: int
+    auditor_model_alias: str
+    verdict: str
+    verdict_decision_method: str
+    is_blind: bool
+    failed_criteria: List[int] = Field(default_factory=list)
+    verbatim_example: str = ""
+    explanation: str = ""
+    explanation_run_id: Optional[int] = None
+    is_mock: bool = False
+    created_at: float
+
+
+class CellQualityAuditsListOut(BaseModel):
+    system_id: int
+    cell_id: str
+    counts: Dict[str, int] = Field(default_factory=dict)
+    audits: List[CellQualityAuditOut] = Field(default_factory=list)
+
+
+class CellQualityFloorEvaluateOut(BaseModel):
+    system_id: int
+    cell_id: str
+    pass_rate: Optional[float] = None
+    floor: float
+    denominator: int
+    suspended: bool
+    escalation_id: Optional[int] = None
+
+
+class CellIntakeResumeIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = ""
+
+
+class CellIntakeStateOut(BaseModel):
+    system_id: int
+    cell_id: str
+    intake_status: str
+    reason: str = ""
+    escalation_id: Optional[int] = None
+    changed_at: Optional[float] = None
+# Root Orchestrator と統合ダイジェスト (Issue #303, Sub 5 of the Probe Cell
+# Fabric epic, Issue #297). Core logic lives in app/cell_root.py; these are
+# the request/response shapes for routes/cell_root.py.
+# ---------------------------------------------------------------------------
+
+
+class CellRootDigestOut(BaseModel):
+    """The 4-level progressive-disclosure digest -- ``digest`` is returned as
+    a plain dict (same pattern as ``CellOrchestratorDigestOut.digest``) since
+    its shape mirrors ``app.cell_root.build_root_digest``'s return value
+    verbatim."""
+
+    system_id: int
+    digest: Dict[str, Any]
+    generated_at: float
+
+
+class CellAskSyncOut(BaseModel):
+    system_id: int
+    created: int
+    deduped: int
+
+
+class CellAskOut(BaseModel):
+    id: int
+    system_id: int
+    source_kind: str
+    source_id: int
+    cell_definition_id: Optional[str] = None
+    goal_id: Optional[int] = None
+    task_id: Optional[int] = None
+    ask_text: str
+    severity: str
+    status: str
+    decision: str = ""
+    decision_method: str = ""
+    decided_by: Optional[str] = None
+    decided_at: Optional[float] = None
+    execution_approved: bool = False
+    dedupe_key: str
+    created_at: float
+
+
+class CellAsksListOut(BaseModel):
+    system_id: int
+    asks: List[CellAskOut] = Field(default_factory=list)
+
+
+class CellAskDecideRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: str
+    note: str = ""
+
+
+# ---------------------------------------------------------------------------
+# 改善仮説・カナリア・shadow実行承認ゲート (Issue #304, Sub 7 of the Probe
+# Cell Fabric epic, Issue #297). Core logic lives in app/cell_improvement.py;
+# these are the request/response shapes for routes/cell_improvement.py.
+# ---------------------------------------------------------------------------
+
+
+class CellImprovementDraftIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    observed_facts_refs: List[str] = Field(default_factory=list)
+    target_kind: str = "role_card"
+    parent_cell_id: Optional[str] = None
+
+
+class CellImprovementCreateIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_kind: str
+    hypothesis: str = ""
+    expected_effect: str = ""
+    risk: str = ""
+    rollback_plan: str = ""
+    observed_facts_refs: List[str] = Field(default_factory=list)
+    parent_cell_id: Optional[str] = None
+
+
+class CellImprovementOut(BaseModel):
+    id: int
+    system_id: int
+    cell_id: str
+    status: str
+    target_kind: str
+    hypothesis: str = ""
+    expected_effect: str = ""
+    risk: str = ""
+    rollback_plan: str = ""
+    observed_facts_refs: List[str] = Field(default_factory=list)
+    proposal_run_id: Optional[int] = None
+    is_mock: bool = False
+    role_card_id: Optional[int] = None
+    proposed_role_card_version: Optional[str] = None
+    canary_evidence_refs: List[str] = Field(default_factory=list)
+    parent_cell_id: Optional[str] = None
+    parent_approved_by: Optional[str] = None
+    parent_approved_at: Optional[float] = None
+    human_approved_by: Optional[str] = None
+    human_approved_at: Optional[float] = None
+    suspended: bool = False
+    suspension_reason: str = ""
+    created_at: float
+    updated_at: float
+
+
+class CellImprovementsListOut(BaseModel):
+    system_id: int
+    cell_id: str
+    improvements: List[CellImprovementOut] = Field(default_factory=list)
+
+
+class CellImprovementEventOut(BaseModel):
+    id: int
+    system_id: int
+    improvement_id: int
+    event_type: str
+    from_status: Optional[str] = None
+    to_status: Optional[str] = None
+    actor: Optional[str] = None
+    detail: str = ""
+    created_at: float
+
+
+class CellShadowDecisionOut(BaseModel):
+    id: int
+    system_id: int
+    improvement_id: int
+    kind: str
+    status: str
+    decided_by: Optional[str] = None
+    decided_at: Optional[float] = None
+    decision_method: str = ""
+    note: str = ""
+    created_at: float
+
+
+class CellImprovementDetailOut(BaseModel):
+    improvement: CellImprovementOut
+    events: List[CellImprovementEventOut] = Field(default_factory=list)
+    shadow_decisions: List[CellShadowDecisionOut] = Field(default_factory=list)
+
+
+class CellImprovementDraftOut(BaseModel):
+    """Response of ``POST /cell-fabric/cells/{cell_id}/improvements/draft``.
+    ``improvement`` is ``None`` and ``draft_error`` is set on ANY LLM/JSON
+    failure -- there is no heuristic hypothesis fallback."""
+
+    system_id: int
+    cell_id: str
+    improvement: Optional[CellImprovementOut] = None
+    draft_error: Optional[str] = None
+    is_mock: bool = False
+    intelligence_run_id: int
+
+
+class CellImprovementTransitionIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    new_status: str
+    canary_evidence_refs: Optional[List[str]] = None
+    proposed_role_card_version: Optional[str] = None
+    allow_major_bump: bool = False
+    detail: str = ""
+    actor: Optional[str] = None
+
+
+class CellApprovalIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str
+
+
+class CellImprovementSuspendIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = ""
+
+
+class CellImprovementRollbackIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    actor: Optional[str] = None
+
+
+class CellShadowProposalIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    note: str = ""
+    actor: Optional[str] = None
+
+
+class CellShadowRequestIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    note: str = ""
+    actor: Optional[str] = None
+
+
+class CellShadowDecideIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: str
+    decided_by: str
+    note: str = ""
