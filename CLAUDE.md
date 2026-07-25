@@ -153,10 +153,12 @@ creating incomplete persistence or execution paths for later phases.
     areas + handoff (answerable areas chosen by the user, handoff answers
     never recorded as the original user's answer). Per-issue design notes
     live in `docs/project-intelligence.md`.
-    **#292 (低リスク提案の一括承認) is intentionally NOT implemented**: its
-    start condition — observed usage data and misclassification/undo cases
-    from individual review — is not yet met. Do not implement it until that
-    data exists.
+    **Status: #282 and #283-#291 are implemented, verified, and closed.**
+    **#292 (低リスク提案の一括承認) is intentionally NOT implemented** and was
+    closed as `not_planned`, superseded by #311: its start condition — observed
+    usage data and misclassification/undo cases from individual review — is not
+    yet met. Do not implement it until that data exists; #309 provides the
+    measurement. Remaining work is tracked under Epic #307.
 
 11. Issue #295 — Interview Alignment UX 差分改善: the original UX proposal
     behind #282. Most of it is already covered by #283-#291; the implemented
@@ -171,11 +173,16 @@ creating incomplete persistence or execution paths for later phases.
     deterministic sampling of no-review-required items, evidence shown
     up-front for conflict/high-risk/runtime-mismatch/single-evidence items,
     4-stage progressive disclosure in Inquiry answers, and 「わからない」
-    auto-routing into the existing route-and-investigate flow. Deferred
-    (need their own issues): Inquiry snapshot/revision premise tracking +
-    `superseded`, the §9 evaluation-metrics pipeline, and sample-error
-    driven rule re-evaluation. #292 remains NOT implemented. See the
-    Issue #295 section in `docs/project-intelligence.md`.
+    auto-routing into the existing route-and-investigate flow.
+    **Status: implemented, verified, and closed.** Deferred work now has its
+    own issues under Epic #307: Inquiry snapshot/revision premise tracking +
+    `superseded` (#308), the §9 evaluation-metrics pipeline (#309),
+    sample-error driven rule re-evaluation (#310), the §5.5 re-confirmation
+    cascade beyond goal/Intent (#312), and externalizing the
+    no-review-required policy out of `alignment.py` (#313). #292 remains NOT
+    implemented (superseded by #311). The Inquiry status set stays at the
+    current 5 values and Intent Brief field names stay as-is — see the
+    Issue #295 section in `docs/project-intelligence.md` for why.
 
 12. Issue #297 — Probe Cell Fabric (sub-issues #298-#304): assign a logical
     Probe Cell to each approved Probe Point / Component (1 probe = 1 logical
@@ -207,6 +214,22 @@ creating incomplete persistence or execution paths for later phases.
     Topology Graph (existing, referenced read-only), Goal/Accountability
     Tree, and Cell Runtime State. See the Issue #297 section in
     `docs/project-intelligence.md`.
+    **Status: #297 and #298-#304 are implemented, verified, and closed.** The
+    one remaining Epic acceptance criterion — an end-to-end 2〜5 Cell
+    read-only pilot bound to a single Feature — is tracked as #314 under Epic
+    #307; every part it needs already exists and is tested, but no fixture
+    ties them together.
+
+13. Issue #307 — remaining work after #282 / #295 / #297 closed. Three
+    categories, all as sub-issues: (A) deliberate deferrals already documented
+    — #308 Inquiry premise tracking + `superseded`, #309 the §9 evaluation
+    metrics pipeline, #310 sample-error driven rule re-evaluation, #311 低リスク
+    提案の一括承認 (blocked on #309 supplying its start-condition data);
+    (B) gaps found during the closing review and not previously documented —
+    #312 the §5.5 cascade beyond goal/Intent, #313 externalizing the
+    no-review-required policy, #314 the 2〜5 Cell read-only pilot fixture;
+    (C) #315 contract/test hardening. None of these relax an existing human
+    gate. Do not start #311 before #309 lands.
 
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and

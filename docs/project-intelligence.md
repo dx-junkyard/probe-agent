@@ -3961,20 +3961,35 @@ Issue #295 は Interview Alignment UX の元提案であり、その大部分は
 
 ### 実装しない・見送った残課題
 
-- **#292(低リスク提案の一括承認)**: 引き続き実装しない(CLAUDE.md
-  参照。開始条件の観測データが未取得)。本節の「まとめて回答」は
+Issue #295 は実装レビュー完了によりクローズ済み。以下の残課題は
+Epic #307 の子 Issue として起票し直した。
+
+- **低リスク提案の一括承認(旧 #292 → #311)**: 引き続き実装しない
+  (開始条件の観測データが未取得。計測手段は #309)。本節の「まとめて回答」は
   ユーザーが1件ずつ選んだ回答の送信バッチ化であり、AI 分類による
   自動承認ではない — `decision_method: manual` は項目単位で維持。
-- **Inquiry の前提追跡(#295 §5.6 拡張)**: Inquiry 行への
+- **Inquiry の前提追跡(#295 §5.6 拡張 → #308)**: Inquiry 行への
   snapshot/revision 参照列・`superseded` 状態・前提変化時の再確認復帰
   は未実装。DB migration を含む独立した issue として設計すべき規模。
-- **評価指標(#295 §9)**: 疑問解消率・誤った回答確定率などの計測基盤
+- **評価指標(#295 §9 → #309)**: 疑問解消率・誤った回答確定率などの計測基盤
   は未実装。指標定義が UI 実装の安定後に確定するため見送り。
-- **サンプル誤り発見時の分類ルール再評価(§5.4 後半)**: 疑問導線まで。
-- **提案 §7 のフィールド名との差異**: 既存実装のフィールド名
+- **サンプル誤り発見時の分類ルール再評価(§5.4 後半 → #310)**: 疑問導線まで。
+- **再確認カスケードの範囲(§5.5 → #312)**: goal / 確定済み Intent の変更時の
+  carry-over 無効化までを実装。Core Capability レベルは決定的判定源が無いため
+  対象外(下記「Core Capability は…」参照)。実装レビューで、この限界が
+  本節に明記されていなかったため追記した。
+- **no_review_required ポリシーの外部化(§7.3 → #313)**: 分類ルールは
+  `app/alignment.py` の `_RULES`(決定的な first-match 表)として実装しており
+  Principle 6 は満たすが、コード変更なしにレビュー・調整できる独立成果物には
+  なっていない。
+- **提案 §7 のフィールド名・status 集合との差異**: 既存実装のフィールド名
   (`non_goals`、`status` 等)を維持し、#295 記載の名称
   (`out_of_scope`、`confirmation_state` 等)への改名は行わない
-  (スキーマ契約の互換性優先)。
+  (スキーマ契約の互換性優先)。同様に Inquiry status は現行の 5 値
+  (`open` / `resolved` / `unresolved` / `cancelled` / `held`)を維持する。
+  #295 §7.5 の `investigating` / `answered` / `insufficient_evidence` は
+  メッセージ内容と固定テンプレートで同等の区別を実現しており機能差がない。
+  `superseded` のみ機能追加を伴うため #308 で扱う。
 
 ### PR #296 レビュー対応(#295 実装の修正)
 
@@ -4330,3 +4345,15 @@ API/Flow 単位のオーケストレーターが状態を集約し、Root Orches
 - reasoning model だけによる承認・採用・publish
 - live shadow・source 変更・外部副作用の無承認実行
 - #282 Interview / #242 Replay 基盤の別系統再実装
+
+### 残課題(Epic #297 クローズ時点)
+
+Issue #297 と sub-issue #298-#304 は実装レビュー完了によりクローズ済み。
+残る 1 件は Epic #307 の子 Issue として起票し直した。
+
+- **2〜5 Cell read-only pilot の end-to-end 実証(#314)**: binding /
+  `feature_refs` / `GET /cell-fabric/cells/{id}/state` / drift 検知の各部品は
+  実装・テスト済みだが、「1 つの Feature に属する承認済み Probe Point 2〜5 件を
+  束ねて end-to-end に読み出す」ことを示す fixture / 統合テストが無い。
+  Epic 受け入れ条件が capability ではなく運用上の実証として書かれているため、
+  残課題として切り出した。
