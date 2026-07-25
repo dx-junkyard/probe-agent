@@ -1073,6 +1073,10 @@ export interface AlignmentItemOut {
   // API doesn't send yet.
   carried_over_from?: number | null;
   content_hash?: string | null;
+  // Issue #313: exact reviewed YAML policy provenance for this
+  // classification. Legacy rows have `legacy-code-v1` and no digest.
+  policy_version: string;
+  policy_digest: string | null;
   intelligence_run_id: number;
   is_mock: boolean;
   created_at: number;

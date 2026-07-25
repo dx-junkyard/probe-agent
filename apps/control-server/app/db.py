@@ -2611,6 +2611,11 @@ CREATE TABLE IF NOT EXISTS alignment_item (
     user_reason             TEXT NOT NULL,
     status                  TEXT NOT NULL DEFAULT 'open',
     user_decision           TEXT,
+    -- Issue #313: the reviewed external policy used for deterministic
+    -- classification. Existing rows are explicitly marked legacy rather
+    -- than guessed to have been produced by a later YAML revision.
+    policy_version          TEXT NOT NULL DEFAULT 'legacy-code-v1',
+    policy_digest           TEXT,
     intelligence_run_id     INTEGER NOT NULL,
     is_mock                 INTEGER NOT NULL DEFAULT 0,
     created_at              REAL NOT NULL,
@@ -4209,6 +4214,18 @@ def init_db() -> None:
                 "ALTER TABLE alignment_item ADD COLUMN carried_over_from INTEGER "
                 "REFERENCES alignment_item(id) ON DELETE SET NULL"
             )
+        # Issue #313: keep policy provenance additive.  The pre-policy Python
+        # rule table is recorded as legacy rather than claiming it used the
+        # new YAML policy; only rows built after this migration receive a
+        # validated policy version and content digest.
+        alignment_item_cols = _columns(conn, "alignment_item")
+        if alignment_item_cols and "policy_version" not in alignment_item_cols:
+            conn.execute(
+                "ALTER TABLE alignment_item "
+                "ADD COLUMN policy_version TEXT NOT NULL DEFAULT 'legacy-code-v1'"
+            )
+        if alignment_item_cols and "policy_digest" not in alignment_item_cols:
+            conn.execute("ALTER TABLE alignment_item ADD COLUMN policy_digest TEXT")
         _ensure_legacy_system(conn)
     _validate_startup_environment()
     _validate_publish_startup_config()

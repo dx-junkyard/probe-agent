@@ -178,8 +178,9 @@ creating incomplete persistence or execution paths for later phases.
     own issues under Epic #307: Inquiry snapshot/revision premise tracking +
     `superseded` (#308), the §9 evaluation-metrics pipeline (#309),
     sample-error driven rule re-evaluation (#310), the §5.5 re-confirmation
-    cascade beyond goal/Intent (#312), and externalizing the
-    no-review-required policy out of `alignment.py` (#313). #292 remains NOT
+    cascade beyond goal/Intent (#312). #313 is implemented: the
+    no-review-required policy is now a schema-validated, fail-closed YAML
+    artifact with version/digest provenance on every new Alignment item. #292 remains NOT
     implemented (superseded by #311). The Inquiry status set stays at the
     current 5 values and Intent Brief field names stay as-is — see the
     Issue #295 section in `docs/project-intelligence.md` for why.
@@ -229,7 +230,7 @@ creating incomplete persistence or execution paths for later phases.
     提案の一括承認 (blocked on #309 supplying its start-condition data);
     (B) gaps found during the closing review and not previously documented —
     #312 the §5.5 cascade beyond goal/Intent, #313 externalizing the
-    no-review-required policy, and #314 the 2〜5 Cell read-only pilot fixture
+    no-review-required policy (**implemented and verified**), and #314 the 2〜5 Cell read-only pilot fixture
     (**implemented and verified with a 3-Cell E2E fixture**); (C) #315
     contract/test hardening. None of these relax an existing human gate. Do
     not start #311 before #309 lands.

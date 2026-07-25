@@ -27,6 +27,7 @@ import json
 import os
 import subprocess
 import time
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import pytest
@@ -34,6 +35,7 @@ from fastapi.testclient import TestClient
 
 from app.alignment import (
     ALIGNMENT_STATES,
+    AlignmentPolicyError,
     CONFIDENCE_LEVELS,
     REASON_CODES,
     REVIEW_CATEGORIES,
@@ -42,10 +44,14 @@ from app.alignment import (
     AlignmentEvidenceItem,
     AlignmentProposalItem,
     AlignmentProposalResult,
+    _DEFAULT_POLICY_PATH,
+    alignment_policy_digest,
+    alignment_policy_version,
     classify_alignment_item,
     compute_content_hash,
     compute_intent_item_digest,
     generate_alignment_proposal,
+    load_alignment_review_policy,
     review_sort_key,
     user_reason_for,
     validate_evidence_against_snapshot,
@@ -167,6 +173,93 @@ def test_user_reason_templates_cover_every_reason_code():
     assert set(USER_REASON_TEMPLATES) == set(REASON_CODES)
 
 
+def _legacy_classify_alignment_item(state, risk_flags, confidence, intent_field, runtime_check):
+    """Pre-#313 policy semantics, retained only as a parity oracle in tests."""
+    if "security" in risk_flags:
+        return "must_review", "security_related"
+    if "high_risk" in risk_flags:
+        return "must_review", "high_risk"
+    if "core_intent" in risk_flags or (
+        intent_field == "goal" and state in ("gap", "conflict")
+    ):
+        return "must_review", "core_intent"
+    if state == "conflict":
+        return "must_review", "conflict_detected"
+    if runtime_check == "mismatch":
+        return "must_review", "runtime_mismatch"
+    if confidence in ("uncertain", "conflicting") or state == "unknown":
+        return "must_review", "low_confidence"
+    if state == "gap":
+        return "batch_reviewable", "routine_update"
+    if state == "aligned":
+        return "no_review_required", "no_change"
+    if state == "not_applicable":
+        return "informational", "informational_only"
+    raise AssertionError(f"unexpected state {state!r}")
+
+
+def test_external_policy_matches_every_legacy_classification():
+    """The #313 extraction must be behavior-preserving for all finite inputs."""
+    risk_combinations = [
+        [flag for bit, flag in enumerate(RISK_FLAGS) if mask & (1 << bit)]
+        for mask in range(1 << len(RISK_FLAGS))
+    ]
+    from app.interview_intent_agent import INTENT_FIELDS
+    from app.runtime_alignment import RUNTIME_CHECK_STATES
+
+    for state in ALIGNMENT_STATES:
+        for risk_flags in risk_combinations:
+            for confidence in CONFIDENCE_LEVELS:
+                for intent_field in (None, *INTENT_FIELDS):
+                    for runtime_check in (None, *RUNTIME_CHECK_STATES):
+                        assert classify_alignment_item(
+                            alignment_state=state,
+                            risk_flags=risk_flags,
+                            confidence=confidence,
+                            intent_field=intent_field,
+                            runtime_check=runtime_check,
+                        ) == _legacy_classify_alignment_item(
+                            state, risk_flags, confidence, intent_field, runtime_check,
+                        )
+
+
+def _default_policy_path() -> Path:
+    return _DEFAULT_POLICY_PATH
+
+
+def test_external_policy_has_a_version_and_digest():
+    policy = load_alignment_review_policy()
+    assert policy.policy_version == alignment_policy_version() == "alignment-review-v1"
+    assert policy.digest == alignment_policy_digest()
+    assert len(policy.digest) == 64
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda text: text.replace("risk_flags_contains: security", "unknown_condition: security", 1),
+        lambda text: text.replace("  - id: informational-not-applicable\n", "", 1),
+        lambda text: text.replace("policy_version: alignment-review-v1", "policy_version: ", 1),
+    ],
+)
+def test_external_policy_rejects_invalid_or_incomplete_configuration(tmp_path, mutate):
+    policy_path = tmp_path / "invalid-alignment-policy.yaml"
+    policy_path.write_text(mutate(_default_policy_path().read_text()), encoding="utf-8")
+    with pytest.raises(AlignmentPolicyError):
+        load_alignment_review_policy(policy_path)
+
+
+def test_external_policy_rejects_duplicate_keys(tmp_path):
+    policy_path = tmp_path / "duplicate-alignment-policy.yaml"
+    policy_path.write_text(
+        "schema_version: alignment-review-policy-v1\n"
+        "schema_version: alignment-review-policy-v1\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AlignmentPolicyError):
+        load_alignment_review_policy(policy_path)
+
+
 # --- Unit tests: compute_content_hash (Issue #295 unchanged carry-over) -----
 #
 # Review fix (PR #296, Finding 1): compute_content_hash now requires
@@ -192,6 +285,7 @@ def _hash_kwargs(repo_path, commit_sha, **overrides):
         confidence="likely",
         intent_field="pain",
         runtime_check=None,
+        policy_digest="test-policy-digest",
         intent_summary="意図の要約",
         gap_summary="ギャップの要約",
         proposed_interpretation="提案された解釈",
@@ -230,6 +324,7 @@ def test_compute_content_hash_ignores_risk_flag_order(tmp_path):
     ("confidence", "confirmed"),
     ("intent_field", "goal"),
     ("runtime_check", "mismatch"),
+    ("policy_digest", "different-policy-digest"),
     ("risk_flags", ["high_risk"]),
     ("intent_summary", "別の要約"),
     ("gap_summary", "別のギャップ要約"),
@@ -753,6 +848,8 @@ def test_build_creates_items_with_deterministic_classification(admin_client, tmp
     assert item["user_reason"] == USER_REASON_TEMPLATES["routine_update"]
     assert item["status"] == "open"
     assert item["user_decision"] is None
+    assert item["policy_version"] == alignment_policy_version()
+    assert item["policy_digest"] == alignment_policy_digest()
     assert item["intelligence_run_id"] is not None
     assert item["is_mock"] is False
     assert item["current_evidence"][0]["path"] == "src/a.py"
@@ -2176,11 +2273,9 @@ def test_system_isolation_for_superseded_column(admin_client, tmp_path, monkeypa
     assert b_item["superseded"] is False
 
 
-def test_superseded_column_migration_backfills_existing_rows_to_zero(tmp_path, monkeypatch):
-    """A pre-Finding-4 database (no ``superseded`` column) gains it via
-    ALTER TABLE and existing rows backfill to 0 -- mirroring this repo's
-    established additive-column migration pattern (see e.g.
-    test_replay_capture_api.py's Phase A migration test)."""
+def test_alignment_item_additive_migrations_preserve_legacy_policy_provenance(tmp_path, monkeypatch):
+    """A pre-review database gains the later additive columns without
+    fabricating policy provenance for an old classification."""
     import sqlite3
 
     db_path = tmp_path / "pre-finding4.db"
@@ -2234,8 +2329,12 @@ def test_superseded_column_migration_backfills_existing_rows_to_zero(tmp_path, m
         check.row_factory = sqlite3.Row
         cols = {r["name"] for r in check.execute("PRAGMA table_info(alignment_item)")}
         assert "superseded" in cols
+        assert "policy_version" in cols
+        assert "policy_digest" in cols
         row = check.execute("SELECT * FROM alignment_item WHERE id = 1").fetchone()
         assert row["superseded"] == 0
+        assert row["policy_version"] == "legacy-code-v1"
+        assert row["policy_digest"] is None
         check.close()
 
 

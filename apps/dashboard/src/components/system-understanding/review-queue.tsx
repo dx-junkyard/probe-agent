@@ -278,6 +278,10 @@ function AuditDetail({ item }: { item: AlignmentItemOut }) {
       </p>
       <p><span className="font-semibold">更新日時:</span> {formatTimestamp(item.updated_at)}</p>
       <p><span className="font-semibold">分析実行:</span> #{item.intelligence_run_id}</p>
+      <p data-testid={`review-item-policy-${item.id}`}>
+        <span className="font-semibold">分類ポリシー:</span> {item.policy_version}
+        {item.policy_digest ? ` (${item.policy_digest.slice(0, 12)})` : ""}
+      </p>
       {item.carried_over_from != null && (
         <p data-testid={`review-item-carried-over-${item.id}`}>
           <span className="font-semibold">引き継ぎ元:</span> #{item.carried_over_from}

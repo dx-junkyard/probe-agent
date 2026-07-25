@@ -1422,10 +1422,13 @@ Epic #307 の子 Issue として起票し直した。
   carry-over 無効化までを実装。Core Capability レベルは決定的判定源が無いため
   対象外(下記「Core Capability は…」参照)。実装レビューで、この限界が
   本節に明記されていなかったため追記した。
-- **no_review_required ポリシーの外部化(§7.3 → #313)**: 分類ルールは
-  `app/alignment.py` の `_RULES`(決定的な first-match 表)として実装しており
-  Principle 6 は満たすが、コード変更なしにレビュー・調整できる独立成果物には
-  なっていない。
+- **no_review_required ポリシーの外部化(§7.3 → #313)**: 完了。
+  `app/policies/alignment_review.yaml` に、有限条件だけを受け付ける
+  first-match ポリシーとして切り出した。読み込み時に schema version、全
+  reason template、許可済み有限値、重複キー、全入力組合せの終端到達を検証し、
+  不正・欠損時は既定値へフォールバックせず fail-closed で起動を拒否する。
+  各 `alignment_item` には policy version と YAML 本文の SHA-256 を保存し、
+  policy 変更は content hash を変えて `unchanged` carry-over を安全側に無効化する。
 - **提案 §7 のフィールド名・status 集合との差異**: 既存実装のフィールド名
   (`non_goals`、`status` 等)を維持し、#295 記載の名称
   (`out_of_scope`、`confirmation_state` 等)への改名は行わない

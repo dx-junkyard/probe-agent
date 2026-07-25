@@ -3326,6 +3326,12 @@ class AlignmentItemOut(BaseModel):
     # (audit-only -- never a live FK join for decision-making).
     content_hash: Optional[str] = None
     carried_over_from: Optional[int] = None
+    # Issue #313: every freshly classified row carries the reviewed external
+    # policy version and the SHA-256 of that exact YAML artifact. Legacy rows
+    # retain an explicit legacy version and no digest rather than pretending
+    # they were classified by the external policy.
+    policy_version: str = "legacy-code-v1"
+    policy_digest: Optional[str] = None
     intelligence_run_id: int
     is_mock: bool = False
     created_at: float

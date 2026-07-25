@@ -75,6 +75,8 @@ function makeItem(overrides: Partial<AlignmentItemOut> & { id: number }): Alignm
     user_reason: "軽微な差分です。まとめて確認してください",
     status: "open",
     user_decision: null,
+    policy_version: "alignment-review-v1",
+    policy_digest: "a86ee1d85f35cef6ad5b9d190db56a8195d458d5ffd521489f032cbed1de335d",
     intelligence_run_id: 1,
     is_mock: false,
     created_at: 0,
@@ -685,6 +687,8 @@ describe("ReviewQueuePanel", () => {
     expect(detail).toHaveTextContent("#9");
     expect(detail).toHaveTextContent("#7");
     expect(detail).toHaveTextContent("#42");
+    expect(detail).toHaveTextContent("alignment-review-v1");
+    expect(within(row).getByTestId("review-item-policy-70")).toHaveTextContent("a86ee1d85f35");
     expect(within(row).getByTestId("review-item-carried-over-70")).toHaveTextContent("#12");
     // A field the response doesn't provide (content_hash) must not render.
     expect(within(row).queryByTestId("review-item-content-hash-70")).not.toBeInTheDocument();
