@@ -440,6 +440,7 @@ export type InterviewStage =
   | "probe_flow_selection"
   | "proposal_generation";
 export type InterviewDecisionMethod = "deterministic" | "reasoning_llm" | "manual";
+export type InterviewDecisionAction = "approved" | "rejected" | "edited";
 export type InterviewApprovalState = "proposed" | "approved" | "rejected" | "edited" | "needs_review";
 export type SourceMetadataElementType =
   | "system" | "core" | "capability" | "element" | "supporting" | "boundary";
@@ -664,16 +665,22 @@ export interface InterviewContextPack {
   omission_notes: string[];
 }
 
+export interface InterviewDialogueProposalOut {
+  path: string;
+  qualified_name: string;
+  symbol_id: number | null;
+  metadata: InterviewProposalMetadataBlock;
+  probe_plan: InterviewProposalProbePlan;
+  graph_node_id: string | null;
+  capability_name: string | null;
+  evidence_summary: string | null;
+  proposal_confidence: number | null;
+  denylist_hit: string | null;
+}
+
 export interface InterviewDialogueTurnOut {
   assistant_message: string;
-  proposals: {
-    path: string;
-    qualified_name: string;
-    symbol_id: number | null;
-    metadata: InterviewProposalMetadataBlock;
-    probe_plan: InterviewProposalProbePlan;
-    denylist_hit: string | null;
-  }[];
+  proposals: InterviewDialogueProposalOut[];
   // Whether this turn asked the reasoning model for proposals (gate open +
   // generate_proposals). True with zero proposals means the model returned
   // narrowing questions instead — show narrowing guidance, not a plain
@@ -1003,7 +1010,7 @@ export type AlignmentReviewCategory =
 export type AlignmentReasonCode =
   | "security_related" | "high_risk" | "core_intent" | "conflict_detected"
   | "low_confidence" | "runtime_mismatch" | "routine_update" | "no_change"
-  | "informational_only";
+  | "informational_only" | "unchanged_since_confirmation";
 // Issue #290: deterministic Runtime Reality Check match state, set only
 // when this item's evidence deterministically maps to a component_id with
 // runtime trace facts; null when no deterministic mapping exists.
@@ -1325,7 +1332,7 @@ export interface InterviewProposalDecisionOut {
   proposal_id: number;
   session_id: number;
   system_id: number;
-  decision: "approved" | "rejected" | "edited";
+  decision: InterviewDecisionAction;
   decision_method: InterviewDecisionMethod;
   actor: string;
   edited_metadata: InterviewProposalMetadataBlock | null;
@@ -1334,22 +1341,24 @@ export interface InterviewProposalDecisionOut {
   decided_at: number;
 }
 
+export interface InterviewApprovedItemOut {
+  proposal_id: number;
+  path: string;
+  qualified_name: string;
+  symbol_id: number | null;
+  metadata: InterviewProposalMetadataBlock;
+  probe_plan: InterviewProposalProbePlan;
+  decision: InterviewDecisionAction;
+  decision_id: number;
+  actor: string;
+  decided_at: number;
+}
+
 export interface InterviewApprovedSetOut {
   session_id: number;
   system_id: number;
   snapshot_id: number;
-  items: {
-    proposal_id: number;
-    path: string;
-    qualified_name: string;
-    symbol_id: number | null;
-    metadata: InterviewProposalMetadataBlock;
-    probe_plan: InterviewProposalProbePlan;
-    decision: "approved" | "edited";
-    decision_id: number;
-    actor: string;
-    decided_at: number;
-  }[];
+  items: InterviewApprovedItemOut[];
   total_proposals: number;
   approved_count: number;
   rejected_count: number;
@@ -1422,8 +1431,11 @@ export interface RuntimeTraceFactsOut {
   duration_p50_ms: number | null;
   duration_p90_ms: number | null;
   duration_p99_ms: number | null;
+  first_observed_at: number | null;
   last_observed_at: number | null;
   has_traces: boolean;
+  observed_environment: string | null;
+  observed_git_sha: string | null;
 }
 
 export interface RuntimeRealityCheckItemOut {

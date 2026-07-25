@@ -6,6 +6,8 @@ import time
 from contextlib import contextmanager
 from typing import Iterator
 
+from .intelligence_run_types import install_intelligence_run_type_guards
+
 logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
@@ -3289,11 +3291,12 @@ CREATE TABLE IF NOT EXISTS cell_intake_states (
     UNIQUE (system_id, cell_definition_id)
 );
 
--- cell_quality_usage: System-scoped daily audit-budget counter, mirroring
+-- cell_quality_usage: System-scoped daily audit-invocation counter, mirroring
 -- llm_daily_usage's (Issue #273) exact pattern -- one row per (system, UTC
--- day), incremented atomically before an audit runs. Each Cell's own
--- cell_quality_configs.daily_audit_budget is the ceiling compared against
--- this SHARED per-System counter (never a per-Cell counter row).
+-- day), incremented atomically before an audit runs. The unit is accepted
+-- run_audit calls, not tokens or currency. Each Cell's own
+-- cell_quality_configs.daily_audit_budget is the invocation ceiling compared
+-- against this SHARED per-System counter (never a per-Cell counter row).
 CREATE TABLE IF NOT EXISTS cell_quality_usage (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     system_id     INTEGER NOT NULL,
@@ -3773,6 +3776,7 @@ def init_db() -> None:
         _migrate_to_system_scope(conn)
         conn.executescript(SCHEMA)
         _migrate_intelligence_runs_snapshot_nullable(conn)
+        install_intelligence_run_type_guards(conn)
         _migrate_cell_improvement_event_types(conn)
         ta_cols = _columns(conn, "trace_analyzers")
         if "reviewed_at" not in ta_cols:

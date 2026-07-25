@@ -1757,8 +1757,17 @@ API/Flow 単位のオーケストレーターが状態を集約し、Root Orches
 - quality floor 割れ: 対象 Cell のみ `cell_intake_states` を
   `suspended` にし sev1 escalation を発行。host app や無関係 Cell は
   止めない。回復は floor 回復の決定的判定+明示操作。
-- sampling / audit / model cost に System-scoped 上限
-  (`resource_limits` の既存機構と同型の日次上限)。
+- sampling / audit に System-scoped 上限を持つ。`daily_audit_budget` の単位は
+  **UTC日ごとの監査呼び出し回数**で、許可された `run_audit` 1回につき
+  verdict や任意の説明 LLM 呼び出し有無にかかわらず1消費する。token 数や
+  通貨金額ではない。説明 LLM を実際に呼ぶ場合は、これとは別に
+  `CONTROL_LLM_DAILY_EXECUTION_LIMIT` の実行回数上限も適用される。
+- 現行プロダクトは billing/原価配賦をスコープに持たず、provider 横断で
+  token usage と時点別価格表を正規化する台帳もない。そのため Issue #315
+  時点では金額ベースの追跡を追加せず、別 Issue も起票しない。請求額表示、
+  chargeback、または通貨建て hard limit がプロダクト要件になった時点で、
+  provider usage の永続化・価格 version/provenance・currency・rounding・
+  retry/cache の課金規則を独立 Issue として設計する。
 
 ### Sub 7: 改善仮説・カナリア・承認ゲート(Issue #304)
 

@@ -30,10 +30,12 @@ This module owns:
   failure, Principle 7). A blind re-audit (``blind=True``) never reads a
   prior ``cell_quality_audits`` row before computing its verdict -- the
   verdict function only ever reads the sampled trace and the component's
-  criteria, never this table. Every audit consumes one unit from the
-  System's shared daily ``cell_quality_usage`` budget (gated by the
-  audited Cell's own ``daily_audit_budget``); an exhausted budget is a
-  deterministic 409 and the audit is not performed at all.
+  criteria, never this table. Every accepted audit invocation consumes one
+  invocation-count unit from the System's shared daily
+  ``cell_quality_usage`` budget (gated by the audited Cell's own
+  ``daily_audit_budget``); this is not a token or currency amount. An
+  exhausted budget is a deterministic 409 and the audit is not performed at
+  all.
 - ``run_parent_blind_audits``: chooses ``floor(audit_rate * sample_count)``
   of a Cell's samples, most-recent-first (a fixed, reproducible order), and
   blind-audits each one via ``run_audit``.
@@ -480,7 +482,7 @@ def list_quality_samples(conn, system_id: int, cell_definition_id: int):
 
 
 # ---------------------------------------------------------------------------
-# Daily audit budget (System-scoped, mirrors resource_limits' daily pattern)
+# Daily audit invocation ceiling (System-scoped; unit is calls, not currency)
 # ---------------------------------------------------------------------------
 
 
@@ -493,7 +495,10 @@ def _utc_day(now: Optional[float] = None) -> str:
 def _consume_quality_audit_budget(conn, system_id: int, budget: int) -> None:
     """Deterministic gate (Principle 6): raises :class:`ConflictError`
     fail-closed WITHOUT performing the audit when the System's shared daily
-    counter has already reached the audited Cell's ``daily_audit_budget``."""
+    invocation counter has already reached the audited Cell's
+    ``daily_audit_budget``. One accepted ``run_audit`` call consumes one
+    unit, regardless of verdict or whether the optional LLM explanation is
+    attempted; the unit is neither tokens nor currency."""
     day = _utc_day()
     conn.execute("BEGIN IMMEDIATE")
     try:

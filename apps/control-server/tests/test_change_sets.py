@@ -19,6 +19,9 @@ Covers:
    guard).
 4. revision lineage + audit contract: change_set -> intelligence_runs ->
    understanding_revision are all linked with the same run id.
+5. System isolation: change sets cannot be previewed/applied/discarded from
+   another System, and an item id cannot be applied through another System's
+   otherwise-valid change set.
 """
 
 from __future__ import annotations
@@ -779,3 +782,100 @@ def test_discard_marks_change_set_and_blocks_further_apply(admin_client, monkeyp
         json={"item_ids": [item_id]}, headers=headers,
     )
     assert r2.status_code == 409, r2.text
+
+
+# --- 5. System isolation ------------------------------------------------------
+
+
+def test_change_sets_and_items_are_isolated_across_systems(admin_client, monkeypatch):
+    token, system_a, snapshot_a = _setup(admin_client, "System A")
+    system_b = _create_system(admin_client, token, "System B")["id"]
+    snapshot_b = _insert_snapshot(system_b, commit_sha="bbb")
+
+    headers_a = _headers(token, system_a)
+    headers_b = _headers(token, system_b)
+    session_a = _create_session(admin_client, headers_a, snapshot_a)
+    session_b = _create_session(admin_client, headers_b, snapshot_b)
+    intent_a = _insert_intent_item(session_a, system_a, "goal", "System A goal")
+    intent_b = _insert_intent_item(session_b, system_b, "goal", "System B goal")
+
+    proposal = [{
+        "target_kind": "intent_item",
+        "target_hint": "goal",
+        "field": "value_text",
+        "after_value": "intruder goal",
+        "reason": "System isolation regression",
+    }]
+    change_a = _create_change_set(
+        admin_client, headers_a, session_a, "System A goal を修正", proposal, monkeypatch,
+    )
+    change_b = _create_change_set(
+        admin_client, headers_b, session_b, "System B goal を修正", proposal, monkeypatch,
+    )
+    change_set_a = change_a["change_set"]["id"]
+    change_set_b = change_b["change_set"]["id"]
+    item_a = change_a["items"][0]["id"]
+    item_b = change_b["items"][0]["id"]
+
+    # A foreign System cannot read (or trigger the proposed -> previewed
+    # mutation on) a change set, apply one of its items, or discard it.
+    assert admin_client.get(
+        f"/interview/change-sets/{change_set_a}", headers=headers_b,
+    ).status_code == 404
+    assert admin_client.post(
+        f"/interview/change-sets/{change_set_a}/apply",
+        json={"item_ids": [item_a]},
+        headers=headers_b,
+    ).status_code == 404
+    assert admin_client.post(
+        f"/interview/change-sets/{change_set_a}/discard", headers=headers_b,
+    ).status_code == 404
+
+    # Item ids are scoped independently too: a caller cannot smuggle an item
+    # from another System through one of its own otherwise-valid change sets.
+    assert admin_client.post(
+        f"/interview/change-sets/{change_set_b}/apply",
+        json={"item_ids": [item_a]},
+        headers=headers_b,
+    ).status_code == 404
+    assert admin_client.post(
+        f"/interview/change-sets/{change_set_a}/apply",
+        json={"item_ids": [item_b]},
+        headers=headers_a,
+    ).status_code == 404
+
+    # Every rejected operation is side-effect free for both the parent rows
+    # and items, including the original intent targets.
+    from app.db import get_conn
+    with get_conn() as conn:
+        change_sets = {
+            row["id"]: row["status"]
+            for row in conn.execute(
+                """SELECT id, status FROM understanding_change_set
+                   WHERE id IN (?, ?)""",
+                (change_set_a, change_set_b),
+            ).fetchall()
+        }
+        items = {
+            row["id"]: row["applied"]
+            for row in conn.execute(
+                """SELECT id, applied FROM understanding_change_item
+                   WHERE id IN (?, ?)""",
+                (item_a, item_b),
+            ).fetchall()
+        }
+        intents = {
+            row["id"]: (row["value_text"], row["superseded_by_id"])
+            for row in conn.execute(
+                """SELECT id, value_text, superseded_by_id
+                   FROM interview_intent_item WHERE id IN (?, ?)""",
+                (intent_a, intent_b),
+            ).fetchall()
+        }
+
+    assert change_sets == {change_set_a: "proposed", change_set_b: "proposed"}
+    assert items == {item_a: 0, item_b: 0}
+    assert intents == {
+        intent_a: ("System A goal", None),
+        intent_b: ("System B goal", None),
+    }

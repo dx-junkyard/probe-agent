@@ -152,6 +152,32 @@ Understanding / Alignment / Review Queue の自動更新ジョブ
 として残る。詳細は `docs/project-intelligence.md` の
 「回答バッチ後の自動更新(Issue #288)」を参照。
 
+### Control Server の実行モデル
+
+`interview_refresh_job` がサポートする実行モデルは、**Control Server
+1プロセス・ASGI worker 1個・DBを共有するレプリカなし**に限定する。
+同一プロセス内では session ごとの `threading.Lock` と `db.get_conn()` の
+process-wide lock が直列化を保証するが、これらは別プロセスを調停しない。
+Docker image はこの契約を明示するため Uvicorn を `--workers 1` で起動する。
+Gunicorn/Uvicorn の worker 数を増やしたり、`control-server` service を
+scale したりしてはならない。`PROBE_REFRESH_EAGER` は同期/非同期 dispatch
+だけを切り替えるテスト用設定であり、この実行モデルを変更しない。
+
+将来マルチワーカーへ移行する際は、少なくとも以下をすべて実装してから
+deployment の worker/replica 数を変更する。
+
+- `pending → updating` を owner token/lease 付きの原子的な DB claim にし、
+  crash した owner の lease/heartbeat recovery を定義する。
+- session 単位の直列化と pending job の dedupe/follow-up drain を、プロセス内
+  lock ではなく DB 制約・transaction または分散 lock で保証する。
+- 推論呼び出し後、各永続化の直前に base revision/answer marker と
+  superseding job を再検証し、条件付き更新(CAS)に失敗した結果は `stale`
+  として書き込まない。
+- 同じ SQLite DB を共有する別プロセスを実際に起動する concurrency test で、
+  二重実行、古い結果の上書き、orphan job、follow-up 取りこぼしがないことを
+  固定する。必要な write concurrency を SQLite で満たせない場合は、
+  lease/CAS を提供できる外部 DB/job queue へ移行する。
+
 | 変数 | 用途 |
 | --- | --- |
 | `PROBE_REFRESH_EAGER` | `1`/`true` で、enqueue された自動更新ジョブを呼び出し元スレッドで同期実行する（既定値は非同期のバックグラウンドスレッド実行）。テストでの決定的なアサーション用（既定値: `0`） |
