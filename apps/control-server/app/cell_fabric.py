@@ -213,6 +213,13 @@ class CellHealth(BaseModel):
     error_rate: Optional[float] = None
     latency_p50_ms: Optional[float] = None
     latency_p95_ms: Optional[float] = None
+    evaluation_count: Optional[int] = None
+    evaluation_pass_rate: Optional[float] = None
+    shadow_result_count: Optional[int] = None
+    replay_run_count: Optional[int] = None
+    replay_completed_count: Optional[int] = None
+    experiment_count: Optional[int] = None
+    experiment_completed_count: Optional[int] = None
 
 
 class CellQuality(BaseModel):
@@ -320,7 +327,7 @@ def build_minimal_cell_state(
 # ---------------------------------------------------------------------------
 
 TASK_TRANSITIONS: Dict[str, set] = {
-    "todo": {"doing", "blocked"},
+    "todo": {"doing", "failed", "blocked"},
     "doing": {"review", "failed", "blocked"},
     "review": {"done", "failed", "doing"},
     "blocked": {"todo", "doing", "failed"},

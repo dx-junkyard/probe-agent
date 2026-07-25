@@ -644,7 +644,28 @@ def list_shadow_decisions(conn, system_id: int, improvement_id: int):
 # ---------------------------------------------------------------------------
 
 
-def _validate_canary_ref(conn, system_id: int, ref: str) -> None:
+def _cell_feature_refs(conn, system_id: int, cell_row) -> set:
+    """Feature ids that deterministically belong to this Cell.
+
+    A worker Cell without a binding may still use its component/cell id as an
+    experiment feature id. Once a binding exists, its pinned feature refs are
+    authoritative.
+    """
+    binding = conn.execute(
+        """SELECT feature_refs_json FROM cell_bindings
+           WHERE system_id = ? AND cell_definition_id = ?
+             AND status != 'superseded'
+           ORDER BY version DESC LIMIT 1""",
+        (system_id, cell_row["id"]),
+    ).fetchone()
+    if binding is None:
+        return {cell_row["cell_id"]}
+    refs = set(json.loads(binding["feature_refs_json"] or "[]"))
+    refs.add(cell_row["cell_id"])
+    return refs
+
+
+def _validate_canary_ref(conn, system_id: int, ref: str, cell_row) -> None:
     match = _CANARY_REF_RE.match(ref) if isinstance(ref, str) else None
     if match is None:
         raise ValidationFailedError(
@@ -653,32 +674,85 @@ def _validate_canary_ref(conn, system_id: int, ref: str) -> None:
         )
     # Existence + System ownership (shared resolver, no new execution path).
     _resolve_evidence_ref(conn, system_id, ref)
-    # Beyond existence, canary evidence must come from a run that ACTUALLY
-    # completed successfully -- an un-run/failed replay or experiment is not
-    # evidence (Principle 6, a deterministic structural gate). An
-    # ``evaluation:<id>`` is an already-terminal ``evaluation_results`` row
-    # (produced only after an evaluation runs), so its existence is the
-    # completion signal.
+    # Beyond existence, canary evidence must prove a successful result for
+    # THIS Cell. Merely reaching a terminal/completed state is insufficient:
+    # a completed replay can contain mismatches, a completed experiment can
+    # have no adopted candidate, and an evaluation result can be a failure.
     kind, raw_id = match.group(1), match.group(2)
     if kind == "replay_run":
-        status = conn.execute(
-            "SELECT status FROM replay_runs WHERE id = ? AND system_id = ?",
+        run = conn.execute(
+            """SELECT status, component_id FROM replay_runs
+               WHERE id = ? AND system_id = ?""",
             (raw_id, system_id),
         ).fetchone()
-        if status is None or status["status"] != "completed":
+        if run is None or run["status"] != "completed":
             raise ValidationFailedError(
                 f"canary evidence {ref!r} is not a completed replay run "
-                f"(status={status['status'] if status else 'missing'!r})"
+                f"(status={run['status'] if run else 'missing'!r})"
+            )
+        if run["component_id"] != cell_row["cell_id"]:
+            raise ValidationFailedError(
+                f"canary evidence {ref!r} belongs to component "
+                f"{run['component_id']!r}, not Cell {cell_row['cell_id']!r}"
+            )
+        cases = conn.execute(
+            """SELECT case_status FROM replay_case_results
+               WHERE system_id = ? AND replay_run_id = ?""",
+            (system_id, raw_id),
+        ).fetchall()
+        if not cases or any(case["case_status"] != "match" for case in cases):
+            raise ValidationFailedError(
+                f"canary evidence {ref!r} must contain at least one replay "
+                "case and every case must match"
             )
     elif kind == "experiment":
-        status = conn.execute(
-            "SELECT status FROM experiments WHERE id = ? AND system_id = ?",
+        experiment = conn.execute(
+            """SELECT status, feature_id, human_decision,
+                      human_decision_variant_key
+               FROM experiments WHERE id = ? AND system_id = ?""",
             (raw_id, system_id),
         ).fetchone()
-        if status is None or status["status"] != "completed":
+        if experiment is None or experiment["status"] != "completed":
             raise ValidationFailedError(
                 f"canary evidence {ref!r} is not a completed experiment "
-                f"(status={status['status'] if status else 'missing'!r})"
+                f"(status={experiment['status'] if experiment else 'missing'!r})"
+            )
+        if experiment["feature_id"] not in _cell_feature_refs(conn, system_id, cell_row):
+            raise ValidationFailedError(
+                f"canary evidence {ref!r} targets unrelated feature "
+                f"{experiment['feature_id']!r}"
+            )
+        if (
+            experiment["human_decision"] != "adopted"
+            or not experiment["human_decision_variant_key"]
+        ):
+            raise ValidationFailedError(
+                f"canary evidence {ref!r} has no human-adopted candidate variant"
+            )
+        variant = conn.execute(
+            """SELECT is_baseline, status FROM experiment_variants
+               WHERE experiment_id = ? AND variant_key = ?""",
+            (raw_id, experiment["human_decision_variant_key"]),
+        ).fetchone()
+        if variant is None or variant["is_baseline"] or variant["status"] != "completed":
+            raise ValidationFailedError(
+                f"canary evidence {ref!r} does not resolve to a completed "
+                "non-baseline adopted variant"
+            )
+    else:
+        evaluation = conn.execute(
+            """SELECT status, component_id FROM evaluation_results
+               WHERE id = ? AND system_id = ?""",
+            (raw_id, system_id),
+        ).fetchone()
+        if evaluation is None or evaluation["status"] != "pass":
+            raise ValidationFailedError(
+                f"canary evidence {ref!r} is not a passing evaluation"
+            )
+        if evaluation["component_id"] != cell_row["cell_id"]:
+            raise ValidationFailedError(
+                f"canary evidence {ref!r} belongs to component "
+                f"{evaluation['component_id']!r}, not Cell {cell_row['cell_id']!r}"
             )
 
 
@@ -726,10 +800,12 @@ def transition_improvement(
     canary_evidence_refs: Optional[List[str]] = None,
     proposed_role_card_version: Optional[str] = None,
     allow_major_bump: bool = False,
+    actor_is_admin: bool = False,
     detail: str = "",
     actor: Optional[str] = None,
 ):
     row = _get_improvement_row(conn, system_id, improvement_id)
+    cell_row = _get_cell_row_by_id(conn, system_id, row["cell_definition_id"])
     if row["suspended"]:
         raise ConflictError(
             f"Improvement {improvement_id} is suspended; resume before transitioning"
@@ -747,7 +823,7 @@ def transition_improvement(
     updated_evidence = list(existing_evidence)
     if canary_evidence_refs:
         for ref in canary_evidence_refs:
-            _validate_canary_ref(conn, system_id, ref)
+            _validate_canary_ref(conn, system_id, ref, cell_row)
             if ref not in updated_evidence:
                 updated_evidence.append(ref)
 
@@ -808,6 +884,15 @@ def transition_improvement(
                 "(replay_run/experiment/evaluation)"
             )
 
+    # Evidence rows are managed by their source workflows and may change
+    # after this improvement first records their refs (for example an
+    # Experiment's human decision can be revised). Revalidate the current
+    # results at every execution/adoption boundary so a once-valid ref cannot
+    # become a stale authorization token.
+    if new_status in ("canary_running", "adopted"):
+        for ref in updated_evidence:
+            _validate_canary_ref(conn, system_id, ref, cell_row)
+
     new_cell_role_card_id: Optional[int] = None
     event_detail_payload: Optional[Dict[str, Any]] = None
 
@@ -853,14 +938,17 @@ def transition_improvement(
                 )
             except cell_fabric.CellContractError as exc:
                 raise ValidationFailedError(str(exc))
-            # An incompatible (major) bump is only adopted when the caller
-            # explicitly intends it -- otherwise fail closed instead of
-            # silently recording 'major_bump' and proceeding.
-            if not compatible and not allow_major_bump:
+            # A major bump remains supported by the original Sub 7 contract,
+            # but a caller-controlled boolean alone is not authority. The
+            # current authenticated principal must also be an administrator
+            # (Root), in addition to the proposal's separately recorded parent
+            # and human approvals checked above.
+            root_override = allow_major_bump and actor_is_admin
+            if not compatible and not root_override:
                 raise ConflictError(
                     f"proposed role card {candidate_card['version']!r} is not "
                     f"semver-compatible with the pinned {pinned_card['version']!r}; "
-                    "pass allow_major_bump=true to adopt an intentional major bump"
+                    "an authenticated administrator Root override is required"
                 )
             compat_label = "compatible" if compatible else "major_bump"
             new_cell_role_card_id = candidate_card["id"]
@@ -937,11 +1025,45 @@ def _ensure_approvable(row) -> None:
         )
 
 
-def parent_approve(conn, *, system_id: int, improvement_id: int, actor: str):
+def _validate_parent_approval_scope(
+    conn, *, system_id: int, row, actor_is_admin: bool,
+) -> None:
+    """Verify that a parent approval is issued in a real parent context.
+
+    Root-owned Cells have no parent Cell, so only an administrator may record
+    their Root approval. Otherwise the declared parent must be an
+    orchestrator whose roster directly contains the improved Cell.
+    """
+    if row["parent_cell_id"] is None:
+        if not actor_is_admin:
+            raise ConflictError(
+                "a root-level improvement requires administrator Root approval"
+            )
+        return
+
+    parent = _get_cell_row_by_id(conn, system_id, row["parent_cell_id"])
+    child = _get_cell_row_by_id(conn, system_id, row["cell_definition_id"])
+    if parent["roster_json"] is None:
+        raise ConflictError("declared parent Cell is not an orchestrator")
+    roster = json.loads(parent["roster_json"] or "[]")
+    if child["cell_id"] not in roster:
+        raise ConflictError(
+            f"declared parent Cell {parent['cell_id']!r} does not directly "
+            f"roster child {child['cell_id']!r}"
+        )
+
+
+def parent_approve(
+    conn, *, system_id: int, improvement_id: int, actor: str,
+    actor_is_admin: bool = False,
+):
     if not actor or not actor.strip():
         raise ValidationFailedError("actor is required")
     row = _get_improvement_row(conn, system_id, improvement_id)
     _ensure_approvable(row)
+    _validate_parent_approval_scope(
+        conn, system_id=system_id, row=row, actor_is_admin=actor_is_admin,
+    )
     now = time.time()
     conn.execute("BEGIN")
     try:
@@ -1127,26 +1249,26 @@ def request_live_shadow_approval(
     # Replay-first (Principle 5/8, #242): the current SDK in-process live
     # shadow does not isolate candidate side effects, so a live shadow may
     # only be REQUESTED after an isolated Replay / offline shadow has actually
-    # run. Deterministic structural gate: the improvement must carry at least
-    # one completed replay_run canary ref.
+    # succeeded. Revalidate the result now rather than trusting that the ref
+    # was valid when it was first attached to the improvement.
     replay_refs = [
         ref for ref in json.loads(row["canary_evidence_json"] or "[]")
         if isinstance(ref, str) and ref.startswith("replay_run:")
     ]
-    has_completed_replay = False
+    cell_row = _get_cell_row_by_id(conn, system_id, row["cell_definition_id"])
+    has_successful_replay = False
     for ref in replay_refs:
-        raw_id = ref.split(":", 1)[1]
-        status = conn.execute(
-            "SELECT status FROM replay_runs WHERE id = ? AND system_id = ?",
-            (raw_id, system_id),
-        ).fetchone()
-        if status is not None and status["status"] == "completed":
-            has_completed_replay = True
+        try:
+            _validate_canary_ref(conn, system_id, ref, cell_row)
+        except ValidationFailedError:
+            continue
+        else:
+            has_successful_replay = True
             break
-    if not has_completed_replay:
+    if not has_successful_replay:
         raise ConflictError(
             "live shadow execution approval requires replay-first evidence: "
-            "at least one completed isolated Replay run (replay_run:<id>) must "
+            "at least one successful isolated Replay run (replay_run:<id>) must "
             "be recorded as canary evidence before live shadow is requested"
         )
     now = time.time()

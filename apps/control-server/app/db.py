@@ -3336,6 +3336,7 @@ CREATE TABLE IF NOT EXISTS cell_asks (
     status                TEXT NOT NULL DEFAULT 'open'
                               CHECK (status IN ('open', 'accepted', 'held', 'rejected')),
     decision              TEXT NOT NULL DEFAULT '',
+    decision_note         TEXT NOT NULL DEFAULT '',
     decision_method       TEXT NOT NULL DEFAULT '',
     decided_by            TEXT,
     decided_at            REAL,
@@ -3681,11 +3682,98 @@ def _migrate_intelligence_runs_snapshot_nullable(conn: sqlite3.Connection) -> No
         conn.execute("PRAGMA foreign_keys=ON")
 
 
+def _migrate_cell_improvement_event_types(conn: sqlite3.Connection) -> None:
+    """Add ``approvals_invalidated`` to the SQLite CHECK constraint.
+
+    SQLite cannot ALTER a CHECK constraint. Rebuild the append-only event
+    table so databases created by an earlier Cell Fabric branch remain
+    writable after upgrade.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'cell_improvement_events'"
+    ).fetchone()
+    if row is None or "approvals_invalidated" in (row["sql"] or ""):
+        return
+
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN")
+        conn.execute(
+            "ALTER TABLE cell_improvement_events "
+            "RENAME TO _old_cell_improvement_events"
+        )
+        conn.execute(
+            """CREATE TABLE cell_improvement_events (
+                   id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                   system_id         INTEGER NOT NULL,
+                   improvement_id    INTEGER NOT NULL,
+                   event_type        TEXT NOT NULL CHECK (event_type IN (
+                       'created', 'status_transition', 'parent_approval',
+                       'human_approval', 'approvals_invalidated',
+                       'shadow_proposed', 'live_shadow_approval_requested',
+                       'live_shadow_approved', 'suspended', 'resumed',
+                       'rolled_back'
+                   )),
+                   from_status       TEXT,
+                   to_status         TEXT,
+                   actor             TEXT,
+                   detail            TEXT NOT NULL DEFAULT '',
+                   created_at        REAL NOT NULL,
+                   FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+                   FOREIGN KEY (improvement_id)
+                       REFERENCES cell_improvements (id) ON DELETE CASCADE
+               )"""
+        )
+        conn.execute(
+            """INSERT INTO cell_improvement_events
+                   (id, system_id, improvement_id, event_type, from_status,
+                    to_status, actor, detail, created_at)
+               SELECT id, system_id, improvement_id, event_type, from_status,
+                      to_status, actor, detail, created_at
+               FROM _old_cell_improvement_events"""
+        )
+        conn.execute("DROP TABLE _old_cell_improvement_events")
+        conn.execute(
+            """CREATE INDEX idx_cell_improvement_events_improvement
+               ON cell_improvement_events
+                  (system_id, improvement_id, id ASC)"""
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _migrate_cell_ask_decision_note(conn: sqlite3.Connection) -> None:
+    """Separate legacy Ask decision notes from the finite decision value.
+
+    Older builds wrote the free-form note into ``decision``. Adding the new
+    column without a backfill would leave existing accepted/held/rejected
+    rows semantically malformed.
+    """
+    columns = _columns(conn, "cell_asks")
+    if not columns or "decision_note" in columns:
+        return
+    conn.execute(
+        "ALTER TABLE cell_asks "
+        "ADD COLUMN decision_note TEXT NOT NULL DEFAULT ''"
+    )
+    conn.execute(
+        """UPDATE cell_asks
+           SET decision_note = decision, decision = status
+           WHERE status IN ('accepted', 'held', 'rejected')"""
+    )
+
+
 def init_db() -> None:
     with get_conn() as conn:
         _migrate_to_system_scope(conn)
         conn.executescript(SCHEMA)
         _migrate_intelligence_runs_snapshot_nullable(conn)
+        _migrate_cell_improvement_event_types(conn)
         ta_cols = _columns(conn, "trace_analyzers")
         if "reviewed_at" not in ta_cols:
             conn.execute("ALTER TABLE trace_analyzers ADD COLUMN reviewed_at REAL")
@@ -3804,6 +3892,7 @@ def init_db() -> None:
                 "ALTER TABLE experiments "
                 "ADD COLUMN human_decision_variant_key TEXT"
             )
+        _migrate_cell_ask_decision_note(conn)
         entrypoint_columns = _columns(conn, "code_entrypoints")
         if "source" not in entrypoint_columns:
             conn.execute(

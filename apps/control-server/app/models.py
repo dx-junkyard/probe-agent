@@ -5945,6 +5945,7 @@ class CellAskOut(BaseModel):
     severity: str
     status: str
     decision: str = ""
+    decision_note: str = ""
     decision_method: str = ""
     decided_by: Optional[str] = None
     decided_at: Optional[float] = None

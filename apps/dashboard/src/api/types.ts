@@ -3595,6 +3595,19 @@ export interface CellOrchestratorKeyPoint {
   type: "orchestrator";
   cell_id: string;
   progress: { by_cell: Record<string, Record<string, number>>; total: Record<string, number> };
+  quality?: Array<{
+    cell_id: string;
+    pass_rate: number | null;
+    audited_count: number | null;
+    intake_status: "accepting" | "suspended" | null;
+    sample_rate: number | null;
+  }>;
+  topology?: Array<{
+    cell_id: string;
+    feature_refs: string[];
+    capability_refs: string[];
+    entrypoint_refs: string[];
+  }>;
   escalations_open_by_severity: Record<string, number>;
   bottleneck_candidates: Array<Record<string, unknown>>;
   binding_stale: boolean;
@@ -3665,6 +3678,7 @@ export interface CellAskOut {
   severity: "sev1" | "sev2" | "sev3";
   status: CellAskStatus;
   decision: string;
+  decision_note?: string;
   decision_method: string;
   decided_by: string | null;
   decided_at: number | null;

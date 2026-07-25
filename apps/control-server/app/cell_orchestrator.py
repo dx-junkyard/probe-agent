@@ -53,7 +53,7 @@ import json
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import cell_binding
+from . import cell_binding, cell_quality
 from .cell_fabric import TASK_STATUSES
 from .db import get_conn
 from .llm import (
@@ -437,7 +437,9 @@ def build_orchestrator_digest(
             (child_row["role_card_id"],),
         ).fetchone()
         binding_row = conn.execute(
-            """SELECT status FROM cell_bindings
+            """SELECT status, feature_refs_json, capability_refs_json,
+                      entrypoint_refs_json
+               FROM cell_bindings
                WHERE system_id = ? AND cell_definition_id = ? AND status != 'superseded'
                ORDER BY version DESC LIMIT 1""",
             (system_id, child_row["id"]),
@@ -450,6 +452,23 @@ def build_orchestrator_digest(
                 conn, system_id=system_id, component_id=child_cell_id,
                 window_seconds=window_seconds,
             ).model_dump()
+        quality = cell_quality.build_cell_quality_state(
+            conn, system_id=system_id, cell_definition_id=child_row["id"],
+        )
+        topology = {
+            "feature_refs": (
+                json.loads(binding_row["feature_refs_json"] or "[]")
+                if binding_row is not None else []
+            ),
+            "capability_refs": (
+                json.loads(binding_row["capability_refs_json"] or "[]")
+                if binding_row is not None else []
+            ),
+            "entrypoint_refs": (
+                json.loads(binding_row["entrypoint_refs_json"] or "[]")
+                if binding_row is not None else []
+            ),
+        }
 
         counts = (
             _task_counts_for_owner(conn, system_id, child_row["id"])
@@ -480,6 +499,8 @@ def build_orchestrator_digest(
             },
             "binding_status": binding_row["status"] if binding_row else None,
             "health": health,
+            "quality": quality.model_dump() if quality is not None else None,
+            "topology": topology,
         })
 
     blocked_by_graph: List[Dict[str, Any]] = []

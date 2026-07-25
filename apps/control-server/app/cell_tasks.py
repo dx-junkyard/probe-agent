@@ -574,7 +574,6 @@ def transition_task(
             params,
         )
         if cur.rowcount == 0:
-            conn.execute("ROLLBACK")
             raise ConflictError(
                 f"Task {task_id} status changed concurrently "
                 f"(expected {current_status!r}); retry the transition"

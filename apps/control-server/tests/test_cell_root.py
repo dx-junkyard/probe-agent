@@ -328,6 +328,12 @@ class TestDigestContract:
         system = _create_system(client, token, "sys-digest-contract")
         headers = _headers(token, system["id"])
         _setup_orchestrator_with_workers(client, headers)
+        quality = client.put(
+            "/cell-fabric/cells/worker-a/quality-config",
+            json={"sample_rate": 0.5},
+            headers=headers,
+        )
+        assert quality.status_code == 200, quality.text
 
         # Distinct summaries (and cells where possible) so these three
         # escalations never collide on the same root-cause dedupe key --
@@ -374,6 +380,21 @@ class TestDigestContract:
         orchestrator_points = [kp for kp in digest["key_points"] if kp["type"] == "orchestrator"]
         assert len(orchestrator_points) == 1
         assert orchestrator_points[0]["cell_id"] == "orch-1"
+        quality_points = orchestrator_points[0]["quality"]
+        assert quality_points == [{
+            "cell_id": "worker-a",
+            "pass_rate": None,
+            "audited_count": 0,
+            "intake_status": "accepting",
+            "sample_rate": 0.5,
+        }]
+        assert {
+            entry["cell_id"] for entry in orchestrator_points[0]["topology"]
+        } == {"worker-a", "worker-b"}
+        for entry in orchestrator_points[0]["topology"]:
+            assert set(entry) == {
+                "cell_id", "feature_refs", "capability_refs", "entrypoint_refs",
+            }
 
     def test_no_llm_call_anywhere(self, admin_client, monkeypatch):
         client = admin_client
@@ -580,6 +601,8 @@ class TestAskLifecycle:
         assert r.status_code == 200, r.text
         body = r.json()
         assert body["status"] == "accepted"
+        assert body["decision"] == "accepted"
+        assert body["decision_note"] == "go ahead"
         assert body["decision_method"] == "manual"
         assert body["execution_approved"] is False
 
@@ -594,14 +617,27 @@ class TestAskLifecycle:
         system = _create_system(client, token, "sys-asks-reject")
         headers = _headers(token, system["id"])
         _setup_orchestrator_with_workers(client, headers)
-        escalation = _submit_escalation(client, headers, "worker-a", severity="sev1")
+        goal = _create_goal(client, headers)
+        task = _delegate_task(client, headers, goal["id"], "worker-a")
+        _transition_task(client, headers, task["id"], new_status="blocked", detail="waiting")
+        escalation = _submit_escalation(
+            client, headers, "worker-a", severity="sev1", task_id=task["id"],
+        )
         client.post("/cell-fabric/asks/sync", headers=headers)
         ask = client.get("/cell-fabric/asks", headers=headers).json()["asks"][0]
 
         r = client.post(f"/cell-fabric/asks/{ask['id']}/decide", json={"decision": "rejected"}, headers=headers)
         assert r.status_code == 200, r.text
         assert r.json()["status"] == "rejected"
+        assert r.json()["decision"] == "rejected"
         assert r.json()["execution_approved"] is False
+
+        task_detail = client.get(
+            f"/cell-fabric/tasks/{task['id']}", headers=headers,
+        ).json()
+        assert task_detail["task"]["status"] == "failed"
+        assert task_detail["events"][-1]["to_status"] == "failed"
+        assert f"cell_ask {ask['id']} rejected" in task_detail["events"][-1]["detail"]
 
         esc = client.get("/cell-fabric/escalations", headers=headers).json()["escalations"]
         matching = [e for e in esc if e["id"] == escalation["escalation_id"]]

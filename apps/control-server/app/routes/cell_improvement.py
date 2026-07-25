@@ -93,6 +93,17 @@ def _cell_business_id(conn, cell_definition_id: Optional[int]) -> Optional[str]:
     return row["cell_id"] if row is not None else None
 
 
+def _principal_actor(principal: Principal) -> str:
+    """Return the authenticated audit identity for every manual decision.
+
+    Request payloads may still carry the legacy ``actor``/``decided_by``
+    fields for wire compatibility, but they are never authoritative.
+    """
+    if principal.username:
+        return principal.username
+    return f"user:{principal.user_id}"
+
+
 # ---------------------------------------------------------------------------
 # Output shaping
 # ---------------------------------------------------------------------------
@@ -295,7 +306,8 @@ def transition_improvement(
                 canary_evidence_refs=payload.canary_evidence_refs,
                 proposed_role_card_version=payload.proposed_role_card_version,
                 allow_major_bump=payload.allow_major_bump,
-                detail=payload.detail, actor=payload.actor,
+                actor_is_admin=principal.is_admin,
+                detail=payload.detail, actor=_principal_actor(principal),
             )
         except cell_improvement.CellImprovementError as exc:
             raise _translate(exc)
@@ -316,7 +328,8 @@ def parent_approve(
     with get_conn() as conn:
         try:
             row = cell_improvement.parent_approve(
-                conn, system_id=system_id, improvement_id=improvement_id, actor=payload.actor,
+                conn, system_id=system_id, improvement_id=improvement_id,
+                actor=_principal_actor(principal), actor_is_admin=principal.is_admin,
             )
         except cell_improvement.CellImprovementError as exc:
             raise _translate(exc)
@@ -337,7 +350,8 @@ def human_approve(
     with get_conn() as conn:
         try:
             row = cell_improvement.human_approve(
-                conn, system_id=system_id, improvement_id=improvement_id, actor=payload.actor,
+                conn, system_id=system_id, improvement_id=improvement_id,
+                actor=_principal_actor(principal),
             )
         except cell_improvement.CellImprovementError as exc:
             raise _translate(exc)
@@ -355,11 +369,11 @@ def rollback_improvement(
     system_id: int = Depends(get_system_id),
     principal: Principal = Depends(require_user),
 ) -> CellImprovementOut:
-    actor = payload.actor if payload is not None else None
     with get_conn() as conn:
         try:
             cell_improvement.rollback_role_card(
-                conn, system_id=system_id, improvement_id=improvement_id, actor=actor,
+                conn, system_id=system_id, improvement_id=improvement_id,
+                actor=_principal_actor(principal),
             )
             row = cell_improvement.get_improvement(conn, system_id, improvement_id)
         except cell_improvement.CellImprovementError as exc:
@@ -386,11 +400,11 @@ def propose_shadow(
     principal: Principal = Depends(require_user),
 ) -> CellShadowDecisionOut:
     note = payload.note if payload is not None else ""
-    actor = payload.actor if payload is not None else None
     with get_conn() as conn:
         try:
             row = cell_improvement.propose_shadow(
-                conn, system_id=system_id, improvement_id=improvement_id, note=note, actor=actor,
+                conn, system_id=system_id, improvement_id=improvement_id,
+                note=note, actor=_principal_actor(principal),
             )
         except cell_improvement.CellImprovementError as exc:
             raise _translate(exc)
@@ -409,11 +423,11 @@ def request_live_shadow(
     principal: Principal = Depends(require_user),
 ) -> CellShadowDecisionOut:
     note = payload.note if payload is not None else ""
-    actor = payload.actor if payload is not None else None
     with get_conn() as conn:
         try:
             row = cell_improvement.request_live_shadow_approval(
-                conn, system_id=system_id, improvement_id=improvement_id, note=note, actor=actor,
+                conn, system_id=system_id, improvement_id=improvement_id,
+                note=note, actor=_principal_actor(principal),
             )
         except cell_improvement.CellImprovementError as exc:
             raise _translate(exc)
@@ -434,7 +448,8 @@ def decide_shadow(
         try:
             row = cell_improvement.decide_shadow(
                 conn, system_id=system_id, decision_id=decision_id,
-                decision=payload.decision, decided_by=payload.decided_by, note=payload.note,
+                decision=payload.decision, decided_by=_principal_actor(principal),
+                note=payload.note,
             )
         except cell_improvement.CellImprovementError as exc:
             raise _translate(exc)

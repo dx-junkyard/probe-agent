@@ -216,6 +216,14 @@ def _orchestrator_key_point(digest: Dict[str, Any]) -> Dict[str, Any]:
         "type": "orchestrator",
         "cell_id": digest["cell_id"],
         "progress": digest["tasks"],
+        "quality": [
+            {"cell_id": entry["cell_id"], **entry["quality"]}
+            for entry in digest["roster"] if entry.get("quality") is not None
+        ],
+        "topology": [
+            {"cell_id": entry["cell_id"], **entry.get("topology", {})}
+            for entry in digest["roster"]
+        ],
         "escalations_open_by_severity": digest["escalations"]["open_by_severity"],
         "bottleneck_candidates": digest["bottleneck_candidates"],
         "binding_stale": is_stale,
@@ -513,8 +521,8 @@ def decide_ask(
       ``blocked``, unblock it (``blocked`` -> ``todo`` via
       ``cell_tasks.transition_task``, which writes its own
       ``cell_task_events`` row). Otherwise no side effect.
-    - ``rejected``: if the Ask's source is an escalation AND that escalation
-      is still ``open``, acknowledge it.
+    - ``rejected``: fail the linked non-terminal task, then acknowledge an
+      open source escalation.
     - ``held``: no side effect.
 
     ``execution_approved`` is NEVER set here -- accepting an Ask is a
@@ -540,9 +548,11 @@ def decide_ask(
     conn.execute("BEGIN")
     try:
         conn.execute(
-            """UPDATE cell_asks SET status = ?, decision = ?, decision_method = 'manual',
-                   decided_by = ?, decided_at = ? WHERE id = ?""",
-            (decision, note or "", decided_by, now, ask_id),
+            """UPDATE cell_asks
+               SET status = ?, decision = ?, decision_note = ?,
+                   decision_method = 'manual', decided_by = ?, decided_at = ?
+               WHERE id = ?""",
+            (decision, decision, note or "", decided_by, now, ask_id),
         )
         conn.execute("COMMIT")
     except Exception:
@@ -560,14 +570,27 @@ def decide_ask(
                 conn, system_id=system_id, task_id=row["task_id"], new_status="todo",
                 detail=f"cell_ask {ask_id} accepted",
             )
-    elif decision == "rejected" and row["source_kind"] == "escalation":
-        escalation_row = conn.execute(
-            "SELECT * FROM cell_escalations WHERE id = ? AND system_id = ?",
-            (row["source_id"], system_id),
-        ).fetchone()
-        if escalation_row is not None and escalation_row["status"] == "open":
-            cell_tasks.acknowledge_escalation(
-                conn, system_id=system_id, escalation_id=escalation_row["id"],
-            )
+    elif decision == "rejected":
+        if row["task_id"] is not None:
+            task_row = conn.execute(
+                "SELECT * FROM cell_tasks WHERE id = ? AND system_id = ?",
+                (row["task_id"], system_id),
+            ).fetchone()
+            if task_row is not None and task_row["status"] in (
+                "todo", "doing", "review", "blocked",
+            ):
+                cell_tasks.transition_task(
+                    conn, system_id=system_id, task_id=row["task_id"],
+                    new_status="failed", detail=f"cell_ask {ask_id} rejected",
+                )
+        if row["source_kind"] == "escalation":
+            escalation_row = conn.execute(
+                "SELECT * FROM cell_escalations WHERE id = ? AND system_id = ?",
+                (row["source_id"], system_id),
+            ).fetchone()
+            if escalation_row is not None and escalation_row["status"] == "open":
+                cell_tasks.acknowledge_escalation(
+                    conn, system_id=system_id, escalation_id=escalation_row["id"],
+                )
 
     return conn.execute("SELECT * FROM cell_asks WHERE id = ?", (ask_id,)).fetchone()

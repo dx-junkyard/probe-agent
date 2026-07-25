@@ -343,14 +343,47 @@ def selection_fraction(system_id: int, cell_definition_id: int, trace_id: str) -
 
 
 def _match_stratum(strata: List[Dict[str, Any]], trace_row) -> str:
-    """Finite-field stratum matching only (Principle 6). The ``traces``
-    table has no task-type/tag column, so ``task_type`` strata never match
-    here; a stratum whose ``risk`` is ``"error"`` matches a trace with a
-    recorded error. First match wins; no match falls back to the default
-    (empty-name) stratum."""
+    """Match deterministic task/risk dimensions captured in trace input.
+
+    SDK trace inputs are JSON and may carry ``task_type``, ``risk`` and
+    ``rare`` either at the top level or under a ``metadata`` object. The
+    special risk ``error`` also matches a recorded trace error. ``rare`` is
+    primarily the minimum-sample guarantee; for a rare-only stratum it is
+    also the explicit trace dimension. First matching stratum wins.
+    """
+    try:
+        payload = json.loads(trace_row["input_json"] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    task_type = payload.get("task_type", metadata.get("task_type"))
+    risk = payload.get("risk", metadata.get("risk"))
+    is_rare = bool(payload.get("rare", metadata.get("rare", False)))
+
     for stratum in strata:
-        if stratum.get("risk") == "error" and trace_row["error"]:
-            return stratum["name"]
+        expected_task_type = stratum.get("task_type")
+        expected_risk = stratum.get("risk")
+        if expected_task_type is not None and task_type != expected_task_type:
+            continue
+        if expected_risk is not None:
+            risk_matches = risk == expected_risk
+            if expected_risk == "error" and trace_row["error"]:
+                risk_matches = True
+            if not risk_matches:
+                continue
+        if (
+            expected_task_type is None
+            and expected_risk is None
+            and stratum.get("rare")
+            and not is_rare
+        ):
+            continue
+        return stratum["name"]
     return ""
 
 
@@ -370,7 +403,10 @@ def select_samples(
     sample_rate = config_row["sample_rate"]
     strata = json.loads(config_row["strata_json"] or "[]")
 
-    query = "SELECT trace_id, error, timestamp FROM traces WHERE system_id = ? AND component_id = ?"
+    query = (
+        "SELECT trace_id, error, input_json, timestamp FROM traces "
+        "WHERE system_id = ? AND component_id = ?"
+    )
     params: List[Any] = [system_id, cell_row["cell_id"]]
     if window_seconds is not None:
         query += " AND timestamp >= ?"
@@ -593,13 +629,30 @@ def run_audit(
         config_row = _ensure_config_row(conn, system_id, cell_definition_id)
 
         # Auditor independence (#302): the auditor model must be SEPARATE from
-        # the worker's own execution model, so a client can never turn an
-        # independent audit into a self-audit by passing the worker's alias.
+        # the worker's own execution model. Alias names are configuration
+        # indirections, so compare their resolved provider/model identities;
+        # two different aliases may point at the same model.
         worker_alias = _worker_model_alias(conn, cell_row)
-        if worker_alias is not None and auditor_alias == worker_alias:
+        try:
+            auditor_config = cell_fabric.resolve_model_alias(auditor_alias)
+            worker_config = (
+                cell_fabric.resolve_model_alias(worker_alias)
+                if worker_alias is not None else None
+            )
+        except cell_fabric.CellContractError as exc:
+            raise ValidationFailedError(str(exc))
+        if worker_config is not None and (
+            auditor_config.provider,
+            auditor_config.model,
+            auditor_config.base_url,
+        ) == (
+            worker_config.provider,
+            worker_config.model,
+            worker_config.base_url,
+        ):
             raise ValidationFailedError(
-                f"auditor_alias {auditor_alias!r} is the audited Cell's own "
-                "worker model alias; an audit must use a separate auditor model"
+                f"auditor_alias {auditor_alias!r} resolves to the audited "
+                "Cell's worker model; an audit requires a separate model"
             )
 
         _consume_quality_audit_budget(conn, system_id, config_row["daily_audit_budget"])
@@ -616,7 +669,7 @@ def run_audit(
         )
         verbatim = _verbatim_example(trace_row)
 
-    llm_config = cell_fabric.resolve_model_alias(auditor_alias)
+    llm_config = auditor_config
     is_mock = llm_config.provider == "mock"
     attempted_llm = verdict == "fail"
     explanation = ""
