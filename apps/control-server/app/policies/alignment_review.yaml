@@ -1,0 +1,88 @@
+# Alignment Review の確認要否ポリシー (Issue #313)
+#
+# 上から順に first-match で評価する。`match` の条件は AND であり、ここに
+# 任意コード・正規表現・数値スコアは書けない。許可される条件・有限値以外は
+# サーバー起動時に fail-closed で拒否される。
+schema_version: alignment-review-policy-v1
+policy_version: alignment-review-v1
+
+# ユーザー表示理由も固定テンプレートのみ。LLM出力や自由記述は使わない。
+reason_templates:
+  security_related: セキュリティに関わるため個別確認が必要です
+  high_risk: 影響が大きい変更のため個別確認が必要です
+  core_intent: 目標(goal)に関わる内容のため個別確認が必要です
+  conflict_detected: 意図と現状の理解が矛盾しているため確認が必要です
+  low_confidence: AIの確信度が低いため個別確認が必要です
+  runtime_mismatch: コード上の理解と実行時の観測が一致していません
+  routine_update: 軽微な差分です。まとめて確認してください
+  no_change: 意図と現状の理解は一致しています。対応は不要です
+  informational_only: 参考情報です。対応は不要です
+  unchanged_since_confirmation: 前回の確認から内容に変更はありません。対応は不要です
+
+rules:
+  - id: security-risk
+    match:
+      risk_flags_contains: security
+    review_category: must_review
+    reason_code: security_related
+
+  - id: high-risk
+    match:
+      risk_flags_contains: high_risk
+    review_category: must_review
+    reason_code: high_risk
+
+  - id: core-intent-risk
+    match:
+      risk_flags_contains: core_intent
+    review_category: must_review
+    reason_code: core_intent
+
+  - id: core-intent-goal-change
+    match:
+      alignment_state_in: [gap, conflict]
+      intent_field_in: [goal]
+    review_category: must_review
+    reason_code: core_intent
+
+  - id: intent-conflict
+    match:
+      alignment_state_in: [conflict]
+    review_category: must_review
+    reason_code: conflict_detected
+
+  - id: runtime-mismatch
+    match:
+      runtime_check_in: [mismatch]
+    review_category: must_review
+    reason_code: runtime_mismatch
+
+  - id: low-confidence
+    match:
+      confidence_in: [uncertain, conflicting]
+    review_category: must_review
+    reason_code: low_confidence
+
+  - id: unknown-state
+    match:
+      alignment_state_in: [unknown]
+    review_category: must_review
+    reason_code: low_confidence
+
+  - id: routine-gap
+    match:
+      alignment_state_in: [gap]
+    review_category: batch_reviewable
+    reason_code: routine_update
+
+  - id: aligned-no-change
+    match:
+      alignment_state_in: [aligned]
+    review_category: no_review_required
+    reason_code: no_change
+
+  - id: informational-not-applicable
+    match:
+      alignment_state_in: [not_applicable]
+    review_category: informational
+    reason_code: informational_only

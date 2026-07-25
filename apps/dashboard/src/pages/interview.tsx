@@ -34,6 +34,7 @@ import {
   useSkipInterviewQa,
   useUnderstandingDiff,
   useUpdateInterviewUnderstanding,
+  recordInterviewMetricEventBestEffort,
 } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
 import { api } from "@/api/client";
@@ -47,6 +48,7 @@ import { ObservationProposalPanel } from "@/components/system-understanding/obse
 import { ChangeSetPanel } from "@/components/system-understanding/change-set-panel";
 import { InquiryPanel, ROUTE_CATEGORY_LABELS } from "@/components/system-understanding/inquiry-panel";
 import { RefreshStatusChip } from "@/components/system-understanding/refresh-status-chip";
+import { InterviewMetricsPanel } from "@/components/system-understanding/interview-metrics-panel";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -589,6 +591,17 @@ function QaItemCard({
   const routeCategoryLabel = qa.route_category
     ? ROUTE_CATEGORY_LABELS[qa.route_category as InquiryRouteCategory]
     : undefined;
+
+  useEffect(() => {
+    void recordInterviewMetricEventBestEffort({
+      schema_version: "interview-metric-event-v1",
+      event_key: `question_presented:qa:${qa.id}`,
+      session_id: sessionId,
+      event_type: "question_presented",
+      target_kind: "qa",
+      target_id: qa.id,
+    });
+  }, [qa.id, sessionId]);
 
   const transcribeInvestigationConclusion = () => {
     if (!qa.investigation) return;
@@ -1872,6 +1885,8 @@ export default function InterviewPage() {
           </Button>
         </div>
       </div>
+
+      <InterviewMetricsPanel />
 
       <div {...purposeFixHighlight}>
         <DiagnosticFixCallout anchor="interview-purpose" />

@@ -782,6 +782,7 @@ export interface InterviewQaOut {
   // populated only for question_source === "runtime".
   runtime_evidence: RuntimeQaEvidence | null;
   answer_text: string | null;
+  answer_unknown: boolean | null;
   status: InterviewQaStatus;
   answered_by: string | null;
   superseded_by_id: number | null;
@@ -1073,6 +1074,10 @@ export interface AlignmentItemOut {
   // API doesn't send yet.
   carried_over_from?: number | null;
   content_hash?: string | null;
+  // Issue #313: exact reviewed YAML policy provenance for this
+  // classification. Legacy rows have `legacy-code-v1` and no digest.
+  policy_version: string;
+  policy_digest: string | null;
   intelligence_run_id: number;
   is_mock: boolean;
   created_at: number;
@@ -1109,6 +1114,92 @@ export interface AlignmentListOut {
   // this field (or an older Control Server) falls back to `counts` instead
   // of breaking.
   outstanding_counts?: Record<string, number>;
+}
+
+// --- Interview UX evaluation metrics (Issue #309) ---------------------------
+//
+// These are deterministic System-level aggregates. `status` is deliberately
+// separate from `value`: a measured zero is meaningful, while an unmeasured
+// metric must keep `value=null` and explain why it cannot yet be calculated.
+
+export type InterviewMetricStatus = "measured" | "unmeasured";
+export type InterviewMetricUnit =
+  | "ratio"
+  | "answers_per_update"
+  | "operations_per_inquiry";
+export type InterviewMetricCategory = "user_burden" | "accuracy" | "ux_quality";
+export type InterviewMetricKey =
+  | "answers_per_understanding_update"
+  | "unknown_answer_rate"
+  | "review_abandonment_rate"
+  | "evidence_detail_expansion_rate"
+  | "operations_per_inquiry"
+  | "corrected_confirmed_intent_rate"
+  | "incorrect_answer_confirmation_rate"
+  | "runtime_contradiction_rate"
+  | "understanding_revision_recorrection_rate"
+  | "post_approval_rejection_rate"
+  | "post_approval_rollback_rate"
+  | "post_approval_rejection_or_rollback_rate"
+  | "repeated_question_rate"
+  | "unchanged_item_reconfirmation_rate"
+  | "inquiry_resolution_rate"
+  | "post_inquiry_confirmation_rate"
+  | "implementation_question_transfer_rate";
+
+export interface InterviewMetricOut {
+  key: InterviewMetricKey;
+  category: InterviewMetricCategory;
+  guardrail: boolean;
+  description: string;
+  formula: string;
+  sources: string[];
+  status: InterviewMetricStatus;
+  value: number | null;
+  unit: InterviewMetricUnit;
+  numerator: number | null;
+  denominator: number | null;
+  sample_size: number;
+  unmeasured_reason: string | null;
+}
+
+export interface InterviewMetricsOut {
+  system_id: number;
+  schema_version: "interview-metrics-v1";
+  generated_at: number;
+  sessions_observed: number;
+  events_observed: number;
+  metrics: InterviewMetricOut[];
+}
+
+export type InterviewMetricEventType =
+  | "review_started"
+  | "review_completed"
+  | "review_abandoned"
+  | "evidence_available"
+  | "evidence_expanded"
+  | "unchanged_item_presented"
+  | "unchanged_item_reconfirmed"
+  | "question_presented";
+export type InterviewMetricTargetKind =
+  | "session"
+  | "qa"
+  | "alignment_item"
+  | "inquiry_message";
+
+export interface InterviewMetricEventCreate {
+  schema_version: "interview-metric-event-v1";
+  event_key: string;
+  session_id: number;
+  event_type: InterviewMetricEventType;
+  target_kind: InterviewMetricTargetKind;
+  target_id: number;
+}
+
+export interface InterviewMetricEventOut extends InterviewMetricEventCreate {
+  id: number;
+  system_id: number;
+  recorded_at: number;
 }
 
 // --- Batch answer (PR #296 review fix, Finding 5) ----------------------------

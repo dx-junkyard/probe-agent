@@ -35,6 +35,7 @@ import type {
   AlignmentBuildOut, AlignmentListOut, AlignmentReviewQueueOut, AlignmentItemOut,
   AlignmentDecisionAction,
   AlignmentBatchAnswerItemRequest, AlignmentBatchAnswerOut,
+  InterviewMetricsOut, InterviewMetricEventCreate, InterviewMetricEventOut,
   RuntimeObservationProposalOut, RuntimeObservationProposalCreate,
   RefreshStatusOut, RefreshJobOut,
   ChangeSetDetailOut, ChangeSetApplyResultOut, ChangeSetOut,
@@ -1209,6 +1210,30 @@ export function useAlignmentList(sessionId: number | null) {
     queryFn: () => api.get<AlignmentListOut>(`/interview/sessions/${sessionId}/alignment`),
     enabled: !!sessionId && !!getSystemId(),
   });
+}
+
+// Issue #309: deterministic System-level Interview / Alignment UX metrics.
+// The selected System is part of the query key even though the API path uses
+// the standard request context to resolve it.
+export function useInterviewMetrics() {
+  return useQuery({
+    queryKey: sysKey("interviewMetrics"),
+    queryFn: () => api.get<InterviewMetricsOut>("/interview/metrics"),
+    enabled: !!getSystemId(),
+  });
+}
+
+// Telemetry must never block or alter the review interaction it observes.
+// Event keys are caller-generated and idempotent within a System, so React
+// StrictMode remounts or repeated renders are harmless.
+export async function recordInterviewMetricEventBestEffort(
+  data: InterviewMetricEventCreate,
+): Promise<void> {
+  try {
+    await api.post<InterviewMetricEventOut>("/interview/metric-events", data);
+  } catch {
+    // Intentionally ignored: metric collection is observability, not a gate.
+  }
 }
 
 export function useReviewQueue(sessionId: number | null) {

@@ -176,10 +176,13 @@ creating incomplete persistence or execution paths for later phases.
     auto-routing into the existing route-and-investigate flow.
     **Status: implemented, verified, and closed.** Deferred work now has its
     own issues under Epic #307: Inquiry snapshot/revision premise tracking +
-    `superseded` (#308), the §9 evaluation-metrics pipeline (#309),
-    sample-error driven rule re-evaluation (#310), the §5.5 re-confirmation
-    cascade beyond goal/Intent (#312), and externalizing the
-    no-review-required policy out of `alignment.py` (#313). #292 remains NOT
+    `superseded` (#308), sample-error driven rule re-evaluation (#310), and
+    the §5.5 re-confirmation cascade beyond goal/Intent (#312). #309 is
+    implemented: deterministic System-scoped UX metrics use persisted facts
+    and finite UI events, return unavailable values as `unmeasured`, and keep
+    guardrails separate without changing product behaviour. #313 is implemented: the
+    no-review-required policy is now a schema-validated, fail-closed YAML
+    artifact with version/digest provenance on every new Alignment item. #292 remains NOT
     implemented (superseded by #311). The Inquiry status set stays at the
     current 5 values and Intent Brief field names stay as-is — see the
     Issue #295 section in `docs/project-intelligence.md` for why.
@@ -225,11 +228,13 @@ creating incomplete persistence or execution paths for later phases.
 13. Issue #307 — remaining work after #282 / #295 / #297 closed. Three
     categories, all as sub-issues: (A) deliberate deferrals already documented
     — #308 Inquiry premise tracking + `superseded`, #309 the §9 evaluation
-    metrics pipeline, #310 sample-error driven rule re-evaluation, #311 低リスク
-    提案の一括承認 (blocked on #309 supplying its start-condition data);
+    metrics pipeline (**implemented and verified**), #310 sample-error driven
+    rule re-evaluation, #311 低リスク提案の一括承認 (the measurement
+    mechanism now exists, but implementation remains blocked until a real
+    observation cohort and undo/misclassification cases exist);
     (B) gaps found during the closing review and not previously documented —
     #312 the §5.5 cascade beyond goal/Intent, #313 externalizing the
-    no-review-required policy, and #314 the 2〜5 Cell read-only pilot fixture
+    no-review-required policy (**implemented and verified**), and #314 the 2〜5 Cell read-only pilot fixture
     (**implemented and verified with a 3-Cell E2E fixture**); (C) #315
     contract/test hardening. None of these relax an existing human gate. Do
     not start #311 before #309 lands.

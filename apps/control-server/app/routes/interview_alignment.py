@@ -56,6 +56,8 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from ..alignment import (
     AlignmentProposalResult,
+    alignment_policy_digest,
+    alignment_policy_version,
     classify_alignment_item,
     compute_content_hash,
     compute_intent_item_digest,
@@ -146,6 +148,10 @@ def _item_out(row) -> AlignmentItemOut:
         superseded=bool(row["superseded"]) if "superseded" in row.keys() else False,
         content_hash=row["content_hash"] if "content_hash" in row.keys() else None,
         carried_over_from=row["carried_over_from"] if "carried_over_from" in row.keys() else None,
+        policy_version=(
+            row["policy_version"] if "policy_version" in row.keys() else "legacy-code-v1"
+        ),
+        policy_digest=row["policy_digest"] if "policy_digest" in row.keys() else None,
         intelligence_run_id=row["intelligence_run_id"],
         is_mock=bool(row["is_mock"]),
         created_at=row["created_at"],
@@ -602,6 +608,7 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
                         intent_digest_by_id.get(linked_intent_item_id)
                         if linked_intent_item_id is not None else None
                     ),
+                    policy_digest=alignment_policy_digest(),
                     repo_path=snapshot_row["repo_path"],
                     commit_sha=snapshot_row["commit_sha"],
                     source_digest_cache=source_digest_cache,
@@ -682,9 +689,9 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
                      intent_summary, current_claim, current_evidence, gap_summary,
                      proposed_interpretation, alignment_state, risk_flags, confidence,
                      review_category, reason_code, user_reason, runtime_check, status,
-                     user_decision, content_hash, carried_over_from,
+                     user_decision, content_hash, carried_over_from, policy_version, policy_digest,
                      intelligence_run_id, is_mock, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?, ?, ?, ?, ?)""",
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id, system_id, revision["id"], revision["snapshot_id"],
                     it["intent_item_id"], it["intent_summary"], it["current_claim"],
@@ -693,6 +700,7 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
                     json.dumps(it["risk_flags"]), it["confidence"], it["review_category"],
                     reason_code, user_reason_for(reason_code), it["runtime_check"],
                     it["content_hash"], it["carried_over_from"],
+                    alignment_policy_version(), alignment_policy_digest(),
                     run_id, 1 if proposal.is_mock else 0, completed_at, completed_at,
                 ),
             )

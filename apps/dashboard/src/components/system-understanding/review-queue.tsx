@@ -69,7 +69,7 @@
 //   す action card の数と一致させる。古い Control Server(未対応)では従
 //   来どおり counts にフォールバックする。
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { AlertCircle, Sparkles } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -88,6 +88,7 @@ import {
   useCorrectAlignmentItem,
   useHoldAlignmentItem,
   useReviewQueue,
+  recordInterviewMetricEventBestEffort,
 } from "@/api/hooks";
 import type {
   AlignmentConfidence,
@@ -204,14 +205,45 @@ function shouldExpandEvidenceByDefault(item: AlignmentItemOut): boolean {
 }
 
 function EvidenceList({ item }: { item: AlignmentItemOut }) {
-  const [open, setOpen] = useState(() => shouldExpandEvidenceByDefault(item));
+  const [startsExpanded] = useState(() => shouldExpandEvidenceByDefault(item));
+  const [open, setOpen] = useState(startsExpanded);
+  const expandedRecorded = useRef(false);
+
+  useEffect(() => {
+    if (item.current_evidence.length === 0 || startsExpanded) return;
+    void recordInterviewMetricEventBestEffort({
+      schema_version: "interview-metric-event-v1",
+      event_key: `evidence_available:alignment_item:${item.id}`,
+      session_id: item.session_id,
+      event_type: "evidence_available",
+      target_kind: "alignment_item",
+      target_id: item.id,
+    });
+  }, [item.current_evidence.length, item.id, item.session_id, startsExpanded]);
+
+  const toggleOpen = () => {
+    const nextOpen = !open;
+    setOpen(nextOpen);
+    if (nextOpen && !startsExpanded && !expandedRecorded.current) {
+      expandedRecorded.current = true;
+      void recordInterviewMetricEventBestEffort({
+        schema_version: "interview-metric-event-v1",
+        event_key: `evidence_expanded:alignment_item:${item.id}`,
+        session_id: item.session_id,
+        event_type: "evidence_expanded",
+        target_kind: "alignment_item",
+        target_id: item.id,
+      });
+    }
+  };
+
   if (item.current_evidence.length === 0) return null;
   return (
     <div>
       <button
         type="button"
         className="text-xs text-primary underline underline-offset-2"
-        onClick={() => setOpen(o => !o)}
+        onClick={toggleOpen}
         aria-expanded={open}
         data-testid={`review-item-evidence-toggle-${item.id}`}
       >
@@ -278,6 +310,10 @@ function AuditDetail({ item }: { item: AlignmentItemOut }) {
       </p>
       <p><span className="font-semibold">更新日時:</span> {formatTimestamp(item.updated_at)}</p>
       <p><span className="font-semibold">分析実行:</span> #{item.intelligence_run_id}</p>
+      <p data-testid={`review-item-policy-${item.id}`}>
+        <span className="font-semibold">分類ポリシー:</span> {item.policy_version}
+        {item.policy_digest ? ` (${item.policy_digest.slice(0, 12)})` : ""}
+      </p>
       {item.carried_over_from != null && (
         <p data-testid={`review-item-carried-over-${item.id}`}>
           <span className="font-semibold">引き継ぎ元:</span> #{item.carried_over_from}
@@ -633,6 +669,7 @@ function InformationalItemRow({
   // 監査情報まで展開されると確認疲れを招くため、非サンプル行と同じ既定閉
   // にする。展開はトグルで常に可能。
   const [open, setOpen] = useState(false);
+  const expandedRecorded = useRef(false);
   const [inquiryMode, setInquiryMode] = useState(false);
   const [hasHeldInquiry, setHasHeldInquiry] = useState(false);
   const [attachedInquiryId, setAttachedInquiryId] = useState<number | null>(null);
@@ -641,6 +678,46 @@ function InformationalItemRow({
     ? attachedInquiryId
     : (existingInquiry?.status === "held" ? existingInquiry.id : null);
   const reopenableInquiryId = existingInquiry?.status === "open" ? existingInquiry.id : null;
+
+  useEffect(() => {
+    if (item.review_category !== "unchanged") return;
+    void recordInterviewMetricEventBestEffort({
+      schema_version: "interview-metric-event-v1",
+      event_key: `unchanged_item_presented:alignment_item:${item.id}`,
+      session_id: sessionId,
+      event_type: "unchanged_item_presented",
+      target_kind: "alignment_item",
+      target_id: item.id,
+    });
+  }, [item.id, item.review_category, sessionId]);
+
+  useEffect(() => {
+    if (item.current_evidence.length === 0) return;
+    void recordInterviewMetricEventBestEffort({
+      schema_version: "interview-metric-event-v1",
+      event_key: `evidence_available:alignment_item:${item.id}`,
+      session_id: sessionId,
+      event_type: "evidence_available",
+      target_kind: "alignment_item",
+      target_id: item.id,
+    });
+  }, [item.current_evidence.length, item.id, sessionId]);
+
+  const toggleDetail = () => {
+    const nextOpen = !open;
+    setOpen(nextOpen);
+    if (nextOpen && item.current_evidence.length > 0 && !expandedRecorded.current) {
+      expandedRecorded.current = true;
+      void recordInterviewMetricEventBestEffort({
+        schema_version: "interview-metric-event-v1",
+        event_key: `evidence_expanded:alignment_item:${item.id}`,
+        session_id: sessionId,
+        event_type: "evidence_expanded",
+        target_kind: "alignment_item",
+        target_id: item.id,
+      });
+    }
+  };
 
   return (
     <div className="rounded-md border p-2 text-xs space-y-1" data-testid={`review-item-informational-${item.id}`}>
@@ -662,7 +739,7 @@ function InformationalItemRow({
       <button
         type="button"
         className="text-xs text-primary underline underline-offset-2"
-        onClick={() => setOpen(o => !o)}
+        onClick={toggleDetail}
         aria-expanded={open}
         data-testid={`review-item-informational-detail-toggle-${item.id}`}
       >
