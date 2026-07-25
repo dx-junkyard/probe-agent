@@ -1415,8 +1415,9 @@ Epic #307 の子 Issue として起票し直した。
 - **Inquiry の前提追跡(#295 §5.6 拡張 → #308)**: Inquiry 行への
   snapshot/revision 参照列・`superseded` 状態・前提変化時の再確認復帰
   は未実装。DB migration を含む独立した issue として設計すべき規模。
-- **評価指標(#295 §9 → #309)**: 疑問解消率・誤った回答確定率などの計測基盤
-  は未実装。指標定義が UI 実装の安定後に確定するため見送り。
+- **評価指標(#295 §9 → #309)**: 完了。既存の永続データと有限な
+  UI 計測イベントだけから System 単位に集計し、算出不能な指標は
+  0 や推定値ではなく `unmeasured` として返す。詳細は下記参照。
 - **サンプル誤り発見時の分類ルール再評価(§5.4 後半 → #310)**: 疑問導線まで。
 - **再確認カスケードの範囲(§5.5 → #312)**: goal / 確定済み Intent の変更時の
   carry-over 無効化までを実装。Core Capability レベルは決定的判定源が無いため
@@ -1437,6 +1438,50 @@ Epic #307 の子 Issue として起票し直した。
   #295 §7.5 の `investigating` / `answered` / `insufficient_evidence` は
   メッセージ内容と固定テンプレートで同等の区別を実現しており機能差がない。
   `superseded` のみ機能追加を伴うため #308 で扱う。
+
+### Alignment / Inquiry UX 評価指標パイプライン(Issue #309)
+
+UX 改善の効果を、LLM の解釈や外部分析基盤を使わず、選択中の
+System に属する永続データだけから監査できるようにした。
+
+- **API 契約**:
+  - `GET /interview/metrics` は固定 schema
+    `interview-metrics-v1` でユーザー負担・精度・UX 品質の指標を返す。
+    各指標は `description` / `formula` / `sources`、分子・分母、
+    `measured|unmeasured` を持つ。分母 0、因果 lineage 不足、未収集は
+    `value: null` と固定理由を返し、計測済みの 0 と区別する。
+  - `POST /interview/metric-events` は
+    `interview-metric-event-v1` の有限 event/target 組だけを受け付ける。
+    対象 session・QA・Alignment item・Inquiry message の System 所有権を
+    検証し、`system_id + event_key` で再送を冪等化する。自由文や画面内容は
+    保存せず、外部サービスにも送信しない。
+- **additive persistence**:
+  - `interview_metric_event` は根拠詳細の提示・展開、質問提示など、
+    domain table から復元できない UI 事実だけを append-only で保持する。
+  - `interview_qa.answer_unknown` は回答操作時の「わからない」を nullable
+    で保持する。既存 `answered` / `unconfirmed` は決定的に backfill するが、
+    旧 `revised` 行は元状態を復元できないため NULL のまま分母から除外する。
+- **決定的に算出する指標**:
+  明示記録 cohort の「わからない」率、確認済み Intent の後日修正率、
+  non-mock・non-superseded な Runtime contradiction 率、承認後却下率、
+  同一 session 内の同一質問文再出現率、Inquiry 解消率、解消後に元項目へ
+  明示回答した割合を既存行から算出する。根拠展開率・途中離脱率・変更なし
+  項目再確認率・実装質問転嫁率は、対応する有限イベントが実際に記録された
+  cohort に限って算出する。
+- **推定しない指標**:
+  回答 ID と Understanding Revision の対応がない
+  「理解更新 1 回あたり回答数」、全 UI 操作を覆えない
+  「Inquiry 1 件あたり追加操作数」、意味的な誤回答確定率、
+  field-level lineage がない Revision 再修正率、未実装の rollback、
+  却下と rollback の合成率は常に `unmeasured` とする。
+- **Dashboard**:
+  Interview 画面に System 集計パネルを追加し、guardrail
+  (疑問解消率、誤回答確定率、実装質問転嫁率)を他の指標から分離する。
+  未計測は理由付きで表示し、計測済み 0 と同じ表示にしない。
+- **安全性**:
+  指標は表示と監査にだけ使い、分類ルール、自動承認、publish、policy
+  変更を起動しない。全 query・event target 検証に `system_id` を含め、
+  System 間の分離を回帰テストで固定する。
 
 ### PR #296 レビュー対応(#295 実装の修正)
 

@@ -94,6 +94,154 @@ beforeEach(() => {
 });
 
 describe("ReviewQueuePanel", () => {
+  test("records evidence opportunity and the first user expansion only for initially collapsed evidence", async () => {
+    const item = makeItem({
+      id: 90,
+      current_evidence: [
+        { path: "src/a.py", start_line: 1, end_line: 3, summary: "根拠A" },
+        { path: "src/b.py", start_line: 4, end_line: 6, summary: "根拠B" },
+      ],
+    });
+    const queue: AlignmentReviewQueueOut = { session_id: 1, system_id: 1, items: [item] };
+    const full: AlignmentListOut = {
+      session_id: 1, system_id: 1,
+      items_by_category: {
+        must_review: [], batch_reviewable: [item], no_review_required: [],
+        unchanged: [], informational: [],
+      },
+      counts: {
+        must_review: 0, batch_reviewable: 1, no_review_required: 0,
+        unchanged: 0, informational: 0,
+      },
+    };
+    getImpl = (path: string) => {
+      if (path === "/interview/sessions/1/review-queue") return Promise.resolve(queue);
+      if (path === "/interview/sessions/1/alignment") return Promise.resolve(full);
+      if (path === "/interview/sessions/1/inquiries") {
+        return Promise.resolve({ session_id: 1, system_id: 1, items: [] });
+      }
+      return Promise.resolve(undefined);
+    };
+    mockApi.post.mockResolvedValue({});
+
+    const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
+    render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+
+    const toggle = await screen.findByTestId("review-item-evidence-toggle-90");
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/metric-events",
+        expect.objectContaining({
+          event_key: "evidence_available:alignment_item:90",
+          event_type: "evidence_available",
+        }),
+      );
+    });
+
+    fireEvent.click(toggle);
+    fireEvent.click(toggle);
+    fireEvent.click(toggle);
+    await waitFor(() => {
+      const expansionCalls = mockApi.post.mock.calls.filter(
+        ([path, body]) => path === "/interview/metric-events"
+          && body.event_key === "evidence_expanded:alignment_item:90",
+      );
+      expect(expansionCalls).toHaveLength(1);
+    });
+  });
+
+  test("does not count automatically pre-expanded evidence as an expansion opportunity", async () => {
+    const item = makeItem({ id: 91 }); // one evidence ref => pre-expanded by §4.4
+    const queue: AlignmentReviewQueueOut = { session_id: 1, system_id: 1, items: [item] };
+    const full: AlignmentListOut = {
+      session_id: 1, system_id: 1,
+      items_by_category: {
+        must_review: [], batch_reviewable: [item], no_review_required: [],
+        unchanged: [], informational: [],
+      },
+      counts: {
+        must_review: 0, batch_reviewable: 1, no_review_required: 0,
+        unchanged: 0, informational: 0,
+      },
+    };
+    getImpl = (path: string) => {
+      if (path === "/interview/sessions/1/review-queue") return Promise.resolve(queue);
+      if (path === "/interview/sessions/1/alignment") return Promise.resolve(full);
+      if (path === "/interview/sessions/1/inquiries") {
+        return Promise.resolve({ session_id: 1, system_id: 1, items: [] });
+      }
+      return Promise.resolve(undefined);
+    };
+    mockApi.post.mockResolvedValue({});
+
+    const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
+    render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+
+    const toggle = await screen.findByTestId("review-item-evidence-toggle-91");
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    await waitFor(() => expect(screen.getByTestId("review-item-evidence-91")).toBeInTheDocument());
+    expect(mockApi.post.mock.calls.filter(([path]) => path === "/interview/metric-events")).toHaveLength(0);
+  });
+
+  test("records an unchanged item only after the collapsed informational row is presented", async () => {
+    const item = makeItem({
+      id: 92,
+      review_category: "unchanged",
+      reason_code: "no_change",
+      alignment_state: "aligned",
+      current_evidence: [],
+    });
+    const queue: AlignmentReviewQueueOut = { session_id: 1, system_id: 1, items: [] };
+    const full: AlignmentListOut = {
+      session_id: 1, system_id: 1,
+      items_by_category: {
+        must_review: [], batch_reviewable: [], no_review_required: [],
+        unchanged: [item], informational: [],
+      },
+      counts: {
+        must_review: 0, batch_reviewable: 0, no_review_required: 0,
+        unchanged: 1, informational: 0,
+      },
+    };
+    getImpl = (path: string) => {
+      if (path === "/interview/sessions/1/review-queue") return Promise.resolve(queue);
+      if (path === "/interview/sessions/1/alignment") return Promise.resolve(full);
+      if (path === "/interview/sessions/1/inquiries") {
+        return Promise.resolve({ session_id: 1, system_id: 1, items: [] });
+      }
+      return Promise.resolve(undefined);
+    };
+    mockApi.post.mockResolvedValue({});
+
+    const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
+    render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+
+    const toggle = await screen.findByTestId("review-queue-informational-toggle");
+    expect(mockApi.post.mock.calls.some(
+      ([path, body]) => path === "/interview/metric-events"
+        && body.event_type === "unchanged_item_presented",
+    )).toBe(false);
+
+    fireEvent.click(toggle);
+    await screen.findByTestId("review-item-informational-92");
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/metric-events",
+        expect.objectContaining({
+          event_key: "unchanged_item_presented:alignment_item:92",
+          event_type: "unchanged_item_presented",
+          target_kind: "alignment_item",
+          target_id: 92,
+        }),
+      );
+    });
+    expect(mockApi.post.mock.calls.some(
+      ([path, body]) => path === "/interview/metric-events"
+        && body.event_type === "unchanged_item_reconfirmed",
+    )).toBe(false);
+  });
+
   test("shows only must_review/batch_reviewable as action cards, collapses the rest, and never renders raw enum values", async () => {
     const mustReview = makeItem({
       id: 1, review_category: "must_review", reason_code: "security_related",

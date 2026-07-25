@@ -1357,6 +1357,11 @@ CREATE TABLE IF NOT EXISTS interview_qa (
     -- other sources; kept separate from evidence_refs (code line ranges).
     runtime_evidence    TEXT,
     answer_text         TEXT,
+    -- Issue #309: explicit answer action provenance for the deterministic
+    -- unknown-selection rate. NULL means the row predates this measurement
+    -- field (or has never been answered); it is never guessed from free
+    -- text. 0/1 is written by both normal Q&A answer paths.
+    answer_unknown      INTEGER,
     status              TEXT NOT NULL DEFAULT 'open',
     answered_by         TEXT,
     superseded_by_id    INTEGER,
@@ -1375,6 +1380,33 @@ CREATE INDEX IF NOT EXISTS idx_interview_qa_system
 
 CREATE INDEX IF NOT EXISTS idx_interview_qa_current
     ON interview_qa (session_id, superseded_by_id);
+
+-- Interview UX measurement events (Issue #309). Server-owned interview
+-- state remains the primary source for metrics; this append-only table is
+-- only for UI interactions which cannot be reconstructed from domain rows
+-- (review abandonment, evidence expansion, unchanged-item reconfirmation).
+-- event_type/target_kind are finite and cross-validated by the API. No free
+-- text or page content is accepted, and nothing is sent to an external
+-- analytics service. event_key makes browser retries idempotent per System.
+CREATE TABLE IF NOT EXISTS interview_metric_event (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key   TEXT NOT NULL,
+    system_id   INTEGER NOT NULL,
+    session_id  INTEGER NOT NULL,
+    event_type  TEXT NOT NULL,
+    target_kind TEXT NOT NULL,
+    target_id   INTEGER NOT NULL,
+    recorded_at REAL NOT NULL,
+    UNIQUE (system_id, event_key),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_interview_metric_event_system
+    ON interview_metric_event (system_id, event_type, recorded_at);
+
+CREATE INDEX IF NOT EXISTS idx_interview_metric_event_session
+    ON interview_metric_event (session_id, recorded_at);
 
 -- Understanding revisions (Issue #136). One row per successful
 -- update-understanding call — appended, never overwritten — so the
@@ -4048,6 +4080,18 @@ def init_db() -> None:
             "UPDATE intelligence_runs SET status = 'completed' WHERE status = 'success'"
         )
         qa_cols = _columns(conn, "interview_qa")
+        if qa_cols and "answer_unknown" not in qa_cols:
+            # Existing answered/unconfirmed rows can be classified
+            # deterministically because Issue #142 exclusively used
+            # unconfirmed for answer_unknown. Revised rows have lost that
+            # distinction, so they deliberately remain NULL/unmeasured.
+            conn.execute("ALTER TABLE interview_qa ADD COLUMN answer_unknown INTEGER")
+            conn.execute(
+                "UPDATE interview_qa SET answer_unknown = 0 WHERE status = 'answered'"
+            )
+            conn.execute(
+                "UPDATE interview_qa SET answer_unknown = 1 WHERE status = 'unconfirmed'"
+            )
         if qa_cols and "runtime_evidence" not in qa_cols:
             # Issue #135: raw trace-aggregate + metadata-provenance JSON for
             # question_source = 'runtime' rows; existing rows stay NULL.

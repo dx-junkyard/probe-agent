@@ -469,6 +469,11 @@ def _qa_out(row) -> InterviewQaOut:
             else None
         ),
         answer_text=row["answer_text"],
+        answer_unknown=(
+            bool(row["answer_unknown"])
+            if "answer_unknown" in row.keys() and row["answer_unknown"] is not None
+            else None
+        ),
         status=row["status"],
         answered_by=row["answered_by"],
         superseded_by_id=row["superseded_by_id"],
@@ -518,6 +523,7 @@ def _insert_qa_row(
     evidence_refs: List[InterviewQaEvidenceRefOut],
     now: float,
     answer_text: Optional[str] = None,
+    answer_unknown: Optional[bool] = None,
     status: str = "open",
     answered_by: Optional[str] = None,
     answered_at: Optional[float] = None,
@@ -529,9 +535,9 @@ def _insert_qa_row(
         """INSERT INTO interview_qa
             (session_id, system_id, question_text, question_category,
              question_source, hypothesis, evidence_refs, runtime_evidence,
-             answer_text, status, answered_by, created_at, answered_at,
+             answer_text, answer_unknown, status, answered_by, created_at, answered_at,
              investigation_json, investigation_run_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             session_id,
             system_id,
@@ -543,6 +549,7 @@ def _insert_qa_row(
             if evidence_refs else None,
             json.dumps(runtime_evidence, ensure_ascii=False) if runtime_evidence else None,
             answer_text,
+            None if answer_unknown is None else (1 if answer_unknown else 0),
             status,
             answered_by,
             now,
@@ -1723,9 +1730,16 @@ def interview_dialogue_turn(
                     conn.execute(
                         """UPDATE interview_qa
                            SET answer_text = ?, status = ?,
-                               answered_by = ?, answered_at = ?
+                               answer_unknown = ?, answered_by = ?, answered_at = ?
                            WHERE id = ?""",
-                        (payload.user_message, consumed_status, payload.actor, now, consumed_id),
+                        (
+                            payload.user_message,
+                            consumed_status,
+                            1 if payload.answer_unknown else 0,
+                            payload.actor,
+                            now,
+                            consumed_id,
+                        ),
                     )
 
             if payload.user_message.strip():
@@ -2017,10 +2031,17 @@ def answer_interview_qa(
             if qa["status"] in ("open", "skipped"):
                 conn.execute(
                     """UPDATE interview_qa
-                       SET answer_text = ?, status = ?, answered_by = ?,
+                       SET answer_text = ?, answer_unknown = ?, status = ?, answered_by = ?,
                            answered_at = ?
                        WHERE id = ?""",
-                    (payload.answer_text, new_status, payload.actor, now, qa_id),
+                    (
+                        payload.answer_text,
+                        1 if payload.answer_unknown else 0,
+                        new_status,
+                        payload.actor,
+                        now,
+                        qa_id,
+                    ),
                 )
                 conn.execute("COMMIT")
                 updated = conn.execute(
@@ -2052,6 +2073,7 @@ def answer_interview_qa(
                     ),
                     now=now,
                     answer_text=payload.answer_text,
+                    answer_unknown=payload.answer_unknown,
                     status=new_status,
                     answered_by=payload.actor,
                     answered_at=now,
