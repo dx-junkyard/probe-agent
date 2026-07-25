@@ -214,11 +214,13 @@ creating incomplete persistence or execution paths for later phases.
     Topology Graph (existing, referenced read-only), Goal/Accountability
     Tree, and Cell Runtime State. See the Issue #297 section in
     `docs/project-intelligence.md`.
-    **Status: #297 and #298-#304 are implemented, verified, and closed.** The
-    one remaining Epic acceptance criterion — an end-to-end 2〜5 Cell
-    read-only pilot bound to a single Feature — is tracked as #314 under Epic
-    #307; every part it needs already exists and is tested, but no fixture
-    ties them together.
+    **Status: #297 and #298-#304 are implemented, verified, and closed.**
+    #314 additionally closes the final operational-proof gap with a 3-Cell
+    end-to-end read-only pilot fixture: one approved Feature/Probe Plan binds
+    three worker Cells, state/domain/root digest reads expose
+    Feature/API/Trace/evidence drill-down, the same Cell ids remain isolated
+    across Systems, and the GET-only pilot is verified not to call an LLM or
+    mutate the target repository, component policy, or Cell persistence.
 
 13. Issue #307 — remaining work after #282 / #295 / #297 closed. Three
     categories, all as sub-issues: (A) deliberate deferrals already documented
@@ -227,9 +229,10 @@ creating incomplete persistence or execution paths for later phases.
     提案の一括承認 (blocked on #309 supplying its start-condition data);
     (B) gaps found during the closing review and not previously documented —
     #312 the §5.5 cascade beyond goal/Intent, #313 externalizing the
-    no-review-required policy, #314 the 2〜5 Cell read-only pilot fixture;
-    (C) #315 contract/test hardening. None of these relax an existing human
-    gate. Do not start #311 before #309 lands.
+    no-review-required policy, and #314 the 2〜5 Cell read-only pilot fixture
+    (**implemented and verified with a 3-Cell E2E fixture**); (C) #315
+    contract/test hardening. None of these relax an existing human gate. Do
+    not start #311 before #309 lands.
 
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
