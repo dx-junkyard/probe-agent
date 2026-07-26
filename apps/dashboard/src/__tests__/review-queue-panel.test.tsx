@@ -1191,4 +1191,68 @@ describe("ReviewQueuePanel", () => {
     // Stays staged so the user can retry after refreshing the content.
     expect(screen.getByTestId("review-item-staged-120")).toBeInTheDocument();
   });
+
+  test("分類ルール再確認は選択した正確なポリシー来歴を送る", async () => {
+    const queue: AlignmentReviewQueueOut = { session_id: 1, system_id: 1, items: [] };
+    const full: AlignmentListOut = {
+      session_id: 1,
+      system_id: 1,
+      items_by_category: {
+        must_review: [], batch_reviewable: [], no_review_required: [],
+        unchanged: [], informational: [],
+      },
+      counts: {
+        must_review: 0, batch_reviewable: 0, no_review_required: 0,
+        unchanged: 0, informational: 0,
+      },
+    };
+    getImpl = (path: string) => {
+      if (path === "/interview/sessions/1/review-queue") return Promise.resolve(queue);
+      if (path === "/interview/sessions/1/alignment") return Promise.resolve(full);
+      if (path === "/interview/sessions/1/inquiries") {
+        return Promise.resolve({ session_id: 1, system_id: 1, items: [] });
+      }
+      if (path === "/interview/alignment/rule-objections") {
+        return Promise.resolve({
+          system_id: 1,
+          rules: [{
+            reason_code: "no_change",
+            policy_version: "alignment-review-v1",
+            policy_digest: "digest-v1",
+            policy_rule_id: "aligned-no-change",
+            objection_count: 2,
+            pending_recheck_count: 0,
+          }],
+        });
+      }
+      return Promise.resolve(undefined);
+    };
+    mockApi.post.mockResolvedValue({
+      system_id: 1,
+      reason_code: "no_change",
+      policy_version: "alignment-review-v1",
+      policy_digest: "digest-v1",
+      policy_rule_id: "aligned-no-change",
+      decision_method: "manual",
+      requested_by_user_id: 1,
+      recheck_target_count: 3,
+    });
+
+    const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
+    render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByTestId("review-queue-rule-recheck-aligned-no-change"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/alignment/rules/no_change/recheck",
+        {
+          policy_version: "alignment-review-v1",
+          policy_digest: "digest-v1",
+          policy_rule_id: "aligned-no-change",
+        },
+      );
+    });
+    expect(screen.getByText(/aligned-no-change/)).toBeInTheDocument();
+  });
 });

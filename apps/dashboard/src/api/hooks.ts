@@ -34,7 +34,7 @@ import type {
   InterviewInquiryOriginKind,
   AlignmentBuildOut, AlignmentListOut, AlignmentReviewQueueOut, AlignmentItemOut,
   AlignmentDecisionAction,
-  AlignmentRuleObjectionListOut, AlignmentRuleRecheckOut,
+  AlignmentRuleObjectionListOut, AlignmentRuleObjectionOut, AlignmentRuleRecheckOut,
   AlignmentBatchAnswerItemRequest, AlignmentBatchAnswerOut,
   InterviewMetricsOut, InterviewMetricEventCreate, InterviewMetricEventOut,
   RuntimeObservationProposalOut, RuntimeObservationProposalCreate,
@@ -1262,8 +1262,15 @@ function _invalidateAlignment(qc: ReturnType<typeof useQueryClient>, sessionId: 
 export function useRequestAlignmentRuleRecheck(sessionId: number | null) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ reasonCode }: { reasonCode: string }) =>
-      api.post<AlignmentRuleRecheckOut>(`/interview/alignment/rules/${reasonCode}/recheck`),
+    mutationFn: (rule: AlignmentRuleObjectionOut) =>
+      api.post<AlignmentRuleRecheckOut>(
+        `/interview/alignment/rules/${rule.reason_code}/recheck`,
+        {
+          policy_version: rule.policy_version,
+          policy_digest: rule.policy_digest,
+          policy_rule_id: rule.policy_rule_id,
+        },
+      ),
     onSuccess: () => _invalidateAlignment(qc, sessionId),
   });
 }

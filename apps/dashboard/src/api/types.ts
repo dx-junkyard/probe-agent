@@ -1078,6 +1078,7 @@ export interface AlignmentItemOut {
   // classification. Legacy rows have `legacy-code-v1` and no digest.
   policy_version: string;
   policy_digest: string | null;
+  policy_rule_id?: string | null;
   manual_recheck_required?: boolean;
   intelligence_run_id: number;
   is_mock: boolean;
@@ -1248,6 +1249,7 @@ export interface AlignmentRuleObjectionOut {
   reason_code: AlignmentReasonCode;
   policy_version: string;
   policy_digest: string | null;
+  policy_rule_id: string;
   objection_count: number;
   pending_recheck_count: number;
 }
@@ -1260,6 +1262,11 @@ export interface AlignmentRuleObjectionListOut {
 export interface AlignmentRuleRecheckOut {
   system_id: number;
   reason_code: AlignmentReasonCode;
+  policy_version: string;
+  policy_digest: string | null;
+  policy_rule_id: string;
+  decision_method: "manual";
+  requested_by_user_id: number;
   recheck_target_count: number;
 }
 

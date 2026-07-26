@@ -96,6 +96,7 @@ import type {
   AlignmentConfidence,
   AlignmentDecisionAction,
   AlignmentItemOut,
+  AlignmentRuleObjectionOut,
   AlignmentReviewCategory,
   AlignmentRiskFlag,
   AlignmentState,
@@ -826,8 +827,8 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
     });
   };
 
-  const handleRequestRecheck = (reasonCode: string) => {
-    requestRecheck.mutate({ reasonCode }, {
+  const handleRequestRecheck = (rule: AlignmentRuleObjectionOut) => {
+    requestRecheck.mutate(rule, {
       onSuccess: result => toast.success(`${result.recheck_target_count}件を再確認対象に戻しました`),
       onError: e => toast.error(String(e)),
     });
@@ -1078,19 +1079,20 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
             </p>
             {ruleObjections?.rules.map(rule => (
               <div
-                key={`${rule.reason_code}:${rule.policy_version}:${rule.policy_digest ?? "legacy"}`}
+                key={`${rule.reason_code}:${rule.policy_version}:${rule.policy_digest ?? "legacy"}:${rule.policy_rule_id}`}
                 className="flex flex-wrap items-center justify-between gap-2 rounded-md border p-2 text-xs"
               >
                 <span>
                   {ruleLabel(rule.reason_code)}: 異議 {rule.objection_count}件
                   {rule.pending_recheck_count > 0 && ` / 再確認中 ${rule.pending_recheck_count}件`}
+                  {` / ${rule.policy_rule_id} (${rule.policy_version})`}
                 </span>
                 <Button
                   size="sm"
                   variant="outline"
                   disabled={requestRecheck.isPending}
-                  onClick={() => handleRequestRecheck(rule.reason_code)}
-                  data-testid={`review-queue-rule-recheck-${rule.reason_code}`}
+                  onClick={() => handleRequestRecheck(rule)}
+                  data-testid={`review-queue-rule-recheck-${rule.policy_rule_id}`}
                 >
                   同じ分類の項目を再確認する
                 </Button>

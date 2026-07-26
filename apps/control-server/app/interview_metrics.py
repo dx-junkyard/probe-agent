@@ -91,20 +91,6 @@ def _unmeasured(
     )
 
 
-def _event_count(
-    conn: sqlite3.Connection,
-    system_id: int,
-    event_type: str,
-) -> int:
-    row = conn.execute(
-        """SELECT COUNT(*) AS n
-           FROM interview_metric_event
-           WHERE system_id = ? AND event_type = ?""",
-        (system_id, event_type),
-    ).fetchone()
-    return int(row["n"])
-
-
 def _ratio_metric_from_events(
     conn: sqlite3.Connection,
     system_id: int,
@@ -118,8 +104,32 @@ def _ratio_metric_from_events(
     numerator_event: str,
     denominator_event: str,
 ) -> InterviewMetricOut:
-    numerator = _event_count(conn, system_id, numerator_event)
-    denominator = _event_count(conn, system_id, denominator_event)
+    # Count semantic observation opportunities, not physical event rows.
+    # Numerators are the subset with the same (session, target kind, target)
+    # as a denominator fact. This keeps ratios bounded even for legacy rows
+    # created before semantic idempotency/prerequisite enforcement.
+    row = conn.execute(
+        """WITH denominator_facts AS (
+               SELECT DISTINCT session_id, target_kind, target_id
+               FROM interview_metric_event
+               WHERE system_id = ? AND event_type = ?
+           ),
+           numerator_facts AS (
+               SELECT DISTINCT session_id, target_kind, target_id
+               FROM interview_metric_event
+               WHERE system_id = ? AND event_type = ?
+           )
+           SELECT COUNT(*) AS denominator_n,
+                  COUNT(n.target_id) AS numerator_n
+           FROM denominator_facts d
+           LEFT JOIN numerator_facts n
+             ON n.session_id = d.session_id
+            AND n.target_kind = d.target_kind
+            AND n.target_id = d.target_id""",
+        (system_id, denominator_event, system_id, numerator_event),
+    ).fetchone()
+    numerator = int(row["numerator_n"])
+    denominator = int(row["denominator_n"])
     return _measured(
         key=key,
         category=category,

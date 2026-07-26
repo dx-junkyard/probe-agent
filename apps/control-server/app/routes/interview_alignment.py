@@ -58,7 +58,7 @@ from ..alignment import (
     AlignmentProposalResult,
     alignment_policy_digest,
     alignment_policy_version,
-    classify_alignment_item,
+    classify_alignment_item_with_rule,
     compute_content_hash,
     compute_intent_item_digest,
     generate_alignment_proposal,
@@ -66,7 +66,7 @@ from ..alignment import (
     user_reason_for,
     validate_evidence_against_snapshot,
 )
-from ..auth import get_system_id
+from ..auth import Principal, get_system_id, require_user
 from ..db import get_conn
 from ..interview_language import get_interview_language
 from ..llm import LLMConfig, LLMError, create_llm_client
@@ -82,6 +82,7 @@ from ..models import (
     AlignmentListOut,
     AlignmentRuleObjectionListOut,
     AlignmentRuleObjectionOut,
+    AlignmentRuleRecheckRequest,
     AlignmentRuleRecheckOut,
     AlignmentReviewQueueOut,
     AlignmentUserDecisionOut,
@@ -155,6 +156,9 @@ def _item_out(row) -> AlignmentItemOut:
             row["policy_version"] if "policy_version" in row.keys() else "legacy-code-v1"
         ),
         policy_digest=row["policy_digest"] if "policy_digest" in row.keys() else None,
+        policy_rule_id=(
+            row["policy_rule_id"] if "policy_rule_id" in row.keys() else None
+        ),
         manual_recheck_required=bool(
             row["manual_recheck_required"]
             if "manual_recheck_required" in row.keys() else False
@@ -205,12 +209,18 @@ def record_sample_rule_objection(
     conn.execute(
         """INSERT OR IGNORE INTO alignment_rule_objection
            (system_id, session_id, alignment_item_id, inquiry_id, reason_code,
-            policy_version, policy_digest, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            policy_version, policy_digest, policy_rule_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             system_id, session_id, item_id, inquiry_id, item["reason_code"],
             item["policy_version"] if "policy_version" in item.keys() else "legacy-code-v1",
-            item["policy_digest"] if "policy_digest" in item.keys() else None, now,
+            item["policy_digest"] if "policy_digest" in item.keys() else None,
+            (
+                item["policy_rule_id"]
+                if "policy_rule_id" in item.keys() and item["policy_rule_id"]
+                else "legacy-unknown"
+            ),
+            now,
         ),
     )
 
@@ -668,17 +678,21 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
                 if carried_from is not None:
                     it["review_category"] = "unchanged"
                     it["reason_code"] = "unchanged_since_confirmation"
+                    it["policy_rule_id"] = None
                     it["carried_over_from"] = carried_from
                 else:
-                    review_category, reason_code = classify_alignment_item(
-                        alignment_state=it["alignment_state"],
-                        risk_flags=it["risk_flags"],
-                        confidence=it["confidence"],
-                        intent_field=it["intent_field"],
-                        runtime_check=it["runtime_check"],
+                    review_category, reason_code, policy_rule_id = (
+                        classify_alignment_item_with_rule(
+                            alignment_state=it["alignment_state"],
+                            risk_flags=it["risk_flags"],
+                            confidence=it["confidence"],
+                            intent_field=it["intent_field"],
+                            runtime_check=it["runtime_check"],
+                        )
                     )
                     it["review_category"] = review_category
                     it["reason_code"] = reason_code
+                    it["policy_rule_id"] = policy_rule_id
                     it["carried_over_from"] = None
 
     run_status = "failed" if proposal.error else "completed"
@@ -703,19 +717,9 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
 
     conn.execute("BEGIN")
     try:
-        # Pending targets are keyed by the exact content hash.  Rebuilds can
-        # replace the physical row without losing an explicitly requested
-        # recheck, while changed content deliberately stops matching.
-        pending_recheck_hashes = {
-            row["content_hash"]
-            for row in conn.execute(
-                """SELECT content_hash FROM alignment_manual_recheck_target
-                   WHERE system_id = ? AND status = 'pending'""",
-                (system_id,),
-            ).fetchall()
-        }
         # Rebuild-merge (Principle 2): only rows with no user progress
-        # are ever replaced.
+        # are ever replaced. Pending manual targets use ON DELETE SET NULL,
+        # then bind one-for-one to an exact same-session replacement below.
         conn.execute(
             """DELETE FROM alignment_item
                WHERE session_id = ? AND system_id = ?
@@ -742,15 +746,34 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
         )
         for it in final_items:
             reason_code = it["reason_code"]
-            conn.execute(
+            policy_version = alignment_policy_version()
+            policy_digest = alignment_policy_digest()
+            pending_target = None
+            if it["content_hash"] and it["policy_rule_id"]:
+                pending_target = conn.execute(
+                    """SELECT id FROM alignment_manual_recheck_target
+                       WHERE system_id = ? AND session_id = ?
+                         AND reason_code = ? AND policy_version = ?
+                         AND policy_digest = ? AND policy_rule_id = ?
+                         AND content_hash = ? AND status = 'pending'
+                         AND alignment_item_id IS NULL
+                       ORDER BY id LIMIT 1""",
+                    (
+                        system_id, session_id, reason_code, policy_version,
+                        policy_digest, it["policy_rule_id"], it["content_hash"],
+                    ),
+                ).fetchone()
+            item_cur = conn.execute(
                 """INSERT INTO alignment_item
                     (session_id, system_id, revision_id, snapshot_id, intent_item_id,
                      intent_summary, current_claim, current_evidence, gap_summary,
                      proposed_interpretation, alignment_state, risk_flags, confidence,
                      review_category, reason_code, user_reason, runtime_check, status,
-                     user_decision, content_hash, carried_over_from, policy_version, policy_digest,
-                     manual_recheck_required, intelligence_run_id, is_mock, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                     user_decision, content_hash, carried_over_from, policy_version,
+                     policy_digest, policy_rule_id, manual_recheck_required,
+                     intelligence_run_id, is_mock, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open',
+                        NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id, system_id, revision["id"], revision["snapshot_id"],
                     it["intent_item_id"], it["intent_summary"], it["current_claim"],
@@ -759,11 +782,28 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
                     json.dumps(it["risk_flags"]), it["confidence"], it["review_category"],
                     reason_code, user_reason_for(reason_code), it["runtime_check"],
                     it["content_hash"], it["carried_over_from"],
-                    alignment_policy_version(), alignment_policy_digest(),
-                    1 if it["content_hash"] in pending_recheck_hashes else 0,
+                    policy_version, policy_digest, it["policy_rule_id"],
+                    1 if pending_target else 0,
                     run_id, 1 if proposal.is_mock else 0, completed_at, completed_at,
                 ),
             )
+            if pending_target:
+                conn.execute(
+                    """UPDATE alignment_manual_recheck_target
+                       SET alignment_item_id = ?
+                       WHERE id = ? AND alignment_item_id IS NULL""",
+                    (item_cur.lastrowid, pending_target["id"]),
+                )
+        # A changed/removed item is no longer the exact human-selected
+        # recheck target. Preserve the audit row, but do not leave it counted
+        # as an actionable pending item after this session's rebuild.
+        conn.execute(
+            """UPDATE alignment_manual_recheck_target
+               SET status = 'superseded', resolved_at = ?
+               WHERE system_id = ? AND session_id = ? AND status = 'pending'
+                 AND alignment_item_id IS NULL""",
+            (completed_at, system_id, session_id),
+        )
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
@@ -913,16 +953,23 @@ def list_alignment_rule_objections(
     with get_conn() as conn:
         rows = conn.execute(
             """SELECT o.reason_code, o.policy_version, o.policy_digest,
+                      o.policy_rule_id,
                       COUNT(*) AS objection_count,
                       COALESCE((
                         SELECT COUNT(*) FROM alignment_manual_recheck_target t
                         WHERE t.system_id = o.system_id
-                          AND t.reason_code = o.reason_code AND t.status = 'pending'
+                          AND t.reason_code = o.reason_code
+                          AND t.policy_version = o.policy_version
+                          AND t.policy_digest = COALESCE(o.policy_digest, '')
+                          AND t.policy_rule_id = o.policy_rule_id
+                          AND t.status = 'pending'
                       ), 0) AS pending_recheck_count
                FROM alignment_rule_objection o
                WHERE o.system_id = ?
-               GROUP BY o.system_id, o.reason_code, o.policy_version, o.policy_digest
-               ORDER BY objection_count DESC, o.reason_code, o.policy_version, o.policy_digest""",
+               GROUP BY o.system_id, o.reason_code, o.policy_version,
+                        o.policy_digest, o.policy_rule_id
+               ORDER BY objection_count DESC, o.reason_code, o.policy_version,
+                        o.policy_digest, o.policy_rule_id""",
             (system_id,),
         ).fetchall()
         return AlignmentRuleObjectionListOut(
@@ -930,7 +977,9 @@ def list_alignment_rule_objections(
             rules=[
                 AlignmentRuleObjectionOut(
                     reason_code=row["reason_code"], policy_version=row["policy_version"],
-                    policy_digest=row["policy_digest"], objection_count=row["objection_count"],
+                    policy_digest=row["policy_digest"],
+                    policy_rule_id=row["policy_rule_id"],
+                    objection_count=row["objection_count"],
                     pending_recheck_count=row["pending_recheck_count"],
                 )
                 for row in rows
@@ -944,7 +993,9 @@ def list_alignment_rule_objections(
 )
 def request_alignment_rule_recheck(
     reason_code: str,
+    payload: AlignmentRuleRecheckRequest,
     system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
 ) -> AlignmentRuleRecheckOut:
     """Explicitly return current similar items to the human Review Queue.
 
@@ -958,8 +1009,15 @@ def request_alignment_rule_recheck(
     with get_conn() as conn:
         objection = conn.execute(
             """SELECT 1 FROM alignment_rule_objection
-               WHERE system_id = ? AND reason_code = ? LIMIT 1""",
-            (system_id, reason_code),
+               WHERE system_id = ? AND reason_code = ?
+                 AND policy_version = ?
+                 AND COALESCE(policy_digest, '') = ?
+                 AND policy_rule_id = ?
+               LIMIT 1""",
+            (
+                system_id, reason_code, payload.policy_version,
+                payload.policy_digest or "", payload.policy_rule_id,
+            ),
         ).fetchone()
         if objection is None:
             raise HTTPException(
@@ -970,24 +1028,47 @@ def request_alignment_rule_recheck(
                 },
             )
         items = conn.execute(
-            """SELECT id, content_hash FROM alignment_item
+            """SELECT id, session_id, content_hash FROM alignment_item
                WHERE system_id = ? AND superseded = 0
                  AND review_category = 'no_review_required' AND reason_code = ?
+                 AND policy_version = ?
+                 AND COALESCE(policy_digest, '') = ?
+                 AND policy_rule_id = ?
                  AND status NOT IN ('answered', 'corrected')
                  AND content_hash IS NOT NULL
                ORDER BY id""",
-            (system_id, reason_code),
+            (
+                system_id, reason_code, payload.policy_version,
+                payload.policy_digest or "", payload.policy_rule_id,
+            ),
         ).fetchall()
         conn.execute("BEGIN")
         try:
             for item in items:
                 conn.execute(
                     """INSERT INTO alignment_manual_recheck_target
-                       (system_id, reason_code, content_hash, status, created_at, resolved_at)
-                       VALUES (?, ?, ?, 'pending', ?, NULL)
-                       ON CONFLICT(system_id, reason_code, content_hash) DO UPDATE SET
-                         status = 'pending', created_at = excluded.created_at, resolved_at = NULL""",
-                    (system_id, reason_code, item["content_hash"], now),
+                       (system_id, session_id, alignment_item_id, reason_code,
+                        policy_version, policy_digest, policy_rule_id, content_hash,
+                        status, decision_method, requested_by_user_id,
+                        created_at, resolved_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'manual', ?, ?, NULL)
+                       ON CONFLICT(alignment_item_id) DO UPDATE SET
+                         reason_code = excluded.reason_code,
+                         policy_version = excluded.policy_version,
+                         policy_digest = excluded.policy_digest,
+                         policy_rule_id = excluded.policy_rule_id,
+                         content_hash = excluded.content_hash,
+                         status = 'pending',
+                         decision_method = 'manual',
+                         requested_by_user_id = excluded.requested_by_user_id,
+                         created_at = excluded.created_at,
+                         resolved_at = NULL""",
+                    (
+                        system_id, item["session_id"], item["id"], reason_code,
+                        payload.policy_version, payload.policy_digest or "",
+                        payload.policy_rule_id, item["content_hash"],
+                        principal.user_id, now,
+                    ),
                 )
             if items:
                 placeholders = ",".join("?" for _ in items)
@@ -1001,7 +1082,14 @@ def request_alignment_rule_recheck(
             conn.execute("ROLLBACK")
             raise
         return AlignmentRuleRecheckOut(
-            system_id=system_id, reason_code=reason_code, recheck_target_count=len(items),
+            system_id=system_id,
+            reason_code=reason_code,
+            policy_version=payload.policy_version,
+            policy_digest=payload.policy_digest,
+            policy_rule_id=payload.policy_rule_id,
+            decision_method="manual",
+            requested_by_user_id=principal.user_id,
+            recheck_target_count=len(items),
         )
 
 
@@ -1099,10 +1187,8 @@ def _write_answer_decision(
     conn.execute(
         """UPDATE alignment_manual_recheck_target
            SET status = 'resolved', resolved_at = ?
-           WHERE system_id = (SELECT system_id FROM alignment_item WHERE id = ?)
-             AND content_hash = (SELECT content_hash FROM alignment_item WHERE id = ?)
-             AND status = 'pending'""",
-        (now, item_id, item_id),
+           WHERE alignment_item_id = ? AND status = 'pending'""",
+        (now, item_id),
     )
     row = conn.execute("SELECT * FROM alignment_item WHERE id = ?", (item_id,)).fetchone()
     return _item_out(row)
@@ -1180,10 +1266,8 @@ def correct_alignment_item(
         conn.execute(
             """UPDATE alignment_manual_recheck_target
                SET status = 'resolved', resolved_at = ?
-               WHERE system_id = (SELECT system_id FROM alignment_item WHERE id = ?)
-                 AND content_hash = (SELECT content_hash FROM alignment_item WHERE id = ?)
-                 AND status = 'pending'""",
-            (now, item_id, item_id),
+               WHERE alignment_item_id = ? AND status = 'pending'""",
+            (now, item_id),
         )
         row = conn.execute("SELECT * FROM alignment_item WHERE id = ?", (item_id,)).fetchone()
         result = _item_out(row)

@@ -65,8 +65,8 @@
       "properties": {
         "id": { "type": "integer" },
         "system_id": { "type": "integer" },
-        "snapshot_id": { "type": "integer" },
-        "run_type": { "enum": ["repository_drafts", "system_profile_draft", "feature_map_draft", "symbol_index", "feature_code_mapping", "probe_plan", "probe_plan_from_flow", "capability_hierarchy", "explanation_refresh", "interview_proposal", "interview_dialogue", "interview_evidence_selection", "understanding_review", "runtime_reality_check", "pattern_reconcile", "pattern_investigate", "probe_plan_from_pattern"] },
+        "snapshot_id": { "type": ["integer", "null"] },
+        "run_type": { "enum": ["alignment_build", "analyzer_proposal", "api_scan", "candidate_studio_proposal", "capability_hierarchy", "cell_improvement_draft", "cell_quality_audit", "cell_triage", "entrypoint_index", "explanation_refresh", "feature_code_mapping", "inquiry_answer", "intent_proposal", "interview_dialogue", "interview_evidence_selection", "interview_proposal", "investigation", "nl_change_set", "pattern_investigate", "pattern_reconcile", "probe_plan", "probe_plan_from_flow", "probe_plan_from_pattern", "question_route", "replay_regression_scaffold", "replay_variant_draft", "repository_drafts", "runtime_match", "runtime_reality_check", "symbol_index", "understanding_review"] },
         "provider": { "type": "string" },
         "model": { "type": "string" },
         "prompt_version": { "type": "string" },

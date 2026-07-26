@@ -179,6 +179,25 @@ class AlignmentReviewPolicy:
         intent_field: Optional[str],
         runtime_check: Optional[str],
     ) -> Tuple[str, str]:
+        review_category, reason_code, _rule_id = self.classify_with_rule(
+            alignment_state=alignment_state,
+            risk_flags=risk_flags,
+            confidence=confidence,
+            intent_field=intent_field,
+            runtime_check=runtime_check,
+        )
+        return review_category, reason_code
+
+    def classify_with_rule(
+        self,
+        *,
+        alignment_state: str,
+        risk_flags: List[str],
+        confidence: str,
+        intent_field: Optional[str],
+        runtime_check: Optional[str],
+    ) -> Tuple[str, str, str]:
+        """Return the classification together with its unique policy rule."""
         for rule in self.rules:
             if rule.matches(
                 alignment_state=alignment_state,
@@ -187,7 +206,7 @@ class AlignmentReviewPolicy:
                 intent_field=intent_field,
                 runtime_check=runtime_check,
             ):
-                return rule.review_category, rule.reason_code
+                return rule.review_category, rule.reason_code, rule.rule_id
         raise AlignmentPolicyError(
             "policy has no matching rule for "
             f"alignment_state={alignment_state!r}, confidence={confidence!r}"
@@ -398,6 +417,24 @@ def classify_alignment_item(
     future rule-table edit accidentally leaving a state uncovered.
     """
     return _ALIGNMENT_REVIEW_POLICY.classify(
+        alignment_state=alignment_state,
+        risk_flags=risk_flags,
+        confidence=confidence,
+        intent_field=intent_field,
+        runtime_check=runtime_check,
+    )
+
+
+def classify_alignment_item_with_rule(
+    *,
+    alignment_state: str,
+    risk_flags: List[str],
+    confidence: str,
+    intent_field: Optional[str],
+    runtime_check: Optional[str] = None,
+) -> Tuple[str, str, str]:
+    """Deterministically classify an item and expose the matched rule id."""
+    return _ALIGNMENT_REVIEW_POLICY.classify_with_rule(
         alignment_state=alignment_state,
         risk_flags=risk_flags,
         confidence=confidence,
