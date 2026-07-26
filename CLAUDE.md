@@ -177,7 +177,10 @@ creating incomplete persistence or execution paths for later phases.
     **Status: implemented, verified, and closed.** Deferred work now has its
     own issues under Epic #307: Inquiry snapshot/revision premise tracking +
     `superseded` (#308), sample-error driven rule re-evaluation (#310), and
-    the §5.5 re-confirmation cascade beyond goal/Intent (#312). #309 is
+    the §5.5 re-confirmation cascade beyond goal/Intent (#312,
+    **implemented and verified** with an authenticated System-wide canonical
+    head, stable Capability identities, manually editable many-to-many support
+    relations, and relation-scoped carry-over invalidation). #309 is
     implemented: deterministic System-scoped UX metrics use persisted facts
     and finite UI events, return unavailable values as `unmeasured`, and keep
     guardrails separate without changing product behaviour. #313 is implemented: the
@@ -233,7 +236,8 @@ creating incomplete persistence or execution paths for later phases.
     mechanism now exists, but implementation remains blocked until a real
     observation cohort and undo/misclassification cases exist);
     (B) gaps found during the closing review and not previously documented —
-    #312 the §5.5 cascade beyond goal/Intent, #313 externalizing the
+    #312 the §5.5 cascade beyond goal/Intent (**implemented and verified**),
+    #313 externalizing the
     no-review-required policy (**implemented and verified**), and #314 the 2〜5 Cell read-only pilot fixture
     (**implemented and verified with a 3-Cell E2E fixture**); (C) #315
     contract/test hardening. None of these relax an existing human gate. Do

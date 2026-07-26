@@ -2368,6 +2368,11 @@ class InterviewSessionOut(BaseModel):
     last_error: Optional[str] = None
     understanding_confirmed_at: Optional[float] = None
     understanding_confirmed_by: Optional[str] = None
+    # Issue #312: a later Understanding revision must be manually confirmed
+    # into the canonical capability graph before it can drive scoped
+    # Alignment carry-over.
+    capability_graph_confirmed_revision_id: Optional[int] = None
+    capability_graph_confirmation_required: bool = False
     # Issue #129: set when an answered interview_qa question is corrected.
     # Never cleared automatically by the revision itself — only a successful
     # understanding rebuild (update-understanding) clears it.
@@ -2637,6 +2642,69 @@ class InterviewDialogueTurnRequest(BaseModel):
     answer_unknown: bool = False
 
 
+CapabilityEntityKind = Literal[
+    "core_capability", "capability_element", "supporting_element", "api_boundary",
+]
+
+
+class InterviewCapabilityIdentityBinding(BaseModel):
+    """Explicitly keep one canonical identity across a display-name rename."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    entity_kind: CapabilityEntityKind
+    current_name: str = Field(min_length=1, max_length=500)
+    entity_id: int = Field(gt=0)
+
+
+class InterviewCapabilityRelationConfirmation(BaseModel):
+    """One manually confirmed many-to-many support relation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    supported_kind: CapabilityEntityKind
+    supported_name: str = Field(min_length=1, max_length=500)
+    supporting_kind: CapabilityEntityKind
+    supporting_name: str = Field(min_length=1, max_length=500)
+    role: str = Field(default="", max_length=1_000)
+    scope: str = Field(default="", max_length=2_000)
+
+
+class InterviewCapabilityNodeOut(BaseModel):
+    entity_id: int
+    entity_kind: CapabilityEntityKind
+    name: str
+    summary: str = ""
+    semantic_digest: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+class InterviewCapabilityRelationOut(BaseModel):
+    relation_id: int
+    supported_entity_id: int
+    supporting_entity_id: int
+    relation_kind: Literal["supports"]
+    role: str = ""
+    scope: str = ""
+    semantic_digest: str
+
+
+class InterviewCapabilityGraphOut(BaseModel):
+    confirmation_id: int
+    system_id: int
+    session_id: int
+    base_confirmation_id: Optional[int] = None
+    source_revision_id: Optional[int] = None
+    source_revision_at: Optional[float] = None
+    composition_digest: str
+    decided_by: str
+    decided_by_user_id: Optional[int] = None
+    decision_method: Literal["manual"]
+    created_at: float
+    nodes: List[InterviewCapabilityNodeOut] = Field(default_factory=list)
+    relations: List[InterviewCapabilityRelationOut] = Field(default_factory=list)
+
+
 class InterviewConfirmUnderstandingRequest(BaseModel):
     """Manual confirmation that the gathered interview context is sufficient.
 
@@ -2649,6 +2717,20 @@ class InterviewConfirmUnderstandingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     actor: str = Field(min_length=1, max_length=200)
+    # Optimistic lock for the System-wide canonical head. Required by the
+    # API whenever a new confirmation builds on an existing head.
+    capability_base_confirmation_id: Optional[int] = Field(default=None, gt=0)
+    # Issue #312: absent means derive exact relations from the current
+    # understanding's ``children`` lists.  An explicitly empty list confirms
+    # a graph with no support relations.
+    capability_relations: Optional[
+        List[InterviewCapabilityRelationConfirmation]
+    ] = Field(default=None, max_length=200)
+    # Exact, human-supplied rename identity.  No fuzzy/name-similarity
+    # inference is performed when this list omits a renamed node.
+    capability_identity_bindings: List[
+        InterviewCapabilityIdentityBinding
+    ] = Field(default_factory=list, max_length=100)
 
 
 class InterviewQuestionEvidenceRef(BaseModel):
@@ -3294,7 +3376,8 @@ AlignmentReviewCategory = Literal[
 AlignmentReasonCode = Literal[
     "security_related", "high_risk", "core_intent", "conflict_detected",
     "low_confidence", "runtime_mismatch", "routine_update", "no_change",
-    "informational_only", "unchanged_since_confirmation",
+    "informational_only", "core_capability_changed",
+    "unchanged_since_confirmation",
 ]
 # Item-level user progress. 'inquiry' is set while an Inquiry
 # (origin_kind='review_item') is open on this item, and reset to 'open'
@@ -3325,6 +3408,20 @@ class AlignmentUserDecisionOut(BaseModel):
     decided_by: Optional[str] = None
 
 
+class AlignmentCapabilityDependencyOut(BaseModel):
+    """Human-reviewable canonical scope attached to one Alignment item."""
+
+    target_kind: Literal["entity", "relation"]
+    entity_id: Optional[int] = None
+    relation_id: Optional[int] = None
+    entity_kind: Optional[CapabilityEntityKind] = None
+    entity_name: Optional[str] = None
+    supported_entity_id: Optional[int] = None
+    supported_entity_name: Optional[str] = None
+    supporting_entity_id: Optional[int] = None
+    supporting_entity_name: Optional[str] = None
+
+
 class AlignmentItemOut(BaseModel):
     id: int
     session_id: int
@@ -3343,6 +3440,12 @@ class AlignmentItemOut(BaseModel):
     review_category: AlignmentReviewCategory
     reason_code: AlignmentReasonCode
     user_reason: str
+    # Issue #312: these exact canonical dependencies are visible to the
+    # reviewer; accept_current confirms the claim and this scope together.
+    capability_confirmation_id: Optional[int] = None
+    capability_dependencies: List[AlignmentCapabilityDependencyOut] = Field(
+        default_factory=list
+    )
     # Issue #290: deterministic Runtime Reality Check match state, set only
     # when this item's evidence deterministically maps to a component_id
     # with runtime trace facts; null when no deterministic mapping exists

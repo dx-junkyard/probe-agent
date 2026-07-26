@@ -507,6 +507,66 @@ export interface CurrentUnderstanding {
   probe_flow_candidates: UnderstandingItem[];
 }
 
+export type CapabilityEntityKind =
+  | "core_capability" | "capability_element" | "supporting_element" | "api_boundary";
+
+export interface InterviewCapabilityNodeOut {
+  entity_id: number;
+  entity_kind: CapabilityEntityKind;
+  name: string;
+  summary: string;
+  semantic_digest: string;
+  payload: Record<string, unknown>;
+}
+
+export interface InterviewCapabilityRelationOut {
+  relation_id: number;
+  supported_entity_id: number;
+  supporting_entity_id: number;
+  relation_kind: "supports";
+  role: string;
+  scope: string;
+  semantic_digest: string;
+}
+
+export interface InterviewCapabilityGraphOut {
+  confirmation_id: number;
+  system_id: number;
+  session_id: number;
+  base_confirmation_id: number | null;
+  source_revision_id: number | null;
+  source_revision_at: number | null;
+  composition_digest: string;
+  decided_by: string;
+  decided_by_user_id: number | null;
+  decision_method: "manual";
+  created_at: number;
+  nodes: InterviewCapabilityNodeOut[];
+  relations: InterviewCapabilityRelationOut[];
+}
+
+export interface InterviewCapabilityIdentityBinding {
+  entity_kind: CapabilityEntityKind;
+  current_name: string;
+  entity_id: number;
+}
+
+export interface InterviewCapabilityRelationConfirmation {
+  supported_kind: CapabilityEntityKind;
+  supported_name: string;
+  supporting_kind: CapabilityEntityKind;
+  supporting_name: string;
+  role?: string;
+  scope?: string;
+}
+
+export interface InterviewConfirmUnderstandingRequest {
+  actor: string;
+  capability_base_confirmation_id?: number | null;
+  capability_relations?: InterviewCapabilityRelationConfirmation[] | null;
+  capability_identity_bindings?: InterviewCapabilityIdentityBinding[];
+}
+
 export interface InterviewSessionOut {
   id: number;
   system_id: number;
@@ -523,6 +583,8 @@ export interface InterviewSessionOut {
   last_error: string | null;
   understanding_confirmed_at: number | null;
   understanding_confirmed_by: string | null;
+  capability_graph_confirmed_revision_id?: number | null;
+  capability_graph_confirmation_required?: boolean;
   // Issue #129: set when an answered interview_qa question is corrected;
   // cleared only by a successful understanding rebuild.
   answers_revised_at: number | null;
@@ -1011,7 +1073,7 @@ export type AlignmentReviewCategory =
 export type AlignmentReasonCode =
   | "security_related" | "high_risk" | "core_intent" | "conflict_detected"
   | "low_confidence" | "runtime_mismatch" | "routine_update" | "no_change"
-  | "informational_only" | "unchanged_since_confirmation";
+  | "informational_only" | "core_capability_changed" | "unchanged_since_confirmation";
 // Issue #290: deterministic Runtime Reality Check match state, set only
 // when this item's evidence deterministically maps to a component_id with
 // runtime trace facts; null when no deterministic mapping exists.
@@ -1036,6 +1098,18 @@ export interface AlignmentUserDecisionOut {
   decided_by: string | null;
 }
 
+export interface AlignmentCapabilityDependencyOut {
+  target_kind: "entity" | "relation";
+  entity_id: number | null;
+  relation_id: number | null;
+  entity_kind: CapabilityEntityKind | null;
+  entity_name: string | null;
+  supported_entity_id: number | null;
+  supported_entity_name: string | null;
+  supporting_entity_id: number | null;
+  supporting_entity_name: string | null;
+}
+
 export interface AlignmentItemOut {
   id: number;
   session_id: number;
@@ -1054,6 +1128,8 @@ export interface AlignmentItemOut {
   review_category: AlignmentReviewCategory;
   reason_code: AlignmentReasonCode;
   user_reason: string;
+  capability_confirmation_id?: number | null;
+  capability_dependencies?: AlignmentCapabilityDependencyOut[];
   runtime_check?: RuntimeCheckState | null;
   status: AlignmentItemStatus;
   user_decision: AlignmentUserDecisionOut | null;

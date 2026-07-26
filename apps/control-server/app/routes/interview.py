@@ -28,7 +28,12 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict
 
-from ..auth import get_system_id
+from ..auth import Principal, get_system_id, require_user
+from ..capability_graph import (
+    CapabilityGraphError,
+    confirm_capability_graph,
+    latest_system_confirmed_graph,
+)
 from ..db import get_conn
 from ..interview_context import build_interview_context
 from ..interview_agent import (
@@ -70,6 +75,7 @@ from ..models import (
     AnswerableAreasUpdateRequest,
     InterviewApprovedItemOut,
     InterviewApprovedSetOut,
+    InterviewCapabilityGraphOut,
     InterviewConfirmUnderstandingRequest,
     InterviewContextPack,
     InterviewDialogueProposalOut,
@@ -343,6 +349,29 @@ router = APIRouter()
 
 def _session_out(conn, row) -> InterviewSessionOut:
     import json as _json
+    latest_revision = conn.execute(
+        """SELECT id FROM understanding_revision
+           WHERE session_id = ? AND system_id = ?
+           ORDER BY id DESC LIMIT 1""",
+        (row["id"], row["system_id"]),
+    ).fetchone()
+    graph_confirmation = conn.execute(
+        """SELECT id, source_revision_id
+           FROM understanding_capability_confirmation
+           WHERE session_id = ? AND system_id = ?
+           ORDER BY id DESC LIMIT 1""",
+        (row["id"], row["system_id"]),
+    ).fetchone()
+    system_graph_confirmation = conn.execute(
+        """SELECT id FROM understanding_capability_confirmation
+           WHERE system_id = ?
+           ORDER BY id DESC LIMIT 1""",
+        (row["system_id"],),
+    ).fetchone()
+    latest_revision_id = latest_revision["id"] if latest_revision else None
+    confirmed_revision_id = (
+        graph_confirmation["source_revision_id"] if graph_confirmation else None
+    )
     return InterviewSessionOut(
         id=row["id"],
         system_id=row["system_id"],
@@ -363,6 +392,17 @@ def _session_out(conn, row) -> InterviewSessionOut:
         understanding_confirmed_by=(
             row["understanding_confirmed_by"]
             if "understanding_confirmed_by" in row.keys() else None
+        ),
+        capability_graph_confirmed_revision_id=confirmed_revision_id,
+        capability_graph_confirmation_required=bool(
+            row["current_understanding"]
+            and latest_revision_id is not None
+            and (
+                confirmed_revision_id != latest_revision_id
+                or graph_confirmation is None
+                or system_graph_confirmation is None
+                or graph_confirmation["id"] != system_graph_confirmation["id"]
+            )
         ),
         answers_revised_at=(
             row["answers_revised_at"] if "answers_revised_at" in row.keys() else None
@@ -2650,6 +2690,27 @@ def materialize_interview_session(
 # --- Understanding Confirmation (Issue #123) ---------------------------------
 
 
+@router.get(
+    "/interview/sessions/{session_id}/capability-graph",
+    response_model=InterviewCapabilityGraphOut,
+)
+def get_interview_capability_graph(
+    session_id: int,
+    system_id: int = Depends(get_system_id),
+) -> InterviewCapabilityGraphOut:
+    """Return the latest System-wide manually-confirmed composition (#312)."""
+
+    with get_conn() as conn:
+        _get_session_or_404(conn, session_id, system_id)
+        graph = latest_system_confirmed_graph(conn, system_id=system_id)
+        if graph is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No confirmed capability graph exists for this session",
+            )
+        return InterviewCapabilityGraphOut(**graph)
+
+
 @router.post(
     "/interview/sessions/{session_id}/confirm-understanding",
     response_model=InterviewSessionOut,
@@ -2658,6 +2719,7 @@ def confirm_interview_understanding(
     session_id: int,
     payload: InterviewConfirmUnderstandingRequest,
     system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
 ) -> InterviewSessionOut:
     """Record the developer's manual confirmation of the interview context.
 
@@ -2680,51 +2742,168 @@ def confirm_interview_understanding(
     """
     now = time.time()
     with get_conn() as conn:
-        session = _get_session_or_404(conn, session_id, system_id)
+        # get_conn() uses autocommit.  The human decision must therefore own
+        # one explicit transaction spanning the canonical graph, session
+        # state, and audit message; a failure in any later write rolls all of
+        # them back.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            session = _get_session_or_404(conn, session_id, system_id)
+            latest_revision = conn.execute(
+                """SELECT * FROM understanding_revision
+                   WHERE session_id = ? AND system_id = ?
+                   ORDER BY id DESC LIMIT 1""",
+                (session_id, system_id),
+            ).fetchone()
+            graph_already_confirmed = None
+            if latest_revision is not None:
+                graph_already_confirmed = conn.execute(
+                    """SELECT id FROM understanding_capability_confirmation
+                       WHERE system_id = ? AND session_id = ?
+                         AND source_revision_id = ?""",
+                    (system_id, session_id, latest_revision["id"]),
+                ).fetchone()
+            system_graph_head = conn.execute(
+                """SELECT id FROM understanding_capability_confirmation
+                   WHERE system_id = ? ORDER BY id DESC LIMIT 1""",
+                (system_id,),
+            ).fetchone()
+            if (
+                graph_already_confirmed is not None
+                and system_graph_head is not None
+                and graph_already_confirmed["id"] != system_graph_head["id"]
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "This revision was confirmed from an older canonical "
+                        "Capability head. Create a fresh Understanding revision "
+                        "before confirming again."
+                    ),
+                )
+            if graph_already_confirmed is None:
+                actual_base_confirmation_id = (
+                    system_graph_head["id"] if system_graph_head is not None else None
+                )
+                if (
+                    payload.capability_base_confirmation_id
+                    != actual_base_confirmation_id
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "The canonical Capability head changed or was not "
+                            "acknowledged. Refresh the graph and confirm again."
+                        ),
+                    )
 
-        # The Dashboard hides the confirmation control once complete. Keep a
-        # direct/retried API request idempotent so it cannot append another
-        # workflow event or alter the recorded decision.
-        if session["understanding_confirmed_at"] is not None:
-            return _session_out(conn, session)
+            # Zero-base confirmation remains session-scoped.  Structured
+            # confirmation always reaches confirm_capability_graph so a retry
+            # with a different binding/relation request is rejected rather
+            # than silently treated as idempotent.
+            if session["understanding_confirmed_at"] is not None and (
+                session["current_understanding"] is None
+                or latest_revision is None
+            ):
+                result = _session_out(conn, session)
+                conn.execute("COMMIT")
+                return result
 
-        user_turns = conn.execute(
-            "SELECT COUNT(*) AS n FROM interview_message WHERE session_id = ? AND role = 'user'",
-            (session_id,),
-        ).fetchone()["n"]
-        if session["current_understanding"] is None and user_turns == 0:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "Nothing to confirm: the session has no built understanding "
-                    "and no interview answers yet"
+            user_turns = conn.execute(
+                """SELECT COUNT(*) AS n FROM interview_message
+                   WHERE session_id = ? AND role = 'user'""",
+                (session_id,),
+            ).fetchone()["n"]
+            if session["current_understanding"] is None and user_turns == 0:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Nothing to confirm: the session has no built understanding "
+                        "and no interview answers yet"
+                    ),
+                )
+
+            if (
+                session["current_understanding"] is not None
+                and latest_revision is not None
+            ):
+                if not latest_revision["current_understanding"]:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "The latest Understanding revision has no structured "
+                            "content and cannot be confirmed as a capability graph"
+                        ),
+                    )
+                revision_understanding = json.loads(
+                    latest_revision["current_understanding"]
+                )
+                confirm_capability_graph(
+                    conn,
+                    system_id=system_id,
+                    session_id=session_id,
+                    revision_id=latest_revision["id"],
+                    revision_created_at=latest_revision["created_at"],
+                    current_understanding=revision_understanding,
+                    actor=principal.username or f"user:{principal.user_id}",
+                    actor_user_id=principal.user_id,
+                    identity_bindings=[
+                        item.model_dump()
+                        for item in payload.capability_identity_bindings
+                    ],
+                    relations=(
+                        [
+                            item.model_dump()
+                            for item in payload.capability_relations
+                        ]
+                        if payload.capability_relations is not None
+                        else None
+                    ),
+                    now=now,
+                )
+                if graph_already_confirmed is not None:
+                    result = _session_out(conn, session)
+                    conn.execute("COMMIT")
+                    return result
+
+            confirmed_by = principal.username or f"user:{principal.user_id}"
+            new_stage = _advance_stage(
+                session["stage"] or "understanding_initialized",
+                "proposal_generation",
+            )
+            conn.execute(
+                """UPDATE interview_session
+                   SET understanding_confirmed_at = ?, understanding_confirmed_by = ?,
+                       stage = ?, updated_at = ?
+                   WHERE id = ? AND system_id = ?""",
+                (now, confirmed_by, new_stage, now, session_id, system_id),
+            )
+            conn.execute(
+                """INSERT INTO interview_message
+                    (session_id, system_id, role, content, created_at)
+                VALUES (?, ?, 'system', ?, ?)""",
+                (
+                    session_id,
+                    system_id,
+                    interview_message(
+                        "confirm_understanding_message",
+                        resolve_message_language(),
+                    ),
+                    now,
                 ),
             )
-
-        new_stage = _advance_stage(
-            session["stage"] or "understanding_initialized",
-            "proposal_generation",
-        )
-        conn.execute(
-            """UPDATE interview_session
-               SET understanding_confirmed_at = ?, understanding_confirmed_by = ?,
-                   stage = ?, updated_at = ?
-               WHERE id = ? AND system_id = ?""",
-            (now, payload.actor, new_stage, now, session_id, system_id),
-        )
-        conn.execute(
-            """INSERT INTO interview_message
-                (session_id, system_id, role, content, created_at)
-            VALUES (?, ?, 'system', ?, ?)""",
-            (
-                session_id,
-                system_id,
-                interview_message("confirm_understanding_message", resolve_message_language()),
-                now,
-            ),
-        )
-        row = _get_session_or_404(conn, session_id, system_id)
-        return _session_out(conn, row)
+            row = _get_session_or_404(conn, session_id, system_id)
+            result = _session_out(conn, row)
+            conn.execute("COMMIT")
+            return result
+        except CapabilityGraphError as exc:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
 
 
 # --- Stage Advancement (Issue #82) -------------------------------------------

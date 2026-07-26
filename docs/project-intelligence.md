@@ -3986,10 +3986,34 @@ Epic #307 の子 Issue として起票し直した。
   再確認化は決定的分類を変更せず、実行者と `decision_method: manual` を保存し、
   通常の手動回答/修正だけが現行対象を解消する。rebuild で内容が変わった旧対象は
   監査行を `superseded` として残し、現行の pending 件数には含めない。
-- **再確認カスケードの範囲(§5.5 → #312)**: goal / 確定済み Intent の変更時の
-  carry-over 無効化までを実装。Core Capability レベルは決定的判定源が無いため
-  対象外(下記「Core Capability は…」参照)。実装レビューで、この限界が
-  本節に明記されていなかったため追記した。
+- **再確認カスケードの範囲(§5.5 → #312)**: 完了。既存の goal / 確定済み
+  Intent ガードに加え、reasoning model の `current_understanding` を提案、
+  `confirm-understanding` を人間による正準構成の確定として分離した。
+  Core Capability / Capability Element / Supporting Element / API Boundary は
+  表示名と独立した System-scoped の安定 entity id を持ち、rename は人間が
+  明示 binding した場合だけ同一 identity を引き継ぐ。支援関係も安定 relation
+  id の多対多グラフなので、同じ下位機能を複数 Core Capability が共有できる。
+  確定履歴は System-wide の canonical head と `base_confirmation_id` で直列化し、
+  確定requestは表示時のhead idをoptimistic lockとして照合するため、
+  同時更新後の古い構成を上書きしない。
+  別 Interview session でも同名 identity を継承する。古い head に紐づく
+  session は新しい Understanding revision を確定するまで Alignment build を
+  409 で拒否する。確定APIはログインユーザー専用で、Principal の user id/名前を
+  保存し、graph・session stage・監査messageを単一transactionで確定する。
+  Dashboard の再確定dialogでは rename binding と採用する多対多relationを
+  人間が確認・編集できる。
+  Alignment item は、生成時に提示された現行の確定グラフに存在する entity /
+  relation id だけを依存先として受理し、`accept_current` の監査範囲と一緒に
+  sidecar tableへ保存し、Review Queueにも名称付きで表示する。次回 build は
+  `base_content_hash` が同じ候補について確定
+  グラフ間の依存 digest を決定的に比較し、変更関係を参照する項目だけを
+  `must_review` / `reason_code='core_capability_changed'` へ戻す。共有機能の
+  非変更側relation、明示 binding 済みの純粋rename、無関係な追加は
+  `unchanged` carry-overを維持する。この有限分類は
+  `alignment-review-policy-v2` の `core-capability-changed` ruleとして監査する。
+  旧DBの既存 `content_hash` は推測なしで `base_content_hash` にcopyする一方、
+  名前からidentity/依存関係は推測backfillせず、最初の人間確定後から正準履歴を
+  開始する。
 - **no_review_required ポリシーの外部化(§7.3 → #313)**: 完了。
   `app/policies/alignment_review.yaml` に、有限条件だけを受け付ける
   first-match ポリシーとして切り出した。読み込み時に schema version、全
@@ -4108,9 +4132,10 @@ System に属する永続データだけから監査できるようにした。
    ケースを項目単位で検知する。加えて goal 専用だった再ビルドガードを
    **確定済み(confirmed/not_applicable)Intent フィールドのいずれかが
    直前ビルド以降に更新された場合**へ一般化(全項目を再分類)。
-   Core Capability は per-capability の確定タイムスタンプ列が存在せず
-   決定的判定源が無いため今回は対象外(ヒューリスティック差分は
-   Principle 6 で禁止のため実装しない)。
+   当時は Core Capability に per-capability の確定履歴が無かったため対象外
+   とした。後続 #312 で、安定entity id・人間確定composition・多対多support
+   relation・Alignment依存参照を追加し、ヒューリスティックを使わない限定
+   カスケードを実装した。
 2. **回答対象の検証強化(指摘2, P1)**: batch の項目検証に
    `superseded=1` 拒否・回答可能 status(open/held)以外の拒否・
    actionable category(must_review/batch_reviewable)以外の拒否・

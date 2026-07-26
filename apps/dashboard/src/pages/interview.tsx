@@ -15,6 +15,7 @@ import {
   useCreateInterviewSession,
   useEditInterviewProposal,
   useInterviewApprovedSet,
+  useInterviewCapabilityGraph,
   useInterviewContextPack,
   useInterviewDialogueTurn,
   useInterviewIntentList,
@@ -64,9 +65,11 @@ import { buildPatchFilename, downloadTextFile } from "@/lib/patch";
 import type {
   AlignmentItemOut,
   AlignmentListOut,
+  CapabilityEntityKind,
   CurrentUnderstanding,
   IntelligenceRunEvidenceOut,
   InterviewMaterializeOut,
+  InterviewCapabilityRelationConfirmation,
   InterviewProposalMetadataBlock,
   InterviewProposalOut,
   InterviewProposalProbePlan,
@@ -107,6 +110,81 @@ const STAGE_ORDER: InterviewStage[] = [
   "probe_flow_selection",
   "proposal_generation",
 ];
+
+const CAPABILITY_SECTIONS: Array<[
+  keyof Pick<
+    CurrentUnderstanding,
+    "core_capabilities" | "capability_elements" | "supporting_elements" | "api_boundaries"
+  >,
+  CapabilityEntityKind,
+]> = [
+  ["core_capabilities", "core_capability"],
+  ["capability_elements", "capability_element"],
+  ["supporting_elements", "supporting_element"],
+  ["api_boundaries", "api_boundary"],
+];
+
+const CAPABILITY_CHILD_KINDS: Record<CapabilityEntityKind, CapabilityEntityKind[]> = {
+  core_capability: ["capability_element", "supporting_element", "api_boundary"],
+  capability_element: ["supporting_element", "api_boundary"],
+  supporting_element: ["api_boundary"],
+  api_boundary: [],
+};
+
+type CapabilityProposalNode = {
+  kind: CapabilityEntityKind;
+  name: string;
+  children: string[];
+};
+
+function capabilityProposalNodes(
+  understanding: CurrentUnderstanding | null | undefined,
+): CapabilityProposalNode[] {
+  if (!understanding) return [];
+  return CAPABILITY_SECTIONS.flatMap(([section, kind]) =>
+    (understanding[section] ?? []).map(item => ({
+      kind,
+      name: item.name,
+      children: item.children ?? [],
+    })),
+  );
+}
+
+function capabilityProposalRelations(
+  nodes: CapabilityProposalNode[],
+): InterviewCapabilityRelationConfirmation[] {
+  const relations: InterviewCapabilityRelationConfirmation[] = [];
+  for (const parent of nodes) {
+    for (const childName of parent.children) {
+      for (const childKind of CAPABILITY_CHILD_KINDS[parent.kind]) {
+        if (nodes.some(node => node.kind === childKind && node.name === childName)) {
+          relations.push({
+            supported_kind: parent.kind,
+            supported_name: parent.name,
+            supporting_kind: childKind,
+            supporting_name: childName,
+          });
+        }
+      }
+    }
+  }
+  return relations;
+}
+
+function capabilityNodeKey(kind: CapabilityEntityKind, name: string): string {
+  return `${kind}\u0000${name}`;
+}
+
+function capabilityRelationKey(
+  relation: InterviewCapabilityRelationConfirmation,
+): string {
+  return [
+    relation.supported_kind,
+    relation.supported_name,
+    relation.supporting_kind,
+    relation.supporting_name,
+  ].join("\u0000");
+}
 
 // ユーザー向けの進捗表示: ステージ名ではなく「何を確認する作業か」を示す。
 const STAGE_LABELS: Record<InterviewStage, string> = {
@@ -1347,6 +1425,11 @@ export default function InterviewPage() {
   const { data: sessions, isLoading: sessionsLoading } = useInterviewSessions();
   const createSession = useCreateInterviewSession();
   const { data: session, isLoading: sessionLoading } = useInterviewSession(selectedSessionId);
+  const priorCapabilityGraphQuery = useInterviewCapabilityGraph(
+    session?.capability_graph_confirmation_required
+      ? selectedSessionId
+      : null,
+  );
   const { data: contextPack } = useInterviewContextPack(selectedSessionId);
   const { data: approvedSet } = useInterviewApprovedSet(selectedSessionId);
   const dialogueTurn = useInterviewDialogueTurn(selectedSessionId);
@@ -1374,8 +1457,31 @@ export default function InterviewPage() {
   // read-only "あなたが実現したいこと" summary line.
   const { data: alignmentFull } = useAlignmentList(selectedSessionId);
   const { data: intentList } = useInterviewIntentList(selectedSessionId);
+  const proposedCapabilityNodes = useMemo(
+    () => capabilityProposalNodes(session?.current_understanding),
+    [session?.current_understanding],
+  );
+  const proposedCapabilityRelations = useMemo(
+    () => capabilityProposalRelations(proposedCapabilityNodes),
+    [proposedCapabilityNodes],
+  );
+  const unmatchedCapabilityNodes = useMemo(() => {
+    const priorNodes = priorCapabilityGraphQuery.data?.nodes ?? [];
+    return proposedCapabilityNodes.filter(node =>
+      !priorNodes.some(
+        prior => prior.entity_kind === node.kind && prior.name === node.name,
+      ),
+    );
+  }, [priorCapabilityGraphQuery.data?.nodes, proposedCapabilityNodes]);
 
   const [message, setMessage] = useState("");
+  const [capabilityConfirmOpen, setCapabilityConfirmOpen] = useState(false);
+  const [capabilityIdentitySelections, setCapabilityIdentitySelections] = useState<
+    Record<string, string>
+  >({});
+  const [capabilityRelationSelections, setCapabilityRelationSelections] = useState<
+    Record<string, boolean>
+  >({});
   const messageInputRef = useRef<HTMLTextAreaElement | null>(null);
   const [editing, setEditing] = useState<InterviewProposalOut | null>(null);
   const [editForm, setEditForm] = useState<EditForm | null>(null);
@@ -1437,7 +1543,11 @@ export default function InterviewPage() {
   // 「この理解を確認済みにする」ボタン(会話タブ内)がまだ有効な状態かどうか。
   // uiState の判定より先に定義し、下の会話タブ必須アクション判定から参照する。
   const canConfirmStructuredUnderstanding = !!(
-    session?.current_understanding && session.understanding_confirmed_at == null
+    session?.current_understanding
+    && (
+      session.understanding_confirmed_at == null
+      || session.capability_graph_confirmation_required === true
+    )
   );
 
   // PR #296 review restructure: 「build 済み(=突き合わせ項目が1件以上あ
@@ -1774,14 +1884,59 @@ export default function InterviewPage() {
     messageInputRef.current?.focus();
   };
 
-  const doConfirmUnderstanding = async () => {
+  const submitUnderstandingConfirmation = async (includeCapabilityReview: boolean) => {
     if (!selectedSessionId) return;
     try {
-      await confirmUnderstanding.mutateAsync({ actor });
+      await confirmUnderstanding.mutateAsync({
+        actor,
+        ...(includeCapabilityReview
+          ? {
+              capability_base_confirmation_id:
+                priorCapabilityGraphQuery.data?.confirmation_id ?? null,
+              capability_relations: proposedCapabilityRelations.filter(
+                relation =>
+                  capabilityRelationSelections[capabilityRelationKey(relation)] !== false,
+              ),
+              capability_identity_bindings: unmatchedCapabilityNodes.flatMap(node => {
+                const selected = capabilityIdentitySelections[
+                  capabilityNodeKey(node.kind, node.name)
+                ];
+                return selected
+                  ? [{
+                      entity_kind: node.kind,
+                      current_name: node.name,
+                      entity_id: Number(selected),
+                    }]
+                  : [];
+              }),
+            }
+          : {}),
+      });
+      setCapabilityConfirmOpen(false);
       toast.success("内容を確定しました。提案を生成できます。");
     } catch (e) {
       toast.error(String(e));
     }
+  };
+
+  const doConfirmUnderstanding = () => {
+    if (
+      canConfirmStructuredUnderstanding
+      && session?.capability_graph_confirmation_required === true
+    ) {
+      setCapabilityIdentitySelections({});
+      setCapabilityRelationSelections(
+        Object.fromEntries(
+          proposedCapabilityRelations.map(relation => [
+            capabilityRelationKey(relation),
+            true,
+          ]),
+        ),
+      );
+      setCapabilityConfirmOpen(true);
+      return;
+    }
+    void submitUnderstandingConfirmation(false);
   };
 
   const openEdit = (proposal: InterviewProposalOut) => {
@@ -2602,6 +2757,114 @@ git commit`}
               />
             </div>
           </div>
+
+          <Dialog
+            open={capabilityConfirmOpen}
+            onOpenChange={setCapabilityConfirmOpen}
+          >
+            <DialogHeader>
+              <DialogTitle>Core Capability 構成を確認</DialogTitle>
+            </DialogHeader>
+            <div className="space-y-4 text-sm" data-testid="capability-confirm-dialog">
+              <p className="text-xs text-muted-foreground">
+                変更後の支援関係と rename の同一性を確認してください。この確定後、
+                影響する Alignment 項目だけが再確認対象になります。
+              </p>
+
+              {priorCapabilityGraphQuery.isLoading ? (
+                <p className="text-xs text-muted-foreground">前回の正準構成を読み込み中...</p>
+              ) : unmatchedCapabilityNodes.length > 0 ? (
+                <div className="space-y-2">
+                  <p className="font-semibold">名前が一致しない Capability</p>
+                  {unmatchedCapabilityNodes.map(node => {
+                    const key = capabilityNodeKey(node.kind, node.name);
+                    const candidates = (priorCapabilityGraphQuery.data?.nodes ?? []).filter(
+                      prior =>
+                        prior.entity_kind === node.kind
+                        && !proposedCapabilityNodes.some(
+                          current =>
+                            current.kind === prior.entity_kind
+                            && current.name === prior.name,
+                        ),
+                    );
+                    return (
+                      <div key={key} className="grid gap-1 md:grid-cols-2 md:items-center">
+                        <Label>{node.name}</Label>
+                        <Select
+                          value={capabilityIdentitySelections[key] ?? ""}
+                          onChange={event =>
+                            setCapabilityIdentitySelections(current => ({
+                              ...current,
+                              [key]: event.target.value,
+                            }))
+                          }
+                          data-testid={`capability-identity-${node.kind}-${node.name}`}
+                        >
+                          <option value="">新しい Capability として扱う</option>
+                          {candidates.map(candidate => (
+                            <option key={candidate.entity_id} value={candidate.entity_id}>
+                              {candidate.name} (entity #{candidate.entity_id}) を rename
+                            </option>
+                          ))}
+                        </Select>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  rename の明示指定が必要な Capability はありません。
+                </p>
+              )}
+
+              <div className="space-y-2">
+                <p className="font-semibold">確定する支援関係</p>
+                {proposedCapabilityRelations.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">支援関係はありません。</p>
+                ) : (
+                  proposedCapabilityRelations.map(relation => {
+                    const key = capabilityRelationKey(relation);
+                    return (
+                      <label key={key} className="flex items-center gap-2 text-xs">
+                        <input
+                          type="checkbox"
+                          checked={capabilityRelationSelections[key] !== false}
+                          onChange={event =>
+                            setCapabilityRelationSelections(current => ({
+                              ...current,
+                              [key]: event.target.checked,
+                            }))
+                          }
+                        />
+                        <span>
+                          {relation.supported_name} → {relation.supporting_name}
+                        </span>
+                      </label>
+                    );
+                  })
+                )}
+              </div>
+
+              <div className="flex justify-end gap-2">
+                <Button
+                  variant="outline"
+                  onClick={() => setCapabilityConfirmOpen(false)}
+                >
+                  キャンセル
+                </Button>
+                <Button
+                  onClick={() => void submitUnderstandingConfirmation(true)}
+                  disabled={
+                    confirmUnderstanding.isPending
+                    || priorCapabilityGraphQuery.isLoading
+                  }
+                  data-testid="confirm-capability-composition"
+                >
+                  {confirmUnderstanding.isPending ? "確定中..." : "この構成を確定"}
+                </Button>
+              </div>
+            </div>
+          </Dialog>
 
           <Dialog open={!!editing && !!editForm} onOpenChange={(open) => { if (!open) { setEditing(null); setEditForm(null); } }}>
             {editing && editForm && (

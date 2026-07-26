@@ -731,6 +731,8 @@
         "last_error": { "type": ["string", "null"] },
         "understanding_confirmed_at": { "type": ["number", "null"], "description": "Issue #123: timestamp of the developer's manual confirmation that the interview gathered enough context; unlocks the proposal gate when no structured understanding could be built (zero-base fallback)." },
         "understanding_confirmed_by": { "type": ["string", "null"] },
+        "capability_graph_confirmed_revision_id": { "type": ["integer", "null"], "description": "Issue #312: latest Understanding revision manually confirmed into the canonical Capability graph for this session." },
+        "capability_graph_confirmation_required": { "type": "boolean", "description": "Issue #312: true when the latest structured Understanding revision still requires human Capability graph confirmation." },
         "answers_revised_at": { "type": ["number", "null"], "description": "Issue #129: set when an interview_qa answer is corrected; cleared only by a successful understanding rebuild, never automatically by the revision itself. Drives the dashboard's rebuild-recommended banner." },
         "understanding_update_available": { "type": "boolean", "description": "Issue #229/#263: deterministic mirror of the update-understanding 409 gate (single source of truth shared with the API check). False only in proposal_generation, after manual confirmation, with no answer correction and no interview_qa row created/answered since confirmation." },
         "materialization_diff": { "type": ["string", "null"] },

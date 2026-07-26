@@ -9,7 +9,7 @@ and a *deterministic* review classification.
 Split per Principle 6:
 
 - Reasoning model (``generate_alignment_proposal``, ``prompt_version`` /
-  ``schema_version`` = ``alignment-v1``): proposes *content* -- which Intent
+  ``schema_version`` = ``alignment-v2``): proposes *content* -- which Intent
   field a current-system claim relates to, the claim text, its evidence,
   the alignment state (aligned/gap/unknown/conflict/not_applicable), risk
   flags (from a finite vocabulary), confidence, and a gap/interpretation
@@ -71,12 +71,13 @@ from .interview_intent_agent import INTENT_FIELDS
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient, is_reasoning_model
 from .runtime_alignment import RUNTIME_CHECK_STATES
 
-PROMPT_VERSION = "alignment-v1"
-SCHEMA_VERSION = "alignment-v1"
+PROMPT_VERSION = "alignment-v2"
+SCHEMA_VERSION = "alignment-v2"
 
 ALIGNMENT_STATES = ("aligned", "gap", "unknown", "conflict", "not_applicable")
 RISK_FLAGS = ("security", "high_risk", "core_intent")
 CONFIDENCE_LEVELS = ("confirmed", "likely", "uncertain", "conflicting")
+CAPABILITY_CHANGE_STATES = ("none", "changed")
 
 # Ordered (rank == index): "first" is the highest-priority category/reason
 # for queue ordering (review_sort_key below).
@@ -86,7 +87,8 @@ REVIEW_CATEGORIES = (
 REASON_CODES = (
     "security_related", "high_risk", "core_intent", "conflict_detected",
     "low_confidence", "runtime_mismatch", "routine_update", "no_change",
-    "informational_only", "unchanged_since_confirmation",
+    "informational_only", "core_capability_changed",
+    "unchanged_since_confirmation",
 )
 
 _CATEGORY_RANK: Dict[str, int] = {name: i for i, name in enumerate(REVIEW_CATEGORIES)}
@@ -101,7 +103,7 @@ _REASON_RANK: Dict[str, int] = {name: i for i, name in enumerate(REASON_CODES)}
 # finite condition vocabulary and rejects unknown fields, duplicate keys, bad
 # enum values, missing terminal coverage, and malformed templates.
 
-POLICY_SCHEMA_VERSION = "alignment-review-policy-v1"
+POLICY_SCHEMA_VERSION = "alignment-review-policy-v2"
 _DEFAULT_POLICY_PATH = Path(__file__).with_name("policies") / "alignment_review.yaml"
 
 
@@ -144,6 +146,7 @@ class AlignmentPolicyRule:
     confidence_in: Tuple[str, ...] = ()
     intent_field_in: Tuple[str, ...] = ()
     runtime_check_in: Tuple[str, ...] = ()
+    capability_change_in: Tuple[str, ...] = ()
 
     def matches(
         self,
@@ -153,6 +156,7 @@ class AlignmentPolicyRule:
         confidence: str,
         intent_field: Optional[str],
         runtime_check: Optional[str],
+        capability_change: str,
     ) -> bool:
         return (
             (not self.alignment_state_in or alignment_state in self.alignment_state_in)
@@ -160,6 +164,10 @@ class AlignmentPolicyRule:
             and (not self.confidence_in or confidence in self.confidence_in)
             and (not self.intent_field_in or intent_field in self.intent_field_in)
             and (not self.runtime_check_in or runtime_check in self.runtime_check_in)
+            and (
+                not self.capability_change_in
+                or capability_change in self.capability_change_in
+            )
         )
 
 
@@ -178,6 +186,7 @@ class AlignmentReviewPolicy:
         confidence: str,
         intent_field: Optional[str],
         runtime_check: Optional[str],
+        capability_change: str = "none",
     ) -> Tuple[str, str]:
         review_category, reason_code, _rule_id = self.classify_with_rule(
             alignment_state=alignment_state,
@@ -185,6 +194,7 @@ class AlignmentReviewPolicy:
             confidence=confidence,
             intent_field=intent_field,
             runtime_check=runtime_check,
+            capability_change=capability_change,
         )
         return review_category, reason_code
 
@@ -196,6 +206,7 @@ class AlignmentReviewPolicy:
         confidence: str,
         intent_field: Optional[str],
         runtime_check: Optional[str],
+        capability_change: str = "none",
     ) -> Tuple[str, str, str]:
         """Return the classification together with its unique policy rule."""
         for rule in self.rules:
@@ -205,6 +216,7 @@ class AlignmentReviewPolicy:
                 confidence=confidence,
                 intent_field=intent_field,
                 runtime_check=runtime_check,
+                capability_change=capability_change,
             ):
                 return rule.review_category, rule.reason_code, rule.rule_id
         raise AlignmentPolicyError(
@@ -263,7 +275,7 @@ def _parse_rule(raw_rule: Any, index: int) -> AlignmentPolicyRule:
     match = _require_mapping(rule["match"], f"{label}.match")
     allowed_match_keys = {
         "alignment_state_in", "risk_flags_contains", "confidence_in",
-        "intent_field_in", "runtime_check_in",
+        "intent_field_in", "runtime_check_in", "capability_change_in",
     }
     unknown_match_keys = set(match) - allowed_match_keys
     if unknown_match_keys:
@@ -303,6 +315,15 @@ def _parse_rule(raw_rule: Any, index: int) -> AlignmentPolicyRule:
                              f"{label}.match.runtime_check_in")
             if "runtime_check_in" in match else ()
         ),
+        capability_change_in=(
+            _parse_enum_list(
+                match["capability_change_in"],
+                CAPABILITY_CHANGE_STATES,
+                f"{label}.match.capability_change_in",
+            )
+            if "capability_change_in" in match
+            else ()
+        ),
     )
 
 
@@ -317,13 +338,15 @@ def _validate_policy_coverage(policy: AlignmentReviewPolicy) -> None:
             for confidence in CONFIDENCE_LEVELS:
                 for intent_field in (None, *INTENT_FIELDS):
                     for runtime_check in (None, *RUNTIME_CHECK_STATES):
-                        policy.classify(
-                            alignment_state=state,
-                            risk_flags=risk_flags,
-                            confidence=confidence,
-                            intent_field=intent_field,
-                            runtime_check=runtime_check,
-                        )
+                        for capability_change in CAPABILITY_CHANGE_STATES:
+                            policy.classify(
+                                alignment_state=state,
+                                risk_flags=risk_flags,
+                                confidence=confidence,
+                                intent_field=intent_field,
+                                runtime_check=runtime_check,
+                                capability_change=capability_change,
+                            )
 
 
 def load_alignment_review_policy(path: Optional[Path] = None) -> AlignmentReviewPolicy:
@@ -401,6 +424,7 @@ def classify_alignment_item(
     confidence: str,
     intent_field: Optional[str],
     runtime_check: Optional[str] = None,
+    capability_change: str = "none",
 ) -> Tuple[str, str]:
     """Deterministic (review_category, reason_code) for one alignment item.
 
@@ -422,6 +446,7 @@ def classify_alignment_item(
         confidence=confidence,
         intent_field=intent_field,
         runtime_check=runtime_check,
+        capability_change=capability_change,
     )
 
 
@@ -432,6 +457,7 @@ def classify_alignment_item_with_rule(
     confidence: str,
     intent_field: Optional[str],
     runtime_check: Optional[str] = None,
+    capability_change: str = "none",
 ) -> Tuple[str, str, str]:
     """Deterministically classify an item and expose the matched rule id."""
     return _ALIGNMENT_REVIEW_POLICY.classify_with_rule(
@@ -440,6 +466,7 @@ def classify_alignment_item_with_rule(
         confidence=confidence,
         intent_field=intent_field,
         runtime_check=runtime_check,
+        capability_change=capability_change,
     )
 
 
@@ -679,6 +706,8 @@ class _RawAlignmentItem(BaseModel):
     confidence: str = Field(..., min_length=1, max_length=20)
     gap_summary: Optional[str] = Field(default=None, max_length=1_000)
     proposed_interpretation: Optional[str] = Field(default=None, max_length=1_000)
+    capability_entity_ids: List[int] = Field(default_factory=list, max_length=20)
+    capability_relation_ids: List[int] = Field(default_factory=list, max_length=20)
 
 
 class _RawAlignmentResponse(BaseModel):
@@ -709,6 +738,8 @@ class AlignmentProposalItem:
     confidence: str
     gap_summary: Optional[str] = None
     proposed_interpretation: Optional[str] = None
+    capability_entity_ids: List[int] = field(default_factory=list)
+    capability_relation_ids: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -758,7 +789,9 @@ commentary), matching exactly this shape:
       "risk_flags": ["security" | "high_risk" | "core_intent", ...],
       "confidence": "confirmed | likely | uncertain | conflicting",
       "gap_summary": "what is missing or different, or null",
-      "proposed_interpretation": "a short suggested resolution, or null"
+      "proposed_interpretation": "a short suggested resolution, or null",
+      "capability_entity_ids": [1, ...],
+      "capability_relation_ids": [10, ...]
     }
   ]
 }
@@ -781,6 +814,12 @@ claim with no related intent (informational only).
 - "intent_field" identifies which Intent Brief field this item relates to, \
 or null when the claim is purely about the current system with no related \
 intent (typically paired with alignment_state "not_applicable").
+- When a confirmed capability graph is supplied, cite only ids present in \
+that graph. Use "capability_entity_ids" for claims directly about a canonical \
+capability definition. Use "capability_relation_ids" for claims about how a \
+lower-level function supports a Core Capability. A shared lower function's \
+different parent relations are different ids. Every Current System claim \
+must cite at least one entity or relation id when the graph is non-empty.
 - Do not propose more than one item per distinct current-system claim.
 - Never decide, adopt, or apply anything yourself here; you only propose \
 content for a human to review.
@@ -791,6 +830,7 @@ def _build_user_prompt(
     intent_items: List[Dict[str, object]],
     current_understanding: Optional[Dict[str, object]],
     gap_analysis: Optional[List[Dict[str, object]]],
+    confirmed_capability_graph: Optional[Dict[str, object]] = None,
 ) -> str:
     parts = [
         "## Intent Brief (current, non-superseded items; only the user can decide these)",
@@ -799,6 +839,9 @@ def _build_user_prompt(
         json.dumps(current_understanding or {}, ensure_ascii=False),
         "\n## Known gaps (docs/code reconciliation)",
         json.dumps(gap_analysis or [], ensure_ascii=False),
+        "\n## Manually confirmed canonical capability graph "
+        "(the only allowed capability dependency ids)",
+        json.dumps(confirmed_capability_graph or {}, ensure_ascii=False),
     ]
     return "\n".join(parts)
 
@@ -810,6 +853,7 @@ def generate_alignment_proposal(
     intent_items: List[Dict[str, object]],
     current_understanding: Optional[Dict[str, object]],
     gap_analysis: Optional[List[Dict[str, object]]],
+    confirmed_capability_graph: Optional[Dict[str, object]] = None,
 ) -> AlignmentProposalResult:
     """Propose alignment items contrasting Intent vs Current System.
 
@@ -831,7 +875,12 @@ def generate_alignment_proposal(
             ),
         )
 
-    prompt = _build_user_prompt(intent_items, current_understanding, gap_analysis)
+    prompt = _build_user_prompt(
+        intent_items,
+        current_understanding,
+        gap_analysis,
+        confirmed_capability_graph,
+    )
 
     try:
         raw = client.generate_text(
@@ -859,6 +908,17 @@ def generate_alignment_proposal(
         )
 
     items: List[AlignmentProposalItem] = []
+    allowed_entity_ids = {
+        item.get("entity_id")
+        for item in (confirmed_capability_graph or {}).get("nodes", [])
+        if isinstance(item, dict)
+    }
+    allowed_relation_ids = {
+        item.get("relation_id")
+        for item in (confirmed_capability_graph or {}).get("relations", [])
+        if isinstance(item, dict)
+    }
+    graph_requires_refs = bool(allowed_entity_ids or allowed_relation_ids)
     for raw_item in validated.items:
         if raw_item.alignment_state not in ALIGNMENT_STATES:
             return AlignmentProposalResult(
@@ -881,6 +941,35 @@ def generate_alignment_proposal(
                 provider=config.provider, model=config.model, is_mock=False,
                 error=f"Model returned an invalid intent_field: {raw_item.intent_field!r}",
             )
+        entity_ids = sorted(set(raw_item.capability_entity_ids))
+        relation_ids = sorted(set(raw_item.capability_relation_ids))
+        unknown_entity_ids = [
+            value for value in entity_ids if value not in allowed_entity_ids
+        ]
+        unknown_relation_ids = [
+            value for value in relation_ids if value not in allowed_relation_ids
+        ]
+        if unknown_entity_ids or unknown_relation_ids:
+            return AlignmentProposalResult(
+                provider=config.provider,
+                model=config.model,
+                is_mock=False,
+                error=(
+                    "Model returned capability dependency ids outside the "
+                    "confirmed graph: "
+                    f"entities={unknown_entity_ids}, relations={unknown_relation_ids}"
+                ),
+            )
+        if graph_requires_refs and not entity_ids and not relation_ids:
+            return AlignmentProposalResult(
+                provider=config.provider,
+                model=config.model,
+                is_mock=False,
+                error=(
+                    "Model omitted capability dependency ids for an item while "
+                    "a confirmed capability graph is active"
+                ),
+            )
         items.append(
             AlignmentProposalItem(
                 intent_field=raw_item.intent_field,
@@ -898,6 +987,8 @@ def generate_alignment_proposal(
                 confidence=raw_item.confidence,
                 gap_summary=raw_item.gap_summary,
                 proposed_interpretation=raw_item.proposed_interpretation,
+                capability_entity_ids=entity_ids,
+                capability_relation_ids=relation_ids,
             )
         )
 

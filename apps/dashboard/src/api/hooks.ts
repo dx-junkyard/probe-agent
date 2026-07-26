@@ -22,6 +22,7 @@ import type {
   WorkspaceContextPack, WorkspaceAgentTurnOut, WorkspaceProposalOut,
   WorkspaceProposalDraftOut,
   InterviewSessionOut, InterviewSessionDetailOut, InterviewContextPack,
+  InterviewCapabilityGraphOut, InterviewConfirmUnderstandingRequest,
   InterviewDialogueTurnOut, InterviewProposalDecisionOut,
   InterviewProposalMetadataBlock, InterviewProposalProbePlan,
   InterviewApprovedSetOut, InterviewMaterializeOut,
@@ -736,6 +737,18 @@ export function useInterviewSession(sessionId: number | null) {
   });
 }
 
+export function useInterviewCapabilityGraph(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("interviewCapabilityGraph"), sessionId],
+    queryFn: () =>
+      api.get<InterviewCapabilityGraphOut>(
+        `/interview/sessions/${sessionId}/capability-graph`,
+      ),
+    enabled: !!sessionId && !!getSystemId(),
+    retry: false,
+  });
+}
+
 export function useInterviewContextPack(sessionId: number | null) {
   return useQuery({
     queryKey: [...sysKey("interviewContextPack"), sessionId],
@@ -762,6 +775,7 @@ export function useInterviewDialogueTurn(sessionId: number | null) {
       api.post<InterviewDialogueTurnOut>(`/interview/sessions/${sessionId}/dialogue-turn`, data),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewCapabilityGraph"), sessionId] });
       qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
       qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] });
     },
@@ -1602,6 +1616,9 @@ export function useAdvanceInterviewStage(sessionId: number | null) {
       ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+      qc.invalidateQueries({
+        queryKey: [...sysKey("interviewCapabilityGraph"), sessionId],
+      });
       qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
       qc.invalidateQueries({ queryKey: sysKey("system-diagnostics") });
     },
@@ -1611,13 +1628,16 @@ export function useAdvanceInterviewStage(sessionId: number | null) {
 export function useConfirmInterviewUnderstanding(sessionId: number | null) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (data: { actor: string }) =>
+    mutationFn: (data: InterviewConfirmUnderstandingRequest) =>
       api.post<InterviewSessionOut>(
         `/interview/sessions/${sessionId}/confirm-understanding`,
         data,
       ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+      qc.invalidateQueries({
+        queryKey: [...sysKey("interviewCapabilityGraph"), sessionId],
+      });
       qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
       qc.invalidateQueries({ queryKey: sysKey("system-diagnostics") });
     },

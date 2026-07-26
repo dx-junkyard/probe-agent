@@ -155,6 +155,7 @@ const RULE_LABELS: Record<string, string> = {
   routine_update: "通常更新",
   no_change: "差分なし",
   informational_only: "参考情報のみ",
+  core_capability_changed: "Core Capability構成変更",
   unchanged_since_confirmation: "前回確認から変更なし",
 };
 
@@ -492,6 +493,27 @@ function ReviewQueueItemCard({
       </div>
 
       <EvidenceList item={item} />
+
+      {(item.capability_dependencies?.length ?? 0) > 0 && (
+        <div
+          className="rounded border bg-muted/30 p-2 text-[11px]"
+          data-testid={`review-item-capability-scope-${item.id}`}
+        >
+          <p className="font-semibold">この確認に含まれる Capability 構成</p>
+          <ul className="mt-1 list-disc space-y-0.5 pl-4">
+            {item.capability_dependencies?.map((dependency, index) => (
+              <li key={`${dependency.target_kind}:${dependency.entity_id ?? dependency.relation_id}:${index}`}>
+                {dependency.target_kind === "entity"
+                  ? `${dependency.entity_name ?? "名称不明"} (entity #${dependency.entity_id})`
+                  : `${dependency.supported_entity_name ?? "名称不明"} → ${dependency.supporting_entity_name ?? "名称不明"} (relation #${dependency.relation_id})`}
+              </li>
+            ))}
+          </ul>
+          <p className="mt-1 text-muted-foreground">
+            「現状を受け入れる」は、この依存範囲も含めた確認として記録されます。
+          </p>
+        </div>
+      )}
 
       {inquiryMode ? (
         <InquiryPanel

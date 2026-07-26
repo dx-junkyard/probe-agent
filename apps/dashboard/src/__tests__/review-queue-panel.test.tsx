@@ -96,6 +96,60 @@ beforeEach(() => {
 });
 
 describe("ReviewQueuePanel", () => {
+  test("shows the canonical Capability dependency included in accept_current", async () => {
+    const item = makeItem({
+      id: 89,
+      capability_confirmation_id: 12,
+      capability_dependencies: [{
+        target_kind: "relation",
+        entity_id: null,
+        relation_id: 44,
+        entity_kind: null,
+        entity_name: null,
+        supported_entity_id: 7,
+        supported_entity_name: "Core A",
+        supporting_entity_id: 9,
+        supporting_entity_name: "Shared",
+      }],
+    });
+    const queue: AlignmentReviewQueueOut = {
+      session_id: 1, system_id: 1, items: [item],
+    };
+    const full: AlignmentListOut = {
+      session_id: 1,
+      system_id: 1,
+      items_by_category: {
+        must_review: [],
+        batch_reviewable: [item],
+        no_review_required: [],
+        unchanged: [],
+        informational: [],
+      },
+      counts: {
+        must_review: 0,
+        batch_reviewable: 1,
+        no_review_required: 0,
+        unchanged: 0,
+        informational: 0,
+      },
+    };
+    getImpl = (path: string) => {
+      if (path === "/interview/sessions/1/review-queue") return Promise.resolve(queue);
+      if (path === "/interview/sessions/1/alignment") return Promise.resolve(full);
+      if (path === "/interview/sessions/1/inquiries") {
+        return Promise.resolve({ session_id: 1, system_id: 1, items: [] });
+      }
+      return Promise.resolve(undefined);
+    };
+
+    const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
+    render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+
+    const scope = await screen.findByTestId("review-item-capability-scope-89");
+    expect(scope).toHaveTextContent("Core A → Shared (relation #44)");
+    expect(scope).toHaveTextContent("この依存範囲も含めた確認");
+  });
+
   test("records evidence opportunity and the first user expansion only for initially collapsed evidence", async () => {
     const item = makeItem({
       id: 90,

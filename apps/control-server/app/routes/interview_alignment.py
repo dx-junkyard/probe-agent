@@ -67,6 +67,14 @@ from ..alignment import (
     validate_evidence_against_snapshot,
 )
 from ..auth import Principal, get_system_id, require_user
+from ..capability_graph import (
+    CapabilityGraphError,
+    confirmed_graph_for_revision,
+    graph_change_sets,
+    latest_system_confirmed_graph,
+    load_confirmed_graph,
+    validate_dependencies,
+)
 from ..db import get_conn
 from ..interview_language import get_interview_language
 from ..llm import LLMConfig, LLMError, create_llm_client
@@ -76,6 +84,7 @@ from ..models import (
     AlignmentBatchAnswerOut,
     AlignmentBatchAnswerRequest,
     AlignmentBuildOut,
+    AlignmentCapabilityDependencyOut,
     AlignmentCorrectRequest,
     AlignmentEvidenceOut,
     AlignmentItemOut,
@@ -103,6 +112,85 @@ router = APIRouter()
 _ACTIONABLE_CATEGORIES = ("must_review", "batch_reviewable")
 
 
+def _capability_scope_for_item(conn, item_id: int) -> Optional[Dict[str, object]]:
+    scope = conn.execute(
+        """SELECT confirmation_id FROM alignment_item_capability_scope
+           WHERE alignment_item_id = ?""",
+        (item_id,),
+    ).fetchone()
+    if scope is None:
+        return None
+    dependencies = conn.execute(
+        """SELECT target_kind, entity_id, relation_id, captured_digest
+           FROM alignment_item_capability_dependency
+           WHERE alignment_item_id = ?
+           ORDER BY target_kind, entity_id, relation_id""",
+        (item_id,),
+    ).fetchall()
+    return {
+        "confirmation_id": scope["confirmation_id"],
+        "entity_ids": {
+            row["entity_id"]
+            for row in dependencies
+            if row["target_kind"] == "entity"
+        },
+        "relation_ids": {
+            row["relation_id"]
+            for row in dependencies
+            if row["target_kind"] == "relation"
+        },
+    }
+
+
+def _capability_scope_changed(
+    conn,
+    *,
+    candidate_item_id: int,
+    current_graph: Optional[Dict[str, object]],
+    current_entity_ids: set,
+    current_relation_ids: set,
+    graph_cache: Dict[int, Dict[str, object]],
+) -> bool:
+    """Whether one otherwise-identical carry candidate's confirmed scope changed."""
+
+    previous_scope = _capability_scope_for_item(conn, candidate_item_id)
+    if current_graph is None:
+        return previous_scope is not None
+    if previous_scope is None:
+        # Legacy accept_current rows have no auditable Capability dependency;
+        # never infer one from names.  They re-enter review once, after which
+        # the new human decision has a real confirmed scope.
+        return True
+
+    previous_entity_ids = previous_scope["entity_ids"]
+    previous_relation_ids = previous_scope["relation_ids"]
+    if (
+        previous_entity_ids != current_entity_ids
+        or previous_relation_ids != current_relation_ids
+    ):
+        return True
+
+    previous_confirmation_id = previous_scope["confirmation_id"]
+    current_confirmation_id = current_graph["confirmation_id"]
+    if previous_confirmation_id == current_confirmation_id:
+        return False
+    previous_graph = graph_cache.get(previous_confirmation_id)
+    if previous_graph is None:
+        previous_graph = load_confirmed_graph(
+            conn,
+            previous_confirmation_id,
+            system_id=current_graph["system_id"],
+        )
+        graph_cache[previous_confirmation_id] = previous_graph
+    changed_entities, changed_relations = graph_change_sets(
+        previous_graph, current_graph
+    )
+    return bool(
+        current_entity_ids & changed_entities
+        or current_relation_ids & changed_relations
+    )
+
+
 def _get_session_or_404(conn, session_id: int, system_id: int):
     row = conn.execute(
         "SELECT * FROM interview_session WHERE id = ? AND system_id = ?",
@@ -123,10 +211,71 @@ def _get_item_or_404(conn, item_id: int, system_id: int):
     return row
 
 
-def _item_out(row) -> AlignmentItemOut:
+def _capability_audit_for_item(
+    conn, item_id: int
+) -> tuple[Optional[int], List[AlignmentCapabilityDependencyOut]]:
+    scope = conn.execute(
+        """SELECT confirmation_id FROM alignment_item_capability_scope
+           WHERE alignment_item_id = ?""",
+        (item_id,),
+    ).fetchone()
+    if scope is None:
+        return None, []
+    graph = load_confirmed_graph(
+        conn,
+        scope["confirmation_id"],
+        system_id=conn.execute(
+            "SELECT system_id FROM alignment_item WHERE id = ?",
+            (item_id,),
+        ).fetchone()["system_id"],
+    )
+    nodes = {node["entity_id"]: node for node in graph["nodes"]}
+    relations = {
+        relation["relation_id"]: relation for relation in graph["relations"]
+    }
+    dependencies = conn.execute(
+        """SELECT target_kind, entity_id, relation_id
+           FROM alignment_item_capability_dependency
+           WHERE alignment_item_id = ?
+           ORDER BY target_kind, entity_id, relation_id""",
+        (item_id,),
+    ).fetchall()
+    result: List[AlignmentCapabilityDependencyOut] = []
+    for dependency in dependencies:
+        if dependency["target_kind"] == "entity":
+            node = nodes[dependency["entity_id"]]
+            result.append(
+                AlignmentCapabilityDependencyOut(
+                    target_kind="entity",
+                    entity_id=node["entity_id"],
+                    entity_kind=node["entity_kind"],
+                    entity_name=node["name"],
+                )
+            )
+            continue
+        relation = relations[dependency["relation_id"]]
+        supported = nodes[relation["supported_entity_id"]]
+        supporting = nodes[relation["supporting_entity_id"]]
+        result.append(
+            AlignmentCapabilityDependencyOut(
+                target_kind="relation",
+                relation_id=relation["relation_id"],
+                supported_entity_id=supported["entity_id"],
+                supported_entity_name=supported["name"],
+                supporting_entity_id=supporting["entity_id"],
+                supporting_entity_name=supporting["name"],
+            )
+        )
+    return scope["confirmation_id"], result
+
+
+def _item_out(conn, row) -> AlignmentItemOut:
     evidence = json.loads(row["current_evidence"]) if row["current_evidence"] else []
     risk_flags = json.loads(row["risk_flags"]) if row["risk_flags"] else []
     user_decision = json.loads(row["user_decision"]) if row["user_decision"] else None
+    capability_confirmation_id, capability_dependencies = (
+        _capability_audit_for_item(conn, row["id"])
+    )
     return AlignmentItemOut(
         id=row["id"],
         session_id=row["session_id"],
@@ -145,6 +294,8 @@ def _item_out(row) -> AlignmentItemOut:
         review_category=row["review_category"],
         reason_code=row["reason_code"],
         user_reason=row["user_reason"],
+        capability_confirmation_id=capability_confirmation_id,
+        capability_dependencies=capability_dependencies,
         runtime_check=row["runtime_check"] if "runtime_check" in row.keys() else None,
         status=row["status"],
         user_decision=AlignmentUserDecisionOut(**user_decision) if user_decision else None,
@@ -170,8 +321,8 @@ def _item_out(row) -> AlignmentItemOut:
     )
 
 
-def _sorted_items(rows) -> List[AlignmentItemOut]:
-    items = [_item_out(r) for r in rows]
+def _sorted_items(conn, rows) -> List[AlignmentItemOut]:
+    items = [_item_out(conn, r) for r in rows]
     items.sort(key=lambda it: review_sort_key(
         review_category=it.review_category, reason_code=it.reason_code, item_id=it.id,
     ))
@@ -410,6 +561,34 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
         json.loads(revision["current_understanding"]) if revision["current_understanding"] else None
     )
     gap_analysis = json.loads(revision["gap_analysis"]) if revision["gap_analysis"] else None
+    current_capability_graph = confirmed_graph_for_revision(
+        conn,
+        system_id=system_id,
+        session_id=session_id,
+        revision_id=revision["id"],
+    )
+    latest_capability_graph = latest_system_confirmed_graph(
+        conn, system_id=system_id
+    )
+    if (
+        latest_capability_graph is not None
+        and (
+            current_capability_graph is None
+            or current_capability_graph["confirmation_id"]
+            != latest_capability_graph["confirmation_id"]
+        )
+    ):
+        # Once the System-wide canonical flow has started, never mix this
+        # session's unconfirmed/stale reasoning snapshot with a different
+        # human-confirmed canonical head.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The latest Understanding revision is not the current "
+                "System-wide canonical capability graph. Confirm a fresh "
+                "revision before rebuilding Alignment."
+            ),
+        )
 
     config = LLMConfig.intelligence_from_env()
     client_error: Optional[str] = None
@@ -432,6 +611,7 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
             intent_items=intent_payload,
             current_understanding=current_understanding,
             gap_analysis=gap_analysis,
+            confirmed_capability_graph=current_capability_graph,
         )
 
     completed_at = time.time()
@@ -440,6 +620,21 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
         line_count_cache: Dict[str, Optional[int]] = {}
         had_raw_items = len(proposal.items) > 0
         for item in proposal.items:
+            try:
+                capability_dependencies = validate_dependencies(
+                    current_capability_graph,
+                    entity_ids=item.capability_entity_ids,
+                    relation_ids=item.capability_relation_ids,
+                )
+            except CapabilityGraphError as exc:
+                proposal = AlignmentProposalResult(
+                    provider=proposal.provider,
+                    model=proposal.model,
+                    is_mock=proposal.is_mock,
+                    error=str(exc),
+                )
+                final_items = []
+                break
             valid_evidence, _pruned = validate_evidence_against_snapshot(
                 snapshot_row["repo_path"], snapshot_row["commit_sha"],
                 item.evidence, line_count_cache,
@@ -500,8 +695,16 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
                 "intent_field": item.intent_field,
                 "runtime_check": runtime_check,
                 "_judge_ctx": judge_ctx,
+                "_capability_dependencies": capability_dependencies,
+                "_capability_entity_ids": set(item.capability_entity_ids),
+                "_capability_relation_ids": set(item.capability_relation_ids),
+                "_capability_confirmation_id": (
+                    current_capability_graph["confirmation_id"]
+                    if current_capability_graph is not None
+                    else None
+                ),
             })
-        if had_raw_items and not final_items:
+        if proposal.error is None and had_raw_items and not final_items:
             proposal = AlignmentProposalResult(
                 provider=proposal.provider, model=proposal.model, is_mock=proposal.is_mock,
                 error="Every proposed alignment item's evidence failed snapshot validation",
@@ -550,12 +753,12 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
             # Read before this build's own DELETE/UPDATE/INSERT touch the
             # table (the write transaction is still below).
             carry_rows = conn.execute(
-                """SELECT id, content_hash, carried_over_from, review_category,
-                          status, user_decision
+                """SELECT id, content_hash, base_content_hash, carried_over_from,
+                          review_category, status, user_decision
                    FROM alignment_item
                    WHERE session_id = ? AND system_id = ?
                      AND superseded = 0
-                     AND content_hash IS NOT NULL
+                     AND base_content_hash IS NOT NULL
                      AND (
                        status = 'answered'
                        OR (review_category = 'unchanged' AND carried_over_from IS NOT NULL)
@@ -563,7 +766,7 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
                    ORDER BY id""",
                 (session_id, system_id),
             ).fetchall()
-            carry_candidates: Dict[str, int] = {}
+            carry_candidates: Dict[str, List[Dict[str, int]]] = {}
             for r in carry_rows:
                 if r["review_category"] == "unchanged":
                     # A prior carried-over row: its own carried_over_from
@@ -577,7 +780,9 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
                     if not decision or decision.get("action") != "accept_current":
                         continue
                     origin_id = r["id"]
-                carry_candidates.setdefault(r["content_hash"], origin_id)
+                carry_candidates.setdefault(r["base_content_hash"], []).append(
+                    {"item_id": r["id"], "origin_id": origin_id}
+                )
 
             # A rebuild triggered by a batch that confirmed/corrected/
             # declined ANY Intent Brief field never carries anything over.
@@ -613,17 +818,10 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
             # INSERT below), so MAX(created_at) over existing rows is
             # exactly that moment.
             #
-            # Core Capability (part of understanding_revision's reasoning-
-            # model output, not a separately-confirmed row like Intent Brief
-            # fields) is deliberately NOT included here: unlike
-            # interview_intent_item, there is no per-Core-Capability
-            # confirmed/updated_at column to compare deterministically
-            # against a previous build's timestamp (only
-            # system_purpose_confirmations exists, and only for System
-            # Purpose, not the Core Capability list) -- adding one is a
-            # persistence/schema change out of this fix's scope. This is a
-            # known, reported gap, not a silent omission (see this PR's
-            # report).
+            # Core Capability changes do not use this coarse timestamp guard.
+            # Issue #312 records a manually-confirmed, versioned Capability
+            # graph and evaluates exact per-item entity/relation dependencies
+            # below, so unrelated relations retain carry-over.
             previous_build_row = conn.execute(
                 "SELECT MAX(created_at) AS ts FROM alignment_item WHERE session_id = ? AND system_id = ?",
                 (session_id, system_id),
@@ -648,6 +846,7 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
             # now performs (one full-file read per distinct path across every
             # item in this build, not per evidence citation).
             source_digest_cache: Dict[str, Optional[List[str]]] = {}
+            capability_graph_cache: Dict[int, Dict[str, object]] = {}
             for it in final_items:
                 linked_intent_item_id = it["intent_item_id"]
                 it["content_hash"] = compute_content_hash(
@@ -671,15 +870,32 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
                     commit_sha=snapshot_row["commit_sha"],
                     source_digest_cache=source_digest_cache,
                 )
-                carried_from = (
-                    None if intent_changed_since_last_build
-                    else carry_candidates.get(it["content_hash"])
-                )
+                # Issue #312 keeps the structural/content key separate from
+                # the confirmed Capability dependency scope.  Legacy
+                # content_hash values migrate into this column exactly.
+                it["base_content_hash"] = it["content_hash"]
+                carried_from = None
+                capability_scope_changed = False
+                if not intent_changed_since_last_build:
+                    for candidate in carry_candidates.get(it["content_hash"], []):
+                        changed = _capability_scope_changed(
+                            conn,
+                            candidate_item_id=candidate["item_id"],
+                            current_graph=current_capability_graph,
+                            current_entity_ids=it["_capability_entity_ids"],
+                            current_relation_ids=it["_capability_relation_ids"],
+                            graph_cache=capability_graph_cache,
+                        )
+                        if not changed:
+                            carried_from = candidate["origin_id"]
+                            break
+                        capability_scope_changed = True
                 if carried_from is not None:
                     it["review_category"] = "unchanged"
                     it["reason_code"] = "unchanged_since_confirmation"
                     it["policy_rule_id"] = None
                     it["carried_over_from"] = carried_from
+                    it["_capability_change_kind"] = "none"
                 else:
                     review_category, reason_code, policy_rule_id = (
                         classify_alignment_item_with_rule(
@@ -688,12 +904,20 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
                             confidence=it["confidence"],
                             intent_field=it["intent_field"],
                             runtime_check=it["runtime_check"],
+                            capability_change=(
+                                "changed" if capability_scope_changed else "none"
+                            ),
                         )
                     )
                     it["review_category"] = review_category
                     it["reason_code"] = reason_code
                     it["policy_rule_id"] = policy_rule_id
                     it["carried_over_from"] = None
+                    it["_capability_change_kind"] = (
+                        "core_capability_changed"
+                        if capability_scope_changed
+                        else "none"
+                    )
 
     run_status = "failed" if proposal.error else "completed"
     run_cur = conn.execute(
@@ -769,11 +993,12 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
                      intent_summary, current_claim, current_evidence, gap_summary,
                      proposed_interpretation, alignment_state, risk_flags, confidence,
                      review_category, reason_code, user_reason, runtime_check, status,
-                     user_decision, content_hash, carried_over_from, policy_version,
+                     user_decision, content_hash, base_content_hash,
+                     carried_over_from, policy_version,
                      policy_digest, policy_rule_id, manual_recheck_required,
                      intelligence_run_id, is_mock, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open',
-                        NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id, system_id, revision["id"], revision["snapshot_id"],
                     it["intent_item_id"], it["intent_summary"], it["current_claim"],
@@ -781,12 +1006,43 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
                     it["gap_summary"], it["proposed_interpretation"], it["alignment_state"],
                     json.dumps(it["risk_flags"]), it["confidence"], it["review_category"],
                     reason_code, user_reason_for(reason_code), it["runtime_check"],
-                    it["content_hash"], it["carried_over_from"],
+                    it["content_hash"], it["base_content_hash"],
+                    it["carried_over_from"],
                     policy_version, policy_digest, it["policy_rule_id"],
                     1 if pending_target else 0,
                     run_id, 1 if proposal.is_mock else 0, completed_at, completed_at,
                 ),
             )
+            if it["_capability_confirmation_id"] is not None:
+                conn.execute(
+                    """INSERT INTO alignment_item_capability_scope
+                        (alignment_item_id, system_id, confirmation_id,
+                         change_kind, created_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        item_cur.lastrowid,
+                        system_id,
+                        it["_capability_confirmation_id"],
+                        it["_capability_change_kind"],
+                        completed_at,
+                    ),
+                )
+                for dependency in it["_capability_dependencies"]:
+                    conn.execute(
+                        """INSERT INTO alignment_item_capability_dependency
+                            (alignment_item_id, system_id, target_kind,
+                             entity_id, relation_id, captured_digest, created_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            item_cur.lastrowid,
+                            system_id,
+                            dependency["target_kind"],
+                            dependency["entity_id"],
+                            dependency["relation_id"],
+                            dependency["captured_digest"],
+                            completed_at,
+                        ),
+                    )
             if pending_target:
                 conn.execute(
                     """UPDATE alignment_manual_recheck_target
@@ -819,7 +1075,7 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
         revision_id=revision["id"],
         intelligence_run_id=run_id,
         is_mock=proposal.is_mock,
-        items=_sorted_items(rows),
+        items=_sorted_items(conn, rows),
     )
 
 
@@ -882,7 +1138,7 @@ def list_alignment_items(
         ).fetchall()
         current_rows = [r for r in rows if not (("superseded" in r.keys()) and r["superseded"])]
         superseded_rows = [r for r in rows if ("superseded" in r.keys()) and r["superseded"]]
-        items = _sorted_items(current_rows)
+        items = _sorted_items(conn, current_rows)
         categories = ("must_review", "batch_reviewable", "no_review_required", "unchanged", "informational")
         items_by_category: Dict[str, List[AlignmentItemOut]] = {c: [] for c in categories}
         counts: Dict[str, int] = {c: 0 for c in categories}
@@ -900,7 +1156,7 @@ def list_alignment_items(
             session_id=session_id, system_id=system_id,
             items_by_category=items_by_category, counts=counts,
             outstanding_counts=outstanding_counts,
-            superseded_items=_sorted_items(superseded_rows),
+            superseded_items=_sorted_items(conn, superseded_rows),
         )
 
 
@@ -938,7 +1194,9 @@ def get_review_queue(
             (session_id, system_id, *_ACTIONABLE_CATEGORIES, session_id, system_id),
         ).fetchall()
         return AlignmentReviewQueueOut(
-            session_id=session_id, system_id=system_id, items=_sorted_items(rows),
+            session_id=session_id,
+            system_id=system_id,
+            items=_sorted_items(conn, rows),
         )
 
 
@@ -1191,7 +1449,7 @@ def _write_answer_decision(
         (now, item_id),
     )
     row = conn.execute("SELECT * FROM alignment_item WHERE id = ?", (item_id,)).fetchone()
-    return _item_out(row)
+    return _item_out(conn, row)
 
 
 @router.post(
@@ -1270,7 +1528,7 @@ def correct_alignment_item(
             (now, item_id),
         )
         row = conn.execute("SELECT * FROM alignment_item WHERE id = ?", (item_id,)).fetchone()
-        result = _item_out(row)
+        result = _item_out(conn, row)
 
     # Issue #288: see answer_alignment_item's comment above.
     from ..interview_refresh import request_refresh
@@ -1295,7 +1553,7 @@ def hold_alignment_item(
         _reject_if_not_actionable(item)
         if item["status"] == "held":
             # Safe retry: preserve the original audit timestamp/payload.
-            return _item_out(item)
+            return _item_out(conn, item)
         _reject_if_not_decidable(item, allow_held=False)
         decision = {"action": "held", "note": None, "decided_at": now, "decided_by": None}
         conn.execute(
@@ -1305,7 +1563,7 @@ def hold_alignment_item(
             (json.dumps(decision, ensure_ascii=False), now, item_id),
         )
         row = conn.execute("SELECT * FROM alignment_item WHERE id = ?", (item_id,)).fetchone()
-        return _item_out(row)
+        return _item_out(conn, row)
 
 
 # --- Batch answer (PR #296 review fix, Finding 5) ----------------------------

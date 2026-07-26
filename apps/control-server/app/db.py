@@ -1434,6 +1434,108 @@ CREATE INDEX IF NOT EXISTS idx_understanding_revision_session
 CREATE INDEX IF NOT EXISTS idx_understanding_revision_system
     ON understanding_revision (system_id, session_id);
 
+-- Canonical, manually-confirmed capability composition (Issue #312).
+--
+-- The reasoning-model ``current_understanding`` JSON remains the proposal
+-- and display snapshot.  These sidecar tables are the authoritative,
+-- append-only identity/composition history used for deterministic cascade
+-- decisions.  Entity identity is independent of the displayed name, and
+-- relations are many-to-many so one lower-level function can support more
+-- than one Core Capability.
+CREATE TABLE IF NOT EXISTS understanding_capability_entity (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id   INTEGER NOT NULL,
+    entity_kind TEXT NOT NULL,
+    created_at  REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_capability_entity_system
+    ON understanding_capability_entity (system_id, entity_kind, id);
+
+CREATE TABLE IF NOT EXISTS understanding_capability_confirmation (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    session_id            INTEGER NOT NULL,
+    base_confirmation_id  INTEGER,
+    source_revision_id    INTEGER,
+    source_revision_at    REAL,
+    composition_digest    TEXT NOT NULL,
+    request_digest        TEXT,
+    decided_by            TEXT NOT NULL,
+    decided_by_user_id    INTEGER,
+    decision_method       TEXT NOT NULL DEFAULT 'manual',
+    created_at            REAL NOT NULL,
+    UNIQUE (system_id, session_id, source_revision_id),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (base_confirmation_id) REFERENCES understanding_capability_confirmation (id) ON DELETE SET NULL,
+    FOREIGN KEY (decided_by_user_id) REFERENCES users (id) ON DELETE SET NULL,
+    -- Revision retention must never erase a confirmed composition.
+    FOREIGN KEY (source_revision_id) REFERENCES understanding_revision (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_capability_confirmation_session
+    ON understanding_capability_confirmation (system_id, session_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS understanding_capability_entity_version (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    confirmation_id   INTEGER NOT NULL,
+    entity_id         INTEGER NOT NULL,
+    entity_kind       TEXT NOT NULL,
+    name              TEXT NOT NULL,
+    summary           TEXT NOT NULL DEFAULT '',
+    semantic_digest   TEXT NOT NULL,
+    payload_json      TEXT NOT NULL,
+    created_at        REAL NOT NULL,
+    UNIQUE (confirmation_id, entity_id),
+    UNIQUE (confirmation_id, entity_kind, name),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (confirmation_id) REFERENCES understanding_capability_confirmation (id) ON DELETE CASCADE,
+    FOREIGN KEY (entity_id) REFERENCES understanding_capability_entity (id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_capability_entity_version_lookup
+    ON understanding_capability_entity_version
+       (system_id, confirmation_id, entity_kind, name);
+
+-- Stable identity of one directed support relation.  Reusing the same
+-- endpoint entity ids reuses this row even if either display name changes.
+CREATE TABLE IF NOT EXISTS understanding_capability_relation (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    supported_entity_id INTEGER NOT NULL,
+    supporting_entity_id INTEGER NOT NULL,
+    relation_kind       TEXT NOT NULL DEFAULT 'supports',
+    created_at          REAL NOT NULL,
+    UNIQUE (system_id, supported_entity_id, supporting_entity_id, relation_kind),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (supported_entity_id) REFERENCES understanding_capability_entity (id) ON DELETE RESTRICT,
+    FOREIGN KEY (supporting_entity_id) REFERENCES understanding_capability_entity (id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_capability_relation_system
+    ON understanding_capability_relation (system_id, supported_entity_id, supporting_entity_id);
+
+CREATE TABLE IF NOT EXISTS understanding_capability_relation_version (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    confirmation_id   INTEGER NOT NULL,
+    relation_id       INTEGER NOT NULL,
+    role              TEXT NOT NULL DEFAULT '',
+    scope             TEXT NOT NULL DEFAULT '',
+    semantic_digest   TEXT NOT NULL,
+    created_at        REAL NOT NULL,
+    UNIQUE (confirmation_id, relation_id),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (confirmation_id) REFERENCES understanding_capability_confirmation (id) ON DELETE CASCADE,
+    FOREIGN KEY (relation_id) REFERENCES understanding_capability_relation (id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_capability_relation_version_lookup
+    ON understanding_capability_relation_version (system_id, confirmation_id, relation_id);
+
 -- Evidence actually read during pass 1 of the interview dialogue turn
 -- (Issue #137). One row per snippet read from the pinned snapshot,
 -- regardless of whether the resulting question cited it — a raw fact kept
@@ -2671,6 +2773,59 @@ CREATE INDEX IF NOT EXISTS idx_alignment_item_system
 
 CREATE INDEX IF NOT EXISTS idx_alignment_item_review_queue
     ON alignment_item (session_id, review_category, status);
+
+-- The exact confirmed capability composition used by an Alignment item and
+-- the finite entity/relation ids the reasoning model cited from it (Issue
+-- #312).  These are new sidecar tables instead of columns on alignment_item:
+-- old databases gain them additively and legacy rows remain explicitly
+-- unscoped rather than having identity inferred from names.
+CREATE TABLE IF NOT EXISTS alignment_item_capability_scope (
+    alignment_item_id INTEGER PRIMARY KEY,
+    system_id         INTEGER NOT NULL,
+    confirmation_id   INTEGER NOT NULL,
+    change_kind       TEXT NOT NULL DEFAULT 'none',
+    created_at        REAL NOT NULL,
+    FOREIGN KEY (alignment_item_id) REFERENCES alignment_item (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (confirmation_id) REFERENCES understanding_capability_confirmation (id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_alignment_item_capability_scope_confirmation
+    ON alignment_item_capability_scope (system_id, confirmation_id, alignment_item_id);
+
+CREATE TABLE IF NOT EXISTS alignment_item_capability_dependency (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    alignment_item_id INTEGER NOT NULL,
+    system_id         INTEGER NOT NULL,
+    target_kind       TEXT NOT NULL,
+    entity_id         INTEGER,
+    relation_id       INTEGER,
+    captured_digest   TEXT NOT NULL,
+    created_at        REAL NOT NULL,
+    CHECK (
+        (target_kind = 'entity' AND entity_id IS NOT NULL AND relation_id IS NULL)
+        OR
+        (target_kind = 'relation' AND entity_id IS NULL AND relation_id IS NOT NULL)
+    ),
+    FOREIGN KEY (alignment_item_id) REFERENCES alignment_item (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (entity_id) REFERENCES understanding_capability_entity (id) ON DELETE RESTRICT,
+    FOREIGN KEY (relation_id) REFERENCES understanding_capability_relation (id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_alignment_item_capability_dependency_entity
+    ON alignment_item_capability_dependency (system_id, entity_id, alignment_item_id);
+
+CREATE INDEX IF NOT EXISTS idx_alignment_item_capability_dependency_relation
+    ON alignment_item_capability_dependency (system_id, relation_id, alignment_item_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_alignment_item_capability_dependency_unique_entity
+    ON alignment_item_capability_dependency (alignment_item_id, entity_id)
+    WHERE target_kind = 'entity';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_alignment_item_capability_dependency_unique_relation
+    ON alignment_item_capability_dependency (alignment_item_id, relation_id)
+    WHERE target_kind = 'relation';
 
 -- Issue #310: an Inquiry opened from a deterministically selected
 -- no_review_required sample is an objection to the rule that classified the
@@ -4395,10 +4550,51 @@ def init_db() -> None:
         alignment_item_cols = _columns(conn, "alignment_item")
         if alignment_item_cols and "content_hash" not in alignment_item_cols:
             conn.execute("ALTER TABLE alignment_item ADD COLUMN content_hash TEXT")
+        # Issue #312: preserve the pre-Capability carry key separately from
+        # the manually-confirmed Capability dependency scope.  Existing
+        # content_hash values are exact deterministic facts and can therefore
+        # be copied without inferring any historical Capability identity.
+        if alignment_item_cols and "base_content_hash" not in alignment_item_cols:
+            conn.execute("ALTER TABLE alignment_item ADD COLUMN base_content_hash TEXT")
+            conn.execute(
+                """UPDATE alignment_item
+                   SET base_content_hash = content_hash
+                   WHERE content_hash IS NOT NULL"""
+            )
         if alignment_item_cols and "carried_over_from" not in alignment_item_cols:
             conn.execute(
                 "ALTER TABLE alignment_item ADD COLUMN carried_over_from INTEGER "
                 "REFERENCES alignment_item(id) ON DELETE SET NULL"
+            )
+        capability_confirmation_cols = _columns(
+            conn, "understanding_capability_confirmation"
+        )
+        if (
+            capability_confirmation_cols
+            and "request_digest" not in capability_confirmation_cols
+        ):
+            conn.execute(
+                "ALTER TABLE understanding_capability_confirmation "
+                "ADD COLUMN request_digest TEXT"
+            )
+        if (
+            capability_confirmation_cols
+            and "decided_by_user_id" not in capability_confirmation_cols
+        ):
+            conn.execute(
+                "ALTER TABLE understanding_capability_confirmation "
+                "ADD COLUMN decided_by_user_id INTEGER "
+                "REFERENCES users(id) ON DELETE SET NULL"
+            )
+        if (
+            capability_confirmation_cols
+            and "base_confirmation_id" not in capability_confirmation_cols
+        ):
+            conn.execute(
+                "ALTER TABLE understanding_capability_confirmation "
+                "ADD COLUMN base_confirmation_id INTEGER "
+                "REFERENCES understanding_capability_confirmation(id) "
+                "ON DELETE SET NULL"
             )
         # Issue #313: keep policy provenance additive.  The pre-policy Python
         # rule table is recorded as legacy rather than claiming it used the

@@ -3,8 +3,8 @@
 # 上から順に first-match で評価する。`match` の条件は AND であり、ここに
 # 任意コード・正規表現・数値スコアは書けない。許可される条件・有限値以外は
 # サーバー起動時に fail-closed で拒否される。
-schema_version: alignment-review-policy-v1
-policy_version: alignment-review-v1
+schema_version: alignment-review-policy-v2
+policy_version: alignment-review-v2
 
 # ユーザー表示理由も固定テンプレートのみ。LLM出力や自由記述は使わない。
 reason_templates:
@@ -17,9 +17,16 @@ reason_templates:
   routine_update: 軽微な差分です。まとめて確認してください
   no_change: 意図と現状の理解は一致しています。対応は不要です
   informational_only: 参考情報です。対応は不要です
+  core_capability_changed: 確定済みのCore Capability構成または支援関係が変更されたため再確認が必要です
   unchanged_since_confirmation: 前回の確認から内容に変更はありません。対応は不要です
 
 rules:
+  - id: core-capability-changed
+    match:
+      capability_change_in: [changed]
+    review_category: must_review
+    reason_code: core_capability_changed
+
   - id: security-risk
     match:
       risk_flags_contains: security
