@@ -199,6 +199,64 @@ function KeyPointsSection({
                 <div className="text-xs text-muted-foreground">
                   {Object.entries(kp.progress.total).map(([status, n]) => `${status}: ${n}`).join(" / ")}
                 </div>
+                {(kp.quality ?? []).length > 0 && (
+                  <div className="space-y-1 pt-1">
+                    <div className="text-xs font-medium">品質</div>
+                    {(kp.quality ?? []).map(q => (
+                      <div key={q.cell_id} className="text-xs text-muted-foreground">
+                        <span className="font-mono">{q.cell_id}</span>
+                        {" · "}pass rate {q.pass_rate == null ? "-" : `${Math.round(q.pass_rate * 100)}%`}
+                        {" · "}audits {q.audited_count == null ? "-" : q.audited_count}
+                        {q.intake_status === "suspended" && (
+                          <Badge variant="destructive" className="ml-2 text-[10px]">受付停止</Badge>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {(kp.topology ?? []).some(t =>
+                  t.feature_refs.length || t.capability_refs.length || t.entrypoint_refs.length
+                ) && (
+                  <div className="space-y-1 pt-1">
+                    <div className="text-xs font-medium">Topology → Cell</div>
+                    {(kp.topology ?? []).map(t => {
+                      const refs = [
+                        ...t.feature_refs.map(ref => ({
+                          label: `Feature:${ref}`,
+                          to: `/feature-map?feature=${encodeURIComponent(ref)}`,
+                        })),
+                        ...t.capability_refs.map(ref => ({
+                          label: `Capability:${ref}`,
+                          to: `/capability-map?capability=${encodeURIComponent(ref)}`,
+                        })),
+                        ...t.entrypoint_refs.map(ref => ({
+                          label: `Entrypoint:${ref}`,
+                          // Binding refs intentionally carry no guessed
+                          // entrypoint type, so open the canonical explorer
+                          // rather than fabricating an auto-selection query.
+                          to: "/flow-explorer",
+                        })),
+                      ];
+                      if (!refs.length) return null;
+                      return (
+                        <div key={t.cell_id} className="text-xs">
+                          <span className="font-mono text-muted-foreground">{t.cell_id}</span>
+                          <div className="mt-1 flex flex-wrap gap-1">
+                            {refs.map(ref => (
+                              <Link
+                                key={ref.label}
+                                to={ref.to}
+                                aria-label={`${ref.label} を開く`}
+                              >
+                                <Badge variant="outline" className="text-[10px]">{ref.label}</Badge>
+                              </Link>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
                 {kp.bottleneck_candidates.length > 0 && (
                   <div className="text-xs">
                     ボトルネック候補: {kp.bottleneck_candidates.length}件

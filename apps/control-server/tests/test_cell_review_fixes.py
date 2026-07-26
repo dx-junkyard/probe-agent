@@ -5,10 +5,11 @@ per-sub-issue test files (cookie login, X-Probe-System-Id headers, direct
 row inserts for evidence fixtures)."""
 
 import time
+import sqlite3
 
 import pytest
 
-from app import cell_binding, cell_quality, cell_tasks
+from app import cell_binding, cell_quality, cell_tasks, db
 
 
 @pytest.fixture
@@ -17,6 +18,9 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("CONTROL_ADMIN_USERNAME", "root")
     monkeypatch.setenv("CONTROL_ADMIN_PASSWORD", "s3cret")
     monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setenv("CELL_MODEL_ALIAS_WORKER_DEFAULT", "mock:worker-mock")
+    monkeypatch.setenv("CELL_MODEL_ALIAS_AUDITOR_DEFAULT", "mock:auditor-mock")
+    monkeypatch.setenv("CELL_MODEL_ALIAS_AUDITOR_CLONE", "mock:worker-mock")
     from app.main import app
     from fastapi.testclient import TestClient
 
@@ -27,8 +31,10 @@ def client(tmp_path, monkeypatch):
 # --- shared helpers ---------------------------------------------------------
 
 
-def _login(client):
-    r = client.post("/auth/login", json={"username": "root", "password": "s3cret"})
+def _login(client, username="root", password="s3cret"):
+    r = client.post(
+        "/auth/login", json={"username": username, "password": password},
+    )
     assert r.status_code == 200, r.text
     return r.cookies.get("probe_session")
 
@@ -184,7 +190,61 @@ def test_audit_rejects_worker_alias_as_auditor(client):
         json={"auditor_alias": "worker-default"}, headers=headers,
     )
     assert r.status_code == 422, r.text
-    assert "separate auditor" in r.json()["detail"] or "self" in r.json()["detail"].lower()
+    assert "separate model" in r.json()["detail"]
+
+    # A different alias string is still a self-audit when it resolves to the
+    # exact same provider/model endpoint as the worker.
+    r = client.post(
+        f"/cell-fabric/quality-samples/{sample['id']}/audit",
+        json={"auditor_alias": "auditor-clone"}, headers=headers,
+    )
+    assert r.status_code == 422, r.text
+    assert "separate model" in r.json()["detail"]
+
+
+def test_approval_actor_is_authenticated_identity_not_payload(client):
+    token = _login(client)
+    system = _system(client, token, "ApprovalIdentity")
+    headers = _headers(token, system["id"])
+    _create_cell(client, headers, cell_id="cell-1")
+    improvement_id = _full_manual_improvement(client, headers, "cell-1")
+
+    r = client.post(
+        f"/cell-fabric/improvements/{improvement_id}/parent-approve",
+        json={"actor": "forged-parent"}, headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["parent_approved_by"] == "root"
+
+    r = client.post(
+        f"/cell-fabric/improvements/{improvement_id}/human-approve",
+        json={"actor": "forged-human"}, headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["human_approved_by"] == "root"
+
+
+def test_non_admin_cannot_record_root_approval(client):
+    root_token = _login(client)
+    r = client.post(
+        "/users",
+        json={"username": "alice", "password": "pw", "role": "user"},
+        headers=_bearer(root_token),
+    )
+    assert r.status_code == 201, r.text
+
+    alice_token = _login(client, "alice", "pw")
+    system = _system(client, alice_token, "UserOwnedRootCell")
+    headers = _headers(alice_token, system["id"])
+    _create_cell(client, headers, cell_id="cell-1")
+    improvement_id = _full_manual_improvement(client, headers, "cell-1")
+
+    r = client.post(
+        f"/cell-fabric/improvements/{improvement_id}/parent-approve",
+        json={"actor": "root"}, headers=headers,
+    )
+    assert r.status_code == 409, r.text
+    assert "administrator Root approval" in r.json()["detail"]
 
 
 # --- P1-7: re-auditing the same sample does not inflate the rolling rate ----
@@ -327,6 +387,52 @@ def test_cell_state_reports_real_task_counts(client):
     assert counts["todo"] == 3
 
 
+def test_cell_state_reports_all_runtime_source_counts(client):
+    token = _login(client)
+    system = _system(client, token, "StateRuntimeSources")
+    headers = _headers(token, system["id"])
+    _create_cell(client, headers, cell_id="cell-1")
+    now = time.time()
+
+    for index, status in enumerate(("pass", "fail")):
+        _insert_row(system["id"], "evaluation_results", {
+            "system_id": system["id"], "trace_id": f"eval-{index}",
+            "component_id": "cell-1", "criterion_id": index + 1,
+            "status": status, "created_at": now,
+        })
+    _insert_row(system["id"], "shadow_results", {
+        "system_id": system["id"], "trace_id": "shadow-1",
+        "component_id": "cell-1", "timestamp": now,
+    })
+
+    snapshot_id = _snapshot(system["id"])
+    replay_set_id = _insert_row(system["id"], "replay_sets", {
+        "system_id": system["id"], "component_id": "cell-1",
+        "name": "state-set", "trace_ids_json": "[]",
+        "source": "manual", "created_at": now,
+    })
+    for index, status in enumerate(("completed", "failed")):
+        _insert_row(system["id"], "replay_runs", {
+            "system_id": system["id"], "replay_set_id": replay_set_id,
+            "component_id": "cell-1", "snapshot_id": snapshot_id,
+            "commit_sha": "deadbeef", "symbol_path": "app/foo.py",
+            "symbol_qualified_name": "foo", "status": status,
+            "trace_set_hash": f"hash-{index}", "created_at": now,
+        })
+    _completed_experiment(system["id"], snapshot_id, "cell-1")
+
+    r = client.get("/cell-fabric/cells/cell-1/state", headers=headers)
+    assert r.status_code == 200, r.text
+    health = r.json()["state"]["health"]
+    assert health["evaluation_count"] == 2
+    assert health["evaluation_pass_rate"] == pytest.approx(0.5)
+    assert health["shadow_result_count"] == 1
+    assert health["replay_run_count"] == 2
+    assert health["replay_completed_count"] == 1
+    assert health["experiment_count"] == 1
+    assert health["experiment_completed_count"] == 1
+
+
 # --- P2: ask sync requires a user session -----------------------------------
 
 
@@ -371,14 +477,22 @@ def _snapshot(system_id):
     })
 
 
-def _completed_experiment(system_id, snapshot_id):
+def _completed_experiment(system_id, snapshot_id, feature_id):
     now = time.time()
-    return _insert_row(system_id, "experiments", {
-        "system_id": system_id, "feature_id": "f", "objective": "o",
+    experiment_id = _insert_row(system_id, "experiments", {
+        "system_id": system_id, "feature_id": feature_id, "objective": "o",
         "snapshot_id": snapshot_id, "baseline_commit": "deadbeef",
         "config_revision": "1", "execution_config": "{}", "status": "completed",
+        "human_decision": "adopted",
+        "human_decision_variant_key": "variant-1",
         "created_at": now,
     })
+    _insert_row(system_id, "experiment_variants", {
+        "experiment_id": experiment_id, "variant_key": "variant-1",
+        "label": "candidate", "is_baseline": 0,
+        "patch_hash": f"hash-{experiment_id}", "status": "completed",
+    })
+    return experiment_id
 
 
 def _advance(client, headers, improvement_id, evidence_ref, version=None):
@@ -395,7 +509,7 @@ def _advance(client, headers, improvement_id, evidence_ref, version=None):
     assert r.status_code == 200, r.text
 
 
-def test_adopt_incompatible_bump_requires_allow_major_bump(client):
+def test_adopt_incompatible_bump_requires_authenticated_root_override(client):
     token = _login(client)
     system = _system(client, token, "MajorBump")
     headers = _headers(token, system["id"])
@@ -406,7 +520,7 @@ def test_adopt_incompatible_bump_requires_allow_major_bump(client):
                     headers=headers)
     assert r.status_code == 201, r.text
     snap = _snapshot(system["id"])
-    exp = _completed_experiment(system["id"], snap)
+    exp = _completed_experiment(system["id"], snap, "cell-1")
     imp = _full_manual_improvement(client, headers, "cell-1", target_kind="role_card",
                                    parent_cell_id=None)
     _advance(client, headers, imp, f"experiment:{exp}", version="2.0.0")
@@ -419,13 +533,62 @@ def test_adopt_incompatible_bump_requires_allow_major_bump(client):
     r = client.post(f"/cell-fabric/improvements/{imp}/transition",
                     json={"new_status": "adopted"}, headers=headers)
     assert r.status_code == 409, r.text
-    assert "major_bump" in r.json()["detail"]
+    assert "semver-compatible" in r.json()["detail"]
 
-    # With allow_major_bump -> adopted.
+    # The authenticated admin may explicitly exercise the Root override.
     r = client.post(f"/cell-fabric/improvements/{imp}/transition",
                     json={"new_status": "adopted", "allow_major_bump": True}, headers=headers)
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "adopted"
+
+
+def test_non_admin_cannot_override_incompatible_role_card(client):
+    root_token = _login(client)
+    r = client.post(
+        "/users",
+        json={"username": "bob", "password": "pw", "role": "user"},
+        headers=_bearer(root_token),
+    )
+    assert r.status_code == 201, r.text
+    user_token = _login(client, "bob", "pw")
+    system = _system(client, user_token, "UserMajorBump")
+    headers = _headers(user_token, system["id"])
+    _create_cell(
+        client, headers, cell_id="cell-1",
+        role_key="worker-generic", version="1.0.0",
+    )
+    assert _make_orchestrator(
+        client, headers, "parent", ["cell-1"],
+    ).status_code == 201
+    r = client.post(
+        "/cell-fabric/role-cards",
+        json=_card_payload(role_key="worker-generic", version="2.0.0"),
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    snap = _snapshot(system["id"])
+    exp = _completed_experiment(system["id"], snap, "cell-1")
+    imp = _full_manual_improvement(
+        client, headers, "cell-1", target_kind="role_card",
+        parent_cell_id="parent",
+    )
+    _advance(client, headers, imp, f"experiment:{exp}", version="2.0.0")
+    assert client.post(
+        f"/cell-fabric/improvements/{imp}/parent-approve",
+        json={"actor": "parent"}, headers=headers,
+    ).status_code == 200
+    assert client.post(
+        f"/cell-fabric/improvements/{imp}/human-approve",
+        json={"actor": "bob"}, headers=headers,
+    ).status_code == 200
+
+    r = client.post(
+        f"/cell-fabric/improvements/{imp}/transition",
+        json={"new_status": "adopted", "allow_major_bump": True},
+        headers=headers,
+    )
+    assert r.status_code == 409, r.text
+    assert "administrator Root override" in r.json()["detail"]
 
 
 def test_adopt_rejects_draft_card(client):
@@ -439,7 +602,7 @@ def test_adopt_rejects_draft_card(client):
                     headers=headers)
     assert r.status_code == 201, r.text
     snap = _snapshot(system["id"])
-    exp = _completed_experiment(system["id"], snap)
+    exp = _completed_experiment(system["id"], snap, "cell-1")
     imp = _full_manual_improvement(client, headers, "cell-1", target_kind="role_card")
     _advance(client, headers, imp, f"experiment:{exp}", version="1.1.0")
     client.post(f"/cell-fabric/improvements/{imp}/parent-approve",
@@ -463,7 +626,7 @@ def test_changing_version_after_approval_invalidates_it(client):
                         headers=headers)
         assert r.status_code == 201, r.text
     snap = _snapshot(system["id"])
-    exp = _completed_experiment(system["id"], snap)
+    exp = _completed_experiment(system["id"], snap, "cell-1")
     imp = _full_manual_improvement(client, headers, "cell-1", target_kind="role_card")
     _advance(client, headers, imp, f"experiment:{exp}", version="1.1.0")
     client.post(f"/cell-fabric/improvements/{imp}/parent-approve",
@@ -532,3 +695,93 @@ def test_child_roster_update_cannot_exceed_depth_via_ancestor(client):
     )
     assert r.status_code == 422, r.text
     assert "depth" in r.json()["detail"].lower()
+
+
+def test_legacy_improvement_event_check_is_migrated(tmp_path):
+    conn = sqlite3.connect(
+        tmp_path / "legacy-events.db", isolation_level=None,
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.executescript(
+        """
+        CREATE TABLE systems (id INTEGER PRIMARY KEY);
+        CREATE TABLE cell_improvements (id INTEGER PRIMARY KEY);
+        INSERT INTO systems (id) VALUES (1);
+        INSERT INTO cell_improvements (id) VALUES (1);
+        CREATE TABLE cell_improvement_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            system_id INTEGER NOT NULL,
+            improvement_id INTEGER NOT NULL,
+            event_type TEXT NOT NULL CHECK (event_type IN (
+                'created', 'status_transition', 'parent_approval',
+                'human_approval', 'shadow_proposed',
+                'live_shadow_approval_requested', 'live_shadow_approved',
+                'suspended', 'resumed', 'rolled_back'
+            )),
+            from_status TEXT,
+            to_status TEXT,
+            actor TEXT,
+            detail TEXT NOT NULL DEFAULT '',
+            created_at REAL NOT NULL
+        );
+        CREATE INDEX idx_cell_improvement_events_improvement
+            ON cell_improvement_events (system_id, improvement_id, id ASC);
+        INSERT INTO cell_improvement_events
+            (system_id, improvement_id, event_type, created_at)
+            VALUES (1, 1, 'created', 1.0);
+        """
+    )
+
+    try:
+        db._migrate_cell_improvement_event_types(conn)
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'cell_improvement_events'"
+        ).fetchone()["sql"]
+        assert "approvals_invalidated" in sql
+        assert conn.execute(
+            "SELECT event_type FROM cell_improvement_events"
+        ).fetchone()["event_type"] == "created"
+        conn.execute(
+            """INSERT INTO cell_improvement_events
+                   (system_id, improvement_id, event_type, created_at)
+               VALUES (1, 1, 'approvals_invalidated', 2.0)"""
+        )
+    finally:
+        conn.close()
+
+
+def test_legacy_ask_decision_note_is_backfilled(tmp_path):
+    conn = sqlite3.connect(
+        tmp_path / "legacy-asks.db", isolation_level=None,
+    )
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE cell_asks (
+            id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL,
+            decision TEXT NOT NULL DEFAULT ''
+        );
+        INSERT INTO cell_asks (id, status, decision)
+            VALUES (1, 'accepted', 'go ahead');
+        INSERT INTO cell_asks (id, status, decision)
+            VALUES (2, 'open', '');
+        """
+    )
+    try:
+        db._migrate_cell_ask_decision_note(conn)
+        decided = conn.execute(
+            "SELECT decision, decision_note FROM cell_asks WHERE id = 1"
+        ).fetchone()
+        assert dict(decided) == {
+            "decision": "accepted",
+            "decision_note": "go ahead",
+        }
+        open_ask = conn.execute(
+            "SELECT decision, decision_note FROM cell_asks WHERE id = 2"
+        ).fetchone()
+        assert dict(open_ask) == {"decision": "", "decision_note": ""}
+    finally:
+        conn.close()

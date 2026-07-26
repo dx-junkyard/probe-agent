@@ -468,9 +468,9 @@ class TestDigest:
         headers = _headers(token, system["id"])
         orch_id = self._setup_roster(client, headers)
 
-        now = time.time()
+        goal = _create_goal(client, headers)
         for i in range(10):
-            _post_trace(client, headers, f"a-trace-{i}", "worker-a", timestamp=now - i)
+            _insert_task(system["id"], goal["id"], "worker-a", status="todo")
         # worker-b stays at queue_length 0.
 
         r = client.get(f"/cell-fabric/orchestrators/{orch_id}/digest", headers=headers)

@@ -9,6 +9,7 @@ additive migration/backfill behavior. No LLM call or worktree write is
 exercised because this issue introduces none.
 """
 
+import json
 import time
 
 import pytest
@@ -153,6 +154,35 @@ def _confirm_and_reach_proposal_generation(client, session_id, headers):
         headers=headers,
     )
     assert r.status_code == 200, r.text
+
+
+def _set_structured_understanding_revision(
+    session_id, system_id, snapshot_id, understanding,
+):
+    from app.db import get_conn
+
+    now = time.time()
+    with get_conn() as conn:
+        conn.execute(
+            """UPDATE interview_session
+               SET current_understanding = ?, updated_at = ?
+               WHERE id = ? AND system_id = ?""",
+            (json.dumps(understanding), now, session_id, system_id),
+        )
+        cur = conn.execute(
+            """INSERT INTO understanding_revision
+                (session_id, system_id, snapshot_id, intelligence_run_id,
+                 current_understanding, gap_analysis, created_at)
+               VALUES (?, ?, ?, NULL, ?, NULL, ?)""",
+            (
+                session_id,
+                system_id,
+                snapshot_id,
+                json.dumps(understanding),
+                now,
+            ),
+        )
+        return cur.lastrowid
 
 
 def _valid_proposal_item():
@@ -1686,6 +1716,246 @@ def test_confirm_understanding_requires_context(admin_client):
         headers=headers,
     )
     assert r.status_code == 422
+
+
+def test_structured_confirmation_is_revision_scoped_and_supports_explicit_rename(
+    admin_client,
+):
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "canonical graph"},
+        headers=headers,
+    ).json()
+    session_id = session["id"]
+    first_understanding = {
+        "core_capabilities": [
+            {"name": "Core A", "summary": "A", "children": ["Shared"]},
+            {"name": "Core B", "summary": "B", "children": ["Shared"]},
+        ],
+        "capability_elements": [
+            {"name": "Shared", "summary": "shared", "children": []},
+        ],
+        "supporting_elements": [],
+        "api_boundaries": [],
+    }
+    first_revision_id = _set_structured_understanding_revision(
+        session_id, system_id, snapshot_id, first_understanding
+    )
+
+    confirmed = admin_client.post(
+        f"/interview/sessions/{session_id}/confirm-understanding",
+        json={"actor": "root"},
+        headers=headers,
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["capability_graph_confirmed_revision_id"] == first_revision_id
+    assert confirmed.json()["capability_graph_confirmation_required"] is False
+    first_graph_response = admin_client.get(
+        f"/interview/sessions/{session_id}/capability-graph",
+        headers=headers,
+    )
+    assert first_graph_response.status_code == 200, first_graph_response.text
+    first_graph = first_graph_response.json()
+    assert len(first_graph["relations"]) == 2
+    old_a = next(node for node in first_graph["nodes"] if node["name"] == "Core A")
+    system_b = _create_system(admin_client, token, "Capability Graph Isolation")
+    foreign_graph = admin_client.get(
+        f"/interview/sessions/{session_id}/capability-graph",
+        headers=_headers(token, system_b["id"]),
+    )
+    assert foreign_graph.status_code == 404
+
+    # Same revision is idempotent and keeps the original human actor.
+    repeated = admin_client.post(
+        f"/interview/sessions/{session_id}/confirm-understanding",
+        json={"actor": "someone-else"},
+        headers=headers,
+    )
+    assert repeated.status_code == 200, repeated.text
+    assert admin_client.get(
+        f"/interview/sessions/{session_id}/capability-graph",
+        headers=headers,
+    ).json()["decided_by"] == "root"
+    conflicting_retry = admin_client.post(
+        f"/interview/sessions/{session_id}/confirm-understanding",
+        json={"actor": "root", "capability_relations": []},
+        headers=headers,
+    )
+    assert conflicting_retry.status_code == 422
+    assert "different identity/relation request" in conflicting_retry.text
+
+    second_understanding = {
+        **first_understanding,
+        "core_capabilities": [
+            {"name": "Renamed Core A", "summary": "A", "children": ["Shared"]},
+            {"name": "Core B", "summary": "B", "children": ["Shared"]},
+        ],
+    }
+    second_revision_id = _set_structured_understanding_revision(
+        session_id, system_id, snapshot_id, second_understanding
+    )
+    before_reconfirm = admin_client.get(
+        f"/interview/sessions/{session_id}", headers=headers
+    ).json()
+    assert before_reconfirm["capability_graph_confirmation_required"] is True
+
+    stale_base = admin_client.post(
+        f"/interview/sessions/{session_id}/confirm-understanding",
+        json={
+            "actor": "root",
+            "capability_base_confirmation_id": first_graph["confirmation_id"] + 999,
+        },
+        headers=headers,
+    )
+    assert stale_base.status_code == 409
+    assert "canonical Capability head changed" in stale_base.text
+
+    reconfirmed = admin_client.post(
+        f"/interview/sessions/{session_id}/confirm-understanding",
+        json={
+            "actor": "root",
+            "capability_base_confirmation_id": first_graph["confirmation_id"],
+            "capability_identity_bindings": [
+                {
+                    "entity_kind": "core_capability",
+                    "current_name": "Renamed Core A",
+                    "entity_id": old_a["entity_id"],
+                }
+            ],
+        },
+        headers=headers,
+    )
+    assert reconfirmed.status_code == 200, reconfirmed.text
+    assert (
+        reconfirmed.json()["capability_graph_confirmed_revision_id"]
+        == second_revision_id
+    )
+    assert reconfirmed.json()["capability_graph_confirmation_required"] is False
+    second_graph = admin_client.get(
+        f"/interview/sessions/{session_id}/capability-graph",
+        headers=headers,
+    ).json()
+    renamed_a = next(
+        node for node in second_graph["nodes"] if node["name"] == "Renamed Core A"
+    )
+    assert renamed_a["entity_id"] == old_a["entity_id"]
+    assert {relation["relation_id"] for relation in second_graph["relations"]} == {
+        relation["relation_id"] for relation in first_graph["relations"]
+    }
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        confirmations = conn.execute(
+            """SELECT source_revision_id, decided_by, decided_by_user_id
+               FROM understanding_capability_confirmation
+               WHERE system_id = ? AND session_id = ?
+               ORDER BY id""",
+            (system_id, session_id),
+        ).fetchall()
+    assert [row["source_revision_id"] for row in confirmations] == [
+        first_revision_id,
+        second_revision_id,
+    ]
+    assert [row["decided_by"] for row in confirmations] == ["root", "root"]
+    assert all(row["decided_by_user_id"] is not None for row in confirmations)
+
+
+def test_confirm_understanding_rejects_sdk_token_as_manual_actor(admin_client):
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "manual-only"},
+        headers=headers,
+    ).json()
+    _set_structured_understanding_revision(
+        session["id"],
+        system_id,
+        snapshot_id,
+        {
+            "core_capabilities": [],
+            "capability_elements": [],
+            "supporting_elements": [],
+            "api_boundaries": [],
+        },
+    )
+    sdk_response = admin_client.post(
+        "/tokens",
+        json={"name": "sdk", "system_id": system_id},
+        headers=_bearer(token),
+    )
+    assert sdk_response.status_code == 201, sdk_response.text
+    sdk_token = sdk_response.json()["token"]
+
+    response = admin_client.post(
+        f"/interview/sessions/{session['id']}/confirm-understanding",
+        json={"actor": "spoofed-human"},
+        headers={"X-Api-Key": sdk_token},
+    )
+    assert response.status_code == 403
+    assert "SDK API tokens cannot access management APIs" in response.text
+
+
+def test_confirm_understanding_rolls_back_graph_when_audit_message_fails(
+    admin_client, monkeypatch,
+):
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "atomic-confirm"},
+        headers=headers,
+    ).json()
+    revision_id = _set_structured_understanding_revision(
+        session["id"],
+        system_id,
+        snapshot_id,
+        {
+            "core_capabilities": [
+                {"name": "Core A", "summary": "A", "children": []},
+            ],
+            "capability_elements": [],
+            "supporting_elements": [],
+            "api_boundaries": [],
+        },
+    )
+
+    def fail_message(*_args, **_kwargs):
+        raise RuntimeError("forced audit message failure")
+
+    monkeypatch.setattr("app.routes.interview.interview_message", fail_message)
+    with pytest.raises(RuntimeError, match="forced audit message failure"):
+        admin_client.post(
+            f"/interview/sessions/{session['id']}/confirm-understanding",
+            json={"actor": "root"},
+            headers=headers,
+        )
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        stored_session = conn.execute(
+            """SELECT understanding_confirmed_at
+               FROM interview_session WHERE id = ?""",
+            (session["id"],),
+        ).fetchone()
+        confirmation_count = conn.execute(
+            """SELECT COUNT(*) AS n
+               FROM understanding_capability_confirmation
+               WHERE source_revision_id = ?""",
+            (revision_id,),
+        ).fetchone()["n"]
+        entity_count = conn.execute(
+            """SELECT COUNT(*) AS n FROM understanding_capability_entity
+               WHERE system_id = ?""",
+            (system_id,),
+        ).fetchone()["n"]
+    assert stored_session["understanding_confirmed_at"] is None
+    assert confirmation_count == 0
+    assert entity_count == 0
 
 
 def test_confirm_understanding_unlocks_zero_base_proposals(admin_client, monkeypatch):

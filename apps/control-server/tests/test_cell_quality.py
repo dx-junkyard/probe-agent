@@ -45,6 +45,8 @@ def admin_client(tmp_path, monkeypatch):
     monkeypatch.setenv("CONTROL_ADMIN_USERNAME", "root")
     monkeypatch.setenv("CONTROL_ADMIN_PASSWORD", "s3cret")
     monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setenv("CELL_MODEL_ALIAS_WORKER_DEFAULT", "mock:worker-mock")
+    monkeypatch.setenv("CELL_MODEL_ALIAS_AUDITOR_DEFAULT", "mock:auditor-mock")
     monkeypatch.delenv("CONTROL_API_KEYS", raising=False)
     from app.llm import get_llm_client
 
@@ -119,7 +121,10 @@ def _create_cell(client, headers, cell_id="cell-1", role_key="worker-generic"):
     return cell_id
 
 
-def _insert_trace(system_id, trace_id, component_id, *, error=None, output="ok", timestamp=None):
+def _insert_trace(
+    system_id, trace_id, component_id, *, error=None, output="ok",
+    timestamp=None, input_json="{}",
+):
     from app.db import get_conn
 
     now = timestamp if timestamp is not None else time.time()
@@ -129,8 +134,8 @@ def _insert_trace(system_id, trace_id, component_id, *, error=None, output="ok",
             """INSERT INTO traces
                    (system_id, trace_id, component_id, mode, input_json,
                     output_text, error, duration_ms, timestamp)
-               VALUES (?, ?, ?, 'trace', '{}', ?, ?, 1.0, ?)""",
-            (system_id, trace_id, component_id, output, error, now),
+               VALUES (?, ?, ?, 'trace', ?, ?, ?, 1.0, ?)""",
+            (system_id, trace_id, component_id, input_json, output, error, now),
         )
         conn.execute("COMMIT")
 
@@ -249,6 +254,31 @@ def test_rare_stratum_guarantees_minimum_one_sample(admin_client):
     result = _select_samples(admin_client, headers, cell_id)
     got = {s["target_id"] for s in result["samples"]}
     assert got == {"only-error"}
+
+
+def test_task_type_stratum_matches_trace_input_metadata(admin_client):
+    token = _login(admin_client)
+    system = _create_system(admin_client, token, "task-type-sys")
+    headers = _headers(token, system["id"])
+    cell_id = _create_cell(admin_client, headers)
+
+    _insert_trace(
+        system["id"], "api-task", cell_id,
+        input_json='{"metadata":{"task_type":"api"}}',
+    )
+    _insert_trace(
+        system["id"], "batch-task", cell_id,
+        input_json='{"metadata":{"task_type":"batch"}}',
+    )
+    _put_config(
+        admin_client, headers, cell_id,
+        sample_rate=0.0,
+        strata=[{"name": "api", "task_type": "api", "rare": True}],
+    )
+
+    result = _select_samples(admin_client, headers, cell_id)
+    assert {sample["target_id"] for sample in result["samples"]} == {"api-task"}
+    assert result["samples"][0]["stratum"] == "api"
 
 
 # ---------------------------------------------------------------------------

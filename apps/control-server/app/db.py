@@ -6,6 +6,8 @@ import time
 from contextlib import contextmanager
 from typing import Iterator
 
+from .intelligence_run_types import install_intelligence_run_type_guards
+
 logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
@@ -1355,6 +1357,11 @@ CREATE TABLE IF NOT EXISTS interview_qa (
     -- other sources; kept separate from evidence_refs (code line ranges).
     runtime_evidence    TEXT,
     answer_text         TEXT,
+    -- Issue #309: explicit answer action provenance for the deterministic
+    -- unknown-selection rate. NULL means the row predates this measurement
+    -- field (or has never been answered); it is never guessed from free
+    -- text. 0/1 is written by both normal Q&A answer paths.
+    answer_unknown      INTEGER,
     status              TEXT NOT NULL DEFAULT 'open',
     answered_by         TEXT,
     superseded_by_id    INTEGER,
@@ -1373,6 +1380,33 @@ CREATE INDEX IF NOT EXISTS idx_interview_qa_system
 
 CREATE INDEX IF NOT EXISTS idx_interview_qa_current
     ON interview_qa (session_id, superseded_by_id);
+
+-- Interview UX measurement events (Issue #309). Server-owned interview
+-- state remains the primary source for metrics; this append-only table is
+-- only for UI interactions which cannot be reconstructed from domain rows
+-- (review abandonment, evidence expansion, unchanged-item reconfirmation).
+-- event_type/target_kind are finite and cross-validated by the API. No free
+-- text or page content is accepted, and nothing is sent to an external
+-- analytics service. event_key makes browser retries idempotent per System.
+CREATE TABLE IF NOT EXISTS interview_metric_event (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key   TEXT NOT NULL,
+    system_id   INTEGER NOT NULL,
+    session_id  INTEGER NOT NULL,
+    event_type  TEXT NOT NULL,
+    target_kind TEXT NOT NULL,
+    target_id   INTEGER NOT NULL,
+    recorded_at REAL NOT NULL,
+    UNIQUE (system_id, event_key),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_interview_metric_event_system
+    ON interview_metric_event (system_id, event_type, recorded_at);
+
+CREATE INDEX IF NOT EXISTS idx_interview_metric_event_session
+    ON interview_metric_event (session_id, recorded_at);
 
 -- Understanding revisions (Issue #136). One row per successful
 -- update-understanding call — appended, never overwritten — so the
@@ -1399,6 +1433,108 @@ CREATE INDEX IF NOT EXISTS idx_understanding_revision_session
 
 CREATE INDEX IF NOT EXISTS idx_understanding_revision_system
     ON understanding_revision (system_id, session_id);
+
+-- Canonical, manually-confirmed capability composition (Issue #312).
+--
+-- The reasoning-model ``current_understanding`` JSON remains the proposal
+-- and display snapshot.  These sidecar tables are the authoritative,
+-- append-only identity/composition history used for deterministic cascade
+-- decisions.  Entity identity is independent of the displayed name, and
+-- relations are many-to-many so one lower-level function can support more
+-- than one Core Capability.
+CREATE TABLE IF NOT EXISTS understanding_capability_entity (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id   INTEGER NOT NULL,
+    entity_kind TEXT NOT NULL,
+    created_at  REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_capability_entity_system
+    ON understanding_capability_entity (system_id, entity_kind, id);
+
+CREATE TABLE IF NOT EXISTS understanding_capability_confirmation (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    session_id            INTEGER NOT NULL,
+    base_confirmation_id  INTEGER,
+    source_revision_id    INTEGER,
+    source_revision_at    REAL,
+    composition_digest    TEXT NOT NULL,
+    request_digest        TEXT,
+    decided_by            TEXT NOT NULL,
+    decided_by_user_id    INTEGER,
+    decision_method       TEXT NOT NULL DEFAULT 'manual',
+    created_at            REAL NOT NULL,
+    UNIQUE (system_id, session_id, source_revision_id),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (base_confirmation_id) REFERENCES understanding_capability_confirmation (id) ON DELETE SET NULL,
+    FOREIGN KEY (decided_by_user_id) REFERENCES users (id) ON DELETE SET NULL,
+    -- Revision retention must never erase a confirmed composition.
+    FOREIGN KEY (source_revision_id) REFERENCES understanding_revision (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_capability_confirmation_session
+    ON understanding_capability_confirmation (system_id, session_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS understanding_capability_entity_version (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    confirmation_id   INTEGER NOT NULL,
+    entity_id         INTEGER NOT NULL,
+    entity_kind       TEXT NOT NULL,
+    name              TEXT NOT NULL,
+    summary           TEXT NOT NULL DEFAULT '',
+    semantic_digest   TEXT NOT NULL,
+    payload_json      TEXT NOT NULL,
+    created_at        REAL NOT NULL,
+    UNIQUE (confirmation_id, entity_id),
+    UNIQUE (confirmation_id, entity_kind, name),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (confirmation_id) REFERENCES understanding_capability_confirmation (id) ON DELETE CASCADE,
+    FOREIGN KEY (entity_id) REFERENCES understanding_capability_entity (id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_capability_entity_version_lookup
+    ON understanding_capability_entity_version
+       (system_id, confirmation_id, entity_kind, name);
+
+-- Stable identity of one directed support relation.  Reusing the same
+-- endpoint entity ids reuses this row even if either display name changes.
+CREATE TABLE IF NOT EXISTS understanding_capability_relation (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    supported_entity_id INTEGER NOT NULL,
+    supporting_entity_id INTEGER NOT NULL,
+    relation_kind       TEXT NOT NULL DEFAULT 'supports',
+    created_at          REAL NOT NULL,
+    UNIQUE (system_id, supported_entity_id, supporting_entity_id, relation_kind),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (supported_entity_id) REFERENCES understanding_capability_entity (id) ON DELETE RESTRICT,
+    FOREIGN KEY (supporting_entity_id) REFERENCES understanding_capability_entity (id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_capability_relation_system
+    ON understanding_capability_relation (system_id, supported_entity_id, supporting_entity_id);
+
+CREATE TABLE IF NOT EXISTS understanding_capability_relation_version (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    confirmation_id   INTEGER NOT NULL,
+    relation_id       INTEGER NOT NULL,
+    role              TEXT NOT NULL DEFAULT '',
+    scope             TEXT NOT NULL DEFAULT '',
+    semantic_digest   TEXT NOT NULL,
+    created_at        REAL NOT NULL,
+    UNIQUE (confirmation_id, relation_id),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (confirmation_id) REFERENCES understanding_capability_confirmation (id) ON DELETE CASCADE,
+    FOREIGN KEY (relation_id) REFERENCES understanding_capability_relation (id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_capability_relation_version_lookup
+    ON understanding_capability_relation_version (system_id, confirmation_id, relation_id);
 
 -- Evidence actually read during pass 1 of the interview dialogue turn
 -- (Issue #137). One row per snippet read from the pinned snapshot,
@@ -2609,6 +2745,15 @@ CREATE TABLE IF NOT EXISTS alignment_item (
     user_reason             TEXT NOT NULL,
     status                  TEXT NOT NULL DEFAULT 'open',
     user_decision           TEXT,
+    -- Issue #313: the reviewed external policy used for deterministic
+    -- classification. Existing rows are explicitly marked legacy rather
+    -- than guessed to have been produced by a later YAML revision.
+    policy_version          TEXT NOT NULL DEFAULT 'legacy-code-v1',
+    policy_digest           TEXT,
+    policy_rule_id          TEXT,
+    -- Issue #310: this does not change deterministic classification.  It
+    -- only makes an explicitly human-selected recheck target actionable.
+    manual_recheck_required INTEGER NOT NULL DEFAULT 0,
     intelligence_run_id     INTEGER NOT NULL,
     is_mock                 INTEGER NOT NULL DEFAULT 0,
     created_at              REAL NOT NULL,
@@ -2628,6 +2773,113 @@ CREATE INDEX IF NOT EXISTS idx_alignment_item_system
 
 CREATE INDEX IF NOT EXISTS idx_alignment_item_review_queue
     ON alignment_item (session_id, review_category, status);
+
+-- The exact confirmed capability composition used by an Alignment item and
+-- the finite entity/relation ids the reasoning model cited from it (Issue
+-- #312).  These are new sidecar tables instead of columns on alignment_item:
+-- old databases gain them additively and legacy rows remain explicitly
+-- unscoped rather than having identity inferred from names.
+CREATE TABLE IF NOT EXISTS alignment_item_capability_scope (
+    alignment_item_id INTEGER PRIMARY KEY,
+    system_id         INTEGER NOT NULL,
+    confirmation_id   INTEGER NOT NULL,
+    change_kind       TEXT NOT NULL DEFAULT 'none',
+    created_at        REAL NOT NULL,
+    FOREIGN KEY (alignment_item_id) REFERENCES alignment_item (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (confirmation_id) REFERENCES understanding_capability_confirmation (id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_alignment_item_capability_scope_confirmation
+    ON alignment_item_capability_scope (system_id, confirmation_id, alignment_item_id);
+
+CREATE TABLE IF NOT EXISTS alignment_item_capability_dependency (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    alignment_item_id INTEGER NOT NULL,
+    system_id         INTEGER NOT NULL,
+    target_kind       TEXT NOT NULL,
+    entity_id         INTEGER,
+    relation_id       INTEGER,
+    captured_digest   TEXT NOT NULL,
+    created_at        REAL NOT NULL,
+    CHECK (
+        (target_kind = 'entity' AND entity_id IS NOT NULL AND relation_id IS NULL)
+        OR
+        (target_kind = 'relation' AND entity_id IS NULL AND relation_id IS NOT NULL)
+    ),
+    FOREIGN KEY (alignment_item_id) REFERENCES alignment_item (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (entity_id) REFERENCES understanding_capability_entity (id) ON DELETE RESTRICT,
+    FOREIGN KEY (relation_id) REFERENCES understanding_capability_relation (id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_alignment_item_capability_dependency_entity
+    ON alignment_item_capability_dependency (system_id, entity_id, alignment_item_id);
+
+CREATE INDEX IF NOT EXISTS idx_alignment_item_capability_dependency_relation
+    ON alignment_item_capability_dependency (system_id, relation_id, alignment_item_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_alignment_item_capability_dependency_unique_entity
+    ON alignment_item_capability_dependency (alignment_item_id, entity_id)
+    WHERE target_kind = 'entity';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_alignment_item_capability_dependency_unique_relation
+    ON alignment_item_capability_dependency (alignment_item_id, relation_id)
+    WHERE target_kind = 'relation';
+
+-- Issue #310: an Inquiry opened from a deterministically selected
+-- no_review_required sample is an objection to the rule that classified the
+-- item.  This is deliberately separate from the Inquiry conversation: it is
+-- a compact, immutable audit fact keyed to the exact item/rule provenance,
+-- not an interpretation of the user's free-text question.
+CREATE TABLE IF NOT EXISTS alignment_rule_objection (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    session_id        INTEGER NOT NULL,
+    alignment_item_id INTEGER NOT NULL UNIQUE,
+    inquiry_id        INTEGER NOT NULL UNIQUE,
+    reason_code       TEXT NOT NULL,
+    policy_version    TEXT NOT NULL,
+    policy_digest     TEXT,
+    policy_rule_id    TEXT NOT NULL,
+    created_at        REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (alignment_item_id) REFERENCES alignment_item (id) ON DELETE CASCADE,
+    FOREIGN KEY (inquiry_id) REFERENCES interview_inquiry (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_alignment_rule_objection_system_rule
+    ON alignment_rule_objection (system_id, reason_code, id);
+
+-- A manual recheck target is an explicit, finite human action. The physical
+-- item link is nullable so an in-flight target survives the rebuild DELETE
+-- and can be rebound one-for-one to the same content in the same session.
+-- Exact policy provenance prevents an objection to one reviewed rule version
+-- from selecting a different version that happens to share a reason_code.
+CREATE TABLE IF NOT EXISTS alignment_manual_recheck_target (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id            INTEGER NOT NULL,
+    session_id           INTEGER NOT NULL,
+    alignment_item_id    INTEGER UNIQUE,
+    reason_code          TEXT NOT NULL,
+    policy_version       TEXT NOT NULL,
+    policy_digest        TEXT NOT NULL DEFAULT '',
+    policy_rule_id       TEXT NOT NULL,
+    content_hash         TEXT NOT NULL,
+    status               TEXT NOT NULL DEFAULT 'pending',
+    decision_method      TEXT NOT NULL DEFAULT 'manual',
+    requested_by_user_id INTEGER,
+    created_at           REAL NOT NULL,
+    resolved_at          REAL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (alignment_item_id) REFERENCES alignment_item (id) ON DELETE SET NULL,
+    FOREIGN KEY (requested_by_user_id) REFERENCES users (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_alignment_manual_recheck_target_pending
+    ON alignment_manual_recheck_target (system_id, status, content_hash);
 
 -- Automatic refresh job after an answer batch (Issue #288). One row per
 -- refresh attempt; app/interview_refresh.py's request_refresh() dedupes so
@@ -3289,11 +3541,12 @@ CREATE TABLE IF NOT EXISTS cell_intake_states (
     UNIQUE (system_id, cell_definition_id)
 );
 
--- cell_quality_usage: System-scoped daily audit-budget counter, mirroring
+-- cell_quality_usage: System-scoped daily audit-invocation counter, mirroring
 -- llm_daily_usage's (Issue #273) exact pattern -- one row per (system, UTC
--- day), incremented atomically before an audit runs. Each Cell's own
--- cell_quality_configs.daily_audit_budget is the ceiling compared against
--- this SHARED per-System counter (never a per-Cell counter row).
+-- day), incremented atomically before an audit runs. The unit is accepted
+-- run_audit calls, not tokens or currency. Each Cell's own
+-- cell_quality_configs.daily_audit_budget is the invocation ceiling compared
+-- against this SHARED per-System counter (never a per-Cell counter row).
 CREATE TABLE IF NOT EXISTS cell_quality_usage (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     system_id     INTEGER NOT NULL,
@@ -3336,6 +3589,7 @@ CREATE TABLE IF NOT EXISTS cell_asks (
     status                TEXT NOT NULL DEFAULT 'open'
                               CHECK (status IN ('open', 'accepted', 'held', 'rejected')),
     decision              TEXT NOT NULL DEFAULT '',
+    decision_note         TEXT NOT NULL DEFAULT '',
     decision_method       TEXT NOT NULL DEFAULT '',
     decided_by            TEXT,
     decided_at            REAL,
@@ -3681,11 +3935,183 @@ def _migrate_intelligence_runs_snapshot_nullable(conn: sqlite3.Connection) -> No
         conn.execute("PRAGMA foreign_keys=ON")
 
 
+def _migrate_alignment_manual_recheck_targets(conn: sqlite3.Connection) -> None:
+    """Replace Issue #310's globally hash-keyed target table.
+
+    The original shape collapsed identical content hashes across interview
+    sessions and did not retain the exact reviewed policy rule or the human
+    actor. Existing pending targets are expanded to every currently matching
+    item; unmatched legacy targets cannot be attributed to a session safely
+    and are deliberately not guessed.
+    """
+    columns = _columns(conn, "alignment_manual_recheck_target")
+    if not columns:
+        return
+    if "alignment_item_id" in columns:
+        # SCHEMA uses an old-shape-compatible bootstrap index so startup can
+        # reach this migration even if a legacy database lost its old index.
+        # Once the new columns are known to exist, install the selective form.
+        conn.execute("DROP INDEX IF EXISTS idx_alignment_manual_recheck_target_pending")
+        conn.execute(
+            """
+            CREATE INDEX idx_alignment_manual_recheck_target_pending
+            ON alignment_manual_recheck_target
+               (system_id, policy_version, policy_digest, policy_rule_id,
+                status, session_id)
+            """
+        )
+        return
+
+    conn.execute("DROP TABLE IF EXISTS _alignment_manual_recheck_target_new")
+    conn.execute(
+        """
+        CREATE TABLE _alignment_manual_recheck_target_new (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            system_id            INTEGER NOT NULL,
+            session_id           INTEGER NOT NULL,
+            alignment_item_id    INTEGER UNIQUE,
+            reason_code          TEXT NOT NULL,
+            policy_version       TEXT NOT NULL,
+            policy_digest        TEXT NOT NULL DEFAULT '',
+            policy_rule_id       TEXT NOT NULL,
+            content_hash         TEXT NOT NULL,
+            status               TEXT NOT NULL DEFAULT 'pending',
+            decision_method      TEXT NOT NULL DEFAULT 'manual',
+            requested_by_user_id INTEGER,
+            created_at           REAL NOT NULL,
+            resolved_at          REAL,
+            FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+            FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+            FOREIGN KEY (alignment_item_id)
+                REFERENCES alignment_item (id) ON DELETE SET NULL,
+            FOREIGN KEY (requested_by_user_id) REFERENCES users (id) ON DELETE SET NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO _alignment_manual_recheck_target_new
+            (system_id, session_id, alignment_item_id, reason_code,
+             policy_version, policy_digest, policy_rule_id, content_hash,
+             status, decision_method, requested_by_user_id, created_at, resolved_at)
+        SELECT old.system_id, item.session_id, item.id, old.reason_code,
+               item.policy_version, COALESCE(item.policy_digest, ''),
+               COALESCE(item.policy_rule_id, 'legacy-unknown'), old.content_hash,
+               old.status, 'manual', NULL, old.created_at, old.resolved_at
+        FROM alignment_manual_recheck_target old
+        JOIN alignment_item item
+          ON item.system_id = old.system_id
+         AND item.reason_code = old.reason_code
+         AND item.content_hash = old.content_hash
+        """
+    )
+    conn.execute("DROP TABLE alignment_manual_recheck_target")
+    conn.execute(
+        "ALTER TABLE _alignment_manual_recheck_target_new "
+        "RENAME TO alignment_manual_recheck_target"
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_alignment_manual_recheck_target_pending
+        ON alignment_manual_recheck_target
+           (system_id, policy_version, policy_digest, policy_rule_id, status, session_id)
+        """
+    )
+
+
+def _migrate_cell_improvement_event_types(conn: sqlite3.Connection) -> None:
+    """Add ``approvals_invalidated`` to the SQLite CHECK constraint.
+
+    SQLite cannot ALTER a CHECK constraint. Rebuild the append-only event
+    table so databases created by an earlier Cell Fabric branch remain
+    writable after upgrade.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'cell_improvement_events'"
+    ).fetchone()
+    if row is None or "approvals_invalidated" in (row["sql"] or ""):
+        return
+
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN")
+        conn.execute(
+            "ALTER TABLE cell_improvement_events "
+            "RENAME TO _old_cell_improvement_events"
+        )
+        conn.execute(
+            """CREATE TABLE cell_improvement_events (
+                   id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                   system_id         INTEGER NOT NULL,
+                   improvement_id    INTEGER NOT NULL,
+                   event_type        TEXT NOT NULL CHECK (event_type IN (
+                       'created', 'status_transition', 'parent_approval',
+                       'human_approval', 'approvals_invalidated',
+                       'shadow_proposed', 'live_shadow_approval_requested',
+                       'live_shadow_approved', 'suspended', 'resumed',
+                       'rolled_back'
+                   )),
+                   from_status       TEXT,
+                   to_status         TEXT,
+                   actor             TEXT,
+                   detail            TEXT NOT NULL DEFAULT '',
+                   created_at        REAL NOT NULL,
+                   FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+                   FOREIGN KEY (improvement_id)
+                       REFERENCES cell_improvements (id) ON DELETE CASCADE
+               )"""
+        )
+        conn.execute(
+            """INSERT INTO cell_improvement_events
+                   (id, system_id, improvement_id, event_type, from_status,
+                    to_status, actor, detail, created_at)
+               SELECT id, system_id, improvement_id, event_type, from_status,
+                      to_status, actor, detail, created_at
+               FROM _old_cell_improvement_events"""
+        )
+        conn.execute("DROP TABLE _old_cell_improvement_events")
+        conn.execute(
+            """CREATE INDEX idx_cell_improvement_events_improvement
+               ON cell_improvement_events
+                  (system_id, improvement_id, id ASC)"""
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _migrate_cell_ask_decision_note(conn: sqlite3.Connection) -> None:
+    """Separate legacy Ask decision notes from the finite decision value.
+
+    Older builds wrote the free-form note into ``decision``. Adding the new
+    column without a backfill would leave existing accepted/held/rejected
+    rows semantically malformed.
+    """
+    columns = _columns(conn, "cell_asks")
+    if not columns or "decision_note" in columns:
+        return
+    conn.execute(
+        "ALTER TABLE cell_asks "
+        "ADD COLUMN decision_note TEXT NOT NULL DEFAULT ''"
+    )
+    conn.execute(
+        """UPDATE cell_asks
+           SET decision_note = decision, decision = status
+           WHERE status IN ('accepted', 'held', 'rejected')"""
+    )
+
+
 def init_db() -> None:
     with get_conn() as conn:
         _migrate_to_system_scope(conn)
         conn.executescript(SCHEMA)
         _migrate_intelligence_runs_snapshot_nullable(conn)
+        install_intelligence_run_type_guards(conn)
+        _migrate_cell_improvement_event_types(conn)
         ta_cols = _columns(conn, "trace_analyzers")
         if "reviewed_at" not in ta_cols:
             conn.execute("ALTER TABLE trace_analyzers ADD COLUMN reviewed_at REAL")
@@ -3804,6 +4230,7 @@ def init_db() -> None:
                 "ALTER TABLE experiments "
                 "ADD COLUMN human_decision_variant_key TEXT"
             )
+        _migrate_cell_ask_decision_note(conn)
         entrypoint_columns = _columns(conn, "code_entrypoints")
         if "source" not in entrypoint_columns:
             conn.execute(
@@ -3950,6 +4377,18 @@ def init_db() -> None:
             "UPDATE intelligence_runs SET status = 'completed' WHERE status = 'success'"
         )
         qa_cols = _columns(conn, "interview_qa")
+        if qa_cols and "answer_unknown" not in qa_cols:
+            # Existing answered/unconfirmed rows can be classified
+            # deterministically because Issue #142 exclusively used
+            # unconfirmed for answer_unknown. Revised rows have lost that
+            # distinction, so they deliberately remain NULL/unmeasured.
+            conn.execute("ALTER TABLE interview_qa ADD COLUMN answer_unknown INTEGER")
+            conn.execute(
+                "UPDATE interview_qa SET answer_unknown = 0 WHERE status = 'answered'"
+            )
+            conn.execute(
+                "UPDATE interview_qa SET answer_unknown = 1 WHERE status = 'unconfirmed'"
+            )
         if qa_cols and "runtime_evidence" not in qa_cols:
             # Issue #135: raw trace-aggregate + metadata-provenance JSON for
             # question_source = 'runtime' rows; existing rows stay NULL.
@@ -4111,11 +4550,94 @@ def init_db() -> None:
         alignment_item_cols = _columns(conn, "alignment_item")
         if alignment_item_cols and "content_hash" not in alignment_item_cols:
             conn.execute("ALTER TABLE alignment_item ADD COLUMN content_hash TEXT")
+        # Issue #312: preserve the pre-Capability carry key separately from
+        # the manually-confirmed Capability dependency scope.  Existing
+        # content_hash values are exact deterministic facts and can therefore
+        # be copied without inferring any historical Capability identity.
+        if alignment_item_cols and "base_content_hash" not in alignment_item_cols:
+            conn.execute("ALTER TABLE alignment_item ADD COLUMN base_content_hash TEXT")
+            conn.execute(
+                """UPDATE alignment_item
+                   SET base_content_hash = content_hash
+                   WHERE content_hash IS NOT NULL"""
+            )
         if alignment_item_cols and "carried_over_from" not in alignment_item_cols:
             conn.execute(
                 "ALTER TABLE alignment_item ADD COLUMN carried_over_from INTEGER "
                 "REFERENCES alignment_item(id) ON DELETE SET NULL"
             )
+        capability_confirmation_cols = _columns(
+            conn, "understanding_capability_confirmation"
+        )
+        if (
+            capability_confirmation_cols
+            and "request_digest" not in capability_confirmation_cols
+        ):
+            conn.execute(
+                "ALTER TABLE understanding_capability_confirmation "
+                "ADD COLUMN request_digest TEXT"
+            )
+        if (
+            capability_confirmation_cols
+            and "decided_by_user_id" not in capability_confirmation_cols
+        ):
+            conn.execute(
+                "ALTER TABLE understanding_capability_confirmation "
+                "ADD COLUMN decided_by_user_id INTEGER "
+                "REFERENCES users(id) ON DELETE SET NULL"
+            )
+        if (
+            capability_confirmation_cols
+            and "base_confirmation_id" not in capability_confirmation_cols
+        ):
+            conn.execute(
+                "ALTER TABLE understanding_capability_confirmation "
+                "ADD COLUMN base_confirmation_id INTEGER "
+                "REFERENCES understanding_capability_confirmation(id) "
+                "ON DELETE SET NULL"
+            )
+        # Issue #313: keep policy provenance additive.  The pre-policy Python
+        # rule table is recorded as legacy rather than claiming it used the
+        # new YAML policy; only rows built after this migration receive a
+        # validated policy version and content digest.
+        alignment_item_cols = _columns(conn, "alignment_item")
+        if alignment_item_cols and "policy_version" not in alignment_item_cols:
+            conn.execute(
+                "ALTER TABLE alignment_item "
+                "ADD COLUMN policy_version TEXT NOT NULL DEFAULT 'legacy-code-v1'"
+            )
+        if alignment_item_cols and "policy_digest" not in alignment_item_cols:
+            conn.execute("ALTER TABLE alignment_item ADD COLUMN policy_digest TEXT")
+        if alignment_item_cols and "policy_rule_id" not in alignment_item_cols:
+            conn.execute("ALTER TABLE alignment_item ADD COLUMN policy_rule_id TEXT")
+            # The only no_review_required rule in alignment-review-v1 is
+            # unambiguous, so existing rows from that reviewed artifact can
+            # be attributed without re-running or guessing classification.
+            conn.execute(
+                """UPDATE alignment_item
+                   SET policy_rule_id = 'aligned-no-change'
+                   WHERE policy_version = 'alignment-review-v1'
+                     AND review_category = 'no_review_required'
+                     AND reason_code = 'no_change'"""
+            )
+        if alignment_item_cols and "manual_recheck_required" not in alignment_item_cols:
+            conn.execute(
+                "ALTER TABLE alignment_item "
+                "ADD COLUMN manual_recheck_required INTEGER NOT NULL DEFAULT 0"
+            )
+        objection_cols = _columns(conn, "alignment_rule_objection")
+        if objection_cols and "policy_rule_id" not in objection_cols:
+            conn.execute(
+                "ALTER TABLE alignment_rule_objection "
+                "ADD COLUMN policy_rule_id TEXT NOT NULL DEFAULT 'legacy-unknown'"
+            )
+            conn.execute(
+                """UPDATE alignment_rule_objection
+                   SET policy_rule_id = 'aligned-no-change'
+                   WHERE policy_version = 'alignment-review-v1'
+                     AND reason_code = 'no_change'"""
+            )
+        _migrate_alignment_manual_recheck_targets(conn)
         _ensure_legacy_system(conn)
     _validate_startup_environment()
     _validate_publish_startup_config()

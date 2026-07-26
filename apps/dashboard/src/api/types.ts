@@ -440,6 +440,7 @@ export type InterviewStage =
   | "probe_flow_selection"
   | "proposal_generation";
 export type InterviewDecisionMethod = "deterministic" | "reasoning_llm" | "manual";
+export type InterviewDecisionAction = "approved" | "rejected" | "edited";
 export type InterviewApprovalState = "proposed" | "approved" | "rejected" | "edited" | "needs_review";
 export type SourceMetadataElementType =
   | "system" | "core" | "capability" | "element" | "supporting" | "boundary";
@@ -506,6 +507,66 @@ export interface CurrentUnderstanding {
   probe_flow_candidates: UnderstandingItem[];
 }
 
+export type CapabilityEntityKind =
+  | "core_capability" | "capability_element" | "supporting_element" | "api_boundary";
+
+export interface InterviewCapabilityNodeOut {
+  entity_id: number;
+  entity_kind: CapabilityEntityKind;
+  name: string;
+  summary: string;
+  semantic_digest: string;
+  payload: Record<string, unknown>;
+}
+
+export interface InterviewCapabilityRelationOut {
+  relation_id: number;
+  supported_entity_id: number;
+  supporting_entity_id: number;
+  relation_kind: "supports";
+  role: string;
+  scope: string;
+  semantic_digest: string;
+}
+
+export interface InterviewCapabilityGraphOut {
+  confirmation_id: number;
+  system_id: number;
+  session_id: number;
+  base_confirmation_id: number | null;
+  source_revision_id: number | null;
+  source_revision_at: number | null;
+  composition_digest: string;
+  decided_by: string;
+  decided_by_user_id: number | null;
+  decision_method: "manual";
+  created_at: number;
+  nodes: InterviewCapabilityNodeOut[];
+  relations: InterviewCapabilityRelationOut[];
+}
+
+export interface InterviewCapabilityIdentityBinding {
+  entity_kind: CapabilityEntityKind;
+  current_name: string;
+  entity_id: number;
+}
+
+export interface InterviewCapabilityRelationConfirmation {
+  supported_kind: CapabilityEntityKind;
+  supported_name: string;
+  supporting_kind: CapabilityEntityKind;
+  supporting_name: string;
+  role?: string;
+  scope?: string;
+}
+
+export interface InterviewConfirmUnderstandingRequest {
+  actor: string;
+  capability_base_confirmation_id?: number | null;
+  capability_relations?: InterviewCapabilityRelationConfirmation[] | null;
+  capability_identity_bindings?: InterviewCapabilityIdentityBinding[];
+}
+
 export interface InterviewSessionOut {
   id: number;
   system_id: number;
@@ -522,6 +583,8 @@ export interface InterviewSessionOut {
   last_error: string | null;
   understanding_confirmed_at: number | null;
   understanding_confirmed_by: string | null;
+  capability_graph_confirmed_revision_id?: number | null;
+  capability_graph_confirmation_required?: boolean;
   // Issue #129: set when an answered interview_qa question is corrected;
   // cleared only by a successful understanding rebuild.
   answers_revised_at: number | null;
@@ -664,16 +727,22 @@ export interface InterviewContextPack {
   omission_notes: string[];
 }
 
+export interface InterviewDialogueProposalOut {
+  path: string;
+  qualified_name: string;
+  symbol_id: number | null;
+  metadata: InterviewProposalMetadataBlock;
+  probe_plan: InterviewProposalProbePlan;
+  graph_node_id: string | null;
+  capability_name: string | null;
+  evidence_summary: string | null;
+  proposal_confidence: number | null;
+  denylist_hit: string | null;
+}
+
 export interface InterviewDialogueTurnOut {
   assistant_message: string;
-  proposals: {
-    path: string;
-    qualified_name: string;
-    symbol_id: number | null;
-    metadata: InterviewProposalMetadataBlock;
-    probe_plan: InterviewProposalProbePlan;
-    denylist_hit: string | null;
-  }[];
+  proposals: InterviewDialogueProposalOut[];
   // Whether this turn asked the reasoning model for proposals (gate open +
   // generate_proposals). True with zero proposals means the model returned
   // narrowing questions instead — show narrowing guidance, not a plain
@@ -775,6 +844,7 @@ export interface InterviewQaOut {
   // populated only for question_source === "runtime".
   runtime_evidence: RuntimeQaEvidence | null;
   answer_text: string | null;
+  answer_unknown: boolean | null;
   status: InterviewQaStatus;
   answered_by: string | null;
   superseded_by_id: number | null;
@@ -1003,7 +1073,7 @@ export type AlignmentReviewCategory =
 export type AlignmentReasonCode =
   | "security_related" | "high_risk" | "core_intent" | "conflict_detected"
   | "low_confidence" | "runtime_mismatch" | "routine_update" | "no_change"
-  | "informational_only";
+  | "informational_only" | "core_capability_changed" | "unchanged_since_confirmation";
 // Issue #290: deterministic Runtime Reality Check match state, set only
 // when this item's evidence deterministically maps to a component_id with
 // runtime trace facts; null when no deterministic mapping exists.
@@ -1028,6 +1098,18 @@ export interface AlignmentUserDecisionOut {
   decided_by: string | null;
 }
 
+export interface AlignmentCapabilityDependencyOut {
+  target_kind: "entity" | "relation";
+  entity_id: number | null;
+  relation_id: number | null;
+  entity_kind: CapabilityEntityKind | null;
+  entity_name: string | null;
+  supported_entity_id: number | null;
+  supported_entity_name: string | null;
+  supporting_entity_id: number | null;
+  supporting_entity_name: string | null;
+}
+
 export interface AlignmentItemOut {
   id: number;
   session_id: number;
@@ -1046,6 +1128,8 @@ export interface AlignmentItemOut {
   review_category: AlignmentReviewCategory;
   reason_code: AlignmentReasonCode;
   user_reason: string;
+  capability_confirmation_id?: number | null;
+  capability_dependencies?: AlignmentCapabilityDependencyOut[];
   runtime_check?: RuntimeCheckState | null;
   status: AlignmentItemStatus;
   user_decision: AlignmentUserDecisionOut | null;
@@ -1066,6 +1150,12 @@ export interface AlignmentItemOut {
   // API doesn't send yet.
   carried_over_from?: number | null;
   content_hash?: string | null;
+  // Issue #313: exact reviewed YAML policy provenance for this
+  // classification. Legacy rows have `legacy-code-v1` and no digest.
+  policy_version: string;
+  policy_digest: string | null;
+  policy_rule_id?: string | null;
+  manual_recheck_required?: boolean;
   intelligence_run_id: number;
   is_mock: boolean;
   created_at: number;
@@ -1102,6 +1192,92 @@ export interface AlignmentListOut {
   // this field (or an older Control Server) falls back to `counts` instead
   // of breaking.
   outstanding_counts?: Record<string, number>;
+}
+
+// --- Interview UX evaluation metrics (Issue #309) ---------------------------
+//
+// These are deterministic System-level aggregates. `status` is deliberately
+// separate from `value`: a measured zero is meaningful, while an unmeasured
+// metric must keep `value=null` and explain why it cannot yet be calculated.
+
+export type InterviewMetricStatus = "measured" | "unmeasured";
+export type InterviewMetricUnit =
+  | "ratio"
+  | "answers_per_update"
+  | "operations_per_inquiry";
+export type InterviewMetricCategory = "user_burden" | "accuracy" | "ux_quality";
+export type InterviewMetricKey =
+  | "answers_per_understanding_update"
+  | "unknown_answer_rate"
+  | "review_abandonment_rate"
+  | "evidence_detail_expansion_rate"
+  | "operations_per_inquiry"
+  | "corrected_confirmed_intent_rate"
+  | "incorrect_answer_confirmation_rate"
+  | "runtime_contradiction_rate"
+  | "understanding_revision_recorrection_rate"
+  | "post_approval_rejection_rate"
+  | "post_approval_rollback_rate"
+  | "post_approval_rejection_or_rollback_rate"
+  | "repeated_question_rate"
+  | "unchanged_item_reconfirmation_rate"
+  | "inquiry_resolution_rate"
+  | "post_inquiry_confirmation_rate"
+  | "implementation_question_transfer_rate";
+
+export interface InterviewMetricOut {
+  key: InterviewMetricKey;
+  category: InterviewMetricCategory;
+  guardrail: boolean;
+  description: string;
+  formula: string;
+  sources: string[];
+  status: InterviewMetricStatus;
+  value: number | null;
+  unit: InterviewMetricUnit;
+  numerator: number | null;
+  denominator: number | null;
+  sample_size: number;
+  unmeasured_reason: string | null;
+}
+
+export interface InterviewMetricsOut {
+  system_id: number;
+  schema_version: "interview-metrics-v1";
+  generated_at: number;
+  sessions_observed: number;
+  events_observed: number;
+  metrics: InterviewMetricOut[];
+}
+
+export type InterviewMetricEventType =
+  | "review_started"
+  | "review_completed"
+  | "review_abandoned"
+  | "evidence_available"
+  | "evidence_expanded"
+  | "unchanged_item_presented"
+  | "unchanged_item_reconfirmed"
+  | "question_presented";
+export type InterviewMetricTargetKind =
+  | "session"
+  | "qa"
+  | "alignment_item"
+  | "inquiry_message";
+
+export interface InterviewMetricEventCreate {
+  schema_version: "interview-metric-event-v1";
+  event_key: string;
+  session_id: number;
+  event_type: InterviewMetricEventType;
+  target_kind: InterviewMetricTargetKind;
+  target_id: number;
+}
+
+export interface InterviewMetricEventOut extends InterviewMetricEventCreate {
+  id: number;
+  system_id: number;
+  recorded_at: number;
 }
 
 // --- Batch answer (PR #296 review fix, Finding 5) ----------------------------
@@ -1143,6 +1319,31 @@ export interface AlignmentReviewQueueOut {
   session_id: number;
   system_id: number;
   items: AlignmentItemOut[];
+}
+
+export interface AlignmentRuleObjectionOut {
+  reason_code: AlignmentReasonCode;
+  policy_version: string;
+  policy_digest: string | null;
+  policy_rule_id: string;
+  objection_count: number;
+  pending_recheck_count: number;
+}
+
+export interface AlignmentRuleObjectionListOut {
+  system_id: number;
+  rules: AlignmentRuleObjectionOut[];
+}
+
+export interface AlignmentRuleRecheckOut {
+  system_id: number;
+  reason_code: AlignmentReasonCode;
+  policy_version: string;
+  policy_digest: string | null;
+  policy_rule_id: string;
+  decision_method: "manual";
+  requested_by_user_id: number;
+  recheck_target_count: number;
 }
 
 // --- Answerable knowledge areas / handoff (Issue #291) ------------------------
@@ -1325,7 +1526,7 @@ export interface InterviewProposalDecisionOut {
   proposal_id: number;
   session_id: number;
   system_id: number;
-  decision: "approved" | "rejected" | "edited";
+  decision: InterviewDecisionAction;
   decision_method: InterviewDecisionMethod;
   actor: string;
   edited_metadata: InterviewProposalMetadataBlock | null;
@@ -1334,22 +1535,24 @@ export interface InterviewProposalDecisionOut {
   decided_at: number;
 }
 
+export interface InterviewApprovedItemOut {
+  proposal_id: number;
+  path: string;
+  qualified_name: string;
+  symbol_id: number | null;
+  metadata: InterviewProposalMetadataBlock;
+  probe_plan: InterviewProposalProbePlan;
+  decision: InterviewDecisionAction;
+  decision_id: number;
+  actor: string;
+  decided_at: number;
+}
+
 export interface InterviewApprovedSetOut {
   session_id: number;
   system_id: number;
   snapshot_id: number;
-  items: {
-    proposal_id: number;
-    path: string;
-    qualified_name: string;
-    symbol_id: number | null;
-    metadata: InterviewProposalMetadataBlock;
-    probe_plan: InterviewProposalProbePlan;
-    decision: "approved" | "edited";
-    decision_id: number;
-    actor: string;
-    decided_at: number;
-  }[];
+  items: InterviewApprovedItemOut[];
   total_proposals: number;
   approved_count: number;
   rejected_count: number;
@@ -1422,8 +1625,11 @@ export interface RuntimeTraceFactsOut {
   duration_p50_ms: number | null;
   duration_p90_ms: number | null;
   duration_p99_ms: number | null;
+  first_observed_at: number | null;
   last_observed_at: number | null;
   has_traces: boolean;
+  observed_environment: string | null;
+  observed_git_sha: string | null;
 }
 
 export interface RuntimeRealityCheckItemOut {
@@ -3595,6 +3801,19 @@ export interface CellOrchestratorKeyPoint {
   type: "orchestrator";
   cell_id: string;
   progress: { by_cell: Record<string, Record<string, number>>; total: Record<string, number> };
+  quality?: Array<{
+    cell_id: string;
+    pass_rate: number | null;
+    audited_count: number | null;
+    intake_status: "accepting" | "suspended" | null;
+    sample_rate: number | null;
+  }>;
+  topology?: Array<{
+    cell_id: string;
+    feature_refs: string[];
+    capability_refs: string[];
+    entrypoint_refs: string[];
+  }>;
   escalations_open_by_severity: Record<string, number>;
   bottleneck_candidates: Array<Record<string, unknown>>;
   binding_stale: boolean;
@@ -3665,6 +3884,7 @@ export interface CellAskOut {
   severity: "sev1" | "sev2" | "sev3";
   status: CellAskStatus;
   decision: string;
+  decision_note?: string;
   decision_method: string;
   decided_by: string | null;
   decided_at: number | null;

@@ -153,10 +153,12 @@ creating incomplete persistence or execution paths for later phases.
     areas + handoff (answerable areas chosen by the user, handoff answers
     never recorded as the original user's answer). Per-issue design notes
     live in `docs/project-intelligence.md`.
-    **#292 (低リスク提案の一括承認) is intentionally NOT implemented**: its
-    start condition — observed usage data and misclassification/undo cases
-    from individual review — is not yet met. Do not implement it until that
-    data exists.
+    **Status: #282 and #283-#291 are implemented, verified, and closed.**
+    **#292 (低リスク提案の一括承認) is intentionally NOT implemented** and was
+    closed as `not_planned`, superseded by #311: its start condition — observed
+    usage data and misclassification/undo cases from individual review — is not
+    yet met. Do not implement it until that data exists; #309 provides the
+    measurement. Remaining work is tracked under Epic #307.
 
 11. Issue #295 — Interview Alignment UX 差分改善: the original UX proposal
     behind #282. Most of it is already covered by #283-#291; the implemented
@@ -171,11 +173,22 @@ creating incomplete persistence or execution paths for later phases.
     deterministic sampling of no-review-required items, evidence shown
     up-front for conflict/high-risk/runtime-mismatch/single-evidence items,
     4-stage progressive disclosure in Inquiry answers, and 「わからない」
-    auto-routing into the existing route-and-investigate flow. Deferred
-    (need their own issues): Inquiry snapshot/revision premise tracking +
-    `superseded`, the §9 evaluation-metrics pipeline, and sample-error
-    driven rule re-evaluation. #292 remains NOT implemented. See the
-    Issue #295 section in `docs/project-intelligence.md`.
+    auto-routing into the existing route-and-investigate flow.
+    **Status: implemented, verified, and closed.** Deferred work now has its
+    own issues under Epic #307: Inquiry snapshot/revision premise tracking +
+    `superseded` (#308), sample-error driven rule re-evaluation (#310), and
+    the §5.5 re-confirmation cascade beyond goal/Intent (#312,
+    **implemented and verified** with an authenticated System-wide canonical
+    head, stable Capability identities, manually editable many-to-many support
+    relations, and relation-scoped carry-over invalidation). #309 is
+    implemented: deterministic System-scoped UX metrics use persisted facts
+    and finite UI events, return unavailable values as `unmeasured`, and keep
+    guardrails separate without changing product behaviour. #313 is implemented: the
+    no-review-required policy is now a schema-validated, fail-closed YAML
+    artifact with version/digest provenance on every new Alignment item. #292 remains NOT
+    implemented (superseded by #311). The Inquiry status set stays at the
+    current 5 values and Intent Brief field names stay as-is — see the
+    Issue #295 section in `docs/project-intelligence.md` for why.
 
 12. Issue #297 — Probe Cell Fabric (sub-issues #298-#304): assign a logical
     Probe Cell to each approved Probe Point / Component (1 probe = 1 logical
@@ -207,6 +220,28 @@ creating incomplete persistence or execution paths for later phases.
     Topology Graph (existing, referenced read-only), Goal/Accountability
     Tree, and Cell Runtime State. See the Issue #297 section in
     `docs/project-intelligence.md`.
+    **Status: #297 and #298-#304 are implemented, verified, and closed.**
+    #314 additionally closes the final operational-proof gap with a 3-Cell
+    end-to-end read-only pilot fixture: one approved Feature/Probe Plan binds
+    three worker Cells, state/domain/root digest reads expose
+    Feature/API/Trace/evidence drill-down, the same Cell ids remain isolated
+    across Systems, and the GET-only pilot is verified not to call an LLM or
+    mutate the target repository, component policy, or Cell persistence.
+
+13. Issue #307 — remaining work after #282 / #295 / #297 closed. Three
+    categories, all as sub-issues: (A) deliberate deferrals already documented
+    — #308 Inquiry premise tracking + `superseded`, #309 the §9 evaluation
+    metrics pipeline (**implemented and verified**), #310 sample-error driven
+    rule re-evaluation, #311 低リスク提案の一括承認 (the measurement
+    mechanism now exists, but implementation remains blocked until a real
+    observation cohort and undo/misclassification cases exist);
+    (B) gaps found during the closing review and not previously documented —
+    #312 the §5.5 cascade beyond goal/Intent (**implemented and verified**),
+    #313 externalizing the
+    no-review-required policy (**implemented and verified**), and #314 the 2〜5 Cell read-only pilot fixture
+    (**implemented and verified with a 3-Cell E2E fixture**); (C) #315
+    contract/test hardening. None of these relax an existing human gate. Do
+    not start #311 before #309 lands.
 
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and

@@ -6,7 +6,7 @@
 // パネルは元の項目の状態を一切変更しない — 解消後は元の入力欄に戻り、
 // ユーザーが明示的に送信するまで自動では回答しない。
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -18,6 +18,7 @@ import {
   useReopenInterviewInquiryDoubt,
   useResolveInterviewInquiry,
   useSendInterviewInquiryMessage,
+  recordInterviewMetricEventBestEffort,
 } from "@/api/hooks";
 import type {
   InquiryRouteCategory,
@@ -210,6 +211,36 @@ function InquiryMessageBubble({ message, sessionId }: { message: InterviewInquir
   const [showReasons, setShowReasons] = useState(preExpand && hasReasons);
   const [showEvidence, setShowEvidence] = useState(preExpand && hasEvidenceSummary);
   const [showAudit, setShowAudit] = useState(false);
+  const evidenceExpandedRecorded = useRef(false);
+  const evidenceMetricsEligible = hasEvidenceSummary && !preExpand;
+
+  useEffect(() => {
+    if (!isAssistant || !evidenceMetricsEligible) return;
+    void recordInterviewMetricEventBestEffort({
+      schema_version: "interview-metric-event-v1",
+      event_key: `evidence_available:inquiry_message:${message.id}`,
+      session_id: sessionId,
+      event_type: "evidence_available",
+      target_kind: "inquiry_message",
+      target_id: message.id,
+    });
+  }, [evidenceMetricsEligible, isAssistant, message.id, sessionId]);
+
+  const toggleEvidence = () => {
+    const nextShow = !showEvidence;
+    setShowEvidence(nextShow);
+    if (nextShow && evidenceMetricsEligible && !evidenceExpandedRecorded.current) {
+      evidenceExpandedRecorded.current = true;
+      void recordInterviewMetricEventBestEffort({
+        schema_version: "interview-metric-event-v1",
+        event_key: `evidence_expanded:inquiry_message:${message.id}`,
+        session_id: sessionId,
+        event_type: "evidence_expanded",
+        target_kind: "inquiry_message",
+        target_id: message.id,
+      });
+    }
+  };
 
   return (
     <div
@@ -275,7 +306,7 @@ function InquiryMessageBubble({ message, sessionId }: { message: InterviewInquir
           <Button
             size="sm"
             variant="outline"
-            onClick={() => setShowEvidence(s => !s)}
+            onClick={toggleEvidence}
             data-testid={`inquiry-show-evidence-${message.id}`}
           >
             {showEvidence ? "根拠を隠す" : "根拠を見る"}

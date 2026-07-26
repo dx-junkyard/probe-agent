@@ -20,6 +20,9 @@ services:
     # Local build output: publish it first when a registry digest is required.
     image: probe-agent/control-server:latest
     container_name: probe-control-server
+    # Issue #315: one container using the Dockerfile's `--workers 1` command
+    # is the supported topology. Do not scale this service while
+    # interview_refresh_job still uses process-local session locks.
     environment:
       PROBE_API_KEY: ${PROBE_API_KEY:-}
       PROBE_DB_PATH: /data/probe.db

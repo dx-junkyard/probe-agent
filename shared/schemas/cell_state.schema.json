@@ -56,7 +56,14 @@
         "queue_oldest_age_seconds": { "type": ["number", "null"], "minimum": 0 },
         "error_rate":           { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
         "latency_p50_ms":       { "type": ["number", "null"], "minimum": 0 },
-        "latency_p95_ms":       { "type": ["number", "null"], "minimum": 0 }
+        "latency_p95_ms":       { "type": ["number", "null"], "minimum": 0 },
+        "evaluation_count":     { "type": ["integer", "null"], "minimum": 0 },
+        "evaluation_pass_rate": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "shadow_result_count":  { "type": ["integer", "null"], "minimum": 0 },
+        "replay_run_count":     { "type": ["integer", "null"], "minimum": 0 },
+        "replay_completed_count": { "type": ["integer", "null"], "minimum": 0 },
+        "experiment_count":     { "type": ["integer", "null"], "minimum": 0 },
+        "experiment_completed_count": { "type": ["integer", "null"], "minimum": 0 }
       },
       "additionalProperties": false
     },

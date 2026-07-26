@@ -3087,6 +3087,117 @@ describe("Interview page", () => {
     });
   });
 
+  test("reconfirmation lets the user bind a rename and confirm shared relations", async () => {
+    const renamedCore = { ...understandingItem("Renamed Core A"), children: ["Shared"] };
+    mockInterviewApi({
+      session: {
+        stage: "proposal_generation",
+        current_understanding: {
+          system_purpose: [understandingItem("Runtime probe platform")],
+          core_capabilities: [renamedCore],
+          capability_elements: [understandingItem("Shared")],
+          supporting_elements: [],
+          api_boundaries: [],
+          probe_flow_candidates: [],
+        },
+        understanding_confirmed_at: 9,
+        understanding_confirmed_by: "admin",
+        capability_graph_confirmed_revision_id: 10,
+        capability_graph_confirmation_required: true,
+      },
+      proposals: [],
+    });
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7/capability-graph") {
+        return Promise.resolve({
+          confirmation_id: 3,
+          system_id: 1,
+          session_id: 7,
+          source_revision_id: 10,
+          source_revision_at: 1,
+          composition_digest: "digest",
+          decided_by: "admin",
+          decided_by_user_id: 1,
+          decision_method: "manual",
+          created_at: 1,
+          nodes: [
+            {
+              entity_id: 7,
+              entity_kind: "core_capability",
+              name: "Core A",
+              summary: "A",
+              semantic_digest: "a",
+              payload: {},
+            },
+            {
+              entity_id: 9,
+              entity_kind: "capability_element",
+              name: "Shared",
+              summary: "shared",
+              semantic_digest: "s",
+              payload: {},
+            },
+          ],
+          relations: [{
+            relation_id: 44,
+            supported_entity_id: 7,
+            supporting_entity_id: 9,
+            relation_kind: "supports",
+            role: "",
+            scope: "",
+            semantic_digest: "r",
+          }],
+        });
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+    mockApi.post.mockResolvedValue(interviewSession({
+      capability_graph_confirmation_required: false,
+    }));
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(await screen.findByTestId("confirm-understanding"));
+    expect(await screen.findByTestId("capability-confirm-dialog")).toBeInTheDocument();
+    fireEvent.change(
+      screen.getByTestId("capability-identity-core_capability-Renamed Core A"),
+      { target: { value: "7" } },
+    );
+    fireEvent.click(screen.getByTestId("confirm-capability-composition"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/7/confirm-understanding",
+        {
+          actor: "admin",
+          capability_base_confirmation_id: 3,
+          capability_identity_bindings: [{
+            entity_kind: "core_capability",
+            current_name: "Renamed Core A",
+            entity_id: 7,
+          }],
+          capability_relations: [{
+            supported_kind: "core_capability",
+            supported_name: "Renamed Core A",
+            supporting_kind: "capability_element",
+            supporting_name: "Shared",
+          }],
+        },
+      );
+    });
+  });
+
   test("answering a gap question passes it to the server for consumption (Issue #123)", async () => {
     mockInterviewApi({
       session: {

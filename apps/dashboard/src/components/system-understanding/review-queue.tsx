@@ -69,7 +69,7 @@
 //   す action card の数と一致させる。古い Control Server(未対応)では従
 //   来どおり counts にフォールバックする。
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { AlertCircle, Sparkles } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -87,12 +87,16 @@ import {
   useBuildAlignment,
   useCorrectAlignmentItem,
   useHoldAlignmentItem,
+  useAlignmentRuleObjections,
+  useRequestAlignmentRuleRecheck,
   useReviewQueue,
+  recordInterviewMetricEventBestEffort,
 } from "@/api/hooks";
 import type {
   AlignmentConfidence,
   AlignmentDecisionAction,
   AlignmentItemOut,
+  AlignmentRuleObjectionOut,
   AlignmentReviewCategory,
   AlignmentRiskFlag,
   AlignmentState,
@@ -140,6 +144,24 @@ const DECISION_LABELS: Record<AlignmentDecisionAction, string> = {
   needs_change: "変更が必要",
   reject_interpretation: "AIの解釈を採用しない",
 };
+
+const RULE_LABELS: Record<string, string> = {
+  security_related: "セキュリティ関連",
+  high_risk: "影響大",
+  core_intent: "目標に関わる",
+  conflict_detected: "矛盾検出",
+  low_confidence: "確信度不足",
+  runtime_mismatch: "実行時の不一致",
+  routine_update: "通常更新",
+  no_change: "差分なし",
+  informational_only: "参考情報のみ",
+  core_capability_changed: "Core Capability構成変更",
+  unchanged_since_confirmation: "前回確認から変更なし",
+};
+
+function ruleLabel(reasonCode: string): string {
+  return RULE_LABELS[reasonCode] ?? "分類ルール";
+}
 
 // Finding 4: full label set for a persisted user_decision.action (the answer
 // actions above plus /correct と /hold が記録する corrected / held)。監査詳細
@@ -204,14 +226,45 @@ function shouldExpandEvidenceByDefault(item: AlignmentItemOut): boolean {
 }
 
 function EvidenceList({ item }: { item: AlignmentItemOut }) {
-  const [open, setOpen] = useState(() => shouldExpandEvidenceByDefault(item));
+  const [startsExpanded] = useState(() => shouldExpandEvidenceByDefault(item));
+  const [open, setOpen] = useState(startsExpanded);
+  const expandedRecorded = useRef(false);
+
+  useEffect(() => {
+    if (item.current_evidence.length === 0 || startsExpanded) return;
+    void recordInterviewMetricEventBestEffort({
+      schema_version: "interview-metric-event-v1",
+      event_key: `evidence_available:alignment_item:${item.id}`,
+      session_id: item.session_id,
+      event_type: "evidence_available",
+      target_kind: "alignment_item",
+      target_id: item.id,
+    });
+  }, [item.current_evidence.length, item.id, item.session_id, startsExpanded]);
+
+  const toggleOpen = () => {
+    const nextOpen = !open;
+    setOpen(nextOpen);
+    if (nextOpen && !startsExpanded && !expandedRecorded.current) {
+      expandedRecorded.current = true;
+      void recordInterviewMetricEventBestEffort({
+        schema_version: "interview-metric-event-v1",
+        event_key: `evidence_expanded:alignment_item:${item.id}`,
+        session_id: item.session_id,
+        event_type: "evidence_expanded",
+        target_kind: "alignment_item",
+        target_id: item.id,
+      });
+    }
+  };
+
   if (item.current_evidence.length === 0) return null;
   return (
     <div>
       <button
         type="button"
         className="text-xs text-primary underline underline-offset-2"
-        onClick={() => setOpen(o => !o)}
+        onClick={toggleOpen}
         aria-expanded={open}
         data-testid={`review-item-evidence-toggle-${item.id}`}
       >
@@ -278,6 +331,10 @@ function AuditDetail({ item }: { item: AlignmentItemOut }) {
       </p>
       <p><span className="font-semibold">更新日時:</span> {formatTimestamp(item.updated_at)}</p>
       <p><span className="font-semibold">分析実行:</span> #{item.intelligence_run_id}</p>
+      <p data-testid={`review-item-policy-${item.id}`}>
+        <span className="font-semibold">分類ポリシー:</span> {item.policy_version}
+        {item.policy_digest ? ` (${item.policy_digest.slice(0, 12)})` : ""}
+      </p>
       {item.carried_over_from != null && (
         <p data-testid={`review-item-carried-over-${item.id}`}>
           <span className="font-semibold">引き継ぎ元:</span> #{item.carried_over_from}
@@ -436,6 +493,27 @@ function ReviewQueueItemCard({
       </div>
 
       <EvidenceList item={item} />
+
+      {(item.capability_dependencies?.length ?? 0) > 0 && (
+        <div
+          className="rounded border bg-muted/30 p-2 text-[11px]"
+          data-testid={`review-item-capability-scope-${item.id}`}
+        >
+          <p className="font-semibold">この確認に含まれる Capability 構成</p>
+          <ul className="mt-1 list-disc space-y-0.5 pl-4">
+            {item.capability_dependencies?.map((dependency, index) => (
+              <li key={`${dependency.target_kind}:${dependency.entity_id ?? dependency.relation_id}:${index}`}>
+                {dependency.target_kind === "entity"
+                  ? `${dependency.entity_name ?? "名称不明"} (entity #${dependency.entity_id})`
+                  : `${dependency.supported_entity_name ?? "名称不明"} → ${dependency.supporting_entity_name ?? "名称不明"} (relation #${dependency.relation_id})`}
+              </li>
+            ))}
+          </ul>
+          <p className="mt-1 text-muted-foreground">
+            「現状を受け入れる」は、この依存範囲も含めた確認として記録されます。
+          </p>
+        </div>
+      )}
 
       {inquiryMode ? (
         <InquiryPanel
@@ -633,6 +711,7 @@ function InformationalItemRow({
   // 監査情報まで展開されると確認疲れを招くため、非サンプル行と同じ既定閉
   // にする。展開はトグルで常に可能。
   const [open, setOpen] = useState(false);
+  const expandedRecorded = useRef(false);
   const [inquiryMode, setInquiryMode] = useState(false);
   const [hasHeldInquiry, setHasHeldInquiry] = useState(false);
   const [attachedInquiryId, setAttachedInquiryId] = useState<number | null>(null);
@@ -641,6 +720,46 @@ function InformationalItemRow({
     ? attachedInquiryId
     : (existingInquiry?.status === "held" ? existingInquiry.id : null);
   const reopenableInquiryId = existingInquiry?.status === "open" ? existingInquiry.id : null;
+
+  useEffect(() => {
+    if (item.review_category !== "unchanged") return;
+    void recordInterviewMetricEventBestEffort({
+      schema_version: "interview-metric-event-v1",
+      event_key: `unchanged_item_presented:alignment_item:${item.id}`,
+      session_id: sessionId,
+      event_type: "unchanged_item_presented",
+      target_kind: "alignment_item",
+      target_id: item.id,
+    });
+  }, [item.id, item.review_category, sessionId]);
+
+  useEffect(() => {
+    if (item.current_evidence.length === 0) return;
+    void recordInterviewMetricEventBestEffort({
+      schema_version: "interview-metric-event-v1",
+      event_key: `evidence_available:alignment_item:${item.id}`,
+      session_id: sessionId,
+      event_type: "evidence_available",
+      target_kind: "alignment_item",
+      target_id: item.id,
+    });
+  }, [item.current_evidence.length, item.id, sessionId]);
+
+  const toggleDetail = () => {
+    const nextOpen = !open;
+    setOpen(nextOpen);
+    if (nextOpen && item.current_evidence.length > 0 && !expandedRecorded.current) {
+      expandedRecorded.current = true;
+      void recordInterviewMetricEventBestEffort({
+        schema_version: "interview-metric-event-v1",
+        event_key: `evidence_expanded:alignment_item:${item.id}`,
+        session_id: sessionId,
+        event_type: "evidence_expanded",
+        target_kind: "alignment_item",
+        target_id: item.id,
+      });
+    }
+  };
 
   return (
     <div className="rounded-md border p-2 text-xs space-y-1" data-testid={`review-item-informational-${item.id}`}>
@@ -662,7 +781,7 @@ function InformationalItemRow({
       <button
         type="button"
         className="text-xs text-primary underline underline-offset-2"
-        onClick={() => setOpen(o => !o)}
+        onClick={toggleDetail}
         aria-expanded={open}
         data-testid={`review-item-informational-detail-toggle-${item.id}`}
       >
@@ -707,6 +826,8 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
   const build = useBuildAlignment(sessionId);
   const batchAnswer = useAnswerAlignmentItemsBatch(sessionId);
   const activeInquiries = useActiveInquiriesByOrigin(sessionId);
+  const { data: ruleObjections } = useAlignmentRuleObjections();
+  const requestRecheck = useRequestAlignmentRuleRecheck(sessionId);
   const [showInformational, setShowInformational] = useState(false);
   const [showSuperseded, setShowSuperseded] = useState(false);
   const [bulkMode, setBulkMode] = useState(false);
@@ -724,6 +845,13 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
       onSuccess: result => {
         toast.success(`${result.items.length} 件の突き合わせ結果を更新しました`);
       },
+      onError: e => toast.error(String(e)),
+    });
+  };
+
+  const handleRequestRecheck = (rule: AlignmentRuleObjectionOut) => {
+    requestRecheck.mutate(rule, {
+      onSuccess: result => toast.success(`${result.recheck_target_count}件を再確認対象に戻しました`),
       onError: e => toast.error(String(e)),
     });
   };
@@ -962,6 +1090,35 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
                 existingInquiry={activeInquiries.get(`review_item:${item.id}`)}
                 sample
               />
+            ))}
+          </div>
+        )}
+
+        {(ruleObjections?.rules.length ?? 0) > 0 && (
+          <div className="space-y-2 pt-2 border-t" data-testid="review-queue-rule-objections">
+            <p className="text-xs font-semibold text-muted-foreground">
+              サンプル確認で異議が出た分類ルール
+            </p>
+            {ruleObjections?.rules.map(rule => (
+              <div
+                key={`${rule.reason_code}:${rule.policy_version}:${rule.policy_digest ?? "legacy"}:${rule.policy_rule_id}`}
+                className="flex flex-wrap items-center justify-between gap-2 rounded-md border p-2 text-xs"
+              >
+                <span>
+                  {ruleLabel(rule.reason_code)}: 異議 {rule.objection_count}件
+                  {rule.pending_recheck_count > 0 && ` / 再確認中 ${rule.pending_recheck_count}件`}
+                  {` / ${rule.policy_rule_id} (${rule.policy_version})`}
+                </span>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={requestRecheck.isPending}
+                  onClick={() => handleRequestRecheck(rule)}
+                  data-testid={`review-queue-rule-recheck-${rule.policy_rule_id}`}
+                >
+                  同じ分類の項目を再確認する
+                </Button>
+              </div>
             ))}
           </div>
         )}

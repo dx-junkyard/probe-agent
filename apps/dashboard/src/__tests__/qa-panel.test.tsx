@@ -62,6 +62,7 @@ function makeQa(overrides: Partial<InterviewQaOut> & { id: number }): InterviewQ
     evidence_refs: [],
     runtime_evidence: null,
     answer_text: null,
+    answer_unknown: null,
     status: "open",
     answered_by: null,
     superseded_by_id: null,
@@ -121,6 +122,28 @@ function mockQaList(items: InterviewQaOut[]) {
 }
 
 describe("QaPanel out-of-area grouping (Issue #291)", () => {
+  test("records each rendered QA as presented with a deterministic idempotency key", async () => {
+    mockQaList([makeQa({ id: 77, route_category: "system_researchable" })]);
+    mockApi.post.mockResolvedValue({});
+
+    await renderQaPanel({ sessionId: 1, actor: "dev", approvedCount: 1, answerableAreas: [] });
+    await screen.findByTestId("qa-item-77");
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/metric-events",
+        {
+          schema_version: "interview-metric-event-v1",
+          event_key: "question_presented:qa:77",
+          session_id: 1,
+          event_type: "question_presented",
+          target_kind: "qa",
+          target_id: 77,
+        },
+      );
+    });
+  });
+
   test("empty answerableAreas: no out-of-area group, all items shown normally", async () => {
     mockQaList([
       makeQa({ id: 1, knowledge_area: "security" }),
@@ -364,7 +387,10 @@ describe("QaPanel route-and-investigate wiring (Issue #286 review fix, Finding 1
     const textarea = await screen.findByPlaceholderText("回答を入力");
     expect((textarea as HTMLTextAreaElement).value).toBe("認証はJWTで行われます");
     // Transcribing only fills the draft -- it never itself submits an answer.
-    expect(mockApi.post).not.toHaveBeenCalled();
+    // The page may have emitted the best-effort question_presented metric.
+    expect(mockApi.post).not.toHaveBeenCalledWith(
+      "/interview/sessions/1/qa/1/answer", expect.anything(),
+    );
   });
 
   test("unresolved investigation shows a muted note instead of a conclusion", async () => {

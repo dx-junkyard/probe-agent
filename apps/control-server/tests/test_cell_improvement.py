@@ -188,7 +188,7 @@ def _insert_replay_run(system_id, snapshot_id, component_id="comp-1"):
             "created_at": now,
         },
     )
-    return _insert_row(
+    replay_run_id = _insert_row(
         system_id,
         "replay_runs",
         {
@@ -205,11 +205,24 @@ def _insert_replay_run(system_id, snapshot_id, component_id="comp-1"):
             "created_at": now,
         },
     )
+    _insert_row(
+        system_id,
+        "replay_case_results",
+        {
+            "system_id": system_id,
+            "replay_run_id": replay_run_id,
+            "trace_id": f"canary-{replay_run_id}",
+            "position": 0,
+            "case_status": "match",
+            "created_at": now,
+        },
+    )
+    return replay_run_id
 
 
 def _insert_experiment(system_id, snapshot_id, feature_id="feat-1", status="completed"):
     now = time.time()
-    return _insert_row(
+    experiment_id = _insert_row(
         system_id,
         "experiments",
         {
@@ -221,9 +234,25 @@ def _insert_experiment(system_id, snapshot_id, feature_id="feat-1", status="comp
             "config_revision": "1",
             "execution_config": "{}",
             "status": status,
+            "human_decision": "adopted" if status == "completed" else "undecided",
+            "human_decision_variant_key": "variant-1" if status == "completed" else None,
             "created_at": now,
         },
     )
+    if status == "completed":
+        _insert_row(
+            system_id,
+            "experiment_variants",
+            {
+                "experiment_id": experiment_id,
+                "variant_key": "variant-1",
+                "label": "candidate",
+                "is_baseline": 0,
+                "patch_hash": f"hash-{experiment_id}",
+                "status": "completed",
+            },
+        )
+    return experiment_id
 
 
 def _insert_evaluation_result(system_id, trace_id="t1", component_id="comp-1"):
@@ -512,7 +541,9 @@ class TestStateMachine:
         headers = _headers(token, system["id"])
         cell_id = _create_cell(admin_client, headers)
         snapshot_id = _insert_snapshot(system["id"])
-        experiment_id = _insert_experiment(system["id"], snapshot_id)
+        experiment_id = _insert_experiment(
+            system["id"], snapshot_id, feature_id=cell_id,
+        )
 
         r = _full_hypothesis_manual(admin_client, headers, cell_id, target_kind="candidate_patch")
         improvement_id = r.json()["id"]
@@ -589,7 +620,9 @@ class TestCanaryGate:
 
         snapshot_id = _insert_snapshot(system["id"])
         replay_run_id = _insert_replay_run(system["id"], snapshot_id, component_id=cell_id)
-        experiment_id = _insert_experiment(system["id"], snapshot_id)
+        experiment_id = _insert_experiment(
+            system["id"], snapshot_id, feature_id=cell_id,
+        )
         _post_trace(admin_client, headers, trace_id="t1", component_id=cell_id)
         evaluation_id = _insert_evaluation_result(system["id"], trace_id="t1", component_id=cell_id)
 
@@ -608,6 +641,90 @@ class TestCanaryGate:
             f"replay_run:{replay_run_id}", f"experiment:{experiment_id}", f"evaluation:{evaluation_id}",
         }
 
+    def test_canary_ready_rejects_unsuccessful_or_unrelated_results(self, admin_client):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "Canary-ResultQuality")
+        headers = _headers(token, system["id"])
+        cell_id = _create_cell(admin_client, headers)
+        improvement_id = self._proposed(admin_client, headers, cell_id)
+        snapshot_id = _insert_snapshot(system["id"])
+
+        replay_run_id = _insert_replay_run(
+            system["id"], snapshot_id, component_id=cell_id,
+        )
+        experiment_id = _insert_experiment(
+            system["id"], snapshot_id, feature_id=cell_id,
+        )
+        evaluation_id = _insert_evaluation_result(
+            system["id"], component_id=cell_id,
+        )
+
+        from app.db import get_conn
+        with get_conn() as conn:
+            conn.execute(
+                "UPDATE replay_case_results SET case_status = 'mismatch' "
+                "WHERE replay_run_id = ?",
+                (replay_run_id,),
+            )
+            conn.execute(
+                "UPDATE experiments SET human_decision = 'undecided', "
+                "human_decision_variant_key = NULL WHERE id = ?",
+                (experiment_id,),
+            )
+            conn.execute(
+                "UPDATE evaluation_results SET status = 'fail' WHERE id = ?",
+                (evaluation_id,),
+            )
+
+        for evidence_ref in (
+            f"replay_run:{replay_run_id}",
+            f"experiment:{experiment_id}",
+            f"evaluation:{evaluation_id}",
+        ):
+            r = _transition(
+                admin_client, headers, improvement_id, "canary_ready",
+                canary_evidence_refs=[evidence_ref],
+            )
+            assert r.status_code == 422, (evidence_ref, r.text)
+
+        unrelated_evaluation_id = _insert_evaluation_result(
+            system["id"], trace_id="other", component_id="another-cell",
+        )
+        r = _transition(
+            admin_client, headers, improvement_id, "canary_ready",
+            canary_evidence_refs=[f"evaluation:{unrelated_evaluation_id}"],
+        )
+        assert r.status_code == 422, r.text
+        assert "not Cell" in r.json()["detail"]
+
+    def test_stale_canary_result_is_revalidated_before_adoption(self, admin_client):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "Canary-Revalidate")
+        headers = _headers(token, system["id"])
+        cell_id = _create_cell(admin_client, headers)
+        snapshot_id = _insert_snapshot(system["id"])
+        experiment_id = _insert_experiment(
+            system["id"], snapshot_id, feature_id=cell_id,
+        )
+        improvement_id = _advance_to_canary_running(
+            admin_client, headers, cell_id, [f"experiment:{experiment_id}"],
+            target_kind="candidate_patch",
+        )
+        _parent_approve(admin_client, headers, improvement_id)
+        _human_approve(admin_client, headers, improvement_id)
+
+        from app.db import get_conn
+        with get_conn() as conn:
+            conn.execute(
+                "UPDATE experiments SET human_decision = 'rejected', "
+                "human_decision_variant_key = NULL WHERE id = ?",
+                (experiment_id,),
+            )
+
+        r = _transition(admin_client, headers, improvement_id, "adopted")
+        assert r.status_code == 422, r.text
+        assert "human-adopted" in r.json()["detail"]
+
 
 # ---------------------------------------------------------------------------
 # 3. Approvals / adoption
@@ -621,7 +738,9 @@ class TestApprovalsAndAdoption:
         headers = _headers(token, system["id"])
         cell_id = _create_cell(admin_client, headers)
         snapshot_id = _insert_snapshot(system["id"])
-        experiment_id = _insert_experiment(system["id"], snapshot_id)
+        experiment_id = _insert_experiment(
+            system["id"], snapshot_id, feature_id=cell_id,
+        )
         improvement_id = _advance_to_canary_running(
             admin_client, headers, cell_id, [f"experiment:{experiment_id}"],
             target_kind="candidate_patch",
@@ -637,7 +756,9 @@ class TestApprovalsAndAdoption:
         headers = _headers(token, system["id"])
         cell_id = _create_cell(admin_client, headers)
         snapshot_id = _insert_snapshot(system["id"])
-        experiment_id = _insert_experiment(system["id"], snapshot_id)
+        experiment_id = _insert_experiment(
+            system["id"], snapshot_id, feature_id=cell_id,
+        )
         improvement_id = _advance_to_canary_running(
             admin_client, headers, cell_id, [f"experiment:{experiment_id}"],
             target_kind="candidate_patch",
@@ -658,7 +779,9 @@ class TestApprovalsAndAdoption:
         new_card = _create_role_card(admin_client, headers, version="1.1.0")
 
         snapshot_id = _insert_snapshot(system["id"])
-        experiment_id = _insert_experiment(system["id"], snapshot_id)
+        experiment_id = _insert_experiment(
+            system["id"], snapshot_id, feature_id=cell_id,
+        )
         # Pin the proposed version BEFORE approval so the approval covers it
         # (P1-2). Adoption then does not change the proposed content.
         improvement_id = _advance_to_canary_running(
@@ -686,7 +809,9 @@ class TestApprovalsAndAdoption:
         headers = _headers(token, system["id"])
         cell_id = _create_cell(admin_client, headers)
         snapshot_id = _insert_snapshot(system["id"])
-        experiment_id = _insert_experiment(system["id"], snapshot_id)
+        experiment_id = _insert_experiment(
+            system["id"], snapshot_id, feature_id=cell_id,
+        )
         improvement_id = _advance_to_canary_running(
             admin_client, headers, cell_id, [f"experiment:{experiment_id}"],
             target_kind="candidate_patch",
@@ -727,7 +852,9 @@ class TestRubricOwnership:
         assert r.status_code == 200
 
         snapshot_id = _insert_snapshot(system["id"])
-        experiment_id = _insert_experiment(system["id"], snapshot_id)
+        experiment_id = _insert_experiment(
+            system["id"], snapshot_id, feature_id=cell_id,
+        )
         r = _transition(
             admin_client, headers, improvement_id, "canary_ready",
             canary_evidence_refs=[f"experiment:{experiment_id}"],
@@ -759,7 +886,9 @@ class TestRubricOwnership:
         _transition(admin_client, headers, improvement_id, "proposed")
 
         snapshot_id = _insert_snapshot(system["id"])
-        experiment_id = _insert_experiment(system["id"], snapshot_id)
+        experiment_id = _insert_experiment(
+            system["id"], snapshot_id, feature_id=cell_id,
+        )
         r = _transition(
             admin_client, headers, improvement_id, "canary_ready",
             canary_evidence_refs=[f"experiment:{experiment_id}"],
@@ -817,6 +946,43 @@ class TestShadowGates:
         decisions = r.json()["shadow_decisions"]
         proposal_row = next(d for d in decisions if d["id"] == proposal["id"])
         assert proposal_row["status"] == "approved"
+
+    def test_live_shadow_revalidates_replay_result(self, admin_client):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "Shadow-RevalidateReplay")
+        headers = _headers(token, system["id"])
+        cell_id = _create_cell(admin_client, headers)
+        improvement_id = _full_hypothesis_manual(
+            admin_client, headers, cell_id,
+        ).json()["id"]
+        _transition(admin_client, headers, improvement_id, "proposed")
+        snapshot_id = _insert_snapshot(system["id"])
+        replay_run_id = _insert_replay_run(
+            system["id"], snapshot_id, component_id=cell_id,
+        )
+        r = _transition(
+            admin_client, headers, improvement_id, "canary_ready",
+            canary_evidence_refs=[f"replay_run:{replay_run_id}"],
+        )
+        assert r.status_code == 200, r.text
+        proposal = _propose_shadow(
+            admin_client, headers, improvement_id,
+        ).json()
+        assert _decide_shadow(
+            admin_client, headers, proposal["id"], "approved",
+        ).status_code == 200
+
+        from app.db import get_conn
+        with get_conn() as conn:
+            conn.execute(
+                "UPDATE replay_case_results SET case_status = 'mismatch' "
+                "WHERE replay_run_id = ?",
+                (replay_run_id,),
+            )
+
+        r = _request_live_shadow(admin_client, headers, improvement_id)
+        assert r.status_code == 409, r.text
+        assert "successful isolated Replay" in r.json()["detail"]
 
     def test_live_shadow_request_before_proposal_approved_409(self, admin_client):
         token = _login(admin_client)
@@ -1078,7 +1244,9 @@ class TestRollback:
 
         new_card = _create_role_card(admin_client, headers, version="1.1.0")
         snapshot_id = _insert_snapshot(system["id"])
-        experiment_id = _insert_experiment(system["id"], snapshot_id)
+        experiment_id = _insert_experiment(
+            system["id"], snapshot_id, feature_id=cell_id,
+        )
         improvement_id = _advance_to_canary_running(
             admin_client, headers, cell_id, [f"experiment:{experiment_id}"],
             target_kind="role_card", proposed_role_card_version="1.1.0",
@@ -1120,7 +1288,9 @@ class TestRollback:
         headers = _headers(token, system["id"])
         cell_id = _create_cell(admin_client, headers)
         snapshot_id = _insert_snapshot(system["id"])
-        experiment_id = _insert_experiment(system["id"], snapshot_id)
+        experiment_id = _insert_experiment(
+            system["id"], snapshot_id, feature_id=cell_id,
+        )
         improvement_id = _advance_to_canary_running(
             admin_client, headers, cell_id, [f"experiment:{experiment_id}"],
             target_kind="candidate_patch",

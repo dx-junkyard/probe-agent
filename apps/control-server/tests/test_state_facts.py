@@ -1227,7 +1227,13 @@ class TestLoadAiPurposeView:
 
         system_id = _create_system(conn_factory)
         snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
-        run_id = _insert_intelligence_run(conn_factory, system_id, snapshot_id, "system_profile_draft", "completed")
+        run_id = _insert_intelligence_run(
+            conn_factory,
+            system_id,
+            snapshot_id,
+            "repository_drafts",
+            "completed",
+        )
         _insert_draft(conn_factory, system_id, snapshot_id, run_id, name="Draft purpose", purpose="Draft summary.")
 
         with conn_factory() as conn:

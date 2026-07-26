@@ -3933,8 +3933,8 @@ Issue #295 は Interview Alignment UX の元提案であり、その大部分は
   updated_at・intelligence run・carried_over_from/content_hash)を表示。
 - サンプル確認(§5.4 最小版): no_review_required + informational から
   id 昇順で最大3件を決定的に選び、展開済み+「疑問がある」導線付きで
-  提示(全件3件以下ならサンプル節なし)。誤り発見時の分類ルール自動
-  再評価は未実装(残課題)。
+  提示(全件3件以下ならサンプル節なし)。誤り発見時は #310 の明示的な
+  手動再確認へ接続し、分類ルールの自動調整は行わない。
 - 根拠の先出し例外(§4.4): conflict / security・high_risk フラグ /
   runtime_check mismatch・stale / 根拠1件のみ、のとき EvidenceList を
   初期展開する(応答の有限フィールドからの決定的判定のみ)。
@@ -3961,20 +3961,126 @@ Issue #295 は Interview Alignment UX の元提案であり、その大部分は
 
 ### 実装しない・見送った残課題
 
-- **#292(低リスク提案の一括承認)**: 引き続き実装しない(CLAUDE.md
-  参照。開始条件の観測データが未取得)。本節の「まとめて回答」は
+Issue #295 は実装レビュー完了によりクローズ済み。以下の残課題は
+Epic #307 の子 Issue として起票し直した。
+
+- **低リスク提案の一括承認(旧 #292 → #311)**: 引き続き実装しない
+  (開始条件の観測データが未取得。計測手段は #309)。本節の「まとめて回答」は
   ユーザーが1件ずつ選んだ回答の送信バッチ化であり、AI 分類による
   自動承認ではない — `decision_method: manual` は項目単位で維持。
-- **Inquiry の前提追跡(#295 §5.6 拡張)**: Inquiry 行への
+- **Inquiry の前提追跡(#295 §5.6 拡張 → #308)**: Inquiry 行への
   snapshot/revision 参照列・`superseded` 状態・前提変化時の再確認復帰
   は未実装。DB migration を含む独立した issue として設計すべき規模。
-- **評価指標(#295 §9)**: 疑問解消率・誤った回答確定率などの計測基盤
-  は未実装。指標定義が UI 実装の安定後に確定するため見送り。
-- **サンプル誤り発見時の分類ルール再評価(§5.4 後半)**: 疑問導線まで。
-- **提案 §7 のフィールド名との差異**: 既存実装のフィールド名
+- **評価指標(#295 §9 → #309)**: 集計基盤と接続済み収集点は実装済み。
+  既存の永続データと有限な UI 計測イベントだけから System 単位に集計し、
+  算出不能な指標は 0 や推定値ではなく `unmeasured` として返す。途中離脱と
+  unchanged 再確認の収集意味は下記のとおり仕様判断を残す。
+- **サンプル誤り発見時の分類ルール再評価(§5.4 後半 → #310)**: 完了。
+  `no_review_required` の決定的サンプル（確認不要/参考情報の id 昇順先頭3件、
+  全体4件以上）から既存 Inquiry を開くと、対象 `alignment_item` の
+  `policy_rule_id` / policy version / policy digest / `reason_code` を
+  `alignment_rule_objection` に不変の監査事実として記録する。System 単位の
+  API はこの正確なルール来歴ごとに異議数を決定的に集計し、人間が選択した
+  同じルール版の現行 `no_review_required` 項目だけを再確認対象へ戻せる。
+  対象は session と物理 item ごとに分離し、同一 content hash でも潰さない。
+  再確認化は決定的分類を変更せず、実行者と `decision_method: manual` を保存し、
+  通常の手動回答/修正だけが現行対象を解消する。rebuild で内容が変わった旧対象は
+  監査行を `superseded` として残し、現行の pending 件数には含めない。
+- **再確認カスケードの範囲(§5.5 → #312)**: 完了。既存の goal / 確定済み
+  Intent ガードに加え、reasoning model の `current_understanding` を提案、
+  `confirm-understanding` を人間による正準構成の確定として分離した。
+  Core Capability / Capability Element / Supporting Element / API Boundary は
+  表示名と独立した System-scoped の安定 entity id を持ち、rename は人間が
+  明示 binding した場合だけ同一 identity を引き継ぐ。支援関係も安定 relation
+  id の多対多グラフなので、同じ下位機能を複数 Core Capability が共有できる。
+  確定履歴は System-wide の canonical head と `base_confirmation_id` で直列化し、
+  確定requestは表示時のhead idをoptimistic lockとして照合するため、
+  同時更新後の古い構成を上書きしない。
+  別 Interview session でも同名 identity を継承する。古い head に紐づく
+  session は新しい Understanding revision を確定するまで Alignment build を
+  409 で拒否する。確定APIはログインユーザー専用で、Principal の user id/名前を
+  保存し、graph・session stage・監査messageを単一transactionで確定する。
+  Dashboard の再確定dialogでは rename binding と採用する多対多relationを
+  人間が確認・編集できる。
+  Alignment item は、生成時に提示された現行の確定グラフに存在する entity /
+  relation id だけを依存先として受理し、`accept_current` の監査範囲と一緒に
+  sidecar tableへ保存し、Review Queueにも名称付きで表示する。次回 build は
+  `base_content_hash` が同じ候補について確定
+  グラフ間の依存 digest を決定的に比較し、変更関係を参照する項目だけを
+  `must_review` / `reason_code='core_capability_changed'` へ戻す。共有機能の
+  非変更側relation、明示 binding 済みの純粋rename、無関係な追加は
+  `unchanged` carry-overを維持する。この有限分類は
+  `alignment-review-policy-v2` の `core-capability-changed` ruleとして監査する。
+  旧DBの既存 `content_hash` は推測なしで `base_content_hash` にcopyする一方、
+  名前からidentity/依存関係は推測backfillせず、最初の人間確定後から正準履歴を
+  開始する。
+- **no_review_required ポリシーの外部化(§7.3 → #313)**: 完了。
+  `app/policies/alignment_review.yaml` に、有限条件だけを受け付ける
+  first-match ポリシーとして切り出した。読み込み時に schema version、全
+  reason template、許可済み有限値、重複キー、全入力組合せの終端到達を検証し、
+  不正・欠損時は既定値へフォールバックせず fail-closed で起動を拒否する。
+  各 `alignment_item` には policy version と YAML 本文の SHA-256 を保存し、
+  policy 変更は content hash を変えて `unchanged` carry-over を安全側に無効化する。
+- **提案 §7 のフィールド名・status 集合との差異**: 既存実装のフィールド名
   (`non_goals`、`status` 等)を維持し、#295 記載の名称
   (`out_of_scope`、`confirmation_state` 等)への改名は行わない
-  (スキーマ契約の互換性優先)。
+  (スキーマ契約の互換性優先)。同様に Inquiry status は現行の 5 値
+  (`open` / `resolved` / `unresolved` / `cancelled` / `held`)を維持する。
+  #295 §7.5 の `investigating` / `answered` / `insufficient_evidence` は
+  メッセージ内容と固定テンプレートで同等の区別を実現しており機能差がない。
+  `superseded` のみ機能追加を伴うため #308 で扱う。
+
+### Alignment / Inquiry UX 評価指標パイプライン(Issue #309)
+
+UX 改善の効果を、LLM の解釈や外部分析基盤を使わず、選択中の
+System に属する永続データだけから監査できるようにした。
+
+- **API 契約**:
+  - `GET /interview/metrics` は固定 schema
+    `interview-metrics-v1` でユーザー負担・精度・UX 品質の指標を返す。
+    各指標は `description` / `formula` / `sources`、分子・分母、
+    `measured|unmeasured` を持つ。分母 0、因果 lineage 不足、未収集は
+    `value: null` と固定理由を返し、計測済みの 0 と区別する。
+  - `POST /interview/metric-events` は
+    `interview-metric-event-v1` の有限 event/target 組だけを受け付ける。
+    対象 session・QA・Alignment item・Inquiry message の System 所有権を
+    検証する。`event_key` は転送再送キーとして扱い、さらに
+    system/session/event/target の意味的同一性で別キーの重複も冪等化する。
+    展開・完了・離脱・再確認は対応する提示/開始イベントが先に存在しなければ
+    409 で拒否する。自由文や画面内容は保存せず、外部サービスにも送信しない。
+- **additive persistence**:
+  - `interview_metric_event` は根拠詳細の提示・展開、質問提示など、
+    domain table から復元できない UI 事実だけを append-only で保持する。
+  - `interview_qa.answer_unknown` は回答操作時の「わからない」を nullable
+    で保持する。既存 `answered` / `unconfirmed` は決定的に backfill するが、
+    旧 `revised` 行は元状態を復元できないため NULL のまま分母から除外する。
+- **決定的に算出する指標**:
+  明示記録 cohort の「わからない」率、確認済み Intent の後日修正率、
+  non-mock・non-superseded な Runtime contradiction 率、承認後却下率、
+  同一 session 内の同一質問文再出現率、Inquiry 解消率、解消後に元項目へ
+  明示回答した割合を既存行から算出する。根拠展開率・途中離脱率・変更なし
+  項目再確認率・実装質問転嫁率は、対応する有限イベントが実際に記録された
+  cohort に限って算出する。
+- **推定しない指標**:
+  回答 ID と Understanding Revision の対応がない
+  「理解更新 1 回あたり回答数」、全 UI 操作を覆えない
+  「Inquiry 1 件あたり追加操作数」、意味的な誤回答確定率、
+  field-level lineage がない Revision 再修正率、未実装の rollback、
+  却下と rollback の合成率は常に `unmeasured` とする。
+- **仕様判断を残す収集点**:
+  `review_started/completed/abandoned` と `unchanged_item_reconfirmed` は有限
+  schema と fail-closed な前提関係まで定義したが、Dashboard の本番 writer は
+  未接続。画面遷移・tab close・一定時間無操作のどれを「途中離脱」とするか、
+  対応不要行に独立した「再確認」操作を追加するかは UX の意味を変えるため
+  自動推定しない。決定するまでは該当 cohort を `unmeasured` のまま扱う。
+- **Dashboard**:
+  Interview 画面に System 集計パネルを追加し、guardrail
+  (疑問解消率、誤回答確定率、実装質問転嫁率)を他の指標から分離する。
+  未計測は理由付きで表示し、計測済み 0 と同じ表示にしない。
+- **安全性**:
+  指標は表示と監査にだけ使い、分類ルール、自動承認、publish、policy
+  変更を起動しない。全 query・event target 検証に `system_id` を含め、
+  System 間の分離を回帰テストで固定する。
 
 ### PR #296 レビュー対応(#295 実装の修正)
 
@@ -4026,9 +4132,10 @@ Issue #295 は Interview Alignment UX の元提案であり、その大部分は
    ケースを項目単位で検知する。加えて goal 専用だった再ビルドガードを
    **確定済み(confirmed/not_applicable)Intent フィールドのいずれかが
    直前ビルド以降に更新された場合**へ一般化(全項目を再分類)。
-   Core Capability は per-capability の確定タイムスタンプ列が存在せず
-   決定的判定源が無いため今回は対象外(ヒューリスティック差分は
-   Principle 6 で禁止のため実装しない)。
+   当時は Core Capability に per-capability の確定履歴が無かったため対象外
+   とした。後続 #312 で、安定entity id・人間確定composition・多対多support
+   relation・Alignment依存参照を追加し、ヒューリスティックを使わない限定
+   カスケードを実装した。
 2. **回答対象の検証強化(指摘2, P1)**: batch の項目検証に
    `superseded=1` 拒否・回答可能 status(open/held)以外の拒否・
    actionable category(must_review/batch_reviewable)以外の拒否・
@@ -4298,8 +4405,17 @@ API/Flow 単位のオーケストレーターが状態を集約し、Root Orches
 - quality floor 割れ: 対象 Cell のみ `cell_intake_states` を
   `suspended` にし sev1 escalation を発行。host app や無関係 Cell は
   止めない。回復は floor 回復の決定的判定+明示操作。
-- sampling / audit / model cost に System-scoped 上限
-  (`resource_limits` の既存機構と同型の日次上限)。
+- sampling / audit に System-scoped 上限を持つ。`daily_audit_budget` の単位は
+  **UTC日ごとの監査呼び出し回数**で、許可された `run_audit` 1回につき
+  verdict や任意の説明 LLM 呼び出し有無にかかわらず1消費する。token 数や
+  通貨金額ではない。説明 LLM を実際に呼ぶ場合は、これとは別に
+  `CONTROL_LLM_DAILY_EXECUTION_LIMIT` の実行回数上限も適用される。
+- 現行プロダクトは billing/原価配賦をスコープに持たず、provider 横断で
+  token usage と時点別価格表を正規化する台帳もない。そのため Issue #315
+  時点では金額ベースの追跡を追加せず、別 Issue も起票しない。請求額表示、
+  chargeback、または通貨建て hard limit がプロダクト要件になった時点で、
+  provider usage の永続化・価格 version/provenance・currency・rounding・
+  retry/cache の課金規則を独立 Issue として設計する。
 
 ### Sub 7: 改善仮説・カナリア・承認ゲート(Issue #304)
 
@@ -4330,3 +4446,24 @@ API/Flow 単位のオーケストレーターが状態を集約し、Root Orches
 - reasoning model だけによる承認・採用・publish
 - live shadow・source 変更・外部副作用の無承認実行
 - #282 Interview / #242 Replay 基盤の別系統再実装
+
+### 2〜5 Cell read-only pilot の end-to-end 実証(Issue #314)
+
+Issue #297 と sub-issue #298-#304 の実装レビュー後に残った運用上の実証を、
+`tests/test_cell_read_only_pilot.py` の 3-Cell 統合 fixture で完了した。
+
+- 1 つの承認済み Probe Plan / Feature に属する 3 件の Probe Point から、
+  versioned Cell Binding を API 経由で作成する。
+- 3 Cell すべてを `GET /cell-fabric/cells/{id}/state` で読み出し、領域
+  orchestrator digest と Root digest が同じ roster と
+  `feature_refs` / `capability_refs` / `entrypoint_refs` を集約する。
+- binding の参照先が実在する Feature / API entrypoint に解決し、
+  component trace API と Root digest の task evidence
+  (`trace:<id>`)まで drill-down できることを確認する。
+- read-only pilot 実行前後で、対象 repository の全ファイル hash と
+  component policy を含む保護対象 DB 行が完全一致することを確認する。
+  `create_llm_client` は呼ばれた時点でテストを失敗させ、
+  `intelligence_runs` に新規行が増えないことも同じ DB snapshot で保証する。
+- 同一 Cell ID / roster を持つ別 System を positive-collision fixture
+  とし、binding / trace / topology / task evidence が一切漏れないことを
+  end-to-end で確認する。

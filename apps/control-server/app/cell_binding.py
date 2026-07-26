@@ -342,12 +342,12 @@ def build_cell_health(
     component_id: str,
     window_seconds: float = 3600.0,
 ) -> cell_fabric.CellHealth:
-    """Deterministic aggregation from ``traces`` (heartbeat / queue / error
-    rate / latency percentiles) and ``cell_activations`` (last activation)
-    ONLY. Every stat that depends on at least one observed row is ``None``
-    when there is nothing to observe -- ``queue_length`` is the one
-    exception: it is a plain count of traces in the window, so it is a real
-    fact (``0``) rather than an absent one even when the window is empty.
+    """Build deterministic health facts from every Cell runtime source.
+
+    Trace rows provide heartbeat/error/latency throughput facts. The actual
+    queue is the Cell's pending Goal/Task ledger work, not trace volume.
+    Evaluation, shadow, Replay and Experiment counts are scoped to the same
+    observation window and never guessed when their denominator is empty.
     """
     now = time.time()
     window_start = now - window_seconds
@@ -371,28 +371,93 @@ def build_cell_health(
         ).fetchone()
         last_activation_at = activation_row["latest"] if activation_row else None
 
-    window_rows = conn.execute(
+    trace_rows = conn.execute(
         """SELECT error, duration_ms, timestamp FROM traces
            WHERE system_id = ? AND component_id = ? AND timestamp >= ?
            ORDER BY timestamp ASC""",
         (system_id, component_id, window_start),
     ).fetchall()
 
-    queue_length = len(window_rows)
-    if queue_length == 0:
+    if cell_row is None:
+        queue_length = None
         queue_oldest_age_seconds = None
+    else:
+        queue_row = conn.execute(
+            """SELECT COUNT(*) AS n, MIN(created_at) AS oldest
+               FROM cell_tasks
+               WHERE system_id = ? AND owner_cell_id = ?
+                 AND status IN ('todo', 'blocked')""",
+            (system_id, cell_row["id"]),
+        ).fetchone()
+        queue_length = queue_row["n"]
+        queue_oldest_age_seconds = (
+            now - queue_row["oldest"] if queue_row["oldest"] is not None else None
+        )
+
+    trace_count = len(trace_rows)
+    if trace_count == 0:
         error_rate = None
         latency_p50_ms = None
         latency_p95_ms = None
     else:
-        queue_oldest_age_seconds = now - window_rows[0]["timestamp"]
-        error_count = sum(1 for r in window_rows if r["error"])
-        error_rate = error_count / queue_length
+        error_count = sum(1 for r in trace_rows if r["error"])
+        error_rate = error_count / trace_count
         durations = sorted(
-            r["duration_ms"] for r in window_rows if r["duration_ms"] is not None
+            r["duration_ms"] for r in trace_rows if r["duration_ms"] is not None
         )
         latency_p50_ms = _percentile(durations, 0.50)
         latency_p95_ms = _percentile(durations, 0.95)
+
+    evaluation_row = conn.execute(
+        """SELECT COUNT(*) AS n,
+                  SUM(CASE WHEN status = 'pass' THEN 1 ELSE 0 END) AS passed
+           FROM evaluation_results
+           WHERE system_id = ? AND component_id = ? AND created_at >= ?""",
+        (system_id, component_id, window_start),
+    ).fetchone()
+    evaluation_count = evaluation_row["n"]
+    evaluation_pass_rate = (
+        evaluation_row["passed"] / evaluation_count if evaluation_count else None
+    )
+
+    shadow_result_count = conn.execute(
+        """SELECT COUNT(*) AS n FROM shadow_results
+           WHERE system_id = ? AND component_id = ? AND timestamp >= ?""",
+        (system_id, component_id, window_start),
+    ).fetchone()["n"]
+
+    replay_row = conn.execute(
+        """SELECT COUNT(*) AS n,
+                  SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed
+           FROM replay_runs
+           WHERE system_id = ? AND component_id = ? AND created_at >= ?""",
+        (system_id, component_id, window_start),
+    ).fetchone()
+    replay_run_count = replay_row["n"]
+    replay_completed_count = replay_row["completed"] or 0
+
+    feature_refs = {component_id}
+    if cell_row is not None:
+        binding = conn.execute(
+            """SELECT feature_refs_json FROM cell_bindings
+               WHERE system_id = ? AND cell_definition_id = ?
+                 AND status != 'superseded'
+               ORDER BY version DESC LIMIT 1""",
+            (system_id, cell_row["id"]),
+        ).fetchone()
+        if binding is not None:
+            feature_refs.update(json.loads(binding["feature_refs_json"] or "[]"))
+    placeholders = ",".join("?" for _ in feature_refs)
+    experiment_row = conn.execute(
+        f"""SELECT COUNT(*) AS n,
+                   SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed
+            FROM experiments
+            WHERE system_id = ? AND created_at >= ?
+              AND feature_id IN ({placeholders})""",
+        (system_id, window_start, *sorted(feature_refs)),
+    ).fetchone()
+    experiment_count = experiment_row["n"]
+    experiment_completed_count = experiment_row["completed"] or 0
 
     return cell_fabric.CellHealth(
         heartbeat_at=heartbeat_at,
@@ -402,6 +467,13 @@ def build_cell_health(
         error_rate=error_rate,
         latency_p50_ms=latency_p50_ms,
         latency_p95_ms=latency_p95_ms,
+        evaluation_count=evaluation_count,
+        evaluation_pass_rate=evaluation_pass_rate,
+        shadow_result_count=shadow_result_count,
+        replay_run_count=replay_run_count,
+        replay_completed_count=replay_completed_count,
+        experiment_count=experiment_count,
+        experiment_completed_count=experiment_completed_count,
     )
 
 

@@ -594,6 +594,22 @@ describe("InquiryPanel (Issue #285)", () => {
       expect(evidenceDetail).toHaveTextContent("テスト");
       expect(evidenceDetail).toHaveTextContent("設定を検証");
       expect(evidenceDetail.textContent).not.toMatch(/config\.py:10-20/);
+      await waitFor(() => {
+        expect(mockApi.post).toHaveBeenCalledWith(
+          "/interview/metric-events",
+          expect.objectContaining({
+            event_key: "evidence_available:inquiry_message:2",
+            event_type: "evidence_available",
+          }),
+        );
+        expect(mockApi.post).toHaveBeenCalledWith(
+          "/interview/metric-events",
+          expect.objectContaining({
+            event_key: "evidence_expanded:inquiry_message:2",
+            event_type: "evidence_expanded",
+          }),
+        );
+      });
 
       fireEvent.click(within(row).getByTestId("inquiry-show-audit-2"));
       const auditDetail = within(row).getByTestId("inquiry-audit-detail-2");
@@ -626,6 +642,11 @@ describe("InquiryPanel (Issue #285)", () => {
       // Buttons reflect the already-open state.
       expect(within(row).getByTestId("inquiry-show-reasons-2")).toHaveTextContent("理由を隠す");
       expect(within(row).getByTestId("inquiry-show-evidence-2")).toHaveTextContent("根拠を隠す");
+      expect(mockApi.post.mock.calls.filter(
+        ([path, body]) => path === "/interview/metric-events"
+          && (body.event_key === "evidence_available:inquiry_message:2"
+            || body.event_key === "evidence_expanded:inquiry_message:2"),
+      )).toHaveLength(0);
     });
 
     test("a runtime_evidence mismatch (conflict) pre-expands layers 2-3", async () => {

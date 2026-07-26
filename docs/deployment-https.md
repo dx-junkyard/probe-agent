@@ -28,6 +28,10 @@ internet --80/443--> Caddy --8501--> Dashboard (nginx) --/api/*--> Control Serve
 - `.env` は Git 管理しない（`.gitignore` 済み）。加えてファイル権限を
   制限する（例: `chmod 600 .env`）。secrets やパスワードを含むため、
   デプロイ先 VM 上でも読み取り権限を絞る。
+- `control-server` は 1 container / 1 Uvicorn worker で運用する。
+  `interview_refresh_job` の session lock と DB access serialization は
+  プロセス内契約であり、同じ DB を開く複数 worker/replica をまだ
+  サポートしない。
 
 ## 初回デプロイ手順
 
@@ -105,6 +109,29 @@ internet --80/443--> Caddy --8501--> Dashboard (nginx) --/api/*--> Control Serve
    docker compose -f docker-compose.prod.yml config | sed -n '/execution-worker:/,/^[^ ]/p'
    docker inspect probe-execution-worker --format '{{json .HostConfig}}'
    ```
+
+   `control-server` image の既定 command は `uvicorn ... --workers 1` に固定
+   している。この command を上書きして `--workers` を増やしたり、
+   `docker compose ... up --scale control-server=N`、複数 host からの
+   同一 SQLite volume 共有を行ったりしてはならない。
+
+### Control Server をマルチワーカー化する前提
+
+worker/replica 数を増やす変更は deployment 設定だけでは完結しない。
+先に次の application contract を実装し、別プロセスを使う結合テストを
+通す必要がある。
+
+1. refresh job の取得を owner token/期限付き lease による原子的 claim にし、
+   crash/restart 後の orphaned `updating` job を回復できるようにする。
+2. session 単位の排他、pending dedupe、follow-up drain を DB transaction/
+   unique constraint または分散 lock で全 worker 間に適用する。
+3. LLM 推論後かつ Understanding/Alignment/Review Queue の書き込み直前に、
+   base revision/answer marker と新しい completed job の有無を再確認する。
+   条件が変わった場合は CAS で書き込みを拒否し、job を `stale` にする。
+4. 2個以上の実プロセスを同じ DB に接続するテストで、二重実行、古い結果の
+   上書き、lease expiry、crash recovery、follow-up 取りこぼしを検証する。
+5. SQLite の write concurrency が要件を満たさない場合は、上記 lease/CAS
+   を安全に提供できる外部 DB/job queue を採用してから scale する。
 
 ## サプライチェーン更新手順
 

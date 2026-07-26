@@ -27,6 +27,7 @@ import json
 import os
 import subprocess
 import time
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import pytest
@@ -34,6 +35,7 @@ from fastapi.testclient import TestClient
 
 from app.alignment import (
     ALIGNMENT_STATES,
+    AlignmentPolicyError,
     CONFIDENCE_LEVELS,
     REASON_CODES,
     REVIEW_CATEGORIES,
@@ -42,10 +44,15 @@ from app.alignment import (
     AlignmentEvidenceItem,
     AlignmentProposalItem,
     AlignmentProposalResult,
+    _DEFAULT_POLICY_PATH,
+    alignment_policy_digest,
+    alignment_policy_version,
     classify_alignment_item,
+    classify_alignment_item_with_rule,
     compute_content_hash,
     compute_intent_item_digest,
     generate_alignment_proposal,
+    load_alignment_review_policy,
     review_sort_key,
     user_reason_for,
     validate_evidence_against_snapshot,
@@ -167,6 +174,108 @@ def test_user_reason_templates_cover_every_reason_code():
     assert set(USER_REASON_TEMPLATES) == set(REASON_CODES)
 
 
+def _legacy_classify_alignment_item(state, risk_flags, confidence, intent_field, runtime_check):
+    """Pre-#313 policy semantics, retained only as a parity oracle in tests."""
+    if "security" in risk_flags:
+        return "must_review", "security_related"
+    if "high_risk" in risk_flags:
+        return "must_review", "high_risk"
+    if "core_intent" in risk_flags or (
+        intent_field == "goal" and state in ("gap", "conflict")
+    ):
+        return "must_review", "core_intent"
+    if state == "conflict":
+        return "must_review", "conflict_detected"
+    if runtime_check == "mismatch":
+        return "must_review", "runtime_mismatch"
+    if confidence in ("uncertain", "conflicting") or state == "unknown":
+        return "must_review", "low_confidence"
+    if state == "gap":
+        return "batch_reviewable", "routine_update"
+    if state == "aligned":
+        return "no_review_required", "no_change"
+    if state == "not_applicable":
+        return "informational", "informational_only"
+    raise AssertionError(f"unexpected state {state!r}")
+
+
+def test_external_policy_matches_every_legacy_classification():
+    """The #313 extraction must be behavior-preserving for all finite inputs."""
+    risk_combinations = [
+        [flag for bit, flag in enumerate(RISK_FLAGS) if mask & (1 << bit)]
+        for mask in range(1 << len(RISK_FLAGS))
+    ]
+    from app.interview_intent_agent import INTENT_FIELDS
+    from app.runtime_alignment import RUNTIME_CHECK_STATES
+
+    for state in ALIGNMENT_STATES:
+        for risk_flags in risk_combinations:
+            for confidence in CONFIDENCE_LEVELS:
+                for intent_field in (None, *INTENT_FIELDS):
+                    for runtime_check in (None, *RUNTIME_CHECK_STATES):
+                        assert classify_alignment_item(
+                            alignment_state=state,
+                            risk_flags=risk_flags,
+                            confidence=confidence,
+                            intent_field=intent_field,
+                            runtime_check=runtime_check,
+                        ) == _legacy_classify_alignment_item(
+                            state, risk_flags, confidence, intent_field, runtime_check,
+                        )
+
+
+def _default_policy_path() -> Path:
+    return _DEFAULT_POLICY_PATH
+
+
+def test_external_policy_has_a_version_and_digest():
+    policy = load_alignment_review_policy()
+    assert policy.policy_version == alignment_policy_version() == "alignment-review-v2"
+    assert policy.digest == alignment_policy_digest()
+    assert len(policy.digest) == 64
+
+
+def test_external_policy_classifies_capability_change_with_auditable_rule():
+    category, reason, rule_id = classify_alignment_item_with_rule(
+        alignment_state="aligned",
+        risk_flags=[],
+        confidence="confirmed",
+        intent_field=None,
+        capability_change="changed",
+    )
+    assert (category, reason, rule_id) == (
+        "must_review",
+        "core_capability_changed",
+        "core-capability-changed",
+    )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda text: text.replace("risk_flags_contains: security", "unknown_condition: security", 1),
+        lambda text: text.replace("  - id: informational-not-applicable\n", "", 1),
+        lambda text: text.replace("policy_version: alignment-review-v2", "policy_version: ", 1),
+    ],
+)
+def test_external_policy_rejects_invalid_or_incomplete_configuration(tmp_path, mutate):
+    policy_path = tmp_path / "invalid-alignment-policy.yaml"
+    policy_path.write_text(mutate(_default_policy_path().read_text()), encoding="utf-8")
+    with pytest.raises(AlignmentPolicyError):
+        load_alignment_review_policy(policy_path)
+
+
+def test_external_policy_rejects_duplicate_keys(tmp_path):
+    policy_path = tmp_path / "duplicate-alignment-policy.yaml"
+    policy_path.write_text(
+        "schema_version: alignment-review-policy-v2\n"
+        "schema_version: alignment-review-policy-v2\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AlignmentPolicyError):
+        load_alignment_review_policy(policy_path)
+
+
 # --- Unit tests: compute_content_hash (Issue #295 unchanged carry-over) -----
 #
 # Review fix (PR #296, Finding 1): compute_content_hash now requires
@@ -192,6 +301,7 @@ def _hash_kwargs(repo_path, commit_sha, **overrides):
         confidence="likely",
         intent_field="pain",
         runtime_check=None,
+        policy_digest="test-policy-digest",
         intent_summary="意図の要約",
         gap_summary="ギャップの要約",
         proposed_interpretation="提案された解釈",
@@ -230,6 +340,7 @@ def test_compute_content_hash_ignores_risk_flag_order(tmp_path):
     ("confidence", "confirmed"),
     ("intent_field", "goal"),
     ("runtime_check", "mismatch"),
+    ("policy_digest", "different-policy-digest"),
     ("risk_flags", ["high_risk"]),
     ("intent_summary", "別の要約"),
     ("gap_summary", "別のギャップ要約"),
@@ -505,6 +616,62 @@ def test_generate_alignment_proposal_accepts_null_intent_field():
     assert result.items[0].intent_field is None
 
 
+def test_generate_alignment_proposal_validates_confirmed_capability_dependency_ids():
+    graph = {
+        "nodes": [{"entity_id": 7}],
+        "relations": [{"relation_id": 11}],
+    }
+    valid = generate_alignment_proposal(
+        FakeLLMClient(
+            response={
+                "items": [
+                    _valid_item(
+                        capability_entity_ids=[7],
+                        capability_relation_ids=[11],
+                    )
+                ]
+            }
+        ),
+        _make_config(),
+        intent_items=[],
+        current_understanding=None,
+        gap_analysis=None,
+        confirmed_capability_graph=graph,
+    )
+    assert valid.error is None
+    assert valid.items[0].capability_entity_ids == [7]
+    assert valid.items[0].capability_relation_ids == [11]
+
+    unknown = generate_alignment_proposal(
+        FakeLLMClient(
+            response={
+                "items": [
+                    _valid_item(
+                        capability_entity_ids=[999],
+                        capability_relation_ids=[],
+                    )
+                ]
+            }
+        ),
+        _make_config(),
+        intent_items=[],
+        current_understanding=None,
+        gap_analysis=None,
+        confirmed_capability_graph=graph,
+    )
+    assert "outside the confirmed graph" in unknown.error
+
+    omitted = generate_alignment_proposal(
+        FakeLLMClient(response={"items": [_valid_item()]}),
+        _make_config(),
+        intent_items=[],
+        current_understanding=None,
+        gap_analysis=None,
+        confirmed_capability_graph=graph,
+    )
+    assert "omitted capability dependency ids" in omitted.error
+
+
 # --- Unit tests: validate_evidence_against_snapshot (real git fixture) ------
 
 
@@ -726,6 +893,377 @@ def _proposal_item(**overrides):
     return base
 
 
+def _confirmed_capability_graph(
+    session_id,
+    system_id,
+    snapshot_id,
+    revision_id,
+    current_understanding,
+    *,
+    identity_bindings=(),
+):
+    from app.capability_graph import confirm_capability_graph
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        revision = conn.execute(
+            """SELECT created_at FROM understanding_revision
+               WHERE id = ? AND session_id = ? AND system_id = ?""",
+            (revision_id, session_id, system_id),
+        ).fetchone()
+        return confirm_capability_graph(
+            conn,
+            system_id=system_id,
+            session_id=session_id,
+            revision_id=revision_id,
+            revision_created_at=revision["created_at"],
+            current_understanding=current_understanding,
+            actor="root",
+            identity_bindings=identity_bindings,
+            now=time.time(),
+        )
+
+
+def test_core_capability_relation_change_rechecks_only_affected_shared_function(
+    admin_client, tmp_path, monkeypatch,
+):
+    """Issue #312: A->Shared changing must not invalidate B->Shared."""
+
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    first_understanding = {
+        "core_capabilities": [
+            {"name": "Core A", "summary": "A", "children": ["Shared"]},
+            {"name": "Core B", "summary": "B", "children": ["Shared"]},
+        ],
+        "capability_elements": [
+            {"name": "Shared", "summary": "shared", "children": []},
+        ],
+        "supporting_elements": [],
+        "api_boundaries": [],
+    }
+    first_revision_id = _insert_revision(
+        session_id,
+        system_id,
+        snapshot_id,
+        current_understanding=first_understanding,
+    )
+    first_graph = _confirmed_capability_graph(
+        session_id,
+        system_id,
+        snapshot_id,
+        first_revision_id,
+        first_understanding,
+    )
+    nodes = {node["name"]: node for node in first_graph["nodes"]}
+    relation_by_parent = {
+        relation["supported_entity_id"]: relation
+        for relation in first_graph["relations"]
+    }
+    a_relation_id = relation_by_parent[nodes["Core A"]["entity_id"]]["relation_id"]
+    b_relation_id = relation_by_parent[nodes["Core B"]["entity_id"]]["relation_id"]
+
+    a_item = _proposal_item(
+        current_claim="Shared supports Core A",
+        capability_relation_ids=[a_relation_id],
+    )
+    b_item = _proposal_item(
+        current_claim="Shared supports Core B",
+        evidence=[
+            AlignmentEvidenceItem(
+                path="src/a.py", start_line=4, end_line=6, summary="B support"
+            )
+        ],
+        capability_relation_ids=[b_relation_id],
+    )
+    _stub_build(monkeypatch, items=[a_item, b_item])
+    first_build = admin_client.post(
+        f"/interview/sessions/{session_id}/alignment/build", headers=headers
+    )
+    assert first_build.status_code == 200, first_build.text
+    first_items = {
+        item["current_claim"]: item
+        for item in first_build.json()["items"]
+        if not item["superseded"]
+    }
+    for item in first_items.values():
+        answered = admin_client.post(
+            f"/interview/alignment/{item['id']}/answer",
+            json={"decision": "accept_current"},
+            headers=headers,
+        )
+        assert answered.status_code == 200, answered.text
+
+    second_understanding = {
+        **first_understanding,
+        "core_capabilities": [
+            {"name": "Core A", "summary": "A changed", "children": ["Shared"]},
+            {"name": "Core B", "summary": "B", "children": ["Shared"]},
+        ],
+    }
+    second_revision_id = _insert_revision(
+        session_id,
+        system_id,
+        snapshot_id,
+        current_understanding=second_understanding,
+    )
+    second_graph = _confirmed_capability_graph(
+        session_id,
+        system_id,
+        snapshot_id,
+        second_revision_id,
+        second_understanding,
+    )
+    second_nodes = {node["name"]: node for node in second_graph["nodes"]}
+    second_relations_by_parent = {
+        relation["supported_entity_id"]: relation
+        for relation in second_graph["relations"]
+    }
+    current_a_relation_id = second_relations_by_parent[
+        second_nodes["Core A"]["entity_id"]
+    ]["relation_id"]
+    current_b_relation_id = second_relations_by_parent[
+        second_nodes["Core B"]["entity_id"]
+    ]["relation_id"]
+    assert current_a_relation_id == a_relation_id
+    assert current_b_relation_id == b_relation_id
+
+    # A's meaning changed while both relation ids remained stable.  The A
+    # relation context must change because its supported endpoint changed;
+    # B->Shared remains unaffected.
+    _stub_build(
+        monkeypatch,
+        items=[
+            _proposal_item(
+                current_claim="Shared supports Core A",
+                capability_relation_ids=[current_a_relation_id],
+            ),
+            _proposal_item(
+                current_claim="Shared supports Core B",
+                evidence=[
+                    AlignmentEvidenceItem(
+                        path="src/a.py",
+                        start_line=4,
+                        end_line=6,
+                        summary="B support",
+                    )
+                ],
+                capability_relation_ids=[current_b_relation_id],
+            ),
+        ],
+    )
+    second_build = admin_client.post(
+        f"/interview/sessions/{session_id}/alignment/build", headers=headers
+    )
+    assert second_build.status_code == 200, second_build.text
+    current_items = {
+        item["current_claim"]: item
+        for item in second_build.json()["items"]
+        if not item["superseded"]
+    }
+    affected = current_items["Shared supports Core A"]
+    unaffected = current_items["Shared supports Core B"]
+    assert affected["review_category"] == "must_review"
+    assert affected["reason_code"] == "core_capability_changed"
+    assert affected["policy_rule_id"] == "core-capability-changed"
+    assert affected["carried_over_from"] is None
+    assert affected["capability_dependencies"] == [
+        {
+            "target_kind": "relation",
+            "entity_id": None,
+            "relation_id": current_a_relation_id,
+            "entity_kind": None,
+            "entity_name": None,
+            "supported_entity_id": second_nodes["Core A"]["entity_id"],
+            "supported_entity_name": "Core A",
+            "supporting_entity_id": second_nodes["Shared"]["entity_id"],
+            "supporting_entity_name": "Shared",
+        }
+    ]
+    assert unaffected["review_category"] == "unchanged"
+    assert unaffected["reason_code"] == "unchanged_since_confirmation"
+    assert unaffected["carried_over_from"] == first_items[
+        "Shared supports Core B"
+    ]["id"]
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        scope = conn.execute(
+            """SELECT change_kind FROM alignment_item_capability_scope
+               WHERE alignment_item_id = ?""",
+            (affected["id"],),
+        ).fetchone()
+        assert scope["change_kind"] == "core_capability_changed"
+
+    accepted_changed_scope = admin_client.post(
+        f"/interview/alignment/{affected['id']}/answer",
+        json={"decision": "accept_current"},
+        headers=headers,
+    )
+    assert accepted_changed_scope.status_code == 200, accepted_changed_scope.text
+
+    # A pure display rename explicitly bound to the same entity changes
+    # neither endpoint semantics nor relation identity, so both items keep
+    # their accepted origin.
+    renamed_understanding = {
+        **second_understanding,
+        "core_capabilities": [
+            {
+                "name": "Renamed Core A",
+                "summary": "A changed",
+                "children": ["Shared"],
+            },
+            {"name": "Core B", "summary": "B", "children": ["Shared"]},
+        ],
+    }
+    third_revision_id = _insert_revision(
+        session_id,
+        system_id,
+        snapshot_id,
+        current_understanding=renamed_understanding,
+    )
+    third_graph = _confirmed_capability_graph(
+        session_id,
+        system_id,
+        snapshot_id,
+        third_revision_id,
+        renamed_understanding,
+        identity_bindings=[
+            {
+                "entity_kind": "core_capability",
+                "current_name": "Renamed Core A",
+                "entity_id": second_nodes["Core A"]["entity_id"],
+            }
+        ],
+    )
+    third_relations_by_parent = {
+        relation["supported_entity_id"]: relation
+        for relation in third_graph["relations"]
+    }
+    assert third_relations_by_parent[
+        second_nodes["Core A"]["entity_id"]
+    ]["relation_id"] == current_a_relation_id
+    _stub_build(
+        monkeypatch,
+        items=[
+            _proposal_item(
+                current_claim="Shared supports Core A",
+                capability_relation_ids=[current_a_relation_id],
+            ),
+            _proposal_item(
+                current_claim="Shared supports Core B",
+                evidence=[
+                    AlignmentEvidenceItem(
+                        path="src/a.py",
+                        start_line=4,
+                        end_line=6,
+                        summary="B support",
+                    )
+                ],
+                capability_relation_ids=[current_b_relation_id],
+            ),
+        ],
+    )
+    third_build = admin_client.post(
+        f"/interview/sessions/{session_id}/alignment/build", headers=headers
+    )
+    assert third_build.status_code == 200, third_build.text
+    third_items = {
+        item["current_claim"]: item
+        for item in third_build.json()["items"]
+        if not item["superseded"]
+    }
+    assert third_items["Shared supports Core A"]["review_category"] == "unchanged"
+    assert (
+        third_items["Shared supports Core A"]["carried_over_from"]
+        == affected["id"]
+    )
+    assert third_items["Shared supports Core B"]["review_category"] == "unchanged"
+    assert (
+        third_items["Shared supports Core B"]["carried_over_from"]
+        == first_items["Shared supports Core B"]["id"]
+    )
+
+
+def test_alignment_build_rejects_new_unconfirmed_revision_after_canonical_flow_started(
+    admin_client, tmp_path, monkeypatch,
+):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    first_revision_id = _insert_revision(
+        session_id, system_id, snapshot_id, current_understanding={}
+    )
+    _confirmed_capability_graph(
+        session_id,
+        system_id,
+        snapshot_id,
+        first_revision_id,
+        {},
+    )
+    _insert_revision(
+        session_id, system_id, snapshot_id, current_understanding={}
+    )
+    _stub_build(monkeypatch, items=[_proposal_item()])
+
+    response = admin_client.post(
+        f"/interview/sessions/{session_id}/alignment/build", headers=headers
+    )
+    assert response.status_code == 409, response.text
+    assert "not the current System-wide canonical capability graph" in response.text
+
+
+def test_alignment_build_rejects_a_session_behind_the_system_canonical_head(
+    admin_client, tmp_path,
+):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    first_session_id = _create_session(admin_client, headers, snapshot_id)
+    second_session_id = _create_session(admin_client, headers, snapshot_id)
+    understanding = {
+        "core_capabilities": [],
+        "capability_elements": [],
+        "supporting_elements": [],
+        "api_boundaries": [],
+    }
+    first_revision_id = _insert_revision(
+        first_session_id,
+        system_id,
+        snapshot_id,
+        current_understanding=understanding,
+    )
+    first = _confirmed_capability_graph(
+        first_session_id,
+        system_id,
+        snapshot_id,
+        first_revision_id,
+        understanding,
+    )
+    second_revision_id = _insert_revision(
+        second_session_id,
+        system_id,
+        snapshot_id,
+        current_understanding=understanding,
+    )
+    second = _confirmed_capability_graph(
+        second_session_id,
+        system_id,
+        snapshot_id,
+        second_revision_id,
+        understanding,
+    )
+    assert second["base_confirmation_id"] == first["confirmation_id"]
+
+    response = admin_client.post(
+        f"/interview/sessions/{first_session_id}/alignment/build",
+        headers=headers,
+    )
+    assert response.status_code == 409
+    assert "not the current System-wide canonical capability graph" in response.text
+
+
 def test_build_requires_understanding_revision(admin_client, tmp_path):
     token, system_id, snapshot_id = _setup(admin_client, tmp_path)
     headers = _headers(token, system_id)
@@ -753,6 +1291,8 @@ def test_build_creates_items_with_deterministic_classification(admin_client, tmp
     assert item["user_reason"] == USER_REASON_TEMPLATES["routine_update"]
     assert item["status"] == "open"
     assert item["user_decision"] is None
+    assert item["policy_version"] == alignment_policy_version()
+    assert item["policy_digest"] == alignment_policy_digest()
     assert item["intelligence_run_id"] is not None
     assert item["is_mock"] is False
     assert item["current_evidence"][0]["path"] == "src/a.py"
@@ -798,7 +1338,7 @@ def test_build_fails_closed_on_llm_error_and_creates_no_rows(admin_client, tmp_p
     assert run["status"] == "failed"
     assert run["error_details"] == "reasoning model call failed"
     assert run["decision_method"] == "reasoning_llm"
-    assert run["prompt_version"] == "alignment-v1"
+    assert run["prompt_version"] == "alignment-v2"
 
 
 def test_build_fails_closed_when_every_items_evidence_is_invalid(admin_client, tmp_path, monkeypatch):
@@ -2176,11 +2716,9 @@ def test_system_isolation_for_superseded_column(admin_client, tmp_path, monkeypa
     assert b_item["superseded"] is False
 
 
-def test_superseded_column_migration_backfills_existing_rows_to_zero(tmp_path, monkeypatch):
-    """A pre-Finding-4 database (no ``superseded`` column) gains it via
-    ALTER TABLE and existing rows backfill to 0 -- mirroring this repo's
-    established additive-column migration pattern (see e.g.
-    test_replay_capture_api.py's Phase A migration test)."""
+def test_alignment_item_additive_migrations_preserve_legacy_policy_provenance(tmp_path, monkeypatch):
+    """A pre-review database gains the later additive columns without
+    fabricating policy provenance for an old classification."""
     import sqlite3
 
     db_path = tmp_path / "pre-finding4.db"
@@ -2207,6 +2745,7 @@ def test_superseded_column_migration_backfills_existing_rows_to_zero(tmp_path, m
             user_reason             TEXT NOT NULL,
             status                  TEXT NOT NULL DEFAULT 'open',
             user_decision           TEXT,
+            content_hash            TEXT,
             intelligence_run_id     INTEGER NOT NULL,
             is_mock                 INTEGER NOT NULL DEFAULT 0,
             created_at              REAL NOT NULL,
@@ -2218,9 +2757,10 @@ def test_superseded_column_migration_backfills_existing_rows_to_zero(tmp_path, m
         """INSERT INTO alignment_item
             (id, session_id, system_id, snapshot_id, current_claim,
              alignment_state, confidence, review_category, reason_code,
-             user_reason, intelligence_run_id, created_at, updated_at)
+             user_reason, content_hash, intelligence_run_id, created_at, updated_at)
         VALUES (1, 1, 1, 1, '既存の項目', 'gap', 'likely',
-                'batch_reviewable', 'routine_update', '既存の理由', 1, ?, ?)""",
+                'batch_reviewable', 'routine_update', '既存の理由',
+                'legacy-content-hash', 1, ?, ?)""",
         (time.time(), time.time()),
     )
     conn.commit()
@@ -2234,8 +2774,35 @@ def test_superseded_column_migration_backfills_existing_rows_to_zero(tmp_path, m
         check.row_factory = sqlite3.Row
         cols = {r["name"] for r in check.execute("PRAGMA table_info(alignment_item)")}
         assert "superseded" in cols
+        assert "policy_version" in cols
+        assert "policy_digest" in cols
+        assert "policy_rule_id" in cols
         row = check.execute("SELECT * FROM alignment_item WHERE id = 1").fetchone()
         assert row["superseded"] == 0
+        assert row["policy_version"] == "legacy-code-v1"
+        assert row["policy_digest"] is None
+        assert row["policy_rule_id"] is None
+        assert row["base_content_hash"] == "legacy-content-hash"
+        # Issue #312 is additive and must not guess Capability identity or
+        # dependencies for a legacy human decision.
+        tables = {
+            row["name"]
+            for row in check.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert "understanding_capability_confirmation" in tables
+        assert "alignment_item_capability_scope" in tables
+        assert "alignment_item_capability_dependency" in tables
+        assert check.execute(
+            "SELECT COUNT(*) FROM understanding_capability_confirmation"
+        ).fetchone()[0] == 0
+        assert check.execute(
+            "SELECT COUNT(*) FROM alignment_item_capability_scope"
+        ).fetchone()[0] == 0
+        assert check.execute(
+            "SELECT COUNT(*) FROM alignment_item_capability_dependency"
+        ).fetchone()[0] == 0
         check.close()
 
 
@@ -2689,3 +3256,231 @@ def test_outstanding_counts_matches_review_queue_after_answer(admin_client, tmp_
     assert after["outstanding_counts"]["must_review"] == len(queue["items"]) == 1
     assert b_id in {it["id"] for it in queue["items"]}
     assert a_id not in {it["id"] for it in queue["items"]}
+
+
+# --- Issue #310: sample objections and explicit rule recheck ----------------
+
+
+def test_legacy_recheck_target_migration_expands_same_hash_per_session():
+    """The old global hash target is migrated without collapsing sessions."""
+    import sqlite3
+
+    from app.db import _migrate_alignment_manual_recheck_targets
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE systems (id INTEGER PRIMARY KEY);
+        CREATE TABLE users (id INTEGER PRIMARY KEY);
+        CREATE TABLE interview_session (
+            id INTEGER PRIMARY KEY,
+            system_id INTEGER NOT NULL
+        );
+        CREATE TABLE alignment_item (
+            id INTEGER PRIMARY KEY,
+            system_id INTEGER NOT NULL,
+            session_id INTEGER NOT NULL,
+            reason_code TEXT NOT NULL,
+            policy_version TEXT NOT NULL,
+            policy_digest TEXT,
+            policy_rule_id TEXT,
+            content_hash TEXT
+        );
+        CREATE TABLE alignment_manual_recheck_target (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            system_id INTEGER NOT NULL,
+            reason_code TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at REAL NOT NULL,
+            resolved_at REAL,
+            UNIQUE (system_id, reason_code, content_hash)
+        );
+        INSERT INTO systems (id) VALUES (1);
+        INSERT INTO interview_session (id, system_id) VALUES (10, 1), (20, 1);
+        INSERT INTO alignment_item
+            (id, system_id, session_id, reason_code, policy_version,
+             policy_digest, policy_rule_id, content_hash)
+        VALUES
+            (100, 1, 10, 'no_change', 'alignment-review-v1',
+             'digest-v1', 'aligned-no-change', 'same-hash'),
+            (200, 1, 20, 'no_change', 'alignment-review-v1',
+             'digest-v1', 'aligned-no-change', 'same-hash');
+        INSERT INTO alignment_manual_recheck_target
+            (system_id, reason_code, content_hash, status, created_at)
+        VALUES (1, 'no_change', 'same-hash', 'pending', 1.0);
+        """
+    )
+
+    _migrate_alignment_manual_recheck_targets(conn)
+
+    columns = {
+        row["name"]
+        for row in conn.execute(
+            "PRAGMA table_info(alignment_manual_recheck_target)"
+        )
+    }
+    assert {
+        "session_id", "alignment_item_id", "policy_version", "policy_digest",
+        "policy_rule_id", "decision_method", "requested_by_user_id",
+    } <= columns
+    rows = conn.execute(
+        """SELECT session_id, alignment_item_id, policy_rule_id, decision_method
+           FROM alignment_manual_recheck_target ORDER BY session_id"""
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        (10, 100, "aligned-no-change", "manual"),
+        (20, 200, "aligned-no-change", "manual"),
+    ]
+    conn.close()
+
+
+def test_sample_objection_is_aggregated_and_explicitly_rechecks_similar_items(
+    admin_client, tmp_path, monkeypatch,
+):
+    """Only a displayed deterministic sample creates a rule objection; a
+    human must separately request that same-rule items return to the queue."""
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+    _stub_build(monkeypatch, items=[
+        _proposal_item(current_claim=f"確認不要 {i}", alignment_state="aligned", confidence="confirmed")
+        for i in range(4)
+    ])
+    built = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+    ids = sorted(item["id"] for item in built["items"])
+    assert {item["policy_rule_id"] for item in built["items"]} == {"aligned-no-change"}
+
+    # Four candidates means only the first three IDs are §5.4 samples.  The
+    # ordinary Inquiry is the existing explicit objection action.
+    _open_review_item_inquiry(admin_client, monkeypatch, session_id, ids[0], headers)
+    objections = admin_client.get("/interview/alignment/rule-objections", headers=headers)
+    assert objections.status_code == 200, objections.text
+    assert objections.json()["rules"] == [{
+        "reason_code": "no_change",
+        "policy_version": alignment_policy_version(),
+        "policy_digest": alignment_policy_digest(),
+        "policy_rule_id": "aligned-no-change",
+        "objection_count": 1,
+        "pending_recheck_count": 0,
+    }]
+
+    # This direct Inquiry is not a selected sample (fourth ID), so it must
+    # not alter the deterministic rule-objection count.
+    _open_review_item_inquiry(admin_client, monkeypatch, session_id, ids[3], headers)
+    assert admin_client.get("/interview/alignment/rule-objections", headers=headers).json()["rules"][0]["objection_count"] == 1
+
+    # A reason_code is not a stable rule identity: the exact reviewed policy
+    # artifact/rule must match the objection.
+    wrong_provenance = admin_client.post(
+        "/interview/alignment/rules/no_change/recheck",
+        json={
+            "policy_version": "alignment-review-v2",
+            "policy_digest": "different-policy-digest",
+            "policy_rule_id": "aligned-no-change",
+        },
+        headers=headers,
+    )
+    assert wrong_provenance.status_code == 409
+
+    # Identical content in another session is a different human recheck
+    # target. The original globally hash-keyed table collapsed these rows.
+    second_session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(
+        second_session_id, system_id, snapshot_id, current_understanding={},
+    )
+    second_built = admin_client.post(
+        f"/interview/sessions/{second_session_id}/alignment/build", headers=headers,
+    ).json()
+    second_ids = sorted(item["id"] for item in second_built["items"])
+    assert [item["content_hash"] for item in built["items"]] == [
+        item["content_hash"] for item in second_built["items"]
+    ]
+
+    recheck = admin_client.post(
+        "/interview/alignment/rules/no_change/recheck",
+        json={
+            "policy_version": alignment_policy_version(),
+            "policy_digest": alignment_policy_digest(),
+            "policy_rule_id": "aligned-no-change",
+        },
+        headers=headers,
+    )
+    assert recheck.status_code == 200, recheck.text
+    assert recheck.json()["recheck_target_count"] == 8
+    assert recheck.json()["decision_method"] == "manual"
+    assert recheck.json()["policy_rule_id"] == "aligned-no-change"
+
+    # The original deterministic category is retained, but every same-rule
+    # item is now an explicitly human-reviewable queue target.
+    queue = admin_client.get(f"/interview/sessions/{session_id}/review-queue", headers=headers)
+    assert queue.status_code == 200, queue.text
+    assert {item["id"] for item in queue.json()["items"]} == set(ids)
+    assert all(item["review_category"] == "no_review_required" for item in queue.json()["items"])
+    assert all(item["manual_recheck_required"] is True for item in queue.json()["items"])
+    second_queue = admin_client.get(
+        f"/interview/sessions/{second_session_id}/review-queue", headers=headers,
+    ).json()
+    assert {item["id"] for item in second_queue["items"]} == set(second_ids)
+
+    summary = admin_client.get("/interview/alignment/rule-objections", headers=headers).json()
+    assert summary["rules"][0]["pending_recheck_count"] == 8
+
+    from app.db import get_conn
+    with get_conn() as conn:
+        target_audit = conn.execute(
+            """SELECT COUNT(*) AS target_count,
+                      COUNT(DISTINCT session_id) AS session_count,
+                      MIN(decision_method) AS decision_method,
+                      MIN(requested_by_user_id) AS requested_by_user_id
+               FROM alignment_manual_recheck_target
+               WHERE system_id = ? AND status = 'pending'""",
+            (system_id,),
+        ).fetchone()
+    assert target_audit["target_count"] == 8
+    assert target_audit["session_count"] == 2
+    assert target_audit["decision_method"] == "manual"
+    assert target_audit["requested_by_user_id"] is not None
+
+    # If one session rebuilds to genuinely different content, only that
+    # session's old targets become superseded; the other session remains
+    # actionable even though the pre-rebuild hashes were identical.
+    _stub_build(monkeypatch, items=[
+        _proposal_item(
+            current_claim=f"変更された確認不要 {i}",
+            alignment_state="aligned",
+            confidence="confirmed",
+        )
+        for i in range(4)
+    ])
+    rebuilt_second = admin_client.post(
+        f"/interview/sessions/{second_session_id}/alignment/build",
+        headers=headers,
+    )
+    assert rebuilt_second.status_code == 200, rebuilt_second.text
+    after_change = admin_client.get(
+        "/interview/alignment/rule-objections", headers=headers,
+    ).json()
+    assert after_change["rules"][0]["pending_recheck_count"] == 4
+    with get_conn() as conn:
+        superseded_targets = conn.execute(
+            """SELECT COUNT(*) AS n FROM alignment_manual_recheck_target
+               WHERE system_id = ? AND session_id = ? AND status = 'superseded'""",
+            (system_id, second_session_id),
+        ).fetchone()["n"]
+    assert superseded_targets == 4
+
+    # Recheck uses the ordinary, explicitly manual decision endpoint; it is
+    # not a hidden automatic approval.  Resolving one target updates only
+    # that target's pending count.
+    refresh_calls = _spy_request_refresh(monkeypatch)
+    answered = admin_client.post(
+        f"/interview/alignment/{ids[1]}/answer",
+        json={"decision": "accept_current"}, headers=headers,
+    )
+    assert answered.status_code == 200, answered.text
+    assert answered.json()["user_decision"]["action"] == "accept_current"
+    assert len(refresh_calls) == 1
+    assert admin_client.get("/interview/alignment/rule-objections", headers=headers).json()["rules"][0]["pending_recheck_count"] == 3

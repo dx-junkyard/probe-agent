@@ -28,6 +28,14 @@ the full write-up):
   job for the same session is marked ``stale`` and writes nothing (checked
   before any work starts, so a stale run never touches
   ``interview_session``/``understanding_revision``/``alignment_item``).
+- Execution contract (Issue #315): the Control Server must run as exactly
+  one OS process / one ASGI worker, with no second replica sharing its
+  database.  Both ``_lock_for_session`` and ``db.get_conn()`` serialization
+  are process-local, and the staleness check is intentionally performed only
+  before work starts.  The production image pins Uvicorn to ``--workers 1``.
+  A multi-worker deployment is unsupported until job claiming and
+  per-session serialization are database/distributed-lock backed and every
+  result is revalidated after inference immediately before its writes.
 - ``PROBE_REFRESH_EAGER=1`` runs a newly enqueued job synchronously on the
   caller's thread instead of a background thread -- used by the test suite
   (see ``tests/conftest.py``) for deterministic assertions without racing a
@@ -80,8 +88,9 @@ _UNDERSTANDING_REBUILD_TRIGGERS = {"qa_answer", "alignment_answer"}
 
 # One lock per session_id so refresh jobs for different sessions can run
 # concurrently, while jobs for the *same* session are always serialized
-# (Principle 8-adjacent isolation: this job never runs two rebuilds for one
-# session at once, regardless of the dispatch mode).
+# inside the supported single-process / single-ASGI-worker deployment
+# contract.  This lock does NOT coordinate separate OS processes or replicas;
+# see the module-level Issue #315 contract before changing the server topology.
 _session_locks_guard = threading.Lock()
 _session_locks: dict = {}
 
@@ -251,11 +260,14 @@ def _run_one_locked(job_id: int) -> None:
         now = time.time()
 
         # Staleness: a strictly newer job for this session has already
-        # completed. Since jobs for one session are always run serially
-        # under `_lock_for_session`, the only way an older job reaches this
-        # point after a newer one already finished is a manual/out-of-order
-        # retry -- its result would regress the session, so it writes
-        # nothing (Principle 2: never silently regress persisted state).
+        # completed. Under the supported single-process deployment, jobs for
+        # one session are always serialized by `_lock_for_session`; the only
+        # way an older job reaches this point after a newer one already
+        # finished is a manual/out-of-order retry. Its result would regress
+        # the session, so it writes nothing (Principle 2: never silently
+        # regress persisted state). This pre-work check alone is NOT a
+        # multi-process safety mechanism; Issue #315's migration prerequisites
+        # require post-inference validation immediately before writes.
         newer_done = conn.execute(
             """SELECT 1 FROM interview_refresh_job
                WHERE session_id = ? AND id > ? AND status = 'updated'

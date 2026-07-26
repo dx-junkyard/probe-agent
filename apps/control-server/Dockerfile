@@ -27,4 +27,7 @@ VOLUME ["/data"]
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# interview_refresh_job currently relies on process-local serialization.
+# Keep one ASGI worker until the multi-worker prerequisites documented in
+# apps/control-server/README.md and docs/deployment-https.md are implemented.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

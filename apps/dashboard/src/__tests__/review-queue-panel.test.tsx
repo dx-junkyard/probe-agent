@@ -75,6 +75,8 @@ function makeItem(overrides: Partial<AlignmentItemOut> & { id: number }): Alignm
     user_reason: "軽微な差分です。まとめて確認してください",
     status: "open",
     user_decision: null,
+    policy_version: "alignment-review-v1",
+    policy_digest: "a86ee1d85f35cef6ad5b9d190db56a8195d458d5ffd521489f032cbed1de335d",
     intelligence_run_id: 1,
     is_mock: false,
     created_at: 0,
@@ -87,11 +89,215 @@ let getImpl: (path: string) => unknown;
 
 beforeEach(() => {
   vi.clearAllMocks();
-  getImpl = () => Promise.resolve(undefined);
+  getImpl = (path: string) => Promise.resolve(
+    path === "/interview/alignment/rule-objections" ? { system_id: 1, rules: [] } : undefined,
+  );
   mockApi.get.mockImplementation((path: string) => getImpl(path));
 });
 
 describe("ReviewQueuePanel", () => {
+  test("shows the canonical Capability dependency included in accept_current", async () => {
+    const item = makeItem({
+      id: 89,
+      capability_confirmation_id: 12,
+      capability_dependencies: [{
+        target_kind: "relation",
+        entity_id: null,
+        relation_id: 44,
+        entity_kind: null,
+        entity_name: null,
+        supported_entity_id: 7,
+        supported_entity_name: "Core A",
+        supporting_entity_id: 9,
+        supporting_entity_name: "Shared",
+      }],
+    });
+    const queue: AlignmentReviewQueueOut = {
+      session_id: 1, system_id: 1, items: [item],
+    };
+    const full: AlignmentListOut = {
+      session_id: 1,
+      system_id: 1,
+      items_by_category: {
+        must_review: [],
+        batch_reviewable: [item],
+        no_review_required: [],
+        unchanged: [],
+        informational: [],
+      },
+      counts: {
+        must_review: 0,
+        batch_reviewable: 1,
+        no_review_required: 0,
+        unchanged: 0,
+        informational: 0,
+      },
+    };
+    getImpl = (path: string) => {
+      if (path === "/interview/sessions/1/review-queue") return Promise.resolve(queue);
+      if (path === "/interview/sessions/1/alignment") return Promise.resolve(full);
+      if (path === "/interview/sessions/1/inquiries") {
+        return Promise.resolve({ session_id: 1, system_id: 1, items: [] });
+      }
+      return Promise.resolve(undefined);
+    };
+
+    const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
+    render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+
+    const scope = await screen.findByTestId("review-item-capability-scope-89");
+    expect(scope).toHaveTextContent("Core A → Shared (relation #44)");
+    expect(scope).toHaveTextContent("この依存範囲も含めた確認");
+  });
+
+  test("records evidence opportunity and the first user expansion only for initially collapsed evidence", async () => {
+    const item = makeItem({
+      id: 90,
+      current_evidence: [
+        { path: "src/a.py", start_line: 1, end_line: 3, summary: "根拠A" },
+        { path: "src/b.py", start_line: 4, end_line: 6, summary: "根拠B" },
+      ],
+    });
+    const queue: AlignmentReviewQueueOut = { session_id: 1, system_id: 1, items: [item] };
+    const full: AlignmentListOut = {
+      session_id: 1, system_id: 1,
+      items_by_category: {
+        must_review: [], batch_reviewable: [item], no_review_required: [],
+        unchanged: [], informational: [],
+      },
+      counts: {
+        must_review: 0, batch_reviewable: 1, no_review_required: 0,
+        unchanged: 0, informational: 0,
+      },
+    };
+    getImpl = (path: string) => {
+      if (path === "/interview/sessions/1/review-queue") return Promise.resolve(queue);
+      if (path === "/interview/sessions/1/alignment") return Promise.resolve(full);
+      if (path === "/interview/sessions/1/inquiries") {
+        return Promise.resolve({ session_id: 1, system_id: 1, items: [] });
+      }
+      return Promise.resolve(undefined);
+    };
+    mockApi.post.mockResolvedValue({});
+
+    const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
+    render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+
+    const toggle = await screen.findByTestId("review-item-evidence-toggle-90");
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/metric-events",
+        expect.objectContaining({
+          event_key: "evidence_available:alignment_item:90",
+          event_type: "evidence_available",
+        }),
+      );
+    });
+
+    fireEvent.click(toggle);
+    fireEvent.click(toggle);
+    fireEvent.click(toggle);
+    await waitFor(() => {
+      const expansionCalls = mockApi.post.mock.calls.filter(
+        ([path, body]) => path === "/interview/metric-events"
+          && body.event_key === "evidence_expanded:alignment_item:90",
+      );
+      expect(expansionCalls).toHaveLength(1);
+    });
+  });
+
+  test("does not count automatically pre-expanded evidence as an expansion opportunity", async () => {
+    const item = makeItem({ id: 91 }); // one evidence ref => pre-expanded by §4.4
+    const queue: AlignmentReviewQueueOut = { session_id: 1, system_id: 1, items: [item] };
+    const full: AlignmentListOut = {
+      session_id: 1, system_id: 1,
+      items_by_category: {
+        must_review: [], batch_reviewable: [item], no_review_required: [],
+        unchanged: [], informational: [],
+      },
+      counts: {
+        must_review: 0, batch_reviewable: 1, no_review_required: 0,
+        unchanged: 0, informational: 0,
+      },
+    };
+    getImpl = (path: string) => {
+      if (path === "/interview/sessions/1/review-queue") return Promise.resolve(queue);
+      if (path === "/interview/sessions/1/alignment") return Promise.resolve(full);
+      if (path === "/interview/sessions/1/inquiries") {
+        return Promise.resolve({ session_id: 1, system_id: 1, items: [] });
+      }
+      return Promise.resolve(undefined);
+    };
+    mockApi.post.mockResolvedValue({});
+
+    const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
+    render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+
+    const toggle = await screen.findByTestId("review-item-evidence-toggle-91");
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    await waitFor(() => expect(screen.getByTestId("review-item-evidence-91")).toBeInTheDocument());
+    expect(mockApi.post.mock.calls.filter(([path]) => path === "/interview/metric-events")).toHaveLength(0);
+  });
+
+  test("records an unchanged item only after the collapsed informational row is presented", async () => {
+    const item = makeItem({
+      id: 92,
+      review_category: "unchanged",
+      reason_code: "no_change",
+      alignment_state: "aligned",
+      current_evidence: [],
+    });
+    const queue: AlignmentReviewQueueOut = { session_id: 1, system_id: 1, items: [] };
+    const full: AlignmentListOut = {
+      session_id: 1, system_id: 1,
+      items_by_category: {
+        must_review: [], batch_reviewable: [], no_review_required: [],
+        unchanged: [item], informational: [],
+      },
+      counts: {
+        must_review: 0, batch_reviewable: 0, no_review_required: 0,
+        unchanged: 1, informational: 0,
+      },
+    };
+    getImpl = (path: string) => {
+      if (path === "/interview/sessions/1/review-queue") return Promise.resolve(queue);
+      if (path === "/interview/sessions/1/alignment") return Promise.resolve(full);
+      if (path === "/interview/sessions/1/inquiries") {
+        return Promise.resolve({ session_id: 1, system_id: 1, items: [] });
+      }
+      return Promise.resolve(undefined);
+    };
+    mockApi.post.mockResolvedValue({});
+
+    const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
+    render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+
+    const toggle = await screen.findByTestId("review-queue-informational-toggle");
+    expect(mockApi.post.mock.calls.some(
+      ([path, body]) => path === "/interview/metric-events"
+        && body.event_type === "unchanged_item_presented",
+    )).toBe(false);
+
+    fireEvent.click(toggle);
+    await screen.findByTestId("review-item-informational-92");
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/metric-events",
+        expect.objectContaining({
+          event_key: "unchanged_item_presented:alignment_item:92",
+          event_type: "unchanged_item_presented",
+          target_kind: "alignment_item",
+          target_id: 92,
+        }),
+      );
+    });
+    expect(mockApi.post.mock.calls.some(
+      ([path, body]) => path === "/interview/metric-events"
+        && body.event_type === "unchanged_item_reconfirmed",
+    )).toBe(false);
+  });
+
   test("shows only must_review/batch_reviewable as action cards, collapses the rest, and never renders raw enum values", async () => {
     const mustReview = makeItem({
       id: 1, review_category: "must_review", reason_code: "security_related",
@@ -685,6 +891,8 @@ describe("ReviewQueuePanel", () => {
     expect(detail).toHaveTextContent("#9");
     expect(detail).toHaveTextContent("#7");
     expect(detail).toHaveTextContent("#42");
+    expect(detail).toHaveTextContent("alignment-review-v1");
+    expect(within(row).getByTestId("review-item-policy-70")).toHaveTextContent("a86ee1d85f35");
     expect(within(row).getByTestId("review-item-carried-over-70")).toHaveTextContent("#12");
     // A field the response doesn't provide (content_hash) must not render.
     expect(within(row).queryByTestId("review-item-content-hash-70")).not.toBeInTheDocument();
@@ -1036,5 +1244,69 @@ describe("ReviewQueuePanel", () => {
     });
     // Stays staged so the user can retry after refreshing the content.
     expect(screen.getByTestId("review-item-staged-120")).toBeInTheDocument();
+  });
+
+  test("分類ルール再確認は選択した正確なポリシー来歴を送る", async () => {
+    const queue: AlignmentReviewQueueOut = { session_id: 1, system_id: 1, items: [] };
+    const full: AlignmentListOut = {
+      session_id: 1,
+      system_id: 1,
+      items_by_category: {
+        must_review: [], batch_reviewable: [], no_review_required: [],
+        unchanged: [], informational: [],
+      },
+      counts: {
+        must_review: 0, batch_reviewable: 0, no_review_required: 0,
+        unchanged: 0, informational: 0,
+      },
+    };
+    getImpl = (path: string) => {
+      if (path === "/interview/sessions/1/review-queue") return Promise.resolve(queue);
+      if (path === "/interview/sessions/1/alignment") return Promise.resolve(full);
+      if (path === "/interview/sessions/1/inquiries") {
+        return Promise.resolve({ session_id: 1, system_id: 1, items: [] });
+      }
+      if (path === "/interview/alignment/rule-objections") {
+        return Promise.resolve({
+          system_id: 1,
+          rules: [{
+            reason_code: "no_change",
+            policy_version: "alignment-review-v1",
+            policy_digest: "digest-v1",
+            policy_rule_id: "aligned-no-change",
+            objection_count: 2,
+            pending_recheck_count: 0,
+          }],
+        });
+      }
+      return Promise.resolve(undefined);
+    };
+    mockApi.post.mockResolvedValue({
+      system_id: 1,
+      reason_code: "no_change",
+      policy_version: "alignment-review-v1",
+      policy_digest: "digest-v1",
+      policy_rule_id: "aligned-no-change",
+      decision_method: "manual",
+      requested_by_user_id: 1,
+      recheck_target_count: 3,
+    });
+
+    const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
+    render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByTestId("review-queue-rule-recheck-aligned-no-change"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/alignment/rules/no_change/recheck",
+        {
+          policy_version: "alignment-review-v1",
+          policy_digest: "digest-v1",
+          policy_rule_id: "aligned-no-change",
+        },
+      );
+    });
+    expect(screen.getByText(/aligned-no-change/)).toBeInTheDocument();
   });
 });

@@ -22,6 +22,7 @@ import type {
   WorkspaceContextPack, WorkspaceAgentTurnOut, WorkspaceProposalOut,
   WorkspaceProposalDraftOut,
   InterviewSessionOut, InterviewSessionDetailOut, InterviewContextPack,
+  InterviewCapabilityGraphOut, InterviewConfirmUnderstandingRequest,
   InterviewDialogueTurnOut, InterviewProposalDecisionOut,
   InterviewProposalMetadataBlock, InterviewProposalProbePlan,
   InterviewApprovedSetOut, InterviewMaterializeOut,
@@ -34,7 +35,9 @@ import type {
   InterviewInquiryOriginKind,
   AlignmentBuildOut, AlignmentListOut, AlignmentReviewQueueOut, AlignmentItemOut,
   AlignmentDecisionAction,
+  AlignmentRuleObjectionListOut, AlignmentRuleObjectionOut, AlignmentRuleRecheckOut,
   AlignmentBatchAnswerItemRequest, AlignmentBatchAnswerOut,
+  InterviewMetricsOut, InterviewMetricEventCreate, InterviewMetricEventOut,
   RuntimeObservationProposalOut, RuntimeObservationProposalCreate,
   RefreshStatusOut, RefreshJobOut,
   ChangeSetDetailOut, ChangeSetApplyResultOut, ChangeSetOut,
@@ -734,6 +737,18 @@ export function useInterviewSession(sessionId: number | null) {
   });
 }
 
+export function useInterviewCapabilityGraph(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("interviewCapabilityGraph"), sessionId],
+    queryFn: () =>
+      api.get<InterviewCapabilityGraphOut>(
+        `/interview/sessions/${sessionId}/capability-graph`,
+      ),
+    enabled: !!sessionId && !!getSystemId(),
+    retry: false,
+  });
+}
+
 export function useInterviewContextPack(sessionId: number | null) {
   return useQuery({
     queryKey: [...sysKey("interviewContextPack"), sessionId],
@@ -760,6 +775,7 @@ export function useInterviewDialogueTurn(sessionId: number | null) {
       api.post<InterviewDialogueTurnOut>(`/interview/sessions/${sessionId}/dialogue-turn`, data),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewCapabilityGraph"), sessionId] });
       qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
       qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] });
     },
@@ -1211,6 +1227,30 @@ export function useAlignmentList(sessionId: number | null) {
   });
 }
 
+// Issue #309: deterministic System-level Interview / Alignment UX metrics.
+// The selected System is part of the query key even though the API path uses
+// the standard request context to resolve it.
+export function useInterviewMetrics() {
+  return useQuery({
+    queryKey: sysKey("interviewMetrics"),
+    queryFn: () => api.get<InterviewMetricsOut>("/interview/metrics"),
+    enabled: !!getSystemId(),
+  });
+}
+
+// Telemetry must never block or alter the review interaction it observes.
+// Event keys are caller-generated and idempotent within a System, so React
+// StrictMode remounts or repeated renders are harmless.
+export async function recordInterviewMetricEventBestEffort(
+  data: InterviewMetricEventCreate,
+): Promise<void> {
+  try {
+    await api.post<InterviewMetricEventOut>("/interview/metric-events", data);
+  } catch {
+    // Intentionally ignored: metric collection is observability, not a gate.
+  }
+}
+
 export function useReviewQueue(sessionId: number | null) {
   return useQuery({
     queryKey: [...sysKey("reviewQueue"), sessionId],
@@ -1219,9 +1259,34 @@ export function useReviewQueue(sessionId: number | null) {
   });
 }
 
+export function useAlignmentRuleObjections() {
+  return useQuery({
+    queryKey: sysKey("alignmentRuleObjections"),
+    queryFn: () => api.get<AlignmentRuleObjectionListOut>("/interview/alignment/rule-objections"),
+    enabled: !!getSystemId(),
+  });
+}
+
 function _invalidateAlignment(qc: ReturnType<typeof useQueryClient>, sessionId: number | null) {
   qc.invalidateQueries({ queryKey: [...sysKey("alignment"), sessionId] });
   qc.invalidateQueries({ queryKey: [...sysKey("reviewQueue"), sessionId] });
+  qc.invalidateQueries({ queryKey: sysKey("alignmentRuleObjections") });
+}
+
+export function useRequestAlignmentRuleRecheck(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (rule: AlignmentRuleObjectionOut) =>
+      api.post<AlignmentRuleRecheckOut>(
+        `/interview/alignment/rules/${rule.reason_code}/recheck`,
+        {
+          policy_version: rule.policy_version,
+          policy_digest: rule.policy_digest,
+          policy_rule_id: rule.policy_rule_id,
+        },
+      ),
+    onSuccess: () => _invalidateAlignment(qc, sessionId),
+  });
 }
 
 export function useBuildAlignment(sessionId: number | null) {
@@ -1551,6 +1616,9 @@ export function useAdvanceInterviewStage(sessionId: number | null) {
       ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+      qc.invalidateQueries({
+        queryKey: [...sysKey("interviewCapabilityGraph"), sessionId],
+      });
       qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
       qc.invalidateQueries({ queryKey: sysKey("system-diagnostics") });
     },
@@ -1560,13 +1628,16 @@ export function useAdvanceInterviewStage(sessionId: number | null) {
 export function useConfirmInterviewUnderstanding(sessionId: number | null) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (data: { actor: string }) =>
+    mutationFn: (data: InterviewConfirmUnderstandingRequest) =>
       api.post<InterviewSessionOut>(
         `/interview/sessions/${sessionId}/confirm-understanding`,
         data,
       ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+      qc.invalidateQueries({
+        queryKey: [...sysKey("interviewCapabilityGraph"), sessionId],
+      });
       qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
       qc.invalidateQueries({ queryKey: sysKey("system-diagnostics") });
     },

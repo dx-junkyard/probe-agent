@@ -2,6 +2,8 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .intelligence_run_types import IntelligenceRunType
+
 Mode = Literal["off", "trace", "shadow"]
 Evaluation = Literal["better", "worse", "same", "unknown"]
 GenerationVerdict = Literal["better", "worse", "same", "unsafe", "error", "unknown"]
@@ -475,62 +477,6 @@ InclusionStatus = Literal[
 ]
 SnapshotStatus = Literal["not_configured", "indexing", "ready", "failed"]
 IntelligenceRunStatus = Literal["pending", "completed", "failed"]
-IntelligenceRunType = Literal[
-    "repository_drafts",
-    "system_profile_draft",
-    "feature_map_draft",
-    "symbol_index",
-    "feature_code_mapping",
-    "probe_plan",
-    "probe_plan_from_flow",
-    "capability_hierarchy",
-    "explanation_refresh",
-    "interview_proposal",
-    "interview_dialogue",
-    # Issue #130: pass 1 of the dialogue turn (choose evidence to read, or
-    # declare no evidence needed) is audited separately from pass 2 (question
-    # generation, run_type "interview_dialogue" above) so the two reasoning
-    # calls stay distinguishable in the audit trail.
-    "interview_evidence_selection",
-    # Issue #127/#123: the system-understanding review behind
-    # update-understanding (system_understanding_reviewer.py). Recorded for
-    # both success and failure so the reviewer's prompt_version stays
-    # auditable (Principle 7).
-    "understanding_review",
-    # Issue #135: reconciling approved metadata/probe plans against
-    # deterministic runtime trace aggregates. The aggregation itself is
-    # deterministic and not separately audited; only the reasoning
-    # reconciliation step that picks confirmation questions is.
-    "runtime_reality_check",
-    # Issue #168: Probe Pattern lifecycle. pattern_reconcile classifies saved
-    # pattern points against the latest snapshot (deterministic structural
-    # checks, escalating to reasoning for moved/split/missing);
-    # pattern_investigate is the "I don't know" investigation assistance;
-    # probe_plan_from_pattern records the manual decision that turned an
-    # approved reconciliation into a Probe Plan.
-    "pattern_reconcile",
-    "pattern_investigate",
-    "probe_plan_from_pattern",
-    # Issue #284: Intent Brief. Proposes missing goal/pain/success_criteria/
-    # priority/constraints/non_goals items from the session conversation and
-    # user_intent free text. Proposed items are never auto-confirmed.
-    "intent_proposal",
-    # Issue #285: Inquiry side-conversation answer generation (the overall
-    # composed outcome; superseded internals split into "question_route" and
-    # "investigation" below by Issue #286, each audited separately).
-    "inquiry_answer",
-    # Issue #286: Question Router classifies a question into
-    # human_only | system_researchable | hybrid before any investigation.
-    "question_route",
-    # Issue #286: read-only Investigation Agent research over the pinned
-    # snapshot, budget-bounded, for system_researchable/hybrid questions.
-    "investigation",
-    # Issue #290 Finding 5 (Part 2): semantic match/mismatch judge over
-    # alignment items whose deterministic runtime baseline is 'match'
-    # (app/runtime_match_judge.py). Never runs for stale/unobserved/
-    # environment-mismatch items -- those keep their deterministic value.
-    "runtime_match",
-]
 DecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
 # How a single hierarchy claim was produced. Kept distinct from the audit
 # DecisionMethod so source-authored facts stay visibly separate from
@@ -651,7 +597,7 @@ class RepositoryResyncJobOut(BaseModel):
 class IntelligenceRunOut(BaseModel):
     id: int
     system_id: int
-    snapshot_id: int
+    snapshot_id: Optional[int]
     run_type: IntelligenceRunType
     provider: str
     model: str
@@ -2422,6 +2368,11 @@ class InterviewSessionOut(BaseModel):
     last_error: Optional[str] = None
     understanding_confirmed_at: Optional[float] = None
     understanding_confirmed_by: Optional[str] = None
+    # Issue #312: a later Understanding revision must be manually confirmed
+    # into the canonical capability graph before it can drive scoped
+    # Alignment carry-over.
+    capability_graph_confirmed_revision_id: Optional[int] = None
+    capability_graph_confirmation_required: bool = False
     # Issue #129: set when an answered interview_qa question is corrected.
     # Never cleared automatically by the revision itself — only a successful
     # understanding rebuild (update-understanding) clears it.
@@ -2691,6 +2642,69 @@ class InterviewDialogueTurnRequest(BaseModel):
     answer_unknown: bool = False
 
 
+CapabilityEntityKind = Literal[
+    "core_capability", "capability_element", "supporting_element", "api_boundary",
+]
+
+
+class InterviewCapabilityIdentityBinding(BaseModel):
+    """Explicitly keep one canonical identity across a display-name rename."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    entity_kind: CapabilityEntityKind
+    current_name: str = Field(min_length=1, max_length=500)
+    entity_id: int = Field(gt=0)
+
+
+class InterviewCapabilityRelationConfirmation(BaseModel):
+    """One manually confirmed many-to-many support relation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    supported_kind: CapabilityEntityKind
+    supported_name: str = Field(min_length=1, max_length=500)
+    supporting_kind: CapabilityEntityKind
+    supporting_name: str = Field(min_length=1, max_length=500)
+    role: str = Field(default="", max_length=1_000)
+    scope: str = Field(default="", max_length=2_000)
+
+
+class InterviewCapabilityNodeOut(BaseModel):
+    entity_id: int
+    entity_kind: CapabilityEntityKind
+    name: str
+    summary: str = ""
+    semantic_digest: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+class InterviewCapabilityRelationOut(BaseModel):
+    relation_id: int
+    supported_entity_id: int
+    supporting_entity_id: int
+    relation_kind: Literal["supports"]
+    role: str = ""
+    scope: str = ""
+    semantic_digest: str
+
+
+class InterviewCapabilityGraphOut(BaseModel):
+    confirmation_id: int
+    system_id: int
+    session_id: int
+    base_confirmation_id: Optional[int] = None
+    source_revision_id: Optional[int] = None
+    source_revision_at: Optional[float] = None
+    composition_digest: str
+    decided_by: str
+    decided_by_user_id: Optional[int] = None
+    decision_method: Literal["manual"]
+    created_at: float
+    nodes: List[InterviewCapabilityNodeOut] = Field(default_factory=list)
+    relations: List[InterviewCapabilityRelationOut] = Field(default_factory=list)
+
+
 class InterviewConfirmUnderstandingRequest(BaseModel):
     """Manual confirmation that the gathered interview context is sufficient.
 
@@ -2703,6 +2717,20 @@ class InterviewConfirmUnderstandingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     actor: str = Field(min_length=1, max_length=200)
+    # Optimistic lock for the System-wide canonical head. Required by the
+    # API whenever a new confirmation builds on an existing head.
+    capability_base_confirmation_id: Optional[int] = Field(default=None, gt=0)
+    # Issue #312: absent means derive exact relations from the current
+    # understanding's ``children`` lists.  An explicitly empty list confirms
+    # a graph with no support relations.
+    capability_relations: Optional[
+        List[InterviewCapabilityRelationConfirmation]
+    ] = Field(default=None, max_length=200)
+    # Exact, human-supplied rename identity.  No fuzzy/name-similarity
+    # inference is performed when this list omits a renamed node.
+    capability_identity_bindings: List[
+        InterviewCapabilityIdentityBinding
+    ] = Field(default_factory=list, max_length=100)
 
 
 class InterviewQuestionEvidenceRef(BaseModel):
@@ -2949,6 +2977,9 @@ class InterviewQaOut(BaseModel):
     # aggregation, not a source-code span. Null for all other sources.
     runtime_evidence: Optional[Dict[str, Any]] = None
     answer_text: Optional[str] = None
+    # Issue #309: explicit measurement provenance. None means unanswered or
+    # legacy history whose unknown/known action cannot be recovered exactly.
+    answer_unknown: Optional[bool] = None
     status: InterviewQaStatus
     answered_by: Optional[str] = None
     superseded_by_id: Optional[int] = None
@@ -2991,6 +3022,103 @@ class InterviewQaListOut(BaseModel):
     open_count: int = 0
     high_priority_open_count: int = 0
     answers_revised_at: Optional[float] = None
+
+
+# --- Interview UX metrics (Issue #309) --------------------------------------
+
+InterviewMetricEventType = Literal[
+    "review_started",
+    "review_completed",
+    "review_abandoned",
+    "evidence_available",
+    "evidence_expanded",
+    "unchanged_item_presented",
+    "unchanged_item_reconfirmed",
+    "question_presented",
+]
+InterviewMetricTargetKind = Literal[
+    "session", "qa", "alignment_item", "inquiry_message",
+]
+InterviewMetricCategory = Literal["user_burden", "accuracy", "ux_quality"]
+InterviewMetricStatus = Literal["measured", "unmeasured"]
+InterviewMetricUnit = Literal[
+    "ratio", "answers_per_update", "operations_per_inquiry",
+]
+InterviewMetricKey = Literal[
+    "answers_per_understanding_update",
+    "unknown_answer_rate",
+    "review_abandonment_rate",
+    "evidence_detail_expansion_rate",
+    "operations_per_inquiry",
+    "corrected_confirmed_intent_rate",
+    "incorrect_answer_confirmation_rate",
+    "runtime_contradiction_rate",
+    "understanding_revision_recorrection_rate",
+    "post_approval_rejection_rate",
+    "post_approval_rollback_rate",
+    "post_approval_rejection_or_rollback_rate",
+    "repeated_question_rate",
+    "unchanged_item_reconfirmation_rate",
+    "inquiry_resolution_rate",
+    "post_inquiry_confirmation_rate",
+    "implementation_question_transfer_rate",
+]
+
+
+class InterviewMetricEventCreate(BaseModel):
+    """One bounded, content-free UI measurement event.
+
+    ``event_key`` is generated by the client and unique within a System so a
+    retry is idempotent. The route validates the finite event/target pairing
+    and target ownership; arbitrary attributes and free-text analytics
+    payloads are intentionally unsupported.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["interview-metric-event-v1"] = "interview-metric-event-v1"
+    event_key: str = Field(..., min_length=1, max_length=128)
+    session_id: int = Field(..., ge=1)
+    event_type: InterviewMetricEventType
+    target_kind: InterviewMetricTargetKind
+    target_id: int = Field(..., ge=1)
+
+
+class InterviewMetricEventOut(BaseModel):
+    id: int
+    schema_version: Literal["interview-metric-event-v1"] = "interview-metric-event-v1"
+    event_key: str
+    system_id: int
+    session_id: int
+    event_type: InterviewMetricEventType
+    target_kind: InterviewMetricTargetKind
+    target_id: int
+    recorded_at: float
+
+
+class InterviewMetricOut(BaseModel):
+    key: InterviewMetricKey
+    category: InterviewMetricCategory
+    guardrail: bool = False
+    description: str
+    formula: str
+    sources: List[str] = Field(default_factory=list)
+    status: InterviewMetricStatus
+    value: Optional[float] = None
+    unit: InterviewMetricUnit
+    numerator: Optional[int] = None
+    denominator: Optional[int] = None
+    sample_size: int = 0
+    unmeasured_reason: Optional[str] = None
+
+
+class InterviewMetricsOut(BaseModel):
+    system_id: int
+    schema_version: Literal["interview-metrics-v1"] = "interview-metrics-v1"
+    generated_at: float
+    sessions_observed: int = 0
+    events_observed: int = 0
+    metrics: List[InterviewMetricOut] = Field(default_factory=list)
 
 
 # --- Batch route-and-investigate (Issue #286 review fix, Finding 1) ----------
@@ -3248,7 +3376,8 @@ AlignmentReviewCategory = Literal[
 AlignmentReasonCode = Literal[
     "security_related", "high_risk", "core_intent", "conflict_detected",
     "low_confidence", "runtime_mismatch", "routine_update", "no_change",
-    "informational_only", "unchanged_since_confirmation",
+    "informational_only", "core_capability_changed",
+    "unchanged_since_confirmation",
 ]
 # Item-level user progress. 'inquiry' is set while an Inquiry
 # (origin_kind='review_item') is open on this item, and reset to 'open'
@@ -3279,6 +3408,20 @@ class AlignmentUserDecisionOut(BaseModel):
     decided_by: Optional[str] = None
 
 
+class AlignmentCapabilityDependencyOut(BaseModel):
+    """Human-reviewable canonical scope attached to one Alignment item."""
+
+    target_kind: Literal["entity", "relation"]
+    entity_id: Optional[int] = None
+    relation_id: Optional[int] = None
+    entity_kind: Optional[CapabilityEntityKind] = None
+    entity_name: Optional[str] = None
+    supported_entity_id: Optional[int] = None
+    supported_entity_name: Optional[str] = None
+    supporting_entity_id: Optional[int] = None
+    supporting_entity_name: Optional[str] = None
+
+
 class AlignmentItemOut(BaseModel):
     id: int
     session_id: int
@@ -3297,6 +3440,12 @@ class AlignmentItemOut(BaseModel):
     review_category: AlignmentReviewCategory
     reason_code: AlignmentReasonCode
     user_reason: str
+    # Issue #312: these exact canonical dependencies are visible to the
+    # reviewer; accept_current confirms the claim and this scope together.
+    capability_confirmation_id: Optional[int] = None
+    capability_dependencies: List[AlignmentCapabilityDependencyOut] = Field(
+        default_factory=list
+    )
     # Issue #290: deterministic Runtime Reality Check match state, set only
     # when this item's evidence deterministically maps to a component_id
     # with runtime trace facts; null when no deterministic mapping exists
@@ -3326,6 +3475,19 @@ class AlignmentItemOut(BaseModel):
     # (audit-only -- never a live FK join for decision-making).
     content_hash: Optional[str] = None
     carried_over_from: Optional[int] = None
+    # Issue #313: every freshly classified row carries the reviewed external
+    # policy version and the SHA-256 of that exact YAML artifact. Legacy rows
+    # retain an explicit legacy version and no digest rather than pretending
+    # they were classified by the external policy.
+    policy_version: str = "legacy-code-v1"
+    policy_digest: Optional[str] = None
+    # Exact first-match YAML rule that produced the category/reason pair.
+    # Legacy and carried-over rows may not have one.
+    policy_rule_id: Optional[str] = None
+    # Issue #310: the deterministic category/reason_code remains unchanged.
+    # This flag only exposes an explicit human request to recheck this exact
+    # item in the normal Review Queue.
+    manual_recheck_required: bool = False
     intelligence_run_id: int
     is_mock: bool = False
     created_at: float
@@ -3369,6 +3531,43 @@ class AlignmentReviewQueueOut(BaseModel):
     session_id: int
     system_id: int
     items: List[AlignmentItemOut] = Field(default_factory=list)
+
+
+class AlignmentRuleObjectionOut(BaseModel):
+    """Deterministic, System-scoped aggregation of sample objections."""
+
+    reason_code: AlignmentReasonCode
+    policy_version: str
+    policy_digest: Optional[str] = None
+    policy_rule_id: str
+    objection_count: int
+    pending_recheck_count: int
+
+
+class AlignmentRuleObjectionListOut(BaseModel):
+    system_id: int
+    rules: List[AlignmentRuleObjectionOut] = Field(default_factory=list)
+
+
+class AlignmentRuleRecheckRequest(BaseModel):
+    """Exact reviewed rule provenance selected by the human."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    policy_version: str = Field(..., min_length=1, max_length=200)
+    policy_digest: Optional[str] = Field(default=None, max_length=128)
+    policy_rule_id: str = Field(..., min_length=1, max_length=200)
+
+
+class AlignmentRuleRecheckOut(BaseModel):
+    system_id: int
+    reason_code: AlignmentReasonCode
+    policy_version: str
+    policy_digest: Optional[str] = None
+    policy_rule_id: str
+    decision_method: Literal["manual"] = "manual"
+    requested_by_user_id: int
+    recheck_target_count: int
 
 
 class AlignmentAnswerRequest(BaseModel):
@@ -5945,6 +6144,7 @@ class CellAskOut(BaseModel):
     severity: str
     status: str
     decision: str = ""
+    decision_note: str = ""
     decision_method: str = ""
     decided_by: Optional[str] = None
     decided_at: Optional[float] = None

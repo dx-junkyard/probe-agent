@@ -88,6 +88,19 @@ function makeDigest(): CellRootDigestOut {
           type: "orchestrator",
           cell_id: "orch-1",
           progress: { by_cell: {}, total: { todo: 1, doing: 0, review: 0, done: 1, failed: 0, blocked: 0 } },
+          quality: [{
+            cell_id: "worker-a",
+            pass_rate: 0.75,
+            audited_count: 8,
+            intake_status: "suspended",
+            sample_rate: 0.2,
+          }],
+          topology: [{
+            cell_id: "worker-a",
+            feature_refs: ["feature-a"],
+            capability_refs: ["capability-a"],
+            entrypoint_refs: ["POST:/jobs"],
+          }],
           escalations_open_by_severity: { sev1: 1, sev2: 1, sev3: 1 },
           bottleneck_candidates: [],
           binding_stale: false,
@@ -189,6 +202,18 @@ describe("CellFabricPage", () => {
     const keyPoints = await screen.findByTestId("cell-fabric-key-points");
     expect(keyPoints).toHaveTextContent("orch-1");
     expect(keyPoints).toHaveTextContent("判断が必要な問題です");
+    expect(keyPoints).toHaveTextContent("pass rate 75%");
+    expect(keyPoints).toHaveTextContent("audits 8");
+    expect(keyPoints).toHaveTextContent("受付停止");
+    expect(keyPoints).toHaveTextContent("Feature:feature-a");
+    expect(keyPoints).toHaveTextContent("Capability:capability-a");
+    expect(keyPoints).toHaveTextContent("Entrypoint:POST:/jobs");
+    expect(screen.getByLabelText("Feature:feature-a を開く"))
+      .toHaveAttribute("href", "/feature-map?feature=feature-a");
+    expect(screen.getByLabelText("Capability:capability-a を開く"))
+      .toHaveAttribute("href", "/capability-map?capability=capability-a");
+    expect(screen.getByLabelText("Entrypoint:POST:/jobs を開く"))
+      .toHaveAttribute("href", "/flow-explorer");
     // sev3 never appears in the always-visible key points list itself.
     expect(keyPoints).not.toHaveTextContent("参考情報です");
 

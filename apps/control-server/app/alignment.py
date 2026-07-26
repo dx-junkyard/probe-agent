@@ -9,7 +9,7 @@ and a *deterministic* review classification.
 Split per Principle 6:
 
 - Reasoning model (``generate_alignment_proposal``, ``prompt_version`` /
-  ``schema_version`` = ``alignment-v1``): proposes *content* -- which Intent
+  ``schema_version`` = ``alignment-v2``): proposes *content* -- which Intent
   field a current-system claim relates to, the claim text, its evidence,
   the alignment state (aligned/gap/unknown/conflict/not_applicable), risk
   flags (from a finite vocabulary), confidence, and a gap/interpretation
@@ -26,12 +26,15 @@ Split per Principle 6:
   wins) mapping the reasoning model's finite output fields to
   ``review_category`` / ``reason_code``. No numeric scoring, no LLM
   ordering -- this is direct structural classification into an explicit
-  finite set (Principle 6), so it is implemented as plain Python data
-  (``_RULES``) that tests can enumerate exhaustively.
+  finite set (Principle 6). The ordered table and fixed Japanese reason
+  templates live in the separately reviewable
+  ``app/policies/alignment_review.yaml``; its strict loader accepts no
+  executable expressions and fails closed on any invalid schema or enum.
 - ``USER_REASON_TEMPLATES`` / ``user_reason_for``: a fixed Japanese template
-  per ``reason_code`` -- never LLM free text (Principle 7's "concise
-  reasons" requirement, made deterministic here since the reason a category
-  was assigned is itself a structural fact, not an interpretation).
+  per ``reason_code`` loaded from that validated policy -- never LLM free
+  text (Principle 7's "concise reasons" requirement, made deterministic here
+  since the reason a category was assigned is itself a structural fact, not
+  an interpretation).
 - ``review_sort_key``: deterministic queue ordering (category rank, then
   reason-code rank, then id) -- no numeric score multiplication.
 
@@ -57,20 +60,24 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+import yaml
 
 from .git_ops import GitError, read_file_at_commit
 from .interview_intent_agent import INTENT_FIELDS
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient, is_reasoning_model
+from .runtime_alignment import RUNTIME_CHECK_STATES
 
-PROMPT_VERSION = "alignment-v1"
-SCHEMA_VERSION = "alignment-v1"
+PROMPT_VERSION = "alignment-v2"
+SCHEMA_VERSION = "alignment-v2"
 
 ALIGNMENT_STATES = ("aligned", "gap", "unknown", "conflict", "not_applicable")
 RISK_FLAGS = ("security", "high_risk", "core_intent")
 CONFIDENCE_LEVELS = ("confirmed", "likely", "uncertain", "conflicting")
+CAPABILITY_CHANGE_STATES = ("none", "changed")
 
 # Ordered (rank == index): "first" is the highest-priority category/reason
 # for queue ordering (review_sort_key below).
@@ -80,75 +87,334 @@ REVIEW_CATEGORIES = (
 REASON_CODES = (
     "security_related", "high_risk", "core_intent", "conflict_detected",
     "low_confidence", "runtime_mismatch", "routine_update", "no_change",
-    "informational_only", "unchanged_since_confirmation",
+    "informational_only", "core_capability_changed",
+    "unchanged_since_confirmation",
 )
 
 _CATEGORY_RANK: Dict[str, int] = {name: i for i, name in enumerate(REVIEW_CATEGORIES)}
 _REASON_RANK: Dict[str, int] = {name: i for i, name in enumerate(REASON_CODES)}
 
-# Fixed Japanese template per reason_code (Principle 6/7: deterministic,
-# never LLM free text). Every REASON_CODES value must have an entry here
-# (checked by tests).
-USER_REASON_TEMPLATES: Dict[str, str] = {
-    "security_related": "セキュリティに関わるため個別確認が必要です",
-    "high_risk": "影響が大きい変更のため個別確認が必要です",
-    "core_intent": "目標(goal)に関わる内容のため個別確認が必要です",
-    "conflict_detected": "意図と現状の理解が矛盾しているため確認が必要です",
-    "low_confidence": "AIの確信度が低いため個別確認が必要です",
-    "runtime_mismatch": "コード上の理解と実行時の観測が一致していません",
-    "routine_update": "軽微な差分です。まとめて確認してください",
-    "no_change": "意図と現状の理解は一致しています。対応は不要です",
-    "informational_only": "参考情報です。対応は不要です",
-    "unchanged_since_confirmation": "前回の確認から内容に変更はありません。対応は不要です",
-}
+# --- Reviewable, fail-closed review policy (Issue #313) ----------------------
+#
+# The rule table used to live as Python lambdas in this module.  Its behaviour
+# remains deterministic and first-match ordered, but the policy is now a
+# separate YAML artifact which can be reviewed without editing application
+# code.  YAML never executes expressions: this loader accepts only a small,
+# finite condition vocabulary and rejects unknown fields, duplicate keys, bad
+# enum values, missing terminal coverage, and malformed templates.
+
+POLICY_SCHEMA_VERSION = "alignment-review-policy-v2"
+_DEFAULT_POLICY_PATH = Path(__file__).with_name("policies") / "alignment_review.yaml"
+
+
+class AlignmentPolicyError(ValueError):
+    """A review-classification policy is missing or unsafe to use.
+
+    Callers must not replace this with a default policy.  A failed load is a
+    fail-closed configuration error, preserving Principle 6.
+    """
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """Safe YAML loader which rejects duplicate mapping keys."""
+
+
+def _construct_unique_mapping(loader, node, deep=False):
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise AlignmentPolicyError(f"duplicate policy key: {key!r}")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping,
+)
+
+
+@dataclass(frozen=True)
+class AlignmentPolicyRule:
+    """One finite, conjunction-only matcher in first-match order."""
+
+    rule_id: str
+    review_category: str
+    reason_code: str
+    alignment_state_in: Tuple[str, ...] = ()
+    risk_flags_contains: Optional[str] = None
+    confidence_in: Tuple[str, ...] = ()
+    intent_field_in: Tuple[str, ...] = ()
+    runtime_check_in: Tuple[str, ...] = ()
+    capability_change_in: Tuple[str, ...] = ()
+
+    def matches(
+        self,
+        *,
+        alignment_state: str,
+        risk_flags: List[str],
+        confidence: str,
+        intent_field: Optional[str],
+        runtime_check: Optional[str],
+        capability_change: str,
+    ) -> bool:
+        return (
+            (not self.alignment_state_in or alignment_state in self.alignment_state_in)
+            and (self.risk_flags_contains is None or self.risk_flags_contains in risk_flags)
+            and (not self.confidence_in or confidence in self.confidence_in)
+            and (not self.intent_field_in or intent_field in self.intent_field_in)
+            and (not self.runtime_check_in or runtime_check in self.runtime_check_in)
+            and (
+                not self.capability_change_in
+                or capability_change in self.capability_change_in
+            )
+        )
+
+
+@dataclass(frozen=True)
+class AlignmentReviewPolicy:
+    policy_version: str
+    digest: str
+    reason_templates: Mapping[str, str]
+    rules: Tuple[AlignmentPolicyRule, ...]
+
+    def classify(
+        self,
+        *,
+        alignment_state: str,
+        risk_flags: List[str],
+        confidence: str,
+        intent_field: Optional[str],
+        runtime_check: Optional[str],
+        capability_change: str = "none",
+    ) -> Tuple[str, str]:
+        review_category, reason_code, _rule_id = self.classify_with_rule(
+            alignment_state=alignment_state,
+            risk_flags=risk_flags,
+            confidence=confidence,
+            intent_field=intent_field,
+            runtime_check=runtime_check,
+            capability_change=capability_change,
+        )
+        return review_category, reason_code
+
+    def classify_with_rule(
+        self,
+        *,
+        alignment_state: str,
+        risk_flags: List[str],
+        confidence: str,
+        intent_field: Optional[str],
+        runtime_check: Optional[str],
+        capability_change: str = "none",
+    ) -> Tuple[str, str, str]:
+        """Return the classification together with its unique policy rule."""
+        for rule in self.rules:
+            if rule.matches(
+                alignment_state=alignment_state,
+                risk_flags=risk_flags,
+                confidence=confidence,
+                intent_field=intent_field,
+                runtime_check=runtime_check,
+                capability_change=capability_change,
+            ):
+                return rule.review_category, rule.reason_code, rule.rule_id
+        raise AlignmentPolicyError(
+            "policy has no matching rule for "
+            f"alignment_state={alignment_state!r}, confidence={confidence!r}"
+        )
+
+
+def _require_mapping(value: Any, label: str) -> Mapping[str, Any]:
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        raise AlignmentPolicyError(f"{label} must be an object with string keys")
+    return value
+
+
+def _require_exact_keys(value: Mapping[str, Any], required: set, label: str) -> None:
+    actual = set(value)
+    if actual != required:
+        missing = sorted(required - actual)
+        unexpected = sorted(actual - required)
+        raise AlignmentPolicyError(
+            f"{label} must contain exactly {sorted(required)!r}; "
+            f"missing={missing!r}, unexpected={unexpected!r}"
+        )
+
+
+def _require_nonempty_string(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise AlignmentPolicyError(f"{label} must be a non-empty string")
+    return value
+
+
+def _parse_enum_list(value: Any, allowed: Tuple[str, ...], label: str) -> Tuple[str, ...]:
+    if not isinstance(value, list) or not value:
+        raise AlignmentPolicyError(f"{label} must be a non-empty list")
+    if any(not isinstance(item, str) or item not in allowed for item in value):
+        raise AlignmentPolicyError(f"{label} must be drawn from {allowed!r}")
+    if len(set(value)) != len(value):
+        raise AlignmentPolicyError(f"{label} must not contain duplicate values")
+    return tuple(value)
+
+
+def _parse_rule(raw_rule: Any, index: int) -> AlignmentPolicyRule:
+    label = f"rules[{index}]"
+    rule = _require_mapping(raw_rule, label)
+    _require_exact_keys(rule, {"id", "match", "review_category", "reason_code"}, label)
+    rule_id = _require_nonempty_string(rule["id"], f"{label}.id")
+    review_category = _require_nonempty_string(
+        rule["review_category"], f"{label}.review_category"
+    )
+    reason_code = _require_nonempty_string(rule["reason_code"], f"{label}.reason_code")
+    if review_category not in REVIEW_CATEGORIES:
+        raise AlignmentPolicyError(f"{label}.review_category is not a known category")
+    if reason_code not in REASON_CODES:
+        raise AlignmentPolicyError(f"{label}.reason_code is not a known reason code")
+
+    match = _require_mapping(rule["match"], f"{label}.match")
+    allowed_match_keys = {
+        "alignment_state_in", "risk_flags_contains", "confidence_in",
+        "intent_field_in", "runtime_check_in", "capability_change_in",
+    }
+    unknown_match_keys = set(match) - allowed_match_keys
+    if unknown_match_keys:
+        raise AlignmentPolicyError(
+            f"{label}.match has unsupported conditions: {sorted(unknown_match_keys)!r}"
+        )
+    if not match:
+        raise AlignmentPolicyError(f"{label}.match must contain at least one condition")
+
+    risk_flag = match.get("risk_flags_contains")
+    if risk_flag is not None:
+        if not isinstance(risk_flag, str) or risk_flag not in RISK_FLAGS:
+            raise AlignmentPolicyError(f"{label}.match.risk_flags_contains is invalid")
+
+    return AlignmentPolicyRule(
+        rule_id=rule_id,
+        review_category=review_category,
+        reason_code=reason_code,
+        alignment_state_in=(
+            _parse_enum_list(match["alignment_state_in"], ALIGNMENT_STATES,
+                             f"{label}.match.alignment_state_in")
+            if "alignment_state_in" in match else ()
+        ),
+        risk_flags_contains=risk_flag,
+        confidence_in=(
+            _parse_enum_list(match["confidence_in"], CONFIDENCE_LEVELS,
+                             f"{label}.match.confidence_in")
+            if "confidence_in" in match else ()
+        ),
+        intent_field_in=(
+            _parse_enum_list(match["intent_field_in"], INTENT_FIELDS,
+                             f"{label}.match.intent_field_in")
+            if "intent_field_in" in match else ()
+        ),
+        runtime_check_in=(
+            _parse_enum_list(match["runtime_check_in"], RUNTIME_CHECK_STATES,
+                             f"{label}.match.runtime_check_in")
+            if "runtime_check_in" in match else ()
+        ),
+        capability_change_in=(
+            _parse_enum_list(
+                match["capability_change_in"],
+                CAPABILITY_CHANGE_STATES,
+                f"{label}.match.capability_change_in",
+            )
+            if "capability_change_in" in match
+            else ()
+        ),
+    )
+
+
+def _validate_policy_coverage(policy: AlignmentReviewPolicy) -> None:
+    """Reject a policy that leaves any validated finite input unclassified."""
+    risk_combinations = [
+        [flag for bit, flag in enumerate(RISK_FLAGS) if mask & (1 << bit)]
+        for mask in range(1 << len(RISK_FLAGS))
+    ]
+    for state in ALIGNMENT_STATES:
+        for risk_flags in risk_combinations:
+            for confidence in CONFIDENCE_LEVELS:
+                for intent_field in (None, *INTENT_FIELDS):
+                    for runtime_check in (None, *RUNTIME_CHECK_STATES):
+                        for capability_change in CAPABILITY_CHANGE_STATES:
+                            policy.classify(
+                                alignment_state=state,
+                                risk_flags=risk_flags,
+                                confidence=confidence,
+                                intent_field=intent_field,
+                                runtime_check=runtime_check,
+                                capability_change=capability_change,
+                            )
+
+
+def load_alignment_review_policy(path: Optional[Path] = None) -> AlignmentReviewPolicy:
+    """Load and strictly validate the external alignment review policy.
+
+    There is intentionally no fallback path.  A missing or invalid policy
+    prevents classification rather than silently reverting to embedded rules.
+    """
+    policy_path = path or _DEFAULT_POLICY_PATH
+    try:
+        raw_bytes = policy_path.read_bytes()
+    except OSError as exc:
+        raise AlignmentPolicyError(f"cannot read alignment review policy: {policy_path}") from exc
+    try:
+        raw = yaml.load(raw_bytes.decode("utf-8"), Loader=_UniqueKeySafeLoader)
+    except (UnicodeDecodeError, yaml.YAMLError, AlignmentPolicyError) as exc:
+        raise AlignmentPolicyError(f"invalid alignment review policy: {policy_path}: {exc}") from exc
+
+    policy = _require_mapping(raw, "policy")
+    _require_exact_keys(
+        policy, {"schema_version", "policy_version", "reason_templates", "rules"}, "policy",
+    )
+    if policy["schema_version"] != POLICY_SCHEMA_VERSION:
+        raise AlignmentPolicyError(
+            f"policy.schema_version must be {POLICY_SCHEMA_VERSION!r}"
+        )
+    policy_version = _require_nonempty_string(policy["policy_version"], "policy.policy_version")
+    templates = _require_mapping(policy["reason_templates"], "policy.reason_templates")
+    if set(templates) != set(REASON_CODES):
+        raise AlignmentPolicyError("policy.reason_templates must cover exactly every reason code")
+    validated_templates = {
+        reason_code: _require_nonempty_string(templates[reason_code], f"reason_templates.{reason_code}")
+        for reason_code in REASON_CODES
+    }
+    raw_rules = policy["rules"]
+    if not isinstance(raw_rules, list) or not raw_rules:
+        raise AlignmentPolicyError("policy.rules must be a non-empty list")
+    rules = tuple(_parse_rule(raw_rule, index) for index, raw_rule in enumerate(raw_rules))
+    rule_ids = [rule.rule_id for rule in rules]
+    if len(set(rule_ids)) != len(rule_ids):
+        raise AlignmentPolicyError("policy.rules ids must be unique")
+
+    result = AlignmentReviewPolicy(
+        policy_version=policy_version,
+        digest=hashlib.sha256(raw_bytes).hexdigest(),
+        reason_templates=validated_templates,
+        rules=rules,
+    )
+    _validate_policy_coverage(result)
+    return result
+
+
+_ALIGNMENT_REVIEW_POLICY = load_alignment_review_policy()
+# Kept as a module-level mapping for existing callers/tests.  Its contents are
+# loaded from the external policy and are never a code fallback.
+USER_REASON_TEMPLATES: Dict[str, str] = dict(_ALIGNMENT_REVIEW_POLICY.reason_templates)
+
+
+def alignment_policy_version() -> str:
+    return _ALIGNMENT_REVIEW_POLICY.policy_version
+
+
+def alignment_policy_digest() -> str:
+    return _ALIGNMENT_REVIEW_POLICY.digest
 
 
 def user_reason_for(reason_code: str) -> str:
     return USER_REASON_TEMPLATES[reason_code]
-
-
-# --- Deterministic review classification rule table (Principle 6) -----------
-#
-# First match wins. Every branch's predicate reads only finite-set fields
-# already validated by generate_alignment_proposal (alignment_state,
-# risk_flags, confidence, intent_field) plus, from Issue #290,
-# runtime_check -- itself a finite state already validated deterministically
-# by app/runtime_alignment.py's compare_claim_to_runtime, never free text.
-# Kept as plain data (not nested if/elif) so tests can enumerate every rule
-# and assert on it directly, and so the priority order is visible at a
-# glance.
-
-_RulePredicate = Callable[[str, List[str], str, Optional[str], Optional[str]], bool]
-
-_RULES: List[Tuple[_RulePredicate, str, str]] = [
-    (lambda state, risk, conf, ifield, runtime_check: "security" in risk,
-     "must_review", "security_related"),
-    (lambda state, risk, conf, ifield, runtime_check: "high_risk" in risk,
-     "must_review", "high_risk"),
-    (lambda state, risk, conf, ifield, runtime_check: (
-        "core_intent" in risk or (ifield == "goal" and state in ("gap", "conflict"))
-     ), "must_review", "core_intent"),
-    (lambda state, risk, conf, ifield, runtime_check: state == "conflict",
-     "must_review", "conflict_detected"),
-    # Issue #290: a deterministic runtime/current-system mismatch is its own
-    # must_review reason, inserted after conflict_detected (an intent-vs-code
-    # conflict is a stronger, more specific signal) and before low_confidence
-    # (a runtime mismatch is a structural fact, not a confidence problem).
-    # stale/unobserved deliberately do NOT match here -- they never force
-    # must_review by themselves (brief).
-    (lambda state, risk, conf, ifield, runtime_check: runtime_check == "mismatch",
-     "must_review", "runtime_mismatch"),
-    (lambda state, risk, conf, ifield, runtime_check: conf in ("uncertain", "conflicting"),
-     "must_review", "low_confidence"),
-    (lambda state, risk, conf, ifield, runtime_check: state == "unknown",
-     "must_review", "low_confidence"),
-    (lambda state, risk, conf, ifield, runtime_check: state == "gap",
-     "batch_reviewable", "routine_update"),
-    (lambda state, risk, conf, ifield, runtime_check: state == "aligned",
-     "no_review_required", "no_change"),
-    (lambda state, risk, conf, ifield, runtime_check: state == "not_applicable",
-     "informational", "informational_only"),
-]
 
 
 def classify_alignment_item(
@@ -158,6 +424,7 @@ def classify_alignment_item(
     confidence: str,
     intent_field: Optional[str],
     runtime_check: Optional[str] = None,
+    capability_change: str = "none",
 ) -> Tuple[str, str]:
     """Deterministic (review_category, reason_code) for one alignment item.
 
@@ -173,10 +440,34 @@ def classify_alignment_item(
     already-validated input; the ``ValueError`` below only guards against a
     future rule-table edit accidentally leaving a state uncovered.
     """
-    for predicate, category, reason_code in _RULES:
-        if predicate(alignment_state, risk_flags, confidence, intent_field, runtime_check):
-            return category, reason_code
-    raise ValueError(f"No review rule matched alignment_state={alignment_state!r}")
+    return _ALIGNMENT_REVIEW_POLICY.classify(
+        alignment_state=alignment_state,
+        risk_flags=risk_flags,
+        confidence=confidence,
+        intent_field=intent_field,
+        runtime_check=runtime_check,
+        capability_change=capability_change,
+    )
+
+
+def classify_alignment_item_with_rule(
+    *,
+    alignment_state: str,
+    risk_flags: List[str],
+    confidence: str,
+    intent_field: Optional[str],
+    runtime_check: Optional[str] = None,
+    capability_change: str = "none",
+) -> Tuple[str, str, str]:
+    """Deterministically classify an item and expose the matched rule id."""
+    return _ALIGNMENT_REVIEW_POLICY.classify_with_rule(
+        alignment_state=alignment_state,
+        risk_flags=risk_flags,
+        confidence=confidence,
+        intent_field=intent_field,
+        runtime_check=runtime_check,
+        capability_change=capability_change,
+    )
 
 
 def review_sort_key(*, review_category: str, reason_code: str, item_id: int) -> tuple:
@@ -258,8 +549,10 @@ def review_sort_key(*, review_category: str, reason_code: str, item_id: int) -> 
 #   the case /correct does not: /confirm and /decline update status IN PLACE
 #   (same id, same value_text), so the id alone would not change.
 #
-# Callers that do not resolve a linked intent item pass ``None`` for both
-# (unchanged behavior, same as before this fields existed).
+# Issue #313 additionally includes the validated external policy digest. A
+# policy edit must never leave a previous ``accept_current`` result hidden as
+# ``unchanged`` under a different review policy; the digest therefore forces
+# safe reclassification after any reviewed policy change.
 
 
 def _read_lines(
@@ -326,6 +619,7 @@ def compute_content_hash(
     confidence: str,
     intent_field: Optional[str],
     runtime_check: Optional[str],
+    policy_digest: str,
     repo_path: str,
     commit_sha: str,
     intent_summary: Optional[str] = None,
@@ -344,7 +638,9 @@ def compute_content_hash(
     ``intent_item_id``/``linked_intent_digest`` (2nd review round, Finding 1)
     make the hash sensitive to the linked Intent Brief entity's own identity
     and current content, not just the field name it belongs to -- see the
-    module-level comment above.
+    module-level comment above. ``policy_digest`` makes a reviewed policy
+    change invalidate carry-over instead of silently preserving an old
+    classification.
     """
     cache: Dict[str, Optional[List[str]]] = (
         source_digest_cache if source_digest_cache is not None else {}
@@ -375,6 +671,7 @@ def compute_content_hash(
         "confidence": confidence,
         "intent_field": intent_field,
         "runtime_check": runtime_check,
+        "policy_digest": policy_digest,
         "intent_summary": intent_summary,
         "gap_summary": gap_summary,
         "proposed_interpretation": proposed_interpretation,
@@ -409,6 +706,8 @@ class _RawAlignmentItem(BaseModel):
     confidence: str = Field(..., min_length=1, max_length=20)
     gap_summary: Optional[str] = Field(default=None, max_length=1_000)
     proposed_interpretation: Optional[str] = Field(default=None, max_length=1_000)
+    capability_entity_ids: List[int] = Field(default_factory=list, max_length=20)
+    capability_relation_ids: List[int] = Field(default_factory=list, max_length=20)
 
 
 class _RawAlignmentResponse(BaseModel):
@@ -439,6 +738,8 @@ class AlignmentProposalItem:
     confidence: str
     gap_summary: Optional[str] = None
     proposed_interpretation: Optional[str] = None
+    capability_entity_ids: List[int] = field(default_factory=list)
+    capability_relation_ids: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -488,7 +789,9 @@ commentary), matching exactly this shape:
       "risk_flags": ["security" | "high_risk" | "core_intent", ...],
       "confidence": "confirmed | likely | uncertain | conflicting",
       "gap_summary": "what is missing or different, or null",
-      "proposed_interpretation": "a short suggested resolution, or null"
+      "proposed_interpretation": "a short suggested resolution, or null",
+      "capability_entity_ids": [1, ...],
+      "capability_relation_ids": [10, ...]
     }
   ]
 }
@@ -511,6 +814,12 @@ claim with no related intent (informational only).
 - "intent_field" identifies which Intent Brief field this item relates to, \
 or null when the claim is purely about the current system with no related \
 intent (typically paired with alignment_state "not_applicable").
+- When a confirmed capability graph is supplied, cite only ids present in \
+that graph. Use "capability_entity_ids" for claims directly about a canonical \
+capability definition. Use "capability_relation_ids" for claims about how a \
+lower-level function supports a Core Capability. A shared lower function's \
+different parent relations are different ids. Every Current System claim \
+must cite at least one entity or relation id when the graph is non-empty.
 - Do not propose more than one item per distinct current-system claim.
 - Never decide, adopt, or apply anything yourself here; you only propose \
 content for a human to review.
@@ -521,6 +830,7 @@ def _build_user_prompt(
     intent_items: List[Dict[str, object]],
     current_understanding: Optional[Dict[str, object]],
     gap_analysis: Optional[List[Dict[str, object]]],
+    confirmed_capability_graph: Optional[Dict[str, object]] = None,
 ) -> str:
     parts = [
         "## Intent Brief (current, non-superseded items; only the user can decide these)",
@@ -529,6 +839,9 @@ def _build_user_prompt(
         json.dumps(current_understanding or {}, ensure_ascii=False),
         "\n## Known gaps (docs/code reconciliation)",
         json.dumps(gap_analysis or [], ensure_ascii=False),
+        "\n## Manually confirmed canonical capability graph "
+        "(the only allowed capability dependency ids)",
+        json.dumps(confirmed_capability_graph or {}, ensure_ascii=False),
     ]
     return "\n".join(parts)
 
@@ -540,6 +853,7 @@ def generate_alignment_proposal(
     intent_items: List[Dict[str, object]],
     current_understanding: Optional[Dict[str, object]],
     gap_analysis: Optional[List[Dict[str, object]]],
+    confirmed_capability_graph: Optional[Dict[str, object]] = None,
 ) -> AlignmentProposalResult:
     """Propose alignment items contrasting Intent vs Current System.
 
@@ -561,7 +875,12 @@ def generate_alignment_proposal(
             ),
         )
 
-    prompt = _build_user_prompt(intent_items, current_understanding, gap_analysis)
+    prompt = _build_user_prompt(
+        intent_items,
+        current_understanding,
+        gap_analysis,
+        confirmed_capability_graph,
+    )
 
     try:
         raw = client.generate_text(
@@ -589,6 +908,17 @@ def generate_alignment_proposal(
         )
 
     items: List[AlignmentProposalItem] = []
+    allowed_entity_ids = {
+        item.get("entity_id")
+        for item in (confirmed_capability_graph or {}).get("nodes", [])
+        if isinstance(item, dict)
+    }
+    allowed_relation_ids = {
+        item.get("relation_id")
+        for item in (confirmed_capability_graph or {}).get("relations", [])
+        if isinstance(item, dict)
+    }
+    graph_requires_refs = bool(allowed_entity_ids or allowed_relation_ids)
     for raw_item in validated.items:
         if raw_item.alignment_state not in ALIGNMENT_STATES:
             return AlignmentProposalResult(
@@ -611,6 +941,35 @@ def generate_alignment_proposal(
                 provider=config.provider, model=config.model, is_mock=False,
                 error=f"Model returned an invalid intent_field: {raw_item.intent_field!r}",
             )
+        entity_ids = sorted(set(raw_item.capability_entity_ids))
+        relation_ids = sorted(set(raw_item.capability_relation_ids))
+        unknown_entity_ids = [
+            value for value in entity_ids if value not in allowed_entity_ids
+        ]
+        unknown_relation_ids = [
+            value for value in relation_ids if value not in allowed_relation_ids
+        ]
+        if unknown_entity_ids or unknown_relation_ids:
+            return AlignmentProposalResult(
+                provider=config.provider,
+                model=config.model,
+                is_mock=False,
+                error=(
+                    "Model returned capability dependency ids outside the "
+                    "confirmed graph: "
+                    f"entities={unknown_entity_ids}, relations={unknown_relation_ids}"
+                ),
+            )
+        if graph_requires_refs and not entity_ids and not relation_ids:
+            return AlignmentProposalResult(
+                provider=config.provider,
+                model=config.model,
+                is_mock=False,
+                error=(
+                    "Model omitted capability dependency ids for an item while "
+                    "a confirmed capability graph is active"
+                ),
+            )
         items.append(
             AlignmentProposalItem(
                 intent_field=raw_item.intent_field,
@@ -628,6 +987,8 @@ def generate_alignment_proposal(
                 confidence=raw_item.confidence,
                 gap_summary=raw_item.gap_summary,
                 proposed_interpretation=raw_item.proposed_interpretation,
+                capability_entity_ids=entity_ids,
+                capability_relation_ids=relation_ids,
             )
         )
 

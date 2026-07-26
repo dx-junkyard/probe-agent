@@ -70,6 +70,7 @@ def _ask_out(conn, row) -> CellAskOut:
         severity=row["severity"],
         status=row["status"],
         decision=row["decision"] or "",
+        decision_note=row["decision_note"] or "",
         decision_method=row["decision_method"] or "",
         decided_by=row["decided_by"],
         decided_at=row["decided_at"],

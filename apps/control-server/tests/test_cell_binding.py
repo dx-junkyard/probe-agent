@@ -593,7 +593,8 @@ class TestHealth:
         assert r.status_code == 200, r.text
         health = r.json()["state"]["health"]
         assert health["heartbeat_at"] == pytest.approx(now - 5, abs=1.0)
-        assert health["queue_length"] == 2
+        # Trace throughput is not pending queue depth.
+        assert health["queue_length"] == 0
         assert health["error_rate"] == pytest.approx(0.5)
         assert health["latency_p50_ms"] is not None
         assert health["latency_p95_ms"] is not None
