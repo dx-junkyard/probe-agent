@@ -1351,6 +1351,157 @@ def request_alignment_rule_recheck(
         )
 
 
+@router.get(
+    "/interview/alignment/rule-objections",
+    response_model=AlignmentRuleObjectionListOut,
+)
+def list_alignment_rule_objections(
+    system_id: int = Depends(get_system_id),
+) -> AlignmentRuleObjectionListOut:
+    """Return deterministic, reviewable objection totals per applied rule."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT o.reason_code, o.policy_version, o.policy_digest,
+                      o.policy_rule_id,
+                      COUNT(*) AS objection_count,
+                      COALESCE((
+                        SELECT COUNT(*) FROM alignment_manual_recheck_target t
+                        WHERE t.system_id = o.system_id
+                          AND t.reason_code = o.reason_code
+                          AND t.policy_version = o.policy_version
+                          AND t.policy_digest = COALESCE(o.policy_digest, '')
+                          AND t.policy_rule_id = o.policy_rule_id
+                          AND t.status = 'pending'
+                      ), 0) AS pending_recheck_count
+               FROM alignment_rule_objection o
+               WHERE o.system_id = ?
+               GROUP BY o.system_id, o.reason_code, o.policy_version,
+                        o.policy_digest, o.policy_rule_id
+               ORDER BY objection_count DESC, o.reason_code, o.policy_version,
+                        o.policy_digest, o.policy_rule_id""",
+            (system_id,),
+        ).fetchall()
+        return AlignmentRuleObjectionListOut(
+            system_id=system_id,
+            rules=[
+                AlignmentRuleObjectionOut(
+                    reason_code=row["reason_code"], policy_version=row["policy_version"],
+                    policy_digest=row["policy_digest"],
+                    policy_rule_id=row["policy_rule_id"],
+                    objection_count=row["objection_count"],
+                    pending_recheck_count=row["pending_recheck_count"],
+                )
+                for row in rows
+            ],
+        )
+
+
+@router.post(
+    "/interview/alignment/rules/{reason_code}/recheck",
+    response_model=AlignmentRuleRecheckOut,
+)
+def request_alignment_rule_recheck(
+    reason_code: str,
+    payload: AlignmentRuleRecheckRequest,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
+) -> AlignmentRuleRecheckOut:
+    """Explicitly return current similar items to the human Review Queue.
+
+    This endpoint is the only transition into manual recheck.  It requires a
+    previously recorded sample objection and never rewrites the deterministic
+    policy classification; it simply marks the matching, current items as
+    human-reviewable.  The ordinary answer/correct endpoints remain the only
+    way to resolve a target, preserving ``decision_method: manual``.
+    """
+    now = time.time()
+    with get_conn() as conn:
+        objection = conn.execute(
+            """SELECT 1 FROM alignment_rule_objection
+               WHERE system_id = ? AND reason_code = ?
+                 AND policy_version = ?
+                 AND COALESCE(policy_digest, '') = ?
+                 AND policy_rule_id = ?
+               LIMIT 1""",
+            (
+                system_id, reason_code, payload.policy_version,
+                payload.policy_digest or "", payload.policy_rule_id,
+            ),
+        ).fetchone()
+        if objection is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "alignment_rule_has_no_sample_objection",
+                    "message": "サンプル確認で異議が記録された分類ルールのみ再確認対象にできます。",
+                },
+            )
+        items = conn.execute(
+            """SELECT id, session_id, content_hash FROM alignment_item
+               WHERE system_id = ? AND superseded = 0
+                 AND review_category = 'no_review_required' AND reason_code = ?
+                 AND policy_version = ?
+                 AND COALESCE(policy_digest, '') = ?
+                 AND policy_rule_id = ?
+                 AND status NOT IN ('answered', 'corrected')
+                 AND content_hash IS NOT NULL
+               ORDER BY id""",
+            (
+                system_id, reason_code, payload.policy_version,
+                payload.policy_digest or "", payload.policy_rule_id,
+            ),
+        ).fetchall()
+        conn.execute("BEGIN")
+        try:
+            for item in items:
+                conn.execute(
+                    """INSERT INTO alignment_manual_recheck_target
+                       (system_id, session_id, alignment_item_id, reason_code,
+                        policy_version, policy_digest, policy_rule_id, content_hash,
+                        status, decision_method, requested_by_user_id,
+                        created_at, resolved_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'manual', ?, ?, NULL)
+                       ON CONFLICT(alignment_item_id) DO UPDATE SET
+                         reason_code = excluded.reason_code,
+                         policy_version = excluded.policy_version,
+                         policy_digest = excluded.policy_digest,
+                         policy_rule_id = excluded.policy_rule_id,
+                         content_hash = excluded.content_hash,
+                         status = 'pending',
+                         decision_method = 'manual',
+                         requested_by_user_id = excluded.requested_by_user_id,
+                         created_at = excluded.created_at,
+                         resolved_at = NULL""",
+                    (
+                        system_id, item["session_id"], item["id"], reason_code,
+                        payload.policy_version, payload.policy_digest or "",
+                        payload.policy_rule_id, item["content_hash"],
+                        principal.user_id, now,
+                    ),
+                )
+            if items:
+                placeholders = ",".join("?" for _ in items)
+                conn.execute(
+                    f"UPDATE alignment_item SET manual_recheck_required = 1, updated_at = ? "
+                    f"WHERE system_id = ? AND id IN ({placeholders})",
+                    (now, system_id, *(item["id"] for item in items)),
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return AlignmentRuleRecheckOut(
+            system_id=system_id,
+            reason_code=reason_code,
+            policy_version=payload.policy_version,
+            policy_digest=payload.policy_digest,
+            policy_rule_id=payload.policy_rule_id,
+            decision_method="manual",
+            requested_by_user_id=principal.user_id,
+            recheck_target_count=len(items),
+        )
+
+
 # --- Manual decisions --------------------------------------------------------
 
 
