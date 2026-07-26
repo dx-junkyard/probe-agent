@@ -87,6 +87,8 @@ import {
   useBuildAlignment,
   useCorrectAlignmentItem,
   useHoldAlignmentItem,
+  useAlignmentRuleObjections,
+  useRequestAlignmentRuleRecheck,
   useReviewQueue,
   recordInterviewMetricEventBestEffort,
 } from "@/api/hooks";
@@ -94,6 +96,7 @@ import type {
   AlignmentConfidence,
   AlignmentDecisionAction,
   AlignmentItemOut,
+  AlignmentRuleObjectionOut,
   AlignmentReviewCategory,
   AlignmentRiskFlag,
   AlignmentState,
@@ -141,6 +144,23 @@ const DECISION_LABELS: Record<AlignmentDecisionAction, string> = {
   needs_change: "変更が必要",
   reject_interpretation: "AIの解釈を採用しない",
 };
+
+const RULE_LABELS: Record<string, string> = {
+  security_related: "セキュリティ関連",
+  high_risk: "影響大",
+  core_intent: "目標に関わる",
+  conflict_detected: "矛盾検出",
+  low_confidence: "確信度不足",
+  runtime_mismatch: "実行時の不一致",
+  routine_update: "通常更新",
+  no_change: "差分なし",
+  informational_only: "参考情報のみ",
+  unchanged_since_confirmation: "前回確認から変更なし",
+};
+
+function ruleLabel(reasonCode: string): string {
+  return RULE_LABELS[reasonCode] ?? "分類ルール";
+}
 
 // Finding 4: full label set for a persisted user_decision.action (the answer
 // actions above plus /correct と /hold が記録する corrected / held)。監査詳細
@@ -784,6 +804,8 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
   const build = useBuildAlignment(sessionId);
   const batchAnswer = useAnswerAlignmentItemsBatch(sessionId);
   const activeInquiries = useActiveInquiriesByOrigin(sessionId);
+  const { data: ruleObjections } = useAlignmentRuleObjections();
+  const requestRecheck = useRequestAlignmentRuleRecheck(sessionId);
   const [showInformational, setShowInformational] = useState(false);
   const [showSuperseded, setShowSuperseded] = useState(false);
   const [bulkMode, setBulkMode] = useState(false);
@@ -801,6 +823,13 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
       onSuccess: result => {
         toast.success(`${result.items.length} 件の突き合わせ結果を更新しました`);
       },
+      onError: e => toast.error(String(e)),
+    });
+  };
+
+  const handleRequestRecheck = (rule: AlignmentRuleObjectionOut) => {
+    requestRecheck.mutate(rule, {
+      onSuccess: result => toast.success(`${result.recheck_target_count}件を再確認対象に戻しました`),
       onError: e => toast.error(String(e)),
     });
   };
@@ -1039,6 +1068,35 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
                 existingInquiry={activeInquiries.get(`review_item:${item.id}`)}
                 sample
               />
+            ))}
+          </div>
+        )}
+
+        {(ruleObjections?.rules.length ?? 0) > 0 && (
+          <div className="space-y-2 pt-2 border-t" data-testid="review-queue-rule-objections">
+            <p className="text-xs font-semibold text-muted-foreground">
+              サンプル確認で異議が出た分類ルール
+            </p>
+            {ruleObjections?.rules.map(rule => (
+              <div
+                key={`${rule.reason_code}:${rule.policy_version}:${rule.policy_digest ?? "legacy"}:${rule.policy_rule_id}`}
+                className="flex flex-wrap items-center justify-between gap-2 rounded-md border p-2 text-xs"
+              >
+                <span>
+                  {ruleLabel(rule.reason_code)}: 異議 {rule.objection_count}件
+                  {rule.pending_recheck_count > 0 && ` / 再確認中 ${rule.pending_recheck_count}件`}
+                  {` / ${rule.policy_rule_id} (${rule.policy_version})`}
+                </span>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={requestRecheck.isPending}
+                  onClick={() => handleRequestRecheck(rule)}
+                  data-testid={`review-queue-rule-recheck-${rule.policy_rule_id}`}
+                >
+                  同じ分類の項目を再確認する
+                </Button>
+              </div>
             ))}
           </div>
         )}

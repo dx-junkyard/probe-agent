@@ -2648,6 +2648,10 @@ CREATE TABLE IF NOT EXISTS alignment_item (
     -- than guessed to have been produced by a later YAML revision.
     policy_version          TEXT NOT NULL DEFAULT 'legacy-code-v1',
     policy_digest           TEXT,
+    policy_rule_id          TEXT,
+    -- Issue #310: this does not change deterministic classification.  It
+    -- only makes an explicitly human-selected recheck target actionable.
+    manual_recheck_required INTEGER NOT NULL DEFAULT 0,
     intelligence_run_id     INTEGER NOT NULL,
     is_mock                 INTEGER NOT NULL DEFAULT 0,
     created_at              REAL NOT NULL,
@@ -2667,6 +2671,60 @@ CREATE INDEX IF NOT EXISTS idx_alignment_item_system
 
 CREATE INDEX IF NOT EXISTS idx_alignment_item_review_queue
     ON alignment_item (session_id, review_category, status);
+
+-- Issue #310: an Inquiry opened from a deterministically selected
+-- no_review_required sample is an objection to the rule that classified the
+-- item.  This is deliberately separate from the Inquiry conversation: it is
+-- a compact, immutable audit fact keyed to the exact item/rule provenance,
+-- not an interpretation of the user's free-text question.
+CREATE TABLE IF NOT EXISTS alignment_rule_objection (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    session_id        INTEGER NOT NULL,
+    alignment_item_id INTEGER NOT NULL UNIQUE,
+    inquiry_id        INTEGER NOT NULL UNIQUE,
+    reason_code       TEXT NOT NULL,
+    policy_version    TEXT NOT NULL,
+    policy_digest     TEXT,
+    policy_rule_id    TEXT NOT NULL,
+    created_at        REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (alignment_item_id) REFERENCES alignment_item (id) ON DELETE CASCADE,
+    FOREIGN KEY (inquiry_id) REFERENCES interview_inquiry (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_alignment_rule_objection_system_rule
+    ON alignment_rule_objection (system_id, reason_code, id);
+
+-- A manual recheck target is an explicit, finite human action. The physical
+-- item link is nullable so an in-flight target survives the rebuild DELETE
+-- and can be rebound one-for-one to the same content in the same session.
+-- Exact policy provenance prevents an objection to one reviewed rule version
+-- from selecting a different version that happens to share a reason_code.
+CREATE TABLE IF NOT EXISTS alignment_manual_recheck_target (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id            INTEGER NOT NULL,
+    session_id           INTEGER NOT NULL,
+    alignment_item_id    INTEGER UNIQUE,
+    reason_code          TEXT NOT NULL,
+    policy_version       TEXT NOT NULL,
+    policy_digest        TEXT NOT NULL DEFAULT '',
+    policy_rule_id       TEXT NOT NULL,
+    content_hash         TEXT NOT NULL,
+    status               TEXT NOT NULL DEFAULT 'pending',
+    decision_method      TEXT NOT NULL DEFAULT 'manual',
+    requested_by_user_id INTEGER,
+    created_at           REAL NOT NULL,
+    resolved_at          REAL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (alignment_item_id) REFERENCES alignment_item (id) ON DELETE SET NULL,
+    FOREIGN KEY (requested_by_user_id) REFERENCES users (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_alignment_manual_recheck_target_pending
+    ON alignment_manual_recheck_target (system_id, status, content_hash);
 
 -- Automatic refresh job after an answer batch (Issue #288). One row per
 -- refresh attempt; app/interview_refresh.py's request_refresh() dedupes so
@@ -3722,6 +3780,90 @@ def _migrate_intelligence_runs_snapshot_nullable(conn: sqlite3.Connection) -> No
         conn.execute("PRAGMA foreign_keys=ON")
 
 
+def _migrate_alignment_manual_recheck_targets(conn: sqlite3.Connection) -> None:
+    """Replace Issue #310's globally hash-keyed target table.
+
+    The original shape collapsed identical content hashes across interview
+    sessions and did not retain the exact reviewed policy rule or the human
+    actor. Existing pending targets are expanded to every currently matching
+    item; unmatched legacy targets cannot be attributed to a session safely
+    and are deliberately not guessed.
+    """
+    columns = _columns(conn, "alignment_manual_recheck_target")
+    if not columns:
+        return
+    if "alignment_item_id" in columns:
+        # SCHEMA uses an old-shape-compatible bootstrap index so startup can
+        # reach this migration even if a legacy database lost its old index.
+        # Once the new columns are known to exist, install the selective form.
+        conn.execute("DROP INDEX IF EXISTS idx_alignment_manual_recheck_target_pending")
+        conn.execute(
+            """
+            CREATE INDEX idx_alignment_manual_recheck_target_pending
+            ON alignment_manual_recheck_target
+               (system_id, policy_version, policy_digest, policy_rule_id,
+                status, session_id)
+            """
+        )
+        return
+
+    conn.execute("DROP TABLE IF EXISTS _alignment_manual_recheck_target_new")
+    conn.execute(
+        """
+        CREATE TABLE _alignment_manual_recheck_target_new (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            system_id            INTEGER NOT NULL,
+            session_id           INTEGER NOT NULL,
+            alignment_item_id    INTEGER UNIQUE,
+            reason_code          TEXT NOT NULL,
+            policy_version       TEXT NOT NULL,
+            policy_digest        TEXT NOT NULL DEFAULT '',
+            policy_rule_id       TEXT NOT NULL,
+            content_hash         TEXT NOT NULL,
+            status               TEXT NOT NULL DEFAULT 'pending',
+            decision_method      TEXT NOT NULL DEFAULT 'manual',
+            requested_by_user_id INTEGER,
+            created_at           REAL NOT NULL,
+            resolved_at          REAL,
+            FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+            FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+            FOREIGN KEY (alignment_item_id)
+                REFERENCES alignment_item (id) ON DELETE SET NULL,
+            FOREIGN KEY (requested_by_user_id) REFERENCES users (id) ON DELETE SET NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO _alignment_manual_recheck_target_new
+            (system_id, session_id, alignment_item_id, reason_code,
+             policy_version, policy_digest, policy_rule_id, content_hash,
+             status, decision_method, requested_by_user_id, created_at, resolved_at)
+        SELECT old.system_id, item.session_id, item.id, old.reason_code,
+               item.policy_version, COALESCE(item.policy_digest, ''),
+               COALESCE(item.policy_rule_id, 'legacy-unknown'), old.content_hash,
+               old.status, 'manual', NULL, old.created_at, old.resolved_at
+        FROM alignment_manual_recheck_target old
+        JOIN alignment_item item
+          ON item.system_id = old.system_id
+         AND item.reason_code = old.reason_code
+         AND item.content_hash = old.content_hash
+        """
+    )
+    conn.execute("DROP TABLE alignment_manual_recheck_target")
+    conn.execute(
+        "ALTER TABLE _alignment_manual_recheck_target_new "
+        "RENAME TO alignment_manual_recheck_target"
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_alignment_manual_recheck_target_pending
+        ON alignment_manual_recheck_target
+           (system_id, policy_version, policy_digest, policy_rule_id, status, session_id)
+        """
+    )
+
+
 def _migrate_cell_improvement_event_types(conn: sqlite3.Connection) -> None:
     """Add ``approvals_invalidated`` to the SQLite CHECK constraint.
 
@@ -4270,6 +4412,36 @@ def init_db() -> None:
             )
         if alignment_item_cols and "policy_digest" not in alignment_item_cols:
             conn.execute("ALTER TABLE alignment_item ADD COLUMN policy_digest TEXT")
+        if alignment_item_cols and "policy_rule_id" not in alignment_item_cols:
+            conn.execute("ALTER TABLE alignment_item ADD COLUMN policy_rule_id TEXT")
+            # The only no_review_required rule in alignment-review-v1 is
+            # unambiguous, so existing rows from that reviewed artifact can
+            # be attributed without re-running or guessing classification.
+            conn.execute(
+                """UPDATE alignment_item
+                   SET policy_rule_id = 'aligned-no-change'
+                   WHERE policy_version = 'alignment-review-v1'
+                     AND review_category = 'no_review_required'
+                     AND reason_code = 'no_change'"""
+            )
+        if alignment_item_cols and "manual_recheck_required" not in alignment_item_cols:
+            conn.execute(
+                "ALTER TABLE alignment_item "
+                "ADD COLUMN manual_recheck_required INTEGER NOT NULL DEFAULT 0"
+            )
+        objection_cols = _columns(conn, "alignment_rule_objection")
+        if objection_cols and "policy_rule_id" not in objection_cols:
+            conn.execute(
+                "ALTER TABLE alignment_rule_objection "
+                "ADD COLUMN policy_rule_id TEXT NOT NULL DEFAULT 'legacy-unknown'"
+            )
+            conn.execute(
+                """UPDATE alignment_rule_objection
+                   SET policy_rule_id = 'aligned-no-change'
+                   WHERE policy_version = 'alignment-review-v1'
+                     AND reason_code = 'no_change'"""
+            )
+        _migrate_alignment_manual_recheck_targets(conn)
         _ensure_legacy_system(conn)
     _validate_startup_environment()
     _validate_publish_startup_config()

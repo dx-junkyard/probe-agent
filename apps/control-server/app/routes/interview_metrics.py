@@ -35,6 +35,13 @@ _EVENT_TARGETS: Dict[str, Set[str]] = {
     "question_presented": {"qa"},
 }
 
+_EVENT_PREREQUISITES: Dict[str, str] = {
+    "review_completed": "review_started",
+    "review_abandoned": "review_started",
+    "evidence_expanded": "evidence_available",
+    "unchanged_item_reconfirmed": "unchanged_item_presented",
+}
+
 
 def _event_out(row) -> InterviewMetricEventOut:
     return InterviewMetricEventOut(
@@ -121,6 +128,66 @@ def _validate_event_target(conn, payload: InterviewMetricEventCreate, system_id:
         raise HTTPException(status_code=404, detail="Metric event target not found")
 
 
+def _find_semantic_event(conn, payload: InterviewMetricEventCreate, system_id: int):
+    """Return the one persisted fact for this semantic observation, if any.
+
+    ``event_key`` is a transport retry key. It is deliberately not part of the
+    semantic identity: two clients/remounts observing the same event for the
+    same target must not create two metric facts merely because their keys
+    differ.
+    """
+
+    return conn.execute(
+        """SELECT * FROM interview_metric_event
+           WHERE system_id = ? AND session_id = ? AND event_type = ?
+             AND target_kind = ? AND target_id = ?
+           ORDER BY id
+           LIMIT 1""",
+        (
+            system_id,
+            payload.session_id,
+            payload.event_type,
+            payload.target_kind,
+            payload.target_id,
+        ),
+    ).fetchone()
+
+
+def _validate_event_prerequisite(
+    conn,
+    payload: InterviewMetricEventCreate,
+    system_id: int,
+) -> None:
+    prerequisite = _EVENT_PREREQUISITES.get(payload.event_type)
+    if prerequisite is None:
+        return
+    row = conn.execute(
+        """SELECT 1 FROM interview_metric_event
+           WHERE system_id = ? AND session_id = ? AND event_type = ?
+             AND target_kind = ? AND target_id = ?
+           LIMIT 1""",
+        (
+            system_id,
+            payload.session_id,
+            prerequisite,
+            payload.target_kind,
+            payload.target_id,
+        ),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "metric_event_prerequisite_missing",
+                "message": (
+                    f"{payload.event_type} requires a prior {prerequisite} "
+                    "event for the same target"
+                ),
+                "required_event_type": prerequisite,
+            },
+        )
+
+
 @router.post(
     "/interview/metric-events",
     response_model=InterviewMetricEventOut,
@@ -130,53 +197,72 @@ def create_interview_metric_event(
     payload: InterviewMetricEventCreate,
     system_id: int = Depends(get_system_id),
 ) -> InterviewMetricEventOut:
-    """Append one validated event, idempotent by (System, event_key)."""
+    """Append one validated event with transport and semantic idempotency."""
 
     with get_conn() as conn:
-        existing = conn.execute(
-            """SELECT * FROM interview_metric_event
-               WHERE system_id = ? AND event_key = ?""",
-            (system_id, payload.event_key),
-        ).fetchone()
-        if existing is not None:
-            matches = (
-                existing["session_id"] == payload.session_id
-                and existing["event_type"] == payload.event_type
-                and existing["target_kind"] == payload.target_kind
-                and existing["target_id"] == payload.target_id
-            )
-            if not matches:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "metric_event_key_conflict",
-                        "message": "event_key is already used by a different metric event",
-                    },
+        # Serialize the read-before-insert sequence across SQLite connections.
+        # SCHEMA intentionally remains unchanged; BEGIN IMMEDIATE closes the
+        # multi-worker race that an application-only semantic lookup would
+        # otherwise leave open.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = conn.execute(
+                """SELECT * FROM interview_metric_event
+                   WHERE system_id = ? AND event_key = ?""",
+                (system_id, payload.event_key),
+            ).fetchone()
+            if existing is not None:
+                matches = (
+                    existing["session_id"] == payload.session_id
+                    and existing["event_type"] == payload.event_type
+                    and existing["target_kind"] == payload.target_kind
+                    and existing["target_id"] == payload.target_id
                 )
-            return _event_out(existing)
+                if not matches:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "metric_event_key_conflict",
+                            "message": "event_key is already used by a different metric event",
+                        },
+                    )
+                conn.execute("COMMIT")
+                return _event_out(existing)
 
-        _validate_event_target(conn, payload, system_id)
-        recorded_at = time.time()
-        cur = conn.execute(
-            """INSERT INTO interview_metric_event
-                (event_key, system_id, session_id, event_type,
-                 target_kind, target_id, recorded_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (
-                payload.event_key,
-                system_id,
-                payload.session_id,
-                payload.event_type,
-                payload.target_kind,
-                payload.target_id,
-                recorded_at,
-            ),
-        )
-        row = conn.execute(
-            "SELECT * FROM interview_metric_event WHERE id = ?",
-            (cur.lastrowid,),
-        ).fetchone()
-        return _event_out(row)
+            _validate_event_target(conn, payload, system_id)
+
+            semantic_existing = _find_semantic_event(conn, payload, system_id)
+            if semantic_existing is not None:
+                conn.execute("COMMIT")
+                return _event_out(semantic_existing)
+
+            _validate_event_prerequisite(conn, payload, system_id)
+            recorded_at = time.time()
+            cur = conn.execute(
+                """INSERT INTO interview_metric_event
+                    (event_key, system_id, session_id, event_type,
+                     target_kind, target_id, recorded_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    payload.event_key,
+                    system_id,
+                    payload.session_id,
+                    payload.event_type,
+                    payload.target_kind,
+                    payload.target_id,
+                    recorded_at,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM interview_metric_event WHERE id = ?",
+                (cur.lastrowid,),
+            ).fetchone()
+            conn.execute("COMMIT")
+            return _event_out(row)
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
 
 
 @router.get("/interview/metrics", response_model=InterviewMetricsOut)

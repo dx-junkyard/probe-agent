@@ -1,17 +1,20 @@
 """Finite-vocabulary contract for ``intelligence_runs.run_type`` (Issue #315)."""
 
+import json
 import re
 import sqlite3
 import time
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from app import db
 from app.intelligence_run_types import (
     INTELLIGENCE_RUN_TYPES,
     IntelligenceRunType,
 )
+from app.models import IntelligenceRunOut
 
 
 @pytest.fixture
@@ -42,6 +45,22 @@ def _insert_run(connection, system_id: int, run_type: str) -> int:
                    'deterministic', 'completed', 0, ?, ?)""",
         (system_id, run_type, now, now),
     ).lastrowid
+
+
+def _run_out(run_type, *, snapshot_id=None):
+    return IntelligenceRunOut(
+        id=1,
+        system_id=1,
+        snapshot_id=snapshot_id,
+        run_type=run_type,
+        provider="test",
+        model="test",
+        prompt_version="test",
+        schema_version="test",
+        decision_method="deterministic",
+        status="completed",
+        started_at=0.0,
+    )
 
 
 def test_every_declared_run_type_is_accepted(conn):
@@ -91,6 +110,36 @@ def test_run_type_cannot_be_changed_to_an_unknown_value(conn):
     assert connection.execute(
         "SELECT run_type FROM intelligence_runs WHERE id = ?", (run_id,)
     ).fetchone()["run_type"] == IntelligenceRunType.SYMBOL_INDEX.value
+
+
+def test_api_model_uses_the_authoritative_run_type_and_nullable_snapshot():
+    assert IntelligenceRunOut.model_fields["run_type"].annotation is IntelligenceRunType
+    assert IntelligenceRunOut.model_fields["snapshot_id"].is_required()
+
+    for run_type in IntelligenceRunType:
+        model = _run_out(run_type.value)
+        assert model.run_type is run_type
+        assert model.snapshot_id is None
+
+    with pytest.raises(ValidationError):
+        _run_out("accidental_new_run")
+
+
+def test_shared_schema_matches_authoritative_run_type_and_nullable_snapshot():
+    schema_path = (
+        Path(__file__).resolve().parents[3]
+        / "shared"
+        / "schemas"
+        / "project_intelligence.schema.json"
+    )
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    run_schema = schema["definitions"]["IntelligenceRun"]
+
+    assert set(run_schema["properties"]["run_type"]["enum"]) == INTELLIGENCE_RUN_TYPES
+    assert set(run_schema["properties"]["snapshot_id"]["type"]) == {
+        "integer",
+        "null",
+    }
 
 
 def test_all_literal_production_writers_use_the_authoritative_vocabulary():

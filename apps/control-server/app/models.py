@@ -2,6 +2,8 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .intelligence_run_types import IntelligenceRunType
+
 Mode = Literal["off", "trace", "shadow"]
 Evaluation = Literal["better", "worse", "same", "unknown"]
 GenerationVerdict = Literal["better", "worse", "same", "unsafe", "error", "unknown"]
@@ -475,62 +477,6 @@ InclusionStatus = Literal[
 ]
 SnapshotStatus = Literal["not_configured", "indexing", "ready", "failed"]
 IntelligenceRunStatus = Literal["pending", "completed", "failed"]
-IntelligenceRunType = Literal[
-    "repository_drafts",
-    "system_profile_draft",
-    "feature_map_draft",
-    "symbol_index",
-    "feature_code_mapping",
-    "probe_plan",
-    "probe_plan_from_flow",
-    "capability_hierarchy",
-    "explanation_refresh",
-    "interview_proposal",
-    "interview_dialogue",
-    # Issue #130: pass 1 of the dialogue turn (choose evidence to read, or
-    # declare no evidence needed) is audited separately from pass 2 (question
-    # generation, run_type "interview_dialogue" above) so the two reasoning
-    # calls stay distinguishable in the audit trail.
-    "interview_evidence_selection",
-    # Issue #127/#123: the system-understanding review behind
-    # update-understanding (system_understanding_reviewer.py). Recorded for
-    # both success and failure so the reviewer's prompt_version stays
-    # auditable (Principle 7).
-    "understanding_review",
-    # Issue #135: reconciling approved metadata/probe plans against
-    # deterministic runtime trace aggregates. The aggregation itself is
-    # deterministic and not separately audited; only the reasoning
-    # reconciliation step that picks confirmation questions is.
-    "runtime_reality_check",
-    # Issue #168: Probe Pattern lifecycle. pattern_reconcile classifies saved
-    # pattern points against the latest snapshot (deterministic structural
-    # checks, escalating to reasoning for moved/split/missing);
-    # pattern_investigate is the "I don't know" investigation assistance;
-    # probe_plan_from_pattern records the manual decision that turned an
-    # approved reconciliation into a Probe Plan.
-    "pattern_reconcile",
-    "pattern_investigate",
-    "probe_plan_from_pattern",
-    # Issue #284: Intent Brief. Proposes missing goal/pain/success_criteria/
-    # priority/constraints/non_goals items from the session conversation and
-    # user_intent free text. Proposed items are never auto-confirmed.
-    "intent_proposal",
-    # Issue #285: Inquiry side-conversation answer generation (the overall
-    # composed outcome; superseded internals split into "question_route" and
-    # "investigation" below by Issue #286, each audited separately).
-    "inquiry_answer",
-    # Issue #286: Question Router classifies a question into
-    # human_only | system_researchable | hybrid before any investigation.
-    "question_route",
-    # Issue #286: read-only Investigation Agent research over the pinned
-    # snapshot, budget-bounded, for system_researchable/hybrid questions.
-    "investigation",
-    # Issue #290 Finding 5 (Part 2): semantic match/mismatch judge over
-    # alignment items whose deterministic runtime baseline is 'match'
-    # (app/runtime_match_judge.py). Never runs for stale/unobserved/
-    # environment-mismatch items -- those keep their deterministic value.
-    "runtime_match",
-]
 DecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
 # How a single hierarchy claim was produced. Kept distinct from the audit
 # DecisionMethod so source-authored facts stay visibly separate from
@@ -651,7 +597,7 @@ class RepositoryResyncJobOut(BaseModel):
 class IntelligenceRunOut(BaseModel):
     id: int
     system_id: int
-    snapshot_id: int
+    snapshot_id: Optional[int]
     run_type: IntelligenceRunType
     provider: str
     model: str
@@ -3432,6 +3378,13 @@ class AlignmentItemOut(BaseModel):
     # they were classified by the external policy.
     policy_version: str = "legacy-code-v1"
     policy_digest: Optional[str] = None
+    # Exact first-match YAML rule that produced the category/reason pair.
+    # Legacy and carried-over rows may not have one.
+    policy_rule_id: Optional[str] = None
+    # Issue #310: the deterministic category/reason_code remains unchanged.
+    # This flag only exposes an explicit human request to recheck this exact
+    # item in the normal Review Queue.
+    manual_recheck_required: bool = False
     intelligence_run_id: int
     is_mock: bool = False
     created_at: float
@@ -3475,6 +3428,43 @@ class AlignmentReviewQueueOut(BaseModel):
     session_id: int
     system_id: int
     items: List[AlignmentItemOut] = Field(default_factory=list)
+
+
+class AlignmentRuleObjectionOut(BaseModel):
+    """Deterministic, System-scoped aggregation of sample objections."""
+
+    reason_code: AlignmentReasonCode
+    policy_version: str
+    policy_digest: Optional[str] = None
+    policy_rule_id: str
+    objection_count: int
+    pending_recheck_count: int
+
+
+class AlignmentRuleObjectionListOut(BaseModel):
+    system_id: int
+    rules: List[AlignmentRuleObjectionOut] = Field(default_factory=list)
+
+
+class AlignmentRuleRecheckRequest(BaseModel):
+    """Exact reviewed rule provenance selected by the human."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    policy_version: str = Field(..., min_length=1, max_length=200)
+    policy_digest: Optional[str] = Field(default=None, max_length=128)
+    policy_rule_id: str = Field(..., min_length=1, max_length=200)
+
+
+class AlignmentRuleRecheckOut(BaseModel):
+    system_id: int
+    reason_code: AlignmentReasonCode
+    policy_version: str
+    policy_digest: Optional[str] = None
+    policy_rule_id: str
+    decision_method: Literal["manual"] = "manual"
+    requested_by_user_id: int
+    recheck_target_count: int
 
 
 class AlignmentAnswerRequest(BaseModel):

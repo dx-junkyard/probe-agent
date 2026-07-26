@@ -263,6 +263,16 @@ def test_event_metrics_are_idempotent_and_system_isolated(admin_client):
     assert retry.status_code == 201
     assert retry.json()["event_key"] == events_a[0]["event_key"]
 
+    # A different transport key for the same semantic observation is also
+    # idempotent and returns the first persisted event.
+    semantic_retry = post(
+        headers_a,
+        **{**events_a[0], "event_key": "a-review-start-from-remount"},
+    )
+    assert semantic_retry.status_code == 201
+    assert semantic_retry.json()["id"] == retry.json()["id"]
+    assert semantic_retry.json()["event_key"] == events_a[0]["event_key"]
+
     for event in (
         {
             "event_key": "a-review-start",  # same key is valid in another System
@@ -313,6 +323,7 @@ def test_event_metrics_are_idempotent_and_system_isolated(admin_client):
         target_id=session_a,
     )
     assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "metric_event_key_conflict"
 
 
 def test_deterministic_db_metrics_and_non_causal_metrics(admin_client):
@@ -558,23 +569,27 @@ def test_event_targets_cover_alignment_and_inquiry_evidence(admin_client):
             runtime_check="match",
         )
 
-    for event_key, target_kind, target_id in (
-        ("alignment-expand", "alignment_item", alignment_id),
-        ("inquiry-expand", "inquiry_message", message_id),
+    for prefix, target_kind, target_id in (
+        ("alignment", "alignment_item", alignment_id),
+        ("inquiry", "inquiry_message", message_id),
     ):
-        response = admin_client.post(
-            "/interview/metric-events",
-            headers=headers,
-            json={
-                "schema_version": "interview-metric-event-v1",
-                "event_key": event_key,
-                "session_id": session_id,
-                "event_type": "evidence_expanded",
-                "target_kind": target_kind,
-                "target_id": target_id,
-            },
-        )
-        assert response.status_code == 201, response.text
+        for suffix, event_type in (
+            ("available", "evidence_available"),
+            ("expand", "evidence_expanded"),
+        ):
+            response = admin_client.post(
+                "/interview/metric-events",
+                headers=headers,
+                json={
+                    "schema_version": "interview-metric-event-v1",
+                    "event_key": f"{prefix}-{suffix}",
+                    "session_id": session_id,
+                    "event_type": event_type,
+                    "target_kind": target_kind,
+                    "target_id": target_id,
+                },
+            )
+            assert response.status_code == 201, response.text
 
     # Unchanged events are rejected unless the persisted target itself was
     # deterministically classified unchanged.
@@ -591,3 +606,138 @@ def test_event_targets_cover_alignment_and_inquiry_evidence(admin_client):
         },
     )
     assert invalid.status_code == 422
+
+
+def test_metric_event_prerequisites_are_fail_closed(admin_client):
+    token = _login(admin_client)
+    system_id, snapshot_id, session_id, headers = _setup_system(
+        admin_client, token, "prerequisites",
+    )
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        qa_id = _insert_qa(
+            conn,
+            system_id=system_id,
+            session_id=session_id,
+            question_text="evidence",
+        )
+        run_id = _insert_run(
+            conn,
+            system_id=system_id,
+            snapshot_id=snapshot_id,
+        )
+        unchanged_id = _insert_alignment(
+            conn,
+            system_id=system_id,
+            session_id=session_id,
+            snapshot_id=snapshot_id,
+            run_id=run_id,
+            runtime_check="match",
+            review_category="unchanged",
+        )
+
+    def post(*, event_key, event_type, target_kind, target_id):
+        return admin_client.post(
+            "/interview/metric-events",
+            headers=headers,
+            json={
+                "schema_version": "interview-metric-event-v1",
+                "event_key": event_key,
+                "session_id": session_id,
+                "event_type": event_type,
+                "target_kind": target_kind,
+                "target_id": target_id,
+            },
+        )
+
+    dependent_events = (
+        ("completed", "review_completed", "session", session_id, "review_started"),
+        ("abandoned", "review_abandoned", "session", session_id, "review_started"),
+        ("expanded", "evidence_expanded", "qa", qa_id, "evidence_available"),
+        (
+            "reconfirmed",
+            "unchanged_item_reconfirmed",
+            "alignment_item",
+            unchanged_id,
+            "unchanged_item_presented",
+        ),
+    )
+    for event_key, event_type, target_kind, target_id, prerequisite in dependent_events:
+        response = post(
+            event_key=event_key,
+            event_type=event_type,
+            target_kind=target_kind,
+            target_id=target_id,
+        )
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == "metric_event_prerequisite_missing"
+        assert response.json()["detail"]["required_event_type"] == prerequisite
+
+    for event_key, event_type, target_kind, target_id in (
+        ("started", "review_started", "session", session_id),
+        ("available", "evidence_available", "qa", qa_id),
+        ("presented", "unchanged_item_presented", "alignment_item", unchanged_id),
+    ):
+        assert post(
+            event_key=event_key,
+            event_type=event_type,
+            target_kind=target_kind,
+            target_id=target_id,
+        ).status_code == 201
+
+    for event_key, event_type, target_kind, target_id, _prerequisite in dependent_events:
+        assert post(
+            event_key=event_key,
+            event_type=event_type,
+            target_kind=target_kind,
+            target_id=target_id,
+        ).status_code == 201
+
+
+def test_event_ratios_count_distinct_paired_semantic_facts(admin_client):
+    """Legacy duplicates/orphans cannot inflate an event ratio above one."""
+
+    token = _login(admin_client)
+    system_id, _snapshot_id, session_id, headers = _setup_system(
+        admin_client, token, "paired-ratios",
+    )
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        paired_qa_id = _insert_qa(
+            conn,
+            system_id=system_id,
+            session_id=session_id,
+            question_text="paired",
+        )
+        orphan_qa_id = _insert_qa(
+            conn,
+            system_id=system_id,
+            session_id=session_id,
+            question_text="orphan",
+        )
+        now = time.time()
+        events = (
+            ("available", "evidence_available", paired_qa_id),
+            ("expanded-1", "evidence_expanded", paired_qa_id),
+            ("expanded-2", "evidence_expanded", paired_qa_id),
+            ("orphan-expanded", "evidence_expanded", orphan_qa_id),
+        )
+        for event_key, event_type, target_id in events:
+            conn.execute(
+                """INSERT INTO interview_metric_event
+                    (event_key, system_id, session_id, event_type,
+                     target_kind, target_id, recorded_at)
+                   VALUES (?, ?, ?, ?, 'qa', ?, ?)""",
+                (event_key, system_id, session_id, event_type, target_id, now),
+            )
+
+    body = admin_client.get("/interview/metrics", headers=headers).json()
+    metric = _metric(body, "evidence_detail_expansion_rate")
+    assert metric["status"] == "measured"
+    assert metric["numerator"] == 1
+    assert metric["denominator"] == 1
+    assert metric["value"] == 1.0

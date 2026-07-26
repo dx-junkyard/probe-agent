@@ -497,10 +497,16 @@ def _protected_db_snapshot(system_id: int) -> Dict[str, list]:
         "code_entrypoints": (
             "SELECT * FROM code_entrypoints WHERE system_id = ? ORDER BY id"
         ),
+        "code_symbols": (
+            "SELECT * FROM code_symbols WHERE system_id = ? ORDER BY id"
+        ),
         "components": (
             "SELECT * FROM components WHERE system_id = ? ORDER BY component_id"
         ),
         "traces": "SELECT * FROM traces WHERE system_id = ? ORDER BY trace_id",
+        "agent_role_cards": (
+            "SELECT * FROM agent_role_cards WHERE system_id = ? ORDER BY id"
+        ),
         "cell_definitions": (
             "SELECT * FROM cell_definitions WHERE system_id = ? ORDER BY id"
         ),
@@ -512,6 +518,9 @@ def _protected_db_snapshot(system_id: int) -> Dict[str, list]:
         ),
         "cell_goals": "SELECT * FROM cell_goals WHERE system_id = ? ORDER BY id",
         "cell_tasks": "SELECT * FROM cell_tasks WHERE system_id = ? ORDER BY id",
+        "cell_task_events": (
+            "SELECT * FROM cell_task_events WHERE system_id = ? ORDER BY id"
+        ),
         "intelligence_runs": (
             "SELECT * FROM intelligence_runs WHERE system_id = ? ORDER BY id"
         ),

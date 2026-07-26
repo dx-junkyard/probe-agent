@@ -2331,10 +2331,12 @@ def test_alignment_item_additive_migrations_preserve_legacy_policy_provenance(tm
         assert "superseded" in cols
         assert "policy_version" in cols
         assert "policy_digest" in cols
+        assert "policy_rule_id" in cols
         row = check.execute("SELECT * FROM alignment_item WHERE id = 1").fetchone()
         assert row["superseded"] == 0
         assert row["policy_version"] == "legacy-code-v1"
         assert row["policy_digest"] is None
+        assert row["policy_rule_id"] is None
         check.close()
 
 
@@ -2788,3 +2790,231 @@ def test_outstanding_counts_matches_review_queue_after_answer(admin_client, tmp_
     assert after["outstanding_counts"]["must_review"] == len(queue["items"]) == 1
     assert b_id in {it["id"] for it in queue["items"]}
     assert a_id not in {it["id"] for it in queue["items"]}
+
+
+# --- Issue #310: sample objections and explicit rule recheck ----------------
+
+
+def test_legacy_recheck_target_migration_expands_same_hash_per_session():
+    """The old global hash target is migrated without collapsing sessions."""
+    import sqlite3
+
+    from app.db import _migrate_alignment_manual_recheck_targets
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE systems (id INTEGER PRIMARY KEY);
+        CREATE TABLE users (id INTEGER PRIMARY KEY);
+        CREATE TABLE interview_session (
+            id INTEGER PRIMARY KEY,
+            system_id INTEGER NOT NULL
+        );
+        CREATE TABLE alignment_item (
+            id INTEGER PRIMARY KEY,
+            system_id INTEGER NOT NULL,
+            session_id INTEGER NOT NULL,
+            reason_code TEXT NOT NULL,
+            policy_version TEXT NOT NULL,
+            policy_digest TEXT,
+            policy_rule_id TEXT,
+            content_hash TEXT
+        );
+        CREATE TABLE alignment_manual_recheck_target (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            system_id INTEGER NOT NULL,
+            reason_code TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at REAL NOT NULL,
+            resolved_at REAL,
+            UNIQUE (system_id, reason_code, content_hash)
+        );
+        INSERT INTO systems (id) VALUES (1);
+        INSERT INTO interview_session (id, system_id) VALUES (10, 1), (20, 1);
+        INSERT INTO alignment_item
+            (id, system_id, session_id, reason_code, policy_version,
+             policy_digest, policy_rule_id, content_hash)
+        VALUES
+            (100, 1, 10, 'no_change', 'alignment-review-v1',
+             'digest-v1', 'aligned-no-change', 'same-hash'),
+            (200, 1, 20, 'no_change', 'alignment-review-v1',
+             'digest-v1', 'aligned-no-change', 'same-hash');
+        INSERT INTO alignment_manual_recheck_target
+            (system_id, reason_code, content_hash, status, created_at)
+        VALUES (1, 'no_change', 'same-hash', 'pending', 1.0);
+        """
+    )
+
+    _migrate_alignment_manual_recheck_targets(conn)
+
+    columns = {
+        row["name"]
+        for row in conn.execute(
+            "PRAGMA table_info(alignment_manual_recheck_target)"
+        )
+    }
+    assert {
+        "session_id", "alignment_item_id", "policy_version", "policy_digest",
+        "policy_rule_id", "decision_method", "requested_by_user_id",
+    } <= columns
+    rows = conn.execute(
+        """SELECT session_id, alignment_item_id, policy_rule_id, decision_method
+           FROM alignment_manual_recheck_target ORDER BY session_id"""
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        (10, 100, "aligned-no-change", "manual"),
+        (20, 200, "aligned-no-change", "manual"),
+    ]
+    conn.close()
+
+
+def test_sample_objection_is_aggregated_and_explicitly_rechecks_similar_items(
+    admin_client, tmp_path, monkeypatch,
+):
+    """Only a displayed deterministic sample creates a rule objection; a
+    human must separately request that same-rule items return to the queue."""
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+    _stub_build(monkeypatch, items=[
+        _proposal_item(current_claim=f"確認不要 {i}", alignment_state="aligned", confidence="confirmed")
+        for i in range(4)
+    ])
+    built = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+    ids = sorted(item["id"] for item in built["items"])
+    assert {item["policy_rule_id"] for item in built["items"]} == {"aligned-no-change"}
+
+    # Four candidates means only the first three IDs are §5.4 samples.  The
+    # ordinary Inquiry is the existing explicit objection action.
+    _open_review_item_inquiry(admin_client, monkeypatch, session_id, ids[0], headers)
+    objections = admin_client.get("/interview/alignment/rule-objections", headers=headers)
+    assert objections.status_code == 200, objections.text
+    assert objections.json()["rules"] == [{
+        "reason_code": "no_change",
+        "policy_version": alignment_policy_version(),
+        "policy_digest": alignment_policy_digest(),
+        "policy_rule_id": "aligned-no-change",
+        "objection_count": 1,
+        "pending_recheck_count": 0,
+    }]
+
+    # This direct Inquiry is not a selected sample (fourth ID), so it must
+    # not alter the deterministic rule-objection count.
+    _open_review_item_inquiry(admin_client, monkeypatch, session_id, ids[3], headers)
+    assert admin_client.get("/interview/alignment/rule-objections", headers=headers).json()["rules"][0]["objection_count"] == 1
+
+    # A reason_code is not a stable rule identity: the exact reviewed policy
+    # artifact/rule must match the objection.
+    wrong_provenance = admin_client.post(
+        "/interview/alignment/rules/no_change/recheck",
+        json={
+            "policy_version": "alignment-review-v2",
+            "policy_digest": "different-policy-digest",
+            "policy_rule_id": "aligned-no-change",
+        },
+        headers=headers,
+    )
+    assert wrong_provenance.status_code == 409
+
+    # Identical content in another session is a different human recheck
+    # target. The original globally hash-keyed table collapsed these rows.
+    second_session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(
+        second_session_id, system_id, snapshot_id, current_understanding={},
+    )
+    second_built = admin_client.post(
+        f"/interview/sessions/{second_session_id}/alignment/build", headers=headers,
+    ).json()
+    second_ids = sorted(item["id"] for item in second_built["items"])
+    assert [item["content_hash"] for item in built["items"]] == [
+        item["content_hash"] for item in second_built["items"]
+    ]
+
+    recheck = admin_client.post(
+        "/interview/alignment/rules/no_change/recheck",
+        json={
+            "policy_version": alignment_policy_version(),
+            "policy_digest": alignment_policy_digest(),
+            "policy_rule_id": "aligned-no-change",
+        },
+        headers=headers,
+    )
+    assert recheck.status_code == 200, recheck.text
+    assert recheck.json()["recheck_target_count"] == 8
+    assert recheck.json()["decision_method"] == "manual"
+    assert recheck.json()["policy_rule_id"] == "aligned-no-change"
+
+    # The original deterministic category is retained, but every same-rule
+    # item is now an explicitly human-reviewable queue target.
+    queue = admin_client.get(f"/interview/sessions/{session_id}/review-queue", headers=headers)
+    assert queue.status_code == 200, queue.text
+    assert {item["id"] for item in queue.json()["items"]} == set(ids)
+    assert all(item["review_category"] == "no_review_required" for item in queue.json()["items"])
+    assert all(item["manual_recheck_required"] is True for item in queue.json()["items"])
+    second_queue = admin_client.get(
+        f"/interview/sessions/{second_session_id}/review-queue", headers=headers,
+    ).json()
+    assert {item["id"] for item in second_queue["items"]} == set(second_ids)
+
+    summary = admin_client.get("/interview/alignment/rule-objections", headers=headers).json()
+    assert summary["rules"][0]["pending_recheck_count"] == 8
+
+    from app.db import get_conn
+    with get_conn() as conn:
+        target_audit = conn.execute(
+            """SELECT COUNT(*) AS target_count,
+                      COUNT(DISTINCT session_id) AS session_count,
+                      MIN(decision_method) AS decision_method,
+                      MIN(requested_by_user_id) AS requested_by_user_id
+               FROM alignment_manual_recheck_target
+               WHERE system_id = ? AND status = 'pending'""",
+            (system_id,),
+        ).fetchone()
+    assert target_audit["target_count"] == 8
+    assert target_audit["session_count"] == 2
+    assert target_audit["decision_method"] == "manual"
+    assert target_audit["requested_by_user_id"] is not None
+
+    # If one session rebuilds to genuinely different content, only that
+    # session's old targets become superseded; the other session remains
+    # actionable even though the pre-rebuild hashes were identical.
+    _stub_build(monkeypatch, items=[
+        _proposal_item(
+            current_claim=f"変更された確認不要 {i}",
+            alignment_state="aligned",
+            confidence="confirmed",
+        )
+        for i in range(4)
+    ])
+    rebuilt_second = admin_client.post(
+        f"/interview/sessions/{second_session_id}/alignment/build",
+        headers=headers,
+    )
+    assert rebuilt_second.status_code == 200, rebuilt_second.text
+    after_change = admin_client.get(
+        "/interview/alignment/rule-objections", headers=headers,
+    ).json()
+    assert after_change["rules"][0]["pending_recheck_count"] == 4
+    with get_conn() as conn:
+        superseded_targets = conn.execute(
+            """SELECT COUNT(*) AS n FROM alignment_manual_recheck_target
+               WHERE system_id = ? AND session_id = ? AND status = 'superseded'""",
+            (system_id, second_session_id),
+        ).fetchone()["n"]
+    assert superseded_targets == 4
+
+    # Recheck uses the ordinary, explicitly manual decision endpoint; it is
+    # not a hidden automatic approval.  Resolving one target updates only
+    # that target's pending count.
+    refresh_calls = _spy_request_refresh(monkeypatch)
+    answered = admin_client.post(
+        f"/interview/alignment/{ids[1]}/answer",
+        json={"decision": "accept_current"}, headers=headers,
+    )
+    assert answered.status_code == 200, answered.text
+    assert answered.json()["user_decision"]["action"] == "accept_current"
+    assert len(refresh_calls) == 1
+    assert admin_client.get("/interview/alignment/rule-objections", headers=headers).json()["rules"][0]["pending_recheck_count"] == 3
