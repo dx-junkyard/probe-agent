@@ -34,6 +34,7 @@ import type {
   InterviewInquiryOriginKind,
   AlignmentBuildOut, AlignmentListOut, AlignmentReviewQueueOut, AlignmentItemOut,
   AlignmentDecisionAction,
+  AlignmentRuleObjectionListOut, AlignmentRuleRecheckOut,
   AlignmentBatchAnswerItemRequest, AlignmentBatchAnswerOut,
   InterviewMetricsOut, InterviewMetricEventCreate, InterviewMetricEventOut,
   RuntimeObservationProposalOut, RuntimeObservationProposalCreate,
@@ -1244,9 +1245,27 @@ export function useReviewQueue(sessionId: number | null) {
   });
 }
 
+export function useAlignmentRuleObjections() {
+  return useQuery({
+    queryKey: sysKey("alignmentRuleObjections"),
+    queryFn: () => api.get<AlignmentRuleObjectionListOut>("/interview/alignment/rule-objections"),
+    enabled: !!getSystemId(),
+  });
+}
+
 function _invalidateAlignment(qc: ReturnType<typeof useQueryClient>, sessionId: number | null) {
   qc.invalidateQueries({ queryKey: [...sysKey("alignment"), sessionId] });
   qc.invalidateQueries({ queryKey: [...sysKey("reviewQueue"), sessionId] });
+  qc.invalidateQueries({ queryKey: sysKey("alignmentRuleObjections") });
+}
+
+export function useRequestAlignmentRuleRecheck(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ reasonCode }: { reasonCode: string }) =>
+      api.post<AlignmentRuleRecheckOut>(`/interview/alignment/rules/${reasonCode}/recheck`),
+    onSuccess: () => _invalidateAlignment(qc, sessionId),
+  });
 }
 
 export function useBuildAlignment(sessionId: number | null) {

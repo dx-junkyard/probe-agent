@@ -63,6 +63,7 @@ from ..interview_context import build_interview_context
 from ..interview_language import interview_message, resolve_message_language
 from ..inquiry_answering import InquiryAnswerResult, generate_inquiry_answer
 from ..investigation_persistence import persist_investigation_run, persist_route_run
+from .interview_alignment import record_sample_rule_objection
 from ..llm import LLMConfig, LLMError, create_llm_client
 from ..models import (
     InterviewInquiryCreate,
@@ -565,6 +566,19 @@ def create_inquiry(
                 status="inquiry",
                 now=now,
             )
+            # Issue #310: an Inquiry is the existing, explicit "this
+            # understanding is questionable" action.  For a deterministic
+            # §5.4 no-review sample, record its exact rule provenance in the
+            # same transaction as the Inquiry; all other origins are no-ops.
+            if payload.origin_kind == "review_item":
+                record_sample_rule_objection(
+                    conn,
+                    system_id=system_id,
+                    session_id=session_id,
+                    item_id=payload.origin_id,
+                    inquiry_id=inquiry_id,
+                    now=now,
+                )
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")

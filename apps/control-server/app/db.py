@@ -2648,6 +2648,9 @@ CREATE TABLE IF NOT EXISTS alignment_item (
     -- than guessed to have been produced by a later YAML revision.
     policy_version          TEXT NOT NULL DEFAULT 'legacy-code-v1',
     policy_digest           TEXT,
+    -- Issue #310: this does not change deterministic classification.  It
+    -- only makes an explicitly human-selected recheck target actionable.
+    manual_recheck_required INTEGER NOT NULL DEFAULT 0,
     intelligence_run_id     INTEGER NOT NULL,
     is_mock                 INTEGER NOT NULL DEFAULT 0,
     created_at              REAL NOT NULL,
@@ -2667,6 +2670,48 @@ CREATE INDEX IF NOT EXISTS idx_alignment_item_system
 
 CREATE INDEX IF NOT EXISTS idx_alignment_item_review_queue
     ON alignment_item (session_id, review_category, status);
+
+-- Issue #310: an Inquiry opened from a deterministically selected
+-- no_review_required sample is an objection to the rule that classified the
+-- item.  This is deliberately separate from the Inquiry conversation: it is
+-- a compact, immutable audit fact keyed to the exact item/rule provenance,
+-- not an interpretation of the user's free-text question.
+CREATE TABLE IF NOT EXISTS alignment_rule_objection (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    session_id        INTEGER NOT NULL,
+    alignment_item_id INTEGER NOT NULL UNIQUE,
+    inquiry_id        INTEGER NOT NULL UNIQUE,
+    reason_code       TEXT NOT NULL,
+    policy_version    TEXT NOT NULL,
+    policy_digest     TEXT,
+    created_at        REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (alignment_item_id) REFERENCES alignment_item (id) ON DELETE CASCADE,
+    FOREIGN KEY (inquiry_id) REFERENCES interview_inquiry (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_alignment_rule_objection_system_rule
+    ON alignment_rule_objection (system_id, reason_code, id);
+
+-- A manual recheck target is an explicit, finite human action.  It is keyed
+-- by content_hash so an in-flight target survives a rebuild only when the
+-- exact classified item still exists; changed content is classified afresh.
+CREATE TABLE IF NOT EXISTS alignment_manual_recheck_target (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    reason_code       TEXT NOT NULL,
+    content_hash      TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'pending',
+    created_at        REAL NOT NULL,
+    resolved_at       REAL,
+    UNIQUE (system_id, reason_code, content_hash),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_alignment_manual_recheck_target_pending
+    ON alignment_manual_recheck_target (system_id, status, content_hash);
 
 -- Automatic refresh job after an answer batch (Issue #288). One row per
 -- refresh attempt; app/interview_refresh.py's request_refresh() dedupes so
@@ -4270,6 +4315,11 @@ def init_db() -> None:
             )
         if alignment_item_cols and "policy_digest" not in alignment_item_cols:
             conn.execute("ALTER TABLE alignment_item ADD COLUMN policy_digest TEXT")
+        if alignment_item_cols and "manual_recheck_required" not in alignment_item_cols:
+            conn.execute(
+                "ALTER TABLE alignment_item "
+                "ADD COLUMN manual_recheck_required INTEGER NOT NULL DEFAULT 0"
+            )
         _ensure_legacy_system(conn)
     _validate_startup_environment()
     _validate_publish_startup_config()

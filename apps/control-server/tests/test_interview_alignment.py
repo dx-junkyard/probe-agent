@@ -2788,3 +2788,71 @@ def test_outstanding_counts_matches_review_queue_after_answer(admin_client, tmp_
     assert after["outstanding_counts"]["must_review"] == len(queue["items"]) == 1
     assert b_id in {it["id"] for it in queue["items"]}
     assert a_id not in {it["id"] for it in queue["items"]}
+
+
+# --- Issue #310: sample objections and explicit rule recheck ----------------
+
+
+def test_sample_objection_is_aggregated_and_explicitly_rechecks_similar_items(
+    admin_client, tmp_path, monkeypatch,
+):
+    """Only a displayed deterministic sample creates a rule objection; a
+    human must separately request that same-rule items return to the queue."""
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _insert_revision(session_id, system_id, snapshot_id, current_understanding={})
+    _stub_build(monkeypatch, items=[
+        _proposal_item(current_claim=f"確認不要 {i}", alignment_state="aligned", confidence="confirmed")
+        for i in range(4)
+    ])
+    built = admin_client.post(f"/interview/sessions/{session_id}/alignment/build", headers=headers).json()
+    ids = sorted(item["id"] for item in built["items"])
+
+    # Four candidates means only the first three IDs are §5.4 samples.  The
+    # ordinary Inquiry is the existing explicit objection action.
+    _open_review_item_inquiry(admin_client, monkeypatch, session_id, ids[0], headers)
+    objections = admin_client.get("/interview/alignment/rule-objections", headers=headers)
+    assert objections.status_code == 200, objections.text
+    assert objections.json()["rules"] == [{
+        "reason_code": "no_change",
+        "policy_version": alignment_policy_version(),
+        "policy_digest": alignment_policy_digest(),
+        "objection_count": 1,
+        "pending_recheck_count": 0,
+    }]
+
+    # This direct Inquiry is not a selected sample (fourth ID), so it must
+    # not alter the deterministic rule-objection count.
+    _open_review_item_inquiry(admin_client, monkeypatch, session_id, ids[3], headers)
+    assert admin_client.get("/interview/alignment/rule-objections", headers=headers).json()["rules"][0]["objection_count"] == 1
+
+    recheck = admin_client.post(
+        "/interview/alignment/rules/no_change/recheck", headers=headers,
+    )
+    assert recheck.status_code == 200, recheck.text
+    assert recheck.json()["recheck_target_count"] == 4
+
+    # The original deterministic category is retained, but every same-rule
+    # item is now an explicitly human-reviewable queue target.
+    queue = admin_client.get(f"/interview/sessions/{session_id}/review-queue", headers=headers)
+    assert queue.status_code == 200, queue.text
+    assert {item["id"] for item in queue.json()["items"]} == set(ids)
+    assert all(item["review_category"] == "no_review_required" for item in queue.json()["items"])
+    assert all(item["manual_recheck_required"] is True for item in queue.json()["items"])
+
+    summary = admin_client.get("/interview/alignment/rule-objections", headers=headers).json()
+    assert summary["rules"][0]["pending_recheck_count"] == 4
+
+    # Recheck uses the ordinary, explicitly manual decision endpoint; it is
+    # not a hidden automatic approval.  Resolving one target updates only
+    # that target's pending count.
+    refresh_calls = _spy_request_refresh(monkeypatch)
+    answered = admin_client.post(
+        f"/interview/alignment/{ids[1]}/answer",
+        json={"decision": "accept_current"}, headers=headers,
+    )
+    assert answered.status_code == 200, answered.text
+    assert answered.json()["user_decision"]["action"] == "accept_current"
+    assert len(refresh_calls) == 1
+    assert admin_client.get("/interview/alignment/rule-objections", headers=headers).json()["rules"][0]["pending_recheck_count"] == 3

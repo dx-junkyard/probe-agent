@@ -89,7 +89,9 @@ let getImpl: (path: string) => unknown;
 
 beforeEach(() => {
   vi.clearAllMocks();
-  getImpl = () => Promise.resolve(undefined);
+  getImpl = (path: string) => Promise.resolve(
+    path === "/interview/alignment/rule-objections" ? { system_id: 1, rules: [] } : undefined,
+  );
   mockApi.get.mockImplementation((path: string) => getImpl(path));
 });
 

@@ -3432,6 +3432,10 @@ class AlignmentItemOut(BaseModel):
     # they were classified by the external policy.
     policy_version: str = "legacy-code-v1"
     policy_digest: Optional[str] = None
+    # Issue #310: the deterministic category/reason_code remains unchanged.
+    # This flag only exposes an explicit human request to recheck this exact
+    # item in the normal Review Queue.
+    manual_recheck_required: bool = False
     intelligence_run_id: int
     is_mock: bool = False
     created_at: float
@@ -3475,6 +3479,27 @@ class AlignmentReviewQueueOut(BaseModel):
     session_id: int
     system_id: int
     items: List[AlignmentItemOut] = Field(default_factory=list)
+
+
+class AlignmentRuleObjectionOut(BaseModel):
+    """Deterministic, System-scoped aggregation of sample objections."""
+
+    reason_code: AlignmentReasonCode
+    policy_version: str
+    policy_digest: Optional[str] = None
+    objection_count: int
+    pending_recheck_count: int
+
+
+class AlignmentRuleObjectionListOut(BaseModel):
+    system_id: int
+    rules: List[AlignmentRuleObjectionOut] = Field(default_factory=list)
+
+
+class AlignmentRuleRecheckOut(BaseModel):
+    system_id: int
+    reason_code: AlignmentReasonCode
+    recheck_target_count: int
 
 
 class AlignmentAnswerRequest(BaseModel):
