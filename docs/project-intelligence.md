@@ -4280,6 +4280,20 @@ snapshot / revision は監査参照(retention 時は `ON DELETE SET NULL`)、
 hash / digest / tracking version は**意味内容の比較に使う監査事実**として
 retention 後も残る。
 
+`premise_capability_digest` の入力は `alignment_item_capability_dependency`
+の `(entity_id | relation_id, captured_digest)` 対だけで、所属する
+`alignment_item_capability_scope.confirmation_id` は**意図的に含めない**。
+Alignment は新しい Understanding revision に対して確定 Capability graph を
+要求するため、確定し直すたびに `confirmation_id` は必ず変わる。これを
+digest に入れると、自分が引用している entity / relation が1つも動いていない
+Inquiry まで次のビルドで `capability_scope_changed` として失効してしまい、
+「ID が変わっただけでは失効させない」(#323)に反する。#312 の
+`_capability_scope_changed` も同じ理由で、`confirmation_id` の相違だけでは
+変更と見なさず、その item 自身の entity / relation id が変更集合に入って
+いるかで判定している。`captured_digest` は entity / relation の
+`semantic_digest` であり、id は確定をまたいで安定なので、この対そのものが
+scope の「意味」である。
+
 `premise_tracking_state`(API のみ、保存しない決定的導出値)は有限集合
 `not_applicable | untrackable | tracked`。
 
@@ -4383,6 +4397,11 @@ item から新しい Inquiry を開いて行う。
 - 元 item が `status='inquiry'` でロックされたままにならないよう、他に
   active な Inquiry が無ければ `open` に戻す(`answered` にはしない。
   #287 の release 規則と同じ)。
+- `removed` / `ambiguous` では旧物理行を `superseded = 1` に**しない**。
+  一意な後継が無い以上、その論点を履歴化してよいかは決定的に言えず、
+  行を隠すと未回答の確認項目が黙って消える。ロックだけ外して `open` の
+  まま Review Queue に残し、判断は開発者に委ねる(後継の推測をしないのと
+  同じ理由で、消滅の推測もしない)。
 - `superseded` は終端なので、同じ rebuild を何度実行しても2つ目の遷移行や
   重複した recheck 対象は作られない(冪等)。
 

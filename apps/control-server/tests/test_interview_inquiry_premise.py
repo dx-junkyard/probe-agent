@@ -129,19 +129,17 @@ def test_capability_scope_digest_is_order_independent_and_scope_sensitive():
         {"target_kind": "relation", "entity_id": None, "relation_id": 5, "captured_digest": "d5"},
         {"target_kind": "entity", "entity_id": 1, "relation_id": None, "captured_digest": "d1"},
     ]
-    digest = compute_capability_scope_digest(confirmation_id=7, dependencies=dependencies)
+    digest = compute_capability_scope_digest(dependencies=dependencies)
     assert digest == compute_capability_scope_digest(
-        confirmation_id=7, dependencies=list(reversed(dependencies)),
+        dependencies=list(reversed(dependencies)),
     )
-    # The confirmed composition and each captured digest are both part of it.
-    assert digest != compute_capability_scope_digest(confirmation_id=8, dependencies=dependencies)
+    # Each cited id and its captured semantic digest are part of it.
     changed = [dict(d) for d in dependencies]
     changed[0]["captured_digest"] = "other"
-    assert digest != compute_capability_scope_digest(confirmation_id=7, dependencies=changed)
+    assert digest != compute_capability_scope_digest(dependencies=changed)
+    assert digest != compute_capability_scope_digest(dependencies=dependencies[:2])
     # An empty scope is a real, comparable fact -- never None.
-    assert isinstance(
-        compute_capability_scope_digest(confirmation_id=None, dependencies=[]), str
-    )
+    assert isinstance(compute_capability_scope_digest(dependencies=[]), str)
 
 
 @pytest.mark.parametrize(
@@ -686,6 +684,89 @@ def test_lineage_does_not_break_unchanged_carry_over(admin_client, tmp_path, mon
 
 
 # --- #323: premise evaluation and the superseded transition -------------------
+
+
+def test_capability_scope_digest_ignores_the_confirmation_version(
+    admin_client, tmp_path, monkeypatch,
+):
+    """A new Capability confirmation alone must not expire a premise.
+
+    Alignment refuses to build unless the session's revision has its own
+    confirmation, so every rebuild after a fresh Understanding revision
+    carries a NEW confirmation_id. If that version identifier were part of
+    the digest, every tracked Inquiry would be superseded with
+    `capability_scope_changed` on the next rebuild even when its own cited
+    entities/relations never moved -- exactly the "an id changed" expiry
+    Issue #323 forbids (and the opposite of Issue #312's own rule).
+    """
+    from app.db import get_conn
+    from app.inquiry_premise import capability_scope_digest_for_item
+
+    headers, system_id, session_id, _snapshot_id = _setup(admin_client, tmp_path)
+    _insert_intent_item(session_id, system_id, field="pain")
+    items = _build(admin_client, headers, session_id, monkeypatch, [_proposal_item()])
+    item_ids = [it["id"] for it in items]
+    assert len(item_ids) == 1
+
+    now = time.time()
+    with get_conn() as conn:
+        entity_id = conn.execute(
+            """INSERT INTO understanding_capability_entity (system_id, entity_kind, created_at)
+               VALUES (?, 'capability', ?)""",
+            (system_id, now),
+        ).lastrowid
+
+        def _scope(item_id: int, captured_digest: str) -> None:
+            confirmation_id = conn.execute(
+                """INSERT INTO understanding_capability_confirmation
+                    (system_id, session_id, composition_digest, decided_by, created_at)
+                   VALUES (?, ?, 'digest', 'user', ?)""",
+                (system_id, session_id, now),
+            ).lastrowid
+            conn.execute(
+                """INSERT INTO alignment_item_capability_scope
+                    (alignment_item_id, system_id, confirmation_id, created_at)
+                   VALUES (?, ?, ?, ?)""",
+                (item_id, system_id, confirmation_id, now),
+            )
+            conn.execute(
+                """INSERT INTO alignment_item_capability_dependency
+                    (alignment_item_id, system_id, target_kind, entity_id,
+                     relation_id, captured_digest, created_at)
+                   VALUES (?, ?, 'entity', ?, NULL, ?, ?)""",
+                (item_id, system_id, entity_id, captured_digest, now),
+            )
+
+        # Three generations of the SAME item id is impossible, so clone the
+        # built row twice -- the digest only reads the two sidecar tables.
+        built = conn.execute(
+            "SELECT * FROM alignment_item WHERE id = ?", (item_ids[0],)
+        ).fetchone()
+        columns = [k for k in built.keys() if k != "id"]
+        clones = []
+        for _ in range(2):
+            placeholders = ",".join("?" for _ in columns)
+            clones.append(
+                conn.execute(
+                    f"INSERT INTO alignment_item ({','.join(columns)}) VALUES ({placeholders})",
+                    tuple(built[c] for c in columns),
+                ).lastrowid
+            )
+
+        older = item_ids[0]
+        newer, moved = clones
+        _scope(older, "semantic-a")
+        # A brand-new confirmed composition, same cited entity, same meaning.
+        _scope(newer, "semantic-a")
+        # Another new composition, but this time the entity's meaning changed.
+        _scope(moved, "semantic-b")
+
+        assert capability_scope_digest_for_item(conn, older) == (
+            capability_scope_digest_for_item(conn, newer)
+        )
+        assert capability_scope_digest_for_item(conn, older) != (
+            capability_scope_digest_for_item(conn, moved)
+        )
 
 
 def _resolved_inquiry_on_first_item(admin_client, headers, session_id, item_id, monkeypatch):
