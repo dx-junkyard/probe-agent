@@ -77,7 +77,6 @@ def _canonical_digest(payload: object) -> str:
 
 def compute_capability_scope_digest(
     *,
-    confirmation_id: Optional[int],
     dependencies: Sequence[Mapping[str, object]],
 ) -> str:
     """sha256 over one review item's confirmed Capability scope (Issue #312).
@@ -87,6 +86,19 @@ def compute_capability_scope_digest(
     A digest is always produced -- an item with no confirmed scope digests
     the explicitly empty scope rather than returning ``None``, so comparing
     two premises is always total (no "unknown" third state to interpret).
+
+    The owning ``alignment_item_capability_scope.confirmation_id`` is
+    deliberately NOT an input. It identifies WHICH confirmed composition the
+    row was written against, and Alignment requires a fresh confirmation
+    whenever a new Understanding revision is built -- so digesting it would
+    expire every tracked Inquiry on the next rebuild, including ones whose
+    own dependencies never moved. Issue #323 expires a premise on MEANING,
+    never on a version identifier, and Issue #312 already settled the same
+    question the same way (``_capability_scope_changed`` treats a differing
+    confirmation_id as a change only when the item's own entity/relation ids
+    are in the changed set). ``captured_digest`` is the entity's/relation's
+    ``semantic_digest``, and the ids are stable across confirmations, so the
+    (id, digest) pairs below ARE the meaning of the scope.
     """
     entities = sorted(
         (int(d["entity_id"]), str(d["captured_digest"]))
@@ -100,7 +112,6 @@ def compute_capability_scope_digest(
     )
     return _canonical_digest(
         {
-            "confirmation_id": confirmation_id,
             "entities": [list(e) for e in entities],
             "relations": [list(r) for r in relations],
         }
@@ -110,16 +121,11 @@ def compute_capability_scope_digest(
 def capability_scope_digest_for_item(conn, item_id: int) -> str:
     """``compute_capability_scope_digest`` for a persisted alignment item.
 
-    Reads only the two Issue #312 sidecar tables. A legacy item with no
-    scope row digests ``confirmation_id=None`` + empty dependency lists,
-    which is a real, comparable fact ("this item had no confirmed
-    Capability scope") rather than an inferred one.
+    Reads only the Issue #312 dependency sidecar table. A legacy item with
+    no dependency rows digests the empty scope, which is a real, comparable
+    fact ("this item had no confirmed Capability scope") rather than an
+    inferred one.
     """
-    scope = conn.execute(
-        """SELECT confirmation_id FROM alignment_item_capability_scope
-           WHERE alignment_item_id = ?""",
-        (item_id,),
-    ).fetchone()
     dependencies = conn.execute(
         """SELECT target_kind, entity_id, relation_id, captured_digest
            FROM alignment_item_capability_dependency
@@ -128,7 +134,6 @@ def capability_scope_digest_for_item(conn, item_id: int) -> str:
         (item_id,),
     ).fetchall()
     return compute_capability_scope_digest(
-        confirmation_id=scope["confirmation_id"] if scope is not None else None,
         dependencies=[
             {
                 "target_kind": row["target_kind"],
@@ -376,8 +381,10 @@ def evaluate_inquiry_premises(
 
     Idempotent: ``superseded`` is terminal, so re-running the evaluation (or
     the whole build) can never write a second transition for the same
-    Inquiry. Returns one summary dict per evaluated Inquiry, for the audit
-    payload of the build response.
+    Inquiry. Returns one summary dict per evaluated Inquiry; the persisted
+    ``premise_evaluation``/``interview_inquiry_transition`` rows are the
+    authoritative audit record (the Alignment build response is unchanged by
+    Issue #323), so the return value is for callers and tests only.
     """
     candidates = conn.execute(
         """SELECT * FROM interview_inquiry

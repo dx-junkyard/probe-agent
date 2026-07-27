@@ -4716,7 +4716,6 @@ def init_db() -> None:
         # 'untrackable' and only rows built after this migration participate
         # in lineage.
         alignment_item_cols = _columns(conn, "alignment_item")
-        alignment_item_cols = _columns(conn, "alignment_item")
         if alignment_item_cols:
             _add_column_if_missing(
                 conn, "alignment_item", alignment_item_cols, "review_subject_id", "TEXT",
