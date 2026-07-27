@@ -3248,7 +3248,19 @@ class InterviewIntentListOut(BaseModel):
 # the origin item's own endpoint, not to closing the Inquiry).
 
 InterviewInquiryOriginKind = Literal["qa", "intent", "review_item"]
-InterviewInquiryStatus = Literal["open", "resolved", "unresolved", "cancelled", "held"]
+# 'superseded' (Issue #308 / #323) is a TERMINAL, system-only status: the
+# premise the conversation was answered against no longer exists, so the
+# history stays readable but is never reused as current justification. It is
+# not "wrong" and not "unresolved"; only the premise evaluation inside an
+# Alignment rebuild ever writes it, never a user endpoint.
+InterviewInquiryStatus = Literal[
+    "open", "resolved", "unresolved", "cancelled", "held", "superseded"
+]
+# Derived (never stored) description of how comparable an Inquiry's premise
+# is -- see app/inquiry_premise.py's PREMISE_TRACKING_STATES.
+InquiryPremiseTrackingState = Literal["not_applicable", "untrackable", "tracked"]
+# Result of the last premise evaluation; null until a rebuild evaluated it.
+InquiryPremiseEvaluation = Literal["unchanged", "changed", "removed", "ambiguous"]
 InterviewInquiryMessageRole = Literal["user", "assistant"]
 
 
@@ -3308,6 +3320,35 @@ class InterviewInquiryOut(BaseModel):
     held_draft: Optional[str] = None
     status: InterviewInquiryStatus
     status_reason: Optional[str] = None
+    # Issue #308 / #320: the immutable premise this conversation was
+    # answered against, captured at creation and never rebased onto a newer
+    # session snapshot. snapshot/revision are audit references (they may go
+    # NULL under retention); the hash/digest columns are what the premise
+    # evaluation actually compares. All null for Inquiries created before
+    # this migration and, apart from the snapshot/version/captured_at trio,
+    # for the qa/intent origins v1 does not auto-track.
+    premise_snapshot_id: Optional[int] = None
+    premise_revision_id: Optional[int] = None
+    premise_review_subject_id: Optional[str] = None
+    premise_content_hash: Optional[str] = None
+    premise_capability_digest: Optional[str] = None
+    premise_intent_digest: Optional[str] = None
+    premise_tracking_version: Optional[str] = None
+    premise_captured_at: Optional[float] = None
+    # Derived from the bundle above, so the UI never has to re-derive
+    # "can this premise be compared at all?" from null checks.
+    premise_tracking_state: InquiryPremiseTrackingState = "not_applicable"
+    # Issue #323: the last premise verdict, the unique current successor
+    # review item (only ever set when exactly one exists -- an ambiguous
+    # successor is never guessed), and the moment this Inquiry became
+    # 'superseded'. superseded_at is separate from closed_at, which keeps
+    # meaning "the developer closed this conversation": a resolved Inquiry
+    # keeps its exact resolved moment, and one the system expires while it
+    # was still open/held keeps closed_at NULL rather than gaining a
+    # resolved-looking timestamp.
+    premise_evaluation: Optional[InquiryPremiseEvaluation] = None
+    premise_successor_item_id: Optional[int] = None
+    superseded_at: Optional[float] = None
     created_at: float
     updated_at: float
     closed_at: Optional[float] = None
@@ -3384,6 +3425,13 @@ AlignmentReasonCode = Literal[
 # (never 'answered') when that Inquiry closes -- the developer must still
 # explicitly answer via this item's own endpoint (Principle 2).
 AlignmentItemStatus = Literal["open", "answered", "corrected", "held", "inquiry"]
+# Issue #321: how one freshly built row relates to the previous generation of
+# the same discussion point -- see app/inquiry_premise.py's SUBJECT_STATES.
+# 'removed' is deliberately absent: a subject with no row in the current
+# build is a premise-evaluation result (#323), not a property of a row.
+AlignmentSubjectState = Literal[
+    "new", "unchanged", "changed", "ambiguous", "untrackable"
+]
 # The three decisions POST /answer accepts as request input.
 AlignmentDecisionAction = Literal["accept_current", "needs_change", "reject_interpretation"]
 # The full set of actions that may appear in a persisted user_decision.action
@@ -3488,6 +3536,17 @@ class AlignmentItemOut(BaseModel):
     # This flag only exposes an explicit human request to recheck this exact
     # item in the normal Review Queue.
     manual_recheck_required: bool = False
+    # Issue #321: stable discussion-point identity and physical lineage.
+    # review_subject_id is a deterministic digest over structural anchors
+    # only (Intent field + confirmed Capability entity/relation ids); it is
+    # null for legacy rows and for items with no stable anchor, which are
+    # reported subject_state='untrackable'. replaces_item_id is set only
+    # when exactly one predecessor generation row carried the same subject
+    # -- a split/merge is reported 'ambiguous' and left unbound rather than
+    # guessed.
+    review_subject_id: Optional[str] = None
+    subject_state: Optional[AlignmentSubjectState] = None
+    replaces_item_id: Optional[int] = None
     intelligence_run_id: int
     is_mock: bool = False
     created_at: float

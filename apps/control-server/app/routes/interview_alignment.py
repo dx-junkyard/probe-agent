@@ -35,6 +35,18 @@ sets it back to ``'open'`` -- never ``'answered'``, so the developer must
 still explicitly call one of this module's answer/correct/hold endpoints
 (Principle 2).
 
+Premise tracking (Issue #308): every built row also carries a
+``review_subject_id`` -- a stable discussion-point identity derived only
+from structural anchors (Intent field + confirmed Capability
+entity/relation ids, ``app/inquiry_premise.py``) -- plus the finite
+``subject_state``/``replaces_item_id`` lineage against the previous
+generation. That identity is what lets ``evaluate_inquiry_premises`` (run
+at the end of this build's write transaction) find the current successor of
+an Inquiry whose original physical row this rebuild replaced, expire the
+conversation as ``superseded``, and flag the successor for manual recheck.
+It never answers or approves anything (Principle 2), and it never guesses:
+an ambiguous or anchor-less subject is reported as such instead.
+
 probe-agent:
   role: API boundary for the Alignment Review / Review Queue (Intent vs
     Current System contrast, deterministic review classification)
@@ -76,6 +88,11 @@ from ..capability_graph import (
     validate_dependencies,
 )
 from ..db import get_conn
+from ..inquiry_premise import (
+    classify_subject_lineage,
+    compute_review_subject_id,
+    evaluate_inquiry_premises,
+)
 from ..interview_language import get_interview_language
 from ..llm import LLMConfig, LLMError, create_llm_client
 from ..models import (
@@ -313,6 +330,13 @@ def _item_out(conn, row) -> AlignmentItemOut:
         manual_recheck_required=bool(
             row["manual_recheck_required"]
             if "manual_recheck_required" in row.keys() else False
+        ),
+        review_subject_id=(
+            row["review_subject_id"] if "review_subject_id" in row.keys() else None
+        ),
+        subject_state=row["subject_state"] if "subject_state" in row.keys() else None,
+        replaces_item_id=(
+            row["replaces_item_id"] if "replaces_item_id" in row.keys() else None
         ),
         intelligence_run_id=row["intelligence_run_id"],
         is_mock=bool(row["is_mock"]),
@@ -919,6 +943,65 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
                         else "none"
                     )
 
+            # Issue #321: stable discussion-point identity + physical
+            # lineage, independent of the content_hash carry-over above.
+            # content_hash answers "is this byte-identical to a row a human
+            # already accepted?"; review_subject_id answers "which earlier
+            # row was the same discussion point?" -- the question an expired
+            # Inquiry needs answered to find its successor (Issue #323),
+            # including when the content genuinely changed.
+            #
+            # Read before this build's own DELETE/INSERT, like the carry-over
+            # candidates above: the predecessor generation of a subject is
+            # whatever the table held BEFORE this build touched it. Only the
+            # LATEST earlier generation counts -- an older one has already
+            # been succeeded once and must not be re-bound now.
+            predecessor_rows = conn.execute(
+                """SELECT id, review_subject_id, base_content_hash, created_at
+                   FROM alignment_item
+                   WHERE session_id = ? AND system_id = ?
+                     AND review_subject_id IS NOT NULL
+                   ORDER BY created_at, id""",
+                (session_id, system_id),
+            ).fetchall()
+            predecessors_by_subject: Dict[str, List[tuple]] = {}
+            latest_generation_at: Dict[str, float] = {}
+            for row in predecessor_rows:
+                subject = row["review_subject_id"]
+                created_at = row["created_at"]
+                previous = latest_generation_at.get(subject)
+                if previous is None or created_at > previous:
+                    latest_generation_at[subject] = created_at
+                    predecessors_by_subject[subject] = []
+                if created_at == latest_generation_at[subject]:
+                    predecessors_by_subject[subject].append(
+                        (row["id"], row["base_content_hash"])
+                    )
+
+            subject_counts: Dict[str, int] = {}
+            for it in final_items:
+                it["review_subject_id"] = compute_review_subject_id(
+                    system_id=system_id,
+                    session_id=session_id,
+                    intent_field=it["intent_field"],
+                    capability_entity_ids=it["_capability_entity_ids"],
+                    capability_relation_ids=it["_capability_relation_ids"],
+                )
+                if it["review_subject_id"] is not None:
+                    subject_counts[it["review_subject_id"]] = (
+                        subject_counts.get(it["review_subject_id"], 0) + 1
+                    )
+            for it in final_items:
+                subject = it["review_subject_id"]
+                subject_state, replaces_item_id = classify_subject_lineage(
+                    review_subject_id=subject,
+                    same_subject_in_build=subject_counts.get(subject, 0),
+                    predecessors=predecessors_by_subject.get(subject, []),
+                    base_content_hash=it["base_content_hash"],
+                )
+                it["subject_state"] = subject_state
+                it["replaces_item_id"] = replaces_item_id
+
     run_status = "failed" if proposal.error else "completed"
     run_cur = conn.execute(
         """
@@ -968,6 +1051,17 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
                  AND status IN ('answered', 'corrected') AND superseded = 0""",
             (session_id, system_id),
         )
+        # A predecessor row with no human progress was just deleted above.
+        # The lineage VERDICT (subject_state) still stands -- it was computed
+        # from the table as it was before this build -- but the physical
+        # audit link must not dangle, so it is dropped for exactly those rows.
+        surviving_item_ids = {
+            row["id"]
+            for row in conn.execute(
+                "SELECT id FROM alignment_item WHERE session_id = ? AND system_id = ?",
+                (session_id, system_id),
+            ).fetchall()
+        }
         for it in final_items:
             reason_code = it["reason_code"]
             policy_version = alignment_policy_version()
@@ -996,9 +1090,10 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
                      user_decision, content_hash, base_content_hash,
                      carried_over_from, policy_version,
                      policy_digest, policy_rule_id, manual_recheck_required,
+                     review_subject_id, subject_state, replaces_item_id,
                      intelligence_run_id, is_mock, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open',
-                        NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id, system_id, revision["id"], revision["snapshot_id"],
                     it["intent_item_id"], it["intent_summary"], it["current_claim"],
@@ -1010,6 +1105,12 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
                     it["carried_over_from"],
                     policy_version, policy_digest, it["policy_rule_id"],
                     1 if pending_target else 0,
+                    it["review_subject_id"], it["subject_state"],
+                    (
+                        it["replaces_item_id"]
+                        if it["replaces_item_id"] in surviving_item_ids
+                        else None
+                    ),
                     run_id, 1 if proposal.is_mock else 0, completed_at, completed_at,
                 ),
             )
@@ -1059,6 +1160,14 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
                WHERE system_id = ? AND session_id = ? AND status = 'pending'
                  AND alignment_item_id IS NULL""",
             (completed_at, system_id, session_id),
+        )
+        # Issue #323: the current review-item set is now final, so every
+        # Inquiry answered against a premise this build invalidated is
+        # expired here -- inside the same transaction, so a failed build
+        # never leaves a conversation half-expired. Never touches an
+        # Inquiry's answer or the origin item's user_decision.
+        evaluate_inquiry_premises(
+            conn, system_id=system_id, session_id=session_id, built_at=completed_at,
         )
         conn.execute("COMMIT")
     except Exception:

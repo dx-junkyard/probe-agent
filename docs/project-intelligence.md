@@ -2423,13 +2423,20 @@ Issue の領分)。
 
 ### 状態機械(有限集合、Principle 6)
 
-`status`: `open | resolved | unresolved | cancelled | held`。
+`status`: `open | resolved | unresolved | cancelled | held | superseded`。
 
 ```
 open       -> resolved | unresolved | held | cancelled | open(no-op)
 held       -> open (resume)
+open|held|resolved -> superseded (system のみ、Issue #308/#323)
 それ以外   -> 409 { code: "invalid_inquiry_transition", message }
 ```
+
+`superseded` は Issue #308(#323)で追加した終端状態で、ユーザー
+エンドポイントからは決して到達しない。Alignment 再ビルド内の決定的な前提
+評価だけが書き込み、`superseded` からの遷移は存在しない(`/message` /
+`/resolve` / `/resume` / `/reopen-doubt` はすべて 409)。詳細は
+「Inquiry の前提追跡と superseded(Issue #308)」節。
 
 `open -> open` は `/reopen-doubt`(「解消していない」)専用の no-op 遷移
 で、既に `open` のときだけ許可される(held からの再開は `/resume` を使
@@ -3968,9 +3975,12 @@ Epic #307 の子 Issue として起票し直した。
   (開始条件の観測データが未取得。計測手段は #309)。本節の「まとめて回答」は
   ユーザーが1件ずつ選んだ回答の送信バッチ化であり、AI 分類による
   自動承認ではない — `decision_method: manual` は項目単位で維持。
-- **Inquiry の前提追跡(#295 §5.6 拡張 → #308)**: Inquiry 行への
-  snapshot/revision 参照列・`superseded` 状態・前提変化時の再確認復帰
-  は未実装。DB migration を含む独立した issue として設計すべき規模。
+- **Inquiry の前提追跡(#295 §5.6 拡張 → #308)**: 完了。作成時に固定する
+  前提 bundle(snapshot / revision / content hash / Capability digest /
+  linked Intent digest / tracking version)、構造的 anchor だけで作る
+  Review item の論点 identity と世代 lineage、Alignment 再ビルド内の決定的
+  な前提評価と `superseded` 遷移、後継の再確認導線までを実装した。詳細は
+  「Inquiry の前提追跡と superseded(Issue #308)」節。
 - **評価指標(#295 §9 → #309)**: 集計基盤と接続済み収集点は実装済み。
   既存の永続データと有限な UI 計測イベントだけから System 単位に集計し、
   算出不能な指標は 0 や推定値ではなく `unmeasured` として返す。途中離脱と
@@ -4237,6 +4247,172 @@ System に属する永続データだけから監査できるようにした。
    未確認候補は `status='proposed' AND origin='ai_proposed'` の行だけ。
    `not_applicable` へ却下済みの AI goal は「AI提案・未確認」として
    再表示しない。
+
+## Inquiry の前提追跡と superseded(Issue #308)
+
+#285 の Inquiry は「どの Snapshot / Understanding Revision / Review item
+の内容を前提に回答されたか」を保持していなかったため、前提が変わった後も
+`resolved` のまま現行の判断根拠として残り続けた。#308 はこれを、作成時に
+固定する**前提 bundle**、Review item の**論点 identity**、再ビルド時の
+**決定的な前提評価**、そして Dashboard 表示の4つに分けて実装する
+(sub-issue #320 / #321 / #323 / #322)。
+
+`superseded` は「回答が誤り」でも「未解決」でもない。**当時の前提に対する
+会話は履歴として残すが、現行の判断には流用しない**という意味だけを持つ。
+
+### 前提 bundle(#320)
+
+`interview_inquiry` に additive 列として追加する。既存行はすべて NULL の
+まま移行し、過去の snapshot / revision / hash を推測して backfill しない。
+
+| 列 | 意味 |
+| --- | --- |
+| `premise_snapshot_id` | 回答生成が固定して使う Snapshot。全 origin で記録 |
+| `premise_revision_id` | 元 Review item がビルドされた Understanding Revision |
+| `premise_review_subject_id` | 論点 identity(#321)。後継の探索に使う |
+| `premise_content_hash` | 元 Review item の `base_content_hash` |
+| `premise_capability_digest` | 確定 Capability scope の digest(#312 の entity/relation id + captured digest) |
+| `premise_intent_digest` | 紐づく Intent 行の `compute_intent_item_digest` |
+| `premise_tracking_version` | 前提追跡契約自体の版(`inquiry-premise-v1`) |
+| `premise_captured_at` | 固定した時刻 |
+
+snapshot / revision は監査参照(retention 時は `ON DELETE SET NULL`)、
+hash / digest / tracking version は**意味内容の比較に使う監査事実**として
+retention 後も残る。
+
+`premise_tracking_state`(API のみ、保存しない決定的導出値)は有限集合
+`not_applicable | untrackable | tracked`。
+
+- `not_applicable`: `origin_kind` が `review_item` 以外。v1 の自動前提追跡
+  対象は `review_item` のみ。
+- `untrackable`: legacy 行、元 item の `content_hash` が NULL、安定
+  anchor が無い、または論点 identity が `ambiguous`。**評価対象にしない**。
+- `tracked`: 比較可能な bundle が揃っている。
+
+初回回答も follow-up も `premise_snapshot_id` を使う。session の
+`snapshot_id` が会話の途中で進んでも、1つの Inquiry の前提は暗黙に rebase
+されない(legacy 行だけ従来どおり session の snapshot にフォールバック)。
+
+### Review item の論点 identity と世代 lineage(#321)
+
+`alignment_item.content_hash` は「完全一致か」しか判定できず、内容が変わっ
+た後も同じ論点であることを示せない。Alignment rebuild は未回答の open 行を
+削除して新しい物理行を作るため、identity が無いと後継を決定的に選べない。
+
+`review_subject_id` は **構造的 anchor だけ**から作る sha256:
+
+- System / session id(System 分離を identity 自体に含める)
+- `intent_field`(#284 の有限な Intent Brief フィールド。1 session 1 field
+  につき現在行は1つなので、field 名自体が安定した Intent identity)
+- 確定 Capability の entity id / relation id(#312 の rename を跨ぐ安定 id)
+
+claim 本文・エビデンス引用・要約・confidence は**入力にしない**。これらは
+reasoning model の言い回しであり、それで論点を結ぶのは #321 が禁じる類似度
+一致そのものになる。anchor がまったく無い item は identity を持たず
+(`review_subject_id IS NULL`)、明示的に `untrackable` になる。
+
+`subject_state`(有限集合)と `replaces_item_id` を各行に記録する。
+
+| 値 | 条件 |
+| --- | --- |
+| `new` | この論点の先行世代が無い |
+| `unchanged` | 先行世代が一意で `base_content_hash` が完全一致 |
+| `changed` | 先行世代が一意で内容が異なる |
+| `ambiguous` | 同一 build 内、または先行世代側で同じ anchor が複数(split / merge) |
+| `untrackable` | 安定 anchor が無い |
+
+`ambiguous` / `untrackable` では `replaces_item_id` を結ばない。「一意に
+対応できない場合は後継を推測しない」ため、`ambiguous` な item から開いた
+Inquiry は前提 bundle に subject を記録せず `untrackable` 扱いにする
+(記録すると、その行を一意に指していなかった identity から後継を1つ選ぶ
+ことになり、まさに禁止された推測になる)。
+
+`removed` はこの集合に含めない。「現行 build に行が無い論点」は行の属性で
+はなく前提評価(#323)の結果だからである。
+
+`content_hash` / `base_content_hash` / `carried_over_from` による #295 の
+unchanged carry-over とは独立で、既存挙動を変えない。前者は「人間が
+accept_current した行と完全一致か」、後者は「どの旧行が同じ論点か」という
+別の問いに答える。古い物理行を current/open に戻すことはなく、常に新しい
+物理行が現行版である。
+
+### 前提評価と superseded 化(#323)
+
+`run_alignment_build` の**書き込みトランザクション内**、現行 Review item
+集合が確定した後に評価する。build が失敗すれば遷移も一緒に rollback する。
+
+対象は `origin_kind='review_item'` かつ `status IN (open, held, resolved)`
+かつ bundle が揃っている Inquiry のみ。`cancelled` / `unresolved` /
+既に `superseded` の行は再訪しない。
+
+後継は `premise_review_subject_id` と**この build が作った行**
+(`created_at = build の completed_at`、`superseded = 0`)を突き合わせて
+構造的に決める。snapshot / revision の id が変わっただけでは失効させない
+(同じソース本文を新しい snapshot に貼り直しても hash は一致する)。
+
+判定結果は有限集合で、first-match:
+
+| 後継 | 比較 | 結果 | reason code |
+| --- | --- | --- | --- |
+| 0件 | — | `removed` | `origin_removed` |
+| 2件以上 | — | `ambiguous` | `successor_ambiguous` |
+| 1件 | hash / capability digest / intent digest がすべて一致 | `unchanged` | (遷移なし) |
+| 1件 | intent digest が異なる | `changed` | `linked_intent_changed` |
+| 1件 | capability digest が異なる | `changed` | `capability_scope_changed` |
+| 1件 | それ以外 | `changed` | `review_item_content_changed` |
+
+reason code は根本原因を優先して選ぶ(content hash は linked intent digest
+を含むため、intent の変更は必ず hash も変える)。
+
+`unchanged` 以外は `superseded` へ遷移させ、
+`interview_inquiry_transition` に `actor='system'` と有限 reason code を
+記録する。`superseded` は終端で、`/message` / `/resolve` / `/resume` /
+`/reopen-doubt` はすべて 409 になる(古い前提のまま会話を継続したり、
+現行の判断として確定したりできない = fail-closed)。再確認は現行 Review
+item から新しい Inquiry を開いて行う。
+
+- `closed_at` は**書き換えない**。`closed_at` は「開発者がこの会話を閉じ
+  た時刻」を意味し続け、`resolved` だった Inquiry は解消時刻をそのまま保
+  持する。open/held のまま失効した Inquiry は `closed_at` を NULL のまま
+  にし、解消したように見える時刻を後から与えない。失効時刻は
+  `superseded_at` に別途記録する。
+- 後継が一意(`changed`)のときだけ、その後継 item に
+  `manual_recheck_required = 1` を立てて Review Queue に戻し、旧物理行を
+  `superseded = 1` の履歴にする。`user_decision` には一切触れない
+  (Principle 2 — 表示や遷移が回答・承認になってはいけない)。
+- 元 item が `status='inquiry'` でロックされたままにならないよう、他に
+  active な Inquiry が無ければ `open` に戻す(`answered` にはしない。
+  #287 の release 規則と同じ)。
+- `superseded` は終端なので、同じ rebuild を何度実行しても2つ目の遷移行や
+  重複した recheck 対象は作られない(冪等)。
+
+### Dashboard(#322)
+
+`superseded` は active な Inquiry として数えず、resume 導線も出さない
+(`activeInquiryByOrigin` は `open` / `held` だけを許可する allow-list)。
+履歴としては読める。表示はすべてサーバーのフィールドからの決定的な写像で、
+クライアント側で後継を推測しない。
+
+- 失効バッジ「前提が変わったため再確認が必要」+ 「未解決・取り消しとは異
+  なる」ことを明示する固定説明文。
+- 理由ごとの固定文言4種: `changed`(内容が変わった) / `removed`(論点が
+  無くなった) / `ambiguous`(後継を一意に特定できない) /
+  `untrackable`(旧データまたは hash 不明で自動比較できない)。
+- 監査詳細に作成時の snapshot / revision、失効理由、tracking version、
+  解消日時と失効日時の両方。
+- `premise_successor_item_id` があるときだけ後継 Review item カードへの
+  導線を出し、無いときは固定文言だけを出す。新しい Inquiry の開始と元
+  Review item への明示回答は別操作のまま。
+- `untrackable` は失効ではないので、失効バッジは付けず固定文言だけを出す。
+
+### 実装しない(#308 の non-goals)
+
+- Inquiry 回答の自動再生成(検知と再確認対象化まで)。
+- `answered` / `investigating` / `insufficient_evidence` への status 追加。
+  現行実装はメッセージ内容と固定テンプレートでこれらを表現しており、命名
+  だけの変更は行わない。
+- qa / intent origin の自動前提追跡(snapshot の固定だけは全 origin で行う)。
+- ambiguous な後継の自動選択、Review item の自動回答・自動承認。
 
 ## Probe Cell Fabric(Issue #297)
 

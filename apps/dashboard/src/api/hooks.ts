@@ -1111,6 +1111,10 @@ export function activeInquiryByOrigin(
 ): Map<string, InterviewInquiryOut> {
   const map = new Map<string, InterviewInquiryOut>();
   for (const item of items) {
+    // Allow-list, not a deny-list: only 'open'/'held' are active. Every
+    // terminal status — including Issue #323's system-written 'superseded'
+    // — is excluded here, so no caller can offer resume/continue for one
+    // (the server 409s those calls anyway).
     if (item.status !== "open" && item.status !== "held") continue;
     const key = `${item.origin_kind}:${item.origin_id}`;
     const current = map.get(key);
@@ -1127,6 +1131,27 @@ export function activeInquiryByOrigin(
 export function useActiveInquiriesByOrigin(sessionId: number | null) {
   const { data } = useInterviewInquiryList(sessionId);
   return useMemo(() => activeInquiryByOrigin(data?.items ?? []), [data]);
+}
+
+// Issue #322 (server #323): 'superseded' is a terminal, system-written
+// status — the premise the conversation was answered against no longer
+// exists. It is deliberately NOT active and NOT resumable (the status filter
+// in activeInquiryByOrigin above only admits 'open'/'held', and the server
+// 409s on /message, /resolve and /resume for a superseded Inquiry), so it
+// must never be counted as an in-progress Inquiry or offered for resume.
+// It stays fully readable as history through this separate selector.
+// Sorted by id ascending for a deterministic, refresh-stable order.
+export function supersededInquiries(
+  items: InterviewInquiryOut[],
+): InterviewInquiryOut[] {
+  return items
+    .filter(item => item.status === "superseded")
+    .sort((a, b) => a.id - b.id);
+}
+
+export function useSupersededInquiries(sessionId: number | null) {
+  const { data } = useInterviewInquiryList(sessionId);
+  return useMemo(() => supersededInquiries(data?.items ?? []), [data]);
 }
 
 function _invalidateInquiry(qc: ReturnType<typeof useQueryClient>, sessionId: number | null, inquiryId: number) {

@@ -15,7 +15,12 @@ import { render, screen, fireEvent, waitFor, within } from "@testing-library/rea
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { vi } from "vitest";
 import type { ReactNode } from "react";
-import type { AlignmentItemOut, AlignmentListOut, AlignmentReviewQueueOut } from "@/api/types";
+import type {
+  AlignmentItemOut,
+  AlignmentListOut,
+  AlignmentReviewQueueOut,
+  InterviewInquiryOut,
+} from "@/api/types";
 
 const mockApi = {
   get: vi.fn(),
@@ -1308,5 +1313,139 @@ describe("ReviewQueuePanel", () => {
       );
     });
     expect(screen.getByText(/aligned-no-change/)).toBeInTheDocument();
+  });
+
+  // --- 前提が変わった疑問の履歴 (Issue #322 / server #308・#320-#323) -------
+  //
+  // superseded な Inquiry は「当時の前提に対する会話」であって、現行の判断に
+  // は流用しない。Review Queue では履歴として読めるようにしつつ、回答・承認・
+  // 再開のアクションは一切与えない。
+  describe("superseded Inquiry の履歴 (Issue #322)", () => {
+    function makeSupersededInquiry(
+      overrides: Partial<InterviewInquiryOut> & { id: number },
+    ): InterviewInquiryOut {
+      return {
+        session_id: 1, system_id: 1, origin_kind: "review_item", origin_id: 89,
+        held_draft: null, status: "superseded", status_reason: "review_item_content_changed",
+        premise_snapshot_id: 11, premise_revision_id: 4,
+        premise_review_subject_id: "subject-abc", premise_content_hash: "hash-abc",
+        premise_capability_digest: null, premise_intent_digest: null,
+        premise_tracking_version: "inquiry-premise-v1", premise_captured_at: 1_700_000_000,
+        premise_tracking_state: "tracked", premise_evaluation: "changed",
+        premise_successor_item_id: null, superseded_at: 1_700_003_000,
+        created_at: 0, updated_at: 0, closed_at: 1_700_003_000,
+        ...overrides,
+      };
+    }
+
+    function renderWithInquiries(inquiries: InterviewInquiryOut[], item: AlignmentItemOut) {
+      const queue: AlignmentReviewQueueOut = { session_id: 1, system_id: 1, items: [item] };
+      const full: AlignmentListOut = {
+        session_id: 1, system_id: 1,
+        items_by_category: {
+          must_review: [], batch_reviewable: [item], no_review_required: [],
+          unchanged: [], informational: [],
+        },
+        counts: {
+          must_review: 0, batch_reviewable: 1, no_review_required: 0,
+          unchanged: 0, informational: 0,
+        },
+      };
+      getImpl = (path: string) => {
+        if (path === "/interview/sessions/1/review-queue") return Promise.resolve(queue);
+        if (path === "/interview/sessions/1/alignment") return Promise.resolve(full);
+        if (path === "/interview/sessions/1/inquiries") {
+          return Promise.resolve({ session_id: 1, system_id: 1, items: inquiries });
+        }
+        return Promise.resolve(undefined);
+      };
+    }
+
+    test("superseded な Inquiry は active 扱いされず、確認項目からは新しい疑問を始められる", async () => {
+      const item = makeItem({ id: 89 });
+      renderWithInquiries([makeSupersededInquiry({ id: 700 })], item);
+
+      const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
+      render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+
+      const card = await screen.findByTestId("review-item-89");
+      // 新しい疑問を始める導線はそのまま(回答・承認とは別のアクション)。
+      expect(within(card).getByTestId("review-item-inquiry-open-89")).toBeInTheDocument();
+      // 再開/保留中マーカーは出さない(サーバーは /resume を 409 で拒否する)。
+      expect(within(card).queryByTestId("review-item-inquiry-reopen-89")).not.toBeInTheDocument();
+      expect(within(card).queryByTestId("review-item-held-inquiry-marker-89")).not.toBeInTheDocument();
+      // 元の確認項目は未対応のまま — 履歴があっても回答済みにはならない。
+      expect(within(card).getByTestId("review-item-status-89")).toHaveTextContent("未対応");
+    });
+
+    test("履歴セクションは初期折りたたみで、展開すると固定文言と後継への導線を出す", async () => {
+      const item = makeItem({ id: 89 });
+      renderWithInquiries(
+        [makeSupersededInquiry({ id: 700, premise_successor_item_id: 89 })],
+        item,
+      );
+
+      const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
+      render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+
+      const toggle = await screen.findByTestId("review-queue-superseded-inquiry-toggle");
+      expect(toggle).toHaveTextContent("前提が変わった疑問 1件");
+      expect(screen.queryByTestId("superseded-inquiry-700")).not.toBeInTheDocument();
+
+      fireEvent.click(toggle);
+      const row = await screen.findByTestId("superseded-inquiry-700");
+      expect(within(row).getByTestId("inquiry-superseded-badge-700")).toHaveTextContent(
+        "前提が変わったため再確認が必要",
+      );
+      expect(within(row).getByTestId("inquiry-premise-reason-700")).toHaveTextContent(
+        "前提となる確認項目の内容が変わりました。",
+      );
+      // 後継の確認項目カードは同じページ内の anchor で辿れる。
+      expect(within(row).getByTestId("inquiry-successor-link-700")).toHaveAttribute(
+        "href", "#review-item-89",
+      );
+      expect(document.getElementById("review-item-89")).not.toBeNull();
+
+      // 履歴の表示・展開は元の確認項目への回答/承認を一切発生させない。
+      for (const call of mockApi.post.mock.calls) {
+        expect(String(call[0])).not.toMatch(/\/answer|\/correct|\/hold|\/resume|\/resolve/);
+      }
+    });
+
+    test("後継が一意に決まらない場合は導線を出さず、固定文言だけを出す", async () => {
+      const item = makeItem({ id: 89 });
+      renderWithInquiries(
+        [makeSupersededInquiry({
+          id: 701, premise_evaluation: "ambiguous", status_reason: "successor_ambiguous",
+        })],
+        item,
+      );
+
+      const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
+      render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+
+      fireEvent.click(await screen.findByTestId("review-queue-superseded-inquiry-toggle"));
+      const row = await screen.findByTestId("superseded-inquiry-701");
+      expect(within(row).getByTestId("inquiry-premise-reason-701")).toHaveTextContent(
+        "後継の確認項目を一意に特定できませんでした。",
+      );
+      expect(within(row).queryByTestId("inquiry-successor-link-701")).not.toBeInTheDocument();
+      expect(within(row).getByTestId("inquiry-successor-unknown-701")).toHaveTextContent(
+        "後継の確認項目は特定されていません。",
+      );
+    });
+
+    test("superseded な Inquiry が無いときは履歴セクションを出さない", async () => {
+      const item = makeItem({ id: 89 });
+      renderWithInquiries([], item);
+
+      const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
+      render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+
+      await screen.findByTestId("review-item-89");
+      expect(
+        screen.queryByTestId("review-queue-superseded-inquiry-toggle"),
+      ).not.toBeInTheDocument();
+    });
   });
 });

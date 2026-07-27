@@ -763,6 +763,13 @@ heuristic result.
 - Commands must come from explicit configuration, run in an isolated workspace,
   and enforce timeout/network/environment policies.
 - Deterministic safety denylists override LLM output.
+- Additive nullable columns go through `db.py`'s `_add_column_if_missing`
+  (Issue #308). It only ever adds a nullable column and never backfills, so
+  do not use it for NOT NULL/DEFAULT migrations that need a value written
+  into existing rows. An index over a newly added column belongs in the
+  migration block, not in `SCHEMA`: that script also runs against older
+  databases, where `CREATE TABLE IF NOT EXISTS` is a no-op and the indexed
+  column does not exist yet.
 
 ## Required Tests
 
