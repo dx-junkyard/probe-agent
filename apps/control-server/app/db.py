@@ -2619,20 +2619,54 @@ CREATE INDEX IF NOT EXISTS idx_interview_intent_item_field
 -- input when the developer returns to the original item -- the server never
 -- interprets it, and resolving never submits it as an answer (Principle 2:
 -- only an explicit user action on the origin item's own endpoint counts).
+-- Premise bundle (Issue #308 / #320): the immutable facts an Inquiry's
+-- conversation was reasoned against, captured once at creation and never
+-- rebased. premise_snapshot_id is the snapshot answer generation is pinned
+-- to, so a follow-up message keeps using it even after the session's own
+-- snapshot advances; premise_revision_id is the Understanding Revision the
+-- origin review item was built from. Both are audit references (ON DELETE
+-- SET NULL under retention); the hash/digest columns are the comparable
+-- MEANING of the premise and survive that retention as standalone audit
+-- facts. premise_review_subject_id (Issue #321) is the stable discussion-
+-- point identity used to find the current successor item after a rebuild
+-- deleted the original physical row. All columns are NULL for rows written
+-- before this migration -- a past snapshot/revision/hash is never guessed --
+-- and, apart from the snapshot/version/captured_at trio, for the qa/intent
+-- origins that v1 does not auto-track.
+--
+-- premise_evaluation / premise_successor_item_id / superseded_at (Issue
+-- #323) are the result side: the finite verdict of the last premise
+-- evaluation, the unique current successor item when there is exactly one,
+-- and the moment the Inquiry became 'superseded' -- kept separate from
+-- closed_at so the original resolved timestamp is never overwritten.
 CREATE TABLE IF NOT EXISTS interview_inquiry (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id      INTEGER NOT NULL,
-    system_id       INTEGER NOT NULL,
-    origin_kind     TEXT NOT NULL,
-    origin_id       INTEGER NOT NULL,
-    held_draft      TEXT,
-    status          TEXT NOT NULL DEFAULT 'open',
-    status_reason   TEXT,
-    created_at      REAL NOT NULL,
-    updated_at      REAL NOT NULL,
-    closed_at       REAL,
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id                INTEGER NOT NULL,
+    system_id                 INTEGER NOT NULL,
+    origin_kind               TEXT NOT NULL,
+    origin_id                 INTEGER NOT NULL,
+    held_draft                TEXT,
+    status                    TEXT NOT NULL DEFAULT 'open',
+    status_reason             TEXT,
+    premise_snapshot_id       INTEGER,
+    premise_revision_id       INTEGER,
+    premise_review_subject_id TEXT,
+    premise_content_hash      TEXT,
+    premise_capability_digest TEXT,
+    premise_intent_digest     TEXT,
+    premise_tracking_version  TEXT,
+    premise_captured_at       REAL,
+    premise_evaluation        TEXT,
+    premise_successor_item_id INTEGER,
+    superseded_at             REAL,
+    created_at                REAL NOT NULL,
+    updated_at                REAL NOT NULL,
+    closed_at                 REAL,
     FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
-    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (premise_snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL,
+    FOREIGN KEY (premise_revision_id) REFERENCES understanding_revision (id) ON DELETE SET NULL,
+    FOREIGN KEY (premise_successor_item_id) REFERENCES alignment_item (id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_interview_inquiry_session
@@ -2754,6 +2788,20 @@ CREATE TABLE IF NOT EXISTS alignment_item (
     -- Issue #310: this does not change deterministic classification.  It
     -- only makes an explicitly human-selected recheck target actionable.
     manual_recheck_required INTEGER NOT NULL DEFAULT 0,
+    -- Issue #321: the stable discussion-point identity this physical row is
+    -- one generation of, plus the auditable link to the previous
+    -- generation. review_subject_id is a deterministic digest over
+    -- structural anchors only (Intent field + confirmed Capability
+    -- entity/relation ids -- app/inquiry_premise.py), NULL when the item has
+    -- no stable anchor. subject_state is the finite lineage verdict
+    -- (new/unchanged/changed/ambiguous/untrackable) and replaces_item_id the
+    -- unique predecessor row, set only when that verdict is unambiguous.
+    -- These are independent of content_hash/carried_over_from: those answer
+    -- "is this byte-identical to a human-accepted row?", these answer "which
+    -- earlier row was the same discussion point?".
+    review_subject_id       TEXT,
+    subject_state           TEXT,
+    replaces_item_id        INTEGER,
     intelligence_run_id     INTEGER NOT NULL,
     is_mock                 INTEGER NOT NULL DEFAULT 0,
     created_at              REAL NOT NULL,
@@ -2762,8 +2810,13 @@ CREATE TABLE IF NOT EXISTS alignment_item (
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
     FOREIGN KEY (revision_id) REFERENCES understanding_revision (id) ON DELETE SET NULL,
     FOREIGN KEY (intent_item_id) REFERENCES interview_intent_item (id) ON DELETE SET NULL,
+    FOREIGN KEY (replaces_item_id) REFERENCES alignment_item (id) ON DELETE SET NULL,
     FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE RESTRICT
 );
+-- NOTE: idx_alignment_item_review_subject is created in the migration block
+-- (init_db), not here: this script also runs against pre-#321 databases,
+-- where CREATE TABLE IF NOT EXISTS is a no-op and the indexed column does
+-- not exist yet.
 
 CREATE INDEX IF NOT EXISTS idx_alignment_item_session
     ON alignment_item (session_id, status);
@@ -3733,6 +3786,24 @@ def _columns(conn: sqlite3.Connection, table: str) -> set:
     return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
 
 
+def _add_column_if_missing(
+    conn: sqlite3.Connection,
+    table: str,
+    existing_columns: set,
+    column: str,
+    definition: str,
+) -> None:
+    """Additive ALTER TABLE for one nullable column, skipped when present.
+
+    Only for columns that are legitimately NULL on existing rows: it never
+    backfills, so it must not be used for NOT NULL/DEFAULT migrations.
+    """
+    if column in existing_columns:
+        return
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+    existing_columns.add(column)
+
+
 def _ensure_legacy_system(conn: sqlite3.Connection) -> int:
     row = conn.execute(
         "SELECT id FROM systems WHERE name = 'Legacy System' AND owner_user_id IS NULL"
@@ -4637,6 +4708,62 @@ def init_db() -> None:
                    WHERE policy_version = 'alignment-review-v1'
                      AND reason_code = 'no_change'"""
             )
+        # Issue #308 / #321: stable review-subject identity and physical
+        # lineage for alignment items. Existing rows stay NULL: their
+        # subject would have to be reconstructed from a snapshot/revision
+        # that may no longer exist, and inferring one from claim text is
+        # exactly the similarity matching #321 forbids. They are reported
+        # 'untrackable' and only rows built after this migration participate
+        # in lineage.
+        alignment_item_cols = _columns(conn, "alignment_item")
+        if alignment_item_cols:
+            _add_column_if_missing(
+                conn, "alignment_item", alignment_item_cols, "review_subject_id", "TEXT",
+            )
+            _add_column_if_missing(
+                conn, "alignment_item", alignment_item_cols, "subject_state", "TEXT",
+            )
+            _add_column_if_missing(
+                conn, "alignment_item", alignment_item_cols, "replaces_item_id",
+                "INTEGER REFERENCES alignment_item(id) ON DELETE SET NULL",
+            )
+            conn.execute(
+                """CREATE INDEX IF NOT EXISTS idx_alignment_item_review_subject
+                   ON alignment_item (session_id, review_subject_id, created_at)"""
+            )
+        # Issue #308 / #320 / #323: the Inquiry premise bundle and its
+        # evaluation result. Purely additive; every existing Inquiry keeps
+        # NULL in all of them (an already-answered conversation's premise is
+        # never reconstructed by guesswork -- it is reported 'untrackable').
+        inquiry_cols = _columns(conn, "interview_inquiry")
+        if inquiry_cols:
+            _add_column_if_missing(
+                conn, "interview_inquiry", inquiry_cols, "premise_snapshot_id",
+                "INTEGER REFERENCES repository_snapshots(id) ON DELETE SET NULL",
+            )
+            _add_column_if_missing(
+                conn, "interview_inquiry", inquiry_cols, "premise_revision_id",
+                "INTEGER REFERENCES understanding_revision(id) ON DELETE SET NULL",
+            )
+            for column in (
+                "premise_review_subject_id",
+                "premise_content_hash",
+                "premise_capability_digest",
+                "premise_intent_digest",
+                "premise_tracking_version",
+                "premise_evaluation",
+            ):
+                _add_column_if_missing(
+                    conn, "interview_inquiry", inquiry_cols, column, "TEXT",
+                )
+            _add_column_if_missing(
+                conn, "interview_inquiry", inquiry_cols, "premise_successor_item_id",
+                "INTEGER REFERENCES alignment_item(id) ON DELETE SET NULL",
+            )
+            for column in ("premise_captured_at", "superseded_at"):
+                _add_column_if_missing(
+                    conn, "interview_inquiry", inquiry_cols, column, "REAL",
+                )
         _migrate_alignment_manual_recheck_targets(conn)
         _ensure_legacy_system(conn)
     _validate_startup_environment()

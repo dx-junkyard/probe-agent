@@ -37,6 +37,17 @@ one already exists, and a closing transition only releases the origin item
 back to ``'open'`` when no OTHER active Inquiry remains for that same
 origin (defense in depth for any pre-existing duplicate rows).
 
+Premise tracking (Issue #308) adds one more thing this module owns: the
+immutable premise bundle captured at creation (``_capture_premise``), which
+also pins the snapshot every answer in the conversation is generated
+against. The premise is only ever COMPARED elsewhere --
+``app/inquiry_premise.py``'s evaluation runs inside the Alignment rebuild
+transaction (``routes/interview_alignment.py``) and is what writes the
+terminal ``superseded`` status. No endpoint here can reach ``superseded``:
+it has no outgoing transition, so /message, /resolve, /resume and
+/reopen-doubt all 409 on an expired Inquiry (fail-closed -- an answer given
+against a premise that no longer exists must not become a current decision).
+
 probe-agent:
   role: API boundary for the Inquiry side-conversation lifecycle (held
     pending -> resolved/unresolved/held/cancelled)
@@ -57,11 +68,17 @@ from typing import Dict, List, Optional, Set
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+from ..alignment import compute_intent_item_digest
 from ..auth import get_system_id
 from ..db import get_conn
 from ..interview_context import build_interview_context
 from ..interview_language import interview_message, resolve_message_language
 from ..inquiry_answering import InquiryAnswerResult, generate_inquiry_answer
+from ..inquiry_premise import (
+    PREMISE_TRACKING_VERSION,
+    capability_scope_digest_for_item,
+    premise_tracking_state,
+)
 from ..investigation_persistence import persist_investigation_run, persist_route_run
 from .interview_alignment import record_sample_rule_objection
 from ..llm import LLMConfig, LLMError, create_llm_client
@@ -180,6 +197,76 @@ def _set_review_item_status(
     )
 
 
+def _capture_premise(
+    conn, *, origin_kind: str, origin_id: int, session_row, system_id: int, now: float,
+) -> Dict[str, object]:
+    """The immutable premise facts to store on a newly created Inquiry.
+
+    Issue #308 / #320. Every origin pins ``premise_snapshot_id`` -- the
+    snapshot answer generation uses -- so a follow-up message keeps the
+    premise the conversation started with even after the session's snapshot
+    advances. The comparable digests are captured for
+    ``origin_kind='review_item'`` only (v1 scope); qa/intent Inquiries keep
+    NULL there and are reported ``premise_tracking_state='not_applicable'``.
+
+    Nothing here is inferred: when the origin item has no ``content_hash``
+    (its evidence could not be re-read from the pinned commit at build time)
+    or no ``review_subject_id`` (no stable anchor, or a pre-migration row),
+    the corresponding column stays NULL and the Inquiry is explicitly
+    ``untrackable`` rather than being compared against a guessed premise.
+    """
+    premise: Dict[str, object] = {
+        "premise_snapshot_id": session_row["snapshot_id"],
+        "premise_revision_id": None,
+        "premise_review_subject_id": None,
+        "premise_content_hash": None,
+        "premise_capability_digest": None,
+        "premise_intent_digest": None,
+        "premise_tracking_version": PREMISE_TRACKING_VERSION,
+        "premise_captured_at": now,
+    }
+    if origin_kind != "review_item":
+        return premise
+    item = conn.execute(
+        "SELECT * FROM alignment_item WHERE id = ? AND system_id = ?",
+        (origin_id, system_id),
+    ).fetchone()
+    if item is None:
+        return premise
+    keys = item.keys()
+    premise["premise_revision_id"] = item["revision_id"]
+    # An 'ambiguous' subject (Issue #321: two rows of the same build share
+    # the anchor, i.e. a split/merge) is deliberately NOT captured. Storing
+    # it would let a later build resolve a single successor for a subject
+    # that never identified this row uniquely in the first place -- that is
+    # the guessed successor #321 forbids. Such an Inquiry stays explicitly
+    # 'untrackable' instead.
+    if (
+        "review_subject_id" in keys
+        and "subject_state" in keys
+        and item["subject_state"] in ("new", "unchanged", "changed")
+    ):
+        premise["premise_review_subject_id"] = item["review_subject_id"]
+    if "base_content_hash" in keys:
+        premise["premise_content_hash"] = item["base_content_hash"]
+    premise["premise_capability_digest"] = capability_scope_digest_for_item(
+        conn, origin_id
+    )
+    if item["intent_item_id"] is not None:
+        intent = conn.execute(
+            "SELECT field, value_text, status FROM interview_intent_item "
+            "WHERE id = ? AND system_id = ?",
+            (item["intent_item_id"], system_id),
+        ).fetchone()
+        if intent is not None:
+            premise["premise_intent_digest"] = compute_intent_item_digest(
+                field=intent["field"],
+                value_text=intent["value_text"],
+                status=intent["status"],
+            )
+    return premise
+
+
 def _suggested_observation_proposal(runtime_evidence) -> Optional[Dict[str, str]]:
     """First unobserved/stale runtime_fact -> a deterministic proposal hint.
 
@@ -227,7 +314,15 @@ def _message_out(row) -> InterviewInquiryMessageOut:
     )
 
 
+def _column(row, name: str):
+    """Value of an optional (additively migrated) column, else None."""
+    return row[name] if name in row.keys() else None
+
+
 def _inquiry_out(row) -> InterviewInquiryOut:
+    tracking_version = _column(row, "premise_tracking_version")
+    content_hash = _column(row, "premise_content_hash")
+    review_subject_id = _column(row, "premise_review_subject_id")
     return InterviewInquiryOut(
         id=row["id"],
         session_id=row["session_id"],
@@ -237,6 +332,23 @@ def _inquiry_out(row) -> InterviewInquiryOut:
         held_draft=row["held_draft"],
         status=row["status"],
         status_reason=row["status_reason"],
+        premise_snapshot_id=_column(row, "premise_snapshot_id"),
+        premise_revision_id=_column(row, "premise_revision_id"),
+        premise_review_subject_id=review_subject_id,
+        premise_content_hash=content_hash,
+        premise_capability_digest=_column(row, "premise_capability_digest"),
+        premise_intent_digest=_column(row, "premise_intent_digest"),
+        premise_tracking_version=tracking_version,
+        premise_captured_at=_column(row, "premise_captured_at"),
+        premise_tracking_state=premise_tracking_state(
+            origin_kind=row["origin_kind"],
+            tracking_version=tracking_version,
+            content_hash=content_hash,
+            review_subject_id=review_subject_id,
+        ),
+        premise_evaluation=_column(row, "premise_evaluation"),
+        premise_successor_item_id=_column(row, "premise_successor_item_id"),
+        superseded_at=_column(row, "superseded_at"),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         closed_at=row["closed_at"],
@@ -540,14 +652,31 @@ def create_inquiry(
                 },
             )
         try:
+            premise = _capture_premise(
+                conn,
+                origin_kind=payload.origin_kind,
+                origin_id=payload.origin_id,
+                session_row=session,
+                system_id=system_id,
+                now=now,
+            )
             cur = conn.execute(
                 """INSERT INTO interview_inquiry
                     (session_id, system_id, origin_kind, origin_id, held_draft,
-                     status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, 'open', ?, ?)""",
+                     status, premise_snapshot_id, premise_revision_id,
+                     premise_review_subject_id, premise_content_hash,
+                     premise_capability_digest, premise_intent_digest,
+                     premise_tracking_version, premise_captured_at,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id, system_id, payload.origin_kind, payload.origin_id,
-                    payload.held_draft, now, now,
+                    payload.held_draft,
+                    premise["premise_snapshot_id"], premise["premise_revision_id"],
+                    premise["premise_review_subject_id"], premise["premise_content_hash"],
+                    premise["premise_capability_digest"], premise["premise_intent_digest"],
+                    premise["premise_tracking_version"], premise["premise_captured_at"],
+                    now, now,
                 ),
             )
             inquiry_id = cur.lastrowid
@@ -587,7 +716,7 @@ def create_inquiry(
         outcome = _generate_and_store_answer(
             conn,
             system_id=system_id,
-            snapshot_id=session["snapshot_id"],
+            snapshot_id=premise["premise_snapshot_id"],
             inquiry_id=inquiry_id,
             question_text=payload.question_text,
             conversation=[{"role": "user", "content": payload.question_text}],
@@ -704,6 +833,13 @@ def post_inquiry_message(
         origin_summary = _validate_origin_exists(
             conn, inquiry["origin_kind"], inquiry["origin_id"], inquiry["session_id"], system_id,
         )
+        # Issue #320: a follow-up is answered against the snapshot pinned when
+        # the Inquiry was created, never silently rebased onto a newer session
+        # snapshot mid-conversation. Inquiries created before this migration
+        # have no pinned snapshot and keep the previous behaviour.
+        premise_snapshot_id = _column(inquiry, "premise_snapshot_id")
+        if premise_snapshot_id is None:
+            premise_snapshot_id = session["snapshot_id"]
 
         prior_rows = conn.execute(
             "SELECT role, content FROM interview_inquiry_message WHERE inquiry_id = ? ORDER BY id",
@@ -725,7 +861,7 @@ def post_inquiry_message(
         outcome = _generate_and_store_answer(
             conn,
             system_id=system_id,
-            snapshot_id=session["snapshot_id"],
+            snapshot_id=premise_snapshot_id,
             inquiry_id=inquiry_id,
             question_text=payload.content,
             conversation=conversation,

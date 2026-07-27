@@ -176,7 +176,11 @@ creating incomplete persistence or execution paths for later phases.
     auto-routing into the existing route-and-investigate flow.
     **Status: implemented, verified, and closed.** Deferred work now has its
     own issues under Epic #307: Inquiry snapshot/revision premise tracking +
-    `superseded` (#308), sample-error driven rule re-evaluation (#310), and
+    `superseded` (#308, **implemented and verified** — an immutable premise
+    bundle captured at Inquiry creation, a review-subject identity built only
+    from structural anchors, a deterministic premise evaluation inside the
+    Alignment rebuild transaction, and a terminal system-only `superseded`
+    status), sample-error driven rule re-evaluation (#310), and
     the §5.5 re-confirmation cascade beyond goal/Intent (#312,
     **implemented and verified** with an authenticated System-wide canonical
     head, stable Capability identities, manually editable many-to-many support
@@ -230,7 +234,12 @@ creating incomplete persistence or execution paths for later phases.
 
 13. Issue #307 — remaining work after #282 / #295 / #297 closed. Three
     categories, all as sub-issues: (A) deliberate deferrals already documented
-    — #308 Inquiry premise tracking + `superseded`, #309 the §9 evaluation
+    — #308 Inquiry premise tracking + `superseded` (**implemented and
+    verified**, via sub-issues #320 premise bundle / #321 review subject
+    identity + lineage / #323 premise evaluation + `superseded` transition /
+    #322 Dashboard; premise tracking is `origin_kind='review_item'` only and
+    never guesses a successor, and `superseded` is terminal and system-only),
+    #309 the §9 evaluation
     metrics pipeline (**implemented and verified**), #310 sample-error driven
     rule re-evaluation, #311 低リスク提案の一括承認 (the measurement
     mechanism now exists, but implementation remains blocked until a real

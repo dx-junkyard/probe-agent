@@ -956,8 +956,26 @@ export interface InterviewIntentListOut {
 // item's own answer/confirm action afterward.
 
 export type InterviewInquiryOriginKind = "qa" | "intent" | "review_item";
-export type InterviewInquiryStatus = "open" | "resolved" | "unresolved" | "cancelled" | "held";
+// Issue #308 / #323: 'superseded' is a TERMINAL, system-only status written
+// exclusively by the server's premise evaluation during an Alignment
+// rebuild. It means "the premise this conversation was answered against no
+// longer exists" — the history stays readable, but it is never reused as a
+// current justification. It is NOT "the answer was wrong" and NOT
+// "unresolved"/"cancelled". /message, /resolve and /resume all 409 on a
+// superseded Inquiry, so the UI must never offer those actions for one.
+export type InterviewInquiryStatus =
+  | "open" | "resolved" | "unresolved" | "cancelled" | "held" | "superseded";
 export type InterviewInquiryMessageRole = "user" | "assistant";
+
+// Issue #320: derived (never stored) description of how comparable an
+// Inquiry's captured premise is. 'not_applicable' = the origin is not a
+// review item (nothing special to show); 'untrackable' = legacy row or
+// unknown content hash, so no automatic comparison is possible; 'tracked' =
+// a full comparable premise bundle.
+export type InquiryPremiseTrackingState = "not_applicable" | "untrackable" | "tracked";
+// Issue #323: the result of the last premise evaluation; null until a
+// rebuild evaluated it. 'unchanged' never supersedes.
+export type InquiryPremiseEvaluation = "unchanged" | "changed" | "removed" | "ambiguous";
 
 export interface InterviewInquiryEvidenceOut {
   path: string;
@@ -1041,6 +1059,30 @@ export interface InterviewInquiryOut {
   held_draft: string | null;
   status: InterviewInquiryStatus;
   status_reason: string | null;
+  // Issue #308 / #320: the immutable premise this conversation was answered
+  // against, captured at creation and never rebased onto a newer snapshot.
+  // snapshot/revision are audit references; the hash/digest columns are what
+  // the server's premise evaluation actually compares. All null for
+  // Inquiries created before that migration and (apart from the
+  // snapshot/version/captured_at trio) for the qa/intent origins v1 does not
+  // auto-track.
+  premise_snapshot_id: number | null;
+  premise_revision_id: number | null;
+  premise_review_subject_id: string | null;
+  premise_content_hash: string | null;
+  premise_capability_digest: string | null;
+  premise_intent_digest: string | null;
+  premise_tracking_version: string | null;
+  premise_captured_at: number | null;
+  premise_tracking_state: InquiryPremiseTrackingState;
+  // Issue #323: the last premise verdict, the unique current successor
+  // review item (set ONLY when exactly one exists — an ambiguous successor
+  // is never guessed, and the front end must never infer one either), and
+  // the moment this Inquiry became 'superseded'. superseded_at is separate
+  // from closed_at so an already-resolved Inquiry keeps both timestamps.
+  premise_evaluation: InquiryPremiseEvaluation | null;
+  premise_successor_item_id: number | null;
+  superseded_at: number | null;
   created_at: number;
   updated_at: number;
   closed_at: number | null;
@@ -1081,6 +1123,12 @@ export type RuntimeCheckState = "match" | "mismatch" | "unobserved" | "stale";
 // 'inquiry' is set while an Inquiry (origin_kind='review_item') is open on
 // this item, and reset to 'open' (never 'answered') when it closes.
 export type AlignmentItemStatus = "open" | "answered" | "corrected" | "held" | "inquiry";
+// Issue #321: how one freshly built row relates to the previous generation
+// of the same discussion point. 'removed' is deliberately absent — a subject
+// with no row in the current build is a premise-evaluation result (#323),
+// not a property of a row that exists.
+export type AlignmentSubjectState =
+  | "new" | "unchanged" | "changed" | "ambiguous" | "untrackable";
 export type AlignmentDecisionAction = "accept_current" | "needs_change" | "reject_interpretation";
 export type AlignmentUserDecisionAction = AlignmentDecisionAction | "corrected" | "held";
 
@@ -1156,6 +1204,16 @@ export interface AlignmentItemOut {
   policy_digest: string | null;
   policy_rule_id?: string | null;
   manual_recheck_required?: boolean;
+  // Issue #321: stable discussion-point identity and physical lineage.
+  // review_subject_id is a deterministic digest over structural anchors only
+  // (Intent field + confirmed Capability entity/relation ids); null for
+  // legacy rows and for items with no stable anchor, which are reported
+  // subject_state='untrackable'. replaces_item_id is set only when exactly
+  // one predecessor generation row carried the same subject — a split/merge
+  // is reported 'ambiguous' and left unbound rather than guessed.
+  review_subject_id: string | null;
+  subject_state: AlignmentSubjectState | null;
+  replaces_item_id: number | null;
   intelligence_run_id: number;
   is_mock: boolean;
   created_at: number;

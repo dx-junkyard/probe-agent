@@ -13,7 +13,11 @@ import { render, screen, fireEvent, waitFor, within } from "@testing-library/rea
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { vi } from "vitest";
 import type { ReactNode } from "react";
-import type { InterviewIntentItemOut, InterviewIntentListOut } from "@/api/types";
+import type {
+  InterviewInquiryOut,
+  InterviewIntentItemOut,
+  InterviewIntentListOut,
+} from "@/api/types";
 
 const mockApi = {
   get: vi.fn(),
@@ -69,6 +73,60 @@ const CONFIRMED_ITEM: InterviewIntentItemOut = {
 // Mutable per-test override for GET /interview/sessions/1/inquiries — the
 // refresh/resume rediscovery list. Defaults to empty (no active Inquiry).
 let inquiryListItems: unknown[] = [];
+
+// --- Issue #322: premise tracking / superseded fixtures --------------------
+//
+// Every field below comes from the server contract (InterviewInquiryOut,
+// apps/control-server/app/models.py). The display must be derived from these
+// fields alone — never from local state — so the same fixture rendered after
+// a reload produces the same badge/message/successor affordance.
+function makeInquiry(overrides: Partial<InterviewInquiryOut> & { id: number }): InterviewInquiryOut {
+  return {
+    session_id: 1, system_id: 1, origin_kind: "review_item", origin_id: 7,
+    held_draft: null, status: "superseded", status_reason: null,
+    premise_snapshot_id: 11, premise_revision_id: 4,
+    premise_review_subject_id: "subject-abc", premise_content_hash: "hash-abc",
+    premise_capability_digest: null, premise_intent_digest: null,
+    premise_tracking_version: "inquiry-premise-v1", premise_captured_at: 1_700_000_000,
+    premise_tracking_state: "tracked", premise_evaluation: null,
+    premise_successor_item_id: null, superseded_at: 1_700_003_000,
+    created_at: 0, updated_at: 0, closed_at: null,
+    ...overrides,
+  };
+}
+
+// changed(後継あり)/ removed / ambiguous / untrackable(失効していない)の
+// 4パターン + 解消済みのまま失効したケース。
+const SUPERSEDED_CHANGED = makeInquiry({
+  id: 600, premise_evaluation: "changed", premise_successor_item_id: 42,
+  status_reason: "review_item_content_changed",
+});
+const SUPERSEDED_REMOVED = makeInquiry({
+  id: 601, premise_evaluation: "removed", status_reason: "origin_removed",
+});
+const SUPERSEDED_AMBIGUOUS = makeInquiry({
+  id: 602, premise_evaluation: "ambiguous", status_reason: "successor_ambiguous",
+});
+const UNTRACKABLE_OPEN = makeInquiry({
+  id: 603, status: "open", premise_tracking_state: "untrackable",
+  premise_content_hash: null, premise_review_subject_id: null,
+  premise_evaluation: null, superseded_at: null,
+});
+// 解消済み(closed_at あり)のまま前提が失効したケース: closed_at と
+// superseded_at は別物として両方残る。
+const SUPERSEDED_AFTER_RESOLVE = makeInquiry({
+  id: 604, premise_evaluation: "changed", premise_successor_item_id: 42,
+  status_reason: "review_item_content_changed",
+  closed_at: 1_700_001_000, superseded_at: 1_700_003_000,
+});
+
+const PREMISE_FIXTURES: Record<string, InterviewInquiryOut> = {
+  "/interview/inquiries/600": SUPERSEDED_CHANGED,
+  "/interview/inquiries/601": SUPERSEDED_REMOVED,
+  "/interview/inquiries/602": SUPERSEDED_AMBIGUOUS,
+  "/interview/inquiries/603": UNTRACKABLE_OPEN,
+  "/interview/inquiries/604": SUPERSEDED_AFTER_RESOLVE,
+};
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -283,6 +341,17 @@ beforeEach(() => {
             },
             intelligence_run_id: 9, is_mock: false, created_at: 0,
           },
+        ],
+      });
+    }
+    // --- Issue #322: premise tracking / superseded fixtures ---------------
+    const premiseFixture = PREMISE_FIXTURES[path];
+    if (premiseFixture) {
+      return Promise.resolve({
+        inquiry: premiseFixture,
+        messages: [
+          { id: 1, inquiry_id: premiseFixture.id, system_id: 1, role: "user", content: "当時の疑問です", detail: null, intelligence_run_id: null, is_mock: false, created_at: 0 },
+          { id: 2, inquiry_id: premiseFixture.id, system_id: 1, role: "assistant", content: "当時の回答です。", detail: null, intelligence_run_id: 1, is_mock: false, created_at: 0 },
         ],
       });
     }
@@ -660,6 +729,169 @@ describe("InquiryPanel (Issue #285)", () => {
       const evidenceDetail = within(row).getByTestId("inquiry-evidence-detail-2");
       expect(evidenceDetail).toHaveTextContent("Runtime");
       expect(evidenceDetail).toHaveTextContent("想定と不一致");
+    });
+  });
+
+  // --- 前提追跡と superseded 表示 (Issue #322 / server #308・#320-#323) ------
+  //
+  // superseded は「当時の前提に対する会話は履歴として残すが、現行の判断には
+  // 流用しない」という終端状態で、未解決/取り消しとも「回答が誤っていた」と
+  // も違う。表示はすべてサーバーのフィールド由来(ローカル state なし)なの
+  // で、リロード/セッション再開後も同じ結果になる。
+  describe("premise tracking / superseded", () => {
+    async function renderPanel(existingInquiryId: number) {
+      const { InquiryPanel } = await import(
+        "@/components/system-understanding/inquiry-panel"
+      );
+      render(
+        <InquiryPanel
+          sessionId={1}
+          originKind="review_item"
+          originId={7}
+          heldDraft={null}
+          existingInquiryId={existingInquiryId}
+          onResolved={vi.fn()}
+          onHeld={vi.fn()}
+          onCancel={vi.fn()}
+        />,
+        { wrapper: createWrapper() },
+      );
+      return screen.findByTestId("inquiry-panel");
+    }
+
+    test("premise_evaluation='changed' は固定の失効バッジ・説明・理由を出し、後継への導線を持つ", async () => {
+      const panel = await renderPanel(600);
+
+      expect(await within(panel).findByTestId("inquiry-superseded-badge-600")).toHaveTextContent(
+        "前提が変わったため再確認が必要",
+      );
+      // 未解決/取り消しとの違いを明示する固定説明文。
+      expect(within(panel).getByTestId("inquiry-superseded-explanation-600")).toHaveTextContent(
+        "当時の前提に対する会話は履歴として残りますが、現行の判断には流用しません(未解決・取り消しとは異なります)。",
+      );
+      expect(within(panel).getByTestId("inquiry-premise-reason-600")).toHaveTextContent(
+        "前提となる確認項目の内容が変わりました。",
+      );
+      // 後継が一意に決まっているときだけ導線を出す。リンク先はサーバーが返
+      // した premise_successor_item_id そのもの。
+      const link = within(panel).getByTestId("inquiry-successor-link-600");
+      expect(link).toHaveAttribute("href", "#review-item-42");
+      expect(link).toHaveTextContent("後継の確認項目 #42 を開く");
+      expect(within(panel).queryByTestId("inquiry-successor-unknown-600")).not.toBeInTheDocument();
+      // 生の enum / reason code は本文に出さない。
+      expect(within(panel).queryByText("changed")).not.toBeInTheDocument();
+      expect(within(panel).queryByText("superseded")).not.toBeInTheDocument();
+    });
+
+    test("premise_evaluation='removed' は固定文言を出し、後継の導線を出さない", async () => {
+      const panel = await renderPanel(601);
+
+      expect(await within(panel).findByTestId("inquiry-premise-reason-601")).toHaveTextContent(
+        "この疑問の論点は現行のレビューから無くなりました。",
+      );
+      expect(within(panel).queryByTestId("inquiry-successor-link-601")).not.toBeInTheDocument();
+      expect(within(panel).getByTestId("inquiry-successor-unknown-601")).toHaveTextContent(
+        "後継の確認項目は特定されていません。必要であれば、現在の確認項目から新しい疑問を開始してください。",
+      );
+    });
+
+    test("premise_evaluation='ambiguous' は固定文言を出し、クライアントは後継を推測しない", async () => {
+      const panel = await renderPanel(602);
+
+      expect(await within(panel).findByTestId("inquiry-premise-reason-602")).toHaveTextContent(
+        "後継の確認項目を一意に特定できませんでした。",
+      );
+      expect(within(panel).queryByTestId("inquiry-successor-link-602")).not.toBeInTheDocument();
+      expect(within(panel).getByTestId("inquiry-successor-unknown-602")).toBeInTheDocument();
+    });
+
+    test("premise_tracking_state='untrackable' は他の3つとは別の固定文言を出し、失効扱いにはしない", async () => {
+      const panel = await renderPanel(603);
+
+      expect(await within(panel).findByTestId("inquiry-premise-reason-603")).toHaveTextContent(
+        "作成時の前提を自動で比較できません(旧データ、または内容のハッシュが不明です)。",
+      );
+      // 失効ではないので、失効バッジも後継の導線も出ない。
+      expect(within(panel).queryByTestId("inquiry-superseded-badge-603")).not.toBeInTheDocument();
+      expect(within(panel).queryByTestId("inquiry-successor-unknown-603")).not.toBeInTheDocument();
+      // 'open' なので通常どおり会話は続けられる。
+      expect(within(panel).getByTestId("inquiry-resolve")).toBeInTheDocument();
+    });
+
+    test("superseded の Inquiry には追加質問・解消・保留のアクションを一切出さない", async () => {
+      const panel = await renderPanel(600);
+      await within(panel).findByTestId("inquiry-superseded-badge-600");
+
+      // /message, /resolve, /resume はサーバーが 409 で拒否するため、UI から
+      // 提示してはいけない。保留中マーカーも出さない。
+      expect(within(panel).queryByTestId("inquiry-followup-input")).not.toBeInTheDocument();
+      expect(within(panel).queryByTestId("inquiry-followup-submit")).not.toBeInTheDocument();
+      expect(within(panel).queryByTestId("inquiry-resolve")).not.toBeInTheDocument();
+      expect(within(panel).queryByTestId("inquiry-reopen-doubt")).not.toBeInTheDocument();
+      expect(within(panel).queryByTestId("inquiry-hold")).not.toBeInTheDocument();
+      expect(within(panel).queryByTestId("inquiry-held-marker")).not.toBeInTheDocument();
+      // 履歴としての会話自体は読める。
+      expect(within(panel).getByText("当時の回答です。")).toBeInTheDocument();
+      // 表示するだけでは一切の書き込みを行わない。
+      expect(mockApi.post).not.toHaveBeenCalled();
+    });
+
+    test("監査詳細に作成時の snapshot / revision と失効理由が出る", async () => {
+      const panel = await renderPanel(600);
+      fireEvent.click(await within(panel).findByTestId("inquiry-premise-audit-toggle-600"));
+
+      const audit = within(panel).getByTestId("inquiry-premise-audit-600");
+      expect(audit).toHaveTextContent("作成時のスナップショット: #11");
+      expect(audit).toHaveTextContent("作成時のリビジョン: #4");
+      expect(audit).toHaveTextContent("失効理由: 内容が変わった");
+      expect(audit).toHaveTextContent("前提の追跡状態: 追跡あり");
+    });
+
+    test("解消済みのまま失効した Inquiry は解消日時と失効日時の両方を出す", async () => {
+      const panel = await renderPanel(604);
+      fireEvent.click(await within(panel).findByTestId("inquiry-premise-audit-toggle-604"));
+
+      // closed_at(解消した瞬間)と superseded_at(前提が失効した瞬間)は
+      // 別のフィールドで、どちらも失われない。
+      expect(within(panel).getByTestId("inquiry-premise-closed-at-604")).toHaveTextContent("解消日時:");
+      expect(within(panel).getByTestId("inquiry-premise-superseded-at-604")).toHaveTextContent("失効日時:");
+    });
+
+    test("前提が追跡済みで未評価の Inquiry には前提の注記を出さない", async () => {
+      // 既存の open な Inquiry(100)は premise_evaluation なし・tracking も
+      // not_applicable なので、余計な注記が増えないこと。
+      const row = await openInquiry();
+      expect(within(row).queryByTestId("inquiry-premise-notice-100")).not.toBeInTheDocument();
+    });
+
+    test("superseded の Inquiry は active 扱いされず、元の項目からは新しい疑問を始められる", async () => {
+      inquiryListItems = [SUPERSEDED_CHANGED, { ...SUPERSEDED_REMOVED, origin_kind: "intent", origin_id: 5 }];
+
+      const row = await openIntentPanel();
+
+      // 再開/再オープンの導線は出さず、通常の「疑問がある」のまま。
+      expect(await within(row).findByTestId("intent-item-inquiry-open-5")).toBeInTheDocument();
+      expect(within(row).queryByTestId("intent-item-inquiry-reopen-5")).not.toBeInTheDocument();
+      expect(within(row).queryByTestId("intent-item-held-inquiry-marker-5")).not.toBeInTheDocument();
+      expect(within(row).queryByTestId("intent-item-inquiry-resume-5")).not.toBeInTheDocument();
+    });
+  });
+
+  // Issue #322: 'superseded' は active/resumable の集合に入らない。
+  describe("activeInquiryByOrigin / supersededInquiries", () => {
+    test("superseded は active から除外され、履歴セレクタだけが返す", async () => {
+      const { activeInquiryByOrigin, supersededInquiries } = await import("@/api/hooks");
+      const items = [
+        SUPERSEDED_CHANGED,
+        SUPERSEDED_REMOVED,
+        makeInquiry({ id: 610, status: "open", origin_id: 8 }),
+      ];
+
+      const active = activeInquiryByOrigin(items);
+      expect(active.get("review_item:7")).toBeUndefined();
+      expect(active.get("review_item:8")?.id).toBe(610);
+
+      expect(supersededInquiries(items).map(i => i.id)).toEqual([600, 601]);
     });
   });
 });

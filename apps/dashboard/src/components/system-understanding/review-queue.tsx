@@ -77,10 +77,12 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Textarea } from "@/components/ui/textarea";
 import { InquiryPanel } from "@/components/system-understanding/inquiry-panel";
+import { InquiryPremiseNotice } from "@/components/system-understanding/inquiry-premise-notice";
 import { RefreshStatusChip } from "@/components/system-understanding/refresh-status-chip";
 import { HandoffModal } from "@/components/system-understanding/handoff-panel";
 import {
   useActiveInquiriesByOrigin,
+  useSupersededInquiries,
   useAlignmentList,
   useAnswerAlignmentItem,
   useAnswerAlignmentItemsBatch,
@@ -439,7 +441,12 @@ function ReviewQueueItemCard({
 
   return (
     <div
-      className={`rounded-md border p-3 space-y-2 ${isMustReview ? "border-destructive/60 bg-destructive/5" : ""}`}
+      // Issue #322: the anchor target a superseded Inquiry's 後継の確認項目
+      // link points at (`#review-item-<premise_successor_item_id>`). The id
+      // always comes from the server-provided successor id — the front end
+      // never derives a successor itself.
+      id={`review-item-${item.id}`}
+      className={`scroll-mt-4 rounded-md border p-3 space-y-2 ${isMustReview ? "border-destructive/60 bg-destructive/5" : ""}`}
       data-testid={`review-item-${item.id}`}
       data-review-category={item.review_category}
       aria-label={isMustReview ? `要確認: ${item.current_claim}` : item.current_claim}
@@ -762,7 +769,14 @@ function InformationalItemRow({
   };
 
   return (
-    <div className="rounded-md border p-2 text-xs space-y-1" data-testid={`review-item-informational-${item.id}`}>
+    <div
+      // Issue #322: same anchor target as the action cards above, so a
+      // superseded Inquiry's successor link resolves even when the successor
+      // ended up in a collapsed/no-action category.
+      id={`review-item-${item.id}`}
+      className="scroll-mt-4 rounded-md border p-2 text-xs space-y-1"
+      data-testid={`review-item-informational-${item.id}`}
+    >
       <div className="flex flex-wrap items-center gap-1">
         {sample && (
           <Badge variant="outline" data-testid={`review-item-sample-${item.id}`}>
@@ -828,8 +842,17 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
   const activeInquiries = useActiveInquiriesByOrigin(sessionId);
   const { data: ruleObjections } = useAlignmentRuleObjections();
   const requestRecheck = useRequestAlignmentRuleRecheck(sessionId);
+  // Issue #322: superseded Inquiries (前提が変わった疑問) are history, never
+  // active — see supersededInquiries()/activeInquiryByOrigin() in api/hooks.
+  // Only 'review_item' origins can ever be superseded (the server evaluates
+  // that origin only), so the Review Queue is where their history belongs.
+  const allSupersededInquiries = useSupersededInquiries(sessionId);
+  const supersededReviewInquiries = allSupersededInquiries.filter(
+    inquiry => inquiry.origin_kind === "review_item",
+  );
   const [showInformational, setShowInformational] = useState(false);
   const [showSuperseded, setShowSuperseded] = useState(false);
+  const [showSupersededInquiries, setShowSupersededInquiries] = useState(false);
   const [bulkMode, setBulkMode] = useState(false);
   const [bulkSending, setBulkSending] = useState(false);
   const [pendingAnswers, setPendingAnswers] = useState<Record<number, StagedAnswer>>({});
@@ -1143,6 +1166,41 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
                     sessionId={sessionId}
                     existingInquiry={activeInquiries.get(`review_item:${item.id}`)}
                   />
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {supersededReviewInquiries.length > 0 && (
+          <div className="pt-2 border-t">
+            <button
+              type="button"
+              className="text-xs text-muted-foreground underline underline-offset-2"
+              onClick={() => setShowSupersededInquiries(s => !s)}
+              aria-expanded={showSupersededInquiries}
+              data-testid="review-queue-superseded-inquiry-toggle"
+            >
+              {showSupersededInquiries
+                ? "前提が変わった疑問を隠す"
+                : `前提が変わった疑問 ${supersededReviewInquiries.length}件`}
+            </button>
+            {showSupersededInquiries && (
+              <div className="mt-2 space-y-2" data-testid="review-queue-superseded-inquiry-list">
+                {supersededReviewInquiries.map(inquiry => (
+                  <div
+                    key={inquiry.id}
+                    className="rounded-md border p-2 text-xs space-y-1"
+                    data-testid={`superseded-inquiry-${inquiry.id}`}
+                  >
+                    <p className="text-muted-foreground">
+                      当時の確認項目: #{inquiry.origin_id}
+                    </p>
+                    {/* 表示も導線もサーバーのフィールドだけから作る。ここには
+                        回答・承認のアクションを一切置かない — 履歴を見ること
+                        が元の確認項目の回答になってはいけない(#285/#322)。 */}
+                    <InquiryPremiseNotice inquiry={inquiry} />
+                  </div>
                 ))}
               </div>
             )}

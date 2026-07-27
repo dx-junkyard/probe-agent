@@ -10,6 +10,7 @@ import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import { InquiryPremiseNotice } from "@/components/system-understanding/inquiry-premise-notice";
 import {
   useCreateInterviewInquiry,
   useCreateObservationProposal,
@@ -465,15 +466,27 @@ export function InquiryPanel({
   };
 
   const isOpen = !inquiryId || detail?.inquiry.status === "open";
+  // Issue #322: a superseded Inquiry is terminal and system-written — the
+  // premise it was answered against no longer exists, and /message,
+  // /resolve, /resume all 409 server-side. `isOpen` above already hides
+  // every action for it; this only swaps the 保留中 header for the premise
+  // notice so the state is readable instead of looking like a stalled
+  // conversation.
+  const supersededInquiry = detail && detail.inquiry.status === "superseded"
+    ? detail.inquiry
+    : null;
 
   return (
     <div
       className="rounded-md border border-amber-500/60 bg-amber-500/5 p-3 space-y-2"
       data-testid="inquiry-panel"
     >
-      <p className="text-xs font-medium text-amber-700" data-testid="inquiry-held-marker">
-        保留中(疑問を解消してから回答)
-      </p>
+      {!supersededInquiry && (
+        <p className="text-xs font-medium text-amber-700" data-testid="inquiry-held-marker">
+          保留中(疑問を解消してから回答)
+        </p>
+      )}
+      {detail && <InquiryPremiseNotice inquiry={detail.inquiry} />}
 
       {detail && (
         <div className="space-y-2 max-h-64 overflow-y-auto pr-1" data-testid="inquiry-conversation">
