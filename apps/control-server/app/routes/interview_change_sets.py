@@ -284,24 +284,31 @@ def create_change_set(
         client = None
         client_error = str(exc)
 
+    # Phase 1 (DB lock held): deterministic reads only.
     with get_conn() as conn:
         session = _get_session_or_404(conn, session_id, system_id)
         revision = _latest_revision_row(conn, session_id, system_id)
         candidates = _build_candidates(conn, session_id, system_id)
 
-        if client_error is not None:
-            proposal = ChangeSetProposalResult(
-                provider=config.provider,
-                model=config.model,
-                is_mock=config.provider == "mock",
-                error=client_error,
-            )
-        else:
-            proposal = generate_change_set_proposal(
-                client, config, source_text=payload.text, candidates=candidates,
-            )
+    # Phase 2 (DB lock released): the reasoning call. The LLM client opens its
+    # own connection for System quota, so it must not run while this thread
+    # holds one (see app/db.py).
+    if client_error is not None:
+        proposal = ChangeSetProposalResult(
+            provider=config.provider,
+            model=config.model,
+            is_mock=config.provider == "mock",
+            error=client_error,
+        )
+    else:
+        proposal = generate_change_set_proposal(
+            client, config, source_text=payload.text, candidates=candidates,
+        )
+    completed_at = time.time()
 
-        completed_at = time.time()
+    # Phase 3 (DB lock re-acquired): persist the audit run, the change set and
+    # its items.
+    with get_conn() as conn:
         run_status = "failed" if proposal.error else "completed"
         run_cur = conn.execute(
             """

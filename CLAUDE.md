@@ -425,6 +425,12 @@ Do not rely only on manual testing when behavior can be covered by unit tests.
 - Add persistence in the issue that owns the lifecycle and query requirements.
 - Prefer additive SQLite schema changes; include migration/backfill behavior and
   isolation tests for every System-scoped table.
+- Never hold a `db.get_conn()` connection across an external call (LLM round
+  trip, subprocess). Its lock is process-wide and non-reentrant, and every LLM
+  client opens its own connection to consume System quota — so an LLM call
+  inside `with get_conn()` deadlocks the entire server until it is restarted.
+  Structure such endpoints as read → reason → persist with the connection
+  closed during the reasoning call. See `.claude/skills/control-server/SKILL.md`.
 - Keep raw deterministic facts separate from LLM interpretations in storage.
 
 ---

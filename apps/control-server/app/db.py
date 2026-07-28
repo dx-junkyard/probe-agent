@@ -12,6 +12,37 @@ logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 
+# ``_lock`` is a plain, NON-reentrant Lock and it is held for the whole lifetime
+# of the connection yielded by get_conn(). The Control Server runs as a single
+# uvicorn worker, so that lock is effectively process-wide: while it is held, no
+# other request can touch the database.
+#
+# Two consequences, both enforced by _open_depth below:
+#
+# 1. Re-entering get_conn() on a thread that already holds a connection is a
+#    permanent self-deadlock -- the thread waits on a lock only it can release,
+#    and every other request piles up behind it until the process is restarted.
+#    The most common way to hit this is indirect: an LLM client call, which
+#    consumes System quota through resource_limits.consume_llm_execution() and
+#    therefore opens its own connection.
+# 2. Even without re-entry, holding the connection across an external call (an
+#    LLM round trip, a subprocess) stalls every other request for its duration.
+#
+# The rule is therefore: never call get_conn() -- directly or transitively --
+# while another connection is open on the same thread, and never keep one open
+# across an external call. Read what is needed, close the connection, do the
+# external work, then reopen to persist. The canonical example is
+# routes/interview.py::run_runtime_reality_check.
+_open_depth = threading.local()
+
+
+class DatabaseReentrancyError(RuntimeError):
+    """get_conn() was re-entered while this thread already held a connection.
+
+    Raised instead of deadlocking, so the offending call stack is visible in
+    the traceback rather than the process hanging forever.
+    """
+
 
 def db_path() -> str:
     return os.getenv("PROBE_DB_PATH", "./probe.db")
@@ -25,13 +56,29 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def connection_is_open() -> bool:
+    """True when this thread already holds a get_conn() connection."""
+    return getattr(_open_depth, "value", 0) > 0
+
+
 @contextmanager
 def get_conn() -> Iterator[sqlite3.Connection]:
+    if connection_is_open():
+        raise DatabaseReentrancyError(
+            "get_conn() was called while this thread already holds a database "
+            "connection. The connection lock is process-wide and not reentrant, "
+            "so this would deadlock the whole server permanently. Close the "
+            "outer connection before doing this work -- in particular, never "
+            "call an LLM client inside a `with get_conn()` block: consuming "
+            "System quota opens its own connection."
+        )
     with _lock:
+        _open_depth.value = 1
         conn = _connect()
         try:
             yield conn
         finally:
+            _open_depth.value = 0
             conn.close()
 
 

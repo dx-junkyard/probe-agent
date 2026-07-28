@@ -567,6 +567,14 @@ def investigate(
     citable evidence kind (``runtime_evidence``); omitting them keeps this
     call exactly as read-only/git-only as before -- no runtime facts are
     gathered or offered.
+
+    Callers should pass ``system_id``/``snapshot_id`` WITHOUT ``conn``: this
+    function then opens its own short-lived connection for the runtime-fact
+    read and closes it before the reasoning call below. Passing a live
+    ``conn`` means the caller still holds the process-wide DB lock across
+    that reasoning call, which stalls every other request (see app/db.py);
+    it is supported only for callers that already own a connection and do
+    not hold the lock across an external call.
     """
     start_time = time.monotonic()
     budget = budget or InvestigationBudget()
@@ -620,11 +628,25 @@ def investigate(
             elapsed_seconds=time.monotonic() - start_time,
         )
 
+    # Runtime-fact gathering is the only DB work in this function, and it
+    # happens strictly BEFORE the reasoning call below. When the caller did
+    # not hand us a connection we open (and close) our own here, so the
+    # process-wide DB lock is never held across the LLM round trip.
     runtime_candidates: List[RuntimeFactCandidate] = []
-    if conn is not None and system_id is not None and snapshot_id is not None:
-        runtime_candidates = _gather_runtime_candidates(
-            conn, system_id, snapshot_id, [s.path for s in snippets], budget.max_runtime_facts,
-        )
+    if system_id is not None and snapshot_id is not None:
+        if conn is not None:
+            runtime_candidates = _gather_runtime_candidates(
+                conn, system_id, snapshot_id,
+                [s.path for s in snippets], budget.max_runtime_facts,
+            )
+        else:
+            from .db import get_conn
+
+            with get_conn() as own_conn:
+                runtime_candidates = _gather_runtime_candidates(
+                    own_conn, system_id, snapshot_id,
+                    [s.path for s in snippets], budget.max_runtime_facts,
+                )
 
     prompt = _build_user_prompt(question, research_focus, snippets, runtime_candidates)
 

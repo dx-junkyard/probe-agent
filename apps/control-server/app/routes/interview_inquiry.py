@@ -363,7 +363,6 @@ class _AnswerOutcome:
 
 
 def _generate_and_store_answer(
-    conn,
     *,
     system_id: int,
     snapshot_id: int,
@@ -389,12 +388,25 @@ def _generate_and_store_answer(
     user's question. ``answerable=false`` is not an error: a fixed,
     non-LLM-fabricated message is stored instead of the model's own
     conclusion text (never fabricate, per Issue #285's brief).
+
+    This function owns its own database connections and must be called with
+    none open on the calling thread: the reasoning pipeline below runs
+    between them, so the process-wide DB lock is never held across an
+    external call (see app/db.py).
     """
-    context_pack = build_interview_context(conn, system_id, snapshot_id)
-    snapshot_row = conn.execute(
-        "SELECT repo_path, commit_sha FROM repository_snapshots WHERE id = ? AND system_id = ?",
-        (snapshot_id, system_id),
-    ).fetchone()
+    # Phase 1 (DB lock held): deterministic context reads only.
+    with get_conn() as conn:
+        context_pack = build_interview_context(conn, system_id, snapshot_id)
+        snapshot_row = conn.execute(
+            "SELECT repo_path, commit_sha FROM repository_snapshots WHERE id = ? AND system_id = ?",
+            (snapshot_id, system_id),
+        ).fetchone()
+        repo_path = snapshot_row["repo_path"] if snapshot_row else None
+        commit_sha = snapshot_row["commit_sha"] if snapshot_row else None
+
+    # Phase 2 (DB lock released): route + investigate + compose. ``conn`` is
+    # deliberately not passed down -- investigate() opens its own short-lived
+    # connection for runtime facts and closes it before its reasoning call.
     config = LLMConfig.intelligence_from_env()
     try:
         client = create_llm_client(config)
@@ -405,9 +417,8 @@ def _generate_and_store_answer(
             question_text=question_text,
             conversation=conversation,
             origin_summary=origin_summary,
-            repo_path=snapshot_row["repo_path"] if snapshot_row else None,
-            commit_sha=snapshot_row["commit_sha"] if snapshot_row else None,
-            conn=conn,
+            repo_path=repo_path,
+            commit_sha=commit_sha,
             system_id=system_id,
             snapshot_id=snapshot_id,
         )
@@ -421,6 +432,30 @@ def _generate_and_store_answer(
 
     completed_at = time.time()
 
+    # Phase 3 (DB lock re-acquired): persist the audit runs and the message.
+    with get_conn() as conn:
+        return _persist_answer_outcome(
+            conn,
+            result=result,
+            system_id=system_id,
+            snapshot_id=snapshot_id,
+            inquiry_id=inquiry_id,
+            now=now,
+            completed_at=completed_at,
+        )
+
+
+def _persist_answer_outcome(
+    conn,
+    *,
+    result: InquiryAnswerResult,
+    system_id: int,
+    snapshot_id: int,
+    inquiry_id: int,
+    now: float,
+    completed_at: float,
+) -> _AnswerOutcome:
+    """Persist the audit rows and assistant message for a generated answer."""
     if result.route is not None:
         persist_route_run(
             conn, system_id=system_id, snapshot_id=snapshot_id, route=result.route,
@@ -713,26 +748,31 @@ def create_inquiry(
             conn.execute("ROLLBACK")
             raise
 
-        outcome = _generate_and_store_answer(
-            conn,
-            system_id=system_id,
-            snapshot_id=premise["premise_snapshot_id"],
-            inquiry_id=inquiry_id,
-            question_text=payload.question_text,
-            conversation=[{"role": "user", "content": payload.question_text}],
-            origin_summary=origin_summary,
-            now=now,
-        )
-        if outcome.error:
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "code": "inquiry_answer_failed",
-                    "message": outcome.error,
-                    "inquiry_id": inquiry_id,
-                },
-            )
+        premise_snapshot_id = premise["premise_snapshot_id"]
 
+    # The Inquiry and the user's question are committed above. Answer
+    # generation runs with NO connection held (it owns its own -- see
+    # app/db.py): the reasoning pipeline must not stall other requests.
+    outcome = _generate_and_store_answer(
+        system_id=system_id,
+        snapshot_id=premise_snapshot_id,
+        inquiry_id=inquiry_id,
+        question_text=payload.question_text,
+        conversation=[{"role": "user", "content": payload.question_text}],
+        origin_summary=origin_summary,
+        now=now,
+    )
+    if outcome.error:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "inquiry_answer_failed",
+                "message": outcome.error,
+                "inquiry_id": inquiry_id,
+            },
+        )
+
+    with get_conn() as conn:
         inquiry_row = conn.execute(
             "SELECT * FROM interview_inquiry WHERE id = ?", (inquiry_id,),
         ).fetchone()
@@ -858,26 +898,28 @@ def post_inquiry_message(
         )
         conversation.append({"role": "user", "content": payload.content})
 
-        outcome = _generate_and_store_answer(
-            conn,
-            system_id=system_id,
-            snapshot_id=premise_snapshot_id,
-            inquiry_id=inquiry_id,
-            question_text=payload.content,
-            conversation=conversation,
-            origin_summary=origin_summary,
-            now=now,
+    # The user's follow-up is persisted above. Answer generation runs with NO
+    # connection held (it owns its own -- see app/db.py).
+    outcome = _generate_and_store_answer(
+        system_id=system_id,
+        snapshot_id=premise_snapshot_id,
+        inquiry_id=inquiry_id,
+        question_text=payload.content,
+        conversation=conversation,
+        origin_summary=origin_summary,
+        now=now,
+    )
+    if outcome.error:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "inquiry_answer_failed",
+                "message": outcome.error,
+                "inquiry_id": inquiry_id,
+            },
         )
-        if outcome.error:
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "code": "inquiry_answer_failed",
-                    "message": outcome.error,
-                    "inquiry_id": inquiry_id,
-                },
-            )
 
+    with get_conn() as conn:
         inquiry_row = conn.execute(
             "SELECT * FROM interview_inquiry WHERE id = ?", (inquiry_id,),
         ).fetchone()

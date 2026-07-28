@@ -340,19 +340,7 @@ def _run_one_locked(job_id: int) -> None:
 
         intelligence_run_id: Optional[int] = None
         result_revision_id: Optional[int] = None
-        if rebuild_understanding:
-            result = _rebuild_understanding(conn, session, system_id)
-            if not result.ok:
-                conn.execute(
-                    """UPDATE interview_refresh_job
-                       SET status = 'failed', error = ?, intelligence_run_id = ?, finished_at = ?
-                       WHERE id = ?""",
-                    (result.error, result.intelligence_run_id, time.time(), job_id),
-                )
-                return
-            intelligence_run_id = result.intelligence_run_id
-            result_revision_id = result.revision_id
-        else:
+        if not rebuild_understanding:
             # Intent updates affect the desired state, not facts about the
             # current system. NL change sets have already persisted their
             # selected claim edits as a new understanding_revision. Reusing
@@ -366,20 +354,39 @@ def _run_one_locked(job_id: int) -> None:
             ).fetchone()
             result_revision_id = latest_rev["id"] if latest_rev else None
 
-        # Issue #287's Alignment build is best-effort here: Understanding
-        # already rebuilt successfully (the primary deliverable), so a
-        # follow-up Alignment failure is recorded as a note rather than
-        # regressing the whole job to 'failed' and discarding the new
-        # understanding revision that was just durably written.
-        from .routes.interview_alignment import run_alignment_build
+    # From here the job's own connection is released. Both
+    # `_rebuild_understanding` and `run_alignment_build` own their connections
+    # around their reasoning calls, so this job must hold none while they run
+    # (see app/db.py); each step below reopens one only to record its outcome.
+    if rebuild_understanding:
+        result = _rebuild_understanding(session, system_id)
+        if not result.ok:
+            with get_conn() as conn:
+                conn.execute(
+                    """UPDATE interview_refresh_job
+                       SET status = 'failed', error = ?, intelligence_run_id = ?, finished_at = ?
+                       WHERE id = ?""",
+                    (result.error, result.intelligence_run_id, time.time(), job_id),
+                )
+            return
+        intelligence_run_id = result.intelligence_run_id
+        result_revision_id = result.revision_id
 
-        alignment_note: Optional[str] = None
-        try:
-            run_alignment_build(conn, session_id, system_id)
-        except HTTPException as exc:
-            detail = exc.detail if isinstance(exc.detail, str) else repr(exc.detail)
-            alignment_note = f"Alignment refresh failed: {detail}"
+    # Issue #287's Alignment build is best-effort here: Understanding
+    # already rebuilt successfully (the primary deliverable), so a
+    # follow-up Alignment failure is recorded as a note rather than
+    # regressing the whole job to 'failed' and discarding the new
+    # understanding revision that was just durably written.
+    from .routes.interview_alignment import run_alignment_build
 
+    alignment_note: Optional[str] = None
+    try:
+        run_alignment_build(session_id, system_id)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, str) else repr(exc.detail)
+        alignment_note = f"Alignment refresh failed: {detail}"
+
+    with get_conn() as conn:
         conn.execute(
             """UPDATE interview_refresh_job
                SET status = 'updated', intelligence_run_id = ?, result_revision_id = ?,

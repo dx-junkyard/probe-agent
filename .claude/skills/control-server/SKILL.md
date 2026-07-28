@@ -763,6 +763,25 @@ heuristic result.
 - Commands must come from explicit configuration, run in an isolated workspace,
   and enforce timeout/network/environment policies.
 - Deterministic safety denylists override LLM output.
+- NEVER hold a `get_conn()` connection across an external call. `db.py`'s lock
+  is process-wide and NON-REENTRANT, and the server runs a single uvicorn
+  worker, so a connection held across an LLM round trip stalls every other
+  request for its duration. Worse, every LLM client consumes System quota via
+  `resource_limits.consume_llm_execution()`, which opens its OWN connection:
+  calling an LLM inside `with get_conn()` self-deadlocks the whole process
+  permanently (no timeout breaks it; only a restart does). `get_conn()` now
+  raises `DatabaseReentrancyError` instead of hanging, but the fix is to
+  structure the endpoint in 3 phases: read under the lock, close it, run the
+  reasoning call, then reopen to persist. Canonical examples:
+  `routes/interview.py::run_runtime_reality_check` and
+  `cell_orchestrator.run_triage`. Helpers that need both DB and an LLM
+  (`_rebuild_understanding`, `run_alignment_build`, `_generate_and_store_answer`,
+  `investigate`) own their connections rather than receiving one, and their
+  docstrings say so — call them with none open.
+  Mock providers do NOT exercise this: reasoning entry points fail closed
+  before `generate_text` on a mock/non-reasoning client, so any test that
+  must reach the LLM path has to configure a real reasoning model
+  (`openai`/`o3`) and stub `llm._request_json`.
 - Additive nullable columns go through `db.py`'s `_add_column_if_missing`
   (Issue #308). It only ever adds a nullable column and never backfills, so
   do not use it for NOT NULL/DEFAULT migrations that need a value written
@@ -786,6 +805,9 @@ Add or update tests for:
   legacy key / anonymous rejected
 - password reset and role change permissions and guards
 - System isolation for every intelligence table/API
+- no `get_conn()` connection is held across an LLM call — `tests/test_db_lock_isolation.py`
+  keeps a static check over every `with get_conn()` block plus dynamic checks
+  with a real reasoning model configured; extend it rather than duplicating it
 - committed-only snapshot behavior
 - reasoning-required operations fail closed without heuristic fallback
 - reasoning metadata and structured-output validation
@@ -928,7 +950,9 @@ Cross-cutting rules for every fabric module:
 - `db.get_conn()`'s lock is NON-REENTRANT: pass `conn` into helpers, and
   NEVER hold a connection across `generate_text` (the quota wrapper opens
   its own connection) -- use the 3-phase read / LLM / write structure of
-  `cell_orchestrator.run_triage`.
+  `cell_orchestrator.run_triage`. This is now a server-wide rule (see
+  `## Rules`), enforced by `get_conn()` itself and by
+  `tests/test_db_lock_isolation.py`.
 - All tables are System-scoped with isolation tests; all reasoning goes
   through `intelligence_runs` fail-closed with `is_mock` surfaced; the
   Probe SDK is never touched by fabric work.
