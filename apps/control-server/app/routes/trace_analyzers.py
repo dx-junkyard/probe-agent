@@ -131,19 +131,28 @@ def propose_analyzer(
     model. Fails closed (422) with an audited failed run on any error; a
     successful proposal is saved as ``proposed`` (never auto-approved)."""
     config = LLMConfig.intelligence_from_env()
+
+    # Phase 1 (DB lock held): deterministic context read only.
     with get_conn() as conn:
         ctx = build_proposal_context(conn, system_id)
 
-        # Client creation can fail closed (e.g. missing API key). Record it.
-        try:
-            client = create_llm_client(config)
-        except LLMError as exc:
+    # Phase 2 (DB lock released): the reasoning call. get_conn() holds a
+    # process-wide, non-reentrant lock and the LLM client opens its own
+    # connection to consume System quota, so calling it here rather than
+    # inside the block above is what keeps this endpoint from deadlocking
+    # the server (see app/db.py).
+    try:
+        client = create_llm_client(config)
+    except LLMError as exc:
+        with get_conn() as conn:
             _record_run(conn, system_id, "analyzer_proposal", config.provider,
                         config.model, False, "failed", str(exc))
-            raise HTTPException(422, f"reasoning model not configured: {exc}")
+        raise HTTPException(422, f"reasoning model not configured: {exc}")
 
-        result = propose(client, config, body.intent, ctx)
+    result = propose(client, config, body.intent, ctx)
 
+    # Phase 3 (DB lock re-acquired): persist the audit run and the proposal.
+    with get_conn() as conn:
         if result.error or result.spec is None:
             _record_run(conn, system_id, "analyzer_proposal", result.provider,
                         result.model, result.is_mock, "failed", result.error)

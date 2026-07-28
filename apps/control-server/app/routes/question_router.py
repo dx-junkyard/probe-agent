@@ -82,6 +82,8 @@ def route_interview_qa(
       probe_value: Verify a routed question persists route_category/route_run_id/knowledge_area and that LLM failure leaves the question unrouted with a failed audit row.
     """
     now = time.time()
+
+    # Phase 1 (DB lock held): read the question and its snapshot.
     with get_conn() as conn:
         qa = conn.execute(
             "SELECT * FROM interview_qa WHERE id = ? AND system_id = ?",
@@ -95,19 +97,24 @@ def route_interview_qa(
         ).fetchone()
         snapshot_id = session["snapshot_id"] if session else None
 
-        config = LLMConfig.intelligence_from_env()
-        try:
-            client = create_llm_client(config)
-            result = route_question(
-                client, config, question_text=qa["question_text"], context=_qa_context(qa),
-            )
-        except LLMError as exc:
-            result = RouteResult(
-                provider=config.provider, model=config.model,
-                is_mock=config.provider == "mock", error=str(exc),
-            )
+    # Phase 2 (DB lock released): the reasoning call. The LLM client opens its
+    # own connection for System quota, so it must not run while this thread
+    # holds one (see app/db.py).
+    config = LLMConfig.intelligence_from_env()
+    try:
+        client = create_llm_client(config)
+        result = route_question(
+            client, config, question_text=qa["question_text"], context=_qa_context(qa),
+        )
+    except LLMError as exc:
+        result = RouteResult(
+            provider=config.provider, model=config.model,
+            is_mock=config.provider == "mock", error=str(exc),
+        )
+    completed_at = time.time()
 
-        completed_at = time.time()
+    # Phase 3 (DB lock re-acquired): persist the audit run and the decision.
+    with get_conn() as conn:
         run_id = persist_route_run(
             conn, system_id=system_id, snapshot_id=snapshot_id, route=result,
             now=now, completed_at=completed_at,
@@ -324,79 +331,92 @@ def route_and_investigate_qa(
         selected = eligible[:MAX_BATCH_QUESTIONS]
         skipped_cap = max(0, len(eligible) - len(selected))
 
-        # Same language resolution as the Inquiry flow
-        # (inquiry_answering.generate_inquiry_answer) so batch-routed
-        # questions and Inquiry answers never diverge on INTERVIEW_LANGUAGE.
-        language = get_interview_language()
+    # Phase 2/3 (DB lock released): up to MAX_BATCH_QUESTIONS questions, each
+    # costing one routing call plus up to InvestigationBudget.max_llm_calls
+    # investigation calls. Holding the process-wide DB lock across that many
+    # external round trips would stall every other request for the whole
+    # batch, so each question's reasoning runs unlocked and only its own
+    # persistence re-acquires a connection (see app/db.py). Per-question
+    # persistence also preserves the existing "fail closed per question
+    # without aborting the batch" contract: a later failure never discards an
+    # earlier question's recorded result.
 
-        results: List[InterviewQaRouteInvestigateItemOut] = list(missing_qa_id_errors)
-        counts = InterviewQaRouteInvestigateCountsOut(
-            skipped_cap=skipped_cap, failed=len(missing_qa_id_errors),
-        )
+    # Same language resolution as the Inquiry flow
+    # (inquiry_answering.generate_inquiry_answer) so batch-routed
+    # questions and Inquiry answers never diverge on INTERVIEW_LANGUAGE.
+    language = get_interview_language()
 
-        for qa in selected:
-            qa_id = qa["id"]
-            route_category: Optional[str] = qa["route_category"]
-            knowledge_area = qa["knowledge_area"] if "knowledge_area" in qa.keys() else None
-            search_keywords: Optional[List[str]] = None
-            research_focus: Optional[str] = None
+    results: List[InterviewQaRouteInvestigateItemOut] = list(missing_qa_id_errors)
+    counts = InterviewQaRouteInvestigateCountsOut(
+        skipped_cap=skipped_cap, failed=len(missing_qa_id_errors),
+    )
 
-            if route_category is None:
-                route_result = route_question(
-                    client, config, question_text=qa["question_text"], context=_qa_context(qa),
-                    language=language,
-                )
-                route_completed_at = time.time()
+    for qa in selected:
+        qa_id = qa["id"]
+        route_category: Optional[str] = qa["route_category"]
+        knowledge_area = qa["knowledge_area"] if "knowledge_area" in qa.keys() else None
+        search_keywords: Optional[List[str]] = None
+        research_focus: Optional[str] = None
+
+        if route_category is None:
+            route_result = route_question(
+                client, config, question_text=qa["question_text"], context=_qa_context(qa),
+                language=language,
+            )
+            route_completed_at = time.time()
+            with get_conn() as conn:
                 route_run_id = persist_route_run(
                     conn, system_id=system_id, snapshot_id=snapshot_id, route=route_result,
                     now=now, completed_at=route_completed_at,
                 )
-                if route_result.error:
-                    counts.failed += 1
-                    results.append(InterviewQaRouteInvestigateItemOut(
-                        qa_id=qa_id, route_category=None, knowledge_area=None,
-                        investigation_status=None, error=route_result.error,
-                    ))
-                    continue
-
-                conn.execute(
-                    "UPDATE interview_qa "
-                    "SET route_category = ?, route_run_id = ?, knowledge_area = ? WHERE id = ?",
-                    (route_result.category, route_run_id, route_result.knowledge_area, qa_id),
-                )
-                counts.routed += 1
-                route_category = route_result.category
-                knowledge_area = route_result.knowledge_area
-                search_keywords = route_result.search_keywords
-                research_focus = route_result.research_focus
-
-            investigation_status: Optional[str] = None
-            item_error: Optional[str] = None
-
-            if route_category in ("system_researchable", "hybrid"):
-                if not repo_path or not commit_sha:
-                    item_error = "Investigation requires a pinned snapshot repo_path/commit_sha"
-                else:
-                    investigation = investigate(
-                        client, config,
-                        repo_path=repo_path, commit_sha=commit_sha,
-                        question=qa["question_text"],
-                        research_focus=research_focus,
-                        search_keywords=search_keywords,
-                        hybrid_decision_question=(route_category == "hybrid"),
-                        language=language,
-                        conn=conn, system_id=system_id, snapshot_id=snapshot_id,
+                if not route_result.error:
+                    conn.execute(
+                        "UPDATE interview_qa "
+                        "SET route_category = ?, route_run_id = ?, knowledge_area = ? WHERE id = ?",
+                        (route_result.category, route_run_id, route_result.knowledge_area, qa_id),
                     )
-                    investigation_completed_at = time.time()
+            if route_result.error:
+                counts.failed += 1
+                results.append(InterviewQaRouteInvestigateItemOut(
+                    qa_id=qa_id, route_category=None, knowledge_area=None,
+                    investigation_status=None, error=route_result.error,
+                ))
+                continue
+
+            counts.routed += 1
+            route_category = route_result.category
+            knowledge_area = route_result.knowledge_area
+            search_keywords = route_result.search_keywords
+            research_focus = route_result.research_focus
+
+        investigation_status: Optional[str] = None
+        item_error: Optional[str] = None
+
+        if route_category in ("system_researchable", "hybrid"):
+            if not repo_path or not commit_sha:
+                item_error = "Investigation requires a pinned snapshot repo_path/commit_sha"
+            else:
+                # No ``conn``: investigate() opens its own short-lived
+                # connection for runtime facts and releases it before its
+                # own reasoning call.
+                investigation = investigate(
+                    client, config,
+                    repo_path=repo_path, commit_sha=commit_sha,
+                    question=qa["question_text"],
+                    research_focus=research_focus,
+                    search_keywords=search_keywords,
+                    hybrid_decision_question=(route_category == "hybrid"),
+                    language=language,
+                    system_id=system_id, snapshot_id=snapshot_id,
+                )
+                investigation_completed_at = time.time()
+                with get_conn() as conn:
                     investigation_run_id = persist_investigation_run(
                         conn, system_id=system_id, snapshot_id=snapshot_id,
-                        investigation=investigation, now=now, completed_at=investigation_completed_at,
+                        investigation=investigation, now=now,
+                        completed_at=investigation_completed_at,
                     )
-                    investigation_status = investigation.status
-                    if investigation.status == "failed":
-                        counts.failed += 1
-                        item_error = investigation.error
-                    else:
+                    if investigation.status != "failed":
                         conn.execute(
                             "UPDATE interview_qa "
                             "SET investigation_json = ?, investigation_run_id = ? WHERE id = ?",
@@ -406,13 +426,18 @@ def route_and_investigate_qa(
                                 qa_id,
                             ),
                         )
-                        counts.investigated += 1
+                investigation_status = investigation.status
+                if investigation.status == "failed":
+                    counts.failed += 1
+                    item_error = investigation.error
+                else:
+                    counts.investigated += 1
 
-            results.append(InterviewQaRouteInvestigateItemOut(
-                qa_id=qa_id, route_category=route_category, knowledge_area=knowledge_area,
-                investigation_status=investigation_status, error=item_error,
-            ))
+        results.append(InterviewQaRouteInvestigateItemOut(
+            qa_id=qa_id, route_category=route_category, knowledge_area=knowledge_area,
+            investigation_status=investigation_status, error=item_error,
+        ))
 
-        return InterviewQaRouteInvestigateBatchOut(
-            session_id=session_id, system_id=system_id, results=results, counts=counts,
-        )
+    return InterviewQaRouteInvestigateBatchOut(
+        session_id=session_id, system_id=system_id, results=results, counts=counts,
+    )

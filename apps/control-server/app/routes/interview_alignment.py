@@ -404,7 +404,7 @@ def record_sample_rule_objection(
 
 
 def _run_runtime_match_judge(
-    conn, system_id: int, snapshot_id: int, config: LLMConfig, client, final_items: List[dict],
+    system_id: int, snapshot_id: int, config: LLMConfig, client, final_items: List[dict],
 ) -> None:
     """Semantic match/mismatch judge over items whose baseline is 'match'.
 
@@ -453,20 +453,23 @@ def _run_runtime_match_judge(
         judge_items = judge_result.items if judge_result.error is None else None
 
     judge_status = "failed" if judge_error else "completed"
-    conn.execute(
-        """
-        INSERT INTO intelligence_runs
-            (system_id, snapshot_id, run_type, provider, model,
-             prompt_version, schema_version, decision_method, status,
-             error_details, is_mock, started_at, completed_at)
-        VALUES (?, ?, 'runtime_match', ?, ?, ?, ?, 'reasoning_llm', ?, ?, 0, ?, ?)
-        """,
-        (
-            system_id, snapshot_id, config.provider, config.model,
-            RUNTIME_MATCH_PROMPT_VERSION, RUNTIME_MATCH_SCHEMA_VERSION, judge_status,
-            judge_error, started_at, time.time(),
-        ),
-    )
+    # Own connection, opened only after the judge call above: the caller must
+    # hold none across that external round trip (see app/db.py).
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO intelligence_runs
+                (system_id, snapshot_id, run_type, provider, model,
+                 prompt_version, schema_version, decision_method, status,
+                 error_details, is_mock, started_at, completed_at)
+            VALUES (?, ?, 'runtime_match', ?, ?, ?, ?, 'reasoning_llm', ?, ?, 0, ?, ?)
+            """,
+            (
+                system_id, snapshot_id, config.provider, config.model,
+                RUNTIME_MATCH_PROMPT_VERSION, RUNTIME_MATCH_SCHEMA_VERSION, judge_status,
+                judge_error, started_at, time.time(),
+            ),
+        )
 
     if judge_items is not None:
         by_index = {r.index: r.runtime_check for r in judge_items}
@@ -482,7 +485,7 @@ def _run_runtime_match_judge(
 # --- Build ---------------------------------------------------------------------
 
 
-def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuildOut:
+def run_alignment_build(session_id: int, system_id: int) -> AlignmentBuildOut:
     """Build alignment items contrasting Intent Brief vs Current System.
 
     Core of ``POST .../alignment/build`` (below), extracted so the automatic
@@ -497,6 +500,10 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
     elsewhere in this API surface). Once a reasoning attempt is made, every
     outcome (success or failure) is recorded as an ``intelligence_runs``
     row (``run_type='alignment_build'``).
+
+    This function owns its own database connections and must be called with
+    none open on the calling thread: the reasoning calls run between them so
+    the process-wide DB lock is never held across one (see app/db.py).
 
     Fail-closed (Principle 6): LLM/schema failures, or every proposed item's
     evidence failing snapshot validation, both raise ``HTTPException`` (502)
@@ -514,105 +521,106 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
     succeeded.
     """
     now = time.time()
-    _get_session_or_404(conn, session_id, system_id)
+    with get_conn() as conn:
+        _get_session_or_404(conn, session_id, system_id)
 
-    revision = conn.execute(
-        """SELECT * FROM understanding_revision
-           WHERE session_id = ? AND system_id = ?
-           ORDER BY id DESC LIMIT 1""",
-        (session_id, system_id),
-    ).fetchone()
-    if revision is None:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "No understanding revision found for this session; "
-                "build/refresh System Understanding first."
-            ),
+        revision = conn.execute(
+            """SELECT * FROM understanding_revision
+               WHERE session_id = ? AND system_id = ?
+               ORDER BY id DESC LIMIT 1""",
+            (session_id, system_id),
+        ).fetchone()
+        if revision is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "No understanding revision found for this session; "
+                    "build/refresh System Understanding first."
+                ),
+            )
+
+        snapshot_row = conn.execute(
+            "SELECT repo_path, commit_sha FROM repository_snapshots WHERE id = ? AND system_id = ?",
+            (revision["snapshot_id"], system_id),
+        ).fetchone()
+        if snapshot_row is None:
+            raise HTTPException(
+                status_code=409,
+                detail="The pinned snapshot for this session's latest understanding revision no longer exists.",
+            )
+
+        # Issue #290: the System's own declared environment (may be '') is the
+        # only "expected environment" compare_claim_to_runtime is ever given --
+        # never inferred from claim text.
+        system_row = conn.execute(
+            "SELECT environment FROM systems WHERE id = ?", (system_id,),
+        ).fetchone()
+        expected_environment = (
+            system_row["environment"] if system_row and system_row["environment"] else None
         )
 
-    snapshot_row = conn.execute(
-        "SELECT repo_path, commit_sha FROM repository_snapshots WHERE id = ? AND system_id = ?",
-        (revision["snapshot_id"], system_id),
-    ).fetchone()
-    if snapshot_row is None:
-        raise HTTPException(
-            status_code=409,
-            detail="The pinned snapshot for this session's latest understanding revision no longer exists.",
-        )
-
-    # Issue #290: the System's own declared environment (may be '') is the
-    # only "expected environment" compare_claim_to_runtime is ever given --
-    # never inferred from claim text.
-    system_row = conn.execute(
-        "SELECT environment FROM systems WHERE id = ?", (system_id,),
-    ).fetchone()
-    expected_environment = (
-        system_row["environment"] if system_row and system_row["environment"] else None
-    )
-
-    intent_rows = conn.execute(
-        """SELECT * FROM interview_intent_item
-           WHERE session_id = ? AND system_id = ? AND superseded_by_id IS NULL
-           ORDER BY field, id""",
-        (session_id, system_id),
-    ).fetchall()
-    intent_payload = [
-        {
-            "id": r["id"], "field": r["field"], "value_text": r["value_text"],
-            "status": r["status"],
+        intent_rows = conn.execute(
+            """SELECT * FROM interview_intent_item
+               WHERE session_id = ? AND system_id = ? AND superseded_by_id IS NULL
+               ORDER BY field, id""",
+            (session_id, system_id),
+        ).fetchall()
+        intent_payload = [
+            {
+                "id": r["id"], "field": r["field"], "value_text": r["value_text"],
+                "status": r["status"],
+            }
+            for r in intent_rows
+        ]
+        # Deterministic FK resolution (Principle 6): the reasoning model only
+        # proposes a *field name*; the concrete interview_intent_item id is
+        # resolved here by an exact structural match against the current
+        # (non-superseded) row for that field -- never a fuzzy/text match.
+        intent_item_id_by_field: Dict[str, int] = {}
+        for r in intent_rows:
+            intent_item_id_by_field.setdefault(r["field"], r["id"])
+        # 2nd review round (PR #296, Finding 1): a fresh digest of every current
+        # (non-superseded) intent row's own field/value_text/status, computed
+        # from THIS build's DB read -- fed into compute_content_hash below so a
+        # content_hash also reflects the linked Intent Brief entity's current
+        # content, not just the field name it belongs to.
+        intent_digest_by_id: Dict[int, str] = {
+            r["id"]: compute_intent_item_digest(field=r["field"], value_text=r["value_text"], status=r["status"])
+            for r in intent_rows
         }
-        for r in intent_rows
-    ]
-    # Deterministic FK resolution (Principle 6): the reasoning model only
-    # proposes a *field name*; the concrete interview_intent_item id is
-    # resolved here by an exact structural match against the current
-    # (non-superseded) row for that field -- never a fuzzy/text match.
-    intent_item_id_by_field: Dict[str, int] = {}
-    for r in intent_rows:
-        intent_item_id_by_field.setdefault(r["field"], r["id"])
-    # 2nd review round (PR #296, Finding 1): a fresh digest of every current
-    # (non-superseded) intent row's own field/value_text/status, computed
-    # from THIS build's DB read -- fed into compute_content_hash below so a
-    # content_hash also reflects the linked Intent Brief entity's current
-    # content, not just the field name it belongs to.
-    intent_digest_by_id: Dict[int, str] = {
-        r["id"]: compute_intent_item_digest(field=r["field"], value_text=r["value_text"], status=r["status"])
-        for r in intent_rows
-    }
 
-    current_understanding = (
-        json.loads(revision["current_understanding"]) if revision["current_understanding"] else None
-    )
-    gap_analysis = json.loads(revision["gap_analysis"]) if revision["gap_analysis"] else None
-    current_capability_graph = confirmed_graph_for_revision(
-        conn,
-        system_id=system_id,
-        session_id=session_id,
-        revision_id=revision["id"],
-    )
-    latest_capability_graph = latest_system_confirmed_graph(
-        conn, system_id=system_id
-    )
-    if (
-        latest_capability_graph is not None
-        and (
-            current_capability_graph is None
-            or current_capability_graph["confirmation_id"]
-            != latest_capability_graph["confirmation_id"]
+        current_understanding = (
+            json.loads(revision["current_understanding"]) if revision["current_understanding"] else None
         )
-    ):
-        # Once the System-wide canonical flow has started, never mix this
-        # session's unconfirmed/stale reasoning snapshot with a different
-        # human-confirmed canonical head.
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "The latest Understanding revision is not the current "
-                "System-wide canonical capability graph. Confirm a fresh "
-                "revision before rebuilding Alignment."
-            ),
+        gap_analysis = json.loads(revision["gap_analysis"]) if revision["gap_analysis"] else None
+        current_capability_graph = confirmed_graph_for_revision(
+            conn,
+            system_id=system_id,
+            session_id=session_id,
+            revision_id=revision["id"],
         )
+        latest_capability_graph = latest_system_confirmed_graph(
+            conn, system_id=system_id
+        )
+        if (
+            latest_capability_graph is not None
+            and (
+                current_capability_graph is None
+                or current_capability_graph["confirmation_id"]
+                != latest_capability_graph["confirmation_id"]
+            )
+        ):
+            # Once the System-wide canonical flow has started, never mix this
+            # session's unconfirmed/stale reasoning snapshot with a different
+            # human-confirmed canonical head.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "The latest Understanding revision is not the current "
+                    "System-wide canonical capability graph. Confirm a fresh "
+                    "revision before rebuilding Alignment."
+                ),
+            )
 
     config = LLMConfig.intelligence_from_env()
     client_error: Optional[str] = None
@@ -641,551 +649,555 @@ def run_alignment_build(conn, session_id: int, system_id: int) -> AlignmentBuild
     completed_at = time.time()
     final_items: List[dict] = []
     if proposal.error is None:
-        line_count_cache: Dict[str, Optional[int]] = {}
-        had_raw_items = len(proposal.items) > 0
-        for item in proposal.items:
-            try:
-                capability_dependencies = validate_dependencies(
-                    current_capability_graph,
-                    entity_ids=item.capability_entity_ids,
-                    relation_ids=item.capability_relation_ids,
-                )
-            except CapabilityGraphError as exc:
-                proposal = AlignmentProposalResult(
-                    provider=proposal.provider,
-                    model=proposal.model,
-                    is_mock=proposal.is_mock,
-                    error=str(exc),
-                )
-                final_items = []
-                break
-            valid_evidence, _pruned = validate_evidence_against_snapshot(
-                snapshot_row["repo_path"], snapshot_row["commit_sha"],
-                item.evidence, line_count_cache,
-            )
-            if not valid_evidence:
-                # Dropped, not fatal on its own -- see the "fail only if
-                # none valid" rule below.
-                continue
-
-            # Issue #290: deterministic evidence -> component_id -> runtime
-            # facts -> finite match state. None whenever no deterministic
-            # mapping exists (ambiguous or no code_symbols component_id
-            # match) -- never guessed. Finding 5: provenance now comes only
-            # from what was actually observed on traces (never the pinned
-            # snapshot/commit).
-            runtime_check: Optional[str] = None
-            judge_ctx: Optional[Dict[str, object]] = None
-            component_id = resolve_component_for_evidence(
-                conn, revision["snapshot_id"], valid_evidence,
-            )
-            if component_id is not None:
-                fact = aggregate_component_facts(conn, system_id, component_id)
-                provenance = build_provenance(fact, conn=conn, system_id=system_id)
-                runtime_check = compare_claim_to_runtime(
-                    item.current_claim, fact, provenance,
-                    expected_environment=expected_environment,
-                )
-                if runtime_check == "match":
-                    # Finding 5 Part 2: only a fresh, structurally-clean
-                    # baseline is eligible for the semantic judge below --
-                    # stale/unobserved/environment-mismatch guards are never
-                    # second-guessed by the model (Principle 6).
-                    judge_ctx = {
-                        "component_id": component_id,
-                        "call_count": fact.call_count,
-                        "error_rate": fact.error_rate,
-                        "duration_p50_ms": fact.duration_p50_ms,
-                        "duration_p90_ms": fact.duration_p90_ms,
-                        "duration_p99_ms": fact.duration_p99_ms,
-                        "freshness": provenance.freshness,
-                        "environment": provenance.environment,
-                    }
-
-            final_items.append({
-                "intent_item_id": intent_item_id_by_field.get(item.intent_field)
-                    if item.intent_field else None,
-                "intent_summary": item.intent_ref_hint,
-                "current_claim": item.current_claim,
-                "current_evidence": [
-                    {"path": e.path, "start_line": e.start_line, "end_line": e.end_line, "summary": e.summary}
-                    for e in valid_evidence
-                ],
-                "gap_summary": item.gap_summary,
-                "proposed_interpretation": item.proposed_interpretation,
-                "alignment_state": item.alignment_state,
-                "risk_flags": item.risk_flags,
-                "confidence": item.confidence,
-                "intent_field": item.intent_field,
-                "runtime_check": runtime_check,
-                "_judge_ctx": judge_ctx,
-                "_capability_dependencies": capability_dependencies,
-                "_capability_entity_ids": set(item.capability_entity_ids),
-                "_capability_relation_ids": set(item.capability_relation_ids),
-                "_capability_confirmation_id": (
-                    current_capability_graph["confirmation_id"]
-                    if current_capability_graph is not None
-                    else None
-                ),
-            })
-        if proposal.error is None and had_raw_items and not final_items:
-            proposal = AlignmentProposalResult(
-                provider=proposal.provider, model=proposal.model, is_mock=proposal.is_mock,
-                error="Every proposed alignment item's evidence failed snapshot validation",
-            )
-
-        if proposal.error is None:
-            _run_runtime_match_judge(conn, system_id, revision["snapshot_id"], config, client, final_items)
-
-            # Issue #295: unchanged-item carry-over. carry_candidates maps a
-            # content_hash from the immediately preceding build to the id of
-            # the ORIGINAL human-decided row for that contrast point -- the
-            # only kind of row a fresh item's audit trail may ever point
-            # back to.
-            #
-            # 3rd review round (Finding 1): ONLY an 'accept_current' answer
-            # is an eligible carry-over origin. That decision is the human
-            # saying "the current understanding of this point is right", so
-            # a byte-identical regeneration genuinely needs no re-review and
-            # can be marked 'unchanged' (excluded from the Review Queue).
-            # 'needs_change' / 'reject_interpretation' answers and 'corrected'
-            # rows are the OPPOSITE: an explicit objection or edit that the
-            # rebuild has NOT yet resolved (there is no code path that folds
-            # such a decision back into the Understanding). Carrying those
-            # over as 'unchanged' would silently drop the human's objection
-            # out of the actionable queue, so they are skipped here and fall
-            # through to fresh classification below, staying actionable.
-            #
-            # Review fix (PR #296, Finding 2): a prior build's 'unchanged'
-            # row (status='open', since it was never itself answered) is
-            # ALSO an eligible candidate, not just terminal answered rows --
-            # otherwise a 3rd build's carry-over candidate set loses the 2nd
-            # build's unchanged row (an 'open' row this rebuild's DELETE ...
-            # WHERE status='open' AND user_decision IS NULL is about to
-            # remove) and the item incorrectly falls back to fresh
-            # reclassification. When the candidate is itself an 'unchanged'
-            # row, its OWN carried_over_from (never its own id) is propagated
-            # as the origin -- so the audit trail always terminates at the
-            # real 'accept_current' decision, no matter how many unchanged
-            # generations sit in between. This is exactly why the DELETE
-            # above is safe against `carried_over_from ... ON DELETE SET
-            # NULL`: the referenced origin id is always an accept_current
-            # 'answered' row, which the DELETE's WHERE clause never touches
-            # (it only ever deletes status='open' rows), so the FK target
-            # never disappears out from under a surviving reference.
-            #
-            # Read before this build's own DELETE/UPDATE/INSERT touch the
-            # table (the write transaction is still below).
-            carry_rows = conn.execute(
-                """SELECT id, content_hash, base_content_hash, carried_over_from,
-                          review_category, status, user_decision
-                   FROM alignment_item
-                   WHERE session_id = ? AND system_id = ?
-                     AND superseded = 0
-                     AND base_content_hash IS NOT NULL
-                     AND (
-                       status = 'answered'
-                       OR (review_category = 'unchanged' AND carried_over_from IS NOT NULL)
-                     )
-                   ORDER BY id""",
-                (session_id, system_id),
-            ).fetchall()
-            carry_candidates: Dict[str, List[Dict[str, int]]] = {}
-            for r in carry_rows:
-                if r["review_category"] == "unchanged":
-                    # A prior carried-over row: its own carried_over_from
-                    # already terminates at an accept_current answer (that
-                    # same guarantee was enforced when this row was created),
-                    # so propagate it rather than this intermediate row's id.
-                    origin_id = r["carried_over_from"]
-                else:
-                    # Terminal 'answered' row: only accept_current qualifies.
-                    decision = json.loads(r["user_decision"]) if r["user_decision"] else None
-                    if not decision or decision.get("action") != "accept_current":
-                        continue
-                    origin_id = r["id"]
-                carry_candidates.setdefault(r["base_content_hash"], []).append(
-                    {"item_id": r["id"], "origin_id": origin_id}
-                )
-
-            # A rebuild triggered by a batch that confirmed/corrected/
-            # declined ANY Intent Brief field never carries anything over.
-            #
-            # 2nd review round (PR #296, Finding 1): originally this guard
-            # covered only the 'goal' field (the rule table's own
-            # core_intent special-case). But goal is not the only Intent
-            # field a per-item content_hash cannot see through: an item may
-            # be linked to (or contrast against) 'constraints' /
-            # 'success_criteria' / any other field, and intent_item_id /
-            # linked_intent_digest above only catch a change for items that
-            # are THEMSELVES linked to the changed field -- an unlinked item
-            # whose claim happens to be affected by a different field's
-            # change (e.g. a new constraint narrows what "aligned" means for
-            # an unrelated claim) would still slip through on hash match
-            # alone. So this guard is generalized: ANY confirmed/
-            # not_applicable Intent Brief field decided/updated since the
-            # immediately preceding build blocks carry-over for the WHOLE
-            # build, not just goal-linked items -- the conservative, safe
-            # direction (Issue #295 brief). goal remains covered as one case
-            # of this general rule.
-            #
-            # interview_refresh.py's trigger_kind alone cannot tell us this:
-            # a batch's later triggers can be swallowed into an
-            # already-'pending' job created by an earlier, different
-            # trigger_kind (see interview_refresh._enqueue's dedupe), so the
-            # job that actually runs may carry a trigger_kind of
-            # 'qa_answer' even though the same batch also confirmed an
-            # intent field. Instead, compare every current (non-superseded,
-            # decided) intent item's updated_at against the immediately
-            # preceding build's timestamp -- every row from one build shares
-            # exactly one created_at (the build's completed_at, see the
-            # INSERT below), so MAX(created_at) over existing rows is
-            # exactly that moment.
-            #
-            # Core Capability changes do not use this coarse timestamp guard.
-            # Issue #312 records a manually-confirmed, versioned Capability
-            # graph and evaluates exact per-item entity/relation dependencies
-            # below, so unrelated relations retain carry-over.
-            previous_build_row = conn.execute(
-                "SELECT MAX(created_at) AS ts FROM alignment_item WHERE session_id = ? AND system_id = ?",
-                (session_id, system_id),
-            ).fetchone()
-            previous_build_at = previous_build_row["ts"] if previous_build_row else None
-            changed_intent_row = None
-            if previous_build_at is not None:
-                changed_intent_row = conn.execute(
-                    """SELECT 1 FROM interview_intent_item
-                       WHERE session_id = ? AND system_id = ?
-                         AND superseded_by_id IS NULL AND status IN ('confirmed', 'not_applicable')
-                         AND updated_at > ?
-                       LIMIT 1""",
-                    (session_id, system_id, previous_build_at),
-                ).fetchone()
-            intent_changed_since_last_build = bool(
-                previous_build_at is not None and changed_intent_row is not None
-            )
-
-            # Review fix (PR #296, Finding 1): source_digest_cache amortizes
-            # the per-evidence-item pinned-commit reads compute_content_hash
-            # now performs (one full-file read per distinct path across every
-            # item in this build, not per evidence citation).
-            source_digest_cache: Dict[str, Optional[List[str]]] = {}
-            capability_graph_cache: Dict[int, Dict[str, object]] = {}
-            for it in final_items:
-                linked_intent_item_id = it["intent_item_id"]
-                it["content_hash"] = compute_content_hash(
-                    current_claim=it["current_claim"],
-                    current_evidence=it["current_evidence"],
-                    alignment_state=it["alignment_state"],
-                    risk_flags=it["risk_flags"],
-                    confidence=it["confidence"],
-                    intent_field=it["intent_field"],
-                    runtime_check=it["runtime_check"],
-                    intent_summary=it["intent_summary"],
-                    gap_summary=it["gap_summary"],
-                    proposed_interpretation=it["proposed_interpretation"],
-                    intent_item_id=linked_intent_item_id,
-                    linked_intent_digest=(
-                        intent_digest_by_id.get(linked_intent_item_id)
-                        if linked_intent_item_id is not None else None
-                    ),
-                    policy_digest=alignment_policy_digest(),
-                    repo_path=snapshot_row["repo_path"],
-                    commit_sha=snapshot_row["commit_sha"],
-                    source_digest_cache=source_digest_cache,
-                )
-                # Issue #312 keeps the structural/content key separate from
-                # the confirmed Capability dependency scope.  Legacy
-                # content_hash values migrate into this column exactly.
-                it["base_content_hash"] = it["content_hash"]
-                carried_from = None
-                capability_scope_changed = False
-                if not intent_changed_since_last_build:
-                    for candidate in carry_candidates.get(it["content_hash"], []):
-                        changed = _capability_scope_changed(
-                            conn,
-                            candidate_item_id=candidate["item_id"],
-                            current_graph=current_capability_graph,
-                            current_entity_ids=it["_capability_entity_ids"],
-                            current_relation_ids=it["_capability_relation_ids"],
-                            graph_cache=capability_graph_cache,
-                        )
-                        if not changed:
-                            carried_from = candidate["origin_id"]
-                            break
-                        capability_scope_changed = True
-                if carried_from is not None:
-                    it["review_category"] = "unchanged"
-                    it["reason_code"] = "unchanged_since_confirmation"
-                    it["policy_rule_id"] = None
-                    it["carried_over_from"] = carried_from
-                    it["_capability_change_kind"] = "none"
-                else:
-                    review_category, reason_code, policy_rule_id = (
-                        classify_alignment_item_with_rule(
-                            alignment_state=it["alignment_state"],
-                            risk_flags=it["risk_flags"],
-                            confidence=it["confidence"],
-                            intent_field=it["intent_field"],
-                            runtime_check=it["runtime_check"],
-                            capability_change=(
-                                "changed" if capability_scope_changed else "none"
-                            ),
-                        )
+        with get_conn() as conn:
+            line_count_cache: Dict[str, Optional[int]] = {}
+            had_raw_items = len(proposal.items) > 0
+            for item in proposal.items:
+                try:
+                    capability_dependencies = validate_dependencies(
+                        current_capability_graph,
+                        entity_ids=item.capability_entity_ids,
+                        relation_ids=item.capability_relation_ids,
                     )
-                    it["review_category"] = review_category
-                    it["reason_code"] = reason_code
-                    it["policy_rule_id"] = policy_rule_id
-                    it["carried_over_from"] = None
-                    it["_capability_change_kind"] = (
-                        "core_capability_changed"
-                        if capability_scope_changed
-                        else "none"
+                except CapabilityGraphError as exc:
+                    proposal = AlignmentProposalResult(
+                        provider=proposal.provider,
+                        model=proposal.model,
+                        is_mock=proposal.is_mock,
+                        error=str(exc),
                     )
-
-            # Issue #321: stable discussion-point identity + physical
-            # lineage, independent of the content_hash carry-over above.
-            # content_hash answers "is this byte-identical to a row a human
-            # already accepted?"; review_subject_id answers "which earlier
-            # row was the same discussion point?" -- the question an expired
-            # Inquiry needs answered to find its successor (Issue #323),
-            # including when the content genuinely changed.
-            #
-            # Read before this build's own DELETE/INSERT, like the carry-over
-            # candidates above: the predecessor generation of a subject is
-            # whatever the table held BEFORE this build touched it. Only the
-            # LATEST earlier generation counts -- an older one has already
-            # been succeeded once and must not be re-bound now.
-            predecessor_rows = conn.execute(
-                """SELECT id, review_subject_id, base_content_hash, created_at
-                   FROM alignment_item
-                   WHERE session_id = ? AND system_id = ?
-                     AND review_subject_id IS NOT NULL
-                   ORDER BY created_at, id""",
-                (session_id, system_id),
-            ).fetchall()
-            predecessors_by_subject: Dict[str, List[tuple]] = {}
-            latest_generation_at: Dict[str, float] = {}
-            for row in predecessor_rows:
-                subject = row["review_subject_id"]
-                created_at = row["created_at"]
-                previous = latest_generation_at.get(subject)
-                if previous is None or created_at > previous:
-                    latest_generation_at[subject] = created_at
-                    predecessors_by_subject[subject] = []
-                if created_at == latest_generation_at[subject]:
-                    predecessors_by_subject[subject].append(
-                        (row["id"], row["base_content_hash"])
-                    )
-
-            subject_counts: Dict[str, int] = {}
-            for it in final_items:
-                it["review_subject_id"] = compute_review_subject_id(
-                    system_id=system_id,
-                    session_id=session_id,
-                    intent_field=it["intent_field"],
-                    capability_entity_ids=it["_capability_entity_ids"],
-                    capability_relation_ids=it["_capability_relation_ids"],
+                    final_items = []
+                    break
+                valid_evidence, _pruned = validate_evidence_against_snapshot(
+                    snapshot_row["repo_path"], snapshot_row["commit_sha"],
+                    item.evidence, line_count_cache,
                 )
-                if it["review_subject_id"] is not None:
-                    subject_counts[it["review_subject_id"]] = (
-                        subject_counts.get(it["review_subject_id"], 0) + 1
-                    )
-            for it in final_items:
-                subject = it["review_subject_id"]
-                subject_state, replaces_item_id = classify_subject_lineage(
-                    review_subject_id=subject,
-                    same_subject_in_build=subject_counts.get(subject, 0),
-                    predecessors=predecessors_by_subject.get(subject, []),
-                    base_content_hash=it["base_content_hash"],
+                if not valid_evidence:
+                    # Dropped, not fatal on its own -- see the "fail only if
+                    # none valid" rule below.
+                    continue
+
+                # Issue #290: deterministic evidence -> component_id -> runtime
+                # facts -> finite match state. None whenever no deterministic
+                # mapping exists (ambiguous or no code_symbols component_id
+                # match) -- never guessed. Finding 5: provenance now comes only
+                # from what was actually observed on traces (never the pinned
+                # snapshot/commit).
+                runtime_check: Optional[str] = None
+                judge_ctx: Optional[Dict[str, object]] = None
+                component_id = resolve_component_for_evidence(
+                    conn, revision["snapshot_id"], valid_evidence,
                 )
-                it["subject_state"] = subject_state
-                it["replaces_item_id"] = replaces_item_id
+                if component_id is not None:
+                    fact = aggregate_component_facts(conn, system_id, component_id)
+                    provenance = build_provenance(fact, conn=conn, system_id=system_id)
+                    runtime_check = compare_claim_to_runtime(
+                        item.current_claim, fact, provenance,
+                        expected_environment=expected_environment,
+                    )
+                    if runtime_check == "match":
+                        # Finding 5 Part 2: only a fresh, structurally-clean
+                        # baseline is eligible for the semantic judge below --
+                        # stale/unobserved/environment-mismatch guards are never
+                        # second-guessed by the model (Principle 6).
+                        judge_ctx = {
+                            "component_id": component_id,
+                            "call_count": fact.call_count,
+                            "error_rate": fact.error_rate,
+                            "duration_p50_ms": fact.duration_p50_ms,
+                            "duration_p90_ms": fact.duration_p90_ms,
+                            "duration_p99_ms": fact.duration_p99_ms,
+                            "freshness": provenance.freshness,
+                            "environment": provenance.environment,
+                        }
 
-    run_status = "failed" if proposal.error else "completed"
-    run_cur = conn.execute(
-        """
-        INSERT INTO intelligence_runs
-            (system_id, snapshot_id, run_type, provider, model,
-             prompt_version, schema_version, decision_method, status,
-             error_details, is_mock, started_at, completed_at)
-        VALUES (?, ?, 'alignment_build', ?, ?, ?, ?, 'reasoning_llm', ?, ?, ?, ?, ?)
-        """,
-        (
-            system_id, revision["snapshot_id"], proposal.provider, proposal.model,
-            proposal.prompt_version, proposal.schema_version, run_status, proposal.error,
-            1 if proposal.is_mock else 0, now, completed_at,
-        ),
-    )
-    run_id = run_cur.lastrowid
-
-    if proposal.error:
-        raise HTTPException(status_code=502, detail=proposal.error)
-
-    conn.execute("BEGIN")
-    try:
-        # Rebuild-merge (Principle 2): only rows with no user progress
-        # are ever replaced. Pending manual targets use ON DELETE SET NULL,
-        # then bind one-for-one to an exact same-session replacement below.
-        conn.execute(
-            """DELETE FROM alignment_item
-               WHERE session_id = ? AND system_id = ?
-                 AND status = 'open' AND user_decision IS NULL""",
-            (session_id, system_id),
-        )
-        # Finding 4 fix: surviving TERMINAL rows (answered/corrected) become
-        # history the moment a fresh row for the same contrast point is
-        # about to be inserted. GET .../review-queue also filters on
-        # status/superseded directly (belt and braces), but marking these
-        # rows here is what lets a full-listing view (GET .../alignment)
-        # tell a stale answered/corrected row apart from a current one.
-        # held/inquiry rows are intentionally NOT marked superseded -- they
-        # are still in-flight and stay the current row (Principle 2's
-        # rebuild-must-never-lose-progress rule already preserves them
-        # untouched; this only adds the superseded label to the terminal
-        # ones).
-        conn.execute(
-            """UPDATE alignment_item
-               SET superseded = 1
-               WHERE session_id = ? AND system_id = ?
-                 AND status IN ('answered', 'corrected') AND superseded = 0""",
-            (session_id, system_id),
-        )
-        # A predecessor row with no human progress was just deleted above.
-        # The lineage VERDICT (subject_state) still stands -- it was computed
-        # from the table as it was before this build -- but the physical
-        # audit link must not dangle, so it is dropped for exactly those rows.
-        surviving_item_ids = {
-            row["id"]
-            for row in conn.execute(
-                "SELECT id FROM alignment_item WHERE session_id = ? AND system_id = ?",
-                (session_id, system_id),
-            ).fetchall()
-        }
-        for it in final_items:
-            reason_code = it["reason_code"]
-            policy_version = alignment_policy_version()
-            policy_digest = alignment_policy_digest()
-            pending_target = None
-            if it["content_hash"] and it["policy_rule_id"]:
-                pending_target = conn.execute(
-                    """SELECT id FROM alignment_manual_recheck_target
-                       WHERE system_id = ? AND session_id = ?
-                         AND reason_code = ? AND policy_version = ?
-                         AND policy_digest = ? AND policy_rule_id = ?
-                         AND content_hash = ? AND status = 'pending'
-                         AND alignment_item_id IS NULL
-                       ORDER BY id LIMIT 1""",
-                    (
-                        system_id, session_id, reason_code, policy_version,
-                        policy_digest, it["policy_rule_id"], it["content_hash"],
-                    ),
-                ).fetchone()
-            item_cur = conn.execute(
-                """INSERT INTO alignment_item
-                    (session_id, system_id, revision_id, snapshot_id, intent_item_id,
-                     intent_summary, current_claim, current_evidence, gap_summary,
-                     proposed_interpretation, alignment_state, risk_flags, confidence,
-                     review_category, reason_code, user_reason, runtime_check, status,
-                     user_decision, content_hash, base_content_hash,
-                     carried_over_from, policy_version,
-                     policy_digest, policy_rule_id, manual_recheck_required,
-                     review_subject_id, subject_state, replaces_item_id,
-                     intelligence_run_id, is_mock, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open',
-                        NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    session_id, system_id, revision["id"], revision["snapshot_id"],
-                    it["intent_item_id"], it["intent_summary"], it["current_claim"],
-                    json.dumps(it["current_evidence"], ensure_ascii=False),
-                    it["gap_summary"], it["proposed_interpretation"], it["alignment_state"],
-                    json.dumps(it["risk_flags"]), it["confidence"], it["review_category"],
-                    reason_code, user_reason_for(reason_code), it["runtime_check"],
-                    it["content_hash"], it["base_content_hash"],
-                    it["carried_over_from"],
-                    policy_version, policy_digest, it["policy_rule_id"],
-                    1 if pending_target else 0,
-                    it["review_subject_id"], it["subject_state"],
-                    (
-                        it["replaces_item_id"]
-                        if it["replaces_item_id"] in surviving_item_ids
+                final_items.append({
+                    "intent_item_id": intent_item_id_by_field.get(item.intent_field)
+                        if item.intent_field else None,
+                    "intent_summary": item.intent_ref_hint,
+                    "current_claim": item.current_claim,
+                    "current_evidence": [
+                        {"path": e.path, "start_line": e.start_line, "end_line": e.end_line, "summary": e.summary}
+                        for e in valid_evidence
+                    ],
+                    "gap_summary": item.gap_summary,
+                    "proposed_interpretation": item.proposed_interpretation,
+                    "alignment_state": item.alignment_state,
+                    "risk_flags": item.risk_flags,
+                    "confidence": item.confidence,
+                    "intent_field": item.intent_field,
+                    "runtime_check": runtime_check,
+                    "_judge_ctx": judge_ctx,
+                    "_capability_dependencies": capability_dependencies,
+                    "_capability_entity_ids": set(item.capability_entity_ids),
+                    "_capability_relation_ids": set(item.capability_relation_ids),
+                    "_capability_confirmation_id": (
+                        current_capability_graph["confirmation_id"]
+                        if current_capability_graph is not None
                         else None
                     ),
-                    run_id, 1 if proposal.is_mock else 0, completed_at, completed_at,
-                ),
+                })
+            if proposal.error is None and had_raw_items and not final_items:
+                proposal = AlignmentProposalResult(
+                    provider=proposal.provider, model=proposal.model, is_mock=proposal.is_mock,
+                    error="Every proposed alignment item's evidence failed snapshot validation",
+                )
+
+        if proposal.error is None:
+            _run_runtime_match_judge(
+                system_id, revision["snapshot_id"], config, client, final_items,
             )
-            if it["_capability_confirmation_id"] is not None:
-                conn.execute(
-                    """INSERT INTO alignment_item_capability_scope
-                        (alignment_item_id, system_id, confirmation_id,
-                         change_kind, created_at)
-                       VALUES (?, ?, ?, ?, ?)""",
+            with get_conn() as conn:
+                # Issue #295: unchanged-item carry-over. carry_candidates maps a
+                # content_hash from the immediately preceding build to the id of
+                # the ORIGINAL human-decided row for that contrast point -- the
+                # only kind of row a fresh item's audit trail may ever point
+                # back to.
+                #
+                # 3rd review round (Finding 1): ONLY an 'accept_current' answer
+                # is an eligible carry-over origin. That decision is the human
+                # saying "the current understanding of this point is right", so
+                # a byte-identical regeneration genuinely needs no re-review and
+                # can be marked 'unchanged' (excluded from the Review Queue).
+                # 'needs_change' / 'reject_interpretation' answers and 'corrected'
+                # rows are the OPPOSITE: an explicit objection or edit that the
+                # rebuild has NOT yet resolved (there is no code path that folds
+                # such a decision back into the Understanding). Carrying those
+                # over as 'unchanged' would silently drop the human's objection
+                # out of the actionable queue, so they are skipped here and fall
+                # through to fresh classification below, staying actionable.
+                #
+                # Review fix (PR #296, Finding 2): a prior build's 'unchanged'
+                # row (status='open', since it was never itself answered) is
+                # ALSO an eligible candidate, not just terminal answered rows --
+                # otherwise a 3rd build's carry-over candidate set loses the 2nd
+                # build's unchanged row (an 'open' row this rebuild's DELETE ...
+                # WHERE status='open' AND user_decision IS NULL is about to
+                # remove) and the item incorrectly falls back to fresh
+                # reclassification. When the candidate is itself an 'unchanged'
+                # row, its OWN carried_over_from (never its own id) is propagated
+                # as the origin -- so the audit trail always terminates at the
+                # real 'accept_current' decision, no matter how many unchanged
+                # generations sit in between. This is exactly why the DELETE
+                # above is safe against `carried_over_from ... ON DELETE SET
+                # NULL`: the referenced origin id is always an accept_current
+                # 'answered' row, which the DELETE's WHERE clause never touches
+                # (it only ever deletes status='open' rows), so the FK target
+                # never disappears out from under a surviving reference.
+                #
+                # Read before this build's own DELETE/UPDATE/INSERT touch the
+                # table (the write transaction is still below).
+                carry_rows = conn.execute(
+                    """SELECT id, content_hash, base_content_hash, carried_over_from,
+                              review_category, status, user_decision
+                       FROM alignment_item
+                       WHERE session_id = ? AND system_id = ?
+                         AND superseded = 0
+                         AND base_content_hash IS NOT NULL
+                         AND (
+                           status = 'answered'
+                           OR (review_category = 'unchanged' AND carried_over_from IS NOT NULL)
+                         )
+                       ORDER BY id""",
+                    (session_id, system_id),
+                ).fetchall()
+                carry_candidates: Dict[str, List[Dict[str, int]]] = {}
+                for r in carry_rows:
+                    if r["review_category"] == "unchanged":
+                        # A prior carried-over row: its own carried_over_from
+                        # already terminates at an accept_current answer (that
+                        # same guarantee was enforced when this row was created),
+                        # so propagate it rather than this intermediate row's id.
+                        origin_id = r["carried_over_from"]
+                    else:
+                        # Terminal 'answered' row: only accept_current qualifies.
+                        decision = json.loads(r["user_decision"]) if r["user_decision"] else None
+                        if not decision or decision.get("action") != "accept_current":
+                            continue
+                        origin_id = r["id"]
+                    carry_candidates.setdefault(r["base_content_hash"], []).append(
+                        {"item_id": r["id"], "origin_id": origin_id}
+                    )
+
+                # A rebuild triggered by a batch that confirmed/corrected/
+                # declined ANY Intent Brief field never carries anything over.
+                #
+                # 2nd review round (PR #296, Finding 1): originally this guard
+                # covered only the 'goal' field (the rule table's own
+                # core_intent special-case). But goal is not the only Intent
+                # field a per-item content_hash cannot see through: an item may
+                # be linked to (or contrast against) 'constraints' /
+                # 'success_criteria' / any other field, and intent_item_id /
+                # linked_intent_digest above only catch a change for items that
+                # are THEMSELVES linked to the changed field -- an unlinked item
+                # whose claim happens to be affected by a different field's
+                # change (e.g. a new constraint narrows what "aligned" means for
+                # an unrelated claim) would still slip through on hash match
+                # alone. So this guard is generalized: ANY confirmed/
+                # not_applicable Intent Brief field decided/updated since the
+                # immediately preceding build blocks carry-over for the WHOLE
+                # build, not just goal-linked items -- the conservative, safe
+                # direction (Issue #295 brief). goal remains covered as one case
+                # of this general rule.
+                #
+                # interview_refresh.py's trigger_kind alone cannot tell us this:
+                # a batch's later triggers can be swallowed into an
+                # already-'pending' job created by an earlier, different
+                # trigger_kind (see interview_refresh._enqueue's dedupe), so the
+                # job that actually runs may carry a trigger_kind of
+                # 'qa_answer' even though the same batch also confirmed an
+                # intent field. Instead, compare every current (non-superseded,
+                # decided) intent item's updated_at against the immediately
+                # preceding build's timestamp -- every row from one build shares
+                # exactly one created_at (the build's completed_at, see the
+                # INSERT below), so MAX(created_at) over existing rows is
+                # exactly that moment.
+                #
+                # Core Capability changes do not use this coarse timestamp guard.
+                # Issue #312 records a manually-confirmed, versioned Capability
+                # graph and evaluates exact per-item entity/relation dependencies
+                # below, so unrelated relations retain carry-over.
+                previous_build_row = conn.execute(
+                    "SELECT MAX(created_at) AS ts FROM alignment_item WHERE session_id = ? AND system_id = ?",
+                    (session_id, system_id),
+                ).fetchone()
+                previous_build_at = previous_build_row["ts"] if previous_build_row else None
+                changed_intent_row = None
+                if previous_build_at is not None:
+                    changed_intent_row = conn.execute(
+                        """SELECT 1 FROM interview_intent_item
+                           WHERE session_id = ? AND system_id = ?
+                             AND superseded_by_id IS NULL AND status IN ('confirmed', 'not_applicable')
+                             AND updated_at > ?
+                           LIMIT 1""",
+                        (session_id, system_id, previous_build_at),
+                    ).fetchone()
+                intent_changed_since_last_build = bool(
+                    previous_build_at is not None and changed_intent_row is not None
+                )
+
+                # Review fix (PR #296, Finding 1): source_digest_cache amortizes
+                # the per-evidence-item pinned-commit reads compute_content_hash
+                # now performs (one full-file read per distinct path across every
+                # item in this build, not per evidence citation).
+                source_digest_cache: Dict[str, Optional[List[str]]] = {}
+                capability_graph_cache: Dict[int, Dict[str, object]] = {}
+                for it in final_items:
+                    linked_intent_item_id = it["intent_item_id"]
+                    it["content_hash"] = compute_content_hash(
+                        current_claim=it["current_claim"],
+                        current_evidence=it["current_evidence"],
+                        alignment_state=it["alignment_state"],
+                        risk_flags=it["risk_flags"],
+                        confidence=it["confidence"],
+                        intent_field=it["intent_field"],
+                        runtime_check=it["runtime_check"],
+                        intent_summary=it["intent_summary"],
+                        gap_summary=it["gap_summary"],
+                        proposed_interpretation=it["proposed_interpretation"],
+                        intent_item_id=linked_intent_item_id,
+                        linked_intent_digest=(
+                            intent_digest_by_id.get(linked_intent_item_id)
+                            if linked_intent_item_id is not None else None
+                        ),
+                        policy_digest=alignment_policy_digest(),
+                        repo_path=snapshot_row["repo_path"],
+                        commit_sha=snapshot_row["commit_sha"],
+                        source_digest_cache=source_digest_cache,
+                    )
+                    # Issue #312 keeps the structural/content key separate from
+                    # the confirmed Capability dependency scope.  Legacy
+                    # content_hash values migrate into this column exactly.
+                    it["base_content_hash"] = it["content_hash"]
+                    carried_from = None
+                    capability_scope_changed = False
+                    if not intent_changed_since_last_build:
+                        for candidate in carry_candidates.get(it["content_hash"], []):
+                            changed = _capability_scope_changed(
+                                conn,
+                                candidate_item_id=candidate["item_id"],
+                                current_graph=current_capability_graph,
+                                current_entity_ids=it["_capability_entity_ids"],
+                                current_relation_ids=it["_capability_relation_ids"],
+                                graph_cache=capability_graph_cache,
+                            )
+                            if not changed:
+                                carried_from = candidate["origin_id"]
+                                break
+                            capability_scope_changed = True
+                    if carried_from is not None:
+                        it["review_category"] = "unchanged"
+                        it["reason_code"] = "unchanged_since_confirmation"
+                        it["policy_rule_id"] = None
+                        it["carried_over_from"] = carried_from
+                        it["_capability_change_kind"] = "none"
+                    else:
+                        review_category, reason_code, policy_rule_id = (
+                            classify_alignment_item_with_rule(
+                                alignment_state=it["alignment_state"],
+                                risk_flags=it["risk_flags"],
+                                confidence=it["confidence"],
+                                intent_field=it["intent_field"],
+                                runtime_check=it["runtime_check"],
+                                capability_change=(
+                                    "changed" if capability_scope_changed else "none"
+                                ),
+                            )
+                        )
+                        it["review_category"] = review_category
+                        it["reason_code"] = reason_code
+                        it["policy_rule_id"] = policy_rule_id
+                        it["carried_over_from"] = None
+                        it["_capability_change_kind"] = (
+                            "core_capability_changed"
+                            if capability_scope_changed
+                            else "none"
+                        )
+
+                # Issue #321: stable discussion-point identity + physical
+                # lineage, independent of the content_hash carry-over above.
+                # content_hash answers "is this byte-identical to a row a human
+                # already accepted?"; review_subject_id answers "which earlier
+                # row was the same discussion point?" -- the question an expired
+                # Inquiry needs answered to find its successor (Issue #323),
+                # including when the content genuinely changed.
+                #
+                # Read before this build's own DELETE/INSERT, like the carry-over
+                # candidates above: the predecessor generation of a subject is
+                # whatever the table held BEFORE this build touched it. Only the
+                # LATEST earlier generation counts -- an older one has already
+                # been succeeded once and must not be re-bound now.
+                predecessor_rows = conn.execute(
+                    """SELECT id, review_subject_id, base_content_hash, created_at
+                       FROM alignment_item
+                       WHERE session_id = ? AND system_id = ?
+                         AND review_subject_id IS NOT NULL
+                       ORDER BY created_at, id""",
+                    (session_id, system_id),
+                ).fetchall()
+                predecessors_by_subject: Dict[str, List[tuple]] = {}
+                latest_generation_at: Dict[str, float] = {}
+                for row in predecessor_rows:
+                    subject = row["review_subject_id"]
+                    created_at = row["created_at"]
+                    previous = latest_generation_at.get(subject)
+                    if previous is None or created_at > previous:
+                        latest_generation_at[subject] = created_at
+                        predecessors_by_subject[subject] = []
+                    if created_at == latest_generation_at[subject]:
+                        predecessors_by_subject[subject].append(
+                            (row["id"], row["base_content_hash"])
+                        )
+
+                subject_counts: Dict[str, int] = {}
+                for it in final_items:
+                    it["review_subject_id"] = compute_review_subject_id(
+                        system_id=system_id,
+                        session_id=session_id,
+                        intent_field=it["intent_field"],
+                        capability_entity_ids=it["_capability_entity_ids"],
+                        capability_relation_ids=it["_capability_relation_ids"],
+                    )
+                    if it["review_subject_id"] is not None:
+                        subject_counts[it["review_subject_id"]] = (
+                            subject_counts.get(it["review_subject_id"], 0) + 1
+                        )
+                for it in final_items:
+                    subject = it["review_subject_id"]
+                    subject_state, replaces_item_id = classify_subject_lineage(
+                        review_subject_id=subject,
+                        same_subject_in_build=subject_counts.get(subject, 0),
+                        predecessors=predecessors_by_subject.get(subject, []),
+                        base_content_hash=it["base_content_hash"],
+                    )
+                    it["subject_state"] = subject_state
+                    it["replaces_item_id"] = replaces_item_id
+
+    run_status = "failed" if proposal.error else "completed"
+    with get_conn() as conn:
+        run_cur = conn.execute(
+            """
+            INSERT INTO intelligence_runs
+                (system_id, snapshot_id, run_type, provider, model,
+                 prompt_version, schema_version, decision_method, status,
+                 error_details, is_mock, started_at, completed_at)
+            VALUES (?, ?, 'alignment_build', ?, ?, ?, ?, 'reasoning_llm', ?, ?, ?, ?, ?)
+            """,
+            (
+                system_id, revision["snapshot_id"], proposal.provider, proposal.model,
+                proposal.prompt_version, proposal.schema_version, run_status, proposal.error,
+                1 if proposal.is_mock else 0, now, completed_at,
+            ),
+        )
+        run_id = run_cur.lastrowid
+
+        if proposal.error:
+            raise HTTPException(status_code=502, detail=proposal.error)
+
+        conn.execute("BEGIN")
+        try:
+            # Rebuild-merge (Principle 2): only rows with no user progress
+            # are ever replaced. Pending manual targets use ON DELETE SET NULL,
+            # then bind one-for-one to an exact same-session replacement below.
+            conn.execute(
+                """DELETE FROM alignment_item
+                   WHERE session_id = ? AND system_id = ?
+                     AND status = 'open' AND user_decision IS NULL""",
+                (session_id, system_id),
+            )
+            # Finding 4 fix: surviving TERMINAL rows (answered/corrected) become
+            # history the moment a fresh row for the same contrast point is
+            # about to be inserted. GET .../review-queue also filters on
+            # status/superseded directly (belt and braces), but marking these
+            # rows here is what lets a full-listing view (GET .../alignment)
+            # tell a stale answered/corrected row apart from a current one.
+            # held/inquiry rows are intentionally NOT marked superseded -- they
+            # are still in-flight and stay the current row (Principle 2's
+            # rebuild-must-never-lose-progress rule already preserves them
+            # untouched; this only adds the superseded label to the terminal
+            # ones).
+            conn.execute(
+                """UPDATE alignment_item
+                   SET superseded = 1
+                   WHERE session_id = ? AND system_id = ?
+                     AND status IN ('answered', 'corrected') AND superseded = 0""",
+                (session_id, system_id),
+            )
+            # A predecessor row with no human progress was just deleted above.
+            # The lineage VERDICT (subject_state) still stands -- it was computed
+            # from the table as it was before this build -- but the physical
+            # audit link must not dangle, so it is dropped for exactly those rows.
+            surviving_item_ids = {
+                row["id"]
+                for row in conn.execute(
+                    "SELECT id FROM alignment_item WHERE session_id = ? AND system_id = ?",
+                    (session_id, system_id),
+                ).fetchall()
+            }
+            for it in final_items:
+                reason_code = it["reason_code"]
+                policy_version = alignment_policy_version()
+                policy_digest = alignment_policy_digest()
+                pending_target = None
+                if it["content_hash"] and it["policy_rule_id"]:
+                    pending_target = conn.execute(
+                        """SELECT id FROM alignment_manual_recheck_target
+                           WHERE system_id = ? AND session_id = ?
+                             AND reason_code = ? AND policy_version = ?
+                             AND policy_digest = ? AND policy_rule_id = ?
+                             AND content_hash = ? AND status = 'pending'
+                             AND alignment_item_id IS NULL
+                           ORDER BY id LIMIT 1""",
+                        (
+                            system_id, session_id, reason_code, policy_version,
+                            policy_digest, it["policy_rule_id"], it["content_hash"],
+                        ),
+                    ).fetchone()
+                item_cur = conn.execute(
+                    """INSERT INTO alignment_item
+                        (session_id, system_id, revision_id, snapshot_id, intent_item_id,
+                         intent_summary, current_claim, current_evidence, gap_summary,
+                         proposed_interpretation, alignment_state, risk_flags, confidence,
+                         review_category, reason_code, user_reason, runtime_check, status,
+                         user_decision, content_hash, base_content_hash,
+                         carried_over_from, policy_version,
+                         policy_digest, policy_rule_id, manual_recheck_required,
+                         review_subject_id, subject_state, replaces_item_id,
+                         intelligence_run_id, is_mock, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open',
+                            NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
-                        item_cur.lastrowid,
-                        system_id,
-                        it["_capability_confirmation_id"],
-                        it["_capability_change_kind"],
-                        completed_at,
+                        session_id, system_id, revision["id"], revision["snapshot_id"],
+                        it["intent_item_id"], it["intent_summary"], it["current_claim"],
+                        json.dumps(it["current_evidence"], ensure_ascii=False),
+                        it["gap_summary"], it["proposed_interpretation"], it["alignment_state"],
+                        json.dumps(it["risk_flags"]), it["confidence"], it["review_category"],
+                        reason_code, user_reason_for(reason_code), it["runtime_check"],
+                        it["content_hash"], it["base_content_hash"],
+                        it["carried_over_from"],
+                        policy_version, policy_digest, it["policy_rule_id"],
+                        1 if pending_target else 0,
+                        it["review_subject_id"], it["subject_state"],
+                        (
+                            it["replaces_item_id"]
+                            if it["replaces_item_id"] in surviving_item_ids
+                            else None
+                        ),
+                        run_id, 1 if proposal.is_mock else 0, completed_at, completed_at,
                     ),
                 )
-                for dependency in it["_capability_dependencies"]:
+                if it["_capability_confirmation_id"] is not None:
                     conn.execute(
-                        """INSERT INTO alignment_item_capability_dependency
-                            (alignment_item_id, system_id, target_kind,
-                             entity_id, relation_id, captured_digest, created_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        """INSERT INTO alignment_item_capability_scope
+                            (alignment_item_id, system_id, confirmation_id,
+                             change_kind, created_at)
+                           VALUES (?, ?, ?, ?, ?)""",
                         (
                             item_cur.lastrowid,
                             system_id,
-                            dependency["target_kind"],
-                            dependency["entity_id"],
-                            dependency["relation_id"],
-                            dependency["captured_digest"],
+                            it["_capability_confirmation_id"],
+                            it["_capability_change_kind"],
                             completed_at,
                         ),
                     )
-            if pending_target:
-                conn.execute(
-                    """UPDATE alignment_manual_recheck_target
-                       SET alignment_item_id = ?
-                       WHERE id = ? AND alignment_item_id IS NULL""",
-                    (item_cur.lastrowid, pending_target["id"]),
-                )
-        # A changed/removed item is no longer the exact human-selected
-        # recheck target. Preserve the audit row, but do not leave it counted
-        # as an actionable pending item after this session's rebuild.
-        conn.execute(
-            """UPDATE alignment_manual_recheck_target
-               SET status = 'superseded', resolved_at = ?
-               WHERE system_id = ? AND session_id = ? AND status = 'pending'
-                 AND alignment_item_id IS NULL""",
-            (completed_at, system_id, session_id),
-        )
-        # Issue #323: the current review-item set is now final, so every
-        # Inquiry answered against a premise this build invalidated is
-        # expired here -- inside the same transaction, so a failed build
-        # never leaves a conversation half-expired. Never touches an
-        # Inquiry's answer or the origin item's user_decision.
-        evaluate_inquiry_premises(
-            conn, system_id=system_id, session_id=session_id, built_at=completed_at,
-        )
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
+                    for dependency in it["_capability_dependencies"]:
+                        conn.execute(
+                            """INSERT INTO alignment_item_capability_dependency
+                                (alignment_item_id, system_id, target_kind,
+                                 entity_id, relation_id, captured_digest, created_at)
+                               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                item_cur.lastrowid,
+                                system_id,
+                                dependency["target_kind"],
+                                dependency["entity_id"],
+                                dependency["relation_id"],
+                                dependency["captured_digest"],
+                                completed_at,
+                            ),
+                        )
+                if pending_target:
+                    conn.execute(
+                        """UPDATE alignment_manual_recheck_target
+                           SET alignment_item_id = ?
+                           WHERE id = ? AND alignment_item_id IS NULL""",
+                        (item_cur.lastrowid, pending_target["id"]),
+                    )
+            # A changed/removed item is no longer the exact human-selected
+            # recheck target. Preserve the audit row, but do not leave it counted
+            # as an actionable pending item after this session's rebuild.
+            conn.execute(
+                """UPDATE alignment_manual_recheck_target
+                   SET status = 'superseded', resolved_at = ?
+                   WHERE system_id = ? AND session_id = ? AND status = 'pending'
+                     AND alignment_item_id IS NULL""",
+                (completed_at, system_id, session_id),
+            )
+            # Issue #323: the current review-item set is now final, so every
+            # Inquiry answered against a premise this build invalidated is
+            # expired here -- inside the same transaction, so a failed build
+            # never leaves a conversation half-expired. Never touches an
+            # Inquiry's answer or the origin item's user_decision.
+            evaluate_inquiry_premises(
+                conn, system_id=system_id, session_id=session_id, built_at=completed_at,
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
-    rows = conn.execute(
-        "SELECT * FROM alignment_item WHERE session_id = ? AND system_id = ?",
-        (session_id, system_id),
-    ).fetchall()
-    return AlignmentBuildOut(
-        session_id=session_id,
-        system_id=system_id,
-        revision_id=revision["id"],
-        intelligence_run_id=run_id,
-        is_mock=proposal.is_mock,
-        items=_sorted_items(conn, rows),
-    )
+        rows = conn.execute(
+            "SELECT * FROM alignment_item WHERE session_id = ? AND system_id = ?",
+            (session_id, system_id),
+        ).fetchall()
+        return AlignmentBuildOut(
+            session_id=session_id,
+            system_id=system_id,
+            revision_id=revision["id"],
+            intelligence_run_id=run_id,
+            is_mock=proposal.is_mock,
+            items=_sorted_items(conn, rows),
+        )
 
 
 @router.post(
@@ -1197,8 +1209,7 @@ def build_alignment_items(
     system_id: int = Depends(get_system_id),
 ) -> AlignmentBuildOut:
     """API boundary for ``run_alignment_build`` -- see its docstring."""
-    with get_conn() as conn:
-        return run_alignment_build(conn, session_id, system_id)
+    return run_alignment_build(session_id, system_id)
 
 
 # --- Read ------------------------------------------------------------------

@@ -369,6 +369,7 @@ def propose_intent_items(
         client = None
         client_error = str(exc)
 
+    # Phase 1 (DB lock held): deterministic reads only.
     with get_conn() as conn:
         session = _get_session_or_404(conn, session_id, system_id)
 
@@ -385,23 +386,28 @@ def propose_intent_items(
         ).fetchall()
         history = [{"role": r["role"], "content": r["content"]} for r in message_rows]
 
-        if client_error is not None:
-            proposal = IntentProposalResult(
-                provider=config.provider,
-                model=config.model,
-                is_mock=config.provider == "mock",
-                error=client_error,
-            )
-        else:
-            proposal = generate_intent_proposal(
-                client,
-                config,
-                history=history,
-                user_intent=session["user_intent"],
-                existing_fields=existing_fields,
-            )
+    # Phase 2 (DB lock released): the reasoning call. The LLM client opens its
+    # own connection for System quota, so it must not run while this thread
+    # holds one (see app/db.py).
+    if client_error is not None:
+        proposal = IntentProposalResult(
+            provider=config.provider,
+            model=config.model,
+            is_mock=config.provider == "mock",
+            error=client_error,
+        )
+    else:
+        proposal = generate_intent_proposal(
+            client,
+            config,
+            history=history,
+            user_intent=session["user_intent"],
+            existing_fields=existing_fields,
+        )
+    completed_at = time.time()
 
-        completed_at = time.time()
+    # Phase 3 (DB lock re-acquired): persist the audit run and any items.
+    with get_conn() as conn:
         run_status = "failed" if proposal.error else "completed"
         run_cur = conn.execute(
             """
