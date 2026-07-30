@@ -2771,6 +2771,118 @@ CREATE TABLE IF NOT EXISTS interview_inquiry_transition (
 CREATE INDEX IF NOT EXISTS idx_interview_inquiry_transition_inquiry
     ON interview_inquiry_transition (inquiry_id, id);
 
+-- Joint Understanding sessions (Epic #328 Phase A / Issue #329). What
+-- 「わからない」 STARTS instead of ending: a shared workspace where
+-- investigation findings, translated explanations, and the developer's own
+-- judgements accumulate in separate provenances until the developer picks a
+-- next action and closes the session with an explicitly typed outcome.
+--
+-- Boundary this table set exists to keep (Epic #328: 「わからない」という入力
+-- を開発者の意図として混入させない): NOTHING here ever writes the origin
+-- confirmation item. interview_qa.answer_text/status,
+-- interview_intent_item.value_text/status, and alignment_item.user_decision/
+-- status are read-only from this feature's point of view -- unlike Issue
+-- #287's Inquiry integration, a Joint Understanding session does not even
+-- mirror an 'inquiry'-style status onto alignment_item (Phase D / #332 owns
+-- the question of how these two flows integrate). question_text lives on the
+-- session row only; it is never copied into an answer field and never
+-- becomes a developer finding.
+--
+-- All three tables are System-scoped and every vocabulary column
+-- (origin_kind/trigger/status/outcome/origin_role/claim_kind/action_kind/
+-- decision_method) is validated against the finite sets in
+-- app/joint_understanding.py before insert (Principle 6).
+CREATE TABLE IF NOT EXISTS joint_understanding_session (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id          INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    origin_kind         TEXT NOT NULL,
+    origin_id           INTEGER NOT NULL,
+    trigger             TEXT NOT NULL,
+    question_text       TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'open',
+    outcome             TEXT,
+    outcome_reason      TEXT,
+    -- The snapshot this session's investigation is pinned to, captured at
+    -- creation (same discipline as an Inquiry's premise bundle, Issue #308)
+    -- so a later round is never silently rebased onto a newer snapshot.
+    premise_snapshot_id INTEGER,
+    schema_version      TEXT NOT NULL,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    closed_at           REAL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (premise_snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_joint_understanding_session_session
+    ON joint_understanding_session (session_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_joint_understanding_session_origin
+    ON joint_understanding_session (system_id, origin_kind, origin_id);
+
+-- Append-only. A correction is a NEW row carrying supersedes_finding_id;
+-- existing rows are never UPDATEd or DELETEd, so an explanation can always
+-- be traced back to the exact claim and evidence it came from even after it
+-- was revised. origin_role/claim_kind are independent axes: WHO produced the
+-- statement vs WHAT kind of statement it is (fact/inference/hypothesis/
+-- unknown/conflict). Only origin_role='investigation' rows may carry
+-- evidence_json/runtime_evidence_json -- a translation references findings
+-- via supports_finding_ids and a developer statement is a judgement, not
+-- snapshot evidence (app/joint_understanding.validate_finding).
+CREATE TABLE IF NOT EXISTS joint_understanding_finding (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    joint_understanding_id  INTEGER NOT NULL,
+    system_id               INTEGER NOT NULL,
+    origin_role             TEXT NOT NULL,
+    claim_kind              TEXT NOT NULL,
+    statement               TEXT NOT NULL,
+    evidence_json           TEXT NOT NULL DEFAULT '[]',
+    runtime_evidence_json   TEXT NOT NULL DEFAULT '[]',
+    supports_finding_ids    TEXT NOT NULL DEFAULT '[]',
+    competing_explanations  TEXT NOT NULL DEFAULT '[]',
+    refutation_conditions   TEXT NOT NULL DEFAULT '[]',
+    next_investigation      TEXT,
+    uncertainty             TEXT NOT NULL DEFAULT '',
+    supersedes_finding_id   INTEGER,
+    decision_method         TEXT NOT NULL,
+    intelligence_run_id     INTEGER,
+    is_mock                 INTEGER NOT NULL DEFAULT 0,
+    created_at              REAL NOT NULL,
+    FOREIGN KEY (joint_understanding_id)
+        REFERENCES joint_understanding_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (supersedes_finding_id)
+        REFERENCES joint_understanding_finding (id) ON DELETE SET NULL,
+    FOREIGN KEY (intelligence_run_id)
+        REFERENCES intelligence_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_joint_understanding_finding_session
+    ON joint_understanding_finding (joint_understanding_id, id);
+
+-- The finite next understanding actions the developer chose, append-only.
+-- decision_method is always 'manual': choosing an action is the human's own
+-- record of what they want to do next, and it never approves, adopts, or
+-- decides the origin item by itself.
+CREATE TABLE IF NOT EXISTS joint_understanding_action (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    joint_understanding_id  INTEGER NOT NULL,
+    system_id               INTEGER NOT NULL,
+    action_kind             TEXT NOT NULL,
+    actor                   TEXT,
+    note                    TEXT,
+    decision_method         TEXT NOT NULL DEFAULT 'manual',
+    created_at              REAL NOT NULL,
+    FOREIGN KEY (joint_understanding_id)
+        REFERENCES joint_understanding_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_joint_understanding_action_session
+    ON joint_understanding_action (joint_understanding_id, id);
+
 -- Alignment Review / Review Queue (Issue #287). Contrasts confirmed/proposed
 -- Intent Brief items (interview_intent_item, Issue #284) against the
 -- evidence-backed Current System understanding (the latest

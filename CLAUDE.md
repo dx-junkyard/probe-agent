@@ -252,6 +252,46 @@ creating incomplete persistence or execution paths for later phases.
     contract/test hardening. None of these relax an existing human gate. Do
     not start #311 before #309 lands.
 
+14. Issue #328 — 共同理解 Epic: treat 「わからない」 as the START of a joint
+    investigation instead of a terminal answer. The developer and the agent
+    take turns — investigate the pinned snapshot, translate findings into
+    purpose/impact, update hypotheses, and only then ask the human what only
+    a human can decide. Three provenances are never merged into one answer:
+    system investigation (technical facts + evidence), translation (meaning
+    for the developer's goal, invents no facts), and the developer (goals,
+    tradeoffs, final judgement). Implement sub-issues in dependency order:
+    - #329 (Phase A) — the deterministic exchange contract and dialogue
+      state: `shared/schemas/joint_understanding.schema.json`,
+      `app/joint_understanding.py`'s finite vocabularies (`origin_role` ×
+      `claim_kind`, session transitions, outcomes, action kinds),
+      `joint_understanding_session/_finding/_action` tables, and
+      `routes/joint_understanding.py`. Findings are append-only (corrections
+      carry `supersedes_finding_id`); a translation may not carry evidence
+      and must reference findings of the SAME session; a developer finding is
+      always `manual` and never carries an intelligence run.
+      `outcome='hypothesis_adopted'` is explicitly provisional and never a
+      fact. **No endpoint writes the origin `interview_qa` /
+      `interview_intent_item` / `alignment_item` / `interview_inquiry` row —
+      not even its status** (unlike #287's Inquiry mirroring), and
+      「わからない」 never becomes a developer finding.
+      **Status: implemented and verified.**
+    - #330 (Phase B) — iterative investigation rounds with carried-over
+      search leads / open hypotheses / missing evidence, cross-source
+      candidate retrieval, finite stop reasons, per-round audit.
+    - #331 (Phase C) — translation + option presentation, fail-closed on
+      invented finding references.
+    - #332 (Phase D) — reflux of system-verified facts into System
+      Understanding without recording them as a human answer, plus the
+      separated terminal states and premise-staleness guard.
+    - #333 (Phase E) — Dashboard 共同理解 panel.
+    - #334 (Phase F) — collaborative-understanding quality metrics, kept
+      separate from efficiency metrics (extends #309).
+    #327 was closed `not_planned` and fully absorbed into this Epic; its
+    design notes remain valid in `docs/system-understanding-ideal-state.md`.
+    #311 (低リスク提案の一括承認) is still NOT implemented and is not a
+    prerequisite of this Epic. See the Issue #328 section in
+    `docs/project-intelligence.md`.
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,

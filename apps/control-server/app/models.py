@@ -3393,6 +3393,189 @@ class InterviewInquiryTransitionRequest(BaseModel):
     actor: Optional[str] = Field(default=None, max_length=200)
 
 
+# --- Joint Understanding session (Epic #328 Phase A / Issue #329) -------------
+#
+# What 「わからない」 STARTS instead of ending. The three provenances
+# (investigation / translation / developer) stay separate rows with separate
+# rules -- see app/joint_understanding.py for the finite vocabularies these
+# Literals mirror and shared/schemas/joint_understanding.schema.json for the
+# contract itself. Nothing in this feature writes the origin confirmation
+# item: 「わからない」 is an entry point into a shared investigation, never a
+# recorded developer intent.
+
+JointUnderstandingOriginKind = Literal["qa", "intent", "review_item", "inquiry"]
+JointUnderstandingTrigger = Literal["unknown_answer", "explicit_request"]
+JointUnderstandingStatus = Literal["open", "held", "closed"]
+# hypothesis_adopted is explicitly PROVISIONAL (never a fact); decided is the
+# only final human value judgement. See SESSION_OUTCOMES.
+JointUnderstandingOutcome = Literal[
+    "understood", "doubt_resolved", "hypothesis_adopted", "decided",
+    "handed_off", "abandoned",
+]
+JointUnderstandingClaimKind = Literal[
+    "fact", "inference", "hypothesis", "unknown", "conflict"
+]
+JointUnderstandingOriginRole = Literal["investigation", "translation", "developer"]
+JointUnderstandingActionKind = Literal[
+    "request_investigation", "explain_reasoning", "compare_options",
+    "adopt_hypothesis", "revise_intent", "hold", "handoff", "decide",
+]
+JointUnderstandingDecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
+JointUnderstandingRuntimeCheck = Literal["match", "mismatch", "unobserved", "stale"]
+
+
+class JointUnderstandingEvidenceIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(..., min_length=1, max_length=500)
+    start_line: int = Field(..., ge=1)
+    end_line: int = Field(..., ge=1)
+    summary: str = Field(default="", max_length=1_000)
+
+
+class JointUnderstandingEvidenceOut(BaseModel):
+    path: str
+    start_line: int
+    end_line: int
+    summary: str = ""
+
+
+class JointUnderstandingRuntimeEvidenceIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    component_id: str = Field(..., min_length=1, max_length=500)
+    runtime_check: JointUnderstandingRuntimeCheck
+    summary: str = Field(default="", max_length=1_000)
+
+
+class JointUnderstandingRuntimeEvidenceOut(BaseModel):
+    component_id: str
+    runtime_check: JointUnderstandingRuntimeCheck
+    summary: str = ""
+
+
+class JointUnderstandingFindingOut(BaseModel):
+    id: int
+    joint_understanding_id: int
+    system_id: int
+    origin_role: JointUnderstandingOriginRole
+    claim_kind: JointUnderstandingClaimKind
+    statement: str
+    evidence: List[JointUnderstandingEvidenceOut] = Field(default_factory=list)
+    runtime_evidence: List[JointUnderstandingRuntimeEvidenceOut] = Field(default_factory=list)
+    supports_finding_ids: List[int] = Field(default_factory=list)
+    competing_explanations: List[str] = Field(default_factory=list)
+    refutation_conditions: List[str] = Field(default_factory=list)
+    next_investigation: Optional[str] = None
+    uncertainty: str = ""
+    supersedes_finding_id: Optional[int] = None
+    decision_method: JointUnderstandingDecisionMethod
+    intelligence_run_id: Optional[int] = None
+    is_mock: bool = False
+    created_at: float
+
+
+class JointUnderstandingFindingCreate(BaseModel):
+    """Append one finding. Findings are never updated or deleted -- a
+    correction is a new finding carrying ``supersedes_finding_id``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    origin_role: JointUnderstandingOriginRole
+    claim_kind: JointUnderstandingClaimKind
+    statement: str = Field(..., min_length=1, max_length=4_000)
+    evidence: List[JointUnderstandingEvidenceIn] = Field(default_factory=list, max_length=20)
+    runtime_evidence: List[JointUnderstandingRuntimeEvidenceIn] = Field(
+        default_factory=list, max_length=20,
+    )
+    supports_finding_ids: List[int] = Field(default_factory=list, max_length=20)
+    competing_explanations: List[str] = Field(default_factory=list, max_length=10)
+    refutation_conditions: List[str] = Field(default_factory=list, max_length=10)
+    next_investigation: Optional[str] = Field(default=None, max_length=2_000)
+    uncertainty: str = Field(default="", max_length=2_000)
+    supersedes_finding_id: Optional[int] = None
+    decision_method: JointUnderstandingDecisionMethod
+    intelligence_run_id: Optional[int] = None
+    is_mock: bool = False
+
+
+class JointUnderstandingActionOut(BaseModel):
+    id: int
+    joint_understanding_id: int
+    system_id: int
+    action_kind: JointUnderstandingActionKind
+    actor: Optional[str] = None
+    note: Optional[str] = None
+    decision_method: Literal["manual"] = "manual"
+    created_at: float
+
+
+class JointUnderstandingActionCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action_kind: JointUnderstandingActionKind
+    actor: Optional[str] = Field(default=None, max_length=200)
+    note: Optional[str] = Field(default=None, max_length=2_000)
+
+
+class JointUnderstandingOut(BaseModel):
+    id: int
+    session_id: int
+    system_id: int
+    origin_kind: JointUnderstandingOriginKind
+    origin_id: int
+    trigger: JointUnderstandingTrigger
+    question_text: str
+    status: JointUnderstandingStatus
+    outcome: Optional[JointUnderstandingOutcome] = None
+    # Derived, never stored: true exactly for outcome='hypothesis_adopted'.
+    # A provisional outcome must not be presented or reused as a fact.
+    outcome_is_provisional: bool = False
+    outcome_reason: Optional[str] = None
+    premise_snapshot_id: Optional[int] = None
+    schema_version: str
+    created_at: float
+    updated_at: float
+    closed_at: Optional[float] = None
+
+
+class JointUnderstandingDetailOut(BaseModel):
+    session: JointUnderstandingOut
+    findings: List[JointUnderstandingFindingOut] = Field(default_factory=list)
+    actions: List[JointUnderstandingActionOut] = Field(default_factory=list)
+    # The finite next-action menu for the session's current status,
+    # deterministically ordered (empty once closed/held).
+    available_actions: List[JointUnderstandingActionKind] = Field(default_factory=list)
+
+
+class JointUnderstandingListOut(BaseModel):
+    session_id: int
+    system_id: int
+    items: List[JointUnderstandingOut] = Field(default_factory=list)
+
+
+class JointUnderstandingCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    origin_kind: JointUnderstandingOriginKind
+    origin_id: int
+    trigger: JointUnderstandingTrigger
+    question_text: str = Field(..., min_length=1, max_length=2_000)
+
+
+class JointUnderstandingCloseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    outcome: JointUnderstandingOutcome
+    outcome_reason: Optional[str] = Field(default=None, max_length=2_000)
+
+
+class JointUnderstandingHoldRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Optional[str] = Field(default=None, max_length=500)
+
+
 # --- Alignment Review / Review Queue (Issue #287) -----------------------------
 #
 # Contrasts confirmed/proposed Intent Brief items against the evidence-backed

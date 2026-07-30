@@ -1,0 +1,247 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://probe-agent.dev/schemas/joint_understanding.json",
+  "title": "JointUnderstandingExchange",
+  "description": "The handoff contract between system investigation, translation, and the developer for one Joint Understanding session (Epic #328 Phase A / Issue #329). A session starts when a developer answers 「わからない」 (trigger=unknown_answer) or explicitly asks to work something out together (explicit_request) about an existing confirmation item, and accumulates append-only findings plus the finite next actions the developer chose. Three provenances are kept strictly apart and never merged into one 'answer': investigation owns technical facts and their snapshot evidence, translation owns purpose/impact wording that may only reference existing findings, and the developer owns value judgements. The session itself never writes the origin item's answer/intent/decision -- 「わからない」 is an entry point into a shared investigation, never a recorded developer intent.",
+  "type": "object",
+  "required": ["schema_version", "session", "findings", "actions"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "joint-understanding-v1"
+    },
+    "session": { "$ref": "#/$defs/session" },
+    "findings": {
+      "type": "array",
+      "description": "Append-only. A correction is a NEW finding carrying supersedes_finding_id, never an edit of an existing one.",
+      "items": { "$ref": "#/$defs/finding" }
+    },
+    "actions": {
+      "type": "array",
+      "description": "The finite next understanding actions the developer chose, in order. Recording an action never decides the origin item.",
+      "items": { "$ref": "#/$defs/action" }
+    }
+  },
+  "$defs": {
+    "session": {
+      "type": "object",
+      "required": [
+        "id", "system_id", "session_id", "origin_kind", "origin_id",
+        "trigger", "question_text", "status", "created_at", "updated_at"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "integer", "minimum": 1 },
+        "system_id": { "type": "integer", "minimum": 1 },
+        "session_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The owning interview_session. A Joint Understanding session is always scoped to one interview session and one System."
+        },
+        "origin_kind": {
+          "enum": ["qa", "intent", "review_item", "inquiry"],
+          "description": "Which confirmation item the developer could not answer. The origin row is only ever READ."
+        },
+        "origin_id": { "type": "integer", "minimum": 1 },
+        "trigger": {
+          "enum": ["unknown_answer", "explicit_request"],
+          "description": "unknown_answer: the developer said 「わからない」. explicit_request: the developer asked to work it out together without having said so."
+        },
+        "question_text": {
+          "type": "string",
+          "minLength": 1,
+          "description": "What the developer wants to understand. Stored on the session only -- never copied into the origin item's answer field and never recorded as a developer finding."
+        },
+        "status": { "enum": ["open", "held", "closed"] },
+        "outcome": {
+          "description": "Set only when status=closed. understood/doubt_resolved record that understanding improved; hypothesis_adopted is explicitly PROVISIONAL and never a fact; decided is the developer's final value judgement; handed_off passes the decision to someone else; abandoned closes without a conclusion.",
+          "oneOf": [
+            { "type": "null" },
+            {
+              "enum": [
+                "understood",
+                "doubt_resolved",
+                "hypothesis_adopted",
+                "decided",
+                "handed_off",
+                "abandoned"
+              ]
+            }
+          ]
+        },
+        "outcome_is_provisional": {
+          "type": "boolean",
+          "description": "Derived, never stored as free text: true exactly for outcome=hypothesis_adopted. A provisional outcome must not be presented or reused as an established fact."
+        },
+        "outcome_reason": { "type": ["string", "null"], "maxLength": 2000 },
+        "premise_snapshot_id": {
+          "type": ["integer", "null"],
+          "description": "The repository snapshot this session's investigation is pinned to, captured at creation (same discipline as an Inquiry's premise bundle, Issue #308). Never rebased onto a newer snapshot mid-session."
+        },
+        "created_at": { "type": "number" },
+        "updated_at": { "type": "number" },
+        "closed_at": { "type": ["number", "null"] }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "required": [
+        "id", "joint_understanding_id", "system_id", "origin_role",
+        "claim_kind", "statement", "decision_method", "created_at"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "integer", "minimum": 1 },
+        "joint_understanding_id": { "type": "integer", "minimum": 1 },
+        "system_id": { "type": "integer", "minimum": 1 },
+        "origin_role": {
+          "enum": ["investigation", "translation", "developer"],
+          "description": "WHO produced this. investigation: technical facts read from the pinned snapshot and runtime observation. translation: purpose/impact wording derived only from other findings. developer: the human's own intent, priority, or value judgement. A role is never allowed to author another role's content."
+        },
+        "claim_kind": {
+          "enum": ["fact", "inference", "hypothesis", "unknown", "conflict"],
+          "description": "WHAT kind of statement this is. Independent of origin_role: 'unknown' is a first-class result (evidence is missing), never plausibility-filled, and 'conflict' records two sources that cannot both hold."
+        },
+        "statement": { "type": "string", "minLength": 1, "maxLength": 4000 },
+        "evidence": {
+          "type": "array",
+          "description": "Snapshot-verified code/doc citations. Allowed ONLY for origin_role=investigation: translation must reference findings instead of inventing citations, and a developer statement is a judgement, not snapshot evidence.",
+          "items": { "$ref": "#/$defs/evidence" }
+        },
+        "runtime_evidence": {
+          "type": "array",
+          "description": "Runtime observation evidence, same restriction as `evidence` (investigation only).",
+          "items": { "$ref": "#/$defs/runtime_evidence" }
+        },
+        "supports_finding_ids": {
+          "type": "array",
+          "description": "Findings of the SAME session this statement is derived from. Required (>=1) for origin_role=translation so any generalized wording can always be traced back to the original technical claim and its evidence.",
+          "items": { "type": "integer", "minimum": 1 }
+        },
+        "competing_explanations": {
+          "type": "array",
+          "description": "Required (>=1) for an investigation hypothesis: a hypothesis is not merely a low-confidence claim.",
+          "items": { "type": "string", "minLength": 1, "maxLength": 2000 }
+        },
+        "refutation_conditions": {
+          "type": "array",
+          "description": "Required (>=1) for an investigation hypothesis: what would have to be observed for this to be wrong.",
+          "items": { "type": "string", "minLength": 1, "maxLength": 2000 }
+        },
+        "next_investigation": {
+          "type": ["string", "null"],
+          "maxLength": 2000,
+          "description": "The next research step that would distinguish the competing explanations."
+        },
+        "uncertainty": { "type": "string", "maxLength": 2000 },
+        "supersedes_finding_id": {
+          "type": ["integer", "null"],
+          "description": "Corrections are additive: the superseded finding stays readable, this row records what replaced it."
+        },
+        "decision_method": {
+          "enum": ["deterministic", "reasoning_llm", "manual"],
+          "description": "manual is reserved for origin_role=developer; a reasoning model never writes a manual record and a human record never carries an intelligence run."
+        },
+        "intelligence_run_id": {
+          "type": ["integer", "null"],
+          "description": "The reasoning run that produced this finding. Always null for origin_role=developer."
+        },
+        "is_mock": { "type": "boolean" },
+        "created_at": { "type": "number" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "origin_role": { "const": "translation" } }, "required": ["origin_role"] },
+          "then": {
+            "properties": {
+              "evidence": { "maxItems": 0 },
+              "runtime_evidence": { "maxItems": 0 },
+              "supports_finding_ids": { "minItems": 1 },
+              "decision_method": { "const": "reasoning_llm" }
+            },
+            "required": ["supports_finding_ids"]
+          }
+        },
+        {
+          "if": { "properties": { "origin_role": { "const": "developer" } }, "required": ["origin_role"] },
+          "then": {
+            "properties": {
+              "evidence": { "maxItems": 0 },
+              "runtime_evidence": { "maxItems": 0 },
+              "decision_method": { "const": "manual" },
+              "intelligence_run_id": { "type": "null" },
+              "is_mock": { "const": false }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "origin_role": { "const": "investigation" },
+              "claim_kind": { "const": "hypothesis" }
+            },
+            "required": ["origin_role", "claim_kind"]
+          },
+          "then": {
+            "properties": {
+              "competing_explanations": { "minItems": 1 },
+              "refutation_conditions": { "minItems": 1 }
+            },
+            "required": ["competing_explanations", "refutation_conditions"]
+          }
+        }
+      ]
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["path", "start_line", "end_line"],
+      "additionalProperties": false,
+      "properties": {
+        "path": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "start_line": { "type": "integer", "minimum": 1 },
+        "end_line": { "type": "integer", "minimum": 1 },
+        "summary": { "type": "string", "maxLength": 1000 }
+      }
+    },
+    "runtime_evidence": {
+      "type": "object",
+      "required": ["component_id", "runtime_check"],
+      "additionalProperties": false,
+      "properties": {
+        "component_id": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "runtime_check": { "enum": ["match", "mismatch", "unobserved", "stale"] },
+        "summary": { "type": "string", "maxLength": 1000 }
+      }
+    },
+    "action": {
+      "type": "object",
+      "required": ["id", "joint_understanding_id", "system_id", "action_kind", "decision_method", "created_at"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "integer", "minimum": 1 },
+        "joint_understanding_id": { "type": "integer", "minimum": 1 },
+        "system_id": { "type": "integer", "minimum": 1 },
+        "action_kind": {
+          "enum": [
+            "request_investigation",
+            "explain_reasoning",
+            "compare_options",
+            "adopt_hypothesis",
+            "revise_intent",
+            "hold",
+            "handoff",
+            "decide"
+          ],
+          "description": "The finite set of next understanding actions offered to the developer. Choosing one records intent to continue the conversation -- it never approves, adopts, or decides the origin item by itself."
+        },
+        "actor": { "type": ["string", "null"], "maxLength": 200 },
+        "note": { "type": ["string", "null"], "maxLength": 2000 },
+        "decision_method": {
+          "const": "manual",
+          "description": "An action is always the human's own choice."
+        },
+        "created_at": { "type": "number" }
+      }
+    }
+  }
+}

@@ -4662,3 +4662,127 @@ Issue #297 と sub-issue #298-#304 の実装レビュー後に残った運用上
 - 同一 Cell ID / roster を持つ別 System を positive-collision fixture
   とし、binding / trace / topology / task evidence が一切漏れないことを
   end-to-end で確認する。
+
+---
+
+## 共同理解セッション(Epic #328)
+
+Epic #328 は、開発者が「わからない」と答えた地点を**終端**ではなく**共同で状況
+理解を作る工程の開始点**として扱うための Epic である。既存の Interview(#282
+系)、Inquiry(#285/#286)、Alignment Review(#287)、前提追跡(#308)、評価
+基盤(#309)を置き換えず、その上に「調査 → 通訳 → 開発者の判断」を分離したまま
+往復できる 1 本の循環を足す。
+
+Phase 分割と sub-issue:
+
+| Phase | Issue | 内容 |
+| --- | --- | --- |
+| A | #329 | 受け渡し契約・対話状態の基盤(決定的、LLM 呼び出し無し) |
+| B | #330 | 反復調査ループと探索継続性 |
+| C | #331 | 通訳(目的・影響への翻訳)と選択肢提示 |
+| D | #332 | システム理解への還流と確定状態の分離 |
+| E | #333 | Dashboard 共同理解パネル |
+| F | #334 | 共同理解の質を測る評価枠組み |
+
+### Phase A: 受け渡し契約と対話状態(Issue #329)
+
+#### 共有スキーマ
+
+`shared/schemas/joint_understanding.schema.json`(`schema_version:
+joint-understanding-v1`)が、1 セッション分の受け渡し契約 —
+`session` / `findings` / `actions` — を定義する。契約の要点は「三つの来歴を
+1 つの回答に混ぜない」ことにある。
+
+- `origin_role`(**誰が**書いたか): `investigation` / `translation` / `developer`
+- `claim_kind`(**何の種類**の主張か): `fact` / `inference` / `hypothesis` /
+  `unknown` / `conflict`
+
+この 2 軸は独立している。`unknown` は失敗ではなく第一級の結果であり、
+もっともらしさで埋めない。`conflict` は両立しない情報源を記録する。
+
+#### 有限語彙(`app/joint_understanding.py`)
+
+すべて Principle 6 の明示的な有限集合で、未知値は 422(推測補完しない)。
+
+- `ORIGIN_KINDS`: `qa` / `intent` / `review_item` / `inquiry`
+- `TRIGGERS`: `unknown_answer` / `explicit_request`
+- `SESSION_STATUSES`: `open` / `held` / `closed`
+- `SESSION_TRANSITIONS`: `open → {held, closed}`、`held → {open}`、
+  `closed` は終端(表に無い遷移は 409)
+- `SESSION_OUTCOMES`: `understood` / `doubt_resolved` /
+  `hypothesis_adopted` / `decided` / `handed_off` / `abandoned`
+  - `PROVISIONAL_OUTCOMES = ("hypothesis_adopted",)` は**暫定**であり、
+    API 応答の `outcome_is_provisional` で常に判別できる。事実として再利用しない。
+  - `decided` だけが人間の最終的な価値判断。
+- `ACTION_KINDS`: `request_investigation` / `explain_reasoning` /
+  `compare_options` / `adopt_hypothesis` / `revise_intent` / `hold` /
+  `handoff` / `decide`
+
+#### 役割ごとの契約(`validate_finding`)
+
+| 役割 | decision_method | evidence | supports_finding_ids |
+| --- | --- | --- | --- |
+| `investigation` | `reasoning_llm` / `deterministic` | 可 | 任意 |
+| `translation` | `reasoning_llm` | **不可** | **1 件以上必須** |
+| `developer` | `manual` のみ | **不可** | 任意 |
+
+- `developer` の Finding は `intelligence_run_id` を持てず `is_mock` にもできない
+  — reasoning model が開発者の名前で発言する経路を機構的に塞ぐ。
+- `translation` は証拠を作れない。一般化した説明から必ず元の技術的主張と証拠へ
+  戻れるように、同一セッション内の Finding id 参照のみを許す(他セッション・
+  存在しない id は 422)。
+- `investigation` の `hypothesis` は競合説明と反証条件を必須にする(仮説は
+  単なる低 confidence claim ではない — `docs/system-understanding-ideal-state.md`
+  §3.4)。
+- `reasoning_llm` の Finding は必ず `intelligence_run_id` を持つ(Principle 7)。
+- Finding は**追記のみ**。更新・削除エンドポイントは存在せず、訂正は
+  `supersedes_finding_id` を持つ新しい Finding で表現する。
+
+#### テーブル(additive、System スコープ)
+
+`joint_understanding_session` / `joint_understanding_finding` /
+`joint_understanding_action`。`premise_snapshot_id` は作成時に interview session
+の snapshot を固定する(#308 の premise bundle と同じ規律。Phase B の追加調査が
+新しい snapshot へ暗黙に乗り換えないため)。
+
+#### API(`routes/joint_understanding.py`)
+
+- `POST /interview/sessions/{session_id}/joint-understanding`(201)
+- `GET /interview/sessions/{session_id}/joint-understanding`(`status` /
+  `origin_kind` フィルタ、未知値は 422)
+- `GET /joint-understanding/{ju_id}`(findings + actions + `available_actions`)
+- `POST /joint-understanding/{ju_id}/findings`(追記)
+- `POST /joint-understanding/{ju_id}/actions`(開発者が選んだ次の行動)
+- `POST /joint-understanding/{ju_id}/hold` / `/resume` / `/close`
+
+`available_actions` は現在の status から決定的に導出する(`open` のときだけ
+`ACTION_KINDS` 全件、`held` / `closed` では空)。
+
+#### 「わからない」を意図として混入させない境界
+
+Phase A のテーブル群が存在する最大の理由がこれである。
+
+- どのエンドポイントも origin 行(`interview_qa` / `interview_intent_item` /
+  `alignment_item` / `interview_inquiry`)に**書き込まない**。読むのは存在確認の
+  SELECT だけ。#287 の Inquiry が行う `alignment_item.status='inquiry'` の
+  ミラーリングも**行わない**(両フローの統合方法は Phase D / #332 で決める。
+  それまで共同理解セッションは既存フローに触れない並走系統として保つ)。
+- `question_text` はセッション行にのみ保持し、回答欄へコピーしない。
+- `trigger='unknown_answer'` でセッションを作っても developer Finding は
+  1 件も作られない(「わからない」はシステムについての主張ではない)。
+- `outcome='decided'` で閉じても origin 行は変わらない。項目の確定は
+  引き続き項目自身の回答・確認エンドポイントだけが行う。
+
+#### Phase A の非スコープ
+
+reasoning model 呼び出し(Phase B / C)、理解への還流(Phase D)、Dashboard
+(Phase E)、評価指標(Phase F)。Phase A の `decision_method` は `manual` か、
+呼び出し側が検証済みで渡す値のみで、この層は LLM を呼ばない。
+
+#### テスト
+
+`apps/control-server/tests/test_joint_understanding.py`:
+契約の単体テスト(遷移表・暫定 outcome・役割別ルール・未知語彙)、共有スキーマの
+検証(translation の evidence 拒否・未知 enum・hypothesis 構造)、API ライフサイクル、
+**origin 行不変**(qa / intent / review_item)、追記のみ、他セッション参照の拒否、
+有限遷移、System 分離。
