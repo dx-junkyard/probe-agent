@@ -7,6 +7,9 @@
 **Feature Intelligence Layer** と、source patch を隔離環境で比較する
 **Experiment Workspace Layer** を提供する。設計は
 [`docs/project-intelligence.md`](docs/project-intelligence.md) を参照。
+System Understanding が長期的に目指す状態と、現在不足している構造的な要素は
+[`docs/system-understanding-ideal-state.md`](docs/system-understanding-ideal-state.md)
+にまとめている。
 
 詳細は [issue #1](https://github.com/dx-junkyard/probe-agent/issues/1) と
 [`docs/mvp.md`](docs/mvp.md) を参照。
