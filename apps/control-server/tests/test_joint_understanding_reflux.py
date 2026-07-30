@@ -423,3 +423,72 @@ def test_reflux_is_system_isolated(admin_client):
     assert admin_client.post(
         f"/joint-understanding/{ju_id}/reflux", headers=_headers(token, other["id"]),
     ).status_code == 404
+
+
+# --- Phase F (#334): joint-understanding quality metrics ------------------------
+
+
+def _metrics(client, headers):
+    r = client.get("/interview/metrics", headers=headers)
+    assert r.status_code == 200, r.text
+    return {m["key"]: m for m in r.json()["metrics"]}
+
+
+def test_joint_understanding_metrics_are_deterministic_and_separate(admin_client):
+    """Issue #334: quality metrics live in their own category and are counted
+    from persisted facts only -- never mixed into the efficiency numbers."""
+    headers, system_id, session_id, snapshot_id, qa, ju_id, run_id = _setup(admin_client)
+    finding_id = _add_finding(admin_client, headers, ju_id, run_id)
+    _add_finding(
+        admin_client, headers, ju_id, run_id,
+        claim_kind="unknown", statement="通知先は特定できなかった", evidence=[],
+    )
+    admin_client.post(f"/joint-understanding/{ju_id}/reflux", headers=headers)
+    admin_client.post(
+        f"/joint-understanding/{ju_id}/close",
+        json={"outcome": "hypothesis_adopted", "outcome_finding_ids": [finding_id]},
+        headers=headers,
+    )
+
+    metrics = _metrics(admin_client, headers)
+    joint = {k: m for k, m in metrics.items() if m["category"] == "joint_understanding"}
+    assert len(joint) == 8
+    # Efficiency metrics keep their own categories -- nothing was merged.
+    assert all(m["category"] != "joint_understanding" for k, m in metrics.items() if k not in joint)
+
+    assert joint["joint_understanding_from_unknown_rate"]["value"] == 1.0
+    assert joint["joint_understanding_provisional_outcome_rate"]["value"] == 1.0
+    assert joint["joint_understanding_provisional_outcome_rate"]["guardrail"] is True
+    assert joint["joint_understanding_unknown_finding_rate"]["value"] == 0.5
+    assert joint["joint_understanding_reflux_rate"]["value"] == 1.0
+
+    # Deterministic: same data, same result.
+    assert _metrics(admin_client, headers) == metrics
+
+
+def test_joint_understanding_metrics_are_unmeasured_without_observations(admin_client):
+    token = _login(admin_client)
+    system = admin_client.post(
+        "/systems", json={"name": "Empty", "environment": "test", "description": "d"},
+        headers={"Authorization": f"Bearer {token}"},
+    ).json()
+    metrics = _metrics(admin_client, _headers(token, system["id"]))
+    joint = {k: m for k, m in metrics.items() if m["category"] == "joint_understanding"}
+    assert len(joint) == 8
+    for metric in joint.values():
+        # Never 0 and never an estimate: an unavailable metric says so.
+        assert metric["status"] == "unmeasured"
+        assert metric["value"] is None
+        assert metric["unmeasured_reason"] == "no_observations"
+
+
+def test_joint_understanding_metrics_are_system_isolated(admin_client):
+    headers, system_id, session_id, snapshot_id, qa, ju_id, run_id = _setup(admin_client)
+    _add_finding(admin_client, headers, ju_id, run_id)
+    token = _login(admin_client)
+    other = admin_client.post(
+        "/systems", json={"name": "Other", "environment": "test", "description": "d"},
+        headers={"Authorization": f"Bearer {token}"},
+    ).json()
+    other_metrics = _metrics(admin_client, _headers(token, other["id"]))
+    assert other_metrics["joint_understanding_from_unknown_rate"]["status"] == "unmeasured"

@@ -5044,3 +5044,39 @@ API 失敗時もパネルとメニューは残り、回答機会を失わせな�
 第 1 層に内部名称が出ず第 3 層で開示されること、有限メニューの表示と送信、
 暫定採用と確定の視覚的区別、前提 stale の警告と第 2 層先出し、調査失敗後も
 対話が残ること、`is_mock` バッジ、未翻訳時の日本語案内。
+
+### Phase F: 共同理解の質を測る評価枠組み(Issue #334)
+
+#309 の指標パイプライン(`app/interview_metrics.py`)に**別カテゴリ**
+`joint_understanding` として追加する。効率化指標(確認件数・承認速度)と
+同じ数値へまとめない — 「効率化を共同理解の質より先に最適化する流れ」を
+置き換えるという Epic #328 の目的上、両者は独立して読めなければならない。
+
+すべて永続化済みの事実に対する決定的な集計で、モデルの自己申告による品質
+スコアは導入しない。分母が 0 の指標は 0 ではなく `unmeasured`
+(`unmeasured_reason='no_observations'`)を返す(#309 の方針を踏襲)。
+
+| key | guardrail | 意味 |
+| --- | --- | --- |
+| `joint_understanding_from_unknown_rate` | – | 「わからない」から始まった割合(終端ではなく開始点として使われているか) |
+| `joint_understanding_conclusion_rate` | – | 閉じたセッションのうち理解・疑問解消・暫定採用・正式判断へ到達した割合 |
+| `joint_understanding_provisional_outcome_rate` | ✓ | 暫定採用で終わった割合(高止まり = 確かめきれずに前へ進めている) |
+| `joint_understanding_stale_premise_close_rate` | ✓ | 前提が変わった状態で閉じた割合 |
+| `joint_understanding_unknown_finding_rate` | ✓ | 調査 Finding のうち `unknown` の割合(証拠不足を埋めていないか) |
+| `joint_understanding_reflux_rate` | – | 確認できた事実のうち、回答へ転記せず理解へ反映された割合 |
+| `joint_understanding_investigation_answered_rate` | – | 反復調査が人へ聞かずに答えへ到達した割合 |
+| `joint_understanding_developer_question_rate` | – | 通訳のうち実際に判断質問まで到達した割合(少ないほど良い指標ではない) |
+
+`InterviewMetricCategory` に `joint_understanding` を、`InterviewMetricKey` に
+上記 8 key を追加(いずれも既存の有限集合の拡張)。
+
+#### #311 との関係
+
+本 Phase の観測項目は #311(低リスク提案の一括承認)の開始条件
+「実利用の誤分類・取り消し・理解低下を観測できること」を判断する材料になるが、
+#311 自体は引き続き実装しない。
+
+#### テスト
+
+`test_joint_understanding_reflux.py` 末尾の 3 件: カテゴリ分離と決定性、
+観測ゼロでの `unmeasured`、System 分離。
