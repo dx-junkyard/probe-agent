@@ -52,7 +52,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -67,8 +67,17 @@ from ..joint_understanding import (
     validate_finding,
     validate_transition,
 )
+from ..investigation_loop import (
+    InvestigationLoopBudget,
+    InvestigationLoopResult,
+    LoopCarryOver,
+    run_investigation_loop,
+)
+from ..interview_language import get_interview_language, resolve_message_language
+from ..llm import LLMConfig, LLMError, create_llm_client
 from ..models import (
     JointUnderstandingActionCreate,
+    JointUnderstandingActionMenuEntryOut,
     JointUnderstandingActionOut,
     JointUnderstandingCloseRequest,
     JointUnderstandingCreate,
@@ -77,9 +86,24 @@ from ..models import (
     JointUnderstandingFindingCreate,
     JointUnderstandingFindingOut,
     JointUnderstandingHoldRequest,
+    JointUnderstandingInvestigateOut,
+    JointUnderstandingInvestigateRequest,
     JointUnderstandingListOut,
+    JointUnderstandingOptionOut,
     JointUnderstandingOut,
+    JointUnderstandingRoundOut,
     JointUnderstandingRuntimeEvidenceOut,
+    JointUnderstandingStatementOut,
+    JointUnderstandingTranslateOut,
+    JointUnderstandingTranslateRequest,
+    JointUnderstandingTranslationOut,
+)
+from ..understanding_translator import (
+    FindingSummary,
+    TranslationResult,
+    ask_developer,
+    build_action_menu,
+    translate_findings,
 )
 
 router = APIRouter()
@@ -210,10 +234,22 @@ def _detail(conn, ju_row) -> JointUnderstandingDetailOut:
         "WHERE joint_understanding_id = ? ORDER BY id",
         (ju_id,),
     ).fetchall()
+    rounds = conn.execute(
+        "SELECT * FROM joint_understanding_investigation_round "
+        "WHERE joint_understanding_id = ? ORDER BY id",
+        (ju_id,),
+    ).fetchall()
+    translations = conn.execute(
+        "SELECT * FROM joint_understanding_translation "
+        "WHERE joint_understanding_id = ? ORDER BY id",
+        (ju_id,),
+    ).fetchall()
     return JointUnderstandingDetailOut(
         session=_session_out(ju_row),
         findings=[_finding_out(f) for f in findings],
         actions=[_action_out(a) for a in actions],
+        investigation_rounds=[_round_out(r) for r in rounds],
+        translations=[_translation_out(t) for t in translations],
         available_actions=available_action_kinds(ju_row["status"]),
     )
 
@@ -425,6 +461,625 @@ def append_finding(
             "SELECT * FROM joint_understanding_finding WHERE id = ?", (cur.lastrowid,),
         ).fetchone()
         return _finding_out(row)
+
+
+# --- Iterative investigation (Phase B / #330) ----------------------------------
+
+
+def _round_out(row) -> JointUnderstandingRoundOut:
+    return JointUnderstandingRoundOut(
+        id=row["id"],
+        joint_understanding_id=row["joint_understanding_id"],
+        system_id=row["system_id"],
+        round_index=row["round_index"],
+        status=row["status"],
+        stop_reason=row["stop_reason"],
+        conclusion=row["conclusion"],
+        search_leads=json.loads(row["search_leads"]),
+        open_hypotheses=json.loads(row["open_hypotheses"]),
+        missing_evidence=json.loads(row["missing_evidence"]),
+        read_paths=json.loads(row["read_paths"]),
+        unread_candidates=json.loads(row["unread_candidates"]),
+        pruned_findings=row["pruned_findings"],
+        files_read=row["files_read"],
+        chars_read=row["chars_read"],
+        llm_calls=row["llm_calls"],
+        elapsed_seconds=row["elapsed_seconds"],
+        intelligence_run_id=row["intelligence_run_id"],
+        error_details=row["error_details"],
+        created_at=row["created_at"],
+    )
+
+
+def _restore_carry_over(conn, ju_id: int) -> LoopCarryOver:
+    """Rebuild the loop state a previous run left behind.
+
+    Search leads, open hypotheses and missing evidence come from the most
+    recent round that produced any (a failed round produces none, and must
+    not erase what the round before it earned); ``read_paths`` is the union
+    across every round, so a retry never re-reads what has already been read.
+    This is the continuity requirement of Epic #328 -- a retry resumes from
+    the leads already paid for instead of starting over from the question.
+    """
+    rows = conn.execute(
+        """SELECT search_leads, open_hypotheses, missing_evidence, read_paths
+           FROM joint_understanding_investigation_round
+           WHERE joint_understanding_id = ? ORDER BY id""",
+        (ju_id,),
+    ).fetchall()
+    carry = LoopCarryOver()
+    for row in rows:
+        leads = json.loads(row["search_leads"])
+        hypotheses = json.loads(row["open_hypotheses"])
+        missing = json.loads(row["missing_evidence"])
+        if leads:
+            carry.search_leads = leads
+        if hypotheses:
+            carry.open_hypotheses = hypotheses
+        if missing:
+            carry.missing_evidence = missing
+        for path in json.loads(row["read_paths"]):
+            if path not in carry.read_paths:
+                carry.read_paths.append(path)
+    return carry
+
+
+def _persist_loop(
+    conn,
+    *,
+    result: InvestigationLoopResult,
+    ju_id: int,
+    system_id: int,
+    snapshot_id: Optional[int],
+    started_at: float,
+    completed_at: float,
+) -> "tuple[List[JointUnderstandingRoundOut], List[JointUnderstandingFindingOut]]":
+    """Persist every round as its own audit run plus its validated findings.
+
+    One ``intelligence_runs`` row per round (Principle 7 -- each reasoning
+    call is independently auditable, with its own budget usage), and each
+    round's findings are appended as ``origin_role='investigation'`` rows
+    referencing that run. A failed round still gets its audit row; it simply
+    contributes no findings, and the rounds before it keep theirs.
+    """
+    round_outs: List[JointUnderstandingRoundOut] = []
+    finding_outs: List[JointUnderstandingFindingOut] = []
+    last_index = len(result.rounds)
+
+    for loop_round in result.rounds:
+        run_cur = conn.execute(
+            """INSERT INTO intelligence_runs
+                (system_id, snapshot_id, run_type, provider, model,
+                 prompt_version, schema_version, decision_method, status,
+                 error_details, is_mock, started_at, completed_at,
+                 budget_files_read, budget_chars_read, budget_llm_calls,
+                 budget_elapsed_seconds)
+            VALUES (?, ?, 'joint_investigation', ?, ?, ?, ?, 'reasoning_llm', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                system_id, snapshot_id, result.provider, result.model,
+                result.prompt_version, result.schema_version,
+                "failed" if loop_round.error else "completed", loop_round.error,
+                1 if result.is_mock else 0, started_at, completed_at,
+                loop_round.files_read, loop_round.chars_read, loop_round.llm_calls,
+                loop_round.elapsed_seconds,
+            ),
+        )
+        run_id = run_cur.lastrowid
+        for snippet in loop_round.read_snippets:
+            conn.execute(
+                """INSERT INTO intelligence_run_evidence
+                    (system_id, intelligence_run_id, path, start_line,
+                     end_line, char_count, truncated, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    system_id, run_id, snippet.path, snippet.start_line,
+                    snippet.end_line, snippet.char_count,
+                    1 if snippet.truncated else 0, completed_at,
+                ),
+            )
+
+        round_cur = conn.execute(
+            """INSERT INTO joint_understanding_investigation_round
+                (joint_understanding_id, system_id, round_index, status,
+                 stop_reason, conclusion, search_leads, open_hypotheses,
+                 missing_evidence, read_paths, unread_candidates,
+                 pruned_findings, files_read, chars_read, llm_calls,
+                 elapsed_seconds, intelligence_run_id, error_details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                ju_id, system_id, loop_round.round_index, loop_round.status,
+                result.stop_reason if loop_round.round_index == last_index else None,
+                loop_round.conclusion,
+                json.dumps(loop_round.search_leads, ensure_ascii=False),
+                json.dumps(loop_round.open_hypotheses, ensure_ascii=False),
+                json.dumps(loop_round.missing_evidence, ensure_ascii=False),
+                json.dumps([s.path for s in loop_round.read_snippets], ensure_ascii=False),
+                json.dumps(loop_round.unread_candidates, ensure_ascii=False),
+                loop_round.pruned_findings, loop_round.files_read, loop_round.chars_read,
+                loop_round.llm_calls, loop_round.elapsed_seconds, run_id,
+                loop_round.error, completed_at,
+            ),
+        )
+        round_outs.append(_round_out(conn.execute(
+            "SELECT * FROM joint_understanding_investigation_round WHERE id = ?",
+            (round_cur.lastrowid,),
+        ).fetchone()))
+
+        for finding in loop_round.findings:
+            known_ids = {
+                r["id"]
+                for r in conn.execute(
+                    "SELECT id FROM joint_understanding_finding "
+                    "WHERE joint_understanding_id = ?",
+                    (ju_id,),
+                ).fetchall()
+            }
+            try:
+                validate_finding(
+                    origin_role="investigation",
+                    claim_kind=finding.claim_kind,
+                    decision_method="reasoning_llm",
+                    evidence=finding.evidence,
+                    runtime_evidence=finding.runtime_evidence,
+                    supports_finding_ids=[],
+                    competing_explanations=finding.competing_explanations,
+                    refutation_conditions=finding.refutation_conditions,
+                    intelligence_run_id=run_id,
+                    is_mock=result.is_mock,
+                    known_finding_ids=known_ids,
+                )
+            except JointUnderstandingValidationError:
+                # The loop already applies this contract; anything that still
+                # fails it is dropped rather than stored in a weaker form.
+                continue
+            cur = conn.execute(
+                """INSERT INTO joint_understanding_finding
+                    (joint_understanding_id, system_id, origin_role, claim_kind,
+                     statement, evidence_json, runtime_evidence_json,
+                     supports_finding_ids, competing_explanations,
+                     refutation_conditions, next_investigation, uncertainty,
+                     supersedes_finding_id, decision_method, intelligence_run_id,
+                     is_mock, created_at)
+                VALUES (?, ?, 'investigation', ?, ?, ?, ?, '[]', ?, ?, ?, ?, NULL,
+                        'reasoning_llm', ?, ?, ?)""",
+                (
+                    ju_id, system_id, finding.claim_kind, finding.statement,
+                    json.dumps(
+                        [
+                            {
+                                "path": e.path, "start_line": e.start_line,
+                                "end_line": e.end_line, "summary": e.summary,
+                            }
+                            for e in finding.evidence
+                        ],
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        [
+                            {
+                                "component_id": e.component_id,
+                                "runtime_check": e.runtime_check,
+                                "summary": e.summary,
+                            }
+                            for e in finding.runtime_evidence
+                        ],
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(finding.competing_explanations, ensure_ascii=False),
+                    json.dumps(finding.refutation_conditions, ensure_ascii=False),
+                    finding.next_investigation, finding.uncertainty,
+                    run_id, 1 if result.is_mock else 0, completed_at,
+                ),
+            )
+            finding_outs.append(_finding_out(conn.execute(
+                "SELECT * FROM joint_understanding_finding WHERE id = ?", (cur.lastrowid,),
+            ).fetchone()))
+
+    conn.execute(
+        "UPDATE joint_understanding_session SET updated_at = ? WHERE id = ?",
+        (completed_at, ju_id),
+    )
+    return round_outs, finding_outs
+
+
+@router.post(
+    "/joint-understanding/{ju_id}/investigate",
+    response_model=JointUnderstandingInvestigateOut,
+)
+def investigate_joint_understanding(
+    ju_id: int,
+    payload: Optional[JointUnderstandingInvestigateRequest] = None,
+    system_id: int = Depends(get_system_id),
+) -> JointUnderstandingInvestigateOut:
+    """Run one iterative investigation over the session's pinned snapshot.
+
+    Each call runs up to ``max_rounds`` read-only rounds
+    (``app/investigation_loop.py``) against the snapshot pinned when the
+    session was created -- never the working tree, never a newer snapshot.
+    Calling it again RESUMES: the previous rounds' search leads, open
+    hypotheses, missing evidence and already-read paths are restored, so a
+    retry continues the investigation instead of restarting it.
+
+    Findings are appended as ``origin_role='investigation'`` rows and every
+    round is persisted as its own ``intelligence_runs`` audit row with its
+    budget usage. Nothing here writes the origin confirmation item, and no
+    finding is ever recorded as the developer's answer.
+
+    Fail-closed (Principle 6/7): a mock/non-reasoning configuration, a git
+    failure, an API failure or invalid structured output yields
+    ``stop_reason='failed'``. When that leaves no findings at all the call is
+    a 502 -- the audit rows are still persisted, but no partial conclusion is
+    reported as if it had succeeded.
+
+    probe-agent:
+      role: API boundary that runs the iterative read-only investigation loop
+        for a Joint Understanding session and persists its rounds/findings
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: io
+      state_effects: [database-read, database-write, external-api]
+      probe_value: Verify a retry restores carried-over leads instead of restarting, that a later-round failure keeps earlier findings, that rounds persist their own audit rows, and that a mock configuration fails closed with no findings.
+    """
+    started_at = time.time()
+    request = payload or JointUnderstandingInvestigateRequest()
+
+    # Phase 1 (DB lock held): deterministic reads only.
+    with get_conn() as conn:
+        ju = _get_or_404(conn, ju_id, system_id)
+        if ju["status"] != "open":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "joint_understanding_not_open",
+                    "message": f"Session is '{ju['status']}', not open",
+                },
+            )
+        snapshot_id = ju["premise_snapshot_id"]
+        snapshot = conn.execute(
+            "SELECT repo_path, commit_sha FROM repository_snapshots "
+            "WHERE id = ? AND system_id = ?",
+            (snapshot_id, system_id),
+        ).fetchone() if snapshot_id is not None else None
+        question_text = ju["question_text"]
+        carry_over = _restore_carry_over(conn, ju_id)
+
+    if snapshot is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "joint_understanding_snapshot_missing",
+                "message": "The session's pinned snapshot is no longer available",
+            },
+        )
+
+    # Phase 2 (DB lock released): the reasoning loop. run_investigation_loop
+    # opens and closes its own short-lived connections for index/runtime
+    # reads, always before each round's LLM call (see app/db.py).
+    config = LLMConfig.intelligence_from_env()
+    budget = InvestigationLoopBudget(
+        **({"max_rounds": request.max_rounds} if request.max_rounds else {})
+    )
+    try:
+        client = create_llm_client(config)
+        result = run_investigation_loop(
+            client, config,
+            repo_path=snapshot["repo_path"], commit_sha=snapshot["commit_sha"],
+            question=question_text,
+            research_focus=request.research_focus,
+            search_keywords=request.search_keywords,
+            language=get_interview_language(),
+            budget=budget, carry_over=carry_over,
+            system_id=system_id, snapshot_id=snapshot_id,
+        )
+    except (LLMError, ValueError) as exc:
+        result = InvestigationLoopResult(
+            provider=config.provider, model=config.model,
+            is_mock=config.provider == "mock",
+            stop_reason="failed", carry_over=carry_over, error=str(exc),
+        )
+    completed_at = time.time()
+
+    # Phase 3 (DB lock re-acquired): persist audit rows and findings.
+    with get_conn() as conn:
+        round_outs, finding_outs = _persist_loop(
+            conn, result=result, ju_id=ju_id, system_id=system_id,
+            snapshot_id=snapshot_id, started_at=started_at, completed_at=completed_at,
+        )
+        if not result.rounds and result.error:
+            # Nothing ran at all (configuration/git failure): record the
+            # failure itself so the fail-closed outcome is auditable.
+            conn.execute(
+                """INSERT INTO intelligence_runs
+                    (system_id, snapshot_id, run_type, provider, model,
+                     prompt_version, schema_version, decision_method, status,
+                     error_details, is_mock, started_at, completed_at)
+                VALUES (?, ?, 'joint_investigation', ?, ?, ?, ?, 'reasoning_llm',
+                        'failed', ?, ?, ?, ?)""",
+                (
+                    system_id, snapshot_id, result.provider, result.model,
+                    result.prompt_version, result.schema_version, result.error,
+                    1 if result.is_mock else 0, started_at, completed_at,
+                ),
+            )
+
+    if result.stop_reason == "failed" and not finding_outs:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "joint_investigation_failed",
+                "message": result.error or "Investigation failed",
+                "joint_understanding_id": ju_id,
+            },
+        )
+
+    return JointUnderstandingInvestigateOut(
+        joint_understanding_id=ju_id,
+        system_id=system_id,
+        stop_reason=result.stop_reason,
+        rounds=round_outs,
+        findings=finding_outs,
+        error=result.error,
+    )
+
+
+# --- Translation (Phase C / #331) ----------------------------------------------
+
+
+def _translation_out(row) -> JointUnderstandingTranslationOut:
+    return JointUnderstandingTranslationOut(
+        id=row["id"],
+        joint_understanding_id=row["joint_understanding_id"],
+        system_id=row["system_id"],
+        purpose_summary=row["purpose_summary"],
+        statements=[
+            JointUnderstandingStatementOut(**s) for s in json.loads(row["statements_json"])
+        ],
+        options=[
+            JointUnderstandingOptionOut(**o) for o in json.loads(row["options_json"])
+        ],
+        open_unknowns=json.loads(row["open_unknowns"]),
+        decision_question=row["decision_question"],
+        ask_developer=bool(row["ask_developer"]),
+        intelligence_run_id=row["intelligence_run_id"],
+        is_mock=bool(row["is_mock"]),
+        created_at=row["created_at"],
+    )
+
+
+def _action_menu(language: str) -> List[JointUnderstandingActionMenuEntryOut]:
+    return [
+        JointUnderstandingActionMenuEntryOut(
+            action_kind=entry.action_kind,
+            label=entry.label,
+            what_changes=entry.what_changes,
+        )
+        for entry in build_action_menu(language)
+    ]
+
+
+@router.post(
+    "/joint-understanding/{ju_id}/translate",
+    response_model=JointUnderstandingTranslateOut,
+    status_code=201,
+)
+def translate_joint_understanding(
+    ju_id: int,
+    payload: Optional[JointUnderstandingTranslateRequest] = None,
+    system_id: int = Depends(get_system_id),
+) -> JointUnderstandingTranslateOut:
+    """Restate this session's findings in terms of purpose, impact, and choices.
+
+    The translation step may not invent technical facts: its only input is
+    the findings already on this session, every sentence it produces must
+    cite the finding ids it came from, and a citation the server did not
+    supply fails the whole call closed (502, nothing persisted but the failed
+    audit row). Each sentence is stored as an ``origin_role='translation'``
+    finding, so the plain explanation always resolves back through a finding
+    to the code evidence -- generalizing the wording never costs the
+    technical provenance (Epic #328).
+
+    The accompanying next-action menu is NOT model output: it is the finite
+    ``ACTION_KINDS`` set with fixed server copy describing what choosing each
+    one changes, assembled deterministically.
+
+    probe-agent:
+      role: API boundary that translates investigation findings into
+        purpose/impact statements with mandatory finding traceability
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: io
+      state_effects: [database-read, database-write, external-api]
+      probe_value: Verify a translation citing an unknown finding id persists nothing, that translated sentences are stored as translation findings with supports_finding_ids, and that the action menu is deterministic server copy rather than model output.
+    """
+    started_at = time.time()
+    request = payload or JointUnderstandingTranslateRequest()
+
+    # Phase 1 (DB lock held): read the findings this translation may use.
+    with get_conn() as conn:
+        ju = _get_or_404(conn, ju_id, system_id)
+        if ju["status"] != "open":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "joint_understanding_not_open",
+                    "message": f"Session is '{ju['status']}', not open",
+                },
+            )
+        question_text = ju["question_text"]
+        snapshot_id = ju["premise_snapshot_id"]
+        rows = conn.execute(
+            """SELECT * FROM joint_understanding_finding
+               WHERE joint_understanding_id = ? AND origin_role = 'investigation'
+               ORDER BY id""",
+            (ju_id,),
+        ).fetchall()
+        summaries = [
+            FindingSummary(
+                id=r["id"],
+                origin_role=r["origin_role"],
+                claim_kind=r["claim_kind"],
+                statement=r["statement"],
+                uncertainty=r["uncertainty"],
+                evidence_count=len(json.loads(r["evidence_json"])),
+                competing_explanations=json.loads(r["competing_explanations"]),
+            )
+            for r in rows
+        ]
+
+    # Phase 2 (DB lock released): the reasoning call.
+    config = LLMConfig.intelligence_from_env()
+    try:
+        language = get_interview_language()
+        client = create_llm_client(config)
+        result = translate_findings(
+            client, config,
+            question=question_text, findings=summaries,
+            goal_hint=request.goal_hint, language=language,
+        )
+    except (LLMError, ValueError) as exc:
+        language = resolve_message_language()
+        result = TranslationResult(
+            provider=config.provider, model=config.model,
+            is_mock=config.provider == "mock", error=str(exc),
+        )
+    completed_at = time.time()
+
+    # Phase 3 (DB lock re-acquired): audit row always; content only on success.
+    with get_conn() as conn:
+        run_cur = conn.execute(
+            """INSERT INTO intelligence_runs
+                (system_id, snapshot_id, run_type, provider, model,
+                 prompt_version, schema_version, decision_method, status,
+                 error_details, is_mock, started_at, completed_at)
+            VALUES (?, ?, 'joint_translation', ?, ?, ?, ?, 'reasoning_llm', ?, ?, ?, ?, ?)""",
+            (
+                system_id, snapshot_id, result.provider, result.model,
+                result.prompt_version, result.schema_version,
+                "failed" if result.error else "completed", result.error,
+                1 if result.is_mock else 0, started_at, completed_at,
+            ),
+        )
+        run_id = run_cur.lastrowid
+
+        if result.error:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "joint_translation_failed",
+                    "message": result.error,
+                    "joint_understanding_id": ju_id,
+                    "run_id": run_id,
+                },
+            )
+
+        known_ids = {
+            r["id"]
+            for r in conn.execute(
+                "SELECT id FROM joint_understanding_finding WHERE joint_understanding_id = ?",
+                (ju_id,),
+            ).fetchall()
+        }
+        statements_json: List[Dict[str, object]] = []
+        for statement in result.statements:
+            try:
+                validate_finding(
+                    origin_role="translation",
+                    claim_kind=statement.claim_kind,
+                    decision_method="reasoning_llm",
+                    evidence=[],
+                    runtime_evidence=[],
+                    supports_finding_ids=statement.supports_finding_ids,
+                    competing_explanations=[],
+                    refutation_conditions=[],
+                    intelligence_run_id=run_id,
+                    is_mock=result.is_mock,
+                    known_finding_ids=known_ids,
+                )
+            except JointUnderstandingValidationError as exc:
+                # The translator already applies this contract, so reaching
+                # here means the two disagree -- fail the whole call rather
+                # than storing a partially-attributable explanation.
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "code": "joint_translation_failed",
+                        "message": str(exc),
+                        "joint_understanding_id": ju_id,
+                        "run_id": run_id,
+                    },
+                )
+            cur = conn.execute(
+                """INSERT INTO joint_understanding_finding
+                    (joint_understanding_id, system_id, origin_role, claim_kind,
+                     statement, evidence_json, runtime_evidence_json,
+                     supports_finding_ids, competing_explanations,
+                     refutation_conditions, next_investigation, uncertainty,
+                     supersedes_finding_id, decision_method, intelligence_run_id,
+                     is_mock, created_at)
+                VALUES (?, ?, 'translation', ?, ?, '[]', '[]', ?, '[]', '[]',
+                        NULL, '', NULL, 'reasoning_llm', ?, ?, ?)""",
+                (
+                    ju_id, system_id, statement.claim_kind, statement.text,
+                    json.dumps(statement.supports_finding_ids),
+                    run_id, 1 if result.is_mock else 0, completed_at,
+                ),
+            )
+            statements_json.append({
+                "layer": statement.layer,
+                "claim_kind": statement.claim_kind,
+                "text": statement.text,
+                "supports_finding_ids": list(statement.supports_finding_ids),
+                "finding_id": cur.lastrowid,
+            })
+
+        should_ask = ask_developer(
+            statements=result.statements,
+            decision_question=result.decision_question,
+            open_unknowns=result.open_unknowns,
+        )
+        translation_cur = conn.execute(
+            """INSERT INTO joint_understanding_translation
+                (joint_understanding_id, system_id, purpose_summary,
+                 statements_json, options_json, open_unknowns,
+                 decision_question, ask_developer, intelligence_run_id,
+                 is_mock, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                ju_id, system_id, result.purpose_summary,
+                json.dumps(statements_json, ensure_ascii=False),
+                json.dumps(
+                    [
+                        {
+                            "label": o.label, "what_changes": o.what_changes,
+                            "tradeoffs": o.tradeoffs,
+                            "supports_finding_ids": list(o.supports_finding_ids),
+                        }
+                        for o in result.options
+                    ],
+                    ensure_ascii=False,
+                ),
+                json.dumps(result.open_unknowns, ensure_ascii=False),
+                # Only surfaced as a question when the deterministic gate says
+                # the developer actually has something to decide with.
+                result.decision_question if should_ask else None,
+                1 if should_ask else 0, run_id,
+                1 if result.is_mock else 0, completed_at,
+            ),
+        )
+        conn.execute(
+            "UPDATE joint_understanding_session SET updated_at = ? WHERE id = ?",
+            (completed_at, ju_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM joint_understanding_translation WHERE id = ?",
+            (translation_cur.lastrowid,),
+        ).fetchone()
+        return JointUnderstandingTranslateOut(
+            translation=_translation_out(row),
+            action_menu=_action_menu(language),
+        )
 
 
 # --- Developer actions ---------------------------------------------------------

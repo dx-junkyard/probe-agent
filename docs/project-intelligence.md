@@ -4786,3 +4786,151 @@ reasoning model 呼び出し(Phase B / C)、理解への還流(Phase D)、Dashbo
 検証(translation の evidence 拒否・未知 enum・hypothesis 構造)、API ライフサイクル、
 **origin 行不変**(qa / intent / review_item)、追記のみ、他セッション参照の拒否、
 有限遷移、System 分離。
+
+### Phase B: 反復調査ループと探索継続性(Issue #330)
+
+`app/investigation_loop.py`。#286 の `investigate()`(1 ラウンド・1 回の
+reasoning 呼び出し)はそのまま残し、その読み取り専用機構の上に「まだ分かって
+いないことを持ち越しながら続ける」ループを足す。
+
+#### 横断的な候補取得(決定的、候補の絞り込みのみ)
+
+`_index_candidates` が pin された snapshot に対して次を横断する。
+
+- `code_symbols` の `qualified_name` / `docstring`(重み 2)
+- `code_entrypoints` の `label` / `route_path` / `handler_qualified_name`(重み 2)
+- `snapshot_files.content` の内容一致(重み 1)
+
+これに #286 の**パス名**一致(`_path_name_candidates`)を後続で足し、既読パスを
+除外して 1 ラウンド分の候補にする。並び順は (一致数 降順, path 昇順) で固定。
+「ファイル名や冒頭部分だけに依存しない探索」(Epic #328)を、最終判断を
+reasoning に残したまま満たす(Principle 6)。
+
+#### ラウンド間・再試行間の継続性
+
+各ラウンドの構造化出力が `search_leads` / `open_hypotheses` /
+`missing_evidence` を返し、次ラウンドの候補取得とプロンプトへ入る。
+`read_paths` は既読集合として累積し、`no_new_evidence` 判定に使う。
+`POST /joint-understanding/{ju_id}/investigate` を再度呼ぶと
+`_restore_carry_over` が永続化済みラウンドから復元するため、**再試行は質問から
+やり直さず、すでに得た手がかりから再開する**(失敗ラウンドは leads を返さないので、
+その前のラウンドの手がかりを消さない)。
+
+#### 有限な停止理由(`STOP_REASONS`)
+
+`answered` / `budget_exhausted` / `no_new_evidence` / `unresolved` / `failed`。
+新しく読めるファイルが 1 件も無いラウンドは決定的に `no_new_evidence` で止める
+(モデルの自己申告で継続しない)。予算 `InvestigationLoopBudget` は
+`max_rounds` / `max_llm_calls` / `max_files` / `max_snippet_chars` /
+`max_files_per_round` / `timeout_seconds` をハードクランプする。
+
+#### Phase A 契約の適用点
+
+ラウンド出力は Phase A の `claim_kind` そのままで返り、次を満たさない Finding は
+**破棄**する(`pruned_findings` に計上、書き換えない)。
+
+- `claim_kind` が有限集合外
+- `hypothesis` なのに競合説明・反証条件が無い
+- 引用が全て snapshot 検証に失敗、または引用が無いのに `unknown` 以外
+  (「調べたが分からなかった」だけは証拠なしで残す)
+
+`completed` なのに有効な Finding が 0 件のラウンドは `unresolved` へ決定的に降格
+(#286 と同じ規律)。
+
+#### 永続化と監査
+
+- `joint_understanding_investigation_round`(additive): ラウンドごとの
+  status / stop_reason / conclusion / carry-over / 未読候補 / 予算使用量 /
+  `intelligence_run_id` / エラー。
+- `intelligence_runs` に 1 ラウンド 1 行(`run_type='joint_investigation'`、
+  新規に `IntelligenceRunType` と `shared/schemas/project_intelligence.schema.json`
+  へ追加)。読んだ抜粋は `intelligence_run_evidence` に全件記録する。
+- Finding は `origin_role='investigation'` / `decision_method='reasoning_llm'` /
+  そのラウンドの `intelligence_run_id` 付きで追記される。
+
+#### fail-closed
+
+mock / 非 reasoning モデル / git 失敗 / API 失敗 / 構造化出力検証失敗はすべて
+`stop_reason='failed'`。ラウンド 1 の失敗は Finding を 1 件も作らず、ラウンド N の
+失敗は**それまでに検証済みの Finding を残したまま**停止する。Finding が 0 件のまま
+`failed` になった呼び出しは 502(監査行は永続化済み)。
+
+#### DB ロック
+
+`run_investigation_loop` は index / runtime facts 用の接続を自分で開き、各ラウンドの
+LLM 呼び出し**前に**閉じる。ルートは read → reason → persist の 3 フェーズ。
+
+#### テスト
+
+`apps/control-server/tests/test_joint_understanding_investigation.py`:
+複数ラウンドと持ち越し、carry-over 指定での再開、`no_new_evidence` /
+`budget_exhausted` / `failed` の停止、mock・非 reasoning・LLM 例外・不正 JSON の
+fail-closed、ラウンド N 失敗時の Finding 保持、hypothesis 構造・引用剪定・
+根拠なし主張の破棄、pin された commit のみ読むこと(作業ツリー汚染後も不変)、
+API での監査行・Finding 永続化、再試行での leads 復元、open 以外での 409、System 分離。
+
+### Phase C: 通訳(目的・影響への翻訳)と選択肢提示(Issue #331)
+
+`app/understanding_translator.py` + `POST /joint-understanding/{ju_id}/translate`。
+
+#### 入力と絶対条件
+
+入力は**同一セッションに記録済みの investigation Finding だけ**(snapshot の
+抜粋は渡さない)。したがって通訳は新しい技術的事実を作れない。出力の各文は
+`supports_finding_ids` を必須とし、渡していない id を 1 つでも参照したら
+**呼び出し全体を fail-closed**(部分保存しない)。
+
+#### 説明の層(`STATEMENT_LAYERS`)
+
+`purpose` / `impact` / `gap` / `consistency` / `decision`。第 1 層(purpose /
+impact)の主語は目的・利用者・観測可能な振る舞いであり、内部変数・関数・API・
+列名ではない。内部名称は隠蔽せず、Finding → evidence の層で必ず開示される
+(Epic #328 の説明の原則)。
+
+#### 通訳が主張できる種類(`TRANSLATION_CLAIM_KINDS`)
+
+`inference` / `unknown` / `conflict` のみ。`fact` と `hypothesis` は不可 —
+新しい事実の断定も、競合説明・反証条件を伴う新仮説の提示も investigation の
+責務であり、通訳が肩代わりしない。`hypothesis` / `unknown` の Finding を
+確定事項へ格上げすることも禁止(プロンプト規則 + 検証)。
+
+#### 追跡性の永続化
+
+翻訳文は `origin_role='translation'` の Finding として追記される(evidence を
+持てず `supports_finding_ids` 必須 = Phase A 契約)。要約・選択肢・未解決点・
+判断質問は `joint_understanding_translation` 行に入り、`statements_json` の
+各要素が対応する translation Finding の `finding_id` を保持する。
+これにより「一般化した説明 → Finding → evidence(path:行)」が常に辿れる。
+
+#### 選択肢メニューは決定的
+
+`build_action_menu()` は `ACTION_KINDS` の順に、`interview_language` の固定
+カタログ(`joint_action_<kind>_label` / `_effect`)から「何が変わるか」を組み立てる。
+モデル出力ではないので、同じ状態なら常に同じメニューになる。
+`adopt_hypothesis` の説明文は「暫定であり事実にならない」ことを明示する。
+
+#### 質問ゲート(`ask_developer`)
+
+「人間にしか決められないと分類した直後、判断材料を示さずユーザーへ返す流れ」
+(Epic #328 が置き換える対象)を防ぐ決定的ゲート。
+
+- `decision_question` が無ければ聞かない
+- `decision` 層の文があれば聞く
+- 判断材料が無く、まだ調べられること(`open_unknowns`)が残っているなら**聞かない**
+  — それは追加調査の理由であって質問の理由ではない
+
+`ask_developer=false` のとき `decision_question` は永続化されない。
+
+#### 監査と fail-closed
+
+`intelligence_runs`(`run_type='joint_translation'`)を成功・失敗とも 1 行記録。
+mock / 非 reasoning モデル / Finding 0 件 / LLM 例外 / 不正 JSON / 未知 id 参照 /
+未知 layer / 禁止 claim_kind はすべて 502 で、翻訳行も translation Finding も作らない。
+
+#### テスト
+
+`apps/control-server/tests/test_joint_understanding_translation.py`:
+参照検証(未知 id・参照なし・選択肢の未知 id)、禁止 claim_kind、未知 layer、
+fail-closed 一式、メニューの決定性と両言語、質問ゲートの 4 分岐、
+API での translation Finding 永続化と `finding_id` 対応、失敗時に監査行のみ、
+origin 行不変、open 以外 409、System 分離。

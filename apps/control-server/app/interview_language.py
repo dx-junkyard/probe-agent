@@ -160,6 +160,75 @@ INTERVIEW_MESSAGES: dict = {
             "policy settings."
         ),
     },
+    # Epic #328 Phase C (#331): the finite next-action menu of a Joint
+    # Understanding session. Two entries per app/joint_understanding.py's
+    # ACTION_KINDS -- the button label and, per Epic #328, what choosing it
+    # actually changes ("各選択肢が何を変えるか"). Fixed templates, never LLM
+    # output, so the menu is identical for identical state.
+    "joint_action_request_investigation_label": {
+        "ja": "さらに調査する",
+        "en": "Investigate further",
+    },
+    "joint_action_request_investigation_effect": {
+        "ja": "固定したスナップショットを追加で読み、不足していた証拠を埋めます。回答は確定しません。",
+        "en": "Reads more of the pinned snapshot to fill the missing evidence. Nothing is confirmed.",
+    },
+    "joint_action_explain_reasoning_label": {
+        "ja": "判断の理由を説明してもらう",
+        "en": "Explain the reasoning",
+    },
+    "joint_action_explain_reasoning_effect": {
+        "ja": "今わかっている事実と推論のつながりを、目的への意味として説明し直します。新しい事実は増えません。",
+        "en": "Re-explains how the known facts connect to your goal. No new facts are added.",
+    },
+    "joint_action_compare_options_label": {
+        "ja": "選択肢を比較する",
+        "en": "Compare the options",
+    },
+    "joint_action_compare_options_effect": {
+        "ja": "取りうる選択肢と、それぞれで何が変わるか・何を諦めるかを並べます。選ぶのはあなたです。",
+        "en": "Lays out the available options and what each changes or costs. You still choose.",
+    },
+    "joint_action_adopt_hypothesis_label": {
+        "ja": "仮説を暫定的に採用する",
+        "en": "Adopt the hypothesis provisionally",
+    },
+    "joint_action_adopt_hypothesis_effect": {
+        "ja": "仮説を「暫定」として記録します。事実にはならず、後で再検証の対象として残ります。",
+        "en": "Records the hypothesis as PROVISIONAL. It does not become a fact and stays subject to re-verification.",
+    },
+    "joint_action_revise_intent_label": {
+        "ja": "意図を修正する",
+        "en": "Revise the intent",
+    },
+    "joint_action_revise_intent_effect": {
+        "ja": "あなたの目的や期待の記述を見直します。実装上の事実は変わりません。",
+        "en": "Revisits your own goal or expectation. The implementation facts do not change.",
+    },
+    "joint_action_hold_label": {
+        "ja": "今は保留する",
+        "en": "Hold for now",
+    },
+    "joint_action_hold_effect": {
+        "ja": "この対話を中断し、いつでも再開できるようにします。元の確認項目は未回答のまま残ります。",
+        "en": "Pauses this conversation so it can resume later. The original item stays unanswered.",
+    },
+    "joint_action_handoff_label": {
+        "ja": "他の人に引き継ぐ",
+        "en": "Hand off to someone else",
+    },
+    "joint_action_handoff_effect": {
+        "ja": "判断できる人へ引き継ぎます。引き継ぎ先の回答があなたの回答として記録されることはありません。",
+        "en": "Hands the decision to someone who can make it. Their answer is never recorded as yours.",
+    },
+    "joint_action_decide_label": {
+        "ja": "判断を確定する",
+        "en": "Record the decision",
+    },
+    "joint_action_decide_effect": {
+        "ja": "この対話での判断を確定として記録します。元の確認項目の回答は、項目ごとの操作で別途行います。",
+        "en": "Records your decision for this conversation. Answering the original item is still a separate step.",
+    },
 }
 
 # Deterministic fallback language for the fixed-text messages above only,

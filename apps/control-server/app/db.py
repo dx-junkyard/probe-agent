@@ -2883,6 +2883,81 @@ CREATE TABLE IF NOT EXISTS joint_understanding_action (
 CREATE INDEX IF NOT EXISTS idx_joint_understanding_action_session
     ON joint_understanding_action (joint_understanding_id, id);
 
+-- One iterative investigation round (Epic #328 Phase B / Issue #330).
+-- Append-only audit of what a round actually did -- which candidates it
+-- picked, which files it read, which it left unread, why it stopped -- plus
+-- the state that must survive into the NEXT round and into a later RETRY:
+-- search_leads / open_hypotheses / missing_evidence / read_paths. Restoring
+-- those on retry is what keeps a re-run from starting over from the bare
+-- question (Epic #328: 調査の再試行で、既に得た調査方針や検索手がかりを失わない).
+-- stop_reason is only set on the round that ended the loop, and is one of
+-- the finite investigation_loop.STOP_REASONS.
+CREATE TABLE IF NOT EXISTS joint_understanding_investigation_round (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    joint_understanding_id  INTEGER NOT NULL,
+    system_id               INTEGER NOT NULL,
+    round_index             INTEGER NOT NULL,
+    status                  TEXT NOT NULL,
+    stop_reason             TEXT,
+    conclusion              TEXT NOT NULL DEFAULT '',
+    search_leads            TEXT NOT NULL DEFAULT '[]',
+    open_hypotheses         TEXT NOT NULL DEFAULT '[]',
+    missing_evidence        TEXT NOT NULL DEFAULT '[]',
+    read_paths              TEXT NOT NULL DEFAULT '[]',
+    unread_candidates       TEXT NOT NULL DEFAULT '[]',
+    pruned_findings         INTEGER NOT NULL DEFAULT 0,
+    files_read              INTEGER NOT NULL DEFAULT 0,
+    chars_read              INTEGER NOT NULL DEFAULT 0,
+    llm_calls               INTEGER NOT NULL DEFAULT 0,
+    elapsed_seconds         REAL NOT NULL DEFAULT 0,
+    intelligence_run_id     INTEGER,
+    error_details           TEXT,
+    created_at              REAL NOT NULL,
+    FOREIGN KEY (joint_understanding_id)
+        REFERENCES joint_understanding_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id)
+        REFERENCES intelligence_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_joint_understanding_round_session
+    ON joint_understanding_investigation_round (joint_understanding_id, id);
+
+-- One translation pass (Epic #328 Phase C / Issue #331): the investigation's
+-- findings restated in terms of purpose, user impact, the gap against that
+-- purpose, system-wide consistency, and which decision changes what.
+--
+-- The translated SENTENCES are also stored as ordinary
+-- joint_understanding_finding rows with origin_role='translation' (that is
+-- the append-only spine, and it is what carries supports_finding_ids), so
+-- this table holds the parts that are not a single statement: the summary,
+-- the option comparison, what is still unknown, and whether the pass
+-- concluded that a question actually has to go to the developer.
+-- statements_json therefore stores each statement's translation finding id,
+-- never a second copy of the sentence's provenance.
+CREATE TABLE IF NOT EXISTS joint_understanding_translation (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    joint_understanding_id  INTEGER NOT NULL,
+    system_id               INTEGER NOT NULL,
+    purpose_summary         TEXT NOT NULL DEFAULT '',
+    statements_json         TEXT NOT NULL DEFAULT '[]',
+    options_json            TEXT NOT NULL DEFAULT '[]',
+    open_unknowns           TEXT NOT NULL DEFAULT '[]',
+    decision_question       TEXT,
+    ask_developer           INTEGER NOT NULL DEFAULT 0,
+    intelligence_run_id     INTEGER,
+    is_mock                 INTEGER NOT NULL DEFAULT 0,
+    created_at              REAL NOT NULL,
+    FOREIGN KEY (joint_understanding_id)
+        REFERENCES joint_understanding_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id)
+        REFERENCES intelligence_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_joint_understanding_translation_session
+    ON joint_understanding_translation (joint_understanding_id, id);
+
 -- Alignment Review / Review Queue (Issue #287). Contrasts confirmed/proposed
 -- Intent Brief items (interview_intent_item, Issue #284) against the
 -- evidence-backed Current System understanding (the latest

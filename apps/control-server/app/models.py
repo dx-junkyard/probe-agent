@@ -3543,6 +3543,15 @@ class JointUnderstandingDetailOut(BaseModel):
     session: JointUnderstandingOut
     findings: List[JointUnderstandingFindingOut] = Field(default_factory=list)
     actions: List[JointUnderstandingActionOut] = Field(default_factory=list)
+    # Issue #330: the per-round investigation audit (what each round read,
+    # what it left unread, why the loop stopped). Forward-referenced because
+    # the Phase B models are defined below; resolved by the model_rebuild()
+    # call at the end of that block.
+    investigation_rounds: List["JointUnderstandingRoundOut"] = Field(default_factory=list)
+    # Issue #331: every translation pass, oldest first. The translated
+    # sentences themselves are also in `findings` as origin_role='translation'
+    # rows; this carries the summary/options/unknowns around them.
+    translations: List["JointUnderstandingTranslationOut"] = Field(default_factory=list)
     # The finite next-action menu for the session's current status,
     # deterministically ordered (empty once closed/held).
     available_actions: List[JointUnderstandingActionKind] = Field(default_factory=list)
@@ -3574,6 +3583,138 @@ class JointUnderstandingHoldRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reason: Optional[str] = Field(default=None, max_length=500)
+
+
+# --- Iterative investigation (Epic #328 Phase B / Issue #330) -----------------
+
+JointUnderstandingStopReason = Literal[
+    "answered", "budget_exhausted", "no_new_evidence", "unresolved", "failed",
+]
+JointUnderstandingRoundStatus = Literal["completed", "unresolved", "failed"]
+
+
+class JointUnderstandingRoundOut(BaseModel):
+    """Audit of one investigation round: what it read, what it left, why."""
+
+    id: int
+    joint_understanding_id: int
+    system_id: int
+    round_index: int
+    status: JointUnderstandingRoundStatus
+    # Only the round that ended the loop carries a stop reason.
+    stop_reason: Optional[JointUnderstandingStopReason] = None
+    conclusion: str = ""
+    # The state carried into the next round and restored on a retry.
+    search_leads: List[str] = Field(default_factory=list)
+    open_hypotheses: List[str] = Field(default_factory=list)
+    missing_evidence: List[str] = Field(default_factory=list)
+    read_paths: List[str] = Field(default_factory=list)
+    # Candidates this round selected but could not read within budget --
+    # "not looked at" stays distinguishable from "not there".
+    unread_candidates: List[str] = Field(default_factory=list)
+    pruned_findings: int = 0
+    files_read: int = 0
+    chars_read: int = 0
+    llm_calls: int = 0
+    elapsed_seconds: float = 0.0
+    intelligence_run_id: Optional[int] = None
+    error_details: Optional[str] = None
+    created_at: float
+
+
+class JointUnderstandingInvestigateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Optional narrowing hints; both only affect deterministic candidate
+    # retrieval, never the conclusion.
+    research_focus: Optional[str] = Field(default=None, max_length=1_000)
+    search_keywords: Optional[List[str]] = Field(default=None, max_length=20)
+    max_rounds: Optional[int] = Field(default=None, ge=1, le=5)
+
+
+class JointUnderstandingInvestigateOut(BaseModel):
+    joint_understanding_id: int
+    system_id: int
+    stop_reason: JointUnderstandingStopReason
+    rounds: List[JointUnderstandingRoundOut] = Field(default_factory=list)
+    # The findings this call appended (origin_role='investigation').
+    findings: List[JointUnderstandingFindingOut] = Field(default_factory=list)
+    error: Optional[str] = None
+
+
+
+# --- Translation (Epic #328 Phase C / Issue #331) -----------------------------
+
+JointUnderstandingStatementLayer = Literal[
+    "purpose", "impact", "gap", "consistency", "decision"
+]
+
+
+class JointUnderstandingStatementOut(BaseModel):
+    """One translated sentence plus the traceability it must never lose."""
+
+    layer: JointUnderstandingStatementLayer
+    claim_kind: JointUnderstandingClaimKind
+    text: str
+    # The investigation findings this sentence was derived from, and the
+    # translation finding row that persists it. Both are always present:
+    # a generalized explanation must always resolve back to the technical
+    # claim and its evidence.
+    supports_finding_ids: List[int] = Field(default_factory=list)
+    finding_id: int
+
+
+class JointUnderstandingOptionOut(BaseModel):
+    label: str
+    what_changes: str
+    tradeoffs: str = ""
+    supports_finding_ids: List[int] = Field(default_factory=list)
+
+
+class JointUnderstandingActionMenuEntryOut(BaseModel):
+    """A finite next action plus what choosing it actually changes.
+
+    Assembled deterministically from the fixed server catalog -- never
+    generated text, and identical for identical session state.
+    """
+
+    action_kind: JointUnderstandingActionKind
+    label: str
+    what_changes: str
+
+
+class JointUnderstandingTranslationOut(BaseModel):
+    id: int
+    joint_understanding_id: int
+    system_id: int
+    purpose_summary: str
+    statements: List[JointUnderstandingStatementOut] = Field(default_factory=list)
+    options: List[JointUnderstandingOptionOut] = Field(default_factory=list)
+    open_unknowns: List[str] = Field(default_factory=list)
+    decision_question: Optional[str] = None
+    # Deterministic gate: true only when the remaining question really is a
+    # value judgement AND the developer has material to decide with.
+    ask_developer: bool = False
+    intelligence_run_id: Optional[int] = None
+    is_mock: bool = False
+    created_at: float
+
+
+class JointUnderstandingTranslateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Optional context about the developer's own goal. Never invented by the
+    # server and never recorded as a developer finding.
+    goal_hint: Optional[str] = Field(default=None, max_length=2_000)
+
+
+class JointUnderstandingTranslateOut(BaseModel):
+    translation: JointUnderstandingTranslationOut
+    # The finite next-action menu that accompanies the explanation.
+    action_menu: List[JointUnderstandingActionMenuEntryOut] = Field(default_factory=list)
+
+
+JointUnderstandingDetailOut.model_rebuild()
 
 
 # --- Alignment Review / Review Queue (Issue #287) -----------------------------
