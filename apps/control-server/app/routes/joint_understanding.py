@@ -63,8 +63,11 @@ from ..joint_understanding import (
     SCHEMA_VERSION,
     JointUnderstandingValidationError,
     available_action_kinds,
+    can_reflux,
     outcome_is_provisional,
+    reflux_target_kind,
     validate_finding,
+    validate_outcome_basis,
     validate_transition,
 )
 from ..investigation_loop import (
@@ -91,6 +94,8 @@ from ..models import (
     JointUnderstandingListOut,
     JointUnderstandingOptionOut,
     JointUnderstandingOut,
+    JointUnderstandingRefluxOut,
+    JointUnderstandingRefluxResultOut,
     JointUnderstandingRoundOut,
     JointUnderstandingRuntimeEvidenceOut,
     JointUnderstandingStatementOut,
@@ -160,7 +165,36 @@ def _require_origin_exists(
         )
 
 
-def _session_out(row) -> JointUnderstandingOut:
+def _column(row, name: str):
+    """Value of an optional (additively migrated) column, else None."""
+    return row[name] if name in row.keys() else None
+
+
+def _premise_state(conn, ju_row) -> str:
+    """Whether the premise this session was investigated against still holds.
+
+    Deterministic and structural (Principle 6): the session pinned a snapshot
+    at creation; if its interview session has since moved to a different one,
+    every finding here was established against a premise that is no longer
+    current. That is 'stale', and Phase D refuses to turn a stale
+    investigation into an adoption or a decision -- the same rule Issue #308
+    applies to an Inquiry, evaluated at close/reflux time instead of at
+    rebuild time. A session with no pinned snapshot is treated as fresh:
+    nothing was pinned, so nothing can have moved out from under it.
+    """
+    pinned = ju_row["premise_snapshot_id"]
+    if pinned is None:
+        return "fresh"
+    current = conn.execute(
+        "SELECT snapshot_id FROM interview_session WHERE id = ? AND system_id = ?",
+        (ju_row["session_id"], ju_row["system_id"]),
+    ).fetchone()
+    if current is None:
+        return "fresh"
+    return "fresh" if current["snapshot_id"] == pinned else "stale"
+
+
+def _session_out(row, premise_state: str = "fresh") -> JointUnderstandingOut:
     return JointUnderstandingOut(
         id=row["id"],
         session_id=row["session_id"],
@@ -173,6 +207,9 @@ def _session_out(row) -> JointUnderstandingOut:
         outcome=row["outcome"],
         outcome_is_provisional=outcome_is_provisional(row["outcome"]),
         outcome_reason=row["outcome_reason"],
+        outcome_finding_ids=json.loads(_column(row, "outcome_finding_ids") or "[]"),
+        outcome_premise_state=_column(row, "outcome_premise_state"),
+        premise_state=premise_state,
         premise_snapshot_id=row["premise_snapshot_id"],
         schema_version=row["schema_version"],
         created_at=row["created_at"],
@@ -244,12 +281,18 @@ def _detail(conn, ju_row) -> JointUnderstandingDetailOut:
         "WHERE joint_understanding_id = ? ORDER BY id",
         (ju_id,),
     ).fetchall()
+    reflux_rows = conn.execute(
+        "SELECT * FROM joint_understanding_reflux "
+        "WHERE joint_understanding_id = ? ORDER BY id",
+        (ju_id,),
+    ).fetchall()
     return JointUnderstandingDetailOut(
-        session=_session_out(ju_row),
+        session=_session_out(ju_row, _premise_state(conn, ju_row)),
         findings=[_finding_out(f) for f in findings],
         actions=[_action_out(a) for a in actions],
         investigation_rounds=[_round_out(r) for r in rounds],
         translations=[_translation_out(t) for t in translations],
+        reflux=[_reflux_out(r) for r in reflux_rows],
         available_actions=available_action_kinds(ju_row["status"]),
     )
 
@@ -346,7 +389,7 @@ def list_joint_understanding(
         ).fetchall()
         return JointUnderstandingListOut(
             session_id=session_id, system_id=system_id,
-            items=[_session_out(r) for r in rows],
+            items=[_session_out(r, _premise_state(conn, r)) for r in rows],
         )
 
 
@@ -1131,6 +1174,187 @@ def record_action(
         return _detail(conn, row)
 
 
+# --- Reflux into the understanding surface (Phase D / #332) --------------------
+
+
+def _reflux_out(row) -> JointUnderstandingRefluxOut:
+    return JointUnderstandingRefluxOut(
+        id=row["id"],
+        joint_understanding_id=row["joint_understanding_id"],
+        system_id=row["system_id"],
+        finding_id=row["finding_id"],
+        target_kind=row["target_kind"],
+        target_id=row["target_id"],
+        statement=row["statement"],
+        evidence=[
+            JointUnderstandingEvidenceOut(**e) for e in json.loads(row["evidence_json"])
+        ],
+        decision_method="reasoning_llm",
+        intelligence_run_id=row["intelligence_run_id"],
+        premise_snapshot_id=row["premise_snapshot_id"],
+        created_at=row["created_at"],
+    )
+
+
+def _write_qa_investigation(conn, *, qa_id: int, system_id: int, rows) -> None:
+    """Attach refluxed facts to interview_qa's investigation slot.
+
+    This is the same non-answer slot Issue #286's route-and-investigate
+    writes: ``investigation_json`` / ``investigation_run_id`` only. It never
+    touches ``answer_text``, ``status``, or ``answered_by`` -- the whole point
+    of Phase D is that a system-verified fact reaches the understanding
+    surface WITHOUT being converted into a human answer first.
+    """
+    payload = {
+        "status": "completed",
+        "source": "joint_understanding",
+        "conclusion": rows[0]["statement"],
+        "key_points": [r["statement"] for r in rows],
+        "evidence": [e for r in rows for e in json.loads(r["evidence_json"])],
+        "uncertainty": "",
+        "confidence": "confirmed",
+        "decision_question": None,
+    }
+    conn.execute(
+        "UPDATE interview_qa SET investigation_json = ?, investigation_run_id = ? "
+        "WHERE id = ? AND system_id = ?",
+        (
+            json.dumps(payload, ensure_ascii=False),
+            rows[-1]["intelligence_run_id"],
+            qa_id, system_id,
+        ),
+    )
+
+
+@router.post(
+    "/joint-understanding/{ju_id}/reflux",
+    response_model=JointUnderstandingRefluxResultOut,
+    status_code=201,
+)
+def reflux_joint_understanding(
+    ju_id: int,
+    system_id: int = Depends(get_system_id),
+) -> JointUnderstandingRefluxResultOut:
+    """Attach this session's system-verified facts to the understanding surface.
+
+    Epic #328 replaces the flow where an investigation result only reached
+    System Understanding if a human retyped it into an answer field. This
+    endpoint does that attachment directly, and specifically NOT as a human
+    answer:
+
+    - only ``origin_role='investigation'`` findings whose ``claim_kind`` is
+      ``fact`` reflux. An inference, hypothesis, unknown or conflict stays
+      inside the conversation -- confidence alone never promotes a hypothesis.
+    - every reflux row records ``decision_method='reasoning_llm'``; it is
+      never ``manual``, because nobody decided anything here.
+    - for a ``qa`` origin the facts also land in ``interview_qa``'s existing
+      investigation slot (``investigation_json``/``investigation_run_id``),
+      never in ``answer_text``/``status``. Other origins have no such
+      non-answer slot -- their built rows are owned by the Alignment /
+      Understanding rebuild -- so the ledger row IS the attachment rather
+      than a write that a rebuild would silently discard.
+    - a ``stale`` premise (the interview session moved to a newer snapshot
+      than this session pinned) refuses the whole call: an old investigation
+      must not be attached as current understanding.
+
+    Repeating the call is idempotent per finding: already-attached facts are
+    counted, not duplicated.
+
+    probe-agent:
+      role: API boundary that attaches system-verified facts to the
+        understanding surface without recording them as a human answer
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: io
+      state_effects: [database-read, database-write]
+      probe_value: Verify reflux never writes answer_text/status/user_decision, that only investigation facts reflux, that decision_method is never manual, that a stale premise refuses the call, and that repeating it does not duplicate rows.
+    """
+    now = time.time()
+    with get_conn() as conn:
+        ju = _get_or_404(conn, ju_id, system_id)
+        premise_state = _premise_state(conn, ju)
+        if premise_state == "stale":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "joint_understanding_premise_stale",
+                    "message": (
+                        "The premise this session was investigated against has "
+                        "changed; re-investigate before attaching its facts"
+                    ),
+                },
+            )
+        target_kind = reflux_target_kind(ju["origin_kind"])
+        findings = conn.execute(
+            "SELECT * FROM joint_understanding_finding "
+            "WHERE joint_understanding_id = ? ORDER BY id",
+            (ju_id,),
+        ).fetchall()
+        existing = {
+            r["finding_id"]
+            for r in conn.execute(
+                "SELECT finding_id FROM joint_understanding_reflux "
+                "WHERE joint_understanding_id = ?",
+                (ju_id,),
+            ).fetchall()
+        }
+        # A finding that has been corrected (superseded by a later one) is
+        # not attached: the correction chain, not the original, is current.
+        superseded = {
+            r["supersedes_finding_id"]
+            for r in findings
+            if r["supersedes_finding_id"] is not None
+        }
+
+        skipped_not_fact = 0
+        new_ids: List[int] = []
+        for finding in findings:
+            if not can_reflux(finding["origin_role"], finding["claim_kind"]):
+                skipped_not_fact += 1
+                continue
+            if finding["id"] in existing or finding["id"] in superseded:
+                continue
+            cur = conn.execute(
+                """INSERT INTO joint_understanding_reflux
+                    (joint_understanding_id, system_id, finding_id, target_kind,
+                     target_id, statement, evidence_json, decision_method,
+                     intelligence_run_id, premise_snapshot_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'reasoning_llm', ?, ?, ?)""",
+                (
+                    ju_id, system_id, finding["id"], target_kind,
+                    ju["origin_id"] if target_kind == "qa_investigation" else None,
+                    finding["statement"], finding["evidence_json"],
+                    finding["intelligence_run_id"], ju["premise_snapshot_id"], now,
+                ),
+            )
+            new_ids.append(cur.lastrowid)
+
+        rows = [
+            conn.execute(
+                "SELECT * FROM joint_understanding_reflux WHERE id = ?", (rid,),
+            ).fetchone()
+            for rid in new_ids
+        ]
+        if rows and target_kind == "qa_investigation":
+            _write_qa_investigation(
+                conn, qa_id=ju["origin_id"], system_id=system_id, rows=rows,
+            )
+        conn.execute(
+            "UPDATE joint_understanding_session SET updated_at = ? WHERE id = ?",
+            (now, ju_id),
+        )
+        return JointUnderstandingRefluxResultOut(
+            joint_understanding_id=ju_id,
+            system_id=system_id,
+            target_kind=target_kind,
+            premise_state=premise_state,
+            refluxed=[_reflux_out(r) for r in rows],
+            already_refluxed=len(existing),
+            skipped_not_fact=skipped_not_fact,
+        )
+
+
 # --- Status transitions --------------------------------------------------------
 
 
@@ -1164,7 +1388,7 @@ def hold_joint_understanding(
         row = conn.execute(
             "SELECT * FROM joint_understanding_session WHERE id = ?", (ju_id,),
         ).fetchone()
-        return _session_out(row)
+        return _session_out(row, _premise_state(conn, row))
 
 
 @router.post("/joint-understanding/{ju_id}/resume", response_model=JointUnderstandingOut)
@@ -1182,7 +1406,7 @@ def resume_joint_understanding(
         row = conn.execute(
             "SELECT * FROM joint_understanding_session WHERE id = ?", (ju_id,),
         ).fetchone()
-        return _session_out(row)
+        return _session_out(row, _premise_state(conn, row))
 
 
 @router.post("/joint-understanding/{ju_id}/close", response_model=JointUnderstandingOut)
@@ -1208,14 +1432,42 @@ def close_joint_understanding(
     with get_conn() as conn:
         ju = _get_or_404(conn, ju_id, system_id)
         _transition(conn, ju, "closed", now)
+        premise_state = _premise_state(conn, ju)
+        known_ids = {
+            r["id"]
+            for r in conn.execute(
+                "SELECT id FROM joint_understanding_finding WHERE joint_understanding_id = ?",
+                (ju_id,),
+            ).fetchall()
+        }
+        try:
+            validate_outcome_basis(
+                outcome=payload.outcome,
+                outcome_finding_ids=payload.outcome_finding_ids,
+                known_finding_ids=known_ids,
+                premise_state=premise_state,
+            )
+        except JointUnderstandingValidationError as exc:
+            # A stale premise is a state conflict (409); a missing or
+            # unresolvable basis is a malformed request (422).
+            status_code = 409 if premise_state == "stale" else 422
+            raise HTTPException(
+                status_code=status_code,
+                detail={"code": "joint_understanding_outcome_rejected", "message": str(exc)},
+            )
         conn.execute(
             """UPDATE joint_understanding_session
                SET status = 'closed', outcome = ?, outcome_reason = ?,
+                   outcome_finding_ids = ?, outcome_premise_state = ?,
                    updated_at = ?, closed_at = ?
                WHERE id = ?""",
-            (payload.outcome, payload.outcome_reason, now, now, ju_id),
+            (
+                payload.outcome, payload.outcome_reason,
+                json.dumps(list(payload.outcome_finding_ids)), premise_state,
+                now, now, ju_id,
+            ),
         )
         row = conn.execute(
             "SELECT * FROM joint_understanding_session WHERE id = ?", (ju_id,),
         ).fetchone()
-        return _session_out(row)
+        return _session_out(row, _premise_state(conn, row))

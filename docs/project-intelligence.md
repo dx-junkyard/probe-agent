@@ -4934,3 +4934,67 @@ mock / 非 reasoning モデル / Finding 0 件 / LLM 例外 / 不正 JSON / 未�
 fail-closed 一式、メニューの決定性と両言語、質問ゲートの 4 分岐、
 API での translation Finding 永続化と `finding_id` 対応、失敗時に監査行のみ、
 origin 行不変、open 以外 409、System 分離。
+
+### Phase D: システム理解への還流と確定状態の分離(Issue #332)
+
+#### 還流(reflux)— 回答へ転記しなくても理解へ反映する
+
+`POST /joint-understanding/{ju_id}/reflux`。Epic #328 が置き換える
+「調査結果を回答欄へ転記しないと理解へ反映されない流れ」の代替経路。
+
+- 還流対象は `origin_role='investigation'` かつ `claim_kind='fact'` のみ
+  (`REFLUXABLE_CLAIM_KINDS`)。inference / hypothesis / unknown / conflict は
+  会話内に留まる — confidence だけで仮説を事実へ昇格させない。
+- 訂正済み(後続 Finding に `supersedes_finding_id` で置き換えられた)Finding は
+  還流しない。
+- `decision_method` は常に `reasoning_llm`。**`manual` にはならない**
+  (誰も決定していない = 人間の回答ではない)。
+- 反映先(`REFLUX_TARGET_KINDS`、既存構造のみ):
+  - `qa_investigation`: `interview_qa.investigation_json` /
+    `investigation_run_id`。#286 の route-and-investigate が書くのと同じ
+    **回答ではないスロット**。`answer_text` / `status` / `answered_by` は書かない。
+  - `session_ledger`: intent / review_item / inquiry 由来。これらの行は
+    Alignment / Understanding の再ビルドが所有しており、事実を書き込んでも
+    次のビルドで黙って消えるため、台帳行そのものを反映先とする
+    (第三の理解モデルを新設しない、という制約の下での明示的な設計判断)。
+- 同じ Finding は二重に還流しない(`UNIQUE (joint_understanding_id, finding_id)`、
+  再呼び出しは `already_refluxed` に計上)。
+- policy / 実行系(`components` の mode、experiments、probe_plans、publish_jobs)には
+  一切触れない。理解の更新と実行権限は別(Principle 7)。
+
+#### 前提整合性(premise state)
+
+`_premise_state()` は決定的・構造的判定:セッション作成時に固定した
+`premise_snapshot_id` と、現在の interview session の `snapshot_id` が異なれば
+`stale`。`stale` のとき
+
+- 還流は 409(古い調査結果を現在の理解として貼らない)
+- `hypothesis_adopted` / `decided` での close は 409
+- 何も断定しない outcome(`understood` / `doubt_resolved` / `handed_off` /
+  `abandoned`)は許可し、`outcome_premise_state='stale'` として記録する
+
+#### 確定状態の分離(`validate_outcome_basis`)
+
+`OUTCOMES_REQUIRING_BASIS = ("hypothesis_adopted", "decided")` は
+`outcome_finding_ids`(同一セッションの Finding)を必須にする。根拠を示せない
+採用・決定は監査できないため 422。`hypothesis_adopted` は
+`outcome_is_provisional=true` を返し続け、事実として還流されることもない
+(仮説は還流対象外)。
+
+追加列(additive、既存 DB は `_add_column_if_missing` / ALTER で追従):
+`joint_understanding_session.outcome_finding_ids` / `outcome_premise_state`。
+新規テーブルは `joint_understanding_reflux` のみ。
+
+#### 既存フローとの関係
+
+Phase D は Inquiry(#285)/ Review Queue(#287)を置き換えず、origin 行への
+書き込みも増やさない。共同理解セッションが書くのは、既存の「回答ではない」
+調査スロットと自身の台帳だけである。
+
+#### テスト
+
+`apps/control-server/tests/test_joint_understanding_reflux.py`:
+還流可否の有限規則、反映先の決定性、outcome basis 規則(不足・他セッション・
+stale)、QA 調査スロットへの反映と回答欄不変、fact 以外の非還流、superseded の
+除外、冪等性、非 QA 由来の台帳のみ反映、stale 前提での 409、4 つの終端状態の
+区別と根拠記録、暫定採用が還流されないこと、policy / 実行系テーブル不変、System 分離。

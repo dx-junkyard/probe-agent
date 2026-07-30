@@ -462,7 +462,11 @@ def test_full_lifecycle_never_touches_the_origin_row(admin_client):
 
     closed = admin_client.post(
         f"/joint-understanding/{ju_id}/close",
-        json={"outcome": "decided", "outcome_reason": "リトライ回数は現状維持"},
+        json={
+            "outcome": "decided", "outcome_reason": "リトライ回数は現状維持",
+            # Issue #332: a decision must name the findings it rests on.
+            "outcome_finding_ids": [finding_id],
+        },
         headers=headers,
     )
     assert closed.status_code == 200, closed.text
@@ -481,9 +485,23 @@ def test_hypothesis_adopted_outcome_is_marked_provisional(admin_client):
     qa = _create_qa(admin_client, headers, session_id)
     ju_id = _open_session(admin_client, headers, session_id, "qa", qa["id"]).json()["session"]["id"]
 
+    hypothesis = admin_client.post(
+        f"/joint-understanding/{ju_id}/findings",
+        json={
+            "origin_role": "developer", "claim_kind": "hypothesis",
+            "statement": "設定由来だと思う", "decision_method": "manual",
+        },
+        headers=headers,
+    )
+    assert hypothesis.status_code == 201, hypothesis.text
+
     r = admin_client.post(
         f"/joint-understanding/{ju_id}/close",
-        json={"outcome": "hypothesis_adopted"}, headers=headers,
+        json={
+            "outcome": "hypothesis_adopted",
+            "outcome_finding_ids": [hypothesis.json()["id"]],
+        },
+        headers=headers,
     )
     assert r.status_code == 200, r.text
     assert r.json()["outcome_is_provisional"] is True

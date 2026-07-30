@@ -2803,6 +2803,13 @@ CREATE TABLE IF NOT EXISTS joint_understanding_session (
     status              TEXT NOT NULL DEFAULT 'open',
     outcome             TEXT,
     outcome_reason      TEXT,
+    -- Issue #332: which findings the recorded outcome rests on, and the
+    -- premise state evaluated at close time ('fresh' | 'stale'). An outcome
+    -- that adopts a hypothesis or records a decision must name its basis;
+    -- a stale premise (the interview session moved to a newer snapshot than
+    -- the one this session pinned) blocks adopt/decide entirely.
+    outcome_finding_ids TEXT NOT NULL DEFAULT '[]',
+    outcome_premise_state TEXT,
     -- The snapshot this session's investigation is pinned to, captured at
     -- creation (same discipline as an Inquiry's premise bundle, Issue #308)
     -- so a later round is never silently rebased onto a newer snapshot.
@@ -2957,6 +2964,55 @@ CREATE TABLE IF NOT EXISTS joint_understanding_translation (
 
 CREATE INDEX IF NOT EXISTS idx_joint_understanding_translation_session
     ON joint_understanding_translation (joint_understanding_id, id);
+
+-- Reflux of system-verified facts into the understanding surface
+-- (Epic #328 Phase D / Issue #332).
+--
+-- The flow this replaces: an investigation result only reached System
+-- Understanding if a HUMAN retyped it into an answer field. A reflux row
+-- records that an investigation finding (origin_role='investigation',
+-- claim_kind='fact') has been attached to the understanding surface WITH its
+-- evidence and WITHOUT being recorded as anyone's answer:
+-- decision_method is always 'reasoning_llm' here, never 'manual', and
+-- nothing in this path writes interview_qa.answer_text/status,
+-- interview_intent_item.value_text/status, or alignment_item.user_decision.
+--
+-- target_kind is a finite set of EXISTING structures (no third understanding
+-- model is introduced):
+--   'qa_investigation'  -- interview_qa.investigation_json/_run_id, the same
+--                          slot Issue #286's route-and-investigate writes and
+--                          which is by construction not the answer
+--   'session_ledger'    -- this table alone, for origins with no such slot
+--                          (intent / review_item / inquiry). Their built rows
+--                          are owned by the Alignment/Understanding rebuild,
+--                          so writing a fact into them would be silently
+--                          overwritten -- the ledger keeps the fact readable
+--                          and attributable instead.
+CREATE TABLE IF NOT EXISTS joint_understanding_reflux (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    joint_understanding_id  INTEGER NOT NULL,
+    system_id               INTEGER NOT NULL,
+    finding_id              INTEGER NOT NULL,
+    target_kind             TEXT NOT NULL,
+    target_id               INTEGER,
+    statement               TEXT NOT NULL,
+    evidence_json           TEXT NOT NULL DEFAULT '[]',
+    decision_method         TEXT NOT NULL DEFAULT 'reasoning_llm',
+    intelligence_run_id     INTEGER,
+    premise_snapshot_id     INTEGER,
+    created_at              REAL NOT NULL,
+    UNIQUE (joint_understanding_id, finding_id),
+    FOREIGN KEY (joint_understanding_id)
+        REFERENCES joint_understanding_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (finding_id)
+        REFERENCES joint_understanding_finding (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id)
+        REFERENCES intelligence_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_joint_understanding_reflux_session
+    ON joint_understanding_reflux (joint_understanding_id, id);
 
 -- Alignment Review / Review Queue (Issue #287). Contrasts confirmed/proposed
 -- Intent Brief items (interview_intent_item, Issue #284) against the
@@ -4832,6 +4888,20 @@ def init_db() -> None:
         # investigates a system_researchable/hybrid question -- a failed
         # investigation leaves them NULL (audit-only failed run), and
         # human_only questions never get one at all.
+        # Issue #332: a database created at Issue #329 has the Joint
+        # Understanding tables without the outcome-basis columns. Added
+        # additively here (NULL/absent on existing rows is correct: those
+        # sessions closed before an outcome basis was recorded).
+        ju_cols = _columns(conn, "joint_understanding_session")
+        if ju_cols and "outcome_finding_ids" not in ju_cols:
+            conn.execute(
+                "ALTER TABLE joint_understanding_session "
+                "ADD COLUMN outcome_finding_ids TEXT NOT NULL DEFAULT '[]'"
+            )
+        _add_column_if_missing(
+            conn, "joint_understanding_session", ju_cols,
+            "outcome_premise_state", "TEXT",
+        )
         qa_cols = _columns(conn, "interview_qa")
         if qa_cols and "investigation_run_id" not in qa_cols:
             conn.execute(

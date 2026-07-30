@@ -238,6 +238,76 @@ def validate_finding(
         )
 
 
+# --- Reflux and outcome basis (Phase D / #332) --------------------------------
+
+# Where a system-verified fact may be attached. Both are EXISTING structures
+# (Epic #328 forbids a third understanding model):
+#   qa_investigation -- interview_qa.investigation_json, the same non-answer
+#                       slot Issue #286's route-and-investigate uses
+#   session_ledger   -- the reflux table itself, for origins whose built rows
+#                       are owned by the Alignment/Understanding rebuild
+REFLUX_TARGET_KINDS = ("qa_investigation", "session_ledger")
+
+# Only a system-established fact refluxes. An inference/hypothesis/unknown/
+# conflict stays inside the conversation: promoting those would be exactly
+# the "confidence alone turns a hypothesis into a fact" move the design
+# principles forbid.
+REFLUXABLE_CLAIM_KINDS = ("fact",)
+
+# Outcomes that assert something forward-looking and therefore need both a
+# named basis and a still-valid premise.
+OUTCOMES_REQUIRING_BASIS = ("hypothesis_adopted", "decided")
+
+# Finite premise verdicts evaluated at close/reflux time.
+PREMISE_STATES = ("fresh", "stale")
+
+
+def can_reflux(origin_role: str, claim_kind: str) -> bool:
+    """Whether a finding may be attached to the understanding surface."""
+    return origin_role == "investigation" and claim_kind in REFLUXABLE_CLAIM_KINDS
+
+
+def reflux_target_kind(origin_kind: str) -> str:
+    """The existing structure a session's facts attach to (deterministic)."""
+    return "qa_investigation" if origin_kind == "qa" else "session_ledger"
+
+
+def validate_outcome_basis(
+    *,
+    outcome: str,
+    outcome_finding_ids: Sequence[int],
+    known_finding_ids: Iterable[int],
+    premise_state: str,
+) -> None:
+    """Guard the two outcomes that assert something beyond "we talked".
+
+    ``hypothesis_adopted`` and ``decided`` must name the findings they rest
+    on, and those findings must belong to this session. Both are refused
+    outright on a ``stale`` premise: an answer given against a premise that
+    no longer exists must not become a current decision (the same rule
+    Issue #308 applies to an Inquiry, evaluated here at close time).
+    """
+    _require_member(outcome, SESSION_OUTCOMES, "outcome")
+    _require_member(premise_state, PREMISE_STATES, "premise_state")
+    if outcome not in OUTCOMES_REQUIRING_BASIS:
+        return
+    if premise_state == "stale":
+        raise JointUnderstandingValidationError(
+            f"Cannot record outcome '{outcome}': the premise this session was "
+            "investigated against has changed; re-investigate first"
+        )
+    if not outcome_finding_ids:
+        raise JointUnderstandingValidationError(
+            f"Outcome '{outcome}' must name the findings it rests on"
+        )
+    known = set(known_finding_ids)
+    unknown = [fid for fid in outcome_finding_ids if fid not in known]
+    if unknown:
+        raise JointUnderstandingValidationError(
+            f"outcome_finding_ids reference findings outside this session: {unknown}"
+        )
+
+
 def available_action_kinds(status: str) -> List[str]:
     """The finite action menu for a session in ``status``.
 

@@ -3422,6 +3422,10 @@ JointUnderstandingActionKind = Literal[
 ]
 JointUnderstandingDecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
 JointUnderstandingRuntimeCheck = Literal["match", "mismatch", "unobserved", "stale"]
+# Issue #332: whether the premise this session was investigated against still
+# holds. 'stale' blocks hypothesis_adopted / decided.
+JointUnderstandingPremiseState = Literal["fresh", "stale"]
+JointUnderstandingRefluxTargetKind = Literal["qa_investigation", "session_ledger"]
 
 
 class JointUnderstandingEvidenceIn(BaseModel):
@@ -3532,6 +3536,13 @@ class JointUnderstandingOut(BaseModel):
     # A provisional outcome must not be presented or reused as a fact.
     outcome_is_provisional: bool = False
     outcome_reason: Optional[str] = None
+    # Issue #332: the findings the recorded outcome rests on, the premise
+    # verdict evaluated when it was recorded, and the CURRENT verdict --
+    # 'stale' means the interview session has moved to a newer snapshot than
+    # this session pinned, so adopt/decide are refused until re-investigation.
+    outcome_finding_ids: List[int] = Field(default_factory=list)
+    outcome_premise_state: Optional[JointUnderstandingPremiseState] = None
+    premise_state: JointUnderstandingPremiseState = "fresh"
     premise_snapshot_id: Optional[int] = None
     schema_version: str
     created_at: float
@@ -3552,6 +3563,9 @@ class JointUnderstandingDetailOut(BaseModel):
     # sentences themselves are also in `findings` as origin_role='translation'
     # rows; this carries the summary/options/unknowns around them.
     translations: List["JointUnderstandingTranslationOut"] = Field(default_factory=list)
+    # Issue #332: system-verified facts attached to the understanding surface
+    # WITHOUT being recorded as anyone's answer.
+    reflux: List["JointUnderstandingRefluxOut"] = Field(default_factory=list)
     # The finite next-action menu for the session's current status,
     # deterministically ordered (empty once closed/held).
     available_actions: List[JointUnderstandingActionKind] = Field(default_factory=list)
@@ -3577,6 +3591,10 @@ class JointUnderstandingCloseRequest(BaseModel):
 
     outcome: JointUnderstandingOutcome
     outcome_reason: Optional[str] = Field(default=None, max_length=2_000)
+    # Issue #332: which findings the outcome rests on. Required for
+    # 'hypothesis_adopted' and 'decided' -- an adoption or a decision that
+    # cannot name its basis is not auditable.
+    outcome_finding_ids: List[int] = Field(default_factory=list, max_length=50)
 
 
 class JointUnderstandingHoldRequest(BaseModel):
@@ -3712,6 +3730,44 @@ class JointUnderstandingTranslateOut(BaseModel):
     translation: JointUnderstandingTranslationOut
     # The finite next-action menu that accompanies the explanation.
     action_menu: List[JointUnderstandingActionMenuEntryOut] = Field(default_factory=list)
+
+
+# --- Reflux (Epic #328 Phase D / Issue #332) ---------------------------------
+
+
+class JointUnderstandingRefluxOut(BaseModel):
+    """One system-verified fact attached to the understanding surface.
+
+    ``decision_method`` is always ``reasoning_llm``: a refluxed fact is what
+    the system established, never what the developer answered. No reflux row
+    corresponds to a write of an answer, an intent value, or a decision.
+    """
+
+    id: int
+    joint_understanding_id: int
+    system_id: int
+    finding_id: int
+    target_kind: JointUnderstandingRefluxTargetKind
+    target_id: Optional[int] = None
+    statement: str
+    evidence: List[JointUnderstandingEvidenceOut] = Field(default_factory=list)
+    decision_method: Literal["reasoning_llm"] = "reasoning_llm"
+    intelligence_run_id: Optional[int] = None
+    premise_snapshot_id: Optional[int] = None
+    created_at: float
+
+
+class JointUnderstandingRefluxResultOut(BaseModel):
+    joint_understanding_id: int
+    system_id: int
+    target_kind: JointUnderstandingRefluxTargetKind
+    premise_state: JointUnderstandingPremiseState
+    # Newly attached this call; already-attached facts are not duplicated.
+    refluxed: List[JointUnderstandingRefluxOut] = Field(default_factory=list)
+    already_refluxed: int = 0
+    # Findings that stayed inside the conversation because they are not
+    # system-established facts (inference / hypothesis / unknown / conflict).
+    skipped_not_fact: int = 0
 
 
 JointUnderstandingDetailOut.model_rebuild()
