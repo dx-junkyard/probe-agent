@@ -27,6 +27,8 @@ import {
   useRebaseInterviewSnapshot,
   useRepositoryStatus,
   useRejectInterviewProposal,
+  useCreateJointUnderstanding,
+  useJointUnderstandingList,
   useResumeInterviewInquiry,
   useResumeInterviewQa,
   useQaAutoInvestigate,
@@ -48,6 +50,7 @@ import { HandoffListPanel, HandoffModal } from "@/components/system-understandin
 import { ObservationProposalPanel } from "@/components/system-understanding/observation-proposal-panel";
 import { ChangeSetPanel } from "@/components/system-understanding/change-set-panel";
 import { InquiryPanel, ROUTE_CATEGORY_LABELS } from "@/components/system-understanding/inquiry-panel";
+import { JointUnderstandingPanel } from "@/components/system-understanding/joint-understanding-panel";
 import { RefreshStatusChip } from "@/components/system-understanding/refresh-status-chip";
 import { InterviewMetricsPanel } from "@/components/system-understanding/interview-metrics-panel";
 import { Button } from "@/components/ui/button";
@@ -664,6 +667,36 @@ function QaItemCard({
   const investigatingUnknown = investigate.investigatingQaId === qa.id;
   const resumeInquiry = useResumeInterviewInquiry(sessionId);
 
+  // Epic #328: 「わからない」の続きとして、AI と一緒に状況を確かめる共同理解
+  // セッション。既存の #142 / #295 フローは変えない — この導線は調査結果を
+  // 見たあとの追加手段であり、開いても元の質問には一切回答しない。
+  const jointList = useJointUnderstandingList(sessionId);
+  const createJoint = useCreateJointUnderstanding(sessionId);
+  const [jointId, setJointId] = useState<number | null>(null);
+  const activeJoint = (jointList.data?.items ?? []).find(
+    item => item.origin_kind === "qa" && item.origin_id === qa.id && item.status !== "closed",
+  );
+  const openJointId = jointId ?? activeJoint?.id ?? null;
+
+  const startJointUnderstanding = () => {
+    if (activeJoint) {
+      setJointId(activeJoint.id);
+      return;
+    }
+    createJoint.mutate(
+      {
+        origin_kind: "qa",
+        origin_id: qa.id,
+        trigger: "unknown_answer",
+        question_text: qa.question_text,
+      },
+      {
+        onSuccess: result => setJointId(result.session.id),
+        onError: e => toast.error(String(e)),
+      },
+    );
+  };
+
   // Raw enum values are never rendered (Issue #266) -- only a known,
   // mapped label is shown; an unrecognized value renders no badge at all.
   const routeCategoryLabel = qa.route_category
@@ -838,6 +871,14 @@ function QaItemCard({
         </p>
       )}
 
+      {openJointId && (
+        <JointUnderstandingPanel
+          sessionId={sessionId}
+          juId={openJointId}
+          onClosed={() => setJointId(null)}
+        />
+      )}
+
       {inquiryMode ? (
         <InquiryPanel
           key={attachedInquiryId ?? "new"}
@@ -942,6 +983,17 @@ function QaItemCard({
                   data-testid={`qa-handoff-open-${qa.id}`}
                 >
                   担当者へ引き継ぐ
+                </Button>
+              )}
+              {!openJointId && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={startJointUnderstanding}
+                  disabled={createJoint.isPending}
+                  data-testid={`qa-joint-understanding-${qa.id}`}
+                >
+                  一緒に確かめる
                 </Button>
               )}
               {reopenableInquiryId ? (

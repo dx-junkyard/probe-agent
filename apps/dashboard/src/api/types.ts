@@ -3961,3 +3961,229 @@ export interface CellAskSyncOut {
   created: number;
   deduped: number;
 }
+
+// --- 共同理解セッション(Epic #328 / Issue #329-#332)------------------------
+//
+// 「わからない」を終端回答ではなく共同で状況理解を作る工程の開始点として扱う。
+// 三つの来歴(investigation / translation / developer)は 1 つの回答へ混ぜない。
+
+export type JointUnderstandingOriginKind = "qa" | "intent" | "review_item" | "inquiry";
+export type JointUnderstandingTrigger = "unknown_answer" | "explicit_request";
+export type JointUnderstandingStatus = "open" | "held" | "closed";
+export type JointUnderstandingOutcome =
+  | "understood"
+  | "doubt_resolved"
+  | "hypothesis_adopted"
+  | "decided"
+  | "handed_off"
+  | "abandoned";
+export type JointUnderstandingClaimKind =
+  | "fact"
+  | "inference"
+  | "hypothesis"
+  | "unknown"
+  | "conflict";
+export type JointUnderstandingOriginRole = "investigation" | "translation" | "developer";
+export type JointUnderstandingActionKind =
+  | "request_investigation"
+  | "explain_reasoning"
+  | "compare_options"
+  | "adopt_hypothesis"
+  | "revise_intent"
+  | "hold"
+  | "handoff"
+  | "decide";
+export type JointUnderstandingStatementLayer =
+  | "purpose"
+  | "impact"
+  | "gap"
+  | "consistency"
+  | "decision";
+export type JointUnderstandingPremiseState = "fresh" | "stale";
+export type JointUnderstandingStopReason =
+  | "answered"
+  | "budget_exhausted"
+  | "no_new_evidence"
+  | "unresolved"
+  | "failed";
+
+export interface JointUnderstandingEvidenceOut {
+  path: string;
+  start_line: number;
+  end_line: number;
+  summary: string;
+}
+
+export interface JointUnderstandingRuntimeEvidenceOut {
+  component_id: string;
+  runtime_check: "match" | "mismatch" | "unobserved" | "stale";
+  summary: string;
+}
+
+export interface JointUnderstandingFindingOut {
+  id: number;
+  joint_understanding_id: number;
+  system_id: number;
+  origin_role: JointUnderstandingOriginRole;
+  claim_kind: JointUnderstandingClaimKind;
+  statement: string;
+  evidence: JointUnderstandingEvidenceOut[];
+  runtime_evidence: JointUnderstandingRuntimeEvidenceOut[];
+  supports_finding_ids: number[];
+  competing_explanations: string[];
+  refutation_conditions: string[];
+  next_investigation: string | null;
+  uncertainty: string;
+  supersedes_finding_id: number | null;
+  decision_method: string;
+  intelligence_run_id: number | null;
+  is_mock: boolean;
+  created_at: number;
+}
+
+export interface JointUnderstandingActionOut {
+  id: number;
+  joint_understanding_id: number;
+  system_id: number;
+  action_kind: JointUnderstandingActionKind;
+  actor: string | null;
+  note: string | null;
+  decision_method: "manual";
+  created_at: number;
+}
+
+export interface JointUnderstandingRoundOut {
+  id: number;
+  joint_understanding_id: number;
+  system_id: number;
+  round_index: number;
+  status: "completed" | "unresolved" | "failed";
+  stop_reason: JointUnderstandingStopReason | null;
+  conclusion: string;
+  search_leads: string[];
+  open_hypotheses: string[];
+  missing_evidence: string[];
+  read_paths: string[];
+  unread_candidates: string[];
+  pruned_findings: number;
+  files_read: number;
+  chars_read: number;
+  llm_calls: number;
+  elapsed_seconds: number;
+  intelligence_run_id: number | null;
+  error_details: string | null;
+  created_at: number;
+}
+
+export interface JointUnderstandingStatementOut {
+  layer: JointUnderstandingStatementLayer;
+  claim_kind: JointUnderstandingClaimKind;
+  text: string;
+  supports_finding_ids: number[];
+  finding_id: number;
+}
+
+export interface JointUnderstandingOptionOut {
+  label: string;
+  what_changes: string;
+  tradeoffs: string;
+  supports_finding_ids: number[];
+}
+
+export interface JointUnderstandingActionMenuEntryOut {
+  action_kind: JointUnderstandingActionKind;
+  label: string;
+  what_changes: string;
+}
+
+export interface JointUnderstandingTranslationOut {
+  id: number;
+  joint_understanding_id: number;
+  system_id: number;
+  purpose_summary: string;
+  statements: JointUnderstandingStatementOut[];
+  options: JointUnderstandingOptionOut[];
+  open_unknowns: string[];
+  decision_question: string | null;
+  ask_developer: boolean;
+  intelligence_run_id: number | null;
+  is_mock: boolean;
+  created_at: number;
+}
+
+export interface JointUnderstandingRefluxOut {
+  id: number;
+  joint_understanding_id: number;
+  system_id: number;
+  finding_id: number;
+  target_kind: "qa_investigation" | "session_ledger";
+  target_id: number | null;
+  statement: string;
+  evidence: JointUnderstandingEvidenceOut[];
+  decision_method: "reasoning_llm";
+  intelligence_run_id: number | null;
+  premise_snapshot_id: number | null;
+  created_at: number;
+}
+
+export interface JointUnderstandingOut {
+  id: number;
+  session_id: number;
+  system_id: number;
+  origin_kind: JointUnderstandingOriginKind;
+  origin_id: number;
+  trigger: JointUnderstandingTrigger;
+  question_text: string;
+  status: JointUnderstandingStatus;
+  outcome: JointUnderstandingOutcome | null;
+  outcome_is_provisional: boolean;
+  outcome_reason: string | null;
+  outcome_finding_ids: number[];
+  outcome_premise_state: JointUnderstandingPremiseState | null;
+  premise_state: JointUnderstandingPremiseState;
+  premise_snapshot_id: number | null;
+  schema_version: string;
+  created_at: number;
+  updated_at: number;
+  closed_at: number | null;
+}
+
+export interface JointUnderstandingDetailOut {
+  session: JointUnderstandingOut;
+  findings: JointUnderstandingFindingOut[];
+  actions: JointUnderstandingActionOut[];
+  investigation_rounds: JointUnderstandingRoundOut[];
+  translations: JointUnderstandingTranslationOut[];
+  reflux: JointUnderstandingRefluxOut[];
+  available_actions: JointUnderstandingActionKind[];
+}
+
+export interface JointUnderstandingListOut {
+  session_id: number;
+  system_id: number;
+  items: JointUnderstandingOut[];
+}
+
+export interface JointUnderstandingInvestigateOut {
+  joint_understanding_id: number;
+  system_id: number;
+  stop_reason: JointUnderstandingStopReason;
+  rounds: JointUnderstandingRoundOut[];
+  findings: JointUnderstandingFindingOut[];
+  error: string | null;
+}
+
+export interface JointUnderstandingTranslateOut {
+  translation: JointUnderstandingTranslationOut;
+  action_menu: JointUnderstandingActionMenuEntryOut[];
+}
+
+export interface JointUnderstandingRefluxResultOut {
+  joint_understanding_id: number;
+  system_id: number;
+  target_kind: "qa_investigation" | "session_ledger";
+  premise_state: JointUnderstandingPremiseState;
+  refluxed: JointUnderstandingRefluxOut[];
+  already_refluxed: number;
+  skipped_not_fact: number;
+}
