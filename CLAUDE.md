@@ -274,18 +274,36 @@ creating incomplete persistence or execution paths for later phases.
       `interview_intent_item` / `alignment_item` / `interview_inquiry` row —
       not even its status** (unlike #287's Inquiry mirroring), and
       「わからない」 never becomes a developer finding.
-      **Status: implemented and verified.**
-    - #330 (Phase B) — iterative investigation rounds with carried-over
-      search leads / open hypotheses / missing evidence, cross-source
-      candidate retrieval, finite stop reasons, per-round audit.
-    - #331 (Phase C) — translation + option presentation, fail-closed on
-      invented finding references.
-    - #332 (Phase D) — reflux of system-verified facts into System
-      Understanding without recording them as a human answer, plus the
-      separated terminal states and premise-staleness guard.
-    - #333 (Phase E) — Dashboard 共同理解 panel.
-    - #334 (Phase F) — collaborative-understanding quality metrics, kept
-      separate from efficiency metrics (extends #309).
+    - #330 (Phase B) — `app/investigation_loop.py`: iterative rounds over the
+      pinned snapshot with carried-over `search_leads` / `open_hypotheses` /
+      `missing_evidence` / `read_paths` (restored on retry, so a re-run
+      resumes instead of restarting), cross-source candidate retrieval
+      (symbol index, entrypoint index, file CONTENT scan, plus #286's path
+      names), finite stop reasons (`answered` | `budget_exhausted` |
+      `no_new_evidence` | `unresolved` | `failed`), and one
+      `intelligence_runs` row per round. A round-1 failure yields no
+      findings; a later-round failure keeps the earlier validated ones.
+      `investigate()` (#286) is reused, never replaced.
+    - #331 (Phase C) — `app/understanding_translator.py`: findings-only
+      input (no snapshot excerpts, so it cannot invent facts), mandatory
+      `supports_finding_ids` on every sentence (an unsupplied id fails the
+      WHOLE call closed), claim kinds restricted to inference/unknown/
+      conflict, and a deterministic action menu from the fixed server
+      catalog. `ask_developer` refuses to hand a question back when the
+      developer has no decision material and investigation could still help.
+    - #332 (Phase D) — reflux: only investigation FACTS attach to the
+      understanding surface, always `decision_method: reasoning_llm`, into
+      `interview_qa.investigation_json` (the same non-answer slot #286 uses)
+      or the session ledger; a stale premise (session moved to a newer
+      snapshot) blocks reflux and both asserting outcomes, and
+      `hypothesis_adopted`/`decided` must name their basis findings.
+    - #333 (Phase E) — Dashboard 共同理解 panel: 4-layer disclosure, finite
+      action menu, provisional-vs-decided distinction, entry point from the
+      Q&A card's 「わからない」 flow (the #142/#295 flow is unchanged).
+    - #334 (Phase F) — 8 quality metrics in their own `joint_understanding`
+      category on the #309 pipeline, deterministic, `unmeasured` when there
+      is nothing to measure, never merged with the efficiency numbers.
+    **Status: #329-#334 are implemented and verified.**
     #327 was closed `not_planned` and fully absorbed into this Epic; its
     design notes remain valid in `docs/system-understanding-ideal-state.md`.
     #311 (低リスク提案の一括承認) is still NOT implemented and is not a

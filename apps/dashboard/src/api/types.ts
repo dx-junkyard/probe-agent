@@ -1263,7 +1263,13 @@ export type InterviewMetricUnit =
   | "ratio"
   | "answers_per_update"
   | "operations_per_inquiry";
-export type InterviewMetricCategory = "user_burden" | "accuracy" | "ux_quality";
+// Issue #334: joint_understanding は共同理解の質を測る別カテゴリ。効率化指標
+// (確認件数・承認速度)と同じ数値へまとめない。
+export type InterviewMetricCategory =
+  | "user_burden"
+  | "accuracy"
+  | "ux_quality"
+  | "joint_understanding";
 export type InterviewMetricKey =
   | "answers_per_understanding_update"
   | "unknown_answer_rate"
@@ -1281,7 +1287,15 @@ export type InterviewMetricKey =
   | "unchanged_item_reconfirmation_rate"
   | "inquiry_resolution_rate"
   | "post_inquiry_confirmation_rate"
-  | "implementation_question_transfer_rate";
+  | "implementation_question_transfer_rate"
+  | "joint_understanding_from_unknown_rate"
+  | "joint_understanding_conclusion_rate"
+  | "joint_understanding_provisional_outcome_rate"
+  | "joint_understanding_stale_premise_close_rate"
+  | "joint_understanding_unknown_finding_rate"
+  | "joint_understanding_reflux_rate"
+  | "joint_understanding_investigation_answered_rate"
+  | "joint_understanding_developer_question_rate";
 
 export interface InterviewMetricOut {
   key: InterviewMetricKey;
