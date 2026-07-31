@@ -27,7 +27,10 @@
       "type": "object",
       "required": [
         "id", "system_id", "session_id", "origin_kind", "origin_id",
-        "trigger", "question_text", "status", "created_at", "updated_at"
+        "trigger", "question_text", "status", "outcome", "outcome_is_provisional",
+        "outcome_reason", "outcome_finding_ids", "outcome_premise_state",
+        "premise_state", "premise_snapshot_id", "schema_version",
+        "created_at", "updated_at", "closed_at"
       ],
       "additionalProperties": false,
       "properties": {
@@ -74,14 +77,68 @@
           "description": "Derived, never stored as free text: true exactly for outcome=hypothesis_adopted. A provisional outcome must not be presented or reused as an established fact."
         },
         "outcome_reason": { "type": ["string", "null"], "maxLength": 2000 },
+        "outcome_finding_ids": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 1 },
+          "maxItems": 50
+        },
+        "outcome_premise_state": {
+          "oneOf": [
+            { "type": "null" },
+            { "enum": ["fresh", "stale"] }
+          ]
+        },
+        "premise_state": { "enum": ["fresh", "stale"] },
         "premise_snapshot_id": {
           "type": ["integer", "null"],
           "description": "The repository snapshot this session's investigation is pinned to, captured at creation (same discipline as an Inquiry's premise bundle, Issue #308). Never rebased onto a newer snapshot mid-session."
         },
+        "schema_version": { "const": "joint-understanding-v1" },
         "created_at": { "type": "number" },
         "updated_at": { "type": "number" },
         "closed_at": { "type": ["number", "null"] }
-      }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "closed" } }, "required": ["status"] },
+          "then": {
+            "properties": {
+              "outcome": { "enum": ["understood", "doubt_resolved", "hypothesis_adopted", "decided", "handed_off", "abandoned"] },
+              "closed_at": { "type": "number" },
+              "outcome_premise_state": { "enum": ["fresh", "stale"] }
+            },
+            "required": ["outcome", "closed_at", "outcome_premise_state"]
+          },
+          "else": {
+            "properties": {
+              "outcome": { "type": "null" },
+              "outcome_is_provisional": { "const": false },
+              "closed_at": { "type": "null" },
+              "outcome_premise_state": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "outcome": { "const": "hypothesis_adopted" } }, "required": ["outcome"] },
+          "then": {
+            "properties": {
+              "outcome_is_provisional": { "const": true },
+              "outcome_finding_ids": { "minItems": 1 }
+            },
+            "required": ["outcome_is_provisional", "outcome_finding_ids"]
+          },
+          "else": {
+            "properties": { "outcome_is_provisional": { "const": false } }
+          }
+        },
+        {
+          "if": { "properties": { "outcome": { "const": "decided" } }, "required": ["outcome"] },
+          "then": {
+            "properties": { "outcome_finding_ids": { "minItems": 1 } },
+            "required": ["outcome_finding_ids"]
+          }
+        }
+      ]
     },
     "finding": {
       "type": "object",
@@ -185,9 +242,25 @@
           "then": {
             "properties": {
               "competing_explanations": { "minItems": 1 },
-              "refutation_conditions": { "minItems": 1 }
+              "refutation_conditions": { "minItems": 1 },
+              "next_investigation": { "type": "string", "minLength": 1 }
             },
-            "required": ["competing_explanations", "refutation_conditions"]
+            "required": ["competing_explanations", "refutation_conditions", "next_investigation"]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "origin_role": { "const": "investigation" },
+              "claim_kind": { "not": { "const": "unknown" } }
+            },
+            "required": ["origin_role", "claim_kind"]
+          },
+          "then": {
+            "anyOf": [
+              { "properties": { "evidence": { "minItems": 1 } }, "required": ["evidence"] },
+              { "properties": { "runtime_evidence": { "minItems": 1 } }, "required": ["runtime_evidence"] }
+            ]
           }
         }
       ]

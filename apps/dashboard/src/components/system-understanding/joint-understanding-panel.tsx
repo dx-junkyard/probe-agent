@@ -21,6 +21,7 @@ import {
   useJointUnderstandingDetail,
   useRecordJointUnderstandingAction,
   useRefluxJointUnderstanding,
+  useResumeJointUnderstanding,
   useTranslateJointUnderstanding,
 } from "@/api/hooks";
 import type {
@@ -135,6 +136,16 @@ function FindingCard({ finding }: { finding: JointUnderstandingFindingOut }) {
           ))}
         </ul>
       )}
+      {finding.runtime_evidence.length > 0 && (
+        <ul className="font-mono text-[10px] text-muted-foreground">
+          {finding.runtime_evidence.map((e, index) => (
+            <li key={`${e.component_id}-${index}`}>
+              runtime:{e.component_id} [{e.runtime_check}]
+              {e.summary ? ` — ${e.summary}` : ""}
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }
@@ -155,6 +166,7 @@ export function JointUnderstandingPanel({
   const reflux = useRefluxJointUnderstanding(sessionId);
   const close = useCloseJointUnderstanding(sessionId);
   const hold = useHoldJointUnderstanding(sessionId);
+  const resume = useResumeJointUnderstanding(sessionId);
 
   const [showReasons, setShowReasons] = useState(false);
   const [showEvidence, setShowEvidence] = useState(false);
@@ -184,6 +196,7 @@ export function JointUnderstandingPanel({
 
   const runAction = async (actionKind: JointUnderstandingActionKind) => {
     try {
+      await recordAction.mutateAsync({ juId, actionKind });
       if (actionKind === "request_investigation") {
         const result = await investigate.mutateAsync({ juId });
         toast.success(STOP_REASON_LABELS[result.stop_reason]);
@@ -193,14 +206,16 @@ export function JointUnderstandingPanel({
       } else if (actionKind === "hold") {
         await hold.mutateAsync({ juId });
       }
-      await recordAction.mutateAsync({ juId, actionKind });
     } catch (error) {
-      // 失敗しても対話は失われない: 記録だけ残らずセッションは open のまま。
+      // 選んだ行動の監査は先に残す。実行に失敗しても対話は open のまま続けられる。
       toast.error(error instanceof Error ? error.message : "操作に失敗しました");
     }
   };
 
-  const closeWith = async (outcome: JointUnderstandingOutcome) => {
+  const closeWith = async (
+    outcome: JointUnderstandingOutcome,
+    actionKind?: JointUnderstandingActionKind,
+  ) => {
     const basis =
       outcome === "hypothesis_adopted"
         ? findings.filter(f => f.claim_kind === "hypothesis").map(f => f.id)
@@ -208,6 +223,9 @@ export function JointUnderstandingPanel({
           ? findings.map(f => f.id)
           : [];
     try {
+      if (actionKind) {
+        await recordAction.mutateAsync({ juId, actionKind });
+      }
       await close.mutateAsync({ juId, outcome, outcomeFindingIds: basis });
       onClosed?.();
     } catch (error) {
@@ -249,6 +267,11 @@ export function JointUnderstandingPanel({
       {/* 第1層: 目的と影響 */}
       {latest ? (
         <div className="space-y-1" data-testid="ju-layer-purpose">
+          {latest.is_mock && (
+            <span className="rounded bg-orange-500/20 px-1 text-[10px] text-orange-800" data-testid="ju-translation-mock-badge">
+              mock 出力
+            </span>
+          )}
           <p className="text-sm">{latest.purpose_summary}</p>
           <ul className="list-disc pl-4 text-xs">
             {firstLayer.map(statement => (
@@ -364,6 +387,20 @@ export function JointUnderstandingPanel({
         </button>
       </div>
 
+      {session.status === "held" && (
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={resume.isPending}
+          onClick={() => void resume.mutateAsync({ juId }).catch(error =>
+            toast.error(error instanceof Error ? error.message : "再開できませんでした"),
+          )}
+          data-testid="ju-resume"
+        >
+          共同理解を再開する
+        </Button>
+      )}
+
       {isOpen && (
         <div className="space-y-2" data-testid="ju-action-menu">
           <p className="text-xs font-medium">次にどうしますか</p>
@@ -379,11 +416,11 @@ export function JointUnderstandingPanel({
                   disabled={investigate.isPending || translate.isPending}
                   onClick={() => {
                     if (actionKind === "adopt_hypothesis") {
-                      void closeWith("hypothesis_adopted");
+                      void closeWith("hypothesis_adopted", actionKind);
                     } else if (actionKind === "decide") {
-                      void closeWith("decided");
+                      void closeWith("decided", actionKind);
                     } else if (actionKind === "handoff") {
-                      void closeWith("handed_off");
+                      void closeWith("handed_off", actionKind);
                     } else {
                       void runAction(actionKind);
                     }
@@ -394,6 +431,17 @@ export function JointUnderstandingPanel({
                 </Button>
               );
             })}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button size="sm" variant="ghost" onClick={() => void closeWith("understood")} data-testid="ju-close-understood">
+              状況を理解できた
+            </Button>
+            <Button size="sm" variant="ghost" onClick={() => void closeWith("doubt_resolved")} data-testid="ju-close-doubt-resolved">
+              疑問が解消した
+            </Button>
+            <Button size="sm" variant="ghost" onClick={() => void closeWith("abandoned")} data-testid="ju-close-abandoned">
+              この対話を中断する
+            </Button>
           </div>
           {investigate.isPending && (
             <p className="text-xs text-muted-foreground" data-testid="ju-investigating">

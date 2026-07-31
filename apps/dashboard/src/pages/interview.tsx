@@ -687,7 +687,7 @@ function QaItemCard({
       {
         origin_kind: "qa",
         origin_id: qa.id,
-        trigger: "unknown_answer",
+        trigger: qa.answer_unknown ? "unknown_answer" : "explicit_request",
         question_text: qa.question_text,
       },
       {

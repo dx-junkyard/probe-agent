@@ -130,6 +130,16 @@ def test_option_citing_an_unsupplied_finding_fails_closed():
     assert result.error is not None
 
 
+def test_option_without_any_reference_fails_closed():
+    client = FakeLLMClient(_response(options=[
+        {"label": "案A", "what_changes": "挙動が変わる", "supports_finding_ids": []},
+    ]))
+    result = translate_findings(
+        client, _make_config(), question="影響は?", findings=_findings(),
+    )
+    assert result.error is not None
+
+
 def test_translation_cannot_assert_a_new_fact_or_hypothesis():
     for claim_kind in ("fact", "hypothesis"):
         client = FakeLLMClient(_response(statements=[
@@ -382,7 +392,7 @@ def test_translate_persists_statements_as_translation_findings(admin_client, mon
     assert r.status_code == 201, r.text
     body = r.json()
     translation = body["translation"]
-    assert translation["purpose_summary"].startswith("外部が落ちても")
+    assert translation["purpose_summary"].startswith("3回失敗すると")
     assert [s["layer"] for s in translation["statements"]] == ["impact", "decision"]
     assert all(s["supports_finding_ids"] == [finding_id] for s in translation["statements"])
     assert translation["ask_developer"] is True

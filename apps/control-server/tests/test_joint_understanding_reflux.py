@@ -190,6 +190,8 @@ def _add_finding(client, headers, ju_id, run_id, **overrides):
         "decision_method": "reasoning_llm", "intelligence_run_id": run_id,
     }
     body.update(overrides)
+    if body["origin_role"] == "investigation" and body["claim_kind"] == "hypothesis":
+        body.setdefault("next_investigation", "競合する説明を追加調査する")
     r = client.post(f"/joint-understanding/{ju_id}/findings", json=body, headers=headers)
     assert r.status_code == 201, r.text
     return r.json()["id"]
@@ -272,6 +274,34 @@ def test_reflux_is_idempotent(admin_client):
 
     detail = admin_client.get(f"/joint-understanding/{ju_id}", headers=headers).json()
     assert len(detail["reflux"]) == 1
+
+
+def test_incremental_reflux_keeps_all_current_qa_facts(admin_client):
+    headers, system_id, session_id, snapshot_id, qa, ju_id, run_id = _setup(admin_client)
+    _add_finding(admin_client, headers, ju_id, run_id, statement="打ち切りは3回")
+    admin_client.post(f"/joint-understanding/{ju_id}/reflux", headers=headers)
+    _add_finding(admin_client, headers, ju_id, run_id, statement="待機は1秒")
+    admin_client.post(f"/joint-understanding/{ju_id}/reflux", headers=headers)
+
+    payload = json.loads(_qa_row(qa["id"])["investigation_json"])
+    assert payload["key_points"] == ["打ち切りは3回", "待機は1秒"]
+
+
+def test_reflux_preserves_runtime_evidence(admin_client):
+    headers, system_id, session_id, snapshot_id, qa, ju_id, run_id = _setup(admin_client)
+    finding_id = _add_finding(
+        admin_client, headers, ju_id, run_id,
+        evidence=[],
+        runtime_evidence=[{
+            "component_id": "retry-worker", "runtime_check": "match",
+            "summary": "実行時にも3回を観測",
+        }],
+    )
+    result = admin_client.post(
+        f"/joint-understanding/{ju_id}/reflux", headers=headers,
+    ).json()
+    assert result["refluxed"][0]["finding_id"] == finding_id
+    assert result["refluxed"][0]["runtime_evidence"][0]["component_id"] == "retry-worker"
 
 
 def test_non_qa_origin_uses_the_session_ledger_only(admin_client):

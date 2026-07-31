@@ -159,6 +159,7 @@ def validate_finding(
     supports_finding_ids: Sequence[int],
     competing_explanations: Sequence[str],
     refutation_conditions: Sequence[str],
+    next_investigation: Optional[str],
     intelligence_run_id: Optional[int],
     is_mock: bool,
     known_finding_ids: Iterable[int],
@@ -224,6 +225,16 @@ def validate_finding(
         if not refutation_conditions:
             raise JointUnderstandingValidationError(
                 "An investigation hypothesis must list at least one refutation condition"
+            )
+        if not next_investigation:
+            raise JointUnderstandingValidationError(
+                "An investigation hypothesis must name the next investigation"
+            )
+
+    if origin_role == "investigation" and claim_kind != "unknown":
+        if not evidence and not runtime_evidence:
+            raise JointUnderstandingValidationError(
+                "An investigation assertion must carry snapshot or runtime evidence"
             )
 
     known = set(known_finding_ids)

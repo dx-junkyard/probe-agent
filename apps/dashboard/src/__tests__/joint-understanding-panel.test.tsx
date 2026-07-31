@@ -172,6 +172,29 @@ test("有限の行動メニューが出て、選択がサーバへ記録され�
   });
 });
 
+test("保留は行動を先に記録し、保留中のセッションを再開できる", async () => {
+  mockApi.get.mockResolvedValue(detail());
+  mockApi.post.mockResolvedValue({});
+  await renderPanel({ sessionId: 3, juId: 7 });
+
+  fireEvent.click(await screen.findByTestId("ju-action-hold"));
+  await waitFor(() => expect(mockApi.post.mock.calls.slice(0, 2)).toEqual([
+    ["/joint-understanding/7/actions", { action_kind: "hold", note: null }],
+    ["/joint-understanding/7/hold", {}],
+  ]));
+
+  mockApi.get.mockResolvedValue(detail({
+    session: { ...detail().session, status: "held" },
+    available_actions: [],
+  }));
+  const held = await renderPanel({ sessionId: 3, juId: 7 });
+  fireEvent.click(await screen.findByTestId("ju-resume"));
+  await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+    "/joint-understanding/7/resume", {},
+  ));
+  held.unmount();
+});
+
 test("暫定採用は確定と視覚的に区別される", async () => {
   mockApi.get.mockResolvedValue(
     detail({
@@ -247,6 +270,19 @@ test("mock LLM 出力にはバッジが付く", async () => {
 
   fireEvent.click(await screen.findByTestId("ju-toggle-evidence"));
   expect(await screen.findByTestId("ju-mock-badge")).toBeInTheDocument();
+});
+
+test("runtime evidence は根拠層で追跡できる", async () => {
+  const base = detail();
+  mockApi.get.mockResolvedValue(detail({ findings: [{
+    ...base.findings[0], evidence: [], runtime_evidence: [{
+      component_id: "retry-worker", runtime_check: "match", summary: "3回を観測",
+    }],
+  }] }));
+  await renderPanel({ sessionId: 3, juId: 7 });
+
+  fireEvent.click(await screen.findByTestId("ju-toggle-evidence"));
+  expect(await screen.findByText(/runtime:retry-worker/)).toBeInTheDocument();
 });
 
 test("未翻訳のときは次に取るべき操作を日本語で案内する", async () => {

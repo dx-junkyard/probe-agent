@@ -454,6 +454,37 @@ def append_finding(
                 (ju_id,),
             ).fetchall()
         }
+        if payload.intelligence_run_id is not None:
+            run = conn.execute(
+                "SELECT system_id, snapshot_id, decision_method, status, is_mock "
+                "FROM intelligence_runs WHERE id = ? AND system_id = ?",
+                (payload.intelligence_run_id, system_id),
+            ).fetchone()
+            if run is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="intelligence_run_id must reference a run of this System",
+                )
+            if payload.decision_method == "reasoning_llm" and (
+                run["decision_method"] != "reasoning_llm" or run["status"] != "completed"
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail="A reasoning finding must reference a completed reasoning run",
+                )
+            if bool(run["is_mock"]) != payload.is_mock:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Finding is_mock must match its intelligence run",
+                )
+            if (
+                ju["premise_snapshot_id"] is not None
+                and run["snapshot_id"] != ju["premise_snapshot_id"]
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail="intelligence_run_id must use this session's pinned snapshot",
+                )
         try:
             validate_finding(
                 origin_role=payload.origin_role,
@@ -464,6 +495,7 @@ def append_finding(
                 supports_finding_ids=payload.supports_finding_ids,
                 competing_explanations=payload.competing_explanations,
                 refutation_conditions=payload.refutation_conditions,
+                next_investigation=payload.next_investigation,
                 intelligence_run_id=payload.intelligence_run_id,
                 is_mock=payload.is_mock,
                 known_finding_ids=known_ids,
@@ -545,22 +577,19 @@ def _restore_carry_over(conn, ju_id: int) -> LoopCarryOver:
     the leads already paid for instead of starting over from the question.
     """
     rows = conn.execute(
-        """SELECT search_leads, open_hypotheses, missing_evidence, read_paths
+        """SELECT status, search_leads, open_hypotheses, missing_evidence, read_paths
            FROM joint_understanding_investigation_round
            WHERE joint_understanding_id = ? ORDER BY id""",
         (ju_id,),
     ).fetchall()
     carry = LoopCarryOver()
     for row in rows:
-        leads = json.loads(row["search_leads"])
-        hypotheses = json.loads(row["open_hypotheses"])
-        missing = json.loads(row["missing_evidence"])
-        if leads:
-            carry.search_leads = leads
-        if hypotheses:
-            carry.open_hypotheses = hypotheses
-        if missing:
-            carry.missing_evidence = missing
+        if row["status"] != "failed":
+            # Empty is meaningful: a later successful round may have resolved
+            # an earlier lead/hypothesis.  Only a failed round is ignored.
+            carry.search_leads = json.loads(row["search_leads"])
+            carry.open_hypotheses = json.loads(row["open_hypotheses"])
+            carry.missing_evidence = json.loads(row["missing_evidence"])
         for path in json.loads(row["read_paths"]):
             if path not in carry.read_paths:
                 carry.read_paths.append(path)
@@ -587,9 +616,7 @@ def _persist_loop(
     """
     round_outs: List[JointUnderstandingRoundOut] = []
     finding_outs: List[JointUnderstandingFindingOut] = []
-    last_index = len(result.rounds)
-
-    for loop_round in result.rounds:
+    for persisted_index, loop_round in enumerate(result.rounds):
         run_cur = conn.execute(
             """INSERT INTO intelligence_runs
                 (system_id, snapshot_id, run_type, provider, model,
@@ -631,7 +658,7 @@ def _persist_loop(
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 ju_id, system_id, loop_round.round_index, loop_round.status,
-                result.stop_reason if loop_round.round_index == last_index else None,
+                result.stop_reason if persisted_index == len(result.rounds) - 1 else None,
                 loop_round.conclusion,
                 json.dumps(loop_round.search_leads, ensure_ascii=False),
                 json.dumps(loop_round.open_hypotheses, ensure_ascii=False),
@@ -667,6 +694,7 @@ def _persist_loop(
                     supports_finding_ids=[],
                     competing_explanations=finding.competing_explanations,
                     refutation_conditions=finding.refutation_conditions,
+                    next_investigation=finding.next_investigation,
                     intelligence_run_id=run_id,
                     is_mock=result.is_mock,
                     known_finding_ids=known_ids,
@@ -786,6 +814,12 @@ def investigate_joint_understanding(
         ).fetchone() if snapshot_id is not None else None
         question_text = ju["question_text"]
         carry_over = _restore_carry_over(conn, ju_id)
+        round_index_offset = int(conn.execute(
+            "SELECT COALESCE(MAX(round_index), 0) AS n "
+            "FROM joint_understanding_investigation_round "
+            "WHERE joint_understanding_id = ?",
+            (ju_id,),
+        ).fetchone()["n"])
 
     if snapshot is None:
         raise HTTPException(
@@ -814,6 +848,7 @@ def investigate_joint_understanding(
             language=get_interview_language(),
             budget=budget, carry_over=carry_over,
             system_id=system_id, snapshot_id=snapshot_id,
+            round_index_offset=round_index_offset,
         )
     except (LLMError, ValueError) as exc:
         result = InvestigationLoopResult(
@@ -1036,6 +1071,7 @@ def translate_joint_understanding(
                     supports_finding_ids=statement.supports_finding_ids,
                     competing_explanations=[],
                     refutation_conditions=[],
+                    next_investigation=None,
                     intelligence_run_id=run_id,
                     is_mock=result.is_mock,
                     known_finding_ids=known_ids,
@@ -1189,6 +1225,10 @@ def _reflux_out(row) -> JointUnderstandingRefluxOut:
         evidence=[
             JointUnderstandingEvidenceOut(**e) for e in json.loads(row["evidence_json"])
         ],
+        runtime_evidence=[
+            JointUnderstandingRuntimeEvidenceOut(**e)
+            for e in json.loads(row["runtime_evidence_json"])
+        ],
         decision_method="reasoning_llm",
         intelligence_run_id=row["intelligence_run_id"],
         premise_snapshot_id=row["premise_snapshot_id"],
@@ -1308,23 +1348,36 @@ def reflux_joint_understanding(
         }
 
         skipped_not_fact = 0
+        skipped_unverified = 0
         new_ids: List[int] = []
         for finding in findings:
             if not can_reflux(finding["origin_role"], finding["claim_kind"]):
                 skipped_not_fact += 1
+                continue
+            if (
+                finding["decision_method"] != "reasoning_llm"
+                or finding["intelligence_run_id"] is None
+                or bool(finding["is_mock"])
+                or (
+                    not json.loads(finding["evidence_json"])
+                    and not json.loads(finding["runtime_evidence_json"])
+                )
+            ):
+                skipped_unverified += 1
                 continue
             if finding["id"] in existing or finding["id"] in superseded:
                 continue
             cur = conn.execute(
                 """INSERT INTO joint_understanding_reflux
                     (joint_understanding_id, system_id, finding_id, target_kind,
-                     target_id, statement, evidence_json, decision_method,
+                     target_id, statement, evidence_json, runtime_evidence_json, decision_method,
                      intelligence_run_id, premise_snapshot_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'reasoning_llm', ?, ?, ?)""",
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'reasoning_llm', ?, ?, ?)""",
                 (
                     ju_id, system_id, finding["id"], target_kind,
                     ju["origin_id"] if target_kind == "qa_investigation" else None,
                     finding["statement"], finding["evidence_json"],
+                    finding["runtime_evidence_json"],
                     finding["intelligence_run_id"], ju["premise_snapshot_id"], now,
                 ),
             )
@@ -1337,8 +1390,20 @@ def reflux_joint_understanding(
             for rid in new_ids
         ]
         if rows and target_kind == "qa_investigation":
+            current_rows = conn.execute(
+                """SELECT r.* FROM joint_understanding_reflux AS r
+                   JOIN joint_understanding_finding AS f ON f.id = r.finding_id
+                   WHERE r.joint_understanding_id = ?
+                     AND NOT EXISTS (
+                       SELECT 1 FROM joint_understanding_finding AS newer
+                       WHERE newer.joint_understanding_id = f.joint_understanding_id
+                         AND newer.supersedes_finding_id = f.id
+                     )
+                   ORDER BY r.id""",
+                (ju_id,),
+            ).fetchall()
             _write_qa_investigation(
-                conn, qa_id=ju["origin_id"], system_id=system_id, rows=rows,
+                conn, qa_id=ju["origin_id"], system_id=system_id, rows=current_rows,
             )
         conn.execute(
             "UPDATE joint_understanding_session SET updated_at = ? WHERE id = ?",
@@ -1352,6 +1417,7 @@ def reflux_joint_understanding(
             refluxed=[_reflux_out(r) for r in rows],
             already_refluxed=len(existing),
             skipped_not_fact=skipped_not_fact,
+            skipped_unverified=skipped_unverified,
         )
 
 

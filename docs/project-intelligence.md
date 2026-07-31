@@ -5088,3 +5088,26 @@ Intent Brief 自体の編集は既存の Intent パネルで行う — 共同理
 
 `test_joint_understanding_reflux.py` 末尾の 3 件: カテゴリ分離と決定性、
 観測ゼロでの `unmeasured`、System 分離。
+
+### 2026-07-31 完了監査と後続スコープ
+
+#328 と #329〜#334 の完了監査で、既存実装に対して次を補強した。
+
+- Investigation Finding のコード/実行時証拠と run provenance を保存時に検証する。
+- 再実行時のラウンド番号・空の carry state を正しく引き継ぎ、検証済み証拠が
+  増えない場合だけ `no_new_evidence` とする。
+- 通訳の目的/影響と選択肢を Finding 参照で根拠付ける。
+- reflux に runtime evidence を保持し、未検証 fact を除外し、増分実行でも
+  過去の有効 fact を失わない。
+- Dashboard の実トリガー、action audit、保留からの再開、終了理由、実行時証拠
+  表示を整合させる。
+- supersede 済み Finding を reflux 率の分母から除外する。
+
+一方、既存 Interview / Inquiry / System Understanding と並走する独立系統を
+「共同理解の単一フロー」に変える作業は仕様判断を伴う。このため元 Epic と
+Phase issue は閉じ、残件を以下へ限定して移管した。
+
+- #336: 実運用フローへの統合、origin 別導線、reflux 後の canonical rebuild。
+- #337: #308 の前提 bundle、actor/provenance、判断根拠の監査契約。
+- #338: 不明解消・仮説反転・訂正・負担を outcome lineage で測る品質指標。
+- #339: 依存/変更履歴/実行時候補を含む探索と Question Router の統合。

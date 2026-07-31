@@ -3016,3 +3016,15 @@ export function useHoldJointUnderstanding(sessionId: number | null) {
     onSuccess: (_result, { juId }) => _invalidateJointUnderstanding(qc, sessionId, juId),
   });
 }
+
+export function useResumeJointUnderstanding(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ juId }: { juId: number }) =>
+      api.post<import("@/api/types").JointUnderstandingOut>(
+        `/joint-understanding/${juId}/resume`,
+        {},
+      ),
+    onSuccess: (_result, { juId }) => _invalidateJointUnderstanding(qc, sessionId, juId),
+  });
+}
