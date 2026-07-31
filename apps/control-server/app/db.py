@@ -2997,6 +2997,7 @@ CREATE TABLE IF NOT EXISTS joint_understanding_reflux (
     target_id               INTEGER,
     statement               TEXT NOT NULL,
     evidence_json           TEXT NOT NULL DEFAULT '[]',
+    runtime_evidence_json   TEXT NOT NULL DEFAULT '[]',
     decision_method         TEXT NOT NULL DEFAULT 'reasoning_llm',
     intelligence_run_id     INTEGER,
     premise_snapshot_id     INTEGER,
@@ -4902,6 +4903,12 @@ def init_db() -> None:
             conn, "joint_understanding_session", ju_cols,
             "outcome_premise_state", "TEXT",
         )
+        reflux_cols = _columns(conn, "joint_understanding_reflux")
+        if reflux_cols and "runtime_evidence_json" not in reflux_cols:
+            conn.execute(
+                "ALTER TABLE joint_understanding_reflux "
+                "ADD COLUMN runtime_evidence_json TEXT NOT NULL DEFAULT '[]'"
+            )
         qa_cols = _columns(conn, "interview_qa")
         if qa_cols and "investigation_run_id" not in qa_cols:
             conn.execute(

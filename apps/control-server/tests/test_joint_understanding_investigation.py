@@ -213,6 +213,25 @@ def test_loop_stops_on_budget_and_reports_unread_candidates(tmp_path):
     assert result.rounds[0].files_read == 2
     # "not looked at" stays distinguishable from "not there".
     assert result.rounds[0].candidate_paths
+    assert result.rounds[0].unread_candidates
+
+
+def test_loop_stops_when_a_round_adds_no_validated_evidence(tmp_path):
+    repo, sha = _init_repo(tmp_path, REPO_FILES)
+    client = ScriptedLLMClient([_round_response(
+        findings=[{"claim_kind": "unknown", "statement": "まだ特定できない"}],
+        search_leads=["beta"], missing_evidence=["呼び出し関係"],
+    )])
+
+    result = run_investigation_loop(
+        client, _make_config(), repo_path=repo, commit_sha=sha,
+        question="alpha beta の関係は?", search_keywords=["alpha", "beta"],
+        budget=InvestigationLoopBudget(max_rounds=3, max_files_per_round=1),
+    )
+
+    assert result.stop_reason == "no_new_evidence"
+    assert len(result.rounds) == 1
+    assert len(client.prompts) == 1
 
 
 def test_loop_stop_reasons_are_from_the_finite_set(tmp_path):
@@ -307,6 +326,7 @@ def test_hypothesis_without_competing_explanations_is_dropped(tmp_path):
                 "evidence": [{"path": "src/alpha.py", "start_line": 1, "end_line": 2}],
                 "competing_explanations": ["キャッシュ由来"],
                 "refutation_conditions": ["設定を変えても再現する"],
+                "next_investigation": "設定を変えて再現を確認する",
             },
         ]),
     ])
@@ -518,6 +538,7 @@ def test_investigate_persists_rounds_findings_and_audit(admin_client, tmp_path, 
 
     detail = admin_client.get(f"/joint-understanding/{ju_id}", headers=headers).json()
     assert len(detail["investigation_rounds"]) == 2
+    assert [r["round_index"] for r in detail["investigation_rounds"]] == [1, 2]
     assert len(detail["findings"]) == 2
 
 

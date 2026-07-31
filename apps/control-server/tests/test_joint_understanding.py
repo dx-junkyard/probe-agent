@@ -48,17 +48,20 @@ def _valid_finding_kwargs(**overrides):
         origin_role="investigation",
         claim_kind="fact",
         decision_method="reasoning_llm",
-        evidence=[],
+        evidence=[{"path": "app/x.py", "start_line": 1, "end_line": 1}],
         runtime_evidence=[],
         supports_finding_ids=[],
         competing_explanations=[],
         refutation_conditions=[],
+        next_investigation=None,
         intelligence_run_id=7,
         is_mock=False,
         known_finding_ids=set(),
         supersedes_finding_id=None,
     )
     base.update(overrides)
+    if base["origin_role"] != "investigation" and "evidence" not in overrides:
+        base["evidence"] = []
     return base
 
 
@@ -136,9 +139,23 @@ def test_investigation_hypothesis_requires_competing_explanations_and_refutation
         validate_finding(**_valid_finding_kwargs(
             claim_kind="hypothesis", competing_explanations=["別解釈"],
         ))
+    with pytest.raises(JointUnderstandingValidationError, match="next investigation"):
+        validate_finding(**_valid_finding_kwargs(
+            claim_kind="hypothesis", competing_explanations=["別解釈"],
+            refutation_conditions=["逆の観測"],
+        ))
     validate_finding(**_valid_finding_kwargs(
         claim_kind="hypothesis",
         competing_explanations=["別解釈"], refutation_conditions=["逆の観測"],
+        next_investigation="設定を切り替えて再現を確認する",
+    ))
+
+
+def test_investigation_assertion_requires_evidence():
+    with pytest.raises(JointUnderstandingValidationError, match="must carry"):
+        validate_finding(**_valid_finding_kwargs(evidence=[], runtime_evidence=[]))
+    validate_finding(**_valid_finding_kwargs(
+        claim_kind="unknown", evidence=[], runtime_evidence=[],
     ))
 
 
@@ -173,7 +190,9 @@ def _exchange(**overrides) -> dict:
             "origin_kind": "qa", "origin_id": 1, "trigger": "unknown_answer",
             "question_text": "この経路は誰に影響しますか?",
             "status": "open", "outcome": None, "outcome_is_provisional": False,
-            "outcome_reason": None, "premise_snapshot_id": 1,
+            "outcome_reason": None, "outcome_finding_ids": [],
+            "outcome_premise_state": None, "premise_state": "fresh",
+            "premise_snapshot_id": 1, "schema_version": SCHEMA_VERSION,
             "created_at": 1.0, "updated_at": 1.0, "closed_at": None,
         },
         "findings": [],
@@ -252,7 +271,27 @@ def test_schema_requires_hypothesis_structure(ju_schema):
 
     bare_hypothesis["findings"][0]["competing_explanations"] = ["設定由来"]
     bare_hypothesis["findings"][0]["refutation_conditions"] = ["キャッシュ無効でも再現する"]
+    bare_hypothesis["findings"][0]["next_investigation"] = "キャッシュ無効時の挙動を調べる"
+    bare_hypothesis["findings"][0]["evidence"] = [
+        {"path": "app/cache.py", "start_line": 1, "end_line": 2}
+    ]
     jsonschema.validate(bare_hypothesis, ju_schema)
+
+
+def test_schema_rejects_inconsistent_session_outcome_state(ju_schema):
+    provisional = _exchange()
+    provisional["session"].update({
+        "status": "closed", "outcome": "hypothesis_adopted",
+        "outcome_is_provisional": False, "outcome_finding_ids": [1],
+        "outcome_premise_state": "fresh", "closed_at": 2.0,
+    })
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(provisional, ju_schema)
+
+    open_with_outcome = _exchange()
+    open_with_outcome["session"]["outcome"] = "understood"
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(open_with_outcome, ju_schema)
 
 
 # --- Route-level tests ---------------------------------------------------------
@@ -600,6 +639,44 @@ def test_supports_finding_ids_cannot_cross_sessions(admin_client):
     )
     assert cross.status_code == 422, cross.text
     assert "outside this session" in json.dumps(cross.json(), ensure_ascii=False)
+
+
+def test_finding_run_provenance_cannot_cross_systems(admin_client):
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session_id = _create_interview_session(admin_client, headers, snapshot_id)
+    qa = _create_qa(admin_client, headers, session_id)
+    ju_id = _open_session(
+        admin_client, headers, session_id, "qa", qa["id"],
+    ).json()["session"]["id"]
+
+    other = _create_system(admin_client, token, "Other")
+    other_snapshot = _insert_snapshot(other["id"], "other123")
+    from app.db import get_conn
+
+    now = time.time()
+    with get_conn() as conn:
+        other_run = conn.execute(
+            """INSERT INTO intelligence_runs
+                (system_id, snapshot_id, run_type, provider, model, prompt_version,
+                 schema_version, decision_method, status, is_mock, started_at)
+               VALUES (?, ?, 'investigation', 'anthropic', 'claude', 'p', 's',
+                       'reasoning_llm', 'completed', 0, ?)""",
+            (other["id"], other_snapshot, now),
+        ).lastrowid
+
+    response = admin_client.post(
+        f"/joint-understanding/{ju_id}/findings",
+        json={
+            "origin_role": "investigation", "claim_kind": "fact",
+            "statement": "別Systemのrunを借りる",
+            "evidence": [{"path": "app/x.py", "start_line": 1, "end_line": 1}],
+            "decision_method": "reasoning_llm", "intelligence_run_id": other_run,
+        },
+        headers=headers,
+    )
+    assert response.status_code == 422
+    assert "this System" in response.text
 
 
 def test_unknown_vocabulary_values_are_422(admin_client):

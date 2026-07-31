@@ -3765,6 +3765,7 @@ class JointUnderstandingRefluxOut(BaseModel):
     target_id: Optional[int] = None
     statement: str
     evidence: List[JointUnderstandingEvidenceOut] = Field(default_factory=list)
+    runtime_evidence: List[JointUnderstandingRuntimeEvidenceOut] = Field(default_factory=list)
     decision_method: Literal["reasoning_llm"] = "reasoning_llm"
     intelligence_run_id: Optional[int] = None
     premise_snapshot_id: Optional[int] = None
@@ -3782,6 +3783,7 @@ class JointUnderstandingRefluxResultOut(BaseModel):
     # Findings that stayed inside the conversation because they are not
     # system-established facts (inference / hypothesis / unknown / conflict).
     skipped_not_fact: int = 0
+    skipped_unverified: int = 0
 
 
 JointUnderstandingDetailOut.model_rebuild()

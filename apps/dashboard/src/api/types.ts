@@ -4134,6 +4134,7 @@ export interface JointUnderstandingRefluxOut {
   target_id: number | null;
   statement: string;
   evidence: JointUnderstandingEvidenceOut[];
+  runtime_evidence: JointUnderstandingRuntimeEvidenceOut[];
   decision_method: "reasoning_llm";
   intelligence_run_id: number | null;
   premise_snapshot_id: number | null;
@@ -4200,4 +4201,5 @@ export interface JointUnderstandingRefluxResultOut {
   refluxed: JointUnderstandingRefluxOut[];
   already_refluxed: number;
   skipped_not_fact: number;
+  skipped_unverified: number;
 }

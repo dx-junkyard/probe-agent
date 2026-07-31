@@ -335,12 +335,21 @@ def translate_findings(
         ))
 
     options: List[TranslatedOption] = []
+    first_layer = [s for s in statements if s.layer in ("purpose", "impact")]
+    if not first_layer:
+        return TranslationResult(
+            provider=config.provider, model=config.model, is_mock=False,
+            error="Translation must contain a grounded purpose or impact statement",
+        )
     for raw_option in validated.options:
         unknown = [i for i in raw_option.supports_finding_ids if i not in known_ids]
-        if unknown:
+        if unknown or not raw_option.supports_finding_ids:
             return TranslationResult(
                 provider=config.provider, model=config.model, is_mock=False,
-                error=f"Option cites finding ids that were not supplied: {unknown}",
+                error=(
+                    "Every translated option must cite supplied finding ids; "
+                    f"offending refs: {unknown or 'none supplied'}"
+                ),
             )
         options.append(TranslatedOption(
             label=raw_option.label,
@@ -357,7 +366,10 @@ def translate_findings(
 
     return TranslationResult(
         provider=config.provider, model=config.model, is_mock=False,
-        purpose_summary=validated.purpose_summary,
+        # The primary summary is assembled only from already-validated,
+        # attributable first-layer statements.  The model's standalone draft
+        # is deliberately not persisted because it has no finding-id field.
+        purpose_summary=" ".join(s.text for s in first_layer),
         statements=statements,
         options=options,
         open_unknowns=list(validated.open_unknowns),

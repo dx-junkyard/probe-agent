@@ -303,7 +303,16 @@ creating incomplete persistence or execution paths for later phases.
     - #334 (Phase F) — 8 quality metrics in their own `joint_understanding`
       category on the #309 pipeline, deterministic, `unmeasured` when there
       is nothing to measure, never merged with the efficiency numbers.
-    **Status: #329-#334 are implemented and verified.**
+    **Status (2026-07-31 audit): #329-#334 are implemented and hardened, but
+    their original intent is not complete in the production flow.** The
+    deterministic gaps that could be fixed locally (evidence/provenance
+    validation, resumable round numbering, grounded translation, cumulative
+    reflux, action audit/resume, and metric supersession) are covered here.
+    The remaining product/architecture decisions were split into #336
+    (single production flow), #337 (premise/provenance/decision audit), #338
+    (outcome-lineage quality metrics), and #339 (investigation breadth and
+    Question Router integration). #328-#334 were then closed in favor of
+    those narrower follow-ups.
     #327 was closed `not_planned` and fully absorbed into this Epic; its
     design notes remain valid in `docs/system-understanding-ideal-state.md`.
     #311 (低リスク提案の一括承認) is still NOT implemented and is not a

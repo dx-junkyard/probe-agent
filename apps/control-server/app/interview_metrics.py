@@ -400,10 +400,19 @@ def _joint_understanding_metrics(
     )
 
     findings = conn.execute(
-        "SELECT origin_role, claim_kind FROM joint_understanding_finding WHERE system_id = ?",
+        "SELECT id, origin_role, claim_kind, supersedes_finding_id "
+        "FROM joint_understanding_finding WHERE system_id = ?",
         (system_id,),
     ).fetchall()
-    investigation = [r for r in findings if r["origin_role"] == "investigation"]
+    superseded_ids = {
+        r["supersedes_finding_id"]
+        for r in findings
+        if r["supersedes_finding_id"] is not None
+    }
+    investigation = [
+        r for r in findings
+        if r["origin_role"] == "investigation" and r["id"] not in superseded_ids
+    ]
     kinds = Counter(r["claim_kind"] for r in investigation)
     metrics.append(
         _measured(

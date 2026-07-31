@@ -530,7 +530,9 @@ def _validate_round_findings(
             dropped += 1
             continue
         if raw.claim_kind == "hypothesis" and (
-            not raw.competing_explanations or not raw.refutation_conditions
+            not raw.competing_explanations
+            or not raw.refutation_conditions
+            or not raw.next_investigation
         ):
             dropped += 1
             continue
@@ -609,6 +611,7 @@ def run_investigation_loop(
     carry_over: Optional[LoopCarryOver] = None,
     system_id: Optional[int] = None,
     snapshot_id: Optional[int] = None,
+    round_index_offset: int = 0,
 ) -> InvestigationLoopResult:
     """Investigate ``question`` over multiple rounds against the pinned snapshot.
 
@@ -660,7 +663,8 @@ def run_investigation_loop(
     remaining_chars = budget.max_snippet_chars
     stop_reason: Optional[str] = None
 
-    for round_index in range(1, budget.max_rounds + 1):
+    for local_round_index in range(1, budget.max_rounds + 1):
+        round_index = round_index_offset + local_round_index
         round_start = time.monotonic()
         if len(result.rounds) >= budget.max_llm_calls:
             stop_reason = "budget_exhausted"
@@ -690,17 +694,18 @@ def run_investigation_loop(
                     conn, system_id, snapshot_id, keywords, budget.max_files_per_round * 3,
                 )
 
+        read_limit = min(budget.max_files_per_round, remaining_files)
         candidates = _round_candidates(
             paths=paths, keywords=keywords, index_paths=index_paths,
             already_read=already_read,
-            limit=min(budget.max_files_per_round, remaining_files),
+            limit=max(read_limit + 1, budget.max_files_per_round * 3),
         )
         if not candidates:
             stop_reason = "no_new_evidence" if result.rounds else "unresolved"
             break
 
         round_budget = InvestigationBudget(
-            max_files=min(budget.max_files_per_round, remaining_files),
+            max_files=read_limit,
             max_snippet_chars=remaining_chars,
             max_llm_calls=1,
             max_evidence_items=20,
@@ -812,6 +817,14 @@ def run_investigation_loop(
             elapsed_seconds=time.monotonic() - round_start,
         ))
         result.findings.extend(findings)
+
+        # "New evidence" means a newly validated snapshot/runtime citation,
+        # not merely that another file happened to be opened.  An ungrounded
+        # unknown is still preserved as the round result, but it must not keep
+        # spending the investigation budget.
+        if not any(f.evidence or f.runtime_evidence for f in findings):
+            stop_reason = "no_new_evidence"
+            break
 
         # Carry-over for the next round AND for a later retry: leads already
         # consumed as read paths are dropped so a retry does not re-propose
