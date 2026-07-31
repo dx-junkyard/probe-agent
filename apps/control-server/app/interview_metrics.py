@@ -301,6 +301,197 @@ def _implementation_question_transfer_metric(
     )
 
 
+def _joint_understanding_metrics(
+    conn: sqlite3.Connection, system_id: int,
+) -> "list[InterviewMetricOut]":
+    """Joint-understanding quality metrics (Epic #328 Phase F / Issue #334).
+
+    These answer "did shared understanding improve?", and they are kept in
+    their own ``joint_understanding`` category precisely so they are never
+    read as, or averaged with, the efficiency numbers above (Epic #328: 確認
+    件数や承認速度の削減を、共同理解の質より先に最適化する流れ を置き換える).
+
+    Every value is a deterministic count over persisted rows -- no reasoning
+    model, no self-reported quality score, no estimate. When a denominator is
+    zero the metric is returned ``unmeasured`` with a stable reason, exactly
+    like the Issue #309 metrics.
+    """
+    metrics: list[InterviewMetricOut] = []
+
+    sessions = conn.execute(
+        "SELECT status, outcome, trigger, outcome_premise_state "
+        "FROM joint_understanding_session WHERE system_id = ?",
+        (system_id,),
+    ).fetchall()
+    total = len(sessions)
+    closed = [r for r in sessions if r["status"] == "closed"]
+    outcomes = Counter(r["outcome"] for r in closed if r["outcome"])
+    from_unknown = sum(1 for r in sessions if r["trigger"] == "unknown_answer")
+
+    metrics.append(
+        _measured(
+            key="joint_understanding_from_unknown_rate",
+            category="joint_understanding",
+            guardrail=False,
+            description=(
+                "共同理解セッションのうち「わからない」から始まった割合。"
+                "「わからない」が終端ではなく開始点として使われているかを見る。"
+            ),
+            formula="sessions with trigger=unknown_answer / joint understanding sessions",
+            sources=["joint_understanding_session.trigger"],
+            unit="ratio",
+            numerator=from_unknown,
+            denominator=total,
+        )
+    )
+    metrics.append(
+        _measured(
+            key="joint_understanding_conclusion_rate",
+            category="joint_understanding",
+            guardrail=False,
+            description=(
+                "閉じた共同理解セッションのうち、理解・疑問解消・暫定採用・"
+                "正式判断のいずれかに到達した割合(中断・引き継ぎを除く)。"
+            ),
+            formula=(
+                "closed sessions with outcome in (understood, doubt_resolved, "
+                "hypothesis_adopted, decided) / closed sessions"
+            ),
+            sources=["joint_understanding_session.outcome"],
+            unit="ratio",
+            numerator=sum(
+                outcomes[o]
+                for o in ("understood", "doubt_resolved", "hypothesis_adopted", "decided")
+            ),
+            denominator=len(closed),
+        )
+    )
+    metrics.append(
+        _measured(
+            key="joint_understanding_provisional_outcome_rate",
+            category="joint_understanding",
+            guardrail=True,
+            description=(
+                "閉じたセッションのうち暫定採用で終わった割合。"
+                "高止まりは、事実として確かめきれないまま前へ進めていることを示す。"
+            ),
+            formula="closed sessions with outcome=hypothesis_adopted / closed sessions",
+            sources=["joint_understanding_session.outcome"],
+            unit="ratio",
+            numerator=outcomes["hypothesis_adopted"],
+            denominator=len(closed),
+        )
+    )
+    metrics.append(
+        _measured(
+            key="joint_understanding_stale_premise_close_rate",
+            category="joint_understanding",
+            guardrail=True,
+            description=(
+                "閉じたセッションのうち、前提スナップショットが変わった状態で"
+                "閉じた割合。調査中の前提変更が理解へ与えた影響を見る。"
+            ),
+            formula="closed sessions with outcome_premise_state='stale' / closed sessions",
+            sources=["joint_understanding_session.outcome_premise_state"],
+            unit="ratio",
+            numerator=sum(1 for r in closed if r["outcome_premise_state"] == "stale"),
+            denominator=len(closed),
+        )
+    )
+
+    findings = conn.execute(
+        "SELECT origin_role, claim_kind FROM joint_understanding_finding WHERE system_id = ?",
+        (system_id,),
+    ).fetchall()
+    investigation = [r for r in findings if r["origin_role"] == "investigation"]
+    kinds = Counter(r["claim_kind"] for r in investigation)
+    metrics.append(
+        _measured(
+            key="joint_understanding_unknown_finding_rate",
+            category="joint_understanding",
+            guardrail=True,
+            description=(
+                "調査 Finding のうち「調べたが分からなかった」と記録された割合。"
+                "証拠不足をもっともらしさで埋めていないかのガードレール。"
+            ),
+            formula="investigation findings with claim_kind='unknown' / investigation findings",
+            sources=["joint_understanding_finding.claim_kind"],
+            unit="ratio",
+            numerator=kinds["unknown"],
+            denominator=len(investigation),
+        )
+    )
+
+    refluxed = int(
+        conn.execute(
+            "SELECT COUNT(*) AS n FROM joint_understanding_reflux WHERE system_id = ?",
+            (system_id,),
+        ).fetchone()["n"]
+    )
+    metrics.append(
+        _measured(
+            key="joint_understanding_reflux_rate",
+            category="joint_understanding",
+            guardrail=False,
+            description=(
+                "調査で確認できた事実のうち、ユーザーが回答へ転記せずに理解へ"
+                "反映された割合。Epic #328 の中心的な改善点。"
+            ),
+            formula="refluxed findings / investigation findings with claim_kind='fact'",
+            sources=["joint_understanding_reflux", "joint_understanding_finding.claim_kind"],
+            unit="ratio",
+            numerator=refluxed,
+            denominator=kinds["fact"],
+        )
+    )
+
+    rounds = conn.execute(
+        "SELECT stop_reason FROM joint_understanding_investigation_round "
+        "WHERE system_id = ? AND stop_reason IS NOT NULL",
+        (system_id,),
+    ).fetchall()
+    stop_reasons = Counter(r["stop_reason"] for r in rounds)
+    metrics.append(
+        _measured(
+            key="joint_understanding_investigation_answered_rate",
+            category="joint_understanding",
+            guardrail=False,
+            description=(
+                "終了した反復調査のうち、追加の人への質問なしに答えへ到達した割合。"
+                "人への質問がコード調査の代替になっていないかを見る。"
+            ),
+            formula="investigation loops with stop_reason='answered' / investigation loops",
+            sources=["joint_understanding_investigation_round.stop_reason"],
+            unit="ratio",
+            numerator=stop_reasons["answered"],
+            denominator=sum(stop_reasons.values()),
+        )
+    )
+
+    translations = conn.execute(
+        "SELECT ask_developer FROM joint_understanding_translation WHERE system_id = ?",
+        (system_id,),
+    ).fetchall()
+    metrics.append(
+        _measured(
+            key="joint_understanding_developer_question_rate",
+            category="joint_understanding",
+            guardrail=False,
+            description=(
+                "通訳のうち、実際に開発者への判断質問まで到達した割合。"
+                "低いことが良いとは限らない — 質問数ではなく判断材料の有無を見る指標。"
+            ),
+            formula="translations with ask_developer=1 / translations",
+            sources=["joint_understanding_translation.ask_developer"],
+            unit="ratio",
+            numerator=sum(1 for r in translations if r["ask_developer"]),
+            denominator=len(translations),
+        )
+    )
+
+    return metrics
+
+
 def build_interview_metrics(
     conn: sqlite3.Connection,
     system_id: int,
@@ -643,6 +834,7 @@ def build_interview_metrics(
     )
     metrics.append(_origin_return_metric(conn, system_id))
     metrics.append(_implementation_question_transfer_metric(conn, system_id))
+    metrics.extend(_joint_understanding_metrics(conn, system_id))
 
     return InterviewMetricsOut(
         system_id=system_id,

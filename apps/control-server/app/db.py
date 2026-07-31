@@ -2771,6 +2771,249 @@ CREATE TABLE IF NOT EXISTS interview_inquiry_transition (
 CREATE INDEX IF NOT EXISTS idx_interview_inquiry_transition_inquiry
     ON interview_inquiry_transition (inquiry_id, id);
 
+-- Joint Understanding sessions (Epic #328 Phase A / Issue #329). What
+-- 「わからない」 STARTS instead of ending: a shared workspace where
+-- investigation findings, translated explanations, and the developer's own
+-- judgements accumulate in separate provenances until the developer picks a
+-- next action and closes the session with an explicitly typed outcome.
+--
+-- Boundary this table set exists to keep (Epic #328: 「わからない」という入力
+-- を開発者の意図として混入させない): NOTHING here ever writes the origin
+-- confirmation item. interview_qa.answer_text/status,
+-- interview_intent_item.value_text/status, and alignment_item.user_decision/
+-- status are read-only from this feature's point of view -- unlike Issue
+-- #287's Inquiry integration, a Joint Understanding session does not even
+-- mirror an 'inquiry'-style status onto alignment_item (Phase D / #332 owns
+-- the question of how these two flows integrate). question_text lives on the
+-- session row only; it is never copied into an answer field and never
+-- becomes a developer finding.
+--
+-- All three tables are System-scoped and every vocabulary column
+-- (origin_kind/trigger/status/outcome/origin_role/claim_kind/action_kind/
+-- decision_method) is validated against the finite sets in
+-- app/joint_understanding.py before insert (Principle 6).
+CREATE TABLE IF NOT EXISTS joint_understanding_session (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id          INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    origin_kind         TEXT NOT NULL,
+    origin_id           INTEGER NOT NULL,
+    trigger             TEXT NOT NULL,
+    question_text       TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'open',
+    outcome             TEXT,
+    outcome_reason      TEXT,
+    -- Issue #332: which findings the recorded outcome rests on, and the
+    -- premise state evaluated at close time ('fresh' | 'stale'). An outcome
+    -- that adopts a hypothesis or records a decision must name its basis;
+    -- a stale premise (the interview session moved to a newer snapshot than
+    -- the one this session pinned) blocks adopt/decide entirely.
+    outcome_finding_ids TEXT NOT NULL DEFAULT '[]',
+    outcome_premise_state TEXT,
+    -- The snapshot this session's investigation is pinned to, captured at
+    -- creation (same discipline as an Inquiry's premise bundle, Issue #308)
+    -- so a later round is never silently rebased onto a newer snapshot.
+    premise_snapshot_id INTEGER,
+    schema_version      TEXT NOT NULL,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    closed_at           REAL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (premise_snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_joint_understanding_session_session
+    ON joint_understanding_session (session_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_joint_understanding_session_origin
+    ON joint_understanding_session (system_id, origin_kind, origin_id);
+
+-- Append-only. A correction is a NEW row carrying supersedes_finding_id;
+-- existing rows are never UPDATEd or DELETEd, so an explanation can always
+-- be traced back to the exact claim and evidence it came from even after it
+-- was revised. origin_role/claim_kind are independent axes: WHO produced the
+-- statement vs WHAT kind of statement it is (fact/inference/hypothesis/
+-- unknown/conflict). Only origin_role='investigation' rows may carry
+-- evidence_json/runtime_evidence_json -- a translation references findings
+-- via supports_finding_ids and a developer statement is a judgement, not
+-- snapshot evidence (app/joint_understanding.validate_finding).
+CREATE TABLE IF NOT EXISTS joint_understanding_finding (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    joint_understanding_id  INTEGER NOT NULL,
+    system_id               INTEGER NOT NULL,
+    origin_role             TEXT NOT NULL,
+    claim_kind              TEXT NOT NULL,
+    statement               TEXT NOT NULL,
+    evidence_json           TEXT NOT NULL DEFAULT '[]',
+    runtime_evidence_json   TEXT NOT NULL DEFAULT '[]',
+    supports_finding_ids    TEXT NOT NULL DEFAULT '[]',
+    competing_explanations  TEXT NOT NULL DEFAULT '[]',
+    refutation_conditions   TEXT NOT NULL DEFAULT '[]',
+    next_investigation      TEXT,
+    uncertainty             TEXT NOT NULL DEFAULT '',
+    supersedes_finding_id   INTEGER,
+    decision_method         TEXT NOT NULL,
+    intelligence_run_id     INTEGER,
+    is_mock                 INTEGER NOT NULL DEFAULT 0,
+    created_at              REAL NOT NULL,
+    FOREIGN KEY (joint_understanding_id)
+        REFERENCES joint_understanding_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (supersedes_finding_id)
+        REFERENCES joint_understanding_finding (id) ON DELETE SET NULL,
+    FOREIGN KEY (intelligence_run_id)
+        REFERENCES intelligence_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_joint_understanding_finding_session
+    ON joint_understanding_finding (joint_understanding_id, id);
+
+-- The finite next understanding actions the developer chose, append-only.
+-- decision_method is always 'manual': choosing an action is the human's own
+-- record of what they want to do next, and it never approves, adopts, or
+-- decides the origin item by itself.
+CREATE TABLE IF NOT EXISTS joint_understanding_action (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    joint_understanding_id  INTEGER NOT NULL,
+    system_id               INTEGER NOT NULL,
+    action_kind             TEXT NOT NULL,
+    actor                   TEXT,
+    note                    TEXT,
+    decision_method         TEXT NOT NULL DEFAULT 'manual',
+    created_at              REAL NOT NULL,
+    FOREIGN KEY (joint_understanding_id)
+        REFERENCES joint_understanding_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_joint_understanding_action_session
+    ON joint_understanding_action (joint_understanding_id, id);
+
+-- One iterative investigation round (Epic #328 Phase B / Issue #330).
+-- Append-only audit of what a round actually did -- which candidates it
+-- picked, which files it read, which it left unread, why it stopped -- plus
+-- the state that must survive into the NEXT round and into a later RETRY:
+-- search_leads / open_hypotheses / missing_evidence / read_paths. Restoring
+-- those on retry is what keeps a re-run from starting over from the bare
+-- question (Epic #328: 調査の再試行で、既に得た調査方針や検索手がかりを失わない).
+-- stop_reason is only set on the round that ended the loop, and is one of
+-- the finite investigation_loop.STOP_REASONS.
+CREATE TABLE IF NOT EXISTS joint_understanding_investigation_round (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    joint_understanding_id  INTEGER NOT NULL,
+    system_id               INTEGER NOT NULL,
+    round_index             INTEGER NOT NULL,
+    status                  TEXT NOT NULL,
+    stop_reason             TEXT,
+    conclusion              TEXT NOT NULL DEFAULT '',
+    search_leads            TEXT NOT NULL DEFAULT '[]',
+    open_hypotheses         TEXT NOT NULL DEFAULT '[]',
+    missing_evidence        TEXT NOT NULL DEFAULT '[]',
+    read_paths              TEXT NOT NULL DEFAULT '[]',
+    unread_candidates       TEXT NOT NULL DEFAULT '[]',
+    pruned_findings         INTEGER NOT NULL DEFAULT 0,
+    files_read              INTEGER NOT NULL DEFAULT 0,
+    chars_read              INTEGER NOT NULL DEFAULT 0,
+    llm_calls               INTEGER NOT NULL DEFAULT 0,
+    elapsed_seconds         REAL NOT NULL DEFAULT 0,
+    intelligence_run_id     INTEGER,
+    error_details           TEXT,
+    created_at              REAL NOT NULL,
+    FOREIGN KEY (joint_understanding_id)
+        REFERENCES joint_understanding_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id)
+        REFERENCES intelligence_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_joint_understanding_round_session
+    ON joint_understanding_investigation_round (joint_understanding_id, id);
+
+-- One translation pass (Epic #328 Phase C / Issue #331): the investigation's
+-- findings restated in terms of purpose, user impact, the gap against that
+-- purpose, system-wide consistency, and which decision changes what.
+--
+-- The translated SENTENCES are also stored as ordinary
+-- joint_understanding_finding rows with origin_role='translation' (that is
+-- the append-only spine, and it is what carries supports_finding_ids), so
+-- this table holds the parts that are not a single statement: the summary,
+-- the option comparison, what is still unknown, and whether the pass
+-- concluded that a question actually has to go to the developer.
+-- statements_json therefore stores each statement's translation finding id,
+-- never a second copy of the sentence's provenance.
+CREATE TABLE IF NOT EXISTS joint_understanding_translation (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    joint_understanding_id  INTEGER NOT NULL,
+    system_id               INTEGER NOT NULL,
+    purpose_summary         TEXT NOT NULL DEFAULT '',
+    statements_json         TEXT NOT NULL DEFAULT '[]',
+    options_json            TEXT NOT NULL DEFAULT '[]',
+    open_unknowns           TEXT NOT NULL DEFAULT '[]',
+    decision_question       TEXT,
+    ask_developer           INTEGER NOT NULL DEFAULT 0,
+    intelligence_run_id     INTEGER,
+    is_mock                 INTEGER NOT NULL DEFAULT 0,
+    created_at              REAL NOT NULL,
+    FOREIGN KEY (joint_understanding_id)
+        REFERENCES joint_understanding_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id)
+        REFERENCES intelligence_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_joint_understanding_translation_session
+    ON joint_understanding_translation (joint_understanding_id, id);
+
+-- Reflux of system-verified facts into the understanding surface
+-- (Epic #328 Phase D / Issue #332).
+--
+-- The flow this replaces: an investigation result only reached System
+-- Understanding if a HUMAN retyped it into an answer field. A reflux row
+-- records that an investigation finding (origin_role='investigation',
+-- claim_kind='fact') has been attached to the understanding surface WITH its
+-- evidence and WITHOUT being recorded as anyone's answer:
+-- decision_method is always 'reasoning_llm' here, never 'manual', and
+-- nothing in this path writes interview_qa.answer_text/status,
+-- interview_intent_item.value_text/status, or alignment_item.user_decision.
+--
+-- target_kind is a finite set of EXISTING structures (no third understanding
+-- model is introduced):
+--   'qa_investigation'  -- interview_qa.investigation_json/_run_id, the same
+--                          slot Issue #286's route-and-investigate writes and
+--                          which is by construction not the answer
+--   'session_ledger'    -- this table alone, for origins with no such slot
+--                          (intent / review_item / inquiry). Their built rows
+--                          are owned by the Alignment/Understanding rebuild,
+--                          so writing a fact into them would be silently
+--                          overwritten -- the ledger keeps the fact readable
+--                          and attributable instead.
+CREATE TABLE IF NOT EXISTS joint_understanding_reflux (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    joint_understanding_id  INTEGER NOT NULL,
+    system_id               INTEGER NOT NULL,
+    finding_id              INTEGER NOT NULL,
+    target_kind             TEXT NOT NULL,
+    target_id               INTEGER,
+    statement               TEXT NOT NULL,
+    evidence_json           TEXT NOT NULL DEFAULT '[]',
+    decision_method         TEXT NOT NULL DEFAULT 'reasoning_llm',
+    intelligence_run_id     INTEGER,
+    premise_snapshot_id     INTEGER,
+    created_at              REAL NOT NULL,
+    UNIQUE (joint_understanding_id, finding_id),
+    FOREIGN KEY (joint_understanding_id)
+        REFERENCES joint_understanding_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (finding_id)
+        REFERENCES joint_understanding_finding (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id)
+        REFERENCES intelligence_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_joint_understanding_reflux_session
+    ON joint_understanding_reflux (joint_understanding_id, id);
+
 -- Alignment Review / Review Queue (Issue #287). Contrasts confirmed/proposed
 -- Intent Brief items (interview_intent_item, Issue #284) against the
 -- evidence-backed Current System understanding (the latest
@@ -4645,6 +4888,20 @@ def init_db() -> None:
         # investigates a system_researchable/hybrid question -- a failed
         # investigation leaves them NULL (audit-only failed run), and
         # human_only questions never get one at all.
+        # Issue #332: a database created at Issue #329 has the Joint
+        # Understanding tables without the outcome-basis columns. Added
+        # additively here (NULL/absent on existing rows is correct: those
+        # sessions closed before an outcome basis was recorded).
+        ju_cols = _columns(conn, "joint_understanding_session")
+        if ju_cols and "outcome_finding_ids" not in ju_cols:
+            conn.execute(
+                "ALTER TABLE joint_understanding_session "
+                "ADD COLUMN outcome_finding_ids TEXT NOT NULL DEFAULT '[]'"
+            )
+        _add_column_if_missing(
+            conn, "joint_understanding_session", ju_cols,
+            "outcome_premise_state", "TEXT",
+        )
         qa_cols = _columns(conn, "interview_qa")
         if qa_cols and "investigation_run_id" not in qa_cols:
             conn.execute(

@@ -29,6 +29,8 @@ class IntelligenceRunType(str, Enum):
     INTERVIEW_EVIDENCE_SELECTION = "interview_evidence_selection"
     INTERVIEW_PROPOSAL = "interview_proposal"
     INVESTIGATION = "investigation"
+    JOINT_INVESTIGATION = "joint_investigation"
+    JOINT_TRANSLATION = "joint_translation"
     NL_CHANGE_SET = "nl_change_set"
     PATTERN_INVESTIGATE = "pattern_investigate"
     PATTERN_RECONCILE = "pattern_reconcile"

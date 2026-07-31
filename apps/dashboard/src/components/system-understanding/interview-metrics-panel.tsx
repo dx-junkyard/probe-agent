@@ -33,15 +33,29 @@ const METRIC_LABELS: Record<InterviewMetricKey, string> = {
   inquiry_resolution_rate: "疑問解消率",
   post_inquiry_confirmation_rate: "疑問解消後の明示回答完了率",
   implementation_question_transfer_rate: "実装質問のユーザー転嫁率",
+  // Epic #328 Phase F (#334): 共同理解の質。効率化指標とは別カテゴリで表示する。
+  joint_understanding_from_unknown_rate: "「わからない」から始まった共同理解の割合",
+  joint_understanding_conclusion_rate: "共同理解が結論に至った割合",
+  joint_understanding_provisional_outcome_rate: "暫定採用で終わった割合",
+  joint_understanding_stale_premise_close_rate: "前提が古いまま終了した割合",
+  joint_understanding_unknown_finding_rate: "「分からなかった」と記録した調査結果の割合",
+  joint_understanding_reflux_rate: "回答へ転記せず理解へ反映された事実の割合",
+  joint_understanding_investigation_answered_rate: "調査だけで答えに到達した割合",
+  joint_understanding_developer_question_rate: "判断質問まで到達した通訳の割合",
 };
 
 const CATEGORY_LABELS: Record<InterviewMetricCategory, string> = {
   user_burden: "ユーザー負担",
   accuracy: "精度",
   ux_quality: "UX品質",
+  joint_understanding: "共同理解の質",
 };
 
-const CATEGORY_ORDER: InterviewMetricCategory[] = ["user_burden", "accuracy", "ux_quality"];
+// 共同理解の質は最後の独立したセクションとして並べる — 効率化指標と同じ
+// グループに混ぜない(Issue #334)。
+const CATEGORY_ORDER: InterviewMetricCategory[] = [
+  "user_burden", "accuracy", "ux_quality", "joint_understanding",
+];
 const METRIC_ORDER = Object.keys(METRIC_LABELS) as InterviewMetricKey[];
 
 function metricOrder(metric: InterviewMetricOut): number {

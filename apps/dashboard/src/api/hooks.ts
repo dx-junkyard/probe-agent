@@ -2872,3 +2872,147 @@ export function useDecideCellAsk() {
     onSuccess: () => invalidateCellFabric(qc),
   });
 }
+
+// --- 共同理解セッション(Epic #328 / Issue #329-#332)------------------------
+//
+// 「わからない」から始まる共同理解の対話。どのフックも元の確認項目
+// (Q&A / Intent / Review item / Inquiry)へは書き込まない — 項目の確定は
+// 引き続き項目自身のエンドポイントだけが行う。
+//
+// 型は `@/api/types` の Joint* 定義を使う(サーバの有限語彙をそのまま保持し、
+// 表示ラベルだけコンポーネント側で日本語化する)。
+
+function _invalidateJointUnderstanding(
+  qc: ReturnType<typeof useQueryClient>,
+  sessionId: number | null,
+  juId: number,
+) {
+  qc.invalidateQueries({ queryKey: [...sysKey("jointUnderstanding"), juId] });
+  if (sessionId) {
+    qc.invalidateQueries({ queryKey: [...sysKey("jointUnderstandingList"), sessionId] });
+  }
+}
+
+export function useJointUnderstandingList(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("jointUnderstandingList"), sessionId],
+    queryFn: () =>
+      api.get<import("@/api/types").JointUnderstandingListOut>(
+        `/interview/sessions/${sessionId}/joint-understanding`,
+      ),
+    enabled: !!sessionId && !!getSystemId(),
+  });
+}
+
+export function useJointUnderstandingDetail(juId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("jointUnderstanding"), juId],
+    queryFn: () =>
+      api.get<import("@/api/types").JointUnderstandingDetailOut>(
+        `/joint-understanding/${juId}`,
+      ),
+    enabled: !!juId && !!getSystemId(),
+  });
+}
+
+export function useCreateJointUnderstanding(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: {
+      origin_kind: import("@/api/types").JointUnderstandingOriginKind;
+      origin_id: number;
+      trigger: import("@/api/types").JointUnderstandingTrigger;
+      question_text: string;
+    }) =>
+      api.post<import("@/api/types").JointUnderstandingDetailOut>(
+        `/interview/sessions/${sessionId}/joint-understanding`,
+        data,
+      ),
+    onSuccess: result => _invalidateJointUnderstanding(qc, sessionId, result.session.id),
+  });
+}
+
+export function useInvestigateJointUnderstanding(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ juId, maxRounds }: { juId: number; maxRounds?: number }) =>
+      api.post<import("@/api/types").JointUnderstandingInvestigateOut>(
+        `/joint-understanding/${juId}/investigate`,
+        maxRounds ? { max_rounds: maxRounds } : {},
+      ),
+    onSuccess: (_result, { juId }) => _invalidateJointUnderstanding(qc, sessionId, juId),
+  });
+}
+
+export function useTranslateJointUnderstanding(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ juId, goalHint }: { juId: number; goalHint?: string }) =>
+      api.post<import("@/api/types").JointUnderstandingTranslateOut>(
+        `/joint-understanding/${juId}/translate`,
+        goalHint ? { goal_hint: goalHint } : {},
+      ),
+    onSuccess: (_result, { juId }) => _invalidateJointUnderstanding(qc, sessionId, juId),
+  });
+}
+
+export function useRecordJointUnderstandingAction(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ juId, actionKind, note }: {
+      juId: number;
+      actionKind: import("@/api/types").JointUnderstandingActionKind;
+      note?: string;
+    }) =>
+      api.post<import("@/api/types").JointUnderstandingDetailOut>(
+        `/joint-understanding/${juId}/actions`,
+        { action_kind: actionKind, note: note ?? null },
+      ),
+    onSuccess: (_result, { juId }) => _invalidateJointUnderstanding(qc, sessionId, juId),
+  });
+}
+
+export function useRefluxJointUnderstanding(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ juId }: { juId: number }) =>
+      api.post<import("@/api/types").JointUnderstandingRefluxResultOut>(
+        `/joint-understanding/${juId}/reflux`,
+        {},
+      ),
+    onSuccess: (_result, { juId }) => _invalidateJointUnderstanding(qc, sessionId, juId),
+  });
+}
+
+export function useCloseJointUnderstanding(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ juId, outcome, outcomeFindingIds, reason }: {
+      juId: number;
+      outcome: import("@/api/types").JointUnderstandingOutcome;
+      outcomeFindingIds?: number[];
+      reason?: string;
+    }) =>
+      api.post<import("@/api/types").JointUnderstandingOut>(
+        `/joint-understanding/${juId}/close`,
+        {
+          outcome,
+          outcome_finding_ids: outcomeFindingIds ?? [],
+          outcome_reason: reason ?? null,
+        },
+      ),
+    onSuccess: (_result, { juId }) => _invalidateJointUnderstanding(qc, sessionId, juId),
+  });
+}
+
+export function useHoldJointUnderstanding(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ juId }: { juId: number }) =>
+      api.post<import("@/api/types").JointUnderstandingOut>(
+        `/joint-understanding/${juId}/hold`,
+        {},
+      ),
+    onSuccess: (_result, { juId }) => _invalidateJointUnderstanding(qc, sessionId, juId),
+  });
+}

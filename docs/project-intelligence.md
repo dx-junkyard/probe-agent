@@ -4662,3 +4662,429 @@ Issue #297 と sub-issue #298-#304 の実装レビュー後に残った運用上
 - 同一 Cell ID / roster を持つ別 System を positive-collision fixture
   とし、binding / trace / topology / task evidence が一切漏れないことを
   end-to-end で確認する。
+
+---
+
+## 共同理解セッション(Epic #328)
+
+Epic #328 は、開発者が「わからない」と答えた地点を**終端**ではなく**共同で状況
+理解を作る工程の開始点**として扱うための Epic である。既存の Interview(#282
+系)、Inquiry(#285/#286)、Alignment Review(#287)、前提追跡(#308)、評価
+基盤(#309)を置き換えず、その上に「調査 → 通訳 → 開発者の判断」を分離したまま
+往復できる 1 本の循環を足す。
+
+Phase 分割と sub-issue:
+
+| Phase | Issue | 内容 |
+| --- | --- | --- |
+| A | #329 | 受け渡し契約・対話状態の基盤(決定的、LLM 呼び出し無し) |
+| B | #330 | 反復調査ループと探索継続性 |
+| C | #331 | 通訳(目的・影響への翻訳)と選択肢提示 |
+| D | #332 | システム理解への還流と確定状態の分離 |
+| E | #333 | Dashboard 共同理解パネル |
+| F | #334 | 共同理解の質を測る評価枠組み |
+
+### Phase A: 受け渡し契約と対話状態(Issue #329)
+
+#### 共有スキーマ
+
+`shared/schemas/joint_understanding.schema.json`(`schema_version:
+joint-understanding-v1`)が、1 セッション分の受け渡し契約 —
+`session` / `findings` / `actions` — を定義する。契約の要点は「三つの来歴を
+1 つの回答に混ぜない」ことにある。
+
+- `origin_role`(**誰が**書いたか): `investigation` / `translation` / `developer`
+- `claim_kind`(**何の種類**の主張か): `fact` / `inference` / `hypothesis` /
+  `unknown` / `conflict`
+
+この 2 軸は独立している。`unknown` は失敗ではなく第一級の結果であり、
+もっともらしさで埋めない。`conflict` は両立しない情報源を記録する。
+
+#### 有限語彙(`app/joint_understanding.py`)
+
+すべて Principle 6 の明示的な有限集合で、未知値は 422(推測補完しない)。
+
+- `ORIGIN_KINDS`: `qa` / `intent` / `review_item` / `inquiry`
+- `TRIGGERS`: `unknown_answer` / `explicit_request`
+- `SESSION_STATUSES`: `open` / `held` / `closed`
+- `SESSION_TRANSITIONS`: `open → {held, closed}`、`held → {open}`、
+  `closed` は終端(表に無い遷移は 409)
+- `SESSION_OUTCOMES`: `understood` / `doubt_resolved` /
+  `hypothesis_adopted` / `decided` / `handed_off` / `abandoned`
+  - `PROVISIONAL_OUTCOMES = ("hypothesis_adopted",)` は**暫定**であり、
+    API 応答の `outcome_is_provisional` で常に判別できる。事実として再利用しない。
+  - `decided` だけが人間の最終的な価値判断。
+- `ACTION_KINDS`: `request_investigation` / `explain_reasoning` /
+  `compare_options` / `adopt_hypothesis` / `revise_intent` / `hold` /
+  `handoff` / `decide`
+
+#### 役割ごとの契約(`validate_finding`)
+
+| 役割 | decision_method | evidence | supports_finding_ids |
+| --- | --- | --- | --- |
+| `investigation` | `reasoning_llm` / `deterministic` | 可 | 任意 |
+| `translation` | `reasoning_llm` | **不可** | **1 件以上必須** |
+| `developer` | `manual` のみ | **不可** | 任意 |
+
+- `developer` の Finding は `intelligence_run_id` を持てず `is_mock` にもできない
+  — reasoning model が開発者の名前で発言する経路を機構的に塞ぐ。
+- `translation` は証拠を作れない。一般化した説明から必ず元の技術的主張と証拠へ
+  戻れるように、同一セッション内の Finding id 参照のみを許す(他セッション・
+  存在しない id は 422)。
+- `investigation` の `hypothesis` は競合説明と反証条件を必須にする(仮説は
+  単なる低 confidence claim ではない — `docs/system-understanding-ideal-state.md`
+  §3.4)。
+- `reasoning_llm` の Finding は必ず `intelligence_run_id` を持つ(Principle 7)。
+- Finding は**追記のみ**。更新・削除エンドポイントは存在せず、訂正は
+  `supersedes_finding_id` を持つ新しい Finding で表現する。
+
+#### テーブル(additive、System スコープ)
+
+`joint_understanding_session` / `joint_understanding_finding` /
+`joint_understanding_action`。`premise_snapshot_id` は作成時に interview session
+の snapshot を固定する(#308 の premise bundle と同じ規律。Phase B の追加調査が
+新しい snapshot へ暗黙に乗り換えないため)。
+
+#### API(`routes/joint_understanding.py`)
+
+- `POST /interview/sessions/{session_id}/joint-understanding`(201)
+- `GET /interview/sessions/{session_id}/joint-understanding`(`status` /
+  `origin_kind` フィルタ、未知値は 422)
+- `GET /joint-understanding/{ju_id}`(findings + actions + `available_actions`)
+- `POST /joint-understanding/{ju_id}/findings`(追記)
+- `POST /joint-understanding/{ju_id}/actions`(開発者が選んだ次の行動)
+- `POST /joint-understanding/{ju_id}/hold` / `/resume` / `/close`
+
+`available_actions` は現在の status から決定的に導出する(`open` のときだけ
+`ACTION_KINDS` 全件、`held` / `closed` では空)。
+
+#### 「わからない」を意図として混入させない境界
+
+Phase A のテーブル群が存在する最大の理由がこれである。
+
+- どのエンドポイントも origin 行(`interview_qa` / `interview_intent_item` /
+  `alignment_item` / `interview_inquiry`)に**書き込まない**。読むのは存在確認の
+  SELECT だけ。#287 の Inquiry が行う `alignment_item.status='inquiry'` の
+  ミラーリングも**行わない**(両フローの統合方法は Phase D / #332 で決める。
+  それまで共同理解セッションは既存フローに触れない並走系統として保つ)。
+- `question_text` はセッション行にのみ保持し、回答欄へコピーしない。
+- `trigger='unknown_answer'` でセッションを作っても developer Finding は
+  1 件も作られない(「わからない」はシステムについての主張ではない)。
+- `outcome='decided'` で閉じても origin 行は変わらない。項目の確定は
+  引き続き項目自身の回答・確認エンドポイントだけが行う。
+
+#### Phase A の非スコープ
+
+reasoning model 呼び出し(Phase B / C)、理解への還流(Phase D)、Dashboard
+(Phase E)、評価指標(Phase F)。Phase A の `decision_method` は `manual` か、
+呼び出し側が検証済みで渡す値のみで、この層は LLM を呼ばない。
+
+#### テスト
+
+`apps/control-server/tests/test_joint_understanding.py`:
+契約の単体テスト(遷移表・暫定 outcome・役割別ルール・未知語彙)、共有スキーマの
+検証(translation の evidence 拒否・未知 enum・hypothesis 構造)、API ライフサイクル、
+**origin 行不変**(qa / intent / review_item)、追記のみ、他セッション参照の拒否、
+有限遷移、System 分離。
+
+### Phase B: 反復調査ループと探索継続性(Issue #330)
+
+`app/investigation_loop.py`。#286 の `investigate()`(1 ラウンド・1 回の
+reasoning 呼び出し)はそのまま残し、その読み取り専用機構の上に「まだ分かって
+いないことを持ち越しながら続ける」ループを足す。
+
+#### 横断的な候補取得(決定的、候補の絞り込みのみ)
+
+`_index_candidates` が pin された snapshot に対して次を横断する。
+
+- `code_symbols` の `qualified_name` / `docstring`(重み 2)
+- `code_entrypoints` の `label` / `route_path` / `handler_qualified_name`(重み 2)
+- `snapshot_files.content` の内容一致(重み 1)
+
+これに #286 の**パス名**一致(`_path_name_candidates`)を後続で足し、既読パスを
+除外して 1 ラウンド分の候補にする。並び順は (一致数 降順, path 昇順) で固定。
+「ファイル名や冒頭部分だけに依存しない探索」(Epic #328)を、最終判断を
+reasoning に残したまま満たす(Principle 6)。
+
+#### ラウンド間・再試行間の継続性
+
+各ラウンドの構造化出力が `search_leads` / `open_hypotheses` /
+`missing_evidence` を返し、次ラウンドの候補取得とプロンプトへ入る。
+`read_paths` は既読集合として累積し、`no_new_evidence` 判定に使う。
+`POST /joint-understanding/{ju_id}/investigate` を再度呼ぶと
+`_restore_carry_over` が永続化済みラウンドから復元するため、**再試行は質問から
+やり直さず、すでに得た手がかりから再開する**(失敗ラウンドは leads を返さないので、
+その前のラウンドの手がかりを消さない)。
+
+#### 有限な停止理由(`STOP_REASONS`)
+
+`answered` / `budget_exhausted` / `no_new_evidence` / `unresolved` / `failed`。
+新しく読めるファイルが 1 件も無いラウンドは決定的に `no_new_evidence` で止める
+(モデルの自己申告で継続しない)。予算 `InvestigationLoopBudget` は
+`max_rounds` / `max_llm_calls` / `max_files` / `max_snippet_chars` /
+`max_files_per_round` / `timeout_seconds` をハードクランプする。
+
+#### Phase A 契約の適用点
+
+ラウンド出力は Phase A の `claim_kind` そのままで返り、次を満たさない Finding は
+**破棄**する(`pruned_findings` に計上、書き換えない)。
+
+- `claim_kind` が有限集合外
+- `hypothesis` なのに競合説明・反証条件が無い
+- 引用が全て snapshot 検証に失敗、または引用が無いのに `unknown` 以外
+  (「調べたが分からなかった」だけは証拠なしで残す)
+
+`completed` なのに有効な Finding が 0 件のラウンドは `unresolved` へ決定的に降格
+(#286 と同じ規律)。
+
+#### 永続化と監査
+
+- `joint_understanding_investigation_round`(additive): ラウンドごとの
+  status / stop_reason / conclusion / carry-over / 未読候補 / 予算使用量 /
+  `intelligence_run_id` / エラー。
+- `intelligence_runs` に 1 ラウンド 1 行(`run_type='joint_investigation'`、
+  新規に `IntelligenceRunType` と `shared/schemas/project_intelligence.schema.json`
+  へ追加)。読んだ抜粋は `intelligence_run_evidence` に全件記録する。
+- Finding は `origin_role='investigation'` / `decision_method='reasoning_llm'` /
+  そのラウンドの `intelligence_run_id` 付きで追記される。
+
+#### fail-closed
+
+mock / 非 reasoning モデル / git 失敗 / API 失敗 / 構造化出力検証失敗はすべて
+`stop_reason='failed'`。ラウンド 1 の失敗は Finding を 1 件も作らず、ラウンド N の
+失敗は**それまでに検証済みの Finding を残したまま**停止する。Finding が 0 件のまま
+`failed` になった呼び出しは 502(監査行は永続化済み)。
+
+#### DB ロック
+
+`run_investigation_loop` は index / runtime facts 用の接続を自分で開き、各ラウンドの
+LLM 呼び出し**前に**閉じる。ルートは read → reason → persist の 3 フェーズ。
+
+#### テスト
+
+`apps/control-server/tests/test_joint_understanding_investigation.py`:
+複数ラウンドと持ち越し、carry-over 指定での再開、`no_new_evidence` /
+`budget_exhausted` / `failed` の停止、mock・非 reasoning・LLM 例外・不正 JSON の
+fail-closed、ラウンド N 失敗時の Finding 保持、hypothesis 構造・引用剪定・
+根拠なし主張の破棄、pin された commit のみ読むこと(作業ツリー汚染後も不変)、
+API での監査行・Finding 永続化、再試行での leads 復元、open 以外での 409、System 分離。
+
+### Phase C: 通訳(目的・影響への翻訳)と選択肢提示(Issue #331)
+
+`app/understanding_translator.py` + `POST /joint-understanding/{ju_id}/translate`。
+
+#### 入力と絶対条件
+
+入力は**同一セッションに記録済みの investigation Finding だけ**(snapshot の
+抜粋は渡さない)。したがって通訳は新しい技術的事実を作れない。出力の各文は
+`supports_finding_ids` を必須とし、渡していない id を 1 つでも参照したら
+**呼び出し全体を fail-closed**(部分保存しない)。
+
+#### 説明の層(`STATEMENT_LAYERS`)
+
+`purpose` / `impact` / `gap` / `consistency` / `decision`。第 1 層(purpose /
+impact)の主語は目的・利用者・観測可能な振る舞いであり、内部変数・関数・API・
+列名ではない。内部名称は隠蔽せず、Finding → evidence の層で必ず開示される
+(Epic #328 の説明の原則)。
+
+#### 通訳が主張できる種類(`TRANSLATION_CLAIM_KINDS`)
+
+`inference` / `unknown` / `conflict` のみ。`fact` と `hypothesis` は不可 —
+新しい事実の断定も、競合説明・反証条件を伴う新仮説の提示も investigation の
+責務であり、通訳が肩代わりしない。`hypothesis` / `unknown` の Finding を
+確定事項へ格上げすることも禁止(プロンプト規則 + 検証)。
+
+#### 追跡性の永続化
+
+翻訳文は `origin_role='translation'` の Finding として追記される(evidence を
+持てず `supports_finding_ids` 必須 = Phase A 契約)。要約・選択肢・未解決点・
+判断質問は `joint_understanding_translation` 行に入り、`statements_json` の
+各要素が対応する translation Finding の `finding_id` を保持する。
+これにより「一般化した説明 → Finding → evidence(path:行)」が常に辿れる。
+
+#### 選択肢メニューは決定的
+
+`build_action_menu()` は `ACTION_KINDS` の順に、`interview_language` の固定
+カタログ(`joint_action_<kind>_label` / `_effect`)から「何が変わるか」を組み立てる。
+モデル出力ではないので、同じ状態なら常に同じメニューになる。
+`adopt_hypothesis` の説明文は「暫定であり事実にならない」ことを明示する。
+
+#### 質問ゲート(`ask_developer`)
+
+「人間にしか決められないと分類した直後、判断材料を示さずユーザーへ返す流れ」
+(Epic #328 が置き換える対象)を防ぐ決定的ゲート。
+
+- `decision_question` が無ければ聞かない
+- `decision` 層の文があれば聞く
+- 判断材料が無く、まだ調べられること(`open_unknowns`)が残っているなら**聞かない**
+  — それは追加調査の理由であって質問の理由ではない
+
+`ask_developer=false` のとき `decision_question` は永続化されない。
+
+#### 監査と fail-closed
+
+`intelligence_runs`(`run_type='joint_translation'`)を成功・失敗とも 1 行記録。
+mock / 非 reasoning モデル / Finding 0 件 / LLM 例外 / 不正 JSON / 未知 id 参照 /
+未知 layer / 禁止 claim_kind はすべて 502 で、翻訳行も translation Finding も作らない。
+
+#### テスト
+
+`apps/control-server/tests/test_joint_understanding_translation.py`:
+参照検証(未知 id・参照なし・選択肢の未知 id)、禁止 claim_kind、未知 layer、
+fail-closed 一式、メニューの決定性と両言語、質問ゲートの 4 分岐、
+API での translation Finding 永続化と `finding_id` 対応、失敗時に監査行のみ、
+origin 行不変、open 以外 409、System 分離。
+
+### Phase D: システム理解への還流と確定状態の分離(Issue #332)
+
+#### 還流(reflux)— 回答へ転記しなくても理解へ反映する
+
+`POST /joint-understanding/{ju_id}/reflux`。Epic #328 が置き換える
+「調査結果を回答欄へ転記しないと理解へ反映されない流れ」の代替経路。
+
+- 還流対象は `origin_role='investigation'` かつ `claim_kind='fact'` のみ
+  (`REFLUXABLE_CLAIM_KINDS`)。inference / hypothesis / unknown / conflict は
+  会話内に留まる — confidence だけで仮説を事実へ昇格させない。
+- 訂正済み(後続 Finding に `supersedes_finding_id` で置き換えられた)Finding は
+  還流しない。
+- `decision_method` は常に `reasoning_llm`。**`manual` にはならない**
+  (誰も決定していない = 人間の回答ではない)。
+- 反映先(`REFLUX_TARGET_KINDS`、既存構造のみ):
+  - `qa_investigation`: `interview_qa.investigation_json` /
+    `investigation_run_id`。#286 の route-and-investigate が書くのと同じ
+    **回答ではないスロット**。`answer_text` / `status` / `answered_by` は書かない。
+  - `session_ledger`: intent / review_item / inquiry 由来。これらの行は
+    Alignment / Understanding の再ビルドが所有しており、事実を書き込んでも
+    次のビルドで黙って消えるため、台帳行そのものを反映先とする
+    (第三の理解モデルを新設しない、という制約の下での明示的な設計判断)。
+- 同じ Finding は二重に還流しない(`UNIQUE (joint_understanding_id, finding_id)`、
+  再呼び出しは `already_refluxed` に計上)。
+- policy / 実行系(`components` の mode、experiments、probe_plans、publish_jobs)には
+  一切触れない。理解の更新と実行権限は別(Principle 7)。
+
+#### 前提整合性(premise state)
+
+`_premise_state()` は決定的・構造的判定:セッション作成時に固定した
+`premise_snapshot_id` と、現在の interview session の `snapshot_id` が異なれば
+`stale`。`stale` のとき
+
+- 還流は 409(古い調査結果を現在の理解として貼らない)
+- `hypothesis_adopted` / `decided` での close は 409
+- 何も断定しない outcome(`understood` / `doubt_resolved` / `handed_off` /
+  `abandoned`)は許可し、`outcome_premise_state='stale'` として記録する
+
+#### 確定状態の分離(`validate_outcome_basis`)
+
+`OUTCOMES_REQUIRING_BASIS = ("hypothesis_adopted", "decided")` は
+`outcome_finding_ids`(同一セッションの Finding)を必須にする。根拠を示せない
+採用・決定は監査できないため 422。`hypothesis_adopted` は
+`outcome_is_provisional=true` を返し続け、事実として還流されることもない
+(仮説は還流対象外)。
+
+追加列(additive、既存 DB は `_add_column_if_missing` / ALTER で追従):
+`joint_understanding_session.outcome_finding_ids` / `outcome_premise_state`。
+新規テーブルは `joint_understanding_reflux` のみ。
+
+#### 既存フローとの関係
+
+Phase D は Inquiry(#285)/ Review Queue(#287)を置き換えず、origin 行への
+書き込みも増やさない。共同理解セッションが書くのは、既存の「回答ではない」
+調査スロットと自身の台帳だけである。
+
+#### テスト
+
+`apps/control-server/tests/test_joint_understanding_reflux.py`:
+還流可否の有限規則、反映先の決定性、outcome basis 規則(不足・他セッション・
+stale)、QA 調査スロットへの反映と回答欄不変、fact 以外の非還流、superseded の
+除外、冪等性、非 QA 由来の台帳のみ反映、stale 前提での 409、4 つの終端状態の
+区別と根拠記録、暫定採用が還流されないこと、policy / 実行系テーブル不変、System 分離。
+
+### Phase E: Dashboard 共同理解パネル(Issue #333)
+
+`apps/dashboard/src/components/system-understanding/joint-understanding-panel.tsx`。
+既存の Inquiry パネル(#295 の 4 段階開示)と同じ規約に合わせ、別系統の表示規則を
+作らない。
+
+#### 4 段階表示
+
+1. **目的と影響**: 通訳の `purpose_summary` + `purpose` / `impact` 層の文。
+   ここに内部名称(path:行)は出さない。
+2. **理由**: `gap` / `consistency` / `decision` 層、未解決点、選択肢
+   (「変わること」「代償」)、`ask_developer=true` のときだけ判断質問。
+3. **根拠**: Finding 一覧(claim_kind バッジ、競合説明、反証条件、未確認、
+   `path:開始-終了`)。**内部名称はここで必ず開示する**(隠蔽しない)。
+4. **調査詳細**: ラウンドごとの読了ファイル・未読候補・不足証拠・停止理由・
+   調査 run、還流済み件数。
+
+例外の先出し: 前提が `stale`、未解決点あり、`conflict` Finding ありのいずれかで
+第 2 層を初期表示する(第 4 層は自動展開しない)。
+
+#### 行動メニューと視覚的区別
+
+`available_actions`(サーバ)をボタン化し、翻訳済みならサーバの `action_menu`
+のラベル/効果説明を優先、未翻訳ならローカルの日本語ラベルにフォールバックする
+(Issue #266: クライアント側フォールバックも日本語)。
+`hypothesis_adopted` は琥珀色 +「(暫定・事実ではありません)」、`decided` は
+緑系で表示し、暫定と確定を取り違えられないようにする。閉じたセッションでは
+メニューを出さない。
+
+調査中は「関連するコードとテストを確認しています…」の短い状態表示のみ。
+API 失敗時もパネルとメニューは残り、回答機会を失わせない。
+
+#### 既存機能との住み分け
+
+パネルの「他の人に引き継ぐ」は共同理解セッションを `handed_off` で閉じる
+**記録**であり、実際の担当者割り当ては既存の引き継ぎ機能(#291 の
+`question_handoff`)で行う。「意図を修正する」も同様に行動の記録で、
+Intent Brief 自体の編集は既存の Intent パネルで行う — 共同理解セッションは
+どちらの元データにも書き込まない。
+
+#### 起動導線
+
+`pages/interview.tsx` の Q&A カードに「一緒に確かめる」を追加。既存の #142 /
+#295 の「わからない」フロー(自動調査 → 既存導線へ戻す)は変更せず、その後段の
+任意手段として `trigger='unknown_answer'` のセッションを開始する。開いても
+元の質問には一切回答しない。既に open/held のセッションがあればそれを再表示する。
+
+#### テスト
+
+`apps/dashboard/src/__tests__/joint-understanding-panel.test.tsx`(8 件):
+第 1 層に内部名称が出ず第 3 層で開示されること、有限メニューの表示と送信、
+暫定採用と確定の視覚的区別、前提 stale の警告と第 2 層先出し、調査失敗後も
+対話が残ること、`is_mock` バッジ、未翻訳時の日本語案内。
+
+### Phase F: 共同理解の質を測る評価枠組み(Issue #334)
+
+#309 の指標パイプライン(`app/interview_metrics.py`)に**別カテゴリ**
+`joint_understanding` として追加する。効率化指標(確認件数・承認速度)と
+同じ数値へまとめない — 「効率化を共同理解の質より先に最適化する流れ」を
+置き換えるという Epic #328 の目的上、両者は独立して読めなければならない。
+
+すべて永続化済みの事実に対する決定的な集計で、モデルの自己申告による品質
+スコアは導入しない。分母が 0 の指標は 0 ではなく `unmeasured`
+(`unmeasured_reason='no_observations'`)を返す(#309 の方針を踏襲)。
+
+| key | guardrail | 意味 |
+| --- | --- | --- |
+| `joint_understanding_from_unknown_rate` | – | 「わからない」から始まった割合(終端ではなく開始点として使われているか) |
+| `joint_understanding_conclusion_rate` | – | 閉じたセッションのうち理解・疑問解消・暫定採用・正式判断へ到達した割合 |
+| `joint_understanding_provisional_outcome_rate` | ✓ | 暫定採用で終わった割合(高止まり = 確かめきれずに前へ進めている) |
+| `joint_understanding_stale_premise_close_rate` | ✓ | 前提が変わった状態で閉じた割合 |
+| `joint_understanding_unknown_finding_rate` | ✓ | 調査 Finding のうち `unknown` の割合(証拠不足を埋めていないか) |
+| `joint_understanding_reflux_rate` | – | 確認できた事実のうち、回答へ転記せず理解へ反映された割合 |
+| `joint_understanding_investigation_answered_rate` | – | 反復調査が人へ聞かずに答えへ到達した割合 |
+| `joint_understanding_developer_question_rate` | – | 通訳のうち実際に判断質問まで到達した割合(少ないほど良い指標ではない) |
+
+`InterviewMetricCategory` に `joint_understanding` を、`InterviewMetricKey` に
+上記 8 key を追加(いずれも既存の有限集合の拡張)。
+
+#### #311 との関係
+
+本 Phase の観測項目は #311(低リスク提案の一括承認)の開始条件
+「実利用の誤分類・取り消し・理解低下を観測できること」を判断する材料になるが、
+#311 自体は引き続き実装しない。
+
+#### テスト
+
+`test_joint_understanding_reflux.py` 末尾の 3 件: カテゴリ分離と決定性、
+観測ゼロでの `unmeasured`、System 分離。
