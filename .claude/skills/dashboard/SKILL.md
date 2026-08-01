@@ -211,7 +211,9 @@ The dashboard should support:
   facts only (never client-only state such as `manualMainTabState` /
   `lastMaterialization` / a mutation's `isPending`), then a backward-transition
   hold so a completed state is never re-entered without explicit
-  acknowledgement; one primary action per state, which must be the operation
+  acknowledgement (the hold covers only the ordered states `W2`-`W7`;
+  `W0-A`/`W0-B`/`W1` have no workflow position and never trigger it);
+  one primary action per state, which must be the operation
   that satisfies that state's completion condition (`W1` alone has none);
   information roles `R1`-`R6`, exactly one per element; and exceptions
   `E1`-`E14` split into blocking / degraded / informational, where degraded

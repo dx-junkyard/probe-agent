@@ -334,7 +334,7 @@ creating incomplete persistence or execution paths for later phases.
     defines: developer-facing states `W0-A`/`W0-B`/`W1`-`W7` decided by a
     **two-stage evaluation** — a first-match rule table over persisted facts,
     then a backward-transition hold (#343); information roles `R1`-`R6`, one
-    role per element, with an inventory of the screen's 69 main UI elements
+    role per element, with an inventory of the screen's 70 main UI elements
     and a state × role display matrix (#344); a finite automation gate
     `A1`-`A4` — does not touch the target repo, does not change approval
     state, failure cannot break existing confirmations, result is recorded
@@ -347,7 +347,10 @@ creating incomplete persistence or execution paths for later phases.
     (rebuild failure, degraded). Forward transitions are automatic;
     **backward transitions into an already completed state always require
     explicit confirmation**, which the rule table alone cannot express — the
-    hold needs persisted `reached_state` + per-request acknowledgement. The
+    hold needs persisted `reached_state` + per-request acknowledgement, and
+    the hold applies only to the ordered states (`W2`-`W7`) — `W0-A`/`W0-B`/
+    `W1` carry no workflow position, so a normal `W3`→`W1`→`W4` is never
+    mistaken for a backward move. The
     spec relaxes no human gate: 理解の確認 / Alignment 項目の確定 /
     提案の承認・編集・却下 / 差分の適用 / 観測の開始 all stay
     `decision_method: manual`, and the isolated-worktree boundary is
@@ -355,11 +358,12 @@ creating incomplete persistence or execution paths for later phases.
     disclosure and its `guardrail`-vs-要確認 separation; the spec only moves
     it out of the main flow and fixes it as `R6`). Implementing it is
     deliberately out of scope here — when a follow-up implementation issue is
-    written, follow §8 of the spec: it requires exactly three new persisted
-    facts (差分レビューの完了 for `W6`→`W7`; a persisted execution record for
-    every process that can produce `W1`; `reached_state` + backward-request
-    acknowledgement for the hold), and everything else is derivable from
-    existing persisted facts. See the Issue #342 section in
+    written, follow §8 of the spec: it requires exactly four new persisted
+    facts — 差分レビューの完了 for `W6`→`W7` (manual); an execution record for
+    every process that can produce `W1`, which doubles as the blocking-failure
+    record carrying the state it blocks (system); `reached_state` + backward
+    requests (system); and the acknowledgement of a backward request (manual).
+    Everything else is derivable from existing persisted facts. See the Issue #342 section in
     `docs/project-intelligence.md`.
 
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
