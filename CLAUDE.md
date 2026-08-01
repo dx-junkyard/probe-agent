@@ -342,12 +342,14 @@ creating incomplete persistence or execution paths for later phases.
     must be the operation that satisfies that state's completion condition
     (#345); and exceptions `E1`-`E14` split into blocking / degraded /
     informational with 8 walkthrough scenarios (#346). Degraded is decided by
-    whether a valid earlier result survives the failure, not by which process
-    failed — hence `E4-a` (first alignment build failure, blocking) vs `E4-b`
-    (rebuild failure, degraded). Forward transitions are automatic;
+    whether enough material remains to continue the current decision, not by
+    which process failed — hence `E3-b` can continue through zero-base questions,
+    while `E4-b` can continue from a surviving earlier result. Forward
+    transitions are automatic;
     **backward transitions into an already completed state always require
     explicit confirmation**, which the rule table alone cannot express — the
-    hold needs persisted `reached_state` + per-request acknowledgement, and
+    hold needs a persisted `reached_state` workflow checkpoint + per-request
+    acknowledgement, and
     the hold applies only to the ordered states (`W2`-`W7`) — `W0-A`/`W0-B`/
     `W1` carry no workflow position, so a normal `W3`→`W1`→`W4` is never
     mistaken for a backward move. The
@@ -363,7 +365,13 @@ creating incomplete persistence or execution paths for later phases.
     every process that can produce `W1`, which doubles as the blocking-failure
     record carrying the state it blocks (system); `reached_state` + backward
     requests (system); and the acknowledgement of a backward request (manual).
-    Everything else is derivable from existing persisted facts. See the Issue #342 section in
+    `reached_state` is the current ordered checkpoint, not an all-time monotonic
+    maximum: it moves backward only with that manual acknowledgement. A safe
+    terminal exit uses the existing session `status=closed` ahead of blocking
+    failures, does not advance `reached_state`, and is itself audited as manual;
+    reopening restores `status=open` and resurfaces unresolved failures.
+    Everything else is derivable from
+    existing persisted facts. See the Issue #342 section in
     `docs/project-intelligence.md`.
 
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no

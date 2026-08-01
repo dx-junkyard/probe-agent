@@ -211,13 +211,18 @@ The dashboard should support:
   facts only (never client-only state such as `manualMainTabState` /
   `lastMaterialization` / a mutation's `isPending`), then a backward-transition
   hold so a completed state is never re-entered without explicit
-  acknowledgement (the hold covers only the ordered states `W2`-`W7`;
+  acknowledgement (`reached_state` is the current checkpoint, not an all-time
+  monotonic maximum; the hold covers only the ordered states `W2`-`W7`;
   `W0-A`/`W0-B`/`W1` have no workflow position and never trigger it);
   one primary action per state, which must be the operation
   that satisfies that state's completion condition (`W1` alone has none);
   information roles `R1`-`R6`, exactly one per element; and exceptions
   `E1`-`E14` split into blocking / degraded / informational, where degraded
-  requires a valid earlier result to have survived the failure. Two rules bind any interview-screen
+  requires enough material to keep making the current decision. A recovery
+  exit uses the existing session `status=closed` before blocking-failure rows;
+  it does not advance `reached_state`, and reopening restores unresolved failures
+  rather than treating them as solved.
+  Two rules bind any interview-screen
   change made before the spec is implemented: (a) do not add a control that
   is rendered disabled with explanatory text for an unmet precondition —
   show it only once it is usable; (b) do not add a manual trigger for a
