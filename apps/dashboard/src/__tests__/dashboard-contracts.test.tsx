@@ -3459,6 +3459,18 @@ describe("Interview page", () => {
         });
       }
       if (path === "/interview/sessions") return Promise.resolve([]);
+      if (path.startsWith("/interview/workflow-state")) {
+        // snapshot はあるがセッション未選択 -> W0-B (ルール表 行 2)。
+        return Promise.resolve(interviewWorkflowState({
+          session_id: null,
+          state: "W0-B",
+          candidate_state: "W0-B",
+          rule_row: 2,
+          reached_state: null,
+          primary_action: "start_session",
+          facts: { has_session: false },
+        }));
+      }
       return Promise.resolve(null);
     });
     mockApi.post.mockImplementation((path: string) => {
@@ -3556,6 +3568,56 @@ describe("Interview page", () => {
   // lead (element #10) are abolished. Which work surface is shown is decided
   // by the server's workflow state, so exactly ONE primary work surface is
   // rendered at a time and no compensating tab-default heuristic exists.
+  test("W0-A では Repository 導線だけが主操作で、開始ボタンは描かれない", async () => {
+    // `E1` は例外ではなく `W0-A` という状態そのもの。実行できない
+    // 「インタビューを開始」を disabled で見せない (原則 P3)。
+    mockInterviewApi();
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path.startsWith("/interview/workflow-state")) {
+        return Promise.resolve(interviewWorkflowState({
+          session_id: null,
+          state: "W0-A", candidate_state: "W0-A", rule_row: 1,
+          reached_state: null, primary_action: "open_repository",
+          facts: { has_snapshot: false, has_session: false },
+          latest_ready_snapshot_id: null,
+          exceptions: [{
+            code: "E1", severity: "blocking", target_state: "W0-A",
+            message: "対象リポジトリの snapshot がまだありません。",
+            detail: null, recovery_process_kind: null,
+            recovery_condition: "Repository 画面で snapshot を作成すると開始できます。",
+          }],
+        }));
+      }
+      if (path === "/repository/snapshots/latest") return Promise.resolve(null);
+      if (path === "/interview/sessions") return Promise.resolve([]);
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("work-surface-W0-A")).toBeInTheDocument();
+    });
+    expect(screen.getByTestId("w0a-primary-action")).toHaveTextContent(
+      "Repository で snapshot を作成する",
+    );
+    expect(screen.queryByRole("button", { name: /インタビューを開始/ })).toBeNull();
+    expect(screen.queryByTestId("work-surface-W0-B")).toBeNull();
+    // `E1` は `W0-A` そのものなので、R5 の警告カードとしては出さない。
+    expect(screen.queryByTestId("workflow-exception-E1")).toBeNull();
+  });
+
   test("W4 では意図とのズレの作業面だけが描かれ、会話・提案・差分の作業面は描かれない", async () => {
     mockInterviewApi({
       workflow: {

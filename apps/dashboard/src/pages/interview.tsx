@@ -1431,7 +1431,7 @@ export default function InterviewPage() {
   const actor = user?.username ?? "dashboard";
 
   const { data: repositoryStatus, refetch: refetchRepositoryStatus } = useRepositoryStatus();
-  const { data: latestSnapshot, isLoading: snapshotLoading } = useLatestSnapshot();
+  const { data: latestSnapshot } = useLatestSnapshot();
   const { data: sessions, isLoading: sessionsLoading } = useInterviewSessions();
   const createSession = useCreateInterviewSession();
   const { data: session, isLoading: sessionLoading } = useInterviewSession(selectedSessionId);
@@ -2085,10 +2085,15 @@ export default function InterviewPage() {
               </option>
             ))}
           </Select>
-          <Button size="sm" onClick={startSession} disabled={building || snapshotLoading || !latestSnapshot}>
-            <Sparkles className="h-4 w-4 mr-1" />
-            {building ? "分析中..." : "インタビューを開始"}
-          </Button>
+          {/* #3 は `W0-B` の主操作。他の状態では非表示にする (§3.3、原則 P3)。
+              snapshot が無い間 (`W0-A`) は disabled で見せるのではなく、
+              Repository への導線だけを主操作にする。 */}
+          {wState === "W0-B" && (
+            <Button size="sm" onClick={startSession} disabled={building}>
+              <Sparkles className="h-4 w-4 mr-1" />
+              {building ? "分析中..." : "インタビューを開始"}
+            </Button>
+          )}
         </div>
       </div>
 
@@ -2099,14 +2104,28 @@ export default function InterviewPage() {
         <DiagnosticFixCallout anchor="interview-capabilities" />
       </div>
 
-      {!latestSnapshot && !snapshotLoading && (
-        <Card>
-          <CardContent className="py-8 text-center text-sm text-muted-foreground">
-            リポジトリのスナップショットがありません。インタビューを開始する前に{" "}
-            <Link className="underline" to="/repository">リポジトリ</Link>{" "}
-            ページでスナップショットを作成してください。
-          </CardContent>
-        </Card>
+      {/* `W0-A` 開始の前提を満たす。`E1` は例外ではなくこの状態そのものなので
+          `R5` にはせず、主作業カードとして出す (§3.3)。主操作は Repository
+          画面への導線 1 つだけ。 */}
+      {wState === "W0-A" && workflow && (
+        <>
+          <WorkflowLocationCard workflow={workflow} />
+          <Card data-testid="work-surface-W0-A">
+            <CardContent className="py-8 text-center space-y-3 text-sm">
+              <p className="text-muted-foreground">
+                このリポジトリにはまだ snapshot がありません。Repository 画面で
+                snapshot を作成すると、システム理解の構築が自動で始まります。
+              </p>
+              <Link
+                className="inline-flex h-9 items-center justify-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground"
+                to="/repository"
+                data-testid="w0a-primary-action"
+              >
+                {PRIMARY_ACTION_LABELS.open_repository}
+              </Link>
+            </CardContent>
+          </Card>
+        </>
       )}
 
       {sessionsLoading || sessionLoading ? (
@@ -2115,18 +2134,29 @@ export default function InterviewPage() {
           <Skeleton className="h-64 w-full" />
         </div>
       ) : !selectedSessionId || !session ? (
-        <Card>
-          <CardContent className="py-10 text-center space-y-3">
-            <p className="text-sm text-muted-foreground">
-              「インタビューを開始」を押すと、最新スナップショットから自動でシステム理解を構築し、
-              確認する内容を1つずつ質問します。
-            </p>
-            <Button onClick={startSession} disabled={building || snapshotLoading || !latestSnapshot}>
-              <Sparkles className="h-4 w-4 mr-1" />
-              {building ? "分析中..." : "インタビューを開始"}
-            </Button>
-          </CardContent>
-        </Card>
+        /* `W0-B` インタビューを始める。`W0-A` のときはこのカードを出さない
+           (実行できない主操作を見せない、原則 P3)。 */
+        wState === "W0-B" && workflow ? (
+          <>
+            <WorkflowLocationCard workflow={workflow} />
+            <Card data-testid="work-surface-W0-B">
+              <CardContent className="py-10 text-center space-y-3">
+                <p className="text-sm text-muted-foreground">
+                  対象 snapshot: {workflow.latest_ready_snapshot_id ?? "-"}。
+                  開始すると、ドキュメントとコードの自動分析からシステム理解の構築が始まります。
+                </p>
+                <Button
+                  onClick={startSession}
+                  disabled={building}
+                  data-testid="w0b-primary-action"
+                >
+                  <Sparkles className="h-4 w-4 mr-1" />
+                  {building ? "分析中..." : PRIMARY_ACTION_LABELS.start_session}
+                </Button>
+              </CardContent>
+            </Card>
+          </>
+        ) : null
       ) : (
         <>
           {repositoryHeadStale && repositoryStatus && (
