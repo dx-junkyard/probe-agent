@@ -187,7 +187,14 @@ creating incomplete persistence or execution paths for later phases.
     relations, and relation-scoped carry-over invalidation). #309 is
     implemented: deterministic System-scoped UX metrics use persisted facts
     and finite UI events, return unavailable values as `unmeasured`, and keep
-    guardrails separate without changing product behaviour. #313 is implemented: the
+    guardrails separate without changing product behaviour. #341 builds on it:
+    the metric cards are collapsed behind a permanent labelled entry that shows
+    正常 / 要確認 N件 / データ不足 / 取得失敗 as text, and the `guardrail`
+    designation is separated from the evaluated 要確認 judgement, which comes
+    from the fail-closed `app/policies/interview_metric_attention.yaml`
+    artifact (direction / minimum sample / window / trigger / clear condition;
+    numeric thresholds are deliberately left unset and decided from real data
+    later). #313 is implemented: the
     no-review-required policy is now a schema-validated, fail-closed YAML
     artifact with version/digest provenance on every new Alignment item. #292 remains NOT
     implemented (superseded by #311). The Inquiry status set stays at the

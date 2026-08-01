@@ -1297,6 +1297,55 @@ export type InterviewMetricKey =
   | "joint_understanding_investigation_answered_rate"
   | "joint_understanding_developer_question_rate";
 
+// Issue #341: `guardrail` only designates which metrics are worth watching.
+// Whether a metric is *currently* in a bad state is a separate evaluated
+// judgement, so 「値が悪い」 and 「まだ判断できない」 never share one state.
+export type InterviewMetricAttentionState =
+  | "attention"
+  | "ok"
+  | "insufficient_data"
+  | "not_measurable"
+  | "criterion_unset"
+  | "observation_only";
+export type InterviewMetricAttentionReason =
+  | "threshold_breached"
+  | "within_threshold"
+  | "sample_below_minimum"
+  | "no_observations_yet"
+  | "not_recorded"
+  | "threshold_not_configured"
+  | "not_a_notification_target";
+export type InterviewMetricAttentionDirection = "high_is_bad" | "low_is_bad";
+
+export interface InterviewMetricAttentionOut {
+  state: InterviewMetricAttentionState;
+  watched: boolean;
+  reason: InterviewMetricAttentionReason;
+  direction: InterviewMetricAttentionDirection | null;
+  threshold: number | null;
+  min_sample: number;
+  window: "all_time" | null;
+  trigger: "single_breach" | null;
+  clear_condition: "value_within_threshold" | null;
+}
+
+// 取得失敗 is deliberately absent: a server that cannot answer cannot report
+// its own failure, so the entry point derives that state client-side.
+export type InterviewMetricsAttentionState =
+  | "normal"
+  | "attention"
+  | "insufficient_data";
+
+export interface InterviewMetricsAttentionSummaryOut {
+  state: InterviewMetricsAttentionState;
+  attention_count: number;
+  insufficient_data_count: number;
+  not_measurable_count: number;
+  watched_count: number;
+  policy_version: string;
+  policy_digest: string;
+}
+
 export interface InterviewMetricOut {
   key: InterviewMetricKey;
   category: InterviewMetricCategory;
@@ -1311,14 +1360,16 @@ export interface InterviewMetricOut {
   denominator: number | null;
   sample_size: number;
   unmeasured_reason: string | null;
+  attention: InterviewMetricAttentionOut;
 }
 
 export interface InterviewMetricsOut {
   system_id: number;
-  schema_version: "interview-metrics-v1";
+  schema_version: "interview-metrics-v2";
   generated_at: number;
   sessions_observed: number;
   events_observed: number;
+  attention: InterviewMetricsAttentionSummaryOut;
   metrics: InterviewMetricOut[];
 }
 

@@ -153,7 +153,7 @@ def test_empty_catalog_marks_missing_or_zero_denominator_unmeasured(admin_client
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["system_id"] == system_id
-    assert body["schema_version"] == "interview-metrics-v1"
+    assert body["schema_version"] == "interview-metrics-v2"
     assert body["sessions_observed"] == 1
     assert body["events_observed"] == 0
 
@@ -741,3 +741,275 @@ def test_event_ratios_count_distinct_paired_semantic_facts(admin_client):
     assert metric["numerator"] == 1
     assert metric["denominator"] == 1
     assert metric["value"] == 1.0
+
+
+# --- Issue #341: 要確認 (attention) evaluation ------------------------------
+
+
+def test_attention_separates_designation_from_judgement(admin_client):
+    """`guardrail` designates; `attention` judges. They are not the same field."""
+
+    token = _login(admin_client)
+    _system_id, _snapshot_id, _session_id, headers = _setup_system(
+        admin_client, token, "attention-empty",
+    )
+
+    body = admin_client.get("/interview/metrics", headers=headers).json()
+
+    # Every metric carries a judgement, and only designated guardrails are watched.
+    for metric in body["metrics"]:
+        assert metric["attention"] is not None
+        assert metric["attention"]["watched"] is False or metric["guardrail"] is True
+
+    watched = [m for m in body["metrics"] if m["attention"]["watched"]]
+    assert watched, "the shipped policy must watch at least one guardrail"
+
+    # 定期観測: a non-guardrail metric never lights the entry point.
+    observation_only = _metric(body, "joint_understanding_investigation_answered_rate")
+    assert observation_only["guardrail"] is False
+    assert observation_only["attention"]["state"] == "observation_only"
+    assert observation_only["attention"]["reason"] == "not_a_notification_target"
+
+    unknown_answer = _metric(body, "unknown_answer_rate")
+    assert unknown_answer["attention"]["state"] == "observation_only"
+
+    summary = body["attention"]
+    assert summary["state"] == "insufficient_data"
+    assert summary["attention_count"] == 0
+    assert summary["watched_count"] == len(watched)
+    assert summary["policy_version"] == "interview-metric-attention-v1"
+    assert len(summary["policy_digest"]) == 64
+
+
+def test_attention_distinguishes_no_data_from_no_measurement_path(admin_client):
+    """未計測 is never a breach, and 母数不足 is not the same as 計測手段なし."""
+
+    token = _login(admin_client)
+    _system_id, _snapshot_id, _session_id, headers = _setup_system(
+        admin_client, token, "attention-unmeasured",
+    )
+
+    body = admin_client.get("/interview/metrics", headers=headers).json()
+
+    # A calculable metric with an empty denominator will resolve with usage.
+    resolution = _metric(body, "inquiry_resolution_rate")
+    assert resolution["status"] == "unmeasured"
+    assert resolution["value"] is None
+    assert resolution["attention"]["state"] == "insufficient_data"
+    assert resolution["attention"]["reason"] == "no_observations_yet"
+
+    # A metric whose underlying fact is not recorded at all never will.
+    incorrect = _metric(body, "incorrect_answer_confirmation_rate")
+    assert incorrect["attention"]["state"] == "not_measurable"
+    assert incorrect["attention"]["reason"] == "not_recorded"
+    assert body["attention"]["not_measurable_count"] >= 1
+
+
+def test_attention_criterion_fields_are_reported_per_metric(admin_client):
+    token = _login(admin_client)
+    _system_id, _snapshot_id, _session_id, headers = _setup_system(
+        admin_client, token, "attention-criterion",
+    )
+
+    body = admin_client.get("/interview/metrics", headers=headers).json()
+    attention = _metric(body, "inquiry_resolution_rate")["attention"]
+    assert attention["direction"] == "low_is_bad"
+    assert attention["min_sample"] >= 1
+    assert attention["window"] == "all_time"
+    assert attention["trigger"] == "single_breach"
+    assert attention["clear_condition"] == "value_within_threshold"
+    # #341 deliberately does not pick numeric thresholds.
+    assert attention["threshold"] is None
+
+
+def test_attention_states_follow_the_policy_thresholds():
+    """Direction, minimum sample, and the clear condition are all honoured."""
+
+    from app.interview_metric_attention import (
+        InterviewMetricAttentionPolicy,
+        MetricAttentionRule,
+        apply_attention,
+    )
+    from app.models import InterviewMetricOut
+
+    def rule(key, direction, threshold, min_sample=5):
+        return MetricAttentionRule(
+            key=key,
+            watch=True,
+            direction=direction,
+            threshold=threshold,
+            min_sample=min_sample,
+            window="all_time",
+            trigger="single_breach",
+            clear="value_within_threshold",
+        )
+
+    def metric(key, value, sample_size):
+        return InterviewMetricOut(
+            key=key,
+            category="ux_quality",
+            guardrail=True,
+            description="d",
+            formula="f",
+            sources=["s"],
+            status="measured",
+            value=value,
+            unit="ratio",
+            numerator=int(value * sample_size),
+            denominator=sample_size,
+            sample_size=sample_size,
+        )
+
+    policy = InterviewMetricAttentionPolicy(
+        policy_version="test-v1",
+        digest="0" * 64,
+        rules={
+            "inquiry_resolution_rate": rule("inquiry_resolution_rate", "low_is_bad", 0.5),
+            "implementation_question_transfer_rate": rule(
+                "implementation_question_transfer_rate", "high_is_bad", 0.5,
+            ),
+            "post_inquiry_confirmation_rate": rule(
+                "post_inquiry_confirmation_rate", "high_is_bad", 0.5,
+            ),
+        },
+    )
+
+    low_breach = metric("inquiry_resolution_rate", 0.4, 10)
+    high_ok = metric("implementation_question_transfer_rate", 0.4, 10)
+    undersampled = metric("post_inquiry_confirmation_rate", 0.9, 2)
+
+    _metrics, summary = apply_attention(
+        [low_breach, high_ok, undersampled], policy=policy,
+    )
+
+    assert low_breach.attention.state == "attention"
+    assert low_breach.attention.reason == "threshold_breached"
+    # 解除条件: value_within_threshold -- the same metric back inside the
+    # boundary is no longer 要確認.
+    recovered = metric("inquiry_resolution_rate", 0.6, 10)
+    _metrics, recovered_summary = apply_attention([recovered], policy=policy)
+    assert recovered.attention.state == "ok"
+    assert recovered.attention.reason == "within_threshold"
+    assert recovered_summary.state == "normal"
+
+    assert high_ok.attention.state == "ok"
+    assert undersampled.attention.state == "insufficient_data"
+    assert undersampled.attention.reason == "sample_below_minimum"
+
+    assert summary.state == "attention"
+    assert summary.attention_count == 1
+    assert summary.insufficient_data_count == 1
+    assert summary.watched_count == 3
+
+
+def test_attention_policy_rejects_watching_a_non_guardrail_metric():
+    from app.interview_metric_attention import (
+        InterviewMetricAttentionPolicy,
+        InterviewMetricAttentionPolicyError,
+        MetricAttentionRule,
+        apply_attention,
+    )
+    from app.models import InterviewMetricOut
+
+    policy = InterviewMetricAttentionPolicy(
+        policy_version="test-v1",
+        digest="0" * 64,
+        rules={
+            "unknown_answer_rate": MetricAttentionRule(
+                key="unknown_answer_rate",
+                watch=True,
+                direction="high_is_bad",
+                threshold=0.5,
+                min_sample=1,
+                window="all_time",
+                trigger="single_breach",
+                clear="value_within_threshold",
+            ),
+        },
+    )
+    metric = InterviewMetricOut(
+        key="unknown_answer_rate",
+        category="user_burden",
+        guardrail=False,
+        description="d",
+        formula="f",
+        sources=[],
+        status="measured",
+        value=0.9,
+        unit="ratio",
+        sample_size=10,
+    )
+    with pytest.raises(InterviewMetricAttentionPolicyError):
+        apply_attention([metric], policy=policy)
+
+
+def test_attention_policy_loader_fails_closed(tmp_path):
+    from app.interview_metric_attention import (
+        InterviewMetricAttentionPolicyError,
+        load_interview_metric_attention_policy,
+    )
+
+    missing = tmp_path / "nope.yaml"
+    with pytest.raises(InterviewMetricAttentionPolicyError):
+        load_interview_metric_attention_policy(missing)
+
+    incomplete = tmp_path / "incomplete.yaml"
+    incomplete.write_text(
+        "schema_version: interview-metric-attention-policy-v1\n"
+        "policy_version: partial\n"
+        "metrics:\n"
+        "  - key: unknown_answer_rate\n"
+        "    watch: false\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(InterviewMetricAttentionPolicyError) as excinfo:
+        load_interview_metric_attention_policy(incomplete)
+    assert "must cover every metric key" in str(excinfo.value)
+
+    bad_enum = tmp_path / "bad-enum.yaml"
+    bad_enum.write_text(
+        "schema_version: interview-metric-attention-policy-v1\n"
+        "policy_version: bad\n"
+        "metrics:\n"
+        "  - key: inquiry_resolution_rate\n"
+        "    watch: true\n"
+        "    direction: sometimes_bad\n"
+        "    threshold: null\n"
+        "    min_sample: 5\n"
+        "    window: all_time\n"
+        "    trigger: single_breach\n"
+        "    clear: value_within_threshold\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(InterviewMetricAttentionPolicyError):
+        load_interview_metric_attention_policy(bad_enum)
+
+    duplicate = tmp_path / "duplicate.yaml"
+    duplicate.write_text(
+        "schema_version: interview-metric-attention-policy-v1\n"
+        "policy_version: dup\n"
+        "policy_version: dup\n"
+        "metrics: []\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(InterviewMetricAttentionPolicyError):
+        load_interview_metric_attention_policy(duplicate)
+
+
+def test_shipped_attention_policy_watches_only_designated_guardrails(admin_client):
+    """The shipped artifact must load and stay consistent with the catalog."""
+
+    from app.interview_metric_attention import load_interview_metric_attention_policy
+    from app.models import INTERVIEW_METRIC_KEYS
+
+    policy = load_interview_metric_attention_policy()
+    assert set(policy.rules) == set(INTERVIEW_METRIC_KEYS)
+
+    token = _login(admin_client)
+    _system_id, _snapshot_id, _session_id, headers = _setup_system(
+        admin_client, token, "shipped-policy",
+    )
+    body = admin_client.get("/interview/metrics", headers=headers).json()
+    guardrail_keys = {m["key"] for m in body["metrics"] if m["guardrail"]}
+    watched_keys = {key for key, rule in policy.rules.items() if rule.watch}
+    assert watched_keys <= guardrail_keys

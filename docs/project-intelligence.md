@@ -4046,8 +4046,9 @@ UX 改善の効果を、LLM の解釈や外部分析基盤を使わず、選択�
 System に属する永続データだけから監査できるようにした。
 
 - **API 契約**:
-  - `GET /interview/metrics` は固定 schema
-    `interview-metrics-v1` でユーザー負担・精度・UX 品質の指標を返す。
+  - `GET /interview/metrics` は固定 schema でユーザー負担・精度・UX 品質の
+    指標を返す(#309 時点は `interview-metrics-v1`、#341 で要確認判定を
+    追加した現行は `interview-metrics-v2`)。
     各指標は `description` / `formula` / `sources`、分子・分母、
     `measured|unmeasured` を持つ。分母 0、因果 lineage 不足、未収集は
     `value: null` と固定理由を返し、計測済みの 0 と区別する。
@@ -4091,6 +4092,56 @@ System に属する永続データだけから監査できるようにした。
   指標は表示と監査にだけ使い、分類ルール、自動承認、publish、policy
   変更を起動しない。全 query・event target 検証に `system_id` を含め、
   System 間の分離を回帰テストで固定する。
+
+### 評価指標の段階的開示と要確認判定(Issue #341)
+
+評価指標は、インタビュー中に常に見る一次情報ではなく、運用が健全か・意味の
+あるデータを取れているかを定期的に確認するための二次情報である。#309 では
+ページ見出し直後に全カードが常時展開されていたため、セッション開始・回答・
+共同理解の更新より監視情報の視覚的優先度が高くなっていた。これを、状態を
+持つ入口の背後へ畳んだ。
+
+- **`guardrail` と要確認判定の分離**: `InterviewMetricOut.guardrail` は
+  「監視対象として指定されているか」だけを表し、実際に異常かどうかは
+  新しい `attention` オブジェクトが持つ。両者を1つの boolean に混ぜない。
+  `attention.state` は有限6値 — `attention`(閾値超過)/ `ok` /
+  `insufficient_data`(母数不足・観測なし)/ `not_measurable`(元の事実が
+  記録されておらず算出手段が無い)/ `criterion_unset`(監視対象だが閾値
+  未設定)/ `observation_only`(通知対象ではない定期観測)。未計測が
+  `ok` や `attention` になることはなく、0 で補うこともない。
+- **判定条件の外部化**: `app/policies/interview_metric_attention.yaml` に、
+  指標ごとの `watch` / `direction`(high_is_bad|low_is_bad)/ `threshold` /
+  `min_sample` / `window` / `trigger` / `clear` を持つ成果物として切り出した
+  (#313 と同じ fail-closed 方式、共通の strict loader は
+  `app/policy_loader.py`)。読み込み時に schema version、全 metric key の
+  終端カバレッジ、有限値、重複キー、`watch: false` 側の余分なフィールドを
+  検証し、不正・欠損時は既定値へフォールバックせず起動を拒否する。
+  `policy_version` と YAML 本文の SHA-256 を応答に含める。
+  `watch: true` にできるのは `guardrail` 指定のある指標だけで、
+  違反は `apply_attention` が例外にする。
+- **v1 語彙の意図的な制限**: `window` は `all_time`、`trigger` は
+  `single_breach`、`clear` は `value_within_threshold` のみ。継続時点灯・
+  期間限定集計・手動の「確認済み」は評価履歴の永続化かスケジュール実行が
+  前提であり、GET 呼び出し(=画面表示回数)を観測回数として数えるのは
+  無意味なため、黙って無視するのではなく語彙から除外して拒否する。
+- **閾値の数値は未設定**: 具体的な閾値は各指標の意味と実データを見て別途
+  決めるため(#341 対象外)、出荷時の全 `threshold` は `null`。この状態の
+  監視対象は `criterion_unset` となり入口を点灯させない。母数チェックは
+  閾値と独立に効くため、「データ不足」の判定は最初から機能する。
+- **通知対象と定期観測の分離**: 出荷時の `watch: true` は #309/#334 で
+  guardrail 指定済みの6指標のみ。「調査だけで答えに到達した割合」や
+  「わからない選択率」のように単純な高低で良否を決められない指標は
+  `watch: false` の定期観測とし、入口を点灯させない。
+- **Dashboard**: カード群は既定で閉じ、見出し付近にラベル付きの常設導線を
+  置く。導線は 正常 / 要確認 N件 / データ不足 / 取得失敗 を色だけでなく
+  テキストで示し、「値が悪い」と「まだ判断できない」に同じ警告表現を
+  使わない。取得失敗はサーバーが自分の失敗を報告できないためクライアント
+  側で導出し、インタビュー操作は従来どおり継続できる。展開時は
+  要確認事項 → データの評価可能性 → 全指標 の順で段階表示する。導線は
+  ネイティブ `<button>` + `aria-expanded` / `aria-controls`、本体は
+  ラベル付き `region`。
+- **契約**: 応答 schema は `interview-metrics-v2`(`attention` の追加と
+  System 単位の集計 summary)。
 
 ### PR #296 レビュー対応(#295 実装の修正)
 

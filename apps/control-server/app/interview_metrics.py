@@ -16,6 +16,7 @@ import time
 from collections import Counter
 from typing import Optional, Sequence
 
+from .interview_metric_attention import InterviewMetricAttentionPolicy, apply_attention
 from .models import InterviewMetricOut, InterviewMetricsOut
 
 
@@ -506,8 +507,14 @@ def build_interview_metrics(
     system_id: int,
     *,
     generated_at: Optional[float] = None,
+    attention_policy: Optional[InterviewMetricAttentionPolicy] = None,
 ) -> InterviewMetricsOut:
-    """Build the fixed v1 metric catalog for exactly one System."""
+    """Build the fixed metric catalog for exactly one System.
+
+    Each metric additionally carries its evaluated 要確認 state (Issue #341),
+    judged by the external attention policy. The judgement never changes a
+    value: an unmeasured metric stays unmeasured.
+    """
 
     session_count = int(
         conn.execute(
@@ -845,10 +852,13 @@ def build_interview_metrics(
     metrics.append(_implementation_question_transfer_metric(conn, system_id))
     metrics.extend(_joint_understanding_metrics(conn, system_id))
 
+    metrics, attention = apply_attention(metrics, policy=attention_policy)
+
     return InterviewMetricsOut(
         system_id=system_id,
         generated_at=generated_at if generated_at is not None else time.time(),
         sessions_observed=session_count,
         events_observed=event_count,
-        metrics=metrics,
+        attention=attention,
+        metrics=list(metrics),
     )

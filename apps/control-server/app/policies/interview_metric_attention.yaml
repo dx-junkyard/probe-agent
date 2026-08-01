@@ -1,0 +1,120 @@
+# Interview UX 評価指標の要確認 (attention) 判定ポリシー (Issue #341)
+#
+# `guardrail`(監視対象としての指定)と、実際に要確認かどうかの判定を分離する
+# ための外部成果物。ここに任意コード・正規表現・スコアは書けず、許可された
+# 有限値以外はサーバー起動時に fail-closed で拒否される。
+#
+# 全 metric key を漏れなく列挙する必要がある(終端カバレッジ検証)。
+#
+# 各フィールド:
+#   watch      通知対象か。false は定期観測で、入口を点灯させない。
+#              true にできるのは guardrail 指定のある指標だけ。
+#   direction  high_is_bad / low_is_bad。どちら向きが問題かを表す。
+#   threshold  要確認と判定する境界値。null は「閾値未設定」で点灯しない。
+#              具体的な数値は実データを見て別途決める(#341 対象外)。
+#   min_sample 判定に必要な最低母数。値の良し悪しの閾値ではなく、比率が
+#              偶然に振れる小標本を判定対象から外すための下限。
+#   window     対象期間。v1 は all_time のみ(#309/#334 の集計が全期間のため)。
+#   trigger    single_breach のみ。継続時点灯は評価履歴の永続化が必要。
+#   clear      value_within_threshold のみ。閾値内に戻れば解除される。
+schema_version: interview-metric-attention-policy-v1
+policy_version: interview-metric-attention-v1
+
+metrics:
+  # --- 通知対象 (guardrail) ------------------------------------------------
+  - key: incorrect_answer_confirmation_rate
+    watch: true
+    direction: high_is_bad
+    threshold: null
+    min_sample: 20
+    window: all_time
+    trigger: single_breach
+    clear: value_within_threshold
+
+  - key: inquiry_resolution_rate
+    watch: true
+    direction: low_is_bad
+    threshold: null
+    min_sample: 20
+    window: all_time
+    trigger: single_breach
+    clear: value_within_threshold
+
+  - key: implementation_question_transfer_rate
+    watch: true
+    direction: high_is_bad
+    threshold: null
+    min_sample: 20
+    window: all_time
+    trigger: single_breach
+    clear: value_within_threshold
+
+  - key: joint_understanding_provisional_outcome_rate
+    watch: true
+    direction: high_is_bad
+    threshold: null
+    min_sample: 20
+    window: all_time
+    trigger: single_breach
+    clear: value_within_threshold
+
+  - key: joint_understanding_stale_premise_close_rate
+    watch: true
+    direction: high_is_bad
+    threshold: null
+    min_sample: 20
+    window: all_time
+    trigger: single_breach
+    clear: value_within_threshold
+
+  # 「調べたが分からなかった」が少なすぎる方が問題。証拠不足を
+  # もっともらしさで埋めていないかを見る指標のため low_is_bad。
+  - key: joint_understanding_unknown_finding_rate
+    watch: true
+    direction: low_is_bad
+    threshold: null
+    min_sample: 20
+    window: all_time
+    trigger: single_breach
+    clear: value_within_threshold
+
+  # --- 定期観測 (入口を点灯させない) ---------------------------------------
+  # 単純な高低だけで良否を決められない、または傾向として読む指標。
+  - key: answers_per_understanding_update
+    watch: false
+  - key: unknown_answer_rate
+    watch: false
+  - key: review_abandonment_rate
+    watch: false
+  - key: evidence_detail_expansion_rate
+    watch: false
+  - key: operations_per_inquiry
+    watch: false
+  - key: corrected_confirmed_intent_rate
+    watch: false
+  - key: runtime_contradiction_rate
+    watch: false
+  - key: understanding_revision_recorrection_rate
+    watch: false
+  - key: post_approval_rejection_rate
+    watch: false
+  - key: post_approval_rollback_rate
+    watch: false
+  - key: post_approval_rejection_or_rollback_rate
+    watch: false
+  - key: repeated_question_rate
+    watch: false
+  - key: unchanged_item_reconfirmation_rate
+    watch: false
+  - key: post_inquiry_confirmation_rate
+    watch: false
+  - key: joint_understanding_from_unknown_rate
+    watch: false
+  - key: joint_understanding_conclusion_rate
+    watch: false
+  - key: joint_understanding_reflux_rate
+    watch: false
+  - key: joint_understanding_investigation_answered_rate
+    watch: false
+  - key: joint_understanding_developer_question_rate
+    watch: false

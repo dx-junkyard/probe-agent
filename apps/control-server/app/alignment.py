@@ -66,6 +66,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 import yaml
 
+from . import policy_loader
 from .git_ops import GitError, read_file_at_commit
 from .interview_intent_agent import INTENT_FIELDS
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient, is_reasoning_model
@@ -115,23 +116,7 @@ class AlignmentPolicyError(ValueError):
     """
 
 
-class _UniqueKeySafeLoader(yaml.SafeLoader):
-    """Safe YAML loader which rejects duplicate mapping keys."""
-
-
-def _construct_unique_mapping(loader, node, deep=False):
-    mapping = {}
-    for key_node, value_node in node.value:
-        key = loader.construct_object(key_node, deep=deep)
-        if key in mapping:
-            raise AlignmentPolicyError(f"duplicate policy key: {key!r}")
-        mapping[key] = loader.construct_object(value_node, deep=deep)
-    return mapping
-
-
-_UniqueKeySafeLoader.add_constructor(
-    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping,
-)
+_UniqueKeySafeLoader = policy_loader.UniqueKeySafeLoader
 
 
 @dataclass(frozen=True)
@@ -226,36 +211,19 @@ class AlignmentReviewPolicy:
 
 
 def _require_mapping(value: Any, label: str) -> Mapping[str, Any]:
-    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
-        raise AlignmentPolicyError(f"{label} must be an object with string keys")
-    return value
+    return policy_loader.require_mapping(value, label, AlignmentPolicyError)
 
 
 def _require_exact_keys(value: Mapping[str, Any], required: set, label: str) -> None:
-    actual = set(value)
-    if actual != required:
-        missing = sorted(required - actual)
-        unexpected = sorted(actual - required)
-        raise AlignmentPolicyError(
-            f"{label} must contain exactly {sorted(required)!r}; "
-            f"missing={missing!r}, unexpected={unexpected!r}"
-        )
+    policy_loader.require_exact_keys(value, required, label, AlignmentPolicyError)
 
 
 def _require_nonempty_string(value: Any, label: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise AlignmentPolicyError(f"{label} must be a non-empty string")
-    return value
+    return policy_loader.require_nonempty_string(value, label, AlignmentPolicyError)
 
 
 def _parse_enum_list(value: Any, allowed: Tuple[str, ...], label: str) -> Tuple[str, ...]:
-    if not isinstance(value, list) or not value:
-        raise AlignmentPolicyError(f"{label} must be a non-empty list")
-    if any(not isinstance(item, str) or item not in allowed for item in value):
-        raise AlignmentPolicyError(f"{label} must be drawn from {allowed!r}")
-    if len(set(value)) != len(value):
-        raise AlignmentPolicyError(f"{label} must not contain duplicate values")
-    return tuple(value)
+    return policy_loader.parse_enum_list(value, allowed, label, AlignmentPolicyError)
 
 
 def _parse_rule(raw_rule: Any, index: int) -> AlignmentPolicyRule:
