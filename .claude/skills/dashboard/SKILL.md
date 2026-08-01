@@ -202,6 +202,25 @@ The dashboard should support:
   Per-metric state comes from the server's `attention` object — the client
   never re-derives a judgement, and an unmeasured metric is never rendered as
   a zero.
+- Interview page target UX (Issue #342, spec only — NOT implemented): before
+  changing anything on `pages/interview.tsx` or
+  `components/system-understanding/*`, read
+  `docs/system-interview-workflow-ux.md`. It is the agreed target design and
+  supersedes ad-hoc layout decisions: developer states `W0`-`W7` chosen by a
+  first-match rule table over persisted facts only (never client-only state
+  such as `manualMainTabState` / `lastMaterialization`), one primary action
+  per state (`W1` alone has none), information roles `R1`-`R6` with an
+  element-by-element assignment, and exceptions `E1`-`E14` split into
+  blocking / degraded / informational. Two rules bind any interview-screen
+  change made before the spec is implemented: (a) do not add a control that
+  is rendered disabled with explanatory text for an unmet precondition —
+  show it only once it is usable; (b) do not add a manual trigger for a
+  process that satisfies the spec's `A1`-`A4` automation gate (understanding
+  build/refresh, alignment build, intent proposal, question routing and
+  investigation, proposal generation, diff materialization, Runtime Reality
+  Check) — such controls belong in the failure/recovery path only. The spec
+  relaxes no human gate and changes nothing about #341's metrics panel
+  beyond its placement and its `R6` role.
 - Interview page layout (Issue #295): the main column is a two-tab area —
   「Alignment Review」 and 「会話」. The default tab is derived
   deterministically from existing client state (`uiState`,
