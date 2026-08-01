@@ -6844,3 +6844,143 @@ class CellShadowDecideIn(BaseModel):
     decision: str
     decided_by: str
     note: str = ""
+
+
+# --- State-driven System Interview workflow (Issue #349) ---------------------
+#
+# Response/request contracts for docs/system-interview-workflow-ux.md. Every
+# field is either a persisted fact or a value the canonical engine
+# (app/interview_workflow.py) derived from persisted facts -- the Dashboard
+# never re-derives a workflow state of its own (spec principle P9).
+
+
+class InterviewWorkflowFactsOut(BaseModel):
+    """The exact inputs of the 13-row first-match rule table, exposed so a
+    displayed state is explainable and testable without re-querying."""
+
+    has_snapshot: bool
+    has_session: bool
+    session_closed: bool
+    running_process_kinds: List[str] = []
+    blocking_failure_states: List[str] = []
+    understanding_unconfirmed: bool
+    open_required_questions: int
+    outstanding_alignment_items: int
+    proposals_needing_review: int
+    proposals_generatable: bool
+    approved_proposal_count: int
+    diff_matches_approval_set: bool
+    diff_review_complete: bool
+    pending_handoff_count: int
+
+
+class InterviewProcessRunOut(BaseModel):
+    id: int
+    session_id: int
+    system_id: int
+    process_kind: str
+    status: str
+    failure_class: Optional[str] = None
+    target_state: Optional[str] = None
+    error: Optional[str] = None
+    started_at: float
+    finished_at: Optional[float] = None
+
+
+class InterviewBackRequestOut(BaseModel):
+    id: int
+    session_id: int
+    system_id: int
+    cause_kind: str
+    candidate_state: str
+    reached_state: str
+    status: str
+    created_at: float
+
+
+class InterviewWorkflowExceptionOut(BaseModel):
+    """One currently-active exception (spec §5.2).
+
+    `severity` is the spec's 3-way split. Only `blocking` and `degraded` are
+    the `R5` role; `informational` exceptions are branches of the primary
+    work card and must never be rendered as a warning band.
+    """
+
+    code: str
+    severity: str
+    target_state: Optional[str] = None
+    message: str
+    detail: Optional[str] = None
+    recovery_process_kind: Optional[str] = None
+    recovery_condition: Optional[str] = None
+
+
+class InterviewWorkflowStateOut(BaseModel):
+    system_id: int
+    session_id: Optional[int] = None
+    state: str
+    candidate_state: str
+    rule_row: int
+    reached_state: Optional[str] = None
+    backward_hold: bool = False
+    pending_back_request: Optional[InterviewBackRequestOut] = None
+    terminal_kind: Optional[str] = None
+    primary_action: str
+    facts: InterviewWorkflowFactsOut
+    running_processes: List[InterviewProcessRunOut] = []
+    unresolved_failures: List[InterviewProcessRunOut] = []
+    exceptions: List[InterviewWorkflowExceptionOut] = []
+    diff_materialized_at: Optional[float] = None
+    latest_ready_snapshot_id: Optional[int] = None
+
+
+class InterviewDiffReviewIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reviewed_by: str = ""
+    note: str = ""
+
+
+class InterviewDiffReviewOut(BaseModel):
+    id: int
+    session_id: int
+    system_id: int
+    diff_materialized_at: float
+    diff_digest: str
+    reviewed_by: str
+    decision_method: str
+    note: str
+    created_at: float
+
+
+class InterviewBackAcknowledgeIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str = ""
+
+
+class InterviewSessionCloseIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    terminal_kind: str = "suspended"
+    reason: str = ""
+    actor: str = ""
+
+
+class InterviewSessionReopenIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = ""
+    actor: str = ""
+
+
+class InterviewSessionStatusAuditOut(BaseModel):
+    id: int
+    session_id: int
+    system_id: int
+    action: str
+    terminal_kind: Optional[str] = None
+    reason: str
+    actor: str
+    decision_method: str
+    created_at: float

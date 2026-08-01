@@ -814,6 +814,37 @@ Rules for any new artifact:
   before `generate_text` on a mock/non-reasoning client, so any test that
   must reach the LLM path has to configure a real reasoning model
   (`openai`/`o3`) and stub `llm._request_json`.
+- The System Interview's developer-facing state is decided in exactly ONE
+  place: `app/interview_workflow.py` (Issue #349, implementing
+  `docs/system-interview-workflow-ux.md`). `evaluate_candidate_state` is the
+  13-row first-match table; `apply_backward_hold` is the ordered-state
+  (`W2 < W3 < W4 < W5 < W6 < W7`) backward hold. Both are pure functions of a
+  `WorkflowFacts` value — no clock, no request-scoped value, no client state
+  — so the same persisted facts always yield the same state. Add a new input
+  by adding a field to `WorkflowFacts` and reading it in `gather_facts`;
+  never branch on something a reload would lose.
+  - Any process that should show 「システムが調べている」 (`W1`) must persist a
+    run record via `process_run` / `ProcessRunTracker` / `tracked_process`.
+    They open short-lived connections only, so they are safe around an LLM
+    call — but the tracked function must still own its own connections.
+  - A 404/409 precondition rejection is `abandon()` (nothing ran), not a
+    failure. Recording it would surface a retry the developer cannot succeed
+    at. A deliberate skip (the Runtime Reality Check's finite skip condition)
+    is likewise not a run.
+  - Failure classification is deterministic and lives in `classify_failure`:
+    it depends on the material left behind (`E3-a` vs `E3-b`, `E4-a` vs
+    `E4-b`), not on which process failed. `target_state` is the finite set
+    `W2` / `W4` / `W5`; nothing else may be blocked.
+  - "Unresolved" is derived (no later success of the same `process_kind`),
+    never stored. `OP-D14` suspend/resume therefore cannot turn a failure
+    into a solved one — it only flips the existing session `status` and adds
+    an `interview_session_status_audit` row.
+  - `routes/interview_workflow.py` writes exactly two developer decisions
+    (the diff review and the backward acknowledgement, both
+    `decision_method: manual`) and two system-recorded progress facts (the
+    `reached_state` checkpoint and the backward request). It confirms no
+    understanding, settles no Alignment item, approves no proposal, applies
+    no diff, and starts no observation.
 - Additive nullable columns go through `db.py`'s `_add_column_if_missing`
   (Issue #308). It only ever adds a nullable column and never backfills, so
   do not use it for NOT NULL/DEFAULT migrations that need a value written

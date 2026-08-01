@@ -4254,3 +4254,131 @@ export interface JointUnderstandingRefluxResultOut {
   skipped_not_fact: number;
   skipped_unverified: number;
 }
+
+// --- State-driven System Interview workflow (Issue #349) ---------------------
+//
+// The canonical developer-facing workflow contract of
+// docs/system-interview-workflow-ux.md. The dashboard renders these values;
+// it never re-derives a workflow state of its own (spec principle P9).
+
+export type InterviewWorkflowState =
+  | "W0-A" | "W0-B" | "W1" | "W2" | "W3" | "W4" | "W5" | "W6" | "W7";
+
+export type InterviewWorkflowPrimaryAction =
+  | "open_repository"
+  | "start_session"
+  | "none"
+  | "confirm_understanding"
+  | "submit_answer"
+  | "confirm_alignment_item"
+  | "approve_proposal"
+  | "record_diff_review"
+  | "open_connection_setup"
+  | "view_handoff_status"
+  | "resume_session";
+
+export type InterviewWorkflowTerminalKind = "completed" | "handoff" | "suspended";
+
+export type InterviewProcessKind =
+  | "understanding_build"
+  | "understanding_update"
+  | "alignment_build"
+  | "question_routing"
+  | "intent_candidates"
+  | "proposal_generation"
+  | "diff_generation"
+  | "runtime_reality_check";
+
+export interface InterviewWorkflowFactsOut {
+  has_snapshot: boolean;
+  has_session: boolean;
+  session_closed: boolean;
+  running_process_kinds: InterviewProcessKind[];
+  blocking_failure_states: string[];
+  understanding_unconfirmed: boolean;
+  open_required_questions: number;
+  outstanding_alignment_items: number;
+  proposals_needing_review: number;
+  proposals_generatable: boolean;
+  approved_proposal_count: number;
+  diff_matches_approval_set: boolean;
+  diff_review_complete: boolean;
+  pending_handoff_count: number;
+}
+
+export interface InterviewProcessRunOut {
+  id: number;
+  session_id: number;
+  system_id: number;
+  process_kind: InterviewProcessKind;
+  status: "running" | "succeeded" | "failed";
+  failure_class: "blocking" | "degraded" | null;
+  target_state: string | null;
+  error: string | null;
+  started_at: number;
+  finished_at: number | null;
+}
+
+export interface InterviewBackRequestOut {
+  id: number;
+  session_id: number;
+  system_id: number;
+  cause_kind: string;
+  candidate_state: InterviewWorkflowState;
+  reached_state: InterviewWorkflowState;
+  status: "pending" | "acknowledged" | "resolved";
+  created_at: number;
+}
+
+export interface InterviewWorkflowExceptionOut {
+  code: string;
+  severity: "blocking" | "degraded" | "informational";
+  target_state: string | null;
+  message: string;
+  detail: string | null;
+  recovery_process_kind: InterviewProcessKind | null;
+  recovery_condition: string | null;
+}
+
+export interface InterviewWorkflowStateOut {
+  system_id: number;
+  session_id: number | null;
+  state: InterviewWorkflowState;
+  candidate_state: InterviewWorkflowState;
+  rule_row: number;
+  reached_state: InterviewWorkflowState | null;
+  backward_hold: boolean;
+  pending_back_request: InterviewBackRequestOut | null;
+  terminal_kind: InterviewWorkflowTerminalKind | null;
+  primary_action: InterviewWorkflowPrimaryAction;
+  facts: InterviewWorkflowFactsOut;
+  running_processes: InterviewProcessRunOut[];
+  unresolved_failures: InterviewProcessRunOut[];
+  exceptions: InterviewWorkflowExceptionOut[];
+  diff_materialized_at: number | null;
+  latest_ready_snapshot_id: number | null;
+}
+
+export interface InterviewDiffReviewOut {
+  id: number;
+  session_id: number;
+  system_id: number;
+  diff_materialized_at: number;
+  diff_digest: string;
+  reviewed_by: string;
+  decision_method: string;
+  note: string;
+  created_at: number;
+}
+
+export interface InterviewSessionStatusAuditOut {
+  id: number;
+  session_id: number;
+  system_id: number;
+  action: "close" | "reopen";
+  terminal_kind: InterviewWorkflowTerminalKind | null;
+  reason: string;
+  actor: string;
+  decision_method: string;
+  created_at: number;
+}

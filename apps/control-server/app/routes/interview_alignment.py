@@ -486,6 +486,40 @@ def _run_runtime_match_judge(
 
 
 def run_alignment_build(session_id: int, system_id: int) -> AlignmentBuildOut:
+    """Alignment build with a persisted run record (Issue #349).
+
+    Wraps `_run_alignment_build_core` so the build appears as `W1` while it
+    runs, and so a failure lands on the right state afterwards: blocking
+    `E4-a` on `W4` when no valid item exists yet, degraded `E4-b` when the
+    previous items are still usable (`interview_workflow.classify_failure`
+    makes that call, per spec §5.1 -- the class depends on the material left,
+    not on which process failed).
+
+    A 404/409 precondition rejection (no session, or no understanding
+    revision to build from) is deliberately NOT recorded as a failed run: no
+    reasoning attempt was made, and turning it into an unresolved blocking
+    failure would show a retry the developer cannot succeed at.
+    """
+    from ..interview_workflow import ProcessRunTracker
+
+    tracker = ProcessRunTracker(session_id, system_id, "alignment_build")
+    tracker.start()
+    try:
+        result = _run_alignment_build_core(session_id, system_id)
+    except HTTPException as exc:
+        if exc.status_code in (404, 409):
+            tracker.abandon()
+        else:
+            tracker.fail(exc)
+        raise
+    except BaseException as exc:  # noqa: BLE001 - recorded then re-raised
+        tracker.fail(exc)
+        raise
+    tracker.succeed()
+    return result
+
+
+def _run_alignment_build_core(session_id: int, system_id: int) -> AlignmentBuildOut:
     """Build alignment items contrasting Intent Brief vs Current System.
 
     Core of ``POST .../alignment/build`` (below), extracted so the automatic

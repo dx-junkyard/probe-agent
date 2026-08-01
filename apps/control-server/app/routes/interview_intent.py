@@ -32,6 +32,7 @@ from typing import Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..auth import get_system_id
+from ..interview_workflow import tracked_process
 from ..db import get_conn
 from ..interview_intent_agent import (
     INTENT_FIELDS,
@@ -348,6 +349,9 @@ def decline_intent_item(
     response_model=List[InterviewIntentItemOut],
     status_code=201,
 )
+# Issue #349 `OP-S4`: Intent candidate generation is automatic; confirming a
+# candidate stays manual (#284). Degraded-only on failure.
+@tracked_process("intent_candidates")
 def propose_intent_items(
     session_id: int,
     system_id: int = Depends(get_system_id),

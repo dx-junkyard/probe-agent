@@ -448,7 +448,10 @@ describe("ReviewQueuePanel", () => {
     expect(within(card).queryByTestId("review-item-hold-12")).not.toBeInTheDocument();
   });
 
-  test("突き合わせを実行 calls the build API", async () => {
+  // Issue #349 (#18 / `OP-S3`): the Alignment build is automatic, so the
+  // manual trigger is not permanent -- it only appears as the E4-a/E4-b
+  // recovery ("run the same process again").
+  test("突き合わせの手動実行は復旧時だけ現れ、通常時は描画されない", async () => {
     const queue: AlignmentReviewQueueOut = { session_id: 1, system_id: 1, items: [] };
     const full: AlignmentListOut = {
       session_id: 1, system_id: 1,
@@ -464,8 +467,15 @@ describe("ReviewQueuePanel", () => {
     mockApi.post.mockResolvedValue({ session_id: 1, system_id: 1, revision_id: 1, intelligence_run_id: 1, is_mock: false, items: [] });
 
     const { ReviewQueuePanel } = await import("@/components/system-understanding/review-queue");
-    render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+    const { unmount } = render(<ReviewQueuePanel sessionId={1} />, { wrapper: createWrapper() });
+    await screen.findByTestId("review-queue-empty");
+    expect(screen.queryByTestId("review-queue-build-button")).toBeNull();
+    unmount();
 
+    render(
+      <ReviewQueuePanel sessionId={1} showRecoveryBuild />,
+      { wrapper: createWrapper() },
+    );
     const button = await screen.findByTestId("review-queue-build-button");
     fireEvent.click(button);
 

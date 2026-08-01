@@ -834,7 +834,17 @@ function InformationalItemRow({
   );
 }
 
-export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
+export function ReviewQueuePanel({
+  sessionId,
+  showRecoveryBuild = false,
+}: {
+  sessionId: number;
+  // Issue #349 (#18 / `OP-S3`): the Alignment build is an automatic system
+  // process, so 「突き合わせを実行」 is NOT a permanent control. It appears
+  // only while `E4-a`/`E4-b` is currently active, as that exception's
+  // "run the same process again" recovery (spec §5.3-1).
+  showRecoveryBuild?: boolean;
+}) {
   const { data: queue } = useReviewQueue(sessionId);
   const { data: full } = useAlignmentList(sessionId);
   const build = useBuildAlignment(sessionId);
@@ -1013,16 +1023,18 @@ export function ReviewQueuePanel({ sessionId }: { sessionId: number }) {
               Intent Brief と現在の理解を突き合わせ、確認が必要な項目だけを表示します。回答後は自動で更新されます。
             </CardDescription>
           </div>
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={handleBuild}
-            disabled={build.isPending}
-            data-testid="review-queue-build-button"
-          >
-            <Sparkles className="h-4 w-4 mr-1" />
-            {build.isPending ? "分析中..." : "突き合わせを実行"}
-          </Button>
+          {showRecoveryBuild && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleBuild}
+              disabled={build.isPending}
+              data-testid="review-queue-build-button"
+            >
+              <Sparkles className="h-4 w-4 mr-1" />
+              {build.isPending ? "分析中..." : "突き合わせをもう一度実行する"}
+            </Button>
+          )}
         </div>
       </CardHeader>
       <CardContent className="space-y-3">

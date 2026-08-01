@@ -15,7 +15,6 @@
 
 import { useState } from "react";
 import { toast } from "sonner";
-import { Sparkles } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -28,7 +27,6 @@ import {
   useCreateInterviewIntentItem,
   useDeclineInterviewIntentItem,
   useInterviewIntentList,
-  useProposeInterviewIntentItems,
   useResumeInterviewInquiry,
 } from "@/api/hooks";
 import {
@@ -350,23 +348,10 @@ function NextMissingFieldPrompt({
 
 export function IntentBriefPanel({ sessionId }: { sessionId: number }) {
   const { data: intentList } = useInterviewIntentList(sessionId);
-  const propose = useProposeInterviewIntentItems(sessionId);
   // Issue #285 refresh/resume: re-attach any still-active Inquiry to its
   // origin item after a reload.
   const activeInquiries = useActiveInquiriesByOrigin(sessionId);
 
-  const handlePropose = () => {
-    propose.mutate(undefined, {
-      onSuccess: items => {
-        if (items.length === 0) {
-          toast.info("新たに提案できる項目はありませんでした");
-        } else {
-          toast.success(`${items.length} 件の提案を追加しました(未確認)`);
-        }
-      },
-      onError: e => toast.error(String(e)),
-    });
-  };
 
   if (!intentList) return null;
 
@@ -386,16 +371,9 @@ export function IntentBriefPanel({ sessionId }: { sessionId: number }) {
               ユーザーの意図は本人だけが決められます。AI 提案は確認するまで確定しません。
             </CardDescription>
           </div>
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={handlePropose}
-            disabled={propose.isPending}
-            data-testid="intent-propose-button"
-          >
-            <Sparkles className="h-4 w-4 mr-1" />
-            {propose.isPending ? "提案中..." : "AIに提案してもらう"}
-          </Button>
+          {/* Issue #349 (#52 / `OP-S4`): Intent 候補の生成は自動なので、
+              通常フローの操作としては置かない。確定・訂正は常に人間の
+              明示操作のまま (#284) で、この下のカードにある。 */}
         </div>
       </CardHeader>
       <CardContent className="space-y-4">

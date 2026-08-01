@@ -26,6 +26,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 
 from ..auth import get_system_id
+from ..interview_workflow import tracked_process
 from ..db import get_conn
 from ..interview_language import get_interview_language
 from ..investigation_agent import investigate
@@ -181,6 +182,11 @@ def _investigation_json(investigation) -> dict:
     "/interview/sessions/{session_id}/qa/route-and-investigate",
     response_model=InterviewQaRouteInvestigateBatchOut,
 )
+# Issue #349 `OP-S5`: question routing + investigation is an automatic system
+# process, so it carries a persisted run record and shows as `W1` while it
+# runs. Its failures are degraded (the question itself is still answerable by
+# the developer), never blocking -- see PROCESS_BLOCKING_TARGET.
+@tracked_process("question_routing")
 def route_and_investigate_qa(
     session_id: int,
     payload: Optional[InterviewQaRouteInvestigateBatchRequest] = None,

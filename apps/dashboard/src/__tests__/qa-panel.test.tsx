@@ -94,6 +94,9 @@ interface QaPanelOwnProps {
   actor: string;
   approvedCount: number;
   answerableAreas: KnowledgeArea[] | null | undefined;
+  // Issue #349: recovery controls appear only while the process behind them
+  // has failed.
+  showRecoveryActions?: boolean;
 }
 
 async function renderQaPanel(props: QaPanelOwnProps) {
@@ -196,7 +199,10 @@ describe("QaPanel out-of-area grouping (Issue #291)", () => {
 });
 
 describe("QaPanel route-and-investigate wiring (Issue #286 review fix, Finding 1/6)", () => {
-  test("AIに先に調査させる button calls the batch endpoint and toasts a Japanese summary", async () => {
+  // Issue #349 (#60 / `OP-S5`): 質問の分類・調査は自動処理なので、通常時に
+  // 手動トリガーを常設しない。処理そのものが失敗したときの復旧操作としてだけ
+  // 現れる (`showRecoveryActions`)。
+  test("調査の手動トリガーは復旧時だけ現れ、押すとバッチ endpoint を呼ぶ", async () => {
     mockQaList([makeQa({ id: 1 })]);
     const batchResult: InterviewQaRouteInvestigateBatchOut = {
       session_id: 1,
@@ -212,7 +218,17 @@ describe("QaPanel route-and-investigate wiring (Issue #286 review fix, Finding 1
     });
 
     const { toast } = await import("sonner");
-    await renderQaPanel({ sessionId: 1, actor: "dev", approvedCount: 1, answerableAreas: [] });
+    const first = await renderQaPanel({
+      sessionId: 1, actor: "dev", approvedCount: 1, answerableAreas: [],
+    });
+    await screen.findByTestId("qa-panel");
+    expect(screen.queryByTestId("route-and-investigate-qa")).toBeNull();
+    first.unmount();
+
+    await renderQaPanel({
+      sessionId: 1, actor: "dev", approvedCount: 1, answerableAreas: [],
+      showRecoveryActions: true,
+    });
 
     const button = await screen.findByTestId("route-and-investigate-qa");
     fireEvent.click(button);

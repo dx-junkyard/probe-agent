@@ -202,37 +202,54 @@ The dashboard should support:
   Per-metric state comes from the server's `attention` object — the client
   never re-derives a judgement, and an unmeasured metric is never rendered as
   a zero.
-- Interview page target UX (Issue #342, spec only — NOT implemented): before
-  changing anything on `pages/interview.tsx` or
+- Interview page state-driven UX (Issue #342 spec, implemented by Issue
+  #349): before changing anything on `pages/interview.tsx` or
   `components/system-understanding/*`, read
-  `docs/system-interview-workflow-ux.md`. It is the agreed target design and
-  supersedes ad-hoc layout decisions: developer states `W0-A`/`W0-B`/`W1`-`W7`
-  chosen by a two-stage evaluation — a first-match rule table over persisted
-  facts only (never client-only state such as `manualMainTabState` /
-  `lastMaterialization` / a mutation's `isPending`), then a backward-transition
-  hold so a completed state is never re-entered without explicit
-  acknowledgement (`reached_state` is the current checkpoint, not an all-time
-  monotonic maximum; the hold covers only the ordered states `W2`-`W7`;
-  `W0-A`/`W0-B`/`W1` have no workflow position and never trigger it);
-  one primary action per state, which must be the operation
-  that satisfies that state's completion condition (`W1` alone has none);
-  information roles `R1`-`R6`, exactly one per element; and exceptions
-  `E1`-`E14` split into blocking / degraded / informational, where degraded
-  requires enough material to keep making the current decision. A recovery
-  exit uses the existing session `status=closed` before blocking-failure rows;
-  it does not advance `reached_state`, and reopening restores unresolved failures
-  rather than treating them as solved.
-  Two rules bind any interview-screen
-  change made before the spec is implemented: (a) do not add a control that
-  is rendered disabled with explanatory text for an unmet precondition —
-  show it only once it is usable; (b) do not add a manual trigger for a
-  process that satisfies the spec's `A1`-`A4` automation gate (understanding
-  build/refresh, alignment build, intent proposal, question routing and
-  investigation, proposal generation, diff materialization, Runtime Reality
-  Check) — such controls belong in the failure/recovery path only. The spec
-  relaxes no human gate and changes nothing about #341's metrics panel
-  beyond its placement and its `R6` role.
-- Interview page layout (Issue #295): the main column is a two-tab area —
+  `docs/system-interview-workflow-ux.md`. It describes what the screen
+  ALREADY does. The developer-facing state comes from ONE query,
+  `useInterviewWorkflowState` → `GET /interview/workflow-state`, which
+  returns the state (`W0-A`/`W0-B`/`W1`-`W7`), the single `primary_action`
+  for it, `reached_state`, any pending backward request, and the currently
+  active exceptions. Never re-derive a workflow state client-side, and never
+  feed a mutation's `isPending`, a chosen tab, or any other client-only
+  value into what is displayed — those vanish on reload (原則 P9).
+  Concretely, on this page:
+  - `components/system-understanding/workflow-panel.tsx` owns `R1`
+    (`WorkflowLocationCard`: state label + 次にやること + progress steps, one
+    per screen), `R5` (`WorkflowExceptions`: blocking/degraded ONLY —
+    informational exceptions like `E8`/`E9` are branches of the primary work
+    card and must never render as a warning band), and the `E8` lead
+    (`BackRequestNotice`).
+  - Exactly one work surface renders at a time
+    (`data-testid="work-surface-W2".."work-surface-W7"`). There are no main
+    tabs and no tab-default heuristic; `W3` and `W4` are separate states.
+  - The state's primary action must BE its completion condition. `W6`'s is
+    「この差分を確認した」 (`POST .../diff-review`, a manual record);
+    downloading the `.patch` and opening the diff are auxiliary and never
+    complete the state.
+  - Do not add a control rendered disabled with explanatory text for an unmet
+    precondition — show it only once it is usable (原則 P3).
+  - Do not add a permanent manual trigger for a process satisfying the
+    `A1`-`A4` automation gate (understanding build/refresh, alignment build,
+    intent proposal, question routing/investigation, proposal generation,
+    diff materialization, Runtime Reality Check). Those controls belong to
+    the failure path only, gated on the matching active exception
+    (`showRecoveryBuild` on `ReviewQueuePanel`, `showRecoveryActions` on
+    `QaPanel`, the `E3-a`-gated understanding rebuild). Recovery offers only
+    "run the same process again" and "leave safely to the `W7` terminal" —
+    never a bypass of a human gate.
+  - `R6` (history/audit) lives behind the single always-openable
+    「履歴と監査情報」 entry in a fixed order, and that is where #341's
+    metrics panel now lives — it is `R6` in every state and never `R2`.
+  - The `W7` terminal (`completed`/`handoff`/`suspended`) decides the primary
+    action; 中断・引き継ぎ・再開 go through `POST .../close` / `.../reopen`,
+    which are manual audit records and never resolve a blocking failure.
+  The spec relaxes no human gate and changes nothing about #341's metrics
+  panel beyond its placement and its `R6` role.
+- Interview page layout (Issue #295) — **superseded by Issue #349**: the
+  two-tab main area and its default-tab derivation described below no longer
+  exist. Kept for context on why the compensating machinery was there. The
+  main column was a two-tab area —
   「Alignment Review」 and 「会話」. The default tab is derived
   deterministically from existing client state (`uiState`,
   `canConfirmStructuredUnderstanding`, `alignmentBuilt` from the

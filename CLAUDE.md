@@ -373,6 +373,51 @@ creating incomplete persistence or execution paths for later phases.
     Everything else is derivable from
     existing persisted facts. See the Issue #342 section in
     `docs/project-intelligence.md`.
+    **Status: the spec is implemented by Issue #349 (below). Treat
+    `docs/system-interview-workflow-ux.md` as the canonical description of
+    the interview screen's behaviour, not as a future plan.**
+
+16. Issue #349 — the implementation of the #342 spec. Unlike #343-#346, this
+    issue explicitly OWNS code: DB, API, state management, Dashboard, tests.
+    What it added, and what any later change must preserve:
+    - `app/interview_workflow.py` is the **single canonical state engine**.
+      `evaluate_candidate_state` is the 13-row first-match table and
+      `apply_backward_hold` is the ordered-state hold; both are pure
+      functions of a `WorkflowFacts` value. Do not re-derive a workflow
+      state anywhere else — in particular never in the Dashboard.
+    - The four §8.1 facts are five tables: `interview_diff_review` (A,
+      manual, keyed to the reviewed diff's `materialized_at` so a new diff
+      never inherits the old confirmation), `interview_process_run` (B,
+      running/succeeded/failed + `failure_class` + a `W2`/`W4`/`W5`
+      `target_state`), `interview_workflow_checkpoint` +
+      `interview_back_request` (C), and `interview_back_acknowledgement`
+      (D, manual). `interview_session_status_audit` records `OP-D14`
+      suspend/resume as manual; the state itself still comes from the
+      existing session `status`.
+    - "Unresolved" for a blocking failure is **derived** (no later success
+      of the same `process_kind`), never stored — so a suspend/resume cannot
+      launder a failure into a solved one.
+    - Every process that can produce `W1` must open a run record:
+      `interview_workflow.process_run` / `ProcessRunTracker` /
+      `tracked_process`. A 404/409 precondition rejection is `abandon()`,
+      not a failure — recording it would show a retry that cannot succeed.
+      A process without a run record must not produce `W1`.
+    - `GET /interview/workflow-state` is the only source of the displayed
+      state, its single `primary_action`, and the active exceptions. The
+      Dashboard renders that; `deriveUiState` survives only as an internal
+      selector for the conversation card's CONTENT and no longer takes a
+      mutation's `isPending`.
+    - The spec's abolished elements are gone from the page: the two main
+      tabs and the 「会話タブへ移動」 lead, the 「差分を生成」 button (`OP-S7`
+      is automatic), the three "precondition not met" notes, and the Intent
+      「AIに提案してもらう」 button. 「理解を構築/更新」, 「突き合わせを実行」,
+      「AIに先に調査させる」 and 「実態チェックを実行」 exist only as the
+      recovery action of a currently-active exception.
+    - `W6`'s primary action is the diff-review record itself; downloading
+      the patch must never satisfy it.
+    Human gates are unchanged: 理解の確認 / Alignment 項目の確定 / 提案の
+    承認・編集・却下 / 差分の適用 / 観測の開始 / 戻り要求への承諾 / 中断・
+    引き継ぎ・再開 all stay `decision_method: manual`.
 
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and

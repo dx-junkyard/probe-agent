@@ -4,6 +4,12 @@ Status: UX 仕様（Issue #342 / #343 / #344 / #345 / #346 の成果物）。
 本書は **仕様の確定** までを担当し、コンポーネント実装・API 変更・状態管理
 コードの変更・テスト実装は含まない（各 Issue の「対象外」に従う）。
 
+**実装状況: 本仕様は Issue #349 で実装済み。** 本書はこれから作るものの
+計画ではなく、システムインタビュー画面が現に満たしている仕様として読むこと。
+実装側の設計判断（正準実装の所在、承諾の消費方法、「未解消」の導出、実行中
+レコードを持たない処理の扱い）は `docs/project-intelligence.md` の
+「状態駆動 System Interview の実装(Issue #349)」節にある。
+
 Scope: `apps/dashboard/src/pages/interview.tsx` と
 `apps/dashboard/src/components/system-understanding/*` が構成する
 「システムインタビュー」画面。

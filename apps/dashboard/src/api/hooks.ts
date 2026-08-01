@@ -3028,3 +3028,108 @@ export function useResumeJointUnderstanding(sessionId: number | null) {
     onSuccess: (_result, { juId }) => _invalidateJointUnderstanding(qc, sessionId, juId),
   });
 }
+
+// --- State-driven System Interview workflow (Issue #349) ---------------------
+//
+// One query owns the developer-facing state: the server evaluates
+// docs/system-interview-workflow-ux.md §2.2 and returns the state, its single
+// primary action, and the currently-active exceptions. The dashboard must not
+// compute a workflow state from a mutation's `isPending` or any other
+// client-only value -- those disappear on reload (spec §2.6).
+
+export function useInterviewWorkflowState(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("interviewWorkflowState"), sessionId],
+    queryFn: () =>
+      api.get<import("@/api/types").InterviewWorkflowStateOut>(
+        sessionId
+          ? `/interview/workflow-state?session_id=${sessionId}`
+          : "/interview/workflow-state",
+      ),
+    enabled: !!getSystemId(),
+    // A system process' running record is a server-side fact; poll while one
+    // is in flight so `W1` clears by itself when it finishes.
+    refetchInterval: (query) =>
+      query.state.data?.running_processes?.length ? 2000 : false,
+  });
+}
+
+function _invalidateWorkflow(qc: ReturnType<typeof useQueryClient>, sessionId: number | null) {
+  qc.invalidateQueries({ queryKey: [...sysKey("interviewWorkflowState"), sessionId] });
+  qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+  qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
+}
+
+/** `W6` の主操作: 差分を確認したという明示記録 (永続事実 A)。 */
+export function useRecordDiffReview(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { reviewed_by?: string; note?: string }) =>
+      api.post<import("@/api/types").InterviewDiffReviewOut>(
+        `/interview/sessions/${sessionId}/diff-review`,
+        body,
+      ),
+    onSuccess: () => _invalidateWorkflow(qc, sessionId),
+  });
+}
+
+/** 戻り要求への明示承諾 (永続事実 D)。承諾は要求ごとに独立。 */
+export function useAcknowledgeBackRequest(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ requestId, actor }: { requestId: number; actor?: string }) =>
+      api.post<import("@/api/types").InterviewWorkflowStateOut>(
+        `/interview/sessions/${sessionId}/back-requests/${requestId}/acknowledge`,
+        { actor: actor ?? "" },
+      ),
+    onSuccess: () => _invalidateWorkflow(qc, sessionId),
+  });
+}
+
+/** `OP-D14`: 中断 / 引き継ぎ終端へ安全に抜ける。 */
+export function useCloseInterviewSession(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { terminal_kind: "suspended" | "handoff"; reason?: string; actor?: string }) =>
+      api.post<import("@/api/types").InterviewWorkflowStateOut>(
+        `/interview/sessions/${sessionId}/close`,
+        body,
+      ),
+    onSuccess: () => _invalidateWorkflow(qc, sessionId),
+  });
+}
+
+/** `OP-D14`: 終端からの再開。未解消の失敗は再び表示される。 */
+export function useReopenInterviewSession(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { reason?: string; actor?: string }) =>
+      api.post<import("@/api/types").InterviewWorkflowStateOut>(
+        `/interview/sessions/${sessionId}/reopen`,
+        body,
+      ),
+    onSuccess: () => _invalidateWorkflow(qc, sessionId),
+  });
+}
+
+export function useInterviewProcessRuns(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("interviewProcessRuns"), sessionId],
+    queryFn: () =>
+      api.get<import("@/api/types").InterviewProcessRunOut[]>(
+        `/interview/sessions/${sessionId}/process-runs`,
+      ),
+    enabled: !!sessionId && !!getSystemId(),
+  });
+}
+
+export function useInterviewSessionStatusAudit(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("interviewStatusAudit"), sessionId],
+    queryFn: () =>
+      api.get<import("@/api/types").InterviewSessionStatusAuditOut[]>(
+        `/interview/sessions/${sessionId}/status-audit`,
+      ),
+    enabled: !!sessionId && !!getSystemId(),
+  });
+}
