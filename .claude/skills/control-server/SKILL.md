@@ -839,6 +839,24 @@ Rules for any new artifact:
     never stored. `OP-D14` suspend/resume therefore cannot turn a failure
     into a solved one — it only flips the existing session `status` and adds
     an `interview_session_status_audit` row.
+  - `W0-B` completes by "session created AND the system started
+    investigating", so `POST /interview/sessions` opens the initial build's
+    run record itself. Leaving that to a second client call lets a reload in
+    between produce a session that falls through the whole rule table to
+    `W7` — a terminal with no way back, because every build control is
+    exception-only. The request that performs the build adopts that record
+    (`ProcessRunTracker.start(adopt=True)`) instead of stacking a second one.
+  - Resolution of a failure follows `finished_at`, not row id: two runs of a
+    kind can overlap and the one that started first can finish last.
+  - The stale sweep is a GUESS from elapsed time (nothing writes
+    `heartbeat_at` while a process runs), so `finish_process_run` still
+    accepts a swept run and lets its real outcome replace the guess.
+  - A suspended session (rule row 3) never auto-resolves a pending backward
+    request: `W7` there means "the developer left", not "the backward
+    question was settled", and §5.4 requires resuming to acknowledge it.
+  - `open_required_questions` must exclude questions held by an in-flight
+    handoff. Handing off deliberately leaves `interview_qa.status` alone, so
+    the status column alone cannot express 「引き継ぎ済み」 (spec §2.3 `W3`).
   - `routes/interview_workflow.py` writes exactly two developer decisions
     (the diff review and the backward acknowledgement, both
     `decision_method: manual`) and two system-recorded progress facts (the

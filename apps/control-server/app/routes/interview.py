@@ -35,6 +35,7 @@ from ..capability_graph import (
     latest_system_confirmed_graph,
 )
 from ..db import get_conn
+from .. import interview_workflow
 from ..interview_workflow import tracked_process
 from ..interview_context import build_interview_context
 from ..interview_agent import (
@@ -709,7 +710,20 @@ def create_interview_session(
             """,
             (system_id, payload.snapshot_id, payload.title, payload.focus, now, now),
         )
-        row = _get_session_or_404(conn, cur.lastrowid, system_id)
+        session_id = cur.lastrowid
+        # Issue #349: `W0-B` completes by "creating a session AND the system
+        # starting to investigate" (spec §2.3), so the run record is opened in
+        # the SAME request that creates the session. Leaving it to a second
+        # client call means a reload/network drop in between produces a
+        # session with no understanding, no questions, no proposals and no
+        # diff -- which falls through the whole rule table to `W7`, a terminal
+        # the developer can never leave because every build control is
+        # exception-only. Recording it here makes the new session `W1` from
+        # its first evaluation onwards.
+        interview_workflow.start_process_run(
+            conn, session_id, system_id, "understanding_build"
+        )
+        row = _get_session_or_404(conn, session_id, system_id)
         return _session_out(conn, row)
 
 
@@ -3089,7 +3103,10 @@ def _rebuild_understanding(session, system_id: int) -> UnderstandingRebuildResul
         return "understanding_update" if prior_revision else "understanding_build"
 
     tracker = ProcessRunTracker(session_id, system_id, "understanding_update")
-    tracker.start(resolve_kind=_kind)
+    # `adopt`: session creation already opened the initial build's record so
+    # the new session reads as `W1` immediately. This request is that build --
+    # close that record, do not stack a second one beside it.
+    tracker.start(resolve_kind=_kind, adopt=True)
     try:
         result = _rebuild_understanding_core(session, system_id)
     except BaseException as exc:  # noqa: BLE001 - recorded then re-raised

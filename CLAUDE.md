@@ -415,6 +415,25 @@ creating incomplete persistence or execution paths for later phases.
       recovery action of a currently-active exception.
     - `W6`'s primary action is the diff-review record itself; downloading
       the patch must never satisfy it.
+    Review round 1 (PR #350) added five more invariants, each of which was a
+    stuck screen rather than a cosmetic slip:
+    - Every Dashboard mutation that changes a state-deciding fact calls
+      `_invalidateWorkflow`. The page renders one server-decided state and
+      the workflow query only polls while something is running, so a missed
+      invalidation freezes the flow until a reload.
+    - `POST /interview/sessions` opens the initial build's run record itself
+      (`W0-B` completes by "session created AND investigation started"); the
+      request that performs the build adopts that record. Otherwise a reload
+      between the two calls drops a new session into `W7` permanently.
+    - `open_required_questions` excludes questions held by an in-flight
+      handoff — 「引き継ぎ済み」 is a `W3` completion condition and the
+      `interview_qa.status` column deliberately cannot express it.
+    - Failure resolution compares `finished_at` (overlapping runs of one kind
+      can finish out of id order), and the stale sweep is provisional: a real
+      completion still overwrites it, because nothing writes `heartbeat_at`
+      mid-run.
+    - A suspended session never auto-resolves a pending backward request, and
+      resuming records the manual acknowledgement for it (§5.4 terminal 3).
     Human gates are unchanged: 理解の確認 / Alignment 項目の確定 / 提案の
     承認・編集・却下 / 差分の適用 / 観測の開始 / 戻り要求への承諾 / 中断・
     引き継ぎ・再開 all stay `decision_method: manual`.

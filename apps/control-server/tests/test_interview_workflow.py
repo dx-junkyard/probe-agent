@@ -412,10 +412,37 @@ def _state(client, headers, session_id=None):
     return r.json()
 
 
-def _create_session(client, headers, snapshot_id):
+def _create_session(client, headers, snapshot_id, *, settle_initial_build=True):
+    """Create a session and, by default, close its initial-build run record.
+
+    Creating a session opens that record on purpose (Issue #349: `W0-B`
+    completes by "session created AND the system started investigating"), so
+    a brand-new session is `W1`. Tests that exercise a LATER state have to
+    let that build finish first -- exactly like the real flow, where the
+    build request closes the record it adopted.
+    """
     r = client.post("/interview/sessions", json={"snapshot_id": snapshot_id}, headers=headers)
     assert r.status_code == 201, r.text
-    return r.json()["id"]
+    session_id = r.json()["id"]
+    if settle_initial_build:
+        _settle_initial_build(session_id)
+    return session_id
+
+
+def _settle_initial_build(session_id: int, *, ok: bool = True):
+    """Close the run record session creation opened, as the build would."""
+    from app.db import get_conn
+    from app.interview_workflow import finish_process_run
+
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT id FROM interview_process_run
+               WHERE session_id = ? AND status = 'running'
+               ORDER BY id LIMIT 1""",
+            (session_id,),
+        ).fetchone()
+        if row is not None:
+            finish_process_run(conn, row["id"], ok=ok, error=None if ok else "build failed")
 
 
 def test_w0a_without_snapshot_and_w0b_with_one(admin_client, tmp_path):
@@ -1077,3 +1104,279 @@ def test_scenario_handoff_terminal(admin_client, tmp_path):
     assert state["state"] == "W7"
     assert state["terminal_kind"] == "handoff"
     assert state["primary_action"] == "view_handoff_status"
+
+
+# ---------------------------------------------------------------------------
+# Part 4: review findings (PR #350)
+# ---------------------------------------------------------------------------
+
+
+def test_a_new_session_is_w1_and_never_falls_through_to_w7(admin_client, tmp_path):
+    """Review finding 3. `W0-B` completes by "session created AND the system
+    started investigating" (spec §2.3), so the initial build's run record is
+    opened in the SAME request that creates the session.
+
+    Before this fix the record was opened by a SECOND client call, so a
+    reload in between left a session with no understanding, no questions, no
+    proposals and no diff -- which fell through the whole rule table to `W7`,
+    a terminal with no way back because every build control is
+    exception-only.
+    """
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "Fresh Session")
+    headers = _headers(token, system_id)
+    session_id = _create_session(
+        admin_client, headers, snapshot_id, settle_initial_build=False
+    )
+
+    state = _state(admin_client, headers, session_id)
+    assert state["state"] == "W1"
+    assert state["rule_row"] == 4
+    assert state["facts"]["running_process_kinds"] == ["understanding_build"]
+    # And it survives a reload -- the record is persisted, not client state.
+    assert _state(admin_client, headers, session_id)["state"] == "W1"
+
+
+def test_the_build_request_adopts_the_creation_record_instead_of_stacking(
+    admin_client, tmp_path
+):
+    """Review finding 3, second half: the request that performs the initial
+    build must CLOSE the record creation opened, not open a second one --
+    otherwise the first is left to be swept as a phantom failure."""
+    from app.db import get_conn
+    from app.interview_workflow import ProcessRunTracker
+
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "Adopt")
+    headers = _headers(token, system_id)
+    session_id = _create_session(
+        admin_client, headers, snapshot_id, settle_initial_build=False
+    )
+
+    tracker = ProcessRunTracker(session_id, system_id, "understanding_build")
+    tracker.start(adopt=True)
+    tracker.succeed()
+
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT status FROM interview_process_run WHERE session_id = ?",
+            (session_id,),
+        ).fetchall()
+    assert [r["status"] for r in rows] == ["succeeded"]
+    assert _state(admin_client, headers, session_id)["state"] != "W1"
+
+
+def test_a_handed_off_question_is_not_outstanding_w3_work(admin_client, tmp_path):
+    """Review finding 2. Spec §2.3's `W3` completion condition is
+    「回答済み / 引き継ぎ済み / 保留(明示)」, and handing a question off
+    deliberately leaves `interview_qa.status` alone -- so counting `status =
+    'open'` alone made `W3` uncompletable once a question was handed off."""
+    from app.db import get_conn
+
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "Handoff Q")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    qa = admin_client.post(
+        f"/interview/sessions/{session_id}/qa",
+        json={"question_text": "この判断は誰が行いますか?", "question_category": "purpose",
+              "question_source": "reviewer"},
+        headers=headers,
+    ).json()
+
+    assert _state(admin_client, headers, session_id)["state"] == "W3"
+
+    r = admin_client.post(
+        f"/interview/sessions/{session_id}/handoffs",
+        json={
+            "origin_kind": "qa", "origin_id": qa["id"], "assignee": "other-dev",
+            "background": "この領域は担当外です", "needed_decision": "方針を決めてほしい",
+            "priority": "high", "created_by": "root",
+        },
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    handoff_id = r.json()["id"]
+
+    state = _state(admin_client, headers, session_id)
+    assert state["facts"]["open_required_questions"] == 0
+    assert state["state"] != "W3"
+
+    # Cancelling the handoff makes the question the developer's work again.
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE question_handoff SET status = 'cancelled' WHERE id = ?", (handoff_id,)
+        )
+    reopened = _state(admin_client, headers, session_id)
+    assert reopened["facts"]["open_required_questions"] == 1
+    # The question is the developer's work again. This session had already
+    # reached a later checkpoint, so re-entering `W3` is a backward move and
+    # waits for the acknowledgement (§2.2 stage 2) -- the point here is that
+    # the question counts at all again.
+    assert reopened["candidate_state"] == "W3"
+
+
+def test_an_in_flight_refresh_job_shows_as_w1(admin_client, tmp_path):
+    """Review finding 1 (server half). The automatic refresh (Issue #288) is
+    a system process in flight, so `W3` -> `W1` -> `W4` must not depend on
+    whether its background thread happened to open its own run record yet."""
+    from app.db import get_conn
+
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "Refresh W1")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    now = time.time()
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO interview_refresh_job
+                   (session_id, system_id, trigger_kind, base_answer_marker,
+                    status, created_at)
+               VALUES (?, ?, 'answer_batch', ?, 'pending', ?)""",
+            (session_id, system_id, now, now),
+        )
+
+    state = _state(admin_client, headers, session_id)
+    assert state["state"] == "W1"
+    assert state["facts"]["running_process_kinds"] == ["understanding_update"]
+
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE interview_refresh_job SET status = 'updated' WHERE session_id = ?",
+            (session_id,),
+        )
+    assert _state(admin_client, headers, session_id)["state"] != "W1"
+
+
+def test_a_later_finishing_run_resolves_an_earlier_failure(admin_client, tmp_path):
+    """Review finding 7. Two runs of the same kind can overlap (a manual
+    rebuild while the automatic refresh is already running), and the one that
+    STARTED first can FINISH last. Resolution must follow completion order,
+    not row id -- otherwise the failure stays unresolved forever and pins a
+    blocking exception the work has already fixed."""
+    from app.db import get_conn
+    from app.interview_workflow import finish_process_run, start_process_run
+
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "Overlap")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+
+    with get_conn() as conn:
+        first = start_process_run(conn, session_id, system_id, "understanding_build")
+        second = start_process_run(conn, session_id, system_id, "understanding_build")
+        # The later-started run fails first...
+        finish_process_run(conn, second, ok=False, error="boom")
+    assert _state(admin_client, headers, session_id)["facts"]["blocking_failure_states"] == ["W2"]
+
+    with get_conn() as conn:
+        # ...and the earlier-started run succeeds afterwards (lower id).
+        finish_process_run(conn, first, ok=True)
+
+    state = _state(admin_client, headers, session_id)
+    assert state["facts"]["blocking_failure_states"] == []
+    assert not [e for e in state["exceptions"] if e["code"] == "E3-a"]
+
+
+def test_a_stale_swept_run_is_corrected_by_its_real_outcome(admin_client, tmp_path, monkeypatch):
+    """Review finding 8. Nothing updates `heartbeat_at` while a process runs,
+    so the stale sweep is a guess from elapsed time. A long-but-healthy build
+    must not be frozen as a failure: when the process actually finishes, its
+    own outcome replaces the sweep's guess."""
+    from app.db import get_conn
+    from app.interview_workflow import finish_process_run, start_process_run
+
+    monkeypatch.setenv("INTERVIEW_PROCESS_STUCK_AFTER_SECONDS", "0")
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "Stale Repair")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+
+    with get_conn() as conn:
+        run_id = start_process_run(conn, session_id, system_id, "understanding_build")
+        conn.execute(
+            "UPDATE interview_process_run SET started_at = ?, heartbeat_at = ? WHERE id = ?",
+            (time.time() - 10_000, time.time() - 10_000, run_id),
+        )
+    # The sweep runs on evaluation and provisionally marks it failed.
+    assert _state(admin_client, headers, session_id)["facts"]["blocking_failure_states"] == ["W2"]
+
+    # The real process finishes successfully afterwards.
+    with get_conn() as conn:
+        finish_process_run(conn, run_id, ok=True)
+
+    state = _state(admin_client, headers, session_id)
+    assert state["facts"]["blocking_failure_states"] == []
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT status, error FROM interview_process_run WHERE id = ?", (run_id,)
+        ).fetchone()
+    assert row["status"] == "succeeded"
+    assert row["error"] is None
+
+
+def test_resume_acknowledges_a_pending_back_request_in_one_operation(
+    admin_client, tmp_path
+):
+    """Review finding 5. Spec §5.4 terminal 3: 「再開する」 is ONE operation, and
+    when a backward request was pending at suspend time, resuming records the
+    manual acknowledgement for it too -- the developer must not have to press
+    「先に確認する」 immediately afterwards."""
+    from app.db import get_conn
+
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "Resume Ack")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _approve_and_materialize(admin_client, headers, session_id, system_id, snapshot_id)
+    admin_client.post(
+        f"/interview/sessions/{session_id}/diff-review", json={}, headers=headers
+    )
+    assert _state(admin_client, headers, session_id)["reached_state"] == "W7"
+
+    admin_client.post(
+        f"/interview/sessions/{session_id}/qa",
+        json={"question_text": "本当にこれで良い?", "question_category": "purpose",
+              "question_source": "reviewer"},
+        headers=headers,
+    )
+    held = _state(admin_client, headers, session_id)
+    assert held["backward_hold"] is True
+    request_id = held["pending_back_request"]["id"]
+
+    admin_client.post(
+        f"/interview/sessions/{session_id}/close",
+        json={"terminal_kind": "suspended"}, headers=headers,
+    )
+    resumed = admin_client.post(
+        f"/interview/sessions/{session_id}/reopen", json={"actor": "root"}, headers=headers
+    ).json()
+
+    assert resumed["state"] == "W3"
+    assert resumed["backward_hold"] is False
+    assert resumed["pending_back_request"] is None
+    with get_conn() as conn:
+        ack = conn.execute(
+            "SELECT * FROM interview_back_acknowledgement WHERE back_request_id = ?",
+            (request_id,),
+        ).fetchone()
+    assert ack is not None
+    assert ack["decision_method"] == "manual"
+
+
+def test_resume_without_a_pending_back_request_records_no_acknowledgement(
+    admin_client, tmp_path
+):
+    """The acknowledgement stays per-request: resuming a session that had no
+    pending backward request must not manufacture one (spec §2.2 stage 2-5)."""
+    from app.db import get_conn
+
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "Resume Plain")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    admin_client.post(
+        f"/interview/sessions/{session_id}/close",
+        json={"terminal_kind": "suspended"}, headers=headers,
+    )
+    admin_client.post(
+        f"/interview/sessions/{session_id}/reopen", json={}, headers=headers
+    )
+    with get_conn() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM interview_back_acknowledgement WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()[0]
+    assert count == 0

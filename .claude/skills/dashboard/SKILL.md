@@ -238,6 +238,22 @@ The dashboard should support:
     `QaPanel`, the `E3-a`-gated understanding rebuild). Recovery offers only
     "run the same process again" and "leave safely to the `W7` terminal" —
     never a bypass of a human gate.
+  - **Any mutation that changes a state-deciding fact must call
+    `_invalidateWorkflow` (api/hooks.ts).** The page renders one
+    server-decided state, so a missing invalidation is a stuck screen, not a
+    stale badge — and since the spec removed the manual 「差分を生成」 CTA,
+    `W5` wedges until a reload. The workflow query only polls while
+    `running_processes` is non-empty, so a stale cache never starts polling
+    by itself.
+  - Panels follow the §3.3 state × role matrix. `W1` in particular shows the
+    location card and the currently-active exceptions and NOTHING the running
+    process consumes — offering Intent / Q&A / まとめて修正 edits while the
+    card says 「操作は不要」 both contradicts the state and races the process.
+  - One retry per exception: the recovery button lives in the
+    `WorkflowExceptions` card (§4.4 puts failure, impact, recovery condition
+    and retry in one frame), never also in the panel the process feeds.
+    `E14` is the exception — it has no card of its own, so its retry sits in
+    the failing process' own panel.
   - `R6` (history/audit) lives behind the single always-openable
     「履歴と監査情報」 entry in a fixed order, and that is where #341's
     metrics panel now lives — it is `R6` in every state and never `R2`.

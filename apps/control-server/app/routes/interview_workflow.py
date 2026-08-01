@@ -121,6 +121,44 @@ _BACK_REQUEST_MESSAGE = {
 }
 
 
+def _acknowledge_back_request_row(conn, request_row, *, actor: str, now: float) -> None:
+    """Persist fact D for one backward request and consume it.
+
+    Consuming means lowering the checkpoint to the acknowledged candidate:
+    the pure engine then sees a candidate that is no longer earlier than
+    `reached_state`, so the displayed state moves without any "was it
+    acknowledged?" branch existing anywhere (spec §2.2 stage 2-4/2-5).
+    """
+    conn.execute(
+        """INSERT INTO interview_back_acknowledgement
+               (back_request_id, session_id, system_id, actor,
+                decision_method, created_at)
+           VALUES (?, ?, ?, ?, 'manual', ?)""",
+        (
+            request_row["id"],
+            request_row["session_id"],
+            request_row["system_id"],
+            actor,
+            now,
+        ),
+    )
+    conn.execute(
+        "UPDATE interview_back_request SET status = 'acknowledged', updated_at = ? WHERE id = ?",
+        (now, request_row["id"]),
+    )
+    candidate = request_row["candidate_state"]
+    if state_rank(candidate) >= 0:
+        conn.execute(
+            """INSERT INTO interview_workflow_checkpoint
+                   (session_id, system_id, reached_state, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(session_id) DO UPDATE SET
+                   reached_state = excluded.reached_state,
+                   updated_at = excluded.updated_at""",
+            (request_row["session_id"], request_row["system_id"], candidate, now),
+        )
+
+
 def _get_session_or_404(conn, session_id: int, system_id: int):
     row = conn.execute(
         "SELECT * FROM interview_session WHERE id = ? AND system_id = ?",
@@ -396,30 +434,9 @@ def acknowledge_back_request(
                     ),
                 },
             )
-        conn.execute(
-            """INSERT INTO interview_back_acknowledgement
-                   (back_request_id, session_id, system_id, actor,
-                    decision_method, created_at)
-               VALUES (?, ?, ?, ?, 'manual', ?)""",
-            (request_id, session_id, system_id, payload.actor, now),
+        _acknowledge_back_request_row(
+            conn, request_row, actor=payload.actor, now=now
         )
-        conn.execute(
-            "UPDATE interview_back_request SET status = 'acknowledged', updated_at = ? WHERE id = ?",
-            (now, request_id),
-        )
-        # Consuming the acknowledgement = lowering the checkpoint to the
-        # acknowledged candidate. Only ordered states are ever stored.
-        candidate = request_row["candidate_state"]
-        if state_rank(candidate) >= 0:
-            conn.execute(
-                """INSERT INTO interview_workflow_checkpoint
-                       (session_id, system_id, reached_state, updated_at)
-                   VALUES (?, ?, ?, ?)
-                   ON CONFLICT(session_id) DO UPDATE SET
-                       reached_state = excluded.reached_state,
-                       updated_at = excluded.updated_at""",
-                (session_id, system_id, candidate, now),
-            )
         return _state_out(conn, system_id, session_id)
 
 
@@ -513,6 +530,24 @@ def reopen_interview_session(
                VALUES (?, ?, 'reopen', NULL, ?, ?, 'manual', ?)""",
             (session_id, system_id, payload.reason, payload.actor, now),
         )
+        # Spec §5.4 terminal 3: 「再開する」 is ONE operation that returns to the
+        # earliest resumable state. When a backward request was pending when
+        # the session was suspended, resuming is itself the developer agreeing
+        # to go back, so the acknowledgement (fact D) is recorded here rather
+        # than making them press 「先に確認する」 immediately afterwards.
+        # It stays a per-request acknowledgement: only the request that is
+        # pending right now is consumed, and a backward request raised later
+        # is held again from scratch (§2.2 stage 2-5).
+        pending = conn.execute(
+            """SELECT * FROM interview_back_request
+               WHERE session_id = ? AND system_id = ? AND status = 'pending'
+               ORDER BY id DESC LIMIT 1""",
+            (session_id, system_id),
+        ).fetchone()
+        if pending is not None:
+            _acknowledge_back_request_row(
+                conn, pending, actor=payload.actor, now=now
+            )
         return _state_out(conn, system_id, session_id)
 
 

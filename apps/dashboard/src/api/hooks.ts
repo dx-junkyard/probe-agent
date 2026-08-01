@@ -712,6 +712,18 @@ export function useApplyProbePatch() {
   });
 }
 
+// Issue #349: the interview screen's state, its single primary action and
+// its exceptions all come from ONE server query. Any mutation that changes a
+// fact the 13-row rule table reads must therefore re-read it -- otherwise the
+// screen keeps rendering the previous state and, because the spec removed the
+// manual 「差分を生成」 CTA, the flow can wedge until a reload. Call this from
+// every such mutation; a missing call is a stuck screen, not a stale badge.
+function _invalidateWorkflow(qc: ReturnType<typeof useQueryClient>, sessionId: number | null) {
+  qc.invalidateQueries({ queryKey: [...sysKey("interviewWorkflowState"), sessionId] });
+  qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+  qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
+}
+
 export function useInterviewSessions() {
   return useQuery({
     queryKey: sysKey("interviewSessions"),
@@ -725,7 +737,12 @@ export function useCreateInterviewSession() {
   return useMutation({
     mutationFn: (data: { snapshot_id: number; title?: string; focus?: string }) =>
       api.post<InterviewSessionOut>("/interview/sessions", data),
-    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("interviewSessions") }),
+    onSuccess: (created) => {
+      qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
+      // The new session's own workflow state: creating it opens the initial
+      // build's run record server-side, so the very first evaluation is `W1`.
+      _invalidateWorkflow(qc, created.id);
+    },
   });
 }
 
@@ -774,6 +791,7 @@ export function useInterviewDialogueTurn(sessionId: number | null) {
     }) =>
       api.post<InterviewDialogueTurnOut>(`/interview/sessions/${sessionId}/dialogue-turn`, data),
     onSuccess: () => {
+      _invalidateWorkflow(qc, sessionId);
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
       qc.invalidateQueries({ queryKey: [...sysKey("interviewCapabilityGraph"), sessionId] });
       qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
@@ -801,7 +819,10 @@ export function useCreateInterviewQa(sessionId: number | null) {
       question_source?: string;
       hypothesis?: string;
     }) => api.post<InterviewQaOut>(`/interview/sessions/${sessionId}/qa`, data),
-    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] });
+      _invalidateWorkflow(qc, sessionId);
+    },
   });
 }
 
@@ -821,6 +842,7 @@ export function useAnswerInterviewQa(sessionId: number | null) {
         { answer_text, actor, answer_unknown: answer_unknown ?? false, handoff_id },
       ),
     onSuccess: () => {
+      _invalidateWorkflow(qc, sessionId);
       qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] });
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
       // Issue #291: confirming a handoff's answer changes handoff state too.
@@ -859,7 +881,10 @@ export function useRouteAndInvestigateQa(sessionId: number | null) {
         : api.post<InterviewQaRouteInvestigateBatchOut>(
             `/interview/sessions/${sessionId}/qa/route-and-investigate`,
           ),
-    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] });
+      _invalidateWorkflow(qc, sessionId);
+    },
   });
 }
 
@@ -960,7 +985,10 @@ export function useCreateQuestionHandoff(sessionId: number | null) {
       priority?: HandoffPriority;
       created_by?: string;
     }) => api.post<QuestionHandoffOut>(`/interview/sessions/${sessionId}/handoffs`, data),
-    onSuccess: () => _invalidateHandoffs(qc, sessionId),
+    onSuccess: () => {
+      _invalidateHandoffs(qc, sessionId);
+      _invalidateWorkflow(qc, sessionId);
+    },
   });
 }
 
@@ -969,7 +997,10 @@ export function useAnswerQuestionHandoff(sessionId: number | null) {
   return useMutation({
     mutationFn: ({ handoffId, answer_text, answered_by }: { handoffId: number; answer_text: string; answered_by: string }) =>
       api.post<QuestionHandoffOut>(`/interview/handoffs/${handoffId}/answer`, { answer_text, answered_by }),
-    onSuccess: () => _invalidateHandoffs(qc, sessionId),
+    onSuccess: () => {
+      _invalidateHandoffs(qc, sessionId);
+      _invalidateWorkflow(qc, sessionId);
+    },
   });
 }
 
@@ -978,7 +1009,10 @@ export function useReturnQuestionHandoff(sessionId: number | null) {
   return useMutation({
     mutationFn: ({ handoffId }: { handoffId: number }) =>
       api.post<QuestionHandoffOut>(`/interview/handoffs/${handoffId}/return`),
-    onSuccess: () => _invalidateHandoffs(qc, sessionId),
+    onSuccess: () => {
+      _invalidateHandoffs(qc, sessionId);
+      _invalidateWorkflow(qc, sessionId);
+    },
   });
 }
 
@@ -987,7 +1021,10 @@ export function useCancelQuestionHandoff(sessionId: number | null) {
   return useMutation({
     mutationFn: ({ handoffId }: { handoffId: number }) =>
       api.post<QuestionHandoffOut>(`/interview/handoffs/${handoffId}/cancel`),
-    onSuccess: () => _invalidateHandoffs(qc, sessionId),
+    onSuccess: () => {
+      _invalidateHandoffs(qc, sessionId);
+      _invalidateWorkflow(qc, sessionId);
+    },
   });
 }
 
@@ -996,7 +1033,10 @@ export function useSkipInterviewQa(sessionId: number | null) {
   return useMutation({
     mutationFn: ({ qaId, actor }: { qaId: number; actor: string }) =>
       api.post<InterviewQaOut>(`/interview/sessions/${sessionId}/qa/${qaId}/skip`, { actor }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] });
+      _invalidateWorkflow(qc, sessionId);
+    },
   });
 }
 
@@ -1005,7 +1045,10 @@ export function useResumeInterviewQa(sessionId: number | null) {
   return useMutation({
     mutationFn: ({ qaId, actor }: { qaId: number; actor: string }) =>
       api.post<InterviewQaOut>(`/interview/sessions/${sessionId}/qa/${qaId}/resume`, { actor }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] });
+      _invalidateWorkflow(qc, sessionId);
+    },
   });
 }
 
@@ -1027,7 +1070,10 @@ export function useCreateInterviewIntentItem(sessionId: number | null) {
       value_text: string;
       status?: InterviewIntentUserStatus;
     }) => api.post<InterviewIntentItemOut>(`/interview/sessions/${sessionId}/intent`, data),
-    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewIntent"), sessionId] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewIntent"), sessionId] });
+      _invalidateWorkflow(qc, sessionId);
+    },
   });
 }
 
@@ -1037,6 +1083,7 @@ export function useConfirmInterviewIntentItem(sessionId: number | null) {
     mutationFn: ({ itemId }: { itemId: number }) =>
       api.post<InterviewIntentItemOut>(`/interview/intent/${itemId}/confirm`),
     onSuccess: () => {
+      _invalidateWorkflow(qc, sessionId);
       qc.invalidateQueries({ queryKey: [...sysKey("interviewIntent"), sessionId] });
       // Issue #288: see useAnswerInterviewQa's comment above.
       _invalidateAfterAnswerBatch(qc, sessionId);
@@ -1050,6 +1097,7 @@ export function useCorrectInterviewIntentItem(sessionId: number | null) {
     mutationFn: ({ itemId, value_text }: { itemId: number; value_text: string }) =>
       api.post<InterviewIntentItemOut>(`/interview/intent/${itemId}/correct`, { value_text }),
     onSuccess: () => {
+      _invalidateWorkflow(qc, sessionId);
       qc.invalidateQueries({ queryKey: [...sysKey("interviewIntent"), sessionId] });
       _invalidateAfterAnswerBatch(qc, sessionId);
     },
@@ -1062,6 +1110,7 @@ export function useDeclineInterviewIntentItem(sessionId: number | null) {
     mutationFn: ({ itemId }: { itemId: number }) =>
       api.post<InterviewIntentItemOut>(`/interview/intent/${itemId}/decline`),
     onSuccess: () => {
+      _invalidateWorkflow(qc, sessionId);
       qc.invalidateQueries({ queryKey: [...sysKey("interviewIntent"), sessionId] });
       _invalidateAfterAnswerBatch(qc, sessionId);
     },
@@ -1073,7 +1122,10 @@ export function useProposeInterviewIntentItems(sessionId: number | null) {
   return useMutation({
     mutationFn: () =>
       api.post<InterviewIntentItemOut[]>(`/interview/sessions/${sessionId}/intent/propose`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("interviewIntent"), sessionId] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewIntent"), sessionId] });
+      _invalidateWorkflow(qc, sessionId);
+    },
   });
 }
 
@@ -1193,7 +1245,10 @@ export function useResolveInterviewInquiry(sessionId: number | null) {
   return useMutation({
     mutationFn: ({ inquiryId }: { inquiryId: number }) =>
       api.post<InterviewInquiryOut>(`/interview/inquiries/${inquiryId}/resolve`),
-    onSuccess: (_result, { inquiryId }) => _invalidateInquiry(qc, sessionId, inquiryId),
+    onSuccess: (_result, { inquiryId }) => {
+      _invalidateInquiry(qc, sessionId, inquiryId);
+      _invalidateWorkflow(qc, sessionId);
+    },
   });
 }
 
@@ -1211,7 +1266,10 @@ export function useHoldInterviewInquiry(sessionId: number | null) {
   return useMutation({
     mutationFn: ({ inquiryId }: { inquiryId: number }) =>
       api.post<InterviewInquiryOut>(`/interview/inquiries/${inquiryId}/hold`),
-    onSuccess: (_result, { inquiryId }) => _invalidateInquiry(qc, sessionId, inquiryId),
+    onSuccess: (_result, { inquiryId }) => {
+      _invalidateInquiry(qc, sessionId, inquiryId);
+      _invalidateWorkflow(qc, sessionId);
+    },
   });
 }
 
@@ -1220,7 +1278,10 @@ export function useResumeInterviewInquiry(sessionId: number | null) {
   return useMutation({
     mutationFn: ({ inquiryId }: { inquiryId: number }) =>
       api.post<InterviewInquiryOut>(`/interview/inquiries/${inquiryId}/resume`),
-    onSuccess: (_result, { inquiryId }) => _invalidateInquiry(qc, sessionId, inquiryId),
+    onSuccess: (_result, { inquiryId }) => {
+      _invalidateInquiry(qc, sessionId, inquiryId);
+      _invalidateWorkflow(qc, sessionId);
+    },
   });
 }
 
@@ -1229,7 +1290,10 @@ export function useCancelInterviewInquiry(sessionId: number | null) {
   return useMutation({
     mutationFn: ({ inquiryId }: { inquiryId: number }) =>
       api.post<InterviewInquiryOut>(`/interview/inquiries/${inquiryId}/cancel`),
-    onSuccess: (_result, { inquiryId }) => _invalidateInquiry(qc, sessionId, inquiryId),
+    onSuccess: (_result, { inquiryId }) => {
+      _invalidateInquiry(qc, sessionId, inquiryId);
+      _invalidateWorkflow(qc, sessionId);
+    },
   });
 }
 
@@ -1310,7 +1374,10 @@ export function useRequestAlignmentRuleRecheck(sessionId: number | null) {
           policy_rule_id: rule.policy_rule_id,
         },
       ),
-    onSuccess: () => _invalidateAlignment(qc, sessionId),
+    onSuccess: () => {
+      _invalidateAlignment(qc, sessionId);
+      _invalidateWorkflow(qc, sessionId);
+    },
   });
 }
 
@@ -1318,7 +1385,10 @@ export function useBuildAlignment(sessionId: number | null) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: () => api.post<AlignmentBuildOut>(`/interview/sessions/${sessionId}/alignment/build`),
-    onSuccess: () => _invalidateAlignment(qc, sessionId),
+    onSuccess: () => {
+      _invalidateAlignment(qc, sessionId);
+      _invalidateWorkflow(qc, sessionId);
+    },
   });
 }
 
@@ -1328,6 +1398,7 @@ export function useAnswerAlignmentItem(sessionId: number | null) {
     mutationFn: ({ itemId, decision, note }: { itemId: number; decision: AlignmentDecisionAction; note?: string }) =>
       api.post<AlignmentItemOut>(`/interview/alignment/${itemId}/answer`, { decision, note }),
     onSuccess: () => {
+      _invalidateWorkflow(qc, sessionId);
       _invalidateAlignment(qc, sessionId);
       // Issue #288: see useAnswerInterviewQa's comment above.
       _invalidateAfterAnswerBatch(qc, sessionId);
@@ -1350,6 +1421,7 @@ export function useAnswerAlignmentItemsBatch(sessionId: number | null) {
         `/interview/sessions/${sessionId}/alignment/answers-batch`, { answers },
       ),
     onSuccess: () => {
+      _invalidateWorkflow(qc, sessionId);
       _invalidateAlignment(qc, sessionId);
       // Issue #288: see useAnswerInterviewQa's comment above.
       _invalidateAfterAnswerBatch(qc, sessionId);
@@ -1363,6 +1435,7 @@ export function useCorrectAlignmentItem(sessionId: number | null) {
     mutationFn: ({ itemId, corrected_interpretation }: { itemId: number; corrected_interpretation: string }) =>
       api.post<AlignmentItemOut>(`/interview/alignment/${itemId}/correct`, { corrected_interpretation }),
     onSuccess: () => {
+      _invalidateWorkflow(qc, sessionId);
       _invalidateAlignment(qc, sessionId);
       _invalidateAfterAnswerBatch(qc, sessionId);
     },
@@ -1374,7 +1447,10 @@ export function useHoldAlignmentItem(sessionId: number | null) {
   return useMutation({
     mutationFn: ({ itemId }: { itemId: number }) =>
       api.post<AlignmentItemOut>(`/interview/alignment/${itemId}/hold`),
-    onSuccess: () => _invalidateAlignment(qc, sessionId),
+    onSuccess: () => {
+      _invalidateAlignment(qc, sessionId);
+      _invalidateWorkflow(qc, sessionId);
+    },
   });
 }
 
@@ -1553,6 +1629,7 @@ export function useApplyChangeSet(sessionId: number | null) {
     mutationFn: ({ changeSetId, itemIds }: { changeSetId: number; itemIds: number[] }) =>
       api.post<ChangeSetApplyResultOut>(`/interview/change-sets/${changeSetId}/apply`, { item_ids: itemIds }),
     onSuccess: (result, { changeSetId }) => {
+      _invalidateWorkflow(qc, sessionId);
       qc.invalidateQueries({ queryKey: [...sysKey("changeSet"), changeSetId] });
       if (result.applied_item_ids.length > 0) {
         // Issue #288: see useAnswerInterviewQa's comment above.
@@ -1582,6 +1659,7 @@ export function useApproveInterviewProposal(sessionId: number | null) {
         { actor },
       ),
     onSuccess: () => {
+      _invalidateWorkflow(qc, sessionId);
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
       qc.invalidateQueries({ queryKey: [...sysKey("interviewApprovedSet"), sessionId] });
     },
@@ -1597,6 +1675,7 @@ export function useRejectInterviewProposal(sessionId: number | null) {
         { actor },
       ),
     onSuccess: () => {
+      _invalidateWorkflow(qc, sessionId);
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
       qc.invalidateQueries({ queryKey: [...sysKey("interviewApprovedSet"), sessionId] });
     },
@@ -1617,6 +1696,7 @@ export function useEditInterviewProposal(sessionId: number | null) {
         { actor: data.actor, metadata: data.metadata, probe_plan: data.probe_plan },
       ),
     onSuccess: () => {
+      _invalidateWorkflow(qc, sessionId);
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
       qc.invalidateQueries({ queryKey: [...sysKey("interviewApprovedSet"), sessionId] });
     },
@@ -1640,6 +1720,7 @@ export function useAdvanceInterviewStage(sessionId: number | null) {
         data,
       ),
     onSuccess: () => {
+      _invalidateWorkflow(qc, sessionId);
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
       qc.invalidateQueries({
         queryKey: [...sysKey("interviewCapabilityGraph"), sessionId],
@@ -1659,6 +1740,7 @@ export function useConfirmInterviewUnderstanding(sessionId: number | null) {
         data,
       ),
     onSuccess: () => {
+      _invalidateWorkflow(qc, sessionId);
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
       qc.invalidateQueries({
         queryKey: [...sysKey("interviewCapabilityGraph"), sessionId],
@@ -1678,6 +1760,7 @@ export function useRebaseInterviewSnapshot(sessionId: number | null) {
         data,
       ),
     onSuccess: () => {
+      _invalidateWorkflow(qc, sessionId);
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
       qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
       qc.invalidateQueries({ queryKey: [...sysKey("interviewApprovedSet"), sessionId] });
@@ -1698,8 +1781,7 @@ export function useUpdateInterviewUnderstanding() {
         {},
       ),
     onSuccess: (_data, sessionId) => {
-      qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
-      qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
+      _invalidateWorkflow(qc, sessionId);
       qc.invalidateQueries({ queryKey: [...sysKey("understandingRevisions"), sessionId] });
       qc.invalidateQueries({ queryKey: [...sysKey("understandingDiff"), sessionId] });
     },
@@ -1734,6 +1816,7 @@ export function useMaterializeInterview(sessionId: number | null) {
     mutationFn: () =>
       api.post<InterviewMaterializeOut>(`/interview/sessions/${sessionId}/materialize`, {}),
     onSuccess: () => {
+      _invalidateWorkflow(qc, sessionId);
       qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
       qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
     },
@@ -1758,6 +1841,7 @@ export function useRunRuntimeRealityCheck(sessionId: number | null) {
         `/interview/sessions/${sessionId}/runtime-reality-check`, {},
       ),
     onSuccess: () => {
+      _invalidateWorkflow(qc, sessionId);
       qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] });
       qc.invalidateQueries({ queryKey: [...sysKey("runtimeRealityFacts"), sessionId] });
     },
@@ -3052,12 +3136,6 @@ export function useInterviewWorkflowState(sessionId: number | null) {
     refetchInterval: (query) =>
       query.state.data?.running_processes?.length ? 2000 : false,
   });
-}
-
-function _invalidateWorkflow(qc: ReturnType<typeof useQueryClient>, sessionId: number | null) {
-  qc.invalidateQueries({ queryKey: [...sysKey("interviewWorkflowState"), sessionId] });
-  qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
-  qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
 }
 
 /** `W6` の主操作: 差分を確認したという明示記録 (永続事実 A)。 */

@@ -70,6 +70,7 @@ __all__ = [
     "ProcessRunTracker",
     "tracked_process",
     "sweep_stale_process_runs",
+    "STALE_SWEEP_ERROR",
     "classify_failure",
     "process_stuck_after_seconds",
 ]
@@ -436,25 +437,44 @@ def start_process_run(conn, session_id: int, system_id: int, process_kind: str) 
     return int(cur.lastrowid)
 
 
+#: Error text of a run the stale sweep closed. A run carrying it was NOT
+#: observed to fail -- the sweep only stopped it from pinning `W1` forever --
+#: so the process' real outcome, if it ever arrives, overwrites it.
+STALE_SWEEP_ERROR = "処理が完了しないまま中断されました。もう一度実行してください。"
+
+
 def finish_process_run(
     conn, run_id: int, *, ok: bool, error: Optional[str] = None
 ) -> None:
-    """Close a running record as succeeded or failed.
+    """Close a run record as succeeded or failed.
 
     A failure is classified here (blocking vs degraded, and the blocked
     target state) so the failure's display location is a persisted fact and
     not something the Dashboard guesses.
+
+    A run the stale sweep already closed is still accepted here: the sweep is
+    a guess made from elapsed time (no heartbeat is written while a process
+    runs), so a long-but-healthy build would otherwise be frozen as a failure
+    even after it succeeded, leaving a blocking exception nobody can clear.
+    The process' own outcome is the truth and replaces the sweep's guess.
     """
     row = conn.execute(
         "SELECT * FROM interview_process_run WHERE id = ?", (run_id,)
     ).fetchone()
-    if row is None or row["status"] != "running":
+    if row is None:
+        return
+    swept = row["status"] == "failed" and (row["error"] or "") == STALE_SWEEP_ERROR
+    if row["status"] != "running" and not swept:
         return
     now = time.time()
     if ok:
+        # `error`/`failure_class`/`target_state` are cleared too: a run the
+        # stale sweep provisionally failed must not keep the sweep's message
+        # once it is known to have succeeded.
         conn.execute(
             """UPDATE interview_process_run
-                   SET status = 'succeeded', finished_at = ?, heartbeat_at = ?
+                   SET status = 'succeeded', finished_at = ?, heartbeat_at = ?,
+                       error = NULL, failure_class = NULL, target_state = NULL
                  WHERE id = ?""",
             (now, now, run_id),
         )
@@ -533,7 +553,7 @@ class ProcessRunTracker:
         self.process_kind = process_kind
         self.run_id: Optional[int] = None
 
-    def start(self, *, resolve_kind=None) -> None:
+    def start(self, *, resolve_kind=None, adopt: bool = False) -> None:
         """Open the run record.
 
         `resolve_kind` lets a caller pick between two process kinds from a
@@ -542,15 +562,34 @@ class ProcessRunTracker:
         process-wide, so an extra acquisition here delays every other
         request -- including, on the answer -> automatic-refresh path, the
         rebuild the developer is waiting on.
+
+        `adopt` takes over an already-running record of the same kind instead
+        of opening a second one. Session creation opens the initial build's
+        record so a brand-new session is `W1` from its first evaluation
+        (spec §2.3 `W0-B`); the request that actually performs that build
+        must close THAT record rather than stack another running row on top,
+        which would leave the first one to be swept as a phantom failure.
         """
         from .db import get_conn
 
         with get_conn() as conn:
             if resolve_kind is not None:
                 self.process_kind = resolve_kind(conn)
-            run_id = start_process_run(
-                conn, self.session_id, self.system_id, self.process_kind
-            )
+            run_id = None
+            if adopt:
+                existing = conn.execute(
+                    """SELECT id FROM interview_process_run
+                       WHERE session_id = ? AND system_id = ? AND process_kind = ?
+                         AND status = 'running'
+                       ORDER BY id LIMIT 1""",
+                    (self.session_id, self.system_id, self.process_kind),
+                ).fetchone()
+                if existing is not None:
+                    run_id = existing["id"]
+            if run_id is None:
+                run_id = start_process_run(
+                    conn, self.session_id, self.system_id, self.process_kind
+                )
         self.run_id = run_id or None
 
     def succeed(self) -> None:
@@ -645,12 +684,7 @@ def sweep_stale_process_runs(conn, session_id: int, system_id: int) -> int:
         (session_id, system_id, cutoff),
     ).fetchall()
     for row in rows:
-        finish_process_run(
-            conn,
-            row["id"],
-            ok=False,
-            error="処理が完了しないまま中断されました。もう一度実行してください。",
-        )
+        finish_process_run(conn, row["id"], ok=False, error=STALE_SWEEP_ERROR)
     return len(rows)
 
 
@@ -698,16 +732,42 @@ def _unresolved_blocking_failures(conn, session_id: int, system_id: int) -> List
         if kind in seen_kinds:
             continue
         seen_kinds.add(kind)
-        later_success = conn.execute(
-            """SELECT id FROM interview_process_run
-               WHERE session_id = ? AND system_id = ? AND process_kind = ?
-                 AND status = 'succeeded' AND id > ?
-               LIMIT 1""",
-            (session_id, system_id, kind, row["id"]),
-        ).fetchone()
-        if later_success is None:
-            unresolved.append(dict(row))
+        if _resolved_by_later_success(conn, session_id, system_id, row):
+            continue
+        unresolved.append(dict(row))
     return unresolved
+
+
+def _resolved_by_later_success(conn, session_id: int, system_id: int, failed_row) -> bool:
+    """Has a run of the same kind SUCCEEDED after this one failed.
+
+    Ordered by real completion time, not by row id: two runs of the same kind
+    can overlap (a manual rebuild while the automatic refresh job is already
+    running), and the one that started first can finish last. Comparing ids
+    would then leave a failure unresolved forever even though the work
+    ultimately succeeded, pinning a blocking exception on `W2`/`W4`/`W5`.
+    `id` only breaks ties for identical timestamps, so the order stays total
+    and deterministic.
+    """
+    finished_at = failed_row["finished_at"]
+    if finished_at is None:
+        return False
+    later_success = conn.execute(
+        """SELECT id FROM interview_process_run
+           WHERE session_id = ? AND system_id = ? AND process_kind = ?
+             AND status = 'succeeded' AND finished_at IS NOT NULL
+             AND (finished_at > ? OR (finished_at = ? AND id > ?))
+           LIMIT 1""",
+        (
+            session_id,
+            system_id,
+            failed_row["process_kind"],
+            finished_at,
+            finished_at,
+            failed_row["id"],
+        ),
+    ).fetchone()
+    return later_success is not None
 
 
 def _degraded_failures(conn, session_id: int, system_id: int) -> List[dict]:
@@ -725,15 +785,9 @@ def _degraded_failures(conn, session_id: int, system_id: int) -> List[dict]:
         if kind in seen:
             continue
         seen.add(kind)
-        later_success = conn.execute(
-            """SELECT id FROM interview_process_run
-               WHERE session_id = ? AND system_id = ? AND process_kind = ?
-                 AND status = 'succeeded' AND id > ?
-               LIMIT 1""",
-            (session_id, system_id, kind, row["id"]),
-        ).fetchone()
-        if later_success is None:
-            out.append(dict(row))
+        if _resolved_by_later_success(conn, session_id, system_id, row):
+            continue
+        out.append(dict(row))
     return out
 
 
@@ -793,6 +847,37 @@ def gather_facts(conn, system_id: int, session_id: Optional[int]) -> GatheredFac
             (session_id, system_id),
         ).fetchall()
     ]
+    # An automatic-refresh job (Issue #288) that is enqueued but has not yet
+    # reached its rebuild is ALSO a system process in flight: the developer
+    # answered and the system is now reflecting that answer. Without this,
+    # `W1` would only appear once the background thread happened to open its
+    # own run record, so the normal `W3` -> `W1` -> `W4` sequence would flicker
+    # past the waiting state depending on thread scheduling -- exactly the
+    # client-timing dependence the spec forbids (§2.3 `W1`, principle P9).
+    # `interview_refresh_job` is a persisted fact, so a reload restores it.
+    refresh_in_flight = conn.execute(
+        """SELECT id FROM interview_refresh_job
+           WHERE session_id = ? AND system_id = ? AND status IN ('pending', 'updating')
+           ORDER BY id LIMIT 1""",
+        (session_id, system_id),
+    ).fetchone()
+    if refresh_in_flight is not None and not any(
+        r["process_kind"] == "understanding_update" for r in running_rows
+    ):
+        # Surfaced under the kind the job actually runs, so the developer
+        # reads 「理解を更新しています」 rather than a job id (§4.4).
+        running_rows.append({
+            "id": -int(refresh_in_flight["id"]),
+            "session_id": session_id,
+            "system_id": system_id,
+            "process_kind": "understanding_update",
+            "status": "running",
+            "failure_class": None,
+            "target_state": None,
+            "error": None,
+            "started_at": session["updated_at"],
+            "finished_at": None,
+        })
     blocking = _unresolved_blocking_failures(conn, session_id, system_id)
     degraded = _degraded_failures(conn, session_id, system_id)
 
@@ -812,10 +897,24 @@ def gather_facts(conn, system_id: int, session_id: Optional[int]) -> GatheredFac
         has_content and (confirmed_at is None or capability_recheck)
     )
 
+    # Spec §2.3 W3 完了条件 is "回答済み / 引き継ぎ済み / 保留(明示)", so a
+    # question whose handoff is still in flight is NOT outstanding work for
+    # this developer -- handing off deliberately leaves `interview_qa.status`
+    # alone (routes/interview_handoff._mark_origin_held), so the status
+    # column cannot express it and the handoff must be joined. A 'returned'
+    # or 'cancelled' handoff makes the question askable again, exactly like
+    # `routes/interview._held_via_pending_handoff` already decides for the
+    # Q&A list -- the two must never disagree about what is still open.
     open_questions = conn.execute(
-        """SELECT COUNT(*) FROM interview_qa
-           WHERE session_id = ? AND system_id = ? AND status = 'open'
-             AND superseded_by_id IS NULL""",
+        """SELECT COUNT(*) FROM interview_qa q
+           WHERE q.session_id = ? AND q.system_id = ? AND q.status = 'open'
+             AND q.superseded_by_id IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM question_handoff h
+               WHERE h.id = q.handoff_id
+                 AND h.system_id = q.system_id
+                 AND h.status IN ('pending', 'answered')
+             )""",
         (session_id, system_id),
     ).fetchone()[0]
 
@@ -1035,10 +1134,16 @@ def evaluate_session_workflow(
             pending = conn.execute(
                 "SELECT * FROM interview_back_request WHERE id = ?", (pending["id"],)
             ).fetchone()
-    elif pending is not None:
+    elif pending is not None and decision.rule_row != 3:
         # The facts moved forward on their own -- the request no longer
         # describes anything, so the system resolves it. Resolving is not an
         # acknowledgement: no fact D row is written and nothing moves back.
+        #
+        # Rule row 3 is excluded on purpose. A suspended session displays
+        # `W7` because the developer left, which says NOTHING about whether
+        # the backward question was settled -- resolving it there would
+        # silently discard the request, and spec §5.4 terminal 3 requires
+        # resuming to record the manual acknowledgement FOR that request.
         conn.execute(
             """UPDATE interview_back_request SET status = 'resolved', updated_at = ?
                WHERE id = ?""",
