@@ -193,14 +193,21 @@ export function WorkflowExceptions({
   onRetry,
   retryPending,
   onLeaveSafely,
+  skipCodes,
 }: {
   workflow: InterviewWorkflowStateOut;
   onRetry?: (kind: InterviewProcessKind) => void;
   retryPending?: boolean;
   onLeaveSafely?: () => void;
+  // 同じ例外を別の専用表示が既に担っている場合に、ここから除外する
+  // (原則 P7: 同じ対象への表示を重複配置しない)。呼び出し側は「なぜその
+  // 例外を別に出すのか」を必ず書くこと。
+  skipCodes?: string[];
 }) {
   const shown = workflow.exceptions.filter(
-    e => e.severity === "blocking" || e.severity === "degraded",
+    e =>
+      (e.severity === "blocking" || e.severity === "degraded")
+      && !(skipCodes ?? []).includes(e.code),
   );
   if (shown.length === 0) return null;
   return (

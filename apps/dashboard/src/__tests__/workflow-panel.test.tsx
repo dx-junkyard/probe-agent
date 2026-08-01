@@ -232,3 +232,29 @@ describe("BackRequestNotice (E8, 情報区分)", () => {
     expect(onAcknowledge).toHaveBeenCalledWith(12);
   });
 });
+
+describe("重複表示の抑止 (原則 P7)", () => {
+  test("skipCodes に挙げた例外は汎用カードから外れる", () => {
+    const wf = workflow({
+      exceptions: [
+        {
+          code: "E2", severity: "blocking", target_state: "W5",
+          message: "Repository の HEAD がセッションの snapshot より進んでいます。",
+          detail: null, recovery_process_kind: null,
+          recovery_condition: "新しい snapshot に更新すると解消します。",
+        },
+        {
+          code: "E12", severity: "blocking", target_state: "W5",
+          message: "差分を生成できませんでした。",
+          detail: null, recovery_process_kind: "diff_generation",
+          recovery_condition: "原因を解消して差分を生成し直すと通常フローへ戻ります。",
+        },
+      ],
+    });
+    render(<WorkflowExceptions workflow={wf} skipCodes={["E2"]} />);
+    // E2 は専用のバナーが担うので、汎用カードには出さない。
+    expect(screen.queryByTestId("workflow-exception-E2")).toBeNull();
+    // それ以外は通常どおり出る。
+    expect(screen.getByTestId("workflow-exception-E12")).toBeInTheDocument();
+  });
+});

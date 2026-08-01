@@ -2208,6 +2208,10 @@ export default function InterviewPage() {
           {workflow && (
             <WorkflowExceptions
               workflow={workflow}
+              // E2 (snapshot のズレ) は、更新操作そのものを内包した専用の
+              // バナー(#7/#8)が上で担っている。汎用の例外カードにも出すと
+              // 同じ対象の表示が 2 箇所になる (原則 P7)。
+              skipCodes={["E2"]}
               retryPending={building || materialize.isPending}
               onRetry={kind => void retryFailedProcess(kind)}
               onLeaveSafely={() => void leaveSafely("suspended")}
