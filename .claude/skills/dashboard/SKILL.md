@@ -202,6 +202,36 @@ The dashboard should support:
   Per-metric state comes from the server's `attention` object — the client
   never re-derives a judgement, and an unmeasured metric is never rendered as
   a zero.
+- Interview page target UX (Issue #342, spec only — NOT implemented): before
+  changing anything on `pages/interview.tsx` or
+  `components/system-understanding/*`, read
+  `docs/system-interview-workflow-ux.md`. It is the agreed target design and
+  supersedes ad-hoc layout decisions: developer states `W0-A`/`W0-B`/`W1`-`W7`
+  chosen by a two-stage evaluation — a first-match rule table over persisted
+  facts only (never client-only state such as `manualMainTabState` /
+  `lastMaterialization` / a mutation's `isPending`), then a backward-transition
+  hold so a completed state is never re-entered without explicit
+  acknowledgement (`reached_state` is the current checkpoint, not an all-time
+  monotonic maximum; the hold covers only the ordered states `W2`-`W7`;
+  `W0-A`/`W0-B`/`W1` have no workflow position and never trigger it);
+  one primary action per state, which must be the operation
+  that satisfies that state's completion condition (`W1` alone has none);
+  information roles `R1`-`R6`, exactly one per element; and exceptions
+  `E1`-`E14` split into blocking / degraded / informational, where degraded
+  requires enough material to keep making the current decision. A recovery
+  exit uses the existing session `status=closed` before blocking-failure rows;
+  it does not advance `reached_state`, and reopening restores unresolved failures
+  rather than treating them as solved.
+  Two rules bind any interview-screen
+  change made before the spec is implemented: (a) do not add a control that
+  is rendered disabled with explanatory text for an unmet precondition —
+  show it only once it is usable; (b) do not add a manual trigger for a
+  process that satisfies the spec's `A1`-`A4` automation gate (understanding
+  build/refresh, alignment build, intent proposal, question routing and
+  investigation, proposal generation, diff materialization, Runtime Reality
+  Check) — such controls belong in the failure/recovery path only. The spec
+  relaxes no human gate and changes nothing about #341's metrics panel
+  beyond its placement and its `R6` role.
 - Interview page layout (Issue #295): the main column is a two-tab area —
   「Alignment Review」 and 「会話」. The default tab is derived
   deterministically from existing client state (`uiState`,

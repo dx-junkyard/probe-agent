@@ -326,6 +326,54 @@ creating incomplete persistence or execution paths for later phases.
     prerequisite of this Epic. See the Issue #328 section in
     `docs/project-intelligence.md`.
 
+15. Issue #342 — システムインタビューを状態駆動型の開発者ワークフローへ
+    再設計する (sub-issues #343-#346). This is a **UX specification** issue:
+    every sub-issue lists Dashboard component changes, API/DB/state-management
+    design, and test implementation as 対象外, so the deliverable is the spec,
+    not code. The spec lives in `docs/system-interview-workflow-ux.md` and
+    defines: developer-facing states `W0-A`/`W0-B`/`W1`-`W7` decided by a
+    **two-stage evaluation** — a first-match rule table over persisted facts,
+    then a backward-transition hold (#343); information roles `R1`-`R6`, one
+    role per element, with an inventory of the screen's 70 main UI elements
+    and a state × role display matrix (#344); a finite automation gate
+    `A1`-`A4` — does not touch the target repo, does not change approval
+    state, failure cannot break existing confirmations, result is recorded
+    and awaits a human — plus exactly one primary action per state, which
+    must be the operation that satisfies that state's completion condition
+    (#345); and exceptions `E1`-`E14` split into blocking / degraded /
+    informational with 8 walkthrough scenarios (#346). Degraded is decided by
+    whether enough material remains to continue the current decision, not by
+    which process failed — hence `E3-b` can continue through zero-base questions,
+    while `E4-b` can continue from a surviving earlier result. Forward
+    transitions are automatic;
+    **backward transitions into an already completed state always require
+    explicit confirmation**, which the rule table alone cannot express — the
+    hold needs a persisted `reached_state` workflow checkpoint + per-request
+    acknowledgement, and
+    the hold applies only to the ordered states (`W2`-`W7`) — `W0-A`/`W0-B`/
+    `W1` carry no workflow position, so a normal `W3`→`W1`→`W4` is never
+    mistaken for a backward move. The
+    spec relaxes no human gate: 理解の確認 / Alignment 項目の確定 /
+    提案の承認・編集・却下 / 差分の適用 / 観測の開始 all stay
+    `decision_method: manual`, and the isolated-worktree boundary is
+    unchanged. It builds on #341 (the metrics panel keeps its progressive
+    disclosure and its `guardrail`-vs-要確認 separation; the spec only moves
+    it out of the main flow and fixes it as `R6`). Implementing it is
+    deliberately out of scope here — when a follow-up implementation issue is
+    written, follow §8 of the spec: it requires exactly four new persisted
+    facts — 差分レビューの完了 for `W6`→`W7` (manual); an execution record for
+    every process that can produce `W1`, which doubles as the blocking-failure
+    record carrying the state it blocks (system); `reached_state` + backward
+    requests (system); and the acknowledgement of a backward request (manual).
+    `reached_state` is the current ordered checkpoint, not an all-time monotonic
+    maximum: it moves backward only with that manual acknowledgement. A safe
+    terminal exit uses the existing session `status=closed` ahead of blocking
+    failures, does not advance `reached_state`, and is itself audited as manual;
+    reopening restores `status=open` and resurfaces unresolved failures.
+    Everything else is derivable from
+    existing persisted facts. See the Issue #342 section in
+    `docs/project-intelligence.md`.
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,
