@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -3077,6 +3077,71 @@ InterviewMetricKey = Literal[
     "joint_understanding_investigation_answered_rate",
     "joint_understanding_developer_question_rate",
 ]
+# The same finite key set as a plain tuple, so the external attention policy
+# (Issue #341) can be validated for terminal coverage at load time.
+INTERVIEW_METRIC_KEYS: tuple = get_args(InterviewMetricKey)
+
+# --- Interview metric 要確認判定 (Issue #341) --------------------------------
+#
+# ``guardrail`` above only designates which metrics are worth watching. Whether
+# a metric is *currently* in a bad state is a separate, evaluated judgement so
+# "値が悪い" and "まだ判断できない" never collapse into one warning state.
+InterviewMetricAttentionState = Literal[
+    "attention",         # 閾値を超えており要確認
+    "ok",                # 判定可能で、要確認条件に該当しない
+    "insufficient_data",  # 母数不足、またはまだ観測が無い
+    "not_measurable",    # 元となる事実が記録されておらず算出手段が無い
+    "criterion_unset",   # 監視対象だが閾値が未設定
+    "observation_only",  # 通知対象ではない定期観測指標
+]
+InterviewMetricAttentionReason = Literal[
+    "threshold_breached",
+    "within_threshold",
+    "sample_below_minimum",
+    "no_observations_yet",
+    "not_recorded",
+    "threshold_not_configured",
+    "not_a_notification_target",
+]
+# v1 vocabularies. See ``interview_metric_attention`` for why bounded windows,
+# sustained triggers, and manual acknowledgement are deliberately absent.
+ATTENTION_DIRECTIONS = ("high_is_bad", "low_is_bad")
+ATTENTION_WINDOWS = ("all_time",)
+ATTENTION_TRIGGERS = ("single_breach",)
+ATTENTION_CLEAR_CONDITIONS = ("value_within_threshold",)
+InterviewMetricAttentionDirection = Literal["high_is_bad", "low_is_bad"]
+InterviewMetricAttentionWindow = Literal["all_time"]
+InterviewMetricAttentionTrigger = Literal["single_breach"]
+InterviewMetricAttentionClear = Literal["value_within_threshold"]
+# The entry point's 取得失敗 state is client-side only: a server that cannot
+# answer cannot report its own failure.
+InterviewMetricsAttentionState = Literal["normal", "attention", "insufficient_data"]
+
+
+class InterviewMetricAttentionOut(BaseModel):
+    """One metric's evaluated 要確認 state plus the criterion it was judged by."""
+
+    state: InterviewMetricAttentionState
+    watched: bool = False
+    reason: InterviewMetricAttentionReason
+    direction: Optional[InterviewMetricAttentionDirection] = None
+    threshold: Optional[float] = None
+    min_sample: int = 0
+    window: Optional[InterviewMetricAttentionWindow] = None
+    trigger: Optional[InterviewMetricAttentionTrigger] = None
+    clear_condition: Optional[InterviewMetricAttentionClear] = None
+
+
+class InterviewMetricsAttentionSummaryOut(BaseModel):
+    """The entry point's state, derived only from watched metrics."""
+
+    state: InterviewMetricsAttentionState
+    attention_count: int = 0
+    insufficient_data_count: int = 0
+    not_measurable_count: int = 0
+    watched_count: int = 0
+    policy_version: str
+    policy_digest: str
 
 
 class InterviewMetricEventCreate(BaseModel):
@@ -3113,6 +3178,7 @@ class InterviewMetricEventOut(BaseModel):
 class InterviewMetricOut(BaseModel):
     key: InterviewMetricKey
     category: InterviewMetricCategory
+    # 監視対象としての指定。実際に要確認かどうかは ``attention`` が持つ。
     guardrail: bool = False
     description: str
     formula: str
@@ -3124,14 +3190,19 @@ class InterviewMetricOut(BaseModel):
     denominator: Optional[int] = None
     sample_size: int = 0
     unmeasured_reason: Optional[str] = None
+    # Evaluated after the value exists, so it is nullable during construction
+    # only. ``build_interview_metrics`` always populates it before returning,
+    # and the ``interview-metrics-v2`` response contract guarantees it.
+    attention: Optional[InterviewMetricAttentionOut] = None
 
 
 class InterviewMetricsOut(BaseModel):
     system_id: int
-    schema_version: Literal["interview-metrics-v1"] = "interview-metrics-v1"
+    schema_version: Literal["interview-metrics-v2"] = "interview-metrics-v2"
     generated_at: float
     sessions_observed: int = 0
     events_observed: int = 0
+    attention: InterviewMetricsAttentionSummaryOut
     metrics: List[InterviewMetricOut] = Field(default_factory=list)
 
 

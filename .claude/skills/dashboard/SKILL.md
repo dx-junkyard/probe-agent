@@ -187,6 +187,21 @@ The dashboard should support:
   Zero-base questions are a fixed UI questionnaire (goal / affected area /
   desired change / constraints / success criteria); answers still flow
   through the reasoning-model dialogue turn — never heuristic inference.
+- Interview UX 評価指標 entry point (Issue #341):
+  `components/system-understanding/interview-metrics-panel.tsx` is secondary
+  observation information, so the cards are COLLAPSED by default behind a
+  permanent labelled button near the page heading. Never restore the
+  always-expanded card wall above the primary interview actions. The entry
+  shows one of four states as TEXT, not colour alone — 正常 / 要確認 N件 /
+  データ不足 / 取得失敗 — where 取得失敗 is derived client-side (a server that
+  cannot answer cannot report its own failure) and never blocks the interview.
+  「値が悪い」 (要確認, destructive) and 「まだ判断できない」 (データ不足,
+  neutral) must not share a badge variant. Expanded content is ordered
+  要確認事項 → データの評価可能性 → 全指標; the entry is a native `<button>`
+  with `aria-expanded`/`aria-controls` and the panel is a labelled `region`.
+  Per-metric state comes from the server's `attention` object — the client
+  never re-derives a judgement, and an unmeasured metric is never rendered as
+  a zero.
 - Interview page layout (Issue #295): the main column is a two-tab area —
   「Alignment Review」 and 「会話」. The default tab is derived
   deterministically from existing client state (`uiState`,

@@ -748,6 +748,38 @@ heuristic result.
   (server); `PROBE_REPLAY_CAPTURE_MAX_BYTES` (SDK). See the Issue #242
   section of `docs/project-intelligence.md`.
 
+## Reviewable policy artifacts (issues #313, #341)
+
+Deterministic classification rules that operators are expected to tune live in
+`app/policies/*.yaml`, not in Python literals, and are loaded through
+`app/policy_loader.py`'s strict helpers (`UniqueKeySafeLoader`,
+`require_mapping` / `require_exact_keys` / `require_nonempty_string` /
+`require_enum` / `parse_enum_list`, each taking the caller's own error class).
+
+- `alignment_review.yaml` — the no-review-required first-match rule table.
+- `interview_metric_attention.yaml` — the Interview UX metric 要確認 criteria.
+
+Rules for any new artifact:
+
+- Load once at import so a broken policy fails startup, never the first
+  request, and NEVER fall back to an embedded default (Principle 6).
+- Validate schema version, exact key sets, every finite value, duplicate keys,
+  and terminal coverage of all inputs at load time.
+- Persist or return the `policy_version` and the SHA-256 of the raw bytes, so a
+  changed policy is auditable and invalidates anything cached under the old one.
+- Keep the vocabulary limited to what the evaluator actually honours. The
+  attention policy therefore accepts only `window: all_time`,
+  `trigger: single_breach`, and `clear: value_within_threshold`: sustained
+  triggers, bounded windows, and manual 「確認済み」 acknowledgement all need
+  persisted evaluation history or a scheduled evaluator, and silently ignoring
+  an unsupported value would be worse than rejecting it.
+- `guardrail` on `InterviewMetricOut` is only the DESIGNATION of a metric worth
+  watching; the evaluated judgement is the separate `attention` object. A
+  policy may only set `watch: true` on a designated guardrail — `apply_attention`
+  raises otherwise. Missing values never become `ok` or `attention`: they split
+  into `insufficient_data` (denominator empty / sample below minimum) and
+  `not_measurable` (the underlying fact is not recorded at all).
+
 ## Rules
 
 - Validate incoming payloads.
