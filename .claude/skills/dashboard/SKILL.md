@@ -206,12 +206,16 @@ The dashboard should support:
   changing anything on `pages/interview.tsx` or
   `components/system-understanding/*`, read
   `docs/system-interview-workflow-ux.md`. It is the agreed target design and
-  supersedes ad-hoc layout decisions: developer states `W0`-`W7` chosen by a
-  first-match rule table over persisted facts only (never client-only state
-  such as `manualMainTabState` / `lastMaterialization`), one primary action
-  per state (`W1` alone has none), information roles `R1`-`R6` with an
-  element-by-element assignment, and exceptions `E1`-`E14` split into
-  blocking / degraded / informational. Two rules bind any interview-screen
+  supersedes ad-hoc layout decisions: developer states `W0-A`/`W0-B`/`W1`-`W7`
+  chosen by a two-stage evaluation — a first-match rule table over persisted
+  facts only (never client-only state such as `manualMainTabState` /
+  `lastMaterialization` / a mutation's `isPending`), then a backward-transition
+  hold so a completed state is never re-entered without explicit
+  acknowledgement; one primary action per state, which must be the operation
+  that satisfies that state's completion condition (`W1` alone has none);
+  information roles `R1`-`R6`, exactly one per element; and exceptions
+  `E1`-`E14` split into blocking / degraded / informational, where degraded
+  requires a valid earlier result to have survived the failure. Two rules bind any interview-screen
   change made before the spec is implemented: (a) do not add a control that
   is rendered disabled with explanatory text for an unmet precondition —
   show it only once it is usable; (b) do not add a manual trigger for a
