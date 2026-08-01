@@ -1316,6 +1316,32 @@ def test_update_understanding_gate_closes_after_successful_rebuild(admin_client,
     time.sleep(0.01)
     _confirm_and_reach_proposal_generation(admin_client, sid, headers)
 
+    # Answering schedules the Issue #288 automatic refresh, which runs the
+    # SAME `_rebuild_understanding` this test is about. Left on a background
+    # thread it races the `create_llm_client` monkeypatch below: if the patch
+    # lands mid-flight the BACKGROUND rebuild succeeds, advances
+    # `understanding_rebuilt_at`, and closes the gate before this test issues
+    # its own rebuild -- so the assertion would depend on thread timing
+    # instead of on the behaviour under test (a successful MANUAL rebuild
+    # closes the gate). Waiting for the job is not an option either: with a
+    # real reasoning client configured it attempts a network call of
+    # unbounded duration.
+    #
+    # Make it deterministic instead: run the refresh inline (eager), with a
+    # client that fails immediately. The refresh then behaves exactly as the
+    # gate contract expects a FAILED rebuild to behave -- the answer is still
+    # persisted (Issue #288) and the gate stays open -- with no thread and no
+    # network involved.
+    from app.llm import LLMError
+    import app.routes.interview as interview_route
+
+    monkeypatch.setenv("PROBE_REFRESH_EAGER", "1")
+
+    def _failing_client(config):
+        raise LLMError("reasoning model unavailable in this test")
+
+    monkeypatch.setattr(interview_route, "create_llm_client", _failing_client)
+
     time.sleep(0.01)
     answer = admin_client.post(
         f"/interview/sessions/{sid}/qa/{qa['id']}/answer",

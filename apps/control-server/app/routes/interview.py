@@ -3072,16 +3072,24 @@ def _rebuild_understanding(session, system_id: int) -> UnderstandingRebuildResul
     from ..interview_workflow import ProcessRunTracker
 
     session_id = session["id"]
-    with get_conn() as conn:
+
+    def _kind(conn) -> str:
+        """build vs update, resolved on the tracker's own connection.
+
+        Deliberately NOT a separate `with get_conn()` block: the DB lock is
+        process-wide, and this function runs on the automatic-refresh
+        thread too, so an extra acquisition adds latency to the very
+        rebuild the developer is waiting for after answering.
+        """
         prior_revision = conn.execute(
             """SELECT id FROM understanding_revision
                WHERE session_id = ? AND system_id = ? LIMIT 1""",
             (session_id, system_id),
         ).fetchone()
-    kind = "understanding_update" if prior_revision else "understanding_build"
+        return "understanding_update" if prior_revision else "understanding_build"
 
-    tracker = ProcessRunTracker(session_id, system_id, kind)
-    tracker.start()
+    tracker = ProcessRunTracker(session_id, system_id, "understanding_update")
+    tracker.start(resolve_kind=_kind)
     try:
         result = _rebuild_understanding_core(session, system_id)
     except BaseException as exc:  # noqa: BLE001 - recorded then re-raised

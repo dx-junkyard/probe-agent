@@ -533,10 +533,21 @@ class ProcessRunTracker:
         self.process_kind = process_kind
         self.run_id: Optional[int] = None
 
-    def start(self) -> None:
+    def start(self, *, resolve_kind=None) -> None:
+        """Open the run record.
+
+        `resolve_kind` lets a caller pick between two process kinds from a
+        query that must run anyway, WITHOUT opening a second connection for
+        it: it receives this connection and returns the kind. The DB lock is
+        process-wide, so an extra acquisition here delays every other
+        request -- including, on the answer -> automatic-refresh path, the
+        rebuild the developer is waiting on.
+        """
         from .db import get_conn
 
         with get_conn() as conn:
+            if resolve_kind is not None:
+                self.process_kind = resolve_kind(conn)
             run_id = start_process_run(
                 conn, self.session_id, self.system_id, self.process_kind
             )
