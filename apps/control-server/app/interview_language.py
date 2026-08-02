@@ -105,6 +105,14 @@ INTERVIEW_MESSAGES: dict = {
         "ja": "「{name}」({section})の根拠がドキュメント・コードから見つかりませんでした。この項目は正しいですか?",
         "en": "No evidence for {section} item: {name}. Is this item correct?",
     },
+    # Issue #352: deterministic confidence reason written onto a Vision claim
+    # the reasoning model produced without any snapshot evidence. It is a
+    # fixed sentence, never the model's own wording, and it exists so the
+    # Understanding Brief can explain WHY the Vision is shown as a hypothesis.
+    "vision_without_evidence": {
+        "ja": "ドキュメント・コード上の根拠がないため、AI の推定にとどまります。",
+        "en": "No documentation or code evidence: this remains an AI hypothesis.",
+    },
     # Issue #285: fixed, non-LLM-fabricated message stored on an Inquiry when
     # the reasoning model determined it cannot answer (answerable=false).
     # Never the model's own wording -- a lookup-table sentence only.

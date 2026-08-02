@@ -537,3 +537,39 @@ data across Systems.
   意味し、実行には別途承認が必要です」 — proposal accept never means
   execution approval (`execution_approved` stays 0 server-side).
 - Tests: `src/__tests__/cell-fabric.test.tsx`.
+
+## Interview 画面の「現在のシステム理解」 (issue #351)
+
+- `components/system-understanding/understanding-brief.tsx` renders
+  `GET /interview/understanding-brief`. The confirmation state, the
+  provenance, the readiness verdict and every reason string come from the
+  server. Do not recompute any of them client-side — the only client table is
+  `BRIEF_DISPLAY_BY_STATE` (display density per workflow state), and the
+  workflow state itself still comes from `GET /interview/workflow-state`.
+- Placement is fixed: top of the MAIN column, in every state. The right
+  column wraps below the main work on narrow screens, so a Brief living there
+  pushes Vision / Purpose / 進行可否 under the current task. There is exactly
+  one Brief on the page; do not add a second copy of 「現在の理解」 anywhere.
+- Display rules that are requirements, not styling:
+  - Every state badge carries text (never colour alone), and 確認状態 /
+    出所 are two separate badges — collapsing them into one loses the
+    distinction the whole feature exists for.
+  - No composite confidence percentage. 「警告 N 件」 alone is never the
+    reason for a readiness verdict; a reason always names its target.
+  - Evidence, API boundaries, elements, and the full understanding tree stay
+    behind a disclosure. The 前回確認後の変更 notice does NOT: a change the
+    developer would miss while collapsed defeats its purpose.
+  - Before the understanding is built, show that fact — never a placeholder
+    Vision or Purpose.
+- `W2` is the only state where the Brief carries the primary action
+  (「この理解で進む」). Keep the judgement target and that button in the same
+  card. The conversation card's remaining confirm button is the zero-base
+  path only (no structured understanding to show).
+- If the Brief request fails or the server predates the endpoint, the panel
+  degrades to `data-display="unavailable"` and still renders `primaryAction`
+  and `fullTree`. Never let a summary failure hide the state's primary action.
+- Mutations that change a state-deciding fact must invalidate the Brief;
+  `_invalidateWorkflow` in `api/hooks.ts` already does both.
+- Tests: `src/__tests__/understanding-brief.test.tsx`, plus the Interview page
+  group in `dashboard-contracts.test.tsx` (which routes
+  `/interview/understanding-brief` through `mockInterviewApi`).

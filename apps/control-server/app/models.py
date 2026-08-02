@@ -6984,3 +6984,68 @@ class InterviewSessionStatusAuditOut(BaseModel):
     actor: str
     decision_method: str
     created_at: float
+
+
+# --- Understanding Brief / Decision Readiness (Issues #351-#354) -------------
+#
+# Every field here is a deterministic derivation persisted facts already
+# support (app/understanding_brief.py). `confirmation` and `provenance` are
+# two independent finite axes on purpose: "the developer confirmed it" and
+# "the developer wrote it" must stay distinguishable.
+
+
+class UnderstandingBriefClaimOut(BaseModel):
+    kind: str
+    name: str
+    summary: str = ""
+    confirmation: str
+    provenance: str
+    confirmation_label: str
+    provenance_label: str
+    reason: str = ""
+    contribution: str = ""
+    #: Mock LLM provenance, labelled rather than hidden (CLAUDE.md).
+    is_mock: bool = False
+    evidence: List[Dict[str, Any]] = []
+    related_docs: List[str] = []
+    related_apis: List[str] = []
+
+
+class UnderstandingReadinessReasonOut(BaseModel):
+    code: str
+    severity: str
+    message: str
+    target_kind: str = "none"
+    target_name: str = ""
+
+
+class UnderstandingChangeOut(BaseModel):
+    change_kind: str
+    section: str
+    section_label: str
+    name: str
+    detail: str
+
+
+class UnderstandingBriefOut(BaseModel):
+    system_id: int
+    session_id: Optional[int] = None
+    built: bool = False
+    vision: Optional[UnderstandingBriefClaimOut] = None
+    vision_missing_information: List[str] = []
+    system_purpose: List[UnderstandingBriefClaimOut] = []
+    core_capabilities: List[UnderstandingBriefClaimOut] = []
+    #: How many Core Capabilities the initial view shows; the rest belong
+    #: behind progressive disclosure. A cap, never a pad.
+    core_capability_initial_count: int = 0
+    key_unconfirmed: List[UnderstandingBriefClaimOut] = []
+    detail_counts: Dict[str, int] = {}
+    readiness_state: str
+    readiness_label: str
+    readiness_description: str
+    readiness_reasons: List[UnderstandingReadinessReasonOut] = []
+    changes_since_confirmation: List[UnderstandingChangeOut] = []
+    confirmed_at: Optional[float] = None
+    confirmed_revision_id: Optional[int] = None
+    revision_id: Optional[int] = None
+    snapshot_id: Optional[int] = None

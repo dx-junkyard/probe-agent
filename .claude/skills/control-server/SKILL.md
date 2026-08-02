@@ -881,6 +881,37 @@ Rules for any new artifact:
     `reached_state` checkpoint and the backward request). It confirms no
     understanding, settles no Alignment item, approves no proposal, applies
     no diff, and starts no observation.
+- The Understanding Brief and Decision Readiness (Issue #351) are derived in
+  exactly ONE place too: `app/understanding_brief.py`, served read-only by
+  `GET /interview/understanding-brief`. It is a second axis over the same
+  persisted facts, not a second workflow state.
+  - `classify_confirmation` (確認状態) and `classify_provenance` (出所) are
+    independent finite classifiers and must stay independent: provenance
+    answers "who wrote this claim", confirmation answers "is it settled".
+    Never let a human confirmation change a claim's provenance.
+  - `evaluate_readiness` is first-match over a `ReadinessFacts` value, same
+    purity rules as `WorkflowFacts` (no clock, no request-scoped value, no
+    client state) except for the runtime-freshness input, which the DB layer
+    resolves before calling it.
+  - Readiness NEVER gates. The single primary action keeps coming from
+    `app/interview_workflow.py` and must stay reachable under `blocked` —
+    "stop the flow until every uncertainty is gone" is an explicit non-goal.
+    The endpoint writes nothing.
+  - Claim identity is exact name equality and content change is a
+    `claim_digest` comparison (name excluded). Do not introduce similarity
+    matching here — a rename is a remove + an add, exactly as in
+    `understanding_diff`.
+  - The confirmed baseline is #312's
+    `understanding_capability_confirmation.source_revision_id`, with a
+    fallback to the newest revision at or before `understanding_confirmed_at`
+    for zero-base and pre-#312 sessions. Both are persisted facts; never
+    guess which revision "was probably on screen".
+  - Adding a `current_understanding` section (as #352 did with `vision`)
+    means updating `system_understanding_reviewer` (field + prompt +
+    `PROMPT_VERSION`/`SCHEMA_VERSION`), `understanding_diff.
+    UNDERSTANDING_SECTIONS`, `interview_workflow._has_understanding_content`,
+    and the Dashboard's `CurrentUnderstanding` / `hasUnderstandingContent` —
+    all five, or the section silently stops counting as content somewhere.
 - Additive nullable columns go through `db.py`'s `_add_column_if_missing`
   (Issue #308). It only ever adds a nullable column and never backfills, so
   do not use it for NOT NULL/DEFAULT migrations that need a value written

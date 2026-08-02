@@ -486,8 +486,11 @@ class TestQaInjection:
         assert "reject_interpretation" in user_prompt
         assert "Do not retain this interpretation." in user_prompt
 
-    def test_prompt_version_bumped_for_alignment_feedback_injection(self):
-        assert PROMPT_VERSION == "understanding-review-v5"
+    def test_prompt_version_is_bumped_when_the_prompt_changes(self):
+        # Bumped for the Alignment-feedback injection (v5) and again for the
+        # Vision section (v6). The audit record must never claim an output was
+        # produced by a prompt that no longer exists.
+        assert PROMPT_VERSION == "understanding-review-v6"
 
 
 class TestEnumValidation:
@@ -637,7 +640,7 @@ class TestOutputLanguage:
         system_msg = client.calls[0]["messages"][0]["content"]
         assert "in Japanese" in system_msg
         assert "enum values" in system_msg
-        assert result.prompt_version == "understanding-review-v5"
+        assert result.prompt_version == "understanding-review-v6"
         assert "review_capabilities" in system_msg
 
     def test_english_directive(self, monkeypatch):
@@ -682,3 +685,83 @@ class TestOutputLanguage:
         assert result.error is None
         questions = [q["question"] for q in result.open_questions]
         assert any("根拠" in q and "Runtime probe evaluation" in q for q in questions)
+
+
+class TestVisionSection:
+    """Issue #352: Vision is a claim in its own right, and never a settled one
+    unless the repository actually evidences it."""
+
+    def test_vision_is_returned_as_its_own_section(self):
+        response = dict(VALID_REVIEW_RESPONSE)
+        response["vision"] = [{
+            "name": "開発者が自分のシステムを説明できる状態にする",
+            "summary": "",
+            "confidence": {"level": "likely", "reason": "README states the goal"},
+            "evidence": [
+                {"path": "README.md", "start_line": 1, "end_line": 3, "summary": "目的"}
+            ],
+        }]
+        graph = _build_graph([_claim()])
+        result = generate_understanding_review(
+            FakeReasoningClient(response), _reasoning_config(),
+            graph=graph, reconciliation=_empty_reconciliation(),
+        )
+        assert result.error is None
+        vision = result.current_understanding["vision"]
+        assert len(vision) == 1
+        assert vision[0]["name"] == "開発者が自分のシステムを説明できる状態にする"
+        # Vision never merges into System Purpose.
+        assert result.current_understanding["system_purpose"][0]["name"] != vision[0]["name"]
+
+    def test_vision_without_evidence_cannot_be_presented_as_settled(self):
+        response = dict(VALID_REVIEW_RESPONSE)
+        response["vision"] = [{
+            "name": "推定した Vision",
+            "summary": "",
+            "confidence": {"level": "confirmed", "reason": "trust me"},
+            "evidence": [],
+        }]
+        graph = _build_graph([_claim()])
+        result = generate_understanding_review(
+            FakeReasoningClient(response), _reasoning_config(),
+            graph=graph, reconciliation=_empty_reconciliation(),
+        )
+        assert result.error is None
+        vision = result.current_understanding["vision"][0]
+        assert vision["confidence"]["level"] == "uncertain"
+        assert vision["confidence"]["reason"]
+        # Unlike the evidence-required sections, it does NOT manufacture a
+        # high-priority question: the developer's Vision belongs to the Intent
+        # Brief, and firing this on every session would be pure noise.
+        assert not [q for q in result.open_questions if "推定した Vision" in q["question"]]
+
+    def test_only_one_vision_item_is_kept(self):
+        response = dict(VALID_REVIEW_RESPONSE)
+        response["vision"] = [
+            {"name": "Vision A", "summary": "", "confidence": {"level": "likely", "reason": ""},
+             "evidence": [{"path": "README.md", "start_line": 1, "end_line": 2, "summary": "a"}]},
+            {"name": "Vision B", "summary": "", "confidence": {"level": "likely", "reason": ""},
+             "evidence": [{"path": "README.md", "start_line": 3, "end_line": 4, "summary": "b"}]},
+        ]
+        graph = _build_graph([_claim()])
+        result = generate_understanding_review(
+            FakeReasoningClient(response), _reasoning_config(),
+            graph=graph, reconciliation=_empty_reconciliation(),
+        )
+        assert result.error is None
+        assert [v["name"] for v in result.current_understanding["vision"]] == ["Vision A"]
+
+    def test_absent_vision_is_an_empty_section_not_a_fabrication(self):
+        graph = _build_graph([_claim()])
+        result = generate_understanding_review(
+            FakeReasoningClient(VALID_REVIEW_RESPONSE), _reasoning_config(),
+            graph=graph, reconciliation=_empty_reconciliation(),
+        )
+        assert result.error is None
+        assert result.current_understanding["vision"] == []
+
+    def test_prompt_and_schema_versions_record_the_vision_change(self):
+        from app.system_understanding_reviewer import PROMPT_VERSION, SCHEMA_VERSION
+
+        assert PROMPT_VERSION == "understanding-review-v6"
+        assert SCHEMA_VERSION == "understanding-review-v2"

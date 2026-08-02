@@ -104,6 +104,8 @@ function priorityBadgeVariant(value: string): BadgeVariant {
 }
 
 const CATEGORY_LABELS: Record<keyof CurrentUnderstanding, string> = {
+  // Issue #352: Vision は Purpose と別の主張。全文ツリーでも独立した節にする。
+  vision: "Vision",
   system_purpose: "システムの目的",
   core_capabilities: "主要機能",
   capability_elements: "機能要素",
@@ -113,6 +115,7 @@ const CATEGORY_LABELS: Record<keyof CurrentUnderstanding, string> = {
 };
 
 const UNDERSTANDING_SECTIONS: (keyof CurrentUnderstanding)[] = [
+  "vision",
   "system_purpose",
   "core_capabilities",
   "capability_elements",
