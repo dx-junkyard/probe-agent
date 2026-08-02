@@ -897,10 +897,22 @@ Rules for any new artifact:
     `app/interview_workflow.py` and must stay reachable under `blocked` —
     "stop the flow until every uncertainty is gone" is an explicit non-goal.
     The endpoint writes nothing.
+  - Only `BRIEF_AFFECTING_PROCESS_KINDS` may move the verdict — both for
+    running records and for blocking failures. A running `proposal_generation`
+    is not 「理解を作成しています」, and a failed `diff_generation` (always a
+    blocking failure) is not 「理解を作る処理が失敗した」. Add a kind to that
+    tuple only if it really writes `current_understanding` or an Intent Brief
+    item.
   - Claim identity is exact name equality and content change is a
     `claim_digest` comparison (name excluded). Do not introduce similarity
     matching here — a rename is a remove + an add, exactly as in
     `understanding_diff`.
+  - `claim_payload` is the single definition of a claim's content: the digest
+    that decides a recheck AND the change list the developer reads are both
+    built from it. Adding a field to the payload means adding it to
+    `_DETAIL_FIELD_CHANGES` too, or a claim becomes reportable as "changed"
+    with nothing to show. `understanding_diff` covers names, summaries and
+    confidence only — never assume it covers the rest.
   - The confirmed baseline is #312's
     `understanding_capability_confirmation.source_revision_id`, with a
     fallback to the newest revision at or before `understanding_confirmed_at`

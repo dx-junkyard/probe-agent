@@ -32,7 +32,10 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
+from app import interview_workflow
 from app.understanding_brief import (
+    BRIEF_AFFECTING_PROCESS_KINDS,
+    CHANGE_KINDS,
     CONFIRMATION_STATES,
     PROVENANCE_KINDS,
     READINESS_STATES,
@@ -738,3 +741,239 @@ def test_a_mock_intent_vision_is_labelled_not_hidden(admin_client, tmp_path):
     assert vision["name"] == "モック提案の Vision"
     assert vision["is_mock"] is True
     assert vision["confirmation"] == "ai_hypothesis"
+
+
+# ---------------------------------------------------------------------------
+# Review round 1: Readiness must describe the UNDERSTANDING, not the workflow
+# ---------------------------------------------------------------------------
+
+
+def test_only_brief_affecting_process_kinds_are_recognised():
+    """The set is closed and contains exactly what can change the Brief.
+
+    `understanding_build` / `understanding_update` write
+    `current_understanding`; `intent_candidates` writes the Intent Brief item
+    that can become the Vision. Nothing else may move the verdict.
+    """
+    assert set(BRIEF_AFFECTING_PROCESS_KINDS) == {
+        "understanding_build",
+        "understanding_update",
+        "intent_candidates",
+    }
+    for kind in BRIEF_AFFECTING_PROCESS_KINDS:
+        assert kind in interview_workflow.PROCESS_KINDS
+
+
+def test_a_later_stage_process_does_not_make_the_brief_building(
+    admin_client, tmp_path
+):
+    """`W1` for proposal generation must not read 「理解を作成しています」."""
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "System PG")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _store_understanding(
+        session_id,
+        system_id,
+        snapshot_id,
+        _understanding(system_purpose=[_item("P")], core_capabilities=[_item("C")]),
+    )
+
+    from app.db import get_conn
+    from app.interview_workflow import start_process_run
+
+    with get_conn() as conn:
+        start_process_run(conn, session_id, system_id, "proposal_generation")
+
+    # The workflow is busy...
+    state = admin_client.get(
+        "/interview/workflow-state", params={"session_id": session_id}, headers=headers
+    ).json()
+    assert state["state"] == "W1"
+    # ...but the understanding itself is not being rebuilt.
+    brief = _brief(admin_client, headers, session_id)
+    assert brief["readiness_state"] != "building"
+    assert not [r for r in brief["readiness_reasons"] if r["code"] == "process_running"]
+
+
+def test_an_understanding_rebuild_does_make_the_brief_building(
+    admin_client, tmp_path
+):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "System UB")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _store_understanding(
+        session_id, system_id, snapshot_id, _understanding(system_purpose=[_item("P")])
+    )
+
+    from app.db import get_conn
+    from app.interview_workflow import start_process_run
+
+    with get_conn() as conn:
+        start_process_run(conn, session_id, system_id, "understanding_update")
+
+    assert _brief(admin_client, headers, session_id)["readiness_state"] == "building"
+
+
+def test_a_later_stage_failure_does_not_block_the_current_understanding(
+    admin_client, tmp_path
+):
+    """Diff generation failing says nothing about whether the understanding
+    can be trusted -- it is a `W5`/`W6` problem, and `E12` already reports it
+    on the workflow surface."""
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "System DG")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _store_understanding(
+        session_id,
+        system_id,
+        snapshot_id,
+        _understanding(system_purpose=[_item("P")], core_capabilities=[_item("C")]),
+    )
+
+    from app.db import get_conn
+    from app.interview_workflow import finish_process_run, start_process_run
+
+    with get_conn() as conn:
+        run_id = start_process_run(conn, session_id, system_id, "diff_generation")
+        finish_process_run(conn, run_id, ok=False, error="patch failed")
+        # Precondition: this really is an unresolved BLOCKING failure.
+        row = conn.execute(
+            "SELECT failure_class, target_state FROM interview_process_run WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        assert row["failure_class"] == "blocking" and row["target_state"] == "W5"
+
+    brief = _brief(admin_client, headers, session_id)
+    assert brief["readiness_state"] != "blocked"
+    assert not [
+        r for r in brief["readiness_reasons"] if r["code"] == "blocking_failure"
+    ]
+
+
+def test_a_purpose_only_understanding_is_never_ready(admin_client, tmp_path):
+    """#352: 主要機能が抽出できない場合は完了したように見せない.
+
+    Confirming a Purpose-only revision used to yield 「進行可能」 with the
+    reason 「System Purpose と主要機能は確認済み」 -- while there were no
+    Core Capabilities at all.
+    """
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "System PO")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    revision_id = _store_understanding(
+        session_id, system_id, snapshot_id, _understanding(system_purpose=[_item("P")])
+    )
+    _confirm(session_id, system_id, revision_id)
+
+    brief = _brief(admin_client, headers, session_id)
+    assert brief["readiness_state"] == "needs_confirmation"
+    codes = {r["code"] for r in brief["readiness_reasons"]}
+    assert "capabilities_missing" in codes
+    assert "ready" not in codes
+
+
+def test_capability_role_and_evidence_changes_are_named_concretely(
+    admin_client, tmp_path
+):
+    """#353: 「何が、どのように変わったか」.
+
+    `why_core` / evidence / related APIs / children are part of the recheck
+    decision, so they must also be part of the change LIST -- otherwise the
+    developer is told the claim changed and shown nothing.
+    """
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "System RC")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+
+    before = _item("Trace 収集")
+    before["why_core"] = "計測の中心"
+    before["related_apis"] = ["GET /traces"]
+    before["children"] = ["ingest"]
+    revision_id = _store_understanding(
+        session_id,
+        system_id,
+        snapshot_id,
+        _understanding(system_purpose=[_item("P")], core_capabilities=[before]),
+    )
+    _confirm(session_id, system_id, revision_id)
+    assert _brief(admin_client, headers, session_id)["changes_since_confirmation"] == []
+
+    after = _item("Trace 収集")
+    after["why_core"] = "別の役割"
+    after["related_apis"] = ["GET /traces", "POST /traces"]
+    after["children"] = ["ingest", "store"]
+    after["evidence"] = [
+        {"path": "b.py", "start_line": 9, "end_line": 12, "summary": "別の根拠"}
+    ]
+    _store_understanding(
+        session_id,
+        system_id,
+        snapshot_id,
+        _understanding(system_purpose=[_item("P")], core_capabilities=[after]),
+    )
+
+    brief = _brief(admin_client, headers, session_id)
+    assert brief["readiness_state"] == "recheck_required"
+    kinds = {
+        (c["change_kind"], c["name"]) for c in brief["changes_since_confirmation"]
+    }
+    assert ("contribution_changed", "Trace 収集") in kinds
+    assert ("evidence_changed", "Trace 収集") in kinds
+    assert ("related_apis_changed", "Trace 収集") in kinds
+    assert ("composition_changed", "Trace 収集") in kinds
+    # 一般論ではなく具体的な変更が出る。
+    assert not [
+        r for r in brief["readiness_reasons"] if r["code"] == "confirmed_claim_edited"
+    ]
+
+
+def test_detail_changes_are_reported_alongside_additions(admin_client, tmp_path):
+    """The earlier `elif` dropped the detail explanation whenever an add or a
+    remove happened in the same rebuild."""
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "System MIX")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+
+    before = _item("Trace 収集")
+    before["why_core"] = "計測の中心"
+    revision_id = _store_understanding(
+        session_id,
+        system_id,
+        snapshot_id,
+        _understanding(system_purpose=[_item("P")], core_capabilities=[before]),
+    )
+    _confirm(session_id, system_id, revision_id)
+
+    edited = _item("Trace 収集")
+    edited["why_core"] = "別の役割"
+    _store_understanding(
+        session_id,
+        system_id,
+        snapshot_id,
+        _understanding(
+            system_purpose=[_item("P")],
+            core_capabilities=[edited, _item("Shadow 比較")],
+        ),
+    )
+
+    kinds = {
+        (c["change_kind"], c["name"])
+        for c in _brief(admin_client, headers, session_id)["changes_since_confirmation"]
+    }
+    assert ("added", "Shadow 比較") in kinds
+    assert ("contribution_changed", "Trace 収集") in kinds
+
+
+def test_every_digest_field_is_nameable_as_a_change():
+    """No field may decide a recheck without being reportable.
+
+    `claim_payload` is the single source for both, so this asserts the two
+    lists cannot drift apart: every payload field is either reported by
+    `understanding_diff` (summary) or by `_DETAIL_FIELD_CHANGES`.
+    """
+    from app.understanding_brief import _DETAIL_FIELD_CHANGES, claim_payload
+
+    payload_fields = set(claim_payload({}))
+    named = {field_name for field_name, _, _ in _DETAIL_FIELD_CHANGES} | {"summary"}
+    assert payload_fields == named
+    assert {kind for _, kind, _ in _DETAIL_FIELD_CHANGES} <= set(CHANGE_KINDS)

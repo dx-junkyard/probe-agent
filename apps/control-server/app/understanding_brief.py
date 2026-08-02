@@ -59,6 +59,7 @@ __all__ = [
     "REASON_SEVERITIES",
     "CHANGE_KINDS",
     "BRIEF_SECTIONS",
+    "BRIEF_AFFECTING_PROCESS_KINDS",
     "CORE_CAPABILITY_INITIAL_LIMIT",
     "KEY_UNCONFIRMED_LIMIT",
     "CONFIRMATION_LABELS",
@@ -71,6 +72,7 @@ __all__ = [
     "classify_confirmation",
     "classify_provenance",
     "evaluate_readiness",
+    "claim_payload",
     "claim_digest",
     "build_understanding_brief",
 ]
@@ -114,12 +116,31 @@ READINESS_STATES: Tuple[str, ...] = (
 #: 不足を混同しない.
 REASON_SEVERITIES: Tuple[str, ...] = ("blocking", "attention", "informational")
 
-#: Change kinds carried over from the deterministic revision diff.
+#: Change kinds. The first four come from the deterministic revision diff
+#: (`understanding_diff`); the rest are the remaining `claim_payload` fields,
+#: compared here. Together they cover every field the recheck decision looks
+#: at, so a claim can never be reported as changed without the change itself
+#: being nameable.
 CHANGE_KINDS: Tuple[str, ...] = (
     "added",
     "removed",
     "summary_changed",
     "confidence_changed",
+    "contribution_changed",
+    "evidence_changed",
+    "related_docs_changed",
+    "related_apis_changed",
+    "composition_changed",
+)
+
+#: `claim_payload` field -> (change kind, developer-facing sentence). `summary`
+#: is absent because the revision diff already reports it.
+_DETAIL_FIELD_CHANGES: Tuple[Tuple[str, str, str], ...] = (
+    ("why_core", "contribution_changed", "目的への貢献の説明が変わりました。"),
+    ("evidence", "evidence_changed", "根拠コードが変わりました。"),
+    ("related_docs", "related_docs_changed", "関連ドキュメントが変わりました。"),
+    ("related_apis", "related_apis_changed", "関連 API が変わりました。"),
+    ("children", "composition_changed", "構成要素が変わりました。"),
 )
 
 #: The `current_understanding` sections the Brief is built from. The remaining
@@ -152,6 +173,26 @@ KEY_UNCONFIRMED_LIMIT = 5
 #: か」. Used only to say WHICH information is missing when no Vision exists --
 #: never to synthesise a Vision out of them.
 VISION_INTENT_FIELDS: Tuple[str, ...] = ("goal", "pain", "success_criteria")
+
+#: The ONLY processes whose progress or failure says anything about this
+#: Brief. Readiness answers 「この理解を信頼できるか」, so a process that
+#: cannot change the Brief must not change the verdict:
+#:
+#: * `understanding_build` / `understanding_update` write
+#:   `current_understanding`, hence the Vision / Purpose / Capability claims.
+#: * `intent_candidates` writes Intent Brief items, and a `goal` item can
+#:   become the Vision (`_resolve_vision`).
+#:
+#: Everything else -- proposal generation, diff generation, Alignment build,
+#: question routing, the Runtime Reality Check -- belongs to a LATER stage of
+#: the workflow. Letting `diff_generation` running mean 「システムが理解を作成
+#: しています」, or its failure mean 「理解を作る処理が失敗した」, is exactly
+#: the Readiness/workflow-state conflation #353 forbids.
+BRIEF_AFFECTING_PROCESS_KINDS: Tuple[str, ...] = (
+    "understanding_build",
+    "understanding_update",
+    "intent_candidates",
+)
 
 
 # --- Japanese developer-facing labels ----------------------------------------
@@ -300,17 +341,23 @@ def classify_provenance(facts: ClaimFacts) -> str:
     return "ai_hypothesis"
 
 
-def claim_digest(item: Any) -> str:
-    """Digest of a claim's meaning-bearing content, excluding its name.
+def claim_payload(item: Any) -> Dict[str, Any]:
+    """A claim's meaning-bearing content, normalized, excluding its name.
 
     The name is the match key (as in `understanding_diff`), so a rename is an
     add + a remove rather than a content change. Everything a developer would
     have read when confirming -- summary, rationale, evidence, related docs
-    and APIs -- is inside the digest; model confidence is not, because a
-    confidence wobble on identical content is not a change of the claim.
+    and APIs -- is here; model confidence is not, because a confidence wobble
+    on identical content is not a change of the claim.
+
+    Both the recheck decision (`claim_digest`) and the change LIST
+    (`_detail_field_changes`) are built from this one function on purpose.
+    When they were computed separately, the digest could see a change the
+    change list could not name, and the developer was told 「変わりました」
+    without being told what changed.
     """
     if not isinstance(item, dict):
-        return ""
+        item = {}
     evidence = []
     for ref in item.get("evidence") or []:
         if not isinstance(ref, dict):
@@ -324,7 +371,7 @@ def claim_digest(item: Any) -> str:
             ]
         )
     evidence.sort()
-    payload = {
+    return {
         "summary": item.get("summary") or "",
         "why_core": item.get("why_core") or "",
         "evidence": evidence,
@@ -332,7 +379,15 @@ def claim_digest(item: Any) -> str:
         "related_apis": sorted(str(v) for v in (item.get("related_apis") or [])),
         "children": sorted(str(v) for v in (item.get("children") or [])),
     }
-    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def claim_digest(item: Any) -> str:
+    """SHA-256 over `claim_payload` -- "is this the same claim content?"."""
+    if not isinstance(item, dict):
+        return ""
+    canonical = json.dumps(
+        claim_payload(item), sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -484,9 +539,12 @@ def evaluate_readiness(facts: ReadinessFacts) -> Tuple[str, List[ReadinessReason
                 )
             )
         elif facts.recheck_claim_count > 0:
-            # The section diff saw nothing (only evidence / related docs /
-            # children moved), but the claim the developer confirmed is not
-            # the claim on screen any more.
+            # Defensive fallback only. `_changes_since_confirmation` now
+            # enumerates every `claim_payload` field, so a changed claim
+            # always produces at least one listed change and this branch
+            # should be unreachable. It stays because the alternative to a
+            # generic sentence here is silence: a claim whose digest moved
+            # without any nameable change would otherwise read 「進行可能」.
             recheck.append(
                 ReadinessReason(
                     code="confirmed_claim_edited",
@@ -559,6 +617,20 @@ def _attention_reasons(facts: ReadinessFacts) -> List[ReadinessReason]:
                 message="System Purpose を抽出できていません。",
                 target_kind="claim",
                 target_name="system_purpose",
+            )
+        )
+    if facts.core_capability_count == 0:
+        # #352: 主要機能が抽出できない場合は、完了したように見せない. Attention,
+        # not blocking -- the developer can still judge a Purpose-only
+        # understanding, but 「進行可能」 would claim 主要機能 were confirmed
+        # when there are none to confirm.
+        out.append(
+            ReadinessReason(
+                code="capabilities_missing",
+                severity="attention",
+                message="主要機能を抽出できていません。",
+                target_kind="claim",
+                target_name="core_capability",
             )
         )
     if facts.unconfirmed_capability_count > 0:
@@ -884,6 +956,35 @@ def _changes_since_confirmation(
                     "summary_changed", section, label, name, "説明が変わりました。"
                 )
             )
+        # `understanding_diff` reports names, summaries and confidence only,
+        # but the recheck decision (`claim_digest`) also covers the rationale,
+        # the evidence, the related docs/APIs and the composition. Without
+        # this pass a Capability whose 役割 or 根拠 was rewritten reports
+        # 「変わりました」 with nothing the developer can look at.
+        out.extend(_detail_field_changes(confirmed, current, section, label))
+    return out
+
+
+def _detail_field_changes(
+    confirmed: Optional[Dict[str, Any]],
+    current: Optional[Dict[str, Any]],
+    section: str,
+    label: str,
+) -> List[UnderstandingChange]:
+    """Per-claim changes in the `claim_payload` fields the revision diff misses.
+
+    Matched by exact name, like everything else here: a claim present in only
+    one of the two revisions is already an add or a remove.
+    """
+    previous_items = {str(item["name"]): item for item in _items(confirmed, section)}
+    current_items = {str(item["name"]): item for item in _items(current, section)}
+    out: List[UnderstandingChange] = []
+    for name in sorted(set(previous_items) & set(current_items)):
+        before = claim_payload(previous_items[name])
+        after = claim_payload(current_items[name])
+        for field_name, change_kind, detail in _DETAIL_FIELD_CHANGES:
+            if before[field_name] != after[field_name]:
+                out.append(UnderstandingChange(change_kind, section, label, name, detail))
     return out
 
 
@@ -984,10 +1085,24 @@ def build_understanding_brief(
 
     changes = _changes_since_confirmation(confirmed_understanding, understanding)
 
+    # Only processes that can change THIS Brief are allowed to change the
+    # verdict about it. A running proposal generation is a workflow fact, not
+    # a statement about the understanding.
+    brief_running = tuple(
+        kind
+        for kind in gathered.facts.running_process_kinds
+        if kind in BRIEF_AFFECTING_PROCESS_KINDS
+    )
+    brief_blocking = [
+        row
+        for row in gathered.blocking_failures
+        if row["process_kind"] in BRIEF_AFFECTING_PROCESS_KINDS
+    ]
+
     readiness_facts = ReadinessFacts(
         has_understanding=built,
-        building=bool(gathered.facts.running_process_kinds),
-        blocking_failure=bool(gathered.blocking_failures),
+        building=bool(brief_running),
+        blocking_failure=bool(brief_blocking),
         conflicting_claims=tuple(
             c.name for c in all_claims if c.confirmation == "conflicting"
         ),
@@ -1016,7 +1131,7 @@ def build_understanding_brief(
         ),
         change_count=len(changes),
         snapshot_stale=gathered.snapshot_stale,
-        running_process_kinds=tuple(gathered.facts.running_process_kinds),
+        running_process_kinds=brief_running,
     )
     state, reasons = evaluate_readiness(readiness_facts)
 

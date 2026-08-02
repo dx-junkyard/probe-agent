@@ -355,3 +355,58 @@ test("モック LLM 由来の主張は隠さずに明示する", () => {
     within(screen.getByTestId("brief-claim-purpose-0")).queryByTestId("brief-claim-mock"),
   ).toBeNull();
 });
+
+describe("W1 の見出しは Readiness に従う", () => {
+  test("理解を作り直しているときだけ「理解を更新しています」と言う", () => {
+    render(
+      <UnderstandingBriefPanel
+        brief={brief({
+          readiness_state: "building",
+          readiness_label: "システムが理解を作成しています",
+        })}
+        state="W1"
+      />,
+    );
+    expect(screen.getByText("現在のシステム理解を更新しています")).toBeInTheDocument();
+    expect(screen.getByTestId("brief-building-revision-note")).toBeInTheDocument();
+  });
+
+  test("提案生成など理解を変えない処理では、理解が変わらないことを示す", () => {
+    // `W1` は「システムが何かを実行中」であって「理解を作り直し中」とは限ら
+    // ない。サーバーの Readiness が building でないなら、理解は変わらない。
+    render(
+      <UnderstandingBriefPanel
+        brief={brief({
+          readiness_state: "ready",
+          readiness_label: "この理解で進めます",
+          system_purpose: [claim({ kind: "system_purpose", name: "P" })],
+        })}
+        state="W1"
+      />,
+    );
+    expect(screen.getByText("システムが処理を実行しています")).toBeInTheDocument();
+    expect(screen.queryByText("現在のシステム理解を更新しています")).toBeNull();
+    expect(screen.queryByTestId("brief-building-revision-note")).toBeNull();
+    // 変わらない理解の要点は読める。確定操作は出さない。
+    expect(screen.getByTestId("brief-compact-purpose")).toHaveTextContent("P");
+  });
+});
+
+test("初回構築では「構築しています」、再構築では「更新しています」と言い分ける", () => {
+  const { unmount } = render(
+    <UnderstandingBriefPanel
+      brief={brief({ built: false, readiness_state: "building", readiness_label: "作成中" })}
+      state="W1"
+    />,
+  );
+  expect(screen.getByText("システム理解を構築しています")).toBeInTheDocument();
+  unmount();
+
+  render(
+    <UnderstandingBriefPanel
+      brief={brief({ built: true, readiness_state: "building", readiness_label: "作成中" })}
+      state="W1"
+    />,
+  );
+  expect(screen.getByText("現在のシステム理解を更新しています")).toBeInTheDocument();
+});

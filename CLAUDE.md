@@ -498,6 +498,21 @@ creating incomplete persistence or execution paths for later phases.
       `informational`) and a target. The single primary action still comes
       from `app/interview_workflow.py` and stays visible under 進行不可.
       No composite confidence percentage anywhere.
+    - Only `BRIEF_AFFECTING_PROCESS_KINDS` (`understanding_build` /
+      `understanding_update` / `intent_candidates`) may move the verdict, for
+      running records and blocking failures alike. A running proposal
+      generation is not 「理解を作成しています」 and a failed diff generation
+      is not 「理解を作る処理が失敗した」 — that conflation is the thing #353
+      forbids. The Dashboard's `W1` heading follows the server's
+      `readiness_state` for the same reason.
+    - Zero Core Capabilities is never `ready` (`capabilities_missing`,
+      attention): #352 requires that a Purpose-only understanding does not
+      read as complete. It does not block — Purpose alone is still judgeable.
+    - `claim_payload` is the single definition of a claim's content. The
+      digest that decides a recheck and the change list the developer reads
+      are both derived from it, so a claim can never be reported as changed
+      without the change being nameable. Additions/removals and detail
+      changes are listed together.
     - `GET /interview/understanding-brief` is the only source of the Brief;
       the Dashboard renders it and never recomputes a confirmation state,
       provenance, or readiness verdict. Only the display density is a client

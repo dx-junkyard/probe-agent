@@ -535,28 +535,45 @@ export function UnderstandingBriefPanel({
   }
 
   if (display === "building") {
-    // 骨格だけを出す。古い理解が残っていても、更新中であることを先に示し、
-    // ここで編集・確定できるようには見せない。
+    // 骨格だけを出す。ここで編集・確定できるようには見せない。
+    //
+    // `W1` は「システムが何かを実行中」であって「理解を作り直し中」とは限ら
+    // ない (提案生成・差分生成も `W1` を出す)。理解が実際に変わるかどうかは
+    // サーバーの Readiness (`building` か否か) が答えているので、見出しも
+    // それに従う -- 提案生成中に「理解を更新しています」と出すのは、
+    // ワークフロー状態を Readiness として読ませることになる。
+    const rebuilding = brief.readiness_state === "building";
     return (
       <Card data-testid="understanding-brief" data-display="building">
         <CardHeader className="pb-2">
           <CardTitle className="text-sm flex items-center gap-2">
             <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
-            現在のシステム理解を更新しています
+            {rebuilding
+              ? brief.built
+                ? "現在のシステム理解を更新しています"
+                : "システム理解を構築しています"
+              : "システムが処理を実行しています"}
           </CardTitle>
           <CardDescription>
-            Vision・System Purpose・主要機能を読み直しています。完了するまで確認・確定はできません。
+            {rebuilding
+              ? "Vision・System Purpose・主要機能を読み直しています。完了するまで確認・確定はできません。"
+              : "現在のシステム理解は変わりません。処理が終わるまで確認・確定はできません。"}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-2">
           <ReadinessSummary brief={brief} />
-          {brief.built && (
-            <p className="text-xs text-muted-foreground" data-testid="brief-building-revision-note">
-              表示中の内容は更新前の理解です
-              {brief.revision_id != null ? ` (revision ${brief.revision_id})` : ""}
-              {brief.snapshot_id != null ? ` / snapshot ${brief.snapshot_id}` : ""}。
-            </p>
-          )}
+          {rebuilding
+            ? brief.built && (
+                <p
+                  className="text-xs text-muted-foreground"
+                  data-testid="brief-building-revision-note"
+                >
+                  表示中の内容は更新前の理解です
+                  {brief.revision_id != null ? ` (revision ${brief.revision_id})` : ""}
+                  {brief.snapshot_id != null ? ` / snapshot ${brief.snapshot_id}` : ""}。
+                </p>
+              )
+            : brief.built && <CompactBody brief={brief} />}
         </CardContent>
       </Card>
     );
