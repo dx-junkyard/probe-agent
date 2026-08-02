@@ -3523,13 +3523,16 @@ describe("Interview page", () => {
         expect.objectContaining({ snapshot_id: 42 }),
       );
     });
-    // Understanding is built automatically for the created session.
-    await waitFor(() => {
-      expect(mockApi.post).toHaveBeenCalledWith(
-        "/interview/sessions/8/update-understanding",
-        {},
-      );
-    });
+    // Issue #349 (再レビュー #2): 初期理解の構築はセッション作成リクエスト
+    // 自身が dispatch する。クライアントから 2 本目を投げると同じ推論処理が
+    // 二重に走るので、`update-understanding` は呼ばれてはいけない。進捗は
+    // `W1` の現在地カードが示す。
+    await new Promise(r => setTimeout(r, 50));
+    expect(
+      mockApi.post.mock.calls.filter(
+        (c: unknown[]) => String(c[0]).endsWith("/update-understanding"),
+      ),
+    ).toHaveLength(0);
   });
 
   // PR #296 review restructure: Alignment Review moves into the main,
@@ -3759,6 +3762,68 @@ describe("Interview page", () => {
     expect(screen.queryByTestId("work-surface-W0-B")).toBeNull();
     // `E1` は `W0-A` そのものなので、R5 の警告カードとしては出さない。
     expect(screen.queryByTestId("workflow-exception-E1")).toBeNull();
+  });
+
+  test("セッションを明示的に未選択にすると W0-B に到達でき、自動選択で戻らない (Issue #349 再レビュー #1)", async () => {
+    // 既存セッションがあるシステムでも新しいインタビューを開始できること。
+    // 以前は「未選択を見つけたら最新セッションを選ぶ」副作用が毎レンダー
+    // 走ったため、選択を外した瞬間に元のセッションへ引き戻され、`W0-B` の
+    // 主操作 (インタビューを開始) に永久に到達できなかった。
+    let sessionSelected = true;
+    mockInterviewApi();
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path.startsWith("/interview/workflow-state")) {
+        // 未選択のときサーバーは `W0-B` を返す (rule row 2)。
+        return Promise.resolve(
+          interviewWorkflowState(
+            sessionSelected
+              ? {}
+              : {
+                  session_id: null,
+                  state: "W0-B",
+                  candidate_state: "W0-B",
+                  rule_row: 2,
+                  reached_state: null,
+                  primary_action: "start_session",
+                  facts: { has_session: false },
+                },
+          ),
+        );
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const picker = (await screen.findByLabelText(
+      "インタビューセッション",
+    )) as HTMLSelectElement;
+    // セッション一覧が届くまで option #7 が存在しないので値は空のまま。
+    await waitFor(() => expect(picker.value).toBe("7"));
+
+    sessionSelected = false;
+    fireEvent.change(picker, { target: { value: "" } });
+
+    // 選択が復活しないこと。
+    await waitFor(() => {
+      expect(picker.value).toBe("");
+    });
+    expect(await screen.findByTestId("work-surface-W0-B")).toBeInTheDocument();
+    expect(screen.getByTestId("w0b-primary-action")).toBeInTheDocument();
+    // 数レンダー分待っても引き戻されない。
+    await new Promise(r => setTimeout(r, 50));
+    expect(picker.value).toBe("");
   });
 
   test("W4 では意図とのズレの作業面だけが描かれ、会話・提案・差分の作業面は描かれない", async () => {

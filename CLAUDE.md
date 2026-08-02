@@ -434,6 +434,31 @@ creating incomplete persistence or execution paths for later phases.
       mid-run.
     - A suspended session never auto-resolves a pending backward request, and
       resuming records the manual acknowledgement for it (§5.4 terminal 3).
+    Review round 2 (PR #350) tightened four more, all of them "the developer
+    cannot get out of here" rather than a wrong label:
+    - Auto-selecting a session happens once, on first load, and never
+      overrides an explicit 「セッション未選択」. Re-selecting on every render
+      made `W0-B` unreachable on any System that already had a session, i.e.
+      no second interview could ever be started.
+    - `POST /interview/sessions` does not merely reserve the run record — it
+      **dispatches the build**, adopting that exact record (eager inline when
+      `PROBE_INTERVIEW_EAGER_INITIAL_BUILD=1`, otherwise a worker thread; a
+      dispatch that cannot start is failed immediately as a recoverable
+      `E3-a` rather than waiting for the stale sweep). Consequently the
+      Dashboard's start flow no longer posts `update-understanding` — that
+      second call would run the same reasoning build twice.
+    - `ProcessRunTracker.start(adopt_run_id=...)` adopts ONE named record.
+      Adopting "the oldest running row of this kind" let two legitimately
+      overlapping rebuilds share a row, so whichever finished last decided
+      for both and could erase the other's failure.
+    - Failure resolution reads the LATEST finished run per `process_kind`
+      (`finished_at`, id as tiebreak), not "any later success". With three or
+      more overlapping runs, an older success would otherwise mask the newest
+      failure.
+    Tests must not spawn that initial-build worker: `tests/conftest.py` stubs
+    `_dispatch_initial_understanding_build` for every test, and
+    `test_interview_workflow.py`'s `real_initial_build_dispatch` fixture puts
+    it back for the two tests that assert on it.
     Human gates are unchanged: 理解の確認 / Alignment 項目の確定 / 提案の
     承認・編集・却下 / 差分の適用 / 観測の開始 / 戻り要求への承諾 / 中断・
     引き継ぎ・再開 all stay `decision_method: manual`.

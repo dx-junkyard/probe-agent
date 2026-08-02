@@ -21,6 +21,8 @@ probe-agent:
 from __future__ import annotations
 
 import json
+import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import List, Optional
@@ -345,6 +347,8 @@ def _question_out(question) -> InterviewStructuredQuestion:
     if isinstance(question, str):
         return InterviewStructuredQuestion(question_text=question)
     return question
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -712,19 +716,83 @@ def create_interview_session(
         )
         session_id = cur.lastrowid
         # Issue #349: `W0-B` completes by "creating a session AND the system
-        # starting to investigate" (spec §2.3), so the run record is opened in
-        # the SAME request that creates the session. Leaving it to a second
-        # client call means a reload/network drop in between produces a
-        # session with no understanding, no questions, no proposals and no
-        # diff -- which falls through the whole rule table to `W7`, a terminal
-        # the developer can never leave because every build control is
-        # exception-only. Recording it here makes the new session `W1` from
-        # its first evaluation onwards.
-        interview_workflow.start_process_run(
+        # starting to investigate" (spec §2.3). Both halves happen here.
+        #
+        # The run record is opened inside this request so the new session is
+        # `W1` from its very first evaluation -- otherwise a reload before the
+        # build starts sees a session with no understanding, no questions, no
+        # proposals and no diff, which falls through the whole rule table to
+        # `W7`, a terminal the developer can never leave because every build
+        # control is exception-only.
+        #
+        # The build itself is dispatched below, outside this connection. The
+        # record is never a mere reservation waiting for the client to send a
+        # second request: a caller that creates a session and then goes away
+        # (an API client, a closed tab) still gets the investigation, and a
+        # dispatch that cannot even start is turned into a recoverable
+        # `E3-a` immediately rather than after the stale sweep.
+        initial_run_id = interview_workflow.start_process_run(
             conn, session_id, system_id, "understanding_build"
         )
         row = _get_session_or_404(conn, session_id, system_id)
-        return _session_out(conn, row)
+        session_out = _session_out(conn, row)
+        session_row = dict(row)
+
+    _dispatch_initial_understanding_build(session_row, system_id, initial_run_id)
+    return session_out
+
+
+def _initial_build_eager() -> bool:
+    """Run the initial build inline instead of on a worker thread.
+
+    Mirrors `interview_refresh`'s `PROBE_REFRESH_EAGER`: tests need the build
+    to be deterministic and finished when the request returns.
+    """
+    return os.getenv("PROBE_INTERVIEW_EAGER_INITIAL_BUILD", "0") == "1"
+
+
+def _dispatch_initial_understanding_build(
+    session_row: dict, system_id: int, run_id: int
+) -> None:
+    """Actually start the initial understanding build for a new session.
+
+    Owns the run record `create_interview_session` opened: the worker adopts
+    that exact id, so the record always describes a process that really ran.
+    If the worker cannot be started at all, the record is failed right away
+    with the reason -- a recoverable `E3-a` the developer can retry, instead
+    of 15 minutes of "システムが調べている" followed by a stale sweep.
+    """
+    import threading
+
+    if not run_id:
+        return
+
+    def _run() -> None:
+        try:
+            _rebuild_understanding(session_row, system_id, adopt_run_id=run_id)
+        except Exception as exc:  # pragma: no cover - defensive worker guard
+            logger.exception(
+                "initial understanding build failed for session %s",
+                session_row.get("id"),
+            )
+            try:
+                with get_conn() as conn:
+                    interview_workflow.finish_process_run(
+                        conn, run_id, ok=False, error=str(exc)
+                    )
+            except Exception:  # pragma: no cover
+                logger.exception("could not record initial build failure")
+
+    if _initial_build_eager():
+        _run()
+        return
+    try:
+        threading.Thread(target=_run, daemon=True).start()
+    except Exception as exc:  # pragma: no cover - thread creation failure
+        with get_conn() as conn:
+            interview_workflow.finish_process_run(
+                conn, run_id, ok=False, error=f"初期調査を開始できませんでした: {exc}"
+            )
 
 
 @router.get(
@@ -3069,7 +3137,9 @@ class UnderstandingRebuildResult:
     revision_id: Optional[int] = None
 
 
-def _rebuild_understanding(session, system_id: int) -> UnderstandingRebuildResult:
+def _rebuild_understanding(
+    session, system_id: int, *, adopt_run_id: Optional[int] = None
+) -> UnderstandingRebuildResult:
     """Understanding build/update with a persisted run record (Issue #349).
 
     Thin wrapper over `_rebuild_understanding_core`: it records the run as
@@ -3103,10 +3173,12 @@ def _rebuild_understanding(session, system_id: int) -> UnderstandingRebuildResul
         return "understanding_update" if prior_revision else "understanding_build"
 
     tracker = ProcessRunTracker(session_id, system_id, "understanding_update")
-    # `adopt`: session creation already opened the initial build's record so
-    # the new session reads as `W1` immediately. This request is that build --
-    # close that record, do not stack a second one beside it.
-    tracker.start(resolve_kind=_kind, adopt=True)
+    # `adopt_run_id` is set only by the initial build that session creation
+    # dispatched, which passes the exact record it opened. Every other caller
+    # (the manual endpoint, the automatic refresh) opens its own row, so two
+    # overlapping rebuilds never share one record and overwrite each other's
+    # outcome.
+    tracker.start(resolve_kind=_kind, adopt_run_id=adopt_run_id)
     try:
         result = _rebuild_understanding_core(session, system_id)
     except BaseException as exc:  # noqa: BLE001 - recorded then re-raised

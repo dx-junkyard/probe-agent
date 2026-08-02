@@ -1429,6 +1429,8 @@ export default function InterviewPage() {
   const selectedSessionId = Number.isFinite(sessionParam) && sessionParam > 0 ? sessionParam : null;
   const { user } = useAuth();
   const actor = user?.username ?? "dashboard";
+  // 「セッション未選択」 を開発者が自分で選んだかどうか。自動選択より優先する。
+  const [sessionClearedByUser, setSessionClearedByUser] = useState(false);
 
   const { data: repositoryStatus, refetch: refetchRepositoryStatus } = useRepositoryStatus();
   const { data: latestSnapshot } = useLatestSnapshot();
@@ -1599,13 +1601,37 @@ export default function InterviewPage() {
   // (`conversationHasRequiredAction` / `manualMainTab` / the tab jump lead)
   // is gone (spec §2.4-2, §3.2).
 
+  // Issue #349 (再レビュー #1): 自動選択は「初回ロードで URL に session が
+  // 無いとき」の 1 回だけ。以前は未選択を見つけるたびに最新セッションへ戻して
+  // いたため、開発者が 「セッション未選択」 を選んでも即座に選択が復活し、
+  // `W0-B` (= 新しいインタビューを開始する状態) に到達できなかった。既存
+  // セッションがあるシステムでは新規開始が事実上不可能になる。
+  const autoSelectedRef = useRef(false);
   useEffect(() => {
-    if (!selectedSessionId && sortedSessions.length > 0) {
+    if (autoSelectedRef.current) return;
+    if (selectedSessionId) {
+      autoSelectedRef.current = true;
+      return;
+    }
+    if (sessionsLoading) return;
+    if (sessionClearedByUser) {
+      autoSelectedRef.current = true;
+      return;
+    }
+    if (sortedSessions.length > 0) {
+      autoSelectedRef.current = true;
       const next = new URLSearchParams(searchParams);
       next.set("session", String(sortedSessions[0].id));
       setSearchParams(next, { replace: true });
     }
-  }, [selectedSessionId, sortedSessions, searchParams, setSearchParams]);
+  }, [
+    selectedSessionId,
+    sessionsLoading,
+    sessionClearedByUser,
+    sortedSessions,
+    searchParams,
+    setSearchParams,
+  ]);
 
 
   const answerRevisionReflected =
@@ -1735,18 +1761,13 @@ export default function InterviewPage() {
         title: `System interview ${latestSnapshot.commit_sha.slice(0, 8)}`,
         focus: "Author reviewed probe-agent metadata and probe proposals",
       });
+      setSessionClearedByUser(false);
       setSearchParams({ session: String(created.id) });
+      // Issue #349 (再レビュー #2): 初期理解の構築はセッション作成リクエスト
+      // 自身が開始する。ここから 2 本目の構築を投げると同じ処理が二重に走り、
+      // 推論モデル呼び出しも二重になる。進捗は `W1` の現在地カードが示し、
+      // 失敗すれば `E3-a` の復旧操作として再試行できる。
       toast.success("インタビューを開始しました。システム理解を自動構築しています…");
-      try {
-        const updated = await updateUnderstanding.mutateAsync(created.id);
-        if (updated.last_error) {
-          toast.error(`自動理解の構築に失敗しました: ${updated.last_error}`);
-        } else {
-          toast.success("初期理解の構築が完了しました。内容を確認してください。");
-        }
-      } catch (e) {
-        toast.error(`自動理解の構築に失敗しました: ${String(e)}`);
-      }
     } catch (e) {
       toast.error(String(e));
     }
@@ -2072,8 +2093,14 @@ export default function InterviewPage() {
             value={selectedSessionId ? String(selectedSessionId) : ""}
             onChange={e => {
               const next = new URLSearchParams(searchParams);
-              if (e.target.value) next.set("session", e.target.value);
-              else next.delete("session");
+              if (e.target.value) {
+                next.set("session", e.target.value);
+                setSessionClearedByUser(false);
+              } else {
+                next.delete("session");
+                // 明示的な未選択。自動選択で上書きしない (再レビュー #1)。
+                setSessionClearedByUser(true);
+              }
               setSearchParams(next);
             }}
             disabled={!sortedSessions.length}

@@ -260,6 +260,16 @@ The dashboard should support:
   - The `W7` terminal (`completed`/`handoff`/`suspended`) decides the primary
     action; 中断・引き継ぎ・再開 go through `POST .../close` / `.../reopen`,
     which are manual audit records and never resolve a blocking failure.
+  - Auto-selecting a session from the list happens ONCE, on first load with
+    no `?session=`, and never overrides an explicit 「セッション未選択」.
+    Re-selecting the newest session on every render makes `W0-B` unreachable
+    on any System that already has a session — the developer can never start
+    a second interview.
+  - 「インタビューを開始」 posts `POST /interview/sessions` and stops there.
+    The server dispatches the initial understanding build itself, so a
+    follow-up `update-understanding` from the client runs the same reasoning
+    build twice. Progress shows as `W1`; failure shows as `E3-a` with its
+    retry.
   The spec relaxes no human gate and changes nothing about #341's metrics
   panel beyond its placement and its `R6` role.
 - Interview page layout (Issue #295) — **superseded by Issue #349**: the

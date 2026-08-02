@@ -33,6 +33,7 @@ from typing import Dict
 import pytest
 from fastapi.testclient import TestClient
 
+import app.routes.interview as _interview_route
 from app.interview_workflow import (
     ORDERED_STATES,
     PRIMARY_ACTION_BY_STATE,
@@ -43,6 +44,10 @@ from app.interview_workflow import (
     state_rank,
     terminal_kind_for,
 )
+
+# Captured before `conftest`'s autouse stub replaces it, so the two tests
+# that exercise the real dispatch can put it back.
+_REAL_INITIAL_DISPATCH = _interview_route._dispatch_initial_understanding_build
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +408,24 @@ def _setup(client, tmp_path, name="System W"):
     repo, sha = _init_repo(tmp_path, f"repo-{name.replace(' ', '-')}")
     snapshot_id = _insert_snapshot(system_id, repo, sha)
     return token, system_id, snapshot_id
+
+
+@pytest.fixture
+def real_initial_build_dispatch(monkeypatch):
+    """Undo `conftest`'s blanket stub for the tests that assert the dispatch.
+
+    The stub exists so no test spawns an unbounded reasoning-model call on a
+    daemon thread; these tests are precisely the ones that need the real
+    dispatcher, and they bound it themselves (eager mode, or a `Thread` that
+    refuses to start).
+    """
+    import app.routes.interview as interview_route
+
+    monkeypatch.setattr(
+        interview_route,
+        "_dispatch_initial_understanding_build",
+        _REAL_INITIAL_DISPATCH,
+    )
 
 
 def _state(client, headers, session_id=None):
@@ -1111,7 +1134,9 @@ def test_scenario_handoff_terminal(admin_client, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_a_new_session_is_w1_and_never_falls_through_to_w7(admin_client, tmp_path):
+def test_a_new_session_is_w1_and_never_falls_through_to_w7(
+    admin_client, tmp_path, monkeypatch
+):
     """Review finding 3. `W0-B` completes by "session created AND the system
     started investigating" (spec §2.3), so the initial build's run record is
     opened in the SAME request that creates the session.
@@ -1121,7 +1146,17 @@ def test_a_new_session_is_w1_and_never_falls_through_to_w7(admin_client, tmp_pat
     proposals and no diff -- which fell through the whole rule table to `W7`,
     a terminal with no way back because every build control is
     exception-only.
+
+    The dispatcher is stubbed here so only the record half is under test; the
+    "the build really runs" half is `test_creating_a_session_actually_starts
+    _the_build` below.
     """
+    import app.routes.interview as interview_route
+
+    monkeypatch.setattr(
+        interview_route, "_dispatch_initial_understanding_build",
+        lambda session_row, system_id, run_id: None,
+    )
     token, system_id, snapshot_id = _setup(admin_client, tmp_path, "Fresh Session")
     headers = _headers(token, system_id)
     session_id = _create_session(
@@ -1136,32 +1171,146 @@ def test_a_new_session_is_w1_and_never_falls_through_to_w7(admin_client, tmp_pat
     assert _state(admin_client, headers, session_id)["state"] == "W1"
 
 
-def test_the_build_request_adopts_the_creation_record_instead_of_stacking(
-    admin_client, tmp_path
+def test_creating_a_session_actually_starts_the_build(
+    admin_client, tmp_path, monkeypatch, real_initial_build_dispatch
 ):
-    """Review finding 3, second half: the request that performs the initial
-    build must CLOSE the record creation opened, not open a second one --
-    otherwise the first is left to be swept as a phantom failure."""
+    """Re-review finding 2. The run record must describe a process that
+    really ran, not a reservation waiting for the client's second request.
+
+    Creating a session through the API alone -- no Dashboard, no follow-up
+    call -- must perform the investigation and leave a finished outcome. With
+    no reasoning model configured that outcome is a failure, which is the
+    correct, recoverable `E3-a`; the point is that the state stops being
+    「システムが調べている」 without anyone sending another request.
+    """
+    monkeypatch.setenv("PROBE_INTERVIEW_EAGER_INITIAL_BUILD", "1")
+    from app.db import get_conn
+
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "API Only")
+    headers = _headers(token, system_id)
+    r = admin_client.post(
+        "/interview/sessions", json={"snapshot_id": snapshot_id}, headers=headers
+    )
+    assert r.status_code == 201, r.text
+    session_id = r.json()["id"]
+
+    with get_conn() as conn:
+        runs = conn.execute(
+            """SELECT process_kind, status FROM interview_process_run
+               WHERE session_id = ? ORDER BY id""",
+            (session_id,),
+        ).fetchall()
+    # Exactly one run, and it is finished -- the dispatched build owned and
+    # closed the record creation opened (no second, stacked row).
+    assert [(r["process_kind"], r["status"]) for r in runs] == [
+        ("understanding_build", "failed"),
+    ]
+
+    state = _state(admin_client, headers, session_id)
+    assert state["state"] != "W1"
+    assert state["facts"]["blocking_failure_states"] == ["W2"]
+    assert [e["code"] for e in state["exceptions"] if e["severity"] == "blocking"] == ["E3-a"]
+
+
+def test_a_failed_dispatch_becomes_a_recoverable_failure_immediately(
+    admin_client, tmp_path, monkeypatch, real_initial_build_dispatch
+):
+    """Re-review finding 2: a dispatch that cannot even start must not leave
+    the developer waiting for the 15-minute stale sweep."""
+    import threading
+
+    import app.routes.interview as interview_route
+
+    monkeypatch.setattr(interview_route, "_initial_build_eager", lambda: False)
+
+    def _explode(*args, **kwargs):
+        raise RuntimeError("no worker threads available")
+
+    monkeypatch.setattr(threading, "Thread", _explode)
+
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "No Worker")
+    headers = _headers(token, system_id)
+    r = admin_client.post(
+        "/interview/sessions", json={"snapshot_id": snapshot_id}, headers=headers
+    )
+    assert r.status_code == 201, r.text
+    session_id = r.json()["id"]
+
+    state = _state(admin_client, headers, session_id)
+    assert state["state"] == "W2"
+    assert state["facts"]["blocking_failure_states"] == ["W2"]
+    blocking = [e for e in state["exceptions"] if e["severity"] == "blocking"]
+    assert blocking and "初期調査を開始できませんでした" in (blocking[0]["detail"] or "")
+
+
+def test_overlapping_runs_of_one_kind_never_share_a_record(admin_client, tmp_path):
+    """Re-review finding 3. `adopt` must name ONE specific record (the one
+    session creation dispatched), not "the oldest running row of this kind".
+
+    Two rebuilds legitimately overlap -- a manual update while the automatic
+    refresh is already running. Sharing a row makes whichever finishes last
+    decide for both, so one process' success silently erases the other's
+    failure (or vice versa).
+    """
     from app.db import get_conn
     from app.interview_workflow import ProcessRunTracker
 
-    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "Adopt")
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "Overlap Adopt")
     headers = _headers(token, system_id)
-    session_id = _create_session(
-        admin_client, headers, snapshot_id, settle_initial_build=False
-    )
+    session_id = _create_session(admin_client, headers, snapshot_id)
 
-    tracker = ProcessRunTracker(session_id, system_id, "understanding_build")
-    tracker.start(adopt=True)
-    tracker.succeed()
+    a = ProcessRunTracker(session_id, system_id, "understanding_update")
+    a.start()
+    b = ProcessRunTracker(session_id, system_id, "understanding_update")
+    b.start()
+    assert a.run_id != b.run_id
+
+    b.fail("second rebuild failed")
+    a.succeed()
 
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT status FROM interview_process_run WHERE session_id = ?",
+            """SELECT id, status FROM interview_process_run
+               WHERE session_id = ? AND process_kind = 'understanding_update'
+               ORDER BY id""",
             (session_id,),
         ).fetchall()
-    assert [r["status"] for r in rows] == ["succeeded"]
-    assert _state(admin_client, headers, session_id)["state"] != "W1"
+    assert [r["status"] for r in rows] == ["succeeded", "failed"]
+
+
+def test_adoption_only_takes_the_named_record(admin_client, tmp_path):
+    """The dispatched initial build adopts exactly the record it was given,
+    and an unrelated running row of the same kind is left alone."""
+    from app.db import get_conn
+    from app.interview_workflow import ProcessRunTracker, start_process_run
+
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "Named Adopt")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+
+    with get_conn() as conn:
+        reserved = start_process_run(
+            conn, session_id, system_id, "understanding_build"
+        )
+        unrelated = start_process_run(
+            conn, session_id, system_id, "understanding_build"
+        )
+
+    tracker = ProcessRunTracker(session_id, system_id, "understanding_build")
+    tracker.start(adopt_run_id=reserved)
+    assert tracker.run_id == reserved
+    tracker.succeed()
+
+    with get_conn() as conn:
+        rows = {
+            r["id"]: r["status"]
+            for r in conn.execute(
+                "SELECT id, status FROM interview_process_run WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
+        }
+    assert rows[reserved] == "succeeded"
+    assert rows[unrelated] == "running"
 
 
 def test_a_handed_off_question_is_not_outstanding_w3_work(admin_client, tmp_path):
@@ -1380,3 +1529,84 @@ def test_resume_without_a_pending_back_request_records_no_acknowledgement(
             (session_id,),
         ).fetchone()[0]
     assert count == 0
+
+
+def test_three_overlapping_runs_use_the_latest_completion(admin_client, tmp_path):
+    """Re-review finding 4. With three overlapping runs of one kind, the
+    unresolved state must follow the LATEST completion, not row id.
+
+    The scan used to mark a `process_kind` seen before checking whether that
+    particular failure was resolved, so a middle success hid an even newer
+    failure with a smaller id -- the blocking exception silently vanished and
+    `W2`/`W4`/`W5` advanced with no material to decide on.
+    """
+    from app.db import get_conn
+
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "Three Runs")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+
+    # id 1 fails LAST (finished_at 30); id 2 succeeds in the middle; id 3
+    # failed first. Ordered by completion the newest event is id 1's failure.
+    with get_conn() as conn:
+        for run_id, status, finished_at in (
+            (None, "failed", 30.0),
+            (None, "succeeded", 20.0),
+            (None, "failed", 10.0),
+        ):
+            cur = conn.execute(
+                """INSERT INTO interview_process_run
+                       (session_id, system_id, process_kind, status,
+                        failure_class, target_state, started_at, finished_at)
+                   VALUES (?, ?, 'alignment_build', ?, ?, ?, 1.0, ?)""",
+                (
+                    session_id,
+                    system_id,
+                    status,
+                    "blocking" if status == "failed" else None,
+                    "W4" if status == "failed" else None,
+                    finished_at,
+                ),
+            )
+            assert cur.lastrowid
+
+    state = _state(admin_client, headers, session_id)
+    assert state["facts"]["blocking_failure_states"] == ["W4"]
+    assert [e["code"] for e in state["exceptions"] if e["severity"] == "blocking"] == ["E4-a"]
+
+
+def test_three_overlapping_runs_resolve_when_the_latest_succeeded(
+    admin_client, tmp_path
+):
+    """The mirror case: succeeded -> failed -> succeeded by completion order
+    leaves nothing unresolved."""
+    from app.db import get_conn
+
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "Three Runs OK")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+
+    with get_conn() as conn:
+        for status, finished_at in (
+            ("succeeded", 30.0),
+            ("failed", 20.0),
+            ("succeeded", 10.0),
+        ):
+            conn.execute(
+                """INSERT INTO interview_process_run
+                       (session_id, system_id, process_kind, status,
+                        failure_class, target_state, started_at, finished_at)
+                   VALUES (?, ?, 'alignment_build', ?, ?, ?, 1.0, ?)""",
+                (
+                    session_id,
+                    system_id,
+                    status,
+                    "blocking" if status == "failed" else None,
+                    "W4" if status == "failed" else None,
+                    finished_at,
+                ),
+            )
+
+    state = _state(admin_client, headers, session_id)
+    assert state["facts"]["blocking_failure_states"] == []
+    assert not [e for e in state["exceptions"] if e["severity"] == "blocking"]

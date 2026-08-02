@@ -841,13 +841,31 @@ Rules for any new artifact:
     an `interview_session_status_audit` row.
   - `W0-B` completes by "session created AND the system started
     investigating", so `POST /interview/sessions` opens the initial build's
-    run record itself. Leaving that to a second client call lets a reload in
-    between produce a session that falls through the whole rule table to
-    `W7` — a terminal with no way back, because every build control is
-    exception-only. The request that performs the build adopts that record
-    (`ProcessRunTracker.start(adopt=True)`) instead of stacking a second one.
-  - Resolution of a failure follows `finished_at`, not row id: two runs of a
-    kind can overlap and the one that started first can finish last.
+    run record itself AND dispatches the build. Leaving either half to a
+    second client call is a bug: without the record, a reload in between
+    produces a session that falls through the whole rule table to `W7` — a
+    terminal with no way back, because every build control is exception-only;
+    without the dispatch, the record describes a process nobody is running,
+    and an API-only or closed-tab session shows 「システムが調べている」
+    forever. The worker adopts that exact record
+    (`ProcessRunTracker.start(adopt_run_id=...)`), a dispatch that cannot
+    start is failed on the spot as a recoverable `E3-a`, and
+    `PROBE_INTERVIEW_EAGER_INITIAL_BUILD=1` makes it synchronous for tests.
+    Because the server starts the build, the client must NOT also post
+    `update-understanding` — that runs the same reasoning build twice.
+  - `adopt_run_id` names ONE record. "The oldest running row of this kind"
+    lets two legitimately overlapping rebuilds (a manual update while the
+    automatic refresh is in flight) share a row, so whichever finishes last
+    decides for both and can erase the other's failure.
+  - Resolution of a failure reads the LATEST finished run per `process_kind`
+    (`finished_at`, id as tiebreak), not "any later success": two runs of a
+    kind can overlap and the one that started first can finish last, and with
+    three or more an older success would mask the newest failure.
+  - `tests/conftest.py` stubs `_dispatch_initial_understanding_build` for
+    every test — otherwise every test that creates a session starts an
+    unbounded reasoning call on a daemon thread, racing its own writes.
+    `test_interview_workflow.py`'s `real_initial_build_dispatch` fixture puts
+    the real one back for the two tests that assert on the dispatch.
   - The stale sweep is a GUESS from elapsed time (nothing writes
     `heartbeat_at` while a process runs), so `finish_process_run` still
     accepts a swept run and lets its real outcome replace the guess.

@@ -181,6 +181,7 @@ deployment の worker/replica 数を変更する。
 | 変数 | 用途 |
 | --- | --- |
 | `PROBE_REFRESH_EAGER` | `1`/`true` で、enqueue された自動更新ジョブを呼び出し元スレッドで同期実行する（既定値は非同期のバックグラウンドスレッド実行）。テストでの決定的なアサーション用（既定値: `0`） |
+| `PROBE_INTERVIEW_EAGER_INITIAL_BUILD` | `1` で、`POST /interview/sessions` が dispatch する初期理解構築をリクエストスレッドで同期実行する（既定値は daemon スレッド）。`PROBE_REFRESH_EAGER` と同じくテストでの決定的なアサーション用（既定値: `0`, Issue #349） |
 
 ## 設定診断 (System Diagnostics)
 

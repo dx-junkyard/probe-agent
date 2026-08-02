@@ -553,8 +553,8 @@ class ProcessRunTracker:
         self.process_kind = process_kind
         self.run_id: Optional[int] = None
 
-    def start(self, *, resolve_kind=None, adopt: bool = False) -> None:
-        """Open the run record.
+    def start(self, *, resolve_kind=None, adopt_run_id: Optional[int] = None) -> None:
+        """Open the run record, or take over exactly the one named.
 
         `resolve_kind` lets a caller pick between two process kinds from a
         query that must run anyway, WITHOUT opening a second connection for
@@ -563,12 +563,17 @@ class ProcessRunTracker:
         request -- including, on the answer -> automatic-refresh path, the
         rebuild the developer is waiting on.
 
-        `adopt` takes over an already-running record of the same kind instead
-        of opening a second one. Session creation opens the initial build's
-        record so a brand-new session is `W1` from its first evaluation
-        (spec §2.3 `W0-B`); the request that actually performs that build
-        must close THAT record rather than stack another running row on top,
-        which would leave the first one to be swept as a phantom failure.
+        `adopt_run_id` takes over ONE specific record: the one session
+        creation opened for the initial build it also dispatched, whose id it
+        hands to the worker. It is deliberately not "the oldest running row
+        of this kind" -- two runs of a kind legitimately overlap (a manual
+        rebuild while the automatic refresh is in flight), and letting them
+        share a row makes their outcomes overwrite each other, so the last
+        one to finish decides for both. Every other caller opens its own row.
+
+        An `adopt_run_id` that is no longer running (already swept, already
+        finished) is ignored and a fresh row is opened, so the work is still
+        recorded rather than silently dropped.
         """
         from .db import get_conn
 
@@ -576,16 +581,16 @@ class ProcessRunTracker:
             if resolve_kind is not None:
                 self.process_kind = resolve_kind(conn)
             run_id = None
-            if adopt:
+            if adopt_run_id is not None:
                 existing = conn.execute(
-                    """SELECT id FROM interview_process_run
-                       WHERE session_id = ? AND system_id = ? AND process_kind = ?
-                         AND status = 'running'
-                       ORDER BY id LIMIT 1""",
-                    (self.session_id, self.system_id, self.process_kind),
+                    """SELECT id, process_kind FROM interview_process_run
+                       WHERE id = ? AND session_id = ? AND system_id = ?
+                         AND status = 'running'""",
+                    (adopt_run_id, self.session_id, self.system_id),
                 ).fetchone()
                 if existing is not None:
                     run_id = existing["id"]
+                    self.process_kind = existing["process_kind"]
             if run_id is None:
                 run_id = start_process_run(
                     conn, self.session_id, self.system_id, self.process_kind
@@ -711,84 +716,73 @@ def _has_understanding_content(understanding: Optional[dict]) -> bool:
     return False
 
 
-def _unresolved_blocking_failures(conn, session_id: int, system_id: int) -> List[dict]:
-    """Failed blocking runs with no later success of the same kind.
+def _latest_finished_runs(conn, session_id: int, system_id: int) -> List[dict]:
+    """The most recent COMPLETED run of each process kind, one row per kind.
 
-    "Unresolved" is derived, never stored, so ANY later success of the same
-    process kind (a manual retry or the automatic refresh) clears it the same
-    way -- and a suspend/resume never clears it at all (spec §5.3-6).
+    "Is this kind currently failing?" is a question about the latest outcome,
+    so it is answered by taking that outcome directly instead of walking
+    individual failures and asking whether each was superseded. The earlier
+    per-failure walk had a real hole with three or more overlapping runs: it
+    marked a kind as seen before checking resolution, so a middle success
+    hid an even newer failure that happened to carry a smaller id, and the
+    blocking exception silently disappeared while `W2`/`W4`/`W5` advanced
+    with nothing to decide on.
+
+    Ordering is `finished_at DESC, id DESC`: runs of one kind overlap (a
+    manual rebuild while the automatic refresh is running), so the row id
+    says nothing about which finished last. `id` only breaks exact ties, so
+    the order is total and the derivation deterministic.
+
+    Runs still in flight are excluded -- they are `W1`, not an outcome.
     """
     rows = conn.execute(
-        """SELECT * FROM interview_process_run
-           WHERE session_id = ? AND system_id = ? AND status = 'failed'
-             AND failure_class = 'blocking' AND target_state IS NOT NULL
-           ORDER BY id DESC""",
+        """SELECT r.* FROM interview_process_run r
+           WHERE r.session_id = ? AND r.system_id = ?
+             AND r.status IN ('succeeded', 'failed')
+             AND r.finished_at IS NOT NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM interview_process_run newer
+               WHERE newer.session_id = r.session_id
+                 AND newer.system_id = r.system_id
+                 AND newer.process_kind = r.process_kind
+                 AND newer.status IN ('succeeded', 'failed')
+                 AND newer.finished_at IS NOT NULL
+                 AND (
+                   newer.finished_at > r.finished_at
+                   OR (newer.finished_at = r.finished_at AND newer.id > r.id)
+                 )
+             )
+           ORDER BY r.process_kind""",
         (session_id, system_id),
     ).fetchall()
-    unresolved: List[dict] = []
-    seen_kinds: set = set()
-    for row in rows:
-        kind = row["process_kind"]
-        if kind in seen_kinds:
-            continue
-        seen_kinds.add(kind)
-        if _resolved_by_later_success(conn, session_id, system_id, row):
-            continue
-        unresolved.append(dict(row))
-    return unresolved
+    return [dict(r) for r in rows]
 
 
-def _resolved_by_later_success(conn, session_id: int, system_id: int, failed_row) -> bool:
-    """Has a run of the same kind SUCCEEDED after this one failed.
+def _unresolved_blocking_failures(conn, session_id: int, system_id: int) -> List[dict]:
+    """Kinds whose latest completion was a BLOCKING failure.
 
-    Ordered by real completion time, not by row id: two runs of the same kind
-    can overlap (a manual rebuild while the automatic refresh job is already
-    running), and the one that started first can finish last. Comparing ids
-    would then leave a failure unresolved forever even though the work
-    ultimately succeeded, pinning a blocking exception on `W2`/`W4`/`W5`.
-    `id` only breaks ties for identical timestamps, so the order stays total
-    and deterministic.
+    "Unresolved" is derived, never stored, so any later success of the same
+    kind (a manual retry or the automatic refresh) clears it the same way --
+    and a suspend/resume never clears it at all (spec §5.3-6).
     """
-    finished_at = failed_row["finished_at"]
-    if finished_at is None:
-        return False
-    later_success = conn.execute(
-        """SELECT id FROM interview_process_run
-           WHERE session_id = ? AND system_id = ? AND process_kind = ?
-             AND status = 'succeeded' AND finished_at IS NOT NULL
-             AND (finished_at > ? OR (finished_at = ? AND id > ?))
-           LIMIT 1""",
-        (
-            session_id,
-            system_id,
-            failed_row["process_kind"],
-            finished_at,
-            finished_at,
-            failed_row["id"],
-        ),
-    ).fetchone()
-    return later_success is not None
+    return [
+        row
+        for row in _latest_finished_runs(conn, session_id, system_id)
+        if row["status"] == "failed"
+        and row["failure_class"] == "blocking"
+        and row["target_state"]
+    ]
 
 
 def _degraded_failures(conn, session_id: int, system_id: int) -> List[dict]:
-    rows = conn.execute(
-        """SELECT * FROM interview_process_run
-           WHERE session_id = ? AND system_id = ? AND status = 'failed'
-             AND failure_class = 'degraded'
-           ORDER BY id DESC""",
-        (session_id, system_id),
-    ).fetchall()
-    out: List[dict] = []
-    seen: set = set()
-    for row in rows:
-        kind = row["process_kind"]
-        if kind in seen:
-            continue
-        seen.add(kind)
-        if _resolved_by_later_success(conn, session_id, system_id, row):
-            continue
-        out.append(dict(row))
-    return out
+    """Kinds whose latest completion was a DEGRADED failure. Same rule as
+    the blocking case -- the two must never disagree about what "latest"
+    means."""
+    return [
+        row
+        for row in _latest_finished_runs(conn, session_id, system_id)
+        if row["status"] == "failed" and row["failure_class"] == "degraded"
+    ]
 
 
 _ACTIONABLE_ALIGNMENT_CATEGORIES = ("must_review", "batch_reviewable")
