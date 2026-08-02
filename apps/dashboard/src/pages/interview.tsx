@@ -3,7 +3,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import {
   AlertCircle, CheckCircle, Download, FileCode, GitPullRequest,
-  HelpCircle, Layers, LifeBuoy, Loader2, MessageSquareText, Pencil, Play, RefreshCw, Send,
+  HelpCircle, Layers, LifeBuoy, Loader2, MessageSquareText, Pencil, RefreshCw, Send,
   Sparkles, XCircle,
 } from "lucide-react";
 import {
@@ -33,6 +33,12 @@ import {
   useResumeInterviewQa,
   useQaAutoInvestigate,
   useRunRuntimeRealityCheck,
+  useInterviewProcessRuns,
+  useInterviewWorkflowState,
+  useRecordDiffReview,
+  useAcknowledgeBackRequest,
+  useCloseInterviewSession,
+  useReopenInterviewSession,
   type QaAutoInvestigateController,
   useSkipInterviewQa,
   useUnderstandingDiff,
@@ -53,6 +59,13 @@ import { InquiryPanel, ROUTE_CATEGORY_LABELS } from "@/components/system-underst
 import { JointUnderstandingPanel } from "@/components/system-understanding/joint-understanding-panel";
 import { RefreshStatusChip } from "@/components/system-understanding/refresh-status-chip";
 import { InterviewMetricsPanel } from "@/components/system-understanding/interview-metrics-panel";
+import {
+  BackRequestNotice,
+  PRIMARY_ACTION_LABELS,
+  PROCESS_LABELS,
+  WorkflowExceptions,
+  WorkflowLocationCard,
+} from "@/components/system-understanding/workflow-panel";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -61,7 +74,6 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { formatTimestamp } from "@/lib/utils";
 import { buildPatchFilename, downloadTextFile } from "@/lib/patch";
@@ -104,15 +116,6 @@ const PROBE_MODES: ProbeRecommendedMode[] = ["trace", "shadow"];
 const RISK_LEVELS: ProbeSideEffectRisk[] = ["none", "low", "medium", "high"];
 const REPLAYABILITY: ProbeReplayability[] = ["safe", "caution", "unsafe"];
 
-const STAGE_ORDER: InterviewStage[] = [
-  "understanding_initialized",
-  "purpose_confirmation",
-  "capability_confirmation",
-  "element_classification",
-  "api_boundary_mapping",
-  "probe_flow_selection",
-  "proposal_generation",
-];
 
 const CAPABILITY_SECTIONS: Array<[
   keyof Pick<
@@ -190,25 +193,7 @@ function capabilityRelationKey(
 }
 
 // ユーザー向けの進捗表示: ステージ名ではなく「何を確認する作業か」を示す。
-const STAGE_LABELS: Record<InterviewStage, string> = {
-  understanding_initialized: "準備",
-  purpose_confirmation: "目的",
-  capability_confirmation: "主要機能",
-  element_classification: "要素分類",
-  api_boundary_mapping: "API境界",
-  probe_flow_selection: "プローブ対象フロー",
-  proposal_generation: "提案",
-};
 
-const STAGE_WORK_DESCRIPTIONS: Record<InterviewStage, string> = {
-  understanding_initialized: "自動分析でシステム理解を構築します",
-  purpose_confirmation: "ゴールと成功基準を確認します",
-  capability_confirmation: "主要な機能領域を確認します",
-  element_classification: "構成要素の分類を確認します",
-  api_boundary_mapping: "責務の境界を確認します",
-  probe_flow_selection: "計測すべき重要な実行フローを確認します",
-  proposal_generation: "提案を生成・レビューします",
-};
 
 // 各ステージでの既定の確認質問(open questions が無い場合に表示)。
 const STAGE_QUESTIONS: Record<InterviewStage, string> = {
@@ -241,19 +226,11 @@ type InterviewUiState =
   | "ready_for_proposals"
   | "proposal_review";
 
-const UI_STATE_LABELS: Record<InterviewUiState, string> = {
-  preparing: "理解を構築中",
-  needs_build: "理解が未構築",
-  confirm_understanding: "理解の確認",
-  fill_gaps: "不足情報の確認",
-  zero_base: "ゼロベースインタビュー",
-  ready_for_proposals: "提案の準備完了",
-  proposal_review: "提案のレビューと承認",
-};
+// Issue #349: the developer-facing state label now comes from
+// `WORKFLOW_STATE_LABELS` in components/system-understanding/workflow-panel,
+// keyed by the server's canonical workflow state. `InterviewUiState` survives
+// only as an internal content selector for the conversation surface.
 
-function stageIndex(stage: InterviewStage): number {
-  return STAGE_ORDER.indexOf(stage);
-}
 
 function hasUnderstandingContent(u: CurrentUnderstanding | null | undefined): boolean {
   if (!u) return false;
@@ -472,78 +449,15 @@ function MetadataGrid({ metadata, probe }: {
   );
 }
 
-function ProgressSteps({ current }: { current: InterviewStage }) {
-  const currentIdx = stageIndex(current);
-  return (
-    <div className="space-y-1" data-testid="stage-stepper">
-      <div className="flex items-center gap-1 flex-wrap">
-        {STAGE_ORDER.map((stage, idx) => {
-          const isCurrent = idx === currentIdx;
-          const isDone = idx < currentIdx;
-          return (
-            <Badge
-              key={stage}
-              variant={isCurrent ? "default" : isDone ? "success" : "outline"}
-              className={isCurrent ? "ring-2 ring-primary/30" : ""}
-              data-testid={`stage-${stage}`}
-            >
-              {isDone ? "✓ " : ""}{STAGE_LABELS[stage]}
-            </Badge>
-          );
-        })}
-      </div>
-      <p className="text-xs text-muted-foreground">
-        現在: {STAGE_LABELS[current]} — {STAGE_WORK_DESCRIPTIONS[current]}
-      </p>
-    </div>
-  );
-}
+// Issue #349: the 7-stage internal ProgressSteps is replaced by
+// `WorkflowProgressSteps` (W0..W7). Internal stage names are never shown to
+// the developer (spec §2.1).
 
-// PR #296 review fix (Finding 4): the banner sits above the main tabs, so a
-// required conversation-tab action (see `conversationHasRequiredAction`
-// below) must stay reachable regardless of which tab is currently shown --
-// otherwise this banner can point at a CTA that lives in the other tab.
-// `onGoToConversation` renders that escape hatch; callers only pass it (and
-// `showGoToConversation`) when the currently displayed tab is NOT the
-// conversation tab and a required action lives there.
-function NextActionBanner({ uiState, nextAction, showGoToConversation, onGoToConversation }: {
-  uiState: InterviewUiState;
-  nextAction: string;
-  showGoToConversation?: boolean;
-  onGoToConversation?: () => void;
-}) {
-  return (
-    <div
-      className="rounded-md border bg-muted/40 p-3 flex items-start gap-3 flex-wrap sm:flex-nowrap"
-      data-testid="next-action"
-    >
-      {uiState === "preparing" ? (
-        <Loader2 className="h-4 w-4 mt-0.5 shrink-0 animate-spin text-primary" />
-      ) : (
-        <Sparkles className="h-4 w-4 mt-0.5 shrink-0 text-primary" />
-      )}
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
-          <Badge variant="secondary">{UI_STATE_LABELS[uiState]}</Badge>
-          <span className="text-xs font-medium text-muted-foreground">次にやること</span>
-        </div>
-        <p className="text-sm mt-1">{nextAction}</p>
-      </div>
-      {showGoToConversation && onGoToConversation && (
-        <Button
-          size="sm"
-          variant="outline"
-          className="shrink-0"
-          onClick={onGoToConversation}
-          data-testid="next-action-go-to-conversation"
-        >
-          <MessageSquareText className="h-4 w-4 mr-1" />
-          会話タブへ移動
-        </Button>
-      )}
-    </div>
-  );
-}
+// Issue #349: `NextActionBanner` is replaced by `WorkflowLocationCard`
+// (`R1` 現在地, one per screen). The banner's stage badge came from the
+// client-derived `InterviewUiState`; the current location must now come from
+// the server's canonical workflow state, and 「次にやること」 must name the
+// state's single primary action, in the same card (spec §3.5, 原則 P2).
 
 // Issue #295 PR #296 review restructure (Finding: Alignment Review layout):
 // 調査結果(qa.investigation)の表示を Q&A一覧カード専用から切り出した
@@ -1042,6 +956,7 @@ function QaItemCard({
 // grouping) without rendering the entire InterviewPage.
 export function QaPanel({
   sessionId, actor, approvedCount, answerableAreas, investigate,
+  showRecoveryActions = false,
 }: {
   sessionId: number;
   actor: string;
@@ -1056,6 +971,9 @@ export function QaPanel({
   // never instantiated locally here, so the two UI surfaces share one
   // in-flight state (see QaAutoInvestigateController's doc comment).
   investigate: QaAutoInvestigateController;
+  // Issue #349: true only while the auto-run process behind these controls
+  // has itself failed (`E14`). Recovery controls are never permanent.
+  showRecoveryActions?: boolean;
 }) {
   const { data: qaList } = useInterviewQaList(sessionId);
   const answer = useAnswerInterviewQa(sessionId);
@@ -1121,7 +1039,7 @@ export function QaPanel({
   // lives here, and its most useful moment is exactly before any questions
   // exist. Hide the panel only when there is nothing to show AND nothing
   // that could be run.
-  if (!qaList || (qaList.items.length === 0 && approvedCount === 0)) return null;
+  if (!qaList || qaList.items.length === 0) return null;
 
   // Issue #291: out-of-area questions are never hidden -- only grouped
   // separately under 「担当外の質問」, excluded from the primary list.
@@ -1138,37 +1056,40 @@ export function QaPanel({
           <span>
             残質問 {qaList.open_count} 件(うち高優先度 {qaList.high_priority_open_count} 件)
           </span>
-          <div className="flex items-center gap-2">
-            {qaList.open_count > 0 && (
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={handleRouteAndInvestigate}
-                disabled={investigate.isPending}
-                data-testid="route-and-investigate-qa"
-              >
-                {investigate.isPending ? "調査中..." : "AIに先に調査させる"}
-              </Button>
-            )}
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={handleRuntimeRealityCheck}
-              disabled={runRealityCheck.isPending || approvedCount === 0}
-              data-testid="run-runtime-reality-check"
-              title={approvedCount === 0 ? "先に提案を1件以上承認してください" : undefined}
-            >
-              {runRealityCheck.isPending ? "実行中..." : "実態チェックを実行"}
-            </Button>
-          </div>
+          {/* Issue #349: 「AIに先に調査させる」(#60) と「実態チェックを実行」
+              (#61) は `OP-S5`/`OP-S8` として自動実行される処理なので、通常時は
+              出さない。その処理そのものが失敗した (`E14`) ときにだけ、復旧
+              操作として現れる。前提未達の注記 (#62) は、ボタンを出さない以上
+              不要なので廃止した (原則 P3)。 */}
+          {showRecoveryActions && (
+            <div className="flex items-center gap-2">
+              {qaList.open_count > 0 && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={handleRouteAndInvestigate}
+                  disabled={investigate.isPending}
+                  data-testid="route-and-investigate-qa"
+                >
+                  {investigate.isPending ? "調査中..." : "調査をもう一度実行する"}
+                </Button>
+              )}
+              {approvedCount > 0 && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={handleRuntimeRealityCheck}
+                  disabled={runRealityCheck.isPending}
+                  data-testid="run-runtime-reality-check"
+                >
+                  {runRealityCheck.isPending ? "実行中..." : "実態チェックをもう一度実行する"}
+                </Button>
+              )}
+            </div>
+          )}
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
-        {approvedCount === 0 && (
-          <p className="text-xs text-muted-foreground" data-testid="runtime-reality-prerequisite">
-            実態チェックには承認済みの提案が必要です。先に提案を確認して少なくとも1件を承認してください。
-          </p>
-        )}
         {qaList.answers_revised_at && (
           <div
             className="rounded-md border border-amber-500 bg-amber-500/10 p-3 text-sm flex items-start gap-2"
@@ -1234,6 +1155,43 @@ export function QaPanel({
         )}
       </CardContent>
     </Card>
+  );
+}
+
+// Issue #349: システム処理の実行履歴 (`R6`)。現在の主作業をブロックして
+// いない過去の失敗は主フローに出さず (§5.3-4)、この監査入口にだけ残す。
+function ProcessRunHistory({ sessionId }: { sessionId: number }) {
+  const { data: runs } = useInterviewProcessRuns(sessionId);
+  if (!runs || runs.length === 0) {
+    return <p className="text-xs text-muted-foreground">まだありません。</p>;
+  }
+  return (
+    <div className="space-y-1">
+      {runs.slice(0, 30).map(run => (
+        <div key={run.id} className="rounded-md border p-2 text-xs" data-testid="process-run-row">
+          <div className="flex items-center justify-between gap-2">
+            <span>{PROCESS_LABELS[run.process_kind]}</span>
+            <Badge
+              variant={
+                run.status === "failed"
+                  ? "destructive"
+                  : run.status === "running"
+                    ? "secondary"
+                    : "success"
+              }
+            >
+              {run.status === "failed"
+                ? "失敗"
+                : run.status === "running"
+                  ? "実行中"
+                  : "成功"}
+            </Badge>
+          </div>
+          <div className="text-muted-foreground">{formatTimestamp(run.started_at)}</div>
+          {run.error ? <div className="break-words">{run.error}</div> : null}
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -1471,9 +1429,11 @@ export default function InterviewPage() {
   const selectedSessionId = Number.isFinite(sessionParam) && sessionParam > 0 ? sessionParam : null;
   const { user } = useAuth();
   const actor = user?.username ?? "dashboard";
+  // 「セッション未選択」 を開発者が自分で選んだかどうか。自動選択より優先する。
+  const [sessionClearedByUser, setSessionClearedByUser] = useState(false);
 
   const { data: repositoryStatus, refetch: refetchRepositoryStatus } = useRepositoryStatus();
-  const { data: latestSnapshot, isLoading: snapshotLoading } = useLatestSnapshot();
+  const { data: latestSnapshot } = useLatestSnapshot();
   const { data: sessions, isLoading: sessionsLoading } = useInterviewSessions();
   const createSession = useCreateInterviewSession();
   const { data: session, isLoading: sessionLoading } = useInterviewSession(selectedSessionId);
@@ -1492,6 +1452,17 @@ export default function InterviewPage() {
   const rebaseSnapshot = useRebaseInterviewSnapshot(selectedSessionId);
   const updateUnderstanding = useUpdateInterviewUnderstanding();
   const confirmUnderstanding = useConfirmInterviewUnderstanding(selectedSessionId);
+  // Issue #349: the canonical developer-facing state. The server evaluates
+  // docs/system-interview-workflow-ux.md §2.2 (13-row first-match rule table
+  // + backward hold) over persisted facts only, and returns the state, its
+  // single primary action, and the currently-active exceptions. This page
+  // must not re-derive a workflow state from client-only values (a chosen
+  // tab, a mutation's isPending) -- those vanish on reload (spec §2.6/P9).
+  const { data: workflow } = useInterviewWorkflowState(selectedSessionId);
+  const recordDiffReview = useRecordDiffReview(selectedSessionId);
+  const acknowledgeBack = useAcknowledgeBackRequest(selectedSessionId);
+  const closeSession = useCloseInterviewSession(selectedSessionId);
+  const reopenSession = useReopenInterviewSession(selectedSessionId);
   // Issue #295 §4.8 / PR #296 review fix (Finding 4): one shared
   // auto-investigation controller per session, used both by the
   // focused-question card below and by QaPanel/QaItemCard (passed down as a
@@ -1546,14 +1517,6 @@ export default function InterviewPage() {
     sessionId: number | null;
     items: IntelligenceRunEvidenceOut[];
   }>({ sessionId: null, items: [] });
-  // PR #296 review restructure: which main-area tab the user explicitly
-  // picked. Scoped by sessionId (same pattern as answerRevisionReflectedState
-  // above) rather than reset via an effect, so switching sessions never
-  // carries over a stale manual pick from a different session.
-  const [manualMainTabState, setManualMainTabState] = useState<{
-    sessionId: number | null;
-    value: "alignment" | "conversation";
-  } | null>(null);
 
   const sortedSessions = useMemo(() => sessions ?? [], [sessions]);
   const proposals = session?.proposals ?? [];
@@ -1571,7 +1534,31 @@ export default function InterviewPage() {
   const repositoryHeadStale = !!(session && repositoryStatus?.snapshot_stale);
 
   const building = createSession.isPending || updateUnderstanding.isPending;
-  const uiState: InterviewUiState | null = session ? deriveUiState(session, building) : null;
+  // Issue #349: `uiState` no longer decides WHICH workflow state is shown --
+  // `workflow.state` does. It now only selects the CONTENT of the
+  // conversation work surface (which question card / confirmation prompt to
+  // compose), so `building` (a mutation's isPending) is deliberately not fed
+  // into it: `W1` comes from the server's persisted running record instead.
+  const uiState: InterviewUiState | null = session ? deriveUiState(session, false) : null;
+  const wState = workflow?.state ?? null;
+  const wFacts = workflow?.facts;
+  // 状態ごとの作業面 (§3.3 のマトリクス)。1 状態・1 主作業 (原則 P1)。
+  const showUnderstandingWork = wState === "W2";
+  const showQuestionWork = wState === "W3";
+  const showAlignmentWork = wState === "W4";
+  const showProposalWork = wState === "W5";
+  const showDiffWork = wState === "W6";
+  const showTerminal = wState === "W7";
+  // 会話の作業面は W2 / W3 のみ。W1 は現在地カードが進行を示す。
+  const showConversationWork = showUnderstandingWork || showQuestionWork;
+  // 復旧操作の常設をやめる (§5.3-1): 対応する例外が今発生しているときだけ。
+  // ブロッキング/劣化の再試行は `WorkflowExceptions` の 1 枚のカードが担う
+  // (§4.4: 失敗内容・影響・復旧条件・再試行を同じ枠に置く) ため、各パネル
+  // 側には置かない。`E14` だけは専用の例外カードを持たない (失敗した処理の
+  // 側に現れる) ので、その処理のパネル内が唯一の復旧場所になる。
+  const auxiliaryProcessFailed = (workflow?.unresolved_failures ?? []).some(
+    f => f.process_kind === "question_routing" || f.process_kind === "runtime_reality_check",
+  );
   const unlocked = session ? proposalsUnlocked(session) : false;
   // A confirmed proposal-stage session is already at its next workflow step.
   // Rebuild only once new developer input (an answer correction, or a
@@ -1580,12 +1567,6 @@ export default function InterviewPage() {
   // server's own evaluation of this same condition (Issue #229/#263's
   // shared `_understanding_update_blocked` predicate) so this flag can never
   // drift from what `update-understanding` will actually accept.
-  const canRefreshUnderstanding = session ? session.understanding_update_available : true;
-  const refreshBlockedUntilAnswerRevision = (
-    isProposalStage
-    && session?.understanding_confirmed_at != null
-    && !canRefreshUnderstanding
-  );
   const purposeFixHighlight = useDiagnosticHighlight<HTMLDivElement>("interview-purpose");
   const capabilitiesFixHighlight = useDiagnosticHighlight<HTMLDivElement>("interview-capabilities");
   // 提案ステージで未回答の絞り込み質問が残っている状態。提案生成を依頼しても
@@ -1606,73 +1587,52 @@ export default function InterviewPage() {
   // る)」を、現在の GET .../alignment レスポンスの実項目数から決定的に
   // 判定する(サーバーに専用フラグは無い)。superseded_items は履歴だが
   // 「一度は build された」事実には変わらないため合算する。
-  const alignmentItemCounts = alignmentFull?.counts;
-  const alignmentOutstandingCounts = alignmentFull?.outstanding_counts;
-  const totalAlignmentItems = alignmentFull
-    ? Object.values(alignmentFull.items_by_category).reduce((n, arr) => n + (arr?.length ?? 0), 0)
-      + (alignmentFull.superseded_items?.length ?? 0)
-    : 0;
-  const alignmentBuilt = totalAlignmentItems > 0;
+
   // 指摘3/5b のフロント側整合: 実行可能(actionable)カテゴリの件数は
   // outstanding_counts(未対応件数)を優先し、Review Queue のカード数と一致
   // させる。古い Control Server(outstanding_counts 未対応)では従来どおり
   // counts(総数)にフォールバックする。
-  const alignmentActionableCount =
-    (alignmentOutstandingCounts?.must_review ?? alignmentItemCounts?.must_review ?? 0)
-    + (alignmentOutstandingCounts?.batch_reviewable ?? alignmentItemCounts?.batch_reviewable ?? 0);
 
-  // PR #296 review fix (Finding 4): 「build 済みだから既定は Alignment
-  // Review」という以前の判定は、会話タブ側にまだ必須操作が残っている状態
-  // (例: 初回の理解確認・不足情報への回答・ゼロベース質問・提案生成待ち)
-  // でも Alignment Review を既定にしてしまい、次にやること(NextActionBanner)
-  // が指す操作が別タブに隠れる問題があった。
-  //
-  // proposal_review は状態名だけでは「必須操作あり」とは限らない。未レビュー
-  // (proposed/needs_review)が残る、または承認済み提案から差分を生成できる間は
-  // 会話タブに操作がある。一方、全提案を却下済みで approved set も空なら
-  // 会話側の操作は完了しており、build 済み Alignment Review を既定表示できる。
-  // uiState の truthiness をそのまま使わず、各状態が実際に持つ CTA から有限に
-  // 導出することで Alignment 自動既定が到達不能になるのを防ぐ。
-  const proposalReviewHasRequiredAction = (
-    uiState === "proposal_review"
-    && (
-      proposals.some(p => proposalReviewable(p.approval_state))
-      || proposals.some(p => p.approval_state === "approved" || p.approval_state === "edited")
-      || approvedCount > 0
-    )
-  );
-  const conversationHasRequiredAction = !!(
-    canConfirmStructuredUnderstanding
-    || uiState === "preparing"
-    || uiState === "needs_build"
-    || uiState === "confirm_understanding"
-    || uiState === "fill_gaps"
-    || uiState === "zero_base"
-    || uiState === "ready_for_proposals"
-    || proposalReviewHasRequiredAction
-  );
-  // ユーザーが明示的にタブを切り替えた場合はそちらを優先するが、その選択は
-  // 選択中のセッションに限って有効にする(別セッションへ切り替えたときに
-  // 古い選択を持ち越さない)。
-  const manualMainTab =
-    manualMainTabState?.sessionId === selectedSessionId ? manualMainTabState.value : null;
-  const mainTab: "alignment" | "conversation" =
-    manualMainTab ?? (alignmentBuilt && !conversationHasRequiredAction ? "alignment" : "conversation");
-  // 指摘4: どのタブを見ていても必須操作(会話タブ)へ到達できるよう、必須
-  // アクションが会話タブ側にあり、かつ今表示中のタブが会話タブでない場合に
-  // NextActionBanner から会話タブへ切り替える導線を出す。
-  const showGoToConversationInBanner = conversationHasRequiredAction && mainTab !== "conversation";
-  const goToConversationTab = () => {
-    setManualMainTabState({ sessionId: selectedSessionId, value: "conversation" });
-  };
+  // Issue #349: the main tabs (element #12) and the 「会話タブへ移動」 lead
+  // (element #10) are abolished. They existed only because `W3` (answering
+  // questions) and `W4` (settling intent drift) were not distinct states, so
+  // the client had to guess which tab held the required action. The workflow
+  // state now decides that, so the compensating machinery
+  // (`conversationHasRequiredAction` / `manualMainTab` / the tab jump lead)
+  // is gone (spec §2.4-2, §3.2).
 
+  // Issue #349 (再レビュー #1): 自動選択は「初回ロードで URL に session が
+  // 無いとき」の 1 回だけ。以前は未選択を見つけるたびに最新セッションへ戻して
+  // いたため、開発者が 「セッション未選択」 を選んでも即座に選択が復活し、
+  // `W0-B` (= 新しいインタビューを開始する状態) に到達できなかった。既存
+  // セッションがあるシステムでは新規開始が事実上不可能になる。
+  const autoSelectedRef = useRef(false);
   useEffect(() => {
-    if (!selectedSessionId && sortedSessions.length > 0) {
+    if (autoSelectedRef.current) return;
+    if (selectedSessionId) {
+      autoSelectedRef.current = true;
+      return;
+    }
+    if (sessionsLoading) return;
+    if (sessionClearedByUser) {
+      autoSelectedRef.current = true;
+      return;
+    }
+    if (sortedSessions.length > 0) {
+      autoSelectedRef.current = true;
       const next = new URLSearchParams(searchParams);
       next.set("session", String(sortedSessions[0].id));
       setSearchParams(next, { replace: true });
     }
-  }, [selectedSessionId, sortedSessions, searchParams, setSearchParams]);
+  }, [
+    selectedSessionId,
+    sessionsLoading,
+    sessionClearedByUser,
+    sortedSessions,
+    searchParams,
+    setSearchParams,
+  ]);
+
 
   const answerRevisionReflected =
     answerRevisionReflectedState.sessionId === selectedSessionId
@@ -1761,7 +1721,7 @@ export default function InterviewPage() {
 
   const nextActionText = useMemo(() => {
     if (canConfirmStructuredUnderstanding) {
-      return "右側の「現在の理解」パネルに表示されているシステム理解を確認し、問題なければ「この理解を確認済みにする」を押してください。";
+      return "同じカード内に表示されているシステム理解が今回の対象として正しいか判断してください。";
     }
     switch (uiState) {
       case "preparing":
@@ -1782,8 +1742,8 @@ export default function InterviewPage() {
           : "「送信して提案を生成」を押すと、確認済みの理解にもとづいて提案が生成されます。";
       case "proposal_review":
         return approvedCount > 0
-          ? "承認済みの提案から「差分を生成」でレビュー用の差分を作成できます。残りの提案のレビューも続けられます。"
-          : "各提案を承認・編集・却下してください。承認した提案から差分を生成できます。";
+          ? "承認済みの提案からレビュー用の差分が自動で生成されます。残りの提案のレビューも続けられます。"
+          : "各提案を承認・編集・却下してください。承認が終わると差分は自動で生成されます。";
       default:
         return "";
     }
@@ -1801,18 +1761,13 @@ export default function InterviewPage() {
         title: `System interview ${latestSnapshot.commit_sha.slice(0, 8)}`,
         focus: "Author reviewed probe-agent metadata and probe proposals",
       });
+      setSessionClearedByUser(false);
       setSearchParams({ session: String(created.id) });
+      // Issue #349 (再レビュー #2): 初期理解の構築はセッション作成リクエスト
+      // 自身が開始する。ここから 2 本目の構築を投げると同じ処理が二重に走り、
+      // 推論モデル呼び出しも二重になる。進捗は `W1` の現在地カードが示し、
+      // 失敗すれば `E3-a` の復旧操作として再試行できる。
       toast.success("インタビューを開始しました。システム理解を自動構築しています…");
-      try {
-        const updated = await updateUnderstanding.mutateAsync(created.id);
-        if (updated.last_error) {
-          toast.error(`自動理解の構築に失敗しました: ${updated.last_error}`);
-        } else {
-          toast.success("初期理解の構築が完了しました。内容を確認してください。");
-        }
-      } catch (e) {
-        toast.error(`自動理解の構築に失敗しました: ${String(e)}`);
-      }
     } catch (e) {
       toast.error(String(e));
     }
@@ -2025,6 +1980,72 @@ export default function InterviewPage() {
     }
   };
 
+  // Issue #349 `OP-S7`: 差分生成は自動 (§4.2.1)。承認が終わり、現在の承認
+  // セットに対応する差分がまだ無く、生成中でも生成に失敗してもいない
+  // ときだけ、1 回だけ起動する。失敗したときは `E12` の復旧操作
+  // (同じ処理の再試行) に委ね、ここでは自動再試行しない。
+  const autoMaterializedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!workflow || !selectedSessionId) return;
+    const f = workflow.facts;
+    const eligible =
+      workflow.state === "W5"
+      && f.proposals_needing_review === 0
+      && f.approved_proposal_count > 0
+      && !f.diff_matches_approval_set
+      && workflow.running_processes.length === 0
+      && !workflow.unresolved_failures.some(x => x.process_kind === "diff_generation");
+    if (!eligible || materialize.isPending) return;
+    const key = `${selectedSessionId}:${f.approved_proposal_count}:${workflow.diff_materialized_at ?? 0}`;
+    if (autoMaterializedRef.current === key) return;
+    autoMaterializedRef.current = key;
+    void triggerMaterialization();
+    // triggerMaterialization/materialize are stable enough for this guard;
+    // the ref key prevents re-entry for the same approval set.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workflow, selectedSessionId]);
+
+  // Issue #349 §5.3-1/§5.3-7: the ONLY recovery a blocking exception offers
+  // is "run the same process again". No heuristic alternative (Principle 6),
+  // and no bypass that would skip a human gate.
+  const retryFailedProcess = async (kind: string) => {
+    if (!selectedSessionId) return;
+    if (kind === "understanding_build" || kind === "understanding_update") {
+      await refreshUnderstanding();
+      return;
+    }
+    if (kind === "alignment_build") {
+      try {
+        await api.post(`/interview/sessions/${selectedSessionId}/alignment/build`, {});
+        toast.success("突き合わせを再実行しました");
+      } catch (e) {
+        toast.error(String(e));
+      }
+      return;
+    }
+    if (kind === "diff_generation") {
+      await triggerMaterialization();
+      return;
+    }
+    toast.error("この処理の再試行はこの画面からは行えません");
+  };
+
+  // `OP-D14` — leave safely to the suspend / handoff terminal. Records a
+  // manual audit entry; never resolves the blocking failure that led here.
+  const leaveSafely = async (terminalKind: "suspended" | "handoff") => {
+    if (!selectedSessionId) return;
+    try {
+      await closeSession.mutateAsync({ terminal_kind: terminalKind, actor });
+      toast.success(
+        terminalKind === "handoff"
+          ? "引き継ぎとして終了しました。再開すると続きから評価します。"
+          : "中断しました。確定内容は保持されます。",
+      );
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
   const downloadPatch = () => {
     if (!diff || !session) return;
     downloadTextFile(
@@ -2072,8 +2093,14 @@ export default function InterviewPage() {
             value={selectedSessionId ? String(selectedSessionId) : ""}
             onChange={e => {
               const next = new URLSearchParams(searchParams);
-              if (e.target.value) next.set("session", e.target.value);
-              else next.delete("session");
+              if (e.target.value) {
+                next.set("session", e.target.value);
+                setSessionClearedByUser(false);
+              } else {
+                next.delete("session");
+                // 明示的な未選択。自動選択で上書きしない (再レビュー #1)。
+                setSessionClearedByUser(true);
+              }
               setSearchParams(next);
             }}
             disabled={!sortedSessions.length}
@@ -2086,14 +2113,12 @@ export default function InterviewPage() {
               </option>
             ))}
           </Select>
-          <Button size="sm" onClick={startSession} disabled={building || snapshotLoading || !latestSnapshot}>
-            <Sparkles className="h-4 w-4 mr-1" />
-            {building ? "分析中..." : "インタビューを開始"}
-          </Button>
+          {/* #3 「インタビューを開始」 は `W0-B` の主操作だが、ヘッダーには
+              置かない。主操作は 1 状態につき 1 箇所で、その状態の作業カード
+              の中にある (原則 P1/P2) -- ヘッダーにも同じ CTA を置くと、
+              どちらが正準か分からない重複になる (原則 P7)。 */}
         </div>
       </div>
-
-      <InterviewMetricsPanel />
 
       <div {...purposeFixHighlight}>
         <DiagnosticFixCallout anchor="interview-purpose" />
@@ -2102,14 +2127,28 @@ export default function InterviewPage() {
         <DiagnosticFixCallout anchor="interview-capabilities" />
       </div>
 
-      {!latestSnapshot && !snapshotLoading && (
-        <Card>
-          <CardContent className="py-8 text-center text-sm text-muted-foreground">
-            リポジトリのスナップショットがありません。インタビューを開始する前に{" "}
-            <Link className="underline" to="/repository">リポジトリ</Link>{" "}
-            ページでスナップショットを作成してください。
-          </CardContent>
-        </Card>
+      {/* `W0-A` 開始の前提を満たす。`E1` は例外ではなくこの状態そのものなので
+          `R5` にはせず、主作業カードとして出す (§3.3)。主操作は Repository
+          画面への導線 1 つだけ。 */}
+      {wState === "W0-A" && workflow && (
+        <>
+          <WorkflowLocationCard workflow={workflow} />
+          <Card data-testid="work-surface-W0-A">
+            <CardContent className="py-8 text-center space-y-3 text-sm">
+              <p className="text-muted-foreground">
+                このリポジトリにはまだ snapshot がありません。Repository 画面で
+                snapshot を作成すると、システム理解の構築が自動で始まります。
+              </p>
+              <Link
+                className="inline-flex h-9 items-center justify-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground"
+                to="/repository"
+                data-testid="w0a-primary-action"
+              >
+                {PRIMARY_ACTION_LABELS.open_repository}
+              </Link>
+            </CardContent>
+          </Card>
+        </>
       )}
 
       {sessionsLoading || sessionLoading ? (
@@ -2118,118 +2157,79 @@ export default function InterviewPage() {
           <Skeleton className="h-64 w-full" />
         </div>
       ) : !selectedSessionId || !session ? (
-        <Card>
-          <CardContent className="py-10 text-center space-y-3">
-            <p className="text-sm text-muted-foreground">
-              「インタビューを開始」を押すと、最新スナップショットから自動でシステム理解を構築し、
-              確認する内容を1つずつ質問します。
-            </p>
-            <Button onClick={startSession} disabled={building || snapshotLoading || !latestSnapshot}>
-              <Sparkles className="h-4 w-4 mr-1" />
-              {building ? "分析中..." : "インタビューを開始"}
-            </Button>
-          </CardContent>
-        </Card>
+        /* `W0-B` インタビューを始める。`W0-A` のときはこのカードを出さない
+           (実行できない主操作を見せない、原則 P3)。 */
+        wState === "W0-B" && workflow ? (
+          <>
+            <WorkflowLocationCard workflow={workflow} />
+            <Card data-testid="work-surface-W0-B">
+              <CardContent className="py-10 text-center space-y-3">
+                <p className="text-sm text-muted-foreground">
+                  対象 snapshot: {workflow.latest_ready_snapshot_id ?? "-"}。
+                  開始すると、ドキュメントとコードの自動分析からシステム理解の構築が始まります。
+                </p>
+                <Button
+                  onClick={startSession}
+                  disabled={building}
+                  data-testid="w0b-primary-action"
+                >
+                  <Sparkles className="h-4 w-4 mr-1" />
+                  {building ? "分析中..." : PRIMARY_ACTION_LABELS.start_session}
+                </Button>
+              </CardContent>
+            </Card>
+          </>
+        ) : null
       ) : (
         <>
-          {repositoryHeadStale && repositoryStatus && (
-            <div
-              className="rounded-md border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 p-3 text-sm text-amber-900 dark:text-amber-100 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"
-              data-testid="repository-head-stale-banner"
-            >
-              <div>
-                リポジトリの HEAD が最新 snapshot より進んでいます
-                {repositoryStatus.latest_snapshot && (
-                  <>
-                    {" "}(snapshot {repositoryStatus.latest_snapshot.id}:{" "}
-                    <code>{shortSha(repositoryStatus.latest_snapshot.commit_sha)}</code>
-                    {" "}→ HEAD <code>{shortSha(repositoryStatus.current_head)}</code>)
-                  </>
-                )}
-                。新しい snapshot を作成してから、このインタビューを更新してください。
-              </div>
-              <Link
-                to="/repository"
-                className="inline-flex h-8 items-center justify-center gap-2 whitespace-nowrap rounded-md border border-input bg-background px-3 text-xs font-medium shadow-sm hover:bg-accent hover:text-accent-foreground"
-              >
-                <RefreshCw className="h-4 w-4" />
-                Repository で snapshot 作成
-              </Link>
-            </div>
-          )}
-
-          {sessionSnapshotStale && latestSnapshot && (
-            <div
-              className="rounded-md border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 p-3 text-sm text-amber-900 dark:text-amber-100 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"
-              data-testid="interview-snapshot-stale-banner"
-            >
-              <div>
-                このインタビューは snapshot {session.snapshot_id} に固定されています。
-                最新 snapshot {latestSnapshot.id} に更新すると、既存の回答を保持し、
-                影響を受けた提案だけ再レビューに戻します。
-              </div>
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={rebaseToLatestSnapshot}
-                disabled={rebaseSnapshot.isPending}
-                data-testid="rebase-interview-snapshot"
-              >
-                <RefreshCw className={`h-4 w-4 mr-1 ${rebaseSnapshot.isPending ? "animate-spin" : ""}`} />
-                {rebaseSnapshot.isPending ? "更新中..." : "最新 snapshot に更新"}
-              </Button>
-            </div>
-          )}
-
-          {uiState && (
-            <NextActionBanner
-              uiState={uiState}
-              nextAction={nextActionText}
-              showGoToConversation={showGoToConversationInBanner}
-              onGoToConversation={goToConversationTab}
+          {/* R1 — 現在地。全状態で 1 箇所のみ。「次にやること」が指す操作は
+              その状態の主操作そのもの (原則 P2)。進捗ステップも同じカードへ
+              まとめる (§3.2 #9/#11/#50/#63 の統合)。 */}
+          {workflow && (
+            <WorkflowLocationCard
+              workflow={workflow}
+              detail={nextActionText}
+              historyEntry={<RefreshStatusChip sessionId={selectedSessionId} />}
             />
           )}
 
-          <Card>
-            <CardContent className="py-3">
-              <ProgressSteps current={currentStage} />
-            </CardContent>
-          </Card>
+          {/* R2 の分岐 — 確認待ちの戻り (E8)。承諾するまで表示状態は
+              reached_state のまま (§2.2 第 2 段)。 */}
+          {workflow && (
+            <BackRequestNotice
+              workflow={workflow}
+              pending={acknowledgeBack.isPending}
+              onAcknowledge={requestId =>
+                acknowledgeBack
+                  .mutateAsync({ requestId, actor })
+                  .then(() => toast.success("確認が必要な状態へ移動しました"))
+                  .catch(e => toast.error(String(e)))
+              }
+            />
+          )}
+
+          {/* R5 — 現在ブロッキング中 / 劣化中の例外だけを、現在地の直下に。 */}
+          {workflow && (
+            <WorkflowExceptions
+              workflow={workflow}
+              // E2 (snapshot のズレ) は、更新操作そのものを内包した専用の
+              // バナー(#7/#8)が上で担っている。汎用の例外カードにも出すと
+              // 同じ対象の表示が 2 箇所になる (原則 P7)。
+              skipCodes={["E2"]}
+              retryPending={building || materialize.isPending}
+              onRetry={kind => void retryFailedProcess(kind)}
+              onLeaveSafely={() => void leaveSafely("suspended")}
+            />
+          )}
 
           <div className="grid grid-cols-1 xl:grid-cols-[1fr_380px] gap-4">
-            {/* メイン: PR #296 レビュー指摘対応 -- Alignment Review(意図と
-                現状の突き合わせをまとめて判断する)と会話(focused question /
-                自由入力)をタブで切り替える主操作領域。
-                指摘4: 「build 済みなら Alignment Review を既定にする」だけ
-                では、会話タブ側にまだ必須操作(初回の理解確認・不足情報へ
-                の回答・ゼロベース質問・提案生成待ちなど)が残っている間も
-                Alignment Review が既定になり、NextActionBanner の CTA が
-                別タブに隠れてしまっていた。既定タブは
-                `conversationHasRequiredAction`(各 uiState の実 CTA と
-                canConfirmStructuredUnderstanding から決定的に導出、新しい
-                サーバーフラグは追加しない)が false -- つまり会話タブでの
-                必須操作が残っていない -- かつ build 済みのときに限り
-                Alignment Review にする(Issue #295 §6)。proposal_review
-                でも proposed/needs_review、または承認済み差分生成が残る間は
-                会話タブを既定にするが、全却下済みなら Alignment 自動既定へ
-                到達する。どちらのタブも常に到達でき、会話タブに必須操作が
-                残る間は NextActionBanner に「会話タブへ移動」ボタンが出る。 */}
+            {/* メイン: 状態ごとに 1 つの主作業面だけを描く (原則 P1/P3)。
+                タブ (#12) は廃止され、W3 と W4 が別状態になったことで
+                「どちらのタブを既定にするか」という判断自体が消えた。 */}
             <div className="space-y-4">
-              <Tabs
-                value={mainTab}
-                onValueChange={v => setManualMainTabState({
-                  sessionId: selectedSessionId, value: v as "alignment" | "conversation",
-                })}
-              >
-                <TabsList>
-                  <TabsTrigger value="alignment" data-testid="main-tab-alignment">
-                    Alignment Review
-                    {alignmentActionableCount > 0 && ` (${alignmentActionableCount})`}
-                  </TabsTrigger>
-                  <TabsTrigger value="conversation" data-testid="main-tab-conversation">会話</TabsTrigger>
-                </TabsList>
-
-                <TabsContent value="alignment" className="space-y-4" data-testid="main-tab-content-alignment">
+              <>
+                {showAlignmentWork && (
+                <div className="space-y-4" data-testid="work-surface-W4">
                   <Card data-testid="alignment-review-panel">
                     <CardHeader>
                       <CardTitle className="text-sm">Alignment Review</CardTitle>
@@ -2245,10 +2245,14 @@ export default function InterviewPage() {
                       />
                     </CardContent>
                   </Card>
+                  {/* 突き合わせの再試行も例外カード側の 1 箇所に集約する
+                      (§4.4 / 原則 P7)。 */}
                   <ReviewQueuePanel sessionId={session.id} />
-                </TabsContent>
+                </div>
+                )}
 
-                <TabsContent value="conversation" className="space-y-4" data-testid="main-tab-content-conversation">
+                {showConversationWork && (
+                <div className="space-y-4" data-testid={showUnderstandingWork ? "work-surface-W2" : "work-surface-W3"}>
               <Card>
                 <CardHeader>
                   <CardTitle className="text-sm">会話</CardTitle>
@@ -2404,11 +2408,25 @@ export default function InterviewPage() {
                         </div>
                       )}
                       {(zeroBaseComplete || canConfirmStructuredUnderstanding) && (
-                        <div className="space-y-1">
-                          {canConfirmStructuredUnderstanding && (
-                            <p className="text-xs text-muted-foreground">
-                              対象: 右側の「現在の理解」パネルに表示されているシステム理解
-                            </p>
+                        <div className="space-y-2" data-testid="understanding-confirm-block">
+                          {/* 判断対象と主操作は同じカード内に置く (原則 P2)。
+                              以前は「対象: 右側の『現在の理解』パネル」と書いて
+                              別カラムを探させており、仕様が解消対象とした
+                              「案内を読んだあと操作場所と判断対象を探す」構造
+                              そのものだった。全文ツリーは R4 として
+                              UnderstandingOverview 内で折りたたまれたまま。 */}
+                          {canConfirmStructuredUnderstanding && session.current_understanding && (
+                            <div className="rounded-md border bg-background/60 p-3" data-testid="understanding-summary-inline">
+                              <p className="text-[10px] uppercase font-semibold text-muted-foreground mb-1">
+                                確認の対象
+                              </p>
+                              <UnderstandingOverview
+                                understanding={session.current_understanding}
+                                gaps={session.gap_analysis}
+                                openQuestions={session.open_questions}
+                                nextAction={nextActionText}
+                              />
+                            </div>
                           )}
                           <Button
                             size="sm"
@@ -2421,7 +2439,7 @@ export default function InterviewPage() {
                               ? "確定中..."
                               : zeroBaseComplete
                                 ? "この内容で提案生成に進む"
-                                : "この理解を確認済みにする"}
+                                : PRIMARY_ACTION_LABELS.confirm_understanding}
                           </Button>
                         </div>
                       )}
@@ -2465,9 +2483,78 @@ export default function InterviewPage() {
                 </CardContent>
               </Card>
 
-              {/* 提案・差分は proposal_generation 到達 + ロック解除まで表示しない(Issue #123) */}
-              {isProposalStage && unlocked && (
-                <>
+                </div>
+                )}
+
+                {/* `E2` (snapshot のズレ) は §5.2 では「更新系操作に限る」
+                    ブロッキングで、表示場所は「該当操作と同じ面」。差分の生成
+                    ・再生成が関わる `W5`/`W6` の作業面の直前でだけ出す --
+                    ページ最上部の常設バナーにすると、継続できる `W2`/`W3`/`W4`
+                    まで全体がブロックされているように見える (§6.6 の確認点)。
+                    Repository HEAD のズレは「新しい snapshot を作る」導線、
+                    セッションの snapshot ズレは「このセッションを新しい
+                    snapshot へ移す」導線で、対象が違うため両方出しうるが、
+                    同時に出るのは HEAD が進み、かつ未取り込みのときだけ。 */}
+                {(showProposalWork || showDiffWork) && (
+                  <>
+          {repositoryHeadStale && repositoryStatus && (
+                    <div
+                      className="rounded-md border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 p-3 text-sm text-amber-900 dark:text-amber-100 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"
+                      data-testid="repository-head-stale-banner"
+                    >
+                      <div>
+                        リポジトリの HEAD が最新 snapshot より進んでいます
+                        {repositoryStatus.latest_snapshot && (
+                          <>
+                            {" "}(snapshot {repositoryStatus.latest_snapshot.id}:{" "}
+                            <code>{shortSha(repositoryStatus.latest_snapshot.commit_sha)}</code>
+                            {" "}→ HEAD <code>{shortSha(repositoryStatus.current_head)}</code>)
+                          </>
+                        )}
+                        。新しい snapshot を作成してから、このインタビューを更新してください。
+                      </div>
+                      <Link
+                        to="/repository"
+                        className="inline-flex h-8 items-center justify-center gap-2 whitespace-nowrap rounded-md border border-input bg-background px-3 text-xs font-medium shadow-sm hover:bg-accent hover:text-accent-foreground"
+                      >
+                        <RefreshCw className="h-4 w-4" />
+                        Repository で snapshot 作成
+                      </Link>
+                    </div>
+                  )}
+
+                  {sessionSnapshotStale && latestSnapshot && (
+                    <div
+                      className="rounded-md border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 p-3 text-sm text-amber-900 dark:text-amber-100 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"
+                      data-testid="interview-snapshot-stale-banner"
+                    >
+                      <div>
+                        このインタビューは snapshot {session.snapshot_id} に固定されています。
+                        最新 snapshot {latestSnapshot.id} に更新すると、既存の回答を保持し、
+                        影響を受けた提案だけ再レビューに戻します。
+                      </div>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={rebaseToLatestSnapshot}
+                        disabled={rebaseSnapshot.isPending}
+                        data-testid="rebase-interview-snapshot"
+                      >
+                        <RefreshCw className={`h-4 w-4 mr-1 ${rebaseSnapshot.isPending ? "animate-spin" : ""}`} />
+                        {rebaseSnapshot.isPending ? "更新中..." : "最新 snapshot に更新"}
+                      </Button>
+                    </div>
+                  )}
+
+                  </>
+                )}
+
+                {/* W5 — 提案を承認する。主操作は「この提案を承認する」。
+                    差分生成 (#33「差分を生成」) は OP-S7 として自動化された
+                    ため、そのボタンと前提説明 (#34) / 未生成注記 (#35) は
+                    廃止した (§4.2.1、原則 P3)。 */}
+                {showProposalWork && (
+                <div className="space-y-4" data-testid="work-surface-W5">
                   <Card>
                     <CardHeader>
                       <div className="flex items-center justify-between gap-2">
@@ -2475,32 +2562,13 @@ export default function InterviewPage() {
                           <CardTitle className="text-sm">提案レビュー</CardTitle>
                           <CardDescription>
                             各提案(メタデータ + プローブ計画)を承認・却下・編集してください。
+                            承認が終わると、差分は自動で生成されます。
                           </CardDescription>
                         </div>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={triggerMaterialization}
-                          disabled={materialize.isPending || approvedCount === 0}
-                          title={approvedCount === 0 ? "先に提案を1件以上承認してください" : undefined}
-                        >
-                          <Play className="h-4 w-4 mr-1" />
-                          {materialize.isPending ? "生成中..." : "差分を生成"}
-                        </Button>
                       </div>
                     </CardHeader>
                     <CardContent className="space-y-3">
-                      {approvedCount === 0 && (
-                        <p className="text-xs text-muted-foreground" data-testid="materialize-prerequisite">
-                          差分を生成するには、各提案を確認して少なくとも1件を承認してください。
-                        </p>
-                      )}
-                      {proposals.length === 0 ? (
-                        <div className="text-sm text-muted-foreground" data-testid="no-proposals-yet">
-                          まだ提案はありません。会話から「送信して提案を生成」でレビュー項目を生成してください。
-                          情報が不足している場合は、AIが対象を絞り込むための確認質問を返します。
-                        </div>
-                      ) : proposals.map(proposal => (
+                      {proposals.map(proposal => (
                         <div key={proposal.id} className="rounded-md border p-4 space-y-3" data-testid="interview-proposal-card">
                           <div className="flex items-start justify-between gap-3">
                             <div className="min-w-0">
@@ -2559,7 +2627,15 @@ export default function InterviewPage() {
                       ))}
                     </CardContent>
                   </Card>
+                </div>
+                )}
 
+                {/* W6 — 差分を確認する。主操作は「この差分を確認した」という
+                    判断の記録そのもの (§4.3)。ダウンロード・差分表示・適用
+                    手順は補助操作であり、完了条件を満たさない。
+                    W7 でも差分は参照できるが、そのときは主操作ではない。 */}
+                {(showDiffWork || showTerminal) && diff && (
+                <div className="space-y-4" data-testid={showDiffWork ? "work-surface-W6" : "terminal-diff-reference"}>
                   <Card>
                     <CardHeader>
                       <div className="flex items-center justify-between gap-2">
@@ -2568,13 +2644,13 @@ export default function InterviewPage() {
                           <CardDescription>差分の生成までで停止し、適用は開発者がレビューして行います。</CardDescription>
                         </div>
                         <div className="flex items-center gap-2">
+                          {/* 補助操作 (§4.3): 差分を読むための手段であって、
+                              読んで問題ないと判断した記録ではない。 */}
                           <Button
                             size="sm"
                             variant="outline"
                             onClick={downloadPatch}
-                            disabled={!diff}
                             data-testid="download-patch-button"
-                            title={diff ? undefined : "差分が未生成のためダウンロードできません"}
                           >
                             <Download className="h-4 w-4 mr-1" />
                             .patch をダウンロード
@@ -2583,8 +2659,6 @@ export default function InterviewPage() {
                             size="sm"
                             variant="outline"
                             onClick={() => openDiff(diff, session.id)}
-                            disabled={!diff}
-                            title={diff ? undefined : "先に承認済み提案から差分を生成してください"}
                           >
                             <GitPullRequest className="h-4 w-4 mr-1" />
                             差分を開く
@@ -2593,6 +2667,33 @@ export default function InterviewPage() {
                       </div>
                     </CardHeader>
                     <CardContent className="space-y-3">
+                      {showDiffWork && (
+                        <div
+                          className="rounded-md border border-primary/40 bg-primary/5 p-3 flex flex-wrap items-center gap-3"
+                          data-testid="diff-review-primary-action"
+                        >
+                          <p className="text-sm flex-1 min-w-[16rem]">
+                            差分の内容を確認し、意図どおりであることを記録してください。
+                            この記録が「差分を確認する」の完了条件です。
+                          </p>
+                          <Button
+                            size="sm"
+                            disabled={recordDiffReview.isPending}
+                            data-testid="record-diff-review"
+                            onClick={() =>
+                              recordDiffReview
+                                .mutateAsync({ reviewed_by: actor })
+                                .then(() => toast.success("差分を確認したことを記録しました"))
+                                .catch(e => toast.error(String(e)))
+                            }
+                          >
+                            <CheckCircle className="h-4 w-4 mr-1" />
+                            {recordDiffReview.isPending
+                              ? "記録中..."
+                              : PRIMARY_ACTION_LABELS.record_diff_review}
+                          </Button>
+                        </div>
+                      )}
                       <div className="rounded-md bg-muted/50 p-3 text-xs space-y-1" data-testid="patch-provenance">
                         <p className="font-medium">この差分について</p>
                         <ul className="list-disc pl-4 space-y-0.5 text-muted-foreground">
@@ -2614,18 +2715,12 @@ export default function InterviewPage() {
                           {lastMaterialization.skipped.join("; ")}
                         </div>
                       ) : null}
-                      {diff ? (
-                        <pre className="max-h-[28rem] overflow-auto rounded-md border bg-muted p-3 text-xs whitespace-pre-wrap">
-                          {diff}
-                        </pre>
-                      ) : (
-                        <div className="rounded-md border p-6 text-center text-sm text-muted-foreground">
-                          提案を1件以上承認してから「差分を生成」を押すと、まとめて1つの差分が生成されます。
-                          差分が未生成の間は .patch のダウンロードはできません。
-                        </div>
-                      )}
-                      {diff && (
-                        <>
+                      <pre className="max-h-[28rem] overflow-auto rounded-md border bg-muted p-3 text-xs whitespace-pre-wrap">
+                        {diff}
+                      </pre>
+                      {/* 適用手順は R4: 既定は折りたたみ。接続セットアップ導線は
+                          W7(完了)の主操作なので、そこでのみ強調する。 */}
+                      <>
                           <details className="rounded-md border p-3 text-xs" data-testid="patch-apply-commands">
                             <summary className="cursor-pointer font-medium text-sm">
                               適用手順とコマンド例
@@ -2651,42 +2746,114 @@ git add -p
 git commit`}
                             </pre>
                           </details>
-                          <div
-                            className="rounded-md border border-primary/40 bg-primary/5 p-3 text-sm flex items-start gap-2"
-                            data-testid="setup-guide-next-action"
-                          >
-                            <LifeBuoy className="h-4 w-4 mt-0.5 shrink-0" />
-                            <div>
-                              <p className="font-medium">次のステップ: 監視対象の設定と疎通確認</p>
-                              <p className="text-xs text-muted-foreground mt-0.5">
-                                patch の適用だけでは監視は始まりません。監視対象側の環境変数・トークン・接続先の設定と、
-                                trace が届くことの確認が必要です。
-                              </p>
-                              <Link
-                                className="inline-flex items-center text-sm underline mt-1"
-                                to={`/setup-guide?session=${session.id}`}
-                              >
-                                接続セットアップガイドを開く(このセッションの文脈付き)
-                              </Link>
-                            </div>
-                          </div>
+                          {/* 完了終端の主操作「接続セットアップへ進む」は
+                              終端カードが 1 つだけ持つ (§5.4)。差分カード側に
+                              同じ導線を置いていたのを廃止した (原則 P7)。 */}
                         </>
-                      )}
-                      {session.materialization_ref && (
-                        <a className="inline-flex items-center text-sm underline" href={session.materialization_ref} target="_blank" rel="noreferrer">
-                          <FileCode className="h-4 w-4 mr-1" />
-                          Materialization リファレンスを開く
-                        </a>
-                      )}
                     </CardContent>
                   </Card>
-                </>
-              )}
-                </TabsContent>
-              </Tabs>
+                </div>
+                )}
+
+                {/* W7 — 結果と残りを確認する。主操作は終端ごとに 1 つ
+                    (§5.4)。「接続セットアップへ進む」を W7 全体に置くと、
+                    中断・引き継ぎ終端で意味を成さない操作が主操作になる。 */}
+                {showTerminal && workflow && (
+                <div className="space-y-4" data-testid="work-surface-W7">
+                  <Card data-testid="terminal-card" data-terminal-kind={workflow.terminal_kind ?? ""}>
+                    <CardHeader>
+                      <CardTitle className="text-sm">
+                        {workflow.terminal_kind === "completed"
+                          ? "このセッションは完了しました"
+                          : workflow.terminal_kind === "handoff"
+                            ? "引き継ぎの回答を待っています"
+                            : "このセッションは中断しています"}
+                      </CardTitle>
+                      <CardDescription>
+                        {workflow.terminal_kind === "completed"
+                          ? "生成された差分を確認済みです。適用と接続確認へ進めます。"
+                          : workflow.terminal_kind === "handoff"
+                            ? "あなた側でできることは残っていません。引き継ぎ先の回答後、確定は明示操作で行います。"
+                            : "ここまでの回答・確定・承認は保持されています。再開すると続きから評価し直します。"}
+                      </CardDescription>
+                    </CardHeader>
+                    <CardContent className="space-y-3 text-sm">
+                      <ul className="list-disc pl-4 space-y-0.5 text-muted-foreground text-xs">
+                        <li>承認済みの提案: {wFacts?.approved_proposal_count ?? 0} 件</li>
+                        <li>引き継ぎ待ち: {wFacts?.pending_handoff_count ?? 0} 件</li>
+                        <li>未対応の確認項目: {wFacts?.outstanding_alignment_items ?? 0} 件</li>
+                      </ul>
+                      <div className="flex flex-wrap gap-2">
+                        {workflow.terminal_kind === "completed" && (
+                          <Link
+                            className="inline-flex h-9 items-center justify-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground"
+                            to={`/setup-guide?session=${session.id}`}
+                            data-testid="terminal-primary-action"
+                          >
+                            <LifeBuoy className="h-4 w-4" />
+                            {PRIMARY_ACTION_LABELS.open_connection_setup}
+                          </Link>
+                        )}
+                        {workflow.terminal_kind === "handoff" && (
+                          <Button
+                            size="sm"
+                            data-testid="terminal-primary-action"
+                            onClick={() => {
+                              document
+                                .querySelector('[data-testid="handoff-list-panel"]')
+                                ?.scrollIntoView({ behavior: "smooth", block: "center" });
+                            }}
+                          >
+                            {PRIMARY_ACTION_LABELS.view_handoff_status}
+                          </Button>
+                        )}
+                        {workflow.terminal_kind === "suspended" && (
+                          <Button
+                            size="sm"
+                            data-testid="terminal-primary-action"
+                            disabled={reopenSession.isPending || !wFacts?.session_closed}
+                            onClick={() =>
+                              reopenSession
+                                .mutateAsync({ actor })
+                                .then(() => toast.success("セッションを再開しました"))
+                                .catch(e => toast.error(String(e)))
+                            }
+                          >
+                            {PRIMARY_ACTION_LABELS.resume_session}
+                          </Button>
+                        )}
+                        {/* 補助操作: 完了 / 引き継ぎ / 中断は排他的な終端なので、
+                            まだ閉じていないセッションだけ明示的に終端へ移せる。 */}
+                        {!wFacts?.session_closed && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            data-testid="terminal-close-session"
+                            disabled={closeSession.isPending}
+                            onClick={() => void leaveSafely(
+                              (wFacts?.pending_handoff_count ?? 0) > 0 ? "handoff" : "suspended",
+                            )}
+                          >
+                            このセッションを終える
+                          </Button>
+                        )}
+                      </div>
+                    </CardContent>
+                  </Card>
+                </div>
+                )}
+              </>
             </div>
 
-            {/* サイド: 理解の内容・セッション情報(補助的な表示) */}
+            {/* サイド: 判断に必要な根拠 (R3) と、必要時に開く詳細 (R4)。
+                履歴・監査・診断 (R6) は §3.6 の共通入口へ集約した。
+
+                §3.3 のマトリクスどおり、各パネルは「その状態の判断に要る」
+                ときだけ描く。とくに `W1` では、現在地カードが「操作は不要」
+                と言っている横で実行中処理の入力 (Intent・Q&A・まとめて修正)
+                を書き換えられてはならない -- 走っている理解更新や突き合わせ
+                と競合するうえ、原則 P1/P3 にも反する。R6 の履歴入口だけは
+                状態に依存せず常に開ける (§3.6)。 */}
             <div className="space-y-4">
               <Card>
                 <CardHeader>
@@ -2696,74 +2863,46 @@ git commit`}
                   </CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-3 text-sm">
-                  <div className="grid grid-cols-3 gap-2">
-                    <div className="rounded-md border p-2">
-                      <div className="text-lg font-semibold">{proposals.length}</div>
-                      <div className="text-xs text-muted-foreground">提案</div>
-                    </div>
-                    <div className="rounded-md border p-2">
-                      <div className="text-lg font-semibold">{approvedCount}</div>
-                      <div className="text-xs text-muted-foreground">承認済み</div>
-                    </div>
-                    <div className="rounded-md border p-2">
-                      <div className="text-lg font-semibold">{pendingCount}</div>
-                      <div className="text-xs text-muted-foreground">未処理</div>
-                    </div>
-                  </div>
-                  {contextPack && (
-                    <div className="rounded-md border p-3 space-y-2">
-                      <div className="flex items-center justify-between">
-                        <span className="font-medium">コンテキストパック</span>
-                        <Badge variant={contextPack.truncated ? "warning" : "secondary"}>
-                          {contextPack.budget_used_chars.toLocaleString()} chars
-                        </Badge>
-                      </div>
-                      <div className="text-xs text-muted-foreground">
-                        {contextPack.total_symbols} symbols · {contextPack.total_entrypoints} entrypoints ·{" "}
-                        {contextPack.unclassified_count} 未分類
-                      </div>
-                    </div>
+                  {/* R4 (#44): 回答可能領域は `W3` の判断にだけ関わる詳細。 */}
+                  {showQuestionWork && (
+                    <AnswerableAreasControl sessionId={session.id} answerableAreas={session.answerable_areas} />
                   )}
-                  <AnswerableAreasControl sessionId={session.id} answerableAreas={session.answerable_areas} />
+                  {!showQuestionWork && (
+                    <p className="text-xs text-muted-foreground">
+                      Snapshot {session.snapshot_id} に固定されたセッションです。
+                    </p>
+                  )}
                 </CardContent>
               </Card>
 
+              {/* 現在の理解: `W2` では主作業カードが要点と確認操作を持つので
+                  ここには出さない (§3.5 の重複解消)。`W3`〜`W7` では判断の
+                  背景 (R3/R4) として参照できる。 */}
+              {wState !== "W1" && wState !== "W2" && (
               <Card>
                 <CardHeader>
                   <div className="flex items-center justify-between gap-2">
                     <div>
                       <CardTitle className="text-sm flex items-center gap-2">
                         <Layers className="h-4 w-4" /> 現在の理解
-                        <RefreshStatusChip sessionId={selectedSessionId} />
                       </CardTitle>
                       <CardDescription>
                         ドキュメントとコード分析から構築したシステム理解。通常は回答後に自動で更新されます。
                       </CardDescription>
                     </div>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={refreshUnderstanding}
-                      disabled={building || !canRefreshUnderstanding}
-                      title={refreshBlockedUntilAnswerRevision
-                        ? "新しい回答(修正・追加回答)がある場合にのみ、理解を再構築できます"
-                        : "通常は回答後に自動で更新されます。障害復旧・診断用の手動更新です"}
-                    >
-                      <Sparkles className="h-4 w-4 mr-1" />
-                      {updateUnderstanding.isPending ? "分析中..." : "理解を更新"}
-                    </Button>
+                    {/* #47 「理解を更新」 / #21 「理解を構築」 は通常フローでは
+                        出さない (`OP-S1`/`OP-S2` は自動)。失敗時の再試行は
+                        `WorkflowExceptions` の 1 枚のカードが持つ -- 失敗内容・
+                        影響・復旧条件・再試行を同じ枠にまとめる (§4.4) 規則
+                        なので、ここに 2 つ目の再試行ボタンは置かない (P7)。
+                        #48 の「更新できない理由」説明文も、ボタンを出さない
+                        以上不要なので廃止した (原則 P3)。 */}
                   </div>
-                  {refreshBlockedUntilAnswerRevision && (
-                    <p
-                      className="mt-2 text-xs text-muted-foreground"
-                      data-testid="understanding-refresh-blocked-reason"
-                    >
-                      理解は確認済みです。次は提案を生成またはレビューしてください。内容を変える場合は、回答を修正するか、未回答の質問に新しく回答すると理解を更新できます。
-                    </p>
-                  )}
                 </CardHeader>
                 <CardContent>
-                  {session.last_error && (
+                  {/* #49 `last_error`: 現在も主作業をブロック/劣化させている
+                      ときだけ出す (§5.3-4)。解消済みの過去エラーは履歴へ。 */}
+                  {session.last_error && (workflow?.unresolved_failures.length ?? 0) > 0 && (
                     <div className="rounded-md border border-destructive bg-destructive/10 p-3 mb-3 text-sm text-destructive flex items-start gap-2">
                       <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
                       <div>
@@ -2782,31 +2921,142 @@ git commit`}
                   )}
                 </CardContent>
               </Card>
+              )}
 
-              {/* PR #296 review restructure: Review Queue now lives only in
-                  the main "Alignment Review" tab above (never duplicated
-                  here) -- the sidebar keeps Intent Brief editing and the
-                  other supporting panels. */}
-              <IntentBriefPanel sessionId={session.id} />
+              {/* Intent Brief (#51a/#51b): 確定・訂正は `W2` 完了時と `W4`。 */}
+              {(showUnderstandingWork || showAlignmentWork) && (
+                <IntentBriefPanel sessionId={session.id} />
+              )}
 
-              <HandoffListPanel sessionId={session.id} actor={actor} />
+              {/* 引き継ぎ待ちの一覧 (#53, R3): `W3` と `W7` で、待ち項目が
+                  あるときだけ意味を持つ。 */}
+              {(showQuestionWork || showTerminal) && (
+                <HandoffListPanel sessionId={session.id} actor={actor} />
+              )}
 
-              <ObservationProposalPanel sessionId={session.id} />
+              {/* 新規観測の提案 (#55): 採否は `W7` の判断 (`OP-D11`)。 */}
+              {showTerminal && <ObservationProposalPanel sessionId={session.id} />}
 
-              <ChangeSetPanel sessionId={session.id} />
+              {/* まとめて修正 (#57, R2 補助): `W2` / `W3` / `W4` の訂正手段。 */}
+              {(showUnderstandingWork || showQuestionWork || showAlignmentWork) && (
+                <ChangeSetPanel sessionId={session.id} />
+              )}
 
-              <UnderstandingDiffPanel
-                sessionId={session.id}
-                answerRevisionReflected={answerRevisionReflected}
-              />
+              {/* Q&A 一覧 (#59a, R4): 現在の 1 問は主作業カードが持つ。一覧は
+                  `W3` の詳細で、履歴 (#59b) は R6 の入口にある。 */}
+              {showQuestionWork && (
+                <QaPanel
+                  sessionId={session.id}
+                  actor={actor}
+                  approvedCount={approvedCount}
+                  answerableAreas={session.answerable_areas}
+                  investigate={qaAutoInvestigate}
+                  showRecoveryActions={auxiliaryProcessFailed}
+                />
+              )}
 
-              <QaPanel
-                sessionId={session.id}
-                actor={actor}
-                approvedCount={approvedCount}
-                answerableAreas={session.answerable_areas}
-                investigate={qaAutoInvestigate}
-              />
+              {/* R6 — 履歴と監査情報 (§3.6)。主フローの各状態には常設せず、
+                  状態に依存しない 1 つの入口からのみ到達する。中身は固定の
+                  並び順で、Interview UX 評価指標 (#341) もこの中に置く。
+                  入口は常に開ける (前提未達でも消さない)。 */}
+              <details className="rounded-md border p-3" data-testid="history-audit-entry">
+                <summary className="cursor-pointer text-sm font-medium">
+                  履歴と監査情報
+                </summary>
+                <div className="mt-3 space-y-4">
+                  <section className="space-y-2" data-testid="history-conversation-log">
+                    <h3 className="text-xs font-semibold text-muted-foreground">会話ログ</h3>
+                    {session.messages.length === 0 ? (
+                      <p className="text-xs text-muted-foreground">まだありません。</p>
+                    ) : (
+                      <div className="space-y-2 max-h-[20rem] overflow-y-auto pr-1">
+                        {session.messages.map(m => (
+                          <div key={m.id} className="rounded-md border p-2 text-xs">
+                            <div className="flex items-center justify-between gap-2 mb-1">
+                              <Badge variant={m.role === "assistant" ? "secondary" : "outline"}>
+                                {m.role}
+                              </Badge>
+                              <span className="text-muted-foreground">
+                                {formatTimestamp(m.created_at)}
+                              </span>
+                            </div>
+                            <p className="whitespace-pre-wrap break-words">{m.content}</p>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </section>
+
+                  <UnderstandingDiffPanel
+                    sessionId={session.id}
+                    answerRevisionReflected={answerRevisionReflected}
+                  />
+
+                  <section className="space-y-2" data-testid="history-session-stats">
+                    <h3 className="text-xs font-semibold text-muted-foreground">
+                      セッション統計 / コンテキストパック
+                    </h3>
+                    <div className="grid grid-cols-3 gap-2">
+                      <div className="rounded-md border p-2">
+                        <div className="text-lg font-semibold">{proposals.length}</div>
+                        <div className="text-xs text-muted-foreground">提案</div>
+                      </div>
+                      <div className="rounded-md border p-2">
+                        <div className="text-lg font-semibold">{approvedCount}</div>
+                        <div className="text-xs text-muted-foreground">承認済み</div>
+                      </div>
+                      <div className="rounded-md border p-2">
+                        <div className="text-lg font-semibold">{pendingCount}</div>
+                        <div className="text-xs text-muted-foreground">未処理</div>
+                      </div>
+                    </div>
+                    {contextPack ? (
+                      <div className="rounded-md border p-3 space-y-2 text-xs">
+                        <div className="flex items-center justify-between">
+                          <span className="font-medium">コンテキストパック</span>
+                          <Badge variant={contextPack.truncated ? "warning" : "secondary"}>
+                            {contextPack.budget_used_chars.toLocaleString()} chars
+                          </Badge>
+                        </div>
+                        <div className="text-muted-foreground">
+                          {contextPack.total_symbols} symbols · {contextPack.total_entrypoints} entrypoints ·{" "}
+                          {contextPack.unclassified_count} 未分類
+                        </div>
+                      </div>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">まだありません。</p>
+                    )}
+                  </section>
+
+                  <section className="space-y-2" data-testid="history-process-runs">
+                    <h3 className="text-xs font-semibold text-muted-foreground">
+                      システム処理の実行履歴
+                    </h3>
+                    <ProcessRunHistory sessionId={session.id} />
+                  </section>
+
+                  <InterviewMetricsPanel />
+
+                  <section className="space-y-2" data-testid="history-materialization-ref">
+                    <h3 className="text-xs font-semibold text-muted-foreground">
+                      Materialization リファレンス
+                    </h3>
+                    {session.materialization_ref ? (
+                      <a
+                        className="inline-flex items-center text-sm underline"
+                        href={session.materialization_ref}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        <FileCode className="h-4 w-4 mr-1" />
+                        リファレンスを開く
+                      </a>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">まだありません。</p>
+                    )}
+                  </section>
+                </div>
+              </details>
             </div>
           </div>
 

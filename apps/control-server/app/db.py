@@ -4059,6 +4059,153 @@ CREATE TABLE IF NOT EXISTS cell_shadow_decisions (
 
 CREATE INDEX IF NOT EXISTS idx_cell_shadow_decisions_improvement
     ON cell_shadow_decisions (system_id, improvement_id, id DESC);
+
+-- ---------------------------------------------------------------------------
+-- State-driven System Interview workflow (Issue #349, implementing the
+-- docs/system-interview-workflow-ux.md spec written by Issue #342/#343-#346).
+--
+-- These five tables are exactly the four persisted facts §8.1 declares
+-- missing (A: diff review completion, B: system-process running/failure
+-- records, C: reached_state + backward requests, D: acknowledgement of a
+-- backward request) plus the manual audit record for OP-D14
+-- (suspend/handoff/resume, which reuses the existing interview_session
+-- `status` rather than adding a state fact of its own).
+--
+-- None of them add or relax a human gate: A and D are developer decisions
+-- recorded with `decision_method = 'manual'`; B and C are system-recorded
+-- progress facts. They exist so the displayed workflow state is derivable
+-- from persisted facts alone (spec principle P9) and survives a reload.
+
+-- Fact A: the developer explicitly recorded "I reviewed this diff".
+-- `diff_materialized_at` is the identity of the reviewed diff (the
+-- interview_session.materialized_at value at review time); a newly generated
+-- diff gets a new timestamp, so a previous completion record never carries
+-- over to it (spec §2.3 W6). Download/摘要表示 never write this row.
+CREATE TABLE IF NOT EXISTS interview_diff_review (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id           INTEGER NOT NULL,
+    system_id            INTEGER NOT NULL,
+    diff_materialized_at REAL NOT NULL,
+    diff_digest          TEXT NOT NULL DEFAULT '',
+    reviewed_by          TEXT NOT NULL DEFAULT '',
+    decision_method      TEXT NOT NULL DEFAULT 'manual'
+                             CHECK (decision_method = 'manual'),
+    note                 TEXT NOT NULL DEFAULT '',
+    created_at           REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_interview_diff_review_session
+    ON interview_diff_review (session_id, id DESC);
+
+-- Fact B: one row per run of a process that can put the screen into `W1`.
+-- `process_kind` is a finite set (see app/interview_workflow.py
+-- PROCESS_KINDS); `failure_class` and `target_state` are only set on a
+-- failed run, and `target_state` is restricted to the spec's finite
+-- blocking set W2 / W4 / W5. A blocking failure counts as unresolved until a
+-- later run of the same kind succeeds -- derived, never stored, so a success
+-- anywhere (manual retry or automatic refresh) resolves it identically.
+CREATE TABLE IF NOT EXISTS interview_process_run (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id     INTEGER NOT NULL,
+    system_id      INTEGER NOT NULL,
+    process_kind   TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'running'
+                       CHECK (status IN ('running', 'succeeded', 'failed')),
+    failure_class  TEXT CHECK (failure_class IN ('blocking', 'degraded')),
+    target_state   TEXT CHECK (target_state IN ('W2', 'W4', 'W5')),
+    error          TEXT,
+    started_at     REAL NOT NULL,
+    heartbeat_at   REAL,
+    finished_at    REAL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_interview_process_run_session
+    ON interview_process_run (session_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_interview_process_run_status
+    ON interview_process_run (session_id, status);
+
+-- Fact C part 1: the session's current workflow checkpoint. NOT an all-time
+-- monotonic maximum -- it moves backward only when the developer
+-- acknowledges a backward request (fact D). Only ordered states (W2..W7) are
+-- ever stored here; W0-A / W0-B / W1 carry no workflow position.
+CREATE TABLE IF NOT EXISTS interview_workflow_checkpoint (
+    session_id    INTEGER PRIMARY KEY,
+    system_id     INTEGER NOT NULL,
+    reached_state TEXT NOT NULL CHECK (
+        reached_state IN ('W2', 'W3', 'W4', 'W5', 'W6', 'W7')
+    ),
+    updated_at    REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+-- Fact C part 2: a recorded backward request. Created by the system when the
+-- first-match rule table picks a candidate state EARLIER than reached_state.
+-- While one is `pending`, the displayed state stays at reached_state
+-- (spec §2.2 stage 2). `resolved` is the system-only outcome when the facts
+-- move forward again on their own; `acknowledged` requires fact D.
+CREATE TABLE IF NOT EXISTS interview_back_request (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      INTEGER NOT NULL,
+    system_id       INTEGER NOT NULL,
+    cause_kind      TEXT NOT NULL,
+    candidate_state TEXT NOT NULL,
+    reached_state   TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending', 'acknowledged', 'resolved')),
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_interview_back_request_session
+    ON interview_back_request (session_id, id DESC);
+
+-- Fact D: the developer's explicit acknowledgement of ONE backward request.
+-- Deliberately a separate table from fact C: "interrupt what I am doing and
+-- go back" is a developer decision, not an observed progress fact, and an
+-- acknowledgement is never reused for a later request (spec §2.2 stage 2-5).
+CREATE TABLE IF NOT EXISTS interview_back_acknowledgement (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    back_request_id INTEGER NOT NULL UNIQUE,
+    session_id      INTEGER NOT NULL,
+    system_id       INTEGER NOT NULL,
+    actor           TEXT NOT NULL DEFAULT '',
+    decision_method TEXT NOT NULL DEFAULT 'manual'
+                        CHECK (decision_method = 'manual'),
+    created_at      REAL NOT NULL,
+    FOREIGN KEY (back_request_id) REFERENCES interview_back_request (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+-- OP-D14 audit: suspending / handing off / resuming a session flips the
+-- existing interview_session.status between 'closed' and 'open'. That is a
+-- developer decision, so it carries a manual audit record. It adds NO new
+-- state-decision fact -- rule row 3 reads `status` directly.
+CREATE TABLE IF NOT EXISTS interview_session_status_audit (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      INTEGER NOT NULL,
+    system_id       INTEGER NOT NULL,
+    action          TEXT NOT NULL CHECK (action IN ('close', 'reopen')),
+    terminal_kind   TEXT CHECK (terminal_kind IN ('suspended', 'handoff')),
+    reason          TEXT NOT NULL DEFAULT '',
+    actor           TEXT NOT NULL DEFAULT '',
+    decision_method TEXT NOT NULL DEFAULT 'manual'
+                        CHECK (decision_method = 'manual'),
+    created_at      REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_interview_session_status_audit_session
+    ON interview_session_status_audit (session_id, id DESC);
 """
 
 

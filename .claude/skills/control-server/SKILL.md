@@ -814,6 +814,73 @@ Rules for any new artifact:
   before `generate_text` on a mock/non-reasoning client, so any test that
   must reach the LLM path has to configure a real reasoning model
   (`openai`/`o3`) and stub `llm._request_json`.
+- The System Interview's developer-facing state is decided in exactly ONE
+  place: `app/interview_workflow.py` (Issue #349, implementing
+  `docs/system-interview-workflow-ux.md`). `evaluate_candidate_state` is the
+  13-row first-match table; `apply_backward_hold` is the ordered-state
+  (`W2 < W3 < W4 < W5 < W6 < W7`) backward hold. Both are pure functions of a
+  `WorkflowFacts` value — no clock, no request-scoped value, no client state
+  — so the same persisted facts always yield the same state. Add a new input
+  by adding a field to `WorkflowFacts` and reading it in `gather_facts`;
+  never branch on something a reload would lose.
+  - Any process that should show 「システムが調べている」 (`W1`) must persist a
+    run record via `process_run` / `ProcessRunTracker` / `tracked_process`.
+    They open short-lived connections only, so they are safe around an LLM
+    call — but the tracked function must still own its own connections.
+  - A 404/409 precondition rejection is `abandon()` (nothing ran), not a
+    failure. Recording it would surface a retry the developer cannot succeed
+    at. A deliberate skip (the Runtime Reality Check's finite skip condition)
+    is likewise not a run.
+  - Failure classification is deterministic and lives in `classify_failure`:
+    it depends on the material left behind (`E3-a` vs `E3-b`, `E4-a` vs
+    `E4-b`), not on which process failed. `target_state` is the finite set
+    `W2` / `W4` / `W5`; nothing else may be blocked.
+  - "Unresolved" is derived (no later success of the same `process_kind`),
+    never stored. `OP-D14` suspend/resume therefore cannot turn a failure
+    into a solved one — it only flips the existing session `status` and adds
+    an `interview_session_status_audit` row.
+  - `W0-B` completes by "session created AND the system started
+    investigating", so `POST /interview/sessions` opens the initial build's
+    run record itself AND dispatches the build. Leaving either half to a
+    second client call is a bug: without the record, a reload in between
+    produces a session that falls through the whole rule table to `W7` — a
+    terminal with no way back, because every build control is exception-only;
+    without the dispatch, the record describes a process nobody is running,
+    and an API-only or closed-tab session shows 「システムが調べている」
+    forever. The worker adopts that exact record
+    (`ProcessRunTracker.start(adopt_run_id=...)`), a dispatch that cannot
+    start is failed on the spot as a recoverable `E3-a`, and
+    `PROBE_INTERVIEW_EAGER_INITIAL_BUILD=1` makes it synchronous for tests.
+    Because the server starts the build, the client must NOT also post
+    `update-understanding` — that runs the same reasoning build twice.
+  - `adopt_run_id` names ONE record. "The oldest running row of this kind"
+    lets two legitimately overlapping rebuilds (a manual update while the
+    automatic refresh is in flight) share a row, so whichever finishes last
+    decides for both and can erase the other's failure.
+  - Resolution of a failure reads the LATEST finished run per `process_kind`
+    (`finished_at`, id as tiebreak), not "any later success": two runs of a
+    kind can overlap and the one that started first can finish last, and with
+    three or more an older success would mask the newest failure.
+  - `tests/conftest.py` stubs `_dispatch_initial_understanding_build` for
+    every test — otherwise every test that creates a session starts an
+    unbounded reasoning call on a daemon thread, racing its own writes.
+    `test_interview_workflow.py`'s `real_initial_build_dispatch` fixture puts
+    the real one back for the two tests that assert on the dispatch.
+  - The stale sweep is a GUESS from elapsed time (nothing writes
+    `heartbeat_at` while a process runs), so `finish_process_run` still
+    accepts a swept run and lets its real outcome replace the guess.
+  - A suspended session (rule row 3) never auto-resolves a pending backward
+    request: `W7` there means "the developer left", not "the backward
+    question was settled", and §5.4 requires resuming to acknowledge it.
+  - `open_required_questions` must exclude questions held by an in-flight
+    handoff. Handing off deliberately leaves `interview_qa.status` alone, so
+    the status column alone cannot express 「引き継ぎ済み」 (spec §2.3 `W3`).
+  - `routes/interview_workflow.py` writes exactly two developer decisions
+    (the diff review and the backward acknowledgement, both
+    `decision_method: manual`) and two system-recorded progress facts (the
+    `reached_state` checkpoint and the backward request). It confirms no
+    understanding, settles no Alignment item, approves no proposal, applies
+    no diff, and starts no observation.
 - Additive nullable columns go through `db.py`'s `_add_column_if_missing`
   (Issue #308). It only ever adds a nullable column and never backfills, so
   do not use it for NOT NULL/DEFAULT migrations that need a value written

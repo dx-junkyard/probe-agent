@@ -32,6 +32,7 @@ from .routes import (
     interview_metrics,
     interview_observation,
     interview_refresh,
+    interview_workflow,
     joint_understanding,
     probe_patterns,
     project_intelligence,
@@ -119,6 +120,7 @@ def create_app() -> FastAPI:
     app.include_router(interview_handoff.router, dependencies=_auth)
     app.include_router(interview_observation.router, dependencies=_auth)
     app.include_router(interview_refresh.router, dependencies=_auth)
+    app.include_router(interview_workflow.router, dependencies=_auth)
     app.include_router(interview_change_sets.router, dependencies=_auth)
     app.include_router(question_router.router, dependencies=_auth)
     app.include_router(joint_understanding.router, dependencies=_auth)

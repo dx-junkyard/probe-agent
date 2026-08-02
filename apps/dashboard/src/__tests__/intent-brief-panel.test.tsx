@@ -183,21 +183,20 @@ describe("IntentBriefPanel", () => {
     });
   });
 
-  test("AI propose button calls the propose endpoint", async () => {
-    const listing: InterviewIntentListOut = { session_id: 1, system_id: 1, items_by_field: emptyGroups() };
+  // Issue #349 (#52 / `OP-S4`): Intent 候補の生成は自動処理なので、通常
+  // フローの操作としては置かない。確定・訂正は人間のまま (#284)。
+  test("AI提案の生成ボタンは通常フローに常設しない", async () => {
+    const listing: InterviewIntentListOut = {
+      session_id: 1, system_id: 1, items_by_field: { ...emptyGroups() },
+    };
     mockApi.get.mockResolvedValue(listing);
-    mockApi.post.mockResolvedValue([]);
 
     const { IntentBriefPanel } = await import(
       "@/components/system-understanding/intent-brief-panel"
     );
     render(<IntentBriefPanel sessionId={1} />, { wrapper: createWrapper() });
 
-    const button = await screen.findByTestId("intent-propose-button");
-    fireEvent.click(button);
-
-    await waitFor(() => {
-      expect(mockApi.post).toHaveBeenCalledWith("/interview/sessions/1/intent/propose");
-    });
+    await screen.findByTestId("intent-brief-panel");
+    expect(screen.queryByTestId("intent-propose-button")).toBeNull();
   });
 });

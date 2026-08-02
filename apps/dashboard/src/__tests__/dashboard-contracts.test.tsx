@@ -2113,18 +2113,65 @@ function interviewProposal() {
   };
 }
 
+// Issue #349: the canonical workflow-state response. The interview page
+// renders the state THIS returns -- it never derives one client-side -- so
+// every interview test declares which developer-facing state it is
+// exercising instead of relying on incidental client state.
+function interviewWorkflowState(overrides: Record<string, unknown> = {}) {
+  const facts = {
+    has_snapshot: true,
+    has_session: true,
+    session_closed: false,
+    running_process_kinds: [],
+    blocking_failure_states: [],
+    understanding_unconfirmed: false,
+    open_required_questions: 0,
+    outstanding_alignment_items: 0,
+    proposals_needing_review: 0,
+    proposals_generatable: false,
+    approved_proposal_count: 0,
+    diff_matches_approval_set: false,
+    diff_review_complete: false,
+    pending_handoff_count: 0,
+    ...((overrides.facts as Record<string, unknown>) ?? {}),
+  };
+  return {
+    system_id: 1,
+    session_id: 7,
+    state: "W5",
+    candidate_state: "W5",
+    rule_row: 11,
+    reached_state: "W5",
+    backward_hold: false,
+    pending_back_request: null,
+    terminal_kind: null,
+    primary_action: "approve_proposal",
+    running_processes: [],
+    unresolved_failures: [],
+    exceptions: [],
+    diff_materialized_at: null,
+    latest_ready_snapshot_id: 42,
+    ...overrides,
+    facts,
+  };
+}
+
 function mockInterviewApi(options: {
   approvedCount?: number;
   session?: Record<string, unknown>;
   proposals?: unknown[];
   understandingDiff?: Record<string, unknown>;
   qaList?: Record<string, unknown>;
+  workflow?: Record<string, unknown>;
 } = {}) {
   const session = interviewSession(options.session ?? {});
   const proposal = interviewProposal();
   const proposals = options.proposals ?? [proposal];
   const approvedCount = options.approvedCount ?? 0;
+  const workflow = interviewWorkflowState(options.workflow ?? {});
   mockApi.get.mockImplementation((path: string) => {
+    if (path.startsWith("/interview/workflow-state")) return Promise.resolve(workflow);
+    if (path === "/interview/sessions/7/process-runs") return Promise.resolve([]);
     if (path === "/interview/sessions/7/understanding-diff") {
       return Promise.resolve(options.understandingDiff ?? null);
     }
@@ -2311,19 +2358,34 @@ describe("Interview page", () => {
     });
   });
 
-  test("runtime reality check trigger is reachable with zero Q&A rows (Issue #135)", async () => {
-    // Approved elements exist but no questions yet — the most useful moment
-    // for the first reality check. The trigger must not be hidden behind an
-    // empty Q&A list.
+  test("実態チェックの手動トリガーは、その処理が失敗しているときだけ現れる (Issue #349 / #61)", async () => {
+    // `OP-S8` は §4.2.2 の決定的条件で自動実行される処理なので、通常時に
+    // 手動トリガーを常設しない (原則 P3 / §5.3-1)。処理そのものが失敗した
+    // ときにだけ、同じ処理の再試行として現れる。
+    const qaList = {
+      session_id: 7,
+      system_id: 1,
+      items: [{
+        id: 3, session_id: 7, system_id: 1,
+        question_text: "この計測でよいですか?",
+        question_category: "runtime", question_source: "runtime",
+        hypothesis: null, evidence_refs: [], runtime_evidence: null,
+        answer_text: null, status: "open", answered_by: null,
+        superseded_by_id: null, created_at: 1, answered_at: null,
+        knowledge_area: null, handoff_id: null, investigation: null,
+        revisions: [],
+      }],
+      open_count: 1,
+      high_priority_open_count: 0,
+      answers_revised_at: null,
+    };
     mockInterviewApi({
       approvedCount: 1,
-      qaList: {
-        session_id: 7,
-        system_id: 1,
-        items: [],
-        open_count: 0,
-        high_priority_open_count: 0,
-        answers_revised_at: null,
+      qaList,
+      workflow: {
+        state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3",
+        primary_action: "submit_answer",
+        facts: { open_required_questions: 1 },
       },
     });
 
@@ -2331,16 +2393,49 @@ describe("Interview page", () => {
       defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
     });
     const { default: InterviewPage } = await import("@/pages/interview");
-    render(
+    const { unmount } = render(
       <QueryClientProvider client={qc}>
         <MemoryRouter initialEntries={["/interview?session=7"]}>
           <InterviewPage />
         </MemoryRouter>
       </QueryClientProvider>,
     );
+    await screen.findByTestId("qa-panel");
+    expect(screen.queryByTestId("run-runtime-reality-check")).toBeNull();
+    unmount();
 
-    const button = await screen.findByTestId("run-runtime-reality-check");
-    expect(button).toBeEnabled();
+    mockInterviewApi({
+      approvedCount: 1,
+      qaList,
+      workflow: {
+        state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3",
+        primary_action: "submit_answer",
+        facts: { open_required_questions: 1 },
+        unresolved_failures: [{
+          id: 4, session_id: 7, system_id: 1,
+          process_kind: "runtime_reality_check", status: "failed",
+          failure_class: "degraded", target_state: null,
+          error: "LLM 呼び出しに失敗", started_at: 1, finished_at: 2,
+        }],
+        exceptions: [{
+          code: "E14", severity: "degraded", target_state: null,
+          message: "処理に失敗しました。", detail: "LLM 呼び出しに失敗",
+          recovery_process_kind: "runtime_reality_check",
+          recovery_condition: "同じ処理の再試行が成功すると解消します。",
+        }],
+      },
+    });
+    const qc2 = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc2}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByTestId("run-runtime-reality-check")).toBeEnabled();
   });
 
   test("shows understanding diff summary and expandable detail (Issue #136)", async () => {
@@ -2422,7 +2517,7 @@ describe("Interview page", () => {
     expect(within(panel).getByText("比較対象となる前のリビジョンがありません(初回の理解構築です)。")).toBeInTheDocument();
   });
 
-  test("shows 'your answer correction was reflected' after rebuilding from a revised answer (Issue #136)", async () => {
+  test("E3-a の復旧で理解を再構築すると、回答修正の反映が示される (Issue #136 / #349)", async () => {
     mockInterviewApi({
       session: { answers_revised_at: 123, understanding_update_available: true },
       understandingDiff: {
@@ -2432,6 +2527,18 @@ describe("Interview page", () => {
         to_revision_id: 2,
         has_previous: true,
         sections: [],
+      },
+      workflow: {
+        state: "W2", candidate_state: "W2", rule_row: 5, reached_state: "W2",
+        primary_action: "confirm_understanding",
+        facts: { blocking_failure_states: ["W2"] },
+        exceptions: [{
+          code: "E3-a", severity: "blocking", target_state: "W2",
+          message: "システム理解を構築できず、代わりに提示できる質問もありません。",
+          detail: null,
+          recovery_process_kind: "understanding_build",
+          recovery_condition: "再試行が成功すると通常フローへ戻ります。",
+        }],
       },
     });
     mockApi.post.mockImplementation((path: string) => {
@@ -2457,49 +2564,97 @@ describe("Interview page", () => {
       </QueryClientProvider>,
     );
 
-    const refreshButton = await screen.findByRole("button", { name: /理解を更新/ });
-    expect(refreshButton).not.toBeDisabled();
-    fireEvent.click(refreshButton);
-
+    fireEvent.click(await screen.findByTestId("workflow-retry-understanding_build"));
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith("/interview/sessions/7/update-understanding", {});
     });
+    fireEvent.click(await screen.findByTestId("history-audit-entry"));
     expect(await screen.findByTestId("answer-revision-reflected-banner")).toBeInTheDocument();
   });
 
-  test("disables understanding refresh after confirmation until an answer is revised (Issue #229)", async () => {
+  test("理解の再構築は常設せず、E3-a のときだけ復旧操作として現れる (Issue #349 / #21・#47・#48)", async () => {
+    // 以前は「理解を更新」を disabled + 説明文で常設していた。仕様は
+    // 未到達の操作を disabled で見せることを禁じ (原則 P3)、`OP-S1`/`OP-S2`
+    // は自動処理なので、通常フローではボタンそのものを出さない。
     mockInterviewApi();
     const qc = new QueryClient({
       defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
     });
     const { default: InterviewPage } = await import("@/pages/interview");
-    render(
+    const { unmount } = render(
       <QueryClientProvider client={qc}>
         <MemoryRouter initialEntries={["/interview?session=7"]}>
           <InterviewPage />
         </MemoryRouter>
       </QueryClientProvider>,
     );
+    await screen.findByTestId("workflow-location");
+    expect(screen.queryByTestId("workflow-retry-understanding_build")).toBeNull();
+    expect(screen.queryByTestId("understanding-refresh-blocked-reason")).toBeNull();
+    unmount();
 
-    const refreshButton = await screen.findByRole("button", { name: /理解を更新/ });
-    expect(refreshButton).toBeDisabled();
-    expect(refreshButton).toHaveAttribute(
-      "title", "新しい回答(修正・追加回答)がある場合にのみ、理解を再構築できます",
+    // E3-a(理解を構築できず、提示できる質問も無い)のときだけ、復旧操作と
+    // して現れる。迂回路ではなく「同じ処理の再試行」だけを提供する。
+    mockInterviewApi({
+      workflow: {
+        state: "W2", candidate_state: "W2", rule_row: 5, reached_state: "W2",
+        primary_action: "confirm_understanding",
+        facts: { blocking_failure_states: ["W2"] },
+        exceptions: [{
+          code: "E3-a", severity: "blocking", target_state: "W2",
+          message: "システム理解を構築できず、代わりに提示できる質問もありません。",
+          detail: "reasoning model is not configured",
+          recovery_process_kind: "understanding_build",
+          recovery_condition: "再試行が成功すると通常フローへ戻ります。",
+        }],
+      },
+    });
+    const qc2 = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc2}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
     );
-    expect(await screen.findByTestId("understanding-refresh-blocked-reason"))
-      .toHaveTextContent("次は提案を生成またはレビューしてください");
-    expect(screen.getByTestId("next-action")).toHaveTextContent("各提案を承認・編集・却下してください");
+    const blocking = await screen.findByTestId("workflow-exception-E3-a");
+    expect(blocking).toHaveAttribute("data-severity", "blocking");
+    expect(blocking.textContent).toContain("作業を進められません");
+    expect(blocking.textContent).toContain("再試行が成功すると通常フローへ戻ります");
+    // 失敗内容・影響・復旧条件・再試行は 1 つの枠にまとまっている (§4.4)。
+    expect(within(blocking).getByTestId("workflow-retry-understanding_build")).toBeEnabled();
+    // 復旧は「同じ処理の再試行」と「安全な終端へ抜ける」の 2 つだけ (§5.3-7)。
+    expect(screen.getByTestId("workflow-leave-safely")).toBeInTheDocument();
+    // 同じ再試行が別パネルにも並ばない (原則 P7)。
+    expect(screen.queryByTestId("understanding-recovery-build")).toBeNull();
   });
 
-  test("re-enables understanding refresh when the server reports new Q&A activity since confirmation, even without answers_revised_at (Issue #229/#263)", async () => {
-    // The server's understanding_update_available flag (single source of
-    // truth shared with the update-understanding 409 gate) can open from a
-    // first-time Q&A-panel answer or a new Runtime Reality Check answer
-    // given after confirmation -- neither ever sets answers_revised_at. The
-    // Dashboard must trust this server-computed flag rather than
-    // re-deriving availability from answers_revised_at alone.
+  test("劣化例外 (E3-b) は主操作を止めず、ブロッキングとは別のラベルで示す (Issue #349)", async () => {
     mockInterviewApi({
-      session: { answers_revised_at: null, understanding_update_available: true },
+      workflow: {
+        state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3",
+        primary_action: "submit_answer",
+        facts: { open_required_questions: 1 },
+        exceptions: [{
+          code: "E3-b", severity: "degraded", target_state: null,
+          message: "自動でのシステム理解を構築できませんでした。以降は質問で理解を組み立てます。",
+          detail: null,
+          recovery_process_kind: "understanding_build",
+          recovery_condition: "以降の理解更新が成功すると解消します。",
+        }],
+      },
+      proposals: [],
+      session: {
+        stage: "capability_confirmation",
+        current_understanding: null,
+        last_error: "reasoning model is not configured",
+        open_questions: [{
+          question: "計測したい対象は何ですか?",
+          category: "followup", priority: "high", hypothesis: null, qa_id: 31,
+        }],
+      },
     });
     const qc = new QueryClient({
       defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
@@ -2512,14 +2667,21 @@ describe("Interview page", () => {
         </MemoryRouter>
       </QueryClientProvider>,
     );
-
-    const refreshButton = await screen.findByRole("button", { name: /理解を更新/ });
-    expect(refreshButton).not.toBeDisabled();
-    expect(screen.queryByTestId("understanding-refresh-blocked-reason")).not.toBeInTheDocument();
+    const degraded = await screen.findByTestId("workflow-exception-E3-b");
+    expect(degraded).toHaveAttribute("data-severity", "degraded");
+    // 色だけで区分を伝えない (原則 P8)。
+    expect(degraded.textContent).toContain("一部の情報が欠けています");
+    // 主作業 (W3 の回答送信) は継続できる。
+    expect(await screen.findByTestId("focused-question")).toBeInTheDocument();
+    const input = screen.getByPlaceholderText(/上の質問への回答や修正点を入力してください。/);
+    fireEvent.change(input, { target: { value: "要約フローです" } });
+    expect(screen.getByRole("button", { name: /送信/ })).toBeEnabled();
+    // 劣化では安全な終端への導線を出さない (ブロッキングだけ)。
+    expect(screen.queryByTestId("workflow-leave-safely")).toBeNull();
   });
 
   test("shows all evidence read for a turn, even when uncited (Issue #137)", async () => {
-    mockInterviewApi();
+    mockInterviewApi({ workflow: { state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3", primary_action: "submit_answer", facts: { open_required_questions: 1 } } });
     mockApi.post.mockResolvedValue({
       assistant_message: "読みました。",
       proposals: [],
@@ -2577,6 +2739,7 @@ describe("Interview page", () => {
     // "ready for proposals" prompt, and answering it consumes the qa_id
     // while re-requesting proposal generation.
     mockInterviewApi({
+      workflow: { state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3", primary_action: "submit_answer", facts: { open_required_questions: 1 } },
       proposals: [],
       session: {
         open_questions: [{
@@ -2649,6 +2812,7 @@ describe("Interview page", () => {
   // コントローラに接続した。
   test("focused question の「わからない」は qa_ids=[その id] だけを対象に自動調査し、成功時は dialogue-turn へ進まない", async () => {
     mockInterviewApi({
+      workflow: { state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3", primary_action: "submit_answer", facts: { open_required_questions: 1 } },
       proposals: [],
       session: {
         open_questions: [{
@@ -2715,6 +2879,7 @@ describe("Interview page", () => {
 
   test("focused question の「わからない」は自動調査が使えないとき従来の #142 フロー(dialogue-turn, answer_unknown)にフォールバックする", async () => {
     mockInterviewApi({
+      workflow: { state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3", primary_action: "submit_answer", facts: { open_required_questions: 1 } },
       proposals: [],
       session: {
         open_questions: [{
@@ -2776,7 +2941,18 @@ describe("Interview page", () => {
   });
 
   test("sends edits through the validated edit endpoint and materializes a diff", async () => {
-    mockInterviewApi({ approvedCount: 1 });
+    mockInterviewApi({
+      approvedCount: 1,
+      // W5 with every proposal reviewed and no diff for the current approval
+      // set: exactly the condition `OP-S7` generates the diff on.
+      workflow: {
+        facts: {
+          proposals_needing_review: 0,
+          approved_proposal_count: 1,
+          diff_matches_approval_set: false,
+        },
+      },
+    });
     mockApi.post.mockImplementation((path: string) => {
       if (path === "/interview/sessions/7/materialize") {
         return Promise.resolve({
@@ -2821,15 +2997,20 @@ describe("Interview page", () => {
       );
     });
 
-    fireEvent.click(screen.getByRole("button", { name: /差分を生成/ }));
+    // Issue #349 `OP-S7`: the diff is generated automatically once the
+    // approval set has no corresponding diff -- there is no 「差分を生成」
+    // button to press (§4.2.1).
+    expect(screen.queryByRole("button", { name: /差分を生成/ })).toBeNull();
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith("/interview/sessions/7/materialize", {});
     });
-    expect(await screen.findByText(/diff --git/)).toBeInTheDocument();
+    // The generated diff becomes the work surface only once the server moves
+    // the session to W6 -- that transition is covered by its own test.
   });
 
   test("shows confirmation question and hides proposal panels before proposal stage (Issue #123)", async () => {
     mockInterviewApi({
+      workflow: { state: "W2", candidate_state: "W2", rule_row: 6, reached_state: "W2", primary_action: "confirm_understanding", facts: { understanding_unconfirmed: true } },
       session: {
         stage: "purpose_confirmation",
         current_understanding: {
@@ -2875,6 +3056,7 @@ describe("Interview page", () => {
   test("renders hypothesis-first question with evidence and quick answers (Issue #128)", async () => {
     const questionText = "トレース取り込みは control-server の責務という理解で正しいですか?";
     mockInterviewApi({
+      workflow: { state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3", primary_action: "submit_answer", facts: { open_required_questions: 1 } },
       session: {
         stage: "capability_confirmation",
         current_understanding: {
@@ -2955,6 +3137,23 @@ describe("Interview page", () => {
 
   test("falls back to a zero-base interview when understanding cannot be built (Issue #123)", async () => {
     mockInterviewApi({
+      workflow: {
+        state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3",
+        primary_action: "submit_answer",
+        facts: { open_required_questions: 1 },
+        exceptions: [{
+          code: "E3-b", severity: "degraded", target_state: null,
+          message: "自動でのシステム理解を構築できませんでした。以降は質問で理解を組み立てます。",
+          detail: "reasoning model is not configured",
+          recovery_process_kind: "understanding_build",
+          recovery_condition: "以降の理解更新が成功すると解消します。",
+        }],
+        unresolved_failures: [{
+          id: 1, session_id: 7, system_id: 1, process_kind: "understanding_build",
+          status: "failed", failure_class: "degraded", target_state: null,
+          error: "reasoning model is not configured", started_at: 1, finished_at: 2,
+        }],
+      },
       session: {
         stage: "understanding_initialized",
         current_understanding: null,
@@ -2991,6 +3190,7 @@ describe("Interview page", () => {
     // Reached proposal_generation through zero-base answers, but the user
     // has not confirmed the gathered context yet.
     mockInterviewApi({
+      workflow: { state: "W2", candidate_state: "W2", rule_row: 6, reached_state: "W2", primary_action: "confirm_understanding", facts: { understanding_unconfirmed: true } },
       session: {
         stage: "proposal_generation",
         current_understanding: null,
@@ -3033,6 +3233,7 @@ describe("Interview page", () => {
 
   test("structured understanding can be explicitly confirmed from the interview page", async () => {
     mockInterviewApi({
+      workflow: { state: "W2", candidate_state: "W2", rule_row: 6, reached_state: "W2", primary_action: "confirm_understanding", facts: { understanding_unconfirmed: true } },
       session: {
         stage: "proposal_generation",
         current_understanding: {
@@ -3075,8 +3276,12 @@ describe("Interview page", () => {
     );
 
     const confirmButton = await screen.findByTestId("confirm-understanding");
-    expect(confirmButton).toHaveTextContent("この理解を確認済みにする");
-    expect(screen.getByTestId("next-action")).toHaveTextContent("この理解を確認済みにする");
+    // Issue #349: the CTA uses the spec's canonical W2 wording (§4.3), and
+    // 「次にやること」 names the same operation (原則 P2).
+    expect(confirmButton).toHaveTextContent("この理解で進む");
+    expect(screen.getByTestId("next-action")).toHaveTextContent("この理解で進む");
+    // 判断対象は同じカード内にある -- 別カラムを探させない (finding 6).
+    expect(screen.getByTestId("understanding-summary-inline")).toBeInTheDocument();
 
     fireEvent.click(confirmButton);
     await waitFor(() => {
@@ -3090,6 +3295,7 @@ describe("Interview page", () => {
   test("reconfirmation lets the user bind a rename and confirm shared relations", async () => {
     const renamedCore = { ...understandingItem("Renamed Core A"), children: ["Shared"] };
     mockInterviewApi({
+      workflow: { state: "W2", candidate_state: "W2", rule_row: 6, reached_state: "W2", primary_action: "confirm_understanding", facts: { understanding_unconfirmed: true } },
       session: {
         stage: "proposal_generation",
         current_understanding: {
@@ -3200,6 +3406,7 @@ describe("Interview page", () => {
 
   test("answering a gap question passes it to the server for consumption (Issue #123)", async () => {
     mockInterviewApi({
+      workflow: { state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3", primary_action: "submit_answer", facts: { open_required_questions: 1 } },
       session: {
         stage: "capability_confirmation",
         current_understanding: {
@@ -3270,6 +3477,18 @@ describe("Interview page", () => {
         });
       }
       if (path === "/interview/sessions") return Promise.resolve([]);
+      if (path.startsWith("/interview/workflow-state")) {
+        // snapshot はあるがセッション未選択 -> W0-B (ルール表 行 2)。
+        return Promise.resolve(interviewWorkflowState({
+          session_id: null,
+          state: "W0-B",
+          candidate_state: "W0-B",
+          rule_row: 2,
+          reached_state: null,
+          primary_action: "start_session",
+          facts: { has_session: false },
+        }));
+      }
       return Promise.resolve(null);
     });
     mockApi.post.mockImplementation((path: string) => {
@@ -3304,13 +3523,16 @@ describe("Interview page", () => {
         expect.objectContaining({ snapshot_id: 42 }),
       );
     });
-    // Understanding is built automatically for the created session.
-    await waitFor(() => {
-      expect(mockApi.post).toHaveBeenCalledWith(
-        "/interview/sessions/8/update-understanding",
-        {},
-      );
-    });
+    // Issue #349 (再レビュー #2): 初期理解の構築はセッション作成リクエスト
+    // 自身が dispatch する。クライアントから 2 本目を投げると同じ推論処理が
+    // 二重に走るので、`update-understanding` は呼ばれてはいけない。進捗は
+    // `W1` の現在地カードが示す。
+    await new Promise(r => setTimeout(r, 50));
+    expect(
+      mockApi.post.mock.calls.filter(
+        (c: unknown[]) => String(c[0]).endsWith("/update-understanding"),
+      ),
+    ).toHaveLength(0);
   });
 
   // PR #296 review restructure: Alignment Review moves into the main,
@@ -3351,8 +3573,267 @@ describe("Interview page", () => {
   // stay on conversation, not Alignment Review -- otherwise the tab shown and
   // the NextActionBanner's instruction point at different places. Alignment
   // Review stays one click away, with the count surfaced on its tab label.
-  test("提案レビュー中の build 済みセッションでは既定が会話タブになり、Alignment Review タブへ切り替えられる", async () => {
+
+
+
+  // PR #296 review fix (2nd pass, Finding 4): "build 済みだから Alignment
+  // Review が既定" は、会話タブ側にまだ必須操作(ここでは fill_gaps の
+  // 「この理解を確認済みにする」)が残っているケースでは適用されない --
+  // 既定は会話タブのままで、必須操作を見失わせない。
+
+  // PR #296 review fix (2nd pass, Finding 5a/5b/3): outstanding_counts feeds
+  // both the tab label and AlignmentSummaryHeader's counts (matching the
+  // Review Queue's own card count), and the gap summary shows the top
+  // outstanding gap's text instead of only a count.
+  // Issue #349: the two-tab main area (element #12) and the 「会話タブへ移動」
+  // lead (element #10) are abolished. Which work surface is shown is decided
+  // by the server's workflow state, so exactly ONE primary work surface is
+  // rendered at a time and no compensating tab-default heuristic exists.
+  // Review finding 1: the page renders ONE server-decided state, so any
+  // mutation that changes a state-deciding fact must re-read it. Without
+  // this the screen keeps showing the old state -- and because the spec
+  // removed the manual 「差分を生成」 CTA, W5 wedges until a reload.
+  test("提案を承認すると正準 Workflow query が再取得される", async () => {
     mockInterviewApi();
+    mockApi.post.mockResolvedValue({ id: 1, decision: "approved", decision_method: "manual" });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await screen.findByText("summarize.summarize_text");
+    const before = mockApi.get.mock.calls.filter(
+      ([path]) => typeof path === "string" && path.startsWith("/interview/workflow-state"),
+    ).length;
+
+    fireEvent.click(screen.getByRole("button", { name: /承認/ }));
+
+    await waitFor(() => {
+      const after = mockApi.get.mock.calls.filter(
+        ([path]) => typeof path === "string" && path.startsWith("/interview/workflow-state"),
+      ).length;
+      expect(after).toBeGreaterThan(before);
+    });
+  });
+
+  test("理解の確認・回答の送信でも正準 Workflow query が再取得される", async () => {
+    mockInterviewApi({
+      workflow: {
+        state: "W2", candidate_state: "W2", rule_row: 6, reached_state: "W2",
+        primary_action: "confirm_understanding",
+        facts: { understanding_unconfirmed: true },
+      },
+      proposals: [],
+      session: {
+        stage: "purpose_confirmation",
+        understanding_confirmed_at: null,
+        current_understanding: {
+          system_purpose: [understandingItem("Runtime probe platform")],
+          core_capabilities: [understandingItem("Trace ingestion")],
+          capability_elements: [], supporting_elements: [],
+          api_boundaries: [], probe_flow_candidates: [],
+        },
+      },
+    });
+    mockApi.post.mockResolvedValue(interviewSession({ understanding_confirmed_at: 9 }));
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const confirm = await screen.findByTestId("confirm-understanding");
+    const before = mockApi.get.mock.calls.filter(
+      ([path]) => typeof path === "string" && path.startsWith("/interview/workflow-state"),
+    ).length;
+    fireEvent.click(confirm);
+
+    await waitFor(() => {
+      const after = mockApi.get.mock.calls.filter(
+        ([path]) => typeof path === "string" && path.startsWith("/interview/workflow-state"),
+      ).length;
+      expect(after).toBeGreaterThan(before);
+    });
+  });
+
+  // Review finding 4: while the current-location card says 「操作は不要」, the
+  // page must not simultaneously offer the inputs that the running process
+  // is consuming (Intent / Q&A / まとめて修正).
+  test("W1 では待機と例外だけを出し、開発者の変更操作は描かれない", async () => {
+    mockInterviewApi({
+      workflow: {
+        state: "W1", candidate_state: "W1", rule_row: 4, reached_state: "W3",
+        primary_action: "none",
+        facts: { running_process_kinds: ["understanding_update"] },
+        running_processes: [{
+          id: 1, session_id: 7, system_id: 1,
+          process_kind: "understanding_update", status: "running",
+          failure_class: null, target_state: null, error: null,
+          started_at: 1, finished_at: null,
+        }],
+      },
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByTestId("workflow-running")).toHaveTextContent("理解を更新しています");
+    for (const testId of [
+      "work-surface-W2", "work-surface-W3", "work-surface-W4",
+      "work-surface-W5", "work-surface-W6", "work-surface-W7",
+      "qa-panel", "intent-brief-panel", "change-set-panel",
+      "observation-proposal-panel", "handoff-list-panel",
+    ]) {
+      expect(screen.queryByTestId(testId)).toBeNull();
+    }
+    // 履歴・監査の入口だけは状態に依存せず常に開ける (§3.6)。
+    expect(screen.getByTestId("history-audit-entry")).toBeInTheDocument();
+  });
+
+  test("W0-A では Repository 導線だけが主操作で、開始ボタンは描かれない", async () => {
+    // `E1` は例外ではなく `W0-A` という状態そのもの。実行できない
+    // 「インタビューを開始」を disabled で見せない (原則 P3)。
+    mockInterviewApi();
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path.startsWith("/interview/workflow-state")) {
+        return Promise.resolve(interviewWorkflowState({
+          session_id: null,
+          state: "W0-A", candidate_state: "W0-A", rule_row: 1,
+          reached_state: null, primary_action: "open_repository",
+          facts: { has_snapshot: false, has_session: false },
+          latest_ready_snapshot_id: null,
+          exceptions: [{
+            code: "E1", severity: "blocking", target_state: "W0-A",
+            message: "対象リポジトリの snapshot がまだありません。",
+            detail: null, recovery_process_kind: null,
+            recovery_condition: "Repository 画面で snapshot を作成すると開始できます。",
+          }],
+        }));
+      }
+      if (path === "/repository/snapshots/latest") return Promise.resolve(null);
+      if (path === "/interview/sessions") return Promise.resolve([]);
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("work-surface-W0-A")).toBeInTheDocument();
+    });
+    expect(screen.getByTestId("w0a-primary-action")).toHaveTextContent(
+      "Repository で snapshot を作成する",
+    );
+    expect(screen.queryByRole("button", { name: /インタビューを開始/ })).toBeNull();
+    expect(screen.queryByTestId("work-surface-W0-B")).toBeNull();
+    // `E1` は `W0-A` そのものなので、R5 の警告カードとしては出さない。
+    expect(screen.queryByTestId("workflow-exception-E1")).toBeNull();
+  });
+
+  test("セッションを明示的に未選択にすると W0-B に到達でき、自動選択で戻らない (Issue #349 再レビュー #1)", async () => {
+    // 既存セッションがあるシステムでも新しいインタビューを開始できること。
+    // 以前は「未選択を見つけたら最新セッションを選ぶ」副作用が毎レンダー
+    // 走ったため、選択を外した瞬間に元のセッションへ引き戻され、`W0-B` の
+    // 主操作 (インタビューを開始) に永久に到達できなかった。
+    let sessionSelected = true;
+    mockInterviewApi();
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path.startsWith("/interview/workflow-state")) {
+        // 未選択のときサーバーは `W0-B` を返す (rule row 2)。
+        return Promise.resolve(
+          interviewWorkflowState(
+            sessionSelected
+              ? {}
+              : {
+                  session_id: null,
+                  state: "W0-B",
+                  candidate_state: "W0-B",
+                  rule_row: 2,
+                  reached_state: null,
+                  primary_action: "start_session",
+                  facts: { has_session: false },
+                },
+          ),
+        );
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const picker = (await screen.findByLabelText(
+      "インタビューセッション",
+    )) as HTMLSelectElement;
+    // セッション一覧が届くまで option #7 が存在しないので値は空のまま。
+    await waitFor(() => expect(picker.value).toBe("7"));
+
+    sessionSelected = false;
+    fireEvent.change(picker, { target: { value: "" } });
+
+    // 選択が復活しないこと。
+    await waitFor(() => {
+      expect(picker.value).toBe("");
+    });
+    expect(await screen.findByTestId("work-surface-W0-B")).toBeInTheDocument();
+    expect(screen.getByTestId("w0b-primary-action")).toBeInTheDocument();
+    // 数レンダー分待っても引き戻されない。
+    await new Promise(r => setTimeout(r, 50));
+    expect(picker.value).toBe("");
+  });
+
+  test("W4 では意図とのズレの作業面だけが描かれ、会話・提案・差分の作業面は描かれない", async () => {
+    mockInterviewApi({
+      workflow: {
+        state: "W4", candidate_state: "W4", rule_row: 9, reached_state: "W4",
+        primary_action: "confirm_alignment_item",
+        facts: { outstanding_alignment_items: 1 },
+      },
+    });
     const item = alignmentItem({ id: 1 });
     const baseGet = mockApi.get.getMockImplementation();
     mockApi.get.mockImplementation((path: string) => {
@@ -3384,64 +3865,20 @@ describe("Interview page", () => {
       </QueryClientProvider>,
     );
 
-    // The proposal review (a conversation-tab action) is the default view.
-    expect(await screen.findByTestId("main-tab-content-conversation")).toBeInTheDocument();
-    expect(screen.queryByTestId("main-tab-content-alignment")).not.toBeInTheDocument();
-    // The tab label still surfaces the actionable Alignment count.
-    expect(screen.getByTestId("main-tab-alignment")).toHaveTextContent("Alignment Review (1)");
-
-    // Alignment Review stays reachable via its tab...
-    fireEvent.click(screen.getByTestId("main-tab-alignment"));
-    await screen.findByTestId("alignment-review-panel");
-    expect(await screen.findByTestId("main-tab-content-alignment")).toBeInTheDocument();
-    expect(screen.queryByTestId("main-tab-content-conversation")).not.toBeInTheDocument();
-
-    // ...but because the required proposal action still lives in the
-    // conversation tab, the banner offers a direct way back to it.
-    const goToConversation = await screen.findByTestId("next-action-go-to-conversation");
-    fireEvent.click(goToConversation);
-    expect(await screen.findByTestId("main-tab-content-conversation")).toBeInTheDocument();
-    expect(screen.queryByTestId("main-tab-content-alignment")).not.toBeInTheDocument();
+    expect(await screen.findByTestId("work-surface-W4")).toBeInTheDocument();
+    expect(screen.queryByTestId("work-surface-W3")).toBeNull();
+    expect(screen.queryByTestId("work-surface-W5")).toBeNull();
+    expect(screen.queryByTestId("work-surface-W6")).toBeNull();
+    // The abolished tab machinery is gone entirely.
+    expect(screen.queryByTestId("main-tab-alignment")).toBeNull();
+    expect(screen.queryByTestId("main-tab-conversation")).toBeNull();
+    expect(screen.queryByTestId("next-action-go-to-conversation")).toBeNull();
+    // The current location names this state's single primary action.
+    expect(screen.getByTestId("workflow-next-action")).toHaveTextContent("この項目を確定する");
   });
 
-  test("提案の必須操作が完了した build 済みセッションでは Alignment Review が自動既定になる", async () => {
-    const rejectedProposal = {
-      ...interviewProposal(),
-      approval_state: "rejected",
-    };
-    mockInterviewApi({ proposals: [rejectedProposal] });
-    const item = alignmentItem({ id: 2 });
-    const baseGet = mockApi.get.getMockImplementation();
-    mockApi.get.mockImplementation((path: string) => {
-      if (path === "/interview/sessions/7/approved-set") {
-        return Promise.resolve({
-          session_id: 7,
-          system_id: 1,
-          snapshot_id: 42,
-          items: [],
-          total_proposals: 1,
-          approved_count: 0,
-          rejected_count: 1,
-          pending_count: 0,
-        });
-      }
-      if (path === "/interview/sessions/7/alignment") {
-        return Promise.resolve({
-          session_id: 7,
-          system_id: 1,
-          items_by_category: {
-            must_review: [item], batch_reviewable: [], no_review_required: [], unchanged: [], informational: [],
-          },
-          counts: { must_review: 1, batch_reviewable: 0, no_review_required: 0, unchanged: 0, informational: 0 },
-          outstanding_counts: { must_review: 1, batch_reviewable: 0, no_review_required: 0, unchanged: 0, informational: 0 },
-        });
-      }
-      if (path === "/interview/sessions/7/review-queue") {
-        return Promise.resolve({ session_id: 7, system_id: 1, items: [item] });
-      }
-      return baseGet?.(path) ?? Promise.resolve(null);
-    });
-
+  test("W5 では提案の作業面だけが描かれ、差分生成ボタンと前提説明は描かれない", async () => {
+    mockInterviewApi({ approvedCount: 0 });
     const qc = new QueryClient({
       defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
     });
@@ -3454,84 +3891,33 @@ describe("Interview page", () => {
       </QueryClientProvider>,
     );
 
-    expect(await screen.findByTestId("main-tab-content-alignment")).toBeInTheDocument();
-    expect(screen.queryByTestId("main-tab-content-conversation")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("next-action-go-to-conversation")).not.toBeInTheDocument();
-
-    fireEvent.click(screen.getByTestId("main-tab-conversation"));
-    expect(await screen.findByTestId("main-tab-content-conversation")).toBeInTheDocument();
+    expect(await screen.findByTestId("work-surface-W5")).toBeInTheDocument();
+    expect(screen.queryByTestId("work-surface-W4")).toBeNull();
+    // #33 / #34 / #35: the manual diff-generation button, the "approve first"
+    // note and the "no proposals yet" note are abolished (`OP-S7` is
+    // automatic; 原則 P3).
+    expect(screen.queryByRole("button", { name: /差分を生成/ })).toBeNull();
+    expect(screen.queryByTestId("materialize-prerequisite")).toBeNull();
+    expect(screen.queryByTestId("no-proposals-yet")).toBeNull();
+    expect(screen.getByTestId("workflow-next-action")).toHaveTextContent("この提案を承認する");
   });
 
-  test("未 build のセッションでは会話が既定表示され、Alignment Review タブへ切り替えられる", async () => {
-    // mockInterviewApi's default catch-all resolves /alignment and
-    // /review-queue to null, i.e. "not built yet".
-    mockInterviewApi();
-
-    const qc = new QueryClient({
-      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
-    });
-    const { default: InterviewPage } = await import("@/pages/interview");
-    render(
-      <QueryClientProvider client={qc}>
-        <MemoryRouter initialEntries={["/interview?session=7"]}>
-          <InterviewPage />
-        </MemoryRouter>
-      </QueryClientProvider>,
-    );
-
-    expect(await screen.findByTestId("main-tab-content-conversation")).toBeInTheDocument();
-    expect(screen.queryByTestId("main-tab-content-alignment")).not.toBeInTheDocument();
-    // No actionable count badge when nothing has been built yet.
-    expect(screen.getByTestId("main-tab-alignment")).toHaveTextContent("Alignment Review");
-    expect(screen.getByTestId("main-tab-alignment")).not.toHaveTextContent("Alignment Review (");
-
-    fireEvent.click(screen.getByTestId("main-tab-alignment"));
-    expect(await screen.findByTestId("main-tab-content-alignment")).toBeInTheDocument();
-    expect(screen.queryByTestId("main-tab-content-conversation")).not.toBeInTheDocument();
-    // Review Queue's own empty/not-yet-built state (build trigger) is reused
-    // as-is -- no separate empty state is invented for this tab.
-    expect(screen.getByTestId("review-queue-build-button")).toBeInTheDocument();
-  });
-
-  // PR #296 review fix (2nd pass, Finding 4): "build 済みだから Alignment
-  // Review が既定" は、会話タブ側にまだ必須操作(ここでは fill_gaps の
-  // 「この理解を確認済みにする」)が残っているケースでは適用されない --
-  // 既定は会話タブのままで、必須操作を見失わせない。
-  test("会話タブに必須アクションが残っている build 済みセッションでは既定が会話タブになり、バナーから会話タブへ移動できる", async () => {
+  test("W6 の主操作は差分レビューの明示記録であり、ダウンロードでは代替されない", async () => {
     mockInterviewApi({
-      session: {
-        stage: "capability_confirmation",
-        understanding_confirmed_at: null,
-        understanding_confirmed_by: null,
-        current_understanding: {
-          system_purpose: [understandingItem("Summarize documents")],
-          core_capabilities: [],
-          capability_elements: [],
-          supporting_elements: [],
-          api_boundaries: [],
-          probe_flow_candidates: [],
-        },
+      approvedCount: 1,
+      session: { materialization_diff: "diff --git a/x b/x\n", materialized_at: 10 },
+      workflow: {
+        state: "W6", candidate_state: "W6", rule_row: 12, reached_state: "W6",
+        primary_action: "record_diff_review",
+        diff_materialized_at: 10,
+        facts: { approved_proposal_count: 1, diff_matches_approval_set: true },
       },
     });
-    const item = alignmentItem({ id: 5, review_category: "batch_reviewable" });
-    const baseGet = mockApi.get.getMockImplementation();
-    mockApi.get.mockImplementation((path: string) => {
-      if (path === "/interview/sessions/7/alignment") {
-        return Promise.resolve({
-          session_id: 7,
-          system_id: 1,
-          items_by_category: {
-            must_review: [], batch_reviewable: [item], no_review_required: [], unchanged: [], informational: [],
-          },
-          counts: { must_review: 0, batch_reviewable: 1, no_review_required: 0, unchanged: 0, informational: 0 },
-        });
-      }
-      if (path === "/interview/sessions/7/review-queue") {
-        return Promise.resolve({ session_id: 7, system_id: 1, items: [item] });
-      }
-      return baseGet?.(path) ?? Promise.resolve(null);
+    mockApi.post.mockResolvedValue({
+      id: 1, session_id: 7, system_id: 1, diff_materialized_at: 10,
+      diff_digest: "d", reviewed_by: "admin", decision_method: "manual",
+      note: "", created_at: 1,
     });
-
     const qc = new QueryClient({
       defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
     });
@@ -3544,34 +3930,117 @@ describe("Interview page", () => {
       </QueryClientProvider>,
     );
 
-    // Alignment has been built (a batch_reviewable item exists), but the
-    // session still needs a conversation-tab action (fill_gaps stage +
-    // canConfirmStructuredUnderstanding) -- the default must stay on the
-    // conversation tab, not Alignment Review.
-    expect(await screen.findByTestId("main-tab-content-conversation")).toBeInTheDocument();
-    expect(screen.queryByTestId("main-tab-content-alignment")).not.toBeInTheDocument();
-    expect(screen.getByTestId("confirm-understanding")).toBeInTheDocument();
+    expect(await screen.findByTestId("work-surface-W6")).toBeInTheDocument();
+    expect(screen.getByTestId("workflow-next-action")).toHaveTextContent("この差分を確認した");
+    // The download exists, but only as an auxiliary action.
+    expect(screen.getByTestId("download-patch-button")).toBeInTheDocument();
 
-    // Switching to the Alignment Review tab manually still works...
-    fireEvent.click(screen.getByTestId("main-tab-alignment"));
-    expect(await screen.findByTestId("main-tab-content-alignment")).toBeInTheDocument();
-
-    // ...but since a required action still lives in the conversation tab,
-    // the next-action banner (which sits above the tabs, reachable from
-    // either) offers a direct way back instead of pointing at a control
-    // hidden behind the currently-shown tab.
-    const goToConversation = await screen.findByTestId("next-action-go-to-conversation");
-    fireEvent.click(goToConversation);
-    expect(await screen.findByTestId("main-tab-content-conversation")).toBeInTheDocument();
-    expect(screen.queryByTestId("main-tab-content-alignment")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("record-diff-review"));
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/7/diff-review",
+        { reviewed_by: "admin" },
+      );
+    });
   });
 
-  // PR #296 review fix (2nd pass, Finding 5a/5b/3): outstanding_counts feeds
-  // both the tab label and AlignmentSummaryHeader's counts (matching the
-  // Review Queue's own card count), and the gap summary shows the top
-  // outstanding gap's text instead of only a count.
-  test("outstanding_counts がタブ件数とギャップサマリの件数に使われ、Review Queue のカード数と一致する", async () => {
-    mockInterviewApi();
+  test("W7 は終端ごとに 1 つの主操作を出し、中断からは再開できる", async () => {
+    mockInterviewApi({
+      workflow: {
+        state: "W7", candidate_state: "W7", rule_row: 3, reached_state: "W5",
+        terminal_kind: "suspended", primary_action: "resume_session",
+        facts: { session_closed: true },
+      },
+      session: { status: "closed" },
+    });
+    mockApi.post.mockResolvedValue(interviewWorkflowState({ state: "W5" }));
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const card = await screen.findByTestId("terminal-card");
+    expect(card).toHaveAttribute("data-terminal-kind", "suspended");
+    const primary = screen.getByTestId("terminal-primary-action");
+    expect(primary).toHaveTextContent("このセッションを再開する");
+    // A closed session cannot also be closed again -- the terminals are
+    // mutually exclusive (§5.4).
+    expect(screen.queryByTestId("terminal-close-session")).toBeNull();
+
+    fireEvent.click(primary);
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/7/reopen", { actor: "admin" },
+      );
+    });
+  });
+
+  test("未承諾の戻り要求がある間は reached_state のまま表示し、承諾で候補状態へ移る", async () => {
+    mockInterviewApi({
+      workflow: {
+        state: "W5", candidate_state: "W3", rule_row: 7, reached_state: "W5",
+        primary_action: "approve_proposal",
+        backward_hold: true,
+        pending_back_request: {
+          id: 12, session_id: 7, system_id: 1,
+          cause_kind: "question_reopened",
+          candidate_state: "W3", reached_state: "W5",
+          status: "pending", created_at: 1,
+        },
+        exceptions: [{
+          code: "E8", severity: "informational", target_state: "W3",
+          message: "回答の修正により、確認が必要な質問が発生しました。",
+          detail: null, recovery_process_kind: null,
+          recovery_condition: "「先に確認する」を選ぶと該当の状態へ戻ります。",
+        }],
+        facts: { open_required_questions: 1 },
+      },
+    });
+    mockApi.post.mockResolvedValue(interviewWorkflowState({ state: "W3" }));
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // The held-back state is still the one shown, and its work stays usable.
+    expect(await screen.findByTestId("work-surface-W5")).toBeInTheDocument();
+    expect(screen.queryByTestId("work-surface-W3")).toBeNull();
+    // E8 is informational, so it is NOT rendered as an R5 warning.
+    expect(screen.queryByTestId("workflow-exception-E8")).toBeNull();
+    const notice = await screen.findByTestId("workflow-back-request");
+    expect(notice).toHaveTextContent("回答の修正により、確認が必要な質問が発生しました");
+
+    fireEvent.click(screen.getByTestId("workflow-acknowledge-back"));
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/7/back-requests/12/acknowledge",
+        { actor: "admin" },
+      );
+    });
+  });
+
+  test("outstanding_counts がギャップサマリの件数に使われ、Review Queue のカード数と一致する", async () => {
+    mockInterviewApi({
+      workflow: {
+        state: "W4", candidate_state: "W4", rule_row: 9, reached_state: "W4",
+        primary_action: "confirm_alignment_item",
+        facts: { outstanding_alignment_items: 1 },
+      },
+    });
     const answeredItem = alignmentItem({
       id: 1, review_category: "must_review", status: "answered",
       gap_summary: "解消済みの古いギャップ文言",
@@ -3616,13 +4085,8 @@ describe("Interview page", () => {
     );
 
     // Tab label count uses outstanding_counts (1), not counts (2). The tab
-    // label is visible regardless of the active tab.
-    expect(await screen.findByTestId("main-tab-alignment")).toHaveTextContent("Alignment Review (1)");
-
-    // This default session is in proposal_review, so the conversation tab is
-    // the default (Finding 3); open Alignment Review to inspect its summary.
-    fireEvent.click(screen.getByTestId("main-tab-alignment"));
-
+    // Issue #349: the tab (and its count badge) is abolished -- W4 is a
+    // state, so the Alignment work surface is simply what is rendered.
     // AlignmentSummaryHeader shows the top outstanding gap's own text (not
     // the resolved item's stale gap text) plus the matching outstanding
     // count.
@@ -3653,7 +4117,9 @@ describe("Interview page", () => {
   // "AI推定と人間確認済み情報の区別" -- it is surfaced as an explicit
   // unconfirmed candidate instead.
   test("未確認のAI提案 goal は確定した『あなたが実現したいこと』として表示せず、未確認候補として明示する", async () => {
-    mockInterviewApi();
+    mockInterviewApi({
+      workflow: { state: "W4", candidate_state: "W4", rule_row: 9, reached_state: "W4", primary_action: "confirm_alignment_item", facts: { outstanding_alignment_items: 1 } },
+    });
     const proposedGoal = intentItem({
       field: "goal", value_text: "AIが推定した目標", status: "proposed",
       origin: "ai_proposed", decision_method: "reasoning_llm", intelligence_run_id: 3,
@@ -3678,8 +4144,6 @@ describe("Interview page", () => {
       </QueryClientProvider>,
     );
 
-    fireEvent.click(await screen.findByTestId("main-tab-alignment"));
-
     const proposed = await screen.findByTestId("alignment-summary-goal-proposed");
     expect(proposed).toHaveTextContent("AIが推定した目標");
     expect(proposed).toHaveTextContent("AI提案");
@@ -3689,7 +4153,9 @@ describe("Interview page", () => {
   });
 
   test("却下済みのAI提案 goal は未確認候補として再表示しない", async () => {
-    mockInterviewApi();
+    mockInterviewApi({
+      workflow: { state: "W4", candidate_state: "W4", rule_row: 9, reached_state: "W4", primary_action: "confirm_alignment_item", facts: { outstanding_alignment_items: 1 } },
+    });
     const declinedGoal = intentItem({
       field: "goal", value_text: "却下したAI目標", status: "not_applicable",
       origin: "ai_proposed", decision_method: "manual", intelligence_run_id: 3,
@@ -3714,8 +4180,6 @@ describe("Interview page", () => {
       </QueryClientProvider>,
     );
 
-    fireEvent.click(await screen.findByTestId("main-tab-alignment"));
-
     const summary = await screen.findByTestId("alignment-summary-goal");
     expect(summary).toHaveTextContent("未入力です");
     expect(summary).not.toHaveTextContent("却下したAI目標");
@@ -3723,7 +4187,9 @@ describe("Interview page", () => {
   });
 
   test("確認済みの goal は『あなたが実現したいこと』として確定表示する", async () => {
-    mockInterviewApi();
+    mockInterviewApi({
+      workflow: { state: "W4", candidate_state: "W4", rule_row: 9, reached_state: "W4", primary_action: "confirm_alignment_item", facts: { outstanding_alignment_items: 1 } },
+    });
     const confirmedGoal = intentItem({ field: "goal", value_text: "確定した目標" });
     const baseGet = mockApi.get.getMockImplementation();
     mockApi.get.mockImplementation((path: string) => {
@@ -3745,8 +4211,6 @@ describe("Interview page", () => {
       </QueryClientProvider>,
     );
 
-    fireEvent.click(await screen.findByTestId("main-tab-alignment"));
-
     const confirmed = await screen.findByTestId("alignment-summary-goal-confirmed");
     expect(confirmed).toHaveTextContent("確定した目標");
     expect(screen.queryByTestId("alignment-summary-goal-proposed")).not.toBeInTheDocument();
@@ -3757,6 +4221,7 @@ describe("Interview page", () => {
   // in the same view as the focused question, not only inside the Q&A list.
   test("調査済みの focused question は、その qa.investigation を同じ画面領域に表示する", async () => {
     mockInterviewApi({
+      workflow: { state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3", primary_action: "submit_answer", facts: { open_required_questions: 1 } },
       proposals: [],
       session: {
         open_questions: [{

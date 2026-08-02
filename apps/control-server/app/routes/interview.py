@@ -21,6 +21,8 @@ probe-agent:
 from __future__ import annotations
 
 import json
+import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import List, Optional
@@ -35,6 +37,8 @@ from ..capability_graph import (
     latest_system_confirmed_graph,
 )
 from ..db import get_conn
+from .. import interview_workflow
+from ..interview_workflow import tracked_process
 from ..interview_context import build_interview_context
 from ..interview_agent import (
     EVIDENCE_PROMPT_VERSION,
@@ -343,6 +347,8 @@ def _question_out(question) -> InterviewStructuredQuestion:
     if isinstance(question, str):
         return InterviewStructuredQuestion(question_text=question)
     return question
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -708,8 +714,85 @@ def create_interview_session(
             """,
             (system_id, payload.snapshot_id, payload.title, payload.focus, now, now),
         )
-        row = _get_session_or_404(conn, cur.lastrowid, system_id)
-        return _session_out(conn, row)
+        session_id = cur.lastrowid
+        # Issue #349: `W0-B` completes by "creating a session AND the system
+        # starting to investigate" (spec §2.3). Both halves happen here.
+        #
+        # The run record is opened inside this request so the new session is
+        # `W1` from its very first evaluation -- otherwise a reload before the
+        # build starts sees a session with no understanding, no questions, no
+        # proposals and no diff, which falls through the whole rule table to
+        # `W7`, a terminal the developer can never leave because every build
+        # control is exception-only.
+        #
+        # The build itself is dispatched below, outside this connection. The
+        # record is never a mere reservation waiting for the client to send a
+        # second request: a caller that creates a session and then goes away
+        # (an API client, a closed tab) still gets the investigation, and a
+        # dispatch that cannot even start is turned into a recoverable
+        # `E3-a` immediately rather than after the stale sweep.
+        initial_run_id = interview_workflow.start_process_run(
+            conn, session_id, system_id, "understanding_build"
+        )
+        row = _get_session_or_404(conn, session_id, system_id)
+        session_out = _session_out(conn, row)
+        session_row = dict(row)
+
+    _dispatch_initial_understanding_build(session_row, system_id, initial_run_id)
+    return session_out
+
+
+def _initial_build_eager() -> bool:
+    """Run the initial build inline instead of on a worker thread.
+
+    Mirrors `interview_refresh`'s `PROBE_REFRESH_EAGER`: tests need the build
+    to be deterministic and finished when the request returns.
+    """
+    return os.getenv("PROBE_INTERVIEW_EAGER_INITIAL_BUILD", "0") == "1"
+
+
+def _dispatch_initial_understanding_build(
+    session_row: dict, system_id: int, run_id: int
+) -> None:
+    """Actually start the initial understanding build for a new session.
+
+    Owns the run record `create_interview_session` opened: the worker adopts
+    that exact id, so the record always describes a process that really ran.
+    If the worker cannot be started at all, the record is failed right away
+    with the reason -- a recoverable `E3-a` the developer can retry, instead
+    of 15 minutes of "システムが調べている" followed by a stale sweep.
+    """
+    import threading
+
+    if not run_id:
+        return
+
+    def _run() -> None:
+        try:
+            _rebuild_understanding(session_row, system_id, adopt_run_id=run_id)
+        except Exception as exc:  # pragma: no cover - defensive worker guard
+            logger.exception(
+                "initial understanding build failed for session %s",
+                session_row.get("id"),
+            )
+            try:
+                with get_conn() as conn:
+                    interview_workflow.finish_process_run(
+                        conn, run_id, ok=False, error=str(exc)
+                    )
+            except Exception:  # pragma: no cover
+                logger.exception("could not record initial build failure")
+
+    if _initial_build_eager():
+        _run()
+        return
+    try:
+        threading.Thread(target=_run, daemon=True).start()
+    except Exception as exc:  # pragma: no cover - thread creation failure
+        with get_conn() as conn:
+            interview_workflow.finish_process_run(
+                conn, run_id, ok=False, error=f"初期調査を開始できませんでした: {exc}"
+            )
 
 
 @router.get(
@@ -1223,6 +1306,11 @@ def create_interview_proposals(
 # --- Dialogue Turn (Issue #69) -----------------------------------------------
 
 
+# Issue #349 `OP-S6`: at the `proposal_generation` stage this turn IS the
+# proposal generation, so it carries a run record and shows as `W1`. Earlier
+# stages are the developer's own answer turn -- deliberately NOT recorded as
+# a system process (spec §8.1 fact B allows this, and the resulting refresh
+# job already produces the "回答を反映しています" `W1`).
 @router.post(
     "/interview/sessions/{session_id}/dialogue-turn",
     response_model=InterviewDialogueTurnOut,
@@ -1231,6 +1319,46 @@ def interview_dialogue_turn(
     session_id: int,
     payload: InterviewDialogueTurnRequest,
     system_id: int = Depends(get_system_id),
+) -> InterviewDialogueTurnOut:
+    """Dialogue turn, recorded as proposal generation at the proposal stage.
+
+    See `_interview_dialogue_turn_core` for the turn itself. The stage is read
+    first (deterministic, one small query) because the run record has to be
+    opened before the core takes its own connections -- the process-wide DB
+    lock is not reentrant (app/db.py).
+    """
+    with get_conn() as conn:
+        session = _get_session_or_404(conn, session_id, system_id)
+        stage = session["stage"] or "understanding_initialized"
+    if stage != "proposal_generation":
+        return _interview_dialogue_turn_core(session_id, payload, system_id)
+
+    from ..interview_workflow import ProcessRunTracker
+
+    tracker = ProcessRunTracker(session_id, system_id, "proposal_generation")
+    tracker.start()
+    try:
+        result = _interview_dialogue_turn_core(session_id, payload, system_id)
+    except BaseException as exc:  # noqa: BLE001 - recorded then re-raised
+        status = getattr(exc, "status_code", None)
+        if status in (404, 409, 422):
+            tracker.abandon()
+        else:
+            tracker.fail(exc)
+        raise
+    # The turn returns 200 with an `error` field when the reasoning call
+    # fails (fail-closed, no proposals persisted) -- that is a failed run.
+    if getattr(result, "error", None):
+        tracker.fail(result.error)
+    else:
+        tracker.succeed()
+    return result
+
+
+def _interview_dialogue_turn_core(
+    session_id: int,
+    payload: InterviewDialogueTurnRequest,
+    system_id: int,
 ) -> InterviewDialogueTurnOut:
     """Generate a reasoning-model dialogue turn for the interview (Issue #69).
 
@@ -2600,6 +2728,38 @@ def materialize_interview_session(
       state_effects: [database-write, filesystem]
       probe_value: Verify materialization produces a valid diff from approved proposals without modifying tracked branches
     """
+    from ..interview_workflow import ProcessRunTracker
+
+    # Issue #349: diff generation is `OP-S7`, an automatic system process, so
+    # it carries a persisted run record -- `W1` while it runs, and a blocking
+    # `E12` on `W5` when it fails (there is no diff to review, so `W6` must
+    # not be reachable). "No approved items" is a precondition, not a failed
+    # generation, so that run is abandoned rather than recorded as a failure.
+    tracker = ProcessRunTracker(session_id, system_id, "diff_generation")
+    tracker.start()
+    try:
+        result_out = _materialize_interview_session_core(
+            session_id, payload, system_id
+        )
+    except HTTPException as exc:
+        if exc.status_code in (404, 422) and "No approved items" in str(exc.detail):
+            tracker.abandon()
+        else:
+            tracker.fail(exc)
+        raise
+    except BaseException as exc:  # noqa: BLE001 - recorded then re-raised
+        tracker.fail(exc)
+        raise
+    tracker.succeed()
+    return result_out
+
+
+def _materialize_interview_session_core(
+    session_id: int,
+    payload: InterviewMaterializeRequest,
+    system_id: int,
+) -> InterviewMaterializeOut:
+    """Core of the materialization endpoint (see its docstring)."""
     import tempfile
     from ..docstring_writer import MetadataValues
     from ..interview_materializer import (
@@ -2977,7 +3137,61 @@ class UnderstandingRebuildResult:
     revision_id: Optional[int] = None
 
 
-def _rebuild_understanding(session, system_id: int) -> UnderstandingRebuildResult:
+def _rebuild_understanding(
+    session, system_id: int, *, adopt_run_id: Optional[int] = None
+) -> UnderstandingRebuildResult:
+    """Understanding build/update with a persisted run record (Issue #349).
+
+    Thin wrapper over `_rebuild_understanding_core`: it records the run as
+    the spec's fact B so the screen can show `W1` while the rebuild runs and
+    the right failure state (`E3-a` blocking `W2`, or the degraded `E3-b`
+    zero-base path) once it ends -- decided by
+    `interview_workflow.classify_failure`, not by the Dashboard. Both entry
+    points (the manual endpoint and the automatic refresh job, Issue #288)
+    go through here, so both produce the same record.
+
+    The tracker owns short-lived connections only; the reasoning call still
+    runs with no connection held (app/db.py).
+    """
+    from ..interview_workflow import ProcessRunTracker
+
+    session_id = session["id"]
+
+    def _kind(conn) -> str:
+        """build vs update, resolved on the tracker's own connection.
+
+        Deliberately NOT a separate `with get_conn()` block: the DB lock is
+        process-wide, and this function runs on the automatic-refresh
+        thread too, so an extra acquisition adds latency to the very
+        rebuild the developer is waiting for after answering.
+        """
+        prior_revision = conn.execute(
+            """SELECT id FROM understanding_revision
+               WHERE session_id = ? AND system_id = ? LIMIT 1""",
+            (session_id, system_id),
+        ).fetchone()
+        return "understanding_update" if prior_revision else "understanding_build"
+
+    tracker = ProcessRunTracker(session_id, system_id, "understanding_update")
+    # `adopt_run_id` is set only by the initial build that session creation
+    # dispatched, which passes the exact record it opened. Every other caller
+    # (the manual endpoint, the automatic refresh) opens its own row, so two
+    # overlapping rebuilds never share one record and overwrite each other's
+    # outcome.
+    tracker.start(resolve_kind=_kind, adopt_run_id=adopt_run_id)
+    try:
+        result = _rebuild_understanding_core(session, system_id)
+    except BaseException as exc:  # noqa: BLE001 - recorded then re-raised
+        tracker.fail(exc)
+        raise
+    if result.ok:
+        tracker.succeed()
+    else:
+        tracker.fail(result.error or "understanding rebuild failed")
+    return result
+
+
+def _rebuild_understanding_core(session, system_id: int) -> UnderstandingRebuildResult:
     """Core of `update_interview_understanding`: always attempts a rebuild.
 
     The caller is responsible for the `_understanding_update_blocked` gate
@@ -3653,6 +3867,11 @@ def get_runtime_reality_facts(
     "/interview/sessions/{session_id}/runtime-reality-check",
     response_model=RuntimeRealityCheckRunOut,
 )
+# Issue #349 `OP-S8`: the Runtime Reality Check is automatic under §4.2.2's
+# deterministic conditions, so it carries a run record (`W1` while running).
+# A deliberate skip is not a run; a failure is degraded (the developer can
+# keep working -- the check only ADDS confirmation questions).
+@tracked_process("runtime_reality_check", skipped_attr="skipped")
 def run_runtime_reality_check(
     session_id: int,
     system_id: int = Depends(get_system_id),

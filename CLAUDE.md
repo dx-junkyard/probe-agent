@@ -373,6 +373,95 @@ creating incomplete persistence or execution paths for later phases.
     Everything else is derivable from
     existing persisted facts. See the Issue #342 section in
     `docs/project-intelligence.md`.
+    **Status: the spec is implemented by Issue #349 (below). Treat
+    `docs/system-interview-workflow-ux.md` as the canonical description of
+    the interview screen's behaviour, not as a future plan.**
+
+16. Issue #349 — the implementation of the #342 spec. Unlike #343-#346, this
+    issue explicitly OWNS code: DB, API, state management, Dashboard, tests.
+    What it added, and what any later change must preserve:
+    - `app/interview_workflow.py` is the **single canonical state engine**.
+      `evaluate_candidate_state` is the 13-row first-match table and
+      `apply_backward_hold` is the ordered-state hold; both are pure
+      functions of a `WorkflowFacts` value. Do not re-derive a workflow
+      state anywhere else — in particular never in the Dashboard.
+    - The four §8.1 facts are five tables: `interview_diff_review` (A,
+      manual, keyed to the reviewed diff's `materialized_at` so a new diff
+      never inherits the old confirmation), `interview_process_run` (B,
+      running/succeeded/failed + `failure_class` + a `W2`/`W4`/`W5`
+      `target_state`), `interview_workflow_checkpoint` +
+      `interview_back_request` (C), and `interview_back_acknowledgement`
+      (D, manual). `interview_session_status_audit` records `OP-D14`
+      suspend/resume as manual; the state itself still comes from the
+      existing session `status`.
+    - "Unresolved" for a blocking failure is **derived** (no later success
+      of the same `process_kind`), never stored — so a suspend/resume cannot
+      launder a failure into a solved one.
+    - Every process that can produce `W1` must open a run record:
+      `interview_workflow.process_run` / `ProcessRunTracker` /
+      `tracked_process`. A 404/409 precondition rejection is `abandon()`,
+      not a failure — recording it would show a retry that cannot succeed.
+      A process without a run record must not produce `W1`.
+    - `GET /interview/workflow-state` is the only source of the displayed
+      state, its single `primary_action`, and the active exceptions. The
+      Dashboard renders that; `deriveUiState` survives only as an internal
+      selector for the conversation card's CONTENT and no longer takes a
+      mutation's `isPending`.
+    - The spec's abolished elements are gone from the page: the two main
+      tabs and the 「会話タブへ移動」 lead, the 「差分を生成」 button (`OP-S7`
+      is automatic), the three "precondition not met" notes, and the Intent
+      「AIに提案してもらう」 button. 「理解を構築/更新」, 「突き合わせを実行」,
+      「AIに先に調査させる」 and 「実態チェックを実行」 exist only as the
+      recovery action of a currently-active exception.
+    - `W6`'s primary action is the diff-review record itself; downloading
+      the patch must never satisfy it.
+    Review round 1 (PR #350) added five more invariants, each of which was a
+    stuck screen rather than a cosmetic slip:
+    - Every Dashboard mutation that changes a state-deciding fact calls
+      `_invalidateWorkflow`. The page renders one server-decided state and
+      the workflow query only polls while something is running, so a missed
+      invalidation freezes the flow until a reload.
+    - `POST /interview/sessions` opens the initial build's run record itself
+      (`W0-B` completes by "session created AND investigation started"); the
+      request that performs the build adopts that record. Otherwise a reload
+      between the two calls drops a new session into `W7` permanently.
+    - `open_required_questions` excludes questions held by an in-flight
+      handoff — 「引き継ぎ済み」 is a `W3` completion condition and the
+      `interview_qa.status` column deliberately cannot express it.
+    - Failure resolution compares `finished_at` (overlapping runs of one kind
+      can finish out of id order), and the stale sweep is provisional: a real
+      completion still overwrites it, because nothing writes `heartbeat_at`
+      mid-run.
+    - A suspended session never auto-resolves a pending backward request, and
+      resuming records the manual acknowledgement for it (§5.4 terminal 3).
+    Review round 2 (PR #350) tightened four more, all of them "the developer
+    cannot get out of here" rather than a wrong label:
+    - Auto-selecting a session happens once, on first load, and never
+      overrides an explicit 「セッション未選択」. Re-selecting on every render
+      made `W0-B` unreachable on any System that already had a session, i.e.
+      no second interview could ever be started.
+    - `POST /interview/sessions` does not merely reserve the run record — it
+      **dispatches the build**, adopting that exact record (eager inline when
+      `PROBE_INTERVIEW_EAGER_INITIAL_BUILD=1`, otherwise a worker thread; a
+      dispatch that cannot start is failed immediately as a recoverable
+      `E3-a` rather than waiting for the stale sweep). Consequently the
+      Dashboard's start flow no longer posts `update-understanding` — that
+      second call would run the same reasoning build twice.
+    - `ProcessRunTracker.start(adopt_run_id=...)` adopts ONE named record.
+      Adopting "the oldest running row of this kind" let two legitimately
+      overlapping rebuilds share a row, so whichever finished last decided
+      for both and could erase the other's failure.
+    - Failure resolution reads the LATEST finished run per `process_kind`
+      (`finished_at`, id as tiebreak), not "any later success". With three or
+      more overlapping runs, an older success would otherwise mask the newest
+      failure.
+    Tests must not spawn that initial-build worker: `tests/conftest.py` stubs
+    `_dispatch_initial_understanding_build` for every test, and
+    `test_interview_workflow.py`'s `real_initial_build_dispatch` fixture puts
+    it back for the two tests that assert on it.
+    Human gates are unchanged: 理解の確認 / Alignment 項目の確定 / 提案の
+    承認・編集・却下 / 差分の適用 / 観測の開始 / 戻り要求への承諾 / 中断・
+    引き継ぎ・再開 all stay `decision_method: manual`.
 
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
