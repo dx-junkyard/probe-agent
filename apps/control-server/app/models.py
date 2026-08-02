@@ -6992,14 +6992,66 @@ class InterviewSessionStatusAuditOut(BaseModel):
 # support (app/understanding_brief.py). `confirmation` and `provenance` are
 # two independent finite axes on purpose: "the developer confirmed it" and
 # "the developer wrote it" must stay distinguishable.
+#
+# The vocabularies live here as `Literal` aliases, not as bare `str` fields,
+# for two reasons: the response schema then carries the enum, and
+# `tests/test_interview_type_parity.py` can hold the Dashboard union to the
+# same set. `app/understanding_brief.py` derives its tuples from these with
+# `get_args`, so there is exactly one definition of each set.
+
+#: 確認状態 -- how settled a claim is.
+UnderstandingConfirmationState = Literal[
+    "confirmed",
+    "ai_hypothesis",
+    "conflicting",
+    "unknown",
+    "recheck_required",
+]
+
+#: 出所 -- where the claim's content came from. Independent of the above.
+UnderstandingProvenanceKind = Literal[
+    "developer_intent",
+    "implementation_fact",
+    "runtime_observation",
+    "ai_hypothesis",
+]
+
+UnderstandingClaimKind = Literal["vision", "system_purpose", "core_capability"]
+
+UnderstandingReadinessState = Literal[
+    "not_built",
+    "building",
+    "needs_confirmation",
+    "ready",
+    "recheck_required",
+    "blocked",
+]
+
+UnderstandingReadinessSeverity = Literal["blocking", "attention", "informational"]
+
+#: Change kinds reported against the confirmed revision. The first four come
+#: from `understanding_diff`; the rest are the remaining `claim_payload`
+#: fields. Every field that can decide a recheck must appear here, or a claim
+#: becomes reportable as "changed" with nothing to show.
+UnderstandingChangeKind = Literal[
+    "added",
+    "removed",
+    "summary_changed",
+    "confidence_changed",
+    "contribution_changed",
+    "evidence_changed",
+    "related_docs_changed",
+    "related_apis_changed",
+    "composition_changed",
+]
 
 
 class UnderstandingBriefClaimOut(BaseModel):
-    kind: str
+    kind: UnderstandingClaimKind
     name: str
     summary: str = ""
-    confirmation: str
-    provenance: str
+    confirmation: UnderstandingConfirmationState
+    provenance: UnderstandingProvenanceKind
     confirmation_label: str
     provenance_label: str
     reason: str = ""
@@ -7013,14 +7065,14 @@ class UnderstandingBriefClaimOut(BaseModel):
 
 class UnderstandingReadinessReasonOut(BaseModel):
     code: str
-    severity: str
+    severity: UnderstandingReadinessSeverity
     message: str
     target_kind: str = "none"
     target_name: str = ""
 
 
 class UnderstandingChangeOut(BaseModel):
-    change_kind: str
+    change_kind: UnderstandingChangeKind
     section: str
     section_label: str
     name: str
@@ -7040,7 +7092,7 @@ class UnderstandingBriefOut(BaseModel):
     core_capability_initial_count: int = 0
     key_unconfirmed: List[UnderstandingBriefClaimOut] = []
     detail_counts: Dict[str, int] = {}
-    readiness_state: str
+    readiness_state: UnderstandingReadinessState
     readiness_label: str
     readiness_description: str
     readiness_reasons: List[UnderstandingReadinessReasonOut] = []

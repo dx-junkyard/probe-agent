@@ -5544,6 +5544,17 @@ mock クライアントに対して fail closed なので `current_understanding
 追加・削除と詳細変更は同時に列挙する — 以前は `elif` で、同じ再構築に追加が
 あると詳細の説明ごと落ちていた。
 
+有限集合は `app/models.py` の `Literal` を唯一の定義とし、
+`understanding_brief.py` は `get_args` で同じ集合をタプルとして取り出す
+(`UnderstandingConfirmationState` / `UnderstandingProvenanceKind` /
+`UnderstandingClaimKind` / `UnderstandingReadinessState` /
+`UnderstandingReadinessSeverity` / `UnderstandingChangeKind`)。API モデルを
+素の `str` にしておくとレスポンススキーマに enum が乗らず、Dashboard の
+union が黙ってずれる — 実際 `change_kind` に 5 種類を足したときにずれた。
+既存の `tests/test_interview_type_parity.py`(models.py と types.ts を直接
+パースして比較する)の `FINITE_TYPE_NAMES` に 6 つとも登録してあるので、
+片側だけの追加は失敗する。
+
 **Readiness を動かせるのは Brief を変えうる処理だけ**
 (`BRIEF_AFFECTING_PROCESS_KINDS` = `understanding_build` /
 `understanding_update` / `intent_candidates`)。実行中レコードとブロッキング

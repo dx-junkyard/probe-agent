@@ -513,6 +513,11 @@ creating incomplete persistence or execution paths for later phases.
       are both derived from it, so a claim can never be reported as changed
       without the change being nameable. Additions/removals and detail
       changes are listed together.
+    - The Brief's six finite vocabularies are `Literal` aliases in
+      `app/models.py`, mirrored into `understanding_brief.py` with `get_args`
+      and held to the Dashboard unions by `test_interview_type_parity.py`'s
+      `FINITE_TYPE_NAMES`. A bare `str` API field puts no enum in the schema
+      and lets the TypeScript union drift unnoticed.
     - `GET /interview/understanding-brief` is the only source of the Brief;
       the Dashboard renders it and never recomputes a confirmation state,
       provenance, or readiness verdict. Only the display density is a client

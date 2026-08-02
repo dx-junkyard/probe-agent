@@ -4419,6 +4419,23 @@ export type UnderstandingReadinessSeverity = "blocking" | "attention" | "informa
 
 export type UnderstandingClaimKind = "vision" | "system_purpose" | "core_capability";
 
+/**
+ * 前回確認時からの変更種別。前 4 つはリビジョン差分 (名前・説明・確信度)、
+ * 残りは `claim_payload` の各フィールド。再確認を決めるフィールドは必ずここに
+ * 現れる -- サーバー側の `UnderstandingChangeKind` と同一集合で、
+ * `test_interview_type_parity.py` が両者の乖離を禁止している。
+ */
+export type UnderstandingChangeKind =
+  | "added"
+  | "removed"
+  | "summary_changed"
+  | "confidence_changed"
+  | "contribution_changed"
+  | "evidence_changed"
+  | "related_docs_changed"
+  | "related_apis_changed"
+  | "composition_changed";
+
 export interface UnderstandingBriefClaimOut {
   kind: UnderstandingClaimKind;
   name: string;
@@ -4445,7 +4462,7 @@ export interface UnderstandingReadinessReasonOut {
 }
 
 export interface UnderstandingChangeOut {
-  change_kind: "added" | "removed" | "summary_changed" | "confidence_changed";
+  change_kind: UnderstandingChangeKind;
   section: string;
   section_label: string;
   name: string;

@@ -47,9 +47,17 @@ import json
 import sqlite3
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, get_args
 
 from . import interview_workflow, runtime_alignment, runtime_reality
+from .models import (
+    UnderstandingChangeKind,
+    UnderstandingClaimKind,
+    UnderstandingConfirmationState,
+    UnderstandingProvenanceKind,
+    UnderstandingReadinessSeverity,
+    UnderstandingReadinessState,
+)
 
 __all__ = [
     "CLAIM_KINDS",
@@ -80,58 +88,38 @@ __all__ = [
 
 # --- §0. Finite vocabularies -------------------------------------------------
 
+# Each vocabulary is defined ONCE, as a `Literal` in `app/models.py`, and
+# mirrored here as a tuple. That way the response schema carries the enum, the
+# Dashboard union is held to the same set by
+# `tests/test_interview_type_parity.py`, and this module still has plain
+# tuples to iterate and assert on. Adding a value means editing the Literal --
+# there is nowhere else it can drift to.
+
 #: The three claim kinds the Brief separates. Merging any two of them is the
 #: exact failure #351 exists to fix, so they never share a list.
-CLAIM_KINDS: Tuple[str, ...] = ("vision", "system_purpose", "core_capability")
+CLAIM_KINDS: Tuple[str, ...] = get_args(UnderstandingClaimKind)
 
-#: 確認状態 -- how settled a claim is. Independent of PROVENANCE_KINDS.
-CONFIRMATION_STATES: Tuple[str, ...] = (
-    "confirmed",         # 確認済み
-    "ai_hypothesis",     # AI 仮説・未確認
-    "conflicting",       # 矛盾あり
-    "unknown",           # 不明・情報不足
-    "recheck_required",  # 変更後の再確認待ち
-)
+#: 確認状態 -- how settled a claim is. Independent of PROVENANCE_KINDS:
+#: confirmed / ai_hypothesis / conflicting / unknown / recheck_required.
+CONFIRMATION_STATES: Tuple[str, ...] = get_args(UnderstandingConfirmationState)
 
 #: 出所 -- where the claim's CONTENT came from. Deliberately a separate axis:
 #: "a human pressed 確認" must never be readable as "a human authored this".
-PROVENANCE_KINDS: Tuple[str, ...] = (
-    "developer_intent",     # 開発者が明示した意図
-    "implementation_fact",  # コード・ドキュメントから得た実装事実
-    "runtime_observation",  # Runtime の観測
-    "ai_hypothesis",        # AI の解釈・仮説
-)
+PROVENANCE_KINDS: Tuple[str, ...] = get_args(UnderstandingProvenanceKind)
 
-READINESS_STATES: Tuple[str, ...] = (
-    "not_built",
-    "building",
-    "needs_confirmation",
-    "ready",
-    "recheck_required",
-    "blocked",
-)
+READINESS_STATES: Tuple[str, ...] = get_args(UnderstandingReadinessState)
 
 #: A reason is either something that stops the current decision, something the
 #: developer should look at, or context. #353: 参考情報の不足と判断を止める
 #: 不足を混同しない.
-REASON_SEVERITIES: Tuple[str, ...] = ("blocking", "attention", "informational")
+REASON_SEVERITIES: Tuple[str, ...] = get_args(UnderstandingReadinessSeverity)
 
 #: Change kinds. The first four come from the deterministic revision diff
 #: (`understanding_diff`); the rest are the remaining `claim_payload` fields,
 #: compared here. Together they cover every field the recheck decision looks
 #: at, so a claim can never be reported as changed without the change itself
 #: being nameable.
-CHANGE_KINDS: Tuple[str, ...] = (
-    "added",
-    "removed",
-    "summary_changed",
-    "confidence_changed",
-    "contribution_changed",
-    "evidence_changed",
-    "related_docs_changed",
-    "related_apis_changed",
-    "composition_changed",
-)
+CHANGE_KINDS: Tuple[str, ...] = get_args(UnderstandingChangeKind)
 
 #: `claim_payload` field -> (change kind, developer-facing sentence). `summary`
 #: is absent because the revision diff already reports it.

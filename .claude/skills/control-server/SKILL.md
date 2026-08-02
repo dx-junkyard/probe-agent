@@ -907,6 +907,15 @@ Rules for any new artifact:
     `claim_digest` comparison (name excluded). Do not introduce similarity
     matching here — a rename is a remove + an add, exactly as in
     `understanding_diff`.
+  - The Brief's finite vocabularies (`UnderstandingConfirmationState`,
+    `UnderstandingProvenanceKind`, `UnderstandingClaimKind`,
+    `UnderstandingReadinessState`, `UnderstandingReadinessSeverity`,
+    `UnderstandingChangeKind`) are declared ONCE as `Literal` aliases in
+    `app/models.py`; `understanding_brief.py` derives its tuples with
+    `get_args`, and `tests/test_interview_type_parity.py` holds the Dashboard
+    unions to the same sets. A bare `str` field here means the response schema
+    carries no enum and the TypeScript union can drift unnoticed — which is
+    exactly what happened when `change_kind` gained five members.
   - `claim_payload` is the single definition of a claim's content: the digest
     that decides a recheck AND the change list the developer reads are both
     built from it. Adding a field to the payload means adding it to
