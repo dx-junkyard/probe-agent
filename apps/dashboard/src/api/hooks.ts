@@ -720,6 +720,11 @@ export function useApplyProbePatch() {
 // every such mutation; a missing call is a stuck screen, not a stale badge.
 function _invalidateWorkflow(qc: ReturnType<typeof useQueryClient>, sessionId: number | null) {
   qc.invalidateQueries({ queryKey: [...sysKey("interviewWorkflowState"), sessionId] });
+  // Issue #351: the Brief is derived from the same persisted facts, so every
+  // mutation that can move the workflow state can also change what the Brief
+  // says. Refreshing them together keeps 「現在の理解」 from lagging one
+  // action behind the state shown right above it.
+  qc.invalidateQueries({ queryKey: [...sysKey("understandingBrief"), sessionId] });
   qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
   qc.invalidateQueries({ queryKey: sysKey("interviewSessions") });
 }
@@ -3135,6 +3140,33 @@ export function useInterviewWorkflowState(sessionId: number | null) {
     // is in flight so `W1` clears by itself when it finishes.
     refetchInterval: (query) =>
       query.state.data?.running_processes?.length ? 2000 : false,
+  });
+}
+
+// --- Understanding Brief / Decision Readiness (Issues #351-#354) ------------
+//
+// A second read-only query alongside the workflow state. It is deliberately
+// NOT merged into `useInterviewWorkflowState`: the workflow state decides
+// where the developer is and what the single primary action is, the Brief
+// says what the system is understood to be and whether that understanding can
+// be trusted. Keeping them apart is what stops the screen from reading a
+// readiness verdict as a workflow position (#353).
+
+export function useUnderstandingBrief(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("understandingBrief"), sessionId],
+    queryFn: () =>
+      api.get<import("@/api/types").UnderstandingBriefOut>(
+        sessionId
+          ? `/interview/understanding-brief?session_id=${sessionId}`
+          : "/interview/understanding-brief",
+      ),
+    enabled: !!getSystemId(),
+    // Mirrors the workflow query: while the server says a process is running,
+    // poll so 「更新しています」 clears by itself. Nothing invalidates this
+    // query when a background rebuild finishes on its own.
+    refetchInterval: (query) =>
+      query.state.data?.readiness_state === "building" ? 2000 : false,
   });
 }
 

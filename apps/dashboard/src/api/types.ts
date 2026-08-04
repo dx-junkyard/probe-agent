@@ -499,6 +499,9 @@ export interface InterviewStructuredQuestion {
 }
 
 export interface CurrentUnderstanding {
+  // Issue #352: added after the other sections, so a session built by an
+  // older Control Server (no `vision` key) still type-checks and renders.
+  vision?: UnderstandingItem[];
   system_purpose: UnderstandingItem[];
   core_capabilities: UnderstandingItem[];
   capability_elements: UnderstandingItem[];
@@ -4381,4 +4384,110 @@ export interface InterviewSessionStatusAuditOut {
   actor: string;
   decision_method: string;
   created_at: number;
+}
+
+// --- Understanding Brief / Decision Readiness (Issues #351-#354) -------------
+//
+// `GET /interview/understanding-brief`. The server derives all of this from
+// persisted facts; the Dashboard renders it and never recomputes a
+// confirmation state, a provenance, or a readiness verdict of its own.
+
+/** 確認状態 — how settled a claim is. */
+export type UnderstandingConfirmationState =
+  | "confirmed"
+  | "ai_hypothesis"
+  | "conflicting"
+  | "unknown"
+  | "recheck_required";
+
+/** 出所 — where the claim's content came from. A separate axis from the above. */
+export type UnderstandingProvenanceKind =
+  | "developer_intent"
+  | "implementation_fact"
+  | "runtime_observation"
+  | "ai_hypothesis";
+
+export type UnderstandingReadinessState =
+  | "not_built"
+  | "building"
+  | "needs_confirmation"
+  | "ready"
+  | "recheck_required"
+  | "blocked";
+
+export type UnderstandingReadinessSeverity = "blocking" | "attention" | "informational";
+
+export type UnderstandingClaimKind = "vision" | "system_purpose" | "core_capability";
+
+/**
+ * 前回確認時からの変更種別。前 4 つはリビジョン差分 (名前・説明・確信度)、
+ * 残りは `claim_payload` の各フィールド。再確認を決めるフィールドは必ずここに
+ * 現れる -- サーバー側の `UnderstandingChangeKind` と同一集合で、
+ * `test_interview_type_parity.py` が両者の乖離を禁止している。
+ */
+export type UnderstandingChangeKind =
+  | "added"
+  | "removed"
+  | "summary_changed"
+  | "confidence_changed"
+  | "contribution_changed"
+  | "evidence_changed"
+  | "related_docs_changed"
+  | "related_apis_changed"
+  | "composition_changed";
+
+export interface UnderstandingBriefClaimOut {
+  kind: UnderstandingClaimKind;
+  name: string;
+  summary: string;
+  confirmation: UnderstandingConfirmationState;
+  provenance: UnderstandingProvenanceKind;
+  confirmation_label: string;
+  provenance_label: string;
+  reason: string;
+  contribution: string;
+  /** モック LLM 由来。隠さずに明示する (CLAUDE.md)。 */
+  is_mock: boolean;
+  evidence: { path: string; start_line: number; end_line: number; summary?: string }[];
+  related_docs: string[];
+  related_apis: string[];
+}
+
+export interface UnderstandingReadinessReasonOut {
+  code: string;
+  severity: UnderstandingReadinessSeverity;
+  message: string;
+  target_kind: string;
+  target_name: string;
+}
+
+export interface UnderstandingChangeOut {
+  change_kind: UnderstandingChangeKind;
+  section: string;
+  section_label: string;
+  name: string;
+  detail: string;
+}
+
+export interface UnderstandingBriefOut {
+  system_id: number;
+  session_id: number | null;
+  built: boolean;
+  vision: UnderstandingBriefClaimOut | null;
+  vision_missing_information: string[];
+  system_purpose: UnderstandingBriefClaimOut[];
+  core_capabilities: UnderstandingBriefClaimOut[];
+  core_capability_initial_count: number;
+  key_unconfirmed: UnderstandingBriefClaimOut[];
+  detail_counts: Record<string, number>;
+  readiness_state: UnderstandingReadinessState;
+  readiness_label: string;
+  readiness_description: string;
+  readiness_reasons: UnderstandingReadinessReasonOut[];
+  changes_since_confirmation: UnderstandingChangeOut[];
+  confirmed_at: number | null;
+  confirmed_revision_id: number | null;
+  /** 表示中の理解のリビジョン。更新中に「いま見ているもの」を特定するため。 */
+  revision_id: number | null;
+  snapshot_id: number | null;
 }

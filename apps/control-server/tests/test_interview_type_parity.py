@@ -89,6 +89,16 @@ FINITE_TYPE_NAMES = (
     "RuntimeObservationProposalStatus",
     "RuntimeCheckState",
     "RuntimeFactFreshness",
+    # Issue #351: the Understanding Brief / Decision Readiness axes. These are
+    # exactly the kind of set that drifts silently -- the Dashboard does not
+    # branch on `change_kind` today, so a missing member type-checks and only
+    # becomes wrong when someone later writes an exhaustive switch.
+    "UnderstandingChangeKind",
+    "UnderstandingClaimKind",
+    "UnderstandingConfirmationState",
+    "UnderstandingProvenanceKind",
+    "UnderstandingReadinessSeverity",
+    "UnderstandingReadinessState",
 )
 
 

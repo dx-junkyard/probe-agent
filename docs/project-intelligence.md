@@ -5447,3 +5447,191 @@ Dashboard 側は `apps/dashboard/src/__tests__/workflow-panel.test.tsx`
 (役割・主操作・例外区分の表示規約)と `dashboard-contracts.test.tsx` の
 Interview page 群(状態ごとに 1 つの作業面、未到達操作が描かれないこと、
 主操作と完了条件の一致、戻り要求の承諾導線)で検証する。
+
+## Understanding Brief と Decision Readiness(Epic #351 / #352 / #353 / #354)
+
+#342 / #349 で、インタビュー画面は「工程のどこにいて、次に何をするか」を
+1 つの正準な状態から描くようになった。#351 が指摘したのはその **手前** の
+欠落である — 開発者が本当に最初に判断したいのは工程上の現在地ではなく、
+「AI はこのシステムを何のためのものと理解しているか」「どこが確実でどこが
+仮説か」「この理解のまま進めてよいか」の 3 点で、従来の「現在の理解」は
+確信度で「分かったこと / 確認したいこと」へ平坦に分類するだけだったため、
+システム全体を **意味として** 要約する層が存在しなかった。
+
+実装は 3 つ:`app/understanding_brief.py`(決定的な導出)、
+`GET /interview/understanding-brief`(唯一の読み取り口)、
+`components/system-understanding/understanding-brief.tsx`(表示)。
+
+### Vision は Purpose と別の主張として持つ
+
+`system_understanding_reviewer` の出力に `vision` セクションを追加した
+(`PROMPT_VERSION='understanding-review-v6'` / `SCHEMA_VERSION=
+'understanding-review-v2'`)。Vision(誰の状態をどう変えたいか)と
+System Purpose(その Vision に対してこのシステムが担う役割)を 1 つの
+セクションに畳むと、#351 が解消対象とした「開発者の意図と実装上の責務が
+同じ『確認済み』表現に混ざる」状態がデータ構造の時点で発生する。
+
+- Vision は最大 1 件(`_MAX_VISION_ITEMS`)。超過分は決定的に切り捨てる。
+- Vision は `_EVIDENCE_REQUIRED_SECTIONS` に **入れない**。根拠が無い Vision
+  ごとに高優先度の open question を作ると、ほぼ全セッションで発火する
+  ノイズになり、しかも開発者自身の Vision には Intent Brief という正しい
+  置き場がすでにある。代わりに、根拠の無い Vision の確信度を決定的に
+  `uncertain` へ落とす。これで Brief 側では「AI 仮説・未確認」または
+  「不明・情報不足」としてしか表示されえない。
+- 「Vision を推定できない」ことは事実として表示する。プロンプトも、入力に
+  対象や実現したい状態が書かれていなければ空配列を返せと明示している —
+  コードの機構から Vision を逆算した文章は事実ではない。
+
+Brief 上の Vision の解決順は first-match で、確定済みの Intent Brief
+`goal` > モデルの `vision` > 未確定の `goal` > 無し(不足情報を明示)。
+開発者自身が「何を変えたいか」を確定しているなら、モデルのリポジトリ読解
+より常にそちらが上位に来る。
+
+モック LLM 由来の主張は隠さずに `is_mock` で明示する。理解レビュー自体は
+mock クライアントに対して fail closed なので `current_understanding` が
+モックになることはないが、Intent Brief の `ai_proposed` 行はモックになりうる
+——そしてそれが Vision として表示されうる。
+
+### 確認状態と出所は独立した 2 軸
+
+同じ「確認済み」表現に混ぜないという要求を、1 つの値で表現することはできない。
+そこで claim ごとに 2 つの有限集合を別々に持つ。
+
+- 確認状態 `confirmation`: `confirmed` / `ai_hypothesis` / `conflicting` /
+  `unknown` / `recheck_required`。first-match で、矛盾 > 確認後の変更 >
+  確認済み > 情報不足 > 仮説。矛盾が確認済みより上なのは、確定した主張が
+  後から矛盾と判定されたときに「確認済み」のままにしないため。確認後の変更が
+  確認済みより上なのは、まさに #351 が禁じた「黙って差し替える」表示を
+  構造的に不可能にするため。
+- 出所 `provenance`: `developer_intent` / `runtime_observation` /
+  `implementation_fact` / `ai_hypothesis`。`classify_provenance` は
+  「人間が確認したか」を **見ない**。AI が書いた文を人が承認しても、著者は
+  AI のままである。
+
+「同じ主張か」の判定は名前の完全一致のみで、`understanding_diff` と同じ規則。
+内容が変わったかは `claim_digest`(名前を除く意味項目の正準 JSON の SHA-256)
+の比較で、改名は「削除 + 追加」として現れる。類似度も埋め込みも使わない
+(Principle 6)。確認済みリビジョンの取得は #312 の
+`understanding_capability_confirmation.source_revision_id` を第一とし、
+ゼロベース確定や #312 以前のセッションでは
+`understanding_confirmed_at` 以前の最新リビジョンにフォールバックする —
+どちらも永続事実で、「たぶんこれを見ていたはず」という推測はしない。
+
+### Decision Readiness はワークフロー状態とは別の軸で、ゲートではない
+
+`evaluate_readiness` は `not_built` / `building` / `blocked` /
+`recheck_required` / `needs_confirmation` / `ready` を first-match で返し、
+同時に有限コードの理由を返す。理由には severity(`blocking` /
+`attention` / `informational`)と対象(claim 名・process 種別・snapshot)が
+必ず付く — #353 の「件数だけで理由を代替しない」「参考情報の不足と判断を
+止める不足を混同しない」に対応する。
+
+「変更後の再確認待ち」は `change_count`(変更の列挙件数)と
+`recheck_claim_count`(claim_digest が変わった主張の件数)の **両方** を見る。
+また、再確認待ちの主張を `unconfirmed_capability_count` /
+`purpose_confirmed` の「未確認」側に数えない。同じ主張について
+「未確認です」と「前回の確認後に変わりました」を並べると、両立しない 2 つの
+説明を同時に出すことになる。
+
+**変更の列挙は再確認の判定と同じフィールド集合から作る。** `claim_payload`
+(名前を除く意味項目の正規化)が唯一の定義で、`claim_digest` はその SHA-256、
+変更リストは同じ payload のフィールド比較である。`understanding_diff` は
+名前・説明・確信度しか報告しないので、それだけに頼ると `why_core`・根拠・
+関連 API・子要素が変わった Capability について「変わりました」とだけ言って
+中身を示せない(#353 の「何が、どのように変わったか」が満たせない)。
+`_DETAIL_FIELD_CHANGES` がこの差を埋め、
+`test_every_digest_field_is_nameable_as_a_change` が両者の乖離を禁止している。
+追加・削除と詳細変更は同時に列挙する — 以前は `elif` で、同じ再構築に追加が
+あると詳細の説明ごと落ちていた。
+
+有限集合は `app/models.py` の `Literal` を唯一の定義とし、
+`understanding_brief.py` は `get_args` で同じ集合をタプルとして取り出す
+(`UnderstandingConfirmationState` / `UnderstandingProvenanceKind` /
+`UnderstandingClaimKind` / `UnderstandingReadinessState` /
+`UnderstandingReadinessSeverity` / `UnderstandingChangeKind`)。API モデルを
+素の `str` にしておくとレスポンススキーマに enum が乗らず、Dashboard の
+union が黙ってずれる — 実際 `change_kind` に 5 種類を足したときにずれた。
+既存の `tests/test_interview_type_parity.py`(models.py と types.ts を直接
+パースして比較する)の `FINITE_TYPE_NAMES` に 6 つとも登録してあるので、
+片側だけの追加は失敗する。
+
+**Readiness を動かせるのは Brief を変えうる処理だけ**
+(`BRIEF_AFFECTING_PROCESS_KINDS` = `understanding_build` /
+`understanding_update` / `intent_candidates`)。実行中レコードとブロッキング
+失敗の両方をこの集合で絞る。絞らないと、提案生成が走っているだけで
+「システムが理解を作成しています」になり、差分生成の失敗(`E12`、常に
+blocking)だけで「理解を作る処理が失敗した」と表示される — どちらも工程の
+状態を理解の信頼性として読ませることになり、両者を分離するという #353 の
+要件そのものに反する。Dashboard 側の `W1` カードも同じ理由で、見出しを
+サーバーの `readiness_state === "building"` で切り替える。`W1` は
+「システムが何か実行中」であって「理解を作り直し中」とは限らない。
+
+**主要機能が 0 件の理解は「進行可能」にならない。** Purpose と主要機能の
+両方が空のときだけブロックする作りでは、Purpose だけのリビジョンを確定すると
+「System Purpose と主要機能は確認済み」と表示されてしまう。`capabilities_missing`
+(attention)を出すことで `ready` に到達しなくなる。ブロッキングにはしない —
+Purpose だけでも開発者は判断できるし、#352 が求めているのは「完了したように
+見せない」ことであって工程を止めることではない。
+
+2 つの境界を意図的に守っている。
+
+1. **ゲートにしない。** 主操作は引き続き `app/interview_workflow.py` が
+   決める 1 つだけで、`blocked` でも消えない。「すべての未確認事項が
+   なくなるまで工程を止める」ことは #353 の明示的な非目標である。
+   `test_a_blocking_failure_blocks_the_brief_but_never_the_primary_action`
+   がこの不変条件を固定している。
+2. **工程状態を再定義しない。** Readiness は「この判断材料を信頼できるか」、
+   ワークフロー状態は「どこにいるか」。事実は `gather_facts` を共有して
+   読むので両者が食い違うことはないが、語彙・見出し・API を分けている。
+
+`ready` は「理解が完全・無誤謬」という意味ではない。説明文にもそう書いて
+あり、根拠として「Purpose と主要機能は確認済みで、判断を止める未解決事項が
+ない」という理由コードを必ず 1 件返す。合成された信頼度パーセントは
+どこにも出さない。
+
+### 全ワークフロー状態で同じ位置・異なる展開量
+
+`BRIEF_DISPLAY_BY_STATE` は状態 → 展開量の固定表で、状態そのものは常に
+サーバーの `workflow.state`(#349 の原則 P9 は緩めていない)。
+
+| 状態 | 展開量 | 出すもの |
+| --- | --- | --- |
+| `W0-A` / `W0-B` | `empty` | 「まだ構築していない」事実のみ。架空の Vision は出さない |
+| `W1` | `building` | 骨格 + 何を構築中か + 表示中が更新前である旨。確定操作は出さない |
+| `W2` | `full` | 主作業。Vision / Purpose / 主要機能 / 重要な未確認事項 + 主操作 |
+| `W3`〜`W7` | `compact` | Vision / Purpose / 主要機能名 / Readiness / 変更有無。展開で `full` と同じ |
+
+配置はメインカラムの先頭に統一した。右カラムは狭い画面で下へ回り込むため、
+そこに置くと Vision・Purpose・進行可否が主作業より大幅に下がる(#354 の
+画面幅要件)。これに伴い、右カラムにあった「現在の理解」カードは廃止した —
+同じ対象を 2 箇所に置かない(#349 の原則 P7)。全文ツリー(従来の
+`UnderstandingOverview`)は Brief の折りたたみの中に R4 として残っている。
+`W2` の確認操作(「この理解で進む」)も会話カードから Brief カードへ移した。
+判断対象と主操作は同じ作業面に置く(原則 P2)という規則を、判断対象が
+Brief になった以上そのまま適用した結果である。会話カードに残る確定操作は
+ゼロベース(構造化された理解が無く、会話内容そのものが確認対象になる場合)
+だけになった。
+
+右カラムの `last_error` 表示も削除した。表示条件が「未解消の失敗がある」
+ことそのもので、失敗内容・影響・復旧条件・再試行を 1 枠にまとめる
+`WorkflowExceptions`(#342 §4.4)と必ず同時に出る重複だったからである。
+
+Brief の取得に失敗した場合(読み込み中、または `understanding-brief` を
+持たない古い Control Server)は、`unavailable` 表示に落として **主操作と
+全文ツリーを残す**。要約は判断の補助であって、ワークフローの前提ではない —
+要約 API が落ちただけで状態の主操作へ到達できなくなるのは、#349 が繰り返し
+潰してきた「画面が詰まる」バグそのものである。
+
+### 検証
+
+`apps/control-server/tests/test_understanding_brief.py` が、確認状態と出所の
+全値の到達可能性・first-match 順序・2 軸の独立性、`claim_digest` の改名/編集
+の扱い、Readiness 全状態と severity 分離と決定性、確定→変更で
+`recheck_required` と具体的な変更内容が出ること、確定済み Intent `goal` が
+Vision を上書きすること、ブロッキング失敗が Readiness を `blocked` にしても
+主操作を変えないこと、リロード再現性、System 分離を検証する。
+`test_system_understanding_reviewer.py` の `TestVisionSection` が Vision の
+独立性・根拠なし時のクランプ・1 件制限・不在時に捏造しないこと・
+prompt/schema version の更新を検証する。Dashboard 側は
+`apps/dashboard/src/__tests__/understanding-brief.test.tsx` と
+`dashboard-contracts.test.tsx` の Interview page 群。

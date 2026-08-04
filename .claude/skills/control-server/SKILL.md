@@ -881,6 +881,58 @@ Rules for any new artifact:
     `reached_state` checkpoint and the backward request). It confirms no
     understanding, settles no Alignment item, approves no proposal, applies
     no diff, and starts no observation.
+- The Understanding Brief and Decision Readiness (Issue #351) are derived in
+  exactly ONE place too: `app/understanding_brief.py`, served read-only by
+  `GET /interview/understanding-brief`. It is a second axis over the same
+  persisted facts, not a second workflow state.
+  - `classify_confirmation` (確認状態) and `classify_provenance` (出所) are
+    independent finite classifiers and must stay independent: provenance
+    answers "who wrote this claim", confirmation answers "is it settled".
+    Never let a human confirmation change a claim's provenance.
+  - `evaluate_readiness` is first-match over a `ReadinessFacts` value, same
+    purity rules as `WorkflowFacts` (no clock, no request-scoped value, no
+    client state) except for the runtime-freshness input, which the DB layer
+    resolves before calling it.
+  - Readiness NEVER gates. The single primary action keeps coming from
+    `app/interview_workflow.py` and must stay reachable under `blocked` —
+    "stop the flow until every uncertainty is gone" is an explicit non-goal.
+    The endpoint writes nothing.
+  - Only `BRIEF_AFFECTING_PROCESS_KINDS` may move the verdict — both for
+    running records and for blocking failures. A running `proposal_generation`
+    is not 「理解を作成しています」, and a failed `diff_generation` (always a
+    blocking failure) is not 「理解を作る処理が失敗した」. Add a kind to that
+    tuple only if it really writes `current_understanding` or an Intent Brief
+    item.
+  - Claim identity is exact name equality and content change is a
+    `claim_digest` comparison (name excluded). Do not introduce similarity
+    matching here — a rename is a remove + an add, exactly as in
+    `understanding_diff`.
+  - The Brief's finite vocabularies (`UnderstandingConfirmationState`,
+    `UnderstandingProvenanceKind`, `UnderstandingClaimKind`,
+    `UnderstandingReadinessState`, `UnderstandingReadinessSeverity`,
+    `UnderstandingChangeKind`) are declared ONCE as `Literal` aliases in
+    `app/models.py`; `understanding_brief.py` derives its tuples with
+    `get_args`, and `tests/test_interview_type_parity.py` holds the Dashboard
+    unions to the same sets. A bare `str` field here means the response schema
+    carries no enum and the TypeScript union can drift unnoticed — which is
+    exactly what happened when `change_kind` gained five members.
+  - `claim_payload` is the single definition of a claim's content: the digest
+    that decides a recheck AND the change list the developer reads are both
+    built from it. Adding a field to the payload means adding it to
+    `_DETAIL_FIELD_CHANGES` too, or a claim becomes reportable as "changed"
+    with nothing to show. `understanding_diff` covers names, summaries and
+    confidence only — never assume it covers the rest.
+  - The confirmed baseline is #312's
+    `understanding_capability_confirmation.source_revision_id`, with a
+    fallback to the newest revision at or before `understanding_confirmed_at`
+    for zero-base and pre-#312 sessions. Both are persisted facts; never
+    guess which revision "was probably on screen".
+  - Adding a `current_understanding` section (as #352 did with `vision`)
+    means updating `system_understanding_reviewer` (field + prompt +
+    `PROMPT_VERSION`/`SCHEMA_VERSION`), `understanding_diff.
+    UNDERSTANDING_SECTIONS`, `interview_workflow._has_understanding_content`,
+    and the Dashboard's `CurrentUnderstanding` / `hasUnderstandingContent` —
+    all five, or the section silently stops counting as content somewhere.
 - Additive nullable columns go through `db.py`'s `_add_column_if_missing`
   (Issue #308). It only ever adds a nullable column and never backfills, so
   do not use it for NOT NULL/DEFAULT migrations that need a value written

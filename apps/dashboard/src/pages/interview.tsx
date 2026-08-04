@@ -3,7 +3,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import {
   AlertCircle, CheckCircle, Download, FileCode, GitPullRequest,
-  HelpCircle, Layers, LifeBuoy, Loader2, MessageSquareText, Pencil, RefreshCw, Send,
+  HelpCircle, LifeBuoy, Loader2, MessageSquareText, Pencil, RefreshCw, Send,
   Sparkles, XCircle,
 } from "lucide-react";
 import {
@@ -35,6 +35,7 @@ import {
   useRunRuntimeRealityCheck,
   useInterviewProcessRuns,
   useInterviewWorkflowState,
+  useUnderstandingBrief,
   useRecordDiffReview,
   useAcknowledgeBackRequest,
   useCloseInterviewSession,
@@ -49,6 +50,7 @@ import { useAuth } from "@/api/auth";
 import { api } from "@/api/client";
 import { DiagnosticFixCallout, useDiagnosticHighlight } from "@/components/diagnostic-fix";
 import { UnderstandingOverview } from "@/components/system-understanding/understanding-overview";
+import { UnderstandingBriefPanel } from "@/components/system-understanding/understanding-brief";
 import { IntentBriefPanel } from "@/components/system-understanding/intent-brief-panel";
 import { ReviewQueuePanel } from "@/components/system-understanding/review-queue";
 import { AnswerableAreasControl, isOutOfArea, knowledgeAreaLabel } from "@/components/system-understanding/answerable-areas";
@@ -235,7 +237,9 @@ type InterviewUiState =
 function hasUnderstandingContent(u: CurrentUnderstanding | null | undefined): boolean {
   if (!u) return false;
   return [
-    u.system_purpose, u.core_capabilities, u.capability_elements,
+    // Issue #352: `vision` is optional on the type (older Control Servers do
+    // not send it) but counts as content exactly like every other section.
+    u.vision, u.system_purpose, u.core_capabilities, u.capability_elements,
     u.supporting_elements, u.api_boundaries, u.probe_flow_candidates,
   ].some(items => (items ?? []).length > 0);
 }
@@ -1459,6 +1463,9 @@ export default function InterviewPage() {
   // must not re-derive a workflow state from client-only values (a chosen
   // tab, a mutation's isPending) -- those vanish on reload (spec §2.6/P9).
   const { data: workflow } = useInterviewWorkflowState(selectedSessionId);
+  // Issue #351: 「現在のシステム理解」 と進行可否。ワークフロー状態とは別の
+  // 軸で、どちらもサーバーが永続事実から決定する。
+  const { data: understandingBrief } = useUnderstandingBrief(selectedSessionId);
   const recordDiffReview = useRecordDiffReview(selectedSessionId);
   const acknowledgeBack = useAcknowledgeBackRequest(selectedSessionId);
   const closeSession = useCloseInterviewSession(selectedSessionId);
@@ -2148,6 +2155,10 @@ export default function InterviewPage() {
               </Link>
             </CardContent>
           </Card>
+          {/* Issue #354: 構築前も「現在の理解」を同じ概念で追えるようにする。
+              主操作の下に短く置き、開始条件を押し下げる大きな空カードには
+              しない。架空の Vision / Purpose はここでも表示しない。 */}
+          <UnderstandingBriefPanel brief={understandingBrief} state={wState} />
         </>
       )}
 
@@ -2178,6 +2189,7 @@ export default function InterviewPage() {
                 </Button>
               </CardContent>
             </Card>
+            <UnderstandingBriefPanel brief={understandingBrief} state={wState} />
           </>
         ) : null
       ) : (
@@ -2228,6 +2240,47 @@ export default function InterviewPage() {
                 「どちらのタブを既定にするか」という判断自体が消えた。 */}
             <div className="space-y-4">
               <>
+                {/* Issue #351: 「現在のシステム理解」 は全状態で同じ概念・同じ
+                    位置に出す。メインカラムの先頭に置くのは #354 の画面幅要件
+                    のため -- 右カラムは狭い画面で下へ回り込むので、そこに置くと
+                    Vision / Purpose / 進行可否が主作業より大幅に下がる。
+                    W2 では主作業として全面表示し、判断対象と主操作
+                    (「この理解で進む」) を同じカードに置く (原則 P2)。W3〜W7 は
+                    コンパクト表示で、展開すると同じ Brief に到達する。
+                    以前ここにあった右カラムの「現在の理解」カードは、同じ対象を
+                    2 箇所に置かないため廃止した (原則 P7)。 */}
+                <UnderstandingBriefPanel
+                  brief={understandingBrief}
+                  state={wState}
+                  primaryAction={
+                    showUnderstandingWork && canConfirmStructuredUnderstanding ? (
+                      <div data-testid="understanding-confirm-block">
+                        <Button
+                          size="sm"
+                          onClick={doConfirmUnderstanding}
+                          disabled={confirmUnderstanding.isPending}
+                          data-testid="confirm-understanding"
+                        >
+                          <CheckCircle className="h-4 w-4 mr-1" />
+                          {confirmUnderstanding.isPending
+                            ? "確定中..."
+                            : PRIMARY_ACTION_LABELS.confirm_understanding}
+                        </Button>
+                      </div>
+                    ) : undefined
+                  }
+                  fullTree={
+                    session.current_understanding ? (
+                      <UnderstandingOverview
+                        understanding={session.current_understanding}
+                        gaps={session.gap_analysis}
+                        openQuestions={session.open_questions}
+                        nextAction={nextActionText}
+                      />
+                    ) : undefined
+                  }
+                />
+
                 {showAlignmentWork && (
                 <div className="space-y-4" data-testid="work-surface-W4">
                   <Card data-testid="alignment-review-panel">
@@ -2329,8 +2382,17 @@ export default function InterviewPage() {
                           )}
                           {(focusedQuestion.confirmable || (focusedQuestion.answerOptions ?? []).length > 0 || uiState === "fill_gaps" || proposalNarrowing) && (
                             <div className="flex flex-wrap gap-2 pt-1" data-testid="quick-answers">
+                              {/* Issue #351: 理解を「正しい」と認める操作は
+                                  Understanding Brief の「この理解で進む」
+                                  1 つに寄せる。ここの「はい、正しいです」は
+                                  会話ターンを送るだけで確定ゲートを通らない
+                                  ので、確定操作が Brief に出ている状態で
+                                  並べると「どちらを押せば進むのか」が分か
+                                  らなくなる (原則 P7)。訂正の入口
+                                  (「いいえ」) は会話側の役割なので残す。 */}
                               {focusedQuestion.confirmable && (
                                 <>
+                                  {!canConfirmStructuredUnderstanding && (
                                   <Button
                                     size="sm"
                                     variant="outline"
@@ -2341,6 +2403,7 @@ export default function InterviewPage() {
                                     <CheckCircle className="h-4 w-4 mr-1 text-emerald-600" />
                                     はい、正しいです
                                   </Button>
+                                  )}
                                   <Button
                                     size="sm"
                                     variant="outline"
@@ -2407,27 +2470,14 @@ export default function InterviewPage() {
                           )}
                         </div>
                       )}
-                      {(zeroBaseComplete || canConfirmStructuredUnderstanding) && (
-                        <div className="space-y-2" data-testid="understanding-confirm-block">
-                          {/* 判断対象と主操作は同じカード内に置く (原則 P2)。
-                              以前は「対象: 右側の『現在の理解』パネル」と書いて
-                              別カラムを探させており、仕様が解消対象とした
-                              「案内を読んだあと操作場所と判断対象を探す」構造
-                              そのものだった。全文ツリーは R4 として
-                              UnderstandingOverview 内で折りたたまれたまま。 */}
-                          {canConfirmStructuredUnderstanding && session.current_understanding && (
-                            <div className="rounded-md border bg-background/60 p-3" data-testid="understanding-summary-inline">
-                              <p className="text-[10px] uppercase font-semibold text-muted-foreground mb-1">
-                                確認の対象
-                              </p>
-                              <UnderstandingOverview
-                                understanding={session.current_understanding}
-                                gaps={session.gap_analysis}
-                                openQuestions={session.open_questions}
-                                nextAction={nextActionText}
-                              />
-                            </div>
-                          )}
+                      {/* Issue #351: 構造化された理解がある場合の確認対象と
+                          主操作は Understanding Brief カードへ移した。会話は
+                          「理解を訂正・補足する手段」であって理解そのものより
+                          上位ではない (#354)。ここに残るのはゼロベース --
+                          構造化された理解が無く、Brief に確認対象が存在しない
+                          ため、会話内容そのものが確認対象になる場合だけ。 */}
+                      {zeroBaseComplete && !canConfirmStructuredUnderstanding && (
+                        <div className="space-y-2" data-testid="zero-base-confirm-block">
                           <Button
                             size="sm"
                             onClick={doConfirmUnderstanding}
@@ -2437,9 +2487,7 @@ export default function InterviewPage() {
                             <CheckCircle className="h-4 w-4 mr-1" />
                             {confirmUnderstanding.isPending
                               ? "確定中..."
-                              : zeroBaseComplete
-                                ? "この内容で提案生成に進む"
-                                : PRIMARY_ACTION_LABELS.confirm_understanding}
+                              : "この内容で提案生成に進む"}
                           </Button>
                         </div>
                       )}
@@ -2875,53 +2923,16 @@ git commit`}
                 </CardContent>
               </Card>
 
-              {/* 現在の理解: `W2` では主作業カードが要点と確認操作を持つので
-                  ここには出さない (§3.5 の重複解消)。`W3`〜`W7` では判断の
-                  背景 (R3/R4) として参照できる。 */}
-              {wState !== "W1" && wState !== "W2" && (
-              <Card>
-                <CardHeader>
-                  <div className="flex items-center justify-between gap-2">
-                    <div>
-                      <CardTitle className="text-sm flex items-center gap-2">
-                        <Layers className="h-4 w-4" /> 現在の理解
-                      </CardTitle>
-                      <CardDescription>
-                        ドキュメントとコード分析から構築したシステム理解。通常は回答後に自動で更新されます。
-                      </CardDescription>
-                    </div>
-                    {/* #47 「理解を更新」 / #21 「理解を構築」 は通常フローでは
-                        出さない (`OP-S1`/`OP-S2` は自動)。失敗時の再試行は
-                        `WorkflowExceptions` の 1 枚のカードが持つ -- 失敗内容・
-                        影響・復旧条件・再試行を同じ枠にまとめる (§4.4) 規則
-                        なので、ここに 2 つ目の再試行ボタンは置かない (P7)。
-                        #48 の「更新できない理由」説明文も、ボタンを出さない
-                        以上不要なので廃止した (原則 P3)。 */}
-                  </div>
-                </CardHeader>
-                <CardContent>
-                  {/* #49 `last_error`: 現在も主作業をブロック/劣化させている
-                      ときだけ出す (§5.3-4)。解消済みの過去エラーは履歴へ。 */}
-                  {session.last_error && (workflow?.unresolved_failures.length ?? 0) > 0 && (
-                    <div className="rounded-md border border-destructive bg-destructive/10 p-3 mb-3 text-sm text-destructive flex items-start gap-2">
-                      <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
-                      <div>
-                        <div className="font-medium">直近の処理でエラーが発生しました</div>
-                        <div className="text-xs mt-1">{session.last_error}</div>
-                      </div>
-                    </div>
-                  )}
-                  {(session.current_understanding || !session.last_error) && (
-                    <UnderstandingOverview
-                      understanding={session.current_understanding}
-                      gaps={session.gap_analysis}
-                      openQuestions={session.open_questions}
-                      nextAction={nextActionText}
-                    />
-                  )}
-                </CardContent>
-              </Card>
-              )}
+              {/* Issue #351: 右カラムの「現在の理解」カードは廃止した。
+                  #354 が求めるのは「現在の理解が右カラムの補助情報としてしか
+                  存在しない状態にはしない」ことで、Brief がメインカラムの先頭
+                  に常設された以上、ここに 2 枚目を置くと同じ対象の重複になる
+                  (原則 P7)。全文ツリー (旧 UnderstandingOverview) は Brief の
+                  折りたたみの中に R4 として残っている。
+                  ここにあった `last_error` 表示も削除した: 表示条件が
+                  「未解消の失敗がある」ことそのもので、失敗内容・影響・復旧
+                  条件・再試行を 1 枠にまとめる `WorkflowExceptions` (§4.4) と
+                  常に同時に出る重複だった。 */}
 
               {/* Intent Brief (#51a/#51b): 確定・訂正は `W2` 完了時と `W4`。 */}
               {(showUnderstandingWork || showAlignmentWork) && (

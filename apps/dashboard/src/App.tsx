@@ -6,6 +6,7 @@ import RepositoryPage from "./pages/repository";
 import FeatureMapPage from "./pages/feature-map";
 import CapabilityMapPage from "./pages/capability-map";
 import InterviewPage from "./pages/interview";
+import InterviewMockPage from "./pages/interview-mock";
 import ProbePlannerPage from "./pages/probe-planner";
 import ProbePatternsPage from "./pages/probe-patterns";
 import FlowExplorerPage from "./pages/flow-explorer";
@@ -29,6 +30,7 @@ export default function App() {
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />
+      <Route path="/interview-mock" element={<InterviewMockPage />} />
       <Route element={<AppLayout />}>
         <Route index element={<OverviewPage />} />
         <Route path="system-understanding" element={<SystemUnderstandingPage />} />

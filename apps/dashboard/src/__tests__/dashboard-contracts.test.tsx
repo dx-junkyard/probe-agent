@@ -2156,6 +2156,58 @@ function interviewWorkflowState(overrides: Record<string, unknown> = {}) {
   };
 }
 
+// Issue #351: the Understanding Brief / Decision Readiness response. Like the
+// workflow state it is decided server-side, so a test declares what the
+// server concluded rather than letting the page infer it.
+function understandingBrief(overrides: Record<string, unknown> = {}) {
+  return {
+    system_id: 1,
+    session_id: 7,
+    built: true,
+    vision: null,
+    vision_missing_information: ["このシステムで実現したい状態・価値"],
+    system_purpose: [
+      {
+        kind: "system_purpose",
+        name: "テキストを正規化して配信する",
+        summary: "",
+        confirmation: "ai_hypothesis",
+        provenance: "implementation_fact",
+        confirmation_label: "AI 仮説・未確認",
+        provenance_label: "コード・ドキュメントの実装事実",
+        reason: "",
+        contribution: "",
+        is_mock: false,
+        evidence: [],
+        related_docs: [],
+        related_apis: [],
+      },
+    ],
+    core_capabilities: [],
+    core_capability_initial_count: 0,
+    key_unconfirmed: [],
+    detail_counts: {},
+    readiness_state: "needs_confirmation",
+    readiness_label: "確認が必要です",
+    readiness_description: "判断の対象はありますが、あなたの確認が必要な内容が残っています。",
+    readiness_reasons: [
+      {
+        code: "purpose_unconfirmed",
+        severity: "attention",
+        message: "System Purpose が未確認です。",
+        target_kind: "claim",
+        target_name: "system_purpose",
+      },
+    ],
+    changes_since_confirmation: [],
+    confirmed_at: null,
+    confirmed_revision_id: null,
+    revision_id: 3,
+    snapshot_id: 42,
+    ...overrides,
+  };
+}
+
 function mockInterviewApi(options: {
   approvedCount?: number;
   session?: Record<string, unknown>;
@@ -2163,13 +2215,16 @@ function mockInterviewApi(options: {
   understandingDiff?: Record<string, unknown>;
   qaList?: Record<string, unknown>;
   workflow?: Record<string, unknown>;
+  brief?: Record<string, unknown>;
 } = {}) {
   const session = interviewSession(options.session ?? {});
   const proposal = interviewProposal();
   const proposals = options.proposals ?? [proposal];
   const approvedCount = options.approvedCount ?? 0;
   const workflow = interviewWorkflowState(options.workflow ?? {});
+  const brief = understandingBrief(options.brief ?? {});
   mockApi.get.mockImplementation((path: string) => {
+    if (path.startsWith("/interview/understanding-brief")) return Promise.resolve(brief);
     if (path.startsWith("/interview/workflow-state")) return Promise.resolve(workflow);
     if (path === "/interview/sessions/7/process-runs") return Promise.resolve([]);
     if (path === "/interview/sessions/7/understanding-diff") {
@@ -3280,8 +3335,17 @@ describe("Interview page", () => {
     // 「次にやること」 names the same operation (原則 P2).
     expect(confirmButton).toHaveTextContent("この理解で進む");
     expect(screen.getByTestId("next-action")).toHaveTextContent("この理解で進む");
-    // 判断対象は同じカード内にある -- 別カラムを探させない (finding 6).
-    expect(screen.getByTestId("understanding-summary-inline")).toBeInTheDocument();
+    // Issue #351: 判断対象は Understanding Brief そのもので、主操作はその
+    // カードの中にある -- 別カラムも別カードも探させない (原則 P2)。
+    const brief = screen.getByTestId("understanding-brief");
+    expect(brief).toHaveAttribute("data-display", "full");
+    expect(brief).toContainElement(confirmButton);
+    // 進行可否とその理由が同じ表示領域にある (#353)。
+    expect(brief).toContainElement(screen.getByTestId("readiness-summary"));
+    expect(screen.getByTestId("readiness-reason-purpose_unconfirmed")).toBeInTheDocument();
+    // 「正しい」と認める操作は 1 つだけ。会話側の「はい、正しいです」は
+    // 確定ゲートを通らないので、確定操作が出ているあいだは並べない (P7)。
+    expect(screen.queryByTestId("quick-answer-yes")).toBeNull();
 
     fireEvent.click(confirmButton);
     await waitFor(() => {
@@ -3290,6 +3354,54 @@ describe("Interview page", () => {
         { actor: "admin" },
       );
     });
+  });
+
+  test("W2 では会話は訂正の手段で、確定操作は Brief 側の 1 つだけ", async () => {
+    // Issue #351: 会話カードの「はい、正しいです」は会話ターンを送るだけで
+    // 確定ゲート (`confirm-understanding`) を通らない。両方並ぶと「どちらを
+    // 押せば進むのか」が分からなくなるので、確定操作が出ているあいだは
+    // 肯定側を出さず、訂正の入口だけを会話に残す。
+    mockInterviewApi({
+      workflow: {
+        state: "W2", candidate_state: "W2", rule_row: 6, reached_state: "W2",
+        primary_action: "confirm_understanding",
+        facts: { understanding_unconfirmed: true },
+      },
+      session: {
+        // uiState = "confirm_understanding" になるステージ。
+        stage: "understanding_initialized",
+        current_understanding: {
+          system_purpose: [understandingItem("Runtime probe platform")],
+          core_capabilities: [understandingItem("Trace ingestion")],
+          capability_elements: [],
+          supporting_elements: [],
+          api_boundaries: [],
+          probe_flow_candidates: [],
+        },
+        understanding_confirmed_at: null,
+        understanding_confirmed_by: null,
+      },
+      proposals: [],
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // 訂正の入口は会話側に残る -- 会話は理解を訂正・補足する手段 (#354)。
+    expect(await screen.findByTestId("quick-answer-no")).toBeInTheDocument();
+    expect(screen.queryByTestId("quick-answer-yes")).toBeNull();
+    // 確定操作は Brief カードの中に 1 つだけ。
+    const confirm = screen.getByTestId("confirm-understanding");
+    expect(screen.getByTestId("understanding-brief")).toContainElement(confirm);
   });
 
   test("reconfirmation lets the user bind a rename and confirm shared relations", async () => {

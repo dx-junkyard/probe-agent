@@ -6984,3 +6984,120 @@ class InterviewSessionStatusAuditOut(BaseModel):
     actor: str
     decision_method: str
     created_at: float
+
+
+# --- Understanding Brief / Decision Readiness (Issues #351-#354) -------------
+#
+# Every field here is a deterministic derivation persisted facts already
+# support (app/understanding_brief.py). `confirmation` and `provenance` are
+# two independent finite axes on purpose: "the developer confirmed it" and
+# "the developer wrote it" must stay distinguishable.
+#
+# The vocabularies live here as `Literal` aliases, not as bare `str` fields,
+# for two reasons: the response schema then carries the enum, and
+# `tests/test_interview_type_parity.py` can hold the Dashboard union to the
+# same set. `app/understanding_brief.py` derives its tuples from these with
+# `get_args`, so there is exactly one definition of each set.
+
+#: 確認状態 -- how settled a claim is.
+UnderstandingConfirmationState = Literal[
+    "confirmed",
+    "ai_hypothesis",
+    "conflicting",
+    "unknown",
+    "recheck_required",
+]
+
+#: 出所 -- where the claim's content came from. Independent of the above.
+UnderstandingProvenanceKind = Literal[
+    "developer_intent",
+    "implementation_fact",
+    "runtime_observation",
+    "ai_hypothesis",
+]
+
+UnderstandingClaimKind = Literal["vision", "system_purpose", "core_capability"]
+
+UnderstandingReadinessState = Literal[
+    "not_built",
+    "building",
+    "needs_confirmation",
+    "ready",
+    "recheck_required",
+    "blocked",
+]
+
+UnderstandingReadinessSeverity = Literal["blocking", "attention", "informational"]
+
+#: Change kinds reported against the confirmed revision. The first four come
+#: from `understanding_diff`; the rest are the remaining `claim_payload`
+#: fields. Every field that can decide a recheck must appear here, or a claim
+#: becomes reportable as "changed" with nothing to show.
+UnderstandingChangeKind = Literal[
+    "added",
+    "removed",
+    "summary_changed",
+    "confidence_changed",
+    "contribution_changed",
+    "evidence_changed",
+    "related_docs_changed",
+    "related_apis_changed",
+    "composition_changed",
+]
+
+
+class UnderstandingBriefClaimOut(BaseModel):
+    kind: UnderstandingClaimKind
+    name: str
+    summary: str = ""
+    confirmation: UnderstandingConfirmationState
+    provenance: UnderstandingProvenanceKind
+    confirmation_label: str
+    provenance_label: str
+    reason: str = ""
+    contribution: str = ""
+    #: Mock LLM provenance, labelled rather than hidden (CLAUDE.md).
+    is_mock: bool = False
+    evidence: List[Dict[str, Any]] = []
+    related_docs: List[str] = []
+    related_apis: List[str] = []
+
+
+class UnderstandingReadinessReasonOut(BaseModel):
+    code: str
+    severity: UnderstandingReadinessSeverity
+    message: str
+    target_kind: str = "none"
+    target_name: str = ""
+
+
+class UnderstandingChangeOut(BaseModel):
+    change_kind: UnderstandingChangeKind
+    section: str
+    section_label: str
+    name: str
+    detail: str
+
+
+class UnderstandingBriefOut(BaseModel):
+    system_id: int
+    session_id: Optional[int] = None
+    built: bool = False
+    vision: Optional[UnderstandingBriefClaimOut] = None
+    vision_missing_information: List[str] = []
+    system_purpose: List[UnderstandingBriefClaimOut] = []
+    core_capabilities: List[UnderstandingBriefClaimOut] = []
+    #: How many Core Capabilities the initial view shows; the rest belong
+    #: behind progressive disclosure. A cap, never a pad.
+    core_capability_initial_count: int = 0
+    key_unconfirmed: List[UnderstandingBriefClaimOut] = []
+    detail_counts: Dict[str, int] = {}
+    readiness_state: UnderstandingReadinessState
+    readiness_label: str
+    readiness_description: str
+    readiness_reasons: List[UnderstandingReadinessReasonOut] = []
+    changes_since_confirmation: List[UnderstandingChangeOut] = []
+    confirmed_at: Optional[float] = None
+    confirmed_revision_id: Optional[int] = None
+    revision_id: Optional[int] = None
+    snapshot_id: Optional[int] = None

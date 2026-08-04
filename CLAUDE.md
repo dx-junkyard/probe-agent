@@ -463,6 +463,77 @@ creating incomplete persistence or execution paths for later phases.
     承認・編集・却下 / 差分の適用 / 観測の開始 / 戻り要求への承諾 / 中断・
     引き継ぎ・再開 all stay `decision_method: manual`.
 
+17. Issue #351 (subs #352-#354) — the Understanding Brief and Decision
+    Readiness: the layer BEFORE #349's workflow position. A developer opening
+    the interview screen must be able to say, within 5 seconds, what the AI
+    thinks the system is for, which parts are settled, and whether the current
+    understanding can be used to proceed. What it added, and what any later
+    change must preserve:
+    - **Vision is a claim of its own**, not a flavour of System Purpose.
+      `system_understanding_reviewer` gained a `vision` section
+      (`understanding-review-v6` / schema `understanding-review-v2`), capped
+      at one item. It is deliberately NOT in `_EVIDENCE_REQUIRED_SECTIONS`;
+      instead an evidence-less Vision is deterministically clamped to
+      `uncertain`, so it can only ever render as a hypothesis. The prompt
+      requires an empty list rather than a Vision reverse-engineered from the
+      code's mechanics. On the Brief, a confirmed Intent Brief `goal`
+      outranks the model's Vision.
+    - **確認状態 and 出所 are two independent finite axes**
+      (`app/understanding_brief.py`). `classify_provenance` never looks at
+      whether a human pressed 確認 — approving an AI-written sentence does
+      not make the developer its author. `classify_confirmation` is
+      first-match with conflict > post-confirmation change > confirmed, so a
+      confirmed claim the system later changed can never keep reading
+      「確認済み」.
+    - Claim identity is exact name equality (same rule as
+      `understanding_diff`); content change is a `claim_digest` comparison
+      over the meaning-bearing fields, name excluded. No similarity, no
+      embeddings. The confirmed baseline is #312's
+      `understanding_capability_confirmation.source_revision_id`, falling
+      back to the newest revision at or before `understanding_confirmed_at`.
+    - **Decision Readiness never gates and never re-decides the workflow
+      state.** `evaluate_readiness` returns one of `not_built` / `building` /
+      `blocked` / `recheck_required` / `needs_confirmation` / `ready` plus
+      finite reason codes carrying a severity (`blocking` / `attention` /
+      `informational`) and a target. The single primary action still comes
+      from `app/interview_workflow.py` and stays visible under 進行不可.
+      No composite confidence percentage anywhere.
+    - Only `BRIEF_AFFECTING_PROCESS_KINDS` (`understanding_build` /
+      `understanding_update` / `intent_candidates`) may move the verdict, for
+      running records and blocking failures alike. A running proposal
+      generation is not 「理解を作成しています」 and a failed diff generation
+      is not 「理解を作る処理が失敗した」 — that conflation is the thing #353
+      forbids. The Dashboard's `W1` heading follows the server's
+      `readiness_state` for the same reason.
+    - Zero Core Capabilities is never `ready` (`capabilities_missing`,
+      attention): #352 requires that a Purpose-only understanding does not
+      read as complete. It does not block — Purpose alone is still judgeable.
+    - `claim_payload` is the single definition of a claim's content. The
+      digest that decides a recheck and the change list the developer reads
+      are both derived from it, so a claim can never be reported as changed
+      without the change being nameable. Additions/removals and detail
+      changes are listed together.
+    - The Brief's six finite vocabularies are `Literal` aliases in
+      `app/models.py`, mirrored into `understanding_brief.py` with `get_args`
+      and held to the Dashboard unions by `test_interview_type_parity.py`'s
+      `FINITE_TYPE_NAMES`. A bare `str` API field puts no enum in the schema
+      and lets the TypeScript union drift unnoticed.
+    - `GET /interview/understanding-brief` is the only source of the Brief;
+      the Dashboard renders it and never recomputes a confirmation state,
+      provenance, or readiness verdict. Only the display density is a client
+      table (`BRIEF_DISPLAY_BY_STATE`: `W0`→empty, `W1`→building, `W2`→full,
+      `W3`-`W7`→compact).
+    - The Brief lives at the top of the MAIN column in every state, because
+      the right column wraps below the main work on narrow screens. The
+      right-column 「現在の理解」 card and its `last_error` block were removed
+      as duplicates (P7); the full tree survives inside the Brief's
+      disclosure, and `W2`'s 「この理解で進む」 moved into the Brief card so
+      the judgement target and the primary action share one surface (P2).
+    - A Brief that cannot be fetched degrades to `unavailable` but KEEPS the
+      primary action and the full tree. The summary assists the decision; it
+      is not a precondition of the workflow.
+    Human gates are unchanged; this epic writes nothing at all.
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,

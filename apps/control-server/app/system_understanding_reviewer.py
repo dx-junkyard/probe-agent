@@ -49,8 +49,13 @@ from .understanding_graph import UnderstandingGraph, GraphNode, EvidenceRef
 # v5: injects terminal Alignment Review decisions so a developer's rejection
 # or correction becomes input to the next Understanding rebuild instead of
 # merely preventing carry-over in the Review Queue.
-PROMPT_VERSION = "understanding-review-v5"
-SCHEMA_VERSION = "understanding-review-v1"
+# v6 / schema v2: adds the `vision` section (Issue #352). Vision — 「誰の状態
+# を、どのように変えたいか」 — is a distinct claim from System Purpose (「その
+# Vision に対してこのシステムが担う役割」) and must never be produced by
+# folding the two together; the Understanding Brief shows them separately and
+# labels their provenance separately.
+PROMPT_VERSION = "understanding-review-v6"
+SCHEMA_VERSION = "understanding-review-v2"
 DEFAULT_REVIEW_MAX_OUTPUT_TOKENS = 32_768
 DEFAULT_REVIEW_MAX_NODES_PER_TYPE = 5
 DEFAULT_REVIEW_MAX_PROMPT_CHARS = 30_000
@@ -58,6 +63,9 @@ DEFAULT_REVIEW_MAX_EVIDENCE_PER_NODE = 2
 # Same budget interview_agent.py uses for Q&A JSON-trim (GAP_AND_QUESTION_MAX_CHARS).
 QA_PROMPT_MAX_CHARS = 4_000
 ALIGNMENT_FEEDBACK_PROMPT_MAX_CHARS = 6_000
+#: Issue #352: the Understanding Brief shows exactly one Vision statement, so
+#: extra items a model returns are dropped rather than silently concatenated.
+_MAX_VISION_ITEMS = 1
 
 
 CONFIDENCE_LEVELS = {"confirmed", "likely", "uncertain", "conflicting"}
@@ -133,6 +141,10 @@ class _OpenQuestion(BaseModel):
 class _RawReviewResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # Issue #352: at most one Vision claim. The list shape matches every other
+    # section so the Brief, the revision diff, and the Dashboard treat it with
+    # the same code path; `_MAX_VISION_ITEMS` trims a model that returns more.
+    vision: List[_UnderstandingItem] = Field(default_factory=list)
     system_purpose: List[_UnderstandingItem] = Field(default_factory=list)
     core_capabilities: List[_UnderstandingItem] = Field(default_factory=list)
     capability_elements: List[_UnderstandingItem] = Field(default_factory=list)
@@ -177,7 +189,8 @@ Respond with a single JSON object and nothing else (no markdown fences),
 matching exactly this shape:
 
 {
-  "system_purpose": [{"name": "...", "summary": "...", "confidence": {"level": "confirmed|likely|uncertain|conflicting", "reason": "..."}, "evidence": [{"path": "...", "start_line": 0, "end_line": 0, "summary": "..."}], "why_core": "", "related_docs": [], "related_apis": [], "children": []}],
+  "vision": [{"name": "...", "summary": "...", "confidence": {"level": "confirmed|likely|uncertain|conflicting", "reason": "..."}, "evidence": [{"path": "...", "start_line": 0, "end_line": 0, "summary": "..."}], "why_core": "", "related_docs": [], "related_apis": [], "children": []}],
+  "system_purpose": [...same shape...],
   "core_capabilities": [...same shape...],
   "capability_elements": [...same shape...],
   "supporting_elements": [...same shape...],
@@ -189,6 +202,16 @@ matching exactly this shape:
 }
 
 Rules:
+- vision and system_purpose are DIFFERENT claims and must never be merged:
+  - vision = whose situation this system intends to change, and how (the
+    people/stakeholders served, the outcome or value intended, and how success
+    would be recognised when the input states one).
+  - system_purpose = the role THIS system takes on in realising that vision.
+  Return at most one vision item. Base it only on the provided documentation
+  and code evidence; when the input does not state who is served or what
+  outcome is intended, return an empty vision list rather than inferring one
+  from the code's mechanics — an absent vision is a fact the developer is
+  asked to supply, and a fabricated one is not.
 - Keep confirmed, likely, uncertain, and conflicting claims separate using the confidence level.
 - Explicit Human Alignment Review Feedback is authoritative. When it
   conflicts with generated graph hypotheses, the newest listed human
@@ -544,6 +567,22 @@ def generate_understanding_review(
                 error=interview_message("invalid_review_response", language),
             )
 
+    # Issue #352: Vision is the one claim a repository often cannot settle on
+    # its own, so it is deliberately NOT in `_EVIDENCE_REQUIRED_SECTIONS`
+    # below: turning every evidence-less Vision into a high-priority open
+    # question would fire on almost every session, and the developer's own
+    # Vision statement already has a home (the Intent Brief's `goal`). What is
+    # NOT optional is that it must not be presented as settled — an
+    # evidence-less Vision is clamped to `uncertain` here, deterministically,
+    # so the Brief can only ever render it as 「AI 仮説・未確認」.
+    del validated.vision[_MAX_VISION_ITEMS:]
+    for item in validated.vision:
+        if not item.evidence and item.confidence.level in ("confirmed", "likely"):
+            item.confidence = _ConfidenceLevel(
+                level="uncertain",
+                reason=interview_message("vision_without_evidence", language),
+            )
+
     _EVIDENCE_REQUIRED_SECTIONS = (
         "system_purpose", "core_capabilities", "capability_elements", "api_boundaries",
     )
@@ -562,6 +601,7 @@ def generate_understanding_review(
                 ))
 
     current_understanding = {
+        "vision": [item.model_dump() for item in validated.vision],
         "system_purpose": [item.model_dump() for item in validated.system_purpose],
         "core_capabilities": [item.model_dump() for item in validated.core_capabilities],
         "capability_elements": [item.model_dump() for item in validated.capability_elements],

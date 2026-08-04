@@ -704,6 +704,7 @@ def _has_understanding_content(understanding: Optional[dict]) -> bool:
     if not understanding:
         return False
     for key in (
+        "vision",
         "system_purpose",
         "core_capabilities",
         "capability_elements",
