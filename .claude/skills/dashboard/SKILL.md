@@ -573,3 +573,51 @@ data across Systems.
 - Tests: `src/__tests__/understanding-brief.test.tsx`, plus the Interview page
   group in `dashboard-contracts.test.tsx` (which routes
   `/interview/understanding-brief` through `mockInterviewApi`).
+
+## Interview コックピット (issue #356)
+
+The Interview page's overview layer, on top of #349's state machine and
+#351's Brief. Page heading is 「インタビュー・コックピット」.
+
+- `components/system-understanding/cockpit/model.ts` is the ONLY place that
+  aggregates or classifies. It is pure (no React, no API client) and unit
+  tested; display components render its output and must not re-derive a
+  category status, a completion number, a priority order, or an action's
+  availability. Adding backend endpoints for this page is out of scope —
+  every number comes from responses the page already fetches.
+- The five categories, their `confirmed`/`review`/`missing` status, and the
+  completion percentage are deterministic: content presence, exact-name gap
+  matching (same rule as `understanding_diff`), then `gap_type`'s default
+  category. No similarity, no keyword scoring. `vision` is an optional key
+  (#352) — a response without it must render as 未設定, never crash.
+- Q&A progress must satisfy 回答済み + 確認待ち + 未回答 = 合計. `revised`
+  (superseded history) and `skipped` are excluded from both the total and the
+  unresolved list; `open_questions` and `interview_qa` rows are deduped by
+  `qa_id` first, then by question text.
+- The detail pane's 「修正するには」 entries only scroll + focus an existing
+  panel (`work-surface-W3` / `change-set-panel` / `understanding-brief`) via
+  `cockpit/navigation.ts`. Never reimplement answering, editing, or evidence
+  display there. Unavailable entries stay visible as disabled + reason —
+  this is the one deliberate exception to 原則 P3, which governs a state's
+  PRIMARY action, not guidance about how to fix an item.
+- Availability is decided from the server's workflow state (`W2`/`W3`/`W4`
+  for editing, `W3` for answering). Do not re-derive the state.
+- Placement is part of the contract: the status summary is full-width ABOVE
+  the two-column grid (so it does not move when the right column wraps), the
+  Brief stays at the top of the main column (#351), the map sits directly
+  under it, unresolved items + Q&A progress sit BELOW the state's work
+  surface, and the detail pane heads the right column with the session-info
+  card (participants / last update / evidence counts / save state) replacing
+  the old 「セッション #id」 card rather than adding a second one.
+- Accessibility requirements, not styling: map cards are native `<button>`s
+  with `aria-pressed`; every status is text as well as colour; the donut has
+  `role="img"` + a full `aria-label` and the same numbers in a text list; the
+  progress bar carries `role="progressbar"` + `aria-valuenow`.
+- The `/interview-mock` route and `pages/interview-mock.tsx` were deleted
+  with this implementation. Do not reintroduce a static mock page.
+- Tests: `src/__tests__/interview-cockpit.test.tsx` (model + components) and
+  the Interview page group in `dashboard-contracts.test.tsx`. Interview page
+  queries in that file must be scoped (e.g. `within(...
+  interview-proposal-card)`) — the cockpit's disabled reasons quote workflow
+  state labels, so a bare `/承認/` or `/編集/` role query now matches more
+  than one button.

@@ -61,6 +61,21 @@ import { InquiryPanel, ROUTE_CATEGORY_LABELS } from "@/components/system-underst
 import { JointUnderstandingPanel } from "@/components/system-understanding/joint-understanding-panel";
 import { RefreshStatusChip } from "@/components/system-understanding/refresh-status-chip";
 import { InterviewMetricsPanel } from "@/components/system-understanding/interview-metrics-panel";
+// Issue #356: インタビュー・コックピット。全体像 (完成度・理解の全体マップ・
+// 未解決事項・Q&A 進捗) と、選択項目の修正方法を 1 画面で把握できるようにする。
+// 集約と状態判定は `cockpit/model.ts` の純粋関数にあり、ここでは既存のデータ
+// 取得・mutation・権限制御をそのまま使う (新しい API は追加しない)。
+import {
+  buildCockpitModel,
+  type CockpitCategoryKey,
+} from "@/components/system-understanding/cockpit/model";
+import { focusCockpitTarget } from "@/components/system-understanding/cockpit/navigation";
+import { CockpitStatusSummary } from "@/components/system-understanding/cockpit/status-summary";
+import { UnderstandingMap } from "@/components/system-understanding/cockpit/understanding-map";
+import { CockpitDetailPanel } from "@/components/system-understanding/cockpit/detail-panel";
+import { CockpitUnresolvedItems } from "@/components/system-understanding/cockpit/unresolved-items";
+import { CockpitQaProgressCard } from "@/components/system-understanding/cockpit/qa-progress";
+import { CockpitSessionInfo } from "@/components/system-understanding/cockpit/session-info";
 import {
   BackRequestNotice,
   PRIMARY_ACTION_LABELS,
@@ -1526,6 +1541,46 @@ export default function InterviewPage() {
   }>({ sessionId: null, items: [] });
 
   const sortedSessions = useMemo(() => sessions ?? [], [sessions]);
+
+  // Issue #356: コックピットの表示モデル。既存の応答 (理解 / gap / open
+  // questions / Q&A 一覧) だけから決定的に集約する。
+  const cockpit = useMemo(
+    () => buildCockpitModel({
+      understanding: session?.current_understanding,
+      gaps: session?.gap_analysis,
+      openQuestions: session?.open_questions,
+      qaItems: qaListForFocus?.items,
+    }),
+    [
+      session?.current_understanding,
+      session?.gap_analysis,
+      session?.open_questions,
+      qaListForFocus?.items,
+    ],
+  );
+  // 選択中カテゴリ。開発者が選ぶまではモデルの既定 (未設定 → 要確認 → 先頭)。
+  const [selectedCategoryState, setSelectedCategoryState] = useState<{
+    sessionId: number | null;
+    key: CockpitCategoryKey;
+  } | null>(null);
+  const selectedCategoryKey =
+    selectedCategoryState?.sessionId === selectedSessionId
+      ? selectedCategoryState.key
+      : cockpit.defaultCategory;
+  const selectedCategory =
+    cockpit.categories.find(c => c.key === selectedCategoryKey) ?? cockpit.categories[0];
+  const selectCockpitCategory = (key: CockpitCategoryKey) =>
+    setSelectedCategoryState({ sessionId: selectedSessionId, key });
+  // 参加者 (issue §7)。サーバーはセッションに参加者一覧を持たないので、
+  // 回答者として実際に記録された値と、今この画面を見ている本人を出す。
+  const sessionParticipants = useMemo(() => {
+    const names = new Set<string>([actor]);
+    for (const qa of qaListForFocus?.items ?? []) {
+      if (qa.answered_by) names.add(qa.answered_by);
+    }
+    return [...names];
+  }, [actor, qaListForFocus?.items]);
+
   const proposals = session?.proposals ?? [];
   const pendingCount = proposals.filter(p => p.approval_state === "proposed").length;
   const approvedCount = approvedSet?.approved_count ?? 0;
@@ -1714,6 +1769,23 @@ export default function InterviewPage() {
     if (open.length === 0 || open[0].question !== focusedQuestion.text) return {};
     return { text: focusedQuestion.text, qaId: open[0].qa_id ?? undefined };
   }, [uiState, session, focusedQuestion]);
+
+  // Issue #356: コックピットの CTA。既存パネルへスクロール + フォーカスする
+  // だけで、回答・編集・根拠表示の処理はそれぞれのパネルが持つ。
+  const openCockpitTarget = (testId: string) => {
+    if (!focusCockpitTarget(testId)) {
+      toast.info("対象のパネルは現在の状態では表示されていません。");
+    }
+  };
+  const goToTopUnresolved = () => {
+    const top = cockpit.unresolved[0];
+    if (!top) return;
+    if (top.category) selectCockpitCategory(top.category);
+    // `W3` の作業面が出ていればその 1 問へ、出ていなければ一覧へ移動する。
+    if (!focusCockpitTarget("work-surface-W3")) {
+      focusCockpitTarget("cockpit-unresolved-items");
+    }
+  };
 
   const ensureRepositorySnapshotFresh = async (action: string) => {
     const { data: status } = await refetchRepositoryStatus();
@@ -2087,14 +2159,41 @@ export default function InterviewPage() {
       <div className="flex items-start justify-between gap-3 flex-wrap">
         <div>
           <h1 className="text-2xl font-bold tracking-tight flex items-center gap-2">
-            <MessageSquareText className="h-6 w-6" /> システムインタビュー
+            <MessageSquareText className="h-6 w-6" /> インタビュー・コックピット
           </h1>
           <p className="text-sm text-muted-foreground mt-1 max-w-3xl">
-            開始すると、ドキュメントとコードの自動分析からシステム理解を構築し、
-            確認と不足情報の質問を経て提案生成へ進みます。
+            理解の全体像を確認し、曖昧な箇所を順番に解消します。開始すると、
+            ドキュメントとコードの自動分析からシステム理解を構築し、確認と不足情報の
+            質問を経て提案生成へ進みます。
           </p>
+          {/* Issue #356 §1: セッション番号 / Snapshot 番号 / ステータス。 */}
+          {session && (
+            <div className="mt-2 flex flex-wrap items-center gap-2" data-testid="cockpit-header-meta">
+              <Badge variant="outline" className="font-normal">セッション #{session.id}</Badge>
+              <Badge variant="outline" className="font-normal">Snapshot {session.snapshot_id}</Badge>
+              <Badge variant="secondary" className="font-normal">{session.status}</Badge>
+            </div>
+          )}
         </div>
         <div className="flex items-center gap-2">
+          {/* 変更履歴への既存導線 (R6 の「履歴と監査情報」) を維持する。 */}
+          {session && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => {
+                const entry = document.querySelector<HTMLDetailsElement>(
+                  '[data-testid="history-audit-entry"]',
+                );
+                if (entry) entry.open = true;
+                focusCockpitTarget("history-audit-entry");
+              }}
+              data-testid="cockpit-open-history"
+            >
+              <FileCode className="h-4 w-4 mr-1" />
+              変更履歴
+            </Button>
+          )}
           <Select
             className="w-[240px]"
             value={selectedSessionId ? String(selectedSessionId) : ""}
@@ -2234,6 +2333,13 @@ export default function InterviewPage() {
             />
           )}
 
+          {/* Issue #356 §2 — Interview status サマリー。ファーストビューで
+              「完成度 / 要確認 / 未設定 / 次にやること」を示す。2 カラムの外
+              (全幅) に置くのは、狭い画面で右カラムが下へ回り込んでも位置が
+              変わらないようにするためで、メインカラム先頭は Issue #351 が
+              定めたとおり Understanding Brief のままにする。 */}
+          <CockpitStatusSummary model={cockpit} onGoToTopUnresolved={goToTopUnresolved} />
+
           <div className="grid grid-cols-1 xl:grid-cols-[1fr_380px] gap-4">
             {/* メイン: 状態ごとに 1 つの主作業面だけを描く (原則 P1/P3)。
                 タブ (#12) は廃止され、W3 と W4 が別状態になったことで
@@ -2279,6 +2385,16 @@ export default function InterviewPage() {
                       />
                     ) : undefined
                   }
+                />
+
+                {/* Issue #356 §3 — 理解の全体マップ。Brief (要点と進行可否)
+                    の直後に置き、同じ「現在の理解」の話題をひとまとまりに
+                    する。カード選択は右カラムの詳細・修正ペインを切り替える
+                    だけで、ワークフロー状態には影響しない。 */}
+                <UnderstandingMap
+                  categories={cockpit.categories}
+                  selected={selectedCategoryKey}
+                  onSelect={selectCockpitCategory}
                 />
 
                 {showAlignmentWork && (
@@ -2891,6 +3007,22 @@ git commit`}
                 </div>
                 )}
               </>
+
+              {/* Issue #356 §5/§6 — 未解決事項と Q&A 進捗。主作業面の下に
+                  置き、「今この状態で何を操作するか」より先に全体像が来ない
+                  ようにする。行のアクションは既存の回答 UI へ移動するだけ。 */}
+              <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_300px] gap-4">
+                <CockpitUnresolvedItems
+                  items={cockpit.unresolved}
+                  onSelect={(_item, category) => {
+                    if (category) selectCockpitCategory(category);
+                    if (!focusCockpitTarget("work-surface-W3")) {
+                      focusCockpitTarget("cockpit-detail-panel");
+                    }
+                  }}
+                />
+                <CockpitQaProgressCard progress={cockpit.qa} />
+              </div>
             </div>
 
             {/* サイド: 判断に必要な根拠 (R3) と、必要時に開く詳細 (R4)。
@@ -2903,25 +3035,35 @@ git commit`}
                 と競合するうえ、原則 P1/P3 にも反する。R6 の履歴入口だけは
                 状態に依存せず常に開ける (§3.6)。 */}
             <div className="space-y-4">
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-sm">セッション #{session.id}</CardTitle>
-                  <CardDescription>
-                    Snapshot {session.snapshot_id} · {formatTimestamp(session.updated_at)}
-                  </CardDescription>
-                </CardHeader>
-                <CardContent className="space-y-3 text-sm">
-                  {/* R4 (#44): 回答可能領域は `W3` の判断にだけ関わる詳細。 */}
-                  {showQuestionWork && (
-                    <AnswerableAreasControl sessionId={session.id} answerableAreas={session.answerable_areas} />
-                  )}
-                  {!showQuestionWork && (
-                    <p className="text-xs text-muted-foreground">
-                      Snapshot {session.snapshot_id} に固定されたセッションです。
-                    </p>
-                  )}
-                </CardContent>
-              </Card>
+              {/* Issue #356 §4 — 選択項目の詳細・修正ペイン。全体マップの選択
+                  に追従し、この項目を「どう直すか」だけを示す。実行できない
+                  手段は理由付きで残す (issue §4) -- ここは状態の主操作では
+                  なく修正方法の案内なので、前提未達の主操作を出さない原則
+                  (spec P3) の対象ではない。 */}
+              {selectedCategory && (
+                <CockpitDetailPanel
+                  category={selectedCategory}
+                  state={wState}
+                  onAction={openCockpitTarget}
+                />
+              )}
+
+              {/* Issue #356 §7 — セッション情報 (参加者・最終更新・根拠数・
+                  保存状態)。旧「セッション #id」カードを置き換える。 */}
+              <CockpitSessionInfo
+                sessionId={session.id}
+                snapshotId={session.snapshot_id}
+                status={session.status}
+                updatedAt={session.updated_at}
+                participants={sessionParticipants}
+                evidenceCounts={cockpit.evidenceCounts}
+                saving={dialogueTurn.isPending || confirmUnderstanding.isPending || building}
+              >
+                {/* R4 (#44): 回答可能領域は `W3` の判断にだけ関わる詳細。 */}
+                {showQuestionWork && (
+                  <AnswerableAreasControl sessionId={session.id} answerableAreas={session.answerable_areas} />
+                )}
+              </CockpitSessionInfo>
 
               {/* Issue #351: 右カラムの「現在の理解」カードは廃止した。
                   #354 が求めるのは「現在の理解が右カラムの補助情報としてしか

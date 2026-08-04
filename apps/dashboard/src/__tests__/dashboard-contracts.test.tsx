@@ -2396,7 +2396,12 @@ describe("Interview page", () => {
     expect(screen.getByText("mock")).toBeInTheDocument();
     expect(screen.getByText("reasoning_llm")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /承認/ }));
+    // Issue #356: コックピットの修正手段カード (現在の状態を引用した理由文)
+    // も同じ語を含むため、提案カードの中に限定して押す。
+    fireEvent.click(
+      within(screen.getAllByTestId("interview-proposal-card")[0])
+        .getByRole("button", { name: /承認/ }),
+    );
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith(
         "/interview/sessions/7/proposals/9/approve",
@@ -3038,7 +3043,10 @@ describe("Interview page", () => {
     );
 
     expect(await screen.findByText("提案レビュー")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /編集/ }));
+    fireEvent.click(
+      within(screen.getAllByTestId("interview-proposal-card")[0])
+        .getByRole("button", { name: /編集/ }),
+    );
     fireEvent.click(await screen.findByRole("button", { name: /修正を保存して承認/ }));
 
     await waitFor(() => {
@@ -3726,7 +3734,12 @@ describe("Interview page", () => {
       ([path]) => typeof path === "string" && path.startsWith("/interview/workflow-state"),
     ).length;
 
-    fireEvent.click(screen.getByRole("button", { name: /承認/ }));
+    // Issue #356: コックピットの修正手段カード (現在の状態を引用した理由文)
+    // も同じ語を含むため、提案カードの中に限定して押す。
+    fireEvent.click(
+      within(screen.getAllByTestId("interview-proposal-card")[0])
+        .getByRole("button", { name: /承認/ }),
+    );
 
     await waitFor(() => {
       const after = mockApi.get.mock.calls.filter(
@@ -3734,6 +3747,102 @@ describe("Interview page", () => {
       ).length;
       expect(after).toBeGreaterThan(before);
     });
+  });
+
+  // Issue #356: インタビュー・コックピット。ファーストビューの全体像 (完成度
+  // / 要確認 / 未設定 / 次にやること)、5 カテゴリの全体マップ、選択に追従する
+  // 詳細・修正ペイン、未解決事項、Q&A 進捗が 1 画面に揃うこと。状態集約その
+  // ものの検証は interview-cockpit.test.tsx にある。
+  test("コックピットの全体像・修正ペイン・未解決事項が /interview に出る", async () => {
+    mockInterviewApi({
+      workflow: {
+        state: "W2", candidate_state: "W2", rule_row: 6, reached_state: "W2",
+        primary_action: "confirm_understanding",
+        facts: { understanding_unconfirmed: true },
+      },
+      proposals: [],
+      session: {
+        stage: "purpose_confirmation",
+        understanding_confirmed_at: null,
+        current_understanding: {
+          system_purpose: [understandingItem("Runtime probe platform")],
+          core_capabilities: [understandingItem("Trace ingestion")],
+          capability_elements: [], supporting_elements: [],
+          api_boundaries: [understandingItem("POST /traces")],
+          probe_flow_candidates: [understandingItem("summarize flow")],
+        },
+        open_questions: [
+          { question: "トレース収集は独立した責務か", category: "capability", priority: "high" },
+        ],
+      },
+      qaList: {
+        session_id: 7,
+        system_id: 1,
+        items: [
+          {
+            id: 31, session_id: 7, system_id: 1,
+            question_text: "トレース収集は独立した責務か",
+            question_category: "capability", question_source: "reviewer",
+            hypothesis: null, evidence_refs: [], runtime_evidence: null,
+            answer_text: null, answer_unknown: null, status: "open",
+            answered_by: null, superseded_by_id: null, created_at: 1, answered_at: null,
+          },
+          {
+            id: 32, session_id: 7, system_id: 1,
+            question_text: "対象範囲は決まっているか",
+            question_category: "purpose", question_source: "reviewer",
+            hypothesis: null, evidence_refs: [], runtime_evidence: null,
+            answer_text: "はい", answer_unknown: null, status: "answered",
+            answered_by: "admin", superseded_by_id: null, created_at: 1, answered_at: 2,
+          },
+        ],
+        open_count: 1,
+        high_priority_open_count: 1,
+        answers_revised_at: null,
+      },
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // ファーストビュー: 完成度・要確認・未設定・次にやること。
+    await screen.findByTestId("cockpit-status-summary");
+    // Vision のみ未設定、Capabilities が要確認 → (3 + 0.5)/5 = 70%
+    expect(screen.getByTestId("cockpit-completion-percent")).toHaveTextContent("70");
+    expect(screen.getByTestId("cockpit-stat-missing")).toHaveTextContent("1");
+    expect(screen.getByTestId("cockpit-stat-review")).toHaveTextContent("1");
+    expect(screen.getByTestId("cockpit-next-step")).toHaveTextContent("Vision");
+
+    // 5 カテゴリのマップ。既定選択は未設定の Vision。
+    for (const key of ["vision", "system_purpose", "capabilities", "api_boundaries", "probe_flow"]) {
+      expect(screen.getByTestId(`cockpit-category-card-${key}`)).toBeInTheDocument();
+    }
+    expect(screen.getByTestId("cockpit-detail-panel")).toHaveAttribute("data-category", "vision");
+
+    // カード選択で詳細・修正ペインが切り替わる。
+    fireEvent.click(screen.getByTestId("cockpit-category-card-capabilities"));
+    expect(screen.getByTestId("cockpit-detail-panel")).toHaveAttribute("data-category", "capabilities");
+    expect(screen.getByTestId("cockpit-detail-question"))
+      .toHaveTextContent("トレース収集は独立した責務か");
+
+    // 未解決事項 (open_questions と Q&A の重複は 1 件に畳まれる) と Q&A 進捗。
+    expect(screen.getAllByTestId("cockpit-unresolved-row")).toHaveLength(1);
+    expect(screen.getByTestId("cockpit-qa-answered")).toHaveTextContent("1 件");
+    expect(screen.getByTestId("cockpit-qa-open")).toHaveTextContent("1 件");
+    expect(screen.getByTestId("cockpit-qa-total")).toHaveTextContent("2 件");
+
+    // セッション情報 (§7)。
+    expect(screen.getByTestId("cockpit-session-info")).toHaveTextContent("Snapshot 42");
+    expect(screen.getByTestId("cockpit-session-participants")).toHaveTextContent("admin");
   });
 
   test("理解の確認・回答の送信でも正準 Workflow query が再取得される", async () => {
