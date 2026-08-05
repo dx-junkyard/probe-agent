@@ -67,9 +67,14 @@ import { InterviewMetricsPanel } from "@/components/system-understanding/intervi
 // 取得・mutation・権限制御をそのまま使う (新しい API は追加しない)。
 import {
   buildCockpitModel,
+  unresolvedTargets,
   type CockpitCategoryKey,
+  type CockpitUnresolvedItem,
 } from "@/components/system-understanding/cockpit/model";
-import { focusCockpitTarget } from "@/components/system-understanding/cockpit/navigation";
+import {
+  focusCockpitTarget,
+  focusFirstCockpitTarget,
+} from "@/components/system-understanding/cockpit/navigation";
 import { CockpitStatusSummary } from "@/components/system-understanding/cockpit/status-summary";
 import { UnderstandingMap } from "@/components/system-understanding/cockpit/understanding-map";
 import { CockpitDetailPanel } from "@/components/system-understanding/cockpit/detail-panel";
@@ -1453,9 +1458,23 @@ export default function InterviewPage() {
 
   const { data: repositoryStatus, refetch: refetchRepositoryStatus } = useRepositoryStatus();
   const { data: latestSnapshot } = useLatestSnapshot();
-  const { data: sessions, isLoading: sessionsLoading } = useInterviewSessions();
+  // セッション一覧・詳細が取れないと画面の本文は何も描けないので、失敗と
+  // 再試行を明示する (issue #356 受け入れ条件「エラー時に適切な表示」)。
+  const {
+    data: sessions,
+    isLoading: sessionsLoading,
+    isError: sessionsFailed,
+    error: sessionsError,
+    refetch: refetchSessions,
+  } = useInterviewSessions();
   const createSession = useCreateInterviewSession();
-  const { data: session, isLoading: sessionLoading } = useInterviewSession(selectedSessionId);
+  const {
+    data: session,
+    isLoading: sessionLoading,
+    isError: sessionFailed,
+    error: sessionError,
+    refetch: refetchSession,
+  } = useInterviewSession(selectedSessionId);
   const priorCapabilityGraphQuery = useInterviewCapabilityGraph(
     session?.capability_graph_confirmation_required
       ? selectedSessionId
@@ -1772,19 +1791,22 @@ export default function InterviewPage() {
 
   // Issue #356: コックピットの CTA。既存パネルへスクロール + フォーカスする
   // だけで、回答・編集・根拠表示の処理はそれぞれのパネルが持つ。
-  const openCockpitTarget = (testId: string) => {
-    if (!focusCockpitTarget(testId)) {
+  const openCockpitTarget = (testIds: string[]) => {
+    if (!focusFirstCockpitTarget(testIds)) {
       toast.info("対象のパネルは現在の状態では表示されていません。");
     }
+  };
+  // 未解決事項 1 件を開く。その質問の行 (`qa-item-<id>`) が描かれていれば
+  // そこへ移動する -- 作業面の先頭ボタンへ飛ばすと、質問が複数あるときに
+  // 選んだものと違う質問にフォーカスが当たる。
+  const openUnresolvedItem = (item: CockpitUnresolvedItem) => {
+    if (item.category) selectCockpitCategory(item.category);
+    focusFirstCockpitTarget(unresolvedTargets(item));
   };
   const goToTopUnresolved = () => {
     const top = cockpit.unresolved[0];
     if (!top) return;
-    if (top.category) selectCockpitCategory(top.category);
-    // `W3` の作業面が出ていればその 1 問へ、出ていなければ一覧へ移動する。
-    if (!focusCockpitTarget("work-surface-W3")) {
-      focusCockpitTarget("cockpit-unresolved-items");
-    }
+    openUnresolvedItem(top);
   };
 
   const ensureRepositorySnapshotFresh = async (action: string) => {
@@ -2266,6 +2288,48 @@ export default function InterviewPage() {
           <Skeleton className="h-32 w-full" />
           <Skeleton className="h-64 w-full" />
         </div>
+      ) : sessionsFailed || sessionFailed ? (
+        /* 取得失敗。これまではここで本文が空になり、何が起きたのかも次に何を
+           すればよいのかも読めなかった。失敗した対象・サーバーからの理由・
+           再試行を 1 枠にまとめる (例外表示 §4.4 と同じ形)。 */
+        <Card data-testid="interview-load-error">
+          <CardHeader>
+            <CardTitle className="text-sm flex items-center gap-2">
+              <AlertCircle className="h-4 w-4 text-destructive" />
+              {sessionsFailed
+                ? "インタビューセッション一覧を取得できませんでした"
+                : `セッション #${selectedSessionId} を取得できませんでした`}
+            </CardTitle>
+            <CardDescription>
+              Control Server からの応答が得られないため、この画面の内容を表示できません。
+              接続を確認してから再試行してください。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <p
+              className="rounded-md border p-2 text-xs font-mono break-words"
+              data-testid="interview-load-error-detail"
+            >
+              {String(
+                (sessionsFailed ? sessionsError : sessionError)?.message
+                ?? (sessionsFailed ? sessionsError : sessionError)
+                ?? "unknown error",
+              )}
+            </p>
+            <Button
+              size="sm"
+              variant="outline"
+              data-testid="interview-load-error-retry"
+              onClick={() => {
+                if (sessionsFailed) void refetchSessions();
+                if (sessionFailed) void refetchSession();
+              }}
+            >
+              <RefreshCw className="h-4 w-4 mr-1" />
+              再試行
+            </Button>
+          </CardContent>
+        </Card>
       ) : !selectedSessionId || !session ? (
         /* `W0-B` インタビューを始める。`W0-A` のときはこのカードを出さない
            (実行できない主操作を見せない、原則 P3)。 */
@@ -3014,12 +3078,7 @@ git commit`}
               <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_300px] gap-4">
                 <CockpitUnresolvedItems
                   items={cockpit.unresolved}
-                  onSelect={(_item, category) => {
-                    if (category) selectCockpitCategory(category);
-                    if (!focusCockpitTarget("work-surface-W3")) {
-                      focusCockpitTarget("cockpit-detail-panel");
-                    }
-                  }}
+                  onSelect={openUnresolvedItem}
                 />
                 <CockpitQaProgressCard progress={cockpit.qa} />
               </div>

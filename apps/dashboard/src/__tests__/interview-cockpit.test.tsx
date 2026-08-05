@@ -26,9 +26,13 @@ import {
   categoryActions,
   completionPercent,
   qaProgress,
+  unresolvedTargets,
   type CockpitCategoryView,
 } from "@/components/system-understanding/cockpit/model";
-import { focusCockpitTarget } from "@/components/system-understanding/cockpit/navigation";
+import {
+  focusCockpitTarget,
+  focusFirstCockpitTarget,
+} from "@/components/system-understanding/cockpit/navigation";
 import { CockpitStatusSummary } from "@/components/system-understanding/cockpit/status-summary";
 import { UnderstandingMap } from "@/components/system-understanding/cockpit/understanding-map";
 import { CockpitDetailPanel } from "@/components/system-understanding/cockpit/detail-panel";
@@ -235,12 +239,38 @@ describe("未解決事項の集約", () => {
         qa({ id: 11, question_text: "未回答の質問", question_category: "api" }),
         qa({ id: 12, question_text: "回答済み", status: "answered" }),
         qa({ id: 13, question_text: "置き換え済み", status: "revised" }),
-        qa({ id: 14, question_text: "見送り", status: "skipped" }),
+        qa({ id: 14, question_text: "後で回答", status: "skipped", question_category: "probe_flow" }),
         qa({ id: 15, question_text: "わからない", status: "unconfirmed", question_category: "capability" }),
       ],
     });
-    expect(model.unresolved.map(u => u.question)).toEqual(["わからない", "未回答の質問"]);
+    // 除外されるのは answered (解決済み) と revised (置き換え履歴) だけ。
+    expect(model.unresolved.map(u => u.question))
+      .toEqual(["わからない", "未回答の質問", "後で回答"]);
     expect(model.unresolved.find(u => u.qaId === 15)!.unconfirmed).toBe(true);
+    expect(model.unresolved.find(u => u.qaId === 14)!.deferred).toBe(true);
+  });
+
+  // skipped は「後で回答する」ための一時状態で、resume で open に戻せる
+  // (routes/interview.py の skip/resume)。解決済みとして数えると、未回答が
+  // 残っているのに未解決 0 件・完成度 100% と表示されてしまう。
+  it("skipped の質問は未解決として数え、カテゴリを要確認にする", () => {
+    const model = buildCockpitModel({
+      understanding: fullUnderstanding(),
+      gaps: [],
+      openQuestions: [],
+      qaItems: [qa({ id: 21, question_text: "後で答える", status: "skipped", question_category: "api" })],
+    });
+    expect(model.unresolved.map(u => u.question)).toEqual(["後で答える"]);
+    expect(model.unresolved[0].deferred).toBe(true);
+    // 開発者が自分で見送ったものなので、通常の未回答より下に置く。
+    expect(model.unresolved[0].priority).toBe("low");
+    expect(model.categories.find(c => c.key === "api_boundaries")!.status).toBe("review");
+    expect(model.missingCount + model.reviewCount).toBeGreaterThan(0);
+    expect(model.completionPercent).toBeLessThan(100);
+    expect(model.qa.total).toBe(1);
+    expect(model.qa.open).toBe(1);
+    expect(model.qa.deferred).toBe(1);
+    expect(model.qa.excluded).toBe(0);
   });
 
   it("どのカテゴリにも属さない general 質問は「全体」として残る", () => {
@@ -269,13 +299,17 @@ describe("qaProgress", () => {
       qa({ id: 5, status: "revised" }),
       qa({ id: 6, status: "skipped" }),
     ]);
-    expect(progress).toEqual({ answered: 2, awaiting: 1, open: 1, total: 4, excluded: 2 });
+    // skipped は未回答に数え、合計から除くのは revised だけ。
+    expect(progress).toEqual({
+      answered: 2, awaiting: 1, open: 2, deferred: 1, total: 5, excluded: 1,
+    });
     expect(progress.answered + progress.awaiting + progress.open).toBe(progress.total);
   });
 
   it("Q&A が 0 件なら全て 0", () => {
-    expect(qaProgress([])).toEqual({ answered: 0, awaiting: 0, open: 0, total: 0, excluded: 0 });
-    expect(qaProgress(null)).toEqual({ answered: 0, awaiting: 0, open: 0, total: 0, excluded: 0 });
+    const zero = { answered: 0, awaiting: 0, open: 0, deferred: 0, total: 0, excluded: 0 };
+    expect(qaProgress([])).toEqual(zero);
+    expect(qaProgress(null)).toEqual(zero);
   });
 });
 
@@ -302,11 +336,11 @@ describe("categoryActions", () => {
 
     const inW3 = categoryActions(withQuestion, "W3").find(a => a.kind === "answer_question")!;
     expect(inW3.disabledReason).toBeNull();
-    expect(inW3.targetTestId).toBe("work-surface-W3");
+    expect(inW3.targetTestIds).toEqual(["work-surface-W3", "cockpit-unresolved-items"]);
 
     const inW5 = categoryActions(withQuestion, "W5").find(a => a.kind === "answer_question")!;
     expect(inW5.disabledReason).toContain("提案を承認する");
-    expect(inW5.targetTestId).toBeNull();
+    expect(inW5.targetTestIds).toEqual([]);
 
     const noQuestion = categoryActions(categoryView(), "W3").find(a => a.kind === "answer_question")!;
     expect(noQuestion.disabledReason).toContain("未解決の質問はありません");
@@ -316,10 +350,28 @@ describe("categoryActions", () => {
     for (const state of ["W2", "W3", "W4"] as const) {
       const action = categoryActions(categoryView(), state).find(a => a.kind === "direct_edit")!;
       expect(action.disabledReason).toBeNull();
-      expect(action.targetTestId).toBe("change-set-panel");
+      expect(action.targetTestIds).toEqual(["change-set-panel"]);
     }
     const blocked = categoryActions(categoryView(), "W6").find(a => a.kind === "direct_edit")!;
     expect(blocked.disabledReason).toContain("差分を確認する");
+  });
+
+  // 指摘 P2: 作業面の先頭ボタンではなく「その質問」へ移動する。複数の質問が
+  // あるとき、選んだものと違う質問にフォーカスが当たってはならない。
+  it("回答対象はカテゴリ内で最優先の質問そのものを指す", () => {
+    const category = buildCockpitModel({
+      understanding: fullUnderstanding(),
+      gaps: [],
+      openQuestions: [
+        openQuestion({ question: "後の質問", priority: "low", category: "api", qa_id: 52 }),
+        openQuestion({ question: "先の質問", priority: "high", category: "api", qa_id: 51 }),
+      ],
+      qaItems: [],
+    }).categories.find(c => c.key === "api_boundaries")!;
+    const action = categoryActions(category, "W3").find(a => a.kind === "answer_question")!;
+    expect(action.targetTestIds).toEqual([
+      "qa-item-51", "work-surface-W3", "cockpit-unresolved-items",
+    ]);
   });
 
   it("内容が無いカテゴリでは根拠確認を無効にする", () => {
@@ -452,7 +504,7 @@ describe("CockpitDetailPanel", () => {
     const m = model({ understanding: fullUnderstanding(), gaps: [], openQuestions: [], qaItems: [] });
     render(<CockpitDetailPanel category={m.categories[1]} state="W2" onAction={onAction} />);
     fireEvent.click(screen.getByTestId("cockpit-action-direct_edit"));
-    expect(onAction).toHaveBeenCalledWith("change-set-panel");
+    expect(onAction).toHaveBeenCalledWith(["change-set-panel"]);
   });
 });
 
@@ -475,7 +527,7 @@ describe("CockpitUnresolvedItems", () => {
     expect(rows[0]).toHaveTextContent("System purpose");
     expect(rows[0]).toHaveTextContent("高優先");
     fireEvent.click(within(rows[0]).getByTestId("cockpit-unresolved-action"));
-    expect(onSelect).toHaveBeenCalledWith(m.unresolved[0], "system_purpose");
+    expect(onSelect).toHaveBeenCalledWith(m.unresolved[0]);
   });
 
   it("未解決が無ければ空表示にする", () => {
@@ -488,7 +540,7 @@ describe("CockpitQaProgressCard", () => {
   it("件数をテキストでも読めるようにし、ドーナツに読み上げ用ラベルを付ける", () => {
     render(
       <CockpitQaProgressCard
-        progress={{ answered: 8, awaiting: 2, open: 1, total: 11, excluded: 3 }}
+        progress={{ answered: 8, awaiting: 2, open: 1, deferred: 1, total: 11, excluded: 3 }}
       />,
     );
     expect(screen.getByTestId("cockpit-qa-answered")).toHaveTextContent("回答済み");
@@ -501,14 +553,41 @@ describe("CockpitQaProgressCard", () => {
       "Q&A の進捗: 合計 11 件のうち、回答済み 8 件、確認待ち 2 件、未回答 1 件",
     );
     expect(screen.getByTestId("cockpit-qa-excluded")).toHaveTextContent("3 件");
+    // 「後で回答」は未回答の内訳として再掲する (解決済みに見せない)。
+    expect(screen.getByTestId("cockpit-qa-deferred")).toHaveTextContent("1 件");
   });
 
   it("Q&A が 0 件でもドーナツを描かず空表示にする", () => {
     render(
-      <CockpitQaProgressCard progress={{ answered: 0, awaiting: 0, open: 0, total: 0, excluded: 0 }} />,
+      <CockpitQaProgressCard
+        progress={{ answered: 0, awaiting: 0, open: 0, deferred: 0, total: 0, excluded: 0 }}
+      />,
     );
     expect(screen.getByTestId("cockpit-qa-empty")).toBeTruthy();
     expect(screen.queryByTestId("cockpit-qa-donut")).toBeNull();
+  });
+});
+
+describe("unresolvedTargets", () => {
+  it("qa_id があればその質問の行を先頭候補にする", () => {
+    const m = model({
+      understanding: fullUnderstanding(),
+      gaps: [],
+      openQuestions: [openQuestion({ question: "質問", category: "api", qa_id: 77 })],
+      qaItems: [],
+    });
+    expect(unresolvedTargets(m.unresolved[0])[0]).toBe("qa-item-77");
+  });
+
+  it("qa_id を持たない質問は作業面・一覧へフォールバックする", () => {
+    const m = model({
+      understanding: fullUnderstanding(),
+      gaps: [],
+      openQuestions: [openQuestion({ question: "旧セッションの質問", category: "api" })],
+      qaItems: [],
+    });
+    expect(unresolvedTargets(m.unresolved[0]))
+      .toEqual(["work-surface-W3", "cockpit-unresolved-items"]);
   });
 });
 
@@ -526,5 +605,31 @@ describe("focusCockpitTarget", () => {
   it("対象が描かれていなければ false を返す (呼び出し側が案内できる)", () => {
     render(<div />);
     expect(focusCockpitTarget("work-surface-W3")).toBe(false);
+  });
+
+  it("候補を優先度順に試し、描かれている最初のものへ移動する", () => {
+    render(
+      <div>
+        <div data-testid="work-surface-W3">
+          <button>作業面の先頭ボタン</button>
+        </div>
+        <div data-testid="qa-item-51">
+          <button>この質問に回答する</button>
+        </div>
+      </div>,
+    );
+    // qa-item が存在すれば、作業面より先にそちらへ移動する。
+    expect(focusFirstCockpitTarget(["qa-item-51", "work-surface-W3"])).toBe(true);
+    expect(document.activeElement?.textContent).toBe("この質問に回答する");
+  });
+
+  it("先頭候補が描かれていなければ次の候補へ落ちる", () => {
+    render(
+      <div data-testid="work-surface-W3">
+        <button>作業面の先頭ボタン</button>
+      </div>,
+    );
+    expect(focusFirstCockpitTarget(["qa-item-99", "work-surface-W3"])).toBe(true);
+    expect(document.activeElement?.textContent).toBe("作業面の先頭ボタン");
   });
 });

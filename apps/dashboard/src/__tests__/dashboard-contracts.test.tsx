@@ -3845,6 +3845,140 @@ describe("Interview page", () => {
     expect(screen.getByTestId("cockpit-session-participants")).toHaveTextContent("admin");
   });
 
+  // Issue #356 指摘 P2: 「この項目を開く」は、作業面の先頭操作ではなく、その
+  // 質問の行へフォーカスを移す。質問が複数あるとき、選んだものと違う質問に
+  // 当たると一覧の意味が無くなる。
+  test("未解決事項の行アクションは選んだ質問そのものへフォーカスする", async () => {
+    function openQa(id: number, text: string, category: string) {
+      return {
+        id, session_id: 7, system_id: 1,
+        question_text: text, question_category: category, question_source: "reviewer",
+        hypothesis: null, evidence_refs: [], runtime_evidence: null,
+        answer_text: null, answer_unknown: null, status: "open",
+        answered_by: null, superseded_by_id: null, created_at: 1, answered_at: null,
+      };
+    }
+    mockInterviewApi({
+      workflow: {
+        state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3",
+        primary_action: "submit_answer",
+        facts: { open_required_questions: 2 },
+      },
+      proposals: [],
+      session: {
+        stage: "gap_questions",
+        current_understanding: {
+          system_purpose: [understandingItem("Runtime probe platform")],
+          core_capabilities: [understandingItem("Trace ingestion")],
+          capability_elements: [], supporting_elements: [],
+          api_boundaries: [understandingItem("POST /traces")],
+          probe_flow_candidates: [understandingItem("summarize flow")],
+        },
+        open_questions: [
+          { question: "先に表示される質問", category: "capability", priority: "high", qa_id: 41 },
+          { question: "後に表示される質問", category: "api", priority: "low", qa_id: 42 },
+        ],
+      },
+      qaList: {
+        session_id: 7, system_id: 1,
+        items: [
+          openQa(41, "先に表示される質問", "capability"),
+          openQa(42, "後に表示される質問", "api"),
+        ],
+        open_count: 2, high_priority_open_count: 1, answers_revised_at: null,
+      },
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const rows = await screen.findAllByTestId("cockpit-unresolved-row");
+    expect(rows).toHaveLength(2);
+    // 2 行目 (低優先) を選んでも、1 行目や作業面の先頭ではなくその質問へ移る。
+    fireEvent.click(within(rows[1]).getByTestId("cockpit-unresolved-action"));
+    await waitFor(() => {
+      expect(screen.getByTestId("qa-item-42").contains(document.activeElement)).toBe(true);
+      expect(screen.getByTestId("qa-item-41").contains(document.activeElement)).toBe(false);
+      expect(document.activeElement?.tagName).not.toBe("BODY");
+    });
+  });
+
+  // Issue #356 受け入れ条件「loading、空データ、エラー…に適切な表示になる」。
+  // 以前はセッション一覧 / 詳細の取得に失敗すると loading 分岐を抜けたあと
+  // 本文が丸ごと空になり、失敗したことすら読めなかった。
+  test("セッション一覧の取得に失敗したらエラーと再試行を出す", async () => {
+    mockInterviewApi();
+    const baseGet = mockApi.get.getMockImplementation();
+    let failing = true;
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/interview/sessions" && failing) {
+        return Promise.reject(new Error("Failed to fetch"));
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const card = await screen.findByTestId("interview-load-error");
+    expect(card).toHaveTextContent("インタビューセッション一覧を取得できませんでした");
+    expect(screen.getByTestId("interview-load-error-detail")).toHaveTextContent("Failed to fetch");
+
+    // 再試行で復旧できる。
+    failing = false;
+    fireEvent.click(screen.getByTestId("interview-load-error-retry"));
+    await waitFor(() => {
+      expect(screen.queryByTestId("interview-load-error")).toBeNull();
+    });
+  });
+
+  test("セッション詳細の取得に失敗したらエラーと再試行を出す", async () => {
+    mockInterviewApi();
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7") {
+        return Promise.reject(new Error("session detail unavailable"));
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const card = await screen.findByTestId("interview-load-error");
+    expect(card).toHaveTextContent("セッション #7 を取得できませんでした");
+    expect(screen.getByTestId("interview-load-error-detail"))
+      .toHaveTextContent("session detail unavailable");
+    expect(screen.getByTestId("interview-load-error-retry")).toBeInTheDocument();
+  });
+
   test("理解の確認・回答の送信でも正準 Workflow query が再取得される", async () => {
     mockInterviewApi({
       workflow: {

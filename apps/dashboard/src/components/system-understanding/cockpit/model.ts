@@ -156,6 +156,13 @@ export interface CockpitUnresolvedItem {
   categoryLabel: string;
   /** 「わからない」と回答済みで、再確認待ちの質問かどうか。 */
   unconfirmed: boolean;
+  /**
+   * `skipped` = 「後で回答する」として明示的に見送られた質問。サーバー側では
+   * `open -> skipped` の一時状態で、`resume` でいつでも `open` に戻せる
+   * (`routes/interview.py` の skip/resume)。回答は済んでいないので未解決
+   * として数える。
+   */
+  deferred: boolean;
 }
 
 // ── Q&A 進捗 ──────────────────────────────────────────────────────────
@@ -164,12 +171,17 @@ export interface CockpitQaProgress {
   answered: number;
   /** 「わからない」で確定回答が無く、再確認待ちの件数。 */
   awaiting: number;
+  /** 未回答 (`open`) と「後で回答」(`skipped`) の合計。 */
   open: number;
+  /** `open` の内訳のうち「後で回答」として見送られた件数 (再掲)。 */
+  deferred: number;
   /** answered + awaiting + open。3 区分の合計と必ず一致する。 */
   total: number;
   /**
-   * 合計から除外した件数。`revised` は後続行に置き換えられた履歴、
-   * `skipped` は見送りが確定した質問で、どちらも「回答待ち」ではない。
+   * 合計から除外した件数。除外するのは `revised` (後続行に置き換えられた
+   * 履歴) だけ。`skipped` は「後で回答する」一時状態で回答が済んでいない
+   * ため、除外せず `open` に数える -- 除外すると未回答が残っているのに
+   * 未解決 0 件・完成度 100% と表示されてしまう。
    */
   excluded: number;
 }
@@ -185,8 +197,11 @@ export interface CockpitAction {
   description: string;
   /** 実行できないとき、その理由 (issue §4)。実行できるときは null。 */
   disabledReason: string | null;
-  /** 遷移先の既存 UI (data-testid)。実行できないときは null。 */
-  targetTestId: string | null;
+  /**
+   * 遷移先の既存 UI (data-testid) を優先度順に並べたもの。実行できないとき
+   * は空配列。呼び出し側は先頭から順に、実際に描かれているものを探す。
+   */
+  targetTestIds: string[];
 }
 
 export interface CockpitCategoryView {
@@ -288,15 +303,19 @@ function unresolvedFromSources(
       category,
       categoryLabel: category ? categoryTitle(category) : "全体",
       unconfirmed: false,
+      deferred: false,
     });
   }
 
   for (const qa of qaItems ?? []) {
-    // 未解決 = まだ回答が無い (`open`)、または「わからない」で確定回答が
-    // 無い (`unconfirmed`)。`answered` は解決済み、`revised` は後続行に
-    // 置き換えられた履歴、`skipped` は見送り確定なので一覧から除く
+    // 未解決 = まだ回答が無い (`open`)、「後で回答」として見送られている
+    // (`skipped`: `resume` で `open` に戻せる一時状態)、または「わからない」
+    // で確定回答が無い (`unconfirmed`)。除外するのは `answered` (解決済み)
+    // と `revised` (後続行に置き換えられた履歴) だけ
     // (issue §5「解決済み項目は一覧から除外する」)。
-    if (qa.status !== "open" && qa.status !== "unconfirmed") continue;
+    if (qa.status !== "open" && qa.status !== "unconfirmed" && qa.status !== "skipped") {
+      continue;
+    }
     if (seenQaIds.has(qa.id)) continue;
     if (seenTexts.has(qa.question_text)) continue;
     seenQaIds.add(qa.id);
@@ -306,12 +325,14 @@ function unresolvedFromSources(
       id: `qa-${qa.id}`,
       qaId: qa.id,
       question: qa.question_text,
-      // Q&A 行は優先度を持たない。「わからない」で再確認待ちのものだけ
-      // 通常の未回答より上に置き、それ以外は medium 相当に揃える。
-      priority: qa.status === "unconfirmed" ? "high" : "medium",
+      // Q&A 行は優先度を持たない。「わからない」で再確認待ちのものは通常の
+      // 未回答より上、開発者が自分で見送った「後で回答」は下に置く。
+      priority:
+        qa.status === "unconfirmed" ? "high" : qa.status === "skipped" ? "low" : "medium",
       category,
       categoryLabel: category ? categoryTitle(category) : "全体",
       unconfirmed: qa.status === "unconfirmed",
+      deferred: qa.status === "skipped",
     });
   }
 
@@ -330,14 +351,19 @@ export function qaProgress(qaItems: InterviewQaOut[] | null | undefined): Cockpi
   let answered = 0;
   let awaiting = 0;
   let open = 0;
+  let deferred = 0;
   let excluded = 0;
   for (const qa of qaItems ?? []) {
     if (qa.status === "answered") answered += 1;
     else if (qa.status === "unconfirmed") awaiting += 1;
     else if (qa.status === "open") open += 1;
-    else excluded += 1;
+    else if (qa.status === "skipped") {
+      // 「後で回答」。回答は済んでいないので未回答に数え、内訳として再掲する。
+      open += 1;
+      deferred += 1;
+    } else excluded += 1;
   }
-  return { answered, awaiting, open, total: answered + awaiting + open, excluded };
+  return { answered, awaiting, open, deferred, total: answered + awaiting + open, excluded };
 }
 
 /**
@@ -493,13 +519,30 @@ export function buildCockpitModel(input: CockpitInput): CockpitModel {
  * (issue「実装方針」: 既存の回答・編集・根拠表示フローへ接続する)。
  */
 export const ACTION_TARGET_TEST_IDS: Record<CockpitActionKind, string> = {
-  // `W3` の作業面 (会話カードの 1 問 + Q&A 一覧)。
+  // `W3` の作業面 (会話カードの 1 問 + Q&A 一覧)。個々の質問へは
+  // `unresolvedTargets()` が返す `qa-item-<id>` を優先して使う。
   answer_question: "work-surface-W3",
   // 自然言語でのまとめて修正 (`ChangeSetPanel`)。
   direct_edit: "change-set-panel",
   // 現在の理解と根拠 (`UnderstandingBrief` の折りたたみ)。
   review_evidence: "understanding-brief",
 };
+
+/**
+ * 未解決事項 1 件に対する移動先候補を、優先度順に返す。
+ *
+ * 「この項目を開く」で作業面の先頭ボタンに飛ぶと、複数の質問があるときに
+ * 選んだ質問と違うものへフォーカスが当たる。Q&A 行 (`qa-item-<id>`) が
+ * 描かれていればそこへ移動し、無い場合だけ作業面 → 未解決一覧の順で
+ * フォールバックする。実際にどれが存在するかは呼び出し側 (DOM) が決める。
+ */
+export function unresolvedTargets(item: CockpitUnresolvedItem | null): string[] {
+  const targets: string[] = [];
+  if (item?.qaId != null) targets.push(`qa-item-${item.qaId}`);
+  targets.push(ACTION_TARGET_TEST_IDS.answer_question);
+  targets.push("cockpit-unresolved-items");
+  return targets;
+}
 
 /**
  * 修正手段とその可否を決める。
@@ -533,7 +576,8 @@ export function categoryActions(
         : category.questions.length === 0
           ? "この項目に未解決の質問はありません。"
           : `質問への回答は「${WORKFLOW_STATE_LABELS.W3}」の状態で行います (現在は「${stateLabel}」)。`,
-      targetTestId: canAnswer ? ACTION_TARGET_TEST_IDS.answer_question : null,
+      // このカテゴリで最も優先度の高い質問そのものへ移動する。
+      targetTestIds: canAnswer ? unresolvedTargets(category.questions[0]) : [],
     },
     {
       kind: "direct_edit",
@@ -542,7 +586,7 @@ export function categoryActions(
       disabledReason: canEdit
         ? null
         : `直接編集は理解・質問・ズレの確認中だけ行えます (現在は「${stateLabel}」)。`,
-      targetTestId: canEdit ? ACTION_TARGET_TEST_IDS.direct_edit : null,
+      targetTestIds: canEdit ? [ACTION_TARGET_TEST_IDS.direct_edit] : [],
     },
     {
       kind: "review_evidence",
@@ -551,7 +595,7 @@ export function categoryActions(
       disabledReason: hasContent
         ? null
         : "まだ内容が無いため、確認できる根拠がありません。",
-      targetTestId: hasContent ? ACTION_TARGET_TEST_IDS.review_evidence : null,
+      targetTestIds: hasContent ? [ACTION_TARGET_TEST_IDS.review_evidence] : [],
     },
   ];
 }

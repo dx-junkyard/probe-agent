@@ -29,7 +29,8 @@ export function CockpitDetailPanel({
   category: CockpitCategoryView;
   /** サーバーが決めたワークフロー状態 (Issue #349)。可否判定に使うだけ。 */
   state: InterviewWorkflowState | null;
-  onAction: (targetTestId: string) => void;
+  /** 移動先候補 (優先度順)。呼び出し側が実際に描かれているものを探す。 */
+  onAction: (targetTestIds: string[]) => void;
 }) {
   const actions = categoryActions(category, state);
   return (
@@ -122,7 +123,7 @@ export function CockpitDetailPanel({
                 key={action.kind}
                 type="button"
                 disabled={disabled}
-                onClick={() => action.targetTestId && onAction(action.targetTestId)}
+                onClick={() => action.targetTestIds.length > 0 && onAction(action.targetTestIds)}
                 className="flex w-full items-start gap-2 rounded-md border p-2 text-left transition-colors hover:bg-accent/50 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-transparent focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                 data-testid={`cockpit-action-${action.kind}`}
               >

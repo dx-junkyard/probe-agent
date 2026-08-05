@@ -7,6 +7,16 @@
 const FOCUSABLE =
   'button:not([disabled]), a[href], textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
+/**
+ * 候補を優先度順に試し、最初に描かれているものへ移動する。
+ *
+ * 「この質問へ」の移動先は `qa-item-<id>` だが、Q&A 一覧が描かれない状態
+ * (`W3` 以外) では存在しない。そのときだけ作業面・一覧へ落とす。
+ */
+export function focusFirstCockpitTarget(testIds: string[]): boolean {
+  return testIds.some(testId => focusCockpitTarget(testId));
+}
+
 /** 対象が見つかりフォーカス移動できたら true。見つからなければ false。 */
 export function focusCockpitTarget(testId: string): boolean {
   if (typeof document === "undefined") return false;

@@ -590,16 +590,25 @@ The Interview page's overview layer, on top of #349's state machine and
   matching (same rule as `understanding_diff`), then `gap_type`'s default
   category. No similarity, no keyword scoring. `vision` is an optional key
   (#352) — a response without it must render as 未設定, never crash.
-- Q&A progress must satisfy 回答済み + 確認待ち + 未回答 = 合計. `revised`
-  (superseded history) and `skipped` are excluded from both the total and the
-  unresolved list; `open_questions` and `interview_qa` rows are deduped by
-  `qa_id` first, then by question text.
+- Q&A progress must satisfy 回答済み + 確認待ち + 未回答 = 合計. ONLY
+  `answered` and `revised` (superseded history) leave the unresolved list and
+  the total. **`skipped` is not resolved** — server-side it is the temporary
+  「後で回答」 state that `resume` puts straight back to `open`
+  (`routes/interview.py`), so it counts as 未回答 (re-stated as a 「後で回答
+  N 件」 breakdown and a row marker). Excluding it makes a session with
+  unanswered questions read as 未解決 0 件 / 完成度 100%. `open_questions` and
+  `interview_qa` rows are deduped by `qa_id` first, then by question text.
 - The detail pane's 「修正するには」 entries only scroll + focus an existing
-  panel (`work-surface-W3` / `change-set-panel` / `understanding-brief`) via
-  `cockpit/navigation.ts`. Never reimplement answering, editing, or evidence
-  display there. Unavailable entries stay visible as disabled + reason —
-  this is the one deliberate exception to 原則 P3, which governs a state's
-  PRIMARY action, not guidance about how to fix an item.
+  panel via `cockpit/navigation.ts`. Targets are an ordered candidate list
+  (`unresolvedTargets()` + `focusFirstCockpitTarget()`), never one fixed id:
+  anything tied to a specific question must target that question's row
+  (`qa-item-<id>`) first and fall back to `work-surface-W3` / the unresolved
+  list only when the row is not rendered. Focusing the work surface's first
+  button sends the developer to a different question than the one they
+  picked. Never reimplement answering, editing, or evidence display there.
+  Unavailable entries stay visible as disabled + reason — this is the one
+  deliberate exception to 原則 P3, which governs a state's PRIMARY action,
+  not guidance about how to fix an item.
 - Availability is decided from the server's workflow state (`W2`/`W3`/`W4`
   for editing, `W3` for answering). Do not re-derive the state.
 - Placement is part of the contract: the status summary is full-width ABOVE
@@ -609,6 +618,10 @@ The Interview page's overview layer, on top of #349's state machine and
   surface, and the detail pane heads the right column with the session-info
   card (participants / last update / evidence counts / save state) replacing
   the old 「セッション #id」 card rather than adding a second one.
+- A failed 「セッション一覧」/「セッション詳細」 query must render the
+  `interview-load-error` card (failed target + server reason + 再試行), never
+  an empty body: without either query the page has nothing to draw, and the
+  old silent-blank behaviour hid both the failure and the next step.
 - Accessibility requirements, not styling: map cards are native `<button>`s
   with `aria-pressed`; every status is text as well as colour; the donut has
   `role="img"` + a full `aria-label` and the same numbers in a text list; the

@@ -14,7 +14,7 @@ const COLORS = {
 } as const;
 
 export function CockpitQaProgressCard({ progress }: { progress: CockpitQaProgress }) {
-  const { answered, awaiting, open, total, excluded } = progress;
+  const { answered, awaiting, open, deferred, total, excluded } = progress;
   const pct = (value: number) => (total > 0 ? (value / total) * 100 : 0);
   const answeredEnd = pct(answered);
   const awaitingEnd = answeredEnd + pct(awaiting);
@@ -78,11 +78,17 @@ export function CockpitQaProgressCard({ progress }: { progress: CockpitQaProgres
                 <dd className="ml-auto font-semibold">{total} 件</dd>
               </div>
             </dl>
+            {/* 「後で回答」は未回答の内訳。解決済みに見えないよう再掲する。 */}
+            {deferred > 0 && (
+              <p className="text-[10px] text-muted-foreground" data-testid="cockpit-qa-deferred">
+                未回答のうち {deferred} 件は「後で回答」として見送り中です。
+              </p>
+            )}
           </>
         )}
         {excluded > 0 && (
           <p className="text-[10px] text-muted-foreground" data-testid="cockpit-qa-excluded">
-            置き換え済み・見送りの質問 {excluded} 件は合計に含めていません。
+            訂正で置き換えられた質問 {excluded} 件は合計に含めていません。
           </p>
         )}
       </CardContent>

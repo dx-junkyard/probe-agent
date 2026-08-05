@@ -556,16 +556,25 @@ creating incomplete persistence or execution paths for later phases.
       review=0.5 / missing=0), never a fixed value and never a composite
       confidence percentage — it is a count of settled categories, which is
       why it does not violate #353's no-confidence-percentage rule.
-    - Q&A progress always satisfies 回答済み + 確認待ち + 未回答 = 合計;
-      `revised` (superseded history) and `skipped` are excluded from both the
-      total and the unresolved list, and `open_questions` / `interview_qa`
-      rows are deduped by `qa_id` first, then question text.
+    - Q&A progress always satisfies 回答済み + 確認待ち + 未回答 = 合計.
+      Only `answered` and `revised` (superseded history) leave the total and
+      the unresolved list; `skipped` is the temporary 「後で回答」 state that
+      `resume` returns to `open`, so it counts as 未回答 — excluding it made a
+      session with unanswered questions read as 未解決 0 件 / 完成度 100%.
+      `open_questions` / `interview_qa` rows are deduped by `qa_id` first,
+      then question text.
     - The detail pane's 「修正するには」 only scrolls + focuses an existing
-      panel (`work-surface-W3` / `change-set-panel` / `understanding-brief`).
+      panel (`change-set-panel` / `understanding-brief`, and for anything tied
+      to a question that question's own `qa-item-<id>` row, falling back to
+      `work-surface-W3` only when the row is not rendered — the work surface's
+      first button belongs to a different question).
       Unavailable entries stay visible as disabled + reason — the one
       deliberate exception to 原則 P3, which governs a state's PRIMARY action,
       not guidance about how to fix an item. Availability is decided from the
       server's workflow state; the state is never re-derived client-side.
+    - A failed session-list / session-detail query renders the
+      `interview-load-error` card (failed target, server reason, 再試行), never
+      an empty page body.
     - Placement is contract, not styling: the status summary is full-width
       above the two-column grid, the Brief keeps the top of the main column,
       the map sits under it, unresolved items + Q&A progress sit BELOW the
