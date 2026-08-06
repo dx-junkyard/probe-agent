@@ -24,9 +24,11 @@ import type {
 import {
   buildCockpitModel,
   categoryActions,
+  CATEGORY_STATUS_LABELS,
   completionPercent,
   qaProgress,
   unresolvedTargets,
+  type CockpitCategoryStatus,
   type CockpitCategoryView,
 } from "@/components/system-understanding/cockpit/model";
 import {
@@ -119,8 +121,8 @@ describe("completionPercent", () => {
 
   // 指摘 P1: 根拠の一部 (Q&A) が読めていない状態で数字を出すと、実際より
   // 高い完成度を確定値として見せてしまう。
-  it("判定できないカテゴリがあれば null を返す (実際より高い値を出さない)", () => {
-    expect(completionPercent(["confirmed", "confirmed", "unknown", "confirmed", "confirmed"]))
+  it("確定できないカテゴリ (null) があれば null を返す", () => {
+    expect(completionPercent(["confirmed", "confirmed", null, "confirmed", "confirmed"]))
       .toBeNull();
   });
 });
@@ -381,10 +383,13 @@ describe("Q&A を取得できていないとき", () => {
     });
     expect(model.qa).toBeNull();
     expect(model.completionPercent).toBeNull();
-    // 「未解決の質問が無い」ことを根拠にした確認済みは言えない。
-    expect(model.categories.every(c => c.status === "unknown")).toBe(true);
+    // 「未解決の質問が無い」ことを根拠にした確認済みは言えないので、状態を
+    // 確定させない (第 4 の状態値は作らない)。
+    expect(model.categories.every(c => c.status === null)).toBe(true);
+    expect(model.categories.every(c => c.statusLabel === null)).toBe(true);
     expect(model.confirmedCount).toBe(0);
-    expect(model.unknownCount).toBe(5);
+    expect(model.pendingCount).toBe(5);
+    expect(model.countsSettled).toBe(false);
     expect(model.qaFetchStatus).toBe("unavailable");
     expect(model.nextStep.title).toContain("Q&A を取得できませんでした");
   });
@@ -398,11 +403,16 @@ describe("Q&A を取得できていないとき", () => {
       qaFetchStatus: "unavailable",
     });
     const byKey = Object.fromEntries(model.categories.map(c => [c.key, c]));
+    // session 詳細だけで確定できる 2 つはそのまま 3 値のまま出る。
     expect(byKey.vision.status).toBe("missing");
+    expect(byKey.vision.statusLabel).toBe("未設定");
     expect(byKey.api_boundaries.status).toBe("review");
-    expect(byKey.system_purpose.status).toBe("unknown");
+    expect(byKey.api_boundaries.statusLabel).toBe("要確認");
+    // 質問の有無にしか依存しないものだけ保留。
+    expect(byKey.system_purpose.status).toBeNull();
     expect(model.missingCount).toBe(1);
     expect(model.reviewCount).toBe(1);
+    expect(model.pendingCount).toBe(3);
   });
 
   it("読み込み中も 0 件を確定値として出さない", () => {
@@ -416,6 +426,51 @@ describe("Q&A を取得できていないとき", () => {
     expect(model.qa).toBeNull();
     expect(model.completionPercent).toBeNull();
     expect(model.nextStep.title).toContain("読み込んでいます");
+  });
+});
+
+// ── 状態の有限集合 (指摘 P2) ──────────────────────────────────────────
+
+describe("カテゴリ状態の 3 値契約", () => {
+  it("状態ラベルは confirmed / review / missing の 3 値だけ", () => {
+    expect(Object.keys(CATEGORY_STATUS_LABELS).sort())
+      .toEqual(["confirmed", "missing", "review"]);
+    // 型の側も 3 値。以下が型エラーにならないことがコンパイル時の保証になる。
+    const all: CockpitCategoryStatus[] = ["confirmed", "review", "missing"];
+    expect(all).toHaveLength(3);
+  });
+
+  it("Q&A 未取得は状態値ではなく、別軸 (qaFetchStatus) に持つ", () => {
+    const model = buildCockpitModel({
+      understanding: fullUnderstanding(),
+      gaps: [],
+      openQuestions: [],
+      qaItems: undefined,
+      qaFetchStatus: "unavailable",
+    });
+    // 確定できないカテゴリは 4 値目ではなく null (ラベル保留)。
+    const statuses = model.categories.map(c => c.status);
+    expect(statuses.every(s => s === null)).toBe(true);
+    expect(statuses.some(s => s != null && !["confirmed", "review", "missing"].includes(s)))
+      .toBe(false);
+    expect(model.qaFetchStatus).toBe("unavailable");
+  });
+
+  it("Q&A の再取得に成功すれば通常の 3 状態へ戻る", () => {
+    const input = {
+      understanding: fullUnderstanding(),
+      gaps: [],
+      openQuestions: [],
+    };
+    const failed = buildCockpitModel({ ...input, qaItems: undefined, qaFetchStatus: "unavailable" as const });
+    expect(failed.categories.every(c => c.status === null)).toBe(true);
+
+    const recovered = buildCockpitModel({ ...input, qaItems: [], qaFetchStatus: "ready" as const });
+    expect(recovered.categories.map(c => c.status)).toEqual(
+      ["confirmed", "confirmed", "confirmed", "confirmed", "confirmed"],
+    );
+    expect(recovered.completionPercent).toBe(100);
+    expect(recovered.countsSettled).toBe(true);
   });
 });
 
@@ -561,6 +616,22 @@ describe("CockpitStatusSummary", () => {
     expect(screen.queryByTestId("cockpit-progress-bar")).toBeNull();
   });
 
+  it("Q&A 未取得時は「要確認 0」を確定値として出さない", () => {
+    const m = model({
+      understanding: fullUnderstanding(),
+      gaps: [],
+      openQuestions: [],
+      qaItems: undefined,
+      qaFetchStatus: "unavailable",
+    });
+    render(<CockpitStatusSummary model={m} onGoToTopUnresolved={() => {}} />);
+    const review = screen.getByTestId("cockpit-stat-review");
+    expect(review).toHaveTextContent("0件以上");
+    expect(review.textContent).not.toMatch(/^0要確認$/);
+    // 未設定は内容の有無だけで決まるので、確定値のまま。
+    expect(screen.getByTestId("cockpit-stat-missing")).toHaveTextContent("0");
+  });
+
   it("未解決が無ければ最優先へ移動する CTA を出さない", () => {
     const m = model({
       understanding: fullUnderstanding(),
@@ -608,6 +679,65 @@ describe("UnderstandingMap", () => {
     expect(
       within(screen.getByTestId("cockpit-category-card-api_boundaries")).getByText("確認済み"),
     ).toBeTruthy();
+  });
+
+  it("Q&A 未取得のカードに第 4 の状態ラベルを出さず、保留として示す", () => {
+    const m = model({
+      understanding: fullUnderstanding({ vision: [] }),
+      gaps: [gap({ name: "GET /unknown", gap_type: "unclassified_entrypoint" })],
+      openQuestions: [],
+      qaItems: undefined,
+      qaFetchStatus: "unavailable",
+    });
+    const onRetryQa = vi.fn();
+    render(
+      <UnderstandingMap
+        categories={m.categories}
+        selected="vision"
+        qaFetchStatus="unavailable"
+        onSelect={() => {}}
+        onRetryQa={onRetryQa}
+      />,
+    );
+    // 確定できないカテゴリには状態バッジを出さない。
+    const purpose = screen.getByTestId("cockpit-category-card-system_purpose");
+    expect(within(purpose).getByTestId("cockpit-status-pending")).toBeTruthy();
+    expect(within(purpose).queryByTestId("cockpit-status-confirmed")).toBeNull();
+    // session 詳細だけで確定できるものは 3 状態のまま出る。
+    expect(
+      within(screen.getByTestId("cockpit-category-card-vision")).getByTestId("cockpit-status-missing"),
+    ).toBeTruthy();
+    expect(
+      within(screen.getByTestId("cockpit-category-card-api_boundaries"))
+        .getByTestId("cockpit-status-review"),
+    ).toBeTruthy();
+    // 理由と復旧手段はマップ全体に 1 度だけ。
+    expect(screen.getByTestId("cockpit-map-qa-unavailable")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("cockpit-map-qa-retry"));
+    expect(onRetryQa).toHaveBeenCalledTimes(1);
+  });
+
+  it("読み込み中も状態ラベルを保留し、再試行は出さない", () => {
+    const m = model({
+      understanding: fullUnderstanding(),
+      gaps: [],
+      openQuestions: [],
+      qaItems: undefined,
+      qaFetchStatus: "loading",
+    });
+    render(
+      <UnderstandingMap
+        categories={m.categories}
+        selected="vision"
+        qaFetchStatus="loading"
+        onSelect={() => {}}
+        onRetryQa={() => {}}
+      />,
+    );
+    expect(screen.getAllByTestId("cockpit-status-pending")).toHaveLength(5);
+    expect(screen.queryByTestId("cockpit-status-confirmed")).toBeNull();
+    expect(screen.getByTestId("cockpit-map-qa-unavailable")).toHaveTextContent("読み込み中");
+    expect(screen.queryByTestId("cockpit-map-qa-retry")).toBeNull();
   });
 
   it("カードはキーボードで選択できる (native button)", () => {

@@ -20,9 +20,15 @@ export function CockpitStatusSummary({
   const percent = model.completionPercent;
   // 取得できていない値は 0 ではなく「—」。0 件と未取得を同じ表示にしない。
   const questionTotal = model.qa ? String(model.qa.total) : "—";
+  // 要確認は Q&A 未取得のとき「今わかっている分」の下限にすぎないので、
+  // 確定値として出さない (0 件だと問題なしに読めてしまう)。未設定は内容の
+  // 有無だけで決まるため常に確定値。
+  const reviewValue = model.countsSettled
+    ? String(model.reviewCount)
+    : `${model.reviewCount}件以上`;
   const stats: Array<[string, string, string]> = [
     ["cockpit-stat-categories", String(model.categoryCount), "理解カテゴリ"],
-    ["cockpit-stat-review", String(model.reviewCount), "要確認"],
+    ["cockpit-stat-review", reviewValue, "要確認"],
     ["cockpit-stat-missing", String(model.missingCount), "未設定"],
     ["cockpit-stat-questions", questionTotal, "質問合計"],
   ];
@@ -87,7 +93,7 @@ export function CockpitStatusSummary({
             <dl className="grid grid-cols-2 gap-2 sm:grid-cols-4">
               {stats.map(([testId, value, label]) => (
                 <div key={testId} className="rounded-md border p-2" data-testid={testId}>
-                  <dd className="text-lg font-semibold leading-none">{value}</dd>
+                  <dd className="text-lg font-semibold leading-none break-words">{value}</dd>
                   <dt className="mt-1 text-xs text-muted-foreground">{label}</dt>
                 </div>
               ))}

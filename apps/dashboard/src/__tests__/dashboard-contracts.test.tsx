@@ -3986,10 +3986,14 @@ describe("Interview page", () => {
     // 「未解決なし」とも読ませない。
     expect(screen.getByTestId("cockpit-unresolved-qa-unavailable")).toBeInTheDocument();
     expect(screen.queryByTestId("cockpit-unresolved-empty")).toBeNull();
-    // 取得できていないカテゴリは確認済みと言い切らない。
-    expect(
-      within(screen.getByTestId("cockpit-category-card-system_purpose")).getByText("判定できません"),
-    ).toBeInTheDocument();
+    // 取得できていないカテゴリは確認済みと言い切らず、第 4 の状態ラベルも
+    // 出さない (状態は confirmed / review / missing の 3 値のまま)。
+    const purposeCard = screen.getByTestId("cockpit-category-card-system_purpose");
+    expect(within(purposeCard).getByTestId("cockpit-status-pending")).toBeInTheDocument();
+    expect(within(purposeCard).queryByTestId("cockpit-status-confirmed")).toBeNull();
+    expect(screen.getByTestId("cockpit-map-qa-unavailable")).toBeInTheDocument();
+    // 「要確認 0」を確定値として出さない。
+    expect(screen.getByTestId("cockpit-stat-review")).toHaveTextContent("件以上");
     expect(screen.getByTestId("cockpit-qa-error-detail")).toHaveTextContent("qa unavailable");
 
     // 再試行が成功すれば通常表示に戻り、件数が入る。
@@ -4001,6 +4005,15 @@ describe("Interview page", () => {
     expect(screen.getByTestId("cockpit-qa-answered")).toHaveTextContent("1 件");
     expect(screen.getByTestId("cockpit-stat-questions")).toHaveTextContent("1");
     expect(screen.getByTestId("cockpit-completion-percent")).toHaveTextContent("100");
+    // 通常の 3 状態へ戻る。
+    expect(
+      within(screen.getByTestId("cockpit-category-card-system_purpose"))
+        .getByTestId("cockpit-status-confirmed"),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("cockpit-status-pending")).toBeNull();
+    expect(screen.queryByTestId("cockpit-map-qa-unavailable")).toBeNull();
+    expect(screen.getByTestId("cockpit-stat-review")).toHaveTextContent("0");
+    expect(screen.getByTestId("cockpit-stat-review")).not.toHaveTextContent("件以上");
   });
 
   // Issue #356 受け入れ条件「loading、空データ、エラー…に適切な表示になる」。

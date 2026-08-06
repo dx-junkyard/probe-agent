@@ -6,41 +6,57 @@
 // アクセシビリティ: カードは native button なのでキーボードで到達・選択でき、
 // 選択状態は `aria-pressed` で伝える。状態は色だけでなく必ずテキストを伴う。
 
-import { AlertTriangle, CheckCircle2, CircleDashed, HelpCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle2, CircleDashed, RefreshCw } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import type { CockpitCategoryKey, CockpitCategoryStatus, CockpitCategoryView } from "./model";
+import {
+  CATEGORY_STATUS_PENDING_LABEL,
+  type CockpitCategoryKey,
+  type CockpitCategoryStatus,
+  type CockpitCategoryView,
+  type CockpitQaFetchStatus,
+} from "./model";
 
-const STATUS_VARIANT: Record<
-  CockpitCategoryStatus,
-  "success" | "warning" | "destructive" | "outline"
-> = {
+const STATUS_VARIANT: Record<CockpitCategoryStatus, "success" | "warning" | "destructive"> = {
   confirmed: "success",
   review: "warning",
   missing: "destructive",
-  // 判定不能は「悪い値」ではないので、要確認と同じ見た目にしない。
-  unknown: "outline",
 };
 
 const STATUS_ICON: Record<CockpitCategoryStatus, typeof CheckCircle2> = {
   confirmed: CheckCircle2,
   review: AlertTriangle,
   missing: CircleDashed,
-  unknown: HelpCircle,
 };
 
+/**
+ * 状態バッジ。状態は `confirmed` / `review` / `missing` の 3 値だけ。
+ * 確定できないカテゴリ (`status === null`) には状態ラベルを出さず、データを
+ * 取得できていないという別軸の説明を出す (issue §3 の 3 状態契約)。
+ */
 export function CategoryStatusBadge({
   status,
   label,
 }: {
-  status: CockpitCategoryStatus;
-  label: string;
+  status: CockpitCategoryStatus | null;
+  label: string | null;
 }) {
+  if (status == null) {
+    return (
+      <span
+        className="inline-flex items-center gap-1 text-xs text-muted-foreground"
+        data-testid="cockpit-status-pending"
+      >
+        {CATEGORY_STATUS_PENDING_LABEL}
+      </span>
+    );
+  }
   const Icon = STATUS_ICON[status];
   return (
     <Badge variant={STATUS_VARIANT[status]} className="gap-1 font-normal" data-testid={`cockpit-status-${status}`}>
       <Icon className="h-3 w-3" aria-hidden="true" />
-      {label}
+      {label ?? ""}
     </Badge>
   );
 }
@@ -48,11 +64,16 @@ export function CategoryStatusBadge({
 export function UnderstandingMap({
   categories,
   selected,
+  qaFetchStatus = "ready",
   onSelect,
+  onRetryQa,
 }: {
   categories: CockpitCategoryView[];
   selected: CockpitCategoryKey;
+  /** Q&A の取得状態。`ready` 以外では確定できない状態がある。 */
+  qaFetchStatus?: CockpitQaFetchStatus;
   onSelect: (key: CockpitCategoryKey) => void;
+  onRetryQa?: () => void;
 }) {
   return (
     <Card data-testid="cockpit-understanding-map">
@@ -62,7 +83,27 @@ export function UnderstandingMap({
           カードを選択すると、状態・根拠・修正方法を詳細ペインに表示します。
         </CardDescription>
       </CardHeader>
-      <CardContent>
+      <CardContent className="space-y-3">
+        {/* 一部のカテゴリが確定できない理由と復旧手段を、マップ全体に 1 度
+            だけ出す。カード側は状態ラベルを保留するだけにする。 */}
+        {qaFetchStatus !== "ready" && (
+          <div
+            className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-dashed p-2 text-xs text-muted-foreground"
+            data-testid="cockpit-map-qa-unavailable"
+          >
+            <span>
+              {qaFetchStatus === "loading"
+                ? "Q&A を読み込み中です。未解決の質問に依存する状態は、読み込み後に確定します。"
+                : "Q&A を取得できていないため、未解決の質問に依存する状態を確定できません。"}
+            </span>
+            {qaFetchStatus === "unavailable" && onRetryQa && (
+              <Button size="sm" variant="outline" onClick={onRetryQa} data-testid="cockpit-map-qa-retry">
+                <RefreshCw className="h-4 w-4 mr-1" />
+                再試行
+              </Button>
+            )}
+          </div>
+        )}
         <ul className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
           {categories.map(category => {
             const isSelected = category.key === selected;

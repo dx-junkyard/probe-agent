@@ -41,20 +41,21 @@ export type CockpitCategoryKey =
   | "probe_flow";
 
 /**
- * カテゴリの状態 (issue §3 の 3 値)。色だけでなく必ずラベルを伴わせる。
+ * カテゴリの状態 (issue §3)。**この 3 値だけ**で、増やさない。色だけでなく
+ * 必ずラベルを伴わせる。
  *
- * `unknown` は 4 値目だが、issue の 3 値を増やしたものではない: Q&A を取得
- * できていないとき、「未解決の質問が無い」ことを根拠にした `confirmed` は
- * 事実として言えない。取得できていない状態を確認済みと言い切らないための
- * 判定不能値で、Q&A が読めている限り現れない。
+ * 「データが取れていない」はカテゴリの業務状態ではないので、ここには入れず
+ * `CockpitQaFetchStatus` に持たせる。確定できないカテゴリは
+ * `CockpitCategoryView.status` が `null` (状態ラベルを保留) になる。
  */
-export type CockpitCategoryStatus = "confirmed" | "review" | "missing" | "unknown";
+export type CockpitCategoryStatus = "confirmed" | "review" | "missing";
 
 /**
  * Q&A 一覧 (`GET /interview/sessions/{id}/qa`) の取得状態。
  *
  * 質問合計・未解決件数・進捗はこの応答だけが根拠なので、取得前や失敗時に
- * 0 件という確定値を出してはならない (0 件と未取得は別物)。
+ * 0 件という確定値を出してはならない (0 件と未取得は別物)。カテゴリ状態と
+ * は別の軸で、混ぜない。
  */
 export type CockpitQaFetchStatus = "ready" | "loading" | "unavailable";
 
@@ -142,8 +143,10 @@ export const CATEGORY_STATUS_LABELS: Record<CockpitCategoryStatus, string> = {
   confirmed: "確認済み",
   review: "要確認",
   missing: "未設定",
-  unknown: "判定できません",
 };
+
+/** 状態を確定できないときの説明 (状態ラベルではない)。 */
+export const CATEGORY_STATUS_PENDING_LABEL = "Q&A 未取得のため保留";
 
 // ── 未解決事項 ────────────────────────────────────────────────────────
 
@@ -225,8 +228,14 @@ export interface CockpitCategoryView {
   number: string;
   title: string;
   caption: string;
-  status: CockpitCategoryStatus;
-  statusLabel: string;
+  /**
+   * 業務状態。Q&A を取得できておらず、「未解決の質問が無い」ことを根拠に
+   * するしか確定手段が無いカテゴリでは `null` (= 状態ラベルを保留)。
+   * `missing` (内容が無い) と gap 由来の `review` は session 詳細だけで
+   * 確定できるので、Q&A が取れていなくてもそのまま出る。
+   */
+  status: CockpitCategoryStatus | null;
+  statusLabel: string | null;
   /** 内容の短いサマリー (issue §3)。 */
   summary: string;
   /** 対応が必要な場合の短い指示 (issue §3)。 */
@@ -247,10 +256,18 @@ export interface CockpitModel {
    * `null`。実際より高い値を出すくらいなら数字を出さない。
    */
   completionPercent: number | null;
+  /**
+   * 要確認の件数。Q&A が `ready` でないときは「今わかっている分」の下限で、
+   * 確定値ではない (`countsSettled` が false)。
+   */
   reviewCount: number;
+  /** 未設定の件数。内容の有無だけで決まるので常に確定値。 */
   missingCount: number;
   confirmedCount: number;
-  unknownCount: number;
+  /** 状態を確定できなかったカテゴリ数 (Q&A 未取得時のみ 0 より大きい)。 */
+  pendingCount: number;
+  /** 件数が確定値かどうか。false なら「N 件以上」として見せる。 */
+  countsSettled: boolean;
   categoryCount: number;
   /** Q&A の取得状態。`ready` 以外では質問由来の件数を確定値として出さない。 */
   qaFetchStatus: CockpitQaFetchStatus;
@@ -434,14 +451,16 @@ export function qaProgress(qaItems: InterviewQaOut[] | null | undefined): Cockpi
  * confirmed = 1、review = 0.5、missing = 0 の重み付き平均を百分率にして
  * 四捨五入する。カテゴリが 0 件のときは 0%。
  *
- * 判定できないカテゴリ (`unknown`) が 1 つでもあれば `null` を返す。根拠の
- * 一部 (Q&A) が読めていない状態で数字を出すと、実際より高い完成度を確定値
+ * 状態を確定できないカテゴリ (`null`) が 1 つでもあれば `null` を返す。根拠
+ * の一部 (Q&A) が読めていない状態で数字を出すと、実際より高い完成度を確定値
  * として見せることになる。
  */
-export function completionPercent(statuses: CockpitCategoryStatus[]): number | null {
+export function completionPercent(
+  statuses: Array<CockpitCategoryStatus | null>,
+): number | null {
   if (statuses.length === 0) return 0;
-  if (statuses.some(status => status === "unknown")) return null;
-  const weight = (status: CockpitCategoryStatus) =>
+  if (statuses.some(status => status == null)) return null;
+  const weight = (status: CockpitCategoryStatus | null) =>
     status === "confirmed" ? 1 : status === "review" ? 0.5 : 0;
   const score = statuses.reduce((sum, status) => sum + weight(status), 0);
   return Math.round((score / statuses.length) * 100);
@@ -449,7 +468,7 @@ export function completionPercent(statuses: CockpitCategoryStatus[]): number | n
 
 function summarizeCategory(
   items: UnderstandingItem[],
-  status: CockpitCategoryStatus,
+  status: CockpitCategoryStatus | null,
   gaps: GapItem[],
   questions: CockpitUnresolvedItem[],
 ): { summary: string; hint: string } {
@@ -467,7 +486,7 @@ function summarizeCategory(
   if (status === "confirmed") {
     return { summary, hint: "未解決の確認事項はありません。必要なら直接編集できます。" };
   }
-  if (status === "unknown") {
+  if (status == null) {
     return {
       summary,
       hint: "Q&A を取得できていないため、未解決の確認事項が残っているか判定できません。",
@@ -521,17 +540,18 @@ export function buildCockpitModel(input: CockpitInput): CockpitModel {
     const items = sectionItems(input.understanding, def.sections);
     const gaps = gapsByCategory.get(def.key) ?? [];
     const questions = unresolved.filter(q => q.category === def.key);
-    // 内容の有無と gap は session 詳細だけで判定できる。「未解決の質問が
-    // 無い」ことを根拠にする `confirmed` だけが Q&A に依存するので、Q&A を
-    // 取得できていないときは確認済みと言い切らず `unknown` にする。
-    const status: CockpitCategoryStatus =
+    // 内容の有無 (`missing`) と gap 由来の `review` は session 詳細だけで
+    // 判定できる。「未解決の質問が無い」ことを根拠にする `confirmed` だけが
+    // Q&A に依存するので、Q&A を取得できていないときは状態を確定させず
+    // `null` (ラベル保留) にする。状態の有限集合は 3 値のまま増やさない。
+    const status: CockpitCategoryStatus | null =
       items.length === 0
         ? "missing"
         : gaps.length > 0 || questions.length > 0
           ? "review"
           : qaReady
             ? "confirmed"
-            : "unknown";
+            : null;
     const { summary, hint } = summarizeCategory(items, status, gaps, questions);
     return {
       key: def.key,
@@ -539,7 +559,7 @@ export function buildCockpitModel(input: CockpitInput): CockpitModel {
       title: def.title,
       caption: def.caption,
       status,
-      statusLabel: CATEGORY_STATUS_LABELS[status],
+      statusLabel: status ? CATEGORY_STATUS_LABELS[status] : null,
       summary,
       hint,
       itemCount: items.length,
@@ -554,7 +574,7 @@ export function buildCockpitModel(input: CockpitInput): CockpitModel {
 
   const missing = categories.filter(c => c.status === "missing");
   const review = categories.filter(c => c.status === "review");
-  const unknown = categories.filter(c => c.status === "unknown");
+  const pending = categories.filter(c => c.status == null);
   const defaultCategory = (missing[0] ?? review[0] ?? categories[0]).key;
 
   const topUnresolved = unresolved[0];
@@ -596,7 +616,8 @@ export function buildCockpitModel(input: CockpitInput): CockpitModel {
     reviewCount: review.length,
     missingCount: missing.length,
     confirmedCount: categories.filter(c => c.status === "confirmed").length,
-    unknownCount: unknown.length,
+    pendingCount: pending.length,
+    countsSettled: qaReady,
     categoryCount: categories.length,
     qaFetchStatus,
     unresolved,
@@ -673,7 +694,11 @@ export function categoryActions(
       disabledReason: canAnswer
         ? null
         : category.questions.length === 0
-          ? "この項目に未解決の質問はありません。"
+          // 状態を確定できていない = Q&A が読めていないので、「質問は
+          // ありません」と言い切れない。
+          ? category.status == null
+            ? "Q&A を取得できていないため、未解決の質問があるか判定できません。"
+            : "この項目に未解決の質問はありません。"
           : `質問への回答は「${WORKFLOW_STATE_LABELS.W3}」の状態で行います (現在は「${stateLabel}」)。`,
       // このカテゴリで最も優先度の高い質問そのものへ移動する。
       targetTestIds: canAnswer ? unresolvedTargets(category.questions[0]) : [],

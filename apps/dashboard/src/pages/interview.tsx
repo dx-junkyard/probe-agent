@@ -2476,7 +2476,9 @@ export default function InterviewPage() {
                 <UnderstandingMap
                   categories={cockpit.categories}
                   selected={selectedCategoryKey}
+                  qaFetchStatus={cockpit.qaFetchStatus}
                   onSelect={selectCockpitCategory}
+                  onRetryQa={() => void refetchQaList()}
                 />
 
                 {showAlignmentWork && (

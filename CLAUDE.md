@@ -567,11 +567,17 @@ creating incomplete persistence or execution paths for later phases.
       `unconfirmed`/`deferred` and state-derived priority apply to the
       surviving row, and a question already `answered` on the Q&A side leaves
       the list.
+    - The category status set is EXACTLY `confirmed`/`review`/`missing` —
+      never add a fourth value for a data-availability condition.
     - 0 件 and 「取得できていない」 are different displays. The Q&A query's
-      state is an input (`qaFetchStatus`); when it is not `ready`, `model.qa`
-      and `completionPercent` are `null` (no zeroed counts, no progress bar),
-      a would-be `confirmed` category becomes `unknown`, and the Q&A card
-      offers a retry. `missing`/`review` still come from the session detail.
+      state is a separate axis fed in as `qaFetchStatus`; when it is not
+      `ready`, `model.qa` and `completionPercent` are `null` (no zeroed
+      counts, no progress bar), a category that would be `confirmed` only
+      because no question is outstanding carries `status: null` (its badge is
+      withheld for a 「Q&A 未取得のため保留」 note), 要確認 renders as
+      「N 件以上」 since it is only a lower bound, and both the Q&A card and
+      the map offer a retry. `missing`/`review` are decided from the session
+      detail alone, so they keep their normal badges.
     - The detail pane's 「修正するには」 only scrolls + focuses an existing
       panel (`change-set-panel` / `understanding-brief`, and for anything tied
       to a question that question's own `qa-item-<id>` row, falling back to

@@ -585,7 +585,11 @@ The Interview page's overview layer, on top of #349's state machine and
   category status, a completion number, a priority order, or an action's
   availability. Adding backend endpoints for this page is out of scope —
   every number comes from responses the page already fetches.
-- The five categories, their `confirmed`/`review`/`missing` status, and the
+- The category status set is EXACTLY `confirmed`/`review`/`missing` (issue §3)
+  — never add a fourth value for a data-availability condition. A status that
+  cannot be settled is `status: null` (label withheld), and the availability
+  itself lives on the separate `qaFetchStatus` axis.
+- The five categories, their status, and the
   completion percentage are deterministic: content presence, exact-name gap
   matching (same rule as `understanding_diff`), then `gap_type`'s default
   category. No similarity, no keyword scoring. `vision` is an optional key
@@ -609,10 +613,12 @@ The Interview page's overview layer, on top of #349's state machine and
   `qaFetchStatus` (`ready`/`loading`/`unavailable`). When it is not `ready`:
   `model.qa` is `null` (never a zeroed progress object), `completionPercent`
   is `null` (no progress bar, a reason instead), a category that would be
-  `confirmed` only because no question is outstanding becomes `unknown`
-  (判定できません — the 4th status exists for exactly this and never appears
-  while Q&A loads fine), and the Q&A card renders a retry. `missing` and
-  `review` are still decided from the session detail alone, so they stay.
+  `confirmed` only because no question is outstanding gets `status: null`
+  (the card shows 「Q&A 未取得のため保留」 instead of a status badge), the
+  要確認 count is rendered as 「N 件以上」 (`countsSettled: false`) because 0
+  would read as "nothing to do", and the Q&A card plus the map both offer a
+  retry. `missing` and `review` are decided from the session detail alone, so
+  they keep their normal 3-value badges.
 - The detail pane's 「修正するには」 entries only scroll + focus an existing
   panel via `cockpit/navigation.ts`. Targets are an ordered candidate list
   (`unresolvedTargets()` + `focusFirstCockpitTarget()`), never one fixed id:
