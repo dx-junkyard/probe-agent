@@ -69,6 +69,7 @@ import {
   buildCockpitModel,
   unresolvedTargets,
   type CockpitCategoryKey,
+  type CockpitQaFetchStatus,
   type CockpitUnresolvedItem,
 } from "@/components/system-understanding/cockpit/model";
 import {
@@ -1513,7 +1514,15 @@ export default function InterviewPage() {
   // fetches, read here too (react-query dedups the identical queryKey) so
   // the focused-question card can show a just-investigated question's
   // qa.investigation in the same view instead of only inside the Q&A list.
-  const { data: qaListForFocus } = useInterviewQaList(selectedSessionId);
+  // Issue #356 (再レビュー): コックピットの質問合計・未解決件数・進捗はこの
+  // 応答だけが根拠なので、取得前・取得失敗を 0 件という確定値にしない。
+  const {
+    data: qaListForFocus,
+    isLoading: qaListLoading,
+    isError: qaListFailed,
+    error: qaListError,
+    refetch: refetchQaList,
+  } = useInterviewQaList(selectedSessionId);
   // PR #296 review restructure: Alignment Review (Intent Brief summary +
   // Review Queue) moves into the main, tabbed content area. `alignmentFull`
   // (same GET .../alignment ReviewQueuePanel already reads) decides whether
@@ -1563,18 +1572,27 @@ export default function InterviewPage() {
 
   // Issue #356: コックピットの表示モデル。既存の応答 (理解 / gap / open
   // questions / Q&A 一覧) だけから決定的に集約する。
+  const qaFetchStatus: CockpitQaFetchStatus = qaListFailed
+    ? "unavailable"
+    : qaListForFocus
+      ? "ready"
+      : qaListLoading
+        ? "loading"
+        : "unavailable";
   const cockpit = useMemo(
     () => buildCockpitModel({
       understanding: session?.current_understanding,
       gaps: session?.gap_analysis,
       openQuestions: session?.open_questions,
       qaItems: qaListForFocus?.items,
+      qaFetchStatus,
     }),
     [
       session?.current_understanding,
       session?.gap_analysis,
       session?.open_questions,
       qaListForFocus?.items,
+      qaFetchStatus,
     ],
   );
   // 選択中カテゴリ。開発者が選ぶまではモデルの既定 (未設定 → 要確認 → 先頭)。
@@ -3078,9 +3096,15 @@ git commit`}
               <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_300px] gap-4">
                 <CockpitUnresolvedItems
                   items={cockpit.unresolved}
+                  qaFetchStatus={cockpit.qaFetchStatus}
                   onSelect={openUnresolvedItem}
                 />
-                <CockpitQaProgressCard progress={cockpit.qa} />
+                <CockpitQaProgressCard
+                  progress={cockpit.qa}
+                  status={cockpit.qaFetchStatus}
+                  error={qaListFailed ? String(qaListError?.message ?? qaListError) : null}
+                  onRetry={() => void refetchQaList()}
+                />
               </div>
             </div>
 

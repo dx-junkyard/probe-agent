@@ -597,7 +597,22 @@ The Interview page's overview layer, on top of #349's state machine and
   (`routes/interview.py`), so it counts as 未回答 (re-stated as a 「後で回答
   N 件」 breakdown and a row marker). Excluding it makes a session with
   unanswered questions read as 未解決 0 件 / 完成度 100%. `open_questions` and
-  `interview_qa` rows are deduped by `qa_id` first, then by question text.
+  `interview_qa` rows are MERGED by `qa_id` (then question text), never
+  "keep the first, drop the rest": only the `interview_qa` row carries state
+  — skip/resume never touch the `session.open_questions` JSON — so the Q&A
+  row's `unconfirmed`/`deferred` and its state-derived priority must be
+  applied to the surviving row, and a question the Q&A side reports as
+  `answered`/`revised` leaves the list even if `open_questions` still lists it.
+- **0 件 and 「取得できていない」 are different displays.** Question totals,
+  unresolved counts, and Q&A progress rest solely on `GET
+  /interview/sessions/{id}/qa`; pass its query state in as
+  `qaFetchStatus` (`ready`/`loading`/`unavailable`). When it is not `ready`:
+  `model.qa` is `null` (never a zeroed progress object), `completionPercent`
+  is `null` (no progress bar, a reason instead), a category that would be
+  `confirmed` only because no question is outstanding becomes `unknown`
+  (判定できません — the 4th status exists for exactly this and never appears
+  while Q&A loads fine), and the Q&A card renders a retry. `missing` and
+  `review` are still decided from the session detail alone, so they stay.
 - The detail pane's 「修正するには」 entries only scroll + focus an existing
   panel via `cockpit/navigation.ts`. Targets are an ordered candidate list
   (`unresolvedTargets()` + `focusFirstCockpitTarget()`), never one fixed id:

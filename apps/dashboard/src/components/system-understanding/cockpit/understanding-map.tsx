@@ -6,21 +6,27 @@
 // アクセシビリティ: カードは native button なのでキーボードで到達・選択でき、
 // 選択状態は `aria-pressed` で伝える。状態は色だけでなく必ずテキストを伴う。
 
-import { AlertTriangle, CheckCircle2, CircleDashed } from "lucide-react";
+import { AlertTriangle, CheckCircle2, CircleDashed, HelpCircle } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import type { CockpitCategoryKey, CockpitCategoryStatus, CockpitCategoryView } from "./model";
 
-const STATUS_VARIANT: Record<CockpitCategoryStatus, "success" | "warning" | "destructive"> = {
+const STATUS_VARIANT: Record<
+  CockpitCategoryStatus,
+  "success" | "warning" | "destructive" | "outline"
+> = {
   confirmed: "success",
   review: "warning",
   missing: "destructive",
+  // 判定不能は「悪い値」ではないので、要確認と同じ見た目にしない。
+  unknown: "outline",
 };
 
 const STATUS_ICON: Record<CockpitCategoryStatus, typeof CheckCircle2> = {
   confirmed: CheckCircle2,
   review: AlertTriangle,
   missing: CircleDashed,
+  unknown: HelpCircle,
 };
 
 export function CategoryStatusBadge({

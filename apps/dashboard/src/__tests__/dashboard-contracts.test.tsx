@@ -3912,6 +3912,97 @@ describe("Interview page", () => {
     });
   });
 
+  // Issue #356 再レビュー指摘 P1: Q&A 取得だけが失敗した場合、セッション詳細
+  // は取れているので画面自体は描ける。そのとき「質問 0 件 / 完成度 100%」と
+  // いう確定値を出してはならない (0 件と未取得は別物)。
+  test("Q&A の取得だけ失敗したら 0 件ではなくエラーと再試行を出す", async () => {
+    mockInterviewApi({
+      workflow: {
+        state: "W2", candidate_state: "W2", rule_row: 6, reached_state: "W2",
+        primary_action: "confirm_understanding",
+        facts: { understanding_unconfirmed: true },
+      },
+      proposals: [],
+      session: {
+        stage: "purpose_confirmation",
+        understanding_confirmed_at: null,
+        current_understanding: {
+          vision: [understandingItem("開発者が挙動を説明できる")],
+          system_purpose: [understandingItem("Runtime probe platform")],
+          core_capabilities: [understandingItem("Trace ingestion")],
+          capability_elements: [], supporting_elements: [],
+          api_boundaries: [understandingItem("POST /traces")],
+          probe_flow_candidates: [understandingItem("summarize flow")],
+        },
+      },
+    });
+    const baseGet = mockApi.get.getMockImplementation();
+    let qaFailing = true;
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7/qa") {
+        if (qaFailing) return Promise.reject(new Error("qa unavailable"));
+        return Promise.resolve({
+          session_id: 7, system_id: 1,
+          items: [
+            {
+              id: 81, session_id: 7, system_id: 1,
+              question_text: "回答済みの質問", question_category: "purpose",
+              question_source: "reviewer", hypothesis: null, evidence_refs: [],
+              runtime_evidence: null, answer_text: "はい", answer_unknown: null,
+              status: "answered", answered_by: "admin", superseded_by_id: null,
+              created_at: 1, answered_at: 2,
+            },
+          ],
+          open_count: 0, high_priority_open_count: 0, answers_revised_at: null,
+        });
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // セッション詳細は取れているので、画面全体のエラーカードにはしない。
+    await screen.findByTestId("cockpit-status-summary");
+    expect(screen.queryByTestId("interview-load-error")).toBeNull();
+
+    // 質問合計と完成度は確定値にしない。
+    await waitFor(() => {
+      expect(screen.getByTestId("cockpit-qa-progress")).toHaveAttribute("data-status", "unavailable");
+    });
+    expect(screen.getByTestId("cockpit-stat-questions")).toHaveTextContent("—");
+    expect(screen.getByTestId("cockpit-completion-percent")).toHaveTextContent("—");
+    expect(screen.getByTestId("cockpit-completion-percent")).not.toHaveTextContent("100");
+    expect(screen.queryByTestId("cockpit-progress-bar")).toBeNull();
+    // 「未解決なし」とも読ませない。
+    expect(screen.getByTestId("cockpit-unresolved-qa-unavailable")).toBeInTheDocument();
+    expect(screen.queryByTestId("cockpit-unresolved-empty")).toBeNull();
+    // 取得できていないカテゴリは確認済みと言い切らない。
+    expect(
+      within(screen.getByTestId("cockpit-category-card-system_purpose")).getByText("判定できません"),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("cockpit-qa-error-detail")).toHaveTextContent("qa unavailable");
+
+    // 再試行が成功すれば通常表示に戻り、件数が入る。
+    qaFailing = false;
+    fireEvent.click(screen.getByTestId("cockpit-qa-retry"));
+    await waitFor(() => {
+      expect(screen.getByTestId("cockpit-qa-progress")).toHaveAttribute("data-status", "ready");
+    });
+    expect(screen.getByTestId("cockpit-qa-answered")).toHaveTextContent("1 件");
+    expect(screen.getByTestId("cockpit-stat-questions")).toHaveTextContent("1");
+    expect(screen.getByTestId("cockpit-completion-percent")).toHaveTextContent("100");
+  });
+
   // Issue #356 受け入れ条件「loading、空データ、エラー…に適切な表示になる」。
   // 以前はセッション一覧 / 詳細の取得に失敗すると loading 分岐を抜けたあと
   // 本文が丸ごと空になり、失敗したことすら読めなかった。

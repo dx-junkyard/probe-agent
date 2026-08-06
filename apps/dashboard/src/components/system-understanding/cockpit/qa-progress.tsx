@@ -4,8 +4,10 @@
 // (色だけに依存しない / 読み上げ可能にする)。件数は `qaProgress` が決めた
 // 値で、回答済み + 確認待ち + 未回答 = 合計 が常に成り立つ。
 
+import { AlertCircle, Loader2, RefreshCw } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import type { CockpitQaProgress } from "./model";
+import type { CockpitQaFetchStatus, CockpitQaProgress } from "./model";
 
 const COLORS = {
   answered: "#10b981",
@@ -13,7 +15,74 @@ const COLORS = {
   open: "#cbd5e1",
 } as const;
 
-export function CockpitQaProgressCard({ progress }: { progress: CockpitQaProgress }) {
+export function CockpitQaProgressCard({
+  progress,
+  status = "ready",
+  error,
+  onRetry,
+}: {
+  /** 取得できていないときは null。0 件と同じ表示にしてはならない。 */
+  progress: CockpitQaProgress | null;
+  status?: CockpitQaFetchStatus;
+  /** 取得失敗時のサーバー由来の理由。 */
+  error?: string | null;
+  onRetry?: () => void;
+}) {
+  // 取得前・取得失敗を 0 件として描かない (issue の受け入れ条件: loading /
+  // エラーで適切な表示になること)。
+  if (status !== "ready" || !progress) {
+    return (
+      <Card data-testid="cockpit-qa-progress" data-status={status}>
+        <CardHeader>
+          <CardTitle className="text-sm">Q&A の進捗</CardTitle>
+          <CardDescription>
+            {status === "loading"
+              ? "回答状況を読み込んでいます。"
+              : "回答状況を取得できませんでした。"}
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3 text-sm">
+          {status === "loading" ? (
+            <p
+              className="flex items-center gap-2 text-xs text-muted-foreground"
+              data-testid="cockpit-qa-loading"
+            >
+              <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+              読み込み中です。件数は読み込み後に表示されます。
+            </p>
+          ) : (
+            <div className="space-y-2" data-testid="cockpit-qa-unavailable">
+              <p className="flex items-start gap-2 text-xs">
+                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" aria-hidden="true" />
+                Q&A を取得できないため、回答済み・確認待ち・未回答の件数は表示できません。
+                0 件ではなく「取得できていない」状態です。
+              </p>
+              {error && (
+                <p
+                  className="rounded-md border p-2 text-[10px] font-mono break-words"
+                  data-testid="cockpit-qa-error-detail"
+                >
+                  {error}
+                </p>
+              )}
+              {onRetry && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={onRetry}
+                  data-testid="cockpit-qa-retry"
+                >
+                  <RefreshCw className="h-4 w-4 mr-1" />
+                  再試行
+                </Button>
+              )}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    );
+  }
+
   const { answered, awaiting, open, deferred, total, excluded } = progress;
   const pct = (value: number) => (total > 0 ? (value / total) * 100 : 0);
   const answeredEnd = pct(answered);
@@ -30,7 +99,7 @@ export function CockpitQaProgressCard({ progress }: { progress: CockpitQaProgres
   ];
 
   return (
-    <Card data-testid="cockpit-qa-progress">
+    <Card data-testid="cockpit-qa-progress" data-status="ready">
       <CardHeader>
         <CardTitle className="text-sm">Q&A の進捗</CardTitle>
         <CardDescription>
@@ -40,7 +109,7 @@ export function CockpitQaProgressCard({ progress }: { progress: CockpitQaProgres
       <CardContent className="space-y-3">
         {total === 0 ? (
           <p className="text-xs text-muted-foreground" data-testid="cockpit-qa-empty">
-            この セッションにはまだ質問がありません。
+            このセッションにはまだ質問がありません。
           </p>
         ) : (
           <>

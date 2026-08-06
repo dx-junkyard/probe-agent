@@ -17,12 +17,21 @@ export function CockpitStatusSummary({
   onGoToTopUnresolved: () => void;
 }) {
   const top = model.unresolved[0] ?? null;
-  const stats: Array<[string, number, string]> = [
-    ["cockpit-stat-categories", model.categoryCount, "理解カテゴリ"],
-    ["cockpit-stat-review", model.reviewCount, "要確認"],
-    ["cockpit-stat-missing", model.missingCount, "未設定"],
-    ["cockpit-stat-questions", model.qa.total, "質問合計"],
+  const percent = model.completionPercent;
+  // 取得できていない値は 0 ではなく「—」。0 件と未取得を同じ表示にしない。
+  const questionTotal = model.qa ? String(model.qa.total) : "—";
+  const stats: Array<[string, string, string]> = [
+    ["cockpit-stat-categories", String(model.categoryCount), "理解カテゴリ"],
+    ["cockpit-stat-review", String(model.reviewCount), "要確認"],
+    ["cockpit-stat-missing", String(model.missingCount), "未設定"],
+    ["cockpit-stat-questions", questionTotal, "質問合計"],
   ];
+  const unavailableNote =
+    model.qaFetchStatus === "unavailable"
+      ? "Q&A を取得できていないため、質問と完成度を確定できません。"
+      : model.qaFetchStatus === "loading"
+        ? "Q&A を読み込み中のため、質問と完成度はまだ確定していません。"
+        : null;
 
   return (
     <Card data-testid="cockpit-status-summary">
@@ -35,31 +44,45 @@ export function CockpitStatusSummary({
                   Interview status
                 </p>
                 <h2 className="mt-1 text-base font-semibold" data-testid="cockpit-completion-headline">
-                  理解の全体像は {model.completionPercent}% まで固まっています
+                  {percent == null
+                    ? "理解の完成度はまだ確定できません"
+                    : `理解の全体像は ${percent}% まで固まっています`}
                 </h2>
               </div>
               <div className="flex items-baseline gap-1">
                 <span className="text-3xl font-bold tracking-tight" data-testid="cockpit-completion-percent">
-                  {model.completionPercent}
+                  {percent ?? "—"}
                 </span>
-                <span className="text-sm font-semibold text-muted-foreground">%</span>
+                {percent != null && (
+                  <span className="text-sm font-semibold text-muted-foreground">%</span>
+                )}
               </div>
             </div>
 
-            <div
-              className="h-2 overflow-hidden rounded-full bg-muted"
-              role="progressbar"
-              aria-valuemin={0}
-              aria-valuemax={100}
-              aria-valuenow={model.completionPercent}
-              aria-label={`インタビューの完成度 ${model.completionPercent}%`}
-              data-testid="cockpit-progress-bar"
-            >
+            {percent == null ? (
+              <p
+                className="rounded-md border border-dashed p-2 text-xs text-muted-foreground"
+                data-testid="cockpit-completion-unavailable"
+              >
+                {unavailableNote
+                  ?? "判定できないカテゴリがあるため、完成度を算出できません。"}
+              </p>
+            ) : (
               <div
-                className="h-full rounded-full bg-emerald-500"
-                style={{ width: `${model.completionPercent}%` }}
-              />
-            </div>
+                className="h-2 overflow-hidden rounded-full bg-muted"
+                role="progressbar"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={percent}
+                aria-label={`インタビューの完成度 ${percent}%`}
+                data-testid="cockpit-progress-bar"
+              >
+                <div
+                  className="h-full rounded-full bg-emerald-500"
+                  style={{ width: `${percent}%` }}
+                />
+              </div>
+            )}
 
             <dl className="grid grid-cols-2 gap-2 sm:grid-cols-4">
               {stats.map(([testId, value, label]) => (

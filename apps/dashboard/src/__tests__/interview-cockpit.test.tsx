@@ -116,6 +116,13 @@ describe("completionPercent", () => {
   it("カテゴリが 0 件なら 0% を返す (0 除算しない)", () => {
     expect(completionPercent([])).toBe(0);
   });
+
+  // 指摘 P1: 根拠の一部 (Q&A) が読めていない状態で数字を出すと、実際より
+  // 高い完成度を確定値として見せてしまう。
+  it("判定できないカテゴリがあれば null を返す (実際より高い値を出さない)", () => {
+    expect(completionPercent(["confirmed", "confirmed", "unknown", "confirmed", "confirmed"]))
+      .toBeNull();
+  });
 });
 
 // ── カテゴリ状態の集約 ────────────────────────────────────────────────
@@ -175,7 +182,7 @@ describe("buildCockpitModel のカテゴリ状態", () => {
     expect(model.categories.every(c => c.status === "missing")).toBe(true);
     expect(model.completionPercent).toBe(0);
     expect(model.unresolved).toEqual([]);
-    expect(model.qa.total).toBe(0);
+    expect(model.qa!.total).toBe(0);
   });
 
   it("複数カテゴリが要確認: gap は名前一致、無ければ gap_type で割り当てる", () => {
@@ -267,10 +274,10 @@ describe("未解決事項の集約", () => {
     expect(model.categories.find(c => c.key === "api_boundaries")!.status).toBe("review");
     expect(model.missingCount + model.reviewCount).toBeGreaterThan(0);
     expect(model.completionPercent).toBeLessThan(100);
-    expect(model.qa.total).toBe(1);
-    expect(model.qa.open).toBe(1);
-    expect(model.qa.deferred).toBe(1);
-    expect(model.qa.excluded).toBe(0);
+    expect(model.qa!.total).toBe(1);
+    expect(model.qa!.open).toBe(1);
+    expect(model.qa!.deferred).toBe(1);
+    expect(model.qa!.excluded).toBe(0);
   });
 
   it("どのカテゴリにも属さない general 質問は「全体」として残る", () => {
@@ -284,6 +291,131 @@ describe("未解決事項の集約", () => {
     expect(model.unresolved[0].categoryLabel).toBe("全体");
     // カテゴリに属さない質問は、どのカテゴリも要確認にしない。
     expect(model.categories.every(c => c.status === "confirmed")).toBe(true);
+  });
+});
+
+// ── 重複時の状態マージ (指摘 P2) ──────────────────────────────────────
+
+// skip API は interview_qa の status しか更新せず、session.open_questions の
+// JSON エントリはそのまま残る (routes/interview.py)。状態を持っているのは
+// Q&A 行だけなので、重複は「後から来た方を捨てる」のではなく Q&A の状態を
+// open_questions 行へ反映して 1 件にまとめる必要がある。
+describe("open_questions と Q&A の重複マージ", () => {
+  it("同じ qa_id の Q&A が skipped なら、1 件に畳んだ上で「後で回答」を反映する", () => {
+    const model = buildCockpitModel({
+      understanding: fullUnderstanding(),
+      gaps: [],
+      openQuestions: [
+        openQuestion({ question: "見送った質問", category: "api", priority: "high", qa_id: 61 }),
+      ],
+      qaItems: [
+        qa({ id: 61, question_text: "見送った質問", question_category: "api", status: "skipped" }),
+      ],
+    });
+    expect(model.unresolved).toHaveLength(1);
+    const row = model.unresolved[0];
+    expect(row.qaId).toBe(61);
+    expect(row.deferred).toBe(true);
+    // 状態由来の優先度が open question 自身の high より優先される。
+    expect(row.priority).toBe("low");
+    expect(model.qa!.deferred).toBe(1);
+  });
+
+  it("同じ qa_id の Q&A が unconfirmed なら再確認待ちとして反映する", () => {
+    const model = buildCockpitModel({
+      understanding: fullUnderstanding(),
+      gaps: [],
+      openQuestions: [
+        openQuestion({ question: "わからなかった質問", category: "capability", priority: "low", qa_id: 62 }),
+      ],
+      qaItems: [
+        qa({
+          id: 62, question_text: "わからなかった質問",
+          question_category: "capability", status: "unconfirmed",
+        }),
+      ],
+    });
+    expect(model.unresolved).toHaveLength(1);
+    expect(model.unresolved[0].unconfirmed).toBe(true);
+    expect(model.unresolved[0].priority).toBe("high");
+  });
+
+  it("qa_id が無くても質問文が一致すれば同じ 1 件として状態を反映する", () => {
+    const model = buildCockpitModel({
+      understanding: fullUnderstanding(),
+      gaps: [],
+      openQuestions: [openQuestion({ question: "旧セッションの質問", category: "api" })],
+      qaItems: [
+        qa({ id: 63, question_text: "旧セッションの質問", question_category: "api", status: "skipped" }),
+      ],
+    });
+    expect(model.unresolved).toHaveLength(1);
+    expect(model.unresolved[0].deferred).toBe(true);
+    expect(model.unresolved[0].qaId).toBe(63);
+  });
+
+  it("Q&A 側で回答済みなら open_questions に残っていても未解決から外す", () => {
+    const model = buildCockpitModel({
+      understanding: fullUnderstanding(),
+      gaps: [],
+      openQuestions: [openQuestion({ question: "回答済みの質問", category: "api", qa_id: 64 })],
+      qaItems: [
+        qa({ id: 64, question_text: "回答済みの質問", question_category: "api", status: "answered" }),
+      ],
+    });
+    expect(model.unresolved).toEqual([]);
+    expect(model.categories.find(c => c.key === "api_boundaries")!.status).toBe("confirmed");
+  });
+});
+
+// ── Q&A 取得失敗 (指摘 P1) ────────────────────────────────────────────
+
+describe("Q&A を取得できていないとき", () => {
+  it("0 件という確定値を出さず、完成度も算出しない", () => {
+    const model = buildCockpitModel({
+      understanding: fullUnderstanding(),
+      gaps: [],
+      openQuestions: [],
+      qaItems: undefined,
+      qaFetchStatus: "unavailable",
+    });
+    expect(model.qa).toBeNull();
+    expect(model.completionPercent).toBeNull();
+    // 「未解決の質問が無い」ことを根拠にした確認済みは言えない。
+    expect(model.categories.every(c => c.status === "unknown")).toBe(true);
+    expect(model.confirmedCount).toBe(0);
+    expect(model.unknownCount).toBe(5);
+    expect(model.qaFetchStatus).toBe("unavailable");
+    expect(model.nextStep.title).toContain("Q&A を取得できませんでした");
+  });
+
+  it("内容が無い / gap がある カテゴリは Q&A 無しでも判定できる", () => {
+    const model = buildCockpitModel({
+      understanding: fullUnderstanding({ vision: [] }),
+      gaps: [gap({ name: "GET /unknown", gap_type: "unclassified_entrypoint" })],
+      openQuestions: [],
+      qaItems: undefined,
+      qaFetchStatus: "unavailable",
+    });
+    const byKey = Object.fromEntries(model.categories.map(c => [c.key, c]));
+    expect(byKey.vision.status).toBe("missing");
+    expect(byKey.api_boundaries.status).toBe("review");
+    expect(byKey.system_purpose.status).toBe("unknown");
+    expect(model.missingCount).toBe(1);
+    expect(model.reviewCount).toBe(1);
+  });
+
+  it("読み込み中も 0 件を確定値として出さない", () => {
+    const model = buildCockpitModel({
+      understanding: fullUnderstanding(),
+      gaps: [],
+      openQuestions: [],
+      qaItems: undefined,
+      qaFetchStatus: "loading",
+    });
+    expect(model.qa).toBeNull();
+    expect(model.completionPercent).toBeNull();
+    expect(model.nextStep.title).toContain("読み込んでいます");
   });
 });
 
@@ -411,6 +543,24 @@ describe("CockpitStatusSummary", () => {
     expect(screen.getByTestId("cockpit-progress-bar")).toHaveAttribute("aria-valuenow", "70");
   });
 
+  it("Q&A を取得できていないときは 0 件・確定した完成度を出さない", () => {
+    const m = model({
+      understanding: fullUnderstanding(),
+      gaps: [],
+      openQuestions: [],
+      qaItems: undefined,
+      qaFetchStatus: "unavailable",
+    });
+    render(<CockpitStatusSummary model={m} onGoToTopUnresolved={() => {}} />);
+    expect(screen.getByTestId("cockpit-completion-percent")).toHaveTextContent("—");
+    expect(screen.getByTestId("cockpit-stat-questions")).toHaveTextContent("—");
+    expect(screen.getByTestId("cockpit-stat-questions")).not.toHaveTextContent("0");
+    expect(screen.getByTestId("cockpit-completion-unavailable"))
+      .toHaveTextContent("Q&A を取得できていない");
+    // 誤解を招く進捗バー (0% でも 100% でも) は描かない。
+    expect(screen.queryByTestId("cockpit-progress-bar")).toBeNull();
+  });
+
   it("未解決が無ければ最優先へ移動する CTA を出さない", () => {
     const m = model({
       understanding: fullUnderstanding(),
@@ -534,6 +684,30 @@ describe("CockpitUnresolvedItems", () => {
     render(<CockpitUnresolvedItems items={[]} onSelect={() => {}} />);
     expect(screen.getByTestId("cockpit-unresolved-empty")).toBeTruthy();
   });
+
+  it("Q&A 未取得のときは「未解決なし」と読める表示にしない", () => {
+    render(
+      <CockpitUnresolvedItems items={[]} qaFetchStatus="unavailable" onSelect={() => {}} />,
+    );
+    expect(screen.getByTestId("cockpit-unresolved-qa-unavailable")).toBeTruthy();
+    expect(screen.queryByTestId("cockpit-unresolved-empty")).toBeNull();
+  });
+
+  it("「後で回答」の行はその旨を明示する", () => {
+    const m = model({
+      understanding: fullUnderstanding(),
+      gaps: [],
+      openQuestions: [openQuestion({ question: "見送った質問", category: "api", qa_id: 71 })],
+      qaItems: [
+        qa({ id: 71, question_text: "見送った質問", question_category: "api", status: "skipped" }),
+      ],
+    });
+    render(<CockpitUnresolvedItems items={m.unresolved} onSelect={() => {}} />);
+    const rows = screen.getAllByTestId("cockpit-unresolved-row");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toHaveTextContent("後で回答");
+    expect(rows[0]).toHaveTextContent("優先度 低");
+  });
 });
 
 describe("CockpitQaProgressCard", () => {
@@ -555,6 +729,32 @@ describe("CockpitQaProgressCard", () => {
     expect(screen.getByTestId("cockpit-qa-excluded")).toHaveTextContent("3 件");
     // 「後で回答」は未回答の内訳として再掲する (解決済みに見せない)。
     expect(screen.getByTestId("cockpit-qa-deferred")).toHaveTextContent("1 件");
+  });
+
+  it("取得失敗時は 0 件ではなくエラーと再試行を出す", () => {
+    const onRetry = vi.fn();
+    render(
+      <CockpitQaProgressCard
+        progress={null}
+        status="unavailable"
+        error="Failed to fetch"
+        onRetry={onRetry}
+      />,
+    );
+    expect(screen.getByTestId("cockpit-qa-unavailable")).toBeTruthy();
+    expect(screen.getByTestId("cockpit-qa-error-detail")).toHaveTextContent("Failed to fetch");
+    expect(screen.queryByTestId("cockpit-qa-empty")).toBeNull();
+    expect(screen.queryByTestId("cockpit-qa-donut")).toBeNull();
+    expect(screen.queryByTestId("cockpit-qa-total")).toBeNull();
+    fireEvent.click(screen.getByTestId("cockpit-qa-retry"));
+    expect(onRetry).toHaveBeenCalledTimes(1);
+  });
+
+  it("読み込み中は件数を出さず読み込み中と示す", () => {
+    render(<CockpitQaProgressCard progress={null} status="loading" />);
+    expect(screen.getByTestId("cockpit-qa-loading")).toBeTruthy();
+    expect(screen.queryByTestId("cockpit-qa-empty")).toBeNull();
+    expect(screen.queryByTestId("cockpit-qa-total")).toBeNull();
   });
 
   it("Q&A が 0 件でもドーナツを描かず空表示にする", () => {

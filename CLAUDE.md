@@ -561,8 +561,17 @@ creating incomplete persistence or execution paths for later phases.
       the unresolved list; `skipped` is the temporary 「後で回答」 state that
       `resume` returns to `open`, so it counts as 未回答 — excluding it made a
       session with unanswered questions read as 未解決 0 件 / 完成度 100%.
-      `open_questions` / `interview_qa` rows are deduped by `qa_id` first,
-      then question text.
+      `open_questions` / `interview_qa` rows are MERGED by `qa_id` (then
+      question text), not first-wins: only the `interview_qa` row carries
+      state (skip/resume never touch `session.open_questions`), so its
+      `unconfirmed`/`deferred` and state-derived priority apply to the
+      surviving row, and a question already `answered` on the Q&A side leaves
+      the list.
+    - 0 件 and 「取得できていない」 are different displays. The Q&A query's
+      state is an input (`qaFetchStatus`); when it is not `ready`, `model.qa`
+      and `completionPercent` are `null` (no zeroed counts, no progress bar),
+      a would-be `confirmed` category becomes `unknown`, and the Q&A card
+      offers a retry. `missing`/`review` still come from the session detail.
     - The detail pane's 「修正するには」 only scrolls + focuses an existing
       panel (`change-set-panel` / `understanding-brief`, and for anything tied
       to a question that question's own `qa-item-<id>` row, falling back to

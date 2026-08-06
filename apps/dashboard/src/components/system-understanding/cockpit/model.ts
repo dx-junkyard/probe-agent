@@ -40,8 +40,23 @@ export type CockpitCategoryKey =
   | "api_boundaries"
   | "probe_flow";
 
-/** カテゴリの状態 (issue §3 の 3 値)。色だけでなく必ずラベルを伴わせる。 */
-export type CockpitCategoryStatus = "confirmed" | "review" | "missing";
+/**
+ * カテゴリの状態 (issue §3 の 3 値)。色だけでなく必ずラベルを伴わせる。
+ *
+ * `unknown` は 4 値目だが、issue の 3 値を増やしたものではない: Q&A を取得
+ * できていないとき、「未解決の質問が無い」ことを根拠にした `confirmed` は
+ * 事実として言えない。取得できていない状態を確認済みと言い切らないための
+ * 判定不能値で、Q&A が読めている限り現れない。
+ */
+export type CockpitCategoryStatus = "confirmed" | "review" | "missing" | "unknown";
+
+/**
+ * Q&A 一覧 (`GET /interview/sessions/{id}/qa`) の取得状態。
+ *
+ * 質問合計・未解決件数・進捗はこの応答だけが根拠なので、取得前や失敗時に
+ * 0 件という確定値を出してはならない (0 件と未取得は別物)。
+ */
+export type CockpitQaFetchStatus = "ready" | "loading" | "unavailable";
 
 /** `CurrentUnderstanding` のどのセクションを集約するか (issue §3)。 */
 type UnderstandingSection = keyof CurrentUnderstanding;
@@ -127,6 +142,7 @@ export const CATEGORY_STATUS_LABELS: Record<CockpitCategoryStatus, string> = {
   confirmed: "確認済み",
   review: "要確認",
   missing: "未設定",
+  unknown: "判定できません",
 };
 
 // ── 未解決事項 ────────────────────────────────────────────────────────
@@ -226,14 +242,21 @@ export interface CockpitCategoryView {
 
 export interface CockpitModel {
   categories: CockpitCategoryView[];
-  /** 完成度 (0-100 の整数)。`completionPercent` で算出する。 */
-  completionPercent: number;
+  /**
+   * 完成度 (0-100 の整数)。判定できないカテゴリがある (= Q&A 未取得) 場合は
+   * `null`。実際より高い値を出すくらいなら数字を出さない。
+   */
+  completionPercent: number | null;
   reviewCount: number;
   missingCount: number;
   confirmedCount: number;
+  unknownCount: number;
   categoryCount: number;
+  /** Q&A の取得状態。`ready` 以外では質問由来の件数を確定値として出さない。 */
+  qaFetchStatus: CockpitQaFetchStatus;
   unresolved: CockpitUnresolvedItem[];
-  qa: CockpitQaProgress;
+  /** Q&A 進捗。取得できていないときは `null` (0 件ではない)。 */
+  qa: CockpitQaProgress | null;
   /** 既定で選択するカテゴリ。未設定 → 要確認 → 先頭、の順で決定的に選ぶ。 */
   defaultCategory: CockpitCategoryKey;
   /** 「次にやること」の見出しと説明。 */
@@ -282,6 +305,31 @@ function openQuestionCategory(value: string | null | undefined): CockpitCategory
   return match ? qaCategoryOwner(match) : null;
 }
 
+/** 未解決として扱う Q&A の状態 (`answered` / `revised` は解決済み・履歴)。 */
+function isUnresolvedQa(qa: InterviewQaOut): boolean {
+  // 未解決 = まだ回答が無い (`open`)、「後で回答」として見送られている
+  // (`skipped`: `resume` で `open` に戻せる一時状態)、または「わからない」
+  // で確定回答が無い (`unconfirmed`)。除外するのは `answered` (解決済み)
+  // と `revised` (後続行に置き換えられた履歴) だけ
+  // (issue §5「解決済み項目は一覧から除外する」)。
+  return qa.status === "open" || qa.status === "unconfirmed" || qa.status === "skipped";
+}
+
+/** Q&A 行の状態から決まる表示属性。`open_questions` 行にも同じ規則を当てる。 */
+function qaStatusFlags(qa: InterviewQaOut): {
+  unconfirmed: boolean;
+  deferred: boolean;
+  priority: CockpitPriority | null;
+} {
+  return {
+    unconfirmed: qa.status === "unconfirmed",
+    deferred: qa.status === "skipped",
+    // 「わからない」で再確認待ちのものは通常の未回答より上、開発者が自分で
+    // 見送った「後で回答」は下。`open` は Q&A 行だけでは優先度を持たない。
+    priority: qa.status === "unconfirmed" ? "high" : qa.status === "skipped" ? "low" : null,
+  };
+}
+
 function unresolvedFromSources(
   openQuestions: OpenQuestion[] | null | undefined,
   qaItems: InterviewQaOut[] | null | undefined,
@@ -290,49 +338,63 @@ function unresolvedFromSources(
   const seenQaIds = new Set<number>();
   const seenTexts = new Set<string>();
 
+  // 同じ質問は `session.open_questions` と `interview_qa` の両方に存在し、
+  // 状態を持っているのは Q&A 行だけである -- skip / resume は
+  // `interview_qa.status` しか更新せず、`open_questions` の JSON エントリは
+  // 元のまま残る (`routes/interview.py`)。したがって重複は「後から来た方を
+  // 捨てる」のではなく、Q&A 側の状態を `open_questions` 行へ反映して 1 件に
+  // まとめる。捨てるだけだと skipped/unconfirmed が通常の未回答に見える。
+  const qaById = new Map<number, InterviewQaOut>();
+  const qaByText = new Map<string, InterviewQaOut>();
+  for (const qa of qaItems ?? []) {
+    qaById.set(qa.id, qa);
+    if (!qaByText.has(qa.question_text)) qaByText.set(qa.question_text, qa);
+  }
+
   for (const q of openQuestions ?? []) {
-    const category = openQuestionCategory(q.category);
     const qaId = q.qa_id ?? null;
+    const matched = (qaId != null ? qaById.get(qaId) : undefined) ?? qaByText.get(q.question);
+    // Q&A 側で解決済み (`answered`) / 置き換え済み (`revised`) になっている
+    // 質問は、`open_questions` に残っていても未解決ではない。
+    if (matched && !isUnresolvedQa(matched)) continue;
+    const category = openQuestionCategory(q.category);
     if (qaId != null) seenQaIds.add(qaId);
+    if (matched) seenQaIds.add(matched.id);
     seenTexts.add(q.question);
+    const flags = matched
+      ? qaStatusFlags(matched)
+      : { unconfirmed: false, deferred: false, priority: null };
     items.push({
       id: qaId != null ? `qa-${qaId}` : `oq-${q.question}`,
-      qaId,
+      qaId: qaId ?? matched?.id ?? null,
       question: q.question,
-      priority: normalizePriority(q.priority),
+      // 状態由来の優先度 (再確認待ち / 後で回答) があればそちらを優先し、
+      // 無ければ open question 自身の優先度を使う。
+      priority: flags.priority ?? normalizePriority(q.priority),
       category,
       categoryLabel: category ? categoryTitle(category) : "全体",
-      unconfirmed: false,
-      deferred: false,
+      unconfirmed: flags.unconfirmed,
+      deferred: flags.deferred,
     });
   }
 
   for (const qa of qaItems ?? []) {
-    // 未解決 = まだ回答が無い (`open`)、「後で回答」として見送られている
-    // (`skipped`: `resume` で `open` に戻せる一時状態)、または「わからない」
-    // で確定回答が無い (`unconfirmed`)。除外するのは `answered` (解決済み)
-    // と `revised` (後続行に置き換えられた履歴) だけ
-    // (issue §5「解決済み項目は一覧から除外する」)。
-    if (qa.status !== "open" && qa.status !== "unconfirmed" && qa.status !== "skipped") {
-      continue;
-    }
+    if (!isUnresolvedQa(qa)) continue;
     if (seenQaIds.has(qa.id)) continue;
     if (seenTexts.has(qa.question_text)) continue;
     seenQaIds.add(qa.id);
     seenTexts.add(qa.question_text);
     const category = qaCategoryOwner(qa.question_category);
+    const flags = qaStatusFlags(qa);
     items.push({
       id: `qa-${qa.id}`,
       qaId: qa.id,
       question: qa.question_text,
-      // Q&A 行は優先度を持たない。「わからない」で再確認待ちのものは通常の
-      // 未回答より上、開発者が自分で見送った「後で回答」は下に置く。
-      priority:
-        qa.status === "unconfirmed" ? "high" : qa.status === "skipped" ? "low" : "medium",
+      priority: flags.priority ?? "medium",
       category,
       categoryLabel: category ? categoryTitle(category) : "全体",
-      unconfirmed: qa.status === "unconfirmed",
-      deferred: qa.status === "skipped",
+      unconfirmed: flags.unconfirmed,
+      deferred: flags.deferred,
     });
   }
 
@@ -371,9 +433,14 @@ export function qaProgress(qaItems: InterviewQaOut[] | null | undefined): Cockpi
  *
  * confirmed = 1、review = 0.5、missing = 0 の重み付き平均を百分率にして
  * 四捨五入する。カテゴリが 0 件のときは 0%。
+ *
+ * 判定できないカテゴリ (`unknown`) が 1 つでもあれば `null` を返す。根拠の
+ * 一部 (Q&A) が読めていない状態で数字を出すと、実際より高い完成度を確定値
+ * として見せることになる。
  */
-export function completionPercent(statuses: CockpitCategoryStatus[]): number {
+export function completionPercent(statuses: CockpitCategoryStatus[]): number | null {
   if (statuses.length === 0) return 0;
+  if (statuses.some(status => status === "unknown")) return null;
   const weight = (status: CockpitCategoryStatus) =>
     status === "confirmed" ? 1 : status === "review" ? 0.5 : 0;
   const score = statuses.reduce((sum, status) => sum + weight(status), 0);
@@ -400,6 +467,12 @@ function summarizeCategory(
   if (status === "confirmed") {
     return { summary, hint: "未解決の確認事項はありません。必要なら直接編集できます。" };
   }
+  if (status === "unknown") {
+    return {
+      summary,
+      hint: "Q&A を取得できていないため、未解決の確認事項が残っているか判定できません。",
+    };
+  }
   const first = questions[0]?.question ?? gaps[0]?.summary ?? gaps[0]?.name ?? "";
   const outstanding = questions.length + gaps.length;
   return {
@@ -415,9 +488,16 @@ export interface CockpitInput {
   gaps: GapItem[] | null | undefined;
   openQuestions: OpenQuestion[] | null | undefined;
   qaItems: InterviewQaOut[] | null | undefined;
+  /**
+   * Q&A 一覧の取得状態。省略時は `ready` (取得済み)。`ready` 以外のとき、
+   * 質問由来の件数を 0 件という確定値として出さない。
+   */
+  qaFetchStatus?: CockpitQaFetchStatus;
 }
 
 export function buildCockpitModel(input: CockpitInput): CockpitModel {
+  const qaFetchStatus = input.qaFetchStatus ?? "ready";
+  const qaReady = qaFetchStatus === "ready";
   const unresolved = unresolvedFromSources(input.openQuestions, input.qaItems);
 
   // 名前 → カテゴリの索引。名前の完全一致でだけ引く。
@@ -441,12 +521,17 @@ export function buildCockpitModel(input: CockpitInput): CockpitModel {
     const items = sectionItems(input.understanding, def.sections);
     const gaps = gapsByCategory.get(def.key) ?? [];
     const questions = unresolved.filter(q => q.category === def.key);
+    // 内容の有無と gap は session 詳細だけで判定できる。「未解決の質問が
+    // 無い」ことを根拠にする `confirmed` だけが Q&A に依存するので、Q&A を
+    // 取得できていないときは確認済みと言い切らず `unknown` にする。
     const status: CockpitCategoryStatus =
       items.length === 0
         ? "missing"
         : gaps.length > 0 || questions.length > 0
           ? "review"
-          : "confirmed";
+          : qaReady
+            ? "confirmed"
+            : "unknown";
     const { summary, hint } = summarizeCategory(items, status, gaps, questions);
     return {
       key: def.key,
@@ -469,9 +554,9 @@ export function buildCockpitModel(input: CockpitInput): CockpitModel {
 
   const missing = categories.filter(c => c.status === "missing");
   const review = categories.filter(c => c.status === "review");
+  const unknown = categories.filter(c => c.status === "unknown");
   const defaultCategory = (missing[0] ?? review[0] ?? categories[0]).key;
 
-  const qa = qaProgress(input.qaItems);
   const topUnresolved = unresolved[0];
   const nextStep = missing[0]
     ? {
@@ -489,20 +574,34 @@ export function buildCockpitModel(input: CockpitInput): CockpitModel {
             title: `${review[0].title} の内容を確認する`,
             description: review[0].hint,
           }
-        : {
-            title: "確認が必要な項目はありません",
-            description: "理解の全体像は揃っています。作業カードの主操作へ進んでください。",
-          };
+        : qaFetchStatus === "unavailable"
+          ? {
+              title: "Q&A を取得できませんでした",
+              description:
+                "未解決の確認事項と回答状況を表示できないため、残りがあるか判定できません。再試行してください。",
+            }
+          : qaFetchStatus === "loading"
+            ? {
+                title: "Q&A を読み込んでいます",
+                description: "未解決の確認事項と回答状況は、読み込み後に表示されます。",
+              }
+            : {
+                title: "確認が必要な項目はありません",
+                description: "理解の全体像は揃っています。作業カードの主操作へ進んでください。",
+              };
 
   return {
     categories,
     completionPercent: completionPercent(categories.map(c => c.status)),
     reviewCount: review.length,
     missingCount: missing.length,
-    confirmedCount: categories.length - review.length - missing.length,
+    confirmedCount: categories.filter(c => c.status === "confirmed").length,
+    unknownCount: unknown.length,
     categoryCount: categories.length,
+    qaFetchStatus,
     unresolved,
-    qa,
+    // 0 件と「取得できていない」を同じ表示にしないため、未取得は null。
+    qa: qaReady ? qaProgress(input.qaItems) : null,
     defaultCategory,
     nextStep,
     evidenceCounts: {

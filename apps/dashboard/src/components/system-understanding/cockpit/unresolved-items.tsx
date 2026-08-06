@@ -5,16 +5,24 @@
 
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { PRIORITY_LABELS, type CockpitUnresolvedItem } from "./model";
+import {
+  PRIORITY_LABELS,
+  type CockpitQaFetchStatus,
+  type CockpitUnresolvedItem,
+} from "./model";
 
 export function CockpitUnresolvedItems({
   items,
+  qaFetchStatus = "ready",
   onSelect,
 }: {
   items: CockpitUnresolvedItem[];
+  /** Q&A の取得状態。未取得なら「残り N 件」は確定値ではない。 */
+  qaFetchStatus?: CockpitQaFetchStatus;
   /** 行のアクション。その質問そのものの回答 UI へ移動する。 */
   onSelect: (item: CockpitUnresolvedItem) => void;
 }) {
+  const qaReady = qaFetchStatus === "ready";
   return (
     <Card data-testid="cockpit-unresolved-items">
       <CardHeader>
@@ -23,16 +31,32 @@ export function CockpitUnresolvedItems({
             <CardTitle className="text-sm">未解決の確認事項</CardTitle>
             <CardDescription>影響が大きい順に並んでいます。</CardDescription>
           </div>
-          <Badge variant={items.length > 0 ? "warning" : "success"} className="font-normal">
-            残り {items.length} 件
+          <Badge
+            variant={!qaReady ? "outline" : items.length > 0 ? "warning" : "success"}
+            className="font-normal"
+          >
+            {qaReady ? `残り ${items.length} 件` : `確認済み ${items.length} 件 + 未取得`}
           </Badge>
         </div>
       </CardHeader>
-      <CardContent>
-        {items.length === 0 ? (
-          <p className="text-xs text-muted-foreground" data-testid="cockpit-unresolved-empty">
-            未解決の確認事項はありません。
+      <CardContent className="space-y-2">
+        {/* Q&A が読めていないときは「0 件 = 残っていない」と読めてはいけない。 */}
+        {!qaReady && (
+          <p
+            className="rounded-md border border-dashed p-2 text-xs text-muted-foreground"
+            data-testid="cockpit-unresolved-qa-unavailable"
+          >
+            {qaFetchStatus === "loading"
+              ? "Q&A を読み込み中です。ここに表示されていない確認事項がある可能性があります。"
+              : "Q&A を取得できていないため、この一覧には Q&A 由来の確認事項が含まれていません。"}
           </p>
+        )}
+        {items.length === 0 ? (
+          qaReady ? (
+            <p className="text-xs text-muted-foreground" data-testid="cockpit-unresolved-empty">
+              未解決の確認事項はありません。
+            </p>
+          ) : null
         ) : (
           <ul className="divide-y">
             {items.map(item => (
