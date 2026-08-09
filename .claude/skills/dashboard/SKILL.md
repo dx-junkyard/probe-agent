@@ -655,3 +655,64 @@ The Interview page's overview layer, on top of #349's state machine and
   interview-proposal-card)`) — the cockpit's disabled reasons quote workflow
   state labels, so a bare `/承認/` or `/編集/` role query now matches more
   than one button.
+
+## Interview コックピットの情報設計 (issue #358, subs #359-#363)
+
+Layered on #356. Everything in the #356 section above still holds — this
+adds the ordering, density, and width rules. Dashboard-only: no endpoint, no
+mutation, no permission change.
+
+- **The first view leads with the action.** `CockpitStatusSummary`'s primary
+  element is 「次にやること」 + exactly ONE CTA; 完成度 is one tile among the
+  counts. The CTA **navigates only** (scroll + focus) — the state's primary
+  action stays the single executor inside its work surface (原則 P1). Only
+  `state_primary` takes its label from the server's `primary_action`; the
+  page supplies it, `model.ts` returns `actionLabel: null`.
+- `CockpitModel.nextStep` is a first-match finite table (`retry_qa` →
+  loading → missing category → unresolved question → review category →
+  `state_primary`). Not a score. Adding a branch means adding a row.
+- **Main-column order is contract**: 現在地 → 例外/戻り要求 → status summary
+  → the state's work surface → 未解決事項 + Q&A 進捗 → 全体像 (Brief, map).
+  This supersedes #351's 「Brief at the top of the main column」 for
+  `W3`-`W7`. In `W1`/`W2` (and with no workflow state) the Brief IS the work
+  surface — `W2`'s 「この理解で進む」 lives in it — so it leads there. Render
+  it from ONE value; never two instances.
+- **Unresolved grouping key is the finite category key only** (5 keys +
+  `null`). 「意味的に近い質問をまとめる」 is membership in an already-finite
+  server-derived set — never similarity, embeddings, or keyword scoring
+  (Principle 6). Top 3 groups initially; 「残り N 件を表示」 counts hidden
+  *questions*; every non-representative question keeps its own open button
+  or it becomes unreachable. Expanding focuses the first revealed row,
+  collapsing returns focus to the toggle.
+- **Any grid row pairing a tall card with a short one needs `items-start`.**
+  CSS Grid's default `stretch` is what made the Q&A progress card 3,416px
+  tall next to the unresolved list.
+- **Map cards are a scan**: 番号 / 名称 / 状態 / one-line 要約 only; caption
+  and hint live in the detail pane. `missing`/`review` get ring emphasis
+  plus a 「要対応」 text marker (never colour alone). The fixed 5-category
+  order never changes — do not sort by status. The detail pane is
+  `xl:sticky`; below `xl` the map's 「選択中のカテゴリの詳細へ」 is the
+  keyboard/mobile route to it.
+- **Auxiliary information is one disclosure area**
+  (`CockpitAuxiliaryPanel`/`CockpitAuxiliarySection`). Which sections exist
+  is still #342 §3.3's state matrix — only the density changed. Three things
+  never go inside a collapsed disclosure: a pending handoff list (it drops
+  into the area only at 0 待ち), blocking/degraded failures (they stay in
+  `WorkflowExceptions` above the summary), and the recovery actions of a
+  currently-failed process (its section opens by default).
+- **`focusCockpitTarget` opens every ancestor `<details>` first.** A closed
+  `<details>` keeps its children in the DOM, so `querySelector` finds them
+  and `focus()` then fails silently — the CTA appears to do nothing. When
+  the target IS a `<details>`, focus its `<summary>`.
+- Session number / Snapshot / status belong to `cockpit-header-meta` alone.
+  `CockpitSessionInfo` must not repeat them; the header's 「セッション情報」
+  button is its entry point.
+- **Below `md` the sidebar is an overlay Drawer** (`AppLayout` owns the open
+  state; the header's `md:hidden` menu button toggles it): focus trap,
+  Escape, close on navigation, focus back to the toggle. At `md`+ the
+  existing rail and its collapse/expand are unchanged. `main` is
+  `p-4 md:p-6`. jsdom does not evaluate media queries — assert on the
+  responsive class names plus real behaviour, not on a simulated width.
+- Tests: `cockpit-unresolved.test.tsx`, `cockpit-map-detail.test.tsx`,
+  `layout-navigation.test.tsx`, plus the Interview page group in
+  `dashboard-contracts.test.tsx` (order, disclosure, header de-duplication).

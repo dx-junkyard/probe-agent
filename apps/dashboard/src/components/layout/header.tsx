@@ -1,8 +1,8 @@
 import { useAuth } from "@/api/auth";
 import { Select } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
-import { LogOut, Plus, Moon, Sun } from "lucide-react";
-import { useState, useCallback } from "react";
+import { LogOut, Plus, Moon, Sun, Menu, X } from "lucide-react";
+import { useState, useCallback, type RefObject } from "react";
 import { Dialog, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -11,6 +11,7 @@ import { DiagnosticsBadge } from "@/components/diagnostics-badge";
 import { ConnectivityBadge } from "@/components/connectivity-badge";
 import { UserPhaseIndicator } from "@/components/system-state";
 import { toast } from "sonner";
+import { MOBILE_NAV_DRAWER_ID } from "./sidebar";
 
 function initTheme() {
   const saved = localStorage.getItem("theme");
@@ -39,7 +40,25 @@ function ThemeToggle() {
   );
 }
 
-export function Header() {
+export interface HeaderProps {
+  /**
+   * Issue #362: mobile navigation Drawer state, owned by `AppLayout`. All
+   * three props are optional so the header can still be rendered on its own
+   * (the menu button then simply does nothing).
+   */
+  navOpen?: boolean;
+  onNavToggle?: () => void;
+  navToggleRef?: RefObject<HTMLButtonElement | null>;
+  /** Element id of the Drawer panel, used as the button's `aria-controls`. */
+  navDrawerId?: string;
+}
+
+export function Header({
+  navOpen = false,
+  onNavToggle,
+  navToggleRef,
+  navDrawerId = MOBILE_NAV_DRAWER_ID,
+}: HeaderProps = {}) {
   const { user, systems, systemId, selectSystem, logout, refreshSystems } = useAuth();
   const [showCreate, setShowCreate] = useState(false);
   const createSystem = useCreateSystem();
@@ -63,13 +82,31 @@ export function Header() {
   };
 
   return (
-    <header className="flex items-center justify-between border-b bg-card px-6 h-14">
-      <div className="flex items-center gap-3">
+    <header className="flex items-center justify-between border-b bg-card px-4 md:px-6 h-14">
+      <div className="flex items-center gap-2 md:gap-3 min-w-0">
+        {/* Issue #362: below md the sidebar is an overlay Drawer, opened
+            from here. At md and above the static rail is always present, so
+            this control is hidden. */}
+        <Button
+          ref={navToggleRef}
+          variant="ghost"
+          size="icon"
+          className="md:hidden shrink-0"
+          onClick={onNavToggle}
+          aria-label={navOpen ? "ナビゲーションを閉じる" : "ナビゲーションを開く"}
+          aria-expanded={navOpen}
+          // Drawer は閉じているとマウントされないので、そのときは
+          // `aria-controls` を出さない -- 存在しない id を指す参照になる。
+          aria-controls={navOpen ? navDrawerId : undefined}
+          data-testid="mobile-nav-toggle"
+        >
+          {navOpen ? <X className="h-4 w-4" /> : <Menu className="h-4 w-4" />}
+        </Button>
         {systems.length > 0 ? (
           <Select
             value={String(systemId ?? "")}
             onChange={(e) => selectSystem(Number(e.target.value))}
-            className="w-60"
+            className="w-40 md:w-60"
           >
             {systems.map((s) => (
               <option key={s.id} value={s.id}>

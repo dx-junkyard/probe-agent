@@ -602,6 +602,79 @@ creating incomplete persistence or execution paths for later phases.
     unchanged. See the Issue #356 sections in
     `docs/project-intelligence.md` and `docs/system-interview-workflow-ux.md`.
 
+19. Issue #358 (subs #359-#363) — the cockpit's information design and its
+    main route through the screen. A UX review on real data (self-test,
+    session #13, `W3`, 1280×720) measured the work surface starting at
+    1,807px with ~5,897px of content, i.e. the developer scrolled ~1,100px
+    past 「次にやること」 to reach the input it names; at 390px the fixed
+    sidebar left `main` 166px and the cards ~118px. Dashboard-only — no new
+    endpoint, no mutation, no permission change. What it changed, and what
+    any later change must preserve:
+    - **The first view leads with the action, not the score** (#360).
+      `CockpitStatusSummary`'s primary element is 「次にやること」 plus ONE
+      CTA; 完成度 is now one tile among the counts, never a large number
+      above the CTA. The CTA **navigates, it never executes** — the
+      state's primary action stays the single executor inside its work
+      surface (#342 原則 P1), which is why a CTA in the summary does not
+      make two primary actions.
+    - `CockpitModel.nextStep` is a `CockpitNextStep` decided by a
+      first-match finite table in `model.ts` (`retry_qa` → loading →
+      `fix_category` for missing → `answer_question` → `fix_category` for
+      review → `state_primary`), so the summary can offer an actionable CTA
+      even with no unresolved question. `state_primary` deliberately
+      carries no label: the page supplies the server's `primary_action`
+      label, because only the server decides that.
+    - **Order in the main column is contract**: 現在地 → 例外/戻り要求 →
+      status summary → the state's work surface → 未解決事項 + Q&A 進捗 →
+      全体像 (Understanding Brief, 理解の全体マップ). This supersedes #351's
+      「Brief is at the top of the main column」 rule in `W3`-`W7` only. In
+      `W1`/`W2` (and when the workflow state is unavailable) the Brief IS
+      the work surface — `W2`'s 「この理解で進む」 lives inside it (#351 /
+      原則 P2) — so it keeps the leading position there. It is rendered
+      once, from one `understandingBriefPanel` value, never twice.
+    - **未解決事項 is grouped and progressively disclosed** (#359). The
+      group key is the finite category key only (the 5 `CockpitCategoryKey`
+      values + `null`); 「意味的に近い質問をまとめる」 is membership in an
+      already-finite server-derived set, never text similarity, embeddings,
+      or keyword scoring (Core Design Principle 6). Top 3 groups render
+      initially with 「残り N 件を表示」 counting hidden *questions*; every
+      non-representative question keeps its own open button, or it becomes
+      unreachable. Both grid rows that pair a tall card with a short one
+      carry `items-start` — CSS Grid's default `stretch` is what inflated
+      the Q&A card to 3,416px.
+    - **The map is a scan, the detail pane is the reading surface** (#363).
+      Cards carry only 番号 / 名称 / 状態 / a one-line 要約; caption and hint
+      moved into the detail pane. `missing`/`review` get ring emphasis plus
+      a 「要対応」 text marker (never colour alone) and the fixed 5-category
+      order is unchanged. The detail pane is `xl:sticky`; below `xl` the
+      map's 「選択中のカテゴリの詳細へ」 button is the keyboard- and
+      mobile-reachable route to it. Reasons and evidence show 3 with the
+      rest behind a toggle.
+    - **Auxiliary information is one disclosure area** (#361):
+      `CockpitAuxiliaryPanel` / `CockpitAuxiliarySection` hold セッション情報
+      / Intent Brief / 引き継ぎ / 観測提案 / まとめて修正 / Q&A 全一覧 /
+      履歴と監査. Which sections exist is still #342 §3.3's state matrix —
+      only their density changed. Session number / Snapshot / status are the
+      header's alone (`cockpit-header-meta`); `CockpitSessionInfo` no longer
+      repeats them and is reached from the header's 「セッション情報」 button.
+    - **Anything needing immediate attention stays out of the disclosure**:
+      a pending handoff renders as a permanent card (it collapses into the
+      auxiliary area only at 0 待ち), blocking failures stay in
+      `WorkflowExceptions` above the summary, and a failed auxiliary process
+      opens the Q&A section by default so its recovery actions are visible.
+    - Because targets now sit inside `<details>`, `focusCockpitTarget` opens
+      every ancestor `<details>` before focusing. A closed `<details>` keeps
+      its children in the DOM, so without this a CTA silently does nothing.
+    - **Below `md` the sidebar is an overlay Drawer** (#362) opened from a
+      header menu button: focus trap, Escape, close on navigation, focus
+      returned to the toggle. At `md` and up the existing collapse/expand
+      rail is unchanged. `main` padding is `p-4 md:p-6`.
+    Human gates, the #349 state machine, the #351 Brief content rules, and
+    the #356 cockpit contracts (3-value category status, the separate
+    `qaFetchStatus` axis, 0 件 ≠ 取得できていない, aggregation only in
+    `model.ts`) are all unchanged. See the Issue #358 sections in
+    `docs/project-intelligence.md` and `docs/system-interview-workflow-ux.md`.
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,

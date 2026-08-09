@@ -184,6 +184,75 @@ export interface CockpitUnresolvedItem {
   deferred: boolean;
 }
 
+/**
+ * 未解決事項のグループ (issue #359)。
+ *
+ * **グループのキーは有限のカテゴリキーだけ** (`CockpitCategoryKey` の 5 値と
+ * `null` → `cat-general`)。issue の「同じ対象・カテゴリ・論点の質問をグルー
+ * ピングする」は、既に有限でサーバー由来のカテゴリへの所属としてのみ実現し、
+ * 文面の類似度・埋め込み・キーワードスコアでは決して判定しない
+ * (Core Design Principle 6: 類似度やキーワードスコアは候補の retrieval には
+ * 使えても、最終的な開かれた判断になってはならない)。
+ */
+export interface CockpitUnresolvedGroup {
+  /** グループの識別子。`cat-<CockpitCategoryKey>` または `cat-general`。 */
+  id: string;
+  category: CockpitCategoryKey | null;
+  categoryLabel: string;
+  /** 代表質問 = グループ内で最優先の 1 件 (= items[0])。 */
+  representative: CockpitUnresolvedItem;
+  items: CockpitUnresolvedItem[];
+  /** グループの優先度 = items[0].priority。 */
+  priority: CockpitPriority;
+  /** 状態内訳。open = total - unconfirmed - deferred。 */
+  counts: { total: number; unconfirmed: number; deferred: number; open: number };
+}
+
+/**
+ * 未解決事項をカテゴリ単位でまとめる。
+ *
+ * 入力は `buildCockpitModel` が優先度順 (同順位は入力順) に並べ終えた配列な
+ * ので、ここでは並べ替えない。グループの並びは「代表質問が入力配列に現れた
+ * 順」= 代表質問の優先度順であり、グループ内の並びも入力順のまま (安定)。
+ */
+export function groupUnresolvedItems(
+  items: CockpitUnresolvedItem[],
+): CockpitUnresolvedGroup[] {
+  const order: string[] = [];
+  const byGroupId = new Map<string, CockpitUnresolvedItem[]>();
+  for (const item of items) {
+    // 有限集合のキーだけでまとめる。質問文は一切見ない。
+    const id = item.category ? `cat-${item.category}` : "cat-general";
+    const bucket = byGroupId.get(id);
+    if (bucket) {
+      bucket.push(item);
+    } else {
+      byGroupId.set(id, [item]);
+      order.push(id);
+    }
+  }
+  return order.map(id => {
+    const groupItems = byGroupId.get(id) ?? [];
+    const representative = groupItems[0];
+    const unconfirmed = groupItems.filter(i => i.unconfirmed).length;
+    const deferred = groupItems.filter(i => i.deferred).length;
+    return {
+      id,
+      category: representative.category,
+      categoryLabel: representative.categoryLabel,
+      representative,
+      items: groupItems,
+      priority: representative.priority,
+      counts: {
+        total: groupItems.length,
+        unconfirmed,
+        deferred,
+        open: groupItems.length - unconfirmed - deferred,
+      },
+    };
+  });
+}
+
 // ── Q&A 進捗 ──────────────────────────────────────────────────────────
 
 export interface CockpitQaProgress {
@@ -249,6 +318,32 @@ export interface CockpitCategoryView {
   downstream: CockpitCategoryKey[];
 }
 
+// ── 次にやること ──────────────────────────────────────────────────────
+
+/**
+ * 「次にやること」の種別 (issue #360)。**この 4 値だけ**の有限集合で、
+ * スコアや確信度ではない。
+ */
+export type CockpitNextStepKind =
+  | "answer_question"  // 未解決の確認事項に答える
+  | "fix_category"     // 未設定 / 要確認のカテゴリを直す
+  | "retry_qa"         // Q&A を取得できていないので再取得する
+  | "state_primary";   // 確認事項が無い。状態の主操作へ進む
+
+export interface CockpitNextStep {
+  kind: CockpitNextStepKind;
+  title: string;
+  description: string;
+  /** 対象カテゴリ。無いときは null。 */
+  category: CockpitCategoryKey | null;
+  /** 対象の未解決項目 (`answer_question` のときだけ)。 */
+  item: CockpitUnresolvedItem | null;
+  /** CTA 文言。`state_primary` / `retry_qa` はページ側が文言と操作を持つので null。 */
+  actionLabel: string | null;
+  /** 移動先候補 (優先度順)。空配列ならページ側が移動先を決める。 */
+  targetTestIds: string[];
+}
+
 export interface CockpitModel {
   categories: CockpitCategoryView[];
   /**
@@ -272,12 +367,17 @@ export interface CockpitModel {
   /** Q&A の取得状態。`ready` 以外では質問由来の件数を確定値として出さない。 */
   qaFetchStatus: CockpitQaFetchStatus;
   unresolved: CockpitUnresolvedItem[];
+  /**
+   * 未解決事項をカテゴリ単位でまとめたもの (issue #359)。段階的開示はこの
+   * 単位で行う。`unresolved` はそのまま残す (件数と最優先項目の判定に使う)。
+   */
+  unresolvedGroups: CockpitUnresolvedGroup[];
   /** Q&A 進捗。取得できていないときは `null` (0 件ではない)。 */
   qa: CockpitQaProgress | null;
   /** 既定で選択するカテゴリ。未設定 → 要確認 → 先頭、の順で決定的に選ぶ。 */
   defaultCategory: CockpitCategoryKey;
-  /** 「次にやること」の見出しと説明。 */
-  nextStep: { title: string; description: string };
+  /** 「次にやること」。見出しだけでなく、実行できる CTA と移動先を持つ。 */
+  nextStep: CockpitNextStep;
   /** 根拠の件数 (issue §7)。 */
   evidenceCounts: { code: number; docs: number };
 }
@@ -514,6 +614,107 @@ export interface CockpitInput {
   qaFetchStatus?: CockpitQaFetchStatus;
 }
 
+/** カテゴリを直す CTA の移動先 (詳細ペイン)。 */
+const NEXT_STEP_CATEGORY_TARGET = "cockpit-detail-panel";
+
+/**
+ * 「次にやること」を決める (issue #360)。
+ *
+ * **決定的な first-match の固定表**であり、スコアでも確信度でもない。
+ * 分岐は 6 行で、結果は `CockpitNextStepKind` の 4 値に閉じている
+ * (Core Design Principle 6)。
+ *
+ * 並び順の理由は「今すぐ実行できるものを先に出す」:
+ *   1. Q&A が取得できていない → 何件残っているか判定できないので、まず再取得。
+ *   2. Q&A を読み込み中 → 確定前に何も勧められない。状態の主操作のまま待つ。
+ *   3. 未設定カテゴリ → 内容が無いので、質問に答えても埋まらない。定義が先。
+ *   4. 未解決の確認事項 → 既に用意された質問に答えるだけで進む、最も即時に
+ *      実行できる操作。要確認カテゴリの「内容を見直す」より手が動く。
+ *   5. 要確認カテゴリ → 具体的な質問は無いが、内容の確認が要る。
+ *   6. どれも無い → 状態自身の主操作へ。
+ */
+function decideNextStep(args: {
+  missing: CockpitCategoryView[];
+  review: CockpitCategoryView[];
+  unresolved: CockpitUnresolvedItem[];
+  qaFetchStatus: CockpitQaFetchStatus;
+}): CockpitNextStep {
+  const { missing, review, unresolved, qaFetchStatus } = args;
+
+  if (qaFetchStatus === "unavailable") {
+    return {
+      kind: "retry_qa",
+      title: "Q&A を取得できませんでした",
+      description:
+        "未解決の確認事項と回答状況を表示できないため、残りがあるか判定できません。再試行してください。",
+      category: null,
+      item: null,
+      // 再取得の操作と文言はページ側 (Q&A カード) が持つ。
+      actionLabel: null,
+      targetTestIds: [],
+    };
+  }
+  if (qaFetchStatus === "loading") {
+    return {
+      kind: "state_primary",
+      title: "Q&A を読み込んでいます",
+      description: "未解決の確認事項と回答状況は、読み込み後に表示されます。",
+      category: null,
+      item: null,
+      actionLabel: null,
+      targetTestIds: [],
+    };
+  }
+  const firstMissing = missing[0];
+  if (firstMissing) {
+    return {
+      kind: "fix_category",
+      title: `${firstMissing.title} を定義する`,
+      description:
+        "コードからは決められない項目です。質問への回答か直接編集で内容を埋めると、下流のカテゴリもつながります。",
+      category: firstMissing.key,
+      item: null,
+      actionLabel: `${firstMissing.title} を定義する`,
+      // 詳細ペイン (修正手段の案内) へ移動する。実際に何ができるかは
+      // `categoryActions` が状態から決めるので、ここでは面だけを指す。
+      targetTestIds: [NEXT_STEP_CATEGORY_TARGET],
+    };
+  }
+  const topUnresolved = unresolved[0];
+  if (topUnresolved) {
+    return {
+      kind: "answer_question",
+      title: `${topUnresolved.categoryLabel} の確認事項に答える`,
+      description: topUnresolved.question,
+      category: topUnresolved.category,
+      item: topUnresolved,
+      actionLabel: "この確認事項に回答する",
+      targetTestIds: unresolvedTargets(topUnresolved),
+    };
+  }
+  const firstReview = review[0];
+  if (firstReview) {
+    return {
+      kind: "fix_category",
+      title: `${firstReview.title} の内容を確認する`,
+      description: firstReview.hint,
+      category: firstReview.key,
+      item: null,
+      actionLabel: `${firstReview.title} を確認する`,
+      targetTestIds: [NEXT_STEP_CATEGORY_TARGET],
+    };
+  }
+  return {
+    kind: "state_primary",
+    title: "確認が必要な項目はありません",
+    description: "理解の全体像は揃っています。この状態の主操作へ進んでください。",
+    category: null,
+    item: null,
+    actionLabel: null,
+    targetTestIds: [],
+  };
+}
+
 export function buildCockpitModel(input: CockpitInput): CockpitModel {
   const qaFetchStatus = input.qaFetchStatus ?? "ready";
   const qaReady = qaFetchStatus === "ready";
@@ -577,38 +778,7 @@ export function buildCockpitModel(input: CockpitInput): CockpitModel {
   const pending = categories.filter(c => c.status == null);
   const defaultCategory = (missing[0] ?? review[0] ?? categories[0]).key;
 
-  const topUnresolved = unresolved[0];
-  const nextStep = missing[0]
-    ? {
-        title: `${missing[0].title} を定義する`,
-        description:
-          "コードからは決められない項目です。質問への回答か直接編集で内容を埋めると、下流のカテゴリもつながります。",
-      }
-    : topUnresolved
-      ? {
-          title: `${topUnresolved.categoryLabel} の確認事項に答える`,
-          description: topUnresolved.question,
-        }
-      : review[0]
-        ? {
-            title: `${review[0].title} の内容を確認する`,
-            description: review[0].hint,
-          }
-        : qaFetchStatus === "unavailable"
-          ? {
-              title: "Q&A を取得できませんでした",
-              description:
-                "未解決の確認事項と回答状況を表示できないため、残りがあるか判定できません。再試行してください。",
-            }
-          : qaFetchStatus === "loading"
-            ? {
-                title: "Q&A を読み込んでいます",
-                description: "未解決の確認事項と回答状況は、読み込み後に表示されます。",
-              }
-            : {
-                title: "確認が必要な項目はありません",
-                description: "理解の全体像は揃っています。作業カードの主操作へ進んでください。",
-              };
+  const nextStep = decideNextStep({ missing, review, unresolved, qaFetchStatus });
 
   return {
     categories,
@@ -621,6 +791,7 @@ export function buildCockpitModel(input: CockpitInput): CockpitModel {
     categoryCount: categories.length,
     qaFetchStatus,
     unresolved,
+    unresolvedGroups: groupUnresolvedItems(unresolved),
     // 0 件と「取得できていない」を同じ表示にしないため、未取得は null。
     qa: qaReady ? qaProgress(input.qaItems) : null,
     defaultCategory,

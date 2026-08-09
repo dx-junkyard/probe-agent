@@ -17,13 +17,43 @@ export function focusFirstCockpitTarget(testIds: string[]): boolean {
   return testIds.some(testId => focusCockpitTarget(testId));
 }
 
+/**
+ * 対象を包んでいる折りたたみ (`<details>`) をすべて開く。
+ *
+ * Issue #361 で補助情報 (Q&A 全一覧・まとめて修正・履歴など) を段階的開示へ
+ * 移したため、移動先が閉じた `<details>` の中にあることがある。閉じた
+ * `<details>` の中身は DOM には残るので `querySelector` では見つかるが、
+ * 表示されていないので `focus()` が黙って失敗する -- 「この項目を開く」を
+ * 押しても何も起きない、という形で壊れる。先に祖先を開いてからフォーカス
+ * する。
+ */
+function revealAncestors(el: HTMLElement): void {
+  let node: HTMLElement | null = el;
+  while (node) {
+    const details: HTMLDetailsElement | null = node.closest("details");
+    if (!details) return;
+    details.open = true;
+    node = details.parentElement;
+  }
+}
+
 /** 対象が見つかりフォーカス移動できたら true。見つからなければ false。 */
 export function focusCockpitTarget(testId: string): boolean {
   if (typeof document === "undefined") return false;
   const el = document.querySelector<HTMLElement>(`[data-testid="${testId}"]`);
   if (!el) return false;
+  revealAncestors(el);
   if (typeof el.scrollIntoView === "function") {
     el.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+  // 折りたたみそのものが移動先のときは、中の最初のボタンではなく summary へ
+  // 移す。中身は開いた直後で、読み始める位置は見出しだからである。
+  if (el instanceof HTMLDetailsElement) {
+    const summary = el.querySelector("summary");
+    if (summary) {
+      summary.focus({ preventScroll: true });
+      return true;
+    }
   }
   const focusable = el.matches(FOCUSABLE) ? el : el.querySelector<HTMLElement>(FOCUSABLE);
   if (focusable) {

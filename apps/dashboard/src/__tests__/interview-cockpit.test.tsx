@@ -587,7 +587,7 @@ describe("CockpitStatusSummary", () => {
       openQuestions: [openQuestion({ question: "確認したい", category: "purpose" })],
       qaItems: [qa({ id: 1, status: "open" }), qa({ id: 2, status: "answered" })],
     });
-    render(<CockpitStatusSummary model={m} onGoToTopUnresolved={() => {}} />);
+    render(<CockpitStatusSummary model={m} actionLabel={m.nextStep.actionLabel} onRunNextStep={() => {}} />);
     // vision missing(0) + purpose review(0.5) + 残り 3 confirmed → 70%
     expect(screen.getByTestId("cockpit-completion-percent")).toHaveTextContent("70");
     expect(screen.getByTestId("cockpit-stat-categories")).toHaveTextContent("5");
@@ -606,7 +606,7 @@ describe("CockpitStatusSummary", () => {
       qaItems: undefined,
       qaFetchStatus: "unavailable",
     });
-    render(<CockpitStatusSummary model={m} onGoToTopUnresolved={() => {}} />);
+    render(<CockpitStatusSummary model={m} actionLabel={m.nextStep.actionLabel} onRunNextStep={() => {}} />);
     expect(screen.getByTestId("cockpit-completion-percent")).toHaveTextContent("—");
     expect(screen.getByTestId("cockpit-stat-questions")).toHaveTextContent("—");
     expect(screen.getByTestId("cockpit-stat-questions")).not.toHaveTextContent("0");
@@ -624,7 +624,7 @@ describe("CockpitStatusSummary", () => {
       qaItems: undefined,
       qaFetchStatus: "unavailable",
     });
-    render(<CockpitStatusSummary model={m} onGoToTopUnresolved={() => {}} />);
+    render(<CockpitStatusSummary model={m} actionLabel={m.nextStep.actionLabel} onRunNextStep={() => {}} />);
     const review = screen.getByTestId("cockpit-stat-review");
     expect(review).toHaveTextContent("0件以上");
     expect(review.textContent).not.toMatch(/^0要確認$/);
@@ -632,28 +632,58 @@ describe("CockpitStatusSummary", () => {
     expect(screen.getByTestId("cockpit-stat-missing")).toHaveTextContent("0");
   });
 
-  it("未解決が無ければ最優先へ移動する CTA を出さない", () => {
+  // Issue #360: 主 CTA の文言はページが決める (`state_primary` のときだけ
+  // サーバーの `primary_action` を使う)。文言が無ければボタンを描かない。
+  it("CTA の文言が無ければ主 CTA を描かない", () => {
     const m = model({
       understanding: fullUnderstanding(),
       gaps: [],
       openQuestions: [],
       qaItems: [],
     });
-    render(<CockpitStatusSummary model={m} onGoToTopUnresolved={() => {}} />);
-    expect(screen.queryByTestId("cockpit-go-to-top-unresolved")).toBeNull();
+    expect(m.nextStep.kind).toBe("state_primary");
+    expect(m.nextStep.actionLabel).toBeNull();
+    render(<CockpitStatusSummary model={m} actionLabel={null} onRunNextStep={() => {}} />);
+    expect(screen.queryByTestId("cockpit-next-step-action")).toBeNull();
   });
 
-  it("CTA を押すと最優先の未解決事項へのハンドラが呼ばれる", () => {
-    const onGo = vi.fn();
+  it("CTA を押すと次にやることのハンドラが呼ばれる", () => {
+    const onRun = vi.fn();
     const m = model({
       understanding: fullUnderstanding(),
       gaps: [],
       openQuestions: [openQuestion({ question: "高優先", priority: "high", category: "api" })],
       qaItems: [],
     });
-    render(<CockpitStatusSummary model={m} onGoToTopUnresolved={onGo} />);
-    fireEvent.click(screen.getByTestId("cockpit-go-to-top-unresolved"));
-    expect(onGo).toHaveBeenCalledTimes(1);
+    expect(m.nextStep.kind).toBe("answer_question");
+    render(
+      <CockpitStatusSummary
+        model={m}
+        actionLabel={m.nextStep.actionLabel}
+        onRunNextStep={onRun}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("cockpit-next-step-action"));
+    expect(onRun).toHaveBeenCalledTimes(1);
+  });
+
+  // Issue #360 の受け入れ条件「完成度・件数は主 CTA より視覚的に強くならない」。
+  // 見た目そのものは jsdom では測れないので、構造の契約で担保する: 主 CTA は
+  // ボタン、完成度は統計タイルの 1 つ、そして「次にやること」が先に来る。
+  it("次にやることが完成度より先に描かれる", () => {
+    const m = model({
+      understanding: fullUnderstanding({ vision: [] }),
+      gaps: [],
+      openQuestions: [],
+      qaItems: [],
+    });
+    const { container } = render(
+      <CockpitStatusSummary model={m} actionLabel="次へ" onRunNextStep={() => {}} />,
+    );
+    const html = container.innerHTML;
+    expect(html.indexOf('data-testid="cockpit-next-step"'))
+      .toBeLessThan(html.indexOf('data-testid="cockpit-completion-percent"'));
+    expect(screen.getByTestId("cockpit-next-step-action").tagName).toBe("BUTTON");
   });
 });
 
@@ -800,7 +830,13 @@ describe("CockpitUnresolvedItems", () => {
       qaItems: [],
     });
     const onSelect = vi.fn();
-    render(<CockpitUnresolvedItems items={m.unresolved} onSelect={onSelect} />);
+    render(
+      <CockpitUnresolvedItems
+        groups={m.unresolvedGroups}
+        totalCount={m.unresolved.length}
+        onSelect={onSelect}
+      />,
+    );
     const rows = screen.getAllByTestId("cockpit-unresolved-row");
     expect(rows).toHaveLength(2);
     expect(rows[0]).toHaveTextContent("優先度 高");
@@ -811,13 +847,18 @@ describe("CockpitUnresolvedItems", () => {
   });
 
   it("未解決が無ければ空表示にする", () => {
-    render(<CockpitUnresolvedItems items={[]} onSelect={() => {}} />);
+    render(<CockpitUnresolvedItems groups={[]} totalCount={0} onSelect={() => {}} />);
     expect(screen.getByTestId("cockpit-unresolved-empty")).toBeTruthy();
   });
 
   it("Q&A 未取得のときは「未解決なし」と読める表示にしない", () => {
     render(
-      <CockpitUnresolvedItems items={[]} qaFetchStatus="unavailable" onSelect={() => {}} />,
+      <CockpitUnresolvedItems
+        groups={[]}
+        totalCount={0}
+        qaFetchStatus="unavailable"
+        onSelect={() => {}}
+      />,
     );
     expect(screen.getByTestId("cockpit-unresolved-qa-unavailable")).toBeTruthy();
     expect(screen.queryByTestId("cockpit-unresolved-empty")).toBeNull();
@@ -832,7 +873,13 @@ describe("CockpitUnresolvedItems", () => {
         qa({ id: 71, question_text: "見送った質問", question_category: "api", status: "skipped" }),
       ],
     });
-    render(<CockpitUnresolvedItems items={m.unresolved} onSelect={() => {}} />);
+    render(
+      <CockpitUnresolvedItems
+        groups={m.unresolvedGroups}
+        totalCount={m.unresolved.length}
+        onSelect={() => {}}
+      />,
+    );
     const rows = screen.getAllByTestId("cockpit-unresolved-row");
     expect(rows).toHaveLength(1);
     expect(rows[0]).toHaveTextContent("後で回答");

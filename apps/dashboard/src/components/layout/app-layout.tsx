@@ -1,7 +1,8 @@
-import { Outlet, Navigate, useNavigate } from "react-router-dom";
+import { useCallback, useRef, useState } from "react";
+import { Outlet, Navigate, useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "@/api/auth";
 import { useSystemState } from "@/api/hooks";
-import { Sidebar } from "./sidebar";
+import { Sidebar, MOBILE_NAV_DRAWER_ID } from "./sidebar";
 import { Header } from "./header";
 import { Skeleton } from "@/components/ui/skeleton";
 import { AssistantPanel } from "@/components/assistant-panel";
@@ -10,8 +11,28 @@ import { systemStateTarget } from "@/components/system-state";
 export function AppLayout() {
   const { user, loading } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
   const { data: systemState } = useSystemState();
   const primaryNotice = systemState?.notification_items[0] ?? null;
+
+  // Issue #362: below the md breakpoint the sidebar is an overlay Drawer so
+  // it takes no horizontal space from <main>. The open state lives here --
+  // the header's menu button and the Drawer are two views of one fact.
+  //
+  // The state stores the route the Drawer was opened on rather than a bare
+  // boolean, so any react-router location change closes it by derivation
+  // (no setState in an effect, and no way for the overlay to survive a
+  // navigation). A link back to the CURRENT route produces no location
+  // change, so the Drawer's own NavLinks additionally call `closeNav`.
+  const pathname = location.pathname;
+  const [navOpenAt, setNavOpenAt] = useState<string | null>(null);
+  const navOpen = navOpenAt !== null && navOpenAt === pathname;
+  const navToggleRef = useRef<HTMLButtonElement>(null);
+  const closeNav = useCallback(() => setNavOpenAt(null), []);
+  const toggleNav = useCallback(
+    () => setNavOpenAt((prev) => (prev === pathname ? null : pathname)),
+    [pathname],
+  );
 
   if (loading) {
     return (
@@ -29,10 +50,20 @@ export function AppLayout() {
 
   return (
     <div className="flex h-screen overflow-hidden">
-      <Sidebar />
-      <div className="flex flex-1 flex-col overflow-hidden">
-        <Header />
-        <main className="flex-1 overflow-y-auto p-6">
+      <Sidebar
+        navOpen={navOpen}
+        onNavClose={closeNav}
+        drawerId={MOBILE_NAV_DRAWER_ID}
+        returnFocusRef={navToggleRef}
+      />
+      <div className="flex flex-1 flex-col overflow-hidden min-w-0">
+        <Header
+          navOpen={navOpen}
+          onNavToggle={toggleNav}
+          navToggleRef={navToggleRef}
+          navDrawerId={MOBILE_NAV_DRAWER_ID}
+        />
+        <main className="flex-1 overflow-y-auto p-4 md:p-6">
           <Outlet />
         </main>
       </div>

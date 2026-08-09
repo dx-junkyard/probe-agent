@@ -82,6 +82,11 @@ import { CockpitDetailPanel } from "@/components/system-understanding/cockpit/de
 import { CockpitUnresolvedItems } from "@/components/system-understanding/cockpit/unresolved-items";
 import { CockpitQaProgressCard } from "@/components/system-understanding/cockpit/qa-progress";
 import { CockpitSessionInfo } from "@/components/system-understanding/cockpit/session-info";
+import { briefLeadsMainColumn } from "@/components/system-understanding/cockpit/layout";
+import {
+  CockpitAuxiliaryPanel,
+  CockpitAuxiliarySection,
+} from "@/components/system-understanding/cockpit/auxiliary-panel";
 import {
   BackRequestNotice,
   PRIMARY_ACTION_LABELS,
@@ -1658,6 +1663,9 @@ export default function InterviewPage() {
   const auxiliaryProcessFailed = (workflow?.unresolved_failures ?? []).some(
     f => f.process_kind === "question_routing" || f.process_kind === "runtime_reality_check",
   );
+  // Issue #361: 未処理の引き継ぎは「即時対応が必要な情報」なので、折りたたみ
+  // の中に入れず常設で出す判断に使う。
+  const pendingHandoffCount = wFacts?.pending_handoff_count ?? 0;
   const unlocked = session ? proposalsUnlocked(session) : false;
   // A confirmed proposal-stage session is already at its next workflow step.
   // Rebuild only once new developer input (an answer correction, or a
@@ -1821,10 +1829,39 @@ export default function InterviewPage() {
     if (item.category) selectCockpitCategory(item.category);
     focusFirstCockpitTarget(unresolvedTargets(item));
   };
-  const goToTopUnresolved = () => {
-    const top = cockpit.unresolved[0];
-    if (!top) return;
-    openUnresolvedItem(top);
+
+  // Issue #360: Status summary の主 CTA。
+  //
+  // その状態の主操作 (完了条件を満たす操作) は作業面のボタンが唯一の実行者
+  // であり続ける (#342 原則 P1)。ここでは移動とフォーカスだけを行い、実行は
+  // しない -- 同じ操作を 2 箇所に置くと、どちらが正準か分からなくなる
+  // (原則 P7)。`W2` の主操作は Brief カードの中にあるので、そちらを先に
+  // 探してから作業面へ落とす。
+  const stateActionTargets: string[] =
+    wState === "W2"
+      ? ["understanding-confirm-block", "work-surface-W2"]
+      : wState
+        ? [`work-surface-${wState}`]
+        : [];
+  const stateActionLabel =
+    workflow && workflow.primary_action !== "none" && stateActionTargets.length > 0
+      ? PRIMARY_ACTION_LABELS[workflow.primary_action]
+      : null;
+  // 有限集合 (`CockpitNextStepKind`) の直接の対応表。ここで新しい判定はしない。
+  const nextStepActionLabel =
+    cockpit.nextStep.kind === "retry_qa"
+      ? "Q&A を再取得"
+      : (cockpit.nextStep.actionLabel ?? stateActionLabel);
+  const runNextStep = () => {
+    const step = cockpit.nextStep;
+    if (step.kind === "retry_qa") {
+      void refetchQaList();
+      return;
+    }
+    if (step.category) selectCockpitCategory(step.category);
+    const targets = step.targetTestIds.length > 0 ? step.targetTestIds : stateActionTargets;
+    if (targets.length === 0) return;
+    openCockpitTarget(targets);
   };
 
   const ensureRepositorySnapshotFresh = async (action: string) => {
@@ -2194,6 +2231,46 @@ export default function InterviewPage() {
     }
   };
 
+  // Issue #351 の「現在のシステム理解」。Issue #360 で **位置だけ** が状態に
+  // よって変わるようになったので、JSX を 1 つの値にして 2 箇所から使い分ける
+  // (描かれるのは常に 1 つ)。中身・表示密度・主操作の規則は #351 のまま。
+  const understandingBriefPanel = session ? (
+    <UnderstandingBriefPanel
+      brief={understandingBrief}
+      state={wState}
+      primaryAction={
+        showUnderstandingWork && canConfirmStructuredUnderstanding ? (
+          <div data-testid="understanding-confirm-block">
+            <Button
+              size="sm"
+              onClick={doConfirmUnderstanding}
+              disabled={confirmUnderstanding.isPending}
+              data-testid="confirm-understanding"
+            >
+              <CheckCircle className="h-4 w-4 mr-1" />
+              {confirmUnderstanding.isPending
+                ? "確定中..."
+                : PRIMARY_ACTION_LABELS.confirm_understanding}
+            </Button>
+          </div>
+        ) : undefined
+      }
+      fullTree={
+        session.current_understanding ? (
+          <UnderstandingOverview
+            understanding={session.current_understanding}
+            gaps={session.gap_analysis}
+            openQuestions={session.open_questions}
+            nextAction={nextActionText}
+          />
+        ) : undefined
+      }
+    />
+  ) : null;
+  // 位置の判断は `cockpit/layout.ts` の純粋関数に閉じ込める (全状態ぶんを
+  // 単体で検証できるようにするため)。
+  const briefLeads = briefLeadsMainColumn(wState);
+
   return (
     <div className="space-y-6">
       <div className="flex items-start justify-between gap-3 flex-wrap">
@@ -2206,12 +2283,23 @@ export default function InterviewPage() {
             ドキュメントとコードの自動分析からシステム理解を構築し、確認と不足情報の
             質問を経て提案生成へ進みます。
           </p>
-          {/* Issue #356 §1: セッション番号 / Snapshot 番号 / ステータス。 */}
+          {/* Issue #356 §1: セッション番号 / Snapshot 番号 / ステータス。
+              Issue #361 でここが唯一の常設表示になった (右カラムのセッション
+              情報カードからは同じ 3 つを外した)。参加者・最終更新・根拠件数・
+              保存状態は補助情報の中で、このボタンから開く。 */}
           {session && (
             <div className="mt-2 flex flex-wrap items-center gap-2" data-testid="cockpit-header-meta">
               <Badge variant="outline" className="font-normal">セッション #{session.id}</Badge>
               <Badge variant="outline" className="font-normal">Snapshot {session.snapshot_id}</Badge>
               <Badge variant="secondary" className="font-normal">{session.status}</Badge>
+              <button
+                type="button"
+                className="text-xs font-medium underline underline-offset-4 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                onClick={() => openCockpitTarget(["cockpit-aux-session"])}
+                data-testid="cockpit-open-session-info"
+              >
+                セッション情報
+              </button>
             </div>
           )}
         </div>
@@ -2415,71 +2503,38 @@ export default function InterviewPage() {
             />
           )}
 
-          {/* Issue #356 §2 — Interview status サマリー。ファーストビューで
-              「完成度 / 要確認 / 未設定 / 次にやること」を示す。2 カラムの外
-              (全幅) に置くのは、狭い画面で右カラムが下へ回り込んでも位置が
-              変わらないようにするためで、メインカラム先頭は Issue #351 が
-              定めたとおり Understanding Brief のままにする。 */}
-          <CockpitStatusSummary model={cockpit} onGoToTopUnresolved={goToTopUnresolved} />
+          {/* Issue #356 §2 / Issue #360 — Interview status サマリー。
+              ファーストビューの主役は「次にやること」と 1 つの主 CTA で、
+              完成度・件数はその下の統計へ降ろした。2 カラムの外 (全幅) に
+              置くのは、狭い画面で右カラムが下へ回り込んでも位置が変わらない
+              ようにするため。 */}
+          <CockpitStatusSummary
+            model={cockpit}
+            actionLabel={nextStepActionLabel}
+            onRunNextStep={runNextStep}
+          />
 
-          <div className="grid grid-cols-1 xl:grid-cols-[1fr_380px] gap-4">
+          {/* `items-start` が無いと、Grid の既定 stretch で右カラムのカードが
+              メインカラムの高さまで引き伸ばされる (issue #359 の実測: Q&A
+              進捗カードが約 3,416px になっていた)。 */}
+          <div className="grid grid-cols-1 xl:grid-cols-[1fr_380px] gap-4 items-start">
             {/* メイン: 状態ごとに 1 つの主作業面だけを描く (原則 P1/P3)。
                 タブ (#12) は廃止され、W3 と W4 が別状態になったことで
-                「どちらのタブを既定にするか」という判断自体が消えた。 */}
+                「どちらのタブを既定にするか」という判断自体が消えた。
+
+                Issue #360 で並び順を変えた: 主作業面が先頭で、全体像
+                (Understanding Brief / 理解の全体マップ) はその後ろの
+                「全体像」領域へ移す。#351 が Brief をメインカラム先頭に
+                置いたのは、右カラムが狭い画面で下へ回り込むと Vision /
+                Purpose / 進行可否が主作業より大幅に下がるためで、その要件は
+                メインカラム内に残したまま満たせる。 */}
             <div className="space-y-4">
               <>
-                {/* Issue #351: 「現在のシステム理解」 は全状態で同じ概念・同じ
-                    位置に出す。メインカラムの先頭に置くのは #354 の画面幅要件
-                    のため -- 右カラムは狭い画面で下へ回り込むので、そこに置くと
-                    Vision / Purpose / 進行可否が主作業より大幅に下がる。
-                    W2 では主作業として全面表示し、判断対象と主操作
-                    (「この理解で進む」) を同じカードに置く (原則 P2)。W3〜W7 は
-                    コンパクト表示で、展開すると同じ Brief に到達する。
-                    以前ここにあった右カラムの「現在の理解」カードは、同じ対象を
-                    2 箇所に置かないため廃止した (原則 P7)。 */}
-                <UnderstandingBriefPanel
-                  brief={understandingBrief}
-                  state={wState}
-                  primaryAction={
-                    showUnderstandingWork && canConfirmStructuredUnderstanding ? (
-                      <div data-testid="understanding-confirm-block">
-                        <Button
-                          size="sm"
-                          onClick={doConfirmUnderstanding}
-                          disabled={confirmUnderstanding.isPending}
-                          data-testid="confirm-understanding"
-                        >
-                          <CheckCircle className="h-4 w-4 mr-1" />
-                          {confirmUnderstanding.isPending
-                            ? "確定中..."
-                            : PRIMARY_ACTION_LABELS.confirm_understanding}
-                        </Button>
-                      </div>
-                    ) : undefined
-                  }
-                  fullTree={
-                    session.current_understanding ? (
-                      <UnderstandingOverview
-                        understanding={session.current_understanding}
-                        gaps={session.gap_analysis}
-                        openQuestions={session.open_questions}
-                        nextAction={nextActionText}
-                      />
-                    ) : undefined
-                  }
-                />
-
-                {/* Issue #356 §3 — 理解の全体マップ。Brief (要点と進行可否)
-                    の直後に置き、同じ「現在の理解」の話題をひとまとまりに
-                    する。カード選択は右カラムの詳細・修正ペインを切り替える
-                    だけで、ワークフロー状態には影響しない。 */}
-                <UnderstandingMap
-                  categories={cockpit.categories}
-                  selected={selectedCategoryKey}
-                  qaFetchStatus={cockpit.qaFetchStatus}
-                  onSelect={selectCockpitCategory}
-                  onRetryQa={() => void refetchQaList()}
-                />
+                {/* `W1` (構築中) と `W2` (理解の確認) では Brief 自体が判断
+                    対象で、`W2` の主操作「この理解で進む」も同じカードにある
+                    (#351 / 原則 P2)。この 2 状態でだけ Brief が主作業面の
+                    位置に立つ。 */}
+                {briefLeads && understandingBriefPanel}
 
                 {showAlignmentWork && (
                 <div className="space-y-4" data-testid="work-surface-W4">
@@ -3092,12 +3147,18 @@ git commit`}
                 )}
               </>
 
-              {/* Issue #356 §5/§6 — 未解決事項と Q&A 進捗。主作業面の下に
-                  置き、「今この状態で何を操作するか」より先に全体像が来ない
-                  ようにする。行のアクションは既存の回答 UI へ移動するだけ。 */}
-              <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_300px] gap-4">
+              {/* Issue #356 §5/§6 / Issue #359 — 未解決事項と Q&A 進捗。
+                  主作業面の直下に置き、「今この状態で何を操作するか」より先に
+                  全体像が来ないようにする。未解決事項は優先度上位のグループ
+                  だけを初期表示し、残りは明示操作で開く。行のアクションは
+                  既存の回答 UI へ移動するだけ。
+
+                  `items-start` が無いと Grid の既定 stretch で Q&A 進捗カード
+                  が未解決事項カードの高さまで引き伸ばされる (issue #359)。 */}
+              <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_300px] gap-4 items-start">
                 <CockpitUnresolvedItems
-                  items={cockpit.unresolved}
+                  groups={cockpit.unresolvedGroups}
+                  totalCount={cockpit.unresolved.length}
                   qaFetchStatus={cockpit.qaFetchStatus}
                   onSelect={openUnresolvedItem}
                 />
@@ -3108,6 +3169,23 @@ git commit`}
                   onRetry={() => void refetchQaList()}
                 />
               </div>
+
+              {/* Issue #360 — 全体像。主作業面と未解決事項のあとに置く。
+                  `W1` / `W2` では Brief が主作業面の位置に立っているので、
+                  ここには全体マップだけが残る (同じカードを 2 枚描かない)。 */}
+              {!briefLeads && understandingBriefPanel}
+
+              {/* Issue #356 §3 / Issue #363 — 理解の全体マップ。カード選択は
+                  詳細・修正ペインを切り替えるだけで、ワークフロー状態には
+                  影響しない。 */}
+              <UnderstandingMap
+                categories={cockpit.categories}
+                selected={selectedCategoryKey}
+                qaFetchStatus={cockpit.qaFetchStatus}
+                onSelect={selectCockpitCategory}
+                onRetryQa={() => void refetchQaList()}
+                onGoToDetail={() => openCockpitTarget(["cockpit-detail-panel"])}
+              />
             </div>
 
             {/* サイド: 判断に必要な根拠 (R3) と、必要時に開く詳細 (R4)。
@@ -3120,40 +3198,38 @@ git commit`}
                 と競合するうえ、原則 P1/P3 にも反する。R6 の履歴入口だけは
                 状態に依存せず常に開ける (§3.6)。 */}
             <div className="space-y-4">
-              {/* Issue #356 §4 — 選択項目の詳細・修正ペイン。全体マップの選択
-                  に追従し、この項目を「どう直すか」だけを示す。実行できない
-                  手段は理由付きで残す (issue §4) -- ここは状態の主操作では
-                  なく修正方法の案内なので、前提未達の主操作を出さない原則
-                  (spec P3) の対象ではない。 */}
+              {/* Issue #356 §4 / Issue #363 — 選択項目の詳細・修正ペイン。
+                  全体マップの選択に追従し、この項目を「どう直すか」だけを
+                  示す。実行できない手段は理由付きで残す (issue §4) -- ここは
+                  状態の主操作ではなく修正方法の案内なので、前提未達の主操作を
+                  出さない原則 (spec P3) の対象ではない。
+
+                  Desktop では sticky にする: マップをスクロールしている間も
+                  選択内容と修正導線を見失わないため (#363)。回り込みが起きる
+                  幅 (xl 未満) では通常の縦積みで、マップの
+                  「選択中のカテゴリの詳細へ」がここへの導線になる。 */}
               {selectedCategory && (
-                <CockpitDetailPanel
-                  category={selectedCategory}
-                  state={wState}
-                  onAction={openCockpitTarget}
-                />
+                <div className="xl:sticky xl:top-0">
+                  <CockpitDetailPanel
+                    category={selectedCategory}
+                    state={wState}
+                    onAction={openCockpitTarget}
+                  />
+                </div>
               )}
 
-              {/* Issue #356 §7 — セッション情報 (参加者・最終更新・根拠数・
-                  保存状態)。旧「セッション #id」カードを置き換える。 */}
-              <CockpitSessionInfo
-                sessionId={session.id}
-                snapshotId={session.snapshot_id}
-                status={session.status}
-                updatedAt={session.updated_at}
-                participants={sessionParticipants}
-                evidenceCounts={cockpit.evidenceCounts}
-                saving={dialogueTurn.isPending || confirmUnderstanding.isPending || building}
-              >
-                {/* R4 (#44): 回答可能領域は `W3` の判断にだけ関わる詳細。 */}
-                {showQuestionWork && (
-                  <AnswerableAreasControl sessionId={session.id} answerableAreas={session.answerable_areas} />
-                )}
-              </CockpitSessionInfo>
+              {/* Issue #361: 即時対応が必要な情報は折りたたみへ入れない。
+                  引き継ぎ待ちが残っているときの一覧 (#53, R3) は、閉じた
+                  `<details>` の中にあると見失うので常設のままにする。待ちが
+                  0 件のときだけ補助情報側へ降ろす。 */}
+              {(showQuestionWork || showTerminal) && pendingHandoffCount > 0 && (
+                <HandoffListPanel sessionId={session.id} actor={actor} />
+              )}
 
               {/* Issue #351: 右カラムの「現在の理解」カードは廃止した。
                   #354 が求めるのは「現在の理解が右カラムの補助情報としてしか
-                  存在しない状態にはしない」ことで、Brief がメインカラムの先頭
-                  に常設された以上、ここに 2 枚目を置くと同じ対象の重複になる
+                  存在しない状態にはしない」ことで、Brief がメインカラムに
+                  常設された以上、ここに 2 枚目を置くと同じ対象の重複になる
                   (原則 P7)。全文ツリー (旧 UnderstandingOverview) は Brief の
                   折りたたみの中に R4 として残っている。
                   ここにあった `last_error` 表示も削除した: 表示条件が
@@ -3161,43 +3237,105 @@ git commit`}
                   条件・再試行を 1 枠にまとめる `WorkflowExceptions` (§4.4) と
                   常に同時に出る重複だった。 */}
 
-              {/* Intent Brief (#51a/#51b): 確定・訂正は `W2` 完了時と `W4`。 */}
-              {(showUnderstandingWork || showAlignmentWork) && (
-                <IntentBriefPanel sessionId={session.id} />
-              )}
+              {/* Issue #361 — 補助情報。セッション管理情報・全件一覧・履歴・
+                  監査を 1 箇所へまとめ、必要なときだけ開く。どの項目を出すかは
+                  これまでどおり §3.3 のマトリクス (その状態の判断に要るか) で
+                  決める -- 折りたたみになっただけで、状態ごとの表示対象は
+                  変えていない。 */}
+              <CockpitAuxiliaryPanel>
+                {/* Issue #356 §7 / #361: セッション情報。セッション番号 /
+                    Snapshot / ステータスはヘッダーが正準なので再掲しない。 */}
+                <CockpitAuxiliarySection
+                  id="session"
+                  title="セッション情報"
+                  description="参加者・最終更新・根拠の件数・保存状態。"
+                >
+                  <CockpitSessionInfo
+                    updatedAt={session.updated_at}
+                    participants={sessionParticipants}
+                    evidenceCounts={cockpit.evidenceCounts}
+                    saving={dialogueTurn.isPending || confirmUnderstanding.isPending || building}
+                  >
+                    {/* R4 (#44): 回答可能領域は `W3` の判断にだけ関わる詳細。 */}
+                    {showQuestionWork && (
+                      <AnswerableAreasControl
+                        sessionId={session.id}
+                        answerableAreas={session.answerable_areas}
+                      />
+                    )}
+                  </CockpitSessionInfo>
+                </CockpitAuxiliarySection>
 
-              {/* 引き継ぎ待ちの一覧 (#53, R3): `W3` と `W7` で、待ち項目が
-                  あるときだけ意味を持つ。 */}
-              {(showQuestionWork || showTerminal) && (
-                <HandoffListPanel sessionId={session.id} actor={actor} />
-              )}
+                {/* Intent Brief (#51a/#51b): 確定・訂正は `W2` 完了時と `W4`。 */}
+                {(showUnderstandingWork || showAlignmentWork) && (
+                  <CockpitAuxiliarySection
+                    id="intent"
+                    title="Intent Brief"
+                    description="この改善で何を達成したいか (開発者の意図)。"
+                  >
+                    <IntentBriefPanel sessionId={session.id} />
+                  </CockpitAuxiliarySection>
+                )}
 
-              {/* 新規観測の提案 (#55): 採否は `W7` の判断 (`OP-D11`)。 */}
-              {showTerminal && <ObservationProposalPanel sessionId={session.id} />}
+                {(showQuestionWork || showTerminal) && pendingHandoffCount === 0 && (
+                  <CockpitAuxiliarySection
+                    id="handoff"
+                    title="引き継ぎ"
+                    description="待ち項目はありません。"
+                  >
+                    <HandoffListPanel sessionId={session.id} actor={actor} />
+                  </CockpitAuxiliarySection>
+                )}
 
-              {/* まとめて修正 (#57, R2 補助): `W2` / `W3` / `W4` の訂正手段。 */}
-              {(showUnderstandingWork || showQuestionWork || showAlignmentWork) && (
-                <ChangeSetPanel sessionId={session.id} />
-              )}
+                {/* 新規観測の提案 (#55): 採否は `W7` の判断 (`OP-D11`)。 */}
+                {showTerminal && (
+                  <CockpitAuxiliarySection id="observation" title="新規観測の提案">
+                    <ObservationProposalPanel sessionId={session.id} />
+                  </CockpitAuxiliarySection>
+                )}
 
-              {/* Q&A 一覧 (#59a, R4): 現在の 1 問は主作業カードが持つ。一覧は
-                  `W3` の詳細で、履歴 (#59b) は R6 の入口にある。 */}
-              {showQuestionWork && (
-                <QaPanel
-                  sessionId={session.id}
-                  actor={actor}
-                  approvedCount={approvedCount}
-                  answerableAreas={session.answerable_areas}
-                  investigate={qaAutoInvestigate}
-                  showRecoveryActions={auxiliaryProcessFailed}
-                />
-              )}
+                {/* まとめて修正 (#57, R2 補助): `W2` / `W3` / `W4` の訂正手段。
+                    詳細ペインの「直接編集する」からここへ移動してくるので、
+                    `focusCockpitTarget` が祖先の `<details>` を開く。 */}
+                {(showUnderstandingWork || showQuestionWork || showAlignmentWork) && (
+                  <CockpitAuxiliarySection
+                    id="change-set"
+                    title="まとめて修正"
+                    description="修正内容を文章で書き、変更セットとして確認してから反映します。"
+                  >
+                    <ChangeSetPanel sessionId={session.id} />
+                  </CockpitAuxiliarySection>
+                )}
+
+                {/* Q&A 一覧 (#59a, R4): 現在の 1 問は主作業カードが持つ。一覧は
+                    `W3` の詳細で、履歴 (#59b) は R6 の入口にある。処理が失敗
+                    しているときは復旧操作を隠さないよう既定で開く (#361)。 */}
+                {showQuestionWork && (
+                  <CockpitAuxiliarySection
+                    id="qa-list"
+                    title="Q&A の全一覧"
+                    description="回答済みを含む全質問。1 問ずつの回答は上の作業面で行います。"
+                    badge={cockpit.qa ? `未回答 ${cockpit.qa.open} 件` : undefined}
+                    defaultOpen={auxiliaryProcessFailed}
+                  >
+                    <QaPanel
+                      sessionId={session.id}
+                      actor={actor}
+                      approvedCount={approvedCount}
+                      answerableAreas={session.answerable_areas}
+                      investigate={qaAutoInvestigate}
+                      showRecoveryActions={auxiliaryProcessFailed}
+                    />
+                  </CockpitAuxiliarySection>
+                )}
 
               {/* R6 — 履歴と監査情報 (§3.6)。主フローの各状態には常設せず、
                   状態に依存しない 1 つの入口からのみ到達する。中身は固定の
                   並び順で、Interview UX 評価指標 (#341) もこの中に置く。
-                  入口は常に開ける (前提未達でも消さない)。 */}
-              <details className="rounded-md border p-3" data-testid="history-audit-entry">
+                  入口は常に開ける (前提未達でも消さない)。ヘッダーの
+                  「変更履歴」ボタンがこの `<details>` を直接開けるので、
+                  `CockpitAuxiliarySection` には置き換えていない。 */}
+              <details className="rounded-md border px-3 py-2" data-testid="history-audit-entry">
                 <summary className="cursor-pointer text-sm font-medium">
                   履歴と監査情報
                 </summary>
@@ -3295,6 +3433,7 @@ git commit`}
                   </section>
                 </div>
               </details>
+              </CockpitAuxiliaryPanel>
             </div>
           </div>
 

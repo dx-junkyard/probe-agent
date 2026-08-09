@@ -5,11 +5,12 @@ import {
   Workflow, Network, MessageSquareText, Brain, GitFork, Filter,
   LifeBuoy, BookMarked, GitMerge, Beaker, Bot, Layers,
 } from "lucide-react";
+import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/api/auth";
 import { useSystemState } from "@/api/hooks";
 import type { UserPhase } from "@/api/types";
-import { useState } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 
 // Issue #179 introduced fixed, explicit headings (Hub / Detail views /
 // Other). Issue #257 re-groups the same routes along the phase axis instead:
@@ -178,15 +179,223 @@ function phaseGroupState(
   return currentRank > maxRank ? "reached" : "future";
 }
 
-export function Sidebar() {
-  const { isAdmin } = useAuth();
+// Issue #362: the mobile Drawer's element id. The header's menu button
+// points at it via `aria-controls`, so both sides must agree on one value.
+export const MOBILE_NAV_DRAWER_ID = "mobile-nav-drawer";
+
+const FOCUSABLE_SELECTOR = [
+  "a[href]",
+  "button:not([disabled])",
+  "input:not([disabled])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  '[tabindex]:not([tabindex="-1"])',
+].join(",");
+
+function SidebarBrand({ collapsed }: { collapsed: boolean }) {
+  return (
+    <>
+      <div className="h-7 w-7 rounded-lg bg-primary flex items-center justify-center">
+        <span className="text-xs font-bold text-primary-foreground">P</span>
+      </div>
+      {!collapsed && <span className="font-semibold text-sm">Probe Agent</span>}
+    </>
+  );
+}
+
+// The nav list itself. Rendered by the static desktop rail and by the mobile
+// Drawer alike (Issue #362) so the two presentations can never drift apart --
+// there is exactly one source of nav markup.
+function SidebarNavList({
+  groups,
+  collapsed,
+  userPhase,
+  onNavigate,
+}: {
+  groups: NavGroup[];
+  collapsed: boolean;
+  userPhase: UserPhase | undefined;
+  onNavigate?: () => void;
+}) {
   const location = useLocation();
+  return (
+    <nav className="flex-1 overflow-y-auto py-2 px-2 space-y-3" data-testid="sidebar-nav">
+      {groups.map((group, gi) => {
+        const slug = group.heading ? group.heading.toLowerCase().replace(/\s+/g, "-") : undefined;
+        const phaseState = phaseGroupState(group.phases, userPhase);
+        return (
+          <div
+            key={group.heading ?? `group-${gi}`}
+            className={cn("space-y-0.5", phaseState === "future" && "opacity-50")}
+            data-testid={slug ? `sidebar-group-${slug}` : undefined}
+            // Issue #257: only phase-linked groups (Setup/Understand/
+            // Instrument/Observe & Evaluate/Publish) carry this attribute;
+            // Overview and Other have no phase and stay undefined.
+            data-phase-state={group.phases ? phaseState : undefined}
+          >
+            {group.heading && !collapsed && (
+              <p
+                className={cn(
+                  "flex items-center gap-1.5 px-3 pb-1 text-xs font-semibold uppercase tracking-wide",
+                  phaseState === "current" ? "text-primary" : "text-muted-foreground/70",
+                )}
+              >
+                {group.heading}
+                {phaseState === "current" && (
+                  <span className="rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium normal-case tracking-normal text-primary">
+                    現在
+                  </span>
+                )}
+              </p>
+            )}
+            {group.items.map((item) => {
+              const isActive = item.to === "/"
+                ? location.pathname === "/"
+                : location.pathname.startsWith(item.to);
+              return (
+                <NavLink
+                  key={item.to}
+                  to={item.to}
+                  // Issue #362: inside the mobile Drawer, following a link
+                  // must close the overlay. The AppLayout also closes on a
+                  // react-router location change, so a link to the current
+                  // route (which produces no location change) still closes.
+                  onClick={onNavigate}
+                  className={cn(
+                    "flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors",
+                    isActive
+                      ? "bg-secondary text-foreground"
+                      : "text-muted-foreground hover:bg-secondary/50 hover:text-foreground",
+                    collapsed && "justify-center px-2",
+                  )}
+                  title={item.title ?? (collapsed ? item.label : undefined)}
+                >
+                  <item.icon className="h-4 w-4 shrink-0" />
+                  {!collapsed && (
+                    <span className="flex flex-col min-w-0">
+                      <span className="flex items-center gap-1.5">
+                        <span>{item.label}</span>
+                        {item.legacy && (
+                          <span
+                            className="rounded bg-muted px-1 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground"
+                            data-testid="sidebar-legacy-badge"
+                          >
+                            Legacy
+                          </span>
+                        )}
+                      </span>
+                      {/* Issue #267 item 11: usage-distinction subtext. */}
+                      {item.subtitle && (
+                        <span
+                          className="truncate text-[11px] font-normal normal-case tracking-normal text-muted-foreground/80"
+                          data-testid={`sidebar-item-subtitle-${item.to.replace(/\//g, "")}`}
+                        >
+                          {item.subtitle}
+                        </span>
+                      )}
+                    </span>
+                  )}
+                </NavLink>
+              );
+            })}
+          </div>
+        );
+      })}
+    </nav>
+  );
+}
+
+export interface SidebarProps {
+  /**
+   * Issue #362: whether the mobile navigation Drawer is open. Owned by
+   * `AppLayout` so the header's menu button and the Drawer stay in sync.
+   * Defaults to `false` so the component can still be rendered on its own.
+   */
+  navOpen?: boolean;
+  /** Called when the Drawer asks to be closed (backdrop, Escape, close button, navigation). */
+  onNavClose?: () => void;
+  /** Element id of the Drawer panel; the header's `aria-controls` target. */
+  drawerId?: string;
+  /** Focus is returned here when the Drawer closes (the header's menu button). */
+  returnFocusRef?: RefObject<HTMLButtonElement | null>;
+}
+
+export function Sidebar({
+  navOpen = false,
+  onNavClose,
+  drawerId = MOBILE_NAV_DRAWER_ID,
+  returnFocusRef,
+}: SidebarProps = {}) {
+  const { isAdmin } = useAuth();
   const [collapsed, setCollapsed] = useState(false);
   // Issue #257: drives phase-linked emphasis/dimming below. Missing data
   // (older server, loading, error) falls through to `phaseGroupState`'s
   // "none" branch, which renders every group normally.
   const { data: systemState } = useSystemState();
   const userPhase = systemState?.user_phase;
+  const drawerRef = useRef<HTMLDivElement>(null);
+  // Kept in a ref so a new inline `onNavClose` identity never tears down and
+  // re-runs the focus effect below (which would bounce focus out of the
+  // Drawer and back in on every parent re-render).
+  const onNavCloseRef = useRef(onNavClose);
+  useEffect(() => {
+    onNavCloseRef.current = onNavClose;
+  }, [onNavClose]);
+
+  // Issue #362: while the Drawer is open it is a modal surface -- Escape
+  // closes it, Tab/Shift+Tab cycle inside it, focus moves into it on open,
+  // and focus returns to the menu button on close.
+  useEffect(() => {
+    if (!navOpen) return;
+    const panel = drawerRef.current;
+    if (!panel) return;
+
+    const focusables = () =>
+      Array.from(panel.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR));
+
+    // Resolved before focus moves into the Drawer, so the cleanup below
+    // restores the element the developer actually came from (normally the
+    // header's menu button, which is what opened the Drawer).
+    const previouslyFocused = document.activeElement;
+    const returnFocusTarget =
+      returnFocusRef?.current
+      ?? (previouslyFocused instanceof HTMLElement ? previouslyFocused : null);
+
+    (focusables()[0] ?? panel).focus();
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onNavCloseRef.current?.();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const items = focusables();
+      if (items.length === 0) {
+        event.preventDefault();
+        panel.focus();
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      const active = document.activeElement;
+      if (event.shiftKey) {
+        if (active === first || !panel.contains(active)) {
+          event.preventDefault();
+          last.focus();
+        }
+      } else if (active === last || !panel.contains(active)) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      if (returnFocusTarget && returnFocusTarget.isConnected) returnFocusTarget.focus();
+    };
+  }, [navOpen, returnFocusRef]);
 
   const groups: NavGroup[] = isAdmin
     ? NAV_GROUPS.map((g, i) =>
@@ -197,104 +406,75 @@ export function Sidebar() {
     : NAV_GROUPS;
 
   return (
-    <aside
-      className={cn(
-        "flex flex-col border-r bg-card transition-all duration-200",
-        collapsed ? "w-16" : "w-56",
-      )}
-    >
-      <div className={cn("flex items-center gap-2 border-b px-4 h-14", collapsed && "justify-center px-2")}>
-        <div className="h-7 w-7 rounded-lg bg-primary flex items-center justify-center">
-          <span className="text-xs font-bold text-primary-foreground">P</span>
-        </div>
-        {!collapsed && <span className="font-semibold text-sm">Probe Agent</span>}
-      </div>
-
-      <nav className="flex-1 overflow-y-auto py-2 px-2 space-y-3" data-testid="sidebar-nav">
-        {groups.map((group, gi) => {
-          const slug = group.heading ? group.heading.toLowerCase().replace(/\s+/g, "-") : undefined;
-          const phaseState = phaseGroupState(group.phases, userPhase);
-          return (
-            <div
-              key={group.heading ?? `group-${gi}`}
-              className={cn("space-y-0.5", phaseState === "future" && "opacity-50")}
-              data-testid={slug ? `sidebar-group-${slug}` : undefined}
-              // Issue #257: only phase-linked groups (Setup/Understand/
-              // Instrument/Observe & Evaluate/Publish) carry this attribute;
-              // Overview and Other have no phase and stay undefined.
-              data-phase-state={group.phases ? phaseState : undefined}
-            >
-              {group.heading && !collapsed && (
-                <p
-                  className={cn(
-                    "flex items-center gap-1.5 px-3 pb-1 text-xs font-semibold uppercase tracking-wide",
-                    phaseState === "current" ? "text-primary" : "text-muted-foreground/70",
-                  )}
-                >
-                  {group.heading}
-                  {phaseState === "current" && (
-                    <span className="rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium normal-case tracking-normal text-primary">
-                      現在
-                    </span>
-                  )}
-                </p>
-              )}
-              {group.items.map((item) => {
-                const isActive = item.to === "/"
-                  ? location.pathname === "/"
-                  : location.pathname.startsWith(item.to);
-                return (
-                  <NavLink
-                    key={item.to}
-                    to={item.to}
-                    className={cn(
-                      "flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors",
-                      isActive
-                        ? "bg-secondary text-foreground"
-                        : "text-muted-foreground hover:bg-secondary/50 hover:text-foreground",
-                      collapsed && "justify-center px-2",
-                    )}
-                    title={item.title ?? (collapsed ? item.label : undefined)}
-                  >
-                    <item.icon className="h-4 w-4 shrink-0" />
-                    {!collapsed && (
-                      <span className="flex flex-col min-w-0">
-                        <span className="flex items-center gap-1.5">
-                          <span>{item.label}</span>
-                          {item.legacy && (
-                            <span
-                              className="rounded bg-muted px-1 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground"
-                              data-testid="sidebar-legacy-badge"
-                            >
-                              Legacy
-                            </span>
-                          )}
-                        </span>
-                        {/* Issue #267 item 11: usage-distinction subtext. */}
-                        {item.subtitle && (
-                          <span
-                            className="truncate text-[11px] font-normal normal-case tracking-normal text-muted-foreground/80"
-                            data-testid={`sidebar-item-subtitle-${item.to.replace(/\//g, "")}`}
-                          >
-                            {item.subtitle}
-                          </span>
-                        )}
-                      </span>
-                    )}
-                  </NavLink>
-                );
-              })}
-            </div>
-          );
-        })}
-      </nav>
-
-      <button
-        onClick={() => setCollapsed(!collapsed)}
-        className="flex items-center justify-center border-t py-3 text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+    <>
+      {/* Static rail. Issue #362: `hidden md:flex` so it contributes no
+          horizontal space below the md breakpoint -- on a 390px screen the
+          navigation lives in the Drawer instead and <main> keeps the width. */}
+      <aside
+        data-testid="sidebar-rail"
+        className={cn(
+          "hidden md:flex flex-col border-r bg-card transition-all duration-200",
+          collapsed ? "w-16" : "w-56",
+        )}
       >
-        {collapsed ? <ChevronRight className="h-4 w-4" /> : <ChevronLeft className="h-4 w-4" />}
-      </button>
-    </aside>
+        <div className={cn("flex items-center gap-2 border-b px-4 h-14", collapsed && "justify-center px-2")}>
+          <SidebarBrand collapsed={collapsed} />
+        </div>
+
+        <SidebarNavList groups={groups} collapsed={collapsed} userPhase={userPhase} />
+
+        <button
+          onClick={() => setCollapsed(!collapsed)}
+          aria-label={collapsed ? "ナビゲーションを展開する" : "ナビゲーションを折りたたむ"}
+          aria-expanded={!collapsed}
+          data-testid="sidebar-collapse-toggle"
+          className="flex items-center justify-center border-t py-3 text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+        >
+          {collapsed ? <ChevronRight className="h-4 w-4" /> : <ChevronLeft className="h-4 w-4" />}
+        </button>
+      </aside>
+
+      {/* Mobile Drawer. Rendered only while open, and only visible below md. */}
+      {navOpen && (
+        <>
+          <div
+            data-testid="mobile-nav-backdrop"
+            aria-hidden="true"
+            onClick={onNavClose}
+            className="fixed inset-0 z-40 bg-black/50 md:hidden"
+          />
+          <div
+            id={drawerId}
+            ref={drawerRef}
+            role="dialog"
+            aria-modal="true"
+            aria-label="ナビゲーション"
+            tabIndex={-1}
+            data-testid="mobile-nav-drawer"
+            className="fixed inset-y-0 left-0 z-50 flex w-64 max-w-[85vw] flex-col border-r bg-card shadow-xl outline-none md:hidden"
+          >
+            <div className="flex items-center gap-2 border-b px-4 h-14">
+              <SidebarBrand collapsed={false} />
+              <button
+                type="button"
+                onClick={onNavClose}
+                aria-label="ナビゲーションを閉じる"
+                data-testid="mobile-nav-close"
+                className="ml-auto flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <SidebarNavList
+              groups={groups}
+              collapsed={false}
+              userPhase={userPhase}
+              onNavigate={onNavClose}
+            />
+          </div>
+        </>
+      )}
+    </>
   );
 }
