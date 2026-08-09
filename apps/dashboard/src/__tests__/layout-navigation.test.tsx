@@ -137,6 +137,12 @@ describe("AppLayout responsive shell (Issue #362)", () => {
     expect(main).not.toBeNull();
     expect(main!.className).toMatch(/(^|\s)p-4(\s|$)/);
     expect(main!.className).toMatch(/md:p-6/);
+    // Issue #102 / #358: the assistant's floating button is fixed at the
+    // bottom-right over this scroll area, so the content must end above it.
+    // This padding and the button's `bottom-*` are one pair -- changing
+    // either alone lets the button cover a page's primary action.
+    expect(main!.className).toMatch(/(^|\s)pb-24(\s|$)/);
+    expect(main!.className).toMatch(/md:pb-24/);
   });
 
   test("the mobile menu toggle is present with an accessible Japanese name and is md:hidden", async () => {

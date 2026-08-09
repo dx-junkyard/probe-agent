@@ -63,7 +63,12 @@ export function AppLayout() {
           navToggleRef={navToggleRef}
           navDrawerId={MOBILE_NAV_DRAWER_ID}
         />
-        <main className="flex-1 overflow-y-auto p-4 md:p-6">
+        {/* `pb-24` は `AssistantPanel` の浮いているボタン (閉じているとき
+            右下に固定) のための予約領域。本文の末尾が常にボタンより上で
+            終わるので、画面の主操作がボタンに覆われることがない (#102:
+            アシスタントは画面の主操作を隠さない)。ボタン側の `bottom-*` と
+            対で意味を持つ値なので、片方だけ変えないこと。 */}
+        <main className="flex-1 overflow-y-auto p-4 pb-24 md:p-6 md:pb-24">
           <Outlet />
         </main>
       </div>

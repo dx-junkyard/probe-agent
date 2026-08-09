@@ -716,3 +716,33 @@ mutation, no permission change.
 - Tests: `cockpit-unresolved.test.tsx`, `cockpit-map-detail.test.tsx`,
   `layout-navigation.test.tsx`, plus the Interview page group in
   `dashboard-contracts.test.tsx` (order, disclosure, header de-duplication).
+
+## オーバーレイの面は 1 つの規則で揃える (`lib/modal-surface.ts`)
+
+Any surface that covers the page content — the mobile nav Drawer (#362), the
+assistant panel (#102) — uses `useModalSurface`. It is the single
+implementation of four rules, and a second copy of them is how one surface
+ends up without Escape or without focus return:
+
+- focus moves into the panel on open,
+- Escape closes it,
+- Tab/Shift+Tab cycle inside it (focus never falls back to the page behind),
+- focus returns to the element that was focused before opening.
+
+The panel needs `tabIndex={-1}`, `role="dialog"`, `aria-modal="true"`, and an
+accessible name. A backdrop that closes on click is the caller's job (the
+hook does not render anything) and is **required** for a surface that can
+cover the whole viewport — at 390px the assistant panel is full width, so a
+single close button in the corner is not an escape route.
+
+`returnFocusRef` is for openers that stay mounted (the header's menu button).
+When the opener is unmounted while the surface is open — the assistant's
+floating button is — the hook's default cannot work: the remembered node is
+detached, and the button comes back as a NEW node. Focus the re-mounted
+element from the component instead.
+
+**The assistant's floating button and `<main>`'s `pb-24` are one pair.**
+The button is `fixed` over the scroll area, so the padding is what guarantees
+page content ends above it (#102: the assistant must not hide a screen's
+primary action). Changing the button's `bottom-*` without the padding — or
+the reverse — puts it back on top of the primary action at narrow widths.

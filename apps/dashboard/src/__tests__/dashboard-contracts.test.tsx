@@ -7585,6 +7585,60 @@ describe("Per-screen assistant panel", () => {
     );
   });
 
+  // Issue #358 追補: 開いたパネルは本文の上に重なるモーダルな面である。
+  // 390px 幅では画面全体を覆うので、閉じる手段が右上のボタン 1 つだけだと
+  // 逃げ場が無い。背景・Escape・フォーカストラップ・戻りフォーカスは
+  // サイドバー Drawer (#362) と同じ `useModalSurface` の規則で揃える。
+  test("開いたアシスタントは背景・Escape・フォーカストラップを持つ", async () => {
+    mockAssistantApi();
+    await renderPanelAt("/system-understanding");
+
+    fireEvent.click(screen.getByTestId("assistant-button"));
+    const panel = await screen.findByTestId("assistant-panel");
+    expect(panel).toHaveAttribute("role", "dialog");
+    expect(panel).toHaveAttribute("aria-modal", "true");
+
+    // 開いた直後、フォーカスは面の中にある (背後の本文を操作させない)。
+    expect(panel.contains(document.activeElement)).toBe(true);
+
+    // Tab は面の中で循環する。最後の要素から進むと先頭へ戻る。
+    const focusables = Array.from(
+      panel.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ),
+    );
+    expect(focusables.length).toBeGreaterThan(1);
+    focusables[focusables.length - 1].focus();
+    fireEvent.keyDown(document, { key: "Tab" });
+    expect(document.activeElement).toBe(focusables[0]);
+
+    // 背景クリックで閉じる。
+    fireEvent.click(screen.getByTestId("assistant-backdrop"));
+    expect(screen.queryByTestId("assistant-panel")).toBeNull();
+
+    // Escape でも閉じ、閉じたらフォーカスは開くボタンへ戻る。
+    const button = screen.getByTestId("assistant-button");
+    button.focus();
+    fireEvent.click(button);
+    await screen.findByTestId("assistant-panel");
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("assistant-panel")).toBeNull());
+    expect(document.activeElement).toBe(screen.getByTestId("assistant-button"));
+  });
+
+  // Issue #102: アシスタントは画面の主操作を隠さない。浮いているボタンの
+  // 位置と `<main>` の予約余白 (`pb-24`) は対で意味を持つ。
+  test("閉じているボタンは狭い画面で端へ寄り、本文の予約余白と対応する", async () => {
+    mockAssistantApi();
+    await renderPanelAt("/system-understanding");
+
+    const floating = screen.getByTestId("assistant-button").parentElement!;
+    expect(floating.className).toMatch(/bottom-4/);
+    expect(floating.className).toMatch(/right-4/);
+    expect(floating.className).toMatch(/md:bottom-6/);
+    expect(floating.className).toMatch(/md:right-6/);
+  });
+
   test("closed agent button can show a snapshot notice bubble", async () => {
     const onSnapshotNoticeClick = vi.fn();
     const { AssistantPanel } = await import("@/components/assistant-panel");

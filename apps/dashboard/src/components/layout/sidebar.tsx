@@ -9,8 +9,9 @@ import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/api/auth";
 import { useSystemState } from "@/api/hooks";
+import { useModalSurface } from "@/lib/modal-surface";
 import type { UserPhase } from "@/api/types";
-import { useEffect, useRef, useState, type RefObject } from "react";
+import { useRef, useState, type RefObject } from "react";
 
 // Issue #179 introduced fixed, explicit headings (Hub / Detail views /
 // Other). Issue #257 re-groups the same routes along the phase axis instead:
@@ -183,15 +184,6 @@ function phaseGroupState(
 // points at it via `aria-controls`, so both sides must agree on one value.
 export const MOBILE_NAV_DRAWER_ID = "mobile-nav-drawer";
 
-const FOCUSABLE_SELECTOR = [
-  "a[href]",
-  "button:not([disabled])",
-  "input:not([disabled])",
-  "select:not([disabled])",
-  "textarea:not([disabled])",
-  '[tabindex]:not([tabindex="-1"])',
-].join(",");
-
 function SidebarBrand({ collapsed }: { collapsed: boolean }) {
   return (
     <>
@@ -334,68 +326,17 @@ export function Sidebar({
   const { data: systemState } = useSystemState();
   const userPhase = systemState?.user_phase;
   const drawerRef = useRef<HTMLDivElement>(null);
-  // Kept in a ref so a new inline `onNavClose` identity never tears down and
-  // re-runs the focus effect below (which would bounce focus out of the
-  // Drawer and back in on every parent re-render).
-  const onNavCloseRef = useRef(onNavClose);
-  useEffect(() => {
-    onNavCloseRef.current = onNavClose;
-  }, [onNavClose]);
 
-  // Issue #362: while the Drawer is open it is a modal surface -- Escape
-  // closes it, Tab/Shift+Tab cycle inside it, focus moves into it on open,
-  // and focus returns to the menu button on close.
-  useEffect(() => {
-    if (!navOpen) return;
-    const panel = drawerRef.current;
-    if (!panel) return;
-
-    const focusables = () =>
-      Array.from(panel.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR));
-
-    // Resolved before focus moves into the Drawer, so the cleanup below
-    // restores the element the developer actually came from (normally the
-    // header's menu button, which is what opened the Drawer).
-    const previouslyFocused = document.activeElement;
-    const returnFocusTarget =
-      returnFocusRef?.current
-      ?? (previouslyFocused instanceof HTMLElement ? previouslyFocused : null);
-
-    (focusables()[0] ?? panel).focus();
-
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        onNavCloseRef.current?.();
-        return;
-      }
-      if (event.key !== "Tab") return;
-      const items = focusables();
-      if (items.length === 0) {
-        event.preventDefault();
-        panel.focus();
-        return;
-      }
-      const first = items[0];
-      const last = items[items.length - 1];
-      const active = document.activeElement;
-      if (event.shiftKey) {
-        if (active === first || !panel.contains(active)) {
-          event.preventDefault();
-          last.focus();
-        }
-      } else if (active === last || !panel.contains(active)) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-
-    document.addEventListener("keydown", onKeyDown);
-    return () => {
-      document.removeEventListener("keydown", onKeyDown);
-      if (returnFocusTarget && returnFocusTarget.isConnected) returnFocusTarget.focus();
-    };
-  }, [navOpen, returnFocusRef]);
+  // Issue #362: 開いている間の Drawer はモーダルな面 -- Escape で閉じ、
+  // Tab / Shift+Tab は中で循環し、開いたら中へ、閉じたらメニューボタンへ
+  // フォーカスが戻る。同じ規則をアシスタントパネルも使うので、実装は
+  // `lib/modal-surface.ts` に 1 つだけ置く。
+  useModalSurface({
+    open: navOpen,
+    onClose: () => onNavClose?.(),
+    panelRef: drawerRef,
+    returnFocusRef,
+  });
 
   const groups: NavGroup[] = isAdmin
     ? NAV_GROUPS.map((g, i) =>
