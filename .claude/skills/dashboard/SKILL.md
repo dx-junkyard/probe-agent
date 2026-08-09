@@ -573,3 +573,85 @@ data across Systems.
 - Tests: `src/__tests__/understanding-brief.test.tsx`, plus the Interview page
   group in `dashboard-contracts.test.tsx` (which routes
   `/interview/understanding-brief` through `mockInterviewApi`).
+
+## Interview コックピット (issue #356)
+
+The Interview page's overview layer, on top of #349's state machine and
+#351's Brief. Page heading is 「インタビュー・コックピット」.
+
+- `components/system-understanding/cockpit/model.ts` is the ONLY place that
+  aggregates or classifies. It is pure (no React, no API client) and unit
+  tested; display components render its output and must not re-derive a
+  category status, a completion number, a priority order, or an action's
+  availability. Adding backend endpoints for this page is out of scope —
+  every number comes from responses the page already fetches.
+- The category status set is EXACTLY `confirmed`/`review`/`missing` (issue §3)
+  — never add a fourth value for a data-availability condition. A status that
+  cannot be settled is `status: null` (label withheld), and the availability
+  itself lives on the separate `qaFetchStatus` axis.
+- The five categories, their status, and the
+  completion percentage are deterministic: content presence, exact-name gap
+  matching (same rule as `understanding_diff`), then `gap_type`'s default
+  category. No similarity, no keyword scoring. `vision` is an optional key
+  (#352) — a response without it must render as 未設定, never crash.
+- Q&A progress must satisfy 回答済み + 確認待ち + 未回答 = 合計. ONLY
+  `answered` and `revised` (superseded history) leave the unresolved list and
+  the total. **`skipped` is not resolved** — server-side it is the temporary
+  「後で回答」 state that `resume` puts straight back to `open`
+  (`routes/interview.py`), so it counts as 未回答 (re-stated as a 「後で回答
+  N 件」 breakdown and a row marker). Excluding it makes a session with
+  unanswered questions read as 未解決 0 件 / 完成度 100%. `open_questions` and
+  `interview_qa` rows are MERGED by `qa_id` (then question text), never
+  "keep the first, drop the rest": only the `interview_qa` row carries state
+  — skip/resume never touch the `session.open_questions` JSON — so the Q&A
+  row's `unconfirmed`/`deferred` and its state-derived priority must be
+  applied to the surviving row, and a question the Q&A side reports as
+  `answered`/`revised` leaves the list even if `open_questions` still lists it.
+- **0 件 and 「取得できていない」 are different displays.** Question totals,
+  unresolved counts, and Q&A progress rest solely on `GET
+  /interview/sessions/{id}/qa`; pass its query state in as
+  `qaFetchStatus` (`ready`/`loading`/`unavailable`). When it is not `ready`:
+  `model.qa` is `null` (never a zeroed progress object), `completionPercent`
+  is `null` (no progress bar, a reason instead), a category that would be
+  `confirmed` only because no question is outstanding gets `status: null`
+  (the card shows 「Q&A 未取得のため保留」 instead of a status badge), the
+  要確認 count is rendered as 「N 件以上」 (`countsSettled: false`) because 0
+  would read as "nothing to do", and the Q&A card plus the map both offer a
+  retry. `missing` and `review` are decided from the session detail alone, so
+  they keep their normal 3-value badges.
+- The detail pane's 「修正するには」 entries only scroll + focus an existing
+  panel via `cockpit/navigation.ts`. Targets are an ordered candidate list
+  (`unresolvedTargets()` + `focusFirstCockpitTarget()`), never one fixed id:
+  anything tied to a specific question must target that question's row
+  (`qa-item-<id>`) first and fall back to `work-surface-W3` / the unresolved
+  list only when the row is not rendered. Focusing the work surface's first
+  button sends the developer to a different question than the one they
+  picked. Never reimplement answering, editing, or evidence display there.
+  Unavailable entries stay visible as disabled + reason — this is the one
+  deliberate exception to 原則 P3, which governs a state's PRIMARY action,
+  not guidance about how to fix an item.
+- Availability is decided from the server's workflow state (`W2`/`W3`/`W4`
+  for editing, `W3` for answering). Do not re-derive the state.
+- Placement is part of the contract: the status summary is full-width ABOVE
+  the two-column grid (so it does not move when the right column wraps), the
+  Brief stays at the top of the main column (#351), the map sits directly
+  under it, unresolved items + Q&A progress sit BELOW the state's work
+  surface, and the detail pane heads the right column with the session-info
+  card (participants / last update / evidence counts / save state) replacing
+  the old 「セッション #id」 card rather than adding a second one.
+- A failed 「セッション一覧」/「セッション詳細」 query must render the
+  `interview-load-error` card (failed target + server reason + 再試行), never
+  an empty body: without either query the page has nothing to draw, and the
+  old silent-blank behaviour hid both the failure and the next step.
+- Accessibility requirements, not styling: map cards are native `<button>`s
+  with `aria-pressed`; every status is text as well as colour; the donut has
+  `role="img"` + a full `aria-label` and the same numbers in a text list; the
+  progress bar carries `role="progressbar"` + `aria-valuenow`.
+- The `/interview-mock` route and `pages/interview-mock.tsx` were deleted
+  with this implementation. Do not reintroduce a static mock page.
+- Tests: `src/__tests__/interview-cockpit.test.tsx` (model + components) and
+  the Interview page group in `dashboard-contracts.test.tsx`. Interview page
+  queries in that file must be scoped (e.g. `within(...
+  interview-proposal-card)`) — the cockpit's disabled reasons quote workflow
+  state labels, so a bare `/承認/` or `/編集/` role query now matches more
+  than one button.

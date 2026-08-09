@@ -534,6 +534,74 @@ creating incomplete persistence or execution paths for later phases.
       is not a precondition of the workflow.
     Human gates are unchanged; this epic writes nothing at all.
 
+18. Issue #356 — the Interview cockpit: the overview layer on top of #349's
+    state machine and #351's Brief, so the developer can see how far the
+    interview has got, which understanding categories are settled, and how to
+    fix the one they picked. Dashboard-only; it adds no backend endpoint and
+    reuses the existing queries, mutations, and permission handling. What it
+    added, and what any later change must preserve:
+    - `components/system-understanding/cockpit/model.ts` is the single place
+      that aggregates or classifies, and it is pure (no React, no API
+      client). Display components render its output; they never re-derive a
+      category status, the completion number, the unresolved ordering, or an
+      action's availability.
+    - The five categories (Vision / System purpose / Capabilities / API
+      boundaries / Probe flow) map onto `CurrentUnderstanding` sections by a
+      fixed table, and their `confirmed`/`review`/`missing` status is
+      deterministic: content presence, then gap attribution by EXACT name
+      equality (same rule as `understanding_diff`), then the `gap_type`'s
+      default category. No similarity, no keyword scoring. `vision` is an
+      optional key (#352), so a response without it renders as 未設定.
+    - Completion is computed from those five statuses (confirmed=1 /
+      review=0.5 / missing=0), never a fixed value and never a composite
+      confidence percentage — it is a count of settled categories, which is
+      why it does not violate #353's no-confidence-percentage rule.
+    - Q&A progress always satisfies 回答済み + 確認待ち + 未回答 = 合計.
+      Only `answered` and `revised` (superseded history) leave the total and
+      the unresolved list; `skipped` is the temporary 「後で回答」 state that
+      `resume` returns to `open`, so it counts as 未回答 — excluding it made a
+      session with unanswered questions read as 未解決 0 件 / 完成度 100%.
+      `open_questions` / `interview_qa` rows are MERGED by `qa_id` (then
+      question text), not first-wins: only the `interview_qa` row carries
+      state (skip/resume never touch `session.open_questions`), so its
+      `unconfirmed`/`deferred` and state-derived priority apply to the
+      surviving row, and a question already `answered` on the Q&A side leaves
+      the list.
+    - The category status set is EXACTLY `confirmed`/`review`/`missing` —
+      never add a fourth value for a data-availability condition.
+    - 0 件 and 「取得できていない」 are different displays. The Q&A query's
+      state is a separate axis fed in as `qaFetchStatus`; when it is not
+      `ready`, `model.qa` and `completionPercent` are `null` (no zeroed
+      counts, no progress bar), a category that would be `confirmed` only
+      because no question is outstanding carries `status: null` (its badge is
+      withheld for a 「Q&A 未取得のため保留」 note), 要確認 renders as
+      「N 件以上」 since it is only a lower bound, and both the Q&A card and
+      the map offer a retry. `missing`/`review` are decided from the session
+      detail alone, so they keep their normal badges.
+    - The detail pane's 「修正するには」 only scrolls + focuses an existing
+      panel (`change-set-panel` / `understanding-brief`, and for anything tied
+      to a question that question's own `qa-item-<id>` row, falling back to
+      `work-surface-W3` only when the row is not rendered — the work surface's
+      first button belongs to a different question).
+      Unavailable entries stay visible as disabled + reason — the one
+      deliberate exception to 原則 P3, which governs a state's PRIMARY action,
+      not guidance about how to fix an item. Availability is decided from the
+      server's workflow state; the state is never re-derived client-side.
+    - A failed session-list / session-detail query renders the
+      `interview-load-error` card (failed target, server reason, 再試行), never
+      an empty page body.
+    - Placement is contract, not styling: the status summary is full-width
+      above the two-column grid, the Brief keeps the top of the main column,
+      the map sits under it, unresolved items + Q&A progress sit BELOW the
+      state's work surface, and the detail pane heads the right column with
+      the session-info card replacing (not duplicating) the old
+      「セッション #id」 card.
+    - `/interview-mock` and `pages/interview-mock.tsx` were deleted with this
+      implementation. Do not reintroduce a static mock page.
+    Human gates, the #349 state machine, and the #351 Brief rules are
+    unchanged. See the Issue #356 sections in
+    `docs/project-intelligence.md` and `docs/system-interview-workflow-ux.md`.
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,
