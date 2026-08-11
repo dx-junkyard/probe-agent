@@ -83,16 +83,51 @@
           "maxItems": 50
         },
         "outcome_premise_state": {
+          "description": "The premise verdict evaluated when the outcome was recorded. 'fresh' is the pre-#337 value and is read-only: rows closed before premise tracking existed keep it, and it is never produced again.",
           "oneOf": [
             { "type": "null" },
-            { "enum": ["fresh", "stale"] }
+            { "enum": ["current", "stale", "missing", "invalid", "fresh"] }
           ]
         },
-        "premise_state": { "enum": ["fresh", "stale"] },
+        "outcome_premise_reason": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/premise_reason" }
+          ]
+        },
+        "closed_by_actor_kind": {
+          "description": "Issue #337: whether an authenticated human closed the session, resolved from the request's Principal rather than its body. A close is a manual decision; an outcome whose decider cannot be recovered is not an audit record.",
+          "oneOf": [
+            { "type": "null" },
+            { "enum": ["user", "system", "legacy"] }
+          ]
+        },
+        "closed_by_username": { "type": ["string", "null"], "maxLength": 200 },
+        "premise_state": {
+          "description": "Issue #337: the finite premise verdict, evaluated from the shared Issue #308 premise bundle rather than from the pinned snapshot id alone. Only 'current' permits hypothesis_adopted / decided / reflux. 'missing' (a premise that was captured and has since disappeared) and 'invalid' (no comparable bundle was ever captured) both used to report as 'fresh' -- a premise that cannot be found is not a premise that still holds.",
+          "enum": ["current", "stale", "missing", "invalid"]
+        },
+        "premise_reason": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/premise_reason" }
+          ]
+        },
         "premise_snapshot_id": {
           "type": ["integer", "null"],
           "description": "The repository snapshot this session's investigation is pinned to, captured at creation (same discipline as an Inquiry's premise bundle, Issue #308). Never rebased onto a newer snapshot mid-session."
         },
+        "premise_commit_sha": {
+          "type": ["string", "null"],
+          "maxLength": 64,
+          "description": "The commit the investigation actually read. This -- not the snapshot id -- is what decides staleness: the same commit re-pinned under a new snapshot row is the same premise (Issue #323's rule applied to the snapshot axis)."
+        },
+        "premise_revision_id": {
+          "type": ["integer", "null"],
+          "description": "The Understanding revision the origin item was built from. Captured for audit and for the hypothesis re-confirmation lineage; deliberately NOT an input to the staleness verdict, since rebuilding the Understanding does not invalidate a conversation about code that did not move."
+        },
+        "premise_tracking_version": { "type": ["string", "null"], "maxLength": 64 },
+        "premise_captured_at": { "type": ["number", "null"] },
         "schema_version": { "const": "joint-understanding-v1" },
         "created_at": { "type": "number" },
         "updated_at": { "type": "number" },
@@ -105,7 +140,7 @@
             "properties": {
               "outcome": { "enum": ["understood", "doubt_resolved", "hypothesis_adopted", "decided", "handed_off", "abandoned"] },
               "closed_at": { "type": "number" },
-              "outcome_premise_state": { "enum": ["fresh", "stale"] }
+              "outcome_premise_state": { "enum": ["current", "stale", "missing", "invalid", "fresh"] }
             },
             "required": ["outcome", "closed_at", "outcome_premise_state"]
           },
@@ -204,9 +239,38 @@
           "description": "The reasoning run that produced this finding. Always null for origin_role=developer."
         },
         "is_mock": { "type": "boolean" },
+        "producer_kind": {
+          "enum": ["investigation_loop", "translator", "developer_api", "legacy"],
+          "description": "Issue #337: WHICH code path wrote this row, as distinct from whose voice it speaks in (origin_role). Resolved from the route, never from the request body: the public findings endpoint can only produce 'developer_api', and 'investigation'/'translation' rows exist only because their internal producer wrote them after validating every citation against the pinned snapshot. 'legacy' is read-only -- what a row written before provenance was recorded reports."
+        },
+        "actor_kind": {
+          "enum": ["user", "system", "legacy"],
+          "description": "Issue #337: whether an authenticated human stands behind this row, resolved from the request's Principal. 'legacy' is unknown and is never assumed to be a human."
+        },
+        "actor_username": { "type": ["string", "null"], "maxLength": 200 },
         "created_at": { "type": "number" }
       },
       "allOf": [
+        {
+          "if": { "properties": { "producer_kind": { "enum": ["investigation_loop", "translator"] } }, "required": ["producer_kind"] },
+          "then": {
+            "properties": {
+              "actor_kind": { "const": "system" },
+              "actor_username": { "type": "null" }
+            },
+            "description": "A system-produced record never names a human actor."
+          }
+        },
+        {
+          "if": { "properties": { "producer_kind": { "const": "developer_api" } }, "required": ["producer_kind"] },
+          "then": {
+            "properties": {
+              "origin_role": { "const": "developer" },
+              "actor_kind": { "const": "user" }
+            },
+            "description": "A producer writes only its own origin_role, and a developer record always has a human actor."
+          }
+        },
         {
           "if": { "properties": { "origin_role": { "const": "translation" } }, "required": ["origin_role"] },
           "then": {
@@ -265,6 +329,20 @@
         }
       ]
     },
+    "premise_reason": {
+      "enum": [
+        "premise_not_captured",
+        "premise_incomplete",
+        "pinned_snapshot_removed",
+        "origin_removed",
+        "origin_superseded",
+        "pinned_commit_changed",
+        "origin_content_changed",
+        "capability_scope_changed",
+        "linked_intent_changed"
+      ],
+      "description": "Issue #337: the single finite reason behind a non-'current' premise verdict, in first-match order. Split by recovery path: a stale premise can be re-investigated, a missing one cannot be recovered at all, and an uncaptured one was never comparable."
+    },
     "evidence": {
       "type": "object",
       "required": ["path", "start_line", "end_line"],
@@ -307,7 +385,13 @@
           ],
           "description": "The finite set of next understanding actions offered to the developer. Choosing one records intent to continue the conversation -- it never approves, adopts, or decides the origin item by itself."
         },
-        "actor": { "type": ["string", "null"], "maxLength": 200 },
+        "actor": {
+          "type": ["string", "null"],
+          "maxLength": 200,
+          "description": "A caller-supplied display label. Issue #337: it is NOT the identity -- actor_kind/actor_username below come from the authenticated Principal, so a request body can no longer attribute an action to someone else."
+        },
+        "actor_kind": { "enum": ["user", "system", "legacy"] },
+        "actor_username": { "type": ["string", "null"], "maxLength": 200 },
         "note": { "type": ["string", "null"], "maxLength": 2000 },
         "decision_method": {
           "const": "manual",
