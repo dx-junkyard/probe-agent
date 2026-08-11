@@ -60,6 +60,7 @@ import { ObservationProposalPanel } from "@/components/system-understanding/obse
 import { ChangeSetPanel } from "@/components/system-understanding/change-set-panel";
 import { InquiryPanel, ROUTE_CATEGORY_LABELS } from "@/components/system-understanding/inquiry-panel";
 import { JointUnderstandingPanel } from "@/components/system-understanding/joint-understanding-panel";
+import { findOpenJointSession } from "@/components/system-understanding/joint-understanding-entry";
 import { RefreshStatusChip } from "@/components/system-understanding/refresh-status-chip";
 import { InterviewMetricsPanel } from "@/components/system-understanding/interview-metrics-panel";
 // Issue #356: インタビュー・コックピット。全体像 (完成度・理解の全体マップ・
@@ -628,17 +629,10 @@ function QaItemCard({
     answerUnknown.isPending || investigate.investigatingQaId === qa.id;
 
   const [jointId, setJointId] = useState<number | null>(null);
-  // Issue #336: match on `current_origin_id` as well as `origin_id`.
-  // `interview_qa` corrects additively, so an answer revision gives this card a
-  // NEW row id while the session still points at the row the conversation
-  // started from — matching on `origin_id` alone made the whole conversation
-  // disappear from the card the moment its question got a revision.
-  const activeJoint = (jointList.data?.items ?? []).find(
-    item =>
-      item.origin_kind === "qa"
-      && item.status !== "closed"
-      && (item.origin_id === qa.id || item.current_origin_id === qa.id),
-  );
+  // Issue #336: one shared matching rule (see findOpenJointSession) — it has to
+  // account for `interview_qa`'s additive corrections, and two copies of that
+  // would drift.
+  const activeJoint = findOpenJointSession(jointList.data?.items, "qa", qa.id);
   const openJointId = jointId ?? activeJoint?.id ?? null;
 
   const startJointUnderstanding = () => {

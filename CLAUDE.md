@@ -454,6 +454,15 @@ creating incomplete persistence or execution paths for later phases.
       completed by an endpoint OUTSIDE this feature. Recording an action is
       intent, never completion — that distinction previously had no
       machine-readable form.
+    - `components/system-understanding/joint-understanding-entry.tsx` is the
+      single UI entry point for the Intent / Review item / Inquiry origins (the
+      Q&A card keeps its own wiring because the 「わからない」 flow auto-opens the
+      panel from a server response). `findOpenJointSession` is exported and
+      shared because its rule has a subtlety that must not be reimplemented:
+      matching on `origin_id` alone made the conversation vanish the moment the
+      item was revised, since `interview_qa` / `interview_intent_item` correct
+      additively and the session keeps pointing at the row it started from. The
+      server reports `current_origin_id` for exactly this.
 
     **#339 (implemented).** Exploration breadth, the router-aware question
     gate, and budgets that actually bind:

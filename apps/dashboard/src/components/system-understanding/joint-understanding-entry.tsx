@@ -19,8 +19,34 @@ import {
   useCreateJointUnderstanding,
   useJointUnderstandingList,
 } from "@/api/hooks";
-import type { JointUnderstandingOriginKind } from "@/api/types";
+import type {
+  JointUnderstandingOriginKind,
+  JointUnderstandingOut,
+} from "@/api/types";
 import { JointUnderstandingPanel } from "./joint-understanding-panel";
+
+/**
+ * The unfinished 共同理解 conversation for one confirmation item, if any.
+ *
+ * Exported and shared because the rule has a subtlety that must not be
+ * reimplemented per call site: `interview_qa` and `interview_intent_item`
+ * correct additively, so an edit gives the item a NEW row id while the session
+ * still points at the row the conversation started from. Matching on
+ * `origin_id` alone made the conversation vanish the moment the item was
+ * revised (Issue #336), and two copies of that rule would drift.
+ */
+export function findOpenJointSession(
+  items: JointUnderstandingOut[] | undefined,
+  originKind: JointUnderstandingOriginKind,
+  originId: number,
+): JointUnderstandingOut | undefined {
+  return (items ?? []).find(
+    item =>
+      item.origin_kind === originKind
+      && item.status !== "closed"
+      && (item.origin_id === originId || item.current_origin_id === originId),
+  );
+}
 
 export function JointUnderstandingEntry({
   sessionId,
@@ -41,16 +67,7 @@ export function JointUnderstandingEntry({
   const create = useCreateJointUnderstanding(sessionId);
   const [openId, setOpenId] = useState<number | null>(null);
 
-  // Match on `current_origin_id` too: `interview_qa` and
-  // `interview_intent_item` correct additively, so an edit gives the item a NEW
-  // row id while the session still points at the row the conversation started
-  // from (Issue #336).
-  const active = (list.data?.items ?? []).find(
-    item =>
-      item.origin_kind === originKind
-      && item.status !== "closed"
-      && (item.origin_id === originId || item.current_origin_id === originId),
-  );
+  const active = findOpenJointSession(list.data?.items, originKind, originId);
   const panelId = openId ?? active?.id ?? null;
 
   const start = () => {
