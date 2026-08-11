@@ -113,11 +113,18 @@ describe("Components page trace details", () => {
     expect(screen.getByRole("button", {
       name: "Trace trace-1234567890 の詳細を隠す",
     })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("trace-1234567890")).toBeInTheDocument();
+
+    // Issue #367: opening a trace row no longer renders the payload. The
+    // audited leak was a JsonTree auto-expanded straight onto an API key, so
+    // the values now need one more deliberate step.
+    expect(screen.queryByText("ValidationError: missing customer")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText("入出力の中身を表示"));
+
     fireEvent.click(screen.getByRole("button", { name: /0.*object/ }));
     expect(screen.getByText(/order-42/)).toBeInTheDocument();
     expect(screen.getByText("{'valid': False}")).toBeInTheDocument();
     expect(screen.getByText("ValidationError: missing customer")).toBeInTheDocument();
-    expect(screen.getByText("trace-1234567890")).toBeInTheDocument();
 
     await waitFor(() => {
       const componentRefreshes = mockApi.get.mock.calls.filter(([path]) => path === "/components");
@@ -10282,7 +10289,8 @@ describe("Dashboard action gating (Issue #255)", () => {
     fireEvent.change(nameInput, { target: { value: "my-new-token" } });
 
     expect(screen.getByTestId("issue-token-no-system-reason")).toBeInTheDocument();
-    const issueButton = screen.getByRole("button", { name: "Issue Token" });
+    // Issue #368/#374: the CTA label follows CLAUDE.md's Dashboard UI言語規約.
+    const issueButton = screen.getByRole("button", { name: "Token を発行" });
     expect(issueButton).toBeDisabled();
 
     // Even though the name is filled in, clicking the disabled button must
@@ -11126,7 +11134,7 @@ describe("Overview get-started per-step completion (Issue #267)", () => {
   });
 
   test("marks step 3 done once at least one SDK token has been issued", async () => {
-    mockOverview267({ tokens: [{ id: 1, name: "svc", kind: "api", system_id: 1, user_id: 1, created_at: 1, expires_at: null, revoked: false }] });
+    mockOverview267({ tokens: [{ id: 1, name: "svc", kind: "api", system_id: 1, user_id: 1, created_at: 1, expires_at: null, revoked: false, status: "active", expires_in_seconds: null }] });
     const { default: OverviewPage } = await import("@/pages/overview");
     render(<OverviewPage />, { wrapper: createWrapper() });
 
@@ -11136,7 +11144,7 @@ describe("Overview get-started per-step completion (Issue #267)", () => {
   });
 
   test("does not mark step 3 done from a session-kind token alone (login session, not an SDK token)", async () => {
-    mockOverview267({ tokens: [{ id: 2, name: "login session", kind: "session", system_id: null, user_id: 1, created_at: 1, expires_at: null, revoked: false }] });
+    mockOverview267({ tokens: [{ id: 2, name: "login session", kind: "session", system_id: null, user_id: 1, created_at: 1, expires_at: null, revoked: false, status: "active", expires_in_seconds: null }] });
     const { default: OverviewPage } = await import("@/pages/overview");
     render(<OverviewPage />, { wrapper: createWrapper() });
 
@@ -11148,8 +11156,8 @@ describe("Overview get-started per-step completion (Issue #267)", () => {
   test("does not mark step 3 done from a revoked or expired SDK token", async () => {
     mockOverview267({
       tokens: [
-        { id: 3, name: "revoked-svc", kind: "api", system_id: 1, user_id: 1, created_at: 1, expires_at: null, revoked: true },
-        { id: 4, name: "expired-svc", kind: "api", system_id: 1, user_id: 1, created_at: 1, expires_at: 1, revoked: false },
+        { id: 3, name: "revoked-svc", kind: "api", system_id: 1, user_id: 1, created_at: 1, expires_at: null, revoked: true, status: "revoked", expires_in_seconds: null },
+        { id: 4, name: "expired-svc", kind: "api", system_id: 1, user_id: 1, created_at: 1, expires_at: 1, revoked: false, status: "expired", expires_in_seconds: 0 },
       ],
     });
     const { default: OverviewPage } = await import("@/pages/overview");
@@ -11161,7 +11169,7 @@ describe("Overview get-started per-step completion (Issue #267)", () => {
   });
 
   test("does not mark step 3 done from an SDK token scoped to a different System", async () => {
-    mockOverview267({ tokens: [{ id: 5, name: "other-system-svc", kind: "api", system_id: 2, user_id: 1, created_at: 1, expires_at: null, revoked: false }] });
+    mockOverview267({ tokens: [{ id: 5, name: "other-system-svc", kind: "api", system_id: 2, user_id: 1, created_at: 1, expires_at: null, revoked: false, status: "active", expires_in_seconds: null }] });
     const { default: OverviewPage } = await import("@/pages/overview");
     render(<OverviewPage />, { wrapper: createWrapper() });
 

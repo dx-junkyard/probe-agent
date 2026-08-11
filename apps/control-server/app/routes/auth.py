@@ -35,6 +35,7 @@ from ..security import (
     validate_production_password,
     verify_password,
 )
+from ..token_status import classify_token_status, token_expires_in_seconds
 
 router = APIRouter()
 
@@ -52,16 +53,27 @@ def _user_out(row) -> UserOut:
     )
 
 
-def _token_out(row) -> TokenOut:
+def _token_out(row, now: Optional[float] = None) -> TokenOut:
+    """Issue #368: `status` is decided here, not by the client.
+
+    `now` is passed in so every row of one response is classified against a
+    single instant -- otherwise a long list could straddle the expiry of one of
+    its own rows.
+    """
+    at = time.time() if now is None else now
+    revoked = bool(row["revoked"])
+    expires_at = row["expires_at"]
     return TokenOut(
         id=row["id"],
         name=row["name"],
         kind=row["kind"],
         user_id=row["user_id"],
         system_id=row["system_id"],
-        revoked=bool(row["revoked"]),
+        revoked=revoked,
         created_at=row["created_at"],
-        expires_at=row["expires_at"],
+        expires_at=expires_at,
+        status=classify_token_status(revoked=revoked, expires_at=expires_at, now=at),
+        expires_in_seconds=token_expires_in_seconds(expires_at=expires_at, now=at),
     )
 
 
@@ -407,7 +419,8 @@ def list_my_tokens(principal: Principal = Depends(require_user)) -> List[TokenOu
             f"SELECT {_TOKEN_COLUMNS} FROM api_tokens WHERE user_id = ? ORDER BY id",
             (principal.user_id,),
         ).fetchall()
-    return [_token_out(r) for r in rows]
+    now = time.time()
+    return [_token_out(r, now) for r in rows]
 
 
 @router.post("/tokens/me", response_model=TokenCreateResponse, status_code=201)
@@ -460,7 +473,8 @@ def list_tokens(_: Principal = Depends(require_admin)) -> List[TokenOut]:
         rows = conn.execute(
             f"SELECT {_TOKEN_COLUMNS} FROM api_tokens ORDER BY id"
         ).fetchall()
-    return [_token_out(r) for r in rows]
+    now = time.time()
+    return [_token_out(r, now) for r in rows]
 
 
 @router.post("/tokens", response_model=TokenCreateResponse, status_code=201)

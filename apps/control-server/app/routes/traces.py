@@ -4,6 +4,8 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from probe_agent.replay_capture import PARTIAL, REASON_REDACTED, REPLAYABLE
+
 from ..auth import Principal, get_principal, get_system_id
 from ..db import get_conn
 from ..models import ProjectionOut, TraceEvent
@@ -12,6 +14,7 @@ from ..resource_limits import (
     enforce_trace_rate_limit,
     trace_storage_limits,
 )
+from ..trace_redaction import redact_trace_payload
 
 router = APIRouter()
 
@@ -23,23 +26,56 @@ def _utf8_size(value) -> int:
 
 
 def _trace_values(event: TraceEvent) -> dict:
+    """Serialise one event for storage, redacting first (Issue #367).
+
+    Redaction happens here, on the write path, so no consumer can reintroduce
+    the leak by forgetting to mask: the plaintext never reaches disk.
+
+    A capture the server had to redact can no longer restore the original call
+    inputs, so its replayability is degraded to ``partial`` with the SDK's own
+    ``redacted`` reason code rather than left claiming ``replayable``. The
+    degradation is one-directional -- it never upgrades a classification the
+    SDK made, and an already ``unreplayable`` capture stays unreplayable.
+    """
+    result = redact_trace_payload(
+        input_value=event.input,
+        output=event.output,
+        error=event.error,
+        input_capture=event.input_capture,
+    )
+
+    replayability = event.replayability
+    replay_reasons = event.replay_reasons
+    capture_redacted = any(
+        entry.field == "input_capture" for entry in result.fields
+    )
+    if capture_redacted and replayability == REPLAYABLE:
+        replayability = PARTIAL
+        replay_reasons = sorted(set(replay_reasons or []) | {REASON_REDACTED})
+    elif capture_redacted and replayability == PARTIAL:
+        replay_reasons = sorted(set(replay_reasons or []) | {REASON_REDACTED})
+
     return {
         "trace_id": event.trace_id,
         "component_id": event.component_id,
         "mode": event.mode,
-        "input_json": json.dumps(event.input, ensure_ascii=False)
-        if event.input is not None else None,
-        "output_text": event.output,
-        "error": event.error,
-        "input_capture_json": json.dumps(event.input_capture, ensure_ascii=False)
-        if event.input_capture is not None else None,
-        "replayability": event.replayability,
-        "replay_reasons_json": json.dumps(event.replay_reasons, ensure_ascii=False)
-        if event.replay_reasons is not None else None,
+        "input_json": json.dumps(result.input, ensure_ascii=False)
+        if result.input is not None else None,
+        "output_text": result.output,
+        "error": result.error,
+        "input_capture_json": json.dumps(result.input_capture, ensure_ascii=False)
+        if result.input_capture is not None else None,
+        "replayability": replayability,
+        "replay_reasons_json": json.dumps(replay_reasons, ensure_ascii=False)
+        if replay_reasons is not None else None,
         # Issue #290 Finding 5: optional deployment provenance reported by
         # the SDK (PROBE_ENVIRONMENT / PROBE_GIT_SHA); None when unset.
         "environment": event.environment,
         "git_sha": event.git_sha,
+        # Always recorded, even for a clean payload: a NULL must keep meaning
+        # "never scanned" so the operational rescan can find exactly the rows
+        # that predate this feature.
+        "redaction_json": json.dumps(result.summary(), ensure_ascii=False),
     }
 
 
@@ -55,7 +91,7 @@ def _stored_trace_bytes(row) -> int:
     return 16 + sum(_utf8_size(row[key]) for key in (
         "trace_id", "component_id", "mode", "input_json", "output_text",
         "error", "input_capture_json", "replayability", "replay_reasons_json",
-        "environment", "git_sha",
+        "environment", "git_sha", "redaction_json",
     ))
 
 
@@ -75,6 +111,7 @@ def _current_trace_usage(conn, system_id: int) -> tuple[int, int]:
                     + length(CAST(COALESCE(replay_reasons_json, '') AS BLOB))
                     + length(CAST(COALESCE(environment, '') AS BLOB))
                     + length(CAST(COALESCE(git_sha, '') AS BLOB))
+                    + length(CAST(COALESCE(redaction_json, '') AS BLOB))
                   ), 0) AS trace_bytes
            FROM traces WHERE system_id = ?""",
         (system_id,),
@@ -245,7 +282,7 @@ def post_trace(
             previous = conn.execute(
             """SELECT trace_id, component_id, mode, input_json, output_text, error,
                       input_capture_json, replayability, replay_reasons_json,
-                      environment, git_sha
+                      environment, git_sha, redaction_json
                FROM traces WHERE system_id = ? AND trace_id = ?""",
             (system_id, event.trace_id),
             ).fetchone()
@@ -283,8 +320,8 @@ def post_trace(
                     (system_id, trace_id, component_id, mode, input_json, output_text,
                      error, duration_ms, timestamp,
                      input_capture_json, replayability, replay_reasons_json,
-                     environment, git_sha)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     environment, git_sha, redaction_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     system_id,
@@ -301,6 +338,7 @@ def post_trace(
                     values["replay_reasons_json"],
                     values["environment"],
                     values["git_sha"],
+                    values["redaction_json"],
                 ),
             )
             _write_lineage(conn, system_id, event)
@@ -333,6 +371,166 @@ def post_trace(
         "trace_id": event.trace_id,
         "sdk_transport_observed": event.sdk_transport is not None,
     }
+
+
+@router.get("/traces/redaction-audit")
+def trace_redaction_audit(system_id: int = Depends(get_system_id)) -> dict:
+    """Report how much stored trace data predates ingestion-time redaction.
+
+    Issue #367: rows written before this feature existed were never scanned,
+    so they are the population that may still hold plaintext credentials.
+    ``unscanned_rows`` counts them; ``findings`` re-runs the scan over them
+    *read-only* so an operator can size the problem -- and decide which
+    credentials to rotate -- before changing any data. The endpoint never
+    returns a matched value, only the rule that matched and where.
+    """
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT trace_id, component_id, timestamp, input_json, output_text,
+                      error, input_capture_json, redaction_json
+               FROM traces WHERE system_id = ?
+               ORDER BY timestamp DESC""",
+            (system_id,),
+        ).fetchall()
+
+    findings = []
+    unscanned = 0
+    for row in rows:
+        if row["redaction_json"] is not None:
+            # Already carries a server-side audit summary: it was scanned.
+            continue
+        unscanned += 1
+        result = _rescan_row(row)
+        if result.redacted:
+            findings.append(
+                {
+                    "trace_id": row["trace_id"],
+                    "component_id": row["component_id"],
+                    "timestamp": row["timestamp"],
+                    "rules": result.rules,
+                    "fields": sorted({entry.field for entry in result.fields}),
+                }
+            )
+    return {
+        "system_id": system_id,
+        "total_rows": len(rows),
+        "unscanned_rows": unscanned,
+        "affected_rows": len(findings),
+        "rules": sorted({rule for f in findings for rule in f["rules"]}),
+        "findings": findings,
+    }
+
+
+@router.post("/traces/redaction-rescan")
+def trace_redaction_rescan(
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(get_principal),
+) -> dict:
+    """Rewrite stored traces that still hold unredacted credentials.
+
+    Deliberately a separate, explicit operation rather than a startup
+    migration: it destroys data (that is the point), and rotating the exposed
+    credential must happen too -- see ``docs/secret-redaction.md``. Rewriting
+    is idempotent, and a row that needed no change keeps its bytes.
+    """
+    rewritten = 0
+    scanned = 0
+    rules: set = set()
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = conn.execute(
+                """SELECT trace_id, input_json, output_text, error,
+                          input_capture_json, replayability, replay_reasons_json,
+                          redaction_json
+                   FROM traces WHERE system_id = ? AND redaction_json IS NULL""",
+                (system_id,),
+            ).fetchall()
+            for row in rows:
+                scanned += 1
+                result = _rescan_row(row)
+                summary = result.summary()
+                if not result.redacted:
+                    # Nothing to remove; mark it scanned so a later audit does
+                    # not keep re-reporting a clean row as unverified.
+                    conn.execute(
+                        """UPDATE traces SET redaction_json = ?
+                           WHERE system_id = ? AND trace_id = ?""",
+                        (json.dumps(summary, ensure_ascii=False),
+                         system_id, row["trace_id"]),
+                    )
+                    continue
+                rules.update(result.rules)
+                capture_redacted = any(
+                    entry.field == "input_capture" for entry in result.fields
+                )
+                replayability = row["replayability"]
+                reasons = _load_json_or_none(row["replay_reasons_json"])
+                if capture_redacted and replayability in (REPLAYABLE, PARTIAL):
+                    replayability = PARTIAL
+                    reasons = sorted(set(reasons or []) | {REASON_REDACTED})
+                conn.execute(
+                    """UPDATE traces
+                       SET input_json = ?, output_text = ?, error = ?,
+                           input_capture_json = ?, replayability = ?,
+                           replay_reasons_json = ?, redaction_json = ?
+                       WHERE system_id = ? AND trace_id = ?""",
+                    (
+                        json.dumps(result.input, ensure_ascii=False)
+                        if result.input is not None else None,
+                        result.output,
+                        result.error,
+                        json.dumps(result.input_capture, ensure_ascii=False)
+                        if result.input_capture is not None else None,
+                        replayability,
+                        json.dumps(reasons, ensure_ascii=False)
+                        if reasons is not None else None,
+                        json.dumps(summary, ensure_ascii=False),
+                        system_id,
+                        row["trace_id"],
+                    ),
+                )
+                rewritten += 1
+            conn.execute("COMMIT")
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    return {
+        "system_id": system_id,
+        "scanned_rows": scanned,
+        "rewritten_rows": rewritten,
+        "rules": sorted(rules),
+        "performed_by_user_id": principal.user_id,
+        # The plaintext is gone from this store, but it was exposed while it
+        # was here. Rotation is the operator's job and cannot be automated.
+        "rotation_required": rewritten > 0,
+    }
+
+
+def _decode_stored_input(raw):
+    """Decode a stored ``input_json`` the same way the read path does.
+
+    A row whose column is not valid JSON is scanned as raw text rather than
+    dropped -- an unparseable payload is exactly the kind that would otherwise
+    slip past the rescan still holding a credential.
+    """
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+
+
+def _rescan_row(row):
+    """Re-run redaction over one stored row's decoded payload."""
+    return redact_trace_payload(
+        input_value=_decode_stored_input(row["input_json"]),
+        output=row["output_text"],
+        error=row["error"],
+        input_capture=_load_json_or_none(row["input_capture_json"]),
+    )
 
 
 @router.get("/sdk-transport/status")
@@ -433,7 +631,8 @@ def list_traces(
             """
             SELECT trace_id, component_id, mode, input_json, output_text,
                    error, duration_ms, timestamp,
-                   input_capture_json, replayability, replay_reasons_json
+                   input_capture_json, replayability, replay_reasons_json,
+                   redaction_json
             FROM traces
             WHERE system_id = ? AND component_id = ?
             ORDER BY timestamp DESC
@@ -458,8 +657,57 @@ def list_traces(
         # rows or components not opted in) surface as explicit nulls.
         d["input_capture"] = _load_json_or_none(d.pop("input_capture_json", None))
         d["replay_reasons"] = _load_json_or_none(d.pop("replay_reasons_json", None))
+        # Issue #367: the redaction audit summary, plus the deterministic
+        # payload shape facts the collapsed detail view shows *before* a
+        # reader expands anything (AC: type / count / size / redaction).
+        d["redaction"] = _load_json_or_none(d.pop("redaction_json", None))
+        d["payload_summary"] = _payload_summary(d["input"], d["output"], d["error"])
         result.append(d)
     return result
+
+
+def _value_kind(value) -> str:
+    """Finite type label for the collapsed trace-detail summary (Issue #367)."""
+    if value is None:
+        return "none"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, list):
+        return "list"
+    if isinstance(value, dict):
+        return "object"
+    return "unknown"
+
+
+def _payload_summary(input_value, output, error) -> dict:
+    """Deterministic size/shape facts about one trace's payload.
+
+    Computed server-side so the Dashboard can render a collapsed summary
+    without first shipping — and parsing — the whole payload it is summarising.
+    """
+
+    def describe(value, serialized: str) -> dict:
+        item_count = None
+        if isinstance(value, (list, dict)):
+            item_count = len(value)
+        return {
+            "kind": _value_kind(value),
+            "item_count": item_count,
+            "bytes": len(serialized.encode("utf-8")) if serialized else 0,
+        }
+
+    input_serialized = (
+        json.dumps(input_value, ensure_ascii=False) if input_value is not None else ""
+    )
+    return {
+        "input": describe(input_value, input_serialized),
+        "output": describe(output, output or ""),
+        "error": describe(error, error or ""),
+    }
 
 
 def _load_json_or_none(raw):

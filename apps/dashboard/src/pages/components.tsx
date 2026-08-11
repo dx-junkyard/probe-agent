@@ -18,8 +18,8 @@ import { formatTimestamp } from "@/lib/utils";
 import { cn } from "@/lib/utils";
 import { Bot } from "lucide-react";
 import { AddToWorkspaceButton } from "@/components/add-to-workspace";
-import { JsonTree } from "@/components/json-tree";
 import { ReplayabilityBadge, ReplayRowActions } from "@/components/replay-row-actions";
+import { RedactionBadge, TracePayloadPanel } from "@/components/trace-payload-panel";
 
 const MODES = ["off", "trace", "shadow"] as const;
 const EVALUATIONS = ["unknown", "better", "worse", "same"];
@@ -210,6 +210,7 @@ export default function ComponentsPage() {
                               <th className="pb-2 font-medium text-muted-foreground">Duration</th>
                               <th className="pb-2 font-medium text-muted-foreground">Status</th>
                               <th className="pb-2 font-medium text-muted-foreground">Replay</th>
+                              <th className="pb-2 font-medium text-muted-foreground">秘匿値</th>
                               <th className="pb-2 font-medium text-muted-foreground text-right">Time</th>
                             </tr>
                           </thead>
@@ -244,11 +245,14 @@ export default function ComponentsPage() {
                                     <td className="py-2">
                                       <ReplayabilityBadge replayability={t.replayability} reasons={t.replay_reasons} />
                                     </td>
+                                    <td className="py-2">
+                                      <RedactionBadge redaction={t.redaction} />
+                                    </td>
                                     <td className="py-2 text-right text-xs text-muted-foreground">{formatTimestamp(t.timestamp)}</td>
                                   </tr>
                                   {expanded && (
                                     <tr key={`${t.trace_id}-details`} className="border-b bg-muted/20">
-                                      <td colSpan={6} className="p-4">
+                                      <td colSpan={7} className="p-4">
                                         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
                                           <span className="text-xs text-muted-foreground">
                                             Trace ID（全体）: <span className="font-mono text-foreground">{t.trace_id}</span>
@@ -262,24 +266,21 @@ export default function ComponentsPage() {
                                             />
                                           </div>
                                         </div>
-                                        <div className="grid gap-4 lg:grid-cols-2">
-                                          <div className="min-w-0">
-                                            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">入力</h3>
-                                            <div className="max-h-64 overflow-auto rounded-md border bg-card p-3">
-                                              <JsonTree data={t.input} defaultExpanded />
-                                            </div>
-                                          </div>
-                                          <div className="min-w-0">
-                                            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">出力</h3>
-                                            <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border bg-card p-3 font-mono text-xs">{t.output ?? "—"}</pre>
-                                          </div>
-                                        </div>
-                                        {t.error && (
-                                          <div className="mt-4">
-                                            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-destructive">エラー</h3>
-                                            <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border border-destructive/40 bg-destructive/5 p-3 font-mono text-xs text-destructive">{t.error}</pre>
-                                          </div>
-                                        )}
+                                        {/* Issue #367: the payload stays closed
+                                            until asked for, behind its shape
+                                            and redaction state. */}
+                                        <TracePayloadPanel
+                                          input={t.input}
+                                          output={t.output}
+                                          error={t.error}
+                                          summary={t.payload_summary}
+                                          redaction={t.redaction}
+                                          replayAffected={
+                                            t.redaction?.fields?.some(
+                                              f => f.field === "input_capture",
+                                            ) ?? false
+                                          }
+                                        />
                                       </td>
                                     </tr>
                                   )}

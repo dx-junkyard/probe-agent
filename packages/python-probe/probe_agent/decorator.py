@@ -15,6 +15,7 @@ from . import context as _lineage
 from . import projection as _projection
 from . import redaction as _redaction
 from . import replay_capture as _replay
+from . import secret_patterns as _secret_patterns
 from .client import ControlClient
 from .config import ProbeConfig
 from .policy import PolicyCache
@@ -119,12 +120,39 @@ def _sensitive_arg_policy(
     return indexes, sensitive_vararg_start
 
 
-def _payload_repr(value: Any) -> str:
+def redact_text(text: str, limit: int = 4000) -> str:
+    """Apply value-shaped credential redaction, then truncate (Issue #367).
+
+    Order matters: masking runs on the full text so a secret cannot survive by
+    straddling the truncation boundary.  Never raises -- an unusable pattern
+    engine must not cost the host application its telemetry, let alone its
+    call, so a failure degrades to a placeholder rather than to raw text.
+    """
     try:
-        return _safe_repr(_redaction.redact_sensitive(value))
+        redacted, _ = _secret_patterns.redact_secret_values(text)
+    except Exception:  # noqa: BLE001 — telemetry must never break the host call
+        logger.debug("secret-pattern redaction failed", exc_info=True)
+        return "<payload-redaction-failed>"
+    if len(redacted) > limit:
+        redacted = redacted[:limit] + "...<truncated>"
+    return redacted
+
+
+def _payload_repr(value: Any) -> str:
+    """Render ``value`` for the trace payload with both redaction layers.
+
+    Layer 1 rebuilds containers *and user-defined objects* with sensitive
+    attributes masked, so ``repr`` never reaches a denied attribute.  Layer 2
+    masks known credential shapes in the rendered text, covering values whose
+    attribute name says nothing (``endpoint="https://u:pw@host"``) and custom
+    ``__repr__`` output the structural pass could not intercept.
+    """
+    try:
+        rendered = repr(_redaction.redact_for_repr(value))
     except Exception:  # noqa: BLE001 — telemetry must never break the host call
         logger.debug("payload redaction failed", exc_info=True)
         return "<payload-redaction-failed>"
+    return redact_text(rendered)
 
 
 def _serialize_input(
@@ -386,7 +414,14 @@ def probe(
                 except BaseException as e:  # noqa: BLE001
                     raised = e
                     if payload_mode == "full":
-                        error_repr = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+                        # Issue #367: an exception message/traceback is
+                        # free-form text, so only the value-shaped credential
+                        # layer can protect it -- and it is not optional,
+                        # since `full` is a verbosity choice, never a consent
+                        # to ship credentials.
+                        error_repr = redact_text(
+                            f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+                        )
                     else:
                         # Exception messages and tracebacks are free-form and
                         # cannot be structurally key-redacted.
@@ -503,7 +538,9 @@ def _spawn_shadow(
                 c_output = candidate(*args, **kwargs)
             except BaseException as e:  # noqa: BLE001
                 c_error = (
-                    f"{type(e).__name__}: {e}"
+                    # Issue #367: same rule as the main error path -- free-form
+                    # exception text gets the value-shaped credential layer.
+                    redact_text(f"{type(e).__name__}: {e}")
                     if payload_mode == "full" else type(e).__name__
                 )
             c_duration = (time.perf_counter() - c_start) * 1000.0

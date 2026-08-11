@@ -2,11 +2,14 @@ from probe_agent import redaction as R
 
 
 def test_recursive_exact_case_insensitive_denylist_is_non_mutating():
+    # Issue #367 widened SENSITIVE_KEYS (access_token is now denied); the
+    # rule itself is unchanged -- exact, case-insensitive, whole-name matches
+    # only, so a name that merely *contains* a denied word still passes.
     source = {
         "Password": "p1",
         "password_hint": "not denied",
         "nested": [
-            {"TOKEN": "t1", "access_token": "not denied"},
+            {"TOKEN": "t1", "access_token": "denied", "token_kind": "not denied"},
             ({"api_key": "k1", "id": 7},),
         ],
     }
@@ -16,7 +19,8 @@ def test_recursive_exact_case_insensitive_denylist_is_non_mutating():
     assert result["Password"] is R.REDACTED
     assert result["password_hint"] == "not denied"
     assert result["nested"][0]["TOKEN"] is R.REDACTED
-    assert result["nested"][0]["access_token"] == "not denied"
+    assert result["nested"][0]["access_token"] is R.REDACTED
+    assert result["nested"][0]["token_kind"] == "not denied"
     assert result["nested"][1][0]["api_key"] is R.REDACTED
     assert result["nested"][1][0]["id"] == 7
     assert source["Password"] == "p1"

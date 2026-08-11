@@ -13,7 +13,12 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { CodeBlock } from "@/components/code-block";
 import { getClientServerUrl } from "@/lib/env";
 import { formatTimestamp } from "@/lib/utils";
-import type { ConnectivityState } from "@/api/types";
+import {
+  FRESHNESS_LABELS,
+  FreshnessBadge,
+  FreshnessDetail,
+  LifecycleMilestone,
+} from "@/components/connectivity-freshness";
 
 // 実行形態は明示的な有限集合。開発者は自分に近いパターンを選ぶ。
 type RuntimePattern = "host" | "compose" | "image" | "external";
@@ -23,12 +28,6 @@ const PATTERN_LABELS: Record<RuntimePattern, string> = {
   compose: "同じ Docker Compose 内",
   image: "既存イメージに SDK を追加",
   external: "別リポジトリ / 外部エンドポイント",
-};
-
-const CONNECTIVITY_LABELS: Record<ConnectivityState, string> = {
-  no_signal: "シグナル未受信",
-  smoke_only: "疎通確認のみ受信",
-  receiving: "受信中",
 };
 
 // 全体の流れ(Issue #165 の 9 項目を一続きの導線として提示する)。
@@ -101,41 +100,39 @@ function ConnectivityStatusCard() {
           <p className="text-sm text-muted-foreground">読み込み中...</p>
         ) : (
           <>
+            {/* Issue #370: the headline is the LIVE reading (freshness).
+                `state` is a cumulative milestone and is shown below as
+                history — a system silent for two weeks must not read 受信中
+                just because it once connected. */}
             <div className="flex items-center gap-2">
-              {data.state === "receiving" ? (
+              {data.freshness === "receiving_now" ? (
                 <CheckCircle2 className="h-5 w-5 text-green-600" />
               ) : (
-                <AlertTriangle className={`h-5 w-5 ${data.state === "no_signal" ? "text-amber-500" : "text-blue-500"}`} />
+                <AlertTriangle
+                  className={`h-5 w-5 ${data.freshness === "stale" ? "text-red-500" : data.freshness === "delayed" ? "text-amber-500" : "text-blue-500"}`}
+                />
               )}
               <span className="font-medium" data-testid="connectivity-state-label">
-                {CONNECTIVITY_LABELS[data.state]}
+                {FRESHNESS_LABELS[data.freshness]}
               </span>
-              <Badge variant={data.state === "receiving" ? "success" : data.state === "smoke_only" ? "secondary" : "warning"}>
-                {data.state}
-              </Badge>
+              <FreshnessBadge freshness={data.freshness} />
             </div>
+            <FreshnessDetail data={data} />
+            <LifecycleMilestone data={data} />
             <div className="grid grid-cols-3 gap-2 text-sm">
               <div className="rounded-md border p-2">
                 <div className="text-lg font-semibold">{data.real_trace_count}</div>
-                <div className="text-xs text-muted-foreground">実 workload trace</div>
+                <div className="text-xs text-muted-foreground">実 workload trace（累計）</div>
               </div>
               <div className="rounded-md border p-2">
                 <div className="text-lg font-semibold">{data.smoke_trace_count}</div>
-                <div className="text-xs text-muted-foreground">smoke trace</div>
+                <div className="text-xs text-muted-foreground">smoke trace（累計）</div>
               </div>
               <div className="rounded-md border p-2">
                 <div className="text-lg font-semibold">{data.total_trace_count}</div>
-                <div className="text-xs text-muted-foreground">合計</div>
+                <div className="text-xs text-muted-foreground">合計（累計）</div>
               </div>
             </div>
-            {data.last_trace_at != null && (
-              <p className="text-xs text-muted-foreground">
-                最終受信: {formatTimestamp(data.last_trace_at)}
-                {data.last_trace_component_id && (
-                  <> · component <code className="font-mono">{data.last_trace_component_id}</code></>
-                )}
-              </p>
-            )}
             {data.state === "no_signal" && (
               <p className="text-xs text-amber-700 dark:text-amber-300">
                 このシステムはまだ一度も trace / signal を受信していません。

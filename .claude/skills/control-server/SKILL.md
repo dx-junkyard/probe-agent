@@ -20,6 +20,34 @@ Use this skill for files under:
 - `PUT /components/{component_id}/policy`
 - `POST /components/{component_id}/shadow-results`
 
+## Trace ingestion redaction (Issue #367)
+
+`POST /traces` redacts **before the row is written**, in
+`app/trace_redaction.py`, reusing the SDK's rule tables
+(`probe_agent.redaction.SENSITIVE_KEYS` and `probe_agent.secret_patterns`) so
+the send boundary and the ingestion boundary cannot drift apart. This is not
+redundant with the SDK: an older SDK, a non-SDK HTTP client, and
+`PROBE_PAYLOAD_MODE=full` all reach this endpoint.
+
+Rules to preserve when touching trace persistence:
+
+- Redact on the write path, never at render time. A presentation-only mask
+  leaves plaintext in the DB, in exports, and in Replay / Candidate Studio /
+  Workspaces, all of which read the stored row.
+- `traces.redaction_json` is `NULL` **only** for rows that predate this
+  feature. A clean payload still records `{"redacted": false, ...}`. Do not
+  "optimise" the clean case back to `NULL` — `GET /traces/redaction-audit`
+  uses exactly that distinction to find rows that were never scanned.
+- Redacting `input_capture` degrades `replayability` to `partial` with reason
+  `redacted`, one-directionally (never upgrades, never touches
+  `unreplayable`).
+- Add any new trace column to all four places or the quota accounting silently
+  drifts: the `CREATE TABLE`, the `_add_column_if_missing` migration,
+  `_stored_trace_bytes`, and `_current_trace_usage`'s SQL sum.
+- `POST /traces/redaction-rescan` is an explicit operator action, not a
+  startup migration: it destroys data on purpose and the exposed credential
+  still has to be rotated by a human. See `docs/secret-redaction.md`.
+
 ## Evaluation context APIs (issue #9)
 
 - `GET /system-profile`, `PUT /system-profile` (singleton, id `default`)

@@ -42,6 +42,7 @@ from .routes import (
     replay,
     retention,
     shadow,
+    snapshot_preflight,
     systems,
     system_state,
     trace_analyzers,
@@ -109,6 +110,7 @@ def create_app() -> FastAPI:
     app.include_router(project_intelligence.router, dependencies=_auth)
     app.include_router(probe_patterns.router, dependencies=_auth)
     app.include_router(connectivity.router, dependencies=_auth)
+    app.include_router(snapshot_preflight.router, dependencies=_auth)
     app.include_router(diagnostics.router, dependencies=_auth)
     app.include_router(system_state.router, dependencies=_auth)
     app.include_router(assistant.router, dependencies=_auth)

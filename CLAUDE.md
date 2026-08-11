@@ -699,6 +699,30 @@ creating incomplete persistence or execution paths for later phases.
     `model.ts`) are all unchanged. See the Issue #358 sections in
     `docs/project-intelligence.md` and `docs/system-interview-workflow-ux.md`.
 
+20. Issue #366 — 設定から候補評価までのエンドツーエンド UX (subs #367-#374).
+    A 2026-08-11 audit walked the whole loop (Repository/Settings → Connect
+    SDK → Components/Traces → AI Candidate Studio → Simulation Workbench →
+    Experiments) and found the screens asserting operational facts they had
+    not actually checked. Implemented in the epic's recommended order:
+    - #367 (P0) — secret redaction across the Trace / Replay / candidate
+      paths. This is now **Core Design Principle 9**; read it before touching
+      any payload-rendering or trace-ingestion code, and see
+      `docs/secret-redaction.md` for the operational procedure.
+    - #370 / #368 / #369 (P1) — make the displayed state match the persisted
+      fact: Trace freshness separate from "ever connected", token expiry
+      evaluated against the clock, and Snapshot `ready` (analysis finished)
+      separate from `current` (matches HEAD).
+    - #372 (P1) — Replay readiness preflight *before* a candidate is
+      generated, so an all-`not captured` component cannot burn an LLM call.
+    - #371 (P1) — one improvement loop with a single progress rail; the three
+      candidate surfaces stop reading as three products.
+    - #373 / #374 (P2) — Trace monitoring (summary/filter/compare) and the
+      progressive information design of Setup Guide, warnings, and empty
+      states.
+    Non-goals for the whole epic, unchanged: no automatic candidate adoption,
+    merge, or deploy; the human Replay approval gate stays; the isolated,
+    network-off sandbox policy stays.
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,
@@ -804,6 +828,39 @@ instead of being bolted onto an unrelated issue's scope.
      reasoning-model proposals, never heuristic free-text guesses, and the
      developer's approval is the `decision_method: manual` record, not the
      LLM's output alone (Principle 7).
+
+9. Never store a secret value (Issue #367).
+   - Redaction has two layers and both are mandatory: **key names**
+     (`probe_agent/redaction.py`'s `SENSITIVE_KEYS`, exact lowercase matches)
+     and **credential value shapes** (`probe_agent/secret_patterns.py`, the
+     documented vendor prefixes / structural markers). Neither alone is
+     sufficient — a key denylist never sees `Config(api_key=...)`, and a value
+     scanner never sees an unknown in-house token format.
+   - The repr path traverses **user-defined objects**
+     (`redaction.redact_for_repr`), because `repr` prints an object's
+     attributes without ever consulting a mapping key. That was the actual
+     audited leak. An object whose state cannot be inspected is rendered as an
+     opaque `<TypeName>`, never via its real `repr`.
+   - Redaction happens **before storage**, at both the SDK send boundary and
+     the Control Server ingestion boundary. Presentation-layer masking is not
+     acceptable: it leaves plaintext on disk and in every downstream consumer
+     (Replay, Candidate Studio, Workspaces, exports).
+   - `PROBE_PAYLOAD_MODE=full` is a verbosity choice, never consent to ship
+     credentials; both layers still apply. Dashboard view permission is not a
+     reason to display a secret.
+   - Both rule sets stay finite and explicitly enumerated (Principle 6). No
+     entropy scoring, no "looks random" heuristics.
+   - `traces.redaction_json` is `NULL` **only** for rows written before
+     ingestion-time redaction existed. A scanned-and-clean row records
+     `{"redacted": false}`. Those are three distinct UI states
+     (未確認 / 秘匿値なし / redact済み) and must not be collapsed into two.
+   - A redaction that touched `input_capture` degrades `replayability` to
+     `partial` with the `redacted` reason — masked input cannot restore the
+     original call. The degradation is one-directional and never upgrades an
+     SDK classification.
+   - Existing leaked data has an operational procedure, not a migration:
+     `GET /traces/redaction-audit` → rotate the credential → `POST
+     /traces/redaction-rescan`. See `docs/secret-redaction.md`.
 
 ---
 

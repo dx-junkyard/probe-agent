@@ -46,6 +46,60 @@ export interface TraceEvent {
   input_capture?: unknown | null;
   replayability?: Replayability | null;
   replay_reasons?: ReplayReason[] | null;
+  // Issue #367: what the Control Server masked at ingestion. `null` means the
+  // row predates ingestion-time redaction and has never been scanned -- which
+  // is NOT the same as `{redacted: false}` (scanned, nothing found).
+  redaction?: TraceRedaction | null;
+  payload_summary?: TracePayloadSummary | null;
+}
+
+// Finite rule vocabulary, mirroring probe_agent.secret_patterns.RULE_NAMES
+// plus the structural rules the server applies (`sensitive_key`, a denylisted
+// mapping key; `depth_limit`, a node past the traversal bound).
+export type TraceRedactionRule =
+  | "sensitive_key"
+  | "depth_limit"
+  | "pem_private_key"
+  | "aws_access_key_id"
+  | "github_fine_grained_pat"
+  | "github_token"
+  | "anthropic_api_key"
+  | "stripe_secret_key"
+  | "openai_api_key"
+  | "slack_token"
+  | "google_api_key"
+  | "jwt"
+  | "authorization_header"
+  | "url_userinfo"
+  | "sensitive_assignment";
+
+export interface TraceRedactionField {
+  field: "input" | "output" | "error" | "input_capture";
+  path: string;
+  rule: TraceRedactionRule;
+}
+
+export interface TraceRedaction {
+  redacted: boolean;
+  rules: TraceRedactionRule[];
+  fields: TraceRedactionField[];
+}
+
+export type TracePayloadKind =
+  | "none" | "boolean" | "string" | "number" | "list" | "object" | "unknown";
+
+export interface TracePayloadShape {
+  kind: TracePayloadKind;
+  item_count: number | null;
+  bytes: number;
+}
+
+// Shape facts shown before a reader expands a trace's payload (Issue #367 AC:
+// 型・件数・サイズ・redaction有無を先に確認できる).
+export interface TracePayloadSummary {
+  input: TracePayloadShape;
+  output: TracePayloadShape;
+  error: TracePayloadShape;
 }
 
 export interface Policy {
@@ -65,6 +119,34 @@ export interface ConnectivityStatusOut {
   last_trace_component_id: string | null;
   smoke_component_id: string;
   materialized_session_ids: number[];
+  // Issue #370: the live reception axis. `state` above is a cumulative
+  // milestone that never regresses ("has connected at least once"); this is
+  // the operational reading and does regress. Never render one as the other.
+  freshness: ConnectivityFreshness;
+  seconds_since_last_trace: number | null;
+  /** Server clock at evaluation, so relative times do not drift with ours. */
+  evaluated_at: number;
+  clock_skew_seconds: number;
+  real_trace_count_5m: number;
+  real_trace_count_1h: number;
+  real_trace_count_24h: number;
+  delayed_after_seconds: number;
+  stale_after_seconds: number;
+  thresholds_customized: boolean;
+}
+
+export type ConnectivityFreshness =
+  | "never_received"
+  | "receiving_now"
+  | "delayed"
+  | "stale";
+
+export interface ConnectivityFreshnessPolicyOut {
+  system_id: number;
+  delayed_after_seconds: number;
+  stale_after_seconds: number;
+  customized: boolean;
+  updated_at: number | null;
 }
 
 // Trace lineage (Issue #145/#146/#147)
@@ -242,6 +324,14 @@ export interface UserOut {
   created_at: string;
 }
 
+/**
+ * Issue #368: the token's lifecycle status is decided by the Control Server
+ * (`app/token_status.py`) from `revoked` + `expires_at` + its own clock.
+ * Mirrors `TokenStatus` in `apps/control-server/app/models.py`; the dashboard
+ * renders it and must never re-derive it from `revoked`/`expires_at`.
+ */
+export type TokenStatus = "active" | "expiring_soon" | "expired" | "revoked";
+
 export interface TokenOut {
   id: number;
   name: string;
@@ -251,6 +341,9 @@ export interface TokenOut {
   revoked: boolean;
   created_at: string;
   expires_at: string | null;
+  status: TokenStatus;
+  /** Seconds until expiry at the instant `status` was decided; null = 無期限. */
+  expires_in_seconds?: number | null;
   token?: string;
 }
 
