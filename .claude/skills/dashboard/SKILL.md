@@ -746,3 +746,31 @@ The button is `fixed` over the scroll area, so the padding is what guarantees
 page content ends above it (#102: the assistant must not hide a screen's
 primary action). Changing the button's `bottom-*` without the padding — or
 the reverse — puts it back on top of the primary action at narrow widths.
+
+### #358 のレビューで直した 3 点 (再発させない)
+
+- **`xl:sticky` は右カラム(Grid の直接の子)に付ける。** 中の詳細ペインだけを
+  sticky にすると、動ける範囲がその親=右カラムの内容高さ(約 875px)に閉じ、
+  行の高さ(約 2,477px)ぶんスクロールする理解マップへ着く前に画面外へ流れる。
+  Grid の直接の子なら containing block は行いっぱいの grid area なので、
+  #359 のために必要な `items-start` と両立する。カラムごと sticky にするのは、
+  詳細ペインだけを浮かせると通常フローに残る補助情報の上へ重なるため。
+  背が高い場合に下端へ到達できるよう `xl:max-h-[...] xl:overflow-y-auto` を
+  必ず添える。
+- **主作業面は 1280 × 720 の初期表示に入っていること。** ソース順で上にある
+  だけでは足りず、実測できる要件である。サマリーの統計は既定で閉じた
+  `<details>` (`cockpit-status-stats`)、画面の説明文はセッション未選択時のみ、
+  ページ root は `space-y-4`。`W2` の主操作「この理解で進む」は Brief カードの
+  **ヘッダー側**に置く(カードが約 566px あり、本文の下だと初期表示に入らない)
+  — カードは 1 枚、主操作も 1 つのままで #351 の条件は変わらない。上部に何かを
+  足すときは、この予算を消費していないか実測して確かめること。
+- **詳細ペインの展開状態はカテゴリ切替でリセットする。** 展開状態はコンポー
+  ネントが持つので、リセットしないと 2 つ目以降のカテゴリが全件展開で始まり、
+  段階的開示が最初のクリック以降ずっと無効になる。effect ではなくレンダー中の
+  「props 変化に応じた state 調整」で畳む(effect だと一度古い状態で描いてから
+  畳み直すちらつきになる)。
+
+実ブラウザでの確認は、`container.innerHTML` を書き出して `dist/assets/*.css`
+と一緒に静的 HTML へ入れ、Chromium (`/opt/pw-browsers/chromium`) で測ると
+本番と同じ CSS のまま寸法を検証できる。Playwright はリポジトリの依存には
+追加しないこと(この確認は使い捨てで行う)。

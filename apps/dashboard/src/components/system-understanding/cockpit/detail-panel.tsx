@@ -72,6 +72,22 @@ export function CockpitDetailPanel({
 }) {
   const [reasonsExpanded, setReasonsExpanded] = useState(false);
   const [evidenceExpanded, setEvidenceExpanded] = useState(false);
+
+  // カテゴリを切り替えたら展開状態を閉じる (レビュー指摘 P2)。
+  //
+  // 展開状態はこのコンポーネントが持つので、そのままだと「A で全件表示 →
+  // B を選ぶ」で B も全件展開で始まり、段階的開示 (初期 3 件に抑えて修正手段
+  // を見つけやすくする) がカテゴリ切替後に崩れる。表示しているカテゴリが
+  // 変わったことは props からしか分からないので、レンダー中に前回値と比べて
+  // 直す (React の「props 変化に応じた state 調整」パターン)。effect にすると
+  // 一度古い展開状態で描いてから畳み直すちらつきになる。
+  const [renderedCategory, setRenderedCategory] = useState(category.key);
+  if (renderedCategory !== category.key) {
+    setRenderedCategory(category.key);
+    setReasonsExpanded(false);
+    setEvidenceExpanded(false);
+  }
+
   const actions = categoryActions(category, state);
 
   // 理由 = gap → 質問 の順 (これまでと同じ並び)。件数はモデルの配列長そのもの。

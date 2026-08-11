@@ -422,3 +422,53 @@ describe("CockpitDetailPanel の段階開示 (issue #363)", () => {
     expect(screen.getByTestId("cockpit-detail-hint")).toHaveTextContent("Q&A を取得できていない");
   });
 });
+
+// ── カテゴリ切替と段階開示 (レビュー指摘 P2) ──────────────────────────
+
+describe("CockpitDetailPanel のカテゴリ切替 (レビュー指摘 P2)", () => {
+  // 展開状態はコンポーネントが持つので、カテゴリを切り替えても残ってしまうと
+  // 「初期は 3 件に抑えて修正手段を見つけやすくする」段階的開示が、2 つ目以降
+  // のカテゴリで最初から崩れる。
+  it("別カテゴリを選ぶと理由・根拠の展開が初期状態へ戻る", () => {
+    const crowded = crowdedCapabilities();
+    const other = buildCockpitModel({
+      understanding: fullUnderstanding(),
+      gaps: [
+        gap({ name: "境界 A", gap_type: "unclassified_entrypoint" }),
+        gap({ name: "境界 B", gap_type: "unclassified_entrypoint" }),
+        gap({ name: "境界 C", gap_type: "unclassified_entrypoint" }),
+        gap({ name: "境界 D", gap_type: "unclassified_entrypoint" }),
+      ],
+      openQuestions: [],
+      qaItems: [],
+    }).categories.find(c => c.key === "api_boundaries")!;
+    expect(other.gaps).toHaveLength(4);
+
+    const { rerender } = render(
+      <CockpitDetailPanel category={crowded} state="W3" onAction={() => {}} />,
+    );
+    const reasons = () => screen.getByTestId("cockpit-detail-reasons");
+
+    fireEvent.click(screen.getByTestId("cockpit-detail-reasons-toggle"));
+    fireEvent.click(screen.getByTestId("cockpit-detail-evidence-toggle"));
+    expect(within(reasons()).getAllByTestId("cockpit-detail-question")).toHaveLength(3);
+
+    // カテゴリを切り替える。
+    rerender(<CockpitDetailPanel category={other} state="W3" onAction={() => {}} />);
+    expect(screen.getByTestId("cockpit-detail-panel")).toHaveAttribute(
+      "data-category",
+      "api_boundaries",
+    );
+    // 4 件のうち 3 件だけが出ている = 展開が持ち越されていない。
+    expect(within(reasons()).getAllByTestId("cockpit-detail-gap")).toHaveLength(3);
+    const toggle = screen.getByTestId("cockpit-detail-reasons-toggle");
+    expect(toggle).toHaveTextContent("残り 1 件の理由を表示");
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+
+    // 元のカテゴリへ戻したときも初期状態から始まる。
+    rerender(<CockpitDetailPanel category={crowded} state="W3" onAction={() => {}} />);
+    expect(within(reasons()).getAllByTestId("cockpit-detail-question")).toHaveLength(1);
+    expect(screen.getByTestId("cockpit-detail-reasons-toggle"))
+      .toHaveAttribute("aria-expanded", "false");
+  });
+});

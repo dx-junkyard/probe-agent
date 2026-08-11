@@ -2272,17 +2272,26 @@ export default function InterviewPage() {
   const briefLeads = briefLeadsMainColumn(wState);
 
   return (
-    <div className="space-y-6">
+    // レビュー指摘 P1: 主作業面を初期ビューポート (1280 x 720) へ入れるため、
+    // 画面上部の縦余白を詰める。ここで稼いだぶんがそのまま主作業面の上端を
+    // 押し上げる。
+    <div className="space-y-4">
       <div className="flex items-start justify-between gap-3 flex-wrap">
         <div>
           <h1 className="text-2xl font-bold tracking-tight flex items-center gap-2">
             <MessageSquareText className="h-6 w-6" /> インタビュー・コックピット
           </h1>
-          <p className="text-sm text-muted-foreground mt-1 max-w-3xl">
-            理解の全体像を確認し、曖昧な箇所を順番に解消します。開始すると、
-            ドキュメントとコードの自動分析からシステム理解を構築し、確認と不足情報の
-            質問を経て提案生成へ進みます。
-          </p>
+          {/* 画面の説明はこれから始める人のためのもの。セッションが動いて
+              いる間は現在地カードと「次にやること」が同じことをより具体的に
+              言っているので出さない -- 3 行ぶんの高さは、そのまま主作業面を
+              画面外へ押し下げる代償になる (レビュー指摘 P1)。 */}
+          {!session && (
+            <p className="text-sm text-muted-foreground mt-1 max-w-3xl">
+              理解の全体像を確認し、曖昧な箇所を順番に解消します。開始すると、
+              ドキュメントとコードの自動分析からシステム理解を構築し、確認と不足情報の
+              質問を経て提案生成へ進みます。
+            </p>
+          )}
           {/* Issue #356 §1: セッション番号 / Snapshot 番号 / ステータス。
               Issue #361 でここが唯一の常設表示になった (右カラムのセッション
               情報カードからは同じ 3 つを外した)。参加者・最終更新・根拠件数・
@@ -3197,25 +3206,35 @@ git commit`}
                 を書き換えられてはならない -- 走っている理解更新や突き合わせ
                 と競合するうえ、原則 P1/P3 にも反する。R6 の履歴入口だけは
                 状態に依存せず常に開ける (§3.6)。 */}
-            <div className="space-y-4">
+            {/* Issue #363 (レビュー指摘 P1): sticky は **右カラムそのもの**
+                に付ける。以前は中の詳細ペインだけを sticky にしていたが、
+                sticky 要素が動ける範囲は親の内容ボックスの中までで、右カラムは
+                中身ぶんの高さ (約 875px) しか無い一方、左右 Grid の行は
+                約 2,477px あった。そのため理解マップまでスクロールする前に
+                ペインが画面外へ流れ去っていた。
+
+                Grid の直接の子を sticky にすると、動ける範囲は「行の高さいっぱい
+                の grid area」になるので、`items-start` (= 中身ぶんの高さ) の
+                ままでもマップの末尾まで追従できる。
+
+                カラムごと sticky にするのは、詳細ペインだけを sticky にすると
+                通常フローに残る補助情報の上へ重なって読めなくなるためで、
+                カラム全体が一緒に動けば重なりは起きない。中身がビューポート
+                より高いときに下端へ到達できなくならないよう、内部スクロール
+                を持たせる。xl 未満 (右カラムが下へ回り込む幅) では通常の縦積み
+                のままで、マップの「選択中のカテゴリの詳細へ」が導線になる。 */}
+            <div className="space-y-4 xl:sticky xl:top-0 xl:max-h-[calc(100vh-5rem)] xl:overflow-y-auto">
               {/* Issue #356 §4 / Issue #363 — 選択項目の詳細・修正ペイン。
                   全体マップの選択に追従し、この項目を「どう直すか」だけを
                   示す。実行できない手段は理由付きで残す (issue §4) -- ここは
                   状態の主操作ではなく修正方法の案内なので、前提未達の主操作を
-                  出さない原則 (spec P3) の対象ではない。
-
-                  Desktop では sticky にする: マップをスクロールしている間も
-                  選択内容と修正導線を見失わないため (#363)。回り込みが起きる
-                  幅 (xl 未満) では通常の縦積みで、マップの
-                  「選択中のカテゴリの詳細へ」がここへの導線になる。 */}
+                  出さない原則 (spec P3) の対象ではない。 */}
               {selectedCategory && (
-                <div className="xl:sticky xl:top-0">
-                  <CockpitDetailPanel
-                    category={selectedCategory}
-                    state={wState}
-                    onAction={openCockpitTarget}
-                  />
-                </div>
+                <CockpitDetailPanel
+                  category={selectedCategory}
+                  state={wState}
+                  onAction={openCockpitTarget}
+                />
               )}
 
               {/* Issue #361: 即時対応が必要な情報は折りたたみへ入れない。

@@ -3923,6 +3923,53 @@ describe("Interview page", () => {
     expect(order("understanding-brief")).toBeLessThan(order("cockpit-understanding-map"));
     // Brief は 1 つの値から描かれる。2 箇所に同時には出ない (原則 P7)。
     expect(screen.getAllByTestId("understanding-brief")).toHaveLength(1);
+
+    // レビュー指摘 P1: 主作業面を初期表示 (1280 x 720) へ入れるため、
+    // サマリーの統計は既定で畳む。主 CTA はその外に出ていること。
+    const stats = screen.getByTestId("cockpit-status-stats") as HTMLDetailsElement;
+    expect(stats.open).toBe(false);
+    expect(stats.contains(screen.getByTestId("cockpit-completion-percent"))).toBe(true);
+    expect(stats.contains(screen.getByTestId("cockpit-next-step-action"))).toBe(false);
+
+    // セッション表示中は画面の説明文を出さない (縦を主作業面へ譲る)。
+    expect(screen.queryByText(/理解の全体像を確認し、曖昧な箇所を順番に解消します/))
+      .toBeNull();
+  });
+
+  // Issue #363 (レビュー指摘 P1): sticky は右カラム **そのもの** に付ける。
+  // 中の詳細ペインだけを sticky にすると、動ける範囲が「中身ぶんの高さしか
+  // 無い右カラム」に限られ、理解マップへ到達する前に画面外へ流れ去る。
+  // Grid の直接の子であれば、動ける範囲は行の高さいっぱいの grid area になる。
+  it("詳細ペインの sticky は Grid の直接の子である右カラムに付く", async () => {
+    mockInterviewW3Cockpit();
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const panel = await screen.findByTestId("cockpit-detail-panel");
+    const column = panel.closest<HTMLElement>(".grid > div");
+    expect(column).not.toBeNull();
+    expect(column!.className).toMatch(/xl:sticky/);
+    // 高さがビューポートを超えても下端へ到達できるよう、内部スクロールを持つ。
+    expect(column!.className).toMatch(/xl:overflow-y-auto/);
+    // 詳細ペインを別の sticky ラッパーで包み直さない (二重 sticky にすると
+    // 内側は再び右カラムの高さに閉じ込められる)。
+    const wrapper = panel.parentElement!;
+    expect(wrapper).toBe(column);
+
+    // 未解決事項と Q&A 進捗を並べる内側の Grid は `items-start` のまま
+    // (背の高いカードに合わせて Q&A カードが引き伸ばされない、#359)。
+    const unresolved = screen.getByTestId("cockpit-unresolved-items");
+    expect(unresolved.parentElement!.className).toMatch(/items-start/);
   });
 
   // Issue #360 の例外: `W2` では Brief 自体が判断対象で、主操作
@@ -3971,6 +4018,18 @@ describe("Interview page", () => {
     expect(brief).toBeLessThan(work);
     expect(work).toBeLessThan(map);
     expect(screen.getAllByTestId("understanding-brief")).toHaveLength(1);
+
+    // レビュー指摘 P1: `W2` の主操作「この理解で進む」は Brief カードの
+    // 見出し側にある。本文の下だとカードが約 566px あるため、初期表示
+    // (1280 x 720) に主操作が入らなかった。カードの中にある、という #351 の
+    // 条件は変わらないので、カードは 1 枚・主操作も 1 つのまま。
+    const confirm = screen.getByTestId("understanding-confirm-block");
+    const briefCard = screen.getByTestId("understanding-brief");
+    expect(briefCard.contains(confirm)).toBe(true);
+    expect(screen.getAllByTestId("understanding-confirm-block")).toHaveLength(1);
+    const briefHtml = briefCard.innerHTML;
+    expect(briefHtml.indexOf('data-testid="understanding-confirm-block"'))
+      .toBeLessThan(briefHtml.indexOf('id="brief-body"'));
   });
 
   // Issue #361: 補助情報は折りたたみの中。閉じていても、そこへ移動する CTA は

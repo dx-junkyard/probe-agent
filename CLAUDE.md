@@ -612,11 +612,22 @@ creating incomplete persistence or execution paths for later phases.
     any later change must preserve:
     - **The first view leads with the action, not the score** (#360).
       `CockpitStatusSummary`'s primary element is 「次にやること」 plus ONE
-      CTA; 完成度 is now one tile among the counts, never a large number
-      above the CTA. The CTA **navigates, it never executes** — the
-      state's primary action stays the single executor inside its work
-      surface (#342 原則 P1), which is why a CTA in the summary does not
-      make two primary actions.
+      CTA; 完成度 is one tile among the counts, never a large number above
+      the CTA. The CTA **navigates, it never executes** — the state's
+      primary action stays the single executor inside its work surface
+      (#342 原則 P1), which is why a CTA in the summary does not make two
+      primary actions.
+    - **The state's work surface must be inside the 1280×720 first view**,
+      not merely above the fold in source order. This is measurable and was
+      missed once: the summary alone was ~290px and pushed `work-surface-W3`
+      to 756px. The vertical budget above the work surface is therefore
+      part of the contract — the summary keeps its stats in a closed
+      `<details>` (`cockpit-status-stats`), the page's intro paragraph is
+      rendered only when no session is selected, and the page root is
+      `space-y-4`. In `W2` the primary action 「この理解で進む」 sits in the
+      Brief card's HEADER for the same reason: the card is ~566px tall, so
+      at the bottom the action fell outside the first view. It is still one
+      action inside the one card #351 requires.
     - `CockpitModel.nextStep` is a `CockpitNextStep` decided by a
       first-match finite table in `model.ts` (`retry_qa` → loading →
       `fix_category` for missing → `answer_question` → `fix_category` for
@@ -646,10 +657,23 @@ creating incomplete persistence or execution paths for later phases.
       Cards carry only 番号 / 名称 / 状態 / a one-line 要約; caption and hint
       moved into the detail pane. `missing`/`review` get ring emphasis plus
       a 「要対応」 text marker (never colour alone) and the fixed 5-category
-      order is unchanged. The detail pane is `xl:sticky`; below `xl` the
-      map's 「選択中のカテゴリの詳細へ」 button is the keyboard- and
-      mobile-reachable route to it. Reasons and evidence show 3 with the
-      rest behind a toggle.
+      order is unchanged. Below `xl` the map's 「選択中のカテゴリの詳細へ」
+      button is the keyboard- and mobile-reachable route to it. Reasons and
+      evidence show 3 with the rest behind a toggle, and switching category
+      resets both disclosures — the expansion state lives in the component,
+      so without the reset the second category opens fully expanded and the
+      staged disclosure is defeated from the second click onward.
+    - **`xl:sticky` belongs on the right column itself, a DIRECT child of
+      the grid** — never on a wrapper inside it. A sticky element can only
+      travel inside its containing block; nested in the column it was
+      limited to the column's own content height (~875px) while the grid row
+      was ~2,477px, so the pane scrolled away long before the map came into
+      view. As a direct grid child its containing block is the grid area,
+      which spans the full row, so `items-start` (needed for #359) is
+      compatible. The whole column sticks — not just the detail pane —
+      because a sticky pane with the auxiliary panel left in normal flow
+      slides over it. Give the column `xl:max-h-[calc(100vh-5rem)]` +
+      `xl:overflow-y-auto` so a tall column's bottom stays reachable.
     - **Auxiliary information is one disclosure area** (#361):
       `CockpitAuxiliaryPanel` / `CockpitAuxiliarySection` hold セッション情報
       / Intent Brief / 引き継ぎ / 観測提案 / まとめて修正 / Q&A 全一覧 /

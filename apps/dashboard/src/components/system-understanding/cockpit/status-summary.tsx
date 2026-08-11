@@ -58,24 +58,38 @@ export function CockpitStatusSummary({
 
   return (
     <Card data-testid="cockpit-status-summary">
-      <CardContent className="space-y-4 p-4">
-        {/* 主役。ファーストビューで最も強い要素はここ 1 つだけ。 */}
-        <div data-testid="cockpit-next-step">
-          <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-            <Lightbulb className="h-4 w-4" /> 次にやること
+      <CardContent className="space-y-2 p-3">
+        {/* 主役。ファーストビューで最も強い要素はここ 1 つだけ。
+            レビュー指摘 P1: 以前はここが約 290px あり、主作業面が初期
+            ビューポート (1280 x 720) の外へ押し出されていた。「次にやること」
+            と CTA を 1 行に並べ、統計は既定で畳んで縦を詰める -- 主操作と
+            その作業面が同時に見えないなら、この面は目的を果たしていない。 */}
+        <div
+          className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2"
+          data-testid="cockpit-next-step"
+        >
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+              <Lightbulb className="h-3.5 w-3.5" /> 次にやること
+            </div>
+            <h2
+              className="text-base font-semibold tracking-tight break-words"
+              data-testid="cockpit-next-step-title"
+            >
+              {model.nextStep.title}
+            </h2>
+            {/* 説明は 2 行まで。全文は title 属性で読める。 */}
+            <p
+              className="line-clamp-2 text-xs leading-5 text-muted-foreground break-words"
+              title={model.nextStep.description}
+            >
+              {model.nextStep.description}
+            </p>
           </div>
-          <h2
-            className="mt-1 text-lg font-semibold tracking-tight break-words"
-            data-testid="cockpit-next-step-title"
-          >
-            {model.nextStep.title}
-          </h2>
-          <p className="mt-1 text-sm leading-6 text-muted-foreground break-words">
-            {model.nextStep.description}
-          </p>
           {actionLabel && (
             <Button
-              className="mt-3"
+              size="sm"
+              className="shrink-0"
               onClick={onRunNextStep}
               data-testid="cockpit-next-step-action"
             >
@@ -85,16 +99,18 @@ export function CockpitStatusSummary({
           )}
         </div>
 
-        {/* 補助。完成度は数字と細い進捗バーだけにし、CTA より強くしない。 */}
-        <div className="border-t pt-3">
-          <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-            Interview status
-          </p>
-          <p className="mt-1 text-xs text-muted-foreground" data-testid="cockpit-completion-headline">
-            {percent == null
-              ? "理解の完成度はまだ確定できません"
-              : `理解の全体像は ${percent}% まで固まっています`}
-          </p>
+        {/* 補助。完成度と件数は既定で畳む -- 常時見えている必要は無く、
+            開いていると主作業面を画面外へ押し下げる。中身は DOM に残るので、
+            読み上げと既存の参照はそのまま効く。 */}
+        <details className="border-t pt-2" data-testid="cockpit-status-stats">
+          <summary className="cursor-pointer text-[11px] text-muted-foreground">
+            <span data-testid="cockpit-completion-headline">
+              {percent == null
+                ? "理解の完成度はまだ確定できません"
+                : `理解の全体像は ${percent}% まで固まっています`}
+            </span>
+            <span className="ml-1 underline underline-offset-2">内訳を見る</span>
+          </summary>
           {percent == null ? (
             <p
               className="mt-2 rounded-md border border-dashed p-2 text-xs text-muted-foreground"
@@ -123,7 +139,7 @@ export function CockpitStatusSummary({
               </div>
             ))}
           </dl>
-        </div>
+        </details>
       </CardContent>
     </Card>
   );
