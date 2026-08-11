@@ -4,7 +4,7 @@ import {
   useExperiments, useRunExperiment, useExperimentDecision,
   useCreateExperiment, useSnapshots, useLatestDrafts,
   useWorkspaceProposalDraft, useVariantExperimentPayload,
-  useGithubAppStatus, useGithubConnections,
+  useGithubAppStatus, useGithubConnections, useSnapshotPreflight,
 } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -21,6 +21,8 @@ import { Play, Download, Plus, Trash2, GitPullRequest, Crosshair, Bot } from "lu
 import type { ExperimentOut } from "@/api/types";
 import { AddToWorkspaceButton } from "@/components/add-to-workspace";
 import { ContextHeader } from "@/components/layout/context-header";
+import { SnapshotPreflightPanel } from "@/components/snapshot-preflight";
+import { ImprovementLoopRail } from "@/components/improvement-loop/rail";
 
 const STATUS_VARIANT: Record<string, "default" | "success" | "destructive" | "secondary" | "warning"> = {
   draft: "secondary",
@@ -30,6 +32,12 @@ const STATUS_VARIANT: Record<string, "default" | "success" | "destructive" | "se
 };
 
 const DECISION_OPTS = ["undecided", "adopted", "rejected", "needs_more_data"];
+const DECISION_LABELS: Record<string, string> = {
+  undecided: "未決定",
+  adopted: "採用",
+  rejected: "不採用",
+  needs_more_data: "追加データが必要",
+};
 
 interface VariantInput {
   label: string;
@@ -61,7 +69,7 @@ export default function ExperimentsPage() {
   // prefill context only, never a patch -- the developer fills in the rest.
   const fromTraceParam = searchParams.get("from_trace");
   const fromComponentParam = searchParams.get("from_component");
-  const { data: experiments, isLoading } = useExperiments();
+  const { data: experiments, isLoading, isError, error, refetch } = useExperiments();
   const runExperiment = useRunExperiment();
   const makeDecision = useExperimentDecision();
   const createExperiment = useCreateExperiment();
@@ -84,7 +92,25 @@ export default function ExperimentsPage() {
   const [newSnapshotId, setNewSnapshotId] = useState<string>("");
   const [variants, setVariants] = useState<VariantInput[] | null>(null);
 
+  // Issue #369: the shared preflight decides both axes for the selected
+  // snapshot (or the recommended one when nothing is selected yet). The page
+  // never re-derives `ready`/`current` itself.
+  const { data: preflight, isLoading: preflightLoading } = useSnapshotPreflight(
+    newSnapshotId ? Number(newSnapshotId) : null,
+  );
+  const [staleReason, setStaleReason] = useState("");
+
   const readySnapshots = snapshots?.filter(s => s.status === "ready") ?? [];
+  // Exactly one recommendation, from the server. Older ready snapshots stay
+  // reachable for reproduction runs, but are not offered as equals.
+  const recommendedId = preflight?.recommended_snapshot_id ?? null;
+  const recommendedSnapshot = readySnapshots.find(s => s.id === recommendedId)
+    ?? readySnapshots[0];
+  const olderSnapshots = readySnapshots.filter(s => s.id !== recommendedSnapshot?.id);
+  // A definitively stale snapshot needs the developer's reason before the
+  // experiment can be created (`decision_method: manual`).
+  const staleAckMissing =
+    !!preflight?.requires_stale_acknowledgement && staleReason.trim().length === 0;
   const features = drafts?.feature_drafts ?? [];
   const draftVariants = workspaceDraft?.draft_type === "experiment_draft"
     ? (workspaceDraft.payload.variant_summaries ?? []).map(summary => ({
@@ -128,7 +154,7 @@ export default function ExperimentsPage() {
     if (!formFeatureId || !formObjective.trim() || !newSnapshotId) return;
     const validVariants = formVariants.filter(v => v.label.trim() && v.patch_text.trim());
     if (validVariants.length < 2) {
-      toast.error("At least two variants with label and patch are required");
+      toast.error("ラベルとpatchを入力した比較候補が2件以上必要です");
       return;
     }
     try {
@@ -141,8 +167,14 @@ export default function ExperimentsPage() {
           patch_text: v.patch_text,
           risk_note: v.risk_note.trim() || undefined,
         })),
+        // Issue #369: only sent when the server's preflight says the snapshot
+        // is definitively behind HEAD. The server re-checks and rejects a
+        // missing reason itself; this is not the gate, only the input to it.
+        ...(preflight?.requires_stale_acknowledgement
+          ? { stale_snapshot_reason: staleReason.trim() }
+          : {}),
       });
-      toast.success("Experiment created");
+      toast.success("Experimentを作成しました");
       setShowCreate(false);
       setDraftDismissed(true);
       resetForm();
@@ -165,13 +197,21 @@ export default function ExperimentsPage() {
   return (
     <div className="space-y-6">
       <ContextHeader />
+      {/* Issue #371: same rail as Components / Candidate Studio / Workbench. */}
+      <ImprovementLoopRail
+        experiment={(experiments ?? []).find(e => e.id === expandedId) ?? null}
+        componentId={fromComponentParam}
+        traceId={fromTraceParam}
+        replayRunId={replayRunId}
+        replayVariantId={replayVariantId}
+      />
       {capabilityContext && (
         <Link
           to={`/capability-map?capability=${encodeURIComponent(capabilityContext)}`}
           className="inline-flex items-center text-xs text-primary hover:underline"
           data-testid="back-to-capability"
         >
-          ← Back to Capability: {capabilityContext}
+          ← Capabilityへ戻る: {capabilityContext}
         </Link>
       )}
       <div className="flex items-center justify-between">
@@ -187,14 +227,23 @@ export default function ExperimentsPage() {
           setShowCreate(true);
         }}>
           <Plus className="h-4 w-4 mr-1" />
-          New Experiment
+          Experimentを作成
         </Button>
       </div>
 
       {isLoading ? (
         <div className="space-y-4">{[1,2].map(i => <Skeleton key={i} className="h-40 w-full" />)}</div>
+      ) : isError ? (
+        <Card role="alert"><CardContent className="space-y-3 py-8 text-center">
+          <p className="text-sm font-medium">Experiment一覧を取得できませんでした。</p>
+          <p className="text-xs text-muted-foreground">{String(error)}</p>
+          <Button size="sm" variant="outline" onClick={() => refetch()}>再試行</Button>
+        </CardContent></Card>
       ) : !experiments?.length ? (
-        <Card><CardContent className="py-8 text-center text-sm text-muted-foreground">No experiments yet. Create one to get started.</CardContent></Card>
+        <Card><CardContent className="space-y-3 py-8 text-center text-sm text-muted-foreground">
+          <p>Experimentはまだありません。評価する候補を用意して作成してください。</p>
+          <Button size="sm" onClick={() => setShowCreate(true)}>最初のExperimentを作成</Button>
+        </CardContent></Card>
       ) : (
         <div className="space-y-4">
           {experiments.map(exp => (
@@ -220,28 +269,28 @@ export default function ExperimentsPage() {
         }
       }}>
         <DialogHeader>
-          <DialogTitle>Create Experiment</DialogTitle>
+          <DialogTitle>Experimentを作成</DialogTitle>
         </DialogHeader>
         <div className="space-y-4 max-h-[60vh] overflow-y-auto">
           {replayPayload && (
             <div className="rounded-md border bg-secondary/30 px-3 py-2 text-xs">
-              Prefilled from Replay Variant run #{replayRunId}, variant #{replayVariantId} ({replayPayload.source}).
+              Replay候補run #{replayRunId}、候補 #{replayVariantId} ({replayPayload.source}) から入力済みです。
               {replayPayload.risk_note && <span className="ml-2">{replayPayload.risk_note}</span>}
-              <span className="ml-1 text-muted-foreground">Complete: feature, objective, snapshot.</span>
+              <span className="ml-1 text-muted-foreground">残り: Feature、評価目的、Snapshot。</span>
             </div>
           )}
           {!replayPayload && fromTraceParam && (
             <div className="rounded-md border bg-secondary/30 px-3 py-2 text-xs">
-              Prefilled context from trace <span className="font-mono">{fromTraceParam}</span>
+              Trace <span className="font-mono">{fromTraceParam}</span> から文脈を入力済みです
               {fromComponentParam && (
                 <> (component <span className="font-mono">{fromComponentParam}</span>)</>
-              )}.
-              <span className="ml-1 text-muted-foreground">Complete: feature, snapshot, and variants.</span>
+              )}。
+              <span className="ml-1 text-muted-foreground">残り: Feature、Snapshot、比較候補。</span>
             </div>
           )}
           {workspaceDraft?.draft_type === "experiment_draft" && (
             <div className="rounded-md border bg-secondary/30 px-3 py-2 text-xs">
-              Prefilled from Decision Workspace proposal #{workspaceDraft.proposal_id}.
+              Decision Workspaceの提案 #{workspaceDraft.proposal_id} から入力済みです。
               {(workspaceDraft.payload.constraints?.length ?? 0) > 0 && (
                 <span className="ml-2">Constraints: {workspaceDraft.payload.constraints?.join(", ")}.</span>
               )}
@@ -250,21 +299,21 @@ export default function ExperimentsPage() {
               )}
               {workspaceDraft.missing_fields.length > 0 && (
                 <span className="ml-1 text-muted-foreground">
-                  Complete: {workspaceDraft.missing_fields.join(", ")}.
+                  残り: {workspaceDraft.missing_fields.join(", ")}。
                 </span>
               )}
               {workspaceIdParam && (
                 <Link className="ml-2 underline" to={`/workspaces?open=${workspaceIdParam}`}>
-                  Back to workspace
+                  Workspaceへ戻る
                 </Link>
               )}
             </div>
           )}
           <div className="space-y-2">
-            <Label>Feature</Label>
+            <Label>Feature（評価対象）</Label>
             {features.length > 0 ? (
               <Select value={formFeatureId} onChange={e => setNewFeatureId(e.target.value)}>
-                <option value="">Select feature...</option>
+                <option value="">Featureを選択...</option>
                 {features.map(f => <option key={f.feature_id} value={f.feature_id}>{f.feature_id} — {f.name}</option>)}
               </Select>
             ) : (
@@ -272,51 +321,71 @@ export default function ExperimentsPage() {
             )}
           </div>
           <div className="space-y-2">
-            <Label>Objective</Label>
-            <Textarea value={formObjective} onChange={e => setNewObjective(e.target.value)} placeholder="What are you trying to learn?" rows={2} />
+            <Label>評価目的</Label>
+            <Textarea value={formObjective} onChange={e => setNewObjective(e.target.value)} placeholder="この比較で確認したいこと" rows={2} />
           </div>
+          {/* Issue #369: the selector no longer presents every "ready"
+              snapshot as an equal option. Exactly one is the recommendation;
+              the rest are disclosed as reproduction-only choices, and the
+              shared preflight below states both axes for whichever is
+              selected. */}
           <div className="space-y-2">
             <Label>Snapshot</Label>
             <Select value={newSnapshotId} onChange={e => setNewSnapshotId(e.target.value)}>
-              <option value="">Select snapshot...</option>
-              {readySnapshots.map(s => (
-                <option key={s.id} value={s.id}>
-                  #{s.id} — {s.commit_sha?.slice(0, 8)} ({s.file_count} files)
+              <option value="">Snapshotを選択...</option>
+              {recommendedSnapshot && (
+                <option value={recommendedSnapshot.id}>
+                  #{recommendedSnapshot.id} — {recommendedSnapshot.commit_sha?.slice(0, 8)}（推奨）
                 </option>
-              ))}
+              )}
+              {olderSnapshots.length > 0 && (
+                <optgroup label="過去のSnapshot（再現用途）">
+                  {olderSnapshots.map(s => (
+                    <option key={s.id} value={s.id}>
+                      #{s.id} — {s.commit_sha?.slice(0, 8)} ({s.file_count} files)
+                    </option>
+                  ))}
+                </optgroup>
+              )}
             </Select>
+            <SnapshotPreflightPanel
+              preflight={preflight}
+              isLoading={preflightLoading}
+              staleReason={staleReason}
+              onStaleReasonChange={setStaleReason}
+            />
           </div>
           <div className="space-y-3">
             <div className="flex items-center justify-between">
-              <Label>Variants</Label>
+              <Label>比較候補</Label>
               <Button variant="ghost" size="sm" onClick={addVariant}>
-                <Plus className="h-3 w-3 mr-1" /> Add
+                <Plus className="h-3 w-3 mr-1" /> 候補を追加
               </Button>
             </div>
             {formVariants.map((v, i) => (
               <div key={i} className="rounded-lg border p-3 space-y-2">
                 <div className="flex items-center justify-between">
-                  <span className="text-xs font-medium text-muted-foreground">Variant {i + 1}</span>
+                  <span className="text-xs font-medium text-muted-foreground">候補 {i + 1}</span>
                   {formVariants.length > 2 && (
-                    <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => removeVariant(i)}>
+                    <Button variant="ghost" size="icon" className="h-6 w-6" aria-label={`候補 ${i + 1} を削除`} onClick={() => removeVariant(i)}>
                       <Trash2 className="h-3 w-3" />
                     </Button>
                   )}
                 </div>
                 <Input
-                  placeholder="Label (e.g., optimized-v1)"
+                  placeholder="ラベル（例: optimized-v1）"
                   value={v.label}
                   onChange={e => updateVariant(i, "label", e.target.value)}
                 />
                 <Textarea
-                  placeholder="Patch text (unified diff format)"
+                  placeholder="Patch内容（unified diff形式）"
                   value={v.patch_text}
                   onChange={e => updateVariant(i, "patch_text", e.target.value)}
                   rows={4}
                   className="font-mono text-xs"
                 />
                 <Input
-                  placeholder="Risk note (optional)"
+                  placeholder="リスクメモ（任意）"
                   value={v.risk_note}
                   onChange={e => updateVariant(i, "risk_note", e.target.value)}
                 />
@@ -325,10 +394,17 @@ export default function ExperimentsPage() {
           </div>
           <Button
             onClick={handleCreate}
-            disabled={createExperiment.isPending || !formFeatureId || !formObjective.trim() || !newSnapshotId || formVariants.filter(v => v.label.trim() && v.patch_text.trim()).length < 2}
+            disabled={createExperiment.isPending || !formFeatureId || !formObjective.trim() || !newSnapshotId || formVariants.filter(v => v.label.trim() && v.patch_text.trim()).length < 2 || staleAckMissing || preflight?.verdict === "blocked"}
+            title={
+              staleAckMissing
+                ? "HEADより古いSnapshotを使う理由を入力してください"
+                : preflight?.verdict === "blocked"
+                  ? "このSnapshotでは開始できません — 上の確認項目を解消してください"
+                  : undefined
+            }
             className="w-full"
           >
-            {createExperiment.isPending ? "Creating..." : "Create Experiment"}
+            {createExperiment.isPending ? "作成中..." : "Experimentを作成"}
           </Button>
         </div>
       </Dialog>
@@ -419,19 +495,19 @@ function ExperimentCard({
 
           {exp.status === "completed" && (
             <div className="rounded-lg border p-4 space-y-3">
-              <h4 className="text-sm font-medium">Decision</h4>
+              <h4 className="text-sm font-medium">判断</h4>
               <div className="grid gap-3 sm:grid-cols-2">
                 <div className="space-y-2">
-                  <Label>Verdict</Label>
+                  <Label>判定</Label>
                   <Select value={decisionVal} onChange={e => setDecisionVal(e.target.value)}>
-                    {DECISION_OPTS.map(d => <option key={d} value={d}>{d}</option>)}
+                    {DECISION_OPTS.map(d => <option key={d} value={d}>{DECISION_LABELS[d]}</option>)}
                   </Select>
                 </div>
                 {decisionVal === "adopted" && (
                   <div className="space-y-2">
-                    <Label>Adopt Variant *</Label>
+                    <Label>採用する候補 *</Label>
                     <Select value={decisionVariant} onChange={e => setDecisionVariant(e.target.value)}>
-                      <option value="">Select variant...</option>
+                      <option value="">候補を選択...</option>
                       {nonBaselineVariants.map(v => (
                         <option key={v.variant_key} value={v.variant_key}>{v.label} ({v.variant_key})</option>
                       ))}
@@ -440,16 +516,16 @@ function ExperimentCard({
                 )}
               </div>
               <div className="space-y-2">
-                <Label>Note {decisionVal === "adopted" ? "*" : ""}</Label>
+                <Label>判断理由 {decisionVal === "adopted" ? "*" : ""}</Label>
                 <Textarea
                   value={decisionNote}
                   onChange={e => setDecisionNote(e.target.value)}
-                  placeholder="Reason for decision..."
+                  placeholder="判断理由を入力..."
                   rows={2}
                 />
               </div>
               <Button size="sm" onClick={handleDecision} disabled={makeDecision.isPending}>
-                {makeDecision.isPending ? "Saving..." : "Save Decision"}
+                {makeDecision.isPending ? "保存中..." : "判断を保存"}
               </Button>
             </div>
           )}
@@ -465,7 +541,7 @@ function ExperimentCard({
 
           {exp.variants?.length > 0 && (
             <div>
-              <h4 className="text-sm font-medium mb-2">Variants</h4>
+              <h4 className="text-sm font-medium mb-2">比較候補</h4>
               <div className="space-y-3">
                 {exp.variants.map(v => (
                   <div key={v.id} className="rounded-lg border p-3">
@@ -499,8 +575,8 @@ function ExperimentCard({
                         <table className="w-full text-xs">
                           <thead>
                             <tr className="border-b">
-                              <th className="pb-1 text-left font-medium text-muted-foreground">Metric</th>
-                              <th className="pb-1 text-right font-medium text-muted-foreground">Value</th>
+                              <th className="pb-1 text-left font-medium text-muted-foreground">指標</th>
+                              <th className="pb-1 text-right font-medium text-muted-foreground">値</th>
                             </tr>
                           </thead>
                           <tbody>
@@ -522,7 +598,7 @@ function ExperimentCard({
 
           {exp.comparison && Object.keys(exp.comparison).length > 0 && (
             <div>
-              <h4 className="text-sm font-medium mb-2">Comparison</h4>
+              <h4 className="text-sm font-medium mb-2">比較結果</h4>
               <pre className="rounded-md bg-muted p-3 text-xs overflow-x-auto">
                 {JSON.stringify(exp.comparison, null, 2)}
               </pre>
@@ -550,7 +626,7 @@ function ExperimentNextAction({ humanDecision, githubPublishAvailable, capabilit
       : "/probe-planner";
     return (
       <div className="rounded-lg border p-3 space-y-2 text-xs" data-testid="experiment-next-action-adopted">
-        <div className="text-sm font-medium">Next step</div>
+        <div className="text-sm font-medium">次のステップ</div>
         {/* GitHub publish link only appears when the workflow is actually
             usable (App configured + at least one connected repo) -- shown
             or hidden by the caller's githubPublishAvailable, never here. */}
@@ -560,7 +636,7 @@ function ExperimentNextAction({ humanDecision, githubPublishAvailable, capabilit
             className="flex items-center gap-1.5 text-primary hover:underline"
             data-testid="experiment-github-publish-link"
           >
-            <GitPullRequest className="h-3.5 w-3.5" /> Publish the adopted change via GitHub
+            <GitPullRequest className="h-3.5 w-3.5" /> 採用した変更をGitHubで公開する
           </Link>
         )}
         <Link
@@ -568,7 +644,7 @@ function ExperimentNextAction({ humanDecision, githubPublishAvailable, capabilit
           className="flex items-center gap-1.5 text-primary hover:underline"
           data-testid="experiment-probe-planner-link"
         >
-          <Crosshair className="h-3.5 w-3.5" /> Start the next probe cycle in Probe Planner
+          <Crosshair className="h-3.5 w-3.5" /> Probe Plannerで次の観測サイクルを始める
         </Link>
       </div>
     );
@@ -577,13 +653,13 @@ function ExperimentNextAction({ humanDecision, githubPublishAvailable, capabilit
   if (humanDecision === "rejected" || humanDecision === "needs_more_data") {
     return (
       <div className="rounded-lg border p-3 space-y-2 text-xs" data-testid="experiment-next-action-candidate-studio">
-        <div className="text-sm font-medium">Next step</div>
+        <div className="text-sm font-medium">次のステップ</div>
         <Link
           to="/candidate-studio"
           className="flex items-center gap-1.5 text-primary hover:underline"
           data-testid="experiment-candidate-studio-link"
         >
-          <Bot className="h-3.5 w-3.5" /> Try an AI-generated candidate in Candidate Studio
+          <Bot className="h-3.5 w-3.5" /> Candidate StudioでAI候補を試す
         </Link>
       </div>
     );

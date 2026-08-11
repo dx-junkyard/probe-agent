@@ -9,7 +9,8 @@ import type {
   SystemStateAssessment,
   FlowOverlayOut, FlowOverlayRequest,
   ShadowResult, ComponentProfile, UserOut, TokenOut,
-  RepositoryCandidateOut, RepositoryConfigOut, SnapshotOut, LatestDraftsOut,
+  RepositoryCandidateOut, RepositoryConfigOut, SnapshotOut, SnapshotPreflightOut,
+  ReplayReadinessOut, TraceSummaryOut, TracePageOut, LatestDraftsOut,
   DraftGenerationResultOut,
   SymbolIndexOut, FeatureCodeLinksOut, ProbePlansListOut, ApiScanResultOut,
   FlowEntrypointsOut, FlowGraphOut, FlowProbeSelection, ProbePlanOut,
@@ -142,6 +143,43 @@ export function useTraces(componentId: string | null, limit = 50, refetchInterva
     queryFn: () => api.get<TraceEvent[]>(`/components/${componentId}/traces?limit=${limit}`),
     enabled: !!componentId && !!getSystemId(),
     refetchInterval,
+  });
+}
+
+export interface TracePageParams {
+  status: string;
+  mode: string;
+  replay: string;
+  window: string;
+  sort: string;
+  query: string;
+  offset: number;
+  limit?: number;
+}
+
+export function useTracePage(
+  componentId: string | null,
+  params: TracePageParams,
+  refetchInterval?: number,
+) {
+  const search = new URLSearchParams({
+    status: params.status,
+    mode: params.mode,
+    replay: params.replay,
+    window: params.window,
+    sort: params.sort,
+    query: params.query,
+    offset: String(params.offset),
+    limit: String(params.limit ?? 50),
+  });
+  return useQuery({
+    queryKey: [...sysKey("tracePage"), componentId, ...Array.from(search.entries())],
+    queryFn: () => api.get<TracePageOut>(
+      `/components/${encodeURIComponent(componentId!)}/trace-page?${search}`,
+    ),
+    enabled: !!componentId && !!getSystemId(),
+    refetchInterval,
+    placeholderData: previous => previous,
   });
 }
 
@@ -404,6 +442,49 @@ export function useSnapshots() {
     queryKey: sysKey("snapshots"),
     queryFn: () => api.get<SnapshotOut[]>("/repository/snapshots"),
     enabled: !!getSystemId(),
+  });
+}
+
+// Shared Snapshot preflight (Issue #369). One server evaluation, rendered by
+// candidate generation / Replay / Experiment alike, so the three surfaces
+// cannot disagree about whether a snapshot may be used. `snapshotId` omitted
+// evaluates the recommended (latest ready) snapshot -- the same one a run
+// resolves by default.
+export function useSnapshotPreflight(snapshotId?: number | null) {
+  const query = snapshotId != null ? `?snapshot_id=${snapshotId}` : "";
+  return useQuery({
+    queryKey: sysKey("snapshotPreflight", snapshotId ?? "recommended"),
+    queryFn: () => api.get<SnapshotPreflightOut>(`/snapshot-preflight${query}`),
+    enabled: !!getSystemId(),
+  });
+}
+
+// Component monitoring summary (Issue #373).
+export function useTraceSummary(componentId: string | null, refetchInterval?: number) {
+  return useQuery({
+    queryKey: sysKey("traceSummary", componentId ?? ""),
+    queryFn: () =>
+      api.get<TraceSummaryOut>(`/components/${encodeURIComponent(componentId!)}/trace-summary`),
+    enabled: !!getSystemId() && !!componentId,
+    refetchInterval,
+  });
+}
+
+// Replay readiness preflight (Issue #372). Evaluated before a candidate is
+// generated so an all-`not captured` component cannot burn an LLM call.
+export function useReplayReadiness(
+  componentId: string | null,
+  traceIds?: string[],
+  snapshotId?: number | null,
+) {
+  const params = new URLSearchParams();
+  if (componentId) params.set("component_id", componentId);
+  (traceIds ?? []).forEach(id => params.append("trace_ids", id));
+  if (snapshotId != null) params.set("snapshot_id", String(snapshotId));
+  return useQuery({
+    queryKey: sysKey("replayReadiness", componentId ?? "", (traceIds ?? []).join(","), snapshotId ?? "recommended"),
+    queryFn: () => api.get<ReplayReadinessOut>(`/replay-readiness?${params.toString()}`),
+    enabled: !!getSystemId() && !!componentId,
   });
 }
 

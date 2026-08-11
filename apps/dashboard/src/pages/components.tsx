@@ -1,7 +1,7 @@
-import { Fragment, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import {
-  useComponents, useTraces, useUpdatePolicy,
+  useComponents, useTracePage, useTraceSummary, useUpdatePolicy,
   useComponentProfile, useUpdateComponentProfile,
   useShadowResults, useUpdateEvaluation,
   useCriteria,
@@ -18,8 +18,14 @@ import { formatTimestamp } from "@/lib/utils";
 import { cn } from "@/lib/utils";
 import { Bot } from "lucide-react";
 import { AddToWorkspaceButton } from "@/components/add-to-workspace";
-import { JsonTree } from "@/components/json-tree";
 import { ReplayabilityBadge, ReplayRowActions } from "@/components/replay-row-actions";
+import { RedactionBadge, TracePayloadPanel } from "@/components/trace-payload-panel";
+import { ImprovementLoopRail } from "@/components/improvement-loop/rail";
+import { TraceSummaryCard, TraceFilterBar } from "@/components/trace-monitor-ui";
+import {
+  DEFAULT_FILTERS, filtersFromSearch, filtersToSearch,
+  formatDuration, formatRelative,
+} from "@/components/trace-monitor";
 
 const MODES = ["off", "trace", "shadow"] as const;
 const EVALUATIONS = ["unknown", "better", "worse", "same"];
@@ -37,25 +43,63 @@ const PROFILE_FIELD_LABELS_JA: Record<string, string> = {
 
 export default function ComponentsPage() {
   const navigate = useNavigate();
-  const [searchParams] = useSearchParams();
-  const { data: components, isLoading } = useComponents(SIGNAL_REFRESH_INTERVAL_MS);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const { data: components, isLoading, isError: componentsError, error: componentError, refetch: refetchComponents } = useComponents(SIGNAL_REFRESH_INTERVAL_MS);
   // Deep link from Trace Lineage / analyzer results: /components?component=<id>
   const [selected, setSelected] = useState<string | null>(
     searchParams.get("component"),
   );
   const requestedTraceId = searchParams.get("trace");
   const [expandedTraceId, setExpandedTraceId] = useState<string | null>(requestedTraceId);
+  // Issue #373: the filter/sort state lives in the URL so a reload or a shared
+  // link reproduces the same view. Unrelated params (component, trace) are
+  // preserved, keeping the Trace Lineage / analyzer deep links working.
+  const filters = filtersFromSearch(searchParams);
+  const pageValue = Number(searchParams.get("page") ?? "1");
+  const page = Number.isInteger(pageValue) && pageValue > 0 ? pageValue : 1;
+  const setFilters = (next: typeof filters) => {
+    const params = filtersToSearch(next, searchParams);
+    params.delete("page");
+    setSearchParams(params, { replace: true });
+  };
+  const setPage = (nextPage: number) => {
+    const params = new URLSearchParams(searchParams);
+    if (nextPage <= 1) params.delete("page");
+    else params.set("page", String(nextPage));
+    setSearchParams(params, { replace: true });
+  };
+  // A single clock for the whole render, so relative times inside one table
+  // are consistent with each other and with the window filter.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(id);
+  }, []);
   const updatePolicy = useUpdatePolicy();
-  const { data: traces } = useTraces(
+  const tracePageQuery = useTracePage(
     selected,
-    requestedTraceId ? 500 : 20,
-    SIGNAL_REFRESH_INTERVAL_MS,
+    {
+      ...filters,
+      query: filters.query || requestedTraceId || "",
+      offset: (page - 1) * 50,
+      limit: 50,
+    },
+    // Keep an expanded row anchored while the developer reads it. New rows
+    // resume polling as soon as the detail is collapsed; the health summary
+    // continues updating independently.
+    expandedTraceId ? undefined : SIGNAL_REFRESH_INTERVAL_MS,
   );
+  const { data: tracePage, isLoading: tracesLoading, isError: tracesError, error: traceError, refetch: refetchTraces } = tracePageQuery;
+  const traces = tracePage?.items ?? [];
   const { data: profile } = useComponentProfile(selected);
   const updateProfile = useUpdateComponentProfile();
   const { data: shadows } = useShadowResults(selected, 20);
   const updateEval = useUpdateEvaluation();
   const { data: criteria } = useCriteria(selected);
+  // Computed over ALL of the component's traces, not the loaded page --
+  // a p95 from the most recent 20 rows would change on every poll.
+  const traceSummaryQuery = useTraceSummary(selected, SIGNAL_REFRESH_INTERVAL_MS);
+  const { data: traceSummary, isLoading: summaryLoading, isError: summaryError, refetch: refetchSummary } = traceSummaryQuery;
 
   const current = components?.find(c => c.component_id === selected);
   // Issue #258: `components` rows are created (mode='trace' by default) via
@@ -67,6 +111,8 @@ export default function ComponentsPage() {
   // no longer resolves) is treated as "unknown", per the escape hatch --
   // only a definitive trace_count === 0 blocks.
   const zeroTraces = current !== undefined && current.trace_count === 0;
+
+  const visibleTraces = traces;
 
   const [profForm, setProfForm] = useState<Record<string, string>>({});
   const profileFields = ["purpose", "responsibility", "expected_input", "expected_output", "failure_impact"] as const;
@@ -91,13 +137,26 @@ export default function ComponentsPage() {
   };
 
   return (
-    <div className="flex gap-6 h-[calc(100vh-8rem)]">
+    <div className="space-y-4">
+      {/* Issue #371: Components is stage 1 of the improvement loop, not a
+          standalone page. The rail names the loop the developer is in. */}
+      <ImprovementLoopRail componentId={selected} traceId={expandedTraceId} />
+    <div className="flex gap-6 h-[calc(100vh-12rem)]">
       <div className="w-64 shrink-0 overflow-y-auto border rounded-xl p-2 space-y-1">
         <h2 className="px-2 py-1 text-xs font-semibold text-muted-foreground uppercase tracking-wider">Components</h2>
         {isLoading ? (
           <div className="space-y-2">{[1,2,3].map(i => <Skeleton key={i} className="h-10 w-full" />)}</div>
+        ) : componentsError ? (
+          <div className="space-y-2 px-2 py-4 text-xs" role="alert">
+            <p className="font-medium text-destructive">componentを取得できませんでした。</p>
+            <p className="text-muted-foreground break-words">{String(componentError)}</p>
+            <Button size="sm" variant="outline" onClick={() => refetchComponents()}>再試行</Button>
+          </div>
         ) : !components?.length ? (
-          <p className="text-xs text-muted-foreground px-2 py-4">componentがありません</p>
+          <div className="space-y-2 px-2 py-4 text-xs text-muted-foreground">
+            <p>componentがありません。</p>
+            <Button size="sm" variant="outline" onClick={() => navigate("/setup-guide")}>Setup Guideを開く</Button>
+          </div>
         ) : (
           components.map(c => (
             <button
@@ -197,10 +256,50 @@ export default function ComponentsPage() {
 
               <TabsContent value="traces">
                 <Card>
-                  <CardContent className="pt-6">
-                    {!traces?.length ? (
+                  <CardContent className="space-y-4 pt-6">
+                    {/* Issue #373: health first, then the rows. */}
+                    <TraceSummaryCard
+                      summary={traceSummary}
+                      now={now}
+                      isLoading={summaryLoading}
+                      isError={summaryError}
+                      onRetry={() => refetchSummary()}
+                    />
+                    {(!!traceSummary?.total || !!tracePage?.total) && (
+                      <TraceFilterBar
+                        filters={filters}
+                        onChange={setFilters}
+                        matched={tracePage?.total ?? 0}
+                        total={traceSummary?.total ?? tracePage?.total ?? 0}
+                      />
+                    )}
+                    {tracesLoading ? (
+                      <div className="space-y-2 py-2" aria-busy="true">
+                        {[1,2,3,4].map(i => <Skeleton key={i} className="h-10 w-full" />)}
+                      </div>
+                    ) : tracesError ? (
+                      <div className="space-y-2 py-8 text-center" role="alert">
+                        <p className="text-sm font-medium">Trace一覧を取得できませんでした。</p>
+                        <p className="text-xs text-muted-foreground">{String(traceError)}</p>
+                        <Button size="sm" variant="outline" onClick={() => refetchTraces()}>再試行</Button>
+                      </div>
+                    ) : (traceSummary?.total ?? tracePage?.total ?? 0) === 0 ? (
                       <p className="text-sm text-muted-foreground text-center py-8">Traceがまだありません</p>
+                    ) : !visibleTraces.length ? (
+                      <div className="py-8 text-center" data-testid="trace-filter-empty">
+                        <p className="text-sm text-muted-foreground">
+                          条件に一致するTraceがありません（全 {traceSummary?.total ?? tracePage?.total ?? 0} 件）。
+                        </p>
+                        <button
+                          type="button"
+                          className="mt-2 text-xs underline cursor-pointer"
+                          onClick={() => setFilters(DEFAULT_FILTERS)}
+                        >
+                          絞り込みを解除
+                        </button>
+                      </div>
                     ) : (
+                      <div className="space-y-3">
                       <div className="overflow-x-auto max-h-96 overflow-y-auto">
                         <table className="w-full text-sm">
                           <thead className="sticky top-0 bg-card">
@@ -210,11 +309,12 @@ export default function ComponentsPage() {
                               <th className="pb-2 font-medium text-muted-foreground">Duration</th>
                               <th className="pb-2 font-medium text-muted-foreground">Status</th>
                               <th className="pb-2 font-medium text-muted-foreground">Replay</th>
+                              <th className="pb-2 font-medium text-muted-foreground">秘匿値</th>
                               <th className="pb-2 font-medium text-muted-foreground text-right">Time</th>
                             </tr>
                           </thead>
                           <tbody>
-                            {traces.map(t => {
+                            {visibleTraces.map(t => {
                               const expanded = expandedTraceId === t.trace_id;
                               return (
                                 <Fragment key={t.trace_id}>
@@ -237,18 +337,25 @@ export default function ComponentsPage() {
                                       </button>
                                     </td>
                                     <td className="py-2"><Badge variant="outline">{t.mode}</Badge></td>
-                                    <td className="py-2 text-xs">{t.duration_ms != null ? `${t.duration_ms}ms` : "—"}</td>
+                                    <td className="py-2 text-xs" title={t.duration_ms != null ? `${t.duration_ms}ms` : undefined}>
+                                      {formatDuration(t.duration_ms)}
+                                    </td>
                                     <td className="py-2">
                                       {t.error ? <Badge variant="destructive">error</Badge> : <Badge variant="success">ok</Badge>}
                                     </td>
                                     <td className="py-2">
                                       <ReplayabilityBadge replayability={t.replayability} reasons={t.replay_reasons} />
                                     </td>
-                                    <td className="py-2 text-right text-xs text-muted-foreground">{formatTimestamp(t.timestamp)}</td>
+                                    <td className="py-2">
+                                      <RedactionBadge redaction={t.redaction} />
+                                    </td>
+                                    <td className="py-2 text-right text-xs text-muted-foreground" title={formatTimestamp(t.timestamp)}>
+                                      {formatRelative(t.timestamp, now)}
+                                    </td>
                                   </tr>
                                   {expanded && (
                                     <tr key={`${t.trace_id}-details`} className="border-b bg-muted/20">
-                                      <td colSpan={6} className="p-4">
+                                      <td colSpan={7} className="p-4">
                                         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
                                           <span className="text-xs text-muted-foreground">
                                             Trace ID（全体）: <span className="font-mono text-foreground">{t.trace_id}</span>
@@ -262,24 +369,21 @@ export default function ComponentsPage() {
                                             />
                                           </div>
                                         </div>
-                                        <div className="grid gap-4 lg:grid-cols-2">
-                                          <div className="min-w-0">
-                                            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">入力</h3>
-                                            <div className="max-h-64 overflow-auto rounded-md border bg-card p-3">
-                                              <JsonTree data={t.input} defaultExpanded />
-                                            </div>
-                                          </div>
-                                          <div className="min-w-0">
-                                            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">出力</h3>
-                                            <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border bg-card p-3 font-mono text-xs">{t.output ?? "—"}</pre>
-                                          </div>
-                                        </div>
-                                        {t.error && (
-                                          <div className="mt-4">
-                                            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-destructive">エラー</h3>
-                                            <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border border-destructive/40 bg-destructive/5 p-3 font-mono text-xs text-destructive">{t.error}</pre>
-                                          </div>
-                                        )}
+                                        {/* Issue #367: the payload stays closed
+                                            until asked for, behind its shape
+                                            and redaction state. */}
+                                        <TracePayloadPanel
+                                          input={t.input}
+                                          output={t.output}
+                                          error={t.error}
+                                          summary={t.payload_summary}
+                                          redaction={t.redaction}
+                                          replayAffected={
+                                            t.redaction?.fields?.some(
+                                              f => f.field === "input_capture",
+                                            ) ?? false
+                                          }
+                                        />
                                       </td>
                                     </tr>
                                   )}
@@ -288,6 +392,14 @@ export default function ComponentsPage() {
                             })}
                           </tbody>
                         </table>
+                      </div>
+                      <div className="flex items-center justify-between text-xs text-muted-foreground" data-testid="trace-pagination">
+                        <span>{tracePage!.offset + 1}〜{Math.min(tracePage!.offset + tracePage!.items.length, tracePage!.total)} / {tracePage!.total}件</span>
+                        <div className="flex gap-2">
+                          <Button size="sm" variant="outline" disabled={page <= 1} onClick={() => setPage(page - 1)}>前へ</Button>
+                          <Button size="sm" variant="outline" disabled={tracePage!.offset + tracePage!.limit >= tracePage!.total} onClick={() => setPage(page + 1)}>次へ</Button>
+                        </div>
+                      </div>
                       </div>
                     )}
                   </CardContent>
@@ -393,6 +505,7 @@ export default function ComponentsPage() {
           </div>
         )}
       </div>
+    </div>
     </div>
   );
 }

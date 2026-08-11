@@ -358,6 +358,15 @@ SMOKE_CHECK_COMPONENT_ID = "probe-smoke-check"
 
 ConnectivityState = Literal["no_signal", "smoke_only", "receiving"]
 
+# Issue #370: freshness is a SECOND, independent axis. ConnectivityState above
+# is a cumulative lifecycle milestone -- "this system has connected at least
+# once" -- and never expires. ConnectivityFreshness answers "is it receiving
+# right now", which does. Rendering the milestone as the live status is the
+# bug this type exists to prevent.
+ConnectivityFreshness = Literal[
+    "never_received", "receiving_now", "delayed", "stale"
+]
+
 
 class ConnectivityStatusOut(BaseModel):
     system_id: int
@@ -370,6 +379,49 @@ class ConnectivityStatusOut(BaseModel):
     last_trace_component_id: Optional[str] = None
     smoke_component_id: str = SMOKE_CHECK_COMPONENT_ID
     materialized_session_ids: List[int] = Field(default_factory=list)
+    # --- Issue #370: live reception, separate from the milestone above -------
+    #: Workload freshness, classified from the newest NON-smoke trace. A smoke
+    #: check proves the transport, not that the instrumented workload runs.
+    freshness: ConnectivityFreshness = "never_received"
+    #: Transport freshness, classified from the newest trace of any kind.
+    #: Reported separately so "the smoke check still gets through" stays
+    #: visible rather than being read as workload health.
+    transport_freshness: ConnectivityFreshness = "never_received"
+    #: Newest non-smoke trace; None when only smoke traces have arrived.
+    last_real_trace_at: Optional[float] = None
+    #: Seconds since the newest non-smoke trace — the same event `freshness`
+    #: judged, so the label and the relative time cannot disagree.
+    seconds_since_last_trace: Optional[float] = None
+    #: Seconds since the newest trace of any kind.
+    seconds_since_last_any_trace: Optional[float] = None
+    #: The server clock this reading was taken against, so the client can show
+    #: a relative time that does not drift with its own clock.
+    evaluated_at: float = 0.0
+    #: Positive when the newest trace is timestamped ahead of the server.
+    clock_skew_seconds: float = 0.0
+    #: Windowed real-workload counts (smoke traces excluded).
+    real_trace_count_5m: int = 0
+    real_trace_count_1h: int = 0
+    real_trace_count_24h: int = 0
+    #: The thresholds this reading used, always returned so the displayed
+    #: state is explainable without consulting the source.
+    delayed_after_seconds: float = 0.0
+    stale_after_seconds: float = 0.0
+    #: True when the thresholds came from a System-specific policy row.
+    thresholds_customized: bool = False
+
+
+class ConnectivityFreshnessPolicyOut(BaseModel):
+    system_id: int
+    delayed_after_seconds: float
+    stale_after_seconds: float
+    customized: bool
+    updated_at: Optional[float] = None
+
+
+class ConnectivityFreshnessPolicyUpdate(BaseModel):
+    delayed_after_seconds: float = Field(gt=0)
+    stale_after_seconds: float = Field(gt=0)
 
 
 class ComponentProfile(BaseModel):
@@ -476,6 +528,20 @@ InclusionStatus = Literal[
     "indexed", "metadata_only", "too_large", "binary", "excluded", "unsupported"
 ]
 SnapshotStatus = Literal["not_configured", "indexing", "ready", "failed"]
+# Issue #369: freshness is a SECOND, independent axis over the same snapshot.
+# `SnapshotStatus` answers "did the analysis finish" (`ready`); this answers
+# "does the pinned commit still equal HEAD" (`current`). Rendering one as the
+# other is the bug this issue fixes -- never collapse them.
+SnapshotFreshnessState = Literal["current", "stale", "unknown"]
+SnapshotPreflightCheckId = Literal[
+    "snapshot_processing",
+    "commit_pinned",
+    "freshness",
+    "symbol_index",
+    "understanding",
+]
+SnapshotPreflightCheckStatus = Literal["ok", "attention", "blocking", "unknown"]
+SnapshotPreflightVerdict = Literal["ready", "attention", "blocked"]
 IntelligenceRunStatus = Literal["pending", "completed", "failed"]
 DecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
 # How a single hierarchy claim was produced. Kept distinct from the audit
@@ -527,6 +593,13 @@ class SnapshotOut(BaseModel):
     created_at: float
     completed_at: Optional[float] = None
     files: List[SnapshotFileOut] = Field(default_factory=list)
+    # Issue #369: the freshness axis, independent of `status`. Populated by the
+    # list endpoint (which resolves HEAD once); `None` means "not evaluated in
+    # this response", never "current".
+    freshness: Optional[SnapshotFreshnessState] = None
+    # Exactly one snapshot per System is the recommended one (the latest ready
+    # snapshot). Every other snapshot is a reproduction-only choice.
+    is_recommended: bool = False
 
 
 class SnapshotRefOut(BaseModel):
@@ -534,6 +607,106 @@ class SnapshotRefOut(BaseModel):
     commit_sha: str
     status: str
     created_at: float
+    freshness: Optional[SnapshotFreshnessState] = None
+
+
+class SnapshotPreflightCheckOut(BaseModel):
+    """One finite preflight check result (Issue #369)."""
+
+    check_id: SnapshotPreflightCheckId
+    status: SnapshotPreflightCheckStatus
+    summary: str
+    detail: str
+    remediation: str = ""
+
+
+class SnapshotPreflightOut(BaseModel):
+    """Shared preflight for candidate generation / Replay / Experiment.
+
+    One server evaluation rendered by every surface, so the three cannot
+    disagree about whether a snapshot may be used.
+    """
+
+    snapshot_id: Optional[int] = None
+    # "Did the analysis finish" -- the existing snapshot status vocabulary.
+    processing_state: Optional[SnapshotStatus] = None
+    # "Does the pinned commit still equal HEAD" -- a separate axis.
+    freshness: SnapshotFreshnessState = "unknown"
+    commit_sha: Optional[str] = None
+    head_sha: Optional[str] = None
+    head_relation: Literal["same", "behind", "diverged", "unknown"] = "unknown"
+    commits_behind: Optional[int] = None
+    verdict: SnapshotPreflightVerdict = "blocked"
+    checks: List[SnapshotPreflightCheckOut] = Field(default_factory=list)
+    recommended_snapshot_id: Optional[int] = None
+    recommended_snapshot_commit_sha: Optional[str] = None
+    recommended_snapshot_freshness: SnapshotFreshnessState = "unknown"
+    is_recommended: bool = False
+    requires_stale_acknowledgement: bool = False
+    stale_continuation_note: Optional[str] = None
+
+
+# Issue #372: Replay readiness, evaluated before a candidate is generated.
+ReplayReadinessStatus = Literal["ok", "attention", "blocking"]
+ReplayReadinessVerdict = Literal["ready", "attention", "blocked"]
+
+
+class ReplayReadinessCountsOut(BaseModel):
+    """How a set of traces splits across the finite replayability values.
+
+    `not_captured` (the component never opted into `replay_capture`) is kept
+    separate from `unreplayable` (capture was attempted and failed): the
+    remediation differs, so merging them would give the wrong instruction.
+    """
+
+    total: int
+    replayable: int
+    partial: int
+    unreplayable: int
+    not_captured: int
+    #: replayable + partial — the traces that can produce a comparison at all.
+    usable: int
+
+
+class ReplayReadinessCheckOut(BaseModel):
+    check_id: str
+    status: ReplayReadinessStatus
+    summary: str
+    detail: str
+    remediation: str
+
+
+class ReplayTraceReadinessOut(BaseModel):
+    trace_id: str
+    replayability: Literal["replayable", "partial", "unreplayable", "not_captured"]
+    primary_reason: Optional[str] = None
+
+
+class ReplayReadinessOut(BaseModel):
+    component_id: str
+    snapshot_id: Optional[int] = None
+    #: Every trace of the component.
+    counts: ReplayReadinessCountsOut
+    #: Only the traces a run would actually use (the auto-selected window, or
+    #: the explicitly chosen ids).
+    selected: ReplayReadinessCountsOut
+    selection_limit: int
+    selection_is_automatic: bool
+    verdict: ReplayReadinessVerdict
+    checks: List[ReplayReadinessCheckOut] = Field(default_factory=list)
+    traces: List[ReplayTraceReadinessOut] = Field(default_factory=list)
+
+
+class StaleSnapshotAck(BaseModel):
+    """The developer's explicit decision to continue on a stale snapshot.
+
+    ``decision_method: manual`` -- an LLM or heuristic never supplies this.
+    The reason is persisted on the record that consumes the snapshot.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(..., min_length=1, max_length=1000)
 
 
 class RepositoryStatusOut(BaseModel):
@@ -721,6 +894,11 @@ class ExperimentCreate(BaseModel):
     variants: List[ExperimentVariantCreate] = Field(
         ..., min_length=2, max_length=10
     )
+    # Issue #369: required when the chosen snapshot is definitively behind
+    # HEAD. Continuing on an older snapshot is legitimate (reproduction runs),
+    # but it is the developer's decision, so it is recorded on the experiment
+    # rather than inferred. `decision_method: manual`.
+    stale_snapshot_reason: Optional[str] = Field(None, min_length=1, max_length=1000)
 
 
 class ExperimentCommandOut(BaseModel):
@@ -1892,6 +2070,10 @@ class ProbePlanFromFlowRequest(BaseModel):
 
 Role = Literal["admin", "user"]
 TokenKind = Literal["session", "api"]
+# Issue #368: a token's lifecycle status is a finite set decided server-side
+# from `revoked` + `expires_at` + the current clock (`app/token_status.py`).
+# The Dashboard renders it and never re-derives it.
+TokenStatus = Literal["active", "expiring_soon", "expired", "revoked"]
 
 
 class LoginRequest(BaseModel):
@@ -1974,6 +2156,21 @@ class TokenOut(BaseModel):
     revoked: bool
     created_at: float
     expires_at: Optional[float] = None
+    status: TokenStatus = Field(
+        ...,
+        description=(
+            "active | expiring_soon | expired | revoked -- Issue #368. Decided "
+            "server-side by app/token_status.classify_token_status against the "
+            "response's own clock; never re-derive it client-side."
+        ),
+    )
+    expires_in_seconds: Optional[float] = Field(
+        default=None,
+        description=(
+            "Seconds until expiry at the moment `status` was decided, clamped "
+            "at 0; None when the token has no expiry."
+        ),
+    )
 
 
 class TokenCreateResponse(TokenOut):
@@ -5684,6 +5881,7 @@ class ReplaySetOut(BaseModel):
 class ReplayRunCreate(BaseModel):
     replay_set_id: int
     snapshot_id: Optional[int] = None
+    stale_snapshot_reason: Optional[str] = Field(None, min_length=1, max_length=1000)
 
 
 class ReplayCaseResultOut(BaseModel):
@@ -5725,6 +5923,9 @@ class ReplayRunOut(BaseModel):
     created_at: float
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
+    snapshot_freshness: Optional[SnapshotFreshnessState] = None
+    head_sha_at_creation: Optional[str] = None
+    stale_ack_reason: Optional[str] = None
 
 
 # --- Replay variants (Issue #242 Phase C / #245) -----------------------------
@@ -5762,6 +5963,9 @@ class ReplayVariantRunCreate(BaseModel):
     replay_set_id: int
     snapshot_id: Optional[int] = None
     variants: List[ReplayVariantCreate] = Field(..., min_length=1, max_length=20)
+    # Issue #369: required when the resolved snapshot is definitively behind
+    # HEAD. Same manual decision the Experiment records.
+    stale_snapshot_reason: Optional[str] = Field(None, min_length=1, max_length=1000)
 
 
 class ReplayVariantCaseResultOut(BaseModel):
@@ -5984,6 +6188,9 @@ class CandidateSessionCreate(BaseModel):
     trace_id: Optional[str] = None
     snapshot_id: Optional[int] = None
     objective: str = Field(default="", max_length=5000)
+    # Issue #369: required when the resolved snapshot is definitively behind
+    # HEAD. Same manual decision the Experiment records.
+    stale_snapshot_reason: Optional[str] = Field(None, min_length=1, max_length=1000)
 
 
 class CandidateProposal(BaseModel):

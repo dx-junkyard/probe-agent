@@ -25,6 +25,7 @@ from ..models import (
     ExperimentVariantResultOut,
 )
 from ..validation_runner import load_validation_config_text
+from .snapshot_preflight import require_snapshot_preflight
 
 router = APIRouter()
 PROMPT_VERSION = "experiment-interpretation-v1"
@@ -162,6 +163,16 @@ def create_experiment(
     system_id: int = Depends(get_system_id),
 ) -> ExperimentOut:
     now = time.time()
+
+    # Issue #369: the shared preflight decides freshness, and a snapshot that
+    # is definitively behind HEAD may only be used with the developer's stated
+    # reason. Evaluated BEFORE the write connection is opened: `gather_preflight`
+    # runs `git` subprocesses, and the SQLite lock is process-wide and
+    # non-reentrant (see .claude/skills/control-server/SKILL.md).
+    freshness, head_sha, stale_reason = require_snapshot_preflight(
+        system_id, payload.snapshot_id, payload.stale_snapshot_reason
+    )
+
     with get_conn() as conn:
         snapshot = conn.execute(
             """
@@ -229,8 +240,9 @@ def create_experiment(
             """
             INSERT INTO experiments
                 (system_id, feature_id, objective, snapshot_id, baseline_commit,
-                 config_revision, execution_config, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?)
+                 config_revision, execution_config, status, created_at,
+                 snapshot_freshness, head_sha_at_creation, stale_ack_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?)
             """,
             (
                 system_id,
@@ -241,6 +253,9 @@ def create_experiment(
                 config_revision,
                 json.dumps(execution_config),
                 now,
+                freshness,
+                head_sha,
+                stale_reason,
             ),
         )
         experiment_id = cur.lastrowid

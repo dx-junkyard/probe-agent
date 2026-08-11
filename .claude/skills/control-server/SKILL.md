@@ -20,6 +20,74 @@ Use this skill for files under:
 - `PUT /components/{component_id}/policy`
 - `POST /components/{component_id}/shadow-results`
 
+## Trace ingestion redaction (Issue #367)
+
+`POST /traces` redacts **before the row is written**, in
+`app/trace_redaction.py`, reusing the SDK's rule tables
+(`probe_agent.redaction.SENSITIVE_KEYS` and `probe_agent.secret_patterns`) so
+the send boundary and the ingestion boundary cannot drift apart. This is not
+redundant with the SDK: an older SDK, a non-SDK HTTP client, and
+`PROBE_PAYLOAD_MODE=full` all reach this endpoint.
+
+The contract belongs to the **storage boundary**, not to `POST /traces`.
+Three tables hold payloads and all three are covered: `traces`,
+`trace_projections` (written by both the trace route and the shadow route),
+and `shadow_results`. Adding a payload column means updating the write path,
+`GET /traces/redaction-audit`, AND `POST /traces/redaction-rescan` — an audit
+narrower than the writers reports `unscanned_rows: 0` while plaintext sits in
+a table it never looked at.
+
+Rules to preserve when touching trace persistence:
+
+- Redact on the write path, never at render time. A presentation-only mask
+  leaves plaintext in the DB, in exports, and in Replay / Candidate Studio /
+  Workspaces, all of which read the stored row.
+- `traces.redaction_json` is `NULL` **only** for rows that predate this
+  feature. A clean payload still records `{"redacted": false, ...}`. Do not
+  "optimise" the clean case back to `NULL` — `GET /traces/redaction-audit`
+  uses exactly that distinction to find rows that were never scanned.
+- Redacting `input_capture` degrades `replayability` to `partial` with reason
+  `redacted`, one-directionally (never upgrades, never touches
+  `unreplayable`).
+- Add any new trace column to all four places or the quota accounting silently
+  drifts: the `CREATE TABLE`, the `_add_column_if_missing` migration,
+  `_stored_trace_bytes`, and `_current_trace_usage`'s SQL sum.
+- `POST /traces/redaction-rescan` is an explicit operator action, not a
+  startup migration: it destroys data on purpose and the exposed credential
+  still has to be rotated by a human. See `docs/secret-redaction.md`.
+
+## Two-axis state endpoints (Issue #366)
+
+Four surfaces in this epic had one displayed word carrying two independent
+facts. Each is now two finite axes decided server-side. When touching any of
+them, keep the axes separate and keep the decision on the server — the
+Dashboard renders, it does not re-derive:
+
+- `GET /connectivity/status` — `state` (cumulative milestone, never regresses)
+  and `freshness` (live, regresses). Thresholds come from
+  `connectivity_freshness_policy` and are returned with every reading;
+  `state_facts.classify_connectivity_freshness` is a pure function of
+  `(last_trace_at, now, thresholds)` so boundaries are testable at an exact
+  instant. Windowed counts exclude smoke traces.
+- `GET /tokens/me`, `GET /tokens` — `app/token_status.py` is the ONLY
+  definition of a token's status. Do not add a second one client-side.
+- `GET /snapshot-preflight` — processing state vs freshness, one recommended
+  snapshot, `unknown` never blocks. Every surface that pins a snapshot calls
+  `require_snapshot_preflight` (Experiment creation, Candidate Studio
+  sessions, Replay variant runs) and records the decision on its own row; a
+  preflight wired into one of the three is not shared. `gather_preflight`
+  runs `git` subprocesses: never call it inside a `get_conn()` block.
+- `GET /replay-readiness` — replayability counts before generation.
+  `POST /candidate-sessions` enforces it (422 `no_replayable_traces`) so no
+  reasoning-model call is spent on an unevaluable candidate, and
+  `POST .../generate` re-checks immediately before the call. Judge the set the
+  run will replay: with a `replay_set_id` that is the Set's own `trace_ids`,
+  never the recent-N window. Keep `not_captured` distinct from
+  `unreplayable`.
+- `connectivity/status` — `freshness` is the WORKLOAD axis, from
+  `last_real_trace_at`. A smoke ping must never revive it; that is what
+  `transport_freshness` is for.
+
 ## Evaluation context APIs (issue #9)
 
 - `GET /system-profile`, `PUT /system-profile` (singleton, id `default`)

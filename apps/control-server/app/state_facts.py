@@ -67,6 +67,12 @@ __all__ = [
     "ConnectivityFacts",
     "get_connectivity_facts",
     "classify_connectivity_state",
+    "classify_connectivity_freshness",
+    "get_freshness_thresholds",
+    "FRESHNESS_VALUES",
+    "DEFAULT_DELAYED_AFTER_SECONDS",
+    "DEFAULT_STALE_AFTER_SECONDS",
+    "CLOCK_SKEW_TOLERANCE_SECONDS",
     "count_approved_probe_plans",
     "count_undecided_completed_experiments",
     "plan_has_validated_patch",
@@ -294,6 +300,83 @@ def get_active_build(conn, system_id: int, snapshot_id: int):
 # --- SDK connectivity ------------------------------------------------------------
 
 
+# --- freshness (Issue #370) ---------------------------------------------------
+#
+# "Ever connected" and "still receiving" are different questions, and the audit
+# found the UI answering the second with the first: a system whose last trace
+# arrived 14 days ago still showed a green 受信中. Lifecycle milestones are
+# cumulative and never expire; freshness is a statement about *now* and does.
+# The two are kept as separate axes with separate vocabularies so no caller can
+# accidentally substitute one for the other.
+
+FRESHNESS_NEVER_RECEIVED = "never_received"
+FRESHNESS_RECEIVING_NOW = "receiving_now"
+FRESHNESS_DELAYED = "delayed"
+FRESHNESS_STALE = "stale"
+FRESHNESS_VALUES = (
+    FRESHNESS_NEVER_RECEIVED,
+    FRESHNESS_RECEIVING_NOW,
+    FRESHNESS_DELAYED,
+    FRESHNESS_STALE,
+)
+
+#: Defaults, in seconds. Deliberately generous: probe-agent cannot know a
+#: system's expected traffic rate, so the defaults only distinguish "clearly
+#: live" from "clearly not", and a System can narrow them (see
+#: ``get_freshness_thresholds``). Issue #370 explicitly rejects forcing one
+#: expected reception frequency on every system.
+DEFAULT_DELAYED_AFTER_SECONDS = 15 * 60
+DEFAULT_STALE_AFTER_SECONDS = 24 * 3600
+
+#: A trace timestamped slightly ahead of the server is a clock difference, not
+#: a future event. Beyond this the skew is reported so the operator can see
+#: that the freshness reading rests on a disagreeing clock.
+CLOCK_SKEW_TOLERANCE_SECONDS = 120
+
+
+def classify_connectivity_freshness(
+    *,
+    last_trace_at: Optional[float],
+    now: float,
+    delayed_after_seconds: float = DEFAULT_DELAYED_AFTER_SECONDS,
+    stale_after_seconds: float = DEFAULT_STALE_AFTER_SECONDS,
+) -> str:
+    """Deterministic 4-way freshness classification (finite set, Principle 6).
+
+    Boundaries are inclusive-at-the-threshold: an age exactly equal to
+    ``delayed_after_seconds`` is already ``delayed``, so the transition is
+    testable at a single point rather than spread across a gap.
+
+    A negative age (the trace's clock is ahead of the server's) is treated as
+    ``receiving_now``: it means data arrived, and a clock difference must not
+    be reported as staleness. The skew itself is surfaced separately.
+    """
+    if last_trace_at is None:
+        return FRESHNESS_NEVER_RECEIVED
+    age = now - last_trace_at
+    if age >= stale_after_seconds:
+        return FRESHNESS_STALE
+    if age >= delayed_after_seconds:
+        return FRESHNESS_DELAYED
+    return FRESHNESS_RECEIVING_NOW
+
+
+def get_freshness_thresholds(conn, system_id: int) -> tuple:
+    """Return ``(delayed_after_seconds, stale_after_seconds)`` for one System.
+
+    Falls back to the documented defaults when the System has not set its own,
+    so the thresholds are always explicit and always readable by the UI.
+    """
+    row = conn.execute(
+        """SELECT delayed_after_seconds, stale_after_seconds
+             FROM connectivity_freshness_policy WHERE system_id = ?""",
+        (system_id,),
+    ).fetchone()
+    if row is None:
+        return DEFAULT_DELAYED_AFTER_SECONDS, DEFAULT_STALE_AFTER_SECONDS
+    return row["delayed_after_seconds"], row["stale_after_seconds"]
+
+
 @dataclass(frozen=True)
 class ConnectivityFacts:
     total_trace_count: int
@@ -303,10 +386,34 @@ class ConnectivityFacts:
     last_trace_at: Optional[float]
     last_trace_component_id: Optional[str]
     materialized_session_ids: List[int]
+    # Issue #370: windowed counts, so "is it still running" is answered by
+    # observed arrivals in a bounded recent period rather than by a cumulative
+    # total that can never decrease.
+    real_trace_count_5m: int = 0
+    real_trace_count_1h: int = 0
+    real_trace_count_24h: int = 0
+    #: Positive when the newest trace is timestamped ahead of the server.
+    clock_skew_seconds: float = 0.0
+    #: Newest NON-smoke trace. A manual smoke check proves the transport
+    #: works; it says nothing about whether the instrumented workload is
+    #: still running, so workload freshness is measured from this and never
+    #: from ``last_trace_at``.
+    last_real_trace_at: Optional[float] = None
 
 
-def get_connectivity_facts(conn, system_id: int, smoke_component_id: str) -> ConnectivityFacts:
-    """Trace-reception counts backing the SDK connectivity status endpoint."""
+def get_connectivity_facts(
+    conn,
+    system_id: int,
+    smoke_component_id: str,
+    now: Optional[float] = None,
+) -> ConnectivityFacts:
+    """Trace-reception counts backing the SDK connectivity status endpoint.
+
+    ``now`` is injected rather than read inside so freshness boundaries are
+    testable at an exact instant.
+    """
+    if now is None:
+        now = time.time()
     counts = conn.execute(
         """
         SELECT
@@ -323,6 +430,24 @@ def get_connectivity_facts(conn, system_id: int, smoke_component_id: str) -> Con
     total = counts["total"] or 0
     smoke = counts["smoke"] or 0
     real = total - smoke
+
+    # Windowed counts exclude smoke traces: a smoke check proves the transport
+    # works, not that the instrumented workload is running.
+    windows = conn.execute(
+        """
+        SELECT
+            SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) AS w5m,
+            SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) AS w1h,
+            SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) AS w24h,
+            MAX(timestamp) AS last_real_at
+        FROM traces
+        WHERE system_id = ? AND component_id != ?
+        """,
+        (now - 300, now - 3600, now - 86400, system_id, smoke_component_id),
+    ).fetchone()
+
+    last_at = counts["last_at"]
+    clock_skew = max(0.0, (last_at - now)) if last_at is not None else 0.0
 
     last_component = None
     if total > 0:
@@ -353,9 +478,14 @@ def get_connectivity_facts(conn, system_id: int, smoke_component_id: str) -> Con
         smoke_trace_count=smoke,
         real_trace_count=real,
         first_trace_at=counts["first_at"],
-        last_trace_at=counts["last_at"],
+        last_trace_at=last_at,
         last_trace_component_id=last_component,
         materialized_session_ids=[r["id"] for r in materialized_rows],
+        real_trace_count_5m=windows["w5m"] or 0,
+        real_trace_count_1h=windows["w1h"] or 0,
+        real_trace_count_24h=windows["w24h"] or 0,
+        clock_skew_seconds=clock_skew,
+        last_real_trace_at=windows["last_real_at"],
     )
 
 

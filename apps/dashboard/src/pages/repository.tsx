@@ -4,8 +4,13 @@ import {
   useRepositoryCandidates, useRepositoryConfig, useUpdateRepositoryConfig,
   useSnapshots, useLatestSnapshot, useCreateSnapshot, useSymbols, useIndexSymbols,
   useApiScanResult, useRunApiScan, useRepositoryStatus, useSystemState,
-  useLatestRepositoryResync, useStartRepositoryResync, sysKey,
+  useLatestRepositoryResync, useStartRepositoryResync, useSnapshotPreflight, sysKey,
 } from "@/api/hooks";
+import {
+  SnapshotFreshnessBadge,
+  SnapshotPreflightPanel,
+  SnapshotProcessingBadge,
+} from "@/components/snapshot-preflight";
 import { useAuth } from "@/api/auth";
 import {
   useDiagnosticFocus, useDiagnosticHighlight, DiagnosticFixCallout,
@@ -56,6 +61,11 @@ export default function RepositoryPage() {
   // gates on the repository being definitively unconfigured (two-stage rule:
   // stays unblocked while status is loading/unknown).
   const configGate = useRepositoryConfiguredGate();
+  // Issue #369: the recommended snapshot and its freshness come from the same
+  // shared preflight the Experiment / Candidate / Replay surfaces read, so
+  // this page cannot label a snapshot differently from the place it is used.
+  const { data: preflight } = useSnapshotPreflight();
+  const recommendedSnapshotId = preflight?.recommended_snapshot_id ?? null;
 
   const configKey = systemId != null ? `${systemId}-${config?.repo_path ?? ""}` : "empty";
 
@@ -163,6 +173,7 @@ export default function RepositoryPage() {
               <Button
                 {...snapshotHighlight}
                 size="sm"
+                variant="outline"
                 onClick={() => createSnapshot.mutateAsync().then(s => {
                   if (s.status === "failed") {
                     toast.error(`Snapshot failed: ${s.error_summary ?? "unknown error"}`);
@@ -176,10 +187,15 @@ export default function RepositoryPage() {
                 title={configGate.blocked ? [configGate.summary, configGate.remediation].filter(Boolean).join(" ") : undefined}
               >
                 <RefreshCw className={`h-4 w-4 mr-1 ${createSnapshot.isPending ? "animate-spin" : ""}`} />
-                Create Snapshot
+                Snapshotのみ作成（詳細操作）
               </Button>
             </CardHeader>
             <CardContent>
+              {/* Issue #369: one shared statement of where the recommended
+                  snapshot stands, in the same words every other surface uses. */}
+              <div className="mb-3">
+                <SnapshotPreflightPanel preflight={preflight} />
+              </div>
               {configGate.blocked && (
                 <p className="text-xs text-muted-foreground mb-3" data-testid="create-snapshot-not-configured-reason">
                   {configGate.summary} {configGate.remediation}{" "}
@@ -198,12 +214,25 @@ export default function RepositoryPage() {
                     <div key={s.id} className="rounded-lg border p-4 space-y-2">
                       <div className="flex items-start justify-between">
                         <div className="space-y-1">
-                          <div className="flex items-center gap-2">
+                          {/* Issue #369: two axes, two badges. `status` says
+                              whether the analysis finished; freshness says
+                              whether the pinned commit still equals HEAD. A
+                              ready snapshot can be stale, so one badge cannot
+                              carry both — that conflation was the bug. */}
+                          <div className="flex flex-wrap items-center gap-2">
                             <GitCommit className="h-4 w-4 text-muted-foreground" />
                             <span className="font-mono text-xs">{s.commit_sha?.slice(0, 8)}</span>
-                            <Badge variant={s.status === "ready" ? "success" : s.status === "failed" ? "destructive" : "secondary"}>
-                              {s.status}
-                            </Badge>
+                            <SnapshotProcessingBadge state={s.status} />
+                            {s.id === recommendedSnapshotId ? (
+                              <>
+                                <SnapshotFreshnessBadge
+                                  freshness={preflight?.freshness ?? "unknown"}
+                                />
+                                <Badge variant="default" data-testid="snapshot-recommended">推奨</Badge>
+                              </>
+                            ) : (
+                              <span className="text-xs text-muted-foreground">再現用途</span>
+                            )}
                           </div>
                           <div className="flex items-center gap-4 text-xs text-muted-foreground">
                             <span><FolderTree className="inline h-3 w-3 mr-1" />{s.file_count} files</span>
@@ -351,12 +380,23 @@ function shortSha(sha: string | null | undefined): string {
 }
 
 function repositoryLagLabel(status: RepositoryStatus): string {
-  if (status.head_relation === "same") return "Latest";
+  if (status.head_relation === "same") return "最新";
   if (status.head_relation === "behind" && status.commits_behind != null) {
-    return `${status.commits_behind} commit${status.commits_behind === 1 ? "" : "s"} behind`;
+    return `${status.commits_behind} commit遅れ`;
   }
-  if (status.head_relation === "diverged") return "History diverged";
-  return "Lag unknown";
+  if (status.head_relation === "diverged") return "履歴が分岐しています";
+  return "差分を確認できません";
+}
+
+function repositoryNextActionLabel(action: string): string {
+  const labels: Record<string, string> = {
+    "Configure the target repository.": "対象Repositoryを設定してください。",
+    "Working tree is dirty; commit, stash, or revert before relying on patch apply.": "working treeに未commit変更があります。patch適用前にcommit・stash・revertしてください。",
+    "Create a snapshot of the current HEAD.": "現在のHEADからSnapshotを作成してください。",
+    "Repository HEAD changed; create a new snapshot before generating new analysis or patches.": "RepositoryのHEADが変わりました。新しい解析やpatchを生成する前にSnapshotを更新してください。",
+    "Re-index symbols for the latest snapshot.": "最新Snapshotのsymbol indexを更新してください。",
+  };
+  return labels[action] ?? action;
 }
 
 function RepositoryRefreshHub({
@@ -399,64 +439,67 @@ function RepositoryRefreshHub({
       <Card>
         <CardHeader>
           <CardTitle className="text-base flex items-center gap-2">
-            <GitBranch className="h-4 w-4" /> Repository Refresh
+            <GitBranch className="h-4 w-4" /> Repository更新
           </CardTitle>
-          <CardDescription>Configure the target repository to enable the refresh loop.</CardDescription>
+          <CardDescription>更新を開始するには対象Repositoryを設定してください。</CardDescription>
         </CardHeader>
       </Card>
     );
   }
 
   const fresh = !status.snapshot_stale && !status.symbols_stale && !status.working_tree_dirty && !status.head_error;
+  const showResyncJob = !!resyncJob && (
+    resyncJob.status !== "completed"
+    || resyncJob.snapshot_id === status.latest_snapshot?.id
+  );
 
   return (
     <Card data-testid="refresh-hub">
       <CardHeader className="flex flex-row items-start justify-between gap-4">
         <div>
           <CardTitle className="text-base flex items-center gap-2">
-            <GitBranch className="h-4 w-4" /> Repository Refresh Hub
+            <GitBranch className="h-4 w-4" /> Repository更新
           </CardTitle>
           <CardDescription>
-            Detect when analysis is stale relative to the repository and re-run the
-            steps in order. Reads HEAD / working tree only — never fetches, pulls, or
-            writes to the repository.
+            Repositoryに対して解析が古くなっていないか確認し、必要な更新を順番に実行します。
+            HEADとworking treeを読み取るだけで、fetch・pull・Repositoryへの書き込みは行いません。
           </CardDescription>
         </div>
         <Button size="sm" variant="outline" onClick={() => refetch()} disabled={isFetching}>
           <RefreshCw className={`h-4 w-4 mr-1 ${isFetching ? "animate-spin" : ""}`} />
-          Refresh status
+          状態を更新
         </Button>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5 text-sm">
           <div className="space-y-0.5">
-            <div className="text-xs text-muted-foreground">Current HEAD</div>
+            <div className="text-xs text-muted-foreground">現在のHEAD</div>
             <div className="font-mono">{shortSha(status.current_head)}</div>
           </div>
           <div className="space-y-0.5">
-            <div className="text-xs text-muted-foreground">Latest snapshot</div>
+            <div className="text-xs text-muted-foreground">最新Snapshot</div>
             <div className="font-mono flex items-center gap-1">
               {status.latest_snapshot
                 ? <>#{status.latest_snapshot.id} <span className="text-muted-foreground">{shortSha(status.latest_snapshot.commit_sha)}</span></>
-                : "none"}
+                : "なし"}
             </div>
           </div>
           <div className="space-y-0.5">
-            <div className="text-xs text-muted-foreground">Symbol index</div>
+            <div className="text-xs text-muted-foreground">symbol index</div>
             <div className="font-mono">
-              {status.latest_indexed_snapshot ? `#${status.latest_indexed_snapshot.id}` : "none"}
+              {status.latest_indexed_snapshot ? `#${status.latest_indexed_snapshot.id}` : "なし"}
             </div>
           </div>
           <div className="space-y-0.5">
-            <div className="text-xs text-muted-foreground">Understanding build</div>
+            <div className="text-xs text-muted-foreground">Understanding構築</div>
             <div className="font-mono">
               {status.understanding_snapshot_id
                 ? `#${status.understanding_snapshot_id} (${status.understanding_status ?? "?"})`
-                : "none"}
+                : "なし"}
             </div>
           </div>
           <div className="space-y-0.5">
-            <div className="text-xs text-muted-foreground">Snapshot vs HEAD</div>
+            <div className="text-xs text-muted-foreground">SnapshotとHEADの差</div>
             <div className="font-medium" data-testid="repository-lag">
               {repositoryLagLabel(status)}
             </div>
@@ -466,21 +509,21 @@ function RepositoryRefreshHub({
         <div className="flex flex-wrap items-center gap-2">
           {fresh && (
             <Badge variant="success" className="gap-1">
-              <CheckCircle2 className="h-3 w-3" /> Up to date
+              <CheckCircle2 className="h-3 w-3" /> 最新です
             </Badge>
           )}
           {status.snapshot_stale && (
-            <Badge variant="destructive" data-testid="snapshot-stale-badge">Snapshot stale vs HEAD</Badge>
+            <Badge variant="destructive" data-testid="snapshot-stale-badge">SnapshotがHEADより古い</Badge>
           )}
           {status.symbols_stale && !status.snapshot_stale && (
-            <Badge variant="warning">Symbols stale</Badge>
+            <Badge variant="warning">symbolが古い</Badge>
           )}
           {status.working_tree_dirty && (
             <Badge variant="warning" data-testid="dirty-badge">
-              Working tree dirty ({status.dirty_file_count})
+              working treeに未commit変更あり（{status.dirty_file_count}件）
             </Badge>
           )}
-          {status.head_error && <Badge variant="destructive">HEAD unreadable</Badge>}
+          {status.head_error && <Badge variant="destructive">HEADを読み取れません</Badge>}
         </div>
 
         {status.head_error && (
@@ -490,15 +533,15 @@ function RepositoryRefreshHub({
         {status.snapshot_stale && (
           <div className="rounded-md border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
             {status.latest_snapshot
-              ? <>This analysis is based on snapshot #{status.latest_snapshot.id} at <code>{shortSha(status.latest_snapshot.commit_sha)}</code>; repository HEAD is <code>{shortSha(status.current_head)}</code>. Create a new snapshot and rebuild before generating a new patch.</>
-              : <>No snapshot exists for HEAD <code>{shortSha(status.current_head)}</code> yet. Create the first snapshot to begin analysis.</>}
+              ? <>現在の解析はSnapshot #{status.latest_snapshot.id}（<code>{shortSha(status.latest_snapshot.commit_sha)}</code>）に基づいていますが、RepositoryのHEADは<code>{shortSha(status.current_head)}</code>です。新しいpatchを生成する前にSnapshotを更新してください。</>
+              : <>HEAD <code>{shortSha(status.current_head)}</code>のSnapshotがまだありません。最初のSnapshotを作成して解析を開始してください。</>}
           </div>
         )}
 
         {status.working_tree_dirty && status.dirty_sample.length > 0 && (
           <details className="text-xs">
             <summary className="cursor-pointer text-muted-foreground">
-              {status.dirty_file_count} uncommitted change(s) — commit, stash, or revert before relying on patch apply
+              未commit変更が{status.dirty_file_count}件あります — patch適用前にcommit・stash・revertしてください
             </summary>
             <pre className="mt-2 rounded bg-muted p-2 overflow-x-auto">{status.dirty_sample.join("\n")}</pre>
           </details>
@@ -506,77 +549,85 @@ function RepositoryRefreshHub({
 
         {status.next_actions.length > 0 && (
           <div className="text-xs">
-            <div className="font-medium mb-1">Next steps</div>
+            <div className="font-medium mb-1">次のステップ</div>
             <ol className="list-decimal pl-5 space-y-0.5 text-muted-foreground">
-              {status.next_actions.map((a, i) => <li key={i}>{a}</li>)}
+              {status.next_actions.map((a, i) => <li key={i}>{repositoryNextActionLabel(a)}</li>)}
             </ol>
           </div>
         )}
 
-        {resyncJob && (
+        {showResyncJob && resyncJob && (
           <div className="rounded-md border bg-muted/30 px-3 py-2 text-xs space-y-1" data-testid="resync-job-status">
             {resyncActive && (
               <div className="flex items-center gap-2">
                 <RefreshCw className="h-3.5 w-3.5 animate-spin" />
                 <span>
                   {resyncJob.status === "indexing"
-                    ? `Indexing symbols for snapshot #${resyncJob.snapshot_id ?? "…"}`
-                    : "Creating a committed repository snapshot"}
+                    ? `Snapshot #${resyncJob.snapshot_id ?? "…"} のsymbolをindex中`
+                    : "commit済みRepositoryからSnapshotを作成中"}
                 </span>
               </div>
             )}
             {resyncJob.status === "completed" && (
               <div className="space-y-1">
                 <div className="text-emerald-700 dark:text-emerald-300">
-                  Snapshot #{resyncJob.snapshot_id} and its symbol index are ready.
+                  Snapshot #{resyncJob.snapshot_id} とsymbol indexの準備ができました。
                 </div>
                 {resyncJob.stale_capability_count > 0 && (
                   <div data-testid="stale-capability-guidance">
-                    <span>{resyncJob.stale_capability_count} capabilit{resyncJob.stale_capability_count === 1 ? "y" : "ies"} still use an older snapshot. </span>
-                    <Link className="text-primary hover:underline" to="/capability-map">Review Capability Map</Link>
+                    <span>{resyncJob.stale_capability_count}件のCapabilityが古いSnapshotを参照しています。 </span>
+                    <Link className="text-primary hover:underline" to="/capability-map">Capability Mapを確認</Link>
                     <span> · </span>
-                    <Link className="text-primary hover:underline" to="/system-understanding?fix=build">Build System Understanding</Link>
+                    <Link className="text-primary hover:underline" to="/system-understanding?fix=build">System Understandingを構築</Link>
                   </div>
                 )}
               </div>
             )}
             {resyncJob.status === "snapshot_failed" && (
-              <div className="text-destructive">Snapshot failed: {resyncJob.error ?? "unknown error"}</div>
+              <div className="text-destructive">Snapshot作成に失敗しました: {resyncJob.error ?? "不明なエラー"}</div>
             )}
             {resyncJob.status === "index_failed" && (
               <div className="text-destructive">
-                Symbol index failed for retained snapshot #{resyncJob.snapshot_id}: {resyncJob.error ?? "unknown error"}
+                保持したSnapshot #{resyncJob.snapshot_id} のsymbol indexに失敗しました: {resyncJob.error ?? "不明なエラー"}
               </div>
             )}
           </div>
         )}
 
-        {/* Guided actions: the whole refresh flow in one place instead of scattered buttons. */}
-        <div className="flex flex-wrap gap-2">
+        {/* One recommended action. Snapshot-only / index-only operations are
+            retained for recovery and reproduction, but disclosed as advanced
+            operations so they no longer compete with the normal path. */}
+        <div className="space-y-2">
           <Button
             size="sm"
             data-testid="repository-resync-button"
             onClick={() => startResync.mutateAsync()
-              .then(() => toast.success("Repository refresh started"))
+              .then(() => toast.success("Repositoryの更新を開始しました"))
               .catch((e) => toast.error(String(e)))}
             disabled={startResync.isPending || resyncActive}
           >
             <RefreshCw className={`h-4 w-4 mr-1 ${startResync.isPending || resyncActive ? "animate-spin" : ""}`} />
-            {resyncActive ? "Refreshing snapshot + symbols" : "Refresh snapshot + symbols"}
+            {resyncActive ? "Snapshotとsymbolを更新中" : "Snapshotとsymbolをまとめて更新"}
           </Button>
-          <Button size="sm" onClick={onCreateSnapshot} disabled={creatingSnapshot}>
-            <RefreshCw className={`h-4 w-4 mr-1 ${creatingSnapshot ? "animate-spin" : ""}`} />
-            {status.snapshot_stale ? "Create new snapshot" : "Re-snapshot"}
-          </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={onIndexSymbols}
-            disabled={indexingSymbols || !status.latest_snapshot}
-          >
-            <Code2 className={`h-4 w-4 mr-1 ${indexingSymbols ? "animate-spin" : ""}`} />
-            Index symbols
-          </Button>
+          <p className="text-xs text-muted-foreground">通常はこの操作だけで、推奨Snapshotの作成とsymbol index更新が完了します。</p>
+          <details>
+            <summary className="cursor-pointer text-xs text-muted-foreground underline">復旧・再現用の個別操作</summary>
+            <div className="mt-2 flex flex-wrap gap-2">
+              <Button size="sm" variant="outline" onClick={onCreateSnapshot} disabled={creatingSnapshot}>
+                <RefreshCw className={`h-4 w-4 mr-1 ${creatingSnapshot ? "animate-spin" : ""}`} />
+                {status.snapshot_stale ? "Snapshotのみ作成" : "Snapshotのみ再作成"}
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={onIndexSymbols}
+                disabled={indexingSymbols || !status.latest_snapshot}
+              >
+                <Code2 className={`h-4 w-4 mr-1 ${indexingSymbols ? "animate-spin" : ""}`} />
+                symbol indexのみ更新
+              </Button>
+            </div>
+          </details>
         </div>
       </CardContent>
     </Card>

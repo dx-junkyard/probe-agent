@@ -699,6 +699,133 @@ creating incomplete persistence or execution paths for later phases.
     `model.ts`) are all unchanged. See the Issue #358 sections in
     `docs/project-intelligence.md` and `docs/system-interview-workflow-ux.md`.
 
+20. Issue #366 — 設定から候補評価までのエンドツーエンド UX (subs #367-#374).
+    A 2026-08-11 audit walked the whole loop (Repository/Settings → Connect
+    SDK → Components/Traces → AI Candidate Studio → Simulation Workbench →
+    Experiments) and found the screens asserting operational facts they had
+    not actually checked. Implemented in the epic's recommended order:
+    - #367 (P0) — secret redaction across the Trace / Replay / candidate
+      paths. This is now **Core Design Principle 9**; read it before touching
+      any payload-rendering or trace-ingestion code, and see
+      `docs/secret-redaction.md` for the operational procedure.
+    - #370 / #368 / #369 (P1) — make the displayed state match the persisted
+      fact: Trace freshness separate from "ever connected", token expiry
+      evaluated against the clock, and Snapshot `ready` (analysis finished)
+      separate from `current` (matches HEAD).
+    - #372 (P1) — Replay readiness preflight *before* a candidate is
+      generated, so an all-`not captured` component cannot burn an LLM call.
+    - #371 (P1) — one improvement loop with a single progress rail; the three
+      candidate surfaces stop reading as three products.
+    - #373 / #374 (P2) — Trace monitoring (summary/filter/compare) and the
+      progressive information design of Setup Guide, warnings, and empty
+      states.
+    Non-goals for the whole epic, unchanged: no automatic candidate adoption,
+    merge, or deploy; the human Replay approval gate stays; the isolated,
+    network-off sandbox policy stays.
+
+    The recurring shape of every fix in this epic is **one displayed word was
+    carrying two independent facts**. Each was split into two finite axes that
+    are computed server-side and only rendered by the Dashboard. Any later
+    change must keep them apart:
+    - **Connectivity** (#370): `state` is a cumulative lifecycle milestone
+      ("has connected at least once") and never regresses; `freshness`
+      (`never_received`/`receiving_now`/`delayed`/`stale`) is the live reading
+      and does. `app/state_facts.py` decides both; thresholds are returned
+      with every reading and adjustable per System
+      (`connectivity_freshness_policy`). Relative times render from the
+      server-measured elapsed seconds, so a skewed browser clock cannot turn a
+      live system stale, and a future-dated trace is `receiving_now` with the
+      skew reported separately. Windowed counts (5m/1h/24h) exclude smoke
+      traces — a cumulative total can never show that traffic stopped. The
+      Overview's setup checklist deliberately still reads `state`: "you
+      connected the SDK" is a step that stays done.
+      **`freshness` is the WORKLOAD axis and is classified from
+      `last_real_trace_at` (the newest non-smoke trace), never from
+      `last_trace_at`.** A manual smoke check proves the transport and nothing
+      more: classifying from the newest trace of any kind let one fresh smoke
+      ping paint a system green while its workload had been silent for days,
+      and hid the header warning with it. `transport_freshness` reports the
+      any-kind axis separately, and the UI shows it only when it disagrees —
+      "the ping still gets through" narrows the problem to the application,
+      but it must never be what the headline says.
+    - **Tokens** (#368): `app/token_status.py` is the only definition of
+      `active`/`expiring_soon`/`expired`/`revoked`. First-match, `revoked`
+      outranks `expired`, a NULL `expires_at` means no expiry (never
+      "expired"), and boundaries are inclusive. The Dashboard never re-derives
+      it from `revoked`/`expires_at` — that second definition was the bug.
+    - **Snapshots** (#369): `app/snapshot_preflight.py` +
+      `GET /snapshot-preflight` decide processing state (`ready` = analysis
+      finished) and freshness (`current` = commit equals HEAD) separately. A
+      `ready` snapshot can be stale; a `failed` one can be current. Exactly
+      one snapshot is the recommendation; the rest are disclosed as
+      reproduction-only. `unknown` freshness never blocks and never demands an
+      acknowledgement — an unreadable HEAD is not evidence the snapshot is
+      behind. Continuing on a definitively stale snapshot requires the
+      developer's reason, persisted on the consuming record
+      (`decision_method: manual`).
+      **Every surface that pins a snapshot goes through
+      `routes/snapshot_preflight.require_snapshot_preflight`** — Experiment
+      creation, Candidate Studio sessions, and Replay variant runs — and each
+      records the resulting `snapshot_freshness` / `head_sha_at_creation` /
+      `stale_ack_reason` on its own row (`experiments`,
+      `candidate_sessions`, `replay_runs`). A "shared" preflight wired into
+      only one of the three is not shared; the other two keep their old,
+      differing judgement.
+      `gather_preflight` runs `git` subprocesses, so it must never be called
+      with a `get_conn()` connection open.
+    - **Replay readiness** (#372): `app/replay_readiness.py` +
+      `GET /replay-readiness` count a component's traces across the finite
+      replayability values *before* generation, and
+      `POST /candidate-sessions` refuses (422 `no_replayable_traces`) when the
+      evaluation set has zero usable captures. `not_captured` (never opted
+      into `replay_capture`) stays separate from `unreplayable` (capture
+      attempted and failed): the remediations differ. `partial` counts as
+      usable — it still produces a real diff — but the comparison limit is
+      stated. Missing Replay approval is `attention`, never `blocking`: a
+      session may be prepared before approval; only the run refuses.
+      **The gate judges the set the run will actually replay.** With a
+      `replay_set_id` that means the Set's own `trace_ids`, resolved fresh —
+      not the recent-N window, which let a Set of entirely uncaptured traces
+      through whenever the window happened to hold a usable one (and blocked a
+      usable Set behind an unusable window). It also runs **again immediately
+      before the reasoning-model call** (`_require_replay_readiness`), because
+      traces, classifications, approval, and the sandbox can all change after
+      the session was created — and the cost the gate protects is spent on the
+      next line.
+    - **The loop** (#371): `components/improvement-loop/model.ts` is the only
+      place that decides the stage, and it is pure. The stage comes from
+      persisted facts (a version's replay/promotion state), never from the
+      route — Candidate Studio alone serves three stages. The rail navigates
+      and never executes; each stage states what its primary action *produces*
+      in the developer's terms, because 「送信」/「promote」/「Experimentへ送る」
+      did not. The internal persistence models are deliberately NOT unified.
+      **`loopSearchParams` emits each destination's OWN parameter names**
+      (`PARAM_NAMES`): `/components` reads `component`/`trace` — as the Trace
+      Lineage and analyzer deep links have always used — while Candidate
+      Studio reads `component_id`/`trace_id`. Emitting one spelling everywhere
+      produced links that navigated and then arrived with nothing selected.
+      The rail's own position must follow the record the developer opened
+      (the expanded Experiment), never the first row of a list.
+    - **Trace monitoring** (#373): `GET /components/{id}/trace-summary`
+      computes over ALL of a component's traces, never the loaded page — a p95
+      from the most recent 20 rows changes on every poll and describes
+      nothing. Percentiles are nearest-rank (always an observed value, no
+      interpolation rule to disagree about), and `error_rate` is `null` with
+      no data rather than `0.0`. Filtering/sorting lives in
+      `components/trace-monitor.ts` as pure functions, and the filter state
+      lives in the URL so a reload or a shared link reproduces the view;
+      `filtersToSearch` preserves unrelated params so the Trace Lineage and
+      analyzer deep links keep working. Sorts are total and stable (ties fall
+      back to newest first) so polling cannot reorder rows under the reader.
+    - **Setup information design** (#374): `components/setup-next-step.ts`
+      answers 現在の状態 / 次の1操作 / 完了条件 by first match over persisted
+      facts, reading `freshness` (not `state`) so a system that has gone
+      silent gets the recovery step rather than a completion message. The
+      8-step flow, troubleshooting, and the env-var reference disclose on
+      demand; the actionable lead stays open. `docs/ui-glossary.md` is the
+      terminology and label contract — most importantly the rule this whole
+      epic exists to enforce: one displayed word must not carry two facts.
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,
@@ -804,6 +931,49 @@ instead of being bolted onto an unrelated issue's scope.
      reasoning-model proposals, never heuristic free-text guesses, and the
      developer's approval is the `decision_method: manual` record, not the
      LLM's output alone (Principle 7).
+
+9. Never store a secret value (Issue #367).
+   - Redaction has two layers and both are mandatory: **key names**
+     (`probe_agent/redaction.py`'s `SENSITIVE_KEYS`, exact lowercase matches)
+     and **credential value shapes** (`probe_agent/secret_patterns.py`, the
+     documented vendor prefixes / structural markers). Neither alone is
+     sufficient — a key denylist never sees `Config(api_key=...)`, and a value
+     scanner never sees an unknown in-house token format.
+   - The repr path traverses **user-defined objects**
+     (`redaction.redact_for_repr`), because `repr` prints an object's
+     attributes without ever consulting a mapping key. That was the actual
+     audited leak. An object whose state cannot be inspected is rendered as an
+     opaque `<TypeName>`, never via its real `repr`.
+   - Redaction happens **before storage**, at both the SDK send boundary and
+     the Control Server ingestion boundary. Presentation-layer masking is not
+     acceptable: it leaves plaintext on disk and in every downstream consumer
+     (Replay, Candidate Studio, Workspaces, exports).
+   - The contract belongs to the **storage boundary, not to one endpoint**.
+     Every table that holds a payload is covered: `traces`,
+     `trace_projections` (both the trace route and the shadow route write it),
+     and `shadow_results`. A projection is a bounded slice of a payload, and a
+     bounded slice of a credential is still a credential — the projection
+     spec's own `redact` paths are the author's intent, not the floor. Adding
+     a new payload column means adding it to the write path, to
+     `GET /traces/redaction-audit`, and to `POST /traces/redaction-rescan`;
+     an audit that covers fewer tables than the writers lets an operator read
+     `unscanned_rows: 0` while plaintext is still stored elsewhere.
+   - `PROBE_PAYLOAD_MODE=full` is a verbosity choice, never consent to ship
+     credentials; both layers still apply. Dashboard view permission is not a
+     reason to display a secret.
+   - Both rule sets stay finite and explicitly enumerated (Principle 6). No
+     entropy scoring, no "looks random" heuristics.
+   - `traces.redaction_json` is `NULL` **only** for rows written before
+     ingestion-time redaction existed. A scanned-and-clean row records
+     `{"redacted": false}`. Those are three distinct UI states
+     (未確認 / 秘匿値なし / redact済み) and must not be collapsed into two.
+   - A redaction that touched `input_capture` degrades `replayability` to
+     `partial` with the `redacted` reason — masked input cannot restore the
+     original call. The degradation is one-directional and never upgrades an
+     SDK classification.
+   - Existing leaked data has an operational procedure, not a migration:
+     `GET /traces/redaction-audit` → rotate the credential → `POST
+     /traces/redaction-rescan`. See `docs/secret-redaction.md`.
 
 ---
 

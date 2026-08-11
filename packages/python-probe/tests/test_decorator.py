@@ -330,7 +330,9 @@ def test_redaction_failure_does_not_change_return_value(sdk, monkeypatch):
     def fail_closed(_value):
         raise RuntimeError("redactor failure")
 
-    monkeypatch.setattr(sdk["decorator_mod"]._redaction, "redact_sensitive", fail_closed)
+    # Issue #367: the repr payload path uses redact_for_repr (object-aware);
+    # replay capture still uses redact_sensitive. This test owns the repr path.
+    monkeypatch.setattr(sdk["decorator_mod"]._redaction, "redact_for_repr", fail_closed)
 
     @probe(component_id="redaction-failure")
     def f(value):

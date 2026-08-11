@@ -80,6 +80,7 @@ from ..replay_variants import (
     summarize_variant_cases,
 )
 from ..trace_analyzer import max_examples
+from .snapshot_preflight import require_snapshot_preflight
 
 router = APIRouter(dependencies=[Depends(require_user)])
 
@@ -732,6 +733,11 @@ def create_replay_run(
 ) -> ReplayRunOut:
     now = time.time()
     timeout_seconds = replay_timeout_seconds()
+    snapshot_freshness, head_sha_at_creation, stale_ack_reason = (
+        require_snapshot_preflight(
+            system_id, payload.snapshot_id, payload.stale_snapshot_reason
+        )
+    )
     with get_conn() as conn:
         replay_set = _get_set_or_404(conn, payload.replay_set_id, system_id)
         component_id = replay_set["component_id"]
@@ -768,8 +774,9 @@ def create_replay_run(
                 (system_id, replay_set_id, component_id, snapshot_id,
                  commit_sha, symbol_path, symbol_qualified_name, status,
                  trace_set_hash, sandbox_config_json, approval_id,
-                 created_at, started_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?)
+                 created_at, started_at, snapshot_freshness,
+                 head_sha_at_creation, stale_ack_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 system_id,
@@ -784,6 +791,9 @@ def create_replay_run(
                 approval["id"],
                 now,
                 now,
+                snapshot_freshness,
+                head_sha_at_creation,
+                stale_ack_reason,
             ),
         )
         run_id = cur.lastrowid
@@ -1050,6 +1060,18 @@ def create_replay_variant_run(
     (baseline-only) is unchanged."""
     now = time.time()
     timeout_seconds = replay_timeout_seconds()
+
+    # Issue #369 (review finding 4): the SAME shared preflight Experiment and
+    # Candidate Studio run. A Replay run pins a snapshot exactly as they do,
+    # so continuing on one that is behind HEAD is the same manual decision and
+    # is recorded on the run. Evaluated BEFORE the connection is opened --
+    # `gather_preflight` runs `git` subprocesses and the lock is non-reentrant.
+    snapshot_freshness, head_sha_at_creation, stale_ack_reason = (
+        require_snapshot_preflight(
+            system_id, payload.snapshot_id, payload.stale_snapshot_reason
+        )
+    )
+
     with get_conn() as conn:
         replay_set = _get_set_or_404(conn, payload.replay_set_id, system_id)
         component_id = replay_set["component_id"]
@@ -1084,8 +1106,9 @@ def create_replay_variant_run(
                 (system_id, replay_set_id, component_id, snapshot_id,
                  commit_sha, symbol_path, symbol_qualified_name, status,
                  trace_set_hash, sandbox_config_json, approval_id,
-                 created_at, started_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?)
+                 created_at, started_at,
+                 snapshot_freshness, head_sha_at_creation, stale_ack_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 system_id,
@@ -1100,6 +1123,9 @@ def create_replay_variant_run(
                 approval["id"],
                 now,
                 now,
+                snapshot_freshness,
+                head_sha_at_creation,
+                stale_ack_reason,
             ),
         )
         run_id = cur.lastrowid

@@ -46,6 +46,60 @@ export interface TraceEvent {
   input_capture?: unknown | null;
   replayability?: Replayability | null;
   replay_reasons?: ReplayReason[] | null;
+  // Issue #367: what the Control Server masked at ingestion. `null` means the
+  // row predates ingestion-time redaction and has never been scanned -- which
+  // is NOT the same as `{redacted: false}` (scanned, nothing found).
+  redaction?: TraceRedaction | null;
+  payload_summary?: TracePayloadSummary | null;
+}
+
+// Finite rule vocabulary, mirroring probe_agent.secret_patterns.RULE_NAMES
+// plus the structural rules the server applies (`sensitive_key`, a denylisted
+// mapping key; `depth_limit`, a node past the traversal bound).
+export type TraceRedactionRule =
+  | "sensitive_key"
+  | "depth_limit"
+  | "pem_private_key"
+  | "aws_access_key_id"
+  | "github_fine_grained_pat"
+  | "github_token"
+  | "anthropic_api_key"
+  | "stripe_secret_key"
+  | "openai_api_key"
+  | "slack_token"
+  | "google_api_key"
+  | "jwt"
+  | "authorization_header"
+  | "url_userinfo"
+  | "sensitive_assignment";
+
+export interface TraceRedactionField {
+  field: "input" | "output" | "error" | "input_capture";
+  path: string;
+  rule: TraceRedactionRule;
+}
+
+export interface TraceRedaction {
+  redacted: boolean;
+  rules: TraceRedactionRule[];
+  fields: TraceRedactionField[];
+}
+
+export type TracePayloadKind =
+  | "none" | "boolean" | "string" | "number" | "list" | "object" | "unknown";
+
+export interface TracePayloadShape {
+  kind: TracePayloadKind;
+  item_count: number | null;
+  bytes: number;
+}
+
+// Shape facts shown before a reader expands a trace's payload (Issue #367 AC:
+// 型・件数・サイズ・redaction有無を先に確認できる).
+export interface TracePayloadSummary {
+  input: TracePayloadShape;
+  output: TracePayloadShape;
+  error: TracePayloadShape;
 }
 
 export interface Policy {
@@ -65,6 +119,40 @@ export interface ConnectivityStatusOut {
   last_trace_component_id: string | null;
   smoke_component_id: string;
   materialized_session_ids: number[];
+  // Issue #370: the live reception axis. `state` above is a cumulative
+  // milestone that never regresses ("has connected at least once"); this is
+  // the operational reading and does regress. Never render one as the other.
+  /** Workload freshness, from the newest NON-smoke trace. */
+  freshness: ConnectivityFreshness;
+  /** Transport freshness, from the newest trace of any kind. */
+  transport_freshness: ConnectivityFreshness;
+  last_real_trace_at: number | null;
+  /** Seconds since the newest non-smoke trace — the event `freshness` judged. */
+  seconds_since_last_trace: number | null;
+  seconds_since_last_any_trace: number | null;
+  /** Server clock at evaluation, so relative times do not drift with ours. */
+  evaluated_at: number;
+  clock_skew_seconds: number;
+  real_trace_count_5m: number;
+  real_trace_count_1h: number;
+  real_trace_count_24h: number;
+  delayed_after_seconds: number;
+  stale_after_seconds: number;
+  thresholds_customized: boolean;
+}
+
+export type ConnectivityFreshness =
+  | "never_received"
+  | "receiving_now"
+  | "delayed"
+  | "stale";
+
+export interface ConnectivityFreshnessPolicyOut {
+  system_id: number;
+  delayed_after_seconds: number;
+  stale_after_seconds: number;
+  customized: boolean;
+  updated_at: number | null;
 }
 
 // Trace lineage (Issue #145/#146/#147)
@@ -242,6 +330,14 @@ export interface UserOut {
   created_at: string;
 }
 
+/**
+ * Issue #368: the token's lifecycle status is decided by the Control Server
+ * (`app/token_status.py`) from `revoked` + `expires_at` + its own clock.
+ * Mirrors `TokenStatus` in `apps/control-server/app/models.py`; the dashboard
+ * renders it and must never re-derive it from `revoked`/`expires_at`.
+ */
+export type TokenStatus = "active" | "expiring_soon" | "expired" | "revoked";
+
 export interface TokenOut {
   id: number;
   name: string;
@@ -251,6 +347,9 @@ export interface TokenOut {
   revoked: boolean;
   created_at: string;
   expires_at: string | null;
+  status: TokenStatus;
+  /** Seconds until expiry at the instant `status` was decided; null = 無期限. */
+  expires_in_seconds?: number | null;
   token?: string;
 }
 
@@ -307,6 +406,116 @@ export interface SnapshotOut {
   created_at: string;
   completed_at: string | null;
   files: SnapshotFileOut[];
+  // Issue #369: freshness is a SECOND axis over the same row. `status`
+  // ("ready") answers whether the analysis finished; this answers whether the
+  // pinned commit still equals HEAD. A ready snapshot can be stale, and a
+  // failed one can be current — never render one as the other.
+  freshness?: SnapshotFreshnessState | null;
+  is_recommended?: boolean;
+}
+
+// Issue #369: shared Snapshot preflight, decided server-side by
+// `app/snapshot_preflight.py` so candidate generation / Replay / Experiment
+// cannot disagree. The Dashboard renders it and never re-derives it.
+export type SnapshotFreshnessState = "current" | "stale" | "unknown";
+export type SnapshotPreflightCheckId =
+  | "snapshot_processing"
+  | "snapshot_freshness"
+  | "symbol_index"
+  | "understanding";
+export type SnapshotPreflightCheckStatus = "ok" | "attention" | "blocking" | "unknown";
+export type SnapshotPreflightVerdict = "ready" | "attention" | "blocked";
+
+export interface SnapshotPreflightCheckOut {
+  check_id: SnapshotPreflightCheckId;
+  status: SnapshotPreflightCheckStatus;
+  summary: string;
+  detail: string;
+  remediation: string;
+}
+
+export interface SnapshotPreflightOut {
+  snapshot_id: number | null;
+  /** "Did the analysis finish" — the existing snapshot status vocabulary. */
+  processing_state: string | null;
+  /** "Does the pinned commit still equal HEAD" — a separate axis. */
+  freshness: SnapshotFreshnessState;
+  commit_sha: string | null;
+  head_sha: string | null;
+  head_relation: "same" | "behind" | "diverged" | "unknown";
+  commits_behind: number | null;
+  verdict: SnapshotPreflightVerdict;
+  checks: SnapshotPreflightCheckOut[];
+  recommended_snapshot_id: number | null;
+  recommended_snapshot_commit_sha: string | null;
+  recommended_snapshot_freshness: SnapshotFreshnessState;
+  is_recommended: boolean;
+  requires_stale_acknowledgement: boolean;
+  stale_continuation_note: string | null;
+}
+
+// Issue #373: deterministic monitoring summary over ALL of a component's
+// traces (never just the loaded page). `error_rate` is null when there is no
+// data — which is not the same as 0%.
+export interface TraceSummaryOut {
+  component_id: string;
+  total: number;
+  error_count: number;
+  error_rate: number | null;
+  last_trace_at: number | null;
+  replayable_count: number;
+  redacted_count: number;
+  duration_p50_ms: number | null;
+  duration_p95_ms: number | null;
+  duration_max_ms: number | null;
+}
+
+export interface TracePageOut {
+  items: TraceEvent[];
+  total: number;
+  offset: number;
+  limit: number;
+}
+
+// Issue #372: Replay readiness, evaluated before a candidate is generated.
+export type ReplayReadinessStatus = "ok" | "attention" | "blocking";
+export type ReplayReadinessVerdict = "ready" | "attention" | "blocked";
+
+export interface ReplayReadinessCountsOut {
+  total: number;
+  replayable: number;
+  partial: number;
+  unreplayable: number;
+  /** Never opted into `replay_capture` — distinct from a failed capture. */
+  not_captured: number;
+  /** replayable + partial: traces that can produce a comparison at all. */
+  usable: number;
+}
+
+export interface ReplayReadinessCheckOut {
+  check_id: string;
+  status: ReplayReadinessStatus;
+  summary: string;
+  detail: string;
+  remediation: string;
+}
+
+export interface ReplayTraceReadinessOut {
+  trace_id: string;
+  replayability: "replayable" | "partial" | "unreplayable" | "not_captured";
+  primary_reason: string | null;
+}
+
+export interface ReplayReadinessOut {
+  component_id: string;
+  snapshot_id?: number | null;
+  counts: ReplayReadinessCountsOut;
+  selected: ReplayReadinessCountsOut;
+  selection_limit: number;
+  selection_is_automatic: boolean;
+  verdict: ReplayReadinessVerdict;
+  checks: ReplayReadinessCheckOut[];
+  traces?: ReplayTraceReadinessOut[];
 }
 
 // Repository refresh-hub status (Issue #158)
@@ -3879,6 +4088,11 @@ export interface CandidateSessionCreateRequest {
   trace_id?: string;
   snapshot_id?: number;
   objective?: string;
+  /**
+   * Issue #369: required when the server's preflight reports the resolved
+   * snapshot is definitively behind HEAD. `decision_method: manual`.
+   */
+  stale_snapshot_reason?: string;
 }
 
 export interface CandidatePromotionOut {

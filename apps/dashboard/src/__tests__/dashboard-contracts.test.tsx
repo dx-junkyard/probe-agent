@@ -67,8 +67,8 @@ describe("Components page trace details", () => {
           { component_id: "order-validator", mode: "trace", trace_count: 1, last_seen: 1000 },
         ]);
       }
-      if (path === "/components/order-validator/traces?limit=20") {
-        return Promise.resolve([{
+      if (path.startsWith("/components/order-validator/trace-page?")) {
+        const items = [{
           trace_id: "trace-1234567890",
           component_id: "order-validator",
           mode: "trace",
@@ -77,7 +77,8 @@ describe("Components page trace details", () => {
           error: "ValidationError: missing customer",
           duration_ms: 12.5,
           timestamp: 1000,
-        }]);
+        }];
+        return Promise.resolve({ items, total: 1, offset: 0, limit: 50 });
       }
       if (path === "/components/order-validator/profile") {
         return Promise.resolve(null);
@@ -113,16 +114,29 @@ describe("Components page trace details", () => {
     expect(screen.getByRole("button", {
       name: "Trace trace-1234567890 の詳細を隠す",
     })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("trace-1234567890")).toBeInTheDocument();
+
+    // Issue #367: opening a trace row no longer renders the payload. The
+    // audited leak was a JsonTree auto-expanded straight onto an API key, so
+    // the values now need one more deliberate step.
+    expect(screen.queryByText("ValidationError: missing customer")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText("入出力の中身を表示"));
+
     fireEvent.click(screen.getByRole("button", { name: /0.*object/ }));
     expect(screen.getByText(/order-42/)).toBeInTheDocument();
     expect(screen.getByText("{'valid': False}")).toBeInTheDocument();
     expect(screen.getByText("ValidationError: missing customer")).toBeInTheDocument();
-    expect(screen.getByText("trace-1234567890")).toBeInTheDocument();
 
+    // The detail stays visually stable while expanded, so list polling pauses.
+    // Collapsing resumes polling without affecting the independently refreshed
+    // component summary.
+    fireEvent.click(screen.getByRole("button", {
+      name: "Trace trace-1234567890 の詳細を隠す",
+    }));
     await waitFor(() => {
       const componentRefreshes = mockApi.get.mock.calls.filter(([path]) => path === "/components");
       const traceRefreshes = mockApi.get.mock.calls.filter(
-        ([path]) => path === "/components/order-validator/traces?limit=20",
+        ([path]) => String(path).startsWith("/components/order-validator/trace-page?"),
       );
       expect(componentRefreshes.length).toBeGreaterThanOrEqual(2);
       expect(traceRefreshes.length).toBeGreaterThanOrEqual(2);
@@ -272,9 +286,9 @@ async function openCreateDialog() {
   render(<ExperimentsPage />, { wrapper: createWrapper() });
 
   await waitFor(() => {
-    expect(screen.getByText("New Experiment")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Experimentを作成" })).toBeInTheDocument();
   });
-  fireEvent.click(screen.getByText("New Experiment"));
+  fireEvent.click(screen.getByRole("button", { name: "Experimentを作成" }));
 
   await waitFor(() => {
     expect(screen.getByPlaceholderText("feature-id")).toBeInTheDocument();
@@ -283,7 +297,7 @@ async function openCreateDialog() {
 
 function fillBasicFields() {
   fireEvent.change(screen.getByPlaceholderText("feature-id"), { target: { value: "feat-1" } });
-  fireEvent.change(screen.getByPlaceholderText("What are you trying to learn?"), { target: { value: "Test objective" } });
+  fireEvent.change(screen.getByPlaceholderText("この比較で確認したいこと"), { target: { value: "Test objective" } });
   const selects = screen.getAllByRole("combobox");
   const snapshotSelect = selects[selects.length - 1];
   fireEvent.change(snapshotSelect, { target: { value: "1" } });
@@ -300,13 +314,12 @@ describe("Experiment creation", () => {
     await openCreateDialog();
     fillBasicFields();
 
-    const labelInputs = screen.getAllByPlaceholderText("Label (e.g., optimized-v1)");
-    const patchInputs = screen.getAllByPlaceholderText("Patch text (unified diff format)");
+    const labelInputs = screen.getAllByPlaceholderText("ラベル（例: optimized-v1）");
+    const patchInputs = screen.getAllByPlaceholderText("Patch内容（unified diff形式）");
     fireEvent.change(labelInputs[0], { target: { value: "variant-a" } });
     fireEvent.change(patchInputs[0], { target: { value: "patch-a" } });
 
-    const buttons = screen.getAllByRole("button");
-    const createBtn = buttons.find(b => b.textContent === "Create Experiment");
+    const createBtn = screen.getAllByRole("button", { name: "Experimentを作成" }).at(-1);
     expect(createBtn).toBeDisabled();
   });
 
@@ -320,16 +333,15 @@ describe("Experiment creation", () => {
     await openCreateDialog();
     fillBasicFields();
 
-    const labelInputs = screen.getAllByPlaceholderText("Label (e.g., optimized-v1)");
-    const patchInputs = screen.getAllByPlaceholderText("Patch text (unified diff format)");
+    const labelInputs = screen.getAllByPlaceholderText("ラベル（例: optimized-v1）");
+    const patchInputs = screen.getAllByPlaceholderText("Patch内容（unified diff形式）");
 
     fireEvent.change(labelInputs[0], { target: { value: "variant-a" } });
     fireEvent.change(patchInputs[0], { target: { value: "patch-a" } });
     fireEvent.change(labelInputs[1], { target: { value: "variant-b" } });
     fireEvent.change(patchInputs[1], { target: { value: "patch-b" } });
 
-    const buttons = screen.getAllByRole("button");
-    const createBtn = buttons.find(b => b.textContent === "Create Experiment")!;
+    const createBtn = screen.getAllByRole("button", { name: "Experimentを作成" }).at(-1)!;
     expect(createBtn).not.toBeDisabled();
 
     fireEvent.click(createBtn);
@@ -351,8 +363,8 @@ describe("Experiment creation", () => {
     setupExperimentMocks();
     await openCreateDialog();
 
-    expect(screen.getByText("Variant 1")).toBeInTheDocument();
-    expect(screen.getByText("Variant 2")).toBeInTheDocument();
+    expect(screen.getByText("候補 1")).toBeInTheDocument();
+    expect(screen.getByText("候補 2")).toBeInTheDocument();
 
     const trashIcons = document.querySelectorAll(".lucide-trash-2");
     expect(trashIcons.length).toBe(0);
@@ -411,7 +423,7 @@ describe("Experiment decision (adopted)", () => {
     fireEvent.click(header);
 
     await waitFor(() => {
-      expect(screen.getByText("Decision")).toBeInTheDocument();
+      expect(screen.getByText("判断")).toBeInTheDocument();
     });
 
     const verdictSelect = screen.getAllByRole("combobox").find(
@@ -420,7 +432,7 @@ describe("Experiment decision (adopted)", () => {
     fireEvent.change(verdictSelect, { target: { value: "adopted" } });
 
     await waitFor(() => {
-      expect(screen.getByText("Adopt Variant *")).toBeInTheDocument();
+      expect(screen.getByText("採用する候補 *")).toBeInTheDocument();
     });
 
     const variantSelect = screen.getAllByRole("combobox").find(
@@ -428,10 +440,10 @@ describe("Experiment decision (adopted)", () => {
     ) as HTMLSelectElement;
     fireEvent.change(variantSelect, { target: { value: "opt-v1" } });
 
-    const noteTextarea = screen.getByPlaceholderText("Reason for decision...");
+    const noteTextarea = screen.getByPlaceholderText("判断理由を入力...");
     fireEvent.change(noteTextarea, { target: { value: "Better performance" } });
 
-    fireEvent.click(screen.getByText("Save Decision"));
+    fireEvent.click(screen.getByText("判断を保存"));
 
     await waitFor(() => {
       expect(mockApi.put).toHaveBeenCalledWith("/experiments/1/decision", {
@@ -539,7 +551,7 @@ describe("Experiment decision next-action (Issue #259)", () => {
     setupDecidedExperiment(decidedExperimentFixture({ human_decision: null, human_decision_variant_key: null }));
     await renderAndExpand();
 
-    await waitFor(() => expect(screen.getByText("Decision")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("判断")).toBeInTheDocument());
     expect(screen.queryByTestId("experiment-next-action-adopted")).not.toBeInTheDocument();
     expect(screen.queryByTestId("experiment-next-action-candidate-studio")).not.toBeInTheDocument();
   });
@@ -831,10 +843,9 @@ describe("Repository Refresh Hub", () => {
 
     const hub = await screen.findByTestId("refresh-hub");
     expect(within(hub).getByTestId("snapshot-stale-badge")).toBeInTheDocument();
-    expect(within(hub).getByTestId("repository-lag")).toHaveTextContent("3 commits behind");
-    // The next-steps list echoes the server's actionable guidance verbatim.
+    expect(within(hub).getByTestId("repository-lag")).toHaveTextContent("3 commit遅れ");
     expect(
-      within(hub).getByText(/create a new snapshot before generating new analysis or patches/i),
+      within(hub).getByText(/新しい解析やpatchを生成する前にSnapshotを更新してください/),
     ).toBeInTheDocument();
   });
 
@@ -854,8 +865,8 @@ describe("Repository Refresh Hub", () => {
     render(<RepositoryPage />, { wrapper: createWrapper() });
 
     const hub = await screen.findByTestId("refresh-hub");
-    expect(within(hub).getByText("Up to date")).toBeInTheDocument();
-    expect(within(hub).getByTestId("repository-lag")).toHaveTextContent("Latest");
+    expect(within(hub).getByText("最新です")).toBeInTheDocument();
+    expect(within(hub).getByTestId("repository-lag")).toHaveTextContent("最新");
   });
 
   test("starts the explicit snapshot and symbol resync from one button", async () => {
@@ -906,11 +917,37 @@ describe("Repository Refresh Hub", () => {
     render(<RepositoryPage />, { wrapper: createWrapper() });
 
     const guidance = await screen.findByTestId("stale-capability-guidance");
-    expect(guidance).toHaveTextContent("2 capabilities still use an older snapshot");
-    expect(within(guidance).getByText("Review Capability Map").closest("a"))
+    expect(guidance).toHaveTextContent("2件のCapabilityが古いSnapshotを参照しています");
+    expect(within(guidance).getByText("Capability Mapを確認").closest("a"))
       .toHaveAttribute("href", "/capability-map");
-    expect(within(guidance).getByText("Build System Understanding").closest("a"))
+    expect(within(guidance).getByText("System Understandingを構築").closest("a"))
       .toHaveAttribute("href", "/system-understanding?fix=build");
+  });
+
+  test("does not show a completed resync message for an obsolete snapshot", async () => {
+    const getBase = baseGet({
+      configured: true, repo_path: "/repos/alpha",
+      current_head: "new0000000", head_error: null,
+      working_tree_dirty: false, dirty_file_count: 0, dirty_sample: [],
+      latest_snapshot: { id: 14, commit_sha: "new0000000", status: "ready", created_at: 3 },
+      latest_indexed_snapshot: null,
+      understanding_snapshot_id: null, understanding_status: null,
+      head_relation: "same", commits_behind: 0,
+      snapshot_stale: false, symbols_stale: true, next_actions: [],
+    });
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/resync/latest") return Promise.resolve({
+        id: 7, system_id: 1, snapshot_id: 13, status: "completed", error: null,
+        stale_capability_count: 0, created_at: 1, started_at: 1, completed_at: 2,
+      });
+      return getBase(path);
+    });
+
+    const { default: RepositoryPage } = await import("@/pages/repository");
+    render(<RepositoryPage />, { wrapper: createWrapper() });
+
+    await screen.findByTestId("refresh-hub");
+    expect(screen.queryByTestId("resync-job-status")).not.toBeInTheDocument();
   });
 });
 
@@ -9599,7 +9636,10 @@ function replayTracesFixture() {
 function setupComponentsPageForReplay(extra: Record<string, unknown> = {}) {
   mockApi.get.mockImplementation((path: string) => {
     if (path === "/components") return Promise.resolve(replayComponentsFixture());
-    if (path === "/components/norm/traces?limit=20") return Promise.resolve(replayTracesFixture());
+    if (path.startsWith("/components/norm/trace-page?")) {
+      const items = replayTracesFixture();
+      return Promise.resolve({ items, total: items.length, offset: 0, limit: 50 });
+    }
     if (path === "/components/norm/profile") return Promise.resolve(null);
     if (path === "/components/norm/shadow-results?limit=20") return Promise.resolve([]);
     if (path === "/components/norm/criteria") return Promise.resolve([]);
@@ -9723,10 +9763,10 @@ describe("Components trace row: Replay actions (Issue #246)", () => {
     fireEvent.click(row.getByText("Experimentを作成"));
 
     await waitFor(() => {
-      expect(screen.getByText(/Prefilled context from trace/)).toBeInTheDocument();
+      expect(screen.getByText(/から文脈を入力済みです/)).toBeInTheDocument();
     });
     expect(
-      screen.getByPlaceholderText("What are you trying to learn?"),
+      screen.getByPlaceholderText("この比較で確認したいこと"),
     ).toHaveValue("Investigate trace trace-replayable-0001 (component norm)");
   });
 });
@@ -10006,9 +10046,9 @@ describe("Simulation Workbench (Issue #246)", () => {
       );
     });
     await waitFor(() => {
-      expect(screen.getByText(/Prefilled from Replay Variant run #1/)).toBeInTheDocument();
+      expect(screen.getByText(/Replay候補run #1、候補 #11/)).toBeInTheDocument();
     });
-    const patchTextarea = screen.getAllByPlaceholderText("Patch text (unified diff format)")[0];
+    const patchTextarea = screen.getAllByPlaceholderText("Patch内容（unified diff形式）")[0];
     expect((patchTextarea as HTMLTextAreaElement).value).toContain("diff --git a/svc.py");
   });
 
@@ -10282,7 +10322,8 @@ describe("Dashboard action gating (Issue #255)", () => {
     fireEvent.change(nameInput, { target: { value: "my-new-token" } });
 
     expect(screen.getByTestId("issue-token-no-system-reason")).toBeInTheDocument();
-    const issueButton = screen.getByRole("button", { name: "Issue Token" });
+    // Issue #368/#374: the CTA label follows CLAUDE.md's Dashboard UI言語規約.
+    const issueButton = screen.getByRole("button", { name: "Token を発行" });
     expect(issueButton).toBeDisabled();
 
     // Even though the name is filled in, clicking the disabled button must
@@ -10294,7 +10335,7 @@ describe("Dashboard action gating (Issue #255)", () => {
     expect(toast.error).not.toHaveBeenCalled();
   });
 
-  test("Repository: Symbols tab Index Symbols is disabled under the same condition as the Refresh Hub", async () => {
+  test("Repository: unified refresh can bootstrap a snapshot while Symbols tab remains gated", async () => {
     mockApi.get.mockImplementation((path: string) => {
       if (path === "/repository") return Promise.resolve({
         id: 1, system_id: 1, repo_path: "/repos/alpha", include_patterns: [], exclude_patterns: [],
@@ -10316,9 +10357,9 @@ describe("Dashboard action gating (Issue #255)", () => {
     const { default: RepositoryPage } = await import("@/pages/repository");
     render(<RepositoryPage />, { wrapper: createWrapper() });
 
-    // Refresh Hub's own button is disabled when there is no snapshot.
+    // The canonical action can bootstrap the first snapshot and its index.
     const hub = await screen.findByTestId("refresh-hub");
-    expect(within(hub).getByRole("button", { name: "Index symbols" })).toBeDisabled();
+    expect(within(hub).getByRole("button", { name: "Snapshotとsymbolをまとめて更新" })).not.toBeDisabled();
 
     // The Symbols tab's button must be gated the same way instead of being
     // clickable with nothing to index.
@@ -10725,7 +10766,7 @@ describe("Prerequisite-based action gating (Issue #258)", () => {
     render(<RepositoryPage />, { wrapper: createWrapper() });
 
     fireEvent.click(await screen.findByRole("button", { name: "Snapshots" }));
-    const button = await screen.findByRole("button", { name: /Create Snapshot/ });
+    const button = await screen.findByRole("button", { name: /Snapshotのみ作成/ });
     await waitFor(() => expect(button).toBeDisabled());
     expect(await screen.findByTestId("create-snapshot-not-configured-reason")).toBeInTheDocument();
   });
@@ -10739,7 +10780,7 @@ describe("Prerequisite-based action gating (Issue #258)", () => {
     render(<RepositoryPage />, { wrapper: createWrapper() });
 
     fireEvent.click(await screen.findByRole("button", { name: "Snapshots" }));
-    const button = await screen.findByRole("button", { name: /Create Snapshot/ });
+    const button = await screen.findByRole("button", { name: /Snapshotのみ作成/ });
     await waitFor(() => expect(button).not.toBeDisabled());
     expect(screen.queryByTestId("create-snapshot-not-configured-reason")).not.toBeInTheDocument();
   });
@@ -11126,7 +11167,7 @@ describe("Overview get-started per-step completion (Issue #267)", () => {
   });
 
   test("marks step 3 done once at least one SDK token has been issued", async () => {
-    mockOverview267({ tokens: [{ id: 1, name: "svc", kind: "api", system_id: 1, user_id: 1, created_at: 1, expires_at: null, revoked: false }] });
+    mockOverview267({ tokens: [{ id: 1, name: "svc", kind: "api", system_id: 1, user_id: 1, created_at: 1, expires_at: null, revoked: false, status: "active", expires_in_seconds: null }] });
     const { default: OverviewPage } = await import("@/pages/overview");
     render(<OverviewPage />, { wrapper: createWrapper() });
 
@@ -11136,7 +11177,7 @@ describe("Overview get-started per-step completion (Issue #267)", () => {
   });
 
   test("does not mark step 3 done from a session-kind token alone (login session, not an SDK token)", async () => {
-    mockOverview267({ tokens: [{ id: 2, name: "login session", kind: "session", system_id: null, user_id: 1, created_at: 1, expires_at: null, revoked: false }] });
+    mockOverview267({ tokens: [{ id: 2, name: "login session", kind: "session", system_id: null, user_id: 1, created_at: 1, expires_at: null, revoked: false, status: "active", expires_in_seconds: null }] });
     const { default: OverviewPage } = await import("@/pages/overview");
     render(<OverviewPage />, { wrapper: createWrapper() });
 
@@ -11148,8 +11189,8 @@ describe("Overview get-started per-step completion (Issue #267)", () => {
   test("does not mark step 3 done from a revoked or expired SDK token", async () => {
     mockOverview267({
       tokens: [
-        { id: 3, name: "revoked-svc", kind: "api", system_id: 1, user_id: 1, created_at: 1, expires_at: null, revoked: true },
-        { id: 4, name: "expired-svc", kind: "api", system_id: 1, user_id: 1, created_at: 1, expires_at: 1, revoked: false },
+        { id: 3, name: "revoked-svc", kind: "api", system_id: 1, user_id: 1, created_at: 1, expires_at: null, revoked: true, status: "revoked", expires_in_seconds: null },
+        { id: 4, name: "expired-svc", kind: "api", system_id: 1, user_id: 1, created_at: 1, expires_at: 1, revoked: false, status: "expired", expires_in_seconds: 0 },
       ],
     });
     const { default: OverviewPage } = await import("@/pages/overview");
@@ -11161,7 +11202,7 @@ describe("Overview get-started per-step completion (Issue #267)", () => {
   });
 
   test("does not mark step 3 done from an SDK token scoped to a different System", async () => {
-    mockOverview267({ tokens: [{ id: 5, name: "other-system-svc", kind: "api", system_id: 2, user_id: 1, created_at: 1, expires_at: null, revoked: false }] });
+    mockOverview267({ tokens: [{ id: 5, name: "other-system-svc", kind: "api", system_id: 2, user_id: 1, created_at: 1, expires_at: null, revoked: false, status: "active", expires_in_seconds: null }] });
     const { default: OverviewPage } = await import("@/pages/overview");
     render(<OverviewPage />, { wrapper: createWrapper() });
 

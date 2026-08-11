@@ -7,26 +7,32 @@ from fastapi import APIRouter, Depends, HTTPException
 from ..auth import get_system_id
 from ..db import get_conn
 from ..models import EvaluationUpdate, ShadowResult
+from ..trace_redaction import redact_projection, redact_shadow_outputs
 
 router = APIRouter()
 
 
 def _write_shadow_projections(conn, system_id: int, result: ShadowResult) -> None:
     """Persist shadow_current / shadow_candidate projections (Issue #150),
-    keyed by the existing trace_id. Never stores the raw payload."""
+    keyed by the existing trace_id. Never stores the raw payload.
+
+    Issue #367: redacted on the write path, on the same contract as the trace
+    route's projections — this endpoint reaches the same table.
+    """
     if not result.projections:
         return
     for proj in result.projections:
-        data_json = json.dumps(
-            {"fields": proj.fields, "metrics": proj.metrics, "samples": proj.samples},
-            ensure_ascii=False,
+        redaction = redact_projection(
+            fields=proj.fields, metrics=proj.metrics, samples=proj.samples
         )
+        data_json = json.dumps(redaction.values, ensure_ascii=False)
         conn.execute(
             """
             INSERT OR REPLACE INTO trace_projections
                 (system_id, trace_id, component_id, projection_name, phase,
-                 data_json, data_hash, truncated, extract_error, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 data_json, data_hash, truncated, extract_error, created_at,
+                 redaction_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 system_id,
@@ -39,6 +45,7 @@ def _write_shadow_projections(conn, system_id: int, result: ShadowResult) -> Non
                 1 if proj.truncated else 0,
                 proj.error,
                 result.timestamp,
+                json.dumps(redaction.summary(), ensure_ascii=False),
             ),
         )
 
@@ -61,22 +68,31 @@ def post_shadow_result(
             """,
             (system_id, component_id, time.time()),
         )
+        # Issue #367: the current/candidate reprs are exactly the shape the
+        # audited leak took on the trace side, arriving through another route.
+        redaction = redact_shadow_outputs(
+            current_output=result.current_output,
+            candidate_output=result.candidate_output,
+            candidate_error=result.candidate_error,
+        )
         cur = conn.execute(
             """
             INSERT INTO shadow_results
                 (system_id, trace_id, component_id, current_output, candidate_output,
-                 candidate_error, candidate_duration_ms, evaluation, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                 candidate_error, candidate_duration_ms, evaluation, timestamp,
+                 redaction_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
             """,
             (
                 system_id,
                 result.trace_id,
                 result.component_id,
-                result.current_output,
-                result.candidate_output,
-                result.candidate_error,
+                redaction.values["current_output"],
+                redaction.values["candidate_output"],
+                redaction.values["candidate_error"],
                 result.candidate_duration_ms,
                 result.timestamp,
+                json.dumps(redaction.summary(), ensure_ascii=False),
             ),
         )
         _write_shadow_projections(conn, system_id, result)

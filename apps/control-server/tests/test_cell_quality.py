@@ -286,7 +286,15 @@ def test_task_type_stratum_matches_trace_input_metadata(admin_client):
 # ---------------------------------------------------------------------------
 
 
-def test_cell_quality_never_imports_the_sdk_and_sdk_is_untouched():
+def test_cell_quality_never_imports_the_sdk_and_sdk_carries_no_cell_quality():
+    """Issue #302: Cell quality sampling is independent of SDK lineage sampling.
+
+    Originally this also asserted ``git status -- packages/python-probe`` was
+    empty. That checked the developer's working tree rather than the code, so
+    it failed for any unrelated SDK change -- Issue #367's redaction work being
+    the first. The invariant it was reaching for is expressed directly below:
+    neither side references the other.
+    """
     repo_root = Path(__file__).resolve().parents[3]
     module_path = repo_root / "apps" / "control-server" / "app" / "cell_quality.py"
     import_lines = [
@@ -297,11 +305,11 @@ def test_cell_quality_never_imports_the_sdk_and_sdk_is_untouched():
         assert "python_probe" not in line
         assert "probe_sdk" not in line
 
-    result = subprocess.run(
-        ["git", "status", "--porcelain", "--", "packages/python-probe"],
-        cwd=repo_root, capture_output=True, text=True, check=True,
-    )
-    assert result.stdout.strip() == ""
+    sdk_root = repo_root / "packages" / "python-probe" / "probe_agent"
+    for source in sdk_root.rglob("*.py"):
+        text = source.read_text(encoding="utf-8")
+        assert "cell_quality" not in text, source
+        assert "quality_sample" not in text, source
 
 
 # ---------------------------------------------------------------------------

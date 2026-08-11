@@ -1,4 +1,3 @@
-import { useState } from "react";
 import { Link } from "react-router-dom";
 import {
   useComponents, useSystemState, useConnectivityStatus,
@@ -12,6 +11,7 @@ import { SystemStateBanner } from "@/components/system-state";
 import { PrerequisiteGuide } from "@/components/prerequisite-guide";
 import { Boxes, Activity, Clock, FolderCog, Compass, Plug, RadioTower, CheckCircle2 } from "lucide-react";
 import { formatTimestamp } from "@/lib/utils";
+import { isApiToken, isTokenUsable } from "@/lib/token-display";
 
 // Deterministic, ordered get-started steps for a brand-new System with zero
 // components (Issue #212). This is a static fallback list, not a heuristic
@@ -64,9 +64,12 @@ export default function OverviewPage() {
   // deterministic fallback (Issue #212).
   const { data: systemState } = useSystemState();
   const primaryOverviewItem = systemState?.page_items["/"]?.[0] ?? null;
-  // Issue #259: drives step 4's completion below -- "receiving" is the same
-  // state the header ConnectivityBadge treats as "done" (it hides itself
-  // once real, non-smoke traces have arrived).
+  // Issue #259: drives step 4's completion below. This is a setup checklist,
+  // so it deliberately reads the cumulative milestone `state`, NOT Issue
+  // #370's live `freshness`: "you have connected the SDK" is a step that
+  // stays done once achieved. The header ConnectivityBadge reads `freshness`
+  // instead, because "is it receiving right now" is the operational question
+  // and it must reappear when traffic stops.
   const { data: connectivity } = useConnectivityStatus();
   // Issue #267: deterministic completion facts for steps 1-3, reusing the
   // same hooks/pattern as `PrerequisiteChecklist` (snapshot presence, System
@@ -74,17 +77,19 @@ export default function OverviewPage() {
   // GET /tokens/me (auth.py) returns every api_tokens row for the user,
   // including the `kind="session"` login token issued on every login
   // (auth.py:119) -- that row is not an SDK/API credential and must not
-  // count here. Only `kind="api"` tokens (auth.py:366) that are not revoked,
-  // not expired, and scoped to the current System (or unscoped) represent an
-  // actual SDK connection.
+  // count here. Only `kind="api"` tokens (auth.py:366) that are still usable
+  // and scoped to the current System (or unscoped) represent an actual SDK
+  // connection.
+  // Issue #368: usability is the server's `status` field
+  // (`app/token_status.py`), not a local revoked/expires_at comparison -- a
+  // second local definition of "expired" is exactly the drift that made the
+  // Access Token list show expired tokens as active.
   const { data: latestSnapshot } = useLatestSnapshot();
   const { data: latestDrafts } = useLatestDrafts();
   const { data: myTokens } = useMyTokens();
-  const [now] = useState(() => Date.now());
   const hasActiveSdkToken = (myTokens ?? []).some((t) =>
-    t.kind === "api" &&
-    !t.revoked &&
-    (t.expires_at == null || Number(t.expires_at) * 1000 > now) &&
+    isApiToken(t) &&
+    isTokenUsable(t.status) &&
     (t.system_id == null || t.system_id === systemId)
   );
   const stepDone: Record<string, boolean> = {

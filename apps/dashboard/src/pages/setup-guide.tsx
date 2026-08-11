@@ -4,7 +4,7 @@ import {
   Activity, AlertTriangle, CheckCircle2, FileDiff, LifeBuoy, RadioTower,
   RefreshCw, Wrench,
 } from "lucide-react";
-import { useConnectivityStatus, useInterviewSession } from "@/api/hooks";
+import { useConnectivityStatus, useInterviewSession, useMyTokens } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -13,7 +13,13 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { CodeBlock } from "@/components/code-block";
 import { getClientServerUrl } from "@/lib/env";
 import { formatTimestamp } from "@/lib/utils";
-import type { ConnectivityState } from "@/api/types";
+import { resolveSetupStep } from "@/components/setup-next-step";
+import {
+  FRESHNESS_LABELS,
+  FreshnessBadge,
+  FreshnessDetail,
+  LifecycleMilestone,
+} from "@/components/connectivity-freshness";
 
 // 実行形態は明示的な有限集合。開発者は自分に近いパターンを選ぶ。
 type RuntimePattern = "host" | "compose" | "image" | "external";
@@ -25,10 +31,39 @@ const PATTERN_LABELS: Record<RuntimePattern, string> = {
   external: "別リポジトリ / 外部エンドポイント",
 };
 
-const CONNECTIVITY_LABELS: Record<ConnectivityState, string> = {
-  no_signal: "シグナル未受信",
-  smoke_only: "疎通確認のみ受信",
-  receiving: "受信中",
+const PATTERN_CHECKLISTS: Record<RuntimePattern, string[]> = {
+  host: [
+    "対象アプリの環境へprobe-agent SDKを導入した",
+    "PROBE_SERVER_URLをホストから到達できるURLへ設定した",
+    "必要な場合は有効なAPI tokenをPROBE_API_KEYへ設定した",
+    "@probeを付けたアプリを再起動した",
+    "同じホストから/healthを確認した",
+    "smoke traceと実workload traceの両方を確認した",
+  ],
+  compose: [
+    "対象serviceへprobe-agent SDKを導入した",
+    "PROBE_SERVER_URLをhttp://control-server:8000へ設定した",
+    "API tokenを.envまたはsecretから対象serviceへ渡した",
+    "control-serverと対象serviceを同じnetworkで起動した",
+    "対象container内から/healthを確認した",
+    "smoke traceと実workload traceの両方を確認した",
+  ],
+  image: [
+    "Docker imageへprobe-agent SDKを追加して再buildした",
+    "実行時にPROBE_SERVER_URLを渡した",
+    "API tokenをimageへ焼き込まず実行時secretとして渡した",
+    "更新したimageで対象アプリを起動した",
+    "container内から/healthを確認した",
+    "smoke traceと実workload traceの両方を確認した",
+  ],
+  external: [
+    "外部環境へprobe-agent SDKを導入した",
+    "対象環境から到達できるHTTPSのPROBE_SERVER_URLを設定した",
+    "有効なAPI tokenをsecret管理からPROBE_API_KEYへ渡した",
+    "firewall・proxy・DNSでControl Serverへの通信を許可した",
+    "対象環境から/healthを確認した",
+    "smoke traceと実workload traceの両方を確認した",
+  ],
 };
 
 // 全体の流れ(Issue #165 の 9 項目を一続きの導線として提示する)。
@@ -75,8 +110,71 @@ const FLOW_STEPS: Array<{ title: string; detail: string }> = [
   },
 ];
 
+/**
+ * Issue #374: 「現在の状態 / 次の1操作 / 完了条件」 above everything else.
+ *
+ * The rest of the page is reference material; this is the part that changes
+ * with the developer's situation, so it leads.
+ */
+function NextStepCard() {
+  const connectivityQuery = useConnectivityStatus(15_000);
+  const tokensQuery = useMyTokens();
+  const { data: connectivity } = connectivityQuery;
+  const { data: tokens } = tokensQuery;
+  const { systemId } = useAuth();
+  const loading = connectivityQuery.isLoading || tokensQuery.isLoading;
+  const failed = connectivityQuery.isError || tokensQuery.isError;
+
+  if (loading) {
+    return (
+      <Card data-testid="setup-next-step-loading" aria-busy="true">
+        <CardHeader className="pb-3"><CardTitle className="text-sm">いまやること</CardTitle></CardHeader>
+        <CardContent className="space-y-2">
+          <div className="h-4 w-2/3 animate-pulse rounded bg-muted" />
+          <div className="h-4 w-4/5 animate-pulse rounded bg-muted" />
+          <div className="h-3 w-1/2 animate-pulse rounded bg-muted" />
+        </CardContent>
+      </Card>
+    );
+  }
+
+  if (failed) {
+    return (
+      <Card data-testid="setup-next-step-error" role="alert">
+        <CardHeader className="pb-3"><CardTitle className="text-sm">現在の状態を確認できません</CardTitle></CardHeader>
+        <CardContent className="space-y-3 text-sm">
+          <p className="text-muted-foreground">接続状態またはtoken一覧の取得に失敗したため、次の操作を安全に判定できません。</p>
+          <Button size="sm" variant="outline" onClick={() => { connectivityQuery.refetch(); tokensQuery.refetch(); }}>再試行</Button>
+        </CardContent>
+      </Card>
+    );
+  }
+  const step = resolveSetupStep(connectivity, tokens, systemId ?? null);
+
+  return (
+    <Card data-testid="setup-next-step" data-step={step.id}>
+      <CardHeader className="pb-3">
+        <CardTitle className="text-sm">いまやること</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-2 text-sm">
+        <p data-testid="setup-next-step-state">
+          <span className="text-muted-foreground">現在の状態: </span>
+          {step.state}
+        </p>
+        <p className="font-medium" data-testid="setup-next-step-action">
+          <span className="font-normal text-muted-foreground">次の操作: </span>
+          {step.action}
+        </p>
+        <p className="text-xs text-muted-foreground" data-testid="setup-next-step-completion">
+          完了条件: {step.completion}
+        </p>
+      </CardContent>
+    </Card>
+  );
+}
+
 function ConnectivityStatusCard() {
-  const { data, isFetching, refetch } = useConnectivityStatus(15_000);
+  const { data, isLoading, isError, error, isFetching, refetch } = useConnectivityStatus(15_000);
 
   return (
     <Card data-testid="connectivity-status-card">
@@ -97,45 +195,52 @@ function ConnectivityStatusCard() {
         </div>
       </CardHeader>
       <CardContent className="space-y-3">
-        {!data ? (
-          <p className="text-sm text-muted-foreground">読み込み中...</p>
+        {isLoading ? (
+          <div className="space-y-2" aria-busy="true">
+            <div className="h-5 w-48 animate-pulse rounded bg-muted" />
+            <div className="h-16 w-full animate-pulse rounded bg-muted" />
+          </div>
+        ) : isError || !data ? (
+          <div className="space-y-2" role="alert">
+            <p className="text-sm font-medium">接続ステータスを取得できませんでした。</p>
+            <p className="text-xs text-muted-foreground">{String(error ?? "応答がありません。")}</p>
+            <Button size="sm" variant="outline" onClick={() => refetch()}>再試行</Button>
+          </div>
         ) : (
           <>
+            {/* Issue #370: the headline is the LIVE reading (freshness).
+                `state` is a cumulative milestone and is shown below as
+                history — a system silent for two weeks must not read 受信中
+                just because it once connected. */}
             <div className="flex items-center gap-2">
-              {data.state === "receiving" ? (
+              {data.freshness === "receiving_now" ? (
                 <CheckCircle2 className="h-5 w-5 text-green-600" />
               ) : (
-                <AlertTriangle className={`h-5 w-5 ${data.state === "no_signal" ? "text-amber-500" : "text-blue-500"}`} />
+                <AlertTriangle
+                  className={`h-5 w-5 ${data.freshness === "stale" ? "text-red-500" : data.freshness === "delayed" ? "text-amber-500" : "text-blue-500"}`}
+                />
               )}
               <span className="font-medium" data-testid="connectivity-state-label">
-                {CONNECTIVITY_LABELS[data.state]}
+                {FRESHNESS_LABELS[data.freshness]}
               </span>
-              <Badge variant={data.state === "receiving" ? "success" : data.state === "smoke_only" ? "secondary" : "warning"}>
-                {data.state}
-              </Badge>
+              <FreshnessBadge freshness={data.freshness} />
             </div>
+            <FreshnessDetail data={data} />
+            <LifecycleMilestone data={data} />
             <div className="grid grid-cols-3 gap-2 text-sm">
               <div className="rounded-md border p-2">
                 <div className="text-lg font-semibold">{data.real_trace_count}</div>
-                <div className="text-xs text-muted-foreground">実 workload trace</div>
+                <div className="text-xs text-muted-foreground">実 workload trace（累計）</div>
               </div>
               <div className="rounded-md border p-2">
                 <div className="text-lg font-semibold">{data.smoke_trace_count}</div>
-                <div className="text-xs text-muted-foreground">smoke trace</div>
+                <div className="text-xs text-muted-foreground">smoke trace（累計）</div>
               </div>
               <div className="rounded-md border p-2">
                 <div className="text-lg font-semibold">{data.total_trace_count}</div>
-                <div className="text-xs text-muted-foreground">合計</div>
+                <div className="text-xs text-muted-foreground">合計（累計）</div>
               </div>
             </div>
-            {data.last_trace_at != null && (
-              <p className="text-xs text-muted-foreground">
-                最終受信: {formatTimestamp(data.last_trace_at)}
-                {data.last_trace_component_id && (
-                  <> · component <code className="font-mono">{data.last_trace_component_id}</code></>
-                )}
-              </p>
-            )}
             {data.state === "no_signal" && (
               <p className="text-xs text-amber-700 dark:text-amber-300">
                 このシステムはまだ一度も trace / signal を受信していません。
@@ -159,6 +264,41 @@ function ConnectivityStatusCard() {
         )}
       </CardContent>
     </Card>
+  );
+}
+
+function RuntimeChecklist({ pattern }: { pattern: RuntimePattern }) {
+  const [checked, setChecked] = useState<Record<string, boolean>>({});
+  const items = PATTERN_CHECKLISTS[pattern];
+  const complete = items.filter(item => checked[`${pattern}:${item}`]).length;
+  return (
+    <div className="mt-4 rounded-md border p-3" data-testid={`runtime-checklist-${pattern}`}>
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <p className="text-sm font-medium">{PATTERN_LABELS[pattern]}の完了チェック</p>
+        <Badge variant={complete === items.length ? "success" : "secondary"}>{complete} / {items.length}</Badge>
+      </div>
+      <ul className="space-y-2">
+        {items.map(item => {
+          const key = `${pattern}:${item}`;
+          return (
+            <li key={item}>
+              <label className="flex cursor-pointer items-start gap-2 text-xs">
+                <input
+                  type="checkbox"
+                  checked={!!checked[key]}
+                  onChange={event => setChecked(current => ({ ...current, [key]: event.target.checked }))}
+                  className="mt-0.5"
+                />
+                <span>{item}</span>
+              </label>
+            </li>
+          );
+        })}
+      </ul>
+      <p className="mt-2 text-xs text-muted-foreground">
+        完了条件: smoke traceだけでなく、実workload traceが直近の期間別件数へ反映されること。
+      </p>
+    </div>
   );
 }
 
@@ -250,31 +390,40 @@ curl -sS -w "\\nHTTP %{http_code}\\n" -X POST "$PROBE_SERVER_URL/traces" \\
 
       {sessionId && <SessionContextBanner sessionId={sessionId} />}
 
+      <NextStepCard />
+
       <ConnectivityStatusCard />
 
+      <details data-testid="setup-flow-disclosure">
+        <summary className="cursor-pointer rounded-md border px-3 py-2 text-sm font-medium">
+          全体の流れ（8ステップの説明）
+        </summary>
+        <div className="mt-2">
       <Card>
-        <CardHeader>
-          <CardTitle className="text-sm">全体の流れ</CardTitle>
-          <CardDescription>
-            instrumentation patch・設定変更・疎通確認は「監視対象を probe-agent で観測可能にする」一連の作業です。
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <ol className="space-y-2">
-            {FLOW_STEPS.map((s, i) => (
-              <li key={i} className="flex items-start gap-3 text-sm">
-                <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-secondary text-xs font-semibold">
-                  {i + 1}
-                </span>
-                <div>
-                  <span className="font-medium">{s.title}</span>
-                  <p className="text-xs text-muted-foreground">{s.detail}</p>
-                </div>
-              </li>
-            ))}
-          </ol>
-        </CardContent>
-      </Card>
+          <CardHeader>
+            <CardTitle className="text-sm">全体の流れ</CardTitle>
+            <CardDescription>
+              instrumentation patch・設定変更・疎通確認は「監視対象を probe-agent で観測可能にする」一連の作業です。
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ol className="space-y-2">
+              {FLOW_STEPS.map((s, i) => (
+                <li key={i} className="flex items-start gap-3 text-sm">
+                  <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-secondary text-xs font-semibold">
+                    {i + 1}
+                  </span>
+                  <div>
+                    <span className="font-medium">{s.title}</span>
+                    <p className="text-xs text-muted-foreground">{s.detail}</p>
+                  </div>
+                </li>
+              ))}
+            </ol>
+          </CardContent>
+        </Card>
+        </div>
+      </details>
 
       <Card>
         <CardHeader>
@@ -400,6 +549,7 @@ curl -sS "$PROBE_SERVER_URL/health"   # => {"ok":true}`}</CodeBlock>
               </p>
             </TabsContent>
           </Tabs>
+          <RuntimeChecklist pattern={pattern} />
         </CardContent>
       </Card>
 
@@ -473,98 +623,112 @@ curl -sS "$PROBE_SERVER_URL/health"
         </CardContent>
       </Card>
 
+      <details data-testid="setup-troubleshooting-disclosure">
+        <summary className="cursor-pointer rounded-md border px-3 py-2 text-sm font-medium">
+          届かないときのトラブルシューティング
+        </summary>
+        <div className="mt-2">
       <Card>
-        <CardHeader>
-          <CardTitle className="text-sm flex items-center gap-2">
-            <Wrench className="h-4 w-4" /> トラブルシューティング(届かないときの切り分け)
-          </CardTitle>
-          <CardDescription>
-            「まだシグナルを受信していない」状態のよくある原因と、それぞれの確認方法です。
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-2 text-sm">
-          {[
-            {
-              title: "設定不足",
-              detail:
-                "PROBE_SERVER_URL が未設定の場合、SDK は http://localhost:8000 に送ります(コンテナ内では自分自身)。対象アプリのプロセスに環境変数が渡っているかを確認してください。",
-              check: "対象アプリ内で: python -c \"import os; print(os.getenv('PROBE_SERVER_URL'))\"",
-            },
-            {
-              title: "認証失敗",
-              detail:
-                "手動 curl で 401 が返る場合、PROBE_API_KEY が未設定・失効・別システムのトークンです。Connect SDK ページでトークンの状態を確認してください。",
-              check: "smoke trace の curl のレスポンスコードを確認(201 以外は本文にエラー理由)",
-            },
-            {
-              title: "ネットワーク不達",
-              detail:
-                "connection refused / timeout は接続先の問題です。Compose 内は http://control-server:8000、コンテナからホストは localhost 不可、外部からは公開 URL、という使い分けと network 設定を確認してください。",
-              check: "対象アプリと同じ場所から: curl -sS $PROBE_SERVER_URL/health",
-            },
-            {
-              title: "イベント未送信",
-              detail:
-                "PROBE_ENABLED=false になっている、または @probe を付けた関数がまだ一度も呼ばれていない可能性があります。tracing の失敗はアプリを壊さないよう黙って握りつぶされるため、まず設定と呼び出しの有無を確認します。",
-              check: "PROBE_ENABLED の値と、@probe 付き関数が実際に実行されるコードパスかを確認",
-            },
-            {
-              title: "対象 workload 未実行",
-              detail:
-                "patch と設定が正しくても、計装した関数を通る処理が動いていなければ trace は発生しません。該当機能へのリクエストやバッチを実際に流してください。",
-              check: "smoke trace は届く(smoke_only)のに実 trace が 0 のままなら、ほぼこのケースです",
-            },
-          ].map(item => (
-            <div key={item.title} className="rounded-md border p-3 space-y-1">
-              <div className="font-medium">{item.title}</div>
-              <p className="text-xs text-muted-foreground">{item.detail}</p>
-              <p className="text-xs">
-                <span className="font-medium">確認: </span>
-                <code className="font-mono text-[11px]">{item.check}</code>
-              </p>
-            </div>
-          ))}
-        </CardContent>
-      </Card>
+          <CardHeader>
+            <CardTitle className="text-sm flex items-center gap-2">
+              <Wrench className="h-4 w-4" /> トラブルシューティング(届かないときの切り分け)
+            </CardTitle>
+            <CardDescription>
+              「まだシグナルを受信していない」状態のよくある原因と、それぞれの確認方法です。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-2 text-sm">
+            {[
+              {
+                title: "設定不足",
+                detail:
+                  "PROBE_SERVER_URL が未設定の場合、SDK は http://localhost:8000 に送ります(コンテナ内では自分自身)。対象アプリのプロセスに環境変数が渡っているかを確認してください。",
+                check: "対象アプリ内で: python -c \"import os; print(os.getenv('PROBE_SERVER_URL'))\"",
+              },
+              {
+                title: "認証失敗",
+                detail:
+                  "手動 curl で 401 が返る場合、PROBE_API_KEY が未設定・失効・別システムのトークンです。Connect SDK ページでトークンの状態を確認してください。",
+                check: "smoke trace の curl のレスポンスコードを確認(201 以外は本文にエラー理由)",
+              },
+              {
+                title: "ネットワーク不達",
+                detail:
+                  "connection refused / timeout は接続先の問題です。Compose 内は http://control-server:8000、コンテナからホストは localhost 不可、外部からは公開 URL、という使い分けと network 設定を確認してください。",
+                check: "対象アプリと同じ場所から: curl -sS $PROBE_SERVER_URL/health",
+              },
+              {
+                title: "イベント未送信",
+                detail:
+                  "PROBE_ENABLED=false になっている、または @probe を付けた関数がまだ一度も呼ばれていない可能性があります。tracing の失敗はアプリを壊さないよう黙って握りつぶされるため、まず設定と呼び出しの有無を確認します。",
+                check: "PROBE_ENABLED の値と、@probe 付き関数が実際に実行されるコードパスかを確認",
+              },
+              {
+                title: "対象 workload 未実行",
+                detail:
+                  "patch と設定が正しくても、計装した関数を通る処理が動いていなければ trace は発生しません。該当機能へのリクエストやバッチを実際に流してください。",
+                check: "smoke trace は届く(smoke_only)のに実 trace が 0 のままなら、ほぼこのケースです",
+              },
+            ].map(item => (
+              <div key={item.title} className="rounded-md border p-3 space-y-1">
+                <div className="font-medium">{item.title}</div>
+                <p className="text-xs text-muted-foreground">{item.detail}</p>
+                <p className="text-xs">
+                  <span className="font-medium">確認: </span>
+                  <code className="font-mono text-[11px]">{item.check}</code>
+                </p>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+        </div>
+      </details>
 
+      <details data-testid="setup-env-disclosure">
+        <summary className="cursor-pointer rounded-md border px-3 py-2 text-sm font-medium">
+          SDK 環境変数リファレンス
+        </summary>
+        <div className="mt-2">
       <Card>
-        <CardHeader>
-          <CardTitle className="text-sm">SDK 環境変数リファレンス</CardTitle>
-          <CardDescription>監視対象アプリ側で使う主な環境変数です。</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b text-left">
-                  <th className="pb-2 font-medium text-muted-foreground">変数</th>
-                  <th className="pb-2 font-medium text-muted-foreground">既定値</th>
-                  <th className="pb-2 font-medium text-muted-foreground">説明</th>
-                </tr>
-              </thead>
-              <tbody>
-                {[
-                  ["PROBE_SERVER_URL", "http://localhost:8000", "Control Server の URL。実行形態に合わせて設定"],
-                  ["PROBE_API_KEY", "(なし)", "認証有効時の API トークン。X-Api-Key ヘッダで送信される"],
-                  ["PROBE_ENABLED", "true", "false で probe を完全に無効化(元の関数のみ実行)"],
-                  ["PROBE_DEFAULT_MODE", "trace", "ポリシー未取得時の既定モード(off / trace / shadow)"],
-                  ["PROBE_POLICY_TTL", "10", "ポリシーのキャッシュ秒数"],
-                  ["PROBE_HTTP_TIMEOUT", "2", "Control Server への送信タイムアウト秒数"],
-                ].map(([name, def, desc]) => (
-                  <tr key={name} className="border-b last:border-0">
-                    <td className="py-2 font-mono text-xs">{name}</td>
-                    <td className="py-2 font-mono text-xs text-muted-foreground">{def}</td>
-                    <td className="py-2 text-xs text-muted-foreground">{desc}</td>
+          <CardHeader>
+            <CardTitle className="text-sm">SDK 環境変数リファレンス</CardTitle>
+            <CardDescription>監視対象アプリ側で使う主な環境変数です。</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b text-left">
+                    <th className="pb-2 font-medium text-muted-foreground">変数</th>
+                    <th className="pb-2 font-medium text-muted-foreground">既定値</th>
+                    <th className="pb-2 font-medium text-muted-foreground">説明</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          <p className="text-[11px] text-muted-foreground mt-3">
-            システム: {systemId != null ? `#${systemId}` : "未選択"} · Control Server: {serverUrl}
-          </p>
-        </CardContent>
-      </Card>
+                </thead>
+                <tbody>
+                  {[
+                    ["PROBE_SERVER_URL", "http://localhost:8000", "Control Server の URL。実行形態に合わせて設定"],
+                    ["PROBE_API_KEY", "(なし)", "認証有効時の API トークン。X-Api-Key ヘッダで送信される"],
+                    ["PROBE_ENABLED", "true", "false で probe を完全に無効化(元の関数のみ実行)"],
+                    ["PROBE_DEFAULT_MODE", "trace", "ポリシー未取得時の既定モード(off / trace / shadow)"],
+                    ["PROBE_POLICY_TTL", "10", "ポリシーのキャッシュ秒数"],
+                    ["PROBE_HTTP_TIMEOUT", "2", "Control Server への送信タイムアウト秒数"],
+                  ].map(([name, def, desc]) => (
+                    <tr key={name} className="border-b last:border-0">
+                      <td className="py-2 font-mono text-xs">{name}</td>
+                      <td className="py-2 font-mono text-xs text-muted-foreground">{def}</td>
+                      <td className="py-2 text-xs text-muted-foreground">{desc}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <p className="text-[11px] text-muted-foreground mt-3">
+              システム: {systemId != null ? `#${systemId}` : "未選択"} · Control Server: {serverUrl}
+            </p>
+          </CardContent>
+        </Card>
+        </div>
+      </details>
     </div>
   );
 }

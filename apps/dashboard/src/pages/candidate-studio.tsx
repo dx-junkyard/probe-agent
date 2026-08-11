@@ -1,9 +1,14 @@
 import { useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
+import { ReplayReadinessPanel } from "@/components/replay-readiness";
+import { SnapshotPreflightPanel } from "@/components/snapshot-preflight";
+import { ImprovementLoopRail } from "@/components/improvement-loop/rail";
 import { toast } from "sonner";
 import {
   useComponents,
   useTraces,
+  useReplayReadiness,
+  useSnapshotPreflight,
   useReplaySets,
   useReplayApproval,
   useReplayVariantRun,
@@ -64,6 +69,19 @@ const STATE_LABEL_JA: Record<StudioState, string> = {
   promoted: "Experimentへ送信済み",
 };
 
+const REPLAYABILITY_LABELS: Record<string, string> = {
+  replayable: "完全復元",
+  partial: "一部マスク",
+  unreplayable: "Replay不可",
+  not_captured: "capture未設定",
+};
+
+function traceReplayHint(trace: TraceEvent): string {
+  const state = trace.replayability ?? "not_captured";
+  const reason = trace.replay_reasons?.[0];
+  return `${REPLAYABILITY_LABELS[state] ?? state}${reason ? `: ${reason}` : ""}`;
+}
+
 function versionState(v: CandidateVersionOut): StudioState {
   if (v.replay_status === "running") return "replaying";
   if (v.replay_status === "failed") return "evaluation_failed";
@@ -101,18 +119,53 @@ function StartView({
   prefillReplaySetId: string | null;
 }) {
   const navigate = useNavigate();
-  const { data: components } = useComponents();
+  const { data: components, isLoading: componentsLoading, isError: componentsError, refetch: refetchComponents } = useComponents();
   const [componentId, setComponentId] = useState(prefillComponentId ?? "");
   const [traceId, setTraceId] = useState(prefillTraceId ?? "");
   const [objective, setObjective] = useState("");
   const [advancedOpen, setAdvancedOpen] = useState(!!prefillReplaySetId);
   const [replaySetId, setReplaySetId] = useState(prefillReplaySetId ?? "");
 
-  const { data: traces } = useTraces(componentId || null, 50);
+  const { data: traces, isLoading: tracesLoading, isError: tracesError, refetch: refetchTraces } = useTraces(componentId || null, 50);
   const { data: replaySets } = useReplaySets(componentId || null);
   const createSession = useCreateCandidateSession();
+  // The readiness check must resolve symbols against the same snapshot the
+  // shared preflight selected for the candidate session.
+  const { data: snapshotPreflight } = useSnapshotPreflight();
 
-  const canStart = !!componentId && !createSession.isPending;
+  // Issue #372: evaluate Replay readiness for exactly the set this session
+  // would use, before the reasoning-model call.
+  //
+  // A Replay Set is judged on its OWN traces, not on the recent-N window: a
+  // Set of entirely uncaptured traces used to slip past the gate because the
+  // window happened to contain usable ones (and a usable Set could be blocked
+  // by an unusable window). The server enforces the same rule.
+  const selectedReplaySet = (replaySets ?? []).find(s => String(s.id) === replaySetId);
+  const evaluationTraceIds = replaySetId
+    ? selectedReplaySet?.trace_ids
+    : traceId
+      ? [traceId]
+      : undefined;
+  const { data: readiness, isLoading: readinessLoading } = useReplayReadiness(
+    componentId || null,
+    evaluationTraceIds,
+    snapshotPreflight?.snapshot_id,
+  );
+  // A selected Replay Set whose contents have not loaded yet cannot be judged;
+  // blocking on an unresolved set would be a guess, so the server stays the
+  // authority and rejects it on submit.
+  // Issue #369 (review finding 4): the same shared Snapshot preflight the
+  // Experiments surface renders, so the two cannot disagree about whether
+  // the snapshot may be used.
+  const [staleReason, setStaleReason] = useState("");
+  const staleAckMissing =
+    !!snapshotPreflight?.requires_stale_acknowledgement && !staleReason.trim();
+  const readinessJudgeable = !replaySetId || !!selectedReplaySet;
+  const readinessBlocked = readiness?.verdict === "blocked" && readinessJudgeable;
+
+  const canStart =
+    !!componentId && !createSession.isPending && !readinessBlocked
+    && !staleAckMissing && snapshotPreflight?.verdict !== "blocked";
 
   const handleStart = async () => {
     const payload: CandidateSessionCreateRequest = {
@@ -124,6 +177,9 @@ function StartView({
     } else if (traceId) {
       payload.trace_id = traceId;
     }
+    if (snapshotPreflight?.requires_stale_acknowledgement) {
+      payload.stale_snapshot_reason = staleReason.trim();
+    }
     try {
       const session = await createSession.mutateAsync(payload);
       navigate(`/candidate-studio?session_id=${session.id}`);
@@ -134,6 +190,12 @@ function StartView({
 
   return (
     <div className="max-w-2xl space-y-6">
+      {/* Issue #371: the same rail Components / Workbench / Experiments show. */}
+      <ImprovementLoopRail
+        componentId={componentId || null}
+        traceId={traceId || null}
+        replaySetId={replaySetId || null}
+      />
       <div>
         <h1 className="text-2xl font-bold tracking-tight">AI Candidate Studio</h1>
         <p className="mt-1 text-sm text-muted-foreground">
@@ -165,6 +227,13 @@ function StartView({
                 </option>
               ))}
             </Select>
+            {componentsLoading && <p className="text-xs text-muted-foreground">componentを読み込んでいます…</p>}
+            {componentsError && (
+              <div className="flex items-center gap-2 text-xs text-destructive" role="alert">
+                <span>componentの取得に失敗しました。</span>
+                <Button size="sm" variant="outline" onClick={() => refetchComponents()}>再試行</Button>
+              </div>
+            )}
           </div>
 
           {componentId && (
@@ -174,21 +243,44 @@ function StartView({
                 <option value="">Traceを選択...</option>
                 {traces?.map((t) => (
                   <option key={t.trace_id} value={t.trace_id}>
-                    {t.trace_id.slice(0, 20)} @ {formatTimestamp(t.timestamp)}
+                    {t.trace_id.slice(0, 20)} — {traceReplayHint(t)} — {formatTimestamp(t.timestamp)}
                   </option>
                 ))}
               </Select>
-              {!traces?.length && (
-                <p className="text-xs text-muted-foreground">
-                  このcomponentのTraceはまだ記録されていません。
-                </p>
-              )}
-              {!traceId && !replaySetId && !!traces?.length && (
-                <p className="text-xs text-muted-foreground">
-                  未選択の場合、このcomponentの直近最大50件のTraceが自動的に使われます。
-                </p>
+              {tracesLoading && <p className="text-xs text-muted-foreground">Traceを読み込んでいます…</p>}
+              {tracesError ? (
+                <div className="flex items-center gap-2 text-xs text-destructive" role="alert">
+                  <span>Traceの取得に失敗しました。</span>
+                  <Button size="sm" variant="outline" onClick={() => refetchTraces()}>再試行</Button>
+                </div>
+              ) : !tracesLoading && !traces?.length && (
+                <div className="rounded-md border p-3 text-xs text-muted-foreground">
+                  <p>このcomponentのTraceはまだ記録されていません。</p>
+                  <Button
+                    className="mt-2"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => navigate(`/components?component=${encodeURIComponent(componentId)}`)}
+                  >
+                    Componentsで収集設定を確認
+                  </Button>
+                </div>
               )}
             </div>
+          )}
+
+          {/* Issue #372: the split, the actually-usable count, and the
+              recovery step — all before anything is generated. This replaces
+              the old bare 「直近最大50件が自動的に使われます」 note, which said
+              how many traces would be read but not how many could be used. */}
+          <SnapshotPreflightPanel
+            preflight={snapshotPreflight}
+            staleReason={staleReason}
+            onStaleReasonChange={setStaleReason}
+          />
+
+          {componentId && (
+            <ReplayReadinessPanel readiness={readiness} isLoading={readinessLoading} />
           )}
 
           <div className="space-y-2">
@@ -222,7 +314,15 @@ function StartView({
             </div>
           )}
 
-          <Button onClick={handleStart} disabled={!canStart}>
+          <Button
+            onClick={handleStart}
+            disabled={!canStart}
+            title={
+              readinessBlocked
+                ? "Replayに使えるTraceがないため、候補を評価できません — 上の回復手順を参照してください"
+                : undefined
+            }
+          >
             {createSession.isPending ? "開始中..." : "セッションを開始"}
           </Button>
         </CardContent>
@@ -235,7 +335,7 @@ function StartView({
 
 function StudioView({ sessionId }: { sessionId: number }) {
   const navigate = useNavigate();
-  const { data: session, isLoading } = useCandidateSession(sessionId);
+  const { data: session, isLoading, isError, error, refetch } = useCandidateSession(sessionId);
   const sendMessage = useSendCandidateMessage();
   const generate = useGenerateCandidateVersion();
   const replay = useReplayCandidateVersion();
@@ -270,8 +370,22 @@ function StudioView({ sessionId }: { sessionId: number }) {
   const { data: approvalState } = useReplayApproval(componentId);
   const canRun = !!approvalState?.active;
 
-  if (isLoading || !session) {
+  if (isLoading) {
     return <Skeleton className="h-64 w-full" />;
+  }
+  if (isError || !session) {
+    return (
+      <Card role="alert">
+        <CardContent className="space-y-3 py-8 text-center">
+          <p className="text-sm font-medium">Candidate Sessionを読み込めませんでした。</p>
+          <p className="text-xs text-muted-foreground">{String(error ?? "対象のSessionが存在しない可能性があります。")}</p>
+          <div className="flex justify-center gap-2">
+            <Button size="sm" variant="outline" onClick={() => refetch()}>再試行</Button>
+            <Button size="sm" variant="ghost" onClick={() => navigate("/candidate-studio")}>一覧へ戻る</Button>
+          </div>
+        </CardContent>
+      </Card>
+    );
   }
 
   const selectedVersion = versions.find((v) => v.id === effectiveSelectedVersionId) ?? null;
@@ -337,6 +451,16 @@ function StudioView({ sessionId }: { sessionId: number }) {
 
   return (
     <div className="space-y-4">
+      {/* Issue #371: the loop's current position, derived from the version's
+          own persisted replay/promotion state -- not from the route, which
+          serves three stages of the loop. */}
+      <ImprovementLoopRail
+        componentId={componentId}
+        sessionId={sessionId}
+        version={selectedVersion}
+        approved={canRun}
+        snapshotId={session.snapshot_id}
+      />
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div>
           <h1 className="text-2xl font-bold tracking-tight">AI Candidate Studio</h1>

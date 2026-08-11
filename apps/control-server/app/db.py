@@ -151,12 +151,31 @@ CREATE TABLE IF NOT EXISTS traces (
     -- set the env var; never backfilled or inferred.
     environment  TEXT,
     git_sha      TEXT,
+    -- Issue #367: audit summary of the redaction the Control Server itself
+    -- applied at ingestion ({"redacted": true, "rules": [...],
+    -- "fields": [...]}). NULL means this row's payload needed no
+    -- server-side redaction -- NOT that redaction did not run, and NOT that
+    -- the SDK found nothing (the SDK masks before sending and does not
+    -- report what it masked).
+    redaction_json TEXT,
     PRIMARY KEY (system_id, trace_id),
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_traces_component_ts
     ON traces (system_id, component_id, timestamp DESC);
+
+-- Issue #370: per-System freshness thresholds. probe-agent cannot know a
+-- system's expected traffic rate, so the defaults in state_facts.py only
+-- separate "clearly live" from "clearly not"; a System that knows its own
+-- cadence narrows them here. Absent row = documented defaults.
+CREATE TABLE IF NOT EXISTS connectivity_freshness_policy (
+    system_id             INTEGER PRIMARY KEY,
+    delayed_after_seconds REAL NOT NULL,
+    stale_after_seconds   REAL NOT NULL,
+    updated_at            REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
 
 -- Issue #273: durable, System-isolated resource counters and observations.
 CREATE TABLE IF NOT EXISTS llm_daily_usage (
@@ -5222,6 +5241,50 @@ def init_db() -> None:
                 _add_column_if_missing(
                     conn, "interview_inquiry", inquiry_cols, column, "REAL",
                 )
+        # Issue #369: the snapshot-freshness facts an experiment was created
+        # under. Additive and never backfilled -- an experiment created before
+        # this existed has no recorded decision, which is exactly what NULL
+        # should say. `stale_ack_reason` is the developer's manual reason for
+        # running against a snapshot that is behind HEAD.
+        experiment_cols = _columns(conn, "experiments")
+        if experiment_cols:
+            for column in (
+                "snapshot_freshness",
+                "head_sha_at_creation",
+                "stale_ack_reason",
+            ):
+                _add_column_if_missing(
+                    conn, "experiments", experiment_cols, column, "TEXT"
+                )
+        # Issue #369 (review finding 4): the same stale-snapshot decision the
+        # Experiment records, on every other record that consumes a snapshot.
+        # Additive and never backfilled -- a row created before the shared
+        # preflight existed has no recorded decision, which is what NULL says.
+        for table in ("candidate_sessions", "replay_runs"):
+            columns = _columns(conn, table)
+            if columns:
+                for column in (
+                    "snapshot_freshness",
+                    "head_sha_at_creation",
+                    "stale_ack_reason",
+                ):
+                    _add_column_if_missing(conn, table, columns, column, "TEXT")
+        # Issue #367: the server-side redaction audit summary. Additive and
+        # never backfilled -- an existing row's NULL means "this row was
+        # stored before ingestion-time redaction existed", which is exactly
+        # the population the operational rescan in docs/secret-redaction.md
+        # is for. Backfilling it here would erase that distinction.
+        trace_cols = _columns(conn, "traces")
+        if trace_cols:
+            _add_column_if_missing(conn, "traces", trace_cols, "redaction_json", "TEXT")
+        # Projections and shadow results carry the same kind of free-form
+        # payload and reach storage through their own routes, so they need the
+        # same audit column. NULL keeps meaning "written before ingestion-time
+        # redaction existed" on every table the rescan covers.
+        for table in ("trace_projections", "shadow_results"):
+            columns = _columns(conn, table)
+            if columns:
+                _add_column_if_missing(conn, table, columns, "redaction_json", "TEXT")
         _migrate_alignment_manual_recheck_targets(conn)
         _ensure_legacy_system(conn)
     _validate_startup_environment()
