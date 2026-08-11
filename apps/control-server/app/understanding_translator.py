@@ -43,7 +43,11 @@ from typing import Dict, List, Optional, Sequence, Set
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .interview_language import interview_message, language_directive
-from .joint_understanding import ACTION_KINDS
+from .joint_understanding import (
+    ACTION_KINDS,
+    completes_outside_session,
+    formal_operation_for,
+)
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient, is_reasoning_model
 
 PROMPT_VERSION = "understanding-translation-v1"
@@ -385,6 +389,11 @@ class ActionMenuEntry:
     action_kind: str
     label: str
     what_changes: str
+    # Issue #336: the existing formal operation this action leads to, and
+    # whether it is performed by an endpoint outside this feature. Both come
+    # from the deterministic server catalog in app/joint_understanding.py.
+    formal_operation: str = ""
+    completes_outside_session: bool = False
 
 
 def build_action_menu(language: str) -> List[ActionMenuEntry]:
@@ -399,6 +408,8 @@ def build_action_menu(language: str) -> List[ActionMenuEntry]:
             action_kind=kind,
             label=interview_message(f"joint_action_{kind}_label", language),
             what_changes=interview_message(f"joint_action_{kind}_effect", language),
+            formal_operation=formal_operation_for(kind),
+            completes_outside_session=completes_outside_session(kind),
         )
         for kind in ACTION_KINDS
     ]

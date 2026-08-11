@@ -1338,7 +1338,7 @@ def test_build_fails_closed_on_llm_error_and_creates_no_rows(admin_client, tmp_p
     assert run["status"] == "failed"
     assert run["error_details"] == "reasoning model call failed"
     assert run["decision_method"] == "reasoning_llm"
-    assert run["prompt_version"] == "alignment-v2"
+    assert run["prompt_version"] == "alignment-v3"
 
 
 def test_build_fails_closed_when_every_items_evidence_is_invalid(admin_client, tmp_path, monkeypatch):
