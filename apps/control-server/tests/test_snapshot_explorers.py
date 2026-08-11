@@ -261,6 +261,49 @@ def test_runtime_facts_discover_candidates_rather_than_only_annotating(
     assert result.candidates == ["app/retry.py"]
 
 
+def test_runtime_discovery_orders_by_traces_not_by_symbol_count(indexed_snapshot):
+    """One path can define several symbols sharing a component_id, so the join
+    yields one row per (trace, symbol) pair. Counting those would weight a path
+    by how many symbols it contains -- a large file jumping ahead of one that is
+    actually failing more often, while still looking like a count of calls."""
+    system_id, snapshot_id = indexed_snapshot
+    from app.db import get_conn
+
+    now = time.time()
+    with get_conn() as conn:
+        # `app/retry.py` already defines TWO symbols; give the second one the
+        # same component_id so the join multiplies its rows.
+        conn.execute(
+            "UPDATE code_symbols SET component_id = 'retry_component' "
+            "WHERE snapshot_id = ? AND path = 'app/retry.py'",
+            (snapshot_id,),
+        )
+        conn.execute(
+            "UPDATE code_symbols SET component_id = 'caller_component' "
+            "WHERE snapshot_id = ? AND path = 'app/caller.py' AND kind = 'module'",
+            (snapshot_id,),
+        )
+        # retry: one error. caller: two errors -- it must come first.
+        conn.execute(
+            """INSERT INTO traces
+                (system_id, trace_id, component_id, mode, duration_ms, error, timestamp)
+               VALUES (?, 'r-1', 'retry_component', 'trace', 1, 'boom', ?)""",
+            (system_id, now),
+        )
+        for index in range(2):
+            conn.execute(
+                """INSERT INTO traces
+                    (system_id, trace_id, component_id, mode, duration_ms, error,
+                     timestamp)
+                   VALUES (?, ?, 'caller_component', 'trace', 1, 'boom', ?)""",
+                (system_id, f"c-{index}", now),
+            )
+        result = runtime_discovery_candidates(
+            conn, snapshot_id=snapshot_id, system_id=system_id,
+        )
+    assert result.candidates[:2] == ["app/caller.py", "app/retry.py"]
+
+
 def test_a_failing_source_is_skipped_not_escalated(indexed_snapshot):
     """A broken source must not fail the round, and must not be replaced by an
     unbounded fallback search."""

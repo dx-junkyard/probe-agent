@@ -3917,6 +3917,13 @@ class JointUnderstandingOut(BaseModel):
     # be recovered after a reload is not an audit record.
     closed_by_actor_kind: Optional[JointUnderstandingActorKind] = None
     closed_by_username: Optional[str] = None
+    # Issue #336: the origin row that is CURRENT today. For `qa` and `intent`,
+    # corrections are additive -- the pinned `origin_id` becomes a superseded row
+    # the moment the developer revises it -- so a consumer matching a session to
+    # the live item must use this, not `origin_id`. Reported rather than
+    # substituted: the session keeps pointing at the row the conversation
+    # started from.
+    current_origin_id: Optional[int] = None
     premise_state: JointUnderstandingPremiseState = "invalid"
     premise_reason: Optional[JointUnderstandingPremiseReason] = None
     # Issue #337: the shared Issue #308 premise bundle as captured at creation.

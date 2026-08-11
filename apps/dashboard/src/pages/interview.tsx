@@ -628,8 +628,16 @@ function QaItemCard({
     answerUnknown.isPending || investigate.investigatingQaId === qa.id;
 
   const [jointId, setJointId] = useState<number | null>(null);
+  // Issue #336: match on `current_origin_id` as well as `origin_id`.
+  // `interview_qa` corrects additively, so an answer revision gives this card a
+  // NEW row id while the session still points at the row the conversation
+  // started from — matching on `origin_id` alone made the whole conversation
+  // disappear from the card the moment its question got a revision.
   const activeJoint = (jointList.data?.items ?? []).find(
-    item => item.origin_kind === "qa" && item.origin_id === qa.id && item.status !== "closed",
+    item =>
+      item.origin_kind === "qa"
+      && item.status !== "closed"
+      && (item.origin_id === qa.id || item.current_origin_id === qa.id),
   );
   const openJointId = jointId ?? activeJoint?.id ?? null;
 

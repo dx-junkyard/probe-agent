@@ -773,3 +773,182 @@ def test_a_basis_from_another_system_is_unreachable(admin_client):
         },
         headers=other_headers,
     ).status_code == 404
+
+
+# --- The review_item and inquiry origins ---------------------------------------
+#
+# These two share their premise with Issue #308: a review item's own
+# `superseded` flag and an Inquiry's `superseded` status are the SAME facts
+# #323's Alignment build writes, so both features have to reach the same verdict
+# from them. That is the whole point of reusing the bundle rather than defining a
+# parallel one.
+
+
+def _insert_alignment_item(system_id, session_id, snapshot_id, **overrides):
+    from app.db import get_conn
+
+    now = time.time()
+    run_id = _insert_run(system_id, snapshot_id)
+    values = {
+        "session_id": session_id, "system_id": system_id, "snapshot_id": snapshot_id,
+        "intelligence_run_id": run_id,
+        "current_claim": "リトライ上限は3回", "alignment_state": "aligned",
+        "confidence": "likely", "review_category": "batch_reviewable",
+        "reason_code": "low_risk", "user_reason": "低リスク",
+        "base_content_hash": "content-hash-A", "subject_state": "new",
+        "review_subject_id": "subject-A", "created_at": now, "updated_at": now,
+    }
+    values.update(overrides)
+    columns = ", ".join(values)
+    placeholders = ", ".join("?" for _ in values)
+    with get_conn() as conn:
+        return conn.execute(
+            f"INSERT INTO alignment_item ({columns}) VALUES ({placeholders})",
+            tuple(values.values()),
+        ).lastrowid
+
+
+def _insert_inquiry(system_id, session_id, snapshot_id, **overrides):
+    from app.db import get_conn
+
+    now = time.time()
+    values = {
+        "session_id": session_id, "system_id": system_id,
+        "origin_kind": "review_item", "origin_id": 1, "status": "open",
+        "premise_snapshot_id": snapshot_id, "premise_content_hash": "inq-hash-A",
+        "premise_capability_digest": "inq-cap-A",
+        "premise_tracking_version": "inquiry-premise-v1",
+        "created_at": now, "updated_at": now,
+    }
+    values.update(overrides)
+    columns = ", ".join(values)
+    placeholders = ", ".join("?" for _ in values)
+    with get_conn() as conn:
+        return conn.execute(
+            f"INSERT INTO interview_inquiry ({columns}) VALUES ({placeholders})",
+            tuple(values.values()),
+        ).lastrowid
+
+
+def test_a_review_item_origin_shares_issue_308s_premise(admin_client):
+    token, system_id, headers, snapshot_id, session_id = _setup(admin_client)
+    item_id = _insert_alignment_item(system_id, session_id, snapshot_id)
+    ju_id = _open_ju(
+        admin_client, headers, session_id, "review_item", item_id,
+    )["session"]["id"]
+    session = admin_client.get(
+        f"/joint-understanding/{ju_id}", headers=headers,
+    ).json()["session"]
+    assert (session["premise_state"], session["premise_reason"]) == ("current", None)
+    # The #321 subject anchor is captured, so the two features can talk about the
+    # same discussion point.
+    assert session["premise_tracking_version"] == JOINT_PREMISE_VERSION
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE alignment_item SET superseded = 1 WHERE id = ?", (item_id,),
+        )
+    assert _premise(admin_client, headers, ju_id) == ("stale", "origin_superseded")
+
+
+def test_a_review_item_content_change_is_detected(admin_client):
+    token, system_id, headers, snapshot_id, session_id = _setup(admin_client)
+    item_id = _insert_alignment_item(system_id, session_id, snapshot_id)
+    ju_id = _open_ju(
+        admin_client, headers, session_id, "review_item", item_id,
+    )["session"]["id"]
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE alignment_item SET base_content_hash = 'content-hash-B' WHERE id = ?",
+            (item_id,),
+        )
+    assert _premise(admin_client, headers, ju_id) == ("stale", "origin_content_changed")
+
+
+def test_an_ambiguous_review_subject_is_not_captured(admin_client):
+    """Issue #321: storing an ambiguous anchor would let a later build resolve a
+    single successor for a subject that never identified this row uniquely."""
+    token, system_id, headers, snapshot_id, session_id = _setup(admin_client)
+    item_id = _insert_alignment_item(
+        system_id, session_id, snapshot_id, subject_state="ambiguous",
+    )
+    detail = _open_ju(admin_client, headers, session_id, "review_item", item_id)
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT premise_review_subject_id FROM joint_understanding_session "
+            "WHERE id = ?",
+            (detail["session"]["id"],),
+        ).fetchone()
+    assert row["premise_review_subject_id"] is None
+    # The premise is still comparable on content, so the session stays usable.
+    assert detail["session"]["premise_state"] == "current"
+
+
+def test_an_inquiry_origin_inherits_the_parent_premise(admin_client):
+    """An Inquiry has no question column of its own, so its premise IS its Issue
+    #308 bundle. Inheriting it means an Alignment build that supersedes the
+    Inquiry produces the same verdict in both features, from the same fact."""
+    token, system_id, headers, snapshot_id, session_id = _setup(admin_client)
+    inquiry_id = _insert_inquiry(system_id, session_id, snapshot_id)
+    ju_id = _open_ju(
+        admin_client, headers, session_id, "inquiry", inquiry_id,
+    )["session"]["id"]
+    assert _premise(admin_client, headers, ju_id) == ("current", None)
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE interview_inquiry SET status = 'superseded' WHERE id = ?",
+            (inquiry_id,),
+        )
+    assert _premise(admin_client, headers, ju_id) == ("stale", "origin_superseded")
+
+
+def test_an_inquiry_premise_change_is_detected(admin_client):
+    token, system_id, headers, snapshot_id, session_id = _setup(admin_client)
+    inquiry_id = _insert_inquiry(system_id, session_id, snapshot_id)
+    ju_id = _open_ju(
+        admin_client, headers, session_id, "inquiry", inquiry_id,
+    )["session"]["id"]
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE interview_inquiry SET premise_content_hash = 'inq-hash-B' "
+            "WHERE id = ?",
+            (inquiry_id,),
+        )
+    # The inherited capability digest is unchanged, so the specific cause
+    # reported is the content, not the scope.
+    assert _premise(admin_client, headers, ju_id) == ("stale", "origin_content_changed")
+
+
+def test_a_deleted_origin_is_missing_for_every_origin_kind(admin_client):
+    token, system_id, headers, snapshot_id, session_id = _setup(admin_client)
+    item_id = _insert_alignment_item(system_id, session_id, snapshot_id)
+    inquiry_id = _insert_inquiry(system_id, session_id, snapshot_id)
+    review_ju = _open_ju(
+        admin_client, headers, session_id, "review_item", item_id,
+    )["session"]["id"]
+    inquiry_ju = _open_ju(
+        admin_client, headers, session_id, "inquiry", inquiry_id,
+    )["session"]["id"]
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        conn.execute("DELETE FROM alignment_item WHERE id = ?", (item_id,))
+        conn.execute("DELETE FROM interview_inquiry WHERE id = ?", (inquiry_id,))
+
+    assert _premise(admin_client, headers, review_ju) == ("missing", "origin_removed")
+    assert _premise(admin_client, headers, inquiry_ju) == ("missing", "origin_removed")

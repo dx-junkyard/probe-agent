@@ -370,11 +370,18 @@ def runtime_discovery_candidates(
     result = ExplorerResult(source_kind="runtime_facts", revision=str(snapshot_id))
     if limit <= 0:
         return result
+    # DISTINCT on the trace identity, not COUNT(*): one path can define several
+    # symbols that share a component_id, and the join then yields one row per
+    # (trace, symbol) pair. Counting those would weight a path by how many
+    # symbols it happens to contain, letting a large file jump the queue ahead of
+    # one that is actually failing more often -- while still looking like a
+    # count of calls.
     rows = conn.execute(
         """SELECT s.path AS path,
-                  SUM(CASE WHEN t.error IS NOT NULL AND t.error != '' THEN 1 ELSE 0 END)
-                      AS errors,
-                  COUNT(*) AS calls
+                  COUNT(DISTINCT CASE
+                      WHEN t.error IS NOT NULL AND t.error != '' THEN t.trace_id
+                  END) AS errors,
+                  COUNT(DISTINCT t.trace_id) AS calls
            FROM traces AS t
            JOIN code_symbols AS s
              ON s.component_id = t.component_id AND s.snapshot_id = ?

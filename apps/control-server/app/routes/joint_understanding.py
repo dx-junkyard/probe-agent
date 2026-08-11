@@ -194,6 +194,22 @@ def _column(row, name: str):
     return row[name] if name in row.keys() else None
 
 
+def _current_origin_id(conn, ju_row) -> Optional[int]:
+    """The origin row that is current today, for a consumer matching the session.
+
+    `interview_qa` and `interview_intent_item` correct additively, so the pinned
+    `origin_id` is a superseded row the moment the developer revises the item.
+    A consumer that matched only on `origin_id` would stop finding the session --
+    the conversation would disappear from the card the moment its question got
+    an answer revision, which is exactly the "a later step must not cost
+    something the developer already had" rule this epic is built on.
+    """
+    facts = resolve_premise_facts(conn, ju_row)
+    if facts is None or facts.current_origin_id is None:
+        return ju_row["origin_id"]
+    return facts.current_origin_id
+
+
 def _premise_verdict(conn, ju_row):
     """The session's finite premise verdict, from the shared #308 bundle.
 
@@ -209,7 +225,7 @@ def _premise_verdict(conn, ju_row):
     return evaluate_session_premise(conn, ju_row)
 
 
-def _session_out(row, verdict=None) -> JointUnderstandingOut:
+def _session_out(row, verdict=None, current_origin_id=None) -> JointUnderstandingOut:
     state = verdict.state if verdict is not None else "invalid"
     reason = verdict.reason_code if verdict is not None else "premise_not_captured"
     return JointUnderstandingOut(
@@ -229,6 +245,7 @@ def _session_out(row, verdict=None) -> JointUnderstandingOut:
         outcome_premise_reason=_column(row, "outcome_premise_reason"),
         closed_by_actor_kind=_column(row, "closed_by_actor_kind"),
         closed_by_username=_column(row, "closed_by_username"),
+        current_origin_id=current_origin_id if current_origin_id is not None else row["origin_id"],
         premise_state=state,
         premise_reason=reason,
         premise_snapshot_id=row["premise_snapshot_id"],
@@ -379,7 +396,7 @@ def _detail(conn, ju_row) -> JointUnderstandingDetailOut:
     verdict = _premise_verdict(conn, ju_row)
     superseded = _superseded_finding_ids(findings)
     return JointUnderstandingDetailOut(
-        session=_session_out(ju_row, verdict),
+        session=_session_out(ju_row, verdict, _current_origin_id(conn, ju_row)),
         findings=[_finding_out(f) for f in findings],
         actions=[_action_out(a) for a in actions],
         investigation_rounds=[
@@ -527,7 +544,7 @@ def list_joint_understanding(
         ).fetchall()
         return JointUnderstandingListOut(
             session_id=session_id, system_id=system_id,
-            items=[_session_out(r, _premise_verdict(conn, r)) for r in rows],
+            items=[_session_out(r, _premise_verdict(conn, r), _current_origin_id(conn, r)) for r in rows],
         )
 
 
@@ -2104,7 +2121,7 @@ def hold_joint_understanding(
         row = conn.execute(
             "SELECT * FROM joint_understanding_session WHERE id = ?", (ju_id,),
         ).fetchone()
-        return _session_out(row, _premise_verdict(conn, row))
+        return _session_out(row, _premise_verdict(conn, row), _current_origin_id(conn, row))
 
 
 @router.post("/joint-understanding/{ju_id}/resume", response_model=JointUnderstandingOut)
@@ -2122,7 +2139,7 @@ def resume_joint_understanding(
         row = conn.execute(
             "SELECT * FROM joint_understanding_session WHERE id = ?", (ju_id,),
         ).fetchone()
-        return _session_out(row, _premise_verdict(conn, row))
+        return _session_out(row, _premise_verdict(conn, row), _current_origin_id(conn, row))
 
 
 @router.post("/joint-understanding/{ju_id}/close", response_model=JointUnderstandingOut)
@@ -2237,4 +2254,4 @@ def close_joint_understanding(
         row = conn.execute(
             "SELECT * FROM joint_understanding_session WHERE id = ?", (ju_id,),
         ).fetchone()
-        return _session_out(row, _premise_verdict(conn, row))
+        return _session_out(row, _premise_verdict(conn, row), _current_origin_id(conn, row))

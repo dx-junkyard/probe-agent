@@ -732,3 +732,40 @@ def test_the_action_menu_names_the_operation_each_action_opens(admin_client, mon
     assert entries["handoff"].formal_operation == "question_handoff_create"
     assert entries["handoff"].completes_outside_session is True
     assert entries["request_investigation"].completes_outside_session is False
+
+
+def test_an_answer_revision_does_not_lose_the_conversation(admin_client, monkeypatch):
+    """`interview_qa` corrects additively, so a revision gives the question a NEW
+    row id while the session still points at the row the conversation started
+    from. A consumer matching only on `origin_id` would stop finding the session
+    -- the conversation would disappear from the card the moment its question got
+    an answer revision."""
+    token, system_id, headers, snapshot_id, session_id = _setup(admin_client)
+    qa = _create_qa(admin_client, headers, session_id)
+    _stub_router(monkeypatch, "system_researchable")
+    _stub_investigation(monkeypatch, findings=1)
+    started = admin_client.post(
+        f"/interview/sessions/{session_id}/qa/{qa['id']}/unknown",
+        json={"answer_text": "分からない", "actor": "root"}, headers=headers,
+    ).json()
+    ju_id = started["joint_understanding_id"]
+    assert ju_id is not None
+
+    revised = admin_client.post(
+        f"/interview/sessions/{session_id}/qa/{qa['id']}/answer",
+        json={"answer_text": "調べたら3回でした", "actor": "root"}, headers=headers,
+    )
+    assert revised.status_code == 200, revised.text
+    new_qa_id = revised.json()["qa"]["id"]
+    assert new_qa_id != qa["id"]
+
+    listed = admin_client.get(
+        f"/interview/sessions/{session_id}/joint-understanding", headers=headers,
+    ).json()["items"]
+    session = next(item for item in listed if item["id"] == ju_id)
+    # The session keeps pointing at where the conversation started...
+    assert session["origin_id"] == qa["id"]
+    # ...and reports the live row a consumer must match on.
+    assert session["current_origin_id"] == new_qa_id
+    # The premise is still current: the QUESTION did not change.
+    assert session["premise_state"] == "current"

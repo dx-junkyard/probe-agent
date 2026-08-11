@@ -4554,6 +4554,11 @@ export interface JointUnderstandingOut {
   outcome_premise_reason: JointUnderstandingPremiseReason | null;
   closed_by_actor_kind: JointUnderstandingActorKind | null;
   closed_by_username: string | null;
+  // Issue #336: the origin row that is CURRENT today. `interview_qa` and
+  // `interview_intent_item` correct additively, so `origin_id` becomes a
+  // superseded row the moment the developer revises the item -- matching a
+  // session to the live item must use this.
+  current_origin_id: number | null;
   premise_state: JointUnderstandingPremiseState;
   premise_reason: JointUnderstandingPremiseReason | null;
   premise_snapshot_id: number | null;
