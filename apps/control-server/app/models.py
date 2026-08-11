@@ -635,6 +635,49 @@ class SnapshotPreflightOut(BaseModel):
     stale_continuation_note: Optional[str] = None
 
 
+# Issue #372: Replay readiness, evaluated before a candidate is generated.
+ReplayReadinessStatus = Literal["ok", "attention", "blocking"]
+ReplayReadinessVerdict = Literal["ready", "attention", "blocked"]
+
+
+class ReplayReadinessCountsOut(BaseModel):
+    """How a set of traces splits across the finite replayability values.
+
+    `not_captured` (the component never opted into `replay_capture`) is kept
+    separate from `unreplayable` (capture was attempted and failed): the
+    remediation differs, so merging them would give the wrong instruction.
+    """
+
+    total: int
+    replayable: int
+    partial: int
+    unreplayable: int
+    not_captured: int
+    #: replayable + partial — the traces that can produce a comparison at all.
+    usable: int
+
+
+class ReplayReadinessCheckOut(BaseModel):
+    check_id: str
+    status: ReplayReadinessStatus
+    summary: str
+    detail: str
+    remediation: str
+
+
+class ReplayReadinessOut(BaseModel):
+    component_id: str
+    #: Every trace of the component.
+    counts: ReplayReadinessCountsOut
+    #: Only the traces a run would actually use (the auto-selected window, or
+    #: the explicitly chosen ids).
+    selected: ReplayReadinessCountsOut
+    selection_limit: int
+    selection_is_automatic: bool
+    verdict: ReplayReadinessVerdict
+    checks: List[ReplayReadinessCheckOut] = Field(default_factory=list)
+
+
 class StaleSnapshotAck(BaseModel):
     """The developer's explicit decision to continue on a stale snapshot.
 
@@ -832,6 +875,11 @@ class ExperimentCreate(BaseModel):
     variants: List[ExperimentVariantCreate] = Field(
         ..., min_length=2, max_length=10
     )
+    # Issue #369: required when the chosen snapshot is definitively behind
+    # HEAD. Continuing on an older snapshot is legitimate (reproduction runs),
+    # but it is the developer's decision, so it is recorded on the experiment
+    # rather than inferred. `decision_method: manual`.
+    stale_snapshot_reason: Optional[str] = Field(None, min_length=1, max_length=1000)
 
 
 class ExperimentCommandOut(BaseModel):

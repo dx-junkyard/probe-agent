@@ -5241,6 +5241,21 @@ def init_db() -> None:
                 _add_column_if_missing(
                     conn, "interview_inquiry", inquiry_cols, column, "REAL",
                 )
+        # Issue #369: the snapshot-freshness facts an experiment was created
+        # under. Additive and never backfilled -- an experiment created before
+        # this existed has no recorded decision, which is exactly what NULL
+        # should say. `stale_ack_reason` is the developer's manual reason for
+        # running against a snapshot that is behind HEAD.
+        experiment_cols = _columns(conn, "experiments")
+        if experiment_cols:
+            for column in (
+                "snapshot_freshness",
+                "head_sha_at_creation",
+                "stale_ack_reason",
+            ):
+                _add_column_if_missing(
+                    conn, "experiments", experiment_cols, column, "TEXT"
+                )
         # Issue #367: the server-side redaction audit summary. Additive and
         # never backfilled -- an existing row's NULL means "this row was
         # stored before ingestion-time redaction existed", which is exactly

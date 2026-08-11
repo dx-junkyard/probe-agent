@@ -400,6 +400,101 @@ export interface SnapshotOut {
   created_at: string;
   completed_at: string | null;
   files: SnapshotFileOut[];
+  // Issue #369: freshness is a SECOND axis over the same row. `status`
+  // ("ready") answers whether the analysis finished; this answers whether the
+  // pinned commit still equals HEAD. A ready snapshot can be stale, and a
+  // failed one can be current — never render one as the other.
+  freshness?: SnapshotFreshnessState | null;
+  is_recommended?: boolean;
+}
+
+// Issue #369: shared Snapshot preflight, decided server-side by
+// `app/snapshot_preflight.py` so candidate generation / Replay / Experiment
+// cannot disagree. The Dashboard renders it and never re-derives it.
+export type SnapshotFreshnessState = "current" | "stale" | "unknown";
+export type SnapshotPreflightCheckId =
+  | "snapshot_processing"
+  | "snapshot_freshness"
+  | "symbol_index"
+  | "understanding";
+export type SnapshotPreflightCheckStatus = "ok" | "attention" | "blocking" | "unknown";
+export type SnapshotPreflightVerdict = "ready" | "attention" | "blocked";
+
+export interface SnapshotPreflightCheckOut {
+  check_id: SnapshotPreflightCheckId;
+  status: SnapshotPreflightCheckStatus;
+  summary: string;
+  detail: string;
+  remediation: string;
+}
+
+export interface SnapshotPreflightOut {
+  snapshot_id: number | null;
+  /** "Did the analysis finish" — the existing snapshot status vocabulary. */
+  processing_state: string | null;
+  /** "Does the pinned commit still equal HEAD" — a separate axis. */
+  freshness: SnapshotFreshnessState;
+  commit_sha: string | null;
+  head_sha: string | null;
+  head_relation: "same" | "behind" | "diverged" | "unknown";
+  commits_behind: number | null;
+  verdict: SnapshotPreflightVerdict;
+  checks: SnapshotPreflightCheckOut[];
+  recommended_snapshot_id: number | null;
+  recommended_snapshot_commit_sha: string | null;
+  recommended_snapshot_freshness: SnapshotFreshnessState;
+  is_recommended: boolean;
+  requires_stale_acknowledgement: boolean;
+  stale_continuation_note: string | null;
+}
+
+// Issue #373: deterministic monitoring summary over ALL of a component's
+// traces (never just the loaded page). `error_rate` is null when there is no
+// data — which is not the same as 0%.
+export interface TraceSummaryOut {
+  component_id: string;
+  total: number;
+  error_count: number;
+  error_rate: number | null;
+  last_trace_at: number | null;
+  replayable_count: number;
+  redacted_count: number;
+  duration_p50_ms: number | null;
+  duration_p95_ms: number | null;
+  duration_max_ms: number | null;
+}
+
+// Issue #372: Replay readiness, evaluated before a candidate is generated.
+export type ReplayReadinessStatus = "ok" | "attention" | "blocking";
+export type ReplayReadinessVerdict = "ready" | "attention" | "blocked";
+
+export interface ReplayReadinessCountsOut {
+  total: number;
+  replayable: number;
+  partial: number;
+  unreplayable: number;
+  /** Never opted into `replay_capture` — distinct from a failed capture. */
+  not_captured: number;
+  /** replayable + partial: traces that can produce a comparison at all. */
+  usable: number;
+}
+
+export interface ReplayReadinessCheckOut {
+  check_id: string;
+  status: ReplayReadinessStatus;
+  summary: string;
+  detail: string;
+  remediation: string;
+}
+
+export interface ReplayReadinessOut {
+  component_id: string;
+  counts: ReplayReadinessCountsOut;
+  selected: ReplayReadinessCountsOut;
+  selection_limit: number;
+  selection_is_automatic: boolean;
+  verdict: ReplayReadinessVerdict;
+  checks: ReplayReadinessCheckOut[];
 }
 
 // Repository refresh-hub status (Issue #158)

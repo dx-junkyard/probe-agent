@@ -834,3 +834,107 @@ def test_candidate_proposal_shape_fails_closed_on_wrong_field_types():
         _validate_proposal_shape({"generated_code": 123})
     with pytest.raises(DraftError, match="risks must be an array of strings"):
         _validate_proposal_shape({"generated_code": "def candidate(): pass", "risks": [1]})
+
+
+# ---------------------------------------------------------------------------
+# Issue #372: Replay readiness preflight before a candidate is generated
+# ---------------------------------------------------------------------------
+
+
+def _post_uncaptured_trace(client, headers, trace_id, component_id):
+    """A trace from a component that never opted into replay_capture."""
+    response = client.post(
+        "/traces",
+        json={
+            "trace_id": trace_id,
+            "component_id": component_id,
+            "mode": "trace",
+            "input": {"args": [], "kwargs": {}},
+            "duration_ms": 1.0,
+            "timestamp": time.time(),
+        },
+        headers=headers,
+    )
+    assert response.status_code == 201, response.text
+
+
+def test_session_creation_is_refused_when_no_trace_can_be_replayed(
+    admin_client, replay_repo
+):
+    """The audited case: traces exist, the symbol resolves, but nothing can be
+    replayed -- so generation must stop BEFORE the reasoning-model call."""
+    _token, _system, headers, _snapshot = _prepare(admin_client, replay_repo)
+    for index in range(11):
+        _post_uncaptured_trace(admin_client, headers, f"nc{index}", "norm")
+
+    response = admin_client.post(
+        "/candidate-sessions",
+        json={"component_id": "norm", "objective": "make it faster"},
+        headers=headers,
+    )
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "no_replayable_traces"
+    assert detail["counts"]["total"] == 11
+    assert detail["counts"]["not_captured"] == 11
+    assert "replay_capture=True" in detail["remediation"]
+
+
+def test_session_creation_proceeds_when_at_least_one_trace_is_replayable(
+    admin_client, replay_repo
+):
+    _token, _system, headers, _snapshot = _prepare(admin_client, replay_repo)
+    for index in range(5):
+        _post_uncaptured_trace(admin_client, headers, f"nc{index}", "norm")
+    _post_trace(admin_client, headers, "usable", "norm", args=("abc",))
+
+    response = admin_client.post(
+        "/candidate-sessions",
+        json={"component_id": "norm", "objective": "make it faster"},
+        headers=headers,
+    )
+    assert response.status_code == 201, response.text
+
+
+def test_readiness_endpoint_reflects_the_same_component(admin_client, replay_repo):
+    _token, _system, headers, _snapshot = _prepare(admin_client, replay_repo)
+    _post_trace(admin_client, headers, "usable", "norm", args=("abc",))
+
+    body = admin_client.get(
+        "/replay-readiness?component_id=norm", headers=headers
+    ).json()
+    assert body["counts"]["usable"] == 1
+    # Approval has not been granted yet: attention, never blocking.
+    approval = next(c for c in body["checks"] if c["check_id"] == "approval")
+    assert approval["status"] == "attention"
+    assert body["verdict"] == "attention"
+
+    _approve(admin_client, headers, "norm")
+    after = admin_client.get(
+        "/replay-readiness?component_id=norm", headers=headers
+    ).json()
+    assert after["verdict"] == "ready"
+
+
+def test_explicit_trace_ids_are_gated_on_their_own_replayability(
+    admin_client, replay_repo
+):
+    """Choosing traces by hand must not bypass the check."""
+    _token, _system, headers, _snapshot = _prepare(admin_client, replay_repo)
+    _post_trace(admin_client, headers, "usable", "norm", args=("abc",))
+    _post_uncaptured_trace(admin_client, headers, "empty", "norm")
+
+    refused = admin_client.post(
+        "/candidate-sessions",
+        json={"component_id": "norm", "objective": "x", "trace_ids": ["empty"]},
+        headers=headers,
+    )
+    assert refused.status_code == 422
+    assert refused.json()["detail"]["code"] == "no_replayable_traces"
+
+    accepted = admin_client.post(
+        "/candidate-sessions",
+        json={"component_id": "norm", "objective": "x", "trace_ids": ["usable"]},
+        headers=headers,
+    )
+    assert accepted.status_code == 201, accepted.text

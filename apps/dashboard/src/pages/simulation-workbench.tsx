@@ -34,6 +34,7 @@ import { Bot } from "lucide-react";
 import { ReplayabilityBadge } from "@/components/replay-row-actions";
 import { ApprovalPanel } from "@/components/replay-approval-panel";
 import { ResultMatrix } from "@/components/replay-result-matrix";
+import { ImprovementLoopRail } from "@/components/improvement-loop/rail";
 
 // Simulation Workbench (Issue #242 Phase D / #246). Display + composition
 // only: every judgement/execution/comparison decision below is made by the
@@ -196,6 +197,9 @@ export default function SimulationWorkbenchPage() {
 
   return (
     <div className="space-y-6">
+      {/* Issue #371: the Workbench is the multi-candidate detail mode of the
+          same loop, not a separate product. */}
+      <ImprovementLoopRail componentId={componentId} />
       <div className="flex items-center justify-between gap-3">
         <h1 className="text-2xl font-bold tracking-tight">Simulation Workbench</h1>
         <div className="flex items-center gap-2">

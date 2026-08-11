@@ -24,6 +24,11 @@ from ..models import (
     ExperimentOut,
     ExperimentVariantResultOut,
 )
+from ..snapshot_preflight import (
+    StaleSnapshotNotAcknowledged,
+    gather_preflight,
+    resolve_stale_decision,
+)
 from ..validation_runner import load_validation_config_text
 
 router = APIRouter()
@@ -162,6 +167,27 @@ def create_experiment(
     system_id: int = Depends(get_system_id),
 ) -> ExperimentOut:
     now = time.time()
+
+    # Issue #369: the shared preflight decides freshness, and a snapshot that
+    # is definitively behind HEAD may only be used with the developer's stated
+    # reason. Evaluated BEFORE the write connection is opened: `gather_preflight`
+    # runs `git` subprocesses, and the SQLite lock is process-wide and
+    # non-reentrant (see .claude/skills/control-server/SKILL.md).
+    preflight = gather_preflight(system_id, payload.snapshot_id)
+    try:
+        freshness, head_sha, stale_reason = resolve_stale_decision(
+            preflight, payload.stale_snapshot_reason
+        )
+    except StaleSnapshotNotAcknowledged as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "stale_snapshot_not_acknowledged",
+                "message": str(exc),
+                "recommended_snapshot_id": preflight.recommended_snapshot_id,
+            },
+        ) from exc
+
     with get_conn() as conn:
         snapshot = conn.execute(
             """
@@ -229,8 +255,9 @@ def create_experiment(
             """
             INSERT INTO experiments
                 (system_id, feature_id, objective, snapshot_id, baseline_commit,
-                 config_revision, execution_config, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?)
+                 config_revision, execution_config, status, created_at,
+                 snapshot_freshness, head_sha_at_creation, stale_ack_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?)
             """,
             (
                 system_id,
@@ -241,6 +268,9 @@ def create_experiment(
                 config_revision,
                 json.dumps(execution_config),
                 now,
+                freshness,
+                head_sha,
+                stale_reason,
             ),
         )
         experiment_id = cur.lastrowid

@@ -1,7 +1,7 @@
-import { Fragment, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import {
-  useComponents, useTraces, useUpdatePolicy,
+  useComponents, useTraces, useTraceSummary, useUpdatePolicy,
   useComponentProfile, useUpdateComponentProfile,
   useShadowResults, useUpdateEvaluation,
   useCriteria,
@@ -20,6 +20,12 @@ import { Bot } from "lucide-react";
 import { AddToWorkspaceButton } from "@/components/add-to-workspace";
 import { ReplayabilityBadge, ReplayRowActions } from "@/components/replay-row-actions";
 import { RedactionBadge, TracePayloadPanel } from "@/components/trace-payload-panel";
+import { ImprovementLoopRail } from "@/components/improvement-loop/rail";
+import { TraceSummaryCard, TraceFilterBar } from "@/components/trace-monitor-ui";
+import {
+  DEFAULT_FILTERS, filterTraces, filtersFromSearch, filtersToSearch,
+  formatDuration, formatRelative,
+} from "@/components/trace-monitor";
 
 const MODES = ["off", "trace", "shadow"] as const;
 const EVALUATIONS = ["unknown", "better", "worse", "same"];
@@ -37,7 +43,7 @@ const PROFILE_FIELD_LABELS_JA: Record<string, string> = {
 
 export default function ComponentsPage() {
   const navigate = useNavigate();
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const { data: components, isLoading } = useComponents(SIGNAL_REFRESH_INTERVAL_MS);
   // Deep link from Trace Lineage / analyzer results: /components?component=<id>
   const [selected, setSelected] = useState<string | null>(
@@ -45,6 +51,19 @@ export default function ComponentsPage() {
   );
   const requestedTraceId = searchParams.get("trace");
   const [expandedTraceId, setExpandedTraceId] = useState<string | null>(requestedTraceId);
+  // Issue #373: the filter/sort state lives in the URL so a reload or a shared
+  // link reproduces the same view. Unrelated params (component, trace) are
+  // preserved, keeping the Trace Lineage / analyzer deep links working.
+  const filters = filtersFromSearch(searchParams);
+  const setFilters = (next: typeof filters) =>
+    setSearchParams(filtersToSearch(next, searchParams), { replace: true });
+  // A single clock for the whole render, so relative times inside one table
+  // are consistent with each other and with the window filter.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(id);
+  }, []);
   const updatePolicy = useUpdatePolicy();
   const { data: traces } = useTraces(
     selected,
@@ -56,6 +75,9 @@ export default function ComponentsPage() {
   const { data: shadows } = useShadowResults(selected, 20);
   const updateEval = useUpdateEvaluation();
   const { data: criteria } = useCriteria(selected);
+  // Computed over ALL of the component's traces, not the loaded page --
+  // a p95 from the most recent 20 rows would change on every poll.
+  const { data: traceSummary } = useTraceSummary(selected);
 
   const current = components?.find(c => c.component_id === selected);
   // Issue #258: `components` rows are created (mode='trace' by default) via
@@ -67,6 +89,11 @@ export default function ComponentsPage() {
   // no longer resolves) is treated as "unknown", per the escape hatch --
   // only a definitive trace_count === 0 blocks.
   const zeroTraces = current !== undefined && current.trace_count === 0;
+
+  const visibleTraces = useMemo(
+    () => filterTraces(traces ?? [], filters, now),
+    [traces, filters, now],
+  );
 
   const [profForm, setProfForm] = useState<Record<string, string>>({});
   const profileFields = ["purpose", "responsibility", "expected_input", "expected_output", "failure_impact"] as const;
@@ -91,7 +118,11 @@ export default function ComponentsPage() {
   };
 
   return (
-    <div className="flex gap-6 h-[calc(100vh-8rem)]">
+    <div className="space-y-4">
+      {/* Issue #371: Components is stage 1 of the improvement loop, not a
+          standalone page. The rail names the loop the developer is in. */}
+      <ImprovementLoopRail componentId={selected} traceId={expandedTraceId} />
+    <div className="flex gap-6 h-[calc(100vh-12rem)]">
       <div className="w-64 shrink-0 overflow-y-auto border rounded-xl p-2 space-y-1">
         <h2 className="px-2 py-1 text-xs font-semibold text-muted-foreground uppercase tracking-wider">Components</h2>
         {isLoading ? (
@@ -197,9 +228,32 @@ export default function ComponentsPage() {
 
               <TabsContent value="traces">
                 <Card>
-                  <CardContent className="pt-6">
+                  <CardContent className="space-y-4 pt-6">
+                    {/* Issue #373: health first, then the rows. */}
+                    <TraceSummaryCard summary={traceSummary} now={now} />
+                    {!!traces?.length && (
+                      <TraceFilterBar
+                        filters={filters}
+                        onChange={setFilters}
+                        matched={visibleTraces.length}
+                        total={traces.length}
+                      />
+                    )}
                     {!traces?.length ? (
                       <p className="text-sm text-muted-foreground text-center py-8">Traceがまだありません</p>
+                    ) : !visibleTraces.length ? (
+                      <div className="py-8 text-center" data-testid="trace-filter-empty">
+                        <p className="text-sm text-muted-foreground">
+                          条件に一致するTraceがありません（全 {traces.length} 件）。
+                        </p>
+                        <button
+                          type="button"
+                          className="mt-2 text-xs underline cursor-pointer"
+                          onClick={() => setFilters(DEFAULT_FILTERS)}
+                        >
+                          絞り込みを解除
+                        </button>
+                      </div>
                     ) : (
                       <div className="overflow-x-auto max-h-96 overflow-y-auto">
                         <table className="w-full text-sm">
@@ -215,7 +269,7 @@ export default function ComponentsPage() {
                             </tr>
                           </thead>
                           <tbody>
-                            {traces.map(t => {
+                            {visibleTraces.map(t => {
                               const expanded = expandedTraceId === t.trace_id;
                               return (
                                 <Fragment key={t.trace_id}>
@@ -238,7 +292,9 @@ export default function ComponentsPage() {
                                       </button>
                                     </td>
                                     <td className="py-2"><Badge variant="outline">{t.mode}</Badge></td>
-                                    <td className="py-2 text-xs">{t.duration_ms != null ? `${t.duration_ms}ms` : "—"}</td>
+                                    <td className="py-2 text-xs" title={t.duration_ms != null ? `${t.duration_ms}ms` : undefined}>
+                                      {formatDuration(t.duration_ms)}
+                                    </td>
                                     <td className="py-2">
                                       {t.error ? <Badge variant="destructive">error</Badge> : <Badge variant="success">ok</Badge>}
                                     </td>
@@ -248,7 +304,9 @@ export default function ComponentsPage() {
                                     <td className="py-2">
                                       <RedactionBadge redaction={t.redaction} />
                                     </td>
-                                    <td className="py-2 text-right text-xs text-muted-foreground">{formatTimestamp(t.timestamp)}</td>
+                                    <td className="py-2 text-right text-xs text-muted-foreground" title={formatTimestamp(t.timestamp)}>
+                                      {formatRelative(t.timestamp, now)}
+                                    </td>
                                   </tr>
                                   {expanded && (
                                     <tr key={`${t.trace_id}-details`} className="border-b bg-muted/20">
@@ -394,6 +452,7 @@ export default function ComponentsPage() {
           </div>
         )}
       </div>
+    </div>
     </div>
   );
 }

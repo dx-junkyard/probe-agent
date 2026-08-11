@@ -1,9 +1,12 @@
 import { useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
+import { ReplayReadinessPanel } from "@/components/replay-readiness";
+import { ImprovementLoopRail } from "@/components/improvement-loop/rail";
 import { toast } from "sonner";
 import {
   useComponents,
   useTraces,
+  useReplayReadiness,
   useReplaySets,
   useReplayApproval,
   useReplayVariantRun,
@@ -112,7 +115,17 @@ function StartView({
   const { data: replaySets } = useReplaySets(componentId || null);
   const createSession = useCreateCandidateSession();
 
-  const canStart = !!componentId && !createSession.isPending;
+  // Issue #372: evaluate Replay readiness for exactly the set this session
+  // would use, before the reasoning-model call. A Replay Set is resolved
+  // server-side, so its own trace ids are what get checked there; here we
+  // scope to the explicitly chosen trace when there is one.
+  const { data: readiness, isLoading: readinessLoading } = useReplayReadiness(
+    componentId || null,
+    traceId && !replaySetId ? [traceId] : undefined,
+  );
+  const readinessBlocked = readiness?.verdict === "blocked" && !replaySetId;
+
+  const canStart = !!componentId && !createSession.isPending && !readinessBlocked;
 
   const handleStart = async () => {
     const payload: CandidateSessionCreateRequest = {
@@ -134,6 +147,8 @@ function StartView({
 
   return (
     <div className="max-w-2xl space-y-6">
+      {/* Issue #371: the same rail Components / Workbench / Experiments show. */}
+      <ImprovementLoopRail componentId={componentId || null} traceId={traceId || null} />
       <div>
         <h1 className="text-2xl font-bold tracking-tight">AI Candidate Studio</h1>
         <p className="mt-1 text-sm text-muted-foreground">
@@ -183,12 +198,15 @@ function StartView({
                   このcomponentのTraceはまだ記録されていません。
                 </p>
               )}
-              {!traceId && !replaySetId && !!traces?.length && (
-                <p className="text-xs text-muted-foreground">
-                  未選択の場合、このcomponentの直近最大50件のTraceが自動的に使われます。
-                </p>
-              )}
             </div>
+          )}
+
+          {/* Issue #372: the split, the actually-usable count, and the
+              recovery step — all before anything is generated. This replaces
+              the old bare 「直近最大50件が自動的に使われます」 note, which said
+              how many traces would be read but not how many could be used. */}
+          {componentId && (
+            <ReplayReadinessPanel readiness={readiness} isLoading={readinessLoading} />
           )}
 
           <div className="space-y-2">
@@ -222,7 +240,15 @@ function StartView({
             </div>
           )}
 
-          <Button onClick={handleStart} disabled={!canStart}>
+          <Button
+            onClick={handleStart}
+            disabled={!canStart}
+            title={
+              readinessBlocked
+                ? "Replayに使えるTraceがないため、候補を評価できません — 上の回復手順を参照してください"
+                : undefined
+            }
+          >
             {createSession.isPending ? "開始中..." : "セッションを開始"}
           </Button>
         </CardContent>
@@ -337,6 +363,16 @@ function StudioView({ sessionId }: { sessionId: number }) {
 
   return (
     <div className="space-y-4">
+      {/* Issue #371: the loop's current position, derived from the version's
+          own persisted replay/promotion state -- not from the route, which
+          serves three stages of the loop. */}
+      <ImprovementLoopRail
+        componentId={componentId}
+        sessionId={sessionId}
+        version={selectedVersion}
+        approved={canRun}
+        snapshotId={session.snapshot_id}
+      />
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div>
           <h1 className="text-2xl font-bold tracking-tight">AI Candidate Studio</h1>

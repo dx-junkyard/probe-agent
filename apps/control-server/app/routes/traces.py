@@ -1,4 +1,5 @@
 import json
+import math
 import time
 from typing import List, Optional
 
@@ -617,6 +618,75 @@ def list_component_projections(
             (system_id, component_id, limit),
         ).fetchall()
     return [_row_to_projection(r) for r in rows]
+
+
+@router.get("/components/{component_id}/trace-summary")
+def component_trace_summary(
+    component_id: str,
+    system_id: int = Depends(get_system_id),
+) -> dict:
+    """Deterministic monitoring summary for one component (Issue #373).
+
+    Computed over ALL of the component's traces, not the page the Dashboard
+    happens to have loaded: a p95 taken from the most recent 20 rows would be
+    a different number every poll and would not describe the component.
+
+    Percentiles use the nearest-rank method on the sorted sample, which needs
+    no interpolation and is exactly reproducible.
+    """
+    with get_conn() as conn:
+        totals = conn.execute(
+            """SELECT COUNT(*) AS total,
+                      SUM(CASE WHEN error IS NOT NULL AND error != '' THEN 1 ELSE 0 END)
+                          AS error_count,
+                      MAX(timestamp) AS last_trace_at,
+                      SUM(CASE WHEN replayability IN ('replayable', 'partial')
+                               THEN 1 ELSE 0 END) AS replayable_count,
+                      SUM(CASE WHEN redaction_json IS NOT NULL
+                                AND redaction_json LIKE '%"redacted": true%'
+                               THEN 1 ELSE 0 END) AS redacted_count
+               FROM traces WHERE system_id = ? AND component_id = ?""",
+            (system_id, component_id),
+        ).fetchone()
+        durations = [
+            row["duration_ms"]
+            for row in conn.execute(
+                """SELECT duration_ms FROM traces
+                   WHERE system_id = ? AND component_id = ? AND duration_ms IS NOT NULL
+                   ORDER BY duration_ms""",
+                (system_id, component_id),
+            ).fetchall()
+        ]
+
+    total = totals["total"] or 0
+    error_count = totals["error_count"] or 0
+    return {
+        "component_id": component_id,
+        "total": total,
+        "error_count": error_count,
+        # Reported as a fraction of the traces that exist; the client formats
+        # it. `None` when there is nothing to divide by, never 0.0 — "no
+        # errors" and "no data" are different answers.
+        "error_rate": (error_count / total) if total else None,
+        "last_trace_at": totals["last_trace_at"],
+        "replayable_count": totals["replayable_count"] or 0,
+        "redacted_count": totals["redacted_count"] or 0,
+        "duration_p50_ms": _percentile(durations, 50),
+        "duration_p95_ms": _percentile(durations, 95),
+        "duration_max_ms": durations[-1] if durations else None,
+    }
+
+
+def _percentile(sorted_values: List[float], percentile: int) -> Optional[float]:
+    """Nearest-rank percentile over an already-sorted list.
+
+    No interpolation, so the result is always an observed value and two
+    callers computing it never disagree by a rounding rule.
+    """
+    if not sorted_values:
+        return None
+    rank = max(1, math.ceil(percentile / 100 * len(sorted_values)))
+    return sorted_values[min(rank, len(sorted_values)) - 1]
 
 
 @router.get("/components/{component_id}/traces")

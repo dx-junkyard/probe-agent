@@ -4,7 +4,7 @@ import {
   useExperiments, useRunExperiment, useExperimentDecision,
   useCreateExperiment, useSnapshots, useLatestDrafts,
   useWorkspaceProposalDraft, useVariantExperimentPayload,
-  useGithubAppStatus, useGithubConnections,
+  useGithubAppStatus, useGithubConnections, useSnapshotPreflight,
 } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -21,6 +21,8 @@ import { Play, Download, Plus, Trash2, GitPullRequest, Crosshair, Bot } from "lu
 import type { ExperimentOut } from "@/api/types";
 import { AddToWorkspaceButton } from "@/components/add-to-workspace";
 import { ContextHeader } from "@/components/layout/context-header";
+import { SnapshotPreflightPanel } from "@/components/snapshot-preflight";
+import { ImprovementLoopRail } from "@/components/improvement-loop/rail";
 
 const STATUS_VARIANT: Record<string, "default" | "success" | "destructive" | "secondary" | "warning"> = {
   draft: "secondary",
@@ -84,7 +86,25 @@ export default function ExperimentsPage() {
   const [newSnapshotId, setNewSnapshotId] = useState<string>("");
   const [variants, setVariants] = useState<VariantInput[] | null>(null);
 
+  // Issue #369: the shared preflight decides both axes for the selected
+  // snapshot (or the recommended one when nothing is selected yet). The page
+  // never re-derives `ready`/`current` itself.
+  const { data: preflight, isLoading: preflightLoading } = useSnapshotPreflight(
+    newSnapshotId ? Number(newSnapshotId) : null,
+  );
+  const [staleReason, setStaleReason] = useState("");
+
   const readySnapshots = snapshots?.filter(s => s.status === "ready") ?? [];
+  // Exactly one recommendation, from the server. Older ready snapshots stay
+  // reachable for reproduction runs, but are not offered as equals.
+  const recommendedId = preflight?.recommended_snapshot_id ?? null;
+  const recommendedSnapshot = readySnapshots.find(s => s.id === recommendedId)
+    ?? readySnapshots[0];
+  const olderSnapshots = readySnapshots.filter(s => s.id !== recommendedSnapshot?.id);
+  // A definitively stale snapshot needs the developer's reason before the
+  // experiment can be created (`decision_method: manual`).
+  const staleAckMissing =
+    !!preflight?.requires_stale_acknowledgement && staleReason.trim().length === 0;
   const features = drafts?.feature_drafts ?? [];
   const draftVariants = workspaceDraft?.draft_type === "experiment_draft"
     ? (workspaceDraft.payload.variant_summaries ?? []).map(summary => ({
@@ -141,6 +161,12 @@ export default function ExperimentsPage() {
           patch_text: v.patch_text,
           risk_note: v.risk_note.trim() || undefined,
         })),
+        // Issue #369: only sent when the server's preflight says the snapshot
+        // is definitively behind HEAD. The server re-checks and rejects a
+        // missing reason itself; this is not the gate, only the input to it.
+        ...(preflight?.requires_stale_acknowledgement
+          ? { stale_snapshot_reason: staleReason.trim() }
+          : {}),
       });
       toast.success("Experiment created");
       setShowCreate(false);
@@ -165,6 +191,8 @@ export default function ExperimentsPage() {
   return (
     <div className="space-y-6">
       <ContextHeader />
+      {/* Issue #371: same rail as Components / Candidate Studio / Workbench. */}
+      <ImprovementLoopRail experiment={experiments?.[0] ?? null} />
       {capabilityContext && (
         <Link
           to={`/capability-map?capability=${encodeURIComponent(capabilityContext)}`}
@@ -275,16 +303,36 @@ export default function ExperimentsPage() {
             <Label>Objective</Label>
             <Textarea value={formObjective} onChange={e => setNewObjective(e.target.value)} placeholder="What are you trying to learn?" rows={2} />
           </div>
+          {/* Issue #369: the selector no longer presents every "ready"
+              snapshot as an equal option. Exactly one is the recommendation;
+              the rest are disclosed as reproduction-only choices, and the
+              shared preflight below states both axes for whichever is
+              selected. */}
           <div className="space-y-2">
             <Label>Snapshot</Label>
             <Select value={newSnapshotId} onChange={e => setNewSnapshotId(e.target.value)}>
-              <option value="">Select snapshot...</option>
-              {readySnapshots.map(s => (
-                <option key={s.id} value={s.id}>
-                  #{s.id} — {s.commit_sha?.slice(0, 8)} ({s.file_count} files)
+              <option value="">Snapshotを選択...</option>
+              {recommendedSnapshot && (
+                <option value={recommendedSnapshot.id}>
+                  #{recommendedSnapshot.id} — {recommendedSnapshot.commit_sha?.slice(0, 8)}（推奨）
                 </option>
-              ))}
+              )}
+              {olderSnapshots.length > 0 && (
+                <optgroup label="過去のSnapshot（再現用途）">
+                  {olderSnapshots.map(s => (
+                    <option key={s.id} value={s.id}>
+                      #{s.id} — {s.commit_sha?.slice(0, 8)} ({s.file_count} files)
+                    </option>
+                  ))}
+                </optgroup>
+              )}
             </Select>
+            <SnapshotPreflightPanel
+              preflight={preflight}
+              isLoading={preflightLoading}
+              staleReason={staleReason}
+              onStaleReasonChange={setStaleReason}
+            />
           </div>
           <div className="space-y-3">
             <div className="flex items-center justify-between">
@@ -325,10 +373,17 @@ export default function ExperimentsPage() {
           </div>
           <Button
             onClick={handleCreate}
-            disabled={createExperiment.isPending || !formFeatureId || !formObjective.trim() || !newSnapshotId || formVariants.filter(v => v.label.trim() && v.patch_text.trim()).length < 2}
+            disabled={createExperiment.isPending || !formFeatureId || !formObjective.trim() || !newSnapshotId || formVariants.filter(v => v.label.trim() && v.patch_text.trim()).length < 2 || staleAckMissing || preflight?.verdict === "blocked"}
+            title={
+              staleAckMissing
+                ? "HEADより古いSnapshotを使う理由を入力してください"
+                : preflight?.verdict === "blocked"
+                  ? "このSnapshotでは開始できません — 上の確認項目を解消してください"
+                  : undefined
+            }
             className="w-full"
           >
-            {createExperiment.isPending ? "Creating..." : "Create Experiment"}
+            {createExperiment.isPending ? "作成中..." : "Experimentを作成"}
           </Button>
         </div>
       </Dialog>

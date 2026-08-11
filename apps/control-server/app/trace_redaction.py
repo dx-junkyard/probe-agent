@@ -111,7 +111,13 @@ def redact_text(
 
 
 def _join(path: str, segment: str) -> str:
-    return segment if not path else f"{path}{segment}" if segment.startswith("[") else f"{path}.{segment}"
+    """Append one path segment: ``kwargs`` + ``api_key`` -> ``kwargs.api_key``,
+    ``args`` + ``[0]`` -> ``args[0]``."""
+    if not path:
+        return segment
+    if segment.startswith("["):
+        return f"{path}{segment}"
+    return f"{path}.{segment}"
 
 
 def redact_value(

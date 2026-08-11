@@ -723,6 +723,76 @@ creating incomplete persistence or execution paths for later phases.
     merge, or deploy; the human Replay approval gate stays; the isolated,
     network-off sandbox policy stays.
 
+    The recurring shape of every fix in this epic is **one displayed word was
+    carrying two independent facts**. Each was split into two finite axes that
+    are computed server-side and only rendered by the Dashboard. Any later
+    change must keep them apart:
+    - **Connectivity** (#370): `state` is a cumulative lifecycle milestone
+      ("has connected at least once") and never regresses; `freshness`
+      (`never_received`/`receiving_now`/`delayed`/`stale`) is the live reading
+      and does. `app/state_facts.py` decides both; thresholds are returned
+      with every reading and adjustable per System
+      (`connectivity_freshness_policy`). Relative times render from the
+      server-measured elapsed seconds, so a skewed browser clock cannot turn a
+      live system stale, and a future-dated trace is `receiving_now` with the
+      skew reported separately. Windowed counts (5m/1h/24h) exclude smoke
+      traces — a cumulative total can never show that traffic stopped. The
+      Overview's setup checklist deliberately still reads `state`: "you
+      connected the SDK" is a step that stays done.
+    - **Tokens** (#368): `app/token_status.py` is the only definition of
+      `active`/`expiring_soon`/`expired`/`revoked`. First-match, `revoked`
+      outranks `expired`, a NULL `expires_at` means no expiry (never
+      "expired"), and boundaries are inclusive. The Dashboard never re-derives
+      it from `revoked`/`expires_at` — that second definition was the bug.
+    - **Snapshots** (#369): `app/snapshot_preflight.py` +
+      `GET /snapshot-preflight` decide processing state (`ready` = analysis
+      finished) and freshness (`current` = commit equals HEAD) separately. A
+      `ready` snapshot can be stale; a `failed` one can be current. Exactly
+      one snapshot is the recommendation; the rest are disclosed as
+      reproduction-only. `unknown` freshness never blocks and never demands an
+      acknowledgement — an unreadable HEAD is not evidence the snapshot is
+      behind. Continuing on a definitively stale snapshot requires the
+      developer's reason, persisted on the consuming record
+      (`experiments.stale_ack_reason`, `decision_method: manual`).
+      `gather_preflight` runs `git` subprocesses, so it must never be called
+      with a `get_conn()` connection open.
+    - **Replay readiness** (#372): `app/replay_readiness.py` +
+      `GET /replay-readiness` count a component's traces across the finite
+      replayability values *before* generation, and
+      `POST /candidate-sessions` refuses (422 `no_replayable_traces`) when the
+      evaluation set has zero usable captures. `not_captured` (never opted
+      into `replay_capture`) stays separate from `unreplayable` (capture
+      attempted and failed): the remediations differ. `partial` counts as
+      usable — it still produces a real diff — but the comparison limit is
+      stated. Missing Replay approval is `attention`, never `blocking`: a
+      session may be prepared before approval; only the run refuses.
+    - **The loop** (#371): `components/improvement-loop/model.ts` is the only
+      place that decides the stage, and it is pure. The stage comes from
+      persisted facts (a version's replay/promotion state), never from the
+      route — Candidate Studio alone serves three stages. The rail navigates
+      and never executes; each stage states what its primary action *produces*
+      in the developer's terms, because 「送信」/「promote」/「Experimentへ送る」
+      did not. The internal persistence models are deliberately NOT unified.
+    - **Trace monitoring** (#373): `GET /components/{id}/trace-summary`
+      computes over ALL of a component's traces, never the loaded page — a p95
+      from the most recent 20 rows changes on every poll and describes
+      nothing. Percentiles are nearest-rank (always an observed value, no
+      interpolation rule to disagree about), and `error_rate` is `null` with
+      no data rather than `0.0`. Filtering/sorting lives in
+      `components/trace-monitor.ts` as pure functions, and the filter state
+      lives in the URL so a reload or a shared link reproduces the view;
+      `filtersToSearch` preserves unrelated params so the Trace Lineage and
+      analyzer deep links keep working. Sorts are total and stable (ties fall
+      back to newest first) so polling cannot reorder rows under the reader.
+    - **Setup information design** (#374): `components/setup-next-step.ts`
+      answers 現在の状態 / 次の1操作 / 完了条件 by first match over persisted
+      facts, reading `freshness` (not `state`) so a system that has gone
+      silent gets the recovery step rather than a completion message. The
+      8-step flow, troubleshooting, and the env-var reference disclose on
+      demand; the actionable lead stays open. `docs/ui-glossary.md` is the
+      terminology and label contract — most importantly the rule this whole
+      epic exists to enforce: one displayed word must not carry two facts.
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,

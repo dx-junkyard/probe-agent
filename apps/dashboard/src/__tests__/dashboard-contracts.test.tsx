@@ -313,7 +313,7 @@ describe("Experiment creation", () => {
     fireEvent.change(patchInputs[0], { target: { value: "patch-a" } });
 
     const buttons = screen.getAllByRole("button");
-    const createBtn = buttons.find(b => b.textContent === "Create Experiment");
+    const createBtn = buttons.find(b => b.textContent === "Experimentを作成");
     expect(createBtn).toBeDisabled();
   });
 
@@ -336,7 +336,7 @@ describe("Experiment creation", () => {
     fireEvent.change(patchInputs[1], { target: { value: "patch-b" } });
 
     const buttons = screen.getAllByRole("button");
-    const createBtn = buttons.find(b => b.textContent === "Create Experiment")!;
+    const createBtn = buttons.find(b => b.textContent === "Experimentを作成")!;
     expect(createBtn).not.toBeDisabled();
 
     fireEvent.click(createBtn);

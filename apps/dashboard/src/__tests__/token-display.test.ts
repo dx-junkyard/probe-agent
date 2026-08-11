@@ -20,8 +20,8 @@ function token(overrides: Partial<TokenOut> = {}): TokenOut {
     user_id: 1,
     system_id: 1,
     revoked: false,
-    created_at: 1_800_000_000,
-    expires_at: 1_800_086_400,
+    created_at: "1800000000",
+    expires_at: "1800086400",
     status: "active",
     expires_in_seconds: 86_400,
     ...overrides,
@@ -68,9 +68,9 @@ describe("sortTokensByUsability", () => {
     const sorted = sortTokensByUsability([
       token({ id: 1, status: "revoked" }),
       token({ id: 2, status: "expired" }),
-      token({ id: 3, status: "active", created_at: 100 }),
+      token({ id: 3, status: "active", created_at: "100" }),
       token({ id: 4, status: "expiring_soon" }),
-      token({ id: 5, status: "active", created_at: 200 }),
+      token({ id: 5, status: "active", created_at: "200" }),
     ]);
     expect(sorted.map(t => t.id)).toEqual([5, 3, 4, 2, 1]);
   });
@@ -91,13 +91,13 @@ describe("formatExpiresIn", () => {
 
   it("期限切れを相対時間で表さない", () => {
     expect(
-      formatExpiresIn({ status: "expired", expires_at: 1, expires_in_seconds: 0 }),
+      formatExpiresIn({ status: "expired", expires_at: "1", expires_in_seconds: 0 }),
     ).toBe("期限切れ");
   });
 
   it("残り時間の単位を切り替える", () => {
     const at = (seconds: number) =>
-      formatExpiresIn({ status: "expiring_soon", expires_at: 1, expires_in_seconds: seconds });
+      formatExpiresIn({ status: "expiring_soon", expires_at: "1", expires_in_seconds: seconds });
     expect(at(30)).toBe("あと1分未満");
     expect(at(1800)).toBe("あと約30分");
     expect(at(7200)).toBe("あと約2時間");
@@ -106,7 +106,7 @@ describe("formatExpiresIn", () => {
 
   it("境界の0秒を期限切れとして扱う", () => {
     expect(
-      formatExpiresIn({ status: "expiring_soon", expires_at: 1, expires_in_seconds: 0 }),
+      formatExpiresIn({ status: "expiring_soon", expires_at: "1", expires_in_seconds: 0 }),
     ).toBe("期限切れ");
   });
 });

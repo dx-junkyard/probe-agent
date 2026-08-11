@@ -334,3 +334,4 @@ def test_preflight_leaves_the_target_repository_unchanged(client, repo, tmp_path
         ).stdout.strip()
         == head
     )
+

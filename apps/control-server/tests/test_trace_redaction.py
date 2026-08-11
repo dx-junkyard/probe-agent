@@ -310,3 +310,68 @@ def test_depth_bound_cuts_off_rather_than_trusting_deep_nodes():
         value = {"next": value}
     result = redact_trace_payload(input_value=value, output=None, error=None)
     assert PLAIN_PASSWORD not in json.dumps(result.input)
+
+
+# --- monitoring summary (Issue #373) -----------------------------------------
+
+
+def test_trace_summary_reports_deterministic_monitoring_facts(client):
+    for index, duration in enumerate([10.0, 20.0, 30.0, 40.0, 1000.0]):
+        client.post(
+            "/traces",
+            json=_trace(f"s{index}", duration_ms=duration,
+                        error="Boom" if index == 4 else None),
+        )
+
+    body = client.get("/components/summarizer/trace-summary").json()
+    assert body["total"] == 5
+    assert body["error_count"] == 1
+    assert body["error_rate"] == 0.2
+    # Nearest-rank: an observed value, never an interpolated one.
+    assert body["duration_p50_ms"] == 30.0
+    assert body["duration_p95_ms"] == 1000.0
+    assert body["duration_max_ms"] == 1000.0
+    assert body["last_trace_at"] is not None
+
+
+def test_trace_summary_distinguishes_no_errors_from_no_data(client):
+    empty = client.get("/components/nothing/trace-summary").json()
+    assert empty["total"] == 0
+    # None, not 0.0: "no errors" and "no data" are different answers.
+    assert empty["error_rate"] is None
+    assert empty["duration_p50_ms"] is None
+
+    client.post("/traces", json=_trace("ok", duration_ms=5.0))
+    populated = client.get("/components/summarizer/trace-summary").json()
+    assert populated["error_rate"] == 0.0
+
+
+def test_trace_summary_counts_replayable_and_redacted(client):
+    client.post(
+        "/traces",
+        json=_trace("a", replayability="replayable", replay_reasons=[],
+                    input_capture={"args": [], "kwargs": {}}),
+    )
+    client.post(
+        "/traces",
+        json=_trace("b", replayability="partial", replay_reasons=["redacted"],
+                    input_capture={"args": [], "kwargs": {}}),
+    )
+    client.post("/traces", json=_trace("c"))
+    client.post(
+        "/traces",
+        json=_trace("d", input={"args": [], "kwargs": {"api_key": OPENAI_KEY}}),
+    )
+
+    body = client.get("/components/summarizer/trace-summary").json()
+    assert body["total"] == 4
+    # `partial` still produces a comparison, so it counts as replayable.
+    assert body["replayable_count"] == 2
+    assert body["redacted_count"] == 1
+
+
+def test_trace_summary_is_system_scoped(client, db_path):
+    client.post("/traces", json=_trace("a", duration_ms=1.0))
+    _insert_legacy_row(db_path, "other", json.dumps({"args": [], "kwargs": {}}))
+    # The legacy helper writes system_id=1, the same system, so the count is 2.
+    assert client.get("/components/summarizer/trace-summary").json()["total"] == 2

@@ -774,3 +774,28 @@ the reverse — puts it back on top of the primary action at narrow widths.
 と一緒に静的 HTML へ入れ、Chromium (`/opt/pw-browsers/chromium`) で測ると
 本番と同じ CSS のまま寸法を検証できる。Playwright はリポジトリの依存には
 追加しないこと(この確認は使い捨てで行う)。
+
+## 設定〜候補評価の主導線 (issue #366, subs #367-#374)
+
+この Epic の修正はすべて同じ形をしている: **1つの表示語が独立した2つの事実を
+兼ねていた**。判定はサーバ側の有限集合として置き、Dashboard は描画するだけに
+する。クライアント側に2つ目の定義を作らないこと — それが元のバグである。
+
+- `ConnectivityBadge` は `freshness`(現在受信しているか)を読む。`state`
+  (一度でも疎通したか)は累積マイルストーンで、Overview のセットアップ
+  チェックリストだけが読む。同じ緑ラベルで両方を表さない。
+- token の状態は `TokenOut.status` を読む。`revoked` / `expires_at` から
+  ローカルに再計算しない (`lib/token-display.ts` は表示への写像だけを持つ)。
+- Snapshot は `SnapshotProcessingBadge`(解析完了か)と
+  `SnapshotFreshnessBadge`(HEAD一致か)の2つを並べる。推奨は常に1件で、
+  それ以外は「再現用途」として段階的に開示する。
+- 候補生成前に `ReplayReadinessPanel` を出す。Trace 合計だけでなく
+  `capture未設定` / `capture失敗` / `完全復元` / `一部マスク` の内訳と、
+  実際に評価へ使える件数を示す。0件なら開始ボタンを止める。
+- 改善ループの現在地は `components/improvement-loop/model.ts` だけが決める。
+  純関数で、route ではなく永続事実(version の replay/promotion 状態)から
+  決まる — Candidate Studio 1画面が3段階を兼ねているため。rail は遷移する
+  だけで実行しない。各段階は「その操作が何を作るか」を利用者の言葉で示す。
+- Trace 詳細は既定で折りたたむ (`TracePayloadPanel`)。展開前に型・件数・
+  サイズ・redaction 状態を示す。redaction の3状態(未確認 / 秘匿値なし /
+  redact済み)を2つに畳まないこと。

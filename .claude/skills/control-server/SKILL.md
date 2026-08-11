@@ -48,6 +48,29 @@ Rules to preserve when touching trace persistence:
   startup migration: it destroys data on purpose and the exposed credential
   still has to be rotated by a human. See `docs/secret-redaction.md`.
 
+## Two-axis state endpoints (Issue #366)
+
+Four surfaces in this epic had one displayed word carrying two independent
+facts. Each is now two finite axes decided server-side. When touching any of
+them, keep the axes separate and keep the decision on the server — the
+Dashboard renders, it does not re-derive:
+
+- `GET /connectivity/status` — `state` (cumulative milestone, never regresses)
+  and `freshness` (live, regresses). Thresholds come from
+  `connectivity_freshness_policy` and are returned with every reading;
+  `state_facts.classify_connectivity_freshness` is a pure function of
+  `(last_trace_at, now, thresholds)` so boundaries are testable at an exact
+  instant. Windowed counts exclude smoke traces.
+- `GET /tokens/me`, `GET /tokens` — `app/token_status.py` is the ONLY
+  definition of a token's status. Do not add a second one client-side.
+- `GET /snapshot-preflight` — processing state vs freshness, one recommended
+  snapshot, `unknown` never blocks. `gather_preflight` runs `git`
+  subprocesses: never call it inside a `get_conn()` block.
+- `GET /replay-readiness` — replayability counts before generation.
+  `POST /candidate-sessions` enforces it (422 `no_replayable_traces`) so no
+  reasoning-model call is spent on an unevaluable candidate. Keep
+  `not_captured` distinct from `unreplayable`.
+
 ## Evaluation context APIs (issue #9)
 
 - `GET /system-profile`, `PUT /system-profile` (singleton, id `default`)

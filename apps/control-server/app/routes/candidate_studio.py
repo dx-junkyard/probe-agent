@@ -64,6 +64,7 @@ from .replay import (
     create_replay_variant_run,
     get_replay_variant_experiment_payload,
 )
+from .replay_readiness import gather_readiness
 
 router = APIRouter()
 
@@ -296,6 +297,35 @@ def create_candidate_session(
                         "provide a Replay Set or capture a trace first"
                     ),
                 )
+
+    # Issue #372: refuse a session whose evaluation set cannot be replayed at
+    # all, BEFORE any reasoning-model call. The audited component had 11
+    # traces and zero usable captures, so the failure only surfaced after the
+    # cost had been paid. Evaluated outside the connection above -- it opens
+    # its own, and the lock is non-reentrant.
+    readiness = gather_readiness(
+        system_id, payload.component_id, trace_ids if trace_ids else None
+    )
+    if readiness.selected.usable == 0:
+        blocking = [c for c in readiness.checks if c.status == "blocking"]
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "no_replayable_traces",
+                "message": (
+                    blocking[0].detail if blocking
+                    else "Replayに使えるTraceがありません"
+                ),
+                "remediation": blocking[0].remediation if blocking else "",
+                "counts": {
+                    "total": readiness.counts.total,
+                    "replayable": readiness.counts.replayable,
+                    "partial": readiness.counts.partial,
+                    "unreplayable": readiness.counts.unreplayable,
+                    "not_captured": readiness.counts.not_captured,
+                },
+            },
+        )
 
     # Phase 2: create the Replay Set from trace ids (its own connection),
     # reusing POST /replay-sets validation (existence, dedupe, size cap).

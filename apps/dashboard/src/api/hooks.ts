@@ -9,7 +9,8 @@ import type {
   SystemStateAssessment,
   FlowOverlayOut, FlowOverlayRequest,
   ShadowResult, ComponentProfile, UserOut, TokenOut,
-  RepositoryCandidateOut, RepositoryConfigOut, SnapshotOut, LatestDraftsOut,
+  RepositoryCandidateOut, RepositoryConfigOut, SnapshotOut, SnapshotPreflightOut,
+  ReplayReadinessOut, TraceSummaryOut, LatestDraftsOut,
   DraftGenerationResultOut,
   SymbolIndexOut, FeatureCodeLinksOut, ProbePlansListOut, ApiScanResultOut,
   FlowEntrypointsOut, FlowGraphOut, FlowProbeSelection, ProbePlanOut,
@@ -404,6 +405,47 @@ export function useSnapshots() {
     queryKey: sysKey("snapshots"),
     queryFn: () => api.get<SnapshotOut[]>("/repository/snapshots"),
     enabled: !!getSystemId(),
+  });
+}
+
+// Shared Snapshot preflight (Issue #369). One server evaluation, rendered by
+// candidate generation / Replay / Experiment alike, so the three surfaces
+// cannot disagree about whether a snapshot may be used. `snapshotId` omitted
+// evaluates the recommended (latest ready) snapshot -- the same one a run
+// resolves by default.
+export function useSnapshotPreflight(snapshotId?: number | null) {
+  const query = snapshotId != null ? `?snapshot_id=${snapshotId}` : "";
+  return useQuery({
+    queryKey: sysKey("snapshotPreflight", snapshotId ?? "recommended"),
+    queryFn: () => api.get<SnapshotPreflightOut>(`/snapshot-preflight${query}`),
+    enabled: !!getSystemId(),
+  });
+}
+
+// Component monitoring summary (Issue #373).
+export function useTraceSummary(componentId: string | null, refetchInterval?: number) {
+  return useQuery({
+    queryKey: sysKey("traceSummary", componentId ?? ""),
+    queryFn: () =>
+      api.get<TraceSummaryOut>(`/components/${encodeURIComponent(componentId!)}/trace-summary`),
+    enabled: !!getSystemId() && !!componentId,
+    refetchInterval,
+  });
+}
+
+// Replay readiness preflight (Issue #372). Evaluated before a candidate is
+// generated so an all-`not captured` component cannot burn an LLM call.
+export function useReplayReadiness(
+  componentId: string | null,
+  traceIds?: string[],
+) {
+  const params = new URLSearchParams();
+  if (componentId) params.set("component_id", componentId);
+  (traceIds ?? []).forEach(id => params.append("trace_ids", id));
+  return useQuery({
+    queryKey: sysKey("replayReadiness", componentId ?? "", (traceIds ?? []).join(",")),
+    queryFn: () => api.get<ReplayReadinessOut>(`/replay-readiness?${params.toString()}`),
+    enabled: !!getSystemId() && !!componentId,
   });
 }
 

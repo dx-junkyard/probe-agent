@@ -4,8 +4,13 @@ import {
   useRepositoryCandidates, useRepositoryConfig, useUpdateRepositoryConfig,
   useSnapshots, useLatestSnapshot, useCreateSnapshot, useSymbols, useIndexSymbols,
   useApiScanResult, useRunApiScan, useRepositoryStatus, useSystemState,
-  useLatestRepositoryResync, useStartRepositoryResync, sysKey,
+  useLatestRepositoryResync, useStartRepositoryResync, useSnapshotPreflight, sysKey,
 } from "@/api/hooks";
+import {
+  SnapshotFreshnessBadge,
+  SnapshotPreflightPanel,
+  SnapshotProcessingBadge,
+} from "@/components/snapshot-preflight";
 import { useAuth } from "@/api/auth";
 import {
   useDiagnosticFocus, useDiagnosticHighlight, DiagnosticFixCallout,
@@ -56,6 +61,11 @@ export default function RepositoryPage() {
   // gates on the repository being definitively unconfigured (two-stage rule:
   // stays unblocked while status is loading/unknown).
   const configGate = useRepositoryConfiguredGate();
+  // Issue #369: the recommended snapshot and its freshness come from the same
+  // shared preflight the Experiment / Candidate / Replay surfaces read, so
+  // this page cannot label a snapshot differently from the place it is used.
+  const { data: preflight } = useSnapshotPreflight();
+  const recommendedSnapshotId = preflight?.recommended_snapshot_id ?? null;
 
   const configKey = systemId != null ? `${systemId}-${config?.repo_path ?? ""}` : "empty";
 
@@ -180,6 +190,11 @@ export default function RepositoryPage() {
               </Button>
             </CardHeader>
             <CardContent>
+              {/* Issue #369: one shared statement of where the recommended
+                  snapshot stands, in the same words every other surface uses. */}
+              <div className="mb-3">
+                <SnapshotPreflightPanel preflight={preflight} />
+              </div>
               {configGate.blocked && (
                 <p className="text-xs text-muted-foreground mb-3" data-testid="create-snapshot-not-configured-reason">
                   {configGate.summary} {configGate.remediation}{" "}
@@ -198,12 +213,25 @@ export default function RepositoryPage() {
                     <div key={s.id} className="rounded-lg border p-4 space-y-2">
                       <div className="flex items-start justify-between">
                         <div className="space-y-1">
-                          <div className="flex items-center gap-2">
+                          {/* Issue #369: two axes, two badges. `status` says
+                              whether the analysis finished; freshness says
+                              whether the pinned commit still equals HEAD. A
+                              ready snapshot can be stale, so one badge cannot
+                              carry both — that conflation was the bug. */}
+                          <div className="flex flex-wrap items-center gap-2">
                             <GitCommit className="h-4 w-4 text-muted-foreground" />
                             <span className="font-mono text-xs">{s.commit_sha?.slice(0, 8)}</span>
-                            <Badge variant={s.status === "ready" ? "success" : s.status === "failed" ? "destructive" : "secondary"}>
-                              {s.status}
-                            </Badge>
+                            <SnapshotProcessingBadge state={s.status} />
+                            {s.id === recommendedSnapshotId ? (
+                              <>
+                                <SnapshotFreshnessBadge
+                                  freshness={preflight?.freshness ?? "unknown"}
+                                />
+                                <Badge variant="default" data-testid="snapshot-recommended">推奨</Badge>
+                              </>
+                            ) : (
+                              <span className="text-xs text-muted-foreground">再現用途</span>
+                            )}
                           </div>
                           <div className="flex items-center gap-4 text-xs text-muted-foreground">
                             <span><FolderTree className="inline h-3 w-3 mr-1" />{s.file_count} files</span>
