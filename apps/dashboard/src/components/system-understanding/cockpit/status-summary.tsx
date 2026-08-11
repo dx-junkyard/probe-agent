@@ -99,15 +99,20 @@ export function CockpitStatusSummary({
           )}
         </div>
 
-        {/* 補助。完成度と件数は既定で畳む -- 常時見えている必要は無く、
-            開いていると主作業面を画面外へ押し下げる。中身は DOM に残るので、
-            読み上げと既存の参照はそのまま効く。 */}
+        {/* 補助。詳細なタイルと進捗バーは既定で畳み、主作業面を画面外へ
+            押し下げない。一方、#356 がファーストビューに求める完成度・
+            要確認数・未設定数は summary に残す。閉じた details の本文は
+            視覚上もアクセシビリティツリー上も初期表示ではないため、DOM に
+            存在するだけでは #356 の要件を満たさない。 */}
         <details className="border-t pt-2" data-testid="cockpit-status-stats">
           <summary className="cursor-pointer text-[11px] text-muted-foreground">
             <span data-testid="cockpit-completion-headline">
               {percent == null
                 ? "理解の完成度はまだ確定できません"
                 : `理解の全体像は ${percent}% まで固まっています`}
+            </span>
+            <span className="ml-2" data-testid="cockpit-status-compact-counts">
+              要確認 {reviewValue} · 未設定 {model.missingCount}件
             </span>
             <span className="ml-1 underline underline-offset-2">内訳を見る</span>
           </summary>

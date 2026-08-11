@@ -594,6 +594,8 @@ describe("CockpitStatusSummary", () => {
     expect(screen.getByTestId("cockpit-stat-review")).toHaveTextContent("1");
     expect(screen.getByTestId("cockpit-stat-missing")).toHaveTextContent("1");
     expect(screen.getByTestId("cockpit-stat-questions")).toHaveTextContent("2");
+    expect(screen.getByTestId("cockpit-status-compact-counts"))
+      .toHaveTextContent("要確認 1 · 未設定 1件");
     expect(screen.getByTestId("cockpit-next-step")).toHaveTextContent("Vision");
     expect(screen.getByTestId("cockpit-progress-bar")).toHaveAttribute("aria-valuenow", "70");
   });
@@ -630,6 +632,8 @@ describe("CockpitStatusSummary", () => {
     expect(review.textContent).not.toMatch(/^0要確認$/);
     // 未設定は内容の有無だけで決まるので、確定値のまま。
     expect(screen.getByTestId("cockpit-stat-missing")).toHaveTextContent("0");
+    expect(screen.getByTestId("cockpit-status-compact-counts"))
+      .toHaveTextContent("要確認 0件以上 · 未設定 0件");
   });
 
   // Issue #360: 主 CTA の文言はページが決める (`state_primary` のときだけ

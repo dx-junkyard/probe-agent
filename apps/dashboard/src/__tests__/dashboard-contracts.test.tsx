@@ -3930,6 +3930,10 @@ describe("Interview page", () => {
     expect(stats.open).toBe(false);
     expect(stats.contains(screen.getByTestId("cockpit-completion-percent"))).toBe(true);
     expect(stats.contains(screen.getByTestId("cockpit-next-step-action"))).toBe(false);
+    // #356 の受け入れ条件。詳細タイルを畳んでも、判断に必要な件数は
+    // 常に見える summary に残す。
+    expect(screen.getByTestId("cockpit-status-compact-counts"))
+      .toHaveTextContent("要確認 1 · 未設定 1件");
 
     // セッション表示中は画面の説明文を出さない (縦を主作業面へ譲る)。
     expect(screen.queryByText(/理解の全体像を確認し、曖昧な箇所を順番に解消します/))
