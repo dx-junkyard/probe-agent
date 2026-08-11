@@ -24,12 +24,8 @@ from ..models import (
     ExperimentOut,
     ExperimentVariantResultOut,
 )
-from ..snapshot_preflight import (
-    StaleSnapshotNotAcknowledged,
-    gather_preflight,
-    resolve_stale_decision,
-)
 from ..validation_runner import load_validation_config_text
+from .snapshot_preflight import require_snapshot_preflight
 
 router = APIRouter()
 PROMPT_VERSION = "experiment-interpretation-v1"
@@ -173,20 +169,9 @@ def create_experiment(
     # reason. Evaluated BEFORE the write connection is opened: `gather_preflight`
     # runs `git` subprocesses, and the SQLite lock is process-wide and
     # non-reentrant (see .claude/skills/control-server/SKILL.md).
-    preflight = gather_preflight(system_id, payload.snapshot_id)
-    try:
-        freshness, head_sha, stale_reason = resolve_stale_decision(
-            preflight, payload.stale_snapshot_reason
-        )
-    except StaleSnapshotNotAcknowledged as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "stale_snapshot_not_acknowledged",
-                "message": str(exc),
-                "recommended_snapshot_id": preflight.recommended_snapshot_id,
-            },
-        ) from exc
+    freshness, head_sha, stale_reason = require_snapshot_preflight(
+        system_id, payload.snapshot_id, payload.stale_snapshot_reason
+    )
 
     with get_conn() as conn:
         snapshot = conn.execute(

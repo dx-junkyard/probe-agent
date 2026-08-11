@@ -1,12 +1,14 @@
 import { useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { ReplayReadinessPanel } from "@/components/replay-readiness";
+import { SnapshotPreflightPanel } from "@/components/snapshot-preflight";
 import { ImprovementLoopRail } from "@/components/improvement-loop/rail";
 import { toast } from "sonner";
 import {
   useComponents,
   useTraces,
   useReplayReadiness,
+  useSnapshotPreflight,
   useReplaySets,
   useReplayApproval,
   useReplayVariantRun,
@@ -116,16 +118,38 @@ function StartView({
   const createSession = useCreateCandidateSession();
 
   // Issue #372: evaluate Replay readiness for exactly the set this session
-  // would use, before the reasoning-model call. A Replay Set is resolved
-  // server-side, so its own trace ids are what get checked there; here we
-  // scope to the explicitly chosen trace when there is one.
+  // would use, before the reasoning-model call.
+  //
+  // A Replay Set is judged on its OWN traces, not on the recent-N window: a
+  // Set of entirely uncaptured traces used to slip past the gate because the
+  // window happened to contain usable ones (and a usable Set could be blocked
+  // by an unusable window). The server enforces the same rule.
+  const selectedReplaySet = (replaySets ?? []).find(s => String(s.id) === replaySetId);
+  const evaluationTraceIds = replaySetId
+    ? selectedReplaySet?.trace_ids
+    : traceId
+      ? [traceId]
+      : undefined;
   const { data: readiness, isLoading: readinessLoading } = useReplayReadiness(
     componentId || null,
-    traceId && !replaySetId ? [traceId] : undefined,
+    evaluationTraceIds,
   );
-  const readinessBlocked = readiness?.verdict === "blocked" && !replaySetId;
+  // A selected Replay Set whose contents have not loaded yet cannot be judged;
+  // blocking on an unresolved set would be a guess, so the server stays the
+  // authority and rejects it on submit.
+  // Issue #369 (review finding 4): the same shared Snapshot preflight the
+  // Experiments surface renders, so the two cannot disagree about whether
+  // the snapshot may be used.
+  const { data: snapshotPreflight } = useSnapshotPreflight();
+  const [staleReason, setStaleReason] = useState("");
+  const staleAckMissing =
+    !!snapshotPreflight?.requires_stale_acknowledgement && !staleReason.trim();
+  const readinessJudgeable = !replaySetId || !!selectedReplaySet;
+  const readinessBlocked = readiness?.verdict === "blocked" && readinessJudgeable;
 
-  const canStart = !!componentId && !createSession.isPending && !readinessBlocked;
+  const canStart =
+    !!componentId && !createSession.isPending && !readinessBlocked
+    && !staleAckMissing && snapshotPreflight?.verdict !== "blocked";
 
   const handleStart = async () => {
     const payload: CandidateSessionCreateRequest = {
@@ -136,6 +160,9 @@ function StartView({
       payload.replay_set_id = Number(replaySetId);
     } else if (traceId) {
       payload.trace_id = traceId;
+    }
+    if (snapshotPreflight?.requires_stale_acknowledgement) {
+      payload.stale_snapshot_reason = staleReason.trim();
     }
     try {
       const session = await createSession.mutateAsync(payload);
@@ -148,7 +175,11 @@ function StartView({
   return (
     <div className="max-w-2xl space-y-6">
       {/* Issue #371: the same rail Components / Workbench / Experiments show. */}
-      <ImprovementLoopRail componentId={componentId || null} traceId={traceId || null} />
+      <ImprovementLoopRail
+        componentId={componentId || null}
+        traceId={traceId || null}
+        replaySetId={replaySetId || null}
+      />
       <div>
         <h1 className="text-2xl font-bold tracking-tight">AI Candidate Studio</h1>
         <p className="mt-1 text-sm text-muted-foreground">
@@ -205,6 +236,12 @@ function StartView({
               recovery step — all before anything is generated. This replaces
               the old bare 「直近最大50件が自動的に使われます」 note, which said
               how many traces would be read but not how many could be used. */}
+          <SnapshotPreflightPanel
+            preflight={snapshotPreflight}
+            staleReason={staleReason}
+            onStaleReasonChange={setStaleReason}
+          />
+
           {componentId && (
             <ReplayReadinessPanel readiness={readiness} isLoading={readinessLoading} />
           )}

@@ -60,7 +60,20 @@ def get_connectivity_status(
         real_trace_count=facts.real_trace_count,
         smoke_trace_count=facts.smoke_trace_count,
     )
+    # Freshness measures the instrumented WORKLOAD, so it is classified from
+    # the newest non-smoke trace. A manual smoke check proves the transport
+    # works and nothing more: classifying from `last_trace_at` let one fresh
+    # smoke ping paint a system green while its real workload had been silent
+    # for days, and hid the header warning with it.
     freshness = state_facts.classify_connectivity_freshness(
+        last_trace_at=facts.last_real_trace_at,
+        now=now,
+        delayed_after_seconds=delayed_after,
+        stale_after_seconds=stale_after,
+    )
+    # The transport axis, reported separately so "the smoke check still gets
+    # through" stays visible instead of being conflated with workload health.
+    transport_freshness = state_facts.classify_connectivity_freshness(
         last_trace_at=facts.last_trace_at,
         now=now,
         delayed_after_seconds=delayed_after,
@@ -78,7 +91,15 @@ def get_connectivity_status(
         last_trace_component_id=facts.last_trace_component_id,
         materialized_session_ids=facts.materialized_session_ids,
         freshness=freshness,
+        transport_freshness=transport_freshness,
+        last_real_trace_at=facts.last_real_trace_at,
+        # Reported against the workload clock, so the relative time next to
+        # the freshness label describes the same event the label judged.
         seconds_since_last_trace=(
+            None if facts.last_real_trace_at is None
+            else now - facts.last_real_trace_at
+        ),
+        seconds_since_last_any_trace=(
             None if facts.last_trace_at is None else now - facts.last_trace_at
         ),
         evaluated_at=now,

@@ -5,6 +5,7 @@ import {
   loopSearchParams,
   resolveStage,
   type LoopContext,
+  type LoopNavigationContext,
 } from "./model";
 
 // Issue #371: the same progress rail on every surface of the improvement
@@ -15,21 +16,11 @@ import {
 // primary action, and the human gates (Replay approval, adoption) are
 // unchanged — nothing here can approve, adopt, merge, or deploy.
 
-interface ImprovementLoopRailProps extends LoopContext {
-  /** Carried into every stage link so the context survives navigation. */
-  traceId?: string | null;
-  snapshotId?: number | null;
-}
+interface ImprovementLoopRailProps extends LoopContext, LoopNavigationContext {}
 
 export function ImprovementLoopRail(props: ImprovementLoopRailProps) {
   const current = resolveStage(props);
   const stages = buildStages(current);
-  const search = loopSearchParams({
-    componentId: props.componentId,
-    traceId: props.traceId,
-    sessionId: props.sessionId,
-    snapshotId: props.snapshotId,
-  });
   const currentStage = stages.find(s => s.status === "current");
 
   return (
@@ -46,7 +37,7 @@ export function ImprovementLoopRail(props: ImprovementLoopRailProps) {
               <span className="text-muted-foreground" aria-hidden="true">›</span>
             )}
             <Link
-              to={`${stage.to}${search}`}
+              to={`${stage.to}${loopSearchParams(stage.to, props)}`}
               data-testid={`loop-stage-${stage.id}`}
               data-status={stage.status}
               aria-current={stage.status === "current" ? "step" : undefined}

@@ -15,7 +15,11 @@ from ..resource_limits import (
     enforce_trace_rate_limit,
     trace_storage_limits,
 )
-from ..trace_redaction import redact_trace_payload
+from ..trace_redaction import (
+    redact_projection,
+    redact_shadow_outputs,
+    redact_trace_payload,
+)
 
 router = APIRouter()
 
@@ -227,16 +231,21 @@ def _write_projections(conn, system_id: int, event: TraceEvent) -> None:
         (system_id, event.trace_id),
     )
     for proj in event.projections or []:
-        data_json = json.dumps(
-            {"fields": proj.fields, "metrics": proj.metrics, "samples": proj.samples},
-            ensure_ascii=False,
+        # Issue #367: a projection is a bounded slice of a payload, and a
+        # bounded slice of a credential is still a credential. The spec's own
+        # `redact` paths are the author's intent; this is the mandatory floor
+        # underneath them.
+        redaction = redact_projection(
+            fields=proj.fields, metrics=proj.metrics, samples=proj.samples
         )
+        data_json = json.dumps(redaction.values, ensure_ascii=False)
         conn.execute(
             """
             INSERT OR REPLACE INTO trace_projections
                 (system_id, trace_id, component_id, projection_name, phase,
-                 data_json, data_hash, truncated, extract_error, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 data_json, data_hash, truncated, extract_error, created_at,
+                 redaction_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 system_id,
@@ -249,6 +258,7 @@ def _write_projections(conn, system_id: int, event: TraceEvent) -> None:
                 1 if proj.truncated else 0,
                 proj.error,
                 event.timestamp,
+                json.dumps(redaction.summary(), ensure_ascii=False),
             ),
         )
 
@@ -385,38 +395,71 @@ def trace_redaction_audit(system_id: int = Depends(get_system_id)) -> dict:
     credentials to rotate -- before changing any data. The endpoint never
     returns a matched value, only the rule that matched and where.
     """
+    tables: dict = {}
+    findings: List[dict] = []
+
     with get_conn() as conn:
-        rows = conn.execute(
+        trace_rows = conn.execute(
             """SELECT trace_id, component_id, timestamp, input_json, output_text,
                       error, input_capture_json, redaction_json
                FROM traces WHERE system_id = ?
                ORDER BY timestamp DESC""",
             (system_id,),
         ).fetchall()
+        projection_rows = conn.execute(
+            """SELECT rowid AS row_id, trace_id, component_id, projection_name,
+                      phase, created_at, data_json, redaction_json
+               FROM trace_projections WHERE system_id = ?
+               ORDER BY created_at DESC""",
+            (system_id,),
+        ).fetchall()
+        shadow_rows = conn.execute(
+            """SELECT id, trace_id, component_id, timestamp, current_output,
+                      candidate_output, candidate_error, redaction_json
+               FROM shadow_results WHERE system_id = ?
+               ORDER BY timestamp DESC""",
+            (system_id,),
+        ).fetchall()
 
-    findings = []
-    unscanned = 0
-    for row in rows:
-        if row["redaction_json"] is not None:
-            # Already carries a server-side audit summary: it was scanned.
-            continue
-        unscanned += 1
-        result = _rescan_row(row)
-        if result.redacted:
-            findings.append(
-                {
-                    "trace_id": row["trace_id"],
-                    "component_id": row["component_id"],
-                    "timestamp": row["timestamp"],
-                    "rules": result.rules,
-                    "fields": sorted({entry.field for entry in result.fields}),
-                }
-            )
+    def _record(table: str, rows, scan) -> None:
+        unscanned = 0
+        affected = 0
+        for row in rows:
+            if row["redaction_json"] is not None:
+                # Already carries a server-side audit summary: it was scanned.
+                continue
+            unscanned += 1
+            result = scan(row)
+            if result.redacted:
+                affected += 1
+                findings.append(
+                    {
+                        "table": table,
+                        "trace_id": row["trace_id"],
+                        "component_id": row["component_id"],
+                        "rules": result.rules,
+                        "fields": sorted({entry.field for entry in result.fields}),
+                    }
+                )
+        tables[table] = {
+            "total_rows": len(rows),
+            "unscanned_rows": unscanned,
+            "affected_rows": affected,
+        }
+
+    _record("traces", trace_rows, _rescan_row)
+    _record("trace_projections", projection_rows, _rescan_projection_row)
+    _record("shadow_results", shadow_rows, _rescan_shadow_row)
+
     return {
         "system_id": system_id,
-        "total_rows": len(rows),
-        "unscanned_rows": unscanned,
-        "affected_rows": len(findings),
+        # Aggregate across every table that stores a payload: reporting only
+        # `traces` would let an operator read `unscanned_rows: 0` while
+        # plaintext still sat in projections or shadow results.
+        "total_rows": sum(t["total_rows"] for t in tables.values()),
+        "unscanned_rows": sum(t["unscanned_rows"] for t in tables.values()),
+        "affected_rows": sum(t["affected_rows"] for t in tables.values()),
+        "tables": tables,
         "rules": sorted({rule for f in findings for rule in f["rules"]}),
         "findings": findings,
     }
@@ -492,21 +535,98 @@ def trace_redaction_rescan(
                     ),
                 )
                 rewritten += 1
+            trace_counts = {"scanned_rows": scanned, "rewritten_rows": rewritten}
+
+            # Projections and shadow results reach storage through their own
+            # routes, so a rescan that stopped at `traces` would leave
+            # plaintext behind while reporting the migration complete.
+            projection_counts = _rescan_projection_rows(conn, system_id, rules)
+            shadow_counts = _rescan_shadow_rows(conn, system_id, rules)
             conn.execute("COMMIT")
         except Exception:
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
             raise
+
+    tables = {
+        "traces": trace_counts,
+        "trace_projections": projection_counts,
+        "shadow_results": shadow_counts,
+    }
+    total_rewritten = sum(t["rewritten_rows"] for t in tables.values())
     return {
         "system_id": system_id,
-        "scanned_rows": scanned,
-        "rewritten_rows": rewritten,
+        "scanned_rows": sum(t["scanned_rows"] for t in tables.values()),
+        "rewritten_rows": total_rewritten,
+        "tables": tables,
         "rules": sorted(rules),
         "performed_by_user_id": principal.user_id,
         # The plaintext is gone from this store, but it was exposed while it
         # was here. Rotation is the operator's job and cannot be automated.
-        "rotation_required": rewritten > 0,
+        "rotation_required": total_rewritten > 0,
     }
+
+
+def _rescan_projection_rows(conn, system_id: int, rules: set) -> dict:
+    """Rewrite unscanned `trace_projections` rows in the caller's transaction."""
+    rows = conn.execute(
+        """SELECT rowid AS row_id, data_json FROM trace_projections
+           WHERE system_id = ? AND redaction_json IS NULL""",
+        (system_id,),
+    ).fetchall()
+    rewritten = 0
+    for row in rows:
+        result = _rescan_projection_row(row)
+        summary = json.dumps(result.summary(), ensure_ascii=False)
+        if result.redacted:
+            rules.update(result.rules)
+            conn.execute(
+                """UPDATE trace_projections SET data_json = ?, redaction_json = ?
+                   WHERE rowid = ?""",
+                (json.dumps(result.values, ensure_ascii=False), summary, row["row_id"]),
+            )
+            rewritten += 1
+        else:
+            conn.execute(
+                "UPDATE trace_projections SET redaction_json = ? WHERE rowid = ?",
+                (summary, row["row_id"]),
+            )
+    return {"scanned_rows": len(rows), "rewritten_rows": rewritten}
+
+
+def _rescan_shadow_rows(conn, system_id: int, rules: set) -> dict:
+    """Rewrite unscanned `shadow_results` rows in the caller's transaction."""
+    rows = conn.execute(
+        """SELECT id, current_output, candidate_output, candidate_error
+           FROM shadow_results WHERE system_id = ? AND redaction_json IS NULL""",
+        (system_id,),
+    ).fetchall()
+    rewritten = 0
+    for row in rows:
+        result = _rescan_shadow_row(row)
+        summary = json.dumps(result.summary(), ensure_ascii=False)
+        if result.redacted:
+            rules.update(result.rules)
+            conn.execute(
+                """UPDATE shadow_results
+                   SET current_output = ?, candidate_output = ?,
+                       candidate_error = ?, redaction_json = ?
+                   WHERE id = ?""",
+                (
+                    result.values["current_output"],
+                    result.values["candidate_output"],
+                    result.values["candidate_error"],
+                    summary,
+                    row["id"],
+                ),
+            )
+            rewritten += 1
+        else:
+            conn.execute(
+                "UPDATE shadow_results SET redaction_json = ? WHERE id = ?",
+                (summary, row["id"]),
+            )
+    return {"scanned_rows": len(rows), "rewritten_rows": rewritten}
 
 
 def _decode_stored_input(raw):
@@ -525,12 +645,29 @@ def _decode_stored_input(raw):
 
 
 def _rescan_row(row):
-    """Re-run redaction over one stored row's decoded payload."""
+    """Re-run redaction over one stored trace row's decoded payload."""
     return redact_trace_payload(
         input_value=_decode_stored_input(row["input_json"]),
         output=row["output_text"],
         error=row["error"],
         input_capture=_load_json_or_none(row["input_capture_json"]),
+    )
+
+
+def _rescan_projection_row(row):
+    data = _load_json_or_none(row["data_json"]) or {}
+    return redact_projection(
+        fields=data.get("fields"),
+        metrics=data.get("metrics"),
+        samples=data.get("samples"),
+    )
+
+
+def _rescan_shadow_row(row):
+    return redact_shadow_outputs(
+        current_output=row["current_output"],
+        candidate_output=row["candidate_output"],
+        candidate_error=row["candidate_error"],
     )
 
 

@@ -14,6 +14,24 @@ export const FRESHNESS_LABELS: Record<ConnectivityFreshness, string> = {
   stale: "長時間受信なし",
 };
 
+/**
+ * The transport axis, shown only when it disagrees with the workload.
+ *
+ * A smoke check that still gets through while the workload has gone silent is
+ * a genuinely useful fact — it narrows the problem to the application rather
+ * than the connection — but it must never be what the headline says.
+ */
+export function TransportNote({ data }: { data: ConnectivityStatusOut }) {
+  if (data.transport_freshness === data.freshness) return null;
+  if (data.transport_freshness !== "receiving_now") return null;
+  return (
+    <p className="text-[11px] text-muted-foreground" data-testid="transport-note">
+      疎通確認 trace は届いています（受信経路は正常）。上の状態は実 workload の
+      trace についてのものです。
+    </p>
+  );
+}
+
 export const FRESHNESS_VARIANTS: Record<
   ConnectivityFreshness,
   "success" | "warning" | "destructive" | "secondary"
@@ -71,14 +89,19 @@ export function FreshnessDetail({ data }: { data: ConnectivityStatusOut }) {
 
   return (
     <div className="space-y-2" data-testid="freshness-detail">
-      {data.last_trace_at != null && data.seconds_since_last_trace != null ? (
+      <TransportNote data={data} />
+      {data.last_real_trace_at != null && data.seconds_since_last_trace != null ? (
         <p className="text-xs text-muted-foreground">
-          最終受信:{" "}
+          実 workload の最終受信:{" "}
           <span className="text-foreground">
             {formatElapsed(data.seconds_since_last_trace)}
           </span>{" "}
-          ({formatTimestamp(data.last_trace_at)})
-          {data.last_trace_component_id && (
+          ({formatTimestamp(data.last_real_trace_at)})
+          {/* The component name is only shown when the newest trace of any
+              kind IS this workload trace; otherwise it names the smoke check,
+              which is not what this line is about. */}
+          {data.last_trace_component_id &&
+            data.last_trace_at === data.last_real_trace_at && (
             <>
               {" "}· component{" "}
               <code className="font-mono">{data.last_trace_component_id}</code>
@@ -86,7 +109,9 @@ export function FreshnessDetail({ data }: { data: ConnectivityStatusOut }) {
           )}
         </p>
       ) : (
-        <p className="text-xs text-muted-foreground">最終受信: まだありません</p>
+        <p className="text-xs text-muted-foreground">
+          実 workload の最終受信: まだありません
+        </p>
       )}
 
       {/* Windowed counts: a cumulative total can never decrease, so it can

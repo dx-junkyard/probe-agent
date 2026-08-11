@@ -375,3 +375,191 @@ def test_trace_summary_is_system_scoped(client, db_path):
     _insert_legacy_row(db_path, "other", json.dumps({"args": [], "kwargs": {}}))
     # The legacy helper writes system_id=1, the same system, so the count is 2.
     assert client.get("/components/summarizer/trace-summary").json()["total"] == 2
+
+
+# --- projections and shadow results (review P0-1 / P0-2) ---------------------
+#
+# The first pass redacted only the four `traces` columns. Projections and
+# shadow results reach storage through their own routes and carry the same
+# kind of payload, so a credential could be persisted -- and re-exposed via
+# the GET APIs -- by going around the trace body.
+
+
+def _stored_projection(db_path):
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return dict(conn.execute("SELECT * FROM trace_projections").fetchone())
+    finally:
+        conn.close()
+
+
+def _stored_shadow(db_path):
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return dict(conn.execute("SELECT * FROM shadow_results").fetchone())
+    finally:
+        conn.close()
+
+
+def test_trace_projection_is_redacted_before_storage(client, db_path):
+    client.post(
+        "/traces",
+        json=_trace(
+            projections=[{
+                "projection_name": "p1",
+                "phase": "input",
+                "fields": {"api_key": OPENAI_KEY, "region": "eu-west-1"},
+                "metrics": {},
+                "samples": {"note": f"loaded {AWS_KEY}"},
+            }],
+        ),
+    )
+    row = _stored_projection(db_path)
+    assert OPENAI_KEY not in row["data_json"]
+    assert AWS_KEY not in row["data_json"]
+    assert "eu-west-1" in row["data_json"]
+    assert AWS_KEY not in _raw_db_text(db_path)
+    assert json.loads(row["redaction_json"])["redacted"] is True
+
+
+def test_clean_projection_records_that_the_scan_ran(client, db_path):
+    client.post(
+        "/traces",
+        json=_trace(
+            projections=[{
+                "projection_name": "p1", "phase": "input",
+                "fields": {"region": "eu-west-1"}, "metrics": {}, "samples": {},
+            }],
+        ),
+    )
+    assert json.loads(_stored_projection(db_path)["redaction_json"])["redacted"] is False
+
+
+def test_shadow_result_outputs_are_redacted_before_storage(client, db_path):
+    client.post("/traces", json=_trace("t1"))
+    client.post(
+        "/components/summarizer/shadow-results",
+        json={
+            "trace_id": "t1",
+            "component_id": "summarizer",
+            "current_output": f"Config(api_key='{OPENAI_KEY}')",
+            "candidate_output": f"'{AWS_KEY}'",
+            "candidate_error": f"ValueError: password={PLAIN_PASSWORD}",
+            "candidate_duration_ms": 1.0,
+            "timestamp": time.time(),
+        },
+    )
+    row = _stored_shadow(db_path)
+    assert OPENAI_KEY not in (row["current_output"] or "")
+    assert AWS_KEY not in (row["candidate_output"] or "")
+    assert PLAIN_PASSWORD not in (row["candidate_error"] or "")
+    assert OPENAI_KEY not in _raw_db_text(db_path)
+    assert json.loads(row["redaction_json"])["redacted"] is True
+
+
+def test_shadow_projection_is_redacted_before_storage(client, db_path):
+    client.post("/traces", json=_trace("t1"))
+    client.post(
+        "/components/summarizer/shadow-results",
+        json={
+            "trace_id": "t1",
+            "component_id": "summarizer",
+            "current_output": "'ok'",
+            "candidate_output": "'ok'",
+            "candidate_error": None,
+            "candidate_duration_ms": 1.0,
+            "timestamp": time.time(),
+            "projections": [{
+                "projection_name": "p1",
+                "phase": "shadow_candidate",
+                "fields": {"token": OPENAI_KEY},
+                "metrics": {},
+                "samples": {},
+            }],
+        },
+    )
+    assert OPENAI_KEY not in _raw_db_text(db_path)
+
+
+def test_shadow_api_response_never_returns_plaintext(client):
+    client.post("/traces", json=_trace("t1"))
+    client.post(
+        "/components/summarizer/shadow-results",
+        json={
+            "trace_id": "t1", "component_id": "summarizer",
+            "current_output": f"'{AWS_KEY}'", "candidate_output": None,
+            "candidate_error": None, "candidate_duration_ms": 1.0,
+            "timestamp": time.time(),
+        },
+    )
+    body = client.get("/components/summarizer/shadow-results").json()
+    assert AWS_KEY not in json.dumps(body)
+
+
+def _insert_legacy_projection(db_path, data):
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """INSERT INTO trace_projections
+                   (system_id, trace_id, component_id, projection_name, phase,
+                    data_json, data_hash, truncated, extract_error, created_at,
+                    redaction_json)
+               VALUES (1, 'legacy', 'summarizer', 'p1', 'input', ?, NULL, 0, NULL, ?, NULL)""",
+            (json.dumps(data), time.time()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _insert_legacy_shadow(db_path, current_output):
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """INSERT INTO shadow_results
+                   (system_id, trace_id, component_id, current_output,
+                    candidate_output, candidate_error, candidate_duration_ms,
+                    evaluation, timestamp, redaction_json)
+               VALUES (1, 'legacy', 'summarizer', ?, NULL, NULL, 1.0, NULL, ?, NULL)""",
+            (current_output, time.time()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_audit_reports_unscanned_projections_and_shadow_results(client, db_path):
+    """A migration is not complete while another table still holds plaintext."""
+    client.post("/traces", json=_trace("clean"))
+    _insert_legacy_projection(db_path, {"fields": {"api_key": OPENAI_KEY}})
+    _insert_legacy_shadow(db_path, f"'{AWS_KEY}'")
+
+    audit = client.get("/traces/redaction-audit").json()
+    assert audit["unscanned_rows"] == 2
+    assert audit["affected_rows"] == 2
+    assert audit["tables"]["trace_projections"]["affected_rows"] == 1
+    assert audit["tables"]["shadow_results"]["affected_rows"] == 1
+    assert {f["table"] for f in audit["findings"]} == {
+        "trace_projections", "shadow_results",
+    }
+    # The report identifies the leak; it must not repeat it.
+    assert OPENAI_KEY not in json.dumps(audit)
+    assert AWS_KEY not in json.dumps(audit)
+
+
+def test_rescan_rewrites_projections_and_shadow_results(client, db_path):
+    _insert_legacy_projection(db_path, {"fields": {"api_key": OPENAI_KEY}})
+    _insert_legacy_shadow(db_path, f"'{AWS_KEY}'")
+
+    result = client.post("/traces/redaction-rescan").json()
+    assert result["tables"]["trace_projections"]["rewritten_rows"] == 1
+    assert result["tables"]["shadow_results"]["rewritten_rows"] == 1
+    assert result["rotation_required"] is True
+    assert OPENAI_KEY not in _raw_db_text(db_path)
+    assert AWS_KEY not in _raw_db_text(db_path)
+
+    again = client.post("/traces/redaction-rescan").json()
+    assert again["scanned_rows"] == 0
+    assert client.get("/traces/redaction-audit").json()["unscanned_rows"] == 0

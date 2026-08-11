@@ -739,6 +739,15 @@ creating incomplete persistence or execution paths for later phases.
       traces — a cumulative total can never show that traffic stopped. The
       Overview's setup checklist deliberately still reads `state`: "you
       connected the SDK" is a step that stays done.
+      **`freshness` is the WORKLOAD axis and is classified from
+      `last_real_trace_at` (the newest non-smoke trace), never from
+      `last_trace_at`.** A manual smoke check proves the transport and nothing
+      more: classifying from the newest trace of any kind let one fresh smoke
+      ping paint a system green while its workload had been silent for days,
+      and hid the header warning with it. `transport_freshness` reports the
+      any-kind axis separately, and the UI shows it only when it disagrees —
+      "the ping still gets through" narrows the problem to the application,
+      but it must never be what the headline says.
     - **Tokens** (#368): `app/token_status.py` is the only definition of
       `active`/`expiring_soon`/`expired`/`revoked`. First-match, `revoked`
       outranks `expired`, a NULL `expires_at` means no expiry (never
@@ -753,7 +762,15 @@ creating incomplete persistence or execution paths for later phases.
       acknowledgement — an unreadable HEAD is not evidence the snapshot is
       behind. Continuing on a definitively stale snapshot requires the
       developer's reason, persisted on the consuming record
-      (`experiments.stale_ack_reason`, `decision_method: manual`).
+      (`decision_method: manual`).
+      **Every surface that pins a snapshot goes through
+      `routes/snapshot_preflight.require_snapshot_preflight`** — Experiment
+      creation, Candidate Studio sessions, and Replay variant runs — and each
+      records the resulting `snapshot_freshness` / `head_sha_at_creation` /
+      `stale_ack_reason` on its own row (`experiments`,
+      `candidate_sessions`, `replay_runs`). A "shared" preflight wired into
+      only one of the three is not shared; the other two keep their old,
+      differing judgement.
       `gather_preflight` runs `git` subprocesses, so it must never be called
       with a `get_conn()` connection open.
     - **Replay readiness** (#372): `app/replay_readiness.py` +
@@ -766,6 +783,15 @@ creating incomplete persistence or execution paths for later phases.
       usable — it still produces a real diff — but the comparison limit is
       stated. Missing Replay approval is `attention`, never `blocking`: a
       session may be prepared before approval; only the run refuses.
+      **The gate judges the set the run will actually replay.** With a
+      `replay_set_id` that means the Set's own `trace_ids`, resolved fresh —
+      not the recent-N window, which let a Set of entirely uncaptured traces
+      through whenever the window happened to hold a usable one (and blocked a
+      usable Set behind an unusable window). It also runs **again immediately
+      before the reasoning-model call** (`_require_replay_readiness`), because
+      traces, classifications, approval, and the sandbox can all change after
+      the session was created — and the cost the gate protects is spent on the
+      next line.
     - **The loop** (#371): `components/improvement-loop/model.ts` is the only
       place that decides the stage, and it is pure. The stage comes from
       persisted facts (a version's replay/promotion state), never from the
@@ -773,6 +799,13 @@ creating incomplete persistence or execution paths for later phases.
       and never executes; each stage states what its primary action *produces*
       in the developer's terms, because 「送信」/「promote」/「Experimentへ送る」
       did not. The internal persistence models are deliberately NOT unified.
+      **`loopSearchParams` emits each destination's OWN parameter names**
+      (`PARAM_NAMES`): `/components` reads `component`/`trace` — as the Trace
+      Lineage and analyzer deep links have always used — while Candidate
+      Studio reads `component_id`/`trace_id`. Emitting one spelling everywhere
+      produced links that navigated and then arrived with nothing selected.
+      The rail's own position must follow the record the developer opened
+      (the expanded Experiment), never the first row of a list.
     - **Trace monitoring** (#373): `GET /components/{id}/trace-summary`
       computes over ALL of a component's traces, never the loaded page — a p95
       from the most recent 20 rows changes on every poll and describes
@@ -915,6 +948,16 @@ instead of being bolted onto an unrelated issue's scope.
      the Control Server ingestion boundary. Presentation-layer masking is not
      acceptable: it leaves plaintext on disk and in every downstream consumer
      (Replay, Candidate Studio, Workspaces, exports).
+   - The contract belongs to the **storage boundary, not to one endpoint**.
+     Every table that holds a payload is covered: `traces`,
+     `trace_projections` (both the trace route and the shadow route write it),
+     and `shadow_results`. A projection is a bounded slice of a payload, and a
+     bounded slice of a credential is still a credential — the projection
+     spec's own `redact` paths are the author's intent, not the floor. Adding
+     a new payload column means adding it to the write path, to
+     `GET /traces/redaction-audit`, and to `POST /traces/redaction-rescan`;
+     an audit that covers fewer tables than the writers lets an operator read
+     `unscanned_rows: 0` while plaintext is still stored elsewhere.
    - `PROBE_PAYLOAD_MODE=full` is a verbosity choice, never consent to ship
      credentials; both layers still apply. Dashboard view permission is not a
      reason to display a secret.

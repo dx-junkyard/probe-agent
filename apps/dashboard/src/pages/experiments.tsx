@@ -192,7 +192,13 @@ export default function ExperimentsPage() {
     <div className="space-y-6">
       <ContextHeader />
       {/* Issue #371: same rail as Components / Candidate Studio / Workbench. */}
-      <ImprovementLoopRail experiment={experiments?.[0] ?? null} />
+      <ImprovementLoopRail
+        experiment={(experiments ?? []).find(e => e.id === expandedId) ?? null}
+        componentId={fromComponentParam}
+        traceId={fromTraceParam}
+        replayRunId={replayRunId}
+        replayVariantId={replayVariantId}
+      />
       {capabilityContext && (
         <Link
           to={`/capability-map?capability=${encodeURIComponent(capabilityContext)}`}

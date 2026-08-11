@@ -18,7 +18,10 @@ function connectivity(overrides: Partial<ConnectivityStatusOut> = {}): Connectiv
     smoke_component_id: "probe-smoke-check",
     materialized_session_ids: [],
     freshness: "never_received",
+    transport_freshness: "never_received",
+    last_real_trace_at: null,
     seconds_since_last_trace: null,
+    seconds_since_last_any_trace: null,
     evaluated_at: 0,
     clock_skew_seconds: 0,
     real_trace_count_5m: 0,
@@ -74,8 +77,14 @@ describe("resolveSetupStep", () => {
   });
 
   it("smoke だけ届いていれば実 workload の実行が次の1操作", () => {
+    // #370 レビュー指摘 P1-5 後の実際の組合せ: smoke が届いていても workload の
+    // freshness は never_received のまま。
     const step = resolveSetupStep(
-      connectivity({ state: "smoke_only", freshness: "receiving_now" }),
+      connectivity({
+        state: "smoke_only",
+        freshness: "never_received",
+        transport_freshness: "receiving_now",
+      }),
       [apiToken()],
       1,
     );

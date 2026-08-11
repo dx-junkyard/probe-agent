@@ -938,3 +938,152 @@ def test_explicit_trace_ids_are_gated_on_their_own_replayability(
         headers=headers,
     )
     assert accepted.status_code == 201, accepted.text
+
+
+def test_replay_set_readiness_is_judged_on_the_sets_own_traces(
+    admin_client, replay_repo
+):
+    """Review finding P0-3: the gate judged the recent-N window, not the Set.
+
+    A Replay Set of entirely uncaptured traces slipped through whenever the
+    window happened to contain a usable one.
+    """
+    _token, _system, headers, _snapshot = _prepare(admin_client, replay_repo)
+    # A usable trace exists for the component -- it would be in the window.
+    _post_trace(admin_client, headers, "usable", "norm", args=("abc",))
+    _post_uncaptured_trace(admin_client, headers, "empty1", "norm")
+    _post_uncaptured_trace(admin_client, headers, "empty2", "norm")
+
+    unusable_set = admin_client.post(
+        "/replay-sets",
+        json={"component_id": "norm", "name": "unusable",
+              "trace_ids": ["empty1", "empty2"]},
+        headers=headers,
+    ).json()
+
+    refused = admin_client.post(
+        "/candidate-sessions",
+        json={"component_id": "norm", "objective": "x",
+              "replay_set_id": unusable_set["id"]},
+        headers=headers,
+    )
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["detail"]["code"] == "no_replayable_traces"
+
+    usable_set = admin_client.post(
+        "/replay-sets",
+        json={"component_id": "norm", "name": "usable", "trace_ids": ["usable"]},
+        headers=headers,
+    ).json()
+    accepted = admin_client.post(
+        "/candidate-sessions",
+        json={"component_id": "norm", "objective": "x",
+              "replay_set_id": usable_set["id"]},
+        headers=headers,
+    )
+    assert accepted.status_code == 201, accepted.text
+
+
+def test_generation_re_evaluates_readiness_after_the_session_exists(
+    admin_client, replay_repo, db_file
+):
+    """Review finding P1-7: readiness can change between creation and generation."""
+    _token, _system, headers, _snapshot = _prepare(admin_client, replay_repo)
+    _post_trace(admin_client, headers, "usable", "norm", args=("abc",))
+    session = admin_client.post(
+        "/candidate-sessions",
+        json={"component_id": "norm", "objective": "x"},
+        headers=headers,
+    ).json()
+
+    # The capture is reclassified after the session was created -- exactly the
+    # window the creation-time-only gate left open.
+    conn = sqlite3.connect(db_file)
+    try:
+        conn.execute(
+            "UPDATE traces SET replayability = 'unreplayable' WHERE trace_id = 'usable'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    response = admin_client.post(
+        f"/candidate-sessions/{session['id']}/generate",
+        json={"instruction": "make it faster"},
+        headers=headers,
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["code"] == "no_replayable_traces"
+
+
+def test_session_creation_uses_the_same_stale_snapshot_gate_as_experiments(
+    admin_client, replay_repo, db_file
+):
+    """Review finding P1-4: the shared preflight now gates Candidate Studio too."""
+    _token, _system, headers, _snapshot = _prepare(admin_client, replay_repo)
+    _post_trace(admin_client, headers, "usable", "norm", args=("abc",))
+    # Move HEAD past the snapshot's pinned commit.
+    (replay_repo / "svc.py").write_text(SVC_SOURCE + "\n# moved\n")
+    _git(replay_repo, "add", ".")
+    _git(replay_repo, "commit", "-m", "move head")
+
+    blocked = admin_client.post(
+        "/candidate-sessions",
+        json={"component_id": "norm", "objective": "x"},
+        headers=headers,
+    )
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["detail"]["code"] == "stale_snapshot_not_acknowledged"
+
+    allowed = admin_client.post(
+        "/candidate-sessions",
+        json={"component_id": "norm", "objective": "x",
+              "stale_snapshot_reason": "当時のコードで再現するため"},
+        headers=headers,
+    )
+    assert allowed.status_code == 201, allowed.text
+
+    conn = sqlite3.connect(db_file)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT snapshot_freshness, stale_ack_reason FROM candidate_sessions"
+            " WHERE id = ?",
+            (allowed.json()["id"],),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["snapshot_freshness"] == "stale"
+    assert row["stale_ack_reason"] == "当時のコードで再現するため"
+
+
+_PATCH_NOOP = (
+    "--- a/svc.py\n+++ b/svc.py\n@@ -1,1 +1,1 @@\n-x\n+x\n"
+)
+
+
+def test_variant_run_uses_the_same_stale_snapshot_gate(
+    admin_client, replay_repo, db_file
+):
+    """A Replay run pins a snapshot too, so it gets the same gate."""
+    _token, _system, headers, _snapshot = _prepare(admin_client, replay_repo)
+    _post_trace(admin_client, headers, "usable", "norm", args=("abc",))
+    _approve(admin_client, headers, "norm")
+    replay_set = admin_client.post(
+        "/replay-sets",
+        json={"component_id": "norm", "name": "s", "trace_ids": ["usable"]},
+        headers=headers,
+    ).json()
+
+    (replay_repo / "svc.py").write_text(SVC_SOURCE + "\n# moved\n")
+    _git(replay_repo, "add", ".")
+    _git(replay_repo, "commit", "-m", "move head")
+
+    blocked = admin_client.post(
+        "/replay-variant-runs",
+        json={"replay_set_id": replay_set["id"],
+              "variants": [{"label": "v1", "patch_text": _PATCH_NOOP}]},
+        headers=headers,
+    )
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["detail"]["code"] == "stale_snapshot_not_acknowledged"

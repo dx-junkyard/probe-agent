@@ -3,6 +3,7 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import {
   useReplaySets,
+  useSnapshotPreflight,
   useReplaySet,
   useReplaySetSource,
   useReplaySourceDiff,
@@ -35,6 +36,7 @@ import { ReplayabilityBadge } from "@/components/replay-row-actions";
 import { ApprovalPanel } from "@/components/replay-approval-panel";
 import { ResultMatrix } from "@/components/replay-result-matrix";
 import { ImprovementLoopRail } from "@/components/improvement-loop/rail";
+import { SnapshotPreflightPanel } from "@/components/snapshot-preflight";
 
 // Simulation Workbench (Issue #242 Phase D / #246). Display + composition
 // only: every judgement/execution/comparison decision below is made by the
@@ -65,6 +67,7 @@ export default function SimulationWorkbenchPage() {
   const selectSet = (id: number) => setSearchParams({ replay_set_id: String(id) });
 
   const { data: sets } = useReplaySets();
+  const { data: snapshotPreflight } = useSnapshotPreflight();
   const { data: replaySet, isLoading: setLoading } = useReplaySet(selectedSetId);
   const componentId = replaySet?.component_id ?? null;
 
@@ -199,7 +202,9 @@ export default function SimulationWorkbenchPage() {
     <div className="space-y-6">
       {/* Issue #371: the Workbench is the multi-candidate detail mode of the
           same loop, not a separate product. */}
-      <ImprovementLoopRail componentId={componentId} />
+      <ImprovementLoopRail componentId={componentId} replaySetId={selectedSetId} />
+      {/* Issue #369 (review finding 4): same shared preflight, same words. */}
+      <SnapshotPreflightPanel preflight={snapshotPreflight} />
       <div className="flex items-center justify-between gap-3">
         <h1 className="text-2xl font-bold tracking-tight">Simulation Workbench</h1>
         <div className="flex items-center gap-2">

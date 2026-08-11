@@ -27,7 +27,10 @@ function status(overrides: Partial<ConnectivityStatusOut> = {}): ConnectivitySta
     smoke_component_id: "probe-smoke-check",
     materialized_session_ids: [],
     freshness: "receiving_now",
+    transport_freshness: "receiving_now",
+    last_real_trace_at: NOW - 30,
     seconds_since_last_trace: 30,
+    seconds_since_last_any_trace: 30,
     evaluated_at: NOW,
     clock_skew_seconds: 0,
     real_trace_count_5m: 3,
@@ -64,7 +67,14 @@ describe("FreshnessBadge", () => {
 
 describe("FreshnessDetail", () => {
   it("最終受信を相対時刻と絶対時刻の両方で表示する", () => {
-    render(<FreshnessDetail data={status({ seconds_since_last_trace: 14 * 86400 })} />);
+    render(
+      <FreshnessDetail
+        data={status({
+          seconds_since_last_trace: 14 * 86400,
+          last_real_trace_at: NOW - 14 * 86400,
+        })}
+      />,
+    );
     const detail = screen.getByTestId("freshness-detail");
     expect(detail.textContent).toContain("14日前");
     // 絶対時刻(年)も併記される
@@ -110,12 +120,40 @@ describe("FreshnessDetail", () => {
     expect(screen.getByTestId("clock-skew-note")).toBeTruthy();
   });
 
+  it("疎通は生きているが workload が止まっているとき、その区別を出す", () => {
+    // レビュー指摘 P1-5: 新しい smoke ping で古い workload が緑にならないこと。
+    render(
+      <FreshnessDetail
+        data={status({
+          freshness: "stale",
+          transport_freshness: "receiving_now",
+          last_real_trace_at: NOW - 14 * 86400,
+          seconds_since_last_trace: 14 * 86400,
+          seconds_since_last_any_trace: 20,
+          real_trace_count_5m: 0,
+          real_trace_count_1h: 0,
+          real_trace_count_24h: 0,
+        })}
+      />,
+    );
+    expect(screen.getByTestId("transport-note").textContent).toContain("受信経路は正常");
+    expect(screen.getByTestId("freshness-detail").textContent).toContain("14日前");
+    // 止まっているので確認導線が出る。
+    expect(screen.getByTestId("freshness-next-steps")).toBeTruthy();
+  });
+
+  it("疎通と workload が一致しているときは transport の注記を出さない", () => {
+    render(<FreshnessDetail data={status()} />);
+    expect(screen.queryByTestId("transport-note")).toBeNull();
+  });
+
   it("未受信でも件数表示で落ちない", () => {
     render(
       <FreshnessDetail
         data={status({
           freshness: "never_received",
           last_trace_at: null,
+          last_real_trace_at: null,
           seconds_since_last_trace: null,
           first_trace_at: null,
           real_trace_count_5m: 0,

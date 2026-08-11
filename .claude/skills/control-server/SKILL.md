@@ -29,6 +29,14 @@ the send boundary and the ingestion boundary cannot drift apart. This is not
 redundant with the SDK: an older SDK, a non-SDK HTTP client, and
 `PROBE_PAYLOAD_MODE=full` all reach this endpoint.
 
+The contract belongs to the **storage boundary**, not to `POST /traces`.
+Three tables hold payloads and all three are covered: `traces`,
+`trace_projections` (written by both the trace route and the shadow route),
+and `shadow_results`. Adding a payload column means updating the write path,
+`GET /traces/redaction-audit`, AND `POST /traces/redaction-rescan` — an audit
+narrower than the writers reports `unscanned_rows: 0` while plaintext sits in
+a table it never looked at.
+
 Rules to preserve when touching trace persistence:
 
 - Redact on the write path, never at render time. A presentation-only mask
@@ -64,12 +72,21 @@ Dashboard renders, it does not re-derive:
 - `GET /tokens/me`, `GET /tokens` — `app/token_status.py` is the ONLY
   definition of a token's status. Do not add a second one client-side.
 - `GET /snapshot-preflight` — processing state vs freshness, one recommended
-  snapshot, `unknown` never blocks. `gather_preflight` runs `git`
-  subprocesses: never call it inside a `get_conn()` block.
+  snapshot, `unknown` never blocks. Every surface that pins a snapshot calls
+  `require_snapshot_preflight` (Experiment creation, Candidate Studio
+  sessions, Replay variant runs) and records the decision on its own row; a
+  preflight wired into one of the three is not shared. `gather_preflight`
+  runs `git` subprocesses: never call it inside a `get_conn()` block.
 - `GET /replay-readiness` — replayability counts before generation.
   `POST /candidate-sessions` enforces it (422 `no_replayable_traces`) so no
-  reasoning-model call is spent on an unevaluable candidate. Keep
-  `not_captured` distinct from `unreplayable`.
+  reasoning-model call is spent on an unevaluable candidate, and
+  `POST .../generate` re-checks immediately before the call. Judge the set the
+  run will replay: with a `replay_set_id` that is the Set's own `trace_ids`,
+  never the recent-N window. Keep `not_captured` distinct from
+  `unreplayable`.
+- `connectivity/status` — `freshness` is the WORKLOAD axis, from
+  `last_real_trace_at`. A smoke ping must never revive it; that is what
+  `transport_freshness` is for.
 
 ## Evaluation context APIs (issue #9)
 

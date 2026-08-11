@@ -20,7 +20,9 @@ from ..models import (
 )
 from ..snapshot_preflight import (
     PreflightResult,
+    StaleSnapshotNotAcknowledged,
     gather_preflight,
+    resolve_stale_decision,
     stale_continuation_message,
 )
 
@@ -59,6 +61,38 @@ def to_out(result: PreflightResult) -> SnapshotPreflightOut:
             else None
         ),
     )
+
+
+def require_snapshot_preflight(
+    system_id: int,
+    snapshot_id: Optional[int],
+    stale_reason: Optional[str],
+) -> tuple:
+    """Evaluate the shared preflight and enforce the stale-snapshot gate.
+
+    Used by every surface that starts work against a snapshot — Experiment
+    creation, Candidate Studio sessions, and Replay runs — so the three cannot
+    disagree about whether a snapshot may be used, or about what continuing on
+    a stale one requires.
+
+    Returns the ``(freshness, head_sha, stale_ack_reason)`` triple to persist
+    on the record that consumes the snapshot.
+
+    Must be called with NO ``get_conn()`` connection open: ``gather_preflight``
+    runs ``git`` subprocesses and the SQLite lock is process-wide.
+    """
+    preflight = gather_preflight(system_id, snapshot_id)
+    try:
+        return resolve_stale_decision(preflight, stale_reason)
+    except StaleSnapshotNotAcknowledged as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "stale_snapshot_not_acknowledged",
+                "message": str(exc),
+                "recommended_snapshot_id": preflight.recommended_snapshot_id,
+            },
+        ) from exc
 
 
 @router.get("/snapshot-preflight", response_model=SnapshotPreflightOut)

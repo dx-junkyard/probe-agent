@@ -40,7 +40,21 @@ Trace / Replay / 候補生成の経路で秘密値を保持しないための契
 | 境界 | 実装 | 目的 |
 | --- | --- | --- |
 | SDK 送信前 | `probe_agent/decorator.py` の `_payload_repr` / `redact_text` | 秘密値をプロセス外へ出さない |
-| Control Server 保存前 | `app/trace_redaction.py` (`POST /traces`) | 旧SDK・非SDKクライアント・`PROBE_PAYLOAD_MODE=full` に対する多層防御 |
+| Control Server 保存前 | `app/trace_redaction.py` | 旧SDK・非SDKクライアント・`PROBE_PAYLOAD_MODE=full` に対する多層防御 |
+
+保存前 redaction は **payload を保存するすべての経路**に適用する。契約は
+エンドポイントの性質ではなく**保存境界**の性質なので、`POST /traces` の本体
+だけを守っても意味がない。
+
+| テーブル | 経路 | 対象列 |
+| --- | --- | --- |
+| `traces` | `POST /traces` | `input_json` / `output_text` / `error` / `input_capture_json` |
+| `trace_projections` | `POST /traces`, `POST /components/{id}/shadow-results` | `data_json` (`fields` / `metrics` / `samples`) |
+| `shadow_results` | `POST /components/{id}/shadow-results` | `current_output` / `candidate_output` / `candidate_error` |
+
+projection は payload の「限定された切り出し」だが、credential の限定された
+切り出しはやはり credential である。projection spec 自身の `redact` path は
+作者の意図であり、ここはその下の必須の床にあたる。
 
 **保存前**であることが重要で、表示時のマスクでは平文がディスクとエクスポート、
 および Replay / Candidate Studio / Workspaces のすべての下流に残ってしまう。
@@ -91,6 +105,10 @@ Trace 由来の秘密値が prompt 境界に到達することはない。
 
    `unscanned_rows` / `affected_rows` と、行ごとの規則名・フィールド名が返る。
    **一致した値そのものは返さない。**
+
+   `tables` に `traces` / `trace_projections` / `shadow_results` の内訳が入る。
+   合計値は3テーブルの和であり、`traces` だけを見て `unscanned_rows: 0` を
+   移行完了と読まないための構造になっている。
 
 2. **漏えいした credential をローテーションする**
 

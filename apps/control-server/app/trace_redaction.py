@@ -32,8 +32,11 @@ from probe_agent.redaction import REDACTION_MARKER, is_sensitive_key
 __all__ = [
     "REDACTION_MARKER",
     "TraceRedactionResult",
+    "PayloadRedactionResult",
     "RedactedField",
     "redact_trace_payload",
+    "redact_projection",
+    "redact_shadow_outputs",
     "redact_value",
     "redact_text",
 ]
@@ -162,6 +165,80 @@ def redact_value(
         return redact_text(value, field_name=field_name, path=path)
 
     return value, entries
+
+
+@dataclass
+class PayloadRedactionResult:
+    """Redacted values for one non-trace payload row, plus its audit entries.
+
+    Projections and shadow results are stored by their own routes, but they
+    carry the same kind of free-form payload a trace does — Issue #367's
+    contract is a property of the *storage boundary*, not of one endpoint, so
+    they go through the same rules.
+    """
+
+    values: Dict[str, Any] = field(default_factory=dict)
+    fields: List[RedactedField] = field(default_factory=list)
+
+    @property
+    def redacted(self) -> bool:
+        return bool(self.fields)
+
+    @property
+    def rules(self) -> List[str]:
+        return sorted({entry.rule for entry in self.fields})
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "redacted": bool(self.fields),
+            "rules": self.rules,
+            "fields": [
+                {"field": entry.field, "path": entry.path, "rule": entry.rule}
+                for entry in self.fields
+            ],
+        }
+
+
+def redact_projection(
+    *, fields: Any, metrics: Any, samples: Any
+) -> PayloadRedactionResult:
+    """Redact one projection's extracted slices.
+
+    A projection is a *bounded* slice of a payload, not the payload itself —
+    but a bounded slice of a credential is still a credential. The projection
+    spec's own `redact` paths are the author's intent; this is the mandatory
+    floor underneath them, for specs that never anticipated a secret and for
+    projections posted by something other than the SDK.
+    """
+    result = PayloadRedactionResult()
+    for name, value in (("fields", fields), ("metrics", metrics), ("samples", samples)):
+        redacted, entries = redact_value(value, field_name=name)
+        result.values[name] = redacted
+        result.fields.extend(entries)
+    return result
+
+
+def redact_shadow_outputs(
+    *,
+    current_output: Optional[str],
+    candidate_output: Optional[str],
+    candidate_error: Optional[str],
+) -> PayloadRedactionResult:
+    """Redact a shadow result's three rendered payload columns.
+
+    These are the current and candidate `repr`s — exactly the shape the
+    audited leak took on the trace side, arriving through a different route.
+    """
+    result = PayloadRedactionResult()
+    for name, value in (
+        ("current_output", current_output),
+        ("candidate_output", candidate_output),
+        ("candidate_error", candidate_error),
+    ):
+        redacted, entries = redact_text(value, field_name=name)
+        result.values[name] = redacted
+        result.fields.extend(entries)
+    return result
 
 
 def redact_trace_payload(

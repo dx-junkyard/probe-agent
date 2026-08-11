@@ -92,21 +92,55 @@ describe("buildStages", () => {
 });
 
 describe("loopSearchParams", () => {
-  it("deep link / 再読込 / 戻る で文脈を保つ", () => {
-    const query = loopSearchParams({
-      componentId: "summarizer",
-      traceId: "t-1",
-      sessionId: 4,
-      snapshotId: 9,
-    });
+  const context = {
+    componentId: "summarizer",
+    traceId: "t-1",
+    sessionId: 4,
+    replaySetId: 7,
+  };
+
+  it("Components が実際に読む名前で渡す", () => {
+    // レビュー指摘 P1-6: rail は component_id を出していたが、Components 画面は
+    // component を読むため、遷移しても未選択に戻っていた。
+    const query = loopSearchParams("/components", context);
+    expect(query).toContain("component=summarizer");
+    expect(query).toContain("trace=t-1");
+    expect(query).not.toContain("component_id=");
+  });
+
+  it("Candidate Studio が読む名前で渡す", () => {
+    const query = loopSearchParams("/candidate-studio", context);
     expect(query).toContain("component_id=summarizer");
     expect(query).toContain("trace_id=t-1");
     expect(query).toContain("session_id=4");
-    expect(query).toContain("snapshot_id=9");
+    expect(query).toContain("replay_set_id=7");
+  });
+
+  it("Workbench に Replay Set を引き継ぐ", () => {
+    const query = loopSearchParams("/simulation-workbench", context);
+    expect(query).toContain("replay_set_id=7");
+    expect(query).toContain("component_id=summarizer");
+  });
+
+  it("Experiments が読む prefill 名で渡す", () => {
+    const query = loopSearchParams("/experiments", {
+      ...context,
+      replayRunId: 11,
+      replayVariantId: 22,
+    });
+    expect(query).toContain("from_component=summarizer");
+    expect(query).toContain("from_trace=t-1");
+    expect(query).toContain("replay_run_id=11");
+    expect(query).toContain("replay_variant_id=22");
   });
 
   it("文脈が無ければクエリを付けない", () => {
-    expect(loopSearchParams({})).toBe("");
+    expect(loopSearchParams("/components", {})).toBe("");
+  });
+
+  it("宛先が読まない値は付けない", () => {
+    // Workbench は trace を読まないので、無意味な param を増やさない。
+    expect(loopSearchParams("/simulation-workbench", context)).not.toContain("trace");
   });
 });
 
@@ -144,11 +178,16 @@ describe("ImprovementLoopRail", () => {
     );
   });
 
-  it("各段階へのリンクが文脈を引き継ぐ", () => {
+  it("各段階へのリンクが宛先の名前で文脈を引き継ぐ", () => {
     renderRail({ componentId: "summarizer", traceId: "t-1" });
-    const link = screen.getByTestId("loop-stage-compare");
-    expect(link.getAttribute("href")).toContain("component_id=summarizer");
-    expect(link.getAttribute("href")).toContain("trace_id=t-1");
+    // Candidate Studio 宛は component_id
+    expect(screen.getByTestId("loop-stage-compare").getAttribute("href"))
+      .toContain("component_id=summarizer");
+    // Components 宛は component（この画面が読む名前）
+    const back = screen.getByTestId("loop-stage-select").getAttribute("href") ?? "";
+    expect(back).toContain("component=summarizer");
+    expect(back).toContain("trace=t-1");
+    expect(back).not.toContain("component_id=");
   });
 
   it("完了段階を色だけで示さない", () => {

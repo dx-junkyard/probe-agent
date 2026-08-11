@@ -380,9 +380,20 @@ class ConnectivityStatusOut(BaseModel):
     smoke_component_id: str = SMOKE_CHECK_COMPONENT_ID
     materialized_session_ids: List[int] = Field(default_factory=list)
     # --- Issue #370: live reception, separate from the milestone above -------
+    #: Workload freshness, classified from the newest NON-smoke trace. A smoke
+    #: check proves the transport, not that the instrumented workload runs.
     freshness: ConnectivityFreshness = "never_received"
-    #: Seconds since the newest trace; None when nothing has ever arrived.
+    #: Transport freshness, classified from the newest trace of any kind.
+    #: Reported separately so "the smoke check still gets through" stays
+    #: visible rather than being read as workload health.
+    transport_freshness: ConnectivityFreshness = "never_received"
+    #: Newest non-smoke trace; None when only smoke traces have arrived.
+    last_real_trace_at: Optional[float] = None
+    #: Seconds since the newest non-smoke trace — the same event `freshness`
+    #: judged, so the label and the relative time cannot disagree.
     seconds_since_last_trace: Optional[float] = None
+    #: Seconds since the newest trace of any kind.
+    seconds_since_last_any_trace: Optional[float] = None
     #: The server clock this reading was taken against, so the client can show
     #: a relative time that does not drift with its own clock.
     evaluated_at: float = 0.0
@@ -5940,6 +5951,9 @@ class ReplayVariantRunCreate(BaseModel):
     replay_set_id: int
     snapshot_id: Optional[int] = None
     variants: List[ReplayVariantCreate] = Field(..., min_length=1, max_length=20)
+    # Issue #369: required when the resolved snapshot is definitively behind
+    # HEAD. Same manual decision the Experiment records.
+    stale_snapshot_reason: Optional[str] = Field(None, min_length=1, max_length=1000)
 
 
 class ReplayVariantCaseResultOut(BaseModel):
@@ -6162,6 +6176,9 @@ class CandidateSessionCreate(BaseModel):
     trace_id: Optional[str] = None
     snapshot_id: Optional[int] = None
     objective: str = Field(default="", max_length=5000)
+    # Issue #369: required when the resolved snapshot is definitively behind
+    # HEAD. Same manual decision the Experiment records.
+    stale_snapshot_reason: Optional[str] = Field(None, min_length=1, max_length=1000)
 
 
 class CandidateProposal(BaseModel):

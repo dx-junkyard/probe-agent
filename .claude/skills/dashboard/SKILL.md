@@ -781,7 +781,9 @@ the reverse — puts it back on top of the primary action at narrow widths.
 兼ねていた**。判定はサーバ側の有限集合として置き、Dashboard は描画するだけに
 する。クライアント側に2つ目の定義を作らないこと — それが元のバグである。
 
-- `ConnectivityBadge` は `freshness`(現在受信しているか)を読む。`state`
+- `ConnectivityBadge` は `freshness`(実 workload をいま受信しているか)を読む。
+  smoke trace は transport の証明でしかないので、`transport_freshness` とは
+  別軸として扱い、食い違うときだけ注記を出す。`state`
   (一度でも疎通したか)は累積マイルストーンで、Overview のセットアップ
   チェックリストだけが読む。同じ緑ラベルで両方を表さない。
 - token の状態は `TokenOut.status` を読む。`revoked` / `expires_at` から
@@ -792,6 +794,11 @@ the reverse — puts it back on top of the primary action at narrow widths.
 - 候補生成前に `ReplayReadinessPanel` を出す。Trace 合計だけでなく
   `capture未設定` / `capture失敗` / `完全復元` / `一部マスク` の内訳と、
   実際に評価へ使える件数を示す。0件なら開始ボタンを止める。
+- 改善ループのリンクは `loopSearchParams(to, ctx)` が**宛先ごとの param 名**で
+  出す。`/components` は `component` / `trace`、Candidate Studio は
+  `component_id` / `trace_id` を読む。1つの綴りに統一すると、遷移はするが
+  未選択で着地するリンクになる。rail の現在地も、一覧の先頭ではなく開発者が
+  開いたレコードに従わせる。
 - 改善ループの現在地は `components/improvement-loop/model.ts` だけが決める。
   純関数で、route ではなく永続事実(version の replay/promotion 状態)から
   決まる — Candidate Studio 1画面が3段階を兼ねているため。rail は遷移する

@@ -394,6 +394,11 @@ class ConnectivityFacts:
     real_trace_count_24h: int = 0
     #: Positive when the newest trace is timestamped ahead of the server.
     clock_skew_seconds: float = 0.0
+    #: Newest NON-smoke trace. A manual smoke check proves the transport
+    #: works; it says nothing about whether the instrumented workload is
+    #: still running, so workload freshness is measured from this and never
+    #: from ``last_trace_at``.
+    last_real_trace_at: Optional[float] = None
 
 
 def get_connectivity_facts(
@@ -433,7 +438,8 @@ def get_connectivity_facts(
         SELECT
             SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) AS w5m,
             SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) AS w1h,
-            SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) AS w24h
+            SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) AS w24h,
+            MAX(timestamp) AS last_real_at
         FROM traces
         WHERE system_id = ? AND component_id != ?
         """,
@@ -479,6 +485,7 @@ def get_connectivity_facts(
         real_trace_count_1h=windows["w1h"] or 0,
         real_trace_count_24h=windows["w24h"] or 0,
         clock_skew_seconds=clock_skew,
+        last_real_trace_at=windows["last_real_at"],
     )
 
 

@@ -142,8 +142,31 @@ def test_window_counts_exclude_smoke_traces(client):
     assert body["real_trace_count_24h"] == 0
     # ...but it still moves the milestone off no_signal.
     assert body["state"] == "smoke_only"
-    # And freshness reflects that *something* arrived: the transport is live.
-    assert body["freshness"] == "receiving_now"
+    # Workload freshness follows the workload, so a smoke ping does not make
+    # it "receiving". The transport axis reports the ping separately.
+    assert body["freshness"] == "never_received"
+    assert body["transport_freshness"] == "receiving_now"
+
+
+def test_a_fresh_smoke_ping_does_not_revive_a_silent_workload(client):
+    """Review finding P1-5: the exact combination that painted a dead system green.
+
+    An old real trace plus a smoke check sent just now used to classify as
+    `receiving_now` (freshness read `MAX(timestamp)` over all traces), while
+    every windowed count was 0 -- and the header warning disappeared with it.
+    """
+    client.post("/traces", json=_trace("summarizer", "old", time.time() - 14 * 86400))
+    client.post("/traces", json=_trace("probe-smoke-check", "fresh-smoke"))
+
+    body = client.get("/connectivity/status").json()
+    assert body["freshness"] == "stale"
+    # The transport really is fine, and that stays visible.
+    assert body["transport_freshness"] == "receiving_now"
+    assert body["real_trace_count_5m"] == 0
+    assert body["real_trace_count_24h"] == 0
+    # The relative time describes the workload the label judged, not the ping.
+    assert body["seconds_since_last_trace"] > 13 * 86400
+    assert body["seconds_since_last_any_trace"] < 300
 
 
 def test_clock_skew_is_reported_as_a_fact(client):

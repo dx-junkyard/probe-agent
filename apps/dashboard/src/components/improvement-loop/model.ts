@@ -119,24 +119,64 @@ export function buildStages(current: LoopStageId): LoopStageView[] {
   }));
 }
 
-/**
- * Carry the loop's context through navigation.
- *
- * Deep links, reloads, and the browser Back button must not drop the
- * component / trace / session the developer is working on (#371). Building
- * the query string in one place keeps every hand-off consistent.
- */
-export function loopSearchParams(context: {
+export interface LoopNavigationContext {
   componentId?: string | null;
   traceId?: string | null;
   sessionId?: number | null;
   snapshotId?: number | null;
-}): string {
+  replaySetId?: number | string | null;
+  replayRunId?: number | null;
+  replayVariantId?: number | null;
+}
+
+/**
+ * The query-parameter names each destination actually reads.
+ *
+ * These differ by page for good reasons — `/components` has read
+ * `component` / `trace` since the Trace Lineage and analyzer deep links were
+ * built — so the rail emits the *destination's* names rather than imposing
+ * one spelling. Emitting `component_id` at `/components` (which the first
+ * pass did) produced a link that navigated but arrived with nothing selected.
+ */
+const PARAM_NAMES: Record<string, Partial<Record<keyof LoopNavigationContext, string>>> = {
+  "/components": { componentId: "component", traceId: "trace" },
+  "/candidate-studio": {
+    componentId: "component_id",
+    traceId: "trace_id",
+    sessionId: "session_id",
+    replaySetId: "replay_set_id",
+  },
+  "/simulation-workbench": {
+    componentId: "component_id",
+    replaySetId: "replay_set_id",
+  },
+  "/experiments": {
+    replayRunId: "replay_run_id",
+    replayVariantId: "replay_variant_id",
+    componentId: "from_component",
+    traceId: "from_trace",
+  },
+};
+
+/**
+ * Carry the loop's context through navigation to one destination.
+ *
+ * Deep links, reloads, and the browser Back button must not drop the
+ * component / trace / session the developer is working on (#371).
+ */
+export function loopSearchParams(
+  to: string,
+  context: LoopNavigationContext,
+): string {
+  const names = PARAM_NAMES[to] ?? {};
   const params = new URLSearchParams();
-  if (context.componentId) params.set("component_id", context.componentId);
-  if (context.traceId) params.set("trace_id", context.traceId);
-  if (context.sessionId != null) params.set("session_id", String(context.sessionId));
-  if (context.snapshotId != null) params.set("snapshot_id", String(context.snapshotId));
+  for (const [key, name] of Object.entries(names) as Array<
+    [keyof LoopNavigationContext, string]
+  >) {
+    const value = context[key];
+    if (value == null || value === "") continue;
+    params.set(name, String(value));
+  }
   const query = params.toString();
   return query ? `?${query}` : "";
 }

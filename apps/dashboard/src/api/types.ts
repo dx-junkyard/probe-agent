@@ -122,8 +122,14 @@ export interface ConnectivityStatusOut {
   // Issue #370: the live reception axis. `state` above is a cumulative
   // milestone that never regresses ("has connected at least once"); this is
   // the operational reading and does regress. Never render one as the other.
+  /** Workload freshness, from the newest NON-smoke trace. */
   freshness: ConnectivityFreshness;
+  /** Transport freshness, from the newest trace of any kind. */
+  transport_freshness: ConnectivityFreshness;
+  last_real_trace_at: number | null;
+  /** Seconds since the newest non-smoke trace — the event `freshness` judged. */
   seconds_since_last_trace: number | null;
+  seconds_since_last_any_trace: number | null;
   /** Server clock at evaluation, so relative times do not drift with ours. */
   evaluated_at: number;
   clock_skew_seconds: number;
@@ -4067,6 +4073,11 @@ export interface CandidateSessionCreateRequest {
   trace_id?: string;
   snapshot_id?: number;
   objective?: string;
+  /**
+   * Issue #369: required when the server's preflight reports the resolved
+   * snapshot is definitively behind HEAD. `decision_method: manual`.
+   */
+  stale_snapshot_reason?: string;
 }
 
 export interface CandidatePromotionOut {

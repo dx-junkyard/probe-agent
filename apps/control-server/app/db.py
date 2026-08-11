@@ -5256,6 +5256,19 @@ def init_db() -> None:
                 _add_column_if_missing(
                     conn, "experiments", experiment_cols, column, "TEXT"
                 )
+        # Issue #369 (review finding 4): the same stale-snapshot decision the
+        # Experiment records, on every other record that consumes a snapshot.
+        # Additive and never backfilled -- a row created before the shared
+        # preflight existed has no recorded decision, which is what NULL says.
+        for table in ("candidate_sessions", "replay_runs"):
+            columns = _columns(conn, table)
+            if columns:
+                for column in (
+                    "snapshot_freshness",
+                    "head_sha_at_creation",
+                    "stale_ack_reason",
+                ):
+                    _add_column_if_missing(conn, table, columns, column, "TEXT")
         # Issue #367: the server-side redaction audit summary. Additive and
         # never backfilled -- an existing row's NULL means "this row was
         # stored before ingestion-time redaction existed", which is exactly
@@ -5264,6 +5277,14 @@ def init_db() -> None:
         trace_cols = _columns(conn, "traces")
         if trace_cols:
             _add_column_if_missing(conn, "traces", trace_cols, "redaction_json", "TEXT")
+        # Projections and shadow results carry the same kind of free-form
+        # payload and reach storage through their own routes, so they need the
+        # same audit column. NULL keeps meaning "written before ingestion-time
+        # redaction existed" on every table the rescan covers.
+        for table in ("trace_projections", "shadow_results"):
+            columns = _columns(conn, table)
+            if columns:
+                _add_column_if_missing(conn, table, columns, "redaction_json", "TEXT")
         _migrate_alignment_manual_recheck_targets(conn)
         _ensure_legacy_system(conn)
     _validate_startup_environment()
