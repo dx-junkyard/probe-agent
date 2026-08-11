@@ -775,6 +775,28 @@ the reverse — puts it back on top of the primary action at narrow widths.
 本番と同じ CSS のまま寸法を検証できる。Playwright はリポジトリの依存には
 追加しないこと(この確認は使い捨てで行う)。
 
+## 共同理解の起点導線 (issue #336)
+
+入口は Q&A カードだけで、他の 3 起点(Intent / Review item / Inquiry)は
+サーバ契約が動いていても開発者が到達できなかった。
+
+- `components/system-understanding/joint-understanding-entry.tsx` を 3 起点で
+  共用する。起点固有の表示(ラベル・質問文)は持てるが、セッションの探索・
+  作成・パネルは共通にする。
+- ボタンからの開始は常に `trigger: "explicit_request"`。`unknown_answer` は
+  サーバの「わからない」入口だけが書く事実なので、クライアントから主張しない。
+- **`findOpenJointSession` を必ず使う。** `origin_id` だけで突き合わせては
+  いけない: `interview_qa` / `interview_intent_item` は加算訂正なので、項目を
+  修正すると行 id が変わる一方、セッションは会話が始まった行を指し続ける。
+  サーバはこのために `current_origin_id` を返す。この規則を呼び出し側ごとに
+  再実装すると、必ず片方だけ直っていない状態になる。
+- 閉じたセッションは履歴。続けるには新しく開く(#329 の terminal 契約)。
+- 内部の分類名(`system_researchable` / `hybrid` / `human_only`)を開発者向け
+  ラベルにしない。「わからない」応答の `next_step` を日本語の説明へ写す。
+- 「調査の限界」と「実行の失敗」を別の文言で説明する。前者は根拠付きの結果
+  (もっと読めば分かるかもしれない)、後者は結果が無い状態(直してやり直す)。
+
+
 ## 設定〜候補評価の主導線 (issue #366, subs #367-#374)
 
 この Epic の修正はすべて同じ形をしている: **1つの表示語が独立した2つの事実を
