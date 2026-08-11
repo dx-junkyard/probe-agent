@@ -326,7 +326,136 @@ creating incomplete persistence or execution paths for later phases.
     prerequisite of this Epic. See the Issue #328 section in
     `docs/project-intelligence.md`.
 
-15. Issue #342 — システムインタビューを状態駆動型の開発者ワークフローへ
+15. Issues #337 / #336 / #339 / #338 — 共同理解フロー統合. The follow-ups
+    #328-#334 were closed in favour of, implemented in dependency order:
+    #337 (premise/provenance/decision audit) → #336 (single flow + canonical
+    reflux) → #339 (exploration + router + hard budgets) → #338 (outcome
+    lineage + quality metrics). Do not add a new origin or Finding producer
+    before #337's contract is settled. Per-issue design notes live in
+    `docs/project-intelligence.md`.
+
+    **#337 (implemented).** What it added, and what any later change must
+    preserve:
+    - `app/joint_premise.py` is the single premise/provenance contract for
+      Joint Understanding. It **reuses Issue #308's bundle** — the same column
+      names on `joint_understanding_session`, the same digest helpers — and
+      generalizes it from `origin_kind='review_item'` to all four origins.
+      `premise_commit_sha` is the one addition: #308 compares review-item
+      *content* so it can ignore the pin, but a Joint Understanding
+      investigation reads *code*, so the commit it read IS its premise.
+    - The verdict is the finite `current` / `stale` / `missing` / `invalid`,
+      first-match. The two added values are the cases the old
+      `("fresh","stale")` pair had to lie about: a premise that **disappeared**
+      and a session that **never captured one**. The pre-#337
+      `_premise_state` returned `"fresh"` for a session with nothing pinned, an
+      unresolvable interview session, and a deleted pinned snapshot — a gate
+      whose failure mode was permissive. Only `current` permits
+      `hypothesis_adopted` / `decided` / reflux.
+    - **Compatibility means the legacy row stays readable and keeps its
+      recorded outcome — never that it is promoted to a satisfied premise.**
+      A row without `premise_tracking_version` is `invalid`
+      (`premise_not_captured`).
+    - **The commit decides staleness, not the snapshot id** (the same commit
+      re-pinned under a new snapshot row is the same premise — #323's rule on
+      the snapshot axis). **`premise_revision_id` is never a staleness input**:
+      rebuilding the Understanding must not expire a conversation about code
+      that did not move. It is captured for audit and for the adoption lineage.
+    - Per-origin content hashes are deliberately not uniform. `qa` digests the
+      QUESTION only (adding the answer would let the session's own reflux make
+      it stale). `intent` digests `field`+`value_text` and **excludes
+      `status`** — the session exists to help decide that item, so confirming
+      it must not invalidate the premise and then block recording the decision
+      (#308 excluded `confirmation_id` for the same reason: expire on MEANING,
+      never on a decision marker). `inquiry` **inherits the parent Inquiry's
+      #308 bundle**, so both features reach the same verdict from the same fact
+      when an Alignment build supersedes it.
+    - `qa`/`intent` correct additively, so the premise walks the
+      `superseded_by_id` chain and reports `PremiseFacts.current_origin_id`
+      rather than substituting it. Reflux resolves it explicitly; without that,
+      an answer revision sent the refluxed facts to a `revised` row the
+      Dashboard never shows.
+    - **`origin_role` / `producer_kind` / `actor_kind` are three separate
+      axes**: whose voice, which code path, whether an authenticated human
+      stands behind it. `POST /joint-understanding/{id}/findings` is now
+      **developer-only** (other roles are 403
+      `joint_understanding_producer_internal`) and its provenance comes from the
+      route and the `Principal`, never the body. Accepting a body-supplied
+      `origin_role` let a caller store an unverifiable "fact" with fabricated
+      citations, and let any caller record a sentence as the human's own
+      judgement with `decision_method='manual'`. `legacy` provenance is
+      read-only and is never assumed to be a human.
+    - A close is an audit record: `outcome_reason` is **required**, and
+      `closed_by_*` / basis / premise verdict + reason are persisted so a
+      reload still says who decided what, on what grounds, against which
+      premise.
+    - `validate_basis` is fail-closed: superseded, mock, and foreign findings
+      are refused, and `hypothesis_adopted` may only adopt a **current
+      investigation hypothesis** with a verified run and evidence. Adopting a
+      fact makes the provisional marker meaningless; adopting a corrected
+      hypothesis re-adopts what the investigation withdrew; adopting a
+      developer's evidence-free hunch is "confidence alone promotes a
+      hypothesis".
+    - `joint_understanding_hypothesis_adoption` immutably captures the basis
+      finding and the premise digests at adoption. Its state
+      (`provisional` / `reconfirmation_required` / `basis_withdrawn`) is
+      **derived, never stored** — the same discipline #349 applies to an
+      unresolved blocking failure.
+    Tests that need a pre-existing investigation/translation finding use
+    `tests/joint_understanding_helpers.insert_producer_finding`, which writes
+    exactly what the producers write; do not reintroduce an endpoint that
+    accepts producer roles from a request body.
+
+    **#336 (implemented).** The entry and the exit of the flow, which are the
+    same defect seen from both ends: a real 「わからない」 went through the #142
+    answer flow (which knew nothing about Joint Understanding) while the
+    Dashboard separately called a one-shot `route-and-investigate`, so no
+    session was ever opened from an actual unknown answer; and reflux attached
+    a verified fact whose attachment, for every origin except `qa`, WAS the
+    `joint_understanding_reflux` row — which no rebuild read. What it added:
+    - `POST /interview/sessions/{id}/qa/{qa_id}/unknown` is the single entry
+      point, and **its order is the contract**: (1) the unknown answer is
+      committed first, so a later failure of the router, the reasoning
+      configuration, or the investigation costs the developer nothing they
+      already had; (2) the Question Router decides whether to investigate at
+      all — `human_only` opens no session, because opening a conversation
+      about something the code cannot answer is just a slower way of handing
+      the question back; (3) `hybrid` investigates first and lets
+      `understanding_translator.ask_developer` decide whether a question still
+      has to reach the human.
+    - `trigger='unknown_answer'` is written **only** by that path. The public
+      create endpoint forces `explicit_request` (422
+      `joint_understanding_trigger_not_settable`), so the audit distinction
+      between an automatic and a deliberate start is a fact about which path
+      ran rather than a claim in a request body.
+    - The response's `next_step` is a finite four-value set and deliberately
+      contains **no internal route name** — `system_researchable` / `hybrid` /
+      `human_only` are classifications, not developer-facing labels.
+    - `app/understanding_evidence_feed.py` + `understanding_evidence_feed` are
+      the single place a verified fact is published to and the single place a
+      rebuild reads it from. Three properties make it a rebuild INPUT rather
+      than a second opinion: its own provenance (always `reasoning_llm`, never
+      `manual`, so a rebuild can tell an investigated fact from a developer's
+      answer — which is why it is a separate prompt section and never merged
+      into the Q&A block); idempotent publication (`content_digest` over the
+      fact's MEANING, **excluding the finding id**, so re-running or
+      incrementally running reflux never duplicates); and **currency evaluated
+      at READ time** (`current_entries` excludes a corrected finding and a
+      non-`current` premise) — neither is knowable at publish time, and an
+      excluded entry stays readable as history rather than being deleted.
+    - The three consumers are `understanding_build` / `alignment_build` /
+      `inquiry_answer`; feeding them bumped `understanding-review-v7` and
+      `alignment-v3`. **Consumption is recorded separately from human
+      confirmation** (`understanding_evidence_consumption` vs
+      `understanding_confirmed_at` / #312's Capability confirmation): writing
+      both in one place would let "the AI fed this in" read as "the developer
+      agreed with it".
+    - `ACTION_FORMAL_OPERATIONS` / `EXTERNAL_FORMAL_OPERATIONS` are the
+      deterministic catalog of where each action goes and which ones are
+      completed by an endpoint OUTSIDE this feature. Recording an action is
+      intent, never completion — that distinction previously had no
+      machine-readable form.
+
+16. Issue #342 — システムインタビューを状態駆動型の開発者ワークフローへ
     再設計する (sub-issues #343-#346). This is a **UX specification** issue:
     every sub-issue lists Dashboard component changes, API/DB/state-management
     design, and test implementation as 対象外, so the deliverable is the spec,
@@ -377,7 +506,7 @@ creating incomplete persistence or execution paths for later phases.
     `docs/system-interview-workflow-ux.md` as the canonical description of
     the interview screen's behaviour, not as a future plan.**
 
-16. Issue #349 — the implementation of the #342 spec. Unlike #343-#346, this
+17. Issue #349 — the implementation of the #342 spec. Unlike #343-#346, this
     issue explicitly OWNS code: DB, API, state management, Dashboard, tests.
     What it added, and what any later change must preserve:
     - `app/interview_workflow.py` is the **single canonical state engine**.
@@ -463,7 +592,7 @@ creating incomplete persistence or execution paths for later phases.
     承認・編集・却下 / 差分の適用 / 観測の開始 / 戻り要求への承諾 / 中断・
     引き継ぎ・再開 all stay `decision_method: manual`.
 
-17. Issue #351 (subs #352-#354) — the Understanding Brief and Decision
+18. Issue #351 (subs #352-#354) — the Understanding Brief and Decision
     Readiness: the layer BEFORE #349's workflow position. A developer opening
     the interview screen must be able to say, within 5 seconds, what the AI
     thinks the system is for, which parts are settled, and whether the current
@@ -534,7 +663,7 @@ creating incomplete persistence or execution paths for later phases.
       is not a precondition of the workflow.
     Human gates are unchanged; this epic writes nothing at all.
 
-18. Issue #356 — the Interview cockpit: the overview layer on top of #349's
+19. Issue #356 — the Interview cockpit: the overview layer on top of #349's
     state machine and #351's Brief, so the developer can see how far the
     interview has got, which understanding categories are settled, and how to
     fix the one they picked. Dashboard-only; it adds no backend endpoint and
@@ -602,7 +731,7 @@ creating incomplete persistence or execution paths for later phases.
     unchanged. See the Issue #356 sections in
     `docs/project-intelligence.md` and `docs/system-interview-workflow-ux.md`.
 
-19. Issue #358 (subs #359-#363) — the cockpit's information design and its
+20. Issue #358 (subs #359-#363) — the cockpit's information design and its
     main route through the screen. A UX review on real data (self-test,
     session #13, `W3`, 1280×720) measured the work surface starting at
     1,807px with ~5,897px of content, i.e. the developer scrolled ~1,100px
@@ -699,7 +828,7 @@ creating incomplete persistence or execution paths for later phases.
     `model.ts`) are all unchanged. See the Issue #358 sections in
     `docs/project-intelligence.md` and `docs/system-interview-workflow-ux.md`.
 
-20. Issue #366 — 設定から候補評価までのエンドツーエンド UX (subs #367-#374).
+21. Issue #366 — 設定から候補評価までのエンドツーエンド UX (subs #367-#374).
     A 2026-08-11 audit walked the whole loop (Repository/Settings → Connect
     SDK → Components/Traces → AI Candidate Studio → Simulation Workbench →
     Experiments) and found the screens asserting operational facts they had

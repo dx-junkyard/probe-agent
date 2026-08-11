@@ -5163,6 +5163,160 @@ Phase issue は閉じ、残件を以下へ限定して移管した。
 - #338: 不明解消・仮説反転・訂正・負担を outcome lineage で測る品質指標。
 - #339: 依存/変更履歴/実行時候補を含む探索と Question Router の統合。
 
+### 共同理解フロー統合(#337 / #336 / #339 / #338)
+
+4 Issue は依存順に実装する。#337 が保存形式と安全境界を確定し、#336 が起点と
+還流先を統合し、#339 が探索と予算を拡張し、#338 がそこで生じる実イベントから
+品質を測る。#337 が確定する前に新しい origin や Finding producer を増やさない。
+
+#### Phase 1: 前提・来歴・決定監査(Issue #337)
+
+**直した欠陥は「失敗できないゲート」だった。** 旧 `_premise_state` は
+`interview_session.snapshot_id` と pin 済み id を比較し、それ以外はすべて
+`"fresh"` を返していた — pin が無いセッション、interview session が解決できない
+場合、pin 済み snapshot 行が削除された場合の 3 つがいずれも「前提は満たされて
+いる」と読めていた。さらに snapshot id が動かない変更(意図の訂正、Alignment
+再構築による review item 差し替え、Inquiry の supersede)は原理的に検知できて
+いなかった。
+
+- **#308 の premise bundle を共通化する**(`app/joint_premise.py`)。列名は
+  `interview_inquiry` の #308 列と同一にした — 同じ bundle だからで、名前を
+  揃えることで運用者が 1 つの前提契約として読める。digest 関数
+  (`compute_intent_item_digest` / `compute_capability_scope_digest` /
+  `capability_scope_digest_for_item`)も #308 のものをそのまま使う。
+  追加したのは `premise_commit_sha` の 1 列だけ: #308 は review item の
+  *内容* を比較するので pin 先を無視できるが、共同理解の調査は**コードを読む**
+  ので、読んだコミットが前提そのものになる。
+- **verdict は `current` / `stale` / `missing` / `invalid` の有限 4 値**
+  (first-match)。追加した 2 値は旧 2 値が嘘をつくしかなかったケースに対応する。
+  `missing` = 前提は記録されていたが消えた(pin 済み snapshot 行の削除、origin
+  項目の削除)。`invalid` = 比較できる bundle がそもそも無い(移行前の行、
+  snapshot 無しで開かれたセッション)。**`invalid` を `current` へ昇格させない**
+  ことが互換性の意味であり、「旧行が読める・記録済み outcome を保持する」ことと
+  「前提が満たされている」ことは別である。
+- **snapshot id 単独では判定しない。** 同一コミットを新しい snapshot 行へ
+  pin し直しただけなら前提は動いていない(#323 の判断を snapshot 軸へ適用)。
+  逆に `premise_revision_id` は **staleness の入力にしない** — Understanding を
+  再構築しただけで、コードが動いていないセッションまで失効させてしまう(#323 が
+  同じ問いを同じ結論で決着させている)。revision は監査と仮説再確認 lineage の
+  ためだけに保存する。
+- **origin ごとの content hash**:
+  `qa` は質問文のみ(答えを入れると、自分の reflux が着地した瞬間に自分の前提を
+  stale にしてしまう)。`intent` は `field` + `value_text` のみで **`status` を
+  除外**する — その項目を決めるためのセッションなので、確定させた瞬間に前提が
+  壊れて判断を記録できなくなる(#308 が `confirmation_id` を除いたのと同じ理由:
+  **意味で失効させ、決定マーカーで失効させない**)。`review_item` は
+  `base_content_hash` + Capability scope + linked Intent digest(#308 と同じ)。
+  `inquiry` は**親 Inquiry の #308 bundle を継承する** — Inquiry には質問文の列が
+  無く、Alignment build が Inquiry を supersede したとき両機能が同じ事実から
+  同じ verdict へ到達するのが bundle 共通化の目的である。
+- **`qa` / `intent` は加算訂正**(訂正で新しい行が入り、旧行が
+  `superseded_by_id` を得る)なので、現在の行まで chain を辿って比較する。
+  `PremiseFacts.current_origin_id` として報告し、置き換えはしない — セッションは
+  会話が始まった行を指し続け、生きた行に届く必要がある消費者(reflux)だけが
+  明示的に解決する。これが無いと、回答を訂正した後の reflux が `revised` 行
+  (Dashboard に出ない)へ書き込まれていた。
+- **producer と actor を分離する。** `origin_role` は文の *声*、`producer_kind`
+  はその行を書いた *コードパス*、`actor_kind` は *認証済み人間が背後にいるか*。
+  塞いだ穴: `POST /joint-understanding/{id}/findings` は body の `origin_role` を
+  そのまま採用していたので、(a) 捏造した引用を持つ検証不能な "fact" を本物の
+  調査 Finding の隣に保存でき、(b) 任意の呼び出し元が自分の文を
+  `decision_method='manual'` 付きで人間の判断として記録できた。現在この
+  endpoint は **developer 専用**(他 role は 403
+  `joint_understanding_producer_internal`)で、provenance は route と
+  `Principal` から決まる。`investigation` / `translation` は producer
+  (`/investigate`, `/translate`)だけが書き、その triple は SQL リテラルなので
+  構造的に成立する。`legacy` は読み取り専用で、**人間だと仮定しない**。
+- **close を監査記録にする。** `outcome_reason`(判断内容)を必須にし、
+  `closed_by_*`(認証済み caller)、basis findings、premise verdict と reason を
+  保存する。reload 後も「誰が・何を・どの根拠で・どの前提に対して」決めたかが
+  復元できる。
+- **basis を fail-closed で検証する**(`validate_basis`)。superseded / mock /
+  他セッションの Finding を拒否し、`hypothesis_adopted` は **current な調査仮説**
+  (検証済み run と証拠を持つもの)だけを basis にできる。fact を「仮説として
+  暫定採用」できてしまうと暫定マーカーが何も意味せず、調査側が訂正した仮説を
+  再採用できてしまうと調査自身が取り下げた主張を採用することになる。
+  開発者自身の証拠なき直感も拒否する — それを採用するのは
+  「確度だけで仮説を事実に昇格させる」ことに他ならない。
+- **仮説採用 lineage**: `joint_understanding_hypothesis_adoption` に
+  基準 Finding と採用時の premise digest を不変記録する。状態
+  (`provisional` / `reconfirmation_required` / `basis_withdrawn`)は
+  **保存せず導出する**(#349 が未解消のブロッキング失敗に対して取っている規律と
+  同じ理由 — 保存した状態は、それが記述する事実から乖離しうる)。これにより
+  暫定採用が「静かに事実と区別できなくなる」のを防ぎ、前提が動いたときに
+  再確認対象として戻ってくる。
+
+#### Phase 2: 単一フローと canonical reflux(Issue #336)
+
+**同じ欠陥を両端から見ている。入口も出口も存在していなかった。**
+
+- **入口**: 実際の 「わからない」 は #142 の回答フロー(Joint Understanding を
+  知らない)を通り、Dashboard が別途 one-shot の `route-and-investigate` を
+  呼んでいた。本物の「わからない」から共同理解セッションが開かれることは
+  一度も無く、この機能は「明示的に頼んだときだけ」到達可能だった。
+- **出口**: reflux は検証済み事実を attach していたが、`qa` 以外の origin では
+  attach 先が `joint_understanding_reflux` 行そのもので、**どの rebuild も
+  そのテーブルを読んでいなかった**。事実は記録され、帰属もでき、そして
+  それを使えたはずのすべての consumer から見えなかった。
+
+##### 単一の 「わからない」 入口
+
+`POST /interview/sessions/{id}/qa/{qa_id}/unknown` の**順序が契約**である。
+
+1. **「わからない」を先に、独立したトランザクションで commit する。** この後は
+   router・reasoning 設定・調査のいずれが失敗してもよく、開発者が持っていた
+   選択肢(回答の訂正・引き継ぎ・後で回答)は 1 つも失われない。
+2. **Question Router が「調査するかどうか」を決める。** `system_researchable` と
+   `hybrid` だけがセッションを開く。`human_only` は開かない — コードから
+   見つかるものが無いのに会話を開くのは、同じ質問を遅く返すだけである。
+3. **`hybrid` は聞く前に調べる。** 調査可能な部分を先に消費し、人へ質問が
+   必要かどうかは翻訳ゲート(`understanding_translator.ask_developer`)が決める。
+
+`trigger='unknown_answer'` は**この経路だけ**が書く。public な create endpoint は
+`explicit_request` を強制する(それ以外は 422
+`joint_understanding_trigger_not_settable`)ので、自動開始と明示開始の監査上の
+区別は「どちらの経路が走ったか」という事実になり、リクエスト本文の主張には
+ならない。応答の `next_step` は有限 4 値で、内部の分類名
+(`system_researchable` / `hybrid` / `human_only`)は**含めない** — 内部の分類名は
+開発者向けラベルではない。
+
+##### 共通 evidence feed
+
+`understanding_evidence_feed` が「検証済み事実を publish する唯一の場所」であり
+「rebuild が読む唯一の場所」。3 つの性質が、これを second opinion ではなく
+rebuild の入力にしている。
+
+- **固有の来歴**: 常に `decision_method='reasoning_llm'` で、reasoning run と
+  確立時の premise を持つ。決して `manual` ではない — 誰も何も回答していないし、
+  rebuild は「調査された事実」と「開発者の確定回答」を区別できなければならない。
+  だから Q&A セクションへ混ぜず、独立した prompt 入力にしている。
+- **冪等な publish**: `content_digest` は `(source_kind, statement, evidence spans,
+  runtime checks)` の canonical sha256 で、**finding id を含めない**。同じ span から
+  同じ statement を確立した 2 ラウンドは同じ事実であり、rebuild には 1 回だけ
+  見えるべきである。`UNIQUE (system_id, content_digest)` により、reflux の再実行も
+  増分実行も caller が publish 済みを管理せずに冪等になる。
+- **currency は write 時ではなく read 時に評価する**(`current_entries`)。
+  後続 finding に訂正された fact と、source session の premise が `current`
+  でなくなった fact を除外する。どちらも publish 時点では知り得ない。除外された
+  entry は履歴として読めるまま残り、削除も書き換えもしない。
+
+consumer は `understanding_build` / `alignment_build` / `inquiry_answer` の 3 つで、
+いずれも prompt へ独立セクションとして渡す(`understanding-review-v7` /
+`alignment-v3` へ prompt version を更新)。**消費の記録は人間の確認とは別の事実**
+として `understanding_evidence_consumption` に持つ — 前者は「AI が rebuild に
+使った」、後者(`understanding_confirmed_at` / #312 の Capability confirmation)は
+「人間が結果を受け入れた」であり、同じ場所に書くと「AI が入力した」が
+「開発者が同意した」と読めてしまう。
+
+##### action と正式操作の対応
+
+`ACTION_FORMAL_OPERATIONS` が「どの action がどの既存の正式操作へ行くか」の
+決定的カタログ。`EXTERNAL_FORMAL_OPERATIONS`(`intent_correct` /
+`question_handoff_create` / `origin_item_answer`)はこの機能の**外の** endpoint が
+行う操作で、**action 行があることを完了と読んではいけない**もの。この区別は
+それまで機械可読な形を持っておらず、開発者が 「意図を修正する」 を選んでも
+`POST /interview/intent/{id}/correct` とは何も繋がっていなかった。
+
 ## システムインタビューの状態駆動ワークフロー UX(Issue #342)
 
 Issue #342(サブイシュー #343-#346)は、システムインタビュー画面を
