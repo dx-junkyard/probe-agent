@@ -952,3 +952,71 @@ def test_a_deleted_origin_is_missing_for_every_origin_kind(admin_client):
 
     assert _premise(admin_client, headers, review_ju) == ("missing", "origin_removed")
     assert _premise(admin_client, headers, inquiry_ju) == ("missing", "origin_removed")
+
+
+# --- Migration ------------------------------------------------------------------
+
+
+def test_init_db_brings_a_pre_migration_database_forward(tmp_path, monkeypatch):
+    """The new tables and columns are additive and idempotent.
+
+    `init_db` runs `executescript(SCHEMA)` on every start, so a database created
+    before these tables existed gains them without a data migration -- and
+    running it again is a no-op rather than an error.
+    """
+    monkeypatch.setenv("PROBE_DB_PATH", str(tmp_path / "probe-migration-test.db"))
+    from app.db import get_conn, init_db
+
+    init_db()
+    added_tables = [
+        "joint_understanding_hypothesis_adoption",
+        "joint_understanding_exploration_source",
+        "understanding_evidence_feed",
+        "understanding_evidence_consumption",
+    ]
+    with get_conn() as conn:
+        for table in added_tables:
+            assert conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone() is not None, table
+        # Simulate the pre-migration shape.
+        for table in added_tables:
+            conn.execute(f"DROP TABLE {table}")
+
+    init_db()
+    with get_conn() as conn:
+        for table in added_tables:
+            assert conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone() is not None, table
+        # Every additively migrated column is present and nullable.
+        session_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(joint_understanding_session)")
+        }
+        for column in (
+            "premise_commit_sha", "premise_revision_id", "premise_content_hash",
+            "premise_capability_digest", "premise_intent_digest",
+            "premise_review_subject_id", "premise_tracking_version",
+            "premise_captured_at", "outcome_premise_reason",
+            "closed_by_actor_kind", "closed_by_user_id", "closed_by_username",
+        ):
+            assert column in session_cols, column
+        finding_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(joint_understanding_finding)")
+        }
+        for column in ("producer_kind", "actor_kind", "actor_user_id", "actor_username"):
+            assert column in finding_cols, column
+        round_cols = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(joint_understanding_investigation_round)"
+            )
+        }
+        assert "failure_class" in round_cols
+
+    # A third run is still a no-op.
+    init_db()
