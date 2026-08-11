@@ -5721,7 +5721,7 @@ Interview page 群(状態ごとに 1 つの作業面、未到達操作が描か�
 ### Vision は Purpose と別の主張として持つ
 
 `system_understanding_reviewer` の出力に `vision` セクションを追加した
-(`PROMPT_VERSION='understanding-review-v6'` / `SCHEMA_VERSION=
+(`PROMPT_VERSION='understanding-review-v7'` / `SCHEMA_VERSION=
 'understanding-review-v2'`)。Vision(誰の状態をどう変えたいか)と
 System Purpose(その Vision に対してこのシステムが担う役割)を 1 つの
 セクションに畳むと、#351 が解消対象とした「開発者の意図と実装上の責務が

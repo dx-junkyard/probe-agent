@@ -709,7 +709,7 @@ creating incomplete persistence or execution paths for later phases.
     change must preserve:
     - **Vision is a claim of its own**, not a flavour of System Purpose.
       `system_understanding_reviewer` gained a `vision` section
-      (`understanding-review-v6` / schema `understanding-review-v2`), capped
+      (`understanding-review-v7` / schema `understanding-review-v2`), capped
       at one item. It is deliberately NOT in `_EVIDENCE_REQUIRED_SECTIONS`;
       instead an evidence-less Vision is deterministically clamped to
       `uncertain`, so it can only ever render as a hypothesis. The prompt
