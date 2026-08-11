@@ -62,8 +62,12 @@ function detail(overrides: Partial<JointUnderstandingDetailOut> = {}): JointUnde
       id: 7, session_id: 3, system_id: 1, origin_kind: "qa", origin_id: 5,
       trigger: "unknown_answer", question_text: "リトライ回数の根拠が分かりません",
       status: "open", outcome: null, outcome_is_provisional: false, outcome_reason: null,
-      outcome_finding_ids: [], outcome_premise_state: null, premise_state: "fresh",
-      premise_snapshot_id: 2, schema_version: "joint-understanding-v1",
+      outcome_finding_ids: [], outcome_premise_state: null,
+      outcome_premise_reason: null, closed_by_actor_kind: null,
+      closed_by_username: null, premise_state: "current", premise_reason: null,
+      premise_snapshot_id: 2, premise_commit_sha: "abc123",
+      premise_revision_id: 4, premise_tracking_version: "joint-premise-v1",
+      premise_captured_at: 1, schema_version: "joint-understanding-v1",
       created_at: 1, updated_at: 1, closed_at: null,
     },
     findings: [
@@ -75,7 +79,9 @@ function detail(overrides: Partial<JointUnderstandingDetailOut> = {}): JointUnde
         runtime_evidence: [], supports_finding_ids: [], competing_explanations: [],
         refutation_conditions: [], next_investigation: null, uncertainty: "",
         supersedes_finding_id: null, decision_method: "reasoning_llm",
-        intelligence_run_id: 4, is_mock: false, created_at: 1,
+        intelligence_run_id: 4, is_mock: false,
+        producer_kind: "investigation_loop", actor_kind: "system",
+        actor_username: null, created_at: 1,
       },
     ],
     actions: [],
@@ -116,6 +122,7 @@ function detail(overrides: Partial<JointUnderstandingDetailOut> = {}): JointUnde
       },
     ],
     reflux: [],
+    hypothesis_adoptions: [],
     available_actions: [
       "request_investigation", "explain_reasoning", "compare_options",
       "adopt_hypothesis", "revise_intent", "hold", "handoff", "decide",
@@ -201,7 +208,7 @@ test("暫定採用は確定と視覚的に区別される", async () => {
       session: {
         ...detail().session, status: "closed", outcome: "hypothesis_adopted",
         outcome_is_provisional: true, outcome_finding_ids: [11],
-        outcome_premise_state: "fresh", closed_at: 9,
+        outcome_premise_state: "current", closed_at: 9,
       },
       available_actions: [],
     }),
@@ -222,7 +229,7 @@ test("正式な判断は暫定と異なる見た目になる", async () => {
       session: {
         ...detail().session, status: "closed", outcome: "decided",
         outcome_is_provisional: false, outcome_finding_ids: [11],
-        outcome_premise_state: "fresh", closed_at: 9,
+        outcome_premise_state: "current", closed_at: 9,
       },
       available_actions: [],
     }),
@@ -235,13 +242,81 @@ test("正式な判断は暫定と異なる見た目になる", async () => {
   expect(badge.className).toContain("emerald");
 });
 
-test("前提が古いときは警告し、理由層を先出しする", async () => {
+test("判断の内容が空のままでは対話を終えられない(Issue #337)", async () => {
+  // close は「この会話の判断記録」なので、outcome ラベルだけでは監査できない。
+  // サーバも必須にしているが、ここで止めれば 422 を読み解かせずに済む。
+  mockApi.get.mockResolvedValue(detail());
+  await renderPanel({ sessionId: 3, juId: 7 });
+
+  const { toast } = await import("sonner");
+  await screen.findByTestId("ju-action-menu");
+  fireEvent.click(screen.getByTestId("ju-close-understood"));
+  await waitFor(() => {
+    expect(toast.error).toHaveBeenCalledWith("判断の内容を記入してください");
+  });
+  expect(mockApi.post).not.toHaveBeenCalledWith(
+    "/joint-understanding/7/close", expect.anything(),
+  );
+
+  fireEvent.change(screen.getByTestId("ju-judgement"), {
+    target: { value: "現状維持でよい" },
+  });
+  mockApi.post.mockResolvedValue({ ...detail().session, status: "closed" });
+  fireEvent.click(screen.getByTestId("ju-close-understood"));
+  await waitFor(() => {
+    expect(mockApi.post).toHaveBeenCalledWith("/joint-understanding/7/close", {
+      outcome: "understood",
+      outcome_finding_ids: [],
+      outcome_reason: "現状維持でよい",
+    });
+  });
+});
+
+test("暫定採用できる調査仮説が無いときは操作を出さない(Issue #337)", async () => {
+  // サーバは fact / 開発者の直感 / 訂正済み仮説をいずれも basis として拒否する。
+  // 押せてしまうと 422 しか返らないので、押せる条件を UI 側で揃える。
+  mockApi.get.mockResolvedValue(detail());
+  const first = await renderPanel({ sessionId: 3, juId: 7 });
+
+  const adopt = await screen.findByTestId("ju-action-adopt_hypothesis");
+  expect(adopt).toBeDisabled();
+  first.unmount();
+
+  const withHypothesis = detail();
+  withHypothesis.findings = [
+    ...withHypothesis.findings,
+    {
+      ...withHypothesis.findings[0],
+      id: 21, claim_kind: "hypothesis",
+      statement: "打ち切りは設定由来と思われる",
+      competing_explanations: ["定数かもしれない"],
+      refutation_conditions: ["設定値が3以外なら誤り"],
+      next_investigation: "設定の読み出し箇所を読む",
+    },
+  ];
+  mockApi.get.mockResolvedValue(withHypothesis);
+  const second = await renderPanel({ sessionId: 3, juId: 8 });
+  await waitFor(() => {
+    expect(screen.getByTestId("ju-action-adopt_hypothesis")).not.toBeDisabled();
+  });
+  second.unmount();
+});
+
+test("前提が現在と一致しないときは理由付きで警告し、理由層を先出しする", async () => {
   mockApi.get.mockResolvedValue(
-    detail({ session: { ...detail().session, premise_state: "stale" } }),
+    detail({
+      session: {
+        ...detail().session,
+        premise_state: "stale",
+        premise_reason: "pinned_commit_changed",
+      },
+    }),
   );
   await renderPanel({ sessionId: 3, juId: 7 });
 
-  expect(await screen.findByTestId("ju-premise-stale")).toBeInTheDocument();
+  const notice = await screen.findByTestId("ju-premise-not-current");
+  expect(notice).toBeInTheDocument();
+  expect(notice.textContent).toContain("調査したコミットから変わりました");
   // 例外があるときは「理由を見る」を押さなくても第2層を表示する。
   expect(screen.getByTestId("ju-layer-reasons")).toBeInTheDocument();
   expect(screen.getByTestId("ju-decision-question")).toBeInTheDocument();

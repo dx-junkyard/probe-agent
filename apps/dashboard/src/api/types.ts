@@ -4281,7 +4281,44 @@ export type JointUnderstandingStatementLayer =
   | "gap"
   | "consistency"
   | "decision";
-export type JointUnderstandingPremiseState = "fresh" | "stale";
+// Issue #337: the finite premise verdict, evaluated from the shared Issue #308
+// premise bundle rather than from the pinned snapshot id alone. Only "current"
+// permits hypothesis_adopted / decided / reflux. "missing" (a premise that was
+// captured and has since disappeared) and "invalid" (no comparable bundle was
+// ever captured) both used to report as "fresh".
+export type JointUnderstandingPremiseState =
+  | "current"
+  | "stale"
+  | "missing"
+  | "invalid";
+// The same set plus the pre-#337 value, for a verdict READ BACK from a session
+// closed before this contract existed. Never produced anew.
+export type JointUnderstandingRecordedPremiseState =
+  | JointUnderstandingPremiseState
+  | "fresh";
+export type JointUnderstandingPremiseReason =
+  | "premise_not_captured"
+  | "premise_incomplete"
+  | "pinned_snapshot_removed"
+  | "origin_removed"
+  | "origin_superseded"
+  | "pinned_commit_changed"
+  | "origin_content_changed"
+  | "capability_scope_changed"
+  | "linked_intent_changed";
+// Issue #337: WHICH code path produced a finding, as distinct from whose voice
+// it speaks in (origin_role). "legacy" is read-only.
+export type JointUnderstandingProducerKind =
+  | "investigation_loop"
+  | "translator"
+  | "developer_api"
+  | "legacy";
+// Issue #337: whether an authenticated human stands behind the row.
+export type JointUnderstandingActorKind = "user" | "system" | "legacy";
+export type JointUnderstandingAdoptionState =
+  | "provisional"
+  | "reconfirmation_required"
+  | "basis_withdrawn";
 export type JointUnderstandingStopReason =
   | "answered"
   | "budget_exhausted"
@@ -4320,6 +4357,9 @@ export interface JointUnderstandingFindingOut {
   decision_method: string;
   intelligence_run_id: number | null;
   is_mock: boolean;
+  producer_kind: JointUnderstandingProducerKind;
+  actor_kind: JointUnderstandingActorKind;
+  actor_username: string | null;
   created_at: number;
 }
 
@@ -4328,10 +4368,30 @@ export interface JointUnderstandingActionOut {
   joint_understanding_id: number;
   system_id: number;
   action_kind: JointUnderstandingActionKind;
+  // Display label only; actor_kind/actor_username are the authenticated
+  // identity the server resolved from the request's Principal (Issue #337).
   actor: string | null;
+  actor_kind: JointUnderstandingActorKind;
+  actor_username: string | null;
   note: string | null;
   decision_method: "manual";
   created_at: number;
+}
+
+export interface JointUnderstandingAdoptionOut {
+  id: number;
+  joint_understanding_id: number;
+  system_id: number;
+  finding_id: number;
+  state: JointUnderstandingAdoptionState;
+  adopted_by_actor_kind: JointUnderstandingActorKind;
+  adopted_by_username: string | null;
+  adoption_reason: string;
+  premise_snapshot_id: number | null;
+  premise_commit_sha: string | null;
+  premise_revision_id: number | null;
+  decision_method: "manual";
+  adopted_at: number;
 }
 
 export interface JointUnderstandingRoundOut {
@@ -4422,9 +4482,17 @@ export interface JointUnderstandingOut {
   outcome_is_provisional: boolean;
   outcome_reason: string | null;
   outcome_finding_ids: number[];
-  outcome_premise_state: JointUnderstandingPremiseState | null;
+  outcome_premise_state: JointUnderstandingRecordedPremiseState | null;
+  outcome_premise_reason: JointUnderstandingPremiseReason | null;
+  closed_by_actor_kind: JointUnderstandingActorKind | null;
+  closed_by_username: string | null;
   premise_state: JointUnderstandingPremiseState;
+  premise_reason: JointUnderstandingPremiseReason | null;
   premise_snapshot_id: number | null;
+  premise_commit_sha: string | null;
+  premise_revision_id: number | null;
+  premise_tracking_version: string | null;
+  premise_captured_at: number | null;
   schema_version: string;
   created_at: number;
   updated_at: number;
@@ -4438,6 +4506,7 @@ export interface JointUnderstandingDetailOut {
   investigation_rounds: JointUnderstandingRoundOut[];
   translations: JointUnderstandingTranslationOut[];
   reflux: JointUnderstandingRefluxOut[];
+  hypothesis_adoptions: JointUnderstandingAdoptionOut[];
   available_actions: JointUnderstandingActionKind[];
 }
 
@@ -4459,6 +4528,34 @@ export interface JointUnderstandingInvestigateOut {
 export interface JointUnderstandingTranslateOut {
   translation: JointUnderstandingTranslationOut;
   action_menu: JointUnderstandingActionMenuEntryOut[];
+}
+
+// Issue #336: the single 「わからない」 entry point. The internal route names
+// (system_researchable / hybrid / human_only) deliberately do not appear in
+// `next_step` -- an internal classification name is not a developer-facing
+// label, so the page maps these four values to its own copy.
+export type JointUnderstandingUnknownNextStep =
+  | "joint_investigation_started"
+  | "joint_understanding_opened"
+  | "developer_answer_required"
+  | "routing_unavailable";
+export type JointUnderstandingRouteCategory =
+  | "human_only"
+  | "system_researchable"
+  | "hybrid";
+
+export interface InterviewQaUnknownOut {
+  session_id: number;
+  system_id: number;
+  // Committed before routing runs, so it is present on every outcome
+  // including the failure ones.
+  qa: InterviewQaOut;
+  route_category: JointUnderstandingRouteCategory | null;
+  knowledge_area: KnowledgeArea | null;
+  joint_understanding_id: number | null;
+  next_step: JointUnderstandingUnknownNextStep;
+  investigation_stop_reason: JointUnderstandingStopReason | null;
+  error: string | null;
 }
 
 export interface JointUnderstandingRefluxResultOut {

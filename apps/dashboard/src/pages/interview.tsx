@@ -27,6 +27,7 @@ import {
   useRebaseInterviewSnapshot,
   useRepositoryStatus,
   useRejectInterviewProposal,
+  useAnswerQaUnknown,
   useCreateJointUnderstanding,
   useJointUnderstandingList,
   useResumeInterviewInquiry,
@@ -574,11 +575,15 @@ function QaInvestigationBlock({
 // 一覧・編集・スキップできる。回答の修正は新しいリビジョン行として保存され、
 // 旧回答も previous として残る(上書きしない)。
 function QaItemCard({
-  qa, sessionId, existingInquiry, onAnswer, onSkip, onResume, answering, skipping, resuming,
-  outOfArea, investigate,
+  qa, sessionId, actor, existingInquiry, onAnswer, onSkip, onResume, answering,
+  skipping, resuming, outOfArea, investigate,
 }: {
   qa: InterviewQaOut;
   sessionId: number;
+  // Issue #336: the 「わからない」 entry point is called from this card, so it
+  // needs the actor label the other answer paths already carry. The recorded
+  // IDENTITY is still the server's authenticated Principal, never this string.
+  actor: string;
   // Issue #285 refresh/resume: an already-active (open/held) Inquiry for
   // this question, rediscovered via the list endpoint so a page reload
   // never forgets an in-progress Inquiry.
@@ -608,7 +613,6 @@ function QaItemCard({
   // Issue #295 §4.8: true only while THIS card's 「わからない」 auto-
   // investigation is in flight (derived from the shared controller, not
   // local state) -- drives the short status line.
-  const investigatingUnknown = investigate.investigatingQaId === qa.id;
   const resumeInquiry = useResumeInterviewInquiry(sessionId);
 
   // Epic #328: 「わからない」の続きとして、AI と一緒に状況を確かめる共同理解
@@ -616,6 +620,13 @@ function QaItemCard({
   // 見たあとの追加手段であり、開いても元の質問には一切回答しない。
   const jointList = useJointUnderstandingList(sessionId);
   const createJoint = useCreateJointUnderstanding(sessionId);
+  const answerUnknown = useAnswerQaUnknown(sessionId);
+  // Issue #336: 「わからない」 is one server call that records, classifies, and
+  // (where the code can help) investigates. The in-flight indicator therefore
+  // follows THAT call, not the old separate route-and-investigate controller.
+  const investigatingUnknown =
+    answerUnknown.isPending || investigate.investigatingQaId === qa.id;
+
   const [jointId, setJointId] = useState<number | null>(null);
   const activeJoint = (jointList.data?.items ?? []).find(
     item => item.origin_kind === "qa" && item.origin_id === qa.id && item.status !== "closed",
@@ -631,7 +642,11 @@ function QaItemCard({
       {
         origin_kind: "qa",
         origin_id: qa.id,
-        trigger: qa.answer_unknown ? "unknown_answer" : "explicit_request",
+        // Issue #336: only the 「わからない」 entry point may record
+        // 'unknown_answer'. Opening the conversation from a button is an
+        // explicit request, and claiming otherwise would make the audit
+        // distinction between the two paths meaningless.
+        trigger: "explicit_request",
         question_text: qa.question_text,
       },
       {
@@ -701,25 +716,49 @@ function QaItemCard({
     setEditing(false);
   };
 
-  // Issue #295 §4.8 / PR #296 review fix (Finding 4): 「わからない」を選ん
-  // だら、まず共有の自動調査コントローラ(useQaAutoInvestigate、「AIに先に
-  // 調査させる」ボタンと同じ基盤)に、この質問だけ(qa_ids=[qa.id])を対象
-  // にした調査を依頼する。投稿された結果が qa.investigation に反映されれば
-  // (下の qa.investigation ブロックが自動で結論を表示する)、#142 の仮説生
-  // 成フローには入らず既存の確認導線(回答する/わからない/疑問がある)に戻
-  // すだけにする。調査が使えない(失敗・対象外・バッチの上限で処理されな
-  // かった)場合は、ユーザーが回答する機会を失わないよう、必ず従来の #142
-  // フローにフォールバックする。
+  // Issue #336: 「わからない」は 1 回の呼び出しになった。サーバが
+  //   1. 「わからない」を先に記録し(以降が失敗しても回答・訂正・引き継ぎの
+  //      機会は失われない)、
+  //   2. Question Router で分類し、
+  //   3. コードで確かめられる分類のときだけ共同理解セッションを開いて調査する
+  // という順序を保証する。以前はここが「route-and-investigate を呼び、失敗
+  // したら #142 の回答フローへ落とす」という無関係な 2 呼び出しで、実際の
+  // 「わからない」から共同理解が始まることは無かった。
+  //
+  // 内部の分類名(system_researchable / hybrid / human_only)は表示しない。
+  // 開発者に見せるのは「調査中/調査の限界/実行失敗/人の判断待ち」の区別。
   const submitUnknown = async () => {
-    if (investigate.isPending) return;
-    const investigated = await investigate.runForQuestion(qa.id);
-    if (investigated) {
-      // AIの調査結果 (qa.investigation) は qa 一覧の再取得で表示される。
-      // 元の回答は一切送信せず、既存の確認導線に戻すだけ。
+    if (answerUnknown.isPending) return;
+    try {
+      const result = await answerUnknown.mutateAsync({
+        qaId: qa.id,
+        answerText: draft.trim(),
+        actor,
+      });
       setEditing(false);
-      return;
+      if (result.joint_understanding_id) {
+        setJointId(result.joint_understanding_id);
+      }
+      if (result.next_step === "routing_unavailable") {
+        toast.info(
+          "「わからない」を記録しました。いまは自動調査を始められないので、"
+          + "回答の修正や引き継ぎはこのまま続けられます",
+        );
+      } else if (result.next_step === "developer_answer_required") {
+        toast.info(
+          "「わからない」を記録しました。これはコードからは確かめられない"
+          + "判断なので、あなたの回答か引き継ぎが必要です",
+        );
+      } else if (result.next_step === "joint_understanding_opened") {
+        toast.info(
+          result.error
+            ? `「わからない」を記録しました。調査は完了できませんでした(${result.error})。もう一度試せます`
+            : "「わからない」を記録し、一緒に確かめる対話を開きました",
+        );
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "「わからない」を記録できませんでした");
     }
-    await fallBackToUnknownFlow();
   };
 
   return (
@@ -887,7 +926,7 @@ function QaItemCard({
                     size="sm"
                     variant="outline"
                     onClick={submitUnknown}
-                    disabled={answering || investigate.isPending}
+                    disabled={answering || answerUnknown.isPending || investigate.isPending}
                     data-testid={`qa-answer-unknown-${qa.id}`}
                   >
                     わからない
@@ -1138,6 +1177,7 @@ export function QaPanel({
               key={qa.id}
               qa={qa}
               sessionId={sessionId}
+              actor={actor}
               existingInquiry={activeInquiries.get(`qa:${qa.id}`)}
               onAnswer={handleAnswer}
               onSkip={qaId => skip.mutate({ qaId, actor }, {
@@ -1165,6 +1205,7 @@ export function QaPanel({
                   key={qa.id}
                   qa={qa}
                   sessionId={sessionId}
+                  actor={actor}
                   existingInquiry={activeInquiries.get(`qa:${qa.id}`)}
                   onAnswer={handleAnswer}
                   onSkip={qaId => skip.mutate({ qaId, actor }, {

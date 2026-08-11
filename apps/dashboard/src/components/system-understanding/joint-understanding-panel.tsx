@@ -26,9 +26,11 @@ import {
 } from "@/api/hooks";
 import type {
   JointUnderstandingActionKind,
+  JointUnderstandingAdoptionState,
   JointUnderstandingClaimKind,
   JointUnderstandingFindingOut,
   JointUnderstandingOutcome,
+  JointUnderstandingPremiseReason,
   JointUnderstandingStatementLayer,
   JointUnderstandingStopReason,
   JointUnderstandingTranslationOut,
@@ -79,6 +81,30 @@ const OUTCOME_LABELS: Record<JointUnderstandingOutcome, string> = {
   decided: "正式に判断した",
   handed_off: "引き継いだ",
   abandoned: "中断した",
+};
+
+// Issue #337: one message per finite premise reason, split by recovery path.
+// 「スナップショットが変わった」だけでは、前提そのものが消えた場合(再調査でも
+// 戻せない)と、そもそも比較できる前提を記録していなかった場合を説明できない。
+const PREMISE_REASON_LABELS: Record<JointUnderstandingPremiseReason, string> = {
+  premise_not_captured:
+    "この対話は前提の記録が始まる前に開かれたため、前提を照合できません。新しく開き直してください",
+  premise_incomplete:
+    "前提を比較できる情報が揃っていません(pin されたスナップショットがありません)。新しく開き直してください",
+  pinned_snapshot_removed:
+    "調査対象だったスナップショットが失われました。現在の状態に対して開き直してください",
+  origin_removed: "元の確認項目が削除されました。現在の状態に対して開き直してください",
+  origin_superseded: "元の確認項目が作り直されました。再調査が必要です",
+  pinned_commit_changed: "調査したコミットから変わりました。再調査が必要です",
+  origin_content_changed: "元の確認項目の内容が変わりました。再調査が必要です",
+  capability_scope_changed: "確定済みの Capability の範囲が変わりました。再調査が必要です",
+  linked_intent_changed: "紐づく意図が変わりました。再調査が必要です",
+};
+
+const ADOPTION_STATE_LABELS: Record<JointUnderstandingAdoptionState, string> = {
+  provisional: "暫定採用中(事実ではありません)",
+  reconfirmation_required: "前提が変わりました。再確認が必要です",
+  basis_withdrawn: "根拠にした仮説が調査側で訂正されました",
 };
 
 const FIRST_LAYERS: JointUnderstandingStatementLayer[] = ["purpose", "impact"];
@@ -172,6 +198,8 @@ export function JointUnderstandingPanel({
   const [showEvidence, setShowEvidence] = useState(false);
   const [showAudit, setShowAudit] = useState(false);
   const [menu, setMenu] = useState<{ action_kind: JointUnderstandingActionKind; label: string; what_changes: string }[]>([]);
+  // Issue #337: the developer's stated judgement, required on every close.
+  const [judgement, setJudgement] = useState("");
 
   if (detail.isLoading) {
     return <p className="text-xs text-muted-foreground">共同理解セッションを読み込んでいます…</p>;
@@ -180,7 +208,15 @@ export function JointUnderstandingPanel({
     return <p className="text-xs text-muted-foreground">共同理解セッションを表示できません。</p>;
   }
 
-  const { session, findings, investigation_rounds: rounds, translations, reflux: refluxed, available_actions } = detail.data;
+  const {
+    session,
+    findings,
+    investigation_rounds: rounds,
+    translations,
+    reflux: refluxed,
+    hypothesis_adoptions: adoptions,
+    available_actions,
+  } = detail.data;
   const latest: JointUnderstandingTranslationOut | undefined = translations[translations.length - 1];
   const findingById = new Map(findings.map(f => [f.id, f]));
   const investigationFindings = findings.filter(f => f.origin_role === "investigation");
@@ -189,8 +225,11 @@ export function JointUnderstandingPanel({
   const firstLayer = (latest?.statements ?? []).filter(s => FIRST_LAYERS.includes(s.layer));
   const secondLayer = (latest?.statements ?? []).filter(s => SECOND_LAYERS.includes(s.layer));
   // 例外の先出し: 前提が古い / 矛盾 / 未解決点があるときは第2層を初期表示する。
+  // Issue #337: any verdict other than 'current' means the ground moved,
+  // disappeared, or was never comparable -- all three block adoption/decision.
+  const premiseBlocked = session.premise_state !== "current";
   const hasException =
-    session.premise_state === "stale" ||
+    premiseBlocked ||
     (latest?.open_unknowns.length ?? 0) > 0 ||
     findings.some(f => f.claim_kind === "conflict");
 
@@ -212,21 +251,49 @@ export function JointUnderstandingPanel({
     }
   };
 
+  // Issue #337: an adoption may only rest on a CURRENT INVESTIGATION hypothesis
+  // -- one the investigation has not itself corrected, that is not mock output,
+  // and that carries a verified run plus evidence. A developer's own hunch and a
+  // superseded hypothesis are both refused by the server, so offering them here
+  // would only produce a 422 the developer cannot act on.
+  const supersededIds = new Set(
+    findings
+      .map(f => f.supersedes_finding_id)
+      .filter((id): id is number => id !== null),
+  );
+  const isCurrentBasis = (f: JointUnderstandingFindingOut) =>
+    !supersededIds.has(f.id) && !f.is_mock;
+  const adoptableHypotheses = findings.filter(
+    f =>
+      isCurrentBasis(f) &&
+      f.origin_role === "investigation" &&
+      f.claim_kind === "hypothesis" &&
+      f.intelligence_run_id !== null &&
+      (f.evidence.length > 0 || f.runtime_evidence.length > 0),
+  );
+
   const closeWith = async (
     outcome: JointUnderstandingOutcome,
     actionKind?: JointUnderstandingActionKind,
   ) => {
     const basis =
       outcome === "hypothesis_adopted"
-        ? findings.filter(f => f.claim_kind === "hypothesis").map(f => f.id)
+        ? adoptableHypotheses.map(f => f.id)
         : outcome === "decided"
-          ? findings.map(f => f.id)
+          ? findings.filter(isCurrentBasis).map(f => f.id)
           : [];
+    const reason = judgement.trim();
+    if (!reason) {
+      // The server requires it; saying so here beats a 422 the developer has to
+      // decode. A close is the manual decision record of this conversation.
+      toast.error("判断の内容を記入してください");
+      return;
+    }
     try {
       if (actionKind) {
         await recordAction.mutateAsync({ juId, actionKind });
       }
-      await close.mutateAsync({ juId, outcome, outcomeFindingIds: basis });
+      await close.mutateAsync({ juId, outcome, outcomeFindingIds: basis, reason });
       onClosed?.();
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "この状態では確定できません");
@@ -242,9 +309,14 @@ export function JointUnderstandingPanel({
             「わからない」から開始
           </span>
         )}
-        {session.premise_state === "stale" && (
-          <span className="rounded bg-amber-500/20 px-1 text-[10px] text-amber-800" data-testid="ju-premise-stale">
-            前提のスナップショットが変わりました。再調査が必要です
+        {premiseBlocked && (
+          <span
+            className="rounded bg-amber-500/20 px-1 text-[10px] text-amber-800"
+            data-testid="ju-premise-not-current"
+          >
+            {session.premise_reason
+              ? PREMISE_REASON_LABELS[session.premise_reason]
+              : "前提が現在の状態と一致していません。再調査が必要です"}
           </span>
         )}
         {session.outcome && (
@@ -367,6 +439,16 @@ export function JointUnderstandingPanel({
               </div>
             ))
           )}
+          {adoptions.length > 0 && (
+            <ul className="space-y-1" data-testid="ju-adoptions">
+              {adoptions.map(adoption => (
+                <li key={adoption.id}>
+                  暫定採用した仮説 #{adoption.finding_id}: {ADOPTION_STATE_LABELS[adoption.state]}
+                  {adoption.adopted_by_username ? `(${adoption.adopted_by_username})` : ""}
+                </li>
+              ))}
+            </ul>
+          )}
           {refluxed.length > 0 && (
             <p data-testid="ju-reflux-summary">
               システムが確認した事実 {refluxed.length} 件を、回答としてではなく理解へ反映済みです
@@ -404,6 +486,19 @@ export function JointUnderstandingPanel({
       {isOpen && (
         <div className="space-y-2" data-testid="ju-action-menu">
           <p className="text-xs font-medium">次にどうしますか</p>
+          <label className="block space-y-1">
+            <span className="text-xs text-muted-foreground">
+              判断の内容(この対話を終える操作すべてで必須)
+            </span>
+            <textarea
+              className="w-full rounded border border-muted-foreground/30 bg-background p-2 text-xs"
+              rows={2}
+              value={judgement}
+              onChange={event => setJudgement(event.target.value)}
+              placeholder="何をどう判断したかを書いてください"
+              data-testid="ju-judgement"
+            />
+          </label>
           <div className="flex flex-wrap gap-2">
             {available_actions.map(actionKind => {
               const entry = menu.find(m => m.action_kind === actionKind);
@@ -412,8 +507,16 @@ export function JointUnderstandingPanel({
                   key={actionKind}
                   size="sm"
                   variant="outline"
-                  title={entry?.what_changes}
-                  disabled={investigate.isPending || translate.isPending}
+                  title={
+                    actionKind === "adopt_hypothesis" && adoptableHypotheses.length === 0
+                      ? "暫定採用できる調査仮説がまだありません。先に調査してください"
+                      : entry?.what_changes
+                  }
+                  disabled={
+                    investigate.isPending ||
+                    translate.isPending ||
+                    (actionKind === "adopt_hypothesis" && adoptableHypotheses.length === 0)
+                  }
                   onClick={() => {
                     if (actionKind === "adopt_hypothesis") {
                       void closeWith("hypothesis_adopted", actionKind);

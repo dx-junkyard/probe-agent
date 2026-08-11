@@ -974,6 +974,33 @@ export function useRouteAndInvestigateQa(sessionId: number | null) {
   });
 }
 
+// Issue #336: the single 「わからない」 entry point. One call records the
+// unknown answer, classifies the question, and -- only for the classifications
+// where the code can actually help -- opens a joint understanding session and
+// investigates. It replaces the two unrelated calls the page used to make
+// (route-and-investigate, then the #142 answer flow as a fallback), and the
+// server guarantees the recorded answer survives any later failure.
+export function useAnswerQaUnknown(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ qaId, answerText, actor }: {
+      qaId: number;
+      answerText: string;
+      actor: string;
+    }) =>
+      api.post<import("@/api/types").InterviewQaUnknownOut>(
+        `/interview/sessions/${sessionId}/qa/${qaId}/unknown`,
+        { answer_text: answerText, actor },
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewQa"), sessionId] });
+      qc.invalidateQueries({ queryKey: [...sysKey("interviewSession"), sessionId] });
+      qc.invalidateQueries({ queryKey: [...sysKey("jointUnderstandingList"), sessionId] });
+      _invalidateWorkflow(qc, sessionId);
+    },
+  });
+}
+
 // Issue #295 §4.8 / PR #296 review fix (Finding 4): a single shared
 // auto-investigation controller so the 「わからない」 auto-investigate
 // wiring is implemented once and reused verbatim by both the normal Q&A list
@@ -3157,18 +3184,21 @@ export function useRefluxJointUnderstanding(sessionId: number | null) {
 export function useCloseJointUnderstanding(sessionId: number | null) {
   const qc = useQueryClient();
   return useMutation({
+    // Issue #337: `reason` is the developer's stated judgement and is REQUIRED
+    // by the server -- a close is the manual decision record of the
+    // conversation, and an outcome label with no text is not auditable.
     mutationFn: ({ juId, outcome, outcomeFindingIds, reason }: {
       juId: number;
       outcome: import("@/api/types").JointUnderstandingOutcome;
       outcomeFindingIds?: number[];
-      reason?: string;
+      reason: string;
     }) =>
       api.post<import("@/api/types").JointUnderstandingOut>(
         `/joint-understanding/${juId}/close`,
         {
           outcome,
           outcome_finding_ids: outcomeFindingIds ?? [],
-          outcome_reason: reason ?? null,
+          outcome_reason: reason,
         },
       ),
     onSuccess: (_result, { juId }) => _invalidateJointUnderstanding(qc, sessionId, juId),
