@@ -589,7 +589,9 @@ function QaItemCard({
   // this question, rediscovered via the list endpoint so a page reload
   // never forgets an in-progress Inquiry.
   existingInquiry?: InterviewInquiryOut;
-  onAnswer: (qaId: number, answerText: string, answerUnknown?: boolean) => Promise<void>;
+  // 確定回答の保存だけ。「わからない」は #336 の専用入口(submitUnknown)が
+  // 扱うので、この経路は answer_unknown を送らない。
+  onAnswer: (qaId: number, answerText: string) => Promise<void>;
   onSkip: (qaId: number) => void;
   onResume: (qaId: number) => void;
   answering: boolean;
@@ -708,13 +710,6 @@ function QaItemCard({
   const submit = async () => {
     if (!draft.trim()) return;
     await onAnswer(qa.id, draft.trim());
-    setEditing(false);
-  };
-
-  // Issue #142: 「わからない」を有効な入力として記録する。エラーにはせず、
-  // status=unconfirmed として保存し、以後の推論で仮説→再確認に回す。
-  const fallBackToUnknownFlow = async () => {
-    await onAnswer(qa.id, draft.trim(), true);
     setEditing(false);
   };
 
@@ -1071,14 +1066,14 @@ export function QaPanel({
     }
   };
 
-  const handleAnswer = async (qaId: number, answerText: string, answerUnknown?: boolean) => {
+  // Q&A カードの確定回答。「わからない」はここを通らない: Issue #336 の
+  // 専用入口が「先に記録 → 分類 → 必要なときだけ調査」の順序を保証する。
+  const handleAnswer = async (qaId: number, answerText: string) => {
     try {
       const result = await answer.mutateAsync({
-        qaId, answer_text: answerText, actor, answer_unknown: answerUnknown,
+        qaId, answer_text: answerText, actor,
       });
-      if (answerUnknown) {
-        toast.info("「わからない」として記録しました。仮説を立てて確認質問を続けます。");
-      } else if (result.regeneration_recommended) {
+      if (result.regeneration_recommended) {
         toast.warning("回答が変わったため、生成済みの提案の再生成を検討してください(自動では再生成されません)。");
       } else {
         toast.success("回答を保存しました");
