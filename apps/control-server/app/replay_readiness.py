@@ -32,6 +32,7 @@ __all__ = [
     "NOT_CAPTURED",
     "ReplayCounts",
     "ReplayReadinessCheck",
+    "ReplayTraceReadiness",
     "ReplayReadiness",
     "count_replayability",
     "evaluate_readiness",
@@ -87,6 +88,13 @@ class ReplayReadinessCheck:
     remediation: str
 
 
+@dataclass(frozen=True)
+class ReplayTraceReadiness:
+    trace_id: str
+    replayability: str
+    primary_reason: Optional[str] = None
+
+
 @dataclass
 class ReplayReadiness:
     component_id: str
@@ -97,6 +105,8 @@ class ReplayReadiness:
     selection_is_automatic: bool = True
     verdict: str = "blocked"  # ready | attention | blocked
     checks: List[ReplayReadinessCheck] = field(default_factory=list)
+    snapshot_id: Optional[int] = None
+    traces: List[ReplayTraceReadiness] = field(default_factory=list)
 
     @property
     def blocked(self) -> bool:
@@ -192,18 +202,22 @@ def evaluate_readiness(
             f"（完全復元 {selected.replayable}件 / 一部マスク {selected.partial}件）。"
         )
         status = "ok"
-        if selected.partial and selected.replayable == 0:
+        excluded = selected.unreplayable + selected.not_captured
+        if selected.partial or excluded:
             # Every usable input is masked somewhere; the comparison is real
             # but its denominator is not the full input.
             status = "attention"
-            detail += " すべて一部マスクされた入力なので、比較は元の呼び出しの部分再現になります。"
+            if selected.partial:
+                detail += f" 一部マスクされた入力が{selected.partial}件あり、比較は部分再現を含みます。"
+            if excluded:
+                detail += f" Replay不能な{excluded}件は評価母数から除外されます。"
         checks.append(
             ReplayReadinessCheck(
                 "replayable_traces", status,
                 f"Replay可能: {selected.usable}件 / {selected.total}件",
                 detail,
                 "" if status == "ok"
-                else "完全な比較には replay_capture の redact 設定を見直してください。",
+                else "除外・マスク理由を確認し、必要なら別のTraceを選ぶかreplay_capture設定を見直してください。",
             )
         )
 

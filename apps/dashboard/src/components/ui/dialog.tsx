@@ -25,6 +25,8 @@ function Dialog({ open, onOpenChange, children }: {
     >
       <div className="relative w-full max-w-lg max-h-[85vh] overflow-auto rounded-xl border bg-background p-6 shadow-lg animate-in fade-in-0 zoom-in-95">
         <button
+          type="button"
+          aria-label="ダイアログを閉じる"
           className="absolute right-4 top-4 rounded-sm opacity-70 ring-offset-background transition-opacity hover:opacity-100 cursor-pointer"
           onClick={() => onOpenChange(false)}
         >

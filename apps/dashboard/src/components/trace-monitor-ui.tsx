@@ -17,10 +17,27 @@ import {
 export function TraceSummaryCard({
   summary,
   now,
+  isLoading = false,
+  isError = false,
+  onRetry,
 }: {
   summary: TraceSummaryOut | undefined;
   now: number;
+  isLoading?: boolean;
+  isError?: boolean;
+  onRetry?: () => void;
 }) {
+  if (isLoading && !summary) {
+    return <div className="grid grid-cols-3 gap-2 sm:grid-cols-6" aria-busy="true">{[1,2,3,4,5,6].map(i => <div key={i} className="h-14 animate-pulse rounded-md bg-muted" />)}</div>;
+  }
+  if (isError && !summary) {
+    return (
+      <div className="flex items-center justify-between rounded-md border border-destructive/40 p-3 text-xs" role="alert">
+        <span>Trace要約を取得できませんでした。</span>
+        {onRetry && <button type="button" className="underline" onClick={onRetry}>再試行</button>}
+      </div>
+    );
+  }
   if (!summary) return null;
   const tiles: Array<[string, string, string?]> = [
     ["件数", String(summary.total)],

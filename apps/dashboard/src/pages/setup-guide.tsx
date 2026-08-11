@@ -31,6 +31,41 @@ const PATTERN_LABELS: Record<RuntimePattern, string> = {
   external: "別リポジトリ / 外部エンドポイント",
 };
 
+const PATTERN_CHECKLISTS: Record<RuntimePattern, string[]> = {
+  host: [
+    "対象アプリの環境へprobe-agent SDKを導入した",
+    "PROBE_SERVER_URLをホストから到達できるURLへ設定した",
+    "必要な場合は有効なAPI tokenをPROBE_API_KEYへ設定した",
+    "@probeを付けたアプリを再起動した",
+    "同じホストから/healthを確認した",
+    "smoke traceと実workload traceの両方を確認した",
+  ],
+  compose: [
+    "対象serviceへprobe-agent SDKを導入した",
+    "PROBE_SERVER_URLをhttp://control-server:8000へ設定した",
+    "API tokenを.envまたはsecretから対象serviceへ渡した",
+    "control-serverと対象serviceを同じnetworkで起動した",
+    "対象container内から/healthを確認した",
+    "smoke traceと実workload traceの両方を確認した",
+  ],
+  image: [
+    "Docker imageへprobe-agent SDKを追加して再buildした",
+    "実行時にPROBE_SERVER_URLを渡した",
+    "API tokenをimageへ焼き込まず実行時secretとして渡した",
+    "更新したimageで対象アプリを起動した",
+    "container内から/healthを確認した",
+    "smoke traceと実workload traceの両方を確認した",
+  ],
+  external: [
+    "外部環境へprobe-agent SDKを導入した",
+    "対象環境から到達できるHTTPSのPROBE_SERVER_URLを設定した",
+    "有効なAPI tokenをsecret管理からPROBE_API_KEYへ渡した",
+    "firewall・proxy・DNSでControl Serverへの通信を許可した",
+    "対象環境から/healthを確認した",
+    "smoke traceと実workload traceの両方を確認した",
+  ],
+};
+
 // 全体の流れ(Issue #165 の 9 項目を一続きの導線として提示する)。
 const FLOW_STEPS: Array<{ title: string; detail: string }> = [
   {
@@ -82,9 +117,38 @@ const FLOW_STEPS: Array<{ title: string; detail: string }> = [
  * with the developer's situation, so it leads.
  */
 function NextStepCard() {
-  const { data: connectivity } = useConnectivityStatus(15_000);
-  const { data: tokens } = useMyTokens();
+  const connectivityQuery = useConnectivityStatus(15_000);
+  const tokensQuery = useMyTokens();
+  const { data: connectivity } = connectivityQuery;
+  const { data: tokens } = tokensQuery;
   const { systemId } = useAuth();
+  const loading = connectivityQuery.isLoading || tokensQuery.isLoading;
+  const failed = connectivityQuery.isError || tokensQuery.isError;
+
+  if (loading) {
+    return (
+      <Card data-testid="setup-next-step-loading" aria-busy="true">
+        <CardHeader className="pb-3"><CardTitle className="text-sm">いまやること</CardTitle></CardHeader>
+        <CardContent className="space-y-2">
+          <div className="h-4 w-2/3 animate-pulse rounded bg-muted" />
+          <div className="h-4 w-4/5 animate-pulse rounded bg-muted" />
+          <div className="h-3 w-1/2 animate-pulse rounded bg-muted" />
+        </CardContent>
+      </Card>
+    );
+  }
+
+  if (failed) {
+    return (
+      <Card data-testid="setup-next-step-error" role="alert">
+        <CardHeader className="pb-3"><CardTitle className="text-sm">現在の状態を確認できません</CardTitle></CardHeader>
+        <CardContent className="space-y-3 text-sm">
+          <p className="text-muted-foreground">接続状態またはtoken一覧の取得に失敗したため、次の操作を安全に判定できません。</p>
+          <Button size="sm" variant="outline" onClick={() => { connectivityQuery.refetch(); tokensQuery.refetch(); }}>再試行</Button>
+        </CardContent>
+      </Card>
+    );
+  }
   const step = resolveSetupStep(connectivity, tokens, systemId ?? null);
 
   return (
@@ -110,7 +174,7 @@ function NextStepCard() {
 }
 
 function ConnectivityStatusCard() {
-  const { data, isFetching, refetch } = useConnectivityStatus(15_000);
+  const { data, isLoading, isError, error, isFetching, refetch } = useConnectivityStatus(15_000);
 
   return (
     <Card data-testid="connectivity-status-card">
@@ -131,8 +195,17 @@ function ConnectivityStatusCard() {
         </div>
       </CardHeader>
       <CardContent className="space-y-3">
-        {!data ? (
-          <p className="text-sm text-muted-foreground">読み込み中...</p>
+        {isLoading ? (
+          <div className="space-y-2" aria-busy="true">
+            <div className="h-5 w-48 animate-pulse rounded bg-muted" />
+            <div className="h-16 w-full animate-pulse rounded bg-muted" />
+          </div>
+        ) : isError || !data ? (
+          <div className="space-y-2" role="alert">
+            <p className="text-sm font-medium">接続ステータスを取得できませんでした。</p>
+            <p className="text-xs text-muted-foreground">{String(error ?? "応答がありません。")}</p>
+            <Button size="sm" variant="outline" onClick={() => refetch()}>再試行</Button>
+          </div>
         ) : (
           <>
             {/* Issue #370: the headline is the LIVE reading (freshness).
@@ -191,6 +264,41 @@ function ConnectivityStatusCard() {
         )}
       </CardContent>
     </Card>
+  );
+}
+
+function RuntimeChecklist({ pattern }: { pattern: RuntimePattern }) {
+  const [checked, setChecked] = useState<Record<string, boolean>>({});
+  const items = PATTERN_CHECKLISTS[pattern];
+  const complete = items.filter(item => checked[`${pattern}:${item}`]).length;
+  return (
+    <div className="mt-4 rounded-md border p-3" data-testid={`runtime-checklist-${pattern}`}>
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <p className="text-sm font-medium">{PATTERN_LABELS[pattern]}の完了チェック</p>
+        <Badge variant={complete === items.length ? "success" : "secondary"}>{complete} / {items.length}</Badge>
+      </div>
+      <ul className="space-y-2">
+        {items.map(item => {
+          const key = `${pattern}:${item}`;
+          return (
+            <li key={item}>
+              <label className="flex cursor-pointer items-start gap-2 text-xs">
+                <input
+                  type="checkbox"
+                  checked={!!checked[key]}
+                  onChange={event => setChecked(current => ({ ...current, [key]: event.target.checked }))}
+                  className="mt-0.5"
+                />
+                <span>{item}</span>
+              </label>
+            </li>
+          );
+        })}
+      </ul>
+      <p className="mt-2 text-xs text-muted-foreground">
+        完了条件: smoke traceだけでなく、実workload traceが直近の期間別件数へ反映されること。
+      </p>
+    </div>
   );
 }
 
@@ -441,6 +549,7 @@ curl -sS "$PROBE_SERVER_URL/health"   # => {"ok":true}`}</CodeBlock>
               </p>
             </TabsContent>
           </Tabs>
+          <RuntimeChecklist pattern={pattern} />
         </CardContent>
       </Card>
 

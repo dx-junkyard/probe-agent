@@ -66,9 +66,9 @@ export default function SimulationWorkbenchPage() {
       : null;
   const selectSet = (id: number) => setSearchParams({ replay_set_id: String(id) });
 
-  const { data: sets } = useReplaySets();
+  const { data: sets, isLoading: setsLoading, isError: setsError, refetch: refetchSets } = useReplaySets();
   const { data: snapshotPreflight } = useSnapshotPreflight();
-  const { data: replaySet, isLoading: setLoading } = useReplaySet(selectedSetId);
+  const { data: replaySet, isLoading: setLoading, isError: setError, error: replaySetError, refetch: refetchSet } = useReplaySet(selectedSetId);
   const componentId = replaySet?.component_id ?? null;
 
   const { data: approvalState } = useReplayApproval(componentId);
@@ -233,18 +233,33 @@ export default function SimulationWorkbenchPage() {
                 </option>
               ))}
             </Select>
+            {setsLoading && <p className="mt-1 text-xs text-muted-foreground">Replay Setを読み込んでいます…</p>}
+            {setsError && (
+              <Button className="mt-1" size="sm" variant="outline" onClick={() => refetchSets()}>
+                Replay Set一覧を再試行
+              </Button>
+            )}
           </div>
         </div>
       </div>
 
       {!selectedSetId ? (
         <Card>
-          <CardContent className="py-8 text-center text-sm text-muted-foreground">
-            上でReplay Setを選択するか、Components タブのTraceで「Replay」を使ってください。
+          <CardContent className="space-y-3 py-8 text-center text-sm text-muted-foreground">
+            <p>上でReplay Setを選択するか、ComponentsのTraceから作成してください。</p>
+            <Button variant="outline" onClick={() => navigate("/components")}>ComponentsでTraceを選ぶ</Button>
           </CardContent>
         </Card>
-      ) : setLoading || !replaySet ? (
+      ) : setLoading ? (
         <Skeleton className="h-64 w-full" />
+      ) : setError || !replaySet ? (
+        <Card role="alert">
+          <CardContent className="space-y-3 py-8 text-center">
+            <p className="text-sm font-medium">Replay Setを読み込めませんでした。</p>
+            <p className="text-xs text-muted-foreground">{String(replaySetError ?? "対象のReplay Setが存在しない可能性があります。")}</p>
+            <Button size="sm" variant="outline" onClick={() => refetchSet()}>再試行</Button>
+          </CardContent>
+        </Card>
       ) : (
         <div className="space-y-6">
           {componentId && <ApprovalPanel componentId={componentId} />}
@@ -259,7 +274,12 @@ export default function SimulationWorkbenchPage() {
                 </CardHeader>
                 <CardContent className="space-y-2 max-h-96 overflow-y-auto">
                   {replaySet.traces.length === 0 ? (
-                    <p className="text-sm text-muted-foreground">このSetにTraceはありません。</p>
+                    <div className="space-y-2 text-sm text-muted-foreground">
+                      <p>このSetにTraceはありません。評価対象のTraceを追加してください。</p>
+                      <Button size="sm" variant="outline" onClick={() => navigate(`/components?component=${encodeURIComponent(replaySet.component_id)}`)}>
+                        ComponentsでTraceを追加
+                      </Button>
+                    </div>
                   ) : (
                     replaySet.traces.map((t) => (
                       <TraceRow

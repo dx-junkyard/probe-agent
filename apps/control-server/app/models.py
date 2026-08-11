@@ -676,8 +676,15 @@ class ReplayReadinessCheckOut(BaseModel):
     remediation: str
 
 
+class ReplayTraceReadinessOut(BaseModel):
+    trace_id: str
+    replayability: Literal["replayable", "partial", "unreplayable", "not_captured"]
+    primary_reason: Optional[str] = None
+
+
 class ReplayReadinessOut(BaseModel):
     component_id: str
+    snapshot_id: Optional[int] = None
     #: Every trace of the component.
     counts: ReplayReadinessCountsOut
     #: Only the traces a run would actually use (the auto-selected window, or
@@ -687,6 +694,7 @@ class ReplayReadinessOut(BaseModel):
     selection_is_automatic: bool
     verdict: ReplayReadinessVerdict
     checks: List[ReplayReadinessCheckOut] = Field(default_factory=list)
+    traces: List[ReplayTraceReadinessOut] = Field(default_factory=list)
 
 
 class StaleSnapshotAck(BaseModel):
@@ -5873,6 +5881,7 @@ class ReplaySetOut(BaseModel):
 class ReplayRunCreate(BaseModel):
     replay_set_id: int
     snapshot_id: Optional[int] = None
+    stale_snapshot_reason: Optional[str] = Field(None, min_length=1, max_length=1000)
 
 
 class ReplayCaseResultOut(BaseModel):
@@ -5914,6 +5923,9 @@ class ReplayRunOut(BaseModel):
     created_at: float
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
+    snapshot_freshness: Optional[SnapshotFreshnessState] = None
+    head_sha_at_creation: Optional[str] = None
+    stale_ack_reason: Optional[str] = None
 
 
 # --- Replay variants (Issue #242 Phase C / #245) -----------------------------

@@ -470,6 +470,13 @@ export interface TraceSummaryOut {
   duration_max_ms: number | null;
 }
 
+export interface TracePageOut {
+  items: TraceEvent[];
+  total: number;
+  offset: number;
+  limit: number;
+}
+
 // Issue #372: Replay readiness, evaluated before a candidate is generated.
 export type ReplayReadinessStatus = "ok" | "attention" | "blocking";
 export type ReplayReadinessVerdict = "ready" | "attention" | "blocked";
@@ -493,14 +500,22 @@ export interface ReplayReadinessCheckOut {
   remediation: string;
 }
 
+export interface ReplayTraceReadinessOut {
+  trace_id: string;
+  replayability: "replayable" | "partial" | "unreplayable" | "not_captured";
+  primary_reason: string | null;
+}
+
 export interface ReplayReadinessOut {
   component_id: string;
+  snapshot_id?: number | null;
   counts: ReplayReadinessCountsOut;
   selected: ReplayReadinessCountsOut;
   selection_limit: number;
   selection_is_automatic: boolean;
   verdict: ReplayReadinessVerdict;
   checks: ReplayReadinessCheckOut[];
+  traces?: ReplayTraceReadinessOut[];
 }
 
 // Repository refresh-hub status (Issue #158)

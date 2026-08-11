@@ -377,6 +377,56 @@ def test_trace_summary_is_system_scoped(client, db_path):
     assert client.get("/components/summarizer/trace-summary").json()["total"] == 2
 
 
+def test_trace_page_filters_and_sorts_the_complete_component_set(client):
+    now = time.time()
+    for index in range(75):
+        client.post(
+            "/traces",
+            json=_trace(
+                f"page-{index:03d}",
+                mode="shadow" if index % 2 else "trace",
+                duration_ms=float(index),
+                error="Boom" if index in {3, 61} else None,
+                replayability="replayable" if index % 3 == 0 else None,
+                replay_reasons=[] if index % 3 == 0 else None,
+                input_capture={"args": [], "kwargs": {}} if index % 3 == 0 else None,
+                timestamp=now - index,
+            ),
+        )
+
+    first = client.get(
+        "/components/summarizer/trace-page?status=error&sort=slowest&limit=1"
+    ).json()
+    assert first["total"] == 2
+    assert first["items"][0]["trace_id"] == "page-061"
+    second = client.get(
+        "/components/summarizer/trace-page?status=error&sort=slowest&limit=1&offset=1"
+    ).json()
+    assert second["items"][0]["trace_id"] == "page-003"
+
+    shadow = client.get(
+        "/components/summarizer/trace-page?mode=shadow&limit=50"
+    ).json()
+    assert shadow["total"] == 37
+    assert all(item["mode"] == "shadow" for item in shadow["items"])
+
+    replayable = client.get(
+        "/components/summarizer/trace-page?replay=replayable&limit=100"
+    ).json()
+    assert replayable["total"] == 25
+    assert len(replayable["items"]) == 25
+
+
+def test_trace_page_query_treats_sql_wildcards_as_literals(client):
+    client.post("/traces", json=_trace("literal%underscore_name"))
+    client.post("/traces", json=_trace("literal-other"))
+    body = client.get(
+        "/components/summarizer/trace-page?query=%25underscore_&limit=50"
+    ).json()
+    assert body["total"] == 1
+    assert body["items"][0]["trace_id"] == "literal%underscore_name"
+
+
 # --- projections and shadow results (review P0-1 / P0-2) ---------------------
 #
 # The first pass redacted only the four `traces` columns. Projections and

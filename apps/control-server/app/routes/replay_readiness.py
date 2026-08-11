@@ -8,6 +8,7 @@ Read-only and deterministic: it counts persisted classifications, it does not
 attempt to reconstruct an uncaptured input (an explicit non-goal of #372).
 """
 
+import json
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, Query
@@ -18,12 +19,15 @@ from ..models import (
     ReplayReadinessCheckOut,
     ReplayReadinessCountsOut,
     ReplayReadinessOut,
+    ReplayTraceReadinessOut,
 )
 from ..replay_readiness import (
     ReplayCounts,
     ReplayReadiness,
     count_replayability,
     evaluate_readiness,
+    primary_reason,
+    ReplayTraceReadiness,
 )
 from .replay import MAX_REPLAY_SET_SIZE
 
@@ -44,6 +48,7 @@ def _counts_out(counts: ReplayCounts) -> ReplayReadinessCountsOut:
 def to_out(readiness: ReplayReadiness) -> ReplayReadinessOut:
     return ReplayReadinessOut(
         component_id=readiness.component_id,
+        snapshot_id=readiness.snapshot_id,
         counts=_counts_out(readiness.counts),
         selected=_counts_out(readiness.selected),
         selection_limit=readiness.selection_limit,
@@ -59,6 +64,14 @@ def to_out(readiness: ReplayReadiness) -> ReplayReadinessOut:
             )
             for c in readiness.checks
         ],
+        traces=[
+            ReplayTraceReadinessOut(
+                trace_id=trace.trace_id,
+                replayability=trace.replayability,
+                primary_reason=trace.primary_reason,
+            )
+            for trace in readiness.traces
+        ],
     )
 
 
@@ -66,6 +79,7 @@ def gather_readiness(
     system_id: int,
     component_id: str,
     trace_ids: Optional[List[str]] = None,
+    snapshot_id: Optional[int] = None,
 ) -> ReplayReadiness:
     """Read the facts and evaluate them.
 
@@ -75,33 +89,40 @@ def gather_readiness(
     """
     with get_conn() as conn:
         all_rows = conn.execute(
-            """SELECT replayability FROM traces
+            """SELECT trace_id, replayability, replay_reasons_json FROM traces
                WHERE system_id = ? AND component_id = ?""",
             (system_id, component_id),
         ).fetchall()
         if trace_ids:
             placeholders = ",".join("?" for _ in trace_ids)
             selected_rows = conn.execute(
-                f"""SELECT replayability FROM traces
+                f"""SELECT trace_id, replayability, replay_reasons_json FROM traces
                     WHERE system_id = ? AND component_id = ?
                       AND trace_id IN ({placeholders})""",
                 (system_id, component_id, *trace_ids),
             ).fetchall()
         else:
             selected_rows = conn.execute(
-                """SELECT replayability FROM traces
+                """SELECT trace_id, replayability, replay_reasons_json FROM traces
                    WHERE system_id = ? AND component_id = ?
                    ORDER BY timestamp DESC, trace_id
                    LIMIT ?""",
                 (system_id, component_id, MAX_REPLAY_SET_SIZE),
             ).fetchall()
 
-        snapshot = conn.execute(
-            """SELECT id FROM repository_snapshots
-               WHERE system_id = ? AND status = 'ready'
-               ORDER BY id DESC LIMIT 1""",
-            (system_id,),
-        ).fetchone()
+        if snapshot_id is None:
+            snapshot = conn.execute(
+                """SELECT id FROM repository_snapshots
+                   WHERE system_id = ? AND status = 'ready'
+                   ORDER BY id DESC LIMIT 1""",
+                (system_id,),
+            ).fetchone()
+        else:
+            snapshot = conn.execute(
+                """SELECT id FROM repository_snapshots
+                   WHERE system_id = ? AND id = ? AND status = 'ready'""",
+                (system_id, snapshot_id),
+            ).fetchone()
         symbol_resolved = False
         if snapshot is not None:
             symbol = conn.execute(
@@ -121,7 +142,7 @@ def gather_readiness(
             (system_id,),
         ).fetchone()
 
-    return evaluate_readiness(
+    readiness = evaluate_readiness(
         component_id=component_id,
         counts=count_replayability(all_rows),
         selected=count_replayability(selected_rows),
@@ -139,11 +160,25 @@ def gather_readiness(
             else "リポジトリが設定されていないため、隔離 worktree を作成できません。"
         ),
     )
+    readiness.snapshot_id = snapshot["id"] if snapshot is not None else snapshot_id
+    readiness.traces = [
+        ReplayTraceReadiness(
+            trace_id=row["trace_id"],
+            replayability=row["replayability"] or "not_captured",
+            primary_reason=primary_reason(
+                json.loads(row["replay_reasons_json"])
+                if row["replay_reasons_json"] else None
+            ),
+        )
+        for row in selected_rows
+    ]
+    return readiness
 
 
 @router.get("/replay-readiness", response_model=ReplayReadinessOut)
 def get_replay_readiness(
     component_id: str,
+    snapshot_id: Optional[int] = None,
     trace_ids: Optional[List[str]] = Query(
         None,
         description=(
@@ -153,4 +188,4 @@ def get_replay_readiness(
     ),
     system_id: int = Depends(get_system_id),
 ) -> ReplayReadinessOut:
-    return to_out(gather_readiness(system_id, component_id, trace_ids))
+    return to_out(gather_readiness(system_id, component_id, trace_ids, snapshot_id))

@@ -110,7 +110,7 @@ def _replay_readiness_error(readiness) -> HTTPException:
 
 
 def _require_replay_readiness(
-    system_id: int, component_id: str, replay_set_id: Optional[int]
+    system_id: int, component_id: str, replay_set_id: Optional[int], snapshot_id: Optional[int]
 ) -> None:
     """Refuse to spend a reasoning-model call on an unevaluable candidate.
 
@@ -131,7 +131,7 @@ def _require_replay_readiness(
         if row is not None:
             trace_ids = _json_list(row["trace_ids_json"])
 
-    readiness = gather_readiness(system_id, component_id, trace_ids or None)
+    readiness = gather_readiness(system_id, component_id, trace_ids or None, snapshot_id)
     if readiness.selected.usable == 0:
         raise _replay_readiness_error(readiness)
 
@@ -363,7 +363,7 @@ def create_candidate_session(
     if evaluation_trace_ids is None:
         evaluation_trace_ids = trace_ids
     readiness = gather_readiness(
-        system_id, payload.component_id, evaluation_trace_ids or None
+        system_id, payload.component_id, evaluation_trace_ids or None, snapshot_id
     )
     if readiness.selected.usable == 0:
         raise _replay_readiness_error(readiness)
@@ -670,7 +670,7 @@ def generate_candidate_version(
     # deleted, reclassified, or redacted, and approval or the sandbox can go
     # away, between the two -- and the cost this gate exists to protect is
     # spent on the very next line.
-    _require_replay_readiness(system_id, component_id, session_replay_set_id)
+    _require_replay_readiness(system_id, component_id, session_replay_set_id, snapshot_id)
 
     # Reasoning attempt (outside the DB lock). Fail closed on any config/call/
     # parse/scope/size failure -- no heuristic fallback (Principle 6).

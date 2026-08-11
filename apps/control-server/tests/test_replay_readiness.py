@@ -118,6 +118,18 @@ def test_only_partial_captures_states_the_comparison_limit():
     assert "部分再現" in check.detail
 
 
+def test_mixed_replayable_and_excluded_traces_requires_attention():
+    readiness = evaluate_readiness(
+        **_ready_kwargs(
+            counts=ReplayCounts(total=3, replayable=1, unreplayable=1, not_captured=1),
+            selected=ReplayCounts(total=3, replayable=1, unreplayable=1, not_captured=1),
+        )
+    )
+    assert readiness.verdict == "attention"
+    check = next(c for c in readiness.checks if c.check_id == "replayable_traces")
+    assert "2件は評価母数から除外" in check.detail
+
+
 def test_the_auto_selection_window_is_disclosed_when_it_truncates():
     readiness = evaluate_readiness(
         **_ready_kwargs(
@@ -248,4 +260,3 @@ def test_a_component_with_no_traces_reports_zero_not_an_error(client):
     body = client.get("/replay-readiness?component_id=nothing-here").json()
     assert body["counts"]["total"] == 0
     assert body["verdict"] == "blocked"
-

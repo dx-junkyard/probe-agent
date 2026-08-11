@@ -1,7 +1,7 @@
-import { Fragment, useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import {
-  useComponents, useTraces, useTraceSummary, useUpdatePolicy,
+  useComponents, useTracePage, useTraceSummary, useUpdatePolicy,
   useComponentProfile, useUpdateComponentProfile,
   useShadowResults, useUpdateEvaluation,
   useCriteria,
@@ -23,7 +23,7 @@ import { RedactionBadge, TracePayloadPanel } from "@/components/trace-payload-pa
 import { ImprovementLoopRail } from "@/components/improvement-loop/rail";
 import { TraceSummaryCard, TraceFilterBar } from "@/components/trace-monitor-ui";
 import {
-  DEFAULT_FILTERS, filterTraces, filtersFromSearch, filtersToSearch,
+  DEFAULT_FILTERS, filtersFromSearch, filtersToSearch,
   formatDuration, formatRelative,
 } from "@/components/trace-monitor";
 
@@ -44,7 +44,7 @@ const PROFILE_FIELD_LABELS_JA: Record<string, string> = {
 export default function ComponentsPage() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
-  const { data: components, isLoading } = useComponents(SIGNAL_REFRESH_INTERVAL_MS);
+  const { data: components, isLoading, isError: componentsError, error: componentError, refetch: refetchComponents } = useComponents(SIGNAL_REFRESH_INTERVAL_MS);
   // Deep link from Trace Lineage / analyzer results: /components?component=<id>
   const [selected, setSelected] = useState<string | null>(
     searchParams.get("component"),
@@ -55,8 +55,19 @@ export default function ComponentsPage() {
   // link reproduces the same view. Unrelated params (component, trace) are
   // preserved, keeping the Trace Lineage / analyzer deep links working.
   const filters = filtersFromSearch(searchParams);
-  const setFilters = (next: typeof filters) =>
-    setSearchParams(filtersToSearch(next, searchParams), { replace: true });
+  const pageValue = Number(searchParams.get("page") ?? "1");
+  const page = Number.isInteger(pageValue) && pageValue > 0 ? pageValue : 1;
+  const setFilters = (next: typeof filters) => {
+    const params = filtersToSearch(next, searchParams);
+    params.delete("page");
+    setSearchParams(params, { replace: true });
+  };
+  const setPage = (nextPage: number) => {
+    const params = new URLSearchParams(searchParams);
+    if (nextPage <= 1) params.delete("page");
+    else params.set("page", String(nextPage));
+    setSearchParams(params, { replace: true });
+  };
   // A single clock for the whole render, so relative times inside one table
   // are consistent with each other and with the window filter.
   const [now, setNow] = useState(() => Date.now());
@@ -65,11 +76,21 @@ export default function ComponentsPage() {
     return () => clearInterval(id);
   }, []);
   const updatePolicy = useUpdatePolicy();
-  const { data: traces } = useTraces(
+  const tracePageQuery = useTracePage(
     selected,
-    requestedTraceId ? 500 : 20,
-    SIGNAL_REFRESH_INTERVAL_MS,
+    {
+      ...filters,
+      query: filters.query || requestedTraceId || "",
+      offset: (page - 1) * 50,
+      limit: 50,
+    },
+    // Keep an expanded row anchored while the developer reads it. New rows
+    // resume polling as soon as the detail is collapsed; the health summary
+    // continues updating independently.
+    expandedTraceId ? undefined : SIGNAL_REFRESH_INTERVAL_MS,
   );
+  const { data: tracePage, isLoading: tracesLoading, isError: tracesError, error: traceError, refetch: refetchTraces } = tracePageQuery;
+  const traces = tracePage?.items ?? [];
   const { data: profile } = useComponentProfile(selected);
   const updateProfile = useUpdateComponentProfile();
   const { data: shadows } = useShadowResults(selected, 20);
@@ -77,7 +98,8 @@ export default function ComponentsPage() {
   const { data: criteria } = useCriteria(selected);
   // Computed over ALL of the component's traces, not the loaded page --
   // a p95 from the most recent 20 rows would change on every poll.
-  const { data: traceSummary } = useTraceSummary(selected);
+  const traceSummaryQuery = useTraceSummary(selected, SIGNAL_REFRESH_INTERVAL_MS);
+  const { data: traceSummary, isLoading: summaryLoading, isError: summaryError, refetch: refetchSummary } = traceSummaryQuery;
 
   const current = components?.find(c => c.component_id === selected);
   // Issue #258: `components` rows are created (mode='trace' by default) via
@@ -90,10 +112,7 @@ export default function ComponentsPage() {
   // only a definitive trace_count === 0 blocks.
   const zeroTraces = current !== undefined && current.trace_count === 0;
 
-  const visibleTraces = useMemo(
-    () => filterTraces(traces ?? [], filters, now),
-    [traces, filters, now],
-  );
+  const visibleTraces = traces;
 
   const [profForm, setProfForm] = useState<Record<string, string>>({});
   const profileFields = ["purpose", "responsibility", "expected_input", "expected_output", "failure_impact"] as const;
@@ -127,8 +146,17 @@ export default function ComponentsPage() {
         <h2 className="px-2 py-1 text-xs font-semibold text-muted-foreground uppercase tracking-wider">Components</h2>
         {isLoading ? (
           <div className="space-y-2">{[1,2,3].map(i => <Skeleton key={i} className="h-10 w-full" />)}</div>
+        ) : componentsError ? (
+          <div className="space-y-2 px-2 py-4 text-xs" role="alert">
+            <p className="font-medium text-destructive">componentを取得できませんでした。</p>
+            <p className="text-muted-foreground break-words">{String(componentError)}</p>
+            <Button size="sm" variant="outline" onClick={() => refetchComponents()}>再試行</Button>
+          </div>
         ) : !components?.length ? (
-          <p className="text-xs text-muted-foreground px-2 py-4">componentがありません</p>
+          <div className="space-y-2 px-2 py-4 text-xs text-muted-foreground">
+            <p>componentがありません。</p>
+            <Button size="sm" variant="outline" onClick={() => navigate("/setup-guide")}>Setup Guideを開く</Button>
+          </div>
         ) : (
           components.map(c => (
             <button
@@ -230,21 +258,37 @@ export default function ComponentsPage() {
                 <Card>
                   <CardContent className="space-y-4 pt-6">
                     {/* Issue #373: health first, then the rows. */}
-                    <TraceSummaryCard summary={traceSummary} now={now} />
-                    {!!traces?.length && (
+                    <TraceSummaryCard
+                      summary={traceSummary}
+                      now={now}
+                      isLoading={summaryLoading}
+                      isError={summaryError}
+                      onRetry={() => refetchSummary()}
+                    />
+                    {(!!traceSummary?.total || !!tracePage?.total) && (
                       <TraceFilterBar
                         filters={filters}
                         onChange={setFilters}
-                        matched={visibleTraces.length}
-                        total={traces.length}
+                        matched={tracePage?.total ?? 0}
+                        total={traceSummary?.total ?? tracePage?.total ?? 0}
                       />
                     )}
-                    {!traces?.length ? (
+                    {tracesLoading ? (
+                      <div className="space-y-2 py-2" aria-busy="true">
+                        {[1,2,3,4].map(i => <Skeleton key={i} className="h-10 w-full" />)}
+                      </div>
+                    ) : tracesError ? (
+                      <div className="space-y-2 py-8 text-center" role="alert">
+                        <p className="text-sm font-medium">Trace一覧を取得できませんでした。</p>
+                        <p className="text-xs text-muted-foreground">{String(traceError)}</p>
+                        <Button size="sm" variant="outline" onClick={() => refetchTraces()}>再試行</Button>
+                      </div>
+                    ) : (traceSummary?.total ?? tracePage?.total ?? 0) === 0 ? (
                       <p className="text-sm text-muted-foreground text-center py-8">Traceがまだありません</p>
                     ) : !visibleTraces.length ? (
                       <div className="py-8 text-center" data-testid="trace-filter-empty">
                         <p className="text-sm text-muted-foreground">
-                          条件に一致するTraceがありません（全 {traces.length} 件）。
+                          条件に一致するTraceがありません（全 {traceSummary?.total ?? tracePage?.total ?? 0} 件）。
                         </p>
                         <button
                           type="button"
@@ -255,6 +299,7 @@ export default function ComponentsPage() {
                         </button>
                       </div>
                     ) : (
+                      <div className="space-y-3">
                       <div className="overflow-x-auto max-h-96 overflow-y-auto">
                         <table className="w-full text-sm">
                           <thead className="sticky top-0 bg-card">
@@ -347,6 +392,14 @@ export default function ComponentsPage() {
                             })}
                           </tbody>
                         </table>
+                      </div>
+                      <div className="flex items-center justify-between text-xs text-muted-foreground" data-testid="trace-pagination">
+                        <span>{tracePage!.offset + 1}〜{Math.min(tracePage!.offset + tracePage!.items.length, tracePage!.total)} / {tracePage!.total}件</span>
+                        <div className="flex gap-2">
+                          <Button size="sm" variant="outline" disabled={page <= 1} onClick={() => setPage(page - 1)}>前へ</Button>
+                          <Button size="sm" variant="outline" disabled={tracePage!.offset + tracePage!.limit >= tracePage!.total} onClick={() => setPage(page + 1)}>次へ</Button>
+                        </div>
+                      </div>
                       </div>
                     )}
                   </CardContent>

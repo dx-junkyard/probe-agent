@@ -1,9 +1,9 @@
 import json
 import math
 import time
-from typing import List, Optional
+from typing import List, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from probe_agent.replay_capture import PARTIAL, REASON_REDACTED, REPLAYABLE
 
@@ -848,29 +848,101 @@ def list_traces(
             (system_id, component_id, limit),
         ).fetchall()
 
-    result = []
-    for row in rows:
-        d = dict(row)
-        if d.get("input_json"):
-            try:
-                d["input"] = json.loads(d["input_json"])
-            except json.JSONDecodeError:
-                d["input"] = d["input_json"]
-        else:
-            d["input"] = None
-        d.pop("input_json", None)
-        d["output"] = d.pop("output_text", None)
-        # Replay capture (Issue #242 Phase A / #243): NULL columns (pre-Phase-A
-        # rows or components not opted in) surface as explicit nulls.
-        d["input_capture"] = _load_json_or_none(d.pop("input_capture_json", None))
-        d["replay_reasons"] = _load_json_or_none(d.pop("replay_reasons_json", None))
-        # Issue #367: the redaction audit summary, plus the deterministic
-        # payload shape facts the collapsed detail view shows *before* a
-        # reader expands anything (AC: type / count / size / redaction).
-        d["redaction"] = _load_json_or_none(d.pop("redaction_json", None))
-        d["payload_summary"] = _payload_summary(d["input"], d["output"], d["error"])
-        result.append(d)
-    return result
+    return [_trace_row_out(row) for row in rows]
+
+
+def _trace_row_out(row) -> dict:
+    d = dict(row)
+    if d.get("input_json"):
+        try:
+            d["input"] = json.loads(d["input_json"])
+        except json.JSONDecodeError:
+            d["input"] = d["input_json"]
+    else:
+        d["input"] = None
+    d.pop("input_json", None)
+    d["output"] = d.pop("output_text", None)
+    # Replay capture (Issue #242 Phase A / #243): NULL columns (pre-Phase-A
+    # rows or components not opted in) surface as explicit nulls.
+    d["input_capture"] = _load_json_or_none(d.pop("input_capture_json", None))
+    d["replay_reasons"] = _load_json_or_none(d.pop("replay_reasons_json", None))
+    # Issue #367: the redaction audit summary, plus the deterministic
+    # payload shape facts the collapsed detail view shows *before* a
+    # reader expands anything (AC: type / count / size / redaction).
+    d["redaction"] = _load_json_or_none(d.pop("redaction_json", None))
+    d["payload_summary"] = _payload_summary(d["input"], d["output"], d["error"])
+    return d
+
+
+@router.get("/components/{component_id}/trace-page")
+def list_trace_page(
+    component_id: str,
+    limit: int = 50,
+    offset: int = 0,
+    status: Literal["all", "ok", "error"] = "all",
+    mode: Literal["all", "off", "trace", "shadow"] = "all",
+    replay: Literal["all", "usable", "replayable", "not_captured"] = "all",
+    window: Literal["all", "5m", "1h", "24h", "7d"] = "all",
+    sort: Literal["recent", "slowest", "errors_first"] = "recent",
+    query: str = Query("", max_length=200),
+    system_id: int = Depends(get_system_id),
+) -> dict:
+    """Server-side monitoring filter/sort/page over the complete trace set.
+
+    The summary and the table now describe the same population.  The previous
+    client-only filter saw at most the newest 20 rows, so an older error or the
+    slowest call could not be found even while the summary counted it.
+    """
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+    clauses = ["system_id = ?", "component_id = ?"]
+    params: list = [system_id, component_id]
+    if status == "ok":
+        clauses.append("(error IS NULL OR error = '')")
+    elif status == "error":
+        clauses.append("error IS NOT NULL AND error != ''")
+    if mode != "all":
+        clauses.append("mode = ?")
+        params.append(mode)
+    if replay == "usable":
+        clauses.append("replayability IN ('replayable', 'partial')")
+    elif replay == "replayable":
+        clauses.append("replayability = 'replayable'")
+    elif replay == "not_captured":
+        clauses.append("replayability IS NULL")
+    window_seconds = {"5m": 300, "1h": 3600, "24h": 86400, "7d": 604800}
+    if window != "all":
+        clauses.append("timestamp >= ?")
+        params.append(time.time() - window_seconds[window])
+    if query:
+        clauses.append("trace_id LIKE ? ESCAPE '\\'")
+        escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        params.append(f"%{escaped}%")
+
+    where = " AND ".join(clauses)
+    order_by = {
+        "recent": "timestamp DESC, trace_id",
+        "slowest": "duration_ms DESC, timestamp DESC, trace_id",
+        "errors_first": "CASE WHEN error IS NOT NULL AND error != '' THEN 0 ELSE 1 END, timestamp DESC, trace_id",
+    }[sort]
+    with get_conn() as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) AS count FROM traces WHERE {where}", params
+        ).fetchone()["count"]
+        rows = conn.execute(
+            f"""SELECT trace_id, component_id, mode, input_json, output_text,
+                       error, duration_ms, timestamp, input_capture_json,
+                       replayability, replay_reasons_json, redaction_json
+                FROM traces WHERE {where}
+                ORDER BY {order_by} LIMIT ? OFFSET ?""",
+            (*params, limit, offset),
+        ).fetchall()
+    return {
+        "items": [_trace_row_out(row) for row in rows],
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+    }
 
 
 def _value_kind(value) -> str:

@@ -125,17 +125,18 @@ describe("resolveSetupStep", () => {
   });
 
   it("すべての段階が状態・操作・完了条件を持つ", () => {
-    const seen = new Set<string>();
-    for (const id of SETUP_STEPS) {
-      // done 以外は具体的な完了条件を書く。
-      const step = resolveSetupStep(
-        connectivity({ state: "receiving", freshness: "receiving_now" }),
-        [apiToken()],
-        1,
-      );
-      seen.add(step.id);
-      expect(id).toBeTruthy();
+    const steps = [
+      resolveSetupStep(connectivity(), [], 1),
+      resolveSetupStep(connectivity(), [apiToken()], 1),
+      resolveSetupStep(connectivity({ state: "smoke_only" }), [apiToken()], 1),
+      resolveSetupStep(connectivity({ state: "receiving", freshness: "receiving_now" }), [apiToken()], 1),
+      resolveSetupStep(connectivity({ state: "receiving", freshness: "stale" }), [apiToken()], 1),
+    ];
+    expect(steps.map(step => step.id).sort()).toEqual([...SETUP_STEPS].sort());
+    for (const step of steps) {
+      expect(step.state.trim()).not.toBe("");
+      expect(step.action.trim()).not.toBe("");
+      expect(step.completion.trim()).not.toBe("");
     }
-    expect(seen.size).toBeGreaterThan(0);
   });
 });

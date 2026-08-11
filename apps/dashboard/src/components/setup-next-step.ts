@@ -17,7 +17,6 @@ export const SETUP_STEPS = [
   "verify_transport",
   "run_workload",
   "restore_reception",
-  "done",
 ] as const;
 
 export type SetupStepId = (typeof SETUP_STEPS)[number];
@@ -62,12 +61,6 @@ const STEPS: Record<SetupStepId, SetupStep> = {
     state: "過去には受信していましたが、現在は届いていません",
     action: "health・認証・network・workload の順に確認する",
     completion: "直近の期間別件数が 0 でなくなる",
-  },
-  done: {
-    id: "done",
-    state: "受信中です",
-    action: "Components で trace を確認する",
-    completion: "—",
   },
 };
 
