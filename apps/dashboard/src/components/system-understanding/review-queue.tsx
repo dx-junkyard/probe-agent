@@ -77,6 +77,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Textarea } from "@/components/ui/textarea";
 import { InquiryPanel } from "@/components/system-understanding/inquiry-panel";
+import { JointUnderstandingEntry } from "@/components/system-understanding/joint-understanding-entry";
 import { InquiryPremiseNotice } from "@/components/system-understanding/inquiry-premise-notice";
 import { RefreshStatusChip } from "@/components/system-understanding/refresh-status-chip";
 import { HandoffModal } from "@/components/system-understanding/handoff-panel";
@@ -675,6 +676,15 @@ function ReviewQueueItemCard({
           >
             保留
           </Button>
+          {/* Issue #336: the same 共同理解 flow the Q&A card uses. Opening it
+              never answers, corrects, holds, or hands off the item — those stay
+              the buttons around it. */}
+          <JointUnderstandingEntry
+            sessionId={sessionId}
+            originKind="review_item"
+            originId={item.id}
+            questionText={`このズレをどう判断すべきか分かりません: ${item.current_claim}`}
+          />
           {!item.handoff_id && (
             <Button
               size="sm"
