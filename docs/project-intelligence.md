@@ -5317,6 +5317,62 @@ consumer は `understanding_build` / `alignment_build` / `inquiry_answer` の 3 
 それまで機械可読な形を持っておらず、開発者が 「意図を修正する」 を選んでも
 `POST /interview/intent/{id}/correct` とは何も繋がっていなかった。
 
+#### Phase 3: 探索拡張・Router 統合・hard budget(Issue #339)
+
+- **探索源が 1 つの問いしか答えられなかった。** 既存の 4 源(ファイル名 /
+  シンボル索引 / 入口索引 / 内容スキャン)はすべて「どのファイルがこれに
+  *言及* しているか」を答える。開発者が日常的に必要とする 3 つ —
+  **何がこれに依存しているか**(ここを変えると誰に影響するか)、
+  **誰がこれを呼ぶか**(振る舞いは上流で決まっている)、
+  **いつ・なぜ変わったか**(理由はコードではなく履歴にある)— は
+  原理的に到達できなかった。`app/snapshot_explorers.py` が
+  dependency / call_graph / git_history を追加し、runtime facts を
+  「選択済みファイルの注釈」から**候補発見**へ引き上げる。
+- **dependency は `code_symbols.imports` を使う**(#24 の indexer が AST から
+  抽出済み)。テキストスキャンではなく実際の索引を使うことが、これを「言及」
+  ではなく構造的関係にしている — docstring がモジュール名を書いているのは
+  依存ではない。
+- **git_history は 2 段階で呼ぶ。** `git log --name-only -- <pathspec>` は
+  表示するファイル一覧も pathspec で絞るので、1 回の呼び出しでは seed 自身しか
+  返らない — 目的である co-change ファイルが全部消える。よって
+  (1) seed を触ったコミットを探し、(2) `--no-walk` でそのコミット群の変更
+  ファイルを列挙する。`--no-walk` は指定コミットだけを列挙するので、pathspec の
+  制約が無くても pin されたコミットの履歴から出られない。
+- **構造探索は round 1 では走らせない。** これらは「これらのファイルの
+  *周辺*」を答えるので、keyword の当て推量を seed にすると「同じ推量に対する
+  2 つ目の推量」になり、さらに小さい per-round read budget では**開発者が
+  実際に聞いたファイルを読めなくなる**。よって seed は「earlier round が実際に
+  読んだファイル」のみで、fresh な round 1 は直接一致だけで答え、追加の
+  breadth は round 1 が生んだ lead を追う。再開実行は carry された read paths を
+  持つので、その最初の round から lead-driven に動く。候補順序も
+  「直接一致 → 構造探索」で固定する(`_round_candidates` の
+  `structural_paths` は最後)。
+- **`failed` が 2 つの正反対を 1 つにまとめていた。** research limitation
+  (システムは見たが確定できなかった)と execution failure(システムは見ることが
+  できなかった)は意味も帰結も逆である。前者は根拠付きの実結果で、
+  「X は判断できなかった」は一級の Finding。後者は結果の**不在**であり、
+  Finding を作ってはいけない(何も読んでいないのにシステムについて主張する
+  ことになる)— 監査イベントと復帰操作だけが残る。
+  `RESEARCH_LIMITATIONS` / `EXECUTION_FAILURE_CLASSES` / `OUTCOME_CLASSES` と
+  `failure_class` 列で有限に分ける。
+- **時間予算を LLM 呼び出し自体に適用する。** ラウンド間で時計を見るのは
+  ループ自身の帳簿を縛るだけで、実際に時間を使う往復は縛らない — 1 回の
+  hang で全予算を超過しても、ラウンド間チェックはすべて通る。
+  `LLMClient.generate_text(timeout=...)` を追加し、残り予算から per-call
+  deadline を導出する。残りが floor 未満なら呼ばずに停止する。
+- **Question Router を質問ゲートへ共通利用する**(`ask_developer`)。
+  `system_researchable` は**決して人へ渡さない** — router 自身の分類により
+  答えはコードの中にあるので、未回答なら調査が終わっていないという意味であり、
+  渡すのは「読む作業を開発者にさせる」ことになる。調査がまだ可能な間
+  (`research_exhausted=False`)は decision material が無ければ質問を保留する
+  (`hybrid` の契約)。`human_only` も material を要求する — 分類は「開発者が
+  決める」と言っているだけで「材料無しで決められる」とは言っていない。
+- **探索源ごとに revision / provenance / budget / 失敗を監査する**
+  (`joint_understanding_exploration_source`)。round 単位の合計では
+  「各源が pin された revision に留まったか」を答えられない。失敗した源は
+  記録してスキップし、round を失敗させず、**無制限の fallback 探索へ
+  置き換えない**。
+
 ## システムインタビューの状態駆動ワークフロー UX(Issue #342)
 
 Issue #342(サブイシュー #343-#346)は、システムインタビュー画面を

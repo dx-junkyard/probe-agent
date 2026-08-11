@@ -455,6 +455,56 @@ creating incomplete persistence or execution paths for later phases.
       intent, never completion — that distinction previously had no
       machine-readable form.
 
+    **#339 (implemented).** Exploration breadth, the router-aware question
+    gate, and budgets that actually bind:
+    - `app/snapshot_explorers.py` adds `dependency` / `call_graph` /
+      `git_history` and promotes runtime facts from annotation to DISCOVERY.
+      The four pre-existing sources all answer "which file MENTIONS this?", so
+      "what depends on this", "who calls this", and "when did this change" were
+      unreachable.
+    - `dependency` reads `code_symbols.imports` (the #24 indexer's AST
+      extraction), not a text scan: a docstring naming a module is not a
+      dependency on it.
+    - `git_history` is **two git calls, deliberately**. `git log --name-only --
+      <pathspec>` filters the shown file list by the pathspec too, so one call
+      can only report the seed back and the co-changed files — the whole point
+      — are filtered out. Step 1 finds the commits touching the seeds; step 2
+      lists their files with `--no-walk`, which enumerates exactly those
+      commits and so cannot leave the pinned commit's history.
+    - **Structural sources do not run in round 1 of a fresh investigation, and
+      their candidates come LAST.** They answer "what is around these files",
+      so seeding them from a keyword guess makes them a second guess about the
+      same guess — and on a small per-round read budget it costs the file the
+      developer actually asked about. Seeds are earlier rounds' actually-read
+      paths only; a resumed run has carry-over reads and so is lead-driven from
+      its first round.
+    - **`failed` used to lump two opposites together.** A research limitation
+      (the system looked and could not tell) is a real evidence-backed result
+      and may carry an `unknown` finding; an execution failure (the system could
+      not look) is the ABSENCE of a result and must produce no finding at all.
+      `RESEARCH_LIMITATIONS` / `EXECUTION_FAILURE_CLASSES` / `OUTCOME_CLASSES`
+      and the `failure_class` column keep them apart; `failure_class` is NULL
+      for a limitation.
+    - **The time budget applies to the LLM call itself.**
+      `LLMClient.generate_text(timeout=...)` exists because checking the clock
+      between rounds bounds the loop's bookkeeping, not the round trip that
+      spends the time — one hung call could overrun the whole budget with every
+      between-round check passing. Below `_MIN_CALL_SECONDS` the loop stops
+      instead of starting a call it would have to abandon.
+    - `ask_developer` now reads the router classification and whether research
+      is finished. `system_researchable` **never** reaches the developer (by the
+      router's own classification the answer is in the code, so an unanswered
+      question means the investigation is unfinished); a question is held back
+      while research could still answer it unless decision-layer material
+      already exists; `human_only` still requires material, because the
+      classification says the developer must decide, not that they can decide
+      with nothing.
+    - `joint_understanding_exploration_source` audits each source's own
+      revision, budget, and failure. A round-level total cannot answer "did
+      each source stay on the pinned revision?". A failing source is recorded
+      and skipped — never escalated to a round failure, never replaced by an
+      unbounded fallback search.
+
 16. Issue #342 — システムインタビューを状態駆動型の開発者ワークフローへ
     再設計する (sub-issues #343-#346). This is a **UX specification** issue:
     every sub-issue lists Dashboard component changes, API/DB/state-management

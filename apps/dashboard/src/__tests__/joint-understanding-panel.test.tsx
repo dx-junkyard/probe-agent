@@ -92,7 +92,17 @@ function detail(overrides: Partial<JointUnderstandingDetailOut> = {}): JointUnde
         search_leads: [], open_hypotheses: [], missing_evidence: [],
         read_paths: ["app/retry.py"], unread_candidates: ["app/other.py"],
         pruned_findings: 0, files_read: 1, chars_read: 100, llm_calls: 1,
-        elapsed_seconds: 0.5, intelligence_run_id: 4, error_details: null, created_at: 1,
+        elapsed_seconds: 0.5, intelligence_run_id: 4, error_details: null,
+        failure_class: null, outcome_class: "answered",
+        sources: [
+          {
+            id: 1, round_id: 1, system_id: 1, source_kind: "git_history",
+            revision: "abc1234567", candidates_found: 2, queries_run: 2,
+            elapsed_seconds: 0.1, truncated: false, error_details: null,
+            created_at: 1,
+          },
+        ],
+        created_at: 1,
       },
     ],
     translations: [
@@ -368,4 +378,48 @@ test("未翻訳のときは次に取るべき操作を日本語で案内する",
   expect(notice.textContent).toContain("まだ説明は作られていません");
   // 未翻訳でもメニューはローカルの日本語ラベルで出る(英語混在なし)。
   expect(screen.getByTestId("ju-action-compare_options").textContent).toBe("選択肢を比較する");
+});
+
+
+test("調査の限界と実行の失敗を区別して説明する(Issue #339)", async () => {
+  // 開発者にとって意味が正反対で、次にできることも違う。限界は根拠付きの結果、
+  // 失敗は結果が無い状態。同じ「失敗しました」で括るとこの区別が消える。
+  const base = detail();
+  const limitation = detail({
+    investigation_rounds: [
+      {
+        ...base.investigation_rounds[0],
+        stop_reason: "budget_exhausted",
+        outcome_class: "research_limitation",
+        failure_class: null,
+      },
+    ],
+  });
+  mockApi.get.mockResolvedValue(limitation);
+  const first = await renderPanel({ sessionId: 3, juId: 7 });
+  fireEvent.click(await screen.findByTestId("ju-toggle-audit"));
+  expect(screen.getByTestId("ju-round-outcome-1").textContent).toContain(
+    "調査したが確定できませんでした",
+  );
+  // 探索源ごとに revision と件数が監査できる。
+  expect(screen.getByTestId("ju-round-sources-1").textContent).toContain("変更履歴");
+  expect(screen.getByTestId("ju-round-sources-1").textContent).toContain("abc12345");
+  first.unmount();
+
+  mockApi.get.mockResolvedValue(
+    detail({
+      investigation_rounds: [
+        {
+          ...base.investigation_rounds[0],
+          status: "failed", stop_reason: "failed",
+          outcome_class: "execution_failure", failure_class: "timeout",
+        },
+      ],
+    }),
+  );
+  await renderPanel({ sessionId: 3, juId: 8 });
+  fireEvent.click(await screen.findByTestId("ju-toggle-audit"));
+  const outcome = screen.getByTestId("ju-round-outcome-1").textContent ?? "";
+  expect(outcome).toContain("調査を実行できませんでした");
+  expect(outcome).toContain("時間上限");
 });

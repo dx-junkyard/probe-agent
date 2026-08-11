@@ -416,8 +416,12 @@ def build_action_menu(language: str) -> List[ActionMenuEntry]:
 
 
 def ask_developer(
-    *, statements: Sequence[TranslatedStatement], decision_question: Optional[str],
+    *,
+    statements: Sequence[TranslatedStatement],
+    decision_question: Optional[str],
     open_unknowns: Sequence[str],
+    route_category: Optional[str] = None,
+    research_exhausted: bool = True,
 ) -> bool:
     """Whether this translation should actually put a question to the developer.
 
@@ -427,11 +431,34 @@ def ask_developer(
     decision-layer statement, or an option comparison the caller supplies.
     Remaining unknowns alone are never a reason to ask -- they are a reason to
     investigate further, which is a different action.
+
+    Issue #339 gives the gate the Question Router's classification, so the two
+    stop disagreeing about what the human is for:
+
+    - ``system_researchable`` never asks. By the router's own classification the
+      answer is in the code, so an unanswered question means the investigation
+      is not finished -- handing it to the developer would be asking them to do
+      the reading.
+    - a question is held back while research is still possible
+      (``research_exhausted=False``, i.e. the loop stopped on a budget or has
+      leads left) unless there is already decision-layer material. This is the
+      `hybrid` contract: consume the researchable part first, then ask only
+      what is left.
+    - ``human_only`` still requires material. The classification says the
+      developer must decide; it does not say they can decide with nothing, and
+      asking anyway is exactly the empty hand-back Epic #328 removed.
     """
     if not decision_question:
         return False
-    if any(s.layer == "decision" for s in statements):
+    if route_category == "system_researchable":
+        return False
+    has_decision_material = any(s.layer == "decision" for s in statements)
+    if has_decision_material:
         return True
+    if not research_exhausted:
+        # More reading could still answer it; investigating is the next action,
+        # not asking.
+        return False
     # No decision-layer material: ask only when there is nothing left to
     # investigate (no open unknowns) but there are still grounded statements
     # the developer can weigh.

@@ -28,7 +28,10 @@ import type {
   JointUnderstandingActionKind,
   JointUnderstandingAdoptionState,
   JointUnderstandingClaimKind,
+  JointUnderstandingExplorationSourceKind,
+  JointUnderstandingFailureClass,
   JointUnderstandingFindingOut,
+  JointUnderstandingOutcomeClass,
   JointUnderstandingOutcome,
   JointUnderstandingPremiseReason,
   JointUnderstandingStatementLayer,
@@ -99,6 +102,35 @@ const PREMISE_REASON_LABELS: Record<JointUnderstandingPremiseReason, string> = {
   origin_content_changed: "元の確認項目の内容が変わりました。再調査が必要です",
   capability_scope_changed: "確定済みの Capability の範囲が変わりました。再調査が必要です",
   linked_intent_changed: "紐づく意図が変わりました。再調査が必要です",
+};
+
+// Issue #339: 「調査の限界」と「実行の失敗」は開発者にとって意味が正反対で、
+// 次にできることも違う。限界は根拠付きの結果(もっと読めば分かるかもしれない)、
+// 失敗は結果が無い状態(直してからやり直す)。同じ「失敗しました」で括ると
+// この区別が消える。
+const OUTCOME_CLASS_LABELS: Record<JointUnderstandingOutcomeClass, string> = {
+  answered: "調査で答えが出ました",
+  research_limitation: "調査したが確定できませんでした",
+  execution_failure: "調査を実行できませんでした",
+};
+
+const FAILURE_CLASS_LABELS: Record<JointUnderstandingFailureClass, string> = {
+  config_invalid: "推論モデルの設定を確認してください",
+  snapshot_unavailable: "固定したスナップショットを読めませんでした",
+  api_failure: "モデル API の呼び出しに失敗しました。再試行できます",
+  schema_invalid: "モデルの応答形式が不正でした。再試行できます",
+  timeout: "調査の時間上限に達して中断しました",
+};
+
+const SOURCE_KIND_LABELS: Record<JointUnderstandingExplorationSourceKind, string> = {
+  path_name: "ファイル名",
+  symbol_index: "シンボル索引",
+  entrypoint_index: "入口の索引",
+  file_content: "ファイル内容",
+  dependency: "依存関係",
+  call_graph: "呼び出し関係",
+  git_history: "変更履歴",
+  runtime_facts: "実行時の記録",
 };
 
 const ADOPTION_STATE_LABELS: Record<JointUnderstandingAdoptionState, string> = {
@@ -435,6 +467,24 @@ export function JointUnderstandingPanel({
                 {round.missing_evidence.length > 0 && (
                   <p>不足していた証拠: {round.missing_evidence.join(" / ")}</p>
                 )}
+                {round.sources.length > 0 && (
+                  <p data-testid={`ju-round-sources-${round.round_index}`}>
+                    探索源:{" "}
+                    {round.sources
+                      .map(source =>
+                        `${SOURCE_KIND_LABELS[source.source_kind]} ${source.candidates_found}件`
+                        + `(${source.revision.slice(0, 8)})`
+                        + (source.error_details ? " ※取得失敗" : ""),
+                      )
+                      .join(" / ")}
+                  </p>
+                )}
+                <p data-testid={`ju-round-outcome-${round.round_index}`}>
+                  {OUTCOME_CLASS_LABELS[round.outcome_class]}
+                  {round.failure_class
+                    ? ` — ${FAILURE_CLASS_LABELS[round.failure_class]}`
+                    : ""}
+                </p>
                 {round.error_details && <p className="text-red-700">{round.error_details}</p>}
               </div>
             ))

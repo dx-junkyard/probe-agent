@@ -4325,6 +4325,28 @@ export type JointUnderstandingStopReason =
   | "no_new_evidence"
   | "unresolved"
   | "failed";
+// Issue #339: the finite outcome class, so a caller never has to inspect
+// `stop_reason` and guess which side of the limitation/failure split it is on.
+export type JointUnderstandingOutcomeClass =
+  | "answered"
+  | "research_limitation"
+  | "execution_failure";
+// Issue #339: WHERE an execution failure broke, because the recovery differs.
+export type JointUnderstandingFailureClass =
+  | "config_invalid"
+  | "snapshot_unavailable"
+  | "api_failure"
+  | "schema_invalid"
+  | "timeout";
+export type JointUnderstandingExplorationSourceKind =
+  | "path_name"
+  | "symbol_index"
+  | "entrypoint_index"
+  | "file_content"
+  | "dependency"
+  | "call_graph"
+  | "git_history"
+  | "runtime_facts";
 
 export interface JointUnderstandingEvidenceOut {
   path: string;
@@ -4413,6 +4435,31 @@ export interface JointUnderstandingRoundOut {
   llm_calls: number;
   elapsed_seconds: number;
   intelligence_run_id: number | null;
+  error_details: string | null;
+  // Issue #339: set ONLY for an execution failure. A research limitation
+  // (budget_exhausted / no_new_evidence / unresolved) is a real,
+  // evidence-backed result and leaves this null -- "the system looked and could
+  // not tell" must stay distinguishable from "the system could not look".
+  failure_class: JointUnderstandingFailureClass | null;
+  outcome_class: JointUnderstandingOutcomeClass;
+  sources: JointUnderstandingExplorationSourceOut[];
+  created_at: number;
+}
+
+export interface JointUnderstandingExplorationSourceOut {
+  id: number;
+  round_id: number;
+  system_id: number;
+  source_kind: JointUnderstandingExplorationSourceKind;
+  // The pinned commit for git history, the snapshot id for the index /
+  // content / runtime sources.
+  revision: string;
+  candidates_found: number;
+  queries_run: number;
+  elapsed_seconds: number;
+  truncated: boolean;
+  // A failed source is recorded and skipped: it never fails the round, and it
+  // is never replaced by an unbounded fallback search.
   error_details: string | null;
   created_at: number;
 }

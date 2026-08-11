@@ -3997,6 +3997,44 @@ JointUnderstandingStopReason = Literal[
     "answered", "budget_exhausted", "no_new_evidence", "unresolved", "failed",
 ]
 JointUnderstandingRoundStatus = Literal["completed", "unresolved", "failed"]
+# Issue #339: the finite outcome class, so a caller never has to inspect
+# `stop_reason` and guess which side of the limitation/failure split it is on.
+JointUnderstandingOutcomeClass = Literal[
+    "answered", "research_limitation", "execution_failure",
+]
+# Issue #339: WHERE an execution failure broke, because the recovery differs --
+# configuration and a missing snapshot are not retries, an API/schema/timeout
+# failure is.
+JointUnderstandingFailureClass = Literal[
+    "config_invalid", "snapshot_unavailable", "api_failure", "schema_invalid",
+    "timeout",
+]
+# Issue #339: the finite exploration sources. The first four are Epic #328's;
+# the last four are the structural breadth this issue adds.
+JointUnderstandingExplorationSourceKind = Literal[
+    "path_name", "symbol_index", "entrypoint_index", "file_content",
+    "dependency", "call_graph", "git_history", "runtime_facts",
+]
+
+
+class JointUnderstandingExplorationSourceOut(BaseModel):
+    """One exploration source's contribution to one round (Issue #339)."""
+
+    id: int
+    round_id: int
+    system_id: int
+    source_kind: JointUnderstandingExplorationSourceKind
+    # The pinned commit for git history, the snapshot id for the index /
+    # content / runtime sources.
+    revision: str
+    candidates_found: int = 0
+    queries_run: int = 0
+    elapsed_seconds: float = 0.0
+    truncated: bool = False
+    # A failed source is recorded and skipped: it never fails the round, and it
+    # is never replaced by an unbounded fallback search.
+    error_details: Optional[str] = None
+    created_at: float
 
 
 class JointUnderstandingRoundOut(BaseModel):
@@ -4025,6 +4063,19 @@ class JointUnderstandingRoundOut(BaseModel):
     elapsed_seconds: float = 0.0
     intelligence_run_id: Optional[int] = None
     error_details: Optional[str] = None
+    # Issue #339: set ONLY for an execution failure. A research limitation
+    # (budget_exhausted / no_new_evidence / unresolved) is a real,
+    # evidence-backed result and leaves this NULL -- "the system looked and
+    # could not tell" must stay distinguishable from "the system could not
+    # look".
+    failure_class: Optional[JointUnderstandingFailureClass] = None
+    outcome_class: JointUnderstandingOutcomeClass = "research_limitation"
+    # One entry per exploration source this round used, each with its own
+    # revision and budget consumption. Per source because "the round only read
+    # the pinned revision" is a claim about each source separately.
+    sources: List["JointUnderstandingExplorationSourceOut"] = Field(
+        default_factory=list,
+    )
     created_at: float
 
 

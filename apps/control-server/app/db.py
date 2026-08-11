@@ -3034,6 +3034,13 @@ CREATE TABLE IF NOT EXISTS joint_understanding_investigation_round (
     elapsed_seconds         REAL NOT NULL DEFAULT 0,
     intelligence_run_id     INTEGER,
     error_details           TEXT,
+    -- Issue #339: the finite execution-failure class
+    -- (app/investigation_loop.EXECUTION_FAILURE_CLASSES). NULL for a round
+    -- that succeeded AND for one that ended in a research limitation -- a
+    -- limitation is a real, evidence-backed result, not a broken run, and
+    -- collapsing the two is what made "the system looked and could not tell"
+    -- indistinguishable from "the system could not look".
+    failure_class           TEXT,
     created_at              REAL NOT NULL,
     FOREIGN KEY (joint_understanding_id)
         REFERENCES joint_understanding_session (id) ON DELETE CASCADE,
@@ -3044,6 +3051,47 @@ CREATE TABLE IF NOT EXISTS joint_understanding_investigation_round (
 
 CREATE INDEX IF NOT EXISTS idx_joint_understanding_round_session
     ON joint_understanding_investigation_round (joint_understanding_id, id);
+
+-- One exploration source's contribution to one investigation round
+-- (Issue #339).
+--
+-- The round row records what the round read in total. That is not enough to
+-- check the boundary the added sources have to respect: "this round only read
+-- the pinned revision" is a claim about EACH source, and a git-history source
+-- that walked past the pinned commit would be invisible in a round-level
+-- total. So every source records its own revision (the pinned commit for git
+-- history, the snapshot id for the index/content/runtime sources), its own
+-- budget consumption, and its own failure.
+--
+-- A failed source is recorded and skipped -- it never fails the round, and it
+-- is never replaced by an unbounded fallback search (Issue #339: 予算超過時に
+-- 無制限の fallback 探索を行わない). source_kind is validated against
+-- app/snapshot_explorers.EXPLORATION_SOURCE_KINDS before insert.
+CREATE TABLE IF NOT EXISTS joint_understanding_exploration_source (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_id                INTEGER NOT NULL,
+    joint_understanding_id  INTEGER NOT NULL,
+    system_id               INTEGER NOT NULL,
+    source_kind             TEXT NOT NULL,
+    revision                TEXT NOT NULL,
+    candidates_found        INTEGER NOT NULL DEFAULT 0,
+    queries_run             INTEGER NOT NULL DEFAULT 0,
+    elapsed_seconds         REAL NOT NULL DEFAULT 0,
+    truncated               INTEGER NOT NULL DEFAULT 0,
+    error_details           TEXT,
+    created_at              REAL NOT NULL,
+    FOREIGN KEY (round_id)
+        REFERENCES joint_understanding_investigation_round (id) ON DELETE CASCADE,
+    FOREIGN KEY (joint_understanding_id)
+        REFERENCES joint_understanding_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_joint_understanding_exploration_round
+    ON joint_understanding_exploration_source (round_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_joint_understanding_exploration_source_kind
+    ON joint_understanding_exploration_source (system_id, source_kind, created_at);
 
 -- One translation pass (Epic #328 Phase C / Issue #331): the investigation's
 -- findings restated in terms of purpose, user impact, the gap against that
@@ -5293,6 +5341,13 @@ def init_db() -> None:
                 conn, "joint_understanding_session", ju_cols,
                 _column_name, _definition,
             )
+        # Issue #339: the finite execution-failure class on a round, so a
+        # research limitation (a real result) is never read as a broken run.
+        ju_round_cols = _columns(conn, "joint_understanding_investigation_round")
+        _add_column_if_missing(
+            conn, "joint_understanding_investigation_round", ju_round_cols,
+            "failure_class", "TEXT",
+        )
         ju_finding_cols = _columns(conn, "joint_understanding_finding")
         for _column_name, _definition in (
             ("producer_kind", "TEXT"),

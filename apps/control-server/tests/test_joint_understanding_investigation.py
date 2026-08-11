@@ -79,8 +79,15 @@ class ScriptedLLMClient(LLMClient):
         self._responses = list(responses)
         self._error_after = error_after
         self.prompts: List[str] = []
+        # Issue #339: the loop derives a per-call deadline from the remaining
+        # time budget and passes it here, so the hard limit is real rather than
+        # only checked between rounds. Recorded so a test can assert on it.
+        self.timeouts: List[Optional[float]] = []
 
-    def generate_text(self, messages, *, temperature=None, max_tokens=None) -> str:
+    def generate_text(
+        self, messages, *, temperature=None, max_tokens=None, timeout=None,
+    ) -> str:
+        self.timeouts.append(timeout)
         user = next((m["content"] for m in messages if m["role"] == "user"), "")
         self.prompts.append(user)
         index = len(self.prompts) - 1

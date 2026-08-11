@@ -86,8 +86,10 @@ from ..investigation_loop import (
     InvestigationLoopBudget,
     InvestigationLoopResult,
     LoopCarryOver,
+    outcome_class_for,
     run_investigation_loop,
 )
+from ..snapshot_explorers import EXPLORATION_SOURCE_KINDS
 from ..interview_language import get_interview_language, resolve_message_language
 from ..llm import LLMConfig, LLMError, create_llm_client
 from ..models import (
@@ -99,6 +101,7 @@ from ..models import (
     JointUnderstandingCreate,
     JointUnderstandingDetailOut,
     JointUnderstandingEvidenceOut,
+    JointUnderstandingExplorationSourceOut,
     JointUnderstandingFindingCreate,
     JointUnderstandingFindingOut,
     JointUnderstandingHoldRequest,
@@ -346,6 +349,13 @@ def _detail(conn, ju_row) -> JointUnderstandingDetailOut:
         "WHERE joint_understanding_id = ? ORDER BY id",
         (ju_id,),
     ).fetchall()
+    sources_by_round: Dict[int, list] = {}
+    for source in conn.execute(
+        "SELECT * FROM joint_understanding_exploration_source "
+        "WHERE joint_understanding_id = ? ORDER BY id",
+        (ju_id,),
+    ).fetchall():
+        sources_by_round.setdefault(source["round_id"], []).append(source)
     translations = conn.execute(
         "SELECT * FROM joint_understanding_translation "
         "WHERE joint_understanding_id = ? ORDER BY id",
@@ -367,7 +377,9 @@ def _detail(conn, ju_row) -> JointUnderstandingDetailOut:
         session=_session_out(ju_row, verdict),
         findings=[_finding_out(f) for f in findings],
         actions=[_action_out(a) for a in actions],
-        investigation_rounds=[_round_out(r) for r in rounds],
+        investigation_rounds=[
+            _round_out(r, sources_by_round.get(r["id"], [])) for r in rounds
+        ],
         translations=[_translation_out(t) for t in translations],
         reflux=[_reflux_out(r) for r in reflux_rows],
         hypothesis_adoptions=[
@@ -674,7 +686,23 @@ def append_finding(
 # --- Iterative investigation (Phase B / #330) ----------------------------------
 
 
-def _round_out(row) -> JointUnderstandingRoundOut:
+def _exploration_source_out(row) -> JointUnderstandingExplorationSourceOut:
+    return JointUnderstandingExplorationSourceOut(
+        id=row["id"],
+        round_id=row["round_id"],
+        system_id=row["system_id"],
+        source_kind=row["source_kind"],
+        revision=row["revision"],
+        candidates_found=row["candidates_found"],
+        queries_run=row["queries_run"],
+        elapsed_seconds=row["elapsed_seconds"],
+        truncated=bool(row["truncated"]),
+        error_details=row["error_details"],
+        created_at=row["created_at"],
+    )
+
+
+def _round_out(row, sources=()) -> JointUnderstandingRoundOut:
     return JointUnderstandingRoundOut(
         id=row["id"],
         joint_understanding_id=row["joint_understanding_id"],
@@ -695,6 +723,9 @@ def _round_out(row) -> JointUnderstandingRoundOut:
         elapsed_seconds=row["elapsed_seconds"],
         intelligence_run_id=row["intelligence_run_id"],
         error_details=row["error_details"],
+        failure_class=_column(row, "failure_class"),
+        outcome_class=outcome_class_for(row["stop_reason"] or "unresolved"),
+        sources=[_exploration_source_out(source) for source in sources],
         created_at=row["created_at"],
     )
 
@@ -787,8 +818,9 @@ def _persist_loop(
                  stop_reason, conclusion, search_leads, open_hypotheses,
                  missing_evidence, read_paths, unread_candidates,
                  pruned_findings, files_read, chars_read, llm_calls,
-                 elapsed_seconds, intelligence_run_id, error_details, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 elapsed_seconds, intelligence_run_id, error_details,
+                 failure_class, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 ju_id, system_id, loop_round.round_index, loop_round.status,
                 result.stop_reason if persisted_index == len(result.rounds) - 1 else None,
@@ -800,13 +832,41 @@ def _persist_loop(
                 json.dumps(loop_round.unread_candidates, ensure_ascii=False),
                 loop_round.pruned_findings, loop_round.files_read, loop_round.chars_read,
                 loop_round.llm_calls, loop_round.elapsed_seconds, run_id,
-                loop_round.error, completed_at,
+                loop_round.error, loop_round.failure_class, completed_at,
             ),
         )
-        round_outs.append(_round_out(conn.execute(
-            "SELECT * FROM joint_understanding_investigation_round WHERE id = ?",
-            (round_cur.lastrowid,),
-        ).fetchone()))
+        round_id = round_cur.lastrowid
+        # Issue #339: one audit row per exploration source, with its own
+        # revision and budget consumption. The round total cannot answer "did
+        # each source stay on the pinned revision?", which is the boundary the
+        # added structural sources have to respect.
+        for source in loop_round.source_audits:
+            if source.source_kind not in EXPLORATION_SOURCE_KINDS:
+                continue
+            conn.execute(
+                """INSERT INTO joint_understanding_exploration_source
+                    (round_id, joint_understanding_id, system_id, source_kind,
+                     revision, candidates_found, queries_run, elapsed_seconds,
+                     truncated, error_details, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    round_id, ju_id, system_id, source.source_kind,
+                    source.revision, len(source.candidates), source.queries_run,
+                    source.elapsed_seconds, 1 if source.truncated else 0,
+                    source.error, completed_at,
+                ),
+            )
+        round_outs.append(_round_out(
+            conn.execute(
+                "SELECT * FROM joint_understanding_investigation_round WHERE id = ?",
+                (round_id,),
+            ).fetchone(),
+            conn.execute(
+                "SELECT * FROM joint_understanding_exploration_source "
+                "WHERE round_id = ? ORDER BY id",
+                (round_id,),
+            ).fetchall(),
+        ))
 
         for finding in loop_round.findings:
             known_ids = {
@@ -987,7 +1047,8 @@ def investigate_joint_understanding(
         result = InvestigationLoopResult(
             provider=config.provider, model=config.model,
             is_mock=config.provider == "mock",
-            stop_reason="failed", carry_over=carry_over, error=str(exc),
+            stop_reason="failed", carry_over=carry_over,
+            failure_class="config_invalid", error=str(exc),
         )
     completed_at = time.time()
 
@@ -1056,6 +1117,46 @@ def _translation_out(row) -> JointUnderstandingTranslationOut:
         is_mock=bool(row["is_mock"]),
         created_at=row["created_at"],
     )
+
+
+def _research_state(conn, ju_id: int, ju_row) -> "tuple[Optional[str], bool]":
+    """The Question Router's classification and whether research is finished.
+
+    Both come from persisted facts, never from the model's own opinion of how
+    complete it is:
+
+    - the classification is the ``interview_qa.route_category`` recorded by the
+      「わからない」 entry point (Issue #336) for a ``qa`` origin; other origins
+      have no routed question, so it is None and the gate falls back to its
+      material rule.
+    - research is "exhausted" when the latest round did NOT stop on a budget and
+      left no leads or missing evidence behind. A budget stop means more reading
+      is possible, which makes asking the developer premature.
+    """
+    route_category = None
+    if ju_row["origin_kind"] == "qa":
+        row = conn.execute(
+            "SELECT route_category FROM interview_qa WHERE id = ? AND system_id = ?",
+            (ju_row["origin_id"], ju_row["system_id"]),
+        ).fetchone()
+        if row is not None:
+            route_category = row["route_category"]
+    latest = conn.execute(
+        """SELECT stop_reason, search_leads, missing_evidence
+           FROM joint_understanding_investigation_round
+           WHERE joint_understanding_id = ? ORDER BY id DESC LIMIT 1""",
+        (ju_id,),
+    ).fetchone()
+    if latest is None:
+        # No round has run: nothing has been researched, so nothing is
+        # exhausted -- the gate holds the question back rather than asking
+        # before the system has looked at all.
+        return route_category, False
+    if latest["stop_reason"] == "budget_exhausted":
+        return route_category, False
+    leads = json.loads(latest["search_leads"] or "[]")
+    missing = json.loads(latest["missing_evidence"] or "[]")
+    return route_category, not (leads or missing)
 
 
 def _action_menu(language: str) -> List[JointUnderstandingActionMenuEntryOut]:
@@ -1140,6 +1241,7 @@ def translate_joint_understanding(
             )
             for r in rows
         ]
+        route_category, research_exhausted = _research_state(conn, ju_id, ju)
 
     # Phase 2 (DB lock released): the reasoning call.
     config = LLMConfig.intelligence_from_env()
@@ -1253,6 +1355,13 @@ def translate_joint_understanding(
             statements=result.statements,
             decision_question=result.decision_question,
             open_unknowns=result.open_unknowns,
+            # Issue #339: the gate reads the Question Router's classification
+            # and whether investigation is actually finished, so the two stop
+            # disagreeing about what the human is for. A `system_researchable`
+            # question is never handed over, and a question is held back while
+            # more reading could still answer it.
+            route_category=route_category,
+            research_exhausted=research_exhausted,
         )
         translation_cur = conn.execute(
             """INSERT INTO joint_understanding_translation
